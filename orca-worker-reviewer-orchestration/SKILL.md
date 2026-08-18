@@ -29,7 +29,14 @@ PASS ─────────────→ next phase / COMPLETED
 FAIL → Worker fix → Reviewer re-review
 ```
 
-정확히 두 역할만 지원한다. 3-agent 이상의 topology는 이 Skill의 범위 밖이다.
+정확히 두 역할만 지원한다.
+
+```text
+Worker
+Reviewer
+```
+
+3-agent 이상의 topology는 이 Skill의 범위 밖이다.
 
 ## 2. Mandatory Orca Orchestration Contract
 
@@ -39,13 +46,26 @@ FAIL → Worker fix → Reviewer re-review
 실행 전에 현재 Orca binary가 제공하는 version-matched orchestration guide를 읽는다.
 
 1. Orca CLI executable을 공식 `orchestration` Skill의 규칙에 따라 한 번 resolve한다.
-2. `<ORCA> skills get orchestration`으로 현재 binary의 전체 guide를 읽는다.
-3. 이후 Run / Task / Dispatch / worker completion / wait / decision 관련 command는 반드시 해당 guide의 현재 grammar를 따른다.
-4. command/subcommand/flag를 기억이나 이 Skill 문서만 보고 추측하지 않는다.
-5. 가능하면 `--json`을 사용한다.
-6. 완료 보고 전에 실제 Task/Dispatch provenance를 확인한다.
+2. 다음을 실행하여 현재 binary의 전체 orchestration guide를 읽는다.
 
-공식 orchestration guide/runtime을 사용할 수 없다면 direct-session 방식으로 조용히 fallback하지 않는다.
+```text
+<ORCA> skills get orchestration
+```
+
+3. Run / Task / Dispatch / worker completion / wait / decision 관련 command는 반드시 해당 guide의 현재 grammar를 따른다.
+4. Custom agent command를 위해 Orca terminal 생성, terminal send/read/wait 등 terminal lifecycle 제어가 필요한 경우 다음도 읽는다.
+
+```text
+<ORCA> skills get orca-cli
+```
+
+5. terminal 생성/입력/대기/읽기 관련 command는 version-matched `orca-cli` guide의 현재 grammar를 따른다.
+6. command/subcommand/flag를 기억이나 이 Skill 문서만 보고 추측하지 않는다.
+7. 가능하면 `--json`을 사용한다.
+8. 작업을 orchestrated라고 완료 보고하기 전에 실제 Task/Dispatch provenance를 확인한다.
+
+공식 orchestration guide가 로드되지 않거나 runtime을 사용할 수 없다면 direct-session 방식으로
+조용히 fallback하지 않는다.
 
 ```text
 STATUS: BLOCKED
@@ -80,6 +100,11 @@ Default:
 Phases:
   Sequential: analysis → plan → design → implementation → test
   Specialized: bugfix, refactoring
+
+Examples:
+  /orca-worker-reviewer-orchestration phases=implementation <request>
+  /orca-worker-reviewer-orchestration phases=design,implementation <request>
+  /orca-worker-reviewer-orchestration phases=bugfix <request>
 ```
 
 ## 4. Runtime Parameters
@@ -146,7 +171,7 @@ STATUS: BLOCKED
 REASON: AGENT_COMMAND_NOT_FOUND
 ```
 
-agent process 실행 시 기본 permission mode:
+실제 agent process 실행 시 기본적으로 다음 permission mode를 사용한다.
 
 ```text
 <agent-command> --dangerously-skip-permissions
@@ -169,23 +194,25 @@ Worker session != Reviewer session
 2. Worker Task를 생성한다.
 3. Worker용 terminal/agent process를 생성 또는 재사용한다.
 4. Worker Task를 실제 Orca Dispatch에 연결한다.
-5. `worker_done` 또는 escalation/question을 orchestration wait/check로 기다린다.
+5. worker completion (`worker_done`) 또는 escalation/question을 orchestration wait/check로 기다린다.
 6. Worker 완료 후 Reviewer Task를 생성하고 별도 Dispatch로 Reviewer에게 전달한다.
 7. Reviewer 결과를 PASS/FAIL contract로 평가한다.
 
 ### Custom command handling
 
-`claude-glm`, `claude-gemma`처럼 Orca Settings에 Custom CLI Agent로 등록되지 않은 command도 지원 대상이다.
+`claude-glm`, `claude-gemma`처럼 Orca Settings에 Custom CLI Agent로 등록되지 않은 command도 사용할 수 있어야 한다.
 
 현재 Orca guide가 selected command를 supervised `worker-start`의 recognized agent로 직접 시작할 수 있으면 그 경로를 우선한다.
 
-그렇지 않으면:
+그렇지 않으면 다음 원칙을 사용한다.
 
-- Orca terminal에서 selected command process를 시작한다.
+- 먼저 `<ORCA> skills get orca-cli`를 읽어 현재 Orca binary의 terminal create/send/read/wait grammar를 확인한다.
+- Orca terminal에서 selected command process를 시작한다. terminal 생성과 prompt delivery는 `orca-cli` guide를 따른다.
 - Task/Dispatch provenance는 반드시 Orca orchestration에 생성한다.
 - runtime이 해당 terminal을 recognized agent로 inject할 수 있는 경우에만 injected dispatch를 사용한다.
-- bare/unrecognized terminal이면 공식 guide의 tracked dispatch + terminal prompt delivery 절차를 사용한다.
-- non-Orca subagent API로 대체하지 않는다.
+- bare/unrecognized terminal이면 `orchestration` guide의 tracked dispatch 절차와 `orca-cli` guide의 terminal prompt delivery 절차를 조합한다.
+- `orchestration` 또는 `orca-cli` command/flag를 기억으로 추측하지 않는다.
+- 어느 경우에도 non-Orca subagent API로 대체하지 않는다.
 
 ## 7. Phase Model
 
@@ -245,11 +272,47 @@ REASON: PHASE_CONFLICT
 
 각 phase는 독립 PASS gate를 가진다. 현재 phase가 PASS하기 전에는 다음 phase Task를 dispatch하지 않는다.
 
+### Specialized Phase Combination Policy
+
+`BUGFIX`, `REFACTORING`은 일반 sequential lifecycle의 고정 단계가 아니라 specialized work phase다.
+
+단독 실행은 허용한다.
+
+```text
+phases=bugfix
+phases=refactoring
+```
+
+다른 phase와 조합하는 경우 Skill에 의미가 명확히 정의된 조합만 허용한다. Coordinator가 임의 순서를 추론하거나 specialized phase를 sequential phase처럼 끼워 넣지 않는다.
+
+지원되지 않거나 의미가 불명확한 조합이면:
+
+```text
+STATUS: BLOCKED
+REASON: UNSUPPORTED_PHASE_COMBINATION
+```
+
+대표적으로 지원하는 조합:
+
+```text
+phases=analysis,plan,design,implementation,test
+phases=design,implementation
+phases=design,implementation,test
+phases=bugfix
+phases=refactoring
+```
+
 ## 9. Approved Phase Output
 
 PASS된 이전 phase 결과는 다음 phase의 approved input이다.
 
-다음 phase Worker에게 최소한 전달:
+```text
+DESIGN PASS
+→ APPROVED_DESIGN
+→ IMPLEMENTATION Worker Task input
+```
+
+다음 phase Worker에게 최소한 다음 context를 전달한다.
 
 ```text
 ORIGINAL_REQUEST
@@ -271,11 +334,13 @@ REASON: PREVIOUS_PHASE_CHANGE_REQUIRED
 
 Worker는 phase별 `templates/*.md`를 따른다.
 
-공통 결과:
+공통 결과 형식:
 
 ```text
 # Worker Result
+
 STATUS: COMPLETE | BLOCKED
+
 ## Summary
 ## Analysis
 ## Changes
@@ -285,8 +350,8 @@ STATUS: COMPLETE | BLOCKED
 ## Review Feedback Resolution
 ```
 
-Worker는 active Dispatch의 lifecycle preamble/guide를 따라 완료를 Orca orchestration에 보고한다.
-Coordinator는 terminal output만 보고 임의 완료 처리하지 않는다.
+Worker는 active Dispatch의 lifecycle preamble/guide를 따라 완료를 Orca orchestration에 보고해야 한다.
+Coordinator는 terminal output만 보고 임의로 완료 처리하지 않는다.
 
 ## 11. Reviewer Contract
 
@@ -298,7 +363,9 @@ Reviewer는 code/artifact를 직접 수정하지 않는다.
 
 ```text
 # Review Result
+
 RESULT: PASS | FAIL
+
 ## Summary
 ## Blocking Findings
 ## Non-Blocking Findings
@@ -306,14 +373,26 @@ RESULT: PASS | FAIL
 ## Final Decision
 ```
 
-CRITICAL 또는 MAJOR finding이 존재하면 FAIL한다.
+Blocking Finding:
+
+```text
+ID:
+Severity: CRITICAL | MAJOR | MINOR
+Location:
+Issue:
+Reason:
+Required Action:
+```
+
+CRITICAL 또는 MAJOR가 존재하면 FAIL한다.
 
 ## 12. FAIL Loop
 
 Reviewer PASS:
 
 ```text
-current phase COMPLETED → next phase / COMPLETED
+current phase COMPLETED
+→ 다음 phase 또는 전체 COMPLETED
 ```
 
 Reviewer FAIL:
@@ -321,21 +400,29 @@ Reviewer FAIL:
 ```text
 Reviewer findings
       ↓
-new Worker correction Task / Dispatch
+새 Worker correction Task / Dispatch
       ↓
 Worker fix
       ↓ worker_done
-new Reviewer Task / Dispatch
+새 Reviewer Task / Dispatch
       ↓
 PASS / FAIL
 ```
 
-Reviewer 자신이 fix를 수행하지 않는다. 각 attempt에 Orca Task/Dispatch provenance가 남아야 한다.
+Reviewer 자신이 fix를 수행하지 않는다.
+Orca의 Task/Dispatch provenance가 각 attempt에 남아야 한다.
 
 ## 13. Iteration
 
+기본:
+
 ```text
-DEFAULT_MAX_ITERATIONS = 5
+max-iterations=5
+```
+
+허용:
+
+```text
 1 <= max-iterations <= 10
 ```
 
@@ -346,12 +433,17 @@ DEFAULT_MAX_ITERATIONS = 5
 STATUS: ESCALATED
 ```
 
+미해결 finding, 반복 원인, Worker/Reviewer 의견 차이를 보고한다.
+
 ## 14. Mandatory Test Gates
 
 IMPLEMENTATION:
 
 ```text
-Production Code Change + Unit Test Add/Modify + Unit Test Execution + PASS
+Production Code Change
++ Unit Test Add/Modify
++ Unit Test Execution
++ PASS
 ```
 
 BUGFIX:
@@ -363,10 +455,18 @@ Regression Test required
 REFACTORING:
 
 ```text
-Behavior preservation + relevant Unit Test execution + PASS
+Behavior preservation
++ relevant Unit Test execution
++ PASS
 ```
 
-필수 test가 없거나 실행 불가능하면 조용히 생략하지 않는다.
+필수 test가 없거나 실행이 기술적으로 불가능하면 Worker가 조용히 생략하지 않는다.
+
+```text
+UNIT_TEST_STATUS: BLOCKED
+```
+
+Reviewer는 자동 PASS하지 않는다.
 
 ## 15. Repository / Security Policy
 
@@ -388,7 +488,7 @@ Coordinator는 직접 production code를 수정하지 않는다.
 전체 완료 전에:
 
 1. 모든 requested phase가 PASS했는지 확인한다.
-2. 각 phase/iteration의 Worker/Reviewer Task/Dispatch가 Orca state에 존재하는지 확인한다.
+2. 각 phase/iteration에 필요한 Worker/Reviewer Task/Dispatch가 Orca state에 존재하는지 확인한다.
 3. unresolved Blocking Finding이 없는지 확인한다.
 4. 마지막 test/validation 결과를 확인한다.
 
@@ -396,12 +496,14 @@ Coordinator는 직접 production code를 수정하지 않는다.
 
 ```text
 # Final Result
+
 STATUS: COMPLETED
 PHASES:
 COMPLETED_PHASES:
 WORKER:
 REVIEWER:
 ITERATIONS_BY_PHASE:
+
 ## Summary
 ## Changed Files / Artifacts
 ## Unit Tests / Validation
@@ -418,8 +520,10 @@ Exactly 2 roles: Worker + Reviewer
 Worker != Reviewer
 Worker Dispatch != Reviewer Dispatch
 Real Orca Run/Task/Dispatch provenance required
-Load version-matched Orca orchestration guide before commands
+Load version-matched Orca orchestration guide before orchestration commands
+Load version-matched Orca CLI guide before terminal lifecycle commands
 Never guess Orca CLI grammar
+Specialized phase combinations must be explicitly supported
 Reviewer never fixes its own findings
 Reviewer FAIL → new Worker correction dispatch
 Current phase PASS required before next phase
