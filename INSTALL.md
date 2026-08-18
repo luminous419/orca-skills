@@ -1,235 +1,68 @@
-# Installation — Orca Worker-Reviewer Loop
+# Installation — Orca Skills
 
-이 문서는 `orca-worker-reviewer-loop` Skill의 **설치, 검증, 업데이트, 삭제**만 다룬다.
-
-사용법, phase, parameter, workflow 설명은 [`README.md`](README.md)를 참고한다.
-
----
+This repository contains multiple Orca skills. Install one or both skill directories into Claude's skill path.
 
 ## 1. Prerequisites
 
-다음 환경이 준비되어 있어야 한다.
-
 - Orca
-- Claude Code 기반 Worker / Reviewer 실행 command
-- 해당 command가 PATH에서 실행 가능
-- `~/.claude/skills` 사용 가능 환경
-
-기본 Skill 설정은 다음 agent command를 사용한다.
-
-```text
-worker=claude-glm
-reviewer=claude-gemma
-```
-
----
-
-## 2. Agent Command 확인
-
-PATH에서 command가 확인되는지 검사한다.
+- Claude Code environment capable of launching the selected Worker/Reviewer commands
+- `~/.claude/skills` available
+- Default agent commands on PATH:
 
 ```bash
 command -v claude-glm
 command -v claude-gemma
 ```
 
-두 command 모두 경로를 반환해야 한다.
+The orchestration variant additionally requires:
 
-실행 권한 확인:
+- Orca built-in `orchestration` support enabled and available in the installed Orca version.
+- Orca built-in `orca-cli` guide available for terminal lifecycle control when custom agent commands are launched in Orca terminals.
 
-```bash
-test -x "$(command -v claude-glm)" && echo "claude-glm OK"
-test -x "$(command -v claude-gemma)" && echo "claude-gemma OK"
-```
+The skill loads the version-matched runtime guides rather than hard-coding terminal/orchestration CLI grammar.
 
-command가 발견되지 않으면 Skill 설치 전에 PATH 설정을 먼저 수정한다.
-
----
-
-## 3. Package 압축 해제
-
-배포 파일:
-
-```text
-orca-worker-reviewer-loop-skill.tar.gz
-```
-
-압축 해제:
+## 2. Clone or Download
 
 ```bash
-tar -xzf orca-worker-reviewer-loop-skill.tar.gz
+git clone https://github.com/luminous419/orca-skills.git
+cd orca-skills
 ```
 
-생성되는 구조:
+For an offline company laptop, transfer the repository/package using the organization's approved file-transfer process, then continue from the extracted directory.
 
-```text
-orca-worker-reviewer-loop-skill/
-├── README.md
-├── INSTALL.md
-└── orca-worker-reviewer-loop/
-    ├── SKILL.md
-    ├── templates/
-    └── reviews/
-```
-
----
-
-## 4. 전역 설치 — 권장
+## 3. Global Installation — Recommended
 
 ```bash
 mkdir -p ~/.claude/skills
-cp -R \
-  orca-worker-reviewer-loop-skill/orca-worker-reviewer-loop \
-  ~/.claude/skills/
 ```
 
-최종 위치:
-
-```text
-~/.claude/skills/orca-worker-reviewer-loop/
-```
-
----
-
-## 5. 설치 결과 확인
+Install the direct-session loop:
 
 ```bash
-find ~/.claude/skills/orca-worker-reviewer-loop \
-  -maxdepth 3 \
-  -type f \
-  | sort
+cp -R orca-worker-reviewer-loop ~/.claude/skills/
 ```
 
-다음 파일이 존재해야 한다.
-
-```text
-~/.claude/skills/orca-worker-reviewer-loop/SKILL.md
-~/.claude/skills/orca-worker-reviewer-loop/templates/analysis.md
-~/.claude/skills/orca-worker-reviewer-loop/templates/plan.md
-~/.claude/skills/orca-worker-reviewer-loop/templates/design.md
-~/.claude/skills/orca-worker-reviewer-loop/templates/implementation.md
-~/.claude/skills/orca-worker-reviewer-loop/templates/test.md
-~/.claude/skills/orca-worker-reviewer-loop/templates/bugfix.md
-~/.claude/skills/orca-worker-reviewer-loop/templates/refactoring.md
-~/.claude/skills/orca-worker-reviewer-loop/reviews/common.md
-~/.claude/skills/orca-worker-reviewer-loop/reviews/analysis.md
-~/.claude/skills/orca-worker-reviewer-loop/reviews/plan.md
-~/.claude/skills/orca-worker-reviewer-loop/reviews/design.md
-~/.claude/skills/orca-worker-reviewer-loop/reviews/implementation.md
-~/.claude/skills/orca-worker-reviewer-loop/reviews/test.md
-~/.claude/skills/orca-worker-reviewer-loop/reviews/refactoring.md
-```
-
----
-
-## 6. Claude Code Session 재시작
-
-Skill이 인식되지 않는 경우 현재 Claude Code session을 종료한 후 다시 실행한다.
+Install the Orca-native orchestration variant:
 
 ```bash
-claude
+cp -R orca-worker-reviewer-orchestration ~/.claude/skills/
 ```
 
----
-
-## 7. Help 동작 확인
-
-```text
-/orca-worker-reviewer-loop help
-```
-
-실제 Worker / Reviewer orchestration이 시작되지 않고 간단한 usage가 출력되어야 한다.
-
----
-
-## 8. 프로젝트 로컬 설치 — 선택 사항
+Install both when comparing behavior:
 
 ```bash
-mkdir -p .claude/skills
-cp -R \
-  orca-worker-reviewer-loop-skill/orca-worker-reviewer-loop \
-  .claude/skills/
+cp -R orca-worker-reviewer-loop ~/.claude/skills/
+cp -R orca-worker-reviewer-orchestration ~/.claude/skills/
 ```
 
-최종 위치:
-
-```text
-<project-root>/.claude/skills/orca-worker-reviewer-loop/
-```
-
-여러 프로젝트에서 공통으로 사용할 목적이면 전역 설치를 권장한다.
-
----
-
-## 9. 기존 Skill에서 Migration
-
-전역:
+## 4. Verify Files
 
 ```bash
-rm -rf ~/.claude/skills/orca-glm-gemma-loop
+find ~/.claude/skills/orca-worker-reviewer-loop -maxdepth 3 -type f | sort
+find ~/.claude/skills/orca-worker-reviewer-orchestration -maxdepth 3 -type f | sort
 ```
 
-프로젝트 로컬:
-
-```bash
-rm -rf .claude/skills/orca-glm-gemma-loop
-```
-
-현재 Skill 이름:
-
-```text
-orca-worker-reviewer-loop
-```
-
----
-
-## 10. Update
-
-백업이 필요하면:
-
-```bash
-mv \
-  ~/.claude/skills/orca-worker-reviewer-loop \
-  ~/.claude/skills/orca-worker-reviewer-loop.backup
-```
-
-새 버전 설치:
-
-```bash
-cp -R \
-  orca-worker-reviewer-loop-skill/orca-worker-reviewer-loop \
-  ~/.claude/skills/
-```
-
-확인 후 백업 제거:
-
-```bash
-rm -rf ~/.claude/skills/orca-worker-reviewer-loop.backup
-```
-
----
-
-## 11. Uninstall
-
-전역 설치 제거:
-
-```bash
-rm -rf ~/.claude/skills/orca-worker-reviewer-loop
-```
-
-프로젝트 로컬 설치 제거:
-
-```bash
-rm -rf .claude/skills/orca-worker-reviewer-loop
-```
-
----
-
-## 12. Runtime `run/` 디렉터리
-
-Skill 실행 중 `run/` 또는 기타 runtime artifact 디렉터리가 생성될 수 있다.
-
-배포/설치 대상은 다음뿐이다.
+Each installed skill should contain:
 
 ```text
 SKILL.md
@@ -237,47 +70,66 @@ templates/
 reviews/
 ```
 
-따라서 다른 환경으로 Skill을 복사하거나 패키징할 때 `run/`은 포함하지 않는다.
+## 5. Verify Orca Built-in Skills for the Orchestration Variant
 
----
+If `orca-worker-reviewer-orchestration` is installed, verify the current Orca binary exposes both built-in guides:
 
-## 13. 설치 파일 역할
-
-- `README.md`: 사용자용 개요, 사용법, phase, parameter, 예시
-- `INSTALL.md`: 설치, 검증, 업데이트, 삭제
-- `orca-worker-reviewer-loop/SKILL.md`: 실제 Coordinator orchestration 실행 명세
-- `templates/`: phase별 Worker 지침
-- `reviews/`: phase별 Reviewer 정책
-
----
-
-## 14. 문제 확인
-
-1. 설치 경로 확인
-
-```bash
-ls -la ~/.claude/skills/orca-worker-reviewer-loop
+```text
+<ORCA> skills get orchestration
+<ORCA> skills get orca-cli
 ```
 
-2. `SKILL.md` 확인
+`<ORCA>` means the Orca CLI executable resolved for the current environment according to Orca's own skill guidance.
 
-```bash
-ls -l ~/.claude/skills/orca-worker-reviewer-loop/SKILL.md
-```
+The first guide is used for Run/Task/Dispatch/worker completion state. The second is used when terminal create/send/read/wait operations are required for custom commands such as `claude-glm` or `claude-gemma`.
 
-3. Claude Code session 재시작
-
-4. agent command 확인
-
-```bash
-command -v claude-glm
-command -v claude-gemma
-```
-
-5. Help 호출
+## 6. Verify Help
 
 ```text
 /orca-worker-reviewer-loop help
+/orca-worker-reviewer-orchestration help
 ```
 
-사용법 자체는 `README.md`를 참고한다.
+Help mode should not start Worker/Reviewer execution.
+
+## 7. Project-local Installation — Optional
+
+```bash
+mkdir -p .claude/skills
+cp -R orca-worker-reviewer-loop .claude/skills/
+cp -R orca-worker-reviewer-orchestration .claude/skills/
+```
+
+Use global installation when the same skills should be reused across projects.
+
+## 8. Update
+
+After pulling or receiving a newer repository snapshot, replace the installed skill directory.
+
+```bash
+rm -rf ~/.claude/skills/orca-worker-reviewer-loop
+cp -R orca-worker-reviewer-loop ~/.claude/skills/
+
+rm -rf ~/.claude/skills/orca-worker-reviewer-orchestration
+cp -R orca-worker-reviewer-orchestration ~/.claude/skills/
+```
+
+Restart the Claude Code session if updated skills are not detected.
+
+## 9. Uninstall
+
+```bash
+rm -rf ~/.claude/skills/orca-worker-reviewer-loop
+rm -rf ~/.claude/skills/orca-worker-reviewer-orchestration
+```
+
+## 10. Runtime Artifacts
+
+Do not copy generated `run/` or other runtime artifact directories as part of a skill installation.
+The distributable skill definition is:
+
+```text
+SKILL.md
+templates/
+reviews/
+```
