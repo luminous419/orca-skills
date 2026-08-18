@@ -14,7 +14,12 @@ command -v claude-glm
 command -v claude-gemma
 ```
 
-The orchestration variant additionally requires Orca built-in orchestration support to be enabled and available in the installed Orca version.
+The orchestration variant additionally requires:
+
+- Orca built-in `orchestration` support enabled and available in the installed Orca version.
+- Orca built-in `orca-cli` guide available for terminal lifecycle control when custom agent commands are launched in Orca terminals.
+
+The skill loads the version-matched runtime guides rather than hard-coding terminal/orchestration CLI grammar.
 
 ## 2. Clone or Download
 
@@ -65,7 +70,20 @@ templates/
 reviews/
 ```
 
-## 5. Verify Help
+## 5. Verify Orca Built-in Skills for the Orchestration Variant
+
+If `orca-worker-reviewer-orchestration` is installed, verify the current Orca binary exposes both built-in guides:
+
+```text
+<ORCA> skills get orchestration
+<ORCA> skills get orca-cli
+```
+
+`<ORCA>` means the Orca CLI executable resolved for the current environment according to Orca's own skill guidance.
+
+The first guide is used for Run/Task/Dispatch/worker completion state. The second is used when terminal create/send/read/wait operations are required for custom commands such as `claude-glm` or `claude-gemma`.
+
+## 6. Verify Help
 
 ```text
 /orca-worker-reviewer-loop help
@@ -74,7 +92,7 @@ reviews/
 
 Help mode should not start Worker/Reviewer execution.
 
-## 6. Project-local Installation — Optional
+## 7. Project-local Installation — Optional
 
 ```bash
 mkdir -p .claude/skills
@@ -84,7 +102,7 @@ cp -R orca-worker-reviewer-orchestration .claude/skills/
 
 Use global installation when the same skills should be reused across projects.
 
-## 7. Update
+## 8. Update
 
 After pulling or receiving a newer repository snapshot, replace the installed skill directory.
 
@@ -98,14 +116,14 @@ cp -R orca-worker-reviewer-orchestration ~/.claude/skills/
 
 Restart the Claude Code session if updated skills are not detected.
 
-## 8. Uninstall
+## 9. Uninstall
 
 ```bash
 rm -rf ~/.claude/skills/orca-worker-reviewer-loop
 rm -rf ~/.claude/skills/orca-worker-reviewer-orchestration
 ```
 
-## 9. Runtime Artifacts
+## 10. Runtime Artifacts
 
 Do not copy generated `run/` or other runtime artifact directories as part of a skill installation.
 The distributable skill definition is:
