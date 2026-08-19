@@ -31,7 +31,8 @@ class ValidatorRegressionTests(unittest.TestCase):
 
         scripts_dir = self.repo_root / "scripts"
         scripts_dir.mkdir()
-        shutil.copy2(SOURCE_ROOT / "scripts/validate_skills.py", scripts_dir)
+        for filename in ("validate_skills.py", "skill_policy.py"):
+            shutil.copy2(SOURCE_ROOT / "scripts" / filename, scripts_dir)
 
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
@@ -57,7 +58,7 @@ class ValidatorRegressionTests(unittest.TestCase):
         )
         text = skill_path.read_text(encoding="utf-8")
         skill_path.write_text(
-            text.replace("REASON: INVALID_MAX_ITERATIONS", "REASON: REMOVED", 1),
+            text.replace("INVALID_MAX_ITERATIONS", "REMOVED_MAX_ITERATIONS_ERROR"),
             encoding="utf-8",
         )
 

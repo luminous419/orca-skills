@@ -36,7 +36,7 @@ Before installing or updating either skill, run:
 
 ```bash
 python3 scripts/validate_skills.py
-python3 -m unittest scripts/test_validate_skills.py
+python3 -m unittest scripts/test_validate_skills.py scripts/test_policy_smoke.py
 ```
 
 The validator checks both `orca-worker-reviewer-loop` and
@@ -47,7 +47,9 @@ workflow policy gates before the skill directories are copied into place.
 
 The validator uses only the Python standard library. A successful run ends with
 `Skill validation PASSED` and exits with status `0`. The accompanying regression
-tests confirm that representative broken repository states are rejected.
+tests confirm that representative broken repository states are rejected and that
+both skills return the same deterministic policy decisions without starting Orca
+or the configured Worker/Reviewer commands.
 
 ## 4. Global Installation — Recommended
 

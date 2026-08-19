@@ -144,6 +144,62 @@ DEFAULT_MAX_ITERATIONS = 5
 → phases=design,implementation
 ```
 
+## Machine-Readable Policy Contract
+
+다음 JSON block은 deterministic policy smoke test의 source of truth다.
+사람이 읽는 위/아래의 정책 설명과 의미가 일치해야 하며 두 Skill에서 동일하게 유지한다.
+자유 형식 자연어의 전체 의미 해석은 여전히 Coordinator/LLM의 책임이고,
+여기에는 대표적인 명시 phase 표현만 machine-readable term으로 정의한다.
+
+```policy-contract
+{
+  "schema_version": 1,
+  "help": {
+    "tokens": ["help", "--help", "-h", "usage"],
+    "empty_request": true
+  },
+  "defaults": {
+    "worker": "claude-glm",
+    "reviewer": "claude-gemma",
+    "max_iterations": 5
+  },
+  "agent_allowlist": ["claude-glm", "claude-gemma"],
+  "max_iterations": {
+    "min": 1,
+    "max": 10
+  },
+  "sequential_phases": [
+    "analysis",
+    "plan",
+    "design",
+    "implementation",
+    "test"
+  ],
+  "specialized_phases": ["bugfix", "refactoring"],
+  "supported_specialized_combinations": [
+    ["bugfix"],
+    ["refactoring"]
+  ],
+  "natural_language_phase_terms": {
+    "analysis": ["analysis", "분석"],
+    "plan": ["plan", "계획"],
+    "design": ["design", "설계"],
+    "implementation": ["implementation", "implement", "구현"],
+    "test": ["test", "테스트"],
+    "bugfix": ["bugfix", "bug fix", "버그 수정"],
+    "refactoring": ["refactoring", "refactor", "리팩터링"]
+  },
+  "errors": {
+    "agent_not_allowed": "AGENT_NOT_ALLOWED",
+    "worker_reviewer_must_differ": "WORKER_REVIEWER_MUST_DIFFER",
+    "invalid_max_iterations": "INVALID_MAX_ITERATIONS",
+    "invalid_phase_order": "INVALID_PHASE_ORDER",
+    "phase_conflict": "PHASE_CONFLICT",
+    "unsupported_phase_combination": "UNSUPPORTED_PHASE_COMBINATION"
+  }
+}
+```
+
 ## 5. Agent Allowlist
 
 runtime agent command는 allowlist 기반으로 제한한다.
