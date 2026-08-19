@@ -214,6 +214,47 @@ Worker session != Reviewer session
 - `orchestration` 또는 `orca-cli` command/flag를 기억으로 추측하지 않는다.
 - 어느 경우에도 non-Orca subagent API로 대체하지 않는다.
 
+### Completed Worker Lifecycle
+
+현재 version-matched orchestration guide에 따라 Coordinator는 accepted `worker_done`을 처리한 뒤,
+다음 Delivery를 acknowledge하거나 다시 wait하기 전에 settled worker terminal의 다음 owner를 반드시 결정한다.
+
+허용되는 lifecycle decision은 정확히 다음 세 가지다.
+
+#### 1. Immediate worker reuse
+
+동일한 agent가 즉시 수행할 후속 Task가 있으면 완료된 Dispatch에서 agent terminal handle을 확인하고,
+현재 version-matched orchestration guide의 worker inspection/reuse 절차에 따라 그 terminal의 cleanup ownership을
+새 Dispatch로 이전한다.
+
+reuse는 같은 session에서 Worker와 Reviewer 역할을 바꾸는 것을 허용하지 않는다.
+동일 역할의 동일 agent가 즉시 이어지는 correction 또는 re-review Task를 수행하는 경우에만 사용한다.
+
+#### 2. Worker release
+
+즉시 재사용하지 않는 succeeded/failed `worker_done`은 현재 version-matched orchestration guide의
+`worker-release` 절차로 release한다.
+
+`worker-release`는 cancellation이 아니라 post-completion cleanup이다. Orca가 inspectable output을 보존한 뒤
+해당 settled Dispatch가 소유한 terminal만 정리하도록 맡긴다. Coordinator는 이를 임의의
+`terminal close`나 process kill로 대체하지 않는다.
+
+#### 3. Explicit worker retain
+
+사용자가 debugging을 위해 completed worker를 live 상태로 유지해 달라고 명시한 경우에만 retain한다.
+현재 version-matched orchestration guide의 `worker-retain` 절차를 사용한다.
+
+retain 사유를 최종 보고에 기록한다. 보존 필요가 끝나면 같은 Dispatch를 `worker-release`에 전달하여 정리한다.
+
+#### Lifecycle safety
+
+- timeout, TUI idle, heartbeat, status, question, escalation, rejected/stale `worker_done`만으로 worker를 release하지 않는다.
+- `worker-release`가 `release_pending` 또는 `release_unknown`을 반환하면 `terminal close`로 우회하지 않고 receipt의 recovery action을 따른다.
+- accepted `worker_done`마다 reuse, retain, release 중 하나를 기록한다.
+- completed worker를 output 확인만을 위해 무기한 live 상태로 방치하지 않는다. release 후에도 output은 orchestration의 worker read 경로로 확인한다.
+- Coordinator는 모든 settled worker terminal의 lifecycle을 account하기 전에는 다음 wait를 시작하거나 최종 완료를 보고하지 않는다.
+- 이 section은 lifecycle policy/invariant만 정의한다. 구체 command/subcommand/flag grammar는 항상 실행 시점에 로드한 version-matched orchestration guide가 우선하며, 이 Skill에서 기억이나 과거 예시를 근거로 재구성하지 않는다.
+
 ## 7. Phase Model
 
 지원 phase:
@@ -426,6 +467,13 @@ max-iterations=5
 1 <= max-iterations <= 10
 ```
 
+범위를 벗어나면:
+
+```text
+STATUS: BLOCKED
+REASON: INVALID_MAX_ITERATIONS
+```
+
 각 phase별 Reviewer attempt를 iteration으로 센다.
 최대치를 넘기면 추가 Dispatch를 만들지 않는다.
 
@@ -491,6 +539,8 @@ Coordinator는 직접 production code를 수정하지 않는다.
 2. 각 phase/iteration에 필요한 Worker/Reviewer Task/Dispatch가 Orca state에 존재하는지 확인한다.
 3. unresolved Blocking Finding이 없는지 확인한다.
 4. 마지막 test/validation 결과를 확인한다.
+5. 모든 settled Worker/Reviewer Dispatch가 reuse, retain 또는 release로 account되었는지 확인한다.
+6. retain된 terminal이 있다면 사용자 요청과 retain 사유를 최종 보고에 기록한다.
 
 최종 보고:
 
@@ -523,6 +573,8 @@ Real Orca Run/Task/Dispatch provenance required
 Load version-matched Orca orchestration guide before orchestration commands
 Load version-matched Orca CLI guide before terminal lifecycle commands
 Never guess Orca CLI grammar
+Every settled worker terminal → immediate reuse, explicit retain, or release
+Never leave a completed worker live indefinitely
 Specialized phase combinations must be explicitly supported
 Reviewer never fixes its own findings
 Reviewer FAIL → new Worker correction dispatch

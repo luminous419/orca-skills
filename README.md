@@ -108,6 +108,32 @@ The orchestration variant intentionally does **not** silently fall back to the l
 
 See [`INSTALL.md`](INSTALL.md).
 
+## Validation
+
+Run the repository validator from the repository root:
+
+```bash
+python3 scripts/validate_skills.py
+python3 -m unittest scripts/test_validate_skills.py
+```
+
+The validator uses only the Python standard library and validates both
+`orca-worker-reviewer-loop` and `orca-worker-reviewer-orchestration`. It checks:
+
+- `SKILL.md` YAML frontmatter
+- required phase templates and review policies
+- phase routing against the files on disk
+- identical shared `templates/` and `reviews/` content across both skills
+- absence of user-specific absolute paths
+- required error codes, test gates, and the `max-iterations` range
+
+The command exits with status `0` when all checks pass and a non-zero status with
+actionable error messages when an inconsistency is found.
+
+The regression tests run the validator against disposable repository copies and
+verify that a valid repository passes while a missing required error code and
+shared-template drift are rejected.
+
 ## Execution-layer Difference
 
 The two skills intentionally share development policy but differ in execution mechanics:
