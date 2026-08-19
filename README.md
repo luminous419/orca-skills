@@ -114,7 +114,7 @@ Run the repository validator from the repository root:
 
 ```bash
 python3 scripts/validate_skills.py
-python3 -m unittest scripts/test_validate_skills.py
+python3 -m unittest scripts/test_validate_skills.py scripts/test_policy_smoke.py
 ```
 
 The validator uses only the Python standard library and validates both
@@ -133,6 +133,16 @@ actionable error messages when an inconsistency is found.
 The regression tests run the validator against disposable repository copies and
 verify that a valid repository passes while a missing required error code and
 shared-template drift are rejected.
+
+The policy smoke tests load the identical `policy-contract` JSON embedded in both
+`SKILL.md` files and evaluate representative invocations without launching Orca
+or an agent. They cover help mode, agent gates, iteration bounds, phase ordering,
+unknown phases, phase conflicts, specialized combinations, explicit/default
+parameter priority, representative natural-language phase terms, valid paths,
+and cross-skill decision parity. Natural-language Worker, Reviewer, and
+max-iterations instructions—as well as free-form phase requests outside declared
+terms—remain Coordinator/LLM responsibilities rather than deterministic parser
+behavior.
 
 ## Execution-layer Difference
 

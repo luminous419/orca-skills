@@ -144,6 +144,73 @@ DEFAULT_MAX_ITERATIONS = 5
 → phases=design,implementation
 ```
 
+## Machine-Readable Policy Contract
+
+다음 JSON block은 deterministic policy smoke test의 source of truth다.
+사람이 읽는 위/아래의 정책 설명과 의미가 일치해야 하며 두 Skill에서 동일하게 유지한다.
+자유 형식 자연어의 전체 의미 해석은 여전히 Coordinator/LLM의 책임이고,
+여기에는 대표적인 명시 phase 표현만 machine-readable term으로 정의한다.
+자연어 Worker/Reviewer/max-iterations 지시는 deterministic helper가 해석하지 않으며 Coordinator/LLM이 판정한다.
+
+```policy-contract
+{
+  "schema_version": 1,
+  "help": {
+    "tokens": ["help", "--help", "-h", "usage"],
+    "empty_request": true
+  },
+  "defaults": {
+    "worker": "claude-glm",
+    "reviewer": "claude-gemma",
+    "max_iterations": 5
+  },
+  "natural_language_automation": {
+    "deterministic_representative_terms_for": ["phases"],
+    "llm_interpretation_required_for": [
+      "worker",
+      "reviewer",
+      "max-iterations",
+      "free-form phase requests"
+    ]
+  },
+  "agent_allowlist": ["claude-glm", "claude-gemma"],
+  "max_iterations": {
+    "min": 1,
+    "max": 10
+  },
+  "sequential_phases": [
+    "analysis",
+    "plan",
+    "design",
+    "implementation",
+    "test"
+  ],
+  "specialized_phases": ["bugfix", "refactoring"],
+  "supported_specialized_combinations": [
+    ["bugfix"],
+    ["refactoring"]
+  ],
+  "natural_language_phase_terms": {
+    "analysis": ["analysis", "분석"],
+    "plan": ["plan", "계획"],
+    "design": ["design", "설계"],
+    "implementation": ["implementation", "implement", "구현"],
+    "test": ["test", "테스트"],
+    "bugfix": ["bugfix", "bug fix", "버그 수정"],
+    "refactoring": ["refactoring", "refactor", "리팩터링"]
+  },
+  "errors": {
+    "agent_not_allowed": "AGENT_NOT_ALLOWED",
+    "worker_reviewer_must_differ": "WORKER_REVIEWER_MUST_DIFFER",
+    "invalid_max_iterations": "INVALID_MAX_ITERATIONS",
+    "invalid_phase": "INVALID_PHASE",
+    "invalid_phase_order": "INVALID_PHASE_ORDER",
+    "phase_conflict": "PHASE_CONFLICT",
+    "unsupported_phase_combination": "UNSUPPORTED_PHASE_COMBINATION"
+  }
+}
+```
+
 ## 5. Agent Allowlist
 
 runtime agent command는 allowlist 기반으로 제한한다.
@@ -247,6 +314,13 @@ IMPLEMENTATION
 TEST
 BUGFIX
 REFACTORING
+```
+
+명시적 `phases=`의 각 값은 위 지원 phase 중 하나여야 한다. 알 수 없는 phase가 포함되면:
+
+```text
+STATUS: BLOCKED
+REASON: INVALID_PHASE
 ```
 
 ### Sequential Development Phases

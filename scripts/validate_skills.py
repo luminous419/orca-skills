@@ -7,6 +7,8 @@ import re
 import sys
 from pathlib import Path
 
+from skill_policy import PolicyContractError, load_policy_contract
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SKILL_DIRS = (
@@ -44,6 +46,7 @@ REQUIRED_ERROR_CODES = (
     "AGENT_NOT_ALLOWED",
     "WORKER_REVIEWER_MUST_DIFFER",
     "AGENT_COMMAND_NOT_FOUND",
+    "INVALID_PHASE",
     "INVALID_PHASE_ORDER",
     "UNSUPPORTED_PHASE_COMBINATION",
     "PHASE_CONFLICT",
@@ -263,6 +266,136 @@ def validate_policy_contracts(validation: Validation, skill_dir: Path) -> None:
     )
 
 
+def validate_machine_readable_contracts(validation: Validation) -> None:
+    contracts: list[tuple[Path, dict[str, object]]] = []
+    for skill_dir in SKILL_DIRS:
+        skill_path = skill_dir / "SKILL.md"
+        skill_text = skill_path.read_text(encoding="utf-8")
+        try:
+            contract = load_policy_contract(skill_path)
+        except (OSError, PolicyContractError) as exc:
+            validation.check(False, str(exc))
+            continue
+        contracts.append((skill_dir, contract))
+
+        validation.check(
+            contract.get("schema_version") == 1,
+            f"{skill_dir.name}: unsupported policy contract schema",
+        )
+        validation.check(
+            contract.get("sequential_phases")
+            == [phase.casefold() for phase in PHASE_ROUTES if phase not in {"BUGFIX", "REFACTORING"}],
+            f"{skill_dir.name}: contract sequential phases do not match phase routing",
+        )
+        validation.check(
+            contract.get("specialized_phases") == ["bugfix", "refactoring"],
+            f"{skill_dir.name}: contract specialized phases are invalid",
+        )
+        validation.check(
+            contract.get("supported_specialized_combinations")
+            == [["bugfix"], ["refactoring"]],
+            f"{skill_dir.name}: contract specialized combinations are invalid",
+        )
+        validation.check(
+            contract.get("natural_language_automation")
+            == {
+                "deterministic_representative_terms_for": ["phases"],
+                "llm_interpretation_required_for": [
+                    "worker",
+                    "reviewer",
+                    "max-iterations",
+                    "free-form phase requests",
+                ],
+            },
+            f"{skill_dir.name}: natural-language automation scope is invalid",
+        )
+
+        raw_defaults = contract.get("defaults", {})
+        defaults = raw_defaults if isinstance(raw_defaults, dict) else {}
+        raw_allowlist = contract.get("agent_allowlist", [])
+        allowlist = raw_allowlist if isinstance(raw_allowlist, list) else []
+        validation.check(
+            defaults.get("worker") in allowlist
+            and defaults.get("reviewer") in allowlist
+            and defaults.get("worker") != defaults.get("reviewer"),
+            f"{skill_dir.name}: contract agent defaults/allowlist are inconsistent",
+        )
+        validation.check(
+            f"DEFAULT_WORKER = {defaults.get('worker')}" in skill_text
+            and f"DEFAULT_REVIEWER = {defaults.get('reviewer')}" in skill_text
+            and f"DEFAULT_MAX_ITERATIONS = {defaults.get('max_iterations')}"
+            in skill_text,
+            f"{skill_dir.name}: human-readable defaults differ from contract",
+        )
+
+        allowlist_match = re.search(
+            r"기본 allowlist:\s*```text\s*(?P<values>.*?)\s*```",
+            skill_text,
+            re.DOTALL,
+        )
+        documented_allowlist = (
+            [
+                line.strip()
+                for line in allowlist_match.group("values").splitlines()
+                if line.strip()
+            ]
+            if allowlist_match
+            else []
+        )
+        validation.check(
+            documented_allowlist == allowlist,
+            f"{skill_dir.name}: human-readable allowlist differs from contract",
+        )
+        raw_iteration_range = contract.get("max_iterations", {})
+        iteration_range = (
+            raw_iteration_range if isinstance(raw_iteration_range, dict) else {}
+        )
+        validation.check(
+            iteration_range.get("min") == 1
+            and iteration_range.get("max") == 10
+            and iteration_range["min"]
+            <= defaults.get("max_iterations", 0)
+            <= iteration_range["max"],
+            f"{skill_dir.name}: contract max-iterations values are inconsistent",
+        )
+        validation.check(
+            bool(
+                re.search(
+                    rf"{iteration_range.get('min')}\s*<=\s*max-iterations\s*<=\s*{iteration_range.get('max')}",
+                    skill_text,
+                )
+            ),
+            f"{skill_dir.name}: human-readable max-iterations range differs from contract",
+        )
+
+        raw_errors = contract.get("errors", {})
+        errors = raw_errors if isinstance(raw_errors, dict) else {}
+        required_error_keys = {
+            "agent_not_allowed",
+            "worker_reviewer_must_differ",
+            "invalid_max_iterations",
+            "invalid_phase",
+            "invalid_phase_order",
+            "phase_conflict",
+            "unsupported_phase_combination",
+        }
+        validation.check(
+            set(errors) == required_error_keys
+            and set(errors.values()).issubset(REQUIRED_ERROR_CODES),
+            f"{skill_dir.name}: contract error mapping is incomplete or invalid",
+        )
+        validation.check(
+            all(f"REASON: {error_code}" in skill_text for error_code in errors.values()),
+            f"{skill_dir.name}: human-readable error mapping differs from contract",
+        )
+
+    if len(contracts) == len(SKILL_DIRS):
+        validation.check(
+            contracts[0][1] == contracts[1][1],
+            "machine-readable policy contracts differ between skills",
+        )
+
+
 def main() -> int:
     validation = Validation()
 
@@ -285,6 +418,7 @@ def main() -> int:
         validate_policy_contracts(validation, skill_dir)
 
     validate_shared_directories(validation)
+    validate_machine_readable_contracts(validation)
     validate_no_user_absolute_paths(validation)
 
     if validation.errors:
