@@ -31,6 +31,7 @@ TOP_LEVEL_FILES = (
     "LICENSE-DECISION.md",
 )
 INCLUDED_ROOTS = (".github", "scripts", *SKILL_NAMES)
+EXECUTABLE_FILES = frozenset({"scripts/fake_bin/codex"})
 FORBIDDEN_PARTS = {
     ".git",
     "artifacts",
@@ -72,6 +73,10 @@ def required_skill_paths(skill_name: str) -> set[str]:
     return paths
 
 
+def archive_mode(relative_path: str) -> int:
+    return 0o755 if relative_path in EXECUTABLE_FILES else 0o644
+
+
 def release_files(root: Path = REPO_ROOT) -> tuple[Path, ...]:
     files = [root / name for name in TOP_LEVEL_FILES]
     for relative_root in INCLUDED_ROOTS:
@@ -111,6 +116,15 @@ def verify_source_tree(root: Path = REPO_ROOT) -> tuple[Path, ...]:
     unexpected = sorted(packaged_skill_files - required)
     if unexpected:
         raise PackageError(f"unexpected Skill package files: {', '.join(unexpected)}")
+
+    missing_executables = sorted(EXECUTABLE_FILES - relative_files)
+    if missing_executables:
+        raise PackageError(
+            f"missing executable release files: {', '.join(missing_executables)}"
+        )
+    for relative in EXECUTABLE_FILES:
+        if not ((root / relative).stat().st_mode & 0o111):
+            raise PackageError(f"release executable lacks execute permission: {relative}")
 
     for relative in relative_files:
         parts = Path(relative).parts

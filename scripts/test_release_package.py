@@ -5,12 +5,19 @@ from __future__ import annotations
 
 import hashlib
 import shutil
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
 
 from build_release import build_archive
-from release_manifest import PackageError, REPO_ROOT, verify_source_tree
+from release_manifest import (
+    EXECUTABLE_FILES,
+    PackageError,
+    REPO_ROOT,
+    read_version,
+    verify_source_tree,
+)
 from verify_package import verify_archive
 
 
@@ -29,10 +36,19 @@ class ReleasePackageTests(unittest.TestCase):
             build_archive(first)
             build_archive(second)
             verify_archive(first)
+            with tarfile.open(first, mode="r:gz") as archive:
+                shim = archive.getmember(
+                    f"orca-skills-{read_version()}/scripts/fake_bin/codex"
+                )
+            self.assertEqual(shim.mode, 0o755)
             self.assertEqual(
                 hashlib.sha256(first.read_bytes()).digest(),
                 hashlib.sha256(second.read_bytes()).digest(),
             )
+
+    def test_executable_manifest_matches_runtime_shim(self) -> None:
+        self.assertEqual(EXECUTABLE_FILES, {"scripts/fake_bin/codex"})
+        self.assertTrue((REPO_ROOT / "scripts/fake_bin/codex").stat().st_mode & 0o111)
 
     def test_missing_required_skill_file_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

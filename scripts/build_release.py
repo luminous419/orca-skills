@@ -9,7 +9,7 @@ import io
 import tarfile
 from pathlib import Path
 
-from release_manifest import REPO_ROOT, read_version, verify_source_tree
+from release_manifest import REPO_ROOT, archive_mode, read_version, verify_source_tree
 
 
 def build_archive(output: Path, root: Path = REPO_ROOT) -> Path:
@@ -26,7 +26,7 @@ def build_archive(output: Path, root: Path = REPO_ROOT) -> Path:
                     data = path.read_bytes()
                     info = tarfile.TarInfo(f"{archive_root}/{relative}")
                     info.size = len(data)
-                    info.mode = 0o644
+                    info.mode = archive_mode(relative)
                     info.mtime = 0
                     info.uid = 0
                     info.gid = 0

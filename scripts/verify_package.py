@@ -7,7 +7,13 @@ import argparse
 import tarfile
 from pathlib import Path, PurePosixPath
 
-from release_manifest import REPO_ROOT, PackageError, read_version, verify_source_tree
+from release_manifest import (
+    REPO_ROOT,
+    PackageError,
+    archive_mode,
+    read_version,
+    verify_source_tree,
+)
 
 
 def verify_archive(archive_path: Path, root: Path = REPO_ROOT) -> None:
@@ -42,7 +48,14 @@ def verify_archive(archive_path: Path, root: Path = REPO_ROOT) -> None:
             raise PackageError(f"unsafe archive path: {member.name}")
         if not member.isfile():
             raise PackageError(f"archive member is not a regular file: {member.name}")
-        if member.mtime != 0 or member.uid != 0 or member.gid != 0 or member.mode != 0o644:
+        relative = member.name.removeprefix(f"{expected_root}/")
+        expected_mode = archive_mode(relative)
+        if (
+            member.mtime != 0
+            or member.uid != 0
+            or member.gid != 0
+            or member.mode != expected_mode
+        ):
             raise PackageError(f"non-deterministic archive metadata: {member.name}")
         if archived_data.get(member.name) != expected[member.name].read_bytes():
             raise PackageError(f"archive content differs from source: {member.name}")
