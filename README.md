@@ -191,8 +191,11 @@ third-party Python dependencies.
 
 CI intentionally does not run Orca Desktop/runtime integration or real
 `claude-glm`/`claude-gemma` agents. Orca integration remains the opt-in local command
-above. The real GLM/Gemma smoke test is **BLOCKED / NOT YET VERIFIED**, so a stable
-production-ready release is not claimed.
+above. Real GLM/Gemma smoke testing is **VERIFIED in the tested company environment on
+Orca 1.4.178-rc.2**; see the
+[`Step 5 report`](STEP5_REAL_GLM_GEMMA_SMOKE_REPORT.md). This is a point verification,
+not a claim of compatibility across an Orca version range. A stable production-ready
+release is not yet claimed because the license decision remains open.
 
 Build and verify the deterministic release archive locally with:
 

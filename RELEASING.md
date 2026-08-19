@@ -10,7 +10,9 @@ read it from that file when building a release.
 - **MINOR**: a backward-compatible phase or policy capability, review policy, or supported runtime capability.
 - **PATCH**: documentation, validator/test improvements, non-breaking prompt refinement, or bug fixes.
 
-The project remains pre-1.0 while real GLM/Gemma smoke testing is not verified. Pre-1.0
+The project remains pre-1.0 pending the license decision and an explicit final stable
+release review. Real GLM/Gemma smoke testing has been verified only in the environment
+documented in `COMPATIBILITY.md`; it is not a general Orca-version support claim. Pre-1.0
 minor releases may contain contract changes, which must be called out prominently in the
 changelog.
 
