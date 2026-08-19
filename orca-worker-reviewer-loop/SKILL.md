@@ -370,7 +370,7 @@ TEST:
 
 BUGFIX:
 - Worker template: `templates/bugfix.md`
-- Reviewer policy: `reviews/common.md` + `reviews/implementation.md`
+- Reviewer policy: `reviews/common.md` + `reviews/bugfix.md`
 
 REFACTORING:
 - Worker template: `templates/refactoring.md`
@@ -712,12 +712,11 @@ STATUS: ESCALATED
 
 ## 20. Mandatory Unit Test Policy
 
-Production code를 변경하는 다음 작업에서는 Unit Test가 필수다.
+Production code를 변경하는 다음 작업에서는 대응 Unit Test 추가/수정과 실행이 필수다.
 
 ```text
 IMPLEMENTATION
 BUGFIX
-REFACTORING
 ```
 
 완료 조건:
@@ -733,6 +732,9 @@ Test PASS
 ```
 
 Unit Test 없이 production code만 변경해서는 안 된다.
+
+REFACTORING은 behavior preservation과 relevant existing Unit Test 실행/PASS가 필수다.
+새 테스트 추가/수정은 기존 테스트만으로 preservation evidence가 충분하지 않을 때 필요하다.
 
 ## 21. BUGFIX Regression Test
 
@@ -895,8 +897,9 @@ Worker != Reviewer
 Worker Session != Reviewer Session
 Reviewer = Review / Decide only
 Reviewer FAIL → Return to Worker
-Production code change → Unit Test required
+IMPLEMENTATION production code change → Unit Test add/modify required
 BUGFIX → Regression Test required
+REFACTORING → relevant existing Unit Test execution + conditional test changes
 No required Unit Test → FAIL
 Agent command → allowlist only
 Agent resolution → PATH based

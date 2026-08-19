@@ -364,7 +364,7 @@ PLAN           → templates/plan.md           + reviews/common.md + reviews/pla
 DESIGN         → templates/design.md         + reviews/common.md + reviews/design.md
 IMPLEMENTATION → templates/implementation.md + reviews/common.md + reviews/implementation.md
 TEST           → templates/test.md           + reviews/common.md + reviews/test.md
-BUGFIX         → templates/bugfix.md         + reviews/common.md + reviews/implementation.md
+BUGFIX         → templates/bugfix.md         + reviews/common.md + reviews/bugfix.md
 REFACTORING    → templates/refactoring.md    + reviews/common.md + reviews/refactoring.md
 ```
 
@@ -579,6 +579,7 @@ REFACTORING:
 ```text
 Behavior preservation
 + relevant Unit Test execution
++ Add/Modify Unit Test only if existing evidence is insufficient
 + PASS
 ```
 
@@ -653,8 +654,9 @@ Specialized phase combinations must be explicitly supported
 Reviewer never fixes its own findings
 Reviewer FAIL → new Worker correction dispatch
 Current phase PASS required before next phase
-Production code change → Unit Test required
+IMPLEMENTATION production code change → Unit Test add/modify required
 BUGFIX → Regression Test required
+REFACTORING → relevant existing Unit Test execution + conditional test changes
 Agent command → allowlist + PATH based
 No silent fallback to direct-session loop
 ```
