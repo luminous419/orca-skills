@@ -120,6 +120,26 @@ class FakeAgentE2ETests(unittest.TestCase):
                         result.reason.startswith("MALFORMED_REVIEWER_OUTPUT:")
                     )
 
+    def test_pass_with_non_blocking_finding_is_valid(self) -> None:
+        scenario = FakeScenario(
+            ("complete",),
+            ("pass-nonblocking",),
+            reviewer_findings=(("R1",),),
+        )
+        for result in self.assert_for_both(scenario):
+            self.assertEqual(result.final_status, "COMPLETED")
+            self.assertEqual(result.findings, {})
+
+    def test_pass_with_blocking_finding_is_malformed(self) -> None:
+        scenario = FakeScenario(
+            ("complete",),
+            ("pass-blocking",),
+            reviewer_findings=(("R1",),),
+        )
+        for result in self.assert_for_both(scenario):
+            self.assertEqual(result.final_status, "ERROR")
+            self.assertTrue(result.reason.startswith("MALFORMED_REVIEWER_OUTPUT:"))
+
     def test_scenario_g_worker_unexpected_exit_skips_reviewer(self) -> None:
         scenario = FakeScenario(("exit",), ())
         for result in self.assert_for_both(scenario):
@@ -204,6 +224,28 @@ class FakeAgentE2ETests(unittest.TestCase):
             self.assertEqual(result.final_status, "ERROR")
             self.assertEqual(result.reason, "FINDING_RESOLUTION_TRACE_INCOMPLETE")
             self.assertEqual(len(result.reviewer_attempts), 1)
+
+    def test_only_previous_blocking_findings_require_resolution(self) -> None:
+        scenario = FakeScenario(
+            worker_modes=("complete", "correction", "correction"),
+            reviewer_modes=("fail", "fail", "pass"),
+            reviewer_findings=(("R1", "R2"), ("R2",), ()),
+            worker_resolutions=(
+                {},
+                {"R1": "RESOLVED", "R2": "DISPUTED"},
+                {"R2": "RESOLVED"},
+            ),
+        )
+        for result in self.assert_for_both(scenario, max_iterations=3):
+            self.assertEqual(result.final_status, "COMPLETED")
+            self.assertEqual(set(result.findings), {"R1", "R2"})
+            self.assertEqual(result.findings["R1"].reviewer_iterations, [1])
+            self.assertEqual(result.findings["R2"].reviewer_iterations, [1, 2])
+            self.assertEqual(result.findings["R1"].resolutions, [(2, "RESOLVED")])
+            self.assertEqual(
+                result.findings["R2"].resolutions,
+                [(2, "DISPUTED"), (3, "RESOLVED")],
+            )
 
     def test_two_skills_have_identical_results_for_shared_scenarios(self) -> None:
         scenarios = (

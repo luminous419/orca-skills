@@ -20,6 +20,9 @@ from scripts.workflow_contract import (
 SCRIPT_DIR = Path(__file__).resolve().parent
 FIELD_LINE = re.compile(r"(?m)^(?P<field>[A-Z_]+):\s*(?P<value>[A-Z_]+)\s*$")
 FINDING_LINE = re.compile(r"(?m)^ID:\s*(?P<id>[A-Za-z][A-Za-z0-9_-]*)\s*$")
+SECTION = re.compile(
+    r"(?ms)^##\s+(?P<title>[^\n]+)\s*\n(?P<body>.*?)(?=^##\s+|\Z)"
+)
 RESOLUTION_LINE = re.compile(
     r"(?m)^FINDING\s+(?P<id>[A-Za-z][A-Za-z0-9_-]*):\s*(?P<status>[A-Z_]+)\s*$"
 )
@@ -105,7 +108,14 @@ def parse_reviewer_output(
         contract.reviewer_field,
         {contract.reviewer_pass, contract.reviewer_fail},
     )
-    findings = tuple(match.group("id") for match in FINDING_LINE.finditer(output))
+    sections = {
+        match.group("title").strip(): match.group("body")
+        for match in SECTION.finditer(output)
+    }
+    blocking_body = sections.get("Blocking Findings", "")
+    findings = tuple(
+        match.group("id") for match in FINDING_LINE.finditer(blocking_body)
+    )
     if len(findings) != len(set(findings)):
         raise OutputContractError("duplicate finding identity")
     if result == contract.reviewer_fail and not findings:
@@ -164,6 +174,7 @@ class E2EHarness:
         worker_attempts: list[AgentAttempt] = []
         reviewer_attempts: list[AgentAttempt] = []
         finding_traces: dict[str, FindingTrace] = {}
+        previous_blocking_findings: set[str] = set()
 
         for iteration in range(1, self.max_iterations + 1):
             if iteration > len(scenario.worker_modes):
@@ -237,8 +248,8 @@ class E2EHarness:
                     reason="WORKER_BLOCKED",
                 )
 
-            if finding_traces:
-                if set(parsed_resolutions) != set(finding_traces):
+            if previous_blocking_findings:
+                if set(parsed_resolutions) != previous_blocking_findings:
                     return self._error(
                         iteration,
                         "FINDING_RESOLUTION_TRACE_INCOMPLETE",
@@ -342,6 +353,7 @@ class E2EHarness:
                     finding_id, FindingTrace(finding_id, iteration)
                 )
                 trace.reviewer_iterations.append(iteration)
+            previous_blocking_findings = set(parsed_findings)
 
         return WorkflowResult(
             current_phase=self.phase,

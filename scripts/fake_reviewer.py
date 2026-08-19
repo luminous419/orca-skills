@@ -35,14 +35,23 @@ def main() -> int:
     else:
         mode = args.mode
 
-    if mode == "pass":
+    findings = json.loads(args.findings_json)
+    if mode in {"pass", "pass-nonblocking", "pass-blocking"}:
         print(f"# Review Result\n\n{args.field}: {args.pass_value}")
         print(f"ITERATION: {args.iteration}")
+        if mode == "pass-blocking":
+            print("\n## Blocking Findings")
+        elif mode == "pass-nonblocking":
+            print("\n## Blocking Findings\n(none)")
+            print("\n## Non-Blocking Findings")
+        for finding_id in findings:
+            print(f"ID: {finding_id}")
+            print("Severity: MINOR")
+            print("Issue: deterministic finding")
         return 0
     if mode != "fail":
         return 2
 
-    findings = json.loads(args.findings_json)
     print(f"# Review Result\n\n{args.field}: {args.fail_value}")
     print(f"ITERATION: {args.iteration}")
     print("\n## Blocking Findings")
