@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 from skill_policy import PolicyContractError, load_policy_contract
+from workflow_contract import WorkflowContractError, load_workflow_output_contract
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -396,6 +397,29 @@ def validate_machine_readable_contracts(validation: Validation) -> None:
         )
 
 
+def validate_workflow_output_contracts(validation: Validation) -> None:
+    contracts = []
+    for skill_dir in SKILL_DIRS:
+        skill_path = skill_dir / "SKILL.md"
+        try:
+            contract = load_workflow_output_contract(skill_path)
+        except (OSError, WorkflowContractError) as exc:
+            validation.check(False, str(exc))
+            continue
+        contracts.append(contract)
+        validation.check(
+            contract.finding_resolution_values
+            == ("RESOLVED", "DISPUTED", "BLOCKED"),
+            f"{skill_dir.name}: invalid finding resolution contract",
+        )
+
+    if len(contracts) == len(SKILL_DIRS):
+        validation.check(
+            contracts[0] == contracts[1],
+            "Worker/Reviewer output contracts differ between skills",
+        )
+
+
 def main() -> int:
     validation = Validation()
 
@@ -419,6 +443,7 @@ def main() -> int:
 
     validate_shared_directories(validation)
     validate_machine_readable_contracts(validation)
+    validate_workflow_output_contracts(validation)
     validate_no_user_absolute_paths(validation)
 
     if validation.errors:
