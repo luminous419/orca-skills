@@ -84,6 +84,21 @@ class ValidatorRegressionTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("templates/analysis.md differs between skills", result.stdout)
 
+    def test_human_readable_default_drift_fails(self) -> None:
+        skill_path = (
+            self.repo_root / "orca-worker-reviewer-orchestration" / "SKILL.md"
+        )
+        text = skill_path.read_text(encoding="utf-8")
+        skill_path.write_text(
+            text.replace("DEFAULT_MAX_ITERATIONS = 5", "DEFAULT_MAX_ITERATIONS = 6", 1),
+            encoding="utf-8",
+        )
+
+        result = self.run_validator()
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("human-readable defaults differ from contract", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

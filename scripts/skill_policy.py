@@ -179,6 +179,19 @@ def evaluate_invocation(skill_path: Path, invocation: str) -> PolicyDecision:
             if phase.strip()
         )
         phase_source = "explicit"
+        known_phases = {
+            *contract["sequential_phases"],
+            *contract["specialized_phases"],
+        }
+        if any(phase not in known_phases for phase in phases):
+            return _blocked(
+                errors["invalid_phase"],
+                worker=worker,
+                reviewer=reviewer,
+                max_iterations=max_iterations,
+                phases=phases,
+                phase_source=phase_source,
+            )
         if any(phase not in phases for phase in natural_phases):
             return _blocked(
                 errors["phase_conflict"],

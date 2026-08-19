@@ -83,6 +83,14 @@ class PolicySmokeTests(unittest.TestCase):
                     "INVALID_PHASE_ORDER",
                 )
 
+    def test_unknown_explicit_phase_is_blocked(self) -> None:
+        for phases in ("unknown", "design,unknown"):
+            with self.subTest(phases=phases):
+                self.assert_blocked(
+                    f" phases={phases} 요청",
+                    "INVALID_PHASE",
+                )
+
     def test_explicit_and_natural_language_phase_conflict(self) -> None:
         self.assert_blocked(
             " phases=design,implementation 테스트까지 명시적으로 수행해줘",
@@ -121,7 +129,7 @@ class PolicySmokeTests(unittest.TestCase):
         self.assert_valid(" phases=bugfix 요청", ("bugfix",))
         self.assert_valid(" phases=refactoring 요청", ("refactoring",))
 
-    def test_parameter_priority(self) -> None:
+    def test_parameter_priority_within_deterministic_scope(self) -> None:
         for skill_path in SKILL_PATHS:
             with self.subTest(skill=skill_path.parent.name, source="explicit"):
                 decision = self.evaluate(
@@ -152,6 +160,24 @@ class PolicySmokeTests(unittest.TestCase):
                 self.assertEqual(decision.reviewer, "claude-gemma")
                 self.assertEqual(decision.max_iterations, 5)
 
+    def test_non_phase_natural_language_parameters_remain_llm_owned(self) -> None:
+        for skill_path in SKILL_PATHS:
+            with self.subTest(skill=skill_path.parent.name):
+                contract = load_policy_contract(skill_path)
+                scope = contract["natural_language_automation"]
+                self.assertEqual(
+                    scope["deterministic_representative_terms_for"], ["phases"]
+                )
+                self.assertEqual(
+                    scope["llm_interpretation_required_for"],
+                    [
+                        "worker",
+                        "reviewer",
+                        "max-iterations",
+                        "free-form phase requests",
+                    ],
+                )
+
     def test_two_skills_have_identical_contracts(self) -> None:
         contracts = [load_policy_contract(path) for path in SKILL_PATHS]
         self.assertEqual(contracts[0], contracts[1])
@@ -164,6 +190,8 @@ class PolicySmokeTests(unittest.TestCase):
             " max-iterations=0 phases=analysis 요청",
             " max-iterations=11 phases=analysis 요청",
             " max-iterations=many phases=analysis 요청",
+            " phases=unknown 요청",
+            " phases=design,unknown 요청",
             " phases=implementation,design 요청",
             " phases=test,implementation 요청",
             " phases=design,implementation 테스트까지 수행해줘",

@@ -137,9 +137,12 @@ shared-template drift are rejected.
 The policy smoke tests load the identical `policy-contract` JSON embedded in both
 `SKILL.md` files and evaluate representative invocations without launching Orca
 or an agent. They cover help mode, agent gates, iteration bounds, phase ordering,
-phase conflicts, specialized combinations, parameter priority, valid paths, and
-cross-skill decision parity. Free-form requests that do not contain a declared
-phase term remain explicitly marked for Coordinator/LLM classification.
+unknown phases, phase conflicts, specialized combinations, explicit/default
+parameter priority, representative natural-language phase terms, valid paths,
+and cross-skill decision parity. Natural-language Worker, Reviewer, and
+max-iterations instructions—as well as free-form phase requests outside declared
+terms—remain Coordinator/LLM responsibilities rather than deterministic parser
+behavior.
 
 ## Execution-layer Difference
 
