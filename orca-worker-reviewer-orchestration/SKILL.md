@@ -224,23 +224,16 @@ Worker session != Reviewer session
 #### 1. Immediate worker reuse
 
 동일한 agent가 즉시 수행할 후속 Task가 있으면 완료된 Dispatch에서 agent terminal handle을 확인하고,
-그 terminal을 새 Dispatch로 이전한다.
-
-```text
-<ORCA> orchestration worker-show --dispatch <dispatch_id> --json
-<ORCA> orchestration worker-start --task <next_task_id> --terminal <handle> --json
-```
+현재 version-matched orchestration guide의 worker inspection/reuse 절차에 따라 그 terminal의 cleanup ownership을
+새 Dispatch로 이전한다.
 
 reuse는 같은 session에서 Worker와 Reviewer 역할을 바꾸는 것을 허용하지 않는다.
 동일 역할의 동일 agent가 즉시 이어지는 correction 또는 re-review Task를 수행하는 경우에만 사용한다.
 
 #### 2. Worker release
 
-즉시 재사용하지 않는 succeeded/failed `worker_done`은 다음 명령으로 release한다.
-
-```text
-<ORCA> orchestration worker-release --dispatch <dispatch_id> --json
-```
+즉시 재사용하지 않는 succeeded/failed `worker_done`은 현재 version-matched orchestration guide의
+`worker-release` 절차로 release한다.
 
 `worker-release`는 cancellation이 아니라 post-completion cleanup이다. Orca가 inspectable output을 보존한 뒤
 해당 settled Dispatch가 소유한 terminal만 정리하도록 맡긴다. Coordinator는 이를 임의의
@@ -249,10 +242,7 @@ reuse는 같은 session에서 Worker와 Reviewer 역할을 바꾸는 것을 허�
 #### 3. Explicit worker retain
 
 사용자가 debugging을 위해 completed worker를 live 상태로 유지해 달라고 명시한 경우에만 retain한다.
-
-```text
-<ORCA> orchestration worker-retain --dispatch <dispatch_id> --json
-```
+현재 version-matched orchestration guide의 `worker-retain` 절차를 사용한다.
 
 retain 사유를 최종 보고에 기록한다. 보존 필요가 끝나면 같은 Dispatch를 `worker-release`에 전달하여 정리한다.
 
@@ -263,6 +253,7 @@ retain 사유를 최종 보고에 기록한다. 보존 필요가 끝나면 같�
 - accepted `worker_done`마다 reuse, retain, release 중 하나를 기록한다.
 - completed worker를 output 확인만을 위해 무기한 live 상태로 방치하지 않는다. release 후에도 output은 orchestration의 worker read 경로로 확인한다.
 - Coordinator는 모든 settled worker terminal의 lifecycle을 account하기 전에는 다음 wait를 시작하거나 최종 완료를 보고하지 않는다.
+- 이 section은 lifecycle policy/invariant만 정의한다. 구체 command/subcommand/flag grammar는 항상 실행 시점에 로드한 version-matched orchestration guide가 우선하며, 이 Skill에서 기억이나 과거 예시를 근거로 재구성하지 않는다.
 
 ## 7. Phase Model
 

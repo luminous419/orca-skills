@@ -114,6 +114,7 @@ Run the repository validator from the repository root:
 
 ```bash
 python3 scripts/validate_skills.py
+python3 -m unittest scripts/test_validate_skills.py
 ```
 
 The validator uses only the Python standard library and validates both
@@ -128,6 +129,10 @@ The validator uses only the Python standard library and validates both
 
 The command exits with status `0` when all checks pass and a non-zero status with
 actionable error messages when an inconsistency is found.
+
+The regression tests run the validator against disposable repository copies and
+verify that a valid repository passes while a missing required error code and
+shared-template drift are rejected.
 
 ## Execution-layer Difference
 
