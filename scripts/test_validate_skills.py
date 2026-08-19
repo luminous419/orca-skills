@@ -31,7 +31,11 @@ class ValidatorRegressionTests(unittest.TestCase):
 
         scripts_dir = self.repo_root / "scripts"
         scripts_dir.mkdir()
-        for filename in ("validate_skills.py", "skill_policy.py"):
+        for filename in (
+            "validate_skills.py",
+            "skill_policy.py",
+            "workflow_contract.py",
+        ):
             shutil.copy2(SOURCE_ROOT / "scripts" / filename, scripts_dir)
 
     def tearDown(self) -> None:
@@ -98,6 +102,21 @@ class ValidatorRegressionTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("human-readable defaults differ from contract", result.stdout)
+
+    def test_workflow_output_contract_drift_fails(self) -> None:
+        skill_path = (
+            self.repo_root / "orca-worker-reviewer-orchestration" / "SKILL.md"
+        )
+        text = skill_path.read_text(encoding="utf-8")
+        skill_path.write_text(
+            text.replace("RESULT: PASS | FAIL", "RESULT: ACCEPT | REJECT"),
+            encoding="utf-8",
+        )
+
+        result = self.run_validator()
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("missing documented choice ['FAIL', 'PASS']", result.stdout)
 
 
 if __name__ == "__main__":

@@ -114,7 +114,7 @@ Run the repository validator from the repository root:
 
 ```bash
 python3 scripts/validate_skills.py
-python3 -m unittest scripts/test_validate_skills.py scripts/test_policy_smoke.py
+python3 -m unittest discover -s scripts -p 'test_*.py'
 ```
 
 The validator uses only the Python standard library and validates both
@@ -143,6 +143,13 @@ and cross-skill decision parity. Natural-language Worker, Reviewer, and
 max-iterations instructions—as well as free-form phase requests outside declared
 terms—remain Coordinator/LLM responsibilities rather than deterministic parser
 behavior.
+
+The fake-agent E2E tests start deterministic Worker and Reviewer subprocesses,
+not Orca or an LLM. A minimal single-phase harness verifies bounded
+Worker → Reviewer iteration, PASS/FAIL transitions, escalation, blocked and
+malformed/exit handling, finding continuity, Reviewer artifact immutability,
+and equivalent shared-policy results for both skills. All workspaces and
+protected production fixtures are disposable temporary directories.
 
 ## Execution-layer Difference
 

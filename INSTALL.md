@@ -36,7 +36,7 @@ Before installing or updating either skill, run:
 
 ```bash
 python3 scripts/validate_skills.py
-python3 -m unittest scripts/test_validate_skills.py scripts/test_policy_smoke.py
+python3 -m unittest discover -s scripts -p 'test_*.py'
 ```
 
 The validator checks both `orca-worker-reviewer-loop` and
@@ -49,7 +49,8 @@ The validator uses only the Python standard library. A successful run ends with
 `Skill validation PASSED` and exits with status `0`. The accompanying regression
 tests confirm that representative broken repository states are rejected and that
 both skills return the same deterministic policy decisions without starting Orca
-or the configured Worker/Reviewer commands.
+or the configured Worker/Reviewer commands. The suite also runs fake-agent E2E
+subprocesses in disposable workspaces; it never invokes a real LLM or Orca runtime.
 
 ## 4. Global Installation — Recommended
 
