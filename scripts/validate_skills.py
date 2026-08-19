@@ -33,7 +33,7 @@ PHASE_ROUTES = {
     "BUGFIX": (
         "templates/bugfix.md",
         "reviews/common.md",
-        "reviews/implementation.md",
+        "reviews/bugfix.md",
     ),
     "REFACTORING": (
         "templates/refactoring.md",
