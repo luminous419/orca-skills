@@ -29,6 +29,7 @@ TOP_LEVEL_FILES = (
     "COMPATIBILITY.md",
     "RELEASING.md",
     "LICENSE-DECISION.md",
+    "STEP5_REAL_GLM_GEMMA_SMOKE_REPORT.md",
 )
 INCLUDED_ROOTS = (".github", "scripts", *SKILL_NAMES)
 EXECUTABLE_FILES = frozenset({"scripts/fake_bin/codex"})

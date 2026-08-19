@@ -1,5 +1,8 @@
 # Step 5 — Real GLM/Gemma Smoke Test 최종 보고
 
+> 이 문서는 실행 당시의 evidence snapshot이다. 이후 release-readiness 판정과 lifecycle
+> clarification은 [`COMPATIBILITY.md`](COMPATIBILITY.md)를 따른다.
+
 > 실행 일자: 2026-08-20
 > 대상 Skill: `orca-worker-reviewer-orchestration`
 > Worker: `claude-glm` / Reviewer: `claude-gemma` / 실제 Orca runtime / 실제 Run·Task·Dispatch·`worker_done` provenance
@@ -7,10 +10,10 @@
 
 ## 1. 실행 환경
 - Machine: 회사 개발 노트북 (darwin 25.4.0)
-- Orca CLI: `/Users/cpp-luminous/Applications/Orca.app/Contents/Resources/bin/orca`
-- Worker: `claude-glm` → `/Users/cpp-luminous/script/claude-glm`
+- Orca CLI: `/Users/<user>/Applications/Orca.app/Contents/Resources/bin/orca`
+- Worker: `claude-glm` → `/Users/<user>/script/claude-glm`
   (Claude Code CLI wrapper, `CLAUDE_CONFIG_DIR=~/.claude-glm`, `--dangerously-skip-permissions`)
-- Reviewer: `claude-gemma` → `/Users/cpp-luminous/script/claude-gemma`
+- Reviewer: `claude-gemma` → `/Users/<user>/script/claude-gemma`
   (동일 구조, `~/.claude-gemma`)
 - Fixture: `/tmp/orca-step5-fixture` — Python stdlib 전용 calculator 프로젝트 + `unittest`
   Orca repo 등록(`a6a11cbd-1964-4bc4-833e-1f3449abfde7`) 후 `step5-smoke` worktree에서 실행.
@@ -26,8 +29,8 @@
   이 runtime을 거부함 — 이는 Step 5로 인한 것이 아니라 환경 조건.
 
 ## 3. command resolution
-- `command -v claude-glm` → `/Users/cpp-luminous/script/claude-glm`
-- `command -v claude-gemma` → `/Users/cpp-luminous/script/claude-gemma`
+- `command -v claude-glm` → `/Users/<user>/script/claude-glm`
+- `command -v claude-gemma` → `/Users/<user>/script/claude-gemma`
 - 서로 다른 executable (inode `208060049` vs `208060223`, sha 상이). 동일 executable 아님.
 
 ## 4. scenario별 결과

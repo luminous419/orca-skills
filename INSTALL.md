@@ -59,9 +59,11 @@ or the configured Worker/Reviewer commands. The suite also runs fake-agent E2E
 subprocesses in disposable workspaces; it never invokes a real LLM or Orca runtime.
 
 The default suite and CI do not start Orca Desktop or real agents. The Step 5
-`claude-glm`/`claude-gemma` smoke test is **BLOCKED / NOT YET VERIFIED** because the
-commands were unavailable in the tested environment. Stable production readiness is
-therefore not claimed.
+`claude-glm`/`claude-gemma` smoke test is **VERIFIED in the tested company environment
+on Orca 1.4.178-rc.2**. See
+[`STEP5_REAL_GLM_GEMMA_SMOKE_REPORT.md`](STEP5_REAL_GLM_GEMMA_SMOKE_REPORT.md) for the
+evidence and [`COMPATIBILITY.md`](COMPATIBILITY.md) for its deliberately narrow scope.
+Stable production readiness is not yet claimed because the license decision remains open.
 
 The optional real-Orca integration suite is separate so Orca availability never
 breaks installation validation. With this checkout registered in a running Orca

@@ -67,6 +67,7 @@ REPOSITORY_DOCS = (
     "COMPATIBILITY.md",
     "RELEASING.md",
     "LICENSE-DECISION.md",
+    "STEP5_REAL_GLM_GEMMA_SMOKE_REPORT.md",
 )
 SEMVER_PATTERN = re.compile(
     r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"

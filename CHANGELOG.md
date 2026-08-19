@@ -10,6 +10,18 @@ are recorded here in a Keep a Changelog-inspired format.
 - GitHub Actions validation across the supported Python versions.
 - Release metadata, compatibility documentation, and distributable-package verification.
 
+### Verified
+
+- Real `claude-glm` Worker and `claude-gemma` Reviewer smoke testing in an isolated
+  company environment on Orca 1.4.178-rc.2.
+- ANALYSIS, DESIGN, IMPLEMENTATION, BUGFIX, DESIGN → IMPLEMENTATION, and an actual
+  Reviewer FAIL → Worker correction → Reviewer PASS path.
+
+### Changed
+
+- Clarified lifecycle accounting when a runtime auto-settles a completed Dispatch before
+  explicit worker release, including separate accounting for residual terminal resources.
+
 ## 0.9.0 - 2026-08-20
 
 ### Added
@@ -27,5 +39,6 @@ are recorded here in a Keep a Changelog-inspired format.
 
 ### Known limitations
 
-- Real `claude-glm` Worker and `claude-gemma` Reviewer smoke testing remains blocked because those PATH commands were unavailable in the Step 5 environment.
-- A stable production-ready release is not yet claimed.
+- Verified Orca 1.4.178-rc.2 and 1.4.184 environments are separate point observations,
+  not a supported version range.
+- A stable production-ready release is not yet claimed; the license decision remains open.

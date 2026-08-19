@@ -286,7 +286,7 @@ Worker session != Reviewer session
 현재 version-matched orchestration guide에 따라 Coordinator는 accepted `worker_done`을 처리한 뒤,
 다음 Delivery를 acknowledge하거나 다시 wait하기 전에 settled worker terminal의 다음 owner를 반드시 결정한다.
 
-허용되는 lifecycle decision은 정확히 다음 세 가지다.
+settled Dispatch가 현재 runtime에서 addressable한 경우 허용되는 lifecycle decision은 정확히 다음 세 가지다.
 
 #### 1. Immediate worker reuse
 
@@ -313,11 +313,33 @@ reuse는 같은 session에서 Worker와 Reviewer 역할을 바꾸는 것을 허�
 
 retain 사유를 최종 보고에 기록한다. 보존 필요가 끝나면 같은 Dispatch를 `worker-release`에 전달하여 정리한다.
 
+#### Runtime-managed auto-settlement
+
+일부 runtime/agent integration은 accepted `worker_done`과 함께 Dispatch를 자동 settlement하여,
+Coordinator가 Delivery를 처리할 때 해당 Dispatch가 이미 release API의 대상이 아니게 만들 수 있다.
+
+이 경우 Coordinator는 다음을 모두 확인한 때에만 runtime-managed settlement로 account한다.
+
+- `worker_done`이 expected Task/Dispatch ID와 일치하고 lifecycle rejection 없이 accepted되었다.
+- 실제 Task/Dispatch provenance에 completed/failed outcome이 남아 있다.
+- 현재 version-matched guide 또는 runtime receipt/state가 Dispatch가 이미 settled되어 더 이상
+  addressable하지 않음을 뒷받침한다.
+
+위 조건이 충족되면 존재하지 않는 Dispatch에 `worker-release`를 반복하거나 Dispatch를 임의로
+재생성하지 않는다. 이는 silent release skip이 아니라 `auto-settled` lifecycle accounting으로 기록한다.
+
+Dispatch settlement와 terminal/resource cleanup은 별도로 account한다. auto-settled Dispatch의 agent
+terminal 또는 다른 owned resource가 남아 있으면 현재 version-matched `orchestration`/`orca-cli` guide와
+runtime receipt가 제공하는 resource cleanup contract를 따른다. 이 Skill은 특정 terminal command를
+universal cleanup grammar로 hard-code하지 않는다.
+
 #### Lifecycle safety
 
 - timeout, TUI idle, heartbeat, status, question, escalation, rejected/stale `worker_done`만으로 worker를 release하지 않는다.
 - `worker-release`가 `release_pending` 또는 `release_unknown`을 반환하면 `terminal close`로 우회하지 않고 receipt의 recovery action을 따른다.
-- accepted `worker_done`마다 reuse, retain, release 중 하나를 기록한다.
+- accepted `worker_done`마다 reuse, retain, release 또는 검증된 auto-settled 상태 중 하나를 기록한다.
+- `dispatch_not_found`와 같은 missing/unaddressable 결과만으로 auto-settlement를 추정하지 않는다. expected `worker_done` acceptance와 Task/Dispatch provenance를 함께 확인한다.
+- Dispatch가 settled되어도 residual terminal/resource가 남아 있으면 별도의 cleanup outcome을 기록한다.
 - completed worker를 output 확인만을 위해 무기한 live 상태로 방치하지 않는다. release 후에도 output은 orchestration의 worker read 경로로 확인한다.
 - Coordinator는 모든 settled worker terminal의 lifecycle을 account하기 전에는 다음 wait를 시작하거나 최종 완료를 보고하지 않는다.
 - 이 section은 lifecycle policy/invariant만 정의한다. 구체 command/subcommand/flag grammar는 항상 실행 시점에 로드한 version-matched orchestration guide가 우선하며, 이 Skill에서 기억이나 과거 예시를 근거로 재구성하지 않는다.

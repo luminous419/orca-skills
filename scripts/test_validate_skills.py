@@ -32,6 +32,7 @@ class ValidatorRegressionTests(unittest.TestCase):
             "COMPATIBILITY.md",
             "RELEASING.md",
             "LICENSE-DECISION.md",
+            "STEP5_REAL_GLM_GEMMA_SMOKE_REPORT.md",
         ):
             shutil.copy2(SOURCE_ROOT / filename, self.repo_root / filename)
         for skill_name in SKILL_NAMES:
@@ -133,6 +134,20 @@ class ValidatorRegressionTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("VERSION must contain one SemVer", result.stdout)
+
+    def test_user_specific_path_in_step5_report_fails(self) -> None:
+        report = self.repo_root / "STEP5_REAL_GLM_GEMMA_SMOKE_REPORT.md"
+        report.write_text(
+            report.read_text(encoding="utf-8").replace(
+                "/Users/<user>/", "/Users/" + "private-user/", 1
+            ),
+            encoding="utf-8",
+        )
+
+        result = self.run_validator()
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("user-specific absolute path", result.stdout)
 
 
 if __name__ == "__main__":
