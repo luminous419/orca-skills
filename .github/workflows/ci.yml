@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Validate Skill packages
+        run: python3 scripts/validate_skills.py
+
+      - name: Run deterministic tests
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
+
+      - name: Verify release package inputs
+        run: python3 scripts/verify_package.py
+
+      - name: Build and verify release archive
+        run: |
+          python3 scripts/build_release.py
+          python3 scripts/verify_package.py --archive "dist/orca-skills-$(tr -d '\n' < VERSION).tar.gz"
+
+      - name: Check whitespace
+        run: git diff --check

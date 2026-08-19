@@ -60,6 +60,17 @@ USER_ABSOLUTE_PATH_PATTERNS = (
     re.compile(r"/home/(?!<|\{)[^/\s`]+"),
     re.compile(r"[A-Za-z]:\\Users\\(?!<|\{)[^\\\s`]+"),
 )
+REPOSITORY_DOCS = (
+    "README.md",
+    "INSTALL.md",
+    "CHANGELOG.md",
+    "COMPATIBILITY.md",
+    "RELEASING.md",
+    "LICENSE-DECISION.md",
+)
+SEMVER_PATTERN = re.compile(
+    r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
+)
 
 
 class Validation:
@@ -217,7 +228,7 @@ def validate_shared_directories(validation: Validation) -> None:
 
 
 def validate_no_user_absolute_paths(validation: Validation) -> None:
-    paths = [REPO_ROOT / "README.md", REPO_ROOT / "INSTALL.md"]
+    paths = [REPO_ROOT / name for name in REPOSITORY_DOCS]
     for skill_dir in SKILL_DIRS:
         paths.extend(skill_dir.rglob("*.md"))
 
@@ -231,6 +242,19 @@ def validate_no_user_absolute_paths(validation: Validation) -> None:
                 if match
                 else "",
             )
+
+
+def validate_version(validation: Validation) -> None:
+    version_path = REPO_ROOT / "VERSION"
+    validation.check(version_path.is_file(), "missing VERSION source of truth")
+    if not version_path.is_file():
+        return
+    raw = version_path.read_text(encoding="utf-8")
+    version = raw.strip()
+    validation.check(
+        raw == f"{version}\n" and bool(SEMVER_PATTERN.fullmatch(version)),
+        "VERSION must contain one SemVer MAJOR.MINOR.PATCH line",
+    )
 
 
 def validate_policy_contracts(validation: Validation, skill_dir: Path) -> None:
@@ -444,6 +468,7 @@ def main() -> int:
     validate_shared_directories(validation)
     validate_machine_readable_contracts(validation)
     validate_workflow_output_contracts(validation)
+    validate_version(validation)
     validate_no_user_absolute_paths(validation)
 
     if validation.errors:
