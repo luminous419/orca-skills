@@ -166,6 +166,10 @@ python3 scripts/test_orca_runtime.py --orca-runtime \
 The integration command resolves the installed Orca CLI, loads its
 version-matched `orchestration` and `orca-cli` guides, and requires a ready Orca
 runtime. It never launches `claude-glm`, `claude-gemma`, Codex, or another LLM.
+The current adapter is compatibility-gated to Orca `1.4.184` and exact required
+guide grammar; a different version or changed command contract is skipped before
+any Run or terminal is created. The resolved executable is passed into every
+fake-agent lifecycle call, including `ORCA_CLI_COMMAND` overrides.
 It tries supervised attachment first and, when the runtime classifies the custom
 fake executable as unrecognized, uses the guide's tracked-Dispatch plus terminal
 prompt fallback. One reviewer terminal is deliberately reused; all other fake

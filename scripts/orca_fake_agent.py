@@ -10,7 +10,10 @@ import subprocess
 import sys
 from pathlib import Path
 
-from workflow_contract import load_workflow_output_contract
+try:
+    from scripts.workflow_contract import load_workflow_output_contract
+except ModuleNotFoundError:
+    from workflow_contract import load_workflow_output_contract
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -79,10 +82,15 @@ def fake_command(args: argparse.Namespace) -> list[str]:
 
 
 def send_done(
-    task_id: str, dispatch_id: str, capability: str | None, outcome: str, body: str
+    task_id: str,
+    dispatch_id: str,
+    capability: str | None,
+    outcome: str,
+    body: str,
+    orca_command: str,
 ) -> None:
     command = [
-        "orca",
+        orca_command,
         "orchestration",
         "send",
         "--type",
@@ -113,10 +121,10 @@ def send_done(
         raise SystemExit(result.returncode)
 
 
-def confirm_dispatch_ready(dispatch_id: str) -> None:
+def confirm_dispatch_ready(dispatch_id: str, orca_command: str) -> None:
     result = subprocess.run(
         [
-            "orca",
+            orca_command,
             "orchestration",
             "worker-show",
             "--dispatch",
@@ -146,6 +154,7 @@ def main() -> int:
     parser.add_argument("--iteration", type=int, default=1)
     parser.add_argument("--findings-json", default="[]")
     parser.add_argument("--resolutions-json", default="{}")
+    parser.add_argument("--orca-command", required=True)
     args = parser.parse_args()
 
     modes = args.mode.split(",")
@@ -168,12 +177,12 @@ def main() -> int:
             continue
 
         if capability:
-            confirm_dispatch_ready(dispatch_id)
+            confirm_dispatch_ready(dispatch_id, args.orca_command)
         args.mode = modes[min(completed_dispatches, len(modes) - 1)]
         args.iteration = completed_dispatches + 1
         if args.ask_before and completed_dispatches == 0:
             ask_command = [
-                "orca",
+                args.orca_command,
                 "orchestration",
                 "ask",
                 "--question",
@@ -210,7 +219,7 @@ def main() -> int:
         )
         if outcome == "failed":
             escalation_command = [
-                "orca",
+                args.orca_command,
                 "orchestration",
                 "send",
                 "--type",
@@ -234,7 +243,14 @@ def main() -> int:
             print(escalation.stdout, end="", flush=True)
             if escalation.returncode != 0:
                 return escalation.returncode
-        send_done(task_id, dispatch_id, capability, outcome, fake.stdout)
+        send_done(
+            task_id,
+            dispatch_id,
+            capability,
+            outcome,
+            fake.stdout,
+            args.orca_command,
+        )
         completed_dispatches += 1
         if completed_dispatches >= args.max_dispatches:
             return 0

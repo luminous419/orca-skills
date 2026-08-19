@@ -17,10 +17,56 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FAKE_CODEX = REPO_ROOT / "scripts" / "fake_bin" / "codex"
 WAIT_TYPES = "worker_done,escalation,question"
+SUPPORTED_ORCA_APP_VERSION = "1.4.184"
+REQUIRED_ORCHESTRATION_GUIDE_SNIPPETS = (
+    "orca orchestration run-create --objective <text> --json",
+    "orca orchestration task-create --spec <text>",
+    "orca orchestration dispatch --task <task_id> --to <handle>",
+    "orca orchestration worker-start --task <task_id>",
+    "orca orchestration check --wait --types worker_done,escalation,question",
+    "orca orchestration worker-release --dispatch <dispatch_id> --json",
+    "orca orchestration worker-retain --dispatch <dispatch_id> --json",
+    "--type worker_done --subject \"<status>\"",
+    "--task-id <task_id> --dispatch-id <dispatch_id> --outcome succeeded",
+)
+REQUIRED_ORCA_CLI_GUIDE_SNIPPETS = (
+    "orca terminal create",
+    "orca terminal send",
+    "ORCA terminal wait",
+)
 
 
 class OrcaRuntimeError(RuntimeError):
     pass
+
+
+class UnsupportedOrcaContract(OrcaRuntimeError):
+    pass
+
+
+def validate_orca_contract(
+    app_version: str, orchestration_guide: str, cli_guide: str
+) -> None:
+    if app_version != SUPPORTED_ORCA_APP_VERSION:
+        raise UnsupportedOrcaContract(
+            f"runtime harness supports Orca {SUPPORTED_ORCA_APP_VERSION}; "
+            f"installed runtime is {app_version}"
+        )
+    missing = [
+        snippet
+        for snippet in REQUIRED_ORCHESTRATION_GUIDE_SNIPPETS
+        if snippet not in orchestration_guide
+    ]
+    missing.extend(
+        snippet
+        for snippet in REQUIRED_ORCA_CLI_GUIDE_SNIPPETS
+        if snippet not in cli_guide
+    )
+    if missing:
+        raise UnsupportedOrcaContract(
+            "installed version-matched guide does not match the pinned grammar: "
+            + ", ".join(missing)
+        )
 
 
 @dataclass
@@ -107,16 +153,7 @@ class OrcaRuntimeHarness:
             capture_output=True,
             check=True,
         ).stdout
-        required = (
-            "worker-start",
-            "worker_done",
-            "worker-release",
-            "worker-retain",
-            "check --wait",
-        )
-        missing = [item for item in required if item not in orchestration]
-        if missing:
-            raise OrcaRuntimeError(f"version-matched guide is missing {missing}")
+        validate_orca_contract(status["runtime"]["appVersion"], orchestration, cli)
         current = self.call("worktree", "current")
         return {
             "executable": self.orca,
@@ -175,6 +212,8 @@ class OrcaRuntimeHarness:
             json.dumps(resolutions or {}, sort_keys=True),
             "--max-dispatches",
             str(max_dispatches),
+            "--orca-command",
+            self.orca,
         ]
         if ask_before:
             command.append("--ask-before")

@@ -10,9 +10,12 @@ import unittest
 from pathlib import Path
 
 try:
-    from scripts.orca_runtime_harness import run_runtime_scenarios
+    from scripts.orca_runtime_harness import (
+        UnsupportedOrcaContract,
+        run_runtime_scenarios,
+    )
 except ModuleNotFoundError:
-    from orca_runtime_harness import run_runtime_scenarios
+    from orca_runtime_harness import UnsupportedOrcaContract, run_runtime_scenarios
 
 
 RUN_ORCA = os.environ.get("ORCA_RUNTIME_TEST") == "1"
@@ -25,10 +28,16 @@ class OrcaRuntimeIntegrationTests(unittest.TestCase):
             self.skipTest("requires --orca-runtime and a ready Orca runtime")
         if ARTIFACT_DIR:
             artifact_dir = Path(ARTIFACT_DIR)
-            results = run_runtime_scenarios(artifact_dir)
+            try:
+                results = run_runtime_scenarios(artifact_dir)
+            except UnsupportedOrcaContract as exc:
+                self.skipTest(str(exc))
         else:
             with tempfile.TemporaryDirectory() as directory:
-                results = run_runtime_scenarios(Path(directory))
+                try:
+                    results = run_runtime_scenarios(Path(directory))
+                except UnsupportedOrcaContract as exc:
+                    self.skipTest(str(exc))
 
         by_name = {result.scenario: result for result in results}
         self.assertEqual(set(by_name), set("ABCDEF"))
