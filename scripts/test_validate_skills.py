@@ -24,7 +24,15 @@ class ValidatorRegressionTests(unittest.TestCase):
         self.repo_root = Path(self.temporary_directory.name) / "repo"
         self.repo_root.mkdir()
 
-        for filename in ("README.md", "INSTALL.md"):
+        for filename in (
+            "README.md",
+            "INSTALL.md",
+            "VERSION",
+            "CHANGELOG.md",
+            "COMPATIBILITY.md",
+            "RELEASING.md",
+            "LICENSE-DECISION.md",
+        ):
             shutil.copy2(SOURCE_ROOT / filename, self.repo_root / filename)
         for skill_name in SKILL_NAMES:
             shutil.copytree(SOURCE_ROOT / skill_name, self.repo_root / skill_name)
@@ -117,6 +125,14 @@ class ValidatorRegressionTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("missing documented choice ['FAIL', 'PASS']", result.stdout)
+
+    def test_invalid_version_fails(self) -> None:
+        (self.repo_root / "VERSION").write_text("v1\n", encoding="utf-8")
+
+        result = self.run_validator()
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("VERSION must contain one SemVer", result.stdout)
 
 
 if __name__ == "__main__":

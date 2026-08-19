@@ -14,6 +14,10 @@ command -v claude-glm
 command -v claude-gemma
 ```
 
+Repository validation and packaging support CPython 3.11, 3.12, and 3.13 and use
+only the standard library. Read [`COMPATIBILITY.md`](COMPATIBILITY.md) before treating
+a runtime configuration as verified.
+
 The orchestration variant additionally requires:
 
 - Orca built-in `orchestration` support enabled and available in the installed Orca version.
@@ -37,6 +41,8 @@ Before installing or updating either skill, run:
 ```bash
 python3 scripts/validate_skills.py
 python3 -m unittest discover -s scripts -p 'test_*.py'
+python3 scripts/verify_package.py
+git diff --check
 ```
 
 The validator checks both `orca-worker-reviewer-loop` and
@@ -51,6 +57,11 @@ tests confirm that representative broken repository states are rejected and that
 both skills return the same deterministic policy decisions without starting Orca
 or the configured Worker/Reviewer commands. The suite also runs fake-agent E2E
 subprocesses in disposable workspaces; it never invokes a real LLM or Orca runtime.
+
+The default suite and CI do not start Orca Desktop or real agents. The Step 5
+`claude-glm`/`claude-gemma` smoke test is **BLOCKED / NOT YET VERIFIED** because the
+commands were unavailable in the tested environment. Stable production readiness is
+therefore not claimed.
 
 The optional real-Orca integration suite is separate so Orca availability never
 breaks installation validation. With this checkout registered in a running Orca
@@ -107,6 +118,18 @@ SKILL.md
 templates/
 reviews/
 ```
+
+For a source release, build and verify the deterministic archive instead of copying a
+working tree with local artifacts:
+
+```bash
+python3 scripts/build_release.py
+python3 scripts/verify_package.py --archive "dist/orca-skills-$(tr -d '\n' < VERSION).tar.gz"
+```
+
+The archive includes repository documentation, validation tooling, CI metadata, and
+both complete Skill directories. It excludes `.git`, `artifacts`, `run`, `dist`, Python
+bytecode, and `__pycache__` content.
 
 ## 6. Verify Orca Built-in Skills for the Orchestration Variant
 

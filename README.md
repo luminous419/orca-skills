@@ -2,6 +2,9 @@
 
 Reusable Orca skills for structured software-development workflows.
 
+The current pre-1.0 version is defined only in [`VERSION`](VERSION). Compatibility
+and verification status are maintained in [`COMPATIBILITY.md`](COMPATIBILITY.md).
+
 ## Available Skills
 
 ### `orca-worker-reviewer-loop`
@@ -115,6 +118,8 @@ Run the repository validator from the repository root:
 ```bash
 python3 scripts/validate_skills.py
 python3 -m unittest discover -s scripts -p 'test_*.py'
+python3 scripts/verify_package.py
+git diff --check
 ```
 
 The validator uses only the Python standard library and validates both
@@ -176,6 +181,29 @@ prompt fallback. One reviewer terminal is deliberately reused; all other fake
 processes exit after their settled attempt.
 Runtime-issued IDs and command receipts are written as diagnostic JSON artifacts;
 tests assert their structure and invariants rather than fixed identifier values.
+
+### CI and releases
+
+GitHub Actions runs the validator, deterministic unit/policy/fake-agent tests,
+package verification, reproducible archive build/verification, and whitespace check
+on pull requests and `main` pushes using Python 3.11, 3.12, and 3.13. It installs no
+third-party Python dependencies.
+
+CI intentionally does not run Orca Desktop/runtime integration or real
+`claude-glm`/`claude-gemma` agents. Orca integration remains the opt-in local command
+above. The real GLM/Gemma smoke test is **BLOCKED / NOT YET VERIFIED**, so a stable
+production-ready release is not claimed.
+
+Build and verify the deterministic release archive locally with:
+
+```bash
+python3 scripts/build_release.py
+python3 scripts/verify_package.py --archive "dist/orca-skills-$(tr -d '\n' < VERSION).tar.gz"
+```
+
+See [`RELEASING.md`](RELEASING.md) for SemVer rules and the release checklist.
+No license has been selected; [`LICENSE-DECISION.md`](LICENSE-DECISION.md) records the
+required owner decision rather than inventing a grant.
 
 ## Execution-layer Difference
 
