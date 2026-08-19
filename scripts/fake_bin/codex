@@ -1,0 +1,4 @@
+#!/bin/bash
+# Test-only shim: its name lets Orca exercise the recognized-agent dispatch path
+# without launching Codex or any other LLM.
+exec -a codex python3 "$(dirname "$0")/../orca_fake_agent.py" "$@"

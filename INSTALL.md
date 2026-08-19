@@ -52,6 +52,20 @@ both skills return the same deterministic policy decisions without starting Orca
 or the configured Worker/Reviewer commands. The suite also runs fake-agent E2E
 subprocesses in disposable workspaces; it never invokes a real LLM or Orca runtime.
 
+The optional real-Orca integration suite is separate so Orca availability never
+breaks installation validation. With this checkout registered in a running Orca
+runtime, execute:
+
+```bash
+python3 scripts/test_orca_runtime.py --orca-runtime \
+  --artifact-dir artifacts/orca-runtime/latest
+```
+
+This uses only deterministic fake agents but creates real Orca Runs, Tasks,
+Dispatches, lifecycle messages, and terminal/resource observations. A custom
+fake executable that is not recognized for supervised attachment follows the
+version-matched guide's tracked-Dispatch fallback.
+
 ## 4. Global Installation — Recommended
 
 ```bash
