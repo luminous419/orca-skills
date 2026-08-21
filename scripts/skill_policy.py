@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,7 @@ CONTRACT_BLOCK_PATTERN = re.compile(
 PARAMETER_PATTERN = re.compile(
     r"(?<!\S)(?P<key>worker|reviewer|max-iterations|phases)=(?P<value>[^\s]+)"
 )
+AGENT_COMMAND_PATTERN = re.compile(r"[A-Za-z0-9._-]+", re.ASCII)
 
 
 class PolicyContractError(ValueError):
@@ -133,8 +135,24 @@ def evaluate_invocation(skill_path: Path, invocation: str) -> PolicyDecision:
     worker = explicit.get("worker", defaults["worker"])
     reviewer = explicit.get("reviewer", defaults["reviewer"])
 
-    allowlist = set(contract["agent_allowlist"])
-    if worker not in allowlist or reviewer not in allowlist:
+    if not AGENT_COMMAND_PATTERN.fullmatch(worker) or not AGENT_COMMAND_PATTERN.fullmatch(
+        reviewer
+    ):
+        return _blocked(
+            errors["invalid_agent_command"],
+            worker=worker,
+            reviewer=reviewer,
+            max_iterations=None,
+        )
+    known_commands = set(contract["known_agent_commands"])
+    custom_command_pattern = re.compile(
+        str(contract["custom_agent_command_pattern"]), re.ASCII
+    )
+    if any(
+        command not in known_commands
+        and not custom_command_pattern.fullmatch(command)
+        for command in (worker, reviewer)
+    ):
         return _blocked(
             errors["agent_not_allowed"],
             worker=worker,
@@ -144,6 +162,13 @@ def evaluate_invocation(skill_path: Path, invocation: str) -> PolicyDecision:
     if worker == reviewer:
         return _blocked(
             errors["worker_reviewer_must_differ"],
+            worker=worker,
+            reviewer=reviewer,
+            max_iterations=None,
+        )
+    if shutil.which(worker) is None or shutil.which(reviewer) is None:
+        return _blocked(
+            errors["agent_command_not_found"],
             worker=worker,
             reviewer=reviewer,
             max_iterations=None,

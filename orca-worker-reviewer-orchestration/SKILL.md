@@ -163,7 +163,10 @@ DEFAULT_MAX_ITERATIONS = 5
       "free-form phase requests"
     ]
   },
-  "agent_allowlist": ["claude-glm", "claude-gemma"],
+  "known_agent_commands": ["claude", "codex", "claude-glm", "claude-gemma"],
+  "agent_command_pattern": "[A-Za-z0-9._-]+",
+  "custom_agent_command_pattern": "(?:claude|codex)-[A-Za-z0-9._-]+",
+  "agent_launch_arguments": [],
   "max_iterations": {
     "min": 1,
     "max": 10
@@ -191,6 +194,8 @@ DEFAULT_MAX_ITERATIONS = 5
   },
   "errors": {
     "agent_not_allowed": "AGENT_NOT_ALLOWED",
+    "invalid_agent_command": "INVALID_AGENT_COMMAND",
+    "agent_command_not_found": "AGENT_COMMAND_NOT_FOUND",
     "worker_reviewer_must_differ": "WORKER_REVIEWER_MUST_DIFFER",
     "invalid_max_iterations": "INVALID_MAX_ITERATIONS",
     "invalid_phase": "INVALID_PHASE",
@@ -203,19 +208,39 @@ DEFAULT_MAX_ITERATIONS = 5
 
 ## 5. Agent Policy
 
-기본 allowlist:
+기본 known commands:
 
 ```text
+claude
+codex
 claude-glm
 claude-gemma
 ```
 
-allowlist 밖의 agent는 실행하지 않는다.
+이 목록 외에는 `claude-` 또는 `codex-` prefix를 가진 model-pinned wrapper만 허용한다.
+예: `claude-opus`, `codex-sol`. 안전한 token이라도 이 trust boundary 밖의 command는
+실행하지 않는다.
+
+agent parameter는 shell fragment나 경로가 아니라 하나의 simple PATH command token이다.
+
+```text
+[A-Za-z0-9._-]+
+```
+
+공백, slash, argument, shell metacharacter가 포함된 값은 실행하지 않는다.
+
+```text
+STATUS: BLOCKED
+REASON: INVALID_AGENT_COMMAND
+```
 
 ```text
 STATUS: BLOCKED
 REASON: AGENT_NOT_ALLOWED
 ```
+
+따라서 PATH에 존재하더라도 `bash`, `sh`, `python3`, `env` 같은 일반 shell/interpreter
+command는 agent로 승인하지 않는다.
 
 Worker와 Reviewer는 서로 달라야 한다.
 
@@ -238,11 +263,18 @@ STATUS: BLOCKED
 REASON: AGENT_COMMAND_NOT_FOUND
 ```
 
-실제 agent process 실행 시 기본적으로 다음 permission mode를 사용한다.
+known command도 PATH에서 resolve되어야 한다. wrapper 내부 모델명이나 vendor별 model-selection
+syntax는 해석하지 않으며, generic CLI의 현재 configuration 또는 model-pinned wrapper가 모델을
+선택할 책임을 가진다.
+
+실제 agent process는 선택된 command token 자체를 entry point로 실행한다.
 
 ```text
-<agent-command> --dangerously-skip-permissions
+<agent-command>
 ```
+
+Skill은 model, permission 또는 vendor-specific argument를 추가하지 않는다. 필요한 옵션은
+해당 CLI의 configuration 또는 model/permission-pinned wrapper command가 소유한다.
 
 절대 사용자 경로를 hard-code하지 않는다.
 
@@ -679,6 +711,6 @@ Current phase PASS required before next phase
 IMPLEMENTATION production code change → Unit Test add/modify required
 BUGFIX → Regression Test required
 REFACTORING → relevant existing Unit Test execution + conditional test changes
-Agent command → allowlist + PATH based
+Agent command → safe token + PATH resolution
 No silent fallback to direct-session loop
 ```

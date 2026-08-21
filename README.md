@@ -53,6 +53,7 @@ FAIL → Worker correction → Reviewer re-review
 Important gates include:
 
 - Worker and Reviewer must differ.
+- Agent values must be simple PATH-resolved command tokens; paths, arguments, and shell syntax are rejected.
 - Sequential phase order is validated.
 - Specialized phases (`BUGFIX`, `REFACTORING`) are not silently mixed into arbitrary sequential combinations.
 - Unsupported specialized phase combinations are blocked with `UNSUPPORTED_PHASE_COMBINATION`.
@@ -80,16 +81,51 @@ Orca-native orchestration version:
 아래 기능을 설계하고 구현해줘.
 ```
 
-Override agents:
+Company environment:
 
 ```text
 /orca-worker-reviewer-orchestration \
 worker=claude-glm \
 reviewer=claude-gemma \
-phases=design,implementation
+phases=analysis,plan,design
 
 <request>
 ```
+
+Personal model-pinned wrappers:
+
+```text
+/orca-worker-reviewer-orchestration \
+worker=claude-opus \
+reviewer=codex-sol \
+phases=analysis,plan,design
+
+<request>
+```
+
+Generic CLIs:
+
+```text
+/orca-worker-reviewer-orchestration \
+worker=claude \
+reviewer=codex \
+phases=analysis,plan,design
+
+<request>
+```
+
+`claude` and `codex` are generic entry points. The Skill does not select or guarantee
+their models; model selection belongs to each CLI's current configuration. For a stable
+model choice, place a model-pinned wrapper such as `claude-opus` or `codex-sol` in a
+directory on PATH and pass its command name. The Skill treats the wrapper as an opaque
+executable and does not inspect its implementation or vendor-specific model syntax.
+The Skill launches only that executable token and appends no model, permission, or
+vendor-specific arguments. Put any required flags in CLI configuration or the wrapper.
+
+Agent values must match `[A-Za-z0-9._-]+` and resolve on PATH. Custom wrappers must use
+a trusted `claude-` or `codex-` prefix; PATH-resolved shells and interpreters such as
+`bash`, `sh`, and `python3` are not agent commands. Do not pass arguments, shell
+fragments, absolute paths, or relative paths in `worker=` or `reviewer=`.
 
 Defaults:
 
@@ -136,8 +172,8 @@ The command exits with status `0` when all checks pass and a non-zero status wit
 actionable error messages when an inconsistency is found.
 
 The regression tests run the validator against disposable repository copies and
-verify that a valid repository passes while a missing required error code and
-shared-template drift are rejected.
+verify that a valid repository passes while policy/prose drift, a missing required
+error code, and shared-template drift are rejected.
 
 The policy smoke tests load the identical `policy-contract` JSON embedded in both
 `SKILL.md` files and evaluate representative invocations without launching Orca

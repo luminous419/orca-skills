@@ -3,8 +3,11 @@
 
 from __future__ import annotations
 
+import os
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from scripts.skill_policy import evaluate_invocation, load_policy_contract
 
@@ -18,6 +21,30 @@ SKILL_PATHS = tuple(REPO_ROOT / name / "SKILL.md" for name in SKILL_NAMES)
 
 
 class PolicySmokeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_directory = tempfile.TemporaryDirectory()
+        bin_dir = Path(self.temp_directory.name)
+        for command in (
+            "claude",
+            "codex",
+            "claude-glm",
+            "claude-gemma",
+            "claude-opus",
+            "codex-sol",
+            "bash",
+            "sh",
+            "python3",
+        ):
+            executable = bin_dir / command
+            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o755)
+        self.path_patch = mock.patch.dict(os.environ, {"PATH": str(bin_dir)})
+        self.path_patch.start()
+
+    def tearDown(self) -> None:
+        self.path_patch.stop()
+        self.temp_directory.cleanup()
+
     def evaluate(self, skill_path: Path, suffix: str):
         return evaluate_invocation(skill_path, f"/{skill_path.parent.name}{suffix}")
 
@@ -60,12 +87,56 @@ class PolicySmokeTests(unittest.TestCase):
             " worker=claude-glm reviewer=claude-glm phases=analysis 요청",
             "WORKER_REVIEWER_MUST_DIFFER",
         )
-
-    def test_agent_must_be_allowlisted(self) -> None:
         self.assert_blocked(
-            " worker=codex reviewer=claude-gemma phases=analysis 요청",
-            "AGENT_NOT_ALLOWED",
+            " worker=claude-opus reviewer=claude-opus phases=analysis 요청",
+            "WORKER_REVIEWER_MUST_DIFFER",
         )
+
+    def test_generic_commands_are_valid(self) -> None:
+        self.assert_valid(
+            " worker=claude reviewer=codex phases=analysis 요청",
+            ("analysis",),
+        )
+
+    def test_known_company_commands_are_valid(self) -> None:
+        self.assert_valid(
+            " worker=claude-glm reviewer=claude-gemma phases=analysis 요청",
+            ("analysis",),
+        )
+
+    def test_path_resolved_model_pinned_wrappers_are_valid(self) -> None:
+        self.assert_valid(
+            " worker=claude-opus reviewer=codex-sol phases=analysis 요청",
+            ("analysis",),
+        )
+
+    def test_missing_agent_command_is_blocked(self) -> None:
+        self.assert_blocked(
+            " worker=claude-missing reviewer=claude-gemma phases=analysis 요청",
+            "AGENT_COMMAND_NOT_FOUND",
+        )
+
+    def test_non_agent_path_commands_are_not_allowed(self) -> None:
+        for command in ("bash", "sh", "python3"):
+            with self.subTest(command=command):
+                self.assert_blocked(
+                    f" worker={command} reviewer=codex phases=analysis 요청",
+                    "AGENT_NOT_ALLOWED",
+                )
+
+    def test_unsafe_agent_commands_are_blocked(self) -> None:
+        for value in (
+            '"claude --model opus"',
+            "../claude",
+            "/usr/local/bin/claude",
+            "claude;echo",
+            "claude&&echo",
+        ):
+            with self.subTest(value=value):
+                self.assert_blocked(
+                    f" worker={value} reviewer=codex phases=analysis 요청",
+                    "INVALID_AGENT_COMMAND",
+                )
 
     def test_invalid_max_iterations(self) -> None:
         for value in ("0", "11", "many"):
@@ -178,6 +249,24 @@ class PolicySmokeTests(unittest.TestCase):
                     ],
                 )
 
+    def test_agent_launch_is_argument_free_for_generic_and_wrapper_commands(self) -> None:
+        for skill_path in SKILL_PATHS:
+            with self.subTest(skill=skill_path.parent.name):
+                contract = load_policy_contract(skill_path)
+                self.assertEqual(contract["agent_launch_arguments"], [])
+
+                for worker, reviewer in (
+                    ("claude", "codex"),
+                    ("claude-opus", "codex-sol"),
+                ):
+                    decision = self.evaluate(
+                        skill_path,
+                        f" worker={worker} reviewer={reviewer} phases=analysis 요청",
+                    )
+                    self.assertEqual(decision.status, "VALID")
+                    self.assertEqual([decision.worker], [worker])
+                    self.assertEqual([decision.reviewer], [reviewer])
+
     def test_two_skills_have_identical_contracts(self) -> None:
         contracts = [load_policy_contract(path) for path in SKILL_PATHS]
         self.assertEqual(contracts[0], contracts[1])
@@ -186,7 +275,10 @@ class PolicySmokeTests(unittest.TestCase):
         suffixes = (
             " help",
             " worker=claude-glm reviewer=claude-glm phases=analysis 요청",
-            " worker=codex phases=analysis 요청",
+            " worker=claude-missing phases=analysis 요청",
+            " worker=bash reviewer=codex phases=analysis 요청",
+            " worker=claude-opus reviewer=codex-sol phases=analysis 요청",
+            " worker=../claude phases=analysis 요청",
             " max-iterations=0 phases=analysis 요청",
             " max-iterations=11 phases=analysis 요청",
             " max-iterations=many phases=analysis 요청",
