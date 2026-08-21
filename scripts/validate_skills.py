@@ -354,6 +354,14 @@ def validate_machine_readable_contracts(validation: Validation) -> None:
             f"{skill_dir.name}: contract agent command pattern is invalid",
         )
         validation.check(
+            contract.get("agent_launch_arguments") == [],
+            f"{skill_dir.name}: agent launch arguments must be empty",
+        )
+        validation.check(
+            "--dangerously-skip-permissions" not in skill_text,
+            f"{skill_dir.name}: contains a vendor-specific agent launch argument",
+        )
+        validation.check(
             f"DEFAULT_WORKER = {defaults.get('worker')}" in skill_text
             and f"DEFAULT_REVIEWER = {defaults.get('reviewer')}" in skill_text
             and f"DEFAULT_MAX_ITERATIONS = {defaults.get('max_iterations')}"

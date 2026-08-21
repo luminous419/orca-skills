@@ -238,6 +238,24 @@ class PolicySmokeTests(unittest.TestCase):
                     ],
                 )
 
+    def test_agent_launch_is_argument_free_for_generic_and_wrapper_commands(self) -> None:
+        for skill_path in SKILL_PATHS:
+            with self.subTest(skill=skill_path.parent.name):
+                contract = load_policy_contract(skill_path)
+                self.assertEqual(contract["agent_launch_arguments"], [])
+
+                for worker, reviewer in (
+                    ("claude", "codex"),
+                    ("claude-opus", "codex-sol"),
+                ):
+                    decision = self.evaluate(
+                        skill_path,
+                        f" worker={worker} reviewer={reviewer} phases=analysis 요청",
+                    )
+                    self.assertEqual(decision.status, "VALID")
+                    self.assertEqual([decision.worker], [worker])
+                    self.assertEqual([decision.reviewer], [reviewer])
+
     def test_two_skills_have_identical_contracts(self) -> None:
         contracts = [load_policy_contract(path) for path in SKILL_PATHS]
         self.assertEqual(contracts[0], contracts[1])

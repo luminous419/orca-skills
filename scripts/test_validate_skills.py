@@ -127,6 +127,21 @@ class ValidatorRegressionTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("human-readable known commands differ", result.stdout)
 
+    def test_vendor_specific_agent_argument_fails(self) -> None:
+        skill_path = (
+            self.repo_root / "orca-worker-reviewer-orchestration" / "SKILL.md"
+        )
+        text = skill_path.read_text(encoding="utf-8")
+        skill_path.write_text(
+            text.replace("<agent-command>", "<agent-command> --dangerously-skip-permissions", 1),
+            encoding="utf-8",
+        )
+
+        result = self.run_validator()
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("vendor-specific agent launch argument", result.stdout)
+
     def test_workflow_output_contract_drift_fails(self) -> None:
         skill_path = (
             self.repo_root / "orca-worker-reviewer-orchestration" / "SKILL.md"

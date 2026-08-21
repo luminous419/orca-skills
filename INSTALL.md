@@ -32,6 +32,8 @@ The repository intentionally does not provide those wrapper scripts. The Skill d
 not inspect wrapper internals. Likewise, when generic `claude` and `codex` commands are
 selected, model selection is the responsibility of each CLI's current configuration;
 the Skill does not choose or guarantee a model.
+The Skill also appends no permission or other vendor-specific launch arguments. Configure
+those in the CLI itself or include them inside the PATH-resolved wrapper implementation.
 
 Do not put arguments, paths, whitespace, or shell metacharacters in `worker=` or
 `reviewer=`. Values such as `claude --model opus`, `../claude`, an absolute path, or

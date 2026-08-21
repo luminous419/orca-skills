@@ -175,6 +175,7 @@ DEFAULT_MAX_ITERATIONS = 5
   },
   "known_agent_commands": ["claude", "codex", "claude-glm", "claude-gemma"],
   "agent_command_pattern": "[A-Za-z0-9._-]+",
+  "agent_launch_arguments": [],
   "max_iterations": {
     "min": 1,
     "max": 10
@@ -269,12 +270,14 @@ REASON: WORKER_REVIEWER_MUST_DIFFER
 
 ## 7. Agent Command Resolution
 
-agent는 PATH를 통해 실행한다.
+agent는 PATH를 통해 resolve한 command token 자체를 entry point로 실행한다.
 
-```bash
-claude-glm --dangerously-skip-permissions
-claude-gemma --dangerously-skip-permissions
+```text
+<agent-command>
 ```
+
+Skill은 model, permission 또는 vendor-specific argument를 추가하지 않는다. 필요한 옵션은
+해당 CLI의 configuration 또는 model/permission-pinned wrapper command가 소유한다.
 
 절대 경로를 Skill 내부 실행 명령으로 hard-code하지 않는다.
 
@@ -580,7 +583,7 @@ PREVIOUS REVIEW FINDINGS
 실행:
 
 ```text
-<worker> --dangerously-skip-permissions
+<worker>
 ```
 
 ## 14. Worker Result Contract
@@ -620,7 +623,7 @@ PREVIOUS_FINDINGS
 실행:
 
 ```text
-<reviewer> --dangerously-skip-permissions
+<reviewer>
 ```
 
 Reviewer는 실제 repository, diff, artifact, tests, test result를 가능한 한 직접 확인한다.

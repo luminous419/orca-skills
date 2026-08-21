@@ -165,6 +165,7 @@ DEFAULT_MAX_ITERATIONS = 5
   },
   "known_agent_commands": ["claude", "codex", "claude-glm", "claude-gemma"],
   "agent_command_pattern": "[A-Za-z0-9._-]+",
+  "agent_launch_arguments": [],
   "max_iterations": {
     "min": 1,
     "max": 10
@@ -264,11 +265,14 @@ known command도 PATH에서 resolve되어야 한다. wrapper 내부 모델명이
 syntax는 해석하지 않으며, generic CLI의 현재 configuration 또는 model-pinned wrapper가 모델을
 선택할 책임을 가진다.
 
-실제 agent process 실행 시 기본적으로 다음 permission mode를 사용한다.
+실제 agent process는 선택된 command token 자체를 entry point로 실행한다.
 
 ```text
-<agent-command> --dangerously-skip-permissions
+<agent-command>
 ```
+
+Skill은 model, permission 또는 vendor-specific argument를 추가하지 않는다. 필요한 옵션은
+해당 CLI의 configuration 또는 model/permission-pinned wrapper command가 소유한다.
 
 절대 사용자 경로를 hard-code하지 않는다.
 

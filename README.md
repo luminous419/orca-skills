@@ -119,6 +119,8 @@ their models; model selection belongs to each CLI's current configuration. For a
 model choice, place a model-pinned wrapper such as `claude-opus` or `codex-sol` in a
 directory on PATH and pass its command name. The Skill treats the wrapper as an opaque
 executable and does not inspect its implementation or vendor-specific model syntax.
+The Skill launches only that executable token and appends no model, permission, or
+vendor-specific arguments. Put any required flags in CLI configuration or the wrapper.
 
 Agent values must match `[A-Za-z0-9._-]+` and resolve on PATH. Do not pass arguments,
 shell fragments, absolute paths, or relative paths in `worker=` or `reviewer=`.
