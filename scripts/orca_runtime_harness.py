@@ -98,6 +98,39 @@ SETTLEMENT_STATES = ("absent", "in_progress", "finalized")
 # rung 3 observes TUI idle before adopting. Both take the same abandon recovery, and
 # neither may be read as a settlement.
 UNSETTLED_WORKER_STATES = frozenset({"outcome_unknown", "ready"})
+# Task/Dispatch provenance values that prove a Dispatch really reached an outcome.
+# Anything else -- `dispatched` above all -- is not-settled, and axis (a) forbids a
+# lifecycle mutation on it. This is the vocabulary of SKILL.md section 6 axis (a),
+# not of the worker registry: it is read from the Dispatch row and the Task row.
+SETTLED_STATUSES = frozenset({"completed", "failed"})
+# The only two outcomes an accepted `worker_done` may carry. Same vocabulary as the
+# dispatch preamble's `--outcome succeeded|failed` (REQUIRED_ORCHESTRATION_GUIDE_
+# SNIPPETS above) and as the fake-worker contract. A payload without one of these is
+# not an accepted settlement message at all, so axis (a) refuses it before STEP 2.
+SETTLED_OUTCOMES = frozenset({"succeeded", "failed"})
+# Identity fields every accepted `worker_done` payload carries, mapped to the value
+# they must equal. SKILL.md section 6 axis (a) requires the message to match the
+# EXPECTED Task and Dispatch ID; neither is optional, because a payload that names
+# no dispatch proves nothing about the dispatch we are about to mutate.
+WORKER_DONE_IDENTITY_FIELDS = ("dispatchId", "taskId")
+# Where a Dispatch row records the completion timestamp axis (a) requires as
+# provenance. The live runtime writes `completed_at` (snake_case, on both the
+# `completed` and the `failed` row); the camelCase spellings are accepted so a
+# JSON-cased projection of the same row is not read as "never completed".
+COMPLETION_TIMESTAMP_KEYS = ("completed_at", "completedAt", "settled_at", "settledAt")
+
+
+def completion_timestamp(dispatch_row: dict[str, Any]) -> str | None:
+    """The Dispatch row's completion timestamp, or None when it carries none.
+
+    Read-only and total: an unknown row shape answers None rather than raising, so
+    the caller decides what a missing timestamp means.
+    """
+    for key in COMPLETION_TIMESTAMP_KEYS:
+        value = dispatch_row.get(key)
+        if value:
+            return str(value)
+    return None
 
 
 class OrcaRuntimeError(RuntimeError):
@@ -448,6 +481,113 @@ class OrcaRuntimeHarness:
             "mid-settlement; recover explicitly instead of repeating the "
             "lifecycle action"
         )
+
+    def verify_settlement(
+        self,
+        dispatch_id: str,
+        *,
+        task_id: str,
+        observation: dict[str, Any],
+        done: dict[str, Any],
+        task_status: str,
+        supervised: bool,
+    ) -> str:
+        """STEP 1b gate. Prove axis (a) BEFORE the first lifecycle mutation.
+
+        Pure with respect to the runtime: issues ZERO Orca commands, exactly like
+        account_axes(). Every input was already fetched by the read-only STEP 1/1b
+        observations, so proving settlement costs no extra mutation risk.
+
+        Returns the proven Dispatch status ("completed" or "failed") and lets the
+        caller proceed to STEP 2. Raises OrcaRuntimeError -- with no lifecycle
+        command issued at all -- when this Dispatch did not actually settle:
+
+          * the `worker_done` was rejected by the runtime;
+          * the `worker_done` does not carry BOTH expected identities, or carries the
+            wrong one (it settles a different Dispatch or a different Task than the
+            one we are about to mutate);
+          * the `worker_done` carries no explicit `succeeded`/`failed` outcome, so it
+            is not an accepted settlement message at all;
+          * the supervised worker record produced no outcome (UNSETTLED_WORKER_STATES);
+          * the Dispatch row or the Task row is still `dispatched`;
+          * the settled Dispatch row carries no completion timestamp, so its
+            provenance does not actually record a completion.
+
+        Those are exactly the cases SKILL.md section 6 axis (a) routes to the
+        recovery path (observe_unexpected_exit's abandon/task-update flow), never to
+        worker-release / worker-retain / close. STEP 0's exactly-once gate answers a
+        different question -- "did I already settle this Dispatch?" -- and stays
+        ahead of this check; this one answers "is there a settlement to account at
+        all?".
+
+        Every one of these is a *read-only* question, which is the whole reason they
+        belong here: a check that could be answered before the mutation and is
+        instead answered after it (STEP 4's payload["outcome"], before this gate
+        validated the field) is the same defect in miniature.
+        """
+        payload = json.loads(done["payload"])
+        if payload.get("_orcaLifecycleRejection"):
+            raise OrcaRuntimeError(
+                f"dispatch {dispatch_id} worker_done was rejected by Orca; no "
+                "lifecycle mutation issued -- follow the guide's recovery procedure"
+            )
+        # Identity before everything else that reads the payload: a message that does
+        # not provably belong to THIS dispatch and THIS task says nothing about them,
+        # whatever else it contains. dispatchId is checked first so a mismatched
+        # dispatch keeps reporting itself as a stale delivery.
+        expected = {"dispatchId": dispatch_id, "taskId": task_id}
+        for field_name in WORKER_DONE_IDENTITY_FIELDS:
+            reported = payload.get(field_name)
+            if reported is None:
+                raise OrcaRuntimeError(
+                    f"worker_done for dispatch {dispatch_id} carries no "
+                    f"{field_name}; its identity cannot be proven and no lifecycle "
+                    "mutation was issued"
+                )
+            if reported != expected[field_name]:
+                raise OrcaRuntimeError(
+                    f"stale worker_done: payload {field_name} is {reported}, not "
+                    f"{expected[field_name]}; no lifecycle mutation issued"
+                )
+        outcome = payload.get("outcome")
+        if outcome not in SETTLED_OUTCOMES:
+            raise OrcaRuntimeError(
+                f"dispatch {dispatch_id} worker_done carries outcome {outcome!r}, "
+                f"not one of {sorted(SETTLED_OUTCOMES)}; no lifecycle mutation "
+                "issued -- an accepted worker_done reports an explicit outcome, so "
+                "recover this dispatch explicitly instead"
+            )
+        worker_state = (observation.get("worker") or {}).get("state")
+        if supervised and worker_state in UNSETTLED_WORKER_STATES:
+            raise OrcaRuntimeError(
+                f"dispatch {dispatch_id} worker is {worker_state!r} and produced no "
+                "outcome; no lifecycle mutation issued -- take the abandon recovery "
+                "path instead"
+            )
+        dispatch_row = observation.get("dispatch") or {}
+        dispatch_status = dispatch_row.get("status")
+        unsettled = ", ".join(
+            f"{name} status {status!r}"
+            for name, status in (("dispatch", dispatch_status), ("task", task_status))
+            if status not in SETTLED_STATUSES
+        )
+        if unsettled:
+            raise OrcaRuntimeError(
+                f"dispatch {dispatch_id} is not settled ({unsettled}); no lifecycle "
+                "mutation issued -- axis (a) must be proven from Task/Dispatch "
+                "provenance before worker-release/worker-retain, so recover this "
+                "dispatch explicitly instead"
+            )
+        # The last half of the axis (a) sentence: a settled status AND a completion
+        # timestamp in the provenance. A row that claims an outcome but records no
+        # moment of completion is not the settlement receipt the guide asks for.
+        if completion_timestamp(dispatch_row) is None:
+            raise OrcaRuntimeError(
+                f"dispatch {dispatch_id} reports status {dispatch_status!r} but its "
+                "provenance carries no completion timestamp; no lifecycle mutation "
+                "issued -- axis (a) requires both before worker-release/worker-retain"
+            )
+        return dispatch_status
 
     def account_axes(
         self,
@@ -879,19 +1019,43 @@ class OrcaRuntimeHarness:
             ]
             observation = {"dispatch": shown.get("dispatch") or shown}
 
+        # ==== STEP 1b. SETTLEMENT VERIFICATION ==============================
+        # Axis (a), proven from real Task/Dispatch provenance and proven HERE, above
+        # every lifecycle mutation. Both reads are read-only: STEP 1 already fetched
+        # the Dispatch row, and task_status() reads the same Task row STEP 4 accounts
+        # from -- it is read earlier now, not read twice. A dispatch that never
+        # settled leaves this method by raising, having issued zero lifecycle
+        # commands, and is recovered explicitly. The EXPECTED task id is handed in so
+        # the gate can compare both identities the guide names, not just the dispatch.
+        task_status = self.task_status(task_id)
+        try:
+            verified_status = self.verify_settlement(
+                dispatch_id,
+                task_id=task_id,
+                observation=observation,
+                done=done,
+                task_status=task_status,
+                supervised=supervised,
+            )
+        except OrcaRuntimeError as error:
+            # The STEP 0 claim is one-way and stays in place; record why it was
+            # refused so the recovery path finds a reason, not a bare stuck row.
+            self._ledger[dispatch_id]["unsettled_reason"] = str(error)
+            raise
+
         # ==== STEP 2. exactly one lifecycle mutation ========================
-        # The only place in settle_attempt that mutates lifecycle state, and it is
-        # unreachable unless STEP 0 handed this dispatch to us.
+        # The only place in settle_attempt that mutates lifecycle state. It is
+        # unreachable unless STEP 0 handed this dispatch to us AND STEP 1b proved the
+        # dispatch actually settled.
+        dispatch_status = verified_status
         if supervised:
             command = LIFECYCLE_TO_COMMAND[lifecycle]
             action = self.call("orchestration", command, "--dispatch", dispatch_id)
-            dispatch_status = observation["dispatch"]["status"]
             worker_state = observation["worker"]["state"]
             terminal_resource = observation.get("terminalResource") or {}
             terminal_state = terminal_resource.get("releaseState", "none")
             lifecycle_action = f"{lifecycle}:{action['result']['state']}"
         else:
-            dispatch_status = observation["dispatch"]["status"]
             worker_state = "settled_external"
             terminal_state = (
                 "reused"
@@ -905,12 +1069,11 @@ class OrcaRuntimeHarness:
             )
             observation["terminalState"] = terminal_state
 
-        # ==== STEP 3. delivery ack + task status ============================
+        # ==== STEP 3. delivery ack ==========================================
         self._ack(delivery_id)
-        tasks = self.call("orchestration", "task-list", "--run", self.run_id)["result"][
-            "tasks"
-        ]
-        task = next(item for item in tasks if item["id"] == task_id)
+        # Safe to index: STEP 1b proved this payload carries an explicit outcome from
+        # SETTLED_OUTCOMES, above the mutation, so this read can no longer be the
+        # first place a malformed worker_done is noticed.
         payload = json.loads(done["payload"])
 
         # ==== STEP 4. axes + single-assignment finalization =================
@@ -919,7 +1082,7 @@ class OrcaRuntimeHarness:
         self.demote_or_promote_role(
             terminal,
             self.ledger_terminal(terminal)["intended_role"],
-            settled=task["status"] == "completed",
+            settled=task_status == "completed",
         )
         axes = self.account_axes(
             task_id,
@@ -927,7 +1090,7 @@ class OrcaRuntimeHarness:
             terminal,
             supervised=supervised,
             observation=observation,
-            task_status=task["status"],
+            task_status=task_status,
             lifecycle=lifecycle,
         )
         attempt = RuntimeAttempt(
@@ -936,7 +1099,7 @@ class OrcaRuntimeHarness:
             task_id=task_id,
             dispatch_id=dispatch_id,
             outcome=payload["outcome"],
-            task_status=task["status"],
+            task_status=task_status,
             dispatch_status=dispatch_status,
             worker_state=worker_state,
             terminal_state=terminal_state,

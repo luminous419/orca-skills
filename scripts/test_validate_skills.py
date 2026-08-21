@@ -295,6 +295,22 @@ class ValidatorRegressionTests(unittest.TestCase):
             "lifecycle contract values differ from the validator source of truth"
         )
 
+    def test_lifecycle_contract_settlement_verification_drift_fails(self) -> None:
+        """Dropping the pre-mutation settlement check from the contract must fail.
+
+        The human review of PR #10 found the harness mutating lifecycle state before
+        axis (a) was proven; the anchor block is where that ordering requirement is
+        locked, so removing the token has to be rejected here.
+        """
+        self.mutate_orchestration_skill(
+            ", settlement_verified_before_lifecycle_action",
+            "",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "lifecycle contract values differ from the validator source of truth"
+        )
+
     def test_lifecycle_contract_copied_into_loop_skill_fails(self) -> None:
         orchestration = (
             self.repo_root / "orca-worker-reviewer-orchestration" / "SKILL.md"

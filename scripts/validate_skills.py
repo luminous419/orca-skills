@@ -109,7 +109,11 @@ LIFECYCLE_CONTRACT: dict[str, tuple[str, ...]] = {
     "CLOSE_ELIGIBLE_TERMINAL_ROLES": ("phase_worker", "phase_reviewer"),
     "CLOSE_ALLOWED_ONLY_WHEN": ("authorized_and_close_eligible_role",),
     "DEFAULT_WHEN_NOT_AUTHORIZED": ("retain_and_report",),
-    "FINALIZATION_PER_DISPATCH": ("exactly_once", "gate_before_lifecycle_action"),
+    "FINALIZATION_PER_DISPATCH": (
+        "exactly_once",
+        "gate_before_lifecycle_action",
+        "settlement_verified_before_lifecycle_action",
+    ),
     "TASK_GRAPH_ORDERING": ("create_graph_before_worker_dispatch",),
     "FORCE_READY_USE": ("recovery_only",),
     "CUSTOM_COMMAND_PLACEMENT_ORDER": (

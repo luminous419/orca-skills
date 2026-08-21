@@ -66,10 +66,18 @@ NEW_ORCHESTRATION_SNIPPETS = (
     "orca orchestration worker-show --dispatch <dispatch_id> --json",
 )
 
+# Shaped exactly like a live `worker_done` payload: the dispatch preamble sends
+# --task-id/--dispatch-id/--outcome, so all three identities are present. STEP 1b now
+# requires all three, which is what makes the omission fixtures below meaningful.
 DONE = {
-    "payload": json.dumps({"outcome": "succeeded", "dispatchId": "ctx_1"}),
+    "payload": json.dumps(
+        {"taskId": "task_g", "dispatchId": "ctx_1", "outcome": "succeeded"}
+    ),
     "body": "ok",
 }
+# The completion timestamp axis (a) requires alongside a settled status. The live
+# runtime writes `completed_at` on both the completed and the failed Dispatch row.
+COMPLETED_AT = "2026-08-21 20:12:31"
 
 
 class AxisCase(NamedTuple):
@@ -103,7 +111,7 @@ class RecordingExec:
 
     RESULTS = {
         "worker-show": {
-            "dispatch": {"status": "completed"},
+            "dispatch": {"status": "completed", "completed_at": COMPLETED_AT},
             "worker": {"state": "settled"},
             "terminalResource": {"releaseState": "released"},
         },
@@ -111,7 +119,9 @@ class RecordingExec:
         "worker-retain": {"state": "retained"},
         "check": {},
         "task-list": {"tasks": [{"id": "task_g", "status": "completed"}]},
-        "dispatch-show": {"dispatch": {"status": "completed"}},
+        "dispatch-show": {
+            "dispatch": {"status": "completed", "completed_at": COMPLETED_AT}
+        },
         "dispatch": {"dispatch": {"id": "ctx_1"}},
         "worker-start": {"dispatchId": "ctx_1"},
         "task-create": {"task": {"id": "task_g"}},
@@ -129,7 +139,7 @@ class RecordingExec:
                 "id": "msg_1",
                 "type": "worker_done",
                 "payload": json.dumps(
-                    {"outcome": "succeeded", "dispatchId": "ctx_1"}
+                    {"taskId": "task_g", "dispatchId": "ctx_1", "outcome": "succeeded"}
                 ),
                 "body": "ok",
             }
@@ -380,7 +390,10 @@ class DuplicateSettlementTests(unittest.TestCase):
         self.assertEqual(harness.lifecycle_commands("ctx_1"), ["worker-release"])
 
     def test_crashed_settlement_is_not_auto_retried(self) -> None:
-        recorder = RecordingExec(fail_on="task-list")
+        # The crash point is the delivery ack (STEP 3), i.e. the first call *after*
+        # the lifecycle mutation. Anything earlier now fails in STEP 1b's settlement
+        # verification, which by design leaves no mutation to be repeated.
+        recorder = RecordingExec(fail_on="check")
         harness = self.make_harness(recorder)
 
         with self.assertRaises(OrcaRuntimeError):
@@ -448,7 +461,9 @@ class DuplicateSettlementTests(unittest.TestCase):
         this throwaway harness -- and asserts none of them reverts the claimed row.
         Forward movement (finalize_once) is allowed; only "absent" is not.
         """
-        recorder = RecordingExec(fail_on="task-list")
+        # fail_on the delivery ack: the crash must land after the mutation, so the
+        # swept row really is "claimed, and one lifecycle command already went out".
+        recorder = RecordingExec(fail_on="check")
         harness = self.make_harness(recorder)
 
         with self.assertRaises(OrcaRuntimeError):
@@ -1105,12 +1120,607 @@ class AccountAxesTests(OfflineHarnessTestCase):
         self.assertEqual(recorder.commands, [])
 
 
+class SettlementOrderingTests(OfflineHarnessTestCase):
+    """Axis (a) is proven from provenance BEFORE the first lifecycle mutation.
+
+    Human review of PR #10 found STEP 2 issuing worker-release / worker-retain on a
+    Dispatch that could still be `dispatched`: STEP 0 answers "did I already settle
+    this Dispatch?" (idempotency) and, before STEP 1b existed, nothing answered "is
+    there a settlement to account at all?" (correctness). These tests pin the
+    corrected order -- STEP 0 gate, read-only provenance, verification, then exactly
+    one mutation -- on both execution paths.
+    """
+
+    SETTLED = {
+        "worker-show": {
+            "dispatch": {"status": "completed", "completed_at": COMPLETED_AT},
+            "worker": {"state": "settled"},
+            "terminalResource": {"releaseState": "active"},
+        },
+        "task-list": {"tasks": [{"id": "task_g", "status": "completed"}]},
+        "dispatch-show": {
+            "dispatch": {"status": "completed", "completed_at": COMPLETED_AT}
+        },
+    }
+    NOT_SETTLED = {
+        "worker-show": {
+            # a worker record that looks perfectly healthy: only the Dispatch and
+            # Task rows say this dispatch has not reached an outcome yet
+            "dispatch": {"status": "dispatched"},
+            "worker": {"state": "settled"},
+            "terminalResource": {"releaseState": "active"},
+        },
+        "task-list": {"tasks": [{"id": "task_g", "status": "dispatched"}]},
+        "dispatch-show": {"dispatch": {"status": "dispatched"}},
+    }
+    LIFECYCLE_VERBS = ("worker-release", "worker-retain", "worker-abandon", "close")
+
+    def settle(
+        self,
+        harness: OrcaRuntimeHarness,
+        *,
+        lifecycle: str = "release",
+        supervised: bool = True,
+        done: dict[str, Any] = DONE,
+    ) -> RuntimeAttempt:
+        return harness.settle_attempt(
+            "worker",
+            1,
+            "task_g",
+            "ctx_1",
+            done,
+            "dlv_1",
+            lifecycle=lifecycle,
+            supervised=supervised,
+            terminal="term_worker",
+        )
+
+    def assert_no_lifecycle_mutation(
+        self, harness: OrcaRuntimeHarness, recorder: RecordingExec
+    ) -> None:
+        self.assertEqual(harness.lifecycle_commands("ctx_1"), [])
+        for verb in self.LIFECYCLE_VERBS:
+            self.assertNotIn(verb, recorder.verbs)
+
+    # ---- 1. a settled dispatch mutates exactly once, and only after the reads ----
+
+    def test_a_settled_dispatch_allows_exactly_one_lifecycle_mutation(self) -> None:
+        recorder = RecordingExec(results=self.SETTLED)
+        harness = self.build(recorder)
+        self.worker_terminal(harness)
+
+        attempt = self.settle(harness)
+
+        self.assertEqual(attempt.settlement, "completed")
+        self.assertEqual(attempt.dispatch_status, "completed")
+        self.assertEqual(attempt.task_status, "completed")
+        self.assertEqual(harness.lifecycle_commands("ctx_1"), ["worker-release"])
+        # ordering, not just presence: both read-only provenance calls precede the
+        # single mutation, and the delivery ack follows it.
+        verbs = recorder.verbs
+        self.assertLess(verbs.index("worker-show"), verbs.index("task-list"))
+        self.assertLess(verbs.index("task-list"), verbs.index("worker-release"))
+        self.assertLess(verbs.index("worker-release"), verbs.index("check"))
+        self.assertNotIn("unsettled_reason", harness._ledger["ctx_1"])
+
+    def test_a_failed_dispatch_is_settled_too(self) -> None:
+        """`failed` is an outcome; only `dispatched` is not-settled."""
+        results = {
+            **self.SETTLED,
+            "worker-show": {
+                "dispatch": {"status": "failed", "completed_at": COMPLETED_AT},
+                "worker": {"state": "settled"},
+                "terminalResource": {"releaseState": "active"},
+            },
+            "task-list": {"tasks": [{"id": "task_g", "status": "failed"}]},
+        }
+        recorder = RecordingExec(results=results)
+        harness = self.build(recorder)
+        self.worker_terminal(harness)
+
+        attempt = self.settle(harness)
+
+        self.assertEqual(attempt.settlement, "failed")
+        self.assertEqual(harness.lifecycle_commands("ctx_1"), ["worker-release"])
+
+    # ---- 2. a not-settled dispatch mutates zero times, loudly --------------------
+
+    def test_a_not_settled_dispatch_issues_no_lifecycle_mutation(self) -> None:
+        for lifecycle in sorted(orca_runtime_harness.LIFECYCLE_INTENTS):
+            with self.subTest(lifecycle=lifecycle):
+                recorder = RecordingExec(results=self.NOT_SETTLED)
+                harness = self.build(recorder)
+                self.worker_terminal(harness)
+
+                with self.assertRaisesRegex(OrcaRuntimeError, "is not settled"):
+                    self.settle(harness, lifecycle=lifecycle)
+
+                self.assert_no_lifecycle_mutation(harness, recorder)
+                # not silently swallowed: the claim stays, carrying the reason, so
+                # the dispatch is recovered explicitly instead of re-mutated.
+                row = harness._ledger["ctx_1"]
+                self.assertEqual(row["state"], "in_progress")
+                self.assertIn("dispatch status 'dispatched'", row["unsettled_reason"])
+                self.assertIn("task status 'dispatched'", row["unsettled_reason"])
+
+    def test_either_half_of_the_provenance_alone_is_not_a_settlement(self) -> None:
+        """A completed Task with an open Dispatch (or the reverse) still blocks."""
+        cases = {
+            "dispatch still open": {
+                **self.NOT_SETTLED,
+                "task-list": {"tasks": [{"id": "task_g", "status": "completed"}]},
+            },
+            "task still open": {
+                **self.NOT_SETTLED,
+                "worker-show": self.SETTLED["worker-show"],
+                "dispatch-show": self.SETTLED["dispatch-show"],
+            },
+        }
+        for name, results in cases.items():
+            with self.subTest(case=name):
+                recorder = RecordingExec(results=results)
+                harness = self.build(recorder)
+                self.worker_terminal(harness)
+
+                with self.assertRaisesRegex(OrcaRuntimeError, "is not settled"):
+                    self.settle(harness)
+
+                self.assert_no_lifecycle_mutation(harness, recorder)
+
+    def test_a_worker_without_an_outcome_is_refused_before_any_mutation(self) -> None:
+        """The abandon-recovery states never reach release, even if the rows lie."""
+        for state in sorted(orca_runtime_harness.UNSETTLED_WORKER_STATES):
+            with self.subTest(worker_state=state):
+                results = {
+                    **self.SETTLED,
+                    "worker-show": {
+                        **self.SETTLED["worker-show"],
+                        "worker": {"state": state},
+                    },
+                }
+                recorder = RecordingExec(results=results)
+                harness = self.build(recorder)
+                self.worker_terminal(harness)
+
+                with self.assertRaisesRegex(OrcaRuntimeError, "produced no outcome"):
+                    self.settle(harness)
+
+                self.assert_no_lifecycle_mutation(harness, recorder)
+
+    def test_a_stale_or_rejected_worker_done_is_refused_before_any_mutation(
+        self,
+    ) -> None:
+        cases = {
+            "stale": (
+                {
+                    "payload": json.dumps(
+                        {"outcome": "succeeded", "dispatchId": "ctx_other"}
+                    ),
+                    "body": "ok",
+                },
+                "stale worker_done",
+            ),
+            "rejected": (
+                {
+                    "payload": json.dumps(
+                        {
+                            "outcome": "succeeded",
+                            "dispatchId": "ctx_1",
+                            "_orcaLifecycleRejection": True,
+                        }
+                    ),
+                    "body": "ok",
+                },
+                "rejected by Orca",
+            ),
+        }
+        for name, (done, expected) in cases.items():
+            with self.subTest(case=name):
+                recorder = RecordingExec(results=self.SETTLED)
+                harness = self.build(recorder)
+                self.worker_terminal(harness)
+
+                with self.assertRaisesRegex(OrcaRuntimeError, expected):
+                    self.settle(harness, done=done)
+
+                self.assert_no_lifecycle_mutation(harness, recorder)
+
+    # ---- 3. replay still issues zero additional lifecycle commands ---------------
+
+    def test_replay_adds_no_further_lifecycle_command(self) -> None:
+        """STEP 1b did not weaken STEP 0: re-entry is still a pure replay."""
+        recorder = RecordingExec(results=self.SETTLED)
+        harness = self.build(recorder)
+        self.worker_terminal(harness)
+
+        first = self.settle(harness)
+        after_first = list(recorder.commands)
+
+        second = self.settle(harness)
+
+        self.assertEqual(asdict(second), asdict(first))
+        self.assertEqual(recorder.commands, after_first)
+        self.assertEqual(harness.lifecycle_commands("ctx_1"), ["worker-release"])
+        self.assertEqual(harness._ledger["ctx_1"]["replays"], 1)
+
+    def test_replay_after_a_refused_settlement_never_starts_a_mutation(self) -> None:
+        """The refused dispatch is recovered explicitly, never re-driven into STEP 2."""
+        recorder = RecordingExec(results=self.NOT_SETTLED)
+        harness = self.build(recorder)
+        self.worker_terminal(harness)
+
+        with self.assertRaisesRegex(OrcaRuntimeError, "is not settled"):
+            self.settle(harness)
+
+        with self.assertRaisesRegex(OrcaRuntimeError, "in progress|crashed"):
+            self.settle(harness)
+
+        self.assert_no_lifecycle_mutation(harness, recorder)
+        self.assertEqual(harness._ledger["ctx_1"]["state"], "in_progress")
+
+    # ---- 4. the guarantee means the same thing on both execution paths -----------
+
+    def test_both_execution_paths_share_the_ordering_guarantee(self) -> None:
+        for supervised in (True, False):
+            with self.subTest(supervised=supervised, settled=False):
+                recorder = RecordingExec(results=self.NOT_SETTLED)
+                harness = self.build(recorder)
+                self.worker_terminal(harness)
+
+                with self.assertRaisesRegex(OrcaRuntimeError, "is not settled"):
+                    self.settle(harness, supervised=supervised)
+
+                self.assert_no_lifecycle_mutation(harness, recorder)
+                # the unsupervised branch's terminal-exit confirmation is part of
+                # STEP 2 as well, so it must not run either
+                self.assertNotIn("wait", recorder.verbs)
+                self.assertEqual(harness._ledger["ctx_1"]["state"], "in_progress")
+
+            with self.subTest(supervised=supervised, settled=True):
+                recorder = RecordingExec(results=self.SETTLED)
+                harness = self.build(recorder)
+                self.worker_terminal(harness)
+
+                attempt = self.settle(harness, supervised=supervised)
+
+                # same axis (a) on both paths; the paths differ only in whether a
+                # supervised worker resource exists to mutate at all
+                self.assertEqual(attempt.settlement, "completed")
+                self.assertEqual(attempt.dispatch_status, "completed")
+                self.assertEqual(
+                    harness.lifecycle_commands("ctx_1"),
+                    ["worker-release"] if supervised else [],
+                )
+                probe = "worker-show" if supervised else "dispatch-show"
+                self.assertLess(
+                    recorder.verbs.index(probe), recorder.verbs.index("task-list")
+                )
+                self.assertLess(
+                    recorder.verbs.index("task-list"), recorder.verbs.index("check")
+                )
+
+
+    # ---- 5. gaps found while re-testing the human-review correction -------------
+
+    def test_a_settled_dispatch_mutates_once_for_every_lifecycle_intent(self) -> None:
+        """Requirement 1 holds for retain/reuse too, not only for release.
+
+        The not-settled direction is already swept over LIFECYCLE_INTENTS; the
+        settled direction was pinned for `release` alone, so a regression that let
+        STEP 1b run after the mutation on the retain branch could have slipped
+        through. The verb mapping matters here: reuse is issued as worker-retain.
+        """
+        for lifecycle in sorted(orca_runtime_harness.LIFECYCLE_INTENTS):
+            with self.subTest(lifecycle=lifecycle):
+                recorder = RecordingExec(results=self.SETTLED)
+                harness = self.build(recorder)
+                self.worker_terminal(harness)
+
+                attempt = self.settle(harness, lifecycle=lifecycle)
+
+                expected = orca_runtime_harness.LIFECYCLE_TO_COMMAND[lifecycle]
+                self.assertEqual(attempt.settlement, "completed")
+                self.assertEqual(harness.lifecycle_commands("ctx_1"), [expected])
+                verbs = recorder.verbs
+                self.assertLess(verbs.index("worker-show"), verbs.index("task-list"))
+                self.assertLess(verbs.index("task-list"), verbs.index(expected))
+                self.assertLess(verbs.index(expected), verbs.index("check"))
+
+    def test_verify_settlement_issues_no_orca_command(self) -> None:
+        """The gate is a pure judgement, exactly like account_axes.
+
+        A verification that could itself talk to the runtime would reintroduce the
+        very thing it guards -- work happening before axis (a) is proven -- so both
+        the accepting and the refusing direction are pinned at zero commands.
+        """
+        recorder = RecordingExec(results=self.SETTLED)
+        harness = self.build(recorder)
+        settled = {
+            "dispatch": {"status": "completed", "completed_at": COMPLETED_AT},
+            "worker": {"state": "settled"},
+        }
+
+        proven = harness.verify_settlement(
+            "ctx_1",
+            task_id="task_g",
+            observation=settled,
+            done=DONE,
+            task_status="completed",
+            supervised=True,
+        )
+
+        self.assertEqual(proven, "completed")
+        self.assertEqual(recorder.commands, [])
+
+        with self.assertRaisesRegex(OrcaRuntimeError, "is not settled"):
+            harness.verify_settlement(
+                "ctx_1",
+                task_id="task_g",
+                observation={"dispatch": {"status": "dispatched"}, "worker": {}},
+                done=DONE,
+                task_status="dispatched",
+                supervised=True,
+            )
+
+        self.assertEqual(recorder.commands, [])
+
+    def test_the_worker_state_gate_is_scoped_to_the_supervised_path(self) -> None:
+        """Requirement 4, at the one place the two paths legitimately differ.
+
+        UNSETTLED_WORKER_STATES describes a *supervised* worker record. On the
+        unsupervised path no such record was ever registered, so the same state
+        string carries no authority and provenance alone decides -- while the
+        supervised path must still refuse it. Pinning the asymmetry keeps a future
+        edit from either widening the refusal to a path that cannot observe the
+        state, or dropping it from the path that can.
+        """
+        observation = {
+            "dispatch": {"status": "completed", "completed_at": COMPLETED_AT},
+            "worker": {"state": "outcome_unknown"},
+        }
+        harness = self.build(RecordingExec(results=self.SETTLED))
+
+        with self.assertRaisesRegex(OrcaRuntimeError, "produced no outcome"):
+            harness.verify_settlement(
+                "ctx_1",
+                task_id="task_g",
+                observation=observation,
+                done=DONE,
+                task_status="completed",
+                supervised=True,
+            )
+
+        self.assertEqual(
+            harness.verify_settlement(
+                "ctx_1",
+                task_id="task_g",
+                observation=observation,
+                done=DONE,
+                task_status="completed",
+                supervised=False,
+            ),
+            "completed",
+        )
+
+    def test_a_refused_dispatch_is_not_re_driven_once_it_later_settles(self) -> None:
+        """STEP 0 and STEP 1b compose one-way: a refusal is terminal for this path.
+
+        The claim STEP 0 takes is deliberately irreversible, so a dispatch refused
+        by STEP 1b stays refused even after the runtime rows flip to `completed`.
+        That is the intended reading -- a claimed row carries no proof of how many
+        mutations went out -- and it is what makes "recover it explicitly" the only
+        way forward. Pinned because the alternative (quietly letting the retry
+        through) would look like a bug fix and would reopen the duplicate-mutation
+        hole STEP 0 exists to close.
+        """
+        recorder = RecordingExec(results=self.NOT_SETTLED)
+        harness = self.build(recorder)
+        self.worker_terminal(harness)
+
+        with self.assertRaisesRegex(OrcaRuntimeError, "is not settled"):
+            self.settle(harness)
+
+        # the dispatch settles for real a moment later
+        recorder.results.update(self.SETTLED)
+
+        with self.assertRaisesRegex(OrcaRuntimeError, "in progress|crashed"):
+            self.settle(harness)
+
+        self.assert_no_lifecycle_mutation(harness, recorder)
+        row = harness._ledger["ctx_1"]
+        self.assertEqual(row["state"], "in_progress")
+        self.assertIn("is not settled", row["unsettled_reason"])
+
+    def test_the_ordering_guarantee_is_scoped_to_the_settlement_path(self) -> None:
+        """The recovery path is the sanctioned exception, and stays distinguishable.
+
+        observe_unexpected_exit issues worker-abandon and worker-release on a
+        Dispatch row that is still `dispatched` -- that is what recovering an
+        unsettled dispatch *means*, and it is the path STEP 1b's error messages send
+        the caller to. settle_attempt refuses the same rows outright. Pinning both
+        halves side by side keeps the guarantee from being read as "no lifecycle
+        command may ever touch a not-settled dispatch", which would make the
+        documented recovery unreachable.
+        """
+        results = {
+            **self.NOT_SETTLED,
+            "worker-show": {
+                "dispatch": {"status": "dispatched"},
+                "worker": {"state": "outcome_unknown"},
+                "terminalResource": {"releaseState": "released"},
+            },
+            "worker-abandon": {"state": "abandoned"},
+            "task-list": {"tasks": [{"id": "task_g", "status": "failed"}]},
+        }
+
+        refusing = RecordingExec(results=self.NOT_SETTLED)
+        harness = self.build(refusing)
+        self.worker_terminal(harness)
+        with self.assertRaisesRegex(OrcaRuntimeError, "is not settled"):
+            self.settle(harness)
+        self.assert_no_lifecycle_mutation(harness, refusing)
+
+        recovering = RecordingExec(results=results)
+        recovery_harness = self.build(recovering)
+
+        attempt = recovery_harness.observe_unexpected_exit("worker", 1)
+
+        self.assertEqual(attempt.worker_done_count, 0)
+        self.assertEqual(
+            recovery_harness.lifecycle_commands("ctx_1"),
+            ["worker-abandon", "worker-release"],
+        )
+        # and it is still never a settlement, nor a close-eligible terminal
+        self.assertEqual(attempt.terminal_role, "active_worker")
+        self.assertEqual(attempt.cleanup_authority, "not_authorized")
+
+    def test_a_worker_done_without_an_outcome_is_refused_before_any_mutation(
+        self,
+    ) -> None:
+        """The outcome field is part of axis (a), so it is read before STEP 2.
+
+        The dispatch preamble requires `worker_done` to carry an explicit
+        `succeeded`/`failed` outcome, and STEP 4 indexes payload["outcome"]. While
+        STEP 1b did not look at the field, an outcome-less payload cleared the gate,
+        worker-release went out, and the settlement then died on a bare
+        KeyError('outcome') -- after the mutation, with no unsettled_reason recorded
+        and the OrcaRuntimeError handler never firing. That is the human review's
+        defect in miniature: a check that could be made read-only, made after the
+        mutation instead. The refusal now happens above STEP 2, with zero commands.
+        """
+        cases = {
+            "missing": {"taskId": "task_g", "dispatchId": "ctx_1"},
+            "null": {"taskId": "task_g", "dispatchId": "ctx_1", "outcome": None},
+            "not an outcome": {
+                "taskId": "task_g",
+                "dispatchId": "ctx_1",
+                # a plausible-looking status word that is NOT one of the two the
+                # contract defines; "settled" is what the worker *record* says
+                "outcome": "settled",
+            },
+        }
+        for name, payload in cases.items():
+            with self.subTest(case=name):
+                recorder = RecordingExec(results=self.SETTLED)
+                harness = self.build(recorder)
+                self.worker_terminal(harness)
+                done = {"payload": json.dumps(payload), "body": "ok"}
+
+                with self.assertRaisesRegex(OrcaRuntimeError, "carries outcome"):
+                    self.settle(harness, done=done)
+
+                self.assert_no_lifecycle_mutation(harness, recorder)
+                # refused the same way a not-settled dispatch is: the claim stays and
+                # carries the reason, so recovery finds a diagnosis, not a KeyError.
+                row = harness._ledger["ctx_1"]
+                self.assertEqual(row["state"], "in_progress")
+                self.assertIn("carries outcome", row["unsettled_reason"])
+
+    def test_both_expected_identities_are_required_before_any_mutation(self) -> None:
+        """Axis (a) compares the message against the EXPECTED Task AND Dispatch ID.
+
+        SKILL.md section 6 axis (a) settles a dispatch only on a `worker_done` that
+        matches both expected identities. wait_for_done() filters deliveries by
+        dispatchId, but verify_settlement is the single pre-mutation correctness gate
+        -- and it is reachable directly, from a recovery re-drive or a caller that
+        did its own delivery read -- so the gate itself must refuse a message that
+        names the wrong Task, or that names no identity at all.
+        """
+        cases = {
+            "no dispatchId": (
+                {"taskId": "task_g", "outcome": "succeeded"},
+                "carries no dispatchId",
+            ),
+            "no taskId": (
+                {"dispatchId": "ctx_1", "outcome": "succeeded"},
+                "carries no taskId",
+            ),
+            "wrong dispatchId": (
+                {"taskId": "task_g", "dispatchId": "ctx_other", "outcome": "succeeded"},
+                "payload dispatchId is ctx_other",
+            ),
+            "wrong taskId": (
+                {"taskId": "task_other", "dispatchId": "ctx_1", "outcome": "succeeded"},
+                "payload taskId is task_other",
+            ),
+        }
+        for name, (payload, expected) in cases.items():
+            with self.subTest(case=name):
+                recorder = RecordingExec(results=self.SETTLED)
+                harness = self.build(recorder)
+                self.worker_terminal(harness)
+                done = {"payload": json.dumps(payload), "body": "ok"}
+
+                with self.assertRaisesRegex(OrcaRuntimeError, expected):
+                    self.settle(harness, done=done)
+
+                self.assert_no_lifecycle_mutation(harness, recorder)
+                self.assertEqual(harness._ledger["ctx_1"]["state"], "in_progress")
+
+    def test_a_settled_status_without_a_completion_timestamp_is_refused(self) -> None:
+        """The other half of the axis (a) sentence: outcome AND completion timestamp.
+
+        A Dispatch row that claims `completed`/`failed` but records no moment of
+        completion is not the provenance the guide asks for -- it is the shape a
+        partially-written or synthesised row has. Refusing it keeps "provenance
+        proves the settlement" from degrading into "a status string proves it".
+        """
+        for status in sorted(orca_runtime_harness.SETTLED_STATUSES):
+            with self.subTest(status=status):
+                results = {
+                    **self.SETTLED,
+                    "worker-show": {
+                        **self.SETTLED["worker-show"],
+                        "dispatch": {"status": status},
+                    },
+                    "task-list": {"tasks": [{"id": "task_g", "status": status}]},
+                }
+                recorder = RecordingExec(results=results)
+                harness = self.build(recorder)
+                self.worker_terminal(harness)
+
+                with self.assertRaisesRegex(
+                    OrcaRuntimeError, "no completion timestamp"
+                ):
+                    self.settle(harness)
+
+                self.assert_no_lifecycle_mutation(harness, recorder)
+                self.assertIn(
+                    "no completion timestamp",
+                    harness._ledger["ctx_1"]["unsettled_reason"],
+                )
+
+    def test_the_completion_timestamp_is_read_from_the_real_row_spellings(self) -> None:
+        """`completed_at` is what the live runtime writes; the reader is not fussier.
+
+        Pinned against two opposite regressions: a reader hard-coded to one camelCase
+        spelling would refuse every real settled dispatch, and a reader that accepts
+        an empty string would let a blank timestamp count as provenance.
+        """
+        row = {"status": "completed"}
+        self.assertIsNone(orca_runtime_harness.completion_timestamp(row))
+        self.assertIsNone(
+            orca_runtime_harness.completion_timestamp({**row, "completed_at": None})
+        )
+        self.assertIsNone(
+            orca_runtime_harness.completion_timestamp({**row, "completed_at": ""})
+        )
+        for key in orca_runtime_harness.COMPLETION_TIMESTAMP_KEYS:
+            with self.subTest(key=key):
+                self.assertEqual(
+                    orca_runtime_harness.completion_timestamp(
+                        {**row, key: COMPLETED_AT}
+                    ),
+                    COMPLETED_AT,
+                )
+
+
 class ReuseIntentTests(OfflineHarnessTestCase):
     """A live terminal handed to the next Dispatch must not be released or closed."""
 
     LIVE_WORKER_SHOW = {
         "worker-show": {
-            "dispatch": {"status": "completed"},
+            "dispatch": {"status": "completed", "completed_at": COMPLETED_AT},
             "worker": {"state": "settled"},
             "terminalResource": {"releaseState": "active"},
         }

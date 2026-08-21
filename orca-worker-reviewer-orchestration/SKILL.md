@@ -423,9 +423,12 @@ accepted `worker_done`마다 서로 독립적인 네 축을 각각 확인하고 
 **(a) Dispatch outcome / settlement**
 
 - 권위 있는 근거는 Task/Dispatch provenance 조회뿐이다.
-- `worker_done`이 expected Task/Dispatch ID와 일치하고 lifecycle rejection 없이 accepted되었으며, 실제 provenance에 `completed`/`failed` outcome과 completion timestamp가 남아 있으면 settled로 account한다.
+- `worker_done`이 expected Task ID와 expected Dispatch ID **양쪽 모두**와 일치하고, 명시적 `succeeded`/`failed` outcome을 담고 있으며, lifecycle rejection 없이 accepted되었고, 실제 provenance에 `completed`/`failed` outcome과 completion timestamp가 남아 있으면 settled로 account한다. 둘 중 한쪽 ID만 일치하거나 outcome 필드가 없거나 provenance에 completion timestamp가 없으면 settled가 아니다.
 - settlement는 worker 기동 방식과 무관하다. supervised든 low-level이든 accepted `worker_done`은 동일하게 Dispatch를 settle한다. low-level Dispatch가 auto-settle되지 않는다고 가정하지 않는다.
 - 아직 `dispatched`면 settled가 아니다. `worker_done`이 rejected/stale이었을 수 있으므로 release나 cleanup으로 진행하지 않고 guide의 recovery 절차를 따른다.
+- 이 판정은 read-only이며, 그 Dispatch의 **첫 lifecycle mutation(`worker-release` / `worker-retain` / close)보다 반드시 먼저** 끝난다. 중복 종결 방지 gate는 "이 Dispatch를 이미 종결했는가"(idempotency)만 답하므로 "이 Dispatch가 실제로 settle되었는가"(correctness)를 대신 답하지 못한다. 두 gate는 모두 필요하며 순서는 **중복 종결 방지 gate → (a) 검증 → lifecycle mutation**이다.
+- (a)가 `completed`/`failed`를 증명하지 못하면 **settlement/finalization 경로**(`worker-release` / `worker-retain` / close)에서는 그 Dispatch에 대해 lifecycle mutation을 **하나도** 실행하지 않는다. 아직 `dispatched`이거나 rejected/stale `worker_done`이거나 outcome 필드 없는 `worker_done`이거나 worker가 outcome 없이 사라진 경우는 조용히 넘어가지 않고 명시적 error로 보고하거나 recovery/escalation 경로로 보낸다. 중복 종결 방지 gate가 이미 잡은 행은 그대로 두고 사유를 기록한다. 임의로 되돌려 재시도하지 않는다.
+- 이 금지의 **유일한 예외는 명시적 recovery 경로**다. worker가 `worker_done` 없이 사라진 Dispatch를 회수할 때는, 아직 `dispatched`인 그 Dispatch에 대해 supervised worker record가 outcome을 남기지 않았으면 `worker-abandon`을 먼저 실행하고 이어서 `worker-release`를 실행한다(이미 `failed`/`stopped`로 관측된 worker는 `worker-release`만). 두 명령 모두 **의도적으로** not-settled Dispatch에 실행된다. supervised worker resource가 없는 low-level Dispatch의 recovery는 Task를 `failed`로 표시할 뿐 worker-resource lifecycle 명령을 실행하지 않는다. unsettled Dispatch를 회수한다는 말이 곧 그 뜻이며, 위 금지는 settlement 경로가 unsettled Dispatch를 settled인 것처럼 종결하는 것을 막는 규칙이지 recovery를 막는 규칙이 아니다. recovery는 settlement로 account되지 않고, `worker_done` count는 0이며, terminal을 close-eligible role로 승격시키지 않는다.
 - settled 확인 후 수동 completed 표시를 중복하지 않는다.
 
 **(b) Supervised worker-resource registration**
@@ -467,12 +470,16 @@ setup terminal도, 아직 실행 중인 worker도 모두 "누군가 만든" term
 
 - STEP 4a supervised. STEP 4-0 통과 후 terminal effect가 `created`, ownership이 `owned`, retain 사유 없음, ownership이 다른 Dispatch로 이전되지 않음, worker identity 증명됨이 전부 성립할 때만 `authorized`. 이때도 직접 close하지 않고 release가 런타임 자신의 손으로 닫게 한다.
 - STEP 4b unsupervised. STEP 4-0 통과 후 Coordinator 자신의 생성 receipt가 유일한 근거이며, 그 receipt는 `handle + phase + role + 이 Dispatch id`를 모두 담아야 한다. 넷이 모두 있고 이후 ownership transfer/takeover receipt가 없으면 `authorized`(orca-cli 경로로 close, receipt 기록), 하나라도 없으면 `unknown`이다.
+- (c2)는 (c1)의 값과 무관하게 **항상** 계산해서 기록한다. (c1)이 live가 아닌 Dispatch도 네 축 모두에 outcome을 남긴다. 다만 그때 취해지는 action은 기록된 (c2) 값이 무엇이든 `nothing to do`다.
 - `unknown`은 close 금지 측면에서 `not_authorized`와 동일하게 취급하고, 차이는 보고 의무뿐이다. 권한이 적극적으로 증명되지 않은 모든 terminal의 기본 동작은 retain-and-report다.
 - 절대 닫지 않는 목록은 위 표에서 `not_authorized`/`unknown`으로 고정된 role 전체다. 이 목록은 산문이 아니라 role enum이므로 machine-checkable하다.
 
-순서 규정은 STEP 1 → 2 → 3 → 4다. (a) 확인 → (b) 확인 → (c1) 항상 확인 → (c1)이 live일 때만 (c2)를
-판정한다. 죽어 있으면 (c2)를 판정할 필요조차 없다. (c2) 안에서는 STEP 4-0(role) → 4a/4b(provenance)
-순서를 지킨다. role 게이트에서 탈락한 terminal에 대해서는 provenance 조회 자체를 하지 않는다.
+순서 규정은 STEP 1 → 2 → 3 → 4다. (a) 확인 → (b) worker-resource 처리 → (c1) 확인 → (c2) 확인이며,
+(a) 확인은 이 Dispatch의 첫 lifecycle mutation보다 앞에 온다. 네 축 outcome은 모든 Dispatch에 대해
+항상 기록한다. (c1)이 live가 아니어도 (c2)는 reporting/accounting 목적으로 계산해 기록하며, 실제
+close/mutation 결정만이 (c1)이 live인 terminal에 대해서만 의미를 갖는다. 죽어 있으면 (c2) 값이
+무엇이든 action은 `nothing to do`다. (c2) 안에서는 STEP 4-0(role) → 4a/4b(provenance) 순서를
+지킨다. role 게이트에서 탈락한 terminal에 대해서는 provenance 조회 자체를 하지 않는다.
 조회하면 "내가 만들었다"는 사실이 다시 close 유혹으로 되돌아온다.
 
 예외 하나가 보존된다. release가 `release_pending`/`release_unknown`이면 (c2)가 `authorized`여도
@@ -481,6 +488,7 @@ setup terminal도, 아직 실행 중인 worker도 모두 "누군가 만든" term
 #### Lifecycle safety
 
 - timeout, TUI idle, heartbeat, status, question, escalation, rejected/stale `worker_done`만으로 worker를 release하지 않는다.
+- settlement 경로의 어떤 lifecycle mutation도 그 Dispatch의 axis (a)가 Task/Dispatch provenance로 `completed`/`failed`임을 증명한 뒤에만 실행한다. 중복 종결 방지 gate 통과는 이 증명을 대신하지 못한다. 명시적 recovery 경로의 `worker-abandon`/`worker-release`는 axis (a)가 not-settled임을 확인한 뒤에 실행되는 별개의 동작이며 이 규칙의 예외다.
 - `worker-release`가 `release_pending` 또는 `release_unknown`을 반환하면 `terminal close`로 우회하지 않고 receipt의 recovery action을 따른다.
 - accepted `worker_done`마다 네 축 각각에 기록된 outcome이 있어야 하며, axis (b)의 outcome은 reuse, retain, release 또는 unsupervised 중 하나다.
 - `dispatch_not_found`와 같은 missing/unaddressable 결과는 axis (b)의 답이며 settlement에 대해 양방향 모두 무정보다. 역으로 supervised resource의 존재도 settlement의 증거가 아니다. settlement는 expected `worker_done` acceptance와 Task/Dispatch provenance로만 판정한다.
@@ -507,7 +515,7 @@ NEVER_CLOSE_TERMINAL_ROLES = coordinator_session, setup_terminal, active_worker,
 CLOSE_ELIGIBLE_TERMINAL_ROLES = phase_worker, phase_reviewer
 CLOSE_ALLOWED_ONLY_WHEN = authorized_and_close_eligible_role
 DEFAULT_WHEN_NOT_AUTHORIZED = retain_and_report
-FINALIZATION_PER_DISPATCH = exactly_once, gate_before_lifecycle_action
+FINALIZATION_PER_DISPATCH = exactly_once, gate_before_lifecycle_action, settlement_verified_before_lifecycle_action
 TASK_GRAPH_ORDERING = create_graph_before_worker_dispatch
 FORCE_READY_USE = recovery_only
 CUSTOM_COMMAND_PLACEMENT_ORDER = worker_start_agent, terminal_create_then_tui_idle_then_worker_start_terminal, dispatch_inject
