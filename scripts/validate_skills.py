@@ -354,6 +354,11 @@ def validate_machine_readable_contracts(validation: Validation) -> None:
             f"{skill_dir.name}: contract agent command pattern is invalid",
         )
         validation.check(
+            contract.get("custom_agent_command_pattern")
+            == "(?:claude|codex)-[A-Za-z0-9._-]+",
+            f"{skill_dir.name}: contract custom agent trust pattern is invalid",
+        )
+        validation.check(
             contract.get("agent_launch_arguments") == [],
             f"{skill_dir.name}: agent launch arguments must be empty",
         )

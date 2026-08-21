@@ -122,8 +122,10 @@ executable and does not inspect its implementation or vendor-specific model synt
 The Skill launches only that executable token and appends no model, permission, or
 vendor-specific arguments. Put any required flags in CLI configuration or the wrapper.
 
-Agent values must match `[A-Za-z0-9._-]+` and resolve on PATH. Do not pass arguments,
-shell fragments, absolute paths, or relative paths in `worker=` or `reviewer=`.
+Agent values must match `[A-Za-z0-9._-]+` and resolve on PATH. Custom wrappers must use
+a trusted `claude-` or `codex-` prefix; PATH-resolved shells and interpreters such as
+`bash`, `sh`, and `python3` are not agent commands. Do not pass arguments, shell
+fragments, absolute paths, or relative paths in `worker=` or `reviewer=`.
 
 Defaults:
 

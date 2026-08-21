@@ -14,9 +14,10 @@ command -v claude-glm
 command -v claude-gemma
 ```
 
-The known commands are `claude`, `codex`, `claude-glm`, and `claude-gemma`, but this
-is not a closed allowlist. Any explicitly selected command is accepted when it is a
-simple `[A-Za-z0-9._-]+` token and resolves to an executable on PATH.
+The known commands are `claude`, `codex`, `claude-glm`, and `claude-gemma`. Additional
+wrappers must use a trusted `claude-` or `codex-` prefix, be a simple
+`[A-Za-z0-9._-]+` token, and resolve to an executable on PATH. This prevents unrelated
+PATH commands such as shells and interpreters from being selected as agents.
 
 For a personal model-pinned setup, place wrappers such as `~/bin/claude-opus` and
 `~/bin/codex-sol` in a directory already on PATH, then select them by command name:

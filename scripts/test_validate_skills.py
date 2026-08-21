@@ -142,6 +142,25 @@ class ValidatorRegressionTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("vendor-specific agent launch argument", result.stdout)
 
+    def test_custom_agent_trust_pattern_drift_fails(self) -> None:
+        skill_path = (
+            self.repo_root / "orca-worker-reviewer-orchestration" / "SKILL.md"
+        )
+        text = skill_path.read_text(encoding="utf-8")
+        skill_path.write_text(
+            text.replace(
+                '"custom_agent_command_pattern": "(?:claude|codex)-[A-Za-z0-9._-]+"',
+                '"custom_agent_command_pattern": "[A-Za-z0-9._-]+"',
+                1,
+            ),
+            encoding="utf-8",
+        )
+
+        result = self.run_validator()
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("custom agent trust pattern is invalid", result.stdout)
+
     def test_workflow_output_contract_drift_fails(self) -> None:
         skill_path = (
             self.repo_root / "orca-worker-reviewer-orchestration" / "SKILL.md"

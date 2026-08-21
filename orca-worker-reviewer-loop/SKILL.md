@@ -175,6 +175,7 @@ DEFAULT_MAX_ITERATIONS = 5
   },
   "known_agent_commands": ["claude", "codex", "claude-glm", "claude-gemma"],
   "agent_command_pattern": "[A-Za-z0-9._-]+",
+  "custom_agent_command_pattern": "(?:claude|codex)-[A-Za-z0-9._-]+",
   "agent_launch_arguments": [],
   "max_iterations": {
     "min": 1,
@@ -226,9 +227,9 @@ claude-glm
 claude-gemma
 ```
 
-이 목록은 폐쇄형 allowlist가 아니다. 사용자가 `worker=<command>` 또는
-`reviewer=<command>`로 다른 model-pinned wrapper를 명시해도 아래 형식과 PATH 검증을
-통과하면 사용할 수 있다.
+이 목록 외에는 `claude-` 또는 `codex-` prefix를 가진 model-pinned wrapper만 허용한다.
+예: `claude-opus`, `codex-sol`. 안전한 token이라도 이 trust boundary 밖의 command는
+실행하지 않는다.
 
 agent parameter는 shell fragment나 경로가 아니라 하나의 simple PATH command token이다.
 
@@ -243,12 +244,13 @@ STATUS: BLOCKED
 REASON: INVALID_AGENT_COMMAND
 ```
 
-`AGENT_NOT_ALLOWED`는 이전 contract 소비자를 위한 legacy error code로만 유지한다.
-현재의 범용 command 정책에는 폐쇄형 allowlist gate가 없으므로 새 결정에서는 사용하지 않는다.
-
 ```text
-LEGACY REASON: AGENT_NOT_ALLOWED
+STATUS: BLOCKED
+REASON: AGENT_NOT_ALLOWED
 ```
+
+따라서 PATH에 존재하더라도 `bash`, `sh`, `python3`, `env` 같은 일반 shell/interpreter
+command는 agent로 승인하지 않는다.
 
 ## 6. Worker and Reviewer Must Differ
 

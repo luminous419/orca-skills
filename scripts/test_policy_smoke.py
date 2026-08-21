@@ -31,6 +31,9 @@ class PolicySmokeTests(unittest.TestCase):
             "claude-gemma",
             "claude-opus",
             "codex-sol",
+            "bash",
+            "sh",
+            "python3",
         ):
             executable = bin_dir / command
             executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
@@ -109,9 +112,17 @@ class PolicySmokeTests(unittest.TestCase):
 
     def test_missing_agent_command_is_blocked(self) -> None:
         self.assert_blocked(
-            " worker=missing-agent reviewer=claude-gemma phases=analysis 요청",
+            " worker=claude-missing reviewer=claude-gemma phases=analysis 요청",
             "AGENT_COMMAND_NOT_FOUND",
         )
+
+    def test_non_agent_path_commands_are_not_allowed(self) -> None:
+        for command in ("bash", "sh", "python3"):
+            with self.subTest(command=command):
+                self.assert_blocked(
+                    f" worker={command} reviewer=codex phases=analysis 요청",
+                    "AGENT_NOT_ALLOWED",
+                )
 
     def test_unsafe_agent_commands_are_blocked(self) -> None:
         for value in (
@@ -264,7 +275,8 @@ class PolicySmokeTests(unittest.TestCase):
         suffixes = (
             " help",
             " worker=claude-glm reviewer=claude-glm phases=analysis 요청",
-            " worker=missing-agent phases=analysis 요청",
+            " worker=claude-missing phases=analysis 요청",
+            " worker=bash reviewer=codex phases=analysis 요청",
             " worker=claude-opus reviewer=codex-sol phases=analysis 요청",
             " worker=../claude phases=analysis 요청",
             " max-iterations=0 phases=analysis 요청",

@@ -144,6 +144,21 @@ def evaluate_invocation(skill_path: Path, invocation: str) -> PolicyDecision:
             reviewer=reviewer,
             max_iterations=None,
         )
+    known_commands = set(contract["known_agent_commands"])
+    custom_command_pattern = re.compile(
+        str(contract["custom_agent_command_pattern"]), re.ASCII
+    )
+    if any(
+        command not in known_commands
+        and not custom_command_pattern.fullmatch(command)
+        for command in (worker, reviewer)
+    ):
+        return _blocked(
+            errors["agent_not_allowed"],
+            worker=worker,
+            reviewer=reviewer,
+            max_iterations=None,
+        )
     if worker == reviewer:
         return _blocked(
             errors["worker_reviewer_must_differ"],
