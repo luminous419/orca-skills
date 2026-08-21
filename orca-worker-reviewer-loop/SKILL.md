@@ -173,7 +173,8 @@ DEFAULT_MAX_ITERATIONS = 5
       "free-form phase requests"
     ]
   },
-  "agent_allowlist": ["claude-glm", "claude-gemma"],
+  "known_agent_commands": ["claude", "codex", "claude-glm", "claude-gemma"],
+  "agent_command_pattern": "[A-Za-z0-9._-]+",
   "max_iterations": {
     "min": 1,
     "max": 10
@@ -201,6 +202,8 @@ DEFAULT_MAX_ITERATIONS = 5
   },
   "errors": {
     "agent_not_allowed": "AGENT_NOT_ALLOWED",
+    "invalid_agent_command": "INVALID_AGENT_COMMAND",
+    "agent_command_not_found": "AGENT_COMMAND_NOT_FOUND",
     "worker_reviewer_must_differ": "WORKER_REVIEWER_MUST_DIFFER",
     "invalid_max_iterations": "INVALID_MAX_ITERATIONS",
     "invalid_phase": "INVALID_PHASE",
@@ -211,25 +214,40 @@ DEFAULT_MAX_ITERATIONS = 5
 }
 ```
 
-## 5. Agent Allowlist
+## 5. Agent Command Policy
 
-runtime agent command는 allowlist 기반으로 제한한다.
-
-기본 allowlist:
+기본 known commands:
 
 ```text
+claude
+codex
 claude-glm
 claude-gemma
 ```
 
-allowlist에 없는 agent가 지정되면 실행하지 않는다.
+이 목록은 폐쇄형 allowlist가 아니다. 사용자가 `worker=<command>` 또는
+`reviewer=<command>`로 다른 model-pinned wrapper를 명시해도 아래 형식과 PATH 검증을
+통과하면 사용할 수 있다.
+
+agent parameter는 shell fragment나 경로가 아니라 하나의 simple PATH command token이다.
+
+```text
+[A-Za-z0-9._-]+
+```
+
+공백, slash, argument, shell metacharacter가 포함된 값은 실행하지 않는다.
 
 ```text
 STATUS: BLOCKED
-REASON: AGENT_NOT_ALLOWED
+REASON: INVALID_AGENT_COMMAND
 ```
 
-새 agent를 사용하려면 이 Skill의 allowlist를 명시적으로 수정한다.
+`AGENT_NOT_ALLOWED`는 이전 contract 소비자를 위한 legacy error code로만 유지한다.
+현재의 범용 command 정책에는 폐쇄형 allowlist gate가 없으므로 새 결정에서는 사용하지 않는다.
+
+```text
+LEGACY REASON: AGENT_NOT_ALLOWED
+```
 
 ## 6. Worker and Reviewer Must Differ
 
@@ -277,6 +295,10 @@ REASON: AGENT_COMMAND_NOT_FOUND
 ```
 
 실제 실행은 command name을 사용한다.
+
+known command도 PATH에서 resolve되어야 한다. wrapper 내부 모델명이나 vendor별 model-selection
+syntax는 해석하지 않으며, generic CLI의 현재 configuration 또는 model-pinned wrapper가 모델을
+선택할 책임을 가진다.
 
 ## 8. Mandatory Independent Orca Sessions
 
@@ -499,7 +521,7 @@ REASON: PREVIOUS_PHASE_CHANGE_REQUIRED
 Coordinator는 orchestration만 담당한다.
 
 1. runtime parameter 해석
-2. allowlist 검증
+2. agent command token 형식 검증
 3. worker != reviewer 검증
 4. PATH command 검증
 5. phases 해석
@@ -901,8 +923,7 @@ IMPLEMENTATION production code change → Unit Test add/modify required
 BUGFIX → Regression Test required
 REFACTORING → relevant existing Unit Test execution + conditional test changes
 No required Unit Test → FAIL
-Agent command → allowlist only
-Agent resolution → PATH based
+Agent command → safe token + PATH resolution
 phases=A,B,C → A then B then C
 Invalid canonical order → BLOCK
 Explicit phases vs natural-language conflict → BLOCK

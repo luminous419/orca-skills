@@ -7,12 +7,35 @@ This repository contains multiple Orca skills. Install one or both skill directo
 - Orca
 - Claude Code environment capable of launching the selected Worker/Reviewer commands
 - `~/.claude/skills` available
-- Default agent commands on PATH:
+- The selected Worker and Reviewer commands on PATH. Defaults:
 
 ```bash
 command -v claude-glm
 command -v claude-gemma
 ```
+
+The known commands are `claude`, `codex`, `claude-glm`, and `claude-gemma`, but this
+is not a closed allowlist. Any explicitly selected command is accepted when it is a
+simple `[A-Za-z0-9._-]+` token and resolves to an executable on PATH.
+
+For a personal model-pinned setup, place wrappers such as `~/bin/claude-opus` and
+`~/bin/codex-sol` in a directory already on PATH, then select them by command name:
+
+```text
+/orca-worker-reviewer-orchestration \
+  worker=claude-opus \
+  reviewer=codex-sol \
+  phases=analysis,plan,design
+```
+
+The repository intentionally does not provide those wrapper scripts. The Skill does
+not inspect wrapper internals. Likewise, when generic `claude` and `codex` commands are
+selected, model selection is the responsibility of each CLI's current configuration;
+the Skill does not choose or guarantee a model.
+
+Do not put arguments, paths, whitespace, or shell metacharacters in `worker=` or
+`reviewer=`. Values such as `claude --model opus`, `../claude`, an absolute path, or
+`claude;echo` are rejected rather than executed.
 
 Repository validation and packaging support CPython 3.11, 3.12, and 3.13 and use
 only the standard library. Read [`COMPATIBILITY.md`](COMPATIBILITY.md) before treating

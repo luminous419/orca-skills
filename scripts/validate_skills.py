@@ -45,6 +45,7 @@ PHASE_ROUTES = {
 
 REQUIRED_ERROR_CODES = (
     "AGENT_NOT_ALLOWED",
+    "INVALID_AGENT_COMMAND",
     "WORKER_REVIEWER_MUST_DIFFER",
     "AGENT_COMMAND_NOT_FOUND",
     "INVALID_PHASE",
@@ -338,13 +339,19 @@ def validate_machine_readable_contracts(validation: Validation) -> None:
 
         raw_defaults = contract.get("defaults", {})
         defaults = raw_defaults if isinstance(raw_defaults, dict) else {}
-        raw_allowlist = contract.get("agent_allowlist", [])
-        allowlist = raw_allowlist if isinstance(raw_allowlist, list) else []
+        raw_known_commands = contract.get("known_agent_commands", [])
+        known_commands = (
+            raw_known_commands if isinstance(raw_known_commands, list) else []
+        )
         validation.check(
-            defaults.get("worker") in allowlist
-            and defaults.get("reviewer") in allowlist
+            defaults.get("worker") in known_commands
+            and defaults.get("reviewer") in known_commands
             and defaults.get("worker") != defaults.get("reviewer"),
-            f"{skill_dir.name}: contract agent defaults/allowlist are inconsistent",
+            f"{skill_dir.name}: contract agent defaults/known commands are inconsistent",
+        )
+        validation.check(
+            contract.get("agent_command_pattern") == "[A-Za-z0-9._-]+",
+            f"{skill_dir.name}: contract agent command pattern is invalid",
         )
         validation.check(
             f"DEFAULT_WORKER = {defaults.get('worker')}" in skill_text
@@ -354,23 +361,23 @@ def validate_machine_readable_contracts(validation: Validation) -> None:
             f"{skill_dir.name}: human-readable defaults differ from contract",
         )
 
-        allowlist_match = re.search(
-            r"기본 allowlist:\s*```text\s*(?P<values>.*?)\s*```",
+        known_commands_match = re.search(
+            r"기본 known commands:\s*```text\s*(?P<values>.*?)\s*```",
             skill_text,
             re.DOTALL,
         )
-        documented_allowlist = (
+        documented_known_commands = (
             [
                 line.strip()
-                for line in allowlist_match.group("values").splitlines()
+                for line in known_commands_match.group("values").splitlines()
                 if line.strip()
             ]
-            if allowlist_match
+            if known_commands_match
             else []
         )
         validation.check(
-            documented_allowlist == allowlist,
-            f"{skill_dir.name}: human-readable allowlist differs from contract",
+            documented_known_commands == known_commands,
+            f"{skill_dir.name}: human-readable known commands differ from contract",
         )
         raw_iteration_range = contract.get("max_iterations", {})
         iteration_range = (
@@ -398,6 +405,8 @@ def validate_machine_readable_contracts(validation: Validation) -> None:
         errors = raw_errors if isinstance(raw_errors, dict) else {}
         required_error_keys = {
             "agent_not_allowed",
+            "invalid_agent_command",
+            "agent_command_not_found",
             "worker_reviewer_must_differ",
             "invalid_max_iterations",
             "invalid_phase",
