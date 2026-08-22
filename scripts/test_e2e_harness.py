@@ -5,9 +5,16 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from scripts.e2e_harness import E2EHarness, FakeScenario, WorkflowResult
+from scripts.e2e_harness import (
+    FinalReviewScenario,
+    WorkflowRunResult,
+    WorkflowScenario,
+    downstream_revalidation_set,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -278,3 +285,899 @@ class FakeAgentE2ETests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FinalAdversarialReviewTests(unittest.TestCase):
+    """DESIGN section 7.2: the Final Adversarial Review gate, offline and deterministic.
+
+    Every method drives the real `run_workflow` through the same fake Worker/Reviewer
+    subprocesses the phase tests use. `run()` itself is byte-unchanged, so the phase
+    gates below are the production single-phase authority, not a re-implementation.
+    """
+
+    ORCHESTRATION_SKILL = (
+        REPO_ROOT / "orca-worker-reviewer-orchestration" / "SKILL.md"
+    )
+    PASSING_PHASE = FakeScenario(("complete",), ("pass",))
+    RESOLUTION_CASES = {
+        "missing": {},
+        "extra": {"R1": "RESOLVED", "R9": "RESOLVED"},
+        "mismatched": {"R9": "RESOLVED"},
+    }
+
+    def run_workflow_scenario_with_artifact(
+        self,
+        scenario: WorkflowScenario,
+        *,
+        max_iterations: int = 5,
+        protect_artifact: bool = False,
+        skill_path: Path | None = None,
+    ) -> tuple[WorkflowRunResult, str | None]:
+        """Mirror of run_scenario for the workflow gate: temp workspace, optional
+        protected artifact, one E2EHarness, `run_workflow` instead of `run`."""
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory)
+            artifact = workspace / "production.txt"
+            protected: tuple[Path, ...] = ()
+            if protect_artifact:
+                artifact.write_text("production content\n", encoding="utf-8")
+                protected = (artifact,)
+            harness = E2EHarness(
+                skill_path or self.ORCHESTRATION_SKILL,
+                phase="implementation",
+                max_iterations=max_iterations,
+                workspace=workspace,
+                protected_artifacts=protected,
+            )
+            result = harness.run_workflow(scenario)
+            final_artifact = (
+                artifact.read_text(encoding="utf-8") if protect_artifact else None
+            )
+            return result, final_artifact
+
+    def run_workflow_scenario(
+        self,
+        scenario: WorkflowScenario,
+        *,
+        max_iterations: int = 5,
+        protect_artifact: bool = False,
+        skill_path: Path | None = None,
+    ) -> WorkflowRunResult:
+        result, _ = self.run_workflow_scenario_with_artifact(
+            scenario,
+            max_iterations=max_iterations,
+            protect_artifact=protect_artifact,
+            skill_path=skill_path,
+        )
+        return result
+
+    # ---- scenario builders shared by a dedicated method and the H-sweep ----------
+
+    def h1_scenario(self) -> tuple[WorkflowScenario, int]:
+        """H1: the responsible phase has already spent its whole budget."""
+        return (
+            WorkflowScenario(
+                phases=("analysis", "implementation"),
+                phase_scenarios={
+                    "analysis": self.PASSING_PHASE,
+                    "implementation": FakeScenario(
+                        worker_modes=("complete", "correction"),
+                        reviewer_modes=("fail", "pass"),
+                        reviewer_findings=(("P1",), ()),
+                        worker_resolutions=({}, {"P1": "RESOLVED"}),
+                    ),
+                },
+                final_review=FinalReviewScenario(
+                    modes=("fail",),
+                    findings=((("R1", "implementation"),),),
+                ),
+            ),
+            2,
+        )
+
+    def h2_scenario(self) -> tuple[WorkflowScenario, int]:
+        """H2: the Final Review budget runs out while a phase is exhausted too."""
+        return (
+            WorkflowScenario(
+                phases=("analysis", "implementation"),
+                phase_scenarios={
+                    "analysis": self.PASSING_PHASE,
+                    "implementation": self.PASSING_PHASE,
+                },
+                final_review=FinalReviewScenario(
+                    modes=("fail", "fail"),
+                    findings=((("R1", "analysis"),), (("R2", "analysis"),)),
+                ),
+                correction_scenarios={
+                    ("analysis", 1): FakeScenario(
+                        ("correction",),
+                        ("pass",),
+                        worker_resolutions=({"R1": "RESOLVED"},),
+                    ),
+                },
+                # T5a: correcting ANALYSIS during Final Review attempt 1 puts the
+                # requested IMPLEMENTATION phase downstream, so the revalidation round
+                # is mandatory. The key's iteration is the `final_review_iterations`
+                # value at the moment the correction ran, i.e. attempt 1. Supplying it
+                # keeps H2's witness intact: ANALYSIS still reaches the phase bound at
+                # the same moment the Final Review bound is reached.
+                revalidation_scenarios={("implementation", 1): self.PASSING_PHASE},
+            ),
+            2,
+        )
+
+    def h3_scenario(self) -> tuple[WorkflowScenario, int]:
+        """H3: max-iterations 1, so the very first FAIL is also the last attempt."""
+        return (
+            WorkflowScenario(
+                phases=("analysis", "implementation"),
+                phase_scenarios={
+                    "analysis": self.PASSING_PHASE,
+                    "implementation": self.PASSING_PHASE,
+                },
+                final_review=FinalReviewScenario(
+                    modes=("fail",),
+                    findings=((("R1", "implementation"),),),
+                ),
+            ),
+            1,
+        )
+
+    def h4_scenario(self) -> tuple[WorkflowScenario, int]:
+        """H4: the last-attempt guard fires while another phase still has budget.
+
+        T5a rewrite (DESIGN section 4.3): the corrected phase is now `implementation`,
+        the LAST requested phase, so `D == ()` and the revalidation loop never spends
+        the fresh `analysis` budget. Correcting `analysis` here -- the pre-T5a setup --
+        would revalidate `implementation` and destroy the very "fresh budget" this
+        guard is supposed to beat.
+        """
+        return (
+            WorkflowScenario(
+                phases=("analysis", "implementation"),
+                phase_scenarios={
+                    "analysis": FakeScenario(("complete",), ("pass",)),
+                    "implementation": FakeScenario(("complete",), ("pass",)),
+                },
+                final_review=FinalReviewScenario(
+                    modes=("fail", "fail", "fail"),
+                    findings=(
+                        (("R1", "implementation"),),
+                        (("R2", "implementation"),),
+                        (("R3", "analysis"),),
+                    ),
+                ),
+                correction_scenarios={
+                    ("implementation", 1): FakeScenario(
+                        ("correction",),
+                        ("pass",),
+                        worker_resolutions=({"R1": "RESOLVED"},),
+                    ),
+                    ("implementation", 2): FakeScenario(
+                        ("correction",),
+                        ("pass",),
+                        worker_resolutions=({"R2": "RESOLVED"},),
+                    ),
+                },
+            ),
+            3,
+        )
+
+    def v1_scenario(self) -> tuple[WorkflowScenario, int]:
+        """V1: the PR #11 human reviewer's own example -- DESIGN section 4.3.
+
+        Five requested phases, the Final Review corrects DESIGN, and the two requested
+        phases after DESIGN must be re-run before a fresh attempt may open.
+        """
+        phases = ("analysis", "plan", "design", "implementation", "test")
+        return (
+            WorkflowScenario(
+                phases=phases,
+                phase_scenarios={phase: self.PASSING_PHASE for phase in phases},
+                final_review=FinalReviewScenario(
+                    modes=("fail", "pass"),
+                    findings=((("R1", "design"),), ()),
+                ),
+                correction_scenarios={
+                    ("design", 1): FakeScenario(
+                        ("correction",),
+                        ("pass",),
+                        worker_resolutions=({"R1": "RESOLVED"},),
+                    ),
+                },
+                revalidation_scenarios={
+                    ("implementation", 1): self.PASSING_PHASE,
+                    ("test", 1): self.PASSING_PHASE,
+                },
+            ),
+            5,
+        )
+
+    def v4_scenario(self) -> tuple[WorkflowScenario, int]:
+        """V4: the revalidation round exhausts the downstream phase's own budget."""
+        return (
+            WorkflowScenario(
+                phases=("design", "implementation"),
+                phase_scenarios={
+                    "design": self.PASSING_PHASE,
+                    "implementation": self.PASSING_PHASE,
+                },
+                final_review=FinalReviewScenario(
+                    modes=("fail", "pass"),
+                    findings=((("R1", "design"),), ()),
+                ),
+                correction_scenarios={
+                    ("design", 1): FakeScenario(
+                        ("correction",),
+                        ("pass",),
+                        worker_resolutions=({"R1": "RESOLVED"},),
+                    ),
+                },
+                revalidation_scenarios={
+                    # budget is max_iterations - 1 == 1, and this Reviewer FAILs, so the
+                    # revalidation round exhausts the phase without ever PASSing.
+                    ("implementation", 1): FakeScenario(
+                        ("complete",),
+                        ("fail",),
+                        reviewer_findings=(("Q1",),),
+                    ),
+                },
+            ),
+            2,
+        )
+
+    def unaccounted_resolution_scenario(
+        self, emitted: dict[str, str]
+    ) -> tuple[WorkflowScenario, int]:
+        """R-N: every other guard is satisfied, so only the bridge can stop this run."""
+        return (
+            WorkflowScenario(
+                phases=("analysis", "implementation"),
+                phase_scenarios={
+                    "analysis": FakeScenario(("complete",), ("pass",)),
+                    "implementation": FakeScenario(("complete",), ("pass",)),
+                },
+                # attempt 2 would PASS -- so ONLY the bridge can stop this run.
+                final_review=FinalReviewScenario(
+                    modes=("fail", "pass"),
+                    findings=((("R1", "implementation"),), ()),
+                ),
+                correction_scenarios={
+                    ("implementation", 1): FakeScenario(
+                        ("correction",), ("pass",), worker_resolutions=(emitted,)
+                    ),
+                },
+            ),
+            5,
+        )
+
+    # ---- 1-2: the gate runs at all -----------------------------------------------
+
+    def test_scenario_a_final_review_runs_after_all_phases_pass(self) -> None:
+        phases = ("analysis", "plan", "design", "implementation", "test")
+        scenario = WorkflowScenario(
+            phases=phases,
+            phase_scenarios={phase: self.PASSING_PHASE for phase in phases},
+            final_review=FinalReviewScenario(modes=("pass",)),
+        )
+
+        result = self.run_workflow_scenario(scenario)
+
+        self.assertEqual(result.final_status, "COMPLETED")
+        self.assertEqual(result.final_review_verdict, "PASS")
+        self.assertEqual(result.final_review_iterations, 1)
+        self.assertEqual(result.phase_iterations, {phase: 1 for phase in phases})
+        self.assertEqual(len(result.final_review_attempts), 1)
+        self.assertEqual(result.correction_dispatches, [])
+        self.assertEqual(
+            result.final_review_artifacts,
+            ("artifacts/FINAL_REVIEW_final_adversarial_review.md",),
+        )
+
+    def test_scenario_a_final_review_runs_after_specialized_single_phase(self) -> None:
+        for phase in ("bugfix", "refactoring", "implementation"):
+            with self.subTest(phase=phase):
+                scenario = WorkflowScenario(
+                    phases=(phase,),
+                    phase_scenarios={phase: self.PASSING_PHASE},
+                    final_review=FinalReviewScenario(modes=("pass",)),
+                )
+
+                result = self.run_workflow_scenario(scenario)
+
+                # the gate is not skipped just because a single phase was requested
+                self.assertEqual(result.final_status, "COMPLETED")
+                self.assertEqual(result.final_review_iterations, 1)
+                self.assertEqual(result.final_review_verdict, "PASS")
+                self.assertEqual(result.phase_iterations, {phase: 1})
+
+    # ---- 3-5: FAIL, routing, and the correction loop ------------------------------
+
+    def test_scenario_c_final_review_fail_is_not_completed(self) -> None:
+        scenario = WorkflowScenario(
+            phases=("analysis", "implementation"),
+            phase_scenarios={
+                "analysis": self.PASSING_PHASE,
+                "implementation": self.PASSING_PHASE,
+            },
+            final_review=FinalReviewScenario(
+                modes=("fail", "fail"),
+                findings=((("R1", "implementation"),), (("R2", "implementation"),)),
+            ),
+            correction_scenarios={
+                ("implementation", 1): FakeScenario(
+                    ("correction",),
+                    ("pass",),
+                    worker_resolutions=({"R1": "RESOLVED"},),
+                ),
+            },
+        )
+
+        result = self.run_workflow_scenario(scenario, max_iterations=2)
+
+        self.assertNotEqual(result.final_status, "COMPLETED")
+        self.assertEqual(result.final_status, "ESCALATED")
+        self.assertEqual(result.final_review_verdict, "FAIL")
+
+    def test_scenario_d_finding_maps_to_responsible_phase_only(self) -> None:
+        scenario = WorkflowScenario(
+            phases=("analysis", "implementation"),
+            phase_scenarios={
+                "analysis": self.PASSING_PHASE,
+                "implementation": self.PASSING_PHASE,
+            },
+            final_review=FinalReviewScenario(
+                modes=("fail", "pass"),
+                findings=((("R1", "implementation"),), ()),
+            ),
+            correction_scenarios={
+                ("implementation", 1): FakeScenario(
+                    ("correction",),
+                    ("pass",),
+                    worker_resolutions=({"R1": "RESOLVED"},),
+                ),
+            },
+        )
+
+        result = self.run_workflow_scenario(scenario)
+
+        self.assertEqual(result.final_status, "COMPLETED")
+        self.assertEqual(
+            result.phase_iterations, {"analysis": 1, "implementation": 2}
+        )
+        self.assertEqual(result.final_review_iterations, 2)
+        # the exact DESIGN section 4.6 prompt-input row for attempt 2
+        self.assertEqual(
+            result.corrected_findings,
+            ((1, "R1", "implementation", "RESOLVED"),),
+        )
+        # the phase that was not responsible was never re-dispatched
+        self.assertEqual(result.correction_dispatches, [("implementation", 2)])
+        self.assertNotIn(
+            "analysis", {phase for phase, _ in result.correction_dispatches}
+        )
+
+    def test_scenario_e_multi_round_correction_then_final_review_pass(self) -> None:
+        scenario = WorkflowScenario(
+            phases=("analysis", "implementation"),
+            phase_scenarios={
+                "analysis": self.PASSING_PHASE,
+                "implementation": self.PASSING_PHASE,
+            },
+            final_review=FinalReviewScenario(
+                modes=("fail", "pass"),
+                findings=((("R1", "implementation"),), ()),
+            ),
+            correction_scenarios={
+                # the round itself needs two Reviewer attempts: R1 is the Final Review
+                # finding the bridge checks, X1 is the correction Reviewer's own finding
+                # that run()'s previous_blocking_findings check enforces.
+                ("implementation", 1): FakeScenario(
+                    worker_modes=("correction", "correction"),
+                    reviewer_modes=("fail", "pass"),
+                    reviewer_findings=(("X1",), ()),
+                    worker_resolutions=({"R1": "RESOLVED"}, {"X1": "RESOLVED"}),
+                ),
+            },
+        )
+
+        result = self.run_workflow_scenario(scenario)
+
+        self.assertEqual(result.final_status, "COMPLETED")
+        self.assertEqual(result.phase_iterations["implementation"], 3)
+        self.assertEqual(result.final_review_iterations, 2)
+        self.assertEqual(
+            result.correction_dispatches,
+            [("implementation", 2), ("implementation", 3)],
+        )
+
+    # ---- 6-9: the four escalation branches ---------------------------------------
+
+    def test_h1_phase_budget_exhausted_during_final_review_correction(self) -> None:
+        scenario, max_iterations = self.h1_scenario()
+
+        result = self.run_workflow_scenario(scenario, max_iterations=max_iterations)
+
+        self.assertEqual(result.final_status, "ESCALATED")
+        self.assertEqual(result.reason, "MAX_ITERATIONS_REACHED (implementation)")
+        self.assertEqual(result.final_review_iterations, 1)
+        # no third IMPLEMENTATION Reviewer, and no second Final Review attempt
+        self.assertEqual(result.phase_iterations["implementation"], 2)
+        self.assertEqual(result.correction_dispatches, [])
+        self.assertEqual(len(result.final_review_attempts), 1)
+
+    def test_h4_last_attempt_guard_fires_while_phase_budget_remains(self) -> None:
+        scenario, max_iterations = self.h4_scenario()
+
+        result = self.run_workflow_scenario(scenario, max_iterations=max_iterations)
+
+        self.assertEqual(result.final_status, "ESCALATED")
+        self.assertEqual(result.reason, "FINAL_REVIEW_MAX_ITERATIONS_REACHED")
+        self.assertEqual(result.final_review_iterations, 3)
+        self.assertEqual(result.phase_iterations["implementation"], 3)
+        self.assertEqual(result.phase_iterations["analysis"], 1)  # 2 unspent
+        # the guard, stated as a negative: the third FAIL named analysis, whose
+        # budget was NOT exhausted, and no correction for it was ever dispatched.
+        self.assertNotIn(
+            "analysis", {phase for phase, _ in result.correction_dispatches}
+        )
+        self.assertEqual(
+            result.correction_dispatches,
+            [("implementation", 2), ("implementation", 3)],
+        )
+        # and T5a genuinely had nothing to do: implementation is the last requested
+        # phase, so D == () and the fresh analysis budget was never touched.
+        self.assertEqual(result.revalidation_dispatches, [])
+
+    def test_h2_final_review_budget_exhausted_escalates_without_correction(
+        self,
+    ) -> None:
+        scenario, max_iterations = self.h2_scenario()
+
+        result = self.run_workflow_scenario(scenario, max_iterations=max_iterations)
+
+        self.assertEqual(result.final_status, "ESCALATED")
+        self.assertEqual(result.reason, "FINAL_REVIEW_MAX_ITERATIONS_REACHED")
+        # the responsible phase is exhausted at the same moment, and the reason is
+        # still never the phase one: T2 is evaluated before any phase counter is read.
+        self.assertEqual(result.phase_iterations["analysis"], max_iterations)
+        self.assertNotEqual(result.reason, "MAX_ITERATIONS_REACHED (analysis)")
+        # nothing was dispatched after Final Review attempt 2 failed
+        self.assertEqual(result.correction_dispatches, [("analysis", 2)])
+        self.assertEqual(result.final_review_iterations, 2)
+        # T5a ran once, for the one requested phase downstream of ANALYSIS, and the
+        # escalation still reports the Final Review reason rather than that phase's.
+        self.assertEqual(result.revalidation_dispatches, [("implementation", 2)])
+
+    def test_h3_max_iterations_one_escalates_on_first_final_review_fail(self) -> None:
+        scenario, max_iterations = self.h3_scenario()
+
+        result = self.run_workflow_scenario(scenario, max_iterations=max_iterations)
+
+        self.assertEqual(result.final_status, "ESCALATED")
+        self.assertEqual(result.reason, "FINAL_REVIEW_MAX_ITERATIONS_REACHED")
+        self.assertEqual(result.final_review_iterations, 1)
+        self.assertEqual(result.correction_dispatches, [])
+
+    def test_completed_is_unreachable_from_every_escalation_branch(self) -> None:
+        branches = {
+            "H1": self.h1_scenario(),
+            "H2": self.h2_scenario(),
+            "H3": self.h3_scenario(),
+            "H4": self.h4_scenario(),
+            "R-N": self.unaccounted_resolution_scenario({}),
+            # T5a's own escalation edge: a downstream revalidation that exhausts the
+            # phase budget must be just as unable to reach COMPLETED as the five above.
+            "V4": self.v4_scenario(),
+        }
+        for label, (scenario, max_iterations) in branches.items():
+            with self.subTest(branch=label):
+                result = self.run_workflow_scenario(
+                    scenario, max_iterations=max_iterations
+                )
+
+                self.assertNotEqual(result.final_status, "COMPLETED")
+
+    # ---- 11-15: routing, verdicts, artifacts, and run() parity --------------------
+
+    def test_out_of_scope_responsible_phase_escalates(self) -> None:
+        scenario = WorkflowScenario(
+            phases=("implementation",),
+            phase_scenarios={"implementation": self.PASSING_PHASE},
+            final_review=FinalReviewScenario(
+                modes=("fail",),
+                findings=((("R1", "refactoring"),),),
+            ),
+        )
+
+        result = self.run_workflow_scenario(scenario)
+
+        self.assertEqual(result.final_status, "ESCALATED")
+        self.assertEqual(result.reason, "OUT_OF_SCOPE_FINAL_REVIEW_FINDING")
+        # the requested phase set is never silently widened to absorb the finding
+        self.assertEqual(result.correction_dispatches, [])
+        self.assertEqual(result.phase_iterations, {"implementation": 1})
+        self.assertEqual(result.corrected_findings, ())
+
+    def test_minor_only_final_review_findings_are_a_pass(self) -> None:
+        scenario = WorkflowScenario(
+            phases=("implementation",),
+            phase_scenarios={"implementation": self.PASSING_PHASE},
+            final_review=FinalReviewScenario(
+                modes=("pass-nonblocking",),
+                findings=((("R1", "implementation"),),),
+            ),
+        )
+
+        result = self.run_workflow_scenario(scenario)
+
+        self.assertEqual(result.final_review_verdict, "PASS")
+        self.assertEqual(result.final_status, "COMPLETED")
+        self.assertEqual(result.correction_dispatches, [])
+        self.assertEqual(result.corrected_findings, ())
+
+    def test_final_review_does_not_modify_protected_artifacts(self) -> None:
+        modifying = WorkflowScenario(
+            phases=("implementation",),
+            phase_scenarios={"implementation": self.PASSING_PHASE},
+            final_review=FinalReviewScenario(
+                modes=("fail-modify",),
+                findings=((("R1", "implementation"),),),
+            ),
+        )
+
+        result, _ = self.run_workflow_scenario_with_artifact(
+            modifying, max_iterations=1, protect_artifact=True
+        )
+
+        self.assertEqual(result.final_status, "ERROR")
+        self.assertEqual(result.reason, "REVIEWER_MODIFIED_PROTECTED_ARTIFACT")
+        self.assertEqual(result.final_review_attempts, [])
+
+        # and a Final Reviewer that behaves leaves the protected bytes untouched
+        behaving = WorkflowScenario(
+            phases=("implementation",),
+            phase_scenarios={"implementation": self.PASSING_PHASE},
+            final_review=FinalReviewScenario(
+                modes=("fail",),
+                findings=((("R1", "implementation"),),),
+            ),
+        )
+
+        behaved, artifact = self.run_workflow_scenario_with_artifact(
+            behaving, max_iterations=1, protect_artifact=True
+        )
+
+        self.assertEqual(artifact, "production content\n")
+        self.assertEqual(behaved.final_status, "ESCALATED")
+
+    def test_run_is_unchanged_by_run_workflow(self) -> None:
+        phase_scenario = FakeScenario(
+            worker_modes=("complete", "correction"),
+            reviewer_modes=("fail", "pass"),
+            reviewer_findings=(("P1",), ()),
+            worker_resolutions=({}, {"P1": "RESOLVED"}),
+        )
+        escalating = FakeScenario(
+            worker_modes=("complete", "correction"),
+            reviewer_modes=("fail", "fail"),
+            reviewer_findings=(("P1",), ("P1",)),
+            worker_resolutions=({}, {"P1": "DISPUTED"}),
+        )
+        direct = FakeAgentE2ETests()
+        for scenario, max_iterations in ((phase_scenario, 5), (escalating, 2)):
+            with self.subTest(scenario=scenario):
+                expected, _ = direct.run_scenario(
+                    self.ORCHESTRATION_SKILL, scenario, max_iterations=max_iterations
+                )
+                workflow = WorkflowScenario(
+                    phases=("implementation",),
+                    phase_scenarios={"implementation": scenario},
+                    final_review=FinalReviewScenario(modes=("pass",)),
+                )
+
+                result = self.run_workflow_scenario(
+                    workflow, max_iterations=max_iterations
+                )
+
+                self.assertEqual(
+                    result.phase_iterations["implementation"],
+                    len(expected.reviewer_attempts),
+                )
+                if expected.final_status == "COMPLETED":
+                    self.assertEqual(result.final_status, "COMPLETED")
+                    self.assertEqual(result.final_review_iterations, 1)
+                else:
+                    # a phase that never PASSes propagates run()'s own status and
+                    # reason verbatim; the gate is never even opened.
+                    self.assertEqual(result.final_status, expected.final_status)
+                    self.assertEqual(result.reason, expected.reason)
+                    self.assertEqual(result.final_review_iterations, 0)
+                    self.assertEqual(result.final_review_attempts, [])
+
+    def test_final_review_artifact_paths_follow_the_attempt_suffix_rule(self) -> None:
+        scenario, max_iterations = self.h4_scenario()
+
+        result = self.run_workflow_scenario(scenario, max_iterations=max_iterations)
+
+        self.assertEqual(
+            result.final_review_artifacts,
+            (
+                "artifacts/FINAL_REVIEW_final_adversarial_review.md",
+                "artifacts/FINAL_REVIEW_final_adversarial_review_iteration2.md",
+                "artifacts/FINAL_REVIEW_final_adversarial_review_iteration3.md",
+            ),
+        )
+        self.assertEqual(
+            len(result.final_review_artifacts), result.final_review_iterations
+        )
+        for path in result.final_review_artifacts:
+            self.assertNotIn("_iteration1", path)
+
+    # ---- 16: the R1 bridge witness ------------------------------------------------
+
+    def test_unaccounted_final_review_finding_resolution_cannot_complete(self) -> None:
+        for label, emitted in self.RESOLUTION_CASES.items():
+            with self.subTest(case=label):
+                scenario, max_iterations = self.unaccounted_resolution_scenario(
+                    emitted
+                )
+
+                result = self.run_workflow_scenario(
+                    scenario, max_iterations=max_iterations
+                )
+
+                self.assertNotEqual(result.final_status, "COMPLETED")
+                self.assertEqual(result.final_status, "ERROR")
+                self.assertTrue(
+                    result.reason.startswith(
+                        "FINAL_REVIEW_RESOLUTION_TRACE_INCOMPLETE (implementation)"
+                    ),
+                    result.reason,
+                )
+                # counters: exactly what actually ran is charged, and no more
+                self.assertEqual(result.phase_iterations["implementation"], 2)
+                self.assertEqual(
+                    result.correction_dispatches, [("implementation", 2)]
+                )
+                # the OTHER counter domain is untouched: no attempt 2 was ever opened,
+                # even though the scenario supplies a PASSing one.
+                self.assertEqual(result.final_review_iterations, 1)
+                self.assertEqual(result.final_review_verdict, "FAIL")
+                # and the DECISION P1 table carries no unverified row
+                self.assertEqual(result.corrected_findings, ())
+
+    # ---- 17-22: T5a downstream revalidation (PR #11 human review, MAJOR 1) --------
+
+    def test_downstream_phases_are_revalidated_after_an_upstream_correction(
+        self,
+    ) -> None:
+        """V1 -- THE witness for MAJOR 1.
+
+        Against the pre-T5a harness `revalidation_dispatches` does not exist at all,
+        and even after a "declare the field but never populate it" patch this method
+        still fails twice over: on `revalidation_dispatches == [...]` and on
+        `phase_iterations`, whose implementation/test entries would remain 1 -- the
+        literal stale-PASS evidence the human reviewer described.
+        """
+        scenario, max_iterations = self.v1_scenario()
+
+        result = self.run_workflow_scenario(scenario, max_iterations=max_iterations)
+
+        self.assertEqual(result.final_status, "COMPLETED")
+        self.assertEqual(result.final_review_iterations, 2)
+        self.assertEqual(result.correction_dispatches, [("design", 2)])
+        # THE assertion MAJOR 1 asks for: the two requested phases after DESIGN were
+        # actually re-dispatched, in canonical order, before the fresh Final Review.
+        self.assertEqual(
+            result.revalidation_dispatches, [("implementation", 2), ("test", 2)]
+        )
+        self.assertEqual(
+            result.phase_iterations,
+            {"analysis": 1, "plan": 1, "design": 2, "implementation": 2, "test": 2},
+        )
+        # upstream phases are untouched
+        self.assertNotIn(
+            "analysis", {phase for phase, _ in result.revalidation_dispatches}
+        )
+        self.assertNotIn(
+            "plan", {phase for phase, _ in result.revalidation_dispatches}
+        )
+
+    def test_downstream_revalidation_is_empty_when_no_requested_phase_follows(
+        self,
+    ) -> None:
+        """V2: the specialized-phase and last-requested-phase carve-outs."""
+        for phase in ("bugfix", "refactoring", "implementation"):
+            with self.subTest(phase=phase):
+                scenario = WorkflowScenario(
+                    phases=(phase,),
+                    phase_scenarios={phase: self.PASSING_PHASE},
+                    final_review=FinalReviewScenario(
+                        modes=("fail", "pass"),
+                        findings=((("R1", phase),), ()),
+                    ),
+                    correction_scenarios={
+                        (phase, 1): FakeScenario(
+                            ("correction",),
+                            ("pass",),
+                            worker_resolutions=({"R1": "RESOLVED"},),
+                        ),
+                    },
+                )
+
+                result = self.run_workflow_scenario(scenario, max_iterations=5)
+
+                self.assertEqual(result.final_status, "COMPLETED")
+                self.assertEqual(result.final_review_iterations, 2)
+                # no revalidation scenario is supplied at all, so a non-empty D would
+                # additionally surface as ERROR/SCENARIO_REVALIDATION_MISSING here.
+                self.assertEqual(result.revalidation_dispatches, [])
+
+    def test_downstream_revalidation_fail_loop_then_pass(self) -> None:
+        """V3: section 12's FAIL Loop applies inside a revalidation round unchanged."""
+        scenario = WorkflowScenario(
+            phases=("design", "implementation"),
+            phase_scenarios={
+                "design": self.PASSING_PHASE,
+                "implementation": self.PASSING_PHASE,
+            },
+            final_review=FinalReviewScenario(
+                modes=("fail", "pass"),
+                findings=((("R1", "design"),), ()),
+            ),
+            correction_scenarios={
+                ("design", 1): FakeScenario(
+                    ("correction",),
+                    ("pass",),
+                    worker_resolutions=({"R1": "RESOLVED"},),
+                ),
+            },
+            revalidation_scenarios={
+                ("implementation", 1): FakeScenario(
+                    worker_modes=("complete", "correction"),
+                    reviewer_modes=("fail", "pass"),
+                    reviewer_findings=(("Q1",), ()),
+                    worker_resolutions=({}, {"Q1": "RESOLVED"}),
+                ),
+            },
+        )
+
+        result = self.run_workflow_scenario(scenario, max_iterations=5)
+
+        self.assertEqual(result.final_status, "COMPLETED")
+        self.assertEqual(
+            result.revalidation_dispatches,
+            [("implementation", 2), ("implementation", 3)],
+        )
+        self.assertEqual(result.phase_iterations["implementation"], 3)
+        # not escalated merely because the revalidation needed two rounds
+        self.assertNotEqual(result.final_status, "ESCALATED")
+        self.assertEqual(result.final_review_iterations, 2)
+
+    def test_downstream_revalidation_budget_exhaustion_escalates(self) -> None:
+        """V4: T5a's escalation edge reuses T4's reason literal, verbatim."""
+        scenario, max_iterations = self.v4_scenario()
+
+        result = self.run_workflow_scenario(scenario, max_iterations=max_iterations)
+
+        self.assertEqual(result.final_status, "ESCALATED")
+        # the SAME literal T4 escalates with -- T5a introduces no new REASON
+        self.assertEqual(result.reason, "MAX_ITERATIONS_REACHED (implementation)")
+        self.assertEqual(result.revalidation_dispatches, [("implementation", 2)])
+        # no fresh Final Review attempt was opened after a failed revalidation
+        self.assertEqual(result.final_review_iterations, 1)
+        self.assertEqual(len(result.final_review_attempts), 1)
+
+    def test_downstream_revalidation_set_is_the_suffix_after_the_earliest_corrected_phase(
+        self,
+    ) -> None:
+        """Unit test of `downstream_revalidation_set` itself -- DESIGN section 3.2.2."""
+        cases = {
+            "single canonical mid-run": (
+                ("design",),
+                ("analysis", "plan", "design", "implementation", "test"),
+                ("implementation", "test"),
+            ),
+            # V5: the later corrected phase is downstream of the earlier one, so the
+            # EARLIEST wins and `test` is corrected AND then revalidated again.
+            "V5 two corrected, later is downstream": (
+                ("design", "test"),
+                ("analysis", "design", "implementation", "test"),
+                ("implementation", "test"),
+            ),
+            "specialized-only corrected set": (
+                ("bugfix", "refactoring"),
+                ("bugfix", "refactoring"),
+                (),
+            ),
+            "corrected phase is the last requested": (
+                ("implementation",),
+                ("analysis", "implementation"),
+                (),
+            ),
+            "non-contiguous requested set": (
+                ("analysis",),
+                ("analysis", "test"),
+                ("test",),
+            ),
+        }
+        for label, (corrected, requested, expected) in cases.items():
+            with self.subTest(case=label):
+                self.assertEqual(
+                    downstream_revalidation_set(corrected, requested), expected
+                )
+
+        # negative: the result is ordered by CANONICAL_PHASES, never by `requested`,
+        # so a caller that passes `phases=` out of canonical order gets the SAME tuple.
+        self.assertEqual(
+            downstream_revalidation_set(
+                ("design",), ("test", "implementation", "design", "analysis")
+            ),
+            ("implementation", "test"),
+        )
+
+    def test_downstream_revalidation_adds_no_corrected_findings_row(self) -> None:
+        """V1 again, at the T5a / DECISION-P1 boundary (risk D-17's witness).
+
+        A revalidation round is not a correction: it resolves no finding, so it must
+        contribute no row to the table that feeds the next attempt's prompt -- and so
+        T5a must call `_phase_harness(...).run(...)`, never `_run_correction_round`.
+
+        Two revalidation Workers are exercised against the same V1 shape. The silent
+        one proves the row set stays at T4's single row. The one that VOLUNTEERS a
+        resolution trace is the behavioural detector for the risk D-17 variant the
+        silent case cannot see: DESIGN section 3.2.4a Q2 says a revalidation Worker is
+        handed UPSTREAM_CORRECTION, not PREVIOUS_REVIEW_FINDINGS, and "no resolution
+        trace is demanded of its first Worker". Routing T5a through
+        `_run_correction_round(phase, budget, revalidation, frozenset())` passes
+        `emitted == set()` silently for a Worker that emits nothing, but a Worker that
+        emits ANY resolution then trips the bridge with
+        `FINAL_REVIEW_RESOLUTION_TRACE_INCOMPLETE (implementation): missing=[]
+        extra=['R1']`. No mock, no spy -- only observable harness behaviour.
+        """
+        reporting_revalidation = FakeScenario(
+            ("complete",), ("pass",), worker_resolutions=({"R1": "RESOLVED"},)
+        )
+        for label, revalidation in (
+            ("silent revalidation Worker", self.PASSING_PHASE),
+            ("revalidation Worker volunteers a resolution", reporting_revalidation),
+        ):
+            with self.subTest(revalidation=label):
+                base, max_iterations = self.v1_scenario()
+                # WorkflowScenario is frozen: swap only the revalidation fixtures,
+                # so both cases share V1's phases, gates, and DESIGN correction.
+                scenario = replace(
+                    base,
+                    revalidation_scenarios={
+                        ("implementation", 1): revalidation,
+                        ("test", 1): revalidation,
+                    },
+                )
+
+                result = self.run_workflow_scenario(
+                    scenario, max_iterations=max_iterations
+                )
+
+                self.assertNotEqual(result.final_status, "ERROR")
+                self.assertEqual(result.final_status, "COMPLETED")
+                self.assertIsNone(result.reason)
+                # only T4's own row survives: the resolutions a revalidation Worker
+                # volunteers are never promoted into the DECISION P1 table.
+                self.assertEqual(
+                    result.corrected_findings, ((1, "R1", "design", "RESOLVED"),)
+                )
+                self.assertNotIn(
+                    "implementation",
+                    {phase for _, _, phase, _ in result.corrected_findings},
+                )
+                self.assertNotIn(
+                    "test", {phase for _, _, phase, _ in result.corrected_findings}
+                )
+                # the revalidations demonstrably DID happen -- so the empty row set
+                # above is the T5a/T4 boundary and not merely a run in which T5a
+                # never fired.
+                self.assertEqual(
+                    result.revalidation_dispatches,
+                    [("implementation", 2), ("test", 2)],
+                )

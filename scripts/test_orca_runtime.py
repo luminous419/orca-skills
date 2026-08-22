@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import tempfile
 import unittest
@@ -18,6 +19,7 @@ try:
         UNSETTLED_WORKER_STATES,
         WORKER_RESOURCE_OUTCOMES,
         UnsupportedOrcaContract,
+        run_final_review_runtime_scenario,
         run_runtime_scenarios,
     )
 except ModuleNotFoundError:
@@ -29,6 +31,7 @@ except ModuleNotFoundError:
         UNSETTLED_WORKER_STATES,
         WORKER_RESOURCE_OUTCOMES,
         UnsupportedOrcaContract,
+        run_final_review_runtime_scenario,
         run_runtime_scenarios,
     )
 
@@ -229,6 +232,77 @@ def main() -> None:
         global ARTIFACT_DIR
         ARTIFACT_DIR = args.artifact_dir
     unittest.main(argv=[__file__, *unittest_args])
+
+
+class FinalReviewRuntimeIntegrationTests(unittest.TestCase):
+    """Opt-in scenario J: Final Adversarial Review terminal freshness, real runtime.
+
+    Skipped unless ORCA_RUNTIME_TEST=1, exactly like OrcaRuntimeIntegrationTests.
+    Scenario J is deliberately outside run_runtime_scenarios(), whose A-I result set
+    is pinned by an exact-set assertion above.
+    """
+
+    FINAL_REVIEW_WORKER_RESOURCE_OUTCOMES = frozenset(
+        {"retain", "release", "unsupervised"}
+    )
+
+    def test_final_review_terminal_freshness(self) -> None:
+        if not RUN_ORCA:
+            self.skipTest("requires --orca-runtime and a ready Orca runtime")
+        if ARTIFACT_DIR:
+            artifact_dir = Path(ARTIFACT_DIR)
+            try:
+                result = run_final_review_runtime_scenario(artifact_dir)
+            except UnsupportedOrcaContract as exc:
+                self.skipTest(str(exc))
+            self.assert_scenario_j(result, artifact_dir)
+        else:
+            with tempfile.TemporaryDirectory() as directory:
+                artifact_dir = Path(directory)
+                try:
+                    result = run_final_review_runtime_scenario(artifact_dir)
+                except UnsupportedOrcaContract as exc:
+                    self.skipTest(str(exc))
+                self.assert_scenario_j(result, artifact_dir)
+
+    def assert_scenario_j(self, result, artifact_dir: Path) -> None:
+        # J-1: the scenario ran to completion
+        self.assertEqual(result.scenario, "J")
+        self.assertEqual(result.status, "COMPLETED")
+
+        # J-2: one brand-new terminal per Final Review attempt
+        self.assertEqual(len(result.final_review_terminals), 2)
+        self.assertNotEqual(
+            result.final_review_terminals[0], result.final_review_terminals[1]
+        )
+
+        # J-3: and none of them is a phase Reviewer's terminal
+        self.assertTrue(
+            set(result.final_review_terminals).isdisjoint(
+                result.phase_reviewer_terminals
+            )
+        )
+
+        # J-4/J-5: axis (b) is never reuse, and each Dispatch finalizes exactly once
+        final_review_attempts = [result.attempts[2], result.attempts[4]]
+        for attempt in final_review_attempts:
+            with self.subTest(dispatch=attempt.dispatch_id):
+                self.assertIn(
+                    attempt.worker_resource,
+                    self.FINAL_REVIEW_WORKER_RESOURCE_OUTCOMES,
+                )
+                self.assertNotEqual(attempt.worker_resource, "reuse")
+                self.assertIn(attempt.worker_resource, set(WORKER_RESOURCE_OUTCOMES))
+                self.assertEqual(attempt.finalizations, 1)
+                self.assertIn(attempt.terminal_role, TERMINAL_ROLE_CLASSES)
+
+        # J-6: the receipt on disk carries the same two distinct handles
+        snapshot_path = artifact_dir / "scenario-j.json"
+        self.assertTrue(snapshot_path.is_file(), snapshot_path)
+        snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        recorded = snapshot["result"]["final_review_terminals"]
+        self.assertEqual(recorded, result.final_review_terminals)
+        self.assertEqual(len(set(recorded)), 2)
 
 
 if __name__ == "__main__":

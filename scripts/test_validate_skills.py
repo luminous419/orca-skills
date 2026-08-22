@@ -330,6 +330,132 @@ class ValidatorRegressionTests(unittest.TestCase):
             "contract"
         )
 
+    # ---- DESIGN section 7.4: the section 17 final review contract ----------------
+
+    def final_review_contract_block(self) -> str:
+        """The section 17 anchor block, sliced out of the copied orchestration skill."""
+        orchestration = (
+            self.repo_root / "orca-worker-reviewer-orchestration" / "SKILL.md"
+        ).read_text(encoding="utf-8")
+        start = orchestration.index("#### Final review contract")
+        fence = orchestration.index("```text", start)
+        end = orchestration.index("```\n", fence + 1) + 4
+        return orchestration[start:end]
+
+    def test_bare_final_review_choice_line_fails(self) -> None:
+        """Blocker-1 lock: the result template's FINAL_REVIEW must stay a single value.
+
+        Written as `PASS | FAIL` it reads as a workflow choice line, and the shared
+        output-contract extractor then sees two skills declaring different fields.
+        """
+        self.mutate_orchestration_skill(
+            "FINAL_REVIEW: PASS",
+            "FINAL_REVIEW: PASS | FAIL",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "inconsistent fields for ['FAIL', 'PASS']"
+        )
+
+    def test_final_review_contract_missing_fails(self) -> None:
+        self.mutate_orchestration_skill(self.final_review_contract_block(), "")
+
+        self.assert_lifecycle_contract_rejected(
+            "missing or malformed final review contract"
+        )
+
+    def test_final_review_contract_allows_reuse_outcome_fails(self) -> None:
+        self.mutate_orchestration_skill(
+            "FINAL_REVIEW_WORKER_RESOURCE_OUTCOMES = retain, release, unsupervised",
+            "FINAL_REVIEW_WORKER_RESOURCE_OUTCOMES = reuse, retain, release, "
+            "unsupervised",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "FINAL_REVIEW_WORKER_RESOURCE_OUTCOMES must never contain reuse"
+        )
+
+    def test_final_review_contract_iteration_bound_drift_fails(self) -> None:
+        self.mutate_orchestration_skill(
+            "FINAL_REVIEW_ITERATION_BOUND = max_iterations",
+            "FINAL_REVIEW_ITERATION_BOUND = three",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "final review contract values differ from the validator source of truth"
+        )
+
+    def test_final_review_contract_last_attempt_guard_drift_fails(self) -> None:
+        self.mutate_orchestration_skill(
+            "FINAL_REVIEW_LAST_ATTEMPT_FAIL = escalate_before_correction_routing",
+            "FINAL_REVIEW_LAST_ATTEMPT_FAIL = correct_then_escalate",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "final review contract values differ from the validator source of truth"
+        )
+
+    def test_final_review_contract_task_graph_drift_fails(self) -> None:
+        self.mutate_orchestration_skill(
+            "FINAL_REVIEW_TASK_GRAPH = single_node_no_dependencies",
+            "FINAL_REVIEW_TASK_GRAPH = depends_on_last_reviewer_task",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "final review contract values differ from the validator source of truth"
+        )
+
+    def test_final_review_anti_anchoring_sentence_removed_fails(self) -> None:
+        self.mutate_orchestration_skill(
+            "이전 phase Reviewer의 PASS 판정을 옳다고 가정하지 않는다.\n",
+            "",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "final review prose is missing the anti-anchoring premise (ko)"
+        )
+
+    def test_final_review_contract_copied_into_loop_skill_fails(self) -> None:
+        block = self.final_review_contract_block()
+        loop_path = self.repo_root / "orca-worker-reviewer-loop" / "SKILL.md"
+        loop_path.write_text(
+            loop_path.read_text(encoding="utf-8") + "\n" + block,
+            encoding="utf-8",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "orca-worker-reviewer-loop: must not contain the orchestration final "
+            "review contract"
+        )
+
+    def test_final_review_downstream_revalidation_drift_fails(self) -> None:
+        """The permanent lock on the AMENDED DECISION P1 (PR #11 human review, MAJOR 1).
+
+        `delegated_to_next_final_review` is the superseded reading: it says a fresh
+        Final Review attempt is a substitute for re-running the downstream phases. That
+        reading cannot be re-introduced into section 17 without the validator rejecting
+        it, whatever any future prose around the block says.
+        """
+        self.mutate_orchestration_skill(
+            "FINAL_REVIEW_DOWNSTREAM_REVALIDATION = "
+            "all_requested_phases_after_earliest_corrected_phase",
+            "FINAL_REVIEW_DOWNSTREAM_REVALIDATION = delegated_to_next_final_review",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "final review contract values differ from the validator source of truth"
+        )
+
+    def test_final_review_role_outside_close_eligible_roles_fails(self) -> None:
+        self.mutate_orchestration_skill(
+            "FINAL_REVIEW_ROLE = phase_reviewer",
+            "FINAL_REVIEW_ROLE = coordinator_session",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "FINAL_REVIEW_ROLE must be a close eligible terminal role"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

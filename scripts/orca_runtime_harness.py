@@ -242,6 +242,8 @@ class RuntimeScenarioResult:
     reviewer_task_status: str = ""
     late_dependent_status: str = ""
     commands_used: list[str] = field(default_factory=list)
+    final_review_terminals: list[str] = field(default_factory=list)
+    phase_reviewer_terminals: list[str] = field(default_factory=list)
 
 
 class OrcaRuntimeHarness:
@@ -408,6 +410,21 @@ class OrcaRuntimeHarness:
             "cleanup_authority": "unknown",
             "action": "retained",
         }
+
+    def handles_with_intended_role(
+        self, intended_role: str = "phase_reviewer"
+    ) -> list[str]:
+        """Ledger query: every handle registered with this intended role, in order.
+
+        Read-only: issues no Orca command and mutates nothing, so it is inert under
+        the public-method sweep in test_orca_runtime_contract.py. The parameter is
+        defaulted on purpose -- that sweep binds every public method by keyword.
+        """
+        return [
+            handle
+            for handle, row in self._terminals.items()
+            if row["intended_role"] == intended_role
+        ]
 
     def classify_terminal(
         self,
@@ -815,7 +832,9 @@ class OrcaRuntimeHarness:
             handle,
             role="active_worker",
             origin="self_created",
-            intended_role="phase_reviewer" if role == "reviewer" else "phase_worker",
+            intended_role="phase_reviewer"
+            if role.endswith("reviewer")
+            else "phase_worker",
         )
         return handle
 
@@ -1433,6 +1452,40 @@ def run_runtime_scenarios(artifact_dir: Path) -> list[RuntimeScenarioResult]:
     results.append(_scenario_i(harness))
 
     return results
+
+
+def run_final_review_runtime_scenario(artifact_dir: Path) -> RuntimeScenarioResult:
+    """Opt-in scenario J: Final Adversarial Review terminal freshness.
+
+    Deliberately NOT part of run_runtime_scenarios(): that function's A-I result set
+    is pinned by an exact-set assertion in test_orca_runtime.py, which this change
+    may not edit. Scenario J is the exact negative image of scenario B, whose
+    reviewer runs with lifecycle="reuse" on a recycled terminal.
+    """
+    harness = OrcaRuntimeHarness(artifact_dir)
+    preflight = harness.preflight()
+    (artifact_dir / "environment-final-review.json").write_text(
+        json.dumps(preflight, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+    run_id = harness.start_run("Final Adversarial Review scenario J terminal freshness")
+    worker, _ = harness.run_attempt("worker", 1, "complete")
+    phase_reviewer, phase_reviewer_terminal = harness.run_attempt("reviewer", 1, "pass")
+    # attempt 1: a brand-new terminal. terminal= is NOT passed - that is the scenario.
+    final_1, final_terminal_1 = harness.run_attempt("reviewer", 1, "fail", findings=("R1",))
+    correction, _ = harness.run_attempt(
+        "worker", 2, "correction", resolutions={"R1": "RESOLVED"}
+    )
+    # attempt 2: another brand-new terminal, again with no terminal= argument.
+    final_2, final_terminal_2 = harness.run_attempt("reviewer", 2, "pass")
+
+    result = RuntimeScenarioResult(
+        "J", run_id, "COMPLETED", 2,
+        [worker, phase_reviewer, final_1, correction, final_2],
+    )
+    result.final_review_terminals = [final_terminal_1, final_terminal_2]
+    result.phase_reviewer_terminals = [phase_reviewer_terminal]
+    return harness.finish(result)
 
 
 def _scenario_g(harness: OrcaRuntimeHarness) -> RuntimeScenarioResult:

@@ -10,6 +10,7 @@ are recorded here in a Keep a Changelog-inspired format.
 - GitHub Actions validation across the supported Python versions.
 - Release metadata, compatibility documentation, and distributable-package verification.
 - Machine-checkable lifecycle accounting contract in the orchestration skill, enforced by the repository validator and covered by negative regression tests.
+- Implicit Final Adversarial Review gate in the orchestration skill: after every requested phase set a fresh Reviewer session reviews the whole final tree, findings carry a `Responsible Phase` that routes each correction back to its owning phase, and a machine-checkable final review contract block is enforced by the repository validator.
 
 ### Verified
 
@@ -20,6 +21,7 @@ are recorded here in a Keep a Changelog-inspired format.
 
 ### Changed
 
+- `STATUS: COMPLETED` in the orchestration skill now requires both every requested phase PASS and a Final Adversarial Review PASS; a phase PASS alone no longer completes a run, and final review attempts are bounded by their own iteration counter, separate from the per-phase one.
 - Clarified lifecycle accounting when a runtime auto-settles a completed Dispatch before
   explicit worker release, including separate accounting for residual terminal resources.
 - Replaced the two-layer lifecycle account with four independent axes — settlement,
