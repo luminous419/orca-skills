@@ -788,6 +788,48 @@ class OfflineHarnessTestCase(unittest.TestCase):
         return handle
 
 
+class RunArtifactRootProvisioningTests(OfflineHarnessTestCase):
+    """MAJOR 1 (PR #13 review): start_run() must provision the directory it names.
+
+    Every other test in this file calls OfflineHarnessTestCase.build(), which sets
+    harness.run_id directly and never calls start_run() at all -- exactly why this
+    gap could ship unnoticed. These tests call the real start_run() instead, against
+    a workspace setUp() created fresh for this test and never pre-populated.
+    """
+
+    def test_start_run_creates_the_directory_before_returning(self) -> None:
+        recorder = RecordingExec(results={"run-create": {"run": {"id": "run_fresh"}}})
+        with patch.dict(environ, {"ORCA_CLI_COMMAND": "/opt/orca-dev"}):
+            harness = OrcaRuntimeHarness(self.artifact_dir)
+        harness._exec_orca = recorder
+
+        target = self.artifact_dir / "artifacts" / "runs" / "run_fresh"
+        self.assertFalse(target.exists(), "setUp must not pre-create the run dir")
+
+        run_id = harness.start_run("fresh run objective")
+
+        self.assertEqual(run_id, "run_fresh")
+        self.assertTrue(
+            target.is_dir(),
+            "start_run() must provision artifacts/runs/<run-id>/ before any Task "
+            "referencing it can be dispatched",
+        )
+
+    def test_a_second_run_in_the_same_workspace_gets_its_own_directory(self) -> None:
+        first = RecordingExec(results={"run-create": {"run": {"id": "run_one"}}})
+        with patch.dict(environ, {"ORCA_CLI_COMMAND": "/opt/orca-dev"}):
+            harness = OrcaRuntimeHarness(self.artifact_dir)
+        harness._exec_orca = first
+        harness.start_run("first run")
+
+        second = RecordingExec(results={"run-create": {"run": {"id": "run_two"}}})
+        harness._exec_orca = second
+        harness.start_run("second run")
+
+        runs_dir = self.artifact_dir / "artifacts" / "runs"
+        self.assertEqual(sorted(path.name for path in runs_dir.iterdir()), ["run_one", "run_two"])
+
+
 class UnsupervisedSettlementTests(OfflineHarnessTestCase):
     """Goal 1: a Dispatch with no supervised worker resource never gets released.
 

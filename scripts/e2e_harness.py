@@ -17,6 +17,7 @@ from pathlib import Path
 from scripts.task_context import (
     build_reviewer_context,
     build_task_boundary,
+    ensure_run_artifact_root,
     phase_artifact_contract,
     render_task_spec,
     run_artifact_root,
@@ -378,6 +379,11 @@ class E2EHarness:
         # its phase loop starts; a bare .run() call (no run_workflow) keeps this
         # default, which is why it is a real, non-empty run id rather than "".
         self.run_id = run_id
+        # Provisioned immediately, under workspace (this instance's own scratch
+        # directory) rather than the real repository's artifacts/ root, before the
+        # first Worker/Reviewer subprocess -- run with cwd=workspace -- could be
+        # told to write inside a directory nothing has created yet.
+        ensure_run_artifact_root(self.run_id, base=self.workspace)
         # The first three MUST be mutable objects. _phase_harness() is a copy.copy(),
         # so a list / dict / count object is shared BY REFERENCE with every clone and
         # the state therefore survives phase, correction and revalidation boundaries.
@@ -875,6 +881,9 @@ class E2EHarness:
         # corrections, revalidations and the Final Review artifacts that follow all
         # land under the SAME artifacts/runs/<run_id>/ directory.
         self.run_id = scenario.run_id
+        # Re-provisioned here because run_id may differ from the constructor's
+        # default: the phase loop below dispatches into this directory immediately.
+        ensure_run_artifact_root(self.run_id, base=self.workspace)
 
         # ---- sequential phase gates (SKILL.md section 8: PASS before the next phase)
         for phase in scenario.phases:

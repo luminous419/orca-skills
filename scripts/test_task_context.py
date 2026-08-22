@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import inspect
+import tempfile
 import unittest
+from pathlib import Path
 
 from scripts.task_context import (
     AGENT_MODES,
@@ -18,10 +20,12 @@ from scripts.task_context import (
     TaskContextError,
     build_reviewer_context,
     build_task_boundary,
+    ensure_run_artifact_root,
     parse_reviewer_context,
     phase_artifact_contract,
     render_task_spec,
     require_workflow_phase,
+    run_artifact_root,
 )
 
 
@@ -278,6 +282,61 @@ class WorkflowPhaseTests(unittest.TestCase):
                     ),
                     f"artifacts/runs/run_a/{phase.upper()}.md",
                 )
+
+    def test_a_path_like_run_id_is_refused_not_sanitized(self) -> None:
+        """run_artifact_root is the isolation boundary, not just a formatter.
+
+        A run_id is interpolated straight into a filesystem path; real Orca run ids
+        never contain a separator or a bare '.'/'..' segment, so a value that does is
+        refused outright rather than cleaned up and used anyway.
+        """
+        for unsafe in ("../escaped", "a/b", "a\\b", ".", ".."):
+            with self.subTest(run_id=unsafe):
+                with self.assertRaisesRegex(TaskContextError, "single path segment"):
+                    run_artifact_root(unsafe)
+                with self.assertRaisesRegex(TaskContextError, "single path segment"):
+                    phase_artifact_contract(
+                        role="worker", phase="design", run_id=unsafe
+                    )
+
+
+class RunArtifactRootProvisioningTests(unittest.TestCase):
+    """MAJOR 1 (PR #13 review): the directory has to exist before anyone writes to it.
+
+    run_artifact_root() only ever returns a string; something has to turn that into a
+    real directory before the first Task naming it is dispatched, or the first Worker
+    told to write there is the one that discovers it is missing.
+    """
+
+    def test_ensure_creates_the_missing_directory_and_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            base = Path(workspace)
+            target = base / "artifacts" / "runs" / "run_fresh"
+            self.assertFalse(target.exists(), "fixture must not pre-create the dir")
+
+            created = ensure_run_artifact_root("run_fresh", base=base)
+
+            self.assertEqual(created, target)
+            self.assertTrue(target.is_dir())
+            # Calling it again (the second phase of the same run) must not raise.
+            self.assertEqual(ensure_run_artifact_root("run_fresh", base=base), target)
+
+    def test_ensure_without_a_base_defaults_to_the_real_artifacts_root(self) -> None:
+        """Signature-only: actually calling this would create a real directory.
+
+        `base` defaulting to None (never a value invented here) is what makes the
+        real repository's artifacts/runs/<run_id>/ the target when a harness omits
+        it -- exercising that path in a test would litter the working tree, which is
+        exactly what the other two tests in this class use `base=` to avoid.
+        """
+        parameter = inspect.signature(ensure_run_artifact_root).parameters["base"]
+        self.assertIsNone(parameter.default)
+
+    def test_ensure_still_fails_closed_on_a_path_like_run_id(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            with self.assertRaisesRegex(TaskContextError, "single path segment"):
+                ensure_run_artifact_root("../escaped", base=Path(workspace))
+            self.assertEqual(list(Path(workspace).iterdir()), [])
 
 
 if __name__ == "__main__":

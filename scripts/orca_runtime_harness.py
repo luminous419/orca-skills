@@ -19,6 +19,7 @@ try:
         FINAL_REVIEW_PHASE,
         build_reviewer_context,
         build_task_boundary,
+        ensure_run_artifact_root,
         phase_artifact_contract,
         render_task_spec,
         require_workflow_phase,
@@ -30,6 +31,7 @@ except ModuleNotFoundError:  # direct `python3 scripts/...` execution
         FINAL_REVIEW_PHASE,
         build_reviewer_context,
         build_task_boundary,
+        ensure_run_artifact_root,
         phase_artifact_contract,
         render_task_spec,
         require_workflow_phase,
@@ -1256,6 +1258,12 @@ class OrcaRuntimeHarness:
         self.run_id = created["result"]["run"]["id"]
         self._signals = []
         self._ledger = {}
+        # Provisioned here, once, immediately after the run id is known -- and
+        # BEFORE any caller can create a Task whose artifact_contract names this
+        # directory. Scoped under artifact_dir (this harness's own scratch space),
+        # never the real repository's artifacts/ root, so exercising this path in
+        # tests cannot litter the working tree with run directories.
+        ensure_run_artifact_root(self.run_id, base=self.artifact_dir)
         return self.run_id
 
     def create_task(self, spec: str, *, deps: tuple[str, ...] = ()) -> str:

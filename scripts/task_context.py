@@ -8,6 +8,7 @@ the edge that couples them.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 # ---- layer 1: what the coordinator writes into the Task spec --------------------
@@ -120,6 +121,12 @@ def run_artifact_root(run_id: str) -> str:
     root every prior run also wrote to -- is exactly the cross-run leakage this
     isolates. `run_id` is the current Orca Run's id (section 6, "Run을 생성하거나 현재
     Run에 bind한다"); it is never invented here.
+
+    This function is the isolation boundary itself, not just a formatter: `run_id` is
+    interpolated straight into a filesystem path, so a value containing a path
+    separator or a `..`/`.` segment could climb out of artifacts/runs/ entirely
+    instead of merely colliding with another run inside it. Real Orca run ids never
+    contain either, so this refuses rather than sanitizes.
     """
     if not run_id:
         raise TaskContextError(
@@ -127,7 +134,33 @@ def run_artifact_root(run_id: str) -> str:
             "fallback -- an artifact path without one would fall back to the shared "
             "artifacts/ root every other run also writes to"
         )
+    if "/" in run_id or "\\" in run_id or run_id in (".", ".."):
+        raise TaskContextError(
+            f"run_id must be a single path segment, got {run_id!r}; a value "
+            "containing a path separator or '.'/'..' could escape artifacts/runs/"
+        )
     return f"artifacts/runs/{run_id}/"
+
+
+def ensure_run_artifact_root(run_id: str, *, base: Path | None = None) -> Path:
+    """Create artifacts/runs/<run_id>/ (under `base` if given) and return it.
+
+    run_artifact_root() only names the directory; something has to make it exist
+    before the first Task referencing it is dispatched, or the first Worker told to
+    write artifacts/runs/<run_id>/ANALYSIS.md is the one that discovers it is
+    missing. This is that something -- called once, right after the Coordinator
+    creates/binds the Run and obtains run_id (section 6 step 1), never per-attempt
+    and never left for an agent to guess at.
+
+    `base` lets a harness provision the directory inside its own scratch space
+    (OrcaRuntimeHarness.artifact_dir, E2EHarness.workspace) instead of the real
+    repository's artifacts/ root, which is what keeps running the test suite from
+    littering the working tree with run directories.
+    """
+    relative = run_artifact_root(run_id)
+    root = Path(base) / relative if base is not None else Path(relative)
+    root.mkdir(parents=True, exist_ok=True)
+    return root
 
 
 def phase_artifact_contract(*, role: str, phase: str, run_id: str = "") -> str:

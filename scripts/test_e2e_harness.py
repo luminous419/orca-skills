@@ -1706,3 +1706,58 @@ class SessionRecordingTests(unittest.TestCase):
             len({event.session_id for event in result.sessions}),
             len(result.sessions),
         )
+
+
+class RunArtifactRootProvisioningTests(unittest.TestCase):
+    """MAJOR 1 (PR #13 review): the run directory must exist before a Worker runs.
+
+    workspace is a fresh tempdir per test and this class never pre-creates
+    artifacts/runs/ inside it -- the point is that E2EHarness does that itself.
+    """
+
+    ORCHESTRATION_SKILL = (
+        REPO_ROOT / "orca-worker-reviewer-orchestration" / "SKILL.md"
+    )
+
+    def test_constructing_the_harness_provisions_its_default_run_directory(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory)
+            target = workspace / "artifacts" / "runs" / "run_e2e"
+            self.assertFalse(target.exists())
+
+            E2EHarness(
+                self.ORCHESTRATION_SKILL,
+                phase="implementation",
+                max_iterations=5,
+                workspace=workspace,
+            )
+
+            self.assertTrue(target.is_dir())
+
+    def test_run_workflow_provisions_the_scenarios_own_run_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory)
+            target = workspace / "artifacts" / "runs" / "run_from_scenario"
+            self.assertFalse(target.exists())
+
+            harness = E2EHarness(
+                self.ORCHESTRATION_SKILL,
+                phase="implementation",
+                max_iterations=5,
+                workspace=workspace,
+            )
+            scenario = WorkflowScenario(
+                phases=("implementation",),
+                phase_scenarios={
+                    "implementation": FakeScenario(("complete",), ("pass",))
+                },
+                final_review=FinalReviewScenario(modes=("pass",)),
+                run_id="run_from_scenario",
+            )
+
+            result = harness.run_workflow(scenario)
+
+            self.assertEqual(result.final_status, "COMPLETED")
+            self.assertTrue(target.is_dir())

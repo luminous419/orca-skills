@@ -290,7 +290,8 @@ Worker session != Reviewer session
 각 phase에서 Coordinator는 현재 version-matched orchestration guide에 따라:
 
 1. Run을 생성하거나 현재 Run에 bind한다. 이 run-id는 이후 모든 artifact 경로(§9 Artifact path contract)의
-   directory identity로 쓰인다.
+   directory identity로 쓰이며, 이 run에서 처음 이 단계를 거칠 때 그 `<ARTIFACT_ROOT>` 디렉터리를 생성한다
+   (§9 참조). 이후 phase/iteration에서는 이미 존재하므로 아무 것도 하지 않는다.
 2. 이 phase/iteration의 Task graph 전체를 먼저 생성한다. Worker Task와 Reviewer Task를 함께 만들고, Reviewer Task는 Worker Task를 dependency로 선언한다.
 3. Worker용 terminal/agent process를 생성 또는 재사용한다.
 4. Worker Task를 실제 Orca Dispatch에 연결한다.
@@ -733,6 +734,11 @@ TASK_BOUNDARY_NEVER_CARRIED = previous_task_id, previous_dispatch_id, unfinished
 ```text
 ARTIFACT_ROOT = artifacts/runs/<run-id>/
 ```
+
+`<ARTIFACT_ROOT>`는 §6 1단계에서 run-id를 얻은 직후, 그 phase/iteration의 첫 Task를 만들거나 dispatch하기
+**전에** Coordinator가 생성한다 (예: `mkdir -p`). 이는 Worker 개별의 판단에 맡기지 않는 orchestration
+contract의 일부다 -- 어떤 Task spec도 아직 존재하지 않는 디렉터리를 `artifact_contract`로 가리키며
+dispatch되지 않는다. 이미 존재하면 아무 것도 하지 않는다 (`mkdir -p`와 동일하게 idempotent).
 
 역할/phase별 경로는 다음 규칙의 첫 일치로 정한다.
 
