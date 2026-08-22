@@ -16,6 +16,7 @@ def main() -> int:
     parser.add_argument("--fail-value", required=True)
     parser.add_argument("--iteration", type=int, required=True)
     parser.add_argument("--findings-json", default="[]")
+    parser.add_argument("--responsible-phases-json", default="{}")
     parser.add_argument("--artifact")
     args = parser.parse_args()
 
@@ -36,6 +37,7 @@ def main() -> int:
         mode = args.mode
 
     findings = json.loads(args.findings_json)
+    responsible_phases = json.loads(args.responsible_phases_json)
     if mode in {"pass", "pass-nonblocking", "pass-blocking"}:
         print(f"# Review Result\n\n{args.field}: {args.pass_value}")
         print(f"ITERATION: {args.iteration}")
@@ -47,6 +49,9 @@ def main() -> int:
         for finding_id in findings:
             print(f"ID: {finding_id}")
             print("Severity: MINOR")
+            phase = responsible_phases.get(finding_id)
+            if phase:
+                print(f"Responsible Phase: {phase}")
             print("Issue: deterministic finding")
         return 0
     if mode != "fail":
@@ -58,6 +63,9 @@ def main() -> int:
     for finding_id in findings:
         print(f"ID: {finding_id}")
         print("Severity: MAJOR")
+        phase = responsible_phases.get(finding_id)
+        if phase:
+            print(f"Responsible Phase: {phase}")
         print("Issue: deterministic finding")
     return 0
 

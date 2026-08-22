@@ -126,6 +126,49 @@ LIFECYCLE_CONTRACT: dict[str, tuple[str, ...]] = {
 LIFECYCLE_AXIS_LABELS = ("(a)", "(b)", "(c1)", "(c2)")
 LIFECYCLE_CONTRACT_MAX_LINES = 15
 
+FINAL_REVIEW_CONTRACT_BLOCK_PATTERN = re.compile(
+    r"####\s*Final review contract\s*\n(?P<body>.*?)```text\n(?P<values>.*?)\n```",
+    re.DOTALL,
+)
+
+FINAL_REVIEW_CONTRACT: dict[str, tuple[str, ...]] = {
+    "FINAL_REVIEW_TRIGGER": ("after_every_requested_phase_set",),
+    "FINAL_REVIEW_STRUCTURE": ("orchestration_only_implicit_gate",),
+    "FINAL_REVIEW_ROLE": ("phase_reviewer",),
+    "FINAL_REVIEW_TERMINAL_FRESHNESS": ("new_terminal_per_attempt",),
+    "FINAL_REVIEW_WORKER_RESOURCE_OUTCOMES": ("retain", "release", "unsupervised"),
+    "FINAL_REVIEW_TASK_GRAPH": ("single_node_no_dependencies",),
+    "FINAL_REVIEW_COUNTER_DOMAINS": ("phase_iterations", "final_review_iterations"),
+    "FINAL_REVIEW_ITERATION_BOUND": ("max_iterations",),
+    "FINAL_REVIEW_LAST_ATTEMPT_FAIL": ("escalate_before_correction_routing",),
+    "FINAL_REVIEW_EXHAUSTION_REASON": ("final_review_max_iterations_reached",),
+    "FINAL_REVIEW_OUT_OF_SCOPE_REASON": ("out_of_scope_final_review_finding",),
+    "FINAL_REVIEW_COMPLETION_GATE": ("requested_phases_pass_and_final_review_pass",),
+}
+
+FINAL_REVIEW_CONTRACT_MAX_LINES = 12
+FINAL_REVIEW_SECTION_HEADING = "## 17. Final Adversarial Review"
+FINAL_REVIEW_SECTION_END = "\n## 18."
+FINAL_REVIEW_ANTI_ANCHORING_SENTENCES = (
+    "이전 phase Reviewer의 PASS 판정을 옳다고 가정하지 않는다.",
+    "Do NOT assume any previous Reviewer PASS decision is correct.",
+)
+FINAL_REVIEW_CHECKLIST_ANCHORS = (
+    "A objective alignment",
+    "B cross-phase consistency",
+    "C contract vs implementation",
+    "D implementation vs tests",
+    "E docs vs behavior",
+    "F lifecycle state machine",
+    "G security destructive",
+    "H over-engineering",
+    "I hidden coupling",
+)
+FINAL_REVIEW_BARE_CHOICE_LINE = re.compile(
+    r"(?m)^FINAL_REVIEW:\s*[A-Z_]+\s*\|\s*[A-Z_]+\s*$"
+)
+
+
 
 class Validation:
     def __init__(self) -> None:
@@ -627,6 +670,168 @@ def extract_lifecycle_section(skill_text: str) -> str:
     return skill_text[start:] if end == -1 else skill_text[start:end]
 
 
+
+def parse_final_review_contract(skill_text: str) -> dict[str, tuple[str, ...]] | None:
+    """Parse the section 17 anchor block into {KEY: (value, ...)}.
+
+    Deliberately a separate implementation from parse_lifecycle_contract rather than a
+    shared extraction: the two blocks have different key prefixes, different line caps
+    and different structural cross-checks, and twelve existing regression tests bind to
+    the lifecycle parser. Only the two shared regexes are reused.
+    """
+    match = FINAL_REVIEW_CONTRACT_BLOCK_PATTERN.search(skill_text)
+    if match is None:
+        return None
+    parsed: dict[str, tuple[str, ...]] = {}
+    for line in match.group("values").splitlines():
+        line_match = LIFECYCLE_CONTRACT_LINE_PATTERN.fullmatch(line)
+        if line_match is None:
+            return None
+        key, raw = line_match.group(1), line_match.group(2)
+        if key in parsed:
+            return None
+        values = tuple(value.strip() for value in raw.split(","))
+        if not all(
+            LIFECYCLE_CONTRACT_TOKEN_PATTERN.fullmatch(value) for value in values
+        ):
+            return None
+        parsed[key] = values
+    return parsed
+
+
+def final_review_contract_block_lines(skill_text: str) -> int:
+    """0 when the block is absent, else its line count."""
+    match = FINAL_REVIEW_CONTRACT_BLOCK_PATTERN.search(skill_text)
+    if match is None:
+        return 0
+    return len(match.group("values").splitlines())
+
+
+def extract_final_review_section(skill_text: str) -> str:
+    """Return the body of section 17, where the final-review prose must live.
+
+    Unlike extract_lifecycle_section this DOES return "" on a missing anchor, but the
+    caller turns that into a dedicated diagnostic rather than letting the content
+    checks fail with derived messages.
+    """
+    start = skill_text.find(FINAL_REVIEW_SECTION_HEADING)
+    if start == -1:
+        return ""
+    end = skill_text.find(FINAL_REVIEW_SECTION_END, start)
+    return skill_text[start:] if end == -1 else skill_text[start:end]
+
+
+def validate_final_review_contract(validation: Validation) -> None:
+    """Orchestration-only section 17 final adversarial review gate contract."""
+    skill_path = LIFECYCLE_SKILL_DIR / "SKILL.md"
+    try:
+        skill_text = skill_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        validation.check(False, f"{LIFECYCLE_SKILL_DIR.name}: {exc}")
+        skill_text = ""
+
+    parsed = parse_final_review_contract(skill_text)
+    validation.check(
+        parsed is not None,
+        f"{LIFECYCLE_SKILL_DIR.name}: missing or malformed final review contract "
+        "block",
+    )
+    parsed = parsed or {}
+
+    validation.check(
+        set(parsed) == set(FINAL_REVIEW_CONTRACT),
+        f"{LIFECYCLE_SKILL_DIR.name}: final review contract keys differ from the "
+        "validator source of truth",
+    )
+    validation.check(
+        parsed == FINAL_REVIEW_CONTRACT,
+        f"{LIFECYCLE_SKILL_DIR.name}: final review contract values differ from the "
+        "validator source of truth",
+    )
+    validation.check(
+        0 < final_review_contract_block_lines(skill_text)
+        <= FINAL_REVIEW_CONTRACT_MAX_LINES,
+        f"{LIFECYCLE_SKILL_DIR.name}: final review contract block exceeds "
+        f"{FINAL_REVIEW_CONTRACT_MAX_LINES} lines",
+    )
+
+    section = extract_final_review_section(skill_text)
+    validation.check(
+        section != "",
+        f"{LIFECYCLE_SKILL_DIR.name}: section 17 Final Adversarial Review is missing "
+        "or renumbered",
+    )
+    validation.check(
+        FINAL_REVIEW_ANTI_ANCHORING_SENTENCES[0] in section,
+        f"{LIFECYCLE_SKILL_DIR.name}: final review prose is missing the "
+        "anti-anchoring premise (ko)",
+    )
+    validation.check(
+        FINAL_REVIEW_ANTI_ANCHORING_SENTENCES[1] in section,
+        f"{LIFECYCLE_SKILL_DIR.name}: final review prose is missing the "
+        "anti-anchoring premise (en)",
+    )
+    validation.check(
+        "Responsible Phase" in section,
+        f"{LIFECYCLE_SKILL_DIR.name}: final review prose is missing the Responsible "
+        "Phase field",
+    )
+    validation.check(
+        "FINAL_REVIEW_MAX_ITERATIONS_REACHED" in section,
+        f"{LIFECYCLE_SKILL_DIR.name}: final review prose is missing the exhaustion "
+        "reason",
+    )
+    validation.check(
+        "OUT_OF_SCOPE_FINAL_REVIEW_FINDING" in section,
+        f"{LIFECYCLE_SKILL_DIR.name}: final review prose is missing the out-of-scope "
+        "reason",
+    )
+    missing_anchors = [
+        anchor for anchor in FINAL_REVIEW_CHECKLIST_ANCHORS if anchor not in section
+    ]
+    validation.check(
+        not missing_anchors,
+        f"{LIFECYCLE_SKILL_DIR.name}: final review checklist is missing "
+        + ", ".join(missing_anchors or ["-"]),
+    )
+
+    outcomes = set(parsed.get("FINAL_REVIEW_WORKER_RESOURCE_OUTCOMES", ()))
+    lifecycle_outcomes = set(LIFECYCLE_CONTRACT["LIFECYCLE_OUTCOMES"])
+    validation.check(
+        "reuse" not in outcomes,
+        "FINAL_REVIEW_WORKER_RESOURCE_OUTCOMES must never contain reuse",
+    )
+    validation.check(
+        bool(outcomes) and outcomes < lifecycle_outcomes,
+        "FINAL_REVIEW_WORKER_RESOURCE_OUTCOMES must be a strict subset of "
+        "LIFECYCLE_OUTCOMES",
+    )
+    role = parsed.get("FINAL_REVIEW_ROLE", ())
+    validation.check(
+        bool(role) and role[0] in LIFECYCLE_CONTRACT["CLOSE_ELIGIBLE_TERMINAL_ROLES"],
+        "FINAL_REVIEW_ROLE must be a close eligible terminal role",
+    )
+
+    loop_skill = REPO_ROOT / "orca-worker-reviewer-loop" / "SKILL.md"
+    loop_text = loop_skill.read_text(encoding="utf-8") if loop_skill.is_file() else ""
+    validation.check(
+        parse_final_review_contract(loop_text) is None,
+        "orca-worker-reviewer-loop: must not contain the orchestration final review "
+        "contract",
+    )
+    validation.check(
+        "Final Adversarial Review" not in loop_text,
+        "orca-worker-reviewer-loop: must not describe the final adversarial review "
+        "gate",
+    )
+
+    validation.check(
+        FINAL_REVIEW_BARE_CHOICE_LINE.search(skill_text) is None,
+        f"{LIFECYCLE_SKILL_DIR.name}: FINAL_REVIEW must not be written as a "
+        "PASS | FAIL choice line",
+    )
+
+
 def validate_workflow_output_contracts(validation: Validation) -> None:
     contracts = []
     for skill_dir in SKILL_DIRS:
@@ -675,6 +880,7 @@ def main() -> int:
     validate_machine_readable_contracts(validation)
     validate_workflow_output_contracts(validation)
     validate_lifecycle_accounting_contract(validation)
+    validate_final_review_contract(validation)
     validate_version(validation)
     validate_no_user_absolute_paths(validation)
 

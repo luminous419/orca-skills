@@ -182,6 +182,28 @@ class RecordingExec:
         return 0, json.dumps({"ok": True, "result": self.results.get(verb, {})})
 
 
+class SequentialTerminalExec(RecordingExec):
+    """RecordingExec whose `terminal create` hands back a fresh handle each call.
+
+    The base recorder pins one handle, which would make every freshness assertion
+    below vacuously false; this subclass is the minimum needed to distinguish
+    "a new terminal per attempt" from "the same terminal twice".
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.created: list[str] = []
+
+    def __call__(self, args: tuple[str, ...]) -> tuple[int, str]:
+        args = tuple(args)
+        if args[:2] == ("terminal", "create"):
+            handle = f"term_fr_{len(self.created) + 1}"
+            self.created.append(handle)
+            self.commands.append(args)
+            return 0, json.dumps({"ok": True, "result": {"terminal": {"handle": handle}}})
+        return super().__call__(args)
+
+
 class OrcaRuntimeContractTests(unittest.TestCase):
     def test_pinned_version_and_guide_contract_pass(self) -> None:
         validate_orca_contract(
@@ -2124,6 +2146,241 @@ class GraphFirstOrderingTests(OfflineHarnessTestCase):
         self.assertEqual(
             overrides, [], "a harness path force-readies a task instead of using deps"
         )
+
+
+class FinalReviewFreshnessTests(OfflineHarnessTestCase):
+    """DESIGN section 7.3: what a Final Adversarial Review Dispatch does to terminals.
+
+    Driven by SequentialTerminalExec, because the base recorder answers every
+    `terminal create` with one pinned handle and would make "the two handles differ"
+    vacuously false. No real Orca is involved.
+    """
+
+    # section 17's FINAL_REVIEW_WORKER_RESOURCE_OUTCOMES, restated here so the test
+    # fails if the runtime ever accounts a Final Review Dispatch as a reuse.
+    FINAL_REVIEW_WORKER_RESOURCE_OUTCOMES = frozenset(
+        {"retain", "release", "unsupervised"}
+    )
+
+    def arm(self, recorder: SequentialTerminalExec, dispatch_id: str) -> None:
+        """Point the stub at the next Dispatch id.
+
+        RecordingExec pins one dispatch id, so without this every attempt would
+        settle the SAME row and the second one would read back as a replay.
+        """
+        recorder.results["worker-start"] = {"dispatchId": dispatch_id}
+        recorder.results["check"] = {
+            "deliveryId": f"dlv_{dispatch_id}",
+            "timedOut": False,
+            "messages": [
+                {
+                    "id": f"msg_{dispatch_id}",
+                    "type": "worker_done",
+                    "payload": json.dumps(
+                        {
+                            "taskId": "task_g",
+                            "dispatchId": dispatch_id,
+                            "outcome": "succeeded",
+                        }
+                    ),
+                    "body": "ok",
+                }
+            ],
+        }
+
+    def phase_reviewer_attempt(
+        self, recorder: SequentialTerminalExec, harness: OrcaRuntimeHarness
+    ) -> tuple[RuntimeAttempt, str]:
+        self.arm(recorder, "ctx_phase_reviewer")
+        return harness.run_attempt("reviewer", 1, "pass")
+
+    def final_review_attempts(
+        self,
+        recorder: SequentialTerminalExec,
+        harness: OrcaRuntimeHarness,
+        count: int = 2,
+    ) -> list[tuple[RuntimeAttempt, str]]:
+        """`count` Final Review attempts, each with NO terminal= argument.
+
+        Passing no terminal is the whole scenario: run_existing_task then takes the
+        create_fake_terminal branch and a new handle is allocated per attempt.
+        """
+        attempts = []
+        for index in range(1, count + 1):
+            self.arm(recorder, f"ctx_fr_{index}")
+            attempts.append(
+                harness.run_attempt(
+                    "reviewer",
+                    index,
+                    "pass" if index == count else "fail",
+                    findings=() if index == count else ("R1",),
+                )
+            )
+        return attempts
+
+    @staticmethod
+    def terminal_creates(recorder: SequentialTerminalExec) -> list[tuple[str, ...]]:
+        return [
+            command
+            for command in recorder.commands
+            if command[:2] == ("terminal", "create")
+        ]
+
+    @staticmethod
+    def adopted_handles(recorder: SequentialTerminalExec) -> list[str]:
+        return [
+            command[command.index("--terminal") + 1]
+            for command in recorder.commands
+            if len(command) > 1 and command[1] == "worker-start"
+        ]
+
+    def test_each_final_review_attempt_creates_a_new_terminal(self) -> None:
+        recorder = SequentialTerminalExec()
+        harness = self.build(recorder)
+
+        attempts = self.final_review_attempts(recorder, harness)
+
+        handles = [handle for _, handle in attempts]
+        self.assertEqual(len(self.terminal_creates(recorder)), 2)
+        self.assertEqual(handles, recorder.created)
+        self.assertNotEqual(handles[0], handles[1])
+        self.assertEqual(len(set(handles)), 2)
+
+    def test_final_review_never_reuses_a_previous_final_review_terminal(self) -> None:
+        recorder = SequentialTerminalExec()
+        harness = self.build(recorder)
+
+        attempts = self.final_review_attempts(recorder, harness)
+
+        first_handle = attempts[0][1]
+        adopted = self.adopted_handles(recorder)
+        self.assertEqual(adopted, [handle for _, handle in attempts])
+        # attempt 2 never adopts attempt 1's terminal
+        self.assertEqual(adopted.count(first_handle), 1)
+        self.assertNotIn(
+            first_handle,
+            adopted[1:],
+            "a later Final Review attempt adopted the previous attempt's terminal",
+        )
+
+    def test_final_review_never_reuses_a_phase_reviewer_terminal(self) -> None:
+        recorder = SequentialTerminalExec()
+        harness = self.build(recorder)
+
+        _, phase_handle = self.phase_reviewer_attempt(recorder, harness)
+        attempts = self.final_review_attempts(recorder, harness)
+
+        final_handles = {handle for _, handle in attempts}
+        reviewer_handles = harness.handles_with_intended_role()
+        # every one of them IS classified as a phase reviewer terminal ...
+        self.assertLessEqual(final_handles | {phase_handle}, set(reviewer_handles))
+        # ... and yet no Final Review attempt ran on the phase Reviewer's terminal
+        self.assertTrue(final_handles.isdisjoint({phase_handle}))
+        self.assertNotIn(phase_handle, self.adopted_handles(recorder)[1:])
+
+    def test_final_review_axis_b_is_never_reuse(self) -> None:
+        recorder = SequentialTerminalExec()
+        harness = self.build(recorder)
+
+        attempts = self.final_review_attempts(recorder, harness)
+
+        self.assertNotIn("reuse", self.FINAL_REVIEW_WORKER_RESOURCE_OUTCOMES)
+        self.assertLessEqual(
+            self.FINAL_REVIEW_WORKER_RESOURCE_OUTCOMES, set(WORKER_RESOURCE_OUTCOMES)
+        )
+        for attempt, _ in attempts:
+            with self.subTest(dispatch=attempt.dispatch_id):
+                self.assertIn(
+                    attempt.worker_resource,
+                    self.FINAL_REVIEW_WORKER_RESOURCE_OUTCOMES,
+                )
+                self.assertNotEqual(attempt.worker_resource, "reuse")
+                self.assertFalse(attempt.lifecycle_action.startswith("reuse:"))
+
+    def test_final_review_dispatch_finalizes_exactly_once(self) -> None:
+        recorder = SequentialTerminalExec()
+        harness = self.build(recorder)
+
+        attempts = self.final_review_attempts(recorder, harness)
+
+        dispatch_ids = [attempt.dispatch_id for attempt, _ in attempts]
+        self.assertEqual(dispatch_ids, ["ctx_fr_1", "ctx_fr_2"])
+        for attempt, _ in attempts:
+            with self.subTest(dispatch=attempt.dispatch_id):
+                self.assertEqual(attempt.finalizations, 1)
+                row = harness._ledger[attempt.dispatch_id]
+                self.assertEqual(row["state"], "finalized")
+                self.assertEqual(row["replays"], 0)
+                # the row is single-assignment: a second finalization is refused
+                with self.assertRaises(OrcaRuntimeError):
+                    harness.finalize_once(attempt.dispatch_id, attempt=attempt)
+
+    def test_final_review_task_is_created_before_its_dispatch_with_no_deps(
+        self,
+    ) -> None:
+        recorder = SequentialTerminalExec()
+        harness = self.build(recorder)
+
+        self.final_review_attempts(recorder, harness)
+
+        verbs = recorder.verbs
+        self.assertEqual(verbs.count("task-create"), 2)
+        self.assertEqual(verbs.count("worker-start"), 2)
+        for index, verb in enumerate(verbs):
+            if verb == "worker-start":
+                self.assertIn("task-create", verbs[:index])
+        # a single-node graph: the Final Review Task depends on nothing, and
+        # readiness is never overridden
+        for command in recorder.commands:
+            if len(command) > 1 and command[1] == "task-create":
+                self.assertNotIn("--deps", command)
+        self.assertNotIn("task-update", verbs)
+
+    def test_final_review_leaves_no_residual_terminal(self) -> None:
+        recorder = SequentialTerminalExec()
+        harness = self.build(recorder)
+
+        attempts = self.final_review_attempts(recorder, harness)
+
+        for attempt, handle in attempts:
+            with self.subTest(dispatch=attempt.dispatch_id):
+                self.assertEqual(
+                    harness.lifecycle_commands(attempt.dispatch_id),
+                    ["worker-release"],
+                )
+                self.assertEqual(harness._ledger[attempt.dispatch_id]["state"],
+                                 "finalized")
+                # the worker resource is gone, so there is nothing left to close
+                self.assertEqual(attempt.process_liveness, "already exited")
+                self.assertEqual(
+                    harness.ledger_terminal(handle)["action"], "nothing to do"
+                )
+        self.assertNotIn("close", recorder.verbs)
+        self.assertEqual(
+            harness.lifecycle_commands(), ["worker-release", "worker-release"]
+        )
+
+    def test_final_reviewer_terminal_is_classified_phase_reviewer(self) -> None:
+        """R-H: the role widening, pinned directly rather than inferred."""
+        recorder = SequentialTerminalExec()
+        harness = self.build(recorder)
+
+        for role, expected in (
+            ("reviewer", "phase_reviewer"),
+            ("final-reviewer", "phase_reviewer"),
+            ("worker", "phase_worker"),
+        ):
+            with self.subTest(role=role):
+                handle = harness.create_fake_terminal(role, "pass", iteration=1)
+
+                row = harness.ledger_terminal(handle)
+                self.assertEqual(row["intended_role"], expected)
+                self.assertEqual(row["role"], "active_worker")
+                self.assertEqual(row["origin"], "self_created")
+                self.assertIn(
+                    handle,
+                    harness.handles_with_intended_role(expected),
+                )
 
 
 if __name__ == "__main__":

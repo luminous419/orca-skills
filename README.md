@@ -26,6 +26,7 @@ Orca-native implementation of the same 2-agent development policy.
 - Uses supervised completion (`worker_done`/escalation/wait) according to the current Orca runtime contract.
 - Creates the phase Task graph before dispatching the Worker, so the Reviewer Task becomes ready through normal dependency promotion instead of a manual status override.
 - Accounts for every settled Dispatch on four separate axes — settlement, supervised worker-resource registration, residual process liveness, and cleanup authority — and finalizes each Dispatch exactly once.
+- Runs an implicit Final Adversarial Review gate after every requested phase set: a fresh Reviewer session per attempt reviews the whole final tree, and `STATUS: COMPLETED` is reachable only through its PASS.
 - Intended for comparison/PoC before deciding whether it should replace the direct-session loop.
 
 ## Shared Development Model
@@ -170,6 +171,7 @@ The validator uses only the Python standard library and validates both
 - absence of user-specific absolute paths
 - required error codes, test gates, and the `max-iterations` range
 - the orchestration-only lifecycle accounting contract block, including the never-close and close-eligible terminal role sets
+- the orchestration-only final adversarial review contract block, its section 17 prose anchors, and the rule that its worker-resource outcomes never include `reuse`
 
 The command exits with status `0` when all checks pass and a non-zero status with
 actionable error messages when an inconsistency is found.
@@ -198,7 +200,10 @@ The fake-agent E2E tests start deterministic Worker and Reviewer subprocesses,
 not Orca or an LLM. A minimal single-phase harness verifies bounded
 Worker → Reviewer iteration, PASS/FAIL transitions, escalation, blocked and
 malformed/exit handling, finding continuity, Reviewer artifact immutability,
-and equivalent shared-policy results for both skills. All workspaces and
+and equivalent shared-policy results for both skills. A multi-phase workflow
+harness additionally drives the orchestration-only Final Adversarial Review
+gate, its responsible-phase routing, and its two independent iteration
+counters. All workspaces and
 protected production fixtures are disposable temporary directories.
 
 ### Orca runtime integration

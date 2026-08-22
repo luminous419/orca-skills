@@ -385,6 +385,10 @@ dispatchId | taskId | phase | iteration | terminal handle | terminal role | term
 reuse는 같은 session에서 Worker와 Reviewer 역할을 바꾸는 것을 허용하지 않는다.
 동일 역할의 동일 agent가 즉시 이어지는 correction 또는 re-review Task를 수행하는 경우에만 사용한다.
 
+단 하나의 예외가 있다. §17 Final Adversarial Review Dispatch에는 이 reuse 권장이 적용되지 않는다.
+모든 Final Adversarial Review attempt는 새로 생성한 terminal을 사용하며, 그 Dispatch의 axis (b)는
+retain / release / unsupervised 중 하나이고 절대 reuse가 아니다.
+
 동일 terminal을 다음 Dispatch로 넘기면 cleanup authority(axis (c2))도 함께 이전되므로, 이후 그
 terminal의 close 판단은 새 Dispatch를 기준으로 한다.
 
@@ -706,7 +710,8 @@ Reviewer PASS:
 
 ```text
 current phase COMPLETED
-→ 다음 phase 또는 전체 COMPLETED
+→ 남은 requested phase가 있으면 다음 phase
+→ 남은 requested phase가 없으면 §17 Final Adversarial Review gate
 ```
 
 Reviewer FAIL:
@@ -725,6 +730,9 @@ PASS / FAIL
 
 Reviewer 자신이 fix를 수행하지 않는다.
 Orca의 Task/Dispatch provenance가 각 attempt에 남아야 한다.
+
+Final Adversarial Review FAIL이 유발한 correction도 이 FAIL Loop와 정확히 같은 모양이다.
+차이는 correction 대상 phase를 Reviewer가 아니라 Final Reviewer의 `Responsible Phase`가 지정한다는 점뿐이다.
 
 ## 13. Iteration
 
@@ -749,6 +757,21 @@ REASON: INVALID_MAX_ITERATIONS
 
 각 phase별 Reviewer attempt를 iteration으로 센다.
 최대치를 넘기면 추가 Dispatch를 만들지 않는다.
+
+```text
+iteration counter는 두 개의 독립 domain을 가지며, 둘 다 같은 max-iterations 값으로 bound된다.
+
+PHASE_ITERATIONS[p]      = phase p의 Reviewer attempt 총합. Final Adversarial Review가 유발한
+                           correction의 Reviewer attempt도 이 counter를 계속 사용한다.
+                           보고 필드: ITERATIONS_BY_PHASE  (기존 필드, 기존 의미)
+FINAL_REVIEW_ITERATIONS  = fresh Final Adversarial Reviewer가 dispatch된 횟수.
+                           보고 필드: FINAL_REVIEW_ITERATIONS  (신규, orchestration 보고 전용)
+
+두 domain은 서로 소비하지 않는다. 새 user-facing parameter는 없다.
+소진 시 STATUS: ESCALATED이며 REASON만 다르다.
+  phase budget 소진        → REASON: MAX_ITERATIONS_REACHED (phase p)
+  final review budget 소진 → REASON: FINAL_REVIEW_MAX_ITERATIONS_REACHED
+```
 
 ```text
 STATUS: ESCALATED
@@ -809,7 +832,8 @@ Coordinator는 직접 production code를 수정하지 않는다.
 
 전체 완료 전에:
 
-1. 모든 requested phase가 PASS했는지 확인한다.
+1. 모든 requested phase가 PASS했고, §17 Final Adversarial Review가 PASS했는지 확인한다.
+   둘 중 하나라도 아니면 STATUS는 COMPLETED가 아니다.
 2. 각 phase/iteration에 필요한 Worker/Reviewer Task/Dispatch가 Orca state에 존재하는지 확인한다.
 3. unresolved Blocking Finding이 없는지 확인한다.
 4. 마지막 test/validation 결과를 확인한다.
@@ -818,6 +842,8 @@ Coordinator는 직접 production code를 수정하지 않는다.
 7. close한 terminal마다 close 권한 근거(terminal role + provenance)가 기록되었는지, 각 Dispatch의
    finalization이 정확히 한 번인지, 그리고 모든 lifecycle 동작이 그 Dispatch의 finalization
    게이트를 통과한 뒤에 수행되었는지 확인한다.
+8. Final Adversarial Review attempt마다 고유한 Task/Dispatch provenance와 새로 생성한 terminal,
+   axis (b) != reuse인 네 축 행이 있는지, 그리고 attempt마다 artifacts/FINAL_REVIEW_*가 있는지 확인한다.
 
 `## Orca Orchestration State`에는 Dispatch마다 다음 형식으로 네 축의 outcome을 기록한다.
 
@@ -848,17 +874,141 @@ COMPLETED_PHASES:
 WORKER:
 REVIEWER:
 ITERATIONS_BY_PHASE:
+FINAL_REVIEW_ITERATIONS:
 
 ## Summary
 ## Changed Files / Artifacts
 ## Unit Tests / Validation
 ## Orca Orchestration State
-## Final Review
-RESULT: PASS
+## Final Adversarial Review
+FINAL_REVIEW: PASS
+FINAL_REVIEW_TASKS: task_<id> / dispatch_<id> (attempt 1)
+FINAL_FINDINGS: none
 ## Non-Blocking Recommendations
 ```
 
-## 17. Core Invariants
+## 17. Final Adversarial Review
+
+모든 requested phase가 Reviewer PASS를 받은 직후 Coordinator는 예외 없이 Final Adversarial Review gate를 한 번 실행한다.
+이 gate는 phase가 아니다. `phases=`에 쓸 수 없고 끄는 parameter도 없으며, 5-phase 전체 run이든 `phases=bugfix` 단독이든
+동일하다. PASS하지 못한 Run은 어떤 경로로도 `STATUS: COMPLETED`가 되지 않는다.
+
+#### Role and freshness
+
+세 번째 역할이 아니다. §11 Reviewer Contract를 그대로 따르는 Reviewer instance이며 출력도 §11과 같다. terminal role은
+`phase_reviewer`, origin은 `self_created`, agent command는 phase Reviewer와 같은 `reviewer=`다. attempt마다 **새 terminal을
+생성한다.** 이전 attempt의 terminal도 어떤 phase Reviewer terminal도 재사용하지 않는다. freshness는 model이 아니라 session의
+속성이며, 목적은 이전 판정 context의 상속을 끊는 것이다. §6 `#### 1. Immediate worker reuse`의 재사용 권장은 여기에 적용되지 않는다.
+
+#### Coordinator procedure
+
+```text
+1. 마지막 requested phase의 Reviewer 판정이 PASS이고 남은 requested phase가 없음을 확인한다.
+2. FINAL_REVIEW_ITERATIONS += 1.
+3. 이번 attempt의 Task graph를 만든다. Final Review Task는 dependency가 없는 단일 node다.
+4. 새 terminal을 생성하고 즉시 ledger에 handle + role(active_worker) + origin(self_created) +
+   intended_role(phase_reviewer)를 기록한다. §6 placement ladder로 입양시켜 Dispatch에 연결한다.
+5. worker_done을 기다린 뒤 그 Dispatch의 lifecycle을 §6 four-axis 절차로 정확히 한 번 종결한다.
+   axis (b)는 reuse가 아니다.
+6. verdict를 평가하고 아래 T1/T2/T3로 분기한다.
+```
+
+dependency edge를 걸지 않는 것은 §6 Task graph ordering의 요구다. trigger가 마지막 Reviewer Task의 **완료된** 판정이므로 그 Task를 dependency로 선언하면 "dependency 완료 이후 dependent 생성"이라는 금지 패턴이 된다.
+
+입력은 ORIGINAL_REQUEST / PHASES / provenance+ledger 요약 / FINAL_REVIEW_ITERATIONS와 max-iterations / 직전 attempt의
+finding·resolution 표를 inline으로, phase별 approved·REVIEW artifact, 전체 diff(base..HEAD), 변경된 production file 목록,
+test·validation 결과를 경로로 전달한다. 직전 attempt가 FAIL이었다면 이번 round에서 **어떤 phase가 어떤 finding id 때문에
+수정되었는지** 반드시 명시한다. downstream phase를 자동 재실행하지 않는 대신 이 attempt가 그 일관성을 검사하기 때문이다.
+
+#### Review checklist
+
+```text
+A objective alignment        원래 요청이 실제로 충족되었는가
+B cross-phase consistency    phase 산출물들이 서로 모순되지 않는가
+C contract vs implementation 문서화된 계약과 코드가 일치하는가
+D implementation vs tests    test가 실제 위험을 검증하는가, 통과를 위해 약화되지 않았는가
+E docs vs behavior           문서가 실제 동작을 설명하는가
+F lifecycle state machine    상태 전이와 counter가 문서와 코드에서 동일한가
+G security destructive       파괴적 동작, secret, 범위 밖 파일 변경이 없는가
+H over-engineering           요청되지 않은 abstraction이나 범위 확대가 없는가
+I hidden coupling            의도치 않은 공유 자산/외부 계약 변경이 없는가
+```
+
+이전 phase Reviewer의 PASS 판정을 옳다고 가정하지 않는다.
+Do NOT assume any previous Reviewer PASS decision is correct.
+
+#### Final Review Finding Contract
+
+§11의 Blocking Finding에 `Responsible Phase` 한 필드만 추가한다.
+
+```text
+ID: R1
+Severity: CRITICAL | MAJOR | MINOR
+Responsible Phase: analysis | plan | design | implementation | test | bugfix | refactoring
+Location:
+Issue:
+Reason / Evidence:
+Required Action:
+```
+
+판정 규칙은 §11과 같다. CRITICAL/MAJOR가 하나라도 남으면 FAIL, MINOR만 있으면 PASS이며 MINOR는
+`## Non-Blocking Recommendations`에 기록한다. 하나의 finding은 정확히 하나의 `Responsible Phase`를 가지며, 두
+phase에 걸친 결함은 서로 다른 id의 두 finding으로 나눈다. 값은 아래 ladder의 첫 일치로 정한다.
+
+```text
+1. Location이 artifacts/<PHASE>_<topic>.md면 → 그 PHASE.
+2. 아니면 결함의 성격으로 매핑한다.
+   잘못된 전제 / 요구사항 오독 / 놓친 제약   → ANALYSIS
+   범위 누락 / 순서 / 계획된 검증의 부재     → PLAN
+   코드는 명세를 따르는데 명세가 틀림        → DESIGN
+   production code 동작 결함 / 계약 위반     → IMPLEMENTATION (specialized run이면 BUGFIX/REFACTORING)
+   test 부재 / 불충분 / 결함을 못 잡는 test  → TEST
+   문서와 실제 동작 불일치                  → 그 동작을 소유한 phase
+3. 결과가 requested phase 집합에 없으면 canonical order에서 그 이하의 마지막 requested phase로 낮춘다.
+4. 그래도 소유자가 없으면 STATUS: ESCALATED / REASON: OUT_OF_SCOPE_FINAL_REVIEW_FINDING.
+```
+
+#### Verdict and state machine
+
+```text
+T0  모든 requested phase PASS    → 새 attempt 생성 (FINAL_REVIEW_ITERATIONS += 1)
+T1  attempt PASS                → STATUS: COMPLETED
+T2  attempt FAIL이고 FINAL_REVIEW_ITERATIONS == max-iterations
+                                → STATUS: ESCALATED
+                                  REASON: FINAL_REVIEW_MAX_ITERATIONS_REACHED
+                                  (correction Dispatch를 만들지 않는다)
+T3  attempt FAIL이고 budget 잔여 → 이 Dispatch를 먼저 종결하고 finding을 phase로 매핑
+T4  각 responsible phase p에 대해 PHASE_ITERATIONS[p] == max-iterations
+                                → STATUS: ESCALATED / REASON: MAX_ITERATIONS_REACHED (phase p)
+    아니면 correction Worker → p의 Reviewer 재검토 (§12 FAIL Loop 그대로)
+T5  모든 p가 다시 PASS           → T0으로 돌아가 새 fresh attempt를 만든다
+```
+
+T2의 마지막-attempt guard는 FAIL edge에서 **가장 먼저** 평가한다. finding을 phase로 매핑하기 전에, `PHASE_ITERATIONS`를 읽기 전에 평가한다. 순서가 뒤바뀌면 예산 소진 뒤에도 correction이 dispatch된다.
+
+review 기록은 attempt 1이 `artifacts/FINAL_REVIEW_<topic>.md`, attempt N>=2가 `artifacts/FINAL_REVIEW_<topic>_iteration<N>.md`다.
+`_iteration1` 형태는 존재하지 않으며 `<N>`은 그 attempt의 `FINAL_REVIEW_ITERATIONS` 값이다. 이 파일은 review 기록이지
+production artifact가 아니므로 §11의 "Reviewer는 code/artifact를 직접 수정하지 않는다"에 위배되지 않으며, Final Adversarial
+Reviewer도 자신이 찾은 결함을 직접 고치지 않는다.
+
+#### Final review contract
+
+```text
+FINAL_REVIEW_TRIGGER = after_every_requested_phase_set
+FINAL_REVIEW_STRUCTURE = orchestration_only_implicit_gate
+FINAL_REVIEW_ROLE = phase_reviewer
+FINAL_REVIEW_TERMINAL_FRESHNESS = new_terminal_per_attempt
+FINAL_REVIEW_WORKER_RESOURCE_OUTCOMES = retain, release, unsupervised
+FINAL_REVIEW_TASK_GRAPH = single_node_no_dependencies
+FINAL_REVIEW_COUNTER_DOMAINS = phase_iterations, final_review_iterations
+FINAL_REVIEW_ITERATION_BOUND = max_iterations
+FINAL_REVIEW_LAST_ATTEMPT_FAIL = escalate_before_correction_routing
+FINAL_REVIEW_EXHAUSTION_REASON = final_review_max_iterations_reached
+FINAL_REVIEW_OUT_OF_SCOPE_REASON = out_of_scope_final_review_finding
+FINAL_REVIEW_COMPLETION_GATE = requested_phases_pass_and_final_review_pass
+```
+
+## 18. Core Invariants
 
 ```text
 Exactly 2 roles: Worker + Reviewer
@@ -886,4 +1036,12 @@ BUGFIX → Regression Test required
 REFACTORING → relevant existing Unit Test execution + conditional test changes
 Agent command → safe token + PATH resolution
 No silent fallback to direct-session loop
+Final Adversarial Review is a Reviewer instance in a fresh session, not a third role
+Final Adversarial Review runs after every requested phase set, with no exception
+All requested phases PASS + Final Adversarial Review PASS required for COMPLETED
+Every Final Adversarial Review attempt uses a newly created terminal
+Final Adversarial Review dispatch worker resource is never reuse
+Final Adversarial Review task has no dependencies and is created before its dispatch
+Final Review FAIL at the iteration bound escalates before any correction dispatch
+Final Adversarial Reviewer never fixes its own findings
 ```
