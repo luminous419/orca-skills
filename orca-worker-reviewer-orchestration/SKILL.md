@@ -289,7 +289,9 @@ Worker session != Reviewer session
 
 각 phase에서 Coordinator는 현재 version-matched orchestration guide에 따라:
 
-1. Run을 생성하거나 현재 Run에 bind한다.
+1. Run을 생성하거나 현재 Run에 bind한다. 이 run-id는 이후 모든 artifact 경로(§9 Artifact path contract)의
+   directory identity로 쓰이며, 이 run에서 처음 이 단계를 거칠 때 그 `<ARTIFACT_ROOT>` 디렉터리를 생성한다
+   (§9 참조). 이후 phase/iteration에서는 이미 존재하므로 아무 것도 하지 않는다.
 2. 이 phase/iteration의 Task graph 전체를 먼저 생성한다. Worker Task와 Reviewer Task를 함께 만들고, Reviewer Task는 Worker Task를 dependency로 선언한다.
 3. Worker용 terminal/agent process를 생성 또는 재사용한다.
 4. Worker Task를 실제 Orca Dispatch에 연결한다.
@@ -723,6 +725,43 @@ DISPATCH_IDENTITY_RULE = injected_by_orca_at_dispatch, new_value_every_attempt, 
 TASK_BOUNDARY_NEVER_CARRIED = previous_task_id, previous_dispatch_id, unfinished_instruction
 ```
 
+#### Artifact path contract
+
+`artifact_contract`이 가리키는 모든 산출물은 이 phase/iteration이 속한 현재 Orca Run의 디렉터리 아래에만
+쓴다. run-id는 §6에서 이미 생성하거나 bind한 그 Run의 id이며, 이 절은 그 id를 directory identity로 재사용할
+뿐 새 user-facing parameter를 추가하지 않는다.
+
+```text
+ARTIFACT_ROOT = artifacts/runs/<run-id>/
+```
+
+`<ARTIFACT_ROOT>`는 §6 1단계에서 run-id를 얻은 직후, 그 phase/iteration의 첫 Task를 만들거나 dispatch하기
+**전에** Coordinator가 생성한다 (예: `mkdir -p`). 이는 Worker 개별의 판단에 맡기지 않는 orchestration
+contract의 일부다 -- 어떤 Task spec도 아직 존재하지 않는 디렉터리를 `artifact_contract`로 가리키며
+dispatch되지 않는다. 이미 존재하면 아무 것도 하지 않는다 (`mkdir -p`와 동일하게 idempotent).
+
+역할/phase별 경로는 다음 규칙의 첫 일치로 정한다.
+
+```text
+1. phase가 final_review면        → <ARTIFACT_ROOT>FINAL_REVIEW.md            (attempt 1)
+                                    <ARTIFACT_ROOT>FINAL_REVIEW_iteration<N>.md (attempt N>=2)
+2. role이 worker면                → <ARTIFACT_ROOT><PHASE>.md                 (in-place 갱신, suffix 없음)
+3. role이 reviewer면 (그 외)      → <ARTIFACT_ROOT>REVIEW_<PHASE>.md           (iteration 1)
+                                    <ARTIFACT_ROOT>REVIEW_<PHASE>_iteration<N>.md (iteration N>=2)
+```
+
+`_iteration1` 형태는 어디에도 존재하지 않는다. BUGFIX/REFACTORING은 `<PHASE>`에 `BUGFIX`/`REFACTORING`을
+대입하는 것 외에 다른 규칙을 갖지 않는다 -- specialized phase도 동일한 run 디렉터리 아래, 동일한 모양의
+경로를 쓴다. Coordinator가 그 run 안에서 부가적으로 남기는 기록(예: ORCHESTRATOR_LOG.md, TIMING_LOG.md)도
+같은 `<ARTIFACT_ROOT>` 아래에 쓴다. 이 절 앞의 다섯 키는 이 규칙으로 대체되지 않으며, `artifact_contract`의
+값이 이 규칙을 따를 뿐이다.
+
+이 run-id가 바뀌지 않는 한 어떤 phase/role/iteration의 산출물도 다른 run의 `<ARTIFACT_ROOT>`를 참조하지
+않는다. `approved_baseline`, `current_delta`, `PREVIOUS_REVIEW_FINDINGS`가 가리키는 경로, §17 downstream
+revalidation이 재검증하는 산출물은 전부 이 규칙 그대로 현재 run의 `<ARTIFACT_ROOT>` 아래에 있다. 다른 run이
+이전에 `artifacts/` root 또는 다른 `<ARTIFACT_ROOT>`에 남긴 산출물은 migration하거나 삭제하지 않으며,
+새 run이 그것을 자신의 approved_baseline이나 current_delta로 참조하지도 않는다.
+
 ## 10. Worker Contract
 
 Worker는 phase별 `templates/*.md`를 따른다.
@@ -1092,7 +1131,7 @@ Required Action:
 phase에 걸친 결함은 서로 다른 id의 두 finding으로 나눈다. 값은 아래 ladder의 첫 일치로 정한다.
 
 ```text
-1. Location이 artifacts/<PHASE>_<topic>.md면 → 그 PHASE.
+1. Location이 §9 Artifact path contract의 `<ARTIFACT_ROOT><PHASE>.md`면 → 그 PHASE.
 2. 아니면 결함의 성격으로 매핑한다.
    잘못된 전제 / 요구사항 오독 / 놓친 제약   → ANALYSIS
    범위 누락 / 순서 / 계획된 검증의 부재     → PLAN
@@ -1150,11 +1189,13 @@ revalidation round는 correction round가 아니다. q는 Final Reviewer에게 �
 바뀔 것이 없으면 없다고 명시하고 근거를 대라"를 요구한다. 그 다음은 보통의 Worker→Reviewer gate이며,
 FAIL하면 §12 FAIL Loop가 그대로 적용된다.
 
-산출물은 `artifacts/<PHASE>_<topic>.md`를 in-place 갱신하고, Reviewer 기록은 기존 규칙대로
-`artifacts/REVIEW_<PHASE>_<topic>_iteration<N>.md`다. counter는 `PHASE_ITERATIONS[q]`를 그대로 쓴다. 새 counter도
-새 user-facing parameter도 없고, 소진 시 REASON은 T4와 같은 `MAX_ITERATIONS_REACHED (phase q)`다.
+산출물은 §9 Artifact path contract의 `<ARTIFACT_ROOT><PHASE>.md`를 in-place 갱신하고, Reviewer 기록은
+기존 규칙대로 `<ARTIFACT_ROOT>REVIEW_<PHASE>_iteration<N>.md`다. counter는 `PHASE_ITERATIONS[q]`를 그대로
+쓴다. 새 counter도 새 user-facing parameter도 없고, 소진 시 REASON은 T4와 같은
+`MAX_ITERATIONS_REACHED (phase q)`다.
 
-review 기록은 attempt 1이 `artifacts/FINAL_REVIEW_<topic>.md`, attempt N>=2가 `artifacts/FINAL_REVIEW_<topic>_iteration<N>.md`다.
+review 기록은 attempt 1이 `<ARTIFACT_ROOT>FINAL_REVIEW.md`, attempt N>=2가
+`<ARTIFACT_ROOT>FINAL_REVIEW_iteration<N>.md`다.
 `_iteration1` 형태는 존재하지 않으며 `<N>`은 그 attempt의 `FINAL_REVIEW_ITERATIONS` 값이다. 이 파일은 review 기록이지
 production artifact가 아니므로 §11의 "Reviewer는 code/artifact를 직접 수정하지 않는다"에 위배되지 않으며, Final Adversarial
 Reviewer도 자신이 찾은 결함을 직접 고치지 않는다.

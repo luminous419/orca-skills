@@ -8,6 +8,7 @@ the edge that couples them.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 # ---- layer 1: what the coordinator writes into the Task spec --------------------
@@ -112,24 +113,81 @@ def require_workflow_phase(current_phase: Any, *, field: str = "current_phase") 
     return str(current_phase)
 
 
-def phase_artifact_contract(*, role: str, phase: str) -> str:
+def run_artifact_root(run_id: str) -> str:
+    """The one string every artifact path in a run is prefixed with.
+
+    Fail-closed like require_workflow_phase: there is no fallback for a missing run
+    id, because an artifact written outside a run directory -- back at the artifacts/
+    root every prior run also wrote to -- is exactly the cross-run leakage this
+    isolates. `run_id` is the current Orca Run's id (section 6, "Run을 생성하거나 현재
+    Run에 bind한다"); it is never invented here.
+
+    This function is the isolation boundary itself, not just a formatter: `run_id` is
+    interpolated straight into a filesystem path, so a value containing a path
+    separator or a `..`/`.` segment could climb out of artifacts/runs/ entirely
+    instead of merely colliding with another run inside it. Real Orca run ids never
+    contain either, so this refuses rather than sanitizes.
+    """
+    if not run_id:
+        raise TaskContextError(
+            "run_id is required and must be the current Orca Run id; there is no "
+            "fallback -- an artifact path without one would fall back to the shared "
+            "artifacts/ root every other run also writes to"
+        )
+    if "/" in run_id or "\\" in run_id or run_id in (".", ".."):
+        raise TaskContextError(
+            f"run_id must be a single path segment, got {run_id!r}; a value "
+            "containing a path separator or '.'/'..' could escape artifacts/runs/"
+        )
+    return f"artifacts/runs/{run_id}/"
+
+
+def ensure_run_artifact_root(run_id: str, *, base: Path | None = None) -> Path:
+    """Create artifacts/runs/<run_id>/ (under `base` if given) and return it.
+
+    run_artifact_root() only names the directory; something has to make it exist
+    before the first Task referencing it is dispatched, or the first Worker told to
+    write artifacts/runs/<run_id>/ANALYSIS.md is the one that discovers it is
+    missing. This is that something -- called once, right after the Coordinator
+    creates/binds the Run and obtains run_id (section 6 step 1), never per-attempt
+    and never left for an agent to guess at.
+
+    `base` lets a harness provision the directory inside its own scratch space
+    (OrcaRuntimeHarness.artifact_dir, E2EHarness.workspace) instead of the real
+    repository's artifacts/ root, which is what keeps running the test suite from
+    littering the working tree with run directories.
+    """
+    relative = run_artifact_root(run_id)
+    root = Path(base) / relative if base is not None else Path(relative)
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def phase_artifact_contract(*, role: str, phase: str, run_id: str = "") -> str:
     """The artifact this (role, phase) pair is contracted to produce.
 
     The same spelling both harnesses already use, in one place instead of two:
-    e2e_harness builds "artifacts/{PHASE}.md" for a worker and
-    "artifacts/REVIEW_{PHASE}.md" for its reviewer. A path built from the phase is
-    what makes a Reviewer's current_delta a reference to the WORKER's deliverable
-    rather than to the reviewer's own future output.
+    e2e_harness builds "artifacts/runs/<run-id>/{PHASE}.md" for a worker and
+    "artifacts/runs/<run-id>/REVIEW_{PHASE}.md" for its reviewer. A path built from
+    the phase is what makes a Reviewer's current_delta a reference to the WORKER's
+    deliverable rather than to the reviewer's own future output. The run-id prefix is
+    what keeps two runs' artifacts -- and their approved_baseline/current_delta
+    references -- from ever pointing at each other.
+
+    `run_id` defaults to "" (never used as-is) rather than being required outright, so
+    that a caller's role/phase mistake is reported before its run_id mistake: role and
+    phase are checked first, exactly as before this parameter existed.
     """
     if role not in TASK_BOUNDARY_ROLES:
         raise TaskContextError(f"unknown role: {role!r}")
     phase = require_workflow_phase(phase, field="phase")
+    base = run_artifact_root(run_id)
     if phase == FINAL_REVIEW_PHASE:
         # One artifact for the gate itself, whichever side is asking about it.
-        return "artifacts/FINAL_REVIEW.md"
+        return f"{base}FINAL_REVIEW.md"
     if role == "worker":
-        return f"artifacts/{phase.upper()}.md"
-    return f"artifacts/REVIEW_{phase.upper()}.md"
+        return f"{base}{phase.upper()}.md"
+    return f"{base}REVIEW_{phase.upper()}.md"
 
 
 def build_task_boundary(

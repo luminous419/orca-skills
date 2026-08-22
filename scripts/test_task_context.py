@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import inspect
+import tempfile
 import unittest
+from pathlib import Path
 
 from scripts.task_context import (
     AGENT_MODES,
@@ -18,10 +20,12 @@ from scripts.task_context import (
     TaskContextError,
     build_reviewer_context,
     build_task_boundary,
+    ensure_run_artifact_root,
     parse_reviewer_context,
     phase_artifact_contract,
     render_task_spec,
     require_workflow_phase,
+    run_artifact_root,
 )
 
 
@@ -217,21 +221,122 @@ class WorkflowPhaseTests(unittest.TestCase):
         instead of at the reviewer's own output path.
         """
         self.assertEqual(
-            phase_artifact_contract(role="worker", phase="design"),
-            "artifacts/DESIGN.md",
+            phase_artifact_contract(role="worker", phase="design", run_id="run_a"),
+            "artifacts/runs/run_a/DESIGN.md",
         )
         self.assertEqual(
-            phase_artifact_contract(role="reviewer", phase="design"),
-            "artifacts/REVIEW_DESIGN.md",
+            phase_artifact_contract(role="reviewer", phase="design", run_id="run_a"),
+            "artifacts/runs/run_a/REVIEW_DESIGN.md",
         )
         self.assertEqual(
-            phase_artifact_contract(role="reviewer", phase="final_review"),
-            "artifacts/FINAL_REVIEW.md",
+            phase_artifact_contract(
+                role="reviewer", phase="final_review", run_id="run_a"
+            ),
+            "artifacts/runs/run_a/FINAL_REVIEW.md",
         )
         with self.assertRaisesRegex(TaskContextError, "agent mode"):
             phase_artifact_contract(role="worker", phase="complete")
         with self.assertRaisesRegex(TaskContextError, "unknown role"):
             phase_artifact_contract(role="coordinator", phase="design")
+
+    def test_the_artifact_contract_requires_a_run_id(self) -> None:
+        """Fail-closed like require_workflow_phase: no fallback to the shared root.
+
+        role and phase are still checked first (test above): this is what happens
+        once both of those are valid and only run_id is missing.
+        """
+        with self.assertRaisesRegex(TaskContextError, "run_id is required"):
+            phase_artifact_contract(role="worker", phase="design")
+        with self.assertRaisesRegex(TaskContextError, "run_id is required"):
+            phase_artifact_contract(role="reviewer", phase="final_review")
+
+    def test_different_runs_never_share_an_artifact_path(self) -> None:
+        """The whole point of run-level isolation, stated as non-overlap.
+
+        Every (role, phase) pair this module can be asked to name gets a disjoint
+        path per run_id, and every path it produces stays inside that run's own
+        artifacts/runs/<run_id>/ directory -- including BUGFIX/REFACTORING, which
+        use the exact same (role, phase) -> path shape as the canonical phases.
+        """
+        phases = (*WORKFLOW_PHASES,)
+        run_a_paths = {
+            phase_artifact_contract(role=role, phase=phase, run_id="run_a")
+            for phase in phases
+            for role in ("worker", "reviewer")
+        }
+        run_b_paths = {
+            phase_artifact_contract(role=role, phase=phase, run_id="run_b")
+            for phase in phases
+            for role in ("worker", "reviewer")
+        }
+        self.assertEqual(run_a_paths & run_b_paths, set())
+        for path in run_a_paths:
+            self.assertTrue(path.startswith("artifacts/runs/run_a/"))
+        for path in run_b_paths:
+            self.assertTrue(path.startswith("artifacts/runs/run_b/"))
+        for phase in ("bugfix", "refactoring"):
+            with self.subTest(phase=phase):
+                self.assertEqual(
+                    phase_artifact_contract(
+                        role="worker", phase=phase, run_id="run_a"
+                    ),
+                    f"artifacts/runs/run_a/{phase.upper()}.md",
+                )
+
+    def test_a_path_like_run_id_is_refused_not_sanitized(self) -> None:
+        """run_artifact_root is the isolation boundary, not just a formatter.
+
+        A run_id is interpolated straight into a filesystem path; real Orca run ids
+        never contain a separator or a bare '.'/'..' segment, so a value that does is
+        refused outright rather than cleaned up and used anyway.
+        """
+        for unsafe in ("../escaped", "a/b", "a\\b", ".", ".."):
+            with self.subTest(run_id=unsafe):
+                with self.assertRaisesRegex(TaskContextError, "single path segment"):
+                    run_artifact_root(unsafe)
+                with self.assertRaisesRegex(TaskContextError, "single path segment"):
+                    phase_artifact_contract(
+                        role="worker", phase="design", run_id=unsafe
+                    )
+
+
+class RunArtifactRootProvisioningTests(unittest.TestCase):
+    """MAJOR 1 (PR #13 review): the directory has to exist before anyone writes to it.
+
+    run_artifact_root() only ever returns a string; something has to turn that into a
+    real directory before the first Task naming it is dispatched, or the first Worker
+    told to write there is the one that discovers it is missing.
+    """
+
+    def test_ensure_creates_the_missing_directory_and_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            base = Path(workspace)
+            target = base / "artifacts" / "runs" / "run_fresh"
+            self.assertFalse(target.exists(), "fixture must not pre-create the dir")
+
+            created = ensure_run_artifact_root("run_fresh", base=base)
+
+            self.assertEqual(created, target)
+            self.assertTrue(target.is_dir())
+            # Calling it again (the second phase of the same run) must not raise.
+            self.assertEqual(ensure_run_artifact_root("run_fresh", base=base), target)
+
+    def test_ensure_without_a_base_defaults_to_the_real_artifacts_root(self) -> None:
+        """Signature-only: actually calling this would create a real directory.
+
+        `base` defaulting to None (never a value invented here) is what makes the
+        real repository's artifacts/runs/<run_id>/ the target when a harness omits
+        it -- exercising that path in a test would litter the working tree, which is
+        exactly what the other two tests in this class use `base=` to avoid.
+        """
+        parameter = inspect.signature(ensure_run_artifact_root).parameters["base"]
+        self.assertIsNone(parameter.default)
+
+    def test_ensure_still_fails_closed_on_a_path_like_run_id(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            with self.assertRaisesRegex(TaskContextError, "single path segment"):
+                ensure_run_artifact_root("../escaped", base=Path(workspace))
+            self.assertEqual(list(Path(workspace).iterdir()), [])
 
 
 if __name__ == "__main__":

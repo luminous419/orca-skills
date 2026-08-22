@@ -502,7 +502,7 @@ class SessionReuseRuntimeIntegrationTests(unittest.TestCase):
         self.assertEqual(
             [boundary["artifact_contract"] for boundary in boundaries],
             [
-                phase_artifact_contract(role=role, phase=phase)
+                phase_artifact_contract(role=role, phase=phase, run_id=result.run_id)
                 for phase in CANONICAL_PHASES[: self.PHASES]
                 for role in ("worker", "reviewer")
             ],
@@ -511,6 +511,13 @@ class SessionReuseRuntimeIntegrationTests(unittest.TestCase):
             with self.subTest(phase=boundary["current_phase"]):
                 # The agent modes scenario K runs its fake agents with.
                 self.assertNotIn(boundary["current_phase"], AGENT_MODES)
+                # K-9: every artifact this run's own boundary names stays inside this
+                # run's own directory, never the shared artifacts/ root.
+                self.assertTrue(
+                    boundary["artifact_contract"].startswith(
+                        f"artifacts/runs/{result.run_id}/"
+                    )
+                )
         # K-8: the Reviewer's delta-first context references the artifacts this run
         # really produced and approved, not a placeholder shaped like one.
         reviewer_specs = [
@@ -524,12 +531,16 @@ class SessionReuseRuntimeIntegrationTests(unittest.TestCase):
                 self.assertEqual(context["current_phase"], phase)
                 self.assertEqual(
                     context["current_delta"],
-                    phase_artifact_contract(role="worker", phase=phase),
+                    phase_artifact_contract(
+                        role="worker", phase=phase, run_id=result.run_id
+                    ),
                 )
                 self.assertEqual(
                     context["approved_baseline"],
                     " || ".join(
-                        phase_artifact_contract(role="worker", phase=earlier)
+                        phase_artifact_contract(
+                            role="worker", phase=earlier, run_id=result.run_id
+                        )
                         for earlier in CANONICAL_PHASES[:index]
                     ),
                 )

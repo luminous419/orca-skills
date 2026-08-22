@@ -902,7 +902,7 @@ class FinalAdversarialReviewTests(unittest.TestCase):
         self.assertEqual(result.correction_dispatches, [])
         self.assertEqual(
             result.final_review_artifacts,
-            ("artifacts/FINAL_REVIEW_final_adversarial_review.md",),
+            ("artifacts/runs/run_e2e_final_adversarial_review/FINAL_REVIEW.md",),
         )
 
     def test_scenario_a_final_review_runs_after_specialized_single_phase(self) -> None:
@@ -1234,9 +1234,11 @@ class FinalAdversarialReviewTests(unittest.TestCase):
         self.assertEqual(
             result.final_review_artifacts,
             (
-                "artifacts/FINAL_REVIEW_final_adversarial_review.md",
-                "artifacts/FINAL_REVIEW_final_adversarial_review_iteration2.md",
-                "artifacts/FINAL_REVIEW_final_adversarial_review_iteration3.md",
+                "artifacts/runs/run_e2e_final_adversarial_review/FINAL_REVIEW.md",
+                "artifacts/runs/run_e2e_final_adversarial_review/"
+                "FINAL_REVIEW_iteration2.md",
+                "artifacts/runs/run_e2e_final_adversarial_review/"
+                "FINAL_REVIEW_iteration3.md",
             ),
         )
         self.assertEqual(
@@ -1244,6 +1246,51 @@ class FinalAdversarialReviewTests(unittest.TestCase):
         )
         for path in result.final_review_artifacts:
             self.assertNotIn("_iteration1", path)
+            self.assertTrue(
+                path.startswith("artifacts/runs/run_e2e_final_adversarial_review/")
+            )
+
+    def test_two_runs_of_the_same_scenario_never_share_an_artifact_path(self) -> None:
+        """Run-level isolation, end to end: same scenario, two run_ids, no overlap.
+
+        h4_scenario is the richest fixture already in this suite (3 Final Review
+        attempts, a correction round, a downstream revalidation): running it twice
+        under different run_ids and diffing every artifact path either run's sessions
+        reference is a stronger witness than comparing final_review_artifacts alone.
+        """
+        scenario, max_iterations = self.h4_scenario()
+
+        result_a = self.run_workflow_scenario(
+            replace(scenario, run_id="run_a"), max_iterations=max_iterations
+        )
+        result_b = self.run_workflow_scenario(
+            replace(scenario, run_id="run_b"), max_iterations=max_iterations
+        )
+
+        self.assertEqual(
+            set(result_a.final_review_artifacts) & set(result_b.final_review_artifacts),
+            set(),
+        )
+        for path in result_a.final_review_artifacts:
+            self.assertTrue(path.startswith("artifacts/runs/run_a/"))
+        for path in result_b.final_review_artifacts:
+            self.assertTrue(path.startswith("artifacts/runs/run_b/"))
+
+        def artifact_contracts(result: WorkflowRunResult) -> set[str]:
+            return {
+                value
+                for event in result.sessions
+                for key, value in event.task_boundary
+                if key == "artifact_contract"
+            }
+
+        contracts_a, contracts_b = artifact_contracts(result_a), artifact_contracts(result_b)
+        self.assertTrue(contracts_a)
+        self.assertEqual(contracts_a & contracts_b, set())
+        for path in contracts_a:
+            self.assertTrue(path.startswith("artifacts/runs/run_a/"))
+        for path in contracts_b:
+            self.assertTrue(path.startswith("artifacts/runs/run_b/"))
 
     # ---- 16: the R1 bridge witness ------------------------------------------------
 
@@ -1659,3 +1706,58 @@ class SessionRecordingTests(unittest.TestCase):
             len({event.session_id for event in result.sessions}),
             len(result.sessions),
         )
+
+
+class RunArtifactRootProvisioningTests(unittest.TestCase):
+    """MAJOR 1 (PR #13 review): the run directory must exist before a Worker runs.
+
+    workspace is a fresh tempdir per test and this class never pre-creates
+    artifacts/runs/ inside it -- the point is that E2EHarness does that itself.
+    """
+
+    ORCHESTRATION_SKILL = (
+        REPO_ROOT / "orca-worker-reviewer-orchestration" / "SKILL.md"
+    )
+
+    def test_constructing_the_harness_provisions_its_default_run_directory(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory)
+            target = workspace / "artifacts" / "runs" / "run_e2e"
+            self.assertFalse(target.exists())
+
+            E2EHarness(
+                self.ORCHESTRATION_SKILL,
+                phase="implementation",
+                max_iterations=5,
+                workspace=workspace,
+            )
+
+            self.assertTrue(target.is_dir())
+
+    def test_run_workflow_provisions_the_scenarios_own_run_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory)
+            target = workspace / "artifacts" / "runs" / "run_from_scenario"
+            self.assertFalse(target.exists())
+
+            harness = E2EHarness(
+                self.ORCHESTRATION_SKILL,
+                phase="implementation",
+                max_iterations=5,
+                workspace=workspace,
+            )
+            scenario = WorkflowScenario(
+                phases=("implementation",),
+                phase_scenarios={
+                    "implementation": FakeScenario(("complete",), ("pass",))
+                },
+                final_review=FinalReviewScenario(modes=("pass",)),
+                run_id="run_from_scenario",
+            )
+
+            result = harness.run_workflow(scenario)
+
+            self.assertEqual(result.final_status, "COMPLETED")
+            self.assertTrue(target.is_dir())
