@@ -8,6 +8,12 @@ import json
 from pathlib import Path
 
 
+try:
+    from scripts.task_context import render_boundary_receipt
+except ModuleNotFoundError:  # run directly as scripts/fake_*.py
+    from task_context import render_boundary_receipt
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", required=True)
@@ -18,6 +24,9 @@ def main() -> int:
     parser.add_argument("--findings-json", default="[]")
     parser.add_argument("--responsible-phases-json", default="{}")
     parser.add_argument("--artifact")
+    # Same contract as fake_worker: the dispatched Task spec is this agent's input,
+    # and the receipt is read back out of it.
+    parser.add_argument("--task-spec", default="")
     args = parser.parse_args()
 
     if args.mode == "exit":
@@ -53,6 +62,7 @@ def main() -> int:
             if phase:
                 print(f"Responsible Phase: {phase}")
             print("Issue: deterministic finding")
+        print(render_boundary_receipt(args.task_spec), end="")
         return 0
     if mode != "fail":
         return 2
@@ -67,6 +77,7 @@ def main() -> int:
         if phase:
             print(f"Responsible Phase: {phase}")
         print("Issue: deterministic finding")
+    print(render_boundary_receipt(args.task_spec), end="")
     return 0
 
 

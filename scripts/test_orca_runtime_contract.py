@@ -10,7 +10,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from dataclasses import asdict
+from collections import defaultdict
+from dataclasses import asdict, replace
 from os import environ
 from contextlib import redirect_stdout
 from io import StringIO
@@ -22,7 +23,9 @@ from scripts import orca_runtime_harness
 from scripts.orca_fake_agent import send_done
 from scripts.orca_runtime_harness import (
     CLOSE_ELIGIBLE_ROLES,
+    LIFECYCLE_MUTATION_COMMANDS,
     NEVER_CLOSE_ROLES,
+    PROCESS_TERMINATING_ACTIONS,
     SELF_HANDLE_ENV,
     TERMINAL_ROLE_CLASSES,
     REQUIRED_ORCA_CLI_GUIDE_SNIPPETS,
@@ -31,13 +34,38 @@ from scripts.orca_runtime_harness import (
     TERMINAL_ORIGINS,
     OrcaRuntimeError,
     OrcaRuntimeHarness,
+    LIVE_RELEASE_STATES,
+    OWNERSHIP_TRANSFERABLE_STATES,
+    REUSABLE_WORKER_STATES,
+    ReuseObservation,
     RuntimeAttempt,
     RuntimeScenarioResult,
     WORKER_RESOURCE_OUTCOMES,
     UnsupportedOrcaContract,
+    SESSION_REUSE_OBJECTIVE,
+    WorkflowEvidence,
     cleanup_authority,
     close_allowed,
+    dispatch_context,
+    run_session_reuse_runtime_scenario,
     validate_orca_contract,
+)
+from scripts.task_context import (
+    AGENT_MODES,
+    BOUNDARY_RECEIPT_PREFIX,
+    CANONICAL_PHASES,
+    FINAL_REVIEW_PHASE,
+    REVIEWER_CONTEXT_KEYS,
+    REVIEWER_CONTEXT_SPEC_HEADER,
+    REVIEWER_DRILL_DOWN_MANDATE,
+    TASK_BOUNDARY_KEYS,
+    TASK_BOUNDARY_SPEC_HEADER,
+    TaskContextError,
+    parse_reviewer_context,
+    parse_reviewer_context_keys,
+    parse_task_boundary,
+    phase_artifact_contract,
+    render_boundary_receipt,
 )
 
 # validate_skills.py imports its siblings by top-level module name, so scripts/ must be
@@ -78,6 +106,23 @@ DONE = {
 # The completion timestamp axis (a) requires alongside a settled status. The live
 # runtime writes `completed_at` on both the completed and the failed Dispatch row.
 COMPLETED_AT = "2026-08-21 20:12:31"
+
+
+def done_for(
+    dispatch_id: str, task_id: str = "task_g", outcome: str = "succeeded"
+) -> dict[str, Any]:
+    """DONE, but for another dispatch.
+
+    A reuse chain settles more than one Dispatch on one terminal, and STEP 1b refuses
+    a payload whose identities are not the ones being settled -- so a second attempt
+    needs a second payload, not the module-level one.
+    """
+    return {
+        "payload": json.dumps(
+            {"taskId": task_id, "dispatchId": dispatch_id, "outcome": outcome}
+        ),
+        "body": "ok",
+    }
 
 
 class AxisCase(NamedTuple):
@@ -202,6 +247,43 @@ class SequentialTerminalExec(RecordingExec):
             self.commands.append(args)
             return 0, json.dumps({"ok": True, "result": {"terminal": {"handle": handle}}})
         return super().__call__(args)
+
+
+class EchoingTerminalExec(SequentialTerminalExec):
+    """SequentialTerminalExec that also plays the agent, and answers with its input.
+
+    It keeps the `--spec` text of every task-create and the `--text` of every
+    terminal send, and the worker_done body it hands back is the boundary receipt
+    parsed out of the spec that was dispatched FOR THAT TASK. That is the difference
+    the finding turned on: a coordinator can always show what it recorded, but only
+    an answer derived from the dispatched input can show what the agent received. A
+    boundary that never reached the Task spec has no receipt to echo, so the positive
+    test below fails at the assertion rather than passing on metadata.
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.specs: dict[str, str] = {}  # task id -> the spec it was created with
+        self.sent: list[str] = []  # every low-level `terminal send --text` payload
+
+    def __call__(self, args: tuple[str, ...]) -> tuple[int, str]:
+        args = tuple(args)
+        verb = args[1] if len(args) > 1 else args[0]
+        code, payload = super().__call__(args)
+        body = json.loads(payload)
+        result = body.get("result") or {}
+        if verb == "task-create" and "--spec" in args:
+            self.specs[result["task"]["id"]] = args[args.index("--spec") + 1]
+        elif verb == "send" and "--text" in args:
+            self.sent.append(args[args.index("--text") + 1])
+        elif verb == "check" and result.get("messages"):
+            for message in result["messages"]:
+                task_id = json.loads(message["payload"])["taskId"]
+                message["body"] = "ok" + render_boundary_receipt(
+                    self.specs.get(task_id, "")
+                )
+            return code, json.dumps(body)
+        return code, payload
 
 
 class OrcaRuntimeContractTests(unittest.TestCase):
@@ -460,6 +542,10 @@ class DuplicateSettlementTests(unittest.TestCase):
         "observation": {},
         "origin": "self_created",
         "owned_by_this_dispatch": True,
+        "agent_command": "exec fake_bin/codex",
+        "effect": "reused",
+        "release_process_action": "none",
+        "retain_reason": "explicit_user_request",
         "result": RuntimeScenarioResult(
             scenario="probe", run_id="run_offline", status="passed", iteration=1
         ),
@@ -790,7 +876,7 @@ class UnexpectedExitSettlementTests(OfflineHarnessTestCase):
         recorder = RecordingExec(results=self.RESULTS)
         harness = self.build(recorder)
 
-        first = harness.observe_unexpected_exit("worker", 1)
+        first = harness.observe_unexpected_exit("worker", 1, phase="implementation")
 
         self.assertEqual(first.worker_done_count, 0)
         self.assertEqual(first.lifecycle_action, "abandon:abandoned;release:released")
@@ -802,7 +888,7 @@ class UnexpectedExitSettlementTests(OfflineHarnessTestCase):
         self.assertEqual(first.cleanup_authority, "not_authorized")
         self.assertEqual(first.finalizations, 1)
 
-        second = harness.observe_unexpected_exit("worker", 1)
+        second = harness.observe_unexpected_exit("worker", 1, phase="implementation")
 
         self.assertEqual(asdict(second), asdict(first))
         self.assertEqual(
@@ -828,7 +914,7 @@ class UnexpectedExitSettlementTests(OfflineHarnessTestCase):
         recorder = RecordingExec(results=results)
         harness = self.build(recorder)
 
-        attempt = harness.observe_unexpected_exit("worker", 1)
+        attempt = harness.observe_unexpected_exit("worker", 1, phase="implementation")
 
         self.assertEqual(attempt.worker_done_count, 0)
         self.assertEqual(attempt.settlement, "failed")
@@ -851,7 +937,7 @@ class UnexpectedExitSettlementTests(OfflineHarnessTestCase):
         harness = self.build(RecordingExec(results=results))
 
         with self.assertRaisesRegex(OrcaRuntimeError, "unexpected exit left worker"):
-            harness.observe_unexpected_exit("worker", 1)
+            harness.observe_unexpected_exit("worker", 1, phase="implementation")
 
 
 class AccountAxesTests(OfflineHarnessTestCase):
@@ -1430,7 +1516,10 @@ class SettlementOrderingTests(OfflineHarnessTestCase):
         The not-settled direction is already swept over LIFECYCLE_INTENTS; the
         settled direction was pinned for `release` alone, so a regression that let
         STEP 1b run after the mutation on the retain branch could have slipped
-        through. The verb mapping matters here: reuse is issued as worker-retain.
+        through. The verb mapping matters here: `retain` and `release` each have a
+        command, and `reuse` deliberately has none -- ownership transfers on the next
+        worker start instead -- so for reuse "mutates once" reads as "mutates zero
+        times, and the read-only order still holds".
         """
         for lifecycle in sorted(orca_runtime_harness.LIFECYCLE_INTENTS):
             with self.subTest(lifecycle=lifecycle):
@@ -1440,11 +1529,16 @@ class SettlementOrderingTests(OfflineHarnessTestCase):
 
                 attempt = self.settle(harness, lifecycle=lifecycle)
 
-                expected = orca_runtime_harness.LIFECYCLE_TO_COMMAND[lifecycle]
+                expected = orca_runtime_harness.LIFECYCLE_TO_COMMAND.get(lifecycle)
                 self.assertEqual(attempt.settlement, "completed")
-                self.assertEqual(harness.lifecycle_commands("ctx_1"), [expected])
                 verbs = recorder.verbs
                 self.assertLess(verbs.index("worker-show"), verbs.index("task-list"))
+                if expected is None:
+                    self.assertEqual(lifecycle, "reuse")
+                    self.assertEqual(harness.lifecycle_commands("ctx_1"), [])
+                    self.assertLess(verbs.index("task-list"), verbs.index("check"))
+                    continue
+                self.assertEqual(harness.lifecycle_commands("ctx_1"), [expected])
                 self.assertLess(verbs.index("task-list"), verbs.index(expected))
                 self.assertLess(verbs.index(expected), verbs.index("check"))
 
@@ -1585,7 +1679,7 @@ class SettlementOrderingTests(OfflineHarnessTestCase):
         recovering = RecordingExec(results=results)
         recovery_harness = self.build(recovering)
 
-        attempt = recovery_harness.observe_unexpected_exit("worker", 1)
+        attempt = recovery_harness.observe_unexpected_exit("worker", 1, phase="implementation")
 
         self.assertEqual(attempt.worker_done_count, 0)
         self.assertEqual(
@@ -1764,12 +1858,12 @@ class ReuseIntentTests(OfflineHarnessTestCase):
             terminal="term_worker",
         )
 
-        # reuse is achieved with the retain command, exactly once, and nothing closes
-        self.assertEqual(harness.lifecycle_commands("ctx_1"), ["worker-retain"])
+        # reuse issues zero lifecycle mutations; ownership moves on the next worker start
+        self.assertEqual(harness.lifecycle_commands("ctx_1"), [])
         self.assertNotIn("worker-release", recorder.verbs)
         self.assertNotIn("close", recorder.verbs)
         self.assertEqual(attempt.worker_resource, "reuse")
-        self.assertEqual(attempt.lifecycle_action, "reuse:retained")
+        self.assertEqual(attempt.lifecycle_action, "reuse:ownership-transfer-pending")
         self.assertEqual(attempt.process_liveness, "live")
 
     def test_an_explicit_retain_issues_retain_and_no_release(self) -> None:
@@ -1792,6 +1886,73 @@ class ReuseIntentTests(OfflineHarnessTestCase):
         self.assertNotIn("close", recorder.verbs)
         self.assertEqual(attempt.worker_resource, "retain")
 
+    def test_reuse_issues_none_of_the_lifecycle_mutation_commands(self) -> None:
+        """E': the whole mutation vocabulary, not only the two verbs reuse replaced.
+
+        lifecycle_commands() filters on LIFECYCLE_MUTATION_COMMANDS, but a reuse that
+        quietly abandoned its predecessor would still leave the release/retain view
+        empty while `worker-abandon` had in fact been sent. The assertion is therefore
+        against the intersection of the real command log with the full set.
+        """
+        recorder = RecordingExec(results=self.LIVE_WORKER_SHOW)
+        harness = self.build(recorder)
+        self.worker_terminal(harness)
+
+        harness.settle_attempt(
+            "worker",
+            1,
+            "task_g",
+            "ctx_1",
+            DONE,
+            "dlv_1",
+            lifecycle="reuse",
+            terminal="term_worker",
+        )
+
+        self.assertEqual(set(recorder.verbs) & LIFECYCLE_MUTATION_COMMANDS, set())
+        self.assertIn("worker-abandon", LIFECYCLE_MUTATION_COMMANDS)
+        self.assertEqual(harness.lifecycle_commands("ctx_1"), [])
+
+    def test_a_reviewer_re_review_reuse_issues_no_command_either(self) -> None:
+        """F: the reviewer half of a chain -- a correction re-review on one terminal.
+
+        Two dispatches settle on the same handle, both with lifecycle="reuse", and the
+        second one is the re-review. Neither may send anything, and the ownership
+        record must show both dispatches in order.
+        """
+        recorder = RecordingExec(results=self.LIVE_WORKER_SHOW)
+        harness = self.build(recorder)
+        self.worker_terminal(
+            harness, "term_reviewer", intended_role="phase_reviewer"
+        )
+
+        for iteration, dispatch_id in enumerate(("ctx_1", "ctx_2"), start=1):
+            harness.register_terminal(
+                "term_reviewer",
+                role="active_worker",
+                origin="self_created",
+                intended_role="phase_reviewer",
+                owner_dispatch_id=dispatch_id,
+            )
+            attempt = harness.settle_attempt(
+                "reviewer",
+                iteration,
+                "task_g",
+                dispatch_id,
+                done_for(dispatch_id),
+                f"dlv_{iteration}",
+                lifecycle="reuse",
+                terminal="term_reviewer",
+            )
+            with self.subTest(dispatch=dispatch_id):
+                self.assertEqual(harness.lifecycle_commands(dispatch_id), [])
+                self.assertEqual(
+                    attempt.lifecycle_action, "reuse:ownership-transfer-pending"
+                )
+                self.assertEqual(attempt.worker_resource, "reuse")
+
+        self.assertEqual(set(recorder.verbs) & LIFECYCLE_MUTATION_COMMANDS, set())
+        self.assertEqual(harness.reuse_chain("term_reviewer"), ("ctx_1", "ctx_2"))
 
 class WorkerPlacementLadderTests(OfflineHarnessTestCase):
     """Goal 4: the rung transitions of the custom-command placement ladder.
@@ -2099,7 +2260,7 @@ class GraphFirstOrderingTests(OfflineHarnessTestCase):
         self.worker_terminal(harness)
 
         attempt, handle = harness.run_existing_task(
-            "reviewer", 1, "pass", "task_g", terminal="term_worker"
+            "reviewer", 1, "pass", "task_g", phase="implementation", terminal="term_worker"
         )
 
         self.assertEqual(handle, "term_worker")
@@ -2117,7 +2278,7 @@ class GraphFirstOrderingTests(OfflineHarnessTestCase):
         self.worker_terminal(harness)
 
         attempt, _ = harness.run_attempt(
-            "worker", 1, "complete", terminal="term_worker"
+            "worker", 1, "complete", phase="implementation", terminal="term_worker"
         )
 
         self.assertEqual(recorder.verbs.count("task-create"), 1)
@@ -2146,6 +2307,1297 @@ class GraphFirstOrderingTests(OfflineHarnessTestCase):
         self.assertEqual(
             overrides, [], "a harness path force-readies a task instead of using deps"
         )
+
+
+class SameRoleSessionReuseTests(OfflineHarnessTestCase):
+    """DESIGN section 7.1 A-1: one terminal per role for a whole run of phases.
+
+    Driven by SequentialTerminalExec, because the base recorder answers every
+    `terminal create` with one pinned handle and would make "the chain kept ONE
+    terminal" true even for a harness that created five. Its own `arm()` swaps the
+    dispatch id, the task id and the delivered worker_done together, so every attempt
+    settles a different row with a different identity -- FinalReviewFreshnessTests
+    keeps its own copy untouched, it is an unmodified regression class.
+    """
+
+    PHASES = ("analysis", "plan", "design", "implementation", "test")
+
+    # settle_attempt's own axis read. The reuse gate adds exactly one more per
+    # decision, which is what the count assertion below separates out.
+    WORKER_SHOWS_PER_SETTLEMENT = 1
+
+    LIVE_TERMINAL_RESOURCE = {
+        "releaseState": "not_requested",
+        "ownershipState": "external",
+        "retainedReason": "external_terminal",
+    }
+
+    def arm(
+        self, recorder: SequentialTerminalExec, dispatch_id: str, task_id: str
+    ) -> None:
+        recorder.results["task-create"] = {"task": {"id": task_id}}
+        recorder.results["task-list"] = {
+            "tasks": [{"id": task_id, "status": "completed"}]
+        }
+        recorder.results["worker-start"] = {
+            "dispatchId": dispatch_id,
+            "effects": [
+                {
+                    "kind": "terminal",
+                    "action": "reused",
+                    "id": "term_agent",
+                    "role": "agent",
+                }
+            ],
+        }
+        recorder.results["worker-show"] = {
+            "dispatch": {"status": "completed", "completed_at": COMPLETED_AT},
+            "worker": {"state": "settled"},
+            "terminalResource": dict(self.LIVE_TERMINAL_RESOURCE),
+        }
+        recorder.results["worker-release"] = {
+            "state": "released",
+            "processAction": "none",
+        }
+        recorder.results["check"] = {
+            "deliveryId": f"dlv_{dispatch_id}",
+            "timedOut": False,
+            "messages": [
+                {
+                    "id": f"msg_{dispatch_id}",
+                    "type": "worker_done",
+                    "payload": json.dumps(
+                        {
+                            "taskId": task_id,
+                            "dispatchId": dispatch_id,
+                            "outcome": "succeeded",
+                        }
+                    ),
+                    "body": "ok",
+                }
+            ],
+        }
+
+    def chain(
+        self,
+        recorder: SequentialTerminalExec,
+        harness: OrcaRuntimeHarness,
+        role: str,
+        *,
+        phases: tuple[str, ...] | None = None,
+        findings: tuple[tuple[str, ...], ...] = (),
+        agent_command: str | None = None,
+    ) -> list[RuntimeAttempt]:
+        """Run one role across `phases` the way scenario K runs it.
+
+        Which terminal an attempt gets is decided by the PRODUCTION gate --
+        terminal_for_next_dispatch(), which takes its own fresh observation and runs
+        the eight conditions -- never by the loop counter. That is the whole point:
+        a chain that handed over the previous handle because `index > 1` would keep
+        one terminal even if the gate refused every time (TEST-I1-MAJOR-1), so no
+        test written against it could tell a working reuse decision from an absent
+        one. Nothing here calls reuse_eligible(): the tests below observe the
+        decision, they do not make it.
+
+        `agent_command` is the command the NEXT attempt is said to need. None means
+        "the one the ledger recorded for the running session", which is what a real
+        same-role chain asks for; passing a different string is condition 2 being
+        violated by the caller, with every other condition left satisfied.
+        """
+        phases = phases or self.PHASES
+        mode = "pass" if role.endswith("reviewer") else "complete"
+        intended_role = "phase_reviewer" if role.endswith("reviewer") else "phase_worker"
+        attempts: list[RuntimeAttempt] = []
+        previous: RuntimeAttempt | None = None
+        for index, phase in enumerate(phases, start=1):
+            task_id = f"task_{role}_{index}"
+            self.arm(recorder, f"ctx_{role}_{index}", task_id)
+            terminal: str | None = None
+            if previous is not None:
+                recorded = harness.ledger_terminal(previous.terminal)["agent_command"]
+                terminal = harness.terminal_for_next_dispatch(
+                    previous.terminal,
+                    role=intended_role,
+                    agent_command=(
+                        recorded if agent_command is None else agent_command
+                    ),
+                    dispatch_id=previous.dispatch_id,
+                )
+            attempt_findings = findings[index - 1] if index <= len(findings) else ()
+            # Composed once and handed to BOTH task-create and the dispatch, exactly
+            # as scenario K does it: the Task spec is the agent-visible payload on
+            # the supervised path, so a chain that skipped it here would be testing
+            # a wiring the runtime scenario does not have.
+            spec, _, _ = dispatch_context(
+                role,
+                index,
+                mode,
+                phase=phase,
+                base_spec=f"{role} iteration {index}: {phase}",
+                findings=attempt_findings,
+            )
+            attempt, _ = harness.run_existing_task(
+                role,
+                index,
+                mode,
+                harness.create_task(spec),
+                phase=phase,
+                spec=spec,
+                lifecycle="release" if index == len(phases) else "reuse",
+                terminal=terminal,
+                findings=attempt_findings,
+            )
+            attempts.append(attempt)
+            previous = attempt
+        return attempts
+
+    # ---- TEST-I1-MAJOR-1: the gate is wired into the path, not just well-formed ----
+
+    def test_the_production_path_reuses_a_terminal_without_the_test_asking(
+        self,
+    ) -> None:
+        """Positive entry-point test: reuse is OBSERVED, never asserted into being.
+
+        Nothing in this test calls reuse_eligible() or observe_for_reuse(). It runs
+        the production sequence and reads back what happened: the second attempt ran
+        on the handle the first attempt created, and `terminal create` went out once
+        for the whole five-phase chain. If terminal_for_next_dispatch() stopped
+        consuming the gate -- or the gate started refusing an eligible session --
+        this reads five handles and five creations instead of one.
+        """
+        recorder = SequentialTerminalExec()
+        harness = self.build(recorder)
+
+        attempts = self.chain(recorder, harness, "worker")
+
+        self.assertEqual(attempts[1].terminal, attempts[0].terminal)
+        self.assertFalse(attempts[1].terminal_created)
+        self.assertEqual(len({attempt.terminal for attempt in attempts}), 1)
+        self.assertEqual(len(recorder.created), 1)
+        # The decision was taken per attempt against a fresh look, so the four reuse
+        # decisions each cost exactly one extra read-only worker-show.
+        self.assertEqual(
+            recorder.verbs.count("worker-show"),
+            self.WORKER_SHOWS_PER_SETTLEMENT * len(self.PHASES)
+            + (len(self.PHASES) - 1),
+        )
+
+    def test_a_different_agent_command_makes_the_production_path_go_fresh(
+        self,
+    ) -> None:
+        """Negative entry-point test: one violated condition, observed end to end.
+
+        Same production sequence, same fixtures, same live receipts -- only the
+        agent command the next attempt needs differs, which is condition 2 and
+        condition 2 alone. The observation is again on the runtime side: every
+        attempt opens its own terminal, so `terminal create` went out five times.
+        A harness that decided reuse by loop position would still report one.
+        """
+        recorder = SequentialTerminalExec()
+        harness = self.build(recorder)
+
+        attempts = self.chain(
+            recorder, harness, "worker", agent_command="exec fake_bin/another-agent"
+        )
+
+        self.assertEqual(
+            [attempt.terminal_created for attempt in attempts],
+            [True] * len(self.PHASES),
+        )
+        self.assertEqual(
+            len({attempt.terminal for attempt in attempts}), len(self.PHASES)
+        )
+        self.assertEqual(len(recorder.created), len(self.PHASES))
+
+    def test_scenario_k_takes_its_terminal_from_the_gate(self) -> None:
+        """Structural lock on the wiring the runtime scenario cannot show offline.
+
+        The offline tests above prove the decision path works; this proves scenario
+        K is ON that path. Re-hardcoding `terminal=` to a loop-carried variable
+        would leave the two tests above green -- they drive their own sequence --
+        so the one thing left to pin is that the runtime scenario asks the gate and
+        that the gate reaches both halves of the decision.
+        """
+        module = ast.parse(Path(orca_runtime_harness.__file__).read_text())
+        scopes = self._callers(module)
+
+        self.assertIn(
+            "terminal_for_next_dispatch",
+            scopes["run_session_reuse_runtime_scenario"] | scopes["next_terminal"],
+            "scenario K no longer asks the reuse gate which terminal to dispatch on",
+        )
+        self.assertLessEqual(
+            {"reuse_eligible", "observe_for_reuse"},
+            scopes["terminal_for_next_dispatch"],
+            "the reuse decision no longer runs the gate against a fresh observation",
+        )
+
+    @staticmethod
+    def _callers(module: ast.Module) -> dict[str, set[str]]:
+        """function name -> the set of method/function names called inside it."""
+        called: dict[str, set[str]] = defaultdict(set)
+
+        def walk(node: ast.AST, scope: str) -> None:
+            for child in ast.iter_child_nodes(node):
+                child_scope = (
+                    child.name
+                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    else scope
+                )
+                if isinstance(child, ast.Call):
+                    function = child.func
+                    if isinstance(function, ast.Attribute):
+                        called[scope].add(function.attr)
+                    elif isinstance(function, ast.Name):
+                        called[scope].add(function.id)
+                walk(child, child_scope)
+
+        walk(module, "<module>")
+        return called
+
+    def test_a_worker_chain_across_phases_creates_one_terminal(self) -> None:
+        recorder = SequentialTerminalExec()
+        harness = self.build(recorder)
+
+        attempts = self.chain(recorder, harness, "worker")
+
+        self.assertEqual(len(attempts), len(self.PHASES))
+        self.assertEqual(
+            [attempt.terminal_created for attempt in attempts],
+            [True, False, False, False, False],
+        )
+        self.assertEqual(len({attempt.terminal for attempt in attempts}), 1)
+        self.assertEqual(len(recorder.created), 1)
+
+    def test_a_reviewer_chain_across_phases_creates_one_terminal(self) -> None:
+        recorder = SequentialTerminalExec()
+        harness = self.build(recorder)
+
+        attempts = self.chain(recorder, harness, "reviewer")
+
+        self.assertEqual(
+            sum(1 for attempt in attempts if attempt.terminal_created), 1
+        )
+        self.assertEqual(len({attempt.terminal for attempt in attempts}), 1)
+        self.assertEqual(len(recorder.created), 1)
+
+    def test_worker_and_reviewer_chains_never_share_a_handle(self) -> None:
+        """C: a role swap is never a reuse, so the two chains cannot intersect."""
+        recorder = SequentialTerminalExec()
+        harness = self.build(recorder)
+
+        worker_attempts = self.chain(recorder, harness, "worker")
+        reviewer_attempts = self.chain(recorder, harness, "reviewer")
+
+        worker_handles = {attempt.terminal for attempt in worker_attempts}
+        reviewer_handles = {attempt.terminal for attempt in reviewer_attempts}
+        self.assertTrue(worker_handles.isdisjoint(reviewer_handles))
+        # The same answer read off the ledger rather than off the attempts.
+        self.assertEqual(
+            set(harness.handles_with_intended_role("phase_worker")), worker_handles
+        )
+        self.assertEqual(
+            set(harness.handles_with_intended_role("phase_reviewer")),
+            reviewer_handles,
+        )
+        self.assertEqual(len(recorder.created), 2)
+
+    def test_every_attempt_in_a_chain_carries_new_task_and_dispatch_identity(
+        self,
+    ) -> None:
+        """D + I-b: the session persists, the identity does not."""
+        recorder = SequentialTerminalExec()
+        harness = self.build(recorder)
+
+        attempts = self.chain(recorder, harness, "worker")
+
+        self.assertEqual(
+            len({attempt.task_id for attempt in attempts}), len(attempts)
+        )
+        self.assertEqual(
+            len({attempt.dispatch_id for attempt in attempts}), len(attempts)
+        )
+        for previous, current in zip(attempts, attempts[1:]):
+            with self.subTest(dispatch=current.dispatch_id):
+                self.assertNotEqual(previous.task_id, current.task_id)
+                self.assertNotEqual(previous.dispatch_id, current.dispatch_id)
+                # ... on the one terminal both of them ran on.
+                self.assertEqual(previous.terminal, current.terminal)
+
+    def test_a_dispatch_in_lifecycle_recovery_forces_a_fresh_terminal(self) -> None:
+        """G: recovery is condition 8, and an ineligible handle is not reused."""
+        recorder = SequentialTerminalExec(
+            results={
+                "worker-show": {
+                    "dispatch": {"status": "dispatched"},
+                    "worker": {"state": "outcome_unknown"},
+                    "terminalResource": {"releaseState": "released"},
+                },
+                "worker-abandon": {"state": "abandoned"},
+                "worker-release": {"state": "released", "processAction": "none"},
+                "task-list": {"tasks": [{"id": "task_g", "status": "failed"}]},
+            }
+        )
+        harness = self.build(recorder)
+
+        crashed = harness.observe_unexpected_exit("worker", 1, phase="implementation")
+        crashed_handle = crashed.terminal
+
+        self.assertEqual(crashed.outcome, "unknown")
+        self.assertEqual(
+            harness.lifecycle_recovery_state(crashed.dispatch_id),
+            "previous_attempt_in_recovery",
+        )
+        eligible, reasons = harness.reuse_eligible(
+            crashed_handle,
+            role="phase_worker",
+            agent_command=harness.ledger_terminal(crashed_handle)["agent_command"],
+            dispatch_id=crashed.dispatch_id,
+            observation=ReuseObservation(
+                observed_at_dispatch=crashed.dispatch_id,
+                handle=crashed_handle,
+                worker_state="settled",
+                release_state="not_requested",
+                ownership_state="external",
+            ),
+        )
+        self.assertFalse(eligible)
+        self.assertIn("previous_attempt_in_recovery", reasons)
+
+        # ... so the next attempt is given no terminal= and creates its own.
+        self.arm(recorder, "ctx_worker_2", "task_worker_2")
+        recovered, recovered_handle = harness.run_existing_task(
+            "worker",
+            2,
+            "complete",
+            harness.create_task("worker iteration 2: complete"),
+            phase="implementation",
+            lifecycle="release",
+        )
+
+        self.assertTrue(recovered.terminal_created)
+        self.assertNotEqual(recovered_handle, crashed_handle)
+
+    def test_a_self_created_reuse_chain_keeps_its_phase_role(self) -> None:
+        """PLAN MINOR 1 / D-1: a reused terminal is never external_or_adopted.
+
+        _attach_terminal demotes a known handle to active_worker while the new
+        dispatch is in flight -- that is the STEP 4-0 "no close before settle" rule --
+        and settle_attempt performs the one allowed promotion back. What must never
+        happen is the adoption branch, which would relabel the coordinator's own
+        terminal as somebody else's and strip its cleanup authority for good.
+        """
+        recorder = RecordingExec(
+            results={
+                "worker-show": {
+                    "dispatch": {"status": "completed", "completed_at": COMPLETED_AT},
+                    "worker": {"state": "settled"},
+                    "terminalResource": dict(self.LIVE_TERMINAL_RESOURCE),
+                },
+                "worker-release": {"state": "released", "processAction": "none"},
+            }
+        )
+        harness = self.build(recorder)
+        harness.register_terminal(
+            "term_worker",
+            role="phase_worker",
+            origin="self_created",
+            intended_role="phase_worker",
+            owner_dispatch_id="ctx_1",
+            agent_command="exec fake_bin/codex --role worker",
+        )
+
+        harness._attach_terminal("term_worker", "ctx_2", "supervised_adopted")
+
+        row = harness.ledger_terminal("term_worker")
+        self.assertNotEqual(row["role"], "external_or_adopted")
+        self.assertEqual(row["role"], "active_worker")
+        self.assertEqual(row["origin"], "self_created")
+        self.assertEqual(row["owner_dispatch_ids"], ["ctx_1", "ctx_2"])
+
+        harness.settle_attempt(
+            "worker",
+            2,
+            "task_g",
+            "ctx_2",
+            done_for("ctx_2"),
+            "dlv_2",
+            lifecycle="release",
+            terminal="term_worker",
+        )
+
+        settled = harness.ledger_terminal("term_worker")
+        self.assertEqual(settled["role"], "phase_worker")
+        self.assertEqual(settled["cleanup_authority"], "authorized")
+
+    def test_reuse_chain_preserves_session_and_refreshes_identity_and_boundary(
+        self,
+    ) -> None:
+        """Test N (DESIGN section 7.1.1): four properties off ONE attempt list.
+
+        (a) the session -- here the terminal -- survives every phase boundary;
+        (b) the Task/Dispatch identity is new on every attempt;
+        (c) the layer-1 boundary is rebuilt per attempt and carries neither id;
+        (d) the Reviewer, and only the Reviewer, is handed the eight delta-first keys.
+
+        If W-27's wiring is removed, (c) and (d) fail at the assertion, not at import:
+        that is why N is worth having next to the individual unit tests.
+        """
+        recorder = SequentialTerminalExec()
+        harness = self.build(recorder)
+        phases = ("analysis", "plan", "design")
+
+        worker_attempts = self.chain(recorder, harness, "worker", phases=phases)
+        reviewer_attempts = self.chain(
+            recorder,
+            harness,
+            "reviewer",
+            phases=phases,
+            findings=(("R1",), ("R1", "R2"), ()),
+        )
+
+        for role, attempts in (
+            ("worker", worker_attempts),
+            ("reviewer", reviewer_attempts),
+        ):
+            with self.subTest(role=role):
+                # (a)
+                self.assertEqual(len({attempt.terminal for attempt in attempts}), 1)
+                self.assertEqual(
+                    sum(1 for attempt in attempts if attempt.terminal_created), 1
+                )
+                # (b)
+                self.assertEqual(
+                    len({attempt.task_id for attempt in attempts}), len(attempts)
+                )
+                self.assertEqual(
+                    len({attempt.dispatch_id for attempt in attempts}), len(attempts)
+                )
+                # (c)
+                boundaries = [attempt.task_boundary for attempt in attempts]
+                self.assertEqual(len(set(boundaries)), len(attempts))
+                for boundary in boundaries:
+                    payload = dict(boundary)
+                    self.assertEqual(
+                        tuple(sorted(payload)), tuple(sorted(TASK_BOUNDARY_KEYS))
+                    )
+                    flattened = " ".join(list(payload) + list(payload.values()))
+                    self.assertNotIn("task_id", flattened)
+                    self.assertNotIn("dispatch_id", flattened)
+                self.assertEqual(
+                    [dict(boundary)["current_iteration"] for boundary in boundaries],
+                    ["1", "2", "3"],
+                )
+
+        # (c) the finding list is refreshed too, not only the iteration counter
+        self.assertEqual(
+            [
+                dict(attempt.task_boundary)["relevant_previous_findings"]
+                for attempt in reviewer_attempts
+            ],
+            ["R1", "R1\nR2", ""],
+        )
+        # (d)
+        for attempt in reviewer_attempts:
+            with self.subTest(dispatch=attempt.dispatch_id):
+                self.assertEqual(
+                    attempt.reviewer_context_keys, tuple(sorted(REVIEWER_CONTEXT_KEYS))
+                )
+                self.assertIn("drill_down", attempt.reviewer_context_keys)
+        for attempt in worker_attempts:
+            self.assertEqual(attempt.reviewer_context_keys, ())
+
+    # ---- FINAL-I1-MAJOR-1: the boundary in the DISPATCHED INPUT, not in the log ----
+
+    def test_the_dispatched_task_spec_carries_the_boundary_and_the_agent_echoes_it(
+        self,
+    ) -> None:
+        """The positive half of the correction, observed at the dispatch, not after.
+
+        Every assertion here reads one of two things: the `--spec` argument that
+        actually went out on task-create (the text Orca replays into the agent's
+        preamble), or the body the agent answered with, which EchoingTerminalExec
+        derives from that same spec. Neither is a RuntimeAttempt field. The previous
+        wiring built the boundary AFTER settle_attempt and stored it on the attempt,
+        which left both of these empty while every attempt-level assertion still
+        passed -- that is the gap this test closes.
+        """
+        recorder = EchoingTerminalExec()
+        harness = self.build(recorder)
+        phases = ("analysis", "plan", "design")
+
+        attempts = self.chain(recorder, harness, "worker", phases=phases)
+
+        # The session really is reused, so "the second attempt" is a second Task on a
+        # terminal that was never restarted -- the case the boundary exists for.
+        self.assertEqual(len({attempt.terminal for attempt in attempts}), 1)
+        self.assertEqual([a.terminal_created for a in attempts], [True, False, False])
+
+        for index, attempt in enumerate(attempts, start=1):
+            with self.subTest(iteration=index):
+                spec = recorder.specs[attempt.task_id]
+                self.assertIn(TASK_BOUNDARY_SPEC_HEADER, spec)
+                dispatched = parse_task_boundary(spec)
+                # All five keys, refreshed for THIS attempt, in the text that was sent.
+                self.assertEqual(
+                    tuple(sorted(dispatched)), tuple(sorted(TASK_BOUNDARY_KEYS))
+                )
+                self.assertEqual(dispatched["current_iteration"], str(index))
+                self.assertEqual(dispatched["current_role"], "worker")
+                # The instrumentation field records what was dispatched; it is not a
+                # second, independently built payload that could drift from it.
+                self.assertEqual(dispatched, dict(attempt.task_boundary))
+                # The agent's own receipt: proof of arrival, not of sending.
+                self.assertIn(
+                    f"{BOUNDARY_RECEIPT_PREFIX}current_iteration: {index}", attempt.body
+                )
+                self.assertIn(
+                    f"{BOUNDARY_RECEIPT_PREFIX}artifact_contract: "
+                    + dispatched["artifact_contract"],
+                    attempt.body,
+                )
+
+    def test_only_the_reviewer_spec_carries_the_delta_first_context(self) -> None:
+        """(d) of test N, moved onto the dispatched text.
+
+        The eight keys and the drill-down mandate have to be IN the Reviewer's Task
+        spec -- a mandate the reviewer never reads restricts nothing -- and they have
+        to be absent from the Worker's.
+        """
+        recorder = EchoingTerminalExec()
+        harness = self.build(recorder)
+        phases = ("analysis", "plan")
+
+        reviewer_attempts = self.chain(
+            recorder, harness, "reviewer", phases=phases, findings=(("R1",), ())
+        )
+        worker_attempts = self.chain(recorder, harness, "worker", phases=phases)
+
+        for attempt in reviewer_attempts:
+            with self.subTest(dispatch=attempt.dispatch_id):
+                spec = recorder.specs[attempt.task_id]
+                self.assertIn(REVIEWER_CONTEXT_SPEC_HEADER, spec)
+                for key in REVIEWER_CONTEXT_KEYS:
+                    self.assertIn(f"{key}:", spec)
+                self.assertIn(REVIEWER_DRILL_DOWN_MANDATE, spec)
+                self.assertIn(
+                    f"{BOUNDARY_RECEIPT_PREFIX}reviewer_context_keys", attempt.body
+                )
+        for attempt in worker_attempts:
+            with self.subTest(dispatch=attempt.dispatch_id):
+                spec = recorder.specs[attempt.task_id]
+                self.assertNotIn(REVIEWER_CONTEXT_SPEC_HEADER, spec)
+                self.assertNotIn(REVIEWER_DRILL_DOWN_MANDATE, spec)
+                self.assertNotIn("reviewer_context_keys", attempt.body)
+
+    def test_no_dispatched_spec_carries_a_previous_identity_or_a_carried_instruction(
+        self,
+    ) -> None:
+        """TASK_BOUNDARY_NEVER_CARRIED, proved at the string level on the real input.
+
+        The three forbidden values are previous_task_id, previous_dispatch_id and
+        unfinished_instruction. The first two are checked against the ids of every
+        OTHER attempt in the same reused session -- the only place a stale id could
+        realistically come from -- and then against the id prefixes outright, because
+        `task_`/`ctx_` cannot appear in a spec that was assembled before either id
+        existed. The third is checked as the "carry on where you left off" phrasing
+        SKILL.md section 9 forbids, which is the form an unfinished instruction takes.
+        """
+        recorder = EchoingTerminalExec()
+        harness = self.build(recorder)
+        phases = ("analysis", "plan", "design")
+
+        attempts = self.chain(
+            recorder,
+            harness,
+            "reviewer",
+            phases=phases,
+            findings=(("R1",), ("R1", "R2"), ()),
+        )
+
+        identities = {attempt.task_id for attempt in attempts} | {
+            attempt.dispatch_id for attempt in attempts
+        }
+        self.assertEqual(len(identities), 2 * len(attempts))  # all six are distinct
+        for attempt in attempts:
+            spec = recorder.specs[attempt.task_id]
+            with self.subTest(dispatch=attempt.dispatch_id):
+                # previous_task_id / previous_dispatch_id: not this attempt's either.
+                for identity in identities:
+                    self.assertNotIn(identity, spec)
+                    self.assertNotIn(identity, attempt.body)
+                for prefix in ("task_", "ctx_", "dcap_"):
+                    self.assertNotIn(prefix, spec)
+                # unfinished_instruction, in the shapes section 9 names.
+                for carried in (
+                    "continue",
+                    "where you left off",
+                    "still open",
+                    "unfinished",
+                    "remaining from",
+                    "as before",
+                ):
+                    self.assertNotIn(carried, spec.lower())
+
+    def test_the_low_level_fallback_prompt_carries_the_same_boundary(self) -> None:
+        """The other agent-visible channel: `terminal send`, not the Task spec.
+
+        On the supervised path Orca replays the Task spec into the preamble; on rung
+        4 the harness writes the prompt itself. Both have to carry the boundary, and
+        they have to carry the SAME one -- a fallback that dropped it would leave an
+        unconfigured agent working without a boundary and nothing would say so.
+        """
+        recorder = EchoingTerminalExec(
+            errors={"worker-start": {"code": "agent_unconfigured"}}
+        )
+        harness = self.build(recorder)
+        # The fallback takes its dispatch id from the `dispatch` verb, which the base
+        # recorder pins to ctx_1, so the delivery has to be armed with that same id.
+        self.arm(recorder, "ctx_1", "task_g")
+
+        attempt, _ = harness.run_attempt("worker", 1, "complete", phase="implementation")
+
+        self.assertEqual(len(recorder.sent), 1)
+        prompt = recorder.sent[0]
+        self.assertIn(TASK_BOUNDARY_SPEC_HEADER, prompt)
+        self.assertEqual(
+            parse_task_boundary(prompt), parse_task_boundary(recorder.specs["task_g"])
+        )
+        self.assertEqual(parse_task_boundary(prompt), dict(attempt.task_boundary))
+
+    def test_rendering_a_spec_twice_produces_the_same_dispatched_text(self) -> None:
+        """run_attempt renders once for task-create and hands the result back in.
+
+        run_existing_task renders again -- it has to, because a caller that created
+        the Task itself passes only its own text -- so the two renders have to agree
+        exactly. If they did not, task-create and the dispatch prompt would carry
+        different boundaries, and the Reviewer's original_objective would quote a
+        whole rendered block back into itself.
+        """
+        once, boundary, context = dispatch_context(
+            "reviewer", 2, "pass", phase="design", findings=("R1",)
+        )
+        twice, boundary_again, context_again = dispatch_context(
+            "reviewer", 2, "pass", phase="design", base_spec=once, findings=("R1",)
+        )
+
+        self.assertEqual(once, twice)
+        self.assertEqual(boundary, boundary_again)
+        self.assertIsNotNone(context)
+        self.assertEqual(context, context_again)
+        self.assertNotIn(
+            TASK_BOUNDARY_SPEC_HEADER, str(context_again["original_objective"])
+        )
+
+    def test_the_boundary_is_rendered_before_the_task_and_the_dispatch_exist(
+        self,
+    ) -> None:
+        """Ordering, which is the defect itself: rendered first, or not at all.
+
+        FINAL-I1-MAJOR-1 was an ordering bug -- the builders ran after start_worker,
+        wait_for_done and settle_attempt had all returned, so nothing they produced
+        could possibly have been dispatched. Reading the command log is the direct
+        way to pin the order: the spec has to be complete by the time task-create
+        goes out, which is before any dispatch verb runs.
+        """
+        recorder = EchoingTerminalExec()
+        harness = self.build(recorder)
+        self.arm(recorder, "ctx_worker_1", "task_worker_1")
+
+        harness.run_attempt("worker", 1, "complete", phase="implementation")
+
+        verbs = recorder.verbs
+        self.assertLess(verbs.index("task-create"), verbs.index("worker-start"))
+        self.assertIn(TASK_BOUNDARY_SPEC_HEADER, recorder.specs["task_worker_1"])
+        # And the ordering is structural, not incidental: dispatch_context is a pure
+        # function of the attempt's own arguments, so it cannot read a dispatch that
+        # does not exist yet.
+        parameters = inspect.signature(dispatch_context).parameters
+        self.assertNotIn("task_id", parameters)
+        self.assertNotIn("dispatch_id", parameters)
+
+
+class ReuseEligibilityTests(OfflineHarnessTestCase):
+    """DESIGN section 7.1 A-2: the eight conditions, one at a time.
+
+    eligible_fixture() satisfies all eight. Every negative below breaks exactly ONE
+    thing and binds to the name that must appear -- which is only a meaningful
+    assertion because reuse_eligible() never short-circuits, so an unrelated
+    condition silently failing would show up here as an extra name rather than
+    hiding behind an early return.
+    """
+
+    HANDLE = "term_worker"
+    DISPATCH = "ctx_1"
+    ROLE = "phase_worker"
+    AGENT_COMMAND = "exec fake_bin/codex --role worker --iteration 1"
+
+    def eligible_fixture(
+        self, **row_overrides: Any
+    ) -> tuple[OrcaRuntimeHarness, RecordingExec, ReuseObservation]:
+        recorder = RecordingExec()
+        harness = self.build(recorder)
+        row: dict[str, Any] = {
+            "role": "phase_worker",
+            "origin": "self_created",
+            "intended_role": "phase_worker",
+            "owner_dispatch_id": self.DISPATCH,
+            "agent_command": self.AGENT_COMMAND,
+        }
+        row.update(row_overrides)
+        harness.register_terminal(self.HANDLE, **row)
+        harness.record_terminal_effect(self.HANDLE, "reused")
+        harness._ledger[self.DISPATCH] = {
+            "dispatch_id": self.DISPATCH,
+            "task_id": "task_g",
+            "handle": self.HANDLE,
+            "role": "worker",
+            "iteration": 1,
+            "state": "finalized",
+            "replays": 0,
+            "attempt": None,
+        }
+        observation = ReuseObservation(
+            observed_at_dispatch=self.DISPATCH,
+            handle=self.HANDLE,
+            worker_state="settled",
+            release_state="not_requested",
+            ownership_state="external",
+            retained_reason="external_terminal",
+        )
+        return harness, recorder, observation
+
+    def gate(
+        self,
+        harness: OrcaRuntimeHarness,
+        observation: Any,
+        *,
+        role: str | None = None,
+        agent_command: str | None = None,
+    ) -> tuple[bool, tuple[str, ...]]:
+        return harness.reuse_eligible(
+            self.HANDLE,
+            role=self.ROLE if role is None else role,
+            agent_command=(
+                self.AGENT_COMMAND if agent_command is None else agent_command
+            ),
+            dispatch_id=self.DISPATCH,
+            observation=observation,
+        )
+
+    # ---- condition 1: same role --------------------------------------------------
+
+    def test_condition_1_matching_role_is_eligible(self) -> None:
+        harness, _, observation = self.eligible_fixture()
+
+        self.assertEqual(harness.ledger_terminal(self.HANDLE)["intended_role"], self.ROLE)
+        self.assertEqual(self.gate(harness, observation), (True, ()))
+
+    def test_condition_1_role_mismatch_is_refused(self) -> None:
+        harness, _, observation = self.eligible_fixture()
+
+        eligible, reasons = self.gate(harness, observation, role="phase_reviewer")
+
+        self.assertFalse(eligible)
+        self.assertEqual(reasons, ("role_mismatch",))
+
+    # ---- condition 2: same agent command -----------------------------------------
+
+    def test_condition_2_matching_agent_command_is_eligible(self) -> None:
+        harness, _, observation = self.eligible_fixture()
+
+        self.assertEqual(
+            harness.ledger_terminal(self.HANDLE)["agent_command"], self.AGENT_COMMAND
+        )
+        self.assertEqual(self.gate(harness, observation), (True, ()))
+
+    def test_condition_2_agent_command_mismatch_is_refused(self) -> None:
+        """F-11's test H, absorbed here: a different agent is a different session."""
+        harness, _, observation = self.eligible_fixture()
+
+        eligible, reasons = self.gate(
+            harness,
+            observation,
+            agent_command="exec fake_bin/codex --role reviewer --iteration 1",
+        )
+
+        self.assertFalse(eligible)
+        self.assertEqual(reasons, ("agent_command_mismatch",))
+
+    # ---- condition 3: positively live --------------------------------------------
+
+    def test_condition_3_a_live_process_is_eligible(self) -> None:
+        harness, _, observation = self.eligible_fixture()
+
+        self.assertIn(observation.release_state, LIVE_RELEASE_STATES)
+        self.assertIn(observation.worker_state, REUSABLE_WORKER_STATES)
+        self.assertEqual(self.gate(harness, observation), (True, ()))
+
+    def test_condition_3_a_dead_release_state_is_refused(self) -> None:
+        harness, _, observation = self.eligible_fixture()
+
+        eligible, reasons = self.gate(
+            harness, replace(observation, release_state="released")
+        )
+
+        self.assertFalse(eligible)
+        self.assertEqual(reasons, ("release_state_not_live",))
+
+    # ---- condition 4: previous dispatch settled AND finalized ---------------------
+
+    def test_condition_4_a_finalized_previous_dispatch_is_eligible(self) -> None:
+        harness, _, observation = self.eligible_fixture()
+
+        self.assertEqual(harness._ledger[self.DISPATCH]["state"], "finalized")
+        self.assertEqual(self.gate(harness, observation), (True, ()))
+
+    def test_condition_4_an_unfinalized_previous_dispatch_is_refused(self) -> None:
+        """One fact, one name: the absent row is not also reported as a recovery."""
+        harness, _, observation = self.eligible_fixture()
+        del harness._ledger[self.DISPATCH]
+
+        eligible, reasons = self.gate(harness, observation)
+
+        self.assertFalse(eligible)
+        self.assertEqual(reasons, ("previous_dispatch_not_finalized",))
+
+    # ---- condition 5: ownership transferable -------------------------------------
+
+    def test_condition_5_transferable_ownership_is_eligible(self) -> None:
+        harness, _, observation = self.eligible_fixture()
+
+        self.assertIn(observation.ownership_state, OWNERSHIP_TRANSFERABLE_STATES)
+        self.assertEqual(
+            harness.ledger_terminal(self.HANDLE)["terminal_effect"], "reused"
+        )
+        self.assertEqual(self.gate(harness, observation), (True, ()))
+
+    def test_condition_5_ownership_held_by_another_dispatch_is_refused(self) -> None:
+        harness, _, observation = self.eligible_fixture(owner_dispatch_id="ctx_0")
+
+        eligible, reasons = self.gate(harness, observation)
+
+        self.assertFalse(eligible)
+        self.assertEqual(reasons, ("ownership_not_held_by_this_dispatch",))
+
+    # ---- condition 6: not explicitly retained ------------------------------------
+
+    def test_condition_6_a_terminal_with_no_retain_request_is_eligible(self) -> None:
+        harness, _, observation = self.eligible_fixture()
+
+        self.assertIs(harness.ledger_terminal(self.HANDLE)["retain_requested"], False)
+        self.assertEqual(self.gate(harness, observation), (True, ()))
+
+    def test_condition_6_an_explicitly_retained_terminal_is_refused(self) -> None:
+        harness, _, observation = self.eligible_fixture()
+        harness.mark_retain_requested(self.HANDLE, retain_reason="user asked")
+
+        eligible, reasons = self.gate(harness, observation)
+
+        self.assertFalse(eligible)
+        self.assertEqual(reasons, ("explicitly_retained",))
+
+    # ---- condition 7: self-created, close-eligible, not the coordinator's ---------
+
+    def test_condition_7_a_self_created_phase_terminal_is_eligible(self) -> None:
+        harness, _, observation = self.eligible_fixture()
+
+        row = harness.ledger_terminal(self.HANDLE)
+        self.assertEqual(row["origin"], "self_created")
+        self.assertIn(row["role"], CLOSE_ELIGIBLE_ROLES)
+        self.assertEqual(self.gate(harness, observation), (True, ()))
+
+    def test_condition_7_an_adopted_terminal_is_refused(self) -> None:
+        harness, _, observation = self.eligible_fixture(
+            role="external_or_adopted", origin="adopted"
+        )
+
+        eligible, reasons = self.gate(harness, observation)
+
+        self.assertFalse(eligible)
+        self.assertEqual(reasons, ("not_self_created", "role_not_reuse_eligible"))
+
+    # ---- condition 8: not in lifecycle recovery ----------------------------------
+
+    def test_condition_8_a_clean_previous_dispatch_is_eligible(self) -> None:
+        harness, _, observation = self.eligible_fixture()
+
+        self.assertEqual(harness.lifecycle_recovery_state(self.DISPATCH), "")
+        self.assertEqual(self.gate(harness, observation), (True, ()))
+
+    def test_condition_8_a_dispatch_in_recovery_is_refused(self) -> None:
+        harness, _, observation = self.eligible_fixture()
+        harness._ledger[self.DISPATCH]["state"] = "in_progress"
+
+        eligible, reasons = self.gate(harness, observation)
+
+        self.assertFalse(eligible)
+        self.assertEqual(
+            reasons, ("previous_dispatch_not_finalized", "settlement_in_progress")
+        )
+
+    # ---- the observation record itself -------------------------------------------
+
+    def test_an_observation_taken_for_another_handle_is_refused(self) -> None:
+        harness, _, observation = self.eligible_fixture()
+
+        eligible, reasons = self.gate(
+            harness, replace(observation, handle="term_other")
+        )
+
+        self.assertFalse(eligible)
+        self.assertEqual(reasons, ("observation_not_for_this_dispatch",))
+
+    # ---- fail-closed: missing vs unknown, one name each (PLAN-I2-MAJOR-1) --------
+
+    def test_a_missing_release_state_is_refused(self) -> None:
+        harness, _, observation = self.eligible_fixture()
+
+        eligible, reasons = self.gate(harness, replace(observation, release_state=""))
+
+        self.assertFalse(eligible)
+        self.assertEqual(reasons, ("release_state_missing",))
+
+    def test_an_unknown_release_state_is_refused(self) -> None:
+        harness, _, observation = self.eligible_fixture()
+        self.assertNotIn("retained", LIVE_RELEASE_STATES)
+
+        eligible, reasons = self.gate(
+            harness, replace(observation, release_state="retained")
+        )
+
+        self.assertFalse(eligible)
+        self.assertEqual(reasons, ("release_state_not_live",))
+
+    def test_a_missing_worker_state_is_refused(self) -> None:
+        harness, _, observation = self.eligible_fixture()
+
+        eligible, reasons = self.gate(harness, replace(observation, worker_state=""))
+
+        self.assertFalse(eligible)
+        self.assertEqual(reasons, ("worker_state_missing",))
+
+    def test_an_unknown_worker_state_is_refused(self) -> None:
+        harness, _, observation = self.eligible_fixture()
+        self.assertNotIn("running", REUSABLE_WORKER_STATES)
+
+        eligible, reasons = self.gate(
+            harness, replace(observation, worker_state="running")
+        )
+
+        self.assertFalse(eligible)
+        self.assertEqual(reasons, ("worker_state_not_reusable",))
+
+    # ---- purity and completeness --------------------------------------------------
+
+    def test_reuse_eligible_issues_no_orca_command_and_writes_no_ledger_row(
+        self,
+    ) -> None:
+        """R-6: the gate is a predicate. It reads an argument and answers."""
+        harness, recorder, observation = self.eligible_fixture()
+        commands_before = list(recorder.commands)
+        row_before = dict(harness.ledger_terminal(self.HANDLE))
+        settlement_before = dict(harness._ledger[self.DISPATCH])
+
+        self.assertEqual(self.gate(harness, observation), (True, ()))
+        self.assertEqual(self.gate(harness, replace(observation, worker_state="")), (
+            False,
+            ("worker_state_missing",),
+        ))
+
+        self.assertEqual(recorder.commands, commands_before)
+        self.assertEqual(dict(harness.ledger_terminal(self.HANDLE)), row_before)
+        self.assertEqual(dict(harness._ledger[self.DISPATCH]), settlement_before)
+
+    def test_every_failing_condition_is_reported_not_just_the_first(self) -> None:
+        """No short-circuit: two broken conditions produce two sorted names."""
+        harness, _, observation = self.eligible_fixture()
+        harness.mark_retain_requested(self.HANDLE, retain_reason="user asked")
+
+        eligible, reasons = self.gate(
+            harness, observation, agent_command="a different agent"
+        )
+
+        self.assertFalse(eligible)
+        self.assertEqual(reasons, ("agent_command_mismatch", "explicitly_retained"))
+        self.assertEqual(list(reasons), sorted(set(reasons)))
+
+
+class RetainStateTransitionTests(OfflineHarnessTestCase):
+    """W-37: the retain record has exactly one writer and exactly one clearer.
+
+    The flag is what condition 6 reads, so "who may set it" is a correctness question
+    and not bookkeeping: an explicit user retain must survive until a release, and a
+    reuse must be unable to invent or erase one.
+    """
+
+    RESULTS = {
+        "worker-show": {
+            "dispatch": {"status": "completed", "completed_at": COMPLETED_AT},
+            "worker": {"state": "settled"},
+            "terminalResource": {"releaseState": "active"},
+        },
+        "worker-release": {"state": "released", "processAction": "none"},
+        "worker-retain": {"state": "retained", "processAction": "none"},
+    }
+
+    def settle(
+        self,
+        harness: OrcaRuntimeHarness,
+        dispatch_id: str,
+        lifecycle: str,
+        **kwargs: Any,
+    ) -> RuntimeAttempt:
+        return harness.settle_attempt(
+            "worker",
+            1,
+            "task_g",
+            dispatch_id,
+            done_for(dispatch_id),
+            f"dlv_{dispatch_id}",
+            lifecycle=lifecycle,
+            terminal="term_worker",
+            **kwargs,
+        )
+
+    def test_a_retain_records_the_request_and_its_reason(self) -> None:
+        harness = self.build(RecordingExec(results=self.RESULTS))
+        self.worker_terminal(harness)
+
+        self.settle(
+            harness, "ctx_1", "retain", retain_reason="user asked to keep the tab"
+        )
+
+        row = harness.ledger_terminal("term_worker")
+        self.assertIs(row["retain_requested"], True)
+        self.assertEqual(row["retain_reason"], "user asked to keep the tab")
+        self.assertEqual(harness.lifecycle_commands("ctx_1"), ["worker-retain"])
+
+    def test_a_release_clears_the_recorded_retain_request(self) -> None:
+        """The guide's "worker-release clears the requested retention", as behaviour."""
+        harness = self.build(RecordingExec(results=self.RESULTS))
+        self.worker_terminal(harness)
+        self.settle(harness, "ctx_1", "retain", retain_reason="user asked")
+        self.assertIs(harness.ledger_terminal("term_worker")["retain_requested"], True)
+
+        self.settle(harness, "ctx_2", "release")
+
+        row = harness.ledger_terminal("term_worker")
+        self.assertIs(row["retain_requested"], False)
+        self.assertEqual(row["retain_reason"], "")
+
+    def test_reuse_neither_sets_nor_clears_the_retain_request(self) -> None:
+        """reuse sends no command, so it also touches neither half of the record."""
+        harness = self.build(RecordingExec(results=self.RESULTS))
+        self.worker_terminal(harness)
+
+        self.settle(harness, "ctx_1", "reuse")
+        self.assertIs(harness.ledger_terminal("term_worker")["retain_requested"], False)
+        self.assertEqual(harness.ledger_terminal("term_worker")["retain_reason"], "")
+
+        harness.mark_retain_requested("term_worker", retain_reason="user asked")
+        before = dict(harness.ledger_terminal("term_worker"))
+
+        self.settle(harness, "ctx_2", "reuse")
+
+        after = harness.ledger_terminal("term_worker")
+        self.assertIs(after["retain_requested"], before["retain_requested"])
+        self.assertEqual(after["retain_reason"], before["retain_reason"])
+        self.assertEqual(harness.lifecycle_commands("ctx_2"), [])
+
+    def test_register_terminal_has_no_retain_parameter(self) -> None:
+        """Creation may not assert a retention nobody requested (DESIGN 4.3.6)."""
+        parameters = inspect.signature(OrcaRuntimeHarness.register_terminal).parameters
+
+        self.assertNotIn("retain_requested", parameters)
+        self.assertNotIn("retain_reason", parameters)
+        self.assertIn("agent_command", parameters)
+        # ... and the one method that may set it does take the reason.
+        self.assertIn(
+            "retain_reason",
+            inspect.signature(OrcaRuntimeHarness.mark_retain_requested).parameters,
+        )
+
+
+class TerminalEffectReceiptTests(OfflineHarnessTestCase):
+    """D-6 / R8-iii: cleanup authority does not read the receipt; the label does.
+
+    The two fixtures differ only in the placement rung and the release receipt, and
+    the expected matrix (DESIGN section 7.1 A-5) says `cleanup_authority` is
+    `authorized` in BOTH -- that identity is R8-iii itself. The only value allowed to
+    move between the two rows is the recorded `action`, and it moves entirely because
+    of the release receipt's `processAction`.
+
+    The base RecordingExec.RESULTS is deliberately left alone: its
+    `terminalResource.releaseState` of "released" sends account_axes down the
+    "already exited" branch, where the action is "nothing to do" and neither label is
+    observable at all.
+    """
+
+    # rung 3 -- the only path this repo has ever observed (25/25 receipts)
+    RUNG_3 = {
+        "worker-start": {
+            "dispatchId": "ctx_1",
+            "effects": [
+                {"kind": "terminal", "action": "reused",
+                 "id": "term_worker", "role": "agent"}
+            ],
+        },
+        "worker-release": {"state": "released", "processAction": "none"},
+        "worker-retain": {"state": "retained", "processAction": "none"},
+        "worker-show": {
+            "dispatch": {"status": "completed", "completed_at": COMPLETED_AT},
+            "worker": {"state": "settled"},
+            "terminalResource": {
+                "releaseState": "not_requested",
+                "ownershipState": "external",
+                "retainedReason": "external_terminal",
+            },
+        },
+    }
+    # rung 1 -- NEVER OBSERVED. This fixture is an unobserved hypothesis (A-7).
+    RUNG_1 = {
+        **RUNG_3,
+        "worker-start": {
+            "dispatchId": "ctx_1",
+            "effects": [
+                {"kind": "terminal", "action": "created",
+                 "id": "term_worker", "role": "agent"}
+            ],
+        },
+        "worker-release": {"state": "released", "processAction": "killed"},
+    }
+
+    class Rung3Exec(RecordingExec):
+        """RecordingExec answering with the observed rung-3 receipt shape."""
+
+        def __init__(self, **kwargs: Any) -> None:
+            results = {
+                **TerminalEffectReceiptTests.RUNG_3,
+                "check": RecordingExec.ACCEPTED_DONE,
+                **(kwargs.pop("results", None) or {}),
+            }
+            super().__init__(results=results, **kwargs)
+
+    class Rung1Exec(RecordingExec):
+        """RecordingExec answering with the UNOBSERVED rung-1 hypothesis (A-7)."""
+
+        def __init__(self, **kwargs: Any) -> None:
+            results = {
+                **TerminalEffectReceiptTests.RUNG_1,
+                "check": RecordingExec.ACCEPTED_DONE,
+                **(kwargs.pop("results", None) or {}),
+            }
+            super().__init__(results=results, **kwargs)
+
+    def run_one_release(
+        self, harness: OrcaRuntimeHarness
+    ) -> tuple[RuntimeAttempt, str]:
+        """create -> adopt -> settle with lifecycle="release", the production path."""
+        handle = harness.create_fake_terminal("worker", "complete", iteration=1)
+        dispatch_id, supervised = harness.start_worker("task_g", handle, "spec")
+        self.assertTrue(supervised)
+        done, delivery_id = harness.wait_for_done(dispatch_id)
+        attempt = harness.settle_attempt(
+            "worker",
+            1,
+            "task_g",
+            dispatch_id,
+            done,
+            delivery_id,
+            lifecycle="release",
+            terminal=handle,
+        )
+        return attempt, handle
+
+    def test_rung_3_receipt_keeps_authority_and_records_a_retained_action(self) -> None:
+        """The observed rung. `processAction: none` proves nothing was ended."""
+        harness = self.build(self.Rung3Exec())
+
+        attempt, handle = self.run_one_release(harness)
+
+        row = harness.ledger_terminal(handle)
+        self.assertEqual(row["terminal_effect"], "reused")
+        self.assertEqual(attempt.release_process_action, "none")
+        self.assertEqual(attempt.terminal_state, "not_requested")
+        self.assertEqual(attempt.process_liveness, "live")
+        # authority does not read the effect -- identical in both rungs
+        self.assertEqual(attempt.cleanup_authority, "authorized")
+        self.assertEqual(row["action"], "retained (runtime kept the process)")
+
+    def test_rung_1_receipt_keeps_authority_and_records_a_released_action(self) -> None:
+        """rung 1 is an unobserved hypothesis (A-7): this repo has never seen it.
+
+        If the real runtime ever reports a created terminal with a different release
+        receipt, this one fixture is what changes -- the authority calculation above
+        is untouched, which is exactly what R8-iii bought.
+        """
+        harness = self.build(self.Rung1Exec())
+
+        attempt, handle = self.run_one_release(harness)
+
+        row = harness.ledger_terminal(handle)
+        self.assertEqual(row["terminal_effect"], "created")
+        self.assertEqual(attempt.release_process_action, "killed")
+        self.assertIn("killed", PROCESS_TERMINATING_ACTIONS)
+        self.assertEqual(attempt.process_liveness, "live")
+        self.assertEqual(attempt.cleanup_authority, "authorized")
+        self.assertEqual(row["action"], "released by runtime")
+
+    def test_a_missing_release_receipt_keeps_the_legacy_released_action(self) -> None:
+        """The default that keeps AxisMatrixTests unmodified, pinned as behaviour."""
+        harness = self.build(self.Rung3Exec())
+        harness.register_terminal(
+            "term_worker",
+            role="phase_worker",
+            origin="self_created",
+            intended_role="phase_worker",
+            owner_dispatch_id="ctx_1",
+        )
+
+        axes = harness.account_axes(
+            "task_g",
+            "ctx_1",
+            "term_worker",
+            supervised=True,
+            observation={
+                "terminalResource": dict(self.RUNG_3["worker-show"]["terminalResource"])
+            },
+            task_status="completed",
+            lifecycle="release",
+        )
+
+        self.assertEqual(axes[2], "live")
+        self.assertEqual(axes[3], "authorized")
+        self.assertEqual(
+            harness.ledger_terminal("term_worker")["action"], "released by runtime"
+        )
+
+    def test_settle_attempt_propagates_the_rung_3_receipt_into_the_ledger_action(
+        self,
+    ) -> None:
+        """End to end: the label is derived from the receipt the runtime returned.
+
+        The expected value is read back out of the recorded worker-release response
+        rather than restated, so this fails if settle_attempt ever stops forwarding
+        `processAction` into account_axes even though the literal above still passes.
+        """
+        harness = self.build(self.Rung3Exec())
+
+        _, handle = self.run_one_release(harness)
+
+        receipts = [
+            (row.get("response") or {}).get("result", {}).get("processAction")
+            for row in harness._raw
+            if len(row["command"]) > 1 and row["command"][1] == "worker-release"
+        ]
+        self.assertEqual(receipts, ["none"])
+        expected = (
+            "released by runtime"
+            if receipts[0] in PROCESS_TERMINATING_ACTIONS
+            else "retained (runtime kept the process)"
+        )
+        self.assertEqual(harness.ledger_terminal(handle)["action"], expected)
 
 
 class FinalReviewFreshnessTests(OfflineHarnessTestCase):
@@ -2192,7 +3644,7 @@ class FinalReviewFreshnessTests(OfflineHarnessTestCase):
         self, recorder: SequentialTerminalExec, harness: OrcaRuntimeHarness
     ) -> tuple[RuntimeAttempt, str]:
         self.arm(recorder, "ctx_phase_reviewer")
-        return harness.run_attempt("reviewer", 1, "pass")
+        return harness.run_attempt("reviewer", 1, "pass", phase="implementation")
 
     def final_review_attempts(
         self,
@@ -2213,6 +3665,7 @@ class FinalReviewFreshnessTests(OfflineHarnessTestCase):
                     "reviewer",
                     index,
                     "pass" if index == count else "fail",
+                    phase=FINAL_REVIEW_PHASE,
                     findings=() if index == count else ("R1",),
                 )
             )
@@ -2381,6 +3834,601 @@ class FinalReviewFreshnessTests(OfflineHarnessTestCase):
                     handle,
                     harness.handles_with_intended_role(expected),
                 )
+
+    def test_final_review_terminals_differ_from_every_handle_in_a_live_reuse_chain(
+        self,
+    ) -> None:
+        """L: freshness must hold against a CHAIN, not just against the previous attempt.
+
+        The helpers above never pass terminal=, so every attempt they drive already
+        gets its own handle; that proves nothing about a run where a phase role really
+        did keep one terminal alive across dispatches. This test builds such a chain
+        first -- two dispatches, one handle, the second still reusable -- and only then
+        asks whether a Final Review attempt stayed out of it.
+        """
+        recorder = SequentialTerminalExec()
+        harness = self.build(recorder)
+
+        chain_handles: list[str] = []
+        terminal: str | None = None
+        for index in (1, 2):
+            self.arm(recorder, f"ctx_chain_{index}")
+            _, terminal = harness.run_attempt(
+                "worker",
+                index,
+                "complete",
+                phase="implementation",
+                lifecycle="release" if index == 2 else "reuse",
+                terminal=terminal,
+            )
+            chain_handles.append(terminal)
+
+        # the chain really is one live terminal handed onward, not two
+        self.assertEqual(len(set(chain_handles)), 1)
+        self.assertEqual(
+            harness.reuse_chain(chain_handles[0]), ("ctx_chain_1", "ctx_chain_2")
+        )
+
+        attempts = self.final_review_attempts(recorder, harness)
+
+        final_review_handles = {handle for _, handle in attempts}
+        self.assertEqual(len(final_review_handles), 2)
+        self.assertTrue(final_review_handles.isdisjoint(chain_handles))
+        for attempt, _ in attempts:
+            with self.subTest(dispatch=attempt.dispatch_id):
+                self.assertTrue(attempt.terminal_created)
+                self.assertNotEqual(attempt.worker_resource, "reuse")
+
+class SessionReuseGateTests(OfflineHarnessTestCase):
+    """The eight-condition reuse gate: pure, fail-closed, and never short-circuiting.
+
+    Only the minimum this IMPLEMENTATION owes: one fully eligible positive, the
+    fail-closed negatives for a missing/stale observation, and the read-only
+    observation builder. The full 45-test placement is the TEST phase's job.
+    """
+
+    def eligible_harness(
+        self, recorder: RecordingExec
+    ) -> tuple[OrcaRuntimeHarness, ReuseObservation]:
+        """A harness whose ledger satisfies all eight conditions for term_worker."""
+        harness = self.build(recorder)
+        harness.register_terminal(
+            "term_worker",
+            role="phase_worker",
+            origin="self_created",
+            intended_role="phase_worker",
+            owner_dispatch_id="ctx_1",
+            agent_command="exec fake_bin/codex",
+        )
+        harness.record_terminal_effect("term_worker", "reused")
+        harness._ledger["ctx_1"] = {
+            "dispatch_id": "ctx_1",
+            "task_id": "task_g",
+            "handle": "term_worker",
+            "role": "worker",
+            "iteration": 1,
+            "state": "finalized",
+            "replays": 0,
+            "attempt": self.PROBE_ATTEMPT,
+        }
+        observation = ReuseObservation(
+            observed_at_dispatch="ctx_1",
+            handle="term_worker",
+            worker_state="settled",
+            release_state="not_requested",
+            ownership_state="external",
+            retained_reason="",
+        )
+        return harness, observation
+
+    PROBE_ATTEMPT = RuntimeAttempt(
+        role="worker",
+        iteration=1,
+        task_id="task_g",
+        dispatch_id="ctx_1",
+        outcome="succeeded",
+        task_status="completed",
+        dispatch_status="completed",
+        worker_state="settled",
+        terminal_state="released",
+        lifecycle_action="reuse",
+        worker_done_count=1,
+        execution_path="offline",
+    )
+
+    def gate(
+        self, harness: OrcaRuntimeHarness, observation: Any
+    ) -> tuple[bool, tuple[str, ...]]:
+        return harness.reuse_eligible(
+            "term_worker",
+            role="phase_worker",
+            agent_command="exec fake_bin/codex",
+            dispatch_id="ctx_1",
+            observation=observation,
+        )
+
+    def test_all_eight_conditions_met_is_eligible_and_issues_no_command(self) -> None:
+        recorder = RecordingExec()
+        harness, observation = self.eligible_harness(recorder)
+
+        eligible, reasons = self.gate(harness, observation)
+
+        self.assertTrue(eligible, reasons)
+        self.assertEqual(reasons, ())
+        # The predicate is pure: no Orca command at all, lifecycle or otherwise.
+        self.assertEqual(recorder.commands, [])
+        self.assertEqual(harness.lifecycle_commands("ctx_1"), [])
+
+    # rung 3 -- the only placement this repo has ever observed (25/25 receipts).
+    # The terminal is live and external, the worker is settled, and the release
+    # receipt proves nothing was killed.
+    RUNG_3 = {
+        "worker-start": {
+            "dispatchId": "ctx_1",
+            "effects": [
+                {
+                    "kind": "terminal",
+                    "action": "reused",
+                    "id": "term_created",
+                    "role": "agent",
+                }
+            ],
+        },
+        "worker-show": {
+            "dispatch": {"status": "completed", "completed_at": COMPLETED_AT},
+            "worker": {"state": "settled"},
+            "terminalResource": {
+                "releaseState": "not_requested",
+                "ownershipState": "external",
+                "retainedReason": "external_terminal",
+            },
+        },
+        "worker-release": {"state": "released", "processAction": "none"},
+        "worker-retain": {"state": "retained", "processAction": "none"},
+        "check": RecordingExec.ACCEPTED_DONE,
+    }
+
+    def test_a_real_flow_reaches_an_eligible_reuse_decision(self) -> None:
+        """The gate is reachable, not merely well-formed.
+
+        Every value the eight conditions read is written by the production path --
+        create_fake_terminal records the agent command, start_worker records the
+        worker-start terminal effect and the owning dispatch, settle_attempt
+        finalizes the row -- so nothing here is hand-placed in the ledger. Without
+        W-20 the `agent_command` column stays "" and condition 2 refuses every
+        terminal forever, which is exactly the failure this test exists to catch:
+        a reuse gate that can never say yes is a reuse feature that never runs.
+        """
+        recorder = RecordingExec(results=self.RUNG_3)
+        harness = self.build(recorder)
+
+        handle = harness.create_fake_terminal("worker", "complete", iteration=1)
+        self.assertTrue(harness.ledger_terminal(handle)["agent_command"])  # W-20
+        dispatch_id, supervised = harness.start_worker(
+            "task_g", handle, "worker iteration 1: complete"
+        )
+        self.assertTrue(supervised)
+        self.assertEqual(harness.ledger_terminal(handle)["terminal_effect"], "reused")
+
+        done, delivery_id = harness.wait_for_done(dispatch_id)
+        attempt = harness.settle_attempt(
+            "worker",
+            1,
+            "task_g",
+            dispatch_id,
+            done,
+            delivery_id,
+            lifecycle="reuse",
+            terminal=handle,
+        )
+        self.assertEqual(attempt.lifecycle_action, "reuse:ownership-transfer-pending")
+        self.assertEqual(harness.lifecycle_commands(dispatch_id), [])
+
+        observation = harness.observe_for_reuse(
+            dispatch_id=dispatch_id, handle=handle
+        )
+        commands_before = list(recorder.commands)
+        eligible, reasons = harness.reuse_eligible(
+            handle,
+            role="phase_worker",
+            agent_command=harness.ledger_terminal(handle)["agent_command"],
+            dispatch_id=dispatch_id,
+            observation=observation,
+        )
+
+        self.assertTrue(eligible, reasons)
+        self.assertEqual(reasons, ())
+        self.assertEqual(recorder.commands, commands_before)
+
+    def test_a_missing_observation_is_refused_and_never_raises(self) -> None:
+        """Fail-closed: the public-method sweep binds `observation` to a dict."""
+        recorder = RecordingExec()
+        harness, _ = self.eligible_harness(recorder)
+
+        for wrong in ({}, None, "term_worker"):
+            with self.subTest(observation=wrong):
+                eligible, reasons = self.gate(harness, wrong)
+                self.assertFalse(eligible)
+                self.assertIn("stale_or_missing_observation", reasons)
+                # "" is NOT OBSERVED, so the two liveness allowlists fail with it.
+                self.assertIn("release_state_missing", reasons)
+                self.assertIn("worker_state_missing", reasons)
+                self.assertIn("ownership_not_transferable", reasons)
+
+    def test_an_observation_taken_for_another_dispatch_is_refused(self) -> None:
+        recorder = RecordingExec()
+        harness, observation = self.eligible_harness(recorder)
+        stale = replace(observation, observed_at_dispatch="ctx_0")
+
+        eligible, reasons = self.gate(harness, stale)
+
+        self.assertFalse(eligible)
+        self.assertEqual(reasons, ("observation_not_for_this_dispatch",))
+
+    def test_an_unrecognized_liveness_value_is_not_live(self) -> None:
+        """Positive allowlists only: an unobserved value fails, it does not pass."""
+        recorder = RecordingExec()
+        harness, observation = self.eligible_harness(recorder)
+        self.assertNotIn("released", LIVE_RELEASE_STATES)
+        self.assertNotIn("running", REUSABLE_WORKER_STATES)
+        self.assertNotIn("runtime_owned", OWNERSHIP_TRANSFERABLE_STATES)
+
+        eligible, reasons = self.gate(
+            harness,
+            replace(
+                observation,
+                release_state="released",
+                worker_state="running",
+                ownership_state="runtime_owned",
+            ),
+        )
+
+        self.assertFalse(eligible)
+        self.assertEqual(
+            reasons,
+            (
+                "ownership_not_transferable",
+                "release_state_not_live",
+                "worker_state_not_reusable",
+            ),
+        )
+
+    def test_an_unregistered_handle_is_refused_instead_of_raising(self) -> None:
+        recorder = RecordingExec()
+        harness = self.build(recorder)
+
+        eligible, reasons = harness.reuse_eligible(
+            "term_unknown",
+            role="phase_worker",
+            agent_command="exec fake_bin/codex",
+            dispatch_id="ctx_1",
+            observation=ReuseObservation(
+                observed_at_dispatch="ctx_1", handle="term_unknown"
+            ),
+        )
+
+        self.assertFalse(eligible)
+        self.assertIn("agent_command_mismatch", reasons)
+        self.assertIn("terminal_effect_unrecorded", reasons)
+        self.assertIn("not_self_created", reasons)
+        self.assertIn("previous_dispatch_not_finalized", reasons)
+
+    def test_lifecycle_recovery_state_names_an_unfinalized_dispatch(self) -> None:
+        recorder = RecordingExec()
+        harness, observation = self.eligible_harness(recorder)
+        harness._ledger["ctx_1"]["state"] = "in_progress"
+
+        self.assertEqual(
+            harness.lifecycle_recovery_state("ctx_1"), "settlement_in_progress"
+        )
+        eligible, reasons = self.gate(harness, observation)
+        self.assertFalse(eligible)
+        self.assertIn("settlement_in_progress", reasons)
+        self.assertIn("previous_dispatch_not_finalized", reasons)
+
+    def test_observe_for_reuse_is_one_read_folded_into_a_record(self) -> None:
+        recorder = RecordingExec(
+            results={
+                "worker-show": {
+                    "worker": {"state": "succeeded"},
+                    "terminalResource": {
+                        "releaseState": "not_requested",
+                        "ownershipState": "external",
+                        "retainedReason": "external terminal",
+                    },
+                }
+            }
+        )
+        harness = self.build(recorder)
+
+        observation = harness.observe_for_reuse(
+            dispatch_id="ctx_1", handle="term_worker"
+        )
+
+        self.assertEqual(
+            observation,
+            ReuseObservation(
+                observed_at_dispatch="ctx_1",
+                handle="term_worker",
+                worker_state="succeeded",
+                release_state="not_requested",
+                ownership_state="external",
+                retained_reason="external terminal",
+            ),
+        )
+        self.assertEqual(recorder.verbs, ["worker-show"])
+        self.assertEqual(harness.lifecycle_commands("ctx_1"), [])
+
+    def test_observe_for_reuse_reads_a_missing_field_as_not_observed(self) -> None:
+        recorder = RecordingExec(results={"worker-show": {}})
+        harness = self.build(recorder)
+
+        observation = harness.observe_for_reuse(dispatch_id="ctx_1")
+
+        self.assertEqual(observation.worker_state, "")
+        self.assertEqual(observation.release_state, "")
+        self.assertEqual(observation.ownership_state, "")
+
+
+class ScenarioKExec(EchoingTerminalExec):
+    """Answers a whole scenario K run offline: five phases, two roles, ten dispatches.
+
+    EchoingTerminalExec has to be re-armed per attempt by the test that drives it,
+    which is exactly what a test of the SCENARIO cannot do -- re-arming from outside
+    would mean the test, not run_session_reuse_runtime_scenario(), decided what each
+    dispatch looked like. This recorder arms itself instead: `task-create` mints the
+    next Task id, `worker-start` mints the Dispatch id for the task it was given and
+    the matching worker_done, so the production function runs its own loop end to end
+    and the assertions read what IT dispatched.
+    """
+
+    TERMINAL_RESOURCE = {
+        "releaseState": "not_requested",
+        "ownershipState": "external",
+        "retainedReason": "external_terminal",
+    }
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.tasks = 0
+        self.dispatches = 0
+        self.results["run-create"] = {"run": {"id": "run_offline_k"}}
+        self.results["run-show"] = {"run": {"id": "run_offline_k"}}
+        self.results["worker-release"] = {"state": "released", "processAction": "none"}
+        self.results["worker-show"] = {
+            "dispatch": {"status": "completed", "completed_at": COMPLETED_AT},
+            "worker": {"state": "settled"},
+            "terminalResource": dict(self.TERMINAL_RESOURCE),
+        }
+
+    def __call__(self, args: tuple[str, ...]) -> tuple[int, str]:
+        args = tuple(args)
+        verb = args[1] if len(args) > 1 else args[0]
+        if verb == "task-create":
+            self.tasks += 1
+            task_id = f"task_k_{self.tasks}"
+            self.results["task-create"] = {"task": {"id": task_id}}
+            self.results["task-list"] = {
+                "tasks": [{"id": task_id, "status": "completed"}]
+            }
+        elif verb == "worker-start":
+            self.dispatches += 1
+            dispatch_id = f"ctx_k_{self.dispatches}"
+            task_id = args[args.index("--task") + 1]
+            self.results["worker-start"] = {
+                "dispatchId": dispatch_id,
+                "effects": [
+                    {
+                        "kind": "terminal",
+                        "action": "reused",
+                        "id": "term_agent",
+                        "role": "agent",
+                    }
+                ],
+            }
+            self.results["check"] = {
+                "deliveryId": f"dlv_{dispatch_id}",
+                "timedOut": False,
+                "messages": [
+                    {
+                        "id": f"msg_{dispatch_id}",
+                        "type": "worker_done",
+                        "payload": json.dumps(
+                            {
+                                "taskId": task_id,
+                                "dispatchId": dispatch_id,
+                                "outcome": "succeeded",
+                            }
+                        ),
+                        "body": "ok",
+                    }
+                ],
+            }
+        return super().__call__(args)
+
+
+class ScenarioKDispatchedPhaseTests(OfflineHarnessTestCase):
+    """PR #12 MAJOR-1: what the ten dispatched specs of scenario K actually SAY.
+
+    The pre-existing reuse tests read RuntimeAttempt -- the coordinator's own record
+    -- and the integration test checked that five boundary keys were present and that
+    current_iteration moved. Neither could see the defect: keys spelled correctly,
+    carrying `current_phase: complete`. These tests run the production scenario
+    function itself against a self-arming stub and then read the dispatched Task
+    specs back out of the command log, which is the text Orca replays into the
+    agent's preamble.
+    """
+
+    ROLE_SEQUENCE = ("worker", "reviewer")
+
+    def run_scenario(self) -> tuple[RuntimeScenarioResult, list[str]]:
+        """The real scenario K, offline, plus every spec it sent to task-create."""
+        recorder = ScenarioKExec()
+        # preflight is a runtime capability probe (orca status + two `skills get`
+        # subprocesses); it is not on the path under test, and stubbing it is what
+        # lets the rest of the function run untouched.
+        with patch.dict(environ, {"ORCA_CLI_COMMAND": "/opt/orca-dev"}), patch.object(
+            OrcaRuntimeHarness, "preflight", return_value={"executable": "/opt/orca-dev"}
+        ), patch.object(OrcaRuntimeHarness, "_exec_orca", recorder):
+            result = run_session_reuse_runtime_scenario(self.artifact_dir)
+        specs = [
+            command[command.index("--spec") + 1]
+            for command in recorder.commands
+            if command[:2] == ("orchestration", "task-create")
+        ]
+        return result, specs
+
+    def test_the_ten_dispatched_specs_carry_the_real_phase_sequence(self) -> None:
+        """(worker, reviewer) x (analysis..test), read off the dispatched payload."""
+        result, specs = self.run_scenario()
+
+        self.assertEqual(len(result.attempts), 2 * len(CANONICAL_PHASES))
+        self.assertEqual(len(specs), 2 * len(CANONICAL_PHASES))
+        boundaries = [parse_task_boundary(spec) for spec in specs]
+        self.assertEqual(
+            [(boundary["current_role"], boundary["current_phase"]) for boundary in boundaries],
+            [(role, phase) for phase in CANONICAL_PHASES for role in self.ROLE_SEQUENCE],
+        )
+        # The iteration axis still moves, and it is NOT what proves the phase axis:
+        # both would be satisfied by a boundary that said current_phase=complete.
+        self.assertEqual(
+            [int(boundary["current_iteration"]) for boundary in boundaries],
+            [index for index in range(1, len(CANONICAL_PHASES) + 1) for _ in self.ROLE_SEQUENCE],
+        )
+        # Each side's artifact contract is the one its phase names.
+        self.assertEqual(
+            [boundary["artifact_contract"] for boundary in boundaries],
+            [
+                phase_artifact_contract(role=role, phase=phase)
+                for phase in CANONICAL_PHASES
+                for role in self.ROLE_SEQUENCE
+            ],
+        )
+
+    def test_no_dispatched_spec_ever_carries_an_agent_mode_as_its_phase(self) -> None:
+        """The defect itself, stated as a negative over every spec and every mode.
+
+        Scenario K runs its worker with mode "complete" and its reviewer with mode
+        "pass"; both strings are still in the specs (the base line says so), so the
+        assertion is specifically about the current_phase VALUE, not about the text.
+        """
+        _, specs = self.run_scenario()
+
+        for spec in specs:
+            boundary = parse_task_boundary(spec)
+            with self.subTest(phase=boundary["current_phase"]):
+                self.assertNotIn(boundary["current_phase"], AGENT_MODES)
+                self.assertIn(boundary["current_phase"], CANONICAL_PHASES)
+        reviewer_specs = [spec for spec in specs if REVIEWER_CONTEXT_SPEC_HEADER in spec]
+        self.assertEqual(len(reviewer_specs), len(CANONICAL_PHASES))
+        for spec in reviewer_specs:
+            context = parse_reviewer_context(spec)
+            with self.subTest(phase=context["current_phase"]):
+                self.assertNotIn(context["current_phase"], AGENT_MODES)
+                self.assertEqual(
+                    context["current_phase"], parse_task_boundary(spec)["current_phase"]
+                )
+
+    def test_reviewer_context_references_real_workflow_evidence(self) -> None:
+        """baseline / delta / validation, checked against what the run really held.
+
+        The delta is the WORKER's artifact for the same phase (not the reviewer's own
+        output path), the baseline is exactly the artifacts whose phases already
+        passed, and validation quotes the settled outcome of the worker attempt this
+        review is about -- all of it available before the dispatch, none of it
+        derived from the fake agent's script.
+        """
+        result, specs = self.run_scenario()
+
+        reviewer_specs = [spec for spec in specs if REVIEWER_CONTEXT_SPEC_HEADER in spec]
+        worker_attempts = [
+            attempt for attempt in result.attempts if attempt.role == "worker"
+        ]
+        for index, (phase, spec) in enumerate(zip(CANONICAL_PHASES, reviewer_specs)):
+            context = parse_reviewer_context(spec)
+            worker_artifact = phase_artifact_contract(role="worker", phase=phase)
+            with self.subTest(phase=phase):
+                self.assertEqual(context["current_delta"], worker_artifact)
+                self.assertEqual(
+                    context["approved_baseline"],
+                    " || ".join(
+                        phase_artifact_contract(role="worker", phase=earlier)
+                        for earlier in CANONICAL_PHASES[:index]
+                    ),
+                )
+                self.assertIn(worker_artifact, context["new_claims"])
+                self.assertIn(
+                    f"worker outcome={worker_attempts[index].outcome}",
+                    context["validation"],
+                )
+                self.assertEqual(context["original_objective"], SESSION_REUSE_OBJECTIVE)
+                self.assertIn(REVIEWER_DRILL_DOWN_MANDATE, context["drill_down"])
+        # And the worker specs carry no Reviewer block at all, before or after.
+        self.assertEqual(
+            [parse_reviewer_context_keys(spec) for spec in specs].count(()),
+            len(CANONICAL_PHASES),
+        )
+
+    def test_the_reuse_accounting_the_correction_had_to_preserve(self) -> None:
+        """Ten dispatches, two terminals, eight reuses -- unchanged by this wiring."""
+        result, _ = self.run_scenario()
+
+        self.assertEqual(result.terminal_creations, 2)
+        self.assertEqual(len({attempt.terminal for attempt in result.attempts}), 2)
+        self.assertEqual(
+            sum(1 for attempt in result.attempts if attempt.worker_resource == "reuse"),
+            8,
+        )
+        self.assertEqual(
+            len({attempt.dispatch_id for attempt in result.attempts}),
+            len(result.attempts),
+        )
+
+    def test_a_phase_is_required_and_an_agent_mode_is_not_one(self) -> None:
+        """Fail-closed, both ways, at the one function every dispatch goes through."""
+        with self.assertRaisesRegex(TaskContextError, "phase is required"):
+            dispatch_context("worker", 1, "complete")
+        for mode in ("complete", "pass", "fail", "exit"):
+            with self.subTest(mode=mode):
+                with self.assertRaisesRegex(TaskContextError, "agent mode"):
+                    dispatch_context("worker", 1, mode, phase=mode)
+        with self.assertRaisesRegex(TaskContextError, "unknown phase"):
+            dispatch_context("worker", 1, "complete", phase="whatever")
+        # ... and the same refusal reaches the methods that dispatch.
+        harness = self.build(ScenarioKExec())
+        with self.assertRaises(TaskContextError):
+            harness.run_attempt("worker", 1, "complete")
+        with self.assertRaises(TaskContextError):
+            harness.run_existing_task("worker", 1, "complete", "task_k_1")
+        with self.assertRaises(TaskContextError):
+            harness.observe_unexpected_exit("worker", 1)
+
+    def test_evidence_defaults_to_the_phase_artifact_rather_than_to_nothing(self) -> None:
+        """A caller with no evidence still gets a real reference, not a placeholder."""
+        spec, _, context = dispatch_context("reviewer", 1, "pass", phase="plan")
+
+        self.assertIsNotNone(context)
+        self.assertEqual(context["current_delta"], ("artifacts/PLAN.md",))
+        self.assertEqual(context["approved_baseline"], ())
+        self.assertEqual(parse_reviewer_context(spec)["current_delta"], "artifacts/PLAN.md")
+
+        with_evidence, _, evidenced = dispatch_context(
+            "reviewer",
+            2,
+            "pass",
+            phase="plan",
+            evidence=WorkflowEvidence(
+                original_objective="the run's own objective",
+                approved_baseline=("artifacts/ANALYSIS.md",),
+                current_delta=("artifacts/PLAN.md",),
+                new_claims=("PLAN.md section 4 rewritten",),
+                validation=("worker outcome=succeeded",),
+            ),
+        )
+        rendered = parse_reviewer_context(with_evidence)
+        self.assertEqual(evidenced["original_objective"], "the run's own objective")
+        self.assertEqual(rendered["approved_baseline"], "artifacts/ANALYSIS.md")
+        self.assertEqual(rendered["validation"], "worker outcome=succeeded")
 
 
 if __name__ == "__main__":

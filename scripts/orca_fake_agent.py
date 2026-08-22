@@ -11,8 +11,10 @@ import sys
 from pathlib import Path
 
 try:
+    from scripts.task_context import TASK_SPEC_END_MARKER, render_boundary_receipt
     from scripts.workflow_contract import load_workflow_output_contract
 except ModuleNotFoundError:
+    from task_context import TASK_SPEC_END_MARKER, render_boundary_receipt
     from workflow_contract import load_workflow_output_contract
 
 
@@ -171,6 +173,12 @@ def main() -> int:
             continue
         if not task_block_seen or not chunk.strip():
             continue
+        if TASK_SPEC_END_MARKER not in prompt:
+            # The Task spec is multi-line and is still being injected. Acting on its
+            # first line would run worker-show while the runtime is still starting
+            # the dispatch -- which fails it outright -- and would echo a receipt for
+            # a boundary only half of which had arrived.
+            continue
         try:
             task_id, dispatch_id, capability = extract_lifecycle(prompt)
         except ValueError:
@@ -248,7 +256,7 @@ def main() -> int:
             dispatch_id,
             capability,
             outcome,
-            fake.stdout,
+            fake.stdout + render_boundary_receipt(prompt),
             args.orca_command,
         )
         completed_dispatches += 1

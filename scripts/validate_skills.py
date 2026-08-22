@@ -126,6 +126,107 @@ LIFECYCLE_CONTRACT: dict[str, tuple[str, ...]] = {
 LIFECYCLE_AXIS_LABELS = ("(a)", "(b)", "(c1)", "(c2)")
 LIFECYCLE_CONTRACT_MAX_LINES = 15
 
+# ---- three new anchor contracts, one per topic (PLAN D-3) ----------------------
+# Each block anchors on its own `#### <heading>` and takes the FIRST ```text fence
+# after it, non-greedily, so the three patterns and the two existing ones never
+# interfere -- not even where a new block sits earlier in the file than an old one.
+
+REUSE_CONTRACT_BLOCK_PATTERN = re.compile(
+    r"####\s*Session reuse contract\s*\n(?P<body>.*?)```text\n(?P<values>.*?)\n```",
+    re.DOTALL,
+)
+REUSE_CONTRACT: dict[str, tuple[str, ...]] = {
+    "REUSE_SCOPE": ("same_role_across_phases_and_iterations",),
+    "REUSE_ELIGIBILITY": (
+        "same_role",
+        "same_agent_command",
+        "live_process",
+        "previous_dispatch_settled",
+        "ownership_transferable",
+        "not_explicitly_retained",
+        "not_coordinator_or_adopted",
+        "not_in_lifecycle_recovery",
+    ),
+    "REUSE_TERMINATION": ("zero_lifecycle_commands", "finalize_exactly_once"),
+    "REUSE_ORDER": (
+        "verify_settlement",
+        "finalize_previous_dispatch",
+        "start_next_task_on_same_terminal",
+    ),
+}
+REUSE_CONTRACT_MAX_LINES = 4
+# The reuse block lives in section 6, so it reuses that section's boundaries.
+REUSE_SECTION_HEADING = "## 6. Orca-native Worker Placement"
+REUSE_SECTION_END = "\n## 7."
+# The prose sentence that makes REUSE_TERMINATION's zero_lifecycle_commands checkable.
+REUSE_ZERO_COMMAND_SENTENCE = (
+    "reuse는 이전 Dispatch에 어떤 lifecycle mutation 명령도 보내지 않는다."
+)
+# PLAN D-1: the role table must no longer call a reused terminal external_or_adopted.
+REUSE_ROLE_TABLE_DRIFT = "| `external_or_adopted` | reused"
+
+TASK_BOUNDARY_CONTRACT_BLOCK_PATTERN = re.compile(
+    r"####\s*Task boundary contract\s*\n(?P<body>.*?)```text\n(?P<values>.*?)\n```",
+    re.DOTALL,
+)
+TASK_BOUNDARY_CONTRACT: dict[str, tuple[str, ...]] = {
+    "TASK_BOUNDARY_KEYS": (
+        "current_role",
+        "current_phase",
+        "current_iteration",
+        "artifact_contract",
+        "relevant_previous_findings",
+    ),
+    "DISPATCH_INJECTED_IDENTITY": (
+        "task_id",
+        "dispatch_id",
+        "dispatch_capability",
+        "coordinator_handle",
+    ),
+    "DISPATCH_IDENTITY_RULE": (
+        "injected_by_orca_at_dispatch",
+        "new_value_every_attempt",
+        "never_written_by_coordinator",
+    ),
+    "TASK_BOUNDARY_NEVER_CARRIED": (
+        "previous_task_id",
+        "previous_dispatch_id",
+        "unfinished_instruction",
+    ),
+}
+TASK_BOUNDARY_CONTRACT_MAX_LINES = 4
+TASK_BOUNDARY_SECTION_HEADING = "## 9. Approved Phase Output"
+TASK_BOUNDARY_SECTION_END = "\n## 10."
+TASK_BOUNDARY_WRITE_ONCE_SENTENCE = "Task spec 본문은"
+
+REVIEWER_CONTEXT_CONTRACT_BLOCK_PATTERN = re.compile(
+    r"####\s*Reviewer context contract\s*\n(?P<body>.*?)```text\n(?P<values>.*?)\n```",
+    re.DOTALL,
+)
+REVIEWER_CONTEXT_CONTRACT: dict[str, tuple[str, ...]] = {
+    "REVIEWER_CONTEXT_KEYS": (
+        "original_objective",
+        "current_phase",
+        "approved_baseline",
+        "current_delta",
+        "new_claims",
+        "previous_findings",
+        "validation",
+        "drill_down",
+    ),
+    "REVIEWER_CONTEXT_MODE": ("delta_first",),
+    "REVIEWER_DRILL_DOWN": ("mandatory_and_unrestricted",),
+    "REVIEWER_CONTEXT_EXCLUDES": ("final_adversarial_review",),
+}
+REVIEWER_CONTEXT_CONTRACT_MAX_LINES = 4
+REVIEWER_CONTEXT_SECTION_HEADING = "## 11. Reviewer Contract"
+REVIEWER_CONTEXT_SECTION_END = "\n## 12."
+# R-4 anti-weakening: delta-first must not be able to shrink the direct-verification
+# duty. This is the ONE place that sentence may appear, which is why the new
+# subsection references it instead of quoting it.
+REVIEWER_DIRECT_VERIFICATION_SENTENCE = "Worker 설명을 사실로 가정하지 않고"
+REVIEWER_DRILL_DOWN_SENTENCE = "delta는 시작점이지 경계가 아니다"
+
 FINAL_REVIEW_CONTRACT_BLOCK_PATTERN = re.compile(
     r"####\s*Final review contract\s*\n(?P<body>.*?)```text\n(?P<values>.*?)\n```",
     re.DOTALL,
@@ -675,6 +776,53 @@ def extract_lifecycle_section(skill_text: str) -> str:
 
 
 
+def parse_anchor_contract(
+    skill_text: str, pattern: re.Pattern[str]
+) -> dict[str, tuple[str, ...]] | None:
+    """Parse any `#### <heading>` + ```text anchor block into {KEY: (value, ...)}.
+
+    Shared by the three contracts added in this change. The two existing parsers stay
+    separate on purpose: parse_final_review_contract's own docstring records that its
+    separation exists because twelve regression tests bind to the lifecycle parser --
+    a test-coupling reason, not a rule that every block needs its own parser. The new
+    blocks carry no such coupling, so they share one implementation and only reuse the
+    same two regexes the existing parsers already share.
+    """
+    match = pattern.search(skill_text)
+    if match is None:
+        return None
+    parsed: dict[str, tuple[str, ...]] = {}
+    for line in match.group("values").splitlines():
+        line_match = LIFECYCLE_CONTRACT_LINE_PATTERN.fullmatch(line)
+        if line_match is None:
+            return None
+        key, raw = line_match.group(1), line_match.group(2)
+        if key in parsed:
+            return None
+        values = tuple(value.strip() for value in raw.split(","))
+        if not all(
+            LIFECYCLE_CONTRACT_TOKEN_PATTERN.fullmatch(value) for value in values
+        ):
+            return None
+        parsed[key] = values
+    return parsed
+
+
+def anchor_contract_block_lines(skill_text: str, pattern: re.Pattern[str]) -> int:
+    """0 when the block is absent, else its line count."""
+    match = pattern.search(skill_text)
+    return 0 if match is None else len(match.group("values").splitlines())
+
+
+def extract_section(skill_text: str, heading: str, end_marker: str) -> str:
+    """The body between `heading` and the next `end_marker`, or "" when absent."""
+    start = skill_text.find(heading)
+    if start == -1:
+        return ""
+    end = skill_text.find(end_marker, start)
+    return skill_text[start:] if end == -1 else skill_text[start:end]
+
+
 def parse_final_review_contract(skill_text: str) -> dict[str, tuple[str, ...]] | None:
     """Parse the section 17 anchor block into {KEY: (value, ...)}.
 
@@ -836,6 +984,207 @@ def validate_final_review_contract(validation: Validation) -> None:
     )
 
 
+def validate_reuse_contract(validation: Validation) -> None:
+    """The section 6 session reuse anchor block, and the prose that must back it."""
+    skill_path = LIFECYCLE_SKILL_DIR / "SKILL.md"
+    if not skill_path.is_file():
+        return
+    skill_text = skill_path.read_text(encoding="utf-8")
+
+    parsed = parse_anchor_contract(skill_text, REUSE_CONTRACT_BLOCK_PATTERN)
+    validation.check(
+        parsed is not None,
+        f"{LIFECYCLE_SKILL_DIR.name}: session reuse contract block is missing or "
+        "malformed",
+    )
+    if parsed is None:
+        return
+    validation.check(
+        set(parsed) == set(REUSE_CONTRACT),
+        f"{LIFECYCLE_SKILL_DIR.name}: session reuse contract keys drifted",
+    )
+    validation.check(
+        parsed == REUSE_CONTRACT,
+        f"{LIFECYCLE_SKILL_DIR.name}: session reuse contract values drifted",
+    )
+    validation.check(
+        0
+        < anchor_contract_block_lines(skill_text, REUSE_CONTRACT_BLOCK_PATTERN)
+        <= REUSE_CONTRACT_MAX_LINES,
+        f"{LIFECYCLE_SKILL_DIR.name}: session reuse contract block exceeds "
+        f"{REUSE_CONTRACT_MAX_LINES} lines",
+    )
+    eligibility = parsed.get("REUSE_ELIGIBILITY", ())
+    validation.check(
+        len(eligibility) == 8,
+        "REUSE_ELIGIBILITY must list exactly eight conditions",
+    )
+    validation.check(
+        "zero_lifecycle_commands" in parsed.get("REUSE_TERMINATION", ()),
+        "REUSE_TERMINATION must keep zero_lifecycle_commands",
+    )
+
+    section = extract_section(skill_text, REUSE_SECTION_HEADING, REUSE_SECTION_END)
+    missing = [token for token in eligibility if token not in section]
+    validation.check(
+        not missing,
+        f"{LIFECYCLE_SKILL_DIR.name}: section 6 prose is missing reuse conditions "
+        + ", ".join(missing or ["-"]),
+    )
+    validation.check(
+        REUSE_ZERO_COMMAND_SENTENCE in section,
+        f"{LIFECYCLE_SKILL_DIR.name}: section 6 prose is missing the zero lifecycle "
+        "command sentence",
+    )
+    validation.check(
+        REUSE_ROLE_TABLE_DRIFT not in skill_text,
+        f"{LIFECYCLE_SKILL_DIR.name}: the terminal role table must not call a reused "
+        "terminal external_or_adopted",
+    )
+
+    loop_skill = REPO_ROOT / "orca-worker-reviewer-loop" / "SKILL.md"
+    loop_text = loop_skill.read_text(encoding="utf-8") if loop_skill.is_file() else ""
+    validation.check(
+        parse_anchor_contract(loop_text, REUSE_CONTRACT_BLOCK_PATTERN) is None,
+        "orca-worker-reviewer-loop: must not contain the session reuse contract",
+    )
+
+
+def validate_task_boundary_contract(validation: Validation) -> None:
+    """The section 9 task boundary anchor block: two layers, and neither id in layer 1."""
+    skill_path = LIFECYCLE_SKILL_DIR / "SKILL.md"
+    if not skill_path.is_file():
+        return
+    skill_text = skill_path.read_text(encoding="utf-8")
+
+    parsed = parse_anchor_contract(skill_text, TASK_BOUNDARY_CONTRACT_BLOCK_PATTERN)
+    validation.check(
+        parsed is not None,
+        f"{LIFECYCLE_SKILL_DIR.name}: task boundary contract block is missing or "
+        "malformed",
+    )
+    if parsed is None:
+        return
+    validation.check(
+        set(parsed) == set(TASK_BOUNDARY_CONTRACT),
+        f"{LIFECYCLE_SKILL_DIR.name}: task boundary contract keys drifted",
+    )
+    validation.check(
+        parsed == TASK_BOUNDARY_CONTRACT,
+        f"{LIFECYCLE_SKILL_DIR.name}: task boundary contract values drifted",
+    )
+    validation.check(
+        0
+        < anchor_contract_block_lines(
+            skill_text, TASK_BOUNDARY_CONTRACT_BLOCK_PATTERN
+        )
+        <= TASK_BOUNDARY_CONTRACT_MAX_LINES,
+        f"{LIFECYCLE_SKILL_DIR.name}: task boundary contract block exceeds "
+        f"{TASK_BOUNDARY_CONTRACT_MAX_LINES} lines",
+    )
+    boundary_keys = set(parsed.get("TASK_BOUNDARY_KEYS", ()))
+    validation.check(
+        "task_id" not in boundary_keys and "dispatch_id" not in boundary_keys,
+        "TASK_BOUNDARY_KEYS must not carry an id that does not exist when the Task "
+        "spec body is written",
+    )
+    validation.check(
+        {"task_id", "dispatch_id"}
+        <= set(parsed.get("DISPATCH_INJECTED_IDENTITY", ())),
+        "DISPATCH_INJECTED_IDENTITY must name both task_id and dispatch_id",
+    )
+    validation.check(
+        "new_value_every_attempt" in parsed.get("DISPATCH_IDENTITY_RULE", ()),
+        "DISPATCH_IDENTITY_RULE must forbid identity carry-over",
+    )
+    validation.check(
+        {"previous_task_id", "previous_dispatch_id"}
+        <= set(parsed.get("TASK_BOUNDARY_NEVER_CARRIED", ())),
+        "TASK_BOUNDARY_NEVER_CARRIED must keep both previous ids",
+    )
+
+    section = extract_section(
+        skill_text, TASK_BOUNDARY_SECTION_HEADING, TASK_BOUNDARY_SECTION_END
+    )
+    validation.check(
+        TASK_BOUNDARY_WRITE_ONCE_SENTENCE in section,
+        f"{LIFECYCLE_SKILL_DIR.name}: section 9 prose is missing the write-once "
+        "task spec premise",
+    )
+
+    loop_skill = REPO_ROOT / "orca-worker-reviewer-loop" / "SKILL.md"
+    loop_text = loop_skill.read_text(encoding="utf-8") if loop_skill.is_file() else ""
+    validation.check(
+        parse_anchor_contract(loop_text, TASK_BOUNDARY_CONTRACT_BLOCK_PATTERN) is None,
+        "orca-worker-reviewer-loop: must not contain the task boundary contract",
+    )
+
+
+def validate_reviewer_context_contract(validation: Validation) -> None:
+    """The section 11 delta-first Reviewer context block, and its anti-weakening guard."""
+    skill_path = LIFECYCLE_SKILL_DIR / "SKILL.md"
+    if not skill_path.is_file():
+        return
+    skill_text = skill_path.read_text(encoding="utf-8")
+
+    parsed = parse_anchor_contract(skill_text, REVIEWER_CONTEXT_CONTRACT_BLOCK_PATTERN)
+    validation.check(
+        parsed is not None,
+        f"{LIFECYCLE_SKILL_DIR.name}: reviewer context contract block is missing or "
+        "malformed",
+    )
+    if parsed is None:
+        return
+    validation.check(
+        set(parsed) == set(REVIEWER_CONTEXT_CONTRACT),
+        f"{LIFECYCLE_SKILL_DIR.name}: reviewer context contract keys drifted",
+    )
+    validation.check(
+        parsed == REVIEWER_CONTEXT_CONTRACT,
+        f"{LIFECYCLE_SKILL_DIR.name}: reviewer context contract values drifted",
+    )
+    validation.check(
+        0
+        < anchor_contract_block_lines(
+            skill_text, REVIEWER_CONTEXT_CONTRACT_BLOCK_PATTERN
+        )
+        <= REVIEWER_CONTEXT_CONTRACT_MAX_LINES,
+        f"{LIFECYCLE_SKILL_DIR.name}: reviewer context contract block exceeds "
+        f"{REVIEWER_CONTEXT_CONTRACT_MAX_LINES} lines",
+    )
+    context_keys = parsed.get("REVIEWER_CONTEXT_KEYS", ())
+    validation.check(
+        "drill_down" in context_keys and len(context_keys) == 8,
+        "REVIEWER_CONTEXT_KEYS must keep all eight keys including drill_down",
+    )
+    validation.check(
+        parsed.get("REVIEWER_CONTEXT_EXCLUDES") == ("final_adversarial_review",),
+        "REVIEWER_CONTEXT_EXCLUDES must keep the final adversarial review carve-out",
+    )
+
+    section = extract_section(
+        skill_text, REVIEWER_CONTEXT_SECTION_HEADING, REVIEWER_CONTEXT_SECTION_END
+    )
+    validation.check(
+        REVIEWER_DIRECT_VERIFICATION_SENTENCE in section,
+        f"{LIFECYCLE_SKILL_DIR.name}: delta-first context must not remove the "
+        "reviewer's direct verification duty",
+    )
+    validation.check(
+        REVIEWER_DRILL_DOWN_SENTENCE in section,
+        f"{LIFECYCLE_SKILL_DIR.name}: section 11 prose is missing the "
+        "delta-is-not-a-boundary sentence",
+    )
+
+    loop_skill = REPO_ROOT / "orca-worker-reviewer-loop" / "SKILL.md"
+    loop_text = loop_skill.read_text(encoding="utf-8") if loop_skill.is_file() else ""
+    validation.check(
+        parse_anchor_contract(loop_text, REVIEWER_CONTEXT_CONTRACT_BLOCK_PATTERN)
+        is None,
+        "orca-worker-reviewer-loop: must not contain the reviewer context contract",
+    )
+
+
 def validate_workflow_output_contracts(validation: Validation) -> None:
     contracts = []
     for skill_dir in SKILL_DIRS:
@@ -885,6 +1234,9 @@ def main() -> int:
     validate_workflow_output_contracts(validation)
     validate_lifecycle_accounting_contract(validation)
     validate_final_review_contract(validation)
+    validate_reuse_contract(validation)
+    validate_task_boundary_contract(validation)
+    validate_reviewer_context_contract(validation)
     validate_version(validation)
     validate_no_user_absolute_paths(validation)
 

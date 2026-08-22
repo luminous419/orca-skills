@@ -383,14 +383,61 @@ dispatchId | taskId | phase | iteration | terminal handle | terminal role | term
 새 Dispatch로 이전한다.
 
 reuse는 같은 session에서 Worker와 Reviewer 역할을 바꾸는 것을 허용하지 않는다.
-동일 역할의 동일 agent가 즉시 이어지는 correction 또는 re-review Task를 수행하는 경우에만 사용한다.
+동일 역할의 동일 agent가 즉시 수행할 다음 Task — 같은 phase의 correction 또는 re-review Task와
+다음 phase의 Task를 모두 포함한다 — 를 수행하는 경우에 사용한다.
+reuse 가능 여부는 아래 `#### Session reuse contract`의 8개 eligibility 조건을 전부 만족할 때에만 참이며,
+하나라도 만족하지 못하면 그 handle을 버리고 새 terminal을 만든다.
 
 단 하나의 예외가 있다. §17 Final Adversarial Review Dispatch에는 이 reuse 권장이 적용되지 않는다.
 모든 Final Adversarial Review attempt는 새로 생성한 terminal을 사용하며, 그 Dispatch의 axis (b)는
 retain / release / unsupervised 중 하나이고 절대 reuse가 아니다.
 
+reuse는 이전 Dispatch에 어떤 lifecycle mutation 명령도 보내지 않는다. axis (b)의 reuse outcome은 그
+Dispatch의 finalization으로만 기록하며, finalization은 ledger 연산이지 명령 발행이 아니다.
+실제 cleanup ownership 이전은 다음 Task를 같은 terminal로 시작시키는 worker 기동 절차가 수행한다.
+따라서 순서는 언제나 이전 Dispatch의 axis (a) 검증 → 이전 Dispatch finalization(명령 0개)
+→ 다음 Task를 같은 terminal로 시작시키는 worker 기동 절차다.
+`worker-retain`은 reuse의 수단이 아니다. 그것은 아래 `#### 3. Explicit worker retain`의 사용자 요청
+전용이며, reuse 경로에서 발행하면 사용자 요청 없이 해소되지 않는 retention record가 쌓여 section 16의
+retain 보고 의무를 만족시킬 수 없다.
 동일 terminal을 다음 Dispatch로 넘기면 cleanup authority(axis (c2))도 함께 이전되므로, 이후 그
 terminal의 close 판단은 새 Dispatch를 기준으로 한다.
+
+#### Session reuse contract
+
+reuse는 아래 8개 조건을 전부 만족할 때에만 허용된다. 하나라도 만족하지 못하면 그 handle을 버리고 새
+terminal을 만들며, 만족하지 못한 조건의 이름을 section 16 보고에 남긴다. 판정은 fail-closed다 —
+확인되지 않은 값은 통과가 아니라 실패다.
+
+1. `same_role` — 이전 Dispatch와 다음 Dispatch의 역할이 같다. Worker에서 Worker로, Reviewer에서
+   Reviewer로만 이어지며 역할 교체는 어떤 경우에도 reuse가 아니다.
+2. `same_agent_command` — 두 Dispatch가 같은 agent command로 기동된다. 양쪽 값이 모두 기록되어 있고
+   문자열이 일치해야 하며, 한쪽이라도 비어 있으면 reuse하지 않는다.
+3. `live_process` — reuse 판정 직전에 새로 관측한 값이 terminal이 살아 있음을 긍정적으로 보여준다.
+   이전 attempt에 기록해 둔 process liveness 값은 근거가 되지 못한다. axis (c1)은 약 10초까지 stale일 수
+   있기 때문이다. 관측값이 비어 있거나 살아 있다고 인정된 값 목록에 없으면 그것은 "괜찮음"이 아니라
+   "확인되지 않음"이며 reuse하지 않는다.
+4. `previous_dispatch_settled` — 이전 Dispatch가 axis (a)로 settle 확인되었고 그 finalization이
+   완료되었다.
+5. `ownership_transferable` — 이전 Dispatch가 그 terminal의 ownership을 실제로 쥐고 있고, terminal
+   effect가 ledger에 기록되어 있으며, 런타임이 그 terminal을 자기 소유로 붙들고 있지 않다.
+6. `not_explicitly_retained` — 사용자 요청에 의한 explicit retain 상태가 아니다. retain 기록이 살아 있는
+   동안은 reuse하지 않으며, 그 기록은 release가 수행될 때에만 해제된다.
+7. `not_coordinator_or_adopted` — Coordinator 자신의 세션도, setup terminal도, Coordinator가 만들지 않은
+   terminal도 아니다. Coordinator가 스스로 만든 close-eligible role의 terminal만 chain에 들어간다.
+8. `not_in_lifecycle_recovery` — 이전 Dispatch가 recovery/error 상태가 아니다. settlement가 진행 중으로
+   남아 있거나, settle되지 못한 사유가 기록되어 있거나, 이전 attempt가 outcome을 남기지 못한 경우는
+   전부 여기에 걸린다.
+
+section 17 Final Adversarial Review Dispatch에는 이 계약이 적용되지 않는다. 모든 Final Adversarial
+Review attempt는 새로 생성한 terminal을 쓰며 어떤 reuse chain에도 들어가지 않는다.
+
+```text
+REUSE_SCOPE = same_role_across_phases_and_iterations
+REUSE_ELIGIBILITY = same_role, same_agent_command, live_process, previous_dispatch_settled, ownership_transferable, not_explicitly_retained, not_coordinator_or_adopted, not_in_lifecycle_recovery
+REUSE_TERMINATION = zero_lifecycle_commands, finalize_exactly_once
+REUSE_ORDER = verify_settlement, finalize_previous_dispatch, start_next_task_on_same_terminal
+```
 
 #### 2. Worker release
 
@@ -464,7 +511,7 @@ STEP 4-0 — terminal role / resource class 게이트. provenance보다 먼저 �
 | `coordinator_session` | 이 orchestration을 실행 중인 Coordinator 자신의 세션 terminal | 언제나 `not_authorized`. 예외 없음. provenance를 조회하지 않는다 |
 | `setup_terminal` | 사용자/이전 세션이 만든 setup·configured tab | 언제나 `not_authorized` |
 | `active_worker` | dispatch가 아직 settle되지 않은 worker/reviewer terminal | 언제나 `not_authorized`. settle 전 close는 axis (a) 위반이다 |
-| `external_or_adopted` | reused / pre-existing / 사용자 지정 / 이전 phase 인계 / user-taken-over | 언제나 `not_authorized` |
+| `external_or_adopted` | **Coordinator가 만들지 않은** terminal. pre-existing / 사용자 지정 / 외부 세션에서 인계받음 / user-taken-over. Coordinator 자신이 만든 terminal을 자기 reuse chain으로 이어받는 것은 여기에 해당하지 않는다(§6 `#### 1. Immediate worker reuse`) | 언제나 `not_authorized` |
 | `phase_worker` \| `phase_reviewer` | Coordinator가 이번 phase의 이 Dispatch를 위해 직접 생성한 worker/reviewer terminal | STEP 4a/4b로 진행 |
 | `unknown_role` | 역할이 기록되지 않음 | `unknown` (= close 금지, 보고 대상) |
 
@@ -472,7 +519,8 @@ STEP 4-0 — terminal role / resource class 게이트. provenance보다 먼저 �
 `terminal origin == self_created`는 필요조건일 뿐 충분조건이 아니다. Coordinator 자신의 세션도,
 setup terminal도, 아직 실행 중인 worker도 모두 "누군가 만든" terminal이기 때문이다.
 
-- STEP 4a supervised. STEP 4-0 통과 후 terminal effect가 `created`, ownership이 `owned`, retain 사유 없음, ownership이 다른 Dispatch로 이전되지 않음, worker identity 증명됨이 전부 성립할 때만 `authorized`. 이때도 직접 close하지 않고 release가 런타임 자신의 손으로 닫게 한다.
+- STEP 4a supervised. STEP 4-0 통과 후 terminal effect가 **기록되어 있고**(`created` 또는 `reused`), ownership이 이 Dispatch로 기록되어 있고, retain 사유 없음, ownership이 다른 Dispatch로 이전되지 않음, worker identity 증명됨이 전부 성립할 때만 `authorized`. 이때도 직접 close하지 않고 release가 런타임 자신의 손으로 닫게 한다.
+- release가 실제로 process를 종료했는지는 axis (c2)의 판정이 아니라 런타임 응답의 process action이 답한다. process action이 종료를 증명하지 못하면 그 terminal은 닫히지 않은 것이며 `retained`로 기록·보고한다. authority가 `authorized`였다는 사실은 이 기록을 바꾸지 않는다.
 - STEP 4b unsupervised. STEP 4-0 통과 후 Coordinator 자신의 생성 receipt가 유일한 근거이며, 그 receipt는 `handle + phase + role + 이 Dispatch id`를 모두 담아야 한다. 넷이 모두 있고 이후 ownership transfer/takeover receipt가 없으면 `authorized`(orca-cli 경로로 close, receipt 기록), 하나라도 없으면 `unknown`이다.
 - (c2)는 (c1)의 값과 무관하게 **항상** 계산해서 기록한다. (c1)이 live가 아닌 Dispatch도 네 축 모두에 outcome을 남긴다. 다만 그때 취해지는 action은 기록된 (c2) 값이 무엇이든 `nothing to do`다.
 - `unknown`은 close 금지 측면에서 `not_authorized`와 동일하게 취급하고, 차이는 보고 의무뿐이다. 권한이 적극적으로 증명되지 않은 모든 terminal의 기본 동작은 retain-and-report다.
@@ -648,6 +696,33 @@ STATUS: BLOCKED
 REASON: PREVIOUS_PHASE_CHANGE_REQUIRED
 ```
 
+#### Task boundary contract
+
+한 Task의 경계는 두 층으로 나뉜다. 층 1은 Coordinator가 Task를 만들 때 spec 본문에 직접 써넣는 값이고,
+층 2는 dispatch 시점에 Orca가 preamble로 주입하는 authoritative identity다. Task spec 본문은
+write-once이며 Task id와 Dispatch id는 그 본문을 조립하는 시점에 아직 존재하지 않으므로, 두 id는
+층 1의 키가 될 수 없다. Coordinator는 층 2를 쓰지 않고, 대신 매 attempt마다 새 값으로 갈렸는지를
+검증한다. worker가 보내는 완료/heartbeat 보고의 task id와 dispatch id가 그 새 값과 일치하지 않으면
+stale이며 어떤 lifecycle mutation도 실행하지 않는다.
+
+reuse된 session에서도 이 경계는 매 Task마다 새로 세운다. 유지되는 session 기억은 탐색 최적화일 뿐
+권위가 아니다. 새 Task의 층-1 경계, `artifact_contract`가 가리키는 artifact, repository 직접 확인보다
+결코 우선하지 않으며 충돌하면 언제나 새 Task와 repository가 이긴다. 이전 Task의 "남은 일"은 새 Task의
+명시적 요구사항으로 다시 쓰거나 전달하지 않는다. "아까 하던 것을 계속하라" 형태의 문장은 쓰지 않는다.
+이전 phase를 참조할 때는 id가 아니라 artifact 경로로 참조한다.
+
+이 절의 다섯 키는 이 section 앞의 여섯 키 목록을 대체하지 않는다. `current_phase`/`current_iteration`은
+양쪽에 공통이고, `APPROVED_PREVIOUS_PHASE_OUTPUT`은 `artifact_contract`의 읽기 항목에,
+`PREVIOUS_REVIEW_FINDINGS`는 `relevant_previous_findings`에 대응한다. `current_role`과
+`artifact_contract`의 쓰기 항목만이 새로 필수가 되는 축이다.
+
+```text
+TASK_BOUNDARY_KEYS = current_role, current_phase, current_iteration, artifact_contract, relevant_previous_findings
+DISPATCH_INJECTED_IDENTITY = task_id, dispatch_id, dispatch_capability, coordinator_handle
+DISPATCH_IDENTITY_RULE = injected_by_orca_at_dispatch, new_value_every_attempt, never_written_by_coordinator
+TASK_BOUNDARY_NEVER_CARRIED = previous_task_id, previous_dispatch_id, unfinished_instruction
+```
+
 ## 10. Worker Contract
 
 Worker는 phase별 `templates/*.md`를 따른다.
@@ -703,6 +778,46 @@ Required Action:
 ```
 
 CRITICAL 또는 MAJOR가 존재하면 FAIL한다.
+
+#### Reviewer context contract
+
+phase Reviewer에게 전체 history를 다시 붓지 않는다. 아래 여덟 키로 delta부터 전달하고, 확인 범위는
+제한하지 않는다.
+
+- `original_objective` — 사용자 원문 요구. 이번 phase 때문에 축약하지 않는다.
+- `current_phase` — 이번 review의 phase와 iteration.
+- `approved_baseline` — 이미 PASS된 이전 phase 결과의 artifact 경로.
+- `current_delta` — 이번 attempt가 실제로 바꾼 것. 변경된 파일과 섹션, diff 범위.
+- `new_claims` — Worker가 이번에 새로 주장한 사실.
+- `previous_findings` — 이번 Task가 해소해야 할 finding의 id와 원문.
+- `validation` — 이번 attempt의 검증/테스트 실행 결과.
+- `drill_down` — delta 밖으로 나가 확인할 때 쓸 진입점. 비워 보내지 않는다.
+
+규칙 여섯 개.
+
+1. delta는 시작점이지 경계가 아니다. Reviewer는 필요하다고 판단하면 repository 어디든 직접 확인한다.
+   이 section 첫 문단이 규정한 직접 확인 의무는 이 계약으로 축소되지 않는다.
+2. `drill_down`은 선택이 아니라 필수다. 그것이 규칙 1의 실행 수단이다.
+3. `approved_baseline`은 immutable truth가 아니다. 이전 phase 결과와 이번 delta가 명백히 모순되면
+   그것은 넘어갈 사항이 아니라 blocking finding이다.
+4. correction re-review에서는 finding id별 Worker resolution, 변경된 파일과 섹션, 새 validation 결과를
+   먼저 전달한다.
+5. session이 재사용되어 Reviewer가 자기 이전 PASS를 기억하고 있더라도 그 기억은 증거가 아니다.
+   이전 PASS를 옳다고 가정하지 않고 이번 delta를 처음 보는 것처럼 확인한다.
+6. 이 계약은 section 17 Final Adversarial Reviewer에는 적용되지 않는다. Final Adversarial Review는
+   attempt마다 새 session에서 자기 checklist 전체를 수행한다.
+
+여덟 키는 `reviews/common.md`의 `## Direct Verification` 목록을 대체하지 않고 그 위에 매핑된다.
+original requirement는 `original_objective`, approved 이전 phase 결과는 `approved_baseline`,
+repository와 git diff는 `current_delta`와 `drill_down`, 테스트 실행 결과는 `validation`,
+Worker validation evidence는 `new_claims`에 대응한다. 매핑은 전달 형식이며 확인 의무를 줄이지 않는다.
+
+```text
+REVIEWER_CONTEXT_KEYS = original_objective, current_phase, approved_baseline, current_delta, new_claims, previous_findings, validation, drill_down
+REVIEWER_CONTEXT_MODE = delta_first
+REVIEWER_DRILL_DOWN = mandatory_and_unrestricted
+REVIEWER_CONTEXT_EXCLUDES = final_adversarial_review
+```
 
 ## 12. FAIL Loop
 
@@ -847,18 +962,34 @@ Coordinator는 직접 production code를 수정하지 않는다.
 8. Final Adversarial Review attempt마다 고유한 Task/Dispatch provenance와 새로 생성한 terminal,
    axis (b) != reuse인 네 축 행이 있는지, 그리고 attempt마다 artifacts/FINAL_REVIEW_*가 있는지 확인한다.
    그리고 T5a에서 재검증된 downstream phase가 FINAL_REVIEW_REVALIDATIONS에 빠짐없이 기록되었는지 확인한다.
+9. reuse chain이 있다면 chain마다 terminal handle과 Dispatch 순서, chain의 종결 방식(retain/release/
+   unsupervised)을 기록했는지, reuse 단계에서 lifecycle mutation 명령이 하나도 발행되지 않았는지,
+   efficiency 수치가 placement 경로 라벨과 함께 기록되었는지 확인한다. 그 수치의 근거는 런타임 응답의
+   terminal effect / process action / retained reason이며 ledger에 기록된 action 라벨이 아니다.
 
 `## Orca Orchestration State`에는 Dispatch마다 다음 형식으로 네 축의 outcome을 기록한다.
 
 ```text
 Dispatch <id> (task <id>, phase <PHASE>, iteration <n>)
   (a) settlement         : completed|failed @ <ts> | not-settled
-  (b) worker resource    : reuse | retain | release | unsupervised
+  (b) worker resource    : reuse -> <다음 dispatch id> | retain | release | unsupervised
   (c1) process liveness  : live | already exited | disputed
   terminal role          : coordinator_session | setup_terminal | active_worker |
                            external_or_adopted | phase_worker | phase_reviewer | unknown_role
   (c2) cleanup authority : authorized <role + 근거 receipt> | not_authorized <role 또는 사유> | unknown
   -> action taken        : released by runtime | closed by coordinator | retained | nothing to do
+```
+
+```text
+Reuse chains
+  worker        : <terminal handle>  <dispatch id> -> <dispatch id> -> ...  (final: retain|release|unsupervised)
+  reviewer      : <terminal handle>  <dispatch id> -> <dispatch id> -> ...  (final: retain|release|unsupervised)
+  final review  : no chain (attempt마다 새 terminal)
+
+Efficiency
+  terminal_creations              : rung_3_observed = <n> | rung_1_unobserved = unknown (unobserved path)
+  end_of_run_retained_terminals   : rung_3_observed = <n> | rung_1_unobserved = unknown (unobserved path)
+  evidence                        : terminal effect / release process action / retained reason (ledger action 아님)
 ```
 
 `(c2)`를 `authorized`로 적을 때는 `terminal role`이 `phase_worker`/`phase_reviewer`임과 근거 receipt를
@@ -1057,6 +1188,10 @@ Load version-matched Orca orchestration guide before orchestration commands
 Load version-matched Orca CLI guide before terminal lifecycle commands
 Never guess Orca CLI grammar
 Every settled worker terminal → immediate reuse, explicit retain, release, or unsupervised (no worker resource)
+Same role session reuse may cross phase and iteration boundaries; role swap is never reuse
+Reuse issues no lifecycle mutation command; ownership transfers when the next task starts on the same terminal
+Every dispatch carries freshly injected task and dispatch identity; no identity is ever carried over
+Reviewer delta context is a starting point, never a boundary on direct verification
 Task graph created before worker dispatch; dependents never created after dependency completion
 Manual task readiness override is recovery-only
 Settlement, worker-resource registration, process liveness, and cleanup authority are four separate axes
