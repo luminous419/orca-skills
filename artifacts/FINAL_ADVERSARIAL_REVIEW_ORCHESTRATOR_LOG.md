@@ -168,3 +168,120 @@ run.
 - After the final TEST PASS, all 11 production/test files were staged, committed as `83f6041`
   ("Add final adversarial review gate"), pushed to `agent/final-adversarial-review`, and opened as
   Draft PR [#11](https://github.com/luminous419/orca-skills/pull/11).
+
+---
+
+## Addendum — GitHub human review correction and the first real Final Adversarial Review
+
+**Run:** `run_cf86d3fd7bbf` (a new Run, bound after PR #11 received a human review on commit
+`2a2d9ea`). Everything above this line built and unit-tested the gate; **nothing above ran it live**.
+The human review's MINOR finding correctly flagged that gap. This addendum is the correction that
+fixed the review's two MAJOR findings and then closed that gap by actually dispatching the gate.
+
+### GitHub human review (PR #11, commit `2a2d9ea`)
+
+CRITICAL: 0, MAJOR: 2, MINOR: 1.
+- **MAJOR 1**: a Final-Review-triggered correction never re-validated requested downstream phases,
+  so `COMPLETED` could be reached with stale pre-correction PASS evidence on later phases.
+- **MAJOR 2**: `lower_to_requested_phase()` silently forward-mapped an out-of-scope finding to a
+  later phase instead of escalating, contradicting SKILL.md §17's own documented ladder.
+- **MINOR 1**: the timing/orchestrator logs above read as if the dogfood run itself exercised the
+  new gate end-to-end; it only ran scenario J (an opt-in unit/integration test), not a live Final
+  Review dispatch against the PR's own diff.
+
+### DESIGN correction (3 iterations to resolve MAJOR 1's design)
+
+- `task_adedb9d03959` (Worker) / `ctx_0165804fe22b` — designed state **T5a**: after a
+  Final-Review-triggered correction, every requested phase strictly after the *earliest* corrected
+  canonical phase is re-run as a full Worker→Reviewer gate (via the same `_phase_harness(...).run(...)`
+  pattern the initial phase loop uses — explicitly **not** `_run_correction_round`, since a
+  revalidation carries no routed findings and must not trip the resolution bridge). Added a 13th
+  contract key, `FINAL_REVIEW_DOWNSTREAM_REVALIDATION`, superseding DECISION P1's former "delegate to
+  the next attempt" reading. Confirmed MAJOR 2 as a pure IMPLEMENTATION bug (§9.1) — SKILL.md's own
+  ladder text was already correct.
+- `task_e5f9afd16d47` (Reviewer) / `ctx_27d46dacb210` — **RESULT: FAIL**, on a mistaken premise: it
+  demanded the design already be applied to the live SKILL.md file, which is IMPLEMENTATION's job in
+  every prior phase of this same PR.
+- `task_25464d2b5f16` (Worker correction, iteration 4) / `ctx_3389b2c3e47b` — investigated the
+  premise directly (policy docs, this PR's own earlier DESIGN iterations, SKILL.md's phase model),
+  confirmed DESIGN does not edit production files, recorded the finding as DISPUTED with that
+  evidence, and re-ran the full empirical probe to reconfirm the design was still implementable.
+- `task_ff2b6b3185d6` (Reviewer re-review) / `ctx_1926adffaa9b` — **RESULT: PASS**. Independently
+  re-investigated the same phase-boundary question, agreed the iteration-3 FAIL was inconsistent with
+  this PR's own DESIGN iteration 2 (which passed with zero production diff), and confirmed the T5a
+  mechanics were otherwise complete. **DESIGN → PASS.**
+
+### IMPLEMENTATION correction (1 iteration)
+
+- `task_782b1bb70a59` (Worker) / `ctx_c03bdf63b24c` — applied DESIGN's I1–I8 steps verbatim: the
+  four `## 17` edits (input-scope sentence, `T5` split into `T5a`+`T5`, the new `#### Downstream
+  revalidation` sub-block, the 13th contract key), the matching `§12`/`§16` edits, the validator's
+  13th `FINAL_REVIEW_CONTRACT` entry plus `FINAL_REVIEW_CONTRACT_MAX_LINES` 12→13, `e2e_harness.py`'s
+  `downstream_revalidation_set` helper and the T5a loop (calling `_phase_harness(...).run(...)`, never
+  the correction bridge), and MAJOR 2's fix (deleting the forward "above" fallback from
+  `lower_to_requested_phase`). Honestly reported that 3 pre-existing tests now failed for one
+  root cause (missing `revalidation_scenarios` fixtures) and flagged a sharper D-17 variant for TEST:
+  routing T5a through the correction bridge with an *empty* frozenset is a silent no-op, not a loud
+  error.
+- `task_74178068e6b4` (Reviewer) / `ctx_87d824e2cc76` — **RESULT: PASS**. Independently verified every
+  named edit against the diff, confirmed the 3 test failures were fixture-only (T5a working exactly
+  as designed), and confirmed `run()` remained byte-unchanged. **IMPLEMENTATION → PASS.**
+
+### TEST correction (2 iterations)
+
+- `task_720ef1b54f20` (Worker) / `ctx_a78ef646412f` — repaired the 3 broken fixtures (rewrote
+  `h4_scenario()` per DESIGN's exact iteration-3 spec so `D == ()`; added one `revalidation_scenarios`
+  entry to `h2_scenario()` without weakening its original witness), added the 6 planned T5a methods
+  (17–22) plus 1 validator lock method, and *found a real gap* while running the required
+  anti-regression probe 2: routing T5a through `_run_correction_round(..., frozenset())` was a
+  **silent** pass across all 176 tests, not a loud failure — exactly the sharper D-17 risk
+  IMPLEMENTATION had flagged. Closed it with one additional non-vacuous witness (176 methods total,
+  which DESIGN §7.1 explicitly permits: "TEST fixes the exact number... may add more if it finds an
+  uncovered T5a branch").
+- `task_f0d9f92e4a4e` (Reviewer) / `ctx_4e92e36e6eb0` — **RESULT: FAIL** on two findings, both later
+  shown to be Reviewer errors: (1) treating DESIGN's explicit "floor, not quota" test-count policy as
+  a hard ceiling; (2) citing an `e2e_harness.py` change that `git show 2a2d9ea` proves already existed
+  in the PR's baseline commit — a historical entry in the cumulative TEST report, misread as this
+  round's own action.
+- `task_ac394ac4a9e9` (Worker correction, iteration 4) / `ctx_3f9dc6cade16` — complied with the
+  count finding (folded the extra witness into method 22 as a second `subTest` case, restoring the
+  exact 41-method / 175-173-2 contract) and disputed the production-edit finding with the exact git
+  evidence above.
+- `task_c6904935839b` (Reviewer re-review) / `ctx_047d7a2c4898` — **RESULT: PASS**. Independently
+  reproduced both the git evidence (withdrawing the production-edit finding) and the restored exact
+  count, and reconfirmed anti-regression probe 2 still fails on exactly the merged witness.
+  **TEST → PASS.**
+
+### Coordinator-level final validation (after all three requested phases PASS)
+
+`validate_skills.py` → 297 checks PASSED · `unittest discover` → 175 collected / 173 executed / 2
+skipped OK · `verify_package.py` → PASSED (59 files) · `build_release.py` + archived
+`verify_package.py --archive` → PASSED · real Orca 1.4.184 A–I regression → OK (182.7s) · real Orca
+opt-in scenario J → OK (40.4s). Committed as `0bf13fb`, pushed to the existing PR #11 branch (no new
+PR, no VERSION bump).
+
+### The first real Final Adversarial Review — attempt 1
+
+- `task_b9aa5cc3b5a9` (Reviewer, **no dependency edge** — a single-node Task per §17) /
+  `ctx_4e5adbfb8d0f` — dispatched to a brand-new terminal (`term_f9bf2b96-bfde-43cd-a69f-08da7af660e0`,
+  created solely for this attempt and closed immediately after settlement), reviewing
+  `git diff df46152...0bf13fb` (the complete feature plus both correction rounds) against the §17
+  checklist A–I with the explicit instruction not to trust any prior PASS verdict.
+- **RESULT: PASS.** Confirmed both original MAJOR findings resolved in the live SKILL.md/harness (not
+  merely in a design document): T5a genuinely re-dispatches every downstream requested phase after a
+  correction, and `lower_to_requested_phase` no longer forward-maps an out-of-scope finding. Directly
+  re-ran `validate_skills.py`, the full test suite, `verify_package.py`, `build_release.py`, and cross
+  -checked the real-Orca A–I/scenario-J evidence rather than trusting the reported numbers. No
+  blocking or non-blocking findings. Full report: `artifacts/FINAL_REVIEW_final_adversarial_review.md`.
+- This is the artifact this addendum exists to add: the gate was not only built and unit-tested, it
+  was dispatched for real against this PR's own final diff, exactly once, and passed on the first
+  attempt — closing the human review's MINOR 1 finding.
+
+### Lifecycle accounting for this addendum
+
+11 further Dispatches (10 correction-round + 1 Final Review), all settled and finalized exactly once
+via the same graph-first / four-axis / placement-ladder discipline as the original run. Zero
+force-ready recoveries. Two Reviewer FAILs in this addendum were themselves found to be
+misapplications of policy on direct re-investigation — both resolved through the standard
+correction→re-review loop, with the disputing Worker citing concrete evidence (git history, this same
+PR's own prior passing phases, DESIGN's own explicit text) rather than simply asserting disagreement.

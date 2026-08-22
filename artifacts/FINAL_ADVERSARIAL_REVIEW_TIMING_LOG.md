@@ -64,3 +64,43 @@ Two of the five FAILs were caught by re-reading the DESIGN document against the 
 (DESIGN itself, and PLAN); one was a settlement-ordering-class finding in ANALYSIS resolved across
 two correction rounds; IMPLEMENTATION passed clean on the first attempt; TEST's single FAIL was a
 mutation-proof defect in a newly added regression test, fixed with an 8-line defensive change.
+
+## Addendum — GitHub human review correction (run `run_cf86d3fd7bbf`)
+
+**This run did not itself exercise a live Final Adversarial Review dispatch** — the gate's own
+correctness was validated by unit tests (34 deterministic scenarios) and one opt-in real-Orca
+scenario (J), not by running the gate against this PR's own diff. A GitHub human review on PR #11
+(commit `2a2d9ea`) correctly flagged this ambiguity (MINOR 1) alongside two MAJOR findings
+(downstream revalidation was missing after a Final-Review-triggered correction; a responsible-phase
+routing bug could forward-map an out-of-scope finding). The table below is the **separate**
+correction run that fixed both MAJOR findings and then, for the first time, ran a real Final
+Adversarial Review attempt against this PR's own final diff.
+
+| Phase | Iter | Role | Task ID | Dispatch ID | Dispatched at | Completed at | Duration | Verdict |
+|---|---|---|---|---|---|---|---|---|
+| DESIGN | 3 | Worker (correction) | `task_adedb9d03959` | `ctx_0165804fe22b` | 08:08:56 | 08:25:53 | 16m 57s | — |
+| DESIGN | 3 | Reviewer (re-review) | `task_e5f9afd16d47` | `ctx_27d46dacb210` | 08:26:28 | 08:28:09 | 1m 41s | FAIL (phase-boundary misapplication, disputed) |
+| DESIGN | 4 | Worker (correction) | `task_25464d2b5f16` | `ctx_3389b2c3e47b` | 08:30:31 | 08:38:10 | 7m 39s | — |
+| DESIGN | 4 | Reviewer (re-review) | `task_ff2b6b3185d6` | `ctx_1926adffaa9b` | 08:38:43 | 08:40:21 | 1m 38s | PASS |
+| IMPLEMENTATION | 2 | Worker (correction) | `task_782b1bb70a59` | `ctx_c03bdf63b24c` | 08:43:01 | 08:52:15 | 9m 14s | — |
+| IMPLEMENTATION | 2 | Reviewer (re-review) | `task_74178068e6b4` | `ctx_87d824e2cc76` | 08:52:52 | 08:55:34 | 2m 42s | PASS |
+| TEST | 3 | Worker (correction) | `task_720ef1b54f20` | `ctx_a78ef646412f` | 08:59:15 | 09:11:29 | 12m 14s | — |
+| TEST | 3 | Reviewer (re-review) | `task_f0d9f92e4a4e` | `ctx_4e92e36e6eb0` | 09:12:14 | 09:15:31 | 3m 17s | FAIL (count/scope misreading, disputed) |
+| TEST | 4 | Worker (correction) | `task_ac394ac4a9e9` | `ctx_3f9dc6cade16` | 09:18:44 | 09:25:28 | 6m 44s | — |
+| TEST | 4 | Reviewer (re-review) | `task_c6904935839b` | `ctx_047d7a2c4898` | 09:26:06 | 09:28:44 | 2m 38s | PASS |
+| **FINAL ADVERSARIAL REVIEW** | **1** | **Reviewer (fresh gate)** | `task_b9aa5cc3b5a9` | `ctx_4e5adbfb8d0f` | **09:35:25** | **09:37:33** | **2m 8s** | **PASS** |
+
+- Total active dispatch time: 1h 6m 52s. Wall clock (first dispatch → Final Review completion): 1h 28m 37s.
+- The Final Review row is the actual, live gate execution this addendum exists to document: a
+  fresh Reviewer terminal (`term_f9bf2b96-bfde-43cd-a69f-08da7af660e0`, created and closed solely
+  for this attempt) reviewed `git diff df46152...0bf13fb` — the complete feature plus both
+  correction rounds — against the checklist in SKILL.md §17, and returned `RESULT: PASS` on the
+  first attempt. Full report: `artifacts/FINAL_REVIEW_final_adversarial_review.md`.
+- Two of the four correction-round FAILs above were Reviewer misapplications rather than real
+  defects, each caught by direct re-verification against git history and the DESIGN document's own
+  explicit text before a further correction round was dispatched: DESIGN iteration 3 misapplied the
+  "production code must already be edited" standard to a DESIGN-only phase (contradicted by this
+  same PR's own earlier DESIGN iterations, which passed with zero production diff); TEST iteration 3
+  cited an `e2e_harness.py` change that git conclusively showed predated this entire session (already
+  present in the `2a2d9ea` baseline) and treated DESIGN's explicit "floor, not quota" test-count
+  language as a hard ceiling.
