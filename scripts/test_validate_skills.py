@@ -428,6 +428,24 @@ class ValidatorRegressionTests(unittest.TestCase):
             "review contract"
         )
 
+    def test_final_review_downstream_revalidation_drift_fails(self) -> None:
+        """The permanent lock on the AMENDED DECISION P1 (PR #11 human review, MAJOR 1).
+
+        `delegated_to_next_final_review` is the superseded reading: it says a fresh
+        Final Review attempt is a substitute for re-running the downstream phases. That
+        reading cannot be re-introduced into section 17 without the validator rejecting
+        it, whatever any future prose around the block says.
+        """
+        self.mutate_orchestration_skill(
+            "FINAL_REVIEW_DOWNSTREAM_REVALIDATION = "
+            "all_requested_phases_after_earliest_corrected_phase",
+            "FINAL_REVIEW_DOWNSTREAM_REVALIDATION = delegated_to_next_final_review",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "final review contract values differ from the validator source of truth"
+        )
+
     def test_final_review_role_outside_close_eligible_roles_fails(self) -> None:
         self.mutate_orchestration_skill(
             "FINAL_REVIEW_ROLE = phase_reviewer",

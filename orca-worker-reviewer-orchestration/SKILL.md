@@ -733,6 +733,8 @@ Orca의 Task/Dispatch provenance가 각 attempt에 남아야 한다.
 
 Final Adversarial Review FAIL이 유발한 correction도 이 FAIL Loop와 정확히 같은 모양이다.
 차이는 correction 대상 phase를 Reviewer가 아니라 Final Reviewer의 `Responsible Phase`가 지정한다는 점뿐이다.
+correction된 phase의 downstream phase를 재검증하는 §17 T5a revalidation round도 같은 모양이다.
+차이는 해소할 finding이 없다는 점이며, 첫 Worker에게 resolution trace를 요구하지 않는다.
 
 ## 13. Iteration
 
@@ -844,6 +846,7 @@ Coordinator는 직접 production code를 수정하지 않는다.
    게이트를 통과한 뒤에 수행되었는지 확인한다.
 8. Final Adversarial Review attempt마다 고유한 Task/Dispatch provenance와 새로 생성한 terminal,
    axis (b) != reuse인 네 축 행이 있는지, 그리고 attempt마다 artifacts/FINAL_REVIEW_*가 있는지 확인한다.
+   그리고 T5a에서 재검증된 downstream phase가 FINAL_REVIEW_REVALIDATIONS에 빠짐없이 기록되었는지 확인한다.
 
 `## Orca Orchestration State`에는 Dispatch마다 다음 형식으로 네 축의 outcome을 기록한다.
 
@@ -884,6 +887,7 @@ FINAL_REVIEW_ITERATIONS:
 FINAL_REVIEW: PASS
 FINAL_REVIEW_TASKS: task_<id> / dispatch_<id> (attempt 1)
 FINAL_FINDINGS: none
+FINAL_REVIEW_REVALIDATIONS: none
 ## Non-Blocking Recommendations
 ```
 
@@ -918,7 +922,8 @@ dependency edge를 걸지 않는 것은 §6 Task graph ordering의 요구다. tr
 입력은 ORIGINAL_REQUEST / PHASES / provenance+ledger 요약 / FINAL_REVIEW_ITERATIONS와 max-iterations / 직전 attempt의
 finding·resolution 표를 inline으로, phase별 approved·REVIEW artifact, 전체 diff(base..HEAD), 변경된 production file 목록,
 test·validation 결과를 경로로 전달한다. 직전 attempt가 FAIL이었다면 이번 round에서 **어떤 phase가 어떤 finding id 때문에
-수정되었는지** 반드시 명시한다. downstream phase를 자동 재실행하지 않는 대신 이 attempt가 그 일관성을 검사하기 때문이다.
+수정되었고, 그로 인해 어떤 downstream phase가 T5a에서 재검증되었는지** 반드시 명시한다. 이 attempt는 그 재검증을
+대체하는 것이 아니라 그 위에 추가로 걸리는 global gate다.
 
 #### Review checklist
 
@@ -981,10 +986,42 @@ T3  attempt FAIL이고 budget 잔여 → 이 Dispatch를 먼저 종결하고 fin
 T4  각 responsible phase p에 대해 PHASE_ITERATIONS[p] == max-iterations
                                 → STATUS: ESCALATED / REASON: MAX_ITERATIONS_REACHED (phase p)
     아니면 correction Worker → p의 Reviewer 재검토 (§12 FAIL Loop 그대로)
-T5  모든 p가 다시 PASS           → T0으로 돌아가 새 fresh attempt를 만든다
+T5a 모든 p가 다시 PASS했으면 downstream revalidation set D를 계산해 canonical order로 순차
+    재검증한다. D가 공집합이면 아무 Dispatch도 만들지 않는다. 각 q ∈ D에 대해
+    PHASE_ITERATIONS[q] == max-iterations
+                                → STATUS: ESCALATED / REASON: MAX_ITERATIONS_REACHED (phase q)
+    아니면 revalidation Worker → q의 Reviewer 재검토 (§12 FAIL Loop 그대로)
+T5  D의 모든 q가 PASS         → T0으로 돌아가 새 fresh attempt를 만든다
 ```
 
 T2의 마지막-attempt guard는 FAIL edge에서 **가장 먼저** 평가한다. finding을 phase로 매핑하기 전에, `PHASE_ITERATIONS`를 읽기 전에 평가한다. 순서가 뒤바뀌면 예산 소진 뒤에도 correction이 dispatch된다.
+
+#### Downstream revalidation
+
+correction은 그 phase의 산출물을 바꾸므로, 그보다 뒤 phase가 correction 이전 상태에 대해 받은 PASS는 더 이상
+유효한 증거가 아니다. fresh Final Review는 그 재검증의 대체재가 아니라 추가적인 global gate다.
+
+```text
+D = requested phase 중, canonical order(analysis, plan, design, implementation, test)에서
+    이번 attempt가 correction한 phase 중 **가장 이른** 것보다 뒤에 있는 phase 전부.
+```
+
+D는 그 phase가 실제로 바뀌었는지와 무관하게 **항상 전부** 재검증한다. "정말 바뀌었는가"는 Coordinator가 값싸게
+증명할 수 없는 판단이며, 조건부 재검증은 stale PASS 구멍을 그대로 남긴다. bugfix / refactoring은 canonical
+order에 없으므로 downstream을 갖지도, 남의 downstream이 되지도 않는다 — specialized run에서 D는 항상 공집합이고
+T5a는 no-op이다. D는 canonical order의 suffix이므로 순차 실행만으로 연쇄가 자동 처리된다. IMPLEMENTATION
+재검증이 코드를 바꾸면 그 뒤에 오는 TEST 재검증이 바뀐 코드를 본다.
+
+revalidation round는 correction round가 아니다. q는 Final Reviewer에게 직접 FAIL을 받은 것이 아니므로
+해소해야 할 finding 목록이 없고, 새 round 첫 Worker에게 resolution trace를 요구하지 않는다. 대신
+`PREVIOUS_REVIEW_FINDINGS` 자리에 UPSTREAM_CORRECTION(어떤 phase가 어떤 finding id 때문에 어떻게 바뀌었는지)을
+전달하고, "corrected upstream artifact에 비추어 네 phase 산출물을 재검증하고 무효화된 부분을 갱신하라.
+바뀔 것이 없으면 없다고 명시하고 근거를 대라"를 요구한다. 그 다음은 보통의 Worker→Reviewer gate이며,
+FAIL하면 §12 FAIL Loop가 그대로 적용된다.
+
+산출물은 `artifacts/<PHASE>_<topic>.md`를 in-place 갱신하고, Reviewer 기록은 기존 규칙대로
+`artifacts/REVIEW_<PHASE>_<topic>_iteration<N>.md`다. counter는 `PHASE_ITERATIONS[q]`를 그대로 쓴다. 새 counter도
+새 user-facing parameter도 없고, 소진 시 REASON은 T4와 같은 `MAX_ITERATIONS_REACHED (phase q)`다.
 
 review 기록은 attempt 1이 `artifacts/FINAL_REVIEW_<topic>.md`, attempt N>=2가 `artifacts/FINAL_REVIEW_<topic>_iteration<N>.md`다.
 `_iteration1` 형태는 존재하지 않으며 `<N>`은 그 attempt의 `FINAL_REVIEW_ITERATIONS` 값이다. 이 파일은 review 기록이지
@@ -1005,6 +1042,7 @@ FINAL_REVIEW_ITERATION_BOUND = max_iterations
 FINAL_REVIEW_LAST_ATTEMPT_FAIL = escalate_before_correction_routing
 FINAL_REVIEW_EXHAUSTION_REASON = final_review_max_iterations_reached
 FINAL_REVIEW_OUT_OF_SCOPE_REASON = out_of_scope_final_review_finding
+FINAL_REVIEW_DOWNSTREAM_REVALIDATION = all_requested_phases_after_earliest_corrected_phase
 FINAL_REVIEW_COMPLETION_GATE = requested_phases_pass_and_final_review_pass
 ```
 

@@ -9,6 +9,7 @@ import json
 import re
 import subprocess
 import sys
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -101,6 +102,9 @@ class WorkflowScenario:
     correction_scenarios: dict[tuple[str, int], FakeScenario] = field(
         default_factory=dict
     )
+    revalidation_scenarios: dict[tuple[str, int], FakeScenario] = field(
+        default_factory=dict
+    )
 
 
 @dataclass
@@ -114,6 +118,7 @@ class WorkflowRunResult:
     final_status: str
     final_review_artifacts: tuple[str, ...] = ()
     corrected_findings: tuple[tuple[int, str, str, str], ...] = ()
+    revalidation_dispatches: list[tuple[str, int]] = field(default_factory=list)
     reason: str | None = None
 
 
@@ -200,9 +205,12 @@ def lower_to_requested_phase(phase: str, requested: tuple[str, ...]) -> str | No
     """Ladder rule 3: map a responsible phase onto the requested phase set.
 
     Returns the phase itself when it is requested; otherwise the last requested
-    canonical phase at or below it; otherwise the first requested canonical phase
-    above it; otherwise None, which the caller turns into
+    canonical phase at or below it; otherwise None, which the caller turns into
     OUT_OF_SCOPE_FINAL_REVIEW_FINDING.
+
+    There is deliberately NO forward ("above") fallback: SKILL.md section 17's ladder
+    has exactly two branches after the nature mapping -- step 3 lowers, step 4
+    escalates. (PR #11 human review, MAJOR 2.)
     """
     if phase in requested:
         return phase
@@ -213,8 +221,29 @@ def lower_to_requested_phase(phase: str, requested: tuple[str, ...]) -> str | No
     below = [p for p in canonical_requested if CANONICAL_PHASES.index(p) <= index]
     if below:
         return max(below, key=CANONICAL_PHASES.index)
-    above = [p for p in canonical_requested if CANONICAL_PHASES.index(p) > index]
-    return min(above, key=CANONICAL_PHASES.index) if above else None
+    return None
+
+
+def downstream_revalidation_set(
+    corrected: Iterable[str], requested: tuple[str, ...]
+) -> tuple[str, ...]:
+    """SKILL.md section 17 D: every requested phase strictly after the EARLIEST
+    corrected phase, in canonical order.
+
+    Only canonical phases carry an order, so a run whose corrected set is entirely
+    specialized (bugfix / refactoring) yields (), which makes T5a a no-op and leaves
+    single-phase runs byte-identical to the pre-T5a behaviour.
+
+    The result is ordered by CANONICAL_PHASES, not by `requested`, so it is
+    deterministic even if a caller passes `phases=` out of canonical order -- the
+    same authority `lower_to_requested_phase` already uses.
+    """
+    indices = [
+        CANONICAL_PHASES.index(p) for p in corrected if p in CANONICAL_PHASES
+    ]
+    if not indices:
+        return ()
+    return tuple(p for p in CANONICAL_PHASES[min(indices) + 1:] if p in requested)
 
 
 def parse_final_review_output(
@@ -628,6 +657,7 @@ class E2EHarness:
     def run_workflow(self, scenario: WorkflowScenario) -> WorkflowRunResult:
         phase_iterations: dict[str, int] = {p: 0 for p in scenario.phases}
         correction_dispatches: list[tuple[str, int]] = []
+        revalidation_dispatches: list[tuple[str, int]] = []
         corrected_findings: list[tuple[int, str, str, str]] = []
         final_review_attempts: list[AgentAttempt] = []
         final_review_artifacts: list[str] = []
@@ -643,6 +673,7 @@ class E2EHarness:
                 final_review_iterations=final_review_iterations,
                 final_review_attempts=list(final_review_attempts),
                 correction_dispatches=list(correction_dispatches),
+                revalidation_dispatches=list(revalidation_dispatches),
                 final_review_verdict=final_review_verdict,
                 final_status=final_status,
                 final_review_artifacts=tuple(final_review_artifacts),
@@ -783,4 +814,47 @@ class E2EHarness:
                             accepted.get(finding_id, UNACCOUNTED_RESOLUTION),
                         )
                     )
-            # ---- T5: every responsible phase PASSed again. Loop to T0 for a fresh attempt.
+
+            # ---- T5a: DOWNSTREAM REVALIDATION.
+            # Every requested phase strictly after the EARLIEST phase corrected in this
+            # attempt is re-run as a full Worker->Reviewer gate, in canonical order,
+            # UNCONDITIONALLY -- whether or not the correction is judged to have changed
+            # anything. A fresh Final Review attempt is an ADDITIONAL global gate, never a
+            # substitute for this. (PR #11 human review, MAJOR 1.)
+            #
+            # Note the call: _phase_harness(...).run(...), the SAME pattern the initial
+            # phase-gate loop above uses -- NOT _run_correction_round(...). A revalidation
+            # round has no routed finding ids, so the section-3.2.7 resolution bridge must
+            # not fire on it; routing it through _run_correction_round would make every
+            # revalidation ERROR with FINAL_REVIEW_RESOLUTION_TRACE_INCOMPLETE. (Risk D-17.)
+            for phase in downstream_revalidation_set(responsible, scenario.phases):
+                if phase_iterations[phase] >= self.max_iterations:
+                    return snapshot(
+                        self.contract.escalated_status,
+                        f"MAX_ITERATIONS_REACHED ({phase})",
+                    )
+                revalidation = scenario.revalidation_scenarios.get(
+                    (phase, final_review_iterations)
+                )
+                if revalidation is None:
+                    return self._workflow_error(
+                        "SCENARIO_REVALIDATION_MISSING", snapshot()
+                    )
+                budget = self.max_iterations - phase_iterations[phase]
+                result = self._phase_harness(phase, budget).run(revalidation)
+                # Ledger BEFORE verdict, exactly as T4: these Reviewer dispatches
+                # physically happened and are never rewound.
+                for offset in range(1, len(result.reviewer_attempts) + 1):
+                    revalidation_dispatches.append(
+                        (phase, phase_iterations[phase] + offset)
+                    )
+                phase_iterations[phase] += len(result.reviewer_attempts)
+                if result.final_status == self.contract.escalated_status:
+                    return snapshot(
+                        self.contract.escalated_status,
+                        f"MAX_ITERATIONS_REACHED ({phase})",
+                    )
+                if result.final_status != self.contract.completed_status:
+                    return snapshot(result.final_status, result.reason)
+                # No corrected_findings row: a revalidation resolves no finding.
+            # ---- T5: every corrected and revalidated phase PASSed. Loop to T0 for a fresh attempt.

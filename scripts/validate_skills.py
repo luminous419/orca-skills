@@ -143,10 +143,14 @@ FINAL_REVIEW_CONTRACT: dict[str, tuple[str, ...]] = {
     "FINAL_REVIEW_LAST_ATTEMPT_FAIL": ("escalate_before_correction_routing",),
     "FINAL_REVIEW_EXHAUSTION_REASON": ("final_review_max_iterations_reached",),
     "FINAL_REVIEW_OUT_OF_SCOPE_REASON": ("out_of_scope_final_review_finding",),
+    # [T5a - iteration 3] the machine-checkable form of MAJOR 1's answer
+    "FINAL_REVIEW_DOWNSTREAM_REVALIDATION": (
+        "all_requested_phases_after_earliest_corrected_phase",
+    ),
     "FINAL_REVIEW_COMPLETION_GATE": ("requested_phases_pass_and_final_review_pass",),
 }
 
-FINAL_REVIEW_CONTRACT_MAX_LINES = 12
+FINAL_REVIEW_CONTRACT_MAX_LINES = 13    # was 12; the 13th key is the T5a decision
 FINAL_REVIEW_SECTION_HEADING = "## 17. Final Adversarial Review"
 FINAL_REVIEW_SECTION_END = "\n## 18."
 FINAL_REVIEW_ANTI_ANCHORING_SENTENCES = (
