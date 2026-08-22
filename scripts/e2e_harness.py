@@ -17,7 +17,9 @@ from pathlib import Path
 from scripts.task_context import (
     build_reviewer_context,
     build_task_boundary,
+    phase_artifact_contract,
     render_task_spec,
+    run_artifact_root,
 )
 from scripts.workflow_contract import (
     WorkflowOutputContract,
@@ -139,7 +141,7 @@ class WorkflowScenario:
     phases: tuple[str, ...]
     phase_scenarios: dict[str, FakeScenario]
     final_review: FinalReviewScenario
-    topic: str = "final_adversarial_review"
+    run_id: str = "run_e2e_final_adversarial_review"
     correction_scenarios: dict[tuple[str, int], FakeScenario] = field(
         default_factory=dict
     )
@@ -232,16 +234,18 @@ def _hash_files(paths: tuple[Path, ...]) -> dict[Path, str]:
 
 
 
-def final_review_artifact_path(topic: str, attempt: int) -> str:
+def final_review_artifact_path(run_id: str, attempt: int) -> str:
     """W-A1-N: attempt 1 is unsuffixed; attempt N>=2 carries _iteration<N>.
 
     There is deliberately no `_iteration1` form -- it would break the parallel with
-    artifacts/REVIEW_<PHASE>_<topic>.md, which uses the same rule.
+    artifacts/runs/<run_id>/REVIEW_<PHASE>.md, which uses the same rule. The run_id
+    prefix (run_artifact_root, task_context's single root builder) is what keeps two
+    runs' Final Review artifacts from landing in the same shared artifacts/ root.
     """
     if attempt < 1:
         raise ValueError(f"attempt must be >= 1, got {attempt}")
     suffix = "" if attempt == 1 else f"_iteration{attempt}"
-    return f"artifacts/FINAL_REVIEW_{topic}{suffix}.md"
+    return f"{run_artifact_root(run_id)}FINAL_REVIEW{suffix}.md"
 
 
 def lower_to_requested_phase(phase: str, requested: tuple[str, ...]) -> str | None:
@@ -362,12 +366,18 @@ class E2EHarness:
         workspace: Path,
         protected_artifacts: tuple[Path, ...] = (),
         session_policy: str = "reuse",
+        run_id: str = "run_e2e",
     ) -> None:
         self.contract = load_workflow_output_contract(skill_path)
         self.phase = phase
         self.max_iterations = max_iterations
         self.workspace = workspace
         self.protected_artifacts = protected_artifacts
+        # The directory identity every artifact_contract this instance builds is
+        # scoped under. run_workflow() overwrites this from scenario.run_id before
+        # its phase loop starts; a bare .run() call (no run_workflow) keeps this
+        # default, which is why it is a real, non-empty run id rather than "".
+        self.run_id = run_id
         # The first three MUST be mutable objects. _phase_harness() is a copy.copy(),
         # so a list / dict / count object is shared BY REFERENCE with every clone and
         # the state therefore survives phase, correction and revalidation boundaries.
@@ -480,7 +490,9 @@ class E2EHarness:
                 current_role="worker",
                 current_phase=self.phase,
                 current_iteration=iteration,
-                artifact_contract=f"artifacts/{self.phase.upper()}.md",
+                artifact_contract=phase_artifact_contract(
+                    role="worker", phase=self.phase, run_id=self.run_id
+                ),
                 relevant_previous_findings=tuple(sorted(previous_blocking_findings)),
             )
             worker_command = [
@@ -583,7 +595,9 @@ class E2EHarness:
                 current_role="reviewer",
                 current_phase=self.phase,
                 current_iteration=iteration,
-                artifact_contract=f"artifacts/REVIEW_{self.phase.upper()}.md",
+                artifact_contract=phase_artifact_contract(
+                    role="reviewer", phase=self.phase, run_id=self.run_id
+                ),
                 relevant_previous_findings=tuple(sorted(previous_blocking_findings)),
             )
             reviewer_context = build_reviewer_context(
@@ -856,6 +870,11 @@ class E2EHarness:
                 "SCENARIO_SESSION_POLICY_INVALID:" + policy, snapshot()
             )
         self.session_policy = policy
+        # The one write of run_id for this workflow: every _phase_harness clone below
+        # copies it by value (same mechanism as session_policy), so the phase gates,
+        # corrections, revalidations and the Final Review artifacts that follow all
+        # land under the SAME artifacts/runs/<run_id>/ directory.
+        self.run_id = scenario.run_id
 
         # ---- sequential phase gates (SKILL.md section 8: PASS before the next phase)
         for phase in scenario.phases:
@@ -879,7 +898,7 @@ class E2EHarness:
             # ---- T0: every requested phase has PASSed. Open a fresh attempt.
             final_review_iterations += 1
             final_review_artifacts.append(
-                final_review_artifact_path(scenario.topic, final_review_iterations)
+                final_review_artifact_path(self.run_id, final_review_iterations)
             )
             index = final_review_iterations - 1
             if index >= len(scenario.final_review.modes):

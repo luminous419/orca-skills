@@ -217,21 +217,67 @@ class WorkflowPhaseTests(unittest.TestCase):
         instead of at the reviewer's own output path.
         """
         self.assertEqual(
-            phase_artifact_contract(role="worker", phase="design"),
-            "artifacts/DESIGN.md",
+            phase_artifact_contract(role="worker", phase="design", run_id="run_a"),
+            "artifacts/runs/run_a/DESIGN.md",
         )
         self.assertEqual(
-            phase_artifact_contract(role="reviewer", phase="design"),
-            "artifacts/REVIEW_DESIGN.md",
+            phase_artifact_contract(role="reviewer", phase="design", run_id="run_a"),
+            "artifacts/runs/run_a/REVIEW_DESIGN.md",
         )
         self.assertEqual(
-            phase_artifact_contract(role="reviewer", phase="final_review"),
-            "artifacts/FINAL_REVIEW.md",
+            phase_artifact_contract(
+                role="reviewer", phase="final_review", run_id="run_a"
+            ),
+            "artifacts/runs/run_a/FINAL_REVIEW.md",
         )
         with self.assertRaisesRegex(TaskContextError, "agent mode"):
             phase_artifact_contract(role="worker", phase="complete")
         with self.assertRaisesRegex(TaskContextError, "unknown role"):
             phase_artifact_contract(role="coordinator", phase="design")
+
+    def test_the_artifact_contract_requires_a_run_id(self) -> None:
+        """Fail-closed like require_workflow_phase: no fallback to the shared root.
+
+        role and phase are still checked first (test above): this is what happens
+        once both of those are valid and only run_id is missing.
+        """
+        with self.assertRaisesRegex(TaskContextError, "run_id is required"):
+            phase_artifact_contract(role="worker", phase="design")
+        with self.assertRaisesRegex(TaskContextError, "run_id is required"):
+            phase_artifact_contract(role="reviewer", phase="final_review")
+
+    def test_different_runs_never_share_an_artifact_path(self) -> None:
+        """The whole point of run-level isolation, stated as non-overlap.
+
+        Every (role, phase) pair this module can be asked to name gets a disjoint
+        path per run_id, and every path it produces stays inside that run's own
+        artifacts/runs/<run_id>/ directory -- including BUGFIX/REFACTORING, which
+        use the exact same (role, phase) -> path shape as the canonical phases.
+        """
+        phases = (*WORKFLOW_PHASES,)
+        run_a_paths = {
+            phase_artifact_contract(role=role, phase=phase, run_id="run_a")
+            for phase in phases
+            for role in ("worker", "reviewer")
+        }
+        run_b_paths = {
+            phase_artifact_contract(role=role, phase=phase, run_id="run_b")
+            for phase in phases
+            for role in ("worker", "reviewer")
+        }
+        self.assertEqual(run_a_paths & run_b_paths, set())
+        for path in run_a_paths:
+            self.assertTrue(path.startswith("artifacts/runs/run_a/"))
+        for path in run_b_paths:
+            self.assertTrue(path.startswith("artifacts/runs/run_b/"))
+        for phase in ("bugfix", "refactoring"):
+            with self.subTest(phase=phase):
+                self.assertEqual(
+                    phase_artifact_contract(
+                        role="worker", phase=phase, run_id="run_a"
+                    ),
+                    f"artifacts/runs/run_a/{phase.upper()}.md",
+                )
 
 
 if __name__ == "__main__":

@@ -2435,6 +2435,7 @@ class SameRoleSessionReuseTests(OfflineHarnessTestCase):
                 phase=phase,
                 base_spec=f"{role} iteration {index}: {phase}",
                 findings=attempt_findings,
+                run_id=harness.run_id or "",
             )
             attempt, _ = harness.run_existing_task(
                 role,
@@ -2975,10 +2976,16 @@ class SameRoleSessionReuseTests(OfflineHarnessTestCase):
         whole rendered block back into itself.
         """
         once, boundary, context = dispatch_context(
-            "reviewer", 2, "pass", phase="design", findings=("R1",)
+            "reviewer", 2, "pass", phase="design", findings=("R1",), run_id="run_x"
         )
         twice, boundary_again, context_again = dispatch_context(
-            "reviewer", 2, "pass", phase="design", base_spec=once, findings=("R1",)
+            "reviewer",
+            2,
+            "pass",
+            phase="design",
+            base_spec=once,
+            findings=("R1",),
+            run_id="run_x",
         )
 
         self.assertEqual(once, twice)
@@ -4299,11 +4306,18 @@ class ScenarioKDispatchedPhaseTests(OfflineHarnessTestCase):
         self.assertEqual(
             [boundary["artifact_contract"] for boundary in boundaries],
             [
-                phase_artifact_contract(role=role, phase=phase)
+                phase_artifact_contract(role=role, phase=phase, run_id=result.run_id)
                 for phase in CANONICAL_PHASES
                 for role in self.ROLE_SEQUENCE
             ],
         )
+        for boundary in boundaries:
+            with self.subTest(artifact_contract=boundary["artifact_contract"]):
+                self.assertTrue(
+                    boundary["artifact_contract"].startswith(
+                        f"artifacts/runs/{result.run_id}/"
+                    )
+                )
 
     def test_no_dispatched_spec_ever_carries_an_agent_mode_as_its_phase(self) -> None:
         """The defect itself, stated as a negative over every spec and every mode.
@@ -4346,13 +4360,17 @@ class ScenarioKDispatchedPhaseTests(OfflineHarnessTestCase):
         ]
         for index, (phase, spec) in enumerate(zip(CANONICAL_PHASES, reviewer_specs)):
             context = parse_reviewer_context(spec)
-            worker_artifact = phase_artifact_contract(role="worker", phase=phase)
+            worker_artifact = phase_artifact_contract(
+                role="worker", phase=phase, run_id=result.run_id
+            )
             with self.subTest(phase=phase):
                 self.assertEqual(context["current_delta"], worker_artifact)
                 self.assertEqual(
                     context["approved_baseline"],
                     " || ".join(
-                        phase_artifact_contract(role="worker", phase=earlier)
+                        phase_artifact_contract(
+                            role="worker", phase=earlier, run_id=result.run_id
+                        )
                         for earlier in CANONICAL_PHASES[:index]
                     ),
                 )
@@ -4405,29 +4423,36 @@ class ScenarioKDispatchedPhaseTests(OfflineHarnessTestCase):
 
     def test_evidence_defaults_to_the_phase_artifact_rather_than_to_nothing(self) -> None:
         """A caller with no evidence still gets a real reference, not a placeholder."""
-        spec, _, context = dispatch_context("reviewer", 1, "pass", phase="plan")
+        spec, _, context = dispatch_context(
+            "reviewer", 1, "pass", phase="plan", run_id="run_x"
+        )
 
         self.assertIsNotNone(context)
-        self.assertEqual(context["current_delta"], ("artifacts/PLAN.md",))
+        self.assertEqual(context["current_delta"], ("artifacts/runs/run_x/PLAN.md",))
         self.assertEqual(context["approved_baseline"], ())
-        self.assertEqual(parse_reviewer_context(spec)["current_delta"], "artifacts/PLAN.md")
+        self.assertEqual(
+            parse_reviewer_context(spec)["current_delta"], "artifacts/runs/run_x/PLAN.md"
+        )
 
         with_evidence, _, evidenced = dispatch_context(
             "reviewer",
             2,
             "pass",
             phase="plan",
+            run_id="run_x",
             evidence=WorkflowEvidence(
                 original_objective="the run's own objective",
-                approved_baseline=("artifacts/ANALYSIS.md",),
-                current_delta=("artifacts/PLAN.md",),
+                approved_baseline=("artifacts/runs/run_x/ANALYSIS.md",),
+                current_delta=("artifacts/runs/run_x/PLAN.md",),
                 new_claims=("PLAN.md section 4 rewritten",),
                 validation=("worker outcome=succeeded",),
             ),
         )
         rendered = parse_reviewer_context(with_evidence)
         self.assertEqual(evidenced["original_objective"], "the run's own objective")
-        self.assertEqual(rendered["approved_baseline"], "artifacts/ANALYSIS.md")
+        self.assertEqual(
+            rendered["approved_baseline"], "artifacts/runs/run_x/ANALYSIS.md"
+        )
         self.assertEqual(rendered["validation"], "worker outcome=succeeded")
 
 
