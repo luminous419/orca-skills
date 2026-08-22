@@ -9,6 +9,7 @@ are recorded here in a Keep a Changelog-inspired format.
 
 - GitHub Actions validation across the supported Python versions.
 - Release metadata, compatibility documentation, and distributable-package verification.
+- Machine-checkable lifecycle accounting contract in the orchestration skill, enforced by the repository validator and covered by negative regression tests.
 
 ### Verified
 
@@ -21,6 +22,20 @@ are recorded here in a Keep a Changelog-inspired format.
 
 - Clarified lifecycle accounting when a runtime auto-settles a completed Dispatch before
   explicit worker release, including separate accounting for residual terminal resources.
+- Replaced the two-layer lifecycle account with four independent axes — settlement,
+  supervised worker-resource registration, residual process liveness, and cleanup
+  authority — and added `unsupervised` as an explicit fourth worker-resource outcome so a
+  dispatch that was never registered is no longer released repeatedly.
+- Required each Dispatch to be finalized exactly once, behind a gate that runs before any
+  lifecycle action rather than after it.
+- Required the phase Task graph to be created before the Worker is dispatched, so the
+  Reviewer Task becomes ready by dependency promotion; manual readiness override is now
+  recovery-only.
+- Made terminal close depend on a close-eligible terminal role plus proven ownership. The
+  coordinator's own session, setup terminals, adopted terminals, and still-active workers
+  can never be closed.
+- Documented the supervised-first placement ladder for custom PATH wrapper commands, so
+  the "unconfigured agent" response is treated as a branch signal rather than a failure.
 
 ## 0.9.0 - 2026-08-20
 

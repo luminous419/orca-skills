@@ -198,6 +198,138 @@ class ValidatorRegressionTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("user-specific absolute path", result.stdout)
 
+    def mutate_orchestration_skill(self, old: str, new: str) -> None:
+        skill_path = (
+            self.repo_root / "orca-worker-reviewer-orchestration" / "SKILL.md"
+        )
+        text = skill_path.read_text(encoding="utf-8")
+        self.assertIn(old, text)
+        skill_path.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+    def assert_lifecycle_contract_rejected(self, expected: str) -> None:
+        result = self.run_validator()
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(expected, result.stdout)
+
+    def test_lifecycle_contract_missing_unsupervised_outcome_fails(self) -> None:
+        self.mutate_orchestration_skill(
+            "LIFECYCLE_OUTCOMES = reuse, retain, release, unsupervised",
+            "LIFECYCLE_OUTCOMES = reuse, retain, release",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "lifecycle contract values differ from the validator source of truth"
+        )
+
+    def test_lifecycle_contract_force_ready_drift_fails(self) -> None:
+        self.mutate_orchestration_skill(
+            "FORCE_READY_USE = recovery_only",
+            "FORCE_READY_USE = routine",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "lifecycle contract values differ from the validator source of truth"
+        )
+
+    def test_lifecycle_contract_missing_worker_start_terminal_step_fails(self) -> None:
+        self.mutate_orchestration_skill(
+            "worker_start_agent, "
+            "terminal_create_then_tui_idle_then_worker_start_terminal, dispatch_inject",
+            "worker_start_agent, dispatch_inject",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "lifecycle contract values differ from the validator source of truth"
+        )
+
+    def test_lifecycle_contract_missing_cleanup_authority_axis_fails(self) -> None:
+        self.mutate_orchestration_skill(
+            "AXIS_C2_CLEANUP_AUTHORITY = launch_provenance_and_ownership\n",
+            "",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "lifecycle contract keys differ from the validator source of truth"
+        )
+
+    def test_lifecycle_contract_close_gate_drift_fails(self) -> None:
+        self.mutate_orchestration_skill(
+            "CLOSE_ALLOWED_ONLY_WHEN = authorized_and_close_eligible_role",
+            "CLOSE_ALLOWED_ONLY_WHEN = connected",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "CLOSE_ALLOWED_ONLY_WHEN must require a close eligible terminal role"
+        )
+
+    def test_lifecycle_contract_coordinator_session_removed_from_never_close_fails(
+        self,
+    ) -> None:
+        self.mutate_orchestration_skill(
+            "NEVER_CLOSE_TERMINAL_ROLES = coordinator_session, ",
+            "NEVER_CLOSE_TERMINAL_ROLES = ",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "NEVER_CLOSE_TERMINAL_ROLES must contain exactly"
+        )
+
+    def test_lifecycle_contract_close_gate_without_role_condition_fails(self) -> None:
+        self.mutate_orchestration_skill(
+            "CLOSE_ALLOWED_ONLY_WHEN = authorized_and_close_eligible_role",
+            "CLOSE_ALLOWED_ONLY_WHEN = authorized",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "CLOSE_ALLOWED_ONLY_WHEN must require a close eligible terminal role"
+        )
+
+    def test_lifecycle_contract_finalization_gate_order_drift_fails(self) -> None:
+        self.mutate_orchestration_skill(
+            "FINALIZATION_PER_DISPATCH = exactly_once, gate_before_lifecycle_action",
+            "FINALIZATION_PER_DISPATCH = exactly_once",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "lifecycle contract values differ from the validator source of truth"
+        )
+
+    def test_lifecycle_contract_settlement_verification_drift_fails(self) -> None:
+        """Dropping the pre-mutation settlement check from the contract must fail.
+
+        The human review of PR #10 found the harness mutating lifecycle state before
+        axis (a) was proven; the anchor block is where that ordering requirement is
+        locked, so removing the token has to be rejected here.
+        """
+        self.mutate_orchestration_skill(
+            ", settlement_verified_before_lifecycle_action",
+            "",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "lifecycle contract values differ from the validator source of truth"
+        )
+
+    def test_lifecycle_contract_copied_into_loop_skill_fails(self) -> None:
+        orchestration = (
+            self.repo_root / "orca-worker-reviewer-orchestration" / "SKILL.md"
+        ).read_text(encoding="utf-8")
+        start = orchestration.index("#### Lifecycle accounting contract")
+        fence = orchestration.index("```text", start)
+        end = orchestration.index("```\n", fence + 1) + 4
+        block = orchestration[start:end]
+        loop_path = self.repo_root / "orca-worker-reviewer-loop" / "SKILL.md"
+        loop_path.write_text(
+            loop_path.read_text(encoding="utf-8") + "\n" + block,
+            encoding="utf-8",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "orca-worker-reviewer-loop: must not contain the orchestration lifecycle "
+            "contract"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

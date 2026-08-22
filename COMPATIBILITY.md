@@ -48,18 +48,31 @@ unaddressable to `worker-show` and `worker-release` (`dispatch_not_found`), whil
 terminal remained idle. This differs from the 1.4.184 fake-agent harness path, where the
 coordinator can release the settled worker before acknowledging its Delivery.
 
-The lifecycle invariant is therefore expressed in two layers:
+Two further observations refine that report's interpretation. First, an accepted
+`worker_done` settles the Dispatch regardless of how the worker was started: a low-level,
+tracked Dispatch is not exempt from auto-settlement. Second, `dispatch_not_found` is
+returned both before and after settlement, so it is evidence about the supervised
+worker-resource registry and not about settlement in either direction.
 
-1. Account for accepted completion through the current runtime's Dispatch settlement
-   contract; do not repeatedly release a Dispatch that the runtime has already settled
-   and made unaddressable.
-2. Independently account for any residual terminal/resource using only cleanup guidance
-   from the installed version-matched guides and runtime receipts. Arbitrary process kills
-   or undocumented cleanup are not acceptable.
+The lifecycle invariant is therefore expressed as four independent axes, each with its
+own recorded outcome:
 
-This clarification permits observed runtime-specific settlement behavior without allowing
-orphaned worker resources. Detailed evidence is in
-[`STEP5_REAL_GLM_GEMMA_SMOKE_REPORT.md`](STEP5_REAL_GLM_GEMMA_SMOKE_REPORT.md).
+1. **(a) Settlement** — accepted completion read from Task/Dispatch provenance. Do not
+   repeatedly release a Dispatch the runtime has already settled.
+2. **(b) Supervised worker-resource registration** — `reuse`, `retain`, `release`, or
+   `unsupervised` when the dispatch was never registered as a supervised worker resource.
+3. **(c1) Residual process liveness** — checked always, from terminal inspection, and
+   answering only whether a process is still alive.
+4. **(c2) Cleanup authority** — `authorized` only when a close-eligible terminal role and
+   proven ownership both hold. Liveness never grants it, and self-creation alone never
+   grants it. Anything else is retain-and-report.
+
+Splitting (c1) from (c2) is what keeps a live terminal from being read as permission to
+close it, and the terminal role gate is what keeps the coordinator's own session, setup
+tabs, and adopted terminals permanently out of the close path. Residual terminals are
+still cleaned up only through the installed version-matched guides and runtime receipts;
+arbitrary process kills or undocumented cleanup remain unacceptable. Detailed evidence is
+in [`STEP5_REAL_GLM_GEMMA_SMOKE_REPORT.md`](STEP5_REAL_GLM_GEMMA_SMOKE_REPORT.md).
 
 ## Stable release blockers
 

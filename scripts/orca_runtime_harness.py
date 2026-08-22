@@ -8,7 +8,7 @@ import os
 import shlex
 import shutil
 import subprocess
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -20,9 +20,15 @@ WAIT_TYPES = "worker_done,escalation,question"
 SUPPORTED_ORCA_APP_VERSION = "1.4.184"
 REQUIRED_ORCHESTRATION_GUIDE_SNIPPETS = (
     "orca orchestration run-create --objective <text> --json",
-    "orca orchestration task-create --spec <text>",
+    # The bare "--spec <text>" form is a prefix of the entry below; keeping both would
+    # make the dependency-grammar regression test vacuous (DESIGN R-12).
+    "orca orchestration task-create --spec <text> [--deps <json_array>]",
+    "orca orchestration task-list [--status <status>] [--ready]",
     "orca orchestration dispatch --task <task_id> --to <handle>",
+    "orca orchestration dispatch-show --task <task_id>",
     "orca orchestration worker-start --task <task_id>",
+    "worker-start --task <next_task_id> --terminal <handle> --json",
+    "orca orchestration worker-show --dispatch <dispatch_id> --json",
     "orca orchestration check --wait --types worker_done,escalation,question",
     "orca orchestration worker-release --dispatch <dispatch_id> --json",
     "orca orchestration worker-retain --dispatch <dispatch_id> --json",
@@ -33,7 +39,98 @@ REQUIRED_ORCA_CLI_GUIDE_SNIPPETS = (
     "orca terminal create",
     "orca terminal send",
     "ORCA terminal wait",
+    "terminal wait --terminal <handle> --for tui-idle",
 )
+
+# ---- lifecycle role vocabulary -------------------------------------------------
+# Same tokens as the SKILL.md anchor block, widened by one fixture-only role. The
+# harness may widen the never-close set; it must never narrow it (DESIGN C-9).
+SKILL_TERMINAL_ROLE_CLASSES = frozenset(
+    {
+        "coordinator_session",
+        "setup_terminal",
+        "active_worker",
+        "external_or_adopted",
+        "phase_worker",
+        "phase_reviewer",
+        "unknown_role",
+    }
+)
+HARNESS_ONLY_ROLES = frozenset({"run_owner_fixture"})
+TERMINAL_ROLE_CLASSES = SKILL_TERMINAL_ROLE_CLASSES | HARNESS_ONLY_ROLES
+NEVER_CLOSE_ROLES = frozenset(
+    {
+        "coordinator_session",
+        "run_owner_fixture",
+        "setup_terminal",
+        "active_worker",
+        "external_or_adopted",
+        "unknown_role",
+    }
+)
+CLOSE_ELIGIBLE_ROLES = frozenset({"phase_worker", "phase_reviewer"})
+TERMINAL_ORIGINS = frozenset({"self_created", "adopted", "pre_existing", "unknown"})
+CLEANUP_AUTHORITY_STATES = frozenset({"authorized", "not_authorized", "unknown"})
+SELF_HANDLE_ENV = "ORCA_TERMINAL_HANDLE"
+
+# ---- lifecycle mutation vocabulary ---------------------------------------------
+WORKER_RESOURCE_OUTCOMES = ("reuse", "retain", "release", "unsupervised")
+LIFECYCLE_TO_COMMAND = {
+    "reuse": "worker-retain",  # reuse is achieved with the retain command
+    "retain": "worker-retain",
+    "release": "worker-release",
+}
+LIFECYCLE_MUTATION_COMMANDS = frozenset(
+    {"worker-release", "worker-retain", "worker-abandon", "close"}
+)
+# The coordinator's three lifecycle *choices* (SKILL.md section 6, outcomes 1-3).
+# The fourth outcome, "unsupervised", is an observation about the Dispatch and can
+# never be chosen, so it is deliberately absent here.
+LIFECYCLE_INTENTS = frozenset(LIFECYCLE_TO_COMMAND)
+# reuse and retain both mean "this terminal is handed onward alive". Neither may ever
+# be accounted as a close or a release, on the supervised branch or the unsupervised
+# one, no matter what cleanup authority the terminal has.
+RETAIN_INTENTS = frozenset({"reuse", "retain"})
+SETTLEMENT_STATES = ("absent", "in_progress", "finalized")
+# Worker states that mean "this dispatch produced no outcome and the process is gone".
+# `outcome_unknown` is the agent that started and died; `ready` is the agent that had
+# already exited when worker-start adopted its terminal -- reachable because ladder
+# rung 3 observes TUI idle before adopting. Both take the same abandon recovery, and
+# neither may be read as a settlement.
+UNSETTLED_WORKER_STATES = frozenset({"outcome_unknown", "ready"})
+# Task/Dispatch provenance values that prove a Dispatch really reached an outcome.
+# Anything else -- `dispatched` above all -- is not-settled, and axis (a) forbids a
+# lifecycle mutation on it. This is the vocabulary of SKILL.md section 6 axis (a),
+# not of the worker registry: it is read from the Dispatch row and the Task row.
+SETTLED_STATUSES = frozenset({"completed", "failed"})
+# The only two outcomes an accepted `worker_done` may carry. Same vocabulary as the
+# dispatch preamble's `--outcome succeeded|failed` (REQUIRED_ORCHESTRATION_GUIDE_
+# SNIPPETS above) and as the fake-worker contract. A payload without one of these is
+# not an accepted settlement message at all, so axis (a) refuses it before STEP 2.
+SETTLED_OUTCOMES = frozenset({"succeeded", "failed"})
+# Identity fields every accepted `worker_done` payload carries, mapped to the value
+# they must equal. SKILL.md section 6 axis (a) requires the message to match the
+# EXPECTED Task and Dispatch ID; neither is optional, because a payload that names
+# no dispatch proves nothing about the dispatch we are about to mutate.
+WORKER_DONE_IDENTITY_FIELDS = ("dispatchId", "taskId")
+# Where a Dispatch row records the completion timestamp axis (a) requires as
+# provenance. The live runtime writes `completed_at` (snake_case, on both the
+# `completed` and the `failed` row); the camelCase spellings are accepted so a
+# JSON-cased projection of the same row is not read as "never completed".
+COMPLETION_TIMESTAMP_KEYS = ("completed_at", "completedAt", "settled_at", "settledAt")
+
+
+def completion_timestamp(dispatch_row: dict[str, Any]) -> str | None:
+    """The Dispatch row's completion timestamp, or None when it carries none.
+
+    Read-only and total: an unknown row shape answers None rather than raising, so
+    the caller decides what a missing timestamp means.
+    """
+    for key in COMPLETION_TIMESTAMP_KEYS:
+        value = dispatch_row.get(key)
+        if value:
+            return str(value)
+    return None
 
 
 class OrcaRuntimeError(RuntimeError):
@@ -69,6 +166,43 @@ def validate_orca_contract(
         )
 
 
+
+def cleanup_authority(role: str, origin: str, owned_by_this_dispatch: bool) -> str:
+    """Axis (c2). Role gate first (STEP 4-0), provenance second (STEP 4a/4b).
+
+    There is deliberately no branch that returns "authorized" from origin alone:
+    a self-created terminal may still be the coordinator's own session.
+    """
+    if role == "unknown_role" or role not in TERMINAL_ROLE_CLASSES:
+        return "unknown"
+    if role in NEVER_CLOSE_ROLES:
+        return "not_authorized"
+    if role not in CLOSE_ELIGIBLE_ROLES:
+        return "unknown"
+    if origin != "self_created" or not owned_by_this_dispatch:
+        return "unknown"
+    return "authorized"
+
+
+def close_allowed(role: str, origin: str, owned_by_this_dispatch: bool) -> bool:
+    """Code-level mirror of CLOSE_ALLOWED_ONLY_WHEN = authorized_and_close_eligible_role.
+
+    Requires the close-eligible role a second time, so loosening cleanup_authority()
+    alone still cannot open the close path (defense in depth).
+    """
+    return (
+        role in CLOSE_ELIGIBLE_ROLES
+        and cleanup_authority(role, origin, owned_by_this_dispatch) == "authorized"
+    )
+
+
+def _flag_value(args: list[str], flag: str) -> str | None:
+    for index, token in enumerate(args):
+        if token == flag and index + 1 < len(args):
+            return args[index + 1]
+    return None
+
+
 @dataclass
 class RuntimeAttempt:
     role: str
@@ -84,6 +218,12 @@ class RuntimeAttempt:
     worker_done_count: int
     execution_path: str
     body: str = ""
+    settlement: str = ""  # axis (a)
+    worker_resource: str = ""  # axis (b): reuse|retain|release|unsupervised
+    process_liveness: str = ""  # axis (c1): live|already exited|disputed
+    cleanup_authority: str = ""  # axis (c2): authorized|not_authorized|unknown
+    terminal_role: str = "unknown_role"
+    finalizations: int = 0
 
 
 @dataclass
@@ -95,6 +235,13 @@ class RuntimeScenarioResult:
     attempts: list[RuntimeAttempt] = field(default_factory=list)
     signals: list[str] = field(default_factory=list)
     recovery: list[str] = field(default_factory=list)
+    run_owner_handle: str = ""
+    ledger: list[dict[str, Any]] = field(default_factory=list)
+    fixture_teardown: dict[str, Any] = field(default_factory=dict)
+    reviewer_task_id: str = ""
+    reviewer_task_status: str = ""
+    late_dependent_status: str = ""
+    commands_used: list[str] = field(default_factory=list)
 
 
 class OrcaRuntimeHarness:
@@ -103,10 +250,14 @@ class OrcaRuntimeHarness:
         self.artifact_dir = artifact_dir
         self.wait_timeout_ms = wait_timeout_ms
         self.artifact_dir.mkdir(parents=True, exist_ok=True)
-        self.coordinator: str | None = None
+        self.run_owner: str | None = None
         self.run_id: str | None = None
         self._raw: list[dict[str, Any]] = []
         self._signals: list[str] = []
+        # handle -> terminal row (authoritative role/origin, survives across dispatches)
+        self._terminals: dict[str, dict[str, Any]] = {}
+        # dispatch_id -> lifecycle row (axis outcomes + finalization state)
+        self._ledger: dict[str, dict[str, Any]] = {}
 
     @staticmethod
     def _resolve_orca() -> str:
@@ -116,7 +267,12 @@ class OrcaRuntimeHarness:
             raise OrcaRuntimeError("Orca CLI executable was not found")
         return executable
 
-    def call(self, *args: str, allow_error: bool = False) -> dict[str, Any]:
+    def _exec_orca(self, args: tuple[str, ...]) -> tuple[int, str]:
+        """The ONLY process boundary in this harness. Returns (returncode, stdout).
+
+        Offline tests replace THIS method -- never call(). Replacing call() would bypass
+        self._raw, which lifecycle_commands() is derived from.
+        """
         completed = subprocess.run(
             [self.orca, *args, "--json"],
             cwd=REPO_ROOT,
@@ -124,18 +280,429 @@ class OrcaRuntimeHarness:
             capture_output=True,
             check=False,
         )
+        return completed.returncode, completed.stdout
+
+    def call(self, *args: str, allow_error: bool = False) -> dict[str, Any]:
+        returncode, stdout = self._exec_orca(tuple(args))
         try:
-            payload = json.loads(completed.stdout)
+            payload = json.loads(stdout)
         except json.JSONDecodeError as exc:
             raise OrcaRuntimeError(
-                f"non-JSON Orca response for {' '.join(args)}: {completed.stdout!r}"
+                f"non-JSON Orca response for {' '.join(args)}: {stdout!r}"
             ) from exc
+        # A failed command is still a command that was sent: record it before raising.
         self._raw.append({"command": list(args), "response": payload})
-        if (completed.returncode != 0 or not payload.get("ok")) and not allow_error:
+        if (returncode != 0 or not payload.get("ok")) and not allow_error:
             raise OrcaRuntimeError(
                 f"Orca command failed ({' '.join(args)}): {payload.get('error')}"
             )
         return payload
+
+    # ---- lifecycle ledger ------------------------------------------------
+
+    def register_terminal(
+        self,
+        handle: str,
+        *,
+        role: str,
+        origin: str,
+        intended_role: str | None = None,
+        owner_dispatch_id: str | None = None,
+        created_by: str = "",
+    ) -> dict[str, Any]:
+        """Create the ledger row for a terminal at creation/adoption time.
+
+        role and origin are the only axis (c2) evidence that exists, and the runtime
+        keeps neither, so they are recorded here or lost forever.
+        """
+        if role not in TERMINAL_ROLE_CLASSES:
+            raise OrcaRuntimeError(f"unknown terminal role: {role}")
+        if origin not in TERMINAL_ORIGINS:
+            raise OrcaRuntimeError(f"unknown terminal origin: {origin}")
+        row = self._terminals.get(handle)
+        if row is None:
+            row = self._terminals[handle] = {
+                "handle": handle,
+                "role": role,
+                "origin": origin,
+                "intended_role": intended_role or role,
+                "owner_dispatch_id": owner_dispatch_id,
+                "created_by": created_by,
+                "policy_commands": [],
+                "tui_idle": "unobserved",
+            }
+        else:  # ownership transfer, never a role promotion (reuse chain)
+            row["owner_dispatch_id"] = owner_dispatch_id or row["owner_dispatch_id"]
+            if created_by:
+                row["created_by"] = created_by
+        row["cleanup_authority"] = cleanup_authority(
+            row["role"], row["origin"], row["owner_dispatch_id"] is not None
+        )
+        row["action"] = "retained"
+        return row
+
+    def _attach_terminal(
+        self, handle: str, dispatch_id: str, created_by: str
+    ) -> dict[str, Any]:
+        """Bind a handle to the dispatch that now owns it.
+
+        A handle already in the ledger keeps its recorded role (ownership transfer,
+        see the reuse outcome); an unseen handle is an adoption.
+        """
+        if handle in self._terminals:
+            return self.register_terminal(
+                handle,
+                role=self._terminals[handle]["role"],
+                origin=self._terminals[handle]["origin"],
+                owner_dispatch_id=dispatch_id,
+                created_by=created_by,
+            )
+        return self.register_terminal(
+            handle,
+            role="external_or_adopted",
+            origin="adopted",
+            owner_dispatch_id=dispatch_id,
+            created_by=created_by,
+        )
+
+    def demote_or_promote_role(
+        self, handle: str, new_role: str, *, settled: bool
+    ) -> None:
+        """The only allowed upward transition is active_worker -> phase_* once settled."""
+        row = self._terminals.get(handle)
+        if row is None or row["role"] == new_role:
+            return
+        current = row["role"]
+        if new_role in CLOSE_ELIGIBLE_ROLES:
+            if current == "active_worker" and settled:
+                row["role"] = new_role
+            return
+        conservativeness = {
+            "phase_worker": 0,
+            "phase_reviewer": 0,
+            "active_worker": 1,
+            "external_or_adopted": 2,
+            "unknown_role": 3,
+        }
+        if (
+            current in conservativeness
+            and new_role in conservativeness
+            and conservativeness[new_role] > conservativeness[current]
+        ):
+            row["role"] = new_role
+
+    def ledger_terminal(self, handle: str) -> dict[str, Any]:
+        """Public read accessor; an unregistered handle reads back as unknown_role."""
+        row = self._terminals.get(handle)
+        if row is not None:
+            return row
+        return {
+            "handle": handle,
+            "role": "unknown_role",
+            "origin": "unknown",
+            "intended_role": "unknown_role",
+            "owner_dispatch_id": None,
+            "created_by": "",
+            "policy_commands": [],
+            "tui_idle": "unobserved",
+            "cleanup_authority": "unknown",
+            "action": "retained",
+        }
+
+    def classify_terminal(
+        self,
+        *,
+        handle: str,
+        role: str,
+        origin: str,
+        owned_by_this_dispatch: bool,
+    ) -> dict[str, Any]:
+        """Classify a hypothetical row without touching the runtime or the ledger."""
+        authority = cleanup_authority(role, origin, owned_by_this_dispatch)
+        return {
+            "handle": handle,
+            "role": role,
+            "origin": origin,
+            "intended_role": role,
+            "owner_dispatch_id": handle if owned_by_this_dispatch else None,
+            "created_by": "simulated",
+            "policy_commands": [],
+            "tui_idle": "unobserved",
+            "cleanup_authority": authority,
+            "action": "closed by coordinator" if authority == "authorized" else "retained",
+        }
+
+    def claim_settlement(
+        self,
+        dispatch_id: str,
+        *,
+        task_id: str,
+        terminal: str,
+        role: str,
+        iteration: int,
+    ) -> RuntimeAttempt | None:
+        """STEP 0 gate. The ONLY entry point to a lifecycle mutation for a Dispatch.
+
+        Returns None when the caller now owns this dispatch's settlement and may issue
+        lifecycle commands. Returns the recorded RuntimeAttempt (a copy) when the
+        dispatch was already finalized -- the caller must return it immediately and
+        issue NO Orca command at all. Raises OrcaRuntimeError when a previous
+        settlement claimed the row and never finalized it; that state is recovered
+        explicitly, never re-mutated.
+
+        The ledger row is one-way: absent -> in_progress -> finalized. There is
+        deliberately NO API that moves a claimed row back to "absent"; a claim
+        carries no proof of how many mutations already went out, so releasing it
+        would let the next settle_attempt() pass this gate and repeat a lifecycle
+        command that the runtime has already accepted.
+
+        MUST be called before the first self.call(...) of the settlement path.
+        """
+        row = self._ledger.get(dispatch_id)
+        if row is None:
+            row = self._ledger[dispatch_id] = {
+                "dispatch_id": dispatch_id,
+                "task_id": task_id,
+                "handle": terminal,
+                "role": role,
+                "iteration": iteration,
+                "state": "absent",
+                "replays": 0,
+                "attempt": None,
+            }
+        if row["state"] == "absent":
+            row["state"] = "in_progress"
+            return None
+        if row["state"] == "finalized":
+            row["replays"] += 1
+            return replace(row["attempt"])
+        raise OrcaRuntimeError(
+            f"dispatch {dispatch_id} settlement is in progress or crashed "
+            "mid-settlement; recover explicitly instead of repeating the "
+            "lifecycle action"
+        )
+
+    def verify_settlement(
+        self,
+        dispatch_id: str,
+        *,
+        task_id: str,
+        observation: dict[str, Any],
+        done: dict[str, Any],
+        task_status: str,
+        supervised: bool,
+    ) -> str:
+        """STEP 1b gate. Prove axis (a) BEFORE the first lifecycle mutation.
+
+        Pure with respect to the runtime: issues ZERO Orca commands, exactly like
+        account_axes(). Every input was already fetched by the read-only STEP 1/1b
+        observations, so proving settlement costs no extra mutation risk.
+
+        Returns the proven Dispatch status ("completed" or "failed") and lets the
+        caller proceed to STEP 2. Raises OrcaRuntimeError -- with no lifecycle
+        command issued at all -- when this Dispatch did not actually settle:
+
+          * the `worker_done` was rejected by the runtime;
+          * the `worker_done` does not carry BOTH expected identities, or carries the
+            wrong one (it settles a different Dispatch or a different Task than the
+            one we are about to mutate);
+          * the `worker_done` carries no explicit `succeeded`/`failed` outcome, so it
+            is not an accepted settlement message at all;
+          * the supervised worker record produced no outcome (UNSETTLED_WORKER_STATES);
+          * the Dispatch row or the Task row is still `dispatched`;
+          * the settled Dispatch row carries no completion timestamp, so its
+            provenance does not actually record a completion.
+
+        Those are exactly the cases SKILL.md section 6 axis (a) routes to the
+        recovery path (observe_unexpected_exit's abandon/task-update flow), never to
+        worker-release / worker-retain / close. STEP 0's exactly-once gate answers a
+        different question -- "did I already settle this Dispatch?" -- and stays
+        ahead of this check; this one answers "is there a settlement to account at
+        all?".
+
+        Every one of these is a *read-only* question, which is the whole reason they
+        belong here: a check that could be answered before the mutation and is
+        instead answered after it (STEP 4's payload["outcome"], before this gate
+        validated the field) is the same defect in miniature.
+        """
+        payload = json.loads(done["payload"])
+        if payload.get("_orcaLifecycleRejection"):
+            raise OrcaRuntimeError(
+                f"dispatch {dispatch_id} worker_done was rejected by Orca; no "
+                "lifecycle mutation issued -- follow the guide's recovery procedure"
+            )
+        # Identity before everything else that reads the payload: a message that does
+        # not provably belong to THIS dispatch and THIS task says nothing about them,
+        # whatever else it contains. dispatchId is checked first so a mismatched
+        # dispatch keeps reporting itself as a stale delivery.
+        expected = {"dispatchId": dispatch_id, "taskId": task_id}
+        for field_name in WORKER_DONE_IDENTITY_FIELDS:
+            reported = payload.get(field_name)
+            if reported is None:
+                raise OrcaRuntimeError(
+                    f"worker_done for dispatch {dispatch_id} carries no "
+                    f"{field_name}; its identity cannot be proven and no lifecycle "
+                    "mutation was issued"
+                )
+            if reported != expected[field_name]:
+                raise OrcaRuntimeError(
+                    f"stale worker_done: payload {field_name} is {reported}, not "
+                    f"{expected[field_name]}; no lifecycle mutation issued"
+                )
+        outcome = payload.get("outcome")
+        if outcome not in SETTLED_OUTCOMES:
+            raise OrcaRuntimeError(
+                f"dispatch {dispatch_id} worker_done carries outcome {outcome!r}, "
+                f"not one of {sorted(SETTLED_OUTCOMES)}; no lifecycle mutation "
+                "issued -- an accepted worker_done reports an explicit outcome, so "
+                "recover this dispatch explicitly instead"
+            )
+        worker_state = (observation.get("worker") or {}).get("state")
+        if supervised and worker_state in UNSETTLED_WORKER_STATES:
+            raise OrcaRuntimeError(
+                f"dispatch {dispatch_id} worker is {worker_state!r} and produced no "
+                "outcome; no lifecycle mutation issued -- take the abandon recovery "
+                "path instead"
+            )
+        dispatch_row = observation.get("dispatch") or {}
+        dispatch_status = dispatch_row.get("status")
+        unsettled = ", ".join(
+            f"{name} status {status!r}"
+            for name, status in (("dispatch", dispatch_status), ("task", task_status))
+            if status not in SETTLED_STATUSES
+        )
+        if unsettled:
+            raise OrcaRuntimeError(
+                f"dispatch {dispatch_id} is not settled ({unsettled}); no lifecycle "
+                "mutation issued -- axis (a) must be proven from Task/Dispatch "
+                "provenance before worker-release/worker-retain, so recover this "
+                "dispatch explicitly instead"
+            )
+        # The last half of the axis (a) sentence: a settled status AND a completion
+        # timestamp in the provenance. A row that claims an outcome but records no
+        # moment of completion is not the settlement receipt the guide asks for.
+        if completion_timestamp(dispatch_row) is None:
+            raise OrcaRuntimeError(
+                f"dispatch {dispatch_id} reports status {dispatch_status!r} but its "
+                "provenance carries no completion timestamp; no lifecycle mutation "
+                "issued -- axis (a) requires both before worker-release/worker-retain"
+            )
+        return dispatch_status
+
+    def account_axes(
+        self,
+        task_id: str,
+        dispatch_id: str,
+        terminal: str,
+        *,
+        supervised: bool,
+        observation: dict[str, Any],
+        task_status: str,
+        lifecycle: str,
+    ) -> tuple[str, str, str, str, str]:
+        """Return (settlement, worker_resource, process_liveness, cleanup, role).
+
+        Pure with respect to the runtime: issues ZERO Orca commands. Every input is
+        either already-fetched observation data, the ledger, or the caller's choice.
+        """
+        if lifecycle not in LIFECYCLE_INTENTS:
+            raise OrcaRuntimeError(f"unknown lifecycle intent: {lifecycle}")
+        settlement = (
+            task_status if task_status in {"completed", "failed"} else "not-settled"
+        )
+        if supervised:
+            worker_resource = lifecycle
+            terminal_resource = observation.get("terminalResource") or {}
+            if not terminal_resource:
+                process_liveness = "disputed"
+            elif terminal_resource.get("releaseState") in {
+                "released",
+                "closed",
+                "exited",
+            }:
+                process_liveness = "already exited"
+            else:
+                process_liveness = "live"
+        else:
+            worker_resource = "unsupervised"
+            observed = observation.get("terminalState")
+            if observed in {"exited", "released", "closed"}:
+                process_liveness = "already exited"
+            elif observed == "reused":
+                process_liveness = "live"
+            else:
+                process_liveness = "disputed"
+
+        row = self.ledger_terminal(terminal)
+        authority = cleanup_authority(
+            row["role"], row["origin"], row["owner_dispatch_id"] == dispatch_id
+        )
+        # Order rule: close is only ever decided while the process is live.
+        #
+        # The retain-intent gate sits ABOVE the authority gate on purpose. Axis (b)
+        # records what happened to the worker *resource* ("unsupervised" whenever no
+        # supervised resource was ever registered), while `lifecycle` records what the
+        # coordinator decided about the *terminal*. reuse and retain both keep the
+        # terminal alive for its next owner, so proven cleanup authority is exactly the
+        # case in which a close would be possible and still must not happen.
+        if process_liveness != "live":
+            action = "nothing to do"
+        elif lifecycle in RETAIN_INTENTS:
+            action = "retained"
+        elif authority != "authorized":
+            action = "retained"
+        elif worker_resource == "unsupervised":
+            action = "closed by coordinator"
+        else:
+            action = "released by runtime"
+        if terminal in self._terminals:
+            self._terminals[terminal]["cleanup_authority"] = authority
+            self._terminals[terminal]["action"] = action
+        return (
+            settlement,
+            worker_resource,
+            process_liveness,
+            authority,
+            row["role"],
+        )
+
+    def finalize_once(
+        self, dispatch_id: str, *, attempt: RuntimeAttempt, **axes: str
+    ) -> dict[str, Any]:
+        """Single-assignment writer for a claimed row. Never call without claim."""
+        row = self._ledger.get(dispatch_id)
+        if row is None:
+            raise OrcaRuntimeError(
+                f"dispatch {dispatch_id} was never claimed; call claim_settlement first"
+            )
+        if row["state"] == "finalized":
+            raise OrcaRuntimeError(f"dispatch {dispatch_id} was already finalized")
+        row.update(axes)
+        row["attempt"] = attempt
+        row["state"] = "finalized"
+        return row
+
+    def lifecycle_commands(
+        self, dispatch_id: str | None = None, handle: str | None = None
+    ) -> list[str]:
+        """Lifecycle-mutating Orca commands actually executed, derived from self._raw.
+
+        Never a hand-maintained counter, so it cannot drift from what was really sent.
+        Execution order is preserved and duplicates are not collapsed: an equality
+        assertion against this list therefore counts mutations, not just presence.
+        """
+        verbs: list[str] = []
+        for row in self._raw:
+            args = row["command"]
+            verb = args[1] if len(args) > 1 else args[0]
+            if verb not in LIFECYCLE_MUTATION_COMMANDS:
+                continue
+            if dispatch_id is not None and _flag_value(args, "--dispatch") != dispatch_id:
+                continue
+            if handle is not None and _flag_value(args, "--terminal") != handle:
+                continue
+            verbs.append(verb)
+        return verbs
 
     def preflight(self) -> dict[str, Any]:
         status = self.call("status")["result"]
@@ -171,20 +738,36 @@ class OrcaRuntimeHarness:
         terminal = self.call(
             "terminal", "create", "--worktree", "current", "--title", objective, "--command", "bash"
         )
-        self.coordinator = terminal["result"]["terminal"]["handle"]
+        self.run_owner = terminal["result"]["terminal"]["handle"]
+        self.register_terminal(
+            self.run_owner, role="run_owner_fixture", origin="self_created"
+        )
         created = self.call(
-            "orchestration", "run-create", "--objective", objective, "--from", self.coordinator
+            "orchestration", "run-create", "--objective", objective, "--from", self.run_owner
         )
         self.run_id = created["result"]["run"]["id"]
         self._signals = []
+        self._ledger = {}
         return self.run_id
 
-    def create_task(self, spec: str) -> str:
-        assert self.coordinator
-        created = self.call(
-            "orchestration", "task-create", "--spec", spec, "--from", self.coordinator
-        )
+    def create_task(self, spec: str, *, deps: tuple[str, ...] = ()) -> str:
+        assert self.run_owner
+        args = ["orchestration", "task-create", "--spec", spec]
+        if deps:
+            args.extend(["--deps", json.dumps(list(deps))])
+        args.extend(["--from", self.run_owner])
+        created = self.call(*args)
         return created["result"]["task"]["id"]
+
+    def task_status(self, task_id: str) -> str:
+        """Read one task's status from the run's task listing."""
+        tasks = self.call("orchestration", "task-list", "--run", self.run_id)["result"][
+            "tasks"
+        ]
+        task = next((item for item in tasks if item["id"] == task_id), None)
+        if task is None:
+            raise OrcaRuntimeError(f"task {task_id} is not part of run {self.run_id}")
+        return task["status"]
 
     def create_fake_terminal(
         self,
@@ -227,10 +810,58 @@ class OrcaRuntimeHarness:
             "--command",
             shlex.join(command),
         )
-        return created["result"]["terminal"]["handle"]
+        handle = created["result"]["terminal"]["handle"]
+        self.register_terminal(
+            handle,
+            role="active_worker",
+            origin="self_created",
+            intended_role="phase_reviewer" if role == "reviewer" else "phase_worker",
+        )
+        return handle
+
+    def wait_for_tui_idle(self, terminal: str) -> str:
+        """Middle rung of the custom-command placement ladder (SKILL.md section 6).
+
+        Rung 3 is `terminal create` -> wait until the TUI is idle -> `worker-start
+        --terminal <handle>`. The wait is not decoration: worker-start adopts whatever
+        the terminal currently is, so skipping it hands the runtime a process that may
+        still be painting its startup UI and has not yet reached its prompt.
+
+        A wait that cannot confirm idle is recorded and adoption still proceeds --
+        rung 3 descends to rung 4 only when worker-start itself reports an
+        unconfigured agent, never because an observation was inconclusive.
+        """
+        waited = self.call(
+            "terminal",
+            "wait",
+            "--terminal",
+            terminal,
+            "--for",
+            "tui-idle",
+            "--timeout-ms",
+            str(self.wait_timeout_ms),
+            allow_error=True,
+        )
+        if not waited.get("ok"):
+            state = "unobserved"
+        elif ((waited.get("result") or {}).get("wait") or {}).get("satisfied"):
+            state = "idle"
+        else:
+            state = "timeout"
+        row = self._terminals.get(terminal)
+        if row is not None:
+            row["tui_idle"] = state
+        return state
 
     def start_worker(self, task_id: str, terminal: str, spec: str) -> tuple[str, bool]:
-        assert self.coordinator
+        assert self.run_owner
+        if terminal == os.environ.get(SELF_HANDLE_ENV):
+            raise OrcaRuntimeError(
+                "refusing to register the caller's own terminal as a worker resource"
+            )
+        # Ladder rung 3, in order: the terminal already exists, so idle first, adopt
+        # second. Both steps precede any dispatch, so rung 4 can never run ahead of it.
+        self.wait_for_tui_idle(terminal)
         started = self.call(
             "orchestration",
             "worker-start",
@@ -239,12 +870,16 @@ class OrcaRuntimeHarness:
             "--terminal",
             terminal,
             "--from",
-            self.coordinator,
+            self.run_owner,
             allow_error=True,
         )
         if started.get("ok"):
-            return started["result"]["dispatchId"], True
+            dispatch_id = started["result"]["dispatchId"]
+            self._attach_terminal(terminal, dispatch_id, "supervised_adopted")
+            return dispatch_id, True
         error = started.get("error", {})
+        # Only agent_unconfigured is a branch signal; every other error is a real
+        # failure (SKILL.md section 6 Custom command handling, rule 1).
         if error.get("code") != "agent_unconfigured":
             raise OrcaRuntimeError(f"worker-start failed: {error}")
         dispatched = self.call(
@@ -255,7 +890,7 @@ class OrcaRuntimeHarness:
             "--to",
             terminal,
             "--from",
-            self.coordinator,
+            self.run_owner,
         )
         dispatch_id = dispatched["result"]["dispatch"]["id"]
         prompt = (
@@ -268,15 +903,16 @@ class OrcaRuntimeHarness:
         self.call(
             "terminal", "send", "--terminal", terminal, "--text", prompt, "--enter"
         )
+        self._attach_terminal(terminal, dispatch_id, "low_level_tracked")
         return dispatch_id, False
 
     def _check(self) -> dict[str, Any]:
-        assert self.coordinator
+        assert self.run_owner
         return self.call(
             "orchestration",
             "check",
             "--terminal",
-            self.coordinator,
+            self.run_owner,
             "--wait",
             "--types",
             WAIT_TYPES,
@@ -285,9 +921,9 @@ class OrcaRuntimeHarness:
         )["result"]
 
     def _ack(self, delivery_id: str) -> None:
-        assert self.coordinator
+        assert self.run_owner
         self.call(
-            "orchestration", "check", "--terminal", self.coordinator, "--ack", delivery_id
+            "orchestration", "check", "--terminal", self.run_owner, "--ack", delivery_id
         )
 
     def confirm_terminal_exit(self, terminal: str) -> str:
@@ -329,7 +965,7 @@ class OrcaRuntimeHarness:
                         "--body",
                         "yes",
                         "--from",
-                        self.coordinator,
+                        self.run_owner,
                     )
                 elif message_type == "escalation":
                     pass
@@ -358,39 +994,112 @@ class OrcaRuntimeHarness:
         supervised: bool = True,
         terminal: str,
     ) -> RuntimeAttempt:
+        # ==== STEP 0. FINALIZATION GATE =====================================
+        # The first statement of the function. Nothing above it, and in particular no
+        # self.call(...), may run before it. A replayed settlement returns here having
+        # issued zero Orca commands.
+        recorded = self.claim_settlement(
+            dispatch_id,
+            task_id=task_id,
+            terminal=terminal,
+            role=role,
+            iteration=iteration,
+        )
+        if recorded is not None:
+            return recorded
+
+        # ==== STEP 1. read-only observation =================================
         if supervised:
-            before = self.call("orchestration", "worker-show", "--dispatch", dispatch_id)["result"]
-            if lifecycle == "retain":
-                action = self.call("orchestration", "worker-retain", "--dispatch", dispatch_id)
-            else:
-                action = self.call("orchestration", "worker-release", "--dispatch", dispatch_id)
-            dispatch_status = before["dispatch"]["status"]
-            worker_state = before["worker"]["state"]
-            terminal_resource = before.get("terminalResource") or {}
+            observation = self.call(
+                "orchestration", "worker-show", "--dispatch", dispatch_id
+            )["result"]
+        else:
+            shown = self.call("orchestration", "dispatch-show", "--task", task_id)[
+                "result"
+            ]
+            observation = {"dispatch": shown.get("dispatch") or shown}
+
+        # ==== STEP 1b. SETTLEMENT VERIFICATION ==============================
+        # Axis (a), proven from real Task/Dispatch provenance and proven HERE, above
+        # every lifecycle mutation. Both reads are read-only: STEP 1 already fetched
+        # the Dispatch row, and task_status() reads the same Task row STEP 4 accounts
+        # from -- it is read earlier now, not read twice. A dispatch that never
+        # settled leaves this method by raising, having issued zero lifecycle
+        # commands, and is recovered explicitly. The EXPECTED task id is handed in so
+        # the gate can compare both identities the guide names, not just the dispatch.
+        task_status = self.task_status(task_id)
+        try:
+            verified_status = self.verify_settlement(
+                dispatch_id,
+                task_id=task_id,
+                observation=observation,
+                done=done,
+                task_status=task_status,
+                supervised=supervised,
+            )
+        except OrcaRuntimeError as error:
+            # The STEP 0 claim is one-way and stays in place; record why it was
+            # refused so the recovery path finds a reason, not a bare stuck row.
+            self._ledger[dispatch_id]["unsettled_reason"] = str(error)
+            raise
+
+        # ==== STEP 2. exactly one lifecycle mutation ========================
+        # The only place in settle_attempt that mutates lifecycle state. It is
+        # unreachable unless STEP 0 handed this dispatch to us AND STEP 1b proved the
+        # dispatch actually settled.
+        dispatch_status = verified_status
+        if supervised:
+            command = LIFECYCLE_TO_COMMAND[lifecycle]
+            action = self.call("orchestration", command, "--dispatch", dispatch_id)
+            worker_state = observation["worker"]["state"]
+            terminal_resource = observation.get("terminalResource") or {}
             terminal_state = terminal_resource.get("releaseState", "none")
             lifecycle_action = f"{lifecycle}:{action['result']['state']}"
         else:
-            shown = self.call("orchestration", "dispatch-show", "--task", task_id)["result"]
-            dispatch = shown.get("dispatch") or shown
-            dispatch_status = dispatch["status"]
             worker_state = "settled_external"
             terminal_state = (
                 "reused"
-                if lifecycle == "retain"
+                if lifecycle in {"retain", "reuse"}
                 else self.confirm_terminal_exit(terminal)
             )
-            lifecycle_action = "reuse:tracked-external" if lifecycle == "retain" else "release:natural-exit"
+            lifecycle_action = (
+                "reuse:tracked-external"
+                if lifecycle in {"retain", "reuse"}
+                else "release:natural-exit"
+            )
+            observation["terminalState"] = terminal_state
+
+        # ==== STEP 3. delivery ack ==========================================
         self._ack(delivery_id)
-        tasks = self.call("orchestration", "task-list", "--run", self.run_id)["result"]["tasks"]
-        task = next(item for item in tasks if item["id"] == task_id)
+        # Safe to index: STEP 1b proved this payload carries an explicit outcome from
+        # SETTLED_OUTCOMES, above the mutation, so this read can no longer be the
+        # first place a malformed worker_done is noticed.
         payload = json.loads(done["payload"])
-        return RuntimeAttempt(
+
+        # ==== STEP 4. axes + single-assignment finalization =================
+        # The single allowed upward role transition, applied only after axis (a) has
+        # confirmed a real completion for this dispatch.
+        self.demote_or_promote_role(
+            terminal,
+            self.ledger_terminal(terminal)["intended_role"],
+            settled=task_status == "completed",
+        )
+        axes = self.account_axes(
+            task_id,
+            dispatch_id,
+            terminal,
+            supervised=supervised,
+            observation=observation,
+            task_status=task_status,
+            lifecycle=lifecycle,
+        )
+        attempt = RuntimeAttempt(
             role=role,
             iteration=iteration,
             task_id=task_id,
             dispatch_id=dispatch_id,
             outcome=payload["outcome"],
-            task_status=task["status"],
+            task_status=task_status,
             dispatch_status=dispatch_status,
             worker_state=worker_state,
             terminal_state=terminal_state,
@@ -398,14 +1107,32 @@ class OrcaRuntimeHarness:
             worker_done_count=1,
             execution_path="supervised" if supervised else "tracked_external",
             body=done["body"],
+            settlement=axes[0],
+            worker_resource=axes[1],
+            process_liveness=axes[2],
+            cleanup_authority=axes[3],
+            terminal_role=axes[4],
+            finalizations=1,
         )
+        self.finalize_once(
+            dispatch_id,
+            attempt=attempt,
+            settlement=axes[0],
+            worker_resource=axes[1],
+            process_liveness=axes[2],
+            cleanup_authority=axes[3],
+            terminal_role=axes[4],
+        )
+        return attempt
 
-    def run_attempt(
+    def run_existing_task(
         self,
         role: str,
         iteration: int,
         mode: str,
+        task_id: str,
         *,
+        spec: str | None = None,
         findings: tuple[str, ...] = (),
         resolutions: dict[str, str] | None = None,
         ask_before: bool = False,
@@ -413,8 +1140,11 @@ class OrcaRuntimeHarness:
         terminal: str | None = None,
         max_dispatches: int = 1,
     ) -> tuple[RuntimeAttempt, str]:
-        spec = f"{role} iteration {iteration}: {mode}"
-        task_id = self.create_task(spec)
+        """Dispatch and settle a Task that already exists (the graph-first path).
+
+        Identical to run_attempt except that the Task is NOT created here.
+        """
+        spec = spec if spec is not None else f"{role} iteration {iteration}: {mode}"
         handle = terminal or self.create_fake_terminal(
             role,
             mode,
@@ -441,6 +1171,36 @@ class OrcaRuntimeHarness:
             handle,
         )
 
+    def run_attempt(
+        self,
+        role: str,
+        iteration: int,
+        mode: str,
+        *,
+        findings: tuple[str, ...] = (),
+        resolutions: dict[str, str] | None = None,
+        ask_before: bool = False,
+        lifecycle: str = "release",
+        terminal: str | None = None,
+        max_dispatches: int = 1,
+    ) -> tuple[RuntimeAttempt, str]:
+        """Unchanged signature, return type and behavior: create the Task, then run it."""
+        spec = f"{role} iteration {iteration}: {mode}"
+        task_id = self.create_task(spec)
+        return self.run_existing_task(
+            role,
+            iteration,
+            mode,
+            task_id,
+            spec=spec,
+            findings=findings,
+            resolutions=resolutions,
+            ask_before=ask_before,
+            lifecycle=lifecycle,
+            terminal=terminal,
+            max_dispatches=max_dispatches,
+        )
+
     def observe_unexpected_exit(
         self, role: str, iteration: int
     ) -> RuntimeAttempt:
@@ -449,7 +1209,18 @@ class OrcaRuntimeHarness:
         dispatch_id, supervised = self.start_worker(
             task_id, handle, f"{role} iteration {iteration}: unexpected exit"
         )
-        assert self.coordinator
+        assert self.run_owner
+        # Same STEP 0 gate as settle_attempt: this path also issues worker-abandon and
+        # worker-release, so no lifecycle mutation may run before the claim.
+        recorded = self.claim_settlement(
+            dispatch_id,
+            task_id=task_id,
+            terminal=handle,
+            role=role,
+            iteration=iteration,
+        )
+        if recorded is not None:
+            return recorded
         self.confirm_terminal_exit(handle)
         checkpoint = self._check()
         if checkpoint.get("messages"):
@@ -468,13 +1239,13 @@ class OrcaRuntimeHarness:
                 "--result",
                 json.dumps({"reason": "process_exited_without_worker_done"}),
                 "--from",
-                self.coordinator,
+                self.run_owner,
             )
             shown_result = self.call("orchestration", "dispatch-show", "--task", task_id)["result"]
             shown = {"dispatch": shown_result.get("dispatch") or shown_result}
             state = "outcome_unknown_external"
         recovery = "task-update:failed" if not supervised else "observed"
-        if supervised and state == "outcome_unknown":
+        if supervised and state in UNSETTLED_WORKER_STATES:
             recovery_result = self.call(
                 "orchestration", "worker-abandon", "--dispatch", dispatch_id
             )
@@ -488,7 +1259,20 @@ class OrcaRuntimeHarness:
             release_state = release["result"]["state"]
         tasks = self.call("orchestration", "task-list", "--run", self.run_id)["result"]["tasks"]
         task = next(item for item in tasks if item["id"] == task_id)
-        return RuntimeAttempt(
+        # No role promotion here: this dispatch never produced an accepted worker_done,
+        # so the terminal stays active_worker and therefore stays never-close.
+        observation = dict(shown)
+        observation["terminalState"] = "exited"
+        axes = self.account_axes(
+            task_id,
+            dispatch_id,
+            handle,
+            supervised=supervised,
+            observation=observation,
+            task_status=task["status"],
+            lifecycle="release",
+        )
+        attempt = RuntimeAttempt(
             role=role,
             iteration=iteration,
             task_id=task_id,
@@ -501,26 +1285,99 @@ class OrcaRuntimeHarness:
             lifecycle_action=f"{recovery};release:{release_state}",
             worker_done_count=0,
             execution_path="supervised" if supervised else "tracked_external",
+            settlement=axes[0],
+            worker_resource=axes[1],
+            process_liveness=axes[2],
+            cleanup_authority=axes[3],
+            terminal_role=axes[4],
+            finalizations=1,
         )
+        self.finalize_once(
+            dispatch_id,
+            attempt=attempt,
+            settlement=axes[0],
+            worker_resource=axes[1],
+            process_liveness=axes[2],
+            cleanup_authority=axes[3],
+            terminal_role=axes[4],
+        )
+        return attempt
 
     def finish(self, result: RuntimeScenarioResult) -> RuntimeScenarioResult:
-        assert self.run_id and self.coordinator
+        assert self.run_id and self.run_owner
         result.signals = list(self._signals)
+        result.run_owner_handle = self.run_owner
+        for handle, row in self._terminals.items():
+            row["policy_commands"] = self.lifecycle_commands(handle=handle)
+        result.ledger = [dict(row) for row in self._terminals.values()] + list(
+            result.ledger
+        )
+        # Derived from the real command log: "<group> <verb>", sorted and de-duplicated.
+        # Answers "what ran / what never ran", unlike lifecycle_commands() which counts.
+        result.commands_used = sorted(
+            {" ".join(command["command"][:2]) for command in self._raw}
+        )
+        teardown_receipt = self._teardown_fixture_terminal()
+        result.fixture_teardown = {**result.fixture_teardown, **teardown_receipt}
         snapshot = {
             "generatedAt": datetime.now(timezone.utc).isoformat(),
             "result": asdict(result),
             "run": self.call("orchestration", "run-show", "--id", self.run_id)["result"],
             "tasks": self.call("orchestration", "task-list", "--run", self.run_id)["result"],
             "commands": self._raw,
+            "fixtureTeardown": teardown_receipt,
         }
         path = self.artifact_dir / f"scenario-{result.scenario.lower()}.json"
         path.write_text(json.dumps(snapshot, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        self.call("terminal", "close", "--terminal", self.coordinator, allow_error=True)
-        self.coordinator = None
+        self.run_owner = None
         self.run_id = None
         self._raw = []
         self._signals = []
+        self._terminals = {}
+        self._ledger = {}
         return result
+
+    def _teardown_fixture_terminal(self, handle: str | None = None) -> dict[str, Any]:
+        """Fixture teardown, NOT the lifecycle policy.
+
+        The policy path (account_axes / settle_attempt / finalize_once) never closes
+        anything on the basis of self-creation; run_owner_fixture is a member of
+        NEVER_CLOSE_ROLES and always classifies as not_authorized / retained. This
+        method exists only so the harness reclaims the fixture terminal it created,
+        and it refuses loudly whenever the assumption that makes that safe fails.
+        """
+        target = handle or self.run_owner
+        if target is None:
+            return {"handle": None, "selfHandleGuard": "no-fixture"}
+        # GUARD 1 (first, and unconditional): never the caller's own terminal.
+        self_handle = os.environ.get(SELF_HANDLE_ENV)
+        if self_handle and target == self_handle:
+            raise OrcaRuntimeError("refusing to close the caller's own terminal")
+        # GUARD 2: the row must be the fixture we created ourselves.
+        row = self.ledger_terminal(target)
+        if row["role"] != "run_owner_fixture" or row["origin"] != "self_created":
+            raise OrcaRuntimeError(
+                f"refusing teardown of {target}: role={row['role']}"
+            )
+        # GUARD 3: the policy path must never have marked this handle closable.
+        if close_allowed(row["role"], row["origin"], True):
+            raise OrcaRuntimeError("policy path must never authorize the fixture terminal")
+        # Snapshot taken BEFORE the close, so it answers the question the ledger's
+        # own policy_commands column cannot: did anything close this handle before
+        # teardown reached it? An empty list here plus close="issued" is the proof
+        # that the only close in the whole run came from this method.
+        receipt = {
+            "handle": target,
+            "role": row["role"],
+            "origin": row["origin"],
+            "selfHandleGuard": "passed" if self_handle else "unset",
+            "policyCommandsBeforeTeardown": self.lifecycle_commands(handle=target),
+        }
+        self.call("terminal", "close", "--terminal", target, allow_error=True)
+        if target == self.run_owner:
+            self.run_owner = None
+        receipt["close"] = "issued"
+        return receipt
 
 
 def run_runtime_scenarios(artifact_dir: Path) -> list[RuntimeScenarioResult]:
@@ -539,7 +1396,7 @@ def run_runtime_scenarios(artifact_dir: Path) -> list[RuntimeScenarioResult]:
     run_id = harness.start_run("Step 4 Scenario B FAIL then PASS")
     worker, _ = harness.run_attempt("worker", 1, "complete")
     reviewer1, reviewer_terminal = harness.run_attempt(
-        "reviewer", 1, "fail,pass", findings=("R1",), lifecycle="retain", max_dispatches=2
+        "reviewer", 1, "fail,pass", findings=("R1",), lifecycle="reuse", max_dispatches=2
     )
     correction, _ = harness.run_attempt(
         "worker", 2, "correction", resolutions={"R1": "RESOLVED"}
@@ -571,4 +1428,84 @@ def run_runtime_scenarios(artifact_dir: Path) -> list[RuntimeScenarioResult]:
     reviewer = harness.observe_unexpected_exit("reviewer", 1)
     results.append(harness.finish(RuntimeScenarioResult("F", run_id, "ERROR", 1, [worker, reviewer], recovery=[reviewer.lifecycle_action])))
 
+    results.append(_scenario_g(harness))
+    results.append(_scenario_h(harness))
+    results.append(_scenario_i(harness))
+
     return results
+
+
+def _scenario_g(harness: OrcaRuntimeHarness) -> RuntimeScenarioResult:
+    """Graph-first dependency promotion: no manual readiness override anywhere."""
+    run_id = harness.start_run("Step 4 Scenario G graph-first dependency promotion")
+    worker_task = harness.create_task("worker iteration 1: complete")
+    reviewer_task = harness.create_task(
+        "reviewer iteration 1: pass", deps=(worker_task,)
+    )
+    pending_status = harness.task_status(reviewer_task)
+    if pending_status != "pending":
+        raise OrcaRuntimeError(
+            f"reviewer task with an open dependency should be pending, got {pending_status}"
+        )
+    worker_attempt, _ = harness.run_existing_task("worker", 1, "complete", worker_task)
+    promoted_status = harness.task_status(reviewer_task)
+    if promoted_status != "ready":
+        raise OrcaRuntimeError(
+            "dependency completion did not promote the reviewer task to ready "
+            f"(status={promoted_status}); do not repair this with a manual override"
+        )
+    reviewer_attempt, _ = harness.run_existing_task(
+        "reviewer", 1, "pass", reviewer_task
+    )
+    if reviewer_attempt.task_id != reviewer_task:
+        raise OrcaRuntimeError(
+            "scenario G dispatched a different task than the promoted reviewer task"
+        )
+    result = RuntimeScenarioResult(
+        "G", run_id, "COMPLETED", 1, [worker_attempt, reviewer_attempt]
+    )
+    result.reviewer_task_id = reviewer_task
+    result.reviewer_task_status = promoted_status
+    return harness.finish(result)
+
+
+def _scenario_h(harness: OrcaRuntimeHarness) -> RuntimeScenarioResult:
+    """Negative control: a dependent created after settlement stays pending forever."""
+    run_id = harness.start_run("Step 4 Scenario H late dependent stays pending")
+    worker_task = harness.create_task("worker iteration 1: complete")
+    worker_attempt, _ = harness.run_existing_task("worker", 1, "complete", worker_task)
+    late_task = harness.create_task(
+        "reviewer iteration 1: pass (created too late)", deps=(worker_task,)
+    )
+    result = RuntimeScenarioResult("H", run_id, "COMPLETED", 1, [worker_attempt])
+    # Observation only: the late dependent is never dispatched.
+    result.late_dependent_status = harness.task_status(late_task)
+    return harness.finish(result)
+
+
+def _scenario_i(harness: OrcaRuntimeHarness) -> RuntimeScenarioResult:
+    """Never-close regression: self-created is not the same as closable."""
+    run_id = harness.start_run("Step 4 Scenario I never-close terminal roles")
+    worker_attempt, _ = harness.run_attempt("worker", 1, "complete")
+    result = RuntimeScenarioResult("I", run_id, "COMPLETED", 1, [worker_attempt])
+    # I-2: a simulated coordinator session row is classified without touching runtime.
+    result.ledger = [
+        harness.classify_terminal(
+            handle="term_simulated",
+            role="coordinator_session",
+            origin="self_created",
+            owned_by_this_dispatch=True,
+        )
+    ]
+    # I-3: the self-handle guard must refuse rather than close.
+    self_handle = os.environ.get(SELF_HANDLE_ENV)
+    if self_handle:
+        try:
+            harness._teardown_fixture_terminal(handle=self_handle)
+        except OrcaRuntimeError:
+            result.fixture_teardown = {"selfHandleProbe": "refused"}
+        else:
+            raise OrcaRuntimeError("self-handle guard did not fire")
+    else:
+        result.fixture_teardown = {"selfHandleProbe": "unset"}
+    return harness.finish(result)

@@ -24,6 +24,8 @@ Orca-native implementation of the same 2-agent development policy.
 - Requires real Run / Task / Dispatch provenance.
 - Loads version-matched guides with `skills get orchestration` and, when terminal control is needed, `skills get orca-cli`.
 - Uses supervised completion (`worker_done`/escalation/wait) according to the current Orca runtime contract.
+- Creates the phase Task graph before dispatching the Worker, so the Reviewer Task becomes ready through normal dependency promotion instead of a manual status override.
+- Accounts for every settled Dispatch on four separate axes — settlement, supervised worker-resource registration, residual process liveness, and cleanup authority — and finalizes each Dispatch exactly once.
 - Intended for comparison/PoC before deciding whether it should replace the direct-session loop.
 
 ## Shared Development Model
@@ -167,13 +169,20 @@ The validator uses only the Python standard library and validates both
 - identical shared `templates/` and `reviews/` content across both skills
 - absence of user-specific absolute paths
 - required error codes, test gates, and the `max-iterations` range
+- the orchestration-only lifecycle accounting contract block, including the never-close and close-eligible terminal role sets
 
 The command exits with status `0` when all checks pass and a non-zero status with
 actionable error messages when an inconsistency is found.
 
 The regression tests run the validator against disposable repository copies and
 verify that a valid repository passes while policy/prose drift, a missing required
-error code, and shared-template drift are rejected.
+error code, and shared-template drift are rejected. They also reject drift in the
+lifecycle accounting contract: a dropped `unsupervised` outcome, a routine
+force-ready policy, a missing custom-command placement step, a missing cleanup
+authority axis, a close gate that no longer requires a close-eligible terminal
+role, `coordinator_session` removed from the never-close roles, a finalization
+contract that no longer requires the gate to run before the lifecycle action, and
+the orchestration-only contract copied into the loop skill.
 
 The policy smoke tests load the identical `policy-contract` JSON embedded in both
 `SKILL.md` files and evaluate representative invocations without launching Orca
@@ -215,6 +224,12 @@ It tries supervised attachment first and, when the runtime classifies the custom
 fake executable as unrecognized, uses the guide's tracked-Dispatch plus terminal
 prompt fallback. One reviewer terminal is deliberately reused; all other fake
 processes exit after their settled attempt.
+Alongside the first-pass, FAIL loop, max-iteration, blocked, and unexpected-exit
+scenarios, the suite covers graph-first dependency promotion, a late-created
+dependent that stays pending, and the never-close terminal roles. The harness never
+closes a terminal from its lifecycle policy path; the only terminal it reclaims is
+the run-owner fixture it created itself, behind three guards that refuse loudly
+rather than close.
 Runtime-issued IDs and command receipts are written as diagnostic JSON artifacts;
 tests assert their structure and invariants rather than fixed identifier values.
 

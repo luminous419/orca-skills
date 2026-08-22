@@ -11,11 +11,26 @@ from pathlib import Path
 
 try:
     from scripts.orca_runtime_harness import (
+        CLEANUP_AUTHORITY_STATES,
+        CLOSE_ELIGIBLE_ROLES,
+        NEVER_CLOSE_ROLES,
+        TERMINAL_ROLE_CLASSES,
+        UNSETTLED_WORKER_STATES,
+        WORKER_RESOURCE_OUTCOMES,
         UnsupportedOrcaContract,
         run_runtime_scenarios,
     )
 except ModuleNotFoundError:
-    from orca_runtime_harness import UnsupportedOrcaContract, run_runtime_scenarios
+    from orca_runtime_harness import (
+        CLEANUP_AUTHORITY_STATES,
+        CLOSE_ELIGIBLE_ROLES,
+        NEVER_CLOSE_ROLES,
+        TERMINAL_ROLE_CLASSES,
+        UNSETTLED_WORKER_STATES,
+        WORKER_RESOURCE_OUTCOMES,
+        UnsupportedOrcaContract,
+        run_runtime_scenarios,
+    )
 
 
 RUN_ORCA = os.environ.get("ORCA_RUNTIME_TEST") == "1"
@@ -40,7 +55,7 @@ class OrcaRuntimeIntegrationTests(unittest.TestCase):
                     self.skipTest(str(exc))
 
         by_name = {result.scenario: result for result in results}
-        self.assertEqual(set(by_name), set("ABCDEF"))
+        self.assertEqual(set(by_name), set("ABCDEFGHI"))
 
         scenario_a = by_name["A"]
         self.assertEqual(scenario_a.status, "COMPLETED")
@@ -78,6 +93,11 @@ class OrcaRuntimeIntegrationTests(unittest.TestCase):
         self.assertEqual(len(scenario_f.attempts), 2)
         self.assertEqual(scenario_f.attempts[1].worker_done_count, 0)
 
+        self.assert_scenario_g(by_name["G"])
+        self.assert_scenario_h(by_name["H"])
+        self.assert_scenario_i(by_name["I"])
+        self.assert_placement_ladder(results)
+
         for result in results:
             self.assertTrue(result.run_id.startswith("run_"))
             for attempt in result.attempts:
@@ -85,10 +105,114 @@ class OrcaRuntimeIntegrationTests(unittest.TestCase):
                 self.assertTrue(attempt.dispatch_id.startswith("ctx_"))
                 if attempt.worker_done_count == 0:
                     self.assertIn(attempt.dispatch_status, {"dispatched", "failed"})
-                    self.assertIn("outcome_unknown", attempt.worker_state)
+                    # "ready" is the adopted-then-already-exited worker; the
+                    # "_external" suffix is the unsupervised branch's own label.
+                    self.assertTrue(
+                        attempt.worker_state in UNSETTLED_WORKER_STATES
+                        or attempt.worker_state.startswith("outcome_unknown"),
+                        f"unsettled dispatch reported {attempt.worker_state}",
+                    )
                 else:
                     self.assertIn(attempt.dispatch_status, {"completed", "failed"})
                 self.assertIn(attempt.task_status, {"completed", "failed", "blocked"})
+
+                self.assertEqual(attempt.finalizations, 1)
+                self.assertIn(attempt.worker_resource, set(WORKER_RESOURCE_OUTCOMES))
+                self.assertIn(attempt.cleanup_authority, CLEANUP_AUTHORITY_STATES)
+                self.assertIn(attempt.terminal_role, TERMINAL_ROLE_CLASSES)
+
+                # Domain assertions alone would accept a wrong-but-valid "authorized".
+                # Pin the actual relation between role and authority instead.
+                if attempt.terminal_role in NEVER_CLOSE_ROLES:
+                    self.assertNotEqual(attempt.cleanup_authority, "authorized")
+                if attempt.cleanup_authority == "authorized":
+                    self.assertIn(attempt.terminal_role, CLOSE_ELIGIBLE_ROLES)
+
+    def assert_placement_ladder(self, results) -> None:
+        """Rung 3's middle step really ran against the installed runtime.
+
+        The offline tests pin the order (create -> tui-idle -> worker-start); this is
+        the evidence that the real `terminal wait --for tui-idle` command was accepted
+        by Orca rather than only being asserted against a stub.
+        """
+        observed = set()
+        for result in results:
+            worker_rows = [
+                row
+                for row in result.ledger
+                if row["role"] != "run_owner_fixture" and row["created_by"]
+            ]
+            self.assertTrue(worker_rows, f"scenario {result.scenario} placed no worker")
+            for row in worker_rows:
+                self.assertIn(row["tui_idle"], {"idle", "timeout", "unobserved"})
+                observed.add(row["tui_idle"])
+            self.assertIn("terminal wait", result.commands_used)
+        # a run in which the wait was never even attempted would leave only the
+        # never-observed default behind
+        self.assertNotEqual(observed, {"unobserved"})
+
+    def assert_scenario_g(self, scenario_g) -> None:
+        """Graph-first promotion used the pre-created Reviewer Task, with no override."""
+        self.assertEqual(scenario_g.status, "COMPLETED")
+        self.assertEqual(len(scenario_g.attempts), 2)
+
+        # (1) the pre-created Reviewer Task became ready without a manual override
+        self.assertTrue(scenario_g.reviewer_task_id.startswith("task_"))
+        self.assertEqual(scenario_g.reviewer_task_status, "ready")
+
+        # (2) the very Task that was promoted is the one that was dispatched
+        reviewer_attempt = scenario_g.attempts[1]
+        self.assertEqual(reviewer_attempt.role, "reviewer")
+        self.assertEqual(reviewer_attempt.task_id, scenario_g.reviewer_task_id)
+        self.assertEqual(reviewer_attempt.task_status, "completed")
+        self.assertEqual(reviewer_attempt.outcome, "succeeded")
+        self.assertEqual(reviewer_attempt.finalizations, 1)
+        self.assertNotEqual(
+            reviewer_attempt.dispatch_id, scenario_g.attempts[0].dispatch_id
+        )
+
+        # (3) no force-ready command ran anywhere in Run G (real command log)
+        self.assertNotIn("orchestration task-update", scenario_g.commands_used)
+        self.assertNotIn("task-update:ready", scenario_g.recovery)
+
+    def assert_scenario_h(self, scenario_h) -> None:
+        """A dependent created after settlement stays pending; it is never dispatched."""
+        self.assertEqual(scenario_h.late_dependent_status, "pending")
+        self.assertEqual(scenario_h.attempts[0].task_status, "completed")
+
+    def assert_scenario_i(self, scenario_i) -> None:
+        """Self-created is not the same as closable."""
+        rows = {row["handle"]: row for row in scenario_i.ledger}
+
+        # I-1: the run-owner fixture is self-created BUT still not authorized
+        owner = rows[scenario_i.run_owner_handle]
+        self.assertEqual(owner["role"], "run_owner_fixture")
+        self.assertEqual(owner["origin"], "self_created")
+        self.assertEqual(owner["cleanup_authority"], "not_authorized")
+        self.assertEqual(owner["action"], "retained")
+        self.assertNotIn("close", owner["policy_commands"])
+        # The ledger snapshot above is taken before teardown, so on its own it cannot
+        # say whether the teardown path closed this handle. The receipt can: it lists
+        # the lifecycle commands seen for the handle immediately BEFORE the close.
+        self.assertEqual(
+            scenario_i.fixture_teardown["policyCommandsBeforeTeardown"], []
+        )
+        self.assertEqual(scenario_i.fixture_teardown["close"], "issued")
+
+        # I-2: a simulated coordinator_session row is never authorized either
+        simulated = rows["term_simulated"]
+        self.assertEqual(simulated["role"], "coordinator_session")
+        self.assertEqual(simulated["cleanup_authority"], "not_authorized")
+        self.assertEqual(simulated["action"], "retained")
+
+        # I-3: the self-handle guard refuses rather than closes
+        self.assertIn(
+            scenario_i.fixture_teardown["selfHandleProbe"], {"refused", "unset"}
+        )
+        self.assertEqual(scenario_i.fixture_teardown["role"], "run_owner_fixture")
+        self.assertIn(
+            scenario_i.fixture_teardown["selfHandleGuard"], {"passed", "unset"}
+        )
 
 
 def main() -> None:

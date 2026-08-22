@@ -74,6 +74,58 @@ SEMVER_PATTERN = re.compile(
     r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
 )
 
+LIFECYCLE_SKILL_DIR = REPO_ROOT / "orca-worker-reviewer-orchestration"
+
+LIFECYCLE_CONTRACT_BLOCK_PATTERN = re.compile(
+    r"####\s*Lifecycle accounting contract\s*\n(?P<body>.*?)```text\n(?P<values>.*?)\n```",
+    re.DOTALL,
+)
+LIFECYCLE_CONTRACT_LINE_PATTERN = re.compile(r"([A-Z][A-Z0-9_]*) = (.+)")
+LIFECYCLE_CONTRACT_TOKEN_PATTERN = re.compile(r"[a-z][a-z0-9_]*")
+
+LIFECYCLE_CONTRACT: dict[str, tuple[str, ...]] = {
+    "AXIS_A_SETTLEMENT": ("dispatch_and_task_provenance",),
+    "AXIS_B_WORKER_RESOURCE": ("supervised_worker_registry",),
+    "AXIS_C1_PROCESS_LIVENESS": ("terminal_inspection",),
+    "AXIS_C2_CLEANUP_AUTHORITY": ("launch_provenance_and_ownership",),
+    "LIFECYCLE_OUTCOMES": ("reuse", "retain", "release", "unsupervised"),
+    "CLEANUP_AUTHORITY_STATES": ("authorized", "not_authorized", "unknown"),
+    "TERMINAL_ROLE_CLASSES": (
+        "coordinator_session",
+        "setup_terminal",
+        "active_worker",
+        "external_or_adopted",
+        "phase_worker",
+        "phase_reviewer",
+        "unknown_role",
+    ),
+    "NEVER_CLOSE_TERMINAL_ROLES": (
+        "coordinator_session",
+        "setup_terminal",
+        "active_worker",
+        "external_or_adopted",
+        "unknown_role",
+    ),
+    "CLOSE_ELIGIBLE_TERMINAL_ROLES": ("phase_worker", "phase_reviewer"),
+    "CLOSE_ALLOWED_ONLY_WHEN": ("authorized_and_close_eligible_role",),
+    "DEFAULT_WHEN_NOT_AUTHORIZED": ("retain_and_report",),
+    "FINALIZATION_PER_DISPATCH": (
+        "exactly_once",
+        "gate_before_lifecycle_action",
+        "settlement_verified_before_lifecycle_action",
+    ),
+    "TASK_GRAPH_ORDERING": ("create_graph_before_worker_dispatch",),
+    "FORCE_READY_USE": ("recovery_only",),
+    "CUSTOM_COMMAND_PLACEMENT_ORDER": (
+        "worker_start_agent",
+        "terminal_create_then_tui_idle_then_worker_start_terminal",
+        "dispatch_inject",
+    ),
+}
+
+LIFECYCLE_AXIS_LABELS = ("(a)", "(b)", "(c1)", "(c2)")
+LIFECYCLE_CONTRACT_MAX_LINES = 15
+
 
 class Validation:
     def __init__(self) -> None:
@@ -444,6 +496,137 @@ def validate_machine_readable_contracts(validation: Validation) -> None:
         )
 
 
+def parse_lifecycle_contract(skill_text: str) -> dict[str, tuple[str, ...]] | None:
+    """Parse the section 6 anchor block into {KEY: (value, ...)}.
+
+    Returns None when the block is absent or violates the format rules; the caller
+    turns that single condition into one diagnostic instead of many derived ones.
+    """
+    match = LIFECYCLE_CONTRACT_BLOCK_PATTERN.search(skill_text)
+    if match is None:
+        return None
+    parsed: dict[str, tuple[str, ...]] = {}
+    for line in match.group("values").splitlines():
+        line_match = LIFECYCLE_CONTRACT_LINE_PATTERN.fullmatch(line)
+        if line_match is None:
+            return None
+        key, raw = line_match.group(1), line_match.group(2)
+        if key in parsed:
+            return None
+        values = tuple(value.strip() for value in raw.split(","))
+        if not all(
+            LIFECYCLE_CONTRACT_TOKEN_PATTERN.fullmatch(value) for value in values
+        ):
+            return None
+        parsed[key] = values
+    return parsed
+
+
+def lifecycle_contract_block_lines(skill_text: str) -> int:
+    match = LIFECYCLE_CONTRACT_BLOCK_PATTERN.search(skill_text)
+    if match is None:
+        return 0
+    return len(match.group("values").splitlines())
+
+
+def validate_lifecycle_accounting_contract(validation: Validation) -> None:
+    """Orchestration-only section 6 lifecycle contract. Not shared with the loop skill."""
+    skill_path = LIFECYCLE_SKILL_DIR / "SKILL.md"
+    try:
+        skill_text = skill_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        validation.check(False, f"{LIFECYCLE_SKILL_DIR.name}: {exc}")
+        skill_text = ""
+
+    parsed = parse_lifecycle_contract(skill_text)
+    validation.check(
+        parsed is not None,
+        f"{LIFECYCLE_SKILL_DIR.name}: missing or malformed lifecycle accounting "
+        "contract block",
+    )
+    parsed = parsed or {}
+
+    validation.check(
+        set(parsed) == set(LIFECYCLE_CONTRACT),
+        f"{LIFECYCLE_SKILL_DIR.name}: lifecycle contract keys differ from the "
+        "validator source of truth",
+    )
+    validation.check(
+        parsed == LIFECYCLE_CONTRACT,
+        f"{LIFECYCLE_SKILL_DIR.name}: lifecycle contract values differ from the "
+        "validator source of truth",
+    )
+    validation.check(
+        0 < lifecycle_contract_block_lines(skill_text) <= LIFECYCLE_CONTRACT_MAX_LINES,
+        f"{LIFECYCLE_SKILL_DIR.name}: lifecycle contract block exceeds "
+        f"{LIFECYCLE_CONTRACT_MAX_LINES} lines",
+    )
+
+    section = extract_lifecycle_section(skill_text)
+    for label in LIFECYCLE_AXIS_LABELS:
+        validation.check(
+            label in section,
+            f"{LIFECYCLE_SKILL_DIR.name}: lifecycle prose is missing axis label "
+            f"{label}",
+        )
+    missing_outcomes = [
+        outcome
+        for outcome in LIFECYCLE_CONTRACT["LIFECYCLE_OUTCOMES"]
+        if outcome not in section
+    ]
+    validation.check(
+        not missing_outcomes,
+        f"{LIFECYCLE_SKILL_DIR.name}: lifecycle prose is missing outcome "
+        + ", ".join(missing_outcomes or ["-"]),
+    )
+
+    loop_skill = REPO_ROOT / "orca-worker-reviewer-loop" / "SKILL.md"
+    loop_text = loop_skill.read_text(encoding="utf-8") if loop_skill.is_file() else ""
+    validation.check(
+        parse_lifecycle_contract(loop_text) is None,
+        "orca-worker-reviewer-loop: must not contain the orchestration lifecycle "
+        "contract",
+    )
+
+    never_close = set(parsed.get("NEVER_CLOSE_TERMINAL_ROLES", ()))
+    close_eligible = set(parsed.get("CLOSE_ELIGIBLE_TERMINAL_ROLES", ()))
+    all_roles = set(parsed.get("TERMINAL_ROLE_CLASSES", ()))
+    expected_never_close = set(LIFECYCLE_CONTRACT["NEVER_CLOSE_TERMINAL_ROLES"])
+    validation.check(
+        never_close == expected_never_close,
+        "NEVER_CLOSE_TERMINAL_ROLES must contain exactly "
+        + ", ".join(sorted(expected_never_close)),
+    )
+    validation.check(
+        close_eligible == set(LIFECYCLE_CONTRACT["CLOSE_ELIGIBLE_TERMINAL_ROLES"]),
+        "CLOSE_ELIGIBLE_TERMINAL_ROLES must be exactly phase_worker, phase_reviewer",
+    )
+    validation.check(
+        bool(all_roles)
+        and not (never_close & close_eligible)
+        and (never_close | close_eligible) == all_roles,
+        "terminal role classes must partition into never-close and close-eligible",
+    )
+    validation.check(
+        parsed.get("CLOSE_ALLOWED_ONLY_WHEN")
+        == LIFECYCLE_CONTRACT["CLOSE_ALLOWED_ONLY_WHEN"],
+        "CLOSE_ALLOWED_ONLY_WHEN must require a close eligible terminal role",
+    )
+    validation.check(
+        "coordinator_session" in section,
+        f"{LIFECYCLE_SKILL_DIR.name}: lifecycle prose must name coordinator_session",
+    )
+
+
+def extract_lifecycle_section(skill_text: str) -> str:
+    """Return the body of section 6, where the lifecycle prose must live."""
+    start = skill_text.find("## 6. Orca-native Worker Placement")
+    if start == -1:
+        return ""
+    end = skill_text.find("\n## 7.", start)
+    return skill_text[start:] if end == -1 else skill_text[start:end]
+
+
 def validate_workflow_output_contracts(validation: Validation) -> None:
     contracts = []
     for skill_dir in SKILL_DIRS:
@@ -491,6 +674,7 @@ def main() -> int:
     validate_shared_directories(validation)
     validate_machine_readable_contracts(validation)
     validate_workflow_output_contracts(validation)
+    validate_lifecycle_accounting_contract(validation)
     validate_version(validation)
     validate_no_user_absolute_paths(validation)
 
