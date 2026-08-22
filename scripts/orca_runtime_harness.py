@@ -14,9 +14,19 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from scripts.task_context import build_reviewer_context, build_task_boundary
+    from scripts.task_context import (
+        build_reviewer_context,
+        build_task_boundary,
+        render_task_spec,
+        strip_task_context,
+    )
 except ModuleNotFoundError:  # direct `python3 scripts/...` execution
-    from task_context import build_reviewer_context, build_task_boundary
+    from task_context import (
+        build_reviewer_context,
+        build_task_boundary,
+        render_task_spec,
+        strip_task_context,
+    )
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -339,6 +349,67 @@ def worker_start_terminal_effect(worker_start_result: dict[str, Any]) -> str:
         if isinstance(effect, dict) and effect.get("kind") == "terminal":
             return str(effect.get("action") or "")
     return ""
+
+
+def dispatch_context(
+    role: str,
+    iteration: int,
+    mode: str,
+    *,
+    base_spec: str | None = None,
+    findings: tuple[str, ...] = (),
+    resolutions: dict[str, str] | None = None,
+) -> tuple[str, dict[str, str], dict[str, Any] | None]:
+    """The Task spec text an agent will actually receive, plus what went into it.
+
+    Returns (spec, boundary, reviewer_context). Every caller runs this BEFORE
+    `task-create` and BEFORE `worker-start`, which is the whole correction behind
+    FINAL-I1-MAJOR-1: the layer-1 boundary and the Reviewer's eight keys have to be
+    part of the dispatched input, not metadata assembled once the attempt is over.
+    Both agent-visible channels carry the same string -- the Task spec, which Orca
+    replays into the dispatch preamble, and the low-level `terminal send` prompt.
+
+    Nothing here can put an id in the payload: build_task_boundary has no such
+    parameter, and both ids are unknown at this point anyway. That is what makes
+    TASK_BOUNDARY_NEVER_CARRIED structural rather than a habit.
+
+    A module-level function, not a method, so it is not swept by the public-method
+    probe in the contract tests (same reason as worker_start_terminal_effect).
+    """
+    # Trimmed, not used raw: run_attempt renders once for task-create and hands the
+    # result back in, so an untrimmed base would quote a whole rendered block into
+    # the Reviewer's original_objective on the second pass.
+    base = strip_task_context(
+        base_spec if base_spec is not None else f"{role} iteration {iteration}: {mode}"
+    )
+    artifact_contract = f"artifacts/{role}-{iteration}"
+    boundary = build_task_boundary(
+        current_role="reviewer" if role.endswith("reviewer") else "worker",
+        current_phase=mode,
+        current_iteration=iteration,
+        artifact_contract=artifact_contract,
+        relevant_previous_findings=findings,
+    )
+    reviewer_context: dict[str, Any] | None = None
+    if role.endswith("reviewer"):
+        # Every value is derivable before the dispatch exists. The previous wiring
+        # fed this builder the attempt's own body and outcome, which is precisely why
+        # it could only ever run after settlement -- a Reviewer cannot be handed its
+        # own future answer as context.
+        reviewer_context = build_reviewer_context(
+            original_objective=base,
+            current_phase=mode,
+            approved_baseline=(),
+            current_delta=(artifact_contract,),
+            new_claims=(f"{role} iteration {iteration}: {mode}",),
+            previous_findings=tuple(
+                (finding, (resolutions or {}).get(finding, ""))
+                for finding in findings
+            ),
+            validation=(f"{role} iteration {iteration}",),
+            drill_down=("the repository working tree",),
+        )
+    return render_task_spec(base, boundary, reviewer_context), boundary, reviewer_context
 
 
 class OrcaRuntimeHarness:
@@ -1550,7 +1621,17 @@ class OrcaRuntimeHarness:
 
         Identical to run_attempt except that the Task is NOT created here.
         """
-        spec = spec if spec is not None else f"{role} iteration {iteration}: {mode}"
+        # Before the dispatch, not after it. `spec` is what start_worker sends on the
+        # low-level path and what a caller passes to task-create on the supervised
+        # one, so the boundary has to be inside it by the time either happens.
+        spec, boundary, reviewer_context = dispatch_context(
+            role,
+            iteration,
+            mode,
+            base_spec=spec,
+            findings=findings,
+            resolutions=resolutions,
+        )
         created_here = terminal is None
         handle = terminal or self.create_fake_terminal(
             role,
@@ -1580,35 +1661,14 @@ class OrcaRuntimeHarness:
         # task/dispatch identity, (c) the refreshed layer-1 boundary and (d) the
         # Reviewer delta context. RuntimeAttempt is a plain (non-frozen) dataclass, so
         # these are assigned after settlement rather than widening its constructor.
-        boundary = build_task_boundary(
-            current_role="reviewer" if role.endswith("reviewer") else "worker",
-            current_phase=mode,
-            current_iteration=iteration,
-            artifact_contract=f"artifacts/{role}-{iteration}",
-            relevant_previous_findings=findings,
-        )
+        # The two payloads are the objects that were rendered into `spec` above, not
+        # a second build: the record and the dispatched input cannot drift apart.
         attempt.terminal = handle
         attempt.terminal_created = created_here
         attempt.terminal_effect = self.ledger_terminal(handle)["terminal_effect"]
         attempt.task_boundary = tuple(sorted(boundary.items()))
-        if role.endswith("reviewer"):
-            attempt.reviewer_context_keys = tuple(
-                sorted(
-                    build_reviewer_context(
-                        original_objective=spec,
-                        current_phase=mode,
-                        approved_baseline=(),
-                        current_delta=(attempt.body,),
-                        new_claims=(attempt.outcome,),
-                        previous_findings=tuple(
-                            (finding, (resolutions or {}).get(finding, ""))
-                            for finding in findings
-                        ),
-                        validation=(attempt.task_status,),
-                        drill_down=(handle,),
-                    )
-                )
-            )
+        if reviewer_context is not None:
+            attempt.reviewer_context_keys = tuple(sorted(reviewer_context))
         return attempt, handle
 
     def run_attempt(
@@ -1625,7 +1685,12 @@ class OrcaRuntimeHarness:
         max_dispatches: int = 1,
     ) -> tuple[RuntimeAttempt, str]:
         """Unchanged signature, return type and behavior: create the Task, then run it."""
-        spec = f"{role} iteration {iteration}: {mode}"
+        # The Task spec is write-once, and on the supervised path it is the ONLY text
+        # the agent sees (Orca replays it into the preamble), so it is composed here
+        # rather than in run_existing_task, which meets an already-created Task.
+        spec, _, _ = dispatch_context(
+            role, iteration, mode, findings=findings, resolutions=resolutions
+        )
         task_id = self.create_task(spec)
         return self.run_existing_task(
             role,
@@ -1644,11 +1709,15 @@ class OrcaRuntimeHarness:
     def observe_unexpected_exit(
         self, role: str, iteration: int
     ) -> RuntimeAttempt:
-        task_id = self.create_task(f"{role} iteration {iteration}: unexpected exit")
-        handle = self.create_fake_terminal(role, "exit", iteration=iteration)
-        dispatch_id, supervised = self.start_worker(
-            task_id, handle, f"{role} iteration {iteration}: unexpected exit"
+        spec, _, _ = dispatch_context(
+            role,
+            iteration,
+            "exit",
+            base_spec=f"{role} iteration {iteration}: unexpected exit",
         )
+        task_id = self.create_task(spec)
+        handle = self.create_fake_terminal(role, "exit", iteration=iteration)
+        dispatch_id, supervised = self.start_worker(task_id, handle, spec)
         assert self.run_owner
         # Same STEP 0 gate as settle_attempt: this path also issues worker-abandon and
         # worker-release, so no lifecycle mutation may run before the claim.
@@ -2024,20 +2093,37 @@ def run_session_reuse_runtime_scenario(artifact_dir: Path) -> RuntimeScenarioRes
         # The mode is the fake agent's script ("complete"/"pass"), not the phase
         # name: a terminal is only created when the gate refuses the previous one,
         # and the agent must be given a script it actually knows.
+        # One rendered spec per attempt, handed to task-create AND to the dispatch:
+        # on the supervised path the Task spec is what Orca replays into the agent's
+        # preamble, so a boundary that is not in it never reaches the agent at all.
+        worker_spec, _, _ = dispatch_context(
+            "worker",
+            iteration,
+            "complete",
+            base_spec=f"worker iteration {iteration}: {phase}",
+        )
         worker, _ = harness.run_existing_task(
             "worker",
             iteration,
             "complete",
-            harness.create_task(f"worker iteration {iteration}: {phase}"),
+            harness.create_task(worker_spec),
+            spec=worker_spec,
             lifecycle="release" if last else "reuse",
             terminal=next_terminal(worker_previous, "worker"),
             max_dispatches=len(phases),
+        )
+        reviewer_spec, _, _ = dispatch_context(
+            "reviewer",
+            iteration,
+            "pass",
+            base_spec=f"reviewer iteration {iteration}: {phase}",
         )
         reviewer, _ = harness.run_existing_task(
             "reviewer",
             iteration,
             "pass",
-            harness.create_task(f"reviewer iteration {iteration}: {phase}"),
+            harness.create_task(reviewer_spec),
+            spec=reviewer_spec,
             lifecycle="release" if last else "reuse",
             terminal=next_terminal(reviewer_previous, "reviewer"),
             max_dispatches=len(phases),
@@ -2055,9 +2141,9 @@ def run_session_reuse_runtime_scenario(artifact_dir: Path) -> RuntimeScenarioRes
 def _scenario_g(harness: OrcaRuntimeHarness) -> RuntimeScenarioResult:
     """Graph-first dependency promotion: no manual readiness override anywhere."""
     run_id = harness.start_run("Step 4 Scenario G graph-first dependency promotion")
-    worker_task = harness.create_task("worker iteration 1: complete")
+    worker_task = harness.create_task(dispatch_context("worker", 1, "complete")[0])
     reviewer_task = harness.create_task(
-        "reviewer iteration 1: pass", deps=(worker_task,)
+        dispatch_context("reviewer", 1, "pass")[0], deps=(worker_task,)
     )
     pending_status = harness.task_status(reviewer_task)
     if pending_status != "pending":
@@ -2089,7 +2175,7 @@ def _scenario_g(harness: OrcaRuntimeHarness) -> RuntimeScenarioResult:
 def _scenario_h(harness: OrcaRuntimeHarness) -> RuntimeScenarioResult:
     """Negative control: a dependent created after settlement stays pending forever."""
     run_id = harness.start_run("Step 4 Scenario H late dependent stays pending")
-    worker_task = harness.create_task("worker iteration 1: complete")
+    worker_task = harness.create_task(dispatch_context("worker", 1, "complete")[0])
     worker_attempt, _ = harness.run_existing_task("worker", 1, "complete", worker_task)
     late_task = harness.create_task(
         "reviewer iteration 1: pass (created too late)", deps=(worker_task,)

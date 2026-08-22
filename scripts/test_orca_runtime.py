@@ -37,6 +37,19 @@ except ModuleNotFoundError:
         run_session_reuse_runtime_scenario,
     )
 
+try:
+    from scripts.task_context import (
+        BOUNDARY_RECEIPT_PREFIX,
+        TASK_BOUNDARY_KEYS,
+        parse_task_boundary,
+    )
+except ModuleNotFoundError:
+    from task_context import (
+        BOUNDARY_RECEIPT_PREFIX,
+        TASK_BOUNDARY_KEYS,
+        parse_task_boundary,
+    )
+
 
 RUN_ORCA = os.environ.get("ORCA_RUNTIME_TEST") == "1"
 ARTIFACT_DIR = os.environ.get("ORCA_RUNTIME_ARTIFACT_DIR")
@@ -433,6 +446,40 @@ class SessionReuseRuntimeIntegrationTests(unittest.TestCase):
         self.assertEqual(
             snapshot["result"]["terminal_creations"], result.terminal_creations
         )
+
+        # K-6 (FINAL-I1-MAJOR-1): the boundary in the DISPATCHED INPUT and in the
+        # agent's answer, read off the real runtime rather than off RuntimeAttempt.
+        # The Task spec is what Orca replays into the preamble, so a spec without a
+        # boundary is an agent that never received one, however complete the
+        # coordinator's own records look.
+        specs = [
+            row["command"][row["command"].index("--spec") + 1]
+            for row in snapshot["commands"]
+            if row["command"][:2] == ["orchestration", "task-create"]
+        ]
+        self.assertEqual(len(specs), self.PHASES * 2)
+        identities = {attempt.task_id for attempt in result.attempts} | {
+            attempt.dispatch_id for attempt in result.attempts
+        }
+        for spec in specs:
+            boundary = parse_task_boundary(spec)
+            self.assertEqual(
+                tuple(sorted(boundary)), tuple(sorted(TASK_BOUNDARY_KEYS))
+            )
+            # TASK_BOUNDARY_NEVER_CARRIED: no attempt's id, this one's included.
+            for identity in identities:
+                self.assertNotIn(identity, spec)
+        self.assertEqual(
+            sorted(int(parse_task_boundary(spec)["current_iteration"]) for spec in specs),
+            sorted(list(range(1, self.PHASES + 1)) * 2),
+        )
+        for attempt in result.attempts:
+            with self.subTest(dispatch=attempt.dispatch_id):
+                # The agent parsed the preamble it was handed and quoted it back.
+                self.assertIn(
+                    f"{BOUNDARY_RECEIPT_PREFIX}current_iteration: {attempt.iteration}",
+                    attempt.body,
+                )
 
 
 if __name__ == "__main__":

@@ -14,7 +14,11 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from scripts.task_context import build_reviewer_context, build_task_boundary
+from scripts.task_context import (
+    build_reviewer_context,
+    build_task_boundary,
+    render_task_spec,
+)
 from scripts.workflow_contract import (
     WorkflowOutputContract,
     load_workflow_output_contract,
@@ -469,6 +473,16 @@ class E2EHarness:
                 if iteration <= len(scenario.worker_resolutions)
                 else {}
             )
+            # Built BEFORE the command, and rendered INTO it: this harness has no
+            # Orca preamble to inject a Task spec, so --task-spec is the agent-visible
+            # payload, and the fake echoes a receipt parsed back out of it.
+            worker_boundary = build_task_boundary(
+                current_role="worker",
+                current_phase=self.phase,
+                current_iteration=iteration,
+                artifact_contract=f"artifacts/{self.phase.upper()}.md",
+                relevant_previous_findings=tuple(sorted(previous_blocking_findings)),
+            )
             worker_command = [
                 sys.executable,
                 str(SCRIPT_DIR / "fake_worker.py"),
@@ -484,23 +498,15 @@ class E2EHarness:
                 str(iteration),
                 "--resolutions-json",
                 json.dumps(resolutions, sort_keys=True),
+                "--task-spec",
+                render_task_spec(
+                    f"worker {self.phase} iteration {iteration}", worker_boundary
+                ),
             ]
             self._record_session(
                 "worker",
                 iteration,
-                task_boundary=tuple(
-                    sorted(
-                        build_task_boundary(
-                            current_role="worker",
-                            current_phase=self.phase,
-                            current_iteration=iteration,
-                            artifact_contract=f"artifacts/{self.phase.upper()}.md",
-                            relevant_previous_findings=tuple(
-                                sorted(previous_blocking_findings)
-                            ),
-                        ).items()
-                    )
-                ),
+                task_boundary=tuple(sorted(worker_boundary.items())),
             )
             worker = subprocess.run(
                 worker_command,
@@ -573,6 +579,26 @@ class E2EHarness:
                 if reviewer_index < len(scenario.reviewer_findings)
                 else ()
             )
+            reviewer_boundary = build_task_boundary(
+                current_role="reviewer",
+                current_phase=self.phase,
+                current_iteration=iteration,
+                artifact_contract=f"artifacts/REVIEW_{self.phase.upper()}.md",
+                relevant_previous_findings=tuple(sorted(previous_blocking_findings)),
+            )
+            reviewer_context = build_reviewer_context(
+                original_objective=f"e2e:{self.phase}",
+                current_phase=self.phase,
+                approved_baseline=(),
+                current_delta=(worker.stdout,),
+                new_claims=tuple(sorted(parsed_resolutions)),
+                previous_findings=tuple(
+                    (finding_id, parsed_resolutions.get(finding_id, ""))
+                    for finding_id in sorted(previous_blocking_findings)
+                ),
+                validation=(worker_status,),
+                drill_down=(str(self.workspace),),
+            )
             reviewer_command = [
                 sys.executable,
                 str(SCRIPT_DIR / "fake_reviewer.py"),
@@ -588,6 +614,12 @@ class E2EHarness:
                 str(iteration),
                 "--findings-json",
                 json.dumps(findings),
+                "--task-spec",
+                render_task_spec(
+                    f"reviewer {self.phase} iteration {iteration}",
+                    reviewer_boundary,
+                    reviewer_context,
+                ),
             ]
             if self.protected_artifacts:
                 reviewer_command.extend(
@@ -596,38 +628,8 @@ class E2EHarness:
             self._record_session(
                 "reviewer",
                 iteration,
-                task_boundary=tuple(
-                    sorted(
-                        build_task_boundary(
-                            current_role="reviewer",
-                            current_phase=self.phase,
-                            current_iteration=iteration,
-                            artifact_contract=(
-                                f"artifacts/REVIEW_{self.phase.upper()}.md"
-                            ),
-                            relevant_previous_findings=tuple(
-                                sorted(previous_blocking_findings)
-                            ),
-                        ).items()
-                    )
-                ),
-                reviewer_context_keys=tuple(
-                    sorted(
-                        build_reviewer_context(
-                            original_objective=f"e2e:{self.phase}",
-                            current_phase=self.phase,
-                            approved_baseline=(),
-                            current_delta=(worker.stdout,),
-                            new_claims=tuple(sorted(parsed_resolutions)),
-                            previous_findings=tuple(
-                                (finding_id, parsed_resolutions.get(finding_id, ""))
-                                for finding_id in sorted(previous_blocking_findings)
-                            ),
-                            validation=(worker_status,),
-                            drill_down=(str(self.workspace),),
-                        )
-                    )
-                ),
+                task_boundary=tuple(sorted(reviewer_boundary.items())),
+                reviewer_context_keys=tuple(sorted(reviewer_context)),
             )
             hashes_before = _hash_files(self.protected_artifacts)
             reviewer = subprocess.run(

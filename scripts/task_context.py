@@ -142,3 +142,164 @@ def build_reviewer_context(
         "validation": tuple(validation),
         "drill_down": (*mandate, *drill_down),
     }
+
+
+# ---- serialization: the boundary as the agent actually receives it --------------
+# A builder whose result only ever reaches the coordinator's own records has not
+# established a boundary; it has described one. These renderers put layer 1 (and the
+# Reviewer's eight keys) into the Task spec body itself -- the text Orca injects into
+# the dispatch preamble, and the text the low-level fallback sends verbatim -- so the
+# payload travels WITH the dispatch instead of being rebuilt afterwards for the log.
+TASK_BOUNDARY_SPEC_HEADER = "=== TASK BOUNDARY (layer 1) ==="
+TASK_BOUNDARY_SPEC_FOOTER = "=== END TASK BOUNDARY ==="
+REVIEWER_CONTEXT_SPEC_HEADER = "=== REVIEWER CONTEXT (delta-first) ==="
+REVIEWER_CONTEXT_SPEC_FOOTER = "=== END REVIEWER CONTEXT ==="
+# The last line of every rendered spec, and the agent's signal that the payload is
+# COMPLETE. A dispatch preamble arrives a line at a time; an agent that acts on the
+# first line of a multi-line spec races the injection that is still delivering it,
+# and the runtime fails the dispatch with "is not starting". One unambiguous
+# terminator is what makes "the whole boundary has arrived" checkable.
+TASK_SPEC_END_MARKER = "=== END TASK SPEC ==="
+# One line per key, so a rendered block stays greppable and a receipt can be parsed
+# back with str.split. Multi-value fields are joined with this separator; a value
+# that contains it round-trips wrong, which is why nothing here builds one.
+SPEC_VALUE_SEPARATOR = " || "
+
+
+def _render_value(value: Any) -> str:
+    """One line for one key, whatever shape the builders put in it."""
+    if isinstance(value, str):
+        return value.replace("\n", SPEC_VALUE_SEPARATOR)
+    if isinstance(value, tuple):
+        return SPEC_VALUE_SEPARATOR.join(
+            f"{item[0]} -> {item[1]}"
+            if isinstance(item, tuple)
+            else str(item).replace("\n", " ")
+            for item in value
+        )
+    return str(value)
+
+
+def strip_task_context(spec: str) -> str:
+    """The caller's own text, with any block a previous render appended removed.
+
+    The same base text is rendered twice on the run_attempt path -- once for
+    task-create and once inside run_existing_task -- so every consumer of "the
+    caller's text" has to agree on where it ends, or the second render quotes the
+    first one back into itself.
+    """
+    return spec.split(TASK_BOUNDARY_SPEC_HEADER)[0].rstrip()
+
+
+def render_task_spec(
+    base_spec: str,
+    boundary: dict[str, str],
+    reviewer_context: dict[str, Any] | None = None,
+) -> str:
+    """The Task spec body an agent is handed: the caller's text, then the boundary.
+
+    Idempotent on purpose. The same string has to reach `task-create --spec` (which
+    Orca replays into the preamble) and the low-level `terminal send` prompt, and the
+    two call sites are in different functions; rendering an already-rendered spec
+    therefore trims back to the caller's own text rather than stacking a second block.
+    """
+    body = strip_task_context(base_spec)
+    lines = [body, "", TASK_BOUNDARY_SPEC_HEADER]
+    # Fixed key order, and a KeyError rather than a blank line for a missing one: a
+    # boundary that cannot be rendered in full is not a boundary.
+    lines.extend(f"{key}: {_render_value(boundary[key])}" for key in TASK_BOUNDARY_KEYS)
+    lines.append(TASK_BOUNDARY_SPEC_FOOTER)
+    if reviewer_context is not None:
+        lines.append("")
+        lines.append(REVIEWER_CONTEXT_SPEC_HEADER)
+        lines.extend(
+            f"{key}: {_render_value(reviewer_context[key])}"
+            for key in REVIEWER_CONTEXT_KEYS
+        )
+        lines.append(REVIEWER_CONTEXT_SPEC_FOOTER)
+    lines.append(TASK_SPEC_END_MARKER)
+    return "\n".join(lines)
+
+
+def parse_task_boundary(text: str) -> dict[str, str]:
+    """Read a rendered layer-1 block back out of whatever text carries it.
+
+    The inverse of render_task_spec's first block, and the reason an agent can prove
+    what it received: it parses the preamble it was actually handed and echoes the
+    result. Raises TaskContextError when the block is absent or incomplete, so a
+    missing boundary reads as a failure rather than as an empty dict.
+    """
+    if TASK_BOUNDARY_SPEC_HEADER not in text:
+        raise TaskContextError("no task boundary block in the supplied text")
+    block = text.split(TASK_BOUNDARY_SPEC_HEADER, 1)[1].split(
+        TASK_BOUNDARY_SPEC_FOOTER, 1
+    )[0]
+    parsed: dict[str, str] = {}
+    for line in block.splitlines():
+        key, separator, value = line.partition(": ")
+        key = key.strip()
+        if key in TASK_BOUNDARY_KEYS:
+            parsed[key] = (
+                value.replace(SPEC_VALUE_SEPARATOR, "\n") if separator else ""
+            )
+        elif line.strip().rstrip(":") in TASK_BOUNDARY_KEYS:
+            parsed[line.strip().rstrip(":")] = ""
+    missing = [key for key in TASK_BOUNDARY_KEYS if key not in parsed]
+    if missing:
+        raise TaskContextError(f"task boundary block is missing {missing}")
+    return parsed
+
+
+# ---- the receipt: what the agent proves it received ------------------------------
+# The coordinator can show its command log to prove it SENT a boundary. Only the
+# agent can show it ARRIVED, and it can only show that by parsing the text it was
+# handed and quoting it back. Rendered here, next to the format it reads, so every
+# agent that echoes one echoes the same shape.
+BOUNDARY_RECEIPT_HEADING = "## Task Boundary Receipt"
+BOUNDARY_RECEIPT_PREFIX = "RECEIVED "
+REVIEWER_CONTEXT_RECEIPT_KEY = "reviewer_context_keys"
+
+
+def parse_reviewer_context_keys(text: str) -> tuple[str, ...]:
+    """Which of the eight Reviewer keys the supplied text actually carries.
+
+    Empty tuple when there is no Reviewer block at all -- a worker's Task spec has
+    none, and that absence is itself an assertion worth being able to make.
+    """
+    if REVIEWER_CONTEXT_SPEC_HEADER not in text:
+        return ()
+    block = text.split(REVIEWER_CONTEXT_SPEC_HEADER, 1)[1].split(
+        REVIEWER_CONTEXT_SPEC_FOOTER, 1
+    )[0]
+    present = {
+        line.partition(":")[0].strip()
+        for line in block.splitlines()
+        if line.partition(":")[1]
+    }
+    return tuple(key for key in REVIEWER_CONTEXT_KEYS if key in present)
+
+
+def render_boundary_receipt(text: str) -> str:
+    """The block an agent appends to its own report to prove what it was handed.
+
+    Returns "" when the supplied text carries no boundary, which is the honest answer
+    for a dispatch that predates this wiring. It never invents a receipt: every line
+    is read back out of the payload the agent received.
+    """
+    try:
+        boundary = parse_task_boundary(text)
+    except TaskContextError:
+        return ""
+    lines = [BOUNDARY_RECEIPT_HEADING]
+    lines.extend(
+        f"{BOUNDARY_RECEIPT_PREFIX}{key}: "
+        + boundary[key].replace("\n", SPEC_VALUE_SEPARATOR)
+        for key in TASK_BOUNDARY_KEYS
+    )
+    reviewer_keys = parse_reviewer_context_keys(text)
+    if reviewer_keys:
+        lines.append(
+            f"{BOUNDARY_RECEIPT_PREFIX}{REVIEWER_CONTEXT_RECEIPT_KEY}: "
+            + ", ".join(reviewer_keys)
+        )
+    return "\n" + "\n".join(lines) + "\n"

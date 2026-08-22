@@ -44,9 +44,19 @@ from scripts.orca_runtime_harness import (
     UnsupportedOrcaContract,
     cleanup_authority,
     close_allowed,
+    dispatch_context,
     validate_orca_contract,
 )
-from scripts.task_context import REVIEWER_CONTEXT_KEYS, TASK_BOUNDARY_KEYS
+from scripts.task_context import (
+    BOUNDARY_RECEIPT_PREFIX,
+    REVIEWER_CONTEXT_KEYS,
+    REVIEWER_CONTEXT_SPEC_HEADER,
+    REVIEWER_DRILL_DOWN_MANDATE,
+    TASK_BOUNDARY_KEYS,
+    TASK_BOUNDARY_SPEC_HEADER,
+    parse_task_boundary,
+    render_boundary_receipt,
+)
 
 # validate_skills.py imports its siblings by top-level module name, so scripts/ must be
 # importable before it can be loaded. `unittest discover -s scripts` already arranges
@@ -227,6 +237,43 @@ class SequentialTerminalExec(RecordingExec):
             self.commands.append(args)
             return 0, json.dumps({"ok": True, "result": {"terminal": {"handle": handle}}})
         return super().__call__(args)
+
+
+class EchoingTerminalExec(SequentialTerminalExec):
+    """SequentialTerminalExec that also plays the agent, and answers with its input.
+
+    It keeps the `--spec` text of every task-create and the `--text` of every
+    terminal send, and the worker_done body it hands back is the boundary receipt
+    parsed out of the spec that was dispatched FOR THAT TASK. That is the difference
+    the finding turned on: a coordinator can always show what it recorded, but only
+    an answer derived from the dispatched input can show what the agent received. A
+    boundary that never reached the Task spec has no receipt to echo, so the positive
+    test below fails at the assertion rather than passing on metadata.
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.specs: dict[str, str] = {}  # task id -> the spec it was created with
+        self.sent: list[str] = []  # every low-level `terminal send --text` payload
+
+    def __call__(self, args: tuple[str, ...]) -> tuple[int, str]:
+        args = tuple(args)
+        verb = args[1] if len(args) > 1 else args[0]
+        code, payload = super().__call__(args)
+        body = json.loads(payload)
+        result = body.get("result") or {}
+        if verb == "task-create" and "--spec" in args:
+            self.specs[result["task"]["id"]] = args[args.index("--spec") + 1]
+        elif verb == "send" and "--text" in args:
+            self.sent.append(args[args.index("--text") + 1])
+        elif verb == "check" and result.get("messages"):
+            for message in result["messages"]:
+                task_id = json.loads(message["payload"])["taskId"]
+                message["body"] = "ok" + render_boundary_receipt(
+                    self.specs.get(task_id, "")
+                )
+            return code, json.dumps(body)
+        return code, payload
 
 
 class OrcaRuntimeContractTests(unittest.TestCase):
@@ -2366,14 +2413,27 @@ class SameRoleSessionReuseTests(OfflineHarnessTestCase):
                     ),
                     dispatch_id=previous.dispatch_id,
                 )
+            attempt_findings = findings[index - 1] if index <= len(findings) else ()
+            # Composed once and handed to BOTH task-create and the dispatch, exactly
+            # as scenario K does it: the Task spec is the agent-visible payload on
+            # the supervised path, so a chain that skipped it here would be testing
+            # a wiring the runtime scenario does not have.
+            spec, _, _ = dispatch_context(
+                role,
+                index,
+                mode,
+                base_spec=f"{role} iteration {index}: {phase}",
+                findings=attempt_findings,
+            )
             attempt, _ = harness.run_existing_task(
                 role,
                 index,
                 mode,
-                harness.create_task(f"{role} iteration {index}: {phase}"),
+                harness.create_task(spec),
+                spec=spec,
                 lifecycle="release" if index == len(phases) else "reuse",
                 terminal=terminal,
-                findings=findings[index - 1] if index <= len(findings) else (),
+                findings=attempt_findings,
             )
             attempts.append(attempt)
             previous = attempt
@@ -2733,6 +2793,213 @@ class SameRoleSessionReuseTests(OfflineHarnessTestCase):
                 self.assertIn("drill_down", attempt.reviewer_context_keys)
         for attempt in worker_attempts:
             self.assertEqual(attempt.reviewer_context_keys, ())
+
+    # ---- FINAL-I1-MAJOR-1: the boundary in the DISPATCHED INPUT, not in the log ----
+
+    def test_the_dispatched_task_spec_carries_the_boundary_and_the_agent_echoes_it(
+        self,
+    ) -> None:
+        """The positive half of the correction, observed at the dispatch, not after.
+
+        Every assertion here reads one of two things: the `--spec` argument that
+        actually went out on task-create (the text Orca replays into the agent's
+        preamble), or the body the agent answered with, which EchoingTerminalExec
+        derives from that same spec. Neither is a RuntimeAttempt field. The previous
+        wiring built the boundary AFTER settle_attempt and stored it on the attempt,
+        which left both of these empty while every attempt-level assertion still
+        passed -- that is the gap this test closes.
+        """
+        recorder = EchoingTerminalExec()
+        harness = self.build(recorder)
+        phases = ("analysis", "plan", "design")
+
+        attempts = self.chain(recorder, harness, "worker", phases=phases)
+
+        # The session really is reused, so "the second attempt" is a second Task on a
+        # terminal that was never restarted -- the case the boundary exists for.
+        self.assertEqual(len({attempt.terminal for attempt in attempts}), 1)
+        self.assertEqual([a.terminal_created for a in attempts], [True, False, False])
+
+        for index, attempt in enumerate(attempts, start=1):
+            with self.subTest(iteration=index):
+                spec = recorder.specs[attempt.task_id]
+                self.assertIn(TASK_BOUNDARY_SPEC_HEADER, spec)
+                dispatched = parse_task_boundary(spec)
+                # All five keys, refreshed for THIS attempt, in the text that was sent.
+                self.assertEqual(
+                    tuple(sorted(dispatched)), tuple(sorted(TASK_BOUNDARY_KEYS))
+                )
+                self.assertEqual(dispatched["current_iteration"], str(index))
+                self.assertEqual(dispatched["current_role"], "worker")
+                # The instrumentation field records what was dispatched; it is not a
+                # second, independently built payload that could drift from it.
+                self.assertEqual(dispatched, dict(attempt.task_boundary))
+                # The agent's own receipt: proof of arrival, not of sending.
+                self.assertIn(
+                    f"{BOUNDARY_RECEIPT_PREFIX}current_iteration: {index}", attempt.body
+                )
+                self.assertIn(
+                    f"{BOUNDARY_RECEIPT_PREFIX}artifact_contract: "
+                    + dispatched["artifact_contract"],
+                    attempt.body,
+                )
+
+    def test_only_the_reviewer_spec_carries_the_delta_first_context(self) -> None:
+        """(d) of test N, moved onto the dispatched text.
+
+        The eight keys and the drill-down mandate have to be IN the Reviewer's Task
+        spec -- a mandate the reviewer never reads restricts nothing -- and they have
+        to be absent from the Worker's.
+        """
+        recorder = EchoingTerminalExec()
+        harness = self.build(recorder)
+        phases = ("analysis", "plan")
+
+        reviewer_attempts = self.chain(
+            recorder, harness, "reviewer", phases=phases, findings=(("R1",), ())
+        )
+        worker_attempts = self.chain(recorder, harness, "worker", phases=phases)
+
+        for attempt in reviewer_attempts:
+            with self.subTest(dispatch=attempt.dispatch_id):
+                spec = recorder.specs[attempt.task_id]
+                self.assertIn(REVIEWER_CONTEXT_SPEC_HEADER, spec)
+                for key in REVIEWER_CONTEXT_KEYS:
+                    self.assertIn(f"{key}:", spec)
+                self.assertIn(REVIEWER_DRILL_DOWN_MANDATE, spec)
+                self.assertIn(
+                    f"{BOUNDARY_RECEIPT_PREFIX}reviewer_context_keys", attempt.body
+                )
+        for attempt in worker_attempts:
+            with self.subTest(dispatch=attempt.dispatch_id):
+                spec = recorder.specs[attempt.task_id]
+                self.assertNotIn(REVIEWER_CONTEXT_SPEC_HEADER, spec)
+                self.assertNotIn(REVIEWER_DRILL_DOWN_MANDATE, spec)
+                self.assertNotIn("reviewer_context_keys", attempt.body)
+
+    def test_no_dispatched_spec_carries_a_previous_identity_or_a_carried_instruction(
+        self,
+    ) -> None:
+        """TASK_BOUNDARY_NEVER_CARRIED, proved at the string level on the real input.
+
+        The three forbidden values are previous_task_id, previous_dispatch_id and
+        unfinished_instruction. The first two are checked against the ids of every
+        OTHER attempt in the same reused session -- the only place a stale id could
+        realistically come from -- and then against the id prefixes outright, because
+        `task_`/`ctx_` cannot appear in a spec that was assembled before either id
+        existed. The third is checked as the "carry on where you left off" phrasing
+        SKILL.md section 9 forbids, which is the form an unfinished instruction takes.
+        """
+        recorder = EchoingTerminalExec()
+        harness = self.build(recorder)
+        phases = ("analysis", "plan", "design")
+
+        attempts = self.chain(
+            recorder,
+            harness,
+            "reviewer",
+            phases=phases,
+            findings=(("R1",), ("R1", "R2"), ()),
+        )
+
+        identities = {attempt.task_id for attempt in attempts} | {
+            attempt.dispatch_id for attempt in attempts
+        }
+        self.assertEqual(len(identities), 2 * len(attempts))  # all six are distinct
+        for attempt in attempts:
+            spec = recorder.specs[attempt.task_id]
+            with self.subTest(dispatch=attempt.dispatch_id):
+                # previous_task_id / previous_dispatch_id: not this attempt's either.
+                for identity in identities:
+                    self.assertNotIn(identity, spec)
+                    self.assertNotIn(identity, attempt.body)
+                for prefix in ("task_", "ctx_", "dcap_"):
+                    self.assertNotIn(prefix, spec)
+                # unfinished_instruction, in the shapes section 9 names.
+                for carried in (
+                    "continue",
+                    "where you left off",
+                    "still open",
+                    "unfinished",
+                    "remaining from",
+                    "as before",
+                ):
+                    self.assertNotIn(carried, spec.lower())
+
+    def test_the_low_level_fallback_prompt_carries_the_same_boundary(self) -> None:
+        """The other agent-visible channel: `terminal send`, not the Task spec.
+
+        On the supervised path Orca replays the Task spec into the preamble; on rung
+        4 the harness writes the prompt itself. Both have to carry the boundary, and
+        they have to carry the SAME one -- a fallback that dropped it would leave an
+        unconfigured agent working without a boundary and nothing would say so.
+        """
+        recorder = EchoingTerminalExec(
+            errors={"worker-start": {"code": "agent_unconfigured"}}
+        )
+        harness = self.build(recorder)
+        # The fallback takes its dispatch id from the `dispatch` verb, which the base
+        # recorder pins to ctx_1, so the delivery has to be armed with that same id.
+        self.arm(recorder, "ctx_1", "task_g")
+
+        attempt, _ = harness.run_attempt("worker", 1, "complete")
+
+        self.assertEqual(len(recorder.sent), 1)
+        prompt = recorder.sent[0]
+        self.assertIn(TASK_BOUNDARY_SPEC_HEADER, prompt)
+        self.assertEqual(
+            parse_task_boundary(prompt), parse_task_boundary(recorder.specs["task_g"])
+        )
+        self.assertEqual(parse_task_boundary(prompt), dict(attempt.task_boundary))
+
+    def test_rendering_a_spec_twice_produces_the_same_dispatched_text(self) -> None:
+        """run_attempt renders once for task-create and hands the result back in.
+
+        run_existing_task renders again -- it has to, because a caller that created
+        the Task itself passes only its own text -- so the two renders have to agree
+        exactly. If they did not, task-create and the dispatch prompt would carry
+        different boundaries, and the Reviewer's original_objective would quote a
+        whole rendered block back into itself.
+        """
+        once, boundary, context = dispatch_context("reviewer", 2, "pass", findings=("R1",))
+        twice, boundary_again, context_again = dispatch_context(
+            "reviewer", 2, "pass", base_spec=once, findings=("R1",)
+        )
+
+        self.assertEqual(once, twice)
+        self.assertEqual(boundary, boundary_again)
+        self.assertIsNotNone(context)
+        self.assertEqual(context, context_again)
+        self.assertNotIn(
+            TASK_BOUNDARY_SPEC_HEADER, str(context_again["original_objective"])
+        )
+
+    def test_the_boundary_is_rendered_before_the_task_and_the_dispatch_exist(
+        self,
+    ) -> None:
+        """Ordering, which is the defect itself: rendered first, or not at all.
+
+        FINAL-I1-MAJOR-1 was an ordering bug -- the builders ran after start_worker,
+        wait_for_done and settle_attempt had all returned, so nothing they produced
+        could possibly have been dispatched. Reading the command log is the direct
+        way to pin the order: the spec has to be complete by the time task-create
+        goes out, which is before any dispatch verb runs.
+        """
+        recorder = EchoingTerminalExec()
+        harness = self.build(recorder)
+        self.arm(recorder, "ctx_worker_1", "task_worker_1")
+
+        harness.run_attempt("worker", 1, "complete")
+
+        verbs = recorder.verbs
+        self.assertLess(verbs.index("task-create"), verbs.index("worker-start"))
+        self.assertIn(TASK_BOUNDARY_SPEC_HEADER, recorder.specs["task_worker_1"])
+        # And the ordering is structural, not incidental: dispatch_context is a pure
+        # function of the attempt's own arguments, so it cannot read a dispatch that
+        # does not exist yet.
+        parameters = inspect.signature(dispatch_context).parameters
+        self.assertNotIn("task_id", parameters)
+        self.assertNotIn("dispatch_id", parameters)
 
 
 class ReuseEligibilityTests(OfflineHarnessTestCase):

@@ -17,7 +17,14 @@ from scripts.e2e_harness import (
     WorkflowScenario,
     downstream_revalidation_set,
 )
-from scripts.task_context import REVIEWER_CONTEXT_KEYS, TASK_BOUNDARY_KEYS
+from scripts.task_context import (
+    BOUNDARY_RECEIPT_HEADING,
+    BOUNDARY_RECEIPT_PREFIX,
+    REVIEWER_CONTEXT_KEYS,
+    REVIEWER_CONTEXT_RECEIPT_KEY,
+    SPEC_VALUE_SEPARATOR,
+    TASK_BOUNDARY_KEYS,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -1585,6 +1592,55 @@ class SessionRecordingTests(unittest.TestCase):
                 self.assertNotEqual(
                     events[0].task_boundary, events[1].task_boundary
                 )
+
+    def test_each_agent_echoes_the_boundary_it_was_actually_handed(self) -> None:
+        """FINAL-I1-MAJOR-1, on this harness's own agent-visible channel.
+
+        E2EHarness has no Orca Task and no dispatch preamble, so the fake agents'
+        input is their argv: --task-spec carries the rendered boundary, and each fake
+        parses it back and prints a receipt. Asserting on the receipt in the agent's
+        stdout -- not on the SessionEvent the harness wrote for itself -- is what
+        distinguishes a boundary that was delivered from one that was only recorded.
+        """
+        result = self.run_phase(
+            FakeScenario(
+                ("complete", "complete"),
+                ("fail", "pass"),
+                reviewer_findings=(("R1",), ()),
+                worker_resolutions=({}, {"R1": "RESOLVED"}),
+            )
+        )
+
+        self.assertEqual(result.final_status, "COMPLETED")
+        for role, attempts in (
+            ("worker", result.worker_attempts),
+            ("reviewer", result.reviewer_attempts),
+        ):
+            events = [event for event in result.sessions if event.role == role]
+            # The session is reused, so attempt 2 is the interesting one: same agent,
+            # new Task, and it has to report the NEW iteration back.
+            self.assertEqual([event.created for event in events], [True, False])
+            for index, (event, attempt) in enumerate(zip(events, attempts), start=1):
+                with self.subTest(role=role, iteration=index):
+                    self.assertIn(BOUNDARY_RECEIPT_HEADING, attempt.output)
+                    for key, value in event.task_boundary:
+                        self.assertIn(
+                            f"{BOUNDARY_RECEIPT_PREFIX}{key}: "
+                            + value.replace("\n", SPEC_VALUE_SEPARATOR),
+                            attempt.output,
+                        )
+                    self.assertIn(
+                        f"{BOUNDARY_RECEIPT_PREFIX}current_iteration: {index}",
+                        attempt.output,
+                    )
+        # The eight delta-first keys reach the Reviewer and only the Reviewer.
+        self.assertIn(
+            f"{BOUNDARY_RECEIPT_PREFIX}{REVIEWER_CONTEXT_RECEIPT_KEY}",
+            result.reviewer_attempts[0].output,
+        )
+        self.assertNotIn(
+            REVIEWER_CONTEXT_RECEIPT_KEY, result.worker_attempts[0].output
+        )
 
     def test_the_fresh_policy_allocates_a_new_session_per_attempt(self) -> None:
         result = self.run_phase(

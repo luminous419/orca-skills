@@ -7,6 +7,12 @@ import argparse
 import json
 
 
+try:
+    from scripts.task_context import render_boundary_receipt
+except ModuleNotFoundError:  # run directly as scripts/fake_*.py
+    from task_context import render_boundary_receipt
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", required=True)
@@ -15,6 +21,10 @@ def main() -> int:
     parser.add_argument("--blocked-value", required=True)
     parser.add_argument("--iteration", type=int, required=True)
     parser.add_argument("--resolutions-json", default="{}")
+    # The dispatched Task spec, verbatim. This fake has no Orca preamble to read, so
+    # the spec is handed to it directly -- but it is still the agent's INPUT, and the
+    # receipt below is still parsed out of it rather than reconstructed.
+    parser.add_argument("--task-spec", default="")
     args = parser.parse_args()
 
     if args.mode == "exit":
@@ -35,6 +45,7 @@ def main() -> int:
         print("\n## Review Feedback Resolution")
         for finding_id, status in sorted(resolutions.items()):
             print(f"FINDING {finding_id}: {status}")
+    print(render_boundary_receipt(args.task_spec), end="")
     return 0
 
 
