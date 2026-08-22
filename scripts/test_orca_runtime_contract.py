@@ -42,19 +42,29 @@ from scripts.orca_runtime_harness import (
     RuntimeScenarioResult,
     WORKER_RESOURCE_OUTCOMES,
     UnsupportedOrcaContract,
+    SESSION_REUSE_OBJECTIVE,
+    WorkflowEvidence,
     cleanup_authority,
     close_allowed,
     dispatch_context,
+    run_session_reuse_runtime_scenario,
     validate_orca_contract,
 )
 from scripts.task_context import (
+    AGENT_MODES,
     BOUNDARY_RECEIPT_PREFIX,
+    CANONICAL_PHASES,
+    FINAL_REVIEW_PHASE,
     REVIEWER_CONTEXT_KEYS,
     REVIEWER_CONTEXT_SPEC_HEADER,
     REVIEWER_DRILL_DOWN_MANDATE,
     TASK_BOUNDARY_KEYS,
     TASK_BOUNDARY_SPEC_HEADER,
+    TaskContextError,
+    parse_reviewer_context,
+    parse_reviewer_context_keys,
     parse_task_boundary,
+    phase_artifact_contract,
     render_boundary_receipt,
 )
 
@@ -866,7 +876,7 @@ class UnexpectedExitSettlementTests(OfflineHarnessTestCase):
         recorder = RecordingExec(results=self.RESULTS)
         harness = self.build(recorder)
 
-        first = harness.observe_unexpected_exit("worker", 1)
+        first = harness.observe_unexpected_exit("worker", 1, phase="implementation")
 
         self.assertEqual(first.worker_done_count, 0)
         self.assertEqual(first.lifecycle_action, "abandon:abandoned;release:released")
@@ -878,7 +888,7 @@ class UnexpectedExitSettlementTests(OfflineHarnessTestCase):
         self.assertEqual(first.cleanup_authority, "not_authorized")
         self.assertEqual(first.finalizations, 1)
 
-        second = harness.observe_unexpected_exit("worker", 1)
+        second = harness.observe_unexpected_exit("worker", 1, phase="implementation")
 
         self.assertEqual(asdict(second), asdict(first))
         self.assertEqual(
@@ -904,7 +914,7 @@ class UnexpectedExitSettlementTests(OfflineHarnessTestCase):
         recorder = RecordingExec(results=results)
         harness = self.build(recorder)
 
-        attempt = harness.observe_unexpected_exit("worker", 1)
+        attempt = harness.observe_unexpected_exit("worker", 1, phase="implementation")
 
         self.assertEqual(attempt.worker_done_count, 0)
         self.assertEqual(attempt.settlement, "failed")
@@ -927,7 +937,7 @@ class UnexpectedExitSettlementTests(OfflineHarnessTestCase):
         harness = self.build(RecordingExec(results=results))
 
         with self.assertRaisesRegex(OrcaRuntimeError, "unexpected exit left worker"):
-            harness.observe_unexpected_exit("worker", 1)
+            harness.observe_unexpected_exit("worker", 1, phase="implementation")
 
 
 class AccountAxesTests(OfflineHarnessTestCase):
@@ -1669,7 +1679,7 @@ class SettlementOrderingTests(OfflineHarnessTestCase):
         recovering = RecordingExec(results=results)
         recovery_harness = self.build(recovering)
 
-        attempt = recovery_harness.observe_unexpected_exit("worker", 1)
+        attempt = recovery_harness.observe_unexpected_exit("worker", 1, phase="implementation")
 
         self.assertEqual(attempt.worker_done_count, 0)
         self.assertEqual(
@@ -2250,7 +2260,7 @@ class GraphFirstOrderingTests(OfflineHarnessTestCase):
         self.worker_terminal(harness)
 
         attempt, handle = harness.run_existing_task(
-            "reviewer", 1, "pass", "task_g", terminal="term_worker"
+            "reviewer", 1, "pass", "task_g", phase="implementation", terminal="term_worker"
         )
 
         self.assertEqual(handle, "term_worker")
@@ -2268,7 +2278,7 @@ class GraphFirstOrderingTests(OfflineHarnessTestCase):
         self.worker_terminal(harness)
 
         attempt, _ = harness.run_attempt(
-            "worker", 1, "complete", terminal="term_worker"
+            "worker", 1, "complete", phase="implementation", terminal="term_worker"
         )
 
         self.assertEqual(recorder.verbs.count("task-create"), 1)
@@ -2422,6 +2432,7 @@ class SameRoleSessionReuseTests(OfflineHarnessTestCase):
                 role,
                 index,
                 mode,
+                phase=phase,
                 base_spec=f"{role} iteration {index}: {phase}",
                 findings=attempt_findings,
             )
@@ -2430,6 +2441,7 @@ class SameRoleSessionReuseTests(OfflineHarnessTestCase):
                 index,
                 mode,
                 harness.create_task(spec),
+                phase=phase,
                 spec=spec,
                 lifecycle="release" if index == len(phases) else "reuse",
                 terminal=terminal,
@@ -2628,7 +2640,7 @@ class SameRoleSessionReuseTests(OfflineHarnessTestCase):
         )
         harness = self.build(recorder)
 
-        crashed = harness.observe_unexpected_exit("worker", 1)
+        crashed = harness.observe_unexpected_exit("worker", 1, phase="implementation")
         crashed_handle = crashed.terminal
 
         self.assertEqual(crashed.outcome, "unknown")
@@ -2659,6 +2671,7 @@ class SameRoleSessionReuseTests(OfflineHarnessTestCase):
             2,
             "complete",
             harness.create_task("worker iteration 2: complete"),
+            phase="implementation",
             lifecycle="release",
         )
 
@@ -2942,7 +2955,7 @@ class SameRoleSessionReuseTests(OfflineHarnessTestCase):
         # recorder pins to ctx_1, so the delivery has to be armed with that same id.
         self.arm(recorder, "ctx_1", "task_g")
 
-        attempt, _ = harness.run_attempt("worker", 1, "complete")
+        attempt, _ = harness.run_attempt("worker", 1, "complete", phase="implementation")
 
         self.assertEqual(len(recorder.sent), 1)
         prompt = recorder.sent[0]
@@ -2961,9 +2974,11 @@ class SameRoleSessionReuseTests(OfflineHarnessTestCase):
         different boundaries, and the Reviewer's original_objective would quote a
         whole rendered block back into itself.
         """
-        once, boundary, context = dispatch_context("reviewer", 2, "pass", findings=("R1",))
+        once, boundary, context = dispatch_context(
+            "reviewer", 2, "pass", phase="design", findings=("R1",)
+        )
         twice, boundary_again, context_again = dispatch_context(
-            "reviewer", 2, "pass", base_spec=once, findings=("R1",)
+            "reviewer", 2, "pass", phase="design", base_spec=once, findings=("R1",)
         )
 
         self.assertEqual(once, twice)
@@ -2989,7 +3004,7 @@ class SameRoleSessionReuseTests(OfflineHarnessTestCase):
         harness = self.build(recorder)
         self.arm(recorder, "ctx_worker_1", "task_worker_1")
 
-        harness.run_attempt("worker", 1, "complete")
+        harness.run_attempt("worker", 1, "complete", phase="implementation")
 
         verbs = recorder.verbs
         self.assertLess(verbs.index("task-create"), verbs.index("worker-start"))
@@ -3629,7 +3644,7 @@ class FinalReviewFreshnessTests(OfflineHarnessTestCase):
         self, recorder: SequentialTerminalExec, harness: OrcaRuntimeHarness
     ) -> tuple[RuntimeAttempt, str]:
         self.arm(recorder, "ctx_phase_reviewer")
-        return harness.run_attempt("reviewer", 1, "pass")
+        return harness.run_attempt("reviewer", 1, "pass", phase="implementation")
 
     def final_review_attempts(
         self,
@@ -3650,6 +3665,7 @@ class FinalReviewFreshnessTests(OfflineHarnessTestCase):
                     "reviewer",
                     index,
                     "pass" if index == count else "fail",
+                    phase=FINAL_REVIEW_PHASE,
                     findings=() if index == count else ("R1",),
                 )
             )
@@ -3841,6 +3857,7 @@ class FinalReviewFreshnessTests(OfflineHarnessTestCase):
                 "worker",
                 index,
                 "complete",
+                phase="implementation",
                 lifecycle="release" if index == 2 else "reuse",
                 terminal=terminal,
             )
@@ -4151,6 +4168,267 @@ class SessionReuseGateTests(OfflineHarnessTestCase):
         self.assertEqual(observation.worker_state, "")
         self.assertEqual(observation.release_state, "")
         self.assertEqual(observation.ownership_state, "")
+
+
+class ScenarioKExec(EchoingTerminalExec):
+    """Answers a whole scenario K run offline: five phases, two roles, ten dispatches.
+
+    EchoingTerminalExec has to be re-armed per attempt by the test that drives it,
+    which is exactly what a test of the SCENARIO cannot do -- re-arming from outside
+    would mean the test, not run_session_reuse_runtime_scenario(), decided what each
+    dispatch looked like. This recorder arms itself instead: `task-create` mints the
+    next Task id, `worker-start` mints the Dispatch id for the task it was given and
+    the matching worker_done, so the production function runs its own loop end to end
+    and the assertions read what IT dispatched.
+    """
+
+    TERMINAL_RESOURCE = {
+        "releaseState": "not_requested",
+        "ownershipState": "external",
+        "retainedReason": "external_terminal",
+    }
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.tasks = 0
+        self.dispatches = 0
+        self.results["run-create"] = {"run": {"id": "run_offline_k"}}
+        self.results["run-show"] = {"run": {"id": "run_offline_k"}}
+        self.results["worker-release"] = {"state": "released", "processAction": "none"}
+        self.results["worker-show"] = {
+            "dispatch": {"status": "completed", "completed_at": COMPLETED_AT},
+            "worker": {"state": "settled"},
+            "terminalResource": dict(self.TERMINAL_RESOURCE),
+        }
+
+    def __call__(self, args: tuple[str, ...]) -> tuple[int, str]:
+        args = tuple(args)
+        verb = args[1] if len(args) > 1 else args[0]
+        if verb == "task-create":
+            self.tasks += 1
+            task_id = f"task_k_{self.tasks}"
+            self.results["task-create"] = {"task": {"id": task_id}}
+            self.results["task-list"] = {
+                "tasks": [{"id": task_id, "status": "completed"}]
+            }
+        elif verb == "worker-start":
+            self.dispatches += 1
+            dispatch_id = f"ctx_k_{self.dispatches}"
+            task_id = args[args.index("--task") + 1]
+            self.results["worker-start"] = {
+                "dispatchId": dispatch_id,
+                "effects": [
+                    {
+                        "kind": "terminal",
+                        "action": "reused",
+                        "id": "term_agent",
+                        "role": "agent",
+                    }
+                ],
+            }
+            self.results["check"] = {
+                "deliveryId": f"dlv_{dispatch_id}",
+                "timedOut": False,
+                "messages": [
+                    {
+                        "id": f"msg_{dispatch_id}",
+                        "type": "worker_done",
+                        "payload": json.dumps(
+                            {
+                                "taskId": task_id,
+                                "dispatchId": dispatch_id,
+                                "outcome": "succeeded",
+                            }
+                        ),
+                        "body": "ok",
+                    }
+                ],
+            }
+        return super().__call__(args)
+
+
+class ScenarioKDispatchedPhaseTests(OfflineHarnessTestCase):
+    """PR #12 MAJOR-1: what the ten dispatched specs of scenario K actually SAY.
+
+    The pre-existing reuse tests read RuntimeAttempt -- the coordinator's own record
+    -- and the integration test checked that five boundary keys were present and that
+    current_iteration moved. Neither could see the defect: keys spelled correctly,
+    carrying `current_phase: complete`. These tests run the production scenario
+    function itself against a self-arming stub and then read the dispatched Task
+    specs back out of the command log, which is the text Orca replays into the
+    agent's preamble.
+    """
+
+    ROLE_SEQUENCE = ("worker", "reviewer")
+
+    def run_scenario(self) -> tuple[RuntimeScenarioResult, list[str]]:
+        """The real scenario K, offline, plus every spec it sent to task-create."""
+        recorder = ScenarioKExec()
+        # preflight is a runtime capability probe (orca status + two `skills get`
+        # subprocesses); it is not on the path under test, and stubbing it is what
+        # lets the rest of the function run untouched.
+        with patch.dict(environ, {"ORCA_CLI_COMMAND": "/opt/orca-dev"}), patch.object(
+            OrcaRuntimeHarness, "preflight", return_value={"executable": "/opt/orca-dev"}
+        ), patch.object(OrcaRuntimeHarness, "_exec_orca", recorder):
+            result = run_session_reuse_runtime_scenario(self.artifact_dir)
+        specs = [
+            command[command.index("--spec") + 1]
+            for command in recorder.commands
+            if command[:2] == ("orchestration", "task-create")
+        ]
+        return result, specs
+
+    def test_the_ten_dispatched_specs_carry_the_real_phase_sequence(self) -> None:
+        """(worker, reviewer) x (analysis..test), read off the dispatched payload."""
+        result, specs = self.run_scenario()
+
+        self.assertEqual(len(result.attempts), 2 * len(CANONICAL_PHASES))
+        self.assertEqual(len(specs), 2 * len(CANONICAL_PHASES))
+        boundaries = [parse_task_boundary(spec) for spec in specs]
+        self.assertEqual(
+            [(boundary["current_role"], boundary["current_phase"]) for boundary in boundaries],
+            [(role, phase) for phase in CANONICAL_PHASES for role in self.ROLE_SEQUENCE],
+        )
+        # The iteration axis still moves, and it is NOT what proves the phase axis:
+        # both would be satisfied by a boundary that said current_phase=complete.
+        self.assertEqual(
+            [int(boundary["current_iteration"]) for boundary in boundaries],
+            [index for index in range(1, len(CANONICAL_PHASES) + 1) for _ in self.ROLE_SEQUENCE],
+        )
+        # Each side's artifact contract is the one its phase names.
+        self.assertEqual(
+            [boundary["artifact_contract"] for boundary in boundaries],
+            [
+                phase_artifact_contract(role=role, phase=phase)
+                for phase in CANONICAL_PHASES
+                for role in self.ROLE_SEQUENCE
+            ],
+        )
+
+    def test_no_dispatched_spec_ever_carries_an_agent_mode_as_its_phase(self) -> None:
+        """The defect itself, stated as a negative over every spec and every mode.
+
+        Scenario K runs its worker with mode "complete" and its reviewer with mode
+        "pass"; both strings are still in the specs (the base line says so), so the
+        assertion is specifically about the current_phase VALUE, not about the text.
+        """
+        _, specs = self.run_scenario()
+
+        for spec in specs:
+            boundary = parse_task_boundary(spec)
+            with self.subTest(phase=boundary["current_phase"]):
+                self.assertNotIn(boundary["current_phase"], AGENT_MODES)
+                self.assertIn(boundary["current_phase"], CANONICAL_PHASES)
+        reviewer_specs = [spec for spec in specs if REVIEWER_CONTEXT_SPEC_HEADER in spec]
+        self.assertEqual(len(reviewer_specs), len(CANONICAL_PHASES))
+        for spec in reviewer_specs:
+            context = parse_reviewer_context(spec)
+            with self.subTest(phase=context["current_phase"]):
+                self.assertNotIn(context["current_phase"], AGENT_MODES)
+                self.assertEqual(
+                    context["current_phase"], parse_task_boundary(spec)["current_phase"]
+                )
+
+    def test_reviewer_context_references_real_workflow_evidence(self) -> None:
+        """baseline / delta / validation, checked against what the run really held.
+
+        The delta is the WORKER's artifact for the same phase (not the reviewer's own
+        output path), the baseline is exactly the artifacts whose phases already
+        passed, and validation quotes the settled outcome of the worker attempt this
+        review is about -- all of it available before the dispatch, none of it
+        derived from the fake agent's script.
+        """
+        result, specs = self.run_scenario()
+
+        reviewer_specs = [spec for spec in specs if REVIEWER_CONTEXT_SPEC_HEADER in spec]
+        worker_attempts = [
+            attempt for attempt in result.attempts if attempt.role == "worker"
+        ]
+        for index, (phase, spec) in enumerate(zip(CANONICAL_PHASES, reviewer_specs)):
+            context = parse_reviewer_context(spec)
+            worker_artifact = phase_artifact_contract(role="worker", phase=phase)
+            with self.subTest(phase=phase):
+                self.assertEqual(context["current_delta"], worker_artifact)
+                self.assertEqual(
+                    context["approved_baseline"],
+                    " || ".join(
+                        phase_artifact_contract(role="worker", phase=earlier)
+                        for earlier in CANONICAL_PHASES[:index]
+                    ),
+                )
+                self.assertIn(worker_artifact, context["new_claims"])
+                self.assertIn(
+                    f"worker outcome={worker_attempts[index].outcome}",
+                    context["validation"],
+                )
+                self.assertEqual(context["original_objective"], SESSION_REUSE_OBJECTIVE)
+                self.assertIn(REVIEWER_DRILL_DOWN_MANDATE, context["drill_down"])
+        # And the worker specs carry no Reviewer block at all, before or after.
+        self.assertEqual(
+            [parse_reviewer_context_keys(spec) for spec in specs].count(()),
+            len(CANONICAL_PHASES),
+        )
+
+    def test_the_reuse_accounting_the_correction_had_to_preserve(self) -> None:
+        """Ten dispatches, two terminals, eight reuses -- unchanged by this wiring."""
+        result, _ = self.run_scenario()
+
+        self.assertEqual(result.terminal_creations, 2)
+        self.assertEqual(len({attempt.terminal for attempt in result.attempts}), 2)
+        self.assertEqual(
+            sum(1 for attempt in result.attempts if attempt.worker_resource == "reuse"),
+            8,
+        )
+        self.assertEqual(
+            len({attempt.dispatch_id for attempt in result.attempts}),
+            len(result.attempts),
+        )
+
+    def test_a_phase_is_required_and_an_agent_mode_is_not_one(self) -> None:
+        """Fail-closed, both ways, at the one function every dispatch goes through."""
+        with self.assertRaisesRegex(TaskContextError, "phase is required"):
+            dispatch_context("worker", 1, "complete")
+        for mode in ("complete", "pass", "fail", "exit"):
+            with self.subTest(mode=mode):
+                with self.assertRaisesRegex(TaskContextError, "agent mode"):
+                    dispatch_context("worker", 1, mode, phase=mode)
+        with self.assertRaisesRegex(TaskContextError, "unknown phase"):
+            dispatch_context("worker", 1, "complete", phase="whatever")
+        # ... and the same refusal reaches the methods that dispatch.
+        harness = self.build(ScenarioKExec())
+        with self.assertRaises(TaskContextError):
+            harness.run_attempt("worker", 1, "complete")
+        with self.assertRaises(TaskContextError):
+            harness.run_existing_task("worker", 1, "complete", "task_k_1")
+        with self.assertRaises(TaskContextError):
+            harness.observe_unexpected_exit("worker", 1)
+
+    def test_evidence_defaults_to_the_phase_artifact_rather_than_to_nothing(self) -> None:
+        """A caller with no evidence still gets a real reference, not a placeholder."""
+        spec, _, context = dispatch_context("reviewer", 1, "pass", phase="plan")
+
+        self.assertIsNotNone(context)
+        self.assertEqual(context["current_delta"], ("artifacts/PLAN.md",))
+        self.assertEqual(context["approved_baseline"], ())
+        self.assertEqual(parse_reviewer_context(spec)["current_delta"], "artifacts/PLAN.md")
+
+        with_evidence, _, evidenced = dispatch_context(
+            "reviewer",
+            2,
+            "pass",
+            phase="plan",
+            evidence=WorkflowEvidence(
+                original_objective="the run's own objective",
+                approved_baseline=("artifacts/ANALYSIS.md",),
+                current_delta=("artifacts/PLAN.md",),
+                new_claims=("PLAN.md section 4 rewritten",),
+                validation=("worker outcome=succeeded",),
+            ),
+        )
+        rendered = parse_reviewer_context(with_evidence)
+        self.assertEqual(evidenced["original_objective"], "the run's own objective")
+        self.assertEqual(rendered["approved_baseline"], "artifacts/ANALYSIS.md")
+        self.assertEqual(rendered["validation"], "worker outcome=succeeded")
 
 
 if __name__ == "__main__":

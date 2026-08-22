@@ -7,14 +7,21 @@ import inspect
 import unittest
 
 from scripts.task_context import (
+    AGENT_MODES,
+    CANONICAL_PHASES,
     DISPATCH_INJECTED_IDENTITY,
     REVIEWER_CONTEXT_KEYS,
     REVIEWER_DRILL_DOWN_MANDATE,
     REVIEWER_PRIOR_PASS_IS_NOT_EVIDENCE,
     TASK_BOUNDARY_KEYS,
+    WORKFLOW_PHASES,
     TaskContextError,
     build_reviewer_context,
     build_task_boundary,
+    parse_reviewer_context,
+    phase_artifact_contract,
+    render_task_spec,
+    require_workflow_phase,
 )
 
 
@@ -123,6 +130,32 @@ class ReviewerContextTests(unittest.TestCase):
         )
         self.assertEqual(context["previous_findings"], (("F1", "RESOLVED"),))
 
+    def test_the_rendered_block_reads_back_as_the_context_that_built_it(self) -> None:
+        """A payload nobody can read back is a claim, not a boundary."""
+        context = self.context(
+            approved_baseline=("artifacts/ANALYSIS.md",),
+            validation=("worker outcome=succeeded",),
+        )
+        spec = render_task_spec(
+            "worker implementation iteration 1",
+            build_task_boundary(
+                current_role="reviewer",
+                current_phase="implementation",
+                current_iteration=1,
+                artifact_contract="artifacts/REVIEW_IMPLEMENTATION.md",
+            ),
+            context,
+        )
+
+        parsed = parse_reviewer_context(spec)
+        self.assertEqual(tuple(sorted(parsed)), tuple(sorted(REVIEWER_CONTEXT_KEYS)))
+        self.assertEqual(parsed["current_phase"], "implementation")
+        self.assertEqual(parsed["approved_baseline"], "artifacts/ANALYSIS.md")
+        self.assertEqual(parsed["current_delta"], "scripts/task_context.py")
+        self.assertEqual(parsed["validation"], "worker outcome=succeeded")
+        with self.assertRaisesRegex(TaskContextError, "no reviewer context block"):
+            parse_reviewer_context("a worker spec carries none")
+
     def test_drill_down_is_mandatory_in_two_distinguishable_ways(self) -> None:
         """Omitted is a TypeError; empty is a TaskContextError. R-4's code defence."""
         with self.assertRaises(TypeError):
@@ -131,6 +164,74 @@ class ReviewerContextTests(unittest.TestCase):
             )  # type: ignore[call-arg]
         with self.assertRaises(TaskContextError):
             self.context(drill_down=())
+
+
+class WorkflowPhaseTests(unittest.TestCase):
+    """PR #12 MAJOR-1: current_phase is the workflow axis, and only that axis.
+
+    The builders used to accept any non-empty string, which is how an agent's
+    behaviour script ("complete" / "pass") ended up in a dispatched Task boundary
+    with every key spelled correctly.
+    """
+
+    def test_every_canonical_phase_passes_and_every_agent_mode_is_refused(self) -> None:
+        for phase in WORKFLOW_PHASES:
+            with self.subTest(phase=phase):
+                self.assertEqual(require_workflow_phase(phase), phase)
+        for mode in sorted(AGENT_MODES):
+            with self.subTest(mode=mode):
+                with self.assertRaisesRegex(TaskContextError, "agent mode"):
+                    require_workflow_phase(mode)
+        # The two axes do not overlap, so refusing one can never refuse the other.
+        self.assertEqual(AGENT_MODES & set(WORKFLOW_PHASES), set())
+        self.assertEqual(WORKFLOW_PHASES[: len(CANONICAL_PHASES)], CANONICAL_PHASES)
+
+    def test_a_missing_or_unknown_phase_fails_closed(self) -> None:
+        """No silent fallback: the caller is told, not quietly given something else."""
+        for absent in (None, "", 0):
+            with self.subTest(value=absent):
+                with self.assertRaisesRegex(TaskContextError, "is required"):
+                    require_workflow_phase(absent)
+        with self.assertRaisesRegex(TaskContextError, "unknown current_phase"):
+            require_workflow_phase("almost-implementation")
+
+    def test_the_builders_refuse_an_agent_mode_as_a_phase(self) -> None:
+        with self.assertRaisesRegex(TaskContextError, "agent mode"):
+            build_task_boundary(
+                current_role="worker",
+                current_phase="complete",
+                current_iteration=1,
+                artifact_contract="artifacts/IMPLEMENTATION.md",
+            )
+        with self.assertRaisesRegex(TaskContextError, "agent mode"):
+            build_reviewer_context(
+                original_objective="make reuse safe",
+                current_phase="pass",
+                drill_down=("scripts/",),
+            )
+
+    def test_the_artifact_contract_is_derived_from_the_phase(self) -> None:
+        """A worker's deliverable and its reviewer's report, named by the same phase.
+
+        This is what lets a Reviewer's current_delta point at the WORKER's artifact
+        instead of at the reviewer's own output path.
+        """
+        self.assertEqual(
+            phase_artifact_contract(role="worker", phase="design"),
+            "artifacts/DESIGN.md",
+        )
+        self.assertEqual(
+            phase_artifact_contract(role="reviewer", phase="design"),
+            "artifacts/REVIEW_DESIGN.md",
+        )
+        self.assertEqual(
+            phase_artifact_contract(role="reviewer", phase="final_review"),
+            "artifacts/FINAL_REVIEW.md",
+        )
+        with self.assertRaisesRegex(TaskContextError, "agent mode"):
+            phase_artifact_contract(role="worker", phase="complete")
+        with self.assertRaisesRegex(TaskContextError, "unknown role"):
+            phase_artifact_contract(role="coordinator", phase="design")
 
 
 if __name__ == "__main__":

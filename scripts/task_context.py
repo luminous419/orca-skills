@@ -35,6 +35,28 @@ DISPATCH_INJECTED_IDENTITY = (
 
 TASK_BOUNDARY_ROLES = frozenset({"worker", "reviewer", "final_reviewer"})
 
+# ---- the phase axis, which is NOT the agent-mode axis -----------------------------
+# current_phase names a WORKFLOW STAGE. A fake agent's behaviour script ("complete",
+# "pass", "fail", "exit") names something else entirely, and PR #12 MAJOR-1 was
+# exactly that confusion reaching the dispatched payload: a boundary whose keys were
+# right and whose current_phase said "pass".
+#
+# The five canonical phases run in order; bugfix / refactoring are the specialized
+# phases SKILL.md allows a run to consist of (and that downstream revalidation never
+# lowers into); final_review is the adversarial gate that runs over a whole run.
+CANONICAL_PHASES = ("analysis", "plan", "design", "implementation", "test")
+SPECIALIZED_PHASES = ("bugfix", "refactoring")
+FINAL_REVIEW_PHASE = "final_review"
+WORKFLOW_PHASES = (*CANONICAL_PHASES, *SPECIALIZED_PHASES, FINAL_REVIEW_PHASE)
+
+# Named so the failure message can say WHICH axis the caller reached for. Membership
+# in WORKFLOW_PHASES already refuses every one of these; this set only buys the
+# caller an error that names the mistake instead of one that lists seven phases.
+AGENT_MODES = frozenset(
+    {"complete", "pass", "fail", "blocked", "exit", "correction", "ask", "done"}
+)
+
+
 REVIEWER_CONTEXT_KEYS = (
     "original_objective",
     "current_phase",
@@ -65,6 +87,51 @@ class TaskContextError(ValueError):
     """Raised when a context builder is asked to produce an incomplete payload."""
 
 
+def require_workflow_phase(current_phase: Any, *, field: str = "current_phase") -> str:
+    """The one gate every phase value passes through. Fail-closed, no fallback.
+
+    There is deliberately no "if we cannot tell, use X" branch: a missing phase and an
+    unknown phase both raise, because the only fallback anyone ever reaches for here
+    is the agent mode that happens to be in scope, which is the defect itself.
+    """
+    if not current_phase:
+        raise TaskContextError(
+            f"{field} is required and must be one of {list(WORKFLOW_PHASES)}; "
+            "there is no fallback -- an agent mode is not a phase"
+        )
+    if current_phase in AGENT_MODES:
+        raise TaskContextError(
+            f"{field}={current_phase!r} is an agent mode, not a workflow phase; "
+            f"pass one of {list(WORKFLOW_PHASES)}"
+        )
+    if current_phase not in WORKFLOW_PHASES:
+        raise TaskContextError(
+            f"unknown {field}: {current_phase!r}; expected one of "
+            f"{list(WORKFLOW_PHASES)}"
+        )
+    return str(current_phase)
+
+
+def phase_artifact_contract(*, role: str, phase: str) -> str:
+    """The artifact this (role, phase) pair is contracted to produce.
+
+    The same spelling both harnesses already use, in one place instead of two:
+    e2e_harness builds "artifacts/{PHASE}.md" for a worker and
+    "artifacts/REVIEW_{PHASE}.md" for its reviewer. A path built from the phase is
+    what makes a Reviewer's current_delta a reference to the WORKER's deliverable
+    rather than to the reviewer's own future output.
+    """
+    if role not in TASK_BOUNDARY_ROLES:
+        raise TaskContextError(f"unknown role: {role!r}")
+    phase = require_workflow_phase(phase, field="phase")
+    if phase == FINAL_REVIEW_PHASE:
+        # One artifact for the gate itself, whichever side is asking about it.
+        return "artifacts/FINAL_REVIEW.md"
+    if role == "worker":
+        return f"artifacts/{phase.upper()}.md"
+    return f"artifacts/REVIEW_{phase.upper()}.md"
+
+
 def build_task_boundary(
     *,
     current_role: str,
@@ -81,8 +148,7 @@ def build_task_boundary(
     """
     if current_role not in TASK_BOUNDARY_ROLES:
         raise TaskContextError(f"unknown current_role: {current_role!r}")
-    if not current_phase:
-        raise TaskContextError("current_phase is required")
+    current_phase = require_workflow_phase(current_phase)
     if current_iteration < 1:
         raise TaskContextError(
             f"current_iteration must be >= 1, got {current_iteration!r}"
@@ -123,8 +189,7 @@ def build_reviewer_context(
         )
     if not original_objective:
         raise TaskContextError("original_objective is required")
-    if not current_phase:
-        raise TaskContextError("current_phase is required")
+    current_phase = require_workflow_phase(current_phase)
     mandate: tuple[str, ...] = (REVIEWER_DRILL_DOWN_MANDATE,)
     if previous_findings:
         # Correction re-review: the finding -> resolution map comes first, and the
@@ -277,6 +342,35 @@ def parse_reviewer_context_keys(text: str) -> tuple[str, ...]:
         if line.partition(":")[1]
     }
     return tuple(key for key in REVIEWER_CONTEXT_KEYS if key in present)
+
+
+def parse_reviewer_context(text: str) -> dict[str, str]:
+    """Read a rendered Reviewer block back out of whatever text carries it.
+
+    The counterpart of parse_task_boundary for layer 2, and for the same reason: the
+    only way to check what a Reviewer was actually TOLD is to read the payload it was
+    handed. Multi-value fields come back as the rendered line, so a caller checks a
+    reference with `in` or splits on SPEC_VALUE_SEPARATOR. Raises when the block is
+    absent or incomplete -- parse_reviewer_context_keys is the total function for
+    "which keys are here", including the worker's answer of none.
+    """
+    if REVIEWER_CONTEXT_SPEC_HEADER not in text:
+        raise TaskContextError("no reviewer context block in the supplied text")
+    block = text.split(REVIEWER_CONTEXT_SPEC_HEADER, 1)[1].split(
+        REVIEWER_CONTEXT_SPEC_FOOTER, 1
+    )[0]
+    parsed: dict[str, str] = {}
+    for line in block.splitlines():
+        key, separator, value = line.partition(": ")
+        key = key.strip()
+        if key in REVIEWER_CONTEXT_KEYS:
+            parsed[key] = value if separator else ""
+        elif line.strip().rstrip(":") in REVIEWER_CONTEXT_KEYS:
+            parsed[line.strip().rstrip(":")] = ""
+    missing = [key for key in REVIEWER_CONTEXT_KEYS if key not in parsed]
+    if missing:
+        raise TaskContextError(f"reviewer context block is missing {missing}")
+    return parsed
 
 
 def render_boundary_receipt(text: str) -> str:

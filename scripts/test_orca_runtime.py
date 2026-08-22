@@ -39,15 +39,23 @@ except ModuleNotFoundError:
 
 try:
     from scripts.task_context import (
+        AGENT_MODES,
         BOUNDARY_RECEIPT_PREFIX,
+        CANONICAL_PHASES,
         TASK_BOUNDARY_KEYS,
+        parse_reviewer_context,
         parse_task_boundary,
+        phase_artifact_contract,
     )
 except ModuleNotFoundError:
     from task_context import (
+        AGENT_MODES,
         BOUNDARY_RECEIPT_PREFIX,
+        CANONICAL_PHASES,
         TASK_BOUNDARY_KEYS,
+        parse_reviewer_context,
         parse_task_boundary,
+        phase_artifact_contract,
     )
 
 
@@ -473,6 +481,67 @@ class SessionReuseRuntimeIntegrationTests(unittest.TestCase):
             sorted(int(parse_task_boundary(spec)["current_iteration"]) for spec in specs),
             sorted(list(range(1, self.PHASES + 1)) * 2),
         )
+
+        # K-7 (PR #12 MAJOR-1): the iteration axis moving is not evidence that the
+        # PHASE axis is right -- a boundary saying current_phase=complete satisfies
+        # everything above. So the ten dispatched specs are checked against the exact
+        # (role, phase) sequence the run performed, on the runtime path, and against
+        # the artifact each pair is contracted to produce.
+        boundaries = [parse_task_boundary(spec) for spec in specs]
+        self.assertEqual(
+            [
+                (boundary["current_role"], boundary["current_phase"])
+                for boundary in boundaries
+            ],
+            [
+                (role, phase)
+                for phase in CANONICAL_PHASES[: self.PHASES]
+                for role in ("worker", "reviewer")
+            ],
+        )
+        self.assertEqual(
+            [boundary["artifact_contract"] for boundary in boundaries],
+            [
+                phase_artifact_contract(role=role, phase=phase)
+                for phase in CANONICAL_PHASES[: self.PHASES]
+                for role in ("worker", "reviewer")
+            ],
+        )
+        for boundary in boundaries:
+            with self.subTest(phase=boundary["current_phase"]):
+                # The agent modes scenario K runs its fake agents with.
+                self.assertNotIn(boundary["current_phase"], AGENT_MODES)
+        # K-8: the Reviewer's delta-first context references the artifacts this run
+        # really produced and approved, not a placeholder shaped like one.
+        reviewer_specs = [
+            spec for spec in specs if parse_task_boundary(spec)["current_role"] == "reviewer"
+        ]
+        self.assertEqual(len(reviewer_specs), self.PHASES)
+        for index, spec in enumerate(reviewer_specs):
+            phase = CANONICAL_PHASES[index]
+            context = parse_reviewer_context(spec)
+            with self.subTest(phase=phase):
+                self.assertEqual(context["current_phase"], phase)
+                self.assertEqual(
+                    context["current_delta"],
+                    phase_artifact_contract(role="worker", phase=phase),
+                )
+                self.assertEqual(
+                    context["approved_baseline"],
+                    " || ".join(
+                        phase_artifact_contract(role="worker", phase=earlier)
+                        for earlier in CANONICAL_PHASES[:index]
+                    ),
+                )
+                self.assertIn("worker outcome=succeeded", context["validation"])
+        for attempt in result.attempts:
+            with self.subTest(dispatch=attempt.dispatch_id):
+                # The phase reached the agent, not just the coordinator's log.
+                self.assertIn(
+                    f"{BOUNDARY_RECEIPT_PREFIX}current_phase: "
+                    f"{dict(attempt.task_boundary)['current_phase']}",
+                    attempt.body,
+                )
         for attempt in result.attempts:
             with self.subTest(dispatch=attempt.dispatch_id):
                 # The agent parsed the preamble it was handed and quoted it back.
