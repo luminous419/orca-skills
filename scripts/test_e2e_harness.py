@@ -11,10 +11,13 @@ from pathlib import Path
 from scripts.e2e_harness import E2EHarness, FakeScenario, WorkflowResult
 from scripts.e2e_harness import (
     FinalReviewScenario,
+    SESSION_AGENT_COMMANDS,
+    SessionEvent,
     WorkflowRunResult,
     WorkflowScenario,
     downstream_revalidation_set,
 )
+from scripts.task_context import REVIEWER_CONTEXT_KEYS, TASK_BOUNDARY_KEYS
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -282,6 +285,327 @@ class FakeAgentE2ETests(unittest.TestCase):
                 ]
                 self.assertEqual(results[0], results[1])
 
+class SessionStateMachineTests(unittest.TestCase):
+    """DESIGN section 7.1 C-1: S-R0..S-R7, called directly.
+
+    allocate_session()/invalidate_session() are the whole policy, so they get unit
+    tests that do not go through run(): a rule that only ever runs inside a workflow
+    is a rule whose boundaries nobody has looked at.
+    """
+
+    ORCHESTRATION_SKILL = (
+        REPO_ROOT / "orca-worker-reviewer-orchestration" / "SKILL.md"
+    )
+
+    def harness(self, *, session_policy: str = "reuse") -> E2EHarness:
+        temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary_directory.cleanup)
+        return E2EHarness(
+            self.ORCHESTRATION_SKILL,
+            phase="implementation",
+            max_iterations=5,
+            workspace=Path(temporary_directory.name),
+            session_policy=session_policy,
+        )
+
+    def test_final_review_always_gets_a_fresh_session_and_leaves_no_chain(self) -> None:
+        """S-R1: section 17's freshness rule, above the policy rather than inside it."""
+        harness = self.harness()
+
+        first_id, first_created = harness.allocate_session(
+            "final_review", "final_review", 1, policy="reuse"
+        )
+        second_id, second_created = harness.allocate_session(
+            "final_review", "final_review", 2, policy="reuse"
+        )
+
+        self.assertTrue(first_created)
+        self.assertTrue(second_created)
+        self.assertNotEqual(first_id, second_id)
+        # ... and nothing was remembered, so no later round can pick the chain up
+        self.assertNotIn("final_review", harness._session_ids)
+
+    def test_a_fresh_policy_allocates_a_new_session_every_round(self) -> None:
+        """S-R2: the fallback is today's one-terminal-per-attempt behaviour."""
+        harness = self.harness(session_policy="fresh")
+
+        allocations = [
+            harness.allocate_session("worker", "implementation", round_, policy="fresh")
+            for round_ in (1, 2, 3)
+        ]
+
+        self.assertTrue(all(created for _, created in allocations))
+        self.assertEqual(len({session_id for session_id, _ in allocations}), 3)
+
+    def test_the_first_allocation_of_a_role_is_always_a_creation(self) -> None:
+        """S-R3: the boundary case -- there is no chain to continue yet."""
+        harness = self.harness()
+
+        for role in ("worker", "reviewer"):
+            with self.subTest(role=role):
+                self.assertNotIn(role, harness._session_ids)
+                session_id, created = harness.allocate_session(
+                    role, "implementation", 1, policy="reuse"
+                )
+                self.assertTrue(created)
+                self.assertEqual(harness._session_ids[role], session_id)
+
+    def test_a_reuse_policy_hands_the_same_session_to_the_next_same_role_round(
+        self,
+    ) -> None:
+        """S-R4: the second attempt is where reuse first actually happens."""
+        harness = self.harness()
+
+        first_id, first_created = harness.allocate_session(
+            "worker", "implementation", 1, policy="reuse"
+        )
+        second_id, second_created = harness.allocate_session(
+            "worker", "implementation", 2, policy="reuse"
+        )
+
+        self.assertTrue(first_created)
+        self.assertFalse(second_created)
+        self.assertEqual(first_id, second_id)
+
+    def test_worker_and_reviewer_session_ids_can_never_collide(self) -> None:
+        """S-R5: the chains are keyed by role, so a swap cannot be a reuse."""
+        harness = self.harness()
+
+        worker_ids = {
+            harness.allocate_session("worker", "implementation", round_, policy="reuse")[0]
+            for round_ in (1, 2, 3)
+        }
+        reviewer_ids = {
+            harness.allocate_session("reviewer", "implementation", round_, policy="reuse")[0]
+            for round_ in (1, 2, 3)
+        }
+
+        self.assertEqual(len(worker_ids), 1)
+        self.assertEqual(len(reviewer_ids), 1)
+        self.assertTrue(worker_ids.isdisjoint(reviewer_ids))
+
+    def test_correction_and_revalidation_rounds_continue_the_same_chain(self) -> None:
+        """S-R6: the chain keys on role alone, so a phase change does not break it."""
+        harness = self.harness()
+
+        initial, _ = harness.allocate_session("worker", "design", 1, policy="reuse")
+        correction, correction_created = harness.allocate_session(
+            "worker", "design", 2, policy="reuse"
+        )
+        revalidation, revalidation_created = harness.allocate_session(
+            "worker", "implementation", 1, policy="reuse"
+        )
+
+        self.assertEqual({initial, correction, revalidation}, {initial})
+        self.assertFalse(correction_created)
+        self.assertFalse(revalidation_created)
+
+    def test_a_failed_round_invalidates_that_roles_session(self) -> None:
+        """S-R7: a round that did not PASS leaves that role in recovery."""
+        harness = self.harness()
+        worker_id, _ = harness.allocate_session("worker", "design", 1, policy="reuse")
+        reviewer_id, _ = harness.allocate_session("reviewer", "design", 1, policy="reuse")
+
+        harness.invalidate_session("worker")
+
+        next_worker_id, next_created = harness.allocate_session(
+            "worker", "design", 2, policy="reuse"
+        )
+        next_reviewer_id, next_reviewer_created = harness.allocate_session(
+            "reviewer", "design", 2, policy="reuse"
+        )
+
+        self.assertTrue(next_created)
+        self.assertNotEqual(next_worker_id, worker_id)
+        # the other role's chain is untouched: invalidation is per role
+        self.assertFalse(next_reviewer_created)
+        self.assertEqual(next_reviewer_id, reviewer_id)
+
+
+class SessionLedgerTests(unittest.TestCase):
+    """DESIGN section 7.1 C-2: where the recorded events end up.
+
+    The three mutable session attributes are shared BY REFERENCE with every
+    _phase_harness() clone; if any of them were rebound per clone the events a phase
+    recorded would vanish when that phase returned.
+    """
+
+    ORCHESTRATION_SKILL = (
+        REPO_ROOT / "orca-worker-reviewer-orchestration" / "SKILL.md"
+    )
+    PASSING_PHASE = FakeScenario(("complete",), ("pass",))
+
+    def harness(self, *, session_policy: str = "reuse") -> E2EHarness:
+        temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary_directory.cleanup)
+        return E2EHarness(
+            self.ORCHESTRATION_SKILL,
+            phase="design",
+            max_iterations=5,
+            workspace=Path(temporary_directory.name),
+            session_policy=session_policy,
+        )
+
+    def test_sessions_accumulate_across_phase_clones(self) -> None:
+        parent = self.harness()
+
+        parent._record_session("worker", 1)
+        clone = parent._phase_harness("implementation", 3)
+        clone._record_session("worker", 1)
+
+        self.assertIs(parent.sessions, clone.sessions)
+        self.assertEqual(len(parent.sessions), 2)
+        self.assertEqual([event.phase for event in parent.sessions], ["design", "implementation"])
+        # the id chain survives the clone boundary too, which is the point of S-R6
+        self.assertEqual(len({event.session_id for event in parent.sessions}), 1)
+        self.assertEqual([event.created for event in parent.sessions], [True, False])
+
+    def test_workflow_run_result_carries_role_events_in_order(self) -> None:
+        scenario = WorkflowScenario(
+            phases=("design", "implementation"),
+            phase_scenarios={
+                "design": self.PASSING_PHASE,
+                "implementation": self.PASSING_PHASE,
+            },
+            final_review=FinalReviewScenario(modes=("pass",)),
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            harness = E2EHarness(
+                self.ORCHESTRATION_SKILL,
+                phase="implementation",
+                max_iterations=5,
+                workspace=Path(temporary_directory),
+            )
+            result = harness.run_workflow(scenario)
+
+        self.assertEqual(result.final_status, "COMPLETED")
+        self.assertEqual(
+            [event.role for event in result.sessions],
+            ["worker", "reviewer", "worker", "reviewer", "final_review"],
+        )
+        self.assertEqual(
+            [event.phase for event in result.sessions],
+            ["design", "design", "implementation", "implementation", "implementation"],
+        )
+        self.assertEqual(
+            [event.agent_command for event in result.sessions],
+            [
+                SESSION_AGENT_COMMANDS["worker"],
+                SESSION_AGENT_COMMANDS["reviewer"],
+                SESSION_AGENT_COMMANDS["worker"],
+                SESSION_AGENT_COMMANDS["reviewer"],
+                SESSION_AGENT_COMMANDS["final_review"],
+            ],
+        )
+
+
+class WorkflowSessionPolicyTests(unittest.TestCase):
+    """DESIGN section 7.1 C-3: the policy actually reaches allocation.
+
+    These drive `run_workflow` and never call allocate_session() themselves -- that
+    is the whole evidence that scenario -> E2EHarness.session_policy -> every
+    _phase_harness clone -> _record_session is really wired, and not just declared.
+    """
+
+    ORCHESTRATION_SKILL = (
+        REPO_ROOT / "orca-worker-reviewer-orchestration" / "SKILL.md"
+    )
+    PASSING_PHASE = FakeScenario(("complete",), ("pass",))
+
+    def correction_and_revalidation_scenario(
+        self, *, session_policy: str = "reuse"
+    ) -> WorkflowScenario:
+        """DESIGN -> FAIL at final review -> DESIGN correction -> IMPLEMENTATION revalidation."""
+        return WorkflowScenario(
+            phases=("design", "implementation"),
+            phase_scenarios={
+                "design": self.PASSING_PHASE,
+                "implementation": self.PASSING_PHASE,
+            },
+            final_review=FinalReviewScenario(
+                modes=("fail", "pass"),
+                findings=((("R1", "design"),), ()),
+            ),
+            correction_scenarios={
+                ("design", 1): FakeScenario(
+                    ("correction",),
+                    ("pass",),
+                    worker_resolutions=({"R1": "RESOLVED"},),
+                ),
+            },
+            revalidation_scenarios={("implementation", 1): self.PASSING_PHASE},
+            session_policy=session_policy,
+        )
+
+    def run_workflow_scenario(self, scenario: WorkflowScenario) -> WorkflowRunResult:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            harness = E2EHarness(
+                self.ORCHESTRATION_SKILL,
+                phase="implementation",
+                max_iterations=5,
+                workspace=Path(temporary_directory),
+            )
+            return harness.run_workflow(scenario)
+
+    def test_a_reuse_workflow_keeps_one_session_per_role_across_correction_and_revalidation(
+        self,
+    ) -> None:
+        result = self.run_workflow_scenario(self.correction_and_revalidation_scenario())
+
+        self.assertEqual(result.final_status, "COMPLETED")
+        self.assertEqual(result.correction_dispatches, [("design", 2)])
+        self.assertEqual(result.revalidation_dispatches, [("implementation", 2)])
+
+        for role in ("worker", "reviewer"):
+            events = [event for event in result.sessions if event.role == role]
+            with self.subTest(role=role):
+                self.assertGreater(len(events), 2)
+                self.assertEqual(len({event.session_id for event in events}), 1)
+                self.assertEqual(
+                    sum(1 for event in events if event.created), 1
+                )
+
+        final_review_events = [
+            event for event in result.sessions if event.role == "final_review"
+        ]
+        self.assertEqual(len(final_review_events), 2)
+        self.assertTrue(all(event.created for event in final_review_events))
+        chained_ids = {
+            event.session_id
+            for event in result.sessions
+            if event.role in {"worker", "reviewer"}
+        }
+        self.assertTrue(
+            {event.session_id for event in final_review_events}.isdisjoint(chained_ids)
+        )
+
+    def test_the_same_workflow_with_a_fresh_policy_allocates_a_session_per_attempt(
+        self,
+    ) -> None:
+        result = self.run_workflow_scenario(
+            self.correction_and_revalidation_scenario(session_policy="fresh")
+        )
+
+        self.assertEqual(result.final_status, "COMPLETED")
+        self.assertTrue(all(event.created for event in result.sessions))
+        self.assertEqual(
+            len({event.session_id for event in result.sessions}),
+            len(result.sessions),
+        )
+
+    def test_an_invalid_session_policy_is_refused_before_the_first_phase_clone(
+        self,
+    ) -> None:
+        result = self.run_workflow_scenario(
+            self.correction_and_revalidation_scenario(session_policy="bogus")
+        )
+
+        self.assertEqual(result.final_status, "ERROR")
+        self.assertEqual(result.reason, "SCENARIO_SESSION_POLICY_INVALID:bogus")
+        # nothing ran, so nothing was recorded: the counters are still at their
+        # pre-seeded zeros and not one session was allocated.
+        self.assertEqual(result.sessions, ())
+        self.assertEqual(set(result.phase_iterations.values()), {0})
 
 if __name__ == "__main__":
     unittest.main()
@@ -1181,3 +1505,101 @@ class FinalAdversarialReviewTests(unittest.TestCase):
                     result.revalidation_dispatches,
                     [("implementation", 2), ("test", 2)],
                 )
+
+
+class SessionRecordingTests(unittest.TestCase):
+    """W-30..W-35: every agent invocation is recorded with the session it ran in.
+
+    The minimum this IMPLEMENTATION owes: one positive that the events are recorded
+    with the layer-1 boundary and the delta-first Reviewer keys, and the two structural
+    properties the state machine exists for (Worker session != Reviewer session, and a
+    reused chain creates its session exactly once).
+    """
+
+    ORCHESTRATION_SKILL = (
+        REPO_ROOT / "orca-worker-reviewer-orchestration" / "SKILL.md"
+    )
+
+    def run_phase(
+        self, scenario: FakeScenario, *, session_policy: str = "reuse"
+    ) -> WorkflowResult:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            harness = E2EHarness(
+                self.ORCHESTRATION_SKILL,
+                phase="implementation",
+                max_iterations=5,
+                workspace=Path(temporary_directory),
+                session_policy=session_policy,
+            )
+            return harness.run(scenario)
+
+    def test_one_pass_round_records_a_worker_and_a_reviewer_session(self) -> None:
+        result = self.run_phase(FakeScenario(("complete",), ("pass",)))
+
+        self.assertEqual(result.final_status, "COMPLETED")
+        self.assertEqual([event.role for event in result.sessions], ["worker", "reviewer"])
+        worker_event, reviewer_event = result.sessions
+        self.assertIsInstance(worker_event, SessionEvent)
+        self.assertTrue(worker_event.created and reviewer_event.created)
+        # S-R5: the two chains are keyed by role, so they can never collide.
+        self.assertNotEqual(worker_event.session_id, reviewer_event.session_id)
+        self.assertEqual(
+            worker_event.agent_command, SESSION_AGENT_COMMANDS["worker"]
+        )
+        self.assertEqual(
+            reviewer_event.agent_command, SESSION_AGENT_COMMANDS["reviewer"]
+        )
+        # Layer 1 is rebuilt per attempt, and neither id is in it.
+        self.assertEqual(
+            tuple(key for key, _ in worker_event.task_boundary),
+            tuple(sorted(TASK_BOUNDARY_KEYS)),
+        )
+        self.assertNotIn("task_id", dict(worker_event.task_boundary))
+        self.assertNotIn("dispatch_id", dict(worker_event.task_boundary))
+        self.assertEqual(dict(worker_event.task_boundary)["current_role"], "worker")
+        self.assertEqual(dict(worker_event.task_boundary)["current_iteration"], "1")
+        # The Reviewer, and only the Reviewer, carries the eight delta-first keys.
+        self.assertEqual(
+            reviewer_event.reviewer_context_keys, tuple(sorted(REVIEWER_CONTEXT_KEYS))
+        )
+        self.assertEqual(worker_event.reviewer_context_keys, ())
+
+    def test_a_reused_chain_creates_each_role_session_once(self) -> None:
+        result = self.run_phase(
+            FakeScenario(
+                ("complete", "complete"),
+                ("fail", "pass"),
+                reviewer_findings=(("R1",), ()),
+                worker_resolutions=({}, {"R1": "RESOLVED"}),
+            )
+        )
+
+        self.assertEqual(result.final_status, "COMPLETED")
+        self.assertEqual(len(result.sessions), 4)
+        for role in ("worker", "reviewer"):
+            events = [event for event in result.sessions if event.role == role]
+            with self.subTest(role=role):
+                self.assertEqual([event.created for event in events], [True, False])
+                self.assertEqual(len({event.session_id for event in events}), 1)
+                # A new boundary every attempt, even inside one session (S-R6).
+                self.assertNotEqual(
+                    events[0].task_boundary, events[1].task_boundary
+                )
+
+    def test_the_fresh_policy_allocates_a_new_session_per_attempt(self) -> None:
+        result = self.run_phase(
+            FakeScenario(
+                ("complete", "complete"),
+                ("fail", "pass"),
+                reviewer_findings=(("R1",), ()),
+                worker_resolutions=({}, {"R1": "RESOLVED"}),
+            ),
+            session_policy="fresh",
+        )
+
+        self.assertEqual(result.final_status, "COMPLETED")
+        self.assertTrue(all(event.created for event in result.sessions))
+        self.assertEqual(
+            len({event.session_id for event in result.sessions}),
+            len(result.sessions),
+        )

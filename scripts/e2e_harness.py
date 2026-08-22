@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import itertools
 import json
 import re
 import subprocess
@@ -13,6 +14,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from scripts.task_context import build_reviewer_context, build_task_boundary
 from scripts.workflow_contract import (
     WorkflowOutputContract,
     load_workflow_output_contract,
@@ -38,6 +40,21 @@ UNACCOUNTED_RESOLUTION = "UNACCOUNTED"
 RESPONSIBLE_PHASE_LINE = re.compile(
     r"(?m)^Responsible Phase:\s*(?P<phase>[a-z][a-z0-9_]*)\s*$"
 )
+
+
+# The only two session policies. "reuse" hands the same session id to the next
+# same-role attempt (S-R4); "fresh" allocates a new one every time (S-R2), which is
+# exactly today's one-terminal-per-attempt behaviour and therefore the safe fallback.
+SESSION_POLICIES = frozenset({"reuse", "fresh"})
+
+# The subprocess each role actually runs. Recorded on the event so `agent_command` is
+# a fact about the run, not decoration -- the runtime harness's eligibility condition
+# 2 compares the same kind of value.
+SESSION_AGENT_COMMANDS = {
+    "worker": "fake_worker.py",
+    "reviewer": "fake_reviewer.py",
+    "final_review": "fake_reviewer.py",
+}
 
 
 class OutputContractError(ValueError):
@@ -77,7 +94,27 @@ class WorkflowResult:
     findings: dict[str, FindingTrace]
     final_status: str
     reason: str | None = None
+    sessions: tuple[SessionEvent, ...] = ()
 
+
+@dataclass(frozen=True)
+class SessionEvent:
+    """One agent invocation, and which session it was handed to.
+
+    task_boundary and reviewer_context_keys are normalized to tuples so this frozen
+    record stays hashable and two attempts can be compared for equality. They are
+    produced by scripts/task_context.py, the same module the runtime harness uses, so
+    the payload shape is defined in exactly one place.
+    """
+
+    role: str = ""
+    phase: str = ""
+    iteration: int = 0
+    session_id: str = ""
+    created: bool = False
+    agent_command: str = ""
+    task_boundary: tuple[tuple[str, str], ...] = ()
+    reviewer_context_keys: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -105,6 +142,7 @@ class WorkflowScenario:
     revalidation_scenarios: dict[tuple[str, int], FakeScenario] = field(
         default_factory=dict
     )
+    session_policy: str = "reuse"
 
 
 @dataclass
@@ -120,6 +158,7 @@ class WorkflowRunResult:
     corrected_findings: tuple[tuple[int, str, str, str], ...] = ()
     revalidation_dispatches: list[tuple[str, int]] = field(default_factory=list)
     reason: str | None = None
+    sessions: tuple[SessionEvent, ...] = ()
 
 
 def _parse_choice(output: str, field_name: str, allowed: set[str]) -> str:
@@ -318,12 +357,77 @@ class E2EHarness:
         max_iterations: int = 5,
         workspace: Path,
         protected_artifacts: tuple[Path, ...] = (),
+        session_policy: str = "reuse",
     ) -> None:
         self.contract = load_workflow_output_contract(skill_path)
         self.phase = phase
         self.max_iterations = max_iterations
         self.workspace = workspace
         self.protected_artifacts = protected_artifacts
+        # The first three MUST be mutable objects. _phase_harness() is a copy.copy(),
+        # so a list / dict / count object is shared BY REFERENCE with every clone and
+        # the state therefore survives phase, correction and revalidation boundaries.
+        # An int counter attribute would be re-bound inside the clone, invisible to
+        # the parent, and ids would collide -- hence itertools.count. Putting any of
+        # them on the class would share them across instances and poison tests.
+        self.sessions: list[SessionEvent] = []
+        self._session_ids: dict[str, str] = {}
+        self._session_counter = itertools.count(1)
+        self.session_policy = session_policy
+
+    def allocate_session(
+        self,
+        role: str = "",
+        phase: str = "",
+        iteration: int = 0,
+        *,
+        policy: str = "reuse",
+    ) -> tuple[str, bool]:
+        """S-R0..S-R7. Returns (session_id, created).
+
+        `phase` and `iteration` are accepted and deliberately unused: every rule keys
+        on role alone, and the caller records those two on the SessionEvent. Keeping
+        them in the signature keeps the call site self-describing and leaves room for
+        a phase-scoped policy without moving the call sites.
+        """
+        if policy not in SESSION_POLICIES:
+            policy = "fresh"        # defence in depth; run_workflow rejects first
+        if role == "final_review":                                      # S-R1
+            return f"sess_{next(self._session_counter)}", True
+        if policy == "reuse" and role in self._session_ids:             # S-R4
+            return self._session_ids[role], False
+        session_id = f"sess_{next(self._session_counter)}"              # S-R2 / S-R3
+        self._session_ids[role] = session_id
+        return session_id, True
+
+    def invalidate_session(self, role: str = "") -> None:               # S-R7
+        """Drop this role's chain so the next round starts a fresh session."""
+        self._session_ids.pop(role, None)
+
+    def _record_session(
+        self,
+        role: str,
+        iteration: int,
+        *,
+        task_boundary: tuple[tuple[str, str], ...] = (),
+        reviewer_context_keys: tuple[str, ...] = (),
+    ) -> SessionEvent:
+        """Append-only: allocate (or reuse) this role's session and record the fact."""
+        session_id, created = self.allocate_session(
+            role, self.phase, iteration, policy=self.session_policy
+        )
+        event = SessionEvent(
+            role=role,
+            phase=self.phase,
+            iteration=iteration,
+            session_id=session_id,
+            created=created,
+            agent_command=SESSION_AGENT_COMMANDS.get(role, ""),
+            task_boundary=task_boundary,
+            reviewer_context_keys=reviewer_context_keys,
+        )
+        self.sessions.append(event)
+        return event
 
     def _error(
         self,
@@ -342,6 +446,7 @@ class E2EHarness:
             findings=findings,
             final_status="ERROR",
             reason=reason,
+            sessions=tuple(self.sessions),
         )
 
     def run(self, scenario: FakeScenario) -> WorkflowResult:
@@ -380,6 +485,23 @@ class E2EHarness:
                 "--resolutions-json",
                 json.dumps(resolutions, sort_keys=True),
             ]
+            self._record_session(
+                "worker",
+                iteration,
+                task_boundary=tuple(
+                    sorted(
+                        build_task_boundary(
+                            current_role="worker",
+                            current_phase=self.phase,
+                            current_iteration=iteration,
+                            artifact_contract=f"artifacts/{self.phase.upper()}.md",
+                            relevant_previous_findings=tuple(
+                                sorted(previous_blocking_findings)
+                            ),
+                        ).items()
+                    )
+                ),
+            )
             worker = subprocess.run(
                 worker_command,
                 cwd=self.workspace,
@@ -420,6 +542,7 @@ class E2EHarness:
                     findings=finding_traces,
                     final_status=self.contract.blocked_status,
                     reason="WORKER_BLOCKED",
+                    sessions=tuple(self.sessions),
                 )
 
             if previous_blocking_findings:
@@ -470,6 +593,42 @@ class E2EHarness:
                 reviewer_command.extend(
                     ["--artifact", str(self.protected_artifacts[0])]
                 )
+            self._record_session(
+                "reviewer",
+                iteration,
+                task_boundary=tuple(
+                    sorted(
+                        build_task_boundary(
+                            current_role="reviewer",
+                            current_phase=self.phase,
+                            current_iteration=iteration,
+                            artifact_contract=(
+                                f"artifacts/REVIEW_{self.phase.upper()}.md"
+                            ),
+                            relevant_previous_findings=tuple(
+                                sorted(previous_blocking_findings)
+                            ),
+                        ).items()
+                    )
+                ),
+                reviewer_context_keys=tuple(
+                    sorted(
+                        build_reviewer_context(
+                            original_objective=f"e2e:{self.phase}",
+                            current_phase=self.phase,
+                            approved_baseline=(),
+                            current_delta=(worker.stdout,),
+                            new_claims=tuple(sorted(parsed_resolutions)),
+                            previous_findings=tuple(
+                                (finding_id, parsed_resolutions.get(finding_id, ""))
+                                for finding_id in sorted(previous_blocking_findings)
+                            ),
+                            validation=(worker_status,),
+                            drill_down=(str(self.workspace),),
+                        )
+                    )
+                ),
+            )
             hashes_before = _hash_files(self.protected_artifacts)
             reviewer = subprocess.run(
                 reviewer_command,
@@ -520,6 +679,7 @@ class E2EHarness:
                     reviewer_attempts=reviewer_attempts,
                     findings=finding_traces,
                     final_status=self.contract.completed_status,
+                    sessions=tuple(self.sessions),
                 )
 
             for finding_id in parsed_findings:
@@ -538,15 +698,17 @@ class E2EHarness:
             findings=finding_traces,
             final_status=self.contract.escalated_status,
             reason="MAX_ITERATIONS_REACHED",
+            sessions=tuple(self.sessions),
         )
 
     def _phase_harness(self, phase: str, budget: int) -> "E2EHarness":
         """A shallow clone that runs `run()` for one phase with a bounded budget.
 
-        run() is the single-phase authority and is byte-unchanged; this clone only
-        varies the two attributes it reads (`phase`, `max_iterations`). The contract,
-        workspace and protected artifacts are shared by reference on purpose -- the
-        protected-artifact guard must see the same files the parent protects.
+        run() is the single-phase authority and this clone does not change its
+        behaviour; the clone only varies the two attributes it reads (`phase`,
+        `max_iterations`). The contract, workspace and protected artifacts are
+        shared by reference on purpose -- the protected-artifact guard must see
+        the same files the parent protects.
         """
         child = copy.copy(self)
         child.phase = phase
@@ -595,6 +757,7 @@ class E2EHarness:
         ]
         if self.protected_artifacts:
             command.extend(["--artifact", str(self.protected_artifacts[0])])
+        self._record_session("final_review", attempt)
         hashes_before = _hash_files(self.protected_artifacts)
         completed = subprocess.run(
             command,
@@ -679,7 +842,18 @@ class E2EHarness:
                 final_review_artifacts=tuple(final_review_artifacts),
                 corrected_findings=tuple(corrected_findings),
                 reason=reason,
+                sessions=tuple(self.sessions),
             )
+
+        # The only write of session_policy in this run: every _phase_harness clone
+        # copies it by value, so the phase gate, correction and revalidation rounds
+        # all read the scenario's policy without run() ever seeing it (S-R0).
+        policy = scenario.session_policy
+        if policy not in SESSION_POLICIES:
+            return self._workflow_error(
+                "SCENARIO_SESSION_POLICY_INVALID:" + policy, snapshot()
+            )
+        self.session_policy = policy
 
         # ---- sequential phase gates (SKILL.md section 8: PASS before the next phase)
         for phase in scenario.phases:
@@ -691,6 +865,10 @@ class E2EHarness:
             result = self._phase_harness(phase, self.max_iterations).run(phase_scenario)
             phase_iterations[phase] += len(result.reviewer_attempts)
             if result.final_status != self.contract.completed_status:
+                # S-R7: a round that did not PASS leaves both roles in recovery, so
+                # neither chain may be carried forward.
+                self.invalidate_session("worker")
+                self.invalidate_session("reviewer")
                 # BLOCKED worker, malformed output, or the phase's own budget exhausted:
                 # the gate is never reached and the phase's status/reason is propagated.
                 return snapshot(result.final_status, result.reason)
@@ -790,10 +968,15 @@ class E2EHarness:
                 #      status, because run() would have fired it at local iteration 1 -- i.e.
                 #      before this round's first Reviewer ever ran.
                 if bridge_reason is not None:
+                    self.invalidate_session("worker")        # S-R7
+                    self.invalidate_session("reviewer")
                     return self._workflow_error(
                         f"{FINAL_REVIEW_RESOLUTION_REASON} ({phase}): {bridge_reason}",
                         snapshot(),
                     )
+                if result.final_status != self.contract.completed_status:
+                    self.invalidate_session("worker")        # S-R7
+                    self.invalidate_session("reviewer")
                 if result.final_status == self.contract.escalated_status:
                     return snapshot(
                         self.contract.escalated_status,
@@ -849,6 +1032,9 @@ class E2EHarness:
                         (phase, phase_iterations[phase] + offset)
                     )
                 phase_iterations[phase] += len(result.reviewer_attempts)
+                if result.final_status != self.contract.completed_status:
+                    self.invalidate_session("worker")        # S-R7
+                    self.invalidate_session("reviewer")
                 if result.final_status == self.contract.escalated_status:
                     return snapshot(
                         self.contract.escalated_status,

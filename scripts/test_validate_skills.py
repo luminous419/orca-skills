@@ -456,6 +456,203 @@ class ValidatorRegressionTests(unittest.TestCase):
             "FINAL_REVIEW_ROLE must be a close eligible terminal role"
         )
 
+    # ---- the three anchor contracts added for session reuse ---------------------
+    # test_valid_repository_passes above is the positive case for all three: it runs
+    # the validator over an unmutated copy, so every new check has to pass there.
+
+    def test_reuse_contract_missing_fails(self) -> None:
+        self.mutate_orchestration_skill(
+            "REUSE_SCOPE = same_role_across_phases_and_iterations\n", ""
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "session reuse contract keys drifted"
+        )
+
+    def test_reuse_eligibility_shorter_than_eight_conditions_fails(self) -> None:
+        self.mutate_orchestration_skill(
+            ", not_coordinator_or_adopted, not_in_lifecycle_recovery\n",
+            "\n",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "REUSE_ELIGIBILITY must list exactly eight conditions"
+        )
+
+    def test_reuse_zero_command_sentence_removal_fails(self) -> None:
+        self.mutate_orchestration_skill(
+            "reuse는 이전 Dispatch에 어떤 lifecycle mutation 명령도 보내지 않는다.",
+            "reuse는 이전 Dispatch에 retain 명령을 보낸다.",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "section 6 prose is missing the zero lifecycle command sentence"
+        )
+
+    def test_role_table_calling_a_reused_terminal_adopted_fails(self) -> None:
+        """PLAN D-1: the drift this change removed must not be reintroduced."""
+        self.mutate_orchestration_skill(
+            "| `external_or_adopted` | **Coordinator가 만들지 않은** terminal.",
+            "| `external_or_adopted` | reused / pre-existing.",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "must not call a reused terminal external_or_adopted"
+        )
+
+    def test_task_boundary_keys_carrying_an_id_fails(self) -> None:
+        """Layer 1 is assembled before either id exists, so neither may appear."""
+        self.mutate_orchestration_skill(
+            "TASK_BOUNDARY_KEYS = current_role,",
+            "TASK_BOUNDARY_KEYS = task_id, current_role,",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "TASK_BOUNDARY_KEYS must not carry an id"
+        )
+
+    def test_dispatch_identity_rule_without_new_value_every_attempt_fails(self) -> None:
+        self.mutate_orchestration_skill(
+            "new_value_every_attempt, ",
+            "",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "DISPATCH_IDENTITY_RULE must forbid identity carry-over"
+        )
+
+    def test_reviewer_context_losing_drill_down_fails(self) -> None:
+        self.mutate_orchestration_skill(
+            ", validation, drill_down\n",
+            ", validation\n",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "REVIEWER_CONTEXT_KEYS must keep all eight keys including drill_down"
+        )
+
+    def test_delta_first_removing_direct_verification_duty_fails(self) -> None:
+        """R-4 anti-weakening: delta-first may not shrink section 11's own duty."""
+        self.mutate_orchestration_skill(
+            "Worker 설명을 사실로 가정하지 않고 실제 repository/artifact/diff/test result를 확인한다.\n",
+            "",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "must not remove the reviewer's direct verification duty"
+        )
+
+    def test_reviewer_context_carve_out_removal_fails(self) -> None:
+        self.mutate_orchestration_skill(
+            "REVIEWER_CONTEXT_EXCLUDES = final_adversarial_review",
+            "REVIEWER_CONTEXT_EXCLUDES = none",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "must keep the final adversarial review carve-out"
+        )
+
+    # ---- DESIGN section 7.1 D: block-level negatives for the three new contracts --
+    # Each block gets the same three: removed entirely, one value drifted, and copied
+    # into the loop skill. The three failure modes hit three different checks -- the
+    # `parsed is not None` guard, the exact-dict comparison, and the containment
+    # guard -- so a validator that lost any one of them still fails here.
+
+    def anchor_block(self, heading: str) -> str:
+        """The `#### <heading>` subsection down to the end of its ```text fence."""
+        orchestration = (
+            self.repo_root / "orca-worker-reviewer-orchestration" / "SKILL.md"
+        ).read_text(encoding="utf-8")
+        start = orchestration.index(heading)
+        fence = orchestration.index("```text", start)
+        end = orchestration.index("```\n", fence + 1) + 4
+        return orchestration[start:end]
+
+    def copy_into_loop_skill(self, heading: str) -> None:
+        loop_path = self.repo_root / "orca-worker-reviewer-loop" / "SKILL.md"
+        loop_path.write_text(
+            loop_path.read_text(encoding="utf-8")
+            + "\n"
+            + self.anchor_block(heading),
+            encoding="utf-8",
+        )
+
+    def test_session_reuse_contract_missing_fails(self) -> None:
+        """The whole block, not one key: the `parsed is not None` guard."""
+        self.mutate_orchestration_skill(self.anchor_block("#### Session reuse contract"), "")
+
+        self.assert_lifecycle_contract_rejected(
+            "session reuse contract block is missing or malformed"
+        )
+
+    def test_session_reuse_contract_value_drift_fails(self) -> None:
+        """The exact-dict comparison itself, independent of the semantic checks."""
+        self.mutate_orchestration_skill(
+            "REUSE_SCOPE = same_role_across_phases_and_iterations",
+            "REUSE_SCOPE = any_role_across_phases_and_iterations",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "session reuse contract values drifted"
+        )
+
+    def test_session_reuse_contract_copied_into_loop_skill_fails(self) -> None:
+        self.copy_into_loop_skill("#### Session reuse contract")
+
+        self.assert_lifecycle_contract_rejected(
+            "orca-worker-reviewer-loop: must not contain the session reuse contract"
+        )
+
+    def test_task_boundary_contract_missing_fails(self) -> None:
+        self.mutate_orchestration_skill(self.anchor_block("#### Task boundary contract"), "")
+
+        self.assert_lifecycle_contract_rejected(
+            "task boundary contract block is missing or malformed"
+        )
+
+    def test_task_boundary_contract_value_drift_fails(self) -> None:
+        self.mutate_orchestration_skill(
+            "DISPATCH_INJECTED_IDENTITY = task_id, dispatch_id, dispatch_capability, "
+            "coordinator_handle",
+            "DISPATCH_INJECTED_IDENTITY = task_id, dispatch_id, coordinator_handle",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "task boundary contract values drifted"
+        )
+
+    def test_task_boundary_contract_copied_into_loop_skill_fails(self) -> None:
+        self.copy_into_loop_skill("#### Task boundary contract")
+
+        self.assert_lifecycle_contract_rejected(
+            "orca-worker-reviewer-loop: must not contain the task boundary contract"
+        )
+
+    def test_reviewer_context_contract_missing_fails(self) -> None:
+        self.mutate_orchestration_skill(
+            self.anchor_block("#### Reviewer context contract"), ""
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "reviewer context contract block is missing or malformed"
+        )
+
+    def test_reviewer_context_contract_value_drift_fails(self) -> None:
+        self.mutate_orchestration_skill(
+            "REVIEWER_CONTEXT_MODE = delta_first",
+            "REVIEWER_CONTEXT_MODE = whole_history",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "reviewer context contract values drifted"
+        )
+
+    def test_reviewer_context_contract_copied_into_loop_skill_fails(self) -> None:
+        self.copy_into_loop_skill("#### Reviewer context contract")
+
+        self.assert_lifecycle_contract_rejected(
+            "orca-worker-reviewer-loop: must not contain the reviewer context contract"
+        )
 
 if __name__ == "__main__":
     unittest.main()

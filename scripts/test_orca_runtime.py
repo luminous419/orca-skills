@@ -21,6 +21,7 @@ try:
         UnsupportedOrcaContract,
         run_final_review_runtime_scenario,
         run_runtime_scenarios,
+        run_session_reuse_runtime_scenario,
     )
 except ModuleNotFoundError:
     from orca_runtime_harness import (
@@ -33,6 +34,7 @@ except ModuleNotFoundError:
         UnsupportedOrcaContract,
         run_final_review_runtime_scenario,
         run_runtime_scenarios,
+        run_session_reuse_runtime_scenario,
     )
 
 
@@ -303,6 +305,134 @@ class FinalReviewRuntimeIntegrationTests(unittest.TestCase):
         recorded = snapshot["result"]["final_review_terminals"]
         self.assertEqual(recorded, result.final_review_terminals)
         self.assertEqual(len(set(recorded)), 2)
+
+
+class SessionReuseRuntimeIntegrationTests(unittest.TestCase):
+    """Opt-in scenario K: same-role session reuse against the real runtime (E-3).
+
+    Skipped unless ORCA_RUNTIME_TEST=1, exactly like the two integration classes
+    above. Scenario K is deliberately outside run_runtime_scenarios(), whose A-I
+    result set is pinned by an exact-set assertion; scenario J set that precedent.
+
+    The four fields aggregated below are the ONLY first-order evidence D-4 allows for
+    the efficiency numbers: the ledger's own `action` label is an accounting of a
+    receipt, not the receipt, and may not stand in for one (ANALYSIS F-3 result 2).
+    """
+
+    PHASES = 5
+
+    def test_session_reuse_terminal_accounting(self) -> None:
+        if not RUN_ORCA:
+            self.skipTest("requires --orca-runtime and a ready Orca runtime")
+        if ARTIFACT_DIR:
+            artifact_dir = Path(ARTIFACT_DIR)
+            try:
+                result = run_session_reuse_runtime_scenario(artifact_dir)
+            except UnsupportedOrcaContract as exc:
+                self.skipTest(str(exc))
+            self.assert_scenario_k(result, artifact_dir)
+        else:
+            with tempfile.TemporaryDirectory() as directory:
+                artifact_dir = Path(directory)
+                try:
+                    result = run_session_reuse_runtime_scenario(artifact_dir)
+                except UnsupportedOrcaContract as exc:
+                    self.skipTest(str(exc))
+                self.assert_scenario_k(result, artifact_dir)
+
+    @staticmethod
+    def receipt_fields(snapshot: dict) -> dict[str, list]:
+        """E-3's four fields, read out of the raw command log on disk."""
+        terminal_effects: list[str] = []
+        release_process_actions: list[str] = []
+        retained_reasons: list[str] = []
+        ownership_states: list[str] = []
+        for row in snapshot["commands"]:
+            command = row["command"]
+            verb = command[1] if len(command) > 1 else command[0]
+            payload = (row.get("response") or {}).get("result") or {}
+            if verb == "worker-start":
+                for effect in payload.get("effects") or ():
+                    if isinstance(effect, dict) and effect.get("kind") == "terminal":
+                        terminal_effects.append(str(effect.get("action") or ""))
+            elif verb in {"worker-release", "worker-retain"}:
+                release_process_actions.append(str(payload.get("processAction") or ""))
+            elif verb == "worker-show":
+                terminal_resource = payload.get("terminalResource") or {}
+                retained_reasons.append(
+                    str(terminal_resource.get("retainedReason") or "")
+                )
+                ownership_states.append(
+                    str(terminal_resource.get("ownershipState") or "")
+                )
+        return {
+            "terminal_effects": terminal_effects,
+            "release_process_actions": release_process_actions,
+            "retained_reasons": retained_reasons,
+            "ownership_states": ownership_states,
+        }
+
+    def assert_scenario_k(self, result, artifact_dir: Path) -> None:
+        # K-1: the scenario ran to completion
+        self.assertEqual(result.scenario, "K")
+        self.assertEqual(result.status, "COMPLETED")
+        self.assertEqual(len(result.attempts), self.PHASES * 2)
+
+        # K-2: ten dispatches, two terminals -- one chain per role
+        self.assertEqual(result.terminal_creations, 2)
+        self.assertEqual(
+            sum(1 for attempt in result.attempts if attempt.terminal_created), 2
+        )
+        self.assertEqual(len({attempt.terminal for attempt in result.attempts}), 2)
+        self.assertEqual(len(result.reuse_chains), 2)
+        for handle, chain in result.reuse_chains.items():
+            with self.subTest(handle=handle):
+                self.assertEqual(len(chain), self.PHASES)
+                self.assertEqual(len(set(chain)), self.PHASES)
+
+        # K-3: every attempt but the last of each role is a reuse, and a reuse never
+        # sends a lifecycle mutation, so axis (b) is the only place it is recorded.
+        reuse_attempts = [
+            attempt for attempt in result.attempts if attempt.worker_resource == "reuse"
+        ]
+        self.assertEqual(len(reuse_attempts), (self.PHASES - 1) * 2)
+        for attempt in result.attempts:
+            with self.subTest(dispatch=attempt.dispatch_id):
+                self.assertIn(attempt.worker_resource, set(WORKER_RESOURCE_OUTCOMES))
+                self.assertEqual(attempt.finalizations, 1)
+                self.assertIn(attempt.terminal_role, TERMINAL_ROLE_CLASSES)
+                self.assertNotIn(attempt.worker_state, UNSETTLED_WORKER_STATES)
+                self.assertIn(attempt.cleanup_authority, CLEANUP_AUTHORITY_STATES)
+        for attempt in reuse_attempts:
+            with self.subTest(dispatch=attempt.dispatch_id):
+                self.assertEqual(
+                    attempt.lifecycle_action, "reuse:ownership-transfer-pending"
+                )
+
+        # K-4: identity is new on every attempt even though the session is not
+        self.assertEqual(
+            len({attempt.task_id for attempt in result.attempts}),
+            len(result.attempts),
+        )
+        self.assertEqual(
+            len({attempt.dispatch_id for attempt in result.attempts}),
+            len(result.attempts),
+        )
+
+        # K-5 (E-3): the four first-order receipt fields, from the log on disk
+        snapshot_path = artifact_dir / "scenario-k.json"
+        self.assertTrue(snapshot_path.is_file(), snapshot_path)
+        snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        fields = self.receipt_fields(snapshot)
+        self.assertEqual(len(fields["terminal_effects"]), self.PHASES * 2)
+        # Two releases only: the last attempt of each role. Every other attempt is a
+        # reuse and issues nothing at all.
+        self.assertEqual(len(fields["release_process_actions"]), 2)
+        self.assertTrue(fields["retained_reasons"])
+        self.assertTrue(fields["ownership_states"])
+        self.assertEqual(
+            snapshot["result"]["terminal_creations"], result.terminal_creations
+        )
 
 
 if __name__ == "__main__":
