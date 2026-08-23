@@ -746,5 +746,29 @@ class ValidatorRegressionTests(unittest.TestCase):
             "orca-worker-reviewer-loop: must not contain the quality profile contract"
         )
 
+    def test_dispatch_settled_example_losing_reuse_fails(self) -> None:
+        """PR #15 review finding: --reuse silently dropped from the CLI example."""
+        self.mutate_orchestration_skill(
+            "--terminal <handle> --action created|reused --reuse <worker-start/dispatch\n"
+            "      응답의 effects[].action> --result \"<outcome/settlement/lifecycle 요약>\"",
+            "--terminal <handle> --action created|reused --result "
+            "\"<outcome/settlement/lifecycle 요약>\"",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "dispatch_settled orchestrator-event example is missing "
+            "'--action created|reused --reuse'"
+        )
+
+    def test_run_logging_section_missing_fails(self) -> None:
+        self.mutate_orchestration_skill(
+            "#### Run-scoped orchestration and timing logs (OS-17)",
+            "#### Removed",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "run-scoped orchestration/timing log section is missing"
+        )
+
 if __name__ == "__main__":
     unittest.main()

@@ -221,6 +221,8 @@ REVIEWER_CONTEXT_CONTRACT: dict[str, tuple[str, ...]] = {
 REVIEWER_CONTEXT_CONTRACT_MAX_LINES = 4
 REVIEWER_CONTEXT_SECTION_HEADING = "## 11. Reviewer Contract"
 REVIEWER_CONTEXT_SECTION_END = "\n## 12."
+RUN_LOGGING_SECTION_HEADING = "#### Run-scoped orchestration and timing logs"
+RUN_LOGGING_SECTION_END = "\n## 10."
 # R-4 anti-weakening: delta-first must not be able to shrink the direct-verification
 # duty. This is the ONE place that sentence may appear, which is why the new
 # subsection references it instead of quoting it.
@@ -339,6 +341,12 @@ QUALITY_GATE_REVIEW_POLICY_ANCHORS = (
     "Quality Attribute:",
     "Blocking: YES | NO",
 )
+# OS-17 review follow-up: the dispatch_settled example is the one place a Coordinator
+# copies its `orchestrator-event` invocation from. `--action` (Coordinator's own
+# created/reused decision) and `--reuse` (Orca's own reported effects[].action) answer
+# different questions; losing either from the example silently loses that column from
+# every ORCHESTRATOR_LOG.md a live Coordinator ever writes.
+RUN_LOGGING_DISPATCH_SETTLED_ANCHORS = ("--action created|reused --reuse",)
 
 
 
@@ -1340,6 +1348,36 @@ def validate_quality_profile_contract(validation: Validation) -> None:
     )
 
 
+def validate_run_logging_contract(validation: Validation) -> None:
+    """The dispatch_settled CLI example in the OS-17 run-logging subsection.
+
+    Regression guard for a review finding on PR #15: the example showed `--action`
+    (the Coordinator's own created/reused decision) but omitted `--reuse` (Orca's own
+    reported effects[].action). Both are real ORCHESTRATOR_LOG.md columns; only prose
+    told a live Coordinator which flags to pass, so a missing flag here silently drops
+    a column from every real run's log with nothing to catch it.
+    """
+    skill_path = LIFECYCLE_SKILL_DIR / "SKILL.md"
+    if not skill_path.is_file():
+        return
+    skill_text = skill_path.read_text(encoding="utf-8")
+
+    section = extract_section(
+        skill_text, RUN_LOGGING_SECTION_HEADING, RUN_LOGGING_SECTION_END
+    )
+    validation.check(
+        bool(section),
+        f"{LIFECYCLE_SKILL_DIR.name}: run-scoped orchestration/timing log section is "
+        "missing",
+    )
+    for anchor in RUN_LOGGING_DISPATCH_SETTLED_ANCHORS:
+        validation.check(
+            anchor in section,
+            f"{LIFECYCLE_SKILL_DIR.name}: dispatch_settled orchestrator-event example "
+            f"is missing {anchor!r}",
+        )
+
+
 def validate_workflow_output_contracts(validation: Validation) -> None:
     contracts = []
     for skill_dir in SKILL_DIRS:
@@ -1393,6 +1431,7 @@ def main() -> int:
     validate_task_boundary_contract(validation)
     validate_reviewer_context_contract(validation)
     validate_quality_profile_contract(validation)
+    validate_run_logging_contract(validation)
     validate_version(validation)
     validate_no_user_absolute_paths(validation)
 

@@ -543,6 +543,7 @@ class DuplicateSettlementTests(unittest.TestCase):
         "mode": "done",
         "new_role": "external_or_adopted",
         "objective": "probe",
+        "phase": "implementation",
         "observation": {},
         "origin": "self_created",
         "owned_by_this_dispatch": True,
@@ -5431,6 +5432,143 @@ class RunLoggingIntegrationTests(OfflineHarnessTestCase):
         self.assertNotEqual(run_end_row["duration_s"], "")
         run_start_row = next(row for row in rows if row["event"] == "run_start")
         self.assertEqual(run_end_row["started_at"], run_start_row["started_at"])
+
+    def test_phase_and_iteration_boundaries_bracket_a_multi_iteration_phase(
+        self,
+    ) -> None:
+        """External review MAJOR: phase/iteration have their own authoritative
+        boundary rows in TIMING_LOG.md, not something a reader reconstructs by
+        grouping dispatch_settled rows by phase/iteration themselves.
+        """
+        recorder = EchoingTerminalExec()
+        harness = self.started_harness(recorder)
+
+        harness.log_phase_start("implementation")
+        harness.log_iteration_start("implementation", 1)
+        self.arm(recorder, "ctx_w1", "task_w1")
+        harness.run_attempt("worker", 1, "complete", phase="implementation")
+        self.arm(recorder, "ctx_r1", "task_r1")
+        harness.run_attempt(
+            "reviewer", 1, "fail", phase="implementation", findings=("R1",)
+        )
+        harness.log_iteration_end("implementation", 1, result="FAIL")
+
+        harness.log_iteration_start("implementation", 2)
+        self.arm(recorder, "ctx_w2", "task_w2")
+        harness.run_attempt(
+            "worker", 2, "correction", phase="implementation", findings=("R1",)
+        )
+        self.arm(recorder, "ctx_r2", "task_r2")
+        harness.run_attempt("reviewer", 2, "pass", phase="implementation")
+        harness.log_iteration_end("implementation", 2, result="PASS")
+        harness.log_phase_end("implementation", result="PASS")
+
+        _, timing_log = self.log_paths(harness.run_id)
+        rows = self.read_rows(timing_log)
+        boundary_rows = [
+            row
+            for row in rows
+            if row["event"]
+            in ("phase_start", "phase_end", "iteration_start", "iteration_end")
+        ]
+        # One phase_start, one phase_end, and one start/end pair per iteration --
+        # exactly the boundaries this scenario opened, no more and no fewer.
+        self.assertEqual(
+            [row["event"] for row in boundary_rows],
+            [
+                "phase_start",
+                "iteration_start",
+                "iteration_end",
+                "iteration_start",
+                "iteration_end",
+                "phase_end",
+            ],
+        )
+        for row in boundary_rows:
+            self.assertEqual(row["phase"], "implementation")
+        iteration_rows = [row for row in boundary_rows if "iteration" in row["event"]]
+        self.assertEqual(
+            [row["iteration"] for row in iteration_rows], ["1", "1", "2", "2"]
+        )
+        # Every _end row measured against the matching _start row's own timestamp,
+        # not against some other boundary's.
+        for row in boundary_rows:
+            if row["event"].endswith("_end"):
+                self.assertNotEqual(row["started_at"], "")
+                self.assertNotEqual(row["ended_at"], "")
+                self.assertNotEqual(row["duration_s"], "")
+        phase_end_row = next(row for row in boundary_rows if row["event"] == "phase_end")
+        self.assertEqual(phase_end_row["detail"], "PASS")
+        iteration_1_end = next(
+            row
+            for row in boundary_rows
+            if row["event"] == "iteration_end" and row["iteration"] == "1"
+        )
+        self.assertEqual(iteration_1_end["detail"], "FAIL")
+
+    def test_phase_and_iteration_boundaries_bracket_final_review_attempts(
+        self,
+    ) -> None:
+        """The same boundary events, applied to the final_review phase value --
+        no special-casing: an iteration is an iteration whether its phase is a
+        canonical one or final_review, exactly like dispatch_settled already
+        treats them identically.
+        """
+        recorder = EchoingTerminalExec()
+        harness = self.started_harness(recorder)
+
+        harness.log_phase_start("final_review")
+        harness.log_iteration_start("final_review", 1)
+        self.arm(recorder, "ctx_f1", "task_f1")
+        harness.run_attempt(
+            "reviewer", 1, "fail", phase="final_review", findings=("R1",)
+        )
+        harness.log_iteration_end("final_review", 1, result="FAIL")
+
+        harness.log_iteration_start("final_review", 2)
+        self.arm(recorder, "ctx_f2", "task_f2")
+        harness.run_attempt("reviewer", 2, "pass", phase="final_review")
+        harness.log_iteration_end("final_review", 2, result="PASS")
+        harness.log_phase_end("final_review", result="PASS")
+
+        _, timing_log = self.log_paths(harness.run_id)
+        rows = self.read_rows(timing_log)
+        boundary_rows = [
+            row
+            for row in rows
+            if row["event"]
+            in ("phase_start", "phase_end", "iteration_start", "iteration_end")
+        ]
+        self.assertEqual(
+            [row["event"] for row in boundary_rows],
+            [
+                "phase_start",
+                "iteration_start",
+                "iteration_end",
+                "iteration_start",
+                "iteration_end",
+                "phase_end",
+            ],
+        )
+        for row in boundary_rows:
+            self.assertEqual(row["phase"], "final_review")
+        for row in boundary_rows:
+            if row["event"].endswith("_end"):
+                self.assertNotEqual(row["duration_s"], "")
+
+    def test_a_boundary_end_without_a_matching_start_still_writes_a_row(self) -> None:
+        """A caller bug (mismatched start/end) is a blank started_at, not a raise."""
+        recorder = EchoingTerminalExec()
+        harness = self.started_harness(recorder)
+
+        harness.log_iteration_end("implementation", 9, result="orphaned")
+
+        _, timing_log = self.log_paths(harness.run_id)
+        rows = self.read_rows(timing_log)
+        row = next(row for row in rows if row["event"] == "iteration_end")
+        self.assertEqual(row["started_at"], "")
+        self.assertEqual(row["duration_s"], "")
+        self.assertEqual(row["iteration"], "9")
 
     # ---- H. Non-success termination -----------------------------------------
 

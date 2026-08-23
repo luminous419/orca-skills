@@ -790,24 +790,45 @@ idempotent). 새 값을 계산하거나 추정하지 않는다 — 모든 인자
 이미 들고 있는 값(Task ID, Dispatch ID, terminal handle, role/phase/iteration, settlement/lifecycle
 axis 결과)을 그대로 전달하는 것뿐이다.
 
+`--action`과 `--reuse`는 서로 다른 질문에 답하며, 하나가 다른 하나를 대신하지 않는다. `--action`은
+Coordinator 자신의 결정이다 — 기존 terminal을 넘겼으면 `reused`, 새로 만들게 했으면 `created`.
+`--reuse`는 Orca 자신이 보고한 실제 결과다 — `worker-start`(또는 low-level `dispatch`) 응답의
+`effects[].action`(`kind: terminal`인 항목) 값을 그대로 전달한다. 이 값은 Coordinator가 §6에서
+terminal handle을 뽑아낼 때 이미 읽는 바로 그 JSON 필드이므로 별도로 조회할 필요가 없다.
+
 Coordinator는 다음 시점에 정확히 한 번씩 호출한다. 동일 event를 여러 위치에서 중복 생성하지 않는다.
 
 ```text
 1. §6 1단계에서 run-id를 얻고 <ARTIFACT_ROOT>를 만든 직후
    -> orchestrator-event --event run_start --detail "<objective>"
    -> timing-event --event run_start --started-at <지금 시각>
-2. §6/§11 각 Worker/Reviewer Dispatch가 accepted worker_done으로 settle된 직후
+2. 이 phase의 첫 Task를 dispatch하기 직전 / 이 phase가 최종적으로 PASS하거나
+   §16/§17에서 종료된 직후
+   -> timing-event --event phase_start|phase_end --phase <phase> [--started-at <시각>]
+      [--ended-at <시각>] [--detail "<PASS|FAIL|사유>"]
+3. 이 iteration의 Worker를 dispatch하기 직전 / 이 iteration의 (phase) Reviewer
+   판정이 나온 직후 (correction, downstream revalidation, §17 Final Adversarial
+   Review attempt도 각자 자신의 iteration 번호로 이 규칙 그대로 쓴다)
+   -> timing-event --event iteration_start|iteration_end --phase <phase>
+      --iteration <n> [--started-at <시각>] [--ended-at <시각>] [--detail "<PASS|FAIL|사유>"]
+4. §6/§11 각 Worker/Reviewer Dispatch가 accepted worker_done으로 settle된 직후
    (correction, downstream revalidation, §17 Final Adversarial Review attempt도
    전부 이 규칙 하나로 커버된다 — 이들은 다른 phase/iteration/role로 다시 호출되는
    같은 종류의 event일 뿐이다)
    -> orchestrator-event --event dispatch_settled --phase <phase> --role <role>
       --iteration <n> --task-id <task_id> --dispatch-id <dispatch_id>
-      --terminal <handle> --action created|reused --result "<outcome/settlement/lifecycle 요약>"
+      --terminal <handle> --action created|reused --reuse <worker-start/dispatch
+      응답의 effects[].action> --result "<outcome/settlement/lifecycle 요약>"
    -> timing-event --event dispatch_settled --phase <phase> --role <role> --iteration <n>
       --started-at <dispatch 직전 시각> --ended-at <settle 직후 시각>
-3. §16/§17에서 이 run의 최종 상태가 COMPLETED/BLOCKED/ERROR/ESCALATED 중 하나로 확정된 직후
+5. §16/§17에서 이 run의 최종 상태가 COMPLETED/BLOCKED/ERROR/ESCALATED 중 하나로 확정된 직후
    -> run-status --status <상태> --reason "<사유>" --run-started-at <1단계의 시각>
 ```
+
+2-3단계는 TIMING_LOG.md 전용이다. `<ARTIFACT_ROOT>ORCHESTRATOR_LOG.md`는 매 dispatch_settled row에
+이미 phase/iteration column을 갖고 있으므로 phase/iteration 경계를 위한 별도 row를 추가하지 않는다.
+phase나 iteration의 시작 시각을 Coordinator가 이미 잊었다면(`--started-at` 생략) 해당 row의
+`duration_s`는 빈 값으로 남는다 — 값을 추정하지 않는다.
 
 Worker/Reviewer가 unexpected exit로 정리되는 경우(§6 recovery)나, invalid quality profile 등
 pre-dispatch failure로 Task 자체가 생성되지 못한 경우도 같은 `orchestrator-event`로 남긴다
