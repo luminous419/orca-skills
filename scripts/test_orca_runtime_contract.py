@@ -5608,6 +5608,119 @@ class RunLoggingIntegrationTests(OfflineHarnessTestCase):
                 ("phase_end", "implementation"),
             ],
         )
+        # OS-17 review round 5 MAJOR: the outgoing phase must close no later than
+        # the next phase's own first dispatch starts -- proving design's
+        # phase_end was not stamped at implementation's own settlement time.
+        design_dispatch = next(
+            row for row in rows if row["event"] == "dispatch_settled" and row["phase"] == "design"
+        )
+        implementation_dispatch = next(
+            row
+            for row in rows
+            if row["event"] == "dispatch_settled" and row["phase"] == "implementation"
+        )
+        design_phase_end = next(
+            row for row in boundary_rows if row["event"] == "phase_end" and row["phase"] == "design"
+        )
+        implementation_phase_start = next(
+            row
+            for row in boundary_rows
+            if row["event"] == "phase_start" and row["phase"] == "implementation"
+        )
+        self.assertEqual(design_phase_end["ended_at"], design_dispatch["ended_at"])
+        self.assertEqual(
+            implementation_phase_start["started_at"],
+            implementation_dispatch["started_at"],
+        )
+        self.assertLessEqual(
+            design_phase_end["ended_at"], implementation_phase_start["started_at"]
+        )
+
+    def test_boundary_timestamps_bracket_the_dispatches_they_claim_to_measure(
+        self,
+    ) -> None:
+        """OS-17 review round 5 MAJOR: a boundary's own started_at/ended_at must
+        actually bracket the dispatch(es) inside it. Opening a boundary AFTER
+        settlement (the round-4 design) would start it after the very first
+        dispatch it claims to measure had already finished; closing an
+        outgoing scope at "now" on a transition would silently fold the NEXT
+        scope's dispatch time into the outgoing one's duration. Neither may
+        happen: an opening boundary's started_at must equal its scope's own
+        first dispatch's started_at, and a closing boundary's ended_at must
+        equal its scope's own LAST dispatch's ended_at -- never the next
+        scope's.
+        """
+        recorder = SequentialTerminalExec()
+        harness = self.started_harness(recorder)
+
+        self.arm(recorder, "ctx_w1", "task_w1")
+        worker1, _ = harness.run_attempt("worker", 1, "complete", phase="implementation")
+        self.arm(recorder, "ctx_r1", "task_r1")
+        recorder.results["check"]["messages"][0]["body"] = "RESULT: FAIL"
+        reviewer1, _ = harness.run_attempt(
+            "reviewer", 1, "fail", phase="implementation", findings=("R1",)
+        )
+        self.arm(recorder, "ctx_w2", "task_w2")
+        worker2, _ = harness.run_attempt(
+            "worker", 2, "correction", phase="implementation", findings=("R1",)
+        )
+        self.arm(recorder, "ctx_r2", "task_r2")
+        recorder.results["check"]["messages"][0]["body"] = "RESULT: PASS"
+        reviewer2, _ = harness.run_attempt("reviewer", 2, "pass", phase="implementation")
+        run_id = harness.run_id
+        harness.finish(
+            RuntimeScenarioResult(
+                "probe", run_id, "COMPLETED", 2,
+                [worker1, reviewer1, worker2, reviewer2],
+            )
+        )
+
+        _, timing_log = self.log_paths(run_id)
+        rows = self.read_rows(timing_log)
+        dispatch_rows = [row for row in rows if row["event"] == "dispatch_settled"]
+        self.assertEqual(len(dispatch_rows), 4)
+        w1, r1, w2, r2 = dispatch_rows
+
+        phase_start = next(row for row in rows if row["event"] == "phase_start")
+        iter1_start = next(
+            row
+            for row in rows
+            if row["event"] == "iteration_start" and row["iteration"] == "1"
+        )
+        iter1_end = next(
+            row
+            for row in rows
+            if row["event"] == "iteration_end" and row["iteration"] == "1"
+        )
+        iter2_start = next(
+            row
+            for row in rows
+            if row["event"] == "iteration_start" and row["iteration"] == "2"
+        )
+        iter2_end = next(
+            row
+            for row in rows
+            if row["event"] == "iteration_end" and row["iteration"] == "2"
+        )
+        phase_end = next(row for row in rows if row["event"] == "phase_end")
+
+        # Opening: started_at is exactly the scope's own first dispatch's
+        # started_at, never a later "recorded after settlement" timestamp.
+        self.assertEqual(phase_start["started_at"], w1["started_at"])
+        self.assertEqual(iter1_start["started_at"], w1["started_at"])
+        self.assertEqual(iter2_start["started_at"], w2["started_at"])
+
+        # Closing: ended_at is exactly the OUTGOING scope's own last dispatch's
+        # ended_at -- iteration 1 closes at reviewer1's settlement (before
+        # worker2/iteration 2 ever dispatches), not at whatever later moment
+        # iteration 2 happens to settle.
+        self.assertEqual(iter1_end["ended_at"], r1["ended_at"])
+        self.assertEqual(iter2_end["ended_at"], r2["ended_at"])
+        self.assertEqual(phase_end["ended_at"], r2["ended_at"])
+
+        # And therefore the outgoing iteration/phase closed no later than the
+        # next iteration's own first dispatch started.
+        self.assertLessEqual(iter1_end["ended_at"], w2["started_at"])
 
     def test_a_run_with_no_dispatches_writes_no_phase_or_iteration_boundary_rows(
         self,

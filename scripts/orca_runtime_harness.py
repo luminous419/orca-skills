@@ -658,15 +658,25 @@ class OrcaRuntimeHarness:
         self._logging_errors: list[str] = []
         # OS-17 review round 4 MAJOR: the currently-open phase/iteration TIMING_LOG
         # boundary, if any -- advanced automatically by _open_phase_iteration_
-        # boundary() (called from _log_attempt(), the one call site every dispatch
-        # already goes through) and closed by finish() for whatever is still open
-        # when the run ends. "" / None means nothing is currently open.
+        # boundary(), called just before a dispatch starts (run_existing_task(),
+        # observe_unexpected_exit()) so its own started_at brackets that dispatch
+        # rather than trailing it, and closed by finish() for whatever is still
+        # open when the run ends. "" / None means nothing is currently open.
+        # round 5 review MAJOR: *_last_ended_at tracks the ended_at of the most
+        # recent attempt actually inside the currently open scope (updated by
+        # _log_attempt() on every settled attempt) so that closing an OUTGOING
+        # scope on a transition uses that scope's own last real activity, never
+        # "whenever the next scope's dispatch happens to settle" -- otherwise an
+        # outgoing iteration/phase's duration would silently include the next
+        # one's dispatch time.
         self._open_phase: str = ""
         self._open_phase_started_at: str = ""
         self._open_phase_result: str = ""
+        self._open_phase_last_ended_at: str = ""
         self._open_iteration: tuple[str, int] | None = None
         self._open_iteration_started_at: str = ""
         self._open_iteration_result: str = ""
+        self._open_iteration_last_ended_at: str = ""
 
     @staticmethod
     def _resolve_orca() -> str:
@@ -1934,12 +1944,12 @@ class OrcaRuntimeHarness:
         """
         if not self.run_id:
             return
-        # OS-17 review round 4 MAJOR: advances (or opens, on the first attempt of a
-        # run) the TIMING_LOG.md phase/iteration boundary for THIS attempt's own
-        # (phase, iteration) before anything else about the attempt is logged --
-        # see _open_phase_iteration_boundary()'s own docstring for why this is the
-        # one place that makes the boundary automatic rather than opt-in.
-        self._open_phase_iteration_boundary(phase or "", attempt.iteration)
+        # round 5 review MAJOR: the phase/iteration boundary for this attempt's
+        # own (phase, iteration) is opened by the CALLER, before the dispatch
+        # this attempt reports on ever started -- see _open_phase_iteration_
+        # boundary()'s own docstring. By the time _log_attempt() runs, the
+        # dispatch has already settled, so this method only ever RECORDS the
+        # scope's ongoing state, never opens it.
         action = "created" if terminal_created else "reused"
         body_excerpt = " ".join((attempt.body or "").split())[:160]
         # OS-17 review: derived from attempt.role/attempt.body -- the same two
@@ -1948,14 +1958,17 @@ class OrcaRuntimeHarness:
         # to know either verdict before the write it belongs to.
         gate_result = _reviewer_gate_result(attempt.role, attempt.body or "")
         review_verdict = _reviewer_review_verdict(attempt.role, attempt.body or "")
-        # The most recent reviewer-role gate result observed for the currently open
-        # iteration/phase becomes that boundary's own eventual phase_end/
-        # iteration_end `detail` when it closes -- see _close_iteration_boundary()/
-        # _close_phase_boundary(). A Worker attempt (gate_result == "") leaves
-        # whatever the phase/iteration already carries unchanged.
+        # The most recent reviewer-role gate result, and this attempt's own
+        # ended_at, observed for the currently open iteration/phase become that
+        # boundary's own eventual iteration_end/phase_end `detail`/`ended_at`
+        # when it closes -- see _close_iteration_boundary()/_close_phase_
+        # boundary(). A Worker attempt leaves the result unchanged (gate_result
+        # == "") but still advances the scope's last-known end time.
         if gate_result:
             self._open_iteration_result = gate_result
             self._open_phase_result = gate_result
+        self._open_iteration_last_ended_at = ended_at
+        self._open_phase_last_ended_at = ended_at
         self._safe_log(
             run_logging.log_orchestrator_event,
             self.run_id,
@@ -2051,38 +2064,57 @@ class OrcaRuntimeHarness:
     # scenario functions (run_runtime_scenarios(), run_final_review_runtime_scenario(),
     # etc.) ever did, so a real OrcaRuntimeHarness run never actually produced
     # these rows despite the methods existing and being unit-tested directly.
-    # Centralized here instead: _log_attempt() is the one call site every Worker,
-    # phase Reviewer, correction, downstream revalidation, and Final Adversarial
-    # Review dispatch already goes through, so a phase/iteration transition it
-    # observes on the (phase, iteration) it is about to log is the transition --
-    # nothing else decides when a boundary opens or closes, and no caller can
-    # omit it because no caller is asked to call anything. Timing rows only --
+    # Centralized instead in the two dispatch-initiating methods that already
+    # exist for every Worker/Reviewer/correction/downstream-revalidation/Final-
+    # Review dispatch (run_existing_task(), observe_unexpected_exit()) -- nothing
+    # else decides when a boundary opens or closes, and no caller can omit it
+    # because no caller is asked to call anything.
+    #
+    # round 5 review MAJOR: opening must happen BEFORE the dispatch it brackets
+    # starts, not after settlement -- _log_attempt() runs only once the dispatch
+    # has already finished, so a boundary opened there would always start AFTER
+    # the very work it claims to bracket. _open_phase_iteration_boundary() is
+    # therefore called by the caller with its own pre-dispatch `opened_at`
+    # timestamp, not computed here. Closing an OUTGOING scope on a transition
+    # uses that scope's own *_last_ended_at (the ended_at of the last attempt
+    # actually inside it, tracked by _log_attempt() on every settled attempt) --
+    # never "now", which at transition time is really "whenever the NEW scope's
+    # dispatch happened to settle" and would silently pull the new scope's own
+    # work into the outgoing scope's duration. Timing rows only --
     # ORCHESTRATOR_LOG.md already carries phase and iteration on every
     # dispatch_settled row, so a duplicate row there would answer a question
     # that row shape already answers.
 
-    def _open_phase_iteration_boundary(self, phase: str, iteration: int) -> None:
+    def _open_phase_iteration_boundary(
+        self, phase: str, iteration: int, *, opened_at: str
+    ) -> None:
         if not self.run_id or not phase:
             return
         if phase != self._open_phase:
-            self._close_iteration_boundary()
-            self._close_phase_boundary()
+            self._close_iteration_boundary(
+                ended_at=self._open_iteration_last_ended_at or None
+            )
+            self._close_phase_boundary(
+                ended_at=self._open_phase_last_ended_at or None
+            )
             self._open_phase = phase
-            self._open_phase_started_at = run_logging.now_iso()
+            self._open_phase_started_at = opened_at
             self._safe_log(
                 run_logging.log_timing_event,
                 self.run_id,
                 base=self.artifact_dir,
                 event="phase_start",
                 phase=phase,
-                started_at=self._open_phase_started_at,
-                timestamp=self._open_phase_started_at,
+                started_at=opened_at,
+                timestamp=opened_at,
             )
         iteration_key = (phase, iteration)
         if iteration_key != self._open_iteration:
-            self._close_iteration_boundary()
+            self._close_iteration_boundary(
+                ended_at=self._open_iteration_last_ended_at or None
+            )
             self._open_iteration = iteration_key
-            self._open_iteration_started_at = run_logging.now_iso()
+            self._open_iteration_started_at = opened_at
             self._safe_log(
                 run_logging.log_timing_event,
                 self.run_id,
@@ -2090,16 +2122,16 @@ class OrcaRuntimeHarness:
                 event="iteration_start",
                 phase=phase,
                 iteration=iteration,
-                started_at=self._open_iteration_started_at,
-                timestamp=self._open_iteration_started_at,
+                started_at=opened_at,
+                timestamp=opened_at,
             )
 
-    def _close_iteration_boundary(self) -> None:
+    def _close_iteration_boundary(self, *, ended_at: str | None = None) -> None:
         if self._open_iteration is None:
             return
         phase, iteration = self._open_iteration
         started_at = self._open_iteration_started_at
-        ended_at = run_logging.now_iso()
+        ended = ended_at or run_logging.now_iso()
         self._safe_log(
             run_logging.log_timing_event,
             self.run_id,
@@ -2108,21 +2140,22 @@ class OrcaRuntimeHarness:
             phase=phase,
             iteration=iteration,
             started_at=started_at,
-            ended_at=ended_at,
-            duration_seconds=run_logging.elapsed_seconds(started_at, ended_at),
+            ended_at=ended,
+            duration_seconds=run_logging.elapsed_seconds(started_at, ended),
             detail=self._open_iteration_result,
-            timestamp=ended_at,
+            timestamp=ended,
         )
         self._open_iteration = None
         self._open_iteration_started_at = ""
         self._open_iteration_result = ""
+        self._open_iteration_last_ended_at = ""
 
-    def _close_phase_boundary(self) -> None:
+    def _close_phase_boundary(self, *, ended_at: str | None = None) -> None:
         if not self._open_phase:
             return
         phase = self._open_phase
         started_at = self._open_phase_started_at
-        ended_at = run_logging.now_iso()
+        ended = ended_at or run_logging.now_iso()
         self._safe_log(
             run_logging.log_timing_event,
             self.run_id,
@@ -2130,14 +2163,15 @@ class OrcaRuntimeHarness:
             event="phase_end",
             phase=phase,
             started_at=started_at,
-            ended_at=ended_at,
-            duration_seconds=run_logging.elapsed_seconds(started_at, ended_at),
+            ended_at=ended,
+            duration_seconds=run_logging.elapsed_seconds(started_at, ended),
             detail=self._open_phase_result,
-            timestamp=ended_at,
+            timestamp=ended,
         )
         self._open_phase = ""
         self._open_phase_started_at = ""
         self._open_phase_result = ""
+        self._open_phase_last_ended_at = ""
 
     def run_existing_task(
         self,
@@ -2204,6 +2238,11 @@ class OrcaRuntimeHarness:
             ask_before=ask_before,
         )
         dispatch_started_at = run_logging.now_iso()
+        # round 5 review MAJOR: opened here, before start_worker(), so phase_start/
+        # iteration_start actually brackets this dispatch instead of trailing it.
+        self._open_phase_iteration_boundary(
+            phase or "", iteration, opened_at=dispatch_started_at
+        )
         dispatch_id, supervised = self.start_worker(task_id, handle, spec)
         done, delivery_id = self.wait_for_done(dispatch_id)
         attempt = self.settle_attempt(
@@ -2326,6 +2365,12 @@ class OrcaRuntimeHarness:
                 phase=phase, role=role, iteration=iteration, error=error
             )
             raise
+        # round 5 review MAJOR: opened only once dispatch_context() has actually
+        # succeeded (a pre-dispatch failure above never opens a boundary), and
+        # before start_worker() -- same placement rule as run_existing_task().
+        self._open_phase_iteration_boundary(
+            phase or "", iteration, opened_at=dispatch_started_at
+        )
         task_id = self.create_task(spec)
         handle = self.create_fake_terminal(role, "exit", iteration=iteration)
         dispatch_id, supervised = self.start_worker(task_id, handle, spec)
@@ -2492,9 +2537,12 @@ class OrcaRuntimeHarness:
         # open when the run ends (the common case -- nothing in this class's
         # normal flow closes the LAST phase/iteration itself, since there is no
         # next attempt whose transition would trigger it) closes here, before the
-        # run's own terminal status is logged.
-        self._close_iteration_boundary()
-        self._close_phase_boundary()
+        # run's own terminal status is logged. round 5 review MAJOR: closed at
+        # that scope's own last recorded activity (*_last_ended_at), not "now" --
+        # snapshot-writing and the other bookkeeping just above this point is not
+        # part of the phase/iteration's own work.
+        self._close_iteration_boundary(ended_at=self._open_iteration_last_ended_at or None)
+        self._close_phase_boundary(ended_at=self._open_phase_last_ended_at or None)
         # OS-17: the one call site every scenario already reaches on its way out,
         # so "log the run's terminal status" does not need a matching reminder
         # in each of them. `result.status` is one of run_logging.RUN_STATUS_VALUES
