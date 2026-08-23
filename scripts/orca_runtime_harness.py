@@ -22,6 +22,7 @@ try:
     from scripts.task_context import (
         CANONICAL_PHASES,
         FINAL_REVIEW_PHASE,
+        TaskContextError,
         build_quality_gate_context,
         build_reviewer_context,
         build_task_boundary,
@@ -32,6 +33,7 @@ try:
         require_workflow_phase,
         strip_task_context,
     )
+    from scripts import run_logging
 except ModuleNotFoundError:  # direct `python3 scripts/...` execution
     from quality_profile import (
         INVALID_PROFILE_REASON,
@@ -41,6 +43,7 @@ except ModuleNotFoundError:  # direct `python3 scripts/...` execution
     from task_context import (
         CANONICAL_PHASES,
         FINAL_REVIEW_PHASE,
+        TaskContextError,
         build_quality_gate_context,
         build_reviewer_context,
         build_task_boundary,
@@ -51,6 +54,7 @@ except ModuleNotFoundError:  # direct `python3 scripts/...` execution
         require_workflow_phase,
         strip_task_context,
     )
+    import run_logging
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -579,6 +583,15 @@ class OrcaRuntimeHarness:
         self._terminals: dict[str, dict[str, Any]] = {}
         # dispatch_id -> lifecycle row (axis outcomes + finalization state)
         self._ledger: dict[str, dict[str, Any]] = {}
+        # OS-17: when this run's ORCHESTRATOR_LOG.md/TIMING_LOG.md were first opened
+        # (start_run()) and the wall-clock start log_run_status() diffs against.
+        # Empty until start_run() runs, same lifecycle as run_id/run_owner.
+        self._run_started_at: str = ""
+        # OS-17: best-effort logging must never change lifecycle correctness, so a
+        # write failure is caught and recorded here rather than raised -- see
+        # _log_attempt(). Empty in the overwhelmingly common case; a test can assert
+        # against it to catch a real bug in the logging helper itself.
+        self._logging_errors: list[str] = []
 
     @staticmethod
     def _resolve_orca() -> str:
@@ -1375,6 +1388,27 @@ class OrcaRuntimeHarness:
         # never the real repository's artifacts/ root, so exercising this path in
         # tests cannot litter the working tree with run directories.
         ensure_run_artifact_root(self.run_id, base=self.artifact_dir)
+        # OS-17: ORCHESTRATOR_LOG.md/TIMING_LOG.md open here, in the same
+        # already-provisioned root, one line each -- the run's own start
+        # timestamp is recorded once and reused by log_run_status() for the
+        # wall-clock duration, never re-read from the filesystem.
+        self._run_started_at = run_logging.now_iso()
+        self._safe_log(
+            run_logging.log_orchestrator_event,
+            self.run_id,
+            base=self.artifact_dir,
+            event="run_start",
+            detail=objective,
+            timestamp=self._run_started_at,
+        )
+        self._safe_log(
+            run_logging.log_timing_event,
+            self.run_id,
+            base=self.artifact_dir,
+            event="run_start",
+            started_at=self._run_started_at,
+            timestamp=self._run_started_at,
+        )
         return self.run_id
 
     def create_task(self, spec: str, *, deps: tuple[str, ...] = ()) -> str:
@@ -1786,6 +1820,130 @@ class OrcaRuntimeHarness:
         )
         return attempt
 
+    # ---- OS-17: run-scoped ORCHESTRATOR_LOG.md / TIMING_LOG.md -----------------
+    # SKILL.md section 9 has always named these two files as something a run
+    # leaves behind under its own <ARTIFACT_ROOT>, but nothing in the actual
+    # execution path wrote them. These three helpers are the whole fix: every
+    # call site below hands them a RuntimeAttempt (or a status string) this
+    # harness already built for its own return value, so no new state is
+    # invented for logging's sake. Every write goes through _safe_log so a
+    # logging failure -- a full disk, an unwritable path -- is recorded in
+    # self._logging_errors and never raised into the caller, which would
+    # otherwise turn an already-settled Dispatch into an apparent failure.
+
+    def _safe_log(self, writer: Any, *args: Any, **kwargs: Any) -> None:
+        try:
+            writer(*args, **kwargs)
+        except Exception as error:  # noqa: BLE001 -- see the section note above
+            self._logging_errors.append(f"{getattr(writer, '__name__', writer)}: {error}")
+
+    def _log_attempt(
+        self,
+        *,
+        phase: str | None,
+        attempt: "RuntimeAttempt",
+        terminal_created: bool,
+        started_at: str,
+        ended_at: str,
+        event: str = "dispatch_settled",
+    ) -> None:
+        """One ORCHESTRATOR_LOG.md row and one TIMING_LOG.md row for one attempt.
+
+        The single call site every dispatch-producing path in this class shares
+        (run_existing_task, observe_unexpected_exit): a Worker dispatch, a phase
+        Reviewer dispatch, a correction round, a downstream revalidation round,
+        and a Final Adversarial Review attempt are all just a RuntimeAttempt
+        built through one of those two methods, so logging them here once
+        answers section 2's seven questions without a second code path per
+        event kind.
+        """
+        if not self.run_id:
+            return
+        action = "created" if terminal_created else "reused"
+        body_excerpt = " ".join((attempt.body or "").split())[:160]
+        self._safe_log(
+            run_logging.log_orchestrator_event,
+            self.run_id,
+            base=self.artifact_dir,
+            event=event,
+            phase=phase or "",
+            role=attempt.role,
+            iteration=attempt.iteration,
+            task_id=attempt.task_id,
+            dispatch_id=attempt.dispatch_id,
+            terminal=attempt.terminal,
+            action=action,
+            reuse=attempt.terminal_effect,
+            result=(
+                f"outcome={attempt.outcome} settlement={attempt.settlement} "
+                f"lifecycle={attempt.lifecycle_action} "
+                f"worker_resource={attempt.worker_resource}"
+            ),
+            detail=body_excerpt,
+        )
+        self._safe_log(
+            run_logging.log_timing_event,
+            self.run_id,
+            base=self.artifact_dir,
+            event=event,
+            phase=phase or "",
+            role=attempt.role,
+            iteration=attempt.iteration,
+            started_at=started_at,
+            ended_at=ended_at,
+            duration_seconds=run_logging.elapsed_seconds(started_at, ended_at),
+            detail=f"task={attempt.task_id} dispatch={attempt.dispatch_id}",
+        )
+
+    def _log_pre_dispatch_failure(
+        self, *, phase: str | None, role: str, iteration: int, error: Exception
+    ) -> None:
+        """A dispatch_context() render that raised before any Task existed.
+
+        Section 5's "invalid quality profile 등 pre-dispatch failure": the
+        BLOCKED-style rejection build_quality_gate_context() issues (an invalid
+        profile, an undeclared requested_phases at the final gate) happens
+        before task-create, so there is no Task/Dispatch id to attach this to
+        -- only the phase/role/iteration the caller was about to dispatch.
+        """
+        if not self.run_id:
+            return
+        self._safe_log(
+            run_logging.log_orchestrator_event,
+            self.run_id,
+            base=self.artifact_dir,
+            event="pre_dispatch_failure",
+            phase=phase or "",
+            role=role,
+            iteration=iteration,
+            result="error",
+            detail=" ".join(str(error).split())[:200],
+        )
+
+    def log_run_status(self, status: str, *, reason: str = "") -> None:
+        """The one run-end log write: section 2's four terminal statuses.
+
+        Status is validated eagerly and NOT through _safe_log: an unrecognized
+        status is a caller bug (a typo'd literal), not an I/O failure, and OS-17
+        section 5 only asks that a *logging* failure stay inert -- it does not
+        ask this method to accept a status the contract does not define.
+        """
+        if status not in run_logging.RUN_STATUS_VALUES:
+            raise run_logging.RunLoggingError(
+                f"unknown run status: {status!r}; expected one of "
+                f"{run_logging.RUN_STATUS_VALUES}"
+            )
+        if not self.run_id:
+            return
+        self._safe_log(
+            run_logging.log_run_status,
+            self.run_id,
+            status,
+            base=self.artifact_dir,
+            reason=reason,
+            run_started_at=self._run_started_at,
+        )
+
     def run_existing_task(
         self,
         role: str,
@@ -1817,19 +1975,29 @@ class OrcaRuntimeHarness:
         # Before the dispatch, not after it. `spec` is what start_worker sends on the
         # low-level path and what a caller passes to task-create on the supervised
         # one, so the boundary has to be inside it by the time either happens.
-        spec, boundary, reviewer_context = dispatch_context(
-            role,
-            iteration,
-            mode,
-            phase=phase,
-            base_spec=spec,
-            findings=findings,
-            resolutions=resolutions,
-            evidence=evidence,
-            run_id=self.run_id or "",
-            quality_profile=self.quality_profile,
-            requested_phases=self.requested_phases,
-        )
+        try:
+            spec, boundary, reviewer_context = dispatch_context(
+                role,
+                iteration,
+                mode,
+                phase=phase,
+                base_spec=spec,
+                findings=findings,
+                resolutions=resolutions,
+                evidence=evidence,
+                run_id=self.run_id or "",
+                quality_profile=self.quality_profile,
+                requested_phases=self.requested_phases,
+            )
+        except (TaskContextError, OrcaRuntimeError) as error:
+            # OS-17 section 5: a pre-dispatch failure (invalid profile, an
+            # undeclared requested_phases at the final gate) happens before any
+            # Task exists. Log it, then re-raise unchanged -- this is logging
+            # ABOUT the failure, not a recovery from it.
+            self._log_pre_dispatch_failure(
+                phase=phase, role=role, iteration=iteration, error=error
+            )
+            raise
         created_here = terminal is None
         handle = terminal or self.create_fake_terminal(
             role,
@@ -1840,6 +2008,7 @@ class OrcaRuntimeHarness:
             max_dispatches=max_dispatches,
             ask_before=ask_before,
         )
+        dispatch_started_at = run_logging.now_iso()
         dispatch_id, supervised = self.start_worker(task_id, handle, spec)
         done, delivery_id = self.wait_for_done(dispatch_id)
         attempt = self.settle_attempt(
@@ -1853,6 +2022,7 @@ class OrcaRuntimeHarness:
             supervised=supervised,
             terminal=handle,
         )
+        dispatch_ended_at = run_logging.now_iso()
 
         # W-27. The one wiring point that makes test N observable on a single attempt
         # list: the same object carries (a) the handle it kept, (b) the new
@@ -1870,6 +2040,13 @@ class OrcaRuntimeHarness:
         # Parsed out of `spec` -- the string that reached task-create and worker-start
         # -- for the same reason the two above are taken from the rendered payload.
         attempt.quality_gate = tuple(sorted(parse_quality_gate(spec).items()))
+        self._log_attempt(
+            phase=phase,
+            attempt=attempt,
+            terminal_created=created_here,
+            started_at=dispatch_started_at,
+            ended_at=dispatch_ended_at,
+        )
         return attempt, handle
 
     def run_attempt(
@@ -1896,18 +2073,27 @@ class OrcaRuntimeHarness:
         # The Task spec is write-once, and on the supervised path it is the ONLY text
         # the agent sees (Orca replays it into the preamble), so it is composed here
         # rather than in run_existing_task, which meets an already-created Task.
-        spec, _, _ = dispatch_context(
-            role,
-            iteration,
-            mode,
-            phase=phase,
-            findings=findings,
-            resolutions=resolutions,
-            evidence=evidence,
-            run_id=self.run_id or "",
-            quality_profile=self.quality_profile,
-            requested_phases=self.requested_phases,
-        )
+        try:
+            spec, _, _ = dispatch_context(
+                role,
+                iteration,
+                mode,
+                phase=phase,
+                findings=findings,
+                resolutions=resolutions,
+                evidence=evidence,
+                run_id=self.run_id or "",
+                quality_profile=self.quality_profile,
+                requested_phases=self.requested_phases,
+            )
+        except (TaskContextError, OrcaRuntimeError) as error:
+            # Same OS-17 pre-dispatch-failure logging as run_existing_task's own
+            # dispatch_context() call below -- this one runs first on this path
+            # and never reaches run_existing_task if it raises.
+            self._log_pre_dispatch_failure(
+                phase=phase, role=role, iteration=iteration, error=error
+            )
+            raise
         task_id = self.create_task(spec)
         return self.run_existing_task(
             role,
@@ -1928,16 +2114,23 @@ class OrcaRuntimeHarness:
     def observe_unexpected_exit(
         self, role: str, iteration: int, *, phase: str | None = None
     ) -> RuntimeAttempt:
-        spec, _, _ = dispatch_context(
-            role,
-            iteration,
-            "exit",
-            phase=phase,
-            base_spec=f"{role} iteration {iteration}: unexpected exit",
-            run_id=self.run_id or "",
-            quality_profile=self.quality_profile,
-            requested_phases=self.requested_phases,
-        )
+        dispatch_started_at = run_logging.now_iso()
+        try:
+            spec, _, _ = dispatch_context(
+                role,
+                iteration,
+                "exit",
+                phase=phase,
+                base_spec=f"{role} iteration {iteration}: unexpected exit",
+                run_id=self.run_id or "",
+                quality_profile=self.quality_profile,
+                requested_phases=self.requested_phases,
+            )
+        except (TaskContextError, OrcaRuntimeError) as error:
+            self._log_pre_dispatch_failure(
+                phase=phase, role=role, iteration=iteration, error=error
+            )
+            raise
         task_id = self.create_task(spec)
         handle = self.create_fake_terminal(role, "exit", iteration=iteration)
         dispatch_id, supervised = self.start_worker(task_id, handle, spec)
@@ -2042,6 +2235,14 @@ class OrcaRuntimeHarness:
             cleanup_authority=axes[3],
             terminal_role=axes[4],
         )
+        self._log_attempt(
+            phase=phase,
+            attempt=attempt,
+            terminal_created=True,
+            started_at=dispatch_started_at,
+            ended_at=run_logging.now_iso(),
+            event="unexpected_exit",
+        )
         return attempt
 
     def finish(self, result: RuntimeScenarioResult) -> RuntimeScenarioResult:
@@ -2092,6 +2293,13 @@ class OrcaRuntimeHarness:
         }
         path = self.artifact_dir / f"scenario-{result.scenario.lower()}.json"
         path.write_text(json.dumps(snapshot, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        # OS-17: the one call site every scenario already reaches on its way out,
+        # so "log the run's terminal status" does not need a matching reminder
+        # in each of them. `result.status` is one of run_logging.RUN_STATUS_VALUES
+        # for every scenario this harness defines (COMPLETED/BLOCKED/ERROR/
+        # ESCALATED); log_run_status() still fails closed if that ever stops
+        # being true, before self.run_id is cleared below.
+        self.log_run_status(result.status, reason="; ".join(result.recovery))
         self.run_owner = None
         self.run_id = None
         self._raw = []

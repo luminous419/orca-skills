@@ -20,6 +20,7 @@ from typing import Any, NamedTuple
 from unittest.mock import patch
 
 from scripts import orca_runtime_harness
+from scripts import run_logging
 from scripts.orca_fake_agent import send_done
 from scripts.orca_runtime_harness import (
     CLOSE_ELIGIBLE_ROLES,
@@ -559,6 +560,7 @@ class DuplicateSettlementTests(unittest.TestCase):
         "task_id": "task_g",
         "task_status": "completed",
         "terminal": "term_worker",
+        "status": "COMPLETED",
     }
 
     def test_no_public_api_moves_a_claimed_row_back_to_absent(self) -> None:
@@ -5235,6 +5237,272 @@ class SpecializedPhaseQualityProfileTests(OfflineHarnessTestCase):
         self.assertNotIn("DESIGN-001", gate["applicable_quality_attributes"])
         self.assertNotIn("BUG-001", gate["applicable_quality_attributes"])
         self.assertEqual(gate["blocking_quality_attributes"], "REFACTOR-001")
+
+
+class RunLoggingIntegrationTests(OfflineHarnessTestCase):
+    """OS-17: ORCHESTRATOR_LOG.md / TIMING_LOG.md, produced by the real execution
+    path (start_run, run_attempt/run_existing_task, observe_unexpected_exit,
+    finish()/log_run_status()) rather than by a helper nobody calls. Every
+    assertion reads the file the harness actually wrote under
+    self.artifact_dir/artifacts/runs/<run_id>/, never the harness's in-memory
+    RuntimeAttempt objects -- those already have their own coverage elsewhere.
+
+    `arm` and the terminal fixture are borrowed by assignment, not inheritance,
+    for the same reason RunScopedQualityProfileTests borrows them.
+    """
+
+    LIVE_TERMINAL_RESOURCE = SameRoleSessionReuseTests.LIVE_TERMINAL_RESOURCE
+    arm = SameRoleSessionReuseTests.arm
+
+    def started_harness(
+        self, recorder: Any, *, run_id: str = "run_logging"
+    ) -> OrcaRuntimeHarness:
+        with patch.dict(environ, {"ORCA_CLI_COMMAND": "/opt/orca-dev"}):
+            harness = OrcaRuntimeHarness(self.artifact_dir)
+        harness._exec_orca = recorder
+        recorder.results["run-create"] = {"run": {"id": run_id}}
+        harness.start_run(
+            "OS-17 run-scoped logging", requested_phases=("implementation", "test")
+        )
+        return harness
+
+    def log_paths(self, run_id: str) -> tuple[Path, Path]:
+        root = self.artifact_dir / "artifacts" / "runs" / run_id
+        return root / run_logging.ORCHESTRATOR_LOG_FILENAME, root / run_logging.TIMING_LOG_FILENAME
+
+    @staticmethod
+    def read_rows(path: Path) -> list[dict[str, str]]:
+        lines = path.read_text(encoding="utf-8").splitlines()
+        columns = [cell.strip() for cell in lines[0].strip("|").split("|")]
+        return [
+            dict(zip(columns, (cell.strip() for cell in line.strip("|").split("|"))))
+            for line in lines[2:]
+        ]
+
+    def read_orchestrator_rows(self, run_id: str) -> list[dict[str, str]]:
+        orchestrator_log, _ = self.log_paths(run_id)
+        return self.read_rows(orchestrator_log)
+
+    # ---- A. Run creation ------------------------------------------------------
+
+    def test_start_run_creates_both_log_files_under_the_run_root(self) -> None:
+        recorder = EchoingTerminalExec()
+        harness = self.started_harness(recorder)
+
+        orchestrator_log, timing_log = self.log_paths(harness.run_id)
+        self.assertTrue(orchestrator_log.is_file())
+        self.assertTrue(timing_log.is_file())
+        self.assertEqual(orchestrator_log.parent, timing_log.parent)
+        self.assertEqual(
+            orchestrator_log.parent,
+            self.artifact_dir / "artifacts" / "runs" / harness.run_id,
+        )
+        self.assertEqual(harness._logging_errors, [])
+
+    # ---- B. Cross-run isolation -------------------------------------------
+
+    def test_two_runs_have_isolated_logs_with_no_shared_events(self) -> None:
+        harness_alpha = self.started_harness(EchoingTerminalExec(), run_id="run_alpha")
+        harness_beta = self.started_harness(EchoingTerminalExec(), run_id="run_beta")
+
+        log_alpha, _ = self.log_paths("run_alpha")
+        log_beta, _ = self.log_paths("run_beta")
+        self.assertNotEqual(log_alpha, log_beta)
+        self.assertNotIn("run_beta", log_alpha.read_text(encoding="utf-8"))
+        self.assertNotIn("run_alpha", log_beta.read_text(encoding="utf-8"))
+        self.assertEqual(harness_alpha.run_id, "run_alpha")
+        self.assertEqual(harness_beta.run_id, "run_beta")
+
+    # ---- C. Worker/Reviewer events -----------------------------------------
+
+    def test_worker_and_reviewer_dispatches_are_recorded_with_identity(self) -> None:
+        recorder = EchoingTerminalExec()
+        harness = self.started_harness(recorder)
+
+        self.arm(recorder, "ctx_w1", "task_w1")
+        harness.run_attempt("worker", 1, "complete", phase="implementation")
+        self.arm(recorder, "ctx_r1", "task_r1")
+        harness.run_attempt("reviewer", 1, "pass", phase="implementation")
+
+        rows = self.read_orchestrator_rows(harness.run_id)
+        by_dispatch = {row["dispatch_id"]: row for row in rows}
+        self.assertEqual(by_dispatch["ctx_w1"]["role"], "worker")
+        self.assertEqual(by_dispatch["ctx_w1"]["task_id"], "task_w1")
+        self.assertEqual(by_dispatch["ctx_w1"]["phase"], "implementation")
+        self.assertEqual(by_dispatch["ctx_w1"]["iteration"], "1")
+        self.assertEqual(by_dispatch["ctx_r1"]["role"], "reviewer")
+        self.assertEqual(by_dispatch["ctx_r1"]["task_id"], "task_r1")
+        self.assertEqual(by_dispatch["ctx_r1"]["phase"], "implementation")
+
+    # ---- D. Session reuse -----------------------------------------------------
+
+    def test_reused_terminal_is_distinguishable_from_created_in_the_log(self) -> None:
+        recorder = EchoingTerminalExec()
+        harness = self.started_harness(recorder)
+
+        self.arm(recorder, "ctx_r1", "task_r1")
+        _, handle1 = harness.run_attempt(
+            "reviewer", 1, "fail", phase="implementation", findings=("R1",)
+        )
+        self.arm(recorder, "ctx_r2", "task_r2")
+        _, handle2 = harness.run_attempt(
+            "reviewer",
+            2,
+            "pass",
+            phase="implementation",
+            terminal=handle1,
+            lifecycle="reuse",
+        )
+        # The scenario itself: the SAME terminal served both dispatches.
+        self.assertEqual(handle1, handle2)
+
+        rows = self.read_orchestrator_rows(harness.run_id)
+        by_dispatch = {row["dispatch_id"]: row for row in rows}
+        self.assertEqual(by_dispatch["ctx_r1"]["action"], "created")
+        self.assertEqual(by_dispatch["ctx_r2"]["action"], "reused")
+        # The log alone -- without touching the harness's live objects -- proves
+        # the "reused" dispatch reused *this specific* terminal, not merely *a*
+        # terminal: the same identifier appears in both rows.
+        self.assertEqual(by_dispatch["ctx_r1"]["terminal"], by_dispatch["ctx_r2"]["terminal"])
+        self.assertEqual(by_dispatch["ctx_r1"]["terminal"], handle1)
+
+    # ---- E. Fresh Final Review ----------------------------------------------
+
+    def test_final_review_attempts_use_distinguishable_fresh_terminals(self) -> None:
+        recorder = EchoingTerminalExec()
+        harness = self.started_harness(recorder)
+
+        self.arm(recorder, "ctx_f1", "task_f1")
+        _, handle1 = harness.run_attempt(
+            "reviewer", 1, "fail", phase="final_review", findings=("R1",)
+        )
+        self.arm(recorder, "ctx_f2", "task_f2")
+        _, handle2 = harness.run_attempt("reviewer", 2, "pass", phase="final_review")
+        self.assertNotEqual(handle1, handle2)
+
+        rows = self.read_orchestrator_rows(harness.run_id)
+        final_rows = [row for row in rows if row["phase"] == "final_review"]
+        self.assertEqual(len(final_rows), 2)
+        self.assertNotEqual(final_rows[0]["terminal"], final_rows[1]["terminal"])
+        self.assertEqual(final_rows[0]["action"], "created")
+        self.assertEqual(final_rows[1]["action"], "created")
+        self.assertEqual(final_rows[0]["iteration"], "1")
+        self.assertEqual(final_rows[1]["iteration"], "2")
+
+    # ---- F. Lifecycle -----------------------------------------------------
+
+    def test_settlement_and_lifecycle_outcome_are_recorded(self) -> None:
+        recorder = EchoingTerminalExec()
+        harness = self.started_harness(recorder)
+
+        self.arm(recorder, "ctx_w1", "task_w1")
+        harness.run_attempt("worker", 1, "complete", phase="implementation")
+
+        rows = self.read_orchestrator_rows(harness.run_id)
+        dispatch_row = next(row for row in rows if row["dispatch_id"] == "ctx_w1")
+        self.assertIn("settlement=completed", dispatch_row["result"])
+        self.assertIn("lifecycle=", dispatch_row["result"])
+        self.assertIn("worker_resource=", dispatch_row["result"])
+        self.assertIn("outcome=succeeded", dispatch_row["result"])
+
+    # ---- G. Timing ----------------------------------------------------------
+
+    def test_timing_log_captures_run_and_dispatch_durations(self) -> None:
+        recorder = EchoingTerminalExec()
+        harness = self.started_harness(recorder)
+
+        self.arm(recorder, "ctx_w1", "task_w1")
+        harness.run_attempt("worker", 1, "complete", phase="implementation")
+        harness.log_run_status("COMPLETED")
+
+        _, timing_log = self.log_paths(harness.run_id)
+        rows = self.read_rows(timing_log)
+        events = [row["event"] for row in rows]
+        self.assertIn("run_start", events)
+        self.assertIn("dispatch_settled", events)
+        self.assertIn("run_end", events)
+
+        dispatch_row = next(row for row in rows if row["event"] == "dispatch_settled")
+        self.assertNotEqual(dispatch_row["duration_s"], "")
+        self.assertNotEqual(dispatch_row["started_at"], "")
+        self.assertNotEqual(dispatch_row["ended_at"], "")
+
+        run_end_row = next(row for row in rows if row["event"] == "run_end")
+        self.assertNotEqual(run_end_row["duration_s"], "")
+        run_start_row = next(row for row in rows if row["event"] == "run_start")
+        self.assertEqual(run_end_row["started_at"], run_start_row["started_at"])
+
+    # ---- H. Non-success termination -----------------------------------------
+
+    def test_a_blocked_status_is_preserved_by_log_run_status(self) -> None:
+        recorder = EchoingTerminalExec()
+        harness = self.started_harness(recorder)
+
+        harness.log_run_status("BLOCKED", reason="max-iterations exhausted")
+
+        orchestrator_log, _ = self.log_paths(harness.run_id)
+        text = orchestrator_log.read_text(encoding="utf-8")
+        self.assertIn("BLOCKED", text)
+        self.assertIn("max-iterations exhausted", text)
+
+    def test_finish_logs_the_scenarios_own_terminal_status(self) -> None:
+        for status in ("COMPLETED", "BLOCKED", "ERROR", "ESCALATED"):
+            with self.subTest(status):
+                recorder = EchoingTerminalExec()
+                harness = self.started_harness(recorder, run_id=f"run_{status.lower()}")
+                self.arm(recorder, f"ctx_{status.lower()}", f"task_{status.lower()}")
+                worker, _ = harness.run_attempt(
+                    "worker", 1, "complete", phase="implementation"
+                )
+                run_id = harness.run_id  # finish() clears it before returning
+                harness.finish(
+                    RuntimeScenarioResult("probe", run_id, status, 1, [worker])
+                )
+                orchestrator_log, _ = self.log_paths(run_id)
+                self.assertIn(status, orchestrator_log.read_text(encoding="utf-8"))
+
+    # ---- unexpected exit / pre-dispatch failure ------------------------------
+
+    def test_unexpected_exit_is_logged_with_its_own_event_name(self) -> None:
+        recorder = EchoingTerminalExec()
+        harness = self.started_harness(recorder)
+        recorder.results["worker-show"] = {
+            "dispatch": {"status": "failed", "completed_at": None},
+            "worker": {"state": "stopped"},
+            "terminalResource": {"releaseState": "released"},
+        }
+        recorder.results["check"] = {"messages": []}
+
+        harness.observe_unexpected_exit("worker", 1, phase="implementation")
+
+        rows = self.read_orchestrator_rows(harness.run_id)
+        exit_rows = [row for row in rows if row["event"] == "unexpected_exit"]
+        self.assertEqual(len(exit_rows), 1)
+        self.assertEqual(exit_rows[0]["role"], "worker")
+        self.assertEqual(exit_rows[0]["phase"], "implementation")
+
+    def test_a_pre_dispatch_failure_is_logged_before_any_task_exists(self) -> None:
+        """External review's own fix (OS-1): an undeclared requested_phases at the
+        final gate now raises before task-create. This is that failure, logged.
+        """
+        recorder = EchoingTerminalExec()
+        with patch.dict(environ, {"ORCA_CLI_COMMAND": "/opt/orca-dev"}):
+            harness = OrcaRuntimeHarness(self.artifact_dir)
+        harness._exec_orca = recorder
+        recorder.results["run-create"] = {"run": {"id": "run_pre_dispatch"}}
+        # No requested_phases declared -- the exact fail-closed shape OS-1 fixed.
+        harness.start_run("pre-dispatch failure probe")
+
+        with self.assertRaises(TaskContextError):
+            harness.run_attempt("reviewer", 1, "pass", phase="final_review")
+
+        rows = self.read_orchestrator_rows(harness.run_id)
+        failure_rows = [row for row in rows if row["event"] == "pre_dispatch_failure"]
+        self.assertEqual(len(failure_rows), 1)
+        self.assertEqual(failure_rows[0]["role"], "reviewer")
+        self.assertEqual(failure_rows[0]["phase"], "final_review")
+        self.assertEqual(failure_rows[0]["result"], "error")
+        self.assertNotIn("task-create", recorder.verbs)
 
 
 if __name__ == "__main__":

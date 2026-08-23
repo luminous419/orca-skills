@@ -762,6 +762,67 @@ revalidation이 재검증하는 산출물은 전부 이 규칙 그대로 현재 
 이전에 `artifacts/` root 또는 다른 `<ARTIFACT_ROOT>`에 남긴 산출물은 migration하거나 삭제하지 않으며,
 새 run이 그것을 자신의 approved_baseline이나 current_delta로 참조하지도 않는다.
 
+#### Run-scoped orchestration and timing logs (OS-17)
+
+`<ARTIFACT_ROOT>ORCHESTRATOR_LOG.md`와 `<ARTIFACT_ROOT>TIMING_LOG.md`는 prose로만 존재하는 문서가
+아니라, 매 run마다 실제로 생성되고 누적되어야 하는 파일이다. 두 파일 모두 `scripts/run_logging.py`가
+소유한다. `OrcaRuntimeHarness`(Python 경로)는 이 모듈의 함수를 직접 호출하고, Bash로 직접 `orca`
+command를 실행하는 Coordinator(이 문서를 따르는 사람 또는 agent)는 동일한 로직을 CLI로 호출한다 —
+두 경로가 별도의 로깅을 구현하지 않고 하나의 writer를 공유한다.
+
+```text
+python3 scripts/run_logging.py orchestrator-event --run-id <run-id> \
+  --event <event> [--phase <phase>] [--role worker|reviewer] [--iteration <n>] \
+  [--task-id <task_id>] [--dispatch-id <dispatch_id>] [--terminal <handle>] \
+  [--action created|reused] [--reuse <effect>] [--result <text>] [--detail <text>]
+
+python3 scripts/run_logging.py timing-event --run-id <run-id> \
+  --event <event> [--phase <phase>] [--role worker|reviewer] [--iteration <n>] \
+  [--started-at <iso8601>] [--ended-at <iso8601>] [--duration-seconds <n>] [--detail <text>]
+
+python3 scripts/run_logging.py run-status --run-id <run-id> \
+  --status COMPLETED|BLOCKED|ERROR|ESCALATED [--reason <text>] [--run-started-at <iso8601>]
+```
+
+세 command 모두 저장소 root에서 실행하면(`--base` 생략) 실제 `artifacts/runs/<run-id>/` 아래에 쓴다.
+`<ARTIFACT_ROOT>`가 아직 없으면 command 자신이 만든다(`ensure_run_artifact_root`와 동일하게
+idempotent). 새 값을 계산하거나 추정하지 않는다 — 모든 인자는 Coordinator가 §6 lifecycle ledger에
+이미 들고 있는 값(Task ID, Dispatch ID, terminal handle, role/phase/iteration, settlement/lifecycle
+axis 결과)을 그대로 전달하는 것뿐이다.
+
+Coordinator는 다음 시점에 정확히 한 번씩 호출한다. 동일 event를 여러 위치에서 중복 생성하지 않는다.
+
+```text
+1. §6 1단계에서 run-id를 얻고 <ARTIFACT_ROOT>를 만든 직후
+   -> orchestrator-event --event run_start --detail "<objective>"
+   -> timing-event --event run_start --started-at <지금 시각>
+2. §6/§11 각 Worker/Reviewer Dispatch가 accepted worker_done으로 settle된 직후
+   (correction, downstream revalidation, §17 Final Adversarial Review attempt도
+   전부 이 규칙 하나로 커버된다 — 이들은 다른 phase/iteration/role로 다시 호출되는
+   같은 종류의 event일 뿐이다)
+   -> orchestrator-event --event dispatch_settled --phase <phase> --role <role>
+      --iteration <n> --task-id <task_id> --dispatch-id <dispatch_id>
+      --terminal <handle> --action created|reused --result "<outcome/settlement/lifecycle 요약>"
+   -> timing-event --event dispatch_settled --phase <phase> --role <role> --iteration <n>
+      --started-at <dispatch 직전 시각> --ended-at <settle 직후 시각>
+3. §16/§17에서 이 run의 최종 상태가 COMPLETED/BLOCKED/ERROR/ESCALATED 중 하나로 확정된 직후
+   -> run-status --status <상태> --reason "<사유>" --run-started-at <1단계의 시각>
+```
+
+Worker/Reviewer가 unexpected exit로 정리되는 경우(§6 recovery)나, invalid quality profile 등
+pre-dispatch failure로 Task 자체가 생성되지 못한 경우도 같은 `orchestrator-event`로 남긴다
+(`--event unexpected_exit` 또는 `--event pre_dispatch_failure`) — Task/Dispatch id가 아직 없다면
+비워 둔다.
+
+로깅 자체가 실패해도(디스크 오류 등) 이미 내려진 lifecycle 판단(settlement, terminal ownership,
+worker-release/retain 여부)을 다시 mutate하지 않는다. 로그 호출은 판단이 끝난 뒤 기록만 하는 별도
+단계이며, 이 호출이 실패했다고 해서 이미 완료된 Dispatch를 재시도하거나 terminal 처리를 바꾸지 않는다.
+
+두 파일은 사람이 바로 읽을 수 있는 append-only markdown table이며, 이후 자동 parsing이 가능하도록
+매 row가 동일한 column 순서를 유지한다. Retention/archive 정책은 OS-8 범위이며 이 파일들은 여기서
+삭제되거나 압축되지 않는다. Bottleneck 분석, aggregate metric, dashboard 등 richer observability는
+OS-7 범위다 — 이 절이 남기는 것은 그 분석의 입력이 될 원시 evidence뿐이다.
+
 ## 10. Worker Contract
 
 Worker는 phase별 `templates/*.md`를 따른다.
