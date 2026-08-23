@@ -750,14 +750,28 @@ class ValidatorRegressionTests(unittest.TestCase):
         """PR #15 review finding: --reuse silently dropped from the CLI example."""
         self.mutate_orchestration_skill(
             "--terminal <handle> --action created|reused --reuse <worker-start/dispatch\n"
-            "      응답의 effects[].action> --result \"<outcome/settlement/lifecycle 요약>\"",
-            "--terminal <handle> --action created|reused --result "
-            "\"<outcome/settlement/lifecycle 요약>\"",
+            "      응답의 effects[].action> [--verdict",
+            "--terminal <handle> --action created|reused [--verdict",
         )
 
         self.assert_lifecycle_contract_rejected(
             "dispatch_settled orchestrator-event example is missing "
             "'--action created|reused --reuse'"
+        )
+
+    def test_dispatch_settled_example_losing_verdict_fails(self) -> None:
+        """PR #15 second review round: --verdict must also stay in the example --
+        it is the only place the log distinguishes a settled-but-FAILed review from
+        a settled-and-PASSed one."""
+        self.mutate_orchestration_skill(
+            "응답의 effects[].action> [--verdict <role가 reviewer일 때, 응답 본문이 실제로 적어\n"
+            "      보낸 PASS|FAIL>] --result",
+            "응답의 effects[].action> --result",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "dispatch_settled orchestrator-event example is missing "
+            "'--verdict <role가 reviewer일 때'"
         )
 
     def test_run_logging_section_missing_fails(self) -> None:

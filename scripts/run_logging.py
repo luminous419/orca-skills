@@ -47,6 +47,7 @@ ORCHESTRATOR_LOG_COLUMNS = (
     "terminal",
     "action",
     "reuse",
+    "verdict",
     "result",
     "detail",
 )
@@ -141,11 +142,21 @@ def log_orchestrator_event(
     terminal: str = "",
     action: str = "",
     reuse: str = "",
+    verdict: str = "",
     result: str = "",
     detail: str = "",
     timestamp: str | None = None,
 ) -> Path:
-    """Append one row to this run's ORCHESTRATOR_LOG.md. Returns the file path."""
+    """Append one row to this run's ORCHESTRATOR_LOG.md. Returns the file path.
+
+    `verdict` is the reviewer-role gate decision (PASS/FAIL) already parsed out of
+    the settled dispatch's own body -- distinct from `result`'s `outcome=...`, which
+    only says the dispatch/process settled successfully. A Reviewer can settle
+    successfully while its review verdict is FAIL (the normal correction-loop case),
+    so `result`'s `outcome=succeeded` alone cannot answer "did this phase/iteration
+    PASS?" -- that is what this column is for. Blank for non-reviewer dispatches and
+    for any event this run's caller did not attach a parsed verdict to.
+    """
     path = orchestrator_log_path(run_id, base=base)
     _ensure_table(path, ORCHESTRATOR_LOG_COLUMNS)
     _append_row(
@@ -162,6 +173,7 @@ def log_orchestrator_event(
             "terminal": terminal,
             "action": action,
             "reuse": reuse,
+            "verdict": verdict,
             "result": result,
             "detail": detail,
         },
@@ -183,10 +195,22 @@ def log_timing_event(
     detail: str = "",
     timestamp: str | None = None,
 ) -> Path:
-    """Append one row to this run's TIMING_LOG.md. Returns the file path."""
+    """Append one row to this run's TIMING_LOG.md. Returns the file path.
+
+    `duration_seconds` is optional. When the caller supplies both `started_at` and
+    `ended_at` but omits (or leaves blank) `duration_seconds`, it is derived here via
+    `elapsed_seconds()` -- the same computation the Python harness path used to do at
+    every call site. Deriving it once, in the writer both paths share, is what keeps
+    a live Coordinator's `timing-event` CLI calls (which only ever had timestamps to
+    give it) numerically identical to `OrcaRuntimeHarness`'s own rows, instead of the
+    CLI path silently leaving `duration_s` blank while the Python path filled it in.
+    An explicit `duration_seconds` (including `0.0`) is never overridden.
+    """
     path = timing_log_path(run_id, base=base)
     _ensure_table(path, TIMING_LOG_COLUMNS)
     duration = duration_seconds
+    if duration in ("", None) and started_at and ended_at:
+        duration = elapsed_seconds(started_at, ended_at)
     if isinstance(duration, float):
         duration = f"{duration:.3f}"
     _append_row(
@@ -285,6 +309,7 @@ def _build_parser() -> argparse.ArgumentParser:
     orchestrator.add_argument("--terminal", default="")
     orchestrator.add_argument("--action", default="", choices=("", "created", "reused"))
     orchestrator.add_argument("--reuse", default="")
+    orchestrator.add_argument("--verdict", default="")
     orchestrator.add_argument("--result", default="")
     orchestrator.add_argument("--detail", default="")
 
@@ -324,6 +349,7 @@ def main(argv: list[str] | None = None) -> int:
             terminal=args.terminal,
             action=args.action,
             reuse=args.reuse,
+            verdict=args.verdict,
             result=args.result,
             detail=args.detail,
         )

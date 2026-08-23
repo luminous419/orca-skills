@@ -343,10 +343,14 @@ QUALITY_GATE_REVIEW_POLICY_ANCHORS = (
 )
 # OS-17 review follow-up: the dispatch_settled example is the one place a Coordinator
 # copies its `orchestrator-event` invocation from. `--action` (Coordinator's own
-# created/reused decision) and `--reuse` (Orca's own reported effects[].action) answer
-# different questions; losing either from the example silently loses that column from
-# every ORCHESTRATOR_LOG.md a live Coordinator ever writes.
-RUN_LOGGING_DISPATCH_SETTLED_ANCHORS = ("--action created|reused --reuse",)
+# created/reused decision), `--reuse` (Orca's own reported effects[].action) and
+# `--verdict` (the settled review's own PASS/FAIL, distinct from dispatch outcome)
+# answer three different questions; losing any of them from the example silently
+# loses that column from every ORCHESTRATOR_LOG.md a live Coordinator ever writes.
+RUN_LOGGING_DISPATCH_SETTLED_ANCHORS = (
+    "--action created|reused --reuse",
+    "--verdict <role가 reviewer일 때",
+)
 
 
 

@@ -65,6 +65,51 @@ class TableWritingTests(unittest.TestCase):
         self.assertEqual(lines[0], "| " + " | ".join(TIMING_LOG_COLUMNS) + " |")
         self.assertEqual(len(lines), 4)
 
+    def test_timing_event_derives_duration_when_only_timestamps_are_given(
+        self,
+    ) -> None:
+        """PR #15 second review round MINOR: the live-Coordinator CLI path only ever
+        has timestamps to give timing-event, not a pre-computed duration -- so the
+        writer itself must derive duration_s, or the CLI path's rows go blank while
+        OrcaRuntimeHarness's own rows (which always computed it) stay populated.
+        """
+        log_timing_event(
+            "run_1",
+            base=self.base,
+            event="dispatch_settled",
+            started_at="2026-01-01T00:00:00+00:00",
+            ended_at="2026-01-01T00:00:05+00:00",
+        )
+        text = timing_log_path("run_1", base=self.base).read_text(encoding="utf-8")
+        self.assertIn("5.000", text)
+
+    def test_an_explicit_duration_of_zero_is_not_overridden(self) -> None:
+        log_timing_event(
+            "run_1",
+            base=self.base,
+            event="dispatch_settled",
+            started_at="2026-01-01T00:00:00+00:00",
+            ended_at="2026-01-01T00:05:00+00:00",
+            duration_seconds=0.0,
+        )
+        text = timing_log_path("run_1", base=self.base).read_text(encoding="utf-8")
+        self.assertIn("0.000", text)
+        self.assertNotIn("300.000", text)
+
+    def test_a_missing_timestamp_leaves_duration_blank_not_guessed(self) -> None:
+        log_timing_event(
+            "run_1",
+            base=self.base,
+            event="dispatch_settled",
+            started_at="2026-01-01T00:00:00+00:00",
+        )
+        lines = timing_log_path("run_1", base=self.base).read_text(
+            encoding="utf-8"
+        ).splitlines()
+        last_row = [cell.strip() for cell in lines[-1].strip("|").split("|")]
+        duration_index = TIMING_LOG_COLUMNS.index("duration_s")
+        self.assertEqual(last_row[duration_index], "")
+
     def test_the_two_logs_are_independent_files_under_the_same_run_root(self) -> None:
         log_orchestrator_event("run_1", base=self.base, event="run_start")
         log_timing_event("run_1", base=self.base, event="run_start")
@@ -250,6 +295,54 @@ class CliTests(unittest.TestCase):
         text = timing_log_path("run_cli", base=self.base).read_text(encoding="utf-8")
         self.assertIn("dispatch", text)
         self.assertIn("5.0", text)
+
+    def test_timing_event_subcommand_derives_duration_without_the_flag(self) -> None:
+        """PR #15 second review round MINOR: SKILL.md's own phase/iteration/
+        dispatch_settled timing-event examples never pass --duration-seconds --
+        only timestamps. This is the CLI path that has to fill it in on its own.
+        """
+        with redirect_stdout(StringIO()):
+            exit_code = cli_main(
+                [
+                    "timing-event",
+                    "--run-id",
+                    "run_cli",
+                    "--base",
+                    str(self.base),
+                    "--event",
+                    "dispatch_settled",
+                    "--started-at",
+                    "2026-01-01T00:00:00+00:00",
+                    "--ended-at",
+                    "2026-01-01T00:00:05+00:00",
+                ]
+            )
+        self.assertEqual(exit_code, 0)
+        text = timing_log_path("run_cli", base=self.base).read_text(encoding="utf-8")
+        self.assertIn("5.000", text)
+
+    def test_orchestrator_event_subcommand_accepts_a_verdict(self) -> None:
+        with redirect_stdout(StringIO()):
+            exit_code = cli_main(
+                [
+                    "orchestrator-event",
+                    "--run-id",
+                    "run_cli",
+                    "--base",
+                    str(self.base),
+                    "--event",
+                    "dispatch_settled",
+                    "--role",
+                    "reviewer",
+                    "--verdict",
+                    "FAIL",
+                ]
+            )
+        self.assertEqual(exit_code, 0)
+        text = orchestrator_log_path("run_cli", base=self.base).read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("FAIL", text)
 
     def test_run_status_subcommand_writes_both_logs(self) -> None:
         with redirect_stdout(StringIO()):

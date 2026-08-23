@@ -34,6 +34,7 @@ try:
         strip_task_context,
     )
     from scripts import run_logging
+    from scripts.workflow_contract import load_workflow_output_contract
 except ModuleNotFoundError:  # direct `python3 scripts/...` execution
     from quality_profile import (
         INVALID_PROFILE_REASON,
@@ -55,6 +56,7 @@ except ModuleNotFoundError:  # direct `python3 scripts/...` execution
         strip_task_context,
     )
     import run_logging
+    from workflow_contract import load_workflow_output_contract
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -68,6 +70,14 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 # precisely so that even that path cannot re-read the file mid-sequence.
 REPO_QUALITY_PROFILE = resolve_quality_profile(REPO_ROOT)
 FAKE_CODEX = REPO_ROOT / "scripts" / "fake_bin" / "codex"
+# OS-17 review MAJOR: the same field/PASS/FAIL vocabulary orca_fake_agent.py already
+# reads out of SKILL.md to build a fake reviewer's own response, read here once so
+# _reviewer_verdict() below can recognize that response in a settled attempt's body
+# without hardcoding a private mode vocabulary that belongs to the fake agent, not to
+# this harness.
+REVIEWER_VERDICT_CONTRACT = load_workflow_output_contract(
+    REPO_ROOT / "orca-worker-reviewer-orchestration" / "SKILL.md"
+)
 WAIT_TYPES = "worker_done,escalation,question"
 SUPPORTED_ORCA_APP_VERSION = "1.4.184"
 REQUIRED_ORCHESTRATION_GUIDE_SNIPPETS = (
@@ -545,6 +555,34 @@ def dispatch_context(
         boundary,
         reviewer_context,
     )
+
+
+def _reviewer_verdict(role: str, body: str) -> str:
+    """The gate verdict (PASS/FAIL) already written into a settled attempt's body.
+
+    OS-17 review MAJOR: `attempt.outcome` only says the dispatch/process settled
+    successfully -- a Reviewer settles just as successfully when its verdict is FAIL
+    (the normal correction-loop case) as when it is PASS, so `outcome=succeeded` alone
+    cannot answer "did this phase/iteration PASS?". This reads the actual `RESULT:
+    PASS`/`RESULT: FAIL` line the settled dispatch wrote, using the same field/value
+    vocabulary SKILL.md documents (REVIEWER_VERDICT_CONTRACT), rather than guessing
+    from the caller's dispatch `mode` -- which would only work for this repository's
+    own scripted fake reviewer, not for a real one. A non-reviewer role, or a body
+    that never wrote a recognizable line (an unexpected exit, a malformed response),
+    both correctly resolve to "" -- an unresolved verdict is a blank, not a guess.
+    """
+    if not role.endswith("reviewer"):
+        return ""
+    field = REVIEWER_VERDICT_CONTRACT.reviewer_field
+    pass_line = f"{field}: {REVIEWER_VERDICT_CONTRACT.reviewer_pass}"
+    fail_line = f"{field}: {REVIEWER_VERDICT_CONTRACT.reviewer_fail}"
+    for line in body.splitlines():
+        stripped = line.strip()
+        if stripped == pass_line:
+            return REVIEWER_VERDICT_CONTRACT.reviewer_pass
+        if stripped == fail_line:
+            return REVIEWER_VERDICT_CONTRACT.reviewer_fail
+    return ""
 
 
 class OrcaRuntimeHarness:
@@ -1868,6 +1906,11 @@ class OrcaRuntimeHarness:
             return
         action = "created" if terminal_created else "reused"
         body_excerpt = " ".join((attempt.body or "").split())[:160]
+        # OS-17 review MAJOR: derived from attempt.role/attempt.body -- the same two
+        # fields every call site of this method already populated by settlement --
+        # not threaded in as a new parameter, since nothing outside this method needs
+        # to know the review verdict before the write it belongs to.
+        verdict = _reviewer_verdict(attempt.role, attempt.body or "")
         self._safe_log(
             run_logging.log_orchestrator_event,
             self.run_id,
@@ -1881,6 +1924,7 @@ class OrcaRuntimeHarness:
             terminal=attempt.terminal,
             action=action,
             reuse=attempt.terminal_effect,
+            verdict=verdict,
             result=(
                 f"outcome={attempt.outcome} settlement={attempt.settlement} "
                 f"lifecycle={attempt.lifecycle_action} "

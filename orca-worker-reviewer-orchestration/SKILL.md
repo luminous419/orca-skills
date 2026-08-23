@@ -774,7 +774,8 @@ command를 실행하는 Coordinator(이 문서를 따르는 사람 또는 agent)
 python3 scripts/run_logging.py orchestrator-event --run-id <run-id> \
   --event <event> [--phase <phase>] [--role worker|reviewer] [--iteration <n>] \
   [--task-id <task_id>] [--dispatch-id <dispatch_id>] [--terminal <handle>] \
-  [--action created|reused] [--reuse <effect>] [--result <text>] [--detail <text>]
+  [--action created|reused] [--reuse <effect>] [--verdict PASS|FAIL] \
+  [--result <text>] [--detail <text>]
 
 python3 scripts/run_logging.py timing-event --run-id <run-id> \
   --event <event> [--phase <phase>] [--role worker|reviewer] [--iteration <n>] \
@@ -783,6 +784,12 @@ python3 scripts/run_logging.py timing-event --run-id <run-id> \
 python3 scripts/run_logging.py run-status --run-id <run-id> \
   --status COMPLETED|BLOCKED|ERROR|ESCALATED [--reason <text>] [--run-started-at <iso8601>]
 ```
+
+`--duration-seconds`는 생략해도 된다. `--started-at`과 `--ended-at`을 둘 다 주면 `timing-event`가 그
+차이로 `duration_s`를 스스로 채운다 — `OrcaRuntimeHarness`(Python 경로)가 항상 해 온 계산을 CLI 쪽으로도
+옮겨, 두 경로가 같은 타임스탬프 쌍에서 다른 `duration_s`를 남기지 않게 한다. 둘 중 하나라도 비어 있으면
+`duration_s`는 빈 값으로 남는다 — 값을 추정하지 않는다. `--duration-seconds`를 직접 준 경우(`0`
+포함)는 그 값을 그대로 쓰고 다시 계산하지 않는다.
 
 세 command 모두 저장소 root에서 실행하면(`--base` 생략) 실제 `artifacts/runs/<run-id>/` 아래에 쓴다.
 `<ARTIFACT_ROOT>`가 아직 없으면 command 자신이 만든다(`ensure_run_artifact_root`와 동일하게
@@ -795,6 +802,17 @@ Coordinator 자신의 결정이다 — 기존 terminal을 넘겼으면 `reused`,
 `--reuse`는 Orca 자신이 보고한 실제 결과다 — `worker-start`(또는 low-level `dispatch`) 응답의
 `effects[].action`(`kind: terminal`인 항목) 값을 그대로 전달한다. 이 값은 Coordinator가 §6에서
 terminal handle을 뽑아낼 때 이미 읽는 바로 그 JSON 필드이므로 별도로 조회할 필요가 없다.
+
+`--verdict`는 이 셋 중 어느 것도 아닌 네 번째 질문에 답한다 — dispatch가 아니라 review 자체의
+결과다. `result`의 `outcome=succeeded`는 그 Dispatch/process가 정상적으로 settle됐다는 뜻일
+뿐이고, Reviewer가 정상적으로 settle되면서 `RESULT: FAIL`을 낸 경우(=correction loop로 넘어가는
+평범한 경우)도 outcome은 여전히 `succeeded`다. 즉 `result`만으로는 "이 phase/iteration이
+PASS했는가"에 답할 수 없다. Worker Dispatch에는 review 자체가 없으므로 `--verdict`를 생략한다.
+Reviewer/Final Reviewer Dispatch에는 그 settle된 응답이 실제로 적어 보낸 판정 — worker/reviewer
+공통 결과 형식(§10/§11)이 쓰는 필드와 값 그대로, 예: `RESULT: PASS`/`RESULT: FAIL` — 을 그대로
+전달한다. 새로 판단하거나 추정하지 않는다: 이미 그 응답 본문에 적혀 있는 값을 그대로 옮기는 것뿐이다.
+그 응답이 예상한 형식을 갖추지 못했다면(예: unexpected exit, malformed response) `--verdict`를
+생략한다 — 빈 값이 추측한 값보다 정직하다.
 
 Coordinator는 다음 시점에 정확히 한 번씩 호출한다. 동일 event를 여러 위치에서 중복 생성하지 않는다.
 
@@ -818,7 +836,8 @@ Coordinator는 다음 시점에 정확히 한 번씩 호출한다. 동일 event�
    -> orchestrator-event --event dispatch_settled --phase <phase> --role <role>
       --iteration <n> --task-id <task_id> --dispatch-id <dispatch_id>
       --terminal <handle> --action created|reused --reuse <worker-start/dispatch
-      응답의 effects[].action> --result "<outcome/settlement/lifecycle 요약>"
+      응답의 effects[].action> [--verdict <role가 reviewer일 때, 응답 본문이 실제로 적어
+      보낸 PASS|FAIL>] --result "<outcome/settlement/lifecycle 요약>"
    -> timing-event --event dispatch_settled --phase <phase> --role <role> --iteration <n>
       --started-at <dispatch 직전 시각> --ended-at <settle 직후 시각>
 5. §16/§17에서 이 run의 최종 상태가 COMPLETED/BLOCKED/ERROR/ESCALATED 중 하나로 확정된 직후
