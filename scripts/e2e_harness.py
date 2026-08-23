@@ -50,7 +50,15 @@ UNACCOUNTED_RESOLUTION = "UNACCOUNTED"
 QUALITY_ATTRIBUTE_LINE = re.compile(
     r"(?m)^Quality Attribute:\s*(?P<attribute>[A-Za-z][A-Za-z0-9_-]*)\s*$"
 )
+SEVERITY_LINE = re.compile(
+    r"(?m)^Severity:\s*(?P<severity>CRITICAL|MAJOR|MINOR)\s*$"
+)
 BLOCKING_LINE = re.compile(r"(?m)^Blocking:\s*(?P<blocking>YES|NO)\s*$")
+# `Quality Attribute: NONE` is the contract's own spelling for "charged to no
+# project attribute", and reviews/common.md pairs it with exactly one blocking
+# value: NO. A General Gate violation is blocking and is charged to G1-G5, never to
+# NONE, so NONE + YES names no criterion at all and cannot be acted on.
+UNCHARGED_QUALITY_ATTRIBUTE = "NONE"
 RESPONSIBLE_PHASE_LINE = re.compile(
     r"(?m)^Responsible Phase:\s*(?P<phase>[a-z][a-z0-9_]*)\s*$"
 )
@@ -343,6 +351,21 @@ def downstream_revalidation_set(
     return tuple(p for p in CANONICAL_PHASES[min(indices) + 1:] if p in requested)
 
 
+def _require_finding_field(
+    pattern: re.Pattern[str], block: str, finding_id: str, field: str
+) -> re.Match[str]:
+    """The match for a REQUIRED finding field, or a contract error naming it.
+
+    One helper for all three so no field can end up with a quiet default while its
+    siblings raise -- which is exactly how `Quality Attribute:` and `Severity:` drifted
+    apart from `Blocking:`.
+    """
+    found = pattern.search(block)
+    if found is None:
+        raise OutputContractError(f"finding {finding_id} has no {field} field")
+    return found
+
+
 def parse_final_review_output(
     output: str, contract: WorkflowOutputContract
 ) -> tuple[str, tuple[FinalFinding, ...]]:
@@ -360,9 +383,19 @@ def parse_final_review_output(
     anything honoured `Blocking:`. The caller now sees every finding and has to decide
     on the field, which is what makes the OS-1 severity/blocking split observable.
 
-    `Blocking:` is required on every finding rather than inferred from the section it
-    sits in: inferring it would re-derive the field from exactly the signal it exists
-    to replace, and a report that dropped the line would silently keep working.
+    Every contract field -- `Quality Attribute:`, `Severity:` and `Blocking:` -- is
+    REQUIRED, and none of them is inferred from the section a finding sits in or from
+    a default. Inferring would re-derive a field from exactly the signal it exists to
+    replace, and defaulting is worse: a report that dropped the line would parse into
+    a finding this function invented, and every downstream assertion about that field
+    would then be an assertion about the default. `Severity:` was defaulted rather
+    than parsed until iteration 3, which silently made an equal-severity control read
+    MAJOR == MAJOR no matter what the report said.
+
+    The one forbidden combination is rejected here too: `Quality Attribute: NONE`
+    with `Blocking: YES`. A finding charged to no attribute is a generic observation,
+    and a blocking one is charged to a project attribute id or a General Gate id --
+    so the pair names no criterion the run could act on.
     """
     verdict, _ = parse_reviewer_output(output, contract)
     sections = {
@@ -381,23 +414,34 @@ def parse_final_review_output(
                 else len(body)
             )
             block = body[start:end]
-            blocking_match = BLOCKING_LINE.search(block)
-            if blocking_match is None:
+            finding_id = match.group("id")
+            attribute = _require_finding_field(
+                QUALITY_ATTRIBUTE_LINE, block, finding_id, "Quality Attribute"
+            ).group("attribute")
+            severity = _require_finding_field(
+                SEVERITY_LINE, block, finding_id, "Severity"
+            ).group("severity")
+            blocking = (
+                _require_finding_field(
+                    BLOCKING_LINE, block, finding_id, "Blocking"
+                ).group("blocking")
+                == "YES"
+            )
+            if attribute == UNCHARGED_QUALITY_ATTRIBUTE and blocking:
                 raise OutputContractError(
-                    f"finding {match.group('id')} has no Blocking field"
+                    f"finding {finding_id} is Blocking: YES with "
+                    f"Quality Attribute: {UNCHARGED_QUALITY_ATTRIBUTE}; a blocking "
+                    "finding is charged to a project attribute id or a General Gate "
+                    "id, never to NONE"
                 )
-            attribute_match = QUALITY_ATTRIBUTE_LINE.search(block)
             phase_match = RESPONSIBLE_PHASE_LINE.search(block)
             findings.append(
                 FinalFinding(
-                    match.group("id"),
+                    finding_id,
                     phase_match.group("phase") if phase_match is not None else None,
-                    quality_attribute=(
-                        attribute_match.group("attribute")
-                        if attribute_match is not None
-                        else "NONE"
-                    ),
-                    blocking=blocking_match.group("blocking") == "YES",
+                    severity=severity,
+                    quality_attribute=attribute,
+                    blocking=blocking,
                 )
             )
     return verdict, tuple(findings)

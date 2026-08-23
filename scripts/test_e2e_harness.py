@@ -2128,6 +2128,123 @@ class FinalReviewFindingContractTests(unittest.TestCase):
         with self.assertRaisesRegex(OutputContractError, "no Blocking field"):
             parse_final_review_output(output, self.contract())
 
+    def test_a_finding_without_a_quality_attribute_field_is_malformed(self) -> None:
+        """TEST-I2 F-001: the field was optional and silently invented as NONE.
+
+        A real report can omit it, and the parser used to answer with a finding it
+        made up -- so every downstream assertion about the attribute was an assertion
+        about the fallback. That is also why the iteration-2 dropped-field mutation
+        appeared to be caught: a happy-path test greps the fake reviewer's generated
+        text, while this boundary accepted the malformed report.
+        """
+        output = self.report(
+            "## Blocking Findings",
+            "ID: R1",
+            "Severity: MAJOR",
+            "Blocking: YES",
+            "Responsible Phase: implementation",
+        )
+
+        with self.assertRaisesRegex(
+            OutputContractError, "R1 has no Quality Attribute field"
+        ):
+            parse_final_review_output(output, self.contract())
+
+    def test_a_finding_without_a_severity_field_is_malformed(self) -> None:
+        """The sibling gap: severity was never parsed at all, only defaulted."""
+        output = self.report(
+            "## Blocking Findings",
+            "ID: R1",
+            "Quality Attribute: DOMAIN-001",
+            "Blocking: YES",
+            "Responsible Phase: implementation",
+        )
+
+        with self.assertRaisesRegex(OutputContractError, "R1 has no Severity field"):
+            parse_final_review_output(output, self.contract())
+
+    def test_severity_is_read_from_the_report_not_defaulted(self) -> None:
+        """Until iteration 3 every parsed finding was MAJOR whatever the report said.
+
+        That made an equal-severity control assert MAJOR == MAJOR by construction.
+        Parsing a report whose severities DIFFER is what proves the field is read.
+        """
+        output = self.report(
+            "## Blocking Findings",
+            "ID: R1",
+            "Quality Attribute: DOMAIN-001",
+            "Severity: CRITICAL",
+            "Blocking: YES",
+            "Responsible Phase: implementation",
+            "",
+            "## Non-Blocking Findings",
+            "ID: N1",
+            "Quality Attribute: TEAM-001",
+            "Severity: MINOR",
+            "Blocking: NO",
+        )
+
+        _verdict, findings = parse_final_review_output(output, self.contract())
+
+        by_id = {finding.finding_id: finding for finding in findings}
+        self.assertEqual(by_id["R1"].severity, "CRITICAL")
+        self.assertEqual(by_id["N1"].severity, "MINOR")
+
+    def test_an_uncharged_blocking_finding_is_malformed(self) -> None:
+        """`Quality Attribute: NONE` with `Blocking: YES` names no criterion.
+
+        reviews/common.md pairs NONE with exactly one blocking value, NO. A blocking
+        General Gate violation is charged to G1-G5, so NONE + YES is a finding that
+        claims to fail the gate under nothing at all.
+        """
+        output = self.report(
+            "## Blocking Findings",
+            "ID: R1",
+            "Quality Attribute: NONE",
+            "Severity: MAJOR",
+            "Blocking: YES",
+            "Responsible Phase: implementation",
+        )
+
+        with self.assertRaisesRegex(OutputContractError, "R1 is Blocking: YES with"):
+            parse_final_review_output(output, self.contract())
+
+    def test_the_legitimate_pairings_are_still_accepted(self) -> None:
+        """The rejection must be exactly one combination, not a blunt instrument.
+
+        NONE + NO is a generic observation, a General Gate id + YES is a gate
+        violation, and a non-blocking PROFILE attribute + NO is the ordinary case for
+        an attribute whose `blocking:` is false. All three are valid.
+        """
+        output = self.report(
+            "## Blocking Findings",
+            "ID: G1F",
+            "Quality Attribute: G1",
+            "Severity: MAJOR",
+            "Blocking: YES",
+            "Responsible Phase: implementation",
+            "",
+            "## Non-Blocking Findings",
+            "ID: N1",
+            "Quality Attribute: NONE",
+            "Severity: MINOR",
+            "Blocking: NO",
+            "",
+            "ID: N2",
+            "Quality Attribute: TEAM-001",
+            "Severity: MAJOR",
+            "Blocking: NO",
+        )
+
+        _verdict, findings = parse_final_review_output(output, self.contract())
+
+        by_id = {finding.finding_id: finding for finding in findings}
+        self.assertEqual(set(by_id), {"G1F", "N1", "N2"})
+        self.assertTrue(by_id["G1F"].blocking)
+        self.assertFalse(by_id["N1"].blocking)
+        self.assertFalse(by_id["N2"].blocking)
+        self.assertEqual(by_id["N2"].quality_attribute, "TEAM-001")
+
     def test_the_emitted_fields_are_the_ones_SKILL_md_documents(self) -> None:
         """Anti-drift: the deterministic reviewer must speak the documented contract.
 
