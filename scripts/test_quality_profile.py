@@ -27,6 +27,7 @@ from scripts.quality_profile import (
     QualityProfileError,
     blocking_attributes,
     load_profile_text,
+    parse_profile_document,
     resolve_quality_profile,
     workflow_gate_value,
 )
@@ -95,6 +96,120 @@ class ProfileLoaderTests(unittest.TestCase):
         )
         self.assertIs(team.blocking, False)
         self.assertEqual(team.applies_to, ())
+
+    def test_an_inline_flow_sequence_is_equivalent_to_a_block_sequence(self) -> None:
+        """External review MINOR: `[a, b, c]` is ordinary YAML, and now parses.
+
+        A user who reads "this is a `.yaml` file" and writes the common inline-list
+        form must get the same result a block list gives, not a scalar string that
+        fails validation for an unrelated-looking reason.
+        """
+        inline = textwrap.dedent(
+            """\
+            version: 1
+
+            quality_attributes:
+
+              - id: DOMAIN-001
+                category: business-domain
+                name: Idempotent processing
+                blocking: true
+                applies_to: [design, implementation, test]
+                verification: [code, tests]
+            """
+        )
+        block = textwrap.dedent(
+            """\
+            version: 1
+
+            quality_attributes:
+
+              - id: DOMAIN-001
+                category: business-domain
+                name: Idempotent processing
+                blocking: true
+                applies_to:
+                  - design
+                  - implementation
+                  - test
+                verification:
+                  - code
+                  - tests
+            """
+        )
+        inline_attribute = load_profile_text(inline).attributes[0]
+        block_attribute = load_profile_text(block).attributes[0]
+        self.assertEqual(inline_attribute.applies_to, block_attribute.applies_to)
+        self.assertEqual(inline_attribute.verification, block_attribute.verification)
+        self.assertEqual(inline_attribute.applies_to, ("design", "implementation", "test"))
+
+    def test_an_empty_inline_flow_sequence_is_an_empty_list(self) -> None:
+        """`[]` parses to `[]`, not to a one-item list or a scalar.
+
+        An attribute's own optional `verification`/`applies_to` fields separately
+        require a non-empty list once one is declared (a pre-existing, unrelated
+        validation rule) -- checked here at the raw-parse layer instead, the same
+        layer `quality_attributes: []` already exercises for a top-level empty list.
+        """
+        document = parse_profile_document(
+            "version: 1\nquality_attributes: []\n"
+        )
+        self.assertEqual(document["quality_attributes"], [])
+
+    def test_an_inline_flow_sequence_item_may_be_quoted(self) -> None:
+        """A quoted item may contain the characters that would otherwise split it."""
+        profile = load_profile_text(
+            "version: 1\n"
+            "quality_attributes:\n"
+            "  - id: TEAM-001\n"
+            "    category: team-convention\n"
+            "    name: Repository convention\n"
+            "    blocking: false\n"
+            '    verification: ["code, tests: both", docs]\n'
+        )
+        self.assertEqual(
+            profile.attributes[0].verification, ("code, tests: both", "docs")
+        )
+
+    def test_a_nested_inline_sequence_is_rejected_not_flattened(self) -> None:
+        with self.assertRaisesRegex(QualityProfileError, "nested"):
+            load_profile_text(
+                "version: 1\n"
+                "quality_attributes:\n"
+                "  - id: TEAM-001\n"
+                "    category: team-convention\n"
+                "    name: Repository convention\n"
+                "    blocking: false\n"
+                "    applies_to: [[design, test], implementation]\n"
+            )
+
+    def test_a_trailing_or_doubled_comma_is_rejected_not_a_null_entry(self) -> None:
+        """A gap between commas must not silently become a null list entry."""
+        for label, source in (
+            (
+                "trailing comma",
+                "version: 1\n"
+                "quality_attributes:\n"
+                "  - id: TEAM-001\n"
+                "    category: team-convention\n"
+                "    name: Repository convention\n"
+                "    blocking: false\n"
+                "    verification: [code, tests,]\n",
+            ),
+            (
+                "doubled comma",
+                "version: 1\n"
+                "quality_attributes:\n"
+                "  - id: TEAM-001\n"
+                "    category: team-convention\n"
+                "    name: Repository convention\n"
+                "    blocking: false\n"
+                "    verification: [code,,tests]\n",
+            ),
+        ):
+            with self.subTest(label):
+                with self.assertRaisesRegex(QualityProfileError, "empty entry"):
+                    load_profile_text(source)
 
     def test_a_missing_profile_is_absent_not_invalid(self) -> None:
         """Absent and invalid demand opposite responses, so they are separate states."""

@@ -165,8 +165,59 @@ def _strip_comment(line: str) -> str:
     return line
 
 
+def _flow_sequence(text: str) -> list[Any]:
+    """Parse `[a, b, c]` inline flow-sequence syntax.
+
+    `applies_to: [design, implementation, test]` is ordinary, common YAML, and a
+    schema that calls itself `.yaml` while silently rejecting it (as a scalar
+    string, then a validation error unrelated to the real cause) is exactly the
+    kind of unexplained mismatch this restricted parser otherwise refuses rather
+    than allows: better to understand the common inline form than to leave a user
+    guessing why valid-looking YAML does not validate. Still deliberately
+    restricted -- one flat list of scalars, no nested `[...]` or `{...}`, because
+    this schema never nests a list inside a list.
+    """
+    inner = text[1:-1].strip()
+    if not inner:
+        return []
+    items: list[str] = []
+    current: list[str] = []
+    quote: str | None = None
+    for char in inner:
+        if quote:
+            current.append(char)
+            if char == quote:
+                quote = None
+            continue
+        if char in "\"'":
+            quote = char
+            current.append(char)
+            continue
+        if char in "[]{}":
+            raise QualityProfileError(
+                f"nested [...] or {{...}} is not supported in an inline list: {text!r}"
+            )
+        if char == ",":
+            items.append("".join(current))
+            current = []
+            continue
+        current.append(char)
+    if quote is not None:
+        raise QualityProfileError(f"unterminated quote in inline list: {text!r}")
+    items.append("".join(current))
+    stripped = [item.strip() for item in items]
+    if any(not item for item in stripped):
+        # A trailing or doubled comma (`[a, b,]`, `[a,,b]`) is not valid YAML flow
+        # syntax; silently turning the gap into a null entry would be exactly the
+        # partial parse this reader otherwise refuses.
+        raise QualityProfileError(f"empty entry in inline list: {text!r}")
+    return [_scalar(item) for item in stripped]
+
+
 def _scalar(raw: str) -> Any:
     text = raw.strip()
+    if text.startswith("[") and text.endswith("]"):
+        return _flow_sequence(text)
     if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
         return text[1:-1]
     if text in ("true", "false"):
@@ -281,7 +332,8 @@ def parse_profile_document(source: str) -> dict[str, Any]:
     """Parse the restricted YAML subset a quality profile is written in.
 
     Supports exactly what the schema needs: `key: scalar`, nested mappings, block
-    sequences of scalars and of mappings, and `>`/`|` block scalars. Anything else
+    sequences of scalars and of mappings, inline `[a, b, c]` flow sequences of
+    scalars, and `>`/`|` block scalars. Anything else
     raises rather than being skipped, so a profile written with a construct this
     reader does not model reads as invalid instead of as partially applied.
     """

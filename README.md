@@ -137,6 +137,17 @@ requested workflow as a whole.
 Deliberately **not** in scope: profile inheritance, remote profiles, organization-wide
 profiles, merge hierarchies, dynamic rule engines, and LLM-generated profiles.
 
+#### YAML subset
+
+`quality-profile.yaml` is parsed by a small, stdlib-only, restricted-subset parser
+(`scripts/quality_profile.py`), not a general-purpose YAML library — this repository
+depends on nothing outside the standard library. It supports `key: value` mappings,
+block sequences (`- item` and `- key: value` list-of-mappings), inline flow sequences
+(`applies_to: [design, implementation, test]`), quoted scalars, and `>`/`|` block
+scalars. It refuses anything it does not understand — including YAML features it does
+not implement, such as nested `[...]`/`{...}` inside an inline list, anchors/aliases,
+or multi-document files — rather than guessing at a partial parse.
+
 ### Minimal General Gate
 
 The general layer is intentionally small and stays five categories:

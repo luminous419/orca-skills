@@ -769,6 +769,14 @@ class OfflineHarnessTestCase(unittest.TestCase):
             harness = OrcaRuntimeHarness(self.artifact_dir)
         harness._exec_orca = recorder  # the only process boundary
         harness.run_owner, harness.run_id = "term_owner", "run_offline"
+        # This helper bypasses start_run() (no real run-create RPC), so it stubs the
+        # requested-phases declaration start_run() would otherwise make too -- a
+        # test that dispatches phase=final_review through this offline run needs a
+        # non-empty set, or build_quality_gate_context() now fails closed exactly as
+        # it should for a REAL undeclared run. The value itself is not the subject of
+        # any test that uses build(); FinalReviewQualityProfileTests declares its own
+        # meaningful set through the real start_run() path instead of this stub.
+        harness.requested_phases = ("implementation",)
         return harness
 
     def worker_terminal(
@@ -4596,7 +4604,9 @@ quality_attributes:
         self.write_profile(root, self.PROFILE_AT_RUN_START)
         recorder = EchoingTerminalExec()
         harness = self.build_for(recorder, root)
-        harness.start_run("run scoped quality profile")
+        harness.start_run(
+            "run scoped quality profile", requested_phases=("implementation",)
+        )
         resolved = harness.quality_profile
 
         self.arm(recorder, "ctx_worker_1", "task_worker_1")
@@ -4611,6 +4621,32 @@ quality_attributes:
         final_gate = parse_quality_gate(recorder.specs["task_final_1"])
         self.assertIn("DOMAIN-001", final_gate["applicable_quality_attributes"])
         self.assertNotIn("LATE-001", final_gate["applicable_quality_attributes"])
+
+    def test_final_review_fails_closed_when_no_requested_phases_were_declared(
+        self,
+    ) -> None:
+        """External review MAJOR: no declared requested set is not "every phase".
+
+        Before this fix, dispatch_context() silently widened an undeclared requested
+        set to ALL_APPLICABLE_PHASES at the final gate. That fallback let an
+        attribute scoped to a phase this run never touched reach the Final
+        Adversarial Review anyway. It is now a hard failure at the real harness
+        dispatch path, not just at build_quality_gate_context() called directly.
+        """
+        root = self.profile_root()
+        self.write_profile(root, self.PROFILE_AT_RUN_START)
+        recorder = EchoingTerminalExec()
+        harness = self.build_for(recorder, root)
+        harness.start_run("run scoped quality profile")  # no requested_phases
+        self.assertEqual(harness.requested_phases, ())
+
+        self.arm(recorder, "ctx_final_1", "task_final_1")
+        with self.assertRaisesRegex(TaskContextError, "requested_phases is required"):
+            harness.run_attempt("reviewer", 1, "pass", phase="final_review")
+
+        # Fail closed means no Task was created for the ungoverned dispatch either:
+        # dispatch_context() raises before run_attempt ever calls create_task.
+        self.assertNotIn("task-create", recorder.verbs)
 
     def test_start_run_refuses_an_invalid_profile_before_anything_exists(self) -> None:
         """Fail at the run boundary, not at the first spec that needs the model."""
@@ -4638,29 +4674,44 @@ quality_attributes:
         self.assertNotIn("run-create", recorder.verbs)
 
     def test_no_harness_path_can_omit_the_run_resolution(self) -> None:
-        """The structural half: an omitted argument is how F-001 shipped.
+        """The structural half: an omitted argument is how F-001 and the external
+        review's MAJOR both shipped.
 
         Behavioural tests catch the paths they exercise. This one refuses the shape
-        that made the defect possible at all -- a dispatch_context call inside the
-        harness that lets the parameter default, and a resolve call anywhere other
-        than the two boundaries (module import and start_run).
+        that made both defects possible at all -- a dispatch_context call inside the
+        harness that lets quality_profile or requested_phases default (the latter is
+        what let the final gate silently widen to every applicable phase instead of
+        failing closed), and a resolve call anywhere other than the two boundaries
+        (module import and start_run).
         """
         source = Path(orca_runtime_harness.__file__).read_text(encoding="utf-8")
         module = ast.parse(source)
 
-        omitted = [
-            node.lineno
+        dispatch_context_calls = [
+            node
             for node in ast.walk(module)
             if isinstance(node, ast.Call)
             and getattr(node.func, "id", None) == "dispatch_context"
-            and "quality_profile" not in {keyword.arg for keyword in node.keywords}
         ]
-        self.assertEqual(
-            omitted,
-            [],
-            "a harness path lets quality_profile default instead of passing the "
-            "run's own resolution",
-        )
+        for keyword_name, reason in (
+            (
+                "quality_profile",
+                "a harness path lets quality_profile default instead of passing "
+                "the run's own resolution",
+            ),
+            (
+                "requested_phases",
+                "a harness path lets requested_phases default instead of passing "
+                "the run's own declared set -- this is how the final gate silently "
+                "widened to every applicable phase",
+            ),
+        ):
+            omitted = [
+                node.lineno
+                for node in dispatch_context_calls
+                if keyword_name not in {keyword.arg for keyword in node.keywords}
+            ]
+            self.assertEqual(omitted, [], reason)
 
         resolves = [
             node.lineno
@@ -4849,6 +4900,13 @@ quality_attributes:
     applies_to:
       - bugfix
 
+  - id: REFACTOR-001
+    category: operational-risk
+    name: Refactoring only rule
+    blocking: true
+    applies_to:
+      - refactoring
+
   - id: TEAM-001
     category: team-convention
     name: Repository convention
@@ -4880,7 +4938,13 @@ quality_attributes:
             )
         harness._exec_orca = recorder
         recorder.results["run-create"] = {"run": {"id": "run_final_profile"}}
-        harness.start_run("final review with a quality profile installed")
+        # full_run() below only ever dispatches implementation and test -- the
+        # requested set a real run of this shape would declare, and the set every
+        # test in this class asserts the final gate is scoped to.
+        harness.start_run(
+            "final review with a quality profile installed",
+            requested_phases=("implementation", "test"),
+        )
         return harness
 
     def attempt(
@@ -4976,7 +5040,17 @@ quality_attributes:
                 self.assertEqual(gate["profile_status"], "loaded")
 
     def test_the_final_reviewer_spec_carries_the_profile_attributes(self) -> None:
-        """13-H a, the positive half: the gate is not merely present but populated."""
+        """13-H a, the positive half: the gate is not merely present but populated.
+
+        External review MAJOR: this run's requested phases are declared
+        (implementation, test) in started_harness(), so DESIGN-001/BUG-001/
+        REFACTOR-001 (each scoped to a phase this run never requested) must be
+        excluded from the real dispatched Final Review spec -- not merely from a
+        direct build_quality_gate_context() call, which
+        test_a_declared_requested_set_narrows_the_final_gate already covers.
+        DOMAIN-001 (implementation+test) and TEAM-001 (no applies_to, so every
+        phase) remain in scope regardless.
+        """
         recorder = EchoingTerminalExec()
         harness = self.started_harness(recorder)
 
@@ -4985,15 +5059,15 @@ quality_attributes:
         for label in ("final_1", "final_2"):
             with self.subTest(label):
                 gate = parse_quality_gate(specs[label])
-                # No requested set is declared through run_attempt, so the documented
-                # conservative fallback applies: the final gate spans every applicable
-                # phase rather than silently narrowing to one.
-                for identifier in ("DOMAIN-001", "DESIGN-001", "BUG-001", "TEAM-001"):
+                for identifier in ("DOMAIN-001", "TEAM-001"):
                     self.assertIn(
                         identifier, gate["applicable_quality_attributes"]
                     )
-                self.assertIn("DOMAIN-001", gate["blocking_quality_attributes"])
-                self.assertIn("BUG-001", gate["blocking_quality_attributes"])
+                for identifier in ("DESIGN-001", "BUG-001", "REFACTOR-001"):
+                    self.assertNotIn(
+                        identifier, gate["applicable_quality_attributes"]
+                    )
+                self.assertEqual(gate["blocking_quality_attributes"], "DOMAIN-001")
 
     def test_a_declared_requested_set_narrows_the_final_gate(self) -> None:
         """The other branch: a Final Review told which phases ran scopes to them."""
@@ -5015,6 +5089,7 @@ quality_attributes:
         self.assertIn("TEAM-001", gate["applicable_quality_attributes"])
         self.assertNotIn("DESIGN-001", gate["applicable_quality_attributes"])
         self.assertNotIn("BUG-001", gate["applicable_quality_attributes"])
+        self.assertNotIn("REFACTOR-001", gate["applicable_quality_attributes"])
 
     def test_the_correction_round_is_judged_against_its_phases_own_attributes(
         self,
@@ -5061,7 +5136,10 @@ quality_attributes:
             )
         harness._exec_orca = recorder
         recorder.results["run-create"] = {"run": {"id": "run_fresh_profile"}}
-        harness.start_run("final review freshness with a profile")
+        harness.start_run(
+            "final review freshness with a profile",
+            requested_phases=("implementation",),
+        )
 
         handles = []
         for index in (1, 2):
@@ -5135,10 +5213,14 @@ class SpecializedPhaseQualityProfileTests(OfflineHarnessTestCase):
         self.assertIn("TEAM-001", worker["applicable_quality_attributes"])
         self.assertNotIn("DOMAIN-001", worker["applicable_quality_attributes"])
         self.assertNotIn("DESIGN-001", worker["applicable_quality_attributes"])
+        self.assertNotIn("REFACTOR-001", worker["applicable_quality_attributes"])
         self.assertEqual(worker["blocking_quality_attributes"], "BUG-001")
 
-    def test_a_refactoring_run_sees_only_the_unscoped_attribute(self) -> None:
-        """No attribute in this profile names refactoring, so only TEAM-001 applies."""
+    def test_a_refactoring_run_sees_its_own_attribute_and_the_unscoped_one(
+        self,
+    ) -> None:
+        """REFACTOR-001 (refactoring-only) and TEAM-001 (unscoped) apply; the
+        canonical-phase and bugfix-only attributes do not."""
         recorder = EchoingTerminalExec()
         harness = self.started_harness(recorder)
 
@@ -5147,11 +5229,12 @@ class SpecializedPhaseQualityProfileTests(OfflineHarnessTestCase):
 
         gate = parse_quality_gate(recorder.specs["task_ref_w"])
 
-        self.assertEqual(
-            gate["applicable_quality_attributes"],
-            "TEAM-001 [team-convention] non-blocking: Repository convention",
-        )
-        self.assertEqual(gate["blocking_quality_attributes"], "none")
+        self.assertIn("REFACTOR-001", gate["applicable_quality_attributes"])
+        self.assertIn("TEAM-001", gate["applicable_quality_attributes"])
+        self.assertNotIn("DOMAIN-001", gate["applicable_quality_attributes"])
+        self.assertNotIn("DESIGN-001", gate["applicable_quality_attributes"])
+        self.assertNotIn("BUG-001", gate["applicable_quality_attributes"])
+        self.assertEqual(gate["blocking_quality_attributes"], "REFACTOR-001")
 
 
 if __name__ == "__main__":

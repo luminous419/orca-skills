@@ -20,7 +20,6 @@ try:
         resolve_quality_profile,
     )
     from scripts.task_context import (
-        ALL_APPLICABLE_PHASES,
         CANONICAL_PHASES,
         FINAL_REVIEW_PHASE,
         build_quality_gate_context,
@@ -40,7 +39,6 @@ except ModuleNotFoundError:  # direct `python3 scripts/...` execution
         resolve_quality_profile,
     )
     from task_context import (
-        ALL_APPLICABLE_PHASES,
         CANONICAL_PHASES,
         FINAL_REVIEW_PHASE,
         build_quality_gate_context,
@@ -525,16 +523,18 @@ def dispatch_context(
     # again, so two specs built moments apart cannot describe two different profiles.
     if quality_profile is None:
         quality_profile = REPO_QUALITY_PROFILE
-    # An undeclared requested set at the final gate resolves to every applicable
-    # phase, never to none: the conservative direction is the one that cannot hide an
-    # attribute from the gate that is supposed to re-check the whole workflow.
-    scope = requested_phases or (
-        ALL_APPLICABLE_PHASES if phase == FINAL_REVIEW_PHASE else ()
-    )
+    # External review MAJOR: an undeclared requested set at the final gate used to
+    # resolve to every applicable phase, which can hand the Final Adversarial Review
+    # an attribute scoped to a phase this run never requested (DESIGN, BUGFIX,
+    # REFACTORING-only rules reaching an implementation+test run) and manufacture a
+    # false blocking violation / correction loop. requested_phases is passed straight
+    # through instead: build_quality_gate_context already fails closed (raises) when
+    # the final_review gate has no requested set, and that fail-closed behaviour is
+    # the whole fix -- broadening was never a real fallback, it was the defect.
     quality_gate = build_quality_gate_context(
         resolution=quality_profile,
         current_phase=phase,
-        requested_phases=scope,
+        requested_phases=requested_phases,
     )
     return (
         render_task_spec(base, boundary, reviewer_context, quality_gate),
@@ -557,6 +557,13 @@ class OrcaRuntimeHarness:
         self.artifact_dir.mkdir(parents=True, exist_ok=True)
         self.run_owner: str | None = None
         self.run_id: str | None = None
+        # The requested workflow phases for the current run, set once by start_run()
+        # and never inferred from which attempts happen to occur (a correction round
+        # can dispatch a phase without that phase having been "requested"). Empty
+        # until start_run() is called, and empty is exactly the state that must fail
+        # closed at the final_review gate rather than silently widen to every phase --
+        # see the External review MAJOR note in dispatch_context().
+        self.requested_phases: tuple[str, ...] = ()
         # The tree the run's quality profile is read from, and the ONE resolution
         # every spec this harness renders is built from. start_run() re-reads it once
         # at the run boundary and then nothing re-reads it until the next run: a
@@ -1323,7 +1330,19 @@ class OrcaRuntimeHarness:
             },
         }
 
-    def start_run(self, objective: str) -> str:
+    def start_run(
+        self, objective: str, *, requested_phases: tuple[str, ...] = ()
+    ) -> str:
+        """STEP 0. `requested_phases` is the run-scoped set every final_review
+        dispatch of this run is judged against (external review MAJOR): explicit,
+        not inferred from which attempts happen to occur, and validated here so a
+        typo'd phase fails at the run boundary rather than inside a rendered spec.
+        Left empty for a run that never reaches final_review; a run that does and
+        never declared one fails closed at that dispatch instead of silently
+        widening to every applicable phase.
+        """
+        for candidate in requested_phases:
+            require_workflow_phase(candidate, field="requested_phases")
         # STEP 0, before the run terminal and long before the first Task. The run's
         # quality model is read exactly once, here, and an invalid profile stops the
         # run at its boundary instead of at the first spec that needs it: nobody can
@@ -1347,6 +1366,7 @@ class OrcaRuntimeHarness:
             "orchestration", "run-create", "--objective", objective, "--from", self.run_owner
         )
         self.run_id = created["result"]["run"]["id"]
+        self.requested_phases = tuple(requested_phases)
         self._signals = []
         self._ledger = {}
         # Provisioned here, once, immediately after the run id is known -- and
@@ -1808,6 +1828,7 @@ class OrcaRuntimeHarness:
             evidence=evidence,
             run_id=self.run_id or "",
             quality_profile=self.quality_profile,
+            requested_phases=self.requested_phases,
         )
         created_here = terminal is None
         handle = terminal or self.create_fake_terminal(
@@ -1885,6 +1906,7 @@ class OrcaRuntimeHarness:
             evidence=evidence,
             run_id=self.run_id or "",
             quality_profile=self.quality_profile,
+            requested_phases=self.requested_phases,
         )
         task_id = self.create_task(spec)
         return self.run_existing_task(
@@ -1914,6 +1936,7 @@ class OrcaRuntimeHarness:
             base_spec=f"{role} iteration {iteration}: unexpected exit",
             run_id=self.run_id or "",
             quality_profile=self.quality_profile,
+            requested_phases=self.requested_phases,
         )
         task_id = self.create_task(spec)
         handle = self.create_fake_terminal(role, "exit", iteration=iteration)
@@ -2244,7 +2267,10 @@ def run_final_review_runtime_scenario(artifact_dir: Path) -> RuntimeScenarioResu
         json.dumps(preflight, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
 
-    run_id = harness.start_run("Final Adversarial Review scenario J terminal freshness")
+    run_id = harness.start_run(
+        "Final Adversarial Review scenario J terminal freshness",
+        requested_phases=(LIFECYCLE_SCENARIO_PHASE,),
+    )
     worker, _ = harness.run_attempt("worker", 1, "complete", phase=LIFECYCLE_SCENARIO_PHASE)
     phase_reviewer, phase_reviewer_terminal = harness.run_attempt(
         "reviewer", 1, "pass", phase=LIFECYCLE_SCENARIO_PHASE
@@ -2338,7 +2364,10 @@ def run_quality_profile_runtime_scenario(
     # at and quietly run the whole scenario against an absent profile.
     harness.quality_profile_root = profile_root
 
-    run_id = harness.start_run("Quality profile scenario L phase filtering")
+    run_id = harness.start_run(
+        "Quality profile scenario L phase filtering",
+        requested_phases=("design", "implementation"),
+    )
     attempts = [
         harness.run_attempt("worker", 1, "complete", phase="design")[0],
         harness.run_attempt("reviewer", 1, "pass", phase="design")[0],
@@ -2444,6 +2473,7 @@ def run_session_reuse_runtime_scenario(artifact_dir: Path) -> RuntimeScenarioRes
             base_spec=f"worker iteration {iteration}: {phase}",
             run_id=run_id,
             quality_profile=harness.quality_profile,
+            requested_phases=harness.requested_phases,
         )
         worker, _ = harness.run_existing_task(
             "worker",
@@ -2479,6 +2509,7 @@ def run_session_reuse_runtime_scenario(artifact_dir: Path) -> RuntimeScenarioRes
             evidence=reviewer_evidence,
             run_id=run_id,
             quality_profile=harness.quality_profile,
+            requested_phases=harness.requested_phases,
         )
         reviewer, _ = harness.run_existing_task(
             "reviewer",
@@ -2514,6 +2545,7 @@ def _scenario_g(harness: OrcaRuntimeHarness) -> RuntimeScenarioResult:
         phase=LIFECYCLE_SCENARIO_PHASE,
         run_id=run_id,
         quality_profile=harness.quality_profile,
+        requested_phases=harness.requested_phases,
     )[0]
     worker_task = harness.create_task(worker_spec)
     reviewer_task = harness.create_task(
@@ -2524,6 +2556,7 @@ def _scenario_g(harness: OrcaRuntimeHarness) -> RuntimeScenarioResult:
             phase=LIFECYCLE_SCENARIO_PHASE,
             run_id=run_id,
             quality_profile=harness.quality_profile,
+            requested_phases=harness.requested_phases,
         )[0],
         deps=(worker_task,),
     )
@@ -2566,6 +2599,7 @@ def _scenario_h(harness: OrcaRuntimeHarness) -> RuntimeScenarioResult:
         phase=LIFECYCLE_SCENARIO_PHASE,
         run_id=run_id,
         quality_profile=harness.quality_profile,
+        requested_phases=harness.requested_phases,
     )[0]
     worker_task = harness.create_task(worker_spec)
     worker_attempt, _ = harness.run_existing_task(
