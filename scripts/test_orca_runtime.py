@@ -75,12 +75,18 @@ class OrcaRuntimeIntegrationTests(unittest.TestCase):
                 results = run_runtime_scenarios(artifact_dir)
             except UnsupportedOrcaContract as exc:
                 self.skipTest(str(exc))
+            self.assert_run_scoped_logs_exist(artifact_dir, results)
         else:
             with tempfile.TemporaryDirectory() as directory:
+                artifact_dir = Path(directory)
                 try:
-                    results = run_runtime_scenarios(Path(directory))
+                    results = run_runtime_scenarios(artifact_dir)
                 except UnsupportedOrcaContract as exc:
                     self.skipTest(str(exc))
+                # OS-17: inside the `with` block on purpose -- the temp directory
+                # this scenario run actually wrote ORCHESTRATOR_LOG.md/TIMING_LOG.md
+                # under is gone the moment this block exits.
+                self.assert_run_scoped_logs_exist(artifact_dir, results)
 
         by_name = {result.scenario: result for result in results}
         self.assertEqual(set(by_name), set("ABCDEFGHI"))
@@ -202,6 +208,48 @@ class OrcaRuntimeIntegrationTests(unittest.TestCase):
         # (3) no force-ready command ran anywhere in Run G (real command log)
         self.assertNotIn("orchestration task-update", scenario_g.commands_used)
         self.assertNotIn("task-update:ready", scenario_g.recovery)
+
+    def assert_run_scoped_logs_exist(self, artifact_dir: Path, results) -> None:
+        """OS-17: every scenario run left ORCHESTRATOR_LOG.md/TIMING_LOG.md behind
+        under its own run directory, including a non-COMPLETED one (D=BLOCKED).
+        """
+        for scenario_name in ("A", "D"):
+            result = next(item for item in results if item.scenario == scenario_name)
+            run_root = artifact_dir / "artifacts" / "runs" / result.run_id
+            orchestrator_log = run_root / "ORCHESTRATOR_LOG.md"
+            timing_log = run_root / "TIMING_LOG.md"
+            self.assertTrue(
+                orchestrator_log.is_file(),
+                f"scenario {scenario_name}: {orchestrator_log} was not created",
+            )
+            self.assertTrue(
+                timing_log.is_file(),
+                f"scenario {scenario_name}: {timing_log} was not created",
+            )
+            log_text = orchestrator_log.read_text(encoding="utf-8")
+            self.assertIn("run_start", log_text)
+            self.assertIn(result.status, log_text)
+
+        # OS-17 review round 4 MAJOR: phase/iteration boundaries must come from
+        # the real OrcaRuntimeHarness workflow (run_runtime_scenarios() calling
+        # run_attempt()/finish(), exactly as every scenario does), not from a
+        # test calling log_phase_start()/log_iteration_start() itself. Scenario
+        # B (Worker -> Reviewer FAIL -> correction -> Reviewer PASS, two
+        # iterations of the same phase) is the real run that actually crosses a
+        # phase and two iteration boundaries, so its own TIMING_LOG.md is the
+        # proof this ran against real Orca, not a mock.
+        scenario_b = next(item for item in results if item.scenario == "B")
+        timing_text = (
+            artifact_dir / "artifacts" / "runs" / scenario_b.run_id / "TIMING_LOG.md"
+        ).read_text(encoding="utf-8")
+        for event in ("phase_start", "phase_end", "iteration_start", "iteration_end"):
+            self.assertIn(
+                f"| {event} |",
+                timing_text,
+                f"scenario B: {event} boundary row missing from a real run",
+            )
+        self.assertEqual(timing_text.count("| iteration_start |"), 2)
+        self.assertEqual(timing_text.count("| iteration_end |"), 2)
 
     def assert_scenario_h(self, scenario_h) -> None:
         """A dependent created after settlement stays pending; it is never dispatched."""

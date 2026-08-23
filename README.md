@@ -66,6 +66,38 @@ Important gates include:
 - Reviewer never edits/fixes its own findings.
 - `max-iterations` limits repeated review loops.
 
+## Run-Scoped Artifacts and Logs
+
+Every orchestration run writes everything it produces under one directory:
+
+```text
+artifacts/runs/<run-id>/
+```
+
+Phase and review artifacts (`IMPLEMENTATION.md`, `REVIEW_TEST.md`, `FINAL_REVIEW.md`, ...) live there,
+and so do two Coordinator-owned logs:
+
+| file | contents |
+| --- | --- |
+| `ORCHESTRATOR_LOG.md` | one row per lifecycle event: run start/end, every Worker/Reviewer/Final-Review dispatch settlement (phase, role, iteration, Task ID, Dispatch ID, terminal, created-vs-reused, the reviewer's own PASS/FAIL gate result and separate four-valued PASS/PASS WITH NOTES/FAIL/BLOCKED review verdict, outcome, lifecycle/cleanup result), unexpected exits, and pre-dispatch failures |
+| `TIMING_LOG.md` | one row per timed event: run start/end with wall-clock duration, phase/iteration start/end boundaries, and each dispatch's start/end/duration |
+
+Both are append-only markdown tables, auto-created on first write (`scripts/run_logging.py` owns the
+format) — a run that never reaches a given event simply never gets that row, and neither file requires
+a separate opt-in. `OrcaRuntimeHarness` (the Python path that drives real Orca) calls
+`scripts/run_logging.py`'s functions directly; a Coordinator driving `orca` by hand from the shell calls
+the same logic through `python3 <SKILL_DIR>/tools/run_logging.py orchestrator-event|timing-event|run-status
+...`, where `<SKILL_DIR>` is wherever `orca-worker-reviewer-orchestration` is actually installed (global,
+project-local, or this repository's own checkout) — the installed Skill ships its own byte-identical copy
+of this module at `orca-worker-reviewer-orchestration/tools/run_logging.py` (parity enforced by
+`scripts/validate_skills.py`) precisely because a global/project-local install never copies this
+repository's `scripts/` directory. See the orchestration skill's "Run-scoped orchestration and timing
+logs" section for the exact call points. The final `run-status` row records one of `COMPLETED`,
+`BLOCKED`, `ERROR`, or `ESCALATED`.
+
+Out of scope here: retention/archival of old runs' logs (OS-8) and richer analysis — bottleneck
+detection, aggregate metrics, dashboards (OS-7). This is raw evidence, not a report.
+
 ## Project Quality Profile
 
 The Reviewer gate is not a broad generic software-quality checklist. A verdict is

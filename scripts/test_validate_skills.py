@@ -44,6 +44,7 @@ class ValidatorRegressionTests(unittest.TestCase):
             "validate_skills.py",
             "skill_policy.py",
             "workflow_contract.py",
+            "run_logging.py",
         ):
             shutil.copy2(SOURCE_ROOT / "scripts" / filename, scripts_dir)
 
@@ -96,6 +97,44 @@ class ValidatorRegressionTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("templates/analysis.md differs between skills", result.stdout)
+
+    def test_installed_run_logging_tool_drift_fails(self) -> None:
+        """OS-17 review round 3 MAJOR-1: the installed Skill's own copy of
+        run_logging.py must stay byte-identical to scripts/run_logging.py, or a
+        Coordinator using the installed copy silently runs different logic than
+        this repository's own tests exercise."""
+        installed_path = (
+            self.repo_root
+            / "orca-worker-reviewer-orchestration"
+            / "tools"
+            / "run_logging.py"
+        )
+        installed_path.write_text(
+            installed_path.read_text(encoding="utf-8") + "\n# drift\n",
+            encoding="utf-8",
+        )
+
+        result = self.run_validator()
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(
+            "tools/run_logging.py differs from scripts/run_logging.py",
+            result.stdout,
+        )
+
+    def test_missing_installed_run_logging_tool_fails(self) -> None:
+        installed_path = (
+            self.repo_root
+            / "orca-worker-reviewer-orchestration"
+            / "tools"
+            / "run_logging.py"
+        )
+        installed_path.unlink()
+
+        result = self.run_validator()
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("tools/run_logging.py is missing", result.stdout)
 
     def test_human_readable_default_drift_fails(self) -> None:
         skill_path = (
@@ -744,6 +783,60 @@ class ValidatorRegressionTests(unittest.TestCase):
 
         self.assert_lifecycle_contract_rejected(
             "orca-worker-reviewer-loop: must not contain the quality profile contract"
+        )
+
+    def test_dispatch_settled_example_losing_reuse_fails(self) -> None:
+        """PR #15 review finding: --reuse silently dropped from the CLI example."""
+        self.mutate_orchestration_skill(
+            "--terminal <handle> --action created|reused --reuse <worker-start/dispatch\n"
+            "      응답의 effects[].action> [--gate-result",
+            "--terminal <handle> --action created|reused [--gate-result",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "dispatch_settled orchestrator-event example is missing "
+            "'--action created|reused --reuse'"
+        )
+
+    def test_dispatch_settled_example_losing_gate_result_fails(self) -> None:
+        """PR #15 second review round: --gate-result must stay in the example --
+        it is the only place the log distinguishes a settled-but-FAILed review from
+        a settled-and-PASSed one."""
+        self.mutate_orchestration_skill(
+            "응답의 effects[].action> [--gate-result <role가 reviewer일 때, 응답 본문이\n"
+            "      실제로 적어 보낸 RESULT: PASS|FAIL>] [--review-verdict",
+            "응답의 effects[].action> [--review-verdict",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "dispatch_settled orchestrator-event example is missing "
+            "'--gate-result <role가 reviewer일 때'"
+        )
+
+    def test_dispatch_settled_example_losing_review_verdict_fails(self) -> None:
+        """PR #15 third review round MAJOR-2: --review-verdict must also stay in
+        the example -- it is the only place the log preserves PASS WITH NOTES and
+        BLOCKED instead of collapsing them into the two-valued gate result."""
+        self.mutate_orchestration_skill(
+            "실제로 적어 보낸 RESULT: PASS|FAIL>] [--review-verdict <role가 reviewer일 때,\n"
+            "      응답 본문이 실제로 적어 보낸 REVIEW_VERDICT: PASS|PASS WITH NOTES|FAIL|BLOCKED>]\n"
+            "      --result",
+            "실제로 적어 보낸 RESULT: PASS|FAIL>] --result",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "dispatch_settled orchestrator-event example is missing "
+            "'--review-verdict <role가 reviewer일 때'"
+        )
+
+    def test_run_logging_section_missing_fails(self) -> None:
+        self.mutate_orchestration_skill(
+            "#### Run-scoped orchestration and timing logs (OS-17)",
+            "#### Removed",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "run-scoped orchestration/timing log section is missing"
         )
 
 if __name__ == "__main__":

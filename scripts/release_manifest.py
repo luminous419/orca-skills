@@ -8,9 +8,10 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+ORCHESTRATION_SKILL_NAME = "orca-worker-reviewer-orchestration"
 SKILL_NAMES = (
     "orca-worker-reviewer-loop",
-    "orca-worker-reviewer-orchestration",
+    ORCHESTRATION_SKILL_NAME,
 )
 PHASES = (
     "analysis",
@@ -71,6 +72,12 @@ def required_skill_paths(skill_name: str) -> set[str]:
     for phase in PHASES:
         paths.add(f"{skill_name}/templates/{phase}.md")
         paths.add(f"{skill_name}/reviews/{phase}.md")
+    if skill_name == ORCHESTRATION_SKILL_NAME:
+        # OS-17 review round 3 MAJOR-1: the run-scoped logging CLI must ship inside
+        # the installed Skill itself (INSTALL.md's `cp -R` never copies this
+        # repository's scripts/), so this one extra file is part of this skill's
+        # distributable definition. The loop skill has no such tool.
+        paths.add(f"{skill_name}/tools/run_logging.py")
     return paths
 
 

@@ -22,6 +22,7 @@ try:
     from scripts.task_context import (
         CANONICAL_PHASES,
         FINAL_REVIEW_PHASE,
+        TaskContextError,
         build_quality_gate_context,
         build_reviewer_context,
         build_task_boundary,
@@ -32,6 +33,8 @@ try:
         require_workflow_phase,
         strip_task_context,
     )
+    from scripts import run_logging
+    from scripts.workflow_contract import load_workflow_output_contract
 except ModuleNotFoundError:  # direct `python3 scripts/...` execution
     from quality_profile import (
         INVALID_PROFILE_REASON,
@@ -41,6 +44,7 @@ except ModuleNotFoundError:  # direct `python3 scripts/...` execution
     from task_context import (
         CANONICAL_PHASES,
         FINAL_REVIEW_PHASE,
+        TaskContextError,
         build_quality_gate_context,
         build_reviewer_context,
         build_task_boundary,
@@ -51,6 +55,8 @@ except ModuleNotFoundError:  # direct `python3 scripts/...` execution
         require_workflow_phase,
         strip_task_context,
     )
+    import run_logging
+    from workflow_contract import load_workflow_output_contract
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -64,6 +70,14 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 # precisely so that even that path cannot re-read the file mid-sequence.
 REPO_QUALITY_PROFILE = resolve_quality_profile(REPO_ROOT)
 FAKE_CODEX = REPO_ROOT / "scripts" / "fake_bin" / "codex"
+# OS-17 review: the same field/value vocabulary orca_fake_agent.py already reads
+# out of SKILL.md to build a fake reviewer's own response, read here once so
+# _reviewer_gate_result()/_reviewer_review_verdict() below can recognize that
+# response in a settled attempt's body without hardcoding a private mode vocabulary
+# that belongs to the fake agent, not to this harness.
+REVIEWER_VERDICT_CONTRACT = load_workflow_output_contract(
+    REPO_ROOT / "orca-worker-reviewer-orchestration" / "SKILL.md"
+)
 WAIT_TYPES = "worker_done,escalation,question"
 SUPPORTED_ORCA_APP_VERSION = "1.4.184"
 REQUIRED_ORCHESTRATION_GUIDE_SNIPPETS = (
@@ -543,6 +557,60 @@ def dispatch_context(
     )
 
 
+def _reviewer_gate_result(role: str, body: str) -> str:
+    """The two-valued workflow gate (PASS/FAIL) already written into a settled
+    attempt's body -- the value that actually drives the correction loop.
+
+    OS-17 review MAJOR: `attempt.outcome` only says the dispatch/process settled
+    successfully -- a Reviewer settles just as successfully when its gate result is
+    FAIL (the normal correction-loop case) as when it is PASS, so `outcome=succeeded`
+    alone cannot answer "did this phase/iteration PASS?". This reads the actual
+    `RESULT: PASS`/`RESULT: FAIL` line the settled dispatch wrote, using the same
+    field/value vocabulary SKILL.md documents (REVIEWER_VERDICT_CONTRACT), rather
+    than guessing from the caller's dispatch `mode` -- which would only work for this
+    repository's own scripted fake reviewer, not for a real one. A non-reviewer role,
+    or a body that never wrote a recognizable line (an unexpected exit, a malformed
+    response), both correctly resolve to "" -- an unresolved result is a blank, not a
+    guess. See _reviewer_review_verdict() below for the separate, richer, four-valued
+    report annotation this two-valued gate cannot preserve on its own.
+    """
+    if not role.endswith("reviewer"):
+        return ""
+    field = REVIEWER_VERDICT_CONTRACT.reviewer_field
+    pass_line = f"{field}: {REVIEWER_VERDICT_CONTRACT.reviewer_pass}"
+    fail_line = f"{field}: {REVIEWER_VERDICT_CONTRACT.reviewer_fail}"
+    for line in body.splitlines():
+        stripped = line.strip()
+        if stripped == pass_line:
+            return REVIEWER_VERDICT_CONTRACT.reviewer_pass
+        if stripped == fail_line:
+            return REVIEWER_VERDICT_CONTRACT.reviewer_fail
+    return ""
+
+
+def _reviewer_review_verdict(role: str, body: str) -> str:
+    """OS-1's separate four-valued report annotation (PASS / PASS WITH NOTES / FAIL /
+    BLOCKED), already written into a settled attempt's body as `REVIEW_VERDICT: ...`.
+
+    OS-17 review round 3 MAJOR-2: the two-valued workflow gate `_reviewer_gate_result`
+    reads collapses PASS WITH NOTES into PASS and BLOCKED into FAIL (reviews/common.md
+    §Verdict's own mapping) -- exactly the review-level distinction a column named
+    for "the verdict" should not silently lose. Parsed the same way as the gate
+    result: an exact line match against the vocabulary SKILL.md documents
+    (REVIEWER_VERDICT_CONTRACT.review_verdict_values), never inferred from the
+    two-valued RESULT line. A non-reviewer role, or a body that never wrote a
+    recognizable REVIEW_VERDICT line, both resolve to "" rather than a guess.
+    """
+    if not role.endswith("reviewer"):
+        return ""
+    field = REVIEWER_VERDICT_CONTRACT.review_verdict_field
+    lines = {line.strip() for line in body.splitlines()}
+    for value in REVIEWER_VERDICT_CONTRACT.review_verdict_values:
+        if f"{field}: {value}" in lines:
+            return value
+    return ""
+
+
 class OrcaRuntimeHarness:
     def __init__(
         self,
@@ -579,6 +647,36 @@ class OrcaRuntimeHarness:
         self._terminals: dict[str, dict[str, Any]] = {}
         # dispatch_id -> lifecycle row (axis outcomes + finalization state)
         self._ledger: dict[str, dict[str, Any]] = {}
+        # OS-17: when this run's ORCHESTRATOR_LOG.md/TIMING_LOG.md were first opened
+        # (start_run()) and the wall-clock start log_run_status() diffs against.
+        # Empty until start_run() runs, same lifecycle as run_id/run_owner.
+        self._run_started_at: str = ""
+        # OS-17: best-effort logging must never change lifecycle correctness, so a
+        # write failure is caught and recorded here rather than raised -- see
+        # _log_attempt(). Empty in the overwhelmingly common case; a test can assert
+        # against it to catch a real bug in the logging helper itself.
+        self._logging_errors: list[str] = []
+        # OS-17 review round 4 MAJOR: the currently-open phase/iteration TIMING_LOG
+        # boundary, if any -- advanced automatically by _open_phase_iteration_
+        # boundary(), called just before a dispatch starts (run_existing_task(),
+        # observe_unexpected_exit()) so its own started_at brackets that dispatch
+        # rather than trailing it, and closed by finish() for whatever is still
+        # open when the run ends. "" / None means nothing is currently open.
+        # round 5 review MAJOR: *_last_ended_at tracks the ended_at of the most
+        # recent attempt actually inside the currently open scope (updated by
+        # _log_attempt() on every settled attempt) so that closing an OUTGOING
+        # scope on a transition uses that scope's own last real activity, never
+        # "whenever the next scope's dispatch happens to settle" -- otherwise an
+        # outgoing iteration/phase's duration would silently include the next
+        # one's dispatch time.
+        self._open_phase: str = ""
+        self._open_phase_started_at: str = ""
+        self._open_phase_result: str = ""
+        self._open_phase_last_ended_at: str = ""
+        self._open_iteration: tuple[str, int] | None = None
+        self._open_iteration_started_at: str = ""
+        self._open_iteration_result: str = ""
+        self._open_iteration_last_ended_at: str = ""
 
     @staticmethod
     def _resolve_orca() -> str:
@@ -1375,6 +1473,27 @@ class OrcaRuntimeHarness:
         # never the real repository's artifacts/ root, so exercising this path in
         # tests cannot litter the working tree with run directories.
         ensure_run_artifact_root(self.run_id, base=self.artifact_dir)
+        # OS-17: ORCHESTRATOR_LOG.md/TIMING_LOG.md open here, in the same
+        # already-provisioned root, one line each -- the run's own start
+        # timestamp is recorded once and reused by log_run_status() for the
+        # wall-clock duration, never re-read from the filesystem.
+        self._run_started_at = run_logging.now_iso()
+        self._safe_log(
+            run_logging.log_orchestrator_event,
+            self.run_id,
+            base=self.artifact_dir,
+            event="run_start",
+            detail=objective,
+            timestamp=self._run_started_at,
+        )
+        self._safe_log(
+            run_logging.log_timing_event,
+            self.run_id,
+            base=self.artifact_dir,
+            event="run_start",
+            started_at=self._run_started_at,
+            timestamp=self._run_started_at,
+        )
         return self.run_id
 
     def create_task(self, spec: str, *, deps: tuple[str, ...] = ()) -> str:
@@ -1786,6 +1905,274 @@ class OrcaRuntimeHarness:
         )
         return attempt
 
+    # ---- OS-17: run-scoped ORCHESTRATOR_LOG.md / TIMING_LOG.md -----------------
+    # SKILL.md section 9 has always named these two files as something a run
+    # leaves behind under its own <ARTIFACT_ROOT>, but nothing in the actual
+    # execution path wrote them. These three helpers are the whole fix: every
+    # call site below hands them a RuntimeAttempt (or a status string) this
+    # harness already built for its own return value, so no new state is
+    # invented for logging's sake. Every write goes through _safe_log so a
+    # logging failure -- a full disk, an unwritable path -- is recorded in
+    # self._logging_errors and never raised into the caller, which would
+    # otherwise turn an already-settled Dispatch into an apparent failure.
+
+    def _safe_log(self, writer: Any, *args: Any, **kwargs: Any) -> None:
+        try:
+            writer(*args, **kwargs)
+        except Exception as error:  # noqa: BLE001 -- see the section note above
+            self._logging_errors.append(f"{getattr(writer, '__name__', writer)}: {error}")
+
+    def _log_attempt(
+        self,
+        *,
+        phase: str | None,
+        attempt: "RuntimeAttempt",
+        terminal_created: bool,
+        started_at: str,
+        ended_at: str,
+        event: str = "dispatch_settled",
+    ) -> None:
+        """One ORCHESTRATOR_LOG.md row and one TIMING_LOG.md row for one attempt.
+
+        The single call site every dispatch-producing path in this class shares
+        (run_existing_task, observe_unexpected_exit): a Worker dispatch, a phase
+        Reviewer dispatch, a correction round, a downstream revalidation round,
+        and a Final Adversarial Review attempt are all just a RuntimeAttempt
+        built through one of those two methods, so logging them here once
+        answers section 2's seven questions without a second code path per
+        event kind.
+        """
+        if not self.run_id:
+            return
+        # round 5 review MAJOR: the phase/iteration boundary for this attempt's
+        # own (phase, iteration) is opened by the CALLER, before the dispatch
+        # this attempt reports on ever started -- see _open_phase_iteration_
+        # boundary()'s own docstring. By the time _log_attempt() runs, the
+        # dispatch has already settled, so this method only ever RECORDS the
+        # scope's ongoing state, never opens it.
+        action = "created" if terminal_created else "reused"
+        body_excerpt = " ".join((attempt.body or "").split())[:160]
+        # OS-17 review: derived from attempt.role/attempt.body -- the same two
+        # fields every call site of this method already populated by settlement --
+        # not threaded in as new parameters, since nothing outside this method needs
+        # to know either verdict before the write it belongs to.
+        gate_result = _reviewer_gate_result(attempt.role, attempt.body or "")
+        review_verdict = _reviewer_review_verdict(attempt.role, attempt.body or "")
+        # The most recent reviewer-role gate result, and this attempt's own
+        # ended_at, observed for the currently open iteration/phase become that
+        # boundary's own eventual iteration_end/phase_end `detail`/`ended_at`
+        # when it closes -- see _close_iteration_boundary()/_close_phase_
+        # boundary(). A Worker attempt leaves the result unchanged (gate_result
+        # == "") but still advances the scope's last-known end time.
+        if gate_result:
+            self._open_iteration_result = gate_result
+            self._open_phase_result = gate_result
+        self._open_iteration_last_ended_at = ended_at
+        self._open_phase_last_ended_at = ended_at
+        self._safe_log(
+            run_logging.log_orchestrator_event,
+            self.run_id,
+            base=self.artifact_dir,
+            event=event,
+            phase=phase or "",
+            role=attempt.role,
+            iteration=attempt.iteration,
+            task_id=attempt.task_id,
+            dispatch_id=attempt.dispatch_id,
+            terminal=attempt.terminal,
+            action=action,
+            reuse=attempt.terminal_effect,
+            gate_result=gate_result,
+            review_verdict=review_verdict,
+            result=(
+                f"outcome={attempt.outcome} settlement={attempt.settlement} "
+                f"lifecycle={attempt.lifecycle_action} "
+                f"worker_resource={attempt.worker_resource}"
+            ),
+            detail=body_excerpt,
+        )
+        self._safe_log(
+            run_logging.log_timing_event,
+            self.run_id,
+            base=self.artifact_dir,
+            event=event,
+            phase=phase or "",
+            role=attempt.role,
+            iteration=attempt.iteration,
+            started_at=started_at,
+            ended_at=ended_at,
+            duration_seconds=run_logging.elapsed_seconds(started_at, ended_at),
+            detail=f"task={attempt.task_id} dispatch={attempt.dispatch_id}",
+        )
+
+    def _log_pre_dispatch_failure(
+        self, *, phase: str | None, role: str, iteration: int, error: Exception
+    ) -> None:
+        """A dispatch_context() render that raised before any Task existed.
+
+        Section 5's "invalid quality profile 등 pre-dispatch failure": the
+        BLOCKED-style rejection build_quality_gate_context() issues (an invalid
+        profile, an undeclared requested_phases at the final gate) happens
+        before task-create, so there is no Task/Dispatch id to attach this to
+        -- only the phase/role/iteration the caller was about to dispatch.
+        """
+        if not self.run_id:
+            return
+        self._safe_log(
+            run_logging.log_orchestrator_event,
+            self.run_id,
+            base=self.artifact_dir,
+            event="pre_dispatch_failure",
+            phase=phase or "",
+            role=role,
+            iteration=iteration,
+            result="error",
+            detail=" ".join(str(error).split())[:200],
+        )
+
+    def log_run_status(self, status: str, *, reason: str = "") -> None:
+        """The one run-end log write: section 2's four terminal statuses.
+
+        Status is validated eagerly and NOT through _safe_log: an unrecognized
+        status is a caller bug (a typo'd literal), not an I/O failure, and OS-17
+        section 5 only asks that a *logging* failure stay inert -- it does not
+        ask this method to accept a status the contract does not define.
+        """
+        if status not in run_logging.RUN_STATUS_VALUES:
+            raise run_logging.RunLoggingError(
+                f"unknown run status: {status!r}; expected one of "
+                f"{run_logging.RUN_STATUS_VALUES}"
+            )
+        if not self.run_id:
+            return
+        self._safe_log(
+            run_logging.log_run_status,
+            self.run_id,
+            status,
+            base=self.artifact_dir,
+            reason=reason,
+            run_started_at=self._run_started_at,
+        )
+
+    # ---- OS-17 review: automatic phase/iteration boundaries in TIMING_LOG ---------
+    # OS-17's own timing contract (section 3) named "phase start/end" and
+    # "iteration start/end" as separate line items from Worker/Reviewer/Final
+    # Review dispatch duration -- not something a reader is meant to reconstruct
+    # by grouping dispatch_settled rows. Round 3 review MAJOR: an earlier version
+    # of this made phase_start/phase_end/iteration_start/iteration_end public
+    # methods a scenario author had to remember to call -- and none of the real
+    # scenario functions (run_runtime_scenarios(), run_final_review_runtime_scenario(),
+    # etc.) ever did, so a real OrcaRuntimeHarness run never actually produced
+    # these rows despite the methods existing and being unit-tested directly.
+    # Centralized instead in the two dispatch-initiating methods that already
+    # exist for every Worker/Reviewer/correction/downstream-revalidation/Final-
+    # Review dispatch (run_existing_task(), observe_unexpected_exit()) -- nothing
+    # else decides when a boundary opens or closes, and no caller can omit it
+    # because no caller is asked to call anything.
+    #
+    # round 5 review MAJOR: opening must happen BEFORE the dispatch it brackets
+    # starts, not after settlement -- _log_attempt() runs only once the dispatch
+    # has already finished, so a boundary opened there would always start AFTER
+    # the very work it claims to bracket. _open_phase_iteration_boundary() is
+    # therefore called by the caller with its own pre-dispatch `opened_at`
+    # timestamp, not computed here. Closing an OUTGOING scope on a transition
+    # uses that scope's own *_last_ended_at (the ended_at of the last attempt
+    # actually inside it, tracked by _log_attempt() on every settled attempt) --
+    # never "now", which at transition time is really "whenever the NEW scope's
+    # dispatch happened to settle" and would silently pull the new scope's own
+    # work into the outgoing scope's duration. Timing rows only --
+    # ORCHESTRATOR_LOG.md already carries phase and iteration on every
+    # dispatch_settled row, so a duplicate row there would answer a question
+    # that row shape already answers.
+
+    def _open_phase_iteration_boundary(
+        self, phase: str, iteration: int, *, opened_at: str
+    ) -> None:
+        if not self.run_id or not phase:
+            return
+        if phase != self._open_phase:
+            self._close_iteration_boundary(
+                ended_at=self._open_iteration_last_ended_at or None
+            )
+            self._close_phase_boundary(
+                ended_at=self._open_phase_last_ended_at or None
+            )
+            self._open_phase = phase
+            self._open_phase_started_at = opened_at
+            self._safe_log(
+                run_logging.log_timing_event,
+                self.run_id,
+                base=self.artifact_dir,
+                event="phase_start",
+                phase=phase,
+                started_at=opened_at,
+                timestamp=opened_at,
+            )
+        iteration_key = (phase, iteration)
+        if iteration_key != self._open_iteration:
+            self._close_iteration_boundary(
+                ended_at=self._open_iteration_last_ended_at or None
+            )
+            self._open_iteration = iteration_key
+            self._open_iteration_started_at = opened_at
+            self._safe_log(
+                run_logging.log_timing_event,
+                self.run_id,
+                base=self.artifact_dir,
+                event="iteration_start",
+                phase=phase,
+                iteration=iteration,
+                started_at=opened_at,
+                timestamp=opened_at,
+            )
+
+    def _close_iteration_boundary(self, *, ended_at: str | None = None) -> None:
+        if self._open_iteration is None:
+            return
+        phase, iteration = self._open_iteration
+        started_at = self._open_iteration_started_at
+        ended = ended_at or run_logging.now_iso()
+        self._safe_log(
+            run_logging.log_timing_event,
+            self.run_id,
+            base=self.artifact_dir,
+            event="iteration_end",
+            phase=phase,
+            iteration=iteration,
+            started_at=started_at,
+            ended_at=ended,
+            duration_seconds=run_logging.elapsed_seconds(started_at, ended),
+            detail=self._open_iteration_result,
+            timestamp=ended,
+        )
+        self._open_iteration = None
+        self._open_iteration_started_at = ""
+        self._open_iteration_result = ""
+        self._open_iteration_last_ended_at = ""
+
+    def _close_phase_boundary(self, *, ended_at: str | None = None) -> None:
+        if not self._open_phase:
+            return
+        phase = self._open_phase
+        started_at = self._open_phase_started_at
+        ended = ended_at or run_logging.now_iso()
+        self._safe_log(
+            run_logging.log_timing_event,
+            self.run_id,
+            base=self.artifact_dir,
+            event="phase_end",
+            phase=phase,
+            started_at=started_at,
+            ended_at=ended,
+            duration_seconds=run_logging.elapsed_seconds(started_at, ended),
+            detail=self._open_phase_result,
+            timestamp=ended,
+        )
+        self._open_phase = ""
+        self._open_phase_started_at = ""
+        self._open_phase_result = ""
+        self._open_phase_last_ended_at = ""
+
     def run_existing_task(
         self,
         role: str,
@@ -1817,19 +2204,29 @@ class OrcaRuntimeHarness:
         # Before the dispatch, not after it. `spec` is what start_worker sends on the
         # low-level path and what a caller passes to task-create on the supervised
         # one, so the boundary has to be inside it by the time either happens.
-        spec, boundary, reviewer_context = dispatch_context(
-            role,
-            iteration,
-            mode,
-            phase=phase,
-            base_spec=spec,
-            findings=findings,
-            resolutions=resolutions,
-            evidence=evidence,
-            run_id=self.run_id or "",
-            quality_profile=self.quality_profile,
-            requested_phases=self.requested_phases,
-        )
+        try:
+            spec, boundary, reviewer_context = dispatch_context(
+                role,
+                iteration,
+                mode,
+                phase=phase,
+                base_spec=spec,
+                findings=findings,
+                resolutions=resolutions,
+                evidence=evidence,
+                run_id=self.run_id or "",
+                quality_profile=self.quality_profile,
+                requested_phases=self.requested_phases,
+            )
+        except (TaskContextError, OrcaRuntimeError) as error:
+            # OS-17 section 5: a pre-dispatch failure (invalid profile, an
+            # undeclared requested_phases at the final gate) happens before any
+            # Task exists. Log it, then re-raise unchanged -- this is logging
+            # ABOUT the failure, not a recovery from it.
+            self._log_pre_dispatch_failure(
+                phase=phase, role=role, iteration=iteration, error=error
+            )
+            raise
         created_here = terminal is None
         handle = terminal or self.create_fake_terminal(
             role,
@@ -1839,6 +2236,12 @@ class OrcaRuntimeHarness:
             resolutions=resolutions,
             max_dispatches=max_dispatches,
             ask_before=ask_before,
+        )
+        dispatch_started_at = run_logging.now_iso()
+        # round 5 review MAJOR: opened here, before start_worker(), so phase_start/
+        # iteration_start actually brackets this dispatch instead of trailing it.
+        self._open_phase_iteration_boundary(
+            phase or "", iteration, opened_at=dispatch_started_at
         )
         dispatch_id, supervised = self.start_worker(task_id, handle, spec)
         done, delivery_id = self.wait_for_done(dispatch_id)
@@ -1853,6 +2256,7 @@ class OrcaRuntimeHarness:
             supervised=supervised,
             terminal=handle,
         )
+        dispatch_ended_at = run_logging.now_iso()
 
         # W-27. The one wiring point that makes test N observable on a single attempt
         # list: the same object carries (a) the handle it kept, (b) the new
@@ -1870,6 +2274,13 @@ class OrcaRuntimeHarness:
         # Parsed out of `spec` -- the string that reached task-create and worker-start
         # -- for the same reason the two above are taken from the rendered payload.
         attempt.quality_gate = tuple(sorted(parse_quality_gate(spec).items()))
+        self._log_attempt(
+            phase=phase,
+            attempt=attempt,
+            terminal_created=created_here,
+            started_at=dispatch_started_at,
+            ended_at=dispatch_ended_at,
+        )
         return attempt, handle
 
     def run_attempt(
@@ -1896,18 +2307,27 @@ class OrcaRuntimeHarness:
         # The Task spec is write-once, and on the supervised path it is the ONLY text
         # the agent sees (Orca replays it into the preamble), so it is composed here
         # rather than in run_existing_task, which meets an already-created Task.
-        spec, _, _ = dispatch_context(
-            role,
-            iteration,
-            mode,
-            phase=phase,
-            findings=findings,
-            resolutions=resolutions,
-            evidence=evidence,
-            run_id=self.run_id or "",
-            quality_profile=self.quality_profile,
-            requested_phases=self.requested_phases,
-        )
+        try:
+            spec, _, _ = dispatch_context(
+                role,
+                iteration,
+                mode,
+                phase=phase,
+                findings=findings,
+                resolutions=resolutions,
+                evidence=evidence,
+                run_id=self.run_id or "",
+                quality_profile=self.quality_profile,
+                requested_phases=self.requested_phases,
+            )
+        except (TaskContextError, OrcaRuntimeError) as error:
+            # Same OS-17 pre-dispatch-failure logging as run_existing_task's own
+            # dispatch_context() call below -- this one runs first on this path
+            # and never reaches run_existing_task if it raises.
+            self._log_pre_dispatch_failure(
+                phase=phase, role=role, iteration=iteration, error=error
+            )
+            raise
         task_id = self.create_task(spec)
         return self.run_existing_task(
             role,
@@ -1928,15 +2348,28 @@ class OrcaRuntimeHarness:
     def observe_unexpected_exit(
         self, role: str, iteration: int, *, phase: str | None = None
     ) -> RuntimeAttempt:
-        spec, _, _ = dispatch_context(
-            role,
-            iteration,
-            "exit",
-            phase=phase,
-            base_spec=f"{role} iteration {iteration}: unexpected exit",
-            run_id=self.run_id or "",
-            quality_profile=self.quality_profile,
-            requested_phases=self.requested_phases,
+        dispatch_started_at = run_logging.now_iso()
+        try:
+            spec, _, _ = dispatch_context(
+                role,
+                iteration,
+                "exit",
+                phase=phase,
+                base_spec=f"{role} iteration {iteration}: unexpected exit",
+                run_id=self.run_id or "",
+                quality_profile=self.quality_profile,
+                requested_phases=self.requested_phases,
+            )
+        except (TaskContextError, OrcaRuntimeError) as error:
+            self._log_pre_dispatch_failure(
+                phase=phase, role=role, iteration=iteration, error=error
+            )
+            raise
+        # round 5 review MAJOR: opened only once dispatch_context() has actually
+        # succeeded (a pre-dispatch failure above never opens a boundary), and
+        # before start_worker() -- same placement rule as run_existing_task().
+        self._open_phase_iteration_boundary(
+            phase or "", iteration, opened_at=dispatch_started_at
         )
         task_id = self.create_task(spec)
         handle = self.create_fake_terminal(role, "exit", iteration=iteration)
@@ -2042,6 +2475,14 @@ class OrcaRuntimeHarness:
             cleanup_authority=axes[3],
             terminal_role=axes[4],
         )
+        self._log_attempt(
+            phase=phase,
+            attempt=attempt,
+            terminal_created=True,
+            started_at=dispatch_started_at,
+            ended_at=run_logging.now_iso(),
+            event="unexpected_exit",
+        )
         return attempt
 
     def finish(self, result: RuntimeScenarioResult) -> RuntimeScenarioResult:
@@ -2092,6 +2533,23 @@ class OrcaRuntimeHarness:
         }
         path = self.artifact_dir / f"scenario-{result.scenario.lower()}.json"
         path.write_text(json.dumps(snapshot, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        # OS-17 review round 4 MAJOR: whatever phase/iteration boundary is still
+        # open when the run ends (the common case -- nothing in this class's
+        # normal flow closes the LAST phase/iteration itself, since there is no
+        # next attempt whose transition would trigger it) closes here, before the
+        # run's own terminal status is logged. round 5 review MAJOR: closed at
+        # that scope's own last recorded activity (*_last_ended_at), not "now" --
+        # snapshot-writing and the other bookkeeping just above this point is not
+        # part of the phase/iteration's own work.
+        self._close_iteration_boundary(ended_at=self._open_iteration_last_ended_at or None)
+        self._close_phase_boundary(ended_at=self._open_phase_last_ended_at or None)
+        # OS-17: the one call site every scenario already reaches on its way out,
+        # so "log the run's terminal status" does not need a matching reminder
+        # in each of them. `result.status` is one of run_logging.RUN_STATUS_VALUES
+        # for every scenario this harness defines (COMPLETED/BLOCKED/ERROR/
+        # ESCALATED); log_run_status() still fails closed if that ever stops
+        # being true, before self.run_id is cleared below.
+        self.log_run_status(result.status, reason="; ".join(result.recovery))
         self.run_owner = None
         self.run_id = None
         self._raw = []

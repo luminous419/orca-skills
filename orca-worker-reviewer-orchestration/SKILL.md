@@ -762,6 +762,130 @@ revalidation이 재검증하는 산출물은 전부 이 규칙 그대로 현재 
 이전에 `artifacts/` root 또는 다른 `<ARTIFACT_ROOT>`에 남긴 산출물은 migration하거나 삭제하지 않으며,
 새 run이 그것을 자신의 approved_baseline이나 current_delta로 참조하지도 않는다.
 
+#### Run-scoped orchestration and timing logs (OS-17)
+
+`<ARTIFACT_ROOT>ORCHESTRATOR_LOG.md`와 `<ARTIFACT_ROOT>TIMING_LOG.md`는 prose로만 존재하는 문서가
+아니라, 매 run마다 실제로 생성되고 누적되어야 하는 파일이다. 두 파일 모두 `tools/run_logging.py`가
+소유한다. `OrcaRuntimeHarness`(Python 경로, 저장소 내부 `scripts/run_logging.py`)는 이 모듈의 함수를
+직접 호출하고, Bash로 직접 `orca` command를 실행하는 Coordinator(이 문서를 따르는 사람 또는 agent)는
+동일한 로직을 CLI로 호출한다 — 두 경로가 별도의 로깅을 구현하지 않고 하나의 writer를 공유한다.
+
+**`<SKILL_DIR>` 해석.** `tools/run_logging.py`는 `scripts/`가 아니라 이 SKILL.md와 같은 Skill
+디렉터리 안에 있다 — INSTALL.md가 문서화하는 global/project-local install(`cp -R
+orca-worker-reviewer-orchestration ...`)이 정확히 `SKILL.md`, `templates/`, `reviews/`,
+`tools/`만 복사하고 저장소의 `scripts/`는 복사하지 않기 때문이다(§9 참고). 따라서 Coordinator는
+아래 command의 `<SKILL_DIR>`을 "지금 로드되어 있는 이 SKILL.md 파일이 실제로 위치한 디렉터리"로
+해석한다 — global install이면 `~/.claude/skills/orca-worker-reviewer-orchestration`, project-local
+install이면 `<project>/.claude/skills/orca-worker-reviewer-orchestration`, 이 저장소 자체를 direct
+checkout으로 쓰는 개발 환경이면 `<repo>/orca-worker-reviewer-orchestration`이다. 새로 계산하거나
+추측하지 않는다 — 이미 로드된 SKILL.md 자신의 실제 경로를 그대로 쓴다. `<SKILL_DIR>`이 어디든
+`--base`를 생략하면 각 command는 **현재 작업 디렉터리**(대상 프로젝트) 기준 `artifacts/runs/<run-id>/`
+에 쓴다 — `tools/run_logging.py` 파일 자신이 어디 있는지는 쓰기 위치에 전혀 영향을 주지 않는다.
+
+```text
+python3 <SKILL_DIR>/tools/run_logging.py orchestrator-event --run-id <run-id> \
+  --event <event> [--phase <phase>] [--role worker|reviewer] [--iteration <n>] \
+  [--task-id <task_id>] [--dispatch-id <dispatch_id>] [--terminal <handle>] \
+  [--action created|reused] [--reuse <effect>] [--gate-result PASS|FAIL] \
+  [--review-verdict PASS|PASS WITH NOTES|FAIL|BLOCKED] \
+  [--result <text>] [--detail <text>]
+
+python3 <SKILL_DIR>/tools/run_logging.py timing-event --run-id <run-id> \
+  --event <event> [--phase <phase>] [--role worker|reviewer] [--iteration <n>] \
+  [--started-at <iso8601>] [--ended-at <iso8601>] [--duration-seconds <n>] [--detail <text>]
+
+python3 <SKILL_DIR>/tools/run_logging.py run-status --run-id <run-id> \
+  --status COMPLETED|BLOCKED|ERROR|ESCALATED [--reason <text>] [--run-started-at <iso8601>]
+```
+
+`--duration-seconds`는 생략해도 된다. `--started-at`과 `--ended-at`을 둘 다 주면 `timing-event`가 그
+차이로 `duration_s`를 스스로 채운다 — `OrcaRuntimeHarness`(Python 경로)가 항상 해 온 계산을 CLI 쪽으로도
+옮겨, 두 경로가 같은 타임스탬프 쌍에서 다른 `duration_s`를 남기지 않게 한다. 둘 중 하나라도 비어 있으면
+`duration_s`는 빈 값으로 남는다 — 값을 추정하지 않는다. `--duration-seconds`를 직접 준 경우(`0`
+포함)는 그 값을 그대로 쓰고 다시 계산하지 않는다.
+
+세 command 모두 대상 프로젝트 root에서 실행하면(`--base` 생략) 실제 `artifacts/runs/<run-id>/` 아래에
+쓴다. `<ARTIFACT_ROOT>`가 아직 없으면 command 자신이 만든다(idempotent). 새 값을 계산하거나
+추정하지 않는다 — 모든 인자는 Coordinator가 §6 lifecycle ledger에 이미 들고 있는 값(Task ID,
+Dispatch ID, terminal handle, role/phase/iteration, settlement/lifecycle axis 결과)을 그대로
+전달하는 것뿐이다.
+
+`--action`과 `--reuse`는 서로 다른 질문에 답하며, 하나가 다른 하나를 대신하지 않는다. `--action`은
+Coordinator 자신의 결정이다 — 기존 terminal을 넘겼으면 `reused`, 새로 만들게 했으면 `created`.
+`--reuse`는 Orca 자신이 보고한 실제 결과다 — `worker-start`(또는 low-level `dispatch`) 응답의
+`effects[].action`(`kind: terminal`인 항목) 값을 그대로 전달한다. 이 값은 Coordinator가 §6에서
+terminal handle을 뽑아낼 때 이미 읽는 바로 그 JSON 필드이므로 별도로 조회할 필요가 없다.
+
+`--gate-result`와 `--review-verdict`는 이 둘 중 어느 것도 아닌, 서로 다른 두 질문에 답한다 —
+dispatch가 아니라 review 자체의 결과다. `result`의 `outcome=succeeded`는 그 Dispatch/process가
+정상적으로 settle됐다는 뜻일 뿐이고, Reviewer가 정상적으로 settle되면서 `RESULT: FAIL`을 낸
+경우(=correction loop로 넘어가는 평범한 경우)도 outcome은 여전히 `succeeded`다. 즉 `result`만으로는
+"이 phase/iteration이 PASS했는가"에 답할 수 없다.
+
+`--gate-result`는 §10/§11 worker/reviewer 공통 결과 형식의 두 값짜리 workflow gate — 그 응답이 실제로
+적어 보낸 `RESULT: PASS`/`RESULT: FAIL` — 를 그대로 옮긴다. `--review-verdict`는 reviews/common.md
+Verdict 절이 정의하는, 별개의 네 값짜리 report annotation — `REVIEW_VERDICT: PASS`/`PASS WITH
+NOTES`/`FAIL`/`BLOCKED` — 를 그대로 옮긴다. 두 필드는 서로를 대신하지 못한다: `--gate-result`만
+쓰면 PASS WITH NOTES가 PASS로, BLOCKED가 FAIL로 뭉개져 그 구분이 로그에서 사라진다(reviews/common.md
+Verdict 절 자신의 매핑이 그렇다). 둘 다 이미 그 응답 본문에 적혀 있는 값을 그대로 옮기는 것뿐이며,
+새로 판단하거나 서로에게서 추론하지 않는다. Worker Dispatch에는 review 자체가 없으므로 둘 다
+생략한다. 응답이 예상한 형식을 갖추지 못했거나(예: malformed response) 해당 필드 자체를 쓰지
+않았다면(예: unexpected exit) 그 필드만 생략한다 — 빈 값이 추측한 값보다 정직하다.
+
+Coordinator는 다음 시점에 정확히 한 번씩 호출한다. 동일 event를 여러 위치에서 중복 생성하지 않는다.
+
+```text
+1. §6 1단계에서 run-id를 얻고 <ARTIFACT_ROOT>를 만든 직후
+   -> orchestrator-event --event run_start --detail "<objective>"
+   -> timing-event --event run_start --started-at <지금 시각>
+2. 이 phase의 첫 Task를 dispatch하기 직전 / 이 phase가 최종적으로 PASS하거나
+   §16/§17에서 종료된 직후
+   -> timing-event --event phase_start|phase_end --phase <phase> [--started-at <시각>]
+      [--ended-at <시각>] [--detail "<PASS|FAIL|사유>"]
+3. 이 iteration의 Worker를 dispatch하기 직전 / 이 iteration의 (phase) Reviewer
+   판정이 나온 직후 (correction, downstream revalidation, §17 Final Adversarial
+   Review attempt도 각자 자신의 iteration 번호로 이 규칙 그대로 쓴다)
+   -> timing-event --event iteration_start|iteration_end --phase <phase>
+      --iteration <n> [--started-at <시각>] [--ended-at <시각>] [--detail "<PASS|FAIL|사유>"]
+4. §6/§11 각 Worker/Reviewer Dispatch가 accepted worker_done으로 settle된 직후
+   (correction, downstream revalidation, §17 Final Adversarial Review attempt도
+   전부 이 규칙 하나로 커버된다 — 이들은 다른 phase/iteration/role로 다시 호출되는
+   같은 종류의 event일 뿐이다)
+   -> orchestrator-event --event dispatch_settled --phase <phase> --role <role>
+      --iteration <n> --task-id <task_id> --dispatch-id <dispatch_id>
+      --terminal <handle> --action created|reused --reuse <worker-start/dispatch
+      응답의 effects[].action> [--gate-result <role가 reviewer일 때, 응답 본문이
+      실제로 적어 보낸 RESULT: PASS|FAIL>] [--review-verdict <role가 reviewer일 때,
+      응답 본문이 실제로 적어 보낸 REVIEW_VERDICT: PASS|PASS WITH NOTES|FAIL|BLOCKED>]
+      --result "<outcome/settlement/lifecycle 요약>"
+   -> timing-event --event dispatch_settled --phase <phase> --role <role> --iteration <n>
+      --started-at <dispatch 직전 시각> --ended-at <settle 직후 시각>
+5. §16/§17에서 이 run의 최종 상태가 COMPLETED/BLOCKED/ERROR/ESCALATED 중 하나로 확정된 직후
+   -> run-status --status <상태> --reason "<사유>" --run-started-at <1단계의 시각>
+```
+
+2-3단계는 TIMING_LOG.md 전용이다. `<ARTIFACT_ROOT>ORCHESTRATOR_LOG.md`는 매 dispatch_settled row에
+이미 phase/iteration column을 갖고 있으므로 phase/iteration 경계를 위한 별도 row를 추가하지 않는다.
+phase나 iteration의 시작 시각을 Coordinator가 이미 잊었다면(`--started-at` 생략) 해당 row의
+`duration_s`는 빈 값으로 남는다 — 값을 추정하지 않는다.
+
+Worker/Reviewer가 unexpected exit로 정리되는 경우(§6 recovery)나, 이미 run-id를 가진 run 안에서
+발생하는 pre-dispatch failure(예: §17 Final Adversarial Review의 requested_phases 누락)로 Task
+자체가 생성되지 못한 경우도 같은 `orchestrator-event`로 남긴다(`--event unexpected_exit` 또는
+`--event pre_dispatch_failure`) — Task/Dispatch id가 아직 없다면 비워 둔다. run 자체를 생성하는
+시점(§6 1단계, `<ARTIFACT_ROOT>`가 아직 없는 시점)에 발생하는 invalid quality profile은 이 규칙의
+예가 아니다 — run-id도 `<ARTIFACT_ROOT>`도 아직 없어 이 event를 쓸 디렉터리 자체가 없으므로, 이
+event로도 다른 어떤 run-scoped 파일로도 기록되지 않는다.
+
+로깅 자체가 실패해도(디스크 오류 등) 이미 내려진 lifecycle 판단(settlement, terminal ownership,
+worker-release/retain 여부)을 다시 mutate하지 않는다. 로그 호출은 판단이 끝난 뒤 기록만 하는 별도
+단계이며, 이 호출이 실패했다고 해서 이미 완료된 Dispatch를 재시도하거나 terminal 처리를 바꾸지 않는다.
+
+두 파일은 사람이 바로 읽을 수 있는 append-only markdown table이며, 이후 자동 parsing이 가능하도록
+매 row가 동일한 column 순서를 유지한다. Retention/archive 정책은 OS-8 범위이며 이 파일들은 여기서
+삭제되거나 압축되지 않는다. Bottleneck 분석, aggregate metric, dashboard 등 richer observability는
+OS-7 범위다 — 이 절이 남기는 것은 그 분석의 입력이 될 원시 evidence뿐이다.
+
 ## 10. Worker Contract
 
 Worker는 phase별 `templates/*.md`를 따른다.

@@ -20,6 +20,7 @@ from typing import Any, NamedTuple
 from unittest.mock import patch
 
 from scripts import orca_runtime_harness
+from scripts import run_logging
 from scripts.orca_fake_agent import send_done
 from scripts.orca_runtime_harness import (
     CLOSE_ELIGIBLE_ROLES,
@@ -542,6 +543,7 @@ class DuplicateSettlementTests(unittest.TestCase):
         "mode": "done",
         "new_role": "external_or_adopted",
         "objective": "probe",
+        "phase": "implementation",
         "observation": {},
         "origin": "self_created",
         "owned_by_this_dispatch": True,
@@ -559,6 +561,7 @@ class DuplicateSettlementTests(unittest.TestCase):
         "task_id": "task_g",
         "task_status": "completed",
         "terminal": "term_worker",
+        "status": "COMPLETED",
     }
 
     def test_no_public_api_moves_a_claimed_row_back_to_absent(self) -> None:
@@ -5235,6 +5238,749 @@ class SpecializedPhaseQualityProfileTests(OfflineHarnessTestCase):
         self.assertNotIn("DESIGN-001", gate["applicable_quality_attributes"])
         self.assertNotIn("BUG-001", gate["applicable_quality_attributes"])
         self.assertEqual(gate["blocking_quality_attributes"], "REFACTOR-001")
+
+
+class RunLoggingIntegrationTests(OfflineHarnessTestCase):
+    """OS-17: ORCHESTRATOR_LOG.md / TIMING_LOG.md, produced by the real execution
+    path (start_run, run_attempt/run_existing_task, observe_unexpected_exit,
+    finish()/log_run_status()) rather than by a helper nobody calls. Every
+    assertion reads the file the harness actually wrote under
+    self.artifact_dir/artifacts/runs/<run_id>/, never the harness's in-memory
+    RuntimeAttempt objects -- those already have their own coverage elsewhere.
+
+    `arm` and the terminal fixture are borrowed by assignment, not inheritance,
+    for the same reason RunScopedQualityProfileTests borrows them.
+    """
+
+    LIVE_TERMINAL_RESOURCE = SameRoleSessionReuseTests.LIVE_TERMINAL_RESOURCE
+    arm = SameRoleSessionReuseTests.arm
+
+    def started_harness(
+        self, recorder: Any, *, run_id: str = "run_logging"
+    ) -> OrcaRuntimeHarness:
+        with patch.dict(environ, {"ORCA_CLI_COMMAND": "/opt/orca-dev"}):
+            harness = OrcaRuntimeHarness(self.artifact_dir)
+        harness._exec_orca = recorder
+        recorder.results["run-create"] = {"run": {"id": run_id}}
+        harness.start_run(
+            "OS-17 run-scoped logging", requested_phases=("implementation", "test")
+        )
+        return harness
+
+    def log_paths(self, run_id: str) -> tuple[Path, Path]:
+        root = self.artifact_dir / "artifacts" / "runs" / run_id
+        return root / run_logging.ORCHESTRATOR_LOG_FILENAME, root / run_logging.TIMING_LOG_FILENAME
+
+    @staticmethod
+    def read_rows(path: Path) -> list[dict[str, str]]:
+        lines = path.read_text(encoding="utf-8").splitlines()
+        columns = [cell.strip() for cell in lines[0].strip("|").split("|")]
+        return [
+            dict(zip(columns, (cell.strip() for cell in line.strip("|").split("|"))))
+            for line in lines[2:]
+        ]
+
+    def read_orchestrator_rows(self, run_id: str) -> list[dict[str, str]]:
+        orchestrator_log, _ = self.log_paths(run_id)
+        return self.read_rows(orchestrator_log)
+
+    # ---- A. Run creation ------------------------------------------------------
+
+    def test_start_run_creates_both_log_files_under_the_run_root(self) -> None:
+        recorder = EchoingTerminalExec()
+        harness = self.started_harness(recorder)
+
+        orchestrator_log, timing_log = self.log_paths(harness.run_id)
+        self.assertTrue(orchestrator_log.is_file())
+        self.assertTrue(timing_log.is_file())
+        self.assertEqual(orchestrator_log.parent, timing_log.parent)
+        self.assertEqual(
+            orchestrator_log.parent,
+            self.artifact_dir / "artifacts" / "runs" / harness.run_id,
+        )
+        self.assertEqual(harness._logging_errors, [])
+
+    # ---- B. Cross-run isolation -------------------------------------------
+
+    def test_two_runs_have_isolated_logs_with_no_shared_events(self) -> None:
+        harness_alpha = self.started_harness(EchoingTerminalExec(), run_id="run_alpha")
+        harness_beta = self.started_harness(EchoingTerminalExec(), run_id="run_beta")
+
+        log_alpha, _ = self.log_paths("run_alpha")
+        log_beta, _ = self.log_paths("run_beta")
+        self.assertNotEqual(log_alpha, log_beta)
+        self.assertNotIn("run_beta", log_alpha.read_text(encoding="utf-8"))
+        self.assertNotIn("run_alpha", log_beta.read_text(encoding="utf-8"))
+        self.assertEqual(harness_alpha.run_id, "run_alpha")
+        self.assertEqual(harness_beta.run_id, "run_beta")
+
+    # ---- C. Worker/Reviewer events -----------------------------------------
+
+    def test_worker_and_reviewer_dispatches_are_recorded_with_identity(self) -> None:
+        recorder = EchoingTerminalExec()
+        harness = self.started_harness(recorder)
+
+        self.arm(recorder, "ctx_w1", "task_w1")
+        harness.run_attempt("worker", 1, "complete", phase="implementation")
+        self.arm(recorder, "ctx_r1", "task_r1")
+        harness.run_attempt("reviewer", 1, "pass", phase="implementation")
+
+        rows = self.read_orchestrator_rows(harness.run_id)
+        by_dispatch = {row["dispatch_id"]: row for row in rows}
+        self.assertEqual(by_dispatch["ctx_w1"]["role"], "worker")
+        self.assertEqual(by_dispatch["ctx_w1"]["task_id"], "task_w1")
+        self.assertEqual(by_dispatch["ctx_w1"]["phase"], "implementation")
+        self.assertEqual(by_dispatch["ctx_w1"]["iteration"], "1")
+        self.assertEqual(by_dispatch["ctx_r1"]["role"], "reviewer")
+        self.assertEqual(by_dispatch["ctx_r1"]["task_id"], "task_r1")
+        self.assertEqual(by_dispatch["ctx_r1"]["phase"], "implementation")
+
+    # ---- D. Session reuse -----------------------------------------------------
+
+    def test_reused_terminal_is_distinguishable_from_created_in_the_log(self) -> None:
+        recorder = EchoingTerminalExec()
+        harness = self.started_harness(recorder)
+
+        self.arm(recorder, "ctx_r1", "task_r1")
+        _, handle1 = harness.run_attempt(
+            "reviewer", 1, "fail", phase="implementation", findings=("R1",)
+        )
+        self.arm(recorder, "ctx_r2", "task_r2")
+        _, handle2 = harness.run_attempt(
+            "reviewer",
+            2,
+            "pass",
+            phase="implementation",
+            terminal=handle1,
+            lifecycle="reuse",
+        )
+        # The scenario itself: the SAME terminal served both dispatches.
+        self.assertEqual(handle1, handle2)
+
+        rows = self.read_orchestrator_rows(harness.run_id)
+        by_dispatch = {row["dispatch_id"]: row for row in rows}
+        self.assertEqual(by_dispatch["ctx_r1"]["action"], "created")
+        self.assertEqual(by_dispatch["ctx_r2"]["action"], "reused")
+        # The log alone -- without touching the harness's live objects -- proves
+        # the "reused" dispatch reused *this specific* terminal, not merely *a*
+        # terminal: the same identifier appears in both rows.
+        self.assertEqual(by_dispatch["ctx_r1"]["terminal"], by_dispatch["ctx_r2"]["terminal"])
+        self.assertEqual(by_dispatch["ctx_r1"]["terminal"], handle1)
+
+    # ---- E. Fresh Final Review ----------------------------------------------
+
+    def test_final_review_attempts_use_distinguishable_fresh_terminals(self) -> None:
+        recorder = EchoingTerminalExec()
+        harness = self.started_harness(recorder)
+
+        self.arm(recorder, "ctx_f1", "task_f1")
+        _, handle1 = harness.run_attempt(
+            "reviewer", 1, "fail", phase="final_review", findings=("R1",)
+        )
+        self.arm(recorder, "ctx_f2", "task_f2")
+        _, handle2 = harness.run_attempt("reviewer", 2, "pass", phase="final_review")
+        self.assertNotEqual(handle1, handle2)
+
+        rows = self.read_orchestrator_rows(harness.run_id)
+        final_rows = [row for row in rows if row["phase"] == "final_review"]
+        self.assertEqual(len(final_rows), 2)
+        self.assertNotEqual(final_rows[0]["terminal"], final_rows[1]["terminal"])
+        self.assertEqual(final_rows[0]["action"], "created")
+        self.assertEqual(final_rows[1]["action"], "created")
+        self.assertEqual(final_rows[0]["iteration"], "1")
+        self.assertEqual(final_rows[1]["iteration"], "2")
+
+    # ---- F. Lifecycle -----------------------------------------------------
+
+    def test_settlement_and_lifecycle_outcome_are_recorded(self) -> None:
+        recorder = EchoingTerminalExec()
+        harness = self.started_harness(recorder)
+
+        self.arm(recorder, "ctx_w1", "task_w1")
+        harness.run_attempt("worker", 1, "complete", phase="implementation")
+
+        rows = self.read_orchestrator_rows(harness.run_id)
+        dispatch_row = next(row for row in rows if row["dispatch_id"] == "ctx_w1")
+        self.assertIn("settlement=completed", dispatch_row["result"])
+        self.assertIn("lifecycle=", dispatch_row["result"])
+        self.assertIn("worker_resource=", dispatch_row["result"])
+        self.assertIn("outcome=succeeded", dispatch_row["result"])
+
+    # ---- G. Timing ----------------------------------------------------------
+
+    def test_timing_log_captures_run_and_dispatch_durations(self) -> None:
+        recorder = EchoingTerminalExec()
+        harness = self.started_harness(recorder)
+
+        self.arm(recorder, "ctx_w1", "task_w1")
+        harness.run_attempt("worker", 1, "complete", phase="implementation")
+        harness.log_run_status("COMPLETED")
+
+        _, timing_log = self.log_paths(harness.run_id)
+        rows = self.read_rows(timing_log)
+        events = [row["event"] for row in rows]
+        self.assertIn("run_start", events)
+        self.assertIn("dispatch_settled", events)
+        self.assertIn("run_end", events)
+
+        dispatch_row = next(row for row in rows if row["event"] == "dispatch_settled")
+        self.assertNotEqual(dispatch_row["duration_s"], "")
+        self.assertNotEqual(dispatch_row["started_at"], "")
+        self.assertNotEqual(dispatch_row["ended_at"], "")
+
+        run_end_row = next(row for row in rows if row["event"] == "run_end")
+        self.assertNotEqual(run_end_row["duration_s"], "")
+        run_start_row = next(row for row in rows if row["event"] == "run_start")
+        self.assertEqual(run_end_row["started_at"], run_start_row["started_at"])
+
+    def test_phase_and_iteration_boundaries_bracket_a_multi_iteration_phase(
+        self,
+    ) -> None:
+        """OS-17 review round 4 MAJOR: phase/iteration boundaries must come from
+        the REAL workflow path -- ordinary run_attempt()/finish() calls, exactly
+        what every real scenario function already does -- with no separate call
+        a scenario author has to remember. Nothing here calls a boundary method
+        directly; _log_attempt()/finish() must produce these rows on their own.
+        """
+        # SequentialTerminalExec, not EchoingTerminalExec: the latter always
+        # overwrites a settled body with a synthesized boundary receipt, so it
+        # never carries a literal RESULT: line -- and this test's own detail
+        # assertions below need the real gate_result a reviewer wrote.
+        recorder = SequentialTerminalExec()
+        harness = self.started_harness(recorder)
+
+        self.arm(recorder, "ctx_w1", "task_w1")
+        worker1, _ = harness.run_attempt("worker", 1, "complete", phase="implementation")
+        self.arm(recorder, "ctx_r1", "task_r1")
+        recorder.results["check"]["messages"][0]["body"] = "RESULT: FAIL"
+        reviewer1, _ = harness.run_attempt(
+            "reviewer", 1, "fail", phase="implementation", findings=("R1",)
+        )
+        self.arm(recorder, "ctx_w2", "task_w2")
+        worker2, _ = harness.run_attempt(
+            "worker", 2, "correction", phase="implementation", findings=("R1",)
+        )
+        self.arm(recorder, "ctx_r2", "task_r2")
+        recorder.results["check"]["messages"][0]["body"] = "RESULT: PASS"
+        reviewer2, _ = harness.run_attempt("reviewer", 2, "pass", phase="implementation")
+        run_id = harness.run_id
+        # finish() is what closes whatever phase/iteration is still open when a
+        # run ends -- every real scenario function already reaches this call.
+        harness.finish(
+            RuntimeScenarioResult(
+                "probe", run_id, "COMPLETED", 2,
+                [worker1, reviewer1, worker2, reviewer2],
+            )
+        )
+
+        _, timing_log = self.log_paths(run_id)
+        rows = self.read_rows(timing_log)
+        boundary_rows = [
+            row
+            for row in rows
+            if row["event"]
+            in ("phase_start", "phase_end", "iteration_start", "iteration_end")
+        ]
+        # One phase_start, one phase_end, and one start/end pair per iteration --
+        # exactly the boundaries this sequence actually crossed, no more and no
+        # fewer, and none of them a manual call.
+        self.assertEqual(
+            [row["event"] for row in boundary_rows],
+            [
+                "phase_start",
+                "iteration_start",
+                "iteration_end",
+                "iteration_start",
+                "iteration_end",
+                "phase_end",
+            ],
+        )
+        for row in boundary_rows:
+            self.assertEqual(row["phase"], "implementation")
+        iteration_rows = [row for row in boundary_rows if "iteration" in row["event"]]
+        self.assertEqual(
+            [row["iteration"] for row in iteration_rows], ["1", "1", "2", "2"]
+        )
+        for row in boundary_rows:
+            if row["event"].endswith("_end"):
+                self.assertNotEqual(row["started_at"], "")
+                self.assertNotEqual(row["ended_at"], "")
+                self.assertNotEqual(row["duration_s"], "")
+        # detail is the last reviewer gate_result observed inside that scope --
+        # iteration 1's FAIL, iteration 2's (and therefore the phase's own) PASS.
+        phase_end_row = next(row for row in boundary_rows if row["event"] == "phase_end")
+        self.assertEqual(phase_end_row["detail"], "PASS")
+        iteration_1_end = next(
+            row
+            for row in boundary_rows
+            if row["event"] == "iteration_end" and row["iteration"] == "1"
+        )
+        self.assertEqual(iteration_1_end["detail"], "FAIL")
+
+    def test_phase_and_iteration_boundaries_bracket_final_review_attempts(
+        self,
+    ) -> None:
+        """The same automatic boundaries, applied to the final_review phase value
+        -- no special-casing: a phase/iteration transition is a phase/iteration
+        transition whether its phase is a canonical one or final_review, exactly
+        like dispatch_settled already treats them identically. Again, nothing
+        here calls a boundary method directly.
+        """
+        recorder = EchoingTerminalExec()
+        harness = self.started_harness(recorder)
+
+        self.arm(recorder, "ctx_f1", "task_f1")
+        final1, _ = harness.run_attempt(
+            "reviewer", 1, "fail", phase="final_review", findings=("R1",)
+        )
+        self.arm(recorder, "ctx_f2", "task_f2")
+        final2, _ = harness.run_attempt("reviewer", 2, "pass", phase="final_review")
+        run_id = harness.run_id
+        harness.finish(
+            RuntimeScenarioResult("probe", run_id, "COMPLETED", 2, [final1, final2])
+        )
+
+        _, timing_log = self.log_paths(run_id)
+        rows = self.read_rows(timing_log)
+        boundary_rows = [
+            row
+            for row in rows
+            if row["event"]
+            in ("phase_start", "phase_end", "iteration_start", "iteration_end")
+        ]
+        self.assertEqual(
+            [row["event"] for row in boundary_rows],
+            [
+                "phase_start",
+                "iteration_start",
+                "iteration_end",
+                "iteration_start",
+                "iteration_end",
+                "phase_end",
+            ],
+        )
+        for row in boundary_rows:
+            self.assertEqual(row["phase"], "final_review")
+        for row in boundary_rows:
+            if row["event"].endswith("_end"):
+                self.assertNotEqual(row["duration_s"], "")
+
+    def test_a_phase_transition_mid_run_closes_the_previous_phase_first(self) -> None:
+        """OS-17 review round 4 MAJOR: a multi-phase run (design -> implementation,
+        the shape scenario L already dispatches) must close the outgoing phase's
+        iteration THEN the outgoing phase itself before opening the next one --
+        proven from ordinary run_attempt() calls across two different phases.
+        """
+        recorder = EchoingTerminalExec()
+        harness = self.started_harness(recorder)
+
+        self.arm(recorder, "ctx_d1", "task_d1")
+        design, _ = harness.run_attempt("worker", 1, "complete", phase="design")
+        self.arm(recorder, "ctx_i1", "task_i1")
+        implementation, _ = harness.run_attempt(
+            "worker", 1, "complete", phase="implementation"
+        )
+        run_id = harness.run_id
+        harness.finish(
+            RuntimeScenarioResult(
+                "probe", run_id, "COMPLETED", 1, [design, implementation]
+            )
+        )
+
+        _, timing_log = self.log_paths(run_id)
+        rows = self.read_rows(timing_log)
+        boundary_rows = [
+            row
+            for row in rows
+            if row["event"]
+            in ("phase_start", "phase_end", "iteration_start", "iteration_end")
+        ]
+        self.assertEqual(
+            [(row["event"], row["phase"]) for row in boundary_rows],
+            [
+                ("phase_start", "design"),
+                ("iteration_start", "design"),
+                ("iteration_end", "design"),
+                ("phase_end", "design"),
+                ("phase_start", "implementation"),
+                ("iteration_start", "implementation"),
+                ("iteration_end", "implementation"),
+                ("phase_end", "implementation"),
+            ],
+        )
+        # OS-17 review round 5 MAJOR: the outgoing phase must close no later than
+        # the next phase's own first dispatch starts -- proving design's
+        # phase_end was not stamped at implementation's own settlement time.
+        design_dispatch = next(
+            row for row in rows if row["event"] == "dispatch_settled" and row["phase"] == "design"
+        )
+        implementation_dispatch = next(
+            row
+            for row in rows
+            if row["event"] == "dispatch_settled" and row["phase"] == "implementation"
+        )
+        design_phase_end = next(
+            row for row in boundary_rows if row["event"] == "phase_end" and row["phase"] == "design"
+        )
+        implementation_phase_start = next(
+            row
+            for row in boundary_rows
+            if row["event"] == "phase_start" and row["phase"] == "implementation"
+        )
+        self.assertEqual(design_phase_end["ended_at"], design_dispatch["ended_at"])
+        self.assertEqual(
+            implementation_phase_start["started_at"],
+            implementation_dispatch["started_at"],
+        )
+        self.assertLessEqual(
+            design_phase_end["ended_at"], implementation_phase_start["started_at"]
+        )
+
+    def test_boundary_timestamps_bracket_the_dispatches_they_claim_to_measure(
+        self,
+    ) -> None:
+        """OS-17 review round 5 MAJOR: a boundary's own started_at/ended_at must
+        actually bracket the dispatch(es) inside it. Opening a boundary AFTER
+        settlement (the round-4 design) would start it after the very first
+        dispatch it claims to measure had already finished; closing an
+        outgoing scope at "now" on a transition would silently fold the NEXT
+        scope's dispatch time into the outgoing one's duration. Neither may
+        happen: an opening boundary's started_at must equal its scope's own
+        first dispatch's started_at, and a closing boundary's ended_at must
+        equal its scope's own LAST dispatch's ended_at -- never the next
+        scope's.
+        """
+        recorder = SequentialTerminalExec()
+        harness = self.started_harness(recorder)
+
+        self.arm(recorder, "ctx_w1", "task_w1")
+        worker1, _ = harness.run_attempt("worker", 1, "complete", phase="implementation")
+        self.arm(recorder, "ctx_r1", "task_r1")
+        recorder.results["check"]["messages"][0]["body"] = "RESULT: FAIL"
+        reviewer1, _ = harness.run_attempt(
+            "reviewer", 1, "fail", phase="implementation", findings=("R1",)
+        )
+        self.arm(recorder, "ctx_w2", "task_w2")
+        worker2, _ = harness.run_attempt(
+            "worker", 2, "correction", phase="implementation", findings=("R1",)
+        )
+        self.arm(recorder, "ctx_r2", "task_r2")
+        recorder.results["check"]["messages"][0]["body"] = "RESULT: PASS"
+        reviewer2, _ = harness.run_attempt("reviewer", 2, "pass", phase="implementation")
+        run_id = harness.run_id
+        harness.finish(
+            RuntimeScenarioResult(
+                "probe", run_id, "COMPLETED", 2,
+                [worker1, reviewer1, worker2, reviewer2],
+            )
+        )
+
+        _, timing_log = self.log_paths(run_id)
+        rows = self.read_rows(timing_log)
+        dispatch_rows = [row for row in rows if row["event"] == "dispatch_settled"]
+        self.assertEqual(len(dispatch_rows), 4)
+        w1, r1, w2, r2 = dispatch_rows
+
+        phase_start = next(row for row in rows if row["event"] == "phase_start")
+        iter1_start = next(
+            row
+            for row in rows
+            if row["event"] == "iteration_start" and row["iteration"] == "1"
+        )
+        iter1_end = next(
+            row
+            for row in rows
+            if row["event"] == "iteration_end" and row["iteration"] == "1"
+        )
+        iter2_start = next(
+            row
+            for row in rows
+            if row["event"] == "iteration_start" and row["iteration"] == "2"
+        )
+        iter2_end = next(
+            row
+            for row in rows
+            if row["event"] == "iteration_end" and row["iteration"] == "2"
+        )
+        phase_end = next(row for row in rows if row["event"] == "phase_end")
+
+        # Opening: started_at is exactly the scope's own first dispatch's
+        # started_at, never a later "recorded after settlement" timestamp.
+        self.assertEqual(phase_start["started_at"], w1["started_at"])
+        self.assertEqual(iter1_start["started_at"], w1["started_at"])
+        self.assertEqual(iter2_start["started_at"], w2["started_at"])
+
+        # Closing: ended_at is exactly the OUTGOING scope's own last dispatch's
+        # ended_at -- iteration 1 closes at reviewer1's settlement (before
+        # worker2/iteration 2 ever dispatches), not at whatever later moment
+        # iteration 2 happens to settle.
+        self.assertEqual(iter1_end["ended_at"], r1["ended_at"])
+        self.assertEqual(iter2_end["ended_at"], r2["ended_at"])
+        self.assertEqual(phase_end["ended_at"], r2["ended_at"])
+
+        # And therefore the outgoing iteration/phase closed no later than the
+        # next iteration's own first dispatch started.
+        self.assertLessEqual(iter1_end["ended_at"], w2["started_at"])
+
+    def test_a_run_with_no_dispatches_writes_no_phase_or_iteration_boundary_rows(
+        self,
+    ) -> None:
+        """The automatic system must not fabricate a boundary for a phase/
+        iteration nothing ever actually dispatched into."""
+        recorder = EchoingTerminalExec()
+        harness = self.started_harness(recorder)
+        run_id = harness.run_id
+
+        harness.finish(RuntimeScenarioResult("probe", run_id, "COMPLETED", 1, []))
+
+        _, timing_log = self.log_paths(run_id)
+        rows = self.read_rows(timing_log)
+        boundary_events = {
+            row["event"]
+            for row in rows
+            if row["event"]
+            in ("phase_start", "phase_end", "iteration_start", "iteration_end")
+        }
+        self.assertEqual(boundary_events, set())
+
+    # ---- H. Non-success termination -----------------------------------------
+
+    def test_a_blocked_status_is_preserved_by_log_run_status(self) -> None:
+        recorder = EchoingTerminalExec()
+        harness = self.started_harness(recorder)
+
+        harness.log_run_status("BLOCKED", reason="max-iterations exhausted")
+
+        orchestrator_log, _ = self.log_paths(harness.run_id)
+        text = orchestrator_log.read_text(encoding="utf-8")
+        self.assertIn("BLOCKED", text)
+        self.assertIn("max-iterations exhausted", text)
+
+    def test_finish_logs_the_scenarios_own_terminal_status(self) -> None:
+        for status in ("COMPLETED", "BLOCKED", "ERROR", "ESCALATED"):
+            with self.subTest(status):
+                recorder = EchoingTerminalExec()
+                harness = self.started_harness(recorder, run_id=f"run_{status.lower()}")
+                self.arm(recorder, f"ctx_{status.lower()}", f"task_{status.lower()}")
+                worker, _ = harness.run_attempt(
+                    "worker", 1, "complete", phase="implementation"
+                )
+                run_id = harness.run_id  # finish() clears it before returning
+                harness.finish(
+                    RuntimeScenarioResult("probe", run_id, status, 1, [worker])
+                )
+                orchestrator_log, _ = self.log_paths(run_id)
+                self.assertIn(status, orchestrator_log.read_text(encoding="utf-8"))
+
+    # ---- I. Reviewer gate result (PASS vs FAIL, distinct from dispatch outcome) ---
+    # OS-17 review MAJOR: `result`'s `outcome=succeeded` says the Dispatch/process
+    # settled normally -- it does not say the review itself PASSed. A Reviewer that
+    # settles successfully while writing RESULT: FAIL is the ordinary correction-loop
+    # case, not a dispatch failure, so these assert on the SEPARATE `gate_result`
+    # column read back from the file, not on `result`. EchoingTerminalExec always
+    # overwrites a settled body with a synthesized boundary receipt (never a literal
+    # RESULT: line), so these tests use plain SequentialTerminalExec and set the
+    # message body by hand -- the one thing that actually lets a Reviewer's real
+    # response reach the log in this offline harness.
+
+    def test_a_succeeded_reviewer_dispatch_still_records_its_own_fail_gate_result(
+        self,
+    ) -> None:
+        recorder = SequentialTerminalExec()
+        harness = self.started_harness(recorder)
+        self.arm(recorder, "ctx_r1", "task_r1")
+        recorder.results["check"]["messages"][0]["body"] = "RESULT: FAIL"
+
+        attempt, _ = harness.run_attempt(
+            "reviewer", 1, "fail", phase="implementation", findings=("R1",)
+        )
+        self.assertEqual(attempt.outcome, "succeeded")
+
+        row = self.read_orchestrator_rows(harness.run_id)[-1]
+        self.assertEqual(row["gate_result"], "FAIL")
+        self.assertIn("outcome=succeeded", row["result"])
+
+    def test_pass_and_fail_gate_results_are_distinguishable_in_the_log(
+        self,
+    ) -> None:
+        recorder = SequentialTerminalExec()
+        harness = self.started_harness(recorder)
+        self.arm(recorder, "ctx_r1", "task_r1")
+        recorder.results["check"]["messages"][0]["body"] = "RESULT: FAIL"
+        harness.run_attempt(
+            "reviewer", 1, "fail", phase="implementation", findings=("R1",)
+        )
+        self.arm(recorder, "ctx_r2", "task_r2")
+        recorder.results["check"]["messages"][0]["body"] = "RESULT: PASS"
+        harness.run_attempt("reviewer", 2, "pass", phase="implementation")
+
+        rows = self.read_orchestrator_rows(harness.run_id)
+        by_dispatch = {row["dispatch_id"]: row for row in rows}
+        self.assertEqual(by_dispatch["ctx_r1"]["gate_result"], "FAIL")
+        self.assertEqual(by_dispatch["ctx_r2"]["gate_result"], "PASS")
+        # Both settled successfully at the dispatch/process level -- the same
+        # outcome=succeeded -- despite opposite gate results. This is exactly
+        # the distinction `result` alone could not make.
+        self.assertIn("outcome=succeeded", by_dispatch["ctx_r1"]["result"])
+        self.assertIn("outcome=succeeded", by_dispatch["ctx_r2"]["result"])
+
+    def test_a_worker_dispatch_never_carries_a_reviewer_gate_result(self) -> None:
+        recorder = SequentialTerminalExec()
+        harness = self.started_harness(recorder)
+        self.arm(recorder, "ctx_w1", "task_w1")
+        # Ignored: gate-result parsing only applies to a reviewer-role dispatch.
+        recorder.results["check"]["messages"][0]["body"] = "RESULT: FAIL"
+
+        harness.run_attempt("worker", 1, "complete", phase="implementation")
+
+        row = self.read_orchestrator_rows(harness.run_id)[-1]
+        self.assertEqual(row["gate_result"], "")
+        self.assertEqual(row["review_verdict"], "")
+
+    def test_a_malformed_reviewer_response_leaves_gate_result_blank_not_guessed(
+        self,
+    ) -> None:
+        recorder = SequentialTerminalExec()
+        harness = self.started_harness(recorder)
+        self.arm(recorder, "ctx_r1", "task_r1")
+        recorder.results["check"]["messages"][0]["body"] = (
+            "# Review Result\n\n## Summary\nMissing result field"
+        )
+
+        harness.run_attempt("reviewer", 1, "fail", phase="implementation")
+
+        row = self.read_orchestrator_rows(harness.run_id)[-1]
+        self.assertEqual(row["gate_result"], "")
+        self.assertEqual(row["review_verdict"], "")
+
+    def test_a_final_review_attempts_gate_result_is_recorded_the_same_way(
+        self,
+    ) -> None:
+        recorder = SequentialTerminalExec()
+        harness = self.started_harness(recorder)
+        self.arm(recorder, "ctx_f1", "task_f1")
+        recorder.results["check"]["messages"][0]["body"] = "RESULT: FAIL"
+
+        harness.run_attempt(
+            "reviewer", 1, "fail", phase="final_review", findings=("R1",)
+        )
+
+        row = self.read_orchestrator_rows(harness.run_id)[-1]
+        self.assertEqual(row["phase"], "final_review")
+        self.assertEqual(row["gate_result"], "FAIL")
+
+    # ---- I2. review_verdict (OS-1's four-valued report annotation) ------------
+    # OS-17 review round 3 MAJOR-2: `gate_result` is only ever PASS/FAIL, and
+    # reviews/common.md's own Verdict mapping collapses PASS WITH NOTES into PASS
+    # and BLOCKED into FAIL at that layer. `review_verdict` is the separate column
+    # that must NOT collapse them -- these tests are the reviewer's explicit ask for
+    # coverage of all four values, especially the two the gate-level column erases.
+
+    def test_all_four_review_verdicts_are_recorded_distinctly(self) -> None:
+        recorder = SequentialTerminalExec()
+        harness = self.started_harness(recorder)
+        bodies = {
+            "ctx_v1": "RESULT: PASS\nREVIEW_VERDICT: PASS",
+            "ctx_v2": "RESULT: PASS\nREVIEW_VERDICT: PASS WITH NOTES",
+            "ctx_v3": "RESULT: FAIL\nREVIEW_VERDICT: FAIL",
+            "ctx_v4": "RESULT: FAIL\nREVIEW_VERDICT: BLOCKED",
+        }
+        for iteration, (dispatch_id, body) in enumerate(bodies.items(), start=1):
+            self.arm(recorder, dispatch_id, f"task_{dispatch_id}")
+            recorder.results["check"]["messages"][0]["body"] = body
+            harness.run_attempt(
+                "reviewer", iteration, "fail", phase="implementation"
+            )
+
+        rows = self.read_orchestrator_rows(harness.run_id)
+        by_dispatch = {row["dispatch_id"]: row for row in rows}
+        # gate_result: PASS WITH NOTES and BLOCKED collapse into PASS/FAIL exactly
+        # as reviews/common.md's mapping documents.
+        self.assertEqual(by_dispatch["ctx_v1"]["gate_result"], "PASS")
+        self.assertEqual(by_dispatch["ctx_v2"]["gate_result"], "PASS")
+        self.assertEqual(by_dispatch["ctx_v3"]["gate_result"], "FAIL")
+        self.assertEqual(by_dispatch["ctx_v4"]["gate_result"], "FAIL")
+        # review_verdict: all four stay distinct -- this is the column that must
+        # not lose PASS WITH NOTES vs PASS, or BLOCKED vs FAIL.
+        self.assertEqual(by_dispatch["ctx_v1"]["review_verdict"], "PASS")
+        self.assertEqual(by_dispatch["ctx_v2"]["review_verdict"], "PASS WITH NOTES")
+        self.assertEqual(by_dispatch["ctx_v3"]["review_verdict"], "FAIL")
+        self.assertEqual(by_dispatch["ctx_v4"]["review_verdict"], "BLOCKED")
+
+    def test_review_verdict_is_not_guessed_from_the_two_valued_gate_result(
+        self,
+    ) -> None:
+        """A body with RESULT but no REVIEW_VERDICT line leaves review_verdict
+        blank -- it is never inferred from gate_result, even though the two are
+        correlated in a well-formed response."""
+        recorder = SequentialTerminalExec()
+        harness = self.started_harness(recorder)
+        self.arm(recorder, "ctx_r1", "task_r1")
+        recorder.results["check"]["messages"][0]["body"] = "RESULT: PASS"
+
+        harness.run_attempt("reviewer", 1, "pass", phase="implementation")
+
+        row = self.read_orchestrator_rows(harness.run_id)[-1]
+        self.assertEqual(row["gate_result"], "PASS")
+        self.assertEqual(row["review_verdict"], "")
+
+    def test_final_review_review_verdict_preserves_pass_with_notes(self) -> None:
+        recorder = SequentialTerminalExec()
+        harness = self.started_harness(recorder)
+        self.arm(recorder, "ctx_f1", "task_f1")
+        recorder.results["check"]["messages"][0]["body"] = (
+            "RESULT: PASS\nREVIEW_VERDICT: PASS WITH NOTES"
+        )
+
+        harness.run_attempt("reviewer", 1, "pass", phase="final_review")
+
+        row = self.read_orchestrator_rows(harness.run_id)[-1]
+        self.assertEqual(row["phase"], "final_review")
+        self.assertEqual(row["gate_result"], "PASS")
+        self.assertEqual(row["review_verdict"], "PASS WITH NOTES")
+
+    # ---- unexpected exit / pre-dispatch failure ------------------------------
+
+    def test_unexpected_exit_is_logged_with_its_own_event_name(self) -> None:
+        recorder = EchoingTerminalExec()
+        harness = self.started_harness(recorder)
+        recorder.results["worker-show"] = {
+            "dispatch": {"status": "failed", "completed_at": None},
+            "worker": {"state": "stopped"},
+            "terminalResource": {"releaseState": "released"},
+        }
+        recorder.results["check"] = {"messages": []}
+
+        harness.observe_unexpected_exit("worker", 1, phase="implementation")
+
+        rows = self.read_orchestrator_rows(harness.run_id)
+        exit_rows = [row for row in rows if row["event"] == "unexpected_exit"]
+        self.assertEqual(len(exit_rows), 1)
+        self.assertEqual(exit_rows[0]["role"], "worker")
+        self.assertEqual(exit_rows[0]["phase"], "implementation")
+
+    def test_a_pre_dispatch_failure_is_logged_before_any_task_exists(self) -> None:
+        """External review's own fix (OS-1): an undeclared requested_phases at the
+        final gate now raises before task-create. This is that failure, logged.
+        """
+        recorder = EchoingTerminalExec()
+        with patch.dict(environ, {"ORCA_CLI_COMMAND": "/opt/orca-dev"}):
+            harness = OrcaRuntimeHarness(self.artifact_dir)
+        harness._exec_orca = recorder
+        recorder.results["run-create"] = {"run": {"id": "run_pre_dispatch"}}
+        # No requested_phases declared -- the exact fail-closed shape OS-1 fixed.
+        harness.start_run("pre-dispatch failure probe")
+
+        with self.assertRaises(TaskContextError):
+            harness.run_attempt("reviewer", 1, "pass", phase="final_review")
+
+        rows = self.read_orchestrator_rows(harness.run_id)
+        failure_rows = [row for row in rows if row["event"] == "pre_dispatch_failure"]
+        self.assertEqual(len(failure_rows), 1)
+        self.assertEqual(failure_rows[0]["role"], "reviewer")
+        self.assertEqual(failure_rows[0]["phase"], "final_review")
+        self.assertEqual(failure_rows[0]["result"], "error")
+        self.assertNotIn("task-create", recorder.verbs)
 
 
 if __name__ == "__main__":

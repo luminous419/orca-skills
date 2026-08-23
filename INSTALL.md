@@ -147,6 +147,13 @@ templates/
 reviews/
 ```
 
+`orca-worker-reviewer-orchestration` additionally contains `tools/run_logging.py` — the
+run-scoped `ORCHESTRATOR_LOG.md`/`TIMING_LOG.md` writer's CLI, needed because a live
+Coordinator invokes it from the installed Skill directory, not from this repository's
+own `scripts/` (which the commands above never copy). It is byte-identical to this
+repository's own `scripts/run_logging.py`; `scripts/validate_skills.py` enforces that
+the two never drift.
+
 For a source release, build and verify the deterministic archive instead of copying a
 working tree with local artifacts:
 
@@ -224,3 +231,6 @@ SKILL.md
 templates/
 reviews/
 ```
+
+`orca-worker-reviewer-orchestration` additionally distributes `tools/run_logging.py` (see
+section 5).
