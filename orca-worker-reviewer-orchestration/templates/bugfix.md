@@ -23,6 +23,15 @@ Reproduce / Understand Bug → Establish Root Cause → Inspect Existing Tests
 - observed symptom, root cause, affected condition과 fix를 구분한다.
 - 기존 정상 동작을 보존하는 최소 변경을 우선한다.
 
+## Quality Profile
+dispatch된 Task spec의 `=== QUALITY GATE (profile-first) ===` block은 이번 phase에 applicable한
+Project Quality Attribute, 그중 blocking인 것, Minimal General Gate와 decision priority를 전달한다.
+
+- `blocking_quality_attributes`의 항목은 처음부터 충족하도록 작업하고 근거를 결과에 남긴다.
+- 그 block에 없는 attribute를 이번 phase에서 추가로 만족시키려 하지 않는다.
+- `profile_status: absent`이면 Explicit Requirements / 이 template의 phase contract /
+  Minimal General Gate만 적용된다.
+
 ## Result Contract
 
 ```text

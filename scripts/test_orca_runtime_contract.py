@@ -47,9 +47,11 @@ from scripts.orca_runtime_harness import (
     cleanup_authority,
     close_allowed,
     dispatch_context,
+    run_quality_profile_runtime_scenario,
     run_session_reuse_runtime_scenario,
     validate_orca_contract,
 )
+from scripts.quality_profile import DEFAULT_PROFILE_PATH, INVALID_PROFILE_REASON
 from scripts.task_context import (
     AGENT_MODES,
     BOUNDARY_RECEIPT_PREFIX,
@@ -61,6 +63,7 @@ from scripts.task_context import (
     TASK_BOUNDARY_KEYS,
     TASK_BOUNDARY_SPEC_HEADER,
     TaskContextError,
+    parse_quality_gate,
     parse_reviewer_context,
     parse_reviewer_context_keys,
     parse_task_boundary,
@@ -766,6 +769,14 @@ class OfflineHarnessTestCase(unittest.TestCase):
             harness = OrcaRuntimeHarness(self.artifact_dir)
         harness._exec_orca = recorder  # the only process boundary
         harness.run_owner, harness.run_id = "term_owner", "run_offline"
+        # This helper bypasses start_run() (no real run-create RPC), so it stubs the
+        # requested-phases declaration start_run() would otherwise make too -- a
+        # test that dispatches phase=final_review through this offline run needs a
+        # non-empty set, or build_quality_gate_context() now fails closed exactly as
+        # it should for a REAL undeclared run. The value itself is not the subject of
+        # any test that uses build(); FinalReviewQualityProfileTests declares its own
+        # meaningful set through the real start_run() path instead of this stub.
+        harness.requested_phases = ("implementation",)
         return harness
 
     def worker_terminal(
@@ -4496,6 +4507,734 @@ class ScenarioKDispatchedPhaseTests(OfflineHarnessTestCase):
             rendered["approved_baseline"], "artifacts/runs/run_x/ANALYSIS.md"
         )
         self.assertEqual(rendered["validation"], "worker outcome=succeeded")
+
+
+class RunScopedQualityProfileTests(OfflineHarnessTestCase):
+    """IMPL-I1 F-001: one Quality Profile resolution per run, threaded everywhere.
+
+    The defect this pins was not that the model was missing from the spec -- it was
+    there -- but that dispatch_context re-read the profile from disk whenever its
+    argument was omitted. Every harness path omitted it, so the Worker's spec and the
+    spec of the Reviewer judging that Worker were built from two independent reads.
+    A profile edited in between (a teammate's commit, a rebase, an editor save)
+    silently gave the two roles different quality models, which is exactly the
+    divergence ORIGINAL_REQUEST section 10 forbids.
+
+    `arm` and the terminal-resource fixture are borrowed by assignment rather than by
+    inheritance: subclassing SameRoleSessionReuseTests would re-run its whole suite
+    under this class's name, and the reuse fixture is an unmodified regression class.
+    """
+
+    LIVE_TERMINAL_RESOURCE = SameRoleSessionReuseTests.LIVE_TERMINAL_RESOURCE
+    arm = SameRoleSessionReuseTests.arm
+
+    PROFILE_AT_RUN_START = """version: 1
+
+quality_attributes:
+
+  - id: DOMAIN-001
+    category: business-domain
+    name: Idempotent processing
+    blocking: true
+    applies_to:
+      - implementation
+"""
+    PROFILE_EDITED_MID_RUN = """version: 1
+
+quality_attributes:
+
+  - id: LATE-001
+    category: operational-risk
+    name: Edited after the run started
+    blocking: true
+    applies_to:
+      - implementation
+"""
+
+    def profile_root(self) -> Path:
+        root = Path(self.temporary_directory.name) / "project"
+        (root / DEFAULT_PROFILE_PATH).parent.mkdir(parents=True, exist_ok=True)
+        return root
+
+    def write_profile(self, root: Path, text: str) -> None:
+        (root / DEFAULT_PROFILE_PATH).write_text(text, encoding="utf-8")
+
+    def build_for(self, recorder: Any, root: Path) -> OrcaRuntimeHarness:
+        with patch.dict(environ, {"ORCA_CLI_COMMAND": "/opt/orca-dev"}):
+            harness = OrcaRuntimeHarness(
+                self.artifact_dir, quality_profile_root=root
+            )
+        harness._exec_orca = recorder
+        recorder.results["run-create"] = {"run": {"id": "run_profile"}}
+        return harness
+
+    def test_a_profile_edited_mid_run_never_reaches_the_reviewer(self) -> None:
+        """The regression itself: edit the file between the two dispatches."""
+        root = self.profile_root()
+        self.write_profile(root, self.PROFILE_AT_RUN_START)
+        recorder = EchoingTerminalExec()
+        harness = self.build_for(recorder, root)
+        harness.start_run("run scoped quality profile")
+
+        self.arm(recorder, "ctx_worker_1", "task_worker_1")
+        harness.run_attempt("worker", 1, "complete", phase="implementation")
+
+        # The edit lands after the Worker was dispatched and before the Reviewer is.
+        # Before the fix this alone changed what the Reviewer was told.
+        self.write_profile(root, self.PROFILE_EDITED_MID_RUN)
+
+        self.arm(recorder, "ctx_reviewer_1", "task_reviewer_1")
+        harness.run_attempt("reviewer", 1, "pass", phase="implementation")
+
+        worker_gate = parse_quality_gate(recorder.specs["task_worker_1"])
+        reviewer_gate = parse_quality_gate(recorder.specs["task_reviewer_1"])
+
+        self.assertEqual(
+            worker_gate,
+            reviewer_gate,
+            "the Reviewer must be judging against the model its Worker was given",
+        )
+        self.assertIn("DOMAIN-001", worker_gate["applicable_quality_attributes"])
+        self.assertNotIn("LATE-001", reviewer_gate["applicable_quality_attributes"])
+        self.assertEqual(reviewer_gate["blocking_quality_attributes"], "DOMAIN-001")
+
+    def test_the_same_resolution_object_reaches_every_attempt_of_the_run(self) -> None:
+        """Identity, not equality: a re-read that happened to agree would still be one."""
+        root = self.profile_root()
+        self.write_profile(root, self.PROFILE_AT_RUN_START)
+        recorder = EchoingTerminalExec()
+        harness = self.build_for(recorder, root)
+        harness.start_run(
+            "run scoped quality profile", requested_phases=("implementation",)
+        )
+        resolved = harness.quality_profile
+
+        self.arm(recorder, "ctx_worker_1", "task_worker_1")
+        harness.run_attempt("worker", 1, "complete", phase="implementation")
+        self.write_profile(root, self.PROFILE_EDITED_MID_RUN)
+        self.arm(recorder, "ctx_reviewer_1", "task_reviewer_1")
+        harness.run_attempt("reviewer", 1, "pass", phase="implementation")
+        self.arm(recorder, "ctx_final_1", "task_final_1")
+        harness.run_attempt("reviewer", 1, "pass", phase="final_review")
+
+        self.assertIs(harness.quality_profile, resolved)
+        final_gate = parse_quality_gate(recorder.specs["task_final_1"])
+        self.assertIn("DOMAIN-001", final_gate["applicable_quality_attributes"])
+        self.assertNotIn("LATE-001", final_gate["applicable_quality_attributes"])
+
+    def test_final_review_fails_closed_when_no_requested_phases_were_declared(
+        self,
+    ) -> None:
+        """External review MAJOR: no declared requested set is not "every phase".
+
+        Before this fix, dispatch_context() silently widened an undeclared requested
+        set to ALL_APPLICABLE_PHASES at the final gate. That fallback let an
+        attribute scoped to a phase this run never touched reach the Final
+        Adversarial Review anyway. It is now a hard failure at the real harness
+        dispatch path, not just at build_quality_gate_context() called directly.
+        """
+        root = self.profile_root()
+        self.write_profile(root, self.PROFILE_AT_RUN_START)
+        recorder = EchoingTerminalExec()
+        harness = self.build_for(recorder, root)
+        harness.start_run("run scoped quality profile")  # no requested_phases
+        self.assertEqual(harness.requested_phases, ())
+
+        self.arm(recorder, "ctx_final_1", "task_final_1")
+        with self.assertRaisesRegex(TaskContextError, "requested_phases is required"):
+            harness.run_attempt("reviewer", 1, "pass", phase="final_review")
+
+        # Fail closed means no Task was created for the ungoverned dispatch either:
+        # dispatch_context() raises before run_attempt ever calls create_task.
+        self.assertNotIn("task-create", recorder.verbs)
+
+    def test_start_run_refuses_an_invalid_profile_before_anything_exists(self) -> None:
+        """Fail at the run boundary, not at the first spec that needs the model."""
+        root = self.profile_root()
+        self.write_profile(root, "version: 1\nquality_attributes: nope\n")
+        recorder = EchoingTerminalExec()
+        harness = self.build_for(recorder, root)
+
+        with self.assertRaisesRegex(OrcaRuntimeError, INVALID_PROFILE_REASON):
+            harness.start_run("run with a broken profile")
+
+        self.assertNotIn("run-create", recorder.verbs)
+        self.assertNotIn("task-create", recorder.verbs)
+
+    def test_a_directory_at_the_profile_path_stops_the_run(self) -> None:
+        """F-002 at the runtime boundary: present-but-unusable is not 'no profile'."""
+        root = self.profile_root()
+        (root / DEFAULT_PROFILE_PATH).mkdir()
+        recorder = EchoingTerminalExec()
+        harness = self.build_for(recorder, root)
+
+        with self.assertRaisesRegex(OrcaRuntimeError, INVALID_PROFILE_REASON):
+            harness.start_run("run with a directory where the profile should be")
+
+        self.assertNotIn("run-create", recorder.verbs)
+
+    def test_no_harness_path_can_omit_the_run_resolution(self) -> None:
+        """The structural half: an omitted argument is how F-001 and the external
+        review's MAJOR both shipped.
+
+        Behavioural tests catch the paths they exercise. This one refuses the shape
+        that made both defects possible at all -- a dispatch_context call inside the
+        harness that lets quality_profile or requested_phases default (the latter is
+        what let the final gate silently widen to every applicable phase instead of
+        failing closed), and a resolve call anywhere other than the two boundaries
+        (module import and start_run).
+        """
+        source = Path(orca_runtime_harness.__file__).read_text(encoding="utf-8")
+        module = ast.parse(source)
+
+        dispatch_context_calls = [
+            node
+            for node in ast.walk(module)
+            if isinstance(node, ast.Call)
+            and getattr(node.func, "id", None) == "dispatch_context"
+        ]
+        for keyword_name, reason in (
+            (
+                "quality_profile",
+                "a harness path lets quality_profile default instead of passing "
+                "the run's own resolution",
+            ),
+            (
+                "requested_phases",
+                "a harness path lets requested_phases default instead of passing "
+                "the run's own declared set -- this is how the final gate silently "
+                "widened to every applicable phase",
+            ),
+        ):
+            omitted = [
+                node.lineno
+                for node in dispatch_context_calls
+                if keyword_name not in {keyword.arg for keyword in node.keywords}
+            ]
+            self.assertEqual(omitted, [], reason)
+
+        resolves = [
+            node.lineno
+            for node in ast.walk(module)
+            if isinstance(node, ast.Call)
+            and getattr(node.func, "id", None) == "resolve_quality_profile"
+        ]
+        self.assertEqual(
+            len(resolves),
+            3,
+            "resolve_quality_profile belongs at exactly three boundaries: the "
+            "import-time constant, the harness constructor, and start_run",
+        )
+
+
+class AutoSequencedExec(EchoingTerminalExec):
+    """EchoingTerminalExec that mints a fresh task and dispatch id per attempt.
+
+    The armed recorders elsewhere in this file are driven attempt-by-attempt from the
+    test body, which a scenario FUNCTION does not allow: it calls run_attempt itself,
+    so nothing can arm the stub in between. This subclass moves that sequencing
+    inside the recorder -- every task-create gets its own id (so `specs` keeps one
+    entry per dispatch instead of overwriting a single key) and every worker-start
+    settles its own row.
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.task_ids: list[str] = []
+        self._dispatches = 0
+
+    def __call__(self, args: tuple[str, ...]) -> tuple[int, str]:
+        args = tuple(args)
+        verb = args[1] if len(args) > 1 else args[0]
+        if verb == "task-create":
+            task_id = f"task_L{len(self.task_ids) + 1}"
+            self.task_ids.append(task_id)
+            self.results["task-create"] = {"task": {"id": task_id}}
+            self.results["task-list"] = {
+                "tasks": [
+                    {"id": identifier, "status": "completed"}
+                    for identifier in self.task_ids
+                ]
+            }
+        elif verb == "worker-start":
+            self._dispatches += 1
+            dispatch_id = f"ctx_L{self._dispatches}"
+            task_id = self.task_ids[-1]
+            self.results["worker-start"] = {"dispatchId": dispatch_id}
+            self.results["check"] = {
+                "deliveryId": f"dlv_{dispatch_id}",
+                "timedOut": False,
+                "messages": [
+                    {
+                        "id": f"msg_{dispatch_id}",
+                        "type": "worker_done",
+                        "payload": json.dumps(
+                            {
+                                "taskId": task_id,
+                                "dispatchId": dispatch_id,
+                                "outcome": "succeeded",
+                            }
+                        ),
+                        "body": "ok",
+                    }
+                ],
+            }
+        return super().__call__(args)
+
+
+class QualityProfileScenarioTests(OfflineHarnessTestCase):
+    """Scenario L's body, executed offline.
+
+    scenario L exists for the opt-in real-Orca suite in test_orca_runtime.py, which
+    skips unless ORCA_RUNTIME_TEST=1 -- so without this class its code would ship
+    having never run. Injecting a stubbed harness executes everything that could be
+    wrong (the attempt sequence, the phases, the recorded aggregates) and skips only
+    preflight and the environment dump.
+    """
+
+    def test_scenario_l_filters_each_phase_and_reports_one_resolution(self) -> None:
+        recorder = AutoSequencedExec()
+        with patch.dict(environ, {"ORCA_CLI_COMMAND": "/opt/orca-dev"}):
+            harness = OrcaRuntimeHarness(self.artifact_dir)
+        harness._exec_orca = recorder
+        recorder.results["run-create"] = {"run": {"id": "run_scenario_l"}}
+
+        result = run_quality_profile_runtime_scenario(
+            self.artifact_dir, harness=harness
+        )
+
+        self.assertEqual(result.scenario, "L")
+        self.assertEqual(result.status, "COMPLETED")
+        self.assertEqual(len(result.attempts), 5)
+        self.assertEqual(result.quality_profile_status, "loaded")
+        applicable = result.quality_profile_attributes
+        self.assertEqual(
+            set(applicable),
+            {
+                "design:worker",
+                "design:reviewer",
+                "implementation:worker",
+                "implementation:reviewer",
+                "final_review:reviewer",
+            },
+        )
+        # Phase filtering, read off the aggregate the scenario itself recorded from
+        # the dispatched specs.
+        self.assertIn("DESIGN-001", applicable["design:worker"])
+        self.assertNotIn("DOMAIN-001", applicable["design:worker"])
+        self.assertIn("DOMAIN-001", applicable["implementation:worker"])
+        self.assertNotIn("DESIGN-001", applicable["implementation:worker"])
+        # Both roles of a phase agree; the final gate spans the workflow.
+        self.assertEqual(applicable["design:worker"], applicable["design:reviewer"])
+        self.assertEqual(
+            applicable["implementation:worker"], applicable["implementation:reviewer"]
+        )
+        for identifier in ("DESIGN-001", "DOMAIN-001", "TEAM-001"):
+            self.assertIn(identifier, applicable["final_review:reviewer"])
+
+    def test_scenario_l_never_writes_a_profile_into_the_repository(self) -> None:
+        """The profile goes under the artifact dir; the checkout is not touched.
+
+        Installing one at the real .orca/quality-profile.yaml would change how every
+        later run of this repository is reviewed -- an out-of-scope side effect, and
+        the kind a test must not have.
+        """
+        recorder = AutoSequencedExec()
+        with patch.dict(environ, {"ORCA_CLI_COMMAND": "/opt/orca-dev"}):
+            harness = OrcaRuntimeHarness(self.artifact_dir)
+        harness._exec_orca = recorder
+        recorder.results["run-create"] = {"run": {"id": "run_scenario_l"}}
+
+        run_quality_profile_runtime_scenario(self.artifact_dir, harness=harness)
+
+        self.assertTrue(
+            (
+                self.artifact_dir
+                / "quality-profile-project"
+                / DEFAULT_PROFILE_PATH
+            ).is_file()
+        )
+        self.assertFalse((Path(orca_runtime_harness.REPO_ROOT) / DEFAULT_PROFILE_PATH).exists())
+
+
+class FinalReviewQualityProfileTests(OfflineHarnessTestCase):
+    """ORIGINAL_REQUEST section 13-H at the runtime-harness level.
+
+    The E2E harness never hands its Final Review attempt a Task spec at all -- that
+    attempt is a reviewer-only subprocess with no `--task-spec` -- so the only place
+    the Final Adversarial Reviewer's dispatched payload can be inspected is here,
+    where run_attempt(phase=final_review) renders and dispatches a real one. Every
+    assertion reads recorder.specs[task_id]: the text task-create was called with.
+
+    `arm` and the terminal fixture are borrowed by assignment, not inheritance, for
+    the same reason RunScopedQualityProfileTests borrows them -- subclassing would
+    re-run an unmodified regression suite under this class's name.
+    """
+
+    LIVE_TERMINAL_RESOURCE = SameRoleSessionReuseTests.LIVE_TERMINAL_RESOURCE
+    arm = SameRoleSessionReuseTests.arm
+
+    PROFILE = """version: 1
+
+quality_attributes:
+
+  - id: DESIGN-001
+    category: platform-infrastructure
+    name: Design only rule
+    blocking: false
+    applies_to:
+      - design
+
+  - id: DOMAIN-001
+    category: business-domain
+    name: Idempotent processing
+    blocking: true
+    applies_to:
+      - implementation
+      - test
+
+  - id: BUG-001
+    category: operational-risk
+    name: Bugfix only rule
+    blocking: true
+    applies_to:
+      - bugfix
+
+  - id: REFACTOR-001
+    category: operational-risk
+    name: Refactoring only rule
+    blocking: true
+    applies_to:
+      - refactoring
+
+  - id: TEAM-001
+    category: team-convention
+    name: Repository convention
+    blocking: false
+"""
+
+    # Everything in the block that is a property of the RUN rather than of the phase.
+    # Phase filtering may vary the two attribute keys; a difference in any of these
+    # means a second resolution reached one of the dispatches.
+    RUN_SCOPED_KEYS = (
+        "profile_status",
+        "profile_path",
+        "general_gate",
+        "decision_priority",
+        "non_blocking_by_default",
+        "verdict_semantics",
+    )
+
+    def profile_root(self) -> Path:
+        root = Path(self.temporary_directory.name) / "project"
+        (root / DEFAULT_PROFILE_PATH).parent.mkdir(parents=True, exist_ok=True)
+        (root / DEFAULT_PROFILE_PATH).write_text(self.PROFILE, encoding="utf-8")
+        return root
+
+    def started_harness(self, recorder: Any) -> OrcaRuntimeHarness:
+        with patch.dict(environ, {"ORCA_CLI_COMMAND": "/opt/orca-dev"}):
+            harness = OrcaRuntimeHarness(
+                self.artifact_dir, quality_profile_root=self.profile_root()
+            )
+        harness._exec_orca = recorder
+        recorder.results["run-create"] = {"run": {"id": "run_final_profile"}}
+        # full_run() below only ever dispatches implementation and test -- the
+        # requested set a real run of this shape would declare, and the set every
+        # test in this class asserts the final gate is scoped to.
+        harness.start_run(
+            "final review with a quality profile installed",
+            requested_phases=("implementation", "test"),
+        )
+        return harness
+
+    def attempt(
+        self,
+        recorder: Any,
+        harness: OrcaRuntimeHarness,
+        role: str,
+        iteration: int,
+        mode: str,
+        phase: str,
+        task_id: str,
+        **kwargs: Any,
+    ) -> str:
+        """Run one real attempt and return the Task spec task-create was given."""
+        self.arm(recorder, f"ctx_{task_id}", task_id)
+        harness.run_attempt(role, iteration, mode, phase=phase, **kwargs)
+        return recorder.specs[task_id]
+
+    def full_run(self, recorder: Any, harness: OrcaRuntimeHarness) -> dict[str, str]:
+        """A complete run: phase gate, failing Final Review, correction, T5a, PASS.
+
+        The shape run_final_review_runtime_scenario drives against real Orca, with a
+        downstream revalidation round added so T5a is exercised with a profile
+        installed. Returns {label: dispatched spec}.
+        """
+        specs = {
+            "impl_worker": self.attempt(
+                recorder, harness, "worker", 1, "complete", "implementation", "task_w1"
+            ),
+            "impl_reviewer": self.attempt(
+                recorder, harness, "reviewer", 1, "pass", "implementation", "task_r1"
+            ),
+            "final_1": self.attempt(
+                recorder,
+                harness,
+                "reviewer",
+                1,
+                "fail",
+                FINAL_REVIEW_PHASE,
+                "task_f1",
+                findings=("R1",),
+            ),
+            "correction_worker": self.attempt(
+                recorder,
+                harness,
+                "worker",
+                2,
+                "correction",
+                "implementation",
+                "task_w2",
+                resolutions={"R1": "RESOLVED"},
+                findings=("R1",),
+            ),
+            "correction_reviewer": self.attempt(
+                recorder,
+                harness,
+                "reviewer",
+                2,
+                "pass",
+                "implementation",
+                "task_r2",
+                findings=("R1",),
+            ),
+            # T5a: implementation was corrected, so the requested TEST phase downstream
+            # of it is revalidated before the next fresh Final Review attempt.
+            "revalidation_worker": self.attempt(
+                recorder, harness, "worker", 1, "complete", "test", "task_w3"
+            ),
+            "revalidation_reviewer": self.attempt(
+                recorder, harness, "reviewer", 1, "pass", "test", "task_r3"
+            ),
+            "final_2": self.attempt(
+                recorder, harness, "reviewer", 2, "pass", FINAL_REVIEW_PHASE, "task_f2"
+            ),
+        }
+        return specs
+
+    def test_one_resolution_reaches_every_dispatch_including_final_review(
+        self,
+    ) -> None:
+        """13-H a. Phase gate, Final Review, correction and T5a all read one profile."""
+        recorder = EchoingTerminalExec()
+        harness = self.started_harness(recorder)
+
+        specs = self.full_run(recorder, harness)
+        gates = {label: parse_quality_gate(spec) for label, spec in specs.items()}
+
+        reference = gates["impl_worker"]
+        for label, gate in gates.items():
+            with self.subTest(label):
+                for key in self.RUN_SCOPED_KEYS:
+                    self.assertEqual(gate[key], reference[key])
+                self.assertEqual(gate["profile_status"], "loaded")
+
+    def test_the_final_reviewer_spec_carries_the_profile_attributes(self) -> None:
+        """13-H a, the positive half: the gate is not merely present but populated.
+
+        External review MAJOR: this run's requested phases are declared
+        (implementation, test) in started_harness(), so DESIGN-001/BUG-001/
+        REFACTOR-001 (each scoped to a phase this run never requested) must be
+        excluded from the real dispatched Final Review spec -- not merely from a
+        direct build_quality_gate_context() call, which
+        test_a_declared_requested_set_narrows_the_final_gate already covers.
+        DOMAIN-001 (implementation+test) and TEAM-001 (no applies_to, so every
+        phase) remain in scope regardless.
+        """
+        recorder = EchoingTerminalExec()
+        harness = self.started_harness(recorder)
+
+        specs = self.full_run(recorder, harness)
+
+        for label in ("final_1", "final_2"):
+            with self.subTest(label):
+                gate = parse_quality_gate(specs[label])
+                for identifier in ("DOMAIN-001", "TEAM-001"):
+                    self.assertIn(
+                        identifier, gate["applicable_quality_attributes"]
+                    )
+                for identifier in ("DESIGN-001", "BUG-001", "REFACTOR-001"):
+                    self.assertNotIn(
+                        identifier, gate["applicable_quality_attributes"]
+                    )
+                self.assertEqual(gate["blocking_quality_attributes"], "DOMAIN-001")
+
+    def test_a_declared_requested_set_narrows_the_final_gate(self) -> None:
+        """The other branch: a Final Review told which phases ran scopes to them."""
+        recorder = EchoingTerminalExec()
+        harness = self.started_harness(recorder)
+
+        spec, _, _ = dispatch_context(
+            "reviewer",
+            1,
+            "pass",
+            phase=FINAL_REVIEW_PHASE,
+            run_id=harness.run_id or "",
+            quality_profile=harness.quality_profile,
+            requested_phases=("implementation", "test"),
+        )
+        gate = parse_quality_gate(spec)
+
+        self.assertIn("DOMAIN-001", gate["applicable_quality_attributes"])
+        self.assertIn("TEAM-001", gate["applicable_quality_attributes"])
+        self.assertNotIn("DESIGN-001", gate["applicable_quality_attributes"])
+        self.assertNotIn("BUG-001", gate["applicable_quality_attributes"])
+        self.assertNotIn("REFACTOR-001", gate["applicable_quality_attributes"])
+
+    def test_the_correction_round_is_judged_against_its_phases_own_attributes(
+        self,
+    ) -> None:
+        """13-H b. A Responsible Phase correction reads what that phase always read."""
+        recorder = EchoingTerminalExec()
+        harness = self.started_harness(recorder)
+
+        specs = self.full_run(recorder, harness)
+        original = parse_quality_gate(specs["impl_worker"])
+
+        for label in ("correction_worker", "correction_reviewer", "impl_reviewer"):
+            with self.subTest(label):
+                self.assertEqual(parse_quality_gate(specs[label]), original)
+        self.assertEqual(original["blocking_quality_attributes"], "DOMAIN-001")
+        self.assertNotIn("DESIGN-001", original["applicable_quality_attributes"])
+        # The correction Worker really was told which finding it must resolve, so this
+        # is a correction round and not just a second first-attempt.
+        self.assertIn("R1", parse_task_boundary(specs["correction_worker"])[
+            "relevant_previous_findings"
+        ])
+
+    def test_downstream_revalidation_reads_the_same_profile(self) -> None:
+        """13-H d. T5a's revalidated phase is scoped to itself, from one resolution."""
+        recorder = EchoingTerminalExec()
+        harness = self.started_harness(recorder)
+
+        specs = self.full_run(recorder, harness)
+        worker = parse_quality_gate(specs["revalidation_worker"])
+        reviewer = parse_quality_gate(specs["revalidation_reviewer"])
+
+        self.assertEqual(worker, reviewer)
+        # TEST is inside DOMAIN-001's applies_to and outside DESIGN-001's.
+        self.assertIn("DOMAIN-001", worker["applicable_quality_attributes"])
+        self.assertNotIn("DESIGN-001", worker["applicable_quality_attributes"])
+        self.assertEqual(worker["blocking_quality_attributes"], "DOMAIN-001")
+
+    def test_final_review_terminal_freshness_survives_a_profile(self) -> None:
+        """Regression, not redesign: section 17's invariant with a profile installed."""
+        recorder = SequentialTerminalExec()
+        with patch.dict(environ, {"ORCA_CLI_COMMAND": "/opt/orca-dev"}):
+            harness = OrcaRuntimeHarness(
+                self.artifact_dir, quality_profile_root=self.profile_root()
+            )
+        harness._exec_orca = recorder
+        recorder.results["run-create"] = {"run": {"id": "run_fresh_profile"}}
+        harness.start_run(
+            "final review freshness with a profile",
+            requested_phases=("implementation",),
+        )
+
+        handles = []
+        for index in (1, 2):
+            recorder.results["worker-start"] = {"dispatchId": f"ctx_fr_{index}"}
+            recorder.results["check"] = {
+                "deliveryId": f"dlv_fr_{index}",
+                "timedOut": False,
+                "messages": [
+                    {
+                        "id": f"msg_fr_{index}",
+                        "type": "worker_done",
+                        "payload": json.dumps(
+                            {
+                                "taskId": "task_g",
+                                "dispatchId": f"ctx_fr_{index}",
+                                "outcome": "succeeded",
+                            }
+                        ),
+                        "body": "ok",
+                    }
+                ],
+            }
+            _, handle = harness.run_attempt(
+                "reviewer", index, "pass", phase=FINAL_REVIEW_PHASE
+            )
+            handles.append(handle)
+
+        self.assertEqual(len(set(handles)), 2)
+        self.assertNotEqual(handles[0], handles[1])
+
+
+class SpecializedPhaseQualityProfileTests(OfflineHarnessTestCase):
+    """Section 13-B for BUGFIX and REFACTORING at the runtime-harness level.
+
+    The canonical five have an order and a downstream set; the specialized two have
+    neither, which is exactly why "they behave like any other phase for filtering"
+    is worth a test rather than an assumption.
+    """
+
+    LIVE_TERMINAL_RESOURCE = SameRoleSessionReuseTests.LIVE_TERMINAL_RESOURCE
+    arm = SameRoleSessionReuseTests.arm
+    PROFILE = FinalReviewQualityProfileTests.PROFILE
+
+    def started_harness(self, recorder: Any) -> OrcaRuntimeHarness:
+        root = Path(self.temporary_directory.name) / "project"
+        (root / DEFAULT_PROFILE_PATH).parent.mkdir(parents=True, exist_ok=True)
+        (root / DEFAULT_PROFILE_PATH).write_text(self.PROFILE, encoding="utf-8")
+        with patch.dict(environ, {"ORCA_CLI_COMMAND": "/opt/orca-dev"}):
+            harness = OrcaRuntimeHarness(
+                self.artifact_dir, quality_profile_root=root
+            )
+        harness._exec_orca = recorder
+        recorder.results["run-create"] = {"run": {"id": "run_specialized"}}
+        harness.start_run("specialized phase quality profile")
+        return harness
+
+    def test_a_bugfix_run_sees_its_own_attribute_and_no_canonical_one(self) -> None:
+        recorder = EchoingTerminalExec()
+        harness = self.started_harness(recorder)
+
+        self.arm(recorder, "ctx_bug_w", "task_bug_w")
+        harness.run_attempt("worker", 1, "complete", phase="bugfix")
+        self.arm(recorder, "ctx_bug_r", "task_bug_r")
+        harness.run_attempt("reviewer", 1, "pass", phase="bugfix")
+
+        worker = parse_quality_gate(recorder.specs["task_bug_w"])
+        reviewer = parse_quality_gate(recorder.specs["task_bug_r"])
+
+        self.assertEqual(worker, reviewer)
+        self.assertIn("BUG-001", worker["applicable_quality_attributes"])
+        self.assertIn("TEAM-001", worker["applicable_quality_attributes"])
+        self.assertNotIn("DOMAIN-001", worker["applicable_quality_attributes"])
+        self.assertNotIn("DESIGN-001", worker["applicable_quality_attributes"])
+        self.assertNotIn("REFACTOR-001", worker["applicable_quality_attributes"])
+        self.assertEqual(worker["blocking_quality_attributes"], "BUG-001")
+
+    def test_a_refactoring_run_sees_its_own_attribute_and_the_unscoped_one(
+        self,
+    ) -> None:
+        """REFACTOR-001 (refactoring-only) and TEAM-001 (unscoped) apply; the
+        canonical-phase and bugfix-only attributes do not."""
+        recorder = EchoingTerminalExec()
+        harness = self.started_harness(recorder)
+
+        self.arm(recorder, "ctx_ref_w", "task_ref_w")
+        harness.run_attempt("worker", 1, "complete", phase="refactoring")
+
+        gate = parse_quality_gate(recorder.specs["task_ref_w"])
+
+        self.assertIn("REFACTOR-001", gate["applicable_quality_attributes"])
+        self.assertIn("TEAM-001", gate["applicable_quality_attributes"])
+        self.assertNotIn("DOMAIN-001", gate["applicable_quality_attributes"])
+        self.assertNotIn("DESIGN-001", gate["applicable_quality_attributes"])
+        self.assertNotIn("BUG-001", gate["applicable_quality_attributes"])
+        self.assertEqual(gate["blocking_quality_attributes"], "REFACTOR-001")
 
 
 if __name__ == "__main__":

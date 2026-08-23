@@ -273,6 +273,73 @@ FINAL_REVIEW_BARE_CHOICE_LINE = re.compile(
     r"(?m)^FINAL_REVIEW:\s*[A-Z_]+\s*\|\s*[A-Z_]+\s*$"
 )
 
+QUALITY_PROFILE_CONTRACT_BLOCK_PATTERN = re.compile(
+    r"####\s*Quality profile contract\s*\n(?P<body>.*?)```text\n"
+    r"(?P<values>QUALITY_PROFILE_STATUS.*?)\n```",
+    re.DOTALL,
+)
+QUALITY_PROFILE_CONTRACT: dict[str, tuple[str, ...]] = {
+    "QUALITY_PROFILE_STATUS": ("loaded", "absent", "invalid"),
+    "QUALITY_PROFILE_ABSENT_CONDITION": ("path_does_not_exist",),
+    "QUALITY_PROFILE_RESOLUTION_SCOPE": ("resolved_once_per_run_never_per_attempt",),
+    "QUALITY_PROFILE_INVALID_HANDLING": ("validation_failure_before_dispatch",),
+    "QUALITY_PROFILE_ABSENT_BASIS": (
+        "explicit_requirements",
+        "current_phase_contract",
+        "minimal_general_gate",
+    ),
+    "QUALITY_ATTRIBUTE_APPLIES_TO_DEFAULT": ("all_applicable_workflow_phases",),
+    "QUALITY_GATE_DECISION_PRIORITY": (
+        "explicit_requirements",
+        "project_quality_attributes",
+        "current_phase_contract",
+        "minimal_general_gate",
+    ),
+    "QUALITY_GATE_GENERAL_IDS": ("g1", "g2", "g3", "g4", "g5"),
+    "QUALITY_GATE_SEVERITY_RULE": ("severity_is_not_blocking",),
+    "QUALITY_GATE_BLOCKING_SOURCES": (
+        "blocking_quality_attribute",
+        "minimal_general_gate",
+    ),
+    "QUALITY_GATE_VERDICTS": ("pass", "pass_with_notes", "fail", "blocked"),
+    "QUALITY_GATE_WORKFLOW_VALUES": ("pass", "fail"),
+    "QUALITY_GATE_CONTEXT_KEYS": (
+        "profile_status",
+        "profile_path",
+        "applicable_quality_attributes",
+        "blocking_quality_attributes",
+        "general_gate",
+        "decision_priority",
+        "non_blocking_by_default",
+        "verdict_semantics",
+    ),
+    "QUALITY_GATE_CONTEXT_ROLES": ("worker", "reviewer", "final_reviewer"),
+}
+QUALITY_PROFILE_CONTRACT_MAX_LINES = 14  # was 12; +absent condition, +resolution scope
+# The prose the block is only an index into. Each of these is a sentence the review
+# policy would still be broad-generic without, which is why they are checked here
+# rather than left to read as documentation flavour.
+QUALITY_PROFILE_PROSE_ANCHORS = (
+    ".orca/quality-profile.yaml",
+    "REASON: INVALID_QUALITY_PROFILE",
+    "broad generic checklist를 복구하지 않는다",
+    # IMPL-I1 F-001/F-002: the two sentences the machine keys only index.
+    "정확히 한 번",
+    "regular file이",
+)
+# The shared review policy is what the phase Reviewer actually reads. A machine
+# contract in SKILL.md that the routed policy file never mentions would be exactly
+# the documentation-only change the requirement forbids.
+QUALITY_GATE_REVIEW_POLICY_ANCHORS = (
+    "## Quality Model",
+    "### Decision Priority",
+    "### Minimal General Gate",
+    "## Severity and Blocking",
+    "PASS WITH NOTES",
+    "Quality Attribute:",
+    "Blocking: YES | NO",
+)
+
 
 
 class Validation:
@@ -1185,6 +1252,94 @@ def validate_reviewer_context_contract(validation: Validation) -> None:
     )
 
 
+def validate_quality_profile_contract(validation: Validation) -> None:
+    """The section 11 quality profile block, and the review policy that must back it.
+
+    Two halves on purpose. The anchor block is the machine-readable claim; the
+    reviews/common.md anchors are the check that the claim reached the text a phase
+    Reviewer is actually routed to. A SKILL.md-only change would satisfy the first
+    and leave the review gate exactly as broad and generic as it was.
+    """
+    skill_path = LIFECYCLE_SKILL_DIR / "SKILL.md"
+    if not skill_path.is_file():
+        return
+    skill_text = skill_path.read_text(encoding="utf-8")
+
+    parsed = parse_anchor_contract(skill_text, QUALITY_PROFILE_CONTRACT_BLOCK_PATTERN)
+    validation.check(
+        parsed is not None,
+        f"{LIFECYCLE_SKILL_DIR.name}: quality profile contract block is missing or "
+        "malformed",
+    )
+    if parsed is None:
+        return
+    validation.check(
+        set(parsed) == set(QUALITY_PROFILE_CONTRACT),
+        f"{LIFECYCLE_SKILL_DIR.name}: quality profile contract keys drifted",
+    )
+    validation.check(
+        parsed == QUALITY_PROFILE_CONTRACT,
+        f"{LIFECYCLE_SKILL_DIR.name}: quality profile contract values drifted",
+    )
+    validation.check(
+        0
+        < anchor_contract_block_lines(
+            skill_text, QUALITY_PROFILE_CONTRACT_BLOCK_PATTERN
+        )
+        <= QUALITY_PROFILE_CONTRACT_MAX_LINES,
+        f"{LIFECYCLE_SKILL_DIR.name}: quality profile contract block exceeds "
+        f"{QUALITY_PROFILE_CONTRACT_MAX_LINES} lines",
+    )
+    validation.check(
+        parsed.get("QUALITY_GATE_WORKFLOW_VALUES") == ("pass", "fail"),
+        "QUALITY_GATE_WORKFLOW_VALUES must stay two-valued so PASS WITH NOTES and "
+        "BLOCKED never become lifecycle states",
+    )
+    validation.check(
+        set(parsed.get("QUALITY_GATE_WORKFLOW_VALUES", ()))
+        < set(parsed.get("QUALITY_GATE_VERDICTS", ())),
+        "QUALITY_GATE_WORKFLOW_VALUES must be a strict subset of QUALITY_GATE_VERDICTS",
+    )
+    validation.check(
+        len(parsed.get("QUALITY_GATE_GENERAL_IDS", ())) == 5,
+        "the minimal general gate must stay five ids",
+    )
+    validation.check(
+        set(parsed.get("QUALITY_GATE_CONTEXT_ROLES", ())) >= {"worker", "reviewer"},
+        "QUALITY_GATE_CONTEXT_ROLES must reach the Worker as well as the Reviewer",
+    )
+
+    section = extract_section(
+        skill_text, REVIEWER_CONTEXT_SECTION_HEADING, REVIEWER_CONTEXT_SECTION_END
+    )
+    for anchor in QUALITY_PROFILE_PROSE_ANCHORS:
+        validation.check(
+            anchor in section,
+            f"{LIFECYCLE_SKILL_DIR.name}: section 11 quality profile prose is missing "
+            f"{anchor!r}",
+        )
+
+    for skill_dir in SKILL_DIRS:
+        policy_path = skill_dir / "reviews" / "common.md"
+        if not policy_path.is_file():
+            continue
+        policy_text = policy_path.read_text(encoding="utf-8")
+        for anchor in QUALITY_GATE_REVIEW_POLICY_ANCHORS:
+            validation.check(
+                anchor in policy_text,
+                f"{skill_dir.name}: reviews/common.md is missing the profile-first "
+                f"anchor {anchor!r}",
+            )
+
+    loop_skill = REPO_ROOT / "orca-worker-reviewer-loop" / "SKILL.md"
+    loop_text = loop_skill.read_text(encoding="utf-8") if loop_skill.is_file() else ""
+    validation.check(
+        parse_anchor_contract(loop_text, QUALITY_PROFILE_CONTRACT_BLOCK_PATTERN)
+        is None,
+        "orca-worker-reviewer-loop: must not contain the quality profile contract",
+    )
+
+
 def validate_workflow_output_contracts(validation: Validation) -> None:
     contracts = []
     for skill_dir in SKILL_DIRS:
@@ -1237,6 +1392,7 @@ def main() -> int:
     validate_reuse_contract(validation)
     validate_task_boundary_contract(validation)
     validate_reviewer_context_contract(validation)
+    validate_quality_profile_contract(validation)
     validate_version(validation)
     validate_no_user_absolute_paths(validation)
 

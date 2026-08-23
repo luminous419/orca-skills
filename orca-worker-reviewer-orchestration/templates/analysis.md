@@ -20,6 +20,15 @@ Understand Request → Inspect Relevant Repository Area → Analyze Current Stat
 - 범위를 요청과 관련 영역으로 제한하고 중요한 unknown을 숨기지 않는다.
 - 해결책 확정보다 현황·문제·영향 분석에 집중한다.
 
+## Quality Profile
+dispatch된 Task spec의 `=== QUALITY GATE (profile-first) ===` block은 이번 phase에 applicable한
+Project Quality Attribute, 그중 blocking인 것, Minimal General Gate와 decision priority를 전달한다.
+
+- `blocking_quality_attributes`의 항목은 처음부터 충족하도록 작업하고 근거를 결과에 남긴다.
+- 그 block에 없는 attribute를 이번 phase에서 추가로 만족시키려 하지 않는다.
+- `profile_status: absent`이면 Explicit Requirements / 이 template의 phase contract /
+  Minimal General Gate만 적용된다.
+
 ## Result Contract
 
 ```text

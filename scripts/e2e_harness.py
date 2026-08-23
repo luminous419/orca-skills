@@ -14,7 +14,10 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from scripts.quality_profile import resolve_quality_profile
 from scripts.task_context import (
+    build_quality_gate_context,
+    parse_quality_gate,
     build_reviewer_context,
     build_task_boundary,
     ensure_run_artifact_root,
@@ -44,6 +47,18 @@ FINAL_REVIEW_RESOLUTION_REASON = "FINAL_REVIEW_RESOLUTION_TRACE_INCOMPLETE"
 # place -- the bridge already proved accepted.keys() == routed ids -- so it exists
 # only so that bypassing the bridge fails on the semantics, not on a raw KeyError.
 UNACCOUNTED_RESOLUTION = "UNACCOUNTED"
+QUALITY_ATTRIBUTE_LINE = re.compile(
+    r"(?m)^Quality Attribute:\s*(?P<attribute>[A-Za-z][A-Za-z0-9_-]*)\s*$"
+)
+SEVERITY_LINE = re.compile(
+    r"(?m)^Severity:\s*(?P<severity>CRITICAL|MAJOR|MINOR)\s*$"
+)
+BLOCKING_LINE = re.compile(r"(?m)^Blocking:\s*(?P<blocking>YES|NO)\s*$")
+# `Quality Attribute: NONE` is the contract's own spelling for "charged to no
+# project attribute", and reviews/common.md pairs it with exactly one blocking
+# value: NO. A General Gate violation is blocking and is charged to G1-G5, never to
+# NONE, so NONE + YES names no criterion at all and cannot be acted on.
+UNCHARGED_QUALITY_ATTRIBUTE = "NONE"
 RESPONSIBLE_PHASE_LINE = re.compile(
     r"(?m)^Responsible Phase:\s*(?P<phase>[a-z][a-z0-9_]*)\s*$"
 )
@@ -112,6 +127,15 @@ class SessionEvent:
     record stays hashable and two attempts can be compared for equality. They are
     produced by scripts/task_context.py, the same module the runtime harness uses, so
     the payload shape is defined in exactly one place.
+
+    `quality_gate` is the profile-first block parsed back OUT of the `--task-spec`
+    text this invocation was handed. The two fields above are the layer-1 keys and the
+    Reviewer key NAMES, neither of which can answer "which quality attributes did this
+    phase's Worker actually see", so a workflow test would otherwise have to re-derive
+    what it believes the spec should have contained. Parsed rather than stored raw
+    because the raw spec carries the Reviewer's drill_down -- an absolute workspace
+    path -- which would make two runs of the same scenario compare unequal and break
+    the cross-skill determinism assertion in test_e2e_harness.py.
     """
 
     role: str = ""
@@ -122,6 +146,7 @@ class SessionEvent:
     agent_command: str = ""
     task_boundary: tuple[tuple[str, str], ...] = ()
     reviewer_context_keys: tuple[str, ...] = ()
+    quality_gate: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -129,12 +154,34 @@ class FinalFinding:
     finding_id: str
     responsible_phase: str | None
     severity: str = "MAJOR"
+    # OS-1's Final Review Finding Contract. `severity` says how much impact the
+    # finding has; `blocking` says whether it fails this gate, and they are different
+    # axes -- a MAJOR finding whose quality attribute is not blocking does not route
+    # to a correction round. `quality_attribute` is the attribute id or general gate
+    # id the finding is charged to; NONE is only ever paired with blocking=False.
+    quality_attribute: str = "G1"
+    blocking: bool = True
+
+
+# A scenario may spell a finding either way. The two-value form predates OS-1 and
+# means "a blocking general-gate violation", which is what every pre-OS-1 fixture in
+# this file already meant by putting a finding under `## Blocking Findings`.
+FinalFindingSpec = tuple[str, str] | tuple[str, str, str, bool]
+
+
+def normalize_final_finding_spec(spec: FinalFindingSpec) -> tuple[str, str, str, bool]:
+    """(id, responsible phase, quality attribute, blocking) from either form."""
+    if len(spec) == 2:
+        finding_id, phase = spec
+        return finding_id, phase, "G1", True
+    finding_id, phase, attribute, blocking = spec
+    return finding_id, phase, attribute, bool(blocking)
 
 
 @dataclass(frozen=True)
 class FinalReviewScenario:
     modes: tuple[str, ...]
-    findings: tuple[tuple[tuple[str, str], ...], ...] = ()
+    findings: tuple[tuple[FinalFindingSpec, ...], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -235,6 +282,16 @@ def _hash_files(paths: tuple[Path, ...]) -> dict[Path, str]:
 
 
 
+def _parsed_quality_gate(spec: str) -> tuple[tuple[str, str], ...]:
+    """The quality-gate block read back out of a rendered spec, as sorted pairs.
+
+    Parsed from the dispatched text rather than from the builder's return value: the
+    question these records exist to answer is what the agent was handed, and only the
+    payload can answer it.
+    """
+    return tuple(sorted(parse_quality_gate(spec).items()))
+
+
 def final_review_artifact_path(run_id: str, attempt: int) -> str:
     """W-A1-N: attempt 1 is unsuffixed; attempt N>=2 carries _iteration<N>.
 
@@ -294,38 +351,99 @@ def downstream_revalidation_set(
     return tuple(p for p in CANONICAL_PHASES[min(indices) + 1:] if p in requested)
 
 
+def _require_finding_field(
+    pattern: re.Pattern[str], block: str, finding_id: str, field: str
+) -> re.Match[str]:
+    """The match for a REQUIRED finding field, or a contract error naming it.
+
+    One helper for all three so no field can end up with a quiet default while its
+    siblings raise -- which is exactly how `Quality Attribute:` and `Severity:` drifted
+    apart from `Blocking:`.
+    """
+    found = pattern.search(block)
+    if found is None:
+        raise OutputContractError(f"finding {finding_id} has no {field} field")
+    return found
+
+
 def parse_final_review_output(
     output: str, contract: WorkflowOutputContract
 ) -> tuple[str, tuple[FinalFinding, ...]]:
-    """Verdict + (finding id, responsible phase) pairs.
+    """Verdict + every finding the report carries, blocking and non-blocking alike.
 
-    Delegates the verdict and the id set to the EXISTING parse_reviewer_output --
-    its signature is bound by several tests and is not changed -- then walks the
-    `## Blocking Findings` body pairing each `ID:` with the `Responsible Phase:`
-    line that follows it before the next `ID:`.
+    Delegates the verdict and the blocking id set to the EXISTING
+    parse_reviewer_output -- its signature is bound by several tests and is not
+    changed -- then walks BOTH finding sections pairing each `ID:` with the
+    `Quality Attribute:`, `Blocking:` and `Responsible Phase:` lines that follow it
+    before the next `ID:`.
+
+    Reading both sections is the point. While only the blocking section was parsed, a
+    non-blocking finding was invisible to the caller, so "notes do not start a
+    correction loop" was true because the parser never saw them -- not because
+    anything honoured `Blocking:`. The caller now sees every finding and has to decide
+    on the field, which is what makes the OS-1 severity/blocking split observable.
+
+    Every contract field -- `Quality Attribute:`, `Severity:` and `Blocking:` -- is
+    REQUIRED, and none of them is inferred from the section a finding sits in or from
+    a default. Inferring would re-derive a field from exactly the signal it exists to
+    replace, and defaulting is worse: a report that dropped the line would parse into
+    a finding this function invented, and every downstream assertion about that field
+    would then be an assertion about the default. `Severity:` was defaulted rather
+    than parsed until iteration 3, which silently made an equal-severity control read
+    MAJOR == MAJOR no matter what the report said.
+
+    The one forbidden combination is rejected here too: `Quality Attribute: NONE`
+    with `Blocking: YES`. A finding charged to no attribute is a generic observation,
+    and a blocking one is charged to a project attribute id or a General Gate id --
+    so the pair names no criterion the run could act on.
     """
     verdict, _ = parse_reviewer_output(output, contract)
     sections = {
         match.group("title").strip(): match.group("body")
         for match in SECTION.finditer(output)
     }
-    blocking_body = sections.get("Blocking Findings", "")
-    matches = list(FINDING_LINE.finditer(blocking_body))
     findings: list[FinalFinding] = []
-    for position, match in enumerate(matches):
-        start = match.end()
-        end = (
-            matches[position + 1].start()
-            if position + 1 < len(matches)
-            else len(blocking_body)
-        )
-        phase_match = RESPONSIBLE_PHASE_LINE.search(blocking_body[start:end])
-        findings.append(
-            FinalFinding(
-                match.group("id"),
-                phase_match.group("phase") if phase_match is not None else None,
+    for title in ("Blocking Findings", "Non-Blocking Findings"):
+        body = sections.get(title, "")
+        matches = list(FINDING_LINE.finditer(body))
+        for position, match in enumerate(matches):
+            start = match.end()
+            end = (
+                matches[position + 1].start()
+                if position + 1 < len(matches)
+                else len(body)
             )
-        )
+            block = body[start:end]
+            finding_id = match.group("id")
+            attribute = _require_finding_field(
+                QUALITY_ATTRIBUTE_LINE, block, finding_id, "Quality Attribute"
+            ).group("attribute")
+            severity = _require_finding_field(
+                SEVERITY_LINE, block, finding_id, "Severity"
+            ).group("severity")
+            blocking = (
+                _require_finding_field(
+                    BLOCKING_LINE, block, finding_id, "Blocking"
+                ).group("blocking")
+                == "YES"
+            )
+            if attribute == UNCHARGED_QUALITY_ATTRIBUTE and blocking:
+                raise OutputContractError(
+                    f"finding {finding_id} is Blocking: YES with "
+                    f"Quality Attribute: {UNCHARGED_QUALITY_ATTRIBUTE}; a blocking "
+                    "finding is charged to a project attribute id or a General Gate "
+                    "id, never to NONE"
+                )
+            phase_match = RESPONSIBLE_PHASE_LINE.search(block)
+            findings.append(
+                FinalFinding(
+                    finding_id,
+                    phase_match.group("phase") if phase_match is not None else None,
+                    severity=severity,
+                    quality_attribute=attribute,
+                    blocking=blocking,
+                )
+            )
     return verdict, tuple(findings)
 
 
@@ -379,6 +497,11 @@ class E2EHarness:
         # its phase loop starts; a bare .run() call (no run_workflow) keeps this
         # default, which is why it is a real, non-empty run id rather than "".
         self.run_id = run_id
+        # Resolved once, from this instance's own workspace rather than the real
+        # repository, for the same reason the artifact root is: a deterministic
+        # scenario must not change its dispatched Task specs because the checkout it
+        # happens to run inside grew a `.orca/quality-profile.yaml`.
+        self.quality_profile = resolve_quality_profile(workspace)
         # Provisioned immediately, under workspace (this instance's own scratch
         # directory) rather than the real repository's artifacts/ root, before the
         # first Worker/Reviewer subprocess -- run with cwd=workspace -- could be
@@ -431,6 +554,7 @@ class E2EHarness:
         *,
         task_boundary: tuple[tuple[str, str], ...] = (),
         reviewer_context_keys: tuple[str, ...] = (),
+        quality_gate: tuple[tuple[str, str], ...] = (),
     ) -> SessionEvent:
         """Append-only: allocate (or reuse) this role's session and record the fact."""
         session_id, created = self.allocate_session(
@@ -445,6 +569,7 @@ class E2EHarness:
             agent_command=SESSION_AGENT_COMMANDS.get(role, ""),
             task_boundary=task_boundary,
             reviewer_context_keys=reviewer_context_keys,
+            quality_gate=quality_gate,
         )
         self.sessions.append(event)
         return event
@@ -467,6 +592,18 @@ class E2EHarness:
             final_status="ERROR",
             reason=reason,
             sessions=tuple(self.sessions),
+        )
+
+    def quality_gate(self) -> dict[str, object]:
+        """The profile-first quality model both fake agents receive this phase.
+
+        One call, one resolution, both roles: the Worker and the Reviewer of a phase
+        must not be handed two different answers to "which quality attributes apply
+        here", and building it in one place is what makes that structural.
+        """
+        return build_quality_gate_context(
+            resolution=self.quality_profile,
+            current_phase=self.phase,
         )
 
     def run(self, scenario: FakeScenario) -> WorkflowResult:
@@ -501,6 +638,15 @@ class E2EHarness:
                 ),
                 relevant_previous_findings=tuple(sorted(previous_blocking_findings)),
             )
+            # One string, bound once: the text handed to the subprocess and the text
+            # the session event records are the same object, so a test reading the
+            # event is reading what the agent was actually given.
+            worker_spec = render_task_spec(
+                f"worker {self.phase} iteration {iteration}",
+                worker_boundary,
+                None,
+                self.quality_gate(),
+            )
             worker_command = [
                 sys.executable,
                 str(SCRIPT_DIR / "fake_worker.py"),
@@ -517,14 +663,13 @@ class E2EHarness:
                 "--resolutions-json",
                 json.dumps(resolutions, sort_keys=True),
                 "--task-spec",
-                render_task_spec(
-                    f"worker {self.phase} iteration {iteration}", worker_boundary
-                ),
+                worker_spec,
             ]
             self._record_session(
                 "worker",
                 iteration,
                 task_boundary=tuple(sorted(worker_boundary.items())),
+                quality_gate=_parsed_quality_gate(worker_spec),
             )
             worker = subprocess.run(
                 worker_command,
@@ -619,6 +764,12 @@ class E2EHarness:
                 validation=(worker_status,),
                 drill_down=(str(self.workspace),),
             )
+            reviewer_spec = render_task_spec(
+                f"reviewer {self.phase} iteration {iteration}",
+                reviewer_boundary,
+                reviewer_context,
+                self.quality_gate(),
+            )
             reviewer_command = [
                 sys.executable,
                 str(SCRIPT_DIR / "fake_reviewer.py"),
@@ -635,11 +786,7 @@ class E2EHarness:
                 "--findings-json",
                 json.dumps(findings),
                 "--task-spec",
-                render_task_spec(
-                    f"reviewer {self.phase} iteration {iteration}",
-                    reviewer_boundary,
-                    reviewer_context,
-                ),
+                reviewer_spec,
             ]
             if self.protected_artifacts:
                 reviewer_command.extend(
@@ -650,6 +797,7 @@ class E2EHarness:
                 iteration,
                 task_boundary=tuple(sorted(reviewer_boundary.items())),
                 reviewer_context_keys=tuple(sorted(reviewer_context)),
+                quality_gate=_parsed_quality_gate(reviewer_spec),
             )
             hashes_before = _hash_files(self.protected_artifacts)
             reviewer = subprocess.run(
@@ -746,7 +894,7 @@ class E2EHarness:
         return result
 
     def _run_final_review_attempt(
-        self, attempt: int, mode: str, findings: tuple[tuple[str, str], ...]
+        self, attempt: int, mode: str, findings: tuple[FinalFindingSpec, ...]
     ) -> tuple[str | None, tuple[FinalFinding, ...], AgentAttempt | None]:
         """One Final Adversarial Review dispatch: a Reviewer-only invocation.
 
@@ -757,6 +905,7 @@ class E2EHarness:
         When the returned AgentAttempt is None a guard tripped, and the first slot
         carries the error reason instead of a verdict.
         """
+        normalized = [normalize_final_finding_spec(spec) for spec in findings]
         command = [
             sys.executable,
             str(SCRIPT_DIR / "fake_reviewer.py"),
@@ -771,11 +920,15 @@ class E2EHarness:
             "--iteration",
             str(attempt),
             "--findings-json",
-            json.dumps([finding_id for finding_id, _ in findings]),
+            json.dumps([spec[0] for spec in normalized]),
             "--responsible-phases-json",
             json.dumps(
-                {finding_id: phase for finding_id, phase in findings}, sort_keys=True
+                {spec[0]: spec[1] for spec in normalized}, sort_keys=True
             ),
+            "--quality-attributes-json",
+            json.dumps({spec[0]: spec[2] for spec in normalized}, sort_keys=True),
+            "--blocking-json",
+            json.dumps({spec[0]: spec[3] for spec in normalized}, sort_keys=True),
         ]
         if self.protected_artifacts:
             command.extend(["--artifact", str(self.protected_artifacts[0])])
@@ -947,12 +1100,19 @@ class E2EHarness:
             # ---- T3: the attempt is settled; now, and only now, route the findings.
             #      routed[owner] keeps the finding IDS, not merely the owner set: those ids
             #      are what T4 hands to the correction round and what the bridge checks.
-            if not findings:
+            #      Only blocking findings are routed at all.
+            # Blocking is the routing axis, not severity and not which section the
+            # reviewer printed the finding under. A MAJOR finding charged to a
+            # non-blocking quality attribute is a note: it is reported and it is not
+            # corrected. A FAIL carrying no blocking finding at all contradicts its
+            # own verdict, which is the malformed case the next line still catches.
+            blocking_findings = [finding for finding in findings if finding.blocking]
+            if not blocking_findings:
                 return self._workflow_error(
                     "MALFORMED_FINAL_REVIEW_OUTPUT", snapshot()
                 )
             routed: dict[str, list[str]] = {}
-            for finding in findings:
+            for finding in blocking_findings:
                 if finding.responsible_phase is None:
                     return self._workflow_error(
                         "MALFORMED_FINAL_REVIEW_OUTPUT", snapshot()

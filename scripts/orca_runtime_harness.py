@@ -14,24 +14,38 @@ from pathlib import Path
 from typing import Any
 
 try:
+    from scripts.quality_profile import (
+        INVALID_PROFILE_REASON,
+        QualityProfileResolution,
+        resolve_quality_profile,
+    )
     from scripts.task_context import (
         CANONICAL_PHASES,
         FINAL_REVIEW_PHASE,
+        build_quality_gate_context,
         build_reviewer_context,
         build_task_boundary,
         ensure_run_artifact_root,
+        parse_quality_gate,
         phase_artifact_contract,
         render_task_spec,
         require_workflow_phase,
         strip_task_context,
     )
 except ModuleNotFoundError:  # direct `python3 scripts/...` execution
+    from quality_profile import (
+        INVALID_PROFILE_REASON,
+        QualityProfileResolution,
+        resolve_quality_profile,
+    )
     from task_context import (
         CANONICAL_PHASES,
         FINAL_REVIEW_PHASE,
+        build_quality_gate_context,
         build_reviewer_context,
         build_task_boundary,
         ensure_run_artifact_root,
+        parse_quality_gate,
         phase_artifact_contract,
         render_task_spec,
         require_workflow_phase,
@@ -40,6 +54,15 @@ except ModuleNotFoundError:  # direct `python3 scripts/...` execution
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+# Resolved once, at import, and never again. dispatch_context used to call
+# resolve_quality_profile() whenever its argument was omitted, which meant a profile
+# edited while a Worker was running could hand that Worker's Reviewer a DIFFERENT
+# quality model than the Worker was given -- the divergence ORIGINAL_REQUEST section
+# 10 forbids. Run paths never reach this constant: OrcaRuntimeHarness resolves once
+# per run in start_run() and threads its own resolution through every spec. This is
+# only the answer for a standalone call with no run behind it, and it is a constant
+# precisely so that even that path cannot re-read the file mid-sequence.
+REPO_QUALITY_PROFILE = resolve_quality_profile(REPO_ROOT)
 FAKE_CODEX = REPO_ROOT / "scripts" / "fake_bin" / "codex"
 WAIT_TYPES = "worker_done,escalation,question"
 SUPPORTED_ORCA_APP_VERSION = "1.4.184"
@@ -321,6 +344,11 @@ class RuntimeAttempt:
     release_process_action: str = ""  # release/retain receipt: none|killed|...
     task_boundary: tuple[tuple[str, str], ...] = ()  # layer-1 payload, frozen
     reviewer_context_keys: tuple[str, ...] = ()  # 8 keys when role is reviewer
+    # The profile-first block, parsed back out of the spec this attempt dispatched.
+    # The two fields above carry layer-1 values and Reviewer key NAMES, so neither
+    # can answer "which quality attributes did this dispatch actually carry" -- the
+    # question a phase-filtering assertion is made of.
+    quality_gate: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass
@@ -341,6 +369,10 @@ class RuntimeScenarioResult:
     commands_used: list[str] = field(default_factory=list)
     final_review_terminals: list[str] = field(default_factory=list)
     phase_reviewer_terminals: list[str] = field(default_factory=list)
+    # ---- scenario L: what the run's one profile resolution was, and what each
+    # dispatch was told applied to it.
+    quality_profile_status: str = ""
+    quality_profile_attributes: dict[str, str] = field(default_factory=dict)
     # ---- reuse aggregates (W-18), filled by finish() before the ledger is cleared
     reuse_chains: dict[str, list[str]] = field(default_factory=dict)
     terminal_creations: int = 0
@@ -396,6 +428,8 @@ def dispatch_context(
     resolutions: dict[str, str] | None = None,
     evidence: WorkflowEvidence | None = None,
     run_id: str = "",
+    quality_profile: QualityProfileResolution | None = None,
+    requested_phases: tuple[str, ...] = (),
 ) -> tuple[str, dict[str, str], dict[str, Any] | None]:
     """The Task spec text an agent will actually receive, plus what went into it.
 
@@ -426,6 +460,14 @@ def dispatch_context(
     Nothing here can put an id in the payload: build_task_boundary has no such
     parameter, and both ids are unknown at this point anyway. That is what makes
     TASK_BOUNDARY_NEVER_CARRIED structural rather than a habit.
+
+    `quality_profile` is the project's resolved Quality Profile, and it reaches BOTH
+    roles through the same block. A Worker that is not told which quality attributes
+    block its phase produces correction rounds for rules it never received, and a
+    Reviewer told something different from the Worker is judging against a spec that
+    was never dispatched -- so the two payloads are built from one resolution, not
+    two. It defaults to reading the repository this harness runs against, which is
+    also the tree `drill_down` points at.
 
     A module-level function, not a method, so it is not swept by the public-method
     probe in the contract tests (same reason as worker_start_terminal_effect).
@@ -476,17 +518,61 @@ def dispatch_context(
             # E2EHarness spells its own workspace: a path, not a description.
             drill_down=(str(REPO_ROOT),),
         )
-    return render_task_spec(base, boundary, reviewer_context), boundary, reviewer_context
+    # Never resolved here. A caller inside a run passes the run's own resolution; a
+    # caller outside one gets the import-time constant. Neither branch reads the file
+    # again, so two specs built moments apart cannot describe two different profiles.
+    if quality_profile is None:
+        quality_profile = REPO_QUALITY_PROFILE
+    # External review MAJOR: an undeclared requested set at the final gate used to
+    # resolve to every applicable phase, which can hand the Final Adversarial Review
+    # an attribute scoped to a phase this run never requested (DESIGN, BUGFIX,
+    # REFACTORING-only rules reaching an implementation+test run) and manufacture a
+    # false blocking violation / correction loop. requested_phases is passed straight
+    # through instead: build_quality_gate_context already fails closed (raises) when
+    # the final_review gate has no requested set, and that fail-closed behaviour is
+    # the whole fix -- broadening was never a real fallback, it was the defect.
+    quality_gate = build_quality_gate_context(
+        resolution=quality_profile,
+        current_phase=phase,
+        requested_phases=requested_phases,
+    )
+    return (
+        render_task_spec(base, boundary, reviewer_context, quality_gate),
+        boundary,
+        reviewer_context,
+    )
 
 
 class OrcaRuntimeHarness:
-    def __init__(self, artifact_dir: Path, *, wait_timeout_ms: int = 10000) -> None:
+    def __init__(
+        self,
+        artifact_dir: Path,
+        *,
+        wait_timeout_ms: int = 10000,
+        quality_profile_root: Path = REPO_ROOT,
+    ) -> None:
         self.orca = self._resolve_orca()
         self.artifact_dir = artifact_dir
         self.wait_timeout_ms = wait_timeout_ms
         self.artifact_dir.mkdir(parents=True, exist_ok=True)
         self.run_owner: str | None = None
         self.run_id: str | None = None
+        # The requested workflow phases for the current run, set once by start_run()
+        # and never inferred from which attempts happen to occur (a correction round
+        # can dispatch a phase without that phase having been "requested"). Empty
+        # until start_run() is called, and empty is exactly the state that must fail
+        # closed at the final_review gate rather than silently widen to every phase --
+        # see the External review MAJOR note in dispatch_context().
+        self.requested_phases: tuple[str, ...] = ()
+        # The tree the run's quality profile is read from, and the ONE resolution
+        # every spec this harness renders is built from. start_run() re-reads it once
+        # at the run boundary and then nothing re-reads it until the next run: a
+        # Worker and the Reviewer that judges it must be handed the same quality
+        # model even if somebody edits the profile in between.
+        self.quality_profile_root = quality_profile_root
+        self.quality_profile: QualityProfileResolution = resolve_quality_profile(
+            quality_profile_root
+        )
         self._raw: list[dict[str, Any]] = []
         self._signals: list[str] = []
         # handle -> terminal row (authoritative role/origin, survives across dispatches)
@@ -1244,7 +1330,31 @@ class OrcaRuntimeHarness:
             },
         }
 
-    def start_run(self, objective: str) -> str:
+    def start_run(
+        self, objective: str, *, requested_phases: tuple[str, ...] = ()
+    ) -> str:
+        """STEP 0. `requested_phases` is the run-scoped set every final_review
+        dispatch of this run is judged against (external review MAJOR): explicit,
+        not inferred from which attempts happen to occur, and validated here so a
+        typo'd phase fails at the run boundary rather than inside a rendered spec.
+        Left empty for a run that never reaches final_review; a run that does and
+        never declared one fails closed at that dispatch instead of silently
+        widening to every applicable phase.
+        """
+        for candidate in requested_phases:
+            require_workflow_phase(candidate, field="requested_phases")
+        # STEP 0, before the run terminal and long before the first Task. The run's
+        # quality model is read exactly once, here, and an invalid profile stops the
+        # run at its boundary instead of at the first spec that needs it: nobody can
+        # produce a trustworthy verdict for this project, so there is nothing worth
+        # dispatching. Everything after this point reads self.quality_profile.
+        self.quality_profile = resolve_quality_profile(self.quality_profile_root)
+        if self.quality_profile.is_invalid:
+            raise OrcaRuntimeError(
+                f"{INVALID_PROFILE_REASON}: {self.quality_profile.path} exists but is "
+                f"not a valid quality profile ({self.quality_profile.error}); no Run "
+                "is created and no Task is dispatched"
+            )
         terminal = self.call(
             "terminal", "create", "--worktree", "current", "--title", objective, "--command", "bash"
         )
@@ -1256,6 +1366,7 @@ class OrcaRuntimeHarness:
             "orchestration", "run-create", "--objective", objective, "--from", self.run_owner
         )
         self.run_id = created["result"]["run"]["id"]
+        self.requested_phases = tuple(requested_phases)
         self._signals = []
         self._ledger = {}
         # Provisioned here, once, immediately after the run id is known -- and
@@ -1716,6 +1827,8 @@ class OrcaRuntimeHarness:
             resolutions=resolutions,
             evidence=evidence,
             run_id=self.run_id or "",
+            quality_profile=self.quality_profile,
+            requested_phases=self.requested_phases,
         )
         created_here = terminal is None
         handle = terminal or self.create_fake_terminal(
@@ -1754,6 +1867,9 @@ class OrcaRuntimeHarness:
         attempt.task_boundary = tuple(sorted(boundary.items()))
         if reviewer_context is not None:
             attempt.reviewer_context_keys = tuple(sorted(reviewer_context))
+        # Parsed out of `spec` -- the string that reached task-create and worker-start
+        # -- for the same reason the two above are taken from the rendered payload.
+        attempt.quality_gate = tuple(sorted(parse_quality_gate(spec).items()))
         return attempt, handle
 
     def run_attempt(
@@ -1789,6 +1905,8 @@ class OrcaRuntimeHarness:
             resolutions=resolutions,
             evidence=evidence,
             run_id=self.run_id or "",
+            quality_profile=self.quality_profile,
+            requested_phases=self.requested_phases,
         )
         task_id = self.create_task(spec)
         return self.run_existing_task(
@@ -1817,6 +1935,8 @@ class OrcaRuntimeHarness:
             phase=phase,
             base_spec=f"{role} iteration {iteration}: unexpected exit",
             run_id=self.run_id or "",
+            quality_profile=self.quality_profile,
+            requested_phases=self.requested_phases,
         )
         task_id = self.create_task(spec)
         handle = self.create_fake_terminal(role, "exit", iteration=iteration)
@@ -2147,7 +2267,10 @@ def run_final_review_runtime_scenario(artifact_dir: Path) -> RuntimeScenarioResu
         json.dumps(preflight, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
 
-    run_id = harness.start_run("Final Adversarial Review scenario J terminal freshness")
+    run_id = harness.start_run(
+        "Final Adversarial Review scenario J terminal freshness",
+        requested_phases=(LIFECYCLE_SCENARIO_PHASE,),
+    )
     worker, _ = harness.run_attempt("worker", 1, "complete", phase=LIFECYCLE_SCENARIO_PHASE)
     phase_reviewer, phase_reviewer_terminal = harness.run_attempt(
         "reviewer", 1, "pass", phase=LIFECYCLE_SCENARIO_PHASE
@@ -2176,6 +2299,91 @@ def run_final_review_runtime_scenario(artifact_dir: Path) -> RuntimeScenarioResu
     )
     result.final_review_terminals = [final_terminal_1, final_terminal_2]
     result.phase_reviewer_terminals = [phase_reviewer_terminal]
+    return harness.finish(result)
+
+
+QUALITY_PROFILE_SCENARIO_PROFILE = """version: 1
+
+quality_attributes:
+
+  - id: DESIGN-001
+    category: platform-infrastructure
+    name: Design only rule
+    blocking: false
+    applies_to:
+      - design
+
+  - id: DOMAIN-001
+    category: business-domain
+    name: Idempotent processing
+    blocking: true
+    applies_to:
+      - implementation
+      - test
+
+  - id: TEAM-001
+    category: team-convention
+    name: Repository convention
+    blocking: false
+"""
+
+
+def run_quality_profile_runtime_scenario(
+    artifact_dir: Path, *, harness: OrcaRuntimeHarness | None = None
+) -> RuntimeScenarioResult:
+    """Opt-in scenario L: phase filtering and one run-scoped profile, against Orca.
+
+    Deliberately NOT part of run_runtime_scenarios(): that function's A-I result set is
+    pinned by an exact-set assertion in test_orca_runtime.py. Scenarios J and K set the
+    precedent; L follows it.
+
+    The profile is written under `artifact_dir`, never into the repository being
+    tested: installing one at the real .orca/quality-profile.yaml would change how
+    every other run of this repository is reviewed, which is not a test's decision to
+    make.
+
+    `harness` exists so the scenario BODY can be executed offline by the contract
+    tests. Everything that could be wrong here -- the attempt sequence, the phases, the
+    assertions -- runs in both modes; only preflight and the environment dump are
+    skipped when a harness is injected, and those are copied verbatim from scenarios J
+    and K.
+    """
+    profile_root = artifact_dir / "quality-profile-project"
+    (profile_root / ".orca").mkdir(parents=True, exist_ok=True)
+    (profile_root / ".orca" / "quality-profile.yaml").write_text(
+        QUALITY_PROFILE_SCENARIO_PROFILE, encoding="utf-8"
+    )
+    if harness is None:
+        harness = OrcaRuntimeHarness(artifact_dir, quality_profile_root=profile_root)
+        preflight = harness.preflight()
+        (artifact_dir / "environment-quality-profile.json").write_text(
+            json.dumps(preflight, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+    # The scenario owns the profile its run is judged against, in both modes: an
+    # injected harness would otherwise resolve whatever its constructor was pointed
+    # at and quietly run the whole scenario against an absent profile.
+    harness.quality_profile_root = profile_root
+
+    run_id = harness.start_run(
+        "Quality profile scenario L phase filtering",
+        requested_phases=("design", "implementation"),
+    )
+    attempts = [
+        harness.run_attempt("worker", 1, "complete", phase="design")[0],
+        harness.run_attempt("reviewer", 1, "pass", phase="design")[0],
+        harness.run_attempt("worker", 1, "complete", phase="implementation")[0],
+        harness.run_attempt("reviewer", 1, "pass", phase="implementation")[0],
+        harness.run_attempt("reviewer", 1, "pass", phase=FINAL_REVIEW_PHASE)[0],
+    ]
+
+    result = RuntimeScenarioResult("L", run_id, "COMPLETED", 1, attempts)
+    result.quality_profile_status = harness.quality_profile.status
+    boundaries = [dict(attempt.task_boundary) for attempt in attempts]
+    result.quality_profile_attributes = {
+        f"{boundary['current_phase']}:{boundary['current_role']}":
+            dict(attempt.quality_gate)["applicable_quality_attributes"]
+        for attempt, boundary in zip(attempts, boundaries)
+    }
     return harness.finish(result)
 
 
@@ -2264,6 +2472,8 @@ def run_session_reuse_runtime_scenario(artifact_dir: Path) -> RuntimeScenarioRes
             phase=phase,
             base_spec=f"worker iteration {iteration}: {phase}",
             run_id=run_id,
+            quality_profile=harness.quality_profile,
+            requested_phases=harness.requested_phases,
         )
         worker, _ = harness.run_existing_task(
             "worker",
@@ -2298,6 +2508,8 @@ def run_session_reuse_runtime_scenario(artifact_dir: Path) -> RuntimeScenarioRes
             base_spec=f"reviewer iteration {iteration}: {phase}",
             evidence=reviewer_evidence,
             run_id=run_id,
+            quality_profile=harness.quality_profile,
+            requested_phases=harness.requested_phases,
         )
         reviewer, _ = harness.run_existing_task(
             "reviewer",
@@ -2327,12 +2539,24 @@ def _scenario_g(harness: OrcaRuntimeHarness) -> RuntimeScenarioResult:
     """Graph-first dependency promotion: no manual readiness override anywhere."""
     run_id = harness.start_run("Step 4 Scenario G graph-first dependency promotion")
     worker_spec = dispatch_context(
-        "worker", 1, "complete", phase=LIFECYCLE_SCENARIO_PHASE, run_id=run_id
+        "worker",
+        1,
+        "complete",
+        phase=LIFECYCLE_SCENARIO_PHASE,
+        run_id=run_id,
+        quality_profile=harness.quality_profile,
+        requested_phases=harness.requested_phases,
     )[0]
     worker_task = harness.create_task(worker_spec)
     reviewer_task = harness.create_task(
         dispatch_context(
-            "reviewer", 1, "pass", phase=LIFECYCLE_SCENARIO_PHASE, run_id=run_id
+            "reviewer",
+            1,
+            "pass",
+            phase=LIFECYCLE_SCENARIO_PHASE,
+            run_id=run_id,
+            quality_profile=harness.quality_profile,
+            requested_phases=harness.requested_phases,
         )[0],
         deps=(worker_task,),
     )
@@ -2369,7 +2593,13 @@ def _scenario_h(harness: OrcaRuntimeHarness) -> RuntimeScenarioResult:
     """Negative control: a dependent created after settlement stays pending forever."""
     run_id = harness.start_run("Step 4 Scenario H late dependent stays pending")
     worker_spec = dispatch_context(
-        "worker", 1, "complete", phase=LIFECYCLE_SCENARIO_PHASE, run_id=run_id
+        "worker",
+        1,
+        "complete",
+        phase=LIFECYCLE_SCENARIO_PHASE,
+        run_id=run_id,
+        quality_profile=harness.quality_profile,
+        requested_phases=harness.requested_phases,
     )[0]
     worker_task = harness.create_task(worker_spec)
     worker_attempt, _ = harness.run_existing_task(

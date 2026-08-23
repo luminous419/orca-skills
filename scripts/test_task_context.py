@@ -8,21 +8,35 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from scripts.quality_profile import (
+    DEFAULT_PROFILE_PATH,
+    PROFILE_STATUS_ABSENT,
+    PROFILE_STATUS_INVALID,
+    PROFILE_STATUS_LOADED,
+    QualityProfileResolution,
+    load_profile_text,
+    resolve_quality_profile,
+)
 from scripts.task_context import (
     AGENT_MODES,
     CANONICAL_PHASES,
     DISPATCH_INJECTED_IDENTITY,
+    QUALITY_GATE_KEYS,
+    QUALITY_GATE_RECEIPT_KEY,
     REVIEWER_CONTEXT_KEYS,
     REVIEWER_DRILL_DOWN_MANDATE,
     REVIEWER_PRIOR_PASS_IS_NOT_EVIDENCE,
     TASK_BOUNDARY_KEYS,
     WORKFLOW_PHASES,
     TaskContextError,
+    build_quality_gate_context,
     build_reviewer_context,
     build_task_boundary,
     ensure_run_artifact_root,
+    parse_quality_gate,
     parse_reviewer_context,
     phase_artifact_contract,
+    render_boundary_receipt,
     render_task_spec,
     require_workflow_phase,
     run_artifact_root,
@@ -341,3 +355,274 @@ class RunArtifactRootProvisioningTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+PROFILE_TEXT = """version: 1
+
+quality_attributes:
+
+  - id: DOMAIN-001
+    category: business-domain
+    name: Idempotent processing
+    blocking: true
+    applies_to:
+      - design
+      - implementation
+
+  - id: DESIGN-001
+    category: platform-infrastructure
+    name: Design only rule
+    blocking: false
+    applies_to:
+      - design
+
+  - id: TEAM-001
+    category: team-convention
+    name: Repository convention
+    blocking: false
+"""
+
+
+def loaded_resolution() -> QualityProfileResolution:
+    return QualityProfileResolution(
+        status=PROFILE_STATUS_LOADED,
+        path=DEFAULT_PROFILE_PATH,
+        profile=load_profile_text(PROFILE_TEXT),
+    )
+
+
+def absent_resolution() -> QualityProfileResolution:
+    return QualityProfileResolution(
+        status=PROFILE_STATUS_ABSENT, path=DEFAULT_PROFILE_PATH
+    )
+
+
+class QualityGateContextTests(unittest.TestCase):
+    """Section 13-E/F: the quality model as the dispatched spec actually carries it."""
+
+    def gate(self, phase: str = "implementation", **kwargs: object) -> dict[str, object]:
+        kwargs.setdefault("resolution", loaded_resolution())
+        return build_quality_gate_context(current_phase=phase, **kwargs)  # type: ignore[arg-type]
+
+    def test_the_gate_carries_every_documented_key(self) -> None:
+        gate = self.gate()
+
+        self.assertEqual(tuple(sorted(gate)), tuple(sorted(QUALITY_GATE_KEYS)))
+        self.assertEqual(gate["profile_status"], PROFILE_STATUS_LOADED)
+        self.assertEqual(gate["profile_path"], DEFAULT_PROFILE_PATH)
+
+    def test_only_the_phases_own_attributes_reach_it(self) -> None:
+        design = self.gate("design")
+        implementation = self.gate("implementation")
+        analysis = self.gate("analysis")
+
+        self.assertIn(
+            "DESIGN-001", " ".join(design["applicable_quality_attributes"])  # type: ignore[arg-type]
+        )
+        self.assertNotIn(
+            "DESIGN-001",
+            " ".join(implementation["applicable_quality_attributes"]),  # type: ignore[arg-type]
+        )
+        self.assertNotIn(
+            "DOMAIN-001", " ".join(analysis["applicable_quality_attributes"])  # type: ignore[arg-type]
+        )
+        # applies_to omitted means every applicable phase, so TEAM-001 is in all three.
+        for gate in (design, implementation, analysis):
+            self.assertIn(
+                "TEAM-001", " ".join(gate["applicable_quality_attributes"])  # type: ignore[arg-type]
+            )
+
+    def test_blocking_is_reported_separately_from_applicability(self) -> None:
+        gate = self.gate("design")
+
+        self.assertEqual(gate["blocking_quality_attributes"], ("DOMAIN-001",))
+
+    def test_the_final_gate_spans_the_requested_workflow(self) -> None:
+        gate = build_quality_gate_context(
+            resolution=loaded_resolution(),
+            current_phase="final_review",
+            requested_phases=("implementation", "test"),
+        )
+
+        rendered = " ".join(gate["applicable_quality_attributes"])  # type: ignore[arg-type]
+        self.assertIn("DOMAIN-001", rendered)
+        self.assertIn("TEAM-001", rendered)
+        self.assertNotIn("DESIGN-001", rendered)
+
+    def test_the_final_gate_refuses_an_undeclared_requested_set(self) -> None:
+        with self.assertRaisesRegex(TaskContextError, "requested_phases is required"):
+            build_quality_gate_context(
+                resolution=loaded_resolution(), current_phase="final_review"
+            )
+
+    def test_an_absent_profile_does_not_restore_a_generic_checklist(self) -> None:
+        """Section 13-F: no profile means three tiers, not the old broad checklist."""
+        gate = build_quality_gate_context(
+            resolution=absent_resolution(), current_phase="implementation"
+        )
+
+        self.assertEqual(gate["profile_status"], PROFILE_STATUS_ABSENT)
+        self.assertEqual(gate["applicable_quality_attributes"], ("none",))
+        self.assertEqual(gate["blocking_quality_attributes"], ("none",))
+        # The general gate is still exactly five, and the suppression list is still
+        # carried: absent is a defined state, not a fall back to "review everything".
+        self.assertEqual(len(gate["general_gate"]), 5)  # type: ignore[arg-type]
+        self.assertIn(
+            "generalized best practice", gate["non_blocking_by_default"]  # type: ignore[operator]
+        )
+
+    def test_an_invalid_profile_cannot_produce_a_dispatchable_context(self) -> None:
+        """Section 13-G: the no-silent-fallback rule, enforced structurally."""
+        resolution = QualityProfileResolution(
+            status=PROFILE_STATUS_INVALID,
+            path=DEFAULT_PROFILE_PATH,
+            error="duplicate quality attribute id: DOMAIN-001",
+        )
+
+        with self.assertRaisesRegex(TaskContextError, "INVALID_QUALITY_PROFILE"):
+            build_quality_gate_context(
+                resolution=resolution, current_phase="implementation"
+            )
+
+    def test_the_rendered_block_reads_back_as_the_gate_that_built_it(self) -> None:
+        spec = render_task_spec(
+            "worker implementation iteration 1",
+            build_task_boundary(
+                current_role="worker",
+                current_phase="implementation",
+                current_iteration=1,
+                artifact_contract="artifacts/runs/run_x/IMPLEMENTATION.md",
+            ),
+            None,
+            self.gate(),
+        )
+
+        parsed = parse_quality_gate(spec)
+        self.assertEqual(tuple(sorted(parsed)), tuple(sorted(QUALITY_GATE_KEYS)))
+        self.assertEqual(parsed["profile_status"], PROFILE_STATUS_LOADED)
+        self.assertIn("DOMAIN-001", parsed["applicable_quality_attributes"])
+        self.assertIn("G1 explicit requirement violation", parsed["general_gate"])
+        self.assertIn("minimal general gate", parsed["decision_priority"])
+        self.assertIn("PASS WITH NOTES", parsed["verdict_semantics"])
+        with self.assertRaisesRegex(TaskContextError, "no quality gate block"):
+            parse_quality_gate("a spec rendered before this wiring")
+
+    def test_the_receipt_proves_the_gate_arrived(self) -> None:
+        spec = render_task_spec(
+            "worker implementation iteration 1",
+            build_task_boundary(
+                current_role="worker",
+                current_phase="implementation",
+                current_iteration=1,
+                artifact_contract="artifacts/runs/run_x/IMPLEMENTATION.md",
+            ),
+            None,
+            self.gate(),
+        )
+
+        receipt = render_boundary_receipt(spec)
+        self.assertIn(QUALITY_GATE_RECEIPT_KEY, receipt)
+        self.assertIn("profile_status", receipt)
+
+    def test_this_repository_has_no_active_profile_yet(self) -> None:
+        """The example is not the profile: activating it is the project's choice."""
+        repo_root = Path(__file__).resolve().parents[1]
+        resolution = resolve_quality_profile(repo_root)
+
+        self.assertEqual(resolution.status, PROFILE_STATUS_ABSENT)
+
+
+class DispatchedSpecQualityGateTests(unittest.TestCase):
+    """The same assertion, made against the text the runtime actually dispatches.
+
+    Testing build_quality_gate_context alone would only prove a helper works. What
+    the requirement asks for is that the Worker's and the Reviewer's real Task specs
+    carry the model, which is why this reaches through dispatch_context -- the one
+    function both the supervised (`task-create --spec`) and low-level (`terminal
+    send`) paths render their agent-visible text with.
+    """
+
+    def dispatched(self, role: str, phase: str = "implementation") -> str:
+        from scripts.orca_runtime_harness import dispatch_context
+
+        spec, _, _ = dispatch_context(
+            role,
+            1,
+            "complete" if role == "worker" else "pass",
+            phase=phase,
+            run_id="run_quality",
+            quality_profile=loaded_resolution(),
+        )
+        return spec
+
+    def test_both_roles_receive_the_same_quality_model(self) -> None:
+        worker = parse_quality_gate(self.dispatched("worker"))
+        reviewer = parse_quality_gate(self.dispatched("reviewer"))
+
+        # Semantically identical, not merely both present: a Worker judged against a
+        # different attribute set than its Reviewer buys correction rounds for rules
+        # it was never handed.
+        self.assertEqual(worker, reviewer)
+        self.assertIn("DOMAIN-001", worker["applicable_quality_attributes"])
+        self.assertEqual(worker["blocking_quality_attributes"], "DOMAIN-001")
+
+    def test_the_dispatched_spec_carries_the_decision_priority_and_general_gate(
+        self,
+    ) -> None:
+        for role in ("worker", "reviewer"):
+            with self.subTest(role):
+                parsed = parse_quality_gate(self.dispatched(role))
+                self.assertIn(
+                    "1 explicit user/project requirements", parsed["decision_priority"]
+                )
+                self.assertIn(
+                    "2 applicable project quality profile attributes",
+                    parsed["decision_priority"],
+                )
+                for gate_id in ("G1", "G2", "G3", "G4", "G5"):
+                    self.assertIn(gate_id, parsed["general_gate"])
+                self.assertIn(
+                    "never promoted to a blocking finding",
+                    parsed["non_blocking_by_default"],
+                )
+
+    def test_phase_filtering_survives_into_the_dispatched_spec(self) -> None:
+        analysis = parse_quality_gate(self.dispatched("reviewer", "analysis"))
+        design = parse_quality_gate(self.dispatched("reviewer", "design"))
+
+        self.assertNotIn("DESIGN-001", analysis["applicable_quality_attributes"])
+        self.assertIn("DESIGN-001", design["applicable_quality_attributes"])
+
+    def test_the_final_reviewer_spec_spans_the_requested_workflow(self) -> None:
+        from scripts.orca_runtime_harness import dispatch_context
+
+        spec, _, _ = dispatch_context(
+            "reviewer",
+            1,
+            "pass",
+            phase="final_review",
+            run_id="run_quality",
+            quality_profile=loaded_resolution(),
+            requested_phases=("implementation", "test"),
+        )
+
+        parsed = parse_quality_gate(spec)
+        self.assertIn("DOMAIN-001", parsed["applicable_quality_attributes"])
+        self.assertNotIn("DESIGN-001", parsed["applicable_quality_attributes"])
+
+    def test_an_invalid_profile_stops_the_dispatch_from_being_rendered(self) -> None:
+        from scripts.orca_runtime_harness import dispatch_context
+
+        with self.assertRaisesRegex(TaskContextError, "INVALID_QUALITY_PROFILE"):
+            dispatch_context(
+                "worker",
+                1,
+                "complete",
+                phase="implementation",
+                run_id="run_quality",
+                quality_profile=QualityProfileResolution(
+                    status=PROFILE_STATUS_INVALID,
+                    path=DEFAULT_PROFILE_PATH,
+                    error="unsupported quality profile schema version 9",
+                ),
+            )

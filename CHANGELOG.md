@@ -10,6 +10,7 @@ are recorded here in a Keep a Changelog-inspired format.
 - GitHub Actions validation across the supported Python versions.
 - Release metadata, compatibility documentation, and distributable-package verification.
 - Machine-checkable lifecycle accounting contract in the orchestration skill, enforced by the repository validator and covered by negative regression tests.
+- Project Quality Profile (`.orca/quality-profile.yaml`) with a standard-library loader, strict schema validation, and per-phase applicability filtering, rendered into the dispatched Worker and Reviewer Task specs as a `=== QUALITY GATE (profile-first) ===` block, plus a generic example profile and a machine-checkable quality profile contract enforced by the repository validator.
 - Implicit Final Adversarial Review gate in the orchestration skill: after every requested phase set a fresh Reviewer session reviews the whole final tree, findings carry a `Responsible Phase` that routes each correction back to its owning phase, and a machine-checkable final review contract block is enforced by the repository validator.
 
 ### Verified
@@ -21,6 +22,10 @@ are recorded here in a Keep a Changelog-inspired format.
 
 ### Changed
 
+- Reviewer verdicts are decided profile-first instead of against a broad generic quality checklist: explicit requirements, then applicable project quality attributes, then the current phase contract, then a Minimal General Gate of exactly five categories. Generic best practice, naming taste, minor duplication and similar preferences are no longer grounds for `FAIL` unless the project profile declares them blocking.
+- Findings now carry `Quality Attribute` and `Blocking` alongside `Severity`; severity expresses impact and no longer decides the gate on its own. Review reports add a `REVIEW_VERDICT` annotation with `PASS`, `PASS WITH NOTES`, `FAIL` and `BLOCKED`, while the workflow gate stays the two-valued `RESULT: PASS | FAIL` — no new lifecycle state, and task settlement, the FAIL loop, downstream revalidation and the Final Review trigger are unchanged.
+- A missing quality profile is a normal state that uses requirements, the phase contract and the Minimal General Gate only; a profile that exists but does not validate is a pre-dispatch validation failure reported as `STATUS: BLOCKED` / `REASON: INVALID_QUALITY_PROFILE`, never a silent fallback to the generic checklist.
+- The quality profile is resolved once per run, at the run boundary, and the same immutable resolution is threaded through every Worker, phase Reviewer, correction, downstream revalidation and Final Reviewer spec of that run; a profile edited mid-run can no longer hand a Reviewer a different quality model than the Worker it is reviewing. Only a genuinely nonexistent path is `absent` — a path that exists but is not a readable regular file (a directory or broken symlink at `.orca/quality-profile.yaml`) is `invalid`.
 - `STATUS: COMPLETED` in the orchestration skill now requires both every requested phase PASS and a Final Adversarial Review PASS; a phase PASS alone no longer completes a run, and final review attempts are bounded by their own iteration counter, separate from the per-phase one.
 - Clarified lifecycle accounting when a runtime auto-settles a completed Dispatch before
   explicit worker release, including separate accounting for residual terminal resources.

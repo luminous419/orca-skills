@@ -11,6 +11,25 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+try:  # pragma: no cover - import shim, exercised by both invocation forms
+    from scripts.quality_profile import (
+        DECISION_PRIORITY,
+        INVALID_PROFILE_REASON,
+        MINIMAL_GENERAL_GATE,
+        NON_BLOCKING_BY_DEFAULT,
+        QualityProfileResolution,
+        blocking_attributes,
+    )
+except ImportError:  # pragma: no cover - same module, flat import path
+    from quality_profile import (
+        DECISION_PRIORITY,
+        INVALID_PROFILE_REASON,
+        MINIMAL_GENERAL_GATE,
+        NON_BLOCKING_BY_DEFAULT,
+        QualityProfileResolution,
+        blocking_attributes,
+    )
+
 # ---- layer 1: what the coordinator writes into the Task spec --------------------
 # Five keys, and neither id among them. A Task spec body is write-once and is
 # assembled BEFORE the Task exists (task-create answers with the id; task-update has
@@ -49,6 +68,10 @@ CANONICAL_PHASES = ("analysis", "plan", "design", "implementation", "test")
 SPECIALIZED_PHASES = ("bugfix", "refactoring")
 FINAL_REVIEW_PHASE = "final_review"
 WORKFLOW_PHASES = (*CANONICAL_PHASES, *SPECIALIZED_PHASES, FINAL_REVIEW_PHASE)
+# Every phase a Quality Attribute's applies_to may name. final_review is excluded on
+# purpose: it is the gate over a requested workflow, not a phase an attribute is
+# authored against, and it evaluates whatever applies to the phases that ran.
+ALL_APPLICABLE_PHASES = (*CANONICAL_PHASES, *SPECIALIZED_PHASES)
 
 # Named so the failure message can say WHICH axis the caller reached for. Membership
 # in WORKFLOW_PHASES already refuses every one of these; this set only buys the
@@ -81,6 +104,40 @@ REVIEWER_DRILL_DOWN_MANDATE = (
 REVIEWER_PRIOR_PASS_IS_NOT_EVIDENCE = (
     "A previous PASS you remember is not evidence; re-verify this delta as if you "
     "were seeing it for the first time."
+)
+
+
+# ---- layer 3: the quality model the gate is actually decided against ---------------
+# The same eight keys reach the Worker and the Reviewer. That is the point: a Worker
+# that does not know which quality attributes block its phase produces correction
+# rounds for rules it was never told, and a Reviewer told something different from the
+# Worker is judging against a spec that was never dispatched. One block, one meaning.
+QUALITY_GATE_KEYS = (
+    "profile_status",
+    "profile_path",
+    "applicable_quality_attributes",
+    "blocking_quality_attributes",
+    "general_gate",
+    "decision_priority",
+    "non_blocking_by_default",
+    "verdict_semantics",
+)
+
+# Carried in the payload rather than only in SKILL.md, for the same reason the
+# drill-down mandate is: an agent that reads nothing but its dispatched spec still
+# has to read the rule that stops a generic preference from becoming a FAIL.
+QUALITY_GATE_SUPPRESSION_MANDATE = (
+    "A concern outside the four decision-priority tiers is never promoted to a "
+    "blocking finding; report it as a non-blocking note or not at all."
+)
+
+VERDICT_SEMANTICS = (
+    "PASS = no blocking violation and no substantive non-blocking note",
+    "PASS WITH NOTES = no blocking violation with one or more non-blocking findings; "
+    "the workflow gate value stays PASS and this is a report annotation only",
+    "FAIL = at least one blocking violation",
+    "BLOCKED = required project information or evidence is missing, so no trustworthy "
+    "verdict is possible; reported as BLOCKED with the workflow gate value FAIL",
 )
 
 
@@ -267,6 +324,69 @@ def build_reviewer_context(
     }
 
 
+def build_quality_gate_context(
+    *,
+    resolution: QualityProfileResolution,
+    current_phase: str,
+    requested_phases: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    """The profile-first quality model for ONE dispatch, as a flat payload.
+
+    Phase applicability is resolved here rather than left to the agent: an attribute
+    scoped to `design` must not reach an ANALYSIS Reviewer as something to evaluate,
+    and the only way to guarantee that is to filter before the spec is rendered.
+    `final_review` is the one phase whose scope is not itself -- the Final Adversarial
+    Review re-checks the requested workflow as a whole, so it receives every attribute
+    applicable to any requested phase.
+
+    An invalid profile raises. That is this function's whole contribution to section
+    11 of the requirement: the profile is read before a Task can be rendered, so a
+    project whose profile does not validate cannot be dispatched at all, and the
+    "silently fall back to the generic checklist" path is structurally absent rather
+    than merely discouraged.
+    """
+    current_phase = require_workflow_phase(current_phase)
+    if resolution.is_invalid:
+        raise TaskContextError(
+            f"{INVALID_PROFILE_REASON}: {resolution.path} exists but is not a valid "
+            f"quality profile ({resolution.error}); no Task is dispatched and the "
+            "generic checklist is not restored"
+        )
+    if current_phase == FINAL_REVIEW_PHASE:
+        scope = tuple(requested_phases)
+        if not scope:
+            raise TaskContextError(
+                "requested_phases is required for the final_review quality gate: the "
+                "final gate re-checks the requested workflow, not a single phase"
+            )
+        for phase in scope:
+            require_workflow_phase(phase, field="requested_phases")
+    else:
+        scope = (current_phase,)
+
+    attributes = resolution.attributes_for(scope)
+    blocking = blocking_attributes(attributes)
+    return {
+        "profile_status": resolution.status,
+        "profile_path": resolution.path,
+        "applicable_quality_attributes": tuple(
+            attribute.summary() for attribute in attributes
+        )
+        or ("none",),
+        "blocking_quality_attributes": tuple(attribute.id for attribute in blocking)
+        or ("none",),
+        "general_gate": tuple(
+            f"{gate_id} {label}" for gate_id, label in MINIMAL_GENERAL_GATE
+        ),
+        "decision_priority": DECISION_PRIORITY,
+        "non_blocking_by_default": (
+            QUALITY_GATE_SUPPRESSION_MANDATE,
+            *NON_BLOCKING_BY_DEFAULT,
+        ),
+        "verdict_semantics": VERDICT_SEMANTICS,
+    }
+
+
 # ---- serialization: the boundary as the agent actually receives it --------------
 # A builder whose result only ever reaches the coordinator's own records has not
 # established a boundary; it has described one. These renderers put layer 1 (and the
@@ -277,6 +397,8 @@ TASK_BOUNDARY_SPEC_HEADER = "=== TASK BOUNDARY (layer 1) ==="
 TASK_BOUNDARY_SPEC_FOOTER = "=== END TASK BOUNDARY ==="
 REVIEWER_CONTEXT_SPEC_HEADER = "=== REVIEWER CONTEXT (delta-first) ==="
 REVIEWER_CONTEXT_SPEC_FOOTER = "=== END REVIEWER CONTEXT ==="
+QUALITY_GATE_SPEC_HEADER = "=== QUALITY GATE (profile-first) ==="
+QUALITY_GATE_SPEC_FOOTER = "=== END QUALITY GATE ==="
 # The last line of every rendered spec, and the agent's signal that the payload is
 # COMPLETE. A dispatch preamble arrives a line at a time; an agent that acts on the
 # first line of a multi-line spec races the injection that is still delivering it,
@@ -318,6 +440,7 @@ def render_task_spec(
     base_spec: str,
     boundary: dict[str, str],
     reviewer_context: dict[str, Any] | None = None,
+    quality_gate: dict[str, Any] | None = None,
 ) -> str:
     """The Task spec body an agent is handed: the caller's text, then the boundary.
 
@@ -340,6 +463,13 @@ def render_task_spec(
             for key in REVIEWER_CONTEXT_KEYS
         )
         lines.append(REVIEWER_CONTEXT_SPEC_FOOTER)
+    if quality_gate is not None:
+        lines.append("")
+        lines.append(QUALITY_GATE_SPEC_HEADER)
+        lines.extend(
+            f"{key}: {_render_value(quality_gate[key])}" for key in QUALITY_GATE_KEYS
+        )
+        lines.append(QUALITY_GATE_SPEC_FOOTER)
     lines.append(TASK_SPEC_END_MARKER)
     return "\n".join(lines)
 
@@ -381,6 +511,7 @@ def parse_task_boundary(text: str) -> dict[str, str]:
 BOUNDARY_RECEIPT_HEADING = "## Task Boundary Receipt"
 BOUNDARY_RECEIPT_PREFIX = "RECEIVED "
 REVIEWER_CONTEXT_RECEIPT_KEY = "reviewer_context_keys"
+QUALITY_GATE_RECEIPT_KEY = "quality_gate_keys"
 
 
 def parse_reviewer_context_keys(text: str) -> tuple[str, ...]:
@@ -431,6 +562,51 @@ def parse_reviewer_context(text: str) -> dict[str, str]:
     return parsed
 
 
+def parse_quality_gate_keys(text: str) -> tuple[str, ...]:
+    """Which of the eight quality-gate keys the supplied text actually carries.
+
+    Empty tuple when there is no block at all, which is the honest answer for a spec
+    rendered before this wiring existed.
+    """
+    if QUALITY_GATE_SPEC_HEADER not in text:
+        return ()
+    block = text.split(QUALITY_GATE_SPEC_HEADER, 1)[1].split(
+        QUALITY_GATE_SPEC_FOOTER, 1
+    )[0]
+    present = {
+        line.partition(":")[0].strip()
+        for line in block.splitlines()
+        if line.partition(":")[1]
+    }
+    return tuple(key for key in QUALITY_GATE_KEYS if key in present)
+
+
+def parse_quality_gate(text: str) -> dict[str, str]:
+    """Read a rendered quality-gate block back out of whatever text carries it.
+
+    The only way to check what an agent was actually TOLD about the quality model is
+    to read the payload it was handed, which is the same reason parse_task_boundary
+    and parse_reviewer_context exist. Raises when the block is absent or incomplete.
+    """
+    if QUALITY_GATE_SPEC_HEADER not in text:
+        raise TaskContextError("no quality gate block in the supplied text")
+    block = text.split(QUALITY_GATE_SPEC_HEADER, 1)[1].split(
+        QUALITY_GATE_SPEC_FOOTER, 1
+    )[0]
+    parsed: dict[str, str] = {}
+    for line in block.splitlines():
+        key, separator, value = line.partition(": ")
+        key = key.strip()
+        if key in QUALITY_GATE_KEYS:
+            parsed[key] = value if separator else ""
+        elif line.strip().rstrip(":") in QUALITY_GATE_KEYS:
+            parsed[line.strip().rstrip(":")] = ""
+    missing = [key for key in QUALITY_GATE_KEYS if key not in parsed]
+    if missing:
+        raise TaskContextError(f"quality gate block is missing {missing}")
+    return parsed
+
+
 def render_boundary_receipt(text: str) -> str:
     """The block an agent appends to its own report to prove what it was handed.
 
@@ -453,5 +629,11 @@ def render_boundary_receipt(text: str) -> str:
         lines.append(
             f"{BOUNDARY_RECEIPT_PREFIX}{REVIEWER_CONTEXT_RECEIPT_KEY}: "
             + ", ".join(reviewer_keys)
+        )
+    quality_keys = parse_quality_gate_keys(text)
+    if quality_keys:
+        lines.append(
+            f"{BOUNDARY_RECEIPT_PREFIX}{QUALITY_GATE_RECEIPT_KEY}: "
+            + ", ".join(quality_keys)
         )
     return "\n" + "\n".join(lines) + "\n"

@@ -66,6 +66,194 @@ Important gates include:
 - Reviewer never edits/fixes its own findings.
 - `max-iterations` limits repeated review loops.
 
+## Project Quality Profile
+
+The Reviewer gate is not a broad generic software-quality checklist. A verdict is
+decided profile-first, in four tiers:
+
+```text
+1 explicit user/project requirements
+2 applicable project quality profile attributes
+3 current phase contract
+4 minimal general gate
+```
+
+A concern outside those four tiers is never promoted to a blocking finding. Generic
+best practice, naming taste, minor duplication, documentation polish, speculative
+extensibility and stylistic refactoring suggestions are not grounds for `FAIL` unless
+the project's own profile declares them blocking.
+
+### Location and schema
+
+The profile lives at `.orca/quality-profile.yaml` in the repository being worked on.
+`.orca/quality-profile.example.yaml` in this repository is a generic starting point;
+copy it and replace every attribute with your project's own.
+
+```yaml
+version: 1
+
+quality_attributes:
+
+  - id: DOMAIN-001
+    category: business-domain
+    name: Idempotent processing
+    blocking: true
+    applies_to:
+      - design
+      - implementation
+      - test
+    description: >
+      Reprocessing the same input must not produce a duplicate side effect.
+    verification:
+      - code
+      - tests
+
+  - id: TEAM-001
+    category: team-convention
+    name: Repository convention
+    blocking: false
+    description: >
+      Keep the existing repository structure and naming convention.
+```
+
+| field | meaning |
+| --- | --- |
+| `version` | schema version; only `1` exists, and any other value is an error |
+| `id` | unique within the profile |
+| `category` | `business-domain`, `platform-infrastructure`, `team-convention`, or `operational-risk` |
+| `name` | short label |
+| `blocking` | a real boolean; a violation of a `true` attribute fails the gate |
+| `description` | optional prose |
+| `applies_to` | optional list of phases; omitted means **all applicable workflow phases** |
+| `verification` | optional list of where the evidence comes from |
+
+`applies_to` accepts `analysis`, `plan`, `design`, `implementation`, `test`, `bugfix`
+and `refactoring`. A `design`-only attribute is not handed to the ANALYSIS Reviewer at
+all, so nobody is asked to evaluate a rule that does not apply yet. `bugfix` and
+`refactoring` follow the same rule as every other phase. The Final Adversarial Review
+receives every attribute applicable to any requested phase, because it re-checks the
+requested workflow as a whole.
+
+Deliberately **not** in scope: profile inheritance, remote profiles, organization-wide
+profiles, merge hierarchies, dynamic rule engines, and LLM-generated profiles.
+
+#### YAML subset
+
+`quality-profile.yaml` is parsed by a small, stdlib-only, restricted-subset parser
+(`scripts/quality_profile.py`), not a general-purpose YAML library — this repository
+depends on nothing outside the standard library. It supports `key: value` mappings,
+block sequences (`- item` and `- key: value` list-of-mappings), inline flow sequences
+(`applies_to: [design, implementation, test]`), quoted scalars, and `>`/`|` block
+scalars. It refuses anything it does not understand — including YAML features it does
+not implement, such as nested `[...]`/`{...}` inside an inline list, anchors/aliases,
+or multi-document files — rather than guessing at a partial parse.
+
+### Minimal General Gate
+
+The general layer is intentionally small and stays five categories:
+
+```text
+G1 explicit requirement violation
+G2 result does not work
+G3 severe regression
+G4 data loss / security / irreversible side effect
+G5 missing validation evidence
+```
+
+### Severity is not blocking
+
+```text
+Severity  how much impact a finding has          CRITICAL | MAJOR | MINOR
+Blocking  whether it must fail this gate         YES | NO
+```
+
+Severity alone never fails a gate. `Blocking: YES` holds only when the violated
+quality attribute is `blocking: true`, or when the finding violates G1-G5. A finding
+with `Quality Attribute: NONE` is always `Blocking: NO`.
+
+```text
+ID: F-001
+Quality Attribute: DOMAIN-001
+Severity: MAJOR
+Blocking: YES
+
+ID: N-001
+Quality Attribute: NONE
+Severity: MINOR
+Blocking: NO
+Required Action: Optional improvement
+```
+
+### Verdicts
+
+A review report has four verdicts; the workflow gate has two values.
+
+| report verdict | meaning | gate |
+| --- | --- | --- |
+| `PASS` | no blocking violation, no substantive note | `RESULT: PASS` |
+| `PASS WITH NOTES` | no blocking violation, one or more non-blocking findings | `RESULT: PASS` |
+| `FAIL` | at least one blocking violation | `RESULT: FAIL` |
+| `BLOCKED` | required project information or evidence is missing | `RESULT: FAIL` |
+
+`PASS WITH NOTES` and `BLOCKED` are report annotations, not new orchestration
+lifecycle states. Task settlement, the FAIL correction loop, downstream revalidation
+and the Final Adversarial Review trigger are unchanged by them. `BLOCKED` is a `FAIL`
+whose Required Action is to supply the missing information or evidence.
+
+Non-blocking findings alone never start a correction loop, in a phase review or in the
+Final Adversarial Review.
+
+### Missing vs. malformed
+
+These two are never conflated:
+
+- **No profile** — meaning the path does not exist — is a normal state. The review
+  then uses explicit requirements, the current phase contract and the Minimal General
+  Gate, and does *not* restore the old broad generic checklist.
+- **A profile that exists but does not validate** is not a normal state. It is a
+  validation failure *before dispatch*: the Coordinator resolves the profile right
+  after binding the Run and before creating the first Task, and reports
+
+  ```text
+  STATUS: BLOCKED
+  REASON: INVALID_QUALITY_PROFILE
+  ```
+
+  No Task is dispatched, so there is no path back to the generic checklist to fall
+  onto. Duplicate attribute ids, a non-boolean `blocking`, an unknown `applies_to`
+  phase, an unknown category, unknown keys, an unsupported `version` and unparseable
+  YAML all resolve to this state — and so does a path that exists but is not a
+  readable regular file, such as a directory or a broken symlink sitting at
+  `.orca/quality-profile.yaml`. Only genuine nonexistence is `absent`.
+
+### What the agents actually receive
+
+The applicable attributes are filtered per phase and rendered into the dispatched Task
+spec itself, for the Worker as well as the Reviewer, from one resolution:
+
+```text
+=== QUALITY GATE (profile-first) ===
+profile_status: loaded
+profile_path: .orca/quality-profile.yaml
+applicable_quality_attributes: DOMAIN-001 [business-domain] blocking: Idempotent processing
+blocking_quality_attributes: DOMAIN-001
+general_gate: G1 explicit requirement violation || ...
+decision_priority: 1 explicit user/project requirements || ...
+non_blocking_by_default: ...
+verdict_semantics: ...
+=== END QUALITY GATE ===
+```
+
+Telling only the Reviewer would buy correction rounds for rules the Worker was never
+given; building both blocks from one resolution is what keeps the two roles from being
+judged against different specs.
+
+That resolution is read **once per run**, at the run boundary, and the same immutable
+object is threaded through every Worker, phase Reviewer, correction, downstream
+revalidation and Final Reviewer spec of that run. Re-reading the file per attempt
+would mean a profile edited while a Worker was running handed that Worker's Reviewer a
+different quality model — the same divergence, arriving by a slower route.
+
 ## Quick Examples
 
 Direct-session version:
