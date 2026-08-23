@@ -22,6 +22,15 @@ Understand Requirements → Inspect Architecture / Conventions / Tests
 - Testing Strategy에는 중요한 정상·분기·경계·실패 동작의 검증 방향을 포함한다.
 - 새 abstraction이나 위험 요소에는 근거를 제시한다.
 
+## Quality Profile
+dispatch된 Task spec의 `=== QUALITY GATE (profile-first) ===` block은 이번 phase에 applicable한
+Project Quality Attribute, 그중 blocking인 것, Minimal General Gate와 decision priority를 전달한다.
+
+- `blocking_quality_attributes`의 항목은 처음부터 충족하도록 작업하고 근거를 결과에 남긴다.
+- 그 block에 없는 attribute를 이번 phase에서 추가로 만족시키려 하지 않는다.
+- `profile_status: absent`이면 Explicit Requirements / 이 template의 phase contract /
+  Minimal General Gate만 적용된다.
+
 ## Result Contract
 
 ```text

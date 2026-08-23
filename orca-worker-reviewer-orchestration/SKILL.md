@@ -797,6 +797,7 @@ Reviewer는 code/artifact를 직접 수정하지 않는다.
 # Review Result
 
 RESULT: PASS | FAIL
+REVIEW_VERDICT: PASS | PASS WITH NOTES | FAIL | BLOCKED
 
 ## Summary
 ## Blocking Findings
@@ -805,18 +806,24 @@ RESULT: PASS | FAIL
 ## Final Decision
 ```
 
-Blocking Finding:
+Finding:
 
 ```text
 ID:
+Quality Attribute: <ATTRIBUTE-ID> | G1 | G2 | G3 | G4 | G5 | NONE
 Severity: CRITICAL | MAJOR | MINOR
+Blocking: YES | NO
 Location:
 Issue:
 Reason:
 Required Action:
 ```
 
-CRITICAL 또는 MAJOR가 존재하면 FAIL한다.
+Severity와 Blocking은 서로 다른 축이다. Severity는 finding의 영향도를, Blocking은 이번 gate를
+실패시켜야 하는지를 뜻한다. severity 자체는 FAIL의 근거가 아니며, `Blocking: YES`는 위반한 Quality
+Attribute의 `blocking`이 true이거나 Minimal General Gate G1-G5를 위반했을 때만 성립한다.
+`Quality Attribute: NONE`인 finding은 언제나 `Blocking: NO`다.
+Blocking finding이 하나라도 존재하면 FAIL한다.
 
 #### Reviewer context contract
 
@@ -856,6 +863,92 @@ REVIEWER_CONTEXT_KEYS = original_objective, current_phase, approved_baseline, cu
 REVIEWER_CONTEXT_MODE = delta_first
 REVIEWER_DRILL_DOWN = mandatory_and_unrestricted
 REVIEWER_CONTEXT_EXCLUDES = final_adversarial_review
+```
+
+#### Quality profile contract
+
+Reviewer의 PASS/FAIL 판단은 broad generic quality checklist가 아니라 profile-first다. 판단 근거는
+아래 네 tier이며, Reviewer는 이 범위 밖의 일반적인 software-quality concern을 스스로 blocking finding으로
+승격하지 않는다. generic best practice, 설계 취향, minor improvement는 Project Quality Profile이
+`blocking: true`로 정의하지 않은 이상 FAIL의 근거가 아니다.
+
+```text
+1 explicit user/project requirements
+2 applicable project quality profile attributes
+3 current phase contract
+4 minimal general gate
+```
+
+Minimal General Gate는 다섯 개이며 의도적으로 여기서 더 늘리지 않는다.
+
+```text
+G1 explicit requirement violation                명시적 요구사항 위반
+G2 result does not work                          결과가 명백히 동작하지 않음
+G3 severe regression                             심각한 regression
+G4 data loss security irreversible side effect   데이터 손상 / 보안 / irreversible side effect 위험
+G5 missing validation evidence                   판단에 필요한 최소 validation evidence 부재
+```
+
+프로젝트 profile은 `.orca/quality-profile.yaml`에서 읽는다. schema는 `version`과
+`quality_attributes`(`id`, `category`, `name`, `blocking`, `description`, `applies_to`,
+`verification`)뿐이며, inheritance / remote / organization-wide / merge hierarchy는 없다.
+`applies_to`를 생략하면 all applicable workflow phases를 뜻한다. `applies_to`가 있으면 그 phase의
+Worker/Reviewer에게만 전달되고, Final Adversarial Review는 requested workflow의 phase에 applicable한
+attribute 전체를 받는다. BUGFIX / REFACTORING은 다른 phase와 같은 규칙을 쓰며 canonical order에 없으므로
+downstream 개념을 갖지 않는다.
+
+profile 상태는 세 가지이며 absent와 invalid를 절대 같은 것으로 취급하지 않는다.
+
+```text
+loaded   applicable attribute가 tier 2로 전달된다.
+absent   정상 상태다. Explicit Requirements / Current Phase Contract / Minimal General Gate만
+         사용하며 broad generic checklist를 복구하지 않는다.
+invalid  Coordinator는 §6에서 Run을 bind한 직후, 첫 Task를 만들기 전에 profile을 resolve한다.
+         invalid면 어떤 Task도 dispatch하지 않는다.
+```
+
+```text
+STATUS: BLOCKED
+REASON: INVALID_QUALITY_PROFILE
+```
+
+`invalid`를 dispatch 이전의 validation failure로 처리하는 이유: 이 실패는 Worker가 고칠 수 있는
+결함이 아니라 판단 기준 자체의 부재이므로 correction loop에 넣을 대상이 아니고, Task가 아예 만들어지지
+않으므로 "조용히 generic checklist로 되돌아가는" 경로가 습관이 아니라 구조적으로 존재하지 않게 된다.
+이는 §7 INVALID_PHASE와 같은 모양의 pre-dispatch 검증이며 새 lifecycle state를 만들지 않는다.
+
+verdict는 report 4개, workflow gate 2개다. PASS WITH NOTES와 BLOCKED는 report annotation이며 새
+orchestration lifecycle state가 아니다. 따라서 task settlement, §12 FAIL Loop, §17 downstream
+revalidation, Final Review trigger는 이 변경으로 달라지지 않는다.
+
+```text
+PASS            -> RESULT: PASS
+PASS WITH NOTES -> RESULT: PASS      blocking violation 없음 + non-blocking finding 1개 이상
+FAIL            -> RESULT: FAIL      blocking violation 1개 이상
+BLOCKED         -> RESULT: FAIL      신뢰할 수 있는 verdict에 필요한 정보/evidence 부족
+```
+
+같은 quality model이 Worker에게도 전달된다. Worker Task spec과 Reviewer Task spec은 같은 resolution에서
+만들어진 동일한 block을 받으므로 두 역할이 서로 다른 기준을 듣는 일이 없다. 전달 형식은 §9 Task boundary와
+같은 방식으로 dispatch되는 spec 본문 안의 block이다.
+
+```text
+=== QUALITY GATE (profile-first) ===
+```
+
+```text
+QUALITY_PROFILE_STATUS = loaded, absent, invalid
+QUALITY_PROFILE_INVALID_HANDLING = validation_failure_before_dispatch
+QUALITY_PROFILE_ABSENT_BASIS = explicit_requirements, current_phase_contract, minimal_general_gate
+QUALITY_ATTRIBUTE_APPLIES_TO_DEFAULT = all_applicable_workflow_phases
+QUALITY_GATE_DECISION_PRIORITY = explicit_requirements, project_quality_attributes, current_phase_contract, minimal_general_gate
+QUALITY_GATE_GENERAL_IDS = g1, g2, g3, g4, g5
+QUALITY_GATE_SEVERITY_RULE = severity_is_not_blocking
+QUALITY_GATE_BLOCKING_SOURCES = blocking_quality_attribute, minimal_general_gate
+QUALITY_GATE_VERDICTS = pass, pass_with_notes, fail, blocked
+QUALITY_GATE_WORKFLOW_VALUES = pass, fail
+QUALITY_GATE_CONTEXT_KEYS = profile_status, profile_path, applicable_quality_attributes, blocking_quality_attributes, general_gate, decision_priority, non_blocking_by_default, verdict_semantics
+QUALITY_GATE_CONTEXT_ROLES = worker, reviewer, final_reviewer
 ```
 
 ## 12. FAIL Loop
@@ -1097,6 +1190,16 @@ test·validation 결과를 경로로 전달한다. 직전 attempt가 FAIL이었�
 
 #### Review checklist
 
+Final Reviewer도 §11 `#### Quality profile contract`의 quality model을 그대로 쓴다. 우선순위는
+Explicit Requirements → blocking Project Quality Attributes → Minimal General Gate → cross-phase
+consistency이며, 대상은 final implementation / diff와 test·validation evidence다. 이 attempt는
+requested workflow의 phase에 applicable한 attribute 전체를 재검증할 수 있다.
+
+Final Reviewer는 무한한 generic quality checklist를 생성하지 않는다. project profile에 없는 일반적
+improvement나 non-blocking finding만 존재하는 경우 verdict는 PASS(WITH NOTES)이며, 그것만으로
+correction loop를 시작하지 않는다. 아래 A-I는 blocking finding을 찾을 **탐색 축**이지 그 자체로
+blocking criterion 목록이 아니다.
+
 ```text
 A objective alignment        원래 요청이 실제로 충족되었는가
 B cross-phase consistency    phase 산출물들이 서로 모순되지 않는가
@@ -1118,7 +1221,9 @@ Do NOT assume any previous Reviewer PASS decision is correct.
 
 ```text
 ID: R1
+Quality Attribute: <ATTRIBUTE-ID> | G1 | G2 | G3 | G4 | G5 | NONE
 Severity: CRITICAL | MAJOR | MINOR
+Blocking: YES | NO
 Responsible Phase: analysis | plan | design | implementation | test | bugfix | refactoring
 Location:
 Issue:
@@ -1126,8 +1231,9 @@ Reason / Evidence:
 Required Action:
 ```
 
-판정 규칙은 §11과 같다. CRITICAL/MAJOR가 하나라도 남으면 FAIL, MINOR만 있으면 PASS이며 MINOR는
-`## Non-Blocking Recommendations`에 기록한다. 하나의 finding은 정확히 하나의 `Responsible Phase`를 가지며, 두
+판정 규칙은 §11과 같다. Blocking finding이 하나라도 남으면 FAIL, non-blocking finding만 있으면 PASS이며
+그 finding은 `## Non-Blocking Recommendations`에 기록한다. `Responsible Phase`는 blocking finding에만
+의미가 있다 -- non-blocking finding은 correction 대상이 아니므로 T3 매핑에 들어가지 않는다. 하나의 finding은 정확히 하나의 `Responsible Phase`를 가지며, 두
 phase에 걸친 결함은 서로 다른 id의 두 finding으로 나눈다. 값은 아래 ladder의 첫 일치로 정한다.
 
 ```text
@@ -1258,4 +1364,11 @@ Final Adversarial Review dispatch worker resource is never reuse
 Final Adversarial Review task has no dependencies and is created before its dispatch
 Final Review FAIL at the iteration bound escalates before any correction dispatch
 Final Adversarial Reviewer never fixes its own findings
+Reviewer verdict is decided profile-first: requirements, applicable quality attributes, phase contract, minimal general gate
+Severity expresses impact; blocking expresses gate failure, and only a blocking quality attribute or the minimal general gate makes a finding blocking
+Generic best practice outside the project quality profile never becomes a blocking finding
+Missing project quality profile never restores the broad generic checklist
+Invalid project quality profile is a pre-dispatch validation failure, never a silent fallback
+PASS WITH NOTES and BLOCKED are review report annotations, never new lifecycle states
+Worker and Reviewer receive the same applicable quality attributes from one resolution
 ```

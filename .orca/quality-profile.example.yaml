@@ -1,0 +1,77 @@
+# Project Quality Profile -- generic example.
+#
+# Copy this file to `.orca/quality-profile.yaml` and replace every attribute with
+# your project's own. The value of a profile is that it is specific: an attribute
+# copied unchanged from an example is a generic best practice wearing a project's
+# name, and the whole point of the profile is that generic best practices do not
+# fail a review.
+#
+# Schema (this is all of it):
+#
+#   version              integer, currently 1
+#   quality_attributes   list of attributes
+#     id                 unique within the profile, e.g. DOMAIN-001
+#     category           business-domain | platform-infrastructure |
+#                        team-convention | operational-risk
+#     name               short label
+#     blocking           true | false -- an actual boolean, not "true"
+#     description        optional prose
+#     applies_to         optional list of phases; omit to mean every applicable
+#                        workflow phase (analysis, plan, design, implementation,
+#                        test, bugfix, refactoring)
+#     verification       optional list of where the evidence comes from
+#
+# `blocking: true` means a violation FAILS the workflow gate. `blocking: false`
+# means a violation is reported as a non-blocking note and the gate still passes.
+# Mark an attribute blocking only when shipping the violation is genuinely worse
+# than another correction round.
+
+version: 1
+
+quality_attributes:
+
+  - id: DOMAIN-001
+    category: business-domain
+    name: Idempotent processing
+    blocking: true
+    applies_to:
+      - design
+      - implementation
+      - test
+    description: >
+      동일 입력을 재처리해도 중복 side effect가 발생하지 않아야 한다.
+    verification:
+      - code
+      - tests
+
+  - id: PLATFORM-001
+    category: platform-infrastructure
+    name: No unreviewed external dependency
+    blocking: true
+    applies_to:
+      - design
+      - implementation
+    description: >
+      새 third-party dependency는 명시적으로 요청되거나 승인된 경우에만 추가한다.
+    verification:
+      - code
+
+  - id: OPS-001
+    category: operational-risk
+    name: Reversible data migration
+    blocking: true
+    applies_to:
+      - design
+      - implementation
+    description: >
+      데이터 형식을 바꾸는 변경은 되돌릴 수 있는 경로를 함께 제시해야 한다.
+    verification:
+      - code
+      - docs
+
+  - id: TEAM-001
+    category: team-convention
+    name: Repository convention
+    blocking: false
+    description: >
+      기존 repository structure와 naming convention을 유지한다.

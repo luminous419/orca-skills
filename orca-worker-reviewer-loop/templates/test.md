@@ -25,6 +25,15 @@ Understand Requirement / Approved Inputs → Inspect Existing Tests
 - repository의 기존 test convention을 따르고 중요한 behavior gap에 집중한다.
 - production code 변경을 TEST phase의 기본 목적으로 삼지 않는다.
 
+## Quality Profile
+dispatch된 Task spec의 `=== QUALITY GATE (profile-first) ===` block은 이번 phase에 applicable한
+Project Quality Attribute, 그중 blocking인 것, Minimal General Gate와 decision priority를 전달한다.
+
+- `blocking_quality_attributes`의 항목은 처음부터 충족하도록 작업하고 근거를 결과에 남긴다.
+- 그 block에 없는 attribute를 이번 phase에서 추가로 만족시키려 하지 않는다.
+- `profile_status: absent`이면 Explicit Requirements / 이 template의 phase contract /
+  Minimal General Gate만 적용된다.
+
 ## Result Contract
 
 ```text

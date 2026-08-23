@@ -14,9 +14,15 @@ from pathlib import Path
 from typing import Any
 
 try:
+    from scripts.quality_profile import (
+        QualityProfileResolution,
+        resolve_quality_profile,
+    )
     from scripts.task_context import (
+        ALL_APPLICABLE_PHASES,
         CANONICAL_PHASES,
         FINAL_REVIEW_PHASE,
+        build_quality_gate_context,
         build_reviewer_context,
         build_task_boundary,
         ensure_run_artifact_root,
@@ -26,9 +32,12 @@ try:
         strip_task_context,
     )
 except ModuleNotFoundError:  # direct `python3 scripts/...` execution
+    from quality_profile import QualityProfileResolution, resolve_quality_profile
     from task_context import (
+        ALL_APPLICABLE_PHASES,
         CANONICAL_PHASES,
         FINAL_REVIEW_PHASE,
+        build_quality_gate_context,
         build_reviewer_context,
         build_task_boundary,
         ensure_run_artifact_root,
@@ -396,6 +405,8 @@ def dispatch_context(
     resolutions: dict[str, str] | None = None,
     evidence: WorkflowEvidence | None = None,
     run_id: str = "",
+    quality_profile: QualityProfileResolution | None = None,
+    requested_phases: tuple[str, ...] = (),
 ) -> tuple[str, dict[str, str], dict[str, Any] | None]:
     """The Task spec text an agent will actually receive, plus what went into it.
 
@@ -426,6 +437,14 @@ def dispatch_context(
     Nothing here can put an id in the payload: build_task_boundary has no such
     parameter, and both ids are unknown at this point anyway. That is what makes
     TASK_BOUNDARY_NEVER_CARRIED structural rather than a habit.
+
+    `quality_profile` is the project's resolved Quality Profile, and it reaches BOTH
+    roles through the same block. A Worker that is not told which quality attributes
+    block its phase produces correction rounds for rules it never received, and a
+    Reviewer told something different from the Worker is judging against a spec that
+    was never dispatched -- so the two payloads are built from one resolution, not
+    two. It defaults to reading the repository this harness runs against, which is
+    also the tree `drill_down` points at.
 
     A module-level function, not a method, so it is not swept by the public-method
     probe in the contract tests (same reason as worker_start_terminal_effect).
@@ -476,7 +495,24 @@ def dispatch_context(
             # E2EHarness spells its own workspace: a path, not a description.
             drill_down=(str(REPO_ROOT),),
         )
-    return render_task_spec(base, boundary, reviewer_context), boundary, reviewer_context
+    if quality_profile is None:
+        quality_profile = resolve_quality_profile(REPO_ROOT)
+    # An undeclared requested set at the final gate resolves to every applicable
+    # phase, never to none: the conservative direction is the one that cannot hide an
+    # attribute from the gate that is supposed to re-check the whole workflow.
+    scope = requested_phases or (
+        ALL_APPLICABLE_PHASES if phase == FINAL_REVIEW_PHASE else ()
+    )
+    quality_gate = build_quality_gate_context(
+        resolution=quality_profile,
+        current_phase=phase,
+        requested_phases=scope,
+    )
+    return (
+        render_task_spec(base, boundary, reviewer_context, quality_gate),
+        boundary,
+        reviewer_context,
+    )
 
 
 class OrcaRuntimeHarness:

@@ -17,9 +17,12 @@ from scripts.e2e_harness import (
     WorkflowScenario,
     downstream_revalidation_set,
 )
+from scripts.quality_profile import DEFAULT_PROFILE_PATH, PROFILE_STATUS_LOADED
 from scripts.task_context import (
     BOUNDARY_RECEIPT_HEADING,
     BOUNDARY_RECEIPT_PREFIX,
+    QUALITY_GATE_KEYS,
+    QUALITY_GATE_RECEIPT_KEY,
     REVIEWER_CONTEXT_KEYS,
     REVIEWER_CONTEXT_RECEIPT_KEY,
     SPEC_VALUE_SEPARATOR,
@@ -1706,6 +1709,101 @@ class SessionRecordingTests(unittest.TestCase):
             len({event.session_id for event in result.sessions}),
             len(result.sessions),
         )
+
+
+class QualityGateE2ETests(unittest.TestCase):
+    """The quality model, checked where the fake agents actually receive it.
+
+    The E2E harness has no Orca preamble, so `--task-spec` IS the dispatched input,
+    and each fake echoes a receipt parsed back out of it. Asserting on that receipt is
+    therefore an assertion about the agent-visible payload, not about a helper.
+    """
+
+    ORCHESTRATION_SKILL = (
+        REPO_ROOT / "orca-worker-reviewer-orchestration" / "SKILL.md"
+    )
+    PROFILE = """version: 1
+
+quality_attributes:
+
+  - id: DOMAIN-001
+    category: business-domain
+    name: Idempotent processing
+    blocking: true
+    applies_to:
+      - implementation
+
+  - id: DESIGN-001
+    category: platform-infrastructure
+    name: Design only rule
+    blocking: false
+    applies_to:
+      - design
+"""
+
+    def run_phase(self, *, profile: str | None) -> WorkflowResult:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory)
+            if profile is not None:
+                path = workspace / DEFAULT_PROFILE_PATH
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(profile, encoding="utf-8")
+            harness = E2EHarness(
+                self.ORCHESTRATION_SKILL,
+                phase="implementation",
+                max_iterations=5,
+                workspace=workspace,
+            )
+            return harness.run(FakeScenario(("complete",), ("pass",)))
+
+    def test_both_agents_receive_the_quality_gate_block(self) -> None:
+        result = self.run_phase(profile=self.PROFILE)
+
+        self.assertEqual(result.final_status, "COMPLETED")
+        for role, attempts in (
+            ("worker", result.worker_attempts),
+            ("reviewer", result.reviewer_attempts),
+        ):
+            with self.subTest(role):
+                output = attempts[0].output
+                self.assertIn(
+                    f"{BOUNDARY_RECEIPT_PREFIX}{QUALITY_GATE_RECEIPT_KEY}", output
+                )
+                for key in QUALITY_GATE_KEYS:
+                    self.assertIn(key, output)
+
+    def test_the_absent_profile_run_still_carries_the_minimal_gate(self) -> None:
+        """No profile is a defined state, not a reason to send nothing."""
+        result = self.run_phase(profile=None)
+
+        self.assertEqual(result.final_status, "COMPLETED")
+        for attempts in (result.worker_attempts, result.reviewer_attempts):
+            self.assertIn(
+                f"{BOUNDARY_RECEIPT_PREFIX}{QUALITY_GATE_RECEIPT_KEY}",
+                attempts[0].output,
+            )
+
+    def test_one_resolution_feeds_both_roles(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory)
+            path = workspace / DEFAULT_PROFILE_PATH
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(self.PROFILE, encoding="utf-8")
+            harness = E2EHarness(
+                self.ORCHESTRATION_SKILL,
+                phase="implementation",
+                max_iterations=5,
+                workspace=workspace,
+            )
+            gate = harness.quality_gate()
+
+        self.assertEqual(gate["profile_status"], PROFILE_STATUS_LOADED)
+        # implementation-scoped only: the design attribute is filtered out before the
+        # spec is rendered, so neither role is asked to evaluate it here.
+        rendered = " ".join(gate["applicable_quality_attributes"])
+        self.assertIn("DOMAIN-001", rendered)
+        self.assertNotIn("DESIGN-001", rendered)
+        self.assertEqual(gate["blocking_quality_attributes"], ("DOMAIN-001",))
 
 
 class RunArtifactRootProvisioningTests(unittest.TestCase):

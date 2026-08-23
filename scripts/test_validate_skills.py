@@ -654,5 +654,97 @@ class ValidatorRegressionTests(unittest.TestCase):
             "orca-worker-reviewer-loop: must not contain the reviewer context contract"
         )
 
+    # ---- the quality profile block, and the review policy it only indexes ---------
+    # The block gets the same three negatives as the others. The fourth test is the
+    # one this contract needs that the others do not: a SKILL.md that still declares
+    # the model while reviews/common.md -- the file a phase Reviewer is actually
+    # routed to -- has lost it is exactly the documentation-only change OS-1 forbids.
+
+    def quality_profile_block(self) -> str:
+        """The machine-readable fence, not the first ```text in the subsection."""
+        orchestration = (
+            self.repo_root / "orca-worker-reviewer-orchestration" / "SKILL.md"
+        ).read_text(encoding="utf-8")
+        start = orchestration.index("```text\nQUALITY_PROFILE_STATUS")
+        return orchestration[start : orchestration.index("```\n", start + 1) + 4]
+
+    def test_quality_profile_contract_missing_fails(self) -> None:
+        self.mutate_orchestration_skill(self.quality_profile_block(), "")
+
+        self.assert_lifecycle_contract_rejected(
+            "quality profile contract block is missing or malformed"
+        )
+
+    def test_quality_profile_contract_value_drift_fails(self) -> None:
+        self.mutate_orchestration_skill(
+            "QUALITY_GATE_SEVERITY_RULE = severity_is_not_blocking",
+            "QUALITY_GATE_SEVERITY_RULE = severity_is_blocking",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "quality profile contract values drifted"
+        )
+
+    def test_quality_gate_gaining_a_third_workflow_value_fails(self) -> None:
+        """PASS WITH NOTES becoming a gate value is the regression this guards."""
+        self.mutate_orchestration_skill(
+            "QUALITY_GATE_WORKFLOW_VALUES = pass, fail",
+            "QUALITY_GATE_WORKFLOW_VALUES = pass, pass_with_notes, fail",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "QUALITY_GATE_WORKFLOW_VALUES must stay two-valued"
+        )
+
+    def test_general_gate_growing_past_five_ids_fails(self) -> None:
+        self.mutate_orchestration_skill(
+            "QUALITY_GATE_GENERAL_IDS = g1, g2, g3, g4, g5",
+            "QUALITY_GATE_GENERAL_IDS = g1, g2, g3, g4, g5, g6",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "the minimal general gate must stay five ids"
+        )
+
+    def test_quality_gate_dropping_the_worker_role_fails(self) -> None:
+        self.mutate_orchestration_skill(
+            "QUALITY_GATE_CONTEXT_ROLES = worker, reviewer, final_reviewer",
+            "QUALITY_GATE_CONTEXT_ROLES = reviewer, final_reviewer",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "QUALITY_GATE_CONTEXT_ROLES must reach the Worker"
+        )
+
+    def test_review_policy_losing_the_profile_first_model_fails(self) -> None:
+        """A documentation-only SKILL.md change must not pass validation."""
+        policy_path = (
+            self.repo_root
+            / "orca-worker-reviewer-orchestration"
+            / "reviews"
+            / "common.md"
+        )
+        text = policy_path.read_text(encoding="utf-8")
+        policy_path.write_text(
+            text.replace("### Minimal General Gate", "### Removed", 1), encoding="utf-8"
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "reviews/common.md is missing the profile-first anchor"
+        )
+
+    def test_quality_profile_contract_copied_into_loop_skill_fails(self) -> None:
+        loop_path = self.repo_root / "orca-worker-reviewer-loop" / "SKILL.md"
+        loop_path.write_text(
+            loop_path.read_text(encoding="utf-8")
+            + "\n#### Quality profile contract\n\n"
+            + self.quality_profile_block(),
+            encoding="utf-8",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "orca-worker-reviewer-loop: must not contain the quality profile contract"
+        )
+
 if __name__ == "__main__":
     unittest.main()

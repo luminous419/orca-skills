@@ -14,7 +14,9 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from scripts.quality_profile import resolve_quality_profile
 from scripts.task_context import (
+    build_quality_gate_context,
     build_reviewer_context,
     build_task_boundary,
     ensure_run_artifact_root,
@@ -379,6 +381,11 @@ class E2EHarness:
         # its phase loop starts; a bare .run() call (no run_workflow) keeps this
         # default, which is why it is a real, non-empty run id rather than "".
         self.run_id = run_id
+        # Resolved once, from this instance's own workspace rather than the real
+        # repository, for the same reason the artifact root is: a deterministic
+        # scenario must not change its dispatched Task specs because the checkout it
+        # happens to run inside grew a `.orca/quality-profile.yaml`.
+        self.quality_profile = resolve_quality_profile(workspace)
         # Provisioned immediately, under workspace (this instance's own scratch
         # directory) rather than the real repository's artifacts/ root, before the
         # first Worker/Reviewer subprocess -- run with cwd=workspace -- could be
@@ -469,6 +476,18 @@ class E2EHarness:
             sessions=tuple(self.sessions),
         )
 
+    def quality_gate(self) -> dict[str, object]:
+        """The profile-first quality model both fake agents receive this phase.
+
+        One call, one resolution, both roles: the Worker and the Reviewer of a phase
+        must not be handed two different answers to "which quality attributes apply
+        here", and building it in one place is what makes that structural.
+        """
+        return build_quality_gate_context(
+            resolution=self.quality_profile,
+            current_phase=self.phase,
+        )
+
     def run(self, scenario: FakeScenario) -> WorkflowResult:
         worker_attempts: list[AgentAttempt] = []
         reviewer_attempts: list[AgentAttempt] = []
@@ -518,7 +537,10 @@ class E2EHarness:
                 json.dumps(resolutions, sort_keys=True),
                 "--task-spec",
                 render_task_spec(
-                    f"worker {self.phase} iteration {iteration}", worker_boundary
+                    f"worker {self.phase} iteration {iteration}",
+                    worker_boundary,
+                    None,
+                    self.quality_gate(),
                 ),
             ]
             self._record_session(
@@ -639,6 +661,7 @@ class E2EHarness:
                     f"reviewer {self.phase} iteration {iteration}",
                     reviewer_boundary,
                     reviewer_context,
+                    self.quality_gate(),
                 ),
             ]
             if self.protected_artifacts:

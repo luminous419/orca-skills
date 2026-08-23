@@ -27,5 +27,7 @@ Production code 변경에는 대응 Unit Test 추가/수정 및 실행이 필수
 Iteration > 1이면 이전 finding의 `RESOLVED | DISPUTED | BLOCKED` 상태와 실제 해결 여부를 확인한다.
 
 ## PASS Conditions
-요구사항과 correctness가 충족되고, 변경이 최소이며, CRITICAL/MAJOR finding이 없고,
+요구사항과 correctness가 충족되고, 변경이 최소이며, blocking finding이 없고,
 필수 Unit Test와 실행 evidence가 충분할 때만 `RESULT: PASS`다.
+severity만으로 자동 FAIL하지 않는다. Blocking 판정은 Common Review Policy의
+`Severity and Blocking`을 따른다.
