@@ -20,6 +20,7 @@ try:
         WORKER_RESOURCE_OUTCOMES,
         UnsupportedOrcaContract,
         run_final_review_runtime_scenario,
+        run_quality_profile_runtime_scenario,
         run_runtime_scenarios,
         run_session_reuse_runtime_scenario,
     )
@@ -33,6 +34,7 @@ except ModuleNotFoundError:
         WORKER_RESOURCE_OUTCOMES,
         UnsupportedOrcaContract,
         run_final_review_runtime_scenario,
+        run_quality_profile_runtime_scenario,
         run_runtime_scenarios,
         run_session_reuse_runtime_scenario,
     )
@@ -239,6 +241,70 @@ class OrcaRuntimeIntegrationTests(unittest.TestCase):
         self.assertIn(
             scenario_i.fixture_teardown["selfHandleGuard"], {"passed", "unset"}
         )
+
+
+class QualityProfileRuntimeIntegrationTests(unittest.TestCase):
+    """Scenario L against a real Orca runtime: phase filtering, one resolution.
+
+    Opt-in like every other class in this file (ORCA_RUNTIME_TEST=1). The scenario
+    BODY is not left to this gate for its correctness -- QualityProfileScenarioTests
+    in scripts/test_orca_runtime_contract.py drives the same function offline with a
+    stubbed process boundary and runs in the default suite. What this class adds is
+    the one thing the offline driver cannot check: that a REAL Orca dispatch carries
+    the quality-gate block through to the agent unaltered.
+    """
+
+    def run_scenario(self):
+        if not RUN_ORCA:
+            self.skipTest("requires --orca-runtime and a ready Orca runtime")
+        if ARTIFACT_DIR:
+            try:
+                return run_quality_profile_runtime_scenario(Path(ARTIFACT_DIR))
+            except UnsupportedOrcaContract as exc:
+                self.skipTest(str(exc))
+        with tempfile.TemporaryDirectory() as directory:
+            try:
+                return run_quality_profile_runtime_scenario(Path(directory))
+            except UnsupportedOrcaContract as exc:
+                self.skipTest(str(exc))
+
+    def test_quality_profile_phase_filtering(self) -> None:
+        result = self.run_scenario()
+
+        self.assertEqual(result.scenario, "L")
+        self.assertEqual(result.status, "COMPLETED")
+        self.assertEqual(result.quality_profile_status, "loaded")
+        applicable = result.quality_profile_attributes
+        self.assertEqual(
+            set(applicable),
+            {
+                "design:worker",
+                "design:reviewer",
+                "implementation:worker",
+                "implementation:reviewer",
+                "final_review:reviewer",
+            },
+        )
+        self.assertIn("DESIGN-001", applicable["design:worker"])
+        self.assertNotIn("DOMAIN-001", applicable["design:worker"])
+        self.assertIn("DOMAIN-001", applicable["implementation:worker"])
+        self.assertNotIn("DESIGN-001", applicable["implementation:worker"])
+        self.assertEqual(applicable["design:worker"], applicable["design:reviewer"])
+        self.assertEqual(
+            applicable["implementation:worker"], applicable["implementation:reviewer"]
+        )
+        for identifier in ("DESIGN-001", "DOMAIN-001", "TEAM-001"):
+            self.assertIn(identifier, applicable["final_review:reviewer"])
+
+    def test_every_dispatch_of_the_run_carries_the_quality_gate(self) -> None:
+        """The receipt half: each agent echoed the gate keys back out of its preamble."""
+        result = self.run_scenario()
+
+        for attempt in result.attempts:
+            with self.subTest(role=attempt.role, iteration=attempt.iteration):
+                self.assertTrue(attempt.quality_gate)
+                gate = dict(attempt.quality_gate)
+                self.assertEqual(gate["profile_status"], "loaded")
 
 
 def main() -> None:

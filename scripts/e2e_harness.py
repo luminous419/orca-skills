@@ -17,6 +17,7 @@ from pathlib import Path
 from scripts.quality_profile import resolve_quality_profile
 from scripts.task_context import (
     build_quality_gate_context,
+    parse_quality_gate,
     build_reviewer_context,
     build_task_boundary,
     ensure_run_artifact_root,
@@ -114,6 +115,15 @@ class SessionEvent:
     record stays hashable and two attempts can be compared for equality. They are
     produced by scripts/task_context.py, the same module the runtime harness uses, so
     the payload shape is defined in exactly one place.
+
+    `quality_gate` is the profile-first block parsed back OUT of the `--task-spec`
+    text this invocation was handed. The two fields above are the layer-1 keys and the
+    Reviewer key NAMES, neither of which can answer "which quality attributes did this
+    phase's Worker actually see", so a workflow test would otherwise have to re-derive
+    what it believes the spec should have contained. Parsed rather than stored raw
+    because the raw spec carries the Reviewer's drill_down -- an absolute workspace
+    path -- which would make two runs of the same scenario compare unequal and break
+    the cross-skill determinism assertion in test_e2e_harness.py.
     """
 
     role: str = ""
@@ -124,6 +134,7 @@ class SessionEvent:
     agent_command: str = ""
     task_boundary: tuple[tuple[str, str], ...] = ()
     reviewer_context_keys: tuple[str, ...] = ()
+    quality_gate: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -235,6 +246,16 @@ def _hash_files(paths: tuple[Path, ...]) -> dict[Path, str]:
         if path.is_file()
     }
 
+
+
+def _parsed_quality_gate(spec: str) -> tuple[tuple[str, str], ...]:
+    """The quality-gate block read back out of a rendered spec, as sorted pairs.
+
+    Parsed from the dispatched text rather than from the builder's return value: the
+    question these records exist to answer is what the agent was handed, and only the
+    payload can answer it.
+    """
+    return tuple(sorted(parse_quality_gate(spec).items()))
 
 
 def final_review_artifact_path(run_id: str, attempt: int) -> str:
@@ -438,6 +459,7 @@ class E2EHarness:
         *,
         task_boundary: tuple[tuple[str, str], ...] = (),
         reviewer_context_keys: tuple[str, ...] = (),
+        quality_gate: tuple[tuple[str, str], ...] = (),
     ) -> SessionEvent:
         """Append-only: allocate (or reuse) this role's session and record the fact."""
         session_id, created = self.allocate_session(
@@ -452,6 +474,7 @@ class E2EHarness:
             agent_command=SESSION_AGENT_COMMANDS.get(role, ""),
             task_boundary=task_boundary,
             reviewer_context_keys=reviewer_context_keys,
+            quality_gate=quality_gate,
         )
         self.sessions.append(event)
         return event
@@ -520,6 +543,15 @@ class E2EHarness:
                 ),
                 relevant_previous_findings=tuple(sorted(previous_blocking_findings)),
             )
+            # One string, bound once: the text handed to the subprocess and the text
+            # the session event records are the same object, so a test reading the
+            # event is reading what the agent was actually given.
+            worker_spec = render_task_spec(
+                f"worker {self.phase} iteration {iteration}",
+                worker_boundary,
+                None,
+                self.quality_gate(),
+            )
             worker_command = [
                 sys.executable,
                 str(SCRIPT_DIR / "fake_worker.py"),
@@ -536,17 +568,13 @@ class E2EHarness:
                 "--resolutions-json",
                 json.dumps(resolutions, sort_keys=True),
                 "--task-spec",
-                render_task_spec(
-                    f"worker {self.phase} iteration {iteration}",
-                    worker_boundary,
-                    None,
-                    self.quality_gate(),
-                ),
+                worker_spec,
             ]
             self._record_session(
                 "worker",
                 iteration,
                 task_boundary=tuple(sorted(worker_boundary.items())),
+                quality_gate=_parsed_quality_gate(worker_spec),
             )
             worker = subprocess.run(
                 worker_command,
@@ -641,6 +669,12 @@ class E2EHarness:
                 validation=(worker_status,),
                 drill_down=(str(self.workspace),),
             )
+            reviewer_spec = render_task_spec(
+                f"reviewer {self.phase} iteration {iteration}",
+                reviewer_boundary,
+                reviewer_context,
+                self.quality_gate(),
+            )
             reviewer_command = [
                 sys.executable,
                 str(SCRIPT_DIR / "fake_reviewer.py"),
@@ -657,12 +691,7 @@ class E2EHarness:
                 "--findings-json",
                 json.dumps(findings),
                 "--task-spec",
-                render_task_spec(
-                    f"reviewer {self.phase} iteration {iteration}",
-                    reviewer_boundary,
-                    reviewer_context,
-                    self.quality_gate(),
-                ),
+                reviewer_spec,
             ]
             if self.protected_artifacts:
                 reviewer_command.extend(
@@ -673,6 +702,7 @@ class E2EHarness:
                 iteration,
                 task_boundary=tuple(sorted(reviewer_boundary.items())),
                 reviewer_context_keys=tuple(sorted(reviewer_context)),
+                quality_gate=_parsed_quality_gate(reviewer_spec),
             )
             hashes_before = _hash_files(self.protected_artifacts)
             reviewer = subprocess.run(

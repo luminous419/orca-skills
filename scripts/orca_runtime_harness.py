@@ -27,6 +27,7 @@ try:
         build_reviewer_context,
         build_task_boundary,
         ensure_run_artifact_root,
+        parse_quality_gate,
         phase_artifact_contract,
         render_task_spec,
         require_workflow_phase,
@@ -46,6 +47,7 @@ except ModuleNotFoundError:  # direct `python3 scripts/...` execution
         build_reviewer_context,
         build_task_boundary,
         ensure_run_artifact_root,
+        parse_quality_gate,
         phase_artifact_contract,
         render_task_spec,
         require_workflow_phase,
@@ -344,6 +346,11 @@ class RuntimeAttempt:
     release_process_action: str = ""  # release/retain receipt: none|killed|...
     task_boundary: tuple[tuple[str, str], ...] = ()  # layer-1 payload, frozen
     reviewer_context_keys: tuple[str, ...] = ()  # 8 keys when role is reviewer
+    # The profile-first block, parsed back out of the spec this attempt dispatched.
+    # The two fields above carry layer-1 values and Reviewer key NAMES, so neither
+    # can answer "which quality attributes did this dispatch actually carry" -- the
+    # question a phase-filtering assertion is made of.
+    quality_gate: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass
@@ -364,6 +371,10 @@ class RuntimeScenarioResult:
     commands_used: list[str] = field(default_factory=list)
     final_review_terminals: list[str] = field(default_factory=list)
     phase_reviewer_terminals: list[str] = field(default_factory=list)
+    # ---- scenario L: what the run's one profile resolution was, and what each
+    # dispatch was told applied to it.
+    quality_profile_status: str = ""
+    quality_profile_attributes: dict[str, str] = field(default_factory=dict)
     # ---- reuse aggregates (W-18), filled by finish() before the ledger is cleared
     reuse_chains: dict[str, list[str]] = field(default_factory=dict)
     terminal_creations: int = 0
@@ -1835,6 +1846,9 @@ class OrcaRuntimeHarness:
         attempt.task_boundary = tuple(sorted(boundary.items()))
         if reviewer_context is not None:
             attempt.reviewer_context_keys = tuple(sorted(reviewer_context))
+        # Parsed out of `spec` -- the string that reached task-create and worker-start
+        # -- for the same reason the two above are taken from the rendered payload.
+        attempt.quality_gate = tuple(sorted(parse_quality_gate(spec).items()))
         return attempt, handle
 
     def run_attempt(
@@ -2259,6 +2273,88 @@ def run_final_review_runtime_scenario(artifact_dir: Path) -> RuntimeScenarioResu
     )
     result.final_review_terminals = [final_terminal_1, final_terminal_2]
     result.phase_reviewer_terminals = [phase_reviewer_terminal]
+    return harness.finish(result)
+
+
+QUALITY_PROFILE_SCENARIO_PROFILE = """version: 1
+
+quality_attributes:
+
+  - id: DESIGN-001
+    category: platform-infrastructure
+    name: Design only rule
+    blocking: false
+    applies_to:
+      - design
+
+  - id: DOMAIN-001
+    category: business-domain
+    name: Idempotent processing
+    blocking: true
+    applies_to:
+      - implementation
+      - test
+
+  - id: TEAM-001
+    category: team-convention
+    name: Repository convention
+    blocking: false
+"""
+
+
+def run_quality_profile_runtime_scenario(
+    artifact_dir: Path, *, harness: OrcaRuntimeHarness | None = None
+) -> RuntimeScenarioResult:
+    """Opt-in scenario L: phase filtering and one run-scoped profile, against Orca.
+
+    Deliberately NOT part of run_runtime_scenarios(): that function's A-I result set is
+    pinned by an exact-set assertion in test_orca_runtime.py. Scenarios J and K set the
+    precedent; L follows it.
+
+    The profile is written under `artifact_dir`, never into the repository being
+    tested: installing one at the real .orca/quality-profile.yaml would change how
+    every other run of this repository is reviewed, which is not a test's decision to
+    make.
+
+    `harness` exists so the scenario BODY can be executed offline by the contract
+    tests. Everything that could be wrong here -- the attempt sequence, the phases, the
+    assertions -- runs in both modes; only preflight and the environment dump are
+    skipped when a harness is injected, and those are copied verbatim from scenarios J
+    and K.
+    """
+    profile_root = artifact_dir / "quality-profile-project"
+    (profile_root / ".orca").mkdir(parents=True, exist_ok=True)
+    (profile_root / ".orca" / "quality-profile.yaml").write_text(
+        QUALITY_PROFILE_SCENARIO_PROFILE, encoding="utf-8"
+    )
+    if harness is None:
+        harness = OrcaRuntimeHarness(artifact_dir, quality_profile_root=profile_root)
+        preflight = harness.preflight()
+        (artifact_dir / "environment-quality-profile.json").write_text(
+            json.dumps(preflight, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+    # The scenario owns the profile its run is judged against, in both modes: an
+    # injected harness would otherwise resolve whatever its constructor was pointed
+    # at and quietly run the whole scenario against an absent profile.
+    harness.quality_profile_root = profile_root
+
+    run_id = harness.start_run("Quality profile scenario L phase filtering")
+    attempts = [
+        harness.run_attempt("worker", 1, "complete", phase="design")[0],
+        harness.run_attempt("reviewer", 1, "pass", phase="design")[0],
+        harness.run_attempt("worker", 1, "complete", phase="implementation")[0],
+        harness.run_attempt("reviewer", 1, "pass", phase="implementation")[0],
+        harness.run_attempt("reviewer", 1, "pass", phase=FINAL_REVIEW_PHASE)[0],
+    ]
+
+    result = RuntimeScenarioResult("L", run_id, "COMPLETED", 1, attempts)
+    result.quality_profile_status = harness.quality_profile.status
+    boundaries = [dict(attempt.task_boundary) for attempt in attempts]
+    result.quality_profile_attributes = {
+        f"{boundary['current_phase']}:{boundary['current_role']}":
+            dict(attempt.quality_gate)["applicable_quality_attributes"]
+        for attempt, boundary in zip(attempts, boundaries)
+    }
     return harness.finish(result)
 
 

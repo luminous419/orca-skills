@@ -1711,6 +1711,356 @@ class SessionRecordingTests(unittest.TestCase):
         )
 
 
+class QualityProfileWorkflowTests(unittest.TestCase):
+    """ORIGINAL_REQUEST section 13-B and 13-H at the full-workflow level.
+
+    The IMPLEMENTATION phase proved phase filtering and the run-scoped resolution one
+    dispatch at a time. What no test asked was whether a WHOLE run holds together:
+    five phases, a Final Review that fails, a correction round routed by Responsible
+    Phase, and a downstream revalidation round -- all of them reading the same
+    profile, each phase seeing only its own attributes. Every assertion below reads
+    `SessionEvent.quality_gate`, which is parsed out of the `--task-spec` text the
+    fake agent subprocess was actually handed, so a harness that built the right
+    payload and dispatched a different one would fail here.
+    """
+
+    ORCHESTRATION_SKILL = (
+        REPO_ROOT / "orca-worker-reviewer-orchestration" / "SKILL.md"
+    )
+    PASSING_PHASE = FakeScenario(("complete",), ("pass",))
+
+    # One attribute per interesting applies_to shape: a single canonical phase, a
+    # multi-phase set, each specialized phase, and an omitted applies_to.
+    PROFILE = """version: 1
+
+quality_attributes:
+
+  - id: DESIGN-001
+    category: platform-infrastructure
+    name: Design only rule
+    blocking: false
+    applies_to:
+      - design
+
+  - id: DOMAIN-001
+    category: business-domain
+    name: Idempotent processing
+    blocking: true
+    applies_to:
+      - implementation
+      - test
+
+  - id: BUG-001
+    category: operational-risk
+    name: Bugfix only rule
+    blocking: true
+    applies_to:
+      - bugfix
+
+  - id: REFACTOR-001
+    category: team-convention
+    name: Refactoring only rule
+    blocking: false
+    applies_to:
+      - refactoring
+
+  - id: TEAM-001
+    category: team-convention
+    name: Repository convention
+    blocking: false
+"""
+
+    # The keys whose value is a property of the RUN, not of the phase. Phase filtering
+    # is allowed to vary the two attribute keys and nothing else; if a second
+    # resolution ever leaked in, it would show up in one of these.
+    RUN_SCOPED_KEYS = (
+        "profile_status",
+        "profile_path",
+        "general_gate",
+        "decision_priority",
+        "non_blocking_by_default",
+        "verdict_semantics",
+    )
+
+    def run_workflow_with_profile(
+        self, scenario: WorkflowScenario, *, max_iterations: int = 5
+    ) -> WorkflowRunResult:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory)
+            path = workspace / DEFAULT_PROFILE_PATH
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(self.PROFILE, encoding="utf-8")
+            harness = E2EHarness(
+                self.ORCHESTRATION_SKILL,
+                phase="implementation",
+                max_iterations=max_iterations,
+                workspace=workspace,
+            )
+            return harness.run_workflow(scenario)
+
+    @staticmethod
+    def gates(result: WorkflowRunResult) -> list[tuple[str, str, dict[str, str]]]:
+        """(phase, role, gate) for every dispatch of the run that carried one."""
+        return [
+            (event.phase, event.role, dict(event.quality_gate))
+            for event in result.sessions
+            if event.quality_gate
+        ]
+
+    def attributes_by_phase(self, result: WorkflowRunResult) -> dict[str, set[str]]:
+        seen: dict[str, set[str]] = {}
+        for phase, _role, gate in self.gates(result):
+            seen.setdefault(phase, set()).update(
+                identifier
+                for identifier in (
+                    "DESIGN-001",
+                    "DOMAIN-001",
+                    "BUG-001",
+                    "REFACTOR-001",
+                    "TEAM-001",
+                )
+                if identifier in gate["applicable_quality_attributes"]
+            )
+        return seen
+
+    def canonical_scenario(self, **overrides: object) -> WorkflowScenario:
+        phases = ("analysis", "plan", "design", "implementation", "test")
+        defaults: dict[str, object] = {
+            "phases": phases,
+            "phase_scenarios": {phase: self.PASSING_PHASE for phase in phases},
+            "final_review": FinalReviewScenario(modes=("pass",)),
+        }
+        defaults.update(overrides)
+        return WorkflowScenario(**defaults)  # type: ignore[arg-type]
+
+    # ---- section 13-B: phase filtering, end to end -------------------------------
+
+    def test_phase_scoped_attributes_are_filtered_across_a_full_five_phase_run(
+        self,
+    ) -> None:
+        result = self.run_workflow_with_profile(self.canonical_scenario())
+
+        self.assertEqual(result.final_status, "COMPLETED")
+        seen = self.attributes_by_phase(result)
+        self.assertEqual(
+            set(seen), {"analysis", "plan", "design", "implementation", "test"}
+        )
+        self.assertEqual(seen["analysis"], {"TEAM-001"})
+        self.assertEqual(seen["plan"], {"TEAM-001"})
+        self.assertEqual(seen["design"], {"DESIGN-001", "TEAM-001"})
+        self.assertEqual(seen["implementation"], {"DOMAIN-001", "TEAM-001"})
+        self.assertEqual(seen["test"], {"DOMAIN-001", "TEAM-001"})
+
+    def test_a_phases_worker_and_reviewer_are_handed_the_same_attributes(self) -> None:
+        """Section 10: the two roles of one phase must not diverge."""
+        result = self.run_workflow_with_profile(self.canonical_scenario())
+
+        by_phase_role: dict[tuple[str, str], dict[str, str]] = {}
+        for phase, role, gate in self.gates(result):
+            by_phase_role[(phase, role)] = gate
+        for phase in ("analysis", "plan", "design", "implementation", "test"):
+            with self.subTest(phase):
+                self.assertEqual(
+                    by_phase_role[(phase, "worker")],
+                    by_phase_role[(phase, "reviewer")],
+                )
+
+    def test_blocking_attributes_are_reported_per_phase_not_per_profile(self) -> None:
+        """DOMAIN-001 is the only blocking attribute, and only where it applies."""
+        result = self.run_workflow_with_profile(self.canonical_scenario())
+
+        blocking = {
+            phase: gate["blocking_quality_attributes"]
+            for phase, _role, gate in self.gates(result)
+        }
+        self.assertEqual(blocking["analysis"], "none")
+        self.assertEqual(blocking["design"], "none")
+        self.assertEqual(blocking["implementation"], "DOMAIN-001")
+        self.assertEqual(blocking["test"], "DOMAIN-001")
+
+    def test_specialized_bugfix_and_refactoring_runs_see_only_their_own_rules(
+        self,
+    ) -> None:
+        """Specialized phases are phases like any other -- including for filtering."""
+        for phase, expected in (
+            ("bugfix", {"BUG-001", "TEAM-001"}),
+            ("refactoring", {"REFACTOR-001", "TEAM-001"}),
+        ):
+            with self.subTest(phase):
+                result = self.run_workflow_with_profile(
+                    WorkflowScenario(
+                        phases=(phase,),
+                        phase_scenarios={phase: self.PASSING_PHASE},
+                        final_review=FinalReviewScenario(modes=("pass",)),
+                        run_id=f"run_e2e_quality_{phase}",
+                    )
+                )
+
+                self.assertEqual(result.final_status, "COMPLETED")
+                self.assertEqual(self.attributes_by_phase(result), {phase: expected})
+
+    def test_a_specialized_run_never_sees_a_canonical_phase_attribute(self) -> None:
+        """The negative half: DOMAIN-001 is implementation/test scoped, so a BUGFIX
+        run must not inherit it just because bugfix is 'the code phase'."""
+        result = self.run_workflow_with_profile(
+            WorkflowScenario(
+                phases=("bugfix",),
+                phase_scenarios={"bugfix": self.PASSING_PHASE},
+                final_review=FinalReviewScenario(modes=("pass",)),
+                run_id="run_e2e_quality_bugfix_negative",
+            )
+        )
+
+        for _phase, _role, gate in self.gates(result):
+            self.assertNotIn("DOMAIN-001", gate["applicable_quality_attributes"])
+            self.assertNotIn("DESIGN-001", gate["applicable_quality_attributes"])
+            self.assertEqual(gate["blocking_quality_attributes"], "BUG-001")
+
+    # ---- section 13-H: the Final Review gate with a profile installed -------------
+
+    def test_a_blocking_finding_still_routes_to_its_responsible_phase(self) -> None:
+        """13-H b. The correction round runs, and its dispatches carry the profile."""
+        result = self.run_workflow_with_profile(
+            self.canonical_scenario(
+                phases=("design", "implementation"),
+                phase_scenarios={
+                    "design": self.PASSING_PHASE,
+                    "implementation": self.PASSING_PHASE,
+                },
+                final_review=FinalReviewScenario(
+                    modes=("fail", "pass"),
+                    findings=((("R1", "implementation"),), ()),
+                ),
+                correction_scenarios={
+                    ("implementation", 1): FakeScenario(
+                        ("correction",),
+                        ("pass",),
+                        worker_resolutions=({"R1": "RESOLVED"},),
+                    )
+                },
+            )
+        )
+
+        self.assertEqual(result.final_status, "COMPLETED")
+        self.assertEqual(result.correction_dispatches, [("implementation", 2)])
+        # The correction round is iteration 2 of implementation, and it must have been
+        # told the same implementation-scoped attributes as iteration 1.
+        implementation_gates = [
+            gate
+            for phase, _role, gate in self.gates(result)
+            if phase == "implementation"
+        ]
+        self.assertGreaterEqual(len(implementation_gates), 4)
+        for gate in implementation_gates:
+            self.assertEqual(gate, implementation_gates[0])
+            self.assertEqual(gate["blocking_quality_attributes"], "DOMAIN-001")
+
+    def test_non_blocking_final_findings_do_not_start_a_correction_loop(self) -> None:
+        """13-H c. Notes alone are not a correction trigger, profile or no profile."""
+        result = self.run_workflow_with_profile(
+            self.canonical_scenario(
+                phases=("design", "implementation"),
+                phase_scenarios={
+                    "design": self.PASSING_PHASE,
+                    "implementation": self.PASSING_PHASE,
+                },
+                final_review=FinalReviewScenario(
+                    modes=("pass-nonblocking",),
+                    findings=((("N1", "implementation"),),),
+                ),
+            )
+        )
+
+        self.assertEqual(result.final_status, "COMPLETED")
+        self.assertEqual(result.final_review_iterations, 1)
+        self.assertEqual(result.correction_dispatches, [])
+        self.assertEqual(result.revalidation_dispatches, [])
+        self.assertEqual(result.corrected_findings, ())
+
+    def test_downstream_revalidation_carries_the_same_profile(self) -> None:
+        """13-H d. T5a still runs, and the revalidated phase reads the same model."""
+        result = self.run_workflow_with_profile(
+            self.canonical_scenario(
+                phases=("design", "implementation", "test"),
+                phase_scenarios={
+                    "design": self.PASSING_PHASE,
+                    "implementation": self.PASSING_PHASE,
+                    "test": self.PASSING_PHASE,
+                },
+                final_review=FinalReviewScenario(
+                    modes=("fail", "pass"),
+                    findings=((("R1", "design"),), ()),
+                ),
+                correction_scenarios={
+                    ("design", 1): FakeScenario(
+                        ("correction",),
+                        ("pass",),
+                        worker_resolutions=({"R1": "RESOLVED"},),
+                    )
+                },
+                revalidation_scenarios={
+                    ("implementation", 1): self.PASSING_PHASE,
+                    ("test", 1): self.PASSING_PHASE,
+                },
+            )
+        )
+
+        self.assertEqual(result.final_status, "COMPLETED")
+        self.assertEqual(result.correction_dispatches, [("design", 2)])
+        self.assertEqual(
+            result.revalidation_dispatches, [("implementation", 2), ("test", 2)]
+        )
+        # Every revalidation dispatch read the same phase-scoped model as the original
+        # round: correcting an upstream phase must not change what downstream is
+        # judged against.
+        per_phase = self.attributes_by_phase(result)
+        self.assertEqual(per_phase["implementation"], {"DOMAIN-001", "TEAM-001"})
+        self.assertEqual(per_phase["test"], {"DOMAIN-001", "TEAM-001"})
+        self.assertEqual(per_phase["design"], {"DESIGN-001", "TEAM-001"})
+
+    def test_one_resolution_spans_every_dispatch_of_a_correcting_run(self) -> None:
+        """13-H a at workflow level: phases, correction and revalidation agree.
+
+        Phase filtering is allowed to vary the two attribute keys. Everything else in
+        the block is a property of the run's single resolution, so any difference
+        across dispatches means a second resolution reached one of them.
+        """
+        result = self.run_workflow_with_profile(
+            self.canonical_scenario(
+                phases=("design", "implementation", "test"),
+                phase_scenarios={
+                    "design": self.PASSING_PHASE,
+                    "implementation": self.PASSING_PHASE,
+                    "test": self.PASSING_PHASE,
+                },
+                final_review=FinalReviewScenario(
+                    modes=("fail", "pass"),
+                    findings=((("R1", "design"),), ()),
+                ),
+                correction_scenarios={
+                    ("design", 1): FakeScenario(
+                        ("correction",),
+                        ("pass",),
+                        worker_resolutions=({"R1": "RESOLVED"},),
+                    )
+                },
+                revalidation_scenarios={
+                    ("implementation", 1): self.PASSING_PHASE,
+                    ("test", 1): self.PASSING_PHASE,
+                },
+            )
+        )
+
+        gates = self.gates(result)
+        self.assertGreater(len(gates), 8, "the run must actually have dispatched")
+        first = gates[0][2]
+        for phase, role, gate in gates:
+            with self.subTest(phase=phase, role=role):
+                for key in self.RUN_SCOPED_KEYS:
+                    self.assertEqual(gate[key], first[key])
+                self.assertEqual(gate["profile_status"], PROFILE_STATUS_LOADED)
+
+
 class QualityGateE2ETests(unittest.TestCase):
     """The quality model, checked where the fake agents actually receive it.
 
