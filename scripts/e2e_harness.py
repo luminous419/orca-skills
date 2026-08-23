@@ -47,6 +47,10 @@ FINAL_REVIEW_RESOLUTION_REASON = "FINAL_REVIEW_RESOLUTION_TRACE_INCOMPLETE"
 # place -- the bridge already proved accepted.keys() == routed ids -- so it exists
 # only so that bypassing the bridge fails on the semantics, not on a raw KeyError.
 UNACCOUNTED_RESOLUTION = "UNACCOUNTED"
+QUALITY_ATTRIBUTE_LINE = re.compile(
+    r"(?m)^Quality Attribute:\s*(?P<attribute>[A-Za-z][A-Za-z0-9_-]*)\s*$"
+)
+BLOCKING_LINE = re.compile(r"(?m)^Blocking:\s*(?P<blocking>YES|NO)\s*$")
 RESPONSIBLE_PHASE_LINE = re.compile(
     r"(?m)^Responsible Phase:\s*(?P<phase>[a-z][a-z0-9_]*)\s*$"
 )
@@ -142,12 +146,34 @@ class FinalFinding:
     finding_id: str
     responsible_phase: str | None
     severity: str = "MAJOR"
+    # OS-1's Final Review Finding Contract. `severity` says how much impact the
+    # finding has; `blocking` says whether it fails this gate, and they are different
+    # axes -- a MAJOR finding whose quality attribute is not blocking does not route
+    # to a correction round. `quality_attribute` is the attribute id or general gate
+    # id the finding is charged to; NONE is only ever paired with blocking=False.
+    quality_attribute: str = "G1"
+    blocking: bool = True
+
+
+# A scenario may spell a finding either way. The two-value form predates OS-1 and
+# means "a blocking general-gate violation", which is what every pre-OS-1 fixture in
+# this file already meant by putting a finding under `## Blocking Findings`.
+FinalFindingSpec = tuple[str, str] | tuple[str, str, str, bool]
+
+
+def normalize_final_finding_spec(spec: FinalFindingSpec) -> tuple[str, str, str, bool]:
+    """(id, responsible phase, quality attribute, blocking) from either form."""
+    if len(spec) == 2:
+        finding_id, phase = spec
+        return finding_id, phase, "G1", True
+    finding_id, phase, attribute, blocking = spec
+    return finding_id, phase, attribute, bool(blocking)
 
 
 @dataclass(frozen=True)
 class FinalReviewScenario:
     modes: tuple[str, ...]
-    findings: tuple[tuple[tuple[str, str], ...], ...] = ()
+    findings: tuple[tuple[FinalFindingSpec, ...], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -320,35 +346,60 @@ def downstream_revalidation_set(
 def parse_final_review_output(
     output: str, contract: WorkflowOutputContract
 ) -> tuple[str, tuple[FinalFinding, ...]]:
-    """Verdict + (finding id, responsible phase) pairs.
+    """Verdict + every finding the report carries, blocking and non-blocking alike.
 
-    Delegates the verdict and the id set to the EXISTING parse_reviewer_output --
-    its signature is bound by several tests and is not changed -- then walks the
-    `## Blocking Findings` body pairing each `ID:` with the `Responsible Phase:`
-    line that follows it before the next `ID:`.
+    Delegates the verdict and the blocking id set to the EXISTING
+    parse_reviewer_output -- its signature is bound by several tests and is not
+    changed -- then walks BOTH finding sections pairing each `ID:` with the
+    `Quality Attribute:`, `Blocking:` and `Responsible Phase:` lines that follow it
+    before the next `ID:`.
+
+    Reading both sections is the point. While only the blocking section was parsed, a
+    non-blocking finding was invisible to the caller, so "notes do not start a
+    correction loop" was true because the parser never saw them -- not because
+    anything honoured `Blocking:`. The caller now sees every finding and has to decide
+    on the field, which is what makes the OS-1 severity/blocking split observable.
+
+    `Blocking:` is required on every finding rather than inferred from the section it
+    sits in: inferring it would re-derive the field from exactly the signal it exists
+    to replace, and a report that dropped the line would silently keep working.
     """
     verdict, _ = parse_reviewer_output(output, contract)
     sections = {
         match.group("title").strip(): match.group("body")
         for match in SECTION.finditer(output)
     }
-    blocking_body = sections.get("Blocking Findings", "")
-    matches = list(FINDING_LINE.finditer(blocking_body))
     findings: list[FinalFinding] = []
-    for position, match in enumerate(matches):
-        start = match.end()
-        end = (
-            matches[position + 1].start()
-            if position + 1 < len(matches)
-            else len(blocking_body)
-        )
-        phase_match = RESPONSIBLE_PHASE_LINE.search(blocking_body[start:end])
-        findings.append(
-            FinalFinding(
-                match.group("id"),
-                phase_match.group("phase") if phase_match is not None else None,
+    for title in ("Blocking Findings", "Non-Blocking Findings"):
+        body = sections.get(title, "")
+        matches = list(FINDING_LINE.finditer(body))
+        for position, match in enumerate(matches):
+            start = match.end()
+            end = (
+                matches[position + 1].start()
+                if position + 1 < len(matches)
+                else len(body)
             )
-        )
+            block = body[start:end]
+            blocking_match = BLOCKING_LINE.search(block)
+            if blocking_match is None:
+                raise OutputContractError(
+                    f"finding {match.group('id')} has no Blocking field"
+                )
+            attribute_match = QUALITY_ATTRIBUTE_LINE.search(block)
+            phase_match = RESPONSIBLE_PHASE_LINE.search(block)
+            findings.append(
+                FinalFinding(
+                    match.group("id"),
+                    phase_match.group("phase") if phase_match is not None else None,
+                    quality_attribute=(
+                        attribute_match.group("attribute")
+                        if attribute_match is not None
+                        else "NONE"
+                    ),
+                    blocking=blocking_match.group("blocking") == "YES",
+                )
+            )
     return verdict, tuple(findings)
 
 
@@ -799,7 +850,7 @@ class E2EHarness:
         return result
 
     def _run_final_review_attempt(
-        self, attempt: int, mode: str, findings: tuple[tuple[str, str], ...]
+        self, attempt: int, mode: str, findings: tuple[FinalFindingSpec, ...]
     ) -> tuple[str | None, tuple[FinalFinding, ...], AgentAttempt | None]:
         """One Final Adversarial Review dispatch: a Reviewer-only invocation.
 
@@ -810,6 +861,7 @@ class E2EHarness:
         When the returned AgentAttempt is None a guard tripped, and the first slot
         carries the error reason instead of a verdict.
         """
+        normalized = [normalize_final_finding_spec(spec) for spec in findings]
         command = [
             sys.executable,
             str(SCRIPT_DIR / "fake_reviewer.py"),
@@ -824,11 +876,15 @@ class E2EHarness:
             "--iteration",
             str(attempt),
             "--findings-json",
-            json.dumps([finding_id for finding_id, _ in findings]),
+            json.dumps([spec[0] for spec in normalized]),
             "--responsible-phases-json",
             json.dumps(
-                {finding_id: phase for finding_id, phase in findings}, sort_keys=True
+                {spec[0]: spec[1] for spec in normalized}, sort_keys=True
             ),
+            "--quality-attributes-json",
+            json.dumps({spec[0]: spec[2] for spec in normalized}, sort_keys=True),
+            "--blocking-json",
+            json.dumps({spec[0]: spec[3] for spec in normalized}, sort_keys=True),
         ]
         if self.protected_artifacts:
             command.extend(["--artifact", str(self.protected_artifacts[0])])
@@ -1000,12 +1056,19 @@ class E2EHarness:
             # ---- T3: the attempt is settled; now, and only now, route the findings.
             #      routed[owner] keeps the finding IDS, not merely the owner set: those ids
             #      are what T4 hands to the correction round and what the bridge checks.
-            if not findings:
+            #      Only blocking findings are routed at all.
+            # Blocking is the routing axis, not severity and not which section the
+            # reviewer printed the finding under. A MAJOR finding charged to a
+            # non-blocking quality attribute is a note: it is reported and it is not
+            # corrected. A FAIL carrying no blocking finding at all contradicts its
+            # own verdict, which is the malformed case the next line still catches.
+            blocking_findings = [finding for finding in findings if finding.blocking]
+            if not blocking_findings:
                 return self._workflow_error(
                     "MALFORMED_FINAL_REVIEW_OUTPUT", snapshot()
                 )
             routed: dict[str, list[str]] = {}
-            for finding in findings:
+            for finding in blocking_findings:
                 if finding.responsible_phase is None:
                     return self._workflow_error(
                         "MALFORMED_FINAL_REVIEW_OUTPUT", snapshot()

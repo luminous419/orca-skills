@@ -10,13 +10,18 @@ from pathlib import Path
 
 from scripts.e2e_harness import E2EHarness, FakeScenario, WorkflowResult
 from scripts.e2e_harness import (
+    FinalFinding,
     FinalReviewScenario,
     SESSION_AGENT_COMMANDS,
     SessionEvent,
     WorkflowRunResult,
     WorkflowScenario,
     downstream_revalidation_set,
+    normalize_final_finding_spec,
+    parse_final_review_output,
 )
+from scripts.e2e_harness import OutputContractError
+from scripts.workflow_contract import load_workflow_output_contract
 from scripts.quality_profile import DEFAULT_PROFILE_PATH, PROFILE_STATUS_LOADED
 from scripts.task_context import (
     BOUNDARY_RECEIPT_HEADING,
@@ -2059,6 +2064,269 @@ quality_attributes:
                 for key in self.RUN_SCOPED_KEYS:
                     self.assertEqual(gate[key], first[key])
                 self.assertEqual(gate["profile_status"], PROFILE_STATUS_LOADED)
+
+
+class FinalReviewFindingContractTests(unittest.TestCase):
+    """TEST-I1 F-001: the finding MODEL must encode what the workflow claims to honour.
+
+    Iteration 1 asserted that non-blocking findings start no correction loop, but the
+    fixture had no way to say "non-blocking" -- the fake reviewer emitted only ID,
+    Severity, Responsible Phase and Issue, and the parser read only the
+    `## Blocking Findings` section. The test therefore passed because of which
+    SECTION a finding was printed under, and would have passed identically with the
+    OS-1 Severity-vs-Blocking split absent. These tests bind to the fields instead.
+    """
+
+    def report(self, *findings: str, verdict: str = "FAIL") -> str:
+        body = "\n".join(findings)
+        return f"# Review Result\n\nRESULT: {verdict}\n\n{body}\n"
+
+    def contract(self):
+        return load_workflow_output_contract(
+            REPO_ROOT / "orca-worker-reviewer-orchestration" / "SKILL.md"
+        )
+
+    def test_both_sections_are_parsed_with_their_contract_fields(self) -> None:
+        """A note the parser cannot see cannot be a note it decided to ignore."""
+        output = self.report(
+            "## Blocking Findings",
+            "ID: R1",
+            "Quality Attribute: DOMAIN-001",
+            "Severity: MAJOR",
+            "Blocking: YES",
+            "Responsible Phase: implementation",
+            "",
+            "## Non-Blocking Findings",
+            "ID: N1",
+            "Quality Attribute: NONE",
+            "Severity: MAJOR",
+            "Blocking: NO",
+            "Responsible Phase: design",
+        )
+
+        verdict, findings = parse_final_review_output(output, self.contract())
+
+        self.assertEqual(verdict, "FAIL")
+        self.assertEqual(
+            findings,
+            (
+                FinalFinding("R1", "implementation", "MAJOR", "DOMAIN-001", True),
+                FinalFinding("N1", "design", "MAJOR", "NONE", False),
+            ),
+        )
+
+    def test_a_finding_without_a_blocking_field_is_malformed(self) -> None:
+        """Inferring it from the section would re-derive it from the signal it replaces."""
+        output = self.report(
+            "## Blocking Findings",
+            "ID: R1",
+            "Quality Attribute: DOMAIN-001",
+            "Severity: MAJOR",
+            "Responsible Phase: implementation",
+        )
+
+        with self.assertRaisesRegex(OutputContractError, "no Blocking field"):
+            parse_final_review_output(output, self.contract())
+
+    def test_the_emitted_fields_are_the_ones_SKILL_md_documents(self) -> None:
+        """Anti-drift: the deterministic reviewer must speak the documented contract.
+
+        The fixture is only evidence about OS-1 if it emits the same field names
+        section 17's Final Review Finding Contract defines. Two spellings of the same
+        contract would let the harness keep passing while the skill said otherwise.
+        """
+        skill = (
+            REPO_ROOT / "orca-worker-reviewer-orchestration" / "SKILL.md"
+        ).read_text(encoding="utf-8")
+        section = skill.split("## 17. Final Adversarial Review", 1)[1].split(
+            "\n## 18.", 1
+        )[0]
+        fake = (REPO_ROOT / "scripts" / "fake_reviewer.py").read_text(encoding="utf-8")
+
+        for field in ("Quality Attribute:", "Severity:", "Blocking:", "Responsible Phase:"):
+            with self.subTest(field):
+                self.assertIn(field, section)
+                self.assertIn(field, fake)
+
+    def test_the_two_value_spec_form_still_means_a_blocking_finding(self) -> None:
+        """Every pre-OS-1 fixture in this file spells findings the short way."""
+        self.assertEqual(
+            normalize_final_finding_spec(("R1", "implementation")),
+            ("R1", "implementation", "G1", True),
+        )
+        self.assertEqual(
+            normalize_final_finding_spec(("N1", "design", "NONE", False)),
+            ("N1", "design", "NONE", False),
+        )
+
+
+class BlockingAttributeCorrectionTests(unittest.TestCase):
+    """TEST-I1 F-001: blocking routes, non-blocking does not, at full workflow level.
+
+    Both scenarios below hold SEVERITY CONSTANT at MAJOR across every finding, so the
+    only thing that can explain a difference in what gets corrected is the
+    `Blocking:` field and the quality attribute behind it. That is the whole content
+    of "Severity != Blocking", and it is not provable while severity and section are
+    the only things a fixture can vary.
+    """
+
+    ORCHESTRATION_SKILL = (
+        REPO_ROOT / "orca-worker-reviewer-orchestration" / "SKILL.md"
+    )
+    PASSING_PHASE = FakeScenario(("complete",), ("pass",))
+    PROFILE = QualityProfileWorkflowTests.PROFILE
+    RUN_SCOPED_KEYS = QualityProfileWorkflowTests.RUN_SCOPED_KEYS
+
+    def run_workflow_with_profile(self, scenario: WorkflowScenario):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory)
+            path = workspace / DEFAULT_PROFILE_PATH
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(self.PROFILE, encoding="utf-8")
+            harness = E2EHarness(
+                self.ORCHESTRATION_SKILL,
+                phase="implementation",
+                max_iterations=5,
+                workspace=workspace,
+            )
+            return harness.run_workflow(scenario)
+
+    def blocking_scenario(self) -> WorkflowScenario:
+        """R1 is charged to DOMAIN-001, the profile's one blocking attribute."""
+        return WorkflowScenario(
+            phases=("implementation", "test"),
+            phase_scenarios={
+                "implementation": self.PASSING_PHASE,
+                "test": self.PASSING_PHASE,
+            },
+            final_review=FinalReviewScenario(
+                modes=("fail", "pass"),
+                findings=((("R1", "implementation", "DOMAIN-001", True),), ()),
+            ),
+            correction_scenarios={
+                ("implementation", 1): FakeScenario(
+                    ("correction",),
+                    ("pass",),
+                    worker_resolutions=({"R1": "RESOLVED"},),
+                )
+            },
+            revalidation_scenarios={("test", 1): self.PASSING_PHASE},
+            run_id="run_e2e_blocking_attribute",
+        )
+
+    def test_a_blocking_quality_attribute_violation_drives_correction(self) -> None:
+        result = self.run_workflow_with_profile(self.blocking_scenario())
+
+        self.assertEqual(result.final_status, "COMPLETED")
+        self.assertEqual(result.correction_dispatches, [("implementation", 2)])
+        # T5a: TEST is downstream of the corrected IMPLEMENTATION and is revalidated.
+        self.assertEqual(result.revalidation_dispatches, [("test", 2)])
+        self.assertEqual(
+            [entry[1:3] for entry in result.corrected_findings],
+            [("R1", "implementation")],
+        )
+
+    def test_the_dispatched_report_carries_the_attribute_and_blocking_fields(
+        self,
+    ) -> None:
+        """The finding the workflow acted on really said DOMAIN-001 / Blocking: YES."""
+        result = self.run_workflow_with_profile(self.blocking_scenario())
+
+        report = result.final_review_attempts[0].output
+        self.assertIn("ID: R1", report)
+        self.assertIn("Quality Attribute: DOMAIN-001", report)
+        self.assertIn("Blocking: YES", report)
+        self.assertIn("Responsible Phase: implementation", report)
+
+    def test_the_correction_round_shares_the_runs_profile_resolution(self) -> None:
+        """The correction and revalidation dispatches read the same resolution."""
+        result = self.run_workflow_with_profile(self.blocking_scenario())
+
+        gates = [
+            (event.phase, dict(event.quality_gate))
+            for event in result.sessions
+            if event.quality_gate
+        ]
+        self.assertGreater(len(gates), 6)
+        first = gates[0][1]
+        for phase, gate in gates:
+            with self.subTest(phase):
+                for key in self.RUN_SCOPED_KEYS:
+                    self.assertEqual(gate[key], first[key])
+                # Both requested phases are inside DOMAIN-001's applies_to.
+                self.assertEqual(gate["blocking_quality_attributes"], "DOMAIN-001")
+
+    def mixed_scenario(self) -> WorkflowScenario:
+        """One report, two MAJOR findings, different only in Blocking and attribute.
+
+        N1 names `design` as its Responsible Phase and design IS a requested phase, so
+        a router that ignored `Blocking:` would have a real phase to correct and the
+        run would demand a correction fixture that deliberately does not exist.
+        """
+        return WorkflowScenario(
+            phases=("design", "implementation"),
+            phase_scenarios={
+                "design": self.PASSING_PHASE,
+                "implementation": self.PASSING_PHASE,
+            },
+            final_review=FinalReviewScenario(
+                modes=("fail-mixed", "pass"),
+                findings=(
+                    (
+                        ("R1", "implementation", "DOMAIN-001", True),
+                        ("N1", "design", "NONE", False),
+                    ),
+                    (),
+                ),
+            ),
+            correction_scenarios={
+                ("implementation", 1): FakeScenario(
+                    ("correction",),
+                    ("pass",),
+                    worker_resolutions=({"R1": "RESOLVED"},),
+                )
+            },
+            run_id="run_e2e_mixed_findings",
+        )
+
+    def test_a_non_blocking_finding_is_reported_and_never_corrected(self) -> None:
+        result = self.run_workflow_with_profile(self.mixed_scenario())
+
+        self.assertEqual(result.final_status, "COMPLETED")
+        # Only the blocking finding routed. `design` was named by N1 and is a
+        # requested phase, so its absence here is a decision, not an impossibility.
+        self.assertEqual(result.correction_dispatches, [("implementation", 2)])
+        self.assertNotIn(
+            "design", [phase for phase, _iteration in result.correction_dispatches]
+        )
+        self.assertEqual(
+            [entry[1:3] for entry in result.corrected_findings],
+            [("R1", "implementation")],
+        )
+
+    def test_severity_is_held_constant_so_only_blocking_can_explain_the_split(
+        self,
+    ) -> None:
+        """The control: both findings are MAJOR, and only one was corrected."""
+        result = self.run_workflow_with_profile(self.mixed_scenario())
+
+        report = result.final_review_attempts[0].output
+        verdict, findings = parse_final_review_output(
+            report,
+            load_workflow_output_contract(self.ORCHESTRATION_SKILL),
+        )
+
+        self.assertEqual(verdict, "FAIL")
+        by_id = {finding.finding_id: finding for finding in findings}
+        self.assertEqual(set(by_id), {"R1", "N1"})
+        self.assertEqual(by_id["R1"].severity, by_id["N1"].severity)
+        self.assertEqual(by_id["R1"].severity, "MAJOR")
+        self.assertTrue(by_id["R1"].blocking)
+        self.assertFalse(by_id["N1"].blocking)
+        self.assertEqual(by_id["R1"].quality_attribute, "DOMAIN-001")
+        self.assertEqual(by_id["N1"].quality_attribute, "NONE")
+        # And the non-blocking one really did name a correctable phase.
+        self.assertEqual(by_id["N1"].responsible_phase, "design")
 
 
 class QualityGateE2ETests(unittest.TestCase):
