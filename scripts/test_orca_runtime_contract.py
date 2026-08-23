@@ -5599,18 +5599,18 @@ class RunLoggingIntegrationTests(OfflineHarnessTestCase):
                 orchestrator_log, _ = self.log_paths(run_id)
                 self.assertIn(status, orchestrator_log.read_text(encoding="utf-8"))
 
-    # ---- I. Reviewer verdict (PASS vs FAIL, distinct from dispatch outcome) ---
+    # ---- I. Reviewer gate result (PASS vs FAIL, distinct from dispatch outcome) ---
     # OS-17 review MAJOR: `result`'s `outcome=succeeded` says the Dispatch/process
     # settled normally -- it does not say the review itself PASSed. A Reviewer that
     # settles successfully while writing RESULT: FAIL is the ordinary correction-loop
-    # case, not a dispatch failure, so these assert on the SEPARATE `verdict` column
-    # read back from the file, not on `result`. EchoingTerminalExec always overwrites
-    # a settled body with a synthesized boundary receipt (never a literal RESULT:
-    # line), so these tests use plain SequentialTerminalExec and set the message body
-    # by hand -- the one thing that actually lets a Reviewer's real response reach
-    # the log in this offline harness.
+    # case, not a dispatch failure, so these assert on the SEPARATE `gate_result`
+    # column read back from the file, not on `result`. EchoingTerminalExec always
+    # overwrites a settled body with a synthesized boundary receipt (never a literal
+    # RESULT: line), so these tests use plain SequentialTerminalExec and set the
+    # message body by hand -- the one thing that actually lets a Reviewer's real
+    # response reach the log in this offline harness.
 
-    def test_a_succeeded_reviewer_dispatch_still_records_its_own_fail_verdict(
+    def test_a_succeeded_reviewer_dispatch_still_records_its_own_fail_gate_result(
         self,
     ) -> None:
         recorder = SequentialTerminalExec()
@@ -5624,10 +5624,10 @@ class RunLoggingIntegrationTests(OfflineHarnessTestCase):
         self.assertEqual(attempt.outcome, "succeeded")
 
         row = self.read_orchestrator_rows(harness.run_id)[-1]
-        self.assertEqual(row["verdict"], "FAIL")
+        self.assertEqual(row["gate_result"], "FAIL")
         self.assertIn("outcome=succeeded", row["result"])
 
-    def test_pass_and_fail_reviewer_verdicts_are_distinguishable_in_the_log(
+    def test_pass_and_fail_gate_results_are_distinguishable_in_the_log(
         self,
     ) -> None:
         recorder = SequentialTerminalExec()
@@ -5643,27 +5643,28 @@ class RunLoggingIntegrationTests(OfflineHarnessTestCase):
 
         rows = self.read_orchestrator_rows(harness.run_id)
         by_dispatch = {row["dispatch_id"]: row for row in rows}
-        self.assertEqual(by_dispatch["ctx_r1"]["verdict"], "FAIL")
-        self.assertEqual(by_dispatch["ctx_r2"]["verdict"], "PASS")
+        self.assertEqual(by_dispatch["ctx_r1"]["gate_result"], "FAIL")
+        self.assertEqual(by_dispatch["ctx_r2"]["gate_result"], "PASS")
         # Both settled successfully at the dispatch/process level -- the same
-        # outcome=succeeded -- despite opposite review verdicts. This is exactly
+        # outcome=succeeded -- despite opposite gate results. This is exactly
         # the distinction `result` alone could not make.
         self.assertIn("outcome=succeeded", by_dispatch["ctx_r1"]["result"])
         self.assertIn("outcome=succeeded", by_dispatch["ctx_r2"]["result"])
 
-    def test_a_worker_dispatch_never_carries_a_reviewer_verdict(self) -> None:
+    def test_a_worker_dispatch_never_carries_a_reviewer_gate_result(self) -> None:
         recorder = SequentialTerminalExec()
         harness = self.started_harness(recorder)
         self.arm(recorder, "ctx_w1", "task_w1")
-        # Ignored: verdict parsing only applies to a reviewer-role dispatch.
+        # Ignored: gate-result parsing only applies to a reviewer-role dispatch.
         recorder.results["check"]["messages"][0]["body"] = "RESULT: FAIL"
 
         harness.run_attempt("worker", 1, "complete", phase="implementation")
 
         row = self.read_orchestrator_rows(harness.run_id)[-1]
-        self.assertEqual(row["verdict"], "")
+        self.assertEqual(row["gate_result"], "")
+        self.assertEqual(row["review_verdict"], "")
 
-    def test_a_malformed_reviewer_response_leaves_verdict_blank_not_guessed(
+    def test_a_malformed_reviewer_response_leaves_gate_result_blank_not_guessed(
         self,
     ) -> None:
         recorder = SequentialTerminalExec()
@@ -5676,9 +5677,12 @@ class RunLoggingIntegrationTests(OfflineHarnessTestCase):
         harness.run_attempt("reviewer", 1, "fail", phase="implementation")
 
         row = self.read_orchestrator_rows(harness.run_id)[-1]
-        self.assertEqual(row["verdict"], "")
+        self.assertEqual(row["gate_result"], "")
+        self.assertEqual(row["review_verdict"], "")
 
-    def test_a_final_review_attempts_verdict_is_recorded_the_same_way(self) -> None:
+    def test_a_final_review_attempts_gate_result_is_recorded_the_same_way(
+        self,
+    ) -> None:
         recorder = SequentialTerminalExec()
         harness = self.started_harness(recorder)
         self.arm(recorder, "ctx_f1", "task_f1")
@@ -5690,7 +5694,77 @@ class RunLoggingIntegrationTests(OfflineHarnessTestCase):
 
         row = self.read_orchestrator_rows(harness.run_id)[-1]
         self.assertEqual(row["phase"], "final_review")
-        self.assertEqual(row["verdict"], "FAIL")
+        self.assertEqual(row["gate_result"], "FAIL")
+
+    # ---- I2. review_verdict (OS-1's four-valued report annotation) ------------
+    # OS-17 review round 3 MAJOR-2: `gate_result` is only ever PASS/FAIL, and
+    # reviews/common.md's own Verdict mapping collapses PASS WITH NOTES into PASS
+    # and BLOCKED into FAIL at that layer. `review_verdict` is the separate column
+    # that must NOT collapse them -- these tests are the reviewer's explicit ask for
+    # coverage of all four values, especially the two the gate-level column erases.
+
+    def test_all_four_review_verdicts_are_recorded_distinctly(self) -> None:
+        recorder = SequentialTerminalExec()
+        harness = self.started_harness(recorder)
+        bodies = {
+            "ctx_v1": "RESULT: PASS\nREVIEW_VERDICT: PASS",
+            "ctx_v2": "RESULT: PASS\nREVIEW_VERDICT: PASS WITH NOTES",
+            "ctx_v3": "RESULT: FAIL\nREVIEW_VERDICT: FAIL",
+            "ctx_v4": "RESULT: FAIL\nREVIEW_VERDICT: BLOCKED",
+        }
+        for iteration, (dispatch_id, body) in enumerate(bodies.items(), start=1):
+            self.arm(recorder, dispatch_id, f"task_{dispatch_id}")
+            recorder.results["check"]["messages"][0]["body"] = body
+            harness.run_attempt(
+                "reviewer", iteration, "fail", phase="implementation"
+            )
+
+        rows = self.read_orchestrator_rows(harness.run_id)
+        by_dispatch = {row["dispatch_id"]: row for row in rows}
+        # gate_result: PASS WITH NOTES and BLOCKED collapse into PASS/FAIL exactly
+        # as reviews/common.md's mapping documents.
+        self.assertEqual(by_dispatch["ctx_v1"]["gate_result"], "PASS")
+        self.assertEqual(by_dispatch["ctx_v2"]["gate_result"], "PASS")
+        self.assertEqual(by_dispatch["ctx_v3"]["gate_result"], "FAIL")
+        self.assertEqual(by_dispatch["ctx_v4"]["gate_result"], "FAIL")
+        # review_verdict: all four stay distinct -- this is the column that must
+        # not lose PASS WITH NOTES vs PASS, or BLOCKED vs FAIL.
+        self.assertEqual(by_dispatch["ctx_v1"]["review_verdict"], "PASS")
+        self.assertEqual(by_dispatch["ctx_v2"]["review_verdict"], "PASS WITH NOTES")
+        self.assertEqual(by_dispatch["ctx_v3"]["review_verdict"], "FAIL")
+        self.assertEqual(by_dispatch["ctx_v4"]["review_verdict"], "BLOCKED")
+
+    def test_review_verdict_is_not_guessed_from_the_two_valued_gate_result(
+        self,
+    ) -> None:
+        """A body with RESULT but no REVIEW_VERDICT line leaves review_verdict
+        blank -- it is never inferred from gate_result, even though the two are
+        correlated in a well-formed response."""
+        recorder = SequentialTerminalExec()
+        harness = self.started_harness(recorder)
+        self.arm(recorder, "ctx_r1", "task_r1")
+        recorder.results["check"]["messages"][0]["body"] = "RESULT: PASS"
+
+        harness.run_attempt("reviewer", 1, "pass", phase="implementation")
+
+        row = self.read_orchestrator_rows(harness.run_id)[-1]
+        self.assertEqual(row["gate_result"], "PASS")
+        self.assertEqual(row["review_verdict"], "")
+
+    def test_final_review_review_verdict_preserves_pass_with_notes(self) -> None:
+        recorder = SequentialTerminalExec()
+        harness = self.started_harness(recorder)
+        self.arm(recorder, "ctx_f1", "task_f1")
+        recorder.results["check"]["messages"][0]["body"] = (
+            "RESULT: PASS\nREVIEW_VERDICT: PASS WITH NOTES"
+        )
+
+        harness.run_attempt("reviewer", 1, "pass", phase="final_review")
+
+        row = self.read_orchestrator_rows(harness.run_id)[-1]
+        self.assertEqual(row["phase"], "final_review")
+        self.assertEqual(row["gate_result"], "PASS")
+        self.assertEqual(row["review_verdict"], "PASS WITH NOTES")
 
     # ---- unexpected exit / pre-dispatch failure ------------------------------
 

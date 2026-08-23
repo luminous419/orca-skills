@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -16,6 +19,7 @@ from scripts.run_logging import (
     TIMING_LOG_COLUMNS,
     TIMING_LOG_FILENAME,
     RunLoggingError,
+    _ensure_run_artifact_root,
     elapsed_seconds,
     log_orchestrator_event,
     log_run_status,
@@ -24,6 +28,9 @@ from scripts.run_logging import (
     orchestrator_log_path,
     timing_log_path,
 )
+from scripts.task_context import TaskContextError, ensure_run_artifact_root
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class TableWritingTests(unittest.TestCase):
@@ -321,7 +328,9 @@ class CliTests(unittest.TestCase):
         text = timing_log_path("run_cli", base=self.base).read_text(encoding="utf-8")
         self.assertIn("5.000", text)
 
-    def test_orchestrator_event_subcommand_accepts_a_verdict(self) -> None:
+    def test_orchestrator_event_subcommand_accepts_a_gate_result_and_review_verdict(
+        self,
+    ) -> None:
         with redirect_stdout(StringIO()):
             exit_code = cli_main(
                 [
@@ -334,14 +343,17 @@ class CliTests(unittest.TestCase):
                     "dispatch_settled",
                     "--role",
                     "reviewer",
-                    "--verdict",
+                    "--gate-result",
                     "FAIL",
+                    "--review-verdict",
+                    "BLOCKED",
                 ]
             )
         self.assertEqual(exit_code, 0)
         text = orchestrator_log_path("run_cli", base=self.base).read_text(
             encoding="utf-8"
         )
+        self.assertIn("BLOCKED", text)
         self.assertIn("FAIL", text)
 
     def test_run_status_subcommand_writes_both_logs(self) -> None:
@@ -382,6 +394,118 @@ class CliTests(unittest.TestCase):
                     "--status",
                     "NOT_A_REAL_STATUS",
                 ]
+            )
+
+
+class ArtifactRootParityTests(unittest.TestCase):
+    """OS-17 review round 3 MAJOR-1: run_logging.py's `_ensure_run_artifact_root`
+    is a deliberate, self-contained duplicate of
+    scripts.task_context.run_artifact_root()/ensure_run_artifact_root() -- see the
+    module docstring for why run_logging.py may not import task_context. The two
+    must keep behaving identically or a Coordinator's real logging path
+    (run_logging.py) could accept/reject a run_id differently than the rest of
+    this repository's artifact-path contract does.
+    """
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.base = Path(self.temporary_directory.name)
+
+    def tearDown(self) -> None:
+        self.temporary_directory.cleanup()
+
+    def test_a_valid_run_id_produces_the_same_path_from_both_implementations(
+        self,
+    ) -> None:
+        inlined = _ensure_run_artifact_root("run_parity", base=self.base)
+        canonical = ensure_run_artifact_root("run_parity", base=self.base)
+        self.assertEqual(inlined, canonical)
+        self.assertTrue(inlined.is_dir())
+
+    def test_both_implementations_reject_the_same_invalid_run_ids(self) -> None:
+        for bad_run_id in ("", "..", ".", "a/b", "a\\b"):
+            with self.subTest(bad_run_id):
+                with self.assertRaises(RunLoggingError):
+                    _ensure_run_artifact_root(bad_run_id, base=self.base)
+                with self.assertRaises(TaskContextError):
+                    ensure_run_artifact_root(bad_run_id, base=self.base)
+
+    def test_omitting_base_resolves_against_the_current_directory_in_both(
+        self,
+    ) -> None:
+        # Same default in both: neither implementation resolves relative to its
+        # own __file__ location -- always the caller's cwd (or `base` override).
+        inlined = _ensure_run_artifact_root("run_parity_cwd")
+        canonical = ensure_run_artifact_root("run_parity_cwd")
+        try:
+            self.assertEqual(inlined, canonical)
+            self.assertEqual(inlined, Path("artifacts") / "runs" / "run_parity_cwd")
+        finally:
+            shutil.rmtree(Path("artifacts") / "runs" / "run_parity_cwd", ignore_errors=True)
+
+
+class InstalledSkillPortabilityTests(unittest.TestCase):
+    """OS-17 review round 3 MAJOR-1: INSTALL.md's documented global install
+    (`cp -R orca-worker-reviewer-orchestration ~/.claude/skills/`) copies only
+    what lives inside that Skill directory -- SKILL.md, templates/, reviews/, and
+    now tools/ -- never this repository's scripts/. A live Coordinator invoking
+    `python3 scripts/run_logging.py` from a target project that is not this
+    repository's own checkout would find no such file. This proves the packaged
+    copy at orca-worker-reviewer-orchestration/tools/run_logging.py works
+    completely standalone: installed into an isolated skills directory exactly
+    the way INSTALL.md documents, then invoked as a real subprocess with cwd set
+    to an unrelated target project directory -- this repository's checkout is
+    nowhere on that subprocess's sys.path.
+    """
+
+    def test_the_installed_tools_copy_writes_logs_under_the_target_project(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as skills_home, tempfile.TemporaryDirectory() as target_project:
+            # Exactly INSTALL.md section 4's documented command shape.
+            shutil.copytree(
+                REPO_ROOT / "orca-worker-reviewer-orchestration",
+                Path(skills_home) / "orca-worker-reviewer-orchestration",
+            )
+            installed_tool = (
+                Path(skills_home)
+                / "orca-worker-reviewer-orchestration"
+                / "tools"
+                / "run_logging.py"
+            )
+            self.assertTrue(installed_tool.is_file())
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(installed_tool),
+                    "orchestrator-event",
+                    "--run-id",
+                    "run_installed",
+                    "--event",
+                    "run_start",
+                    "--detail",
+                    "objective text",
+                ],
+                cwd=target_project,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            written = (
+                Path(target_project)
+                / "artifacts"
+                / "runs"
+                / "run_installed"
+                / ORCHESTRATOR_LOG_FILENAME
+            )
+            self.assertTrue(written.is_file())
+            self.assertIn("objective text", written.read_text(encoding="utf-8"))
+            # The repository checkout must not have been needed for this to work.
+            self.assertFalse(
+                (REPO_ROOT / "artifacts" / "runs" / "run_installed").exists()
             )
 
 

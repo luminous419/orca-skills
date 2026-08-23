@@ -70,11 +70,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 # precisely so that even that path cannot re-read the file mid-sequence.
 REPO_QUALITY_PROFILE = resolve_quality_profile(REPO_ROOT)
 FAKE_CODEX = REPO_ROOT / "scripts" / "fake_bin" / "codex"
-# OS-17 review MAJOR: the same field/PASS/FAIL vocabulary orca_fake_agent.py already
-# reads out of SKILL.md to build a fake reviewer's own response, read here once so
-# _reviewer_verdict() below can recognize that response in a settled attempt's body
-# without hardcoding a private mode vocabulary that belongs to the fake agent, not to
-# this harness.
+# OS-17 review: the same field/value vocabulary orca_fake_agent.py already reads
+# out of SKILL.md to build a fake reviewer's own response, read here once so
+# _reviewer_gate_result()/_reviewer_review_verdict() below can recognize that
+# response in a settled attempt's body without hardcoding a private mode vocabulary
+# that belongs to the fake agent, not to this harness.
 REVIEWER_VERDICT_CONTRACT = load_workflow_output_contract(
     REPO_ROOT / "orca-worker-reviewer-orchestration" / "SKILL.md"
 )
@@ -557,19 +557,22 @@ def dispatch_context(
     )
 
 
-def _reviewer_verdict(role: str, body: str) -> str:
-    """The gate verdict (PASS/FAIL) already written into a settled attempt's body.
+def _reviewer_gate_result(role: str, body: str) -> str:
+    """The two-valued workflow gate (PASS/FAIL) already written into a settled
+    attempt's body -- the value that actually drives the correction loop.
 
     OS-17 review MAJOR: `attempt.outcome` only says the dispatch/process settled
-    successfully -- a Reviewer settles just as successfully when its verdict is FAIL
-    (the normal correction-loop case) as when it is PASS, so `outcome=succeeded` alone
-    cannot answer "did this phase/iteration PASS?". This reads the actual `RESULT:
-    PASS`/`RESULT: FAIL` line the settled dispatch wrote, using the same field/value
-    vocabulary SKILL.md documents (REVIEWER_VERDICT_CONTRACT), rather than guessing
-    from the caller's dispatch `mode` -- which would only work for this repository's
-    own scripted fake reviewer, not for a real one. A non-reviewer role, or a body
-    that never wrote a recognizable line (an unexpected exit, a malformed response),
-    both correctly resolve to "" -- an unresolved verdict is a blank, not a guess.
+    successfully -- a Reviewer settles just as successfully when its gate result is
+    FAIL (the normal correction-loop case) as when it is PASS, so `outcome=succeeded`
+    alone cannot answer "did this phase/iteration PASS?". This reads the actual
+    `RESULT: PASS`/`RESULT: FAIL` line the settled dispatch wrote, using the same
+    field/value vocabulary SKILL.md documents (REVIEWER_VERDICT_CONTRACT), rather
+    than guessing from the caller's dispatch `mode` -- which would only work for this
+    repository's own scripted fake reviewer, not for a real one. A non-reviewer role,
+    or a body that never wrote a recognizable line (an unexpected exit, a malformed
+    response), both correctly resolve to "" -- an unresolved result is a blank, not a
+    guess. See _reviewer_review_verdict() below for the separate, richer, four-valued
+    report annotation this two-valued gate cannot preserve on its own.
     """
     if not role.endswith("reviewer"):
         return ""
@@ -582,6 +585,29 @@ def _reviewer_verdict(role: str, body: str) -> str:
             return REVIEWER_VERDICT_CONTRACT.reviewer_pass
         if stripped == fail_line:
             return REVIEWER_VERDICT_CONTRACT.reviewer_fail
+    return ""
+
+
+def _reviewer_review_verdict(role: str, body: str) -> str:
+    """OS-1's separate four-valued report annotation (PASS / PASS WITH NOTES / FAIL /
+    BLOCKED), already written into a settled attempt's body as `REVIEW_VERDICT: ...`.
+
+    OS-17 review round 3 MAJOR-2: the two-valued workflow gate `_reviewer_gate_result`
+    reads collapses PASS WITH NOTES into PASS and BLOCKED into FAIL (reviews/common.md
+    §Verdict's own mapping) -- exactly the review-level distinction a column named
+    for "the verdict" should not silently lose. Parsed the same way as the gate
+    result: an exact line match against the vocabulary SKILL.md documents
+    (REVIEWER_VERDICT_CONTRACT.review_verdict_values), never inferred from the
+    two-valued RESULT line. A non-reviewer role, or a body that never wrote a
+    recognizable REVIEW_VERDICT line, both resolve to "" rather than a guess.
+    """
+    if not role.endswith("reviewer"):
+        return ""
+    field = REVIEWER_VERDICT_CONTRACT.review_verdict_field
+    lines = {line.strip() for line in body.splitlines()}
+    for value in REVIEWER_VERDICT_CONTRACT.review_verdict_values:
+        if f"{field}: {value}" in lines:
+            return value
     return ""
 
 
@@ -1906,11 +1932,12 @@ class OrcaRuntimeHarness:
             return
         action = "created" if terminal_created else "reused"
         body_excerpt = " ".join((attempt.body or "").split())[:160]
-        # OS-17 review MAJOR: derived from attempt.role/attempt.body -- the same two
+        # OS-17 review: derived from attempt.role/attempt.body -- the same two
         # fields every call site of this method already populated by settlement --
-        # not threaded in as a new parameter, since nothing outside this method needs
-        # to know the review verdict before the write it belongs to.
-        verdict = _reviewer_verdict(attempt.role, attempt.body or "")
+        # not threaded in as new parameters, since nothing outside this method needs
+        # to know either verdict before the write it belongs to.
+        gate_result = _reviewer_gate_result(attempt.role, attempt.body or "")
+        review_verdict = _reviewer_review_verdict(attempt.role, attempt.body or "")
         self._safe_log(
             run_logging.log_orchestrator_event,
             self.run_id,
@@ -1924,7 +1951,8 @@ class OrcaRuntimeHarness:
             terminal=attempt.terminal,
             action=action,
             reuse=attempt.terminal_effect,
-            verdict=verdict,
+            gate_result=gate_result,
+            review_verdict=review_verdict,
             result=(
                 f"outcome={attempt.outcome} settlement={attempt.settlement} "
                 f"lifecycle={attempt.lifecycle_action} "

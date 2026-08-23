@@ -343,13 +343,16 @@ QUALITY_GATE_REVIEW_POLICY_ANCHORS = (
 )
 # OS-17 review follow-up: the dispatch_settled example is the one place a Coordinator
 # copies its `orchestrator-event` invocation from. `--action` (Coordinator's own
-# created/reused decision), `--reuse` (Orca's own reported effects[].action) and
-# `--verdict` (the settled review's own PASS/FAIL, distinct from dispatch outcome)
-# answer three different questions; losing any of them from the example silently
-# loses that column from every ORCHESTRATOR_LOG.md a live Coordinator ever writes.
+# created/reused decision), `--reuse` (Orca's own reported effects[].action),
+# `--gate-result` (the settled review's own two-valued PASS/FAIL, distinct from
+# dispatch outcome) and `--review-verdict` (OS-1's separate four-valued report
+# annotation) answer four different questions; losing any of them from the example
+# silently loses that column from every ORCHESTRATOR_LOG.md a live Coordinator ever
+# writes.
 RUN_LOGGING_DISPATCH_SETTLED_ANCHORS = (
     "--action created|reused --reuse",
-    "--verdict <role가 reviewer일 때",
+    "--gate-result <role가 reviewer일 때",
+    "--review-verdict <role가 reviewer일 때",
 )
 
 
@@ -1382,6 +1385,35 @@ def validate_run_logging_contract(validation: Validation) -> None:
         )
 
 
+def validate_run_logging_tool_parity(validation: Validation) -> None:
+    """scripts/run_logging.py and the copy installed inside the Skill must match.
+
+    OS-17 review round 3 MAJOR-1: INSTALL.md's documented global install
+    (`cp -R orca-worker-reviewer-orchestration ~/.claude/skills/`) never copies
+    scripts/, so a live Coordinator's logging commands only work if the Skill
+    directory ships its own copy of run_logging.py (orca-worker-reviewer-
+    orchestration/tools/run_logging.py). Two copies of the same file is a drift
+    risk with no compiler to catch it, so this validator is the compiler: same
+    exact-byte-equality pattern validate_shared_directories() above already uses
+    for templates/ and reviews/, applied to this one file pair instead of two
+    directories.
+    """
+    canonical_path = REPO_ROOT / "scripts" / "run_logging.py"
+    installed_path = LIFECYCLE_SKILL_DIR / "tools" / "run_logging.py"
+    validation.check(
+        installed_path.is_file(),
+        f"{LIFECYCLE_SKILL_DIR.name}: tools/run_logging.py is missing -- the "
+        "installed Skill would have no working logging CLI",
+    )
+    if not (canonical_path.is_file() and installed_path.is_file()):
+        return
+    validation.check(
+        canonical_path.read_bytes() == installed_path.read_bytes(),
+        f"{LIFECYCLE_SKILL_DIR.name}: tools/run_logging.py differs from "
+        "scripts/run_logging.py",
+    )
+
+
 def validate_workflow_output_contracts(validation: Validation) -> None:
     contracts = []
     for skill_dir in SKILL_DIRS:
@@ -1436,6 +1468,7 @@ def main() -> int:
     validate_reviewer_context_contract(validation)
     validate_quality_profile_contract(validation)
     validate_run_logging_contract(validation)
+    validate_run_logging_tool_parity(validation)
     validate_version(validation)
     validate_no_user_absolute_paths(validation)
 
