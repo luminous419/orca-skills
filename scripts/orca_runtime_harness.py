@@ -656,13 +656,17 @@ class OrcaRuntimeHarness:
         # _log_attempt(). Empty in the overwhelmingly common case; a test can assert
         # against it to catch a real bug in the logging helper itself.
         self._logging_errors: list[str] = []
-        # OS-17 review MAJOR: start timestamps for log_phase_start/end and
-        # log_iteration_start/end, keyed the same way the caller identifies the
-        # boundary itself (phase alone; phase+iteration). Not cleared by finish()
-        # deliberately -- a boundary opened and never explicitly closed is a
-        # caller bug worth a blank ended_at/duration_s in the log, not a KeyError.
-        self._phase_started_at: dict[str, str] = {}
-        self._iteration_started_at: dict[tuple[str, int], str] = {}
+        # OS-17 review round 4 MAJOR: the currently-open phase/iteration TIMING_LOG
+        # boundary, if any -- advanced automatically by _open_phase_iteration_
+        # boundary() (called from _log_attempt(), the one call site every dispatch
+        # already goes through) and closed by finish() for whatever is still open
+        # when the run ends. "" / None means nothing is currently open.
+        self._open_phase: str = ""
+        self._open_phase_started_at: str = ""
+        self._open_phase_result: str = ""
+        self._open_iteration: tuple[str, int] | None = None
+        self._open_iteration_started_at: str = ""
+        self._open_iteration_result: str = ""
 
     @staticmethod
     def _resolve_orca() -> str:
@@ -1930,6 +1934,12 @@ class OrcaRuntimeHarness:
         """
         if not self.run_id:
             return
+        # OS-17 review round 4 MAJOR: advances (or opens, on the first attempt of a
+        # run) the TIMING_LOG.md phase/iteration boundary for THIS attempt's own
+        # (phase, iteration) before anything else about the attempt is logged --
+        # see _open_phase_iteration_boundary()'s own docstring for why this is the
+        # one place that makes the boundary automatic rather than opt-in.
+        self._open_phase_iteration_boundary(phase or "", attempt.iteration)
         action = "created" if terminal_created else "reused"
         body_excerpt = " ".join((attempt.body or "").split())[:160]
         # OS-17 review: derived from attempt.role/attempt.body -- the same two
@@ -1938,6 +1948,14 @@ class OrcaRuntimeHarness:
         # to know either verdict before the write it belongs to.
         gate_result = _reviewer_gate_result(attempt.role, attempt.body or "")
         review_verdict = _reviewer_review_verdict(attempt.role, attempt.body or "")
+        # The most recent reviewer-role gate result observed for the currently open
+        # iteration/phase becomes that boundary's own eventual phase_end/
+        # iteration_end `detail` when it closes -- see _close_iteration_boundary()/
+        # _close_phase_boundary(). A Worker attempt (gate_result == "") leaves
+        # whatever the phase/iteration already carries unchanged.
+        if gate_result:
+            self._open_iteration_result = gate_result
+            self._open_phase_result = gate_result
         self._safe_log(
             run_logging.log_orchestrator_event,
             self.run_id,
@@ -2023,73 +2041,64 @@ class OrcaRuntimeHarness:
             run_started_at=self._run_started_at,
         )
 
-    # ---- OS-17 review MAJOR: explicit phase/iteration boundaries in TIMING_LOG ----
+    # ---- OS-17 review: automatic phase/iteration boundaries in TIMING_LOG ---------
     # OS-17's own timing contract (section 3) named "phase start/end" and
     # "iteration start/end" as separate line items from Worker/Reviewer/Final
     # Review dispatch duration -- not something a reader is meant to reconstruct
-    # by grouping dispatch_settled rows. Unlike a dispatch, a phase or iteration
-    # has no single call this harness makes on the caller's behalf: only the
-    # caller (a scenario, or a live Coordinator through the CLI) knows when one
-    # actually starts or ends, so these are explicit, not inferred from mode or
-    # role. Timing rows only -- ORCHESTRATOR_LOG.md already carries phase and
-    # iteration on every dispatch_settled row, so a duplicate row there would
-    # answer a question that row shape already answers.
+    # by grouping dispatch_settled rows. Round 3 review MAJOR: an earlier version
+    # of this made phase_start/phase_end/iteration_start/iteration_end public
+    # methods a scenario author had to remember to call -- and none of the real
+    # scenario functions (run_runtime_scenarios(), run_final_review_runtime_scenario(),
+    # etc.) ever did, so a real OrcaRuntimeHarness run never actually produced
+    # these rows despite the methods existing and being unit-tested directly.
+    # Centralized here instead: _log_attempt() is the one call site every Worker,
+    # phase Reviewer, correction, downstream revalidation, and Final Adversarial
+    # Review dispatch already goes through, so a phase/iteration transition it
+    # observes on the (phase, iteration) it is about to log is the transition --
+    # nothing else decides when a boundary opens or closes, and no caller can
+    # omit it because no caller is asked to call anything. Timing rows only --
+    # ORCHESTRATOR_LOG.md already carries phase and iteration on every
+    # dispatch_settled row, so a duplicate row there would answer a question
+    # that row shape already answers.
 
-    def log_phase_start(self, phase: str) -> None:
-        if not self.run_id:
+    def _open_phase_iteration_boundary(self, phase: str, iteration: int) -> None:
+        if not self.run_id or not phase:
             return
-        started_at = run_logging.now_iso()
-        self._phase_started_at[phase] = started_at
-        self._safe_log(
-            run_logging.log_timing_event,
-            self.run_id,
-            base=self.artifact_dir,
-            event="phase_start",
-            phase=phase,
-            started_at=started_at,
-            timestamp=started_at,
-        )
+        if phase != self._open_phase:
+            self._close_iteration_boundary()
+            self._close_phase_boundary()
+            self._open_phase = phase
+            self._open_phase_started_at = run_logging.now_iso()
+            self._safe_log(
+                run_logging.log_timing_event,
+                self.run_id,
+                base=self.artifact_dir,
+                event="phase_start",
+                phase=phase,
+                started_at=self._open_phase_started_at,
+                timestamp=self._open_phase_started_at,
+            )
+        iteration_key = (phase, iteration)
+        if iteration_key != self._open_iteration:
+            self._close_iteration_boundary()
+            self._open_iteration = iteration_key
+            self._open_iteration_started_at = run_logging.now_iso()
+            self._safe_log(
+                run_logging.log_timing_event,
+                self.run_id,
+                base=self.artifact_dir,
+                event="iteration_start",
+                phase=phase,
+                iteration=iteration,
+                started_at=self._open_iteration_started_at,
+                timestamp=self._open_iteration_started_at,
+            )
 
-    def log_phase_end(self, phase: str, *, result: str = "") -> None:
-        if not self.run_id:
+    def _close_iteration_boundary(self) -> None:
+        if self._open_iteration is None:
             return
-        started_at = self._phase_started_at.get(phase, "")
-        ended_at = run_logging.now_iso()
-        self._safe_log(
-            run_logging.log_timing_event,
-            self.run_id,
-            base=self.artifact_dir,
-            event="phase_end",
-            phase=phase,
-            started_at=started_at,
-            ended_at=ended_at,
-            duration_seconds=run_logging.elapsed_seconds(started_at, ended_at),
-            detail=result,
-            timestamp=ended_at,
-        )
-
-    def log_iteration_start(self, phase: str, iteration: int) -> None:
-        if not self.run_id:
-            return
-        started_at = run_logging.now_iso()
-        self._iteration_started_at[(phase, iteration)] = started_at
-        self._safe_log(
-            run_logging.log_timing_event,
-            self.run_id,
-            base=self.artifact_dir,
-            event="iteration_start",
-            phase=phase,
-            iteration=iteration,
-            started_at=started_at,
-            timestamp=started_at,
-        )
-
-    def log_iteration_end(
-        self, phase: str, iteration: int, *, result: str = ""
-    ) -> None:
-        if not self.run_id:
-            return
-        started_at = self._iteration_started_at.get((phase, iteration), "")
+        phase, iteration = self._open_iteration
+        started_at = self._open_iteration_started_at
         ended_at = run_logging.now_iso()
         self._safe_log(
             run_logging.log_timing_event,
@@ -2101,9 +2110,34 @@ class OrcaRuntimeHarness:
             started_at=started_at,
             ended_at=ended_at,
             duration_seconds=run_logging.elapsed_seconds(started_at, ended_at),
-            detail=result,
+            detail=self._open_iteration_result,
             timestamp=ended_at,
         )
+        self._open_iteration = None
+        self._open_iteration_started_at = ""
+        self._open_iteration_result = ""
+
+    def _close_phase_boundary(self) -> None:
+        if not self._open_phase:
+            return
+        phase = self._open_phase
+        started_at = self._open_phase_started_at
+        ended_at = run_logging.now_iso()
+        self._safe_log(
+            run_logging.log_timing_event,
+            self.run_id,
+            base=self.artifact_dir,
+            event="phase_end",
+            phase=phase,
+            started_at=started_at,
+            ended_at=ended_at,
+            duration_seconds=run_logging.elapsed_seconds(started_at, ended_at),
+            detail=self._open_phase_result,
+            timestamp=ended_at,
+        )
+        self._open_phase = ""
+        self._open_phase_started_at = ""
+        self._open_phase_result = ""
 
     def run_existing_task(
         self,
@@ -2454,6 +2488,13 @@ class OrcaRuntimeHarness:
         }
         path = self.artifact_dir / f"scenario-{result.scenario.lower()}.json"
         path.write_text(json.dumps(snapshot, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        # OS-17 review round 4 MAJOR: whatever phase/iteration boundary is still
+        # open when the run ends (the common case -- nothing in this class's
+        # normal flow closes the LAST phase/iteration itself, since there is no
+        # next attempt whose transition would trigger it) closes here, before the
+        # run's own terminal status is logged.
+        self._close_iteration_boundary()
+        self._close_phase_boundary()
         # OS-17: the one call site every scenario already reaches on its way out,
         # so "log the run's terminal status" does not need a matching reminder
         # in each of them. `result.status` is one of run_logging.RUN_STATUS_VALUES

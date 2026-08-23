@@ -5436,34 +5436,44 @@ class RunLoggingIntegrationTests(OfflineHarnessTestCase):
     def test_phase_and_iteration_boundaries_bracket_a_multi_iteration_phase(
         self,
     ) -> None:
-        """External review MAJOR: phase/iteration have their own authoritative
-        boundary rows in TIMING_LOG.md, not something a reader reconstructs by
-        grouping dispatch_settled rows by phase/iteration themselves.
+        """OS-17 review round 4 MAJOR: phase/iteration boundaries must come from
+        the REAL workflow path -- ordinary run_attempt()/finish() calls, exactly
+        what every real scenario function already does -- with no separate call
+        a scenario author has to remember. Nothing here calls a boundary method
+        directly; _log_attempt()/finish() must produce these rows on their own.
         """
-        recorder = EchoingTerminalExec()
+        # SequentialTerminalExec, not EchoingTerminalExec: the latter always
+        # overwrites a settled body with a synthesized boundary receipt, so it
+        # never carries a literal RESULT: line -- and this test's own detail
+        # assertions below need the real gate_result a reviewer wrote.
+        recorder = SequentialTerminalExec()
         harness = self.started_harness(recorder)
 
-        harness.log_phase_start("implementation")
-        harness.log_iteration_start("implementation", 1)
         self.arm(recorder, "ctx_w1", "task_w1")
-        harness.run_attempt("worker", 1, "complete", phase="implementation")
+        worker1, _ = harness.run_attempt("worker", 1, "complete", phase="implementation")
         self.arm(recorder, "ctx_r1", "task_r1")
-        harness.run_attempt(
+        recorder.results["check"]["messages"][0]["body"] = "RESULT: FAIL"
+        reviewer1, _ = harness.run_attempt(
             "reviewer", 1, "fail", phase="implementation", findings=("R1",)
         )
-        harness.log_iteration_end("implementation", 1, result="FAIL")
-
-        harness.log_iteration_start("implementation", 2)
         self.arm(recorder, "ctx_w2", "task_w2")
-        harness.run_attempt(
+        worker2, _ = harness.run_attempt(
             "worker", 2, "correction", phase="implementation", findings=("R1",)
         )
         self.arm(recorder, "ctx_r2", "task_r2")
-        harness.run_attempt("reviewer", 2, "pass", phase="implementation")
-        harness.log_iteration_end("implementation", 2, result="PASS")
-        harness.log_phase_end("implementation", result="PASS")
+        recorder.results["check"]["messages"][0]["body"] = "RESULT: PASS"
+        reviewer2, _ = harness.run_attempt("reviewer", 2, "pass", phase="implementation")
+        run_id = harness.run_id
+        # finish() is what closes whatever phase/iteration is still open when a
+        # run ends -- every real scenario function already reaches this call.
+        harness.finish(
+            RuntimeScenarioResult(
+                "probe", run_id, "COMPLETED", 2,
+                [worker1, reviewer1, worker2, reviewer2],
+            )
+        )
 
-        _, timing_log = self.log_paths(harness.run_id)
+        _, timing_log = self.log_paths(run_id)
         rows = self.read_rows(timing_log)
         boundary_rows = [
             row
@@ -5472,7 +5482,8 @@ class RunLoggingIntegrationTests(OfflineHarnessTestCase):
             in ("phase_start", "phase_end", "iteration_start", "iteration_end")
         ]
         # One phase_start, one phase_end, and one start/end pair per iteration --
-        # exactly the boundaries this scenario opened, no more and no fewer.
+        # exactly the boundaries this sequence actually crossed, no more and no
+        # fewer, and none of them a manual call.
         self.assertEqual(
             [row["event"] for row in boundary_rows],
             [
@@ -5490,13 +5501,13 @@ class RunLoggingIntegrationTests(OfflineHarnessTestCase):
         self.assertEqual(
             [row["iteration"] for row in iteration_rows], ["1", "1", "2", "2"]
         )
-        # Every _end row measured against the matching _start row's own timestamp,
-        # not against some other boundary's.
         for row in boundary_rows:
             if row["event"].endswith("_end"):
                 self.assertNotEqual(row["started_at"], "")
                 self.assertNotEqual(row["ended_at"], "")
                 self.assertNotEqual(row["duration_s"], "")
+        # detail is the last reviewer gate_result observed inside that scope --
+        # iteration 1's FAIL, iteration 2's (and therefore the phase's own) PASS.
         phase_end_row = next(row for row in boundary_rows if row["event"] == "phase_end")
         self.assertEqual(phase_end_row["detail"], "PASS")
         iteration_1_end = next(
@@ -5509,29 +5520,27 @@ class RunLoggingIntegrationTests(OfflineHarnessTestCase):
     def test_phase_and_iteration_boundaries_bracket_final_review_attempts(
         self,
     ) -> None:
-        """The same boundary events, applied to the final_review phase value --
-        no special-casing: an iteration is an iteration whether its phase is a
-        canonical one or final_review, exactly like dispatch_settled already
-        treats them identically.
+        """The same automatic boundaries, applied to the final_review phase value
+        -- no special-casing: a phase/iteration transition is a phase/iteration
+        transition whether its phase is a canonical one or final_review, exactly
+        like dispatch_settled already treats them identically. Again, nothing
+        here calls a boundary method directly.
         """
         recorder = EchoingTerminalExec()
         harness = self.started_harness(recorder)
 
-        harness.log_phase_start("final_review")
-        harness.log_iteration_start("final_review", 1)
         self.arm(recorder, "ctx_f1", "task_f1")
-        harness.run_attempt(
+        final1, _ = harness.run_attempt(
             "reviewer", 1, "fail", phase="final_review", findings=("R1",)
         )
-        harness.log_iteration_end("final_review", 1, result="FAIL")
-
-        harness.log_iteration_start("final_review", 2)
         self.arm(recorder, "ctx_f2", "task_f2")
-        harness.run_attempt("reviewer", 2, "pass", phase="final_review")
-        harness.log_iteration_end("final_review", 2, result="PASS")
-        harness.log_phase_end("final_review", result="PASS")
+        final2, _ = harness.run_attempt("reviewer", 2, "pass", phase="final_review")
+        run_id = harness.run_id
+        harness.finish(
+            RuntimeScenarioResult("probe", run_id, "COMPLETED", 2, [final1, final2])
+        )
 
-        _, timing_log = self.log_paths(harness.run_id)
+        _, timing_log = self.log_paths(run_id)
         rows = self.read_rows(timing_log)
         boundary_rows = [
             row
@@ -5556,19 +5565,70 @@ class RunLoggingIntegrationTests(OfflineHarnessTestCase):
             if row["event"].endswith("_end"):
                 self.assertNotEqual(row["duration_s"], "")
 
-    def test_a_boundary_end_without_a_matching_start_still_writes_a_row(self) -> None:
-        """A caller bug (mismatched start/end) is a blank started_at, not a raise."""
+    def test_a_phase_transition_mid_run_closes_the_previous_phase_first(self) -> None:
+        """OS-17 review round 4 MAJOR: a multi-phase run (design -> implementation,
+        the shape scenario L already dispatches) must close the outgoing phase's
+        iteration THEN the outgoing phase itself before opening the next one --
+        proven from ordinary run_attempt() calls across two different phases.
+        """
         recorder = EchoingTerminalExec()
         harness = self.started_harness(recorder)
 
-        harness.log_iteration_end("implementation", 9, result="orphaned")
+        self.arm(recorder, "ctx_d1", "task_d1")
+        design, _ = harness.run_attempt("worker", 1, "complete", phase="design")
+        self.arm(recorder, "ctx_i1", "task_i1")
+        implementation, _ = harness.run_attempt(
+            "worker", 1, "complete", phase="implementation"
+        )
+        run_id = harness.run_id
+        harness.finish(
+            RuntimeScenarioResult(
+                "probe", run_id, "COMPLETED", 1, [design, implementation]
+            )
+        )
 
-        _, timing_log = self.log_paths(harness.run_id)
+        _, timing_log = self.log_paths(run_id)
         rows = self.read_rows(timing_log)
-        row = next(row for row in rows if row["event"] == "iteration_end")
-        self.assertEqual(row["started_at"], "")
-        self.assertEqual(row["duration_s"], "")
-        self.assertEqual(row["iteration"], "9")
+        boundary_rows = [
+            row
+            for row in rows
+            if row["event"]
+            in ("phase_start", "phase_end", "iteration_start", "iteration_end")
+        ]
+        self.assertEqual(
+            [(row["event"], row["phase"]) for row in boundary_rows],
+            [
+                ("phase_start", "design"),
+                ("iteration_start", "design"),
+                ("iteration_end", "design"),
+                ("phase_end", "design"),
+                ("phase_start", "implementation"),
+                ("iteration_start", "implementation"),
+                ("iteration_end", "implementation"),
+                ("phase_end", "implementation"),
+            ],
+        )
+
+    def test_a_run_with_no_dispatches_writes_no_phase_or_iteration_boundary_rows(
+        self,
+    ) -> None:
+        """The automatic system must not fabricate a boundary for a phase/
+        iteration nothing ever actually dispatched into."""
+        recorder = EchoingTerminalExec()
+        harness = self.started_harness(recorder)
+        run_id = harness.run_id
+
+        harness.finish(RuntimeScenarioResult("probe", run_id, "COMPLETED", 1, []))
+
+        _, timing_log = self.log_paths(run_id)
+        rows = self.read_rows(timing_log)
+        boundary_events = {
+            row["event"]
+            for row in rows
+            if row["event"]
+            in ("phase_start", "phase_end", "iteration_start", "iteration_end")
+        }
+        self.assertEqual(boundary_events, set())
 
     # ---- H. Non-success termination -----------------------------------------
 

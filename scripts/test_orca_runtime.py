@@ -230,6 +230,27 @@ class OrcaRuntimeIntegrationTests(unittest.TestCase):
             self.assertIn("run_start", log_text)
             self.assertIn(result.status, log_text)
 
+        # OS-17 review round 4 MAJOR: phase/iteration boundaries must come from
+        # the real OrcaRuntimeHarness workflow (run_runtime_scenarios() calling
+        # run_attempt()/finish(), exactly as every scenario does), not from a
+        # test calling log_phase_start()/log_iteration_start() itself. Scenario
+        # B (Worker -> Reviewer FAIL -> correction -> Reviewer PASS, two
+        # iterations of the same phase) is the real run that actually crosses a
+        # phase and two iteration boundaries, so its own TIMING_LOG.md is the
+        # proof this ran against real Orca, not a mock.
+        scenario_b = next(item for item in results if item.scenario == "B")
+        timing_text = (
+            artifact_dir / "artifacts" / "runs" / scenario_b.run_id / "TIMING_LOG.md"
+        ).read_text(encoding="utf-8")
+        for event in ("phase_start", "phase_end", "iteration_start", "iteration_end"):
+            self.assertIn(
+                f"| {event} |",
+                timing_text,
+                f"scenario B: {event} boundary row missing from a real run",
+            )
+        self.assertEqual(timing_text.count("| iteration_start |"), 2)
+        self.assertEqual(timing_text.count("| iteration_end |"), 2)
+
     def assert_scenario_h(self, scenario_h) -> None:
         """A dependent created after settlement stays pending; it is never dispatched."""
         self.assertEqual(scenario_h.late_dependent_status, "pending")
