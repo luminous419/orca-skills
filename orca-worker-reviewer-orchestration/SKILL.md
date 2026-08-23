@@ -901,11 +901,19 @@ profile 상태는 세 가지이며 absent와 invalid를 절대 같은 것으로 
 
 ```text
 loaded   applicable attribute가 tier 2로 전달된다.
-absent   정상 상태다. Explicit Requirements / Current Phase Contract / Minimal General Gate만
-         사용하며 broad generic checklist를 복구하지 않는다.
+absent   경로가 존재하지 않는 경우에만 해당한다. 정상 상태이며 Explicit Requirements /
+         Current Phase Contract / Minimal General Gate만 사용하고
+         broad generic checklist를 복구하지 않는다.
 invalid  Coordinator는 §6에서 Run을 bind한 직후, 첫 Task를 만들기 전에 profile을 resolve한다.
-         invalid면 어떤 Task도 dispatch하지 않는다.
+         invalid면 어떤 Task도 dispatch하지 않는다. 경로가 존재하지만 regular file이
+         아니거나(디렉터리, 끊어진 symlink 등) 읽을 수 없는 경우도 absent가 아니라 invalid다.
 ```
+
+profile은 Run 경계에서 **정확히 한 번** resolve하고, 그 하나의 resolution을 그 Run의 모든
+Worker / phase Reviewer / correction / downstream revalidation / Final Reviewer spec에
+그대로 전달한다. attempt마다 다시 읽지 않는다 -- Worker가 실행되는 동안 profile이 수정되면
+그 Worker를 심사하는 Reviewer가 다른 quality model을 받게 되고, 그것이 바로 아래 "Worker와
+Reviewer가 서로 다른 기준을 듣는" 상태다.
 
 ```text
 STATUS: BLOCKED
@@ -938,6 +946,8 @@ BLOCKED         -> RESULT: FAIL      신뢰할 수 있는 verdict에 필요한 �
 
 ```text
 QUALITY_PROFILE_STATUS = loaded, absent, invalid
+QUALITY_PROFILE_ABSENT_CONDITION = path_does_not_exist
+QUALITY_PROFILE_RESOLUTION_SCOPE = resolved_once_per_run_never_per_attempt
 QUALITY_PROFILE_INVALID_HANDLING = validation_failure_before_dispatch
 QUALITY_PROFILE_ABSENT_BASIS = explicit_requirements, current_phase_contract, minimal_general_gate
 QUALITY_ATTRIBUTE_APPLIES_TO_DEFAULT = all_applicable_workflow_phases
@@ -1364,6 +1374,8 @@ Final Adversarial Review dispatch worker resource is never reuse
 Final Adversarial Review task has no dependencies and is created before its dispatch
 Final Review FAIL at the iteration bound escalates before any correction dispatch
 Final Adversarial Reviewer never fixes its own findings
+One quality profile resolution per run reaches every worker, reviewer, correction, revalidation and final reviewer spec
+A quality profile path that exists but is unreadable or not a regular file is invalid, never absent
 Reviewer verdict is decided profile-first: requirements, applicable quality attributes, phase contract, minimal general gate
 Severity expresses impact; blocking expresses gate failure, and only a blocking quality attribute or the minimal general gate makes a finding blocking
 Generic best practice outside the project quality profile never becomes a blocking finding

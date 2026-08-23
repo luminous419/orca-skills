@@ -196,9 +196,9 @@ Final Adversarial Review.
 
 These two are never conflated:
 
-- **No profile** is a normal state. The review then uses explicit requirements, the
-  current phase contract and the Minimal General Gate — and does *not* restore the
-  old broad generic checklist.
+- **No profile** — meaning the path does not exist — is a normal state. The review
+  then uses explicit requirements, the current phase contract and the Minimal General
+  Gate, and does *not* restore the old broad generic checklist.
 - **A profile that exists but does not validate** is not a normal state. It is a
   validation failure *before dispatch*: the Coordinator resolves the profile right
   after binding the Run and before creating the first Task, and reports
@@ -211,7 +211,9 @@ These two are never conflated:
   No Task is dispatched, so there is no path back to the generic checklist to fall
   onto. Duplicate attribute ids, a non-boolean `blocking`, an unknown `applies_to`
   phase, an unknown category, unknown keys, an unsupported `version` and unparseable
-  YAML all resolve to this state.
+  YAML all resolve to this state — and so does a path that exists but is not a
+  readable regular file, such as a directory or a broken symlink sitting at
+  `.orca/quality-profile.yaml`. Only genuine nonexistence is `absent`.
 
 ### What the agents actually receive
 
@@ -234,6 +236,12 @@ verdict_semantics: ...
 Telling only the Reviewer would buy correction rounds for rules the Worker was never
 given; building both blocks from one resolution is what keeps the two roles from being
 judged against different specs.
+
+That resolution is read **once per run**, at the run boundary, and the same immutable
+object is threaded through every Worker, phase Reviewer, correction, downstream
+revalidation and Final Reviewer spec of that run. Re-reading the file per attempt
+would mean a profile edited while a Worker was running handed that Worker's Reviewer a
+different quality model — the same divergence, arriving by a slower route.
 
 ## Quick Examples
 

@@ -1783,6 +1783,34 @@ quality_attributes:
                 attempts[0].output,
             )
 
+    def test_correction_and_revalidation_clones_share_the_run_resolution(self) -> None:
+        """IMPL-I1 F-001, E2E side: a phase clone must not re-read the profile.
+
+        _phase_harness() is the seam every correction and downstream-revalidation
+        round goes through. A shallow copy shares the resolution by reference; a
+        clone that re-resolved would give a correction Worker a different model from
+        the Reviewer that failed it.
+        """
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory)
+            path = workspace / DEFAULT_PROFILE_PATH
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(self.PROFILE, encoding="utf-8")
+            harness = E2EHarness(
+                self.ORCHESTRATION_SKILL,
+                phase="implementation",
+                max_iterations=5,
+                workspace=workspace,
+            )
+            resolved = harness.quality_profile
+            path.write_text("version: 1\nquality_attributes: []\n", encoding="utf-8")
+            clone = harness._phase_harness("implementation", 2)
+
+        self.assertIs(clone.quality_profile, resolved)
+        self.assertIn(
+            "DOMAIN-001", " ".join(clone.quality_gate()["applicable_quality_attributes"])
+        )
+
     def test_one_resolution_feeds_both_roles(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             workspace = Path(temporary_directory)

@@ -73,10 +73,15 @@ quality attribute와 그중 blocking인 것을 이미 필터링해 전달한다.
 
 ```text
 loaded   applicable attribute를 tier 2로 사용한다.
-absent   정상 상태다. Explicit Requirements / Current Phase Contract / Minimal General Gate만
-         사용하며, broad generic checklist를 복구하지 않는다.
+absent   경로가 존재하지 않는 경우에만 해당한다. 정상 상태이며 Explicit Requirements /
+         Current Phase Contract / Minimal General Gate만 사용하고,
+         broad generic checklist를 복구하지 않는다.
 invalid  dispatch 이전에 차단된다. 이 상태로 dispatch된 Task는 존재하지 않는다.
+         경로가 존재하지만 regular file이 아니거나 읽을 수 없는 경우도 invalid다.
 ```
+
+한 Run 안에서 profile은 Run 경계에서 한 번만 resolve되고 그 결과가 Worker와 Reviewer에게
+동일하게 전달된다. 따라서 이 block의 내용은 같은 phase의 Worker가 받은 것과 항상 일치한다.
 
 ## Review Principles
 - 요구사항 충족, correctness, regression risk와 변경 최소성을 우선한다.

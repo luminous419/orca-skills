@@ -50,6 +50,7 @@ from scripts.orca_runtime_harness import (
     run_session_reuse_runtime_scenario,
     validate_orca_contract,
 )
+from scripts.quality_profile import DEFAULT_PROFILE_PATH, INVALID_PROFILE_REASON
 from scripts.task_context import (
     AGENT_MODES,
     BOUNDARY_RECEIPT_PREFIX,
@@ -61,6 +62,7 @@ from scripts.task_context import (
     TASK_BOUNDARY_KEYS,
     TASK_BOUNDARY_SPEC_HEADER,
     TaskContextError,
+    parse_quality_gate,
     parse_reviewer_context,
     parse_reviewer_context_keys,
     parse_task_boundary,
@@ -4496,6 +4498,181 @@ class ScenarioKDispatchedPhaseTests(OfflineHarnessTestCase):
             rendered["approved_baseline"], "artifacts/runs/run_x/ANALYSIS.md"
         )
         self.assertEqual(rendered["validation"], "worker outcome=succeeded")
+
+
+class RunScopedQualityProfileTests(OfflineHarnessTestCase):
+    """IMPL-I1 F-001: one Quality Profile resolution per run, threaded everywhere.
+
+    The defect this pins was not that the model was missing from the spec -- it was
+    there -- but that dispatch_context re-read the profile from disk whenever its
+    argument was omitted. Every harness path omitted it, so the Worker's spec and the
+    spec of the Reviewer judging that Worker were built from two independent reads.
+    A profile edited in between (a teammate's commit, a rebase, an editor save)
+    silently gave the two roles different quality models, which is exactly the
+    divergence ORIGINAL_REQUEST section 10 forbids.
+
+    `arm` and the terminal-resource fixture are borrowed by assignment rather than by
+    inheritance: subclassing SameRoleSessionReuseTests would re-run its whole suite
+    under this class's name, and the reuse fixture is an unmodified regression class.
+    """
+
+    LIVE_TERMINAL_RESOURCE = SameRoleSessionReuseTests.LIVE_TERMINAL_RESOURCE
+    arm = SameRoleSessionReuseTests.arm
+
+    PROFILE_AT_RUN_START = """version: 1
+
+quality_attributes:
+
+  - id: DOMAIN-001
+    category: business-domain
+    name: Idempotent processing
+    blocking: true
+    applies_to:
+      - implementation
+"""
+    PROFILE_EDITED_MID_RUN = """version: 1
+
+quality_attributes:
+
+  - id: LATE-001
+    category: operational-risk
+    name: Edited after the run started
+    blocking: true
+    applies_to:
+      - implementation
+"""
+
+    def profile_root(self) -> Path:
+        root = Path(self.temporary_directory.name) / "project"
+        (root / DEFAULT_PROFILE_PATH).parent.mkdir(parents=True, exist_ok=True)
+        return root
+
+    def write_profile(self, root: Path, text: str) -> None:
+        (root / DEFAULT_PROFILE_PATH).write_text(text, encoding="utf-8")
+
+    def build_for(self, recorder: Any, root: Path) -> OrcaRuntimeHarness:
+        with patch.dict(environ, {"ORCA_CLI_COMMAND": "/opt/orca-dev"}):
+            harness = OrcaRuntimeHarness(
+                self.artifact_dir, quality_profile_root=root
+            )
+        harness._exec_orca = recorder
+        recorder.results["run-create"] = {"run": {"id": "run_profile"}}
+        return harness
+
+    def test_a_profile_edited_mid_run_never_reaches_the_reviewer(self) -> None:
+        """The regression itself: edit the file between the two dispatches."""
+        root = self.profile_root()
+        self.write_profile(root, self.PROFILE_AT_RUN_START)
+        recorder = EchoingTerminalExec()
+        harness = self.build_for(recorder, root)
+        harness.start_run("run scoped quality profile")
+
+        self.arm(recorder, "ctx_worker_1", "task_worker_1")
+        harness.run_attempt("worker", 1, "complete", phase="implementation")
+
+        # The edit lands after the Worker was dispatched and before the Reviewer is.
+        # Before the fix this alone changed what the Reviewer was told.
+        self.write_profile(root, self.PROFILE_EDITED_MID_RUN)
+
+        self.arm(recorder, "ctx_reviewer_1", "task_reviewer_1")
+        harness.run_attempt("reviewer", 1, "pass", phase="implementation")
+
+        worker_gate = parse_quality_gate(recorder.specs["task_worker_1"])
+        reviewer_gate = parse_quality_gate(recorder.specs["task_reviewer_1"])
+
+        self.assertEqual(
+            worker_gate,
+            reviewer_gate,
+            "the Reviewer must be judging against the model its Worker was given",
+        )
+        self.assertIn("DOMAIN-001", worker_gate["applicable_quality_attributes"])
+        self.assertNotIn("LATE-001", reviewer_gate["applicable_quality_attributes"])
+        self.assertEqual(reviewer_gate["blocking_quality_attributes"], "DOMAIN-001")
+
+    def test_the_same_resolution_object_reaches_every_attempt_of_the_run(self) -> None:
+        """Identity, not equality: a re-read that happened to agree would still be one."""
+        root = self.profile_root()
+        self.write_profile(root, self.PROFILE_AT_RUN_START)
+        recorder = EchoingTerminalExec()
+        harness = self.build_for(recorder, root)
+        harness.start_run("run scoped quality profile")
+        resolved = harness.quality_profile
+
+        self.arm(recorder, "ctx_worker_1", "task_worker_1")
+        harness.run_attempt("worker", 1, "complete", phase="implementation")
+        self.write_profile(root, self.PROFILE_EDITED_MID_RUN)
+        self.arm(recorder, "ctx_reviewer_1", "task_reviewer_1")
+        harness.run_attempt("reviewer", 1, "pass", phase="implementation")
+        self.arm(recorder, "ctx_final_1", "task_final_1")
+        harness.run_attempt("reviewer", 1, "pass", phase="final_review")
+
+        self.assertIs(harness.quality_profile, resolved)
+        final_gate = parse_quality_gate(recorder.specs["task_final_1"])
+        self.assertIn("DOMAIN-001", final_gate["applicable_quality_attributes"])
+        self.assertNotIn("LATE-001", final_gate["applicable_quality_attributes"])
+
+    def test_start_run_refuses_an_invalid_profile_before_anything_exists(self) -> None:
+        """Fail at the run boundary, not at the first spec that needs the model."""
+        root = self.profile_root()
+        self.write_profile(root, "version: 1\nquality_attributes: nope\n")
+        recorder = EchoingTerminalExec()
+        harness = self.build_for(recorder, root)
+
+        with self.assertRaisesRegex(OrcaRuntimeError, INVALID_PROFILE_REASON):
+            harness.start_run("run with a broken profile")
+
+        self.assertNotIn("run-create", recorder.verbs)
+        self.assertNotIn("task-create", recorder.verbs)
+
+    def test_a_directory_at_the_profile_path_stops_the_run(self) -> None:
+        """F-002 at the runtime boundary: present-but-unusable is not 'no profile'."""
+        root = self.profile_root()
+        (root / DEFAULT_PROFILE_PATH).mkdir()
+        recorder = EchoingTerminalExec()
+        harness = self.build_for(recorder, root)
+
+        with self.assertRaisesRegex(OrcaRuntimeError, INVALID_PROFILE_REASON):
+            harness.start_run("run with a directory where the profile should be")
+
+        self.assertNotIn("run-create", recorder.verbs)
+
+    def test_no_harness_path_can_omit_the_run_resolution(self) -> None:
+        """The structural half: an omitted argument is how F-001 shipped.
+
+        Behavioural tests catch the paths they exercise. This one refuses the shape
+        that made the defect possible at all -- a dispatch_context call inside the
+        harness that lets the parameter default, and a resolve call anywhere other
+        than the two boundaries (module import and start_run).
+        """
+        source = Path(orca_runtime_harness.__file__).read_text(encoding="utf-8")
+        module = ast.parse(source)
+
+        omitted = [
+            node.lineno
+            for node in ast.walk(module)
+            if isinstance(node, ast.Call)
+            and getattr(node.func, "id", None) == "dispatch_context"
+            and "quality_profile" not in {keyword.arg for keyword in node.keywords}
+        ]
+        self.assertEqual(
+            omitted,
+            [],
+            "a harness path lets quality_profile default instead of passing the "
+            "run's own resolution",
+        )
+
+        resolves = [
+            node.lineno
+            for node in ast.walk(module)
+            if isinstance(node, ast.Call)
+            and getattr(node.func, "id", None) == "resolve_quality_profile"
+        ]
+        self.assertEqual(
+            len(resolves),
+            3,
+            "resolve_quality_profile belongs at exactly three boundaries: the "
+            "import-time constant, the harness constructor, and start_run",
+        )
 
 
 if __name__ == "__main__":

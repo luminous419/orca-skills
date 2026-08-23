@@ -543,8 +543,23 @@ def resolve_quality_profile(
     """
     path = Path(root) / relative_path
     display = relative_path
-    if not path.is_file():
+    # Nonexistence and presence are the two things this branch has to tell apart, so
+    # it asks about existence -- not about being a regular file. `is_file()` answers
+    # False for a directory, a broken symlink and a device node alike, which would
+    # file every one of those present-but-unusable paths under "this project has no
+    # quality attributes". A directory at .orca/quality-profile.yaml is somebody's
+    # broken setup, not their considered decision to have no profile.
+    if not path.exists() and not path.is_symlink():
         return QualityProfileResolution(status=PROFILE_STATUS_ABSENT, path=display)
+    if not path.is_file():
+        return QualityProfileResolution(
+            status=PROFILE_STATUS_INVALID,
+            path=display,
+            error=(
+                "exists but is not a regular file (a directory, symlink loop or "
+                "device node cannot be a quality profile)"
+            ),
+        )
     try:
         text = path.read_text(encoding="utf-8")
     except OSError as exc:

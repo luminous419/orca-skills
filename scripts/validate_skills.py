@@ -280,6 +280,8 @@ QUALITY_PROFILE_CONTRACT_BLOCK_PATTERN = re.compile(
 )
 QUALITY_PROFILE_CONTRACT: dict[str, tuple[str, ...]] = {
     "QUALITY_PROFILE_STATUS": ("loaded", "absent", "invalid"),
+    "QUALITY_PROFILE_ABSENT_CONDITION": ("path_does_not_exist",),
+    "QUALITY_PROFILE_RESOLUTION_SCOPE": ("resolved_once_per_run_never_per_attempt",),
     "QUALITY_PROFILE_INVALID_HANDLING": ("validation_failure_before_dispatch",),
     "QUALITY_PROFILE_ABSENT_BASIS": (
         "explicit_requirements",
@@ -313,7 +315,7 @@ QUALITY_PROFILE_CONTRACT: dict[str, tuple[str, ...]] = {
     ),
     "QUALITY_GATE_CONTEXT_ROLES": ("worker", "reviewer", "final_reviewer"),
 }
-QUALITY_PROFILE_CONTRACT_MAX_LINES = 12
+QUALITY_PROFILE_CONTRACT_MAX_LINES = 14  # was 12; +absent condition, +resolution scope
 # The prose the block is only an index into. Each of these is a sentence the review
 # policy would still be broad-generic without, which is why they are checked here
 # rather than left to read as documentation flavour.
@@ -321,6 +323,9 @@ QUALITY_PROFILE_PROSE_ANCHORS = (
     ".orca/quality-profile.yaml",
     "REASON: INVALID_QUALITY_PROFILE",
     "broad generic checklist를 복구하지 않는다",
+    # IMPL-I1 F-001/F-002: the two sentences the machine keys only index.
+    "정확히 한 번",
+    "regular file이",
 )
 # The shared review policy is what the phase Reviewer actually reads. A machine
 # contract in SKILL.md that the routed policy file never mentions would be exactly

@@ -421,6 +421,47 @@ class MalformedProfileTests(unittest.TestCase):
 
         self.assertEqual(resolution.status, PROFILE_STATUS_INVALID)
 
+    def test_a_directory_at_the_profile_path_is_invalid_not_absent(self) -> None:
+        """IMPL-I1 F-002. `is_file()` said False here, and False read as 'no profile'.
+
+        A directory at .orca/quality-profile.yaml is a broken setup -- a botched
+        checkout, a mkdir -p that ran on the file path, a mount point. Reading it as
+        "this project chose to have no quality attributes" silently swaps the whole
+        gate for the no-profile fallback, which is the one outcome sections 3 and 11
+        say must never happen quietly.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / DEFAULT_PROFILE_PATH).mkdir(parents=True)
+            resolution = resolve_quality_profile(root)
+
+        self.assertEqual(resolution.status, PROFILE_STATUS_INVALID)
+        self.assertFalse(resolution.is_absent)
+        self.assertIsNone(resolution.profile)
+        self.assertIn("not a regular file", resolution.error)
+
+    def test_a_broken_symlink_at_the_profile_path_is_invalid_not_absent(self) -> None:
+        """`exists()` is False for a broken symlink, so existence alone is not enough."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / DEFAULT_PROFILE_PATH
+            path.parent.mkdir(parents=True)
+            path.symlink_to(root / ".orca" / "gone.yaml")
+            resolution = resolve_quality_profile(root)
+
+        self.assertEqual(resolution.status, PROFILE_STATUS_INVALID)
+        self.assertIn("not a regular file", resolution.error)
+
+    def test_only_a_truly_missing_path_is_absent(self) -> None:
+        """The other half of F-002: absent must stay reachable for the normal case."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            # An .orca directory that simply has no profile in it is still absent.
+            (root / ".orca").mkdir()
+            self.assertEqual(
+                resolve_quality_profile(root).status, PROFILE_STATUS_ABSENT
+            )
+
     def test_the_reason_code_is_the_documented_one(self) -> None:
         self.assertEqual(INVALID_PROFILE_REASON, "INVALID_QUALITY_PROFILE")
 

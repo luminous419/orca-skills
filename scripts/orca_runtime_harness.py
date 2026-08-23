@@ -15,6 +15,7 @@ from typing import Any
 
 try:
     from scripts.quality_profile import (
+        INVALID_PROFILE_REASON,
         QualityProfileResolution,
         resolve_quality_profile,
     )
@@ -32,7 +33,11 @@ try:
         strip_task_context,
     )
 except ModuleNotFoundError:  # direct `python3 scripts/...` execution
-    from quality_profile import QualityProfileResolution, resolve_quality_profile
+    from quality_profile import (
+        INVALID_PROFILE_REASON,
+        QualityProfileResolution,
+        resolve_quality_profile,
+    )
     from task_context import (
         ALL_APPLICABLE_PHASES,
         CANONICAL_PHASES,
@@ -49,6 +54,15 @@ except ModuleNotFoundError:  # direct `python3 scripts/...` execution
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+# Resolved once, at import, and never again. dispatch_context used to call
+# resolve_quality_profile() whenever its argument was omitted, which meant a profile
+# edited while a Worker was running could hand that Worker's Reviewer a DIFFERENT
+# quality model than the Worker was given -- the divergence ORIGINAL_REQUEST section
+# 10 forbids. Run paths never reach this constant: OrcaRuntimeHarness resolves once
+# per run in start_run() and threads its own resolution through every spec. This is
+# only the answer for a standalone call with no run behind it, and it is a constant
+# precisely so that even that path cannot re-read the file mid-sequence.
+REPO_QUALITY_PROFILE = resolve_quality_profile(REPO_ROOT)
 FAKE_CODEX = REPO_ROOT / "scripts" / "fake_bin" / "codex"
 WAIT_TYPES = "worker_done,escalation,question"
 SUPPORTED_ORCA_APP_VERSION = "1.4.184"
@@ -495,8 +509,11 @@ def dispatch_context(
             # E2EHarness spells its own workspace: a path, not a description.
             drill_down=(str(REPO_ROOT),),
         )
+    # Never resolved here. A caller inside a run passes the run's own resolution; a
+    # caller outside one gets the import-time constant. Neither branch reads the file
+    # again, so two specs built moments apart cannot describe two different profiles.
     if quality_profile is None:
-        quality_profile = resolve_quality_profile(REPO_ROOT)
+        quality_profile = REPO_QUALITY_PROFILE
     # An undeclared requested set at the final gate resolves to every applicable
     # phase, never to none: the conservative direction is the one that cannot hide an
     # attribute from the gate that is supposed to re-check the whole workflow.
@@ -516,13 +533,28 @@ def dispatch_context(
 
 
 class OrcaRuntimeHarness:
-    def __init__(self, artifact_dir: Path, *, wait_timeout_ms: int = 10000) -> None:
+    def __init__(
+        self,
+        artifact_dir: Path,
+        *,
+        wait_timeout_ms: int = 10000,
+        quality_profile_root: Path = REPO_ROOT,
+    ) -> None:
         self.orca = self._resolve_orca()
         self.artifact_dir = artifact_dir
         self.wait_timeout_ms = wait_timeout_ms
         self.artifact_dir.mkdir(parents=True, exist_ok=True)
         self.run_owner: str | None = None
         self.run_id: str | None = None
+        # The tree the run's quality profile is read from, and the ONE resolution
+        # every spec this harness renders is built from. start_run() re-reads it once
+        # at the run boundary and then nothing re-reads it until the next run: a
+        # Worker and the Reviewer that judges it must be handed the same quality
+        # model even if somebody edits the profile in between.
+        self.quality_profile_root = quality_profile_root
+        self.quality_profile: QualityProfileResolution = resolve_quality_profile(
+            quality_profile_root
+        )
         self._raw: list[dict[str, Any]] = []
         self._signals: list[str] = []
         # handle -> terminal row (authoritative role/origin, survives across dispatches)
@@ -1281,6 +1313,18 @@ class OrcaRuntimeHarness:
         }
 
     def start_run(self, objective: str) -> str:
+        # STEP 0, before the run terminal and long before the first Task. The run's
+        # quality model is read exactly once, here, and an invalid profile stops the
+        # run at its boundary instead of at the first spec that needs it: nobody can
+        # produce a trustworthy verdict for this project, so there is nothing worth
+        # dispatching. Everything after this point reads self.quality_profile.
+        self.quality_profile = resolve_quality_profile(self.quality_profile_root)
+        if self.quality_profile.is_invalid:
+            raise OrcaRuntimeError(
+                f"{INVALID_PROFILE_REASON}: {self.quality_profile.path} exists but is "
+                f"not a valid quality profile ({self.quality_profile.error}); no Run "
+                "is created and no Task is dispatched"
+            )
         terminal = self.call(
             "terminal", "create", "--worktree", "current", "--title", objective, "--command", "bash"
         )
@@ -1752,6 +1796,7 @@ class OrcaRuntimeHarness:
             resolutions=resolutions,
             evidence=evidence,
             run_id=self.run_id or "",
+            quality_profile=self.quality_profile,
         )
         created_here = terminal is None
         handle = terminal or self.create_fake_terminal(
@@ -1825,6 +1870,7 @@ class OrcaRuntimeHarness:
             resolutions=resolutions,
             evidence=evidence,
             run_id=self.run_id or "",
+            quality_profile=self.quality_profile,
         )
         task_id = self.create_task(spec)
         return self.run_existing_task(
@@ -1853,6 +1899,7 @@ class OrcaRuntimeHarness:
             phase=phase,
             base_spec=f"{role} iteration {iteration}: unexpected exit",
             run_id=self.run_id or "",
+            quality_profile=self.quality_profile,
         )
         task_id = self.create_task(spec)
         handle = self.create_fake_terminal(role, "exit", iteration=iteration)
@@ -2300,6 +2347,7 @@ def run_session_reuse_runtime_scenario(artifact_dir: Path) -> RuntimeScenarioRes
             phase=phase,
             base_spec=f"worker iteration {iteration}: {phase}",
             run_id=run_id,
+            quality_profile=harness.quality_profile,
         )
         worker, _ = harness.run_existing_task(
             "worker",
@@ -2334,6 +2382,7 @@ def run_session_reuse_runtime_scenario(artifact_dir: Path) -> RuntimeScenarioRes
             base_spec=f"reviewer iteration {iteration}: {phase}",
             evidence=reviewer_evidence,
             run_id=run_id,
+            quality_profile=harness.quality_profile,
         )
         reviewer, _ = harness.run_existing_task(
             "reviewer",
@@ -2363,12 +2412,22 @@ def _scenario_g(harness: OrcaRuntimeHarness) -> RuntimeScenarioResult:
     """Graph-first dependency promotion: no manual readiness override anywhere."""
     run_id = harness.start_run("Step 4 Scenario G graph-first dependency promotion")
     worker_spec = dispatch_context(
-        "worker", 1, "complete", phase=LIFECYCLE_SCENARIO_PHASE, run_id=run_id
+        "worker",
+        1,
+        "complete",
+        phase=LIFECYCLE_SCENARIO_PHASE,
+        run_id=run_id,
+        quality_profile=harness.quality_profile,
     )[0]
     worker_task = harness.create_task(worker_spec)
     reviewer_task = harness.create_task(
         dispatch_context(
-            "reviewer", 1, "pass", phase=LIFECYCLE_SCENARIO_PHASE, run_id=run_id
+            "reviewer",
+            1,
+            "pass",
+            phase=LIFECYCLE_SCENARIO_PHASE,
+            run_id=run_id,
+            quality_profile=harness.quality_profile,
         )[0],
         deps=(worker_task,),
     )
@@ -2405,7 +2464,12 @@ def _scenario_h(harness: OrcaRuntimeHarness) -> RuntimeScenarioResult:
     """Negative control: a dependent created after settlement stays pending forever."""
     run_id = harness.start_run("Step 4 Scenario H late dependent stays pending")
     worker_spec = dispatch_context(
-        "worker", 1, "complete", phase=LIFECYCLE_SCENARIO_PHASE, run_id=run_id
+        "worker",
+        1,
+        "complete",
+        phase=LIFECYCLE_SCENARIO_PHASE,
+        run_id=run_id,
+        quality_profile=harness.quality_profile,
     )[0]
     worker_task = harness.create_task(worker_spec)
     worker_attempt, _ = harness.run_existing_task(
