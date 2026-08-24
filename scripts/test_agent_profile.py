@@ -55,6 +55,7 @@ from scripts.agent_profile import (
     resolve_phase_role,
     select_agent_profile,
     validate_required_roles,
+    validate_routing_command_safety,
     validate_routing_commands,
 )
 from scripts.quality_profile import APPLICABLE_PHASES
@@ -113,6 +114,18 @@ def gate(routing, *, which=always_found) -> None:
         known_commands=KNOWN_COMMANDS,
         custom_command_pattern=CUSTOM_PATTERN,
         which=which,
+    )
+
+
+def gate_safety(routing) -> None:
+    """The static half only -- no `which`, because the function under test never
+    takes one. Its absence from the signature is itself part of what these tests
+    pin: PATH cannot leak into this gate even by accident."""
+    validate_routing_command_safety(
+        routing,
+        token_pattern=AGENT_COMMAND_PATTERN,
+        known_commands=KNOWN_COMMANDS,
+        custom_command_pattern=CUSTOM_PATTERN,
     )
 
 
@@ -349,6 +362,71 @@ class SelectionTests(unittest.TestCase):
 
         self.assertEqual(selection.status, SELECTION_SELECTED)
         self.assertEqual(selection.profile.source, SOURCE_PROJECT_LOCAL)
+
+    def test_a_malformed_user_global_file_does_not_block_a_valid_project_local_selection(
+        self,
+    ) -> None:
+        """The review fix, verbatim: project-local `diverse` is valid (setUp), and
+        a broken user-global file must not be able to fail that selection -- the
+        selected profile is a self-contained resolution domain, and a
+        lower-precedence source's condition is not part of that domain."""
+        (self.home / USER_PROFILE_RELATIVE_PATH).write_text(
+            "version: 9\nprofiles:\n  diverse:\n    defaults:\n      worker: c\n",
+            encoding="utf-8",
+        )
+
+        selection = self.select("diverse")
+
+        self.assertEqual(selection.status, SELECTION_SELECTED)
+        self.assertEqual(selection.profile.source, SOURCE_PROJECT_LOCAL)
+        self.assertEqual(selection.profile.default_for(ROLE_WORKER), "claude")
+
+    def test_user_global_is_not_even_opened_when_project_local_has_the_name(
+        self,
+    ) -> None:
+        """Stronger than the malformed-file case: a directory at the user-global
+        path raises the instant anything tries to read it as a document (see
+        SourcePrecedenceTests.test_a_directory_at_the_profile_path_is_invalid).
+        Selecting a project-local name must not trip that at all."""
+        (self.home / USER_PROFILE_RELATIVE_PATH).mkdir()
+
+        selection = self.select("diverse")
+
+        self.assertEqual(selection.status, SELECTION_SELECTED)
+        self.assertEqual(selection.profile.source, SOURCE_PROJECT_LOCAL)
+
+    def test_a_name_only_in_user_global_still_resolves_when_project_local_lacks_it(
+        self,
+    ) -> None:
+        """The fallback half of the same precedence rule: project-local parses
+        cleanly and simply does not have this name, so user-global is consulted
+        and wins -- short-circuiting to project-local must not mean skipping
+        user-global outright."""
+        (self.home / USER_PROFILE_RELATIVE_PATH).write_text(
+            "version: 1\nprofiles:\n  only_global:\n    defaults:\n      worker: codex\n",
+            encoding="utf-8",
+        )
+
+        selection = self.select("only_global")
+
+        self.assertEqual(selection.status, SELECTION_SELECTED)
+        self.assertEqual(selection.profile.source, SOURCE_USER_GLOBAL)
+
+    def test_a_malformed_user_global_file_is_reported_only_when_actually_needed(
+        self,
+    ) -> None:
+        """The mirror image of the first regression above: once project-local is
+        confirmed not to have the name, a malformed user-global file IS an error
+        -- it is genuinely needed now, not irrelevant."""
+        (self.home / USER_PROFILE_RELATIVE_PATH).write_text(
+            "version: 9\nprofiles:\n  p:\n    defaults:\n      worker: c\n",
+            encoding="utf-8",
+        )
+
+        selection = self.select("nosuch")
+
+        self.assertEqual(selection.status, SELECTION_INVALID)
+        self.assertEqual(selection.reason, REASON_INVALID_PROFILE)
 
     def test_an_empty_profile_value_is_unknown_not_omitted(self) -> None:
         selection = self.select("")
@@ -648,6 +726,166 @@ class RequiredCommandGateTests(unittest.TestCase):
         self.assertEqual(
             required, {("design", ROLE_WORKER), ("final_review", ROLE_FINAL_REVIEWER)}
         )
+
+
+class AllEntriesCommandSafetyTests(unittest.TestCase):
+    """validate_routing_command_safety(): token + allowlist over every RESOLVED
+    entry this routing materialized, required or not. This is the review fix --
+    an unused role must not be a channel for an unvalidated string to reach audit
+    evidence. PATH is deliberately absent from this gate; NonRequiredEntryTests
+    below still proves an unused-but-safe command missing from PATH does not
+    block anything, and that stays validate_routing_commands()'s job alone.
+    """
+
+    def routing(self, text, *, risk="low", phases=("analysis",), runtime=RUNTIME_ORCHESTRATION):
+        from scripts.agent_profile import AgentProfileSelection
+
+        profiles = load(text)
+        name = next(iter(profiles))
+        return materialize_run_routing(
+            runtime=runtime,
+            selection=AgentProfileSelection(
+                status=SELECTION_SELECTED, name=name, profile=profiles[name]
+            ),
+            requested_phases=phases,
+            risk=risk,
+        )
+
+    def assert_blocked(self, routing, reason) -> None:
+        with self.assertRaises(AgentProfileError) as caught:
+            gate_safety(routing)
+        self.assertEqual(caught.exception.reason, reason)
+
+    def test_an_unused_optional_reviewer_of_bash_is_agent_not_allowed(self) -> None:
+        """The review's own example: LOW leaves the phase Reviewer optional, and
+        the old required-only gate let `bash` sit there unvalidated."""
+        routing = self.routing(
+            "version: 1\nprofiles:\n  p:\n"
+            "    defaults:\n      worker: claude\n      reviewer: bash\n"
+            "    final_review:\n      reviewer: codex\n"
+        )
+
+        self.assert_blocked(routing, REASON_COMMAND_NOT_ALLOWED)
+
+    def test_an_unused_optional_reviewer_with_a_shell_fragment_is_invalid_agent_command(
+        self,
+    ) -> None:
+        routing = self.routing(
+            "version: 1\nprofiles:\n  p:\n"
+            "    defaults:\n      worker: claude\n"
+            '      reviewer: "claude && rm -rf /"\n'
+            "    final_review:\n      reviewer: codex\n"
+        )
+
+        self.assert_blocked(routing, REASON_INVALID_COMMAND)
+
+    def test_an_unused_optional_reviewer_with_a_space_containing_value_is_invalid_agent_command(
+        self,
+    ) -> None:
+        routing = self.routing(
+            "version: 1\nprofiles:\n  p:\n"
+            "    defaults:\n      worker: claude\n"
+            '      reviewer: "my agent"\n'
+            "    final_review:\n      reviewer: codex\n"
+        )
+
+        self.assert_blocked(routing, REASON_INVALID_COMMAND)
+
+    def test_an_unused_optional_reviewer_shaped_like_a_credential_is_not_allowed(
+        self,
+    ) -> None:
+        """A raw secret-shaped string passes the token pattern (it is just
+        alphanumeric-and-dashes) but is not on the allowlist and does not match
+        the claude-/codex- wrapper pattern, so it is refused before it can ever
+        reach `detail=command=...` in an evidence row."""
+        routing = self.routing(
+            "version: 1\nprofiles:\n  p:\n"
+            "    defaults:\n      worker: claude\n"
+            "      reviewer: sk-ant-api03-not-a-real-key-0000000000\n"
+            "    final_review:\n      reviewer: codex\n"
+        )
+
+        self.assert_blocked(routing, REASON_COMMAND_NOT_ALLOWED)
+
+    def test_an_out_of_request_phase_command_is_still_untouched(self) -> None:
+        """This gate is scoped to MATERIALIZED entries (requested phases plus
+        Final Review), not the raw profile document. A phase this run never
+        requested was never materialized and stays outside both gates -- that is
+        the existing, unchanged, intentional boundary NonRequiredEntryTests pins
+        for validate_routing_commands(); this test pins the same boundary for the
+        new safety gate so the two do not quietly drift apart."""
+        routing = self.routing(
+            "version: 1\nprofiles:\n  p:\n"
+            "    defaults:\n      worker: claude\n      reviewer: codex\n"
+            "    phases:\n      refactoring:\n        worker: bash\n"
+        )
+
+        gate_safety(routing)
+
+    def test_loop_never_materializes_a_final_review_entry_to_check(self) -> None:
+        """Loop has no Final Adversarial Review, so materialize_run_routing()
+        never creates a final_review entry for it at all -- there is nothing for
+        this gate (or any gate) to see, safe or not. Mirrors
+        NonRequiredEntryTests.test_loop_ignores_a_disallowed_final_review_reviewer
+        for the new safety gate, so the two cannot quietly drift apart."""
+        routing = self.routing(
+            "version: 1\nprofiles:\n  p:\n"
+            "    defaults:\n      worker: claude\n      reviewer: codex\n"
+            "    final_review:\n      reviewer: bash\n",
+            runtime=RUNTIME_LOOP,
+            risk=None,
+        )
+
+        self.assertIsNone(routing.for_role("final_review", ROLE_FINAL_REVIEWER))
+        gate_safety(routing)  # must not raise: nothing was materialized to check
+
+    def test_a_disallowed_final_review_reviewer_is_not_allowed_for_orchestration(
+        self,
+    ) -> None:
+        """Orchestration DOES materialize this entry (it has a Final Adversarial
+        Review), so it owes the same static safety as any other entry."""
+        routing = self.routing(
+            "version: 1\nprofiles:\n  p:\n"
+            "    defaults:\n      worker: claude\n      reviewer: codex\n"
+            "    final_review:\n      reviewer: bash\n"
+        )
+
+        self.assert_blocked(routing, REASON_COMMAND_NOT_ALLOWED)
+
+    def test_an_unused_but_safe_entry_passes_with_no_which_call(self) -> None:
+        """Positive control, paired with the four negatives above: a resolved,
+        allowlisted, unused command is never blocked by this gate, and the gate
+        needs no `which` to decide that -- proving PATH truly plays no part."""
+        routing = self.routing(
+            "version: 1\nprofiles:\n  p:\n"
+            "    defaults:\n      worker: claude\n      reviewer: claude-glm\n"
+            "    final_review:\n      reviewer: codex\n"
+        )
+
+        gate_safety(routing)  # must not raise
+
+    def test_the_safety_gate_target_set_is_every_resolved_entry(self) -> None:
+        """Contrast with test_the_gate_target_set_is_exactly_required_entries
+        directly above: required_entries() is a strict subset of what this gate
+        checks, not the whole set."""
+        routing = self.routing(VALID, risk="low", phases=("design",))
+
+        targets = {
+            (entry.phase, entry.role)
+            for entry in routing.entries
+            if entry.resolved
+        }
+        required = {(entry.phase, entry.role) for entry in routing.required_entries()}
+
+        self.assertEqual(
+            targets,
+            {
+                ("design", ROLE_WORKER),
+                ("design", ROLE_REVIEWER),
+                ("final_review", ROLE_FINAL_REVIEWER),
+            },
+        )
+        self.assertLess(required, targets)
 
 
 class NonRequiredEntryTests(unittest.TestCase):

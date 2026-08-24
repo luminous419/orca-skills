@@ -19,6 +19,7 @@ try:  # pragma: no cover - import shim, exercised by both invocation forms
         materialize_run_routing,
         select_agent_profile,
         validate_required_roles,
+        validate_routing_command_safety,
         validate_routing_commands,
     )
 except ImportError:  # pragma: no cover - same module, flat import path
@@ -30,6 +31,7 @@ except ImportError:  # pragma: no cover - same module, flat import path
         materialize_run_routing,
         select_agent_profile,
         validate_required_roles,
+        validate_routing_command_safety,
         validate_routing_commands,
     )
 
@@ -282,9 +284,11 @@ def evaluate_invocation(
     # execute. Checking an explicit value here would block a run over a role that
     # is optional at this risk level and will never be dispatched.
     #
-    # For Branch B the gate is validate_routing_commands(), over the materialized
-    # required routing, at the bottom of this function. That is the only place a
-    # profile-path command is judged.
+    # For Branch B the gate is two functions in _resolve_agent_routing():
+    # validate_routing_command_safety() over EVERY resolved entry (token +
+    # allowlist, required or not -- this is what evidence_rows() will record),
+    # then validate_routing_commands() over required_entries() only (adds PATH).
+    # Those are the only places a profile-path command is judged.
     profile_selected = "profile" in explicit
     worker = explicit.get("worker", "" if profile_selected else defaults["worker"])
     reviewer = explicit.get("reviewer", "" if profile_selected else defaults["reviewer"])
@@ -527,6 +531,17 @@ def _resolve_agent_routing(
         explicit_reviewer=decision.reviewer or "",
     )
     try:
+        # Static safety first, over EVERY resolved entry (required or not) --
+        # this is the set evidence_rows() will later record, so nothing reaches
+        # audit evidence without having passed token+allowlist. PATH is a
+        # narrower, environment-only question and is checked second, for
+        # required_entries() only.
+        validate_routing_command_safety(
+            routing,
+            token_pattern=AGENT_COMMAND_PATTERN,
+            known_commands=known_commands,
+            custom_command_pattern=custom_command_pattern,
+        )
         validate_routing_commands(
             routing,
             token_pattern=AGENT_COMMAND_PATTERN,

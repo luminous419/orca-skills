@@ -16,12 +16,17 @@ Two things in this module are deliberate and easy to undo by accident:
    are actually required -- and a command in a role this run never dispatches must
    not be able to block the run.
 
-2. The gate therefore lives in exactly one place: validate_routing_commands(),
-   over routing.required_entries() only. That set is precisely the set of commands
-   this run can execute (an optional LOW-risk phase Reviewer, a loop run's
-   final_review.reviewer, and any phase outside the request are never dispatched),
-   so restricting the gate to it leaves no hole in the trust boundary while
-   letting an unused command be anything at all.
+2. The gate is therefore two functions, not one, each scoped to a different set
+   and a different question. validate_routing_command_safety() asks "is this a
+   safe, allowlisted command token" of every resolved entry in routing.entries --
+   required or not, because that is exactly the set evidence_rows() records, and
+   an unvalidated string must never reach the audit log even in an unused role.
+   validate_routing_commands() asks "does this command actually exist" of
+   routing.required_entries() only -- PATH is an environment fact, not a trust
+   question, and an unused-but-syntactically-safe command need not be installed.
+   Splitting the two means a `bash` sitting in an unused role is refused before a
+   Run ever exists, while an unused-but-valid command that simply is not on this
+   machine's PATH does not block anything.
 
 Standard library only, like every other module in scripts/. The restricted-subset
 YAML reader is reused from scripts.quality_profile rather than re-implemented:
@@ -485,7 +490,15 @@ def _read_source(path: Path, display: str, source: str) -> tuple[tuple[str, Agen
 def discover_agent_profiles(
     *, project_root: Path | str = ".", home: Path | str | None = None
 ) -> tuple[dict[str, AgentProfile], tuple[str, ...]]:
-    """Load both sources and apply whole-definition precedence.
+    """Load and merge BOTH sources eagerly, for enumeration.
+
+    Not used by select_agent_profile() (see there): resolving one requested name
+    must stop at the first source that has it, so that a lower-precedence source's
+    condition can never affect a selection the higher-precedence source already
+    answered. This function answers a different question -- "what profiles exist
+    across both sources" -- for which reading both is the correct behaviour, and a
+    malformed lower-precedence file is correctly an error here even if the name a
+    caller eventually wants lives entirely in the higher-precedence one.
 
     `home` is a parameter, not a lookup, because a developer's real
     ~/.orca/agent-profiles.yaml must never reach a test run. Production passes
@@ -523,6 +536,15 @@ def select_agent_profile(
     `name is None` means the parameter was omitted -- the legacy path, which does
     not read either source file. An empty string means the user wrote `profile=`
     with no value, which is an explicit invalid value rather than an omission.
+
+    Unlike discover_agent_profiles() (which parses BOTH sources unconditionally,
+    for enumeration), this walks SOURCE_PRECEDENCE one source at a time and stops
+    at the first one that actually contains `name`. That is the whole fix: the
+    selected profile is a self-contained resolution domain, so a lower-precedence
+    source's condition -- malformed, unreadable, a directory, anything -- must
+    never be able to fail a selection the higher-precedence source already
+    answered. Only when project-local parses cleanly and does not contain `name`
+    is user-global even opened.
     """
     if name is None:
         return AgentProfileSelection(status=SELECTION_OMITTED)
@@ -533,23 +555,43 @@ def select_agent_profile(
             reason=REASON_UNKNOWN_PROFILE,
             error="profile= was given with no value",
         )
-    try:
-        profiles, searched = discover_agent_profiles(project_root=project_root, home=home)
-    except AgentProfileError as exc:
-        return AgentProfileSelection(
-            status=SELECTION_INVALID, name=name, reason=exc.reason, error=str(exc)
-        )
-    profile = profiles.get(name)
-    if profile is None:
-        return AgentProfileSelection(
-            status=SELECTION_INVALID,
-            name=name,
-            reason=REASON_UNKNOWN_PROFILE,
-            error=f"no profile named {name!r} in {', '.join(searched)}",
-            searched=searched,
-        )
+    home_path = Path.home() if home is None else Path(home)
+    candidates = (
+        (SOURCE_PROJECT_LOCAL, Path(project_root) / PROJECT_PROFILE_RELATIVE_PATH,
+         PROJECT_PROFILE_RELATIVE_PATH),
+        (SOURCE_USER_GLOBAL, home_path / USER_PROFILE_RELATIVE_PATH,
+         f"~/{USER_PROFILE_RELATIVE_PATH}"),
+    )
+    searched: list[str] = []
+    for source, path, display in candidates:
+        searched.append(display)
+        try:
+            profiles = dict(_read_source(path, display, source))
+        except AgentProfileError as exc:
+            return AgentProfileSelection(
+                status=SELECTION_INVALID,
+                name=name,
+                reason=exc.reason,
+                error=str(exc),
+                searched=tuple(searched),
+            )
+        profile = profiles.get(name)
+        if profile is not None:
+            return AgentProfileSelection(
+                status=SELECTION_SELECTED,
+                name=name,
+                profile=profile,
+                searched=tuple(searched),
+            )
+        # This source parsed cleanly and simply does not have `name`. Fall through
+        # to the next (lower-precedence) source rather than treating that as
+        # unknown yet -- unknown is only true once every source has been tried.
     return AgentProfileSelection(
-        status=SELECTION_SELECTED, name=name, profile=profile, searched=searched
+        status=SELECTION_INVALID,
+        name=name,
+        reason=REASON_UNKNOWN_PROFILE,
+        error=f"no profile named {name!r} in {', '.join(searched)}",
+        searched=tuple(searched),
     )
 
 
@@ -693,7 +735,54 @@ def materialize_run_routing(
     )
 
 
-# ---- the one command gate ----------------------------------------------------------------
+# ---- the static safety gate --------------------------------------------------------------
+
+
+def validate_routing_command_safety(
+    routing: RunRouting,
+    *,
+    token_pattern: re.Pattern[str],
+    known_commands: Iterable[str],
+    custom_command_pattern: re.Pattern[str],
+) -> None:
+    """Apply the STATIC half of the agent-command trust boundary -- token shape and
+    allowlist membership, never PATH -- to every resolved entry this routing
+    carries, required or not.
+
+    `routing.entries` is exactly the set `evidence_rows()` records (optional
+    entries included) and exactly the set a selected profile can populate for this
+    run's requested phases plus, for orchestration, the Final Reviewer. An unused
+    role being merely absent from PATH is not a safety problem -- nothing will try
+    to run it -- but an unused role holding `bash`, a shell fragment, or a
+    credential-shaped string is a safety problem the moment it reaches audit
+    evidence verbatim, whether or not this run happens to dispatch it. That is
+    the boundary this function closes: PATH availability stays scoped to
+    routing.required_entries() in validate_routing_commands(), but token shape and
+    allowlist membership apply here, unconditionally, before evidence can ever be
+    written and before the Run exists.
+    """
+    allowed = set(known_commands)
+    targets = tuple(entry for entry in routing.entries if entry.resolved)
+
+    for entry in targets:
+        if not token_pattern.fullmatch(entry.command):
+            raise AgentProfileError(
+                f"{entry.phase}.{entry.role}: {entry.command!r} is not a simple "
+                "PATH command token",
+                reason=REASON_INVALID_COMMAND,
+            )
+    for entry in targets:
+        if entry.command not in allowed and not custom_command_pattern.fullmatch(
+            entry.command
+        ):
+            raise AgentProfileError(
+                f"{entry.phase}.{entry.role}: {entry.command!r} is outside the "
+                "agent trust boundary",
+                reason=REASON_COMMAND_NOT_ALLOWED,
+            )
+
+
+# ---- the availability gate -----------------------------------------------------------------
 
 
 def validate_routing_commands(
@@ -704,22 +793,23 @@ def validate_routing_commands(
     custom_command_pattern: re.Pattern[str],
     which: Callable[[str], str | None] = shutil.which,
 ) -> None:
-    """Apply the existing agent-command boundary to required routing, and only that.
+    """Apply the full agent-command boundary -- token, allowlist, AND PATH -- to
+    required routing, and only required routing.
 
-    The three checks and their order are the repository's existing ones, moved to a
-    different target set rather than reinvented. Gate-major (three passes over the
-    same entries) rather than entry-major, so that when two entries fail different
-    checks the reported code matches what the legacy path would have reported:
-    every token is judged before any allowlist, and every allowlist before any PATH
-    lookup.
+    Call this AFTER validate_routing_command_safety() has already cleared every
+    entry's token and allowlist, required or not; the two token/allowlist passes
+    here re-check required entries specifically so the reported error and its
+    ordering match exactly what the legacy (no-profile) path would have reported
+    for the same command, then add the one check safety-only cannot make: PATH
+    existence, which is the deliberately narrower gate.
 
-    The target set is required_entries(). An optional or non-consumed entry is
-    never dispatched, so its command cannot reach execution and must not be able to
-    block the run -- an unused `phases.refactoring.worker` on a run that asked only
-    for `analysis`, a LOW-risk phase Reviewer, a loop run's final_review.reviewer.
-
-    The trust boundary is unaffected by that narrowing: required_entries() is
-    exactly the set of commands this run can execute.
+    The PATH target set is required_entries(). An optional or non-consumed entry
+    is never dispatched, so its command cannot reach execution and must not be
+    able to block the run over an environment fact -- an unused
+    `phases.refactoring.worker` on a run that asked only for `analysis`, a
+    LOW-risk phase Reviewer, a loop run's final_review.reviewer. Static safety for
+    those same entries already happened in validate_routing_command_safety(); this
+    function narrows only the availability check, never the trust boundary.
 
     Unresolved required entries are not this function's business; validate_required_roles()
     reports those, with the reason code that says a role is missing rather than wrong.

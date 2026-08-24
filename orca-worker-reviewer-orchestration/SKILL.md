@@ -320,6 +320,13 @@ user-global    ~/.orca/agent-profiles.yaml
 같은 이름이 양쪽에 있으면 **project-local 정의가 통째로 이긴다.** field-level merge는 하지 않는다 —
 project-local이 생략한 필드를 user-global에서 빌려오지 않는다.
 
+resolution은 **short-circuit**한다. requested profile을 project-local에서 먼저 찾고, 거기 있으면
+그 정의로 즉시 확정한다 — user-global 파일은 이 경우 아예 열지 않는다. project-local에 그 이름이
+없을 때에만 user-global을 consult한다. project-local 자체가 malformed면 (그 파일이 요청된 이름을
+가졌는지 판단할 수 없으므로) 그대로 fail closed하지만, project-local이 정상적으로 파싱되어 요청된
+profile을 찾았다면 user-global 파일의 상태 — malformed든 무엇이든 — 는 그 selection에 영향을 주지
+않는다.
+
 schema는 다음이 전부다.
 
 ```yaml
@@ -358,16 +365,20 @@ default 처리, `WORKER_REVIEWER_MUST_DIFFER` 검사가 지금과 동일하게 �
 `profile`이 명시된 경우 Run/Task/Dispatch를 만들기 **전에** 다음 순서로 처리한다.
 
 ```text
-1. profile source 읽기 + schema 검증   (여기서는 command를 검사하지 않는다)
+1. profile source 읽기 + schema 검증        (여기서는 command를 검사하지 않는다)
 2. requested phase와 Final Review에 대한 routing materialize
-3. required role의 resolved command에만 token -> allowlist -> PATH 검사
-4. required role이 전부 resolve되었는지 검사
-5. 위가 모두 통과한 경우에만 Run 생성
+3. materialize된 모든 resolved entry에 token -> allowlist 검사 (required 여부와 무관)
+4. required role의 resolved command에만 PATH 검사
+5. required role이 전부 resolve되었는지 검사
+6. 위가 모두 통과한 경우에만 Run 생성
 ```
 
-3번의 검사 대상은 **required role뿐**이다. 이 run이 dispatch하지 않는 role — requested phase 밖의
-routing이 대표적이다 — 의 command는 검사하지 않으며 run을 막지 않는다. required role은 이 run에서
-실행될 수 있는 command 집합과 정확히 같으므로 trust boundary에는 빈틈이 없다.
+3번의 검사 대상은 이 run이 materialize한 **모든 resolved entry**다 — required든 optional이든 상관없다.
+audit evidence가 optional entry를 포함해 모든 entry를 기록하므로, token/allowlist를 통과하지 못한
+command는 required 여부와 무관하게 애초에 evidence에 도달하지 못한다. 4번의 PATH 검사만
+**required role로 좁힌다** — PATH 존재 여부는 trust 문제가 아니라 이 machine의 환경 사실이며, dispatch되지
+않는 role의 command가 설치되어 있지 않다는 이유로 run을 막을 필요는 없다. required role은 이 run에서
+실행될 수 있는 command 집합과 정확히 같으므로 이 좁힘이 trust boundary에 빈틈을 만들지 않는다.
 
 profile을 arbitrary shell execution 통로로 쓰지 않는다. resolved command에는 §5의 기존 agent
 command 정책(safe token / trust boundary / PATH resolution)을 그대로 적용하며 인자를 붙이지 않는다.

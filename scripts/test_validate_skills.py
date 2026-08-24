@@ -728,14 +728,25 @@ class ValidatorRegressionTests(unittest.TestCase):
             "missing the profile=<name> runtime parameter"
         )
 
-    def test_a_skill_losing_the_required_only_gate_scope_fails(self) -> None:
-        """The prose that keeps the command gate from widening back out."""
+    def test_a_skill_losing_the_all_entries_safety_scope_fails(self) -> None:
+        """The prose that keeps token/allowlist from narrowing back to required-only."""
         self.mutate_orchestration_skill(
-            "검사 대상은 **required role뿐**이다", "검사 대상은 모든 role이다"
+            "모든 resolved entry에 token -> allowlist 검사 (required 여부와 무관)",
+            "required role에만 token -> allowlist 검사",
         )
 
         self.assert_lifecycle_contract_rejected(
-            "missing the required-role-only command gate scope"
+            "missing the all-entries token/allowlist safety scope"
+        )
+
+    def test_a_skill_losing_the_required_only_path_scope_fails(self) -> None:
+        """The prose that keeps the PATH check from widening back out to every role."""
+        self.mutate_orchestration_skill(
+            "**required role로 좁힌다**", "**모든 role에 적용한다**"
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "missing the required-role-only PATH gate scope"
         )
 
     def test_risk_downstream_revalidation_widened_fails(self) -> None:

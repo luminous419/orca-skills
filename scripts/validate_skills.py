@@ -480,8 +480,14 @@ LOOP_AGENT_PROFILE_PROSE_ANCHORS = (
 AGENT_PROFILE_LEGACY_PROSE_ANCHOR = (
     "`profile`을 생략하면 기존 동작을 그대로 유지한다"
 )
-# The required-only rule, in the prose a reader actually meets.
-AGENT_PROFILE_REQUIRED_ONLY_PROSE_ANCHOR = "검사 대상은 **required role뿐**이다"
+# The two-gate split, in the prose a reader actually meets: token/allowlist over
+# every resolved entry, PATH narrowed to required roles only.
+AGENT_PROFILE_SAFETY_ALL_ENTRIES_PROSE_ANCHOR = (
+    "모든 resolved entry에 token -> allowlist 검사 (required 여부와 무관)"
+)
+AGENT_PROFILE_PATH_REQUIRED_ONLY_PROSE_ANCHOR = (
+    "PATH 검사만\n**required role로 좁힌다**"
+)
 # Section 6 must say that risk chooses which graph NODES exist, never WHEN they are
 # created -- the sentence that keeps LOW from leaving an orphan ready Reviewer Task.
 RISK_TASK_GRAPH_PROSE_ANCHOR = "LOW에서는 Worker Task 하나만 만들고"
@@ -1822,8 +1828,12 @@ def validate_agent_profile_contract(validation: Validation) -> None:
             f"{skill_dir.name}: missing the omitted-profile legacy guarantee",
         )
         validation.check(
-            AGENT_PROFILE_REQUIRED_ONLY_PROSE_ANCHOR in text,
-            f"{skill_dir.name}: missing the required-role-only command gate scope",
+            AGENT_PROFILE_SAFETY_ALL_ENTRIES_PROSE_ANCHOR in text,
+            f"{skill_dir.name}: missing the all-entries token/allowlist safety scope",
+        )
+        validation.check(
+            AGENT_PROFILE_PATH_REQUIRED_ONLY_PROSE_ANCHOR in text,
+            f"{skill_dir.name}: missing the required-role-only PATH gate scope",
         )
 
     loop_text = (
