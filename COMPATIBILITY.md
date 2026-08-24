@@ -74,6 +74,20 @@ still cleaned up only through the installed version-matched guides and runtime r
 arbitrary process kills or undocumented cleanup remain unacceptable. Detailed evidence is
 in [`STEP5_REAL_GLM_GEMMA_SMOKE_REPORT.md`](STEP5_REAL_GLM_GEMMA_SMOKE_REPORT.md).
 
+## Agent Profile
+
+Agent Profile is an optional abstraction and requires no Orca version beyond what the two
+skills already need. It changes which agent command each phase runs, not how Orca is
+driven: no new orchestration or CLI verb is used, no argument is added to an agent launch,
+and the Run/Task/Dispatch lifecycle is unchanged.
+
+An invocation without `profile=` behaves exactly as it did before the feature existed —
+the profile files are not read, so a malformed or unreadable `~/.orca/agent-profiles.yaml`
+cannot affect a run that does not ask for a profile.
+
+Profile files are plain data read with the repository's own restricted-subset YAML reader;
+no third-party dependency is introduced.
+
 ## Stable release blockers
 
 - **License decision:** the owner must select and add a license as documented in

@@ -929,6 +929,160 @@ class RunArtifactRootProvisioningTests(OfflineHarnessTestCase):
         self.assertEqual(sorted(path.name for path in runs_dir.iterdir()), ["run_one", "run_two"])
 
 
+class AgentRoutingEvidenceTests(OfflineHarnessTestCase):
+    """OS-4: the routing a run resolved must actually reach ORCHESTRATOR_LOG.md.
+
+    start_run() is called for real here, for the same reason
+    RunArtifactRootProvisioningTests calls it: build() never runs it, so a writer
+    that is defined but never invoked would ship unnoticed -- which is exactly the
+    gap the implementation review caught.
+    """
+
+    PROFILE = (
+        "version: 1\n"
+        "profiles:\n"
+        "  diverse:\n"
+        "    defaults:\n      worker: claude\n      reviewer: codex\n"
+        "    final_review:\n      reviewer: codex\n"
+    )
+
+    def routing(self, *, risk="low"):
+        from scripts.agent_profile import (
+            RUNTIME_ORCHESTRATION,
+            load_agent_profiles_text,
+            materialize_run_routing,
+            AgentProfileSelection,
+            SELECTION_SELECTED,
+        )
+
+        profiles = dict(
+            load_agent_profiles_text(
+                self.PROFILE, path=".orca/agent-profiles.yaml", source="project_local"
+            )
+        )
+        return materialize_run_routing(
+            runtime=RUNTIME_ORCHESTRATION,
+            selection=AgentProfileSelection(
+                status=SELECTION_SELECTED, name="diverse", profile=profiles["diverse"]
+            ),
+            requested_phases=("analysis",),
+            risk=risk,
+        )
+
+    def start(self, routing):
+        recorder = RecordingExec(results={"run-create": {"run": {"id": "run_ev"}}})
+        with patch.dict(environ, {"ORCA_CLI_COMMAND": "/opt/orca-dev"}):
+            harness = OrcaRuntimeHarness(self.artifact_dir, agent_routing=routing)
+        harness._exec_orca = recorder
+        harness.start_run("evidence run", requested_phases=("analysis",))
+        log = (
+            self.artifact_dir
+            / "artifacts"
+            / "runs"
+            / "run_ev"
+            / "ORCHESTRATOR_LOG.md"
+        )
+        return harness, log.read_text(encoding="utf-8")
+
+    def test_a_selected_profile_writes_its_rows_at_run_start(self) -> None:
+        _, log = self.start(self.routing())
+
+        self.assertIn("agent_profile_selected", log)
+        self.assertIn("profile=diverse source=project_local", log)
+        self.assertIn("agent_routing_resolved", log)
+        self.assertIn("command=claude origin=defaults", log)
+
+    def test_a_low_risk_optional_reviewer_is_in_the_log(self) -> None:
+        """Optional is a dispatch requirement, never an evidence exemption."""
+        _, log = self.start(self.routing(risk="low"))
+        rows = [line for line in log.splitlines() if "agent_routing_resolved" in line]
+
+        reviewer = [row for row in rows if "| reviewer |" in row]
+
+        self.assertEqual(len(reviewer), 1, rows)
+        self.assertIn("optional", reviewer[0])
+
+    def test_the_final_reviewer_is_in_the_log(self) -> None:
+        _, log = self.start(self.routing())
+        rows = [line for line in log.splitlines() if "final_reviewer" in line]
+
+        self.assertTrue(rows)
+        self.assertIn("required", rows[0])
+
+    def test_a_legacy_run_writes_no_agent_profile_row(self) -> None:
+        """The byte-identity claim, at the log surface."""
+        _, log = self.start(None)
+
+        self.assertNotIn("agent_profile_selected", log)
+        self.assertNotIn("agent_routing_resolved", log)
+
+    def test_the_writer_reports_how_many_rows_it_wrote(self) -> None:
+        harness, _ = self.start(self.routing())
+
+        # One selection row plus one per entry (worker, reviewer, final reviewer).
+        self.assertEqual(harness.log_agent_routing_evidence(), 4)
+
+
+class AgentRoutingDispatchTests(OfflineHarnessTestCase):
+    """The routing must reach the dispatched spec and the reuse ledger, not just a log."""
+
+    def test_a_dispatched_spec_carries_the_routing_block(self) -> None:
+        from scripts.agent_profile import (
+            RUNTIME_ORCHESTRATION,
+            load_agent_profiles_text,
+            materialize_run_routing,
+            AgentProfileSelection,
+            SELECTION_SELECTED,
+        )
+        from scripts.orca_runtime_harness import dispatch_context
+        from scripts.task_context import parse_agent_routing_keys, AGENT_ROUTING_KEYS
+
+        profiles = dict(
+            load_agent_profiles_text(
+                AgentRoutingEvidenceTests.PROFILE,
+                path=".orca/agent-profiles.yaml",
+                source="project_local",
+            )
+        )
+        routing = materialize_run_routing(
+            runtime=RUNTIME_ORCHESTRATION,
+            selection=AgentProfileSelection(
+                status=SELECTION_SELECTED, name="diverse", profile=profiles["diverse"]
+            ),
+            requested_phases=("analysis",),
+            risk="high",
+        )
+
+        spec, _, _ = dispatch_context(
+            "worker",
+            1,
+            "complete",
+            phase="analysis",
+            run_id="run_ev",
+            requested_phases=("analysis",),
+            agent_routing=routing,
+        )
+
+        self.assertEqual(parse_agent_routing_keys(spec), AGENT_ROUTING_KEYS)
+        self.assertIn("agent_profile: diverse", spec)
+
+    def test_a_legacy_dispatch_renders_no_routing_block(self) -> None:
+        from scripts.orca_runtime_harness import dispatch_context
+        from scripts.task_context import parse_agent_routing_keys
+
+        spec, _, _ = dispatch_context(
+            "worker",
+            1,
+            "complete",
+            phase="analysis",
+            run_id="run_ev",
+            requested_phases=("analysis",),
+        )
+
+        self.assertEqual(parse_agent_routing_keys(spec), ())
+        self.assertNotIn("AGENT ROUTING", spec)
+
+
 class UnsupervisedSettlementTests(OfflineHarnessTestCase):
     """Goal 1: a Dispatch with no supervised worker resource never gets released.
 

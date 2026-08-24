@@ -1,0 +1,76 @@
+# Agent Profile -- generic example.
+#
+# Copy this file to `.orca/agent-profiles.yaml` (project-local) or
+# `~/.orca/agent-profiles.yaml` (user-global) and replace the commands with the
+# agent commands your environment actually has on PATH.
+#
+# An Agent Profile answers WHO executes each phase. It does not change WHAT runs
+# (`phases`), HOW STRONGLY the work is reviewed (`risk`), or WHAT COUNTS AS PASS
+# (the project quality profile). Selecting a profile can never turn a review off,
+# add a phase, or make a failing gate pass.
+#
+# Schema (this is all of it):
+#
+#   version        integer, currently 1
+#   profiles       mapping of profile name -> profile
+#     defaults     optional; worker and/or reviewer used when a phase says nothing
+#     phases       optional; per-phase worker/reviewer for any of the seven phases
+#                  (analysis, plan, design, implementation, test, bugfix,
+#                  refactoring)
+#     final_review optional; reviewer for the final review gate
+#
+# Resolution order, per role. Note that the phase roles and the final reviewer
+# disagree about which source wins first, on purpose:
+#
+#   phase worker    explicit worker=   > phases.<phase>.worker   > defaults.worker
+#   phase reviewer  explicit reviewer= > phases.<phase>.reviewer > defaults.reviewer
+#   final reviewer  final_review.reviewer > explicit reviewer=   > defaults.reviewer
+#
+# A profile named in BOTH source files is taken from the project-local file as a
+# whole definition. Fields are never merged across the two files, so a profile you
+# can read in one place is the profile that ran.
+#
+# Declaring routing for a phase does not run that phase. Which phases run is
+# decided by `phases=` alone.
+#
+# A role that no requested phase will dispatch does not have to resolve, and its
+# command is not checked. At LOW risk the orchestration skill runs no phase
+# Reviewer, so the profile below is valid there even though `analysis` names no
+# reviewer -- at MEDIUM or HIGH the same run would stop with
+# AGENT_ROLE_UNRESOLVED. The loop skill has no risk axis and always reviews, so
+# every phase needs a reviewer there.
+
+version: 1
+
+profiles:
+
+  # Different vendors on either side of each gate, so the reviewer is not checking
+  # its own habits. This is the case the feature exists for.
+  diverse:
+    defaults:
+      worker: claude
+      reviewer: codex
+    phases:
+      analysis:
+        worker: claude
+        reviewer: codex
+      design:
+        # The same command on both sides is allowed. The sessions are still
+        # separate -- a Worker session is never reused as a Reviewer session.
+        worker: claude
+        reviewer: claude
+      implementation:
+        worker: codex
+        reviewer: codex
+      test:
+        worker: codex
+        reviewer: claude
+    final_review:
+      reviewer: codex
+
+  # Everything on one command. Equivalent to a plain worker=/reviewer= invocation,
+  # written down so a team can name it.
+  uniform:
+    defaults:
+      worker: claude
+      reviewer: claude

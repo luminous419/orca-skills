@@ -18,6 +18,10 @@ from scripts.quality_profile import (
     resolve_quality_profile,
 )
 from scripts.task_context import (
+    AGENT_ROUTING_KEYS,
+    build_agent_routing_context,
+    parse_agent_routing,
+    parse_agent_routing_keys,
     RISK_CONTEXT_KEYS,
     RISK_SPEC_HEADER,
     build_risk_context,
@@ -469,6 +473,91 @@ class RiskProfileBlockTests(unittest.TestCase):
         self.assertEqual(parse_risk_profile_keys(spec), ())
         with self.assertRaises(TaskContextError):
             parse_risk_profile(spec)
+
+
+class AgentRoutingContextTests(unittest.TestCase):
+    """OS-4's third block: disjoint from the other two, and absent on the legacy path."""
+
+    def routing(self, *, risk="low"):
+        from scripts.agent_profile import (
+            RUNTIME_ORCHESTRATION,
+            SELECTION_SELECTED,
+            AgentProfileSelection,
+            load_agent_profiles_text,
+            materialize_run_routing,
+        )
+
+        profiles = dict(
+            load_agent_profiles_text(
+                "version: 1\nprofiles:\n  p:\n"
+                "    defaults:\n      worker: claude\n      reviewer: codex\n"
+                "    final_review:\n      reviewer: codex\n",
+                path="test.yaml",
+                source="project_local",
+            )
+        )
+        return materialize_run_routing(
+            runtime=RUNTIME_ORCHESTRATION,
+            selection=AgentProfileSelection(
+                status=SELECTION_SELECTED, name="p", profile=profiles["p"]
+            ),
+            requested_phases=("analysis",),
+            risk=risk,
+        )
+
+    def test_the_three_axis_key_sets_are_disjoint(self) -> None:
+        """Agent routing, risk and the quality gate are three independent axes."""
+        self.assertEqual(set(AGENT_ROUTING_KEYS) & set(RISK_CONTEXT_KEYS), set())
+        self.assertEqual(set(AGENT_ROUTING_KEYS) & set(QUALITY_GATE_KEYS), set())
+
+    def test_the_builder_reads_the_routing_without_re_resolving(self) -> None:
+        context = build_agent_routing_context(
+            routing=self.routing(), current_phase="analysis"
+        )
+
+        self.assertEqual(context["agent_profile"], "p")
+        self.assertEqual(context["agent_profile_source"], "project_local")
+        self.assertEqual(context["phase_worker"], "claude")
+        self.assertEqual(context["final_reviewer"], "codex")
+        self.assertEqual(context["routing_mutability"], "immutable_for_this_run")
+
+    def test_every_key_is_rendered_and_parses_back(self) -> None:
+        context = build_agent_routing_context(
+            routing=self.routing(), current_phase="analysis"
+        )
+        spec = render_task_spec(
+            "body", self.boundary(), agent_routing=context
+        )
+
+        self.assertEqual(parse_agent_routing_keys(spec), AGENT_ROUTING_KEYS)
+        self.assertEqual(parse_agent_routing(spec), context)
+
+    def test_omitting_the_argument_renders_a_byte_identical_spec(self) -> None:
+        """The legacy path passes nothing, so its spec cannot grow a routing block."""
+        boundary = self.boundary()
+
+        self.assertEqual(
+            render_task_spec("body", boundary),
+            render_task_spec("body", boundary, agent_routing=None),
+        )
+        self.assertNotIn("AGENT ROUTING", render_task_spec("body", boundary))
+        self.assertEqual(parse_agent_routing_keys(render_task_spec("body", boundary)), ())
+
+    def test_a_legacy_spec_has_no_routing_block_to_parse(self) -> None:
+        with self.assertRaises(TaskContextError):
+            parse_agent_routing(render_task_spec("body", self.boundary()))
+
+    def test_the_builder_refuses_a_missing_routing(self) -> None:
+        with self.assertRaises(TaskContextError):
+            build_agent_routing_context(routing=None, current_phase="analysis")
+
+    def boundary(self):
+        return build_task_boundary(
+            current_role="worker",
+            current_phase="analysis",
+            current_iteration=1,
+            artifact_contract="write: artifacts/runs/run_test/ANALYSIS.md",
+        )
 
 
 if __name__ == "__main__":

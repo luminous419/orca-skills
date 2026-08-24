@@ -176,6 +176,32 @@ SAFETY_FLOOR_EVIDENCE_LOW = "unit_test_status_required"
 SAFETY_FLOOR_EVIDENCE_REVIEWED = "phase_reviewer_verifies"
 
 
+# ---- OS-4: WHO executes, carried beside the other two blocks ----------------------
+# A third block with a THIRD disjoint key set. Agent routing, risk and the quality
+# profile are three independent axes, and the disjointness is what makes that
+# structural instead of a promise: no builder here reads another axis's input, and
+# no key appears in two blocks.
+#
+# This block reaches a dispatch only when a profile was selected. A run without
+# `profile=` renders the spec exactly as it did before OS-4 -- the caller passes no
+# agent_routing at all, rather than passing one that says "none".
+AGENT_ROUTING_KEYS = (
+    "agent_profile",
+    "agent_profile_source",
+    "phase_worker",
+    "phase_reviewer",
+    "final_reviewer",
+    "resolution_sources",
+    "routing_scope",
+    "routing_mutability",
+)
+# What a role reads when this runtime has no such role at all, as against a role
+# that exists but is not required at this risk level.
+ROUTING_NOT_APPLICABLE = "not_applicable"
+ROUTING_NOT_REQUIRED = "not_required"
+ROUTING_IMMUTABLE = "immutable_for_this_run"
+
+
 class TaskContextError(ValueError):
     """Raised when a context builder is asked to produce an incomplete payload."""
 
@@ -459,6 +485,55 @@ def build_risk_context(
     }
 
 
+def build_agent_routing_context(
+    *, routing: Any, current_phase: str
+) -> dict[str, str]:
+    """What ONE dispatch is told about who executes this run.
+
+    Reads the already-materialized routing; resolves nothing. That is the whole
+    point of the run-scoped routing object -- a re-resolution here would be a second
+    answer to a question that was settled before the Run existed, and a profile
+    edited mid-run could hand two dispatches different agents.
+
+    Accepts no QualityProfileResolution and no risk level, exactly as
+    build_risk_context accepts neither a profile nor a routing: three axes, three
+    builders, no shared argument and no shared key.
+    """
+    if routing is None:
+        raise TaskContextError("no agent routing to render; the legacy path renders none")
+    current_phase = require_workflow_phase(current_phase)
+
+    worker = routing.for_role(current_phase, "worker")
+    reviewer = routing.for_role(current_phase, "reviewer")
+    final = routing.for_role("final_review", "final_reviewer")
+
+    sources = []
+    if worker is not None and worker.resolved:
+        sources.append(f"worker={worker.origin}")
+    if reviewer is not None and reviewer.resolved:
+        sources.append(f"reviewer={reviewer.origin}")
+    if final is not None and final.resolved:
+        sources.append(f"final_reviewer={final.origin}")
+
+    def _command(entry: Any) -> str:
+        if entry is None:
+            return ROUTING_NOT_APPLICABLE
+        if not entry.resolved:
+            return ROUTING_NOT_REQUIRED if not entry.required else ""
+        return entry.command
+
+    return {
+        "agent_profile": routing.profile_name,
+        "agent_profile_source": routing.profile_source,
+        "phase_worker": _command(worker),
+        "phase_reviewer": _command(reviewer),
+        "final_reviewer": _command(final),
+        "resolution_sources": " ".join(sources),
+        "routing_scope": "run" if routing.runtime == "orchestration" else "invocation",
+        "routing_mutability": ROUTING_IMMUTABLE,
+    }
+
+
 # ---- serialization: the boundary as the agent actually receives it --------------
 # A builder whose result only ever reaches the coordinator's own records has not
 # established a boundary; it has described one. These renderers put layer 1 (and the
@@ -473,6 +548,8 @@ QUALITY_GATE_SPEC_HEADER = "=== QUALITY GATE (profile-first) ==="
 QUALITY_GATE_SPEC_FOOTER = "=== END QUALITY GATE ==="
 RISK_SPEC_HEADER = "=== RISK PROFILE ==="
 RISK_SPEC_FOOTER = "=== END RISK PROFILE ==="
+AGENT_ROUTING_SPEC_HEADER = "=== AGENT ROUTING (who executes) ==="
+AGENT_ROUTING_SPEC_FOOTER = "=== END AGENT ROUTING ==="
 # The last line of every rendered spec, and the agent's signal that the payload is
 # COMPLETE. A dispatch preamble arrives a line at a time; an agent that acts on the
 # first line of a multi-line spec races the injection that is still delivering it,
@@ -516,6 +593,7 @@ def render_task_spec(
     reviewer_context: dict[str, Any] | None = None,
     quality_gate: dict[str, Any] | None = None,
     risk_context: dict[str, str] | None = None,
+    agent_routing: dict[str, str] | None = None,
 ) -> str:
     """The Task spec body an agent is handed: the caller's text, then the boundary.
 
@@ -554,6 +632,16 @@ def render_task_spec(
             f"{key}: {_render_value(risk_context[key])}" for key in RISK_CONTEXT_KEYS
         )
         lines.append(RISK_SPEC_FOOTER)
+    if agent_routing is not None:
+        # Appended AFTER the risk block and before the end marker, so a caller that
+        # omits it -- which is every caller on the legacy path -- renders a
+        # byte-identical spec to before this argument existed.
+        lines.append("")
+        lines.append(AGENT_ROUTING_SPEC_HEADER)
+        lines.extend(
+            f"{key}: {_render_value(agent_routing[key])}" for key in AGENT_ROUTING_KEYS
+        )
+        lines.append(AGENT_ROUTING_SPEC_FOOTER)
     lines.append(TASK_SPEC_END_MARKER)
     return "\n".join(lines)
 
@@ -729,6 +817,46 @@ def parse_risk_profile(text: str) -> dict[str, str]:
     missing = [key for key in RISK_CONTEXT_KEYS if key not in parsed]
     if missing:
         raise TaskContextError(f"risk profile block is missing {missing}")
+    return parsed
+
+
+def parse_agent_routing_keys(text: str) -> tuple[str, ...]:
+    """Which of the eight routing keys the text carries; () when there is none.
+
+    () is the correct answer for every legacy dispatch, which is what makes this the
+    assertion a compatibility test can bind to.
+    """
+    if AGENT_ROUTING_SPEC_HEADER not in text:
+        return ()
+    block = text.split(AGENT_ROUTING_SPEC_HEADER, 1)[1].split(
+        AGENT_ROUTING_SPEC_FOOTER, 1
+    )[0]
+    present = {
+        line.partition(":")[0].strip()
+        for line in block.splitlines()
+        if line.partition(":")[1]
+    }
+    return tuple(key for key in AGENT_ROUTING_KEYS if key in present)
+
+
+def parse_agent_routing(text: str) -> dict[str, str]:
+    """Read a rendered routing block back out of whatever text carries it."""
+    if AGENT_ROUTING_SPEC_HEADER not in text:
+        raise TaskContextError("no agent routing block in the supplied text")
+    block = text.split(AGENT_ROUTING_SPEC_HEADER, 1)[1].split(
+        AGENT_ROUTING_SPEC_FOOTER, 1
+    )[0]
+    parsed: dict[str, str] = {}
+    for line in block.splitlines():
+        key, separator, value = line.partition(": ")
+        key = key.strip()
+        if key in AGENT_ROUTING_KEYS:
+            parsed[key] = value if separator else ""
+        elif line.strip().rstrip(":") in AGENT_ROUTING_KEYS:
+            parsed[line.strip().rstrip(":")] = ""
+    missing = [key for key in AGENT_ROUTING_KEYS if key not in parsed]
+    if missing:
+        raise TaskContextError(f"agent routing block is missing {missing}")
     return parsed
 
 

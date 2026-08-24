@@ -3,12 +3,22 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
+from os import environ
+from unittest.mock import patch
 from dataclasses import replace
 from pathlib import Path
 
 from scripts.task_context import RISK_CONTEXT_KEYS
+import scripts.e2e_harness as e2e_module
+from scripts.final_report import ORCHESTRATION_SKILL, render_final_report
+from scripts.orca_runtime_harness import OrcaRuntimeHarness
+
+# The log-writing runtime's process-boundary stub lives in the runtime contract
+# tests; importing it here keeps ONE definition of what a stubbed orca call returns.
+from scripts.test_orca_runtime_contract import RecordingExec as _RecordingExec
 from scripts.e2e_harness import (
     UNIT_TEST_GATED_PHASES,
     RiskNotSupportedError,
@@ -672,8 +682,849 @@ class WorkflowSessionPolicyTests(unittest.TestCase):
         self.assertEqual(result.sessions, ())
         self.assertEqual(set(result.phase_iterations.values()), {0})
 
-if __name__ == "__main__":
-    unittest.main()
+MULTIPHASE_PROFILE = (
+    "version: 1\n"
+    "profiles:\n"
+    "  diverse:\n"
+    "    defaults:\n      worker: claude\n      reviewer: codex\n"
+    "    phases:\n"
+    "      design:\n        worker: claude\n        reviewer: claude\n"
+    "      implementation:\n        worker: codex\n        reviewer: codex\n"
+    "      bugfix:\n        worker: codex\n        reviewer: claude\n"
+    "      refactoring:\n        worker: claude\n        reviewer: codex\n"
+    "    final_review:\n      reviewer: claude-gemma\n"
+)
+
+
+class MultiPhaseRoutingConsumptionTests(unittest.TestCase):
+    """I-001-R1: every requested phase, and the Final Review, must consume the routing.
+
+    The earlier tests all ran a single phase, which is exactly why a routing
+    materialized for the constructor's one phase looked correct: with one phase the
+    wrong set and the right set are the same set.
+    """
+
+    def run_workflow(self, skill_path: Path, phases, *, profile="diverse"):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            (workspace / ".orca").mkdir(parents=True, exist_ok=True)
+            (workspace / ".orca" / "agent-profiles.yaml").write_text(
+                MULTIPHASE_PROFILE, encoding="utf-8"
+            )
+            harness = E2EHarness(
+                skill_path,
+                phase=phases[0],
+                workspace=workspace,
+                agent_profile=profile,
+            )
+            result = harness.run_workflow(
+                WorkflowScenario(
+                    phases=phases,
+                    phase_scenarios={
+                        phase: FakeScenario(("complete",), ("pass",))
+                        for phase in phases
+                    },
+                    final_review=FinalReviewScenario(modes=("pass",)),
+                )
+            )
+            return result, harness
+
+    def routing_by_phase(self, result):
+        return {
+            (event.phase, event.role): dict(event.agent_routing)
+            for event in result.sessions
+            if event.agent_routing
+        }
+
+    def test_every_canonical_phase_gets_its_own_resolved_worker(self) -> None:
+        phases = ("design", "implementation")
+        for skill_path in SKILL_PATHS:
+            with self.subTest(skill=skill_path.parent.name):
+                result, _ = self.run_workflow(skill_path, phases)
+
+                self.assertEqual(result.final_status, "COMPLETED", result.reason)
+                blocks = self.routing_by_phase(result)
+                # The defect this test exists for: with a single-phase
+                # materialization the second phase rendered not_applicable.
+                self.assertEqual(blocks[("design", "worker")]["phase_worker"], "claude")
+                self.assertEqual(
+                    blocks[("implementation", "worker")]["phase_worker"], "codex"
+                )
+                for (phase, role), block in blocks.items():
+                    # The final-review record legitimately has no phase Worker; it
+                    # is keyed under the last phase because that is the harness's
+                    # session phase, so exclude it by ROLE rather than by phase.
+                    if phase in phases and role != "final_review":
+                        self.assertNotEqual(block["phase_worker"], "not_applicable")
+
+    def test_the_same_role_changes_identity_between_phases(self) -> None:
+        """Which is precisely when the reuse gate must refuse to reuse a session."""
+        for skill_path in SKILL_PATHS:
+            with self.subTest(skill=skill_path.parent.name):
+                result, _ = self.run_workflow(
+                    skill_path, ("design", "implementation")
+                )
+                blocks = self.routing_by_phase(result)
+
+                self.assertNotEqual(
+                    blocks[("design", "worker")]["phase_worker"],
+                    blocks[("implementation", "worker")]["phase_worker"],
+                )
+
+    def test_specialized_phases_route_the_same_way(self) -> None:
+        for phase, worker in (("bugfix", "codex"), ("refactoring", "claude")):
+            for skill_path in SKILL_PATHS:
+                with self.subTest(skill=skill_path.parent.name, phase=phase):
+                    result, _ = self.run_workflow(skill_path, (phase,))
+
+                    blocks = self.routing_by_phase(result)
+                    self.assertEqual(blocks[(phase, "worker")]["phase_worker"], worker)
+
+    def test_the_final_review_dispatch_consumes_the_final_reviewer(self) -> None:
+        """Orchestration only: the loop skill has no such gate to route."""
+        orchestration = [
+            path
+            for path in SKILL_PATHS
+            if not path.parent.name.endswith("-loop")
+        ][0]
+
+        result, _ = self.run_workflow(orchestration, ("implementation",))
+
+        final = [
+            dict(event.agent_routing)
+            for event in result.sessions
+            if event.role == "final_review" and event.agent_routing
+        ]
+
+        self.assertTrue(final, "the final review session recorded no routing")
+        self.assertEqual(final[0]["final_reviewer"], "claude-gemma")
+        # A Final Review attempt has no Worker, and the block says so.
+        self.assertEqual(final[0]["phase_worker"], "not_applicable")
+
+    def test_the_final_reviewer_may_differ_from_every_phase_reviewer(self) -> None:
+        orchestration = [
+            path for path in SKILL_PATHS if not path.parent.name.endswith("-loop")
+        ][0]
+
+        result, _ = self.run_workflow(orchestration, ("design", "implementation"))
+        blocks = self.routing_by_phase(result)
+        final = [
+            dict(event.agent_routing)
+            for event in result.sessions
+            if event.role == "final_review" and event.agent_routing
+        ][0]
+
+        phase_reviewers = {
+            block["phase_reviewer"]
+            for key, block in blocks.items()
+            if key[1] == "reviewer"
+        }
+
+        self.assertNotIn(final["final_reviewer"], phase_reviewers)
+
+    def test_a_legacy_workflow_records_no_routing_on_any_session(self) -> None:
+        for skill_path in SKILL_PATHS:
+            with self.subTest(skill=skill_path.parent.name):
+                result, _ = self.run_workflow(
+                    skill_path, ("design", "implementation"), profile=None
+                )
+
+                self.assertTrue(result.sessions)
+                self.assertTrue(
+                    all(event.agent_routing == () for event in result.sessions)
+                )
+
+
+class SameCommandSessionIsolationTests(unittest.TestCase):
+    """OS-4 verification item 8, and the safety claim D4 rests on.
+
+    A profile is allowed to route a phase's Worker and Reviewer to the SAME agent
+    command -- MULTIPHASE_PROFILE does exactly that for `design` (claude/claude) and
+    `implementation` (codex/codex). What must still hold is that they are different
+    SESSIONS: the relaxation removed a command-inequality check, and the invariant it
+    was mistakenly guarding is owned separately by the role condition.
+
+    Nothing asserted this before. Every existing session-isolation test predates
+    profiles and runs with two different commands, so it would pass even if a
+    same-command profile collapsed the two roles onto one session.
+    """
+
+    def run_phase(self, skill_path: Path, phase: str, *, profile="diverse"):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            if profile is not None:
+                (workspace / ".orca").mkdir(parents=True, exist_ok=True)
+                (workspace / ".orca" / "agent-profiles.yaml").write_text(
+                    MULTIPHASE_PROFILE, encoding="utf-8"
+                )
+            harness = E2EHarness(
+                skill_path,
+                phase=phase,
+                workspace=workspace,
+                agent_profile=profile,
+            )
+            result = harness.run_workflow(
+                WorkflowScenario(
+                    phases=(phase,),
+                    phase_scenarios={phase: FakeScenario(("complete",), ("pass",))},
+                    final_review=FinalReviewScenario(modes=("pass",)),
+                )
+            )
+            return result, harness
+
+    def test_a_same_command_phase_still_uses_two_sessions(self) -> None:
+        for phase in ("design", "implementation"):
+            for skill_path in SKILL_PATHS:
+                with self.subTest(skill=skill_path.parent.name, phase=phase):
+                    result, _ = self.run_phase(skill_path, phase)
+
+                    worker = [e for e in result.sessions if e.role == "worker"]
+                    reviewer = [e for e in result.sessions if e.role == "reviewer"]
+                    self.assertTrue(worker and reviewer)
+                    # The profile routes both roles to one command for this phase...
+                    block = dict(worker[0].agent_routing)
+                    self.assertEqual(block["phase_worker"], block["phase_reviewer"])
+                    # ...and the two roles are still separate sessions.
+                    self.assertNotEqual(
+                        worker[0].session_id, reviewer[0].session_id
+                    )
+
+    def test_no_session_is_ever_shared_between_the_two_roles(self) -> None:
+        for skill_path in SKILL_PATHS:
+            with self.subTest(skill=skill_path.parent.name):
+                result, _ = self.run_phase(skill_path, "design")
+
+                worker_sessions = {
+                    e.session_id for e in result.sessions if e.role == "worker"
+                }
+                reviewer_sessions = {
+                    e.session_id for e in result.sessions if e.role == "reviewer"
+                }
+
+                self.assertTrue(worker_sessions)
+                self.assertTrue(reviewer_sessions)
+                self.assertEqual(worker_sessions & reviewer_sessions, set())
+
+
+class CorrectionRoutingStabilityTests(unittest.TestCase):
+    """OS-4 verification item 10: correction and downstream revalidation must read
+    the run's ONE materialized routing, never re-resolve.
+
+    The existing stability tests cover the QUALITY profile through the same rounds;
+    the agent routing had no equivalent, so a correction round that re-read the
+    profile file would not have been caught.
+    """
+
+    PASSING = FakeScenario(("complete",), ("pass",))
+
+    def run_scenario(self, skill_path: Path, scenario: WorkflowScenario):
+        """Run a workflow whose rounds go past the phase gate.
+
+        The profile file is NOT mutated here. run_workflow() materializes the routing
+        for the scenario's phase set before its first dispatch -- that IS the run's
+        resolution point -- so a rewrite before that call would be picked up
+        legitimately and would prove nothing. The claim these tests make instead is
+        the one that matters after that point: every later round reads the same
+        resolution. The file-mutation angle is covered at unit level by
+        test_agent_profile.MaterializationTests.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            (workspace / ".orca").mkdir(parents=True, exist_ok=True)
+            (workspace / ".orca" / "agent-profiles.yaml").write_text(
+                MULTIPHASE_PROFILE, encoding="utf-8"
+            )
+            harness = E2EHarness(
+                skill_path,
+                phase=scenario.phases[0],
+                workspace=workspace,
+                agent_profile="diverse",
+            )
+            return harness.run_workflow(scenario), harness
+
+    def blocks_for(self, result, role: str):
+        return [
+            dict(event.agent_routing)
+            for event in result.sessions
+            if event.role == role and event.agent_routing
+        ]
+
+    def test_a_correction_round_uses_the_same_routing_as_its_phase_gate(self) -> None:
+        orchestration = [
+            p for p in SKILL_PATHS if not p.parent.name.endswith("-loop")
+        ][0]
+        scenario = WorkflowScenario(
+            phases=("analysis", "implementation"),
+            phase_scenarios={
+                "analysis": self.PASSING,
+                "implementation": self.PASSING,
+            },
+            final_review=FinalReviewScenario(
+                modes=("fail", "pass"), findings=((("R1", "implementation"),), ())
+            ),
+            correction_scenarios={
+                ("implementation", 1): FakeScenario(
+                    worker_modes=("correction", "correction"),
+                    reviewer_modes=("fail", "pass"),
+                    reviewer_findings=(("X1",), ()),
+                    worker_resolutions=({"R1": "RESOLVED"}, {"X1": "RESOLVED"}),
+                ),
+            },
+        )
+
+        result, _ = self.run_scenario(orchestration, scenario)
+
+        self.assertEqual(result.final_status, "COMPLETED", result.reason)
+        self.assertTrue(result.correction_dispatches)
+        # Every implementation-phase Worker dispatch -- the phase gate AND the
+        # correction rounds -- carries the same block, byte for byte.
+        implementation = [
+            tuple(sorted(dict(event.agent_routing).items()))
+            for event in result.sessions
+            if event.role == "worker"
+            and event.phase == "implementation"
+            and event.agent_routing
+        ]
+        self.assertGreater(len(implementation), 1, "no correction round dispatched")
+        self.assertEqual(len(set(implementation)), 1)
+        self.assertEqual(dict(implementation[0])["phase_worker"], "codex")
+
+    def test_downstream_revalidation_uses_the_same_routing(self) -> None:
+        orchestration = [
+            p for p in SKILL_PATHS if not p.parent.name.endswith("-loop")
+        ][0]
+        scenario = WorkflowScenario(
+            phases=("analysis", "implementation"),
+            phase_scenarios={
+                "analysis": self.PASSING,
+                "implementation": self.PASSING,
+            },
+            final_review=FinalReviewScenario(
+                modes=("fail", "pass"), findings=((("R1", "analysis"),), ())
+            ),
+            correction_scenarios={
+                ("analysis", 1): FakeScenario(
+                    worker_modes=("correction",),
+                    reviewer_modes=("pass",),
+                    worker_resolutions=({"R1": "RESOLVED"},),
+                ),
+            },
+            # The key's iteration is final_review_iterations at the moment the
+            # correction ran, i.e. attempt 1 -- see h2_scenario's note.
+            revalidation_scenarios={
+                ("implementation", 1): FakeScenario(("complete",), ("pass",)),
+            },
+        )
+
+        result, _ = self.run_scenario(orchestration, scenario)
+
+        self.assertTrue(
+            result.revalidation_dispatches, "T5a did not run; the test proves nothing"
+        )
+        # The revalidation round is an implementation-phase dispatch like any other,
+        # and it carries the same block the phase gate did.
+        implementation = [
+            tuple(sorted(dict(event.agent_routing).items()))
+            for event in result.sessions
+            if event.role == "worker"
+            and event.phase == "implementation"
+            and event.agent_routing
+        ]
+        self.assertGreater(len(implementation), 1, "no revalidation dispatched")
+        self.assertEqual(len(set(implementation)), 1)
+        # The corrected phase keeps its own routing too.
+        analysis = {
+            dict(event.agent_routing)["phase_worker"]
+            for event in result.sessions
+            if event.role == "worker"
+            and event.phase == "analysis"
+            and event.agent_routing
+        }
+        self.assertEqual(analysis, {"claude"})
+
+    def test_the_final_review_also_reads_the_pre_run_routing(self) -> None:
+        orchestration = [
+            p for p in SKILL_PATHS if not p.parent.name.endswith("-loop")
+        ][0]
+        scenario = WorkflowScenario(
+            phases=("implementation",),
+            phase_scenarios={"implementation": self.PASSING},
+            final_review=FinalReviewScenario(modes=("pass",)),
+        )
+
+        result, _ = self.run_scenario(orchestration, scenario)
+
+        final = self.blocks_for(result, "final_review")
+        self.assertTrue(final)
+        self.assertEqual(final[0]["final_reviewer"], "claude-gemma")
+
+
+PROFILE_DOCUMENT = (
+    "version: 1\n"
+    "profiles:\n"
+    "  diverse:\n"
+    "    defaults:\n      worker: claude\n      reviewer: codex\n"
+    "    phases:\n"
+    "      implementation:\n        worker: codex\n        reviewer: codex\n"
+    "    final_review:\n      reviewer: codex\n"
+)
+
+
+LEGACY_BASELINE = (
+    Path(__file__).resolve().parents[1]
+    / "scripts"
+    / "fixtures"
+    / "legacy_baseline"
+    / "pre_os4_artifacts.json"
+)
+
+# The three representative workflows the golden fixture covers, for both skills.
+GOLDEN_WORKFLOWS = {
+    "single_canonical": ("implementation",),
+    "multi_canonical": ("design", "implementation"),
+    "specialized_bugfix": ("bugfix",),
+}
+
+
+def _normalize_artifact(text: str, workspace: Path) -> str:
+    """Strip what legitimately varies between two runs of the same scenario.
+
+    The workspace path, ISO timestamps and orca-assigned ids are per-run facts and
+    were never part of the contract; everything else must match exactly.
+    """
+    out = text.replace(str(workspace), "<WORKSPACE>")
+    lines = []
+    for line in out.splitlines():
+        tokens = []
+        for token in line.split():
+            if token.count("-") >= 2 and token.count(":") >= 2:
+                token = "<TS>"
+            tokens.append(token)
+        lines.append(" ".join(tokens))
+    return "\n".join(lines)
+
+
+def capture_orchestrator_log(skill_name, phases, routing=None) -> str:
+    """The real ORCHESTRATOR_LOG.md for THIS fixture's own phase sequence.
+
+    Earlier revisions called a fixed single-phase run and pasted its log onto all six
+    fixtures, so a bugfix fixture's "log" recorded phase=implementation. The phases
+    are arguments now, and one worker attempt is dispatched per requested phase, so
+    each fixture's log is that fixture's workflow.
+
+    "" for the loop skill, and that is the contract rather than a gap: that runtime
+    has no run-scoped log at all (DESIGN: its evidence medium is the final report).
+    Manufacturing one here would report a medium the skill does not have.
+    """
+    if skill_name != ORCHESTRATION_SKILL:
+        return ""
+    with tempfile.TemporaryDirectory() as directory:
+        artifacts = Path(directory)
+        recorder = _RecordingExec(
+            results={
+                "run-create": {"run": {"id": "run_golden"}},
+                "check": _RecordingExec.ACCEPTED_DONE,
+            }
+        )
+        kwargs = {} if routing is None else {"agent_routing": routing}
+        with patch.dict(environ, {"ORCA_CLI_COMMAND": "/opt/orca-dev"}):
+            harness = OrcaRuntimeHarness(artifacts, **kwargs)
+        harness._exec_orca = recorder
+        harness.start_run(f"golden {'+'.join(phases)}", requested_phases=phases)
+        for iteration, phase in enumerate(phases, start=1):
+            harness.run_attempt("worker", iteration, "complete", phase=phase)
+        harness.log_run_status("COMPLETED")
+        log = artifacts / "artifacts" / "runs" / "run_golden" / "ORCHESTRATOR_LOG.md"
+        return _normalize_artifact(log.read_text(encoding="utf-8"), artifacts)
+
+
+def capture_legacy_artifacts(
+    repo_root: Path, skill_name: str, workflow: str, *, profile: str | None = None
+) -> dict:
+    """The three artifacts a run leaves behind, each from its own real producer and
+    each for THIS fixture's own skill and workflow.
+
+    task_specs        full rendered text, via a render_task_spec wrapper
+    orchestrator_log  the real file, replaying this fixture's phase sequence
+    final_report      this skill's OWN SKILL.md template, via scripts/final_report.py
+
+    This exact function, run inside a `git archive` checkout of the last pre-OS-4
+    commit (with scripts/final_report.py copied in, since the renderer is new), built
+    scripts/fixtures/legacy_baseline/pre_os4_artifacts.json.
+    """
+    phases = GOLDEN_WORKFLOWS[workflow]
+    skill_path = repo_root / skill_name / "SKILL.md"
+    rendered: list[str] = []
+    original = e2e_module.render_task_spec
+
+    def recording(*args, **kwargs):
+        spec = original(*args, **kwargs)
+        rendered.append(spec)
+        return spec
+
+    e2e_module.render_task_spec = recording
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            if profile is not None:
+                (workspace / ".orca").mkdir(parents=True, exist_ok=True)
+                (workspace / ".orca" / "agent-profiles.yaml").write_text(
+                    MULTIPHASE_PROFILE, encoding="utf-8"
+                )
+            kwargs = {} if profile is None else {"agent_profile": profile}
+            harness = E2EHarness(
+                skill_path,
+                phase=phases[0],
+                workspace=workspace,
+                run_id="run_golden",
+                **kwargs,
+            )
+            result = harness.run_workflow(
+                WorkflowScenario(
+                    phases=phases,
+                    phase_scenarios={
+                        phase: FakeScenario(("complete",), ("pass",))
+                        for phase in phases
+                    },
+                    final_review=FinalReviewScenario(modes=("pass",)),
+                    run_id="run_golden",
+                )
+            )
+            routing = getattr(harness, "agent_routing", None)
+            captured = {
+                "task_specs": [
+                    _normalize_artifact(spec, workspace) for spec in rendered
+                ],
+                "orchestrator_log": capture_orchestrator_log(
+                    skill_name, phases, routing
+                ),
+                "final_report": _normalize_artifact(
+                    render_final_report(result, skill_name=skill_name), workspace
+                ),
+            }
+            if profile is not None:
+                captured["routing_blocks"] = [
+                    [list(pair) for pair in event.agent_routing]
+                    for event in result.sessions
+                ]
+            return captured
+    finally:
+        e2e_module.render_task_spec = original
+
+
+def _template_from_skill(skill_path: Path) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """The Final Result template's header keys and section headings, read from the
+    SKILL.md fence itself.
+
+    The contract is the document. Parsing it here means the renderer is checked
+    against what the skill actually promises rather than against a second copy of
+    someone's reading of it.
+    """
+    text = skill_path.read_text(encoding="utf-8")
+    start = text.index("# Final Result")
+    fence = text.index("\n```", start)
+    block = text[start:fence]
+    keys = []
+    sections = []
+    for line in block.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("## "):
+            sections.append(stripped)
+        elif stripped and ":" in stripped and stripped.split(":", 1)[0].isupper():
+            key = stripped.split(":", 1)[0]
+            if key not in keys:
+                keys.append(key)
+    return tuple(keys), tuple(sections)
+
+
+class FinalReportContractTests(unittest.TestCase):
+    """The renderer must emit each skill's OWN template, parsed from its SKILL.md.
+
+    Not one common format: the loop template carries no risk axis and no Final
+    Adversarial Review block, and the two differ on `## Unit Tests / Validation`
+    versus separate `## Unit Tests` and `## Validation` sections. A renderer that
+    emitted RISK for the loop skill would be reporting a lifecycle it does not run.
+    """
+
+    def report_for(self, skill_path: Path) -> str:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            harness = E2EHarness(
+                skill_path, phase="implementation", workspace=workspace
+            )
+            result = harness.run_workflow(
+                WorkflowScenario(
+                    phases=("implementation",),
+                    phase_scenarios={
+                        "implementation": FakeScenario(("complete",), ("pass",))
+                    },
+                    final_review=FinalReviewScenario(modes=("pass",)),
+                )
+            )
+        return render_final_report(result, skill_name=skill_path.parent.name)
+
+    def test_every_template_header_key_is_rendered(self) -> None:
+        for skill_path in SKILL_PATHS:
+            with self.subTest(skill=skill_path.parent.name):
+                keys, _ = _template_from_skill(skill_path)
+                report = self.report_for(skill_path)
+
+                self.assertTrue(keys)
+                for key in keys:
+                    with self.subTest(key=key):
+                        self.assertIn(f"{key}:", report)
+
+    def test_every_template_section_is_rendered(self) -> None:
+        for skill_path in SKILL_PATHS:
+            with self.subTest(skill=skill_path.parent.name):
+                _, sections = _template_from_skill(skill_path)
+                report = self.report_for(skill_path)
+
+                self.assertTrue(sections)
+                for section in sections:
+                    with self.subTest(section=section):
+                        self.assertIn(section, report)
+
+    def test_the_renderer_emits_no_key_the_template_does_not_declare(self) -> None:
+        """The direction that catches a common format leaking into both skills."""
+        for skill_path in SKILL_PATHS:
+            with self.subTest(skill=skill_path.parent.name):
+                keys, _ = _template_from_skill(skill_path)
+                report = self.report_for(skill_path)
+
+                rendered = {
+                    line.split(":", 1)[0]
+                    for line in report.splitlines()
+                    if ":" in line and line.split(":", 1)[0].isupper() and line[:1].isupper()
+                }
+                self.assertEqual(rendered - set(keys), set())
+
+    def test_the_loop_report_carries_no_risk_axis_or_final_review_gate(self) -> None:
+        loop = [p for p in SKILL_PATHS if p.parent.name.endswith("-loop")][0]
+
+        report = self.report_for(loop)
+
+        for absent in ("RISK:", "RISK_SOURCE:", "FINAL_REVIEW_ITERATIONS:",
+                       "## Final Adversarial Review"):
+            with self.subTest(absent=absent):
+                self.assertNotIn(absent, report)
+        self.assertIn("RESULT:", report)
+
+    def test_the_orchestration_report_carries_the_final_review_block(self) -> None:
+        orchestration = [
+            p for p in SKILL_PATHS if not p.parent.name.endswith("-loop")
+        ][0]
+
+        report = self.report_for(orchestration)
+
+        for key in ("RISK:", "RISK_SOURCE:", "FINAL_REVIEW_ITERATIONS:",
+                    "FINAL_REVIEW:", "FINAL_REVIEW_TASKS:", "FINAL_FINDINGS:",
+                    "FINAL_REVIEW_REVALIDATIONS:", "## Orca Orchestration State"):
+            with self.subTest(key=key):
+                self.assertIn(key, report)
+
+    def test_an_unknown_skill_is_refused(self) -> None:
+        with self.assertRaises(ValueError):
+            render_final_report(object(), skill_name="something-else")
+
+
+class LegacyByteIdentityTests(unittest.TestCase):
+    """DESIGN T14: an omitted-profile run must reproduce the PRE-OS-4 artifacts.
+
+    The baseline is not "what this code produces today" -- that would only prove the
+    code agrees with itself. It is a golden capture taken from commit 8f3cfa3, the
+    last commit before Agent Profile existed, and it is compared character for
+    character. See scripts/fixtures/legacy_baseline/README.md.
+
+    Two skills x three workflows (single canonical phase, two canonical phases, a
+    specialized bugfix phase), and the non-vacuity half runs the same fixtures with a
+    profile selected so a comparison that could never fail would be caught.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.golden = json.loads(LEGACY_BASELINE.read_text(encoding="utf-8"))
+        cls.repo_root = Path(__file__).resolve().parents[1]
+
+    def fixtures(self):
+        for skill_path in SKILL_PATHS:
+            for workflow in GOLDEN_WORKFLOWS:
+                yield skill_path.parent.name, workflow
+
+    def test_the_baseline_covers_both_skills_and_three_workflows(self) -> None:
+        """A shrunken fixture would silently shrink the claim."""
+        self.assertEqual(len(self.golden), 6)
+        for skill, workflow in self.fixtures():
+            self.assertIn(f"{skill}::{workflow}", self.golden)
+
+    def test_every_dispatched_spec_matches_the_pre_os4_capture(self) -> None:
+        """Full spec text, character for character -- not a structured summary."""
+        for skill, workflow in self.fixtures():
+            with self.subTest(skill=skill, workflow=workflow):
+                current = capture_legacy_artifacts(self.repo_root, skill, workflow)
+                golden = self.golden[f"{skill}::{workflow}"]["task_specs"]
+
+                self.assertTrue(current["task_specs"])
+                self.assertEqual(len(current["task_specs"]), len(golden))
+                for index, (actual, expected) in enumerate(
+                    zip(current["task_specs"], golden)
+                ):
+                    with self.subTest(spec=index):
+                        self.assertEqual(actual, expected)
+
+    def test_the_orchestrator_log_matches_the_pre_os4_capture(self) -> None:
+        """Real log bytes for the runtime that has a log, and none for the one that
+        does not -- an empty-vs-empty comparison would prove nothing on its own."""
+        for skill, workflow in self.fixtures():
+            with self.subTest(skill=skill, workflow=workflow):
+                current = capture_legacy_artifacts(self.repo_root, skill, workflow)
+                golden = self.golden[f"{skill}::{workflow}"]["orchestrator_log"]
+
+                if skill == ORCHESTRATION_SKILL:
+                    self.assertTrue(golden.strip(), "the golden log must not be empty")
+                    self.assertIn("run_start", golden)
+                    self.assertIn("dispatch_settled", golden)
+                else:
+                    # DESIGN: the loop runtime has no run-scoped log at all. Its
+                    # evidence medium is the final report, checked below.
+                    self.assertEqual(golden, "")
+                self.assertEqual(current["orchestrator_log"], golden)
+
+    def test_each_orchestration_log_reflects_its_own_workflow(self) -> None:
+        """The defect this replaced: one fixed single-phase log pasted onto all six
+        fixtures, so a bugfix fixture's log recorded phase=implementation."""
+        logs = {}
+        for workflow, phases in GOLDEN_WORKFLOWS.items():
+            golden = self.golden[f"{ORCHESTRATION_SKILL}::{workflow}"][
+                "orchestrator_log"
+            ]
+            logs[workflow] = golden
+            with self.subTest(workflow=workflow):
+                run_start = [
+                    line for line in golden.splitlines() if "run_start" in line
+                ][0]
+                self.assertIn(",".join(phases), run_start)
+                settled = [
+                    line for line in golden.splitlines() if "dispatch_settled" in line
+                ]
+                self.assertEqual(len(settled), len(phases))
+                for phase in phases:
+                    self.assertTrue(
+                        any(f"| {phase} |" in line for line in settled),
+                        f"{workflow}: no dispatch row for {phase}",
+                    )
+
+        # And they are genuinely three different logs, not one reused three times.
+        self.assertEqual(len(set(logs.values())), len(logs))
+
+    def test_the_loop_evidence_lives_in_its_report_not_a_log(self) -> None:
+        for workflow in GOLDEN_WORKFLOWS:
+            with self.subTest(workflow=workflow):
+                fixture = self.golden[f"orca-worker-reviewer-loop::{workflow}"]
+
+                self.assertEqual(fixture["orchestrator_log"], "")
+                self.assertTrue(fixture["final_report"].startswith("# Final Result"))
+
+    def test_the_final_report_matches_the_pre_os4_capture(self) -> None:
+        """The renderer's whole output text, not a dict of remembered fields."""
+        for skill, workflow in self.fixtures():
+            with self.subTest(skill=skill, workflow=workflow):
+                current = capture_legacy_artifacts(self.repo_root, skill, workflow)
+                golden = self.golden[f"{skill}::{workflow}"]["final_report"]
+
+                self.assertTrue(golden.startswith("# Final Result"))
+                self.assertNotIn("AGENT_PROFILE", golden)
+                self.assertEqual(current["final_report"], golden)
+
+    def test_no_dispatched_spec_carries_a_routing_block(self) -> None:
+        """Stated directly as well as implied by the golden comparison."""
+        for skill, workflow in self.fixtures():
+            with self.subTest(skill=skill, workflow=workflow):
+                skill_path = self.repo_root / skill / "SKILL.md"
+                with tempfile.TemporaryDirectory() as directory:
+                    workspace = Path(directory)
+                    phases = GOLDEN_WORKFLOWS[workflow]
+                    harness = E2EHarness(
+                        skill_path, phase=phases[0], workspace=workspace
+                    )
+                    result = harness.run_workflow(
+                        WorkflowScenario(
+                            phases=phases,
+                            phase_scenarios={
+                                phase: FakeScenario(("complete",), ("pass",))
+                                for phase in phases
+                            },
+                            final_review=FinalReviewScenario(modes=("pass",)),
+                        )
+                    )
+
+                    self.assertTrue(
+                        all(event.agent_routing == () for event in result.sessions)
+                    )
+                    self.assertEqual(result.agent_profile_report, ())
+
+    def test_a_selected_profile_changes_all_three_surfaces(self) -> None:
+        """The non-vacuity half: the comparisons above must be able to fail."""
+        for skill, workflow in self.fixtures():
+            with self.subTest(skill=skill, workflow=workflow):
+                baseline = self.golden[f"{skill}::{workflow}"]
+                legacy = capture_legacy_artifacts(self.repo_root, skill, workflow)
+                selected = capture_legacy_artifacts(
+                    self.repo_root, skill, workflow, profile="diverse"
+                )
+
+                # 1. every dispatch now carries a routing block; the legacy run of
+                #    the same fixture carries none. `sessions` deliberately keeps the
+                #    pre-OS-4 shape (that is the golden contract), so the routing
+                #    surface is compared on its own.
+                self.assertNotIn("routing_blocks", legacy)
+                self.assertTrue(any(selected["routing_blocks"]))
+                # Every phase Worker/Reviewer dispatch, specifically -- not just
+                # "at least one session somewhere".
+                phase_blocks = [
+                    block
+                    for block, session in zip(
+                        selected["routing_blocks"],
+                        [
+                            line
+                            for line in selected["final_report"].splitlines()
+                            if line.startswith("- worker ")
+                            or line.startswith("- reviewer ")
+                            or line.startswith("- final_review ")
+                        ],
+                    )
+                    if session.startswith(("- worker ", "- reviewer "))
+                ]
+                self.assertTrue(phase_blocks)
+                self.assertTrue(all(phase_blocks))
+                # 3. everything else is unchanged -- routing decides WHO executes,
+                #    not WHAT runs or whether it passes.
+                self.assertNotEqual(selected["task_specs"], baseline["task_specs"])
+                # 4. the audit log gains the agent-routing rows -- for the runtime
+                #    that HAS a log. The loop skill has none, and its evidence is the
+                #    report checked immediately below.
+                if skill == ORCHESTRATION_SKILL:
+                    self.assertNotEqual(
+                        selected["orchestrator_log"], baseline["orchestrator_log"]
+                    )
+                    self.assertIn(
+                        "agent_profile_selected", selected["orchestrator_log"]
+                    )
+                    self.assertIn(
+                        "agent_routing_resolved", selected["orchestrator_log"]
+                    )
+                else:
+                    self.assertEqual(selected["orchestrator_log"], "")
+                # 5. the report gains its conditional lines.
+                self.assertNotEqual(
+                    selected["final_report"], baseline["final_report"]
+                )
+                self.assertIn("AGENT_PROFILE:", selected["final_report"])
+                self.assertIn("AGENT_ROUTING:", selected["final_report"])
+                # 6. and the run still completes: routing changes WHO executes, not
+                #    WHAT runs or whether it passes.
+                self.assertIn("STATUS: COMPLETED", selected["final_report"])
+                self.assertIn("STATUS: COMPLETED", baseline["final_report"])
 
 
 class FinalAdversarialReviewTests(unittest.TestCase):
@@ -3437,3 +4288,7 @@ class RiskWorkflowTests(unittest.TestCase):
         result = self.run_workflow(scenario, risk="low")
         self.assertEqual((result.risk, result.risk_source), ("medium", "explicit"))
         self.assertEqual(len(self.reviewer_events(result)), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -120,6 +120,7 @@ worker=<agent-command>
 reviewer=<agent-command>
 max-iterations=<integer>
 phases=<phase1,phase2,...>
+profile=<name>
 risk=<low|medium|high>
 ```
 
@@ -178,6 +179,14 @@ DEFAULT_RISK = high
     ]
   },
   "known_agent_commands": ["claude", "codex", "claude-glm", "claude-gemma"],
+  "agent_profile": {
+    "parameter": "profile",
+    "project_source": ".orca/agent-profiles.yaml",
+    "user_source": "~/.orca/agent-profiles.yaml",
+    "schema_versions": [1],
+    "source_precedence": ["project_local", "user_global"],
+    "merge": "whole_definition"
+  },
   "agent_command_pattern": "[A-Za-z0-9._-]+",
   "custom_agent_command_pattern": "(?:claude|codex)-[A-Za-z0-9._-]+",
   "agent_launch_arguments": [],
@@ -215,7 +224,10 @@ DEFAULT_RISK = high
     "invalid_phase": "INVALID_PHASE",
     "invalid_phase_order": "INVALID_PHASE_ORDER",
     "phase_conflict": "PHASE_CONFLICT",
-    "unsupported_phase_combination": "UNSUPPORTED_PHASE_COMBINATION"
+    "unsupported_phase_combination": "UNSUPPORTED_PHASE_COMBINATION",
+    "invalid_agent_profile": "INVALID_AGENT_PROFILE",
+    "unknown_agent_profile": "UNKNOWN_AGENT_PROFILE",
+    "agent_role_unresolved": "AGENT_ROLE_UNRESOLVED"
   }
 }
 ```
@@ -291,6 +303,122 @@ Skill은 model, permission 또는 vendor-specific argument를 추가하지 않�
 해당 CLI의 configuration 또는 model/permission-pinned wrapper command가 소유한다.
 
 절대 사용자 경로를 hard-code하지 않는다.
+
+## Agent Profile
+
+`profile=<name>`는 named Agent Profile을 선택한다. Agent Profile은 **누가 실행하는가**만 정한다 —
+requested phase 집합, risk level, gate/correction/revalidation lifecycle, Final Review 요구,
+PASS/FAIL 기준을 바꾸지 않는다.
+
+profile 파일은 두 곳에서 읽는다.
+
+```text
+project-local  <project>/.orca/agent-profiles.yaml
+user-global    ~/.orca/agent-profiles.yaml
+```
+
+같은 이름이 양쪽에 있으면 **project-local 정의가 통째로 이긴다.** field-level merge는 하지 않는다 —
+project-local이 생략한 필드를 user-global에서 빌려오지 않는다.
+
+resolution은 **short-circuit**한다. requested profile을 project-local에서 먼저 찾고, 거기 있으면
+그 정의로 즉시 확정한다 — user-global 파일은 이 경우 아예 열지 않는다. project-local에 그 이름이
+없을 때에만 user-global을 consult한다. project-local 자체가 malformed면 (그 파일이 요청된 이름을
+가졌는지 판단할 수 없으므로) 그대로 fail closed하지만, project-local이 정상적으로 파싱되어 요청된
+profile을 찾았다면 user-global 파일의 상태 — malformed든 무엇이든 — 는 그 selection에 영향을 주지
+않는다.
+
+schema는 다음이 전부다.
+
+```yaml
+version: 1
+profiles:
+  <name>:
+    defaults:
+      worker: <agent-command>
+      reviewer: <agent-command>
+    phases:
+      <phase>:
+        worker: <agent-command>
+        reviewer: <agent-command>
+    final_review:
+      reviewer: <agent-command>
+```
+
+`<phase>`는 이 Skill이 지원하는 7개 phase(analysis, plan, design, implementation, test, bugfix,
+refactoring)뿐이다. profile에 어떤 phase의 routing이 있다는 것이 그 phase를 실행한다는 뜻은 아니다 —
+실행 대상은 `phases` contract만 정한다.
+
+role별 resolution 순서는 다음과 같다. phase role과 Final Reviewer는 **1순위가 서로 반대**다.
+
+```text
+Phase Worker   : explicit worker   > profile.phases.<phase>.worker   > profile.defaults.worker   > unresolved
+Phase Reviewer : explicit reviewer > profile.phases.<phase>.reviewer > profile.defaults.reviewer > unresolved
+Final Reviewer : profile.final_review.reviewer > explicit reviewer   > profile.defaults.reviewer > unresolved
+```
+
+명시적으로 선택된 profile은 **self-contained resolution domain**이다. 다른 profile이나 profile 없는
+경로의 default에서 빠진 필드를 채우지 않는다.
+
+`profile`을 생략하면 기존 동작을 그대로 유지한다. profile 파일을 읽지 않으며 `worker=`/`reviewer=`와
+default 처리, `WORKER_REVIEWER_MUST_DIFFER` 검사가 지금과 동일하게 적용된다.
+
+`profile`이 명시된 경우 Run/Task/Dispatch를 만들기 **전에** 다음 순서로 처리한다.
+
+```text
+1. profile source 읽기 + schema 검증                       (여기서는 command를 검사하지 않는다)
+2. selected profile 전체 정의 + 참여하는 explicit worker/reviewer에
+   token -> allowlist 검사 (requested phase, required 여부와 무관)
+3. requested phase와 Final Review에 대한 routing materialize
+4. required role의 resolved command에만 PATH 검사
+5. required role이 전부 resolve되었는지 검사
+6. 위가 모두 통과한 경우에만 Run 생성
+```
+
+2번의 검사 대상은 **selected profile이 선언한 모든 command**다 — `defaults`, 이 invocation이 요청하지
+않은 phase를 포함한 모든 `phases.<phase>`, `final_review`, 그리고 이 invocation에 실제로 주어진 explicit
+`worker=`/`reviewer=` 값까지 전부 포함하며, requested phase 여부나 required 여부와 무관하다. profile은
+하나의 trust document이므로, 이번 invocation이 `refactoring`을 요청하지 않았다고 해서
+`phases.refactoring.worker: bash`가 안전해지지는 않는다 — 같은 profile의 다음 invocation이 그 phase를
+요청할 수 있고, audit evidence는 실제로 materialize된 entry를 optional 포함 전부 기록하기 때문이다.
+2번은 phase나 risk 정보 없이 selection 직후 정확히 한 번 실행되며 PATH는 절대 확인하지 않는다.
+4번의 PATH 검사만 **required role로 좁힌다** — PATH 존재 여부는 trust 문제가 아니라 이 machine의 환경
+사실이며, dispatch되지 않는 role의 command가 설치되어 있지 않다는 이유로 run을 막을 필요는 없다.
+required role은 이 run에서 실행될 수 있는 command 집합과 정확히 같으므로 이 좁힘이 trust boundary에
+빈틈을 만들지 않는다.
+
+profile을 arbitrary shell execution 통로로 쓰지 않는다. resolved command에는 §5의 기존 agent
+command 정책(safe token / trust boundary / PATH resolution)을 그대로 적용하며 인자를 붙이지 않는다.
+
+실패는 전부 Run/Task/Dispatch 생성 이전의 validation failure이며 correction loop 대상이 아니다.
+
+```text
+STATUS: BLOCKED
+REASON: INVALID_AGENT_PROFILE
+```
+
+```text
+STATUS: BLOCKED
+REASON: UNKNOWN_AGENT_PROFILE
+```
+
+```text
+STATUS: BLOCKED
+REASON: AGENT_ROLE_UNRESOLVED
+```
+
+`INVALID_AGENT_PROFILE`은 파일이 존재하지만 malformed YAML / 미지원 `version` / unknown 또는 중복 키 /
+unknown phase key / 비어 있거나 문자열이 아닌 command 값 / 읽을 수 없는 경로인 경우다.
+`UNKNOWN_AGENT_PROFILE`은 그 이름의 profile이 두 source 어디에도 없는 경우이며, 값이 없는
+`profile=`도 생략이 아니라 명시적으로 잘못된 값이므로 여기에 해당한다.
+`AGENT_ROLE_UNRESOLVED`는 required role이 precedence 체인을 모두 거쳐도 command를 얻지 못한 경우다.
+
+resolved routing은 이 run 동안 immutable하다. profile 파일이 run 중 변경되어도 correction과
+re-review는 profile을 다시 읽지 않고 최초 resolution을 그대로 사용한다.
+
+required role은 risk가 정한다. requested phase Worker는 모든 risk에서 required이고, phase Reviewer는
+MEDIUM/HIGH에서 required이며 LOW에서는 optional이다(LOW에는 Reviewer node가 없다). Final Reviewer는
+모든 risk에서 required다. 따라서 Worker와 Final Reviewer만 정의한 profile은 LOW에서 유효할 수 있다.
+이 판정은 확정된 requested phases와 risk를 **읽기만** 하며 그 어느 쪽도 바꾸지 않는다.
 
 ## 6. Orca-native Worker Placement
 
@@ -429,7 +557,11 @@ terminal을 만들며, 만족하지 못한 조건의 이름을 section 16 보고
 
 1. `same_role` — 이전 Dispatch와 다음 Dispatch의 역할이 같다. Worker에서 Worker로, Reviewer에서
    Reviewer로만 이어지며 역할 교체는 어떤 경우에도 reuse가 아니다.
-2. `same_agent_command` — 두 Dispatch가 같은 agent command로 기동된다. 양쪽 값이 모두 기록되어 있고
+2. `same_agent_command` — 두 Dispatch가 같은 agent command로 기동된다. 여기서 말하는 agent command는
+   그 phase에 대해 materialize된 **resolved role command**다. Agent Profile이 선택된 run에서는 같은
+   role이라도 phase가 달라 resolved command가 달라질 수 있고, 그때는 reuse하지 않고 새 terminal을
+   쓴다. profile이 없는 run에서는 이 값이 지금까지와 같이 `worker=`/`reviewer=`로 정해진 command다.
+   양쪽 값이 모두 기록되어 있고
    문자열이 일치해야 하며, 한쪽이라도 비어 있으면 reuse하지 않는다.
 3. `live_process` — reuse 판정 직전에 새로 관측한 값이 terminal이 살아 있음을 긍정적으로 보여준다.
    이전 attempt에 기록해 둔 process liveness 값은 근거가 되지 못한다. axis (c1)은 약 10초까지 stale일 수
@@ -1278,6 +1410,32 @@ QUALITY_GATE_CONTEXT_KEYS = profile_status, profile_path, applicable_quality_att
 QUALITY_GATE_CONTEXT_ROLES = worker, reviewer, final_reviewer
 ```
 
+#### Agent profile contract
+
+아래 블록은 이 Skill의 Agent Profile 처리에 대한 회귀 잠금이다. 경로와 error code 문자열은 여기에
+넣지 않는다 — 그것들은 shared policy contract JSON과 위 산문이 소유한다.
+
+```text
+AGENT_PROFILE_PARAMETER = profile
+AGENT_PROFILE_SELECTION_STATES = omitted, selected, invalid
+AGENT_PROFILE_RESOLUTION_SCOPE = resolved_once_before_run_never_per_attempt
+AGENT_PROFILE_GATE_ORDER = materialize, validate_commands, validate_required_roles, create_run
+AGENT_PROFILE_PHASE_WORKER_PRECEDENCE = explicit, phase, defaults
+AGENT_PROFILE_PHASE_REVIEWER_PRECEDENCE = explicit, phase, defaults
+AGENT_PROFILE_FINAL_REVIEWER_PRECEDENCE = final_review, explicit, defaults
+AGENT_PROFILE_SOURCE_PRECEDENCE = project_local, user_global
+AGENT_PROFILE_MERGE = whole_definition_never_field_level
+AGENT_PROFILE_REQUIRED_ROLES_LOW = phase_worker, final_reviewer
+AGENT_PROFILE_REQUIRED_ROLES_MEDIUM = phase_worker, phase_reviewer, final_reviewer
+AGENT_PROFILE_REQUIRED_ROLES_HIGH = phase_worker, phase_reviewer, final_reviewer
+AGENT_PROFILE_PATH_CHECK_SCOPE = required_roles_only
+AGENT_PROFILE_EVIDENCE = profile_name, profile_source, requested_phases, resolved_commands, resolution_sources
+AGENT_PROFILE_SECRETS = never_recorded
+AGENT_PROFILE_RISK_DEPENDENCY = reads_settled_risk_never_modifies
+AGENT_PROFILE_QUALITY_AXIS = independent
+AGENT_PROFILE_LEGACY = omitted_profile_preserves_existing_behavior
+```
+
 ## 12. FAIL Loop
 
 이 절의 PASS/FAIL은 그 phase의 **phase gate** 판정을 뜻하며, phase gate가 무엇인지는 risk가
@@ -1521,6 +1679,22 @@ FINAL_REVIEW_REVALIDATIONS: none
 ## Non-Blocking Recommendations
 ```
 
+`profile`이 선택된 run에서만 최종 보고에 다음 두 줄을 추가한다. profile이 없는 run의 최종 보고는
+지금과 문자 단위로 동일하며 이 두 줄이 존재하지 않는다 — `AGENT_PROFILE: none`이라고 적지도 않는다.
+
+```text
+AGENT_PROFILE: <name> (<project_local|user_global>)
+AGENT_ROUTING:
+  <phase>  worker=<command> (<origin>)  reviewer=<command> (<origin>[, optional])
+```
+
+`AGENT_ROUTING:`에는 requested phase 전체의 Worker/Reviewer가 나타나며, 그 risk level에서 dispatch되지
+않는 optional Reviewer도 `optional` 표시와 함께 기록한다. optional은 dispatch 요건이지 기록 면제가
+아니다. profile이 선택된 run에서는 `WORKER:` / `REVIEWER:` 줄이 phase마다 달라질 수 있으므로
+`(per phase — see AGENT_ROUTING)`을 담고, profile이 없는 run에서는 지금과 같은 단일 값을 유지한다.
+
+Final Reviewer는 `AGENT_ROUTING:`에 `final_review reviewer=<command> (<origin>)`로 함께 기록한다.
+
 ## 17. Final Adversarial Review
 
 모든 requested phase가 자신의 **phase gate**를 PASS한 직후 Coordinator는 예외 없이 Final Adversarial
@@ -1533,7 +1707,10 @@ Reviewer의 존재를 전제하지 않는다.
 #### Role and freshness
 
 세 번째 역할이 아니다. §11 Reviewer Contract를 그대로 따르는 Reviewer instance이며 출력도 §11과 같다. terminal role은
-`phase_reviewer`, origin은 `self_created`, agent command는 phase Reviewer와 같은 `reviewer=`다. attempt마다 **새 terminal을
+`phase_reviewer`, origin은 `self_created`, agent command는 Final Reviewer resolution이 정한 값이다 —
+Agent Profile이 선택되었으면 `profile.final_review.reviewer` > explicit `reviewer=` >
+`profile.defaults.reviewer` 순서이고(phase Reviewer 체인과 1순위가 반대다), profile이 없으면 지금까지와
+같이 `reviewer=`다. 따라서 Final Reviewer는 phase Reviewer와 다른 command일 수 있다. attempt마다 **새 terminal을
 생성한다.** 이전 attempt의 terminal도 어떤 phase Reviewer terminal도 재사용하지 않는다. freshness는 model이 아니라 session의
 속성이며, 목적은 이전 판정 context의 상속을 끊는 것이다. §6 `#### 1. Immediate worker reuse`의 재사용 권장은 여기에 적용되지 않는다.
 
@@ -1708,6 +1885,7 @@ FINAL_REVIEW_OUT_OF_SCOPE_REASON = out_of_scope_final_review_finding
 FINAL_REVIEW_DOWNSTREAM_REVALIDATION = all_requested_phases_after_earliest_corrected_phase
 FINAL_REVIEW_COMPLETION_GATE = requested_phases_pass_and_final_review_pass
 FINAL_REVIEW_RISK_INDEPENDENCE = mandatory_and_identical_at_every_risk_level
+FINAL_REVIEW_AGENT_RESOLUTION = agent_profile_final_review_then_explicit_then_defaults
 ```
 
 ## 18. Core Invariants

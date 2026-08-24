@@ -10,7 +10,11 @@ from pathlib import Path
 from dataclasses import replace
 from unittest import mock
 
-from scripts.skill_policy import evaluate_invocation, load_policy_contract
+from scripts.skill_policy import (
+    evaluate_invocation,
+    finalize_routing,
+    load_policy_contract,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -393,7 +397,19 @@ class PolicySmokeTests(unittest.TestCase):
                 # that drops only the intentional fields, and two new assertions pin
                 # the asymmetry itself -- strictly more than the single assertEqual.
                 shared = [
-                    replace(decision, risk=None, risk_source=None)
+                    replace(
+                        decision,
+                        risk=None,
+                        risk_source=None,
+                        # OS-4 adds three fields that are None on every legacy
+                        # invocation, which is what these suffixes all are. They are
+                        # projected out for the same reason risk is: the equality
+                        # claim is about SHARED behaviour, not about the two skills
+                        # being identical.
+                        agent_profile=None,
+                        agent_profile_source=None,
+                        routing=None,
+                    )
                     for decision in decisions
                 ]
                 self.assertEqual(shared[0], shared[1])
@@ -410,6 +426,265 @@ class PolicySmokeTests(unittest.TestCase):
                     self.assertEqual(decisions[1].risk_source, "default")
                 else:
                     self.assertIn(decisions[1].risk, (None, "high"))
+
+
+class AgentProfileInvocationTests(unittest.TestCase):
+    """OS-4 at the invocation boundary: the two branches, and what separates them."""
+
+    def setUp(self) -> None:
+        self.temp_directory = tempfile.TemporaryDirectory()
+        root = Path(self.temp_directory.name)
+        self.project = root / "project"
+        self.home = root / "home"
+        (self.project / ".orca").mkdir(parents=True)
+        (self.home / ".orca").mkdir(parents=True)
+        (self.project / ".orca" / "agent-profiles.yaml").write_text(
+            "version: 1\n"
+            "profiles:\n"
+            "  diverse:\n"
+            "    defaults:\n      worker: claude\n      reviewer: codex\n"
+            "    final_review:\n      reviewer: codex\n",
+            encoding="utf-8",
+        )
+
+    def tearDown(self) -> None:
+        self.temp_directory.cleanup()
+
+    def evaluate(self, skill_path: Path, suffix: str, *, which=None):
+        def default_which(command: str):
+            # Everything the profile names exists; the legacy contract defaults do
+            # NOT. A profile run must not care about commands it replaced.
+            return f"/usr/bin/{command}" if command in {"claude", "codex"} else None
+
+        return evaluate_invocation(
+            skill_path,
+            f"/{skill_path.parent.name}{suffix}",
+            project_root=self.project,
+            home=self.home,
+            which=which or default_which,
+        )
+
+    def test_an_unused_legacy_default_missing_from_path_does_not_block(self) -> None:
+        """The defect the design review caught: a profile run must not be failed by
+        `claude-glm`/`claude-gemma` being absent when nothing will run them."""
+        for skill_path in SKILL_PATHS:
+            with self.subTest(skill=skill_path.parent.name):
+                decision = self.evaluate(
+                    skill_path, " profile=diverse phases=analysis 요청"
+                )
+                self.assertEqual(decision.status, "VALID", decision.reason)
+                self.assertEqual(decision.agent_profile, "diverse")
+                self.assertIsNotNone(decision.routing)
+
+    def test_an_unsafe_optional_reviewer_fails_closed_at_the_invocation_boundary(
+        self,
+    ) -> None:
+        """The other half of the same review defect, at the full evaluate_invocation
+        boundary rather than the unit level: LOW leaves the orchestration phase
+        Reviewer optional, and an unvalidated `bash` sitting there used to reach
+        should_execute=True. It must now fail closed before any Run exists, with
+        the same AGENT_NOT_ALLOWED reason the legacy path would report."""
+        (self.project / ".orca" / "agent-profiles.yaml").write_text(
+            "version: 1\n"
+            "profiles:\n"
+            "  unsafe:\n"
+            "    defaults:\n      worker: claude\n      reviewer: bash\n"
+            "    final_review:\n      reviewer: codex\n",
+            encoding="utf-8",
+        )
+        orchestration = SKILL_PATHS[1]
+        decision = self.evaluate(
+            orchestration, " profile=unsafe risk=low phases=analysis 요청"
+        )
+
+        self.assertEqual(decision.reason, "AGENT_NOT_ALLOWED")
+        self.assertFalse(decision.should_execute)
+
+    def test_an_out_of_request_phase_declaration_fails_closed_at_the_invocation_boundary(
+        self,
+    ) -> None:
+        """The re-review's own example, verbatim: a selected profile declaring
+        `phases.refactoring.worker: bash` used to be accepted whenever the
+        invocation only requested `phases=analysis`, because
+        materialize_run_routing() never materializes a phase nobody asked for.
+        The profile-definition-wide safety gate now catches it regardless of
+        which phases this particular invocation requests."""
+        (self.project / ".orca" / "agent-profiles.yaml").write_text(
+            "version: 1\n"
+            "profiles:\n"
+            "  tainted:\n"
+            "    defaults:\n      worker: claude\n      reviewer: codex\n"
+            "    phases:\n      refactoring:\n        worker: bash\n"
+            "    final_review:\n      reviewer: codex\n",
+            encoding="utf-8",
+        )
+        for skill_path in SKILL_PATHS:
+            with self.subTest(skill=skill_path.parent.name):
+                decision = self.evaluate(
+                    skill_path, " profile=tainted phases=analysis 요청"
+                )
+
+                self.assertEqual(decision.reason, "AGENT_NOT_ALLOWED")
+                self.assertFalse(decision.should_execute)
+
+    def test_contract_defaults_are_never_substituted_under_a_profile(self) -> None:
+        for skill_path in SKILL_PATHS:
+            with self.subTest(skill=skill_path.parent.name):
+                decision = self.evaluate(
+                    skill_path, " profile=diverse phases=analysis 요청"
+                )
+                self.assertEqual(decision.worker, "")
+                self.assertEqual(decision.reviewer, "")
+
+    def test_a_legacy_invocation_resolves_no_routing(self) -> None:
+        """Branch A leaves every OS-4 field None, which is what stops a routing
+        block, an evidence row and a report field from appearing."""
+        for skill_path in SKILL_PATHS:
+            with self.subTest(skill=skill_path.parent.name):
+                decision = self.evaluate(
+                    skill_path,
+                    " phases=analysis 요청",
+                    which=lambda command: f"/usr/bin/{command}",
+                )
+                self.assertEqual(decision.status, "VALID", decision.reason)
+                self.assertIsNone(decision.agent_profile)
+                self.assertIsNone(decision.routing)
+                self.assertEqual(decision.worker, "claude-glm")
+
+    def test_an_unknown_profile_fails_closed(self) -> None:
+        for skill_path in SKILL_PATHS:
+            with self.subTest(skill=skill_path.parent.name):
+                decision = self.evaluate(skill_path, " profile=nosuch phases=analysis 요청")
+                self.assertEqual(decision.reason, "UNKNOWN_AGENT_PROFILE")
+                self.assertFalse(decision.should_execute)
+
+    def test_an_empty_profile_value_is_explicit_not_omitted(self) -> None:
+        for skill_path in SKILL_PATHS:
+            with self.subTest(skill=skill_path.parent.name):
+                decision = self.evaluate(skill_path, " profile= phases=analysis 요청")
+                self.assertEqual(decision.reason, "UNKNOWN_AGENT_PROFILE")
+
+    def test_a_profile_name_containing_a_phase_word_is_not_a_phase_request(self) -> None:
+        """The token must leave `body` before natural-language phase detection."""
+        (self.project / ".orca" / "agent-profiles.yaml").write_text(
+            "version: 1\n"
+            "profiles:\n"
+            "  design_first:\n"
+            "    defaults:\n      worker: claude\n      reviewer: codex\n"
+            "    final_review:\n      reviewer: codex\n",
+            encoding="utf-8",
+        )
+        for skill_path in SKILL_PATHS:
+            with self.subTest(skill=skill_path.parent.name):
+                decision = self.evaluate(
+                    skill_path, " profile=design_first phases=analysis 요청"
+                )
+                self.assertEqual(decision.status, "VALID", decision.reason)
+                self.assertEqual(decision.phases, ("analysis",))
+
+    def test_a_required_role_that_cannot_resolve_blocks(self) -> None:
+        (self.project / ".orca" / "agent-profiles.yaml").write_text(
+            "version: 1\nprofiles:\n  thin:\n    defaults:\n      worker: claude\n",
+            encoding="utf-8",
+        )
+        # Orchestration always requires a Final Reviewer; the loop skill always
+        # requires a phase Reviewer. Neither resolves here.
+        for skill_path in SKILL_PATHS:
+            with self.subTest(skill=skill_path.parent.name):
+                decision = self.evaluate(skill_path, " profile=thin phases=analysis 요청")
+                self.assertEqual(decision.reason, "AGENT_ROLE_UNRESOLVED")
+
+    def test_a_natural_language_request_defers_routing_to_finalize(self) -> None:
+        """R9's second gate. When an LLM has to classify the phases, the routing
+        cannot be materialized at parse time -- so the gate MOVES, it is not skipped."""
+        for skill_path in SKILL_PATHS:
+            with self.subTest(skill=skill_path.parent.name):
+                decision = self.evaluate(skill_path, " profile=diverse 작업을 진행해줘")
+
+                self.assertEqual(decision.status, "VALID", decision.reason)
+                self.assertTrue(decision.requires_llm_phase_classification)
+                self.assertEqual(decision.phases, ())
+                # The profile is remembered; the routing is not yet built.
+                self.assertEqual(decision.agent_profile, "diverse")
+                self.assertIsNone(decision.routing)
+
+    def finalize(self, skill_path: Path, decision, phases, *, which=None):
+        def default_which(command: str):
+            return f"/usr/bin/{command}" if command in {"claude", "codex"} else None
+
+        return finalize_routing(
+            decision,
+            phases,
+            skill_path=skill_path,
+            project_root=self.project,
+            home=self.home,
+            which=which or default_which,
+        )
+
+    def test_finalize_routing_materializes_once_the_phases_are_settled(self) -> None:
+        for skill_path in SKILL_PATHS:
+            with self.subTest(skill=skill_path.parent.name):
+                decision = self.evaluate(skill_path, " profile=diverse 작업을 진행해줘")
+
+                final = self.finalize(skill_path, decision, ("analysis",))
+
+                self.assertEqual(final.status, "VALID", final.reason)
+                self.assertEqual(final.phases, ("analysis",))
+                self.assertIsNotNone(final.routing)
+                self.assertEqual(final.routing.requested_phases, ("analysis",))
+                self.assertFalse(final.requires_llm_phase_classification)
+
+    def test_finalize_routing_still_fails_closed(self) -> None:
+        """Deferring the gate must not weaken it: an unresolvable required role is
+        refused here exactly as it would have been at parse time."""
+        (self.project / ".orca" / "agent-profiles.yaml").write_text(
+            "version: 1\nprofiles:\n  thin:\n    defaults:\n      worker: claude\n",
+            encoding="utf-8",
+        )
+        for skill_path in SKILL_PATHS:
+            with self.subTest(skill=skill_path.parent.name):
+                decision = self.evaluate(skill_path, " profile=thin 작업을 진행해줘")
+
+                final = self.finalize(skill_path, decision, ("analysis",))
+
+                self.assertEqual(final.reason, "AGENT_ROLE_UNRESOLVED")
+                self.assertFalse(final.should_execute)
+
+    def test_finalize_routing_is_idempotent(self) -> None:
+        """A coordinator may call it unconditionally; a decision that already has a
+        routing comes back unchanged."""
+        skill_path = SKILL_PATHS[0]
+        decision = self.evaluate(skill_path, " profile=diverse phases=analysis 요청")
+        self.assertIsNotNone(decision.routing)
+
+        final = self.finalize(skill_path, decision, ("design",))
+
+        self.assertIs(final, decision)
+
+    def test_finalize_routing_leaves_a_legacy_decision_untouched(self) -> None:
+        """The legacy path passes through: no profile, no routing, no change."""
+        for skill_path in SKILL_PATHS:
+            with self.subTest(skill=skill_path.parent.name):
+                decision = self.evaluate(
+                    skill_path,
+                    " 작업을 진행해줘",
+                    which=lambda command: f"/usr/bin/{command}",
+                )
+
+                final = self.finalize(skill_path, decision, ("analysis",))
+
+                self.assertIs(final, decision)
+                self.assertIsNone(final.routing)
+
+    def test_the_loop_skill_also_resolves_a_profile(self) -> None:
+        """OS-4 applies to BOTH skills; only the consumed keys differ."""
+        decision = self.evaluate(
+            SKILL_PATHS[0], " profile=diverse phases=analysis 요청"
+        )
+
+        self.assertEqual(SKILL_PATHS[0].parent.name, "orca-worker-reviewer-loop")
+        self.assertIsNotNone(decision.routing)
+        self.assertEqual(decision.routing.runtime, "loop")
 
 
 if __name__ == "__main__":

@@ -20,6 +20,7 @@ try:
         resolve_quality_profile,
     )
     from scripts.task_context import (
+        build_agent_routing_context,
         CANONICAL_PHASES,
         FINAL_REVIEW_PHASE,
         TaskContextError,
@@ -43,6 +44,7 @@ except ModuleNotFoundError:  # direct `python3 scripts/...` execution
         resolve_quality_profile,
     )
     from task_context import (
+        build_agent_routing_context,
         CANONICAL_PHASES,
         FINAL_REVIEW_PHASE,
         TaskContextError,
@@ -365,6 +367,9 @@ class RuntimeAttempt:
     # can answer "which quality attributes did this dispatch actually carry" -- the
     # question a phase-filtering assertion is made of.
     quality_gate: tuple[tuple[str, str], ...] = ()
+    # OS-4: the routing block this attempt was dispatched with, parsed back out of
+    # its own spec. () for a legacy attempt, which renders no such block.
+    agent_routing: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass
@@ -453,6 +458,7 @@ def dispatch_context(
     requested_phases: tuple[str, ...] = (),
     risk: str = "high",
     risk_source: str = "default",
+    agent_routing: Any | None = None,
 ) -> tuple[str, dict[str, str], dict[str, Any] | None]:
     """The Task spec text an agent will actually receive, plus what went into it.
 
@@ -564,8 +570,23 @@ def dispatch_context(
     risk_context = build_risk_context(
         risk=risk, risk_source=risk_source, current_phase=phase
     )
+    # OS-4: a third block, built only when this run selected a profile. None is the
+    # legacy answer, and render_task_spec() then omits the block entirely -- which is
+    # why a profile-less dispatch keeps rendering byte-identical text.
+    routing_context = (
+        None
+        if agent_routing is None
+        else build_agent_routing_context(routing=agent_routing, current_phase=phase)
+    )
     return (
-        render_task_spec(base, boundary, reviewer_context, quality_gate, risk_context),
+        render_task_spec(
+            base,
+            boundary,
+            reviewer_context,
+            quality_gate,
+            risk_context,
+            routing_context,
+        ),
         boundary,
         reviewer_context,
     )
@@ -634,6 +655,7 @@ class OrcaRuntimeHarness:
         quality_profile_root: Path = REPO_ROOT,
         risk: str = "high",
         risk_source: str = "default",
+        agent_routing: Any | None = None,
     ) -> None:
         self.orca = self._resolve_orca()
         self.artifact_dir = artifact_dir
@@ -648,6 +670,12 @@ class OrcaRuntimeHarness:
         # closed at the final_review gate rather than silently widen to every phase --
         # see the External review MAJOR note in dispatch_context().
         self.requested_phases: tuple[str, ...] = ()
+        # OS-4: the run's single materialized routing, or None on the legacy path.
+        # Set once by the caller before the first dispatch and never re-resolved per
+        # attempt -- that is the property corrections and re-reviews depend on.
+        # None is the default so a scenario that selects no profile dispatches the
+        # same specs and records the same ledger values as before this field existed.
+        self.agent_routing = agent_routing
         # The tree the run's quality profile is read from, and the ONE resolution
         # every spec this harness renders is built from. start_run() re-reads it once
         # at the run boundary and then nothing re-reads it until the next run: a
@@ -1531,7 +1559,36 @@ class OrcaRuntimeHarness:
             risk=self.risk,
             timestamp=self._run_started_at,
         )
+        self.log_agent_routing_evidence()
         return self.run_id
+
+    def log_agent_routing_evidence(self) -> int:
+        """Write this run's agent-routing evidence. Returns the number of rows.
+
+        Here rather than before the Run because the log is run-scoped and needs the
+        run id; the ROUTING itself was materialized earlier, before any Run existed,
+        and is only being reported now.
+
+        Zero rows on the legacy path -- evidence_rows() returns () for a routing with
+        no profile, and there is no routing at all when `profile=` was omitted. That
+        is what keeps a profile-less run's ORCHESTRATOR_LOG.md byte-identical to one
+        produced before OS-4.
+
+        Every entry is written, optional ones included: "not dispatched at this risk
+        level" is a statement about the lifecycle, not permission to leave a resolved
+        command out of the record.
+        """
+        if self.agent_routing is None or not self.run_id:
+            return 0
+        rows = self.agent_routing.evidence_rows()
+        for row in rows:
+            self._safe_log(
+                run_logging.log_orchestrator_event,
+                self.run_id,
+                base=self.artifact_dir,
+                **row,
+            )
+        return len(rows)
 
     def create_task(self, spec: str, *, deps: tuple[str, ...] = ()) -> str:
         assert self.run_owner
@@ -1599,6 +1656,7 @@ class OrcaRuntimeHarness:
         resolutions: dict[str, str] | None = None,
         max_dispatches: int = 1,
         ask_before: bool = False,
+        phase: str = "",
     ) -> str:
         command = [
             "exec",
@@ -1620,7 +1678,14 @@ class OrcaRuntimeHarness:
         ]
         if ask_before:
             command.append("--ask-before")
-        agent_command = shlex.join(command)
+        # W-20 / OS-4: the value the reuse gate's condition 2 compares. Without a
+        # routing this stays the launch command line, exactly as before. With one it
+        # becomes the RESOLVED ROLE COMMAND for this phase, which is the identity
+        # that actually decides whether the next task may keep this session: a
+        # profile can route two phases of the same role to different agents, and
+        # reusing a session across that change would hand the next phase the wrong
+        # agent while every other reuse condition still passed.
+        agent_command = self.resolved_agent_command(role, phase) or shlex.join(command)
         created = self.call(
             "terminal",
             "create",
@@ -1642,6 +1707,24 @@ class OrcaRuntimeHarness:
             agent_command=agent_command,  # W-20: the reuse gate's condition 2 evidence
         )
         return handle
+
+    def resolved_agent_command(self, role: str, phase: str = "") -> str:
+        """The resolved command for `role` in `phase`, or "" when there is no routing.
+
+        Reads the run's already-materialized routing; resolves nothing. "" is the
+        legacy answer, and every caller falls back to what it used before -- which is
+        what keeps a scenario that selected no profile dispatching the same commands
+        and recording the same ledger values as before this method existed.
+        """
+        if self.agent_routing is None:
+            return ""
+        if role.startswith("final"):
+            entry = self.agent_routing.for_role("final_review", "final_reviewer")
+        else:
+            entry = self.agent_routing.for_role(
+                phase, "reviewer" if role.endswith("reviewer") else "worker"
+            )
+        return entry.command if entry is not None else ""
 
     def wait_for_tui_idle(self, terminal: str) -> str:
         """Middle rung of the custom-command placement ladder (SKILL.md section 6).
@@ -2273,6 +2356,7 @@ class OrcaRuntimeHarness:
                 requested_phases=self.requested_phases,
                 risk=self.risk,
                 risk_source=self.risk_source,
+                agent_routing=self.agent_routing,
             )
         except (TaskContextError, OrcaRuntimeError) as error:
             # OS-17 section 5: a pre-dispatch failure (invalid profile, an
@@ -2292,6 +2376,7 @@ class OrcaRuntimeHarness:
             resolutions=resolutions,
             max_dispatches=max_dispatches,
             ask_before=ask_before,
+            phase=phase,
         )
         dispatch_started_at = run_logging.now_iso()
         # round 5 review MAJOR: opened here, before start_worker(), so phase_start/
@@ -2379,6 +2464,7 @@ class OrcaRuntimeHarness:
                 requested_phases=self.requested_phases,
                 risk=self.risk,
                 risk_source=self.risk_source,
+                agent_routing=self.agent_routing,
             )
         except (TaskContextError, OrcaRuntimeError) as error:
             # Same OS-17 pre-dispatch-failure logging as run_existing_task's own
@@ -2427,6 +2513,7 @@ class OrcaRuntimeHarness:
                 requested_phases=self.requested_phases,
                 risk=self.risk,
                 risk_source=self.risk_source,
+                agent_routing=self.agent_routing,
             )
         except (TaskContextError, OrcaRuntimeError) as error:
             self._log_pre_dispatch_failure(
@@ -2440,7 +2527,9 @@ class OrcaRuntimeHarness:
             phase or "", iteration, opened_at=dispatch_started_at
         )
         task_id = self.create_task(spec)
-        handle = self.create_fake_terminal(role, "exit", iteration=iteration)
+        handle = self.create_fake_terminal(
+            role, "exit", iteration=iteration, phase=phase
+        )
         dispatch_id, supervised = self.start_worker(task_id, handle, spec)
         assert self.run_owner
         # Same STEP 0 gate as settle_attempt: this path also issues worker-abandon and
@@ -3201,6 +3290,7 @@ def _scenario_g(harness: OrcaRuntimeHarness) -> RuntimeScenarioResult:
         requested_phases=harness.requested_phases,
         risk=harness.risk,
         risk_source=harness.risk_source,
+        agent_routing=harness.agent_routing,
     )[0]
     # OS-3 MIGRATION (site 1 of the seven-site verdict table): the one positive
     # Worker + dependent-Reviewer pair in this file now goes through the risk-aware
@@ -3215,6 +3305,7 @@ def _scenario_g(harness: OrcaRuntimeHarness) -> RuntimeScenarioResult:
         requested_phases=harness.requested_phases,
         risk=harness.risk,
         risk_source=harness.risk_source,
+        agent_routing=harness.agent_routing,
     )[0]
     worker_task, reviewer_task = harness.create_phase_graph(worker_spec, reviewer_spec)
     if reviewer_task is None:
@@ -3263,6 +3354,7 @@ def _scenario_h(harness: OrcaRuntimeHarness) -> RuntimeScenarioResult:
         requested_phases=harness.requested_phases,
         risk=harness.risk,
         risk_source=harness.risk_source,
+        agent_routing=harness.agent_routing,
     )[0]
     worker_task = harness.create_task(worker_spec)
     worker_attempt, _ = harness.run_existing_task(
