@@ -944,7 +944,9 @@ python3 <SKILL_DIR>/tools/run_logging.py run-status --run-id <run-id> \
 
 `--started-at`/`--ended-at`/`--duration-seconds`는 여전히 받는다(사후 재구성 같은 정당한 용도가
 있다). 다만 어느 경로로 들어오든 판정은 같다: `ended_at`이 `started_at`보다 앞서거나, 파싱할 수
-없는 값이거나, 음수 duration이면 `duration_s`를 **빈 값으로 남기고** 그 row의 `detail`에
+없는 값이거나, 음수 duration이거나, 유한하지 않은 duration(`nan`/`inf`/`-inf` — NaN은 어떤 대소
+비교에도 걸리지 않으므로 "음수인가"만으로는 절대 걸러지지 않는다)이면 `duration_s`를
+**빈 값으로 남기고** 그 row의 `detail`에
 `timing_invalid=...` 표시를 덧붙인다. 0으로 clamp하거나 절댓값을 취하지 않는다 — 그러면 잘못된
 입력이 정상적인 측정값처럼 보이게 된다. `--duration-seconds`를 함께 주더라도 이 판정은 건너뛰지
 않는다 — 양쪽 timestamp가 모두 채워져 있으면 그 pair 자체를 먼저 검증하고, 불가능한 pair에 대해

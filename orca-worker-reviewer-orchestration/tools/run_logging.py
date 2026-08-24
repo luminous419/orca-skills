@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -117,10 +118,19 @@ ROUND_KIND_VALUES = (
 TIMING_INVALID_ORDER = "timing_invalid=ended_at_before_started_at"
 TIMING_INVALID_TIMESTAMP = "timing_invalid=unusable_timestamp"
 TIMING_INVALID_DURATION = "timing_invalid=negative_duration_seconds"
+# OS-19 Final Review R1: a negative duration is not the only impossible number a
+# caller can hand in. `float("nan")`, `float("inf")` and `float("-inf")` all
+# convert cleanly, and NaN in particular compares False against EVERY ordering
+# test -- so a `value < 0` guard lets it straight through and `duration_s` is
+# emitted as `nan`, which is not >= 0 and is not a measurement of anything. It
+# gets its own marker rather than borrowing the negative one, because a reader
+# grepping the log should not be told a NaN was a negative number.
+TIMING_INVALID_NONFINITE_DURATION = "timing_invalid=non_finite_duration_seconds"
 TIMING_INVALID_MARKERS = (
     TIMING_INVALID_ORDER,
     TIMING_INVALID_TIMESTAMP,
     TIMING_INVALID_DURATION,
+    TIMING_INVALID_NONFINITE_DURATION,
 )
 
 # OS-19 review round 1 BF-001: a marker alone was not enough. A row whose
@@ -206,6 +216,17 @@ def _validate_duration(duration: Any) -> tuple[float | str, str]:
     a negative value would otherwise still reach the file through that door. A
     value that is not a number at all is passed through untouched: this function
     exists to catch impossible measurements, not to police the column's type.
+
+    OS-19 Final Review R1: "not negative" is a weaker test than "is a duration".
+    A non-finite float parses as a number and then fails the `value < 0` guard --
+    NaN because every comparison against it is False, +inf because it is not
+    negative -- and would be written as `duration_s=nan` / `duration_s=inf`.
+    Neither is a count of seconds, so `math.isfinite` is checked FIRST and all
+    three (NaN, +inf, -inf) take the same fail-safe exit as a negative value:
+    the cell is left empty and `detail` says why. Nothing is clamped to 0 or
+    passed through `abs()` here either -- that would turn an impossible input
+    into a number a later reader could not tell apart from a real measurement,
+    which is the whole point of the OS-19 fix.
     """
     if duration in ("", None):
         return "", ""
@@ -213,6 +234,8 @@ def _validate_duration(duration: Any) -> tuple[float | str, str]:
         value = float(duration)
     except (TypeError, ValueError):
         return duration, ""
+    if not math.isfinite(value):
+        return "", TIMING_INVALID_NONFINITE_DURATION
     if value < 0:
         return "", TIMING_INVALID_DURATION
     return value, ""
@@ -409,7 +432,8 @@ def log_timing_event(
 
     OS-19: whichever door the duration comes through, it is the same fail-safe
     judgement -- an impossible measurement (an `ended_at` before its
-    `started_at`, an unusable timestamp, a negative explicit duration) leaves
+    `started_at`, an unusable timestamp, a negative or non-finite explicit
+    duration) leaves
     `duration_s` empty and appends a `timing_invalid=...` marker to `detail`
     rather than writing a number no reader could trust. This function still
     never raises: it is logging, and section 9 (OS-17) requires that a logging

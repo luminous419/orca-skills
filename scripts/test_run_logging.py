@@ -767,6 +767,148 @@ class TimingCorrectnessRegressionTests(unittest.TestCase):
         self.assertEqual(row["duration_s"], "")
         self.assertIn(run_logging.TIMING_INVALID_DURATION, row["detail"])
 
+    # ---- Final Review R1: the non-finite door ---------------------------------
+    #
+    # `--duration-seconds nan` is the Final Reviewer's own probe. It is not a
+    # negative number, so a `value < 0` guard never fires on it: NaN compares
+    # False against every ordering test, and +inf is simply not negative. Both
+    # reached `duration_s` verbatim, and neither `nan` nor `inf` satisfies the
+    # explicit `duration_s >= 0` requirement.
+
+    NONFINITE_PROBE = ("nan", "inf", "-inf", "NaN", "Infinity")
+
+    def test_a_non_finite_explicit_duration_is_refused_like_a_negative_one(
+        self,
+    ) -> None:
+        """The Final Review R1 probe verbatim: a VALID timestamp pair (so the
+        pair check cannot be what rejects the row) plus an explicit non-finite
+        duration. The cell must come back empty with a marker that names the
+        reason, never `nan`/`inf` -- and never clamped to 0 or `abs()`-ed into a
+        number a later reader would mistake for a measurement.
+        """
+        for index, supplied in enumerate(self.NONFINITE_PROBE):
+            with self.subTest(duration=supplied):
+                log_timing_event(
+                    "run_os19",
+                    base=self.base,
+                    event="dispatch_settled",
+                    phase="IMPLEMENTATION",
+                    role="reviewer",
+                    iteration=index,
+                    started_at="2026-01-01T00:00:00+00:00",
+                    ended_at="2026-01-01T00:00:01+00:00",
+                    duration_seconds=supplied,
+                )
+                row = self.rows()[-1]
+                self.assertEqual(row["duration_s"], "", row)
+                self.assertIn(
+                    run_logging.TIMING_INVALID_NONFINITE_DURATION, row["detail"]
+                )
+                # The pair itself was fine, so it is NOT quarantined -- only the
+                # impossible number was thrown away.
+                self.assertEqual(row["started_at"], "2026-01-01T00:00:00+00:00")
+                self.assertEqual(row["ended_at"], "2026-01-01T00:00:01+00:00")
+        self.assert_log_invariants()
+
+    def test_the_non_finite_floats_themselves_are_refused_not_only_their_spellings(
+        self,
+    ) -> None:
+        """The same three values as floats rather than strings: a Python caller
+        reaches `log_timing_event` directly, so `float("nan")` must be judged the
+        same as the CLI's `"nan"` text.
+        """
+        for index, supplied in enumerate(
+            (float("nan"), float("inf"), float("-inf"))
+        ):
+            with self.subTest(duration=supplied):
+                self.assertEqual(
+                    run_logging._validate_duration(supplied),
+                    ("", run_logging.TIMING_INVALID_NONFINITE_DURATION),
+                )
+                log_timing_event(
+                    "run_os19",
+                    base=self.base,
+                    event="dispatch_settled",
+                    phase="TEST",
+                    role="worker",
+                    iteration=index,
+                    duration_seconds=supplied,
+                )
+                row = self.rows()[-1]
+                self.assertEqual(row["duration_s"], "", row)
+                self.assertIn(
+                    run_logging.TIMING_INVALID_NONFINITE_DURATION, row["detail"]
+                )
+        self.assert_log_invariants()
+
+    def test_a_finite_explicit_duration_still_goes_through_untouched(self) -> None:
+        """The other half of R1: rejecting non-finite values may not cost the
+        ordinary case anything. Zero, a fraction and a large finite value are all
+        still written exactly as supplied, with no marker.
+        """
+        for index, (supplied, expected) in enumerate(
+            ((0, "0.000"), (0.5, "0.500"), (423, "423.000"), ("7", "7.000"))
+        ):
+            with self.subTest(duration=supplied):
+                log_timing_event(
+                    "run_os19",
+                    base=self.base,
+                    event="dispatch_settled",
+                    phase="DESIGN",
+                    role="worker",
+                    iteration=index,
+                    duration_seconds=supplied,
+                )
+                row = self.rows()[-1]
+                self.assertEqual(row["duration_s"], expected, row)
+                self.assertNotIn("timing_invalid=", row["detail"])
+        self.assert_log_invariants()
+
+    def test_the_cli_path_refuses_a_non_finite_duration_too(self) -> None:
+        """`timing-event --duration-seconds nan` is what a live Coordinator would
+        actually type, and the flag takes raw text -- so the runtime CLI path
+        gets the same probe, asserted over every row the run emitted.
+        """
+        for index, supplied in enumerate(self.NONFINITE_PROBE):
+            with self.subTest(duration=supplied):
+                stream = StringIO()
+                with redirect_stdout(stream):
+                    exit_code = cli_main(
+                        [
+                            "timing-event",
+                            "--run-id",
+                            "run_os19_nonfinite",
+                            "--base",
+                            str(self.base),
+                            "--event",
+                            "dispatch_settled",
+                            "--phase",
+                            "IMPLEMENTATION",
+                            "--role",
+                            "reviewer",
+                            "--iteration",
+                            str(index),
+                            "--started-at",
+                            "2026-01-01T00:00:00+00:00",
+                            "--ended-at",
+                            "2026-01-01T00:00:01+00:00",
+                            # `=` rather than a space: argparse would otherwise
+                            # read `-inf` as an option name.
+                            f"--duration-seconds={supplied}",
+                        ]
+                    )
+                self.assertEqual(exit_code, 0)
+                settled = [
+                    row
+                    for row in self.rows("run_os19_nonfinite")
+                    if row["event"] == "dispatch_settled"
+                ][-1]
+                self.assertEqual(settled["duration_s"], "", settled)
+                self.assertIn(
+                    run_logging.TIMING_INVALID_NONFINITE_DURATION, settled["detail"]
+                )
+        self.assert_log_invariants("run_os19_nonfinite")
+
     def test_a_mixed_awareness_pair_is_fail_safe_not_a_raise(self) -> None:
         """`datetime.fromisoformat` parses both sides, but subtracting an aware
         from a naive one raises TypeError -- which the pre-OS-19 code did not
@@ -1475,6 +1617,94 @@ class InstalledToolsTimingParityTests(unittest.TestCase):
                         started_at=started_at,
                         ended_at=ended_at,
                         duration_seconds=7,
+                    )
+                    python_log = timing_log_path(run_id, base=python_base)
+                    for column in ("started_at", "ended_at", "duration_s", "detail"):
+                        self.assertEqual(
+                            self.cell(installed_log, column),
+                            self.cell(python_log, column),
+                            f"{column} differs between the installed CLI and the "
+                            "Python path",
+                        )
+
+    def test_a_non_finite_duration_is_refused_through_the_installed_cli_too(
+        self,
+    ) -> None:
+        """Final Review R1, on the path a live Coordinator actually runs.
+
+        The Final Reviewer's probe went through the INSTALLED copy, so the
+        regression does too: a real subprocess, from an unrelated project
+        directory, with this repository's checkout off sys.path. `nan`, `inf`
+        and `-inf` must all come back with an empty `duration_s` and the
+        non-finite marker, and must match what the in-repo Python writer
+        produces for the same input -- byte-identity of the two files is not by
+        itself proof that the executed behaviour agrees.
+        """
+        with tempfile.TemporaryDirectory() as skills_home, tempfile.TemporaryDirectory() as target_project:
+            shutil.copytree(
+                REPO_ROOT / "orca-worker-reviewer-orchestration",
+                Path(skills_home) / "orca-worker-reviewer-orchestration",
+            )
+            installed_tool = (
+                Path(skills_home)
+                / "orca-worker-reviewer-orchestration"
+                / "tools"
+                / "run_logging.py"
+            )
+            for index, supplied in enumerate(("nan", "inf", "-inf")):
+                with self.subTest(duration=supplied):
+                    run_id = f"run_nonfinite_{index}"
+                    result = subprocess.run(
+                        [
+                            sys.executable,
+                            str(installed_tool),
+                            "timing-event",
+                            "--run-id",
+                            run_id,
+                            "--event",
+                            "dispatch_settled",
+                            "--phase",
+                            "IMPLEMENTATION",
+                            "--role",
+                            "reviewer",
+                            "--iteration",
+                            "2",
+                            "--started-at",
+                            "2026-01-01T00:00:00+00:00",
+                            "--ended-at",
+                            "2026-01-01T00:00:01+00:00",
+                            f"--duration-seconds={supplied}",
+                        ],
+                        cwd=target_project,
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    installed_log = (
+                        Path(target_project)
+                        / "artifacts"
+                        / "runs"
+                        / run_id
+                        / TIMING_LOG_FILENAME
+                    )
+                    self.assertEqual(self.cell(installed_log, "duration_s"), "")
+                    self.assertIn(
+                        run_logging.TIMING_INVALID_NONFINITE_DURATION,
+                        self.cell(installed_log, "detail"),
+                    )
+
+                    python_base = Path(target_project) / "python-path"
+                    log_timing_event(
+                        run_id,
+                        base=python_base,
+                        event="dispatch_settled",
+                        phase="IMPLEMENTATION",
+                        role="reviewer",
+                        iteration=2,
+                        started_at="2026-01-01T00:00:00+00:00",
+                        ended_at="2026-01-01T00:00:01+00:00",
+                        duration_seconds=supplied,
                     )
                     python_log = timing_log_path(run_id, base=python_base)
                     for column in ("started_at", "ended_at", "duration_s", "detail"):
