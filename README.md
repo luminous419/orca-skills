@@ -104,12 +104,21 @@ STATUS: BLOCKED
 REASON: INVALID_RISK
 ```
 
-**Churn.** For identical requested phases, `LOW < MEDIUM` always, and `MEDIUM < HIGH`
-whenever a correction or downstream revalidation occurs. `MEDIUM == HIGH` is a
-**documented, authorized exception** in exactly two cases — a clean first-pass run, and
-every BUGFIX/REFACTORING run — because HIGH's only churn-producing mechanism (T5a) is
-structurally inert in both: specialized phases have no canonical order, so their
-downstream set is always empty.
+**Churn.** For identical requested phases, `LOW < MEDIUM` always strictly, and churn is
+monotonic: `LOW <= MEDIUM <= HIGH`. `MEDIUM < HIGH` holds strictly in exactly one
+situation: a Final Adversarial Review FAIL routes a correction to some requested phase
+`p`, and the set of requested phases after `p` in canonical order is non-empty, so
+section 17's T5a downstream revalidation actually produces extra dispatches — that is
+HIGH's only churn-producing mechanism beyond MEDIUM. Everywhere else `MEDIUM == HIGH`,
+which is documented behavior, not a defect:
+
+- Final Review passes cleanly, whether or not a phase-local Reviewer FAIL/correction
+  happened along the way — that loop is identical at MEDIUM and HIGH and by itself
+  produces no extra HIGH churn.
+- A Final Review correction is routed to the last requested phase in canonical order,
+  so the downstream set is empty.
+- Every BUGFIX/REFACTORING run — specialized phases have no canonical order, so their
+  downstream set is always empty.
 
 **Safety floor.** Risk changes validation strength, never the safety floor. The section 14
 gates (IMPLEMENTATION unit tests, BUGFIX regression test, REFACTORING behavior

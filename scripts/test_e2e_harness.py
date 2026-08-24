@@ -2893,6 +2893,37 @@ class RiskWorkflowTests(unittest.TestCase):
             },
         )
 
+    def fail_then_pass_scenario_on_last_phase(
+        self, phases: tuple[str, ...]
+    ) -> WorkflowScenario:
+        """Final Review FAILs once, charged to the LAST requested phase, then passes.
+
+        Unlike `fail_then_pass_scenario` (charged to `phases[0]`), the corrected
+        phase here has no requested phase after it in canonical order, so section
+        17's downstream set D is empty and T5a has nothing to revalidate.
+        """
+        correction = FakeScenario(
+            ("correction",),
+            ("pass",),
+            worker_resolutions=({"R1": "RESOLVED"},),
+            worker_unit_test_statuses=("PASS",),
+        )
+        return WorkflowScenario(
+            phases=phases,
+            phase_scenarios={
+                phase: (
+                    self.PASSING_GATED
+                    if phase in UNIT_TEST_GATED_PHASES
+                    else self.PASSING
+                )
+                for phase in phases
+            },
+            final_review=FinalReviewScenario(
+                modes=("fail", "pass"), findings=((("R1", phases[-1]),), ())
+            ),
+            correction_scenarios={(phases[-1], 1): correction},
+        )
+
     def test_low_final_fail_routes_worker_only(self) -> None:
         """T-9. Correction runs with ZERO phase-Reviewer dispatches."""
         result = self.run_workflow(
@@ -2926,10 +2957,18 @@ class RiskWorkflowTests(unittest.TestCase):
             ["design", "implementation"],
         )
 
-    # ---- T-12: the authorized DQ-1 churn table -----------------------------------
+    # ---- T-12: churn is LOW <= MEDIUM <= HIGH, strict MEDIUM<HIGH only when T5a --
+    # ---- actually revalidates a non-empty downstream set ------------------------
 
-    def test_churn_ordering_on_the_correction_path_is_strict(self) -> None:
-        """T-12, row 2: LOW < MEDIUM < HIGH, strictly."""
+    def test_churn_ordering_when_t5a_actually_revalidates_something_is_strict(
+        self,
+    ) -> None:
+        """T-12, representative strict case: a Final Review correction is charged
+        to a NON-last requested phase, so T5a's downstream set D is non-empty and
+        HIGH strictly outdoes MEDIUM. This is the ONLY mechanism that makes HIGH
+        churn more than MEDIUM -- see the other T-12 cases below for the (more
+        common) MEDIUM == HIGH paths.
+        """
         phases = ("plan", "design", "implementation")
         churn = {
             risk: self.churn(
@@ -2940,11 +2979,65 @@ class RiskWorkflowTests(unittest.TestCase):
         self.assertLess(churn["low"], churn["medium"])
         self.assertLess(churn["medium"], churn["high"])
 
-    def test_churn_on_a_clean_first_pass_is_the_documented_exception(self) -> None:
-        """T-12, row 1: MEDIUM == HIGH, asserted as intended behaviour."""
+    def test_churn_on_a_clean_first_pass_is_medium_equals_high(self) -> None:
+        """T-12: no Final Review FAIL at all -> T5a never runs -> MEDIUM == HIGH."""
         phases = ("plan", "design", "implementation")
         churn = {
             risk: self.churn(self.run_workflow(self.clean_scenario(phases), risk=risk))
+            for risk in ("low", "medium", "high")
+        }
+        self.assertLess(churn["low"], churn["medium"])
+        self.assertEqual(churn["medium"], churn["high"])
+
+    def test_churn_with_only_a_phase_local_correction_is_medium_equals_high(
+        self,
+    ) -> None:
+        """T-12 (external review MAJOR, case 1): a phase-local Reviewer FAIL/
+        correction is IDENTICAL machinery at MEDIUM and HIGH -- it is not a
+        Final Review correction, so it never triggers T5a. A scenario where one
+        requested phase needs a phase-local correction but the Final Review still
+        passes cleanly must still show MEDIUM == HIGH; only a *Final Review*
+        correction with a non-empty downstream set (the test above) makes HIGH
+        strictly outdo MEDIUM.
+        """
+        phases = ("plan", "design", "implementation")
+        phase_local_correction = FakeScenario(
+            worker_modes=("complete", "correction"),
+            reviewer_modes=("fail", "pass"),
+            reviewer_findings=(("R1",), ()),
+            worker_resolutions=({}, {"R1": "RESOLVED"}),
+        )
+        scenario = WorkflowScenario(
+            phases=phases,
+            phase_scenarios={
+                "plan": phase_local_correction,
+                "design": self.PASSING,
+                "implementation": self.PASSING_GATED,
+            },
+            final_review=FinalReviewScenario(modes=("pass",)),
+        )
+        churn = {
+            risk: self.churn(self.run_workflow(scenario, risk=risk))
+            for risk in ("medium", "high")
+        }
+        self.assertEqual(churn["medium"], churn["high"])
+
+    def test_churn_with_final_review_correction_on_the_last_phase_is_medium_equals_high(
+        self,
+    ) -> None:
+        """T-12 (external review MAJOR, case 2): a Final Review correction charged
+        to the LAST requested phase in canonical order has an empty downstream set
+        D, so T5a has nothing left to revalidate even though a correction genuinely
+        happened. MEDIUM == HIGH here too -- strict inequality is not "whenever any
+        correction occurs," only when D is actually non-empty.
+        """
+        phases = ("plan", "design", "implementation")
+        churn = {
+            risk: self.churn(
+                self.run_workflow(
+                    self.fail_then_pass_scenario_on_last_phase(phases), risk=risk
+                )
+            )
             for risk in ("low", "medium", "high")
         }
         self.assertLess(churn["low"], churn["medium"])

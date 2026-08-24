@@ -715,19 +715,24 @@ HIGH
 - Final Review FAIL -> 책임 phase correction -> 그 phase Reviewer -> requested-phase downstream
   revalidation(§17 T5a) -> 새 Final Review.
 
-동일한 requested phase 집합에 대해 Reviewer/Task churn은 `LOW < MEDIUM`이 언제나 성립하고,
-correction 또는 downstream revalidation이 한 번이라도 발생하는 경로에서는 `MEDIUM < HIGH`가
-성립한다. 그 두 경우를 제외한 다음 두 상황에서는 `MEDIUM == HIGH`이며, 이는 결함이 아니라
-문서화된 예외다.
+동일한 requested phase 집합에 대해 Reviewer/Task churn은 `LOW < MEDIUM`이 언제나 엄격히
+성립하는 monotonic 관계 `LOW <= MEDIUM <= HIGH`를 따른다. `MEDIUM < HIGH`가 엄격히 성립하는
+경우는 정확히 하나뿐이다: Final Adversarial Review가 FAIL하여 어떤 requested phase p에 대한
+correction을 유발하고, canonical order 기준 p보다 뒤에 있는 requested phase의 집합(§17의 D)이
+공집합이 아니어서 §17 T5a downstream revalidation이 실제로 추가 dispatch를 만드는 경우다.
+HIGH가 MEDIUM보다 추가로 만드는 dispatch는 T5a 하나뿐이므로, 이 조건이 성립하지 않는 모든
+경로에서는 `MEDIUM == HIGH`이며 이는 결함이 아니라 문서화된 결과다.
 
 ```text
-1. 한 번도 FAIL 없이 통과한 clean first-pass run
-2. 모든 BUGFIX / REFACTORING run
+1. Final Review가 처음부터 PASS하는 경로. phase-local Reviewer FAIL/correction이 한 번이라도
+   있었더라도 마찬가지다 -- 그 correction loop는 MEDIUM과 HIGH에서 완전히 동일한 mechanism이므로
+   그 자체로는 추가 churn을 만들지 않는다.
+2. Final Review correction의 책임 phase가 requested phase 중 canonical order상 마지막이어서
+   downstream 집합이 공집합인 경로.
+3. 한 번도 FAIL 없이 통과한 clean first-pass run (1의 특수한 경우).
+4. 모든 BUGFIX / REFACTORING run. specialized phase는 canonical order가 없으므로 downstream
+   집합이 언제나 공집합이다(§17).
 ```
-
-HIGH가 MEDIUM보다 추가로 만드는 dispatch는 §17 T5a downstream revalidation 하나뿐이고,
-두 경우 모두 T5a가 구조적으로 실행되지 않기 때문이다. specialized phase는 canonical order에
-없으므로 downstream 집합 D가 언제나 공집합이다(§17).
 
 BUGFIX / REFACTORING × risk
 
