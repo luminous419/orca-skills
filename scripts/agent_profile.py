@@ -7,26 +7,35 @@ project quality profile) -- the one dependency that exists runs in a single
 direction: required_roles() READS the settled requested phases and risk to decide
 which roles must resolve, and never writes back to either.
 
-Two things in this module are deliberate and easy to undo by accident:
+Three things in this module are deliberate and easy to undo by accident:
 
 1. Parsing does NOT run the agent-command gate. build_agent_profiles() validates
    YAML shape, the closed key sets, types and the phase vocabulary, and stops
-   there. Whether a command may be executed cannot be answered until the requested
-   phases and the risk level are known, because that is what decides which roles
-   are actually required -- and a command in a role this run never dispatches must
-   not be able to block the run.
+   there. A command's SAFETY (is it even a plausible, allowlisted token) does not
+   depend on the requested phases or risk level and is answered at selection time
+   instead -- see (2). Its EXECUTABILITY (does this run actually need it, is it
+   on PATH) does depend on them, because that is what decides which roles are
+   actually required, and a command in a role this run never dispatches must not
+   be able to block the run over an environment fact -- see (3).
 
-2. The gate is therefore two functions, not one, each scoped to a different set
-   and a different question. validate_routing_command_safety() asks "is this a
-   safe, allowlisted command token" of every resolved entry in routing.entries --
-   required or not, because that is exactly the set evidence_rows() records, and
-   an unvalidated string must never reach the audit log even in an unused role.
-   validate_routing_commands() asks "does this command actually exist" of
-   routing.required_entries() only -- PATH is an environment fact, not a trust
-   question, and an unused-but-syntactically-safe command need not be installed.
-   Splitting the two means a `bash` sitting in an unused role is refused before a
-   Run ever exists, while an unused-but-valid command that simply is not on this
-   machine's PATH does not block anything.
+2. validate_profile_command_safety() asks "is this a safe, allowlisted command
+   token" of every command the SELECTED PROFILE DECLARES -- defaults, every
+   phase override regardless of whether this invocation requested that phase,
+   final_review -- plus any explicit worker=/reviewer= participating in this same
+   invocation. It runs once, right after selection, needs no requested-phase or
+   risk information at all, and never touches PATH. A profile is a single trust
+   document; a `bash` sitting in a phase this invocation did not ask for is not
+   made safe by that omission, because the very next invocation of the same
+   profile might ask for it.
+
+3. validate_routing_commands() asks "does this command actually exist" of
+   routing.required_entries() only, after requested phases and risk have decided
+   which roles are required. PATH is an environment fact, not a trust question,
+   so an unused-but-syntactically-safe command need not be installed. Splitting
+   safety from availability this way means an invalid or disallowed command
+   anywhere in the profile's definition is refused before a Run ever exists,
+   while an unused-but-valid command that simply is not on this machine's PATH
+   does not block anything.
 
 Standard library only, like every other module in scripts/. The restricted-subset
 YAML reader is reused from scripts.quality_profile rather than re-implemented:
@@ -738,46 +747,64 @@ def materialize_run_routing(
 # ---- the static safety gate --------------------------------------------------------------
 
 
-def validate_routing_command_safety(
-    routing: RunRouting,
+def validate_profile_command_safety(
+    profile: AgentProfile,
     *,
+    explicit_worker: str = "",
+    explicit_reviewer: str = "",
     token_pattern: re.Pattern[str],
     known_commands: Iterable[str],
     custom_command_pattern: re.Pattern[str],
 ) -> None:
     """Apply the STATIC half of the agent-command trust boundary -- token shape and
-    allowlist membership, never PATH -- to every resolved entry this routing
-    carries, required or not.
+    allowlist membership, never PATH -- to every command the SELECTED PROFILE
+    DECLARES, whether or not this invocation's requested phases will ever
+    materialize or dispatch it, plus any explicit worker=/reviewer= value
+    participating in this same selected-profile invocation.
 
-    `routing.entries` is exactly the set `evidence_rows()` records (optional
-    entries included) and exactly the set a selected profile can populate for this
-    run's requested phases plus, for orchestration, the Final Reviewer. An unused
-    role being merely absent from PATH is not a safety problem -- nothing will try
-    to run it -- but an unused role holding `bash`, a shell fragment, or a
-    credential-shaped string is a safety problem the moment it reaches audit
-    evidence verbatim, whether or not this run happens to dispatch it. That is
-    the boundary this function closes: PATH availability stays scoped to
-    routing.required_entries() in validate_routing_commands(), but token shape and
-    allowlist membership apply here, unconditionally, before evidence can ever be
-    written and before the Run exists.
+    This deliberately does NOT operate on RunRouting.entries.
+    materialize_run_routing() only builds entries for requested phases (plus, for
+    orchestration, Final Review) -- an intentional, unrelated decision about WHAT
+    RUNS that this function does not touch or widen: it validates the profile
+    DEFINITION itself, once, at selection time, before any phase is even known.
+    A profile is a single trust document an operator wrote; `bash` sitting in
+    `phases.refactoring.worker` is not made safe by this invocation asking only
+    for `analysis` -- the very next invocation of the same profile might ask for
+    `refactoring`, and evidence_rows() would then record it verbatim. Checking the
+    whole definition once here closes that gap without ever creating a Task,
+    Dispatch, or routing entry for a phase nobody requested.
+
+    PATH existence is deliberately excluded, for a different run each time: it is
+    an environment fact, not a trust question, and applies only to
+    routing.required_entries() in validate_routing_commands().
     """
     allowed = set(known_commands)
-    targets = tuple(entry for entry in routing.entries if entry.resolved)
+    commands: list[tuple[str, str]] = []
+    for role, command in profile.defaults:
+        if command:
+            commands.append((f"defaults.{role}", command))
+    for phase_name, roles in profile.phases:
+        for role, command in roles:
+            if command:
+                commands.append((f"phases.{phase_name}.{role}", command))
+    for role, command in profile.final_review:
+        if command:
+            commands.append((f"final_review.{role}", command))
+    if explicit_worker:
+        commands.append(("explicit.worker", explicit_worker))
+    if explicit_reviewer:
+        commands.append(("explicit.reviewer", explicit_reviewer))
 
-    for entry in targets:
-        if not token_pattern.fullmatch(entry.command):
+    for location, command in commands:
+        if not token_pattern.fullmatch(command):
             raise AgentProfileError(
-                f"{entry.phase}.{entry.role}: {entry.command!r} is not a simple "
-                "PATH command token",
+                f"{location}: {command!r} is not a simple PATH command token",
                 reason=REASON_INVALID_COMMAND,
             )
-    for entry in targets:
-        if entry.command not in allowed and not custom_command_pattern.fullmatch(
-            entry.command
-        ):
+    for location, command in commands:
+        if command not in allowed and not custom_command_pattern.fullmatch(command):
             raise AgentProfileError(
-                f"{entry.phase}.{entry.role}: {entry.command!r} is outside the "
-                "agent trust boundary",
+                f"{location}: {command!r} is outside the agent trust boundary",
                 reason=REASON_COMMAND_NOT_ALLOWED,
             )
 
@@ -796,20 +823,21 @@ def validate_routing_commands(
     """Apply the full agent-command boundary -- token, allowlist, AND PATH -- to
     required routing, and only required routing.
 
-    Call this AFTER validate_routing_command_safety() has already cleared every
-    entry's token and allowlist, required or not; the two token/allowlist passes
-    here re-check required entries specifically so the reported error and its
-    ordering match exactly what the legacy (no-profile) path would have reported
-    for the same command, then add the one check safety-only cannot make: PATH
-    existence, which is the deliberately narrower gate.
+    Call this AFTER validate_profile_command_safety() has already cleared the
+    whole profile definition's token and allowlist safety; the two token/allowlist
+    passes here re-check required entries specifically so the reported error and
+    its ordering match exactly what the legacy (no-profile) path would have
+    reported for the same command, then add the one check safety-only cannot
+    make: PATH existence, which is the deliberately narrower gate.
 
     The PATH target set is required_entries(). An optional or non-consumed entry
     is never dispatched, so its command cannot reach execution and must not be
     able to block the run over an environment fact -- an unused
     `phases.refactoring.worker` on a run that asked only for `analysis`, a
     LOW-risk phase Reviewer, a loop run's final_review.reviewer. Static safety for
-    those same entries already happened in validate_routing_command_safety(); this
-    function narrows only the availability check, never the trust boundary.
+    every entry's command -- required or not, requested phase or not -- already
+    happened in validate_profile_command_safety(); this function narrows only the
+    availability check, never the trust boundary.
 
     Unresolved required entries are not this function's business; validate_required_roles()
     reports those, with the reason code that says a role is missing rather than wrong.

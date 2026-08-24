@@ -729,10 +729,11 @@ class ValidatorRegressionTests(unittest.TestCase):
         )
 
     def test_a_skill_losing_the_all_entries_safety_scope_fails(self) -> None:
-        """The prose that keeps token/allowlist from narrowing back to required-only."""
+        """The prose that keeps token/allowlist from narrowing back to
+        required-only or requested-phase-only."""
         self.mutate_orchestration_skill(
-            "모든 resolved entry에 token -> allowlist 검사 (required 여부와 무관)",
-            "required role에만 token -> allowlist 검사",
+            "selected profile이 선언한 모든 command**다",
+            "selected profile이 선언한 required command만",
         )
 
         self.assert_lifecycle_contract_rejected(

@@ -500,6 +500,33 @@ class AgentProfileInvocationTests(unittest.TestCase):
         self.assertEqual(decision.reason, "AGENT_NOT_ALLOWED")
         self.assertFalse(decision.should_execute)
 
+    def test_an_out_of_request_phase_declaration_fails_closed_at_the_invocation_boundary(
+        self,
+    ) -> None:
+        """The re-review's own example, verbatim: a selected profile declaring
+        `phases.refactoring.worker: bash` used to be accepted whenever the
+        invocation only requested `phases=analysis`, because
+        materialize_run_routing() never materializes a phase nobody asked for.
+        The profile-definition-wide safety gate now catches it regardless of
+        which phases this particular invocation requests."""
+        (self.project / ".orca" / "agent-profiles.yaml").write_text(
+            "version: 1\n"
+            "profiles:\n"
+            "  tainted:\n"
+            "    defaults:\n      worker: claude\n      reviewer: codex\n"
+            "    phases:\n      refactoring:\n        worker: bash\n"
+            "    final_review:\n      reviewer: codex\n",
+            encoding="utf-8",
+        )
+        for skill_path in SKILL_PATHS:
+            with self.subTest(skill=skill_path.parent.name):
+                decision = self.evaluate(
+                    skill_path, " profile=tainted phases=analysis 요청"
+                )
+
+                self.assertEqual(decision.reason, "AGENT_NOT_ALLOWED")
+                self.assertFalse(decision.should_execute)
+
     def test_contract_defaults_are_never_substituted_under_a_profile(self) -> None:
         for skill_path in SKILL_PATHS:
             with self.subTest(skill=skill_path.parent.name):

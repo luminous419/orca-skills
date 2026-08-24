@@ -481,12 +481,13 @@ AGENT_PROFILE_LEGACY_PROSE_ANCHOR = (
     "`profile`을 생략하면 기존 동작을 그대로 유지한다"
 )
 # The two-gate split, in the prose a reader actually meets: token/allowlist over
-# every resolved entry, PATH narrowed to required roles only.
+# the WHOLE selected profile definition (every phase, requested or not, plus
+# participating explicit values), PATH narrowed to required roles only.
 AGENT_PROFILE_SAFETY_ALL_ENTRIES_PROSE_ANCHOR = (
-    "모든 resolved entry에 token -> allowlist 검사 (required 여부와 무관)"
+    "selected profile이 선언한 모든 command**다"
 )
 AGENT_PROFILE_PATH_REQUIRED_ONLY_PROSE_ANCHOR = (
-    "PATH 검사만\n**required role로 좁힌다**"
+    "PATH 검사만 **required role로 좁힌다**"
 )
 # Section 6 must say that risk chooses which graph NODES exist, never WHEN they are
 # created -- the sentence that keeps LOW from leaving an orphan ready Reviewer Task.

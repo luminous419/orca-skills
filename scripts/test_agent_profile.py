@@ -55,7 +55,7 @@ from scripts.agent_profile import (
     resolve_phase_role,
     select_agent_profile,
     validate_required_roles,
-    validate_routing_command_safety,
+    validate_profile_command_safety,
     validate_routing_commands,
 )
 from scripts.quality_profile import APPLICABLE_PHASES
@@ -117,12 +117,16 @@ def gate(routing, *, which=always_found) -> None:
     )
 
 
-def gate_safety(routing) -> None:
+def gate_profile_safety(profile, *, explicit_worker="", explicit_reviewer="") -> None:
     """The static half only -- no `which`, because the function under test never
     takes one. Its absence from the signature is itself part of what these tests
-    pin: PATH cannot leak into this gate even by accident."""
-    validate_routing_command_safety(
-        routing,
+    pin: PATH cannot leak into this gate even by accident. Operates on the whole
+    profile DEFINITION, not on materialized routing -- see
+    validate_profile_command_safety()."""
+    validate_profile_command_safety(
+        profile,
+        explicit_worker=explicit_worker,
+        explicit_reviewer=explicit_reviewer,
         token_pattern=AGENT_COMMAND_PATTERN,
         known_commands=KNOWN_COMMANDS,
         custom_command_pattern=CUSTOM_PATTERN,
@@ -728,68 +732,65 @@ class RequiredCommandGateTests(unittest.TestCase):
         )
 
 
-class AllEntriesCommandSafetyTests(unittest.TestCase):
-    """validate_routing_command_safety(): token + allowlist over every RESOLVED
-    entry this routing materialized, required or not. This is the review fix --
-    an unused role must not be a channel for an unvalidated string to reach audit
-    evidence. PATH is deliberately absent from this gate; NonRequiredEntryTests
-    below still proves an unused-but-safe command missing from PATH does not
-    block anything, and that stays validate_routing_commands()'s job alone.
+class WholeProfileCommandSafetyTests(unittest.TestCase):
+    """validate_profile_command_safety(): token + allowlist over EVERY command the
+    SELECTED PROFILE DECLARES -- defaults, every phase (requested or not),
+    final_review -- plus any explicit worker=/reviewer= participating in this
+    invocation. This is the review's corrected scope: the first cut of this fix
+    only checked materialize_run_routing()'s output, which never contains a phase
+    this invocation did not request, so `phases.refactoring.worker: bash` still
+    slipped through whenever the request was `phases=analysis`. This gate
+    validates the PROFILE DEFINITION directly and needs no requested-phase or
+    risk information at all. PATH is deliberately absent from this gate;
+    NonRequiredEntryTests below still proves an unused-but-safe command missing
+    from PATH does not block anything once routing IS materialized, and that
+    stays validate_routing_commands()'s job alone.
     """
 
-    def routing(self, text, *, risk="low", phases=("analysis",), runtime=RUNTIME_ORCHESTRATION):
-        from scripts.agent_profile import AgentProfileSelection
-
+    def profile(self, text):
         profiles = load(text)
         name = next(iter(profiles))
-        return materialize_run_routing(
-            runtime=runtime,
-            selection=AgentProfileSelection(
-                status=SELECTION_SELECTED, name=name, profile=profiles[name]
-            ),
-            requested_phases=phases,
-            risk=risk,
-        )
+        return profiles[name]
 
-    def assert_blocked(self, routing, reason) -> None:
+    def assert_blocked(self, profile, reason, **kwargs) -> None:
         with self.assertRaises(AgentProfileError) as caught:
-            gate_safety(routing)
+            gate_profile_safety(profile, **kwargs)
         self.assertEqual(caught.exception.reason, reason)
 
     def test_an_unused_optional_reviewer_of_bash_is_agent_not_allowed(self) -> None:
         """The review's own example: LOW leaves the phase Reviewer optional, and
-        the old required-only gate let `bash` sit there unvalidated."""
-        routing = self.routing(
+        the required-only gate alone let `bash` sit there unvalidated."""
+        profile = self.profile(
             "version: 1\nprofiles:\n  p:\n"
             "    defaults:\n      worker: claude\n      reviewer: bash\n"
             "    final_review:\n      reviewer: codex\n"
         )
 
-        self.assert_blocked(routing, REASON_COMMAND_NOT_ALLOWED)
+        self.assert_blocked(profile, REASON_COMMAND_NOT_ALLOWED)
 
     def test_an_unused_optional_reviewer_with_a_shell_fragment_is_invalid_agent_command(
         self,
     ) -> None:
-        routing = self.routing(
+        profile = self.profile(
             "version: 1\nprofiles:\n  p:\n"
             "    defaults:\n      worker: claude\n"
             '      reviewer: "claude && rm -rf /"\n'
             "    final_review:\n      reviewer: codex\n"
         )
 
-        self.assert_blocked(routing, REASON_INVALID_COMMAND)
+        self.assert_blocked(profile, REASON_INVALID_COMMAND)
 
     def test_an_unused_optional_reviewer_with_a_space_containing_value_is_invalid_agent_command(
         self,
     ) -> None:
-        routing = self.routing(
+        profile = self.profile(
             "version: 1\nprofiles:\n  p:\n"
             "    defaults:\n      worker: claude\n"
             '      reviewer: "my agent"\n'
             "    final_review:\n      reviewer: codex\n"
         )
 
-        self.assert_blocked(routing, REASON_INVALID_COMMAND)
+        self.assert_blocked(profile, REASON_INVALID_COMMAND)
 
     def test_an_unused_optional_reviewer_shaped_like_a_credential_is_not_allowed(
         self,
@@ -798,94 +799,115 @@ class AllEntriesCommandSafetyTests(unittest.TestCase):
         alphanumeric-and-dashes) but is not on the allowlist and does not match
         the claude-/codex- wrapper pattern, so it is refused before it can ever
         reach `detail=command=...` in an evidence row."""
-        routing = self.routing(
+        profile = self.profile(
             "version: 1\nprofiles:\n  p:\n"
             "    defaults:\n      worker: claude\n"
             "      reviewer: sk-ant-api03-not-a-real-key-0000000000\n"
             "    final_review:\n      reviewer: codex\n"
         )
 
-        self.assert_blocked(routing, REASON_COMMAND_NOT_ALLOWED)
+        self.assert_blocked(profile, REASON_COMMAND_NOT_ALLOWED)
 
-    def test_an_out_of_request_phase_command_is_still_untouched(self) -> None:
-        """This gate is scoped to MATERIALIZED entries (requested phases plus
-        Final Review), not the raw profile document. A phase this run never
-        requested was never materialized and stays outside both gates -- that is
-        the existing, unchanged, intentional boundary NonRequiredEntryTests pins
-        for validate_routing_commands(); this test pins the same boundary for the
-        new safety gate so the two do not quietly drift apart."""
-        routing = self.routing(
+    def test_an_out_of_request_phase_declaration_is_now_checked_and_disallowed(
+        self,
+    ) -> None:
+        """The exact re-review defect: `phases.refactoring.worker: bash` used to
+        pass because materialize_run_routing() never materializes a phase this
+        invocation did not request. This gate validates the profile DEFINITION,
+        not materialized routing, so an out-of-request phase's command is checked
+        regardless of what this particular invocation asked for."""
+        profile = self.profile(
             "version: 1\nprofiles:\n  p:\n"
             "    defaults:\n      worker: claude\n      reviewer: codex\n"
             "    phases:\n      refactoring:\n        worker: bash\n"
         )
 
-        gate_safety(routing)
+        self.assert_blocked(profile, REASON_COMMAND_NOT_ALLOWED)
 
-    def test_loop_never_materializes_a_final_review_entry_to_check(self) -> None:
-        """Loop has no Final Adversarial Review, so materialize_run_routing()
-        never creates a final_review entry for it at all -- there is nothing for
-        this gate (or any gate) to see, safe or not. Mirrors
-        NonRequiredEntryTests.test_loop_ignores_a_disallowed_final_review_reviewer
-        for the new safety gate, so the two cannot quietly drift apart."""
-        routing = self.routing(
-            "version: 1\nprofiles:\n  p:\n"
-            "    defaults:\n      worker: claude\n      reviewer: codex\n"
-            "    final_review:\n      reviewer: bash\n",
-            runtime=RUNTIME_LOOP,
-            risk=None,
-        )
-
-        self.assertIsNone(routing.for_role("final_review", ROLE_FINAL_REVIEWER))
-        gate_safety(routing)  # must not raise: nothing was materialized to check
-
-    def test_a_disallowed_final_review_reviewer_is_not_allowed_for_orchestration(
+    def test_an_out_of_request_phase_declaration_with_a_malformed_token_is_disallowed(
         self,
     ) -> None:
-        """Orchestration DOES materialize this entry (it has a Final Adversarial
-        Review), so it owes the same static safety as any other entry."""
-        routing = self.routing(
+        profile = self.profile(
+            "version: 1\nprofiles:\n  p:\n"
+            "    defaults:\n      worker: claude\n      reviewer: codex\n"
+            '    phases:\n      refactoring:\n        worker: "not a token"\n'
+        )
+
+        self.assert_blocked(profile, REASON_INVALID_COMMAND)
+
+    def test_an_out_of_request_phase_declaration_that_is_valid_still_passes(
+        self,
+    ) -> None:
+        """Positive control paired with the two negatives above: a genuinely
+        allowlisted, well-formed command in an out-of-request phase is not
+        refused merely for being declared there."""
+        profile = self.profile(
+            "version: 1\nprofiles:\n  p:\n"
+            "    defaults:\n      worker: claude\n      reviewer: codex\n"
+            "    phases:\n      refactoring:\n        worker: claude-glm\n"
+        )
+
+        gate_profile_safety(profile)  # must not raise
+
+    def test_a_disallowed_final_review_reviewer_is_not_allowed(self) -> None:
+        """final_review.reviewer is a known key for BOTH skills (loop just does
+        not consume it for dispatch) -- it is still part of the profile
+        definition and still owes static safety, independent of runtime."""
+        profile = self.profile(
             "version: 1\nprofiles:\n  p:\n"
             "    defaults:\n      worker: claude\n      reviewer: codex\n"
             "    final_review:\n      reviewer: bash\n"
         )
 
-        self.assert_blocked(routing, REASON_COMMAND_NOT_ALLOWED)
+        self.assert_blocked(profile, REASON_COMMAND_NOT_ALLOWED)
 
-    def test_an_unused_but_safe_entry_passes_with_no_which_call(self) -> None:
-        """Positive control, paired with the four negatives above: a resolved,
-        allowlisted, unused command is never blocked by this gate, and the gate
-        needs no `which` to decide that -- proving PATH truly plays no part."""
-        routing = self.routing(
+    def test_a_participating_explicit_reviewer_of_bash_is_not_allowed(self) -> None:
+        """The other half of the re-review instruction: explicit worker=/
+        reviewer= values that participate in a selected-profile invocation are
+        in scope too, even though they are not part of the profile file itself."""
+        profile = self.profile(
+            "version: 1\nprofiles:\n  p:\n    defaults:\n      worker: claude\n"
+        )
+
+        self.assert_blocked(
+            profile, REASON_COMMAND_NOT_ALLOWED, explicit_reviewer="bash"
+        )
+
+    def test_a_non_participating_explicit_value_is_not_checked(self) -> None:
+        """An explicit value that was never supplied for this invocation
+        (empty string, the "not given" sentinel used throughout this module)
+        contributes nothing to check and must not be treated as a declared bash
+        by accident."""
+        profile = self.profile(
+            "version: 1\nprofiles:\n  p:\n    defaults:\n      worker: claude\n"
+        )
+
+        gate_profile_safety(profile, explicit_reviewer="")  # must not raise
+
+    def test_an_unused_but_safe_declaration_passes_with_no_which_call(self) -> None:
+        """Positive control: a resolved, allowlisted, unused command anywhere in
+        the profile is never blocked by this gate, and the gate needs no `which`
+        to decide that -- proving PATH truly plays no part."""
+        profile = self.profile(
             "version: 1\nprofiles:\n  p:\n"
             "    defaults:\n      worker: claude\n      reviewer: claude-glm\n"
             "    final_review:\n      reviewer: codex\n"
         )
 
-        gate_safety(routing)  # must not raise
+        gate_profile_safety(profile)  # must not raise
 
-    def test_the_safety_gate_target_set_is_every_resolved_entry(self) -> None:
-        """Contrast with test_the_gate_target_set_is_exactly_required_entries
-        directly above: required_entries() is a strict subset of what this gate
-        checks, not the whole set."""
-        routing = self.routing(VALID, risk="low", phases=("design",))
+    def test_the_safety_gate_target_set_is_the_whole_profile_not_any_routing(
+        self,
+    ) -> None:
+        """Contrast with test_the_gate_target_set_is_exactly_required_entries in
+        RequiredCommandGateTests: this gate never materializes routing at all, so
+        its target set is every command VALID declares -- including
+        `implementation`, a phase no test in this class ever requests."""
+        profile = self.profile(VALID)
 
-        targets = {
-            (entry.phase, entry.role)
-            for entry in routing.entries
-            if entry.resolved
-        }
-        required = {(entry.phase, entry.role) for entry in routing.required_entries()}
-
-        self.assertEqual(
-            targets,
-            {
-                ("design", ROLE_WORKER),
-                ("design", ROLE_REVIEWER),
-                ("final_review", ROLE_FINAL_REVIEWER),
-            },
-        )
-        self.assertLess(required, targets)
+        gate_profile_safety(profile)  # design + implementation + final_review,
+        # all allowlisted -- must not raise regardless of any requested phase.
+        self.assertEqual(profile.phase_for("implementation", ROLE_WORKER), "codex")
 
 
 class NonRequiredEntryTests(unittest.TestCase):

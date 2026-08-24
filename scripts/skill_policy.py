@@ -19,7 +19,7 @@ try:  # pragma: no cover - import shim, exercised by both invocation forms
         materialize_run_routing,
         select_agent_profile,
         validate_required_roles,
-        validate_routing_command_safety,
+        validate_profile_command_safety,
         validate_routing_commands,
     )
 except ImportError:  # pragma: no cover - same module, flat import path
@@ -31,7 +31,7 @@ except ImportError:  # pragma: no cover - same module, flat import path
         materialize_run_routing,
         select_agent_profile,
         validate_required_roles,
-        validate_routing_command_safety,
+        validate_profile_command_safety,
         validate_routing_commands,
     )
 
@@ -285,10 +285,13 @@ def evaluate_invocation(
     # is optional at this risk level and will never be dispatched.
     #
     # For Branch B the gate is two functions in _resolve_agent_routing():
-    # validate_routing_command_safety() over EVERY resolved entry (token +
-    # allowlist, required or not -- this is what evidence_rows() will record),
-    # then validate_routing_commands() over required_entries() only (adds PATH).
-    # Those are the only places a profile-path command is judged.
+    # validate_profile_command_safety() over the WHOLE selected profile
+    # definition plus any explicit worker=/reviewer= (token + allowlist,
+    # regardless of requested phases or required-ness -- this runs once, right
+    # after selection, before phases are even known), then
+    # validate_routing_commands() over required_entries() only (adds PATH, once
+    # phases and risk have decided what is required). Those are the only places
+    # a profile-path command is judged.
     profile_selected = "profile" in explicit
     worker = explicit.get("worker", "" if profile_selected else defaults["worker"])
     reviewer = explicit.get("reviewer", "" if profile_selected else defaults["reviewer"])
@@ -509,6 +512,26 @@ def _resolve_agent_routing(
             decision, status="BLOCKED", reason=selection.reason, should_execute=False
         )
 
+    if selection.is_selected and selection.profile is not None:
+        # Whole-definition static safety, before anything about requested phases
+        # or risk is even consulted: this validates the PROFILE, not this
+        # invocation's materialized routing, so it runs exactly once regardless
+        # of which phases end up requested. See validate_profile_command_safety()
+        # for why this cannot be deferred to the materialized-routing gate below.
+        try:
+            validate_profile_command_safety(
+                selection.profile,
+                explicit_worker=decision.worker or "",
+                explicit_reviewer=decision.reviewer or "",
+                token_pattern=AGENT_COMMAND_PATTERN,
+                known_commands=known_commands,
+                custom_command_pattern=custom_command_pattern,
+            )
+        except AgentProfileError as exc:
+            return replace(
+                decision, status="BLOCKED", reason=exc.reason, should_execute=False
+            )
+
     if decision.requires_llm_phase_classification:
         # The requested phase set is not known yet, so there is nothing to
         # materialize. The gate is not skipped -- it moves to finalize_routing(),
@@ -531,17 +554,8 @@ def _resolve_agent_routing(
         explicit_reviewer=decision.reviewer or "",
     )
     try:
-        # Static safety first, over EVERY resolved entry (required or not) --
-        # this is the set evidence_rows() will later record, so nothing reaches
-        # audit evidence without having passed token+allowlist. PATH is a
-        # narrower, environment-only question and is checked second, for
-        # required_entries() only.
-        validate_routing_command_safety(
-            routing,
-            token_pattern=AGENT_COMMAND_PATTERN,
-            known_commands=known_commands,
-            custom_command_pattern=custom_command_pattern,
-        )
+        # Availability only, for required_entries() only. Safety (token +
+        # allowlist) already ran above, once, over the whole profile definition.
         validate_routing_commands(
             routing,
             token_pattern=AGENT_COMMAND_PATTERN,

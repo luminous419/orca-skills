@@ -365,20 +365,26 @@ default 처리, `WORKER_REVIEWER_MUST_DIFFER` 검사가 지금과 동일하게 �
 `profile`이 명시된 경우 Run/Task/Dispatch를 만들기 **전에** 다음 순서로 처리한다.
 
 ```text
-1. profile source 읽기 + schema 검증        (여기서는 command를 검사하지 않는다)
-2. requested phase와 Final Review에 대한 routing materialize
-3. materialize된 모든 resolved entry에 token -> allowlist 검사 (required 여부와 무관)
+1. profile source 읽기 + schema 검증                       (여기서는 command를 검사하지 않는다)
+2. selected profile 전체 정의 + 참여하는 explicit worker/reviewer에
+   token -> allowlist 검사 (requested phase, required 여부와 무관)
+3. requested phase와 Final Review에 대한 routing materialize
 4. required role의 resolved command에만 PATH 검사
 5. required role이 전부 resolve되었는지 검사
 6. 위가 모두 통과한 경우에만 Run 생성
 ```
 
-3번의 검사 대상은 이 run이 materialize한 **모든 resolved entry**다 — required든 optional이든 상관없다.
-audit evidence가 optional entry를 포함해 모든 entry를 기록하므로, token/allowlist를 통과하지 못한
-command는 required 여부와 무관하게 애초에 evidence에 도달하지 못한다. 4번의 PATH 검사만
-**required role로 좁힌다** — PATH 존재 여부는 trust 문제가 아니라 이 machine의 환경 사실이며, dispatch되지
-않는 role의 command가 설치되어 있지 않다는 이유로 run을 막을 필요는 없다. required role은 이 run에서
-실행될 수 있는 command 집합과 정확히 같으므로 이 좁힘이 trust boundary에 빈틈을 만들지 않는다.
+2번의 검사 대상은 **selected profile이 선언한 모든 command**다 — `defaults`, 이 invocation이 요청하지
+않은 phase를 포함한 모든 `phases.<phase>`, `final_review`, 그리고 이 invocation에 실제로 주어진 explicit
+`worker=`/`reviewer=` 값까지 전부 포함하며, requested phase 여부나 required 여부와 무관하다. profile은
+하나의 trust document이므로, 이번 invocation이 `refactoring`을 요청하지 않았다고 해서
+`phases.refactoring.worker: bash`가 안전해지지는 않는다 — 같은 profile의 다음 invocation이 그 phase를
+요청할 수 있고, audit evidence는 실제로 materialize된 entry를 optional 포함 전부 기록하기 때문이다.
+2번은 phase나 risk 정보 없이 selection 직후 정확히 한 번 실행되며 PATH는 절대 확인하지 않는다.
+4번의 PATH 검사만 **required role로 좁힌다** — PATH 존재 여부는 trust 문제가 아니라 이 machine의 환경
+사실이며, dispatch되지 않는 role의 command가 설치되어 있지 않다는 이유로 run을 막을 필요는 없다.
+required role은 이 run에서 실행될 수 있는 command 집합과 정확히 같으므로 이 좁힘이 trust boundary에
+빈틈을 만들지 않는다.
 
 profile을 arbitrary shell execution 통로로 쓰지 않는다. resolved command에는 §5의 기존 agent
 command 정책(safe token / trust boundary / PATH resolution)을 그대로 적용하며 인자를 붙이지 않는다.
