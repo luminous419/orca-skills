@@ -541,9 +541,27 @@ RUN_LOGGING_DISPATCH_SETTLED_ANCHORS = (
 # the tuple above because the failure message must name the right example.
 RUN_LOGGING_TIMING_RISK_ANCHORS = (
     "--event run_start --started-at <지금 시각> --risk <이 run의 risk>",
-    "[--ended-at <시각>] --risk <이 run의 risk> [--detail",
-    "--iteration <n> [--started-at <시각>] [--ended-at <시각>] --risk <이 run의 risk>",
-    "--ended-at <settle 직후 시각> --risk <이 run의 risk>",
+    # OS-19: the boundary call points no longer take a timestamp -- the scope's
+    # start is whatever timing-dispatch-start captured -- but they still name
+    # --risk, which is what these anchors exist to hold.
+    "--event phase_end --phase <phase>\n      --risk <이 run의 risk>",
+    # Scoped to the iteration_end call point: the bare `--iteration <n> --risk ...`
+    # line now occurs three times in this section (iteration_end, the
+    # timing-dispatch-start clock call, and dispatch_settled), so an unscoped
+    # anchor would stay satisfied by a sibling after this one lost its flag.
+    "--event iteration_end --phase <phase>\n      --iteration <n> --risk <이 run의 risk>",
+    "--event dispatch_settled --phase <phase> --role <role> --iteration <n>\n      --risk <이 run의 risk>",
+)
+# OS-19: the authoritative dispatch clock. The five negative duration_s rows in
+# PR #16's real OS-3 TIMING_LOG.md all came from a Coordinator reconstructing
+# --started-at from an earlier row, because this section asked it to. If the
+# pre-dispatch call point ever drops back out of the documented procedure, the
+# CLI path silently returns to guessing, so it is anchored the same way the
+# dispatch_settled flags are.
+RUN_LOGGING_DISPATCH_CLOCK_ANCHORS = (
+    "timing-dispatch-start --run-id <run-id>",
+    "(worker-start 직전) timing-dispatch-start --phase <phase> --role <role>",
+    "timing_invalid=",
 )
 
 
@@ -1717,6 +1735,14 @@ def validate_run_logging_contract(validation: Validation) -> None:
             f"{LIFECYCLE_SKILL_DIR.name}: a timing-event call point is missing "
             f"{anchor!r}; every TIMING_LOG.md row names the risk it was produced "
             "under, and the CLI path must write the same column the Python path does",
+        )
+    for anchor in RUN_LOGGING_DISPATCH_CLOCK_ANCHORS:
+        validation.check(
+            anchor in section,
+            f"{LIFECYCLE_SKILL_DIR.name}: the run-logging section is missing "
+            f"{anchor!r}; without the authoritative pre-dispatch clock (OS-19) a "
+            "Coordinator reconstructs --started-at from an earlier row and "
+            "TIMING_LOG.md gets negative durations again",
         )
 
 

@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
+from datetime import datetime
 from io import StringIO
 from pathlib import Path
 
@@ -610,6 +611,1149 @@ class RiskLoggingTests(unittest.TestCase):
         record = dict(zip(*[self.rows(path)[0], self.rows(path)[-1]]))
         for column in ("risk", "risk_source", "requested_phases", "round_kind"):
             self.assertEqual(record[column], "")
+
+
+class TimingCorrectnessRegressionTests(unittest.TestCase):
+    """OS-19: TIMING_LOG.md must never record a negative duration or an
+    out-of-order timestamp pair.
+
+    Every case here is taken from the real TIMING_LOG.md that PR #16's OS-3 run
+    (`run_e0cdf1afae58`) actually produced. That log has four `dispatch_settled`
+    rows whose `duration_s` is negative -- IMPLEMENTATION reviewer iteration 2
+    at -423s, TEST reviewer iteration 3 at -2267s, DESIGN reviewer iteration 7
+    at -1296s, IMPLEMENTATION reviewer iteration 3 at -1998s -- plus a fifth,
+    TEST reviewer iteration 4 at -2766s. Every one of them is a row whose
+    `started_at` was chained off the PREVIOUS row's `ended_at` while its own
+    `ended_at` came from real wall clock, which is what the fix has to make
+    structurally impossible rather than merely detectable.
+    """
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.base = Path(self.temporary.name)
+        self.addCleanup(self.temporary.cleanup)
+
+    def rows(self, run_id: str = "run_os19") -> list[dict[str, str]]:
+        lines = timing_log_path(run_id, base=self.base).read_text(
+            encoding="utf-8"
+        ).splitlines()
+        columns = [cell.strip() for cell in lines[0].strip("|").split("|")]
+        return [
+            dict(zip(columns, (cell.strip() for cell in line.strip("|").split("|"))))
+            for line in lines[2:]
+        ]
+
+    @staticmethod
+    def parsed(value: str) -> datetime | None:
+        try:
+            return datetime.fromisoformat(value)
+        except (TypeError, ValueError):
+            return None
+
+    def assert_log_invariants(self, run_id: str = "run_os19") -> None:
+        """The OS-19 invariant itself, asserted over every emitted row.
+
+        Review round 1 BF-001: the earlier version of this helper encoded a
+        WEAKER rule than the one the task asks for -- it tolerated an emitted
+        `started_at > ended_at` pair as long as the row carried a marker, which
+        is exactly the row shape the reviewer rejected. It now asserts the
+        requirement verbatim: `started_at <= ended_at` for every populated pair,
+        `duration_s >= 0` always, and no unreadable value in either timestamp
+        column. Evidence for a rejected pair belongs in `detail`, which
+        `assert_quarantined` checks separately -- never in the timestamp
+        columns, whose values are now always trustworthy on their face.
+        """
+        for index, row in enumerate(self.rows(run_id)):
+            with self.subTest(row=index, event=row["event"]):
+                if row["duration_s"]:
+                    self.assertGreaterEqual(
+                        float(row["duration_s"]),
+                        0.0,
+                        f"negative duration_s in {row}",
+                    )
+                started_at = self.parsed(row["started_at"]) if row["started_at"] else None
+                ended_at = self.parsed(row["ended_at"]) if row["ended_at"] else None
+                if row["started_at"]:
+                    self.assertIsNotNone(
+                        started_at, f"unreadable started_at emitted: {row}"
+                    )
+                if row["ended_at"]:
+                    self.assertIsNotNone(
+                        ended_at, f"unreadable ended_at emitted: {row}"
+                    )
+                if started_at is not None and ended_at is not None:
+                    self.assertLessEqual(
+                        started_at,
+                        ended_at,
+                        f"a row was emitted with started_at > ended_at: {row}",
+                    )
+
+    def assert_quarantined(
+        self, row: dict[str, str], marker: str, started_at: str, ended_at: str
+    ) -> None:
+        """One rejected row: no duration, no timestamps, all of the evidence."""
+        self.assertEqual(row["duration_s"], "", row)
+        self.assertEqual(row["started_at"], "", row)
+        self.assertEqual(row["ended_at"], "", row)
+        self.assertIn(marker, row["detail"])
+        self.assertIn(
+            f"{run_logging.TIMING_INVALID_STARTED_AT_FIELD}={started_at}",
+            row["detail"],
+        )
+        self.assertIn(
+            f"{run_logging.TIMING_INVALID_ENDED_AT_FIELD}={ended_at}",
+            row["detail"],
+        )
+
+    # ---- A. The observed rows, replayed exactly -------------------------------
+
+    def test_the_four_observed_negative_rows_are_never_written_as_negative(self) -> None:
+        observed = (
+            ("IMPLEMENTATION", 2, "2026-08-24T01:48:15Z", "2026-08-24T01:41:12Z"),
+            ("TEST", 3, "2026-08-24T02:50:15Z", "2026-08-24T02:12:28Z"),
+            ("DESIGN", 7, "2026-08-24T03:15:15Z", "2026-08-24T02:53:39Z"),
+            ("IMPLEMENTATION", 3, "2026-08-24T03:36:15Z", "2026-08-24T03:02:57Z"),
+            ("TEST", 4, "2026-08-24T03:58:15Z", "2026-08-24T03:12:09Z"),
+        )
+        for phase, iteration, started_at, ended_at in observed:
+            log_timing_event(
+                "run_os19",
+                base=self.base,
+                event="dispatch_settled",
+                phase=phase,
+                role="reviewer",
+                iteration=iteration,
+                started_at=started_at,
+                ended_at=ended_at,
+            )
+        written = self.rows()
+        self.assertEqual(len(written), len(observed))
+        for row, (_, _, started_at, ended_at) in zip(written, observed):
+            # Not clamped to 0 and not absolute-valued: an out-of-order pair has
+            # no knowable duration, so the cell stays empty and says why. And
+            # (review round 1 BF-001) the pair itself does not reach the
+            # timestamp columns -- it survives as evidence inside `detail`.
+            self.assert_quarantined(
+                row, run_logging.TIMING_INVALID_ORDER, started_at, ended_at
+            )
+        self.assert_log_invariants()
+
+    def test_elapsed_seconds_refuses_to_return_a_negative_number(self) -> None:
+        self.assertEqual(
+            elapsed_seconds("2026-08-24T01:48:15Z", "2026-08-24T01:41:12Z"), ""
+        )
+        self.assertEqual(
+            run_logging.resolve_duration(
+                "2026-08-24T01:48:15Z", "2026-08-24T01:41:12Z"
+            ),
+            ("", run_logging.TIMING_INVALID_ORDER),
+        )
+
+    def test_an_explicitly_supplied_negative_duration_is_refused_too(self) -> None:
+        """The observed rows could equally have arrived as a pre-computed
+        `--duration-seconds -423`; a fail-safe that only covers the derived path
+        would still let that reach the file.
+        """
+        log_timing_event(
+            "run_os19",
+            base=self.base,
+            event="dispatch_settled",
+            phase="IMPLEMENTATION",
+            role="reviewer",
+            iteration=2,
+            duration_seconds=-423.0,
+        )
+        row = self.rows()[-1]
+        self.assertEqual(row["duration_s"], "")
+        self.assertIn(run_logging.TIMING_INVALID_DURATION, row["detail"])
+
+    # ---- Final Review R1: the non-finite door ---------------------------------
+    #
+    # `--duration-seconds nan` is the Final Reviewer's own probe. It is not a
+    # negative number, so a `value < 0` guard never fires on it: NaN compares
+    # False against every ordering test, and +inf is simply not negative. Both
+    # reached `duration_s` verbatim, and neither `nan` nor `inf` satisfies the
+    # explicit `duration_s >= 0` requirement.
+
+    NONFINITE_PROBE = ("nan", "inf", "-inf", "NaN", "Infinity")
+
+    def test_a_non_finite_explicit_duration_is_refused_like_a_negative_one(
+        self,
+    ) -> None:
+        """The Final Review R1 probe verbatim: a VALID timestamp pair (so the
+        pair check cannot be what rejects the row) plus an explicit non-finite
+        duration. The cell must come back empty with a marker that names the
+        reason, never `nan`/`inf` -- and never clamped to 0 or `abs()`-ed into a
+        number a later reader would mistake for a measurement.
+        """
+        for index, supplied in enumerate(self.NONFINITE_PROBE):
+            with self.subTest(duration=supplied):
+                log_timing_event(
+                    "run_os19",
+                    base=self.base,
+                    event="dispatch_settled",
+                    phase="IMPLEMENTATION",
+                    role="reviewer",
+                    iteration=index,
+                    started_at="2026-01-01T00:00:00+00:00",
+                    ended_at="2026-01-01T00:00:01+00:00",
+                    duration_seconds=supplied,
+                )
+                row = self.rows()[-1]
+                self.assertEqual(row["duration_s"], "", row)
+                self.assertIn(
+                    run_logging.TIMING_INVALID_NONFINITE_DURATION, row["detail"]
+                )
+                # The pair itself was fine, so it is NOT quarantined -- only the
+                # impossible number was thrown away.
+                self.assertEqual(row["started_at"], "2026-01-01T00:00:00+00:00")
+                self.assertEqual(row["ended_at"], "2026-01-01T00:00:01+00:00")
+        self.assert_log_invariants()
+
+    def test_the_non_finite_floats_themselves_are_refused_not_only_their_spellings(
+        self,
+    ) -> None:
+        """The same three values as floats rather than strings: a Python caller
+        reaches `log_timing_event` directly, so `float("nan")` must be judged the
+        same as the CLI's `"nan"` text.
+        """
+        for index, supplied in enumerate(
+            (float("nan"), float("inf"), float("-inf"))
+        ):
+            with self.subTest(duration=supplied):
+                self.assertEqual(
+                    run_logging._validate_duration(supplied),
+                    ("", run_logging.TIMING_INVALID_NONFINITE_DURATION),
+                )
+                log_timing_event(
+                    "run_os19",
+                    base=self.base,
+                    event="dispatch_settled",
+                    phase="TEST",
+                    role="worker",
+                    iteration=index,
+                    duration_seconds=supplied,
+                )
+                row = self.rows()[-1]
+                self.assertEqual(row["duration_s"], "", row)
+                self.assertIn(
+                    run_logging.TIMING_INVALID_NONFINITE_DURATION, row["detail"]
+                )
+        self.assert_log_invariants()
+
+    def test_a_finite_explicit_duration_still_goes_through_untouched(self) -> None:
+        """The other half of R1: rejecting non-finite values may not cost the
+        ordinary case anything. Zero, a fraction and a large finite value are all
+        still written exactly as supplied, with no marker.
+        """
+        for index, (supplied, expected) in enumerate(
+            ((0, "0.000"), (0.5, "0.500"), (423, "423.000"), ("7", "7.000"))
+        ):
+            with self.subTest(duration=supplied):
+                log_timing_event(
+                    "run_os19",
+                    base=self.base,
+                    event="dispatch_settled",
+                    phase="DESIGN",
+                    role="worker",
+                    iteration=index,
+                    duration_seconds=supplied,
+                )
+                row = self.rows()[-1]
+                self.assertEqual(row["duration_s"], expected, row)
+                self.assertNotIn("timing_invalid=", row["detail"])
+        self.assert_log_invariants()
+
+    def test_the_cli_path_refuses_a_non_finite_duration_too(self) -> None:
+        """`timing-event --duration-seconds nan` is what a live Coordinator would
+        actually type, and the flag takes raw text -- so the runtime CLI path
+        gets the same probe, asserted over every row the run emitted.
+        """
+        for index, supplied in enumerate(self.NONFINITE_PROBE):
+            with self.subTest(duration=supplied):
+                stream = StringIO()
+                with redirect_stdout(stream):
+                    exit_code = cli_main(
+                        [
+                            "timing-event",
+                            "--run-id",
+                            "run_os19_nonfinite",
+                            "--base",
+                            str(self.base),
+                            "--event",
+                            "dispatch_settled",
+                            "--phase",
+                            "IMPLEMENTATION",
+                            "--role",
+                            "reviewer",
+                            "--iteration",
+                            str(index),
+                            "--started-at",
+                            "2026-01-01T00:00:00+00:00",
+                            "--ended-at",
+                            "2026-01-01T00:00:01+00:00",
+                            # `=` rather than a space: argparse would otherwise
+                            # read `-inf` as an option name.
+                            f"--duration-seconds={supplied}",
+                        ]
+                    )
+                self.assertEqual(exit_code, 0)
+                settled = [
+                    row
+                    for row in self.rows("run_os19_nonfinite")
+                    if row["event"] == "dispatch_settled"
+                ][-1]
+                self.assertEqual(settled["duration_s"], "", settled)
+                self.assertIn(
+                    run_logging.TIMING_INVALID_NONFINITE_DURATION, settled["detail"]
+                )
+        self.assert_log_invariants("run_os19_nonfinite")
+
+    def test_a_mixed_awareness_pair_is_fail_safe_not_a_raise(self) -> None:
+        """`datetime.fromisoformat` parses both sides, but subtracting an aware
+        from a naive one raises TypeError -- which the pre-OS-19 code did not
+        catch, so it escaped `elapsed_seconds()` into the caller's lifecycle path
+        rather than staying inside logging.
+        """
+        self.assertEqual(
+            elapsed_seconds("2026-08-24T01:00:00", "2026-08-24T01:05:00+00:00"), ""
+        )
+        log_timing_event(
+            "run_os19",
+            base=self.base,
+            event="dispatch_settled",
+            started_at="2026-08-24T01:00:00",
+            ended_at="2026-08-24T01:05:00+00:00",
+        )
+        self.assert_quarantined(
+            self.rows()[-1],
+            run_logging.TIMING_INVALID_TIMESTAMP,
+            "2026-08-24T01:00:00",
+            "2026-08-24T01:05:00+00:00",
+        )
+        self.assert_log_invariants()
+
+    def test_a_malformed_timestamp_says_so_instead_of_going_quiet(self) -> None:
+        log_timing_event(
+            "run_os19",
+            base=self.base,
+            event="dispatch_settled",
+            started_at="not-a-timestamp",
+            ended_at="2026-08-24T01:05:00+00:00",
+        )
+        self.assert_quarantined(
+            self.rows()[-1],
+            run_logging.TIMING_INVALID_TIMESTAMP,
+            "not-a-timestamp",
+            "2026-08-24T01:05:00+00:00",
+        )
+        self.assert_log_invariants()
+
+    def test_a_fail_safe_marker_never_destroys_the_callers_own_detail(self) -> None:
+        log_timing_event(
+            "run_os19",
+            base=self.base,
+            event="dispatch_settled",
+            started_at="2026-08-24T01:48:15Z",
+            ended_at="2026-08-24T01:41:12Z",
+            detail="task=task_x dispatch=ctx_x",
+        )
+        row = self.rows()[-1]
+        self.assertIn("task=task_x dispatch=ctx_x", row["detail"])
+        self.assert_quarantined(
+            row,
+            run_logging.TIMING_INVALID_ORDER,
+            "2026-08-24T01:48:15Z",
+            "2026-08-24T01:41:12Z",
+        )
+
+    # ---- B. Review round 1 BF-001: the supplied-duration door ------------------
+
+    # The reviewer's own probe, verbatim: an out-of-order pair and a malformed
+    # pair, each handed in together with an explicit, perfectly non-negative
+    # `duration_seconds=7`. Before the correction both were written as
+    # `duration_s=7.000` with the impossible pair intact in the timestamp columns
+    # and no marker anywhere, because `log_timing_event()` validated the supplied
+    # duration INSTEAD OF the pair rather than as well as it.
+    BF001_PROBE = (
+        ("2026-08-24T02:00:00+00:00", "2026-08-24T01:00:00+00:00", "out-of-order"),
+        ("broken", "2026-08-24T01:00:00+00:00", "malformed"),
+    )
+
+    def test_a_supplied_duration_does_not_buy_an_invalid_pair_a_way_in(self) -> None:
+        for started_at, ended_at, label in self.BF001_PROBE:
+            with self.subTest(pair=label):
+                log_timing_event(
+                    "run_os19",
+                    base=self.base,
+                    event="dispatch_settled",
+                    phase="IMPLEMENTATION",
+                    role="reviewer",
+                    iteration=2,
+                    started_at=started_at,
+                    ended_at=ended_at,
+                    duration_seconds=7,
+                )
+                row = self.rows()[-1]
+                self.assertNotIn("7", row["duration_s"])
+                self.assert_quarantined(
+                    row,
+                    run_logging.TIMING_INVALID_ORDER
+                    if label == "out-of-order"
+                    else run_logging.TIMING_INVALID_TIMESTAMP,
+                    started_at,
+                    ended_at,
+                )
+        self.assert_log_invariants()
+
+    def test_a_supplied_duration_still_survives_a_pair_that_is_actually_valid(
+        self,
+    ) -> None:
+        """The check added for BF-001 rejects impossible pairs, not explicit
+        durations: an offline reconstruction that hands in a valid pair and its
+        own measured duration is still written exactly as given.
+        """
+        log_timing_event(
+            "run_os19",
+            base=self.base,
+            event="dispatch_settled",
+            started_at="2026-08-24T01:00:00+00:00",
+            ended_at="2026-08-24T02:00:00+00:00",
+            duration_seconds=7,
+        )
+        row = self.rows()[-1]
+        self.assertEqual(row["duration_s"], "7.000")
+        self.assertEqual(row["started_at"], "2026-08-24T01:00:00+00:00")
+        self.assertEqual(row["ended_at"], "2026-08-24T02:00:00+00:00")
+        self.assertEqual(row["detail"], "")
+        self.assert_log_invariants()
+
+    def test_a_lone_timestamp_that_is_not_a_timestamp_is_refused_as_well(self) -> None:
+        """A half-filled row has no pair to be out of order with, but a value
+        that cannot be read as a timestamp still may not sit in a timestamp
+        column -- the row would claim a start instant nothing can interpret.
+        """
+        log_timing_event(
+            "run_os19",
+            base=self.base,
+            event="phase_start",
+            phase="IMPLEMENTATION",
+            started_at="broken",
+        )
+        self.assert_quarantined(
+            self.rows()[-1], run_logging.TIMING_INVALID_TIMESTAMP, "broken", ""
+        )
+        self.assert_log_invariants()
+
+    def test_a_missing_side_is_not_an_error_and_is_left_alone(self) -> None:
+        """The ordinary half-filled row: an open boundary that has not ended yet
+        keeps its real `started_at` and says nothing about anything being wrong.
+        """
+        log_timing_event(
+            "run_os19",
+            base=self.base,
+            event="phase_start",
+            phase="IMPLEMENTATION",
+            started_at="2026-08-24T01:00:00+00:00",
+        )
+        row = self.rows()[-1]
+        self.assertEqual(row["started_at"], "2026-08-24T01:00:00+00:00")
+        self.assertEqual(row["ended_at"], "")
+        self.assertEqual(row["duration_s"], "")
+        self.assertEqual(row["detail"], "")
+        self.assert_log_invariants()
+
+    def test_the_cli_path_refuses_the_same_probe(self) -> None:
+        """The same two probes through the runtime CLI path the reviewer used
+        (`timing-event --duration-seconds 7`), including the boundary rows the
+        tracker opens around them -- the invariant is asserted over every row the
+        run emitted, not only over the settlement rows.
+        """
+        for started_at, ended_at, label in self.BF001_PROBE:
+            with self.subTest(pair=label):
+                stream = StringIO()
+                with redirect_stdout(stream):
+                    exit_code = cli_main(
+                        [
+                            "timing-event",
+                            "--run-id",
+                            "run_os19_cli",
+                            "--base",
+                            str(self.base),
+                            "--event",
+                            "dispatch_settled",
+                            "--phase",
+                            "IMPLEMENTATION",
+                            "--role",
+                            "reviewer",
+                            "--iteration",
+                            "2",
+                            "--started-at",
+                            started_at,
+                            "--ended-at",
+                            ended_at,
+                            "--duration-seconds",
+                            "7",
+                        ]
+                    )
+                self.assertEqual(exit_code, 0)
+                settled = [
+                    row
+                    for row in self.rows("run_os19_cli")
+                    if row["event"] == "dispatch_settled"
+                ][-1]
+                self.assert_quarantined(
+                    settled,
+                    run_logging.TIMING_INVALID_ORDER
+                    if label == "out-of-order"
+                    else run_logging.TIMING_INVALID_TIMESTAMP,
+                    started_at,
+                    ended_at,
+                )
+        self.assert_log_invariants("run_os19_cli")
+
+
+class AuthoritativeDispatchClockTests(unittest.TestCase):
+    """OS-19: the CLI path must capture dispatch start/settlement times itself.
+
+    The negative rows in the real OS-3 log are not a formatting slip -- they are
+    what happens when the only clock is a Coordinator's recollection. SKILL.md
+    section 9 asked it for `--started-at <dispatch 직전 시각>`, it had no clock,
+    and so every `started_at` was reconstructed from the previous row's
+    (itself estimated, often future-dated) `ended_at`. `timing-dispatch-start`
+    is the authoritative source: the same `now_iso()` the Python harness uses,
+    captured at the same point in the dispatch lifecycle.
+    """
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.base = Path(self.temporary.name)
+        self.addCleanup(self.temporary.cleanup)
+
+    def cli(self, *args: str) -> str:
+        stream = StringIO()
+        with redirect_stdout(stream):
+            exit_code = cli_main([*args, "--base", str(self.base)])
+        self.assertEqual(exit_code, 0)
+        return stream.getvalue().strip()
+
+    def rows(self, run_id: str = "run_clock") -> list[dict[str, str]]:
+        lines = timing_log_path(run_id, base=self.base).read_text(
+            encoding="utf-8"
+        ).splitlines()
+        columns = [cell.strip() for cell in lines[0].strip("|").split("|")]
+        return [
+            dict(zip(columns, (cell.strip() for cell in line.strip("|").split("|"))))
+            for line in lines[2:]
+        ]
+
+    def dispatch(self, phase: str, role: str, iteration: int) -> None:
+        """One full Coordinator-side dispatch: mark the start, then settle it.
+
+        Note what is NOT passed: no `--started-at`, no `--ended-at`. That is the
+        whole point -- the Coordinator has no clock to be wrong with.
+        """
+        self.cli(
+            "timing-dispatch-start",
+            "--run-id",
+            "run_clock",
+            "--phase",
+            phase,
+            "--role",
+            role,
+            "--iteration",
+            str(iteration),
+        )
+        self.cli(
+            "timing-event",
+            "--run-id",
+            "run_clock",
+            "--event",
+            "dispatch_settled",
+            "--phase",
+            phase,
+            "--role",
+            role,
+            "--iteration",
+            str(iteration),
+        )
+
+    def test_a_dispatch_settles_with_the_start_the_cli_itself_captured(self) -> None:
+        captured = self.cli(
+            "timing-dispatch-start",
+            "--run-id",
+            "run_clock",
+            "--phase",
+            "IMPLEMENTATION",
+            "--role",
+            "reviewer",
+            "--iteration",
+            "2",
+        )
+        self.cli(
+            "timing-event",
+            "--run-id",
+            "run_clock",
+            "--event",
+            "dispatch_settled",
+            "--phase",
+            "IMPLEMENTATION",
+            "--role",
+            "reviewer",
+            "--iteration",
+            "2",
+        )
+        settled = [row for row in self.rows() if row["event"] == "dispatch_settled"][-1]
+        self.assertEqual(settled["started_at"], captured)
+        self.assertTrue(settled["ended_at"])
+        self.assertGreaterEqual(float(settled["duration_s"]), 0.0)
+
+    def test_the_os3_correction_loop_shape_produces_no_negative_duration(self) -> None:
+        """The exact sequence that produced -423s: phase gate iteration 1
+        (worker, reviewer FAIL), correction iteration 2 (worker, reviewer PASS).
+        """
+        self.dispatch("IMPLEMENTATION", "worker", 1)
+        self.dispatch("IMPLEMENTATION", "reviewer", 1)
+        self.cli(
+            "timing-event",
+            "--run-id",
+            "run_clock",
+            "--event",
+            "iteration_end",
+            "--phase",
+            "IMPLEMENTATION",
+            "--iteration",
+            "1",
+            "--detail",
+            "FAIL",
+        )
+        self.dispatch("IMPLEMENTATION", "worker", 2)
+        self.dispatch("IMPLEMENTATION", "reviewer", 2)
+        self.cli(
+            "timing-event",
+            "--run-id",
+            "run_clock",
+            "--event",
+            "iteration_end",
+            "--phase",
+            "IMPLEMENTATION",
+            "--iteration",
+            "2",
+            "--detail",
+            "PASS",
+        )
+        for row in self.rows():
+            if row["duration_s"]:
+                self.assertGreaterEqual(float(row["duration_s"]), 0.0, row)
+            if row["started_at"] and row["ended_at"]:
+                self.assertLessEqual(row["started_at"], row["ended_at"], row)
+
+    def test_boundaries_bracket_the_dispatches_of_their_own_scope(self) -> None:
+        self.dispatch("IMPLEMENTATION", "worker", 1)
+        self.dispatch("IMPLEMENTATION", "reviewer", 1)
+        self.dispatch("IMPLEMENTATION", "worker", 2)
+        self.dispatch("IMPLEMENTATION", "reviewer", 2)
+        self.cli(
+            "timing-event",
+            "--run-id",
+            "run_clock",
+            "--event",
+            "phase_end",
+            "--phase",
+            "IMPLEMENTATION",
+            "--detail",
+            "PASS",
+        )
+        rows = self.rows()
+        by_iteration: dict[str, list[dict[str, str]]] = {}
+        for row in rows:
+            if row["event"] == "dispatch_settled":
+                by_iteration.setdefault(row["iteration"], []).append(row)
+        for iteration, dispatches in by_iteration.items():
+            start = next(
+                row
+                for row in rows
+                if row["event"] == "iteration_start" and row["iteration"] == iteration
+            )
+            end = next(
+                row
+                for row in rows
+                if row["event"] == "iteration_end" and row["iteration"] == iteration
+            )
+            self.assertTrue(start["started_at"])
+            # The boundary is not merely present: it has a real duration, which
+            # every iteration_end/phase_end row in the real OS-3 log lacked.
+            self.assertTrue(end["duration_s"], f"iteration {iteration} end has no duration")
+            for dispatch in dispatches:
+                self.assertLessEqual(start["started_at"], dispatch["started_at"])
+                self.assertLessEqual(dispatch["ended_at"], end["ended_at"])
+
+    def test_the_next_iterations_time_never_lands_in_the_previous_ones(self) -> None:
+        self.dispatch("IMPLEMENTATION", "worker", 1)
+        self.dispatch("IMPLEMENTATION", "reviewer", 1)
+        boundary_ended_at = [
+            row for row in self.rows() if row["event"] == "dispatch_settled"
+        ][-1]["ended_at"]
+        self.dispatch("IMPLEMENTATION", "worker", 2)
+        rows = self.rows()
+        iteration_end = next(
+            row
+            for row in rows
+            if row["event"] == "iteration_end" and row["iteration"] == "1"
+        )
+        # Closed at iteration 1's own last activity, not at "whenever iteration
+        # 2's dispatch happened to settle".
+        self.assertEqual(iteration_end["ended_at"], boundary_ended_at)
+        iteration_2_start = next(
+            row
+            for row in rows
+            if row["event"] == "iteration_start" and row["iteration"] == "2"
+        )
+        self.assertLessEqual(iteration_end["ended_at"], iteration_2_start["started_at"])
+
+    def test_a_phase_transition_excludes_the_next_phases_time(self) -> None:
+        self.dispatch("IMPLEMENTATION", "worker", 1)
+        implementation_last_end = [
+            row for row in self.rows() if row["event"] == "dispatch_settled"
+        ][-1]["ended_at"]
+        self.dispatch("TEST", "worker", 1)
+        rows = self.rows()
+        phase_end = next(
+            row
+            for row in rows
+            if row["event"] == "phase_end" and row["phase"] == "IMPLEMENTATION"
+        )
+        self.assertEqual(phase_end["ended_at"], implementation_last_end)
+        self.assertTrue(phase_end["duration_s"])
+        self.assertGreaterEqual(float(phase_end["duration_s"]), 0.0)
+
+    def test_final_review_timing_obeys_the_same_invariants(self) -> None:
+        """Section 17's Final Adversarial Review is just another scope with its
+        own iteration numbers -- including the re-opened upstream phases each
+        failed attempt routes back into, which is where -1296s (DESIGN
+        iteration 7, opened by a Final Review FAIL) actually came from.
+        """
+        self.dispatch("TEST", "worker", 1)
+        self.dispatch("final_review", "reviewer", 1)
+        self.cli(
+            "timing-event",
+            "--run-id",
+            "run_clock",
+            "--event",
+            "iteration_end",
+            "--phase",
+            "final_review",
+            "--iteration",
+            "1",
+            "--detail",
+            "FAIL - routed to design",
+        )
+        self.dispatch("DESIGN", "worker", 7)
+        self.dispatch("DESIGN", "reviewer", 7)
+        self.dispatch("final_review", "reviewer", 2)
+        rows = self.rows()
+        final_rows = [row for row in rows if row["phase"] == "final_review"]
+        self.assertTrue(final_rows)
+        for row in rows:
+            if row["duration_s"]:
+                self.assertGreaterEqual(float(row["duration_s"]), 0.0, row)
+            if row["started_at"] and row["ended_at"]:
+                self.assertLessEqual(row["started_at"], row["ended_at"], row)
+        # The re-opened DESIGN scope gets its own start, not the one it had
+        # before final_review took over.
+        design_starts = [
+            row
+            for row in rows
+            if row["event"] == "iteration_start" and row["phase"] == "DESIGN"
+        ]
+        self.assertEqual(len(design_starts), 1)
+
+    def test_run_status_closes_whatever_scope_is_still_open(self) -> None:
+        self.cli(
+            "timing-event", "--run-id", "run_clock", "--event", "run_start"
+        )
+        self.dispatch("IMPLEMENTATION", "worker", 1)
+        self.cli(
+            "run-status", "--run-id", "run_clock", "--status", "COMPLETED"
+        )
+        rows = self.rows()
+        events = [row["event"] for row in rows]
+        self.assertIn("iteration_end", events)
+        self.assertIn("phase_end", events)
+        self.assertIn("run_end", events)
+        self.assertLess(events.index("phase_end"), events.index("run_end"))
+        run_end = next(row for row in rows if row["event"] == "run_end")
+        # run_start's own captured timestamp is remembered, so the Coordinator
+        # does not have to hand `--run-started-at` back hours later.
+        self.assertTrue(run_end["started_at"])
+        self.assertGreaterEqual(float(run_end["duration_s"]), 0.0)
+        for row in rows:
+            if row["started_at"] and row["ended_at"]:
+                self.assertLessEqual(row["started_at"], row["ended_at"], row)
+
+    def test_a_supplied_timestamp_still_wins_but_is_still_validated(self) -> None:
+        """An explicit `--started-at`/`--ended-at` remains accepted (an offline
+        reconstruction is a legitimate use), but it is validated the same way,
+        so the OS-3 shape cannot come back through the override.
+        """
+        self.cli(
+            "timing-event",
+            "--run-id",
+            "run_clock",
+            "--event",
+            "dispatch_settled",
+            "--phase",
+            "IMPLEMENTATION",
+            "--role",
+            "reviewer",
+            "--iteration",
+            "2",
+            "--started-at",
+            "2026-08-24T01:48:15Z",
+            "--ended-at",
+            "2026-08-24T01:41:12Z",
+        )
+        row = self.rows()[-1]
+        self.assertEqual(row["duration_s"], "")
+        self.assertIn(run_logging.TIMING_INVALID_ORDER, row["detail"])
+
+
+class InstalledToolsTimingParityTests(unittest.TestCase):
+    """OS-19: the installed Skill CLI copy must reach the same duration and the
+    same fail-safe judgement as the in-repo Python path for identical input.
+
+    Byte-identity (RunLoggingTwinParityTests) proves the two FILES match; this
+    proves the two PATHS agree behaviourally when actually executed as the
+    installed Skill does -- a real subprocess, from an unrelated project
+    directory, with this repository's checkout off sys.path.
+    """
+
+    CASES = (
+        ("2026-08-24T01:41:30Z", "2026-08-24T02:03:00Z"),   # ordered
+        ("2026-08-24T01:48:15Z", "2026-08-24T01:41:12Z"),   # the OS-3 shape
+        ("not-a-timestamp", "2026-08-24T01:41:12Z"),        # malformed
+        ("2026-08-24T01:00:00", "2026-08-24T01:05:00+00:00"),  # mixed awareness
+        ("2026-08-24T01:41:30Z", "2026-08-24T01:41:30+00:00"),  # mixed spelling, 0s
+    )
+
+    # A missing side is deliberately NOT in the matrix above: `timing-event
+    # --event dispatch_settled` is a lifecycle command run at the moment of
+    # settlement, so an omitted `--ended-at` is filled from its own authoritative
+    # clock, while log_timing_event() is the raw writer and leaves it blank.
+    # That difference is the OS-19 fix, not a drift -- see
+    # test_the_cli_fills_a_missing_settlement_time_and_the_raw_writer_does_not.
+
+    @staticmethod
+    def cell(path: Path, column: str) -> str:
+        lines = path.read_text(encoding="utf-8").splitlines()
+        columns = [text.strip() for text in lines[0].strip("|").split("|")]
+        row = [text.strip() for text in lines[-1].strip("|").split("|")]
+        return dict(zip(columns, row))[column]
+
+    def test_both_paths_agree_on_duration_and_on_the_fail_safe_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as skills_home, tempfile.TemporaryDirectory() as target_project:
+            shutil.copytree(
+                REPO_ROOT / "orca-worker-reviewer-orchestration",
+                Path(skills_home) / "orca-worker-reviewer-orchestration",
+            )
+            installed_tool = (
+                Path(skills_home)
+                / "orca-worker-reviewer-orchestration"
+                / "tools"
+                / "run_logging.py"
+            )
+            for index, (started_at, ended_at) in enumerate(self.CASES):
+                with self.subTest(started_at=started_at, ended_at=ended_at):
+                    run_id = f"run_parity_{index}"
+                    result = subprocess.run(
+                        [
+                            sys.executable,
+                            str(installed_tool),
+                            "timing-event",
+                            "--run-id",
+                            run_id,
+                            "--event",
+                            "dispatch_settled",
+                            "--phase",
+                            "IMPLEMENTATION",
+                            "--role",
+                            "reviewer",
+                            "--iteration",
+                            "2",
+                            "--started-at",
+                            started_at,
+                            "--ended-at",
+                            ended_at,
+                            "--detail",
+                            "task=t dispatch=d",
+                        ],
+                        cwd=target_project,
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    installed_log = (
+                        Path(target_project)
+                        / "artifacts"
+                        / "runs"
+                        / run_id
+                        / TIMING_LOG_FILENAME
+                    )
+
+                    python_base = Path(target_project) / "python-path"
+                    log_timing_event(
+                        run_id,
+                        base=python_base,
+                        event="dispatch_settled",
+                        phase="IMPLEMENTATION",
+                        role="reviewer",
+                        iteration=2,
+                        started_at=started_at,
+                        ended_at=ended_at,
+                        detail="task=t dispatch=d",
+                    )
+                    python_log = timing_log_path(run_id, base=python_base)
+
+                    for column in ("started_at", "ended_at", "duration_s", "detail"):
+                        self.assertEqual(
+                            self.cell(installed_log, column),
+                            self.cell(python_log, column),
+                            f"{column} differs between the installed CLI and the "
+                            "Python path",
+                        )
+
+    def test_a_supplied_duration_cannot_smuggle_an_invalid_pair_through_the_installed_cli(
+        self,
+    ) -> None:
+        """Review round 1 BF-001, on the path a live Coordinator actually runs.
+
+        The reviewer's probe was a subprocess against the INSTALLED copy, so the
+        regression is too: an out-of-order pair and a malformed pair, each with
+        `--duration-seconds 7`. Both must come back quarantined -- no `7.000`, no
+        timestamps in the timestamp columns, the evidence in `detail` -- and must
+        match what the in-repo Python writer produces for the same input, so the
+        fix cannot hold on one path and not the other.
+        """
+        probe = (
+            (
+                "2026-08-24T02:00:00+00:00",
+                "2026-08-24T01:00:00+00:00",
+                run_logging.TIMING_INVALID_ORDER,
+            ),
+            ("broken", "2026-08-24T01:00:00+00:00", run_logging.TIMING_INVALID_TIMESTAMP),
+        )
+        with tempfile.TemporaryDirectory() as skills_home, tempfile.TemporaryDirectory() as target_project:
+            shutil.copytree(
+                REPO_ROOT / "orca-worker-reviewer-orchestration",
+                Path(skills_home) / "orca-worker-reviewer-orchestration",
+            )
+            installed_tool = (
+                Path(skills_home)
+                / "orca-worker-reviewer-orchestration"
+                / "tools"
+                / "run_logging.py"
+            )
+            for index, (started_at, ended_at, marker) in enumerate(probe):
+                with self.subTest(started_at=started_at, ended_at=ended_at):
+                    run_id = f"run_bf001_{index}"
+                    result = subprocess.run(
+                        [
+                            sys.executable,
+                            str(installed_tool),
+                            "timing-event",
+                            "--run-id",
+                            run_id,
+                            "--event",
+                            "dispatch_settled",
+                            "--phase",
+                            "IMPLEMENTATION",
+                            "--role",
+                            "reviewer",
+                            "--iteration",
+                            "2",
+                            "--started-at",
+                            started_at,
+                            "--ended-at",
+                            ended_at,
+                            "--duration-seconds",
+                            "7",
+                        ],
+                        cwd=target_project,
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    installed_log = (
+                        Path(target_project)
+                        / "artifacts"
+                        / "runs"
+                        / run_id
+                        / TIMING_LOG_FILENAME
+                    )
+                    self.assertEqual(self.cell(installed_log, "duration_s"), "")
+                    self.assertEqual(self.cell(installed_log, "started_at"), "")
+                    self.assertEqual(self.cell(installed_log, "ended_at"), "")
+                    detail = self.cell(installed_log, "detail")
+                    self.assertIn(marker, detail)
+                    self.assertIn(
+                        f"{run_logging.TIMING_INVALID_STARTED_AT_FIELD}={started_at}",
+                        detail,
+                    )
+                    self.assertIn(
+                        f"{run_logging.TIMING_INVALID_ENDED_AT_FIELD}={ended_at}",
+                        detail,
+                    )
+
+                    python_base = Path(target_project) / "python-path"
+                    log_timing_event(
+                        run_id,
+                        base=python_base,
+                        event="dispatch_settled",
+                        phase="IMPLEMENTATION",
+                        role="reviewer",
+                        iteration=2,
+                        started_at=started_at,
+                        ended_at=ended_at,
+                        duration_seconds=7,
+                    )
+                    python_log = timing_log_path(run_id, base=python_base)
+                    for column in ("started_at", "ended_at", "duration_s", "detail"):
+                        self.assertEqual(
+                            self.cell(installed_log, column),
+                            self.cell(python_log, column),
+                            f"{column} differs between the installed CLI and the "
+                            "Python path",
+                        )
+
+    def test_a_non_finite_duration_is_refused_through_the_installed_cli_too(
+        self,
+    ) -> None:
+        """Final Review R1, on the path a live Coordinator actually runs.
+
+        The Final Reviewer's probe went through the INSTALLED copy, so the
+        regression does too: a real subprocess, from an unrelated project
+        directory, with this repository's checkout off sys.path. `nan`, `inf`
+        and `-inf` must all come back with an empty `duration_s` and the
+        non-finite marker, and must match what the in-repo Python writer
+        produces for the same input -- byte-identity of the two files is not by
+        itself proof that the executed behaviour agrees.
+        """
+        with tempfile.TemporaryDirectory() as skills_home, tempfile.TemporaryDirectory() as target_project:
+            shutil.copytree(
+                REPO_ROOT / "orca-worker-reviewer-orchestration",
+                Path(skills_home) / "orca-worker-reviewer-orchestration",
+            )
+            installed_tool = (
+                Path(skills_home)
+                / "orca-worker-reviewer-orchestration"
+                / "tools"
+                / "run_logging.py"
+            )
+            for index, supplied in enumerate(("nan", "inf", "-inf")):
+                with self.subTest(duration=supplied):
+                    run_id = f"run_nonfinite_{index}"
+                    result = subprocess.run(
+                        [
+                            sys.executable,
+                            str(installed_tool),
+                            "timing-event",
+                            "--run-id",
+                            run_id,
+                            "--event",
+                            "dispatch_settled",
+                            "--phase",
+                            "IMPLEMENTATION",
+                            "--role",
+                            "reviewer",
+                            "--iteration",
+                            "2",
+                            "--started-at",
+                            "2026-01-01T00:00:00+00:00",
+                            "--ended-at",
+                            "2026-01-01T00:00:01+00:00",
+                            f"--duration-seconds={supplied}",
+                        ],
+                        cwd=target_project,
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    installed_log = (
+                        Path(target_project)
+                        / "artifacts"
+                        / "runs"
+                        / run_id
+                        / TIMING_LOG_FILENAME
+                    )
+                    self.assertEqual(self.cell(installed_log, "duration_s"), "")
+                    self.assertIn(
+                        run_logging.TIMING_INVALID_NONFINITE_DURATION,
+                        self.cell(installed_log, "detail"),
+                    )
+
+                    python_base = Path(target_project) / "python-path"
+                    log_timing_event(
+                        run_id,
+                        base=python_base,
+                        event="dispatch_settled",
+                        phase="IMPLEMENTATION",
+                        role="reviewer",
+                        iteration=2,
+                        started_at="2026-01-01T00:00:00+00:00",
+                        ended_at="2026-01-01T00:00:01+00:00",
+                        duration_seconds=supplied,
+                    )
+                    python_log = timing_log_path(run_id, base=python_base)
+                    for column in ("started_at", "ended_at", "duration_s", "detail"):
+                        self.assertEqual(
+                            self.cell(installed_log, column),
+                            self.cell(python_log, column),
+                            f"{column} differs between the installed CLI and the "
+                            "Python path",
+                        )
+
+    def test_the_cli_fills_a_missing_settlement_time_and_the_raw_writer_does_not(
+        self,
+    ) -> None:
+        """The one intentional difference between the two, stated explicitly."""
+        with tempfile.TemporaryDirectory() as base_directory:
+            base = Path(base_directory)
+            stream = StringIO()
+            with redirect_stdout(stream):
+                cli_main(
+                    [
+                        "timing-event",
+                        "--run-id",
+                        "run_fill",
+                        "--base",
+                        str(base),
+                        "--event",
+                        "dispatch_settled",
+                        "--phase",
+                        "IMPLEMENTATION",
+                        "--role",
+                        "reviewer",
+                        "--iteration",
+                        "2",
+                        "--started-at",
+                        "2026-08-24T01:41:30+00:00",
+                    ]
+                )
+            cli_row = self.cell(timing_log_path("run_fill", base=base), "ended_at")
+            self.assertTrue(cli_row, "the CLI must settle on its own clock")
+
+            log_timing_event(
+                "run_raw",
+                base=base,
+                event="dispatch_settled",
+                started_at="2026-08-24T01:41:30+00:00",
+            )
+            self.assertEqual(
+                self.cell(timing_log_path("run_raw", base=base), "ended_at"), ""
+            )
 
 
 class RunLoggingTwinParityTests(unittest.TestCase):

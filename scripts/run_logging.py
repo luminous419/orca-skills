@@ -31,14 +31,24 @@ Standard library only, like every other module in scripts/.
 from __future__ import annotations
 
 import argparse
+import json
+import math
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 ORCHESTRATOR_LOG_FILENAME = "ORCHESTRATOR_LOG.md"
 TIMING_LOG_FILENAME = "TIMING_LOG.md"
+# OS-19: the CLI path is a fresh process per event and therefore has no memory
+# of when a dispatch started or which phase/iteration scope is open. That memory
+# is the difference between a boundary that brackets its own dispatches and one
+# that is stamped from a Coordinator's recollection, so it lives in a file next
+# to the two logs it serves. The Python path (OrcaRuntimeHarness) is one long
+# lived process and keeps the same state in memory instead -- same class, same
+# transitions, only the storage differs.
+TIMING_STATE_FILENAME = ".timing_state.json"
 
 # The columns are the whole schema. Both tables are append-only and every row
 # fills every column (blank string where a field does not apply to that
@@ -99,6 +109,48 @@ ROUND_KIND_VALUES = (
     "final_review",
 )
 
+# OS-19 fail-safe markers. A duration that cannot be measured leaves `duration_s`
+# empty and appends one of these to the row's own `detail`, so "no duration" and
+# "a duration that was thrown away because the input was impossible" are
+# distinguishable by a later reader -- and by grep -- instead of both being a
+# blank cell. They are appended to whatever `detail` the caller already had, never
+# substituted for it.
+TIMING_INVALID_ORDER = "timing_invalid=ended_at_before_started_at"
+TIMING_INVALID_TIMESTAMP = "timing_invalid=unusable_timestamp"
+TIMING_INVALID_DURATION = "timing_invalid=negative_duration_seconds"
+# OS-19 Final Review R1: a negative duration is not the only impossible number a
+# caller can hand in. `float("nan")`, `float("inf")` and `float("-inf")` all
+# convert cleanly, and NaN in particular compares False against EVERY ordering
+# test -- so a `value < 0` guard lets it straight through and `duration_s` is
+# emitted as `nan`, which is not >= 0 and is not a measurement of anything. It
+# gets its own marker rather than borrowing the negative one, because a reader
+# grepping the log should not be told a NaN was a negative number.
+TIMING_INVALID_NONFINITE_DURATION = "timing_invalid=non_finite_duration_seconds"
+TIMING_INVALID_MARKERS = (
+    TIMING_INVALID_ORDER,
+    TIMING_INVALID_TIMESTAMP,
+    TIMING_INVALID_DURATION,
+    TIMING_INVALID_NONFINITE_DURATION,
+)
+
+# OS-19 review round 1 BF-001: a marker alone was not enough. A row whose
+# `started_at`/`ended_at` columns still carried the impossible pair verbatim
+# violated the `started_at <= ended_at` invariant in the row itself, no matter
+# what `duration_s` and `detail` said about it. The pair is therefore quarantined
+# instead: the timestamp columns are left empty (they are for timestamps that
+# survived validation) and the two raw values move into `detail` under these
+# names, so the evidence of what was actually handed in is preserved without a
+# later reader -- or a `sort`, or a `min()`/`max()` over the column -- ever
+# seeing an invalid value in a timestamp column.
+TIMING_INVALID_STARTED_AT_FIELD = "timing_invalid_started_at"
+TIMING_INVALID_ENDED_AT_FIELD = "timing_invalid_ended_at"
+
+# The TIMING_LOG events RunTimingTracker owns the lifecycle of, as opposed to
+# merely writing. Spelled once so the CLI and the tracker cannot disagree.
+BOUNDARY_OPEN_EVENTS = ("phase_start", "iteration_start")
+BOUNDARY_CLOSE_EVENTS = ("phase_end", "iteration_end")
+DISPATCH_EVENTS = ("dispatch_settled", "unexpected_exit")
+
 
 class RunLoggingError(ValueError):
     """Raised for a caller mistake (e.g. an unknown run status), never for I/O."""
@@ -109,20 +161,116 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def elapsed_seconds(started_at: str, ended_at: str) -> float | str:
-    """`ended_at - started_at` in seconds, or "" when either side can't be parsed.
+def resolve_duration(started_at: str, ended_at: str) -> tuple[float | str, str]:
+    """`(duration_s, reason)` for one timestamp pair. Never raises.
 
-    Never raises: a malformed or missing timestamp is a blank duration cell,
-    not a reason to fail the event it is attached to.
+    OS-19: `duration_s` is a measurement, and there is no such thing as a
+    measurement of negative seconds. When the pair cannot produce one, the
+    duration is "" and `reason` names why -- which is the whole point. PR #16's
+    real OS-3 TIMING_LOG.md carries five rows whose `started_at` is minutes
+    AFTER their `ended_at`, and the pre-OS-19 writer recorded the raw negative
+    delta (-423s, -2267s, -1296s, -1998s, -2766s) as if it were a duration. It
+    is neither clamped to 0 nor absolute-valued here: both would turn "this
+    input was wrong" into a plausible-looking number that no later reader could
+    tell apart from a real measurement.
+
+    `reason` is "" both when the duration is valid and when there was simply
+    nothing to compute (a missing side) -- an absent timestamp is a legitimate
+    state (a `phase_start` row has no `ended_at` yet), not a fault to annotate.
     """
     if not started_at or not ended_at:
-        return ""
+        return "", ""
     try:
         start = datetime.fromisoformat(started_at)
         end = datetime.fromisoformat(ended_at)
-    except ValueError:
-        return ""
-    return (end - start).total_seconds()
+    except (TypeError, ValueError):
+        return "", TIMING_INVALID_TIMESTAMP
+    try:
+        delta = (end - start).total_seconds()
+    except TypeError:
+        # Both sides parsed, but one is offset-naive and the other offset-aware,
+        # so they are not comparable. Pre-OS-19 this raised out of
+        # elapsed_seconds() -- and every caller invoked it OUTSIDE its own
+        # _safe_log wrapper, so a logging concern aborted an already-settled
+        # Dispatch. Section 9 (OS-17) forbids exactly that.
+        return "", TIMING_INVALID_TIMESTAMP
+    if delta < 0:
+        return "", TIMING_INVALID_ORDER
+    return delta, ""
+
+
+def elapsed_seconds(started_at: str, ended_at: str) -> float | str:
+    """`ended_at - started_at` in seconds, or "" when it cannot be measured.
+
+    Never raises and never returns a negative number -- see resolve_duration(),
+    which this delegates to and which also reports WHY a pair produced nothing.
+    """
+    return resolve_duration(started_at, ended_at)[0]
+
+
+def _validate_duration(duration: Any) -> tuple[float | str, str]:
+    """The same fail-safe judgement for a duration the caller computed itself.
+
+    A caller that hands over `duration_seconds` directly (the `--duration-seconds`
+    flag, or an offline reconstruction) bypasses resolve_duration() entirely, so
+    a negative value would otherwise still reach the file through that door. A
+    value that is not a number at all is passed through untouched: this function
+    exists to catch impossible measurements, not to police the column's type.
+
+    OS-19 Final Review R1: "not negative" is a weaker test than "is a duration".
+    A non-finite float parses as a number and then fails the `value < 0` guard --
+    NaN because every comparison against it is False, +inf because it is not
+    negative -- and would be written as `duration_s=nan` / `duration_s=inf`.
+    Neither is a count of seconds, so `math.isfinite` is checked FIRST and all
+    three (NaN, +inf, -inf) take the same fail-safe exit as a negative value:
+    the cell is left empty and `detail` says why. Nothing is clamped to 0 or
+    passed through `abs()` here either -- that would turn an impossible input
+    into a number a later reader could not tell apart from a real measurement,
+    which is the whole point of the OS-19 fix.
+    """
+    if duration in ("", None):
+        return "", ""
+    try:
+        value = float(duration)
+    except (TypeError, ValueError):
+        return duration, ""
+    if not math.isfinite(value):
+        return "", TIMING_INVALID_NONFINITE_DURATION
+    if value < 0:
+        return "", TIMING_INVALID_DURATION
+    return value, ""
+
+
+def _is_unusable_timestamp(value: Any) -> bool:
+    """True for a populated value `datetime.fromisoformat` cannot read at all.
+
+    A blank side is not a fault (a `phase_start` row legitimately has no
+    `ended_at` yet); a populated one that is not a timestamp is. resolve_duration()
+    only reaches that judgement for a PAIR, because a duration needs both sides --
+    this is the same judgement for the lone side of a half-filled row, so that no
+    value which is not a timestamp is ever written into a timestamp column.
+    """
+    if not value:
+        return False
+    try:
+        datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return True
+    return False
+
+
+def _quarantine_evidence(started_at: Any, ended_at: Any) -> str:
+    """The `detail` evidence for a pair that may not be written as timestamps.
+
+    OS-19 review round 1 BF-001 required that an invalid populated pair never
+    be emitted into the timestamp columns AND that the diagnostic evidence not
+    be destroyed. This is the second half: the exact strings the caller handed
+    in, under names that are greppable and are not timestamp columns.
+    """
+    return (
+        f"{TIMING_INVALID_STARTED_AT_FIELD}={'' if started_at is None else started_at} "
+        f"{TIMING_INVALID_ENDED_AT_FIELD}={'' if ended_at is None else ended_at}"
+    )
 
 
 def _escape(value: Any) -> str:
@@ -281,12 +429,61 @@ def log_timing_event(
     give it) numerically identical to `OrcaRuntimeHarness`'s own rows, instead of the
     CLI path silently leaving `duration_s` blank while the Python path filled it in.
     An explicit `duration_seconds` (including `0.0`) is never overridden.
+
+    OS-19: whichever door the duration comes through, it is the same fail-safe
+    judgement -- an impossible measurement (an `ended_at` before its
+    `started_at`, an unusable timestamp, a negative or non-finite explicit
+    duration) leaves
+    `duration_s` empty and appends a `timing_invalid=...` marker to `detail`
+    rather than writing a number no reader could trust. This function still
+    never raises: it is logging, and section 9 (OS-17) requires that a logging
+    concern cannot change a lifecycle decision that has already been made.
+
+    OS-19 review round 1 BF-001: the timestamp pair is validated whenever BOTH
+    sides are populated, whether or not `duration_seconds` was supplied. Two
+    things follow. First, an explicit duration is no longer a door around the
+    check -- a caller-computed `7` for a pair whose `ended_at` precedes its
+    `started_at` is not a measurement of that pair and is not written as one.
+    Second, an invalid pair does not reach the `started_at`/`ended_at` columns
+    at all: the row would otherwise violate `started_at <= ended_at` in its own
+    two timestamp cells however loudly `detail` disclaimed it. The pair is
+    quarantined into `detail` verbatim instead (see `_quarantine_evidence`), so
+    every emitted row with both timestamp columns populated satisfies the
+    invariant and nothing about the bad input is lost. The same quarantine
+    covers the lone populated side of a half-filled row when it is not a
+    readable timestamp at all: a value that is not a timestamp has no business
+    in a timestamp column either, even where there is no pair to order it
+    against.
     """
     path = timing_log_path(run_id, base=base)
     _ensure_table(path, TIMING_LOG_COLUMNS)
-    duration = duration_seconds
-    if duration in ("", None) and started_at and ended_at:
-        duration = elapsed_seconds(started_at, ended_at)
+    # Always resolved, never only as a duration source: for a populated pair this
+    # IS the ordering check, and `reason` is non-empty only when both sides were
+    # populated and the pair was impossible.
+    derived, reason = resolve_duration(started_at, ended_at)
+    if not reason and (
+        _is_unusable_timestamp(started_at) or _is_unusable_timestamp(ended_at)
+    ):
+        # Only reachable for a half-filled row: a populated pair has already been
+        # judged above. Same rule, same fail-safe.
+        reason = TIMING_INVALID_TIMESTAMP
+    if reason:
+        duration = ""
+        detail = " ".join(
+            part
+            for part in (detail, reason, _quarantine_evidence(started_at, ended_at))
+            if part
+        )
+        started_at = ""
+        ended_at = ""
+    elif duration_seconds in ("", None):
+        duration = derived
+    else:
+        duration, duration_reason = _validate_duration(duration_seconds)
+        if duration_reason:
+            detail = (
+                f"{detail} {duration_reason}".strip() if detail else duration_reason
+            )
     if isinstance(duration, float):
         duration = f"{duration:.3f}"
     _append_row(
@@ -344,11 +541,298 @@ def log_run_status(
         event="run_end",
         started_at=run_started_at,
         ended_at=ended_at,
-        duration_seconds=elapsed_seconds(run_started_at, ended_at),
+        # OS-19: derived inside log_timing_event, the one place that applies the
+        # fail-safe judgement. Computing it here as well would be a second
+        # derivation that could disagree with the writer's -- and would put a
+        # `(end - start)` outside the writer, where a TypeError on a naive/aware
+        # pair escapes into the caller instead of staying a blank cell.
         risk=risk,
         detail=status,
         timestamp=ended_at,
     )
+
+
+# ---- OS-19: the authoritative clock and the phase/iteration boundary lifecycle ----
+
+
+class RunTimingTracker:
+    """One run's open phase/iteration scopes and its pending dispatch clocks.
+
+    OS-19. Before this existed, the boundary lifecycle lived only inside
+    `OrcaRuntimeHarness` (Python path) and the CLI path had none at all -- it is
+    a fresh process per event, so a live Coordinator following SKILL.md section
+    9 had to supply `--started-at`/`--ended-at` from memory. It has no clock, and
+    in PR #16's real OS-3 run it did what anything without a clock does: it
+    chained each dispatch's `started_at` off the PREVIOUS row's `ended_at`, which
+    was itself an estimate and frequently in the future. Five `dispatch_settled`
+    rows came out with `started_at` minutes after `ended_at`, and every single
+    `iteration_end`/`phase_end` row in that log has an empty `started_at` and a
+    blank `duration_s`, because nothing remembered where the scope began.
+
+    So this class owns two things, and both paths use the same one:
+
+    1. The authoritative clock. `mark_dispatch_started()` reads `now_iso()` at
+       the moment the dispatch actually starts and keeps it until that dispatch
+       settles. Nothing downstream reconstructs it.
+    2. The boundary lifecycle. A scope opens at the `opened_at` of the first
+       dispatch inside it -- before that dispatch runs, so it brackets rather
+       than trails it -- and closes at that scope's OWN last recorded activity,
+       never at "now", which at transition time really means "whenever the next
+       scope's dispatch happened to settle" and would fold the next scope's time
+       into the outgoing one's duration.
+
+    State lives in memory. `load()`/`save()` add a JSON round-trip through the
+    run's own artifact root for the CLI path, whose process ends after every
+    event; `OrcaRuntimeHarness` holds one instance for the life of the run and
+    never persists. Same class, same transitions, so the two paths cannot drift.
+
+    `emit` is the injected writer. `OrcaRuntimeHarness` passes one that routes
+    through its `_safe_log`, which is what keeps section 9's "logging never
+    changes lifecycle correctness" true for every row this class produces.
+    """
+
+    def __init__(
+        self,
+        run_id: str,
+        *,
+        base: Path | None = None,
+        emit: Callable[..., Any] | None = None,
+        risk: str = "",
+    ) -> None:
+        self.run_id = run_id
+        self.base = base
+        self.risk = risk
+        self._emit = emit if emit is not None else self._write_row
+        self.run_started_at: str = ""
+        self.open_phase: str = ""
+        self.phase_started_at: str = ""
+        self.phase_result: str = ""
+        self.phase_last_ended_at: str = ""
+        self.open_iteration: tuple[str, str] | None = None
+        self.iteration_started_at: str = ""
+        self.iteration_result: str = ""
+        self.iteration_last_ended_at: str = ""
+        # "<phase>|<role>|<iteration>" -> the started_at this tracker captured.
+        self.dispatch_marks: dict[str, str] = {}
+
+    # ---- writer ------------------------------------------------------------
+
+    def _write_row(self, **fields: Any) -> None:
+        log_timing_event(self.run_id, base=self.base, **fields)
+
+    # ---- authoritative clock -----------------------------------------------
+
+    @staticmethod
+    def dispatch_key(phase: str, role: str, iteration: int | str) -> str:
+        return f"{phase}|{role}|{iteration}"
+
+    def mark_dispatch_started(
+        self,
+        *,
+        phase: str,
+        role: str,
+        iteration: int | str,
+        started_at: str | None = None,
+    ) -> str:
+        """Capture (and return) the instant this dispatch starts.
+
+        `started_at` is an override for a caller that already holds the same
+        authoritative instant -- `OrcaRuntimeHarness` reads `now_iso()` itself
+        immediately before `start_worker()` and hands that exact value to both
+        this tracker and the eventual `dispatch_settled` row, so the two cannot
+        differ. Nobody else supplies it.
+        """
+        captured = started_at or now_iso()
+        self.dispatch_marks[self.dispatch_key(phase, role, iteration)] = captured
+        return captured
+
+    def take_dispatch_mark(
+        self, *, phase: str, role: str, iteration: int | str
+    ) -> str:
+        """The captured start for this dispatch, consumed so a re-dispatch of the
+        same (phase, role, iteration) gets its own mark rather than the last one's.
+        """
+        return self.dispatch_marks.pop(self.dispatch_key(phase, role, iteration), "")
+
+    # ---- boundary lifecycle -------------------------------------------------
+
+    def open_boundary(
+        self, phase: str, iteration: int | str | None, *, opened_at: str
+    ) -> None:
+        """Open this dispatch's phase/iteration scope, closing whatever it replaces.
+
+        Idempotent for a scope that is already open, so a Coordinator that marks
+        every dispatch (the normal case) and one that also writes an explicit
+        `phase_start` row do not produce two.
+        """
+        if not self.run_id or not phase:
+            return
+        if phase != self.open_phase:
+            # The outgoing scopes close at their own last activity. `opened_at`
+            # is the fallback for a scope nothing ever settled inside: it is the
+            # same authoritative instant this transition is happening at, not a
+            # second, slightly later clock read.
+            self.close_iteration(ended_at=self.iteration_last_ended_at or opened_at)
+            self.close_phase(ended_at=self.phase_last_ended_at or opened_at)
+            self.open_phase = phase
+            self.phase_started_at = opened_at
+            self.phase_result = ""
+            self.phase_last_ended_at = ""
+            self._emit(
+                event="phase_start",
+                phase=phase,
+                started_at=opened_at,
+                risk=self.risk,
+                timestamp=opened_at,
+            )
+        if iteration is None or iteration == "":
+            return
+        iteration_key = (phase, str(iteration))
+        if iteration_key != self.open_iteration:
+            self.close_iteration(ended_at=self.iteration_last_ended_at or opened_at)
+            self.open_iteration = iteration_key
+            self.iteration_started_at = opened_at
+            self.iteration_result = ""
+            self.iteration_last_ended_at = ""
+            self._emit(
+                event="iteration_start",
+                phase=phase,
+                iteration=iteration,
+                started_at=opened_at,
+                risk=self.risk,
+                timestamp=opened_at,
+            )
+
+    def record_scope_activity(self, *, ended_at: str, result: str = "") -> None:
+        """A dispatch inside the currently open scope settled at `ended_at`.
+
+        This is what lets a scope close at its own last real activity. `result`
+        is the most recent reviewer gate result seen inside the scope and
+        becomes the eventual `iteration_end`/`phase_end` row's `detail`; a
+        Worker attempt leaves it unchanged but still advances the end time.
+        """
+        if ended_at:
+            self.iteration_last_ended_at = ended_at
+            self.phase_last_ended_at = ended_at
+        if result:
+            self.iteration_result = result
+            self.phase_result = result
+
+    def close_iteration(
+        self, *, ended_at: str | None = None, result: str | None = None
+    ) -> None:
+        if self.open_iteration is None:
+            return
+        phase, iteration = self.open_iteration
+        ended = ended_at or self.iteration_last_ended_at or now_iso()
+        self._emit(
+            event="iteration_end",
+            phase=phase,
+            iteration=iteration,
+            started_at=self.iteration_started_at,
+            ended_at=ended,
+            risk=self.risk,
+            detail=self.iteration_result if result is None else result,
+            timestamp=ended,
+        )
+        self.open_iteration = None
+        self.iteration_started_at = ""
+        self.iteration_result = ""
+        self.iteration_last_ended_at = ""
+
+    def close_phase(
+        self, *, ended_at: str | None = None, result: str | None = None
+    ) -> None:
+        if not self.open_phase:
+            return
+        # The iteration inside it closes at ITS own last activity, not at the
+        # phase's -- a phase_end supplied from outside must not retro-stamp the
+        # iteration it happens to contain.
+        self.close_iteration()
+        ended = ended_at or self.phase_last_ended_at or now_iso()
+        self._emit(
+            event="phase_end",
+            phase=self.open_phase,
+            started_at=self.phase_started_at,
+            ended_at=ended,
+            risk=self.risk,
+            detail=self.phase_result if result is None else result,
+            timestamp=ended,
+        )
+        self.open_phase = ""
+        self.phase_started_at = ""
+        self.phase_result = ""
+        self.phase_last_ended_at = ""
+
+    def close_all(self, *, ended_at: str | None = None) -> None:
+        """Close whatever is still open when the run ends.
+
+        The common case: nothing in a normal flow closes the LAST phase and
+        iteration, because there is no next scope whose transition would do it.
+        """
+        self.close_iteration(ended_at=ended_at or self.iteration_last_ended_at or None)
+        self.close_phase(ended_at=ended_at or self.phase_last_ended_at or None)
+
+    # ---- persistence (the CLI path's substitute for a long-lived process) ----
+
+    def state_path(self) -> Path:
+        return _ensure_run_artifact_root(self.run_id, base=self.base) / TIMING_STATE_FILENAME
+
+    _PERSISTED = (
+        "run_started_at",
+        "open_phase",
+        "phase_started_at",
+        "phase_result",
+        "phase_last_ended_at",
+        "iteration_started_at",
+        "iteration_result",
+        "iteration_last_ended_at",
+        "dispatch_marks",
+    )
+
+    @classmethod
+    def load(
+        cls,
+        run_id: str,
+        *,
+        base: Path | None = None,
+        emit: Callable[..., Any] | None = None,
+        risk: str = "",
+    ) -> "RunTimingTracker":
+        """Read this run's tracker state, or start an empty one.
+
+        Unreadable or corrupt state is an empty tracker, never an exception: a
+        run whose state file was truncated still has to be able to log, and
+        section 9 does not let a logging concern stop the run.
+        """
+        tracker = cls(run_id, base=base, emit=emit, risk=risk)
+        try:
+            raw = json.loads(tracker.state_path().read_text(encoding="utf-8"))
+        except (OSError, ValueError):  # RunLoggingError is a ValueError
+            return tracker
+        if not isinstance(raw, dict):
+            return tracker
+        for name in cls._PERSISTED:
+            value = raw.get(name)
+            if isinstance(value, (str, dict)):
+                setattr(tracker, name, value)
+        open_iteration = raw.get("open_iteration")
+        if isinstance(open_iteration, list) and len(open_iteration) == 2:
+            tracker.open_iteration = (str(open_iteration[0]), str(open_iteration[1]))
+        return tracker
+
+    def save(self) -> None:
+        """Persist this run's tracker state. Never raises, for the same reason."""
+        payload: dict[str, Any] = {name: getattr(self, name) for name in self._PERSISTED}
+        payload["open_iteration"] = (
+            list(self.open_iteration) if self.open_iteration else None
+        )
+        try:
+            self.state_path().write_text(
+                json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            )
+        except (OSError, ValueError):  # RunLoggingError is a ValueError
+            return
 
 
 # ---- CLI: the same three writers, for a Coordinator driving Orca by hand ----------
@@ -413,6 +897,16 @@ def _build_parser() -> argparse.ArgumentParser:
     timing.add_argument("--risk", default="", choices=("", *RISK_VALUES))
     timing.add_argument("--detail", default="")
 
+    dispatch_start = subparsers.add_parser(
+        "timing-dispatch-start",
+        help=(
+            "capture the authoritative start of one dispatch and open its "
+            "phase/iteration boundary; run this immediately before worker-start"
+        ),
+    )
+    _add_common_arguments(dispatch_start)
+    dispatch_start.add_argument("--risk", default="", choices=("", *RISK_VALUES))
+
     status = subparsers.add_parser(
         "run-status", help="append the one run-end row to both logs"
     )
@@ -454,33 +948,116 @@ def main(argv: list[str] | None = None) -> int:
             result=args.result,
             detail=args.detail,
         )
-    elif args.command == "timing-event":
-        path = log_timing_event(
-            args.run_id,
-            base=base,
-            event=args.event,
-            phase=args.phase,
-            role=args.role,
-            iteration=args.iteration,
-            started_at=args.started_at,
-            ended_at=args.ended_at,
-            duration_seconds=args.duration_seconds,
-            risk=args.risk,
-            detail=args.detail,
+    elif args.command == "timing-dispatch-start":
+        # OS-19: the authoritative dispatch clock for the CLI path. The
+        # Coordinator does not pass a timestamp here and never has to remember
+        # one later -- this command reads now_iso() at the moment the dispatch
+        # actually starts, and the matching `timing-event --event
+        # dispatch_settled` reads the mark back. That is the whole fix for the
+        # five negative rows in PR #16's real OS-3 TIMING_LOG.md, every one of
+        # which had a `started_at` reconstructed from an earlier row's estimate.
+        tracker = RunTimingTracker.load(args.run_id, base=base, risk=args.risk)
+        started_at = tracker.mark_dispatch_started(
+            phase=args.phase, role=args.role, iteration=args.iteration
         )
+        tracker.open_boundary(args.phase, args.iteration, opened_at=started_at)
+        tracker.save()
+        print(started_at)
+        return 0
+    elif args.command == "timing-event":
+        path = _cli_timing_event(args, base)
     else:
+        tracker = RunTimingTracker.load(args.run_id, base=base, risk=args.risk)
+        # The Python path closes whatever scope is still open in finish(),
+        # immediately before log_run_status(). Same order here, so a run that
+        # ends mid-phase leaves a closed boundary rather than a dangling one.
+        tracker.close_all()
         log_run_status(
             args.run_id,
             args.status,
             base=base,
             reason=args.reason,
-            run_started_at=args.run_started_at,
+            # A run's own start was captured by `timing-event --event run_start`
+            # hours earlier; asking the Coordinator to hand it back is asking it
+            # to remember a timestamp, which is what OS-19 is about.
+            run_started_at=args.run_started_at or tracker.run_started_at,
             risk=args.risk,
             risk_source=args.risk_source,
         )
+        tracker.save()
         path = orchestrator_log_path(args.run_id, base=base)
     print(path)
     return 0
+
+
+def _cli_timing_event(args: argparse.Namespace, base: Path | None) -> Path:
+    """`timing-event`, routed through this run's RunTimingTracker.
+
+    The tracker owns the phase/iteration lifecycle and the dispatch clock, so
+    the CLI path produces the same boundary rows, with the same bracketing and
+    the same next-scope exclusion, that OrcaRuntimeHarness produces in-process.
+    An explicit `--started-at`/`--ended-at` is still honoured -- an offline
+    reconstruction is a legitimate use -- but it is validated identically, so
+    the OS-3 failure cannot return through that door.
+    """
+    tracker = RunTimingTracker.load(args.run_id, base=base, risk=args.risk)
+    path = timing_log_path(args.run_id, base=base)
+    event = args.event
+    started_at = args.started_at
+    ended_at = args.ended_at
+
+    if event in DISPATCH_EVENTS:
+        started_at = started_at or tracker.take_dispatch_mark(
+            phase=args.phase, role=args.role, iteration=args.iteration
+        )
+        ended_at = ended_at or now_iso()
+        # A Coordinator that skipped `timing-dispatch-start` still gets a
+        # bracketing boundary: opening here is idempotent for a scope that is
+        # already open, and uses this dispatch's own start, never "now".
+        tracker.open_boundary(args.phase, args.iteration, opened_at=started_at)
+        log_timing_event(
+            args.run_id,
+            base=base,
+            event=event,
+            phase=args.phase,
+            role=args.role,
+            iteration=args.iteration,
+            started_at=started_at,
+            ended_at=ended_at,
+            duration_seconds=args.duration_seconds,
+            risk=args.risk,
+            detail=args.detail,
+        )
+        tracker.record_scope_activity(ended_at=ended_at)
+    elif event == "phase_start":
+        tracker.open_boundary(args.phase, None, opened_at=started_at or now_iso())
+    elif event == "iteration_start":
+        tracker.open_boundary(
+            args.phase, args.iteration, opened_at=started_at or now_iso()
+        )
+    elif event == "iteration_end":
+        tracker.close_iteration(ended_at=ended_at or None, result=args.detail or None)
+    elif event == "phase_end":
+        tracker.close_phase(ended_at=ended_at or None, result=args.detail or None)
+    else:
+        if event == "run_start":
+            tracker.run_started_at = started_at or now_iso()
+            started_at = tracker.run_started_at
+        log_timing_event(
+            args.run_id,
+            base=base,
+            event=event,
+            phase=args.phase,
+            role=args.role,
+            iteration=args.iteration,
+            started_at=started_at,
+            ended_at=ended_at,
+            duration_seconds=args.duration_seconds,
+            risk=args.risk,
+            detail=args.detail,
+        )
+    tracker.save()
+    return path
 
 
 if __name__ == "__main__":

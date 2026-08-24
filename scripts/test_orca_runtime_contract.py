@@ -6181,6 +6181,186 @@ class RunLoggingIntegrationTests(OfflineHarnessTestCase):
         # next iteration's own first dispatch started.
         self.assertLessEqual(iter1_end["ended_at"], w2["started_at"])
 
+    # ---- G2. OS-19: no row may ever carry a negative or out-of-order duration ----
+
+    @staticmethod
+    def assert_timing_invariants(rows: list[dict[str, str]]) -> None:
+        """`started_at <= ended_at` and `duration_s >= 0` on every row that has them.
+
+        The invariant PR #16's real OS-3 TIMING_LOG.md broke five times
+        (IMPLEMENTATION reviewer 2 at -423s, TEST reviewer 3 at -2267s, DESIGN
+        reviewer 7 at -1296s, IMPLEMENTATION reviewer 3 at -1998s, TEST reviewer
+        4 at -2766s). Asserted over the WHOLE file, not a hand-picked row, so a
+        future event kind cannot quietly opt out of it.
+        """
+        for row in rows:
+            if row["duration_s"]:
+                assert float(row["duration_s"]) >= 0.0, f"negative duration_s: {row}"
+            if (
+                row["started_at"]
+                and row["ended_at"]
+                and row["started_at"] > row["ended_at"]
+            ):
+                # The pair is written back as it arrived -- erasing it would
+                # destroy the evidence -- but it may not go out looking like a
+                # measurement: blank duration, and the row says why.
+                assert row["duration_s"] == "", f"out-of-order with a duration: {row}"
+                assert any(
+                    marker in row["detail"]
+                    for marker in run_logging.TIMING_INVALID_MARKERS
+                ), f"an out-of-order pair was recorded without saying so: {row}"
+
+    def test_a_full_correction_and_final_review_run_holds_the_timing_invariants(
+        self,
+    ) -> None:
+        """OS-19: the run shape that actually produced the negative rows --
+        correction loops, a phase re-opened by a Final Review FAIL, and a
+        Final Review attempt of its own -- replayed through the real harness.
+        """
+        recorder = SequentialTerminalExec()
+        harness = self.started_harness(recorder)
+        attempts = []
+
+        self.arm(recorder, "ctx_w1", "task_w1")
+        attempts.append(
+            harness.run_attempt("worker", 1, "complete", phase="implementation")[0]
+        )
+        self.arm(recorder, "ctx_r1", "task_r1")
+        recorder.results["check"]["messages"][0]["body"] = "RESULT: FAIL"
+        attempts.append(
+            harness.run_attempt(
+                "reviewer", 1, "fail", phase="implementation", findings=("R1",)
+            )[0]
+        )
+        self.arm(recorder, "ctx_w2", "task_w2")
+        attempts.append(
+            harness.run_attempt(
+                "worker", 2, "correction", phase="implementation",
+                findings=("R1",), round_kind="correction",
+            )[0]
+        )
+        self.arm(recorder, "ctx_r2", "task_r2")
+        recorder.results["check"]["messages"][0]["body"] = "RESULT: PASS"
+        attempts.append(
+            harness.run_attempt(
+                "reviewer", 2, "pass", phase="implementation", round_kind="correction"
+            )[0]
+        )
+        self.arm(recorder, "ctx_f1", "task_f1")
+        recorder.results["check"]["messages"][0]["body"] = "RESULT: FAIL"
+        attempts.append(
+            harness.run_attempt(
+                "reviewer", 1, "fail", phase="final_review",
+                findings=("R1",), round_kind="final_review",
+            )[0]
+        )
+        # The Final Review FAIL routes back into an upstream phase, which
+        # re-opens design at a NEW iteration number -- the exact path DESIGN
+        # iteration 7 (-1296s) came down in the real run.
+        self.arm(recorder, "ctx_d7", "task_d7")
+        recorder.results["check"]["messages"][0]["body"] = "RESULT: PASS"
+        attempts.append(
+            harness.run_attempt(
+                "worker", 7, "correction", phase="design",
+                findings=("R1",), round_kind="downstream_revalidation",
+            )[0]
+        )
+        self.arm(recorder, "ctx_f2", "task_f2")
+        attempts.append(
+            harness.run_attempt(
+                "reviewer", 2, "pass", phase="final_review", round_kind="final_review"
+            )[0]
+        )
+        run_id = harness.run_id
+        harness.finish(
+            RuntimeScenarioResult("probe", run_id, "COMPLETED", 2, attempts)
+        )
+
+        _, timing_log = self.log_paths(run_id)
+        rows = self.read_rows(timing_log)
+        self.assert_timing_invariants(rows)
+        self.assertEqual(harness._logging_errors, [])
+        # Every closed boundary really measured something rather than going blank.
+        for row in rows:
+            if row["event"] in ("iteration_end", "phase_end"):
+                self.assertNotEqual(row["duration_s"], "", row)
+
+    def test_a_backwards_jumping_clock_never_becomes_a_negative_duration(self) -> None:
+        """OS-19 fail-safe, exercised through the real lifecycle path.
+
+        A time source that goes backwards (an NTP step, a Coordinator-supplied
+        timestamp, a clock read on a different host) is exactly what the real
+        OS-3 rows look like from the writer's side. It must produce a blank,
+        self-describing duration cell -- never a negative number, never a value
+        clamped to zero that reads as a real measurement -- and it must not
+        disturb the dispatch it is describing.
+        """
+        recorder = SequentialTerminalExec()
+        harness = self.started_harness(recorder)
+
+        # Descending timestamps: every settlement reads earlier than its start.
+        clock = iter(
+            [f"2026-08-24T0{9 - index}:00:00+00:00" for index in range(9)]
+        )
+        real_now_iso = run_logging.now_iso
+
+        self.arm(recorder, "ctx_w1", "task_w1")
+        with patch.object(
+            run_logging, "now_iso", lambda: next(clock, real_now_iso())
+        ):
+            worker, _ = harness.run_attempt(
+                "worker", 1, "complete", phase="implementation"
+            )
+        run_id = harness.run_id
+        harness.finish(RuntimeScenarioResult("probe", run_id, "COMPLETED", 1, [worker]))
+
+        _, timing_log = self.log_paths(run_id)
+        rows = self.read_rows(timing_log)
+        self.assert_timing_invariants(rows)
+        settled = next(row for row in rows if row["event"] == "dispatch_settled")
+        self.assertEqual(settled["duration_s"], "")
+        self.assertIn(run_logging.TIMING_INVALID_ORDER, settled["detail"])
+        # OS-17 section 9: logging never changes lifecycle correctness. The
+        # dispatch settled exactly as it would have with a sane clock.
+        self.assertEqual(worker.outcome, "succeeded")
+        self.assertEqual(worker.finalizations, 1)
+        self.assertEqual(harness._logging_errors, [])
+
+    def test_an_unusable_timestamp_pair_never_raises_into_the_lifecycle(self) -> None:
+        """`(end - start)` on a naive/aware pair raises TypeError, not ValueError.
+
+        Pre-OS-19 the harness computed the duration at its own call site --
+        OUTSIDE _safe_log -- so that TypeError escaped logging and aborted an
+        already-settled dispatch, which is precisely what section 9 forbids.
+        """
+        recorder = SequentialTerminalExec()
+        harness = self.started_harness(recorder)
+        naive_then_aware = iter(
+            ["2026-08-24T01:00:00", "2026-08-24T01:05:00+00:00"]
+        )
+        real_now_iso = run_logging.now_iso
+
+        self.arm(recorder, "ctx_w1", "task_w1")
+        with patch.object(
+            run_logging, "now_iso", lambda: next(naive_then_aware, real_now_iso())
+        ):
+            worker, _ = harness.run_attempt(
+                "worker", 1, "complete", phase="implementation"
+            )
+        run_id = harness.run_id
+        harness.finish(RuntimeScenarioResult("probe", run_id, "COMPLETED", 1, [worker]))
+
+        _, timing_log = self.log_paths(run_id)
+        settled = next(
+            row
+            for row in self.read_rows(timing_log)
+            if row["event"] == "dispatch_settled"
+        )
+        self.assertEqual(settled["duration_s"], "")
+        self.assertIn(run_logging.TIMING_INVALID_TIMESTAMP, settled["detail"])
+        self.assertEqual(worker.outcome, "succeeded")
+        self.assertEqual(harness._logging_errors, [])
+
     def test_a_run_with_no_dispatches_writes_no_phase_or_iteration_boundary_rows(
         self,
     ) -> None:
