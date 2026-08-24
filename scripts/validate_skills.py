@@ -7,7 +7,7 @@ import re
 import sys
 from pathlib import Path
 
-from skill_policy import PolicyContractError, load_policy_contract
+from skill_policy import PolicyContractError, load_policy_contract, load_risk_contract
 from workflow_contract import WorkflowContractError, load_workflow_output_contract
 
 
@@ -75,6 +75,10 @@ SEMVER_PATTERN = re.compile(
 )
 
 LIFECYCLE_SKILL_DIR = REPO_ROOT / "orca-worker-reviewer-orchestration"
+
+# Re-exported so anchor_contract_block_lines() can measure the same block
+# load_risk_contract() parses -- one pattern, not two.
+from skill_policy import RISK_CONTRACT_BLOCK_PATTERN  # noqa: E402
 
 LIFECYCLE_CONTRACT_BLOCK_PATTERN = re.compile(
     r"####\s*Lifecycle accounting contract\s*\n(?P<body>.*?)```text\n(?P<values>.*?)\n```",
@@ -251,14 +255,22 @@ FINAL_REVIEW_CONTRACT: dict[str, tuple[str, ...]] = {
         "all_requested_phases_after_earliest_corrected_phase",
     ),
     "FINAL_REVIEW_COMPLETION_GATE": ("requested_phases_pass_and_final_review_pass",),
+    # OS-3: the final gate does not vary with risk.
+    "FINAL_REVIEW_RISK_INDEPENDENCE": ("mandatory_and_identical_at_every_risk_level",),
 }
 
-FINAL_REVIEW_CONTRACT_MAX_LINES = 13    # was 12; the 13th key is the T5a decision
+FINAL_REVIEW_CONTRACT_MAX_LINES = 14    # was 13; the 14th key is OS-3's risk independence
 FINAL_REVIEW_SECTION_HEADING = "## 17. Final Adversarial Review"
 FINAL_REVIEW_SECTION_END = "\n## 18."
+# Rewritten by D-1.7 S-5: the pre-OS-3 wording anchored the anti-anchoring rule on a
+# previous *Reviewer* PASS, which LOW never produces -- so the checklist's defence
+# against inheriting an upstream mistake evaporated at exactly the level where the
+# upstream evidence is an unreviewed Worker self-report. The premise is now stated
+# over the phase gate. These two stay the OPENING clause of each language's version,
+# so the sentence can be extended without churn but not deleted.
 FINAL_REVIEW_ANTI_ANCHORING_SENTENCES = (
-    "이전 phase Reviewer의 PASS 판정을 옳다고 가정하지 않는다.",
-    "Do NOT assume any previous Reviewer PASS decision is correct.",
+    "앞선 phase gate가 PASS였다는 사실을 옳다고 가정하지 않는다.",
+    "Do NOT assume any previous phase gate PASS is correct:",
 )
 FINAL_REVIEW_CHECKLIST_ANCHORS = (
     "A objective alignment",
@@ -349,10 +361,189 @@ QUALITY_GATE_REVIEW_POLICY_ANCHORS = (
 # annotation) answer four different questions; losing any of them from the example
 # silently loses that column from every ORCHESTRATOR_LOG.md a live Coordinator ever
 # writes.
+# ---- OS-3: the seventh orchestration-only anchor contract -----------------------
+# Same shape as the six above: read from LIFECYCLE_SKILL_DIR only, asserted absent
+# from the loop skill, and parsed by ONE function -- skill_policy.load_risk_contract,
+# imported rather than re-implemented, so the runtime evaluator and this validator
+# cannot disagree about what the block says.
+RISK_CONTRACT: dict[str, tuple[str, ...]] = {
+    "RISK_PARAMETER": ("risk",),
+    "RISK_LEVELS": ("low", "medium", "high"),
+    "RISK_DEFAULT": ("high",),
+    "RISK_SELECTION_SOURCES": ("explicit", "default"),
+    "RISK_NATURAL_LANGUAGE": ("deterministic_explicit_parameter_only",),
+    "RISK_INVALID_ERROR": ("invalid_risk",),
+    "RISK_INVALID_HANDLING": ("validation_failure_before_dispatch",),
+    "RISK_EMPTY_VALUE": ("explicit_invalid_never_omission",),
+    "RISK_RESOLUTION_SCOPE": ("resolved_once_per_run_never_per_attempt",),
+    "RISK_PHASE_AXIS": ("never_expands_or_contracts_requested_phases",),
+    "RISK_QUALITY_PROFILE_AXIS": ("independent_never_read_or_gate_on_each_other",),
+    "RISK_LOW_PHASE_GATE": ("worker_only",),
+    "RISK_MEDIUM_PHASE_GATE": ("worker_then_phase_reviewer",),
+    "RISK_HIGH_PHASE_GATE": ("worker_then_phase_reviewer",),
+    "RISK_LOW_TASK_GRAPH": ("worker_node_only",),
+    "RISK_MEDIUM_TASK_GRAPH": ("worker_and_dependent_reviewer",),
+    "RISK_HIGH_TASK_GRAPH": ("worker_and_dependent_reviewer",),
+    "RISK_DOWNSTREAM_REVALIDATION": ("high_only",),
+    "RISK_FINAL_REVIEW": ("mandatory_at_every_level",),
+    "RISK_SAFETY_FLOOR": ("mandatory_test_gates_apply_at_every_level",),
+}
+RISK_CONTRACT_MAX_LINES = 20
+RISK_SECTION_HEADING = "## 8. Phase Sequence Contract"
+RISK_SECTION_END = "\n## 9."
+# The prose the block is only an index into. Each is a sentence the section would be
+# WRONG without, the same criterion QUALITY_PROFILE_PROSE_ANCHORS already uses.
+RISK_PROSE_ANCHORS = (
+    "REASON: INVALID_RISK",
+    "mid-phase Reviewer gate를 건너뛴다",
+    "phase-local bounded correction loop",
+    "downstream revalidation(§17 T5a)",
+    "문서화된 예외",
+    "BUGFIX / REFACTORING × risk",
+)
+RISK_PARAMETER_DOC_ANCHOR = "risk=<low|medium|high>"
+# Section 6 must say that risk chooses which graph NODES exist, never WHEN they are
+# created -- the sentence that keeps LOW from leaving an orphan ready Reviewer Task.
+RISK_TASK_GRAPH_PROSE_ANCHOR = "LOW에서는 Worker Task 하나만 만들고"
+
+# ---- OS-3 Final Review R1: risk-neutral phase-gate predicates -------------------
+# The phase gate is risk-dependent (section 6 step 8, section 8, section 16, section
+# 18), so a phase transition or the Final Review trigger must never be expressed as
+# requiring a Reviewer PASS -- LOW creates no phase Reviewer and produces no verdict,
+# which would make the mandatory final gate unreachable in the specification even
+# though the code handles it correctly.
+#
+# Stale predicates that must never reappear ANYWHERE in the document. Each is the
+# exact text Final Review R1 found, so a revert or a copy-paste from an older
+# revision fails loudly.
+PHASE_GATE_STALE_PREDICATES = (
+    "Reviewer PASS를 받을 때까지",                      # frontmatter
+    "모든 requested phase가 Reviewer PASS를 받은",       # section 17 trigger
+    "마지막 requested phase의 Reviewer 판정이 PASS",     # section 17 procedure step 1
+    "trigger가 마지막 Reviewer Task의",                  # section 17 dependency justification
+    # --- extended by D-1.7 (Final Review R1, attempt 2) ---------------------
+    # The four entries above are the four sentences the SECOND review round
+    # happened to quote. R1 recurred a third time because nothing swept for
+    # siblings, so D-1.7 swept the whole document and these seven are what it
+    # found. Each is the exact text as it stood before the sweep, so a revert or
+    # a copy-paste from an older revision fails loudly and by name.
+    #
+    # The `아니면 ` prefix is load-bearing: corrected section 17 T4 still
+    # contains `correction Worker → p의 Reviewer 재검토 (§12 FAIL Loop 그대로)`
+    # on its MEDIUM/HIGH branch line, where it is correct. Only the
+    # unconditional form began with `아니면 `. Dropping the prefix would reject
+    # the corrected file.
+    "아니면 correction Worker → p의 Reviewer 재검토",        # S-1, section 17 T4
+    # S-2, section 6 `### Task graph ordering`. The WHOLE BULLET LINE,
+    # deliberately: the bare sentence `Reviewer Task는 Worker Task를 dependency로
+    # 선언한다` occurs a second time, at section 6 step 2, where it is already
+    # correctly risk-scoped (`MEDIUM/HIGH에서는 ... LOW에서는 Worker Task 하나만
+    # 만들고 ...`). A sentence anchor would reject the corrected document -- the
+    # same trap the section 12 headings below hit with `Reviewer FAIL`. Verified
+    # against the corrected file: this full line occurs 0 times, the sentence 1.
+    "- Coordinator는 Worker를 dispatch하기 전에 그 phase/iteration의 Task graph 전체를 "
+    "생성한다. Reviewer Task는 Worker Task를 dependency로 선언한다.",
+    "FAIL loop의 correction/re-review Task도 동일 규칙",     # S-2, section 6, same bullet list
+    # S-3, section 9 OS-17 timing call point 3. The parenthesis is part of the
+    # anchor: `(phase) Reviewer` in that bracketed form appears nowhere else, and
+    # the replacement reads `이 iteration의 phase gate 판정이`.
+    "이 iteration의 (phase) Reviewer",
+    "각 phase별 Reviewer attempt를 iteration으로 센다",       # S-4, section 13
+    # S-5, section 17 review checklist. The FULL sentence, because the
+    # replacement legitimately contains `이전 phase Reviewer의 PASS 판정이고` --
+    # a shorter prefix anchor would reject the corrected file.
+    "이전 phase Reviewer의 PASS 판정을 옳다고 가정하지 않는다",
+    "이 FAIL Loop와 정확히 같은 모양이다",                    # S-6, section 12
+)
+# Section 12's two transition HEADINGS. They need their own list because they are
+# stale only in one section and only as whole lines. BOTH refinements are
+# load-bearing:
+#
+#   - SCOPED, because `Reviewer PASS` / `Reviewer FAIL` occur legitimately elsewhere
+#     in the document -- section 17's anti-anchoring sentence ("Do NOT assume any
+#     previous Reviewer PASS decision is correct.") and section 18's invariant
+#     ("Reviewer FAIL -> new Worker correction dispatch"). A document-wide check
+#     would reject the corrected file.
+#
+#   - LINE-EXACT, because section 12 ITSELF legitimately contains the substring
+#     `Reviewer FAIL`, in "LOW에는 in-phase Reviewer FAIL이 없으므로 이 loop는 §17 T4를
+#     통해서만 진입한다" -- the very sentence that states the LOW rule correctly. A
+#     substring check scoped to section 12 would therefore fail on the CORRECTED
+#     document. The stale forms are whole lines ending in a colon; that prose is not.
+#
+# D-1.7 note: after S-5 rewrote section 17's anti-anchoring line in terms of the
+# phase gate, the bare substring `Reviewer PASS` no longer occurs anywhere in the
+# document -- so half the SCOPED justification above now reads as historical. Do
+# NOT "simplify" `Reviewer PASS:` into a document-wide negative anchor on that
+# basis. Section 11 and section 17 may legitimately regain the phrase, and
+# `Reviewer FAIL` still occurs twice for exactly the reasons stated (section 12's
+# own LOW sentence and section 18's invariant), so the pair must keep the same
+# shape. The LINE-EXACT half is unaffected and remains load-bearing.
+PHASE_GATE_STALE_SECTION_HEADINGS = (
+    ("## 12. FAIL Loop", "\n## 13.", "Reviewer PASS:"),
+    ("## 12. FAIL Loop", "\n## 13.", "Reviewer FAIL:"),
+)
+# The risk-neutral replacements, each checked in the section that must carry it.
+PHASE_GATE_NEUTRAL_ANCHORS = (
+    ("## 12. FAIL Loop", "\n## 13.", "phase gate PASS:"),
+    ("## 12. FAIL Loop", "\n## 13.", "phase gate FAIL:"),
+    # TEST-phase revalidation: the two headings above are risk-NEUTRAL but say
+    # nothing about what the gate IS. Deleting the sentence that defines it left the
+    # validator green while the document went back to not telling a Coordinator that
+    # LOW's gate is the Worker result -- R1's failure mode in a quieter form. These
+    # two anchor the definition itself, one per section that carries it.
+    (
+        "## 12. FAIL Loop",
+        "\n## 13.",
+        "LOW에서는 Worker 자신의 결과(§6 8단계, §14)이고",
+    ),
+    ("## 17. Final Adversarial Review", "\n## 18.", "자신의 **phase gate**를 PASS한 직후"),
+    ("## 17. Final Adversarial Review", "\n## 18.", "마지막 requested phase의 phase gate가 PASS"),
+    ("## 17. Final Adversarial Review", "\n## 18.", "LOW에서는 Worker 자신의 결과이고"),
+    # --- extended by D-1.7 (Final Review R1, attempt 2) ---------------------
+    # One per S-finding location, checked in the section that must carry it. The
+    # negative list above forbids the stale text; these forbid its silent
+    # DELETION, which would leave a section saying nothing about risk at all --
+    # R1's failure mode in a quieter form.
+    ("## 1. Purpose", "\n## 2.", "위 그림은 MEDIUM/HIGH의 모양이다"),
+    ("## 6. Orca-native Worker Placement", "\n## 7.", "LOW에는 없다(§6 2단계)"),
+    ("## 9. Approved Phase Output", "\n## 10.", "이 iteration의 phase gate 판정이 나온"),
+    ("## 12. FAIL Loop", "\n## 13.", "위 문단의 LOW 예외를 뒤집지 않는다"),
+    ("## 13. Iteration", "\n## 14.", "각 phase별 gate attempt를 iteration으로 센다"),
+    ("## 17. Final Adversarial Review", "\n## 18.", "아니면 correction round를 연다"),
+    ("## 17. Final Adversarial Review", "\n## 18.", "T5a HIGH에서만 실행된다"),
+    (
+        "## 17. Final Adversarial Review",
+        "\n## 18.",
+        "Do NOT assume any previous phase gate PASS is correct",
+    ),
+)
+PHASE_GATE_FRONTMATTER_ANCHOR = "phase gate는 risk가 정한다"
+
 RUN_LOGGING_DISPATCH_SETTLED_ANCHORS = (
     "--action created|reused --reuse",
     "--gate-result <role가 reviewer일 때",
     "--review-verdict <role가 reviewer일 때",
+    # OS-3: same reasoning -- prose alone silently drops a column.
+    # Indented, so these anchor on the dispatch_settled CALL POINT rather than on
+    # the usage block above it -- both live inside this section, and only the call
+    # point is what a Coordinator copies its invocation from.
+    "\n      --risk <이 run의 risk>",
+    "\n      --round-kind phase_gate|correction|downstream_revalidation|final_review",
+)
+# TEST-phase revalidation 2: the same failure mode, one log over. TIMING_LOG.md's
+# `risk` column shipped populated at two of six call sites in the Python path and at
+# NONE of them in the CLI path documented here, so a Coordinator driving Orca by hand
+# wrote a wholly blank column while OrcaRuntimeHarness wrote a partly filled one --
+# two different logs for the same run. The behavioural half is pinned by T-36 (every
+# TIMING row carries the run's risk); these four keep the CALL POINTS, which are what
+# a live Coordinator copies its invocation from, saying the same thing. Separate from
+# the tuple above because the failure message must name the right example.
+RUN_LOGGING_TIMING_RISK_ANCHORS = (
+    "--event run_start --started-at <지금 시각> --risk <이 run의 risk>",
+    "[--ended-at <시각>] --risk <이 run의 risk> [--detail",
+    "--iteration <n> [--started-at <시각>] [--ended-at <시각>] --risk <이 run의 risk>",
+    "--ended-at <settle 직후 시각> --risk <이 run의 risk>",
 )
 
 
@@ -1355,6 +1546,143 @@ def validate_quality_profile_contract(validation: Validation) -> None:
     )
 
 
+def validate_risk_profile_contract(validation: Validation) -> None:
+    """The section 8 risk block, and the section 4/6/8 prose it is only an index into.
+
+    Imports load_risk_contract from skill_policy rather than re-implementing the
+    parse, extending the dependency direction this module already has. One parser
+    means the runtime evaluator and this validator cannot disagree about the block.
+    """
+    skill_path = LIFECYCLE_SKILL_DIR / "SKILL.md"
+    if not skill_path.is_file():
+        return
+    skill_text = skill_path.read_text(encoding="utf-8")
+
+    parsed = load_risk_contract(skill_path)
+    validation.check(
+        parsed is not None,
+        f"{LIFECYCLE_SKILL_DIR.name}: risk profile contract block is missing or "
+        "malformed",
+    )
+    if parsed is None:
+        return
+    validation.check(
+        set(parsed) == set(RISK_CONTRACT),
+        f"{LIFECYCLE_SKILL_DIR.name}: risk profile contract keys drifted",
+    )
+    validation.check(
+        parsed == RISK_CONTRACT,
+        f"{LIFECYCLE_SKILL_DIR.name}: risk profile contract values drifted",
+    )
+    validation.check(
+        0
+        < anchor_contract_block_lines(skill_text, RISK_CONTRACT_BLOCK_PATTERN)
+        <= RISK_CONTRACT_MAX_LINES,
+        f"{LIFECYCLE_SKILL_DIR.name}: risk profile contract block exceeds "
+        f"{RISK_CONTRACT_MAX_LINES} lines",
+    )
+
+    # Internal consistency: the three facts the runtime actually branches on.
+    validation.check(
+        parsed.get("RISK_DEFAULT", ("",))[0] in parsed.get("RISK_LEVELS", ()),
+        "RISK_DEFAULT must be one of RISK_LEVELS",
+    )
+    validation.check(
+        parsed.get("RISK_SELECTION_SOURCES") == ("explicit", "default"),
+        "RISK_SELECTION_SOURCES must be exactly explicit, default",
+    )
+    validation.check(
+        parsed.get("RISK_LOW_TASK_GRAPH") != parsed.get("RISK_MEDIUM_TASK_GRAPH")
+        and parsed.get("RISK_MEDIUM_TASK_GRAPH")
+        == parsed.get("RISK_HIGH_TASK_GRAPH"),
+        "LOW must differ from MEDIUM/HIGH in task graph shape, and MEDIUM must equal "
+        "HIGH",
+    )
+    validation.check(
+        parsed.get("RISK_DOWNSTREAM_REVALIDATION") == ("high_only",),
+        "downstream revalidation must be HIGH-only",
+    )
+
+    section = extract_section(skill_text, RISK_SECTION_HEADING, RISK_SECTION_END)
+    for anchor in RISK_PROSE_ANCHORS:
+        validation.check(
+            anchor in section,
+            f"{LIFECYCLE_SKILL_DIR.name}: section 8 risk prose is missing "
+            f"{anchor!r}",
+        )
+    for anchor in (RISK_PARAMETER_DOC_ANCHOR, "DEFAULT_RISK = high"):
+        validation.check(
+            anchor in skill_text,
+            f"{LIFECYCLE_SKILL_DIR.name}: section 4 does not document {anchor!r}",
+        )
+    validation.check(
+        RISK_TASK_GRAPH_PROSE_ANCHOR in extract_lifecycle_section(skill_text),
+        f"{LIFECYCLE_SKILL_DIR.name}: section 6 does not make the task graph "
+        "risk-conditional",
+    )
+
+    loop_skill = REPO_ROOT / "orca-worker-reviewer-loop" / "SKILL.md"
+    validation.check(
+        not loop_skill.is_file() or load_risk_contract(loop_skill) is None,
+        "orca-worker-reviewer-loop: must not contain the risk profile contract",
+    )
+    loop_text = loop_skill.read_text(encoding="utf-8") if loop_skill.is_file() else ""
+    validation.check(
+        "INVALID_RISK" not in loop_text,
+        "orca-worker-reviewer-loop: must not carry the orchestration-only "
+        "INVALID_RISK error code",
+    )
+
+
+def validate_phase_gate_neutrality(validation: Validation) -> None:
+    """Phase transitions and the Final Review trigger must be risk-neutral.
+
+    A separate function from validate_risk_profile_contract() so a failure names the
+    actual concern: a transition expressed in terms of a Reviewer that LOW does not
+    create. Its load-bearing half is the NEGATIVE anchors -- a neutral phrase can sit
+    happily beside a stale one in the same section, which is exactly how this
+    regressed past three review rounds.
+    """
+    skill_path = LIFECYCLE_SKILL_DIR / "SKILL.md"
+    if not skill_path.is_file():
+        return
+    skill_text = skill_path.read_text(encoding="utf-8")
+
+    for stale in PHASE_GATE_STALE_PREDICATES:
+        validation.check(
+            stale not in skill_text,
+            f"{LIFECYCLE_SKILL_DIR.name}: phase gate predicate is not risk-neutral -- "
+            f"{stale!r} requires a Reviewer PASS, which LOW cannot produce",
+        )
+
+    for heading, end, stale in PHASE_GATE_STALE_SECTION_HEADINGS:
+        section = extract_section(skill_text, heading, end)
+        validation.check(
+            stale not in [line.strip() for line in section.splitlines()],
+            f"{LIFECYCLE_SKILL_DIR.name}: section 12 still uses the Reviewer-scoped "
+            f"transition heading {stale!r}; the phase gate predicate is risk-neutral "
+            "(LOW = the Worker result, MEDIUM/HIGH = the phase Reviewer verdict)",
+        )
+
+    for heading, end, anchor in PHASE_GATE_NEUTRAL_ANCHORS:
+        section = extract_section(skill_text, heading, end)
+        validation.check(
+            anchor in section,
+            f"{LIFECYCLE_SKILL_DIR.name}: {heading} is missing the risk-neutral "
+            f"phase gate anchor {anchor!r}",
+        )
+
+    try:
+        description = parse_frontmatter(skill_path).get("description", "")
+    except (OSError, ValueError):
+        description = ""
+    validation.check(
+        PHASE_GATE_FRONTMATTER_ANCHOR in description,
+        f"{LIFECYCLE_SKILL_DIR.name}: the frontmatter description does not state "
+        f"that the phase gate is risk-determined ({PHASE_GATE_FRONTMATTER_ANCHOR!r})",
+    )
+
+
 def validate_run_logging_contract(validation: Validation) -> None:
     """The dispatch_settled CLI example in the OS-17 run-logging subsection.
 
@@ -1382,6 +1710,13 @@ def validate_run_logging_contract(validation: Validation) -> None:
             anchor in section,
             f"{LIFECYCLE_SKILL_DIR.name}: dispatch_settled orchestrator-event example "
             f"is missing {anchor!r}",
+        )
+    for anchor in RUN_LOGGING_TIMING_RISK_ANCHORS:
+        validation.check(
+            anchor in section,
+            f"{LIFECYCLE_SKILL_DIR.name}: a timing-event call point is missing "
+            f"{anchor!r}; every TIMING_LOG.md row names the risk it was produced "
+            "under, and the CLI path must write the same column the Python path does",
         )
 
 
@@ -1467,6 +1802,8 @@ def main() -> int:
     validate_task_boundary_contract(validation)
     validate_reviewer_context_contract(validation)
     validate_quality_profile_contract(validation)
+    validate_risk_profile_contract(validation)
+    validate_phase_gate_neutrality(validation)
     validate_run_logging_contract(validation)
     validate_run_logging_tool_parity(validation)
     validate_version(validation)

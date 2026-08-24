@@ -8,6 +8,7 @@ import inspect
 import json
 import subprocess
 import sys
+import shutil
 import tempfile
 import unittest
 from collections import defaultdict
@@ -47,6 +48,8 @@ from scripts.orca_runtime_harness import (
     WorkflowEvidence,
     cleanup_authority,
     close_allowed,
+    _scenario_c,
+    _scenario_g,
     dispatch_context,
     run_quality_profile_runtime_scenario,
     run_session_reuse_runtime_scenario,
@@ -67,6 +70,7 @@ from scripts.task_context import (
     parse_quality_gate,
     parse_reviewer_context,
     parse_reviewer_context_keys,
+    parse_risk_profile,
     parse_task_boundary,
     phase_artifact_contract,
     render_boundary_receipt,
@@ -251,6 +255,84 @@ class SequentialTerminalExec(RecordingExec):
             self.commands.append(args)
             return 0, json.dumps({"ok": True, "result": {"terminal": {"handle": handle}}})
         return super().__call__(args)
+
+
+class SequentialDispatchExec(SequentialTerminalExec):
+    """SequentialTerminalExec that also hands back a fresh task and dispatch id.
+
+    The base recorders pin ONE task-create id and ONE worker-start dispatch id, which
+    a test that drives several dispatches by hand works around by re-`arm`ing between
+    calls. A scenario function dispatches internally, so there is no "between" -- and
+    a pinned dispatch id would be rejected by the finalize-once gate on the second
+    attempt. Same minimum-needed extension SequentialTerminalExec itself already is
+    for `terminal create`.
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.dispatched: list[str] = []
+        self.last_task_id = "task_seq_0"
+
+    def __call__(self, args: tuple[str, ...]) -> tuple[int, str]:
+        args = tuple(args)
+        verb = args[1] if len(args) > 1 else args[0]
+        if verb == "task-create":
+            task_id = f"task_seq_{len(self.dispatched) + 1}"
+            self.last_task_id = task_id
+            self.results["task-create"] = {"task": {"id": task_id}}
+            self.results["task-list"] = {
+                "tasks": [{"id": task_id, "status": "completed"}]
+            }
+        elif verb == "worker-start":
+            task_id = self.last_task_id
+            dispatch_id = f"ctx_seq_{len(self.dispatched) + 1}"
+            self.dispatched.append(dispatch_id)
+            self.results["worker-start"] = {
+                "dispatchId": dispatch_id,
+                "effects": [
+                    {
+                        "kind": "terminal",
+                        "action": "reused",
+                        "id": "term_agent",
+                        "role": "agent",
+                    }
+                ],
+            }
+            self.results["worker-show"] = {
+                "dispatch": {"status": "completed", "completed_at": COMPLETED_AT},
+                "worker": {"state": "settled"},
+                "terminalResource": dict(self.LIVE_TERMINAL_RESOURCE),
+            }
+            self.results["dispatch-show"] = {
+                "dispatch": {"status": "completed", "completed_at": COMPLETED_AT}
+            }
+            self.results["worker-release"] = {
+                "state": "released",
+                "processAction": "none",
+            }
+            # The settlement the harness waits for, keyed to THIS dispatch: the same
+            # payload shape arm() builds, generated per dispatch instead of pinned.
+            self.results["check"] = {
+                "deliveryId": f"dlv_{dispatch_id}",
+                "timedOut": False,
+                "messages": [
+                    {
+                        "id": f"msg_{dispatch_id}",
+                        "type": "worker_done",
+                        "payload": json.dumps(
+                            {
+                                "taskId": task_id,
+                                "dispatchId": dispatch_id,
+                                "outcome": "succeeded",
+                            }
+                        ),
+                        "body": "ok",
+                    }
+                ],
+            }
+        return super().__call__(args)
+
+    LIVE_TERMINAL_RESOURCE = {"releaseState": "live", "processState": "running"}
 
 
 class EchoingTerminalExec(SequentialTerminalExec):
@@ -536,6 +618,9 @@ class DuplicateSettlementTests(unittest.TestCase):
         ),
         "delivery_id": "dlv_1",
         "dispatch_id": "ctx_1",
+        # OS-3: create_phase_graph()'s required argument. The probe only needs a
+        # bindable value; the offline runtime never dispatches it.
+        "worker_spec": "probe worker spec",
         "done": DONE,
         "handle": "term_worker",
         "iteration": 1,
@@ -5256,10 +5341,18 @@ class RunLoggingIntegrationTests(OfflineHarnessTestCase):
     arm = SameRoleSessionReuseTests.arm
 
     def started_harness(
-        self, recorder: Any, *, run_id: str = "run_logging"
+        self, recorder: Any, *, run_id: str = "run_logging", risk: str = ""
     ) -> OrcaRuntimeHarness:
+        # `risk` is opt-in and defaults to the empty string, so every pre-OS-3
+        # caller constructs exactly the harness it constructed before -- the
+        # constructor is not even handed the keyword unless a test asks for a
+        # level. T-34 is the only caller that does.
         with patch.dict(environ, {"ORCA_CLI_COMMAND": "/opt/orca-dev"}):
-            harness = OrcaRuntimeHarness(self.artifact_dir)
+            harness = (
+                OrcaRuntimeHarness(self.artifact_dir, risk=risk, risk_source="explicit")
+                if risk
+                else OrcaRuntimeHarness(self.artifact_dir)
+            )
         harness._exec_orca = recorder
         recorder.results["run-create"] = {"run": {"id": run_id}}
         harness.start_run(
@@ -5334,6 +5427,239 @@ class RunLoggingIntegrationTests(OfflineHarnessTestCase):
         self.assertEqual(by_dispatch["ctx_r1"]["role"], "reviewer")
         self.assertEqual(by_dispatch["ctx_r1"]["task_id"], "task_r1")
         self.assertEqual(by_dispatch["ctx_r1"]["phase"], "implementation")
+
+    # ---- C2. OS-3 round_kind: which KIND of round produced each row -----------
+    # Every assertion below reads a row the HARNESS wrote after a real dispatch.
+    # A writer-level test (test_run_logging.py) proves the column ACCEPTS a value;
+    # only these prove a dispatch path PRODUCES it -- the distinction the TEST-phase
+    # review F-001 was about.
+
+    def test_a_phase_gate_dispatch_is_labelled_phase_gate(self) -> None:
+        recorder = EchoingTerminalExec()
+        harness = self.started_harness(recorder)
+
+        self.arm(recorder, "ctx_w1", "task_w1")
+        harness.run_attempt("worker", 1, "complete", phase="implementation")
+        self.arm(recorder, "ctx_r1", "task_r1")
+        harness.run_attempt("reviewer", 1, "pass", phase="implementation")
+
+        by_dispatch = {
+            row["dispatch_id"]: row
+            for row in self.read_orchestrator_rows(harness.run_id)
+        }
+        self.assertEqual(by_dispatch["ctx_w1"]["round_kind"], "phase_gate")
+        self.assertEqual(by_dispatch["ctx_r1"]["round_kind"], "phase_gate")
+
+    def test_a_correction_round_is_labelled_correction(self) -> None:
+        recorder = EchoingTerminalExec()
+        harness = self.started_harness(recorder)
+
+        self.arm(recorder, "ctx_r1", "task_r1")
+        harness.run_attempt(
+            "reviewer", 1, "fail", phase="implementation", findings=("R1",)
+        )
+        self.arm(recorder, "ctx_w2", "task_w2")
+        harness.run_attempt(
+            "worker",
+            2,
+            "correction",
+            phase="implementation",
+            resolutions={"R1": "RESOLVED"},
+            round_kind="correction",
+        )
+
+        by_dispatch = {
+            row["dispatch_id"]: row
+            for row in self.read_orchestrator_rows(harness.run_id)
+        }
+        # The FAIL that caused it is still a phase gate; only the round it triggered
+        # is a correction. Both rows in one assertion, so the two cannot be conflated.
+        self.assertEqual(by_dispatch["ctx_r1"]["round_kind"], "phase_gate")
+        self.assertEqual(by_dispatch["ctx_w2"]["round_kind"], "correction")
+
+    def test_a_downstream_revalidation_round_is_labelled_as_one(self) -> None:
+        """SKILL.md section 17 T5a. The runtime harness ships no T5a *scenario* --
+        that state machine is modelled in e2e_harness, which writes no logs -- so
+        this drives the revalidation dispatch directly through the same public API a
+        T5a round would use, and reads the row the harness wrote for it."""
+        recorder = EchoingTerminalExec()
+        harness = self.started_harness(recorder)
+
+        self.arm(recorder, "ctx_w1", "task_w1")
+        harness.run_attempt(
+            "worker",
+            2,
+            "complete",
+            phase="test",
+            round_kind="downstream_revalidation",
+        )
+        self.arm(recorder, "ctx_r1", "task_r1")
+        harness.run_attempt(
+            "reviewer",
+            2,
+            "pass",
+            phase="test",
+            round_kind="downstream_revalidation",
+        )
+
+        by_dispatch = {
+            row["dispatch_id"]: row
+            for row in self.read_orchestrator_rows(harness.run_id)
+        }
+        for dispatch_id in ("ctx_w1", "ctx_r1"):
+            self.assertEqual(
+                by_dispatch[dispatch_id]["round_kind"], "downstream_revalidation"
+            )
+
+    def test_a_final_adversarial_review_attempt_is_labelled_final_review(self) -> None:
+        """The row F-001 was actually about: before the fix a Final Review attempt
+        was written as an ordinary phase gate."""
+        recorder = EchoingTerminalExec()
+        harness = self.started_harness(recorder)
+
+        self.arm(recorder, "ctx_f1", "task_f1")
+        harness.run_attempt(
+            "reviewer", 1, "pass", phase="final_review", round_kind="final_review"
+        )
+
+        row = {
+            r["dispatch_id"]: r for r in self.read_orchestrator_rows(harness.run_id)
+        }["ctx_f1"]
+        self.assertEqual(row["phase"], "final_review")
+        self.assertEqual(row["round_kind"], "final_review")
+        self.assertNotEqual(row["round_kind"], "phase_gate")
+
+    def test_run_existing_task_carries_the_round_kind_too(self) -> None:
+        """run_attempt forwards to run_existing_task; the graph-first path takes the
+        value directly, so it is asserted on its own rather than through the wrapper."""
+        recorder = EchoingTerminalExec()
+        harness = self.started_harness(recorder)
+
+        self.arm(recorder, "ctx_x1", "task_x1")
+        harness.run_existing_task(
+            "worker",
+            2,
+            "correction",
+            "task_x1",
+            phase="implementation",
+            round_kind="correction",
+        )
+
+        row = {
+            r["dispatch_id"]: r for r in self.read_orchestrator_rows(harness.run_id)
+        }["ctx_x1"]
+        self.assertEqual(row["round_kind"], "correction")
+
+    def test_an_unexpected_exit_records_the_round_it_happened_in(self) -> None:
+        """An unexpected exit describes a dispatch too, so "which kind of round was
+        this?" is exactly as meaningful there."""
+        recorder = EchoingTerminalExec()
+        # A worker that vanished without an outcome -- the state observe_unexpected_exit
+        # exists for, spelled the way the recovery tests above already spell it.
+        recorder.results.update(
+            {
+                "worker-show": {
+                    "dispatch": {"status": "dispatched"},
+                    "worker": {"state": "outcome_unknown"},
+                    "terminalResource": {"releaseState": "released"},
+                },
+                "worker-abandon": {"state": "abandoned"},
+                "worker-release": {"state": "released", "processAction": "none"},
+            }
+        )
+        harness = self.started_harness(recorder)
+
+        harness.observe_unexpected_exit(
+            "worker", 2, phase="implementation", round_kind="correction"
+        )
+
+        exits = [
+            row
+            for row in self.read_orchestrator_rows(harness.run_id)
+            if row["event"] == "unexpected_exit"
+        ]
+        self.assertEqual(len(exits), 1)
+        self.assertEqual(exits[0]["round_kind"], "correction")
+
+    def test_an_unknown_round_kind_fails_closed(self) -> None:
+        """One vocabulary, owned by run_logging, validated in the single funnel every
+        settled dispatch passes through -- so a typo is a loud error, not a silently
+        mislabelled row."""
+        recorder = EchoingTerminalExec()
+        harness = self.started_harness(recorder)
+
+        self.arm(recorder, "ctx_w1", "task_w1")
+        with self.assertRaisesRegex(OrcaRuntimeError, "unknown round_kind"):
+            harness.run_attempt(
+                "worker", 1, "complete", phase="implementation", round_kind="phase-gate"
+            )
+
+    def test_every_documented_round_kind_is_reachable_from_a_dispatch(self) -> None:
+        """The regression guard for F-001 itself: the defect was that three of the
+        four documented values could never appear, because no caller passed one."""
+        recorder = EchoingTerminalExec()
+        harness = self.started_harness(recorder)
+
+        for index, round_kind in enumerate(run_logging.ROUND_KIND_VALUES, start=1):
+            self.arm(recorder, f"ctx_{index}", f"task_{index}")
+            harness.run_attempt(
+                "reviewer",
+                index,
+                "pass",
+                phase="implementation",
+                round_kind=round_kind,
+            )
+
+        produced = {
+            row["round_kind"]
+            for row in self.read_orchestrator_rows(harness.run_id)
+            if row["event"] == "dispatch_settled"
+        }
+        self.assertEqual(produced, set(run_logging.ROUND_KIND_VALUES))
+
+    def test_scenario_c_labels_only_its_correction_rounds(self) -> None:
+        """The regression guard for the missed call site: run the REAL scenario.
+
+        Every other round_kind test drives the public dispatch API with a value the
+        test itself supplies, which is precisely the shape that could not catch a
+        production call site forgetting to pass one. This one runs _scenario_c()
+        exactly as run_runtime_scenarios() does and reads the rows the harness wrote:
+        iteration 1 is the phase gate, iterations 2 and 3 are corrections, and BOTH
+        the Worker and the Reviewer of each round carry that round's label.
+        """
+        recorder = SequentialDispatchExec()
+        recorder.results["run-create"] = {"run": {"id": "run_scenario_c"}}
+        with patch.dict(environ, {"ORCA_CLI_COMMAND": "/opt/orca-dev"}):
+            harness = OrcaRuntimeHarness(self.artifact_dir)
+        harness._exec_orca = recorder
+
+        result = _scenario_c(harness)
+
+        self.assertEqual(result.scenario, "C")
+        self.assertEqual(len(result.attempts), 6)
+
+        rows = [
+            row
+            for row in self.read_orchestrator_rows("run_scenario_c")
+            if row["event"] == "dispatch_settled"
+        ]
+        self.assertEqual(len(rows), 6)
+        labelled = {
+            (row["iteration"], row["role"]): row["round_kind"] for row in rows
+        }
+        self.assertEqual(labelled["1", "worker"], "phase_gate")
+        self.assertEqual(labelled["1", "reviewer"], "phase_gate")
+        for iteration in ("2", "3"):
+            for role in ("worker", "reviewer"):
+                with self.subTest(iteration=iteration, role=role):
+                    self.assertEqual(labelled[iteration, role], "correction")
+        # And the whole point in one line: a reader of this log can tell the three
+        # rounds apart instead of seeing three identical phase gates.
+        self.assertEqual(
+            [row["round_kind"] for row in rows],
+            ["phase_gate", "phase_gate", "correction", "correction",
+             "correction", "correction"],
+        )
 
     # ---- D. Session reuse -----------------------------------------------------
 
@@ -5516,6 +5842,139 @@ class RunLoggingIntegrationTests(OfflineHarnessTestCase):
             if row["event"] == "iteration_end" and row["iteration"] == "1"
         )
         self.assertEqual(iteration_1_end["detail"], "FAIL")
+
+    def test_every_timing_row_carries_the_risk_that_produced_it(self) -> None:
+        """T-36: the CALL SITES populate TIMING_LOG's risk column, not just the writer.
+
+        Raised as a non-blocking observation by the IMPLEMENTATION revalidation
+        Worker and confirmed here: `risk=self.risk` was passed at the run_start
+        (`:1518`) and dispatch-settled (`:2077`) timing call sites but at none of
+        the four phase/iteration boundary sites, so `phase_end` and
+        `iteration_end` -- the two rows that carry a phase's and an iteration's
+        DURATION -- were exactly the rows missing the value the column exists to
+        pair a duration with (`run_logging.TIMING_LOG_COLUMNS`: "a duration is only
+        interpretable against the strength that produced it").
+
+        The pre-existing T-19 test could not catch this: it calls
+        log_timing_event(risk="medium") directly, which proves the WRITER honours
+        the parameter and says nothing about whether any caller passes it. This
+        test drives the real path instead and asserts the rule with no exceptions
+        to remember -- every row, every event kind.
+        """
+        recorder = SequentialTerminalExec()
+        harness = self.started_harness(recorder, risk="low")
+
+        self.arm(recorder, "ctx_w1", "task_w1")
+        worker1, _ = harness.run_attempt("worker", 1, "complete", phase="implementation")
+        self.arm(recorder, "ctx_w2", "task_w2")
+        worker2, _ = harness.run_attempt(
+            "worker", 2, "correction", phase="implementation", findings=("R1",)
+        )
+        # A second phase, so phase_start/phase_end are crossed more than once and
+        # the assertion covers a real transition rather than a single open scope.
+        self.arm(recorder, "ctx_w3", "task_w3")
+        worker3, _ = harness.run_attempt("worker", 1, "complete", phase="test")
+        run_id = harness.run_id
+        harness.finish(
+            RuntimeScenarioResult(
+                "probe", run_id, "COMPLETED", 2, [worker1, worker2, worker3]
+            )
+        )
+
+        _, timing_log = self.log_paths(run_id)
+        rows = self.read_rows(timing_log)
+        # Not vacuous: all six timing event kinds this path can emit are present,
+        # so "every row" is a claim about the whole vocabulary and not about a
+        # lucky subset.
+        self.assertEqual(
+            sorted({row["event"] for row in rows}),
+            [
+                "dispatch_settled",
+                "iteration_end",
+                "iteration_start",
+                "phase_end",
+                "phase_start",
+                "run_end",
+                "run_start",
+            ],
+        )
+        self.assertEqual(
+            [row["event"] for row in rows if row["risk"] != "low"],
+            [],
+            "every TIMING_LOG row must name the risk its duration was produced under",
+        )
+
+    def test_low_risk_iterations_still_get_their_closing_boundary(self) -> None:
+        """T-34 (D-1.7 S-3): section 9's iteration_end call point at LOW.
+
+        Before S-3, section 9 gave `iteration_end` exactly ONE firing point --
+        "this iteration's (phase) Reviewer verdict came out" -- which a LOW run
+        never reaches, because LOW creates no phase Reviewer at all. A Coordinator
+        following that prose literally would open every iteration and close none,
+        so every LOW iteration boundary would be missing from TIMING_LOG.md: the
+        precise OS-17 surface OS-3 was required to extend.
+
+        The CODE was already right -- the harness derives both boundaries from the
+        (phase, iteration) transitions it observes on dispatches it settles, with
+        no reviewer anywhere in that path -- so this passes unchanged. That is the
+        point of pinning it: the assertion holds the behaviour in BOTH directions,
+        so the specification can never again describe something the code does not
+        do, and a future "simplification" that made iteration_end reviewer-driven
+        would now be a red test rather than a prose defect nobody checks.
+        """
+        recorder = SequentialTerminalExec()
+        harness = self.started_harness(recorder, risk="low")
+
+        self.arm(recorder, "ctx_w1", "task_w1")
+        worker1, _ = harness.run_attempt("worker", 1, "complete", phase="implementation")
+        self.arm(recorder, "ctx_w2", "task_w2")
+        worker2, _ = harness.run_attempt(
+            "worker", 2, "correction", phase="implementation", findings=("R1",)
+        )
+        run_id = harness.run_id
+        harness.finish(
+            RuntimeScenarioResult("probe", run_id, "COMPLETED", 2, [worker1, worker2])
+        )
+
+        # The premise: no phase Reviewer was dispatched at all, so nothing in this
+        # run could ever have produced the verdict the stale prose waited for.
+        self.assertEqual(
+            [
+                row
+                for row in self.read_orchestrator_rows(run_id)
+                if row["role"] == "reviewer"
+            ],
+            [],
+        )
+
+        _, timing_log = self.log_paths(run_id)
+        rows = self.read_rows(timing_log)
+        starts = [
+            (row["phase"], row["iteration"])
+            for row in rows
+            if row["event"] == "iteration_start"
+        ]
+        ends = [
+            (row["phase"], row["iteration"])
+            for row in rows
+            if row["event"] == "iteration_end"
+        ]
+        self.assertEqual(starts, [("implementation", "1"), ("implementation", "2")])
+        # Balanced, and in the same order: every iteration that was opened is
+        # also closed. An empty `ends` would satisfy neither.
+        self.assertEqual(ends, starts)
+        for row in rows:
+            if row["event"] == "iteration_end":
+                self.assertNotEqual(row["started_at"], "")
+                self.assertNotEqual(row["ended_at"], "")
+        # Deliberately NOT asserted here: that the boundary row carries `risk`.
+        # It does not today -- `risk=self.risk` is passed at the run_start and
+        # dispatch-settled call sites but not at the four phase/iteration boundary
+        # ones -- and whether that is a gap is a question about the OS-3 log
+        # schema, not about S-3's call point. T-34 is scoped to the boundary being
+        # REACHABLE at LOW; widening it into a schema assertion would change what
+        # this test fails for. Recorded as an observation in IMPLEMENTATION.md
+        # instead of silently expanded here.
 
     def test_phase_and_iteration_boundaries_bracket_final_review_attempts(
         self,
@@ -5981,6 +6440,183 @@ class RunLoggingIntegrationTests(OfflineHarnessTestCase):
         self.assertEqual(failure_rows[0]["phase"], "final_review")
         self.assertEqual(failure_rows[0]["result"], "error")
         self.assertNotIn("task-create", recorder.verbs)
+
+
+class RiskGraphContractTests(unittest.TestCase):
+    """OS-3 (T-21, T-21a, T-28a): section 6 topology, offline and deterministic.
+
+    create_phase_graph() is the one place the risk conditional lives, and these
+    exercise it through a harness whose `risk` came from the CONSTRUCTOR -- the
+    T-28a direction -- with only the process boundary replaced.
+    """
+
+    def setUp(self) -> None:
+        self.directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.directory, True)
+        self.artifact_dir = Path(self.directory)
+
+    def harness(self, risk: str) -> OrcaRuntimeHarness:
+        recorder = RecordingExec()
+        with patch.dict(environ, {"ORCA_CLI_COMMAND": "/opt/orca-dev"}):
+            harness = OrcaRuntimeHarness(
+                self.artifact_dir, risk=risk, risk_source="explicit"
+            )
+        harness._exec_orca = recorder
+        harness.run_owner, harness.run_id = "term_owner", "run_offline"
+        harness.requested_phases = ("implementation",)
+        return harness
+
+    @staticmethod
+    def task_creates(harness: OrcaRuntimeHarness) -> list[list[str]]:
+        return [
+            entry["command"]
+            for entry in harness._raw
+            if "task-create" in entry["command"]
+        ]
+
+    def test_low_creates_no_dependent_reviewer_node(self) -> None:
+        """T-21 / T-28a: the LOW graph is a single Worker node -- nothing is created
+        that would be promoted to ready by the Worker's completion and then never
+        dispatched."""
+        harness = self.harness("low")
+        worker_task, reviewer_task = harness.create_phase_graph(
+            "worker spec", "reviewer spec"
+        )
+        self.assertEqual(worker_task, "task_g")
+        self.assertIsNone(reviewer_task)
+        creates = self.task_creates(harness)
+        self.assertEqual(len(creates), 1)
+        self.assertNotIn("--deps", creates[0])
+
+    def test_medium_and_high_create_the_dependent_reviewer_node(self) -> None:
+        """T-21: MEDIUM/HIGH keep today's Worker + dependent Reviewer pair, and the
+        dependency edge is declared before the Worker is ever dispatched."""
+        for risk in ("medium", "high"):
+            with self.subTest(risk=risk):
+                harness = self.harness(risk)
+                _worker, reviewer_task = harness.create_phase_graph(
+                    "worker spec", "reviewer spec"
+                )
+                self.assertIsNotNone(reviewer_task)
+                creates = self.task_creates(harness)
+                self.assertEqual(len(creates), 2)
+                self.assertNotIn("--deps", creates[0])
+                self.assertIn("--deps", creates[1])
+
+    def test_a_missing_reviewer_spec_yields_a_single_node_at_any_risk(self) -> None:
+        """T-21a: section 17's Final Review Task is a single node with no
+        dependencies at EVERY risk level, and it never routes through this helper --
+        a caller with no reviewer spec is never forced to invent one."""
+        harness = self.harness("high")
+        _worker, reviewer = harness.create_phase_graph("worker spec")
+        self.assertIsNone(reviewer)
+        self.assertEqual(len(self.task_creates(harness)), 1)
+
+    def test_a_skipped_gate_is_logged_positively(self) -> None:
+        """T-19/T-21a: the absence of a reviewer row is never the only evidence."""
+        harness = self.harness("low")
+        harness.log_reviewer_gate_skipped("implementation")
+        log = (
+            self.artifact_dir
+            / "artifacts"
+            / "runs"
+            / "run_offline"
+            / "ORCHESTRATOR_LOG.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("reviewer_gate_skipped", log)
+        self.assertIn("| low |", log)
+
+    def test_an_invalid_risk_prevents_the_run_from_being_created(self) -> None:
+        """Fail-closed at the run boundary, the same shape as an invalid profile."""
+        with patch.dict(environ, {"ORCA_CLI_COMMAND": "/opt/orca-dev"}):
+            harness = OrcaRuntimeHarness(self.artifact_dir, risk="extreme")
+        harness._exec_orca = RecordingExec()
+        with self.assertRaisesRegex(OrcaRuntimeError, "INVALID_RISK"):
+            harness.start_run("bad risk", requested_phases=("implementation",))
+
+    def test_run_end_carries_the_resolved_pair(self) -> None:
+        """The harness's own log_run_status() wiring, not just the writer's.
+
+        RiskLoggingTests exercises log_run_status() directly with explicit values;
+        this asserts the harness actually forwards its own resolved pair, which is a
+        one-line wiring that could regress without any other test noticing.
+        """
+        harness = self.harness("low")
+        harness._run_started_at = "2026-01-01T00:00:00+00:00"
+        harness.log_run_status("COMPLETED", reason="done")
+        log = (
+            self.artifact_dir
+            / "artifacts"
+            / "runs"
+            / "run_offline"
+            / "ORCHESTRATOR_LOG.md"
+        ).read_text(encoding="utf-8")
+        run_end = [line for line in log.splitlines() if "run_end" in line][0]
+        self.assertIn("| low |", run_end)
+        self.assertIn("| explicit |", run_end)
+        timing = (
+            self.artifact_dir
+            / "artifacts"
+            / "runs"
+            / "run_offline"
+            / "TIMING_LOG.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("| low |", [l for l in timing.splitlines() if "run_end" in l][0])
+
+    def test_scenario_g_refuses_to_run_without_a_dependent_reviewer(self) -> None:
+        """The defensive guard the implementation added when migrating site 1.
+
+        Scenario G exists to prove edge-triggered dependency promotion, which needs a
+        dependent node; at LOW there is none. run_runtime_scenarios() only ever
+        builds a default-risk harness, so the guard is unreachable in practice --
+        which is exactly why it is worth pinning: a future change that runs the
+        suite at LOW should get this message, not a TypeError from task_status(None).
+        """
+        source = inspect.getsource(_scenario_g)
+        self.assertIn("create_phase_graph", source)
+        self.assertIn("if reviewer_task is None:", source)
+        self.assertIn("run it at medium/high risk", source)
+        # And the branch it guards is real: the helper does return None at LOW.
+        harness = self.harness("low")
+        self.assertIsNone(harness.create_phase_graph("worker", "reviewer")[1])
+
+    def test_the_dispatched_spec_carries_the_risk_block(self) -> None:
+        """T-24/T-25 on the real-runtime path: dispatch_context threads the pair."""
+        spec, _boundary, _reviewer = dispatch_context(
+            "worker",
+            1,
+            "complete",
+            phase="implementation",
+            run_id="run_r",
+            risk="low",
+            risk_source="explicit",
+        )
+        parsed = parse_risk_profile(spec)
+        self.assertEqual(parsed["risk_level"], "low")
+        self.assertEqual(parsed["risk_source"], "explicit")
+        self.assertEqual(parsed["phase_gate"], "worker_only")
+        self.assertEqual(parsed["safety_floor_evidence"], "unit_test_status_required")
+
+    def test_the_risk_block_and_the_quality_gate_are_separate_payloads(self) -> None:
+        """T-16 on this path too: two blocks, disjoint keys, one spec."""
+        specs = {
+            risk: dispatch_context(
+                "worker",
+                1,
+                "complete",
+                phase="implementation",
+                run_id="run_r",
+                risk=risk,
+                risk_source="default",
+            )[0]
+            for risk in ("low", "medium", "high")
+        }
+        gates = {risk: parse_quality_gate(spec) for risk, spec in specs.items()}
+        self.assertEqual(gates["low"], gates["medium"])
+        self.assertEqual(gates["medium"], gates["high"])
+        self.assertNotEqual(
+            parse_risk_profile(specs["low"]), parse_risk_profile(specs["high"])
+        )
 
 
 if __name__ == "__main__":

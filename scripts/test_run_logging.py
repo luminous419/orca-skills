@@ -12,6 +12,7 @@ from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
 
+from scripts import run_logging
 from scripts.run_logging import (
     ORCHESTRATOR_LOG_COLUMNS,
     ORCHESTRATOR_LOG_FILENAME,
@@ -507,6 +508,123 @@ class InstalledSkillPortabilityTests(unittest.TestCase):
             self.assertFalse(
                 (REPO_ROOT / "artifacts" / "runs" / "run_installed").exists()
             )
+
+
+class RiskLoggingTests(unittest.TestCase):
+    """OS-3 (T-19): the four new ORCHESTRATOR_LOG columns and the TIMING_LOG one."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.base = Path(self.temporary.name)
+        self.addCleanup(self.temporary.cleanup)
+
+    def rows(self, path: Path) -> list[list[str]]:
+        lines = path.read_text(encoding="utf-8").splitlines()
+        return [[cell.strip() for cell in line.strip("|").split("|")] for line in lines]
+
+    def test_the_documented_columns_are_present_in_order(self) -> None:
+        self.assertEqual(
+            run_logging.ORCHESTRATOR_LOG_COLUMNS[12:16],
+            ("risk", "risk_source", "requested_phases", "round_kind"),
+        )
+        self.assertIn("risk", run_logging.TIMING_LOG_COLUMNS)
+
+    def test_run_start_carries_risk_source_and_requested_phases(self) -> None:
+        path = run_logging.log_orchestrator_event(
+            "run_r",
+            base=self.base,
+            event="run_start",
+            risk="low",
+            risk_source="explicit",
+            requested_phases="analysis,plan",
+            detail="objective",
+        )
+        header, _divider, row = self.rows(path)
+        record = dict(zip(header, row))
+        self.assertEqual(record["risk"], "low")
+        self.assertEqual(record["risk_source"], "explicit")
+        self.assertEqual(record["requested_phases"], "analysis,plan")
+
+    def test_dispatch_settled_carries_risk_and_round_kind(self) -> None:
+        path = run_logging.log_orchestrator_event(
+            "run_r",
+            base=self.base,
+            event="dispatch_settled",
+            phase="implementation",
+            role="reviewer",
+            risk="high",
+            round_kind="downstream_revalidation",
+            gate_result="PASS",
+        )
+        record = dict(zip(*[self.rows(path)[0], self.rows(path)[-1]]))
+        self.assertEqual(record["risk"], "high")
+        self.assertEqual(record["round_kind"], "downstream_revalidation")
+
+    def test_a_skipped_reviewer_gate_is_a_positive_row(self) -> None:
+        """The absence of a reviewer row must never be the only evidence."""
+        path = run_logging.log_orchestrator_event(
+            "run_r",
+            base=self.base,
+            event="reviewer_gate_skipped",
+            phase="implementation",
+            risk="low",
+            detail="risk=low: no phase Reviewer gate for this phase",
+        )
+        record = dict(zip(*[self.rows(path)[0], self.rows(path)[-1]]))
+        self.assertEqual(record["event"], "reviewer_gate_skipped")
+        self.assertEqual(record["risk"], "low")
+
+    def test_timing_rows_carry_the_risk_a_duration_was_produced_under(self) -> None:
+        path = run_logging.log_timing_event(
+            "run_r",
+            base=self.base,
+            event="dispatch_settled",
+            phase="implementation",
+            role="worker",
+            started_at="2026-01-01T00:00:00+00:00",
+            ended_at="2026-01-01T00:00:05+00:00",
+            risk="medium",
+        )
+        record = dict(zip(*[self.rows(path)[0], self.rows(path)[-1]]))
+        self.assertEqual(record["risk"], "medium")
+        self.assertEqual(record["duration_s"], "5.000")
+
+    def test_run_status_carries_the_pair_on_both_logs(self) -> None:
+        run_logging.log_run_status(
+            "run_r", "COMPLETED", base=self.base, risk="low", risk_source="explicit"
+        )
+        orchestrator = self.rows(
+            run_logging.orchestrator_log_path("run_r", base=self.base)
+        )
+        record = dict(zip(orchestrator[0], orchestrator[-1]))
+        self.assertEqual((record["risk"], record["risk_source"]), ("low", "explicit"))
+        timing = self.rows(run_logging.timing_log_path("run_r", base=self.base))
+        self.assertEqual(dict(zip(timing[0], timing[-1]))["risk"], "low")
+
+    def test_every_new_parameter_defaults_to_blank(self) -> None:
+        """The compatibility guarantee: an existing call site writes blank cells,
+        never a guessed value."""
+        path = run_logging.log_orchestrator_event(
+            "run_r", base=self.base, event="run_start", detail="objective"
+        )
+        record = dict(zip(*[self.rows(path)[0], self.rows(path)[-1]]))
+        for column in ("risk", "risk_source", "requested_phases", "round_kind"):
+            self.assertEqual(record[column], "")
+
+
+class RunLoggingTwinParityTests(unittest.TestCase):
+    """T-20: the installed Skill's copy stays byte-identical after any edit."""
+
+    def test_the_two_copies_are_byte_identical(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        canonical = repo_root / "scripts" / "run_logging.py"
+        installed = (
+            repo_root
+            / "orca-worker-reviewer-orchestration"
+            / "tools"
+            / "run_logging.py"
+        )
+        self.assertEqual(canonical.read_bytes(), installed.read_bytes())
 
 
 if __name__ == "__main__":

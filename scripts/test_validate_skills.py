@@ -245,11 +245,467 @@ class ValidatorRegressionTests(unittest.TestCase):
         self.assertIn(old, text)
         skill_path.write_text(text.replace(old, new, 1), encoding="utf-8")
 
+    def orchestration_section(self, heading: str, end: str) -> str:
+        """The body of one section of the orchestration SKILL.md, as the validator
+        extracts it -- so a test can assert on exactly the text a scoped check sees."""
+        text = (
+            self.repo_root / "orca-worker-reviewer-orchestration" / "SKILL.md"
+        ).read_text(encoding="utf-8")
+        start = text.find(heading)
+        self.assertNotEqual(start, -1, heading)
+        stop = text.find(end, start)
+        return text[start:] if stop == -1 else text[start:stop]
+
     def assert_lifecycle_contract_rejected(self, expected: str) -> None:
         result = self.run_validator()
 
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn(expected, result.stdout)
+
+    # ---- OS-3 Final Review R1: phase-gate neutrality (T-30) ---------------------
+    # Two shapes, deliberately. REPLACEMENT tests swap a corrected sentence back for
+    # the stale one. COEXISTENCE tests ADD a stale section-12 heading while leaving
+    # the neutral one in place -- a replacement there would trip the neutral-anchor
+    # check instead and prove nothing about the section-scoped negative check, which
+    # is the blind spot the iteration-7 review found.
+
+    def test_frontmatter_reverting_to_reviewer_pass_fails(self) -> None:
+        self.mutate_orchestration_skill(
+            "자신의 phase gate를 PASS할 때까지 Worker 수정과 재검토를 반복하는",
+            "Reviewer PASS를 받을 때까지 Worker 수정과 Reviewer 재검토를 반복하는",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "phase gate predicate is not risk-neutral"
+        )
+
+    def test_section_17_trigger_reverting_to_reviewer_pass_fails(self) -> None:
+        self.mutate_orchestration_skill(
+            "모든 requested phase가 자신의 **phase gate**를 PASS한 직후",
+            "모든 requested phase가 Reviewer PASS를 받은 직후",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "phase gate predicate is not risk-neutral"
+        )
+
+    def test_section_17_procedure_reverting_to_reviewer_verdict_fails(self) -> None:
+        self.mutate_orchestration_skill(
+            "1. 마지막 requested phase의 phase gate가 PASS이고",
+            "1. 마지막 requested phase의 Reviewer 판정이 PASS이고",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "phase gate predicate is not risk-neutral"
+        )
+
+    def test_section_17_dependency_justification_reverting_fails(self) -> None:
+        self.mutate_orchestration_skill(
+            "trigger가 마지막 requested phase의 **완료된** phase gate 판정",
+            "trigger가 마지막 Reviewer Task의 **완료된** 판정",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "phase gate predicate is not risk-neutral"
+        )
+
+    def test_section_12_regaining_the_reviewer_pass_heading_fails(self) -> None:
+        # The stale heading ADDED next to the neutral one: every other check still
+        # passes, so only the section-scoped negative anchor can reject this.
+        self.mutate_orchestration_skill(
+            "phase gate PASS:",
+            "Reviewer PASS:\n\nphase gate PASS:",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "section 12 still uses the Reviewer-scoped transition heading"
+        )
+
+    def test_section_12_regaining_the_reviewer_fail_heading_fails(self) -> None:
+        self.mutate_orchestration_skill(
+            "phase gate FAIL:",
+            "Reviewer FAIL:\n\nphase gate FAIL:",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "section 12 still uses the Reviewer-scoped transition heading"
+        )
+
+    def test_section_12_losing_the_neutral_heading_fails(self) -> None:
+        """The positive-anchor half, so the two checks are proven independently."""
+        self.mutate_orchestration_skill("phase gate PASS:", "gate PASS:")
+
+        self.assert_lifecycle_contract_rejected(
+            "is missing the risk-neutral phase gate anchor"
+        )
+
+    def test_the_unmutated_document_passes_phase_gate_neutrality(self) -> None:
+        """The assertion that pins the LINE-EXACT matching.
+
+        Section 12 legitimately contains the substring `Reviewer FAIL`, in the very
+        sentence that states the LOW rule correctly ("LOW에는 in-phase Reviewer
+        FAIL이 없으므로 ..."). A substring-based guard scoped to section 12 would
+        reject the CORRECTED document, so this test is what stops the whole-line
+        match from being "simplified" into a substring check later.
+        """
+        section = self.orchestration_section("## 12. FAIL Loop", "\n## 13.")
+        self.assertIn("in-phase Reviewer FAIL이 없으므로", section)
+        self.assertNotIn("Reviewer FAIL:", [line.strip() for line in section.splitlines()])
+
+        result = self.run_validator()
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    # ---- TEST-phase revalidation (T-31): the DEFINITION, not just the heading ----
+    # The heading anchors above prove section 12 and section 17 use risk-neutral
+    # WORDS. These prove they still say what the phase gate IS -- deleting the
+    # defining sentence left the validator green while the document went back to not
+    # telling a Coordinator that LOW's gate is the Worker result, which is R1's
+    # failure mode in a quieter form.
+
+    def test_section_12_losing_the_phase_gate_definition_fails(self) -> None:
+        self.mutate_orchestration_skill(
+            "LOW에서는 Worker 자신의 결과(§6 8단계, §14)이고, MEDIUM/HIGH에서는 phase",
+            "MEDIUM/HIGH에서는 phase",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "## 12. FAIL Loop is missing the risk-neutral phase gate anchor"
+        )
+
+    def test_section_17_losing_the_phase_gate_definition_fails(self) -> None:
+        self.mutate_orchestration_skill(
+            "phase gate는 risk가 정한다(§8) — LOW에서는 Worker 자신의 결과이고",
+            "phase gate는 risk가 정한다(§8) —",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "## 17. Final Adversarial Review is missing the risk-neutral phase gate anchor"
+        )
+
+    # ---- D-1.7 full-document sweep (T-32 negative, T-33 positive) ---------------
+    # R1 recurred a third time because the guard anchored only the four sentences
+    # the second round happened to quote. D-1.7 swept the whole document; these are
+    # its seven findings and the eight anchors that keep their replacements alive.
+    # T-32 is REPLACEMENT-shaped throughout: unlike section 12's headings, each
+    # S-finding's stale text and its corrected text are mutually exclusive, so the
+    # document-wide negative check is the one under test.
+
+    def test_section_17_t4_reverting_to_an_unconditional_reviewer_fails(self) -> None:
+        """S-1, the cited finding. The `아니면 ` prefix is what makes this a
+        distinct anchor from T4's still-legitimate MEDIUM/HIGH branch line."""
+        self.mutate_orchestration_skill(
+            "    아니면 correction round를 연다. round의 모양은 risk가 정한다(§8 Risk Axis, §12).",
+            "    아니면 correction Worker → p의 Reviewer 재검토 (§12 FAIL Loop 그대로)",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "phase gate predicate is not risk-neutral"
+        )
+
+    def test_section_6_graph_ordering_reverting_the_dependency_bullet_fails(
+        self,
+    ) -> None:
+        """S-2, first bullet. Anchored as a WHOLE LINE, because the sentence it
+        ends with legitimately recurs at section 6 step 2."""
+        self.mutate_orchestration_skill(
+            "- Coordinator는 Worker를 dispatch하기 전에 그 phase/iteration의 Task graph "
+            "전체를 생성한다. 그 graph에 dependent node가 있으면 — MEDIUM/HIGH의 Reviewer "
+            "Task가 그것이고, LOW에는 없다(§6 2단계) — dependent는 Worker Task를 dependency로 "
+            "선언한다.",
+            "- Coordinator는 Worker를 dispatch하기 전에 그 phase/iteration의 Task graph "
+            "전체를 생성한다. Reviewer Task는 Worker Task를 dependency로 선언한다.",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "phase gate predicate is not risk-neutral"
+        )
+
+    def test_section_6_graph_ordering_reverting_the_fail_loop_bullet_fails(
+        self,
+    ) -> None:
+        """S-2, the correction/re-review bullet from the same list."""
+        self.mutate_orchestration_skill(
+            "- FAIL loop의 correction Task도, 그 risk level에 re-review Task가 존재한다면 "
+            "re-review Task도 동일 규칙을 따른다.",
+            "- FAIL loop의 correction/re-review Task도 동일 규칙을 따른다.",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "phase gate predicate is not risk-neutral"
+        )
+
+    def test_section_9_iteration_end_reverting_to_a_reviewer_verdict_fails(
+        self,
+    ) -> None:
+        """S-3. The stale wording gave iteration_end one firing point LOW never
+        reaches, which would drop every LOW iteration boundary from TIMING_LOG.md.
+        The parenthesis in `(phase) Reviewer` is part of the anchor."""
+        self.mutate_orchestration_skill(
+            "3. 이 iteration의 Worker를 dispatch하기 직전 / 이 iteration의 phase gate 판정이 나온",
+            "3. 이 iteration의 Worker를 dispatch하기 직전 / 이 iteration의 (phase) Reviewer 판정이 나온",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "phase gate predicate is not risk-neutral"
+        )
+
+    def test_section_13_reverting_the_iteration_definition_fails(self) -> None:
+        """S-4. The stale sentence contradicted the PHASE_ITERATIONS block six
+        lines below it, so a reader who stopped at the prose got the pre-OS-3 rule."""
+        self.mutate_orchestration_skill(
+            "각 phase별 gate attempt를 iteration으로 센다",
+            "각 phase별 Reviewer attempt를 iteration으로 센다",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "phase gate predicate is not risk-neutral"
+        )
+
+    def test_section_17_checklist_reverting_the_anti_anchoring_premise_fails(
+        self,
+    ) -> None:
+        """S-5. Anchored as the FULL sentence: the corrected text legitimately
+        contains `이전 phase Reviewer의 PASS 판정이고`, so a shorter prefix anchor
+        would reject the corrected document instead of the stale one."""
+        self.mutate_orchestration_skill(
+            "앞선 phase gate가 PASS였다는 사실을 옳다고 가정하지 않는다.",
+            "이전 phase Reviewer의 PASS 판정을 옳다고 가정하지 않는다.",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "phase gate predicate is not risk-neutral"
+        )
+
+    def test_section_12_reverting_the_same_shape_sentence_fails(self) -> None:
+        """S-6. "정확히 같은 모양이다" sat immediately after the LOW exception and
+        could be read as re-imposing the two-node round at every level."""
+        self.mutate_orchestration_skill(
+            "Final Adversarial Review FAIL이 유발한 correction도 그 risk level의 FAIL Loop와 같은 모양이다.",
+            "Final Adversarial Review FAIL이 유발한 correction도 이 FAIL Loop와 정확히 같은 모양이다.",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "phase gate predicate is not risk-neutral"
+        )
+
+    # T-33: the positive half. A negative anchor stops the stale text coming back;
+    # only these stop the replacement being DELETED, which would leave the section
+    # silent about risk -- R1's failure mode in a quieter form. Each mutation
+    # removes the anchor WITHOUT reintroducing stale text, so the positive check is
+    # the only one that can fire.
+
+    def test_section_1_losing_the_diagram_risk_rider_fails(self) -> None:
+        self.mutate_orchestration_skill(
+            "위 그림은 MEDIUM/HIGH의 모양이다. LOW에서는", "LOW에서는"
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "## 1. Purpose is missing the risk-neutral phase gate anchor"
+        )
+
+    def test_section_6_losing_the_low_single_node_qualifier_fails(self) -> None:
+        self.mutate_orchestration_skill(
+            "Task가 그것이고, LOW에는 없다(§6 2단계) — dependent는",
+            "Task가 그것이다 — dependent는",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "## 6. Orca-native Worker Placement is missing the risk-neutral phase gate anchor"
+        )
+
+    def test_section_9_losing_the_phase_gate_call_point_fails(self) -> None:
+        self.mutate_orchestration_skill(
+            "이 iteration의 phase gate 판정이 나온", "이 iteration의 gate 판정이 나온"
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "## 9. Approved Phase Output is missing the risk-neutral phase gate anchor"
+        )
+
+    def test_section_12_losing_the_low_exception_reminder_fails(self) -> None:
+        self.mutate_orchestration_skill(
+            "위 문단의 LOW 예외를 뒤집지 않는다", "위 문단의 예외를 뒤집지 않는다"
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "## 12. FAIL Loop is missing the risk-neutral phase gate anchor"
+        )
+
+    def test_section_13_losing_the_gate_attempt_definition_fails(self) -> None:
+        self.mutate_orchestration_skill(
+            "각 phase별 gate attempt를 iteration으로 센다", "각 phase별 attempt를 iteration으로 센다"
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "## 13. Iteration is missing the risk-neutral phase gate anchor"
+        )
+
+    def test_section_17_losing_the_t4_correction_round_anchor_fails(self) -> None:
+        self.mutate_orchestration_skill(
+            "아니면 correction round를 연다", "아니면 correction round를 시작한다"
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "## 17. Final Adversarial Review is missing the risk-neutral phase gate anchor"
+        )
+
+    def test_section_17_losing_the_t5a_high_only_scoping_fails(self) -> None:
+        self.mutate_orchestration_skill(
+            "T5a HIGH에서만 실행된다", "T5a 실행된다"
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "## 17. Final Adversarial Review is missing the risk-neutral phase gate anchor"
+        )
+
+    def test_section_17_losing_the_english_anti_anchoring_premise_fails(self) -> None:
+        self.mutate_orchestration_skill(
+            "Do NOT assume any previous phase gate PASS is correct",
+            "Do NOT assume any previous gate PASS is correct",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "## 17. Final Adversarial Review is missing the risk-neutral phase gate anchor"
+        )
+
+    def test_a_timing_event_call_point_losing_risk_fails(self) -> None:
+        """TEST-phase revalidation 2: the CLI path must write the same TIMING_LOG
+        column the Python path does. Dropping `--risk` from one call point is how
+        this shipped in the first place -- the flag existed, the example omitted it,
+        and the column silently went blank for every hand-driven run."""
+        self.mutate_orchestration_skill(
+            "--iteration <n> [--started-at <시각>] [--ended-at <시각>] --risk <이 run의 risk>",
+            "--iteration <n> [--started-at <시각>] [--ended-at <시각>]",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "a timing-event call point is missing"
+        )
+
+    # ---- OS-3 risk profile contract (T-18) -------------------------------------
+
+    def mutate_loop_skill(self, old: str, new: str) -> None:
+        skill_path = self.repo_root / "orca-worker-reviewer-loop" / "SKILL.md"
+        text = skill_path.read_text(encoding="utf-8")
+        self.assertIn(old, text)
+        skill_path.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+    def test_risk_contract_block_removed_fails(self) -> None:
+        self.mutate_orchestration_skill(
+            "#### Risk profile contract", "#### Risk profile notes"
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "risk profile contract block is missing or malformed"
+        )
+
+    def test_risk_contract_key_drift_fails(self) -> None:
+        self.mutate_orchestration_skill(
+            "RISK_PARAMETER = risk\n", "RISK_PARAMETER_NAME = risk\n"
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "risk profile contract keys drifted"
+        )
+
+    def test_risk_contract_value_drift_fails(self) -> None:
+        self.mutate_orchestration_skill(
+            "RISK_DEFAULT = high\n", "RISK_DEFAULT = low\n"
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "risk profile contract values drifted"
+        )
+
+    def test_risk_downstream_revalidation_widened_fails(self) -> None:
+        """HIGH-only T5a is the DQ-1 decision; widening it must break a check."""
+        self.mutate_orchestration_skill(
+            "RISK_DOWNSTREAM_REVALIDATION = high_only",
+            "RISK_DOWNSTREAM_REVALIDATION = every_level",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "risk profile contract values drifted"
+        )
+
+    def test_risk_low_task_graph_matching_medium_fails(self) -> None:
+        """LOW must differ from MEDIUM/HIGH in graph shape -- that difference IS the
+        section 6 change."""
+        self.mutate_orchestration_skill(
+            "RISK_LOW_TASK_GRAPH = worker_node_only",
+            "RISK_LOW_TASK_GRAPH = worker_and_dependent_reviewer",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "risk profile contract values drifted"
+        )
+
+    def test_risk_error_code_missing_from_section_8_fails(self) -> None:
+        self.mutate_orchestration_skill(
+            "REASON: INVALID_RISK", "REASON: BAD_RISK"
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "section 8 risk prose is missing 'REASON: INVALID_RISK'"
+        )
+
+    def test_risk_parameter_undocumented_in_section_4_fails(self) -> None:
+        """The anchor is checked against the whole document, so it only trips when
+        BOTH the section 3 usage line and the section 4 fence lose it."""
+        self.mutate_orchestration_skill(
+            "[risk=<low|medium|high>] <request>", "<request>"
+        )
+        self.mutate_orchestration_skill(
+            "risk=<low|medium|high>\n```", "risk=<anything>\n```"
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "section 4 does not document 'risk=<low|medium|high>'"
+        )
+
+    def test_section_6_losing_the_risk_conditional_graph_fails(self) -> None:
+        self.mutate_orchestration_skill(
+            "LOW에서는 Worker Task 하나만 만들고",
+            "LOW에서도 Reviewer Task를 만들고",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "section 6 does not make the task graph risk-conditional"
+        )
+
+    def test_the_loop_skill_gaining_the_risk_contract_fails(self) -> None:
+        """The out-of-scope guarantee, enforced from the other direction."""
+        self.mutate_loop_skill(
+            "## 1. Purpose",
+            "#### Risk profile contract\n\n```text\nRISK_PARAMETER = risk\n```\n\n"
+            "## 1. Purpose",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "orca-worker-reviewer-loop: must not contain the risk profile contract"
+        )
+
+    def test_the_loop_skill_gaining_the_risk_error_code_fails(self) -> None:
+        self.mutate_loop_skill(
+            "## 1. Purpose", "REASON: INVALID_RISK\n\n## 1. Purpose"
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "must not carry the orchestration-only INVALID_RISK error code"
+        )
+
+    def test_dispatch_settled_example_losing_risk_flags_fails(self) -> None:
+        """--round-kind is unique to the dispatch_settled example; --risk also
+        appears on the run_start call point, so this mutates the discriminating one."""
+        self.mutate_orchestration_skill(
+            "      --round-kind phase_gate|correction|downstream_revalidation|final_review\n",
+            "",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "dispatch_settled orchestrator-event example is missing"
+        )
 
     def test_lifecycle_contract_missing_unsupervised_outcome_fails(self) -> None:
         self.mutate_orchestration_skill(
@@ -446,7 +902,7 @@ class ValidatorRegressionTests(unittest.TestCase):
 
     def test_final_review_anti_anchoring_sentence_removed_fails(self) -> None:
         self.mutate_orchestration_skill(
-            "이전 phase Reviewer의 PASS 판정을 옳다고 가정하지 않는다.\n",
+            "앞선 phase gate가 PASS였다는 사실을 옳다고 가정하지 않는다.",
             "",
         )
 
@@ -820,6 +1276,9 @@ class ValidatorRegressionTests(unittest.TestCase):
         self.mutate_orchestration_skill(
             "실제로 적어 보낸 RESULT: PASS|FAIL>] [--review-verdict <role가 reviewer일 때,\n"
             "      응답 본문이 실제로 적어 보낸 REVIEW_VERDICT: PASS|PASS WITH NOTES|FAIL|BLOCKED>]\n"
+            # OS-3 added two flags between the verdict and the result in this example.
+            "      --risk <이 run의 risk>\n"
+            "      --round-kind phase_gate|correction|downstream_revalidation|final_review\n"
             "      --result",
             "실제로 적어 보낸 RESULT: PASS|FAIL>] --result",
         )

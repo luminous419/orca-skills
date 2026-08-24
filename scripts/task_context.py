@@ -141,6 +141,41 @@ VERDICT_SEMANTICS = (
 )
 
 
+# ---- OS-3: the risk axis, carried in the dispatched spec beside the quality gate --
+# A separate block, a separate builder, and a disjoint key set: risk and the project
+# quality profile are two independent axes, and nothing here reads a
+# QualityProfileResolution the way nothing in build_quality_gate_context reads a risk
+# level. templates/ and reviews/ are byte-locked against orca-worker-reviewer-loop, so
+# the dispatched spec is the only place this can reach an agent.
+RISK_LEVELS = ("low", "medium", "high")
+RISK_SELECTION_SOURCES = ("explicit", "default")
+RISK_CONTEXT_KEYS = (
+    "risk_level",
+    "risk_source",
+    "phase_gate",
+    "downstream_revalidation",
+    "final_review",
+    "safety_floor",
+    "safety_floor_evidence",
+    "quality_profile_axis",
+)
+# SKILL.md section 14 names a mandatory test gate for exactly these three phases.
+# TEST is deliberately absent: its obligations live in templates/test.md's Mandatory
+# Invariants (decision-priority tier 3, the phase contract), not in section 14, and
+# templates/ cannot gain a receipt field because it is byte-locked across both skills.
+SAFETY_FLOOR_BY_PHASE = {
+    "implementation": "unit_test_add_modify_execute_pass",
+    "bugfix": "regression_test_required",
+    "refactoring": "behavior_preservation_and_relevant_unit_tests",
+}
+SAFETY_FLOOR_NOT_APPLICABLE = "not_applicable"
+# What receipt THIS dispatch must produce. The one risk-varying key: `safety_floor`
+# itself is identical at every level, which is the machine-checkable form of "risk
+# changes validation strength, never the safety floor".
+SAFETY_FLOOR_EVIDENCE_LOW = "unit_test_status_required"
+SAFETY_FLOOR_EVIDENCE_REVIEWED = "phase_reviewer_verifies"
+
+
 class TaskContextError(ValueError):
     """Raised when a context builder is asked to produce an incomplete payload."""
 
@@ -387,6 +422,43 @@ def build_quality_gate_context(
     }
 
 
+def build_risk_context(
+    *, risk: str, risk_source: str, current_phase: str
+) -> dict[str, str]:
+    """The resolved risk model for ONE dispatch, as a flat payload.
+
+    Raises TaskContextError on an unknown level or source -- the same fail-closed
+    shape build_quality_gate_context() uses for an invalid profile, so a spec that
+    cannot state its own strength is never rendered.
+
+    Deliberately accepts NO QualityProfileResolution: the two builders share no
+    argument and no key, which is what makes section 11's independence structural
+    rather than a convention.
+    """
+    if risk not in RISK_LEVELS:
+        raise TaskContextError(f"unknown risk level: {risk!r}")
+    if risk_source not in RISK_SELECTION_SOURCES:
+        raise TaskContextError(f"unknown risk source: {risk_source!r}")
+    current_phase = require_workflow_phase(current_phase)
+    safety_floor = SAFETY_FLOOR_BY_PHASE.get(current_phase, SAFETY_FLOOR_NOT_APPLICABLE)
+    if safety_floor == SAFETY_FLOOR_NOT_APPLICABLE:
+        evidence = SAFETY_FLOOR_NOT_APPLICABLE
+    elif risk == "low":
+        evidence = SAFETY_FLOOR_EVIDENCE_LOW
+    else:
+        evidence = SAFETY_FLOOR_EVIDENCE_REVIEWED
+    return {
+        "risk_level": risk,
+        "risk_source": risk_source,
+        "phase_gate": "worker_only" if risk == "low" else "worker_then_phase_reviewer",
+        "downstream_revalidation": "enabled" if risk == "high" else "disabled",
+        "final_review": "mandatory",
+        "safety_floor": safety_floor,
+        "safety_floor_evidence": evidence,
+        "quality_profile_axis": "independent",
+    }
+
+
 # ---- serialization: the boundary as the agent actually receives it --------------
 # A builder whose result only ever reaches the coordinator's own records has not
 # established a boundary; it has described one. These renderers put layer 1 (and the
@@ -399,6 +471,8 @@ REVIEWER_CONTEXT_SPEC_HEADER = "=== REVIEWER CONTEXT (delta-first) ==="
 REVIEWER_CONTEXT_SPEC_FOOTER = "=== END REVIEWER CONTEXT ==="
 QUALITY_GATE_SPEC_HEADER = "=== QUALITY GATE (profile-first) ==="
 QUALITY_GATE_SPEC_FOOTER = "=== END QUALITY GATE ==="
+RISK_SPEC_HEADER = "=== RISK PROFILE ==="
+RISK_SPEC_FOOTER = "=== END RISK PROFILE ==="
 # The last line of every rendered spec, and the agent's signal that the payload is
 # COMPLETE. A dispatch preamble arrives a line at a time; an agent that acts on the
 # first line of a multi-line spec races the injection that is still delivering it,
@@ -441,6 +515,7 @@ def render_task_spec(
     boundary: dict[str, str],
     reviewer_context: dict[str, Any] | None = None,
     quality_gate: dict[str, Any] | None = None,
+    risk_context: dict[str, str] | None = None,
 ) -> str:
     """The Task spec body an agent is handed: the caller's text, then the boundary.
 
@@ -470,6 +545,15 @@ def render_task_spec(
             f"{key}: {_render_value(quality_gate[key])}" for key in QUALITY_GATE_KEYS
         )
         lines.append(QUALITY_GATE_SPEC_FOOTER)
+    if risk_context is not None:
+        # Appended AFTER the quality gate and before the end marker, so a caller that
+        # omits it renders a byte-identical spec to before this argument existed.
+        lines.append("")
+        lines.append(RISK_SPEC_HEADER)
+        lines.extend(
+            f"{key}: {_render_value(risk_context[key])}" for key in RISK_CONTEXT_KEYS
+        )
+        lines.append(RISK_SPEC_FOOTER)
     lines.append(TASK_SPEC_END_MARKER)
     return "\n".join(lines)
 
@@ -604,6 +688,47 @@ def parse_quality_gate(text: str) -> dict[str, str]:
     missing = [key for key in QUALITY_GATE_KEYS if key not in parsed]
     if missing:
         raise TaskContextError(f"quality gate block is missing {missing}")
+    return parsed
+
+
+def parse_risk_profile_keys(text: str) -> tuple[str, ...]:
+    """Which of the eight risk keys the supplied text carries; () when there is none.
+
+    Mirrors parse_quality_gate_keys: an empty tuple is the honest answer for a spec
+    rendered without a risk block, which is what a skill with no risk axis produces.
+    """
+    if RISK_SPEC_HEADER not in text:
+        return ()
+    block = text.split(RISK_SPEC_HEADER, 1)[1].split(RISK_SPEC_FOOTER, 1)[0]
+    present = {
+        line.partition(":")[0].strip()
+        for line in block.splitlines()
+        if line.partition(":")[1]
+    }
+    return tuple(key for key in RISK_CONTEXT_KEYS if key in present)
+
+
+def parse_risk_profile(text: str) -> dict[str, str]:
+    """Read a rendered risk block back out of whatever text carries it.
+
+    The same shape as parse_quality_gate: split on header/footer, require every key,
+    raise when the block is absent or incomplete. Callers that must tolerate an
+    absent block check for RISK_SPEC_HEADER first.
+    """
+    if RISK_SPEC_HEADER not in text:
+        raise TaskContextError("no risk profile block in the supplied text")
+    block = text.split(RISK_SPEC_HEADER, 1)[1].split(RISK_SPEC_FOOTER, 1)[0]
+    parsed: dict[str, str] = {}
+    for line in block.splitlines():
+        key, separator, value = line.partition(": ")
+        key = key.strip()
+        if key in RISK_CONTEXT_KEYS:
+            parsed[key] = value if separator else ""
+        elif line.strip().rstrip(":") in RISK_CONTEXT_KEYS:
+            parsed[line.strip().rstrip(":")] = ""
+    missing = [key for key in RISK_CONTEXT_KEYS if key not in parsed]
+    if missing:
+        raise TaskContextError(f"risk profile block is missing {missing}")
     return parsed
 
 

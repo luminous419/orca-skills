@@ -25,6 +25,20 @@ def main() -> int:
     # the spec is handed to it directly -- but it is still the agent's INPUT, and the
     # receipt below is still parsed out of it rather than reconstructed.
     parser.add_argument("--task-spec", default="")
+    # OS-3 section 14 evidence. Opt-in: the default emits NOTHING, so every existing
+    # scenario's output stays byte-identical. UNIT_TEST_STATUS matches the harness's
+    # FIELD_LINE regex but not its `STATUS` field filter, so the existing status
+    # parse is untouched.
+    parser.add_argument(
+        "--unit-test-status", default="", choices=("", "PASS", "BLOCKED")
+    )
+    # The malformed-output seam. --unit-test-status above is the well-formed,
+    # scenario-facing knob and stays constrained on purpose; this one is deliberately
+    # UNCONSTRAINED and repeatable, so a test can drive the parser's duplicate-line
+    # and unknown-value branches through the real subprocess rather than by calling
+    # parse_unit_test_status() in isolation. Same role --mode malformed already plays
+    # for the STATUS field.
+    parser.add_argument("--unit-test-status-raw", action="append", default=None)
     args = parser.parse_args()
 
     if args.mode == "exit":
@@ -40,6 +54,10 @@ def main() -> int:
 
     resolutions = json.loads(args.resolutions_json)
     print(f"# Worker Result\n\n{args.field}: {args.complete_value}")
+    if args.unit_test_status:
+        print(f"UNIT_TEST_STATUS: {args.unit_test_status}")
+    for raw in args.unit_test_status_raw or ():
+        print(f"UNIT_TEST_STATUS: {raw}")
     print(f"ITERATION: {args.iteration}")
     if resolutions:
         print("\n## Review Feedback Resolution")

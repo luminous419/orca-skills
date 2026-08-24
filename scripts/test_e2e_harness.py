@@ -8,6 +8,12 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 
+from scripts.task_context import RISK_CONTEXT_KEYS
+from scripts.e2e_harness import (
+    UNIT_TEST_GATED_PHASES,
+    RiskNotSupportedError,
+    parse_unit_test_status,
+)
 from scripts.e2e_harness import E2EHarness, FakeScenario, WorkflowResult
 from scripts.e2e_harness import (
     FinalFinding,
@@ -40,6 +46,21 @@ SKILL_PATHS = (
     REPO_ROOT / "orca-worker-reviewer-loop" / "SKILL.md",
     REPO_ROOT / "orca-worker-reviewer-orchestration" / "SKILL.md",
 )
+
+
+def _without_risk_profile(result):
+    """The same result with the orchestration-only risk field cleared everywhere.
+
+    Used only by the cross-skill comparison, so the equality it asserts is about
+    behaviour the two skills genuinely share.
+    """
+    return replace(
+        result,
+        sessions=tuple(
+            replace(event, risk_profile=())
+            for event in result.sessions
+        ),
+    )
 
 
 class FakeAgentE2ETests(unittest.TestCase):
@@ -298,7 +319,36 @@ class FakeAgentE2ETests(unittest.TestCase):
                     )[0]
                     for skill_path in SKILL_PATHS
                 ]
-                self.assertEqual(results[0], results[1])
+                # T-26. Whole-object equality is no longer the right claim: risk is
+                # orchestration-only, so the orchestration side carries a populated
+                # SessionEvent.risk_profile and the loop side carries (). That
+                # asymmetry IS the requirement -- the loop skill must have no risk
+                # axis at all. The equality claim survives as a claim about SHARED
+                # behaviour, made over a projection that drops only the intentional
+                # field, plus two explicit assertions about the asymmetry itself.
+                shared = [_without_risk_profile(result) for result in results]
+                self.assertEqual(shared[0], shared[1])
+                # (b) the loop skill is untouched: no event carries a risk block.
+                self.assertTrue(
+                    all(event.risk_profile == () for event in results[0].sessions)
+                )
+                # (c) the orchestration skill reflects the resolved risk. Only
+                # Worker/Reviewer dispatches render a spec, so final_review events
+                # legitimately carry () here too.
+                dispatched = [
+                    event
+                    for event in results[1].sessions
+                    if event.role in ("worker", "reviewer")
+                ]
+                for event in dispatched:
+                    self.assertEqual(
+                        tuple(key for key, _ in event.risk_profile),
+                        tuple(sorted(RISK_CONTEXT_KEYS)),
+                    )
+                    self.assertEqual(dict(event.risk_profile)["risk_level"], "high")
+                    self.assertEqual(
+                        dict(event.risk_profile)["risk_source"], "default"
+                    )
 
 class SessionStateMachineTests(unittest.TestCase):
     """DESIGN section 7.1 C-1: S-R0..S-R7, called directly.
@@ -2622,3 +2672,768 @@ class RunArtifactRootProvisioningTests(unittest.TestCase):
 
             self.assertEqual(result.final_status, "COMPLETED")
             self.assertTrue(target.is_dir())
+
+
+class RiskWorkflowTests(unittest.TestCase):
+    """OS-3: the risk axis, driven through the real run_workflow state machine.
+
+    Orchestration skill only. The loop skill has no risk axis, and asserting the
+    boundary is T-26/T-27's job, not this class's.
+    """
+
+    ORCHESTRATION_SKILL = (
+        REPO_ROOT / "orca-worker-reviewer-orchestration" / "SKILL.md"
+    )
+    LOOP_SKILL = REPO_ROOT / "orca-worker-reviewer-loop" / "SKILL.md"
+    PASSING = FakeScenario(("complete",), ("pass",))
+    # A LOW run on a section-14 gated phase must carry affirmative evidence.
+    PASSING_GATED = FakeScenario(("complete",), ("pass",), worker_unit_test_statuses=("PASS",))
+
+    # ---- helpers ----------------------------------------------------------------
+
+    def run_workflow(
+        self,
+        scenario: WorkflowScenario,
+        *,
+        risk: str | None = None,
+        skill_path: Path | None = None,
+        max_iterations: int = 5,
+    ) -> WorkflowRunResult:
+        with tempfile.TemporaryDirectory() as directory:
+            harness = E2EHarness(
+                skill_path or self.ORCHESTRATION_SKILL,
+                phase="implementation",
+                max_iterations=max_iterations,
+                workspace=Path(directory),
+                risk=risk,
+            )
+            return harness.run_workflow(scenario)
+
+    def clean_scenario(self, phases: tuple[str, ...], **kwargs) -> WorkflowScenario:
+        """Every requested phase passes first try, and the Final Review passes."""
+        return WorkflowScenario(
+            phases=phases,
+            phase_scenarios={
+                phase: (
+                    self.PASSING_GATED
+                    if phase in UNIT_TEST_GATED_PHASES
+                    else self.PASSING
+                )
+                for phase in phases
+            },
+            final_review=FinalReviewScenario(modes=("pass",)),
+            **kwargs,
+        )
+
+    @staticmethod
+    def reviewer_events(result: WorkflowRunResult) -> list:
+        return [event for event in result.sessions if event.role == "reviewer"]
+
+    @staticmethod
+    def churn(result: WorkflowRunResult) -> int:
+        return (
+            len(RiskWorkflowTests.reviewer_events(result))
+            + len(result.correction_dispatches)
+            + len(result.revalidation_dispatches)
+        )
+
+    # ---- T-1 / T-2 / T-3: the phase-set matrix ----------------------------------
+
+    def test_analysis_plan_matrix(self) -> None:
+        """T-1."""
+        phases = ("analysis", "plan")
+        expected = {"low": 0, "medium": 2, "high": 2}
+        for risk, reviewers in expected.items():
+            with self.subTest(risk=risk):
+                result = self.run_workflow(self.clean_scenario(phases), risk=risk)
+                self.assertEqual(result.final_status, "COMPLETED")
+                self.assertEqual(len(self.reviewer_events(result)), reviewers)
+
+    def test_plan_design_implementation_matrix(self) -> None:
+        """T-2."""
+        phases = ("plan", "design", "implementation")
+        expected = {"low": 0, "medium": 3, "high": 3}
+        for risk, reviewers in expected.items():
+            with self.subTest(risk=risk):
+                result = self.run_workflow(self.clean_scenario(phases), risk=risk)
+                self.assertEqual(result.final_status, "COMPLETED")
+                self.assertEqual(len(self.reviewer_events(result)), reviewers)
+
+    def test_the_executed_phase_set_is_identical_at_every_risk(self) -> None:
+        """T-3. Risk changes HOW STRONGLY, never WHAT."""
+        phases = ("plan", "design", "implementation")
+        dispatched = {}
+        for risk in ("low", "medium", "high"):
+            result = self.run_workflow(self.clean_scenario(phases), risk=risk)
+            self.assertEqual(result.phases, phases)
+            dispatched[risk] = [
+                event.phase for event in result.sessions if event.role == "worker"
+            ]
+        self.assertEqual(dispatched["low"], dispatched["medium"])
+        self.assertEqual(dispatched["medium"], dispatched["high"])
+        self.assertEqual(dispatched["low"], list(phases))
+
+    def test_risk_omitted_matches_explicit_high(self) -> None:
+        """T-4. The backward-compatibility guarantee, stated directly."""
+        phases = ("plan", "design")
+        omitted = self.run_workflow(self.clean_scenario(phases))
+        explicit = self.run_workflow(self.clean_scenario(phases), risk="high")
+        self.assertEqual(omitted.risk, "high")
+        self.assertEqual(omitted.risk_source, "default")
+        self.assertEqual(explicit.risk_source, "explicit")
+        self.assertEqual(omitted.phase_iterations, explicit.phase_iterations)
+        self.assertEqual(
+            len(self.reviewer_events(omitted)), len(self.reviewer_events(explicit))
+        )
+        self.assertEqual(
+            omitted.final_review_iterations, explicit.final_review_iterations
+        )
+
+    # ---- TEST phase: the section 13 counter, which nothing asserted at LOW -------
+
+    def test_phase_iterations_counts_gate_attempts_at_every_risk(self) -> None:
+        """SKILL.md section 13 redefines PHASE_ITERATIONS as *gate* attempts -- a
+        Reviewer attempt at MEDIUM/HIGH, a Worker attempt at LOW.
+
+        Nothing asserted this at LOW. If gate_attempts() regressed to counting
+        reviewer attempts, a LOW run would silently report all-zeros -- exactly the
+        "technically true and practically useless" ITERATIONS_BY_PHASE the analysis
+        phase identified -- and every other test in this file would still pass.
+        """
+        phases = ("plan", "design", "implementation")
+        counters = {}
+        for risk in ("low", "medium", "high"):
+            result = self.run_workflow(self.clean_scenario(phases), risk=risk)
+            self.assertEqual(result.final_status, "COMPLETED")
+            counters[risk] = result.phase_iterations
+        expected = {phase: 1 for phase in phases}
+        for risk, counter in counters.items():
+            with self.subTest(risk=risk):
+                # Not zero, and not phase-dependent: one gate attempt per phase.
+                self.assertEqual(counter, expected)
+
+    def test_low_correction_rounds_are_counted_and_ledgered(self) -> None:
+        """The same counter on the T4 path. A LOW correction round dispatches a
+        Worker and no Reviewer, so a reviewer-attempt-based counter would leave both
+        the counter and the correction ledger untouched."""
+        result = self.run_workflow(
+            self.fail_then_pass_scenario(("plan", "design")), risk="low"
+        )
+        self.assertEqual(result.final_status, "COMPLETED")
+        # phase gate (1) + one correction round (1)
+        self.assertEqual(result.phase_iterations["plan"], 2)
+        self.assertEqual(result.phase_iterations["design"], 1)
+        # and the ledger records the round at the right iteration number
+        self.assertEqual(result.correction_dispatches, [("plan", 2)])
+
+    # ---- TEST phase: reviewer_gates_skipped beyond a single phase ----------------
+
+    def test_every_requested_phase_is_recorded_as_a_skipped_gate_at_low(self) -> None:
+        """The log-facing record of "which phases got a Reviewer gate". Previously
+        asserted only for a one-phase run, where a bug that recorded just the first
+        phase would be invisible."""
+        phases = ("analysis", "plan", "design")
+        result = self.run_workflow(self.clean_scenario(phases), risk="low")
+        self.assertEqual(result.reviewer_gates_skipped, list(phases))
+
+    def test_no_gate_is_recorded_as_skipped_at_medium_or_high(self) -> None:
+        for risk in ("medium", "high"):
+            with self.subTest(risk=risk):
+                result = self.run_workflow(
+                    self.clean_scenario(("analysis", "plan")), risk=risk
+                )
+                self.assertEqual(result.reviewer_gates_skipped, [])
+
+    def test_final_review_eligibility_at_low_needs_no_phase_reviewer(self) -> None:
+        """T-29 (Final Review R1). Section 17's gate is mandatory at every risk
+        level, and LOW produces no phase Reviewer verdict at all -- so eligibility
+        must rest on the phase gate, never on a Reviewer PASS.
+
+        `test_low_final_fail_routes_worker_only` covers the FAIL path; this is the
+        clean path, which is the one a literal reading of the old section 17 trigger
+        sentence would have blocked.
+        """
+        result = self.run_workflow(
+            self.clean_scenario(("analysis", "plan", "design")), risk="low"
+        )
+        self.assertEqual(result.final_status, "COMPLETED")
+        self.assertEqual(self.reviewer_events(result), [])       # no phase Reviewer ran
+        self.assertGreaterEqual(result.final_review_iterations, 1)  # the gate still fired
+        self.assertEqual(result.final_review_verdict, "PASS")
+
+    # ---- T-9 / T-10 / T-11: Final-Review FAIL routing ----------------------------
+
+    def fail_then_pass_scenario(self, phases: tuple[str, ...]) -> WorkflowScenario:
+        """Final Review FAILs once, charged to the first phase, then passes."""
+        correction = FakeScenario(
+            ("correction",),
+            ("pass",),
+            worker_resolutions=({"R1": "RESOLVED"},),
+            worker_unit_test_statuses=("PASS",),
+        )
+        revalidation = FakeScenario(
+            ("complete",), ("pass",), worker_unit_test_statuses=("PASS",)
+        )
+        return WorkflowScenario(
+            phases=phases,
+            phase_scenarios={
+                phase: (
+                    self.PASSING_GATED
+                    if phase in UNIT_TEST_GATED_PHASES
+                    else self.PASSING
+                )
+                for phase in phases
+            },
+            final_review=FinalReviewScenario(
+                modes=("fail", "pass"), findings=((("R1", phases[0]),), ())
+            ),
+            correction_scenarios={(phases[0], 1): correction},
+            revalidation_scenarios={
+                (phase, 1): revalidation for phase in phases[1:]
+            },
+        )
+
+    def fail_then_pass_scenario_on_last_phase(
+        self, phases: tuple[str, ...]
+    ) -> WorkflowScenario:
+        """Final Review FAILs once, charged to the LAST requested phase, then passes.
+
+        Unlike `fail_then_pass_scenario` (charged to `phases[0]`), the corrected
+        phase here has no requested phase after it in canonical order, so section
+        17's downstream set D is empty and T5a has nothing to revalidate.
+        """
+        correction = FakeScenario(
+            ("correction",),
+            ("pass",),
+            worker_resolutions=({"R1": "RESOLVED"},),
+            worker_unit_test_statuses=("PASS",),
+        )
+        return WorkflowScenario(
+            phases=phases,
+            phase_scenarios={
+                phase: (
+                    self.PASSING_GATED
+                    if phase in UNIT_TEST_GATED_PHASES
+                    else self.PASSING
+                )
+                for phase in phases
+            },
+            final_review=FinalReviewScenario(
+                modes=("fail", "pass"), findings=((("R1", phases[-1]),), ())
+            ),
+            correction_scenarios={(phases[-1], 1): correction},
+        )
+
+    def test_low_final_fail_routes_worker_only(self) -> None:
+        """T-9. Correction runs with ZERO phase-Reviewer dispatches."""
+        result = self.run_workflow(
+            self.fail_then_pass_scenario(("plan", "design")), risk="low"
+        )
+        self.assertEqual(result.final_status, "COMPLETED")
+        self.assertEqual(self.reviewer_events(result), [])
+        self.assertEqual(result.revalidation_dispatches, [])
+        self.assertEqual(result.final_review_iterations, 2)
+        self.assertEqual([phase for phase, _ in result.correction_dispatches], ["plan"])
+
+    def test_medium_final_fail_routes_through_the_phase_reviewer(self) -> None:
+        """T-10. Correction is reviewed; T5a still does not run."""
+        result = self.run_workflow(
+            self.fail_then_pass_scenario(("plan", "design")), risk="medium"
+        )
+        self.assertEqual(result.final_status, "COMPLETED")
+        self.assertEqual([phase for phase, _ in result.correction_dispatches], ["plan"])
+        self.assertEqual(result.revalidation_dispatches, [])
+
+    def test_high_final_fail_runs_downstream_revalidation(self) -> None:
+        """T-11. T5a covers every requested phase after the corrected one."""
+        result = self.run_workflow(
+            self.fail_then_pass_scenario(("plan", "design", "implementation")),
+            risk="high",
+        )
+        self.assertEqual(result.final_status, "COMPLETED")
+        self.assertEqual([phase for phase, _ in result.correction_dispatches], ["plan"])
+        self.assertEqual(
+            [phase for phase, _ in result.revalidation_dispatches],
+            ["design", "implementation"],
+        )
+
+    # ---- T-12: churn is LOW <= MEDIUM <= HIGH, strict MEDIUM<HIGH only when T5a --
+    # ---- actually revalidates a non-empty downstream set ------------------------
+
+    def test_churn_ordering_when_t5a_actually_revalidates_something_is_strict(
+        self,
+    ) -> None:
+        """T-12, representative strict case: a Final Review correction is charged
+        to a NON-last requested phase, so T5a's downstream set D is non-empty and
+        HIGH strictly outdoes MEDIUM. This is the ONLY mechanism that makes HIGH
+        churn more than MEDIUM -- see the other T-12 cases below for the (more
+        common) MEDIUM == HIGH paths.
+        """
+        phases = ("plan", "design", "implementation")
+        churn = {
+            risk: self.churn(
+                self.run_workflow(self.fail_then_pass_scenario(phases), risk=risk)
+            )
+            for risk in ("low", "medium", "high")
+        }
+        self.assertLess(churn["low"], churn["medium"])
+        self.assertLess(churn["medium"], churn["high"])
+
+    def test_churn_on_a_clean_first_pass_is_medium_equals_high(self) -> None:
+        """T-12: no Final Review FAIL at all -> T5a never runs -> MEDIUM == HIGH."""
+        phases = ("plan", "design", "implementation")
+        churn = {
+            risk: self.churn(self.run_workflow(self.clean_scenario(phases), risk=risk))
+            for risk in ("low", "medium", "high")
+        }
+        self.assertLess(churn["low"], churn["medium"])
+        self.assertEqual(churn["medium"], churn["high"])
+
+    def test_churn_with_only_a_phase_local_correction_is_medium_equals_high(
+        self,
+    ) -> None:
+        """T-12 (external review MAJOR, case 1): a phase-local Reviewer FAIL/
+        correction is IDENTICAL machinery at MEDIUM and HIGH -- it is not a
+        Final Review correction, so it never triggers T5a. A scenario where one
+        requested phase needs a phase-local correction but the Final Review still
+        passes cleanly must still show MEDIUM == HIGH; only a *Final Review*
+        correction with a non-empty downstream set (the test above) makes HIGH
+        strictly outdo MEDIUM.
+        """
+        phases = ("plan", "design", "implementation")
+        phase_local_correction = FakeScenario(
+            worker_modes=("complete", "correction"),
+            reviewer_modes=("fail", "pass"),
+            reviewer_findings=(("R1",), ()),
+            worker_resolutions=({}, {"R1": "RESOLVED"}),
+        )
+        scenario = WorkflowScenario(
+            phases=phases,
+            phase_scenarios={
+                "plan": phase_local_correction,
+                "design": self.PASSING,
+                "implementation": self.PASSING_GATED,
+            },
+            final_review=FinalReviewScenario(modes=("pass",)),
+        )
+        churn = {
+            risk: self.churn(self.run_workflow(scenario, risk=risk))
+            for risk in ("medium", "high")
+        }
+        self.assertEqual(churn["medium"], churn["high"])
+
+    def test_churn_with_final_review_correction_on_the_last_phase_is_medium_equals_high(
+        self,
+    ) -> None:
+        """T-12 (external review MAJOR, case 2): a Final Review correction charged
+        to the LAST requested phase in canonical order has an empty downstream set
+        D, so T5a has nothing left to revalidate even though a correction genuinely
+        happened. MEDIUM == HIGH here too -- strict inequality is not "whenever any
+        correction occurs," only when D is actually non-empty.
+        """
+        phases = ("plan", "design", "implementation")
+        churn = {
+            risk: self.churn(
+                self.run_workflow(
+                    self.fail_then_pass_scenario_on_last_phase(phases), risk=risk
+                )
+            )
+            for risk in ("low", "medium", "high")
+        }
+        self.assertLess(churn["low"], churn["medium"])
+        self.assertEqual(churn["medium"], churn["high"])
+
+    # ---- T-13: HIGH inspects out of scope without creating phase Tasks -----------
+
+    def test_an_out_of_scope_finding_is_lowered_never_widened(self) -> None:
+        """T-13. The dispatched phase set never grows, at any risk level."""
+        correction = FakeScenario(
+            ("correction",), ("pass",), worker_resolutions=({"R1": "RESOLVED"},)
+        )
+        scenario = WorkflowScenario(
+            phases=("plan",),
+            phase_scenarios={"plan": self.PASSING},
+            # `design` is NOT requested: the ladder must lower it onto `plan`.
+            final_review=FinalReviewScenario(
+                modes=("fail", "pass"), findings=((("R1", "design"),), ())
+            ),
+            correction_scenarios={("plan", 1): correction},
+        )
+        for risk in ("low", "medium", "high"):
+            with self.subTest(risk=risk):
+                result = self.run_workflow(scenario, risk=risk)
+                self.assertEqual(result.final_status, "COMPLETED")
+                self.assertEqual(
+                    {event.phase for event in result.sessions if event.role == "worker"},
+                    {"plan"},
+                )
+                self.assertEqual(
+                    [phase for phase, _ in result.correction_dispatches], ["plan"]
+                )
+
+    # ---- T-14 / T-15: specialized phases -----------------------------------------
+
+    def assert_specialized(self, phase: str, expected_floor: str) -> None:
+        churn = {}
+        for risk in ("low", "medium", "high"):
+            result = self.run_workflow(self.clean_scenario((phase,)), risk=risk)
+            self.assertEqual(result.final_status, "COMPLETED")
+            self.assertEqual(result.revalidation_dispatches, [])
+            churn[risk] = self.churn(result)
+            worker_events = [
+                event for event in result.sessions
+                if event.role == "worker" and event.phase == phase
+            ]
+            self.assertTrue(worker_events)
+            for event in worker_events:
+                self.assertEqual(
+                    dict(event.risk_profile)["safety_floor"], expected_floor
+                )
+        self.assertLess(churn["low"], churn["medium"])
+        # The DQ-1 documented exception: D is always empty for specialized runs.
+        self.assertEqual(churn["medium"], churn["high"])
+
+    def test_bugfix_across_risk_levels(self) -> None:
+        """T-14."""
+        self.assert_specialized("bugfix", "regression_test_required")
+
+    def test_refactoring_across_risk_levels(self) -> None:
+        """T-15."""
+        self.assert_specialized(
+            "refactoring", "behavior_preservation_and_relevant_unit_tests"
+        )
+
+    # ---- T-16: profile independence, on the dispatched payload -------------------
+
+    def test_the_quality_gate_payload_does_not_vary_with_risk(self) -> None:
+        """T-16. Read off result.sessions, so it is about what an agent received."""
+        phases = ("plan", "design")
+        gates = {}
+        for risk in ("low", "medium", "high"):
+            result = self.run_workflow(self.clean_scenario(phases), risk=risk)
+            gates[risk] = sorted(
+                (event.phase, event.role, event.quality_gate)
+                for event in result.sessions
+                if event.role == "worker"
+            )
+        self.assertEqual(gates["low"], gates["medium"])
+        self.assertEqual(gates["medium"], gates["high"])
+
+    # ---- T-22 / T-22a / T-23: the section 14 safety floor -------------------------
+
+    def gated_scenario(self, phase: str, status: str) -> WorkflowScenario:
+        return WorkflowScenario(
+            phases=(phase,),
+            phase_scenarios={
+                phase: FakeScenario(
+                    ("complete",),
+                    ("pass",),
+                    worker_unit_test_statuses=(status,) if status else (),
+                )
+            },
+            final_review=FinalReviewScenario(modes=("pass",)),
+        )
+
+    def test_low_requires_affirmative_unit_test_evidence(self) -> None:
+        """T-22. Only an explicit PASS satisfies the gate; every other input is a
+        defined non-PASS, and none of them dispatches a Reviewer."""
+        cases = {
+            "PASS": ("COMPLETED", None),
+            "": ("BLOCKED", "UNIT_TEST_EVIDENCE_MISSING"),
+            "BLOCKED": ("BLOCKED", "UNIT_TEST_BLOCKED"),
+        }
+        for phase in sorted(UNIT_TEST_GATED_PHASES):
+            for status, (expected_status, expected_reason) in cases.items():
+                with self.subTest(phase=phase, status=status or "<absent>"):
+                    result = self.run_workflow(
+                        self.gated_scenario(phase, status), risk="low"
+                    )
+                    self.assertEqual(result.final_status, expected_status)
+                    if expected_reason is not None:
+                        self.assertEqual(result.reason, expected_reason)
+                        self.assertEqual(self.reviewer_events(result), [])
+
+    def malformed_scenario(
+        self, phase: str, raw: tuple[str, ...]
+    ) -> WorkflowScenario:
+        """A scenario whose Worker emits RAW UNIT_TEST_STATUS lines.
+
+        The --unit-test-status knob is constrained to the well-formed values on
+        purpose, so it cannot reach the parser's duplicate-line or unknown-value
+        branches. This drives them through the real subprocess instead.
+        """
+        return WorkflowScenario(
+            phases=(phase,),
+            phase_scenarios={
+                phase: FakeScenario(
+                    ("complete",), ("pass",), worker_unit_test_status_lines=(raw,)
+                )
+            },
+            final_review=FinalReviewScenario(modes=("pass",)),
+        )
+
+    def assert_malformed(self, result: WorkflowRunResult) -> None:
+        self.assertEqual(result.final_status, "ERROR")
+        self.assertIsNotNone(result.reason)
+        self.assertTrue(
+            result.reason.startswith("MALFORMED_WORKER_OUTPUT:"),
+            f"unexpected reason: {result.reason!r}",
+        )
+        # The error returns before the Reviewer half, at every risk level.
+        self.assertEqual(self.reviewer_events(result), [])
+
+    def test_duplicate_unit_test_status_lines_are_malformed_output(self) -> None:
+        """T-22, the duplicate branch, through the real run() parse path.
+
+        Two lines is a contract violation whatever the values are: the gate asks
+        what the Worker reported, and two answers is not an answer.
+        """
+        for raw in (("PASS", "PASS"), ("PASS", "BLOCKED"), ("BLOCKED", "BLOCKED")):
+            for phase in sorted(UNIT_TEST_GATED_PHASES):
+                with self.subTest(raw=raw, phase=phase):
+                    result = self.run_workflow(
+                        self.malformed_scenario(phase, raw), risk="low"
+                    )
+                    self.assert_malformed(result)
+                    self.assertIn("at most one", result.reason)
+
+    def test_an_unknown_unit_test_status_value_is_malformed_output(self) -> None:
+        """T-22, the unknown-value branch, through the real run() parse path."""
+        for value in ("MAYBE", "SKIPPED", "FAILED", "OK"):
+            with self.subTest(value=value):
+                result = self.run_workflow(
+                    self.malformed_scenario("implementation", (value,)), risk="low"
+                )
+                self.assert_malformed(result)
+                self.assertIn(f"invalid UNIT_TEST_STATUS {value}", result.reason)
+
+    def test_malformed_evidence_is_an_error_at_every_risk_level(self) -> None:
+        """The parse runs before any risk branch, so a contract violation is an
+        ERROR at MEDIUM and HIGH too -- not something only LOW notices."""
+        for risk in ("low", "medium", "high"):
+            for raw in (("PASS", "PASS"), ("MAYBE",)):
+                with self.subTest(risk=risk, raw=raw):
+                    result = self.run_workflow(
+                        self.malformed_scenario("implementation", raw), risk=risk
+                    )
+                    self.assert_malformed(result)
+
+    def test_a_lowercase_value_is_not_a_recognized_field_line(self) -> None:
+        """A boundary worth pinning: FIELD_LINE requires an uppercase value, so
+        `UNIT_TEST_STATUS: pass` is not a malformed VALUE -- it is not a recognized
+        line at all, which at LOW is the missing-evidence case, not an ERROR."""
+        result = self.run_workflow(
+            self.malformed_scenario("implementation", ("pass",)), risk="low"
+        )
+        self.assertEqual(result.final_status, "BLOCKED")
+        self.assertEqual(result.reason, "UNIT_TEST_EVIDENCE_MISSING")
+        self.assertEqual(self.reviewer_events(result), [])
+
+    def test_malformed_evidence_on_an_ungated_phase_is_still_an_error(self) -> None:
+        """The phase gate is risk-and-phase conditional; the output CONTRACT is not.
+        A duplicate line is malformed output even where section 14 names no gate."""
+        result = self.run_workflow(
+            self.malformed_scenario("plan", ("PASS", "PASS")), risk="low"
+        )
+        self.assert_malformed(result)
+
+    def test_the_raw_seam_still_reaches_the_ordinary_gate(self) -> None:
+        """The seam is not a bypass: a single well-formed raw line behaves exactly
+        like the constrained knob, which is what makes the tests above meaningful."""
+        passing = self.run_workflow(
+            self.malformed_scenario("implementation", ("PASS",)), risk="low"
+        )
+        self.assertEqual(passing.final_status, "COMPLETED")
+        blocked = self.run_workflow(
+            self.malformed_scenario("implementation", ("BLOCKED",)), risk="low"
+        )
+        self.assertEqual(blocked.final_status, "BLOCKED")
+        self.assertEqual(blocked.reason, "UNIT_TEST_BLOCKED")
+
+    def test_an_ungated_phase_is_unaffected_at_low(self) -> None:
+        """T-22a. TEST in particular is asserted NOT gated -- section 14 names three
+        phases, and TEST is not one of them."""
+        for phase in ("analysis", "plan", "design", "test"):
+            with self.subTest(phase=phase):
+                self.assertNotIn(phase, UNIT_TEST_GATED_PHASES)
+                result = self.run_workflow(
+                    self.gated_scenario(phase, ""), risk="low"
+                )
+                self.assertEqual(result.final_status, "COMPLETED")
+
+    def test_medium_and_high_still_dispatch_the_reviewer(self) -> None:
+        """T-23. The section 14 enforcer at MEDIUM/HIGH is the phase Reviewer, and
+        that is unchanged: no input short-circuits before it."""
+        for risk in ("medium", "high"):
+            for status in ("PASS", "", "BLOCKED"):
+                with self.subTest(risk=risk, status=status or "<absent>"):
+                    result = self.run_workflow(
+                        self.gated_scenario("implementation", status), risk=risk
+                    )
+                    self.assertEqual(result.final_status, "COMPLETED")
+                    self.assertEqual(len(self.reviewer_events(result)), 1)
+
+    def test_the_parser_itself_rejects_duplicate_and_unknown_values(self) -> None:
+        """The unit-level complement to the run()-path tests above: the same two
+        branches, asserted directly, so a future refactor that moves the gate cannot
+        quietly lose them."""
+        with self.assertRaisesRegex(OutputContractError, "at most one"):
+            parse_unit_test_status(
+                "# Worker Result\n\nSTATUS: COMPLETE\n"
+                "UNIT_TEST_STATUS: PASS\nUNIT_TEST_STATUS: BLOCKED\n"
+            )
+        with self.assertRaisesRegex(OutputContractError, "invalid UNIT_TEST_STATUS"):
+            parse_unit_test_status(
+                "# Worker Result\n\nSTATUS: COMPLETE\nUNIT_TEST_STATUS: MAYBE\n"
+            )
+        # And the two well-formed answers still parse.
+        self.assertEqual(
+            parse_unit_test_status("STATUS: COMPLETE\nUNIT_TEST_STATUS: PASS\n"),
+            "PASS",
+        )
+        self.assertEqual(
+            parse_unit_test_status("STATUS: COMPLETE\nUNIT_TEST_STATUS: BLOCKED\n"),
+            "BLOCKED",
+        )
+
+    def test_the_fake_worker_emits_nothing_when_the_flag_is_absent(self) -> None:
+        """T-23, the untouched-fixture guard: this is what keeps every pre-existing
+        FakeScenario byte-identical."""
+        result = self.run_workflow(self.gated_scenario("implementation", ""))
+        worker_output = result  # the run reached the reviewer, i.e. no gate fired
+        self.assertEqual(worker_output.final_status, "COMPLETED")
+        self.assertEqual(parse_unit_test_status("# Worker Result\n\nSTATUS: COMPLETE\n"), "")
+
+    # ---- T-24 / T-25: the dispatched risk payload --------------------------------
+
+    def test_safety_floor_evidence_reaches_the_worker(self) -> None:
+        """T-24, read off the dispatched payload rather than the builder."""
+        expected = {
+            "low": "unit_test_status_required",
+            "medium": "phase_reviewer_verifies",
+            "high": "phase_reviewer_verifies",
+        }
+        for risk, evidence in expected.items():
+            with self.subTest(risk=risk):
+                result = self.run_workflow(
+                    self.clean_scenario(("implementation",)), risk=risk
+                )
+                worker = next(
+                    event for event in result.sessions if event.role == "worker"
+                )
+                self.assertEqual(
+                    dict(worker.risk_profile)["safety_floor_evidence"], evidence
+                )
+                self.assertEqual(
+                    dict(worker.risk_profile)["safety_floor"],
+                    "unit_test_add_modify_execute_pass",
+                )
+
+    def test_every_dispatched_spec_carries_the_full_risk_block(self) -> None:
+        """T-25. The wiring itself: one risk_context() call, both roles."""
+        result = self.run_workflow(self.clean_scenario(("plan",)), risk="medium")
+        dispatched = [
+            event for event in result.sessions if event.role in ("worker", "reviewer")
+        ]
+        self.assertEqual(len(dispatched), 2)
+        for event in dispatched:
+            self.assertEqual(
+                tuple(key for key, _ in event.risk_profile),
+                tuple(sorted(RISK_CONTEXT_KEYS)),
+            )
+        self.assertEqual(dispatched[0].risk_profile, dispatched[1].risk_profile)
+        for event in result.sessions:
+            if event.role == "final_review":
+                self.assertEqual(event.risk_profile, ())
+
+    # ---- T-27: the capability boundary --------------------------------------------
+
+    def test_explicit_risk_on_a_non_risk_skill_fails_closed(self) -> None:
+        """T-27. Two layers, each in its own idiom."""
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(RiskNotSupportedError) as caught:
+                E2EHarness(
+                    self.LOOP_SKILL,
+                    phase="implementation",
+                    workspace=Path(directory),
+                    risk="low",
+                )
+            self.assertIn("RISK_NOT_SUPPORTED", str(caught.exception))
+
+        result = self.run_workflow(
+            WorkflowScenario(
+                phases=("plan",),
+                phase_scenarios={"plan": self.PASSING},
+                final_review=FinalReviewScenario(modes=("pass",)),
+                risk="low",
+            ),
+            skill_path=self.LOOP_SKILL,
+        )
+        self.assertEqual(result.final_status, "ERROR")
+        self.assertEqual(result.reason, "SCENARIO_RISK_NOT_SUPPORTED:low")
+
+    def test_a_non_risk_skill_without_an_explicit_risk_is_unchanged(self) -> None:
+        """T-27, the must-not-fail half."""
+        result = self.run_workflow(
+            self.clean_scenario(("plan",)), skill_path=self.LOOP_SKILL
+        )
+        self.assertEqual(result.final_status, "COMPLETED")
+        self.assertIsNone(result.risk)
+        self.assertIsNone(result.risk_source)
+        self.assertTrue(all(event.risk_profile == () for event in result.sessions))
+
+    def test_an_invalid_scenario_risk_is_refused(self) -> None:
+        result = self.run_workflow(
+            WorkflowScenario(
+                phases=("plan",),
+                phase_scenarios={"plan": self.PASSING},
+                final_review=FinalReviewScenario(modes=("pass",)),
+                risk="extreme",
+            )
+        )
+        self.assertEqual(result.final_status, "ERROR")
+        self.assertEqual(result.reason, "SCENARIO_RISK_INVALID:extreme")
+
+    def test_an_invalid_constructor_risk_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "INVALID_RISK"):
+                E2EHarness(
+                    self.ORCHESTRATION_SKILL,
+                    phase="implementation",
+                    workspace=Path(directory),
+                    risk="extreme",
+                )
+
+    # ---- T-28: the precedence rule -------------------------------------------------
+
+    def test_constructor_explicit_risk_survives_a_scenario_that_omits_it(self) -> None:
+        """T-28. The precedence regression, pinned in all three directions."""
+        phases = ("implementation",)
+        # (a) preserve: constructor LOW + scenario omitted
+        result = self.run_workflow(self.clean_scenario(phases), risk="low")
+        self.assertEqual(result.risk, "low")
+        self.assertEqual(result.risk_source, "explicit")
+        # (b) the pair survived into the DISPATCHED payload, not just the result
+        for event in result.sessions:
+            if event.role == "worker":
+                self.assertEqual(dict(event.risk_profile)["risk_level"], "low")
+                self.assertEqual(dict(event.risk_profile)["risk_source"], "explicit")
+        # (c) LOW behaviour actually occurred
+        self.assertEqual(self.reviewer_events(result), [])
+        self.assertEqual(result.reviewer_gates_skipped, ["implementation"])
+        self.assertEqual(result.revalidation_dispatches, [])
+
+    def test_the_contract_default_applies_only_when_neither_layer_supplied_one(
+        self,
+    ) -> None:
+        """T-28 (d), first half."""
+        result = self.run_workflow(self.clean_scenario(("implementation",)))
+        self.assertEqual((result.risk, result.risk_source), ("high", "default"))
+
+    def test_an_explicit_scenario_value_overrides_the_constructor(self) -> None:
+        """T-28 (d), second half: the override direction still works."""
+        scenario = self.clean_scenario(("implementation",))
+        scenario = replace(scenario, risk="medium")
+        result = self.run_workflow(scenario, risk="low")
+        self.assertEqual((result.risk, result.risk_source), ("medium", "explicit"))
+        self.assertEqual(len(self.reviewer_events(result)), 1)

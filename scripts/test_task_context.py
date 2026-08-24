@@ -18,6 +18,11 @@ from scripts.quality_profile import (
     resolve_quality_profile,
 )
 from scripts.task_context import (
+    RISK_CONTEXT_KEYS,
+    RISK_SPEC_HEADER,
+    build_risk_context,
+    parse_risk_profile,
+    parse_risk_profile_keys,
     AGENT_MODES,
     CANONICAL_PHASES,
     DISPATCH_INJECTED_IDENTITY,
@@ -351,6 +356,119 @@ class RunArtifactRootProvisioningTests(unittest.TestCase):
             with self.assertRaisesRegex(TaskContextError, "single path segment"):
                 ensure_run_artifact_root("../escaped", base=Path(workspace))
             self.assertEqual(list(Path(workspace).iterdir()), [])
+
+
+class RiskProfileBlockTests(unittest.TestCase):
+    """OS-3: the `=== RISK PROFILE ===` block (T-16 structural half, T-24)."""
+
+    def boundary(self, phase: str = "implementation"):
+        return build_task_boundary(
+            current_role="worker",
+            current_phase=phase,
+            current_iteration=1,
+            artifact_contract=f"artifacts/runs/r/{phase.upper()}.md",
+        )
+
+    def test_the_two_axes_share_no_key(self) -> None:
+        """T-16. Independence made structural, not conventional."""
+        self.assertEqual(set(QUALITY_GATE_KEYS) & set(RISK_CONTEXT_KEYS), set())
+
+    def test_the_two_builders_share_no_argument(self) -> None:
+        """T-16. build_risk_context takes no profile; build_quality_gate_context
+        takes no risk. Neither can read the other's state even by accident."""
+        risk_params = set(inspect.signature(build_risk_context).parameters)
+        gate_params = set(inspect.signature(build_quality_gate_context).parameters)
+        self.assertNotIn("resolution", risk_params)
+        self.assertEqual(risk_params & {"resolution", "profile", "quality_profile"}, set())
+        self.assertEqual(gate_params & {"risk", "risk_source"}, set())
+
+    def test_safety_floor_is_phase_specific_and_risk_invariant(self) -> None:
+        """T-24. `safety_floor` is identical at every level -- the machine-checkable
+        form of "risk changes validation strength, never the safety floor"."""
+        expected = {
+            "implementation": "unit_test_add_modify_execute_pass",
+            "bugfix": "regression_test_required",
+            "refactoring": "behavior_preservation_and_relevant_unit_tests",
+            "analysis": "not_applicable",
+            "plan": "not_applicable",
+            "design": "not_applicable",
+            "test": "not_applicable",
+        }
+        for phase, floor in expected.items():
+            floors = {
+                build_risk_context(
+                    risk=risk, risk_source="default", current_phase=phase
+                )["safety_floor"]
+                for risk in ("low", "medium", "high")
+            }
+            with self.subTest(phase=phase):
+                self.assertEqual(floors, {floor})
+
+    def test_safety_floor_evidence_is_the_one_risk_varying_key(self) -> None:
+        """T-24. What receipt THIS dispatch must produce."""
+        cases = {
+            ("implementation", "low"): "unit_test_status_required",
+            ("implementation", "medium"): "phase_reviewer_verifies",
+            ("implementation", "high"): "phase_reviewer_verifies",
+            ("bugfix", "low"): "unit_test_status_required",
+            ("refactoring", "low"): "unit_test_status_required",
+            ("analysis", "low"): "not_applicable",
+            ("test", "low"): "not_applicable",
+        }
+        for (phase, risk), expected in cases.items():
+            with self.subTest(phase=phase, risk=risk):
+                context = build_risk_context(
+                    risk=risk, risk_source="default", current_phase=phase
+                )
+                self.assertEqual(context["safety_floor_evidence"], expected)
+
+    def test_derived_values_track_the_level(self) -> None:
+        low = build_risk_context(
+            risk="low", risk_source="explicit", current_phase="implementation"
+        )
+        high = build_risk_context(
+            risk="high", risk_source="default", current_phase="implementation"
+        )
+        self.assertEqual(low["phase_gate"], "worker_only")
+        self.assertEqual(high["phase_gate"], "worker_then_phase_reviewer")
+        self.assertEqual(low["downstream_revalidation"], "disabled")
+        self.assertEqual(high["downstream_revalidation"], "enabled")
+        for context in (low, high):
+            self.assertEqual(context["final_review"], "mandatory")
+            self.assertEqual(context["quality_profile_axis"], "independent")
+
+    def test_an_unknown_level_or_source_fails_closed(self) -> None:
+        with self.assertRaises(TaskContextError):
+            build_risk_context(
+                risk="extreme", risk_source="default", current_phase="implementation"
+            )
+        with self.assertRaises(TaskContextError):
+            build_risk_context(
+                risk="low", risk_source="inferred", current_phase="implementation"
+            )
+
+    def test_omitting_the_block_renders_a_byte_identical_spec(self) -> None:
+        """The compatibility guarantee for every existing caller."""
+        boundary = self.boundary()
+        self.assertEqual(
+            render_task_spec("base", boundary),
+            render_task_spec("base", boundary, None, None, None),
+        )
+        self.assertNotIn(RISK_SPEC_HEADER, render_task_spec("base", boundary))
+
+    def test_the_block_round_trips_through_the_rendered_spec(self) -> None:
+        context = build_risk_context(
+            risk="low", risk_source="explicit", current_phase="implementation"
+        )
+        spec = render_task_spec("base", self.boundary(), None, None, context)
+        self.assertEqual(parse_risk_profile(spec), context)
+        self.assertEqual(parse_risk_profile_keys(spec), RISK_CONTEXT_KEYS)
+
+    def test_parsing_a_spec_without_a_block_is_an_error_but_keys_are_empty(self) -> None:
+        spec = render_task_spec("base", self.boundary())
+        self.assertEqual(parse_risk_profile_keys(spec), ())
+        with self.assertRaises(TaskContextError):
+            parse_risk_profile(spec)
 
 
 if __name__ == "__main__":

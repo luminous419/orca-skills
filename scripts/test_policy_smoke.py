@@ -7,6 +7,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from dataclasses import replace
 from unittest import mock
 
 from scripts.skill_policy import evaluate_invocation, load_policy_contract
@@ -267,6 +268,90 @@ class PolicySmokeTests(unittest.TestCase):
                     self.assertEqual([decision.worker], [worker])
                     self.assertEqual([decision.reviewer], [reviewer])
 
+    # ---- OS-3 risk parameter (T-5, T-6, T-6a, T-7, T-8) -------------------------
+
+    ORCHESTRATION = REPO_ROOT / "orca-worker-reviewer-orchestration" / "SKILL.md"
+    LOOP = REPO_ROOT / "orca-worker-reviewer-loop" / "SKILL.md"
+
+    def orchestration(self, suffix: str):
+        return self.evaluate(self.ORCHESTRATION, suffix)
+
+    def test_risk_defaults_to_high_when_omitted(self) -> None:
+        decision = self.orchestration(" phases=implementation 구현해줘")
+        self.assertEqual(decision.status, "VALID")
+        self.assertEqual(decision.risk, "high")
+        self.assertEqual(decision.risk_source, "default")
+
+    def test_explicit_risk_overrides_the_default(self) -> None:
+        """T-5."""
+        for value, expected in (("low", "low"), ("medium", "medium"), ("high", "high")):
+            with self.subTest(value=value):
+                decision = self.orchestration(
+                    f" risk={value} phases=implementation 구현해줘"
+                )
+                self.assertEqual(decision.status, "VALID")
+                self.assertEqual(decision.risk, expected)
+                self.assertEqual(decision.risk_source, "explicit")
+
+    def test_invalid_risk_fails_closed(self) -> None:
+        """T-6. Every value here is still not a level AFTER case folding, and the
+        empty explicit value is one of them: `\S*` matches `risk=` with nothing
+        after it, so the key is recognized and "" simply is not a member."""
+        for suffix in (
+            " risk=extreme phases=implementation 구현해줘",
+            " risk=1 phases=implementation 구현해줘",
+            " risk=lo phases=implementation 구현해줘",
+            " risk=low,high phases=implementation 구현해줘",
+            " risk=none phases=implementation 구현해줘",
+            " risk= phases=implementation 구현해줘",
+            " phases=implementation 구현해줘 risk=",
+        ):
+            with self.subTest(invocation=suffix):
+                decision = self.orchestration(suffix)
+                self.assertEqual(decision.status, "BLOCKED")
+                self.assertEqual(decision.reason, "INVALID_RISK")
+                self.assertFalse(decision.should_execute)
+                self.assertEqual(decision.risk_source, "explicit")
+
+    def test_omission_and_an_empty_explicit_value_are_different(self) -> None:
+        """T-6a. The two cases side by side, so they can never be conflated: an
+        omitted risk is the default, an explicitly empty one fails closed."""
+        omitted = self.orchestration(" phases=implementation 구현해줘")
+        empty = self.orchestration(" risk= phases=implementation 구현해줘")
+        self.assertEqual((omitted.status, omitted.risk, omitted.risk_source),
+                         ("VALID", "high", "default"))
+        self.assertEqual((empty.status, empty.reason), ("BLOCKED", "INVALID_RISK"))
+
+    def test_a_risk_token_never_reaches_natural_language_phase_detection(self) -> None:
+        """T-6a, second half: the token is stripped from the body before it is
+        scanned, so it can never be read as request prose."""
+        decision = self.orchestration(" risk=low phases=implementation 구현해줘")
+        self.assertEqual(decision.phases, ("implementation",))
+        self.assertEqual(decision.phase_source, "explicit")
+
+    def test_risk_values_are_case_folded(self) -> None:
+        """T-7. Non-empty values only, deliberately disjoint from T-6. A trailing
+        space terminates the token; it does not invalidate the value."""
+        for suffix, expected in (
+            (" risk=HIGH phases=implementation 구현해줘", "high"),
+            (" risk=High phases=implementation 구현해줘", "high"),
+            (" risk=Medium phases=implementation 구현해줘", "medium"),
+            (" risk=LOW  phases=implementation 구현해줘", "low"),
+        ):
+            with self.subTest(invocation=suffix):
+                decision = self.orchestration(suffix)
+                self.assertEqual(decision.status, "VALID")
+                self.assertEqual(decision.risk, expected)
+                self.assertEqual(decision.risk_source, "explicit")
+
+    def test_the_loop_skill_has_no_risk_axis(self) -> None:
+        """T-8. A `risk=` token on the loop skill is not a parameter at all: it is
+        left in the request body, exactly as before OS-3."""
+        decision = self.evaluate(self.LOOP, " risk=low phases=implementation 구현해줘")
+        self.assertEqual(decision.status, "VALID")
+        self.assertIsNone(decision.risk)
+        self.assertIsNone(decision.risk_source)
+
     def test_two_skills_have_identical_contracts(self) -> None:
         contracts = [load_policy_contract(path) for path in SKILL_PATHS]
         self.assertEqual(contracts[0], contracts[1])
@@ -301,7 +386,30 @@ class PolicySmokeTests(unittest.TestCase):
         for suffix in suffixes:
             with self.subTest(invocation=suffix):
                 decisions = [self.evaluate(path, suffix) for path in SKILL_PATHS]
-                self.assertEqual(decisions[0], decisions[1])
+                # OS-3 T-8. Whole-object equality is no longer the right claim: risk
+                # is orchestration-only, so the orchestration decision resolves a
+                # level and the loop decision resolves None. That asymmetry IS the
+                # requirement. The shared-policy equality survives over a projection
+                # that drops only the intentional fields, and two new assertions pin
+                # the asymmetry itself -- strictly more than the single assertEqual.
+                shared = [
+                    replace(decision, risk=None, risk_source=None)
+                    for decision in decisions
+                ]
+                self.assertEqual(shared[0], shared[1])
+                # The loop skill NEVER resolves a risk, on any path.
+                self.assertIsNone(decisions[0].risk)
+                self.assertIsNone(decisions[0].risk_source)
+                # The orchestration skill resolves one wherever the gate is reached.
+                # HELP returns before any parameter is read, and a BLOCKED decision
+                # from an earlier gate (agent/max-iterations) also returns first --
+                # both legitimately carry None, so the strong assertion is made where
+                # the decision actually got that far.
+                if decisions[1].status == "VALID":
+                    self.assertEqual(decisions[1].risk, "high")
+                    self.assertEqual(decisions[1].risk_source, "default")
+                else:
+                    self.assertIn(decisions[1].risk, (None, "high"))
 
 
 if __name__ == "__main__":
