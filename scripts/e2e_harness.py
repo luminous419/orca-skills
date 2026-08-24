@@ -16,9 +16,20 @@ from pathlib import Path
 
 from scripts.quality_profile import resolve_quality_profile
 from scripts.skill_policy import load_risk_contract
+from scripts.agent_profile import (
+    RUNTIME_LOOP,
+    RUNTIME_ORCHESTRATION,
+    AgentProfileError,
+    materialize_run_routing,
+    select_agent_profile,
+)
 from scripts.task_context import (
+    AGENT_ROUTING_SPEC_HEADER,
+    build_agent_routing_context,
+    parse_agent_routing,
     RISK_CONTEXT_KEYS,
     RISK_SPEC_HEADER,
+    FINAL_REVIEW_PHASE,
     build_quality_gate_context,
     build_risk_context,
     parse_quality_gate,
@@ -191,6 +202,11 @@ class SessionEvent:
     # final_review record. Contains no absolute paths, so it cannot reintroduce the
     # drill_down non-determinism this docstring warns about above.
     risk_profile: tuple[tuple[str, str], ...] = ()
+    # OS-4: the routing block parsed back OUT of the dispatched spec, the same way
+    # quality_gate and risk_profile are. () for every legacy dispatch -- a run with
+    # no `profile=` renders no routing block at all, so an empty tuple here is the
+    # assertion a compatibility test binds to rather than a placeholder.
+    agent_routing: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -267,6 +283,11 @@ class WorkflowRunResult:
     risk: str | None = None
     risk_source: str | None = None
     reviewer_gates_skipped: list[str] = field(default_factory=list)
+    # OS-4 reporting (never input). () for a run that selected no profile -- the
+    # final report of such a run must not grow an AGENT_PROFILE line, not even one
+    # reading "none", so an empty tuple here is the absence itself rather than a
+    # placeholder standing in for it.
+    agent_profile_report: tuple[str, ...] = ()
 
 
 def _parse_choice(output: str, field_name: str, allowed: set[str]) -> str:
@@ -374,6 +395,16 @@ def _parsed_quality_gate(spec: str) -> tuple[tuple[str, str], ...]:
     payload can answer it.
     """
     return tuple(sorted(parse_quality_gate(spec).items()))
+
+
+def _parsed_agent_routing(spec: str) -> tuple[tuple[str, str], ...]:
+    """The routing block parsed back out of a rendered spec; () when absent.
+
+    Absent is the normal answer: only a run that selected a profile renders one.
+    """
+    if AGENT_ROUTING_SPEC_HEADER not in spec:
+        return ()
+    return tuple(sorted(parse_agent_routing(spec).items()))
 
 
 def _parsed_risk_profile(spec: str) -> tuple[tuple[str, str], ...]:
@@ -583,6 +614,7 @@ class E2EHarness:
         session_policy: str = "reuse",
         run_id: str = "run_e2e",
         risk: str | None = None,
+        agent_profile: str | None = None,
     ) -> None:
         self.contract = load_workflow_output_contract(skill_path)
         # OS-3. Resolved ONCE, from the skill this harness was constructed for,
@@ -607,6 +639,18 @@ class E2EHarness:
         # scenario must not change its dispatched Task specs because the checkout it
         # happens to run inside grew a `.orca/quality-profile.yaml`.
         self.quality_profile = resolve_quality_profile(workspace)
+        # OS-4: materialized ONCE, from this instance's own workspace, exactly like
+        # the quality profile above and for the same reason. None when no profile was
+        # selected -- and None is what makes every downstream site skip the routing
+        # block, the ledger identity and the evidence rows, so a profile-less run
+        # produces the bytes it produced before OS-4.
+        self.agent_profile_name = agent_profile
+        # Kept so run_workflow() can re-materialize for the scenario's full phase set
+        # once it knows what that set is -- the constructor cannot.
+        self._skill_path = skill_path
+        self.agent_routing = self._resolve_agent_routing(
+            skill_path, workspace, (self.phase,)
+        )
         # Provisioned immediately, under workspace (this instance's own scratch
         # directory) rather than the real repository's artifacts/ root, before the
         # first Worker/Reviewer subprocess -- run with cwd=workspace -- could be
@@ -676,6 +720,89 @@ class E2EHarness:
             current_phase=self.phase,
         )
 
+    def _resolve_agent_routing(
+        self, skill_path: Path, workspace: Path, requested_phases: tuple[str, ...]
+    ):
+        """Materialize this run's routing once, for EVERY requested phase.
+
+        `requested_phases` is the whole set the run will execute, not the phase this
+        instance happens to be pointed at. A single-phase materialization looks right
+        for a `.run()` call and is wrong for `run_workflow()`: the phase clones share
+        this object by reference, so any phase missing from it would render as
+        not_applicable in that phase's own dispatch.
+
+        Reads the profile from `workspace`, never the real repository or the real
+        home directory: a deterministic scenario must not change what it dispatches
+        because the checkout it happens to run inside grew an agent-profiles.yaml.
+        """
+        if self.agent_profile_name is None:
+            return None
+        selection = select_agent_profile(
+            self.agent_profile_name, project_root=workspace, home=workspace
+        )
+        if not selection.is_selected:
+            raise AgentProfileError(
+                f"agent profile {self.agent_profile_name!r}: {selection.error}",
+                reason=selection.reason,
+            )
+        return materialize_run_routing(
+            runtime=(
+                RUNTIME_LOOP
+                if skill_path.parent.name.endswith("-loop")
+                else RUNTIME_ORCHESTRATION
+            ),
+            selection=selection,
+            requested_phases=requested_phases,
+            risk=self.risk,
+        )
+
+    def agent_routing_context(self) -> dict[str, str] | None:
+        """The routing block both fake agents receive this phase, or None.
+
+        Same one-call-both-roles shape as quality_gate() and risk_context(). None on
+        the legacy path, and render_task_spec() then omits the block entirely.
+        """
+        if self.agent_routing is None:
+            return None
+        return build_agent_routing_context(
+            routing=self.agent_routing, current_phase=self.phase
+        )
+
+    def final_review_routing_context(self) -> dict[str, str] | None:
+        """The routing block a Final Review dispatch receives, or None.
+
+        Built against the final_review slot rather than a workflow phase, so
+        `final_reviewer` carries the resolved command and the phase roles read
+        not_applicable -- a Final Review attempt has no Worker.
+        """
+        if self.agent_routing is None:
+            return None
+        return build_agent_routing_context(
+            routing=self.agent_routing, current_phase=FINAL_REVIEW_PHASE
+        )
+
+    def agent_routing_report_lines(self) -> tuple[str, ...]:
+        """The conditional final-report evidence, or () when no profile was selected.
+
+        () is not a formatting detail: a profile-less run's final report must not grow
+        an `AGENT_PROFILE:` line, not even one reading "none".
+        """
+        if self.agent_routing is None:
+            return ()
+        lines = [
+            f"AGENT_PROFILE: {self.agent_routing.profile_name} "
+            f"({self.agent_routing.profile_source})",
+            "AGENT_ROUTING:",
+        ]
+        for entry in self.agent_routing.entries:
+            command = entry.command or "unresolved"
+            suffix = "" if entry.required else ", optional"
+            lines.append(
+                f"  {entry.phase} {entry.role}={command} "
+                f"({entry.origin or 'none'}{suffix})"
+            )
+        return tuple(lines)
+
     def allocate_session(
         self,
         role: str = "",
@@ -714,6 +841,7 @@ class E2EHarness:
         reviewer_context_keys: tuple[str, ...] = (),
         quality_gate: tuple[tuple[str, str], ...] = (),
         risk_profile: tuple[tuple[str, str], ...] = (),
+        agent_routing: tuple[tuple[str, str], ...] = (),
     ) -> SessionEvent:
         """Append-only: allocate (or reuse) this role's session and record the fact."""
         session_id, created = self.allocate_session(
@@ -730,6 +858,7 @@ class E2EHarness:
             reviewer_context_keys=reviewer_context_keys,
             quality_gate=quality_gate,
             risk_profile=risk_profile,
+            agent_routing=agent_routing,
         )
         self.sessions.append(event)
         return event
@@ -807,6 +936,7 @@ class E2EHarness:
                 None,
                 self.quality_gate(),
                 self.risk_context(),
+                self.agent_routing_context(),
             )
             worker_command = [
                 sys.executable,
@@ -846,6 +976,7 @@ class E2EHarness:
                 task_boundary=tuple(sorted(worker_boundary.items())),
                 quality_gate=_parsed_quality_gate(worker_spec),
                 risk_profile=_parsed_risk_profile(worker_spec),
+                agent_routing=_parsed_agent_routing(worker_spec),
             )
             worker = subprocess.run(
                 worker_command,
@@ -990,6 +1121,7 @@ class E2EHarness:
                 reviewer_context,
                 self.quality_gate(),
                 self.risk_context(),
+                self.agent_routing_context(),
             )
             reviewer_command = [
                 sys.executable,
@@ -1020,6 +1152,7 @@ class E2EHarness:
                 reviewer_context_keys=tuple(sorted(reviewer_context)),
                 quality_gate=_parsed_quality_gate(reviewer_spec),
                 risk_profile=_parsed_risk_profile(reviewer_spec),
+                agent_routing=_parsed_agent_routing(reviewer_spec),
             )
             hashes_before = _hash_files(self.protected_artifacts)
             reviewer = subprocess.run(
@@ -1154,7 +1287,34 @@ class E2EHarness:
         ]
         if self.protected_artifacts:
             command.extend(["--artifact", str(self.protected_artifacts[0])])
-        self._record_session("final_review", attempt)
+        # OS-4: the Final Reviewer's own routing reaches the dispatch and the session
+        # record. Rendered ONLY when a profile was selected -- a legacy Final Review
+        # attempt keeps the exact argv it had before OS-4, with no --task-spec.
+        final_routing = self.final_review_routing_context()
+        recorded_routing: tuple[tuple[str, str], ...] = ()
+        if final_routing is not None:
+            final_spec = render_task_spec(
+                f"final_review attempt {attempt}",
+                build_task_boundary(
+                    current_role="final_reviewer",
+                    current_phase=FINAL_REVIEW_PHASE,
+                    current_iteration=attempt,
+                    artifact_contract=phase_artifact_contract(
+                        role="final_reviewer",
+                        phase=FINAL_REVIEW_PHASE,
+                        run_id=self.run_id,
+                    ),
+                ),
+                None,
+                None,
+                None,
+                final_routing,
+            )
+            command.extend(["--task-spec", final_spec])
+            recorded_routing = _parsed_agent_routing(final_spec)
+        self._record_session(
+            "final_review", attempt, agent_routing=recorded_routing
+        )
         hashes_before = _hash_files(self.protected_artifacts)
         completed = subprocess.run(
             command,
@@ -1244,6 +1404,7 @@ class E2EHarness:
                 risk=self.risk,
                 risk_source=self.risk_source,
                 reviewer_gates_skipped=list(reviewer_gates_skipped),
+                agent_profile_report=self.agent_routing_report_lines(),
             )
 
         # The only write of session_policy in this run: every _phase_harness clone
@@ -1280,6 +1441,15 @@ class E2EHarness:
         # Re-provisioned here because run_id may differ from the constructor's
         # default: the phase loop below dispatches into this directory immediately.
         ensure_run_artifact_root(self.run_id, base=self.workspace)
+        # OS-4: the routing for THIS workflow's whole requested phase set, resolved
+        # once here -- before the first dispatch, which is this harness's equivalent
+        # of "before the Run exists". The constructor could only see one phase; the
+        # clones below share this object by reference, so every phase gate,
+        # correction, revalidation and the Final Review read the same resolution and
+        # none of them re-reads the profile file.
+        self.agent_routing = self._resolve_agent_routing(
+            self._skill_path, self.workspace, scenario.phases
+        )
 
         def gate_attempts(result: WorkflowResult) -> int:
             """SKILL.md section 13: a gate attempt is a Reviewer attempt at

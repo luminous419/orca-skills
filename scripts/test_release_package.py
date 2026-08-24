@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import shutil
 import tarfile
 import tempfile
@@ -19,6 +20,126 @@ from release_manifest import (
     verify_source_tree,
 )
 from verify_package import verify_archive
+
+
+SKILL_NAMES = ("orca-worker-reviewer-loop", "orca-worker-reviewer-orchestration")
+
+
+class InstalledSkillPortabilityTests(unittest.TestCase):
+    """OS-4 verification item 15: the Agent Profile contract must survive the
+    documented install.
+
+    INSTALL.md section 4 installs a skill with `cp -R <skill-dir> ~/.claude/skills/`.
+    That copies SKILL.md, templates/, reviews/ and (orchestration only)
+    tools/run_logging.py -- and NOT the repository's scripts/. DESIGN D3 decided the
+    profile loader does not need to run inside an installed skill: the Coordinator
+    follows the SKILL.md prose contract, the same way it already does for the quality
+    profile, whose loader is likewise repository-only.
+
+    That decision is only sound if the installed SKILL.md is self-contained. These
+    tests hold it to that: whatever the Agent Profile section tells a Coordinator to
+    do must be doable with the files `cp -R` actually delivered.
+    """
+
+    def install(self, root: Path, skill_name: str) -> Path:
+        """Reproduce INSTALL.md section 4 exactly: one `cp -R` of the skill dir."""
+        target = root / "skills"
+        target.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(REPO_ROOT / skill_name, target / skill_name)
+        return target / skill_name
+
+    def agent_profile_section(self, skill_md: Path) -> str:
+        text = skill_md.read_text(encoding="utf-8")
+        start = text.index("## Agent Profile")
+        end = text.index("\n## ", start + 1)
+        return text[start:end]
+
+    def test_the_install_delivers_what_each_skill_declares(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for skill_name in SKILL_NAMES:
+                with self.subTest(skill=skill_name):
+                    installed = self.install(root, skill_name)
+
+                    self.assertTrue((installed / "SKILL.md").is_file())
+                    self.assertTrue((installed / "templates").is_dir())
+                    self.assertTrue((installed / "reviews").is_dir())
+                    if skill_name.endswith("orchestration"):
+                        self.assertTrue(
+                            (installed / "tools" / "run_logging.py").is_file()
+                        )
+
+    def test_the_agent_profile_contract_survives_the_install(self) -> None:
+        """The section exists in the installed copy, with both source paths."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for skill_name in SKILL_NAMES:
+                with self.subTest(skill=skill_name):
+                    installed = self.install(root, skill_name)
+                    section = self.agent_profile_section(installed / "SKILL.md")
+
+                    self.assertIn(".orca/agent-profiles.yaml", section)
+                    self.assertIn("~/.orca/agent-profiles.yaml", section)
+                    self.assertIn("profile=<name>", installed.joinpath("SKILL.md").read_text(encoding="utf-8"))
+
+    def test_the_agent_profile_contract_needs_no_uninstalled_file(self) -> None:
+        """D3's condition. If this section ever tells a Coordinator to run a
+        repository script, the documented install stops being sufficient and either
+        the file must ship inside the skill (as tools/run_logging.py does) or the
+        prose must stop depending on it."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for skill_name in SKILL_NAMES:
+                with self.subTest(skill=skill_name):
+                    installed = self.install(root, skill_name)
+                    section = self.agent_profile_section(installed / "SKILL.md")
+
+                    self.assertNotIn("scripts/", section)
+                    for module in ("agent_profile.py", "final_report.py"):
+                        self.assertNotIn(module, section)
+
+    def test_every_script_the_installed_skill_names_is_installed(self) -> None:
+        """Whole-document version of the check above: any `tools/<file>` the SKILL.md
+        references must exist in the installed tree."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for skill_name in SKILL_NAMES:
+                with self.subTest(skill=skill_name):
+                    installed = self.install(root, skill_name)
+                    text = (installed / "SKILL.md").read_text(encoding="utf-8")
+
+                    for match in re.findall(r"tools/[A-Za-z0-9_.-]+\.py", text):
+                        self.assertTrue(
+                            (installed / match).is_file(),
+                            f"{skill_name}: SKILL.md names {match}, "
+                            "which the documented install does not deliver",
+                        )
+
+    def test_the_release_archive_carries_the_new_os4_modules(self) -> None:
+        """The source release is the other distribution path, and it DOES carry
+        scripts/. A repository consumer must get the loader and the renderer."""
+        files = {
+            path.relative_to(REPO_ROOT).as_posix() for path in verify_source_tree()
+        }
+
+        for expected in (
+            "scripts/agent_profile.py",
+            "scripts/final_report.py",
+            "scripts/test_agent_profile.py",
+            "scripts/fixtures/legacy_baseline/pre_os4_artifacts.json",
+        ):
+            with self.subTest(path=expected):
+                self.assertIn(expected, files)
+
+    def test_the_example_profile_is_repository_only(self) -> None:
+        """`.orca/` is deliberately outside the package: shipping it would package a
+        user's real profile. The example stays a repository reference."""
+        files = {
+            path.relative_to(REPO_ROOT).as_posix() for path in verify_source_tree()
+        }
+
+        self.assertTrue((REPO_ROOT / ".orca" / "agent-profiles.example.yaml").is_file())
+        self.assertFalse(any(path.startswith(".orca/") for path in files))
 
 
 class ReleasePackageTests(unittest.TestCase):

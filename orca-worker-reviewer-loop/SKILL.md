@@ -101,6 +101,7 @@ worker=<agent-command>
 reviewer=<agent-command>
 max-iterations=<integer>
 phases=<phase1,phase2,...>
+profile=<name>
 ```
 
 예:
@@ -174,6 +175,14 @@ DEFAULT_MAX_ITERATIONS = 5
     ]
   },
   "known_agent_commands": ["claude", "codex", "claude-glm", "claude-gemma"],
+  "agent_profile": {
+    "parameter": "profile",
+    "project_source": ".orca/agent-profiles.yaml",
+    "user_source": "~/.orca/agent-profiles.yaml",
+    "schema_versions": [1],
+    "source_precedence": ["project_local", "user_global"],
+    "merge": "whole_definition"
+  },
   "agent_command_pattern": "[A-Za-z0-9._-]+",
   "custom_agent_command_pattern": "(?:claude|codex)-[A-Za-z0-9._-]+",
   "agent_launch_arguments": [],
@@ -211,7 +220,10 @@ DEFAULT_MAX_ITERATIONS = 5
     "invalid_phase": "INVALID_PHASE",
     "invalid_phase_order": "INVALID_PHASE_ORDER",
     "phase_conflict": "PHASE_CONFLICT",
-    "unsupported_phase_combination": "UNSUPPORTED_PHASE_COMBINATION"
+    "unsupported_phase_combination": "UNSUPPORTED_PHASE_COMBINATION",
+    "invalid_agent_profile": "INVALID_AGENT_PROFILE",
+    "unknown_agent_profile": "UNKNOWN_AGENT_PROFILE",
+    "agent_role_unresolved": "AGENT_ROLE_UNRESOLVED"
   }
 }
 ```
@@ -251,6 +263,108 @@ REASON: AGENT_NOT_ALLOWED
 
 따라서 PATH에 존재하더라도 `bash`, `sh`, `python3`, `env` 같은 일반 shell/interpreter
 command는 agent로 승인하지 않는다.
+
+## Agent Profile
+
+`profile=<name>`는 named Agent Profile을 선택한다. Agent Profile은 **누가 실행하는가**만 정한다 —
+requested phase 집합, risk level, gate/correction/revalidation lifecycle, Final Review 요구,
+PASS/FAIL 기준을 바꾸지 않는다.
+
+profile 파일은 두 곳에서 읽는다.
+
+```text
+project-local  <project>/.orca/agent-profiles.yaml
+user-global    ~/.orca/agent-profiles.yaml
+```
+
+같은 이름이 양쪽에 있으면 **project-local 정의가 통째로 이긴다.** field-level merge는 하지 않는다 —
+project-local이 생략한 필드를 user-global에서 빌려오지 않는다.
+
+schema는 다음이 전부다.
+
+```yaml
+version: 1
+profiles:
+  <name>:
+    defaults:
+      worker: <agent-command>
+      reviewer: <agent-command>
+    phases:
+      <phase>:
+        worker: <agent-command>
+        reviewer: <agent-command>
+    final_review:
+      reviewer: <agent-command>
+```
+
+`<phase>`는 이 Skill이 지원하는 7개 phase(analysis, plan, design, implementation, test, bugfix,
+refactoring)뿐이다. profile에 어떤 phase의 routing이 있다는 것이 그 phase를 실행한다는 뜻은 아니다 —
+실행 대상은 `phases` contract만 정한다.
+
+role별 resolution 순서는 다음과 같다. phase role과 Final Reviewer는 **1순위가 서로 반대**다.
+
+```text
+Phase Worker   : explicit worker   > profile.phases.<phase>.worker   > profile.defaults.worker   > unresolved
+Phase Reviewer : explicit reviewer > profile.phases.<phase>.reviewer > profile.defaults.reviewer > unresolved
+Final Reviewer : profile.final_review.reviewer > explicit reviewer   > profile.defaults.reviewer > unresolved
+```
+
+명시적으로 선택된 profile은 **self-contained resolution domain**이다. 다른 profile이나 profile 없는
+경로의 default에서 빠진 필드를 채우지 않는다.
+
+`profile`을 생략하면 기존 동작을 그대로 유지한다. profile 파일을 읽지 않으며 `worker=`/`reviewer=`와
+default 처리, `WORKER_REVIEWER_MUST_DIFFER` 검사가 지금과 동일하게 적용된다.
+
+`profile`이 명시된 경우 Run/Task/Dispatch를 만들기 **전에** 다음 순서로 처리한다.
+
+```text
+1. profile source 읽기 + schema 검증   (여기서는 command를 검사하지 않는다)
+2. requested phase와 Final Review에 대한 routing materialize
+3. required role의 resolved command에만 token -> allowlist -> PATH 검사
+4. required role이 전부 resolve되었는지 검사
+5. 위가 모두 통과한 경우에만 Run 생성
+```
+
+3번의 검사 대상은 **required role뿐**이다. 이 run이 dispatch하지 않는 role — requested phase 밖의
+routing이 대표적이다 — 의 command는 검사하지 않으며 run을 막지 않는다. required role은 이 run에서
+실행될 수 있는 command 집합과 정확히 같으므로 trust boundary에는 빈틈이 없다.
+
+profile을 arbitrary shell execution 통로로 쓰지 않는다. resolved command에는 §5의 기존 agent
+command 정책(safe token / trust boundary / PATH resolution)을 그대로 적용하며 인자를 붙이지 않는다.
+
+실패는 전부 Run/Task/Dispatch 생성 이전의 validation failure이며 correction loop 대상이 아니다.
+
+```text
+STATUS: BLOCKED
+REASON: INVALID_AGENT_PROFILE
+```
+
+```text
+STATUS: BLOCKED
+REASON: UNKNOWN_AGENT_PROFILE
+```
+
+```text
+STATUS: BLOCKED
+REASON: AGENT_ROLE_UNRESOLVED
+```
+
+`INVALID_AGENT_PROFILE`은 파일이 존재하지만 malformed YAML / 미지원 `version` / unknown 또는 중복 키 /
+unknown phase key / 비어 있거나 문자열이 아닌 command 값 / 읽을 수 없는 경로인 경우다.
+`UNKNOWN_AGENT_PROFILE`은 그 이름의 profile이 두 source 어디에도 없는 경우이며, 값이 없는
+`profile=`도 생략이 아니라 명시적으로 잘못된 값이므로 여기에 해당한다.
+`AGENT_ROLE_UNRESOLVED`는 required role이 precedence 체인을 모두 거쳐도 command를 얻지 못한 경우다.
+
+resolved routing은 이 run 동안 immutable하다. profile 파일이 run 중 변경되어도 correction과
+re-review는 profile을 다시 읽지 않고 최초 resolution을 그대로 사용한다.
+
+이 Skill에는 risk 축이 없으므로 모든 phase에서 Reviewer가 required다. Worker만 정의한 profile은 이
+Skill에서는 언제나 `AGENT_ROLE_UNRESOLVED`로 막힌다.
+
+이 Skill에는 run 전체를 대상으로 하는 최종 Reviewer gate가 없다. `final_review.reviewer`는 schema에
+존재하는 **알려진 키이므로 unknown key가 아니며**, 이 Skill은 그 값을 읽지 않고 무시한다. 하나의
+profile 파일이 두 Skill을 모두 서비스할 수 있어야 하기 때문이다. 그 role에 대한 evidence도 이
+Skill에는 해당하지 않는다.
 
 ## 6. Worker and Reviewer Must Differ
 
@@ -322,6 +436,10 @@ Worker Session != Reviewer Session
 ```
 
 동일 업무의 여러 iteration에서는 역할별 기존 session을 재사용할 수 있으나 역할을 바꾸지 않는다.
+
+재사용 조건에는 agent identity도 포함된다. 이전 session과 다음 Task의 **resolved role command**가
+같을 때에만 재사용하며, resolved role command가 달라지면 같은 role이라도 새 session을 사용한다.
+Agent Profile이 선택된 run에서는 phase마다 resolved command가 달라질 수 있다.
 
 ## 9. No Custom CLI Agent Dependency
 
@@ -559,6 +677,15 @@ CURRENT_ITERATION
 WORKER_AGENT
 REVIEWER_AGENT
 ```
+
+`profile`이 선택된 run에서는 다음 두 값도 함께 보존한다. profile이 없는 run에서는 존재하지 않는다.
+
+```text
+AGENT_PROFILE
+AGENT_ROUTING
+```
+
+보존된 routing은 그 실행 동안 immutable하다. iteration이 바뀌어도 profile 파일을 다시 읽지 않는다.
 
 Iteration > 1:
 
@@ -915,6 +1042,22 @@ RESULT: PASS
 
 ## Non-Blocking Recommendations
 ```
+
+`profile`이 선택된 run에서만 최종 보고에 다음 두 줄을 추가한다. profile이 없는 run의 최종 보고는
+지금과 문자 단위로 동일하며 이 두 줄이 존재하지 않는다 — `AGENT_PROFILE: none`이라고 적지도 않는다.
+
+```text
+AGENT_PROFILE: <name> (<project_local|user_global>)
+AGENT_ROUTING:
+  <phase>  worker=<command> (<origin>)  reviewer=<command> (<origin>[, optional])
+```
+
+`AGENT_ROUTING:`에는 requested phase 전체의 Worker/Reviewer가 나타나며, 그 risk level에서 dispatch되지
+않는 optional Reviewer도 `optional` 표시와 함께 기록한다. optional은 dispatch 요건이지 기록 면제가
+아니다. profile이 선택된 run에서는 `WORKER:` / `REVIEWER:` 줄이 phase마다 달라질 수 있으므로
+`(per phase — see AGENT_ROUTING)`을 담고, profile이 없는 run에서는 지금과 같은 단일 값을 유지한다.
+
+이 Skill에는 그 gate가 없으므로 `AGENT_ROUTING:`에 final reviewer 줄이 존재하지 않는다.
 
 ## 29. Core Invariants
 

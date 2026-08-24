@@ -165,6 +165,130 @@ logs" section for the exact call points. The final `run-status` row records one 
 Out of scope here: retention/archival of old runs' logs (OS-8) and richer analysis — bottleneck
 detection, aggregate metrics, dashboards (OS-7). This is raw evidence, not a report.
 
+## Agent Profile
+
+A named Agent Profile decides **who** executes each phase. It does not decide what runs
+(`phases`), how strongly the work is reviewed (`risk`), or what counts as PASS (the project
+quality profile). Selecting a profile cannot turn a review off, add a phase, or make a
+failing gate pass.
+
+```text
+/orca-worker-reviewer-orchestration profile=diverse phases=design,implementation <request>
+```
+
+Both skills support it. They read the same file and the same resolution rules, and differ
+only in which routing keys they can consume.
+
+### Location and schema
+
+Profiles are read from two places, highest precedence first:
+
+```text
+<project>/.orca/agent-profiles.yaml
+~/.orca/agent-profiles.yaml
+```
+
+A name present in both is taken from the project-local file **as a whole definition**.
+Fields are never merged across the two files, so the profile you can read in one place is
+the profile that ran. `.orca/agent-profiles.example.yaml` in this repository is a starting
+point.
+
+```yaml
+version: 1
+
+profiles:
+  diverse:
+    defaults:
+      worker: claude
+      reviewer: codex
+    phases:
+      implementation:
+        worker: codex
+        reviewer: codex
+    final_review:
+      reviewer: codex
+```
+
+`phases` may name any of the seven workflow phases — the same seven the skills already
+support. Declaring routing for a phase does not run that phase; `phases=` alone decides
+that.
+
+### Resolution
+
+Three chains, and the phase roles disagree with the final reviewer about which source wins
+first. That asymmetry is intended: a profile that names a final reviewer means it, while an
+explicit `reviewer=` on the command line is about the phase reviewers.
+
+```text
+phase worker    explicit worker=      > phases.<phase>.worker   > defaults.worker
+phase reviewer  explicit reviewer=    > phases.<phase>.reviewer > defaults.reviewer
+final reviewer  final_review.reviewer > explicit reviewer=      > defaults.reviewer
+```
+
+A selected profile is a self-contained resolution domain. It never borrows a missing field
+from another profile or from the defaults a profile-less run would have used.
+
+### Which roles must resolve
+
+Risk decides, and the answer differs per skill:
+
+| role | orchestration | loop |
+|---|---|---|
+| phase Worker | required at every risk | required |
+| phase Reviewer | required at MEDIUM/HIGH, optional at LOW | always required |
+| final reviewer | required at every risk | not applicable |
+
+So a profile defining only a Worker and a final reviewer is valid for a LOW-risk
+orchestration run, and never valid for the loop skill. This computation *reads* the settled
+phases and risk; it changes neither.
+
+### What is checked, and when
+
+Everything happens before a Run, a Task or a Dispatch exists:
+
+```text
+1. read the profile sources and validate the schema   (no command is judged here)
+2. materialize routing for the requested phases and the final review
+3. token -> allowlist -> PATH, over the REQUIRED roles only
+4. check that every required role resolved
+5. only then create the Run
+```
+
+Step 3 deliberately checks required roles and nothing else. A command in a role this run
+will never dispatch — a phase outside the request, a LOW-risk phase Reviewer, the loop
+skill's `final_review.reviewer` — is not checked and cannot block the run. That leaves no
+gap in the trust boundary, because the required set is exactly the set of commands the run
+can execute.
+
+### Missing vs. malformed
+
+```text
+omitted            legacy behaviour, unchanged. The profile files are not read at all.
+profile=<unknown>  UNKNOWN_AGENT_PROFILE. `profile=` with no value is here too --
+                   an empty value is an explicit wrong answer, not an omission.
+malformed schema   INVALID_AGENT_PROFILE. Unknown or duplicate keys, an unknown phase,
+                   an unsupported version and a non-string command all land here.
+unresolved role    AGENT_ROLE_UNRESOLVED.
+```
+
+Every one of these blocks before any Run exists, in the same shape as `INVALID_PHASE` and
+`INVALID_RISK`. None of them is a correction-loop input.
+
+### Run-scoped and audited
+
+Routing is materialized once and is immutable for that run. Editing the profile file
+mid-run changes nothing: corrections, re-reviews and downstream revalidation all read the
+same resolution.
+
+Both skills record what they resolved — the profile name and source, the requested phases,
+each resolved command and where it came from. Optional roles are recorded too, because
+"not dispatched at this risk level" is a statement about the lifecycle, not permission to
+leave it out of the record. Nothing but command tokens and enumerations is written, so no
+secret, credential or environment value can reach the evidence.
+
+A run without `profile=` records none of this and renders no routing block, because its
+output must stay identical to a run from before the feature existed.
+
 ## Project Quality Profile
 
 The Reviewer gate is not a broad generic software-quality checklist. A verdict is

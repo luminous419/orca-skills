@@ -54,6 +54,13 @@ REQUIRED_ERROR_CODES = (
     "PHASE_CONFLICT",
     "PREVIOUS_PHASE_CHANGE_REQUIRED",
     "INVALID_MAX_ITERATIONS",
+    # OS-4. These three live in the SHARED policy contract rather than the
+    # orchestration-only anchor block: unlike the risk axis, both skills select a
+    # profile and both fail closed on one, so an anchor block would leave
+    # orca-worker-reviewer-loop with no contract for reporting its own failures.
+    "INVALID_AGENT_PROFILE",
+    "UNKNOWN_AGENT_PROFILE",
+    "AGENT_ROLE_UNRESOLVED",
 )
 
 USER_ABSOLUTE_PATH_PATTERNS = (
@@ -256,10 +263,16 @@ FINAL_REVIEW_CONTRACT: dict[str, tuple[str, ...]] = {
     ),
     "FINAL_REVIEW_COMPLETION_GATE": ("requested_phases_pass_and_final_review_pass",),
     # OS-3: the final gate does not vary with risk.
+    # OS-4: which command the Final Reviewer runs. The chain's first entry differs
+    # from the phase reviewer's on purpose -- a profile that names a final reviewer
+    # outranks an explicit `reviewer=`, which is about the phase reviewers.
+    "FINAL_REVIEW_AGENT_RESOLUTION": (
+        "agent_profile_final_review_then_explicit_then_defaults",
+    ),
     "FINAL_REVIEW_RISK_INDEPENDENCE": ("mandatory_and_identical_at_every_risk_level",),
 }
 
-FINAL_REVIEW_CONTRACT_MAX_LINES = 14    # was 13; the 14th key is OS-3's risk independence
+FINAL_REVIEW_CONTRACT_MAX_LINES = 15    # was 14; the 15th key is OS-4's agent resolution
 FINAL_REVIEW_SECTION_HEADING = "## 17. Final Adversarial Review"
 FINAL_REVIEW_SECTION_END = "\n## 18."
 # Rewritten by D-1.7 S-5: the pre-OS-3 wording anchored the anti-anchoring rule on a
@@ -402,6 +415,73 @@ RISK_PROSE_ANCHORS = (
     "BUGFIX / REFACTORING × risk",
 )
 RISK_PARAMETER_DOC_ANCHOR = "risk=<low|medium|high>"
+
+# ---- OS-4: the eighth orchestration-only anchor contract ------------------------
+# The risk block's rationale applies here only in part. The SHARED policy contract
+# owns everything both skills need (the parameter, the two source paths, the schema
+# version, the three error codes); this block owns what only the orchestration
+# runtime has -- Final Reviewer routing, the risk-aware required-role table, the
+# pre-Run gate order, and the evidence obligation. The value grammar is lowercase
+# snake tokens, which is why no path or error-code string can live here.
+AGENT_PROFILE_CONTRACT_BLOCK_PATTERN = re.compile(
+    r"####\s*Agent profile contract\s*\n(?P<body>.*?)```text\n(?P<values>.*?)\n```",
+    re.DOTALL,
+)
+AGENT_PROFILE_CONTRACT: dict[str, tuple[str, ...]] = {
+    "AGENT_PROFILE_PARAMETER": ("profile",),
+    "AGENT_PROFILE_SELECTION_STATES": ("omitted", "selected", "invalid"),
+    "AGENT_PROFILE_RESOLUTION_SCOPE": ("resolved_once_before_run_never_per_attempt",),
+    "AGENT_PROFILE_GATE_ORDER": (
+        "materialize",
+        "validate_commands",
+        "validate_required_roles",
+        "create_run",
+    ),
+    "AGENT_PROFILE_PHASE_WORKER_PRECEDENCE": ("explicit", "phase", "defaults"),
+    "AGENT_PROFILE_PHASE_REVIEWER_PRECEDENCE": ("explicit", "phase", "defaults"),
+    "AGENT_PROFILE_FINAL_REVIEWER_PRECEDENCE": ("final_review", "explicit", "defaults"),
+    "AGENT_PROFILE_SOURCE_PRECEDENCE": ("project_local", "user_global"),
+    "AGENT_PROFILE_MERGE": ("whole_definition_never_field_level",),
+    "AGENT_PROFILE_REQUIRED_ROLES_LOW": ("phase_worker", "final_reviewer"),
+    "AGENT_PROFILE_REQUIRED_ROLES_MEDIUM": (
+        "phase_worker",
+        "phase_reviewer",
+        "final_reviewer",
+    ),
+    "AGENT_PROFILE_REQUIRED_ROLES_HIGH": (
+        "phase_worker",
+        "phase_reviewer",
+        "final_reviewer",
+    ),
+    "AGENT_PROFILE_PATH_CHECK_SCOPE": ("required_roles_only",),
+    "AGENT_PROFILE_EVIDENCE": (
+        "profile_name",
+        "profile_source",
+        "requested_phases",
+        "resolved_commands",
+        "resolution_sources",
+    ),
+    "AGENT_PROFILE_SECRETS": ("never_recorded",),
+    "AGENT_PROFILE_RISK_DEPENDENCY": ("reads_settled_risk_never_modifies",),
+    "AGENT_PROFILE_QUALITY_AXIS": ("independent",),
+    "AGENT_PROFILE_LEGACY": ("omitted_profile_preserves_existing_behavior",),
+}
+AGENT_PROFILE_CONTRACT_MAX_LINES = 18
+AGENT_PROFILE_PARAMETER_DOC_ANCHOR = "profile=<name>"
+# The sentences that keep the two runtime differences from quietly disappearing from
+# the loop skill. Prose rather than an anchor block: orca-worker-reviewer-loop has no
+# anchor contracts at all, and adding its first one for two facts would be a heavier
+# structure than the facts need.
+LOOP_AGENT_PROFILE_PROSE_ANCHORS = (
+    "이 Skill에는 risk 축이 없으므로 모든 phase에서 Reviewer가 required다",
+    "이 Skill은 그 값을 읽지 않고 무시한다",
+)
+# Both skills must say that omitting the parameter changes nothing.
+AGENT_PROFILE_LEGACY_PROSE_ANCHOR = (
+    "`profile`을 생략하면 기존 동작을 그대로 유지한다"
+)
+# The required-only rule, in the prose a reader actually meets.
+AGENT_PROFILE_REQUIRED_ONLY_PROSE_ANCHOR = "검사 대상은 **required role뿐**이다"
 # Section 6 must say that risk chooses which graph NODES exist, never WHEN they are
 # created -- the sentence that keeps LOW from leaving an orphan ready Reviewer Task.
 RISK_TASK_GRAPH_PROSE_ANCHOR = "LOW에서는 Worker Task 하나만 만들고"
@@ -834,6 +914,11 @@ def validate_machine_readable_contracts(validation: Validation) -> None:
         known_commands = (
             raw_known_commands if isinstance(raw_known_commands, list) else []
         )
+        # OS-4 R11: this is about the LEGACY default PAIR only -- the two commands a
+        # profile-less invocation falls back to. It says nothing about a `defaults`
+        # block inside an agent profile, where worker and reviewer are allowed to be
+        # the same command (session separation is a different invariant, owned by the
+        # reuse gate's role condition).
         validation.check(
             defaults.get("worker") in known_commands
             and defaults.get("reviewer") in known_commands
@@ -917,6 +1002,9 @@ def validate_machine_readable_contracts(validation: Validation) -> None:
             "invalid_phase_order",
             "phase_conflict",
             "unsupported_phase_combination",
+            "invalid_agent_profile",
+            "unknown_agent_profile",
+            "agent_role_unresolved",
         }
         validation.check(
             set(errors) == required_error_keys
@@ -1652,6 +1740,102 @@ def validate_risk_profile_contract(validation: Validation) -> None:
     )
 
 
+def validate_agent_profile_contract(validation: Validation) -> None:
+    """The OS-4 anchor block, and the prose in both skills it indexes.
+
+    Reuses parse_anchor_contract rather than adding a ninth parser: this block has
+    no test coupling of its own, which is the condition that function's docstring
+    names for sharing one implementation.
+    """
+    skill_path = LIFECYCLE_SKILL_DIR / "SKILL.md"
+    if not skill_path.is_file():
+        return
+    skill_text = skill_path.read_text(encoding="utf-8")
+
+    parsed = parse_anchor_contract(skill_text, AGENT_PROFILE_CONTRACT_BLOCK_PATTERN)
+    validation.check(
+        parsed is not None,
+        f"{LIFECYCLE_SKILL_DIR.name}: agent profile contract block is missing or "
+        "malformed",
+    )
+    if parsed is None:
+        return
+    validation.check(
+        set(parsed) == set(AGENT_PROFILE_CONTRACT),
+        f"{LIFECYCLE_SKILL_DIR.name}: agent profile contract keys drifted",
+    )
+    validation.check(
+        parsed == AGENT_PROFILE_CONTRACT,
+        f"{LIFECYCLE_SKILL_DIR.name}: agent profile contract values drifted",
+    )
+    validation.check(
+        0
+        < anchor_contract_block_lines(skill_text, AGENT_PROFILE_CONTRACT_BLOCK_PATTERN)
+        <= AGENT_PROFILE_CONTRACT_MAX_LINES,
+        f"{LIFECYCLE_SKILL_DIR.name}: agent profile contract block exceeds "
+        f"{AGENT_PROFILE_CONTRACT_MAX_LINES} lines",
+    )
+
+    # Internal consistency: the two facts the runtime branches on. LOW is the level
+    # that makes a phase Reviewer optional, and it is the only one.
+    validation.check(
+        "phase_reviewer" not in parsed.get("AGENT_PROFILE_REQUIRED_ROLES_LOW", ()),
+        "AGENT_PROFILE_REQUIRED_ROLES_LOW must not require a phase reviewer",
+    )
+    validation.check(
+        all(
+            "phase_reviewer" in parsed.get(key, ())
+            for key in (
+                "AGENT_PROFILE_REQUIRED_ROLES_MEDIUM",
+                "AGENT_PROFILE_REQUIRED_ROLES_HIGH",
+            )
+        ),
+        "AGENT_PROFILE_REQUIRED_ROLES_MEDIUM/HIGH must require a phase reviewer",
+    )
+    validation.check(
+        all(
+            "final_reviewer" in parsed.get(key, ())
+            for key in (
+                "AGENT_PROFILE_REQUIRED_ROLES_LOW",
+                "AGENT_PROFILE_REQUIRED_ROLES_MEDIUM",
+                "AGENT_PROFILE_REQUIRED_ROLES_HIGH",
+            )
+        ),
+        "the final reviewer must be required at every risk level",
+    )
+    # The two chains disagree about their first entry on purpose. If they ever match,
+    # one of them has been "corrected" into the other.
+    validation.check(
+        parsed.get("AGENT_PROFILE_PHASE_REVIEWER_PRECEDENCE")
+        != parsed.get("AGENT_PROFILE_FINAL_REVIEWER_PRECEDENCE"),
+        "the phase reviewer and final reviewer precedence chains must differ",
+    )
+
+    for skill_dir in SKILL_DIRS:
+        text = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
+        validation.check(
+            AGENT_PROFILE_PARAMETER_DOC_ANCHOR in text,
+            f"{skill_dir.name}: missing the profile=<name> runtime parameter",
+        )
+        validation.check(
+            AGENT_PROFILE_LEGACY_PROSE_ANCHOR in text,
+            f"{skill_dir.name}: missing the omitted-profile legacy guarantee",
+        )
+        validation.check(
+            AGENT_PROFILE_REQUIRED_ONLY_PROSE_ANCHOR in text,
+            f"{skill_dir.name}: missing the required-role-only command gate scope",
+        )
+
+    loop_text = (
+        REPO_ROOT / "orca-worker-reviewer-loop" / "SKILL.md"
+    ).read_text(encoding="utf-8")
+    for anchor in LOOP_AGENT_PROFILE_PROSE_ANCHORS:
+        validation.check(
+            anchor in loop_text,
+            f"orca-worker-reviewer-loop: missing agent profile prose anchor {anchor!r}",
+        )
+
+
 def validate_phase_gate_neutrality(validation: Validation) -> None:
     """Phase transitions and the Final Review trigger must be risk-neutral.
 
@@ -1829,6 +2013,7 @@ def main() -> int:
     validate_reviewer_context_contract(validation)
     validate_quality_profile_contract(validation)
     validate_risk_profile_contract(validation)
+    validate_agent_profile_contract(validation)
     validate_phase_gate_neutrality(validation)
     validate_run_logging_contract(validation)
     validate_run_logging_tool_parity(validation)

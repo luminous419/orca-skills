@@ -45,6 +45,12 @@ class ValidatorRegressionTests(unittest.TestCase):
             "skill_policy.py",
             "workflow_contract.py",
             "run_logging.py",
+            # OS-4: skill_policy imports agent_profile, which imports the YAML
+            # reader in quality_profile. The validator runs as a subprocess in this
+            # copied tree, so a missing dependency here is an import crash with an
+            # empty stdout rather than the named failure a test is asserting on.
+            "agent_profile.py",
+            "quality_profile.py",
         ):
             shutil.copy2(SOURCE_ROOT / "scripts" / filename, scripts_dir)
 
@@ -644,6 +650,92 @@ class ValidatorRegressionTests(unittest.TestCase):
 
         self.assert_lifecycle_contract_rejected(
             "risk profile contract values drifted"
+        )
+
+    # ---- OS-4: the agent profile anchor contract and its prose anchors ----------
+    # The eighth anchor contract shipped with no negative regression test at all, so
+    # the validator that locks it was itself unverified: a silently deleted block or
+    # a drifted value would have been caught by nothing.
+
+    def test_agent_profile_contract_block_removed_fails(self) -> None:
+        self.mutate_orchestration_skill(
+            "#### Agent profile contract", "#### Agent profile contract REMOVED"
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "agent profile contract block is missing or malformed"
+        )
+
+    def test_agent_profile_contract_key_drift_fails(self) -> None:
+        self.mutate_orchestration_skill(
+            "AGENT_PROFILE_PARAMETER = profile\n",
+            "AGENT_PROFILE_PARAMETER_RENAMED = profile\n",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "agent profile contract keys drifted"
+        )
+
+    def test_agent_profile_contract_value_drift_fails(self) -> None:
+        self.mutate_orchestration_skill(
+            "AGENT_PROFILE_MERGE = whole_definition_never_field_level\n",
+            "AGENT_PROFILE_MERGE = field_level\n",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "agent profile contract values drifted"
+        )
+
+    def test_low_risk_requiring_a_phase_reviewer_fails(self) -> None:
+        """The risk-aware required-role table is the one thing in this block the
+        runtime actually branches on."""
+        self.mutate_orchestration_skill(
+            "AGENT_PROFILE_REQUIRED_ROLES_LOW = phase_worker, final_reviewer\n",
+            "AGENT_PROFILE_REQUIRED_ROLES_LOW = phase_worker, phase_reviewer, "
+            "final_reviewer\n",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "AGENT_PROFILE_REQUIRED_ROLES_LOW must not require a phase reviewer"
+        )
+
+    def test_the_two_precedence_chains_becoming_identical_fails(self) -> None:
+        """They disagree about their first entry on purpose; if one is ever
+        'corrected' into the other, that is a silent behaviour change."""
+        self.mutate_orchestration_skill(
+            "AGENT_PROFILE_FINAL_REVIEWER_PRECEDENCE = final_review, explicit, "
+            "defaults\n",
+            "AGENT_PROFILE_FINAL_REVIEWER_PRECEDENCE = explicit, phase, defaults\n",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "the phase reviewer and final reviewer precedence chains must differ"
+        )
+
+    def test_a_skill_losing_the_profile_parameter_fails(self) -> None:
+        """The anchor is checked against the whole document -- the same caveat
+        test_risk_parameter_undocumented_in_section_4_fails records -- so it trips
+        only when BOTH the section 4 fence and the Agent Profile prose lose it."""
+        skill_path = self.repo_root / "orca-worker-reviewer-orchestration" / "SKILL.md"
+        text = skill_path.read_text(encoding="utf-8")
+        self.assertEqual(text.count("profile=<name>"), 2)
+        skill_path.write_text(
+            text.replace("profile=<name>", "profile-parameter-removed"),
+            encoding="utf-8",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "missing the profile=<name> runtime parameter"
+        )
+
+    def test_a_skill_losing_the_required_only_gate_scope_fails(self) -> None:
+        """The prose that keeps the command gate from widening back out."""
+        self.mutate_orchestration_skill(
+            "검사 대상은 **required role뿐**이다", "검사 대상은 모든 role이다"
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "missing the required-role-only command gate scope"
         )
 
     def test_risk_downstream_revalidation_widened_fails(self) -> None:
