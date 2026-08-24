@@ -914,6 +914,9 @@ python3 <SKILL_DIR>/tools/run_logging.py orchestrator-event --run-id <run-id> \
   [--round-kind phase_gate|correction|downstream_revalidation|final_review] \
   [--result <text>] [--detail <text>]
 
+python3 <SKILL_DIR>/tools/run_logging.py timing-dispatch-start --run-id <run-id> \
+  --phase <phase> --role worker|reviewer --iteration <n> [--risk low|medium|high]
+
 python3 <SKILL_DIR>/tools/run_logging.py timing-event --run-id <run-id> \
   --event <event> [--phase <phase>] [--role worker|reviewer] [--iteration <n>] \
   [--started-at <iso8601>] [--ended-at <iso8601>] [--duration-seconds <n>] \
@@ -924,11 +927,33 @@ python3 <SKILL_DIR>/tools/run_logging.py run-status --run-id <run-id> \
   [--risk low|medium|high] [--risk-source explicit|default]
 ```
 
-`--duration-seconds`는 생략해도 된다. `--started-at`과 `--ended-at`을 둘 다 주면 `timing-event`가 그
-차이로 `duration_s`를 스스로 채운다 — `OrcaRuntimeHarness`(Python 경로)가 항상 해 온 계산을 CLI 쪽으로도
-옮겨, 두 경로가 같은 타임스탬프 쌍에서 다른 `duration_s`를 남기지 않게 한다. 둘 중 하나라도 비어 있으면
-`duration_s`는 빈 값으로 남는다 — 값을 추정하지 않는다. `--duration-seconds`를 직접 준 경우(`0`
-포함)는 그 값을 그대로 쓰고 다시 계산하지 않는다.
+**시각은 Coordinator가 기억하지 않는다 (OS-19).** `timing-dispatch-start`는 Dispatch를 실제로
+시작하기 직전에 호출하며, 그 순간의 시각을 도구 자신이 읽어 기록해 둔다. 뒤이은 `timing-event
+--event dispatch_settled`는 `--started-at`/`--ended-at`을 주지 않으며, 저장된 시작 시각과 settle
+시점의 실제 시각을 스스로 사용한다. 이것이 §9가 요구하는 authoritative time source다 — Coordinator
+에게는 시계가 없고, 시각을 기억하게 하면 앞 row의 (역시 추정된) `ended_at`에서 다음 row의
+`started_at`을 이어 만들게 된다. 실제로 PR #16의 OS-3 run이 그렇게 해서 `started_at`이 `ended_at`
+보다 수십 분 뒤인 row 5개(-423s / -2267s / -1296s / -1998s / -2766s)를 남겼다.
+
+`timing-dispatch-start`는 시작 시각을 기록하는 동시에 그 dispatch의 phase/iteration 경계를 연다 —
+새 phase면 `phase_start`, 새 iteration이면 `iteration_start` row를 이 시각으로 쓰고, 직전 scope는
+그 scope 자신의 마지막 dispatch settle 시각으로 닫는다(다음 scope의 시간이 이전 scope의 duration에
+섞이지 않는다). 그래서 `phase_start`/`iteration_start`를 따로 호출할 필요가 없고, `phase_end`/
+`iteration_end`는 `--started-at`을 줄 필요가 없다 — 그 scope가 어디서 시작했는지는 도구가 이미
+알고 있다.
+
+`--started-at`/`--ended-at`/`--duration-seconds`는 여전히 받는다(사후 재구성 같은 정당한 용도가
+있다). 다만 어느 경로로 들어오든 판정은 같다: `ended_at`이 `started_at`보다 앞서거나, 파싱할 수
+없는 값이거나, 음수 duration이면 `duration_s`를 **빈 값으로 남기고** 그 row의 `detail`에
+`timing_invalid=...` 표시를 덧붙인다. 0으로 clamp하거나 절댓값을 취하지 않는다 — 그러면 잘못된
+입력이 정상적인 측정값처럼 보이게 된다. 입력받은 `started_at`/`ended_at` 자체는 그대로 기록한다
+(무엇이 들어왔는지가 증거이기 때문이다). 이 fail-safe는 **로깅에만** 작용한다: 이미 내려진
+settlement/terminal ownership/task status 판단은 무엇도 바꾸지 않는다.
+
+`--duration-seconds`를 직접 준 경우(`0` 포함)는 그 값을 그대로 쓰고 다시 계산하지 않는다.
+`--started-at`과 `--ended-at`을 둘 다 주고 `--duration-seconds`를 생략하면 `timing-event`가 그
+차이로 `duration_s`를 채운다 — `OrcaRuntimeHarness`(Python 경로)와 같은 하나의 writer가 계산하므로
+두 경로가 같은 입력에서 다른 `duration_s`나 다른 fail-safe 판정을 남기지 않는다.
 
 세 command 모두 대상 프로젝트 root에서 실행하면(`--base` 생략) 실제 `artifacts/runs/<run-id>/` 아래에
 쓴다. `<ARTIFACT_ROOT>`가 아직 없으면 command 자신이 만든다(idempotent). 새 값을 계산하거나
@@ -966,23 +991,26 @@ Coordinator는 다음 시점에 정확히 한 번씩 호출한다. 동일 event�
       --risk <이 run의 risk> --risk-source explicit|default
       --requested-phases "<requested phase 목록>"
    -> timing-event --event run_start --started-at <지금 시각> --risk <이 run의 risk>
-2. 이 phase의 첫 Task를 dispatch하기 직전 / 이 phase가 최종적으로 PASS하거나
-   §16/§17에서 종료된 직후
-   -> timing-event --event phase_start|phase_end --phase <phase> [--started-at <시각>]
-      [--ended-at <시각>] --risk <이 run의 risk> [--detail "<PASS|FAIL|사유>"]
-3. 이 iteration의 Worker를 dispatch하기 직전 / 이 iteration의 phase gate 판정이 나온
-   직후 — 그 판정은 LOW에서는 그 Worker의 accepted worker_done 결과이고, MEDIUM/HIGH
-   에서는 그 phase Reviewer의 RESULT: 판정이다(§8 Risk Axis). (correction, downstream
-   revalidation, §17 Final Adversarial Review attempt도 각자 자신의 iteration 번호로
-   이 규칙 그대로 쓴다)
-   -> timing-event --event iteration_start|iteration_end --phase <phase>
-      --iteration <n> [--started-at <시각>] [--ended-at <시각>] --risk <이 run의 risk>
+2. 이 phase가 최종적으로 PASS하거나 §16/§17에서 종료된 직후
+   (`phase_start`는 호출하지 않는다 — 4단계의 timing-dispatch-start가 그 phase의 첫
+   dispatch에서 자동으로 연다)
+   -> timing-event --event phase_end --phase <phase>
+      --risk <이 run의 risk> [--detail "<PASS|FAIL|사유>"]
+3. 이 iteration의 phase gate 판정이 나온 직후 — 그 판정은 LOW에서는 그 Worker의
+   accepted worker_done 결과이고, MEDIUM/HIGH에서는 그 phase Reviewer의 RESULT:
+   판정이다(§8 Risk Axis). (correction, downstream revalidation, §17 Final
+   Adversarial Review attempt도 각자 자신의 iteration 번호로 이 규칙 그대로 쓴다.
+   `iteration_start`도 4단계가 자동으로 연다)
+   -> timing-event --event iteration_end --phase <phase>
+      --iteration <n> --risk <이 run의 risk>
       [--detail "<PASS|FAIL|사유>"]
-4. §6/§11 각 Worker/Reviewer Dispatch가 accepted worker_done으로 settle된 직후
-   (correction, downstream revalidation, §17 Final Adversarial Review attempt도
-   전부 이 규칙 하나로 커버된다 — 이들은 다른 phase/iteration/role로 다시 호출되는
-   같은 종류의 event일 뿐이다)
-   -> orchestrator-event --event dispatch_settled --phase <phase> --role <role>
+4. §6/§11 각 Worker/Reviewer Dispatch를 start하기 직전, 그리고 그 Dispatch가 accepted
+   worker_done으로 settle된 직후 (correction, downstream revalidation, §17 Final
+   Adversarial Review attempt도 전부 이 규칙 하나로 커버된다 — 이들은 다른
+   phase/iteration/role로 다시 호출되는 같은 종류의 event일 뿐이다)
+   -> (worker-start 직전) timing-dispatch-start --phase <phase> --role <role>
+      --iteration <n> --risk <이 run의 risk>
+   -> (settle 직후) orchestrator-event --event dispatch_settled --phase <phase> --role <role>
       --iteration <n> --task-id <task_id> --dispatch-id <dispatch_id>
       --terminal <handle> --action created|reused --reuse <worker-start/dispatch
       응답의 effects[].action> [--gate-result <role가 reviewer일 때, 응답 본문이
@@ -992,9 +1020,10 @@ Coordinator는 다음 시점에 정확히 한 번씩 호출한다. 동일 event�
       --round-kind phase_gate|correction|downstream_revalidation|final_review
       --result "<outcome/settlement/lifecycle 요약>"
    -> timing-event --event dispatch_settled --phase <phase> --role <role> --iteration <n>
-      --started-at <dispatch 직전 시각> --ended-at <settle 직후 시각> --risk <이 run의 risk>
+      --risk <이 run의 risk>
 5. §16/§17에서 이 run의 최종 상태가 COMPLETED/BLOCKED/ERROR/ESCALATED 중 하나로 확정된 직후
-   -> run-status --status <상태> --reason "<사유>" --run-started-at <1단계의 시각>
+   (열려 있는 phase/iteration 경계는 run-status가 먼저 닫는다)
+   -> run-status --status <상태> --reason "<사유>"
       --risk <이 run의 risk> --risk-source explicit|default
 6. risk=low에서 각 requested phase의 Worker를 dispatch하기 직전 (건너뛴 gate를 row의
    부재가 아니라 명시적 row로 남긴다)
@@ -1010,8 +1039,11 @@ Coordinator는 다음 시점에 정확히 한 번씩 호출한다. 동일 event�
 
 2-3단계는 TIMING_LOG.md 전용이다. `<ARTIFACT_ROOT>ORCHESTRATOR_LOG.md`는 매 dispatch_settled row에
 이미 phase/iteration column을 갖고 있으므로 phase/iteration 경계를 위한 별도 row를 추가하지 않는다.
-phase나 iteration의 시작 시각을 Coordinator가 이미 잊었다면(`--started-at` 생략) 해당 row의
-`duration_s`는 빈 값으로 남는다 — 값을 추정하지 않는다.
+경계의 시작 시각은 Coordinator가 기억하지 않는다 — 4단계의 `timing-dispatch-start`가 그 scope의 첫
+dispatch 시작 시각으로 열어 두었고, `phase_end`/`iteration_end`는 그 값을 그대로 자신의
+`started_at`으로 쓴다. 따라서 모든 경계 row는 자기 scope의 실제 dispatch들을 bracket하며(`started_at`
+<= 그 scope 첫 dispatch의 `started_at`, `ended_at` = 그 scope 마지막 dispatch의 `ended_at`), 다음
+scope의 시간이 이전 scope의 duration에 섞이지 않는다.
 
 Worker/Reviewer가 unexpected exit로 정리되는 경우(§6 recovery)나, 이미 run-id를 가진 run 안에서
 발생하는 pre-dispatch failure(예: §17 Final Adversarial Review의 requested_phases 누락)로 Task

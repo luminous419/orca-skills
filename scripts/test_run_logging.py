@@ -643,7 +643,14 @@ class TimingCorrectnessRegressionTests(unittest.TestCase):
         ]
 
     def assert_log_invariants(self, run_id: str = "run_os19") -> None:
-        """`started_at <= ended_at` and `duration_s >= 0` on every row that has them."""
+        """No row carries a negative duration, and no out-of-order pair is silent.
+
+        The caller's own `started_at`/`ended_at` are written back verbatim even
+        when they are impossible -- erasing them would destroy the evidence of
+        what was actually handed in. What may not happen is that the row goes
+        out looking like a normal measurement: `duration_s` is empty and the row
+        says why.
+        """
         for index, row in enumerate(self.rows(run_id)):
             with self.subTest(row=index, event=row["event"]):
                 if row["duration_s"]:
@@ -652,11 +659,18 @@ class TimingCorrectnessRegressionTests(unittest.TestCase):
                         0.0,
                         f"negative duration_s in {row}",
                     )
-                if row["started_at"] and row["ended_at"]:
-                    self.assertLessEqual(
-                        row["started_at"],
-                        row["ended_at"],
-                        f"started_at is after ended_at in {row}",
+                if (
+                    row["started_at"]
+                    and row["ended_at"]
+                    and row["started_at"] > row["ended_at"]
+                ):
+                    self.assertEqual(row["duration_s"], "", row)
+                    self.assertTrue(
+                        any(
+                            marker in row["detail"]
+                            for marker in run_logging.TIMING_INVALID_MARKERS
+                        ),
+                        f"an out-of-order pair was recorded without saying so: {row}",
                     )
 
     # ---- A. The observed rows, replayed exactly -------------------------------
@@ -1084,8 +1098,15 @@ class InstalledToolsTimingParityTests(unittest.TestCase):
         ("2026-08-24T01:48:15Z", "2026-08-24T01:41:12Z"),   # the OS-3 shape
         ("not-a-timestamp", "2026-08-24T01:41:12Z"),        # malformed
         ("2026-08-24T01:00:00", "2026-08-24T01:05:00+00:00"),  # mixed awareness
-        ("2026-08-24T01:41:30Z", ""),                        # missing side
+        ("2026-08-24T01:41:30Z", "2026-08-24T01:41:30+00:00"),  # mixed spelling, 0s
     )
+
+    # A missing side is deliberately NOT in the matrix above: `timing-event
+    # --event dispatch_settled` is a lifecycle command run at the moment of
+    # settlement, so an omitted `--ended-at` is filled from its own authoritative
+    # clock, while log_timing_event() is the raw writer and leaves it blank.
+    # That difference is the OS-19 fix, not a drift -- see
+    # test_the_cli_fills_a_missing_settlement_time_and_the_raw_writer_does_not.
 
     @staticmethod
     def cell(path: Path, column: str) -> str:
@@ -1166,6 +1187,46 @@ class InstalledToolsTimingParityTests(unittest.TestCase):
                             f"{column} differs between the installed CLI and the "
                             "Python path",
                         )
+
+    def test_the_cli_fills_a_missing_settlement_time_and_the_raw_writer_does_not(
+        self,
+    ) -> None:
+        """The one intentional difference between the two, stated explicitly."""
+        with tempfile.TemporaryDirectory() as base_directory:
+            base = Path(base_directory)
+            stream = StringIO()
+            with redirect_stdout(stream):
+                cli_main(
+                    [
+                        "timing-event",
+                        "--run-id",
+                        "run_fill",
+                        "--base",
+                        str(base),
+                        "--event",
+                        "dispatch_settled",
+                        "--phase",
+                        "IMPLEMENTATION",
+                        "--role",
+                        "reviewer",
+                        "--iteration",
+                        "2",
+                        "--started-at",
+                        "2026-08-24T01:41:30+00:00",
+                    ]
+                )
+            cli_row = self.cell(timing_log_path("run_fill", base=base), "ended_at")
+            self.assertTrue(cli_row, "the CLI must settle on its own clock")
+
+            log_timing_event(
+                "run_raw",
+                base=base,
+                event="dispatch_settled",
+                started_at="2026-08-24T01:41:30+00:00",
+            )
+            self.assertEqual(
+                self.cell(timing_log_path("run_raw", base=base), "ended_at"), ""
+            )
 
 
 class RunLoggingTwinParityTests(unittest.TestCase):

@@ -442,8 +442,8 @@ class ValidatorRegressionTests(unittest.TestCase):
         reaches, which would drop every LOW iteration boundary from TIMING_LOG.md.
         The parenthesis in `(phase) Reviewer` is part of the anchor."""
         self.mutate_orchestration_skill(
-            "3. 이 iteration의 Worker를 dispatch하기 직전 / 이 iteration의 phase gate 판정이 나온",
-            "3. 이 iteration의 Worker를 dispatch하기 직전 / 이 iteration의 (phase) Reviewer 판정이 나온",
+            "3. 이 iteration의 phase gate 판정이 나온",
+            "3. 이 iteration의 (phase) Reviewer 판정이 나온",
         )
 
         self.assert_lifecycle_contract_rejected(
@@ -574,13 +574,41 @@ class ValidatorRegressionTests(unittest.TestCase):
         column the Python path does. Dropping `--risk` from one call point is how
         this shipped in the first place -- the flag existed, the example omitted it,
         and the column silently went blank for every hand-driven run."""
+        # OS-19 moved the timestamps out of this call point -- the scope's start
+        # is whatever timing-dispatch-start captured -- so the anchor is now the
+        # shorter line. The concern is unchanged: --risk must stay on it.
         self.mutate_orchestration_skill(
-            "--iteration <n> [--started-at <시각>] [--ended-at <시각>] --risk <이 run의 risk>",
-            "--iteration <n> [--started-at <시각>] [--ended-at <시각>]",
+            "--iteration <n> --risk <이 run의 risk>",
+            "--iteration <n>",
         )
 
         self.assert_lifecycle_contract_rejected(
             "a timing-event call point is missing"
+        )
+
+    # ---- OS-19 authoritative dispatch clock ------------------------------------
+
+    def test_dropping_the_pre_dispatch_clock_call_point_fails(self) -> None:
+        """OS-19: without `timing-dispatch-start` in the documented procedure, a
+        Coordinator is back to reconstructing `--started-at` from an earlier row
+        -- which is exactly how PR #16's real OS-3 run produced five negative
+        `duration_s` values."""
+        self.mutate_orchestration_skill(
+            "(worker-start 직전) timing-dispatch-start --phase <phase> --role <role>",
+            "(worker-start 직전) 시작 시각을 기억해 둔다 --phase <phase> --role <role>",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "the run-logging section is missing"
+        )
+
+    def test_dropping_the_fail_safe_marker_contract_fails(self) -> None:
+        """The other half of OS-19: an unusable timestamp pair must be recorded as
+        a blank duration that says why, not clamped into a plausible number."""
+        self.mutate_orchestration_skill("timing_invalid=", "duration_note=")
+
+        self.assert_lifecycle_contract_rejected(
+            "the run-logging section is missing"
         )
 
     # ---- OS-3 risk profile contract (T-18) -------------------------------------

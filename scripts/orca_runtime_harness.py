@@ -681,22 +681,23 @@ class OrcaRuntimeHarness:
         # boundary(), called just before a dispatch starts (run_existing_task(),
         # observe_unexpected_exit()) so its own started_at brackets that dispatch
         # rather than trailing it, and closed by finish() for whatever is still
-        # open when the run ends. "" / None means nothing is currently open.
-        # round 5 review MAJOR: *_last_ended_at tracks the ended_at of the most
-        # recent attempt actually inside the currently open scope (updated by
-        # _log_attempt() on every settled attempt) so that closing an OUTGOING
-        # scope on a transition uses that scope's own last real activity, never
-        # "whenever the next scope's dispatch happens to settle" -- otherwise an
-        # outgoing iteration/phase's duration would silently include the next
-        # one's dispatch time.
-        self._open_phase: str = ""
-        self._open_phase_started_at: str = ""
-        self._open_phase_result: str = ""
-        self._open_phase_last_ended_at: str = ""
-        self._open_iteration: tuple[str, int] | None = None
-        self._open_iteration_started_at: str = ""
-        self._open_iteration_result: str = ""
-        self._open_iteration_last_ended_at: str = ""
+        # open when the run ends.
+        # round 5 review MAJOR: the tracker's *_last_ended_at fields hold the
+        # ended_at of the most recent attempt actually inside the currently open
+        # scope (advanced by _log_attempt() on every settled attempt) so that
+        # closing an OUTGOING scope on a transition uses that scope's own last
+        # real activity, never "whenever the next scope's dispatch happens to
+        # settle" -- otherwise an outgoing iteration/phase's duration would
+        # silently include the next one's dispatch time.
+        # OS-19: that state and its transitions now live in
+        # run_logging.RunTimingTracker rather than in eight fields here, because
+        # the CLI path (a live Coordinator, one process per event) needs exactly
+        # the same lifecycle and had none. One class, two storage strategies --
+        # in memory here, a JSON file there -- so the two paths cannot drift into
+        # different timing semantics. `emit` routes every row the tracker writes
+        # through _safe_log, which is what keeps section 9's "a logging failure
+        # never changes lifecycle correctness" true for boundary rows too.
+        self._timing: run_logging.RunTimingTracker | None = None
 
     @staticmethod
     def _resolve_orca() -> str:
@@ -1503,6 +1504,13 @@ class OrcaRuntimeHarness:
         # timestamp is recorded once and reused by log_run_status() for the
         # wall-clock duration, never re-read from the filesystem.
         self._run_started_at = run_logging.now_iso()
+        self._timing = run_logging.RunTimingTracker(
+            self.run_id,
+            base=self.artifact_dir,
+            emit=self._emit_timing_row,
+            risk=self.risk,
+        )
+        self._timing.run_started_at = self._run_started_at
         self._safe_log(
             run_logging.log_orchestrator_event,
             self.run_id,
@@ -1988,6 +1996,18 @@ class OrcaRuntimeHarness:
         except Exception as error:  # noqa: BLE001 -- see the section note above
             self._logging_errors.append(f"{getattr(writer, '__name__', writer)}: {error}")
 
+    def _emit_timing_row(self, **fields: Any) -> None:
+        """The writer RunTimingTracker emits phase/iteration boundary rows through.
+
+        OS-19: injected rather than let the tracker write directly, so a boundary
+        row is covered by the same _safe_log guarantee as every other row this
+        class produces -- a failed write lands in self._logging_errors instead of
+        unwinding into an already-settled Dispatch.
+        """
+        self._safe_log(
+            run_logging.log_timing_event, self.run_id, base=self.artifact_dir, **fields
+        )
+
     def _log_attempt(
         self,
         *,
@@ -2040,11 +2060,8 @@ class OrcaRuntimeHarness:
         # when it closes -- see _close_iteration_boundary()/_close_phase_
         # boundary(). A Worker attempt leaves the result unchanged (gate_result
         # == "") but still advances the scope's last-known end time.
-        if gate_result:
-            self._open_iteration_result = gate_result
-            self._open_phase_result = gate_result
-        self._open_iteration_last_ended_at = ended_at
-        self._open_phase_last_ended_at = ended_at
+        if self._timing is not None:
+            self._timing.record_scope_activity(ended_at=ended_at, result=gate_result)
         self._safe_log(
             run_logging.log_orchestrator_event,
             self.run_id,
@@ -2083,7 +2100,11 @@ class OrcaRuntimeHarness:
             iteration=attempt.iteration,
             started_at=started_at,
             ended_at=ended_at,
-            duration_seconds=run_logging.elapsed_seconds(started_at, ended_at),
+            # OS-19: the duration is derived inside log_timing_event, which is
+            # inside _safe_log. Deriving it HERE put a `(end - start)` outside
+            # the logging guard, where a naive/aware timestamp pair raises
+            # TypeError straight into an already-settled Dispatch -- the one
+            # thing section 9 says logging may never do.
             risk=self.risk,
             detail=f"task={attempt.task_id} dispatch={attempt.dispatch_id}",
         )
@@ -2162,105 +2183,48 @@ class OrcaRuntimeHarness:
     # therefore called by the caller with its own pre-dispatch `opened_at`
     # timestamp, not computed here. Closing an OUTGOING scope on a transition
     # uses that scope's own *_last_ended_at (the ended_at of the last attempt
-    # actually inside it, tracked by _log_attempt() on every settled attempt) --
-    # never "now", which at transition time is really "whenever the NEW scope's
-    # dispatch happened to settle" and would silently pull the new scope's own
-    # work into the outgoing scope's duration. Timing rows only --
-    # ORCHESTRATOR_LOG.md already carries phase and iteration on every
-    # dispatch_settled row, so a duplicate row there would answer a question
-    # that row shape already answers.
+    # actually inside it, advanced by _log_attempt() on every settled attempt via
+    # RunTimingTracker.record_scope_activity()) -- never "now", which at
+    # transition time is really "whenever the NEW scope's dispatch happened to
+    # settle" and would silently pull the new scope's own work into the outgoing
+    # scope's duration. Timing rows only -- ORCHESTRATOR_LOG.md already carries
+    # phase and iteration on every dispatch_settled row, so a duplicate row there
+    # would answer a question that row shape already answers.
+    #
+    # OS-19: those transitions now live in run_logging.RunTimingTracker and the
+    # three methods below are thin delegations. The rules did not change; what
+    # changed is that the CLI path -- a live Coordinator, one process per event,
+    # which had NO boundary lifecycle and therefore wrote every iteration_end/
+    # phase_end row of the real OS-3 run with an empty started_at and a blank
+    # duration_s -- now runs the same ones out of the same class.
 
     def _open_phase_iteration_boundary(
         self, phase: str, iteration: int, *, opened_at: str
     ) -> None:
-        if not self.run_id or not phase:
+        """Open this dispatch's phase/iteration scope. Delegates to the tracker.
+
+        OS-19: the transitions themselves moved into
+        run_logging.RunTimingTracker so the CLI path -- which had no boundary
+        lifecycle at all, and whose every iteration_end/phase_end row in the
+        real OS-3 run therefore had an empty started_at and a blank duration --
+        runs the same ones. This method stays because it is the name both
+        dispatch-initiating call sites already use, and because `opened_at` is
+        still the caller's own pre-dispatch timestamp rather than a second clock
+        read taken here.
+        """
+        if self._timing is None or not self.run_id or not phase:
             return
-        if phase != self._open_phase:
-            self._close_iteration_boundary(
-                ended_at=self._open_iteration_last_ended_at or None
-            )
-            self._close_phase_boundary(
-                ended_at=self._open_phase_last_ended_at or None
-            )
-            self._open_phase = phase
-            self._open_phase_started_at = opened_at
-            self._safe_log(
-                run_logging.log_timing_event,
-                self.run_id,
-                base=self.artifact_dir,
-                event="phase_start",
-                phase=phase,
-                started_at=opened_at,
-                risk=self.risk,
-                timestamp=opened_at,
-            )
-        iteration_key = (phase, iteration)
-        if iteration_key != self._open_iteration:
-            self._close_iteration_boundary(
-                ended_at=self._open_iteration_last_ended_at or None
-            )
-            self._open_iteration = iteration_key
-            self._open_iteration_started_at = opened_at
-            self._safe_log(
-                run_logging.log_timing_event,
-                self.run_id,
-                base=self.artifact_dir,
-                event="iteration_start",
-                phase=phase,
-                iteration=iteration,
-                started_at=opened_at,
-                risk=self.risk,
-                timestamp=opened_at,
-            )
+        self._timing.open_boundary(phase, iteration, opened_at=opened_at)
 
     def _close_iteration_boundary(self, *, ended_at: str | None = None) -> None:
-        if self._open_iteration is None:
+        if self._timing is None:
             return
-        phase, iteration = self._open_iteration
-        started_at = self._open_iteration_started_at
-        ended = ended_at or run_logging.now_iso()
-        self._safe_log(
-            run_logging.log_timing_event,
-            self.run_id,
-            base=self.artifact_dir,
-            event="iteration_end",
-            phase=phase,
-            iteration=iteration,
-            started_at=started_at,
-            ended_at=ended,
-            duration_seconds=run_logging.elapsed_seconds(started_at, ended),
-            risk=self.risk,
-            detail=self._open_iteration_result,
-            timestamp=ended,
-        )
-        self._open_iteration = None
-        self._open_iteration_started_at = ""
-        self._open_iteration_result = ""
-        self._open_iteration_last_ended_at = ""
+        self._timing.close_iteration(ended_at=ended_at)
 
     def _close_phase_boundary(self, *, ended_at: str | None = None) -> None:
-        if not self._open_phase:
+        if self._timing is None:
             return
-        phase = self._open_phase
-        started_at = self._open_phase_started_at
-        ended = ended_at or run_logging.now_iso()
-        self._safe_log(
-            run_logging.log_timing_event,
-            self.run_id,
-            base=self.artifact_dir,
-            event="phase_end",
-            phase=phase,
-            started_at=started_at,
-            ended_at=ended,
-            duration_seconds=run_logging.elapsed_seconds(started_at, ended),
-            risk=self.risk,
-            detail=self._open_phase_result,
-            timestamp=ended,
-        )
-        self._open_phase = ""
-        self._open_phase_started_at = ""
-        self._open_phase_result = ""
-        self._open_phase_last_ended_at = ""
+        self._timing.close_phase(ended_at=ended_at)
 
     def run_existing_task(
         self,
@@ -2646,8 +2610,8 @@ class OrcaRuntimeHarness:
         # that scope's own last recorded activity (*_last_ended_at), not "now" --
         # snapshot-writing and the other bookkeeping just above this point is not
         # part of the phase/iteration's own work.
-        self._close_iteration_boundary(ended_at=self._open_iteration_last_ended_at or None)
-        self._close_phase_boundary(ended_at=self._open_phase_last_ended_at or None)
+        if self._timing is not None:
+            self._timing.close_all()
         # OS-17: the one call site every scenario already reaches on its way out,
         # so "log the run's terminal status" does not need a matching reminder
         # in each of them. `result.status` is one of run_logging.RUN_STATUS_VALUES
@@ -2657,6 +2621,7 @@ class OrcaRuntimeHarness:
         self.log_run_status(result.status, reason="; ".join(result.recovery))
         self.run_owner = None
         self.run_id = None
+        self._timing = None
         self._raw = []
         self._signals = []
         self._terminals = {}

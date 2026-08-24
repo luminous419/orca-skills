@@ -6196,8 +6196,19 @@ class RunLoggingIntegrationTests(OfflineHarnessTestCase):
         for row in rows:
             if row["duration_s"]:
                 assert float(row["duration_s"]) >= 0.0, f"negative duration_s: {row}"
-            if row["started_at"] and row["ended_at"]:
-                assert row["started_at"] <= row["ended_at"], f"out-of-order: {row}"
+            if (
+                row["started_at"]
+                and row["ended_at"]
+                and row["started_at"] > row["ended_at"]
+            ):
+                # The pair is written back as it arrived -- erasing it would
+                # destroy the evidence -- but it may not go out looking like a
+                # measurement: blank duration, and the row says why.
+                assert row["duration_s"] == "", f"out-of-order with a duration: {row}"
+                assert any(
+                    marker in row["detail"]
+                    for marker in run_logging.TIMING_INVALID_MARKERS
+                ), f"an out-of-order pair was recorded without saying so: {row}"
 
     def test_a_full_correction_and_final_review_run_holds_the_timing_invariants(
         self,
