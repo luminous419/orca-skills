@@ -65,6 +65,64 @@ Important gates include:
 - BUGFIX requires a Regression Test.
 - Reviewer never edits/fixes its own findings.
 - `max-iterations` limits repeated review loops.
+- `risk=low|medium|high` (orchestration skill only) selects validation strength; an invalid or explicitly empty value is blocked with `INVALID_RISK`.
+
+## Risk-Based Workflow
+
+`orca-worker-reviewer-orchestration` takes a second, independent axis beside `phases`:
+
+```text
+phases   WHAT to execute            (unchanged semantics)
+risk     HOW STRONGLY to validate   (low | medium | high, default high)
+```
+
+`risk` never expands or contracts the requested phase set, and the Final Adversarial
+Review is mandatory and identical at every level.
+
+| | **LOW** | **MEDIUM** | **HIGH** (default) |
+|---|---|---|---|
+| per requested phase | Worker only | Worker → Reviewer, bounded correction loop | Worker → Reviewer, full existing strength |
+| phase Task graph | Worker node only | Worker + dependent Reviewer | Worker + dependent Reviewer |
+| phase gate | the Worker's own result | the Reviewer verdict | the Reviewer verdict |
+| downstream revalidation (T5a) | no-op | no-op | runs |
+| Final Adversarial Review | mandatory | mandatory | mandatory |
+| Final Review FAIL routing | Worker correction → fresh Final Review | correction → phase Reviewer → fresh Final Review | correction → phase Reviewer → T5a → fresh Final Review |
+
+```text
+/orca-worker-reviewer-orchestration risk=low phases=implementation <request>
+```
+
+Omitting `risk` resolves to `high`, so every pre-existing invocation behaves exactly as
+before. An explicit value always overrides the default; there is no natural-language
+inference, so the selection source is only ever `explicit` or `default`. A value that is
+not a level — **including an explicitly empty `risk=`**, which is an explicit parameter
+with no valid value rather than an omission — fails closed before any Run, Task or
+Dispatch is created:
+
+```text
+STATUS: BLOCKED
+REASON: INVALID_RISK
+```
+
+**Churn.** For identical requested phases, `LOW < MEDIUM` always, and `MEDIUM < HIGH`
+whenever a correction or downstream revalidation occurs. `MEDIUM == HIGH` is a
+**documented, authorized exception** in exactly two cases — a clean first-pass run, and
+every BUGFIX/REFACTORING run — because HIGH's only churn-producing mechanism (T5a) is
+structurally inert in both: specialized phases have no canonical order, so their
+downstream set is always empty.
+
+**Safety floor.** Risk changes validation strength, never the safety floor. The section 14
+gates (IMPLEMENTATION unit tests, BUGFIX regression test, REFACTORING behavior
+preservation) hold at every level. At MEDIUM/HIGH the phase Reviewer enforces them; at LOW,
+where none exists, the Worker must carry an affirmative `UNIT_TEST_STATUS: PASS` — a
+missing or `BLOCKED` value does not pass the gate.
+
+**Independence.** The Risk Profile and the Project Quality Profile are two separate,
+non-interacting resolutions. Neither reads the other's configuration or gates on the
+other's state, and they reach agents as two separate blocks in the dispatched Task spec.
+
+`risk` is orchestration-only. `orca-worker-reviewer-loop` has no risk axis and is
+unaffected.
 
 ## Run-Scoped Artifacts and Logs
 
@@ -79,8 +137,8 @@ and so do two Coordinator-owned logs:
 
 | file | contents |
 | --- | --- |
-| `ORCHESTRATOR_LOG.md` | one row per lifecycle event: run start/end, every Worker/Reviewer/Final-Review dispatch settlement (phase, role, iteration, Task ID, Dispatch ID, terminal, created-vs-reused, the reviewer's own PASS/FAIL gate result and separate four-valued PASS/PASS WITH NOTES/FAIL/BLOCKED review verdict, outcome, lifecycle/cleanup result), unexpected exits, and pre-dispatch failures |
-| `TIMING_LOG.md` | one row per timed event: run start/end with wall-clock duration, phase/iteration start/end boundaries, and each dispatch's start/end/duration |
+| `ORCHESTRATOR_LOG.md` | one row per lifecycle event: run start/end, every Worker/Reviewer/Final-Review dispatch settlement (phase, role, iteration, Task ID, Dispatch ID, terminal, created-vs-reused, the reviewer's own PASS/FAIL gate result and separate four-valued PASS/PASS WITH NOTES/FAIL/BLOCKED review verdict, outcome, lifecycle/cleanup result), the run's selected `risk` and `risk_source`, its `requested_phases`, each dispatch's `round_kind` (`phase_gate`/`correction`/`downstream_revalidation`/`final_review`), `reviewer_gate_skipped` rows for a LOW run's skipped phase gates, unexpected exits, and pre-dispatch failures |
+| `TIMING_LOG.md` | one row per timed event: run start/end with wall-clock duration, phase/iteration start/end boundaries, and each dispatch's start/end/duration, each carrying the `risk` it was produced under |
 
 Both are append-only markdown tables, auto-created on first write (`scripts/run_logging.py` owns the
 format) — a run that never reaches a given event simply never gets that row, and neither file requires

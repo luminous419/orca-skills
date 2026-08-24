@@ -25,6 +25,7 @@ try:
         TaskContextError,
         build_quality_gate_context,
         build_reviewer_context,
+        build_risk_context,
         build_task_boundary,
         ensure_run_artifact_root,
         parse_quality_gate,
@@ -47,6 +48,7 @@ except ModuleNotFoundError:  # direct `python3 scripts/...` execution
         TaskContextError,
         build_quality_gate_context,
         build_reviewer_context,
+        build_risk_context,
         build_task_boundary,
         ensure_run_artifact_root,
         parse_quality_gate,
@@ -391,6 +393,11 @@ class RuntimeScenarioResult:
     reuse_chains: dict[str, list[str]] = field(default_factory=dict)
     terminal_creations: int = 0
     retained_terminals: list[str] = field(default_factory=list)
+    # ---- OS-3: what strength this run enforced, and what the graph looked like.
+    risk: str = ""
+    risk_source: str = ""
+    phase_reviewer_task_ids: list[str] = field(default_factory=list)
+    reviewer_gates_skipped: list[str] = field(default_factory=list)
 
 
 def worker_start_terminal_effect(worker_start_result: dict[str, Any]) -> str:
@@ -444,6 +451,8 @@ def dispatch_context(
     run_id: str = "",
     quality_profile: QualityProfileResolution | None = None,
     requested_phases: tuple[str, ...] = (),
+    risk: str = "high",
+    risk_source: str = "default",
 ) -> tuple[str, dict[str, str], dict[str, Any] | None]:
     """The Task spec text an agent will actually receive, plus what went into it.
 
@@ -550,8 +559,13 @@ def dispatch_context(
         current_phase=phase,
         requested_phases=requested_phases,
     )
+    # OS-3: a separate block from the quality gate, built by a builder that takes no
+    # QualityProfileResolution -- the two axes share no argument and no key.
+    risk_context = build_risk_context(
+        risk=risk, risk_source=risk_source, current_phase=phase
+    )
     return (
-        render_task_spec(base, boundary, reviewer_context, quality_gate),
+        render_task_spec(base, boundary, reviewer_context, quality_gate, risk_context),
         boundary,
         reviewer_context,
     )
@@ -618,6 +632,8 @@ class OrcaRuntimeHarness:
         *,
         wait_timeout_ms: int = 10000,
         quality_profile_root: Path = REPO_ROOT,
+        risk: str = "high",
+        risk_source: str = "default",
     ) -> None:
         self.orca = self._resolve_orca()
         self.artifact_dir = artifact_dir
@@ -638,6 +654,10 @@ class OrcaRuntimeHarness:
         # Worker and the Reviewer that judges it must be handed the same quality
         # model even if somebody edits the profile in between.
         self.quality_profile_root = quality_profile_root
+        # ---- OS-3: run-scoped strength. Validated in start_run(), then frozen: every
+        # spec, graph and log row of the run reads this one pair.
+        self.risk = risk
+        self.risk_source = risk_source
         self.quality_profile: QualityProfileResolution = resolve_quality_profile(
             quality_profile_root
         )
@@ -1441,6 +1461,11 @@ class OrcaRuntimeHarness:
         """
         for candidate in requested_phases:
             require_workflow_phase(candidate, field="requested_phases")
+        if self.risk not in RISK_LEVELS:
+            raise OrcaRuntimeError(
+                f"INVALID_RISK: {self.risk!r} is not one of {RISK_LEVELS}; no Run is "
+                "created and no Task is dispatched"
+            )
         # STEP 0, before the run terminal and long before the first Task. The run's
         # quality model is read exactly once, here, and an invalid profile stops the
         # run at its boundary instead of at the first spec that needs it: nobody can
@@ -1483,6 +1508,9 @@ class OrcaRuntimeHarness:
             self.run_id,
             base=self.artifact_dir,
             event="run_start",
+            risk=self.risk,
+            risk_source=self.risk_source,
+            requested_phases=",".join(self.requested_phases),
             detail=objective,
             timestamp=self._run_started_at,
         )
@@ -1492,6 +1520,7 @@ class OrcaRuntimeHarness:
             base=self.artifact_dir,
             event="run_start",
             started_at=self._run_started_at,
+            risk=self.risk,
             timestamp=self._run_started_at,
         )
         return self.run_id
@@ -1504,6 +1533,43 @@ class OrcaRuntimeHarness:
         args.extend(["--from", self.run_owner])
         created = self.call(*args)
         return created["result"]["task"]["id"]
+
+    def create_phase_graph(
+        self, worker_spec: str, reviewer_spec: str | None = None
+    ) -> tuple[str, str | None]:
+        """SKILL.md section 6 step 2, in one place instead of per scenario.
+
+        MEDIUM/HIGH -> (worker_task, reviewer_task) with the dependency edge declared
+                       before the Worker is dispatched.
+        LOW         -> (worker_task, None); no dependent Reviewer node is created at
+                       all, so nothing is promoted to ready and then abandoned.
+
+        The Final Adversarial Review does NOT go through this method: section 17's
+        Task is a single node with no dependencies, created at every risk level,
+        LOW included.
+        """
+        worker_task = self.create_task(worker_spec)
+        if self.risk == "low" or reviewer_spec is None:
+            return worker_task, None
+        return worker_task, self.create_task(reviewer_spec, deps=(worker_task,))
+
+    def log_reviewer_gate_skipped(self, phase: str) -> None:
+        """One positive row per phase whose Reviewer gate LOW skips.
+
+        The absence of a reviewer row must never be the only evidence that a gate
+        was skipped -- that is indistinguishable from a crash or a dropped write.
+        """
+        if not self.run_id:
+            return
+        self._safe_log(
+            run_logging.log_orchestrator_event,
+            self.run_id,
+            base=self.artifact_dir,
+            event="reviewer_gate_skipped",
+            phase=phase,
+            risk=self.risk,
+            detail="risk=low: no phase Reviewer gate for this phase",
+        )
 
     def task_status(self, task_id: str) -> str:
         """Read one task's status from the run's task listing."""
@@ -1931,6 +1997,7 @@ class OrcaRuntimeHarness:
         started_at: str,
         ended_at: str,
         event: str = "dispatch_settled",
+        round_kind: str = "phase_gate",
     ) -> None:
         """One ORCHESTRATOR_LOG.md row and one TIMING_LOG.md row for one attempt.
 
@@ -1944,6 +2011,15 @@ class OrcaRuntimeHarness:
         """
         if not self.run_id:
             return
+        # OS-3 TEST review F-001: the value is threaded explicitly from each dispatch
+        # call site, never inferred from unrelated state, and validated here -- the
+        # single funnel every settled dispatch passes through. run_logging owns the
+        # vocabulary, so there is one list, not two.
+        if round_kind not in run_logging.ROUND_KIND_VALUES:
+            raise OrcaRuntimeError(
+                f"unknown round_kind: {round_kind!r}; expected one of "
+                f"{run_logging.ROUND_KIND_VALUES}"
+            )
         # round 5 review MAJOR: the phase/iteration boundary for this attempt's
         # own (phase, iteration) is opened by the CALLER, before the dispatch
         # this attempt reports on ever started -- see _open_phase_iteration_
@@ -1984,6 +2060,12 @@ class OrcaRuntimeHarness:
             reuse=attempt.terminal_effect,
             gate_result=gate_result,
             review_verdict=review_verdict,
+            risk=self.risk,
+            # Written on unexpected_exit rows too: both events describe a dispatch,
+            # and "which kind of round did this happen in" is exactly the question
+            # OS-17's workflow-path requirement asks. Only pre_dispatch_failure --
+            # which has no dispatch at all -- leaves it blank.
+            round_kind=round_kind,
             result=(
                 f"outcome={attempt.outcome} settlement={attempt.settlement} "
                 f"lifecycle={attempt.lifecycle_action} "
@@ -2002,6 +2084,7 @@ class OrcaRuntimeHarness:
             started_at=started_at,
             ended_at=ended_at,
             duration_seconds=run_logging.elapsed_seconds(started_at, ended_at),
+            risk=self.risk,
             detail=f"task={attempt.task_id} dispatch={attempt.dispatch_id}",
         )
 
@@ -2052,6 +2135,8 @@ class OrcaRuntimeHarness:
             base=self.artifact_dir,
             reason=reason,
             run_started_at=self._run_started_at,
+            risk=self.risk,
+            risk_source=self.risk_source,
         )
 
     # ---- OS-17 review: automatic phase/iteration boundaries in TIMING_LOG ---------
@@ -2106,6 +2191,7 @@ class OrcaRuntimeHarness:
                 event="phase_start",
                 phase=phase,
                 started_at=opened_at,
+                risk=self.risk,
                 timestamp=opened_at,
             )
         iteration_key = (phase, iteration)
@@ -2123,6 +2209,7 @@ class OrcaRuntimeHarness:
                 phase=phase,
                 iteration=iteration,
                 started_at=opened_at,
+                risk=self.risk,
                 timestamp=opened_at,
             )
 
@@ -2142,6 +2229,7 @@ class OrcaRuntimeHarness:
             started_at=started_at,
             ended_at=ended,
             duration_seconds=run_logging.elapsed_seconds(started_at, ended),
+            risk=self.risk,
             detail=self._open_iteration_result,
             timestamp=ended,
         )
@@ -2165,6 +2253,7 @@ class OrcaRuntimeHarness:
             started_at=started_at,
             ended_at=ended,
             duration_seconds=run_logging.elapsed_seconds(started_at, ended),
+            risk=self.risk,
             detail=self._open_phase_result,
             timestamp=ended,
         )
@@ -2189,6 +2278,7 @@ class OrcaRuntimeHarness:
         lifecycle: str = "release",
         terminal: str | None = None,
         max_dispatches: int = 1,
+        round_kind: str = "phase_gate",
     ) -> tuple[RuntimeAttempt, str]:
         """Dispatch and settle a Task that already exists (the graph-first path).
 
@@ -2217,6 +2307,8 @@ class OrcaRuntimeHarness:
                 run_id=self.run_id or "",
                 quality_profile=self.quality_profile,
                 requested_phases=self.requested_phases,
+                risk=self.risk,
+                risk_source=self.risk_source,
             )
         except (TaskContextError, OrcaRuntimeError) as error:
             # OS-17 section 5: a pre-dispatch failure (invalid profile, an
@@ -2280,6 +2372,7 @@ class OrcaRuntimeHarness:
             terminal_created=created_here,
             started_at=dispatch_started_at,
             ended_at=dispatch_ended_at,
+            round_kind=round_kind,
         )
         return attempt, handle
 
@@ -2297,6 +2390,7 @@ class OrcaRuntimeHarness:
         lifecycle: str = "release",
         terminal: str | None = None,
         max_dispatches: int = 1,
+        round_kind: str = "phase_gate",
     ) -> tuple[RuntimeAttempt, str]:
         """Create the Task, then run it. Return type and behavior unchanged.
 
@@ -2319,6 +2413,8 @@ class OrcaRuntimeHarness:
                 run_id=self.run_id or "",
                 quality_profile=self.quality_profile,
                 requested_phases=self.requested_phases,
+                risk=self.risk,
+                risk_source=self.risk_source,
             )
         except (TaskContextError, OrcaRuntimeError) as error:
             # Same OS-17 pre-dispatch-failure logging as run_existing_task's own
@@ -2343,10 +2439,16 @@ class OrcaRuntimeHarness:
             lifecycle=lifecycle,
             terminal=terminal,
             max_dispatches=max_dispatches,
+            round_kind=round_kind,
         )
 
     def observe_unexpected_exit(
-        self, role: str, iteration: int, *, phase: str | None = None
+        self,
+        role: str,
+        iteration: int,
+        *,
+        phase: str | None = None,
+        round_kind: str = "phase_gate",
     ) -> RuntimeAttempt:
         dispatch_started_at = run_logging.now_iso()
         try:
@@ -2359,6 +2461,8 @@ class OrcaRuntimeHarness:
                 run_id=self.run_id or "",
                 quality_profile=self.quality_profile,
                 requested_phases=self.requested_phases,
+                risk=self.risk,
+                risk_source=self.risk_source,
             )
         except (TaskContextError, OrcaRuntimeError) as error:
             self._log_pre_dispatch_failure(
@@ -2482,6 +2586,7 @@ class OrcaRuntimeHarness:
             started_at=dispatch_started_at,
             ended_at=run_logging.now_iso(),
             event="unexpected_exit",
+            round_kind=round_kind,
         )
         return attempt
 
@@ -2629,6 +2734,7 @@ class OrcaRuntimeHarness:
 # that phase explicitly. Naming it is the point: current_phase is never inferred from
 # the fake agent's mode, not even when a scenario only cares about the mode.
 LIFECYCLE_SCENARIO_PHASE = "implementation"
+RISK_LEVELS = ("low", "medium", "high")
 # Scenario K's run objective, and therefore the ORIGINAL objective its Reviewers are
 # told about: the request the whole chain exists to satisfy, not the one-line spec of
 # whichever attempt is being dispatched.
@@ -2667,29 +2773,19 @@ def run_runtime_scenarios(artifact_dir: Path) -> list[RuntimeScenarioResult]:
         "correction",
         phase=LIFECYCLE_SCENARIO_PHASE,
         resolutions={"R1": "RESOLVED"},
+        round_kind="correction",
     )
     reviewer2, _ = harness.run_attempt(
-        "reviewer", 2, "pass", phase=LIFECYCLE_SCENARIO_PHASE, terminal=reviewer_terminal
+        "reviewer",
+        2,
+        "pass",
+        phase=LIFECYCLE_SCENARIO_PHASE,
+        terminal=reviewer_terminal,
+        round_kind="correction",
     )
     results.append(harness.finish(RuntimeScenarioResult("B", run_id, "COMPLETED", 2, [worker, reviewer1, correction, reviewer2])))
 
-    run_id = harness.start_run("Step 4 Scenario C max iterations")
-    attempts = []
-    for iteration in range(1, 4):
-        worker, _ = harness.run_attempt(
-            "worker", iteration, "complete" if iteration == 1 else "correction",
-            phase=LIFECYCLE_SCENARIO_PHASE,
-            resolutions={} if iteration == 1 else {"R1": "DISPUTED"},
-        )
-        reviewer, _ = harness.run_attempt(
-            "reviewer",
-            iteration,
-            "fail",
-            phase=LIFECYCLE_SCENARIO_PHASE,
-            findings=("R1",),
-        )
-        attempts.extend((worker, reviewer))
-    results.append(harness.finish(RuntimeScenarioResult("C", run_id, "ESCALATED", 3, attempts)))
+    results.append(_scenario_c(harness))
 
     run_id = harness.start_run("Step 4 Scenario D Worker BLOCKED")
     worker, _ = harness.run_attempt("worker", 1, "blocked", phase=LIFECYCLE_SCENARIO_PHASE)
@@ -2737,7 +2833,12 @@ def run_final_review_runtime_scenario(artifact_dir: Path) -> RuntimeScenarioResu
     # The phase is the gate itself, not the phase under review: a Final Adversarial
     # Review reads the whole run, and its boundary says so.
     final_1, final_terminal_1 = harness.run_attempt(
-        "reviewer", 1, "fail", phase=FINAL_REVIEW_PHASE, findings=("R1",)
+        "reviewer",
+        1,
+        "fail",
+        phase=FINAL_REVIEW_PHASE,
+        findings=("R1",),
+        round_kind="final_review",
     )
     correction, _ = harness.run_attempt(
         "worker",
@@ -2745,10 +2846,11 @@ def run_final_review_runtime_scenario(artifact_dir: Path) -> RuntimeScenarioResu
         "correction",
         phase=LIFECYCLE_SCENARIO_PHASE,
         resolutions={"R1": "RESOLVED"},
+        round_kind="correction",
     )
     # attempt 2: another brand-new terminal, again with no terminal= argument.
     final_2, final_terminal_2 = harness.run_attempt(
-        "reviewer", 2, "pass", phase=FINAL_REVIEW_PHASE
+        "reviewer", 2, "pass", phase=FINAL_REVIEW_PHASE, round_kind="final_review"
     )
 
     result = RuntimeScenarioResult(
@@ -2831,7 +2933,9 @@ def run_quality_profile_runtime_scenario(
         harness.run_attempt("reviewer", 1, "pass", phase="design")[0],
         harness.run_attempt("worker", 1, "complete", phase="implementation")[0],
         harness.run_attempt("reviewer", 1, "pass", phase="implementation")[0],
-        harness.run_attempt("reviewer", 1, "pass", phase=FINAL_REVIEW_PHASE)[0],
+        harness.run_attempt(
+            "reviewer", 1, "pass", phase=FINAL_REVIEW_PHASE, round_kind="final_review"
+        )[0],
     ]
 
     result = RuntimeScenarioResult("L", run_id, "COMPLETED", 1, attempts)
@@ -2932,6 +3036,8 @@ def run_session_reuse_runtime_scenario(artifact_dir: Path) -> RuntimeScenarioRes
             run_id=run_id,
             quality_profile=harness.quality_profile,
             requested_phases=harness.requested_phases,
+            risk=harness.risk,
+            risk_source=harness.risk_source,
         )
         worker, _ = harness.run_existing_task(
             "worker",
@@ -2968,7 +3074,18 @@ def run_session_reuse_runtime_scenario(artifact_dir: Path) -> RuntimeScenarioRes
             run_id=run_id,
             quality_profile=harness.quality_profile,
             requested_phases=harness.requested_phases,
+            risk=harness.risk,
+            risk_source=harness.risk_source,
         )
+        # OS-3 (site 2 of the verdict table): EXCLUDED from create_phase_graph -- this
+        # fixture deliberately has no dependency edge and deliberately builds the
+        # reviewer spec AFTER the worker settles, which is the property it exists to
+        # demonstrate. The risk conditional therefore lives at the caller instead.
+        if harness.risk == "low":
+            harness.log_reviewer_gate_skipped(phase)
+            worker_previous = worker
+            attempts.append(worker)
+            continue
         reviewer, _ = harness.run_existing_task(
             "reviewer",
             iteration,
@@ -2993,6 +3110,119 @@ def run_session_reuse_runtime_scenario(artifact_dir: Path) -> RuntimeScenarioRes
     return harness.finish(result)
 
 
+def run_risk_runtime_scenario(artifact_dir: Path) -> list[RuntimeScenarioResult]:
+    """OS-3: the section 6 graph shape, asserted on the MIGRATED path.
+
+    Runs the migrated _scenario_g site twice -- once at LOW, once at MEDIUM -- and
+    records what the run's REAL task list contained, not what the helper returned.
+    At LOW there must be no phase Reviewer task at all; at MEDIUM the Reviewer task
+    must be pending before the Worker settles and ready after. The section 17 Final
+    Review task is created at both levels and never routes through the helper.
+    """
+    results: list[RuntimeScenarioResult] = []
+    for risk in ("low", "medium"):
+        harness = OrcaRuntimeHarness(artifact_dir, risk=risk, risk_source="explicit")
+        harness.preflight()
+        run_id = harness.start_run(
+            f"OS-3 risk scenario ({risk})",
+            requested_phases=(LIFECYCLE_SCENARIO_PHASE,),
+        )
+        worker_spec = dispatch_context(
+            "worker",
+            1,
+            "complete",
+            phase=LIFECYCLE_SCENARIO_PHASE,
+            run_id=run_id,
+            quality_profile=harness.quality_profile,
+            requested_phases=harness.requested_phases,
+            risk=harness.risk,
+            risk_source=harness.risk_source,
+        )[0]
+        reviewer_spec = dispatch_context(
+            "reviewer",
+            1,
+            "pass",
+            phase=LIFECYCLE_SCENARIO_PHASE,
+            run_id=run_id,
+            quality_profile=harness.quality_profile,
+            requested_phases=harness.requested_phases,
+            risk=harness.risk,
+            risk_source=harness.risk_source,
+        )[0]
+        worker_task, reviewer_task = harness.create_phase_graph(
+            worker_spec, reviewer_spec
+        )
+        result = RuntimeScenarioResult("R", run_id, "COMPLETED", 1)
+        result.risk = harness.risk
+        result.risk_source = harness.risk_source
+        if reviewer_task is None:
+            harness.log_reviewer_gate_skipped(LIFECYCLE_SCENARIO_PHASE)
+            result.reviewer_gates_skipped = [LIFECYCLE_SCENARIO_PHASE]
+        else:
+            result.phase_reviewer_task_ids = [reviewer_task]
+            result.reviewer_task_status = harness.task_status(reviewer_task)
+        worker, _ = harness.run_existing_task(
+            "worker",
+            1,
+            "complete",
+            worker_task,
+            phase=LIFECYCLE_SCENARIO_PHASE,
+            spec=worker_spec,
+        )
+        result.attempts.append(worker)
+        if reviewer_task is not None:
+            result.reviewer_task_status = harness.task_status(reviewer_task)
+            reviewer, _ = harness.run_existing_task(
+                "reviewer",
+                1,
+                "pass",
+                reviewer_task,
+                phase=LIFECYCLE_SCENARIO_PHASE,
+                spec=reviewer_spec,
+            )
+            result.attempts.append(reviewer)
+        harness.log_run_status("COMPLETED")
+        results.append(harness.finish(result))
+    return results
+
+
+def _scenario_c(harness: OrcaRuntimeHarness) -> RuntimeScenarioResult:
+    """Scenario C: the per-phase iteration budget, exhausted by repeated FAILs.
+
+    Extracted from run_runtime_scenarios() so its produced log rows can be asserted
+    offline, the same way _scenario_g/h/i already are. That extraction is what makes
+    the round_kind labelling below checkable: iteration 1 is the phase gate, and
+    iterations 2-3 are correction rounds (their Worker mode says so), so each pair of
+    dispatches is labelled for the round it actually belongs to rather than taking
+    _log_attempt()'s phase_gate default.
+    """
+    run_id = harness.start_run("Step 4 Scenario C max iterations")
+    attempts = []
+    for iteration in range(1, 4):
+        # One value, computed once and passed to BOTH sides of the round: the Worker
+        # that does the work and the Reviewer that re-reviews it belong to the same
+        # round, and labelling only one of them is how a round becomes unreadable.
+        round_kind = "phase_gate" if iteration == 1 else "correction"
+        worker, _ = harness.run_attempt(
+            "worker", iteration, "complete" if iteration == 1 else "correction",
+            phase=LIFECYCLE_SCENARIO_PHASE,
+            resolutions={} if iteration == 1 else {"R1": "DISPUTED"},
+            round_kind=round_kind,
+        )
+        reviewer, _ = harness.run_attempt(
+            "reviewer",
+            iteration,
+            "fail",
+            phase=LIFECYCLE_SCENARIO_PHASE,
+            findings=("R1",),
+            round_kind=round_kind,
+        )
+        attempts.extend((worker, reviewer))
+    return harness.finish(
+        RuntimeScenarioResult("C", run_id, "ESCALATED", 3, attempts)
+    )
+
+
 def _scenario_g(harness: OrcaRuntimeHarness) -> RuntimeScenarioResult:
     """Graph-first dependency promotion: no manual readiness override anywhere."""
     run_id = harness.start_run("Step 4 Scenario G graph-first dependency promotion")
@@ -3004,20 +3234,28 @@ def _scenario_g(harness: OrcaRuntimeHarness) -> RuntimeScenarioResult:
         run_id=run_id,
         quality_profile=harness.quality_profile,
         requested_phases=harness.requested_phases,
+        risk=harness.risk,
+        risk_source=harness.risk_source,
     )[0]
-    worker_task = harness.create_task(worker_spec)
-    reviewer_task = harness.create_task(
-        dispatch_context(
-            "reviewer",
-            1,
-            "pass",
-            phase=LIFECYCLE_SCENARIO_PHASE,
-            run_id=run_id,
-            quality_profile=harness.quality_profile,
-            requested_phases=harness.requested_phases,
-        )[0],
-        deps=(worker_task,),
-    )
+    # OS-3 MIGRATION (site 1 of the seven-site verdict table): the one positive
+    # Worker + dependent-Reviewer pair in this file now goes through the risk-aware
+    # helper, so LOW creates no dependent Reviewer node at all.
+    reviewer_spec = dispatch_context(
+        "reviewer",
+        1,
+        "pass",
+        phase=LIFECYCLE_SCENARIO_PHASE,
+        run_id=run_id,
+        quality_profile=harness.quality_profile,
+        requested_phases=harness.requested_phases,
+        risk=harness.risk,
+        risk_source=harness.risk_source,
+    )[0]
+    worker_task, reviewer_task = harness.create_phase_graph(worker_spec, reviewer_spec)
+    if reviewer_task is None:
+        raise OrcaRuntimeError(
+            "scenario G requires a dependent Reviewer node; run it at medium/high risk"
+        )
     pending_status = harness.task_status(reviewer_task)
     if pending_status != "pending":
         raise OrcaRuntimeError(
@@ -3058,6 +3296,8 @@ def _scenario_h(harness: OrcaRuntimeHarness) -> RuntimeScenarioResult:
         run_id=run_id,
         quality_profile=harness.quality_profile,
         requested_phases=harness.requested_phases,
+        risk=harness.risk,
+        risk_source=harness.risk_source,
     )[0]
     worker_task = harness.create_task(worker_spec)
     worker_attempt, _ = harness.run_existing_task(

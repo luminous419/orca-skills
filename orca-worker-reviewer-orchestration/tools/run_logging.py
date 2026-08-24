@@ -56,6 +56,15 @@ ORCHESTRATOR_LOG_COLUMNS = (
     "reuse",
     "gate_result",
     "review_verdict",
+    # OS-3. Sparse by design, the same way gate_result/review_verdict are: `risk` is
+    # on run_start, every dispatch_settled, reviewer_gate_skipped and run_end;
+    # `risk_source` on run_start and run_end; `requested_phases` on run_start;
+    # `round_kind` on every dispatch_settled. Each answers a distinct question OS-3
+    # asks these logs, and a column is machine-parseable where prose is not.
+    "risk",
+    "risk_source",
+    "requested_phases",
+    "round_kind",
     "result",
     "detail",
 )
@@ -68,6 +77,8 @@ TIMING_LOG_COLUMNS = (
     "started_at",
     "ended_at",
     "duration_s",
+    # A duration is only interpretable against the strength that produced it.
+    "risk",
     "detail",
 )
 
@@ -76,6 +87,17 @@ TIMING_LOG_COLUMNS = (
 # one of the four the contract names, and that fails closed rather than being
 # written as an unrecognized string a later reader has to guess about.
 RUN_STATUS_VALUES = ("COMPLETED", "BLOCKED", "ERROR", "ESCALATED")
+# OS-3 column vocabularies. Spelled here rather than imported: this module
+# deliberately imports nothing from scripts/ (see the docstring), and the CLI's
+# existing `--action` choices are the precedent for constraining a column this way.
+RISK_VALUES = ("low", "medium", "high")
+RISK_SOURCE_VALUES = ("explicit", "default")
+ROUND_KIND_VALUES = (
+    "phase_gate",
+    "correction",
+    "downstream_revalidation",
+    "final_review",
+)
 
 
 class RunLoggingError(ValueError):
@@ -182,6 +204,10 @@ def log_orchestrator_event(
     reuse: str = "",
     gate_result: str = "",
     review_verdict: str = "",
+    risk: str = "",
+    risk_source: str = "",
+    requested_phases: str = "",
+    round_kind: str = "",
     result: str = "",
     detail: str = "",
     timestamp: str | None = None,
@@ -219,6 +245,10 @@ def log_orchestrator_event(
             "reuse": reuse,
             "gate_result": gate_result,
             "review_verdict": review_verdict,
+            "risk": risk,
+            "risk_source": risk_source,
+            "requested_phases": requested_phases,
+            "round_kind": round_kind,
             "result": result,
             "detail": detail,
         },
@@ -237,6 +267,7 @@ def log_timing_event(
     started_at: str = "",
     ended_at: str = "",
     duration_seconds: float | str = "",
+    risk: str = "",
     detail: str = "",
     timestamp: str | None = None,
 ) -> Path:
@@ -270,6 +301,7 @@ def log_timing_event(
             "started_at": started_at,
             "ended_at": ended_at,
             "duration_s": duration,
+            "risk": risk,
             "detail": detail,
         },
     )
@@ -283,6 +315,8 @@ def log_run_status(
     base: Path | None = None,
     reason: str = "",
     run_started_at: str = "",
+    risk: str = "",
+    risk_source: str = "",
 ) -> None:
     """The one run-end event: one ORCHESTRATOR_LOG row, one TIMING_LOG row.
 
@@ -298,6 +332,8 @@ def log_run_status(
         run_id,
         base=base,
         event="run_end",
+        risk=risk,
+        risk_source=risk_source,
         result=status,
         detail=reason,
         timestamp=ended_at,
@@ -309,6 +345,7 @@ def log_run_status(
         started_at=run_started_at,
         ended_at=ended_at,
         duration_seconds=elapsed_seconds(run_started_at, ended_at),
+        risk=risk,
         detail=status,
         timestamp=ended_at,
     )
@@ -356,6 +393,14 @@ def _build_parser() -> argparse.ArgumentParser:
     orchestrator.add_argument("--reuse", default="")
     orchestrator.add_argument("--gate-result", default="")
     orchestrator.add_argument("--review-verdict", default="")
+    orchestrator.add_argument("--risk", default="", choices=("", *RISK_VALUES))
+    orchestrator.add_argument(
+        "--risk-source", default="", choices=("", *RISK_SOURCE_VALUES)
+    )
+    orchestrator.add_argument("--requested-phases", default="")
+    orchestrator.add_argument(
+        "--round-kind", default="", choices=("", *ROUND_KIND_VALUES)
+    )
     orchestrator.add_argument("--result", default="")
     orchestrator.add_argument("--detail", default="")
 
@@ -365,6 +410,7 @@ def _build_parser() -> argparse.ArgumentParser:
     timing.add_argument("--started-at", default="")
     timing.add_argument("--ended-at", default="")
     timing.add_argument("--duration-seconds", default="")
+    timing.add_argument("--risk", default="", choices=("", *RISK_VALUES))
     timing.add_argument("--detail", default="")
 
     status = subparsers.add_parser(
@@ -375,6 +421,10 @@ def _build_parser() -> argparse.ArgumentParser:
     status.add_argument("--status", required=True, choices=RUN_STATUS_VALUES)
     status.add_argument("--reason", default="")
     status.add_argument("--run-started-at", default="")
+    status.add_argument("--risk", default="", choices=("", *RISK_VALUES))
+    status.add_argument(
+        "--risk-source", default="", choices=("", *RISK_SOURCE_VALUES)
+    )
 
     return parser
 
@@ -397,6 +447,10 @@ def main(argv: list[str] | None = None) -> int:
             reuse=args.reuse,
             gate_result=args.gate_result,
             review_verdict=args.review_verdict,
+            risk=args.risk,
+            risk_source=args.risk_source,
+            requested_phases=args.requested_phases,
+            round_kind=args.round_kind,
             result=args.result,
             detail=args.detail,
         )
@@ -411,6 +465,7 @@ def main(argv: list[str] | None = None) -> int:
             started_at=args.started_at,
             ended_at=args.ended_at,
             duration_seconds=args.duration_seconds,
+            risk=args.risk,
             detail=args.detail,
         )
     else:
@@ -420,6 +475,8 @@ def main(argv: list[str] | None = None) -> int:
             base=base,
             reason=args.reason,
             run_started_at=args.run_started_at,
+            risk=args.risk,
+            risk_source=args.risk_source,
         )
         path = orchestrator_log_path(args.run_id, base=base)
     print(path)

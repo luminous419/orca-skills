@@ -21,6 +21,7 @@ try:
         UnsupportedOrcaContract,
         run_final_review_runtime_scenario,
         run_quality_profile_runtime_scenario,
+        run_risk_runtime_scenario,
         run_runtime_scenarios,
         run_session_reuse_runtime_scenario,
     )
@@ -35,6 +36,7 @@ except ModuleNotFoundError:
         UnsupportedOrcaContract,
         run_final_review_runtime_scenario,
         run_quality_profile_runtime_scenario,
+        run_risk_runtime_scenario,
         run_runtime_scenarios,
         run_session_reuse_runtime_scenario,
     )
@@ -369,6 +371,55 @@ def main() -> None:
         global ARTIFACT_DIR
         ARTIFACT_DIR = args.artifact_dir
     unittest.main(argv=[__file__, *unittest_args])
+
+
+class RiskRuntimeIntegrationTests(unittest.TestCase):
+    """Opt-in scenario R: the OS-3 section 6 risk-conditional Task graph, real runtime.
+
+    Skipped unless ORCA_RUNTIME_TEST=1, exactly like the other opt-in classes.
+    run_risk_runtime_scenario() shipped with no caller at all -- not registered here
+    the way the final-review, quality-profile and session-reuse scenarios are -- so
+    it could never run even on a matching runtime. This class is that registration;
+    the offline RiskGraphContractTests in test_orca_runtime_contract.py remains the
+    primary proof surface.
+    """
+
+    def test_risk_conditional_phase_graph(self) -> None:
+        if not RUN_ORCA:
+            self.skipTest("requires --orca-runtime and a ready Orca runtime")
+        if ARTIFACT_DIR:
+            artifact_dir = Path(ARTIFACT_DIR)
+            try:
+                results = run_risk_runtime_scenario(artifact_dir)
+            except UnsupportedOrcaContract as exc:
+                self.skipTest(str(exc))
+            self.assert_scenario_r(results)
+        else:
+            with tempfile.TemporaryDirectory() as directory:
+                artifact_dir = Path(directory)
+                try:
+                    results = run_risk_runtime_scenario(artifact_dir)
+                except UnsupportedOrcaContract as exc:
+                    self.skipTest(str(exc))
+                self.assert_scenario_r(results)
+
+    def assert_scenario_r(self, results) -> None:
+        """LOW leaves no phase Reviewer task in the run; MEDIUM creates one and it is
+        promoted by the Worker's completion."""
+        by_risk = {result.risk: result for result in results}
+        self.assertEqual(set(by_risk), {"low", "medium"})
+
+        low = by_risk["low"]
+        self.assertEqual(low.risk_source, "explicit")
+        self.assertEqual(low.phase_reviewer_task_ids, [])
+        self.assertEqual(low.reviewer_gates_skipped, ["implementation"])
+        self.assertEqual(low.reviewer_task_status, "")
+
+        medium = by_risk["medium"]
+        self.assertEqual(len(medium.phase_reviewer_task_ids), 1)
+        self.assertEqual(medium.reviewer_gates_skipped, [])
+        # Promoted by dependency completion, never by a manual readiness override.
+        self.assertEqual(medium.reviewer_task_status, "ready")
 
 
 class FinalReviewRuntimeIntegrationTests(unittest.TestCase):

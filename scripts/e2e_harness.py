@@ -15,9 +15,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from scripts.quality_profile import resolve_quality_profile
+from scripts.skill_policy import load_risk_contract
 from scripts.task_context import (
+    RISK_CONTEXT_KEYS,
+    RISK_SPEC_HEADER,
     build_quality_gate_context,
+    build_risk_context,
     parse_quality_gate,
+    parse_risk_profile,
     build_reviewer_context,
     build_task_boundary,
     ensure_run_artifact_root,
@@ -79,8 +84,33 @@ SESSION_AGENT_COMMANDS = {
 }
 
 
+# ---- OS-3 -------------------------------------------------------------------------
+RISK_LEVELS = ("low", "medium", "high")
+UNIT_TEST_STATUS_FIELD = "UNIT_TEST_STATUS"
+UNIT_TEST_STATUS_PASS = "PASS"
+UNIT_TEST_STATUS_BLOCKED = "BLOCKED"
+UNIT_TEST_STATUS_VALUES = (UNIT_TEST_STATUS_PASS, UNIT_TEST_STATUS_BLOCKED)
+# SKILL.md section 14's three headings, and only those. TEST is deliberately absent:
+# its obligations live in templates/test.md's Mandatory Invariants (the phase
+# contract, tier 3), not in section 14, and templates/ is byte-locked across skills.
+UNIT_TEST_GATED_PHASES = frozenset({"implementation", "bugfix", "refactoring"})
+UNIT_TEST_EVIDENCE_MISSING_REASON = "UNIT_TEST_EVIDENCE_MISSING"
+UNIT_TEST_BLOCKED_REASON = "UNIT_TEST_BLOCKED"
+
+
 class OutputContractError(ValueError):
     """Raised when fake-agent output violates the documented result contract."""
+
+
+class RiskNotSupportedError(ValueError):
+    """Raised when an explicit risk is given to a skill that has no risk axis.
+
+    A separate class rather than OutputContractError: that one means "fake-agent
+    output violates the result contract" and is caught by run()'s output-parsing
+    blocks, so a capability error routed through it would be silently converted into
+    a MALFORMED_WORKER_OUTPUT result. ValueError keeps it in the same house shape as
+    TaskContextError / RunLoggingError / PolicyContractError.
+    """
 
 
 @dataclass(frozen=True)
@@ -89,6 +119,15 @@ class FakeScenario:
     reviewer_modes: tuple[str, ...]
     reviewer_findings: tuple[tuple[str, ...], ...] = ()
     worker_resolutions: tuple[dict[str, str], ...] = ()
+    # OS-3: per-iteration section 14 evidence, indexed exactly like
+    # worker_resolutions. Empty tuple -> no flag passed -> byte-identical output.
+    worker_unit_test_statuses: tuple[str, ...] = ()
+    # The malformed-output seam: per iteration, the RAW UNIT_TEST_STATUS values to
+    # emit, one line each and unconstrained, so a scenario can drive the parser's
+    # duplicate-line and unknown-value branches through the real subprocess. Separate
+    # from the field above rather than loosening it: that one is the well-formed knob
+    # every ordinary scenario uses, and it should stay impossible to misuse.
+    worker_unit_test_status_lines: tuple[tuple[str, ...], ...] = ()
 
 
 @dataclass
@@ -147,6 +186,11 @@ class SessionEvent:
     task_boundary: tuple[tuple[str, str], ...] = ()
     reviewer_context_keys: tuple[str, ...] = ()
     quality_gate: tuple[tuple[str, str], ...] = ()
+    # OS-3: the risk block parsed back OUT of the dispatched --task-spec text, the
+    # same way quality_gate is. () for a skill with no risk axis and for the
+    # final_review record. Contains no absolute paths, so it cannot reintroduce the
+    # drill_down non-determinism this docstring warns about above.
+    risk_profile: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -197,6 +241,12 @@ class WorkflowScenario:
         default_factory=dict
     )
     session_policy: str = "reuse"
+    # OS-3. None means "not specified", NOT "high": a field defaulted to "high" could
+    # not distinguish "explicitly asked for HIGH" from "said nothing", and both the
+    # loop-skill fail-closed rule and the precedence rule depend on that difference.
+    # There is deliberately no risk_source field -- a scenario that supplies a value
+    # IS the explicit case, so a second field could only agree redundantly or lie.
+    risk: str | None = None
 
 
 @dataclass
@@ -213,6 +263,10 @@ class WorkflowRunResult:
     revalidation_dispatches: list[tuple[str, int]] = field(default_factory=list)
     reason: str | None = None
     sessions: tuple[SessionEvent, ...] = ()
+    # OS-3 reporting (never input): None for a skill with no risk axis.
+    risk: str | None = None
+    risk_source: str | None = None
+    reviewer_gates_skipped: list[str] = field(default_factory=list)
 
 
 def _parse_choice(output: str, field_name: str, allowed: set[str]) -> str:
@@ -246,6 +300,36 @@ def parse_worker_output(
             raise OutputContractError(f"duplicate finding resolution {finding_id}")
         resolutions[finding_id] = resolution
     return status, resolutions
+
+
+def parse_unit_test_status(output: str) -> str:
+    """The section 14 gate result a Worker reported, or "" when it reported none.
+
+    A standalone reader rather than a fourth element on parse_worker_output()'s
+    return tuple: that function has three call sites and is bound by existing tests,
+    and an ABSENT field is a legitimate, common state that must not become an
+    OutputContractError -- it is the CALLER that decides whether absence is
+    acceptable, which is what makes the LOW/MEDIUM/HIGH split expressible here.
+
+    Raises OutputContractError on more than one line, or on a value outside
+    UNIT_TEST_STATUS_VALUES, matching _parse_choice's own strictness.
+    """
+    values = [
+        match.group("value")
+        for match in FIELD_LINE.finditer(output)
+        if match.group("field") == UNIT_TEST_STATUS_FIELD
+    ]
+    if not values:
+        return ""
+    if len(values) > 1:
+        raise OutputContractError(
+            f"expected at most one {UNIT_TEST_STATUS_FIELD}, got {values}"
+        )
+    if values[0] not in UNIT_TEST_STATUS_VALUES:
+        raise OutputContractError(
+            f"invalid {UNIT_TEST_STATUS_FIELD} {values[0]}"
+        )
+    return values[0]
 
 
 def parse_reviewer_output(
@@ -290,6 +374,18 @@ def _parsed_quality_gate(spec: str) -> tuple[tuple[str, str], ...]:
     payload can answer it.
     """
     return tuple(sorted(parse_quality_gate(spec).items()))
+
+
+def _parsed_risk_profile(spec: str) -> tuple[tuple[str, str], ...]:
+    """The risk block read back out of a rendered spec, as sorted pairs.
+
+    Returns () when the spec carries no block at all -- the honest answer for a skill
+    with no risk axis, and the reason this does not call parse_risk_profile()
+    unguarded (that function raises on an absent block, by design).
+    """
+    if RISK_SPEC_HEADER not in spec:
+        return ()
+    return tuple(sorted(parse_risk_profile(spec).items()))
 
 
 def final_review_artifact_path(run_id: str, attempt: int) -> str:
@@ -486,8 +582,17 @@ class E2EHarness:
         protected_artifacts: tuple[Path, ...] = (),
         session_policy: str = "reuse",
         run_id: str = "run_e2e",
+        risk: str | None = None,
     ) -> None:
         self.contract = load_workflow_output_contract(skill_path)
+        # OS-3. Resolved ONCE, from the skill this harness was constructed for,
+        # exactly the way evaluate_invocation() distinguishes the two skills. None
+        # means "this skill has no risk axis", which is what orca-worker-reviewer-loop
+        # yields with no edit to that file -- so its dispatched specs stay
+        # byte-identical and its SessionEvents keep risk_profile == ().
+        self.risk_contract = load_risk_contract(skill_path)
+        self.supports_risk = self.risk_contract is not None
+        self.risk, self.risk_source = self._resolve_risk(risk, skill_path)
         self.phase = phase
         self.max_iterations = max_iterations
         self.workspace = workspace
@@ -517,6 +622,59 @@ class E2EHarness:
         self._session_ids: dict[str, str] = {}
         self._session_counter = itertools.count(1)
         self.session_policy = session_policy
+
+    def _resolve_risk(
+        self, risk: str | None, skill_path: Path
+    ) -> tuple[str | None, str | None]:
+        """The (level, source) pair this harness is frozen at. Called once, from
+        __init__.
+
+        The ONLY place a risk level is resolved for this harness, and the only place
+        the contract default is applied. run_workflow() may later re-resolve it, but
+        only when a scenario supplies an explicit value -- never by falling back to
+        the default again, which is how an explicitly constructed LOW would get
+        silently promoted to HIGH.
+        """
+        if not self.supports_risk:
+            if risk is not None:
+                raise RiskNotSupportedError(
+                    f"RISK_NOT_SUPPORTED: {skill_path.parent.name} has no "
+                    f"'#### Risk profile contract' block, so risk={risk!r} cannot be "
+                    "honoured; no harness is constructed"
+                )
+            return None, None
+        if risk is None:
+            return self.risk_contract["RISK_DEFAULT"][0], "default"
+        folded = risk.casefold()
+        if folded not in RISK_LEVELS:
+            raise ValueError(f"INVALID_RISK: {risk!r}")
+        return folded, "explicit"
+
+    def _risk_or_default(self) -> str:
+        """The strength this harness actually enforces, as a level name.
+
+        A skill with no risk axis (self.risk is None) behaves exactly as it did
+        before OS-3, which is the HIGH-equivalent path -- so every risk conditional
+        reads this instead of comparing self.risk to a literal. Comparing the raw
+        None against "high" would silently DISABLE T5a for the loop skill, which is a
+        behaviour change, not a no-op.
+        """
+        return self.risk or "high"
+
+    def risk_context(self) -> dict[str, str] | None:
+        """The risk model both fake agents receive this phase, or None.
+
+        The same one-call-both-roles shape as quality_gate(). Returns None for a
+        skill whose SKILL.md carries no risk block; render_task_spec() skips a None
+        block entirely, so that skill's dispatched payload stays byte-identical.
+        """
+        if not self.supports_risk:
+            return None
+        return build_risk_context(
+            risk=self.risk,
+            risk_source=self.risk_source,
+            current_phase=self.phase,
+        )
 
     def allocate_session(
         self,
@@ -555,6 +713,7 @@ class E2EHarness:
         task_boundary: tuple[tuple[str, str], ...] = (),
         reviewer_context_keys: tuple[str, ...] = (),
         quality_gate: tuple[tuple[str, str], ...] = (),
+        risk_profile: tuple[tuple[str, str], ...] = (),
     ) -> SessionEvent:
         """Append-only: allocate (or reuse) this role's session and record the fact."""
         session_id, created = self.allocate_session(
@@ -570,6 +729,7 @@ class E2EHarness:
             task_boundary=task_boundary,
             reviewer_context_keys=reviewer_context_keys,
             quality_gate=quality_gate,
+            risk_profile=risk_profile,
         )
         self.sessions.append(event)
         return event
@@ -646,6 +806,7 @@ class E2EHarness:
                 worker_boundary,
                 None,
                 self.quality_gate(),
+                self.risk_context(),
             )
             worker_command = [
                 sys.executable,
@@ -665,11 +826,26 @@ class E2EHarness:
                 "--task-spec",
                 worker_spec,
             ]
+            unit_test_status = (
+                scenario.worker_unit_test_statuses[iteration - 1]
+                if iteration <= len(scenario.worker_unit_test_statuses)
+                else ""
+            )
+            if unit_test_status:
+                worker_command.extend(["--unit-test-status", unit_test_status])
+            raw_statuses = (
+                scenario.worker_unit_test_status_lines[iteration - 1]
+                if iteration <= len(scenario.worker_unit_test_status_lines)
+                else ()
+            )
+            for raw in raw_statuses:
+                worker_command.extend(["--unit-test-status-raw", raw])
             self._record_session(
                 "worker",
                 iteration,
                 task_boundary=tuple(sorted(worker_boundary.items())),
                 quality_gate=_parsed_quality_gate(worker_spec),
+                risk_profile=_parsed_risk_profile(worker_spec),
             )
             worker = subprocess.run(
                 worker_command,
@@ -690,6 +866,10 @@ class E2EHarness:
                 worker_status, parsed_resolutions = parse_worker_output(
                     worker.stdout, self.contract
                 )
+                # Parsed inside the SAME try block, so a duplicate or unrecognized
+                # value reuses the existing MALFORMED_WORKER_OUTPUT error path
+                # rather than inventing a second one.
+                reported_unit_test_status = parse_unit_test_status(worker.stdout)
             except OutputContractError as exc:
                 return self._error(
                     iteration,
@@ -714,6 +894,31 @@ class E2EHarness:
                     sessions=tuple(self.sessions),
                 )
 
+            # ---- OS-3 section 14 safety floor. LOW requires AFFIRMATIVE evidence:
+            # silence is exactly what section 14 forbids, and LOW has no phase
+            # Reviewer to notice it. MEDIUM/HIGH are unchanged -- the phase Reviewer
+            # stays the documented enforcer there.
+            if (
+                self.phase in UNIT_TEST_GATED_PHASES
+                and self._risk_or_default() == "low"
+                and reported_unit_test_status != UNIT_TEST_STATUS_PASS
+            ):
+                return WorkflowResult(
+                    current_phase=self.phase,
+                    current_iteration=iteration,
+                    max_iterations=self.max_iterations,
+                    worker_attempts=worker_attempts,
+                    reviewer_attempts=reviewer_attempts,
+                    findings=finding_traces,
+                    final_status=self.contract.blocked_status,
+                    reason=(
+                        UNIT_TEST_BLOCKED_REASON
+                        if reported_unit_test_status == UNIT_TEST_STATUS_BLOCKED
+                        else UNIT_TEST_EVIDENCE_MISSING_REASON
+                    ),
+                    sessions=tuple(self.sessions),
+                )
+
             if previous_blocking_findings:
                 if set(parsed_resolutions) != previous_blocking_findings:
                     return self._error(
@@ -727,6 +932,21 @@ class E2EHarness:
                     finding_traces[finding_id].resolutions.append(
                         (iteration, resolution)
                     )
+
+            # ---- OS-3: at LOW the phase gate IS the Worker result. Every
+            # Worker-side guard above has already run; the Reviewer half below is
+            # skipped entirely, so no Reviewer Task/Dispatch is ever recorded.
+            if self._risk_or_default() == "low":
+                return WorkflowResult(
+                    current_phase=self.phase,
+                    current_iteration=iteration,
+                    max_iterations=self.max_iterations,
+                    worker_attempts=worker_attempts,
+                    reviewer_attempts=reviewer_attempts,
+                    findings=finding_traces,
+                    final_status=self.contract.completed_status,
+                    sessions=tuple(self.sessions),
+                )
 
             reviewer_index = iteration - 1
             if reviewer_index >= len(scenario.reviewer_modes):
@@ -769,6 +989,7 @@ class E2EHarness:
                 reviewer_boundary,
                 reviewer_context,
                 self.quality_gate(),
+                self.risk_context(),
             )
             reviewer_command = [
                 sys.executable,
@@ -798,6 +1019,7 @@ class E2EHarness:
                 task_boundary=tuple(sorted(reviewer_boundary.items())),
                 reviewer_context_keys=tuple(sorted(reviewer_context)),
                 quality_gate=_parsed_quality_gate(reviewer_spec),
+                risk_profile=_parsed_risk_profile(reviewer_spec),
             )
             hashes_before = _hash_files(self.protected_artifacts)
             reviewer = subprocess.run(
@@ -1001,6 +1223,7 @@ class E2EHarness:
         final_review_artifacts: list[str] = []
         final_review_iterations = 0
         final_review_verdict: str | None = None
+        reviewer_gates_skipped: list[str] = []
 
         def snapshot(
             final_status: str = "", reason: str | None = None
@@ -1018,6 +1241,9 @@ class E2EHarness:
                 corrected_findings=tuple(corrected_findings),
                 reason=reason,
                 sessions=tuple(self.sessions),
+                risk=self.risk,
+                risk_source=self.risk_source,
+                reviewer_gates_skipped=list(reviewer_gates_skipped),
             )
 
         # The only write of session_policy in this run: every _phase_harness clone
@@ -1029,6 +1255,23 @@ class E2EHarness:
                 "SCENARIO_SESSION_POLICY_INVALID:" + policy, snapshot()
             )
         self.session_policy = policy
+        # ---- OS-3 guards, capability first then value ------------------------------
+        if scenario.risk is not None and not self.supports_risk:
+            return self._workflow_error(
+                "SCENARIO_RISK_NOT_SUPPORTED:" + scenario.risk, snapshot()
+            )
+        if scenario.risk is not None and scenario.risk.casefold() not in RISK_LEVELS:
+            return self._workflow_error(
+                "SCENARIO_RISK_INVALID:" + scenario.risk, snapshot()
+            )
+        # PRECEDENCE: an explicit scenario value overrides; an omitted one PRESERVES
+        # what __init__ already resolved. There is deliberately no `or RISK_DEFAULT`
+        # fallback here -- _resolve_risk() already applied the default, and
+        # re-applying it is how an explicitly constructed LOW gets promoted to HIGH.
+        if scenario.risk is not None:
+            self.risk = scenario.risk.casefold()
+            self.risk_source = "explicit"
+        risk = self._risk_or_default()
         # The one write of run_id for this workflow: every _phase_harness clone below
         # copies it by value (same mechanism as session_policy), so the phase gates,
         # corrections, revalidations and the Final Review artifacts that follow all
@@ -1038,15 +1281,27 @@ class E2EHarness:
         # default: the phase loop below dispatches into this directory immediately.
         ensure_run_artifact_root(self.run_id, base=self.workspace)
 
+        def gate_attempts(result: WorkflowResult) -> int:
+            """SKILL.md section 13: a gate attempt is a Reviewer attempt at
+            MEDIUM/HIGH and a Worker attempt at LOW, so the per-phase budget stays
+            reachable -- and the dispatch ledgers stay non-empty -- at every level."""
+            return len(
+                result.worker_attempts if risk == "low" else result.reviewer_attempts
+            )
+
         # ---- sequential phase gates (SKILL.md section 8: PASS before the next phase)
         for phase in scenario.phases:
+            if risk == "low":
+                # A skipped gate is recorded positively: the absence of a Reviewer
+                # row must never be the only evidence that one was skipped.
+                reviewer_gates_skipped.append(phase)
             phase_scenario = scenario.phase_scenarios.get(phase)
             if phase_scenario is None:
                 return self._workflow_error(
                     "SCENARIO_PHASE_MISSING:" + phase, snapshot()
                 )
             result = self._phase_harness(phase, self.max_iterations).run(phase_scenario)
-            phase_iterations[phase] += len(result.reviewer_attempts)
+            phase_iterations[phase] += gate_attempts(result)
             if result.final_status != self.contract.completed_status:
                 # S-R7: a round that did not PASS leaves both roles in recovery, so
                 # neither chain may be carried forward.
@@ -1149,11 +1404,11 @@ class E2EHarness:
                 # The ledger is written BEFORE any verdict is applied: these Reviewer
                 # dispatches physically happened and are never rewound, whatever the
                 # bridge decides.
-                for offset in range(1, len(result.reviewer_attempts) + 1):
+                for offset in range(1, gate_attempts(result) + 1):
                     correction_dispatches.append(
                         (phase, phase_iterations[phase] + offset)
                     )
-                phase_iterations[phase] += len(result.reviewer_attempts)
+                phase_iterations[phase] += gate_attempts(result)
                 # ---- T4a: the finding-resolution bridge, evaluated BEFORE the round's own
                 #      status, because run() would have fired it at local iteration 1 -- i.e.
                 #      before this round's first Reviewer ever ran.
@@ -1200,7 +1455,16 @@ class E2EHarness:
             # round has no routed finding ids, so the section-3.2.7 resolution bridge must
             # not fire on it; routing it through _run_correction_round would make every
             # revalidation ERROR with FINAL_REVIEW_RESOLUTION_TRACE_INCOMPLETE. (Risk D-17.)
-            for phase in downstream_revalidation_set(responsible, scenario.phases):
+            # OS-3: D is computed and executed at HIGH only. At LOW and MEDIUM T5a
+            # is a no-op. downstream_revalidation_set() itself is unchanged -- the
+            # CALL SITE is gated, which is smaller and safer than gating a pure
+            # function other callers depend on.
+            downstream = (
+                downstream_revalidation_set(responsible, scenario.phases)
+                if risk == "high"
+                else ()
+            )
+            for phase in downstream:
                 if phase_iterations[phase] >= self.max_iterations:
                     return snapshot(
                         self.contract.escalated_status,
@@ -1217,11 +1481,11 @@ class E2EHarness:
                 result = self._phase_harness(phase, budget).run(revalidation)
                 # Ledger BEFORE verdict, exactly as T4: these Reviewer dispatches
                 # physically happened and are never rewound.
-                for offset in range(1, len(result.reviewer_attempts) + 1):
+                for offset in range(1, gate_attempts(result) + 1):
                     revalidation_dispatches.append(
                         (phase, phase_iterations[phase] + offset)
                     )
-                phase_iterations[phase] += len(result.reviewer_attempts)
+                phase_iterations[phase] += gate_attempts(result)
                 if result.final_status != self.contract.completed_status:
                     self.invalidate_session("worker")        # S-R7
                     self.invalidate_session("reviewer")

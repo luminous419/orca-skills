@@ -3,8 +3,9 @@ name: orca-worker-reviewer-orchestration
 description: >
   Orca built-in orchestration을 실행 레이어로 사용하여 정확히 하나의 Worker와
   하나의 Reviewer를 supervised task/dispatch로 조정하고, 각 development phase가
-  Reviewer PASS를 받을 때까지 Worker 수정과 Reviewer 재검토를 반복하는
-  2-agent software development orchestration skill.
+  자신의 phase gate를 PASS할 때까지 Worker 수정과 재검토를 반복하는
+  2-agent software development orchestration skill. phase gate는 risk가 정한다 —
+  LOW는 Worker 결과, MEDIUM/HIGH는 phase Reviewer 판정이다.
 ---
 
 # Orca Worker-Reviewer Orchestration
@@ -28,6 +29,9 @@ Reviewer
 PASS ─────────────→ next phase / COMPLETED
 FAIL → Worker fix → Reviewer re-review
 ```
+
+위 그림은 MEDIUM/HIGH의 모양이다. LOW에서는 Reviewer 행이 없고 Worker 결과가 곧 그 phase의
+phase gate이며, §17 Final Adversarial Review는 세 level 모두에 그대로 걸린다(§8 Risk Axis).
 
 정확히 두 역할만 지원한다.
 
@@ -90,12 +94,13 @@ REASON: ORCA_ORCHESTRATION_UNAVAILABLE
 orca-worker-reviewer-orchestration
 
 Usage:
-/orca-worker-reviewer-orchestration [worker=<agent>] [reviewer=<agent>] [max-iterations=<1-10>] [phases=<...>] <request>
+/orca-worker-reviewer-orchestration [worker=<agent>] [reviewer=<agent>] [max-iterations=<1-10>] [phases=<...>] [risk=<low|medium|high>] <request>
 
 Default:
   worker=claude-glm
   reviewer=claude-gemma
   max-iterations=5
+  risk=high
 
 Phases:
   Sequential: analysis → plan → design → implementation → test
@@ -105,6 +110,7 @@ Examples:
   /orca-worker-reviewer-orchestration phases=implementation <request>
   /orca-worker-reviewer-orchestration phases=design,implementation <request>
   /orca-worker-reviewer-orchestration phases=bugfix <request>
+  /orca-worker-reviewer-orchestration risk=low phases=implementation <request>
 ```
 
 ## 4. Runtime Parameters
@@ -114,6 +120,7 @@ worker=<agent-command>
 reviewer=<agent-command>
 max-iterations=<integer>
 phases=<phase1,phase2,...>
+risk=<low|medium|high>
 ```
 
 우선순위:
@@ -130,9 +137,16 @@ phases=<phase1,phase2,...>
 DEFAULT_WORKER = claude-glm
 DEFAULT_REVIEWER = claude-gemma
 DEFAULT_MAX_ITERATIONS = 5
+DEFAULT_RISK = high
 ```
 
 `phases`가 없으면 자연어 요청에서 phase를 결정한다.
+
+`risk`는 `phases`와 독립된 축이다. `phases`는 무엇을 실행할지, `risk`는 요청된 phase를 얼마나
+강하게 검증할지를 결정하며, risk가 requested phase 집합을 늘리거나 줄이지 않는다. 명시적
+`risk=`는 언제나 default를 override한다. 자연어에서 risk를 추론하지 않으므로 selection source는
+`explicit`과 `default` 두 가지뿐이다. 값이 없는 `risk=`는 생략이 아니라 명시적으로 잘못된 값이며
+§8의 `INVALID_RISK`로 fail-closed된다. 의미와 machine-readable contract는 §8을 따른다.
 
 ## Machine-Readable Policy Contract
 
@@ -292,24 +306,26 @@ Worker session != Reviewer session
 1. Run을 생성하거나 현재 Run에 bind한다. 이 run-id는 이후 모든 artifact 경로(§9 Artifact path contract)의
    directory identity로 쓰이며, 이 run에서 처음 이 단계를 거칠 때 그 `<ARTIFACT_ROOT>` 디렉터리를 생성한다
    (§9 참조). 이후 phase/iteration에서는 이미 존재하므로 아무 것도 하지 않는다.
-2. 이 phase/iteration의 Task graph 전체를 먼저 생성한다. Worker Task와 Reviewer Task를 함께 만들고, Reviewer Task는 Worker Task를 dependency로 선언한다.
+2. 이 phase/iteration의 Task graph 전체를 먼저 생성한다. graph의 node 구성은 risk가 결정한다(§8 Risk Axis). MEDIUM/HIGH에서는 Worker Task와 Reviewer Task를 함께 만들고, Reviewer Task는 Worker Task를 dependency로 선언한다. LOW에서는 Worker Task 하나만 만들고 dependency edge를 만들지 않는다 — dispatch되지 않을 Reviewer Task를 미리 만들면 Worker 완료와 동시에 ready로 승격된 뒤 영원히 방치되기 때문이다.
 3. Worker용 terminal/agent process를 생성 또는 재사용한다.
 4. Worker Task를 실제 Orca Dispatch에 연결한다.
 5. worker completion (`worker_done`) 또는 escalation/question을 orchestration wait/check로 기다린다.
-6. accepted `worker_done` 이후, 이미 존재하던 Reviewer Task가 dependency 충족으로 ready가 된 것을 확인하고 별도 Dispatch로 Reviewer에게 전달한다. 이 시점에 Reviewer Task를 새로 생성하지 않는다.
+6. MEDIUM/HIGH에서만 해당한다. accepted `worker_done` 이후, 이미 존재하던 Reviewer Task가 dependency 충족으로 ready가 된 것을 확인하고 별도 Dispatch로 Reviewer에게 전달한다. 이 시점에 Reviewer Task를 새로 생성하지 않는다. LOW에는 Reviewer Task가 없으므로 이 단계를 수행하지 않는다.
 7. 해당 Dispatch의 lifecycle을 아래 "Four-axis lifecycle accounting" 절차로 정확히 한 번 종결한다.
-8. Reviewer 결과를 PASS/FAIL contract로 평가한다.
+8. Reviewer 결과를 PASS/FAIL contract로 평가한다. LOW에서는 Reviewer 판정이 없으므로 phase gate는 Worker 자신의 결과다(§13, §14).
 
 ### Task graph ordering
 
 Orca orchestration graph의 dependency promotion은 dependency가 completed되는 순간에 평가된다.
-따라서 Task를 만드는 시점이 Reviewer Task가 ready가 되는지 여부를 결정한다.
+따라서 Task를 만드는 시점이 dependent Task — MEDIUM/HIGH의 Reviewer Task가 그 대표다 — 가
+ready가 되는지 여부를 결정한다.
 
-- Coordinator는 Worker를 dispatch하기 전에 그 phase/iteration의 Task graph 전체를 생성한다. Reviewer Task는 Worker Task를 dependency로 선언한다.
+- Coordinator는 Worker를 dispatch하기 전에 그 phase/iteration의 Task graph 전체를 생성한다. 그 graph에 dependent node가 있으면 — MEDIUM/HIGH의 Reviewer Task가 그것이고, LOW에는 없다(§6 2단계) — dependent는 Worker Task를 dependency로 선언한다.
 - Dependency promotion은 edge-triggered다. dependency가 completed되는 순간에 이미 존재하며 그 Task를 dependency로 올린 dependent만 ready가 된다. 전역 재평가 sweep은 없다.
 - 따라서 accepted `worker_done` 이후에 dependent Task를 생성하는 것을 금지한다. 그렇게 만든 Task는 영구히 pending으로 남는다.
-- FAIL loop의 correction/re-review Task도 동일 규칙을 따른다. 다음 iteration의 graph는 현재 iteration의 Worker를 dispatch하기 전에 만든다.
+- FAIL loop의 correction Task도, 그 risk level에 re-review Task가 존재한다면 re-review Task도 동일 규칙을 따른다. 다음 iteration의 graph는 현재 iteration의 Worker를 dispatch하기 전에 만든다.
 - ready task 조회를 dispatch 대상 선택의 external memory로 사용한다.
+- risk는 graph에 어떤 node가 존재하는지를 정하고, node를 언제 만드는지는 정하지 않는다. node가 하나뿐인 graph도 Worker dispatch 이전에 전부 생성되며, dependency가 completed된 이후에 dependent를 만들지 않는다는 규칙은 모든 risk에서 동일하다.
 - force-ready(수동 status override)는 recovery 전용이다. dependency validation을 전혀 수행하지 않으므로(미완료 dependency를 가진 Task도 promote된다) 정상 readiness 경로로 쓰지 않는다. 사용한 경우 사유와 receipt를 최종 보고에 기록한다.
 
 > 이 sub-section은 concrete flag 문자열을 본문에 쓰지 않는다. "dependency로 선언한다", "ready task 조회",
@@ -670,6 +686,106 @@ phases=bugfix
 phases=refactoring
 ```
 
+### Risk Axis
+
+`risk`는 요청된 phase를 얼마나 강하게 검증할지를 결정한다. `phases`가 결정하는 실행 대상은
+어떤 risk에서도 달라지지 않는다.
+
+LOW
+
+- 요청된 각 phase는 Worker만 수행한다. 그 phase의 Task graph에는 Reviewer node를 만들지 않는다.
+- mid-phase Reviewer gate를 건너뛴다.
+- Final Adversarial Review는 그대로 필수다.
+- Final Review FAIL -> 책임 phase에 대한 Worker correction -> 새 Final Review.
+
+MEDIUM
+
+- 요청된 각 phase는 Worker -> Reviewer (phase-local bounded correction loop)로 수행한다.
+  단일 phase에 대해서는 지금까지의 기본 동작과 같다.
+- Final Adversarial Review는 필수다.
+- Final Review FAIL -> 책임 phase Worker correction -> 그 phase Reviewer -> 새 Final Review.
+- HIGH의 광범위한 downstream revalidation(§17 T5a)은 기본으로 수행하지 않는다.
+
+HIGH
+
+- 이 문서(§6, §9, §12, §13, §17, §18)가 규정한 전체 강도를 그대로 유지한다.
+- Final Adversarial Review는 필수다.
+- requested phase 밖의 repository/artifact/upstream/downstream context를 확인·검증할 수 있으나,
+  사용자가 요청하지 않은 phase를 위해 새 Task/Worker/artifact를 만들지 않는다.
+- Final Review FAIL -> 책임 phase correction -> 그 phase Reviewer -> requested-phase downstream
+  revalidation(§17 T5a) -> 새 Final Review.
+
+동일한 requested phase 집합에 대해 Reviewer/Task churn은 `LOW < MEDIUM`이 언제나 성립하고,
+correction 또는 downstream revalidation이 한 번이라도 발생하는 경로에서는 `MEDIUM < HIGH`가
+성립한다. 그 두 경우를 제외한 다음 두 상황에서는 `MEDIUM == HIGH`이며, 이는 결함이 아니라
+문서화된 예외다.
+
+```text
+1. 한 번도 FAIL 없이 통과한 clean first-pass run
+2. 모든 BUGFIX / REFACTORING run
+```
+
+HIGH가 MEDIUM보다 추가로 만드는 dispatch는 §17 T5a downstream revalidation 하나뿐이고,
+두 경우 모두 T5a가 구조적으로 실행되지 않기 때문이다. specialized phase는 canonical order에
+없으므로 downstream 집합 D가 언제나 공집합이다(§17).
+
+BUGFIX / REFACTORING × risk
+
+```text
+| 축                       | LOW           | MEDIUM                      | HIGH                        |
+| Task graph               | Worker node만 | Worker + dependent Reviewer | Worker + dependent Reviewer |
+| phase gate               | Worker 결과   | Worker -> Reviewer          | Worker -> Reviewer          |
+| §14 gate                 | 그대로 필수   | 그대로 필수                 | 그대로 필수                 |
+| downstream 집합 D        | 공집합        | 공집합                      | 공집합                      |
+| §17 T5a                  | no-op         | no-op                       | no-op                       |
+| Final Adversarial Review | 필수          | 필수                        | 필수                        |
+| churn                    | 가장 낮음     | 1 + c                       | 1 + c (MEDIUM과 동일)       |
+```
+
+`phases=`에 쓸 수 있는 specialized 조합은 risk와 무관하게 `bugfix` 단독과 `refactoring` 단독뿐이다.
+risk는 이 목록을 바꾸지 않는다. HIGH row가 MEDIUM과 churn이 같은 것은 위 문서화된 예외이며
+결함이 아니다.
+
+`risk` 값이 low/medium/high가 아니면 — 값이 비어 있는 `risk=`도 포함한다 — 어떤 Run/Task/
+Dispatch도 만들지 않고 즉시 중단한다. 이는 §7 INVALID_PHASE, §11 INVALID_QUALITY_PROFILE과
+같은 모양의 pre-dispatch validation failure다.
+
+```text
+STATUS: BLOCKED
+REASON: INVALID_RISK
+```
+
+Risk Profile과 §11 Project Quality Profile은 서로 독립된 두 resolution이다. 어느 쪽도 다른 쪽의
+설정을 읽지 않고 다른 쪽의 상태로 gate하지 않는다.
+
+#### Risk profile contract
+
+아래 블록은 이 절 산문의 요약이자 회귀 잠금이다. 새 policy contract가 아니며 두 스킬 사이에서
+공유되지 않는다.
+
+```text
+RISK_PARAMETER = risk
+RISK_LEVELS = low, medium, high
+RISK_DEFAULT = high
+RISK_SELECTION_SOURCES = explicit, default
+RISK_NATURAL_LANGUAGE = deterministic_explicit_parameter_only
+RISK_INVALID_ERROR = invalid_risk
+RISK_INVALID_HANDLING = validation_failure_before_dispatch
+RISK_EMPTY_VALUE = explicit_invalid_never_omission
+RISK_RESOLUTION_SCOPE = resolved_once_per_run_never_per_attempt
+RISK_PHASE_AXIS = never_expands_or_contracts_requested_phases
+RISK_QUALITY_PROFILE_AXIS = independent_never_read_or_gate_on_each_other
+RISK_LOW_PHASE_GATE = worker_only
+RISK_MEDIUM_PHASE_GATE = worker_then_phase_reviewer
+RISK_HIGH_PHASE_GATE = worker_then_phase_reviewer
+RISK_LOW_TASK_GRAPH = worker_node_only
+RISK_MEDIUM_TASK_GRAPH = worker_and_dependent_reviewer
+RISK_HIGH_TASK_GRAPH = worker_and_dependent_reviewer
+RISK_DOWNSTREAM_REVALIDATION = high_only
+RISK_FINAL_REVIEW = mandatory_at_every_level
+RISK_SAFETY_FLOOR = mandatory_test_gates_apply_at_every_level
+```
+
 ## 9. Approved Phase Output
 
 PASS된 이전 phase 결과는 다음 phase의 approved input이다.
@@ -788,14 +904,19 @@ python3 <SKILL_DIR>/tools/run_logging.py orchestrator-event --run-id <run-id> \
   [--task-id <task_id>] [--dispatch-id <dispatch_id>] [--terminal <handle>] \
   [--action created|reused] [--reuse <effect>] [--gate-result PASS|FAIL] \
   [--review-verdict PASS|PASS WITH NOTES|FAIL|BLOCKED] \
+  [--risk low|medium|high] [--risk-source explicit|default] \
+  [--requested-phases <comma-separated>] \
+  [--round-kind phase_gate|correction|downstream_revalidation|final_review] \
   [--result <text>] [--detail <text>]
 
 python3 <SKILL_DIR>/tools/run_logging.py timing-event --run-id <run-id> \
   --event <event> [--phase <phase>] [--role worker|reviewer] [--iteration <n>] \
-  [--started-at <iso8601>] [--ended-at <iso8601>] [--duration-seconds <n>] [--detail <text>]
+  [--started-at <iso8601>] [--ended-at <iso8601>] [--duration-seconds <n>] \
+  [--risk low|medium|high] [--detail <text>]
 
 python3 <SKILL_DIR>/tools/run_logging.py run-status --run-id <run-id> \
-  --status COMPLETED|BLOCKED|ERROR|ESCALATED [--reason <text>] [--run-started-at <iso8601>]
+  --status COMPLETED|BLOCKED|ERROR|ESCALATED [--reason <text>] [--run-started-at <iso8601>] \
+  [--risk low|medium|high] [--risk-source explicit|default]
 ```
 
 `--duration-seconds`는 생략해도 된다. `--started-at`과 `--ended-at`을 둘 다 주면 `timing-event`가 그
@@ -837,16 +958,21 @@ Coordinator는 다음 시점에 정확히 한 번씩 호출한다. 동일 event�
 ```text
 1. §6 1단계에서 run-id를 얻고 <ARTIFACT_ROOT>를 만든 직후
    -> orchestrator-event --event run_start --detail "<objective>"
-   -> timing-event --event run_start --started-at <지금 시각>
+      --risk <이 run의 risk> --risk-source explicit|default
+      --requested-phases "<requested phase 목록>"
+   -> timing-event --event run_start --started-at <지금 시각> --risk <이 run의 risk>
 2. 이 phase의 첫 Task를 dispatch하기 직전 / 이 phase가 최종적으로 PASS하거나
    §16/§17에서 종료된 직후
    -> timing-event --event phase_start|phase_end --phase <phase> [--started-at <시각>]
-      [--ended-at <시각>] [--detail "<PASS|FAIL|사유>"]
-3. 이 iteration의 Worker를 dispatch하기 직전 / 이 iteration의 (phase) Reviewer
-   판정이 나온 직후 (correction, downstream revalidation, §17 Final Adversarial
-   Review attempt도 각자 자신의 iteration 번호로 이 규칙 그대로 쓴다)
+      [--ended-at <시각>] --risk <이 run의 risk> [--detail "<PASS|FAIL|사유>"]
+3. 이 iteration의 Worker를 dispatch하기 직전 / 이 iteration의 phase gate 판정이 나온
+   직후 — 그 판정은 LOW에서는 그 Worker의 accepted worker_done 결과이고, MEDIUM/HIGH
+   에서는 그 phase Reviewer의 RESULT: 판정이다(§8 Risk Axis). (correction, downstream
+   revalidation, §17 Final Adversarial Review attempt도 각자 자신의 iteration 번호로
+   이 규칙 그대로 쓴다)
    -> timing-event --event iteration_start|iteration_end --phase <phase>
-      --iteration <n> [--started-at <시각>] [--ended-at <시각>] [--detail "<PASS|FAIL|사유>"]
+      --iteration <n> [--started-at <시각>] [--ended-at <시각>] --risk <이 run의 risk>
+      [--detail "<PASS|FAIL|사유>"]
 4. §6/§11 각 Worker/Reviewer Dispatch가 accepted worker_done으로 settle된 직후
    (correction, downstream revalidation, §17 Final Adversarial Review attempt도
    전부 이 규칙 하나로 커버된다 — 이들은 다른 phase/iteration/role로 다시 호출되는
@@ -857,12 +983,25 @@ Coordinator는 다음 시점에 정확히 한 번씩 호출한다. 동일 event�
       응답의 effects[].action> [--gate-result <role가 reviewer일 때, 응답 본문이
       실제로 적어 보낸 RESULT: PASS|FAIL>] [--review-verdict <role가 reviewer일 때,
       응답 본문이 실제로 적어 보낸 REVIEW_VERDICT: PASS|PASS WITH NOTES|FAIL|BLOCKED>]
+      --risk <이 run의 risk>
+      --round-kind phase_gate|correction|downstream_revalidation|final_review
       --result "<outcome/settlement/lifecycle 요약>"
    -> timing-event --event dispatch_settled --phase <phase> --role <role> --iteration <n>
-      --started-at <dispatch 직전 시각> --ended-at <settle 직후 시각>
+      --started-at <dispatch 직전 시각> --ended-at <settle 직후 시각> --risk <이 run의 risk>
 5. §16/§17에서 이 run의 최종 상태가 COMPLETED/BLOCKED/ERROR/ESCALATED 중 하나로 확정된 직후
    -> run-status --status <상태> --reason "<사유>" --run-started-at <1단계의 시각>
+      --risk <이 run의 risk> --risk-source explicit|default
+6. risk=low에서 각 requested phase의 Worker를 dispatch하기 직전 (건너뛴 gate를 row의
+   부재가 아니라 명시적 row로 남긴다)
+   -> orchestrator-event --event reviewer_gate_skipped --phase <phase> --risk low
+      --detail "risk=low: no phase Reviewer gate for this phase"
 ```
+
+`--risk`는 TIMING_LOG.md의 **모든** row에 붙는다 — run_start, phase/iteration 경계, dispatch_settled
+전부다. 이 run의 risk는 §8에서 한 번 결정되고 run 내내 바뀌지 않으므로 값 자체는 run_start row에서도
+읽을 수 있지만, duration은 그것을 만들어낸 검증 강도와 함께 볼 때만 해석 가능하다(`run_logging.py`
+`TIMING_LOG_COLUMNS`의 근거). 각 row가 스스로를 설명하게 두는 편이 reader에게 cross-reference를
+요구하는 것보다 낫고, "모든 timing row가 risk를 갖는다"는 예외 없는 규칙이라 지키기도 쉽다.
 
 2-3단계는 TIMING_LOG.md 전용이다. `<ARTIFACT_ROOT>ORCHESTRATOR_LOG.md`는 매 dispatch_settled row에
 이미 phase/iteration column을 갖고 있으므로 phase/iteration 경계를 위한 별도 row를 추가하지 않는다.
@@ -1060,6 +1199,12 @@ FAIL            -> RESULT: FAIL      blocking violation 1개 이상
 BLOCKED         -> RESULT: FAIL      신뢰할 수 있는 verdict에 필요한 정보/evidence 부족
 ```
 
+Risk Profile(§8)과 Project Quality Profile은 서로 독립된 두 축이며 두 개의 별도 resolution이다.
+어느 쪽도 다른 쪽의 설정을 읽지 않고, 다른 쪽의 상태를 자신의 판정 근거로 쓰지 않는다. profile이
+absent인 것이 risk level을 암시하지 않고, invalid profile은 risk를 보기 전에 Run 경계에서
+fail-closed되며, 어떤 risk level도 applicable attribute 목록이나 finding의 blocking 여부를
+바꾸지 않는다. 두 block은 dispatch되는 spec 안에서도 분리되어 전달된다.
+
 같은 quality model이 Worker에게도 전달된다. Worker Task spec과 Reviewer Task spec은 같은 resolution에서
 만들어진 동일한 block을 받으므로 두 역할이 서로 다른 기준을 듣는 일이 없다. 전달 형식은 §9 Task boundary와
 같은 방식으로 dispatch되는 spec 본문 안의 block이다.
@@ -1087,7 +1232,12 @@ QUALITY_GATE_CONTEXT_ROLES = worker, reviewer, final_reviewer
 
 ## 12. FAIL Loop
 
-Reviewer PASS:
+이 절의 PASS/FAIL은 그 phase의 **phase gate** 판정을 뜻하며, phase gate가 무엇인지는 risk가
+정한다(§8 Risk Axis). LOW에서는 Worker 자신의 결과(§6 8단계, §14)이고, MEDIUM/HIGH에서는 phase
+Reviewer의 `RESULT:` 판정이다. 아래 두 전이는 그 gate 판정에 대한 것이며 특정 risk level의
+Reviewer 존재를 전제하지 않는다.
+
+phase gate PASS:
 
 ```text
 current phase COMPLETED
@@ -1095,9 +1245,10 @@ current phase COMPLETED
 → 남은 requested phase가 없으면 §17 Final Adversarial Review gate
 ```
 
-Reviewer FAIL:
+phase gate FAIL:
 
 ```text
+(아래 모양은 phase Reviewer가 존재하는 MEDIUM/HIGH의 것이다. LOW는 그 아래 문단을 따른다.)
 Reviewer findings
       ↓
 새 Worker correction Task / Dispatch
@@ -1112,9 +1263,17 @@ PASS / FAIL
 Reviewer 자신이 fix를 수행하지 않는다.
 Orca의 Task/Dispatch provenance가 각 attempt에 남아야 한다.
 
-Final Adversarial Review FAIL이 유발한 correction도 이 FAIL Loop와 정확히 같은 모양이다.
+이 in-phase FAIL Loop는 phase Reviewer가 존재하는 risk level에서만 trigger된다. MEDIUM/HIGH는
+위 내용 그대로이고, LOW에는 in-phase Reviewer FAIL이 없으므로 이 loop는 §17 T4를 통해서만
+진입한다. LOW의 correction round는 Worker node 하나짜리 graph이며 re-review가 없다.
+"Reviewer가 자기 finding을 고치지 않는다"는 invariant는 모든 risk에서 그대로다.
+
+Final Adversarial Review FAIL이 유발한 correction도 그 risk level의 FAIL Loop와 같은 모양이다.
+여기서 "같은 모양"은 바로 위 문단의 LOW 예외를 뒤집지 않는다 — MEDIUM/HIGH에서는 correction
+Worker → 재검토의 2-node round이고, LOW에서는 correction Worker 하나짜리 round다(§17 T4).
 차이는 correction 대상 phase를 Reviewer가 아니라 Final Reviewer의 `Responsible Phase`가 지정한다는 점뿐이다.
-correction된 phase의 downstream phase를 재검증하는 §17 T5a revalidation round도 같은 모양이다.
+correction된 phase의 downstream phase를 재검증하는 §17 T5a revalidation round도 같은 모양이며,
+T5a는 HIGH에서만 실행되므로 그 round는 항상 2-node다.
 차이는 해소할 finding이 없다는 점이며, 첫 Worker에게 resolution trace를 요구하지 않는다.
 
 ## 13. Iteration
@@ -1138,14 +1297,20 @@ STATUS: BLOCKED
 REASON: INVALID_MAX_ITERATIONS
 ```
 
-각 phase별 Reviewer attempt를 iteration으로 센다.
+각 phase별 gate attempt를 iteration으로 센다 — MEDIUM/HIGH에서는 Reviewer attempt 하나가,
+LOW에서는 Worker attempt 하나가 gate attempt 하나다(아래 counter 정의).
 최대치를 넘기면 추가 Dispatch를 만들지 않는다.
 
 ```text
 iteration counter는 두 개의 독립 domain을 가지며, 둘 다 같은 max-iterations 값으로 bound된다.
 
-PHASE_ITERATIONS[p]      = phase p의 Reviewer attempt 총합. Final Adversarial Review가 유발한
-                           correction의 Reviewer attempt도 이 counter를 계속 사용한다.
+PHASE_ITERATIONS[p]      = phase p의 gate attempt 총합.
+                           MEDIUM/HIGH에서는 Reviewer attempt 하나가 gate attempt 하나다
+                           (기존 의미 그대로). LOW에는 phase Reviewer가 없으므로 Worker
+                           attempt 하나가 gate attempt 하나다. 이렇게 정의해야 LOW에서도
+                           phase budget이 소진되어 MAX_ITERATIONS_REACHED (phase p)에 도달할
+                           수 있다. Final Adversarial Review가 유발한 correction의 attempt도
+                           이 counter를 계속 사용한다.
                            보고 필드: ITERATIONS_BY_PHASE  (기존 필드, 기존 의미)
 FINAL_REVIEW_ITERATIONS  = fresh Final Adversarial Reviewer가 dispatch된 횟수.
                            보고 필드: FINAL_REVIEW_ITERATIONS  (신규, orchestration 보고 전용)
@@ -1196,6 +1361,22 @@ UNIT_TEST_STATUS: BLOCKED
 
 Reviewer는 자동 PASS하지 않는다.
 
+이 세 gate는 risk와 무관하게 항상 적용된다. risk는 검증의 강도를 바꾸고 safety floor를 바꾸지
+않는다.
+
+MEDIUM/HIGH에서는 위 문장 그대로 phase Reviewer가 이 gate의 enforcer다.
+
+LOW에는 phase Reviewer가 없으므로 Worker 자신이 affirmative evidence를 남겨야 한다.
+IMPLEMENTATION / BUGFIX / REFACTORING phase에서 Worker Result는 다음 한 줄을 반드시 포함한다.
+
+```text
+UNIT_TEST_STATUS: PASS
+```
+
+이 줄이 없으면 gate를 통과하지 못한다. 생략은 통과가 아니다 — §14가 금지하는 것이 바로 조용한
+생략이고, LOW에는 그것을 발견할 Reviewer가 없기 때문이다. 필수 test를 수행할 수 없으면 기존과
+같이 `UNIT_TEST_STATUS: BLOCKED`를 남기며, 이 역시 gate 통과가 아니다.
+
 ## 15. Repository / Security Policy
 
 사용자가 명시하지 않는 한 금지:
@@ -1218,6 +1399,7 @@ Coordinator는 직접 production code를 수정하지 않는다.
 1. 모든 requested phase가 PASS했고, §17 Final Adversarial Review가 PASS했는지 확인한다.
    둘 중 하나라도 아니면 STATUS는 COMPLETED가 아니다.
 2. 각 phase/iteration에 필요한 Worker/Reviewer Task/Dispatch가 Orca state에 존재하는지 확인한다.
+   "필요한"은 risk가 결정한다 — LOW에서는 phase Reviewer Task/Dispatch가 존재하지 않는 것이 정상이다(§8).
 3. unresolved Blocking Finding이 없는지 확인한다.
 4. 마지막 test/validation 결과를 확인한다.
 5. 각 Dispatch가 네 축 (a)/(b)/(c1)/(c2) 모두에 기록된 outcome을 갖는지 확인한다 (axis (b)는 reuse, retain, release 또는 unsupervised 중 하나).
@@ -1251,6 +1433,7 @@ Reuse chains
   worker        : <terminal handle>  <dispatch id> -> <dispatch id> -> ...  (final: retain|release|unsupervised)
   reviewer      : <terminal handle>  <dispatch id> -> <dispatch id> -> ...  (final: retain|release|unsupervised)
   final review  : no chain (attempt마다 새 terminal)
+  (LOW에서는 reviewer chain이 비어 있는 것이 정상이며, 기록 누락이 아니라 빈 chain으로 보고한다)
 
 Efficiency
   terminal_creations              : rung_3_observed = <n> | rung_1_unobserved = unknown (unobserved path)
@@ -1270,6 +1453,8 @@ Coordinator 자신의 세션 handle은 이 보고에 `terminal role: coordinator
 
 STATUS: COMPLETED
 PHASES:
+RISK:
+RISK_SOURCE:
 COMPLETED_PHASES:
 WORKER:
 REVIEWER:
@@ -1290,7 +1475,10 @@ FINAL_REVIEW_REVALIDATIONS: none
 
 ## 17. Final Adversarial Review
 
-모든 requested phase가 Reviewer PASS를 받은 직후 Coordinator는 예외 없이 Final Adversarial Review gate를 한 번 실행한다.
+모든 requested phase가 자신의 **phase gate**를 PASS한 직후 Coordinator는 예외 없이 Final Adversarial
+Review gate를 한 번 실행한다. phase gate는 risk가 정한다(§8) — LOW에서는 Worker 자신의 결과이고
+MEDIUM/HIGH에서는 phase Reviewer 판정이다. 이 gate의 eligibility는 어떤 risk level에서도 phase
+Reviewer의 존재를 전제하지 않는다.
 이 gate는 phase가 아니다. `phases=`에 쓸 수 없고 끄는 parameter도 없으며, 5-phase 전체 run이든 `phases=bugfix` 단독이든
 동일하다. PASS하지 못한 Run은 어떤 경로로도 `STATUS: COMPLETED`가 되지 않는다.
 
@@ -1304,7 +1492,8 @@ FINAL_REVIEW_REVALIDATIONS: none
 #### Coordinator procedure
 
 ```text
-1. 마지막 requested phase의 Reviewer 판정이 PASS이고 남은 requested phase가 없음을 확인한다.
+1. 마지막 requested phase의 phase gate가 PASS이고 남은 requested phase가 없음을 확인한다.
+   그 gate는 LOW에서는 그 phase Worker의 결과, MEDIUM/HIGH에서는 그 phase Reviewer의 판정이다.
 2. FINAL_REVIEW_ITERATIONS += 1.
 3. 이번 attempt의 Task graph를 만든다. Final Review Task는 dependency가 없는 단일 node다.
 4. 새 terminal을 생성하고 즉시 ledger에 handle + role(active_worker) + origin(self_created) +
@@ -1314,7 +1503,7 @@ FINAL_REVIEW_REVALIDATIONS: none
 6. verdict를 평가하고 아래 T1/T2/T3로 분기한다.
 ```
 
-dependency edge를 걸지 않는 것은 §6 Task graph ordering의 요구다. trigger가 마지막 Reviewer Task의 **완료된** 판정이므로 그 Task를 dependency로 선언하면 "dependency 완료 이후 dependent 생성"이라는 금지 패턴이 된다.
+dependency edge를 걸지 않는 것은 §6 Task graph ordering의 요구다. trigger가 마지막 requested phase의 **완료된** phase gate 판정 — LOW에서는 그 Worker Task, MEDIUM/HIGH에서는 그 Reviewer Task — 이므로 그 Task를 dependency로 선언하면 "dependency 완료 이후 dependent 생성"이라는 금지 패턴이 된다.
 
 입력은 ORIGINAL_REQUEST / PHASES / provenance+ledger 요약 / FINAL_REVIEW_ITERATIONS와 max-iterations / 직전 attempt의
 finding·resolution 표를 inline으로, phase별 approved·REVIEW artifact, 전체 diff(base..HEAD), 변경된 production file 목록,
@@ -1346,8 +1535,12 @@ H over-engineering           요청되지 않은 abstraction이나 범위 확대
 I hidden coupling            의도치 않은 공유 자산/외부 계약 변경이 없는가
 ```
 
-이전 phase Reviewer의 PASS 판정을 옳다고 가정하지 않는다.
-Do NOT assume any previous Reviewer PASS decision is correct.
+앞선 phase gate가 PASS였다는 사실을 옳다고 가정하지 않는다. 그 gate는 MEDIUM/HIGH에서는
+이전 phase Reviewer의 PASS 판정이고, LOW에서는 어떤 phase Reviewer도 검증한 적 없는
+그 Worker 자신의 성공 보고다 — LOW에서 이 attempt는 그것을 검증하는 유일한 gate다.
+Do NOT assume any previous phase gate PASS is correct: at MEDIUM/HIGH that is a phase
+Reviewer's PASS decision, at LOW it is the Worker's own success report, which no phase
+Reviewer ever checked.
 
 #### Final Review Finding Contract
 
@@ -1395,13 +1588,20 @@ T2  attempt FAIL이고 FINAL_REVIEW_ITERATIONS == max-iterations
 T3  attempt FAIL이고 budget 잔여 → 이 Dispatch를 먼저 종결하고 finding을 phase로 매핑
 T4  각 responsible phase p에 대해 PHASE_ITERATIONS[p] == max-iterations
                                 → STATUS: ESCALATED / REASON: MAX_ITERATIONS_REACHED (phase p)
-    아니면 correction Worker → p의 Reviewer 재검토 (§12 FAIL Loop 그대로)
-T5a 모든 p가 다시 PASS했으면 downstream revalidation set D를 계산해 canonical order로 순차
-    재검증한다. D가 공집합이면 아무 Dispatch도 만들지 않는다. 각 q ∈ D에 대해
-    PHASE_ITERATIONS[q] == max-iterations
+    아니면 correction round를 연다. round의 모양은 risk가 정한다(§8 Risk Axis, §12).
+      LOW          correction Worker 하나짜리 round. phase Reviewer가 없으므로 재검토도 없다.
+                   그 Worker의 결과가 p의 새 phase gate 판정이다(§6 8단계, §14).
+      MEDIUM/HIGH  correction Worker → p의 Reviewer 재검토 (§12 FAIL Loop 그대로)
+    어느 쪽이든 p가 자신의 phase gate를 다시 PASS하면 T5a로 간다.
+T5a HIGH에서만 실행된다. 모든 p가 다시 PASS했으면 downstream revalidation set D를 계산해
+    canonical order로 순차 재검증한다. LOW/MEDIUM에서는 D를 계산하지 않으며 이 전이는
+    no-op이다(§17 `#### Downstream revalidation`). D가 공집합이면 아무 Dispatch도 만들지
+    않는다. 각 q ∈ D에 대해 PHASE_ITERATIONS[q] == max-iterations
                                 → STATUS: ESCALATED / REASON: MAX_ITERATIONS_REACHED (phase q)
-    아니면 revalidation Worker → q의 Reviewer 재검토 (§12 FAIL Loop 그대로)
-T5  D의 모든 q가 PASS         → T0으로 돌아가 새 fresh attempt를 만든다
+    아니면 revalidation Worker → q의 Reviewer 재검토 (§12 FAIL Loop 그대로).
+    D가 비지 않는 것은 HIGH에서뿐이므로 여기서 q의 Reviewer는 항상 존재한다.
+T5  D의 모든 q가 PASS      → T0으로 돌아가 새 fresh attempt를 만든다
+                             (LOW/MEDIUM에서는 D가 공집합이므로 자명하게 참이다)
 ```
 
 T2의 마지막-attempt guard는 FAIL edge에서 **가장 먼저** 평가한다. finding을 phase로 매핑하기 전에, `PHASE_ITERATIONS`를 읽기 전에 평가한다. 순서가 뒤바뀌면 예산 소진 뒤에도 correction이 dispatch된다.
@@ -1415,6 +1615,9 @@ correction은 그 phase의 산출물을 바꾸므로, 그보다 뒤 phase가 cor
 D = requested phase 중, canonical order(analysis, plan, design, implementation, test)에서
     이번 attempt가 correction한 phase 중 **가장 이른** 것보다 뒤에 있는 phase 전부.
 ```
+
+D의 계산과 실행은 HIGH에서만 수행한다. LOW와 MEDIUM에서 T5a는 no-op이며, 이는 §8 Risk Axis가
+규정한 의도된 동작이다. D의 정의 자체는 risk와 무관하게 그대로다.
 
 D는 그 phase가 실제로 바뀌었는지와 무관하게 **항상 전부** 재검증한다. "정말 바뀌었는가"는 Coordinator가 값싸게
 증명할 수 없는 판단이며, 조건부 재검증은 stale PASS 구멍을 그대로 남긴다. bugfix / refactoring은 canonical
@@ -1456,6 +1659,7 @@ FINAL_REVIEW_EXHAUSTION_REASON = final_review_max_iterations_reached
 FINAL_REVIEW_OUT_OF_SCOPE_REASON = out_of_scope_final_review_finding
 FINAL_REVIEW_DOWNSTREAM_REVALIDATION = all_requested_phases_after_earliest_corrected_phase
 FINAL_REVIEW_COMPLETION_GATE = requested_phases_pass_and_final_review_pass
+FINAL_REVIEW_RISK_INDEPENDENCE = mandatory_and_identical_at_every_risk_level
 ```
 
 ## 18. Core Invariants
@@ -1484,7 +1688,12 @@ Never leave a completed worker live indefinitely
 Specialized phase combinations must be explicitly supported
 Reviewer never fixes its own findings
 Reviewer FAIL → new Worker correction dispatch
-Current phase PASS required before next phase
+Current phase PASS required before next phase; at low risk the phase gate is the worker result
+Risk and phases are independent axes; risk never expands or contracts the requested phase set
+Risk selects which task graph nodes exist, never when they are created
+Final Adversarial Review is mandatory and identical at every risk level
+Mandatory test gates hold at every risk level; risk changes validation strength, never the safety floor
+An explicitly supplied risk value that is not a level, empty included, blocks before any run or task
 IMPLEMENTATION production code change → Unit Test add/modify required
 BUGFIX → Regression Test required
 REFACTORING → relevant existing Unit Test execution + conditional test changes
