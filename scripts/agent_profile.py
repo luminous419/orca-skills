@@ -376,7 +376,10 @@ def _require_command_value(value: Any, where: str) -> str:
     """A command must be a non-empty string. Its SHAPE is not checked here.
 
     `bash`, `my agent` and `../claude` all pass this function. They are rejected by
-    validate_routing_commands() if -- and only if -- they end up in a required role.
+    validate_profile_command_safety() as soon as the profile is selected --
+    anywhere in the profile's definition, not only in a role this invocation
+    happens to require -- and PATH-missing required commands are separately
+    rejected by validate_routing_commands().
     """
     if not isinstance(value, str) or not value:
         raise AgentProfileError(f"{where} must be a non-empty string")
