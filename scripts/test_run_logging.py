@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
+from datetime import datetime
 from io import StringIO
 from pathlib import Path
 
@@ -642,14 +643,25 @@ class TimingCorrectnessRegressionTests(unittest.TestCase):
             for line in lines[2:]
         ]
 
-    def assert_log_invariants(self, run_id: str = "run_os19") -> None:
-        """No row carries a negative duration, and no out-of-order pair is silent.
+    @staticmethod
+    def parsed(value: str) -> datetime | None:
+        try:
+            return datetime.fromisoformat(value)
+        except (TypeError, ValueError):
+            return None
 
-        The caller's own `started_at`/`ended_at` are written back verbatim even
-        when they are impossible -- erasing them would destroy the evidence of
-        what was actually handed in. What may not happen is that the row goes
-        out looking like a normal measurement: `duration_s` is empty and the row
-        says why.
+    def assert_log_invariants(self, run_id: str = "run_os19") -> None:
+        """The OS-19 invariant itself, asserted over every emitted row.
+
+        Review round 1 BF-001: the earlier version of this helper encoded a
+        WEAKER rule than the one the task asks for -- it tolerated an emitted
+        `started_at > ended_at` pair as long as the row carried a marker, which
+        is exactly the row shape the reviewer rejected. It now asserts the
+        requirement verbatim: `started_at <= ended_at` for every populated pair,
+        `duration_s >= 0` always, and no unreadable value in either timestamp
+        column. Evidence for a rejected pair belongs in `detail`, which
+        `assert_quarantined` checks separately -- never in the timestamp
+        columns, whose values are now always trustworthy on their face.
         """
         for index, row in enumerate(self.rows(run_id)):
             with self.subTest(row=index, event=row["event"]):
@@ -659,19 +671,39 @@ class TimingCorrectnessRegressionTests(unittest.TestCase):
                         0.0,
                         f"negative duration_s in {row}",
                     )
-                if (
-                    row["started_at"]
-                    and row["ended_at"]
-                    and row["started_at"] > row["ended_at"]
-                ):
-                    self.assertEqual(row["duration_s"], "", row)
-                    self.assertTrue(
-                        any(
-                            marker in row["detail"]
-                            for marker in run_logging.TIMING_INVALID_MARKERS
-                        ),
-                        f"an out-of-order pair was recorded without saying so: {row}",
+                started_at = self.parsed(row["started_at"]) if row["started_at"] else None
+                ended_at = self.parsed(row["ended_at"]) if row["ended_at"] else None
+                if row["started_at"]:
+                    self.assertIsNotNone(
+                        started_at, f"unreadable started_at emitted: {row}"
                     )
+                if row["ended_at"]:
+                    self.assertIsNotNone(
+                        ended_at, f"unreadable ended_at emitted: {row}"
+                    )
+                if started_at is not None and ended_at is not None:
+                    self.assertLessEqual(
+                        started_at,
+                        ended_at,
+                        f"a row was emitted with started_at > ended_at: {row}",
+                    )
+
+    def assert_quarantined(
+        self, row: dict[str, str], marker: str, started_at: str, ended_at: str
+    ) -> None:
+        """One rejected row: no duration, no timestamps, all of the evidence."""
+        self.assertEqual(row["duration_s"], "", row)
+        self.assertEqual(row["started_at"], "", row)
+        self.assertEqual(row["ended_at"], "", row)
+        self.assertIn(marker, row["detail"])
+        self.assertIn(
+            f"{run_logging.TIMING_INVALID_STARTED_AT_FIELD}={started_at}",
+            row["detail"],
+        )
+        self.assertIn(
+            f"{run_logging.TIMING_INVALID_ENDED_AT_FIELD}={ended_at}",
+            row["detail"],
+        )
 
     # ---- A. The observed rows, replayed exactly -------------------------------
 
@@ -696,11 +728,14 @@ class TimingCorrectnessRegressionTests(unittest.TestCase):
             )
         written = self.rows()
         self.assertEqual(len(written), len(observed))
-        for row in written:
+        for row, (_, _, started_at, ended_at) in zip(written, observed):
             # Not clamped to 0 and not absolute-valued: an out-of-order pair has
-            # no knowable duration, so the cell stays empty and says why.
-            self.assertEqual(row["duration_s"], "")
-            self.assertIn(run_logging.TIMING_INVALID_ORDER, row["detail"])
+            # no knowable duration, so the cell stays empty and says why. And
+            # (review round 1 BF-001) the pair itself does not reach the
+            # timestamp columns -- it survives as evidence inside `detail`.
+            self.assert_quarantined(
+                row, run_logging.TIMING_INVALID_ORDER, started_at, ended_at
+            )
         self.assert_log_invariants()
 
     def test_elapsed_seconds_refuses_to_return_a_negative_number(self) -> None:
@@ -748,9 +783,13 @@ class TimingCorrectnessRegressionTests(unittest.TestCase):
             started_at="2026-08-24T01:00:00",
             ended_at="2026-08-24T01:05:00+00:00",
         )
-        row = self.rows()[-1]
-        self.assertEqual(row["duration_s"], "")
-        self.assertIn(run_logging.TIMING_INVALID_TIMESTAMP, row["detail"])
+        self.assert_quarantined(
+            self.rows()[-1],
+            run_logging.TIMING_INVALID_TIMESTAMP,
+            "2026-08-24T01:00:00",
+            "2026-08-24T01:05:00+00:00",
+        )
+        self.assert_log_invariants()
 
     def test_a_malformed_timestamp_says_so_instead_of_going_quiet(self) -> None:
         log_timing_event(
@@ -760,9 +799,13 @@ class TimingCorrectnessRegressionTests(unittest.TestCase):
             started_at="not-a-timestamp",
             ended_at="2026-08-24T01:05:00+00:00",
         )
-        row = self.rows()[-1]
-        self.assertEqual(row["duration_s"], "")
-        self.assertIn(run_logging.TIMING_INVALID_TIMESTAMP, row["detail"])
+        self.assert_quarantined(
+            self.rows()[-1],
+            run_logging.TIMING_INVALID_TIMESTAMP,
+            "not-a-timestamp",
+            "2026-08-24T01:05:00+00:00",
+        )
+        self.assert_log_invariants()
 
     def test_a_fail_safe_marker_never_destroys_the_callers_own_detail(self) -> None:
         log_timing_event(
@@ -775,7 +818,157 @@ class TimingCorrectnessRegressionTests(unittest.TestCase):
         )
         row = self.rows()[-1]
         self.assertIn("task=task_x dispatch=ctx_x", row["detail"])
-        self.assertIn(run_logging.TIMING_INVALID_ORDER, row["detail"])
+        self.assert_quarantined(
+            row,
+            run_logging.TIMING_INVALID_ORDER,
+            "2026-08-24T01:48:15Z",
+            "2026-08-24T01:41:12Z",
+        )
+
+    # ---- B. Review round 1 BF-001: the supplied-duration door ------------------
+
+    # The reviewer's own probe, verbatim: an out-of-order pair and a malformed
+    # pair, each handed in together with an explicit, perfectly non-negative
+    # `duration_seconds=7`. Before the correction both were written as
+    # `duration_s=7.000` with the impossible pair intact in the timestamp columns
+    # and no marker anywhere, because `log_timing_event()` validated the supplied
+    # duration INSTEAD OF the pair rather than as well as it.
+    BF001_PROBE = (
+        ("2026-08-24T02:00:00+00:00", "2026-08-24T01:00:00+00:00", "out-of-order"),
+        ("broken", "2026-08-24T01:00:00+00:00", "malformed"),
+    )
+
+    def test_a_supplied_duration_does_not_buy_an_invalid_pair_a_way_in(self) -> None:
+        for started_at, ended_at, label in self.BF001_PROBE:
+            with self.subTest(pair=label):
+                log_timing_event(
+                    "run_os19",
+                    base=self.base,
+                    event="dispatch_settled",
+                    phase="IMPLEMENTATION",
+                    role="reviewer",
+                    iteration=2,
+                    started_at=started_at,
+                    ended_at=ended_at,
+                    duration_seconds=7,
+                )
+                row = self.rows()[-1]
+                self.assertNotIn("7", row["duration_s"])
+                self.assert_quarantined(
+                    row,
+                    run_logging.TIMING_INVALID_ORDER
+                    if label == "out-of-order"
+                    else run_logging.TIMING_INVALID_TIMESTAMP,
+                    started_at,
+                    ended_at,
+                )
+        self.assert_log_invariants()
+
+    def test_a_supplied_duration_still_survives_a_pair_that_is_actually_valid(
+        self,
+    ) -> None:
+        """The check added for BF-001 rejects impossible pairs, not explicit
+        durations: an offline reconstruction that hands in a valid pair and its
+        own measured duration is still written exactly as given.
+        """
+        log_timing_event(
+            "run_os19",
+            base=self.base,
+            event="dispatch_settled",
+            started_at="2026-08-24T01:00:00+00:00",
+            ended_at="2026-08-24T02:00:00+00:00",
+            duration_seconds=7,
+        )
+        row = self.rows()[-1]
+        self.assertEqual(row["duration_s"], "7.000")
+        self.assertEqual(row["started_at"], "2026-08-24T01:00:00+00:00")
+        self.assertEqual(row["ended_at"], "2026-08-24T02:00:00+00:00")
+        self.assertEqual(row["detail"], "")
+        self.assert_log_invariants()
+
+    def test_a_lone_timestamp_that_is_not_a_timestamp_is_refused_as_well(self) -> None:
+        """A half-filled row has no pair to be out of order with, but a value
+        that cannot be read as a timestamp still may not sit in a timestamp
+        column -- the row would claim a start instant nothing can interpret.
+        """
+        log_timing_event(
+            "run_os19",
+            base=self.base,
+            event="phase_start",
+            phase="IMPLEMENTATION",
+            started_at="broken",
+        )
+        self.assert_quarantined(
+            self.rows()[-1], run_logging.TIMING_INVALID_TIMESTAMP, "broken", ""
+        )
+        self.assert_log_invariants()
+
+    def test_a_missing_side_is_not_an_error_and_is_left_alone(self) -> None:
+        """The ordinary half-filled row: an open boundary that has not ended yet
+        keeps its real `started_at` and says nothing about anything being wrong.
+        """
+        log_timing_event(
+            "run_os19",
+            base=self.base,
+            event="phase_start",
+            phase="IMPLEMENTATION",
+            started_at="2026-08-24T01:00:00+00:00",
+        )
+        row = self.rows()[-1]
+        self.assertEqual(row["started_at"], "2026-08-24T01:00:00+00:00")
+        self.assertEqual(row["ended_at"], "")
+        self.assertEqual(row["duration_s"], "")
+        self.assertEqual(row["detail"], "")
+        self.assert_log_invariants()
+
+    def test_the_cli_path_refuses_the_same_probe(self) -> None:
+        """The same two probes through the runtime CLI path the reviewer used
+        (`timing-event --duration-seconds 7`), including the boundary rows the
+        tracker opens around them -- the invariant is asserted over every row the
+        run emitted, not only over the settlement rows.
+        """
+        for started_at, ended_at, label in self.BF001_PROBE:
+            with self.subTest(pair=label):
+                stream = StringIO()
+                with redirect_stdout(stream):
+                    exit_code = cli_main(
+                        [
+                            "timing-event",
+                            "--run-id",
+                            "run_os19_cli",
+                            "--base",
+                            str(self.base),
+                            "--event",
+                            "dispatch_settled",
+                            "--phase",
+                            "IMPLEMENTATION",
+                            "--role",
+                            "reviewer",
+                            "--iteration",
+                            "2",
+                            "--started-at",
+                            started_at,
+                            "--ended-at",
+                            ended_at,
+                            "--duration-seconds",
+                            "7",
+                        ]
+                    )
+                self.assertEqual(exit_code, 0)
+                settled = [
+                    row
+                    for row in self.rows("run_os19_cli")
+                    if row["event"] == "dispatch_settled"
+                ][-1]
+                self.assert_quarantined(
+                    settled,
+                    run_logging.TIMING_INVALID_ORDER
+                    if label == "out-of-order"
+                    else run_logging.TIMING_INVALID_TIMESTAMP,
+                    started_at,
+                    ended_at,
+                )
+        self.assert_log_invariants("run_os19_cli")
 
 
 class AuthoritativeDispatchClockTests(unittest.TestCase):
@@ -1180,6 +1373,110 @@ class InstalledToolsTimingParityTests(unittest.TestCase):
                     )
                     python_log = timing_log_path(run_id, base=python_base)
 
+                    for column in ("started_at", "ended_at", "duration_s", "detail"):
+                        self.assertEqual(
+                            self.cell(installed_log, column),
+                            self.cell(python_log, column),
+                            f"{column} differs between the installed CLI and the "
+                            "Python path",
+                        )
+
+    def test_a_supplied_duration_cannot_smuggle_an_invalid_pair_through_the_installed_cli(
+        self,
+    ) -> None:
+        """Review round 1 BF-001, on the path a live Coordinator actually runs.
+
+        The reviewer's probe was a subprocess against the INSTALLED copy, so the
+        regression is too: an out-of-order pair and a malformed pair, each with
+        `--duration-seconds 7`. Both must come back quarantined -- no `7.000`, no
+        timestamps in the timestamp columns, the evidence in `detail` -- and must
+        match what the in-repo Python writer produces for the same input, so the
+        fix cannot hold on one path and not the other.
+        """
+        probe = (
+            (
+                "2026-08-24T02:00:00+00:00",
+                "2026-08-24T01:00:00+00:00",
+                run_logging.TIMING_INVALID_ORDER,
+            ),
+            ("broken", "2026-08-24T01:00:00+00:00", run_logging.TIMING_INVALID_TIMESTAMP),
+        )
+        with tempfile.TemporaryDirectory() as skills_home, tempfile.TemporaryDirectory() as target_project:
+            shutil.copytree(
+                REPO_ROOT / "orca-worker-reviewer-orchestration",
+                Path(skills_home) / "orca-worker-reviewer-orchestration",
+            )
+            installed_tool = (
+                Path(skills_home)
+                / "orca-worker-reviewer-orchestration"
+                / "tools"
+                / "run_logging.py"
+            )
+            for index, (started_at, ended_at, marker) in enumerate(probe):
+                with self.subTest(started_at=started_at, ended_at=ended_at):
+                    run_id = f"run_bf001_{index}"
+                    result = subprocess.run(
+                        [
+                            sys.executable,
+                            str(installed_tool),
+                            "timing-event",
+                            "--run-id",
+                            run_id,
+                            "--event",
+                            "dispatch_settled",
+                            "--phase",
+                            "IMPLEMENTATION",
+                            "--role",
+                            "reviewer",
+                            "--iteration",
+                            "2",
+                            "--started-at",
+                            started_at,
+                            "--ended-at",
+                            ended_at,
+                            "--duration-seconds",
+                            "7",
+                        ],
+                        cwd=target_project,
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    installed_log = (
+                        Path(target_project)
+                        / "artifacts"
+                        / "runs"
+                        / run_id
+                        / TIMING_LOG_FILENAME
+                    )
+                    self.assertEqual(self.cell(installed_log, "duration_s"), "")
+                    self.assertEqual(self.cell(installed_log, "started_at"), "")
+                    self.assertEqual(self.cell(installed_log, "ended_at"), "")
+                    detail = self.cell(installed_log, "detail")
+                    self.assertIn(marker, detail)
+                    self.assertIn(
+                        f"{run_logging.TIMING_INVALID_STARTED_AT_FIELD}={started_at}",
+                        detail,
+                    )
+                    self.assertIn(
+                        f"{run_logging.TIMING_INVALID_ENDED_AT_FIELD}={ended_at}",
+                        detail,
+                    )
+
+                    python_base = Path(target_project) / "python-path"
+                    log_timing_event(
+                        run_id,
+                        base=python_base,
+                        event="dispatch_settled",
+                        phase="IMPLEMENTATION",
+                        role="reviewer",
+                        iteration=2,
+                        started_at=started_at,
+                        ended_at=ended_at,
+                        duration_seconds=7,
+                    )
+                    python_log = timing_log_path(run_id, base=python_base)
                     for column in ("started_at", "ended_at", "duration_s", "detail"):
                         self.assertEqual(
                             self.cell(installed_log, column),

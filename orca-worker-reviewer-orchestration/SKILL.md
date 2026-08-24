@@ -946,9 +946,18 @@ python3 <SKILL_DIR>/tools/run_logging.py run-status --run-id <run-id> \
 있다). 다만 어느 경로로 들어오든 판정은 같다: `ended_at`이 `started_at`보다 앞서거나, 파싱할 수
 없는 값이거나, 음수 duration이면 `duration_s`를 **빈 값으로 남기고** 그 row의 `detail`에
 `timing_invalid=...` 표시를 덧붙인다. 0으로 clamp하거나 절댓값을 취하지 않는다 — 그러면 잘못된
-입력이 정상적인 측정값처럼 보이게 된다. 입력받은 `started_at`/`ended_at` 자체는 그대로 기록한다
-(무엇이 들어왔는지가 증거이기 때문이다). 이 fail-safe는 **로깅에만** 작용한다: 이미 내려진
-settlement/terminal ownership/task status 판단은 무엇도 바꾸지 않는다.
+입력이 정상적인 측정값처럼 보이게 된다. `--duration-seconds`를 함께 주더라도 이 판정은 건너뛰지
+않는다 — 양쪽 timestamp가 모두 채워져 있으면 그 pair 자체를 먼저 검증하고, 불가능한 pair에 대해
+caller가 계산해 온 duration은 그 pair의 측정값이 아니므로 쓰지 않는다.
+
+거부된 pair는 `started_at`/`ended_at` column에 **기록되지 않는다**: 그대로 남기면 그 row 자체가
+`started_at <= ended_at`을 어기게 되고, 그 column을 그대로 읽는 쪽은 `detail`을 보지 않는다. 대신
+두 column을 비우고 입력받은 값 자체를 같은 row의 `detail`에
+`timing_invalid_started_at=<입력값> timing_invalid_ended_at=<입력값>`으로 남긴다 — 무엇이 들어왔는지가
+증거이기 때문이다. 그래서 기록된 모든 row는 "timestamp column에 있는 값은 항상 읽을 수 있는
+timestamp이고, 둘 다 채워져 있으면 항상 `started_at <= ended_at`"을 만족한다. 이 fail-safe는
+**로깅에만** 작용한다: 이미 내려진 settlement/terminal ownership/task status 판단은 무엇도 바꾸지
+않는다.
 
 `--duration-seconds`를 직접 준 경우(`0` 포함)는 그 값을 그대로 쓰고 다시 계산하지 않는다.
 `--started-at`과 `--ended-at`을 둘 다 주고 `--duration-seconds`를 생략하면 `timing-event`가 그

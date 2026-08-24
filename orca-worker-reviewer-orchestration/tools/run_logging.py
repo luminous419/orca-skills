@@ -123,6 +123,18 @@ TIMING_INVALID_MARKERS = (
     TIMING_INVALID_DURATION,
 )
 
+# OS-19 review round 1 BF-001: a marker alone was not enough. A row whose
+# `started_at`/`ended_at` columns still carried the impossible pair verbatim
+# violated the `started_at <= ended_at` invariant in the row itself, no matter
+# what `duration_s` and `detail` said about it. The pair is therefore quarantined
+# instead: the timestamp columns are left empty (they are for timestamps that
+# survived validation) and the two raw values move into `detail` under these
+# names, so the evidence of what was actually handed in is preserved without a
+# later reader -- or a `sort`, or a `min()`/`max()` over the column -- ever
+# seeing an invalid value in a timestamp column.
+TIMING_INVALID_STARTED_AT_FIELD = "timing_invalid_started_at"
+TIMING_INVALID_ENDED_AT_FIELD = "timing_invalid_ended_at"
+
 # The TIMING_LOG events RunTimingTracker owns the lifecycle of, as opposed to
 # merely writing. Spelled once so the CLI and the tracker cannot disagree.
 BOUNDARY_OPEN_EVENTS = ("phase_start", "iteration_start")
@@ -204,6 +216,38 @@ def _validate_duration(duration: Any) -> tuple[float | str, str]:
     if value < 0:
         return "", TIMING_INVALID_DURATION
     return value, ""
+
+
+def _is_unusable_timestamp(value: Any) -> bool:
+    """True for a populated value `datetime.fromisoformat` cannot read at all.
+
+    A blank side is not a fault (a `phase_start` row legitimately has no
+    `ended_at` yet); a populated one that is not a timestamp is. resolve_duration()
+    only reaches that judgement for a PAIR, because a duration needs both sides --
+    this is the same judgement for the lone side of a half-filled row, so that no
+    value which is not a timestamp is ever written into a timestamp column.
+    """
+    if not value:
+        return False
+    try:
+        datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return True
+    return False
+
+
+def _quarantine_evidence(started_at: Any, ended_at: Any) -> str:
+    """The `detail` evidence for a pair that may not be written as timestamps.
+
+    OS-19 review round 1 BF-001 required that an invalid populated pair never
+    be emitted into the timestamp columns AND that the diagnostic evidence not
+    be destroyed. This is the second half: the exact strings the caller handed
+    in, under names that are greppable and are not timestamp columns.
+    """
+    return (
+        f"{TIMING_INVALID_STARTED_AT_FIELD}={'' if started_at is None else started_at} "
+        f"{TIMING_INVALID_ENDED_AT_FIELD}={'' if ended_at is None else ended_at}"
+    )
 
 
 def _escape(value: Any) -> str:
@@ -370,17 +414,54 @@ def log_timing_event(
     rather than writing a number no reader could trust. This function still
     never raises: it is logging, and section 9 (OS-17) requires that a logging
     concern cannot change a lifecycle decision that has already been made.
+
+    OS-19 review round 1 BF-001: the timestamp pair is validated whenever BOTH
+    sides are populated, whether or not `duration_seconds` was supplied. Two
+    things follow. First, an explicit duration is no longer a door around the
+    check -- a caller-computed `7` for a pair whose `ended_at` precedes its
+    `started_at` is not a measurement of that pair and is not written as one.
+    Second, an invalid pair does not reach the `started_at`/`ended_at` columns
+    at all: the row would otherwise violate `started_at <= ended_at` in its own
+    two timestamp cells however loudly `detail` disclaimed it. The pair is
+    quarantined into `detail` verbatim instead (see `_quarantine_evidence`), so
+    every emitted row with both timestamp columns populated satisfies the
+    invariant and nothing about the bad input is lost. The same quarantine
+    covers the lone populated side of a half-filled row when it is not a
+    readable timestamp at all: a value that is not a timestamp has no business
+    in a timestamp column either, even where there is no pair to order it
+    against.
     """
     path = timing_log_path(run_id, base=base)
     _ensure_table(path, TIMING_LOG_COLUMNS)
-    if duration_seconds in ("", None):
-        duration, reason = resolve_duration(started_at, ended_at)
+    # Always resolved, never only as a duration source: for a populated pair this
+    # IS the ordering check, and `reason` is non-empty only when both sides were
+    # populated and the pair was impossible.
+    derived, reason = resolve_duration(started_at, ended_at)
+    if not reason and (
+        _is_unusable_timestamp(started_at) or _is_unusable_timestamp(ended_at)
+    ):
+        # Only reachable for a half-filled row: a populated pair has already been
+        # judged above. Same rule, same fail-safe.
+        reason = TIMING_INVALID_TIMESTAMP
+    if reason:
+        duration = ""
+        detail = " ".join(
+            part
+            for part in (detail, reason, _quarantine_evidence(started_at, ended_at))
+            if part
+        )
+        started_at = ""
+        ended_at = ""
+    elif duration_seconds in ("", None):
+        duration = derived
     else:
-        duration, reason = _validate_duration(duration_seconds)
+        duration, duration_reason = _validate_duration(duration_seconds)
+        if duration_reason:
+            detail = (
+                f"{detail} {duration_reason}".strip() if detail else duration_reason
+            )
     if isinstance(duration, float):
         duration = f"{duration:.3f}"
-    if reason:
-        detail = f"{detail} {reason}".strip() if detail else reason
     _append_row(
         path,
         TIMING_LOG_COLUMNS,
