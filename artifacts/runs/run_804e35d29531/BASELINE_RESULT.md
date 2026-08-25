@@ -1,3 +1,21 @@
+> **SUPERSEDED — this is no longer the current §7 baseline.**
+> The capture described below (`artifacts/runs/run_92759e0e1034/`) was taken under the superseded
+> `redaction/1.0` policy, and its retained `input.md`, `record.json` and evidence bundle carry a raw
+> environment-specific scratch path. That is finding **R6** in
+> `artifacts/runs/run_804e35d29531/FINAL_REVIEW_iteration3.md`, and it means this capture does not
+> satisfy DESIGN's B3 gate.
+>
+> **The current, authoritative §7 baseline is
+> [`artifacts/runs/run_644c005bc9db/BASELINE_RESULT.md`](../run_644c005bc9db/BASELINE_RESULT.md)**,
+> describing the re-capture in `artifacts/runs/run_5967188007ce/` under `redaction/1.1`.
+>
+> This document and the `run_92759e0e1034/` artifacts are retained unmodified as historical forensic
+> evidence of R6 — exactly as `run_ff587481a820/` is retained as the forensic evidence of R2/R4. Do
+> **not** cite either as the accepted baseline result. Everything below is preserved as it stood when
+> it was written; only this notice was added.
+
+---
+
 # OS-22 §7 Fixture-Based Final Review Baseline
 
 **This document replaces the previous §7 baseline write-up.** The first attempt at this baseline
