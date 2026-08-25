@@ -41,6 +41,11 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+# The sibling module, not a second implementation: "standard library only" forbids
+# third-party dependencies, not reuse of this repository's own module, and a second
+# copy of a redaction policy is precisely the drift R1 punished.
+import run_logging
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_FIXTURE_DIR = REPO_ROOT / "scripts" / "fixtures" / "final_review_eval"
@@ -60,11 +65,21 @@ ARCHETYPES = (
     "validation_scope_gap",
 )
 
-# The one classification an unmatched finding gets by default, and the only two an
-# adjudication can change it to. There is no fourth value and no inference rule.
+# The classification an unmatched finding gets by default, the two an adjudication can
+# change it to, and the ONE a signed closed-world attestation can. There is no fifth
+# value and no inference rule: ATTESTED_FALSE_POSITIVE is reachable only on the
+# closed-world path, only for reason `no_key_match`, and only when no explicit verdict
+# names the finding.
 UNADJUDICATED = "UNADJUDICATED"
 ADJUDICATED_TRUE_POSITIVE = "ADJUDICATED_TRUE_POSITIVE"
 ADJUDICATED_FALSE_POSITIVE = "ADJUDICATED_FALSE_POSITIVE"
+ATTESTED_FALSE_POSITIVE = "ATTESTED_FALSE_POSITIVE"
+# The two unmatched reasons the attestation says NOTHING about: they mean the matcher
+# could not FINISH evaluating the finding against the key -- in the ambiguous case the
+# finding actually satisfied two entries' criteria -- while the attestation speaks only
+# about the key's coverage of true defects. Auto-FP-ing a finding the matcher never
+# managed to test would manufacture precision out of a matcher limitation.
+INCOMPLETE_MATCH_REASONS = ("unresolvable_location", "ambiguous_match")
 VERDICT_VALUES = ("true_positive", "false_positive")
 # DEC-8 rule 4 made structural: a verdict object may carry NOTHING else, so a
 # historical-corpus signal ("was corrected", "was not disputed") is unrepresentable
@@ -790,8 +805,13 @@ def load_adjudications(path: Path) -> dict:
             raise EvalContractError(
                 f"{finding_id}: rationale is required and must be non-empty"
             )
+    # closed_world and exhaustive_attestation are COUPLED, and the coupling is an input
+    # contract rather than something silently tolerated. This deletes the two half-states
+    # the file could otherwise express -- a closed-world claim with nothing signed behind
+    # it, and an attestation no computation path reads -- so the precision gate never has
+    # to decide what an unsigned closed world means.
+    attestation = document.get("exhaustive_attestation")
     if document.get("closed_world"):
-        attestation = document.get("exhaustive_attestation")
         if not isinstance(attestation, dict) or not all(
             str(attestation.get(field) or "").strip() for field in ATTESTATION_KEYS
         ):
@@ -799,7 +819,75 @@ def load_adjudications(path: Path) -> dict:
                 "closed_world requires a complete exhaustive_attestation "
                 f"({', '.join(ATTESTATION_KEYS)})"
             )
+    elif attestation is not None:
+        raise EvalContractError(
+            "exhaustive_attestation is present while closed_world is false; an "
+            "attestation no computation path reads is a half-state, not a document"
+        )
     return document
+
+
+def classify_unmatched(
+    unmatched: list[dict], verdicts: dict[str, str], *, closed_world: bool
+) -> tuple[list[dict], dict[str, int]]:
+    """E.5 point 2, as ONE function over both paths, so the two numerators cannot drift.
+
+    Its only inputs are `closed_world`, the per-finding unmatched `reason` and the
+    verdict map. An explicit per-item verdict ALWAYS wins over the attestation.
+
+    Path B (open world) can only ever produce UNADJUDICATED or an adjudicated
+    classification: there is no flag, config or heuristic that maps unmatched -> false
+    positive on it, because absent a signed exhaustive attestation the key is a SAMPLE
+    of the true defects and "did not match the key" carries no information about
+    whether a finding is true.
+    """
+    classified: list[dict] = []
+    counts = {
+        "adjudicated_true_positives": 0,
+        "adjudicated_false_positives": 0,
+        "attested_false_positives": 0,
+    }
+    for item in unmatched:
+        verdict = verdicts.get(item["finding_id"])
+        if verdict == "true_positive":
+            classification = ADJUDICATED_TRUE_POSITIVE
+            counts["adjudicated_true_positives"] += 1
+        elif verdict == "false_positive":
+            classification = ADJUDICATED_FALSE_POSITIVE
+            counts["adjudicated_false_positives"] += 1
+        elif closed_world and item["reason"] == "no_key_match":
+            # The matcher compared this finding against the WHOLE key and it satisfied
+            # no entry; under an attestation that the key enumerates every true defect
+            # in scope, that is a positive statement that the finding names none.
+            classification = ATTESTED_FALSE_POSITIVE
+            counts["attested_false_positives"] += 1
+        else:
+            classification = UNADJUDICATED
+        classified.append({**item, "classification": classification})
+    return classified, counts
+
+
+def _retained_path_field(value: Any) -> str:
+    """C.7 P-PATH, applied to the two path-bearing fields this scorer serializes.
+
+    A metrics document produced from a scratch workspace must not embed that
+    workspace's absolute path. The ladder is the same shape run_logging.py uses --
+    repository-relative when the path is inside this checkout, the whole value replaced
+    otherwise -- and the classifier and its postcondition come from that module rather
+    than from a second copy of the policy here.
+    """
+    text = str(value or "")
+    if not text:
+        return ""
+    candidate = Path(text)
+    if candidate.is_absolute():
+        try:
+            text = candidate.resolve().relative_to(REPO_ROOT).as_posix()
+        except (ValueError, OSError):
+            text = run_logging.FOREIGN_PATH_PLACEHOLDER
+    normalized = run_logging.normalize_retained_path_field(text)
+    run_logging.assert_retained_path_field(normalized)
+    return normalized
 
 
 def score(
@@ -835,58 +923,88 @@ def score(
         if entry["id"] not in {item["seeded_defect_id"] for item in matched}
     )
 
+    raw_verdicts = (adjudications or {}).get("verdicts", []) or []
     verdicts = {
-        verdict["finding_id"]: verdict["verdict"]
-        for verdict in (adjudications or {}).get("verdicts", [])
+        verdict["finding_id"]: verdict["verdict"] for verdict in raw_verdicts
     }
-    classified = []
-    true_positives = 0
-    false_positives = 0
-    for item in unmatched:
-        verdict = verdicts.get(item["finding_id"])
-        if verdict == "true_positive":
-            classification = ADJUDICATED_TRUE_POSITIVE
-            true_positives += 1
-        elif verdict == "false_positive":
-            classification = ADJUDICATED_FALSE_POSITIVE
-            false_positives += 1
-        else:
-            classification = UNADJUDICATED
-        classified.append({**item, "classification": classification})
+    closed_world = bool((adjudications or {}).get("closed_world"))
+    classified, counts = classify_unmatched(
+        unmatched, verdicts, closed_world=closed_world
+    )
+    true_positives = counts["adjudicated_true_positives"]
+    false_positives = counts["adjudicated_false_positives"]
+    attested_false_positives = counts["attested_false_positives"]
     unadjudicated = [
         item for item in classified if item["classification"] == UNADJUDICATED
     ]
 
-    closed_world = bool((adjudications or {}).get("closed_world"))
-    if adjudications is None:
+    # The mapping is total, and first match wins. `complete_by_attestation` exists so
+    # the PROVENANCE of the completeness stays visible: a reader can tell at a glance
+    # that some false positives were derived from a signed scope claim rather than
+    # judged one by one, which is a materially weaker warrant and must not be laundered
+    # into plain `complete`.
+    if adjudications is None or (not raw_verdicts and not closed_world):
         adjudication_status = "none"
-    elif not unadjudicated:
-        adjudication_status = "complete"
-    else:
+    elif unadjudicated:
         adjudication_status = "partial"
+    elif attested_false_positives:
+        adjudication_status = "complete_by_attestation"
+    else:
+        adjudication_status = "complete"
 
     grounded, ungrounded = _evidence_grounding(findings, workspace)
 
+    # The two computation paths are MUTUALLY EXCLUSIVE, selected by closed_world, and
+    # each is complete on its own. One decision gates both metrics, so they can never
+    # disagree -- R3 was exactly a numerator that penalised unmatched findings in
+    # precision while false_positive_rate ignored them and reported a false 0.
     precision: float | None = None
     false_positive_rate: float | None = None
-    if closed_world or not unadjudicated:
-        status = "COMPUTED"
-        reason = ""
-        total = len(findings)
-        if total:
-            precision = (len(matched) + true_positives) / total
-            false_positive_rate = false_positives / total
-        else:
-            precision = None
-            false_positive_rate = None
+    total = len(findings)
+    if not total:
+        status = "REFUSED"
+        reason = "no_findings: the report carried no finding to compute a rate over"
+    elif closed_world:
+        blocked = [
+            item["finding_id"]
+            for item in unadjudicated
+            if item["reason"] in INCOMPLETE_MATCH_REASONS
+        ]
+        if unadjudicated:
             status = "REFUSED"
-            reason = "no_findings: the report carried no finding to compute a rate over"
-    else:
+            reason = (
+                f"closed_world_incomplete_match_evaluation: {len(blocked)} unmatched "
+                "findings have reason unresolvable_location|ambiguous_match and carry "
+                "no explicit verdict"
+            )
+        else:
+            status = "COMPUTED"
+            reason = ""
+    elif unadjudicated:
         status = "REFUSED"
         reason = (
             f"adjudication_incomplete: {len(unadjudicated)} unmatched finding(s) carry "
             "no independent adjudication verdict, and no closed_world exhaustive "
             "attestation is present"
+        )
+    else:
+        status = "COMPUTED"
+        reason = ""
+
+    if status == "COMPUTED":
+        precision = (len(matched) + true_positives) / total
+        false_positive_rate = (
+            false_positives + attested_false_positives
+        ) / total
+        _assert_metric_consistency(
+            total,
+            matched=len(matched),
+            true_positives=true_positives,
+            false_positives=false_positives,
+            attested_false_positives=attested_false_positives,
+            unadjudicated=len(unadjudicated),
+            precision=precision,
+            false_positive_rate=false_positive_rate,
         )
 
     metrics: dict[str, Any] = {
@@ -895,7 +1013,9 @@ def score(
         "fixture_digest": key.get("fixture_digest", ""),
         "key_digest": "sha256:"
         + sha256_text(json.dumps(key, sort_keys=True, ensure_ascii=False)),
-        "findings_source": findings_document.get("source_report", ""),
+        "findings_source": _retained_path_field(
+            findings_document.get("source_report", "")
+        ),
         "findings_source_digest": findings_document.get("source_report_digest", ""),
         "findings_total": len(findings),
         "adjudication_status": adjudication_status,
@@ -921,6 +1041,8 @@ def score(
         "unadjudicated_count": len(unadjudicated),
         "adjudicated_true_positives": true_positives,
         "adjudicated_false_positives": false_positives,
+        # Always present; non-zero only under a signed closed-world attestation.
+        "attested_false_positives": attested_false_positives,
         "precision": precision,
         "precision_status": status,
         "precision_refusal_reason": reason,
@@ -936,6 +1058,42 @@ def score(
     }
     metrics["evidence_grounding"]["ungrounded_finding_ids"] = ungrounded
     return metrics
+
+
+def _assert_metric_consistency(
+    total: int,
+    *,
+    matched: int,
+    true_positives: int,
+    false_positives: int,
+    attested_false_positives: int,
+    unadjudicated: int,
+    precision: float,
+    false_positive_rate: float,
+) -> None:
+    """E.5's three consistency invariants. A violation aborts; it never serializes.
+
+    R3 was a silent inconsistency between two metrics, so this is a RuntimeError rather
+    than a note: `precision_status == COMPUTED` implies every finding is accounted for
+    by exactly one of matched / adjudicated TP / adjudicated FP / attested FP, and
+    therefore `precision + false_positive_rate == 1` exactly.
+    """
+    if unadjudicated:
+        raise RuntimeError(
+            "COMPUTED precision with "
+            f"{unadjudicated} unadjudicated finding(s): a metric that leaves findings "
+            "unaccounted for is the R3 failure mode"
+        )
+    accounted = matched + true_positives + false_positives + attested_false_positives
+    if accounted != total:
+        raise RuntimeError(
+            f"COMPUTED precision accounts for {accounted} of {total} findings"
+        )
+    if abs(precision + false_positive_rate - 1.0) > 1e-9:
+        raise RuntimeError(
+            f"precision ({precision}) + false_positive_rate ({false_positive_rate}) "
+            "!= 1; the two metrics disagree about the same findings"
+        )
 
 
 def _evidence_grounding(
@@ -1112,7 +1270,7 @@ def _dispatch(args: argparse.Namespace) -> int:
         workspace = Path(args.workspace) if args.workspace else None
         document = {
             "schema_version": FINDINGS_SCHEMA_VERSION,
-            "source_report": str(report_path),
+            "source_report": _retained_path_field(str(report_path)),
             "source_report_digest": "sha256:" + sha256_text(raw),
             "findings": parse_report(raw, workspace),
         }

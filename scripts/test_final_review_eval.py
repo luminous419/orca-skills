@@ -13,6 +13,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import run_logging
 from scripts import final_review_eval as evaluator
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -100,6 +101,36 @@ NOISE_FINDING = finding(
     "style preference.",
     blocking=False,
 )
+
+# The closed-world case needs a noise finding whose location RESOLVES and that still
+# matches no key entry: that is the only shape an exhaustive attestation can speak
+# about. NOISE_FINDING above is deliberately unresolvable, which is a different case
+# (the matcher could not finish evaluating it) and must stay REFUSED.
+RESOLVED_NOISE_FINDING = finding(
+    "R9",
+    "src/validation.py:10",
+    "the required field list could be a frozenset.",
+    "micro-optimization, not a contract violation.",
+    blocking=False,
+)
+
+
+def attestation(**overrides) -> dict:
+    document = {
+        "schema_version": "1.0",
+        "adjudicator": "a human",
+        "adjudicated_at": "2026-08-26T10:00:00+00:00",
+        "closed_world": True,
+        "exhaustive_attestation": {
+            "scope": "final_review_eval/v1",
+            "statement": "the key enumerates every true defect in this scope",
+            "attested_by": "a human",
+            "attested_at": "2026-08-26T10:00:00+00:00",
+        },
+        "verdicts": [],
+    }
+    document.update(overrides)
+    return document
 
 
 class FixtureIntegrityTests(unittest.TestCase):
@@ -601,24 +632,24 @@ class PrecisionRefusalTests(unittest.TestCase):
         self.assertEqual(metrics["unadjudicated_count"], 1)
 
     def test_a_closed_world_attestation_computes_precision(self) -> None:
-        adjudications = {
-            "schema_version": "1.0",
-            "adjudicator": "a human",
-            "adjudicated_at": "2026-08-26T10:00:00+00:00",
-            "closed_world": True,
-            "exhaustive_attestation": {
-                "scope": "final_review_eval/v1",
-                "statement": "the key enumerates everything a correct review reports",
-                "attested_by": "a human",
-                "attested_at": "2026-08-26T10:00:00+00:00",
-            },
-            "verdicts": [],
-        }
-
-        metrics = self.score(PERFECT_REPORT + NOISE_FINDING, adjudications)
+        metrics = self.score(PERFECT_REPORT + RESOLVED_NOISE_FINDING, attestation())
 
         self.assertEqual(metrics["precision_status"], "COMPUTED")
         self.assertTrue(metrics["closed_world"])
+
+    def test_a_closed_world_run_refuses_an_unresolvable_noise_finding(self) -> None:
+        """The attestation covers the KEY's completeness, not a match the matcher
+        could not finish evaluating. Auto-FP-ing one would manufacture precision out
+        of a matcher limitation."""
+        metrics = self.score(PERFECT_REPORT + NOISE_FINDING, attestation())
+
+        self.assertEqual(metrics["precision_status"], "REFUSED")
+        self.assertIn(
+            "closed_world_incomplete_match_evaluation",
+            metrics["precision_refusal_reason"],
+        )
+        self.assertEqual(metrics["unmatched_findings"][0]["classification"], "UNADJUDICATED")
+        self.assertEqual(metrics["attested_false_positives"], 0)
 
     def test_recall_is_computable_even_when_precision_is_refused(self) -> None:
         metrics = self.score(PERFECT_REPORT + NOISE_FINDING)
@@ -642,6 +673,255 @@ class PrecisionRefusalTests(unittest.TestCase):
         self.assertEqual(several["verdict_reproducibility"]["status"], "OBSERVED")
         self.assertEqual(several["verdict_reproducibility"]["run_count"], 3)
         self.assertAlmostEqual(several["verdict_reproducibility"]["agreement"], 2 / 3)
+
+
+class ClosedWorldFalsePositiveRateTests(unittest.TestCase):
+    """The R3 regression guard, asserted by EXACT VALUE, not by "computation occurred".
+
+    Before the D-E correction this exact input reported false_positive_rate 0.0 with
+    unadjudicated_count 1: precision penalised the unmatched finding while the
+    false-positive rate ignored it. Four of the assertions below fail against that
+    behaviour, which is what makes this a regression guard rather than a formality.
+    """
+
+    def parse(self, report: str) -> dict:
+        return {
+            "schema_version": "1.0",
+            "source_report": "report.md",
+            "source_report_digest": "sha256:" + evaluator.sha256_text(report),
+            "findings": evaluator.parse_report(report, None),
+        }
+
+    def score(self, report: str, adjudications=None) -> dict:
+        return evaluator.score(
+            self.parse(report),
+            evaluator.load_key(KEY_PATH),
+            adjudications=adjudications,
+        )
+
+    def test_an_unmatched_finding_under_attestation_is_an_attested_false_positive(
+        self,
+    ) -> None:
+        metrics = self.score(PERFECT_REPORT + RESOLVED_NOISE_FINDING, attestation())
+
+        self.assertEqual(metrics["findings_total"], 6)
+        self.assertEqual(len(metrics["matched_findings"]), 5)
+        unmatched = metrics["unmatched_findings"]
+        self.assertEqual(len(unmatched), 1)
+        self.assertEqual(unmatched[0]["finding_id"], "R9")
+        self.assertEqual(unmatched[0]["reason"], "no_key_match")
+        self.assertEqual(unmatched[0]["classification"], "ATTESTED_FALSE_POSITIVE")
+        self.assertEqual(metrics["attested_false_positives"], 1)
+        self.assertEqual(metrics["adjudicated_false_positives"], 0)
+        self.assertEqual(metrics["unadjudicated_count"], 0)
+        self.assertEqual(metrics["adjudication_status"], "complete_by_attestation")
+        self.assertEqual(metrics["precision_status"], "COMPUTED")
+        self.assertAlmostEqual(metrics["precision"], 5 / 6)
+        # The R3 defect reported 0.0 here.
+        self.assertAlmostEqual(metrics["false_positive_rate"], 1 / 6)
+        self.assertAlmostEqual(
+            metrics["precision"] + metrics["false_positive_rate"], 1.0
+        )
+
+    def test_an_explicit_verdict_beats_the_attestation(self) -> None:
+        adjudications = attestation(
+            verdicts=[
+                {
+                    "finding_id": "R9",
+                    "verdict": "true_positive",
+                    "rationale": "a real defect the key does not enumerate",
+                }
+            ]
+        )
+
+        metrics = self.score(PERFECT_REPORT + RESOLVED_NOISE_FINDING, adjudications)
+
+        self.assertEqual(
+            metrics["unmatched_findings"][0]["classification"],
+            "ADJUDICATED_TRUE_POSITIVE",
+        )
+        self.assertEqual(metrics["attested_false_positives"], 0)
+        self.assertEqual(metrics["adjudication_status"], "complete")
+        self.assertAlmostEqual(metrics["precision"], 1.0)
+        self.assertAlmostEqual(metrics["false_positive_rate"], 0.0)
+
+    def test_closed_world_refuses_an_incompletely_evaluated_match(self) -> None:
+        """Both reasons, and the fix available to the adjudicator.
+
+        The reason is FORCED rather than provoked: what is under test is the
+        classification rule keyed on E.4 step 6's reason, not the matcher's ability to
+        produce that reason from a particular report.
+        """
+        real = evaluator.match_findings
+
+        def forced(reason: str):
+            def _match(findings, key):
+                matched, unmatched = real(findings, key)
+                return matched, [{**item, "reason": reason} for item in unmatched]
+
+            return _match
+
+        for reason in evaluator.INCOMPLETE_MATCH_REASONS:
+            with self.subTest(reason=reason):
+                with patch.object(evaluator, "match_findings", forced(reason)):
+                    metrics = self.score(
+                        PERFECT_REPORT + RESOLVED_NOISE_FINDING, attestation()
+                    )
+
+                self.assertEqual(metrics["unmatched_findings"][0]["reason"], reason)
+                self.assertEqual(
+                    metrics["unmatched_findings"][0]["classification"], "UNADJUDICATED"
+                )
+                self.assertEqual(metrics["precision_status"], "REFUSED")
+                self.assertEqual(metrics["false_positive_rate_status"], "REFUSED")
+                self.assertIsNone(metrics["precision"])
+                self.assertIsNone(metrics["false_positive_rate"])
+                self.assertIn(
+                    "closed_world_incomplete_match_evaluation",
+                    metrics["precision_refusal_reason"],
+                )
+                self.assertEqual(metrics["adjudication_status"], "partial")
+                self.assertEqual(metrics["attested_false_positives"], 0)
+
+                # The fix available to the adjudicator: a verdict for exactly that id
+                # flips the same input to COMPUTED.
+                with patch.object(evaluator, "match_findings", forced(reason)):
+                    supplied = self.score(
+                        PERFECT_REPORT + RESOLVED_NOISE_FINDING,
+                        attestation(
+                            verdicts=[
+                                {
+                                    "finding_id": "R9",
+                                    "verdict": "false_positive",
+                                    "rationale": "a style preference, not a defect",
+                                }
+                            ]
+                        ),
+                    )
+                self.assertEqual(supplied["precision_status"], "COMPUTED")
+                self.assertEqual(supplied["adjudication_status"], "complete")
+                self.assertAlmostEqual(supplied["false_positive_rate"], 1 / 6)
+
+        supplied = self.score(
+            PERFECT_REPORT + NOISE_FINDING,
+            attestation(
+                verdicts=[
+                    {
+                        "finding_id": "R9",
+                        "verdict": "false_positive",
+                        "rationale": "a style preference the review should not have "
+                        "reported",
+                    }
+                ]
+            ),
+        )
+        self.assertEqual(supplied["precision_status"], "COMPUTED")
+        self.assertEqual(supplied["adjudication_status"], "complete")
+        self.assertAlmostEqual(supplied["false_positive_rate"], 1 / 6)
+
+    def test_the_open_world_path_never_auto_false_positives(self) -> None:
+        """Path B is unchanged by the closed-world exception."""
+        for report in (
+            PERFECT_REPORT + RESOLVED_NOISE_FINDING,
+            PERFECT_REPORT + NOISE_FINDING,
+        ):
+            with self.subTest(report=report[-40:]):
+                metrics = self.score(report)
+                self.assertEqual(
+                    metrics["unmatched_findings"][0]["classification"],
+                    "UNADJUDICATED",
+                )
+                self.assertEqual(metrics["attested_false_positives"], 0)
+                self.assertEqual(metrics["precision_status"], "REFUSED")
+                self.assertIn(
+                    "adjudication_incomplete", metrics["precision_refusal_reason"]
+                )
+
+    def test_the_gate_is_a_single_decision_across_every_case(self) -> None:
+        cases = (
+            (PERFECT_REPORT + RESOLVED_NOISE_FINDING, attestation()),
+            (PERFECT_REPORT + NOISE_FINDING, attestation()),
+            (PERFECT_REPORT + RESOLVED_NOISE_FINDING, None),
+            (PERFECT_REPORT, None),
+            (PERFECT_REPORT, attestation()),
+        )
+        for report, adjudications in cases:
+            with self.subTest(adjudicated=adjudications is not None):
+                metrics = self.score(report, adjudications)
+                self.assertEqual(
+                    metrics["precision_status"], metrics["false_positive_rate_status"]
+                )
+                if metrics["precision_status"] == "COMPUTED":
+                    self.assertEqual(metrics["unadjudicated_count"], 0)
+                    self.assertAlmostEqual(
+                        metrics["precision"] + metrics["false_positive_rate"], 1.0
+                    )
+
+    def test_no_findings_refuses_both_metrics_on_both_paths(self) -> None:
+        for adjudications in (None, attestation()):
+            with self.subTest(closed_world=adjudications is not None):
+                metrics = self.score("RESULT: PASS\n", adjudications)
+
+                self.assertEqual(metrics["findings_total"], 0)
+                self.assertIsNone(metrics["precision"])
+                self.assertIsNone(metrics["false_positive_rate"])
+                self.assertEqual(metrics["precision_status"], "REFUSED")
+                self.assertIn("no_findings", metrics["precision_refusal_reason"])
+
+
+class ScorerPathFieldTests(unittest.TestCase):
+    """C.7 P-PATH: the scorer's own path fields, so a metrics document produced from a
+    scratch workspace cannot embed that workspace's absolute path."""
+
+    def metrics_for(self, source_report: str) -> dict:
+        document = {
+            "schema_version": "1.0",
+            "source_report": source_report,
+            "source_report_digest": "sha256:" + evaluator.sha256_text(PERFECT_REPORT),
+            "findings": evaluator.parse_report(PERFECT_REPORT, None),
+        }
+        return evaluator.score(document, evaluator.load_key(KEY_PATH))
+
+    def test_an_absolute_source_report_outside_the_repository_is_replaced(self) -> None:
+        for value in (
+            "/private/tmp/claude-501/-Users-luminous-orca-skills/9b57/scratch/REPORT.md",
+            "/luminous",
+        ):
+            with self.subTest(value=value):
+                metrics = self.metrics_for(value)
+
+                self.assertEqual(
+                    metrics["findings_source"], "<REDACTED:foreign_absolute_path>"
+                )
+                self.assertNotIn("luminous", json.dumps(metrics))
+
+    def test_a_repository_path_stays_readable(self) -> None:
+        metrics = self.metrics_for(
+            str(REPO_ROOT / "artifacts" / "runs" / "run_x" / "report.md")
+        )
+
+        self.assertEqual(metrics["findings_source"], "artifacts/runs/run_x/report.md")
+
+    def test_every_string_in_the_metrics_document_is_path_safe(self) -> None:
+        metrics = self.metrics_for("/private/tmp/x/y/report.md")
+
+        def walk(node):
+            if isinstance(node, str):
+                yield node
+            elif isinstance(node, dict):
+                for value in node.values():
+                    yield from walk(value)
+            elif isinstance(node, list):
+                for value in node:
+                    yield from walk(value)
+
+        for value in walk(metrics):
+            with self.subTest(value=value):
+                self.assertFalse(value.startswith("/"))
+        self.assertEqual(
+            run_logging.normalize_retained_path_field(metrics["findings_source"]),
+            metrics["findings_source"],
+        )
 
 
 class AdjudicationContractTests(unittest.TestCase):
@@ -699,6 +979,12 @@ class AdjudicationContractTests(unittest.TestCase):
 
         with self.assertRaises(evaluator.EvalContractError):
             self.load(document)
+
+    def test_an_attestation_without_a_closed_world_claim_is_refused(self) -> None:
+        """The other half of E.3's coupling: an attestation no computation path reads
+        is a half-state, not a document."""
+        with self.assertRaises(evaluator.EvalContractError):
+            self.load(attestation(closed_world=False))
 
     def test_closed_world_requires_a_complete_attestation(self) -> None:
         with self.assertRaises(evaluator.EvalContractError):
@@ -923,6 +1209,83 @@ class ExitCodeTests(unittest.TestCase):
         )
 
         self.assertEqual(completed.returncode, 2)
+
+    def test_three_when_a_closed_world_run_cannot_finish_a_match(self) -> None:
+        """The findings file's noise finding is unresolvable, so the attestation says
+        nothing about it and --require-precision must still exit 3."""
+        path = self.root / "attestation.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "schema_version": "1.0",
+                    "adjudicator": "a human",
+                    "adjudicated_at": "2026-08-26T10:00:00+00:00",
+                    "closed_world": True,
+                    "exhaustive_attestation": {
+                        "scope": "final_review_eval/v1",
+                        "statement": "the key enumerates every true defect in scope",
+                        "attested_by": "a human",
+                        "attested_at": "2026-08-26T10:00:00+00:00",
+                    },
+                    "verdicts": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        completed = run_cli(
+            "score",
+            "--findings",
+            str(self.findings),
+            "--key",
+            str(KEY_PATH),
+            "--adjudications",
+            str(path),
+            "--require-precision",
+        )
+
+        self.assertEqual(completed.returncode, 3)
+        self.assertIn("closed_world_incomplete_match_evaluation", completed.stderr)
+
+    def test_two_when_closed_world_and_the_attestation_disagree(self) -> None:
+        """E.3's coupling, in both directions, at the CLI boundary."""
+        signed = {
+            "scope": "final_review_eval/v1",
+            "statement": "the key enumerates every true defect in scope",
+            "attested_by": "a human",
+            "attested_at": "2026-08-26T10:00:00+00:00",
+        }
+        for label, closed_world, attestation_value in (
+            ("unsigned closed world", True, None),
+            ("unread attestation", False, signed),
+        ):
+            with self.subTest(case=label):
+                path = self.root / f"adjudications-{closed_world}.json"
+                path.write_text(
+                    json.dumps(
+                        {
+                            "schema_version": "1.0",
+                            "adjudicator": "a human",
+                            "adjudicated_at": "2026-08-26T10:00:00+00:00",
+                            "closed_world": closed_world,
+                            "exhaustive_attestation": attestation_value,
+                            "verdicts": [],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+                completed = run_cli(
+                    "score",
+                    "--findings",
+                    str(self.findings),
+                    "--key",
+                    str(KEY_PATH),
+                    "--adjudications",
+                    str(path),
+                )
+
+                self.assertEqual(completed.returncode, 2, completed.stderr)
 
     def test_four_for_a_leak_and_for_a_non_empty_destination(self) -> None:
         leaky = self.root / "leaky.md"
