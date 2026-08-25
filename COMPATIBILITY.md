@@ -88,6 +88,44 @@ cannot affect a run that does not ask for a profile.
 Profile files are plain data read with the repository's own restricted-subset YAML reader;
 no third-party dependency is introduced.
 
+## Final Review audit records and evaluation tooling
+
+The per-dispatch Final Adversarial Review audit records
+(`artifacts/runs/<run-id>/final_review_audit/`), the evidence-bundle export, the evaluation
+fixture and the scorer require no Orca version beyond what the two skills already need, and
+introduce no third-party dependency: standard library only, CPython 3.11+.
+
+**Additive by construction.** They add a directory under an existing artifact root, new
+`--event` values in a vocabulary that was already open (no `ORCHESTRATOR_LOG.md` column is
+added, so every file on disk keeps its width), new functions and subcommands in the shared
+`run_logging.py`, and a new repository-side `scripts/final_review_eval.py`. No existing
+column, path, schema or function signature changes. `RESULT:` stays two-valued and
+`REVIEW_VERDICT:` stays four-valued — both are copied verbatim into a record, never
+re-derived or collapsed.
+
+**No migration, and none is possible to need.** No existing artifact changes meaning, so no
+existing consumer can misread one. A run that completed before these records existed simply
+has no `final_review_audit/` directory, and every reader treats an absent record as
+`unknown` — the correct reading for a run that never wrote one. Historical runs are not
+backfilled, deliberately: a backfilled record would carry a `recorded_at` that is not the
+settlement time and a report snapshot taken long after any overwrite, which is precisely the
+stale self-referential provenance these records exist to prevent.
+
+**Capture degrades, it does not fail.** The two capture sources are post-dispatch `orca`
+CLI reads. If `orca` is absent from `PATH`, exits non-zero, times out or returns
+unparseable JSON, the record is still written with `capture_status: unavailable` and a
+non-empty `capture_error` — a record that says why the input could not be captured is
+evidence; a missing record is not.
+
+**Redaction policy v1.0 covers POSIX paths only.** `C:\Users\<name>` is deliberately not a
+category: this document does not claim Windows support for the runtime path, and an untested
+pattern is worse than a stated gap. Adding it is a MINOR policy bump.
+
+**Packaging.** `scripts/` is included in the release archive, so a downloaded tarball
+contains `scripts/fixtures/final_review_eval/key/answer_key.json`. This is stated rather
+than worked around: the claim the tooling makes is about the reviewer's *retained input*,
+verified mechanically per run, not "the key was unreachable."
+
 ## Stable release blockers
 
 - **License decision:** the owner must select and add a license as documented in

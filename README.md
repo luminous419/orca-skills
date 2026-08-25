@@ -148,6 +148,8 @@ and so do two Coordinator-owned logs:
 | --- | --- |
 | `ORCHESTRATOR_LOG.md` | one row per lifecycle event: run start/end, every Worker/Reviewer/Final-Review dispatch settlement (phase, role, iteration, Task ID, Dispatch ID, terminal, created-vs-reused, the reviewer's own PASS/FAIL gate result and separate four-valued PASS/PASS WITH NOTES/FAIL/BLOCKED review verdict, outcome, lifecycle/cleanup result), the run's selected `risk` and `risk_source`, its `requested_phases`, each dispatch's `round_kind` (`phase_gate`/`correction`/`downstream_revalidation`/`final_review`), `reviewer_gate_skipped` rows for a LOW run's skipped phase gates, unexpected exits, and pre-dispatch failures |
 | `TIMING_LOG.md` | one row per timed event: run start/end with wall-clock duration, phase/iteration start/end boundaries, and each dispatch's start/end/duration, each carrying the `risk` it was produced under |
+| `final_review_audit/<dispatch_key>/` | one immutable directory per Final Adversarial Review **dispatch**: `record.json` (identity, provenance, digests, failure metadata, explicit `schema_version`), `input.md` (the retained redacted Task spec Orca stored for that dispatch) and `report.md` (the retained redacted review snapshot). `dispatch_key` is `attempt<N>__<task_id>__<dispatch_id or nodispatch>` |
+| `FINAL_REVIEW_EVIDENCE_BUNDLE.json` | an **opt-in** self-contained export of the above plus this run's `ORCHESTRATOR_LOG.md`, content inlined, every artifact carrying both its recorded and its recomputed digest |
 
 Both are append-only markdown tables, auto-created on first write (`scripts/run_logging.py` owns the
 format) — a run that never reaches a given event simply never gets that row, and neither file requires
@@ -161,6 +163,66 @@ of this module at `orca-worker-reviewer-orchestration/tools/run_logging.py` (par
 repository's `scripts/` directory. See the orchestration skill's "Run-scoped orchestration and timing
 logs" section for the exact call points. The final `run-status` row records one of `COMPLETED`,
 `BLOCKED`, `ERROR`, or `ESCALATED`.
+
+### Final Review audit records
+
+`final_review_audit/` answers a question the two logs cannot: **what was the Final Adversarial
+Reviewer actually handed, and what did it actually produce?** The logs are authoritative for run
+lifecycle provenance; these records are authoritative for an attempt's *content*, and
+`FINAL_RESULT.md` is a summary that references both. Where a summary and a record disagree, the
+record wins and a reader has to say so rather than reconcile silently.
+
+Four properties are worth knowing before reading one:
+
+- **A published directory is a complete record.** Three files are staged and fsynced, then
+  published with a single `os.rename()`, so the name only appears once everything is on disk.
+  There is no "is it finished yet?" heuristic, and readers ignore `final_review_audit/.staging/`
+  entirely. A publication that never completed is *retained* as the only evidence of that attempt
+  and reported, never silently dropped.
+- **A record is written once and never edited.** A retry has a new Task/Dispatch identity and
+  therefore a new `dispatch_key`; the writer refuses to overwrite, and there is no force flag,
+  no update function and no code path that writes into a published record.
+- **Provenance is fail-closed.** `provenance_state` is `accepted | voided | unknown`, and no
+  default anywhere is `accepted`. A missing file, an unparseable one, a missing required field and
+  an unknown schema MAJOR all read `unknown`. A `voided` record — with one of six `void_reason`
+  values — is never returned as a verdict, and two `accepted` records in one attempt is reported
+  as a contract violation rather than resolved by picking a winner.
+- **Retained artifacts are secret-safe.** Both `.md` files pass through a versioned redaction
+  policy (dispatch capability tokens, URL credentials, secret-named environment values, and the
+  user-name segment of an absolute path). The raw bytes never touch disk; only the digests survive,
+  and the record carries the pre-redaction digest, the policy version, the post-redaction artifact
+  digest and per-category substitution counts — never a substituted value or its offset.
+
+Writing and reading these is the same shared writer the logs use:
+
+```text
+python3 <SKILL_DIR>/tools/run_logging.py final-review-audit-write --run-id <run-id> --attempt <n> \
+    --task-id <task_id> [--dispatch-id <id>] [--provenance accepted|voided|unknown] ...
+python3 <SKILL_DIR>/tools/run_logging.py final-review-audit-provenance --run-id <run-id> --attempt <n>
+python3 <SKILL_DIR>/tools/run_logging.py final-review-audit-export --run-id <run-id> [--out <path>]
+```
+
+Adding these records changed **no** byte of what a Reviewer is dispatched, and that is checked
+rather than asserted: `scripts/fixtures/os22_neutrality/pre_os22_task_specs.json` is a golden
+capture of every Task spec this repository renders, taken before the feature existed, and the
+comparison is on encoded bytes.
+
+`artifacts/runs/` is deliberately not gitignored — these records *are* the evidence — and nothing
+here stages or commits them for you. Nothing is ever deleted, compacted or garbage-collected.
+
+### Evaluating a Final Review
+
+`scripts/fixtures/final_review_eval/` holds a small subject project in two states with a written
+contract on both sides, and `scripts/final_review_eval.py` materializes a reviewable workspace
+from it, verifies the fixture against its own key, scans for key material leaking into a
+reviewer's scope, parses a review into normalized findings, and scores it.
+
+The metric contract refuses to overclaim. Recall over the key's entries is always computable and
+always carries its numerator, denominator and population. A finding that matches nothing is
+`UNADJUDICATED` — never, by any flag or path, an automatic false positive — and precision and
+false-positive rate are `REFUSED` with a machine-readable reason until a human adjudicates the
+unmatched findings or signs a closed-world attestation. The metrics document contains no
+clock-derived value, so identical inputs produce byte-identical output.
 
 Out of scope here: retention/archival of old runs' logs (OS-8) and richer analysis — bottleneck
 detection, aggregate metrics, dashboards (OS-7). This is raw evidence, not a report.
