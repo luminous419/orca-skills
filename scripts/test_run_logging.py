@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import shutil
 import subprocess
@@ -3469,6 +3470,266 @@ class ProvenanceLadderTests(_AuditTestCase):
             run_logging.probe_final_review_report(self.RUN_ID, 2, base=self.base),
             ("captured", "malformed"),
         )
+
+
+# ---- T-5a: the retained-report whitespace exemption (DESIGN A.6, R5) ----------------
+
+WHITESPACE_GATE_BASE_COMMIT = "1045815"
+
+# The one retained report that actually carries Markdown hard breaks, and what
+# record.json commits its bytes to. Pinned literally so half (b) of this test cannot
+# be satisfied by an empty scan.
+HARD_BREAK_REPORT = (
+    "artifacts/runs/run_92759e0e1034/final_review_audit/"
+    "attempt1__task_936f73b5d2eb__ctx_1f82fd26c92b/report.md"
+)
+HARD_BREAK_REPORT_DIGEST = (
+    "sha256:6f91033e4e2f644ab64eb4e61292734671b588d51ff0eb1649c626f8ae748e18"
+)
+HARD_BREAK_REPORT_BYTES = 6028
+
+GITATTRIBUTES_RULE = (
+    "artifacts/runs/*/final_review_audit/**/report.md -whitespace"
+)
+
+
+class RetainedReportWhitespaceExemptionTests(unittest.TestCase):
+    """T-5a: `git diff --check` passes AND the exempted bytes were never trimmed.
+
+    DESIGN A.6. The two halves must hold together: passing the gate is worthless if
+    it was bought by editing a digest-bound file, and an intact digest is worthless
+    if the gate still fails. Neither assertion here can be satisfied by the other's
+    fix.
+    """
+
+    @staticmethod
+    def _git(*args: str, cwd: Path) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["git", *args],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def _require_git_range(self) -> None:
+        """Skip -- never silently pass -- when the gate cannot be evaluated."""
+        if shutil.which("git") is None:
+            self.skipTest("git is not available on PATH")
+        if not (REPO_ROOT / ".git").exists():
+            self.skipTest("not a git checkout; the whitespace gate cannot be run")
+        probe = self._git(
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            f"{WHITESPACE_GATE_BASE_COMMIT}^{{commit}}",
+            cwd=REPO_ROOT,
+        )
+        if probe.returncode != 0:
+            self.skipTest(
+                f"base commit {WHITESPACE_GATE_BASE_COMMIT} is unreachable "
+                "(shallow or grafted checkout)"
+            )
+
+    # -- (a) the gate passes ---------------------------------------------------------
+
+    def test_the_whitespace_gate_passes_over_the_whole_os22_range(self) -> None:
+        self._require_git_range()
+        checked = self._git(
+            "diff",
+            "--check",
+            f"{WHITESPACE_GATE_BASE_COMMIT}..HEAD",
+            cwd=REPO_ROOT,
+        )
+        self.assertEqual(
+            checked.returncode,
+            0,
+            "git diff --check must exit 0 over the OS-22 range; got "
+            f"{checked.returncode}:\n{checked.stdout}",
+        )
+        self.assertEqual(checked.stdout, "")
+
+    def test_the_gitattributes_rule_is_exactly_the_one_designed(self) -> None:
+        attributes = REPO_ROOT / ".gitattributes"
+        self.assertTrue(
+            attributes.is_file(), ".gitattributes must exist at the repository root"
+        )
+        rules = [
+            line.strip()
+            for line in attributes.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        self.assertEqual(
+            rules,
+            [GITATTRIBUTES_RULE],
+            "A.6 allows exactly one scoped rule; a repo-wide or broadened pattern "
+            "is a design violation",
+        )
+
+    # -- (b) the exempted bytes are untouched ----------------------------------------
+
+    def test_every_retained_artifact_still_matches_its_recorded_digest(self) -> None:
+        records = sorted(
+            REPO_ROOT.glob("artifacts/runs/*/final_review_audit/*/record.json")
+        )
+        self.assertTrue(records, "no published record units found to verify")
+        verified: list[str] = []
+        for record_path in records:
+            run_root = record_path.parents[2]
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            for block_name in ("report", "stored_task_spec"):
+                block = record.get(block_name) or {}
+                relative = block.get("artifact_path") or ""
+                if not relative:
+                    # Nothing was retained for this half of the unit (capture_status
+                    # is not "captured"); there are no bytes to bind.
+                    continue
+                artifact = run_root / relative
+                with self.subTest(record=str(record_path), block=block_name):
+                    self.assertTrue(artifact.is_file(), f"missing {artifact}")
+                    payload = artifact.read_bytes()
+                    self.assertEqual(
+                        "sha256:" + hashlib.sha256(payload).hexdigest(),
+                        block.get("artifact_digest_post_redaction"),
+                        f"{artifact} no longer hashes to its recorded digest -- the "
+                        "whitespace gate must never be satisfied by trimming bytes",
+                    )
+                    self.assertEqual(
+                        len(payload), block.get("byte_length_post_redaction")
+                    )
+                verified.append(
+                    str(artifact.relative_to(REPO_ROOT)).replace("\\", "/")
+                )
+        self.assertIn(
+            HARD_BREAK_REPORT,
+            verified,
+            "the hard-break report must be among the verified artifacts; without it "
+            "this test would pass vacuously",
+        )
+
+    def test_the_hard_break_report_keeps_its_forty_trailing_space_lines(self) -> None:
+        report = REPO_ROOT / HARD_BREAK_REPORT
+        self.assertTrue(report.is_file(), f"missing {report}")
+        payload = report.read_bytes()
+        self.assertEqual(
+            "sha256:" + hashlib.sha256(payload).hexdigest(), HARD_BREAK_REPORT_DIGEST
+        )
+        self.assertEqual(len(payload), HARD_BREAK_REPORT_BYTES)
+        hard_breaks = [
+            line
+            for line in payload.decode("utf-8").split("\n")
+            if line.rstrip() and line.endswith("  ")
+        ]
+        self.assertEqual(
+            len(hard_breaks),
+            40,
+            "the 40 Markdown hard breaks are the bytes the exemption exists to "
+            "protect; losing them means the file was trimmed",
+        )
+
+    # -- (c) the exemption is narrow, asserted rather than assumed --------------------
+
+    def test_only_retained_reports_are_exempt(self) -> None:
+        self._require_git_range()
+        reports = sorted(
+            REPO_ROOT.glob("artifacts/runs/*/final_review_audit/*/report.md")
+        )
+        self.assertTrue(reports, "no retained reports found to check attributes on")
+        still_gated = [
+            REPO_ROOT / "scripts" / "run_logging.py",
+            REPO_ROOT / "README.md",
+        ]
+        still_gated.extend(
+            sorted(REPO_ROOT.glob("artifacts/runs/*/final_review_audit/*/input.md"))
+        )
+        still_gated.extend(
+            sorted(REPO_ROOT.glob("artifacts/runs/*/final_review_audit/*/record.json"))
+        )
+        for path, expected in [(p, "unset") for p in reports] + [
+            (p, "unspecified") for p in still_gated
+        ]:
+            relative = str(path.relative_to(REPO_ROOT)).replace("\\", "/")
+            with self.subTest(path=relative):
+                attribute = self._git(
+                    "check-attr", "whitespace", "--", relative, cwd=REPO_ROOT
+                )
+                self.assertEqual(attribute.returncode, 0, attribute.stderr)
+                self.assertEqual(
+                    attribute.stdout.strip(),
+                    f"{relative}: whitespace: {expected}",
+                )
+
+    def test_the_pattern_does_not_leak_outside_the_audit_directories(self) -> None:
+        self._require_git_range()
+        for outsider in (
+            "report.md",
+            "artifacts/report.md",
+            "artifacts/runs/run_92759e0e1034/report.md",
+            "final_review_audit/x/report.md",
+        ):
+            with self.subTest(path=outsider):
+                attribute = self._git(
+                    "check-attr", "whitespace", "--", outsider, cwd=REPO_ROOT
+                )
+                self.assertEqual(
+                    attribute.stdout.strip(),
+                    f"{outsider}: whitespace: unspecified",
+                )
+
+    # -- (d) mutation check ----------------------------------------------------------
+
+    def test_the_gate_fails_again_once_the_exemption_is_removed(self) -> None:
+        """Without .gitattributes the same range must exit 2 -- otherwise this whole
+        test class would be passing because the condition happens not to occur."""
+        self._require_git_range()
+        with tempfile.TemporaryDirectory() as scratch:
+            clone = Path(scratch) / "clone"
+            cloned = self._git(
+                "clone",
+                "--quiet",
+                "--local",
+                "--no-hardlinks",
+                str(REPO_ROOT),
+                str(clone),
+                cwd=Path(scratch),
+            )
+            if cloned.returncode != 0:
+                self.skipTest(f"could not clone the repository: {cloned.stderr}")
+
+            attributes = clone / ".gitattributes"
+            self.assertTrue(
+                attributes.is_file(),
+                ".gitattributes must be COMMITTED, not just present in the working "
+                "tree, or a fresh clone still fails the gate",
+            )
+
+            with_exemption = self._git(
+                "diff",
+                "--check",
+                f"{WHITESPACE_GATE_BASE_COMMIT}..HEAD",
+                cwd=clone,
+            )
+            self.assertEqual(
+                with_exemption.returncode,
+                0,
+                f"fresh clone must pass the gate:\n{with_exemption.stdout}",
+            )
+
+            attributes.unlink()
+            without_exemption = self._git(
+                "diff",
+                "--check",
+                f"{WHITESPACE_GATE_BASE_COMMIT}..HEAD",
+                cwd=clone,
+            )
+            self.assertEqual(
+                without_exemption.returncode,
+                2,
+                "removing the exemption must bring the failure back; it did not, so "
+                "the gate is no longer proving anything",
+            )
+            self.assertIn("trailing whitespace", without_exemption.stdout)
+            self.assertIn(HARD_BREAK_REPORT, without_exemption.stdout)
 
 
 if __name__ == "__main__":

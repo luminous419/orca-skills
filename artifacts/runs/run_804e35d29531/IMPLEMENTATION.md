@@ -879,3 +879,161 @@ POST-FIX
   findings_source <REDACTED:foreign_absolute_path>
   exit 0 under --require-precision
 ```
+
+---
+
+## IMPLEMENTATION iteration 5 — downstream revalidation for R5 (§17 T5a)
+
+Not a correction round against IMPLEMENTATION's own gate. This is the §17 T5a revalidation
+triggered by a **corrected upstream artifact**: the Final Adversarial Review's R5 was adjudicated
+as a DESIGN-phase gap, DESIGN.md gained a new subsection **A.6** (commit `a8bec44`), and A.6's
+mechanism plus its T-5a regression requirement land here. R1–R4 are settled and are not reopened;
+the two Coordinator-owned residual disclosures are untouched.
+
+### Summary / Analysis
+
+**The defect, restated from the evidence rather than from the report.** The repository's required
+final validation is `git diff --check <base>..HEAD`. Measured at the start of this iteration:
+
+```text
+$ git diff --check 1045815..HEAD ; echo EXIT=$?
+… 80 lines of output …
+EXIT=2
+```
+
+All 80 output lines are 40 `trailing whitespace.` errors, every one of them in a single file:
+
+```text
+artifacts/runs/run_92759e0e1034/final_review_audit/attempt1__task_936f73b5d2eb__ctx_1f82fd26c92b/report.md
+```
+
+Those 40 lines end in two spaces — the Markdown **hard line break**, which is what makes the
+`ID:` / `Severity:` / `Blocking:` finding blocks render as separate lines in the Reviewer's report.
+
+**Why the bytes could not be trimmed, verified rather than asserted.** That file's `record.json`
+records `report.artifact_digest_post_redaction = sha256:6f91033e…e748e18` and
+`report.byte_length_post_redaction = 6028`, and the committed bytes still hash to exactly that.
+A.3 makes a published `<dispatch_key>/` byte-for-byte immutable and gives the writer no mutation
+surface, so trimming would either falsify the published record or require rewriting it. The fix
+therefore had to make the gate pass **without changing one byte of any published record** — which
+is what A.6 specifies and what was applied here, unchanged. Nothing in A.6 was redesigned; it had
+already been verified empirically by the DESIGN correction, and this iteration's job was to apply
+it for real and pin it with a test.
+
+### Changes
+
+| # | commit | what |
+|---|---|---|
+| 1 | `7718ea5` | **Step 0**: new repository-root `.gitattributes` — one commented, path-scoped `-whitespace` rule. Committed **before** any other change in this iteration, so every later step's own `git diff --check` run was already clean and the fix cannot be read as a retroactive patch over a failing gate. |
+| 2 | *(this commit)* | T-5a — `RetainedReportWhitespaceExemptionTests` in `scripts/test_run_logging.py` (7 tests), and this IMPLEMENTATION section. |
+
+**Commit 1 — the exemption, exactly as A.6 spells it.**
+
+```gitattributes
+artifacts/runs/*/final_review_audit/**/report.md -whitespace
+```
+
+`-whitespace` (attribute *unset*) tells `git diff --check`, `git apply --whitespace` and `git am`
+to apply **no** whitespace rules to matching paths. It is honoured for already-committed content
+because `git diff` resolves attributes from the working-tree `.gitattributes`, not from the commits
+being compared, so a range ending at `HEAD` is covered the moment the file exists in the checkout.
+The scope is `report.md` alone — **not** the audit directory. `input.md` is a canonicalized capture
+of the stored Task spec and `record.json` is writer-serialized JSON; both are produced by this
+codebase under its own formatting control and both stay fully gated. The rule is not repo-wide,
+does not use `* -whitespace`, and does not touch `core.whitespace`.
+
+**Commit 2 — T-5a, both halves in one class.** The point of the test is that A.6's two halves must
+hold **together**: passing the gate is worthless if it was bought by editing a digest-bound file,
+and an intact digest is worthless if the gate still fails. Neither assertion can be satisfied by
+the other's fix.
+
+### Modified Files
+
+| file | change |
+|---|---|
+| `.gitattributes` | **new** (repository root). One commented rule, `artifacts/runs/*/final_review_audit/**/report.md -whitespace`. |
+| `scripts/test_run_logging.py` | `import hashlib`; new `RetainedReportWhitespaceExemptionTests` (7 tests) plus the pinned constants `WHITESPACE_GATE_BASE_COMMIT`, `HARD_BREAK_REPORT`, `HARD_BREAK_REPORT_DIGEST`, `HARD_BREAK_REPORT_BYTES`, `GITATTRIBUTES_RULE`. |
+| `artifacts/runs/run_804e35d29531/IMPLEMENTATION.md` | this section, appended. |
+
+**Not touched, deliberately.** No published record unit — no `report.md`, `input.md` or
+`record.json` under any `final_review_audit/` directory was read-modify-written, and `git diff`
+confirms every one of them is byte-identical to `HEAD`. `scripts/run_logging.py` and its installed
+twin are unchanged, so no byte-parity risk was introduced. R1–R4's fixes and the two
+Coordinator-owned residual disclosures are untouched.
+
+### Unit Tests
+
+**Added — `scripts/test_run_logging.py::RetainedReportWhitespaceExemptionTests`**
+
+| test | half of A.6 | behaviour covered |
+|---|---|---|
+| `test_the_whitespace_gate_passes_over_the_whole_os22_range` | (a) | `git diff --check 1045815..HEAD` as a subprocess from the repository root: **exit 0 and empty stdout** |
+| `test_the_gitattributes_rule_is_exactly_the_one_designed` | (a) | the file's non-comment lines are **exactly** the one scoped rule — a repo-wide or broadened pattern fails here |
+| `test_every_retained_artifact_still_matches_its_recorded_digest` | (b) | for **every** record unit under `artifacts/runs/*/final_review_audit/*/`, both `report` and `stored_task_spec`: re-hash the file named by `artifact_path` and assert SHA-256 == `artifact_digest_post_redaction` and size == `byte_length_post_redaction`. Guarded against a vacuous pass — the hard-break report **must** appear in the verified set |
+| `test_the_hard_break_report_keeps_its_forty_trailing_space_lines` | (b) | the pinned file still hashes to `sha256:6f91033e…e748e18` at 6028 bytes **and** still carries exactly **40** two-trailing-space lines. This is the assertion trimming would break |
+| `test_only_retained_reports_are_exempt` | (c) | `git check-attr whitespace` is `unset` for each retained `report.md` and `unspecified` for every sibling `input.md` and `record.json`, for `scripts/run_logging.py`, and for the root `README.md` |
+| `test_the_pattern_does_not_leak_outside_the_audit_directories` | (c) | the glob boundaries: `report.md`, `artifacts/report.md`, `artifacts/runs/<run>/report.md` and `final_review_audit/x/report.md` all resolve `unspecified` |
+| `test_the_gate_fails_again_once_the_exemption_is_removed` | (d) | in a scratch `git clone` of the repository: `.gitattributes` **is present** (proving it is committed, not merely sitting in a working tree), the gate exits **0** there; then the file is deleted and the same command must exit **2** naming the hard-break report. This is what makes T-5a a regression test rather than one that passes because the condition happens not to occur |
+
+**Never a silent pass.** `_require_git_range()` **skips** — not passes — when `git` is absent from
+`PATH`, when there is no `.git` directory, or when commit `1045815` is unreachable (shallow or
+grafted checkout). The clone-based test skips if the clone itself cannot be made.
+
+**Execution.** `python3 -m unittest discover -s scripts -p 'test_*.py'` → **1026 tests, OK**
+(6 pre-existing skips). A clean clone of `HEAD` before this commit runs **1019**, so this iteration
+is **+7 net**, matching the 7 tests added and confirming nothing was displaced.
+
+### Additional Validation
+
+| check | result |
+|---|---|
+| `git diff --check 1045815..HEAD` | **exit 0**, no output (was exit 2 / 40 errors) |
+| `python3 scripts/validate_skills.py` | PASSED (463 checks) |
+| `python3 -m unittest discover -s scripts -p 'test_*.py'` | OK — **1026** tests, 6 skipped |
+| `python3 scripts/verify_package.py` | PASSED (107 source files) |
+| `cmp scripts/run_logging.py orca-worker-reviewer-orchestration/tools/run_logging.py` | byte-identical |
+| `python3 -m unittest scripts.test_run_logging.RetainedReportWhitespaceExemptionTests` | OK — 7 tests |
+
+**Digest re-verification over every published record unit** (step 3 of this task, run directly
+rather than only through the test):
+
+```text
+OK  stored_task_spec  run_804e35d29531/…__ctx_4b509b12a0b1/input.md   9322  sha256:cb503eeb…
+OK  stored_task_spec  run_804e35d29531/…__ctx_6478d2923ca0/input.md   9322  sha256:cb503eeb…
+OK  stored_task_spec  run_804e35d29531/…__ctx_99cc7e6b886c/input.md   9322  sha256:cb503eeb…
+OK  report            run_92759e0e1034/…__ctx_1f82fd26c92b/report.md  6028  sha256:6f91033e…
+OK  stored_task_spec  run_92759e0e1034/…__ctx_1f82fd26c92b/input.md   4104  sha256:03001ef4…
+OK  report            run_ff587481a820/…__ctx_33c8c8414587/report.md  6503  sha256:c9aecb9f…
+OK  stored_task_spec  run_ff587481a820/…__ctx_33c8c8414587/input.md   3936  sha256:e084234f…
+```
+
+`git diff --quiet -- 'artifacts/runs/*/final_review_audit/*/report.md'` exits **0**: the working
+copies are byte-identical to `HEAD`. (`run_804e35d29531`'s three units carry
+`report.capture_status = "absent"` with an empty `artifact_path` — there are no retained report
+bytes to bind for those, so only their `input.md` is digest-checked.)
+
+**Negative controls — the exemption suppresses nothing else** (step 4; each mutation was reverted
+immediately and `git status` confirmed a clean tree afterwards):
+
+| injected trailing whitespace | `git diff --check` |
+|---|---|
+| `scripts/_ws_probe_tmp.py` (throwaway file outside the pattern) | **exit 2**, flagged `trailing whitespace.` |
+| `…/final_review_audit/…__ctx_1f82fd26c92b/input.md` (sibling in the *same* record unit) | **exit 2**, flagged |
+| `…/final_review_audit/…__ctx_1f82fd26c92b/report.md` (the exempted path) | **exit 0**, correctly not flagged |
+
+**Attribute resolution, measured:**
+
+```text
+unset        artifacts/runs/*/final_review_audit/*/report.md          (all 5)
+unspecified  artifacts/runs/*/final_review_audit/*/input.md           (all 5)
+unspecified  artifacts/runs/*/final_review_audit/*/record.json        (all 5)
+unspecified  scripts/run_logging.py, README.md,
+             report.md, artifacts/report.md, artifacts/runs/<run>/report.md
+```
+
+### Residual / deferred
+
+None introduced by this iteration. A.6's exemption is future-proof in the intended direction: it
+covers any *future* retained report whose Reviewer uses Markdown hard breaks, so this class of
+gate failure cannot recur, while a whitespace defect in real code, in a skill, in a script, in a
+test, in documentation — or in the other two files of the very same record unit — is still caught.
