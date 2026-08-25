@@ -1,77 +1,11 @@
 {
   "schema_version": "1.0",
-  "source_report": "/private/tmp/claude-501/-Users-luminous-aiAssistedProjects-orca-skills/76cc26c3-d829-4f6e-af74-3ecb73c217ab/scratchpad/os22_baseline_workspace/REPORT.md",
-  "source_report_digest": "sha256:c9aecb9fb1512667e7adfa1b7e250a4e5907a4af5693946838c87da7964fb9c2",
-  "findings": [
-    {
-      "id": "F-001",
-      "location_raw": "src/config.py:16-18",
-      "location_file": "src/config.py",
-      "location_line": 16,
-      "severity": "MAJOR",
-      "blocking": true,
-      "quality_attribute": "NONE",
-      "responsible_phase": "",
-      "issue": "`resolve_settings` applies all four sources in the reverse of the required precedence.",
-      "reason": "In a Python dictionary display, later expansions overwrite earlier ones. `{**explicit, **destination, **project, **BUILTIN_DEFAULTS}` therefore makes built-ins highest and explicit overrides lowest, contradicting CONTRACT.md section 1. Direct execution with `owner` present in explicit, destination, and project returned `project` (and a colliding built-in key would return the built-in), rather than the explicit value.",
-      "required_action": "Merge from lowest to highest precedence (`builtin`, `project`, `destination`, `explicit`) and add collision tests covering each adjacent and end-to-end precedence relationship.",
-      "raw": "ID: F-001\nQuality Attribute: NONE\nSeverity: MAJOR\nBlocking: YES\nLocation: src/config.py:16-18\nIssue: `resolve_settings` applies all four sources in the reverse of the required precedence.\nReason / Evidence: In a Python dictionary display, later expansions overwrite earlier ones. `{**explicit, **destination, **project, **BUILTIN_DEFAULTS}` therefore makes built-ins highest and explicit overrides lowest, contradicting CONTRACT.md section 1. Direct execution with `owner` present in explicit, destination, and project returned `project` (and a colliding built-in key would return the built-in), rather than the explicit value.\nRequired Action: Merge from lowest to highest precedence (`builtin`, `project`, `destination`, `explicit`) and add collision tests covering each adjacent and end-to-end precedence relationship."
-    },
-    {
-      "id": "F-002",
-      "location_raw": "src/policy.py:6-15; src/quota.py:16-18",
-      "location_file": "src/policy.py",
-      "location_line": 6,
-      "severity": "CRITICAL",
-      "blocking": true,
-      "quality_attribute": "NONE",
-      "responsible_phase": "",
-      "issue": "Destination tier resolution uses key presence rather than validating the value against `TIERS`, and unknown tiers become unlimited.",
-      "reason": "`resolve_tier` returns any present destination value, including `\"\"` and `\"typo\"`, although CONTRACT.md section 2 requires both to fall back to `default`. `tier_limits` then converts an unknown tier into `{max_items: None}`, and `enforce_quota` treats `None` as unconditional acceptance. Direct execution returned the empty string and `typo` unchanged, creating a quota-bypass path. The same destination-first branch also prevents a higher-precedence tier already present in effective settings from winning, contrary to section 1.",
-      "required_action": "Resolve tier according to the effective settings precedence, accept a destination tier only when its value is a key in `TIERS`, and otherwise return the `default` tier with its real limits; add empty, unknown, and explicit-vs-destination tests.",
-      "raw": "ID: F-002\nQuality Attribute: NONE\nSeverity: CRITICAL\nBlocking: YES\nLocation: src/policy.py:6-15; src/quota.py:16-18\nIssue: Destination tier resolution uses key presence rather than validating the value against `TIERS`, and unknown tiers become unlimited.\nReason / Evidence: `resolve_tier` returns any present destination value, including `\"\"` and `\"typo\"`, although CONTRACT.md section 2 requires both to fall back to `default`. `tier_limits` then converts an unknown tier into `{max_items: None}`, and `enforce_quota` treats `None` as unconditional acceptance. Direct execution returned the empty string and `typo` unchanged, creating a quota-bypass path. The same destination-first branch also prevents a higher-precedence tier already present in effective settings from winning, contrary to section 1.\nRequired Action: Resolve tier according to the effective settings precedence, accept a destination tier only when its value is a key in `TIERS`, and otherwise return the `default` tier with its real limits; add empty, unknown, and explicit-vs-destination tests."
-    },
-    {
-      "id": "F-003",
-      "location_raw": "src/quota.py:10-19",
-      "location_file": "src/quota.py",
-      "location_line": 10,
-      "severity": "MAJOR",
-      "blocking": true,
-      "quality_attribute": "NONE",
-      "responsible_phase": "",
-      "issue": "Quota enforcement rejects a publication whose resulting count equals `max_items`.",
-      "reason": "The implementation returns `len(store) < limit`; CONTRACT.md section 3 says rejection occurs only when the publication would exceed the limit and equality must be accepted. Direct execution of `enforce_quota` with exactly 100 records in the default tier returned `False`.",
-      "required_action": "Use an inclusive comparison for acceptance (`len(store) <= limit`) and test below, exactly at, and one over each relevant tier boundary.",
-      "raw": "ID: F-003\nQuality Attribute: NONE\nSeverity: MAJOR\nBlocking: YES\nLocation: src/quota.py:10-19\nIssue: Quota enforcement rejects a publication whose resulting count equals `max_items`.\nReason / Evidence: The implementation returns `len(store) < limit`; CONTRACT.md section 3 says rejection occurs only when the publication would exceed the limit and equality must be accepted. Direct execution of `enforce_quota` with exactly 100 records in the default tier returned `False`.\nRequired Action: Use an inclusive comparison for acceptance (`len(store) <= limit`) and test below, exactly at, and one over each relevant tier boundary."
-    },
-    {
-      "id": "F-004",
-      "location_raw": "src/pipeline.py:22-28",
-      "location_file": "src/pipeline.py",
-      "location_line": 22,
-      "severity": "MAJOR",
-      "blocking": true,
-      "quality_attribute": "NONE",
-      "responsible_phase": "",
-      "issue": "`publish_batch` does not evaluate quota against the destination's resolved tier.",
-      "reason": "The quota call on line 25 omits `tier=tier`, and the tier is not resolved until line 27. Thus every batch is checked against the function's default tier even when the destination is `extended` or `archival`, violating CONTRACT.md section 4. Direct execution rejected an extended/archival batch resulting in 101 items, even though both tier limits exceed 101.",
-      "required_action": "Resolve the destination tier before quota enforcement and pass it to `enforce_quota`; add batch tests that distinguish default, extended, and archival limits.",
-      "raw": "ID: F-004\nQuality Attribute: NONE\nSeverity: MAJOR\nBlocking: YES\nLocation: src/pipeline.py:22-28\nIssue: `publish_batch` does not evaluate quota against the destination's resolved tier.\nReason / Evidence: The quota call on line 25 omits `tier=tier`, and the tier is not resolved until line 27. Thus every batch is checked against the function's default tier even when the destination is `extended` or `archival`, violating CONTRACT.md section 4. Direct execution rejected an extended/archival batch resulting in 101 items, even though both tier limits exceed 101.\nRequired Action: Resolve the destination tier before quota enforcement and pass it to `enforce_quota`; add batch tests that distinguish default, extended, and archival limits."
-    },
-    {
-      "id": "F-005",
-      "location_raw": "src/pipeline.py:31-36",
-      "location_file": "src/pipeline.py",
-      "location_line": 31,
-      "severity": "MAJOR",
-      "blocking": true,
-      "quality_attribute": "NONE",
-      "responsible_phase": "",
-      "issue": "`republish` writes records without calling `validate_record`.",
-      "reason": "The path proceeds directly through tier resolution, quota, and `_write_record`. This violates CONTRACT.md section 5's explicit rule that every writing path validates first and has no exemption. Direct execution accepted and stored `{\"id\": \"bad\"}`, which lacks both `payload` and `created_at`.",
-      "required_action": "Call `validate_record(record)` before quota evaluation or any write in `republish`, and add invalid-record tests for that path. ## Non-Blocking Findings None. No additional style or speculative design concerns are needed for the decision. ## Test Review `python -m unittest discover -v` ran 20 tests and reported `OK`, but the suite does not meaningfully cover the risky contract behavior: - `tests/test_config.py:7-18` checks only non-colliding keys, so reversed precedence remains invisible. - `tests/test_policy.py:7-14` checks known or absent values only; it omits empty and unknown destination values and any higher-source collision. - `tests/test_quota.py:13-20` uses counts far from boundaries; it omits exact equality and one-over cases. - `tests/test_pipeline.py:31-43` exercises batches only with a destination that has no tier, so the missing tier argument is invisible. - `tests/test_pipeline.py:46-50` checks only a valid `republish`, so the validation omission is invisible. Targeted read-only probes reproduced all five failures against the actual source. The passing suite is therefore not evidence that the changed behavior satisfies the contract. ## Evidence Checked - Read `CONTRACT.md` in full, with particular attention to sections 1-5. - Read `DIFF.patch` in full to identify the base-to-head behavior changes. - Directly inspected every file under `src/` and `tests/` with line numbers. - Ran the complete unittest suite: 20 tests passed. - Ran targeted probes for colliding settings sources, empty/unknown tiers, the exact default-tier boundary, extended/archival batch quota selection, and invalid `republish` input. - Checked the diff for unrelated/destructive changes, secrets, external effects, unnecessary abstraction, and hidden coupling; none beyond the correctness findings above affected the verdict. ## Final Decision FAIL. Five explicit contract violations are present in production code, including an unknown-tier quota bypass and an unvalidated write path. The implementation requires correction and focused regression tests before it can pass the final gate.",
-      "raw": "ID: F-005\nQuality Attribute: NONE\nSeverity: MAJOR\nBlocking: YES\nLocation: src/pipeline.py:31-36\nIssue: `republish` writes records without calling `validate_record`.\nReason / Evidence: The path proceeds directly through tier resolution, quota, and `_write_record`. This violates CONTRACT.md section 5's explicit rule that every writing path validates first and has no exemption. Direct execution accepted and stored `{\"id\": \"bad\"}`, which lacks both `payload` and `created_at`.\nRequired Action: Call `validate_record(record)` before quota evaluation or any write in `republish`, and add invalid-record tests for that path.\n\n## Non-Blocking Findings\n\nNone. No additional style or speculative design concerns are needed for the decision.\n\n## Test Review\n\n`python -m unittest discover -v` ran 20 tests and reported `OK`, but the suite does not meaningfully cover the risky contract behavior:\n\n- `tests/test_config.py:7-18` checks only non-colliding keys, so reversed precedence remains invisible.\n- `tests/test_policy.py:7-14` checks known or absent values only; it omits empty and unknown destination values and any higher-source collision.\n- `tests/test_quota.py:13-20` uses counts far from boundaries; it omits exact equality and one-over cases.\n- `tests/test_pipeline.py:31-43` exercises batches only with a destination that has no tier, so the missing tier argument is invisible.\n- `tests/test_pipeline.py:46-50` checks only a valid `republish`, so the validation omission is invisible.\n\nTargeted read-only probes reproduced all five failures against the actual source. The passing suite is therefore not evidence that the changed behavior satisfies the contract.\n\n## Evidence Checked\n\n- Read `CONTRACT.md` in full, with particular attention to sections 1-5.\n- Read `DIFF.patch` in full to identify the base-to-head behavior changes.\n- Directly inspected every file under `src/` and `tests/` with line numbers.\n- Ran the complete unittest suite: 20 tests passed.\n- Ran targeted probes for colliding settings sources, empty/unknown tiers, the exact default-tier boundary, extended/archival batch quota selection, and invalid `republish` input.\n- Checked the diff for unrelated/destructive changes, secrets, external effects, unnecessary abstraction, and hidden coupling; none beyond the correctness findings above affected the verdict.\n\n## Final Decision\n\nFAIL. Five explicit contract violations are present in production code, including an unknown-tier quota bypass and an unvalidated write path. The implementation requires correction and focused regression tests before it can pass the final gate."
-    }
-  ]
+  "record_kind": "quarantined_artifact_placeholder",
+  "quarantined_file": "FINDINGS.json",
+  "quarantined_on": "2026-08-25",
+  "quarantined_by": "OS-22 TEST iteration-2 correction round (findings R2 / R4)",
+  "reason": "quarantined alongside METRICS.json as the paired output of the same scorer step; it carries no key-derived content and is fully reproducible from the retained report.md with `final_review_eval.py parse-report`",
+  "original_sha256": "sha256:5ea5d517ce6bb9d1c1f4a2e1eaa884e54ce88a42eb7a6f7d25c78e74961f5b47",
+  "original_location": "moved out of this repository; not retained in version control",
+  "note": "This run is SUPERSEDED. The accepted baseline is run_92759e0e1034, written up in artifacts/runs/run_804e35d29531/BASELINE_RESULT.md. This directory is retained only as forensic evidence of the defect that correction fixes; its audit trail (record.json, input.md, report.md) is intact and is the evidence. The scorer output that made the key reachable is not."
 }

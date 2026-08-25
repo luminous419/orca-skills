@@ -3,6 +3,8 @@
 STATUS: COMPLETE
 
 Phase: TEST · Iteration 1 · Task `task_cfb92198ced6` · Dispatch `ctx_22ff34804e8a`
+Correction round: TEST · Iteration 2 · Task `task_236e21abdf42` · Dispatch `ctx_2952d62c5194` — see [Iteration 2](#iteration-2--r2--r4-correction-7-baseline-replacement) at the end of this document
+Correction round: TEST · Iteration 3 · Task `task_51cfdb499ed2` · Dispatch `ctx_3efd5e30255f` — see [Iteration 3](#iteration-3--r4-t2-correction-arithmetic-disclosure-of-the-key-population) at the end of this document
 Branch: `agent/final-review-observability-evaluation` (verified with `git branch --show-current`)
 Baseline read: `d614c89` (IMPLEMENTATION's last commit) · TEST commit: `f3d5792`
 
@@ -62,28 +64,39 @@ Per §9, this section **shows** the fixture and key rather than counting tests.
 
 | PLAN case | status | evidence |
 |---|---|---|
-| each intended seeded defect actually exists in `subject/` — **demonstrated, not asserted** | **covered** | `FixtureIntegrityTests.test_each_entry_is_demonstrated_by_running_the_head_tree` executes `head/` in a scratch tree and observes each behaviour (below). Ran live: `verify-fixture` → `fixture verification PASSED` (exit 0) |
+| each intended planted defect actually exists in `subject/` — **demonstrated, not asserted** | **covered** | `FixtureIntegrityTests.test_each_entry_is_demonstrated_by_running_the_head_tree` executes `head/` in a scratch tree and observes each behaviour (below). Ran live: `verify-fixture` → `fixture verification PASSED` (exit 0) |
 | answer-key correctness | **covered** | `FixtureIntegrityTests.test_every_key_entry_names_a_real_symbol_in_a_changed_range` (each entry's symbol is a real `def` inside the stated range **and** that range is in the base→head diff); `..test_both_subject_suites_pass` (a green head suite, so no test localizes an entry for free) |
 | `subject/` contains no key token or key path (`scan-leak`, no exclusions) | **covered** | `LeakScanTests` (5 tests, incl. three positive controls proving the scanner fires); `MaterializeTests.test_the_scanner_takes_no_exclusion_argument` (I-001). Ran live: `scan-leak --target …/subject` → `leak scan PASSED` (exit 0) |
 | the retained reviewer input carries no key token and no expected-count statement | **covered** | `MaterializeTests.test_the_key_and_the_adjudications_never_reach_the_workspace`; `..test_the_workspace_the_reviewer_reads_is_clean`; `..test_the_manifest_names_the_fixture_opaquely`; `NoTargetCountTests` (2 tests). Ran live against a real materialized workspace — see `## Execution` |
-| recall computed with an explicit denominator | **covered** | `MatchingTests.test_a_missed_entry_is_reported_with_an_explicit_denominator`. Ran live: `seeded_recall = {"value": 0.2, "numerator": 1, "denominator": 5, "population": "seeded_defects_only"}` |
+| recall computed with an explicit denominator | **covered** | `MatchingTests.test_a_missed_entry_is_reported_with_an_explicit_denominator`. Ran live: the recall object came back carrying all four contracted members — `value`, `numerator`, `denominator`, `population` — each present and of the right type, with `denominator` a positive integer and `value == numerator / denominator`. The four values themselves are withheld under P-1 (see the note under `## Execution`); what the case requires is that the denominator is *stated* rather than implied, and that is what was observed |
 | an unmatched finding is `UNADJUDICATED`, never auto-FP | **covered** | `MatchingTests.test_an_unmatched_finding_is_unadjudicated_and_never_an_auto_false_positive`; `..test_a_finding_with_no_key_match_is_labelled_no_key_match`. Ran live: `{"finding_id": "F2", "reason": "no_key_match", "classification": "UNADJUDICATED"}` |
 | precision **refused** with non-zero exit under insufficient adjudication | **covered** | `PrecisionRefusalTests` (7 tests, incl. partial adjudication still refusing and recall still computable); `ExitCodeTests.test_three_when_precision_is_refused_and_required`. Ran live: exit **3**, `precision = null`, `false_positive_rate = null` |
 | the §7 baseline is PASS only over a settled, scored report | **out of scope here (procedural, DEC-9/B-5)** | the scorer half is enforced — `ExitCodeTests.test_one_for_a_missing_input` refuses to score an absent report. The recording rule itself belongs to the Coordinator's B-1…B-5, deferred (see `## Remaining Gaps`) |
 
-**The five seeded defects, as the key states them** (`scripts/fixtures/final_review_eval/key/answer_key.json`, `schema_version` 1.0, `expected_finding_count_is_not_a_contract: true`):
+**The fixture's planted defects, described without reproducing the key.** The key is deliberately
+not restated here: this document names none of its entry ids, archetype names, file/symbol
+locations, governing contract sections, or summaries, and does not give its path. That content is
+exactly what a committed run artifact must not make reachable. What was verified about it:
 
-| id | archetype | location | contract | what is wrong |
-|---|---|---|---|---|
-| SD-1 | `value_vs_presence` | `src/policy.py::resolve_tier` 6-10 | CONTRACT.md 2 | tests for the *presence* of `retention_tier` instead of validating its *value* against `TIERS`, so an unknown tier is accepted and its limit vanishes |
-| SD-2 | `omitted_call_site_propagation` | `src/pipeline.py::publish_batch` 22-28 | CONTRACT.md 4 | `publish_batch` resolves the destination tier but leaves its `enforce_quota` call at the pre-feature form, so the tier never propagates |
-| SD-3 | `equality_boundary` | `src/quota.py::enforce_quota` 10-19 | CONTRACT.md 3 | strict `<` where the contract permits equality, so a store sitting exactly on its limit is refused |
-| SD-4 | `losing_precedence_fallback` | `src/config.py::resolve_settings` 16-18 | CONTRACT.md 1 | a dict-splat literal whose later keys win, so textual source order is the exact inverse of precedence order |
-| SD-5 | `validation_scope_gap` | `src/pipeline.py::republish` 31-36 | CONTRACT.md 5 | the retry path reaches `_write_record` without `validate_record`, so it writes a record no validator saw |
+* The key declares a small, fixed number of planted defects — the count lives in the key, not here.
+  Every entry carries a distinct archetype drawn from the ticket's §5 category list, a file/symbol
+  location, a governing contract section, and a summary.
+* Every entry is **demonstrated, not asserted**.
+  `FixtureIntegrityTests.test_each_entry_is_demonstrated_by_running_the_head_tree` imports the
+  `head/` tree and executes it, observing each entry's stated wrong behavior as a real runtime
+  result rather than trusting the key's prose. Every entry passes that check, so no entry is a
+  claim the fixture does not actually exhibit.
+* Every entry also carries a `negative_space_argument` (R-5) explaining why that defect is not
+  findable by string search — for example, why code that reads correctly in textual order can
+  still behave incorrectly at runtime. `FixtureIntegrityTests` asserts the field is present and
+  non-empty on every entry.
+* `verify-fixture` PASSES against the committed subject tree: the subject is what the key says it
+  is, by digest.
 
-**Demonstrated, not asserted** — the observations `test_each_entry_is_demonstrated_by_running_the_head_tree` makes by executing `head/`: `resolve_tier({'retention_tier': 'typo'}, {}) == 'typo'` and `tier_limits('typo')['max_items'] is None` and a 9999-item store passing (SD-1); the batch path not using the destination tier (SD-2); `enforce_quota([{}]*100, {})` returning False at exactly the limit (SD-3); `resolve_settings({'max_items': 7}, {}, {})['max_items'] == 100`, i.e. the explicit override never taking effect (SD-4); `republish` writing one record with no validation (SD-5).
-
-Every entry also carries a `negative_space_argument` (R-5): SD-4's, for example, is that all four precedence sources appear in the textually correct order, so the defect is invisible to anyone reading source order rather than dict-splat semantics — none of the five is findable by string search.
+*(Redaction note — finding R2-T1, see `## Review Feedback Resolution`. This passage previously
+reproduced the key in full: every entry id, archetype name, location, contract section and summary,
+plus the key's path and one of its field names. It was redacted during the iteration-2 correction
+round. No verification claim was dropped; only the identifying content was.)*
 
 ### T-5 — Regression
 
@@ -173,6 +186,23 @@ Committed as `f3d5792` on `agent/final-review-observability-evaluation`. No `git
 
 ## Execution
 
+> **Two elisions apply to the quoted output below.**
+>
+> 1. *Schema field names* (R2-T1): `recall = …` rather than the tool's exact field name,
+>    `"…_defects_only"` rather than the exact population label. The exact schema names are defined
+>    in `DESIGN.md` and in `scripts/final_review_eval.py`; they are elided here only so this
+>    document holds at zero hits under the reviewer-scope leak scan.
+> 2. *Numeric metric values* (R4-T2): every value in
+>    `{key population total, detected/matched count, missed count, unmatched count, reviewer
+>    finding count, recall}` is withheld, marked `<withheld>`. Publishing any two of them lets a
+>    reader solve for the key's population size, so withholding one field is not enough —
+>    the rule is **P-1**, stated in `BASELINE_RESULT.md` and applied identically here: committed
+>    evidence publishes at most one of those quantities, and only as a coarse bucket. This
+>    document publishes none of them.
+>
+> Structure, which fields are present, exit codes and every non-metric value are quoted verbatim
+> and unchanged. See findings R2-T1 and R4-T2 in `## Review Feedback Resolution`.
+
 ```text
 Command: python3 scripts/validate_skills.py
 Result:  PASS — "Skill validation PASSED (463 checks)"
@@ -228,11 +258,11 @@ T-4 evidence run live against the shipped fixture, not only through the suite:
 
 ```text
 Command: python3 scripts/final_review_eval.py verify-fixture \
-           --key scripts/fixtures/final_review_eval/key/answer_key.json
+           --key <key>
 Result:  "fixture verification PASSED"  exit 0
 
 Command: python3 scripts/final_review_eval.py scan-leak \
-           --key scripts/fixtures/final_review_eval/key/answer_key.json \
+           --key <key> \
            --target scripts/fixtures/final_review_eval/subject
 Result:  "leak scan PASSED"  exit 0        (no --exclude flag exists; the scanner takes none)
 
@@ -243,7 +273,7 @@ Result:  exit 0 — {"fixture_digest": "sha256:b63f5a9f4280549ea3a05407b4b5fff28
          `find <ws> -name .git | wc -l` -> 0.  No key/ and no adjudications/ directory.
 
 Command: python3 scripts/final_review_eval.py scan-leak \
-           --key .../answer_key.json --target <scratch>/ws
+           --key <key> --target <scratch>/ws
 Result:  "leak scan PASSED"  exit 0        (the workspace a Reviewer would actually read)
 
 Command: python3 scripts/final_review_eval.py parse-report --report <synthetic FINAL_REVIEW.md> \
@@ -251,23 +281,28 @@ Command: python3 scripts/final_review_eval.py parse-report --report <synthetic F
 Result:  exit 0
 
 Command: python3 scripts/final_review_eval.py score --findings <findings.json> \
-           --key .../answer_key.json --workspace <ws> --require-precision --out <metrics.json>
+           --key <key> --workspace <ws> --require-precision --out <metrics.json>
 Result:  exit 3 (EXIT_PRECISION_REFUSED), stderr:
-         "precision refused: adjudication_incomplete: 1 unmatched finding(s) carry no
+         "precision refused: adjudication_incomplete: <n> unmatched finding(s) carry no
           independent adjudication verdict, and no closed_world exhaustive attestation is present"
          metrics.json:
-           seeded_recall = {"value": 0.2, "numerator": 1, "denominator": 5,
-                            "population": "seeded_defects_only"}
+           recall = {"value": <withheld>, "numerator": <withheld>,
+                     "denominator": <withheld, a positive integer>,
+                     "population": "…_defects_only"}
            precision            = null
            false_positive_rate  = null
            precision_status     = "REFUSED"
            unmatched_findings   = [{"finding_id": "F2", "reason": "no_key_match",
-                                    "classification": "UNADJUDICATED"}]
+                                    "classification": "UNADJUDICATED"}, …]
+                                  (list length withheld)
 ```
 
 That last run exercises four §9 Evaluation requirements at once against real bytes: an explicit
-recall denominator, `UNADJUDICATED` as the default for an unmatched finding, no auto-false-positive,
-and a non-zero exit on refused precision.
+recall denominator (present, integral, and the divisor of the reported value — its magnitude
+withheld under P-1), `UNADJUDICATED` as the default for an unmatched finding, no
+auto-false-positive, and a non-zero exit on refused precision. Each of those is a *structural*
+property, which is why withholding the magnitudes costs the evidence nothing: none of the four
+claims depends on what the numbers are.
 
 ## Failures / Findings
 
@@ -290,14 +325,14 @@ has the fields the scorer then indexes directly. `score()` does `finding["id"]` 
 ```text
 $ cat bad_findings.json
 {"schema_version": "1.0", "findings": [{"id": "F1", "claim": "x"}]}
-$ python3 scripts/final_review_eval.py score --findings bad_findings.json --key .../answer_key.json
+$ python3 scripts/final_review_eval.py score --findings bad_findings.json --key <key>
   File ".../final_review_eval.py", line 748, in match_findings
     elif finding["location_file"] is None:
 KeyError: 'location_file'
 
 $ cat bad2.json
 {"schema_version": "1.0", "findings": ["not-a-dict"]}
-$ python3 scripts/final_review_eval.py score --findings bad2.json --key .../answer_key.json
+$ python3 scripts/final_review_eval.py score --findings bad2.json --key <key>
     identifiers = [finding["id"] for finding in findings]
 TypeError: string indices must be integers, not 'str'
 ```
@@ -349,3 +384,373 @@ That maps the case onto exit 2 and makes the two input contracts symmetric.
 5. **No H-1/H-2/H-4/H-5 conclusion is drawn, and none is available from this phase.** Nothing here
    measures Final Review detection quality; the fixture and scorer exist so that a later ticket
    can, which is exactly OS-22's scope boundary.
+
+---
+
+## Iteration 2 — R2 / R4 correction (§7 baseline replacement)
+
+Triggered by the Final Adversarial Review FAIL recorded in
+`artifacts/runs/run_804e35d29531/FINAL_REVIEW.md`. Two blocking findings, R2 and R4, were routed to
+this phase. Both concern the §7 fixture-based baseline that ran *after* iteration 1 of TEST passed
+— not the tests reviewed and approved above. **Nothing in the sections above this line was
+touched.** R1 and R3 belong to DESIGN and arrive here later through §17's T5a downstream
+revalidation; they are deliberately not addressed in this round.
+
+### What the two findings were, and what was done
+
+**R2 — the retained baseline input was not neutral.** The Reviewer dispatched for the superseded
+baseline had been told which classes of defect to weight most heavily and pointed at specific
+numbered contract sections as the ones that mattered. That is a search-depth alteration of the very
+mechanism the baseline exists to measure unchanged, so the resulting number was not a baseline. The
+shipped `scan-leak` could not see it: it compares literal key vocabulary after collapsing
+whitespace only, and the hint was spelled with hyphens where the key uses underscores.
+
+Action taken: the fixture was re-materialized into a fresh scratch workspace and **one new Final
+Adversarial Review attempt was dispatched in a new Orca Run, `run_92759e0e1034`**, with a Reviewer
+input carrying only the ordinary §17/§11 framing — role, Direct Verification duty, the full
+undifferentiated A–I search-axis list, the Review Result format, the Finding Contract — plus the
+materialized subject and the report path. It names no defect class, weights no contract section
+above another, does not disclose that the subject is a fixture or part of an evaluation, and never says
+how many findings there are to find. `agent=codex-sol` as before; the attempt settled cleanly, provenance
+`accepted`, zero violations. `parse-report` and `score` ran afterwards as a separate step, exactly
+as before.
+
+**R4 — key-derived identities were reachable from committed baseline evidence.** The superseded run
+committed scorer output that republished the subject's identifier, the entry total, individual entry
+ids, finding-to-entry mappings, the missed-id list, and the key's path.
+
+Action taken: scorer output for the replacement run was written to a scratch directory **outside the
+repository and is not committed**. What is committed is the audit trail (Task/Dispatch ids,
+timestamps, accepted/voided provenance, redacted input and report text, the evidence bundle) plus a
+deliberately sanitized top-line summary in the rewritten `BASELINE_RESULT.md`, which names none of
+the identities R4 lists. (That summary's *numeric* sanitization was still insufficient and was
+corrected again in iteration 3 — see R4-T2 below.)
+
+### Leak validation, extended
+
+R2's required action included extending leak validation beyond literal ids and a handful of phrases.
+A new checker was added at
+`artifacts/runs/run_92759e0e1034/tools/semantic_leak_scan.py`. It normalizes `_`, `-`, `/` and
+whitespace to a single form before comparing, so every spelling of the same key vocabulary collapses
+together, and it additionally flags partial key vocabulary co-occurring inside an eight-word window,
+contract-section targeting, expected-defect-count statements, and framing or emphasis that narrows
+the search. It reads its vocabulary from the key at runtime and hard-codes none of it, so the
+checker is itself safe to commit next to reviewer-visible evidence. Two profiles: `prompt` runs
+every check and is what a reviewer-visible input must pass; `evidence` runs only the identity checks
+and is what a committed run artifact must pass.
+
+Regression evidence that the checker actually detects R2: run against the superseded attempt's
+retained input it reports **11 hits**, including the emphasis phrasing, the contract-section
+pointer and the framing on that prompt's very first line. Run against the replacement attempt's input it reports **0**.
+
+The shipped `scan-leak` was left untouched — it is IMPLEMENTATION-owned surface, and this round
+changes no production script.
+
+### R2-T1 — a third leak, found by the extended scan
+
+The extended scan was run over the artifact set proposed for commit, as R4 required. It found a
+leak that neither R2 nor R4 named, in this very file: the iteration-1 `## Test Scope` section
+reproduced the key **in full** — every entry id, every archetype name, each entry's file/symbol and
+line range, each entry's governing contract section, a near-verbatim restatement of each summary,
+plus the key's path and one of its field names. Under R4's own yardstick that one file produced 25
+literal hits and 32 semantic hits, while everything else in the set was already at zero. Reading it
+was enough to sit the review.
+
+It also showed that the superseded attempt's Reviewer input opened with a line naming the whole
+exercise outright — the first line of `run_ff587481a820/…/input.md` labels the task as a
+fixture-based baseline attempt. That is a stronger disclosure than R2 described, and it is what the
+extended `fixture_framing` check is for.
+
+The correction instruction told me not to touch anything else already reviewed and approved in this
+file, so this was escalated rather than fixed unilaterally, and the Coordinator directed the
+redaction. What was done:
+
+* The `## Test Scope` passage was replaced with a non-identifying description that keeps **every**
+  verification claim — that each entry is demonstrated by executing the head tree rather than
+  asserted, that each carries a distinct archetype from the ticket's §5 category list, that each
+  carries a non-empty negative-space argument, and that `verify-fixture` passes by digest — while
+  naming none of the identifying content. A redaction note marks the passage.
+* Remaining references to the key's path elsewhere in this file were replaced with `<key>`, and two
+  quoted metric-output blocks had their schema field names elided (values, structure and exit codes
+  quoted verbatim and unchanged). A note at the head of `## Execution` records that elision.
+* The superseded run's key-derived scorer output was quarantined — see below.
+
+### The superseded run's evidence: quarantined, not deleted
+
+On the Coordinator's instruction, and without deleting the directory or its audit trail:
+
+| artifact | action |
+|---|---|
+| `run_ff587481a820/attempt1_scoring/METRICS.json` | replaced with a placeholder recording what it held, why, and the original SHA-256; original moved out of the repository |
+| `run_ff587481a820/attempt1_scoring/FINDINGS.json` | same treatment as the paired output of the same scorer step. It carried no key-derived content and is fully reproducible from the retained `report.md` via `parse-report`, so nothing forensic is lost |
+| `run_ff587481a820/ORCHESTRATOR_LOG.md` run-end row | detail text replaced; it had named key-derived quantities. Row, timestamp and result untouched |
+| `run_ff587481a820/…/record.json` `notes` | replaced with a supersession note; every other field, digest and provenance value untouched |
+| `run_ff587481a820/EXPORT_BUNDLE.json` | regenerated from the redacted log and record |
+
+`record.json`, `input.md` and `report.md` are intact. They are the evidence.
+
+### Committed artifact set, and the leak-scan result over it
+
+```
+artifacts/runs/run_92759e0e1034/ORCHESTRATOR_LOG.md
+artifacts/runs/run_92759e0e1034/TIMING_LOG.md
+artifacts/runs/run_92759e0e1034/FINAL_REVIEW_EVIDENCE_BUNDLE.json
+artifacts/runs/run_92759e0e1034/final_review_audit/attempt1__task_936f73b5d2eb__ctx_1f82fd26c92b/{input,report,record}.*
+artifacts/runs/run_92759e0e1034/tools/semantic_leak_scan.py
+artifacts/runs/run_804e35d29531/BASELINE_RESULT.md   (rewritten, sanitized)
+artifacts/runs/run_804e35d29531/TEST.md              (this file, redacted per R2-T1)
+artifacts/runs/run_ff587481a820/{ORCHESTRATOR_LOG.md, TIMING_LOG.md, EXPORT_BUNDLE.json}
+artifacts/runs/run_ff587481a820/attempt1_scoring/{FINDINGS,METRICS}.json  (placeholders)
+artifacts/runs/run_ff587481a820/attempt1_scoring/REPORT.md
+artifacts/runs/run_ff587481a820/final_review_audit/attempt1__task_0c55cde37456__ctx_33c8c8414587/{input,report,record}.*
+```
+
+No scorer output for the replacement run appears in that list; it was written outside the repository.
+`.timing_state.json` is git-ignored and is not part of it.
+
+| scan | scope | result |
+|---|---|---|
+| `scan-leak` (shipped, literal) | materialized workspace, no exclusions | PASSED, 0 hits |
+| `semantic_leak_scan --profile prompt` | the replacement attempt's retained Reviewer input | PASSED, 0 hits |
+| `scan-leak` + `semantic_leak_scan --profile evidence` | every file above **except** the four retained forensic rows | PASSED, 0 hits, file by file |
+| `scan-leak` + `semantic_leak_scan --profile evidence` | the four retained forensic rows (the superseded attempt's `input.md` and `report.md`, `attempt1_scoring/REPORT.md`, and the `EXPORT_BUNDLE.json` that embeds the input) | hits by design — see below |
+
+*(That sweep used the two scanners as they stood in iteration 2. It was insufficient — both
+returned zero on files that still disclosed the key population by arithmetic. The sweep was redone
+in iteration 3 with a third check; see `## Iteration 3` for the current result.)*
+
+Everything this correction produces is at zero hits under both scanners. The four retained rows are
+the superseded attempt's own forensic evidence, kept with explicit Coordinator authorization: a scan
+cannot come back clean over the artifact whose evidentiary purpose is to contain the defect. After
+quarantine, what they still carry is archetype *vocabulary* — already published in the `ARCHETYPES`
+tuple in `scripts/final_review_eval.py` — and the fact that four of those categories were pointed at
+during that attempt. They carry no entry id, no finding-to-entry mapping, no total, no missed-entry
+list and no key path.
+
+### Result of the replacement baseline
+
+Unchanged in form from the superseded attempt: `RESULT: FAIL` / `REVIEW_VERDICT: FAIL` from the
+Reviewer, a non-empty set of blocking findings, perfect evidence grounding, precision and
+false-positive rate `REFUSED` because unmatched findings carry no independent adjudication,
+reproducibility `SINGLE_RUN_NOT_ASSERTED`. All five DEC-9 baseline criteria PASS. Counts and the
+exact recall are withheld under P-1 (see R4-T2). The full sanitized write-up is
+`artifacts/runs/run_804e35d29531/BASELINE_RESULT.md`.
+
+Worth recording plainly: the neutral input landed in the **same** recall bucket as the hinted one,
+and the underlying exact value did not move at all. That does not retire R2 — a measurement taken
+through an altered mechanism is not a baseline whatever number it lands on, and one paired attempt
+cannot show the hints were inert — but the recorded number itself did not move.
+
+---
+
+## Iteration 3 — R4-T2 correction (arithmetic disclosure of the key population)
+
+Triggered by `artifacts/runs/run_804e35d29531/REVIEW_TEST_iteration2.md`, `RESULT: FAIL`, finding
+**R4-T2** (G1, MAJOR, blocking). R2 is confirmed resolved and nothing R2 fixed was touched: the
+baseline procedure, the neutral Reviewer prompt and `run_92759e0e1034`'s dispatch and audit trail
+are all unchanged in this round. This correction is scoped entirely to what gets **committed**.
+
+### What R4-T2 found
+
+Iteration 2 redacted the denominator as a *field* and stopped there. That was not a disclosure
+control, because the remaining published numbers solved for it two different ways:
+
+* `TEST.md` twice quoted a live scoring result whose `denominator` member carried its real value —
+  a direct disclosure, not an inference.
+* `BASELINE_RESULT.md` published the Reviewer's finding count, the unmatched-finding count and an
+  exact recall decimal. Subtract the second from the first for the matched count, divide by recall,
+  and the withheld population comes out exactly.
+
+Both files were at zero under the shipped literal `scan-leak` and under
+`semantic_leak_scan --profile evidence` at the time. The finding is therefore as much about the
+validation as about the documents: **token matching cannot detect a leak that consists of no
+tokens.**
+
+### The rule this round adopted, and applied to both files
+
+Publishing any *two* of `{key population total, detected/matched count, missed count,
+unmatched-finding count, reviewer finding count, recall}` determines the rest. Redacting one member
+of that set is therefore not a control. The rule adopted instead is **P-1**, stated in full in
+`BASELINE_RESULT.md`:
+
+> Committed evidence publishes **at most one** quantity from that set, and publishes it only as a
+> **coarse bucket**, never as an exact value. Everything else is reported qualitatively.
+
+Applied consistently:
+
+| document | before | after |
+|---|---|---|
+| `BASELINE_RESULT.md` | reviewer finding count, unmatched count, exact recall decimal, exact evidence-grounding ratio | recall as the bucket **50–75%** and nothing else numeric from the set; the finding count, the unmatched count and the exact recall are all withheld; the five B-5 criteria and every other row are qualitative |
+| `TEST.md` | two live quotations whose `value` / `numerator` / `denominator` members carried their real magnitudes, an unmatched count inside a quoted stderr string, and a reviewer finding count plus an unadjudicated-finding count in the iteration-2 summary | every one of those replaced by `<withheld>` or by a qualitative statement; the quoted output keeps its structure, its field names, which fields are present, its exit codes and its non-metric values verbatim |
+
+Nothing that the §9 cases actually require was lost. Each case here is structural — *is* there an
+explicit denominator, *is* an unmatched finding defaulted to `UNADJUDICATED`, *does* refused
+precision exit non-zero — and none of them depends on the magnitude of a number. That is what makes
+P-1 cheap: it removes exactly the part of the evidence that carried no verification weight and all
+of the disclosure.
+
+### The disclosure check added to the tooling
+
+`artifacts/runs/run_92759e0e1034/tools/semantic_leak_scan.py` gained a `metric_inference` check.
+It extracts the evaluation's numeric metric fields from a document — as JSON-ish `field: value`
+pairs and as prose, in digits or in number words — and reports whether any combination of them
+algebraically determines the key population, under the relationships
+`scripts/final_review_eval.py` actually computes. The relationships it checks, stated explicitly:
+
+| id | relationship | fires when the document publishes |
+|---|---|---|
+| REL-1 | the denominator / population total is itself a published field | that field, in any spelling (`denominator`, `population_size`, `…_total`) |
+| REL-2 | `recall = detected / total` → `total = detected / recall` | recall **and** the detected/matched/numerator count |
+| REL-3 | `recall = 1 − missed / total` → `total = missed / (1 − recall)` | recall **and** the missed count |
+| REL-4 | `total = detected + missed` | the detected count **and** the missed count |
+| REL-5 | `detected = reported findings − unmatched`, then REL-2 | the Reviewer's finding count, the unmatched count **and** recall |
+| REL-6 | recall written as the fraction `detected/total` | that fraction, in any spelling |
+
+Three properties worth stating, because they are what make it a check rather than a gesture:
+
+* **Buckets are not values.** `50-75%` and `between 50% and 75%` are stripped before extraction, so
+  P-1's coarse recall is deliberately not a hit — the check permits exactly the presentation P-1
+  prescribes.
+* **Satisfiability, not correctness, is the trigger.** A hit is raised whenever the published
+  numbers pin a positive integral total, whether or not that total is the real one. A reader doing
+  the arithmetic does not know the answer in advance either. When the scanner is handed the real
+  key it additionally annotates whether the solved value matched, which is diagnostic output, not
+  the trigger.
+* **It runs cross-file as well as per-file.** After the per-file pass it runs once more over the
+  union of every metric found anywhere in the target set, because a commit set can jointly disclose
+  what no single file in it discloses alone. `--no-cross-file` turns that off.
+* **Three guards keep it from reading prose as data**, since a check that fires on every document
+  would just be turned off: a number that is part of an identifier or label (`REL-5`, `P-1`,
+  `F-005`, `1.0`) is not a value; a comparison (`recall < 1.0`) is not a published value, only an
+  assignment or a table cell is; and the ambiguous English readings of *detected* and *missed*
+  ("all three detected") count only inside an evaluation context — near `key`, `entr…`, `defect`,
+  `finding`, `recall`, `population` or `seed…`. The JSON-ish `field: value` readings need no such
+  gate. All three guards were added because they fired on this very document; none of them weakens
+  the four controls above.
+
+The check is in the `evidence` profile as well as `prompt`, since a committed artifact is exactly
+what it exists to guard. The shipped `scan-leak` was again left untouched — it is
+IMPLEMENTATION-owned surface and this round changes no production script.
+
+**Regression evidence that it reproduces R4-T2.** Run against the pre-correction versions of the
+two documents it fires precisely as the finding described:
+
+```text
+$ semantic_leak_scan.py --profile evidence --no-cross-file --target <pre-correction BASELINE_RESULT.md>
+HIT metric_inference: REL-5: reported findings=<n> minus unmatched=<n> gives detected=<n>,
+    with recall=<n> determines the key population size (solves to <n>; matches the key)
+semantic leak scan [evidence] FAILED (1 files scanned, 1 hits)
+
+$ semantic_leak_scan.py --profile evidence --no-cross-file --target <pre-correction TEST.md>
+HIT metric_inference: REL-1/REL-6: an explicit denominator / population total determines the key
+    population size (solves to <n>; matches the key)
+HIT metric_inference: REL-2: recall=<n> with detected=<n> determines … (matches the key)
+HIT metric_inference: REL-5: reported findings=<n> minus unmatched=<n> gives detected=<n>,
+    with recall=<n> determines … (matches the key)
+… 5 hits total
+semantic leak scan [evidence] FAILED (1 files scanned, 5 hits)
+```
+
+(The operands are shown as `<n>` here for the obvious reason: quoting the tool's own output
+verbatim in a committed document would republish the very numbers the check exists to catch. The
+run is reproducible from `git show` of the pre-correction revision.)
+
+Negative control, so the check is not vacuous: a document that publishes recall **only** as the
+bucket `50-75%` and no other metric returns zero, and the same document with an exact recall
+decimal and an unmatched count added returns a REL-3 hit. Buckets pass; exact pairs do not.
+
+### The sweep over the exact final commit set
+
+All three checks — the shipped literal `scan-leak`, the `semantic_leak_scan --profile evidence`
+vocabulary checks, and `metric_inference` per-file **and** cross-file — were re-run over the exact
+set this correction proposes to commit. The set is unchanged from iteration 2's list above, except
+that `run_92759e0e1034/tools/semantic_leak_scan.py` now carries the new check.
+
+```text
+### literal scan-leak, file by file (14 non-forensic files)
+  run_92759e0e1034/ORCHESTRATOR_LOG.md ................. leak scan PASSED
+  run_92759e0e1034/TIMING_LOG.md ....................... leak scan PASSED
+  run_92759e0e1034/FINAL_REVIEW_EVIDENCE_BUNDLE.json ... leak scan PASSED
+  run_92759e0e1034/final_review_audit/attempt1__…/input.md   leak scan PASSED
+  run_92759e0e1034/final_review_audit/attempt1__…/report.md  leak scan PASSED
+  run_92759e0e1034/final_review_audit/attempt1__…/record.json leak scan PASSED
+  run_92759e0e1034/tools/semantic_leak_scan.py ......... leak scan PASSED
+  run_804e35d29531/BASELINE_RESULT.md .................. leak scan PASSED
+  run_804e35d29531/TEST.md ............................. leak scan PASSED
+  run_ff587481a820/ORCHESTRATOR_LOG.md ................. leak scan PASSED
+  run_ff587481a820/TIMING_LOG.md ....................... leak scan PASSED
+  run_ff587481a820/attempt1_scoring/FINDINGS.json ...... leak scan PASSED
+  run_ff587481a820/attempt1_scoring/METRICS.json ....... leak scan PASSED
+  run_ff587481a820/final_review_audit/attempt1__…/record.json leak scan PASSED
+  -> 0 failures
+
+### semantic_leak_scan --profile evidence, same 14 files, per-file AND cross-file union
+  semantic leak scan [evidence] PASSED (14 files scanned, 0 hits)   exit 0
+
+### metric_inference over the union INCLUDING the four retained forensic rows
+  metric_inference hits: 0
+  (that union still reports vocabulary hits on the forensic rows, by design and unchanged
+   from iteration 2 — but not one arithmetic hit, so nothing in the commit set, forensic
+   rows included, determines the key population)
+
+### unchanged R2 evidence, re-verified after the tooling change
+  --profile prompt, replacement Reviewer input ... PASSED, 0 hits
+  --profile prompt, superseded Reviewer input .... FAILED, 11 hits (R2 still reproduced)
+```
+
+The last block matters: extending the scanner must not weaken what it already caught. The
+superseded input still trips 11 checks and the replacement input still trips none, so R2's evidence
+is exactly as it was.
+
+### Out-of-scope disclosures found by the new check, escalated not fixed
+
+Running `metric_inference` over the wider artifact tree surfaced the same arithmetic disclosure in
+files this Task does not own and must not rewrite. They are reported here rather than edited:
+
+| file | what it carries | why it was not fixed here |
+|---|---|---|
+| `artifacts/runs/run_804e35d29531/ORCHESTRATOR_LOG.md` (row for `dispatch_settled` / TEST iteration 2) | the review's own `detail` text restates the finding by quoting the exact denominator and the exact finding/unmatched/recall triple | Coordinator-owned append-only log; a worker rewriting a settled row is not a redaction, it is tampering with the audit trail |
+| `artifacts/runs/run_804e35d29531/final_review_audit/attempt1__task_75d5e97d1679__ctx_*/input.md` (three records) | the Final Review dispatch input summarises the §7 baseline as an exact `detected/total` fraction with its decimal — REL-6 and REL-2 both fire | immutable per-dispatch audit records whose `artifact_digest_post_redaction` is recorded in the paired `record.json`; editing the bytes breaks the digest chain that T-1 exists to prove |
+
+Both are real R4-class disclosures under R4-T2's own yardstick. They were escalated to the
+Coordinator, who directed that both be left untouched and documented here. Recorded plainly rather
+than laundered, and rather than silently claiming a clean sweep over a set that includes them.
+
+Three things the Coordinator asked be stated explicitly, so this is not miscategorized:
+
+1. **These are structural residuals, not omissions.** `ORCHESTRATOR_LOG.md` is append-only and the
+   per-dispatch audit records are immutable — both by this ticket's own design (§4 and §3). Editing
+   either is not redaction; it is destroying the guarantee the artifact exists to provide, and in
+   the audit records' case it would break the exact digest chain T-1 was written to prove. No
+   correction round scoped to TEST-phase evidence can or should fix them.
+2. **The three leaking `input.md` files are a Coordinator-side drafting mistake, not a TEST-phase
+   code defect.** They are the Coordinator's own Final Review Task specs; their provenance/ledger
+   summary section stated this baseline's result as an exact matched-over-total fraction with its
+   decimal rather than as a coarse bucket. The leak is in how that summary was written, not in
+   anything the evaluation tooling or this phase's tests do. Flagged here for the record so it is
+   filed against the right surface.
+3. **Full resolution needs one of two things, neither of them in this round's scope.** Either a
+   documented redaction/quarantine exception for provenance logs and immutable audit records — a
+   policy decision above this correction — or the Coordinator drafting future Final Review inputs
+   without exact baseline fractions, which the Coordinator has committed to doing for any further
+   Final Review attempt in this run. No policy fix was attempted here.
+
+## Review Feedback Resolution
+
+| id | source | status | resolution |
+|---|---|---|---|
+| R2 | Final Adversarial Review (`FINAL_REVIEW.md`), G1 MAJOR, blocking | **resolved** | The baseline was re-run in a new Orca Run, `run_92759e0e1034`, against a freshly materialized fixture, with a Reviewer input carrying only the ordinary §17/§11 framing and the undifferentiated A–I axis list. No defect class is named, no contract section is weighted above another, the subject is not disclosed as a fixture or an evaluation, and no finding count is stated. Leak validation was extended past literal matching by `run_92759e0e1034/tools/semantic_leak_scan.py`, which reproduces R2 on the superseded input (11 hits) and returns 0 on the replacement input. The superseded write-up was replaced. |
+| R4 | Final Adversarial Review (`FINAL_REVIEW.md`), G1 MAJOR, blocking | **resolved**, with a follow-up (R4-T2) | Scorer output for the replacement run was written outside the repository and is not committed. `BASELINE_RESULT.md` was rewritten to report an aggregate only, naming no entry id, mapping, total, missed-entry list, subject identifier or key path. A leak scan was run over the exact artifact set proposed for commit, file by file. The superseded run's key-derived scorer output was quarantined. The *identity* half of R4 is closed by this. Its *arithmetic* half was not — the aggregate still published enough numbers to solve for the withheld total — and is closed by R4-T2 below. |
+| R2-T1 | found by this round's extended scan, escalated to the Coordinator, resolution directed by them | **resolved** | The iteration-1 `## Test Scope` passage in this file reproduced the key in full. It was replaced with a non-identifying description that keeps every verification claim; the key's path was replaced with `<key>` throughout; two quoted metric blocks had schema field names elided, with a note at the head of `## Execution`. This file is now at zero hits under both scanners. |
+| R4-T2 | TEST Reviewer, iteration 2 (`REVIEW_TEST_iteration2.md`), G1 MAJOR, blocking | **resolved** | Iteration 2 redacted the denominator as a field but left enough other numbers published to solve for it. Rule **P-1** was adopted instead — committed evidence publishes at most one quantity from `{population total, detected, missed, unmatched, reviewer finding count, recall}`, and only as a coarse bucket — and applied to both files: `TEST.md`'s two live scoring quotations now carry `<withheld>` in place of every metric magnitude and its iteration-2 summary is qualitative, and `BASELINE_RESULT.md` publishes recall as the bucket `50-75%` and nothing else numeric from the set. Validation was extended past token matching with a `metric_inference` check in `run_92759e0e1034/tools/semantic_leak_scan.py` that solves the six relationships REL-1 … REL-6 over the metric values a document publishes, per file and across the whole set; it reproduces R4-T2 on the pre-correction files and returns zero on the corrected ones. The full sweep over the exact commit set is above. Two disclosures of the same class were found in Coordinator-owned files this Task must not rewrite; they are reported under `### Out-of-scope disclosures found by the new check`, not silently included in the clean result. |
+| R1, R3 | Final Adversarial Review, routed to DESIGN | **not this round** | The redaction-pattern scope (R1) and the closed-world formula (R3) are being corrected in a parallel DESIGN round and reach this phase through §17's T5a downstream revalidation. This round's baseline may still exhibit either if it happened to touch those paths; that is expected and is re-verified after the downstream revalidation, not here. |
+
+### Known residual
+
+`artifacts/runs/run_ff587481a820/` is retained and still tracked in git, per the correction
+instruction to preserve it as forensic evidence. After the quarantine above it no longer makes the
+key's contents reachable, but its `input.md` still shows which categories that Reviewer was pointed
+at, and `EXPORT_BUNDLE.json` embeds that text. Stated rather than laundered: that run is
+**superseded**, is not the accepted baseline, and must not be cited as one. If the project would
+rather the repository hold no such material at all, moving that directory into an out-of-band
+forensic archive is the follow-up — a separate decision, not taken here.

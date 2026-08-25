@@ -1,90 +1,11 @@
 {
   "schema_version": "1.0",
-  "fixture_id": "final_review_eval/v1",
-  "fixture_digest": "sha256:b63f5a9f4280549ea3a05407b4b5fff28e054b75ee674f419413b5c69cf70f1d",
-  "key_digest": "sha256:d9dbe73c809cbaf19034761321951b4f4118d44b7e9f4f9b64ceb8080f81efaa",
-  "findings_source": "/private/tmp/claude-501/-Users-luminous-aiAssistedProjects-orca-skills/76cc26c3-d829-4f6e-af74-3ecb73c217ab/scratchpad/os22_baseline_workspace/REPORT.md",
-  "findings_source_digest": "sha256:c9aecb9fb1512667e7adfa1b7e250a4e5907a4af5693946838c87da7964fb9c2",
-  "findings_total": 5,
-  "adjudication_status": "none",
-  "closed_world": false,
-  "seeded_defects_total": 5,
-  "detected_seeded_defects": 3,
-  "seeded_recall": {
-    "value": 0.6,
-    "numerator": 3,
-    "denominator": 5,
-    "population": "seeded_defects_only"
-  },
-  "miss_count": 2,
-  "miss_rate": {
-    "value": 0.4,
-    "numerator": 2,
-    "denominator": 5,
-    "population": "seeded_defects_only"
-  },
-  "missed_defect_ids": [
-    "SD-2",
-    "SD-4"
-  ],
-  "matched_findings": [
-    {
-      "finding_id": "F-002",
-      "seeded_defect_id": "SD-1",
-      "claim_groups_satisfied": 2,
-      "symbol_hit": true,
-      "line_distance": 2.0
-    },
-    {
-      "finding_id": "F-003",
-      "seeded_defect_id": "SD-3",
-      "claim_groups_satisfied": 2,
-      "symbol_hit": true,
-      "line_distance": 4.5
-    },
-    {
-      "finding_id": "F-005",
-      "seeded_defect_id": "SD-5",
-      "claim_groups_satisfied": 2,
-      "symbol_hit": true,
-      "line_distance": 2.5
-    }
-  ],
-  "unmatched_findings": [
-    {
-      "finding_id": "F-001",
-      "reason": "no_key_match",
-      "classification": "UNADJUDICATED"
-    },
-    {
-      "finding_id": "F-004",
-      "reason": "no_key_match",
-      "classification": "UNADJUDICATED"
-    }
-  ],
-  "unadjudicated_count": 2,
-  "adjudicated_true_positives": 0,
-  "adjudicated_false_positives": 0,
-  "precision": null,
-  "precision_status": "REFUSED",
-  "precision_refusal_reason": "adjudication_incomplete: 2 unmatched finding(s) carry no independent adjudication verdict, and no closed_world exhaustive attestation is present",
-  "precision_definition": "a matched finding counts as a true positive by construction of the key: it identified an entry the key describes",
-  "false_positive_rate": null,
-  "false_positive_rate_status": "REFUSED",
-  "false_positive_rate_refusal_reason": "adjudication_incomplete: 2 unmatched finding(s) carry no independent adjudication verdict, and no closed_world exhaustive attestation is present",
-  "evidence_grounding": {
-    "value": 1.0,
-    "numerator": 5,
-    "denominator": 5,
-    "definition": "fraction of findings whose Location resolves to a file that exists in the materialized subject workspace and, when a line is given, to a line within that file",
-    "ungrounded_finding_ids": []
-  },
-  "verdict_reproducibility": {
-    "status": "SINGLE_RUN_NOT_ASSERTED",
-    "run_count": 1,
-    "verdicts": [
-      "FAIL"
-    ],
-    "agreement": null
-  }
+  "record_kind": "quarantined_artifact_placeholder",
+  "quarantined_file": "METRICS.json",
+  "quarantined_on": "2026-08-25",
+  "quarantined_by": "OS-22 TEST iteration-2 correction round (findings R2 / R4)",
+  "reason": "reproduced key-derived identities: the subject identifier, the entry total, individual entry ids, finding-to-entry mappings and the missed-id list",
+  "original_sha256": "sha256:d7b3d375621522840651811f002af7f835a632ac97c5b0e2ea41c08d54d7dd7f",
+  "original_location": "moved out of this repository; not retained in version control",
+  "note": "This run is SUPERSEDED. The accepted baseline is run_92759e0e1034, written up in artifacts/runs/run_804e35d29531/BASELINE_RESULT.md. This directory is retained only as forensic evidence of the defect that correction fixes; its audit trail (record.json, input.md, report.md) is intact and is the evidence. The scorer output that made the key reachable is not."
 }

@@ -2,7 +2,7 @@
   "schema_version": "1.0",
   "bundle_kind": "final_review_evidence_bundle",
   "run_id": "run_ff587481a820",
-  "exported_at": "2026-08-25T18:26:26.984273+00:00",
+  "exported_at": "2026-08-25T19:02:37.229419+00:00",
   "component_versions": {
     "audit_schema": "1.0",
     "redaction_policy": "redaction/1.0",
@@ -10,8 +10,8 @@
   },
   "orchestrator_log": {
     "path": "ORCHESTRATOR_LOG.md",
-    "digest": "sha256:9b14a832e15f80bcc365bbd5dc8abe66223782d3b5f849a499ab6b657225781a",
-    "content": "| timestamp | event | phase | role | iteration | task_id | dispatch_id | terminal | action | reuse | gate_result | review_verdict | risk | risk_source | requested_phases | round_kind | result | detail |\n| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n| 2026-08-25T18:25:50.913563+00:00 | final_review_audit_written | final_review | reviewer | 1 | task_0c55cde37456 | ctx_33c8c8414587 | term_d2c7c74b-f479-4d17-ba7b-d4e90559f88f |  |  |  |  |  |  |  | final_review | provenance=accepted | record=final_review_audit/attempt1__task_0c55cde37456__ctx_33c8c8414587/record.json |\n"
+    "digest": "sha256:41fae29c21d2ff61f79281253942f2eaf05ac7fd9ebbab7c9fad3e4b6fec43d4",
+    "content": "| timestamp | event | phase | role | iteration | task_id | dispatch_id | terminal | action | reuse | gate_result | review_verdict | risk | risk_source | requested_phases | round_kind | result | detail |\n| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n| 2026-08-25T18:25:50.913563+00:00 | final_review_audit_written | final_review | reviewer | 1 | task_0c55cde37456 | ctx_33c8c8414587 | term_d2c7c74b-f479-4d17-ba7b-d4e90559f88f |  |  |  |  |  |  |  | final_review | provenance=accepted | record=final_review_audit/attempt1__task_0c55cde37456__ctx_33c8c8414587/record.json |\n| 2026-08-25T18:27:19.484208+00:00 | run_end |  |  |  |  |  |  |  |  |  |  |  |  |  |  | COMPLETED | SUPERSEDED by run_92759e0e1034 (OS-22 TEST iteration-2 correction, findings R2/R4). Original detail text redacted 2026-08-25: it named key-derived quantities. This run is retained as forensic evidence only and is NOT the accepted section-7 baseline. |\n"
   },
   "attempts": [
     {
@@ -103,7 +103,7 @@
             "failure_detail": "",
             "observed_input_bytes": null,
             "input_altered_across_retry": "unknown",
-            "notes": "OS-22 section-7 seeded-fixture baseline; no detection/search policy change",
+            "notes": "OS-22 section-7 baseline attempt, SUPERSEDED by run_92759e0e1034 (TEST iteration-2 correction, findings R2/R4). Note text redacted 2026-08-25; no detection/search policy change was made for this attempt.",
             "metadata_redaction": {
               "redaction_policy_version": "redaction/1.0",
               "covered_fields": [

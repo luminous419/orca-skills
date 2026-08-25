@@ -1,0 +1,103 @@
+{
+  "schema_version": "1.0",
+  "record_kind": "final_review_dispatch_audit",
+  "run_id": "run_804e35d29531",
+  "final_review_attempt": 1,
+  "task_id": "task_75d5e97d1679",
+  "dispatch_id": "ctx_99cc7e6b886c",
+  "dispatch_key": "attempt1__task_75d5e97d1679__ctx_99cc7e6b886c",
+  "recorded_at": "2026-08-25T18:32:48.451515+00:00",
+  "reviewer_terminal": "term_e852bced-1854-4fd9-b9f7-e2ad1310e334",
+  "reviewer_agent_command": "codex-sol",
+  "reviewer_agent_origin": "self_created",
+  "repository": {
+    "head_commit": "5642e5b67e000ec785cccb58a9c4297e5dc992d7",
+    "branch": "agent/final-review-observability-evaluation",
+    "dirty": true
+  },
+  "stored_task_spec": {
+    "source": "orca orchestration task-list --run <run_id> --json",
+    "capture_status": "captured",
+    "capture_error": "",
+    "captured_at": "2026-08-25T18:32:48.165437+00:00",
+    "is_stored_spec_not_delivered_bytes": true,
+    "byte_length_pre_redaction": 9322,
+    "input_digest_pre_redaction": "sha256:cb503eebecba622b678c204ff0cfc49821ed5d09dc0dde1010bb87189b52a012",
+    "redaction_policy_version": "redaction/1.0",
+    "artifact_path": "final_review_audit/attempt1__task_75d5e97d1679__ctx_99cc7e6b886c/input.md",
+    "artifact_digest_post_redaction": "sha256:cb503eebecba622b678c204ff0cfc49821ed5d09dc0dde1010bb87189b52a012",
+    "byte_length_post_redaction": 9322,
+    "redactions": []
+  },
+  "delivery_evidence": {
+    "source": "orca orchestration dispatch-show --task <task_id> --json",
+    "capture_status": "captured",
+    "capture_error": "",
+    "captured_at": "2026-08-25T18:32:48.451211+00:00",
+    "preamble_captured": false,
+    "dispatch_status": "failed",
+    "contract_version": 1,
+    "dispatched_at": "2026-08-25 18:31:48",
+    "completed_at": "2026-08-25 18:31:50",
+    "capability_hash": "9eb53067ac58a707b1b70c7827563c74925c2729708af5d1a3cd2c2e58b4c070",
+    "capability_revoked_at": "2026-08-25 18:31:50",
+    "assignee_handle": "term_e852bced-1854-4fd9-b9f7-e2ad1310e334",
+    "process_incarnation": "6677a9cf-724c-4e55-9b14-95ada8f054ac::/Users/<REDACTED:absolute_local_path>/aiAssistedProjects/orca-skills@@06ecbf9b:bb9da6a0-6db6-44bf-ac76-1c088669055f",
+    "failure_count": 0,
+    "last_failure": "agent_prompt_blocked",
+    "termination_reason": null
+  },
+  "report": {
+    "contract_path": "FINAL_REVIEW.md",
+    "resolution": "ladder",
+    "capture_status": "absent",
+    "capture_error": "no report at FINAL_REVIEW.md",
+    "captured_at": "2026-08-25T18:32:48.451504+00:00",
+    "byte_length_pre_redaction": null,
+    "report_digest_pre_redaction": null,
+    "redaction_policy_version": "redaction/1.0",
+    "artifact_path": "",
+    "artifact_digest_post_redaction": null,
+    "byte_length_post_redaction": null,
+    "redactions": [],
+    "parsed": {
+      "parse_status": "not_attempted",
+      "parse_error": "",
+      "result": "",
+      "review_verdict": "",
+      "blocking_finding_ids": [],
+      "non_blocking_finding_ids": []
+    }
+  },
+  "provenance_state": "voided",
+  "void_reason": "dispatch_input_rejected",
+  "settlement_state": "not_settled",
+  "failure_detail": "agent_prompt_blocked at dispatch stage dispatch_input; capability_revoked_at=2026-08-25 18:31:50; however terminal read shows the prompt WAS delivered and the agent began working (visible 'Exploring: Read SKILL.md' activity) -- Orca's own dispatch confirmation failed even though the underlying send appears to have succeeded. Retrying under a new Task/Dispatch identity per DEC-2.",
+  "observed_input_bytes": null,
+  "input_altered_across_retry": "unknown",
+  "notes": "",
+  "metadata_redaction": {
+    "redaction_policy_version": "redaction/1.0",
+    "covered_fields": [
+      "reviewer_agent_command",
+      "reviewer_agent_origin",
+      "failure_detail",
+      "notes",
+      "stored_task_spec.capture_error",
+      "report.capture_error",
+      "delivery_evidence.capture_error",
+      "delivery_evidence.process_incarnation",
+      "delivery_evidence.last_failure",
+      "delivery_evidence.termination_reason",
+      "report.parsed.parse_error",
+      "report.parsed.blocking_finding_ids",
+      "report.parsed.non_blocking_finding_ids"
+    ],
+    "redactions": [
+      {
+        "category": "absolute_local_path",
+        "count": 1
+      }
+    ]
+  }
+}
