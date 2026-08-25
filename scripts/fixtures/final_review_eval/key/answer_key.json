@@ -1,0 +1,128 @@
+{
+  "schema_version": "1.0",
+  "fixture_id": "final_review_eval/v1",
+  "fixture_digest": "sha256:b63f5a9f4280549ea3a05407b4b5fff28e054b75ee674f419413b5c69cf70f1d",
+  "expected_finding_count_is_not_a_contract": true,
+  "seeded_defects": [
+    {
+      "id": "SD-1",
+      "archetype": "value_vs_presence",
+      "location": {
+        "file": "src/policy.py",
+        "symbol": "resolve_tier",
+        "line_range": [6, 10]
+      },
+      "contract_reference": "CONTRACT.md 2",
+      "summary": "resolve_tier tests for the PRESENCE of retention_tier instead of validating its VALUE against TIERS, so an unknown tier is accepted and tier_limits falls back to an unlimited quota.",
+      "introduced_by": "src/policy.py resolve_tier/tier_limits hunk (base -> head)",
+      "negative_space_argument": "Every occurrence of retention_tier in the tree looks correct in isolation -- the TIERS table, BUILTIN_DEFAULTS, the two lines of this function, the stored tier on a written record, its tests, and the contract sentence. There is no suspicious token to find, because the defect is the ABSENCE of a membership test against TIERS. Localizing it requires cross-reading four places that are not adjacent: CONTRACT.md section 2's 'names a tier that exists in TIERS' sentence, src/config.py's TIERS keys, this function's presence-only 'in' check, and tier_limits()'s 'or {...}' fallback -- the line that converts the missed validation into a real consequence, since an unknown tier yields max_items None and enforce_quota treats a None limit as unlimited, silently dropping both the quota and require_signature for the archival tier. No single grep spans that chain.",
+      "match_criterion": {
+        "location_tolerance_lines": 6,
+        "claim_requirements": {
+          "all_of": [
+            {"any_of": ["presence", "present", "\"in\" check", "key exists", "membership",
+                        "존재 여부", "존재만"]},
+            {"any_of": ["unknown tier", "invalid tier", "unrecognized tier", "not in tiers",
+                        "arbitrary value", "validate the value", "값을 검증", "알 수 없는 tier"]}
+          ]
+        }
+      }
+    },
+    {
+      "id": "SD-2",
+      "archetype": "omitted_call_site_propagation",
+      "location": {
+        "file": "src/pipeline.py",
+        "symbol": "publish_batch",
+        "line_range": [22, 28]
+      },
+      "contract_reference": "CONTRACT.md 4",
+      "summary": "publish_batch gained the destination parameter and resolves the tier for the write, but its enforce_quota call was left at the pre-feature form, so the batch path silently evaluates quota against the default tier instead of the destination's.",
+      "introduced_by": "src/quota.py enforce_quota signature hunk plus the src/pipeline.py call-site hunks (base -> head)",
+      "negative_space_argument": "enforce_quota has one definition and three call sites, and every one of them is a syntactically valid call to the new signature, because the new parameter has a default. There is no error, no warning and no odd token: the defect is a missing ARGUMENT, so it has no textual footprint at all. Localizing it requires reading the new signature in src/quota.py, then the call sites in src/pipeline.py side by side -- the asymmetry is only visible in comparison, not in any line alone -- then CONTRACT.md section 4's 'Every path ... publish_one, publish_batch, republish', and then noticing that tests/test_pipeline.py exercises publish_batch only against a destination whose tier IS default, so the wrong tier is indistinguishable from the right answer in every existing test.",
+      "match_criterion": {
+        "location_tolerance_lines": 6,
+        "claim_requirements": {
+          "all_of": [
+            {"any_of": ["not passed", "not propagated", "does not pass", "omits the tier",
+                        "missing argument", "tier argument", "without the tier",
+                        "전달되지 않", "전달하지 않", "누락"]},
+            {"any_of": ["publish_batch", "batch path", "default tier", "the batch", "배치"]}
+          ]
+        }
+      }
+    },
+    {
+      "id": "SD-3",
+      "archetype": "equality_boundary",
+      "location": {
+        "file": "src/quota.py",
+        "symbol": "enforce_quota",
+        "line_range": [10, 19]
+      },
+      "contract_reference": "CONTRACT.md 3",
+      "summary": "enforce_quota compares with < where the contract says a publication is rejected only when it would EXCEED max_items, so a publication of exactly max_items records is rejected instead of accepted.",
+      "introduced_by": "src/quota.py enforce_quota hunk (base -> head)",
+      "negative_space_argument": "Both < and <= appear elsewhere in the tree legitimately, so no comparison operator is inherently suspicious, and although the changed line IS in the diff, it was rewritten for a different and legitimate reason -- the tier lookup -- so the comparison change reads as incidental. Localizing it requires reading CONTRACT.md section 3's 'exceed' / 'exactly max_items is accepted' wording against the operator, and then checking tests/test_quota.py, which exercises 50 and 150 against a limit of 100 and never 100 -- the boundary is the one value the suite does not test. No string search reaches that.",
+      "match_criterion": {
+        "location_tolerance_lines": 6,
+        "claim_requirements": {
+          "all_of": [
+            {"any_of": ["off-by-one", "off by one", "boundary", "strict comparison",
+                        "less than or equal", "<=", "경계", "오프바이원"]},
+            {"any_of": ["exactly", "at the limit", "equal to max_items", "equals max_items",
+                        "정확히", "같을 때"]}
+          ]
+        }
+      }
+    },
+    {
+      "id": "SD-4",
+      "archetype": "losing_precedence_fallback",
+      "location": {
+        "file": "src/config.py",
+        "symbol": "resolve_settings",
+        "line_range": [16, 18]
+      },
+      "contract_reference": "CONTRACT.md 1",
+      "summary": "resolve_settings builds a dict splat literal whose later keys win, so the textual source order is exactly the inverse of the precedence order: BUILTIN_DEFAULTS overrides everything and an explicit override never takes effect.",
+      "introduced_by": "src/config.py resolve_settings hunk (base -> head)",
+      "negative_space_argument": "This is the sharpest negative space of the set, because the code contains all four sources in the textually correct order -- explicit, destination, project, BUILTIN_DEFAULTS, reading left to right exactly as CONTRACT.md section 1 lists them -- and carries a docstring restating the correct ladder. Any grep for the source names, for 'explicit', or for 'resolve_settings' lands on a line that looks like the contract. Localizing it requires knowing Python's {**a, **b} last-wins semantics AND cross-reading the ladder in CONTRACT.md; and tests/test_config.py populates exactly one source per case, so precedence -- the only thing that could expose it -- is never exercised by any existing test.",
+      "match_criterion": {
+        "location_tolerance_lines": 6,
+        "claim_requirements": {
+          "all_of": [
+            {"any_of": ["precedence", "override", "overrides", "우선순위", "덮어"]},
+            {"any_of": ["inverted", "reversed", "last wins", "last-wins",
+                        "lower source wins", "builtin overrides", "built-in overrides",
+                        "builtin_defaults wins", "역순", "반대로"]}
+          ]
+        }
+      }
+    },
+    {
+      "id": "SD-5",
+      "archetype": "validation_scope_gap",
+      "location": {
+        "file": "src/pipeline.py",
+        "symbol": "republish",
+        "line_range": [31, 36]
+      },
+      "contract_reference": "CONTRACT.md 5",
+      "summary": "republish reaches the shared _write_record sink without calling validate_record, so the retry path writes a record no validator ever saw -- and the contract says there is no exempt path.",
+      "introduced_by": "src/pipeline.py republish hunk (base -> head)",
+      "negative_space_argument": "grep validate_record over the tree finds the definition, two call sites, a dedicated test file and CONTRACT.md section 5 -- the function looks thoroughly used, which is what makes the gap invisible to a coverage-by-grep reading. The defect is a THIRD writer that does not call it. Localizing it requires enumerating call sites of the SINK (_write_record, three of them) rather than of the validator, noticing that one reaches the store without passing through the validator, and reading CONTRACT.md section 5's 'There is no exempt path' against the docstring's plausible-sounding excuse ('already failed downstream of validation') -- an excuse that is false for a retry path, since a retried record can be re-supplied by a caller and is never re-checked. tests/test_pipeline.py calls republish only with a record that is already valid, so the suite is green and silent.",
+      "match_criterion": {
+        "location_tolerance_lines": 6,
+        "claim_requirements": {
+          "all_of": [
+            {"any_of": ["validate_record", "validation", "not validated", "no validation",
+                        "unvalidated", "검증", "유효성"]},
+            {"any_of": ["republish", "retry path", "write path", "bypass", "bypasses",
+                        "skips", "우회", "재발행"]}
+          ]
+        }
+      }
+    }
+  ]
+}
