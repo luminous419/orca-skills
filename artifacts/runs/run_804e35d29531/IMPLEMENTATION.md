@@ -692,3 +692,190 @@ for the reviewer's convenience:
 | D-001 — the neutrality golden was not a byte-identity test | RESOLVED — `canonicalize_task_spec()` performs exactly one substitution and `_normalize_artifact()` is never applied to a Task spec; strictness is proven by `test_a_whitespace_only_change_fails_the_neutrality_golden`, not asserted |
 | D-002 — clock-derived `generated_at` broke B5's byte-identity | RESOLVED — `score` reads a clock only under `--provenance-out`, into a sidecar; a patched-clock test asserts no timestamp reaches the metrics document, and the rerun assertion is unqualified |
 | D-003 — the three-file writer could permanently orphan a dispatch | RESOLVED — A.3's stage-and-one-rename protocol, with the fault-injection suite asserting at every write boundary that a later write for the same dispatch key still succeeds |
+
+---
+
+## IMPLEMENTATION iteration 4 — downstream revalidation (§17 T5a)
+
+Not a correction round against IMPLEMENTATION's own gate — that passed after iterations 2 and 3.
+This is the §17 T5a revalidation triggered by a **corrected upstream artifact**: the Final
+Adversarial Review's R1 and R3 were adjudicated as DESIGN-phase gaps, DESIGN.md's D-C and D-E were
+rewritten (commit `476dcc9`), and that commit states plainly that "the redaction-pattern and
+closed-world-formula code fixes implied by the corrected DESIGN spec have not landed yet". They
+land here.
+
+### Summary / Analysis
+
+**Something did have to change, and it was not cosmetic.** Both corrected sections change the
+*shipped behaviour* the previously-approved code implements, so "nothing needed to change" was
+never available:
+
+* **R1 / D-C.** `redaction/1.0` stated the absolute-path rule as an **allowlist of three home
+  roots**, so every root nobody thought of failed open. `_relative_artifact_path()`'s fallback ran
+  `redact_text()` over a path that the policy did not recognise and returned it **unchanged**.
+* **R3 / D-E.** The precision gate was `if closed_world or not unadjudicated`, and the false-
+  positive numerator was `adjudicated_false_positives` alone. Under a closed-world attestation with
+  an unmatched finding, the gate opened, `precision` charged the finding against itself, and
+  `false_positive_rate` reported **0.0** while `unadjudicated_count` was 1 — two metrics
+  contradicting each other about the same finding.
+
+Both were reproduced against the **pre-fix code at `HEAD`** (`git show HEAD:scripts/…` executed
+directly), then re-run against the fixed code. See *Additional Validation* for the transcripts.
+
+### Changes
+
+| # | commit | what |
+|---|---|---|
+| 1 | `9e19ce0` | D-C: `redaction/1.1`, category 5, C.7's P-PATH classifier + postcondition, the `_relative_artifact_path()` ladder, SKILL.md §9 + validator anchor, T-3 tests. `tools/run_logging.py` byte-parity in the **same** commit. |
+| 2 | `2d863ea` | D-E: `classify_unmatched()`, `ATTESTED_FALSE_POSITIVE`, `attested_false_positives`, `complete_by_attestation`, the three consistency invariants, E.3's coupling in both directions, C.7 P-PATH for the scorer's own path fields, T-4 tests. |
+
+**Commit 1 — D-C, exactly as the corrected spec states it.**
+
+* `FINAL_REVIEW_REDACTION_POLICY_VERSION = "redaction/1.1"`. `"redaction/1.0"` now raises like any
+  other unknown version (C.2: exactly one policy is *executable* at a time; older records keep the
+  `1.0` stamp as **data**).
+* `_PATH_SEGMENT`, `_HOME_ABSOLUTE_PATH` and `_FOREIGN_ABSOLUTE_PATH` copied **verbatim** from
+  C.3.1 — not re-derived — and `REDACTION_CATEGORIES` is now the ordered **5**-tuple. Category 4 is
+  unchanged (user-name segment only, path stays readable); category 5 replaces the **whole** match
+  with `FOREIGN_PATH_PLACEHOLDER` and borrows nothing from the input. **No segment-count floor**:
+  `/tmp`, `/luminous`, `/workspace-501` and `/session-<uuid>` are matched, which is the D3-001 fix.
+* C.7's literals — `FOREIGN_PATH_PLACEHOLDER`, `_SAFE_RELATIVE_PATH`, `_NON_FILE_URL` — and the
+  total pair `normalize_retained_path_field()` / `assert_retained_path_field()`. The postcondition
+  re-runs the **total classifier**; it is not a fixed-point test, so a value the free-text policy
+  fails to recognise has no way through.
+* `_relative_artifact_path(path, root)` keeps its name and signature and gains rung 2
+  (`<REPO>/…`, project root **derived** from `<ARTIFACT_ROOT>` via `_artifact_project_root()` — no
+  `.git` walk, no `__file__`, no env var) and rung 3 (the whole value replaced, **without** calling
+  `redact_text()`), then normalizes and asserts.
+* `FINAL_REVIEW_RETAINED_PATH_FIELDS` is the closed table, checked by `_assert_retained_path_fields()`
+  at record assembly **after every field is in place and before anything is staged**, and the
+  exporter runs the same assertion over `orchestrator_log.path` and each embedded artifact path
+  before serialising. A violation is `RunLoggingError` and nothing is published.
+* SKILL.md §9's *secret-safe* paragraph now states `redaction/1.1`, category 5 with no segment
+  floor, and the P-PATH property in its own words; `validate_skills.py`'s anchor moves with it
+  (`test_a_redaction_policy_version_that_drifts_fails` now derives the expected string from the
+  constant instead of hard-coding it, so this cannot drift again).
+
+**Commit 2 — D-E, and the scorer's own path fields.**
+
+* `classify_unmatched(unmatched, verdicts, *, closed_world)` — **one** function over both paths,
+  whose only inputs are `closed_world`, the E.4 step-6 `reason` and the verdict map, so the two
+  numerators cannot drift apart again. An explicit verdict always wins; closed world +
+  `no_key_match` + no verdict → `ATTESTED_FALSE_POSITIVE`; `unresolvable_location` and
+  `ambiguous_match` stay `UNADJUDICATED` and **refuse both metrics** with
+  `closed_world_incomplete_match_evaluation`.
+* `attested_false_positives` is unconditional; `adjudication_status` gains
+  `complete_by_attestation`; `false_positive_rate = (adjudicated + attested) / findings_total`,
+  which reduces to the unchanged open-world formula because `attested` is 0 on path B.
+* `_assert_metric_consistency()` **aborts rather than serializes** (`RuntimeError`): COMPUTED
+  implies `unadjudicated_count == 0`, every finding accounted for exactly once, and
+  `precision + false_positive_rate == 1`. `findings_total == 0` refuses both metrics on both paths.
+* E.3's coupling is now validated in **both** directions — an `exhaustive_attestation` supplied
+  while `closed_world` is false is exit 2, like an unsigned closed world.
+* C.7 for the scorer: `final_review_eval.py` **imports** `run_logging` and routes `parse-report`'s
+  `source_report` and the metrics' `findings_source` through `normalize_retained_path_field()` /
+  `assert_retained_path_field()`. A second copy of the policy is precisely the drift R1 punished;
+  "standard library only" forbids third-party dependencies, not this repository's own module.
+
+### Modified Files
+
+| file | change |
+|---|---|
+| `scripts/run_logging.py` | policy version, `_PATH_SEGMENT` / `_HOME_ABSOLUTE_PATH` / `_FOREIGN_ABSOLUTE_PATH`, category 5, `FOREIGN_PATH_PLACEHOLDER`, `_SAFE_RELATIVE_PATH`, `_NON_FILE_URL`, `REPO_RELATIVE_PREFIX`, `FINAL_REVIEW_RETAINED_PATH_FIELDS`, `normalize_retained_path_field()`, `assert_retained_path_field()`, `_assert_retained_path_fields()`, `_artifact_project_root()`, the `_relative_artifact_path()` ladder, the record-assembly and exporter postconditions |
+| `orca-worker-reviewer-orchestration/tools/run_logging.py` | byte-identical twin, same commit (`cmp` clean) |
+| `orca-worker-reviewer-orchestration/SKILL.md` | §9 *secret-safe*: `redaction/1.1`, category 5, P-PATH |
+| `scripts/validate_skills.py` | the redaction-policy anchor |
+| `scripts/final_review_eval.py` | `import run_logging`, `ATTESTED_FALSE_POSITIVE`, `INCOMPLETE_MATCH_REASONS`, `classify_unmatched()`, `_retained_path_field()`, `_assert_metric_consistency()`, the rewritten gate, `attested_false_positives`, `complete_by_attestation`, E.3's reverse coupling, `source_report` / `findings_source` |
+| `scripts/test_run_logging.py` | +14 tests (below) |
+| `scripts/test_final_review_eval.py` | +13 tests (below) |
+| `scripts/test_validate_skills.py` | the drift test derives the version from the constant |
+
+**Not touched, deliberately.** I-001 / I-002 / I-002-R1 (resolved, unrelated); the two
+Coordinator-owned residual disclosures documented in TEST.md (append-only/immutable by design); and
+the two historical baseline runs `artifacts/runs/run_ff587481a820/` and
+`artifacts/runs/run_92759e0e1034/`, which were executed **before** this fix and retain the pre-fix
+path-leak artifacts as forensic evidence of R1's prior state. D-C C.7's *regeneration of
+already-retained evidence* rule therefore remains **open and deferred** — regenerating a baseline is
+a fresh capture, which is a TEST-phase activity, not part of this revalidation.
+
+### Unit Tests
+
+**Added — `scripts/test_run_logging.py`**
+
+| class / test | behaviour covered |
+|---|---|
+| `RedactionPolicyTests.test_the_superseded_policy_version_is_refused_too` | `"redaction/1.0"` raises; older records keep the stamp as data |
+| `ForeignAbsolutePathRedactionTests` (5 tests) | the 9 category-5 positives — including the shipped-baseline shape and **all four one-segment D3-001 cases** — each replaced whole, with a non-zero `foreign_absolute_path` count and no username / uid / session fragment surviving; `file://` keeps its scheme; the 7 guaranteed exemptions survive; a home path stays readable and is **not** swallowed by category 5; idempotence over both tables |
+| `RetainedPathFieldClassifierTests` (4 tests) | the classifier is total — 12 values replaced in full (4 of them one-segment), 7 returned unchanged (P1/P2/P3/P4); normalizer/postcondition agreement; and `assert_retained_path_field("/luminous")` **raises**, which a fixed-point test would not have done |
+| `RetainedPathFieldRecordTests` (4 tests) | the three ladder rungs produce `FINAL_REVIEW.md` / `<REPO>/docs/FINAL_REVIEW.md` / the placeholder through the **real writer**; a scratch path leaves no fragment in `record.json`; the generic sweep — no string anywhere in the record begins with `/`, and every closed-table field is P1–P4; and with the ladder stubbed to a raw path (multi-segment **and** one-segment) the write raises and publishes nothing |
+
+**Added — `scripts/test_final_review_eval.py`**
+
+| class / test | behaviour covered |
+|---|---|
+| `ClosedWorldFalsePositiveRateTests.test_an_unmatched_finding_under_attestation_is_an_attested_false_positive` | **the R3 reproduction, by exact value**: `findings_total 6`, 5 matched, reason `no_key_match`, classification `ATTESTED_FALSE_POSITIVE`, `attested_false_positives 1`, `adjudicated_false_positives 0`, `unadjudicated_count 0`, status `complete_by_attestation`, `precision 5/6`, `false_positive_rate 1/6` — **not 0** — and `precision + fpr == 1`. Four of these assertions fail against the pre-fix code |
+| `…test_an_explicit_verdict_beats_the_attestation` | verdict wins; `attested 0`, status `complete`, precision 1, fpr 0 |
+| `…test_closed_world_refuses_an_incompletely_evaluated_match` | both incomplete reasons forced: REFUSED with `closed_world_incomplete_match_evaluation`, `UNADJUDICATED`, status `partial`; a verdict for that id flips the same input to COMPUTED |
+| `…test_the_open_world_path_never_auto_false_positives` | path B unchanged: still `UNADJUDICATED`, `attested 0`, `adjudication_incomplete` |
+| `…test_the_gate_is_a_single_decision_across_every_case` | `precision_status == false_positive_rate_status` everywhere, and COMPUTED ⇒ `unadjudicated_count == 0` and the sum is 1 |
+| `…test_no_findings_refuses_both_metrics_on_both_paths` | zero denominator refused, never divided |
+| `PrecisionRefusalTests.test_a_closed_world_run_refuses_an_unresolvable_noise_finding` | the honest half of the rule, at the same call site as the old test |
+| `ScorerPathFieldTests` (3 tests) | a scratch `source_report` **and** `/luminous` both become the placeholder; a repository path stays readable; no string in the metrics document begins with `/` |
+| `AdjudicationContractTests.test_an_attestation_without_a_closed_world_claim_is_refused` | E.3's reverse coupling |
+| `ExitCodeTests.test_three_when_a_closed_world_run_cannot_finish_a_match` | `--require-precision` still exits **3** under a closed-world refusal |
+| `ExitCodeTests.test_two_when_closed_world_and_the_attestation_disagree` | exit **2** in both directions, at the CLI boundary |
+
+**Modified.** `PrecisionRefusalTests.test_a_closed_world_attestation_computes_precision` now uses a
+noise finding whose location **resolves** (the only shape an attestation can speak about); the old
+input, whose location is unresolvable, moved to the new refusal test rather than being deleted.
+`test_a_redaction_policy_version_that_drifts_fails` derives the version from the constant.
+
+**Execution.** `python3 -m unittest discover -s scripts -p 'test_*.py'` → **1011 tests, OK**
+(6 pre-existing skips); 984 before this iteration, so +27 net.
+
+### Additional Validation
+
+| check | result |
+|---|---|
+| `python3 scripts/validate_skills.py` | PASSED (463 checks) |
+| `python3 -m unittest discover -s scripts -p 'test_*.py'` | OK — 1011 tests, 6 skipped |
+| `python3 scripts/verify_package.py` | PASSED (107 source files) |
+| `cmp scripts/run_logging.py orca-worker-reviewer-orchestration/tools/run_logging.py` | byte-identical |
+| `python3 scripts/final_review_eval.py verify-fixture` | PASSED (exit 0) |
+
+**R1 reproduction, at the code level, through the real writer.** A record written with
+`report_path` pointing at a real file under the session scratch root
+(`/private/tmp/claude-<uid>/-Users-<user>-…/<session-uuid>/scratchpad/…/REPORT.md`), and a second
+with the one-segment `/luminous`:
+
+```text
+PRE-FIX  (git show HEAD:scripts/run_logging.py)
+  report.contract_path : /private/tmp/claude-501/-Users-luminous-…/<uuid>/scratchpad/…/REPORT.md
+  report.redactions    : []
+
+POST-FIX (deep scratch path)          POST-FIX (one-segment "/luminous")
+  contract_path : <REDACTED:foreign_absolute_path>   <REDACTED:foreign_absolute_path>
+  "luminous" in record.json   : False                False
+  "claude-501" in record.json : False                False
+  any string value starts "/" : False                False
+  redaction_policy_version    : redaction/1.1        redaction/1.1
+```
+
+**R3 reproduction, end to end through the CLI.** `parse-report` → `score --adjudications
+<closed-world attestation, zero verdicts> --require-precision`, on a perfect report plus one noise
+finding whose location resolves and matches no key entry:
+
+```text
+PRE-FIX  (git show HEAD:scripts/final_review_eval.py)
+  unadjudicated_count 1 | classification UNADJUDICATED | adjudication_status partial
+  precision 0.8333 | false_positive_rate 0.0            <- the false zero
+  findings_source /private/tmp/claude-501/-Users-luminous-…/repro_r3/REPORT.md   <- the path leak
+
+POST-FIX
+  findings_total 6 | unadjudicated_count 0 | adjudication_status complete_by_attestation
+  unmatched: [{finding_id R9, reason no_key_match, classification ATTESTED_FALSE_POSITIVE}]
+  attested_false_positives 1 | adjudicated_false_positives 0
+  precision 0.8333 (COMPUTED) | false_positive_rate 0.1667 (COMPUTED) | sum 1.0
+  findings_source <REDACTED:foreign_absolute_path>
+  exit 0 under --require-precision
+```
