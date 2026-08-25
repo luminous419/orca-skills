@@ -1,0 +1,4 @@
+| timestamp | event | phase | role | iteration | task_id | dispatch_id | terminal | action | reuse | gate_result | review_verdict | risk | risk_source | requested_phases | round_kind | result | detail |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 2026-08-25T18:25:50.913563+00:00 | final_review_audit_written | final_review | reviewer | 1 | task_0c55cde37456 | ctx_33c8c8414587 | term_d2c7c74b-f479-4d17-ba7b-d4e90559f88f |  |  |  |  |  |  |  | final_review | provenance=accepted | record=final_review_audit/attempt1__task_0c55cde37456__ctx_33c8c8414587/record.json |
+| 2026-08-25T18:27:19.484208+00:00 | run_end |  |  |  |  |  |  |  |  |  |  |  |  |  |  | COMPLETED | OS-22 section-7 baseline: single seeded-fixture Final Review attempt, accepted provenance, scoring executed as separate step, recall=0.6 (3/5), precision REFUSED (adjudication incomplete). No detection/search policy change. |
