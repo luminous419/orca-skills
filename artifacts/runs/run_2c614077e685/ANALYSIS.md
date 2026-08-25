@@ -74,9 +74,11 @@ causal claim in this section carries a tier:
   are candidate causes requiring controlled validation before any lifecycle change is justified
   by them.
 
-Hypotheses are numbered H-1 … H-4 and introduced at the point they first arise (H-4 in F3, H-1 in
-F4, H-2 and H-3 in F5). A contract *gap* being demonstrated never by itself promotes the claim
-that the gap caused an observed miss — that claim is always a separate, tiered statement.
+Hypotheses are numbered H-1 … H-5 and introduced at the point they first arise (H-4 and H-5 in F3,
+H-1 in F4, H-2 and H-3 in F5). A contract *gap* being demonstrated never by itself promotes the
+claim that the gap caused an observed miss — that claim is always a separate, tiered statement.
+Where two hypotheses predict the same observations on this corpus (H-4 and H-5), neither is
+ranked above the other on evidence.
 
 The distinction is load-bearing here. No Final Review *input* spec is retained for any run in the
 corpus (§9 has no artifact contract for it), and for the run where attempt-to-attempt
@@ -117,36 +119,59 @@ external CRITICAL/MAJOR recall                                         : 0 / 5  
 runs where an internal PASS was followed by >=1 external blocking      : 4 / 5  = 80%
 ```
 
-### F2 — The Final Reviewer is precise, not noisy. The failure is recall, not discipline.
+### F2 — Every internal blocking finding was accepted and acted on, and none was contested. That measures acceptance, not correctness. The demonstrated failure is recall, not finding volume.
 
 Internal Final Reviewers issued **6** blocking findings in the recoverable corpus. Of the 4
-that entered the lifecycle, **0** were later disputed or withdrawn, and all 4 were real
-defects that were fixed:
+that entered the lifecycle, **0** were disputed or withdrawn by the Worker, the Coordinator, a
+phase Reviewer, or a later attempt, and all 4 were accepted and corrected:
 
-| Finding | Run | Defect | Outcome |
+| Finding | Run | Finding as stated by the reviewer | Lifecycle outcome |
 |---|---|---|---|
-| FINAL-I1-MAJOR-1 | #12 attempt 1 | Task boundary built *after* `start_worker()` — the advertised safety boundary was never delivered to any agent | corrected + downstream revalidation |
-| R1 | #16 attempt 1 | §12/§17 phase transitions expressed as "Reviewer PASS", impossible at LOW | corrected in DESIGN |
-| R1 | #16 attempt 2 | §17 T4 still routes every Final Review correction through a phase Reviewer | corrected in DESIGN |
-| R1 | #17 attempt 1 | NaN duration reachable in TIMING_LOG | corrected in BUGFIX |
+| FINAL-I1-MAJOR-1 | #12 attempt 1 | Task boundary built *after* `start_worker()` — the advertised safety boundary was never delivered to any agent | accepted; corrected + downstream revalidation |
+| R1 | #16 attempt 1 | §12/§17 phase transitions expressed as "Reviewer PASS", impossible at LOW | accepted; corrected in DESIGN |
+| R1 | #16 attempt 2 | §17 T4 still routes every Final Review correction through a phase Reviewer | accepted; corrected in DESIGN |
+| R1 | #17 attempt 1 | NaN duration reachable in TIMING_LOG | accepted; corrected in BUGFIX |
 
-Non-blocking findings issued across the whole corpus: 3 (all in PR #12's Final Review, all
-accurate and correctly non-blocking). Evidence grounding is consistently good: every internal
-Final Review artifact cites `file:line` locations, quotes the diff range it read, and re-runs
-and reports `validate_skills.py` / `unittest discover` / `verify_package.py` /
-`git diff --check` totals itself rather than trusting the Worker's numbers.
+**What these figures measure, and what they do not.** The rates below record what the
+*lifecycle did* with each finding, not whether each finding was true. Acceptance is not
+adjudication: an agent can implement a requested correction even when the finding was
+unnecessary or rested on an incorrect reading of the contract. No independent adjudication of
+these 4 findings against explicit contract or repository behaviour has been performed — not in
+the original runs, and not in this report — and the external channel does not independently
+confirm them either: overlap between the two channels is zero in the measured direction (0/5,
+F1), and at least two of these four are findings the external reviewer never raised
+(factor-assessment table, F5). They are therefore reported as **accepted**, never as verified
+true positives.
 
 ```text
-blocking false-positive rate      : 0 / 4   = 0%
+dispute/withdrawal rate           : 0 / 4   = 0%    (no finding was contested or retracted)
+accepted-correction rate          : 4 / 4   = 100%  (every finding was acted on as issued)
 findings citing concrete evidence : 9 / 9   = 100%
 independent re-run of validation  : 5 / 5 runs
 ```
 
-This matters for the recommendation: the gate is **conservative**, and the fix direction is
-*not* "raise strictness" or "widen the checklist" — that would break the deliberate
-`Not Blocking by Default` minimalism in `reviews/common.md`. The gap is where it looks.
+**No blocking false-positive rate is reported here, and none should be inferred from the rows
+above.** Establishing one requires independently adjudicating each finding's truth, which this
+phase did not do. `0/4 disputed` is consistent with four true positives and equally consistent
+with a finding that was simply never contested; this evidence cannot separate those readings.
 
-### F3 — All five missed findings share one archetype (negative-space defects), and §17 states no falsification obligation. Both are DEMONSTRATED; that the missing obligation *caused* the misses is a HYPOTHESIS (H-4). (Core Q2, Q3)
+What *is* demonstrated is evidence discipline in how findings were written: every internal
+Final Review artifact cites `file:line` locations, quotes the diff range it read, and re-runs
+and reports `validate_skills.py` / `unittest discover` / `verify_package.py` /
+`git diff --check` totals itself rather than trusting the Worker's numbers. Non-blocking
+findings issued across the whole corpus: 3 (all in PR #12's Final Review, each carrying the
+same kind of concrete citation and each classified non-blocking).
+
+This bounds the recommendation rather than settling it. The gate issues few blocking findings
+and none of them drew pushback, so this corpus shows **no observed evidence of a noise
+problem** — but it also contains no measurement establishing that the gate is precise, so a
+"0% false positives" guarantee is not available to argue from. The demonstrated gap is recall
+(0/5 external blocking findings on the same heads, F1). The fix direction argued below is
+therefore added *search depth* rather than new blocking criteria — which also leaves the
+deliberate `Not Blocking by Default` minimalism in `reviews/common.md` untouched. The gap is
+where the gate looks.
+
+### F3 — All five missed findings share one archetype (negative-space defects), and §17 states no falsification obligation. Both are DEMONSTRATED; that the missing obligation *caused* the misses is a HYPOTHESIS (H-4), competing on equal evidential footing with a defect-class-specific capability weakness (H-5). (Core Q2, Q3)
 
 **DEMONSTRATED 1 — the archetype.** All five missed external MAJORs are **negative-space**
 defects — a fallback branch, a losing precedence path, an equality case of an inequality claim,
@@ -196,17 +221,19 @@ the places looked.
 files the FR artifact explicitly lists as inspected. M3 sits in the same `SKILL.md` section
 the FR quoted. M1 is in the function the FR named. M5 is in the code path the FR blessed.
 **Scope check** — 5/5 in scope under axes A/C/D/E. No miss is attributable to missing
-evidence or an out-of-scope finding.
+evidence or an out-of-scope finding. Neither check speaks to reviewer *capability*, which
+remains a live candidate cause and is **not** ruled out by anything in this section (H-5,
+below).
 
-**H-4 (HYPOTHESIS — the best-supported one in this report; needs a controlled test) — the
+**H-4 (HYPOTHESIS — the most directly actionable one; needs a controlled test) — the
 affirmative-only search contract.** The explanation joining DEMONSTRATED 1 to DEMONSTRATED 2 is
 that the absence of an explicit falsification obligation is what let each reviewer stop after one
-confirming instance, producing the 5/5 negative-space archetype. This analysis considers it the
-most likely explanation and its most directly actionable one: it is consistent with all five
-misses, it names an editable contract surface, and the competing explanations are individually
-weaker on this corpus (capability is present — the same reviewer channel produced 4 real,
-well-evidenced MAJORs in the same runs, F2; visibility and scope are excluded — 5/5 misses had
-their evidence available and in scope, immediately above). It is nonetheless **not demonstrated**:
+confirming instance, producing the 5/5 negative-space archetype. It is consistent with all five
+misses and it names an editable contract surface, which is why it is the intervention target this
+report proposes measuring first. Two of the alternatives *are* excluded on this corpus —
+visibility and scope, since 5/5 misses had their evidence available and in scope (immediately
+above). Reviewer capability is **not** among the excluded ones (H-5). H-4 is itself **not
+demonstrated**:
 
 - No Final Review *input* spec and no reviewer search procedure is retained for any run in the
   corpus, so nothing in the record shows that any reviewer stopped *because* the checklist asked
@@ -218,11 +245,46 @@ their evidence available and in scope, immediately above). It is nonetheless **n
   failed at `dispatch_input` and were voided (provenance note above); the accepted PASS attempt
   produced no report at all, so its search behaviour is unrecoverable.
 
-Separating the two readings requires the controlled comparison this report proposes rather than
+Separating these readings requires the controlled comparison this report proposes rather than
 performs — a seeded-defect fixture reviewed with and without an explicit falsification obligation
 (Recommended Next Step item 1, enabled by item 2). Until that runs, H-4 is an evidence-supported
 inference, not a settled root cause, and the effectiveness of the intervention it motivates must
 be **measured**, not assumed.
+
+**H-5 (HYPOTHESIS — competing with H-4 and not distinguishable from it on this corpus) — a
+capability weakness specific to this defect class.** The same reviewer channel produced 4
+accepted, concretely-evidenced blocking findings in the same runs (F2), so reviewer capability is
+demonstrably **non-zero in general**. That does not bear on capability for the *specific* class
+that was missed. A reviewer can be strong at reading a stated contract against a stated
+implementation — three of the four accepted internal findings are of that shape — and
+systematically weak at counterexample search over negative-space paths, boundary cases, and
+losing branches. That combination is fully consistent with this corpus and would produce exactly
+the observed pattern: accepted findings in one class, zero overlap with the external channel in
+the other.
+
+**One related observation, recorded as an unknown and non-discriminating between H-4 and H-5.**
+The fourth accepted internal finding — "NaN duration reachable in TIMING_LOG" (#17 attempt 1) —
+*is* a boundary case, so at least one Final Reviewer instance in the corpus did reach into that
+class once. It is recorded here because it is real and bears on what the reviewer channel can do,
+but it does **not** move the evidentiary balance between H-4 and H-5 in either direction. It is a
+single, uncontrolled observation from a different run and a different attempt than any of the
+five misses, and it is compatible with H-4 alone, H-5 alone, or both together: it shows only that
+the channel *could* catch a boundary case once, under conditions that were never held constant
+against the five misses, and it says nothing about whether checklist wording (H-4) or
+defect-class capability (H-5) explains that one catch or those five misses. It is carried as an
+open unknown — what differed between that attempt and the five misses is unretained (F5) — not as
+evidence for or against either hypothesis.
+
+**No controlled comparison across reviewer models or agent assignments was run.** Every
+recoverable Final Review in the corpus used whatever reviewer the run happened to assign; no
+defect was ever reviewed twice under different models or agent profiles. H-4 (a checklist/
+contract gap that permits stopping early) and H-5 (a capability weakness for this defect class)
+therefore predict the same observations here and are **evidentially indistinguishable on this
+corpus**. Neither is ranked above the other on evidence, and they are not mutually exclusive —
+an explicit falsification obligation only helps to the extent the reviewer can execute the
+counterexample search it demands. The seeded-defect fixture in Recommended Next Step item 1 must
+accordingly vary reviewer model / agent assignment as well as the checklist, or it will not
+separate them.
 
 ### F4 — The Final Review did not independently re-derive an accepted DESIGN-Reviewer scope decision, and a cross-phase defect survived it. Why it survived is UNKNOWN. (Core Q4)
 
@@ -361,7 +423,7 @@ two with the best external outcomes. No controlled variation — suggestive, not
 
 | Candidate cause | Verdict | Evidence |
 |---|---|---|
-| Prompt/checklist coverage | **HYPOTHESIS (H-4) — best-supported; needs validation** | DEMONSTRATED: 5/5 misses are negative-space defects, each verified present at the PASSed head by `git show`, and §17's A–I entries are topic labels stating no falsification/search-depth obligation (nor does any `reviews/final_review.md` exist to carry one). NOT DEMONSTRATED: that the missing obligation is what made reviewers stop — no input spec or search procedure is retained, and model/per-attempt variance is not excluded (F3) |
+| Prompt/checklist coverage | **HYPOTHESIS (H-4) — most actionable; not evidentially ranked above H-5; needs validation** | DEMONSTRATED: 5/5 misses are negative-space defects, each verified present at the PASSed head by `git show`, and §17's A–I entries are topic labels stating no falsification/search-depth obligation (nor does any `reviews/final_review.md` exist to carry one). NOT DEMONSTRATED: that the missing obligation is what made reviewers stop — no input spec or search procedure is retained, and neither model/per-attempt variance nor a defect-class capability weakness (H-5) is excluded (F3) |
 | Repo/diff inspection depth | **DEMONSTRATED (depth, not breadth)** | Breadth is good — diffs, file lists, validation all re-run. All 5 misses lie inside files the FR listed as inspected (F3) |
 | Test-evidence inspection | **DEMONSTRATED** | In M5 the *test suite itself encoded the defect*; the retained FR reports read "773 tests OK" as evidence of correctness rather than asking which tests bless which behaviour |
 | Verdict reproducibility / input auditability | **DEMONSTRATED (not on the ticket's candidate list)** | PR #18: three verdicts on one head; the accepted PASS's input spec *and* report are both unretained, so its reasoning cannot be audited now or later (F5) |
@@ -369,7 +431,7 @@ two with the best external outcomes. No controlled variation — suggestive, not
 | Prior-decision anchoring | **HYPOTHESIS (H-1) — needs validation** | Consistent with M5 and with the §11 exclusion, but no retained FR artifact cites D-002-R1 and no input spec survives; independent same-mistake is observationally identical (F4) |
 | Review budget / stopping rule | **HYPOTHESIS (H-2) — needs validation** | `T1 = first PASS completes` is a contract fact and PR #18 completed on a non-reproducible PASS — but no valid FAIL was ever accepted, so no suppression of an accepted contradiction is demonstrated (F5) |
 | Context / spec budget | **HYPOTHESIS — mechanism unknown** | The ~6x shrink and the undocumented `agent_prompt_blocked` limit are demonstrated; because the spec was not retained, whether content loss changed the verdict is undeterminable (F5) |
-| Model capability / agent assignment | **Not supported as primary** | The same reviewer channel produced 4 real, well-evidenced MAJORs elsewhere in the same runs, including two SKILL.md contradictions the external reviewer never found. Capability is present |
+| Model capability / agent assignment | **HYPOTHESIS (H-5) — NOT ruled out; competes with H-4 and is not evidentially distinguishable from it on this corpus** | Capability is demonstrably non-zero *in general*: the same reviewer channel produced 4 accepted, concretely-evidenced blocking findings elsewhere in the same runs, including two SKILL.md contradictions the external reviewer never found. That says nothing about capability for the missed class specifically — strength at contract-contradiction reading is compatible with a systematic weakness at counterexample search over negative-space/boundary/losing-branch paths. No controlled comparison across reviewer models or agent assignments on the same defects was run, so this cannot be separated from H-4 (F3) |
 | Artifact visibility | **Not supported** | 5/5 misses had the evidence available and in scope |
 | Task scope | **Not supported** | 5/5 misses were within §17's stated axes |
 
@@ -436,9 +498,12 @@ the corpus with a clean record.
   `.orca/quality-profile.example.yaml` exists), so only Explicit Requirements + the ANALYSIS
   phase contract + G1–G5 apply.
 - **`reviews/common.md` minimalism is a hard constraint on any future fix.** The
-  `Not Blocking by Default` list and the four-tier decision priority are deliberate and are
-  working (F2: 0% false-positive rate). Any improvement must add *search depth*, not new
-  blocking criteria.
+  `Not Blocking by Default` list and the four-tier decision priority are deliberate design
+  choices in the skill. This corpus shows no evidence of a noise problem against them
+  (F2: dispute/withdrawal rate 0/4, accepted-correction rate 4/4) — but that measures
+  acceptance, not correctness, and is **not** a measured precision guarantee. Any improvement
+  should add *search depth* rather than new blocking criteria, because search depth is where
+  the demonstrated gap is (F1, F3), not because precision has been proven.
 - **External review is a single reviewer channel**, not an independent panel; it is a
   reference standard, not ground truth. Defects neither channel found are invisible to this
   measurement, so all recall figures are upper bounds on the true miss count, never lower.
@@ -446,8 +511,14 @@ the corpus with a clean record.
 ## Risks
 
 - **R-A (high) — Over-correcting into noise.** The obvious reaction to 0% recall is a longer
-  checklist. `reviews/common.md`'s minimalism and the observed 0% false-positive rate say the
-  opposite: broadening blocking criteria would trade a working property for a speculative one.
+  checklist. Two things argue against it, and only one of them is a measurement:
+  `reviews/common.md`'s minimalism is a deliberate design constraint, and the demonstrated gap
+  is recall (0/5, F1) rather than volume — broadening blocking criteria does not address it.
+  Note what is *not* available as an argument here: the gate's precision has never been
+  measured (F2 reports a 0/4 dispute/withdrawal rate and a 4/4 accepted-correction rate, which
+  measure acceptance, not correctness), so "we would lose a proven 0% false-positive rate" is
+  not a claim this evidence supports. The risk is that a broader checklist trades a deliberate
+  design property for a speculative one, with no precision baseline to detect the regression.
 - **R-B (high, DEMONSTRATED) — Non-reproducible verdicts on an unrecorded input.** PR #18
   produced three different verdicts on one head, and the accepted PASS's input spec and report
   are both unretained. The demonstrated consequence is already visible in this ticket: that PASS
@@ -486,6 +557,21 @@ the corpus with a clean record.
   archetype and §17's missing falsification obligation are both demonstrated, but no retained
   record shows that the second produced the first, and H-4 is labelled a hypothesis throughout
   F3, the factor table, and the recommendations.
+- **Unknown — whether reviewer capability contributes to the missed defect class.** No
+  controlled comparison across reviewer models or agent assignments on the same defects exists
+  in the corpus; every recoverable Final Review used whatever reviewer its run assigned.
+  Capability is demonstrably non-zero in general (F2), but a systematic weakness at
+  counterexample search over negative-space / boundary / losing-branch paths is **not ruled
+  out** and predicts the same observations as H-4. H-4 and H-5 are therefore carried as
+  co-equal, evidentially indistinguishable hypotheses (F3, factor table, Recommended Next Step),
+  and neither is ranked above the other on evidence anywhere in this report.
+- **Not adjudicated — the truth of the 4 internal blocking findings.** Each was accepted and
+  corrected, and none was ever disputed or withdrawn, but none has been independently
+  adjudicated against explicit contract or repository behaviour, and the external channel does
+  not corroborate them (zero channel overlap). Accordingly no false-positive rate is reported
+  anywhere in this document; F2 reports a dispute/withdrawal rate (0/4) and an
+  accepted-correction rate (4/4) instead, and every downstream argument uses those terms. Any
+  future claim about the gate's precision requires adjudication work this phase did not do.
 - **Negative check performed, and it settles nothing either way.** `D-002` appears in no Final
   Review artifact (only in `REVIEW_DESIGN_iteration2.md` and `ORCHESTRATOR_LOG.md`). Absence of a
   citation is consistent with both anchoring and independent agreement; it is recorded so a
@@ -507,27 +593,33 @@ PLAN should scope, prioritise, and split the following into a separate Jira back
 should **not** design fixes for all of them, and per the ticket only minimal
 fixture/harness work needed to make this validation repeatable may be implemented in this run.
 
-Items are ranked by **evidential support and the directness of the gap they close**, and every
-item carries its evidence tier. Item 1 is ranked first because the gap it closes is demonstrated
-and is the most directly editable surface in the contract — but its *causal* premise is H-4 and
-must be measured, not assumed. Items 2–3 follow from demonstrated evidence alone. Items 4–6 are
-hypothesis-driven and must be validated before they justify a lifecycle change (Core Q6).
+Items are ranked by **the directness of the demonstrated gap they close and how editable that
+surface is**, and every item carries its evidence tier. Item 1 is ranked first on those grounds
+only — the gap it closes is demonstrated and §17 is the most directly editable surface in the
+contract. That ordering is explicitly **not** a claim that its causal premise (H-4) outranks the
+competing capability hypothesis (H-5); on this corpus the two are evidentially indistinguishable
+(F3), so item 1's premise must be measured, not assumed, and the measurement must be able to
+separate them. Items 2–3 follow from demonstrated evidence alone. Items 4–6 are hypothesis-driven
+and must be validated before they justify a lifecycle change (Core Q6).
 
-### Ranked first — central intervention target (gap DEMONSTRATED, causal premise H-4)
+### Ranked first — most directly editable surface over a DEMONSTRATED gap (causal premise H-4, competing with H-5)
 
 1. **P1 (H-4) — Give the Final Review a falsification obligation.** Two things are demonstrated:
    5/5 misses are negative-space defects, each verified present at the internally-PASSed head,
    and §17's A–I entries are topic labels that state no falsification or search-depth obligation
-   (F3). That the second *caused* the first is **H-4** — the best-supported explanation in this
-   report, but an inference, not an established fact: no reviewer input spec or search procedure
-   is retained and model/per-attempt variance is not excluded. This remains the change with the
-   broadest evidential support and the first PLAN should scope. In scope for PLAN: whether it
-   lands as a new `reviews/final_review.md` policy artifact (closing the asymmetry in Current
-   State item 1) or as §17 text, and how to add depth without touching `Not Blocking by Default`
-   (R-A). **PLAN must pair the change with the controlled measurement that would settle H-4 and
-   size the change's real effect** — a seeded-defect fixture reviewed with and without the
-   obligation, enabled by item 2 — and must state its expected impact as a hypothesis to be
-   measured, not as a proven fix.
+   (F3). That the second *caused* the first is **H-4** — an inference, not an established fact:
+   no reviewer input spec or search procedure is retained, model/per-attempt variance is not
+   excluded, and a capability weakness specific to this defect class (**H-5**) predicts the same
+   observations and is not ruled out. H-4 is scoped first because it names the most directly
+   editable contract surface, **not** because it is better supported than H-5. In scope for PLAN:
+   whether it lands as a new `reviews/final_review.md` policy artifact (closing the asymmetry in
+   Current State item 1) or as §17 text, and how to add depth without touching
+   `Not Blocking by Default` (R-A). **PLAN must pair the change with a controlled measurement
+   that can separate H-4 from H-5 and size the change's real effect** — a seeded-defect fixture
+   reviewed with and without the obligation *and* across at least two reviewer models / agent
+   assignments, enabled by item 2 — and must state its expected impact as a hypothesis to be
+   measured, not as a proven fix. If the fixture varies only the checklist, it cannot attribute
+   any improvement (or its absence) to either hypothesis.
 
 ### Backed by demonstrated evidence
 
@@ -535,9 +627,11 @@ hypothesis-driven and must be validated before they justify a lifecycle change (
    contract (§9) for the FR input spec *and* for each attempt's report, and record/handle the
    `agent_prompt_blocked` size limit rather than silently shrinking the spec (R-D). Demonstrated
    need: PR #18 produced three verdicts on one head with the accepted one's input and report both
-   unretained (F5, R-B). This is also the precondition for validating H-1, H-2 and H-4 at all — on
-   the current record the sharpest causal questions in this ticket are structurally unanswerable,
-   and will stay so.
+   unretained (F5, R-B). This is also the precondition for validating H-1, H-2, H-4 and H-5 at
+   all — on the current record the sharpest causal questions in this ticket are structurally
+   unanswerable, and will stay so. For H-4 vs H-5 specifically, retaining the input spec is
+   necessary but not sufficient: the reviewer model / agent assignment of each attempt must be
+   recorded alongside it, or the two hypotheses stay indistinguishable even in future runs.
 3. **P2 — Add a `Responsible Phase` ladder rung for "a prior phase Reviewer's accepted finding
    was itself wrong."** M5's true owner is D-002-R1, a DESIGN Reviewer's own accepted blocking
    finding, and §17's ladder maps only to IMPLEMENTATION (F4, DEMONSTRATED 3). This is a
@@ -574,4 +668,9 @@ hypothesis-driven and must be validated before they justify a lifecycle change (
 
 No implementation, prompt change, or lifecycle change should be made until PLAN has scoped
 these and the evidence for each item has been accepted — and item 1's causal premise (H-4) along
-with items 4-6 should not be treated as settled root causes at any point in that scoping.
+with items 4-6 should not be treated as settled root causes at any point in that scoping. Two
+guardrails carry through that scoping: H-4 must not be ranked above H-5 (a defect-class-specific
+capability weakness) on evidence, since this corpus cannot separate them; and no argument may
+rest on a measured false-positive rate for the gate, because none exists — F2 measures a
+dispute/withdrawal rate (0/4) and an accepted-correction rate (4/4), which record acceptance,
+not correctness.
