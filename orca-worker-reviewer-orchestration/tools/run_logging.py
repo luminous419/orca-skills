@@ -31,8 +31,14 @@ Standard library only, like every other module in scripts/.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
+import os
+import re
+import secrets
+import shutil
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -835,6 +841,1298 @@ class RunTimingTracker:
             return
 
 
+# ---- OS-22: the Final Review per-dispatch audit record family ---------------------
+# Section 1 of OS-22 asks for a per-dispatch record of what the Final Adversarial
+# Reviewer was actually handed and what it actually produced, retained independently
+# of any summary, never overwritten by a retry, and carrying an explicit schema
+# version. Section 2 asks that adding it change nothing about the dispatched input.
+#
+# Both are properties of WHERE this code runs, not of how carefully it is written:
+# every capture source below is a CLI read that cannot answer before the dispatch
+# exists, so nothing here is reachable from the spec-assembly -> dispatch edge. That
+# is what makes the neutrality claim structural
+# (scripts/fixtures/os22_neutrality/README.md) rather than an argument.
+#
+# It lives in this module, next to the other run-scoped writers, because this file is
+# the one that already ships into an installed Skill as tools/run_logging.py. A new
+# module would have to be added to release_manifest.py's required_skill_paths(); a
+# function here rides the parity rule that already exists.
+
+FINAL_REVIEW_AUDIT_SCHEMA_VERSION = "1.0"
+FINAL_REVIEW_REDACTION_POLICY_VERSION = "redaction/1.0"
+FINAL_REVIEW_EXPORT_SCHEMA_VERSION = "1.0"
+
+FINAL_REVIEW_AUDIT_DIRNAME = "final_review_audit"
+# A sibling of the published directories, INSIDE final_review_audit/, so staging and
+# the rename target are on the same filesystem by construction and os.rename() can
+# never degrade into a copy or an EXDEV.
+FINAL_REVIEW_AUDIT_STAGING_DIRNAME = ".staging"
+FINAL_REVIEW_AUDIT_RECORD_KIND = "final_review_dispatch_audit"
+FINAL_REVIEW_AUDIT_RECORD_FILENAME = "record.json"
+FINAL_REVIEW_AUDIT_INPUT_FILENAME = "input.md"
+FINAL_REVIEW_AUDIT_REPORT_FILENAME = "report.md"
+FINAL_REVIEW_AUDIT_FILENAMES = (
+    FINAL_REVIEW_AUDIT_INPUT_FILENAME,
+    FINAL_REVIEW_AUDIT_REPORT_FILENAME,
+    FINAL_REVIEW_AUDIT_RECORD_FILENAME,
+)
+FINAL_REVIEW_EVIDENCE_BUNDLE_FILENAME = "FINAL_REVIEW_EVIDENCE_BUNDLE.json"
+
+# `unknown` is a MEMBER of the state set, not a separate absence-state: an absent
+# field, an unparseable record, an unknown MAJOR and a literal "unknown" all read as
+# unknown, through one state machine. Nothing anywhere defaults to `accepted`.
+PROVENANCE_ACCEPTED = "accepted"
+PROVENANCE_VOIDED = "voided"
+PROVENANCE_UNKNOWN = "unknown"
+PROVENANCE_STATES = (PROVENANCE_ACCEPTED, PROVENANCE_VOIDED, PROVENANCE_UNKNOWN)
+
+VOID_REASONS = (
+    "dispatch_input_rejected",       # the dispatch was refused at input
+    "dispatch_capability_invalid",   # the dispatch capability was refused
+    "settlement_failure",            # dispatched, never reached a settled outcome
+    "report_missing",                # settled, no report artifact at the resolved path
+    "report_malformed",              # settled with a report that fails the contract parse
+    "superseded_by_retry",           # a later dispatch of the SAME attempt was acted on
+)
+
+SETTLEMENT_STATES = ("settled", "not_settled", "unknown")
+
+# Which of the three ways the writer arrived at the report path it read. Recorded
+# rather than assumed, because task_context.phase_artifact_contract() hands every
+# attempt the same unsuffixed FINAL_REVIEW.md on the real dispatch path while
+# section 9's ladder suffixes attempt N>=2 -- a deferred conformance defect that this
+# field makes visible as data in every run instead of silently absorbing.
+REPORT_RESOLUTIONS = ("explicit", "ladder", "fallback_unsuffixed")
+REPORT_CAPTURE_STATUSES = ("captured", "absent", "unreadable")
+CAPTURE_STATUSES = ("captured", "unavailable")
+PARSE_STATUSES = ("ok", "malformed", "not_attempted")
+RECORD_READ_STATUSES = ("ok", "unknown_major", "malformed", "missing")
+INPUT_ALTERED_VALUES = ("yes", "no", "unknown")
+
+# The exact CLI reads the two capture sources are, carried in the record so a reader
+# never has to guess which surface a value came from. The `--preamble` field is
+# deliberately absent from both: it is re-rendered against reader state at read time
+# and has been observed carrying the wrong coordinator handle and no capability
+# material at all, so it is not evidence of what was delivered.
+CAPTURE_STORED_TASK_SPEC_SOURCE = (
+    "orca orchestration task-list --run <run_id> --json"
+)
+CAPTURE_DELIVERY_EVIDENCE_SOURCE = (
+    "orca orchestration dispatch-show --task <task_id> --json"
+)
+CAPTURE_TIMEOUT_SECONDS = 30
+CAPTURE_DISABLED_ERROR = "capture disabled by the caller (--no-capture)"
+
+# A.2's filename grammar. A leading dot is rejected, which is the second of the two
+# independent reasons `.staging/` can never be read as a published record.
+_DISPATCH_KEY_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+_DISPATCH_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+
+# The ORCHESTRATOR_LOG event vocabulary this feature adds. `--event` has no `choices`
+# by design, so these are new VALUES in an already-open vocabulary: no new column, no
+# schema change, and the section 9 log-to-record join is on task_id/dispatch_id,
+# columns that already exist.
+EVENT_AUDIT_WRITTEN = "final_review_audit_written"
+EVENT_AUDIT_INCOMPLETE = "final_review_audit_incomplete"
+EVENT_AUDIT_COLLISION = "final_review_audit_collision"
+EVENT_AUDIT_WRITE_FAILED = "final_review_audit_write_failed"
+EVENT_AUDIT_INCOMPLETE_PUBLICATION = "final_review_audit_incomplete_publication"
+
+
+class FinalReviewAuditError(RunLoggingError):
+    """Base for every refusal this family raises."""
+
+
+class FinalReviewAuditCollision(FinalReviewAuditError):
+    """A record for this dispatch key is already published. Never an overwrite.
+
+    Correcting a record means writing a NEW record under a new dispatch key, which
+    is exactly what a retry already produces. There is no force, no --overwrite and
+    no update function anywhere in this module.
+    """
+
+    def __init__(self, dispatch_key: str, published_path: Path) -> None:
+        super().__init__(
+            f"a final review audit record for {dispatch_key!r} is already published "
+            f"at {published_path}; a published record is never overwritten"
+        )
+        self.dispatch_key = dispatch_key
+        self.published_path = published_path
+
+
+class FinalReviewAuditWriteFailed(FinalReviewAuditError):
+    """Staging or publication raised OSError. NOTHING was published.
+
+    A published <dispatch_key>/ directory only ever appears via one os.rename() of a
+    fully written, fsynced staging directory, so a failure here can never leave a
+    half-record behind and can never block the same dispatch key from publishing on
+    a later attempt.
+    """
+
+    def __init__(self, dispatch_key: str, boundary: str, error: BaseException) -> None:
+        super().__init__(
+            f"final review audit record {dispatch_key!r} was not published: "
+            f"failed at {boundary}: {error}"
+        )
+        self.dispatch_key = dispatch_key
+        self.boundary = boundary
+
+
+# ---- digests ---------------------------------------------------------------------
+# The algorithm travels with the value, so a future algorithm change is a visible
+# reinterpretation rather than a silent one.
+
+
+def sha256_text(text: str) -> str:
+    """sha256 of the exact string, UTF-8 encoded, with NO normalization."""
+    return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def sha256_bytes(data: bytes) -> str:
+    return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+# ---- redaction policy v1.0 -------------------------------------------------------
+# Order is part of the policy, not an implementation detail: a dcap_ token inside an
+# environment assignment is redacted and counted by orca_dispatch_capability, not by
+# env_secret_pattern, because the first pass has already replaced it. Declaring the
+# order is what makes the counts reproducible.
+REDACTION_CATEGORIES = (
+    (
+        "orca_dispatch_capability",
+        re.compile(r"\bdcap_[A-Za-z0-9_\-]{8,}"),
+        "<REDACTED:orca_dispatch_capability>",
+    ),
+    (
+        "url_credential",
+        re.compile(r"\b([A-Za-z][A-Za-z0-9+.\-]*)://[^\s/@:]+:[^\s/@]+@"),
+        r"\1://<REDACTED:url_credential>@",
+    ),
+    (
+        "env_secret_pattern",
+        re.compile(
+            r"(?i)\b([A-Z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|API_?KEY|PRIVATE_KEY"
+            r"|ACCESS_KEY)[A-Z0-9_]*)\s*([=:])\s*(\"[^\"\n]*\"|'[^'\n]*'|[^\s\n]+)"
+        ),
+        r"\1\2<REDACTED:env_secret_pattern>",
+    ),
+    (
+        # Only the user-name segment is replaced: the /Users/ prefix and everything
+        # after the segment survive, so the path stays semantically readable while
+        # the identifying part is gone. The (?!<|\{) lookahead is the same one
+        # validate_skills.py uses, so an already-placeheld /Users/<name>/ is not
+        # double-redacted. Windows C:\Users\<name> is deliberately NOT in v1.0:
+        # COMPATIBILITY.md claims no Windows support for the runtime path, and an
+        # untested pattern is worse than a stated gap. It is a MINOR-bump candidate.
+        "absolute_local_path",
+        re.compile(r"(/Users/|/home/|/root/)(?!<|\{)[^/\s\"'`,;:)\]}]+"),
+        r"\1<REDACTED:absolute_local_path>",
+    ),
+)
+
+
+def redact_text(
+    text: str, *, policy_version: str = FINAL_REVIEW_REDACTION_POLICY_VERSION
+) -> tuple[str, tuple[dict[str, int], ...]]:
+    """Deterministic. A pure function of (text, policy_version).
+
+    No randomness, no salt, no clock, no environment, no filesystem, no
+    path-dependent state: the same input under the same policy produces byte-identical
+    output and an identical `redactions` list on any machine, in any process, at any
+    time. That determinism is what makes "redaction 전후 identity 검증 가능" a testable
+    property when the raw bytes are deliberately never retained -- re-running the
+    pipeline on the same source reproduces both digests and the same counts.
+
+    An unknown policy_version raises rather than silently falling back: a digest is
+    only comparable against a digest produced by the SAME policy.
+
+    The returned list carries an entry only for a category that matched at least
+    once, in policy order, so `[]` unambiguously means "nothing was substituted".
+    It carries NO offsets and NO per-occurrence digest: offsets plus the retained
+    text localize the removed value and reveal its length, which is a leak channel
+    the category+count form does not have. Adding either later is an additive MINOR
+    bump.
+    """
+    if policy_version != FINAL_REVIEW_REDACTION_POLICY_VERSION:
+        raise RunLoggingError(
+            f"unknown redaction policy version {policy_version!r}; expected "
+            f"{FINAL_REVIEW_REDACTION_POLICY_VERSION!r} -- a digest produced under an "
+            "unknown policy is not comparable to anything"
+        )
+    out = text
+    counts: list[dict[str, int]] = []
+    for name, pattern, replacement in REDACTION_CATEGORIES:
+        out, hits = pattern.subn(replacement, out)
+        if hits:
+            counts.append({"category": name, "count": hits})
+    return out, tuple(counts)
+
+
+# ---- capture: post-dispatch reads, and nothing else -------------------------------
+# This module cannot import from scripts/ (see the module docstring), so it resolves
+# the CLI command the same way it already re-implements _ensure_run_artifact_root():
+# the same ORCA_CLI_COMMAND environment variable orca_runtime_harness.py reads.
+#
+# Captured text arrives on the subprocess's stdout PIPE -- never through a file, never
+# through an argument, never through an environment variable -- is parsed in memory,
+# redacted in memory, and only the redacted form is written. That deletes the leak
+# class rather than mitigating it.
+
+
+def _orca_command() -> str:
+    return os.environ.get("ORCA_CLI_COMMAND", "orca")
+
+
+def _run_orca_json(args: tuple[str, ...]) -> tuple[Any, str]:
+    """`(payload, error)`. Never raises: every failure funnels into `error`.
+
+    A record that says "the input could not be captured, and here is exactly why"
+    is evidence. A missing record is not.
+    """
+    try:
+        completed = subprocess.run(
+            [_orca_command(), *args],
+            capture_output=True,
+            text=True,
+            timeout=CAPTURE_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except FileNotFoundError:
+        return None, f"{_orca_command()!r} was not found on PATH"
+    except subprocess.TimeoutExpired:
+        return None, f"timed out after {CAPTURE_TIMEOUT_SECONDS}s"
+    except OSError as error:
+        return None, f"could not run the capture command: {error}"
+    if completed.returncode != 0:
+        stderr = (completed.stderr or "").strip().replace("\n", " ")[:400]
+        return None, f"exit {completed.returncode}: {stderr}"
+    try:
+        return json.loads(completed.stdout), ""
+    except (json.JSONDecodeError, TypeError) as error:
+        return None, f"unparseable JSON on stdout: {error}"
+
+
+def _unwrap(payload: Any, key: str) -> Any:
+    """Read `key` out of a payload that may or may not be wrapped in `result`."""
+    if isinstance(payload, dict):
+        if key in payload:
+            return payload[key]
+        result = payload.get("result")
+        if isinstance(result, dict) and key in result:
+            return result[key]
+    return None
+
+
+def capture_stored_task_spec(run_id: str, task_id: str) -> tuple[str | None, str]:
+    """The spec Orca STORED for this Task, read back after the dispatch.
+
+    Returns `(spec, "")` or `(None, reason)`. This is deliberately the stored spec
+    and not the delivered bytes -- Orca exposes no read-back of what the terminal
+    received -- and the record says so in a field of its own rather than only in
+    prose, so no reader can mistake one for the other.
+    """
+    payload, error = _run_orca_json(
+        ("orchestration", "task-list", "--run", run_id, "--json")
+    )
+    if payload is None:
+        return None, error
+    tasks = _unwrap(payload, "tasks")
+    if tasks is None and isinstance(payload, list):
+        tasks = payload
+    if not isinstance(tasks, list):
+        return None, "no task list in the capture response"
+    for task in tasks:
+        if isinstance(task, dict) and task.get("id") == task_id:
+            spec = task.get("spec")
+            if not isinstance(spec, str):
+                return None, f"task {task_id} carries no spec string"
+            return spec, ""
+    return None, f"task {task_id} is not in run {run_id}'s task list"
+
+
+def capture_delivery_evidence(task_id: str) -> tuple[dict | None, str]:
+    """The dispatch record for this Task: delivery evidence, separate from the spec.
+
+    `preamble` is never read. It is re-rendered against reader state and has been
+    observed naming the wrong coordinator handle and omitting capability material
+    entirely, so it is not evidence of what was delivered.
+    """
+    payload, error = _run_orca_json(
+        ("orchestration", "dispatch-show", "--task", task_id, "--json")
+    )
+    if payload is None:
+        return None, error
+    dispatch = _unwrap(payload, "dispatch")
+    if not isinstance(dispatch, dict):
+        return None, "no dispatch object in the capture response"
+    return dispatch, ""
+
+
+def _capture_repository_state() -> dict | None:
+    """`{head_commit, branch, dirty}` or None when git is unavailable."""
+
+    def _git(*args: str) -> str | None:
+        try:
+            completed = subprocess.run(
+                ["git", *args],
+                capture_output=True,
+                text=True,
+                timeout=CAPTURE_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+            return None
+        if completed.returncode != 0:
+            return None
+        return completed.stdout.rstrip("\n")
+
+    head = _git("rev-parse", "HEAD")
+    if head is None:
+        return None
+    status = _git("status", "--porcelain")
+    return {
+        "head_commit": head,
+        "branch": _git("rev-parse", "--abbrev-ref", "HEAD") or "",
+        "dirty": bool(status),
+    }
+
+
+# ---- report resolution and parsing ------------------------------------------------
+
+
+def final_review_report_ladder_path(
+    run_id: str, attempt: int, *, base: Path | None = None
+) -> Path:
+    """Section 9's ladder: attempt 1 unsuffixed, attempt N>=2 _iteration<N>."""
+    if attempt < 1:
+        raise RunLoggingError(f"final_review_attempt must be >= 1, got {attempt!r}")
+    suffix = "" if attempt == 1 else f"_iteration{attempt}"
+    return _ensure_run_artifact_root(run_id, base=base) / f"FINAL_REVIEW{suffix}.md"
+
+
+def resolve_final_review_report(
+    run_id: str,
+    attempt: int,
+    *,
+    base: Path | None = None,
+    report_path: str | Path | None = None,
+) -> tuple[Path, str]:
+    """`(path, resolution)` -- which of REPORT_RESOLUTIONS produced it."""
+    if report_path:
+        return Path(report_path), "explicit"
+    laddered = final_review_report_ladder_path(run_id, attempt, base=base)
+    if laddered.exists():
+        return laddered, "ladder"
+    unsuffixed = final_review_report_ladder_path(run_id, 1, base=base)
+    if attempt > 1 and unsuffixed.exists():
+        return unsuffixed, "fallback_unsuffixed"
+    return laddered, "ladder"
+
+
+_RESULT_LINE = re.compile(r"^RESULT:\s*(.+?)\s*$", re.MULTILINE)
+_REVIEW_VERDICT_LINE = re.compile(r"^REVIEW_VERDICT:\s*(.+?)\s*$", re.MULTILINE)
+_FINDING_ID_LINE = re.compile(r"^ID:\s*(\S+)\s*$", re.MULTILINE)
+_BLOCKING_LINE = re.compile(r"^Blocking:\s*(YES|NO)\s*$", re.MULTILINE)
+RESULT_VALUES = ("PASS", "FAIL")
+REVIEW_VERDICT_VALUES = ("PASS", "PASS WITH NOTES", "FAIL", "BLOCKED")
+
+
+def parse_final_review_report(text: str) -> dict:
+    """The section 11/17 shape, copied VERBATIM -- never re-derived, never collapsed.
+
+    `RESULT:` stays two-valued and `REVIEW_VERDICT:` stays four-valued: both are
+    carried through as the report wrote them, so nothing here can turn a
+    `PASS WITH NOTES` into a `PASS` or a `BLOCKED` into a `FAIL`.
+    """
+    parsed: dict[str, Any] = {
+        "parse_status": "ok",
+        "parse_error": "",
+        "result": "",
+        "review_verdict": "",
+        "blocking_finding_ids": [],
+        "non_blocking_finding_ids": [],
+    }
+    result = _RESULT_LINE.search(text)
+    if result is None:
+        parsed["parse_status"] = "malformed"
+        parsed["parse_error"] = "no RESULT: line"
+        return parsed
+    parsed["result"] = result.group(1)
+    if parsed["result"] not in RESULT_VALUES:
+        parsed["parse_status"] = "malformed"
+        parsed["parse_error"] = (
+            f"RESULT: {parsed['result']!r} is not one of {RESULT_VALUES}"
+        )
+        return parsed
+    verdict = _REVIEW_VERDICT_LINE.search(text)
+    if verdict is not None:
+        parsed["review_verdict"] = verdict.group(1)
+        if parsed["review_verdict"] not in REVIEW_VERDICT_VALUES:
+            parsed["parse_status"] = "malformed"
+            parsed["parse_error"] = (
+                f"REVIEW_VERDICT: {parsed['review_verdict']!r} is not one of "
+                f"{REVIEW_VERDICT_VALUES}"
+            )
+            return parsed
+    blocking: list[str] = []
+    non_blocking: list[str] = []
+    matches = list(_FINDING_ID_LINE.finditer(text))
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        block = text[match.end():end]
+        flag = _BLOCKING_LINE.search(block)
+        if flag is not None and flag.group(1) == "YES":
+            blocking.append(match.group(1))
+        elif flag is not None:
+            non_blocking.append(match.group(1))
+    parsed["blocking_finding_ids"] = blocking
+    parsed["non_blocking_finding_ids"] = non_blocking
+    return parsed
+
+
+# ---- paths, keys, and the crash-safe publication protocol --------------------------
+
+
+def final_review_audit_dir(run_id: str, *, base: Path | None = None) -> Path:
+    """artifacts/runs/<run_id>/final_review_audit/, provisioning the run root.
+
+    A subdirectory rather than flat files under <ARTIFACT_ROOT>: section 9's artifact
+    ladder assigns meaning to that flat namespace (<PHASE>.md, REVIEW_<PHASE>.md,
+    FINAL_REVIEW*.md) and the `FINAL_REVIEW*` glob section 16 names must not start
+    matching audit files.
+    """
+    return _ensure_run_artifact_root(run_id, base=base) / FINAL_REVIEW_AUDIT_DIRNAME
+
+
+def final_review_dispatch_key(
+    final_review_attempt: int, task_id: str, dispatch_id: str = ""
+) -> str:
+    """`attempt<N>__<task_id>__<dispatch_id or nodispatch>`, validated fail-closed.
+
+    The attempt leads so `ls` sorts by attempt and the attempt GROUPING is visible
+    without opening a file; both ids appear because the identity tuple is
+    (run_id, final_review_attempt, task_id, dispatch_id) and run_id is already the
+    directory. `nodispatch` covers a pre-dispatch failure, where no dispatch id
+    exists at all.
+
+    Attempt grouping is nonetheless always derived by readers from the record's own
+    `final_review_attempt` field, never from this filename: section 1 forbids a
+    consumer depending on filename convention. This is a convenience for humans.
+    """
+    if not isinstance(final_review_attempt, int) or isinstance(
+        final_review_attempt, bool
+    ):
+        raise RunLoggingError(
+            f"final_review_attempt must be an int >= 1, got "
+            f"{final_review_attempt!r}"
+        )
+    if final_review_attempt < 1:
+        raise RunLoggingError(
+            f"final_review_attempt must be >= 1, got {final_review_attempt!r}"
+        )
+    dispatch = dispatch_id or "nodispatch"
+    for label, component in (("task_id", task_id), ("dispatch_id", dispatch)):
+        if not component or not _DISPATCH_KEY_COMPONENT.match(component):
+            raise RunLoggingError(
+                f"{label} must match {_DISPATCH_KEY_COMPONENT.pattern} and be "
+                f"non-empty, got {component!r}; a dispatch key is a directory name "
+                "and is validated before any file is touched"
+            )
+    return f"attempt{final_review_attempt}__{task_id}__{dispatch}"
+
+
+def _fsync_directory(path: Path) -> None:
+    """Best effort. Durability is a strengthening here, never a precondition."""
+    try:
+        handle = os.open(str(path), os.O_RDONLY)
+    except (OSError, AttributeError):
+        return
+    try:
+        os.fsync(handle)
+    except (OSError, AttributeError):
+        pass
+    finally:
+        try:
+            os.close(handle)
+        except OSError:
+            pass
+
+
+def _write_staged_file(path: Path, text: str) -> None:
+    with open(path, "x", encoding="utf-8") as handle:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _stage_and_publish_audit_record(
+    audit_dir: Path, dispatch_key: str, files: dict[str, str]
+) -> Path:
+    """Stage three files, then publish them with ONE atomic rename.
+
+    Never overwrites. Never mutates a published record. A failure at any write
+    boundary leaves NO published record and never blocks a later attempt for the
+    same dispatch key.
+
+    An earlier design prechecked the three final paths and then created them
+    sequentially with open(path, "x"). That is not recoverable: an OSError after
+    input.md exists but before record.json does leaves a surviving file every later
+    attempt reads as a permanent collision, so that dispatch could never acquire a
+    complete record -- and three separate creates are not atomic with respect to
+    each other anyway.
+
+    The reader rule this buys: a published directory IS a complete record. That name
+    only ever appears via the rename below, of a fully written and fsynced staging
+    directory, so existence and completeness are the same fact and no reader needs an
+    "is it finished yet?" heuristic.
+    """
+    published = audit_dir / dispatch_key
+    if published.exists():
+        raise FinalReviewAuditCollision(dispatch_key, published)
+    staging_root = audit_dir / FINAL_REVIEW_AUDIT_STAGING_DIRNAME
+    staging_dir = staging_root / f"{dispatch_key}.{os.getpid()}-{secrets.token_hex(4)}"
+    boundary = "makedirs:staging_root"
+    try:
+        os.makedirs(staging_root, exist_ok=True)
+        boundary = "mkdir:staging_dir"
+        # os.mkdir is exclusive by definition, so two concurrent writers cannot
+        # share one staging directory.
+        os.mkdir(staging_dir)
+        for name in FINAL_REVIEW_AUDIT_FILENAMES:
+            boundary = f"write:{name}"
+            _write_staged_file(staging_dir / name, files[name])
+        boundary = "fsync:staging_dir"
+        _fsync_directory(staging_dir)
+        boundary = "rename"
+        # NOT os.replace: replace would overwrite. rename onto an existing
+        # non-empty directory fails, which is the immutability guarantee obtained
+        # atomically rather than by a precheck that races.
+        os.rename(staging_dir, published)
+    except OSError as error:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        if boundary == "rename" and published.exists():
+            raise FinalReviewAuditCollision(dispatch_key, published) from error
+        raise FinalReviewAuditWriteFailed(dispatch_key, boundary, error) from error
+    _fsync_directory(audit_dir)
+    return published
+
+
+def sweep_final_review_audit_staging(
+    run_id: str, *, base: Path | None = None
+) -> list[dict]:
+    """Classify every abandoned `.staging/` entry. Reported, never silently dropped.
+
+    A staged copy whose record HAS since published is redundant scratch and is
+    removed -- the bytes survive at the final path. A staged copy with no published
+    record is RETAINED, because it is the only surviving evidence of that attempt,
+    and is returned so the caller can log it and the export bundle can carry it.
+
+    This is not a deletion path for run artifacts. No published record, no log, no
+    bundle and no phase artifact is ever removed by anything in this module.
+    """
+    audit_dir = final_review_audit_dir(run_id, base=base)
+    staging_root = audit_dir / FINAL_REVIEW_AUDIT_STAGING_DIRNAME
+    if not staging_root.is_dir():
+        return []
+    incomplete: list[dict] = []
+    for entry in sorted(staging_root.iterdir()):
+        if not entry.is_dir():
+            continue
+        dispatch_key = entry.name.rsplit(".", 1)[0]
+        if (audit_dir / dispatch_key).is_dir():
+            shutil.rmtree(entry, ignore_errors=True)
+            continue
+        present = [name for name in FINAL_REVIEW_AUDIT_FILENAMES if (entry / name).exists()]
+        incomplete.append(
+            {
+                "dispatch_key": dispatch_key,
+                "staging_dir": entry.name,
+                "files_present": present,
+                "files_absent": [
+                    name for name in FINAL_REVIEW_AUDIT_FILENAMES if name not in present
+                ],
+            }
+        )
+    return incomplete
+
+
+# ---- the writer -------------------------------------------------------------------
+
+
+def _relative_artifact_path(path: Path, root: Path) -> str:
+    """A POSIX path relative to <ARTIFACT_ROOT> when it is under it, else redacted.
+
+    record.json is retained evidence too, so a path that cannot be relativized goes
+    through the same redaction policy the two .md artifacts do rather than carrying
+    a developer's home directory into the record.
+    """
+    try:
+        return path.resolve().relative_to(root.resolve()).as_posix()
+    except (ValueError, OSError):
+        return redact_text(path.as_posix())[0]
+
+
+def _validate_provenance(
+    provenance_state: str, void_reason: str, settlement_state: str
+) -> None:
+    """Fail-closed, in every direction. No default anywhere is `accepted`."""
+    if provenance_state not in PROVENANCE_STATES:
+        raise RunLoggingError(
+            f"unknown provenance_state {provenance_state!r}; expected one of "
+            f"{PROVENANCE_STATES}"
+        )
+    if provenance_state == PROVENANCE_VOIDED and not void_reason:
+        raise RunLoggingError(
+            "provenance_state 'voided' requires a void_reason; a voided record that "
+            "does not say why is not evidence"
+        )
+    if provenance_state != PROVENANCE_VOIDED and void_reason:
+        raise RunLoggingError(
+            f"void_reason {void_reason!r} is only meaningful with "
+            "provenance_state 'voided'"
+        )
+    if void_reason and void_reason not in VOID_REASONS:
+        raise RunLoggingError(
+            f"unknown void_reason {void_reason!r}; expected one of {VOID_REASONS}"
+        )
+    if settlement_state not in SETTLEMENT_STATES:
+        raise RunLoggingError(
+            f"unknown settlement_state {settlement_state!r}; expected one of "
+            f"{SETTLEMENT_STATES}"
+        )
+
+
+def _capture_input_section(
+    run_id: str, task_id: str, *, capture: bool
+) -> tuple[dict, str]:
+    """`(section, redacted_text)` for the retained input. Raw bytes stay local."""
+    section: dict[str, Any] = {
+        "source": CAPTURE_STORED_TASK_SPEC_SOURCE,
+        "capture_status": "unavailable",
+        "capture_error": CAPTURE_DISABLED_ERROR if not capture else "",
+        "captured_at": now_iso(),
+        # DEC-1's honest limit, carried in the artifact rather than only in prose:
+        # Orca exposes no read-back of the bytes the terminal received, so this is
+        # the STORED spec and the record says so in a field of its own.
+        "is_stored_spec_not_delivered_bytes": True,
+        "byte_length_pre_redaction": None,
+        "input_digest_pre_redaction": None,
+        "redaction_policy_version": FINAL_REVIEW_REDACTION_POLICY_VERSION,
+        "artifact_path": "",
+        "artifact_digest_post_redaction": None,
+        "byte_length_post_redaction": None,
+        "redactions": [],
+    }
+    if not capture:
+        return section, ""
+    raw, error = capture_stored_task_spec(run_id, task_id)
+    if raw is None:
+        section["capture_error"] = error
+        return section, ""
+    section["capture_status"] = "captured"
+    section["byte_length_pre_redaction"] = len(raw.encode("utf-8"))
+    section["input_digest_pre_redaction"] = sha256_text(raw)
+    redacted, counts = redact_text(raw)
+    section["redactions"] = [dict(entry) for entry in counts]
+    section["byte_length_post_redaction"] = len(redacted.encode("utf-8"))
+    section["artifact_digest_post_redaction"] = sha256_text(redacted)
+    del raw
+    return section, redacted
+
+
+def _capture_report_section(
+    path: Path, resolution: str, root: Path
+) -> tuple[dict, str]:
+    section: dict[str, Any] = {
+        "contract_path": _relative_artifact_path(path, root),
+        "resolution": resolution,
+        "capture_status": "absent",
+        "capture_error": "",
+        "captured_at": now_iso(),
+        "byte_length_pre_redaction": None,
+        "report_digest_pre_redaction": None,
+        "redaction_policy_version": FINAL_REVIEW_REDACTION_POLICY_VERSION,
+        "artifact_path": "",
+        "artifact_digest_post_redaction": None,
+        "byte_length_post_redaction": None,
+        "redactions": [],
+        "parsed": {
+            "parse_status": "not_attempted",
+            "parse_error": "",
+            "result": "",
+            "review_verdict": "",
+            "blocking_finding_ids": [],
+            "non_blocking_finding_ids": [],
+        },
+    }
+    if not path.exists():
+        section["capture_error"] = f"no report at {section['contract_path']}"
+        return section, ""
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        section["capture_status"] = "unreadable"
+        section["capture_error"] = str(error)
+        return section, ""
+    section["capture_status"] = "captured"
+    section["byte_length_pre_redaction"] = len(raw.encode("utf-8"))
+    section["report_digest_pre_redaction"] = sha256_text(raw)
+    # A report can quote a path or a command line, so it is redacted under the same
+    # policy version the input is.
+    redacted, counts = redact_text(raw)
+    section["redactions"] = [dict(entry) for entry in counts]
+    section["byte_length_post_redaction"] = len(redacted.encode("utf-8"))
+    section["artifact_digest_post_redaction"] = sha256_text(redacted)
+    # The malformed bytes are the evidence: the raw report is snapshotted whatever
+    # the parse says about it.
+    section["parsed"] = parse_final_review_report(raw)
+    del raw
+    return section, redacted
+
+
+def _delivery_section(evidence: dict | None, error: str) -> dict:
+    section: dict[str, Any] = {
+        "source": CAPTURE_DELIVERY_EVIDENCE_SOURCE,
+        "capture_status": "captured" if evidence is not None else "unavailable",
+        "capture_error": "" if evidence is not None else error,
+        "captured_at": now_iso(),
+        # The one field that says what was NOT used, and why the record is honest
+        # about it: `preamble` is re-rendered against reader state.
+        "preamble_captured": False,
+    }
+    if evidence is None:
+        return section
+    section.update(
+        {
+            "dispatch_status": evidence.get("status"),
+            "contract_version": evidence.get("contract_version"),
+            "dispatched_at": evidence.get("dispatched_at"),
+            "completed_at": evidence.get("completed_at"),
+            # A hash, never the dcap_ token itself.
+            "capability_hash": evidence.get("capability_hash"),
+            "capability_revoked_at": evidence.get("capability_revoked_at"),
+            "assignee_handle": evidence.get("assignee_handle"),
+            "process_incarnation": evidence.get("process_incarnation"),
+            "failure_count": evidence.get("failure_count"),
+            "last_failure": evidence.get("last_failure"),
+            "termination_reason": evidence.get("termination_reason"),
+        }
+    )
+    return section
+
+
+def write_final_review_audit_record(
+    run_id: str,
+    *,
+    final_review_attempt: int,
+    task_id: str,
+    dispatch_id: str = "",
+    base: Path | None = None,
+    provenance_state: str = PROVENANCE_UNKNOWN,
+    void_reason: str = "",
+    settlement_state: str = "unknown",
+    reviewer_terminal: str = "",
+    reviewer_agent_command: str = "",
+    reviewer_agent_origin: str = "",
+    report_path: str | Path | None = None,
+    failure_detail: str = "",
+    observed_input_bytes: int | None = None,
+    input_altered_across_retry: str = "unknown",
+    notes: str = "",
+    capture: bool = True,
+    recorded_at: str | None = None,
+) -> Path:
+    """Write ONE immutable per-dispatch Final Review audit record. Returns its dir.
+
+    `provenance_state` defaults to `unknown`, so a caller that forgets it produces a
+    fail-closed record rather than an `accepted` one. There is no code path in this
+    module that yields `accepted` from anything but a record that literally carries
+    it.
+
+    The record is complete when it is written and is never edited: every row of the
+    provenance ladder is determinable at settlement time, which is what makes
+    immutability and provenance compatible. Correcting a record means writing a new
+    record under a new dispatch key -- which is what a retry already produces.
+    """
+    _validate_provenance(provenance_state, void_reason, settlement_state)
+    if input_altered_across_retry not in INPUT_ALTERED_VALUES:
+        raise RunLoggingError(
+            f"input_altered_across_retry must be one of {INPUT_ALTERED_VALUES}, got "
+            f"{input_altered_across_retry!r}"
+        )
+    dispatch_key = final_review_dispatch_key(
+        final_review_attempt, task_id, dispatch_id
+    )
+    root = _ensure_run_artifact_root(run_id, base=base)
+    audit_dir = root / FINAL_REVIEW_AUDIT_DIRNAME
+
+    input_section, input_text = _capture_input_section(
+        run_id, task_id, capture=capture
+    )
+    if capture:
+        evidence, evidence_error = capture_delivery_evidence(task_id)
+    else:
+        evidence, evidence_error = None, CAPTURE_DISABLED_ERROR
+    delivery_section = _delivery_section(evidence, evidence_error)
+    resolved_report, resolution = resolve_final_review_report(
+        run_id, final_review_attempt, base=base, report_path=report_path
+    )
+    report_section, report_text = _capture_report_section(
+        resolved_report, resolution, root
+    )
+    relative = f"{FINAL_REVIEW_AUDIT_DIRNAME}/{dispatch_key}"
+    if input_section["capture_status"] == "captured":
+        input_section["artifact_path"] = (
+            f"{relative}/{FINAL_REVIEW_AUDIT_INPUT_FILENAME}"
+        )
+    if report_section["capture_status"] == "captured":
+        report_section["artifact_path"] = (
+            f"{relative}/{FINAL_REVIEW_AUDIT_REPORT_FILENAME}"
+        )
+
+    record: dict[str, Any] = {
+        "schema_version": FINAL_REVIEW_AUDIT_SCHEMA_VERSION,
+        "record_kind": FINAL_REVIEW_AUDIT_RECORD_KIND,
+        "run_id": run_id,
+        "final_review_attempt": final_review_attempt,
+        "task_id": task_id,
+        "dispatch_id": dispatch_id,
+        "dispatch_key": dispatch_key,
+        "recorded_at": recorded_at or now_iso(),
+        "reviewer_terminal": reviewer_terminal,
+        "reviewer_agent_command": reviewer_agent_command,
+        "reviewer_agent_origin": reviewer_agent_origin,
+    }
+    repository = _capture_repository_state() if capture else None
+    if repository is not None:
+        record["repository"] = repository
+    record["stored_task_spec"] = input_section
+    record["delivery_evidence"] = delivery_section
+    record["report"] = report_section
+    record["provenance_state"] = provenance_state
+    record["void_reason"] = void_reason
+    record["settlement_state"] = settlement_state
+    record["failure_detail"] = failure_detail
+    record["observed_input_bytes"] = observed_input_bytes
+    # The writer never guesses: a reader derives this by comparing
+    # input_digest_pre_redaction across an attempt's records.
+    record["input_altered_across_retry"] = input_altered_across_retry
+    record["notes"] = notes
+
+    # `sort_keys=False` over an insertion-ordered dict, so schema_version is the
+    # first key of the file and a human `head`-ing it sees the version first.
+    document = json.dumps(record, indent=2, sort_keys=False, ensure_ascii=False) + "\n"
+    # <key>/input.md and <key>/report.md contain the redacted text and NOTHING else --
+    # no header, no front matter, no provenance comment -- so
+    # artifact_digest_post_redaction is re-verifiable with a plain read_bytes().
+    files = {
+        FINAL_REVIEW_AUDIT_INPUT_FILENAME: input_text,
+        FINAL_REVIEW_AUDIT_REPORT_FILENAME: report_text,
+        FINAL_REVIEW_AUDIT_RECORD_FILENAME: document,
+    }
+    try:
+        published = _stage_and_publish_audit_record(audit_dir, dispatch_key, files)
+    except FinalReviewAuditCollision as error:
+        _log_audit_event(
+            run_id,
+            base=base,
+            event=EVENT_AUDIT_COLLISION,
+            attempt=final_review_attempt,
+            task_id=task_id,
+            dispatch_id=dispatch_id,
+            terminal=reviewer_terminal,
+            result="collision",
+            detail=f"existing={relative}/",
+        )
+        raise error
+    except FinalReviewAuditWriteFailed as error:
+        _log_audit_event(
+            run_id,
+            base=base,
+            event=EVENT_AUDIT_WRITE_FAILED,
+            attempt=final_review_attempt,
+            task_id=task_id,
+            dispatch_id=dispatch_id,
+            terminal=reviewer_terminal,
+            result="write_failed",
+            detail=f"stage={error.boundary}; error={error}",
+        )
+        raise error
+
+    provenance_cell = f"provenance={provenance_state}"
+    if void_reason:
+        provenance_cell += f" void_reason={void_reason}"
+    detail = f"record={relative}/{FINAL_REVIEW_AUDIT_RECORD_FILENAME}"
+    incomplete = (
+        input_section["capture_status"] != "captured"
+        or report_section["capture_status"] != "captured"
+        or delivery_section["capture_status"] != "captured"
+    )
+    if incomplete:
+        detail += (
+            f"; input={input_section['capture_status']}"
+            f"; report={report_section['capture_status']}"
+            f"; delivery={delivery_section['capture_status']}"
+            f"; error={input_section['capture_error'] or report_section['capture_error'] or delivery_section['capture_error']}"
+        )
+    _log_audit_event(
+        run_id,
+        base=base,
+        event=EVENT_AUDIT_INCOMPLETE if incomplete else EVENT_AUDIT_WRITTEN,
+        attempt=final_review_attempt,
+        task_id=task_id,
+        dispatch_id=dispatch_id,
+        terminal=reviewer_terminal,
+        result=provenance_cell,
+        detail=detail,
+    )
+    for entry in sweep_final_review_audit_staging(run_id, base=base):
+        _log_audit_event(
+            run_id,
+            base=base,
+            event=EVENT_AUDIT_INCOMPLETE_PUBLICATION,
+            attempt=final_review_attempt,
+            task_id=task_id,
+            dispatch_id=dispatch_id,
+            terminal=reviewer_terminal,
+            result="incomplete_publication",
+            detail=(
+                f"staging={entry['staging_dir']}; "
+                f"files={','.join(entry['files_present']) or 'none'}"
+            ),
+        )
+    return published
+
+
+def _log_audit_event(
+    run_id: str,
+    *,
+    base: Path | None,
+    event: str,
+    attempt: int,
+    task_id: str,
+    dispatch_id: str,
+    terminal: str,
+    result: str,
+    detail: str,
+) -> None:
+    """One ORCHESTRATOR_LOG row, in the EXISTING columns. Never raises.
+
+    The audit family adds new `--event` VALUES to an already-open vocabulary and no
+    column: the section 9 log-to-record join is on task_id/dispatch_id, which the
+    table has carried since OS-17. A failure to log an audit event must not turn a
+    successfully published record into an exception, so this swallows.
+    """
+    try:
+        log_orchestrator_event(
+            run_id,
+            base=base,
+            event=event,
+            phase="final_review",
+            role="reviewer",
+            iteration=attempt,
+            task_id=task_id,
+            dispatch_id=dispatch_id,
+            terminal=terminal,
+            round_kind="final_review",
+            result=result,
+            detail=detail,
+        )
+    except Exception:  # noqa: BLE001 -- a log row never changes lifecycle state
+        pass
+
+
+# ---- readers ----------------------------------------------------------------------
+
+_REQUIRED_RECORD_FIELDS = (
+    "schema_version",
+    "record_kind",
+    "run_id",
+    "final_review_attempt",
+    "task_id",
+    "dispatch_id",
+    "dispatch_key",
+    "recorded_at",
+    "stored_task_spec",
+    "delivery_evidence",
+    "report",
+    "provenance_state",
+    "void_reason",
+    "settlement_state",
+)
+_SCHEMA_VERSION = re.compile(r"^(\d+)\.(\d+)$")
+
+
+def read_final_review_audit_record(path: Path) -> tuple[dict | None, str]:
+    """`(record, status)` -- one of RECORD_READ_STATUSES.
+
+    Every failure mode reads `unknown` at the provenance layer, never `accepted`:
+    a missing file, an unparseable one, one missing a required field, one whose
+    schema_version is absent or malformed, and one whose MAJOR this reader does not
+    know. On an unknown MAJOR the reader REFUSES to interpret the document at all --
+    it does not fall back to reading the fields it recognizes, because a MAJOR bump
+    is exactly the statement that an existing field changed meaning.
+    """
+    if not path.exists():
+        return None, "missing"
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None, "malformed"
+    if not isinstance(record, dict):
+        return None, "malformed"
+    version = record.get("schema_version")
+    if not isinstance(version, str):
+        return None, "malformed"
+    match = _SCHEMA_VERSION.match(version)
+    if match is None:
+        return None, "malformed"
+    if int(match.group(1)) != int(FINAL_REVIEW_AUDIT_SCHEMA_VERSION.split(".")[0]):
+        return None, "unknown_major"
+    for field in _REQUIRED_RECORD_FIELDS:
+        if field not in record:
+            return None, "malformed"
+    if record.get("provenance_state") not in PROVENANCE_STATES:
+        return None, "malformed"
+    return record, "ok"
+
+
+def iter_final_review_audit_records(
+    run_id: str, *, base: Path | None = None
+) -> list[tuple[str, Path]]:
+    """Every PUBLISHED record directory, sorted by dispatch key.
+
+    `.staging/` is excluded twice over -- by an explicit name check and by the
+    dispatch-key grammar, which rejects a leading dot. Nothing under it is ever
+    parsed, digested, exported, counted or allowed to answer a provenance question.
+    """
+    audit_dir = final_review_audit_dir(run_id, base=base)
+    if not audit_dir.is_dir():
+        return []
+    found = []
+    for entry in sorted(audit_dir.iterdir()):
+        if not entry.is_dir():
+            continue
+        if entry.name == FINAL_REVIEW_AUDIT_STAGING_DIRNAME:
+            continue
+        if not _DISPATCH_KEY.match(entry.name):
+            continue
+        found.append((entry.name, entry))
+    return found
+
+
+def read_final_review_attempt_provenance(
+    run_id: str, attempt: int, *, base: Path | None = None
+) -> dict:
+    """Derive one attempt's accepted verdict from its dispatch records.
+
+    Never resolves a contract violation -- it REPORTS one. Two accepted records in
+    one attempt is not a tie to break; it is a violation of the "at most one
+    accepted per attempt" rule, and a reader that picked a winner would be inventing
+    the answer the records failed to give.
+
+    A `voided` record is never returned as a verdict by any function in this module.
+    There is no parameter, flag or fallback that makes it one.
+    """
+    records: list[str] = []
+    unreadable: list[dict] = []
+    violations: list[dict] = []
+    accepted: list[str] = []
+    for dispatch_key, directory in iter_final_review_audit_records(run_id, base=base):
+        record, status = read_final_review_audit_record(
+            directory / FINAL_REVIEW_AUDIT_RECORD_FILENAME
+        )
+        if status != "ok" or record is None:
+            unreadable.append({"dispatch_key": dispatch_key, "status": status})
+            violations.append(
+                {
+                    "code": "unreadable_record",
+                    "dispatch_key": dispatch_key,
+                    "status": status,
+                }
+            )
+            continue
+        # Attempt grouping comes from the record's own field, never from the
+        # filename: section 1 forbids a consumer depending on filename convention.
+        if record.get("final_review_attempt") != attempt:
+            continue
+        records.append(dispatch_key)
+        if record.get("provenance_state") == PROVENANCE_ACCEPTED:
+            accepted.append(dispatch_key)
+    if len(accepted) > 1:
+        violations.append(
+            {"code": "multiple_accepted_dispatches", "dispatch_keys": sorted(accepted)}
+        )
+    elif not accepted:
+        violations.append({"code": "no_accepted_dispatch", "attempt": attempt})
+    return {
+        "run_id": run_id,
+        "final_review_attempt": attempt,
+        "records": sorted(records),
+        "unreadable": unreadable,
+        "accepted_dispatch_key": accepted[0] if len(accepted) == 1 else None,
+        "violations": violations,
+    }
+
+
+# ---- export -----------------------------------------------------------------------
+# The minimum evidence subset, as a closed list: per attempt, every dispatch record
+# in that attempt group plus its retained input and report; once per run, the
+# ORCHESTRATOR_LOG. TIMING_LOG.md, .timing_state.json, phase artifacts and
+# FINAL_RESULT.md are NOT in it -- none of them is required to reconstruct an
+# attempt's input, report, verdict or provenance.
+
+
+def _embedded_artifact(directory: Path, filename: str, recorded: Any, relative: str) -> dict:
+    path = directory / filename
+    embedded: dict[str, Any] = {
+        "path": f"{relative}/{filename}",
+        "digest_recorded": recorded,
+        "digest_recomputed": None,
+        "digest_verified": False,
+        "content": None,
+    }
+    if not path.exists():
+        return embedded
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return embedded
+    embedded["digest_recomputed"] = sha256_bytes(data)
+    embedded["digest_verified"] = bool(recorded) and recorded == embedded[
+        "digest_recomputed"
+    ]
+    embedded["content"] = data.decode("utf-8", errors="replace")
+    return embedded
+
+
+def export_final_review_evidence(
+    run_id: str, *, base: Path | None = None, out: Path | None = None
+) -> Path:
+    """Write the self-contained evidence bundle. Opt-in; nothing calls it on a run.
+
+    Content is INLINED rather than referenced: a bundle a human attaches to a PR is
+    self-contained or it is not evidence. Every embedded artifact carries both the
+    digest recorded in the record and the digest recomputed from disk, plus the
+    boolean -- and a mismatch does NOT abort the export, because a tamper or
+    corruption event is exactly the thing an auditor needs to receive rather than be
+    denied.
+
+    Overwriting a bundle is permitted, in deliberate contrast to a record's
+    immutability: a bundle is fully re-derivable from records that are themselves
+    immutable, so a stale bundle is a hazard while a rewritten one is not.
+
+    There is no `git add` here or anywhere else in this module. Committing run
+    artifacts stays a deliberate per-run human decision.
+    """
+    root = _ensure_run_artifact_root(run_id, base=base)
+    destination = Path(out) if out else root / FINAL_REVIEW_EVIDENCE_BUNDLE_FILENAME
+    attempts: dict[int, dict] = {}
+    integrity: dict[str, Any] = {
+        "records_found": 0,
+        "records_ok": 0,
+        "digest_mismatches": [],
+        "unreadable": [],
+        "missing_artifacts": [],
+        "incomplete_publications": sweep_final_review_audit_staging(run_id, base=base),
+    }
+    for dispatch_key, directory in iter_final_review_audit_records(run_id, base=base):
+        integrity["records_found"] += 1
+        relative = f"{FINAL_REVIEW_AUDIT_DIRNAME}/{dispatch_key}"
+        record, status = read_final_review_audit_record(
+            directory / FINAL_REVIEW_AUDIT_RECORD_FILENAME
+        )
+        if status == "ok" and record is not None:
+            integrity["records_ok"] += 1
+            attempt = record.get("final_review_attempt")
+        else:
+            integrity["unreadable"].append(
+                {"dispatch_key": dispatch_key, "status": status}
+            )
+            attempt = None
+        stored = (record or {}).get("stored_task_spec", {}) if record else {}
+        reported = (record or {}).get("report", {}) if record else {}
+        entry = {
+            "dispatch_key": dispatch_key,
+            "record_status": status,
+            "record": record,
+            "input": _embedded_artifact(
+                directory,
+                FINAL_REVIEW_AUDIT_INPUT_FILENAME,
+                stored.get("artifact_digest_post_redaction"),
+                relative,
+            ),
+            "report": _embedded_artifact(
+                directory,
+                FINAL_REVIEW_AUDIT_REPORT_FILENAME,
+                reported.get("artifact_digest_post_redaction"),
+                relative,
+            ),
+        }
+        for name in ("input", "report"):
+            embedded = entry[name]
+            if embedded["content"] is None:
+                integrity["missing_artifacts"].append(embedded["path"])
+            elif embedded["digest_recorded"] and not embedded["digest_verified"]:
+                integrity["digest_mismatches"].append(
+                    {
+                        "path": embedded["path"],
+                        "recorded": embedded["digest_recorded"],
+                        "recomputed": embedded["digest_recomputed"],
+                    }
+                )
+        group = attempts.setdefault(
+            attempt if isinstance(attempt, int) else -1,
+            {"final_review_attempt": attempt, "dispatches": []},
+        )
+        group["dispatches"].append(entry)
+    serialized = []
+    for attempt in sorted(attempts, key=lambda value: (value is None, value)):
+        group = attempts[attempt]
+        group["dispatches"].sort(key=lambda item: item["dispatch_key"])
+        if isinstance(attempt, int) and attempt >= 1:
+            provenance = read_final_review_attempt_provenance(
+                run_id, attempt, base=base
+            )
+            group["accepted_dispatch_key"] = provenance["accepted_dispatch_key"]
+            group["violations"] = provenance["violations"]
+        else:
+            group["accepted_dispatch_key"] = None
+            group["violations"] = [{"code": "unattributable_records"}]
+        serialized.append(group)
+
+    log_path = root / ORCHESTRATOR_LOG_FILENAME
+    log_content = ""
+    log_digest = None
+    if log_path.exists():
+        log_content = log_path.read_text(encoding="utf-8")
+        log_digest = sha256_text(log_content)
+    bundle = {
+        "schema_version": FINAL_REVIEW_EXPORT_SCHEMA_VERSION,
+        "bundle_kind": "final_review_evidence_bundle",
+        "run_id": run_id,
+        "exported_at": now_iso(),
+        "component_versions": {
+            "audit_schema": FINAL_REVIEW_AUDIT_SCHEMA_VERSION,
+            "redaction_policy": FINAL_REVIEW_REDACTION_POLICY_VERSION,
+            "export_schema": FINAL_REVIEW_EXPORT_SCHEMA_VERSION,
+        },
+        "orchestrator_log": {
+            "path": _relative_artifact_path(log_path, root),
+            "digest": log_digest,
+            "content": log_content,
+        },
+        "attempts": serialized,
+        "integrity": integrity,
+    }
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(
+        json.dumps(bundle, indent=2, sort_keys=False, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    return destination
+
+
 # ---- CLI: the same three writers, for a Coordinator driving Orca by hand ----------
 # OrcaRuntimeHarness calls the functions above directly from Python. A live
 # Coordinator following SKILL.md's own procedure drives Orca through `orca ...`
@@ -907,6 +2205,60 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_common_arguments(dispatch_start)
     dispatch_start.add_argument("--risk", default="", choices=("", *RISK_VALUES))
 
+    # OS-22. Three read/write surfaces for the Final Review audit family. The write
+    # command's --provenance defaults to `unknown`: no default anywhere, on any
+    # surface, may be `accepted`.
+    audit_write = subparsers.add_parser(
+        "final-review-audit-write",
+        help="write one immutable per-dispatch Final Review audit record",
+    )
+    audit_write.add_argument("--run-id", required=True)
+    audit_write.add_argument(
+        "--base", default=None, help="defaults to the current directory"
+    )
+    audit_write.add_argument("--attempt", required=True, type=int)
+    audit_write.add_argument("--task-id", required=True)
+    audit_write.add_argument("--dispatch-id", default="")
+    audit_write.add_argument(
+        "--provenance", default=PROVENANCE_UNKNOWN, choices=PROVENANCE_STATES
+    )
+    audit_write.add_argument("--void-reason", default="", choices=("", *VOID_REASONS))
+    audit_write.add_argument(
+        "--settlement", default="unknown", choices=SETTLEMENT_STATES
+    )
+    audit_write.add_argument("--report-path", default="")
+    audit_write.add_argument("--terminal", default="")
+    audit_write.add_argument("--agent-command", default="")
+    audit_write.add_argument("--agent-origin", default="")
+    audit_write.add_argument("--failure-detail", default="")
+    audit_write.add_argument("--observed-input-bytes", default=None, type=int)
+    audit_write.add_argument(
+        "--no-capture",
+        action="store_true",
+        help="skip the post-dispatch orca reads; the record is still written",
+    )
+    audit_write.add_argument("--notes", default="")
+
+    audit_provenance = subparsers.add_parser(
+        "final-review-audit-provenance",
+        help="report one attempt's accepted dispatch, or the violation that blocks it",
+    )
+    audit_provenance.add_argument("--run-id", required=True)
+    audit_provenance.add_argument(
+        "--base", default=None, help="defaults to the current directory"
+    )
+    audit_provenance.add_argument("--attempt", required=True, type=int)
+
+    audit_export = subparsers.add_parser(
+        "final-review-audit-export",
+        help="write the self-contained Final Review evidence bundle for this run",
+    )
+    audit_export.add_argument("--run-id", required=True)
+    audit_export.add_argument(
+        "--base", default=None, help="defaults to the current directory"
+    )
+    audit_export.add_argument("--out", default="")
+
     status = subparsers.add_parser(
         "run-status", help="append the one run-end row to both logs"
     )
@@ -966,6 +2318,41 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     elif args.command == "timing-event":
         path = _cli_timing_event(args, base)
+    elif args.command == "final-review-audit-write":
+        path = write_final_review_audit_record(
+            args.run_id,
+            base=base,
+            final_review_attempt=args.attempt,
+            task_id=args.task_id,
+            dispatch_id=args.dispatch_id,
+            provenance_state=args.provenance,
+            void_reason=args.void_reason,
+            settlement_state=args.settlement,
+            reviewer_terminal=args.terminal,
+            reviewer_agent_command=args.agent_command,
+            reviewer_agent_origin=args.agent_origin,
+            report_path=args.report_path or None,
+            failure_detail=args.failure_detail,
+            observed_input_bytes=args.observed_input_bytes,
+            notes=args.notes,
+            capture=not args.no_capture,
+        )
+    elif args.command == "final-review-audit-provenance":
+        print(
+            json.dumps(
+                read_final_review_attempt_provenance(
+                    args.run_id, args.attempt, base=base
+                ),
+                indent=2,
+                sort_keys=False,
+                ensure_ascii=False,
+            )
+        )
+        return 0
+    elif args.command == "final-review-audit-export":
+        path = export_final_review_evidence(
+            args.run_id, base=base, out=Path(args.out) if args.out else None
+        )
     else:
         tracker = RunTimingTracker.load(args.run_id, base=base, risk=args.risk)
         # The Python path closes whatever scope is still open in finish(),
