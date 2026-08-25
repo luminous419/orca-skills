@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ast
+import inspect
 import json
 import subprocess
 import sys
@@ -291,16 +292,44 @@ class MaterializeTests(unittest.TestCase):
             self.assertEqual(list(destination.rglob("answer_key.json")), [])
 
     def test_the_workspace_the_reviewer_reads_is_clean(self) -> None:
+        """D.5 rule 4, with no exemption: every file, MANIFEST.json included."""
         key = evaluator.load_key(KEY_PATH)
         with tempfile.TemporaryDirectory() as directory:
             destination = self.workspace(directory)
 
-            self.assertEqual(
-                evaluator.scan_leak(
-                    key, [destination], exclude_names=("MANIFEST.json",)
-                ),
-                [],
+            scanned = sorted(
+                path.relative_to(destination).as_posix()
+                for path in destination.rglob("*")
+                if path.is_file()
             )
+            self.assertIn("MANIFEST.json", scanned)
+            self.assertIn("CONTRACT.md", scanned)
+            self.assertIn("DIFF.patch", scanned)
+            self.assertEqual(evaluator.scan_leak(key, [destination]), [])
+
+    def test_the_manifest_names_the_fixture_opaquely(self) -> None:
+        """The fixture id is a leak token, so the workspace carries a digest of it."""
+        key = evaluator.load_key(KEY_PATH)
+        fixture_id = key["fixture_id"]
+        with tempfile.TemporaryDirectory() as directory:
+            destination = self.workspace(directory)
+
+            raw = (destination / "MANIFEST.json").read_text(encoding="utf-8")
+            self.assertNotIn(fixture_id, raw)
+            manifest = json.loads(raw)
+            self.assertEqual(
+                manifest["fixture_id"], evaluator.workspace_fixture_ref(fixture_id)
+            )
+            self.assertEqual(
+                manifest["fixture_id_form"], evaluator.WORKSPACE_FIXTURE_REF_FORM
+            )
+
+    def test_the_scanner_takes_no_exclusion_argument(self) -> None:
+        """A scanner that can be told to skip reviewer-visible content proves nothing."""
+        self.assertNotIn(
+            "exclude_names",
+            inspect.signature(evaluator.scan_leak).parameters,
+        )
 
     def test_a_non_empty_destination_is_refused(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

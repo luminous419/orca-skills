@@ -309,17 +309,14 @@ def key_leak_tokens(key: dict) -> set[str]:
     return {token for token in tokens if token}
 
 
-def scan_leak(
-    key: dict, targets: list[Path], *, exclude_names: tuple[str, ...] = ()
-) -> list[dict]:
+def scan_leak(key: dict, targets: list[Path]) -> list[dict]:
     """Every hit, as `{path, token}` / `{path, expected_count_statement}` records.
 
-    `exclude_names` exists for exactly one caller and is named rather than hard-coded:
-    `materialize` writes its own MANIFEST.json, whose entire content is relative paths,
-    digests and the fixture id -- and the fixture id is itself a leak token, so a
-    workspace could never pass its own scan otherwise. Nothing about a seeded entry can
-    reach that file, because this module generates every byte of it. The `scan-leak`
-    command applies no exclusion at all: it scans exactly what it is pointed at.
+    There is deliberately no exclusion parameter. A file that a reviewer can read is
+    either clean or it is a leak; a scanner that can be told to skip reviewer-visible
+    content proves nothing about the content it skipped. `materialize` therefore
+    tokenizes its own MANIFEST.json (see `workspace_fixture_ref`) instead of asking to
+    be exempted from the scan it has to pass.
     """
     tokens = key_leak_tokens(key)
     hits: list[dict] = []
@@ -330,7 +327,7 @@ def scan_leak(
             else [target]
         )
         for path in files:
-            if "__pycache__" in path.parts or path.name in exclude_names:
+            if "__pycache__" in path.parts:
                 continue
             try:
                 raw = path.read_text(encoding="utf-8")
@@ -388,7 +385,12 @@ def materialize(dest: Path, fixture: Path) -> dict:
             path.write_text(text, encoding="utf-8")
         (staging / "DIFF.patch").write_text(diff, encoding="utf-8")
         manifest = {
-            "fixture_id": _fixture_id(fixture),
+            # The workspace names the fixture by an opaque reference, never by the
+            # fixture id itself: the id is a D.6 leak token, and the workspace has to
+            # pass the very same scan with no exemption. The real id stays where the
+            # reviewer never looks -- in `key/answer_key.json` and in the audit trail.
+            "fixture_id": workspace_fixture_ref(_fixture_id(fixture)),
+            "fixture_id_form": WORKSPACE_FIXTURE_REF_FORM,
             "fixture_digest": digest,
             "files": dict(sorted(files.items())),
         }
@@ -404,7 +406,7 @@ def materialize(dest: Path, fixture: Path) -> dict:
                         f"a path component named {part!r} reached the workspace"
                     )
         key = load_key(fixture / "key" / "answer_key.json")
-        hits = scan_leak(key, [staging], exclude_names=("MANIFEST.json",))
+        hits = scan_leak(key, [staging])
         if hits:
             raise FixtureError(
                 "key material reached the materialized workspace: "
@@ -423,6 +425,19 @@ def materialize(dest: Path, fixture: Path) -> dict:
     finally:
         shutil.rmtree(staging, ignore_errors=True)
     return {"dest": str(dest), "fixture_digest": digest, "files": len(files)}
+
+
+WORKSPACE_FIXTURE_REF_FORM = "sha256-of-fixture-id"
+
+
+def workspace_fixture_ref(fixture_id: str) -> str:
+    """The opaque name a materialized workspace calls its fixture by.
+
+    One-way and deterministic: two workspaces built from the same fixture carry the
+    same reference, and neither carries the literal a reviewer could recognize as an
+    evaluation fixture. `verify-fixture` and the answer key still hold the real id.
+    """
+    return "sha256:" + sha256_text(fixture_id)
 
 
 def _fixture_id(fixture: Path) -> str:
