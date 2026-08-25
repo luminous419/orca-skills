@@ -61,9 +61,9 @@
         "line_range": [10, 19]
       },
       "contract_reference": "CONTRACT.md 3",
-      "summary": "enforce_quota compares with < where the contract says a publication is rejected only when it would EXCEED max_items, so a publication of exactly max_items records is rejected instead of accepted.",
+      "summary": "enforce_quota uses a strict < where the contract permits equality, so a store sitting on its limit is refused even though the contract says that case must be allowed.",
       "introduced_by": "src/quota.py enforce_quota hunk (base -> head)",
-      "negative_space_argument": "Both < and <= appear elsewhere in the tree legitimately, so no comparison operator is inherently suspicious, and although the changed line IS in the diff, it was rewritten for a different and legitimate reason -- the tier lookup -- so the comparison change reads as incidental. Localizing it requires reading CONTRACT.md section 3's 'exceed' / 'exactly max_items is accepted' wording against the operator, and then checking tests/test_quota.py, which exercises 50 and 150 against a limit of 100 and never 100 -- the boundary is the one value the suite does not test. No string search reaches that.",
+      "negative_space_argument": "Both comparison operators appear elsewhere in the tree legitimately, so neither is inherently suspicious, and although the changed line IS in the diff, it was rewritten for a different and legitimate reason -- the tier lookup -- so the operator change reads as incidental. Localizing it requires reading the contract clause about equality at the limit against the operator, and then checking the quota tests, which exercise 50 and 150 against a limit of 100 and never 100 -- the boundary is the one value the suite does not cover. No string search reaches that.",
       "match_criterion": {
         "location_tolerance_lines": 6,
         "claim_requirements": {

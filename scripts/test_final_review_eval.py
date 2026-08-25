@@ -1,0 +1,975 @@
+#!/usr/bin/env python3
+"""Tests for scripts/final_review_eval.py: the fixture, the leak scan, the scorer."""
+
+from __future__ import annotations
+
+import ast
+import json
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from scripts import final_review_eval as evaluator
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+FIXTURE = REPO_ROOT / "scripts" / "fixtures" / "final_review_eval"
+KEY_PATH = FIXTURE / "key" / "answer_key.json"
+SCORER = REPO_ROOT / "scripts" / "final_review_eval.py"
+
+
+def run_cli(*argv: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, str(SCORER), *argv],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def finding(
+    identifier: str,
+    location: str,
+    issue: str,
+    reason: str = "",
+    action: str = "",
+    *,
+    blocking: bool = True,
+) -> str:
+    return (
+        f"\nID: {identifier}\n"
+        "Quality Attribute: G1\n"
+        "Severity: MAJOR\n"
+        f"Blocking: {'YES' if blocking else 'NO'}\n"
+        "Responsible Phase: implementation\n"
+        f"Location: {location}\n"
+        f"Issue: {issue}\n"
+        f"Reason / Evidence: {reason}\n"
+        f"Required Action: {action}\n"
+    )
+
+
+# One finding per entry, phrased in words the key never uses verbatim -- the point of
+# claim GROUPS is that the reviewer does not have to guess the key's wording.
+PERFECT_REPORT = (
+    "# Final Adversarial Review\n\nRESULT: FAIL\nREVIEW_VERDICT: FAIL\n\n"
+    + finding(
+        "R1",
+        "src/policy.py:8",
+        "resolve_tier only checks the presence of the retention_tier key.",
+        "CONTRACT.md 2 requires the value to name a tier that exists; an unknown tier "
+        "is accepted and the limit lookup then reports none.",
+    )
+    + finding(
+        "R2",
+        "src/pipeline.py:25",
+        "publish_batch resolves a tier for the write but the quota call omits the tier.",
+        "the batch path silently evaluates the default tier, so a destination tier is "
+        "not propagated.",
+    )
+    + finding(
+        "R3",
+        "src/quota.py:19",
+        "enforce_quota uses a strict comparison at the boundary.",
+        "a store sitting exactly at the limit is refused, and the contract allows that "
+        "case.",
+    )
+    + finding(
+        "R4",
+        "src/config.py:17",
+        "resolve_settings inverts the documented precedence.",
+        "the dict splat is last wins, so the built-in defaults override an explicit "
+        "override.",
+    )
+    + finding(
+        "R5",
+        "src/pipeline.py:33",
+        "republish never calls validate_record.",
+        "the retry path bypasses validation entirely.",
+    )
+)
+
+NOISE_FINDING = finding(
+    "R9",
+    "somewhere in the project",
+    "the module docstrings could be longer.",
+    "style preference.",
+    blocking=False,
+)
+
+
+class FixtureIntegrityTests(unittest.TestCase):
+    """The fixture is what the key says it is -- demonstrated, not asserted."""
+
+    def test_verify_fixture_passes_on_the_shipped_fixture(self) -> None:
+        self.assertEqual(evaluator.verify_fixture(FIXTURE, KEY_PATH), [])
+
+    def test_both_subject_suites_pass(self) -> None:
+        """A green head suite is the point: a failing test would localize an entry for
+        free, and the fixture would stop measuring search at all."""
+        for tree in ("base", "head"):
+            with self.subTest(tree=tree):
+                passed, output = evaluator._run_suite(
+                    evaluator.read_tree(FIXTURE / "subject" / tree)
+                )
+                self.assertTrue(passed, output)
+
+    def test_every_key_entry_names_a_real_symbol_in_a_changed_range(self) -> None:
+        key = evaluator.load_key(KEY_PATH)
+        base = evaluator.read_tree(FIXTURE / "subject" / "base")
+        head = evaluator.read_tree(FIXTURE / "subject" / "head")
+        for entry in key["seeded_defects"]:
+            location = entry["location"]
+            start, end = location["line_range"]
+            with self.subTest(entry=entry["id"]):
+                text = head[location["file"]]
+                lines = text.splitlines()
+                self.assertTrue(
+                    any(
+                        lines[number - 1].lstrip().startswith(
+                            f"def {location['symbol']}"
+                        )
+                        for number in range(start, end + 1)
+                    )
+                )
+                touched = evaluator.changed_head_lines(
+                    base.get(location["file"], ""), text
+                )
+                self.assertTrue(touched & set(range(start, end + 1)))
+
+    def test_each_entry_is_demonstrated_by_running_the_head_tree(self) -> None:
+        """Not "the key says so": each behaviour is exercised against head/ itself."""
+        head = FIXTURE / "subject" / "head"
+        program = (
+            "import sys; sys.path.insert(0, '.')\n"
+            "from src.policy import resolve_tier, tier_limits\n"
+            "from src.quota import enforce_quota\n"
+            "from src.config import resolve_settings\n"
+            "from src.pipeline import publish_batch, republish\n"
+            "out = {}\n"
+            "out['unknown_tier_accepted'] = resolve_tier({'retention_tier': 'typo'}, {})\n"
+            "out['unknown_tier_limit'] = tier_limits('typo')['max_items']\n"
+            "out['unlimited'] = enforce_quota([{}] * 9999, {}, tier='typo')\n"
+            "store = [{} for _ in range(120)]\n"
+            "try:\n"
+            "    publish_batch(store, [{'id': 'r1', 'payload': 'x', 'created_at': 't'}],"
+            " {'max_items': 100}, {'retention_tier': 'archival'})\n"
+            "    out['batch_used_destination_tier'] = True\n"
+            "except Exception:\n"
+            "    out['batch_used_destination_tier'] = False\n"
+            "out['exactly_at_limit_accepted'] = enforce_quota([{}] * 100, {})\n"
+            "out['explicit_override'] = resolve_settings({'max_items': 7}, {}, {})"
+            "['max_items']\n"
+            "written = []\n"
+            "republish(written, {'id': 'r1'}, {}, {'name': 'd'})\n"
+            "out['unvalidated_write'] = len(written)\n"
+            "import json; print(json.dumps(out))\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name, text in evaluator.read_tree(head).items():
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(text, encoding="utf-8")
+            completed = subprocess.run(
+                [sys.executable, "-c", program],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        observed = json.loads(completed.stdout)
+
+        # SD-1: a value that is not a tier is accepted, and the limit vanishes with it.
+        self.assertEqual(observed["unknown_tier_accepted"], "typo")
+        self.assertIsNone(observed["unknown_tier_limit"])
+        self.assertTrue(observed["unlimited"])
+        # SD-2: the batch path did not use the destination's tier.
+        self.assertFalse(observed["batch_used_destination_tier"])
+        # SD-3: the contract accepts exactly the limit; the code does not.
+        self.assertFalse(observed["exactly_at_limit_accepted"])
+        # SD-4: the explicit override never takes effect.
+        self.assertEqual(observed["explicit_override"], 100)
+        # SD-5: the retry path wrote a record no validator saw.
+        self.assertEqual(observed["unvalidated_write"], 1)
+
+
+class LeakScanTests(unittest.TestCase):
+    def test_the_subject_tree_carries_no_key_material(self) -> None:
+        key = evaluator.load_key(KEY_PATH)
+        self.assertEqual(evaluator.scan_leak(key, [FIXTURE / "subject"]), [])
+
+    def test_the_scan_catches_an_entry_id_and_an_archetype_name(self) -> None:
+        key = evaluator.load_key(KEY_PATH)
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "leaky.py"
+            target.write_text(
+                "# SD-3 here, archetype equality_boundary\n", encoding="utf-8"
+            )
+
+            hits = evaluator.scan_leak(key, [target])
+
+        tokens = {hit.get("token") for hit in hits}
+        self.assertIn("sd-3", tokens)
+        self.assertIn("equality_boundary", tokens)
+
+    def test_the_scan_catches_a_verbatim_run_of_the_key_prose(self) -> None:
+        key = evaluator.load_key(KEY_PATH)
+        excerpt = " ".join(key["seeded_defects"][0]["summary"].split()[:8])
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "leaky.md"
+            target.write_text(excerpt, encoding="utf-8")
+
+            self.assertTrue(evaluator.scan_leak(key, [target]))
+
+    def test_the_scan_catches_an_expected_count_statement(self) -> None:
+        key = evaluator.load_key(KEY_PATH)
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "leaky.md"
+            target.write_text(
+                "You should find five defects in this project.\n", encoding="utf-8"
+            )
+
+            hits = evaluator.scan_leak(key, [target])
+
+        self.assertTrue(any("expected_count_statement" in hit for hit in hits))
+
+    def test_the_scan_does_not_flag_a_real_symbol_the_subject_must_contain(
+        self,
+    ) -> None:
+        """"Every string in the key" would be wrong: the key names symbols and files
+        that MUST appear in the subject tree."""
+        key = evaluator.load_key(KEY_PATH)
+        tokens = evaluator.key_leak_tokens(key)
+        for allowed in ("resolve_tier", "src/policy.py", "enforce_quota", "republish"):
+            with self.subTest(token=allowed):
+                self.assertNotIn(allowed, tokens)
+
+
+class MaterializeTests(unittest.TestCase):
+    def workspace(self, directory: str) -> Path:
+        destination = Path(directory) / "ws"
+        evaluator.materialize(destination, FIXTURE)
+        return destination
+
+    def test_a_workspace_carries_the_head_tree_a_diff_and_a_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            destination = self.workspace(directory)
+
+            self.assertTrue((destination / "CONTRACT.md").is_file())
+            self.assertTrue((destination / "src" / "policy.py").is_file())
+            self.assertTrue((destination / "tests" / "test_quota.py").is_file())
+            diff = (destination / "DIFF.patch").read_text(encoding="utf-8")
+            self.assertIn("--- a/src/config.py", diff)
+            self.assertIn("+++ b/src/pipeline.py", diff)
+            manifest = json.loads(
+                (destination / "MANIFEST.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                manifest["fixture_digest"], evaluator.key_fixture_digest(KEY_PATH)
+            )
+
+    def test_no_git_directory_is_created_or_copied(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            destination = self.workspace(directory)
+
+            self.assertFalse((destination / ".git").exists())
+            self.assertEqual(list(destination.rglob(".git")), [])
+
+    def test_the_key_and_the_adjudications_never_reach_the_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            destination = self.workspace(directory)
+
+            for path in destination.rglob("*"):
+                for part in path.relative_to(destination).parts:
+                    with self.subTest(path=str(path)):
+                        self.assertNotIn(part, ("key", "adjudications"))
+            self.assertEqual(list(destination.rglob("answer_key.json")), [])
+
+    def test_the_workspace_the_reviewer_reads_is_clean(self) -> None:
+        key = evaluator.load_key(KEY_PATH)
+        with tempfile.TemporaryDirectory() as directory:
+            destination = self.workspace(directory)
+
+            self.assertEqual(
+                evaluator.scan_leak(
+                    key, [destination], exclude_names=("MANIFEST.json",)
+                ),
+                [],
+            )
+
+    def test_a_non_empty_destination_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "ws"
+            destination.mkdir()
+            (destination / "already-here").write_text("x", encoding="utf-8")
+
+            with self.assertRaises(evaluator.FixtureError):
+                evaluator.materialize(destination, FIXTURE)
+
+            self.assertEqual(
+                sorted(path.name for path in destination.iterdir()), ["already-here"]
+            )
+
+    def test_a_stale_expected_digest_fails_and_leaves_nothing_behind(self) -> None:
+        """There is deliberately no flag that rewrites the value it checks against."""
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "ws"
+            with patch.object(
+                evaluator, "key_fixture_digest", return_value="sha256:stale"
+            ):
+                with self.assertRaises(evaluator.EvalContractError):
+                    evaluator.materialize(destination, FIXTURE)
+
+            self.assertFalse(destination.exists() and any(destination.iterdir()))
+
+    def test_two_materializations_are_byte_identical(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            first = self.workspace(directory)
+            second = Path(directory) / "ws2"
+            evaluator.materialize(second, FIXTURE)
+
+            self.assertEqual(
+                evaluator.read_tree(first), evaluator.read_tree(second)
+            )
+
+
+class MatchingTests(unittest.TestCase):
+    def parse(self, report: str, workspace: Path | None = None) -> dict:
+        return {
+            "schema_version": "1.0",
+            "source_report": "report.md",
+            "source_report_digest": "sha256:" + evaluator.sha256_text(report),
+            "findings": evaluator.parse_report(report, workspace),
+        }
+
+    def score(self, report: str, **kwargs) -> dict:
+        return evaluator.score(
+            self.parse(report), evaluator.load_key(KEY_PATH), **kwargs
+        )
+
+    def test_a_report_that_finds_everything_scores_full_recall(self) -> None:
+        metrics = self.score(PERFECT_REPORT)
+
+        self.assertEqual(metrics["detected_seeded_defects"], 5)
+        self.assertEqual(
+            metrics["seeded_recall"],
+            {
+                "value": 1.0,
+                "numerator": 5,
+                "denominator": 5,
+                "population": "seeded_defects_only",
+            },
+        )
+        self.assertEqual(metrics["missed_defect_ids"], [])
+
+    def test_two_entries_in_one_file_are_separated(self) -> None:
+        """SD-2 and SD-5 both live in src/pipeline.py, which is exactly why the matcher
+        needs symbol and line disambiguation."""
+        metrics = self.score(PERFECT_REPORT)
+
+        pairs = {
+            item["finding_id"]: item["seeded_defect_id"]
+            for item in metrics["matched_findings"]
+        }
+        self.assertEqual(pairs["R2"], "SD-2")
+        self.assertEqual(pairs["R5"], "SD-5")
+
+    def test_the_assignment_is_one_to_one(self) -> None:
+        duplicated = PERFECT_REPORT + finding(
+            "R6",
+            "src/policy.py:8",
+            "resolve_tier only checks the presence of the key.",
+            "an unknown tier is accepted.",
+        )
+
+        metrics = self.score(duplicated)
+
+        assigned = [item["seeded_defect_id"] for item in metrics["matched_findings"]]
+        self.assertEqual(len(assigned), len(set(assigned)))
+        self.assertIn("R6", [item["finding_id"] for item in metrics["unmatched_findings"]])
+
+    def test_a_missed_entry_is_reported_with_an_explicit_denominator(self) -> None:
+        partial = (
+            "RESULT: FAIL\n"
+            + finding(
+                "R1",
+                "src/policy.py:8",
+                "resolve_tier only checks the presence of the retention_tier key.",
+                "an unknown tier is accepted.",
+            )
+        )
+
+        metrics = self.score(partial)
+
+        self.assertEqual(metrics["seeded_recall"]["numerator"], 1)
+        self.assertEqual(metrics["seeded_recall"]["denominator"], 5)
+        self.assertEqual(metrics["seeded_recall"]["population"], "seeded_defects_only")
+        self.assertEqual(metrics["miss_count"], 4)
+        self.assertEqual(
+            metrics["missed_defect_ids"], ["SD-2", "SD-3", "SD-4", "SD-5"]
+        )
+
+    def test_an_unmatched_finding_is_unadjudicated_and_never_an_auto_false_positive(
+        self,
+    ) -> None:
+        metrics = self.score(PERFECT_REPORT + NOISE_FINDING)
+
+        unmatched = metrics["unmatched_findings"]
+        self.assertEqual(len(unmatched), 1)
+        self.assertEqual(unmatched[0]["finding_id"], "R9")
+        self.assertEqual(unmatched[0]["classification"], "UNADJUDICATED")
+        self.assertEqual(metrics["adjudicated_false_positives"], 0)
+        self.assertEqual(metrics["unadjudicated_count"], 1)
+
+    def test_a_finding_whose_location_does_not_resolve_says_so(self) -> None:
+        metrics = self.score(PERFECT_REPORT + NOISE_FINDING)
+
+        self.assertEqual(
+            metrics["unmatched_findings"][0]["reason"], "unresolvable_location"
+        )
+
+    def test_a_finding_with_no_key_match_is_labelled_no_key_match(self) -> None:
+        off_topic = "RESULT: FAIL\n" + finding(
+            "R7",
+            "src/validation.py:10",
+            "the required field list could be a frozenset.",
+            "micro-optimization.",
+        )
+
+        metrics = self.score(off_topic)
+
+        self.assertEqual(metrics["unmatched_findings"][0]["reason"], "no_key_match")
+
+    def test_evidence_grounding_uses_the_materialized_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "ws"
+            evaluator.materialize(workspace, FIXTURE)
+
+            metrics = evaluator.score(
+                self.parse(PERFECT_REPORT + NOISE_FINDING, workspace),
+                evaluator.load_key(KEY_PATH),
+                workspace=workspace,
+            )
+
+        self.assertEqual(metrics["evidence_grounding"]["numerator"], 5)
+        self.assertEqual(metrics["evidence_grounding"]["denominator"], 6)
+        self.assertEqual(
+            metrics["evidence_grounding"]["ungrounded_finding_ids"], ["R9"]
+        )
+
+    def test_a_workspace_that_is_not_the_keys_tree_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "ws"
+            evaluator.materialize(workspace, FIXTURE)
+            manifest = json.loads(
+                (workspace / "MANIFEST.json").read_text(encoding="utf-8")
+            )
+            manifest["fixture_digest"] = "sha256:something-else"
+            (workspace / "MANIFEST.json").write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
+
+            with self.assertRaises(evaluator.EvalContractError):
+                evaluator.score(
+                    self.parse(PERFECT_REPORT),
+                    evaluator.load_key(KEY_PATH),
+                    workspace=workspace,
+                )
+
+
+class PrecisionRefusalTests(unittest.TestCase):
+    def parse(self, report: str) -> dict:
+        return {
+            "schema_version": "1.0",
+            "source_report": "report.md",
+            "source_report_digest": "sha256:" + evaluator.sha256_text(report),
+            "findings": evaluator.parse_report(report, None),
+        }
+
+    def score(self, report: str, adjudications=None) -> dict:
+        return evaluator.score(
+            self.parse(report),
+            evaluator.load_key(KEY_PATH),
+            adjudications=adjudications,
+        )
+
+    def test_precision_is_refused_without_adjudication(self) -> None:
+        metrics = self.score(PERFECT_REPORT + NOISE_FINDING)
+
+        self.assertIsNone(metrics["precision"])
+        self.assertEqual(metrics["precision_status"], "REFUSED")
+        self.assertIn("adjudication_incomplete", metrics["precision_refusal_reason"])
+        self.assertIsNone(metrics["false_positive_rate"])
+        self.assertEqual(metrics["false_positive_rate_status"], "REFUSED")
+        self.assertEqual(metrics["adjudication_status"], "none")
+
+    def test_the_refused_keys_are_present_never_omitted(self) -> None:
+        metrics = self.score(PERFECT_REPORT + NOISE_FINDING)
+
+        for key in (
+            "precision",
+            "precision_status",
+            "precision_refusal_reason",
+            "false_positive_rate",
+            "false_positive_rate_status",
+            "false_positive_rate_refusal_reason",
+            "unadjudicated_count",
+            "adjudication_status",
+        ):
+            with self.subTest(key=key):
+                self.assertIn(key, metrics)
+
+    def test_a_complete_adjudication_computes_precision(self) -> None:
+        adjudications = {
+            "schema_version": "1.0",
+            "adjudicator": "a human",
+            "adjudicated_at": "2026-08-26T10:00:00+00:00",
+            "closed_world": False,
+            "exhaustive_attestation": None,
+            "verdicts": [
+                {
+                    "finding_id": "R9",
+                    "verdict": "false_positive",
+                    "rationale": "a style preference, not a defect",
+                }
+            ],
+        }
+
+        metrics = self.score(PERFECT_REPORT + NOISE_FINDING, adjudications)
+
+        self.assertEqual(metrics["precision_status"], "COMPUTED")
+        self.assertAlmostEqual(metrics["precision"], 5 / 6)
+        self.assertAlmostEqual(metrics["false_positive_rate"], 1 / 6)
+        self.assertEqual(metrics["adjudication_status"], "complete")
+        self.assertEqual(metrics["unadjudicated_count"], 0)
+
+    def test_a_partial_adjudication_still_refuses(self) -> None:
+        report = PERFECT_REPORT + NOISE_FINDING + finding(
+            "R10", "src/validation.py:5", "unrelated", "unrelated"
+        )
+        adjudications = {
+            "schema_version": "1.0",
+            "adjudicator": "a human",
+            "adjudicated_at": "2026-08-26T10:00:00+00:00",
+            "verdicts": [
+                {
+                    "finding_id": "R9",
+                    "verdict": "false_positive",
+                    "rationale": "style only",
+                }
+            ],
+        }
+
+        metrics = self.score(report, adjudications)
+
+        self.assertEqual(metrics["precision_status"], "REFUSED")
+        self.assertEqual(metrics["adjudication_status"], "partial")
+        self.assertEqual(metrics["unadjudicated_count"], 1)
+
+    def test_a_closed_world_attestation_computes_precision(self) -> None:
+        adjudications = {
+            "schema_version": "1.0",
+            "adjudicator": "a human",
+            "adjudicated_at": "2026-08-26T10:00:00+00:00",
+            "closed_world": True,
+            "exhaustive_attestation": {
+                "scope": "final_review_eval/v1",
+                "statement": "the key enumerates everything a correct review reports",
+                "attested_by": "a human",
+                "attested_at": "2026-08-26T10:00:00+00:00",
+            },
+            "verdicts": [],
+        }
+
+        metrics = self.score(PERFECT_REPORT + NOISE_FINDING, adjudications)
+
+        self.assertEqual(metrics["precision_status"], "COMPUTED")
+        self.assertTrue(metrics["closed_world"])
+
+    def test_recall_is_computable_even_when_precision_is_refused(self) -> None:
+        metrics = self.score(PERFECT_REPORT + NOISE_FINDING)
+
+        self.assertEqual(metrics["seeded_recall"]["value"], 1.0)
+        self.assertEqual(metrics["precision_status"], "REFUSED")
+
+    def test_verdict_reproducibility_is_never_asserted_from_one_run(self) -> None:
+        document = self.parse(PERFECT_REPORT)
+        key = evaluator.load_key(KEY_PATH)
+
+        single = evaluator.score(document, key, run_verdicts=["FAIL"])
+        self.assertEqual(
+            single["verdict_reproducibility"]["status"], "SINGLE_RUN_NOT_ASSERTED"
+        )
+        self.assertIsNone(single["verdict_reproducibility"]["agreement"])
+
+        several = evaluator.score(
+            document, key, run_verdicts=["FAIL", "FAIL", "PASS"]
+        )
+        self.assertEqual(several["verdict_reproducibility"]["status"], "OBSERVED")
+        self.assertEqual(several["verdict_reproducibility"]["run_count"], 3)
+        self.assertAlmostEqual(several["verdict_reproducibility"]["agreement"], 2 / 3)
+
+
+class AdjudicationContractTests(unittest.TestCase):
+    def load(self, document: dict):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "adjudications.json"
+            path.write_text(json.dumps(document), encoding="utf-8")
+            return evaluator.load_adjudications(path)
+
+    def base(self, **overrides) -> dict:
+        document = {
+            "schema_version": "1.0",
+            "adjudicator": "a human",
+            "adjudicated_at": "2026-08-26T10:00:00+00:00",
+            "verdicts": [
+                {"finding_id": "R9", "verdict": "false_positive", "rationale": "style"}
+            ],
+        }
+        document.update(overrides)
+        return document
+
+    def test_a_well_formed_adjudication_loads(self) -> None:
+        self.assertEqual(len(self.load(self.base())["verdicts"]), 1)
+
+    def test_a_historical_corpus_field_is_a_hard_error(self) -> None:
+        """DEC-8 rule 4 made structural: the forbidden inference is unrepresentable,
+        not merely discouraged."""
+        document = self.base()
+        document["verdicts"][0]["was_corrected_in_a_previous_run"] = True
+
+        with self.assertRaises(evaluator.EvalContractError):
+            self.load(document)
+
+    def test_an_unknown_top_level_key_is_a_hard_error(self) -> None:
+        with self.assertRaises(evaluator.EvalContractError):
+            self.load(self.base(historical_agreement_rate=0.9))
+
+    def test_an_empty_rationale_is_refused(self) -> None:
+        document = self.base()
+        document["verdicts"][0]["rationale"] = "   "
+
+        with self.assertRaises(evaluator.EvalContractError):
+            self.load(document)
+
+    def test_a_third_verdict_value_is_refused(self) -> None:
+        document = self.base()
+        document["verdicts"][0]["verdict"] = "probably_fine"
+
+        with self.assertRaises(evaluator.EvalContractError):
+            self.load(document)
+
+    def test_a_duplicate_finding_id_is_refused(self) -> None:
+        document = self.base()
+        document["verdicts"].append(dict(document["verdicts"][0]))
+
+        with self.assertRaises(evaluator.EvalContractError):
+            self.load(document)
+
+    def test_closed_world_requires_a_complete_attestation(self) -> None:
+        with self.assertRaises(evaluator.EvalContractError):
+            self.load(self.base(closed_world=True))
+        with self.assertRaises(evaluator.EvalContractError):
+            self.load(
+                self.base(
+                    closed_world=True,
+                    exhaustive_attestation={
+                        "scope": "x",
+                        "statement": "",
+                        "attested_by": "y",
+                        "attested_at": "z",
+                    },
+                )
+            )
+
+
+class DeterminismTests(unittest.TestCase):
+    """B5: identical inputs, byte-identical metrics -- for the WHOLE file."""
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary_directory.name)
+        self.report = self.root / "report.md"
+        self.report.write_text(PERFECT_REPORT + NOISE_FINDING, encoding="utf-8")
+        self.findings = self.root / "findings.json"
+        self.assertEqual(
+            run_cli(
+                "parse-report", "--report", str(self.report), "--out", str(self.findings)
+            ).returncode,
+            0,
+        )
+
+    def tearDown(self) -> None:
+        self.temporary_directory.cleanup()
+
+    def score_to(self, name: str, *extra: str) -> tuple[Path, int]:
+        out = self.root / name
+        completed = run_cli(
+            "score",
+            "--findings",
+            str(self.findings),
+            "--key",
+            str(KEY_PATH),
+            "--out",
+            str(out),
+            *extra,
+        )
+        return out, completed.returncode
+
+    def test_two_runs_produce_byte_identical_metrics(self) -> None:
+        first, code_a = self.score_to("a.json")
+        second, code_b = self.score_to("b.json")
+
+        self.assertEqual((code_a, code_b), (0, 0))
+        self.assertEqual(first.read_bytes(), second.read_bytes())
+
+    def test_the_metrics_document_reads_no_clock(self) -> None:
+        """Structural, not reviewed: every clock module reachable from this module is
+        replaced by an object that raises on ANY attribute access, and `score` still
+        returns. A future contributor cannot reintroduce a timestamp into the metrics
+        document without this failing."""
+        document = json.loads(self.findings.read_text(encoding="utf-8"))
+        key = evaluator.load_key(KEY_PATH)
+
+        class Exploding:
+            def __getattr__(self, name):
+                raise AssertionError(f"the scorer reached a clock: {name}")
+
+        with patch.dict(
+            sys.modules, {"time": Exploding(), "datetime": Exploding()}
+        ):
+            metrics = evaluator.score(document, key)
+
+        self.assertNotIn("generated_at", metrics)
+        for value in metrics:
+            with self.subTest(key=value):
+                self.assertNotIn("generated", value)
+
+    def test_the_only_clock_read_lives_in_the_sidecar_writer(self) -> None:
+        """The import that reads a clock is function-local, in one function, so the
+        proof above is about the whole module rather than about one call path."""
+        module = ast.parse(SCORER.read_text(encoding="utf-8"))
+        clock_importers = set()
+        for node in ast.walk(module):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for inner in ast.walk(node):
+                    names = []
+                    if isinstance(inner, ast.Import):
+                        names = [alias.name for alias in inner.names]
+                    elif isinstance(inner, ast.ImportFrom):
+                        names = [inner.module or ""]
+                    if any(name in ("time", "datetime") for name in names):
+                        clock_importers.add(node.name)
+        self.assertEqual(clock_importers, {"_write_provenance"})
+        top_level = {
+            alias.name
+            for node in module.body
+            if isinstance(node, ast.Import)
+            for alias in node.names
+        }
+        self.assertNotIn("time", top_level)
+        self.assertNotIn("datetime", top_level)
+
+    def test_the_provenance_sidecar_is_a_separate_file(self) -> None:
+        out = self.root / "metrics.json"
+        sidecar = self.root / "provenance.json"
+        completed = run_cli(
+            "score",
+            "--findings",
+            str(self.findings),
+            "--key",
+            str(KEY_PATH),
+            "--out",
+            str(out),
+            "--provenance-out",
+            str(sidecar),
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        metrics = json.loads(out.read_text(encoding="utf-8"))
+        provenance = json.loads(sidecar.read_text(encoding="utf-8"))
+        self.assertNotIn("generated_at", metrics)
+        self.assertIn("generated_at", provenance)
+        self.assertEqual(
+            provenance["metrics_digest"],
+            "sha256:" + evaluator.sha256_text(out.read_text(encoding="utf-8")),
+        )
+
+    def test_the_default_invocation_writes_no_sidecar(self) -> None:
+        out, code = self.score_to("metrics.json")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(list(self.root.glob("provenance*.json")), [])
+        self.assertTrue(out.is_file())
+
+
+class ExitCodeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary_directory.name)
+        report = self.root / "report.md"
+        report.write_text(PERFECT_REPORT + NOISE_FINDING, encoding="utf-8")
+        self.findings = self.root / "findings.json"
+        run_cli("parse-report", "--report", str(report), "--out", str(self.findings))
+
+    def tearDown(self) -> None:
+        self.temporary_directory.cleanup()
+
+    def test_zero_when_precision_is_refused_and_not_required(self) -> None:
+        completed = run_cli(
+            "score", "--findings", str(self.findings), "--key", str(KEY_PATH)
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("REFUSED", completed.stdout)
+
+    def test_three_when_precision_is_refused_and_required(self) -> None:
+        completed = run_cli(
+            "score",
+            "--findings",
+            str(self.findings),
+            "--key",
+            str(KEY_PATH),
+            "--require-precision",
+        )
+
+        self.assertEqual(completed.returncode, 3)
+        self.assertIn("precision refused", completed.stderr)
+
+    def test_one_for_a_missing_input(self) -> None:
+        completed = run_cli(
+            "score",
+            "--findings",
+            str(self.root / "nope.json"),
+            "--key",
+            str(KEY_PATH),
+        )
+
+        self.assertEqual(completed.returncode, 1)
+
+    def test_one_for_an_unknown_schema_major(self) -> None:
+        document = json.loads(self.findings.read_text(encoding="utf-8"))
+        document["schema_version"] = "9.0"
+        path = self.root / "future.json"
+        path.write_text(json.dumps(document), encoding="utf-8")
+
+        completed = run_cli("score", "--findings", str(path), "--key", str(KEY_PATH))
+
+        self.assertEqual(completed.returncode, 1)
+
+    def test_two_for_a_contract_violation_in_an_adjudication(self) -> None:
+        path = self.root / "adjudications.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "schema_version": "1.0",
+                    "adjudicator": "a human",
+                    "adjudicated_at": "2026-08-26T10:00:00+00:00",
+                    "verdicts": [
+                        {
+                            "finding_id": "R9",
+                            "verdict": "false_positive",
+                            "rationale": "style",
+                            "was_not_disputed": True,
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        completed = run_cli(
+            "score",
+            "--findings",
+            str(self.findings),
+            "--key",
+            str(KEY_PATH),
+            "--adjudications",
+            str(path),
+        )
+
+        self.assertEqual(completed.returncode, 2)
+
+    def test_four_for_a_leak_and_for_a_non_empty_destination(self) -> None:
+        leaky = self.root / "leaky.md"
+        leaky.write_text("SD-1 lives here\n", encoding="utf-8")
+        leak = run_cli(
+            "scan-leak", "--key", str(KEY_PATH), "--target", str(leaky)
+        )
+        self.assertEqual(leak.returncode, 4)
+
+        destination = self.root / "ws"
+        destination.mkdir()
+        (destination / "x").write_text("x", encoding="utf-8")
+        occupied = run_cli("materialize", "--dest", str(destination))
+        self.assertEqual(occupied.returncode, 4)
+
+    def test_verify_fixture_exits_zero_on_the_shipped_fixture(self) -> None:
+        completed = run_cli("verify-fixture")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("PASSED", completed.stdout)
+
+
+class NoTargetCountTests(unittest.TestCase):
+    def test_nothing_reads_a_target_finding_count(self) -> None:
+        """Section 5's "expected finding count" cannot leak through the key even by
+        accident, because no code path reads one.
+
+        Asserted over the parsed source: the phrase occurs exactly twice -- once as a
+        token the leak scanner looks FOR, and once as the name of the literal guard the
+        key must carry -- and never as a value anything reads.
+        """
+        module = ast.parse(SCORER.read_text(encoding="utf-8"))
+        read = [
+            node.args[0].value
+            for node in ast.walk(module)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "get"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+        ]
+        subscripts = [
+            node.slice.value
+            for node in ast.walk(module)
+            if isinstance(node, ast.Subscript)
+            and isinstance(node.slice, ast.Constant)
+            and isinstance(node.slice.value, str)
+        ]
+        # The ONLY name carrying the phrase that anything reads is the literal guard,
+        # and it is read to assert its presence -- never for a number.
+        for name in read + subscripts:
+            with self.subTest(name=name):
+                if "expected_finding_count" in name:
+                    self.assertEqual(
+                        name, "expected_finding_count_is_not_a_contract"
+                    )
+                self.assertNotIn("target_count", name)
+                self.assertNotIn("finding_count", name.replace(
+                    "expected_finding_count_is_not_a_contract", ""
+                ))
+
+    def test_the_key_carries_the_literal_guard(self) -> None:
+        key = json.loads(KEY_PATH.read_text(encoding="utf-8"))
+        self.assertIs(key["expected_finding_count_is_not_a_contract"], True)
+
+    def test_a_key_without_the_guard_is_refused(self) -> None:
+        key = json.loads(KEY_PATH.read_text(encoding="utf-8"))
+        del key["expected_finding_count_is_not_a_contract"]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "key.json"
+            path.write_text(json.dumps(key), encoding="utf-8")
+
+            with self.assertRaises(evaluator.EvalContractError):
+                evaluator.load_key(path)
+
+
+if __name__ == "__main__":
+    unittest.main()
