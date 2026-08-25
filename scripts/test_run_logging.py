@@ -2529,8 +2529,21 @@ class RecordMetadataRedactionTests(_AuditTestCase):
             "termination_reason": self.poisoned("termination_reason"),
         }
 
-    def write_poisoned_record(self, **overrides):
+    def poisoned_report(self) -> str:
+        """A well-formed report whose FINDING IDS are report-controlled hostile
+        tokens: one credential-shaped (ID-shaped, so redaction has to catch it) and
+        two that are not id-shaped at all (so the shape check has to)."""
+        return (
+            "RESULT: PASS\nREVIEW_VERDICT: PASS WITH NOTES\n\n"
+            f"ID: {self.CAPABILITY}\nBlocking: YES\nLocation: a.py\n\n"
+            f"ID: {self.SECRET}\nBlocking: NO\nLocation: b.py\n\n"
+            f"ID: {_local_path(self.USER, 'private/repo')}\n"
+            "Blocking: NO\nLocation: c.py\n"
+        )
+
+    def write_poisoned_record(self, report: str | None = None, **overrides):
         """One record with a credential and a home path down every covered path."""
+        self.write_report(self.poisoned_report() if report is None else report)
         with patch(
             "scripts.run_logging.capture_stored_task_spec",
             return_value=(None, self.poisoned("capture failed")),
@@ -2662,6 +2675,76 @@ class RecordMetadataRedactionTests(_AuditTestCase):
         self.assertEqual(record, {"notes": None, "delivery_evidence": None,
                                   "failure_detail": ""})
 
+    # I-002-R1. The report is the one input NOBODY on the writer side controls, and
+    # its parse output lands in the record. Each route below injects a capability
+    # token, an env-secret value and a `/Users/<name>/` path through the report and
+    # asserts against the bytes that reach disk.
+
+    def assert_record_bytes_are_clean(self, published) -> None:
+        raw = (published / "record.json").read_text(encoding="utf-8")
+        self.assertNotIn(self.CAPABILITY, raw)
+        self.assertNotIn("topsecretvalue", raw)
+        self.assertNotIn(self.USER, raw)
+        self.assertNotIn(_local_path(self.USER), raw)
+
+    def test_a_malformed_result_never_reaches_the_record_as_raw_text(self) -> None:
+        published = self.write_poisoned_record(
+            report=f"RESULT: {self.poisoned('nonsense')}\n"
+        )
+
+        parsed = self.record_json(published)["report"]["parsed"]
+        # The invalid capture is not the field's value; the field stays in its set.
+        self.assertEqual(parsed["result"], run_logging.PARSED_ENUM_INVALID)
+        self.assertEqual(parsed["parse_status"], "malformed")
+        # It is still said, once, in the field that exists to say it -- redacted.
+        self.assertIn("RESULT:", parsed["parse_error"])
+        self.assertIn("<REDACTED:orca_dispatch_capability>", parsed["parse_error"])
+        self.assertIn("<REDACTED:env_secret_pattern>", parsed["parse_error"])
+        self.assertIn("<REDACTED:absolute_local_path>", parsed["parse_error"])
+        self.assert_record_bytes_are_clean(published)
+
+    def test_a_malformed_review_verdict_never_reaches_the_record_raw(self) -> None:
+        published = self.write_poisoned_record(
+            report=f"RESULT: PASS\nREVIEW_VERDICT: {self.poisoned('nonsense')}\n"
+        )
+
+        parsed = self.record_json(published)["report"]["parsed"]
+        self.assertEqual(parsed["result"], "PASS")
+        self.assertEqual(parsed["review_verdict"], run_logging.PARSED_ENUM_INVALID)
+        self.assertEqual(parsed["parse_status"], "malformed")
+        self.assertIn("REVIEW_VERDICT:", parsed["parse_error"])
+        self.assertIn("<REDACTED:orca_dispatch_capability>", parsed["parse_error"])
+        self.assert_record_bytes_are_clean(published)
+
+    def test_report_controlled_finding_ids_are_constrained_and_redacted(self) -> None:
+        published = self.write_poisoned_record()
+
+        parsed = self.record_json(published)["report"]["parsed"]
+        self.assertEqual(parsed["parse_status"], "ok")
+        # ID-shaped but a credential: the shape check passes it, redaction does not.
+        blocking = parsed["blocking_finding_ids"]
+        self.assertEqual(len(blocking), 1)
+        self.assertNotIn(self.CAPABILITY, blocking[0])
+        self.assertIn("<REDACTED:", blocking[0])
+        # Not ID-shaped at all: replaced outright, and the count stays honest.
+        self.assertEqual(
+            parsed["non_blocking_finding_ids"],
+            [run_logging.PARSED_FINDING_ID_INVALID] * 2,
+        )
+        self.assert_record_bytes_are_clean(published)
+
+    def test_a_well_formed_report_keeps_its_ids_and_its_enums(self) -> None:
+        """The other half again: constraining must not destroy real evidence."""
+        published = self.write_poisoned_record(report=FAILING_REPORT)
+
+        parsed = self.record_json(published)["report"]["parsed"]
+        self.assertEqual(parsed["parse_status"], "ok")
+        self.assertEqual(parsed["parse_error"], "")
+        self.assertEqual(parsed["result"], "FAIL")
+        self.assertEqual(parsed["review_verdict"], "FAIL")
+        self.assertEqual(parsed["blocking_finding_ids"], ["R1"])
+        self.assertEqual(parsed["non_blocking_finding_ids"], ["R2"])
+
     def test_no_free_form_string_field_escapes_the_covered_list(self) -> None:
         """The durable guard: a new string field added to the record must be either
         declared free-form (and redacted) or declared an identity here."""
@@ -2694,17 +2777,44 @@ class RecordMetadataRedactionTests(_AuditTestCase):
             "report.contract_path", "report.resolution", "report.capture_status",
             "report.captured_at", "report.redaction_policy_version",
             "report.artifact_path",
-            "report.parsed.parse_status", "report.parsed.parse_error",
-            "report.parsed.result", "report.parsed.review_verdict",
+            "report.report_digest_pre_redaction",
+            "report.artifact_digest_post_redaction",
+            "report.redactions.[].category",
+            "report.parsed.parse_status",
             "metadata_redaction.redaction_policy_version",
             "metadata_redaction.covered_fields.[]",
             "metadata_redaction.redactions.[].category",
         }
+        # I-002-R1. Parser output is NOT exempt by being called an enum: a field is
+        # exempt here only if the writer constrains it to a closed set BEFORE it is
+        # persisted, and that claim is proved against the bytes on disk rather than
+        # asserted by listing the field's name. `parse_error` and the finding-id
+        # lists are constrained by nothing, so they are covered instead.
+        constrained = {
+            "report.parsed.result": {
+                "", run_logging.PARSED_ENUM_INVALID, *run_logging.RESULT_VALUES,
+            },
+            "report.parsed.review_verdict": {
+                "",
+                run_logging.PARSED_ENUM_INVALID,
+                *run_logging.REVIEW_VERDICT_VALUES,
+            },
+        }
         covered = set(run_logging.FINAL_REVIEW_REDACTED_METADATA_FIELDS)
+
+        for field, allowed in constrained.items():
+            with self.subTest(field=field):
+                leaf = field.rpartition(".")[2]
+                self.assertIn(record["report"]["parsed"][leaf], allowed)
 
         for field in sorted(set(leaves(record))):
             with self.subTest(field=field):
-                self.assertIn(field, covered | exempt)
+                # A list of strings is covered by its containing field.
+                known = covered | exempt | set(constrained)
+                self.assertTrue(
+                    field in known or field.removesuffix(".[]") in known,
+                    f"{field} is neither covered nor declared constrained/identity",
+                )
 
 
 class AuditCaptureFailureTests(_AuditTestCase):

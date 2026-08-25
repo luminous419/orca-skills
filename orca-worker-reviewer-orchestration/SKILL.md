@@ -1261,13 +1261,21 @@ policy version, redaction 후 artifact digest, 그리고 category별 치환 횟�
 
 `record.json` 자체도 보존되는 artifact다. 따라서 record가 담는 **free-form string** — `notes`,
 `failure_detail`, `reviewer_agent_command`, `reviewer_agent_origin`, 세 section의 `capture_error`,
-그리고 delivery evidence의 `process_incarnation` / `last_failure` / `termination_reason` — 은
-persist 직전 단 한 곳에서 `input.md`/`report.md`와 **동일한 policy**를 통과한다. 무엇이 대상이었고
+delivery evidence의 `process_incarnation` / `last_failure` / `termination_reason`, 그리고 report에서
+유래한 `report.parsed.parse_error` 와 finding id 목록 — 은 persist 직전 단 한 곳에서
+`input.md`/`report.md`와 **동일한 policy**를 통과한다. 무엇이 대상이었고
 어떤 category가 몇 번 치환됐는지는 `metadata_redaction` (`redaction_policy_version`,
 `covered_fields`, `redactions`)이 말한다. 반대로 record가 증명하려고 존재하는 **identity**는 절대
 치환되지 않는다 — `run_id`/`task_id`/`dispatch_id`/`dispatch_key`, `reviewer_terminal`,
 `assignee_handle`, 이미 hash인 `capability_hash`, 그리고 validated enum들. over-redaction은
 secret-safe의 반대쪽 실패다.
+
+**report는 writer가 통제하지 않는 유일한 input이다.** 그래서 `RESULT:` / `REVIEW_VERDICT:` 의 capture가
+enum 검증에 실패하면 그 raw text는 field 값이 되지 못한다 — field는 `INVALID` sentinel을 담고, 문제의
+byte는 `parse_error` 한 곳에서만, 그것도 redaction을 거쳐 남는다. 즉 `result` / `review_verdict` 가
+redaction 없이 persist되어도 안전한 이유는 "enum이라고 불러서"가 아니라 **persist 전에 닫힌 집합으로
+제한되기 때문**이다. finding id 역시 report가 고른 token이므로 id 형태(`[A-Za-z0-9][A-Za-z0-9._-]{0,63}`)가
+아니면 `INVALID_ID` 로 대체되고(목록 길이는 그대로 유지된다), 형태를 통과한 값도 redaction을 한 번 더 거친다.
 
 **세 authority.** 서로를 대체하지 않는다.
 

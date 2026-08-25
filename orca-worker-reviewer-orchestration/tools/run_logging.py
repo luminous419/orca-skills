@@ -907,6 +907,12 @@ FINAL_REVIEW_REDACTED_METADATA_FIELDS = (
     "delivery_evidence.process_incarnation",
     "delivery_evidence.last_failure",
     "delivery_evidence.termination_reason",
+    # I-002-R1. Report-derived text is report-CONTROLLED text. `parse_error` quotes
+    # the capture that failed its enum check, and a finding id stays a token the
+    # report chose even after the shape check, so both pass through the policy too.
+    "report.parsed.parse_error",
+    "report.parsed.blocking_finding_ids",
+    "report.parsed.non_blocking_finding_ids",
 )
 
 # `unknown` is a MEMBER of the state set, not a separate absence-state: an absent
@@ -1267,13 +1273,38 @@ _BLOCKING_LINE = re.compile(r"^Blocking:\s*(YES|NO)\s*$", re.MULTILINE)
 RESULT_VALUES = ("PASS", "FAIL")
 REVIEW_VERDICT_VALUES = ("PASS", "PASS WITH NOTES", "FAIL", "BLOCKED")
 
+# I-002-R1. A capture that fails its enum check is report-controlled FREE TEXT, and
+# `record.json` is a retained artifact. So the invalid capture never becomes the
+# field's value: `result` and `review_verdict` hold their enum, `""`, or this
+# sentinel and nothing else, which is what makes them safe to persist unredacted.
+# The offending bytes are said once, in `parse_error` -- the field this codebase
+# already uses to say what was wrong -- and that field goes through the same
+# redaction policy every other free-form metadata field does.
+PARSED_ENUM_INVALID = "INVALID"
+
+# A finding id is an identifier, not prose. Anything not shaped like one is replaced
+# rather than retained (which also keeps the two lists' lengths honest), and what IS
+# retained is still report-controlled, so it is redacted on top of the shape check.
+PARSED_FINDING_ID_INVALID = "INVALID_ID"
+_SAFE_FINDING_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+def _finding_id(captured: str) -> str:
+    """The captured id if it is ID-shaped, the sentinel otherwise."""
+    return captured if _SAFE_FINDING_ID.match(captured) else PARSED_FINDING_ID_INVALID
+
 
 def parse_final_review_report(text: str) -> dict:
     """The section 11/17 shape, copied VERBATIM -- never re-derived, never collapsed.
 
-    `RESULT:` stays two-valued and `REVIEW_VERDICT:` stays four-valued: both are
-    carried through as the report wrote them, so nothing here can turn a
-    `PASS WITH NOTES` into a `PASS` or a `BLOCKED` into a `FAIL`.
+    `RESULT:` stays two-valued and `REVIEW_VERDICT:` stays four-valued: a VALID
+    value is carried through exactly as the report wrote it, so nothing here can
+    turn a `PASS WITH NOTES` into a `PASS` or a `BLOCKED` into a `FAIL`.
+
+    An INVALID value is not carried through: it becomes `PARSED_ENUM_INVALID` and
+    the raw capture is quoted only into `parse_error`. Verbatim is a fidelity rule
+    about the contract's enums, not a licence to copy arbitrary report text into a
+    retained record (I-002-R1).
     """
     parsed: dict[str, Any] = {
         "parse_status": "ok",
@@ -1288,23 +1319,27 @@ def parse_final_review_report(text: str) -> dict:
         parsed["parse_status"] = "malformed"
         parsed["parse_error"] = "no RESULT: line"
         return parsed
-    parsed["result"] = result.group(1)
-    if parsed["result"] not in RESULT_VALUES:
+    captured_result = result.group(1)
+    if captured_result not in RESULT_VALUES:
+        parsed["result"] = PARSED_ENUM_INVALID
         parsed["parse_status"] = "malformed"
         parsed["parse_error"] = (
-            f"RESULT: {parsed['result']!r} is not one of {RESULT_VALUES}"
+            f"RESULT: {captured_result!r} is not one of {RESULT_VALUES}"
         )
         return parsed
+    parsed["result"] = captured_result
     verdict = _REVIEW_VERDICT_LINE.search(text)
     if verdict is not None:
-        parsed["review_verdict"] = verdict.group(1)
-        if parsed["review_verdict"] not in REVIEW_VERDICT_VALUES:
+        captured_verdict = verdict.group(1)
+        if captured_verdict not in REVIEW_VERDICT_VALUES:
+            parsed["review_verdict"] = PARSED_ENUM_INVALID
             parsed["parse_status"] = "malformed"
             parsed["parse_error"] = (
-                f"REVIEW_VERDICT: {parsed['review_verdict']!r} is not one of "
+                f"REVIEW_VERDICT: {captured_verdict!r} is not one of "
                 f"{REVIEW_VERDICT_VALUES}"
             )
             return parsed
+        parsed["review_verdict"] = captured_verdict
     blocking: list[str] = []
     non_blocking: list[str] = []
     matches = list(_FINDING_ID_LINE.finditer(text))
@@ -1313,9 +1348,9 @@ def parse_final_review_report(text: str) -> dict:
         block = text[match.end():end]
         flag = _BLOCKING_LINE.search(block)
         if flag is not None and flag.group(1) == "YES":
-            blocking.append(match.group(1))
+            blocking.append(_finding_id(match.group(1)))
         elif flag is not None:
-            non_blocking.append(match.group(1))
+            non_blocking.append(_finding_id(match.group(1)))
     parsed["blocking_finding_ids"] = blocking
     parsed["non_blocking_finding_ids"] = non_blocking
     return parsed
@@ -1734,10 +1769,20 @@ def _redact_record_metadata(record: dict) -> list[dict]:
     breakdown says which field held a secret, which is a localization channel the
     aggregate does not have, and nothing reads a per-field number.
 
-    A missing field, a non-string value and an empty string are all skipped -- the
-    record's shape is decided by its writer, not by this function.
+    A covered field is a string or a list of strings -- the finding-id lists are the
+    second shape. A missing field, a value of any other shape and an empty string are
+    all skipped: the record's shape is decided by its writer, not by this function.
     """
     totals: dict[str, int] = {}
+
+    def substitute(value: str) -> str:
+        if not value:
+            return value
+        redacted, counts = redact_text(value)
+        for entry in counts:
+            totals[entry["category"]] = totals.get(entry["category"], 0) + entry["count"]
+        return redacted
+
     for dotted in FINAL_REVIEW_REDACTED_METADATA_FIELDS:
         *parents, leaf = dotted.split(".")
         container: Any = record
@@ -1746,12 +1791,10 @@ def _redact_record_metadata(record: dict) -> list[dict]:
         if not isinstance(container, dict):
             continue
         value = container.get(leaf)
-        if not isinstance(value, str) or not value:
-            continue
-        redacted, counts = redact_text(value)
-        container[leaf] = redacted
-        for entry in counts:
-            totals[entry["category"]] = totals.get(entry["category"], 0) + entry["count"]
+        if isinstance(value, str):
+            container[leaf] = substitute(value)
+        elif isinstance(value, list) and all(isinstance(item, str) for item in value):
+            container[leaf] = [substitute(item) for item in value]
     return [
         {"category": name, "count": totals[name]}
         for name, _pattern, _replacement in REDACTION_CATEGORIES
