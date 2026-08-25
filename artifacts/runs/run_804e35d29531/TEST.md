@@ -107,6 +107,8 @@ round. No verification claim was dropped; only the identifying content was.)*
 | `verify_package.py` green | **covered** | 107 source files |
 | existing lifecycle / Risk / Quality Profile / Agent Profile tests untouched and passing | **covered** | no pre-existing test file was edited this phase (`git show --stat f3d5792` = one added file); `RiskLoggingTests`, `test_risk_policy.py`, `test_quality_profile.py`, `test_agent_profile.py`, `test_workflow_contract.py` all green inside the full run |
 | no workflow path runs `git add` (DEC-6, `PLAN.md:664`) | **PARTIAL → test added** | `EvidenceBundleTests.test_this_module_runs_no_write_side_git_command` covers `run_logging.py` alone, and it inspects argv literals only — `run_logging.py` shells out as `["git", *args]` through a `_git()` wrapper, so the subcommand is not in the literal at all. Closed by `test_os22_required_tests.NoWriteSideGitOnAnyWorkflowPathTests` (5 tests) over five workflow modules + the installed twin, through argv literals, `_git()` call sites **and** the shelled-out string form |
+| `git diff --check <base>..HEAD` green *(**added by iteration 5** — this command was always one of PLAN/DESIGN's standing required regression commands, but iteration 1's case list did not name it, so no row of this table ever tracked it. DESIGN A.6 (R5) made that omission material. See `## TEST iteration 5`.)* | **covered** | `git diff --check 1045815..HEAD` → exit 0, no output, re-run at `ad22943`. Pinned as a test rather than only as a recorded run by `test_run_logging.RetainedReportWhitespaceExemptionTests.test_the_whitespace_gate_passes_over_the_whole_os22_range` |
+| the retained-report whitespace exemption is narrow and bought no digest change (T-5a, A.6) *(**added by iteration 5**)* | **covered** | `test_run_logging.RetainedReportWhitespaceExemptionTests` (7 tests), added by IMPLEMENTATION iteration 5 under `scripts/`, therefore inside the standard `unittest discover -s scripts -p 'test_*.py'` run — confirmed discovered and green there, not only under a targeted invocation. Independently re-derived by this phase: see `## TEST iteration 5` |
 
 ### T-6 — Neutrality (DEC-1)
 
@@ -1072,3 +1074,309 @@ Iteration 1's gap list is re-checked item by item rather than restated.
    three published files. Neither is a *proof* that a future field is safe — the closed table plus
    the two sweeps is the control, and it is a control that fails closed. Recorded so a reviewer
    does not have to re-derive why an enumerated table is acceptable here.
+
+## TEST iteration 5 — downstream revalidation for R5 (§17 T5a)
+
+Not a correction round: no TEST-phase finding is open, and `relevant_previous_findings` is empty.
+This is the §17 T5a revalidation triggered by one **corrected upstream artifact**. The Final
+Adversarial Review's R5 was adjudicated as a DESIGN-phase gap; DESIGN.md gained a new subsection
+**A.6** (commit `a8bec44`); IMPLEMENTATION applied it as a repository-root `.gitattributes`
+(`7718ea5`) and pinned it with `RetainedReportWhitespaceExemptionTests` (`d000d70`), recorded as
+`## IMPLEMENTATION iteration 5` in `ad22943`. Both artifacts precede TEST in canonical order, so
+this phase re-checks its own claims against them. This is the last iteration available to TEST
+under this run's `max-iterations=5` budget.
+
+**Something did have to change here, and it is stated up front so that "nothing needed updating"
+is visibly not what happened.** `git diff --check <base>..HEAD` is one of this project's standing
+required regression commands — PLAN and DESIGN both list it in T-5's command block (`DESIGN.md`
+§T-5, "All four green (`git diff --check` exits 0 with no output)") — but **iteration 1's T-5 case
+table never carried a row for it**. Every other required command had a row; this one did not. That
+was harmless while the gate happened to pass, and it stopped being harmless the moment R5 showed
+the gate had in fact been failing (exit 2, 40 errors) with no TEST-owned row tracking it. Two rows
+were therefore added to the T-5 table in place, above the iteration-2 divider, following this
+document's existing annotation convention.
+
+**No test was added by this round.** IMPLEMENTATION iteration 5 already wrote T-5a in the module
+that owns the mechanism, and the Task is explicit that this phase need not duplicate it. What this
+phase owed instead was (a) the missing coverage rows, and (b) an *independent* re-derivation of
+both halves of A.6 — run by this phase, from the tree as committed, not read out of
+IMPLEMENTATION's write-up. Both were done and both are below.
+
+### Test Scope / Existing Test Assessment
+
+Two questions, asked group by group: *does the corrected behaviour have a test in the suite this
+phase owns*, and *is any claim this document already made now false?*
+
+**1 — T-5, the whitespace gate. The one real gap, and it is a coverage-table gap, not a test gap.**
+
+`RetainedReportWhitespaceExemptionTests` (7 tests, `scripts/test_run_logging.py`) covers A.6's
+mechanism thoroughly and in the module that owns it — the gate's exit status, the exact
+`.gitattributes` rule text, the digest of every published record unit, the pinned hard-break
+report's 40 lines, `git check-attr` narrowness including the glob boundaries, and a clone-based
+mutation control. There is nothing this phase could add to that without duplicating it, and the
+Task says not to.
+
+What was missing is on this document's side. **T-5's case table did not name `git diff --check` at
+all** — the string appeared nowhere in this file before this round. So the one required command
+that R5 turned out to be failing was the one command T-5 was not tracking. **Gap → coverage rows
+added**, not tests:
+
+* a row for `git diff --check <base>..HEAD` as a standing required command, with its re-run result
+  and the test that now pins it rather than only a recorded run;
+* a row acknowledging that `RetainedReportWhitespaceExemptionTests` exists, lives under `scripts/`,
+  and is therefore inside the standard `unittest discover -s scripts -p 'test_*.py'` run — a claim
+  this phase verified by name in the discovery output rather than inferring from the file's
+  location (below).
+
+**2 — T-6, neutrality. Not affected, and checked rather than assumed.**
+
+R5 is a repository *Git-attribute* change. It adds one file, `.gitattributes`, that no Python
+module reads, and it changes the behaviour of `git diff --check`, `git apply --whitespace` and
+`git am` only. It touches no detection policy, no search policy, no redaction rule, no scorer
+arithmetic, no `render_task_spec()` surface, and no byte of the reviewer-visible fixture. The
+mechanism is nonetheless *adjacent* to reviewer-visible bytes — its whole purpose is that certain
+retained bytes must not change — so "pure attribute change" was verified, not asserted: the
+neutrality golden was re-run, and the retained bytes were re-hashed independently. Both below.
+**No claim invalidated.**
+
+**3 — T-1, T-2, T-3, T-4.** No claim invalidated, and the reasoning is the same shape as T-6's: no
+production module, fixture, or record byte was modified by R5. The strongest available evidence is
+not that argument but the digest sweep in *Behavior Covered* — every published record unit under
+every `final_review_audit/` directory still hashes to the value its own `record.json` recorded,
+which is precisely what T-1's audit-integrity and T-3's redaction claims rest on. If R5 had
+disturbed any of them, that sweep is where it would show.
+
+### Added / Modified Tests
+
+**None.** No test file was created, edited, weakened, skipped or deleted by this round, and no
+production file was touched.
+
+| file | change |
+|---|---|
+| `artifacts/runs/run_804e35d29531/TEST.md` | two rows added to the `### T-5 — Regression` table in place (each carrying an `**added by iteration 5**` marker, per this document's convention); this section appended. Nothing removed. |
+
+The tests that discharge the new rows were written by IMPLEMENTATION iteration 5 and are named in
+those rows. Restating them here as though this phase authored them would be the failure mode the
+Task explicitly rules out.
+
+### Behavior Covered
+
+Every item below was run by this phase against the tree as committed at `ad22943`, before this
+round's own edit. None of it is quoted from IMPLEMENTATION's write-up.
+
+**1 — The gate passes, independently confirmed (step 1).**
+
+```text
+$ git diff --check 1045815..HEAD ; echo EXIT=$?
+EXIT=0
+```
+
+No output, exit 0, from the repository root at `ad22943`.
+
+**2 — `RetainedReportWhitespaceExemptionTests` is reached by the standard discovery run (step 3).**
+
+Not inferred from the file living under `scripts/`. The full discovery run was executed with `-v`
+and its output grepped for the class name: **7** test methods appear, all `ok`, under the module
+name `test_run_logging` as `unittest discover -s scripts` resolves it:
+
+```text
+test_every_retained_artifact_still_matches_its_recorded_digest      ... ok
+test_only_retained_reports_are_exempt                               ... ok
+test_the_gate_fails_again_once_the_exemption_is_removed             ... ok
+test_the_gitattributes_rule_is_exactly_the_one_designed             ... ok
+test_the_hard_break_report_keeps_its_forty_trailing_space_lines     ... ok
+test_the_pattern_does_not_leak_outside_the_audit_directories        ... ok
+test_the_whitespace_gate_passes_over_the_whole_os22_range           ... ok
+```
+
+**3 — The exempted bytes were not bought by trimming (step 1's other half).**
+
+Re-derived directly, not through the test. For **every** record unit under
+`artifacts/runs/*/final_review_audit/*/`, both the `report` and the `stored_task_spec` member were
+re-hashed from disk and compared against the `artifact_digest_post_redaction` /
+`byte_length_post_redaction` its own `record.json` records:
+
+```text
+OK  stored_task_spec  run_804e35d29531/…__ctx_4b509b12a0b1/input.md   9322  sha256:cb503eeb…
+OK  stored_task_spec  run_804e35d29531/…__ctx_6478d2923ca0/input.md   9322  sha256:cb503eeb…
+OK  stored_task_spec  run_804e35d29531/…__ctx_99cc7e6b886c/input.md   9322  sha256:cb503eeb…
+OK  report            run_92759e0e1034/…__ctx_1f82fd26c92b/report.md  6028  sha256:6f91033e…
+OK  stored_task_spec  run_92759e0e1034/…__ctx_1f82fd26c92b/input.md   4104  sha256:03001ef4…
+OK  report            run_ff587481a820/…__ctx_33c8c8414587/report.md  6503  sha256:c9aecb9f…
+OK  stored_task_spec  run_ff587481a820/…__ctx_33c8c8414587/input.md   3936  sha256:e084234f…
+ALL_DIGESTS_MATCH True
+```
+
+`run_804e35d29531`'s three units carry `report.capture_status = "absent"` with an empty
+`artifact_path`, so they have no retained report bytes to bind and only their `input.md` is
+checked — which is why the sweep must not be read as "3 of 5 reports were skipped for
+convenience". The pinned file specifically:
+
+```text
+$ shasum -a 256 …/attempt1__task_936f73b5d2eb__ctx_1f82fd26c92b/report.md
+6f91033e4e2f644ab64eb4e61292734671b588d51ff0eb1649c626f8ae748e18
+$ wc -c < …/report.md            → 6028
+$ grep -c '  $' …/report.md      → 40
+$ git diff --quiet -- 'artifacts/runs/*/final_review_audit/*/report.md' ; echo $?  → 0
+```
+
+40 two-trailing-space hard-break lines still present, digest and length exactly as recorded, and
+every retained `report.md` byte-identical to `HEAD`. The gate passing did **not** cost a byte.
+
+**4 — The exemption is narrow, measured independently.**
+
+```text
+unset        artifacts/runs/*/final_review_audit/*/report.md      (5 of 5)
+unspecified  artifacts/runs/*/final_review_audit/*/input.md       (5 of 5)  ┐ 10 sibling files,
+unspecified  artifacts/runs/*/final_review_audit/*/record.json    (5 of 5)  ┘ all still gated
+unspecified  scripts/run_logging.py, README.md
+unspecified  report.md, artifacts/report.md, artifacts/runs/<run>/report.md   (glob boundaries)
+```
+
+The committed `.gitattributes` is four comment lines plus exactly one rule,
+`artifacts/runs/*/final_review_audit/**/report.md -whitespace`. It is tracked
+(`git ls-files --error-unmatch .gitattributes` succeeds), so it travels with a clone rather than
+depending on an untracked working-tree file. There is no `* -whitespace` line and no
+`core.whitespace` change.
+
+**5 — The regression control, re-derived by this phase in a throwaway clone.**
+
+A local clone of `HEAD` was made and three independent controls run in it. This is the assertion
+that matters most, because a gate that passes for the wrong reason looks identical to one that
+passes for the right reason:
+
+| control | expected | observed |
+|---|---|---|
+| clone as-is: is `.gitattributes` present after `git clone`? | yes — it is committed | **YES** |
+| clone as-is: `git diff --check 1045815..HEAD` | exit 0 | **exit 0**, no output |
+| `.gitattributes` deleted: same command | exit 2, naming only the hard-break report | **exit 2, 40 `trailing whitespace.` errors**, all in `run_92759e0e1034/…__ctx_1f82fd26c92b/report.md` |
+| `.gitattributes` restored, then trailing whitespace committed into `scripts/_ws_probe_tmp.py` | still flagged | **exit 2**, flagged |
+| …and into the sibling `input.md` of the *same* record unit | still flagged | **exit 2**, flagged |
+| …and into the exempted `report.md` itself | not flagged | **not flagged** (0 occurrences in the output) |
+
+The clone was deleted afterwards and `git status` on the real repository confirms no probe file,
+no mutation, and a working tree carrying only this round's TEST.md edit. **The exemption removes
+exactly the 40 pre-existing errors and suppresses nothing else** — including nothing in the other
+two files of the very same record unit. The last row is the honest cost of the mechanism and is
+recorded as a gap below rather than buried here.
+
+**6 — T-6 neutrality, re-run rather than argued (step 5).**
+
+```text
+Command: python3 -m unittest scripts.test_e2e_harness.FinalReviewObservabilityNeutralityTests -v
+Result:  PASS — Ran 12 tests, OK
+```
+
+`test_every_workflow_spec_is_byte_identical_to_the_pre_os22_capture` and
+`test_every_direct_spec_is_byte_identical_to_the_pre_os22_capture` both pass against the unchanged
+`scripts/fixtures/os22_neutrality/pre_os22_task_specs.json`; `git status` reports the fixture,
+`e2e_harness.py` and `orca_runtime_harness.py` all clean, so the golden was not regenerated to fit.
+`test_render_task_spec_gained_no_parameter` and the two audit-unreachability tripwires also pass.
+R5 changed no detection or search policy, and the golden confirms it changed no reviewer-visible
+byte either.
+
+### Execution
+
+All of T-5's regression commands — now including the one this round added a row for — re-run at
+`ad22943`, after IMPLEMENTATION iteration 5's changes and before this round's TEST.md edit.
+
+```text
+Command: python3 scripts/validate_skills.py
+Result:  PASS — "Skill validation PASSED (463 checks)"
+                (unchanged; the new repository-root .gitattributes does not perturb it)
+
+Command: python3 -m unittest discover -s scripts -p 'test_*.py'
+Result:  PASS — "Ran 1026 tests in 66.012s / OK (skipped=6)"
+                (1019 at iteration 4, +7 from IMPLEMENTATION iteration 5's T-5a, +0 here —
+                 this round adds no test. The 6 skips are test_orca_runtime.py's opt-in
+                 live-runtime tests, pre-existing and unrelated.)
+
+Command: python3 scripts/verify_package.py
+Result:  PASS — "Package verification PASSED (107 source files)"
+                (unchanged: .gitattributes is not a packaged source file)
+
+Command: cmp scripts/run_logging.py orca-worker-reviewer-orchestration/tools/run_logging.py
+Result:  PASS — no output, exit 0 (byte-identical; R5 touched neither copy)
+
+Command: git diff --check 1045815..HEAD
+Result:  PASS — exit 0, no output   ← the command T-5 had no row for until this round
+```
+
+Per-group runs:
+
+```text
+Command: python3 -m unittest scripts.test_e2e_harness.FinalReviewObservabilityNeutralityTests
+Result:  PASS — Ran 12 tests, OK                 (T-6, the byte-identity golden)
+
+Command: python3 -m unittest discover -s scripts -p 'test_*.py' -v  | grep RetainedReport…
+Result:  PASS — 7 methods of RetainedReportWhitespaceExemptionTests present and ok
+                (T-5a is reached by standard discovery, verified by name, not by inference)
+```
+
+### Failures / Findings
+
+**No test failed, and no new defect was found.** A.6 behaves exactly as DESIGN specifies and as
+IMPLEMENTATION reports, and this phase's independent re-derivation reproduces every claim it
+checked — including the two that could have been true for the wrong reason (the gate passing, and
+the digests being intact).
+
+**Stated explicitly, per step 6 of the Task:** beyond the two coverage rows added to the T-5 table
+and this section, **nothing else needed updating**, and the evidence for that is the audit above
+rather than an absence of investigation — 1026 tests green, five required commands green, 7 record
+members re-hashed, 15 `check-attr` paths measured, 6 clone controls run, and the T-6 golden re-run.
+
+Per this phase's Mandatory Invariant, no production defect was fixed here in any case. The one
+production defect this phase has ever reported, **T-001** (`final_review_eval.py score` tracebacks
+on a malformed findings document), is unrelated to R5 — R5 touches no Python module — and remains
+**open, MINOR, non-blocking**, unchanged in severity and in its suggested fix from iteration 4's
+re-verification. It was not re-executed this round because no code on its path changed since
+`0582aed`; `git log --oneline 0582aed..HEAD -- scripts/final_review_eval.py` is empty.
+
+### Disclosure re-check over this round's own draft and the corrected upstream artifact
+
+Iteration 3's P-1 rule binds committed reviewer-visible evidence, and iteration 3's
+`metric_inference` check exists precisely because a correction can introduce an arithmetic
+disclosure that no token scan sees. Both were re-run on this round's **draft**, before commit,
+rather than assumed.
+
+| target | result |
+|---|---|
+| `TEST.md`, with this section appended — literal `scan-leak` | **PASSED**, 0 hits |
+| `TEST.md`, with this section appended — `semantic_leak_scan --profile evidence` (identity checks + `metric_inference`) | **PASSED**, 0 hits |
+| `BASELINE_RESULT.md`, unchanged this round | **PASSED**, 0 hits on both scanners — re-verified, not assumed |
+| the other 12 files of iteration 3's committed evidence set | byte-unchanged since that sweep, so the recorded result stands |
+
+**The R5 correction added no disclosure to either upstream artifact.** Reported as an observation,
+not fixed — they belong to other phases.
+
+| artifact | before R5 | after | delta |
+|---|---|---|---|
+| `DESIGN.md` (`a8bec44~1` → now, i.e. the A.6 subsection alone) | 379 hits, 8 of them `metric_inference` | **379 / 8** | **none** |
+| `IMPLEMENTATION.md` (`ad22943~1` → now) | 2 hits, 0 `metric_inference` | **2 / 0** | **none** |
+
+`DESIGN.md`'s pre-existing profile remains what iteration 4 escalated and did not fix: a
+DESIGN-phase artifact carrying one REL-1 hit that solves to the key population, predating R1/R3 and
+never part of the 14-file evidence set iteration 3 swept. R5 neither worsened nor addressed it, and
+it stays escalated rather than fixed here for the same reason as before — it is above this
+revalidation's scope and belongs to another phase.
+
+### Remaining Gaps
+
+Iteration 4's list stands unchanged — items 1 through 6 are all untouched by R5, which changes no
+Python, no fixture and no baseline. One item is added, and it is the direct cost of A.6 rather than
+an unrelated observation.
+
+7. **New: trailing whitespace inside a retained `report.md` is now permanently unpoliced — by
+   design, and this is the trade DESIGN A.6 made explicitly.** Control 6 of the clone experiment
+   above demonstrates it directly: a *newly committed* trailing-whitespace line inside the exempted
+   `report.md` is not flagged by `git diff --check`. That is the intended behaviour — the whole
+   point is that Reviewer-authored Markdown hard breaks in a digest-bound, A.3-immutable snapshot
+   must survive — and A.6 argues the case at length. It is recorded here anyway because it is a
+   real reduction in gate coverage over one path class, it is invisible from the passing gate, and
+   a future reader is entitled to see the cost stated by the phase that verified it rather than
+   only by the phase that chose it. The countervailing controls are the ones measured above: the
+   exemption is one path pattern, the two sibling files of the same record unit stay gated, and
+   `RetainedReportWhitespaceExemptionTests` (b)/(d) mean a retained report cannot be *edited*
+   without failing the digest assertions and the exemption cannot be *removed* without failing the
+   mutation test. Nothing about the gap suggests a different mechanism; it is a limit, not a
+   defect, and no Finding is raised for it.
