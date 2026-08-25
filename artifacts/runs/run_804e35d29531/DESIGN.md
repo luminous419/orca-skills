@@ -510,6 +510,113 @@ MINOR is bumped for additive fields; MAJOR for any change to the meaning of an e
 There is no code path anywhere that yields `accepted` from a record that did not read `ok` and did
 not carry `"provenance_state": "accepted"` literally.
 
+#### A.6 Retained audit Markdown vs. the repository whitespace gate (R5)
+
+A.3 makes a published `<dispatch_key>/` byte-for-byte immutable, and A.4/C.5 bind each retained
+file to a digest recorded inside `record.json`. The repository's required final validation is
+`git diff --check <base>..HEAD`. Those two rules collided on real committed evidence, and this
+subsection is the mechanism that lets both hold at once. It changes **no** other part of D-A.
+
+**The observed conflict.** `git diff --check 1045815..HEAD` exits **2** with **40** errors, all of
+kind `trailing whitespace.`, all in one file:
+
+```text
+artifacts/runs/run_92759e0e1034/final_review_audit/attempt1__task_936f73b5d2eb__ctx_1f82fd26c92b/report.md
+    lines 12-19, 22-29, 32-39, 42-49, 52-59   (40 lines)
+```
+
+**Root cause, stated exactly.** Those 40 lines end in two spaces. That is the Markdown *hard line
+break* — the standard, correct way for the Reviewer to force a line break inside a paragraph, and
+what makes the `ID:` / `Severity:` / `Blocking:` finding blocks render as separate lines. Git's
+default whitespace rule set includes `blank-at-eol`, and `git diff --check` reports every **added**
+line matching an active rule and exits 2 when any is found. Neither side is wrong: the report is
+valid Markdown, and the gate is doing exactly what its default configuration asks. The defect is
+that the OS-22 contract never said how byte-exact retained audit Markdown participates in that gate.
+
+**Why the bytes cannot simply be trimmed.** `record.json` for that dispatch records
+
+```text
+report.artifact_digest_post_redaction = sha256:6f91033e4e2f644ab64eb4e61292734671b588d51ff0eb1649c626f8ae748e18
+report.byte_length_post_redaction     = 6028
+```
+
+and that digest recomputes over the committed bytes exactly as they stand (verified: `shasum -a
+256` of the file on disk equals the recorded value, and `git diff --quiet` confirms the working
+copy is byte-identical to `HEAD`). Trimming the 40 lines changes both the digest and the byte
+length, which would either falsify the published record or require mutating it — and A.3/P7 give
+the writer no mutation surface at all. Re-deriving the report is equally excluded: it is a
+*retained snapshot of Reviewer-produced bytes*, not a regenerable artifact. So the fix must make
+the gate pass **without touching a single byte of any published record**.
+
+**Scope, measured rather than assumed.** Every file under every `final_review_audit/` directory in
+the repository was scanned for trailing whitespace in its committed bytes:
+
+| path class | files | files with trailing whitespace |
+|---|---|---|
+| `artifacts/runs/*/final_review_audit/**/report.md` | 5 | 1 (40 lines) |
+| `artifacts/runs/*/final_review_audit/**/input.md` | 5 | 0 |
+| `artifacts/runs/*/final_review_audit/**/record.json` | 5 | 0 |
+
+Only `report.md` is affected, and only `report.md` *can* be affected as a class, because it is the
+only member of the record unit whose bytes are free-form prose authored by an external Reviewer
+agent that legitimately uses Markdown hard breaks. `input.md` is a canonicalized capture of the
+stored Task spec and `record.json` is writer-serialized JSON — both are produced by this codebase
+under its own formatting control, so both stay fully covered by the gate and are **not** exempted.
+The exemption is therefore scoped to `report.md` alone, not to the audit directory.
+
+**The mechanism — a path-scoped Git `-whitespace` attribute.** One line, one new repository-root
+file:
+
+```gitattributes
+# .gitattributes
+# Retained Final Review reports are byte-exact snapshots of Reviewer-authored Markdown, digest-
+# bound by record.json and immutable under DESIGN A.3. Markdown hard breaks (two trailing spaces)
+# are legitimate there and must not be trimmed, so this path is exempt from git's whitespace
+# rules. Scope is exactly these snapshots; every other path keeps the default rules.
+artifacts/runs/*/final_review_audit/**/report.md -whitespace
+```
+
+`-whitespace` (attribute *unset*) tells `git diff --check`, `git apply --whitespace`, and
+`git am` to apply **no** whitespace rules to matching paths. It is Git-native, it is the mechanism
+Git documents for exactly this case, and it is honoured for already-committed content because
+`git diff` resolves attributes from the working-tree `.gitattributes`, not from the commits being
+compared — so a range that ends at `HEAD` is covered the moment the file exists in the checkout.
+
+**Verified empirically before being written down** (this was tested against the real failing file,
+not reasoned about):
+
+| check | result |
+|---|---|
+| `git diff --check 1045815..HEAD` with the attribute present | **exit 0**, no output (was exit 2 / 40 errors) |
+| same, in a fresh `git clone` with `.gitattributes` **committed** | **exit 0**, no output |
+| `report.md` digest after the change | `sha256:6f91033e…e748e18` — **unchanged**; `git diff --quiet` reports the file unmodified |
+| `git check-attr whitespace` on the affected `report.md` | `unset` |
+| `git check-attr whitespace` on sibling `input.md` / `record.json` | `unspecified` (still gated) |
+| trailing whitespace introduced into a `src/*.py` file | still flagged, **exit 2** |
+| trailing whitespace introduced into a `final_review_audit/**/input.md` | still flagged, **exit 2** |
+| `verify_package.py` / `validate_skills.py` with the file present | PASSED (107 source files) / PASSED (463 checks) |
+
+Glob boundaries were checked the same way: `report.md`, `artifacts/report.md` and
+`artifacts/runs/<run>/report.md` all resolve `unspecified`; only paths of the form
+`artifacts/runs/<run>/final_review_audit/**/report.md` resolve `unset`.
+
+**What this does not do.** The exemption is a single path pattern. It is **not** repo-wide, does
+not use `* -whitespace`, does not touch `core.whitespace`, and does not alter the gate for
+production code, skills, scripts, tests, docs, or any other artifact — including the other two
+files of the very same record unit. `git diff --check` keeps its full default coverage everywhere
+else, which the negative controls above demonstrate rather than assert. The rule is also
+future-proof in the right direction: it covers any *future* retained report whose Reviewer uses
+hard breaks, so this class of failure cannot recur, while a whitespace defect in real code is
+still caught.
+
+**Regression requirement.** T-5 gains a two-part test that pins both halves of this invariant —
+that the gate passes, and that it passes *because of the attribute* rather than because someone
+trimmed the file. See `## Testing Strategy` → T-5.
+
+**Implementation note.** `.gitattributes` is a new repository-root file and is added to the Files
+summary in `## Expected Changed Files / Implementation Steps`. It is created in Step 0 (before any
+product change), so every subsequent step's own `git diff --check` run is already clean.
+
 ---
 
 ### D-B — Provenance state machine (DEC-2)
@@ -2310,6 +2417,7 @@ destroy evidence if violated.
 | `scripts/test_e2e_harness.py` | add `NEUTRALITY_WORKFLOWS`, `NEUTRALITY_DIRECT_CASES`, `NEUTRALITY_CANONICALIZATION`, `_TASK_SPEC_NONDETERMINISM_TRIPWIRES`, `canonicalize_task_spec()` and `capture_neutrality_task_specs()` — **new** functions, not an extension of `capture_legacy_artifacts()` and **never calling `_normalize_artifact()` on a Task spec** (**HARD**, N.1.1); `_normalize_artifact()` itself is left byte-for-byte unmodified so OS-4's `LegacyByteIdentityTests` keeps its exact input |
 | `scripts/fixtures/os22_neutrality/pre_os22_task_specs.json` | **new**, generated by running that function inside a `git archive 1045815` checkout |
 | `scripts/fixtures/os22_neutrality/README.md` | **new**: what it holds, how it was generated, and the regeneration rule (N.2) |
+| `.gitattributes` | **new**, one commented rule: `artifacts/runs/*/final_review_audit/**/report.md -whitespace` (A.6). Created first so every later step's `git diff --check` run is already clean, and so the fix can never be mistaken for a retroactive patch over a failing gate |
 
 A golden generated after implementation proves nothing. Verify by diffing the fixture's own
 `captured_from_commit` against `git rev-parse --short 1045815` in the test.
@@ -2403,6 +2511,7 @@ the bundle; `CHANGELOG.md`; `COMPATIBILITY.md`. Draft PR
 ### Files summary
 
 ```text
+NEW   .gitattributes                                             (one line, A.6/R5)
 NEW   scripts/final_review_eval.py
 NEW   scripts/test_final_review_eval.py
 NEW   scripts/fixtures/os22_neutrality/{pre_os22_task_specs.json,README.md}
@@ -2629,11 +2738,41 @@ count tests.
 python3 scripts/validate_skills.py
 python3 -m unittest discover -s scripts -p 'test_*.py'
 python3 scripts/verify_package.py
+git diff --check 1045815..HEAD
 ```
 
-All three green. Plus: existing lifecycle / Risk / Quality Profile / Agent Profile tests untouched
-and passing; and a grep assertion that **no workflow path performs an automatic `git add`, commit
-or push of run artifacts** (PLAN C20).
+All four green (`git diff --check` exits 0 with no output). Plus: existing lifecycle / Risk /
+Quality Profile / Agent Profile tests untouched and passing; and a grep assertion that **no
+workflow path performs an automatic `git add`, commit or push of run artifacts** (PLAN C20).
+
+#### T-5a Retained-report whitespace exemption — `scripts/test_run_logging.py` (A.6, R5)
+
+`RetainedReportWhitespaceExemptionTests`. The point of the test is that the two halves of A.6 must
+hold **together**: passing the gate is worthless if it was bought by editing a digest-bound file,
+and an intact digest is worthless if the gate still fails. Both are asserted in one test class, and
+neither assertion may be satisfied by the other's fix.
+
+* **(a) The gate passes.** Run `git diff --check 1045815..HEAD` as a subprocess from the repository
+  root and assert **exit 0 and empty stdout**. Skipped — not passed — when the repository has no
+  `.git` directory or commit `1045815` is unreachable, so the test never silently degrades into a
+  vacuous success.
+* **(b) The exempted bytes are untouched.** For **every** published record unit found under
+  `artifacts/runs/*/final_review_audit/*/`, load `record.json` and re-hash the file named by
+  `report.artifact_path`; assert the SHA-256 equals `report.artifact_digest_post_redaction` and the
+  size equals `report.byte_length_post_redaction`. The same check is applied to
+  `stored_task_spec.artifact_path`. This is what proves the exemption did not require trimming the
+  file:
+  `artifacts/runs/run_92759e0e1034/final_review_audit/attempt1__task_936f73b5d2eb__ctx_1f82fd26c92b/report.md`
+  must still hash to `sha256:6f91033e4e2f644ab64eb4e61292734671b588d51ff0eb1649c626f8ae748e18` at
+  6028 bytes, with its 40 hard-break lines intact.
+* **(c) The exemption is narrow, asserted rather than assumed.** `git check-attr whitespace --
+  <path>` returns `unset` for each retained `report.md`, and `unspecified` for each sibling
+  `input.md` and `record.json`, for `scripts/run_logging.py`, and for the repository-root
+  `README.md`. A repo-wide `* -whitespace` line or a `core.whitespace` change would fail this
+  assertion.
+* **(d) Mutation check.** With `.gitattributes` temporarily moved aside in a scratch clone, (a)
+  must **fail** with exit 2. That is what makes T-5a a real regression rather than a test that
+  passes because the underlying condition happens not to occur.
 
 ### T-6 Neutrality — `scripts/test_e2e_harness.py`
 
@@ -2773,6 +2912,65 @@ the maintenance burden is stated so it is not discovered later as a surprise.
   recorded in N.2.
 
 ## Review Feedback Resolution
+
+### DESIGN iteration 5 (correction) — Final Adversarial Review R5
+
+Source: `artifacts/runs/run_804e35d29531/FINAL_REVIEW_iteration2.md` (RESULT: FAIL). One
+MAJOR/blocking finding, R5. The same review confirmed R1, R2, R3 and R4 **resolved** and found the
+two documented residual disclosures (the append-only `ORCHESTRATOR_LOG.md` row and the three
+immutable `final_review_audit/**/input.md` files) **acceptable** under the audit-immutability
+invariants. None of those is reopened here. This iteration adds **one new subsection, A.6**, and
+the test and file-list entries that A.6 requires; D-B, D-C, D-D, D-E, D-F and N-1 are untouched, no
+PLAN DEC is reopened, and no already-committed byte is modified.
+
+#### R5 — the mandatory whitespace gate failed on an immutable retained report (G5, MAJOR, blocking)
+
+**Finding.** `git diff --check 1045815..HEAD` exits 2 with 40 `trailing whitespace.` errors in
+`artifacts/runs/run_92759e0e1034/final_review_audit/attempt1__task_936f73b5d2eb__ctx_1f82fd26c92b/report.md`.
+The bytes cannot be trimmed: `record.json` binds them to
+`artifact_digest_post_redaction = sha256:6f91033e...e748e18` at 6028 bytes, and A.3/P7 make a
+published record immutable with no mutation surface. The repository state could therefore satisfy
+the required full validation **or** its own immutable-evidence rule, never both.
+
+**Root cause.** The 40 lines end in two spaces — the Markdown hard line break, which is what makes
+the Reviewer's `ID:` / `Severity:` / `Blocking:` blocks render as separate lines. Git's default
+whitespace rules include `blank-at-eol`, so `git diff --check` flags every such added line. Both
+sides are individually correct; the design was silent on how byte-exact retained audit Markdown
+participates in the gate. This is a **design** omission, not an implementation defect — the
+implementation correctly retained and digested the Reviewer-produced bytes.
+
+**Resolution — new A.6.** A path-scoped Git `-whitespace` attribute in a new repository-root
+`.gitattributes`, matching `artifacts/runs/*/final_review_audit/**/report.md` and nothing else.
+This suppresses the gate for that artifact class without altering one byte of any published record.
+
+**Scope was measured, not assumed.** All 15 files under all three `final_review_audit/` directories
+were scanned: only `report.md` carries trailing whitespace (1 of 5 files, 40 lines), and only
+`report.md` *can*, because it is the sole member of the record unit whose bytes are free-form prose
+authored by an external Reviewer. `input.md` and `record.json` are produced by this codebase under
+its own formatting control and stay fully gated. The exemption is scoped to `report.md`, not to the
+audit directory.
+
+**The mechanism was verified before being written down**, against the real failing file rather than
+by reasoning: the gate goes 2 -> 0 with the attribute present, again in a fresh clone with
+`.gitattributes` committed; the report's digest is unchanged and `git diff --quiet` reports the
+file unmodified; `git check-attr` returns `unset` only for retained `report.md` paths and
+`unspecified` for siblings, source and docs; trailing whitespace injected into `src/*.py` and into
+a sibling `input.md` is still flagged with exit 2; and `verify_package.py` / `validate_skills.py`
+still pass with the new root file present. The full evidence table is in A.6.
+
+**Regression.** New T-5a asserts the gate passes **and** that every retained artifact still matches
+its recorded digest and byte length, plus a narrowness assertion over `git check-attr` and a
+mutation check that fails when `.gitattributes` is moved aside. Either half alone would be
+satisfiable by the wrong fix; only the conjunction pins the invariant. `git diff --check
+1045815..HEAD` is also added to T-5's standing command list so the gate is a first-class regression
+rather than an ad-hoc manual step.
+
+#### Not reopened in iteration 5
+
+R1, R2, R3, R4 and their D-C / D-E fixes are confirmed resolved and are untouched. The two
+Coordinator-owned residual disclosures are settled and untouched. Nothing in D-A other than the new
+A.6 changed, and A.3's immutability rule is strengthened by this iteration rather than relaxed —
+the whole point of the mechanism chosen is that it required zero edits to published bytes.
 
 ### DESIGN iteration 4 (correction) — Final Adversarial Review D3-001
 
