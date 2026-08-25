@@ -878,6 +878,37 @@ FINAL_REVIEW_AUDIT_FILENAMES = (
 )
 FINAL_REVIEW_EVIDENCE_BUNDLE_FILENAME = "FINAL_REVIEW_EVIDENCE_BUNDLE.json"
 
+# record.json is a retained artifact too. Every FREE-FORM string it carries -- text a
+# human, an agent or the runtime wrote, as opposed to an identifier the record exists
+# to preserve -- passes through the same versioned policy input.md and report.md do,
+# at the single choke point below. The list is closed and dotted so a new free-form
+# field cannot be added "next to" one of these and silently skip redaction: a field
+# absent from this tuple is not redacted, and that is visible here rather than buried
+# in an assembly expression.
+#
+# Deliberately ABSENT, and why: `run_id`, `task_id`, `dispatch_id`, `dispatch_key`,
+# `reviewer_terminal` and `delivery_evidence.assignee_handle` are the identities the
+# record exists to prove (section 1 requires the reviewer terminal by name);
+# `capability_hash` is already a hash, never the dcap_ token; `provenance_state`,
+# `void_reason`, `settlement_state` and `input_altered_across_retry` are validated
+# enums; `report.contract_path` is relativized-or-redacted at construction by
+# _relative_artifact_path(). Redacting an identity would destroy the evidence the
+# record is for, which is the other half of "secret-safe".
+FINAL_REVIEW_REDACTED_METADATA_FIELDS = (
+    "reviewer_agent_command",
+    "reviewer_agent_origin",
+    "failure_detail",
+    "notes",
+    "stored_task_spec.capture_error",
+    "report.capture_error",
+    "delivery_evidence.capture_error",
+    # C.3 says so explicitly: process_incarnation embeds a workspace path, so it
+    # passes through category 4 like any other text.
+    "delivery_evidence.process_incarnation",
+    "delivery_evidence.last_failure",
+    "delivery_evidence.termination_reason",
+)
+
 # `unknown` is a MEMBER of the state set, not a separate absence-state: an absent
 # field, an unparseable record, an unknown MAJOR and a literal "unknown" all read as
 # unknown, through one state machine. Nothing anywhere defaults to `accepted`.
@@ -1691,6 +1722,43 @@ def _delivery_section(evidence: dict | None, error: str) -> dict:
     return section
 
 
+def _redact_record_metadata(record: dict) -> list[dict]:
+    """Redact every free-form field of FINAL_REVIEW_REDACTED_METADATA_FIELDS in place.
+
+    Returns the aggregated `[{category, count}]` in the C.3 policy order, with the
+    same C.4 shape the two artifact sections use: an entry only for a category that
+    matched at least once, no offsets, no per-occurrence digest, and never the removed
+    value. `[]` therefore means "nothing was substituted anywhere in the metadata".
+
+    Counts are aggregated across fields rather than reported per field: a per-field
+    breakdown says which field held a secret, which is a localization channel the
+    aggregate does not have, and nothing reads a per-field number.
+
+    A missing field, a non-string value and an empty string are all skipped -- the
+    record's shape is decided by its writer, not by this function.
+    """
+    totals: dict[str, int] = {}
+    for dotted in FINAL_REVIEW_REDACTED_METADATA_FIELDS:
+        *parents, leaf = dotted.split(".")
+        container: Any = record
+        for part in parents:
+            container = container.get(part) if isinstance(container, dict) else None
+        if not isinstance(container, dict):
+            continue
+        value = container.get(leaf)
+        if not isinstance(value, str) or not value:
+            continue
+        redacted, counts = redact_text(value)
+        container[leaf] = redacted
+        for entry in counts:
+            totals[entry["category"]] = totals.get(entry["category"], 0) + entry["count"]
+    return [
+        {"category": name, "count": totals[name]}
+        for name, _pattern, _replacement in REDACTION_CATEGORIES
+        if name in totals
+    ]
+
+
 def write_final_review_audit_record(
     run_id: str,
     *,
@@ -1788,6 +1856,15 @@ def write_final_review_audit_record(
     # input_digest_pre_redaction across an attempt's records.
     record["input_altered_across_retry"] = input_altered_across_retry
     record["notes"] = notes
+    # LAST, and after every field is in place: one pass over the closed list above, so
+    # no free-form string reaches json.dumps() -- or the export bundle, which inlines
+    # this record verbatim -- without having passed the policy.
+    metadata_redactions = _redact_record_metadata(record)
+    record["metadata_redaction"] = {
+        "redaction_policy_version": FINAL_REVIEW_REDACTION_POLICY_VERSION,
+        "covered_fields": list(FINAL_REVIEW_REDACTED_METADATA_FIELDS),
+        "redactions": metadata_redactions,
+    }
 
     # `sort_keys=False` over an insertion-ordered dict, so schema_version is the
     # first key of the file and a human `head`-ing it sees the version first.

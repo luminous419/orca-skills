@@ -1259,6 +1259,16 @@ subprocess의 stdout pipe와 메모리 안에만 존재하고 어디에도 쓰�
 policy version, redaction 후 artifact digest, 그리고 category별 치환 횟수 네 가지를 갖는다 — 치환된
 값 자체나 그 offset은 갖지 않는다.
 
+`record.json` 자체도 보존되는 artifact다. 따라서 record가 담는 **free-form string** — `notes`,
+`failure_detail`, `reviewer_agent_command`, `reviewer_agent_origin`, 세 section의 `capture_error`,
+그리고 delivery evidence의 `process_incarnation` / `last_failure` / `termination_reason` — 은
+persist 직전 단 한 곳에서 `input.md`/`report.md`와 **동일한 policy**를 통과한다. 무엇이 대상이었고
+어떤 category가 몇 번 치환됐는지는 `metadata_redaction` (`redaction_policy_version`,
+`covered_fields`, `redactions`)이 말한다. 반대로 record가 증명하려고 존재하는 **identity**는 절대
+치환되지 않는다 — `run_id`/`task_id`/`dispatch_id`/`dispatch_key`, `reviewer_terminal`,
+`assignee_handle`, 이미 hash인 `capability_hash`, 그리고 validated enum들. over-redaction은
+secret-safe의 반대쪽 실패다.
+
 **세 authority.** 서로를 대체하지 않는다.
 
 ```text

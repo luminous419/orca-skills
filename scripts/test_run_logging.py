@@ -2498,6 +2498,215 @@ class RetainedArtifactSecurityTests(_AuditTestCase):
                 self.assertNotIn(forbidden, section)
 
 
+class RecordMetadataRedactionTests(_AuditTestCase):
+    """record.json is a retained artifact too: its free-form metadata is redacted.
+
+    Redaction of `input.md`/`report.md` alone leaves the record itself as a leak
+    channel -- a workspace path in `process_incarnation`, a credential quoted into
+    `last_failure`, an agent command line, a human note. Every one of those is
+    exercised here through the real writer, against the bytes that reach disk.
+    """
+
+    CAPABILITY = "dcap_AAAAAAAAAAAAAAAAAAAA"
+    SECRET = "ORCA_TOKEN=topsecretvalue"
+    USER = "alice"
+
+    def poisoned(self, label: str) -> str:
+        return (
+            f"{label}: {self.CAPABILITY} {self.SECRET} "
+            + _local_path(self.USER, "private/repo")
+        )
+
+    def evidence(self) -> dict:
+        return {
+            "status": "failed",
+            "contract_version": "1.0",
+            "capability_hash": "sha256:0123456789abcdef",
+            "assignee_handle": "term_assignee",
+            "process_incarnation": "pid:7:" + _local_path(self.USER, "private/repo"),
+            "failure_count": 2,
+            "last_failure": self.poisoned("last_failure"),
+            "termination_reason": self.poisoned("termination_reason"),
+        }
+
+    def write_poisoned_record(self, **overrides):
+        """One record with a credential and a home path down every covered path."""
+        with patch(
+            "scripts.run_logging.capture_stored_task_spec",
+            return_value=(None, self.poisoned("capture failed")),
+        ), patch(
+            "scripts.run_logging.capture_delivery_evidence",
+            return_value=(self.evidence(), ""),
+        ), patch(
+            "scripts.run_logging._capture_repository_state", return_value=None
+        ):
+            kwargs = dict(
+                capture=True,
+                reviewer_terminal="term_reviewer",
+                reviewer_agent_command=self.poisoned("claude --print"),
+                reviewer_agent_origin=self.poisoned("resolved_from"),
+                provenance_state="voided",
+                void_reason="settlement_failure",
+                settlement_state="not_settled",
+                failure_detail=self.poisoned("agent_prompt_blocked"),
+                notes=self.poisoned("see"),
+            )
+            kwargs.update(overrides)
+            return self.write_record(**kwargs)
+
+    def test_no_credential_and_no_home_path_survives_into_record_json(self) -> None:
+        published = self.write_poisoned_record()
+
+        raw = (published / "record.json").read_text(encoding="utf-8")
+        self.assertNotIn(self.CAPABILITY, raw)
+        self.assertNotIn("topsecretvalue", raw)
+        self.assertNotIn(self.USER, raw)
+        self.assertNotIn(_local_path(self.USER), raw)
+        self.assertIn("<REDACTED:orca_dispatch_capability>", raw)
+        self.assertIn("<REDACTED:env_secret_pattern>", raw)
+        self.assertIn("<REDACTED:absolute_local_path>", raw)
+
+    def test_every_injection_route_is_redacted_field_by_field(self) -> None:
+        """One assertion per route the correction names, so a partial fix fails."""
+        record = self.record_json(self.write_poisoned_record())
+
+        routes = {
+            "reviewer_agent_command": record["reviewer_agent_command"],
+            "reviewer_agent_origin": record["reviewer_agent_origin"],
+            "failure_detail": record["failure_detail"],
+            "notes": record["notes"],
+            "stored_task_spec.capture_error": record["stored_task_spec"][
+                "capture_error"
+            ],
+            "delivery_evidence.process_incarnation": record["delivery_evidence"][
+                "process_incarnation"
+            ],
+            "delivery_evidence.last_failure": record["delivery_evidence"][
+                "last_failure"
+            ],
+            "delivery_evidence.termination_reason": record["delivery_evidence"][
+                "termination_reason"
+            ],
+        }
+        for field, value in routes.items():
+            with self.subTest(field=field):
+                self.assertNotIn(self.CAPABILITY, value)
+                self.assertNotIn("topsecretvalue", value)
+                self.assertNotIn(self.USER, value)
+                self.assertIn("<REDACTED:absolute_local_path>", value)
+
+    def test_the_identities_the_record_exists_to_prove_are_not_redacted(self) -> None:
+        """The other half of secret-safe: over-redaction destroys the evidence."""
+        record = self.record_json(self.write_poisoned_record())
+
+        self.assertEqual(record["reviewer_terminal"], "term_reviewer")
+        self.assertEqual(record["task_id"], "task_aaa")
+        self.assertEqual(record["dispatch_id"], "ctx_bbb")
+        self.assertEqual(record["dispatch_key"], "attempt1__task_aaa__ctx_bbb")
+        delivery = record["delivery_evidence"]
+        self.assertEqual(delivery["assignee_handle"], "term_assignee")
+        self.assertEqual(delivery["capability_hash"], "sha256:0123456789abcdef")
+        self.assertEqual(delivery["failure_count"], 2)
+        self.assertEqual(record["provenance_state"], "voided")
+        self.assertEqual(record["void_reason"], "settlement_failure")
+
+    def test_the_record_states_what_was_covered_and_what_matched(self) -> None:
+        record = self.record_json(self.write_poisoned_record())
+
+        block = record["metadata_redaction"]
+        self.assertEqual(
+            block["redaction_policy_version"],
+            run_logging.FINAL_REVIEW_REDACTION_POLICY_VERSION,
+        )
+        self.assertEqual(
+            block["covered_fields"],
+            list(run_logging.FINAL_REVIEW_REDACTED_METADATA_FIELDS),
+        )
+        # C.4's shape: policy order, an entry only for a category that matched, no
+        # offset and no removed value anywhere in the block.
+        self.assertEqual(
+            [entry["category"] for entry in block["redactions"]],
+            ["orca_dispatch_capability", "env_secret_pattern", "absolute_local_path"],
+        )
+        for entry in block["redactions"]:
+            self.assertEqual(sorted(entry), ["category", "count"])
+            self.assertGreater(entry["count"], 0)
+
+    def test_a_clean_record_records_no_substitution(self) -> None:
+        """`[]` unambiguously means nothing was substituted."""
+        record = self.record_json(self.write_record(notes="nothing to hide"))
+
+        self.assertEqual(record["metadata_redaction"]["redactions"], [])
+        self.assertEqual(record["notes"], "nothing to hide")
+
+    def test_the_report_capture_error_route_is_covered(self) -> None:
+        """Exercised directly: this error is built from an already-relative path,
+        so the guarantee is the choke point, not the one message it usually holds."""
+        record = {"report": {"capture_error": self.poisoned("unreadable")}}
+
+        counts = run_logging._redact_record_metadata(record)
+
+        value = record["report"]["capture_error"]
+        self.assertNotIn(self.CAPABILITY, value)
+        self.assertNotIn(self.USER, value)
+        self.assertEqual(
+            [entry["category"] for entry in counts],
+            ["orca_dispatch_capability", "env_secret_pattern", "absolute_local_path"],
+        )
+
+    def test_the_choke_point_skips_absent_and_non_string_values(self) -> None:
+        """The record's shape is decided by its writer, never by the redactor."""
+        record = {"notes": None, "delivery_evidence": None, "failure_detail": ""}
+
+        self.assertEqual(run_logging._redact_record_metadata(record), [])
+        self.assertEqual(record, {"notes": None, "delivery_evidence": None,
+                                  "failure_detail": ""})
+
+    def test_no_free_form_string_field_escapes_the_covered_list(self) -> None:
+        """The durable guard: a new string field added to the record must be either
+        declared free-form (and redacted) or declared an identity here."""
+        record = self.record_json(self.write_poisoned_record())
+
+        def leaves(node, prefix=""):
+            if isinstance(node, dict):
+                for name, value in node.items():
+                    yield from leaves(value, f"{prefix}{name}.")
+            elif isinstance(node, list):
+                for value in node:
+                    yield from leaves(value, f"{prefix}[].")
+            elif isinstance(node, str):
+                yield prefix[:-1]
+
+        # Identities, enums, constants, digests, timestamps and paths that are
+        # relativized-or-redacted at construction. Anything NOT here must be covered.
+        exempt = {
+            "schema_version", "record_kind", "run_id", "task_id", "dispatch_id",
+            "dispatch_key", "recorded_at", "reviewer_terminal", "provenance_state",
+            "void_reason", "settlement_state", "input_altered_across_retry",
+            "stored_task_spec.source", "stored_task_spec.capture_status",
+            "stored_task_spec.captured_at",
+            "stored_task_spec.redaction_policy_version",
+            "stored_task_spec.artifact_path",
+            "delivery_evidence.source", "delivery_evidence.capture_status",
+            "delivery_evidence.captured_at", "delivery_evidence.dispatch_status",
+            "delivery_evidence.contract_version", "delivery_evidence.capability_hash",
+            "delivery_evidence.assignee_handle",
+            "report.contract_path", "report.resolution", "report.capture_status",
+            "report.captured_at", "report.redaction_policy_version",
+            "report.artifact_path",
+            "report.parsed.parse_status", "report.parsed.parse_error",
+            "report.parsed.result", "report.parsed.review_verdict",
+            "metadata_redaction.redaction_policy_version",
+            "metadata_redaction.covered_fields.[]",
+            "metadata_redaction.redactions.[].category",
+        }
+        covered = set(run_logging.FINAL_REVIEW_REDACTED_METADATA_FIELDS)
+
+        for field in sorted(set(leaves(record))):
+            with self.subTest(field=field):
+                self.assertIn(field, covered | exempt)
+
+
 class AuditCaptureFailureTests(_AuditTestCase):
     """A record that says "the input could not be captured, here is why" is evidence.
     A missing record is not."""
