@@ -1,0 +1,5 @@
+# Retained Final Review reports are byte-exact snapshots of Reviewer-authored Markdown, digest-
+# bound by record.json and immutable under DESIGN A.3. Markdown hard breaks (two trailing spaces)
+# are legitimate there and must not be trimmed, so this path is exempt from git's whitespace
+# rules. Scope is exactly these snapshots; every other path keeps the default rules.
+artifacts/runs/*/final_review_audit/**/report.md -whitespace
