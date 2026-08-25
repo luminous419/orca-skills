@@ -1252,9 +1252,16 @@ report_malformed | superseded_by_retry` 중 하나의 `void_reason`을 반드시
 `voided` record는 어떤 함수도 verdict로 반환하지 않는다.
 
 **secret-safe.** `input.md`/`report.md`는 versioned redaction policy
-(`FINAL_REVIEW_REDACTION_POLICY_VERSION = redaction/1.0`)를 통과한 텍스트만 담는다 — dispatch
-capability token, URL credential, 이름이 secret인 환경변수 값, 그리고 절대 경로의 사용자 이름 segment가
-치환된다 (예: `/Users/<name>/…` → `/Users/<REDACTED:absolute_local_path>/…`). raw byte는 capture
+(`FINAL_REVIEW_REDACTION_POLICY_VERSION = redaction/1.1`)를 통과한 텍스트만 담는다 — dispatch
+capability token, URL credential, 이름이 secret인 환경변수 값, home-rooted 절대 경로의 사용자 이름
+segment (예: `/Users/<name>/…` → `/Users/<REDACTED:absolute_local_path>/…`), 그리고 **그 밖의 모든
+절대 경로 전체**가 치환된다 (`/private/tmp/…`, `/var/folders/…`, `/tmp` — segment 개수 하한은 없다 —
+→ `<REDACTED:foreign_absolute_path>`). 위험한 root를 allowlist로 세는 정책은 아무도 떠올리지 못한
+root에서 fail-open하므로, v1.1은 home 세 철자만 좁게 유지하고 **나머지 절대 경로는 기본적으로 전부**
+치환한다. 나아가 **retained record의 경로 field는 어떤 code path가 썼든** `<ARTIFACT_ROOT>`-relative,
+`<REPO>/`-relative, 경로가 아닌 값, 또는 통째로 치환된 `<REDACTED:foreign_absolute_path>` 네 가지 출력
+범주 중 하나여야 한다 (**P-PATH**). 네 범주 밖의 값은 record assembly에서 `RunLoggingError`로 막히고
+아무것도 published되지 않는다 — "policy가 바꾸지 않았다"는 통과 사유가 아니다. raw byte는 capture
 subprocess의 stdout pipe와 메모리 안에만 존재하고 어디에도 쓰이지 않는다. record는 redaction 전 digest,
 policy version, redaction 후 artifact digest, 그리고 category별 치환 횟수 네 가지를 갖는다 — 치환된
 값 자체나 그 offset은 갖지 않는다.

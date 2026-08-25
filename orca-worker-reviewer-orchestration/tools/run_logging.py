@@ -859,7 +859,7 @@ class RunTimingTracker:
 # function here rides the parity rule that already exists.
 
 FINAL_REVIEW_AUDIT_SCHEMA_VERSION = "1.0"
-FINAL_REVIEW_REDACTION_POLICY_VERSION = "redaction/1.0"
+FINAL_REVIEW_REDACTION_POLICY_VERSION = "redaction/1.1"
 FINAL_REVIEW_EXPORT_SCHEMA_VERSION = "1.0"
 
 FINAL_REVIEW_AUDIT_DIRNAME = "final_review_audit"
@@ -1029,11 +1029,52 @@ def sha256_bytes(data: bytes) -> str:
     return "sha256:" + hashlib.sha256(data).hexdigest()
 
 
-# ---- redaction policy v1.0 -------------------------------------------------------
+# ---- redaction policy v1.1 -------------------------------------------------------
 # Order is part of the policy, not an implementation detail: a dcap_ token inside an
 # environment assignment is redacted and counted by orca_dispatch_capability, not by
 # env_secret_pattern, because the first pass has already replaced it. Declaring the
 # order is what makes the counts reproducible.
+#
+# v1.1 adds category 5. v1.0 stated the absolute-path rule as an ALLOWLIST of three
+# dangerous roots, which fails open on every root nobody thought of -- a real retained
+# baseline carried /private/tmp/claude-<uid>/-Users-<user>-.../<session-uuid>/... through
+# untouched while the record truthfully reported zero redactions. v1.1 inverts the
+# posture: category 4 keeps its narrow, readability-preserving job for the three home
+# spellings, and category 5 catches every OTHER absolute path by default, with NO
+# minimum segment count -- '/luminous', '/workspace-501' and '/session-<uuid>' are each
+# one segment and each identifies a user, a uid-derived workspace or a session, so a
+# segment-count carve-out would be the same fail-open shape one level down.
+
+# A path-segment character. Excludes the separator, whitespace, the quoting/bracketing
+# punctuation a path is normally embedded in, and the angle brackets a placeholder
+# uses, so a match stops at prose punctuation and never swallows a <PLACEHOLDER>.
+_PATH_SEGMENT = r"[^/\s\"'`,;:<>|)\]}]+"
+
+# Category 4 -- home-rooted. UNCHANGED from redaction/1.0. Replaces the user-name
+# segment only, so the remainder of the path stays semantically readable.
+_HOME_ABSOLUTE_PATH = re.compile(r"(/Users/|/home/|/root/)(?!<|\{)[^/\s\"'`,;:)\]}]+")
+
+# Category 5 -- NEW in redaction/1.1. Every absolute POSIX path category 4 does not
+# already own, with NO minimum segment count. Replaces the ENTIRE match.
+_FOREIGN_ABSOLUTE_PATH = re.compile(
+    r"(?:(?<=file://)|(?<![\w>/]))"    # left boundary: start-of-text, or a delimiter
+                                      #   that is not a word char, not '>' (so
+                                      #   `<ROOT>/a/b` survives) and not '/' (so
+                                      #   `https://h/a/b` never matches); `file://` is
+                                      #   the one scheme that IS a local path.
+    r"/(?!/)"                         # a single leading separator, never a URL's '//'
+    r"(?!Users/|home/|root/)"         # category 4 owns these -- never double-redact,
+                                      #   never swallow the readable tail it preserved
+    r"(?!<)"                          # not an already-placeheld '/<...'
+    rf"{_PATH_SEGMENT}(?:/{_PATH_SEGMENT})*"   # >= 1 segment -- NO floor (D3-001)
+)
+
+# The one literal category 5 and C.7's field-level rule both substitute. It borrows
+# NOTHING from the input -- not the basename, not the first segment, not a length hint,
+# not a hash -- because every candidate fragment is itself environment-identifying in
+# some real layout, and "keep the safe part" would be the allowlist mistake again.
+FOREIGN_PATH_PLACEHOLDER = "<REDACTED:foreign_absolute_path>"
+
 REDACTION_CATEGORIES = (
     (
         "orca_dispatch_capability",
@@ -1058,12 +1099,23 @@ REDACTION_CATEGORIES = (
         # after the segment survive, so the path stays semantically readable while
         # the identifying part is gone. The (?!<|\{) lookahead is the same one
         # validate_skills.py uses, so an already-placeheld /Users/<name>/ is not
-        # double-redacted. Windows C:\Users\<name> is deliberately NOT in v1.0:
+        # double-redacted. Windows C:\Users\<name> is deliberately NOT in v1.1:
         # COMPATIBILITY.md claims no Windows support for the runtime path, and an
         # untested pattern is worse than a stated gap. It is a MINOR-bump candidate.
         "absolute_local_path",
-        re.compile(r"(/Users/|/home/|/root/)(?!<|\{)[^/\s\"'`,;:)\]}]+"),
+        _HOME_ABSOLUTE_PATH,
         r"\1<REDACTED:absolute_local_path>",
+    ),
+    (
+        # Everything else absolute, replaced WHOLE. Readability is preserved only
+        # where it is provably safe -- the three home spellings above and
+        # repo-relative paths, which have no leading '/' and are never touched --
+        # and surrendered everywhere else. What is lost is the environment-specific
+        # spelling of a location; WHICH artifact is meant stays recoverable from the
+        # retained artifact_path and the *_digest_pre_redaction next to it.
+        "foreign_absolute_path",
+        _FOREIGN_ABSOLUTE_PATH,
+        FOREIGN_PATH_PLACEHOLDER,
     ),
 )
 
@@ -1103,6 +1155,98 @@ def redact_text(
         if hits:
             counts.append({"category": name, "count": hits})
     return out, tuple(counts)
+
+
+# ---- P-PATH: the safety property EVERY retained path-bearing field must satisfy ----
+# The pipeline above is capture -> redact_text() -> write. A retained artifact can also
+# carry a filesystem path in a field that never goes through it: report.contract_path is
+# the concrete case, and that is exactly how a raw scratch path reached a shipped
+# record.json while the record truthfully reported "redactions": []. So the policy is
+# stated once more, as a FIELD-LEVEL property that holds regardless of which code path
+# wrote the value:
+#
+#   Every string field of a retained artifact that can hold a filesystem path lands, on
+#   disk, in exactly one of four output categories --
+#     P1 <ARTIFACT_ROOT>-relative        P2 "<REPO>/"-prefixed repository-relative
+#     P3 not a filesystem path at all    P4 the FOREIGN_PATH_PLACEHOLDER literal, whole
+#   -- and there is no fifth category, no segment-count condition, and no "the policy
+#   left it unchanged" case.
+#
+# The last exclusion is the point. A postcondition phrased as "redaction is a fixed
+# point of this value" is CIRCULAR: a value the policy does not recognise satisfies it
+# trivially, so a raw one-segment "/luminous" would have passed it (D3-001). Asking
+# which of four ALLOWED categories the value is in has no "unrecognised" answer to give,
+# so a shape nobody anticipated fails closed.
+
+# A plain relative POSIX path: at least one character, no leading '/', no '..' segment,
+# no whitespace, no angle bracket (so a placeholder can never masquerade as P1/P2), no
+# backslash and no drive letter (so a Windows path is never mistaken for a relative
+# one), and no '://' anywhere (so a URL -- 'file://...' in particular -- is decided by
+# the URL test and can never fall through to here as a "relative path").
+_SAFE_RELATIVE_PATH = re.compile(r"(?!/)(?![A-Za-z]:)(?!(?:.*/)?\.\.(?:/|$))(?!.*://)[^\s<>\\]+")
+
+# A URL that is not a local file: any scheme except 'file', and no whitespace.
+_NON_FILE_URL = re.compile(r"(?!(?i:file):)[A-Za-z][A-Za-z0-9+.\-]*://\S*")
+
+REPO_RELATIVE_PREFIX = "<REPO>/"
+
+# The closed list of retained record fields P-PATH governs. A new field that can hold a
+# path must be added here in the same commit that adds it -- the same discipline
+# FINAL_REVIEW_REDACTED_METADATA_FIELDS already uses, and for the same reason: a field
+# absent from the list is not covered, and that must be visible here rather than
+# inferred from an assembly expression.
+FINAL_REVIEW_RETAINED_PATH_FIELDS = (
+    "stored_task_spec.artifact_path",
+    "report.artifact_path",
+    "report.contract_path",
+)
+
+
+def normalize_retained_path_field(value: str) -> str:
+    """Total: every input maps into exactly one of P1..P4. Never calls redact_text().
+
+    The four categories are mutually exclusive by construction -- the P4 literal and a
+    URL both carry characters _SAFE_RELATIVE_PATH forbids -- so no test order can change
+    the answer; the order below only reads most directly.
+    """
+    if not isinstance(value, str):
+        return FOREIGN_PATH_PLACEHOLDER
+    if value == "" or value == FOREIGN_PATH_PLACEHOLDER:      # P3 (empty) / P4
+        return value
+    if _NON_FILE_URL.fullmatch(value):                        # P3
+        return value
+    if value.startswith(REPO_RELATIVE_PREFIX) and _SAFE_RELATIVE_PATH.fullmatch(
+        value[len(REPO_RELATIVE_PREFIX) :]
+    ):
+        return value                                          # P2
+    if _SAFE_RELATIVE_PATH.fullmatch(value):                  # P1
+        return value
+    return FOREIGN_PATH_PLACEHOLDER                           # everything else, WHOLE
+
+
+def assert_retained_path_field(value: str) -> None:
+    """Fail-closed postcondition. Raises rather than write a value outside P1..P4.
+
+    It is deliberately NOT a fixed-point test: re-running the total classifier asks the
+    only question that matters -- which allowed category is this value in? -- and a
+    value the free-text policy happens not to match has no way to sneak through.
+    """
+    if normalize_retained_path_field(value) != value:
+        raise RunLoggingError(
+            f"P-PATH violation in a retained path field: {value!r} is in none of the "
+            "four allowed output categories (<ARTIFACT_ROOT>-relative, <REPO>/-relative, "
+            f"not-a-path, or the whole-value {FOREIGN_PATH_PLACEHOLDER})"
+        )
+
+
+def _assert_retained_path_fields(record: dict) -> None:
+    """The closed table above, checked at record assembly, before anything is staged."""
+    for dotted in FINAL_REVIEW_RETAINED_PATH_FIELDS:
+        section, _, field = dotted.partition(".")
+        container = record.get(section)
+        if not isinstance(container, dict) or field not in container:
+            continue
+        assert_retained_path_field(container[field])
 
 
 # ---- capture: post-dispatch reads, and nothing else -------------------------------
@@ -1595,17 +1739,57 @@ def sweep_final_review_audit_staging(
 # ---- the writer -------------------------------------------------------------------
 
 
-def _relative_artifact_path(path: Path, root: Path) -> str:
-    """A POSIX path relative to <ARTIFACT_ROOT> when it is under it, else redacted.
+def _artifact_project_root(resolved_root: Path) -> Path | None:
+    """The repository root, DERIVED from <ARTIFACT_ROOT> -- never discovered.
 
-    record.json is retained evidence too, so a path that cannot be relativized goes
-    through the same redaction policy the two .md artifacts do rather than carrying
-    a developer's home directory into the record.
+    `root` is always `<base>/artifacts/runs/<run_id>`. No .git walk, no __file__
+    inspection, no environment variable, no second notion of "the repository":
+    introducing one is exactly how two functions come to disagree about where a path
+    lives, and it would make the ladder depend on state the record cannot reproduce.
+    A shape this does not recognise yields None, so rung 2 is skipped and rung 3 --
+    the fail-closed direction -- applies.
     """
+    if len(resolved_root.parents) < 3:
+        return None
+    if resolved_root.parent.name != "runs" or resolved_root.parents[1].name != "artifacts":
+        return None
+    return resolved_root.parents[2]
+
+
+def _relative_artifact_path(path: Path, root: Path) -> str:
+    """<ARTIFACT_ROOT>-relative, else `<REPO>/`-relative, else the whole value replaced.
+
+    Rung 3 does NOT call redact_text(): whether the free-text policy recognises the
+    path is irrelevant to whether the FIELD is safe, and a path outside every root this
+    project owns is by definition environment-specific, with no reviewer-visible
+    semantics in its spelling to preserve. Rung 2 is why the answer to "redact it, or
+    make it logical?" is both, in that order: a report that genuinely lives in the
+    repository keeps a readable, environment-independent identity.
+
+    The postcondition, not the ladder, is the guarantee: it is what makes the field
+    safe even if a future contributor adds a fourth production path.
+    """
+    value = FOREIGN_PATH_PLACEHOLDER
     try:
-        return path.resolve().relative_to(root.resolve()).as_posix()
-    except (ValueError, OSError):
-        return redact_text(path.as_posix())[0]
+        resolved = path.resolve()
+        resolved_root = root.resolve()
+    except OSError:
+        resolved = None
+    if resolved is not None:
+        try:
+            value = resolved.relative_to(resolved_root).as_posix()      # rung 1
+        except ValueError:
+            project_root = _artifact_project_root(resolved_root)
+            if project_root is not None:
+                try:
+                    value = REPO_RELATIVE_PREFIX + resolved.relative_to(
+                        project_root
+                    ).as_posix()                                        # rung 2
+                except ValueError:
+                    value = FOREIGN_PATH_PLACEHOLDER                    # rung 3
+    value = normalize_retained_path_field(value)
+    assert_retained_path_field(value)
+    return value
 
 
 def _validate_provenance(
@@ -1908,6 +2092,12 @@ def write_final_review_audit_record(
         "covered_fields": list(FINAL_REVIEW_REDACTED_METADATA_FIELDS),
         "redactions": metadata_redactions,
     }
+
+    # C.7's P-PATH postcondition, over the closed table, AFTER every field is in place
+    # and BEFORE anything is staged: a path-bearing field that is in none of the four
+    # allowed output categories raises here, so nothing is written or published. The
+    # leak this closes reached disk because the field had no postcondition at all.
+    _assert_retained_path_fields(record)
 
     # `sort_keys=False` over an insertion-ordered dict, so schema_version is the
     # first key of the file and a human `head`-ing it sees the version first.
@@ -2315,6 +2505,13 @@ def export_final_review_evidence(
         "attempts": serialized,
         "integrity": integrity,
     }
+    # The exporter runs the same P-PATH assertion before serialising: the inlined
+    # records inherit their own compliance, but these three path fields are built here.
+    assert_retained_path_field(bundle["orchestrator_log"]["path"])
+    for group in serialized:
+        for entry in group["dispatches"]:
+            for name in ("input", "report"):
+                assert_retained_path_field(entry[name]["path"])
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(
         json.dumps(bundle, indent=2, sort_keys=False, ensure_ascii=False) + "\n",

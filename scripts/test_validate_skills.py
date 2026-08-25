@@ -10,6 +10,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import run_logging
+
 
 SOURCE_ROOT = Path(__file__).resolve().parents[1]
 SKILL_NAMES = (
@@ -1460,7 +1462,8 @@ class ValidatorRegressionTests(unittest.TestCase):
 
     def test_a_redaction_policy_version_that_drifts_fails(self) -> None:
         self.mutate_orchestration_skill(
-            "FINAL_REVIEW_REDACTION_POLICY_VERSION = redaction/1.0",
+            f"FINAL_REVIEW_REDACTION_POLICY_VERSION = "
+            f"{run_logging.FINAL_REVIEW_REDACTION_POLICY_VERSION}",
             "FINAL_REVIEW_REDACTION_POLICY_VERSION = redaction/9.9",
         )
 

@@ -2412,6 +2412,162 @@ class RedactionPolicyTests(unittest.TestCase):
         with self.assertRaises(RunLoggingError):
             run_logging.redact_text("x", policy_version="redaction/9.9")
 
+    def test_the_superseded_policy_version_is_refused_too(self) -> None:
+        """Older records keep their redaction/1.0 stamp as DATA; readers read that
+        string, they never re-run the policy from it."""
+        with self.assertRaises(RunLoggingError):
+            run_logging.redact_text("x", policy_version="redaction/1.0")
+
+
+class ForeignAbsolutePathRedactionTests(unittest.TestCase):
+    """T-3's R1 regression guard: category 5, positives and negatives, one by one.
+
+    The shipped baseline carried a /private/tmp/... path through untouched and reported
+    zero redactions, because redaction/1.0 stated the absolute-path rule as an allowlist
+    of three roots. The count assertion below is itself part of the guard.
+    """
+
+    PLACEHOLDER = "<REDACTED:foreign_absolute_path>"
+
+    POSITIVES = (
+        "/private/tmp/claude-501/-Users-luminous-aiAssistedProjects-orca-skills"
+        "/9b570fb8-7a72/scratchpad/os22/REPORT.md",
+        "/var/folders/ab/cd/T/tmpxyz",
+        "/tmp/a/b",
+        "/opt/homebrew/bin/python3",
+        "/etc/passwd",
+        # D3-001: one-segment absolute paths. Each identifies a user, a uid-derived
+        # workspace or a session, so the >= 2-segment floor the first draft carried was
+        # an exclusion carved out of a default-deny rule -- the same fail-open shape as
+        # the prefix allowlist, one level down.
+        "/tmp",
+        "/luminous",
+        "/workspace-501",
+        "/session-1f2e3d4c-9a8b",
+    )
+    NEGATIVES = (
+        "https://host/a/b",
+        "postgres://host/db",
+        "<ARTIFACT_ROOT>/final_review_audit/k/input.md",
+        "artifacts/runs/run_x/report.md",
+        "PASS/FAIL",
+        "and/or",
+        "redaction/1.1",
+    )
+
+    def test_every_non_home_absolute_path_is_replaced_whole(self) -> None:
+        for value in self.POSITIVES:
+            with self.subTest(value=value):
+                redacted, counts = run_logging.redact_text(value)
+
+                self.assertEqual(redacted, self.PLACEHOLDER)
+                self.assertEqual(
+                    [dict(entry) for entry in counts],
+                    [{"category": "foreign_absolute_path", "count": 1}],
+                )
+                for fragment in ("luminous", "501", "1f2e3d4c", "9b570fb8"):
+                    self.assertNotIn(fragment, redacted)
+
+    def test_a_file_url_keeps_its_scheme_and_loses_its_path(self) -> None:
+        redacted, counts = run_logging.redact_text("file:///private/tmp/a/b")
+
+        self.assertEqual(redacted, "file://" + self.PLACEHOLDER)
+        self.assertEqual(counts[0]["category"], "foreign_absolute_path")
+
+    def test_the_four_guaranteed_exemptions_survive(self) -> None:
+        for value in self.NEGATIVES:
+            with self.subTest(value=value):
+                self.assertEqual(run_logging.redact_text(value), (value, ()))
+
+    def test_a_home_path_stays_readable_and_is_not_swallowed_whole(self) -> None:
+        path = _local_path("luminous", "repo/x.py")
+        redacted, counts = run_logging.redact_text(path)
+
+        self.assertEqual(
+            redacted, _HOME + "<REDACTED:absolute_local_path>/repo/x.py"
+        )
+        self.assertEqual(
+            [entry["category"] for entry in counts], ["absolute_local_path"]
+        )
+
+    def test_the_policy_is_idempotent_over_both_tables(self) -> None:
+        for value in (
+            *self.POSITIVES,
+            *self.NEGATIVES,
+            "file:///private/tmp/a/b",
+            _local_path("luminous", "repo/x.py"),
+            "built under /luminous with dcap_AAAAAAAAAAAA",
+        ):
+            with self.subTest(value=value):
+                once = run_logging.redact_text(value)[0]
+
+                self.assertEqual(run_logging.redact_text(once)[0], once)
+
+
+class RetainedPathFieldClassifierTests(unittest.TestCase):
+    """C.7: the classifier is TOTAL, and D3-001's loophole is closed by name."""
+
+    PLACEHOLDER = "<REDACTED:foreign_absolute_path>"
+
+    REPLACED = (
+        # Every one of these four is ONE segment -- the exact shape the >= 2-segment
+        # floor plus a fixed-point test let through.
+        "/luminous",
+        "/tmp",
+        "/workspace-501",
+        "/session-1f2e3d4c",
+        "/private/tmp/a/b",
+        "file:///private/tmp/a/b",
+        # A PARTIALLY substituted home path is still an absolute path, so the field
+        # form replaces it whole: category 4's readability-preserving behaviour is a
+        # free-text rule and deliberately does not apply to a whole-value path field.
+        _HOME + "<REDACTED:absolute_local_path>/repo/x.py",
+        "C:" + "\\Users\\bob\\x",
+        "C:" + "/Users/bob",
+        "a/../../etc/passwd",
+        "..",
+        "built under /luminous",
+    )
+    UNCHANGED = (
+        "final_review_audit/k/input.md",
+        "artifacts/runs/run_x/report.md",
+        "<REPO>/artifacts/x/FINAL_REVIEW.md",
+        "https://example.com/a",
+        "HTTPS://EX.COM/a",
+        "",
+        "<REDACTED:foreign_absolute_path>",
+    )
+
+    def test_everything_outside_p1_to_p4_is_replaced_in_full(self) -> None:
+        for value in self.REPLACED:
+            with self.subTest(value=value):
+                self.assertEqual(
+                    run_logging.normalize_retained_path_field(value), self.PLACEHOLDER
+                )
+
+    def test_the_four_allowed_categories_are_returned_unchanged(self) -> None:
+        for value in self.UNCHANGED:
+            with self.subTest(value=value):
+                self.assertEqual(
+                    run_logging.normalize_retained_path_field(value), value
+                )
+
+    def test_the_classifier_is_total_and_the_postcondition_agrees_with_it(self) -> None:
+        for value in (*self.REPLACED, *self.UNCHANGED):
+            with self.subTest(value=value):
+                normalized = run_logging.normalize_retained_path_field(value)
+
+                self.assertEqual(
+                    run_logging.normalize_retained_path_field(normalized), normalized
+                )
+                run_logging.assert_retained_path_field(normalized)
+
+    def test_the_postcondition_is_not_a_fixed_point_test(self) -> None:
+        """redact_text("/luminous") was a fixed point under redaction/1.0, and the
+        writer would have accepted the value on exactly that reasoning (D3-001)."""
+        with self.assertRaises(RunLoggingError):
+            run_logging.assert_retained_path_field("/luminous")
+
 
 class RetainedArtifactSecurityTests(_AuditTestCase):
     """T-3's shape: what reaches disk, and whether the digests re-derive."""
@@ -2496,6 +2652,100 @@ class RetainedArtifactSecurityTests(_AuditTestCase):
         for forbidden in ("14805", "5553", "2269", "14.8", "5.5", "2.3"):
             with self.subTest(constant=forbidden):
                 self.assertNotIn(forbidden, section)
+
+
+class RetainedPathFieldRecordTests(_AuditTestCase):
+    """C.7 P-PATH on the record itself, whatever code path wrote the value."""
+
+    PLACEHOLDER = "<REDACTED:foreign_absolute_path>"
+
+    def test_the_three_resolution_rungs_produce_the_three_allowed_forms(self) -> None:
+        inside = self.root / "FINAL_REVIEW.md"
+        inside.write_text(PASSING_REPORT, encoding="utf-8")
+        in_repo = self.base / "docs" / "FINAL_REVIEW.md"
+        in_repo.parent.mkdir(parents=True, exist_ok=True)
+        in_repo.write_text(PASSING_REPORT, encoding="utf-8")
+        with tempfile.TemporaryDirectory() as scratch:
+            outside = Path(scratch) / "REPORT.md"
+            outside.write_text(PASSING_REPORT, encoding="utf-8")
+
+            cases = (
+                (inside, "FINAL_REVIEW.md", "ctx_in"),
+                (in_repo, "<REPO>/docs/FINAL_REVIEW.md", "ctx_repo"),
+                (outside, self.PLACEHOLDER, "ctx_out"),
+            )
+            for path, expected, dispatch in cases:
+                with self.subTest(expected=expected):
+                    directory = self.write_record(
+                        report_path=path, dispatch_id=dispatch
+                    )
+                    record = self.record_json(directory)
+
+                    self.assertEqual(record["report"]["contract_path"], expected)
+
+    def test_a_scratch_path_leaves_no_fragment_in_the_record(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            outside = Path(scratch) / "luminous-workspace" / "REPORT.md"
+            outside.parent.mkdir(parents=True)
+            outside.write_text(PASSING_REPORT, encoding="utf-8")
+
+            directory = self.write_record(report_path=outside)
+
+        raw = (directory / "record.json").read_text(encoding="utf-8")
+        self.assertNotIn("luminous-workspace", raw)
+        self.assertIn(self.PLACEHOLDER, raw)
+
+    def test_no_string_anywhere_in_the_record_begins_with_a_separator(self) -> None:
+        """The generic sweep: it does not ask whether the policy RECOGNISED the value,
+        which is what makes it catch a newly added path field nobody routed through the
+        ladder."""
+        with tempfile.TemporaryDirectory() as scratch:
+            outside = Path(scratch) / "REPORT.md"
+            outside.write_text(PASSING_REPORT, encoding="utf-8")
+            directory = self.write_record(report_path=outside)
+
+        record = self.record_json(directory)
+
+        def walk(node):
+            if isinstance(node, str):
+                yield node
+            elif isinstance(node, dict):
+                for value in node.values():
+                    yield from walk(value)
+            elif isinstance(node, list):
+                for value in node:
+                    yield from walk(value)
+
+        for value in walk(record):
+            with self.subTest(value=value):
+                self.assertFalse(value.startswith("/"))
+
+        for dotted in run_logging.FINAL_REVIEW_RETAINED_PATH_FIELDS:
+            section, _, field = dotted.partition(".")
+            value = record[section][field]
+            with self.subTest(field=dotted):
+                self.assertEqual(
+                    run_logging.normalize_retained_path_field(value), value
+                )
+
+    def test_the_postcondition_raises_rather_than_writes(self) -> None:
+        """With the ladder stubbed, record assembly is the last line of defence -- and
+        the one-segment case must fail closed exactly like the multi-segment one."""
+        for forged in ("/private/tmp/a/b/REPORT.md", "/luminous"):
+            with self.subTest(forged=forged):
+                with patch.object(
+                    run_logging, "_relative_artifact_path", return_value=forged
+                ):
+                    with self.assertRaises(RunLoggingError):
+                        self.write_record(dispatch_id="ctx_forged")
+
+                audit = self.root / "final_review_audit"
+                published = [
+                    entry
+                    for entry in (audit.iterdir() if audit.is_dir() else [])
+                    if entry.name != ".staging"
+                ]
+                self.assertEqual(published, [])
 
 
 class RecordMetadataRedactionTests(_AuditTestCase):

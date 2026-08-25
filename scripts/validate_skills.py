@@ -1960,7 +1960,7 @@ FINAL_REVIEW_AUDIT_SECTION_END = "\n## 10."
 FINAL_REVIEW_AUDIT_ANCHORS = (
     "final_review_audit/",
     "FINAL_REVIEW_AUDIT_SCHEMA_VERSION = 1.0",
-    "FINAL_REVIEW_REDACTION_POLICY_VERSION = redaction/1.0",
+    "FINAL_REVIEW_REDACTION_POLICY_VERSION = redaction/1.1",
     "FINAL_REVIEW_EVIDENCE_BUNDLE.json",
     "final-review-audit-write",
     "final-review-audit-provenance",
