@@ -19,12 +19,22 @@ from __future__ import annotations
 import ast
 import json
 import re
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+# `test_final_review_eval` imports `run_logging` by its bare name, which resolves only
+# when `scripts/` is itself on the path -- true under `unittest discover -s scripts`,
+# not true when this module is imported by dotted name. Reusing that module's fixtures
+# rather than restating them is deliberate: its report constants are shaped by the
+# key, and a second copy of key-shaped content in a second file is exactly what
+# finding R2-T1 was about.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 from scripts import run_logging
+from scripts import test_final_review_eval as eval_fixtures
 from scripts.run_logging import (
     FINAL_REVIEW_AUDIT_DIRNAME,
     FINAL_REVIEW_AUDIT_INPUT_FILENAME,
@@ -734,6 +744,349 @@ class OrcaRuntimeDispatchPathNeutralityTests(unittest.TestCase):
             for name in self.TRIPWIRES:
                 with self.subTest(function=node.name, surface=name):
                     self.assertNotIn(name, segment)
+
+
+# --- iteration 4, downstream revalidation (§17 T5a) -------------------------------
+# DESIGN's D-C/D-E were corrected and IMPLEMENTATION landed redaction/1.1 + the
+# closed-world false-positive rate. Both corrections changed shipped behaviour that
+# PLAN's T-1/T-3 and T-4 groups own, so the two classes below carry the residue this
+# module exists for: the cases the owning modules stop one step short of.
+
+
+# A foreign absolute root of the shape the shipped baseline actually leaked, and the
+# one-segment root D3-001 named. Assembled at runtime for the same reason _HOME is.
+_SCRATCH_ROOT = "/private/" + "tmp/claude-501/-Users-someone-orca-skills/s-1/scratchpad"
+_ONE_SEGMENT_ROOT = "/" + "luminous"
+
+# The stored spec, carrying one value from category 5 as well: a deep session-scratch
+# path and a one-segment root, neither of which redaction/1.0's three-home allowlist
+# recognised.
+STORED_SPEC_WITH_FOREIGN_PATHS = (
+    STORED_SPEC
+    + f"report: {_SCRATCH_ROOT}/REPORT.md\n"
+    + f"root: {_ONE_SEGMENT_ROOT}\n"
+)
+
+
+class ForeignAbsolutePathAcrossThePublishedUnitTests(_RunRootTestCase):
+    """T-3 x T-1, iteration 4: redaction/1.1 category 5 over the WHOLE published unit.
+
+    `test_run_logging.ForeignAbsolutePathRedactionTests` proves the pattern, and
+    `RetainedPathFieldRecordTests` sweeps `record.json`. Neither reads `input.md`,
+    `report.md` or `ORCHESTRATOR_LOG.md` back off disk, and the log file is not part of
+    any record -- so the published unit as a whole (three files plus the row that names
+    them) has no owning module. That cross-file surface is what these tests close, and
+    they close it with the PRODUCTION pattern rather than a restated one, so a future
+    edit to `_FOREIGN_ABSOLUTE_PATH` cannot leave this test asserting the old rule.
+    """
+
+    PLACEHOLDER = run_logging.FOREIGN_PATH_PLACEHOLDER
+
+    def published_from_a_foreign_report(self, scratch: Path) -> Path:
+        """Publish one record whose report lives outside every root the ladder knows,
+        with a stored spec that carries two category-5 values."""
+        outside = scratch / "REPORT.md"
+        outside.write_text(PASSING_REPORT, encoding="utf-8")
+        with patch.object(
+            run_logging,
+            "capture_stored_task_spec",
+            return_value=(STORED_SPEC_WITH_FOREIGN_PATHS, ""),
+        ), patch.object(
+            run_logging,
+            "capture_delivery_evidence",
+            return_value=(
+                {"dispatch_id": "ctx_bbb", "dispatched_at": "2026-08-26T00:00:00Z"},
+                "",
+            ),
+        ):
+            return self.write_record(
+                capture=True,
+                provenance_state="accepted",
+                settlement_state="settled",
+                report_path=outside,
+            )
+
+    def test_no_file_of_the_published_unit_matches_the_category_five_pattern(
+        self,
+    ) -> None:
+        """The unit is a fixed point of the corrected rule -- checked with the shipped
+        pattern, over every published byte INCLUDING the log the record never sees."""
+        with tempfile.TemporaryDirectory() as scratch:
+            published = self.published_from_a_foreign_report(Path(scratch))
+
+        files = [
+            published / FINAL_REVIEW_AUDIT_INPUT_FILENAME,
+            published / FINAL_REVIEW_AUDIT_REPORT_FILENAME,
+            published / FINAL_REVIEW_AUDIT_RECORD_FILENAME,
+            self.root / ORCHESTRATOR_LOG_FILENAME,
+        ]
+        for path in files:
+            with self.subTest(published=path.name):
+                self.assertTrue(path.is_file(), f"{path.name} was not published")
+                text = path.read_text(encoding="utf-8")
+                self.assertEqual(
+                    run_logging._FOREIGN_ABSOLUTE_PATH.findall(text),
+                    [],
+                    f"a foreign absolute path survived into {path.name}",
+                )
+                for fragment in ("claude-501", "luminous", "/private/"):
+                    self.assertNotIn(fragment, text)
+
+    def test_the_record_counts_the_new_category_and_stamps_the_executable_policy(
+        self,
+    ) -> None:
+        """The category is EXERCISED here, not merely present in the table: the count
+        the record publishes must be non-zero, and the stamp must be the one policy
+        version that is executable."""
+        self.assertIn(
+            "foreign_absolute_path",
+            [name for name, _pattern, _replacement in run_logging.REDACTION_CATEGORIES],
+        )
+        with tempfile.TemporaryDirectory() as scratch:
+            published = self.published_from_a_foreign_report(Path(scratch))
+
+        record = self.record_json(published)
+        counts = {
+            entry["category"]: entry["count"]
+            for entry in record["stored_task_spec"]["redactions"]
+        }
+        # Two category-5 values went in: the deep scratch path and the one-segment root.
+        self.assertGreaterEqual(counts.get("foreign_absolute_path", 0), 2)
+        # Category 4 still owns the home path and still leaves the tail readable, so
+        # category 5 did not swallow it.
+        self.assertGreaterEqual(counts.get("absolute_local_path", 0), 1)
+        self.assertIn(
+            "aiAssistedProjects/orca-skills",
+            (published / FINAL_REVIEW_AUDIT_INPUT_FILENAME).read_text(encoding="utf-8"),
+        )
+        self.assertEqual(
+            record["stored_task_spec"]["redaction_policy_version"],
+            run_logging.FINAL_REVIEW_REDACTION_POLICY_VERSION,
+        )
+        self.assertEqual(
+            run_logging.FINAL_REVIEW_REDACTION_POLICY_VERSION, "redaction/1.1"
+        )
+
+    def test_the_superseded_policy_cannot_be_re_executed_over_the_retained_input(
+        self,
+    ) -> None:
+        """The old rule is not merely out of favour, it is unavailable -- which is what
+        stops a reader from re-deriving the retained digests under redaction/1.0 and
+        concluding the one-segment root was fine."""
+        with self.assertRaises(run_logging.RunLoggingError):
+            run_logging.redact_text(
+                STORED_SPEC_WITH_FOREIGN_PATHS, policy_version="redaction/1.0"
+            )
+        redacted, _counts = run_logging.redact_text(STORED_SPEC_WITH_FOREIGN_PATHS)
+        # No segment-count floor: the one-segment root is replaced WHOLE, and nothing
+        # of it -- not even the leading separator -- is borrowed into the output.
+        self.assertNotIn(_ONE_SEGMENT_ROOT, redacted)
+        self.assertIn(f"root: {self.PLACEHOLDER}\n", redacted)
+
+    def test_the_identity_join_still_holds_when_the_report_path_is_replaced_whole(
+        self,
+    ) -> None:
+        """T-1's join must not be collateral damage of T-3's fix: the record may no
+        longer say WHERE the report was, but it must still say WHICH bytes it was, and
+        the log row must still reach them."""
+        with tempfile.TemporaryDirectory() as scratch:
+            published = self.published_from_a_foreign_report(Path(scratch))
+
+        record = self.record_json(published)
+        self.assertEqual(record["report"]["contract_path"], self.PLACEHOLDER)
+        # Every closed-table field is still one of P1..P4 after the write.
+        for dotted in run_logging.FINAL_REVIEW_RETAINED_PATH_FIELDS:
+            section, _, field = dotted.partition(".")
+            with self.subTest(field=dotted):
+                run_logging.assert_retained_path_field(record[section][field])
+
+        rows = [
+            row
+            for row in _audit_log_rows(self.root)
+            if row["event"].startswith("final_review_audit")
+        ]
+        self.assertTrue(rows, "the write produced no audit row to join on")
+        for row in rows:
+            with self.subTest(event=row["event"]):
+                key = run_logging.final_review_dispatch_key(
+                    1, row["task_id"], row["dispatch_id"]
+                )
+                self.assertEqual(
+                    (self.root / FINAL_REVIEW_AUDIT_DIRNAME / key).resolve(),
+                    published.resolve(),
+                )
+        for filename, section in (
+            (FINAL_REVIEW_AUDIT_INPUT_FILENAME, "stored_task_spec"),
+            (FINAL_REVIEW_AUDIT_REPORT_FILENAME, "report"),
+        ):
+            with self.subTest(artifact=filename):
+                data = (published / filename).read_bytes()
+                self.assertEqual(
+                    run_logging.sha256_bytes(data),
+                    record[section]["artifact_digest_post_redaction"],
+                )
+                self.assertEqual(
+                    record[section]["artifact_path"],
+                    f"{FINAL_REVIEW_AUDIT_DIRNAME}/{record['dispatch_key']}/{filename}",
+                )
+        # And the pre-redaction identity of the report is still the untouched source,
+        # so "which bytes" survives the loss of "which path".
+        self.assertEqual(
+            record["report"]["report_digest_pre_redaction"],
+            run_logging.sha256_text(PASSING_REPORT),
+        )
+
+
+class ClosedWorldMetricContractTests(unittest.TestCase):
+    """T-4, iteration 4: section 6's unmatched-finding rule after the D-E correction.
+
+    PLAN's T-4 case reads "an unmatched finding is UNADJUDICATED, never auto-FP".
+    The corrected section 6 keeps the second half exactly and qualifies the first: an
+    explicit, signed closed-world attestation reclassifies it as
+    ATTESTED_FALSE_POSITIVE. `test_final_review_eval.ClosedWorldFalsePositiveRateTests`
+    proves the arithmetic at the function boundary. What it does not do -- and what
+    PLAN's case actually asks for -- is show that the SAME findings document takes both
+    answers only because the adjudication input changed, end to end through the CLI,
+    and that no other route reaches the attested class at all.
+    """
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary_directory.name)
+        report = self.root / "report.md"
+        report.write_text(
+            eval_fixtures.PERFECT_REPORT + eval_fixtures.RESOLVED_NOISE_FINDING,
+            encoding="utf-8",
+        )
+        self.findings = self.root / "findings.json"
+        completed = eval_fixtures.run_cli(
+            "parse-report", "--report", str(report), "--out", str(self.findings)
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def tearDown(self) -> None:
+        self.temporary_directory.cleanup()
+
+    def score(self, adjudications: dict | None) -> tuple[dict, int]:
+        argv = [
+            "score",
+            "--findings",
+            str(self.findings),
+            "--key",
+            str(eval_fixtures.KEY_PATH),
+            "--out",
+            str(self.root / "metrics.json"),
+            "--require-precision",
+        ]
+        if adjudications is not None:
+            path = self.root / "adjudications.json"
+            path.write_text(json.dumps(adjudications), encoding="utf-8")
+            argv += ["--adjudications", str(path)]
+        completed = eval_fixtures.run_cli(*argv)
+        return (
+            json.loads((self.root / "metrics.json").read_text(encoding="utf-8")),
+            completed.returncode,
+        )
+
+    def unmatched(self, metrics: dict) -> dict:
+        entries = metrics["unmatched_findings"]
+        self.assertEqual(len(entries), 1, entries)
+        return entries[0]
+
+    def test_the_default_for_an_unmatched_finding_is_still_unadjudicated(self) -> None:
+        """The half of PLAN's case the correction did NOT change, re-pinned at the CLI
+        boundary so the iteration-1 claim keeps a live test behind it."""
+        metrics, returncode = self.score(None)
+
+        entry = self.unmatched(metrics)
+        self.assertEqual(entry["reason"], "no_key_match")
+        self.assertEqual(entry["classification"], "UNADJUDICATED")
+        self.assertEqual(metrics["attested_false_positives"], 0)
+        self.assertIsNone(metrics["precision"])
+        self.assertIsNone(metrics["false_positive_rate"])
+        self.assertEqual(metrics["precision_status"], "REFUSED")
+        self.assertEqual(returncode, 3)
+
+    def test_the_same_findings_become_an_attested_false_positive_under_attestation(
+        self,
+    ) -> None:
+        """Only the adjudication input differs, and it is an explicit signed claim --
+        so the reclassification is attested, never inferred."""
+        metrics, returncode = self.score(eval_fixtures.attestation())
+
+        entry = self.unmatched(metrics)
+        self.assertEqual(entry["reason"], "no_key_match")
+        self.assertEqual(entry["classification"], "ATTESTED_FALSE_POSITIVE")
+        self.assertEqual(metrics["attested_false_positives"], 1)
+        self.assertEqual(metrics["adjudicated_false_positives"], 0)
+        self.assertEqual(metrics["unadjudicated_count"], 0)
+        self.assertEqual(metrics["adjudication_status"], "complete_by_attestation")
+        self.assertEqual(metrics["precision_status"], "COMPUTED")
+        # The R3 regression, by value: the rate is the finding's share, NOT 0.0.
+        self.assertNotEqual(metrics["false_positive_rate"], 0.0)
+        self.assertAlmostEqual(
+            metrics["false_positive_rate"], 1 / metrics["findings_total"]
+        )
+        self.assertAlmostEqual(
+            metrics["precision"] + metrics["false_positive_rate"], 1.0
+        )
+        self.assertEqual(returncode, 0)
+
+    def test_the_two_metrics_are_one_decision_on_both_inputs(self) -> None:
+        for adjudications in (None, eval_fixtures.attestation()):
+            with self.subTest(closed_world=adjudications is not None):
+                metrics, _returncode = self.score(adjudications)
+
+                self.assertEqual(
+                    metrics["precision_status"], metrics["false_positive_rate_status"]
+                )
+                if metrics["precision_status"] == "COMPUTED":
+                    self.assertEqual(metrics["unadjudicated_count"], 0)
+
+    def test_no_route_but_the_closed_world_branch_reaches_the_attested_class(
+        self,
+    ) -> None:
+        """"Never auto-FP" as a source-level property, which no per-call test gives:
+        the class is assigned in exactly one function, under a closed_world guard."""
+        source = (REPO_ROOT / "scripts" / "final_review_eval.py").read_text(
+            encoding="utf-8"
+        )
+        tree = ast.parse(source)
+
+        def assigns_the_class(node: ast.AST) -> bool:
+            return any(
+                isinstance(inner, ast.Name) and inner.id == "ATTESTED_FALSE_POSITIVE"
+                for statement in ast.walk(node)
+                if isinstance(statement, (ast.Assign, ast.AnnAssign))
+                for inner in ast.walk(statement.value)
+                if statement.value is not None
+            )
+
+        assigning = [
+            node.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and assigns_the_class(node)
+        ]
+        self.assertEqual(assigning, ["classify_unmatched"])
+
+        classifier = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "classify_unmatched"
+        )
+        guards = [
+            branch
+            for branch in ast.walk(classifier)
+            if isinstance(branch, ast.If)
+            and assigns_the_class(branch)
+            and any(
+                isinstance(name, ast.Name) and name.id == "closed_world"
+                for name in ast.walk(branch.test)
+            )
+        ]
+        self.assertTrue(
+            guards, "the attested class is assigned outside any closed_world guard"
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -50,7 +50,7 @@ non-blocking defect was found in the scorer while testing and is reported below 
 |---|---|---|
 | redaction is deterministic (same input twice → identical bytes and digests) | **covered** | `RedactionPolicyTests.test_redaction_is_deterministic` |
 | `artifact_digest_post_redaction` re-hashes the file on disk | **covered** | `RetainedArtifactSecurityTests.test_the_retained_artifact_carries_the_redacted_text_and_nothing_else` — hashes `read_bytes()` of the published file, not an in-memory string. Re-asserted for **both** artifacts by the new `LogInputReportIdentityJoinTests.test_both_retained_artifacts_rehash_to_the_digests_the_record_states` |
-| a synthetic `dcap_…` and a `/Users/<name>/…` path do not survive into the retained artifact | **covered** | `RetainedArtifactSecurityTests.test_no_secret_survives_into_the_retained_report`; `RecordMetadataRedactionTests.test_no_credential_and_no_home_path_survives_into_record_json` and `..test_every_injection_route_is_redacted_field_by_field` (I-002/I-002-R1) |
+| a synthetic `dcap_…` and a `/Users/<name>/…` path do not survive into the retained artifact *(**widened by iteration 4** — `redaction/1.1` adds category 5, so the case now covers EVERY absolute root, with no segment-count floor. See `## TEST iteration 4`.)* | **covered** | `RetainedArtifactSecurityTests.test_no_secret_survives_into_the_retained_report`; `RecordMetadataRedactionTests.test_no_credential_and_no_home_path_survives_into_record_json` and `..test_every_injection_route_is_redacted_field_by_field` (I-002/I-002-R1) |
 | `redactions` carries no redacted value | **covered** | `RedactionPolicyTests.test_the_counts_carry_no_redacted_value_and_no_offset`; `..test_nothing_matched_reads_as_an_empty_list` |
 | pre/post identity re-derivable by re-running the pipeline on the same source | **covered** | `RetainedArtifactSecurityTests.test_the_pre_and_post_identity_is_rederivable`; `..test_the_four_identity_fields_are_all_present` |
 
@@ -69,7 +69,7 @@ Per §9, this section **shows** the fixture and key rather than counting tests.
 | `subject/` contains no key token or key path (`scan-leak`, no exclusions) | **covered** | `LeakScanTests` (5 tests, incl. three positive controls proving the scanner fires); `MaterializeTests.test_the_scanner_takes_no_exclusion_argument` (I-001). Ran live: `scan-leak --target …/subject` → `leak scan PASSED` (exit 0) |
 | the retained reviewer input carries no key token and no expected-count statement | **covered** | `MaterializeTests.test_the_key_and_the_adjudications_never_reach_the_workspace`; `..test_the_workspace_the_reviewer_reads_is_clean`; `..test_the_manifest_names_the_fixture_opaquely`; `NoTargetCountTests` (2 tests). Ran live against a real materialized workspace — see `## Execution` |
 | recall computed with an explicit denominator | **covered** | `MatchingTests.test_a_missed_entry_is_reported_with_an_explicit_denominator`. Ran live: the recall object came back carrying all four contracted members — `value`, `numerator`, `denominator`, `population` — each present and of the right type, with `denominator` a positive integer and `value == numerator / denominator`. The four values themselves are withheld under P-1 (see the note under `## Execution`); what the case requires is that the denominator is *stated* rather than implied, and that is what was observed |
-| an unmatched finding is `UNADJUDICATED`, never auto-FP | **covered** | `MatchingTests.test_an_unmatched_finding_is_unadjudicated_and_never_an_auto_false_positive`; `..test_a_finding_with_no_key_match_is_labelled_no_key_match`. Ran live: `{"finding_id": "F2", "reason": "no_key_match", "classification": "UNADJUDICATED"}` |
+| an unmatched finding is `UNADJUDICATED`, never auto-FP *(**qualified by iteration 4** — the second half is unchanged; the first is now the DEFAULT, which an explicit signed closed-world attestation may override. See `## TEST iteration 4`.)* | **covered** | `MatchingTests.test_an_unmatched_finding_is_unadjudicated_and_never_an_auto_false_positive`; `..test_a_finding_with_no_key_match_is_labelled_no_key_match`. Ran live: `{"finding_id": "F2", "reason": "no_key_match", "classification": "UNADJUDICATED"}` |
 | precision **refused** with non-zero exit under insufficient adjudication | **covered** | `PrecisionRefusalTests` (7 tests, incl. partial adjudication still refusing and recall still computable); `ExitCodeTests.test_three_when_precision_is_refused_and_required`. Ran live: exit **3**, `precision = null`, `false_positive_rate = null` |
 | the §7 baseline is PASS only over a settled, scored report | **out of scope here (procedural, DEC-9/B-5)** | the scorer half is enforced — `ExitCodeTests.test_one_for_a_missing_input` refuses to score an absent report. The recording rule itself belongs to the Coordinator's B-1…B-5, deferred (see `## Remaining Gaps`) |
 
@@ -754,3 +754,321 @@ at, and `EXPORT_BUNDLE.json` embeds that text. Stated rather than laundered: tha
 **superseded**, is not the accepted baseline, and must not be cited as one. If the project would
 rather the repository hold no such material at all, moving that directory into an out-of-band
 forensic archive is the follow-up — a separate decision, not taken here.
+
+---
+
+## TEST iteration 4 — downstream revalidation (§17 T5a)
+
+Not a correction round: no TEST-phase finding is open. This is the §17 T5a revalidation triggered
+by two **corrected upstream artifacts**. DESIGN's D-C and D-E were rewritten (commit `476dcc9`) in
+response to the Final Adversarial Review's R1 and R3, and IMPLEMENTATION landed the resulting code
+in `9e19ce0` and `2d863ea` and recorded it as `## IMPLEMENTATION iteration 4`. Both precede TEST in
+canonical order, so this phase re-checks its own claims against them.
+
+**Something did have to change here too, and it is stated up front so that "nothing needed
+updating" is visibly not what happened.** Two of iteration 1's coverage rows are no longer accurate
+as written and now carry inline supersession markers, and the T-1/T-3 and T-4 groups this phase
+owns had no case exercising either corrected behaviour: every test of the corrected code lived in
+the module that owns it. Sections above the iteration-2 divider are otherwise untouched, per this
+document's existing convention.
+
+**The baseline procedure and `run_92759e0e1034` were not touched in this round** — deliberately,
+and on the Task's instruction. A fresh baseline reflecting the code fix would be a new capture, not
+a revalidation, and is a separate future activity.
+
+### Test Scope / Existing Test Assessment
+
+Two questions, asked group by group: *does the corrected behaviour have a test in the suite this
+phase owns*, and *is any claim this document already made now false?*
+
+**1 — T-1 / T-3, `redaction/1.1` and the P-PATH postcondition.**
+
+IMPLEMENTATION's own module covers the corrected rule thoroughly:
+`test_run_logging.ForeignAbsolutePathRedactionTests` (5) proves the pattern including all four
+one-segment D3-001 cases, `RetainedPathFieldClassifierTests` (4) proves the classifier is total and
+that `assert_retained_path_field("/luminous")` raises, and `RetainedPathFieldRecordTests` (4) drives
+the three ladder rungs through the real writer and sweeps `record.json`.
+
+What none of them does — and what PLAN's T-1 last case and T-3 third case are actually about — is
+read the **published unit** back off disk. `RetainedPathFieldRecordTests` reads `record.json` only;
+`input.md`, `report.md` and the `ORCHESTRATOR_LOG.md` row that names the directory are never
+examined for a surviving absolute path, and the log file is not part of any record, so it has no
+owning module at all. That is precisely the cross-file residue `test_os22_required_tests.py` exists
+to hold. **PARTIAL → tests added.**
+
+The iteration-1 T-3 row *a synthetic `dcap_…` and a `/Users/<name>/…` path do not survive* remains
+true but now understates the rule: under `redaction/1.0` it was the whole rule, and every root
+outside the three-home allowlist failed open. The row is annotated in place.
+
+**2 — T-4, the closed-world `ATTESTED_FALSE_POSITIVE` classification.**
+
+`test_final_review_eval.ClosedWorldFalsePositiveRateTests` (6) proves the corrected arithmetic by
+exact value at the `score()` boundary, and `ExitCodeTests` covers the two new exit-code cases. But
+PLAN's T-4 case is stated as a **contract over §6**, and iteration 1 discharged it by quoting a
+live CLI run. After the correction that case has two answers rather than one, and nothing showed
+that the *same* findings document takes both — that the reclassification follows from the
+adjudication input and from nothing else. There was also no source-level guard that the attested
+class is unreachable except through the closed-world branch, which is the surviving half of "never
+auto-FP" and the half no per-call test can establish. **PARTIAL → tests added.**
+
+The iteration-1 T-4 row *an unmatched finding is `UNADJUDICATED`, never auto-FP* is the one claim
+in this document that the correction makes **inaccurate as written**. Its second half is unchanged
+and still enforced; its first half is now the *default*, overridable only by an explicit signed
+closed-world attestation. The row is annotated in place and the corrected rule is pinned by the new
+tests.
+
+**3 — T-2, T-5, T-6.** No claim was invalidated.
+
+* **T-2.** The threshold guard reads the OS-22 section of both `run_logging.py` copies, both
+  emission-method bodies and the scorer's numeric literals. All four surfaces were edited by the
+  correction, so the guard was re-run over the edited sources: still clean, and
+  `observed_input_bytes` is still an operand of no comparison. Nothing to change.
+* **T-5.** Every regression command was re-run (below); all green. The recorded test count moves
+  because IMPLEMENTATION added 27 and this round adds 8 — iteration 1's `984` is left as the
+  historical record of that run, and the current figure is stated below.
+* **T-6.** The concern the Task names — whether a redaction/scoring bugfix silently changed what a
+  Reviewer sees — was checked three ways, not one, and the answer is no. See *Behavior Covered*.
+
+### Added / Modified Tests
+
+One existing file extended. **No existing test was edited, weakened, skipped or deleted, and no
+production file was touched.**
+
+| file | classes added | tests | group |
+|---|---|---|---|
+| `scripts/test_os22_required_tests.py` | `ForeignAbsolutePathAcrossThePublishedUnitTests` (4), `ClosedWorldMetricContractTests` (4) | **8** | T-1 × T-3, T-4 |
+
+The module's import block gained `sys.path.insert(...)` and
+`from scripts import test_final_review_eval as eval_fixtures`. That reuse is deliberate: the eval
+module's report constants are shaped by the key, and a second copy of key-shaped content in
+a second file is exactly what finding R2-T1 was about. The `sys.path` line is needed because
+`test_final_review_eval` imports `run_logging` by its bare name, which resolves under
+`unittest discover -s scripts` but not under a dotted import.
+
+### Behavior Covered
+
+**T-1 × T-3 — the corrected rule over the whole published unit.**
+
+* `test_no_file_of_the_published_unit_matches_the_category_five_pattern` publishes one record
+  through the **real writer** with a report living outside every root the ladder knows and a stored
+  spec carrying two category-5 values (a deep session-scratch path of the shape the shipped
+  baseline actually leaked, and a bare one-segment root). It then re-reads `input.md`, `report.md`,
+  `record.json` **and `ORCHESTRATOR_LOG.md`**, and asserts each is a fixed point of
+  `run_logging._FOREIGN_ABSOLUTE_PATH` — the **production** pattern, imported rather than
+  restated, so an edit to the rule cannot leave this test asserting the superseded one — plus a
+  fragment check for the identifying substrings.
+* `test_the_record_counts_the_new_category_and_stamps_the_executable_policy` requires the category
+  to be *exercised*, not merely present: `foreign_absolute_path` must appear in
+  `REDACTION_CATEGORIES` **and** the record's published count for it must be ≥ 2. It also asserts
+  category 4 still owns the home path and still leaves the tail readable, so category 5 did not
+  swallow the readable half, and that the stamp is `redaction/1.1`.
+* `test_the_superseded_policy_cannot_be_re_executed_over_the_retained_input` asserts that
+  `redact_text(..., policy_version="redaction/1.0")` **raises**, which is what stops a reader from
+  re-deriving the retained digests under the old rule and concluding the one-segment root was fine,
+  and that the one-segment root is replaced whole with nothing borrowed from the input.
+* `test_the_identity_join_still_holds_when_the_report_path_is_replaced_whole` is the case the two
+  groups create together: T-1's join must not be collateral damage of T-3's fix. With
+  `report.contract_path` reduced to the placeholder, the log row must still resolve to the
+  directory, both artifacts must still re-hash to the digests the record states, every field of
+  `FINAL_REVIEW_RETAINED_PATH_FIELDS` must still pass `assert_retained_path_field`, and
+  `report_digest_pre_redaction` must still be the untouched source — so the record no longer says
+  *where* the report was but still says *which bytes* it was.
+
+**T-4 — §6's metric contract, end to end and at the source.**
+
+* `test_the_default_for_an_unmatched_finding_is_still_unadjudicated` re-pins the half of the case
+  the correction did not change, at the CLI boundary: no adjudications → `UNADJUDICATED`,
+  `attested_false_positives` 0, both metrics `null`, `REFUSED`, exit **3**.
+* `test_the_same_findings_become_an_attested_false_positive_under_attestation` runs the **same
+  `findings.json`** with an attestation and nothing else changed → `ATTESTED_FALSE_POSITIVE`,
+  `attested_false_positives` 1, `adjudicated_false_positives` 0, `unadjudicated_count` 0,
+  `complete_by_attestation`, `COMPUTED`, exit **0**. The R3 regression is asserted structurally:
+  the rate is **not** `0.0`, it equals the single unmatched finding's share of the findings total,
+  and `precision + false_positive_rate == 1`. (Magnitudes withheld under P-1 — see the note below.)
+* `test_the_two_metrics_are_one_decision_on_both_inputs` asserts
+  `precision_status == false_positive_rate_status` on both inputs, and that COMPUTED implies
+  `unadjudicated_count == 0`.
+* `test_no_route_but_the_closed_world_branch_reaches_the_attested_class` is the surviving half of
+  "never auto-FP" as a **source-level** property, which no per-call test can give: an AST walk
+  requires that `ATTESTED_FALSE_POSITIVE` is assigned in exactly one function
+  (`classify_unmatched`), and that at least one `If` whose subtree contains that assignment tests
+  `closed_world`.
+
+> **P-1 applies to this section too.** The new T-4 tests assert exact magnitudes in code, but the
+> matched count and the findings total of the fixture report jointly determine the key population,
+> so no magnitude from `{key population total, detected/matched count, missed count,
+> unmatched-finding count, reviewer finding count, recall}` is published here. Every claim above is
+> structural, so nothing is lost: "the rate is the finding's share, not zero" is the whole content
+> of the R3 regression.
+
+**Falsification of the new tests** (a passing test that cannot fail proves nothing — the same bar
+iteration 1 set).
+
+| new assertion | falsified by | result |
+|---|---|---|
+| the published-unit sweep is armed | re-running it with category 5 removed from `REDACTION_CATEGORIES`, i.e. `redaction/1.0`'s table | **FAIL** — the sweep fires, and so does the counts test |
+| the one-segment root is replaced with no segment floor | redacting the same spec under the pre-1.1 table | pre-1.1 leaves `root: /luminous` **verbatim**; `redaction/1.1` gives `root: <REDACTED:foreign_absolute_path>` |
+| the AST tripwire detects a second assignment site | appending `def sneaky_auto_fp(item): classification = ATTESTED_FALSE_POSITIVE` to the scorer source and re-running the tripwire's own logic | detected — `['classify_unmatched', 'sneaky_auto_fp']`, so the equality assertion fails |
+| the T-4 attestation test is an R3 regression guard | running the identical CLI invocation against the pre-fix scorer (`git show 476dcc9:scripts/final_review_eval.py`) | **five** assertions fail: classification `UNADJUDICATED`, `attested_false_positives` **absent from the document**, `false_positive_rate` **0.0**, `unadjudicated_count` 1, status `partial` |
+
+That last row is the R3 defect reproduced through this phase's own new test rather than through
+IMPLEMENTATION's: the pre-fix scorer returned exit 0 under `--require-precision` while reporting a
+zero false-positive rate and one unadjudicated finding at the same time.
+
+### Execution
+
+All of T-5's regression commands, re-run after the IMPLEMENTATION revalidation's changes **and**
+after this round's additions.
+
+```text
+Command: python3 scripts/validate_skills.py
+Result:  PASS — "Skill validation PASSED (463 checks)"
+                (unchanged from iteration 1, after the SKILL.md §9 and validator-anchor edits)
+
+Command: python3 -m unittest discover -s scripts -p 'test_*.py'
+Result:  PASS — "Ran 1019 tests in 63.488s / OK (skipped=6)"
+                (984 at iteration 1, +27 from IMPLEMENTATION iteration 4, +8 here. The 6 skips are
+                 test_orca_runtime.py's opt-in live-runtime tests, pre-existing and unrelated.)
+
+Command: python3 scripts/verify_package.py
+Result:  PASS — "Package verification PASSED (107 source files)"
+                (unchanged: this round added no file, only classes to an existing one)
+
+Command: cmp scripts/run_logging.py orca-worker-reviewer-orchestration/tools/run_logging.py
+Result:  PASS — no output, exit 0 (byte-identical; the D-C commit edited both in one commit)
+```
+
+The suite was also run once **before** this round's additions, so the two effects are separable:
+`1011 tests, OK` on `0582aed` with everything else identical. IMPLEMENTATION's revalidation was
+therefore already green on its own, and the 8 added here take it to 1019.
+
+Per-group runs:
+
+```text
+Command: python3 -m unittest scripts.test_os22_required_tests
+Result:  PASS — Ran 27 tests, OK                (19 from iteration 1 + the 8 added here)
+
+Command: python3 -m unittest scripts.test_e2e_harness.FinalReviewObservabilityNeutralityTests
+Result:  PASS — Ran 12 tests, OK                (T-6, the byte-identity golden)
+
+Command: python3 -m unittest scripts.test_os22_required_tests.OrcaRuntimeDispatchPathNeutralityTests
+Result:  PASS — Ran 3 tests, OK                 (T-6, the other dispatch path)
+```
+
+T-6, checked three ways rather than trusting the label "pure bugfix":
+
+```text
+1. The neutrality golden, unchanged and still byte-identical.
+   test_every_workflow_spec_is_byte_identical_to_the_pre_os22_capture and
+   test_every_direct_spec_is_byte_identical_to_the_pre_os22_capture both PASS against
+   scripts/fixtures/os22_neutrality/pre_os22_task_specs.json. `git status` reports the
+   fixture, e2e_harness.py and orca_runtime_harness.py all clean, so the golden was not
+   regenerated to fit — it is the same 350 003 bytes committed in e168344, compared against
+   freshly rendered specs. Byte-identical is the assertion the class makes; it passed.
+
+2. The reviewer-visible workspace, by digest.
+   Command: python3 scripts/final_review_eval.py materialize --dest <scratch>/ws
+   Result:  fixture_digest sha256:b63f5a9f4280549ea3a05407b4b5fff28e054b75ee674f419413b5c69cf70f1d
+            files 14
+   That is character-for-character the digest iteration 1 recorded. The bytes a Reviewer reads
+   are unchanged by both corrections.
+
+3. Search behaviour and fixture integrity, re-run.
+   Command: python3 scripts/final_review_eval.py verify-fixture --key <key>
+   Result:  "fixture verification PASSED"  exit 0
+   Command: python3 scripts/final_review_eval.py scan-leak --key <key> --target <ws>
+   Result:  "leak scan PASSED"  exit 0
+   Command: python3 scripts/final_review_eval.py scan-leak --key <key> \
+              --target scripts/fixtures/final_review_eval/subject
+   Result:  "leak scan PASSED"  exit 0
+```
+
+The one code change that *could* have touched T-6 is `final_review_eval.py` importing
+`run_logging`. It does not: the import is used only by `_retained_path_field()` on the scorer's own
+output document, `final_review_eval` is not on the spec-assembly → dispatch path at all, and the
+two neutrality tripwire classes — which patch `redact_text`, `capture_stored_task_spec`,
+`capture_delivery_evidence` and `write_final_review_audit_record` to raise on any call — still pass
+on both dispatch paths.
+
+### Failures / Findings
+
+**No test failed, and no new defect was found.** The two upstream corrections were re-derived
+against this phase's own suite and both behave as DESIGN and IMPLEMENTATION describe.
+
+Per this phase's Mandatory Invariant nothing was fixed here in any case; the one production defect
+this phase has ever reported, **T-001**, is unrelated to R1/R3 and was re-checked rather than
+assumed:
+
+```text
+$ python3 scripts/final_review_eval.py score --findings <a findings doc whose entry
+    has no location_file> --key <key>
+KeyError: 'location_file'
+```
+
+Still reproducible on `0582aed`. **T-001 remains open, unchanged in severity (MINOR, non-blocking)
+and unchanged in its suggested fix.** One detail of its write-up has drifted and is corrected here
+rather than silently left wrong: the two line numbers it cites moved with the D-E edit —
+`match_findings`'s unguarded index is now `scripts/final_review_eval.py:763`, not `:748`. The
+symbol names in the finding (`match_findings`, `score`, `load_adjudications`) are unchanged and
+remain the reliable reference. The D-E correction rewrote the metric gate around it without
+touching `match_findings`'s unguarded indexing, which is consistent — T-001 was routed to a later
+IMPLEMENTATION correction or an explicit accept-as-is, not to this one.
+
+### Disclosure re-check over the corrected upstream artifacts
+
+Iteration 3's `metric_inference` check exists precisely because a correction can introduce an
+arithmetic disclosure that no token scan sees, so it was re-run rather than assumed — over this
+file, and over the two artifacts the correction actually rewrote.
+
+| target | result |
+|---|---|
+| `TEST.md`, after this round's additions — literal `scan-leak` | **PASSED**, 0 hits |
+| `TEST.md`, after this round's additions — `semantic_leak_scan --profile evidence` (identity checks + `metric_inference`) | **PASSED**, 0 hits |
+| `BASELINE_RESULT.md`, unchanged this round | **PASSED**, 0 hits — re-verified, not assumed |
+| the other 12 files of iteration 3's committed evidence set | byte-unchanged since that sweep (`git status` clean for all of them), so the recorded result stands |
+
+One hit was found in this round's own first draft and fixed before commit: a sentence in *Added /
+Modified Tests* named the key by its literal two-word phrase. That is the whole point of running
+the scan on the draft rather than on the intention.
+
+**The two corrected upstream artifacts were also scanned, and the correction did not materially
+worsen either.** Reported as an observation, not fixed — they belong to other phases, and neither
+is in iteration 3's reviewer-visible evidence set.
+
+| artifact | before the correction | after | delta |
+|---|---|---|---|
+| `IMPLEMENTATION.md` (`f62047a~1` → now) | 2 hits (one key phrase, one partial-archetype coincidence on ordinary prose) | **identical 2 hits**, 0 `metric_inference` | none |
+| `DESIGN.md` (`476dcc9~1` → now) | 378 hits, 7 of them `metric_inference` | 379 hits, 8 of them `metric_inference` | **+1**, and it is a REL-5 satisfiability hit that solves to a value which is **not** the key population — a false positive of the check's own "satisfiability, not correctness" trigger, not a new disclosure |
+
+`DESIGN.md`'s pre-existing profile is a separate matter and is **escalated, not fixed**: it carries
+one REL-1 hit that does solve to the key population, plus key vocabulary that a design document
+describing the fixture will inevitably contain. It predates both R1/R3 corrections, it is a
+DESIGN-phase artifact this Task must not rewrite, and it was never part of the 14-file evidence set
+iteration 3 swept — the P-1 rule was adopted for *committed reviewer-visible evidence*, and whether
+it should also bind phase design documents is a policy question above this revalidation. Recorded
+here so the clean result above is not read as a clean result over the whole run directory.
+
+### Remaining Gaps
+
+Iteration 1's gap list is re-checked item by item rather than restated.
+
+1. **The live baseline dispatch (§7 / PLAN B-1…B-5) is still deferred**, unchanged — and the
+   correction adds a wrinkle worth recording explicitly: the two committed baselines
+   (`run_ff587481a820`, `run_92759e0e1034`) were captured under `redaction/1.0` and retain the
+   pre-fix path-leak artifacts as forensic evidence of R1's prior state. IMPLEMENTATION iteration 4
+   deliberately left them alone and left D-C C.7's *regeneration of already-retained evidence* rule
+   open. Regenerating a baseline under `redaction/1.1` is a fresh capture, which is a TEST-phase
+   activity — **but it was explicitly placed out of scope for this revalidation**, so it is
+   recorded here as the open item it is rather than performed.
+2. **T-4's `baseline execution 성공` case** — unchanged, still a recording rule over a live run.
+3. **T-001** — unchanged, open by design, re-verified above.
+4. **The `agent_prompt_blocked` delivery limit** — unchanged, still a stated limit.
+5. **No H-1/H-2/H-4/H-5 conclusion is available from this phase** — unchanged.
+6. **New, and small: the P-PATH postcondition covers the closed table, not every future field.**
+   `FINAL_REVIEW_RETAINED_PATH_FIELDS` is enumerated, and `_assert_retained_path_fields()` checks
+   exactly those three. `RetainedPathFieldRecordTests.test_no_string_anywhere_in_the_record_begins_
+   with_a_separator` is the generic sweep that would catch a fourth field added without routing it
+   through the ladder, and this round's published-unit sweep extends that reasoning to the other
+   three published files. Neither is a *proof* that a future field is safe — the closed table plus
+   the two sweeps is the control, and it is a control that fails closed. Recorded so a reviewer
+   does not have to re-derive why an enumerated table is acceptable here.
