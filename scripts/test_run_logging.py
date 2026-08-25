@@ -2791,5 +2791,116 @@ class AuditCliTests(_AuditTestCase):
         self.assertEqual(tuple(actions["provenance"].choices), run_logging.PROVENANCE_STATES)
 
 
+class ProvenanceLadderTests(_AuditTestCase):
+    """D-B B.2 evaluated once, in one place, so two emission points cannot disagree."""
+
+    def test_the_ladder_takes_the_earliest_matching_cause(self) -> None:
+        """Two causes at once resolve to the FIRST -- and the second survives
+        verbatim in failure_detail, which is why provenance is two fields and not
+        one flat enum."""
+        self.assertEqual(
+            run_logging.resolve_final_review_provenance(
+                input_rejected=True, capability_invalid=True
+            ),
+            ("voided", "dispatch_input_rejected", "not_settled"),
+        )
+
+    def test_every_row_of_the_ladder(self) -> None:
+        cases = (
+            ({"input_rejected": True}, ("voided", "dispatch_input_rejected", "not_settled")),
+            ({"capability_invalid": True}, ("voided", "dispatch_capability_invalid", "not_settled")),
+            ({"settled": False}, ("voided", "settlement_failure", "not_settled")),
+            (
+                {"settled": True, "report_capture_status": "absent"},
+                ("voided", "report_missing", "settled"),
+            ),
+            (
+                {"settled": True, "report_capture_status": "unreadable"},
+                ("voided", "report_missing", "settled"),
+            ),
+            (
+                {
+                    "settled": True,
+                    "report_capture_status": "captured",
+                    "report_parse_status": "malformed",
+                },
+                ("voided", "report_malformed", "settled"),
+            ),
+            (
+                {
+                    "settled": True,
+                    "report_capture_status": "captured",
+                    "report_parse_status": "ok",
+                    "superseded_by_retry": True,
+                },
+                ("voided", "superseded_by_retry", "settled"),
+            ),
+            (
+                {
+                    "settled": True,
+                    "report_capture_status": "captured",
+                    "report_parse_status": "ok",
+                },
+                ("accepted", "", "settled"),
+            ),
+            ({"determinable": False}, ("unknown", "", "unknown")),
+        )
+        for kwargs, expected in cases:
+            with self.subTest(**kwargs):
+                self.assertEqual(
+                    run_logging.resolve_final_review_provenance(**kwargs), expected
+                )
+
+    def test_the_ladder_never_yields_accepted_without_a_usable_report(self) -> None:
+        for capture in ("absent", "unreadable"):
+            for parse in ("not_attempted", "malformed", "ok"):
+                with self.subTest(capture=capture, parse=parse):
+                    state, _reason, _settlement = (
+                        run_logging.resolve_final_review_provenance(
+                            settled=True,
+                            report_capture_status=capture,
+                            report_parse_status=parse,
+                        )
+                    )
+                    self.assertNotEqual(state, "accepted")
+
+    def test_every_void_reason_the_ladder_emits_is_in_the_enum(self) -> None:
+        for kwargs in (
+            {"input_rejected": True},
+            {"capability_invalid": True},
+            {"settled": False},
+            {"settled": True},
+            {"settled": True, "report_capture_status": "captured",
+             "report_parse_status": "malformed"},
+            {"settled": True, "report_capture_status": "captured",
+             "report_parse_status": "ok", "superseded_by_retry": True},
+        ):
+            with self.subTest(**kwargs):
+                _state, reason, _settlement = (
+                    run_logging.resolve_final_review_provenance(**kwargs)
+                )
+                self.assertIn(reason, run_logging.VOID_REASONS)
+
+    def test_probe_reports_an_absent_report_without_writing_anything(self) -> None:
+        self.assertEqual(
+            run_logging.probe_final_review_report(self.RUN_ID, 1, base=self.base),
+            ("absent", "not_attempted"),
+        )
+        self.assertFalse((self.root / "final_review_audit").exists())
+
+    def test_probe_reads_the_laddered_path_and_parses_it(self) -> None:
+        self.write_report(PASSING_REPORT, attempt=1)
+        self.write_report("garbage\n", attempt=2)
+
+        self.assertEqual(
+            run_logging.probe_final_review_report(self.RUN_ID, 1, base=self.base),
+            ("captured", "ok"),
+        )
+        self.assertEqual(
+            run_logging.probe_final_review_report(self.RUN_ID, 2, base=self.base),
+            ("captured", "malformed"),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

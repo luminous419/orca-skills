@@ -1290,6 +1290,76 @@ def parse_final_review_report(text: str) -> dict:
     return parsed
 
 
+# ---- the provenance ladder, as one shared first-match evaluation ------------------
+# D-B B.2. Both emission points (the live Orca runtime and the deterministic e2e
+# harness) evaluate it here rather than each implementing the table, because a
+# provenance assignment that two code paths could disagree about is not reproducible
+# -- which is the whole property the ladder exists to give.
+
+
+def probe_final_review_report(
+    run_id: str,
+    attempt: int,
+    *,
+    base: Path | None = None,
+    report_path: str | Path | None = None,
+) -> tuple[str, str]:
+    """`(capture_status, parse_status)` for the report, writing nothing.
+
+    The ladder's rows 4 and 5 are about the report, so a caller has to be able to
+    ask about it before it decides what to record.
+    """
+    path, _resolution = resolve_final_review_report(
+        run_id, attempt, base=base, report_path=report_path
+    )
+    if not path.exists():
+        return "absent", "not_attempted"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return "unreadable", "not_attempted"
+    return "captured", parse_final_review_report(text)["parse_status"]
+
+
+def resolve_final_review_provenance(
+    *,
+    determinable: bool = True,
+    input_rejected: bool = False,
+    capability_invalid: bool = False,
+    settled: bool = False,
+    report_capture_status: str = "absent",
+    report_parse_status: str = "not_attempted",
+    superseded_by_retry: bool = False,
+) -> tuple[str, str, str]:
+    """`(provenance_state, void_reason, settlement_state)`, first match wins.
+
+    The ladder is evaluated at the single write point, at settlement, which is what
+    makes immutability and provenance compatible: every row is determinable then, so
+    a record is complete when it is written and never needs editing. Row 7 is not a
+    retroactive blessing -- the Coordinator acts on a cleanly settled dispatch's
+    verdict immediately, so "will this one be acted on?" is known at that moment, and
+    row 6 covers the only case where a settled dispatch is knowingly not acted on.
+
+    `determinable=False` is row 8: the caller could not tell which of 1-7 applies, and
+    says so rather than guessing. It reads `unknown`, never `accepted`.
+    """
+    if not determinable:
+        return PROVENANCE_UNKNOWN, "", "unknown"
+    if input_rejected:
+        return PROVENANCE_VOIDED, "dispatch_input_rejected", "not_settled"
+    if capability_invalid:
+        return PROVENANCE_VOIDED, "dispatch_capability_invalid", "not_settled"
+    if not settled:
+        return PROVENANCE_VOIDED, "settlement_failure", "not_settled"
+    if report_capture_status != "captured":
+        return PROVENANCE_VOIDED, "report_missing", "settled"
+    if report_parse_status == "malformed":
+        return PROVENANCE_VOIDED, "report_malformed", "settled"
+    if superseded_by_retry:
+        return PROVENANCE_VOIDED, "superseded_by_retry", "settled"
+    return PROVENANCE_ACCEPTED, "", "settled"
+
+
 # ---- paths, keys, and the crash-safe publication protocol --------------------------
 
 

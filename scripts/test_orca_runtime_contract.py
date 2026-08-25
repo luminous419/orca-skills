@@ -6953,5 +6953,254 @@ class RiskGraphContractTests(unittest.TestCase):
         )
 
 
+class FinalReviewAuditEmissionTests(OfflineHarnessTestCase):
+    """OS-22 I-10: the live dispatch path writes one record per Final Review dispatch.
+
+    Every assertion reads the files the harness actually wrote under
+    self.artifact_dir/artifacts/runs/<run_id>/final_review_audit/, never an in-memory
+    object -- an emission point that produces nothing on disk is the defect this
+    guards against.
+    """
+
+    LIVE_TERMINAL_RESOURCE = SameRoleSessionReuseTests.LIVE_TERMINAL_RESOURCE
+    arm = SameRoleSessionReuseTests.arm
+    started_harness = RunLoggingIntegrationTests.started_harness
+    log_paths = RunLoggingIntegrationTests.log_paths
+    read_rows = staticmethod(RunLoggingIntegrationTests.read_rows)
+    read_orchestrator_rows = RunLoggingIntegrationTests.read_orchestrator_rows
+
+    REPORT = "RESULT: PASS\nREVIEW_VERDICT: PASS\n\nID: R1\nBlocking: NO\n"
+
+    def audit_dir(self, run_id: str) -> Path:
+        return (
+            self.artifact_dir
+            / "artifacts"
+            / "runs"
+            / run_id
+            / run_logging.FINAL_REVIEW_AUDIT_DIRNAME
+        )
+
+    def write_report(self, run_id: str, attempt: int, text: str | None = None) -> Path:
+        root = self.artifact_dir / "artifacts" / "runs" / run_id
+        suffix = "" if attempt == 1 else f"_iteration{attempt}"
+        path = root / f"FINAL_REVIEW{suffix}.md"
+        path.write_text(self.REPORT if text is None else text, encoding="utf-8")
+        return path
+
+    def records(self, run_id: str) -> dict[str, dict]:
+        found = {}
+        for key, directory in run_logging.iter_final_review_audit_records(
+            run_id, base=self.artifact_dir
+        ):
+            found[key] = json.loads(
+                (directory / "record.json").read_text(encoding="utf-8")
+            )
+        return found
+
+    def test_a_final_review_dispatch_writes_one_record(self) -> None:
+        recorder = EchoingTerminalExec()
+        harness = self.started_harness(recorder)
+        self.write_report(harness.run_id, 1)
+
+        self.arm(recorder, "ctx_fr1", "task_fr1")
+        harness.run_attempt(
+            "reviewer", 1, "pass", phase=FINAL_REVIEW_PHASE,
+            round_kind="final_review",
+        )
+
+        records = self.records(harness.run_id)
+        self.assertEqual(len(records), 1)
+        record = next(iter(records.values()))
+        self.assertEqual(record["final_review_attempt"], 1)
+        self.assertEqual(record["task_id"], "task_fr1")
+        self.assertEqual(record["dispatch_id"], "ctx_fr1")
+        self.assertEqual(record["provenance_state"], "accepted")
+        self.assertEqual(record["settlement_state"], "settled")
+        self.assertEqual(record["report"]["parsed"]["result"], "PASS")
+        self.assertEqual(harness._logging_errors, [])
+
+    def test_a_phase_gate_dispatch_writes_no_record(self) -> None:
+        """The audit family is scoped to the Final Adversarial Review gate."""
+        recorder = EchoingTerminalExec()
+        harness = self.started_harness(recorder)
+
+        self.arm(recorder, "ctx_p1", "task_p1")
+        harness.run_attempt("reviewer", 1, "pass", phase="implementation")
+
+        self.assertFalse(self.audit_dir(harness.run_id).exists())
+
+    def test_two_attempts_produce_two_records_under_separate_identities(self) -> None:
+        recorder = EchoingTerminalExec()
+        harness = self.started_harness(recorder)
+        self.write_report(harness.run_id, 1)
+        self.write_report(harness.run_id, 2)
+
+        self.arm(recorder, "ctx_fr1", "task_fr1")
+        harness.run_attempt(
+            "reviewer", 1, "fail", phase=FINAL_REVIEW_PHASE,
+            round_kind="final_review", findings=("R1",),
+        )
+        self.arm(recorder, "ctx_fr2", "task_fr2")
+        harness.run_attempt(
+            "reviewer", 2, "pass", phase=FINAL_REVIEW_PHASE,
+            round_kind="final_review",
+        )
+
+        records = self.records(harness.run_id)
+        self.assertEqual(
+            sorted(records),
+            ["attempt1__task_fr1__ctx_fr1", "attempt2__task_fr2__ctx_fr2"],
+        )
+        for attempt in (1, 2):
+            provenance = run_logging.read_final_review_attempt_provenance(
+                harness.run_id, attempt, base=self.artifact_dir
+            )
+            with self.subTest(attempt=attempt):
+                self.assertIsNotNone(provenance["accepted_dispatch_key"])
+
+    def test_a_missing_report_is_recorded_as_voided_never_accepted(self) -> None:
+        """ANALYSIS F2a: two attempts, zero report files, reported as COMPLETED with
+        no findings. Under this record that run could not make that claim silently."""
+        recorder = EchoingTerminalExec()
+        harness = self.started_harness(recorder)
+
+        self.arm(recorder, "ctx_fr1", "task_fr1")
+        harness.run_attempt(
+            "reviewer", 1, "pass", phase=FINAL_REVIEW_PHASE,
+            round_kind="final_review",
+        )
+
+        record = next(iter(self.records(harness.run_id).values()))
+        self.assertEqual(record["provenance_state"], "voided")
+        self.assertEqual(record["void_reason"], "report_missing")
+        self.assertEqual(record["report"]["capture_status"], "absent")
+        provenance = run_logging.read_final_review_attempt_provenance(
+            harness.run_id, 1, base=self.artifact_dir
+        )
+        self.assertIsNone(provenance["accepted_dispatch_key"])
+
+    def test_a_malformed_report_is_recorded_as_voided(self) -> None:
+        recorder = EchoingTerminalExec()
+        harness = self.started_harness(recorder)
+        self.write_report(harness.run_id, 1, "no verdict line anywhere\n")
+
+        self.arm(recorder, "ctx_fr1", "task_fr1")
+        harness.run_attempt(
+            "reviewer", 1, "pass", phase=FINAL_REVIEW_PHASE,
+            round_kind="final_review",
+        )
+
+        record = next(iter(self.records(harness.run_id).values()))
+        self.assertEqual(record["void_reason"], "report_malformed")
+        self.assertIn(
+            "no verdict line anywhere",
+            (
+                self.audit_dir(harness.run_id)
+                / record["dispatch_key"]
+                / "report.md"
+            ).read_text(encoding="utf-8"),
+        )
+
+    def test_an_audit_write_failure_never_mutates_settled_lifecycle_state(
+        self,
+    ) -> None:
+        """Section 9's rule, applied to the record family beside the two logs."""
+        recorder = EchoingTerminalExec()
+        harness = self.started_harness(recorder)
+        self.write_report(harness.run_id, 1)
+
+        self.arm(recorder, "ctx_fr1", "task_fr1")
+        with patch(
+            "scripts.run_logging.write_final_review_audit_record",
+            side_effect=OSError("disk full"),
+        ):
+            attempt, _terminal = harness.run_attempt(
+                "reviewer", 1, "pass", phase=FINAL_REVIEW_PHASE,
+                round_kind="final_review",
+            )
+
+        self.assertEqual(attempt.settlement, "completed")
+        self.assertEqual(attempt.finalizations, 1)
+        self.assertTrue(
+            any("disk full" in error for error in harness._logging_errors)
+        )
+
+    def test_the_record_is_joined_to_the_log_on_the_existing_columns(self) -> None:
+        recorder = EchoingTerminalExec()
+        harness = self.started_harness(recorder)
+        self.write_report(harness.run_id, 1)
+
+        self.arm(recorder, "ctx_fr1", "task_fr1")
+        harness.run_attempt(
+            "reviewer", 1, "pass", phase=FINAL_REVIEW_PHASE,
+            round_kind="final_review",
+        )
+
+        rows = self.read_orchestrator_rows(harness.run_id)
+        audit_rows = [
+            row for row in rows if row["event"].startswith("final_review_audit")
+        ]
+        self.assertTrue(audit_rows)
+        record = next(iter(self.records(harness.run_id).values()))
+        for row in audit_rows:
+            with self.subTest(event=row["event"]):
+                self.assertEqual(row["task_id"], record["task_id"])
+                self.assertEqual(row["dispatch_id"], record["dispatch_id"])
+                self.assertEqual(row["round_kind"], "final_review")
+
+    PROFILE = (
+        "version: 1\n"
+        "profiles:\n"
+        "  diverse:\n"
+        "    defaults:\n      worker: claude\n      reviewer: codex\n"
+        "    final_review:\n      reviewer: claude\n"
+    )
+
+    def final_review_routing(self):
+        from scripts.agent_profile import (
+            RUNTIME_ORCHESTRATION,
+            AgentProfileSelection,
+            SELECTION_SELECTED,
+            load_agent_profiles_text,
+            materialize_run_routing,
+        )
+
+        profiles = dict(
+            load_agent_profiles_text(
+                self.PROFILE, path=".orca/agent-profiles.yaml", source="project_local"
+            )
+        )
+        return materialize_run_routing(
+            runtime=RUNTIME_ORCHESTRATION,
+            selection=AgentProfileSelection(
+                status=SELECTION_SELECTED, name="diverse", profile=profiles["diverse"]
+            ),
+            requested_phases=("implementation",),
+            risk="high",
+        )
+
+    def test_the_record_carries_the_routed_final_reviewer_identity(self) -> None:
+        """The routing is RECORDED, never consulted for a decision."""
+        routing = self.final_review_routing()
+        recorder = EchoingTerminalExec()
+        with patch.dict(environ, {"ORCA_CLI_COMMAND": "/opt/orca-dev"}):
+            harness = OrcaRuntimeHarness(self.artifact_dir, agent_routing=routing)
+        harness._exec_orca = recorder
+        recorder.results["run-create"] = {"run": {"id": "run_routed_audit"}}
+        harness.start_run("OS-22 routed audit", requested_phases=("implementation",))
+        self.write_report("run_routed_audit", 1)
+
+        self.arm(recorder, "ctx_fr1", "task_fr1")
+        harness.run_attempt(
+            "reviewer", 1, "pass", phase=FINAL_REVIEW_PHASE,
+            round_kind="final_review",
+        )
+
+        record = next(iter(self.records("run_routed_audit").values()))
+        entry = routing.for_role("final_review", "final_reviewer")
+        self.assertEqual(record["reviewer_agent_command"], entry.command)
+        self.assertEqual(record["reviewer_agent_origin"], entry.origin)
+
+
 if __name__ == "__main__":
     unittest.main()

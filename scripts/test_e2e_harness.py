@@ -16,6 +16,7 @@ from pathlib import Path
 
 from scripts.task_context import RISK_CONTEXT_KEYS
 import scripts.e2e_harness as e2e_module
+from scripts import run_logging
 import scripts.task_context as task_context_module
 from scripts.final_report import ORCHESTRATION_SKILL, render_final_report
 from scripts.orca_runtime_harness import OrcaRuntimeHarness
@@ -4809,6 +4810,99 @@ class FinalReviewObservabilityNeutralityTests(unittest.TestCase):
                         "the old normalizer was supposed to accept this mutation",
                     )
 
+    def test_the_audit_module_is_not_reachable_from_the_dispatch_path(self) -> None:
+        """N.2 assertion 3: DEC-4's ordering invariant, enforced structurally.
+
+        Literal non-importability is not achievable -- the redaction code lives in
+        run_logging.py, which the dispatching module already imports for logging --
+        so the requirement is implemented as NON-INVOCATION and proved here. That is
+        strictly stronger evidence than an import graph: an import proves nothing
+        about a call, and this proves the call did not happen.
+
+        The patched entry points raise on ANY call, and a full workflow is then
+        driven through spec assembly and the dispatch call. The capture surfaces are
+        deliberately left out of the tripwire and re-patched below, because they are
+        SUPPOSED to run -- after the dispatch, from the settlement path.
+        """
+        tripwires = (
+            "redact_text",
+            "capture_stored_task_spec",
+            "capture_delivery_evidence",
+            "write_final_review_audit_record",
+        )
+        rendered: list[str] = []
+        original = e2e_module.render_task_spec
+
+        def recording(*args, **kwargs):
+            spec = original(*args, **kwargs)
+            # The tripwires are armed while THIS runs: a spec that renders without
+            # tripping one is a spec no audit code touched.
+            rendered.append(spec)
+            return spec
+
+        skill_path = [
+            path for path in SKILL_PATHS if not path.parent.name.endswith("-loop")
+        ][0]
+        e2e_module.render_task_spec = recording
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                workspace = Path(directory)
+                harness = E2EHarness(
+                    skill_path,
+                    phase="implementation",
+                    workspace=workspace,
+                    run_id="run_tripwire",
+                )
+                scenario = WorkflowScenario(
+                    phases=("implementation",),
+                    phase_scenarios={
+                        "implementation": FakeScenario(("complete",), ("pass",))
+                    },
+                    final_review=FinalReviewScenario(modes=("pass",)),
+                    run_id="run_tripwire",
+                )
+                patches = [
+                    patch.object(
+                        run_logging,
+                        name,
+                        side_effect=AssertionError(
+                            f"run_logging.{name} was reached from the "
+                            "spec-assembly -> dispatch path"
+                        ),
+                    )
+                    for name in tripwires
+                ]
+                # The audit emission point itself is on the settlement path, which
+                # this workflow also runs, so it is suppressed here rather than
+                # allowed to trip its own tripwire.
+                with patch.object(
+                    e2e_module.E2EHarness, "_write_final_review_audit", lambda *a: None
+                ):
+                    for entry in patches:
+                        entry.start()
+                    try:
+                        result = harness.run_workflow(scenario)
+                    finally:
+                        for entry in reversed(patches):
+                            entry.stop()
+        finally:
+            e2e_module.render_task_spec = original
+
+        self.assertEqual(result.final_status, "COMPLETED")
+        self.assertTrue(rendered, "no spec was rendered, so nothing was proved")
+
+    def test_the_audit_surfaces_this_test_arms_all_exist(self) -> None:
+        """A tripwire patched onto a name that no longer exists proves nothing, and
+        patch() on a missing attribute would be the only thing to say so."""
+        for name in (
+            "redact_text",
+            "capture_stored_task_spec",
+            "capture_delivery_evidence",
+            "write_final_review_audit_record",
+        ):
+            with self.subTest(name=name):
+                self.assertTrue(callable(getattr(run_logging, name)))
+
     def test_render_task_spec_gained_no_parameter(self) -> None:
         signature = inspect.signature(task_context_module.render_task_spec)
         actual = tuple(
@@ -4854,6 +4948,146 @@ class FinalReviewObservabilityNeutralityTests(unittest.TestCase):
                 }
                 self.assertNotIn("_normalize_artifact", called, node.name)
         self.assertEqual(found, capture_functions)
+
+
+class DeterministicFinalReviewAuditTests(unittest.TestCase):
+    """OS-22 I-10, harness side: the deterministic runtime takes the same path.
+
+    The point is not to re-test the writer -- test_run_logging.py does that -- but to
+    prove the EMISSION POINT exists on this path too, and that the workflow's own
+    verdict is unaffected by it.
+    """
+
+    def run_workflow(
+        self,
+        modes,
+        workspace: Path,
+        run_id: str = "run_audit_e2e",
+        *,
+        findings=(),
+        correction_scenarios=None,
+    ):
+        skill_path = [
+            path for path in SKILL_PATHS if not path.parent.name.endswith("-loop")
+        ][0]
+        harness = E2EHarness(
+            skill_path, phase="implementation", workspace=workspace, run_id=run_id
+        )
+        return harness.run_workflow(
+            WorkflowScenario(
+                phases=("implementation",),
+                phase_scenarios={
+                    "implementation": FakeScenario(("complete",), ("pass",))
+                },
+                final_review=FinalReviewScenario(modes=modes, findings=findings),
+                run_id=run_id,
+                correction_scenarios=correction_scenarios or {},
+            )
+        )
+
+    def records(self, workspace: Path, run_id: str) -> dict[str, dict]:
+        return {
+            key: json.loads((directory / "record.json").read_text(encoding="utf-8"))
+            for key, directory in run_logging.iter_final_review_audit_records(
+                run_id, base=workspace
+            )
+        }
+
+    def test_one_record_per_final_review_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+
+            result = self.run_workflow(("pass",), workspace)
+
+            records = self.records(workspace, "run_audit_e2e")
+            self.assertEqual(len(records), 1)
+            record = records["attempt1__task_e2e_final_review_1__ctx_e2e_final_review_1"]
+            self.assertEqual(record["final_review_attempt"], 1)
+            self.assertEqual(record["provenance_state"], "accepted")
+            self.assertEqual(record["settlement_state"], "settled")
+            self.assertEqual(result.final_review_iterations, 1)
+
+    def test_the_contracted_review_artifact_is_materialized_and_snapshotted(
+        self,
+    ) -> None:
+        """final_review_artifact_path() named the path and nothing wrote it, so the
+        contracted artifact existed only as a string in a result object."""
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+
+            result = self.run_workflow(("pass",), workspace)
+
+            report = workspace / result.final_review_artifacts[0]
+            self.assertTrue(report.is_file())
+            record = next(iter(self.records(workspace, "run_audit_e2e").values()))
+            self.assertEqual(record["report"]["capture_status"], "captured")
+            snapshot = (
+                workspace
+                / "artifacts"
+                / "runs"
+                / "run_audit_e2e"
+                / "final_review_audit"
+                / record["dispatch_key"]
+                / "report.md"
+            )
+            self.assertEqual(
+                run_logging.sha256_bytes(snapshot.read_bytes()),
+                record["report"]["artifact_digest_post_redaction"],
+            )
+
+    def test_a_second_attempt_never_overwrites_the_first_record(self) -> None:
+        """The whole point of a per-dispatch key: attempt 2's Reviewer can overwrite
+        attempt 1's FINAL_REVIEW.md, but not attempt 1's snapshot of it."""
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+
+            self.run_workflow(
+                ("fail", "pass"),
+                workspace,
+                findings=((("R1", "implementation"),), ()),
+                correction_scenarios={
+                    ("implementation", 1): FakeScenario(
+                        worker_modes=("correction",),
+                        reviewer_modes=("pass",),
+                        worker_resolutions=({"R1": "RESOLVED"},),
+                    )
+                },
+            )
+
+            records = self.records(workspace, "run_audit_e2e")
+            self.assertEqual(len(records), 2)
+            attempts = sorted(
+                record["final_review_attempt"] for record in records.values()
+            )
+            self.assertEqual(attempts, [1, 2])
+            audit_dir = (
+                workspace / "artifacts" / "runs" / "run_audit_e2e"
+                / "final_review_audit"
+            )
+            first = (
+                audit_dir
+                / "attempt1__task_e2e_final_review_1__ctx_e2e_final_review_1"
+                / "report.md"
+            ).read_text(encoding="utf-8")
+            second = (
+                audit_dir
+                / "attempt2__task_e2e_final_review_2__ctx_e2e_final_review_2"
+                / "report.md"
+            ).read_text(encoding="utf-8")
+            self.assertNotEqual(first, second)
+
+    def test_an_audit_failure_does_not_change_the_workflow_verdict(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+
+            with patch(
+                "scripts.run_logging.write_final_review_audit_record",
+                side_effect=OSError("disk full"),
+            ):
+                result = self.run_workflow(("pass",), workspace)
+
+            self.assertEqual(result.final_review_verdict, "PASS")
+            self.assertEqual(result.final_status, "COMPLETED")
 
 
 if __name__ == "__main__":
