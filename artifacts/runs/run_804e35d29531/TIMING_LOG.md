@@ -101,3 +101,7 @@
 | 2026-08-25T20:30:43.171730+00:00 | dispatch_settled | DESIGN | reviewer | 5 | 2026-08-25T20:29:00.273423+00:00 | 2026-08-25T20:30:43.171507+00:00 | 102.898 | high |  |
 | 2026-08-25T20:30:43.171507+00:00 | iteration_end | DESIGN |  | 5 | 2026-08-25T20:23:20.964975+00:00 | 2026-08-25T20:30:43.171507+00:00 | 442.207 | high | PASS (final available iteration) |
 | 2026-08-25T20:30:43.171507+00:00 | phase_end | DESIGN |  |  | 2026-08-25T20:23:20.964975+00:00 | 2026-08-25T20:30:43.171507+00:00 | 442.207 | high | PASS after Final-Review-2-triggered correction (R5) |
+| 2026-08-25T20:31:58.437991+00:00 | phase_start | IMPLEMENTATION |  |  | 2026-08-25T20:31:58.437991+00:00 |  |  | high |  |
+| 2026-08-25T20:31:58.437991+00:00 | iteration_start | IMPLEMENTATION |  | 5 | 2026-08-25T20:31:58.437991+00:00 |  |  | high |  |
+| 2026-08-25T20:43:16.081995+00:00 | dispatch_settled | IMPLEMENTATION | reviewer | 5 | 2026-08-25T20:40:05.003402+00:00 | 2026-08-25T20:43:16.081804+00:00 | 191.078 | high |  |
+| 2026-08-25T20:43:16.081804+00:00 | iteration_end | IMPLEMENTATION |  | 5 | 2026-08-25T20:31:58.437991+00:00 | 2026-08-25T20:43:16.081804+00:00 | 677.644 | high | PASS (final available iteration, downstream revalidation) |
