@@ -218,3 +218,81 @@ with no blocking or non-blocking findings.
 * **D-A.6″'s seven-rule `.gitattributes` block is not implemented in this tree**, which is why
   step 6 was an add rather than an update. Flagged above under Summary so the coordinator can route
   it rather than have it discovered later.
+
+---
+
+## IMPLEMENTATION iteration 2 -- correction for F-901
+
+STATUS: COMPLETE
+
+### Summary / Analysis
+
+`REVIEW_IMPLEMENTATION_iteration1.md` raised exactly one blocking finding, F-901 (MINOR, G1),
+against the comment block commit `467cdc9` added to `.gitattributes`. The comment claimed the shared
+predicate is enforced at "all SEVEN public boundaries" and then enumerated **eight** surfaces,
+because it folded `run_logging.final_review_dispatch_key()` -- GATE 0, the *pre-existing* shipped
+check that D-A.7 only refactored onto the predicate -- into the same sentence as the seven
+newly-specified gates. DESIGN iteration 2 step 6 requires the comment to name **seven** boundaries
+and the shared predicate, so the stated cardinality was false against an explicit requirement.
+
+Fixed with the reviewer's option (a): the enumerated list now contains exactly the seven gates
+(GATE 1 `repatriate()`, GATE 2 `isolate()`, GATE 4 `build_attestation()`, GATE 3 the
+`final_review_eval.py isolate --attempt` CLI door, GATE 5 `final_review_report_ladder_path()`,
+GATE 7 `read_final_review_attempt_provenance()`, GATE 6 `e2e_harness.final_review_artifact_path()`),
+and `final_review_dispatch_key()` is named separately as "the pre-existing, already-guarded"
+surface "whose shipped inline check was refactored onto that same predicate". Both facts DESIGN
+records are now stated, and neither is counted twice.
+
+This is a **comment-text-only** change. No other finding was open, and nothing else was reopened.
+
+### Changes
+
+1. `.gitattributes` lines 6-15: the invariant comment block rewritten as described above. Nine
+   comment lines replaced by ten; all lines remain within the file's existing ~99-column budget.
+
+**Explicitly unchanged:** the attribute rule
+`artifacts/runs/*/final_review_audit/**/report.md -whitespace` (line 16, byte-identical -- the diff
+shows it as unmodified context), the four-line A.3/A.6 preamble (lines 1-4), `GITATTRIBUTES_RULE` in
+`scripts/test_run_logging.py`, all seven executable gates, `attempt_domain_violation()`, the two
+exception facades, the byte-identical Skill mirror, and every test file.
+
+### Modified Files
+
+| file | change |
+|---|---|
+| `.gitattributes` | comment text only (9 lines removed, 10 added; the rule line untouched) |
+| `artifacts/runs/run_028d416e596a/IMPLEMENTATION.md` | this appended section |
+
+### Unit Tests
+
+Narrowest selection covering the `.gitattributes` rule and the whitespace-exemption contract:
+
+```
+python3 -m pytest scripts/test_run_logging.py -k "gitattributes or Whitespace or whitespace" -q
+  -> 2 failed, 5 passed, 184 deselected, 38 subtests passed in 0.81s
+```
+
+`test_the_gitattributes_rule_is_exactly_the_one_designed` **passes**: the parser strips `#` lines,
+so it reads the single rule line and asserts it equals `GITATTRIBUTES_RULE` exactly -- direct proof
+the rule text is untouched and the fix is comment-only.
+
+The two failures are the **already-recorded baseline** the iteration-1 reviewer classified as
+pre-existing noise (`test_the_whitespace_gate_passes_over_the_whole_os22_range` and
+`test_the_gate_fails_again_once_the_exemption_is_removed`; both fail on trailing whitespace in older
+review artifacts such as `artifacts/runs/run_75c5c6046f35/REVIEW_TEST_iteration1.md`, outside this
+change). **Proved pre-existing, not assumed:** the identical selection was run with this change
+stashed and produced the identical `2 failed, 5 passed, 184 deselected, 38 subtests passed` -- the
+same two test IDs, before and after. Both assertions read committed history via `git diff --check`
+over a commit range, which a working-tree comment edit cannot influence.
+
+Result: PASS (no regression; the one test that governs this file's rule passes).
+
+### Review Feedback Resolution
+
+* **F-901 (MINOR / G1 / BLOCKING) -- RESOLVED.** The comment now names seven newly-specified
+  boundaries in its enumerated list and states `final_review_dispatch_key()` separately as the
+  pre-existing, already-guarded site. Required Action satisfied via the reviewer's option (a); the
+  attribute rule is unchanged.
+* No non-blocking findings were filed. RK-19 and RK-21 remain open and deliberately unaddressed, as
+  recorded in iteration 1, along with the note that D-A.6″'s seven-rule `.gitattributes` block is
+  not implemented in this tree.
