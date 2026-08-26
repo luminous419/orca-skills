@@ -14,9 +14,11 @@ carries the fail-closed guarantee, so the guarantee is never merely unasserted.
 
 from __future__ import annotations
 
+import ast
 import dataclasses
 import errno
 import hashlib
+import inspect
 import json
 import os
 import shutil
@@ -30,7 +32,9 @@ from pathlib import Path
 from unittest import mock
 
 import review_isolation
+from scripts import e2e_harness
 from scripts import final_review_eval as evaluator
+from scripts import run_logging
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = REPO_ROOT / "scripts" / "fixtures" / "final_review_eval"
@@ -51,6 +55,25 @@ NEEDS_SANDBOX = unittest.skipUnless(
 # MECHANISM; walking /System to re-derive what an integration run already established
 # would add three minutes per test and prove nothing new.
 FAST_IMM = ("/bin", "/sbin")
+
+
+def _function_body_statements(function) -> list[str]:
+    """The function's own statements, source order, docstring dropped.
+
+    T-13.4' needs "the gate PRECEDES every other statement", which a substring search
+    over the whole module cannot express -- a gate deleted from one function and left in
+    a sibling would still match. Parsing the one function is what makes the assertion
+    about placement rather than about presence.
+    """
+    tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
+    body = tree.body[0].body
+    if (
+        isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        body = body[1:]
+    return [ast.unparse(statement) for statement in body]
 
 
 def run_cli(*argv: str) -> subprocess.CompletedProcess[str]:
@@ -2166,6 +2189,300 @@ class NonRegularScanTests(_IsolationTestCase):
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(completed.stdout.strip(), "4")
+
+
+class AttemptDomainTests(_IsolationTestCase):
+    """T-13.1 / T-13.3 / T-13.4' / T-13.5 / T-13.6 -- DESIGN D-A.7 and INV-ATTEMPT-2.
+
+    `attempt` becomes a path component through
+    `suffix = "" if attempt == 1 else f"_iteration{attempt}"`, and an f-string accepts
+    ANY object while `== 1` is a value comparison, so `0`, `-1`, `False` and `2.0` all
+    produced real, unexempted, digest-bound destinations before D-A.7 (DESIGN M-14/M-24).
+    """
+
+    # DESIGN M-14: `attempt=False` wrote FINAL_REVIEW_iterationFalse.md and
+    # `attempt=True` silently aliased attempt 1, because `True == 1`. The bool exclusion
+    # is that measurement, not pedantry.
+    OUT_OF_RANGE = (0, -1, -12)
+    WRONG_TYPE = (False, True, 2.0, "2", None)
+
+    def prepared(self) -> Path:
+        session = self.build()
+        (session / "review_root" / "artifacts" / "runs" / "run_t"
+         / "FINAL_REVIEW.md").write_text("RESULT: PASS\n", encoding="utf-8")
+        (session / "control" / review_isolation.ISOLATION_FILENAME).write_text(
+            "{}\n", encoding="utf-8"
+        )
+        return session
+
+    def attestation_arguments(self, session: Path, **overrides) -> dict:
+        arguments = {
+            "run_id": "run_t", "attempt": 1, "terminal": "term_x", "session": session,
+            "enforcement": "seatbelt",
+            "readable": {
+                "entries": [
+                    {"class": "IMM", "path": "/bin", "scanned": False,
+                     "proof": {"passed": True, "writable_dirs": 0, "writable_files": 0}},
+                ],
+                "carve_outs": [],
+            },
+            "traversal": ["/"], "writable": [str(session / "review_root")],
+            "denied": [str(REPO_ROOT)], "profile_digest": "sha256:x",
+            "probes": [
+                {"id": identifier, "result": "PASS"}
+                for identifier in ("NEG-0", "NEG-1", "NEG-2", "NEG-3", "NEG-4",
+                                   "NEG-5", "NEG-6", "NEG-7", "NEG-8")
+            ],
+        }
+        arguments.update(overrides)
+        return arguments
+
+    def assertNothingCreated(self) -> None:
+        """The half a bare assertRaises would miss.
+
+        DESIGN M-14 measured the shipped `repatriate()` creating
+        `artifacts/runs/<run>/` BEFORE it looked at `attempt`, so this is what pins the
+        check ahead of the mkdir rather than merely present.
+        """
+        self.assertFalse(
+            (self.base / "artifacts").exists(),
+            "a refused attempt must leave no run directory behind",
+        )
+
+    # ---- T-13.1 -------------------------------------------------------------------
+
+    def test_t131_repatriate_refuses_zero_and_negatives_and_creates_nothing(self) -> None:
+        session = self.prepared()
+        for attempt in self.OUT_OF_RANGE:
+            with self.subTest(attempt=attempt):
+                with self.assertRaises(
+                    review_isolation.IsolationAttemptDomainError
+                ) as caught:
+                    review_isolation.repatriate(
+                        session, "run_t", attempt=attempt, base=self.base
+                    )
+                self.assertEqual(
+                    str(caught.exception), f"attempt must be >= 1, got {attempt!r}"
+                )
+                self.assertNothingCreated()
+
+    def test_t131_isolate_refuses_zero_and_negatives_and_builds_no_session(self) -> None:
+        before = set(Path(tempfile.gettempdir()).glob(
+            f"{review_isolation.SESSION_PREFIX}*"
+        ))
+        for attempt in self.OUT_OF_RANGE:
+            with self.subTest(attempt=attempt):
+                with self.assertRaises(
+                    review_isolation.IsolationAttemptDomainError
+                ) as caught:
+                    review_isolation.isolate(
+                        "run_t", fixture=FIXTURE, session_base=self.base,
+                        attempt=attempt, enforcement="none", plant=False,
+                    )
+                self.assertEqual(
+                    str(caught.exception), f"attempt must be >= 1, got {attempt!r}"
+                )
+                self.assertNothingCreated()
+        self.assertEqual(
+            set(Path(tempfile.gettempdir()).glob(
+                f"{review_isolation.SESSION_PREFIX}*"
+            )),
+            before,
+            "a session is expensive to build and must not be built on a bad argument",
+        )
+
+    # ---- T-13.3 -------------------------------------------------------------------
+
+    def test_t133a_non_integer_objects_are_refused_at_the_function_boundary(self) -> None:
+        session = self.prepared()
+        for attempt in self.WRONG_TYPE:
+            with self.subTest(attempt=attempt):
+                for call in (
+                    lambda: review_isolation.repatriate(
+                        session, "run_t", attempt=attempt, base=self.base
+                    ),
+                    lambda: review_isolation.isolate(
+                        "run_t", fixture=FIXTURE, session_base=self.base,
+                        attempt=attempt, enforcement="none", plant=False,
+                    ),
+                ):
+                    with self.assertRaises(
+                        review_isolation.IsolationAttemptDomainError
+                    ) as caught:
+                        call()
+                    self.assertEqual(
+                        str(caught.exception),
+                        f"attempt must be an int >= 1, got {attempt!r}",
+                    )
+                    self.assertNothingCreated()
+
+    def test_t133b_non_integer_text_at_the_cli_keeps_argparses_own_exit_two(self) -> None:
+        # PRE-EXISTING AND DELIBERATE (D-A.7.5). An out-of-DOMAIN integer is a
+        # program-level input error (exit 1, G.7); unparseable TEXT never reaches the
+        # program at all and takes argparse's usage exit, the same one `--enforcement
+        # bogus` already takes. Both codes are pinned so a future unification is
+        # deliberate rather than accidental.
+        for text in ("abc", "1.5", "0x2", "1e3"):
+            with self.subTest(text=text):
+                completed = run_cli(
+                    "isolate", "--run-id", "run_t", "--teardown", str(self.base),
+                    "--attempt", text,
+                )
+                self.assertEqual(completed.returncode, 2, completed.stderr)
+                self.assertIn("invalid int value", completed.stderr)
+
+    def test_t133c_lenient_integer_spellings_parse_and_are_accepted(self) -> None:
+        # M-16: spelling leniency cannot produce an out-of-domain name, because argparse
+        # normalises the text to an int before the domain check ever sees it.
+        parser = evaluator.build_parser()
+        for text, expected in (("001", 1), ("+2", 2), ("1_0", 10), (" 3 ", 3)):
+            with self.subTest(text=text):
+                arguments = parser.parse_args(
+                    ["isolate", "--run-id", "run_t", "--attempt", text]
+                )
+                self.assertEqual(arguments.attempt, expected)
+                self.assertIsNone(
+                    run_logging.attempt_domain_violation(arguments.attempt)
+                )
+
+    # ---- T-13.4' ------------------------------------------------------------------
+
+    def test_t134_every_gated_boundary_checks_before_it_does_anything_else(self) -> None:
+        """D-A.7.6's census made executable, corrected for INV-ATTEMPT-2.
+
+        D-A.7's T-13.4 asserted a REACHABILITY claim about `build_attestation()`; that
+        clause is deleted, because GATE 4 now makes the claim unnecessary.
+        """
+        for function, expression in (
+            (review_isolation.repatriate, "assert_attempt_in_domain(attempt)"),
+            (review_isolation.isolate, "assert_attempt_in_domain(attempt)"),
+            (review_isolation.build_attestation, "assert_attempt_in_domain(attempt)"),
+            (run_logging.final_review_report_ladder_path,
+             "assert_attempt_in_domain(attempt"),
+            (run_logging.read_final_review_attempt_provenance,
+             "assert_attempt_in_domain(attempt"),
+            (e2e_harness.final_review_artifact_path,
+             "assert_attempt_in_domain(attempt)"),
+        ):
+            with self.subTest(function=function.__qualname__):
+                body = _function_body_statements(function)
+                self.assertTrue(
+                    body, f"{function.__qualname__} has no executable body"
+                )
+                self.assertIn(
+                    expression, body[0],
+                    f"{function.__qualname__}'s domain gate must PRECEDE every other "
+                    "statement, not merely be present",
+                )
+
+    def test_t134_review_isolation_still_declares_no_cli_door_of_its_own(self) -> None:
+        source = (REPO_ROOT / "scripts" / "review_isolation.py").read_text(
+            encoding="utf-8"
+        )
+        for marker in ("__main__", "import argparse", "\ndef main("):
+            self.assertNotIn(
+                marker, source,
+                "review_isolation is library-only; it is reached from the command line "
+                "only through final_review_eval.py isolate (C-7)",
+            )
+
+    def test_t134_the_shipped_run_logging_mirror_is_byte_identical(self) -> None:
+        # C-10 / RK-22: a global or project-local Skill install never copies this
+        # repository's scripts/, so the Skill ships its own copy. validate_skills.py
+        # fails on drift; this is the faster tripwire inside the suite.
+        self.assertEqual(
+            (REPO_ROOT / "scripts" / "run_logging.py").read_bytes(),
+            (REPO_ROOT / "orca-worker-reviewer-orchestration" / "tools"
+             / "run_logging.py").read_bytes(),
+            "any attempt-domain edit to run_logging.py must be mirrored in the same "
+            "commit",
+        )
+
+    # ---- T-13.5 -------------------------------------------------------------------
+
+    def test_t135_valid_attempts_are_unaffected_in_every_respect(self) -> None:
+        session = self.prepared()
+        source = (session / "review_root" / "artifacts" / "runs" / "run_t"
+                  / "FINAL_REVIEW.md")
+        root = self.base / "artifacts" / "runs" / "run_t"
+        # 100 is in this list deliberately: D-A.7.2 declines an upper bound and D-A.6"
+        # leaves the path unexempted (RK-19). This asserts it still WORKS; T-12.3
+        # asserts it is still unexempted. Together they make the undermatch a bounded
+        # choice rather than a gap.
+        for attempt in (1, 2, 3, 9, 10, 42, 99, 100):
+            with self.subTest(attempt=attempt):
+                result = review_isolation.repatriate(
+                    session, "run_t", attempt=attempt, base=self.base
+                )
+                suffix = "" if attempt == 1 else f"_iteration{attempt}"
+                self.assertEqual(
+                    result["report"], str(root / f"FINAL_REVIEW{suffix}.md")
+                )
+                self.assertEqual(
+                    result["workspace"],
+                    str(root / f"{review_isolation.REPATRIATED_WORKSPACE_DIRNAME}"
+                        f"{suffix}"),
+                )
+                self.assertEqual(
+                    result["report_digest"], review_isolation.sha256_path(source),
+                    "the existing digest-verification path is reached unchanged",
+                )
+
+    # ---- T-13.6 -- GATE 4 ---------------------------------------------------------
+
+    def test_t136_build_attestation_refuses_every_out_of_domain_attempt(self) -> None:
+        session = self.build()
+        for attempt in self.OUT_OF_RANGE + self.WRONG_TYPE:
+            with self.subTest(attempt=attempt):
+                # `type(...) is int`, not `attempt in self.OUT_OF_RANGE`: `False == 0`,
+                # so membership would classify the bool as an out-of-RANGE value and
+                # assert the wrong half of the message contract.
+                expected = (
+                    f"attempt must be >= 1, got {attempt!r}"
+                    if type(attempt) is int
+                    else f"attempt must be an int >= 1, got {attempt!r}"
+                )
+                with self.assertRaises(
+                    review_isolation.IsolationAttemptDomainError
+                ) as caught:
+                    review_isolation.build_attestation(
+                        **self.attestation_arguments(session, attempt=attempt)
+                    )
+                self.assertEqual(str(caught.exception), expected)
+
+    def test_t136_the_domain_error_wins_before_any_document_field_is_built(self) -> None:
+        # The half a bare assertRaises would miss: an otherwise-invalid `readable` that
+        # would raise IsolationError if the body ran (see T-8.7c). The DOMAIN error must
+        # win, which is what places the gate before `verdicts = {...}`.
+        session = self.build()
+        broken = {
+            "entries": [{"class": "USR", "path": "/bin", "scanned": False}],
+            "carve_outs": [],
+        }
+        with self.assertRaises(review_isolation.IsolationError):
+            review_isolation.build_attestation(
+                **self.attestation_arguments(session, attempt=1, readable=broken)
+            )
+        with self.assertRaises(review_isolation.IsolationAttemptDomainError):
+            review_isolation.build_attestation(
+                **self.attestation_arguments(session, attempt=0, readable=broken)
+            )
+
+    def test_t136_valid_attempts_round_trip_as_json_numbers(self) -> None:
+        # The direct counter-assertion to M-24c, which measured shipped code serializing
+        # 0, -1, 2.0, false, true, "2" and null into ISOLATION.json's
+        # final_review_attempt field.
+        session = self.build()
+        for attempt in (1, 2, 100):
+            with self.subTest(attempt=attempt):
+                document = review_isolation.build_attestation(
+                    **self.attestation_arguments(session, attempt=attempt)
+                )
+                self.assertIs(type(document["final_review_attempt"]), int)
+                self.assertEqual(document["final_review_attempt"], attempt)
+                self.assertEqual(
+                    json.loads(json.dumps(document))["final_review_attempt"], attempt
+                )
 
 
 if __name__ == "__main__":       # pragma: no cover

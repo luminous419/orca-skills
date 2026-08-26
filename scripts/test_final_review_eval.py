@@ -1541,5 +1541,67 @@ class IsolateCliWiringTests(unittest.TestCase):
             )
 
 
+class AttemptDomainCliTests(unittest.TestCase):
+    """T-13.2 -- DESIGN D-A.7.4 GATE 3, the shared `--attempt` CLI door.
+
+    Asserting the EXIT CODE and not only the message is the point: it pins the `except`
+    clause in `_dispatch_isolate()`. An `IsolationAttemptDomainError` that escaped to
+    `main()` would traceback instead of printing `input error: ...`, because this file
+    runs as `__main__` while `review_isolation` does its own `import final_review_eval`
+    -- two `EvalInputError` classes, no subclass relationship across them. That is
+    IMPLEMENTATION Finding F-503's defect, in this file, for this reason.
+    """
+
+    def assertRefused(self, completed, attempt: str) -> None:
+        self.assertEqual(
+            completed.returncode, evaluator.EXIT_INPUT_ERROR, completed.stderr
+        )
+        self.assertIn(
+            f"input error: --attempt must be >= 1, got {int(attempt)}", completed.stderr
+        )
+        self.assertNotIn("Traceback", completed.stderr)
+
+    def test_t132_the_repatriate_form_refuses_zero_and_negatives(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            for attempt in ("0", "-1"):
+                with self.subTest(attempt=attempt):
+                    self.assertRefused(
+                        run_cli(
+                            "isolate", "--run-id", "r", "--repatriate", directory,
+                            "--attempt", attempt,
+                        ),
+                        attempt,
+                    )
+
+    def test_t132_the_teardown_form_refuses_them_too(self) -> None:
+        # `--teardown` ignores `attempt` today, so this is what proves GATE 3 precedes
+        # the branch rather than sitting inside one arm of it. A door that accepts a
+        # nonsense value on one form is an open door.
+        with tempfile.TemporaryDirectory() as directory:
+            for attempt in ("0", "-1"):
+                with self.subTest(attempt=attempt):
+                    completed = run_cli(
+                        "isolate", "--run-id", "r", "--teardown", directory,
+                        "--attempt", attempt,
+                    )
+                    self.assertRefused(completed, attempt)
+                    self.assertTrue(
+                        Path(directory).is_dir(),
+                        "a refused attempt must tear nothing down",
+                    )
+
+    def test_t132_a_valid_attempt_still_reaches_the_handler(self) -> None:
+        # The regression half: gate 3 refuses the domain and nothing else. A valid
+        # attempt still reaches `repatriate()`, which refuses this directory for its own
+        # reason (no report) with the CONTRACT exit, not the input-error exit.
+        with tempfile.TemporaryDirectory() as directory:
+            completed = run_cli(
+                "isolate", "--run-id", "r", "--repatriate", directory, "--attempt", "2"
+            )
+            self.assertEqual(
+                completed.returncode, evaluator.EXIT_CONTRACT_VIOLATION, completed.stderr
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

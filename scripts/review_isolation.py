@@ -1030,6 +1030,24 @@ _NO_FOLLOW_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEX
 _NO_FOLLOW_FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
 
 
+class IsolationAttemptDomainError(final_review_eval.EvalInputError):
+    """`attempt` outside its declared domain. Maps to EXIT_INPUT_ERROR (1), like every
+    other argument-grammar failure -- nothing is built, so there is nothing to remove."""
+
+
+def assert_attempt_in_domain(attempt: object, *, label: str = "attempt") -> int:
+    """This module's facade over `run_logging.attempt_domain_violation()`.
+
+    Same rule, same message text, different exception type -- the type has to be an
+    `EvalInputError` subclass or `_dispatch_isolate`'s `except` cannot map it to
+    exit 1 (IMPLEMENTATION F-503's defect).
+    """
+    message = run_logging.attempt_domain_violation(attempt, label)
+    if message is not None:
+        raise IsolationAttemptDomainError(message)
+    return attempt
+
+
 class IsolationSeedGrammarError(final_review_eval.EvalInputError):
     """A malformed `--seed` argument. Maps to EXIT_INPUT_ERROR (1), like every other
     argument-grammar failure -- nothing is built, so there is nothing to remove."""
@@ -2470,6 +2488,7 @@ def build_attestation(
     `isolated: true` field -- a single boolean invites reading a partial result as a whole
     one.
     """
+    attempt = assert_attempt_in_domain(attempt)
     verdicts = {probe["id"]: probe["result"] for probe in probes}
 
     def passed(*identifiers: str) -> str:
@@ -2609,6 +2628,7 @@ def repatriate(
     contains no clock-derived value. The one thing that WOULD have broken B5 -- pointing
     `--workspace` at a deleted session path -- is closed by that copy.
     """
+    attempt = assert_attempt_in_domain(attempt)
     session = Path(session)
     root = (Path(base) if base else Path.cwd()) / "artifacts" / "runs" / run_id
     root.mkdir(parents=True, exist_ok=True)
@@ -2676,6 +2696,7 @@ def isolate(
     A half-built isolation session is worse than none, because its existence would be
     read as a guarantee. Every failure below removes the session before it raises.
     """
+    attempt = assert_attempt_in_domain(attempt)
     if enforcement not in (ENFORCEMENT_SEATBELT, ENFORCEMENT_NONE):
         raise IsolationContractError(f"unknown enforcement backend {enforcement!r}")
     if enforcement == ENFORCEMENT_SEATBELT and not Path(SANDBOX_EXEC).exists():

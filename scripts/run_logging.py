@@ -1494,8 +1494,7 @@ def final_review_report_ladder_path(
     run_id: str, attempt: int, *, base: Path | None = None
 ) -> Path:
     """Section 9's ladder: attempt 1 unsuffixed, attempt N>=2 _iteration<N>."""
-    if attempt < 1:
-        raise RunLoggingError(f"final_review_attempt must be >= 1, got {attempt!r}")
+    attempt = assert_attempt_in_domain(attempt, label="final_review_attempt")
     suffix = "" if attempt == 1 else f"_iteration{attempt}"
     return _ensure_run_artifact_root(run_id, base=base) / f"FINAL_REVIEW{suffix}.md"
 
@@ -1693,6 +1692,37 @@ def final_review_audit_dir(run_id: str, *, base: Path | None = None) -> Path:
     return _ensure_run_artifact_root(run_id, base=base) / FINAL_REVIEW_AUDIT_DIRNAME
 
 
+ATTEMPT_MIN = 1
+
+
+def attempt_domain_violation(attempt: object, label: str = "attempt") -> str | None:
+    """The Final Review attempt domain, as ONE predicate. Message, or None if legal.
+
+    Domain: exact type `int` (a `bool` is NOT an int here), and `>= ATTEMPT_MIN`.
+
+    It deliberately RAISES NOTHING. Three modules enforce this same rule and each
+    owns a different exception contract -- `run_logging` raises `RunLoggingError`,
+    `review_isolation` must raise an `EvalInputError` subclass so
+    `_dispatch_isolate`'s dual-module-identity `except` maps it to exit 1, and
+    `e2e_harness` raises a plain `ValueError`. A shared *raiser* would force one of
+    them to change its error contract; a shared *predicate* gives all of them the
+    identical rule and the identical message text while each keeps its own type.
+    """
+    if not isinstance(attempt, int) or isinstance(attempt, bool):
+        return f"{label} must be an int >= {ATTEMPT_MIN}, got {attempt!r}"
+    if attempt < ATTEMPT_MIN:
+        return f"{label} must be >= {ATTEMPT_MIN}, got {attempt!r}"
+    return None
+
+
+def assert_attempt_in_domain(attempt: object, *, label: str = "attempt") -> int:
+    """`run_logging`'s facade over `attempt_domain_violation()`. Returns the value."""
+    message = attempt_domain_violation(attempt, label)
+    if message is not None:
+        raise RunLoggingError(message)
+    return attempt
+
+
 def final_review_dispatch_key(
     final_review_attempt: int, task_id: str, dispatch_id: str = ""
 ) -> str:
@@ -1708,17 +1738,9 @@ def final_review_dispatch_key(
     `final_review_attempt` field, never from this filename: section 1 forbids a
     consumer depending on filename convention. This is a convenience for humans.
     """
-    if not isinstance(final_review_attempt, int) or isinstance(
-        final_review_attempt, bool
-    ):
-        raise RunLoggingError(
-            f"final_review_attempt must be an int >= 1, got "
-            f"{final_review_attempt!r}"
-        )
-    if final_review_attempt < 1:
-        raise RunLoggingError(
-            f"final_review_attempt must be >= 1, got {final_review_attempt!r}"
-        )
+    final_review_attempt = assert_attempt_in_domain(
+        final_review_attempt, label="final_review_attempt"
+    )
     dispatch = dispatch_id or "nodispatch"
     for label, component in (("task_id", task_id), ("dispatch_id", dispatch)):
         if not component or not _DISPATCH_KEY_COMPONENT.match(component):
@@ -2423,6 +2445,7 @@ def read_final_review_attempt_provenance(
     A `voided` record is never returned as a verdict by any function in this module.
     There is no parameter, flag or fallback that makes it one.
     """
+    attempt = assert_attempt_in_domain(attempt, label="final_review_attempt")
     records: list[str] = []
     unreadable: list[dict] = []
     violations: list[dict] = []

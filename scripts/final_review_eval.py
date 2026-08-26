@@ -1383,6 +1383,13 @@ def _dispatch_isolate(args: argparse.Namespace) -> int:
     import review_isolation
 
     try:
+        # GATE 3 (DESIGN D-A.7.4). Inside the `try:` so the `except` below maps it to an
+        # exit code, and BEFORE the branch so `--attempt 0 --teardown <p>` is refused too:
+        # `--teardown` ignores the value today, and a door that accepts a nonsense value on
+        # one form is an open door.
+        args.attempt = review_isolation.assert_attempt_in_domain(
+            args.attempt, label="--attempt"
+        )
         if args.teardown:
             review_isolation.teardown(Path(args.teardown))
             print(json.dumps({"teardown": args.teardown}, indent=2))
@@ -1411,7 +1418,10 @@ def _dispatch_isolate(args: argparse.Namespace) -> int:
             agent_path=tuple(args.agent_path),
             agent_command=args.agent_command,
         )
-    except review_isolation.IsolationSeedGrammarError as error:
+    except (
+        review_isolation.IsolationSeedGrammarError,
+        review_isolation.IsolationAttemptDomainError,
+    ) as error:
         # Caught HERE and not by `main()`'s `except EvalInputError`. This file runs as
         # `__main__` while `review_isolation` does its own `import final_review_eval`, so
         # there are two `EvalInputError` classes and the subclass relationship that holds

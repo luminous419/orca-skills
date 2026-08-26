@@ -428,8 +428,7 @@ def final_review_artifact_path(run_id: str, attempt: int) -> str:
     prefix (run_artifact_root, task_context's single root builder) is what keeps two
     runs' Final Review artifacts from landing in the same shared artifacts/ root.
     """
-    if attempt < 1:
-        raise ValueError(f"attempt must be >= 1, got {attempt}")
+    attempt = run_logging.assert_attempt_in_domain(attempt)
     suffix = "" if attempt == 1 else f"_iteration{attempt}"
     return f"{run_artifact_root(run_id)}FINAL_REVIEW{suffix}.md"
 

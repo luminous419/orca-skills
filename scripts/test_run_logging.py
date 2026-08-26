@@ -4187,5 +4187,189 @@ class RetainedReportWhitespaceExemptionTests(unittest.TestCase):
             self.assertIn(HARD_BREAK_REPORT, without_exemption.stdout)
 
 
+# The eight out-of-domain values every gate in DESIGN D-A.7 is tested against: three
+# out-of-RANGE ints and five wrong-TYPE objects. `False` and `True` are named cases --
+# M-14 measured `attempt=False` writing FINAL_REVIEW_iterationFalse.md and `attempt=True`
+# silently aliasing attempt 1, because `True == 1`.
+OUT_OF_RANGE_ATTEMPTS = (0, -1, -12)
+WRONG_TYPE_ATTEMPTS = (False, True, 2.0, "2", None)
+
+
+def expected_attempt_message(attempt: object, label: str = "attempt") -> str:
+    # `type(...) is int`, not membership: `False == 0`, so a membership test would
+    # classify the bool as out-of-RANGE and assert the wrong half of the contract.
+    if type(attempt) is int:
+        return f"{label} must be >= 1, got {attempt!r}"
+    return f"{label} must be an int >= 1, got {attempt!r}"
+
+
+class AttemptDomainLadderTests(unittest.TestCase):
+    """T-13.7 -- DESIGN D-A.7.4' GATE 5, plus the extraction's own regression."""
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.base = Path(self.temporary_directory.name)
+
+    def tearDown(self) -> None:
+        self.temporary_directory.cleanup()
+
+    def test_t137_the_ladder_path_refuses_every_out_of_domain_attempt(self) -> None:
+        # The type half is what shipped code lacked (M-24a): `2.0` produced a real
+        # artifacts/runs/<run>/FINAL_REVIEW_iteration2.0.md -- an unexempted,
+        # digest-bound, generatable path, which is exactly what D-A.6"'s pattern
+        # derivation assumes cannot exist.
+        for attempt in OUT_OF_RANGE_ATTEMPTS + WRONG_TYPE_ATTEMPTS:
+            with self.subTest(attempt=attempt):
+                with self.assertRaises(RunLoggingError) as caught:
+                    run_logging.final_review_report_ladder_path(
+                        "run_t", attempt, base=self.base
+                    )
+                self.assertEqual(
+                    str(caught.exception),
+                    expected_attempt_message(attempt, "final_review_attempt"),
+                )
+
+    def test_t137_valid_attempts_still_produce_the_shipped_ladder_names(self) -> None:
+        # 100 is kept legal by D-A.7.2 and left unexempted by D-A.6" (RK-19).
+        for attempt in (1, 2, 3, 9, 10, 42, 99, 100):
+            with self.subTest(attempt=attempt):
+                suffix = "" if attempt == 1 else f"_iteration{attempt}"
+                self.assertEqual(
+                    run_logging.final_review_report_ladder_path(
+                        "run_t", attempt, base=self.base
+                    ).name,
+                    f"FINAL_REVIEW{suffix}.md",
+                )
+
+    def test_t137_the_extraction_did_not_reword_the_dispatch_key_messages(self) -> None:
+        """The refactor's own regression, pinned VERBATIM against the shipped strings.
+
+        `final_review_dispatch_key()`'s two inline checks are the ones extracted into
+        `attempt_domain_violation()`. M-24d measured the extracted text byte-identical to
+        the shipped text; this is that measurement made executable, so the refactor
+        cannot silently reword a message another test or a human reads.
+        """
+        for attempt, message in (
+            (0, "final_review_attempt must be >= 1, got 0"),
+            (-1, "final_review_attempt must be >= 1, got -1"),
+            (False, "final_review_attempt must be an int >= 1, got False"),
+            (2.0, "final_review_attempt must be an int >= 1, got 2.0"),
+            ("2", "final_review_attempt must be an int >= 1, got '2'"),
+        ):
+            with self.subTest(attempt=attempt):
+                with self.assertRaises(RunLoggingError) as caught:
+                    run_logging.final_review_dispatch_key(attempt, "task_a", "ctx_b")
+                self.assertEqual(str(caught.exception), message)
+        self.assertEqual(
+            run_logging.final_review_dispatch_key(2, "task_a", "ctx_b"),
+            "attempt2__task_a__ctx_b",
+            "the positive path is untouched by the extraction",
+        )
+
+
+class AttemptDomainProvenanceTests(_AuditTestCase):
+    """T-13.8 -- DESIGN D-A.7.4' GATE 7 and CLI door 2.
+
+    Shipped `final-review-audit-provenance --attempt 0` exited 0 and printed a report
+    carrying `"final_review_attempt": 0` (M-26); its sibling `-write --attempt 0` already
+    exited 1 and wrote nothing. Gate 7 makes door 2 internally consistent.
+    """
+
+    def run_module_cli(self, argv: list[str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, str(REPO_ROOT / "scripts" / "run_logging.py"), *argv],
+            cwd=REPO_ROOT, capture_output=True, text=True, check=False,
+        )
+
+    def test_t138_the_reader_refuses_out_of_domain_attempts(self) -> None:
+        self.write_record(provenance_state="accepted", settlement_state="settled")
+        for attempt in OUT_OF_RANGE_ATTEMPTS + WRONG_TYPE_ATTEMPTS:
+            with self.subTest(attempt=attempt):
+                with self.assertRaises(RunLoggingError) as caught:
+                    run_logging.read_final_review_attempt_provenance(
+                        self.RUN_ID, attempt, base=self.base
+                    )
+                self.assertEqual(
+                    str(caught.exception),
+                    expected_attempt_message(attempt, "final_review_attempt"),
+                )
+
+    def test_t138_a_refused_attempt_scans_no_record_directory(self) -> None:
+        # A well-formed record IS present, so a successful call would have listed it.
+        # The gate is the first statement, so the scan never starts.
+        self.write_record(provenance_state="accepted", settlement_state="settled")
+        with patch.object(
+            run_logging, "iter_final_review_audit_records"
+        ) as iterator:
+            with self.assertRaises(RunLoggingError):
+                run_logging.read_final_review_attempt_provenance(
+                    self.RUN_ID, 0, base=self.base
+                )
+        iterator.assert_not_called()
+
+    def test_t138_door_two_refuses_and_prints_no_json(self) -> None:
+        self.write_record(provenance_state="accepted", settlement_state="settled")
+        completed = self.run_module_cli(
+            [
+                "final-review-audit-provenance",
+                "--run-id", self.RUN_ID,
+                "--base", str(self.base),
+                "--attempt", "0",
+            ]
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(completed.stdout.strip(), "")
+        self.assertIn("final_review_attempt must be >= 1, got 0", completed.stderr)
+
+    def test_t138_both_door_two_subcommands_now_refuse_alike(self) -> None:
+        # The sibling parity named in DESIGN Error Handling. RK-21 is why the refusal
+        # surfaces as a traceback rather than an `input error:` line: run_logging's
+        # main() has no `except RunLoggingError` mapping. That is shipped, pre-existing,
+        # and fail-closed -- exit non-zero, nothing written -- and gates 5 and 7 inherit
+        # the convention rather than inventing a second one inside the same CLI.
+        for argv in (
+            ["final-review-audit-provenance", "--run-id", self.RUN_ID,
+             "--base", str(self.base), "--attempt", "0"],
+            ["final-review-audit-write", "--run-id", self.RUN_ID,
+             "--base", str(self.base), "--attempt", "0", "--task-id", "task_cli",
+             "--no-capture"],
+        ):
+            with self.subTest(subcommand=argv[0]):
+                completed = self.run_module_cli(argv)
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertFalse(
+                    (self.root / "final_review_audit").exists(),
+                    "a refused attempt writes nothing at either subcommand",
+                )
+
+    def test_t138_valid_attempts_still_report_unchanged(self) -> None:
+        self.write_record(provenance_state="accepted", settlement_state="settled")
+        completed = self.run_module_cli(
+            [
+                "final-review-audit-provenance",
+                "--run-id", self.RUN_ID,
+                "--base", str(self.base),
+                "--attempt", "1",
+            ]
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        parsed = json.loads(completed.stdout)
+        self.assertEqual(
+            parsed["accepted_dispatch_key"], "attempt1__task_aaa__ctx_bbb"
+        )
+        # Attempt grouping comes from the record's own field, never the filename:
+        # attempt 2 finds nothing even though the record directory is right there.
+        second = self.run_module_cli(
+            [
+                "final-review-audit-provenance",
+                "--run-id", self.RUN_ID,
+                "--base", str(self.base),
+                "--attempt", "2",
+            ]
+        )
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(json.loads(second.stdout)["records"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -5090,5 +5090,43 @@ class DeterministicFinalReviewAuditTests(unittest.TestCase):
             self.assertEqual(result.final_status, "COMPLETED")
 
 
+class FinalReviewArtifactPathAttemptDomainTests(unittest.TestCase):
+    """T-13.9 -- DESIGN D-A.7.4' GATE 6.
+
+    `final_review_artifact_path()` is the third public producer of the
+    FINAL_REVIEW.md / FINAL_REVIEW_iteration<N>.md filename family. It shipped with the
+    `< 1` half of the check and not the type half, so `2.0` built
+    artifacts/runs/<run>/FINAL_REVIEW_iteration2.0.md (M-24b).
+    """
+
+    OUT_OF_DOMAIN = (0, -1, -12, False, True, 2.0, "2", None)
+
+    def test_t139_every_out_of_domain_attempt_is_refused(self) -> None:
+        for attempt in self.OUT_OF_DOMAIN:
+            with self.subTest(attempt=attempt):
+                # assertRaises(ValueError) ON PURPOSE, not assertRaises(RunLoggingError).
+                # The gate now raises `run_logging.RunLoggingError`, which is declared
+                # `class RunLoggingError(ValueError)`, so the shipped raise contract is
+                # preserved: every existing `except ValueError` around this function
+                # still catches it. This assertion is what pins that substitution
+                # (D-A.7.3') rather than leaving a reader to notice it.
+                with self.assertRaises(ValueError):
+                    e2e_module.final_review_artifact_path("run_t", attempt)
+
+    def test_t139_the_refusal_is_the_shared_predicates_message(self) -> None:
+        with self.assertRaises(run_logging.RunLoggingError) as caught:
+            e2e_module.final_review_artifact_path("run_t", 2.0)
+        self.assertEqual(str(caught.exception), "attempt must be an int >= 1, got 2.0")
+
+    def test_t139_valid_attempts_return_the_shipped_strings(self) -> None:
+        for attempt in (1, 2, 3, 99, 100):
+            with self.subTest(attempt=attempt):
+                suffix = "" if attempt == 1 else f"_iteration{attempt}"
+                self.assertEqual(
+                    e2e_module.final_review_artifact_path("run_t", attempt),
+                    f"artifacts/runs/run_t/FINAL_REVIEW{suffix}.md",
+                )
+
+
 if __name__ == "__main__":
     unittest.main()
