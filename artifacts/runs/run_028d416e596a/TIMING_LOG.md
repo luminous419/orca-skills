@@ -8,3 +8,5 @@
 | 2026-08-26T14:02:22.795573+00:00 | phase_end | DESIGN |  |  | 2026-08-26T13:36:54.043947+00:00 | 2026-08-26T14:02:22.795573+00:00 | 1528.752 | high |  |
 | 2026-08-26T14:06:47.422905+00:00 | phase_start | design |  |  | 2026-08-26T14:06:47.422905+00:00 |  |  | high |  |
 | 2026-08-26T14:06:47.422905+00:00 | iteration_start | design |  | 2 | 2026-08-26T14:06:47.422905+00:00 |  |  | high |  |
+| 2026-08-26T14:24:03.033626+00:00 | dispatch_settled | design | worker | 2 | 2026-08-26T14:06:47.422905+00:00 | 2026-08-26T14:24:02.981444+00:00 | 1035.559 | high | DESIGN iteration 2 (F-801 correction) worker_done succeeded |
+| 2026-08-26T14:24:19.673265+00:00 | dispatch_settled | design | worker | 2 | 2026-08-26T14:06:47.422905+00:00 | 2026-08-26T14:24:19.648451+00:00 | 1052.226 | high | DESIGN iteration 2 (F-801 correction) worker_done succeeded |
