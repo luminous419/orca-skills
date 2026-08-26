@@ -150,6 +150,24 @@ These were executed, not assumed. Darwin 25.5.0.
 | `orca terminal create` accepts an arbitrary startup command line | `orca terminal create --help` → `--command <text>` | usable to wrap the agent |
 | no stray copy of the key exists under `$HOME` today | `find "$HOME" -maxdepth 8 -name answer_key.json` | zero hits (the in-repo copy is under the working tree, and `dist/*.tar.gz` holds one as an archive member) |
 
+**Added in iteration 2 (F-001).** Every row below was executed on this host; the planted copies
+were removed afterwards and their absence re-checked.
+
+| fact | how verified | result |
+|---|---|---|
+| the run user's real temp dir is a **writable descendant of `/private/var`** | `os.path.realpath(tempfile.gettempdir())`, then `os.access(..., W_OK)` | `/private/var/folders/<hash>/T`, `W_OK=True`, while `/private/var` itself is `W_OK=False` |
+| the iteration-1 profile **does** leak an answer-key copy planted there | plant → `sandbox-exec -f <iteration-1 profile> python3 probe.py` | `open` returns the key's exact sha256, `listdir` lists it, `cat`/`grep`/`find` all succeed — **F-001 reproduced** |
+| `/System/Volumes/Data` is a **mount point, not a symlink**, and re-exposes the whole data volume inside `/System` | `os.path.islink` → `False`; `os.stat` of `/System/Volumes/Data<tmpdir>` vs `<tmpdir>` → same `(st_dev, st_ino)`; `os.path.realpath` does **not** collapse it | the repository and the key are reachable as `/System/Volumes/Data<repo>/…/answer_key.json` |
+| `st_dev` cannot discriminate the sealed system volume from the data volume | `os.stat("/usr").st_dev` vs `os.stat("/Library").st_dev` | identical (`16777230`) — APFS firmlinks share the fsid, so **`st_dev` is not a usable boundary test**; `statvfs().f_flag & ST_RDONLY` is (`/usr` True, `/usr/local` False) |
+| which Class SYS roots actually contain user-writable descendants | exhaustive walk, `W_OK` on every directory and regular file | **`/private/var`, `/Library`, `/usr/local`, `/System/Volumes/Data`, `/opt/homebrew`, `/Users` do; `/bin`, `/sbin`, `/private/etc`, `/usr`(−carve-outs), `/System`(−carve-outs), `/dev`, `/private/var/select`, `/Library/Developer/CommandLineTools` do not** |
+| `/usr/share/firmlinks` is an authoritative boundary list and agrees with the walk | `cat /usr/share/firmlinks`; compare to the `statvfs` flag-change set | exact agreement (19 entries; `/usr/local`, `/usr/libexec/cups`, `/usr/share/snmp`, the `/System/Library/*` set, and the root-level `/Users`, `/Library`, `/private`, `/opt`, `/Volumes`, `/Applications`) |
+| the full recursive proof is affordable | timed walks | `/System` 13.0 s (169,297 dirs / 286,743 files), `/Library/Developer/CommandLineTools` 5.1 s, `/usr` 0.7 s, rest < 0.1 s |
+| a global `(allow file-read-metadata)` is a **discovery channel**, even with a corrected readable set | corrected readable set + global metadata allow | `os.path.exists(plant)` → `True`, `os.stat(plant).st_size` → `9347` (the key's real size) |
+| the closed traversal set closes it without breaking exec | traversal set + carve-outs | `exists` → `False`, `stat`/`listdir`/`open`/`cat`/`ls` → `Operation not permitted`, `find`/`grep` → empty stdout; `/bin/echo`, `python3`, `git --version`, reading `review_root` all still work |
+| seatbelt **canonicalizes firmlink spellings** before matching | `open("/System/Volumes/Data" + <repo>/…/answer_key.json)` under the iteration-1 profile | `PermissionError` — the deny on the repo realpath already covered the alias |
+| a symlink inside `review_root` pointing at a denied file does not bypass the profile | `os.symlink(plant, review_root/lnk); open(lnk)` | `PermissionError` — seatbelt evaluates the resolved target |
+| removing `/Library` and `/private/var` breaks tooling unless `HOME`/`TMPDIR` are session-scoped | `git --version` under the corrected profile with the host `HOME` | `fatal: unable to access '/Users/<user>/.gitconfig': Operation not permitted`; with `HOME=<SESSION>/home` it exits 0, while `git -C <repo> show HEAD:VERSION` still fails |
+
 ### Existing conventions this design must not fork
 
 * Standard library only, CPython ≥ 3.11 (`scripts/final_review_eval.py` module docstring).
@@ -236,7 +254,7 @@ whose threat model is unstated is not a guarantee.
 |---|---|---|---|
 | **S1 — scope** | The Reviewer's cwd and every path reachable by relative traversal from it contain no key material and no path relationship to `key/` or `adjudications/`. | G.2 session layout + `materialize()`'s existing assertions | NEG-1 |
 | **S2 — unreadability** | No absolute path outside the computed readable set is readable *or stat-able* by the Reviewer process, including via `git`, and the key's own paths are in neither. | G.4 seatbelt profile | NEG-2, NEG-3, NEG-4 |
-| **S3 — cleanliness of the readable set** | Every path the Reviewer *can* read has been exhaustively scanned and contains zero key material. | G.3 readable-set computation + scan | NEG-5, NEG-6 |
+| **S3 — cleanliness of the readable set** | Every path the Reviewer *can* read is covered by one of exactly two proofs: it is exhaustively content-scanned and contains zero key material (Class USR), or it is exhaustively proven immutable so that no unprivileged process can put key material there (Class IMM). No admitted path is a proper ancestor of a mutable path covered by neither. | G.3 readable-set computation + G.3.1 proof + G.3.3 scan + `assert_no_unscanned_descendant()` | NEG-5, NEG-6, **NEG-7**, **NEG-8** |
 
 S1 alone is what the previous design had. S2 without S3 is defeated by a stray copy. S3 without S2
 is unbounded. The three are required together and `ISOLATION.json` records all three verdicts
@@ -266,11 +284,21 @@ Creates, via `tempfile.mkdtemp(prefix="frv_iso_")`, and prints a descriptor:
             REVIEW_DESIGN.md        <- orca-worker-reviewer-orchestration/reviews/design.md
             …one per --policy-file
         artifacts/runs/<run-id>/    <- created empty; the Reviewer's only write target
+    tmp/                        <- the sandboxed agent's TMPDIR (created empty)
+    home/                       <- the sandboxed agent's HOME   (created empty)
     control/
         scope.sb
         ISOLATION.json
         probes/
 ```
+
+`tmp/` and `home/` are an **iteration-2 addition (F-001)**. Once the host's `/private/var` and
+`/Library` are no longer admitted, the agent has no writable scratch and no config root, and
+`git`/`xcrun`-shimmed tools fail (measured: `fatal: unable to access '/Users/<user>/.gitconfig':
+Operation not permitted`). Pointing `TMPDIR`/`HOME` at session-private directories restores that
+without re-admitting anything host-wide, and has the side benefit of closing the *write* half of
+open issue **O-2**: an isolated agent can no longer deposit anything into, or pick anything up
+from, a state directory shared with non-isolated sessions.
 
 Rules, all enforced by the command before it exits 0:
 
@@ -308,25 +336,115 @@ fixture layout on disk does not change at all.
 before anything else — `/tmp` → `/private/tmp` on darwin; an unresolved spelling in a seatbelt
 profile does not match).
 
-**Class SYS** — the closed default list, all read-only to the run user:
+> **Superseded in iteration 2 (F-001).** The rule below replaces the iteration-1 rule
+> *"each Class SYS root is admitted only if `os.access(root, os.W_OK)` is False"*. That rule was
+> wrong: root non-writability does not imply descendant non-writability, and on this host the
+> unchanged iteration-1 profile let a sandboxed process read an answer-key-identical file planted
+> in the current user's real `tempfile.gettempdir()`. The reproduction and the fix's verification
+> are recorded in `## DESIGN iteration 2 — correction for F-001`.
 
-```text
-/          (literal only, not subpath — dyld requires it; see the host-facts table)
-/usr  /bin  /sbin  /System  /Library  /private/etc  /private/var  /dev
-```
+Every admitted path belongs to exactly one of **two** classes, and **there is no third way in**.
+A path that cannot be placed in one of the two is not admitted at all.
 
-Each Class SYS root is admitted only if `os.access(root, os.W_OK)` is **False**. A root that is
-user-writable is *moved to Class USR* and scanned. (`/opt/homebrew` is user-writable on a typical
-darwin install and is therefore Class USR by this rule, not by a special case.)
+| class | what it means | admission requires | content-scanned? |
+|---|---|---|---|
+| **IMM** | no unprivileged process can cause new readable content to appear anywhere in the subtree | the **recursive immutability proof** below, run over the whole subtree at session-build time | no — the proof makes planting impossible, so scanning would be scanning a set that cannot change |
+| **USR** | mutable, but proven to contain no key material right now | the **exhaustive content scan** (passes A–D) over the whole subtree | yes |
 
-**Class USR** — everything else that must be readable for the agent to function:
+**The invariant this restores (call it the *no-unscanned-descendant* invariant):**
+
+> For every path `p` admitted by the profile, every path reachable under `p` is covered by either
+> the IMM proof or the USR scan. Equivalently: **no admitted path may be a proper ancestor of a
+> mutable path that is not itself proven or scanned.** `assert_no_unscanned_descendant()` checks
+> this over the assembled readable set and is a hard failure (exit 4).
+
+This is the specific clause the iteration-1 design violated. `(subpath "/private/var")` was an
+admitted proper ancestor of `tempfile.gettempdir()`, which is mutable and was never scanned.
+
+##### G.3.1 The recursive immutability proof — `prove_immutable(root, carve_outs)`
+
+Run over the *entire* subtree, not its root. It returns PASS only if **all six** hold:
+
+| # | check | why it is load-bearing |
+|---|---|---|
+| **I-1** | `os.walk(root, followlinks=False)` completes without an unreadable directory | a subtree that cannot be enumerated cannot be certified |
+| **I-2** | **no directory** in the subtree satisfies `os.access(d, os.W_OK)` | a writable directory admits `create`/`rename`/`unlink` — i.e. planting a new file — anywhere beneath it |
+| **I-3** | **no regular file** in the subtree satisfies `os.access(f, os.W_OK)` | a writable regular file admits overwriting existing content with key material |
+| **I-4** | every filesystem boundary strictly inside the subtree is enumerated and each is either itself IMM-proven or listed in `carve_outs` | a boundary crossing re-enters a different volume, where I-2/I-3 were never evaluated |
+| **I-5** | `os.statvfs(p).f_flag & ST_RDONLY` is identical for every directory `p` in the subtree (excluding carve-outs) | this is how I-4's boundaries are *found* — a firmlink or mount point shows up as a flag change |
+| **I-6** | every non-regular, non-directory node that is writable is a character or block device (`/dev`), never a regular file | device nodes hold no persistable file content; this is the one narrow exception, and it is named rather than assumed |
+
+Escaping symlinks are **recorded but are not hits**: seatbelt evaluates the *resolved* target
+against the profile, so a symlink out of an IMM root reaches the target's own class or is denied.
+Verified on this host (see the iteration-2 evidence table, row *symlink indirection*).
+
+`carve_outs` is not a discretionary `--ignore`. It is the enumerated boundary set from I-4/I-5, and
+**every carve-out is emitted as an explicit `(deny file-read* file-read-metadata (subpath …))`
+clause in the profile** (G.4 clause 4). A boundary that is carved out of the proof but not denied
+in the profile is exactly the F-001 defect in a new place, so the two lists are generated from one
+variable and `assert_carve_outs_denied()` compares them before the profile is written.
+
+Boundaries are *found* by I-5 and *cross-checked* against two cheap authorities, both read at
+session-build time and both recorded in `ISOLATION.json`:
+
+* the mount table (`/sbin/mount`, parsed for mount point + `read-only`), and
+* `/usr/share/firmlinks` on darwin — the OS's own system-volume→data-volume firmlink table.
+
+If I-5's walk finds a boundary that neither authority names, that is a hard failure, not a warning.
+
+##### G.3.2 The Class IMM default list, as proven on this host
+
+The iteration-1 list is **not** the list. `/private/var` and `/Library` are removed wholesale;
+`/usr` and `/System` are admitted only with their carve-outs; `/private/var/select` is added
+because the pre-flight probe proved it necessary and the proof passed on it.
+
+| root | I-2/I-3 result | carve-outs required | verdict |
+|---|---|---|---|
+| `/` | — | admitted as `(literal "/")` only, never `(subpath "/")` | IMM (literal) |
+| `/bin` | 1 dir, 37 files, 0 writable | none | **IMM** |
+| `/sbin` | 1 dir, 74 files, 0 writable | none | **IMM** |
+| `/private/etc` | 31 dirs, 230 files, 0 writable | none | **IMM** (note: on a *writable* volume — see below) |
+| `/usr` | 1,173 dirs, 21,796 files, 0 writable | `/usr/local`, `/usr/libexec/cups`, `/usr/share/snmp` | **IMM with carve-outs** |
+| `/System` | 169,297 dirs, 286,743 files, 0 writable | `/System/Volumes` **(critical)**, `/System/Library/Caches`, `/System/Library/Assets`, `/System/Library/AssetsV2`, `/System/Library/PreinstalledAssets`, `/System/Library/PreinstalledAssetsV2`, `/System/Library/Speech`, `/System/Library/CoreServices/CoreTypes.bundle/Contents/Library` | **IMM with carve-outs** |
+| `/dev` | 3 dirs (`/dev`, `/dev/fd`, `/dev/monotonic`), none writable; 407 char + 37 block nodes; the only writable regular files are `/dev/fd/1`, `/dev/fd/2` — the probing process's own stdout/stderr | none | **IMM by I-6** |
+| `/private/var/select` | 1 dir, 0 writable files | none | **IMM** (added: the `xcrun` shim `readlink`s `/var/select/developer_dir`) |
+| `/Library/Developer/CommandLineTools` | 27,983 dirs, 109,959 files, 0 writable | none | **IMM** (needed: `git` and the `/usr/bin/python3` shim resolve here) |
+| **`/private/var`** | contains `/private/var/tmp`, `/private/var/run/…`, `/private/var/protected/sfanalytics`, and **`tempfile.gettempdir()`**, all user-writable | — | **REMOVED — this is F-001** |
+| **`/Library`** | `/Library/Caches`, `/Library/Fonts`, `/Library/Receipts`, `/Library/Logs/DiagnosticReports`, `/Library/Frameworks/Python.framework/Versions/3.11` all user-writable | — | **REMOVED wholesale**; only the proven `CommandLineTools` subtree is admitted |
+
+Two results in that table are the reason the proof is written as *"exhaustive walk"* and not
+*"read-only mount"*:
+
+* **`/private/etc` sits on a read-write volume** (`statvfs().f_flag & ST_RDONLY` is false, because
+  `/private` is firmlinked to the data volume) **yet passes I-2/I-3 exhaustively.** A mount-flag
+  test alone would wrongly reject it.
+* **`/System` is a sealed read-only mount, and that is still not sufficient**, because
+  `/System/Volumes/Data` is a *mount point of the writable data volume nested inside it*. It is
+  **not a symlink**, so `os.path.realpath()` does not collapse it: `os.path.realpath(
+  "/System/Volumes/Data" + tmpdir)` returns the aliased spelling unchanged, and
+  `os.stat()` confirms the same `(st_dev, st_ino)`. The whole of `/Users`, `/private/var` and the
+  repository is reachable by that spelling. The mount flag is therefore **corroborating evidence
+  recorded in the attestation, never the proof**.
+
+Measured cost of the full proof on this host: `/System` 13.0 s, `/Library/Developer/CommandLineTools`
+5.1 s, `/usr` 0.7 s, everything else < 0.1 s — under 20 s in total, once per session. There is no
+performance argument for the root-only shortcut that produced F-001.
+
+##### G.3.3 Class USR
+
+Everything else that must be readable, admitted **only** as an exact path and always scanned:
 
 * `<SESSION>/review_root` (always);
-* the agent's own state/config roots, supplied by `--allow-read` and defaulted to the values the
-  pre-flight probe of G.5 discovers to be necessary — the design does **not** hard-code a
-  particular agent's dotfile layout, because routing can select a different agent per phase
-  (`agent_profile.py`);
-* `$TMPDIR` is **not** added wholesale. Only `<SESSION>/review_root`.
+* `<SESSION>/tmp` and `<SESSION>/home` — the session-scoped `TMPDIR` and `HOME` (G.2, G.5). These
+  exist *because* the host's per-user temp and home are no longer admitted: the agent still needs a
+  writable scratch and config root, and giving it a session-private one is what makes removing
+  `/private/var` and `/Library` survivable. They are created empty by `isolate`, so their scan is
+  trivially clean, and they are destroyed with the session;
+* any further root the pre-flight probe proves necessary, supplied by an explicit `--allow-read`.
+
+**Not admitted, and named here so a future edit cannot re-add them by habit:** the host
+`tempfile.gettempdir()` (or any ancestor of it), `$HOME`, `~/Library/Caches`, `/private/var`,
+`/private/tmp`, `/Library`, `/opt/homebrew`, `/Users`, `/Applications`, `/System/Volumes/Data`.
 
 **Every Class USR root is scanned exhaustively** by `scan_readable_set()`:
 
@@ -343,10 +461,17 @@ that root and re-run the pre-flight probe. Pass D reads only the archive's index
 unreadable or malformed it counts as a hit, because an archive whose contents cannot be enumerated
 cannot be certified clean.
 
-Class SYS roots are **not** content-scanned (they are gigabytes and not user-writable). Instead
-`ISOLATION.json` records, for each, the `W_OK=False` evidence and the assertion that it is neither
-an ancestor nor a descendant of any key-bearing path found by G.3. That asymmetry is a stated
-limitation, recorded in the attestation and in D-I, not a silent one.
+Class IMM roots are **not** content-scanned, and the justification is now the proof rather than an
+assertion about the root directory: G.3.1's I-1…I-6 establish that no unprivileged process can
+create or overwrite readable content anywhere in the subtree, so there is nothing a scan could
+find that the proof allows to exist. `ISOLATION.json` records, per root, the full proof counters
+(directories walked, files walked, writable directories, writable regular files, boundaries found,
+carve-outs applied) — not a single `W_OK` boolean. A root whose proof fails is **not** admitted as
+IMM: it is either narrowed by a carve-out and re-proven, demoted to Class USR and content-scanned,
+or dropped. The residual limitation is now precisely one sentence: *the proof is evaluated at
+session-build time against the run user's own privileges, so it does not bind a privileged
+(root) writer* — and that writer is outside the G.1 threat model. That sentence, and nothing
+broader, is what `ISOLATION.json.limitations[]` and D-I carry.
 
 Bounding: pass A/B/C walks skip nothing and follow no symlinks (`os.walk(..., followlinks=False)`),
 and every symlink encountered whose realpath escapes the root is itself a hit — an escaping symlink
@@ -354,51 +479,103 @@ inside an allowed root is an allowed read path that the walk did not cover.
 
 #### G.4 The scope profile — exact generated text, and the ordering rule
 
-Backend `seatbelt` (darwin). `render_seatbelt_profile(readable, writable, denied)` emits exactly
-this, in exactly this order; **seatbelt is last-match-wins, so the order is the semantics**:
+Backend `seatbelt` (darwin). `render_seatbelt_profile(imm, usr, carve_outs, writable, denied)`
+emits exactly this, in exactly this order; **seatbelt is last-match-wins, so the order is the
+semantics**:
+
+> **Superseded in iteration 2 (F-001).** Two structural changes against the iteration-1 skeleton:
+> (a) clause 2's *global* `(allow file-read-metadata)` is replaced by a **closed traversal set**,
+> so the profile's metadata surface can never exceed its data surface; (b) clause 4 is new — every
+> carve-out from G.3.1's proof is denied explicitly. Without (a), the corrected readable set still
+> let a sandboxed process `os.stat()` the planted key copy and learn its exact size (measured:
+> `exists() == True`, `st_size == 9347`); with (a), `exists()` returns `False` and `stat` raises
+> `PermissionError`. Both measurements are in the iteration-2 evidence table.
 
 ```scheme
 (version 1)
 ;; Generated by scripts/review_isolation.py -- do not edit. Session: <SESSION>
 (allow default)
 
-;; 1. Deny every file read, then name the readable set. Allowlist, not denylist:
-;;    a profile that denied only the repository is defeated by any copy of the key
-;;    outside it.
+;; 1. Deny every file read -- data AND metadata. Allowlist, not denylist: a profile
+;;    that denied only the repository is defeated by any copy of the key outside it.
 (deny file-read*)
-;; 2. Metadata must be globally allowed or the process cannot even fstat its own
-;;    stdout (verified: "cat: stdout: Operation not permitted"). Narrowed again in 5.
-(allow file-read-metadata)
-;; 3. The readable set. "(literal \"/\")" is required or dyld aborts at exec.
+
+;; 2. Traversal set: metadata ONLY, on the exact path components needed to resolve
+;;    the readable set, plus the root-level symlinks that spell them (/var, /etc,
+;;    /tmp) and /dev. Computed as
+;;      {ancestors(r) for r in readable} u {root symlinks resolving into readable}
+;;    -- NOT a global allow. A global (allow file-read-metadata) makes every path on
+;;    the machine stat-able and existence-checkable; that is a discovery channel, and
+;;    NEG-7 fails on it.
+(allow file-read-metadata
+    (literal "/") (literal "/usr") (literal "/private") (literal "/private/var")
+    (literal "/var") (literal "/etc") (literal "/tmp")
+    (literal "/System") (literal "/System/Library")
+    (literal "/Library") (literal "/Library/Developer")
+    (subpath "/dev"))
+
+;; 3. The readable set: one (subpath "<realpath>") per Class IMM root (G.3.2) and per
+;;    Class USR root (G.3.3). file-read* is data + metadata, so nothing here can be
+;;    readable-but-not-stat-able or the reverse. "(literal \"/\")" is required or dyld
+;;    aborts at exec.
 (allow file-read*
     (literal "/")
-    (subpath "/usr")
-    …one (subpath "<realpath>") per Class SYS and Class USR root…
-    (subpath "<SESSION>/review_root"))
-;; 4. Writes: deny everything, then name the writable set.
+    (subpath "/usr") (subpath "/bin") (subpath "/sbin") (subpath "/System")
+    (subpath "/private/etc") (subpath "/private/var/select") (subpath "/dev")
+    (subpath "/Library/Developer/CommandLineTools")
+    (subpath "<SESSION>/review_root")
+    (subpath "<SESSION>/tmp")
+    (subpath "<SESSION>/home")
+    …one per additional --allow-read root, each USR-scanned…)
+
+;; 4. Carve-outs: every boundary G.3.1's proof excluded, denied for data AND metadata.
+;;    Generated from the same variable as the proof's carve_out list;
+;;    assert_carve_outs_denied() refuses to write the profile if the two differ.
+;;    "/System/Volumes" is the load-bearing one: /System/Volumes/Data is a mount point
+;;    of the writable data volume nested inside the sealed system volume, and it is not
+;;    a symlink, so realpath() does not collapse it.
+(deny file-read* file-read-metadata
+    (subpath "/usr/local") (subpath "/usr/libexec/cups") (subpath "/usr/share/snmp")
+    (subpath "/System/Volumes")
+    (subpath "/System/Library/Caches") (subpath "/System/Library/Assets")
+    (subpath "/System/Library/AssetsV2") (subpath "/System/Library/PreinstalledAssets")
+    (subpath "/System/Library/PreinstalledAssetsV2") (subpath "/System/Library/Speech")
+    (subpath "/System/Library/CoreServices/CoreTypes.bundle/Contents/Library"))
+
+;; 5. Writes: deny everything, then name the writable set. The session-scoped tmp/home
+;;    are what let clause 3 drop the host's /private/var and /Library entirely.
 (deny file-write*)
 (allow file-write*
     (subpath "<SESSION>/review_root")
-    (subpath "/dev")
-    …one per --allow-write root the pre-flight probe proved necessary…)
-;; 5. The key-bearing roots, denied for BOTH data and metadata, after the global
-;;    metadata allow so that existence itself is hidden. Redundant with (1) for
-;;    reads; kept because a future edit that widens (3) must not silently widen
-;;    these, and because it makes the profile self-documenting about what it is
-;;    protecting.
+    (subpath "<SESSION>/tmp")
+    (subpath "<SESSION>/home")
+    (subpath "/dev"))
+
+;; 6. The key-bearing roots, denied for BOTH data and metadata, after everything else
+;;    so that existence itself is hidden. Redundant with (1) for reads; kept because a
+;;    future edit that widens (3) must not silently widen these, and because it makes
+;;    the profile self-documenting about what it is protecting.
 (deny file-read-metadata
     (subpath "<repo realpath>")
     …one per key-bearing root discovered in G.3…)
-(deny file-read* file-write*
+(deny file-read* file-read-metadata file-write*
     (subpath "<repo realpath>")
     …one per key-bearing root discovered in G.3…)
 ```
 
-Verified live: with clause 5 present, `os.path.exists(<key path>)` inside the sandbox returns
+**Aliases need no separate enumeration, and this was measured rather than assumed.** seatbelt
+canonicalizes a firmlinked spelling to the same vnode before matching, so the clause-6 deny on the
+repository realpath also denied `/System/Volumes/Data/<repo>/…/answer_key.json`, and clause 4's
+`/System/Volumes` deny covered the aliased spelling of the planted temp copy. The design therefore
+does **not** generate per-alias deny clauses — but G.9's **NEG-8** probes the aliases anyway,
+because "the sandbox canonicalizes" is a property of this OS release, not of this design.
+
+Verified live: with clause 6 present, `os.path.exists(<key path>)` inside the sandbox returns
 `False`, `os.stat` and `os.listdir` return `Operation not permitted`, `open()` returns
-`Operation not permitted`, and `git -C <repo> show HEAD:<path>` fails. Without clause 5's
+`Operation not permitted`, and `git -C <repo> show HEAD:<path>` fails. Without clause 6's
 `file-read-metadata` line, `os.stat` succeeded — so that line is load-bearing and must not be
-dropped as "redundant".
+dropped as "redundant". The same is true of clause 2 being a closed set rather than a global
+allow, for the same reason applied to every *other* path on the machine.
 
 Backend `none`: no profile is generated, the launch line is the unchanged one, and
 `ISOLATION.json` records `scope_enforcement: "unenforced"`. **This is the only supported way to
@@ -419,11 +596,24 @@ metadata that outlives the ephemeral directory).
 ```bash
 orca terminal create --worktree current \
   --title "final-review-isolated-<attempt>" \
-  --command "cd <SESSION>/review_root && exec /usr/bin/sandbox-exec -f <SESSION>/control/scope.sb <resolved agent command>"
+  --command "cd <SESSION>/review_root && TMPDIR=<SESSION>/tmp HOME=<SESSION>/home exec /usr/bin/sandbox-exec -f <SESSION>/control/scope.sb <resolved agent command>"
 ```
 
 Why this is correct rather than a trick:
 
+* **`TMPDIR` and `HOME` are set to the session-scoped directories** (iteration 2, F-001). They are
+  part of the launch line rather than of `agent_command`, for the same reuse-gate reason the
+  sandbox wrapper is. Two host facts make this mandatory rather than cosmetic: with the corrected
+  profile and the host `HOME`, `git` fails on `~/.gitconfig`; with the session `HOME`, `git
+  --version` exits 0 and `git -C <repo> show HEAD:VERSION` still fails, which is exactly the
+  intended pair of outcomes. One residual is recorded honestly: the `/usr/bin/xcrun` shim resolves
+  its cache directory through `confstr(_CS_DARWIN_USER_TEMP_DIR)`, which ignores `TMPDIR`, so it
+  emits a non-fatal `couldn't create cache file` line on stderr. It is a diagnostic, not a failure
+  — measured: the shimmed `/usr/bin/python3` and the resolved
+  `/Library/Developer/CommandLineTools/usr/bin/git` both run correctly through it. The pre-flight
+  probe must classify that specific line as benign, and **must not** be "fixed" by granting write
+  access to the host per-user temp directory (tried; it does not even help — the shim still fails —
+  and it would re-admit a host-wide mutable path).
 * The shell that runs the `--command` text starts in the main checkout and is **not** sandboxed;
   the `cd` therefore succeeds, and `exec` replaces that shell with the sandboxed agent. The agent
   process — the only process that ever sees the review — has cwd `review_root` and the profile
@@ -475,11 +665,18 @@ and **copied into the run artifact root at repatriation time** (G.8) as
   "review_root": "<REDACTED:foreign_absolute_path>",
   "profile_digest": "sha256:…",
   "readable_set": [
-    {"class": "SYS", "path": "/usr", "user_writable": false, "scanned": false},
+    {"class": "IMM", "path": "/usr", "scanned": false,
+     "proof": {"dirs": 1173, "files": 21796, "writable_dirs": 0, "writable_files": 0,
+               "boundaries_found": 3, "carve_outs": ["/usr/local", "/usr/libexec/cups",
+                                                     "/usr/share/snmp"],
+               "mount_readonly": true, "escaping_symlinks": 41}},
     {"class": "USR", "path": "<REDACTED:foreign_absolute_path>",
-     "user_writable": true, "scanned": true,
+     "scanned": true,
      "scan": {"files": 412, "archives": 0, "hits": 0}}
   ],
+  "carve_outs_denied": ["/usr/local", "/System/Volumes", "…"],
+  "no_unscanned_descendant": "PASS",
+  "traversal_set": ["/", "/usr", "/private", "…"],
   "writable_set": ["<REDACTED:foreign_absolute_path>"],
   "denied_roots": ["<REDACTED:foreign_absolute_path>"],
   "key_bearing_roots_discovered": 2,
@@ -489,7 +686,9 @@ and **copied into the run artifact root at repatriation time** (G.8) as
     {"id": "NEG-1", "kind": "review_root_walk",  "result": "PASS", "hits": 0}
   ],
   "threat_model": "unconstrained well-behaved reviewer agent; not a sandbox-escaping adversary",
-  "limitations": ["Class SYS roots are asserted non-writable, not content-scanned"]
+  "limitations": [
+    "Class IMM roots are proven immutable recursively at session-build time against the run user's own privileges, not content-scanned; the proof does not bind a privileged (root) writer, who is outside the stated threat model"
+  ]
 }
 ```
 
@@ -504,8 +703,13 @@ Rules:
   `generated_at` and the attestation digest. Same rule, same reason, same code shape.
 * `properties.S1/S2/S3` are three separate verdicts. There is no aggregate "isolated: true" field —
   a single boolean invites reading a partial result as a whole one.
-* `readable_set[].scanned: false` is only ever legal for `class: "SYS"`, enforced when the document
-  is written.
+* `readable_set[].scanned: false` is only ever legal for `class: "IMM"` **and** only when that
+  entry carries a complete `proof` object whose `writable_dirs` and `writable_files` are both `0`.
+  Enforced when the document is written. `class: "SYS"` is not a legal value any more — the
+  iteration-1 name is retired deliberately, so a half-migrated writer fails loudly instead of
+  producing a document that looks valid.
+* `no_unscanned_descendant` records the G.3 invariant check by name. It is the field a reader
+  should look at first, because it is the one F-001 would have set to `FAIL`.
 
 #### G.7 Fail-closed rules and exit codes
 
@@ -584,15 +788,39 @@ tested in CI and re-proved at every capture.
 | **NEG-2** | Inside the sandbox: `open(<key abs path>)`, `open(<adjudications file>)`. | both raise `PermissionError` |
 | **NEG-3** | Inside the sandbox: `os.path.exists(<key abs path>)`, `os.stat`, `os.listdir(<key dir>)`, `os.listdir(<repo root>)`. | `exists` is `False`; the other three raise `PermissionError` — *discovery*, not just reading, is blocked |
 | **NEG-4** | Inside the sandbox: `git -C <repo> show HEAD:scripts/fixtures/final_review_eval/key/answer_key.json`; `git -C <repo> grep seeded_defects`; `tar -tzf <repo>/dist/*.tar.gz`. | all exit non-zero and none prints key content |
-| **NEG-5** | The G.3 readable-set scan over every Class USR root, re-run from inside the sandbox using only paths the profile permits. | zero hits in passes A–D |
+| **NEG-5** | The G.3 readable-set scan over **every admitted root, IMM and USR alike**, re-run from inside the sandbox using only paths the profile permits. (Iteration 1 re-scanned Class USR only, which is why it could not have caught F-001.) | zero hits in passes A–D |
 | **NEG-6** | Profile integrity: `sha256(scope.sb)` equals `ISOLATION.json.profile_digest`, and the profile parses (`sandbox-exec -f scope.sb /usr/bin/true` exits 0). | both hold |
+| **NEG-7** | **The writable-descendant probe (iteration 2, F-001).** Plants, in the current user's *resolved* mutable roots, (a) a byte-identical copy of the answer key and (b) a second file carrying the fixture's real seeded-defect identity strings. Then runs `open`, `os.path.exists`, `os.stat`, `os.listdir` on the plant and on its parent, `os.listdir` on the temp root itself, `/bin/cat`, `/bin/ls`, `/usr/bin/find -name answer_key.json`, `/usr/bin/grep -rl <key content marker>`, a read through a **symlink placed inside `review_root` pointing at the plant**, and a read through the plant's `/System/Volumes/Data` alias. | **every one is denied**: `open`/`stat`/`listdir`/`cat`/`ls` raise `PermissionError` or exit non-zero, `os.path.exists` returns `False`, and `find`/`grep` produce **no stdout** |
+| **NEG-8** | **Alias probe.** For every denied root and every carve-out, the same read/stat/list battery through each alias spelling derived from the mount table and `/usr/share/firmlinks` — in particular `/System/Volumes/Data<path>`. | all denied, exactly as the canonical spelling is |
+
+**The NEG-7 plant sites are resolved, never assumed.** The probe writes to
+`os.path.realpath(tempfile.gettempdir())` and to `os.path.realpath(os.path.expanduser(
+"~/Library/Caches"))` — the actual values on the running host, because the whole point of F-001 is
+that an *assumed* path (`/tmp`, `$TMPDIR` as spelled in the environment) is not the path the
+allowlist actually admitted. `/private/var/folders/<hash>/T` is a per-user, per-boot path; a test
+that hard-codes any part of it tests nothing. Both plants are removed in a `finally:` block, and
+`isolate` refuses to start if a previous run's plant directory still exists — leaving a real
+answer-key copy on disk would be a worse outcome than the bug.
+
+**NEG-7's positive control is NEG-0's, extended.** Before asserting any denial, the *same probe
+script* runs unsandboxed and must report every one of those reads as succeeding, with the plant's
+sha256 equal to the answer key's. A denial result is only meaningful paired with a demonstration
+that the identical operation succeeds without the sandbox.
+
+**The discovery oracle is stated explicitly, because the obvious one is wrong.** A discovery is
+*successful, non-empty stdout* — never "the probed path appears somewhere in the output". Measured:
+under the corrected profile `find <plant dir> -name answer_key.json` exits 1 and prints
+`find: <plant dir>: Operation not permitted` **on stderr**, which contains the plant path verbatim.
+A substring oracle reads that as a leak. The oracle is therefore `rc == 0 and stdout.strip()` for
+the command probes, and for content probes it matches a marker that exists only inside the key's
+bytes (`final_review_eval/v1`), never a path fragment.
 
 NEG-2 … NEG-5 run the probe as a *separate process launched by exactly the same
 `wrap_command()` used for the real dispatch* — not by re-implementing the launch line in the test.
 A negative test that builds its own launch line proves something about the test, not about the
 dispatch.
 
-Under `--enforcement none`, NEG-2 … NEG-6 are **not** recorded as `SKIP`; they are recorded as
+Under `--enforcement none`, NEG-2 … NEG-8 are **not** recorded as `SKIP`; they are recorded as
 `"result": "NOT_APPLICABLE_UNENFORCED"` and `properties.S2` is `"FAIL"`. A skip reads like an
 absence of evidence; this reads like what it is.
 
@@ -854,6 +1082,13 @@ a commit boundary and may not be merged with its neighbours.
 No import from `run_logging` beyond `redact_text` / `_relative_artifact_path` /
 `assert_retained_path_field` (allowed direction).
 
+Iteration 2 (F-001) adds to this module: `prove_immutable(root, carve_outs)` (G.3.1 I-1…I-6),
+`enumerate_boundaries()` (mount table + `/usr/share/firmlinks` + the `statvfs` flag-change walk),
+`assert_carve_outs_denied()`, `assert_no_unscanned_descendant()`, `compute_traversal_set()` (G.4
+clause 2), and the session-scoped `tmp/`+`home/` creation and `TMPDIR`/`HOME` launch-line
+environment. `render_seatbelt_profile()` changes signature to take the carve-out and traversal
+sets. The `SYS` class name is replaced by `IMM` throughout, including in `ISOLATION.json`.
+
 ### Step 4 — `scripts/final_review_eval.py` subcommands (**HARD**, same commit as Step 3)
 
 `isolate` with `--run-id / --fixture / --session-base / --policy-file / --allow-read /
@@ -938,9 +1173,11 @@ not only on the log object — a leak that moved to another key is still a leak.
 | T-8.2 | a session whose base resolves inside the repository or the fixture → exit 2, nothing left on disk |
 | T-8.3 | a symlink in the policy copy list → exit 4 |
 | T-8.4 | `scan_readable_set()` pass A/B/C/D each catch a planted copy: a renamed `key.json`, a file containing a key shingle, a byte-identical copy under another name, and a `.tar.gz` whose member list names `key/answer_key.json` |
-| T-8.5 | a Class SYS root that is user-writable is reclassified to USR and scanned |
-| T-8.6 | `render_seatbelt_profile()` emits the five clauses in G.4's order; a generated profile parses (`sandbox-exec -f … /usr/bin/true` exits 0) |
-| T-8.7 | `ISOLATION.json` validates: no clock value; every path field is P1/P2/P3/P4 under `assert_retained_path_field`; `scanned: false` only for `class: "SYS"`; `properties` has three independent verdicts |
+| T-8.5 | `prove_immutable()` **rejects** a root containing a writable descendant at any depth (not merely a writable root), and such a root is then either carved out and re-proven, demoted to USR and scanned, or dropped — never admitted unproven. Includes the F-001 shape directly: a root whose own `W_OK` is false but which contains a writable descendant |
+| T-8.5b | `enumerate_boundaries()` finds every `statvfs` flag-change inside a candidate root and cross-checks it against the mount table and `/usr/share/firmlinks`; a boundary named by neither is a hard failure |
+| T-8.5c | `assert_carve_outs_denied()` refuses to write a profile whose deny clauses do not exactly cover the proof's carve-out list; `assert_no_unscanned_descendant()` refuses an admitted proper ancestor of an unproven mutable path |
+| T-8.6 | `render_seatbelt_profile()` emits the six clauses in G.4's order; the metadata surface is a closed traversal set rather than a global allow (a generated profile containing `(allow file-read-metadata)` with no operand list is a test failure); a generated profile parses (`sandbox-exec -f … /usr/bin/true` exits 0) |
+| T-8.7 | `ISOLATION.json` validates: no clock value; every path field is P1/P2/P3/P4 under `assert_retained_path_field`; `scanned: false` only for `class: "IMM"` **and** only with a complete `proof` object whose `writable_dirs` and `writable_files` are `0`; `class: "SYS"` is rejected outright; `no_unscanned_descendant` is present; `properties` has three independent verdicts |
 | T-8.8 | `--enforcement none` records `scope_enforcement: "unenforced"`, `S2: "FAIL"`, probes `NOT_APPLICABLE_UNENFORCED`, and exits 0 with a stderr warning |
 | T-8.9 | `--enforcement seatbelt` on a host with no `sandbox-exec` → exit 4 |
 | T-8.10 | `--repatriate` refuses a byte-differing copy and refuses an existing differing destination |
@@ -952,6 +1189,21 @@ NEG-0 … NEG-6 exactly as specified, against a temporary fixture that plants a 
 as a whole with an explicit reason on a non-darwin host (`sys.platform != "darwin"`), and **T-8.9
 is the test that then carries the fail-closed guarantee**, so the guarantee is never merely
 unasserted. NEG-0 runs first inside each of NEG-2 … NEG-4's test method, not as a separate test.
+
+**T-9.7 … T-9.9 (iteration 2, F-001), all in one test method so the control cannot be skipped:**
+
+* **T-9.7** — NEG-7 end to end against a *synthetic* key fixture: resolve
+  `tempfile.gettempdir()` and `~/Library/Caches`, plant the byte-identical key copy plus the
+  seeded-defect identity file, assert the unsandboxed control reads both, then assert the exact
+  `wrap_command()` launch line cannot `open`/`stat`/`exists`/`listdir`/`cat`/`ls`/`find`/`grep` them,
+  nor reach them through a `review_root` symlink or the `/System/Volumes/Data` alias. `finally:`
+  removes both plants and the test asserts their absence.
+* **T-9.8** — NEG-8 alias battery over every denied root and carve-out.
+* **T-9.9** — **the regression guard for F-001 itself**: build a profile from the *iteration-1*
+  rule (`os.access(root, W_OK)` at the root only, `/private/var` admitted wholesale, global
+  metadata allow) and assert that `prove_immutable()` **rejects** it and that
+  `assert_no_unscanned_descendant()` raises. This is the test that fails if someone reintroduces
+  the shortcut, and it does not depend on a plant surviving on disk.
 
 ### T-10 CLI wiring — `scripts/test_final_review_eval.py`
 
@@ -994,7 +1246,7 @@ B-7  python3 scripts/run_logging.py final-review-audit-export --run-id <run>
 | **B3** artifacts produced | unchanged, **plus**: the P-PATH grep now also returns zero hits for the isolation session path spelling, and the exported bundle is grepped as a whole (D-H makes this meaningful for the log for the first time) |
 | **B4** no answer-key leak | unchanged (D.6 scan of the retained reviewer input returns zero hits) |
 | **B5** reproducible | unchanged — byte-identical metrics on re-score, no excepted field |
-| **B6** scope enforced (**new**) | `FINAL_REVIEW_ISOLATION.json` exists for the accepted dispatch, `scope_enforcement == "seatbelt"`, `properties.S1/S2/S3` all `PASS`, NEG-0 `PASS` and NEG-1…NEG-6 all `PASS`, and `profile_digest` matches the profile the launch line actually used. A capture missing any of these is **not a baseline** — it is recorded as an exploratory run and labelled as one |
+| **B6** scope enforced (**new**) | `FINAL_REVIEW_ISOLATION.json` exists for the accepted dispatch, `scope_enforcement == "seatbelt"`, `properties.S1/S2/S3` all `PASS`, NEG-0 `PASS` and NEG-1…NEG-8 all `PASS`, and `profile_digest` matches the profile the launch line actually used. A capture missing any of these is **not a baseline** — it is recorded as an exploratory run and labelled as one |
 
 Unchanged and restated so it cannot drift: the Reviewer's **verdict is an observation, not a
 criterion**. A baseline where the Reviewer returns FAIL, or misses all five seeded defects, still
@@ -1010,7 +1262,9 @@ any artifact.
 | id | risk | mechanism |
 |---|---|---|
 | **RK-1** | The allowlist is widened during pre-flight until the agent starts, and the widening quietly re-admits a key copy. | Every widening is an explicit `--allow-read` on a re-invocation, and every Class USR root is scanned by G.3 passes A-D *after* the widening. A root that cannot be scanned clean cannot be allowed. Recorded per-root in `ISOLATION.json.readable_set[]`. |
-| **RK-2** | Class SYS roots are not content-scanned. | Stated in the attestation's `limitations[]` and in D-I. Admission requires `os.access(root, W_OK) == False`, so planting a key there needs privilege the threat model excludes. |
+| **RK-2** | Class IMM roots are not content-scanned. | **Rewritten in iteration 2 (F-001); the previous mechanism — "admission requires `os.access(root, W_OK) == False`" — was the defect.** Admission now requires G.3.1's recursive proof I-1…I-6 over the whole subtree, every boundary it finds is denied in the profile (G.4 clause 4), `assert_no_unscanned_descendant()` refuses an admitted ancestor of an unproven mutable path, and NEG-5/NEG-7/NEG-8 re-prove it from inside the sandbox at every capture. What remains is only that the proof is evaluated against the run user's privileges at session-build time, so it does not bind a privileged writer — who is outside G.1's threat model. Stated in `limitations[]` and in D-I in exactly those terms. |
+| **RK-8** | The proof is a session-build-time snapshot: a root proven IMM could in principle be mutated *during* the dispatch by a privileged writer or an OS update. | Same class of residual as **O-2**, and bounded by the same reasoning: it requires privilege the threat model excludes, and the window is one dispatch. `ISOLATION.json` records the proof counters so a re-run on the same host is comparable; a differing count on re-capture is a signal worth investigating, not silently absorbed. Not designed around further, and named rather than implied. |
+| **RK-9** | A future contributor "simplifies" G.4 clause 2 back to a global `(allow file-read-metadata)` because the traversal set is fiddly to compute. | NEG-7 fails immediately and loudly on exactly that change — measured: with a global metadata allow and an otherwise-correct readable set, `os.path.exists(plant)` is `True` and `os.stat(plant).st_size` is the key's real size. The comment in the generated profile says so at the point of edit. |
 | **RK-3** | `sandbox-exec` is deprecated by Apple and could be removed. | The backend is behind `render_profile()`/`wrap_command()`; `--enforcement` is an enum with a fail-closed default. If the backend disappears, captures fail B6 loudly rather than degrading silently. |
 | **RK-4** | The generated profile is too tight and the agent half-works — producing a *worse* review that gets mistaken for a detection signal. | The pre-flight probe runs the real agent command and `orca orchestration check` before any Task is dispatched, and B6's verdict is separate from the review's. Also: the baseline draws no detection conclusion at all, by design. |
 | **RK-5** | Someone reads `scope_enforcement: unenforced` as "isolated enough". | It is a distinct enum value, `S2` is `FAIL`, probes read `NOT_APPLICABLE_UNENFORCED` rather than `SKIP`, and B6 fails. Three independent places say the same thing. |
@@ -1053,3 +1307,194 @@ any artifact.
   identity, or the redaction policy's five categories.
 * No Linux/Windows enforcement backend, and no claim of one.
 * No deletion or edit of the predecessor baseline's artifacts.
+
+---
+
+## DESIGN iteration 2 — correction for F-001
+
+STATUS: COMPLETE
+
+Scope of this iteration: **D-G's Class SYS handling only**. D-H (evidence-bundle sanitization) and
+D-I (`COMPATIBILITY.md` wording) were confirmed concretely resolved by
+`REVIEW_DESIGN_iteration1.md` and are **not touched** — no sentence of either changed, and nothing
+below depends on either changing. `D-I` gains no new claim: the one limitation sentence it carries
+is narrowed, not widened, and the narrowed text is quoted in §4 below.
+
+### Summary / Requirements
+
+F-001 said the Class SYS allowlist admitted `/private/var` wholesale on the strength of
+`os.access(root, os.W_OK) == False` at the *root*, while the run user's real
+`tempfile.gettempdir()` is a writable descendant of it that G.3 never scanned and NEG-0…NEG-5 never
+probed. That is correct, and the reproduction below shows it is not theoretical: under the
+unmodified iteration-1 profile a sandboxed process read a byte-identical answer-key copy planted in
+that descendant.
+
+The correction has four parts, in the order the review's Required Action names them:
+
+1. **Remove the wholesale grants.** `/private/var` and `/Library` are gone from the admitted list
+   entirely (G.3.2). What replaces them is narrow: `/private/var/select` (one directory, proven)
+   and `/Library/Developer/CommandLineTools` (proven), plus the *session* paths the runtime
+   actually needs — `<SESSION>/review_root`, `<SESSION>/tmp`, `<SESSION>/home`.
+2. **Prove immutability recursively instead of checking a root.** `prove_immutable()` (G.3.1)
+   walks the entire subtree and requires I-1…I-6: no writable directory anywhere, no writable
+   regular file anywhere, every filesystem/firmlink boundary inside it enumerated and either proven
+   or carved out, and the one narrow device-node exception named explicitly.
+3. **Apply the same analysis to every other root**, not just `/private/var` (§2 below — it turned
+   up two further defects the review had not seen).
+4. **Add the load-bearing negative test**, NEG-7, plus NEG-8 for aliases and T-9.9 as a regression
+   guard against the iteration-1 rule itself (G.9, T-9).
+
+Everything below was executed on this host before being written into the spec, the same way
+iteration 1 verified `sandbox-exec`. All planted material was removed afterwards and its absence
+re-verified.
+
+### What the same analysis found on the other Class SYS roots
+
+The review asked that `/private/var` not be patched in isolation. Doing the descendant analysis
+across the whole iteration-1 list found **two additional defects of the same kind**, both of which
+the narrow fix would have missed:
+
+* **`/System` re-exposed the entire data volume, including the answer key itself.**
+  `/System/Volumes/Data` is a *mount point*, not a symlink, so `os.path.realpath()` does not
+  collapse it, and `(subpath "/System")` therefore reached
+  `/System/Volumes/Data<repo>/scripts/fixtures/final_review_eval/key/answer_key.json`. This is
+  strictly worse than F-001 as filed: F-001 required someone to plant a copy, this needed nothing
+  planted at all. It is closed by the mandatory `(deny … (subpath "/System/Volumes"))` carve-out.
+  *(Measured mitigation: seatbelt canonicalizes the firmlinked spelling before matching, so
+  iteration-1's clause-5 deny on the repo realpath happened to already deny that particular read.
+  That is a property of this OS release, not of the design — which is why the carve-out is
+  mandatory and NEG-8 probes aliases explicitly.)*
+* **`/usr` was not immutable either**: `/usr/local` (writable — it holds a
+  `node_modules/@openai/codex/…` tree and a writable Foxit directory), `/usr/libexec/cups` and
+  `/usr/share/snmp` are all firmlinks onto the writable data volume. Carved out.
+* **`/Library` failed outright** — `/Library/Caches`, `/Library/Fonts`, `/Library/Receipts`,
+  `/Library/Logs/DiagnosticReports` and `/Library/Frameworks/Python.framework/Versions/3.11` are
+  all user-writable. Removed wholesale.
+* `/bin`, `/sbin`, `/private/etc` and `/dev` **passed** the exhaustive proof and stay.
+
+Two method corrections fell out of that work and are now stated in G.3.1 rather than assumed:
+
+* **`st_dev` is not a boundary test.** `/usr` and `/Library` report the *same* `st_dev`
+  (`16777230`) because APFS firmlinks share the fsid. `statvfs().f_flag & ST_RDONLY` does
+  discriminate them, and is what I-5 uses.
+* **The read-only mount flag is not the proof either.** `/private/etc` sits on a read-write volume
+  yet is exhaustively immutable (a flag test would wrongly reject it), while `/System` is a sealed
+  read-only mount that nonetheless contains a writable volume's mount point (a flag test would
+  wrongly accept it). The exhaustive walk is the proof; the flag is corroborating evidence recorded
+  in the attestation. Measured cost of the full proof: **under 20 s per session**, so there is no
+  performance argument for the shortcut that caused F-001.
+
+### Empirical verification — the same probe, three ways
+
+One probe script, three launches: unsandboxed (positive control), under the **unmodified
+iteration-1 profile**, and under the **corrected profile**. The plant is a byte-identical copy of
+`scripts/fixtures/final_review_eval/key/answer_key.json`
+(`sha256:953c97482d7e75ede033ff09c30ae2cde6aae5812d38dffe235ba19580be9222`) plus a second file
+carrying the fixture's real seeded-defect identities (`SD-1,SD-2,SD-3`), written to the **resolved**
+`tempfile.gettempdir()` — `/private/var/folders/<hash>/T/frv_neg7_probe` — and, separately, to the
+resolved `~/Library/Caches`.
+
+| probe | NEG-0 control (unsandboxed) | iteration-1 profile | corrected profile |
+|---|---|---|---|
+| `open(plant)` → sha256 | `953c9748…` (= key) | **`953c9748…` — LEAK** | `PermissionError` |
+| read seeded-defect identity file | `defect identity: SD-1,SD-2,SD-3` | **same string — LEAK** | `PermissionError` |
+| `os.path.exists(plant)` | `True` | **`True`** | **`False`** |
+| `os.stat(plant).st_size` | `9347` | **`9347`** | `PermissionError` |
+| `os.listdir(plant dir)` | `['notes.txt','answer_key.json']` | **same listing** | `PermissionError` |
+| `os.listdir(real TMPDIR)` | `1548` entries | **`1548` entries** | `PermissionError` |
+| `os.listdir("/private/var/folders")` | `2` | **`2`** | `PermissionError` |
+| `/bin/cat plant` | prints the key JSON | **prints the key JSON** | `rc=1`, `Operation not permitted` |
+| `/bin/ls <plant dir>` | lists both files | **lists both files** | `rc=1`, `Operation not permitted` |
+| `find <plant dir> -name answer_key.json` | `rc=0`, path on stdout | **`rc=0`, path on stdout** | `rc=1`, **empty stdout** |
+| `grep -rl final_review_eval/v1 <plant dir>` | `rc=0`, path on stdout | **`rc=0`, path on stdout** | `rc=2`, **empty stdout** |
+| read via symlink placed inside `review_root` | `9347` bytes | **`9347` bytes** | `PermissionError` |
+| read via `/System/Volumes/Data` alias of the plant | `9347` bytes | **`9347` bytes** | `PermissionError` |
+| the same battery against `~/Library/Caches/frv_neg7_probe` | all readable | (host `$HOME` was not admitted in either profile) | `open`/`stat`/`listdir` → `PermissionError`, `exists` → `False` |
+| **functionality:** `ls review_root` | works | works | works |
+| **functionality:** `git --version` | `git version 2.50.1` | (fails on `~/.gitconfig`) | `git version 2.50.1` **with session `HOME`** |
+| **functionality:** `git -C <repo> show HEAD:VERSION` | succeeds | fails | fails |
+| **functionality:** `/bin/echo`, `python3` startup, reading `review_root/subject` | work | work | work |
+
+An intermediate measurement is worth keeping, because it is the reason G.4 clause 2 changed:
+with the corrected *readable set* but iteration-1's **global `(allow file-read-metadata)`** still in
+place, content reads were denied but `os.path.exists(plant)` was `True` and
+`os.stat(plant).st_size` was `9347`. The task's requirement is that the Reviewer cannot *stat, list
+or otherwise discover* the plant, so a global metadata allow does not satisfy it. Replacing it with
+the closed traversal set (G.4 clause 2) is what turns that row from `True/9347` into
+`False/PermissionError`, and it costs nothing: `/bin/cat`, `python3`, `git` and `review_root` reads
+all still work.
+
+Cleanup was verified: both plant directories and the probe session are gone
+(`No such file or directory` for all three).
+
+### Components / Interfaces / Data Flow — what changed, precisely
+
+| location | iteration-1 | iteration-2 |
+|---|---|---|
+| **G.3** classification | `SYS` (admitted on root `W_OK`, unscanned) / `USR` (scanned) | `IMM` (admitted on the recursive proof I-1…I-6, unscanned because planting is impossible) / `USR` (scanned). `SYS` is retired as a value so a half-migrated writer fails loudly. |
+| **G.3** invariant | implicit | explicit *no-unscanned-descendant* invariant + `assert_no_unscanned_descendant()`, exit 4 |
+| **G.3** admitted list | `/usr /bin /sbin /System /Library /private/etc /private/var /dev` | `/bin /sbin /private/etc /dev /private/var/select`, `/usr`−carve-outs, `/System`−carve-outs, `/Library/Developer/CommandLineTools`; **`/private/var` and `/Library` removed** |
+| **G.3** boundaries | not considered | `enumerate_boundaries()` — mount table + `/usr/share/firmlinks` + the `statvfs` flag-change walk; an unexplained boundary is a hard failure |
+| **G.4** clause 2 | global `(allow file-read-metadata)` | closed traversal set; metadata surface ⊆ data surface |
+| **G.4** clause 4 | did not exist | carve-out denies, generated from the proof's own list, checked by `assert_carve_outs_denied()` |
+| **G.2 / G.5** | session held `review_root` + `control` | adds `tmp/` and `home/`; launch line sets `TMPDIR`/`HOME` to them |
+| **G.6** attestation | `{"class":"SYS","user_writable":false,"scanned":false}` | `{"class":"IMM","scanned":false,"proof":{…counters…}}` + `carve_outs_denied`, `traversal_set`, `no_unscanned_descendant` |
+| **G.9** | NEG-0…NEG-6; NEG-5 re-scanned Class USR only | NEG-5 re-scans **every** admitted root; **NEG-7** (writable-descendant plant) and **NEG-8** (alias battery) added; the discovery oracle is specified |
+| **RK-2** | "admission requires `W_OK == False`" | rewritten around the recursive proof; **RK-8** (proof is a build-time snapshot) and **RK-9** (do not restore the global metadata allow) added |
+
+### Error Handling / Compatibility
+
+No change to failure posture: every new check is fail-closed at exit 4 with the offending path
+printed, and a half-built session is still removed. Three new hard-failure conditions join the G.7
+table under the same exit code — a failed `prove_immutable()`, a boundary named by neither the
+mount table nor `/usr/share/firmlinks`, and a mismatch between the proof's carve-out list and the
+profile's deny list.
+
+The `ISOLATION.json` schema stays at `1.0` because it has never been emitted: no attestation exists
+on disk, so there is no reader to break. The `class` value changes from `SYS` to `IMM` and
+`readable_set[].proof` is added; `scanned: false` now additionally requires a complete `proof`
+object with zero writable directories and zero writable regular files.
+
+**D-I's limitation sentence narrows** — this is the only D-I-adjacent change and it removes a
+claim rather than adding one. It reads, in the corrected form:
+
+> System paths admitted to the Reviewer's readable set are proven immutable by an exhaustive
+> recursive check of the whole subtree at session-build time, evaluated against the run user's own
+> privileges; the proof does not bind a privileged (root) writer, who is outside the stated threat
+> model.
+
+Nothing else in D-I, and nothing at all in D-H, changes.
+
+### Expected Changed Files / Implementation Steps
+
+Unchanged from iteration 1 except within two files already on the list:
+
+* `scripts/review_isolation.py` — add `prove_immutable()`, `enumerate_boundaries()`,
+  `compute_traversal_set()`, `assert_carve_outs_denied()`, `assert_no_unscanned_descendant()`;
+  `render_seatbelt_profile()` takes the carve-out and traversal sets; session `tmp/`+`home/` and the
+  `TMPDIR`/`HOME` launch environment; `SYS` → `IMM` throughout.
+* `scripts/test_review_isolation.py` — T-9.7 (NEG-7), T-9.8 (NEG-8), T-9.9 (the regression guard
+  that asserts the iteration-1 rule is *rejected*).
+
+No new file, no new subcommand, no new exit code. `VERSION`, `LICENSE-DECISION.md`, the fixture
+trees, the answer key and `release_manifest.py` remain untouched, and no D-H or D-I file is
+reopened.
+
+### Risks / Open Issues
+
+* **RK-2** is rewritten, **RK-8** and **RK-9** are added — all three are in the risk table above.
+* **O-2 is partly closed as a side effect.** The session-scoped `HOME`/`TMPDIR` mean an isolated
+  agent no longer shares a state directory with non-isolated sessions, which was the mechanism O-2
+  described. The residual it named — key material arriving from another session *during* the
+  dispatch — no longer has a shared directory to arrive in. O-2 stays on the list because an agent
+  configured with an absolute state path via `--allow-read` could still reintroduce it, and that
+  root is then subject to the G.3 scan.
+* **New, and named rather than implied:** the readable set is now tight enough that a different
+  reviewer agent may need roots this host's probe did not surface. That is what the mandatory
+  pre-flight probe is for, and every widening is an explicit `--allow-read` that is then proven or
+  scanned. A widening that can be neither proven nor scanned clean must fail the capture, not be
+  waived.
+* **Portability, restated:** the carve-out list above is *derived*, not hard-coded — it is whatever
+  `enumerate_boundaries()` finds on the host at session-build time. The concrete list in G.3.2 is
+  this host's result, recorded so the implementation has a known-good target to test against, and
+  `ISOLATION.json` records the host's own list per capture. No Linux/Windows backend is claimed.
