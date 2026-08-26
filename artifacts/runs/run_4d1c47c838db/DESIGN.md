@@ -254,7 +254,7 @@ whose threat model is unstated is not a guarantee.
 |---|---|---|---|
 | **S1 — scope** | The Reviewer's cwd and every path reachable by relative traversal from it contain no key material and no path relationship to `key/` or `adjudications/`. | G.2 session layout + `materialize()`'s existing assertions | NEG-1 |
 | **S2 — unreadability** | No absolute path outside the computed readable set is readable *or stat-able* by the Reviewer process, including via `git`, and the key's own paths are in neither. | G.4 seatbelt profile | NEG-2, NEG-3, NEG-4 |
-| **S3 — cleanliness of the readable set** | Every path the Reviewer *can* read is covered by one of exactly two proofs: it is exhaustively content-scanned and contains zero key material (Class USR), or it is exhaustively proven immutable so that no unprivileged process can put key material there (Class IMM). No admitted path is a proper ancestor of a mutable path covered by neither. | G.3 readable-set computation + G.3.1 proof + G.3.3 scan + `assert_no_unscanned_descendant()` | NEG-5, NEG-6, **NEG-7**, **NEG-8** |
+| **S3 — cleanliness of the readable set** | **Every** path the Reviewer *can* read is exhaustively content-scanned and contains zero key material — Class USR and Class IMM alike (**corrected in iteration 5**; before it, Class IMM rested on immutability alone, which is a statement about writes and not about content). A Class IMM root is *additionally* proven immutable, and the two proofs do different jobs that neither can do for the other: the content scan says the key material is not there **now**, the immutability proof says nothing unprivileged can put it there **afterwards**. No admitted path is a proper ancestor of a mutable path covered by neither. | G.3 readable-set computation + G.3.1 proof + G.3.3 scan + `assert_no_unscanned_descendant()` | NEG-5, NEG-6, **NEG-7**, **NEG-8** |
 
 S1 alone is what the previous design had. S2 without S3 is defeated by a stray copy. S3 without S2
 is unbounded. The three are required together and `ISOLATION.json` records all three verdicts
@@ -451,7 +451,7 @@ Everything else that must be readable, admitted **only** as an exact path and al
 | pass | what it does | a hit means |
 |---|---|---|
 | **A — name** | walk the root; any file whose basename is `answer_key.json`, or whose path contains a component named `key` or `adjudications` **under a directory that also contains a `subject/`** | a fixture tree is reachable |
-| **B — content** | `scan_leak(key, [root])` — the existing D.6 token/shingle/expected-count scan, no exclusions | key material is reachable |
+| **B — content** | open every regular file the walk reaches, normalise whitespace, casefold, and test it against the key's vocabulary — the existing D.6 token/shingle/expected-count test, but driven from **this walk** rather than from `scan_leak()`'s own `rglob`, so that it prunes the same carve-outs as A/C/D and follows no symlink. **Mandatory for every admitted root, IMM and USR alike (iteration 5).** The *vocabulary* is per class and is the only thing that differs: Class USR matches the full `key_leak_tokens()` set plus the two expected-count regexes; Class IMM matches `key_material_tokens()` — the key's **content** vocabulary (fixture id, archetypes, prose shingles, and the *identifier-form* markers `answer_key` / `seeded_defect` / `expected_finding_count`) without its **natural-language** vocabulary (`answer key`, `seeded defect`, `expected finding`, `seeded`, `정답`, `시드`) and without the defect ids (`sd-1`…`sd-5`) or the count heuristics — 712 tokens against 723. Both are exhaustive over files. See **D-5.1**, which measures why a literally-whole pass B over an OS tree is not a gate. | key material is reachable |
 | **C — key digest** | any file whose sha256 equals the answer key file's sha256. **Size prefilter (iteration 4):** a file whose `st_size` differs from the key file's byte length can never have the key's sha256, so only size-matching files are opened and hashed. This is an *equivalence*, not an approximation — it detects exactly the set the unfiltered pass detects — and it is what makes pass C affordable over a Class IMM root. | a renamed copy is reachable |
 | **S — escaping symlink** | a symlink whose realpath leaves the root — an allowed read path the walk did not cover. **Class USR only** (recorded here in iteration 4 to match what ships): for a Class IMM root the *profile* is the evidence, seatbelt evaluates the resolved target, so such a link reaches the target's own class or is denied on the target's own terms. | the scan did not cover an allowed read path |
 | **D — archive members** | for every `*.tar`, `*.tar.gz`, `*.tgz`, `*.zip` under the root, list members with `tarfile`/`zipfile` (**names only — members are never extracted and never read**) and match member names by pass A's rule | a packaged copy is reachable (this is what catches `dist/orca-skills-*.tar.gz`) |
@@ -462,10 +462,22 @@ that root and re-run the pre-flight probe. Pass D reads only the archive's index
 unreadable or malformed it counts as a hit, because an archive whose contents cannot be enumerated
 cannot be certified clean.
 
-Class IMM roots are **not** content-scanned *at session-build time*, and the justification is now
-the proof rather than an assertion about the root directory: G.3.1's I-1…I-6 establish that no unprivileged process can
-create or overwrite readable content anywhere in the subtree, so there is nothing a scan could
-find that the proof allows to exist. `ISOLATION.json` records, per root, the full proof counters
+Class IMM roots are content-scanned like every other admitted root. What differs is only *when*
+and with *which vocabulary*. The scan is not run a **second** time at session-build time, because
+NEG-5 already runs it over **the profile's own admitted set**, after the profile has been computed —
+strictly better evidence than a build-time scan of the candidate list, because NEG-5's whole job is
+to not trust the classification it is checking — and running the same read of tens of gigabytes
+twice per capture would double the one cost that now dominates a capture (measured in **D-5.1**).
+
+**The immutability proof is not a substitute for that scan and is nowhere offered as one.** G.3.1's
+I-1…I-6 establish exactly one thing: *no unprivileged process can create or overwrite readable
+content anywhere in the subtree*, evaluated against the run user's privileges at session-build time.
+It says nothing whatever about content that was **already there** when the proof ran, because it
+never opens a file. Pass B is what covers a reformatted or partial rendering of the key; pass C is
+what covers a byte-identical copy; the proof is what makes both durable, by establishing that
+nothing unprivileged can add such content after the scan.
+
+`ISOLATION.json` records, per root, the full proof counters
 (directories walked, files walked, writable directories, writable regular files, boundaries found,
 carve-outs applied) — not a single `W_OK` boolean. A root whose proof fails is **not** admitted as
 IMM: it is either narrowed by a carve-out and re-proven, demoted to Class USR and content-scanned,
@@ -474,18 +486,25 @@ session-build time against the run user's own privileges, so it does not bind a 
 (root) writer* — and that writer is outside the G.1 threat model. That sentence, and nothing
 broader, is what `ISOLATION.json.limitations[]` carries.
 
-**Iteration 4 (IMPLEMENTATION review F-001).** "Not content-scanned at session-build time" is
-not the same statement as "never content-scanned". NEG-5 re-runs the scan **from inside the
-sandbox**, and there its job is precisely *not* to trust this classification — that is what makes it
-the check F-001 would have failed. G.9's NEG-5 row therefore runs passes **A, C, D** over each Class
-IMM root: the proof bounds what an unprivileged process can *write* into the subtree, it says
-nothing about what is *already there*, and pass C under the size prefilter above costs a walk. Pass
-B remains the one pass Class IMM does not run, and `## DESIGN iteration 4` records exactly what that
-gives up and why.
+**Iteration 5 (DESIGN review F-001), superseding iteration 4's pass set.** NEG-5 re-runs the scan
+**over the resolved readable set the profile actually grants**, and there its job is precisely *not*
+to trust this classification — that is what makes it the check the IMPLEMENTATION review's F-001
+would have failed. G.9's NEG-5 row
+therefore runs passes **A, B, C, D** over each Class IMM root and **A, B, C, D, S** over each Class
+USR root. Pass B over Class IMM is **required, on by default, and not gated behind a flag**;
+iteration 4's optional `--scan-imm-content` is removed, because a content-cleanliness gate that is
+off by default is not a gate. `## DESIGN iteration 5` records the one thing that is per class — the
+vocabulary — and the measurement that forces it.
 
-Bounding: pass A/B/C walks skip nothing and follow no symlinks (`os.walk(..., followlinks=False)`),
-and every symlink encountered whose realpath escapes the root is itself a hit — an escaping symlink
-inside an allowed root is an allowed read path that the walk did not cover.
+Bounding: every pass is driven by **one shared** `os.walk(..., followlinks=False)` that prunes the
+root's carve-outs and skips nothing else, and no pass ever follows a symlink — pass B included,
+which is exactly why iteration 5 drives it from this walk instead of from `scan_leak()`'s own
+`rglob` (**D-5.1**). An escaping symlink is a hit under **pass S, and pass S is Class USR only**, as
+its row above states; for a Class IMM root the *profile* is the evidence, because seatbelt evaluates
+the resolved target, so such a link reaches the target's own class or is denied on the target's own
+terms. Refusing to follow symlinks costs no content coverage in either class: a link that stays
+inside the root points at a file this walk reads directly, and a link that leaves it is a pass-S hit
+(Class USR) or is resolved by the profile against the target's own class (Class IMM).
 
 #### G.4 The scope profile — exact generated text, and the ordering rule
 
@@ -798,7 +817,7 @@ tested in CI and re-proved at every capture.
 | **NEG-2** | Inside the sandbox: `open(<key abs path>)`, `open(<adjudications file>)`. | both raise `PermissionError` |
 | **NEG-3** | Inside the sandbox: `os.path.exists(<key abs path>)`, `os.stat`, `os.listdir(<key dir>)`, `os.listdir(<repo root>)`. | `exists` is `False`; the other three raise `PermissionError` — *discovery*, not just reading, is blocked |
 | **NEG-4** | Inside the sandbox: `git -C <repo> show HEAD:scripts/fixtures/final_review_eval/key/answer_key.json`; `git -C <repo> grep seeded_defects`; `tar -tzf <repo>/dist/*.tar.gz`. | all exit non-zero and none prints key content |
-| **NEG-5** | The G.3 readable-set scan over **every admitted root, IMM and USR alike**, re-run from inside the sandbox using only paths the profile permits. (Iteration 1 re-scanned Class USR only, which is why it could not have caught F-001.) **The pass set is per class, decided in iteration 4 and stated rather than left to IMPLEMENTATION:** Class USR gets **A, B, C, D, S**; Class IMM gets **A, C, D** — the two walk passes plus the key-digest pass, which is run under the size prefilter of G.3.3 and is therefore walk-cost. Pass **B is deliberately not run over Class IMM**, and pass **S is Class-USR-only**; both reductions are justified in `## DESIGN iteration 4`. The per-root pass list is recorded in the NEG-5 probe record. | zero hits in every pass the root's class runs |
+| **NEG-5** | The G.3 readable-set scan over **every admitted root, IMM and USR alike**, re-run against the resolved readable set the profile grants, with each root's carve-outs pruned. (**Wording corrected in iteration 5**, because D-5.1 leans on what this probe actually does: NEG-5 is an *in-process* re-scan inside `run_probes()`, not a sandboxed subprocess like NEG-2/NEG-3/NEG-4. Its independence comes from running against the **computed** readable set rather than the candidate list, not from being sandboxed. No behaviour changes; the earlier "from inside the sandbox" phrasing simply did not describe the code.) (Iteration 1 re-scanned Class USR only, which is why it could not have caught F-001.) **The pass set is stated here rather than left to IMPLEMENTATION, and iteration 5 settles it:** Class USR gets **A, B, C, D, S**; Class IMM gets **A, B, C, D**. **Pass B is mandatory over Class IMM** — no flag, no default-off path — because the immutability proof bounds writes and says nothing about pre-existing content, and pass C alone catches only a byte-identical copy. The single per-class difference is pass B's **vocabulary** (`key_material_tokens()` for IMM, `key_leak_tokens()` for USR), measured and justified in **D-5.1**. Pass **S is Class-USR-only**, justified in G.3.3's pass table. The per-root pass list **and vocabulary** are recorded in the NEG-5 probe record. | zero hits in every pass the root's class runs |
 | **NEG-6** | Profile integrity: `sha256(scope.sb)` equals `ISOLATION.json.profile_digest`, and the profile parses (`sandbox-exec -f scope.sb /usr/bin/true` exits 0). | both hold |
 | **NEG-7** | **The writable-descendant probe (iteration 2, F-001).** Plants, in the current user's *resolved* mutable roots, (a) a byte-identical copy of the answer key and (b) a second file carrying the fixture's real seeded-defect identity strings. Then runs `open`, `os.path.exists`, `os.stat`, `os.listdir` on the plant and on its parent, `os.listdir` on the temp root itself, `/bin/cat`, `/bin/ls`, `/usr/bin/find -name answer_key.json`, `/usr/bin/grep -rl <key content marker>`, a read through a **symlink placed inside `review_root` pointing at the plant**, and a read through the plant's `/System/Volumes/Data` alias. | **every one is denied**: `open`/`stat`/`listdir`/`cat`/`ls` raise `PermissionError` or exit non-zero, `os.path.exists` returns `False`, and `find`/`grep` produce **no stdout** |
 | **NEG-8** | **Alias probe.** For every denied root and every carve-out, the same read/stat/list battery through each alias spelling derived from the mount table and `/usr/share/firmlinks` — in particular `/System/Volumes/Data<path>`. | all denied, exactly as the canonical spelling is |
@@ -1297,7 +1316,7 @@ any artifact.
 | id | risk | mechanism |
 |---|---|---|
 | **RK-1** | The allowlist is widened during pre-flight until the agent starts, and the widening quietly re-admits a key copy. | Every widening is an explicit `--allow-read` on a re-invocation, and every Class USR root is scanned by G.3 passes A-D *after* the widening. A root that cannot be scanned clean cannot be allowed. Recorded per-root in `ISOLATION.json.readable_set[]`. |
-| **RK-2** | Class IMM roots are not content-scanned. | **Rewritten in iteration 2 (F-001); the previous mechanism — "admission requires `os.access(root, W_OK) == False`" — was the defect.** Admission now requires G.3.1's recursive proof I-1…I-6 over the whole subtree, every boundary it finds is denied in the profile (G.4 clause 4), `assert_no_unscanned_descendant()` refuses an admitted ancestor of an unproven mutable path, and NEG-5/NEG-7/NEG-8 re-prove it from inside the sandbox at every capture. What remains is only that the proof is evaluated against the run user's privileges at session-build time, so it does not bind a privileged writer — who is outside G.1's threat model. Stated in exactly those terms in G.3.3 and in `ISOLATION.json.limitations[]`; D-I's `COMPATIBILITY.md` wording is unchanged. |
+| **RK-2** | Class IMM roots rest on an immutability proof rather than on content. **Closed in iteration 5:** they are now content-scanned too, by a mandatory pass B at NEG-5 (D-5.1); what is left of this risk is only the privileged-writer boundary below. | **Rewritten in iteration 2 (F-001); the previous mechanism — "admission requires `os.access(root, W_OK) == False`" — was the defect.** Admission now requires G.3.1's recursive proof I-1…I-6 over the whole subtree, every boundary it finds is denied in the profile (G.4 clause 4), `assert_no_unscanned_descendant()` refuses an admitted ancestor of an unproven mutable path, and NEG-5/NEG-7/NEG-8 re-prove it from inside the sandbox at every capture. What remains is only that the proof is evaluated against the run user's privileges at session-build time, so it does not bind a privileged writer — who is outside G.1's threat model. Stated in exactly those terms in G.3.3 and in `ISOLATION.json.limitations[]`; D-I's `COMPATIBILITY.md` wording is unchanged. |
 | **RK-8** | The proof is a session-build-time snapshot: a root proven IMM could in principle be mutated *during* the dispatch by a privileged writer or an OS update. | Same class of residual as **O-2**, and bounded by the same reasoning: it requires privilege the threat model excludes, and the window is one dispatch. `ISOLATION.json` records the proof counters so a re-run on the same host is comparable; a differing count on re-capture is a signal worth investigating, not silently absorbed. Not designed around further, and named rather than implied. |
 | **RK-9** | A future contributor "simplifies" G.4 clause 2 back to a global `(allow file-read-metadata)` because the traversal set is fiddly to compute. | NEG-7 fails immediately and loudly on exactly that change — measured: with a global metadata allow and an otherwise-correct readable set, `os.path.exists(plant)` is `True` and `os.stat(plant).st_size` is the key's real size. The comment in the generated profile says so at the point of edit. |
 | **RK-3** | `sandbox-exec` is deprecated by Apple and could be removed. | The backend is behind `render_profile()`/`wrap_command()`; `--enforcement` is an enum with a fail-closed default. If the backend disappears, captures fail B6 loudly rather than degrading silently. |
@@ -1648,7 +1667,7 @@ silently, and both escalated by the IMPLEMENTATION Reviewer as blocking G1 viola
 | review id | IMPLEMENTATION.md id | subject | decision |
 |---|---|---|---|
 | **F-002** | **F-101** | D-H.2 step 2's `extra == ()` residue clause | **The clause was never a correct formalization. Replaced** — not relaxed — by a *per-match* rule that is strictly stronger than the text equality the implementation shipped. |
-| **F-001** | **F-102** | NEG-5's reduced pass set over Class IMM roots | **Partly upheld, partly rejected.** Pass **C is required** over Class IMM roots — the reduction to A/D left exactly the gap the review names — but it is redefined with a size prefilter that makes it *walk-cost*. Pass **B stays out**, now as an explicit, justified decision with its residual named. |
+| **F-001** | **F-102** | NEG-5's reduced pass set over Class IMM roots | **Partly upheld, partly rejected — and the rejected half was reversed in iteration 5.** Pass **C is required** over Class IMM roots, redefined with a size prefilter that makes it *walk-cost*; that part stands. Iteration 4 kept pass **B** out; the DESIGN reviewer's F-001 showed that leaves the readable set unproved clean of a reformatted or partial copy, and **D-5.1 makes pass B mandatory over Class IMM**. Read D-4.2 with its superseded banner. |
 
 What this iteration changes, and nothing else:
 
@@ -1656,6 +1675,7 @@ What this iteration changes, and nothing else:
 * **D-G**: G.3.3's pass table (pass C gains the size prefilter; pass S is recorded), G.3.3's "not
   content-scanned" paragraph (scoped to session-build time), G.9's NEG-5 row (per-class pass set).
 * **New**: T-7.13, T-7.14, T-8.4b, T-8.4c, T-9.5; RK-11, RK-12; one additive CLI flag.
+  *(Iteration 5 reverses the last two of those: RK-12 is rewritten and the CLI flag is withdrawn.)*
 
 What this iteration does **not** touch, restated so a re-review does not have to re-derive it:
 
@@ -1851,62 +1871,41 @@ reason this check can produce.
 
 #### Decision D-4.2 — NEG-5's pass set is per class, and pass C is required over Class IMM
 
-| class | passes | rationale |
+> **SUPERSEDED IN ITERATION 5 by D-5.1. Do not implement this decision.** The DESIGN review's F-001
+> is upheld: leaving pass B out of Class IMM left the readable set unproved clean of a reformatted
+> or partial rendering of the key, and the optional `--scan-imm-content` flag did not make the
+> *default* baseline satisfy the answer-key non-exposure requirement. **Pass B is now mandatory over
+> every admitted root, the flag is removed, and `SCAN_PASSES_IMM_CONTENT` is never created.** What
+> survives from this decision, unchanged and still required, is exactly two things: pass C's **size
+> prefilter** (an equivalence, not an approximation) and pass **S being Class USR only**. Everything
+> below is retained only as the record of what iteration 4 reasoned and why iteration 5 reversed it.
+
+| class | passes | rationale (iteration 4 — superseded) |
 |---|---|---|
 | **USR** | **A, B, C, D, S** | unchanged. The root is small (a freshly created session tree), mutable, and the scan is the only evidence there is. |
-| **IMM** | **A, C, D** | A and D are walk passes. **C is required**, under the size prefilter — the proof says nothing about pre-existing content, and NEG-5 must not assume the classification it is checking. Cost: a walk plus, on this host, one 9 KB hash. |
+| **IMM** | ~~**A, C, D**~~ → **A, B, C, D** (D-5.1) | A and D are walk passes. **C is required**, under the size prefilter — the proof says nothing about pre-existing content, and NEG-5 must not assume the classification it is checking. Cost: a walk plus, on this host, one 9 KB hash. |
 
-Pass **B is not run over Class IMM roots.** This is an explicit design decision, recorded here
-rather than left as silence or as an implementation note, and it is bounded as follows.
+Iteration 4 argued that pass B over Class IMM was an acceptable residual on three grounds — that
+I-3 proves the run user cannot have *written* such a copy, that the one in-scope way key material
+reaches an admitted root is a classification bug already covered four other ways, and that pass B
+costs 26.85 GB of reads per capture. **Ground 1 is the one that fails, and it fails on the same
+point iteration 4 itself established two sections above:** I-3 is a statement about *write
+capability*, so it cannot speak to a file that was already present when the proof ran. A
+pre-existing reformatted copy is an **initial-state condition**, not an act by a privileged writer,
+and therefore is not covered by the out-of-scope privileged-writer boundary that ground 1 leans on.
+Grounds 2 and 3 remain true as stated and are simply not sufficient: ground 2 enumerates coverage
+for a *different* failure (a classification bug), and ground 3 is a cost, which this design has
+consistently ruled must never be the reason a safety gate is skipped.
 
-**What running pass B over Class IMM would add over A + C + D:** detection of key material present
-in a form that is neither byte-identical to the key file (C) nor named like the fixture (A) nor
-packaged in an archive whose index names it (D) — i.e. a *reformatted or partial* rendering: a
-pretty-printed copy, an excerpt, a quoted fragment in a log.
+The escape hatch iteration 4 proposed, `isolate --scan-imm-content` (default **off**), is
+**withdrawn**. A default-off content-cleanliness gate leaves the default capture — the one §7
+actually takes — unproved, which is precisely the reviewer's finding. D-5.1 replaces it with a
+mandatory pass B, and removes the flag rather than leaving it as a no-op, so that the design and the
+CLI cannot disagree.
 
-**Why that is an acceptable residual:**
-
-1. **I-3 proves the run user cannot have written it.** Admission as IMM requires that *no regular
-   file anywhere in the subtree* satisfies `os.access(f, W_OK)`, exhaustively, over the whole
-   subtree at session-build time. So key material in an IMM root cannot have arrived by any
-   unprivileged write. It requires a **privileged (root) writer** — which is the residual G.3.3,
-   RK-2, RK-8 and `ISOLATION.json.limitations[]` already state in exactly those terms, and which
-   G.1 places outside the threat model. Pass B over Class IMM would be a partial mitigation of a
-   threat this design has already, and separately, declared out of scope.
-2. **The one in-scope way key material reaches an admitted root is a classification bug** — the
-   F-001 shape, where a subtree the run user *can* write is wrongly admitted as immutable. That
-   case is covered four independent ways and none of them is pass B:
-   `assert_no_unscanned_descendant()` refuses the structural shape, `assert_carve_outs_denied()`
-   refuses the profile shape, **NEG-7 plants a real byte-identical key copy plus an identity-string
-   file in the resolved mutable roots and asserts every read, stat, list, `cat`, `ls`, `find`,
-   `grep`, symlink and `/System/Volumes/Data` alias is denied**, and NEG-5's passes A and C find a
-   planted copy by name or by digest. T-9.9 is the regression guard for the classification rule
-   itself.
-3. **Cost, honestly stated:** 26.85 GB of reads per capture, on top of the ~3.5 minutes the proof
-   already costs (IMPLEMENTATION.md F-102's measurement, which supersedes G.3.2's "< 20 s" —
-   G.3.2's mechanism is correct and only its constant was wrong). Unlike pass C, no prefilter makes
-   it cheaper without weakening it.
-4. **It is not a permanent refusal.** `--scan-imm-content` (below) runs it on demand and records
-   that it ran.
-
-**Additive escape hatch — `isolate --scan-imm-content`.** Default **off**. When passed, Class IMM
-roots run **A, B, C, D**, and `ISOLATION.json`'s NEG-5 probe record carries
-`"imm_content_scan": true` alongside the per-root `passes` list it already carries. This gives the
-operator a one-command way to discharge residual 1 above on a host they have reason to doubt — a
-shared machine, a machine where something was once installed with `sudo` from this repository —
-without paying 26.85 GB on every capture. A capture taken with the flag is *more* attested, never
-less, and the flag can only widen the pass set, never narrow it.
-
-**Rejected alternative — full A–D over every root at every capture.** It is the option the review
-offers, and it is defensible; it is rejected because pass C's prefilter already closes the concrete
-gap the review names at walk cost, leaving only residual 1 — a threat G.1 excludes and
-`limitations[]` already discloses — to justify minutes of I/O per capture. Buying a partial
-mitigation of an out-of-scope threat at that price, on every capture, is not a good trade, and
-`--scan-imm-content` makes it available to anyone who disagrees on a given host.
-
-**Rejected alternative — keep A/D only and document it.** Rejected outright. It leaves the review's
-named gap open, and its stated justification ("the proof establishes it more strongly") is false
-for pass C.
+**Rejected alternative — keep A/D only and document it.** Rejected outright, in iteration 4 and
+again in iteration 5. It leaves the review's named gap open, and its stated justification ("the
+proof establishes it more strongly") is false for pass C and for pass B alike.
 
 ---
 
@@ -1946,11 +1945,11 @@ including why `extra == ()` is a different property rather than a stricter one.
 | symbol | change |
 |---|---|
 | `SCAN_PASSES_ALL` | unchanged: `("A", "B", "C", "D", "S")` |
-| `SCAN_PASSES_NAME_ONLY` | **renamed** `SCAN_PASSES_IMM`, value `("A", "C", "D")`; comment rewritten to the D-4.2 rationale. The old name is removed, not aliased — it no longer describes the value. |
-| `SCAN_PASSES_IMM_CONTENT` | **new**, `("A", "B", "C", "D")`, used only under `--scan-imm-content` |
+| `SCAN_PASSES_NAME_ONLY` | **renamed** `SCAN_PASSES_IMM`, value **`("A", "B", "C", "D")`** (iteration 5; iteration 4's `("A", "C", "D")` is superseded). The old name is removed, not aliased — it no longer describes the value. |
+| `SCAN_PASSES_IMM_CONTENT` | **not created.** Iteration 4 proposed it for the withdrawn `--scan-imm-content` flag; with pass B mandatory there is nothing for a second IMM pass set to mean. |
 | `scan_readable_set()` | pass C gains the size prefilter. Add `_answer_key_size(key)` next to the existing `_answer_key_digest(key)`, reading the size from the **same** `key["__source_path__"]` and returning `None` on a missing path or `OSError`, exactly as `_answer_key_digest()` does — one source of truth for "which file is the key". In the walk, `continue` before `sha256_path(entry)` when `key_size is not None and entry.lstat().st_size != key_size`. When `key_size is None` pass C is already inert (`key_digest` is `None` too) and nothing changes. Applied on **both** classes — it is an equivalence, so it is strictly a speedup for Class USR too. An `OSError` from `lstat()` falls through to hashing rather than skipping, so the prefilter can never turn an unreadable file into a silent pass. |
-| `run_negative_probes()` | the NEG-5 loop selects `SCAN_PASSES_ALL` / `SCAN_PASSES_IMM` / `SCAN_PASSES_IMM_CONTENT`; the probe record gains `"imm_content_scan": bool` at the probe level. `rescan_detail[]`'s existing `passes` list is unchanged in shape. The duplicated comment paragraph at `review_isolation.py:1315-1319` is deduplicated in the same edit. |
-| `build_parser()` | `--scan-imm-content`, `action="store_true"`, default `False`, on the `isolate` subcommand only. Threaded through to `run_negative_probes()`. |
+| `run_negative_probes()` | the NEG-5 loop selects `SCAN_PASSES_ALL` (USR) or `SCAN_PASSES_IMM` (IMM) — no third case and no flag; each `rescan_detail[]` entry gains `"vocabulary": "key_leak" \| "key_material"` alongside its existing `passes` list. The NEG-5 comment block at `review_isolation.py:1315-1330` is rewritten wholesale: lines 1318-1319 are the duplicated sentence iteration 4 already flagged, and lines 1321-1330 — "A Class IMM root gets the two WALK passes … and not the two READ passes … What passes B and C would be re-deriving is already established more strongly by the recursive proof" — state exactly the claim D-5.1 refutes, so they are **deleted** rather than edited. |
+| `build_parser()` | **no change.** `--scan-imm-content` is not added. |
 
 **Data flow, unchanged everywhere else.** `ISOLATION.json`'s `readable_set[]` entries keep
 `scanned: false` for Class IMM: that field describes the **session-build-time** scan (G.3.3), which
@@ -1964,8 +1963,9 @@ record is where the from-inside-the-sandbox pass set is reported, and it already
 
 * **Exit codes: unchanged.** A pass-C hit inside a Class IMM root is a hit like any other — exit 4,
   offending path printed. There is still no `--ignore`.
-* **`--scan-imm-content` is purely additive** and defaults off, so every existing invocation
-  behaves identically. It can only widen the pass set.
+* **No new CLI surface.** `--scan-imm-content` is not added (D-4.2's proposal is withdrawn by
+  D-5.1), so `isolate`'s option set is unchanged and no invocation anywhere needs editing. The
+  behaviour change is that a capture now scans more, never that a caller must ask it to.
 * **Bundle schema stays `2.0`.** The residue rule changes *which* inputs are embedded versus
   omitted, but relative to what is deployed at `cac283b` (text equality) the corrected rule embeds a
   subset, and no input is known — after a 400,000-trial search — on which the two differ. Relative
@@ -1975,13 +1975,15 @@ record is where the from-inside-the-sandbox pass set is reported, and it already
   observation about D-I's "exhaustively scanned" wording is unchanged in truth-value by this
   iteration: Class IMM roots were partly unscanned before and are partly unscanned after, and
   reopening D-I remains out of bounds.
-* **`ISOLATION.json.limitations[]` keeps its single existing entry.** The one residual D-4.2
-  creates — pass B is not run over Class IMM roots — is a mitigation gap against a **privileged
-  writer**, and that entry already states exactly that boundary: *the proof is evaluated at
-  session-build time against the run user's own privileges, so it does not bind a privileged (root)
-  writer*. Adding a second entry would restate the same limitation in different words, which is the
-  drift R1 punished. The pass-set detail lives in the NEG-5 probe record, where a reader can see it
-  per root.
+* **`ISOLATION.json.limitations[]` keeps its single existing entry** — and iteration 5 makes that
+  *easier* to defend, not harder. D-4.2's residual (pass B not run over Class IMM) is **gone**: the
+  content gap it left is now closed by a mandatory pass B. What the single entry still says is the
+  only thing still true — *the proof is evaluated at session-build time against the run user's own
+  privileges, so it does not bind a privileged (root) writer* — and that is a statement about the
+  **immutability** proof's durability, not about content, which is now independently established.
+  Adding a second entry would restate the same limitation in different words, which is the drift R1
+  punished. The per-root pass set **and vocabulary** live in the NEG-5 probe record, where a reader
+  can see them per root.
 * **Failure posture on the new `stat` call:** an `OSError` from `entry.lstat()` in the prefilter is
   treated as "cannot certify" and falls through to hashing the file rather than skipping it, so the
   prefilter can never turn an unreadable file into a silent pass.
@@ -1994,15 +1996,15 @@ record is where the from-inside-the-sandbox pass set is reported, and it already
 |---|---|---|---|
 | 1 | `scripts/run_logging.py` | `_residual_matches_are_self_output()`; `safe_embedded_text()` step 2; docstring correction | **HARD** |
 | 2 | `scripts/test_run_logging.py` | T-7.3 / T-7.4 / T-7.8 assertions extended; T-7.9 monkeypatch retargeted; T-7.13, T-7.14 added | **HARD**, same commit as 1 |
-| 3 | `scripts/review_isolation.py` | `SCAN_PASSES_IMM`, `SCAN_PASSES_IMM_CONTENT`, pass-C size prefilter, NEG-5 pass selection + `imm_content_scan`, comment dedup | **HARD** |
-| 4 | `scripts/final_review_eval.py` | `--scan-imm-content` on `isolate`, threaded through | same commit as 3 |
-| 5 | `scripts/test_review_isolation.py` | T-8.4b, T-8.4c, T-9.5 | **HARD**, same commit as 3-4 |
+| 3 | `scripts/review_isolation.py` | `SCAN_PASSES_IMM = ("A","B","C","D")`, pass B relocated into `scan_readable_set()`'s pruned walk with the per-class vocabulary, pass-C size prefilter, NEG-5 pass/vocabulary selection, stale comment block deleted | **HARD** |
+| 4 | `scripts/final_review_eval.py` | `key_material_tokens()` + `scan_leak_text()` extracted next to `key_leak_tokens()` / `scan_leak()`; `scan_leak()` re-expressed over `scan_leak_text()` so there is one authority for "what counts as key material". **No CLI change.** | same commit as 3 |
+| 5 | `scripts/test_review_isolation.py` | T-8.4b (assertion corrected), T-8.4c, T-8.4d, T-8.4e, T-8.4f, T-9.5, plus two in-place test corrections — **see `## DESIGN iteration 5`'s Testing Strategy, which is the authority** | **HARD**, same commit as 3-4 |
 | 6 | `orca-worker-reviewer-orchestration/tools/run_logging.py` | mirror of 1 — `cmp` with `scripts/run_logging.py` must stay byte-identical, as the existing gate requires | same commit as 1 |
 | 7 | *§7 baseline re-capture* | re-run per the amended B-1′…B-7 once 1-6 are green | after 1-6 |
 
-No documentation file changes. `CHANGELOG.md` is untouched: the schema version does not move and
-the CLI flag is additive within the same MINOR. `SKILL.md` §9's description of the export is
-unchanged.
+No documentation file changes. `CHANGELOG.md` is untouched: the schema version does not move, no
+CLI surface changes (iteration 5 withdraws iteration 4's proposed flag), and no reader-visible field
+is added or renamed. `SKILL.md` §9's description of the export is unchanged.
 
 ---
 
@@ -2022,9 +2024,9 @@ row.
 
 | id | asserts |
 |---|---|
-| **T-8.4b** | *Pass C survives the reduced IMM pass set.* `scan_readable_set(key, root, passes=SCAN_PASSES_IMM)` over a fixture root containing a byte-identical copy of the answer key under an unrelated basename (`libfoo.dat`) returns exactly one hit, `pass == "C"`. This is the review's named gap, asserted directly: the same call with the shipped `("A", "D")` set returns zero hits, and the test says so in its docstring. |
+| **T-8.4b** | *Pass C survives the IMM pass set.* `scan_readable_set(key, root, passes=SCAN_PASSES_IMM)` over a fixture root containing a byte-identical copy of the answer key under an unrelated basename (`libfoo.dat`) returns **exactly one `pass == "C"` hit**. **Corrected in iteration 5:** the original wording said "exactly one hit" full stop, which mandatory pass B falsifies — a byte-identical copy of the key contains all of the key's prose, so pass B fires on it too. The test asserts the C hit by filtering on `pass`, and asserts the B hits are present as *corroboration*, which is the correct relationship between the two passes. The same call with the shipped `("A", "D")` set returns zero hits, and the test says so in its docstring. |
 | **T-8.4c** | *The size prefilter is an equivalence, not an approximation.* Over a fixture root holding (a) a byte-identical key copy, (b) a file of exactly the key's byte length whose content differs in one byte, and (c) a file with the key's content plus a trailing newline: `passes=("C",)` returns exactly one hit and it is (a). Asserts (b) is hashed and not a hit, and (c) is size-filtered out and not a hit — a file that is not byte-identical is not a hit under either implementation, which is what makes the two equivalent. |
-| **T-9.5** | *The NEG-5 contract, at the probe record.* Against the synthetic fixture, the NEG-5 record's `roots[]` has `passes == ["A", "C", "D"]` for every `class == "IMM"` entry and `["A", "B", "C", "D", "S"]` for every `class == "USR"` entry, and `imm_content_scan is False`. With `--scan-imm-content`, every IMM entry reads `["A", "B", "C", "D"]` and `imm_content_scan is True`. Darwin-only, skipped with an explicit reason elsewhere, like the rest of T-9. |
+| **T-9.5** | *The NEG-5 contract, at the probe record.* Against the synthetic fixture, the NEG-5 record's `roots[]` has `passes == ["A", "B", "C", "D"]` and `vocabulary == "key_material"` for every `class == "IMM"` entry, and `passes == ["A", "B", "C", "D", "S"]` with `vocabulary == "key_leak"` for every `class == "USR"` entry, and every entry carries an integer `content_scanned`. Asserts there is **no** `imm_content_scan` field and **no** `--scan-imm-content` option on the `isolate` parser — the regression guard against reintroducing a default-off content gate. Darwin-only, skipped with an explicit reason elsewhere, like the rest of T-9. **The authoritative statement of this test is `## DESIGN iteration 5`'s Testing Strategy.** |
 
 **Unchanged and still required:** T-7.1, T-7.2, T-7.5…T-7.7, T-7.10…T-7.12; T-8.1…T-8.11 (T-8.4's
 existing pass A/B/C/D assertions still run with the full USR pass set); T-9.1…T-9.4, T-9.6…T-9.9;
@@ -2049,12 +2051,13 @@ gate, exactly as before.
   the direction H.1 mandates, and no such input is known after a 400,000-trial search — but a first
   occurrence would show up as a bundle with `content_omitted_reason: "redaction_residue"` rather
   than as a leak, and should be investigated as a policy bug under RK-7(c).
-* **RK-12 (new).** Pass B is not run over Class IMM roots. What that gives up is detection of a
-  *non-byte-identical* rendering of key material inside an OS-owned, run-user-unwritable subtree —
-  reachable only by a privileged writer, which G.1 excludes and which
-  `ISOLATION.json.limitations[]` already discloses. `--scan-imm-content` discharges it on demand
-  and records that it did. This is a decision, not an omission, and D-4.2 states its cost
-  (26.85 GB per capture) and its alternatives.
+* **RK-12 — rewritten in iteration 5.** Iteration 4's RK-12 recorded "pass B is not run over Class
+  IMM roots" as an accepted residual. That residual is **closed**: pass B is mandatory over every
+  admitted root. What replaces it is a narrower and differently-shaped risk, stated in full as
+  **RK-14** in `## DESIGN iteration 5`: pass B's *vocabulary* over a Class IMM root is the key's
+  content vocabulary rather than its full leak vocabulary, because the full one is measurably not a
+  gate over an OS tree (40 vendor-file hits under `/usr` alone). RK-12 as iteration 4 wrote it no
+  longer describes anything this design does.
 * **RK-13 (new, small).** `SCAN_PASSES_NAME_ONLY` is removed rather than aliased. Any out-of-tree
   caller breaks loudly at import. That is intended: the name asserts "name-only", the new pass set
   is not name-only, and a silently-wrong name is how F-001 was defended for an iteration.
@@ -2062,11 +2065,621 @@ gate, exactly as before.
   at "under 20 s in total"; IMPLEMENTATION.md F-102 measured ~3.5 minutes on this host (`/System`
   210 s), and my own walk timings are consistent with that order. The *mechanism* G.3.2 specifies
   is unchanged and correct; only the constant was wrong, and no design decision in this document
-  rested on it — including D-4.2, which is decided on the 26.85 GB of pass-B reads, not on the
-  proof's cost.
+  rested on it. **Iteration 5 supersedes the constant again, upward:** with pass B mandatory over
+  Class IMM the proof is no longer the dominant cost of a capture, and D-5.1 carries the measured
+  end-to-end figure. No decision rests on that constant either — D-5.1 is decided on soundness, and
+  its cost is reported rather than traded against.
 * **O-1, O-2, O-3 stand unchanged.** O-1 (the `orca` CLI's behaviour from inside the sandbox)
   remains undischarged and is still a blocking pre-flight assertion for the Step 7 capture; O-2 (a
   shared agent state directory) is the one place where in-scope key material could reach a
-  `--allow-read` root, and that root is Class USR and gets the full pass set, so D-4.2 does not
-  touch it.
+  `--allow-read` root, and that root is Class USR and gets the full pass set **and the full
+  `key_leak_tokens()` vocabulary**, so neither D-4.2 nor D-5.1 touches it.
 * **RK-1…RK-6, RK-8…RK-10 stand unchanged.**
+
+---
+
+## DESIGN iteration 5 — correction for the NEG-5 Class IMM gap
+
+STATUS: COMPLETE
+
+### Summary / Requirements
+
+The DESIGN review's **F-001** is upheld in full, and this iteration closes it.
+
+| review finding | disposition |
+|---|---|
+| The default Class IMM NEG-5 pass set (A/C/D, with pass B available only through an optional, default-off `--scan-imm-content`) does not prove an admitted readable IMM root clean of pre-existing answer-key material. | **Upheld. Pass B is now mandatory over every admitted root, IMM and USR alike, by default and with no flag.** `--scan-imm-content` is withdrawn — not turned into a no-op — so the design and the CLI cannot disagree. |
+| G.3.3 lines ~465-468 ("there is nothing a scan could find that the proof allows to exist") contradict lines ~481-482 ("the proof … says nothing about what is *already there*"). | **Upheld. Reconciled to one statement**, stated once and repeated nowhere in a weaker form: the recursive proof establishes *current write incapability* and nothing else. |
+| G.3.3's "Bounding" paragraph says every escaping symlink is a hit, next to a pass-S row that is Class-USR-only. | **Upheld. Rewritten** to match the pass-S contract exactly, with the reason the two classes settle the case differently stated at the point of the claim. |
+
+The reviewer's Required Action offered two ways to close the gap. This iteration takes the first —
+*require pass B for every admitted IMM root in a qualifying baseline* — and delivers it. **One thing
+about it could not be delivered literally, and the reason is a measurement, not a preference:** pass
+B's *predicate*, run verbatim over an OS tree, is not a gate. It is not the 26 GB of reads that
+stops it; it is that `key_leak_tokens()` fires **40 times under `/usr` alone**, across 36 vendor files —
+the OS dictionary, `/usr/bin/man`, a dozen man pages, a zsh completion script, a Korean tokenizer
+table — none of which contains any answer-key material. A hit is a hard failure with no `--ignore`, and the design's
+prescribed remedies ("remove the copy", "stop allowing that root") are not available for
+`/usr/share/dict/web2`. Shipping pass B verbatim over Class IMM would therefore make **every §7
+baseline capture fail**, which is a G2 defect, not a stricter gate.
+
+So pass B is mandatory over Class IMM — the pass, its exhaustiveness over files, its
+hard-failure posture and its default-on status are all exactly what the reviewer asked for — and
+the single thing that is per class is its **vocabulary**: Class IMM matches the key's *content*
+vocabulary rather than the fixture's *label* vocabulary. §A and §B below measure both halves of
+that, and D-5.1 states the soundness argument and the residual.
+
+What this iteration changes, and nothing else:
+
+* **D-G**: S3's definition (both classes are content-scanned now), G.3.3's pass-B row, G.3.3's
+  "not content-scanned" paragraph, G.3.3's iteration-4 paragraph, G.3.3's "Bounding" paragraph,
+  G.9's NEG-5 row, RK-2's label. G.9's NEG-5 row also gets one **accuracy** correction, unrelated
+  to the pass set and explained in §D′: "from inside the sandbox" did not describe the code.
+* **D-4.2**: superseded in place by **D-5.1**, with its reasoning retained as the record and its
+  proposed flag withdrawn. Pass C's size prefilter and pass S's Class-USR-only scope, the two
+  parts of D-4.2 that survive, are unchanged.
+* **New**: `key_material_tokens()` and `scan_leak_text()` in `final_review_eval.py`; T-8.4d,
+  T-8.4e, T-8.4f; RK-14, RK-15. RK-12 is rewritten; T-9.5 is rewritten.
+
+What this iteration does **not** touch, restated so a re-review does not have to re-derive it:
+
+* **D-H.2 and RK-7.** Both were confirmed sound and implementation-ready by the same review. Not a
+  character of D-4.1, `_residual_matches_are_self_output()`, T-7.13, T-7.14, RK-7 or RK-11 is
+  changed here.
+* **Iteration 2's F-001 fix** — `prove_immutable()` I-1…I-6, the carve-outs, the removal of
+  `/private/var` and `/Library`, the closed metadata traversal set, NEG-7, NEG-8, T-9.9.
+* **Iteration 3's F-002 fix** — the single-authority D-I. `COMPATIBILITY.md` is not touched and
+  `ISOLATION.json.limitations[]` keeps its single entry with its existing wording.
+* The bundle schema (`2.0`), the five redaction categories, the exit-code table, the profile clause
+  order and text, the session layout, the readable-set *membership* rules, the baseline procedure's
+  steps.
+
+---
+
+### Current Architecture
+
+Everything below was re-derived on this host against the code as it stands at `19753f6`. Nothing is
+taken from a previous iteration's report.
+
+#### A. What pass B does over a Class IMM root, measured
+
+Pass B is `scan_leak(key, [root])`: for every file, normalise whitespace, casefold, then report a
+hit for **any** of `key_leak_tokens(key)` present as a substring, plus a hit if either
+`_EXPECTED_COUNT` regex matches. Against the shipped fixture that vocabulary is **723 tokens**.
+
+Ran it, verbatim, over `/usr` with the root's three carve-outs pruned:
+
+```text
+/usr: files=17,953  bytes=1.67 GB  decoded=11,027  undecodable=6,926  hits=40
+```
+
+All 40 are false — 40 hit records across 36 distinct files. Counted from the run's own output, not
+estimated:
+
+| hits | token | where |
+|---:|---|---|
+| 20 | `sd-1` … `sd-5` (all five) | `sd-2` × 11 (`/usr/bin/man`, `whatis`, `manpath`, `apropos`, `locate.mklocatedb`, `bc.1`, `dc.1`, `tmux.vim`, `_composer`, …), `sd-3` × 4, `sd-4` × 2, `sd-5` × 2 (`/usr/bin/par.pl`), `sd-1` × 1 (`/usr/share/man/man1/time.1`) |
+| 8 | `seeded` | `/usr/share/dict/web2`, `/usr/share/dict/web2a`, `/usr/share/cracklib/pw_dict.pwd`, `dc.1`, `zshparam.1`, … — an ordinary English word, and one of those files is literally the system dictionary |
+| 1 | `정답` | `/usr/share/tokenizer/ko/dicrc` — a vendor Korean tokenizer dictionary |
+| 11 | *(no token)* | `_EXPECTED_COUNT` / `_EXPECTED_COUNT_REVERSE` firing on ordinary prose: `nohup.1`, `perlguts.1`, `perl5201delta.1`, `perl5301delta.1`, `comm.n`, `vi_diff.txt`, `version9.txt`, … |
+
+Zero hits came from `answer_key`, `answer key`, `seeded_defect`, `seeded defect`, `expected
+finding`, `expected_finding_count`, `시드`, the `fixture_id`, any `archetype`, or any prose shingle.
+
+Every one of those tokens is drawn from `FIXED_LEAK_MARKERS` or from a `seeded_defects[].id`, or is
+the natural-language count heuristic. **Not one hit came from a `fixture_id`, an `archetype`, or a
+prose shingle.**
+
+Re-running with the label half removed then surfaced one more collision of exactly the same kind, in
+a root `/usr`'s size does not reach:
+
+```text
+/Library/Developer/CommandLineTools/SDKs/MacOSX15.2.sdk/System/Library/Frameworks/
+  AVFoundation.framework/Versions/A/Headers/AVContentKeySession.h
+    "…a persistable content key cannot be used to answer key requests during later playback…"
+```
+
+`answer key` is a `FIXED_LEAK_MARKERS` entry and it is also an ordinary English verb-plus-noun. That
+one hit is why D-5.1's rule below is **structural** — *keep the identifier forms, drop the
+natural-language forms* — rather than a list of three hand-picked words. `answer_key`,
+`seeded_defect` and `expected_finding_count` cannot appear in English prose by accident; `answer
+key`, `seeded defect`, `expected finding`, `seeded`, `정답` and `시드` measurably can.
+
+That asymmetry is not luck, it is what the two halves of the vocabulary *are*.
+`key_leak_tokens()` answers *"does this file bear any trace of the fixture?"* — the right question
+for a materialised review workspace, where any trace is bleed, and where the low-entropy half costs
+nothing because the tree is small and derived. Over 398,241 vendor files it is the wrong question,
+and its low-entropy half answers it wrongly 40 times in the smallest of the three big roots — the
+one that holds 1.67 GB of the 26.25 GB admitted.
+
+#### B. Why pass B cannot be delegated to `scan_leak()` for a Class IMM root
+
+This is a second, independent defect in "just run pass B over Class IMM", and it is a correctness
+defect rather than a precision one.
+
+`scan_leak(key, targets)` takes no carve-out parameter — deliberately, and `scan_readable_set()`'s
+own comment says why it is safe: *"that is right for a Class USR root — which is the only class that
+runs pass B, and which never has a carve-out. A carve-out only ever arises inside a Class IMM
+root."* The NEG-5 loop computes `root_carve_outs` per root and threads it into `scan_readable_set()`
+precisely because passes A/C/D must not descend into them; pass B, being delegated, ignores it.
+
+The carve-out that matters is `MANDATORY_CARVE_OUTS = ("/System/Volumes",)`.
+`/System/Volumes/Data` is a mount point of the writable data volume nested inside the sealed system
+volume and is **not** a symlink, so a carve-out-blind walk of `/System` descends through it into the
+entire data volume — the repository, and `scripts/fixtures/final_review_eval/key/answer_key.json`
+itself. `review_isolation.py`'s own NEG-5 comment already names this outcome: *"wrong in the loud
+direction: /System/Volumes/Data re-exposes the entire data volume, so the rescan reports every
+answer-key copy anywhere on the machine as a hit while the sandboxed process cannot reach a single
+one of them."* The existing test
+`test_a_carved_out_subtree_is_not_scanned_because_it_is_not_readable` documents the same constraint
+in an inline comment.
+
+So pass B over a Class IMM root has to be **driven by the same carve-out-pruned walk** as A/C/D. It
+cannot be a delegated `rglob`.
+
+#### C. What the recursive immutability proof establishes — stated once
+
+`prove_immutable()`'s I-1…I-6 is a statement about **write capability**: *no unprivileged process
+can cause new readable content to appear anywhere in the subtree*, evaluated against the run user's
+privileges at session-build time. It is **not** a statement about existing content, because the
+proof never opens a file.
+
+Iteration 4 derived exactly this and wrote it down at §C of its own *Current Architecture*, and then
+G.3.3 still carried the older sentence *"there is nothing a scan could find that the proof allows to
+exist"* fourteen lines above it. That sentence is false and is now deleted. A pre-existing
+reformatted copy inside an admitted IMM root is an **initial-state condition**: it needs no
+malicious operator, no privileged writer during the review, and no classification bug. It is
+therefore *not* covered by the privileged-writer boundary G.1 excludes, which is the ground D-4.2
+leaned on hardest — and that is precisely why F-001 is upheld.
+
+#### D′. What NEG-5 actually is, since D-5.1 leans on it
+
+One accuracy correction, made because this iteration's argument depends on it rather than as a
+re-opening of settled work. G.9's NEG-5 row said the rescan is *"re-run from inside the sandbox"*.
+It is not: `run_probes()` executes in the parent process (`review_isolation.py:1196`), and only
+NEG-2 / NEG-3 / NEG-4 spawn sandboxed subprocesses via `_command_probe()`. NEG-5 calls
+`scan_readable_set()` in-process, once per entry of `readable["entries"]`, with each root's
+carve-outs pruned.
+
+What NEG-5's independence actually rests on — and this is unchanged and still sufficient — is that
+it scans the **computed** readable set, after classification, rather than the candidate list. A root
+wrongly classified as IMM is still scanned by NEG-5, with the IMM pass set, and a planted copy in it
+is still a hit. That is the property F-001 needed and it does not require a sandbox. G.9's row is
+corrected to say so; no behaviour changes.
+
+#### D. `rglob` versus `os.walk(followlinks=False)`, re-derived rather than assumed
+
+Relocating pass B into the walk changes which symlinks it reads, so the difference was measured on
+this interpreter (Python 3.11.8) against a temp tree holding a real directory, a symlink to an
+outside directory, and a symlink to an outside file:
+
+```text
+rglob("*")                  -> ['linkdir', 'linkfile.txt', 'real', 'real/a.txt']
+rglob("*") + is_file()      -> ['linkfile.txt', 'real/a.txt']
+os.walk(followlinks=False)  -> ('.', ['real','linkdir'], ['linkfile.txt']), ('real', [], ['a.txt'])
+```
+
+Two facts, both relevant:
+
+1. **Neither** recurses into a symlinked directory (`linkdir` is listed, nothing under it is). So
+   relocating pass B loses no *directory* coverage.
+2. `rglob` + `is_file()` **does** yield a symlink-to-a-file, and `scan_leak()` therefore reads its
+   target. `scan_readable_set()`'s walk `continue`s on `os.path.islink(entry)`, so the relocated
+   pass B does not.
+
+Fact 2 is a real behavioural delta and is stated rather than glossed: **an escaping
+symlink-to-a-file inside a Class USR root used to be caught by pass S *and* pass B; after this
+change it is caught by pass S only.** No coverage is lost — pass S is a hard failure on the same
+terms — and a link that stays inside the root points at a file the walk reads directly. For a Class
+IMM root pass S does not run and the *profile* is the evidence, as G.3.3's pass-S row states.
+
+#### E. What a mandatory pass B costs, measured end to end
+
+Walking every admitted IMM root with carve-outs pruned, opening every regular file, decoding as
+UTF-8, normalising and matching:
+
+| root | regular files | bytes | decoded as UTF-8 | undecodable (skipped) | hits | elapsed |
+|---|---:|---:|---:|---:|---:|---:|
+| `/usr` (3 carve-outs pruned) | 17,953 | 1.67 GB | 11,027 | 6,926 | 0 | 117.6 s |
+| `/Library/Developer/CommandLineTools` | 98,658 | 5.87 GB | 94,472 | 4,186 | 3 | **1,953.9 s** |
+| `/System` (8 carve-outs pruned) | 281,314 | 18.69 GB | 77,256 | 204,058 | 0 | 683.0 s |
+| `/private/etc` | 227 | 0.7 MB | 214 | 13 | 0 | 3.1 s |
+| `/bin` | 37 | 6 MB | 0 | 37 | 0 | < 0.1 s |
+| `/sbin` | 52 | 6 MB | 0 | 52 | 0 | < 0.1 s |
+| `/private/var/select` | 0 | 0 | 0 | 0 | 0 | < 0.1 s |
+| **total** | **398,241** | **26.25 GB** | **182,969** | **215,272** | **3** | **2,757.7 s ≈ 46 min** |
+
+Four things in that table are load-bearing, and none of them is the total:
+
+1. **The three hits are all `answer key`, all in `AVContentKeySession.h`, in three SDK copies.** That
+   run used the 715-token intermediate vocabulary, before §A's third collision forced the
+   identifier-form rule. `key_material_tokens()` as D-5.1 finally defines it is a **strict subset**
+   of what was measured — it removes exactly `answer key`, `seeded defect` and `expected finding` —
+   so its hit count over every admitted IMM root on this host is **zero**, by subset, without a
+   re-run. Stated that way rather than as a measured zero, because it is the former.
+2. **Cost tracks *decodable* bytes, not total bytes.** `/System` is 3.2× CommandLineTools' bytes and
+   costs a third as much, because 204,058 of its 281,314 files fail UTF-8 decode in their first
+   bytes and are skipped. CommandLineTools is 96% decodable (SDK headers, `.tbd` files, sources) and
+   is 71% of the whole run's time on its own.
+3. **Memory is bounded and small.** Peak RSS over the whole run was 51 MB, and the largest single
+   decoded file was 24.5 MB
+   (`/System/Library/PrivateFrameworks/DocumentUnderstanding.framework/.../l4-smolberto.nlembedding`).
+   Reading whole files is not a memory hazard at this scale, so no streaming/chunking mechanism is
+   introduced — one less thing that could silently change the predicate.
+4. **`/bin` and `/sbin` decode zero files.** A root can be admitted, walked, and contribute nothing
+   to pass B — which is the normal case for a pure-binary tree, and worth knowing before someone
+   reads a zero as a bug.
+
+For scale, the same host's immutability proof over the same roots is IMPLEMENTATION.md F-102's ~3.5
+minutes. **A mandatory pass B is now the dominant cost of a capture by roughly 13×**, and a §7
+capture goes from minutes to the better part of an hour. That is reported here, not traded against: this design has held throughout that a
+correction may cost readability or time and may never cost safety, and a §7 baseline capture is
+taken once per remediation run, not per dispatch.
+
+NEG-5's scan runs **in process**, inside `run_negative_probes()`; the `timeout=` arguments in
+`review_isolation.py` all belong to `subprocess.run()` calls for the sandboxed command probes, so
+there is no timeout for this work to breach.
+
+---
+
+### Proposed Design
+
+#### Decision D-5.1 — pass B is mandatory over every admitted root; the only per-class difference is its vocabulary
+
+| class | passes | pass-B vocabulary | count heuristics |
+|---|---|---|---|
+| **USR** | **A, B, C, D, S** | `key_leak_tokens()` — 723 tokens, unchanged | **yes**, unchanged |
+| **IMM** | **A, B, C, D** | `key_material_tokens()` — 712 tokens | **no** |
+
+Three properties define the decision, and each is the answer to one of the review's points:
+
+1. **Pass B is not optional, not flagged, and not default-off.** `--scan-imm-content` is withdrawn
+   and `SCAN_PASSES_IMM_CONTENT` is never created. A content-cleanliness gate the default capture
+   does not run is not a gate, and the §7 baseline is taken with the default.
+2. **Pass B is exhaustive over files in both classes.** Every regular file the pruned walk reaches
+   is opened and tested. There is no size cap, no extension filter, no type gate and no sampling —
+   each of which would be a real weakening, unlike the vocabulary difference below.
+3. **The vocabulary is per class, and that is the whole of the difference.** Same walk, same
+   normalisation, same hard-failure posture, same absence of an `--ignore`.
+
+##### `key_material_tokens()` — the definition
+
+```python
+def _is_identifier_form(marker: str) -> bool:
+    """True for `answer_key`, false for `answer key`, `seeded`, `정답`.
+
+    The whole rule, and it is deliberately mechanical rather than a curated list: a
+    marker spelled as an identifier cannot occur in running prose by accident, and a
+    marker spelled as a word or a phrase measurably can. `/usr/share/dict/web2` contains
+    `seeded`; `/usr/share/tokenizer/ko/dicrc` contains `정답`; AVFoundation's
+    `AVContentKeySession.h` contains "used to answer key requests". See DESIGN D-5.1 sec A.
+    """
+    return "_" in marker
+
+
+def _key_tokens(key: dict, *, include_labels: bool) -> set[str]:
+    """One construction, two questions. See DESIGN D-5.1.
+
+    include_labels=True  -> key_leak_tokens():     "does this file bear ANY trace of the fixture?"
+    include_labels=False -> key_material_tokens(): "is this file a RENDERING of the key?"
+    """
+    tokens = {
+        marker.casefold()
+        for marker in FIXED_LEAK_MARKERS
+        if include_labels or _is_identifier_form(marker)
+    }
+    fixture_id = key.get("fixture_id")
+    if isinstance(fixture_id, str) and fixture_id:
+        tokens.add(fixture_id.casefold())
+    for entry in key.get("seeded_defects", []):
+        if include_labels and entry.get("id"):
+            tokens.add(str(entry["id"]).casefold())
+        if entry.get("archetype"):
+            tokens.add(str(entry["archetype"]).casefold())
+        for field in ("summary", "negative_space_argument"):
+            text = entry.get(field) or ""
+            tokens.update(shingle.casefold() for shingle in _shingles(" ".join(text.split())))
+    return {token for token in tokens if token}
+
+
+def key_leak_tokens(key: dict) -> set[str]:
+    return _key_tokens(key, include_labels=True)
+
+
+def key_material_tokens(key: dict) -> set[str]:
+    return _key_tokens(key, include_labels=False)
+```
+
+Deriving both from one construction is the point: `key_material_tokens(key) ⊆ key_leak_tokens(key)`
+holds **structurally**, not by inspection, so a sixth marker or a new key field added tomorrow
+cannot make the IMM vocabulary drift into something the USR vocabulary does not contain. T-8.4f
+asserts the containment and the exact difference.
+
+Against the shipped fixture the difference is exactly eleven tokens — the six
+natural-language markers `{answer key, seeded defect, expected finding, seeded, 정답, 시드}` and the
+five defect ids `{sd-1 … sd-5}`, 723 → 712 — plus the two count heuristics, which pass B skips for
+Class IMM. The three identifier markers `answer_key`, `seeded_defect` and `expected_finding_count`
+are **kept**, and `expected_finding_count` is a real substring of a real top-level key field
+(`expected_finding_count_is_not_a_contract`).
+
+##### What the IMM vocabulary catches
+
+> **Claim.** Let *F* be any file whose content is derived from the answer key by reformatting,
+> excerpting or quoting, and which reproduces **either** one `seeded_defects[].archetype` **or**
+> six consecutive words of one `summary` / `negative_space_argument` (`_shingles()` uses `size=6`). Then pass B over a Class IMM
+> root flags *F*.
+>
+> **Why.** Archetypes and six-word shingles are members of `key_material_tokens()` verbatim, and
+> matching happens after `" ".join(text.split()).casefold()` — the same normalisation on both
+> sides. Re-indentation, re-wrapping, JSON pretty-printing and case changes are therefore all
+> irrelevant to the match, which is exactly the class of transformation the review named. A
+> *partial* copy is caught as soon as it retains one such field.
+
+That is the review's counterexample, closed: *"a reformatted/partial copy, excerpt, or quoted
+fragment under an unrelated filename"* carries the key's prose, and the key's prose is what this
+vocabulary is made of. It is caught for the same reason pass C catches a byte-identical copy under
+an unrelated filename — the test is on content, and the filename is not consulted.
+
+**Verified, not asserted.** Built the three plants T-8.4d specifies — `vendor.dat` holding
+`json.dumps(key, indent=4, ensure_ascii=False)`, `notes.log` holding one
+`negative_space_argument` re-wrapped at 40 columns, `chat.txt` holding one `summary` quoted with
+`> ` markers inside unrelated prose — under unrelated basenames in a scratch root, then ran the real
+`scan_readable_set()` and the proposed vocabulary over it:
+
+```text
+scan_readable_set(key, root, passes=("A","C","D"))   ->  hits = []          <- the review's gap
+key_material_tokens(key)  vs  key_leak_tokens(key)   ->  712 vs 723, proper subset
+  difference = ['answer key','expected finding','sd-1','sd-2','sd-3','sd-4','sd-5',
+                'seeded','seeded defect','시드','정답']                      <- exactly the rule
+pass B [key_material]  vendor.dat  ->  711 token hits
+pass B [key_material]  notes.log   ->  127 token hits
+pass B [key_material]  chat.txt    ->   11 token hits                        <- all three caught
+```
+
+Iteration 4's pass set finds **nothing** in any of the three; the mandatory pass B finds all three,
+by margins of two orders of magnitude rather than by a single lucky token. The eleven-token
+difference computed from the running code is exactly the six natural-language markers plus the five
+defect ids — the identifier-form rule, confirmed against the real fixture rather than assumed.
+
+##### What it does not catch, stated as a bounded residual (RK-14)
+
+A file whose **entire** overlap with the key is the eleven excluded tokens — no archetype, no prose
+shingle, no `fixture_id`, and none of the three retained identifier markers (`answer_key`,
+`seeded_defect`, `expected_finding_count`). Such a file carries no answer-key content: `sd-1` is a
+two-character local label, and `seeded` / `정답` / `시드` / `answer key` / `seeded defect` /
+`expected finding` are ordinary words and phrases that this host demonstrably ships inside vendor
+files. The one real datum reachable through them alone is the *number* of seeded defects, and a
+document stating that number in a form a reviewer could use would have to say what was being
+counted. This is RK-14, and it applies only to Class IMM — vendor-owned, run-user-unwritable trees. Every root where the fixture's own artifacts can plausibly appear
+(`review_root`, `tmp`, `home`, every `--allow-read` root, including O-2's shared agent state
+directory) is Class USR and keeps the full 723-token vocabulary **and** the count heuristics.
+
+##### Rejected alternatives
+
+**Run `key_leak_tokens()` verbatim over Class IMM.** This is the reviewer's Required Action read
+literally, and it is what this iteration set out to do. Rejected on measurement, not on preference:
+40 false hits under `/usr` alone, on files a hard-failure gate offers no remedy for, so every §7
+capture fails and the design ships a G2 defect instead of a stricter gate. §A has the paths.
+
+**Carve out the vendor files that hit.** The design already provides carve-outs as the remedy for an
+unwanted path, and 40 paths could be carved from `/usr`. Rejected: that is an `--ignore` list in a
+carve-out costume — per host, re-derived after every OS update, and growing silently. The design
+removed `--ignore` for exactly this reason, and a gate whose exception list is measured rather than
+principled proves nothing about the next host.
+
+**Cap pass B by file size, extension or type.** Rejected outright. Unlike the vocabulary
+difference, each of these leaves a *placement* that defeats the gate: a key copy appended to a large
+file, renamed to `.dylib`, or stored with a byte that fails UTF-8 strict decode at offset zero.
+Pass B's exhaustiveness over files is not negotiable, and it is what makes the cost in §E
+irreducible.
+
+**Keep the `sd-N` ids as a conjunctive signal** — flag a file that contains *every*
+`seeded_defects[].id`. This would close RK-14 at essentially zero marginal cost, and it is the first
+thing to reach for if RK-14 ever needs closing. Rejected **for this iteration** because it is a new
+hard-failure predicate whose false-positive rate over all 398,241 vendor files has not been
+measured, and the one lesson §A teaches is that shipping an unmeasured hard-failure gate over an OS
+tree is how you get a capture that can never pass. The partial evidence is encouraging and is
+recorded so the next iteration does not start from zero: across `/usr`, the largest number of
+*distinct* defect ids in any single vendor file is **three**
+(`/usr/share/zsh/5.9/functions/_composer` holds `sd-2`, `sd-3`, `sd-4`), so a conjunction over all
+five would not have fired there. That is one root, not three, which is exactly why it is not shipped
+here.
+
+#### Decision D-5.2 — the two internal contradictions, reconciled
+
+Both are corrected **in place** in G.3.3, so a reader of the normative text never meets the
+contradiction and then a footnote resolving it.
+
+1. **What the proof establishes.** The clause *"so there is nothing a scan could find that the proof
+   allows to exist"* is **deleted**. In its place G.3.3 now says, once: Class IMM roots *are*
+   content-scanned; the scan simply runs at NEG-5 rather than twice per capture; and the proof
+   establishes current write incapability and nothing about pre-existing content, because it never
+   opens a file. The paragraph beginning *"The immutability proof is not a substitute for that scan
+   and is nowhere offered as one"* is the single authority, and §C above is its derivation. S3's
+   row in G.1 is updated to match — both classes are content-scanned, and the immutability proof is
+   what makes the IMM scan *durable* rather than what replaces it.
+2. **Symlink bounding.** The blanket sentence *"every symlink encountered whose realpath escapes the
+   root is itself a hit"* is **replaced** by a statement scoped exactly like the pass-S row it sits
+   under: an escaping symlink is a hit under **pass S, which runs for Class USR only**; for Class
+   IMM the profile is the evidence, because seatbelt evaluates the resolved target. The same
+   paragraph now also states why refusing to follow symlinks costs no content coverage in either
+   class, which is the fact §D measured and which the relocation of pass B makes load-bearing.
+
+---
+
+### Components / Interfaces / Data Flow
+
+No new module, no new dependency, no schema version change, no exit-code change, no profile-clause
+change, no CLI option added or removed, no `ISOLATION.json` field removed or renamed.
+
+**`scripts/final_review_eval.py`**
+
+| symbol | change |
+|---|---|
+| `_is_identifier_form(marker)` | **new**, `return "_" in marker`. Its docstring names the three measured collisions (`/usr/share/dict/web2` for `seeded`, `/usr/share/tokenizer/ko/dicrc` for `정답`, `AVContentKeySession.h` for `answer key`) so the next reader does not re-derive why the natural-language markers are separated. A mechanical rule, not a curated list: a marker added to `FIXED_LEAK_MARKERS` tomorrow is classified on the day it is added. |
+| `_key_tokens(key, *, include_labels)` | **new**, the single construction above. `include_labels=False` keeps only the identifier-form entries of `FIXED_LEAK_MARKERS` and drops every `seeded_defects[].id`. |
+| `key_leak_tokens()` | **behaviour unchanged**; re-expressed as `_key_tokens(key, include_labels=True)`. The existing docstring is kept verbatim — it is still the right description of this function. |
+| `key_material_tokens()` | **new**, `_key_tokens(key, include_labels=False)`. |
+| `scan_leak_text(path, text, tokens, *, count_heuristics=True)` | **new**, the per-file body lifted out of `scan_leak()` unchanged: normalise, casefold, report every token present, then at most one expected-count hit. Returns the same `{path, token}` / `{path, expected_count_statement}` records. |
+| `scan_leak()` | **behaviour unchanged**; its per-file body becomes a call to `scan_leak_text(path, raw, tokens)` with `count_heuristics=True`. It keeps its `rglob`, its `__pycache__` skip, its `(OSError, UnicodeDecodeError)` skip, and its deliberate absence of an exclusion parameter. Every existing caller — `materialize`'s workspace check included — is untouched. |
+
+**`scripts/review_isolation.py`**
+
+| symbol | change |
+|---|---|
+| `SCAN_PASSES_ALL` | unchanged: `("A", "B", "C", "D", "S")` |
+| `SCAN_PASSES_NAME_ONLY` | **renamed** `SCAN_PASSES_IMM`, value **`("A", "B", "C", "D")`**. Removed, not aliased: the old name asserted "name-only" and the value is not name-only. |
+| `SCAN_PASSES_IMM_CONTENT` | **not created** (D-4.2's proposal, withdrawn). |
+| `scan_readable_set()` | gains `vocabulary: str = "key_leak"` (the other value is `"key_material"`). Pass B moves **into the existing walk**: before the walk, `b_tokens = final_review_eval.key_leak_tokens(key)` or `key_material_tokens(key)` per `vocabulary`, computed once; inside the file loop, after the symlink `continue` and before pass C's prefilter, skip when `"__pycache__" in entry.parts` (matching `scan_leak`), then `entry.read_text(encoding="utf-8")` under `except (OSError, UnicodeDecodeError): pass` (matching `scan_leak`), then extend `hits` with `{"pass": "B", **hit}` for each `scan_leak_text(entry, text, b_tokens, count_heuristics=(vocabulary == "key_leak"))` record. The trailing `if "B" in passes: for hit in final_review_eval.scan_leak(key, [root])` block is **deleted**, and so is the comment above it that justified delegating. Pass C's size prefilter is unchanged. `counters` gains `"content_scanned"` — the number of files pass B actually opened and decoded. `hits` is sorted by `(pass, path)` before return, so the record is stable now that B's hits interleave with A/C/D's instead of being appended after them. |
+| `run_negative_probes()` | the NEG-5 loop selects `SCAN_PASSES_ALL` + `vocabulary="key_leak"` for Class USR and `SCAN_PASSES_IMM` + `vocabulary="key_material"` for Class IMM. Each `rescan_detail[]` entry gains `"vocabulary"` and `"content_scanned"` beside its existing `path` / `class` / `passes` / `carve_outs` / `hits`. The comment block at `review_isolation.py:1315-1330` is rewritten: lines 1318-1319 are the duplicated sentence, and lines 1321-1330 state the claim D-5.1 refutes. |
+| `build_parser()` | **no change.** |
+
+**Data flow.** `ISOLATION.json`'s `readable_set[]` entries keep `scanned: false` for Class IMM.
+That field describes the **session-build-time** scan, which this iteration does not change, and
+T-8.7's assertion on it stands as written. It is not in tension with S3's corrected wording, and the
+reason is visible in the same document: S3's content leg is discharged for Class IMM at **NEG-5**,
+and the NEG-5 probe record is where the from-inside-the-sandbox pass set, vocabulary and
+`content_scanned` count are reported. A reader holding one `ISOLATION.json` sees both — `scanned:
+false` meaning *not at build time*, and `probes[NEG-5].roots[].content_scanned` giving the number of
+files the mandatory pass actually opened (182,969 of the 398,241 regular files walked on this host; the remaining 215,272 fail UTF-8 decode and are skipped exactly as `scan_leak()` already skips them). Neither field can be read as the
+whole answer on its own, which is why both are kept.
+
+**And NEG-5 is fail-closed, which is what makes relying on it sound.** `isolate` collects the probe
+list and, at `review_isolation.py:1795-1798`, raises `IsolationError` for any probe whose result is
+not `PASS` / `UNENFORCED` / `SKIP`. A pass-B hit inside a Class IMM root therefore aborts the
+session build; it does not land as a `FAIL` line in an attestation that is written anyway.
+
+---
+
+### Error Handling / Compatibility
+
+* **Exit codes: unchanged, and verified rather than assumed.** A pass-B hit inside a Class IMM root
+  raises `IsolationError` at `review_isolation.py:1798`, which `final_review_eval.py:1313-1315`
+  maps to `EXIT_LEAK_OR_FIXTURE == 4`. Same code, same printed path, still no `--ignore`.
+* **No CLI surface changes.** `--scan-imm-content` is not added. `isolate`'s option set is
+  byte-for-byte what ships today, so no invocation, script or document needs editing.
+* **`ISOLATION.json` gains two additive fields** inside the NEG-5 probe record's `roots[]`
+  (`vocabulary`, `content_scanned`) and removes none. No consumer reads that record positionally,
+  and the bundle schema stays `2.0`: the isolation attestation is not the bundle.
+* **Two additive fields do not need a `limitations[]` entry** — they narrow the limitation rather
+  than widening it. The single existing entry is unchanged, and D-4.2's residual that would have
+  needed a second one is closed rather than disclosed.
+* **The failure mode that matters is a false hit, and it fails closed.** If a vendor file on some
+  other host does contain a key archetype or a six-word run of the key's prose, that capture
+  fails at exit 4 with the path printed, and the operator narrows the root or drops it. That is the
+  same remedy every other pass offers, and it is the direction this design has consistently chosen.
+* **The reverse failure — an unreadable or undecodable file — is treated exactly as `scan_leak()`
+  already treats it:** `OSError` and `UnicodeDecodeError` skip the file. This is unchanged
+  behaviour, and it is bounded by the other passes: a file pass B cannot decode is still walked by
+  pass A, still size-compared and hashed by pass C, and still index-listed by pass D if it is an
+  archive.
+* **Wall-clock.** A capture's NEG-5 goes from a walk to a measured **2,757.7 s (~46 minutes)** on this host, 71% of it in `/Library/Developer/CommandLineTools` alone. §7's baseline procedure has no
+  step timeout that this breaches, and `review_isolation.py`'s `timeout=` arguments all belong to
+  `subprocess.run()` calls for the sandboxed command probes. B-6's operator-facing description
+  should say the capture takes minutes, which is a wording change to a runbook, not a design change.
+* **`COMPATIBILITY.md` is not touched.** D-I stands exactly as iteration 3 settled it. RK-10's
+  observation about D-I's "exhaustively scanned" wording is **improved** by this iteration rather
+  than disturbed: the readable set is now closer to that wording than it was, never further.
+
+---
+
+### Expected Changed Files / Implementation Steps
+
+Steps 1, 2 and 6 (D-H) are unchanged from iteration 4 and are restated only so the commit plan is
+readable end to end.
+
+| # | file | change | hard? |
+|---|---|---|---|
+| 1 | `scripts/run_logging.py` | D-H.2 — `_residual_matches_are_self_output()`; `safe_embedded_text()` step 2; docstring correction. **Unchanged by iteration 5.** | **HARD** |
+| 2 | `scripts/test_run_logging.py` | T-7.3 / T-7.4 / T-7.8 / T-7.9 / T-7.13 / T-7.14. **Unchanged by iteration 5.** | **HARD**, same commit as 1 |
+| 3 | `scripts/review_isolation.py` | `SCAN_PASSES_IMM = ("A","B","C","D")`; pass B relocated into the pruned walk with the per-class vocabulary; `vocabulary` parameter; `content_scanned` counter; hits sorted by `(pass, path)`; NEG-5 pass/vocabulary selection and record fields; the `1315-1330` comment block rewritten | **HARD** |
+| 4 | `scripts/final_review_eval.py` | `_is_identifier_form()`, `_key_tokens()`, `key_material_tokens()`, `scan_leak_text()`; `key_leak_tokens()` and `scan_leak()` re-expressed over them with behaviour unchanged. **No CLI change.** | **HARD**, same commit as 3 |
+| 5 | `scripts/test_review_isolation.py` | T-8.4b (**assertion corrected**, see below), T-8.4c (unchanged), **T-8.4d, T-8.4e, T-8.4f (new)**, T-9.5 (rewritten), and the two in-place corrections below | **HARD**, same commit as 3-4 |
+| 6 | `orca-worker-reviewer-orchestration/tools/run_logging.py` | mirror of 1 — `cmp` with `scripts/run_logging.py` must stay byte-identical | same commit as 1 |
+| 7 | *§7 baseline re-capture* | re-run per the amended B-1′…B-7 once 1-6 are green, allowing for the new capture duration | after 1-6 |
+
+`CHANGELOG.md`, `SKILL.md` and `COMPATIBILITY.md` are untouched: no schema version moves, no CLI
+option is added or removed, and no reader-visible bundle field changes.
+
+---
+
+### Testing Strategy
+
+**Corrected in place, in `scripts/test_review_isolation.py`:**
+
+| existing test | correction |
+|---|---|
+| `test_an_escaping_symlink_is_not_a_hit_for_a_proven_immutable_root` | `SCAN_PASSES_NAME_ONLY` → `SCAN_PASSES_IMM`, and its two closing assertions become `assertIn("S", SCAN_PASSES_ALL)` / `assertNotIn("S", SCAN_PASSES_IMM)`. It must keep passing **with pass B in the IMM set**, which is exactly §D's fact 2 asserted as behaviour: the walk does not follow the link, so the escaping symlink yields neither an S hit nor a B hit for Class IMM. |
+| `test_a_carved_out_subtree_is_not_scanned_because_it_is_not_readable` | switch to `SCAN_PASSES_IMM` and **delete the inline comment** *"(Pass B is `scan_leak()`, which has no exclusion parameter by design and is therefore never run over a root that has one.)"* — it is the assumption §B refutes. Strengthened: plant the key's **prose**, not only `answer_key.json`, under the carved subtree, so the test now proves the carve-out prunes **pass B** and not merely pass A. This is the regression guard for §B. |
+| `test_t84_pass_b_catches_a_key_shingle` | unchanged assertion, but it now exercises the walk-driven pass B. |
+| **T-8.4b** (iteration 4's own new test, corrected before it is written) | Its stated assertion was *"returns exactly one hit, `pass == \"C\"`"*. **Mandatory pass B falsifies the "exactly one" half**: a byte-identical copy of the answer key contains every archetype and every prose shingle, so pass B fires on `libfoo.dat` as well. The assertion becomes *exactly one hit whose `pass == "C"`*, plus a positive assertion that pass-B hits on the same path are present — the two passes corroborating each other is the correct relationship, and asserting "one hit total" would have been asserting that pass B does not work. The `("A","D")`-returns-zero half of the test is unchanged. Caught here rather than at IMPLEMENTATION time, which is the point of writing the assertion out in the design. |
+
+**New, in `scripts/test_review_isolation.py`:**
+
+| id | asserts |
+|---|---|
+| **T-8.4d** | *The review's F-001 counterexample, closed.* Over a fixture root, plant three files under unrelated basenames, none named like the fixture and none byte-identical to the key: (a) `vendor.dat` holding `json.dumps(key, indent=4, ensure_ascii=False)` — a **reformatted** copy (byte-identical to nothing, so pass C cannot see it); (b) `notes.log` holding a single `seeded_defects[0]["negative_space_argument"]` re-wrapped at 40 columns — a **partial excerpt**; (c) `chat.txt` holding one `summary` embedded in unrelated prose with `> ` quote markers — a **quoted fragment**. With `passes=SCAN_PASSES_IMM, vocabulary="key_material"`, **each of the three is a pass-B hit**. The test then asserts the same three files produce **zero** hits under iteration 4's `("A", "C", "D")`, and says so in its docstring: this is the gap the DESIGN review named, reproduced and closed. |
+| **T-8.4e** | *The IMM vocabulary is specific, not merely smaller.* Over a fixture root holding a file that contains only the eleven excluded tokens, plus the literal sentence from `AVContentKeySession.h` ("a persistable content key cannot be used to answer key requests"), plus one sentence shaped like `_EXPECTED_COUNT` ("you should find three defects"), `vocabulary="key_material"` returns **zero** hits while `vocabulary="key_leak"` returns hits — the measured `/usr` situation reduced to a unit test, so a future contributor who "simplifies" the two vocabularies back into one fails here with the reason in front of them. Asserts in the same test that a file containing one `archetype` **is** a hit under both. |
+| **T-8.4f** | *The two vocabularies cannot drift apart.* `key_material_tokens(key) < key_leak_tokens(key)` (proper subset), and the difference is exactly `{m for m in FIXED_LEAK_MARKERS if "_" not in m} ∪ {entry["id"].casefold() for entry in key["seeded_defects"]}` — computed from `FIXED_LEAK_MARKERS` and from the key, not hard-coded to eleven strings, so the assertion survives a fixture with more defects or a sixth marker. Asserts `count_heuristics` is off for `"key_material"` and on for `"key_leak"` by calling `scan_leak_text()` directly with each. |
+| **T-9.5** *(rewritten)* | *The NEG-5 contract, at the probe record.* Against the synthetic fixture, every `class == "IMM"` entry has `passes == ["A","B","C","D"]` and `vocabulary == "key_material"`; every `class == "USR"` entry has `passes == ["A","B","C","D","S"]` and `vocabulary == "key_leak"`; every entry carries an integer `content_scanned`. Asserts there is **no** `imm_content_scan` field and **no** `--scan-imm-content` option on the `isolate` parser — the regression guard against reintroducing a default-off content gate. Darwin-only, skipped with an explicit reason elsewhere, like the rest of T-9. |
+
+**New, in `scripts/test_final_review_eval.py`** (the module that already owns `scan_leak`'s tests):
+
+| id | asserts |
+|---|---|
+| **T-8.4g** | *The refactor is behaviour-preserving.* For the shipped fixture and for a synthetic tree containing one file per hit shape (token hit, expected-count hit, clean, undecodable, `__pycache__`), `scan_leak(key, [tree])` returns records equal to the pre-refactor implementation's — same paths, same tokens, same at-most-one expected-count record per file, same ordering. This is what licenses "behaviour unchanged" in the Components table rather than leaving it as an assertion. |
+
+**Unchanged and still required:** T-7.1…T-7.14; T-8.1…T-8.11 including T-8.4c;
+T-9.1…T-9.4, T-9.6…T-9.9; T-10; NEG-0…NEG-8. `python3 -m unittest discover -s scripts -p
+'test_*.py'`, `validate_skills.py`, `verify_package.py`, and the `cmp` of the two `run_logging.py`
+copies are the gate, exactly as before.
+
+---
+
+### Risks / Open Issues
+
+* **RK-14 (new).** Pass B's Class IMM vocabulary excludes eleven tokens — the six
+  natural-language `FIXED_LEAK_MARKERS` and the five `seeded_defects[].id`s — and the two
+  natural-language count heuristics, so a file inside a vendor-owned, run-user-unwritable subtree
+  whose *entire* overlap with the key is the eleven excluded tokens (`answer key`, `seeded defect`,
+  `expected finding`, `seeded`, `정답`, `시드`, `sd-1`…`sd-5`) — no archetype, no prose shingle, no
+  `fixture_id`, none of the three retained identifier markers — is not flagged. Such a
+  file carries no answer-key content beyond, at most, the number of seeded defects. **Why the
+  exclusion is not optional:** the alternative is measured to produce 40 false hard failures under
+  `/usr` alone (§A), which is a capture that can never pass. **What would close it:** the
+  conjunctive-id rule of D-5.1's rejected alternatives, once someone measures its false-positive
+  rate over all admitted IMM roots on more than this one host. **Where it does not apply:** every
+  Class USR root, which keeps the full 723-token vocabulary and the count heuristics — including
+  O-2's shared agent state directory, the one place in-scope key material could plausibly reach an
+  admitted root.
+* **RK-15 (new).** A capture now costs a measured ~46 minutes instead of a walk, and the cost scales with the
+  bytes under the admitted IMM roots, which is a property of the host's OS install rather than of
+  this repository. A host with a much larger `/System` pays proportionally more. Nothing about the
+  design bounds it, and nothing should: the alternatives that would bound it (size caps, extension
+  filters, sampling) are each a placement the gate would then miss. The mitigation is procedural —
+  §7's baseline is captured once per remediation run — and `content_scanned` in the NEG-5 record
+  makes the actual per-capture work visible instead of estimated. **The constant, unlike the
+  predicate, is IMPLEMENTATION's to improve.** §E's figure comes from the straightforward form —
+  normalise each file, then match — and is dominated by *decodable* bytes rather than by total
+  bytes, which is why `/usr` (mostly binaries that fail UTF-8 decode in the first few bytes) is
+  cheap per gigabyte and the SDK trees are not. A single-pass matcher over the normalised text is
+  free to be substituted as long as the hit set is unchanged; T-8.4d/e/f and T-8.4g are what pin
+  the hit set, so such a change is checkable rather than a matter of trust. The concrete candidate,
+  named so the next person does not have to find it: intersect the *file's* 6-word shingle set with
+  the key's, which turns 712 substring scans per file into one pass of set lookups. It is **not**
+  adopted here because it is not obviously hit-set-equivalent at the margins — `token in haystack`
+  is a substring test and a shingle-set intersection is a word-boundary test, and they differ on a
+  key shingle embedded inside longer words. Proving or bounding that difference is the work; doing
+  it silently is not.
+* **RK-12 — rewritten**, see the risk table in `## DESIGN iteration 4`: its residual is closed and
+  replaced by RK-14.
+* **RK-13 stands** and is now doubly true: `SCAN_PASSES_NAME_ONLY` is removed rather than aliased,
+  and its value changed twice (`("A","D")` → `("A","C","D")` → `("A","B","C","D")`). An out-of-tree
+  caller must break loudly at import rather than silently scan less than the current contract.
+* **RK-11, RK-7, RK-1…RK-10 stand unchanged.** RK-2's *label* is corrected (Class IMM roots are
+  content-scanned now); its mechanism column, which is about the immutability proof, is untouched.
+* **O-1, O-2, O-3 stand unchanged.** O-1 (the `orca` CLI's behaviour from inside the sandbox)
+  remains undischarged and is still a blocking pre-flight assertion for the Step 7 capture.
+* **Not reopened, deliberately:** D-H.2, D-4.1, RK-7, D-I, `COMPATIBILITY.md`,
+  `ISOLATION.json.limitations[]`, the readable-set membership rules, and every iteration-2 and
+  iteration-3 decision. The review confirmed the first two sound; the rest are outside F-001.
