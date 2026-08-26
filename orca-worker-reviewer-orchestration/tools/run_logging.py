@@ -860,7 +860,13 @@ class RunTimingTracker:
 
 FINAL_REVIEW_AUDIT_SCHEMA_VERSION = "1.0"
 FINAL_REVIEW_REDACTION_POLICY_VERSION = "redaction/1.1"
-FINAL_REVIEW_EXPORT_SCHEMA_VERSION = "1.0"
+# 2.0, not 1.1: `orchestrator_log.content` is GONE and `orchestrator_log.digest` is
+# renamed, both of which break a reader that has not been updated. The rename is the
+# point -- leaving `content` in place with new (sanitized) semantics would let an
+# unchanged reader keep reading a key whose meaning changed, which is the more
+# dangerous option. A bundle is fully re-derivable from immutable records, so an old
+# bundle is REGENERATED, never migrated; a consumer accepts 2.x and refuses 1.x/3.x.
+FINAL_REVIEW_EXPORT_SCHEMA_VERSION = "2.0"
 
 FINAL_REVIEW_AUDIT_DIRNAME = "final_review_audit"
 # A sibling of the published directories, INSIDE final_review_audit/, so staging and
@@ -1155,6 +1161,88 @@ def redact_text(
         if hits:
             counts.append({"category": name, "count": hits})
     return out, tuple(counts)
+
+
+# ---- D-H: the one gate every string embedded in the evidence bundle passes --------
+# The rule, stated once, and it is the exporter's whole posture:
+#
+#   No text enters FINAL_REVIEW_EVIDENCE_BUNDLE.json that has not been proved
+#   residue-free under the current redaction policy. Text that cannot be made
+#   residue-free is OMITTED with a stated reason and a digest -- never embedded,
+#   and never silently truncated.
+#
+# Three consequences, all load-bearing:
+#   1. the authoritative local ORCHESTRATOR_LOG.md is opened read-only and is never
+#      rewritten; only the exported COPY is sanitized;
+#   2. sanitization is redact_text() itself, not a second policy -- a second copy of a
+#      redaction policy is precisely the drift R1 punished;
+#   3. residue is a hard stop for the affected VALUE, not for the export: the bundle is
+#      still written, still lists every attempt, and says which content it withheld and
+#      why. Reporting beats denying, exactly as the digest-mismatch path already does.
+
+# Closed vocabulary, the same discipline REDACTION_CATEGORIES and
+# FINAL_REVIEW_RETAINED_PATH_FIELDS already use: a reason absent from this tuple is not
+# a reason, and that is visible here rather than inferred from an assembly expression.
+EMBED_OMISSION_REASONS = (
+    "redaction_residue",
+    "table_structure_changed",
+    "unreadable",
+)
+
+
+def safe_embedded_text(
+    raw: str, *, redact: bool
+) -> tuple[str | None, tuple[dict[str, int], ...], str]:
+    """Return `(text_or_None, redactions, omission_reason)`.
+
+    `redact=True`  -- the source is NOT already a post-redaction artifact
+                      (ORCHESTRATOR_LOG.md). Apply redact_text() first.
+    `redact=False` -- the source IS a digest-bound post-redaction artifact
+                      (input.md / report.md). Re-redacting would break the recorded
+                      digest identity, so this path VERIFIES ONLY.
+
+    The residue check is a fixed point of the policy, and that is a CLOSED statement
+    over the policy's own categories rather than an inspection: category 5
+    (`foreign_absolute_path`) matches every absolute POSIX path with no minimum segment
+    count and replaces it whole, and category 4 owns the three home spellings, so a
+    fixed point means no absolute path, no `dcap_...`, no `scheme://user:pass@` and no
+    SECRET/TOKEN/PASSWORD/API_KEY-named assignment survived.
+
+    The fixed point is asserted on the TEXT (`again == candidate`), and that is the
+    whole of the security statement: a second pass that matched something and rewrote it
+    to different bytes breaks text equality, and a second pass that rewrote it to
+    IDENTICAL bytes removed nothing, because the only region a category can rewrite to
+    itself is a region that is already its own placeholder.
+
+    It is deliberately NOT additionally asserted that the second pass reports no
+    category at all. That would be strictly stronger, but this policy cannot satisfy it
+    and is not meant to: every category preserves a readable anchor on purpose --
+    `env_secret_pattern` keeps `KEY=` and its value class `[^\s\n]+` re-matches its own
+    `<REDACTED:env_secret_pattern>` output, and `url_credential` keeps `scheme://...@`
+    and re-matches likewise. Both rewrite to identical bytes, so both are counted on a
+    second pass while removing nothing. Requiring a zero count would omit the log from
+    every bundle that logged a secret-named assignment or a credentialed URL -- i.e.
+    exactly the bundles the sanitization exists for.
+
+    The structure check exists so that a FUTURE policy which introduced a newline or a
+    `|` into a placeholder fails loudly here instead of silently corrupting the
+    exported log table. It is applied only on the `redact=True` path, because that is
+    the only path that transforms anything.
+    """
+    if redact:
+        candidate, redactions = redact_text(raw)
+    else:
+        candidate, redactions = raw, ()
+    again, _second_pass_counts = redact_text(candidate)
+    if again != candidate:
+        return None, redactions, "redaction_residue"
+    if redact:
+        if candidate.count("\n") != raw.count("\n"):
+            return None, redactions, "table_structure_changed"
+        for before, after in zip(raw.splitlines(), candidate.splitlines()):
+            if before.count("|") != after.count("|"):
+                return None, redactions, "table_structure_changed"
+    return candidate, redactions, ""
 
 
 # ---- P-PATH: the safety property EVERY retained path-bearing field must satisfy ----
@@ -2363,7 +2451,26 @@ def read_final_review_attempt_provenance(
 # attempt's input, report, verdict or provenance.
 
 
-def _embedded_artifact(directory: Path, filename: str, recorded: Any, relative: str) -> dict:
+def _embedded_artifact(
+    directory: Path,
+    filename: str,
+    recorded: Any,
+    relative: str,
+    *,
+    redact: bool = False,
+) -> dict:
+    """One retained artifact, digest-checked and residue-checked before it is embedded.
+
+    `redact=False` is the normal case for input.md / report.md: they are ALREADY
+    post-redaction and their digests are bound to exactly these bytes, so re-redacting
+    would make `digest_verified` false for a clean artifact. The residue check runs
+    anyway -- a pass changes nothing, and a FAIL means a retained artifact written under
+    an older policy (or a policy bug) carries residue, in which case the content is
+    omitted with a reason while the digests are kept. Embedding known-residual content
+    ships the leak; aborting the export makes a legacy record permanently un-exportable
+    with no remedy that does not violate the record's immutability. Omission is the only
+    option that is simultaneously safe, non-destructive, and honest.
+    """
     path = directory / filename
     embedded: dict[str, Any] = {
         "path": f"{relative}/{filename}",
@@ -2371,18 +2478,27 @@ def _embedded_artifact(directory: Path, filename: str, recorded: Any, relative: 
         "digest_recomputed": None,
         "digest_verified": False,
         "content": None,
+        "content_omitted_reason": "",
+        "redaction_residue_detected": False,
     }
     if not path.exists():
+        embedded["content_omitted_reason"] = "unreadable"
         return embedded
     try:
         data = path.read_bytes()
     except OSError:
+        embedded["content_omitted_reason"] = "unreadable"
         return embedded
     embedded["digest_recomputed"] = sha256_bytes(data)
     embedded["digest_verified"] = bool(recorded) and recorded == embedded[
         "digest_recomputed"
     ]
-    embedded["content"] = data.decode("utf-8", errors="replace")
+    text, _redactions, reason = safe_embedded_text(
+        data.decode("utf-8", errors="replace"), redact=redact
+    )
+    embedded["content"] = text
+    embedded["content_omitted_reason"] = reason
+    embedded["redaction_residue_detected"] = reason == "redaction_residue"
     return embedded
 
 
@@ -2391,8 +2507,19 @@ def export_final_review_evidence(
 ) -> Path:
     """Write the self-contained evidence bundle. Opt-in; nothing calls it on a run.
 
-    Content is INLINED rather than referenced: a bundle a human attaches to a PR is
-    self-contained or it is not evidence. Every embedded artifact carries both the
+    THE RULE, and it governs every string this function writes:
+
+        No text enters FINAL_REVIEW_EVIDENCE_BUNDLE.json that has not been proved
+        residue-free under the current redaction policy. Text that cannot be made
+        residue-free is omitted with a stated reason and a digest, never embedded
+        and never silently truncated.
+
+    Content is INLINED rather than referenced -- a bundle a human attaches to a PR is
+    self-contained or it is not evidence -- but "inlined" has never meant "unfiltered",
+    and ORCHESTRATOR_LOG.md is the one source here that is not already a post-redaction
+    artifact. Its `detail` and `result` columns are free-form runtime strings, so it is
+    sanitized through safe_embedded_text(..., redact=True) on the way in and the raw
+    local file is left exactly as it was. Every embedded artifact carries both the
     digest recorded in the record and the digest recomputed from disk, plus the
     boolean -- and a mismatch does NOT abort the export, because a tamper or
     corruption event is exactly the thing an auditor needs to receive rather than be
@@ -2414,6 +2541,9 @@ def export_final_review_evidence(
         "digest_mismatches": [],
         "unreadable": [],
         "missing_artifacts": [],
+        # Every string the bundle DECLINED to embed, with the closed-vocabulary reason.
+        # An auditor reads this before believing the bundle is complete.
+        "omitted_content": [],
         "incomplete_publications": sweep_final_review_audit_staging(run_id, base=base),
     }
     for dispatch_key, directory in iter_final_review_audit_records(run_id, base=base):
@@ -2451,7 +2581,18 @@ def export_final_review_evidence(
         }
         for name in ("input", "report"):
             embedded = entry[name]
+            # "missing" keeps its original meaning -- the file was absent or unreadable.
+            # Content withheld because it failed the residue gate is a DIFFERENT fact
+            # and is reported as one; conflating them would let a leak-shaped omission
+            # read as a filesystem accident.
             if embedded["content"] is None:
+                integrity["omitted_content"].append(
+                    {
+                        "path": embedded["path"],
+                        "reason": embedded["content_omitted_reason"],
+                    }
+                )
+            if embedded["digest_recomputed"] is None:
                 integrity["missing_artifacts"].append(embedded["path"])
             elif embedded["digest_recorded"] and not embedded["digest_verified"]:
                 integrity["digest_mismatches"].append(
@@ -2481,12 +2622,49 @@ def export_final_review_evidence(
             group["violations"] = [{"code": "unattributable_records"}]
         serialized.append(group)
 
+    # The authoritative local log is opened READ-ONLY here and nowhere is it rewritten:
+    # its append-only lifecycle, its digests and its immutability are untouched. Only
+    # the copy that lands in the bundle is sanitized, and it is sanitized by the very
+    # same redact_text() every retained record already passes through.
     log_path = root / ORCHESTRATOR_LOG_FILENAME
-    log_content = ""
-    log_digest = None
+    log_relative = _relative_artifact_path(log_path, root)
+    log_object: dict[str, Any] = {
+        "path": log_relative,
+        "redaction_policy_version": FINAL_REVIEW_REDACTION_POLICY_VERSION,
+        "digest_pre_redaction": None,
+        "digest_post_redaction": None,
+        "redactions": [],
+        "content_redacted": None,
+        "content_omitted_reason": "unreadable",
+    }
     if log_path.exists():
-        log_content = log_path.read_text(encoding="utf-8")
-        log_digest = sha256_text(log_content)
+        try:
+            log_raw = log_path.read_text(encoding="utf-8")
+        except OSError:
+            log_raw = None
+        if log_raw is not None:
+            # digest_pre_redaction identifies WHICH log this is -- an auditor holding
+            # the local file recomputes it and compares. digest_post_redaction
+            # identifies the embedded bytes. redact_text() is a pure deterministic
+            # function of (text, policy_version), so
+            #   digest_post_redaction == sha256(redact_text(local file, <recorded>)[0])
+            # is a re-derivable equality, on any machine, at any time. That is the whole
+            # chain -- raw -> recorded policy -> embedded bytes -- with no unverifiable
+            # link, and it is what makes the sanitized-vs-original identity auditable.
+            log_object["digest_pre_redaction"] = sha256_text(log_raw)
+            text, redactions, reason = safe_embedded_text(log_raw, redact=True)
+            log_object["redactions"] = [dict(entry) for entry in redactions]
+            log_object["content_redacted"] = text
+            log_object["content_omitted_reason"] = reason
+            if text is not None:
+                log_object["digest_post_redaction"] = sha256_text(text)
+    if log_object["content_redacted"] is None:
+        integrity["omitted_content"].append(
+            {
+                "path": log_relative,
+                "reason": log_object["content_omitted_reason"],
+            }
+        )
     bundle = {
         "schema_version": FINAL_REVIEW_EXPORT_SCHEMA_VERSION,
         "bundle_kind": "final_review_evidence_bundle",
@@ -2497,11 +2675,7 @@ def export_final_review_evidence(
             "redaction_policy": FINAL_REVIEW_REDACTION_POLICY_VERSION,
             "export_schema": FINAL_REVIEW_EXPORT_SCHEMA_VERSION,
         },
-        "orchestrator_log": {
-            "path": _relative_artifact_path(log_path, root),
-            "digest": log_digest,
-            "content": log_content,
-        },
+        "orchestrator_log": log_object,
         "attempts": serialized,
         "integrity": integrity,
     }

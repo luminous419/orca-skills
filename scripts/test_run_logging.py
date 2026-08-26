@@ -3178,7 +3178,7 @@ class EvidenceBundleTests(_AuditTestCase):
             run_logging.FINAL_REVIEW_AUDIT_SCHEMA_VERSION,
         )
         self.assertIn(
-            "final_review_audit", bundle["orchestrator_log"]["content"]
+            "final_review_audit", bundle["orchestrator_log"]["content_redacted"]
         )
         dispatch = bundle["attempts"][0]["dispatches"][0]
         self.assertEqual(dispatch["record_status"], "ok")
@@ -3267,6 +3267,338 @@ class EvidenceBundleTests(_AuditTestCase):
                 self.assertIn(element.value, read_only)
         self.assertTrue(seen, "the git argv literals were not found at all")
 
+
+class BundleSanitizationTests(_AuditTestCase):
+    """T-7 (D-H): the exported bundle cannot carry what the redaction policy removes.
+
+    Every case here is a POSITIVE control plus a NEGATIVE control, in the same test:
+    the poisoned value provably reaches the raw local log (that is the leak the
+    unsanitized exporter shipped), and provably does not reach the bundle. An assertion
+    that only checks the bundle is clean cannot distinguish "sanitized" from "the value
+    never got there".
+    """
+
+    # Composed rather than written as a literal: release_manifest.py forbids a
+    # `/Users/<name>/` literal anywhere in the source tree, and this test exists
+    # precisely because such a path can appear at RUNTIME.
+    HOME_PREFIX = "/Users/"
+    POISON_USER = "poisoned-operator"
+
+    def home_rooted_poison(self) -> str:
+        return f"{self.HOME_PREFIX}{self.POISON_USER}/aiAssistedProjects/x"
+
+    def poison(self, **columns: str) -> str:
+        """Write one poisoned row and return the raw local log text.
+
+        Asserts the poison actually landed in the raw log first -- the positive control
+        for every negative assertion that follows.
+        """
+        run_logging.log_orchestrator_event(
+            self.RUN_ID, base=self.base, event="poisoned", **columns
+        )
+        raw = (self.root / ORCHESTRATOR_LOG_FILENAME).read_text(encoding="utf-8")
+        for value in columns.values():
+            self.assertIn(
+                value,
+                raw,
+                "positive control: the poison must reach the raw local log, or the "
+                "negative assertion below proves nothing",
+            )
+        return raw
+
+    def export(self) -> tuple[dict, str]:
+        path = run_logging.export_final_review_evidence(self.RUN_ID, base=self.base)
+        serialized = path.read_text(encoding="utf-8")
+        return json.loads(serialized), serialized
+
+    def assert_not_in_bundle(self, needle: str, serialized: str) -> None:
+        """The whole serialized bundle, not just the log object.
+
+        A leak that moved to another key is still a leak.
+        """
+        self.assertNotIn(needle, serialized)
+
+    def categories(self, bundle: dict) -> dict[str, int]:
+        return {
+            entry["category"]: entry["count"]
+            for entry in bundle["orchestrator_log"]["redactions"]
+        }
+
+    # -- T-7.1 .. T-7.5: one poisoned cell per redaction category --------------------
+
+    def test_t71_a_foreign_absolute_path_in_detail_never_reaches_the_bundle(self) -> None:
+        self.poison(detail="artifact at /Volumes/ext/build/out.md")
+
+        bundle, serialized = self.export()
+
+        self.assert_not_in_bundle("/Volumes/ext/build/out.md", serialized)
+        self.assertGreaterEqual(self.categories(bundle)["foreign_absolute_path"], 1)
+        self.assertIn(
+            run_logging.FOREIGN_PATH_PLACEHOLDER,
+            bundle["orchestrator_log"]["content_redacted"],
+        )
+
+    def test_t72_a_username_bearing_path_keeps_its_tail_and_loses_the_name(self) -> None:
+        self.poison(detail=self.home_rooted_poison())
+
+        bundle, serialized = self.export()
+
+        self.assert_not_in_bundle(f"{self.HOME_PREFIX}{self.POISON_USER}", serialized)
+        self.assertIn(
+            "/Users/<REDACTED:absolute_local_path>/aiAssistedProjects/x",
+            bundle["orchestrator_log"]["content_redacted"],
+        )
+
+    def test_t73_a_secret_named_assignment_in_result_never_reaches_the_bundle(self) -> None:
+        self.poison(result="GITHUB_TOKEN=ghp_deadbeefcafebabe0123")
+
+        bundle, serialized = self.export()
+
+        self.assert_not_in_bundle("ghp_deadbeefcafebabe0123", serialized)
+        self.assertGreaterEqual(self.categories(bundle)["env_secret_pattern"], 1)
+
+    def test_t74_a_url_credential_never_reaches_the_bundle(self) -> None:
+        self.poison(detail="https://user:hunter2@example.test/x")
+
+        bundle, serialized = self.export()
+
+        self.assert_not_in_bundle("hunter2", serialized)
+        self.assertGreaterEqual(self.categories(bundle)["url_credential"], 1)
+
+    def test_t75_a_dispatch_capability_never_reaches_the_bundle(self) -> None:
+        self.poison(detail="dcap_AAAABBBBCCCCDDDDEEEEFFFF")
+
+        bundle, serialized = self.export()
+
+        self.assert_not_in_bundle("dcap_AAAABBBBCCCCDDDDEEEEFFFF", serialized)
+        self.assertGreaterEqual(
+            self.categories(bundle)["orca_dispatch_capability"], 1
+        )
+
+    # -- T-7.6: the clean case is byte-identical, and says so ------------------------
+
+    def test_t76_a_clean_log_is_embedded_verbatim_with_no_redactions(self) -> None:
+        run_logging.log_orchestrator_event(
+            self.RUN_ID, base=self.base, event="clean", detail="nothing to see"
+        )
+        raw = (self.root / ORCHESTRATOR_LOG_FILENAME).read_text(encoding="utf-8")
+
+        bundle, _ = self.export()
+
+        log = bundle["orchestrator_log"]
+        self.assertEqual(log["redactions"], [])
+        self.assertEqual(log["content_redacted"], raw)
+        self.assertEqual(log["digest_post_redaction"], log["digest_pre_redaction"])
+        self.assertEqual(log["content_omitted_reason"], "")
+
+    # -- T-7.7: the identity relationship is re-derivable ----------------------------
+
+    def test_t77_both_digests_are_independently_recomputable(self) -> None:
+        raw = self.poison(
+            detail="/Volumes/ext/a", result="AWS_SECRET_ACCESS_KEY=zzz"
+        )
+
+        bundle, _ = self.export()
+
+        log = bundle["orchestrator_log"]
+        self.assertEqual(log["digest_pre_redaction"], run_logging.sha256_text(raw))
+        expected, _counts = run_logging.redact_text(
+            raw, policy_version=log["redaction_policy_version"]
+        )
+        self.assertEqual(
+            log["digest_post_redaction"], run_logging.sha256_text(expected)
+        )
+        self.assertEqual(log["content_redacted"], expected)
+
+    # -- T-7.8: the table survives sanitization ---------------------------------------
+
+    def test_t78_every_poisoned_case_keeps_the_table_structure(self) -> None:
+        poisons = (
+            {"detail": "artifact at /Volumes/ext/build/out.md"},
+            {"detail": self.home_rooted_poison()},
+            {"result": "GITHUB_TOKEN=ghp_deadbeefcafebabe0123"},
+            {"detail": "https://user:hunter2@example.test/x"},
+            {"detail": "dcap_AAAABBBBCCCCDDDDEEEEFFFF"},
+        )
+        for columns in poisons:
+            with self.subTest(columns=columns):
+                self.setUp()
+                try:
+                    raw = self.poison(**columns)
+                    bundle, _ = self.export()
+                    embedded = bundle["orchestrator_log"]["content_redacted"]
+                    self.assertIsNotNone(
+                        embedded,
+                        "a poisoned-but-sanitizable log must be EMBEDDED, not omitted",
+                    )
+                    self.assertEqual(raw.count("\n"), embedded.count("\n"))
+                    self.assertEqual(
+                        [line.count("|") for line in raw.splitlines()],
+                        [line.count("|") for line in embedded.splitlines()],
+                    )
+                finally:
+                    self.tearDown()
+
+    # -- T-7.9: residue is omitted, and the export still ships ------------------------
+
+    def test_t79_residual_text_is_omitted_with_a_reason_and_the_export_ships(self) -> None:
+        raw = self.poison(detail="/Volumes/ext/a")
+
+        def non_fixed_point(text, *, policy_version=None):
+            # A policy that keeps finding something to remove: the second pass differs
+            # from the first, which is exactly the residue signature.
+            return text + "!", ({"category": "foreign_absolute_path", "count": 1},)
+
+        with patch.object(run_logging, "redact_text", non_fixed_point):
+            path = run_logging.export_final_review_evidence(self.RUN_ID, base=self.base)
+
+        bundle = json.loads(path.read_text(encoding="utf-8"))
+        log = bundle["orchestrator_log"]
+        self.assertIsNone(log["content_redacted"])
+        self.assertEqual(log["content_omitted_reason"], "redaction_residue")
+        self.assertIn(log["content_omitted_reason"], run_logging.EMBED_OMISSION_REASONS)
+        self.assertEqual(log["digest_pre_redaction"], run_logging.sha256_text(raw))
+        self.assertIsNone(log["digest_post_redaction"])
+        self.assertIn(
+            {"path": ORCHESTRATOR_LOG_FILENAME, "reason": "redaction_residue"},
+            bundle["integrity"]["omitted_content"],
+        )
+        self.assertTrue(path.is_file(), "the export must still return a written path")
+
+    def test_t79b_a_structure_changing_policy_is_omitted_not_silently_shipped(self) -> None:
+        self.poison(detail="/Volumes/ext/a")
+
+        def pipe_eating(text, *, policy_version=None):
+            return text.replace("|", ""), ()
+
+        with patch.object(run_logging, "redact_text", pipe_eating):
+            path = run_logging.export_final_review_evidence(self.RUN_ID, base=self.base)
+
+        log = json.loads(path.read_text(encoding="utf-8"))["orchestrator_log"]
+        self.assertIsNone(log["content_redacted"])
+        self.assertEqual(log["content_omitted_reason"], "table_structure_changed")
+
+    # -- T-7.10: residue in a retained report is omitted, not embedded -----------------
+
+    def test_t710_residue_in_a_retained_report_is_omitted_with_digests_kept(self) -> None:
+        self.write_report(FAILING_REPORT)
+        published = self.write_record(
+            provenance_state="accepted", settlement_state="settled"
+        )
+        # A report written by a stub that bypassed redaction: the bytes on disk carry a
+        # raw foreign absolute path, which no current writer would produce.
+        residual = FAILING_REPORT + "\nsee /Volumes/ext/secret/report.md\n"
+        (published / "report.md").write_text(residual, encoding="utf-8")
+
+        bundle, serialized = self.export()
+
+        embedded = bundle["attempts"][0]["dispatches"][0]["report"]
+        self.assert_not_in_bundle("/Volumes/ext/secret/report.md", serialized)
+        self.assertIsNone(embedded["content"])
+        self.assertEqual(embedded["content_omitted_reason"], "redaction_residue")
+        self.assertTrue(embedded["redaction_residue_detected"])
+        self.assertIsNotNone(embedded["digest_recorded"])
+        self.assertEqual(
+            embedded["digest_recomputed"], run_logging.sha256_text(residual)
+        )
+        self.assertIn(
+            {"path": embedded["path"], "reason": "redaction_residue"},
+            bundle["integrity"]["omitted_content"],
+        )
+
+    def test_t710b_a_clean_retained_report_is_embedded_unchanged(self) -> None:
+        self.write_report(FAILING_REPORT)
+        self.write_record(provenance_state="accepted", settlement_state="settled")
+
+        bundle, _ = self.export()
+
+        embedded = bundle["attempts"][0]["dispatches"][0]["report"]
+        self.assertIn("RESULT: FAIL", embedded["content"])
+        self.assertEqual(embedded["content_omitted_reason"], "")
+        self.assertFalse(embedded["redaction_residue_detected"])
+        self.assertTrue(embedded["digest_verified"])
+
+    # -- T-7.11: the authoritative local log is never rewritten -------------------------
+
+    def test_t711_the_raw_local_log_is_byte_identical_after_the_export(self) -> None:
+        self.poison(detail="/Volumes/ext/a", result="GITHUB_TOKEN=ghp_zzzz1111")
+        log_path = self.root / ORCHESTRATOR_LOG_FILENAME
+        before = log_path.read_bytes()
+
+        self.export()
+
+        self.assertEqual(log_path.read_bytes(), before)
+        self.assertEqual(
+            run_logging.sha256_bytes(log_path.read_bytes()),
+            run_logging.sha256_bytes(before),
+        )
+        self.assertIn("/Volumes/ext/a", log_path.read_text(encoding="utf-8"))
+
+    # -- T-7.12: the schema break is visible ---------------------------------------------
+
+    def test_t712_the_export_schema_is_two_zero_and_content_is_gone(self) -> None:
+        self.poison(detail="/Volumes/ext/a")
+
+        bundle, _ = self.export()
+
+        self.assertEqual(bundle["schema_version"], "2.0")
+        self.assertEqual(bundle["component_versions"]["export_schema"], "2.0")
+        self.assertEqual(
+            run_logging.FINAL_REVIEW_EXPORT_SCHEMA_VERSION, "2.0"
+        )
+        self.assertNotIn("content", bundle["orchestrator_log"])
+        self.assertNotIn("digest", bundle["orchestrator_log"])
+        self.assertEqual(
+            bundle["orchestrator_log"]["redaction_policy_version"],
+            run_logging.FINAL_REVIEW_REDACTION_POLICY_VERSION,
+        )
+
+    # -- the gate itself, as a unit ------------------------------------------------------
+
+    def test_safe_embedded_text_verifies_without_transforming_when_redact_is_false(
+        self,
+    ) -> None:
+        clean = "| a | b |\n"
+        text, redactions, reason = run_logging.safe_embedded_text(clean, redact=False)
+        self.assertEqual(text, clean)
+        self.assertEqual(redactions, ())
+        self.assertEqual(reason, "")
+
+        dirty = "| a | /Volumes/ext/a |\n"
+        text, redactions, reason = run_logging.safe_embedded_text(dirty, redact=False)
+        self.assertIsNone(text)
+        self.assertEqual(redactions, ())
+        self.assertEqual(reason, "redaction_residue")
+
+    def test_safe_embedded_text_transforms_when_redact_is_true(self) -> None:
+        text, redactions, reason = run_logging.safe_embedded_text(
+            "| a | /Volumes/ext/a |\n", redact=True
+        )
+        self.assertEqual(
+            text, f"| a | {run_logging.FOREIGN_PATH_PLACEHOLDER} |\n"
+        )
+        self.assertEqual(
+            redactions, ({"category": "foreign_absolute_path", "count": 1},)
+        )
+        self.assertEqual(reason, "")
+
+    def test_the_omission_reason_vocabulary_is_closed(self) -> None:
+        self.assertEqual(
+            run_logging.EMBED_OMISSION_REASONS,
+            ("redaction_residue", "table_structure_changed", "unreadable"),
+        )
+
+    def test_a_missing_log_is_reported_as_unreadable_not_as_clean(self) -> None:
+        bundle, _ = self.export()
+
+        log = bundle["orchestrator_log"]
+        self.assertIsNone(log["content_redacted"])
+        self.assertIsNone(log["digest_pre_redaction"])
+        self.assertEqual(log["content_omitted_reason"], "unreadable")
+        self.assertIn(
+            {"path": ORCHESTRATOR_LOG_FILENAME, "reason": "unreadable"},
+            bundle["integrity"]["omitted_content"],
+        )
 
 class AuditCliTests(_AuditTestCase):
     """I-5: the three subcommands a live Coordinator actually calls."""
