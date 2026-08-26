@@ -60,6 +60,7 @@ import stat as stat_module
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -68,7 +69,7 @@ import run_logging
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-ISOLATION_SCHEMA_VERSION = "1.0"
+ISOLATION_SCHEMA_VERSION = "1.1"
 ISOLATION_DOCUMENT_KIND = "final_review_isolation_attestation"
 ISOLATION_FILENAME = "ISOLATION.json"
 REPATRIATED_ISOLATION_FILENAME = "FINAL_REVIEW_ISOLATION.json"
@@ -540,6 +541,14 @@ def scan_readable_set(
     whose target is inside the root is reached as a real file by the walk itself, and a
     link whose target is outside it is the target's own class's problem -- which is what
     pass S says for Class USR and what the profile says for Class IMM.
+
+    Only REGULAR files are ever opened (F-401). Passes B, C and D each open what the walk
+    hands them, and a walk over `/dev` -- a default Class IMM candidate -- hands them 459
+    character and block devices. `counters["non_regular"]` in THIS function's returned
+    record reports how many entries were counted and not opened, so the policy is a
+    measured number rather than an inference. (The NEG-5 probe record carries the
+    correlated `content_scanned` and not this counter; over `/dev` it reads 0, which is
+    the same fact from the other side.)
     """
     import tarfile
     import zipfile
@@ -552,7 +561,7 @@ def scan_readable_set(
     root = _realpath(root)
     carved = [_realpath(entry) for entry in carve_outs]
     hits: list[dict] = []
-    counters = {"files": 0, "archives": 0, "content_scanned": 0}
+    counters = {"files": 0, "archives": 0, "content_scanned": 0, "non_regular": 0}
     key_digest = _answer_key_digest(key) if "C" in passes else None
     key_size = _answer_key_size(key) if "C" in passes else None
     b_tokens = (
@@ -592,6 +601,31 @@ def scan_readable_set(
                 continue
             if "A" in passes and name == "answer_key.json":
                 hits.append({"pass": "A", "path": str(entry), "why": "answer_key.json"})
+            # F-401. The walk yields DIRECTORY ENTRIES, not regular files, and the three
+            # passes below all OPEN what they are handed. `/dev` is a default Class IMM
+            # candidate and 459 of its 462 entries are character or block devices: a
+            # `read_text()` on `/dev/zero` allocates 64 GB/s and never reaches EOF, which
+            # is what SIGKILLed the section 7 capture at 17m44s, and a `read_text()` on a
+            # FIFO simply never returns.
+            #
+            # So the policy is general and stated once, rather than a `/dev` special
+            # case: NOTHING under this walk is opened unless `lstat()` says it is a
+            # REGULAR file. That covers pass B (the finding as filed), pass C (whose size
+            # prefilter falls through to a full read whenever `lstat()` raises) and pass D
+            # (which hands the path to `tarfile`/`zipfile`, i.e. opens it too). A
+            # non-regular entry is still COUNTED, so `files` keeps its meaning and the
+            # entry is never silently absent from the record.
+            #
+            # This is also the general policy DESIGN's O-2 iteration depends on: the
+            # pre-flight's own agent writes into `<SESSION>/home`, the operator's real
+            # `$CODEX_HOME` contains a unix socket, and NEG-5 re-scans that root.
+            try:
+                is_regular = stat_module.S_ISREG(entry.lstat().st_mode)
+            except OSError:
+                is_regular = False
+            if not is_regular:
+                counters["non_regular"] += 1
+                continue
             if "D" in passes and name.endswith((".tar", ".tar.gz", ".tgz", ".zip")):
                 counters["archives"] += 1
                 hits.extend(_scan_archive_members(entry, tarfile, zipfile))
@@ -869,7 +903,7 @@ def render_seatbelt_profile(
 """
 
 
-def wrap_command(session: Path, command: str) -> str:
+def wrap_command(session: Path, command: str, agent_path: Sequence[str] = ()) -> str:
     """The launch line, and it is the one thing the negative test must not re-implement.
 
     `cd` first, `exec` second, and the order is not cosmetic: `git` inside the sandbox
@@ -883,6 +917,16 @@ def wrap_command(session: Path, command: str) -> str:
     `git --version` exits 0 while `git -C <repo> show HEAD:VERSION` still fails, which is
     exactly the pair of outcomes intended.
 
+    `PATH` joins them when -- and only when -- `--agent-path` was given (D-6.6). The
+    measured reason it is needed at all: the project's agent command is a wrapper that
+    `exec codex ...`, and THAT lookup happens inside the sandbox, where the host PATH names
+    `/opt/homebrew/bin` -- a directory whose every entry is a symlink escaping to
+    `Caskroom`/`Cellar`, i.e. 77 pass-S hits and a root the scanner is right to refuse.
+    The resolved directory is admissible; the PATH directory is not. Each entry here has
+    already been through `assert_agent_path_admitted()`, so PATH can never name a root the
+    readable set did not scan. With no `--agent-path` the launch line is byte-identical to
+    what it was before this parameter existed.
+
     They are part of the LAUNCH LINE rather than of `agent_command` for the reuse-gate
     reason the sandbox wrapper is: the gate compares the resolved role command, so
     wrapping must be applied at launch or every isolated dispatch looks like a different
@@ -892,8 +936,14 @@ def wrap_command(session: Path, command: str) -> str:
     tmp = shlex.quote(str(session / "tmp"))
     home = shlex.quote(str(session / "home"))
     profile = shlex.quote(str(session / "control" / PROFILE_FILENAME))
+    path = ""
+    if agent_path:
+        directories = [str(_realpath(entry)) for entry in agent_path]
+        path = "PATH=" + shlex.quote(
+            ":".join([*directories, "/usr/bin", "/bin", "/usr/sbin", "/sbin"])
+        ) + " "
     return (
-        f"cd {review_root} && TMPDIR={tmp} HOME={home} "
+        f"cd {review_root} && TMPDIR={tmp} HOME={home} {path}"
         f"exec {SANDBOX_EXEC} -f {profile} {command}"
     )
 
@@ -923,6 +973,751 @@ def discover_key_bearing_roots(fixture: Path) -> list[str]:
         if not any(_is_within(candidate, kept) for kept in minimal):
             minimal.append(candidate)
     return [str(entry) for entry in minimal]
+
+
+# ---- D-6 the session HOME seed -------------------------------------------------------
+#
+# O-2's credential/state provisioning, and F-403's blocking half: the isolated agent needs
+# a credential inside a WRITABLE, session-scoped state directory, and nothing could put
+# one there while the attestation still covered it.
+#
+# Two functions with a deliberately narrow interface between them, and the narrowness is
+# the fix rather than a style choice (DESIGN D-6.8, F-001): `read_seed_sources()` opens
+# each source EXACTLY ONCE through a component-by-component O_NOFOLLOW walk and decides
+# every content rule over the bytes it read from THAT descriptor; `place_seed_sources()`
+# is handed those bytes and no re-openable source pathname, so "no later step may
+# re-resolve the source" is a property a reader can check by reading one dataclass
+# instead of a rule someone has to remember.
+#
+# `shutil.copyfile()` and `sha256_path()` MUST NOT appear anywhere on this path.
+
+MAX_SEEDS = 8
+MAX_SEED_BYTES = 1024 * 1024
+MAX_SEED_TOTAL_BYTES = 4 * 1024 * 1024
+MAX_HOME_INVENTORY = 1024
+MAX_KEY_INODES = 4096
+
+SEED_POLICY_STATEMENT = (
+    "enumerated regular files only, copied by a fixed routine before the readable-set "
+    "scan; no pass is exempted and no flag disables a check"
+)
+
+SEED_DIGEST_LIMITATION = (
+    "A seeded file's seeded and observed digests are recorded, so a holder of this "
+    "attestation can test a GUESSED plaintext against them: a low-entropy secret (a "
+    "passphrase, a PIN) must not be seeded. This is a property of the secret, not "
+    "something this tool can measure, so it is stated rather than checked."
+)
+
+# The archive extensions S-6 refuses, and they are pass D's list rather than a second one:
+# pass D enumerates member NAMES and never reads a member, so an archive is the one file
+# type the battery certifies less completely than its content.
+SEED_ARCHIVE_SUFFIXES = (".tar", ".tar.gz", ".tgz", ".zip")
+
+# The destination component names D-2 refuses: a seed must not be able to construct a path
+# that LOOKS like fixture material to a later reader of the session or of the inventory.
+SEED_REFUSED_COMPONENTS = ("key", "adjudications", "subject")
+
+_NO_FOLLOW_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+# O_NONBLOCK is NOT decoration and is the one flag DESIGN D-6.8's list does not name --
+# see IMPLEMENTATION Finding F-501. S-1 is decided from `os.fstat(fd)`, so the refusal of
+# a FIFO cannot happen until the descriptor exists; and `os.open(<fifo>, O_RDONLY)` with
+# no writer BLOCKS FOREVER (measured on this host), so without this flag the FIFO is
+# refused only in unbounded time -- which is F-401's defect class at the seed door, and
+# exactly what D-6.8's own T-10.2 requires be bounded. With O_NONBLOCK the open returns
+# immediately, `fstat` says S_ISFIFO, and S-1 refuses it. It is a no-op on a regular
+# file, which is the only kind of source that reaches the read.
+_NO_FOLLOW_FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+
+
+class IsolationSeedGrammarError(final_review_eval.EvalInputError):
+    """A malformed `--seed` argument. Maps to EXIT_INPUT_ERROR (1), like every other
+    argument-grammar failure -- nothing is built, so there is nothing to remove."""
+
+
+@dataclass(frozen=True)
+class SeedSource:
+    """Phase 1's output, and it deliberately carries NO absolute source pathname.
+
+    `place_seed_sources()` is not given a value it could hand to `open()`, `stat()`,
+    `shutil.copyfile()` or `sha256_path()`, so the source cannot be re-resolved between
+    the decision and the copy. That is F-001's structural answer.
+    """
+
+    dest: str            # HOME-relative POSIX string, already D-1/D-2/D-4 validated
+    source: str          # ALREADY redacted through `_path_field()`
+    data: bytes          # the exact validated bytes, read from the one descriptor
+    sha256: str          # sha256_bytes(data) -- over the buffer, never sha256_path()
+
+
+@dataclass(frozen=True)
+class SeededRecord:
+    """The as-copied identity, written once by the routine that wrote the bytes.
+
+    Frozen because D-6.9's whole point is that nothing downstream -- `attest_seeds()`
+    least of all -- can recompute or overwrite what `place_seed_sources()` put there.
+    The observed identity is a separate group, filled in at attestation time.
+    """
+
+    dest: str            # session-relative, i.e. "home/<dest>"
+    source: str
+    seeded_bytes: int
+    seeded_sha256: str
+    seeded_mode: str
+
+
+def _assert_dir_fd_support() -> None:
+    """A loud refusal rather than a silent fallback to pathname operations.
+
+    The fallback IS F-001, so an unsupported platform must fail the command. Measured
+    present on this host and on Linux; absent on Windows, which `sandbox-exec` already
+    excludes.
+    """
+    missing = [
+        name
+        for name, function in (
+            ("os.open", os.open), ("os.mkdir", os.mkdir), ("os.stat", os.stat),
+        )
+        if function not in os.supports_dir_fd
+    ]
+    if missing:
+        raise IsolationError(
+            f"seeding requires dir_fd support for {missing}, which this platform does "
+            "not provide. There is deliberately no pathname fallback: re-resolving a "
+            "pathname between validation and copy is the defect the seed path exists "
+            "to make impossible."
+        )
+
+
+def _seed_components(absolute: str) -> tuple[str, ...]:
+    """The literal component sequence, with the grammar D-6.8 requires. Exit 1."""
+    if not absolute.startswith("/"):
+        raise IsolationSeedGrammarError(
+            f"--seed source must be an absolute path; got {absolute!r}"
+        )
+    parts = tuple(absolute.split("/")[1:])
+    for index, part in enumerate(parts):
+        if part in ("", ".", ".."):
+            raise IsolationSeedGrammarError(
+                f"--seed source {absolute!r} has an empty, '.' or '..' component at "
+                f"index {index}; a '..' would let the walk climb back above a directory "
+                "it had just proved, so `parts` would stop being the whole story"
+            )
+    return parts
+
+
+def _split_seed_pair(pair: str) -> tuple[str, str]:
+    """`<ABS_SOURCE>:<HOME_RELATIVE_DEST>`, exactly one colon. Exit 1 on the grammar."""
+    if pair.count(":") != 1:
+        raise IsolationSeedGrammarError(
+            f"--seed takes exactly one ':' separating an absolute source from a "
+            f"HOME-relative destination; got {pair!r}. A path containing a colon cannot "
+            "be seeded, which is the price of an unambiguous grammar."
+        )
+    source, _, dest = pair.partition(":")
+    if not dest:
+        raise IsolationSeedGrammarError(
+            f"--seed destination is empty in {pair!r}"
+        )
+    _seed_components(source)
+    return source, dest
+
+
+def _open_no_follow(abs_path: str) -> tuple[int, tuple[str, ...]]:
+    """One descriptor, obtained through a component-by-component O_NOFOLLOW walk.
+
+    A symlink component raises ELOOP and a non-directory component raises ENOTDIR; on the
+    FINAL component ELOOP *is* S-1's symlink refusal, enforced by the kernel in the same
+    call that obtains the descriptor rather than by an `lstat` on a pathname that could be
+    re-pointed afterwards. The walk holds at most two descriptors at a time.
+
+    Returns the descriptor and the literal component sequence the walk actually opened --
+    which is what S-3 and S-6 are then decided over, so lexical containment gives the same
+    answer a `realpath()` would have WITHOUT a second resolution that could observe a
+    different filesystem than the descriptor came from.
+    """
+    parts = _seed_components(abs_path)
+    dfd = os.open("/", _NO_FOLLOW_DIR_FLAGS)
+    try:
+        for index, part in enumerate(parts[:-1]):
+            try:
+                nxt = os.open(part, _NO_FOLLOW_DIR_FLAGS, dir_fd=dfd)
+            except OSError as error:
+                raise IsolationError(
+                    f"--seed source component {index} ({part!r}) is a symlink or not a "
+                    f"directory ({error.strerror}); the source is refused"
+                ) from error
+            os.close(dfd)
+            dfd = nxt
+        try:
+            fd = os.open(parts[-1], _NO_FOLLOW_FILE_FLAGS, dir_fd=dfd)
+        except OSError as error:
+            raise IsolationError(
+                f"--seed source {parts[-1]!r} could not be opened as a regular file "
+                f"without following a symlink ({error.strerror}); S-1 refuses it"
+            ) from error
+    finally:
+        os.close(dfd)
+    return fd, parts
+
+
+def _key_bearing_inodes(fixture: Path) -> set[tuple[int, int]]:
+    """S-8's bound: the identities a symlink-free walk cannot otherwise see.
+
+    A hard link has no symlink component and no distinguishing pathname, so a hard link to
+    key material planted outside every refused root survives both the walk and S-3. It
+    does not survive `(st_dev, st_ino)`.
+
+    Bounded to the fixture's own key-bearing material (`answer_key.json`, `key/` and
+    `adjudications/`) rather than to every root `discover_key_bearing_roots()` returns:
+    walking the whole repository checkout for inodes on every seeded run would be
+    unbounded. Measured on this host the set is 2 entries. A hard link to a repository
+    file OUTSIDE those subtrees is still caught by S-3 (path) and S-4 (content); S-8
+    strictly adds and claims no more.
+    """
+    candidates = [fixture / "key" / "answer_key.json"]
+    for root in (fixture / "key", fixture / "adjudications"):
+        if not root.is_dir():
+            continue
+        for dirpath, _dirnames, filenames in os.walk(root, followlinks=False):
+            candidates.extend(Path(dirpath) / name for name in filenames)
+    identities: set[tuple[int, int]] = set()
+    for path in candidates:
+        try:
+            st = path.lstat()
+        except OSError:
+            continue
+        if not stat_module.S_ISREG(st.st_mode):
+            continue
+        identities.add((st.st_dev, st.st_ino))
+        if len(identities) > MAX_KEY_INODES:
+            raise IsolationError(
+                f"the key-bearing inode set exceeds MAX_KEY_INODES ({MAX_KEY_INODES}); "
+                "seeding is refused rather than run against a truncated set"
+            )
+    return identities
+
+
+def _read_to_ceiling(fd: int, ceiling: int) -> bytes:
+    """Read to EOF with a hard ceiling, and the ceiling is what actually enforces S-2.
+
+    `st_size` is advisory -- it can change after it was sampled -- so the cap that binds
+    is the one over the bytes actually taken.
+    """
+    chunks: list[bytes] = []
+    taken = 0
+    while taken <= ceiling:
+        chunk = os.read(fd, min(65536, ceiling + 1 - taken))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        taken += len(chunk)
+    return b"".join(chunks)
+
+
+def read_seed_sources(
+    pairs: Sequence[str],
+    *,
+    key: dict,
+    fixture: Path,
+    repo_root: Path = REPO_ROOT,
+) -> tuple[SeedSource, ...]:
+    """Phase 1 (D-6.8). EVERY pair completes every check before phase 2 runs at all.
+
+    The buffer is the artefact: steps 5-10 below decide over `data`, phase 2 writes
+    `data`, and `seeded_sha256` digests `data`. Nothing reads the source a second time, so
+    there is no second value for the three to disagree about -- a source replaced,
+    truncated, deleted or turned into a symlink into the repository, the fixture or a
+    key-bearing root at ANY moment after step 5 changes nothing observable.
+
+    There is deliberately NO post-read `fstat` identity re-check: a file can be replaced
+    and restored between two `fstat`s, so that comparison cannot fail closed, and a check
+    that cannot fail closed is not a control.
+    """
+    pairs = tuple(pairs)
+    if not pairs:
+        return ()
+    _assert_dir_fd_support()
+    if len(pairs) > MAX_SEEDS:
+        raise IsolationError(
+            f"--seed may be given at most {MAX_SEEDS} times; got {len(pairs)}. More than "
+            "this is describing a directory copy, which S-1 refuses."
+        )
+
+    key_inodes = _key_bearing_inodes(fixture)
+    refused_roots = [
+        _realpath(repo_root),
+        _realpath(fixture),
+        *[_realpath(entry) for entry in discover_key_bearing_roots(fixture)],
+    ]
+    key_digest = _answer_key_digest(key)
+    tokens = final_review_eval.key_leak_tokens(key)
+
+    sources: list[SeedSource] = []
+    destinations: set[str] = set()
+    total = 0
+    for pair in pairs:
+        absolute, dest = _split_seed_pair(pair)                      # grammar, exit 1
+        fd, parts = _open_no_follow(absolute)                        # 1
+        try:
+            st = os.fstat(fd)
+            if not stat_module.S_ISREG(st.st_mode):                  # 2  S-1
+                raise IsolationError(
+                    f"--seed source {parts[-1]!r} is not a regular file (mode "
+                    f"{stat_module.filemode(st.st_mode)}); a directory, FIFO, socket, "
+                    "character or block device is never seeded"
+                )
+            if st.st_mode & 0o111:                                   # 3  S-5
+                raise IsolationError(
+                    f"--seed source {parts[-1]!r} is executable; a binary is never "
+                    "seeded. The agent's own executable reaches the session through "
+                    "--allow-read over its own scanned directory."
+                )
+            if st.st_size > MAX_SEED_BYTES:                          # 4  S-2 advisory
+                raise IsolationError(
+                    f"--seed source {parts[-1]!r} is {st.st_size} bytes, over the "
+                    f"{MAX_SEED_BYTES}-byte per-source cap"
+                )
+            data = _read_to_ceiling(fd, MAX_SEED_BYTES)              # 5  S-2 enforced
+            if len(data) > MAX_SEED_BYTES:
+                raise IsolationError(
+                    f"--seed source {parts[-1]!r} yielded more than {MAX_SEED_BYTES} "
+                    "bytes from the descriptor; the read ceiling, not the sampled "
+                    "st_size, is what binds"
+                )
+        finally:
+            os.close(fd)                                             # 12 (the close half)
+
+        total += len(data)                                           # 6  S-2 total
+        if total > MAX_SEED_TOTAL_BYTES:
+            raise IsolationError(
+                f"--seed sources total {total} bytes, over the "
+                f"{MAX_SEED_TOTAL_BYTES}-byte cap"
+            )
+
+        walked = Path("/" + "/".join(parts))
+        if walked.name.endswith(SEED_ARCHIVE_SUFFIXES):              # 7  S-6
+            raise IsolationError(
+                f"--seed source {walked.name!r} is an archive; pass D enumerates member "
+                "NAMES only and never reads a member, so an archive is refused at the "
+                "door rather than argued about"
+            )
+        for root in refused_roots:                                   # 7  S-3
+            if _is_within(walked, root):
+                raise IsolationError(
+                    f"--seed source {walked.name!r} lives under a key-bearing root; no "
+                    "file the repository or the fixture owns can be nominated as a seed, "
+                    "whatever it is named"
+                )
+        if any(part in ("key", "adjudications") for part in parts[:-1]):
+            raise IsolationError(
+                f"--seed source {walked.name!r} has a 'key' or 'adjudications' path "
+                "component; S-3 refuses it unconditionally"
+            )
+        if walked.name == "answer_key.json":
+            raise IsolationError(
+                "--seed source is named answer_key.json; S-3 refuses it by name"
+            )
+        if (st.st_dev, st.st_ino) in key_inodes:                     # 8  S-8
+            raise IsolationError(
+                f"--seed source {walked.name!r} is a hard-link alias of key-bearing "
+                "material (same st_dev/st_ino); S-8 refuses it"
+            )
+        try:                                                         # 9  S-7
+            text = data.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise IsolationError(
+                f"--seed source {walked.name!r} is not UTF-8 decodable; a file pass B "
+                "cannot decode is a file pass B silently skips, and this design refuses "
+                "to place content the mandatory content gate cannot read"
+            ) from error
+
+        redacted = _path_field(absolute, repo_root)
+        digest = sha256_bytes(data)                                  # 10 S-4
+        if key_digest is not None and digest == key_digest:
+            raise IsolationError(
+                "--seed source is byte-identical to the answer key; S-4 refuses it"
+            )
+        hits = final_review_eval.scan_leak_text(
+            Path(redacted), text, tokens, count_heuristics=True
+        )
+        if hits:
+            raise IsolationError(
+                "--seed source carries key vocabulary and is refused BEFORE the copy, so "
+                "no key material ever lands in the session: "
+                + json.dumps(hits[:5], ensure_ascii=False)
+            )
+
+        _validate_seed_destination(dest, destinations)               # 11 D-1..D-4
+        destinations.add(dest)
+        sources.append(                                              # 12 retain
+            SeedSource(dest=dest, source=redacted, data=data, sha256=digest)
+        )
+    return tuple(sources)
+
+
+def _validate_seed_destination(dest: str, already: set[str]) -> None:
+    """D-1 .. D-4's decidable-from-`dest` half. The rest is enforced by the kernel.
+
+    D-3's containment and D-4's "must not already exist" are not re-derived here: phase 2
+    creates every intermediate itself with `mkdir(dir_fd=)` and re-opens it O_NOFOLLOW,
+    and creates the file with O_CREAT|O_EXCL. Both are then properties of the calls that
+    do the work rather than of a pathname test taken beforehand.
+    """
+    if dest in already:
+        raise IsolationError(
+            f"--seed destination {dest!r} is named twice; two pairs writing one path "
+            "would make the attestation ambiguous about which source is in the session"
+        )
+    try:
+        run_logging.assert_retained_path_field("home/" + dest)       # D-1
+    except run_logging.RunLoggingError as error:
+        raise IsolationError(
+            f"--seed destination {dest!r} cannot be honestly recorded in the "
+            f"attestation, so it cannot be seeded: {error}"
+        ) from error
+    parts = dest.split("/")
+    # D-1's stated intent, enforced here because the field D-1 validates cannot carry it:
+    # `assert_retained_path_field("home/" + "/abs")` sees `"home//abs"`, which has no
+    # leading slash and is ACCEPTED (measured). Without this, an absolute destination
+    # reached phase 2 and `os.mkdir("", dir_fd=)` raised a raw FileNotFoundError out of
+    # the seed path instead of a refusal. See IMPLEMENTATION Finding F-502; the grammar
+    # is the same one D-6.8 already requires of a source.
+    if any(part in ("", ".", "..") for part in parts):               # D-1
+        raise IsolationError(
+            f"--seed destination {dest!r} has an empty, '.' or '..' component; it is "
+            "HOME-relative by construction and an absolute or traversing form is refused"
+        )
+    if any(part in SEED_REFUSED_COMPONENTS for part in parts):       # D-2
+        raise IsolationError(
+            f"--seed destination {dest!r} names a "
+            f"{'/'.join(SEED_REFUSED_COMPONENTS)} component; a seed must not construct a "
+            "path that looks like fixture material to a later reader"
+        )
+    if parts[-1] == "answer_key.json":
+        raise IsolationError(
+            f"--seed destination {dest!r} is named answer_key.json"
+        )
+
+
+def place_seed_sources(
+    session: Path, sources: Sequence[SeedSource]
+) -> tuple[SeededRecord, ...]:
+    """Phase 2 (D-6.8). No-follow, exclusive, descriptor-scoped, and re-resolution-proof.
+
+    It is handed buffers, not pathnames. D-3's "the routine creates every intermediate
+    itself and refuses to descend through anything it did not create" is literal here: a
+    pre-existing symlink intermediate fails the no-follow re-open with ELOOP instead of
+    being resolved, and O_EXCL is D-4 enforced by the kernel in the same call that creates
+    the file, so the destination has no TOCTOU window either.
+
+    The write is `os.write` + `fchmod(0600)` on the DESCRIPTOR rather than `copy2` for
+    D-5's unchanged reason: mode, mtime, flags and xattrs are not carried across, a fixed
+    0600 is safer than an inherited mode, and the attestation carries no clock value.
+    """
+    sources = tuple(sources)
+    if not sources:
+        return ()
+    _assert_dir_fd_support()
+    records: list[SeededRecord] = []
+    home_fd = os.open(str(Path(session) / "home"), _NO_FOLLOW_DIR_FLAGS)
+    try:
+        for source in sources:
+            parts = source.dest.split("/")
+            parent_fd = os.open(".", _NO_FOLLOW_DIR_FLAGS, dir_fd=home_fd)
+            try:
+                for part in parts[:-1]:
+                    try:
+                        os.mkdir(part, 0o700, dir_fd=parent_fd)
+                    except FileExistsError:
+                        pass
+                    try:
+                        nxt = os.open(part, _NO_FOLLOW_DIR_FLAGS, dir_fd=parent_fd)
+                    except OSError as error:
+                        raise IsolationError(
+                            f"--seed destination parent {part!r} of {source.dest!r} is a "
+                            f"symlink or not a directory ({error.strerror}); the routine "
+                            "refuses to descend through anything it did not create"
+                        ) from error
+                    os.close(parent_fd)
+                    parent_fd = nxt
+                try:
+                    out = os.open(
+                        parts[-1],
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+                        | os.O_CLOEXEC,
+                        0o600,
+                        dir_fd=parent_fd,
+                    )
+                except OSError as error:
+                    raise IsolationError(
+                        f"--seed destination {source.dest!r} already exists or could not "
+                        f"be created exclusively ({error.strerror}); D-4 refuses it"
+                    ) from error
+                try:
+                    written = 0
+                    while written < len(source.data):
+                        written += os.write(out, source.data[written:])
+                    os.fchmod(out, 0o600)
+                finally:
+                    os.close(out)
+            finally:
+                os.close(parent_fd)
+            records.append(
+                SeededRecord(
+                    dest="home/" + source.dest,
+                    source=source.source,
+                    seeded_bytes=len(source.data),
+                    seeded_sha256=source.sha256,
+                    seeded_mode="0600",
+                )
+            )
+    finally:
+        os.close(home_fd)
+    return tuple(records)
+
+
+def seed_session_home(
+    session: Path,
+    pairs: Sequence[str],
+    *,
+    key: dict,
+    fixture: Path,
+    repo_root: Path = REPO_ROOT,
+) -> tuple[SeededRecord, ...]:
+    """The composition, and the seam between the two phases is where T-10.13 drives.
+
+    It is two public functions rather than one function with a test-only hook because a
+    test seam that only exists for tests is a different code path from the one that ships.
+    """
+    sources = read_seed_sources(pairs, key=key, fixture=fixture, repo_root=repo_root)
+    return place_seed_sources(session, sources)
+
+
+def _inventory_kind(mode: int) -> str:
+    for predicate, name in (
+        (stat_module.S_ISLNK, "symlink"), (stat_module.S_ISDIR, "directory"),
+        (stat_module.S_ISFIFO, "fifo"), (stat_module.S_ISSOCK, "socket"),
+        (stat_module.S_ISCHR, "character_device"), (stat_module.S_ISBLK, "block_device"),
+    ):
+        if predicate(mode):
+            return name
+    return "unknown"
+
+
+def inventory_session_home(session: Path) -> dict:
+    """D-6.9's SINGLE reader of `<SESSION>/home` at attestation time.
+
+    One `lstat`-only walk and one read per regular file, so the observed side has no
+    second-read TOCTOU either -- D-6.8's lesson applied to the other end of the window.
+    A non-regular entry is `lstat`-recorded with `kind`, with no digest and NO open: the
+    same lesson F-401 teaches, applied to the one new walk this design introduces, so the
+    new code cannot inherit the old defect.
+
+    Every entry leaves here with `origin: "session"`. `attest_seeds()` is what re-stamps
+    the declared destinations as `"seed"` and fills the three correlated counters, because
+    it is the only function that has the manifest.
+    """
+    home = _realpath(Path(session) / "home")
+    entries: list[dict] = []
+    total_bytes = 0
+    for dirpath, dirnames, filenames in os.walk(home, followlinks=False):
+        dirnames.sort()
+        here = Path(dirpath)
+        dfd = os.open(str(here), _NO_FOLLOW_DIR_FLAGS)
+        try:
+            for name in sorted(dirnames):
+                if not os.path.islink(here / name):
+                    continue
+                entries.append(
+                    {
+                        "path": "home/" + (here / name).relative_to(home).as_posix(),
+                        "kind": "symlink",
+                        "origin": "session",
+                    }
+                )
+            for name in sorted(filenames):
+                relative = "home/" + (here / name).relative_to(home).as_posix()
+                st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+                if not stat_module.S_ISREG(st.st_mode):
+                    entries.append(
+                        {
+                            "path": relative,
+                            "kind": _inventory_kind(st.st_mode),
+                            "origin": "session",
+                        }
+                    )
+                    continue
+                fd = os.open(name, _NO_FOLLOW_FILE_FLAGS, dir_fd=dfd)
+                try:
+                    data = _read_all(fd)
+                finally:
+                    os.close(fd)
+                total_bytes += len(data)
+                entries.append(
+                    {
+                        "path": relative,
+                        "bytes": len(data),
+                        "sha256": sha256_bytes(data),
+                        "mode": format(st.st_mode & 0o7777, "04o"),
+                        "origin": "session",
+                    }
+                )
+                if len(entries) > MAX_HOME_INVENTORY:
+                    raise IsolationError(
+                        f"the session HOME holds more than MAX_HOME_INVENTORY "
+                        f"({MAX_HOME_INVENTORY}) entries; "
+                        "a session HOME whose contents cannot be meaningfully attested "
+                        "fails the capture. The remedy is to reduce what the agent does "
+                        "at start-up, never a larger cap."
+                    )
+        finally:
+            os.close(dfd)
+    if len(entries) > MAX_HOME_INVENTORY:
+        raise IsolationError(
+            f"the session HOME holds {len(entries)} entries, over "
+            f"MAX_HOME_INVENTORY ({MAX_HOME_INVENTORY})"
+        )
+    entries.sort(key=lambda entry: entry["path"])
+    tree_digest = sha256_bytes(
+        "".join(
+            f"{entry['path']}\n{entry.get('bytes', 0)}\n{entry.get('sha256', '')}\n"
+            for entry in entries
+        ).encode("utf-8")
+    )
+    return {
+        "files": len(entries),
+        "bytes": total_bytes,
+        "tree_digest": tree_digest,
+        "seeded_unmodified": 0,
+        "seeded_modified": 0,
+        "unseeded": len(entries),
+        "truncated": False,
+        "entries": entries,
+    }
+
+
+def _read_all(fd: int) -> bytes:
+    chunks: list[bytes] = []
+    while True:
+        chunk = os.read(fd, 1024 * 1024)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def attest_seeds(
+    manifest: Sequence[SeededRecord], inventory: dict
+) -> list[dict]:
+    """D-6.9. Two disjoint field groups, and `state` is DERIVED from comparing them.
+
+    It is handed frozen records, so it cannot recompute or overwrite the as-copied side --
+    which is the whole of F-002's answer. The observed side comes from the inventory's
+    single read, so `inventory.entries[dest].sha256` and `seeded[].observed_sha256` are
+    the same value BY CONSTRUCTION rather than by a comparison that could pass on a lucky
+    day; no cross-check assertion is needed and none is added.
+
+    It also stamps `origin: "seed"` and the three correlated counters into `inventory`,
+    because it is the only function that holds both halves. A declared destination that is
+    absent or is not a regular file is exit 4: a missing seed is a session that is not what
+    it claims. There is no `"present"` state and no `"missing"` state -- presence is not
+    something a record can carry, because a missing destination means no attestation is
+    written at all.
+    """
+    by_path = {entry["path"]: entry for entry in inventory["entries"]}
+    seeded: list[dict] = []
+    unmodified = 0
+    modified = 0
+    for record in manifest:
+        entry = by_path.get(record.dest)
+        if entry is None:
+            raise IsolationError(
+                f"the declared seed {record.dest!r} is absent from the session HOME at "
+                "attestation time; something removed it and the session is not what it "
+                "claims"
+            )
+        if "sha256" not in entry:
+            raise IsolationError(
+                f"the declared seed {record.dest!r} is present but is not a regular file "
+                f"({entry.get('kind')}); the session is not what it claims"
+            )
+        state = (
+            "unmodified" if entry["sha256"] == record.seeded_sha256 else "modified"
+        )
+        unmodified += state == "unmodified"
+        modified += state == "modified"
+        entry["origin"] = "seed"
+        seeded.append(
+            {
+                "dest": record.dest,
+                "source": record.source,
+                "seeded_bytes": record.seeded_bytes,
+                "seeded_sha256": record.seeded_sha256,
+                "seeded_mode": record.seeded_mode,
+                "observed_bytes": entry["bytes"],
+                "observed_sha256": entry["sha256"],
+                "observed_mode": entry["mode"],
+                "state": state,
+            }
+        )
+    inventory["seeded_unmodified"] = unmodified
+    inventory["seeded_modified"] = modified
+    inventory["unseeded"] = inventory["files"] - len(seeded)
+    return seeded
+
+
+def assert_home_scanned(
+    session: Path, readable: dict, probes: Sequence[dict] = ()
+) -> None:
+    """D-6.3's first contract assertion: a silent hole made loud.
+
+    `<SESSION>/home` must appear in the readable set as a `class: USR` entry with
+    `scanned: true`, and -- when NEG-5 ran at all -- in NEG-5's own per-root record. A seed
+    mechanism whose root somehow left the scanned set is not a mechanism.
+    """
+    home = str(_realpath(Path(session) / "home"))
+    entry = next(
+        (item for item in readable["entries"] if item["path"] == home), None
+    )
+    if entry is None or entry["class"] != CLASS_USR or entry.get("scanned") is not True:
+        raise IsolationError(
+            f"{home} is not an admitted, scanned class {CLASS_USR} root: {entry!r}. The "
+            "session HOME is where the seed lands, so a seed mechanism whose root left "
+            "the scanned set is a silent hole."
+        )
+    neg5 = next((probe for probe in probes if probe["id"] == "NEG-5"), None)
+    if neg5 is not None and neg5.get("result") == "PASS":
+        if not any(root["path"] == home for root in neg5.get("roots", [])):
+            raise IsolationError(
+                f"{home} is absent from NEG-5's per-root record, so the seed was never "
+                "re-scanned against the readable set the profile actually grants"
+            )
+
+
+def assert_agent_path_admitted(
+    agent_path: Sequence[str], readable: dict
+) -> list[str]:
+    """D-6.6. `--agent-path` can only name a root `--allow-read` already scanned.
+
+    The redundancy IS the safety property: the operator passes each directory twice, once
+    as `--allow-read` (which scans it) and once as `--agent-path` (which puts it on PATH),
+    and the second cannot silently exceed the first. A future "simplification" that
+    derived PATH from the readable set automatically would put every admitted root on the
+    agent's PATH, which is strictly larger than the operator asked for.
+    """
+    admitted = {entry["path"] for entry in readable["entries"]}
+    resolved = []
+    for candidate in agent_path:
+        root = str(_realpath(candidate))
+        if root not in admitted:
+            raise IsolationError(
+                f"--agent-path {root} is not an admitted readable-set root; pass it as "
+                "--allow-read as well, so the directory that lands on the agent's PATH "
+                "is one this capture actually scanned"
+            )
+        resolved.append(root)
+    return resolved
 
 
 def compute_readable_set(
@@ -1050,8 +1845,26 @@ def build_session(
     session_base: Path | None = None,
     policy_files: Sequence[str] = DEFAULT_POLICY_FILES,
     repo_root: Path = REPO_ROOT,
+    seed: Sequence[str] = (),
+    seed_manifest: list[SeededRecord] | None = None,
 ) -> Path:
     """The six rules of G.2, every one of them enforced before this returns.
+
+    Returns the RESOLVED session path (F-402). `tempfile.mkdtemp()` hands back
+    `/var/folders/...` on darwin while `compute_readable_set()` resolves every Class USR
+    root to `/private/var/folders/...`, so the generated profile's read clause and its
+    write clause named the same directory two different ways and seatbelt -- which matches
+    on the resolved path -- allowed nothing at all. Resolving here fixes the writable set
+    and `wrap_command()`'s `TMPDIR`/`HOME` spellings in one stroke, at the one place the
+    path enters the system.
+
+    `seed` is D-6.3's call site and the reason it is HERE: it runs immediately after
+    `(session / "home").mkdir()`, inside this `try:`, so the seed precedes the readable-set
+    scan (which therefore covers it), the profile, the pre-flight, NEG-5 and the
+    attestation -- and a failure at any point removes the session, seed included.
+    `seed_manifest` is an out-parameter rather than a second return value because the
+    frozen as-copied records are needed by `build_attestation()` in `isolate()`, and
+    changing this function's return type would break every existing caller for no gain.
 
     Layout, and `control/` is a SIBLING of `review_root/` rather than a child, because it
     holds the generated profile -- which necessarily NAMES the denied roots, i.e. it
@@ -1079,6 +1892,16 @@ def build_session(
         review_root = session / "review_root"
         (session / "tmp").mkdir()
         (session / "home").mkdir()
+        if seed:
+            records = seed_session_home(
+                resolved,
+                seed,
+                key=_load_key_with_source(fixture),
+                fixture=fixture,
+                repo_root=repo_root,
+            )
+            if seed_manifest is not None:
+                seed_manifest.extend(records)
         control = session / "control"
         (control / "probes").mkdir(parents=True)
         review_root.mkdir()
@@ -1116,7 +1939,7 @@ def build_session(
         for path in review_root.rglob("*"):
             if path.is_symlink():
                 raise IsolationError(f"a symlink reached review_root: {path}")
-        return session
+        return resolved
     except BaseException:
         shutil.rmtree(session, ignore_errors=True)   # a half-built session is worse than none
         raise
@@ -1635,6 +2458,7 @@ def build_attestation(
     denied: Sequence[str],
     profile_digest: str | None,
     probes: Sequence[dict],
+    session_home: dict | None = None,
     repo_root: Path = REPO_ROOT,
 ) -> dict:
     """The document, and it carries NO clock value.
@@ -1703,6 +2527,11 @@ def build_attestation(
         "writable_set": [_path_field(entry, repo_root) for entry in writable],
         "denied_roots": [_path_field(entry, repo_root) for entry in denied],
         "key_bearing_roots_discovered": len(denied),
+        # D-6.4/D-6.9. Present on every seeded capture and absent otherwise, so a reader
+        # can tell "nothing was seeded" from "the seed was not recorded". Every path in
+        # it is session-relative and P-PATH-clean by D-1's construction; `seeded[].source`
+        # is the redacted placeholder, and no byte of a seeded file appears anywhere.
+        **({"session_home": session_home} if session_home is not None else {}),
         "properties": {
             "S1": passed("NEG-1"),
             "S2": passed("NEG-2", "NEG-3", "NEG-4"),
@@ -1720,7 +2549,12 @@ def build_attestation(
         "limitations": [
             "The recursive immutability proof is evaluated at session-build time "
             "against the run user's own privileges, so it does not bind a privileged "
-            "(root) writer, who is outside the stated threat model"
+            "(root) writer, who is outside the stated threat model",
+            *(
+                [SEED_DIGEST_LIMITATION]
+                if session_home and session_home.get("seeded")
+                else []
+            ),
         ],
     }
     assert_no_clock_value(document)
@@ -1831,6 +2665,10 @@ def isolate(
     attempt: int = 1,
     terminal: str = "",
     plant: bool = True,
+    seed: Sequence[str] = (),
+    agent_path: Sequence[str] = (),
+    agent_command: str = "",
+    orca: str = "orca",
     repo_root: Path = REPO_ROOT,
 ) -> dict:
     """Build one isolation session, prove it, attest it. Fail-closed at every step.
@@ -1849,9 +2687,11 @@ def isolate(
     if enforcement == ENFORCEMENT_SEATBELT and plant:
         assert_no_stale_plants()
 
+    seed_manifest: list[SeededRecord] = []
     session = build_session(
         run_id, fixture=fixture, session_base=session_base,
         policy_files=policy_files, repo_root=repo_root,
+        seed=seed, seed_manifest=seed_manifest,
     )
     try:
         key = _load_key_with_source(fixture)
@@ -1860,8 +2700,14 @@ def isolate(
         carve_outs = readable["carve_outs"]
         denied = discover_key_bearing_roots(fixture)
         traversal = compute_traversal_set(paths, carve_outs)
-        writable = [str(session / "review_root"), str(session / "tmp"),
-                    str(session / "home")]
+        # RESOLVED, like every Class USR root the readable set admits (F-402). `session`
+        # already comes back resolved from `build_session()`; this is the second belt,
+        # here rather than in a comment, because the two clauses of one generated profile
+        # disagreeing is precisely the defect and it was invisible in the attestation.
+        writable = [str(_realpath(session / "review_root")),
+                    str(_realpath(session / "tmp")),
+                    str(_realpath(session / "home"))]
+        agent_path = assert_agent_path_admitted(agent_path, readable)
         profile_digest = None
         if enforcement == ENFORCEMENT_SEATBELT:
             assert_carve_outs_denied(carve_outs, carve_outs)
@@ -1877,7 +2723,13 @@ def isolate(
             profile_path = session / "control" / PROFILE_FILENAME
             profile_path.write_text(profile, encoding="utf-8")
             profile_digest = sha256_path(profile_path)
-            preflight = preflight_probe(session)
+            # F-403. The pre-flight runs the ACTUAL resolved agent command under the
+            # ACTUAL generated profile, which is what G.5 always said it did and what no
+            # caller ever made true: every prior capture ran four read-only checks and
+            # called it a pre-flight, on a session in which the agent could not start.
+            preflight = preflight_probe(
+                session, agent_command or None, agent_path=agent_path
+            )
             (session / "control" / "probes" / "preflight.log").write_text(
                 preflight["log"], encoding="utf-8"
             )
@@ -1886,6 +2738,23 @@ def isolate(
                     "the pre-flight probe FAILED, so no Task is dispatched into this "
                     f"session: {preflight['log'][:600]}"
                 )
+            # F-403 part 2 / O-1, asserted rather than assumed. Only when a dispatch
+            # terminal handle is actually supplied: with no handle there is no dispatch
+            # to check, and inventing one would prove nothing.
+            if terminal:
+                orca_check = orca_check_probe(
+                    session, terminal, orca=orca, agent_path=agent_path
+                )
+                (session / "control" / "probes" / "orca_check.log").write_text(
+                    json.dumps(orca_check, indent=2, ensure_ascii=False) + "\n",
+                    encoding="utf-8",
+                )
+                if orca_check["rc"] != 0:
+                    raise IsolationError(
+                        "the O-1 probe FAILED: `orca orchestration check` does not work "
+                        "from inside the sandbox, so a dispatched worker could not report "
+                        f"back. rc={orca_check['rc']} {orca_check['stderr']}"
+                    )
         probes = run_probes(
             session, fixture=fixture, readable=readable, denied=denied,
             enforcement=enforcement, plant=plant,
@@ -1894,20 +2763,37 @@ def isolate(
                   ("PASS", UNENFORCED_PROBE_RESULT, "SKIP")]
         if failed:
             raise IsolationError(f"negative probes FAILED: {failed}")
+        # D-6.3's contract assertions, and D-6.9's single reader. The order is the whole
+        # point: `inventory_session_home()` is the ONLY thing that reads `<SESSION>/home`
+        # at attestation time, and `attest_seeds()` derives every observed value from the
+        # entries THAT walk produced -- so the two views cannot disagree by construction.
+        assert_home_scanned(session, readable, probes)
+        session_home = None
+        if seed:
+            inventory = inventory_session_home(session)
+            seeded = attest_seeds(seed_manifest, inventory)
+            session_home = {
+                "seed_policy": SEED_POLICY_STATEMENT,
+                "seeded": seeded,
+                "inventory": inventory,
+                "scanned_by": ["compute_readable_set:USR", "NEG-5"],
+            }
         document = build_attestation(
             run_id=run_id, attempt=attempt, terminal=terminal, session=session,
             enforcement=enforcement, readable=readable, traversal=traversal,
             writable=writable, denied=denied, profile_digest=profile_digest,
-            probes=probes, repo_root=repo_root,
+            probes=probes, session_home=session_home, repo_root=repo_root,
         )
         write_attestation(session, document)
         return {
             "session": str(session),
             "review_root": str(session / "review_root"),
             "attestation": str(session / "control" / ISOLATION_FILENAME),
-            "launch_command": wrap_command(session, "<resolved agent command>")
+            "launch_command": wrap_command(
+                session, agent_command or "<resolved agent command>", agent_path
+            )
             if enforcement == ENFORCEMENT_SEATBELT
-            else "<resolved agent command>",
+            else (agent_command or "<resolved agent command>"),
             "scope_enforcement": document["scope_enforcement"],
             "properties": document["properties"],
         }
@@ -1916,7 +2802,12 @@ def isolate(
         raise
 
 
-def preflight_probe(session: Path, agent_command: str | None = None) -> dict:
+def preflight_probe(
+    session: Path,
+    agent_command: str | None = None,
+    *,
+    agent_path: Sequence[str] = (),
+) -> dict:
     """Mandatory, before the real dispatch. Runs the launch line for real.
 
     Purpose: discover the Class USR roots the agent genuinely needs (an `Abort trap: 6`
@@ -1944,7 +2835,7 @@ def preflight_probe(session: Path, agent_command: str | None = None) -> dict:
     ok = True
     for command in checks:
         completed = subprocess.run(
-            ["/bin/sh", "-c", wrap_command(session, command)],
+            ["/bin/sh", "-c", wrap_command(session, command, agent_path)],
             capture_output=True, text=True, check=False, timeout=120,
         )
         benign = _benign_stderr(completed.stderr)
@@ -1961,7 +2852,13 @@ def _benign_stderr(text: str) -> bool:
     return bool(text) and "couldn't create cache file" in text
 
 
-def orca_check_probe(session: Path, terminal: str, orca: str = "orca") -> dict:
+def orca_check_probe(
+    session: Path,
+    terminal: str,
+    orca: str = "orca",
+    *,
+    agent_path: Sequence[str] = (),
+) -> dict:
     """O-1, asserted rather than assumed.
 
     `orca orchestration send/check/ask` must keep working from inside the sandbox: the
@@ -1970,10 +2867,14 @@ def orca_check_probe(session: Path, terminal: str, orca: str = "orca") -> dict:
     being read from the repo. There is no known blocker -- but the CLI may resolve a
     worktree from cwd for some subcommands, so this probes it concretely. A failure is a
     BLOCKING finding for IMPLEMENTATION, not something to work around silently.
+
+    Called from `isolate()` whenever a dispatch terminal handle is supplied (F-403), and a
+    non-zero rc is exit 4 with the log written to `control/probes/orca_check.log`. Before
+    that wiring it had no caller anywhere, so O-1 was in fact still assumed.
     """
     command = f"{shlex.quote(orca)} orchestration check --terminal {shlex.quote(terminal)}"
     completed = subprocess.run(
-        ["/bin/sh", "-c", wrap_command(session, command)],
+        ["/bin/sh", "-c", wrap_command(session, command, agent_path)],
         capture_output=True, text=True, check=False, timeout=120,
     )
     return {"rc": completed.returncode, "stderr": completed.stderr[:400]}

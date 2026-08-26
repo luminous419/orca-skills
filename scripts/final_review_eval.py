@@ -1310,6 +1310,46 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     command.add_argument(
+        "--seed",
+        action="append",
+        default=[],
+        metavar="ABS_SOURCE:HOME_RELATIVE_DEST",
+        help=(
+            "repeatable, at most 8 times. Copy one regular file into the session HOME "
+            "BEFORE the readable-set scan runs, so the scan, NEG-5 and the attestation "
+            "all cover it. Exactly one ':'; a source path containing a colon cannot be "
+            "seeded. Refused, every one of them before a byte is copied: the answer key "
+            "by name, by digest or by containing directory; anything under the fixture, "
+            "the repository or a key-bearing root; a hard-link alias of key material; "
+            "any directory, symlink, FIFO, socket or device node; any executable; any "
+            "archive; anything over 1 MiB or not UTF-8-decodable; anything whose content "
+            "produces a leak-scan hit. The attestation records the seeded and observed "
+            "digests, which lets a holder of it test a GUESSED plaintext -- so a "
+            "low-entropy secret (a passphrase, a PIN) must not be seeded."
+        ),
+    )
+    command.add_argument(
+        "--agent-path",
+        action="append",
+        default=[],
+        metavar="ABS_DIR",
+        help=(
+            "repeatable. A directory to place on the isolated agent's PATH. Each entry "
+            "must ALREADY be an admitted readable-set root, so pass it as --allow-read "
+            "too; the redundancy is the safety property -- PATH can never name a root "
+            "this capture did not scan."
+        ),
+    )
+    command.add_argument(
+        "--agent-command",
+        default="",
+        help=(
+            "the resolved agent command. The mandatory pre-flight runs it under the "
+            "generated profile with a short timeout, so a session the agent cannot start "
+            "in fails the command instead of being dispatched into."
+        ),
+    )
+    command.add_argument(
         "--enforcement",
         choices=("seatbelt", "none"),
         default="seatbelt",
@@ -1367,7 +1407,20 @@ def _dispatch_isolate(args: argparse.Namespace) -> int:
             attempt=args.attempt,
             terminal=args.terminal,
             plant=not args.no_plant,
+            seed=tuple(args.seed),
+            agent_path=tuple(args.agent_path),
+            agent_command=args.agent_command,
         )
+    except review_isolation.IsolationSeedGrammarError as error:
+        # Caught HERE and not by `main()`'s `except EvalInputError`. This file runs as
+        # `__main__` while `review_isolation` does its own `import final_review_eval`, so
+        # there are two `EvalInputError` classes and the subclass relationship that holds
+        # inside `review_isolation` does not hold against `__main__`'s copy. Without this
+        # clause the grammar failure exits 1 by way of an UNCAUGHT TRACEBACK -- the right
+        # code for the wrong reason, and an operator sees a stack trace instead of the
+        # message. See IMPLEMENTATION Finding F-503.
+        print(f"input error: {error}", file=sys.stderr)
+        return EXIT_INPUT_ERROR
     except review_isolation.IsolationContractError as error:
         print(f"isolation contract violation: {error}", file=sys.stderr)
         return EXIT_CONTRACT_VIOLATION

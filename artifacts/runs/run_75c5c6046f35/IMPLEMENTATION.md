@@ -382,3 +382,528 @@ nowhere under `scripts/` or `orca-worker-reviewer-orchestration/` outside the T-
 now pin their absence. Pass S remains Class USR only via `SCAN_PASSES_ALL`. NEG-5 remains
 in-process, fail-closed through `IsolationError` at `review_isolation.py`'s probe collection, and
 mapped to `EXIT_LEAK_OR_FIXTURE == 4`.
+
+## IMPLEMENTATION iteration 2 — F-401/F-402/F-403
+
+STATUS: COMPLETE
+
+Scope of this iteration: **DESIGN's approved iteration-3 *Expected Changed Files / Implementation
+Steps* table (steps 1-4), plus TEST's F-401 and F-402, and nothing else.** No design decision was
+reopened and none was made. Where DESIGN's text could not be implemented as written, the code
+implements the smallest correction that preserves the property DESIGN states and the deviation is
+filed below as a Finding (**F-501**, **F-502**, **F-503**) rather than folded silently into the
+diff — same Mandatory Invariant as iteration 1.
+
+The load-bearing claim of this iteration is not "the three findings were each addressed". It is the
+one thing `TEST.md`'s `B-1′` attempt could not close: **a real, seeded, end-to-end
+`isolate --enforcement seatbelt` run now terminates and writes a valid `ISOLATION.json`.** The
+evidence is in `## End-to-End Proof` below, and it is what makes F-401, F-402 and F-403 closed
+*together* rather than three individually plausible patches.
+
+### Summary / Analysis
+
+| finding | what shipped |
+|---|---|
+| **F-401** — `scan_readable_set()`'s pass B `read_text()`s every non-symlink entry the walk reaches; `/dev` is a default Class IMM candidate and 459 of its 462 entries are character or block devices, which is what SIGKILLed the §7 capture at 17m44s | The gate is **general policy, not a `/dev` special case**, exactly as DESIGN's *Risks* row requires: nothing under the walk is opened unless `lstat()` says `S_ISREG`. It precedes pass B (the finding as filed), pass C (whose size prefilter falls through to a full read when `lstat()` raises) and pass D (which hands the path to `tarfile`/`zipfile`, i.e. opens it too). A non-regular entry is still **counted**, in `files` and in the new `counters["non_regular"]`, so the policy is visible in the attestation's per-root record rather than inferred from an absence. |
+| **F-402** — `compute_readable_set()` admits realpath-resolved Class USR roots while `isolate()` built the writable list from the raw `tempfile.mkdtemp()` path, so on darwin one generated profile's read clause said `/private/var/folders/…` and its write clause said `/var/folders/…`; seatbelt matches on the resolved path, so every sandboxed write was denied | Fixed **where the path enters the system**: `build_session()` now returns `_realpath(session)`, which corrects the writable set and `wrap_command()`'s `TMPDIR`/`HOME` spellings in one stroke. `isolate()` additionally resolves each writable entry — a second belt, in code rather than in a comment, because two clauses of one profile disagreeing is precisely the defect and it was invisible in the attestation. |
+| **F-403 (1)** — `preflight_probe()` was never called with a real `agent_command` anywhere in the codebase | `isolate()` now calls `preflight_probe(session, agent_command or None, agent_path=agent_path)` with the resolved command threaded from a new `--agent-command` on the `isolate` CLI, writes `control/probes/preflight.log`, and raises (exit `4`) with the log's first 600 bytes when it fails. G.5 always said the pre-flight ran the launch line; no caller ever made that true. |
+| **F-403 (2)** — `orca_check_probe()` had no caller anywhere, so O-1 was assumed rather than asserted | `isolate()` calls it **whenever a dispatch terminal handle is supplied** — with no handle there is no dispatch to check and inventing one would prove nothing — writes `control/probes/orca_check.log`, and a non-zero rc is exit `4`. |
+| **F-403 (3)** — the session HOME had no attested way to receive agent credentials before the readable-set scan ran | DESIGN's D-6.8/D-6.9 mechanism, built in full: `SeedSource`/`SeededRecord` (both `@dataclass(frozen=True)`), `_open_no_follow()`, `read_seed_sources()`, `place_seed_sources()`, `seed_session_home()`, `inventory_session_home()`, `attest_seeds()`, `assert_home_scanned()`, `assert_agent_path_admitted()`, the S-1…S-8 and D-1…D-4 refusals, the five caps, the `os.supports_dir_fd` guard, `--seed`/`--agent-path` on the CLI, and `ISOLATION_SCHEMA_VERSION = "1.1"`. |
+
+**`shutil.copyfile` and `sha256_path` appear nowhere on the seed path**, which is the whole of
+F-001's structural answer and is asserted by a test that reads the module's own source between
+`read_seed_sources()` and `inventory_session_home()`.
+
+### Changes
+
+#### Step 1 — `scripts/review_isolation.py` — **HARD**
+
+**F-401.** `scan_readable_set()` gains an `lstat()`-based `S_ISREG` gate ahead of passes B, C and D
+and a `counters["non_regular"]` field; the docstring states the policy once, generally, with the
+measured reason (`/dev`, 459 devices, the 17m44s SIGKILL) and the forward reason (the pre-flight's
+own agent writes into `<SESSION>/home`, the operator's real `$CODEX_HOME` contains a unix socket,
+and NEG-5 re-scans that root).
+
+**F-402.** `build_session()` returns `_realpath(session)`; `isolate()`'s `writable` list is built
+from `_realpath(session / …)` for all three roots.
+
+**The seed mechanism (D-6.1 … D-6.9).**
+
+* Constants: `MAX_SEEDS = 8`, `MAX_SEED_BYTES = 1 MiB`, `MAX_SEED_TOTAL_BYTES = 4 MiB`,
+  `MAX_HOME_INVENTORY = 1024`, `MAX_KEY_INODES = 4096`; `SEED_POLICY_STATEMENT`,
+  `SEED_DIGEST_LIMITATION`, `SEED_ARCHIVE_SUFFIXES`, `SEED_REFUSED_COMPONENTS`,
+  `_NO_FOLLOW_DIR_FLAGS`, `_NO_FOLLOW_FILE_FLAGS`.
+* `IsolationSeedGrammarError(final_review_eval.EvalInputError)` — the argument-grammar failures of
+  D-6.1/D-6.8, which are exit `1` because nothing is built and there is nothing to remove. Every
+  other refusal is `IsolationError`, i.e. exit `4`.
+* `SeedSource(dest, source, data, sha256)` and `SeededRecord(dest, source, seeded_bytes,
+  seeded_sha256, seeded_mode)`, both frozen. `SeedSource` carries **no absolute source pathname**:
+  `source` is already `_path_field()`-redacted, so `place_seed_sources()` is not handed a value it
+  could pass to `open`, `stat`, `copyfile` or `sha256_path`.
+* `_assert_dir_fd_support()` — a loud exit-`4` refusal rather than a silent pathname fallback,
+  because the fallback is F-001.
+* `_open_no_follow(abs_path) -> (fd, parts)` — component-by-component `O_NOFOLLOW` walk from `/`,
+  at most two descriptors held, `os.close()` in a `finally:`. Returns the literal component
+  sequence S-3 and S-6 are then decided over.
+* `_key_bearing_inodes(fixture)` — S-8's `(st_dev, st_ino)` set over `answer_key.json` and every
+  regular file under the fixture's `key/` and `adjudications/`; **2 entries measured** on this host,
+  capped at `MAX_KEY_INODES` and fail-closed above it. Collected only when at least one `--seed` is
+  declared.
+* `_read_to_ceiling(fd, ceiling)` — the read that actually enforces S-2, because `st_size` is
+  advisory.
+* `read_seed_sources()` — phase 1, steps 1-12 of D-6.8's table in that order, every pair completed
+  before phase 2 runs at all. No post-read `fstat` identity re-check, deliberately: a file can be
+  replaced and restored between two `fstat`s, so that comparison cannot fail closed.
+* `place_seed_sources()` — phase 2: `mkdir(0o700, dir_fd=)` + `O_DIRECTORY|O_NOFOLLOW` re-open per
+  parent, `O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW` at `0o600`, `os.write` to completion, `os.fchmod` on
+  the **descriptor**.
+* `seed_session_home()` — the two-line composition, called from `build_session()` immediately after
+  `(session / "home").mkdir()` and inside the existing `try:` whose `except BaseException:` removes
+  a half-built session (D-6.3's call site).
+* `inventory_session_home(session)` — D-6.9's **single reader**: one `lstat`-only walk, one read per
+  regular file through `O_RDONLY|O_NOFOLLOW` from the walk's own directory descriptor, a
+  non-regular entry recorded with `kind` and **no digest and no open**.
+* `attest_seeds(manifest, inventory)` — replaces the designed-then-superseded
+  `assert_seeds_present()`. Fills `observed_*` from the inventory entry, derives `state`, stamps
+  `origin: "seed"` and the three counters, and exits `4` on a declared `dest` that is absent or not
+  a regular file. It is handed frozen records, so it cannot recompute or overwrite the as-copied
+  side.
+* `assert_home_scanned(session, readable, probes)` and
+  `assert_agent_path_admitted(agent_path, readable)` — D-6.3's and D-6.6's contract assertions.
+* `wrap_command(session, command, agent_path=())` adds `PATH` **only** when `--agent-path` was
+  given; with none, the launch line is byte-identical to what it was before the parameter existed
+  (asserted by a test).
+* `build_attestation(..., session_home=None)` emits the `session_home` object when and only when
+  something was seeded, and appends `SEED_DIGEST_LIMITATION` to `limitations[]` in that case.
+  `ISOLATION_SCHEMA_VERSION = "1.1"`.
+* `isolate(..., seed=(), agent_path=(), agent_command="", orca="orca")`, with the call order
+  D-6.9 requires: `assert_home_scanned()` → `inventory_session_home()` → `attest_seeds()` →
+  `build_attestation()`.
+
+#### Step 2 — `scripts/final_review_eval.py` — **HARD**
+
+`--seed` (repeatable, `metavar="ABS_SOURCE:HOME_RELATIVE_DEST"`, help text carrying the closed
+refusal list and the low-entropy-secret caveat in DESIGN iteration 3's wording — *"the seeded and
+observed digests"*), `--agent-path` (repeatable) and `--agent-command`, all defaulting to empty and
+all threaded into `_dispatch_isolate()`.
+
+#### Step 3 — `scripts/test_review_isolation.py` — **HARD**
+
+33 new tests in seven classes (31 for steps 1-3, plus the 2 `SeedCliExitCodeTests` that
+Finding **F-503** added). See `## Unit Tests`.
+
+#### Step 4 — docs
+
+`CHANGELOG.md` gains one `Unreleased → Added` entry stating the `--seed`/`--agent-path`/
+`--agent-command` contract, the single-descriptor read contract, the closed refusal list including
+S-8's hard-link rule, the two-identity seed record and the `1.0 → 1.1` bump, and the
+low-entropy-secret residual. `COMPATIBILITY.md` is untouched, as DESIGN requires.
+
+### Modified Files
+
+| file | step |
+|---|---|
+| `scripts/review_isolation.py` | 1 (+ F-401, F-402) |
+| `scripts/final_review_eval.py` | 2 |
+| `scripts/test_review_isolation.py` | 3 |
+| `CHANGELOG.md` | 4 |
+| `artifacts/runs/run_75c5c6046f35/IMPLEMENTATION.md` | this Worker Result |
+
+`VERSION`, `LICENSE-DECISION.md`, `COMPATIBILITY.md`, `scripts/run_logging.py` and its byte-identical
+mirror, the fixture trees, the answer key, the scorer, the adjudication schema, the redaction policy,
+`release_manifest.py`, the detection/search policy and the H-1/H-2/H-4/H-5 conclusions are all
+untouched. No branch and no PR was created; the work is committed on
+`agent/final-review-observability-evaluation`.
+
+### Unit Tests
+
+**Added — `scripts/test_review_isolation.py`**
+
+| DESIGN id | test | class |
+|---|---|---|
+| T-10.1 | `test_t101_a_valid_pair_lands_with_both_identities_and_the_designed_modes` | `SeedPlacementTests` |
+| T-10.1 (`O_EXCL`) | `test_t101b_the_destination_is_created_by_o_excl` | `SeedPlacementTests` |
+| T-10.7 | `test_t107_the_per_source_total_and_count_caps_all_bind` | `SeedPlacementTests` |
+| T-10.8 | `test_t108_validate_all_then_copy_leaves_neither_pair_behind` | `SeedPlacementTests` |
+| T-10.2 | `test_t102_a_directory_a_symlink_and_a_fifo_are_each_refused` | `SeedSourceRefusalTests` |
+| T-10.3 | `test_t103_the_repository_the_fixture_and_key_names_are_each_refused` | `SeedSourceRefusalTests` |
+| T-10.4 | `test_t104_a_source_carrying_key_vocabulary_is_refused_before_the_copy` | `SeedSourceRefusalTests` |
+| T-10.5 | `test_t105_an_executable_an_archive_and_a_non_utf8_source_are_refused` | `SeedSourceRefusalTests` |
+| T-10.6 | `test_t106_every_refused_destination_form_is_refused` | `SeedDestinationRefusalTests` |
+| T-10.6 (grammar) | `test_t106b_the_argument_grammar_is_exit_one_not_exit_four` | `SeedDestinationRefusalTests` |
+| T-10.13 | `test_t1013_a_substitution_between_the_phases_changes_nothing_observable` | `SeedSubstitutionRaceTests` |
+| T-10.14 | `test_t1014_a_substitution_can_never_bypass_a_refusal` | `SeedSubstitutionRaceTests` |
+| T-10.15 | `test_t1015_the_walk_decides_over_components_not_over_a_pathname` | `SeedSubstitutionRaceTests` |
+| T-10.16 | `test_t1016_s8_refuses_a_hard_link_alias_of_key_material` | `SeedSubstitutionRaceTests` |
+| T-10.17 | `test_t1017_the_by_construction_guarantees_hold` | `SeedSubstitutionRaceTests` |
+| D-6.8 (by inspection) | `test_the_seed_path_never_names_copyfile_or_sha256_path` | `SeedSubstitutionRaceTests` |
+| T-10.9 | `test_t109_the_session_home_is_not_exempt_from_the_admission_scan` | `SeedAttestationTests` |
+| T-10.10 | `test_t1010_the_record_shape_is_the_two_identity_one` | `SeedAttestationTests` |
+| T-10.11 | `test_t1011_the_inventory_is_the_single_reader_and_opens_nothing_it_should_not` | `SeedAttestationTests` |
+| T-10.11 (`tree_digest`) | `test_t1011b_the_tree_digest_is_stable_across_two_identical_sessions` | `SeedAttestationTests` |
+| T-10.18 | `test_t1018_a_modified_seed_keeps_both_identities` | `SeedAttestationTests` |
+| T-10.19 | `test_t1019_the_unmodified_case_and_the_immutability_guard` | `SeedAttestationTests` |
+| T-10.12 | `test_t1012_an_unadmitted_entry_is_refused_and_an_admitted_one_leads_path` | `AgentPathTests` |
+| T-10.12 (control) | `test_the_launch_line_is_byte_identical_with_no_agent_path` | `AgentPathTests` |
+| **F-402** | `test_build_session_returns_a_resolved_path` | `WritableSetSpellingTests` |
+| **F-402** | `test_the_readable_and_writable_spellings_of_one_root_agree` | `WritableSetSpellingTests` |
+| **F-402** | `test_f402_the_generated_profile_actually_permits_a_write` | `NegativeContractTests` |
+| **F-402** | `test_f402b_every_writable_root_is_denied_outside_the_session` | `NegativeContractTests` |
+| **F-401** | `test_a_fifo_under_an_admitted_root_is_counted_and_not_opened` | `NonRegularScanTests` |
+| **F-401** | `test_a_non_regular_entry_named_like_an_archive_is_not_handed_to_tarfile` | `NonRegularScanTests` |
+| **F-401** | `test_the_production_entry_point_terminates_on_a_non_regular_entry` | `NonRegularScanTests` |
+| **F-503** | `test_a_grammar_failure_is_exit_one_with_a_message_not_a_traceback` | `SeedCliExitCodeTests` |
+| **F-503** | `test_a_refused_source_is_exit_four_with_no_session_left` | `SeedCliExitCodeTests` |
+
+#### Behaviour covered, and why each test is shaped the way it is
+
+* **The race tests are deterministic.** The substitution happens between two ordinary function calls
+  in the test body — no threads, no timing, no retries — which is only possible because D-6.8 made
+  phases 1 and 2 two public functions. The seam the tests drive is the seam that ships; a test-only
+  hook would have been a different code path from the one that runs.
+* **T-10.13 asserts the outcome, not the exception.** For each of the four substitutions the
+  destination's bytes are byte-identical to the *original* source, its digest equals the returned
+  `seeded_sha256`, and **no byte of the answer key and no key token appears anywhere under
+  `<SESSION>/home`** — the assertion F-001 is actually about.
+* **T-10.16 asserts S-4 and S-8 independently**, each with the other disabled at the unit level
+  (`_key_bearing_inodes` stubbed to the empty set for the S-4 half; `_answer_key_digest` and
+  `key_leak_tokens` stubbed for the S-8 half), plus the case S-4 alone would pass — a hard link to a
+  non-key regular file under `key/` carrying no key vocabulary, with the "S-4 would pass this"
+  control asserted in the same method.
+* **F-401's production-entry-point test runs in a subprocess with `timeout=180`**, so a regression
+  fails loudly instead of hanging the suite forever. `/dev/zero` cannot be reproduced without root;
+  a FIFO reproduces the same defect exactly (`read_text()` on one never returns) and the fix is the
+  same general policy for both.
+* **F-402's integration test runs the real launch line against a real generated profile** and looks
+  at the filesystem afterwards, in `NegativeContractTests` where a real session, a real readable set
+  and a real profile already exist. A literal assertion over the profile *text* would have passed
+  against the defective profile, which is exactly why it is not one — paired, as every negative
+  assertion in that class is, with the inverse: a write to the host temp directory outside the
+  session is still denied.
+* **Seed sources live under the realpath of the temporary directory.** `tempfile.mkdtemp()` hands
+  back `/var/folders/…` on darwin and `/var` is a symlink, so an unresolved source path is refused
+  by the no-follow walk at component 0. That is D-6.8 working as specified, not a test
+  inconvenience, and it is recorded here because an operator will meet it (see **N-4**).
+
+### End-to-End Proof — the loop `TEST.md`'s `B-1′` attempt could not close
+
+This is the load-bearing evidence of the iteration. F-401, F-402 and F-403 are not three
+independently plausible patches: the mechanism is only fixed if a real, seeded, kernel-enforced
+`isolate` run **terminates** and writes a **valid** `ISOLATION.json`, which had never happened.
+
+**The command, run exactly as an operator would run it** (a synthetic `auth.json`-shaped seed — no
+real credential is needed to prove the mechanism, and the pre-flight's real-agent authentication
+remains `B-1′`'s own step):
+
+```bash
+python3 scripts/final_review_eval.py isolate \
+    --run-id run_e2e_seed_proof \
+    --seed <SCRATCH>/e2e/auth.json:.codex/auth.json \
+    --agent-command "/bin/echo AGENT-STARTED-OK" \
+    --enforcement seatbelt \
+    --out <SCRATCH>/e2e/isolate_result.json
+```
+
+`rc=0`, empty stderr, wall clock **~14 minutes**. The `TEST.md` attempt this replaces was SIGKILLed
+at **17m44s** while blocked in `read()` on `/dev/console`, having produced nothing.
+
+**F-401 — the scan terminates, and the record says why.** `probes[NEG-5].roots[]`:
+
+| class | root | `content_scanned` | hits |
+|---|---|---|---|
+| IMM | `/bin` | 0 | 0 |
+| IMM | `/sbin` | 0 | 0 |
+| IMM | `/private/etc` | 214 | 0 |
+| IMM | **`/dev`** | **0** | 0 |
+| IMM | `/private/var/select` | 0 | 0 |
+| IMM | `/usr` | 11,027 | 0 |
+| IMM | `/System` | 77,256 | 0 |
+| IMM | `/Library/Developer/CommandLineTools` | 94,472 | 0 |
+| USR | `<SESSION>/review_root` | 16 | 0 |
+| USR | `<SESSION>/tmp` | 0 | 0 |
+| USR | **`<SESSION>/home`** | 1 | 0 |
+
+**182,986 files opened and content-scanned in total, and `/dev` contributes exactly zero of them** —
+every one of its entries is a character or block device and the `S_ISREG` gate skipped all of them
+while still counting them. That single `0` is the finding, closed, measured at the production entry
+point rather than argued about: the mandatory pass B of D-5.1 ran in full over every admitted root
+*including* the one that used to hang it.
+
+**F-402 — the writable set and the profile agree.** `build_session()` returned the resolved session
+path, and the emitted launch line spells `TMPDIR`, `HOME` and the profile path with the same
+`/private/var/folders/...` prefix the read clauses use. The pre-flight then **wrote inside the
+session for real** — the `xcrun` shims created `<SESSION>/home/Library/Caches/com.apple.python/...`,
+34 files of it, which the inventory enumerates below. A profile whose write clause disagreed with
+its read clause could not have produced a single one of them.
+
+**F-403 (1) — the pre-flight ran the actual agent command under the actual profile.**
+`control/probes/preflight.log`, verbatim tail:
+
+```text
+$ /bin/ls .
+rc=0
+artifacts
+policy
+subject
+
+
+$ /bin/echo AGENT-STARTED-OK
+rc=0
+AGENT-STARTED-OK
+```
+
+The fifth entry exists only because `--agent-command` was threaded through to
+`preflight_probe(session, agent_command, agent_path=…)`. Before this iteration the log had four
+entries on every capture and the agent command was never executed at all.
+
+**F-403 (2) — O-1.** No `--terminal` was supplied on this run, so `orca_check_probe()` correctly did
+not run: with no dispatch handle there is no dispatch to check, and inventing one would prove
+nothing. The caller now exists, is exercised by the `--terminal` path, and O-1 stays open and
+undischarged exactly as DESIGN says it does — it is discharged by a capture that supplies a real
+handle, not by this proof.
+
+**F-403 (3) — the seed, attested at both ends of the window.** `ISOLATION.json`:
+
+```json
+"schema_version": "1.1",
+"scope_enforcement": "seatbelt",
+"properties": {"S1": "PASS", "S2": "PASS", "S3": "PASS"},
+"session_home": {
+  "seeded": [{
+    "dest": "home/.codex/auth.json",
+    "source": "<REDACTED:foreign_absolute_path>",
+    "seeded_bytes": 319,
+    "seeded_sha256": "sha256:28fe5058751280777ccf9abffd6125597d2803de9925889a74cafb3730498e8f",
+    "seeded_mode": "0600",
+    "observed_bytes": 319,
+    "observed_sha256": "sha256:28fe5058751280777ccf9abffd6125597d2803de9925889a74cafb3730498e8f",
+    "observed_mode": "0600",
+    "state": "unmodified"
+  }],
+  "inventory": {
+    "files": 35, "bytes": 421463,
+    "tree_digest": "sha256:3e1a20e2a5cd65bf6268f5183ac9137f51dc5db232e7963e5810e76e595e742f",
+    "seeded_unmodified": 1, "seeded_modified": 0, "unseeded": 34, "truncated": false
+  },
+  "scanned_by": ["compute_readable_set:USR", "NEG-5"]
+}
+```
+
+Every claim D-6.4 and D-6.9 make about this document is true of it:
+
+* the seed landed at `home/.codex/auth.json` at mode `0600` under a `0700` parent, and is the one
+  entry whose `origin` is `"seed"`;
+* the **34 other files** are what the pre-flight's own processes wrote into the session HOME after
+  the admission scan and before the attestation — enumerated with digests, each `origin: "session"`,
+  which is the honest statement (present at attestation time and not in the seed manifest) rather
+  than a guess about who wrote them;
+* `inventory.entries["home/.codex/auth.json"].sha256` **is** `seeded[0].observed_sha256`, the same
+  string, because there is one walk and one read;
+* `assert_home_scanned()` passed: `<SESSION>/home` is a scanned Class USR root in `readable_set[]`
+  **and** carries its own NEG-5 per-root record (`passes: [A,B,C,D,S]`, `vocabulary: key_leak`,
+  `content_scanned: 1`, `hits: 0`) — the seed was scanned by both gates, with the full key
+  vocabulary, in the session it actually runs in;
+* every path-bearing field passes P-PATH (`writable_set[]` and `seeded[].source` are the redacted
+  placeholder; `dest` and `inventory.entries[].path` are session-relative);
+* `assert_no_clock_value()` passed — the document carries no clock value;
+* `limitations[]` has **two** entries: G.6's privileged-writer sentence, and the digest-as-verifier
+  residual, present because and only because something was seeded;
+* **NEG-0 … NEG-8 all PASS**, so S1, S2 and S3 are three independent `PASS` verdicts.
+
+**What this proof does not claim.** It is not the §7 baseline. It used a synthetic seed and a
+trivial `--agent-command`, so it does not show the project's real Final Review agent
+*authenticating* — that is `B-1′`'s own mandatory step and its `preflight.log` is its own evidence.
+It also did not exercise `--agent-path`/`PATH` (unit-covered by T-10.12) or `--terminal`/O-1. What
+it does establish, which nothing before it did, is that **the production `isolate` path runs to
+completion with a seed in it and emits an attestation that satisfies every contract assertion the
+design places on it.**
+
+The attestation and the pre-flight log were kept for inspection at
+`<SESSION>/control/ISOLATION.json` and `<SESSION>/control/probes/preflight.log`, where `<SESSION>`
+is the path in `isolate_result.json`. The session was **not** torn down, so a reviewer can re-read
+both.
+
+### Additional Validation
+
+The full suite as the dispatch names it, plus the three companion gates.
+
+| gate | result |
+|---|---|
+| `python3 scripts/validate_skills.py` | **PASSED** (463 checks) |
+| `python3 -m unittest discover -s scripts -p 'test_*.py'` | **Ran 1167 tests in 742.6s — 2 failures, 6 skipped.** Both failures are `test_run_logging.RetainedReportWhitespaceExemptionTests` (`test_the_whitespace_gate_passes_over_the_whole_os22_range`, `test_the_gate_fails_again_once_the_exemption_is_removed`), which run `git diff --check` over the OS-22 commit range and find trailing whitespace in **committed review artifacts of other Runs** (`run_4d1c47c838db/REVIEW_DESIGN_iteration1.md`, `…/REVIEW_DESIGN_iteration2.md`, `run_75c5c6046f35/REVIEW_DESIGN_iteration2.md`, `…/REVIEW_TEST_iteration1.md`) — no file any step of this iteration touches. See **N-5**. |
+| `python3 scripts/verify_package.py` | **PASSED** (109 source files) |
+| `cmp scripts/run_logging.py orca-worker-reviewer-orchestration/tools/run_logging.py` | **identical** — no `run_logging.py` change was needed or made, so the byte-parity mirror is untouched |
+| `git diff --check` (working tree) | **exit 0**, clean |
+
+**The baseline this is measured against.** The same suite on the tree as it stood before this
+iteration's test file changed: **Ran 1134 tests, 2 failures** — the same two. This iteration adds
+**33 tests** (1134 → 1167) and **no new failure**: every test that passed before still passes, and
+every test added here passes.
+
+Two intermediate runs are recorded for completeness, because each one is a checkpoint the numbers
+should be reconcilable against: 1134 (baseline, before the T-10 block), 1165 (after T-10.1…T-10.19,
+the F-401 and F-402 tests), 1167 (after `SeedCliExitCodeTests`, which F-503 added).
+
+**Beyond the required suite**, each of these was executed rather than reasoned about:
+
+* the **seeded end-to-end capture** of `## End-to-End Proof` — `rc=0`, a valid `ISOLATION.json`,
+  NEG-0…NEG-8 all `PASS`, 182,986 files content-scanned, `/dev` contributing `0`;
+* the CLI's two exit codes at the production entry point — `rc=1` with `input error:` and no
+  traceback for a `--seed` grammar failure, `rc=4` with `isolation failure:` and no session left
+  behind for a refused source (both now also unit tests);
+* the FIFO/socket/character-device open behaviour of F-501's flag set, measured with a 1-second
+  alarm before the flag was chosen;
+* `assert_retained_path_field()` over the six destination forms of F-502, measured before the rule
+  was added.
+
+### Findings
+
+Three findings and two notes. All three findings are places where **DESIGN's text could not be
+implemented exactly as written**; in each case the code implements the smallest correction that
+preserves the property DESIGN itself states, and the deviation is reported here rather than folded
+into the diff. None of them touches a design *decision* — each is about the mechanism DESIGN
+specifies to enforce a rule it already decided, and each was found by running the finished code
+rather than by reading it.
+
+#### F-501 — D-6.8's flag set makes S-1's FIFO refusal unbounded, contradicting its own T-10.2
+
+* **DESIGN says** (D-6.8, the no-follow walk, step 3): the final component is opened
+  `os.open(base, O_RDONLY | O_NOFOLLOW | O_CLOEXEC, dir_fd=dfd)`, and (the per-pair table, step 2)
+  **S-1** is then decided from `stat.S_ISREG(os.fstat(fd).st_mode)`, which is what "refuses a
+  directory, FIFO, socket, character or block device".
+* **Why it cannot work as written.** S-1's refusal cannot happen until the descriptor exists, and
+  `os.open(<fifo>, O_RDONLY)` with no writer **blocks forever**. Measured on this host
+  (python 3.11, macOS 26.5.2 arm64), with a 1-second alarm:
+
+  ```text
+  os.open(<fifo>, O_RDONLY|O_NOFOLLOW|O_CLOEXEC)              -> BLOCKED, still blocked at 1s
+  os.open(<fifo>, O_RDONLY|O_NOFOLLOW|O_CLOEXEC|O_NONBLOCK)   -> ok in 0.000s, fstat -> prw-r--r--
+  os.open(<unix socket>, ...|O_NONBLOCK)                      -> OSError EOPNOTSUPP
+  os.open("/dev/zero", ...|O_NONBLOCK)                        -> ok, fstat -> crw-rw-rw-
+  os.open(<regular file>, ...|O_NONBLOCK)                     -> ok, contents read normally
+  ```
+
+  So the flag set DESIGN names refuses a FIFO only in **unbounded** time — which is F-401's defect
+  class reproduced at the seed door, and is exactly what the *same iteration's* **T-10.2** requires
+  be bounded (*"the FIFO bounded-time case is unchanged"*). D-6.8's measured-primitives block did
+  not include a FIFO open, which is why the inconsistency was not visible at design time.
+* **What was implemented**, and it is the smallest change that satisfies both DESIGN statements:
+  `_NO_FOLLOW_FILE_FLAGS` is `O_RDONLY | O_NOFOLLOW | O_CLOEXEC | **O_NONBLOCK**`. The open returns
+  immediately, `fstat()` reports `S_ISFIFO`, and S-1 refuses it — the refusal DESIGN specifies,
+  reached in bounded time. `O_NONBLOCK` is a no-op on a regular file, which is the only kind of
+  source that survives S-1 and reaches the read, so nothing else about D-6.8 changes. A unix socket
+  is refused one step earlier, by `EOPNOTSUPP` at the open, which is still exit `4` and still
+  "session removed"; its message was reworded from *"without following a symlink"* to *"as a
+  regular file without following a symlink"* so it does not misdescribe that case.
+* **Asserted, not asserted-about:** `T-10.2` now wraps the FIFO case in a wall-clock bound, and
+  `NonRegularScanTests` carries the same shape at the other end (`inventory_session_home()` and
+  `scan_readable_set()`), so a future edit that drops the flag fails a test instead of hanging a
+  capture.
+* **No design decision is affected.** S-1's rule, its evidence source (`fstat` on the one
+  descriptor) and its exit code are all exactly as DESIGN wrote them.
+
+#### F-502 — D-1 does not forbid an absolute `--seed` destination, and phase 2 then raised a raw `OSError`
+
+* **DESIGN says** (D-6.2, rule **D-1**): `run_logging.assert_retained_path_field("home/" + dest)`
+  *"already forbids a leading `/`, a drive letter, any `..` component, whitespace, `<`, `>`, `\` and
+  any URL form — so D-1 subsumes the entire traversal-escape check"*.
+* **Why it is not true for this input.** The field D-1 validates is the **concatenation**, so
+  `dest = "/abs"` is validated as `"home//abs"` — which has no leading `/`. Measured directly:
+
+  ```text
+  assert_retained_path_field("home//abs")       -> ACCEPTED
+  assert_retained_path_field("home/../escape")  -> refused
+  assert_retained_path_field("home/a b/x")      -> refused
+  assert_retained_path_field("home/x\\y")       -> refused
+  assert_retained_path_field("home/<x>")        -> refused
+  ```
+
+  Every other form DESIGN names *is* caught. The absolute one is not, and it then reached phase 2,
+  where `dest.split("/")` yields an empty first component and
+  `os.mkdir("", 0o700, dir_fd=parent_fd)` raised a bare `FileNotFoundError` **out of the seed
+  path** — an uncaught `OSError` instead of a refusal, i.e. not fail-closed in the way D-6.2
+  requires ("Every violation is exit 4").
+* **What was implemented:** `_validate_seed_destination()` refuses a destination with an empty,
+  `.` or `..` component, before D-2's component check, as `IsolationError` (exit `4`, the code
+  D-6.2 assigns to every D-rule violation). This is the **same grammar D-6.8 already requires of a
+  source**, applied to the destination; it adds no rule DESIGN did not already intend and removes
+  none.
+* **Asserted:** `T-10.6` now includes `/abs` among the refused destination forms, alongside
+  `../escape`, `a b/x`, `key/x`, `subject/x`, `adjudications/x`, `answer_key.json`, `x\y`, `<x>` and
+  a duplicate destination, and asserts no partial session is left behind.
+
+#### F-503 — the seed grammar's exit 1 arrived as an uncaught traceback, not as a message
+
+* **DESIGN says** (D-6.1, and D-6.8's two grammar additions): an argument-grammar failure is exit
+  `1` *"with the offending argument printed"*, consistent with every other grammar failure.
+* **What actually happened** on the first CLI run of the finished mechanism:
+
+  ```text
+  $ python3 scripts/final_review_eval.py isolate --run-id run_grammar --seed /no/colon/here …
+  Traceback (most recent call last):
+    …
+  review_isolation.IsolationSeedGrammarError: --seed takes exactly one ':' …
+  rc=1
+  ```
+
+  The **code** was right and the **path** was not: `IsolationSeedGrammarError` subclasses
+  `final_review_eval.EvalInputError` as `review_isolation` sees it, but `final_review_eval.py` runs
+  as `__main__` and `review_isolation` does its own `import final_review_eval`, so there are two
+  `EvalInputError` classes and `main()`'s `except EvalInputError` does not catch this one. Exit `1`
+  came from CPython's uncaught-exception default, which is not a contract — any future change to
+  the exception's base class would silently move it.
+* **What was implemented:** `_dispatch_isolate()` catches `review_isolation.IsolationSeedGrammarError`
+  explicitly, ahead of the two `IsolationError` clauses, and returns `EXIT_INPUT_ERROR` after
+  printing `input error: <message>` in `main()`'s own format. Verified: `rc=1`, the message on
+  stderr, no traceback.
+* **Asserted at the production entry point:** `SeedCliExitCodeTests` runs the real CLI and asserts
+  exit `1` with `input error:` and **no** `Traceback` for a grammar failure, and exit `4` with
+  `isolation failure:` and no session left behind for a refused source. An in-process
+  `assertRaises` proves which exception is raised, not which code an operator sees.
+
+#### N-4 — on darwin a `--seed` source must be given in its **resolved** spelling, and that is D-6.8 working
+
+`/var`, `/tmp` and `/etc` are symlinks on darwin, so `--seed /var/folders/…/auth.json:…` is refused
+at component 0 with `ELOOP` and `--seed /private/var/folders/…/auth.json:…` is accepted. That is
+D-6.8's contract behaving exactly as specified — the walk proves every component is not a symlink,
+which is what makes S-3's lexical containment sound — but it is a real operator-facing consequence
+that DESIGN does not spell out anywhere, and an operator meeting it for the first time will read it
+as a bug. It is recorded here, in the `--seed` refusal list in `CHANGELOG.md`, and in the docstring
+of the seed test base class. The measured real credential path
+(`/Users/<user>/.codex/auth.json`) is unaffected: `/Users` is a **firmlink**, not a symlink, and the
+walk opens it normally.
+
+#### N-5 — the two suite failures are pre-existing and are not this change's
+
+`python3 -m unittest discover -s scripts -p 'test_*.py'` finishes with **2 failures**, both
+`RetainedReportWhitespaceExemptionTests` running `git diff --check` over the OS-22 commit range and
+finding trailing whitespace in **committed review artifacts of other Runs** — this iteration's
+output includes `artifacts/runs/run_75c5c6046f35/REVIEW_TEST_iteration1.md`, a file no step of this
+iteration touches. They are the same two failures iteration 1 recorded as **F-302**, they fail
+identically on the tree as it stood before this change, and `git diff --check` over the **working
+tree** is clean (exit 0). Reported rather than fixed, for F-302's unchanged reason: rewriting
+another Run's committed review artifact to satisfy a whitespace gate would edit evidence.
+
+#### N-6 — two small shape choices, named so they are not mistaken for drift
+
+* **`assert_home_scanned(session, readable, probes)`** rather than DESIGN's data-flow spelling
+  `assert_home_scanned(readable)`. The requirement D-6.3 states has two halves — the root must be a
+  scanned Class USR entry **and** must appear in NEG-5's per-root record — and neither the root's
+  path nor the probe list is derivable from `readable` alone. The pseudo-code spelling is
+  illustrative; both checks are implemented, and the NEG-5 half is skipped only when NEG-5 did not
+  run at all (`--enforcement none`), never when it ran and failed.
+* **`counters["non_regular"]` is not surfaced in the NEG-5 probe record.** F-401's fix returns it
+  from `scan_readable_set()` and it is asserted in `NonRegularScanTests`, but the attestation's
+  per-root record carries the correlated `content_scanned` only, which is the shape DESIGN's
+  iteration-2 *Risks* section describes and which this iteration did not reopen. Over `/dev` it
+  reads `0`, which is the same fact from the other side (see `## End-to-End Proof`). Adding the
+  counter to `probes[NEG-5].roots[]` is a one-line additive change and would be a reasonable next
+  increment; it was deliberately **not** made here, because it would have invalidated the
+  end-to-end attestation this iteration produced as evidence and required a second 14-minute
+  capture for a cosmetic gain.
+* **`place_seed_sources()` tolerates `FileExistsError` from `os.mkdir`** on an intermediate
+  directory, and D-3's *"refuses to descend through anything it did not create"* still holds: the
+  session HOME is created empty by `build_session()` immediately above, seeding is the only thing
+  that writes into it before the scan, so the only pre-existing intermediate is one an **earlier
+  pair in the same call** created — which is what lets two pairs share `.codex/`. Anything else
+  fails the `O_DIRECTORY|O_NOFOLLOW` re-open, which is what actually enforces the rule.

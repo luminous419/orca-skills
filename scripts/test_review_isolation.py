@@ -14,6 +14,8 @@ carries the fail-closed guarantee, so the guarantee is never merely unasserted.
 
 from __future__ import annotations
 
+import dataclasses
+import errno
 import hashlib
 import json
 import os
@@ -22,8 +24,10 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import review_isolation
 from scripts import final_review_eval as evaluator
@@ -1184,6 +1188,48 @@ class NegativeContractTests(_IsolationTestCase):
         result = review_isolation._command_probe(self.session, "/bin/ls subject")
         self.assertTrue(result["discovered"], "review_root must remain readable")
 
+    def test_f402_the_generated_profile_actually_permits_a_write(self) -> None:
+        """F-402, asserted against an ACTUAL generated profile rather than a literal.
+
+        `tempfile.mkdtemp()` hands back `/var/folders/...` on darwin while
+        `compute_readable_set()` resolves every Class USR root to
+        `/private/var/folders/...`, so one generated profile's read clause and its write
+        clause named the same three directories two different ways -- and seatbelt, which
+        matches on the RESOLVED path, denied every write the session was supposed to
+        allow. An assertion over the profile TEXT would have passed against exactly that
+        profile, which is why this one runs the real launch line and looks at the
+        filesystem afterwards.
+        """
+        self.control()
+        for relative in ("review_root/probe.txt", "tmp/probe.txt", "home/probe.txt"):
+            with self.subTest(relative):
+                target = self.session / relative
+                if target.exists():
+                    target.unlink()
+                completed = subprocess.run(
+                    ["/bin/sh", "-c", review_isolation.wrap_command(
+                        self.session, f"/usr/bin/touch {target}"
+                    )],
+                    capture_output=True, text=True, check=False, timeout=120,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertTrue(target.is_file(),
+                                "the writable set must actually be writable")
+                target.unlink()
+
+    def test_f402b_every_writable_root_is_denied_outside_the_session(self) -> None:
+        """The other half: the corrected spelling must not have widened anything."""
+        self.control()
+        outside = Path(os.path.realpath(tempfile.gettempdir())) / "frv_f402_probe.txt"
+        completed = subprocess.run(
+            ["/bin/sh", "-c", review_isolation.wrap_command(
+                self.session, f"/usr/bin/touch {outside}"
+            )],
+            capture_output=True, text=True, check=False, timeout=120,
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertFalse(outside.exists())
+
     def test_t97_a_planted_key_copy_in_the_real_temp_dir_is_unreachable(self) -> None:
         """T-9.7 / NEG-7 -- the probe F-001 would have failed, control included."""
         probe = review_isolation._run_neg7(self.session, self.key_path, plant=True)
@@ -1317,6 +1363,809 @@ class ProbeFailClosedTests(unittest.TestCase):
         # sys.executable is frequently a user-installed python under $HOME, which is
         # never admitted; a probe that cannot exec proves nothing.
         self.assertEqual(review_isolation.SYSTEM_PYTHON, "/usr/bin/python3")
+
+
+# ---- T-10 the seed mechanism (DESIGN D-6.1 .. D-6.9) ---------------------------------
+#
+# Every test below runs over SYNTHETIC roots. None needs a network, a real credential or
+# the operator's own `$CODEX_HOME`, and none writes outside a temporary directory.
+#
+# The race tests are DETERMINISTIC: the substitution happens between two ordinary function
+# calls in the test body, with no threads, no timing and no retries. That is only possible
+# because D-6.8 split the mechanism into `read_seed_sources()` and `place_seed_sources()`
+# -- the seam the tests drive is the seam that ships.
+
+
+class _SeedTestCase(_IsolationTestCase):
+    """Seed sources live under the REALPATH of the temporary directory.
+
+    `tempfile.mkdtemp()` hands back `/var/folders/...` on darwin and `/var` is a symlink,
+    so an unresolved source path is refused by the no-follow walk at component 0. That is
+    D-6.8 working exactly as specified rather than a test inconvenience, and it is why
+    every test here resolves the base first.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.origin = Path(os.path.realpath(self.base)) / "origin"
+        self.origin.mkdir()
+
+    def key(self, fixture: Path = FIXTURE) -> dict:
+        return review_isolation._load_key_with_source(fixture)
+
+    def source(
+        self,
+        name: str,
+        text: str = '{"token": "synthetic-not-a-real-secret"}\n',
+        mode: int = 0o600,
+    ) -> Path:
+        path = self.origin / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        os.chmod(path, mode)
+        return path
+
+    def read_sources(self, *pairs: str, fixture: Path = FIXTURE, key: dict | None = None):
+        return review_isolation.read_seed_sources(
+            pairs,
+            key=self.key(fixture) if key is None else key,
+            fixture=fixture,
+            repo_root=REPO_ROOT,
+        )
+
+    def seed(self, session: Path, *pairs: str, fixture: Path = FIXTURE):
+        return review_isolation.seed_session_home(
+            session, pairs, key=self.key(fixture), fixture=fixture, repo_root=REPO_ROOT
+        )
+
+    def assert_no_key_byte_under_home(self, session: Path, fixture: Path = FIXTURE):
+        """The assertion F-001 is actually about: not `an error was raised`."""
+        key_bytes = (fixture / "key" / "answer_key.json").read_bytes()
+        tokens = evaluator.key_leak_tokens(self.key(fixture))
+        for path in sorted((session / "home").rglob("*")):
+            if not path.is_file() or path.is_symlink():
+                continue
+            raw = path.read_bytes()
+            self.assertNotIn(key_bytes, raw, f"{path} carries the answer key verbatim")
+            try:
+                text = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+            self.assertEqual(
+                evaluator.scan_leak_text(path, text, tokens), [],
+                f"{path} carries key vocabulary",
+            )
+
+
+class SeedPlacementTests(_SeedTestCase):
+    """T-10.1, T-10.7, T-10.8: what a valid pair does, and what an invalid one leaves."""
+
+    def test_t101_a_valid_pair_lands_with_both_identities_and_the_designed_modes(
+        self,
+    ) -> None:
+        source = self.source("auth.json")
+        raw = source.read_bytes()
+        session = self.build()
+
+        (record,) = self.seed(session, f"{source}:.codex/auth.json")
+
+        dest = session / "home" / ".codex" / "auth.json"
+        self.assertEqual(dest.read_bytes(), raw, "content is byte-identical")
+        self.assertEqual(dest.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(dest.parent.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(record.dest, "home/.codex/auth.json")
+        self.assertEqual(record.seeded_bytes, len(raw))
+        self.assertEqual(
+            record.seeded_sha256, review_isolation.sha256_bytes(raw),
+            "the as-copied digest is over the BUFFER, never over the pathname",
+        )
+        self.assertEqual(record.seeded_mode, "0600")
+        self.assertEqual(
+            record.source, review_isolation.run_logging.FOREIGN_PATH_PLACEHOLDER
+        )
+
+    def test_t101b_the_destination_is_created_by_o_excl(self) -> None:
+        # D-4 enforced by the kernel in the same call that creates the file, so the
+        # destination has no TOCTOU window either.
+        source = self.source("auth.json")
+        session = self.build()
+        sources = self.read_sources(f"{source}:.codex/auth.json")
+        review_isolation.place_seed_sources(session, sources)
+
+        with self.assertRaises(review_isolation.IsolationError) as caught:
+            review_isolation.place_seed_sources(session, sources)
+        self.assertIsInstance(caught.exception.__cause__, FileExistsError)
+
+    def test_t107_the_per_source_total_and_count_caps_all_bind(self) -> None:
+        session = self.build()
+        oversized = self.source("big.json", "x" * (review_isolation.MAX_SEED_BYTES + 1))
+        with self.assertRaises(review_isolation.IsolationError):
+            self.seed(session, f"{oversized}:big.json")
+
+        pairs = []
+        for index in range(5):                      # 5 MiB against a 4 MiB total cap
+            path = self.source(f"one_mib_{index}.json", "y" * review_isolation.MAX_SEED_BYTES)
+            pairs.append(f"{path}:m{index}.json")
+        with self.assertRaises(review_isolation.IsolationError):
+            self.seed(session, *pairs)
+
+        many = [
+            f"{self.source(f'n{index}.json')}:n{index}.json"
+            for index in range(review_isolation.MAX_SEEDS + 1)
+        ]
+        with self.assertRaises(review_isolation.IsolationError):
+            self.seed(session, *many)
+        self.assertEqual(
+            sorted(p.name for p in (session / "home").rglob("*")), [],
+            "a refused batch leaves NOTHING in the session HOME",
+        )
+
+    def test_t108_validate_all_then_copy_leaves_neither_pair_behind(self) -> None:
+        good = self.source("good.json")
+        bad = self.source("bad.zip")               # S-6
+        session = self.build()
+
+        with self.assertRaises(review_isolation.IsolationError):
+            self.seed(session, f"{good}:good.json", f"{bad}:bad.zip")
+
+        self.assertFalse((session / "home" / "good.json").exists(),
+                         "pair 1 must not be placed when pair 2 is refused")
+        self.assertEqual(list((session / "home").iterdir()), [])
+
+
+class SeedSourceRefusalTests(_SeedTestCase):
+    """T-10.2 .. T-10.5: the source half of the closed refusal list (D-6.5)."""
+
+    def test_t102_a_directory_a_symlink_and_a_fifo_are_each_refused(self) -> None:
+        session = self.build()
+        directory = self.origin / "adir"
+        directory.mkdir()
+        real = self.source("real.json")
+        link = self.origin / "link.json"
+        os.symlink(str(real), str(link))
+        fifo = self.origin / "pipe"
+        os.mkfifo(str(fifo))
+
+        with self.assertRaises(review_isolation.IsolationError) as caught:
+            self.seed(session, f"{directory}:d.json")
+        self.assertIn("not a regular file", str(caught.exception))
+
+        # S-1's symlink case is decided by the NO-FOLLOW OPEN, not by an `lstat` on a
+        # pathname that could be re-pointed afterwards: the kernel refuses in the same
+        # call that would have handed back the descriptor.
+        with self.assertRaises(review_isolation.IsolationError) as caught:
+            self.seed(session, f"{link}:l.json")
+        self.assertIsInstance(caught.exception.__cause__, OSError)
+        self.assertEqual(caught.exception.__cause__.errno, errno.ELOOP)
+
+        # ... and at an INTERMEDIATE component too, which is what makes S-3's lexical
+        # containment sound (T-10.15 proves the consequence).
+        os.symlink(str(directory), str(self.origin / "alink"))
+        (directory / "inner.json").write_text("{}", encoding="utf-8")
+        with self.assertRaises(review_isolation.IsolationError) as caught:
+            self.seed(session, f"{self.origin / 'alink' / 'inner.json'}:i.json")
+        # A symlink component raises ELOOP and a non-directory raises ENOTDIR; darwin
+        # answers O_DIRECTORY|O_NOFOLLOW over a symlink-to-directory with ENOTDIR.
+        # DESIGN's error table names both, and both are exit 4.
+        self.assertIn(caught.exception.__cause__.errno, (errno.ELOOP, errno.ENOTDIR))
+
+        # The FIFO must be refused in BOUNDED TIME. `os.open(<fifo>, O_RDONLY)` with no
+        # writer blocks forever, which is F-401's defect class at the seed door; the
+        # O_NONBLOCK in `_NO_FOLLOW_FILE_FLAGS` is what makes `fstat` reachable at all.
+        started = time.monotonic()
+        with self.assertRaises(review_isolation.IsolationError) as caught:
+            self.seed(session, f"{fifo}:p.json")
+        self.assertLess(time.monotonic() - started, 30.0,
+                        "S-1 must refuse a FIFO in bounded time")
+        self.assertIn("not a regular file", str(caught.exception))
+        self.assertEqual(list((session / "home").iterdir()), [])
+
+    def test_t103_the_repository_the_fixture_and_key_names_are_each_refused(self) -> None:
+        session = self.build()
+        fixture = self.synthetic_fixture()
+        cases = {
+            "under the fixture": fixture / "README.md",
+            "under key/": fixture / "key" / "answer_key.json",
+            "a key/ component elsewhere": self.source("key/other.json"),
+            "an adjudications/ component": self.source("adjudications/other.json"),
+            "under the repository": REPO_ROOT / "VERSION",
+            "merely NAMED answer_key.json": self.source("answer_key.json", "{}\n"),
+        }
+        for label, path in cases.items():
+            with self.subTest(label):
+                with self.assertRaises(review_isolation.IsolationError):
+                    self.seed(session, f"{path}:x.json", fixture=fixture)
+        self.assertEqual(list((session / "home").iterdir()), [])
+
+    def test_t104_a_source_carrying_key_vocabulary_is_refused_before_the_copy(
+        self,
+    ) -> None:
+        session = self.build()
+        contaminated = self.source(
+            "notes.json", f'{{"marker": "{review_isolation.KEY_CONTENT_MARKER}"}}\n'
+        )
+
+        with self.assertRaises(review_isolation.IsolationError) as caught:
+            self.seed(session, f"{contaminated}:notes.json")
+
+        self.assertIn("key vocabulary", str(caught.exception))
+        self.assertFalse((session / "home" / "notes.json").exists(),
+                         "the exit-4 path must have nothing to remove")
+
+    def test_t105_an_executable_an_archive_and_a_non_utf8_source_are_refused(
+        self,
+    ) -> None:
+        session = self.build()
+        executable = self.source("run.sh", "#!/bin/sh\nexit 0\n", mode=0o700)
+        archive = self.source("bundle.zip", "not really a zip")
+        binary = self.origin / "blob.json"
+        binary.write_bytes(b"\xff\xfe\x00\x01")
+        os.chmod(binary, 0o600)
+
+        for label, path, needle in (
+            ("S-5 executable", executable, "executable"),
+            ("S-6 archive", archive, "archive"),
+            ("S-7 not UTF-8", binary, "UTF-8"),
+        ):
+            with self.subTest(label):
+                with self.assertRaises(review_isolation.IsolationError) as caught:
+                    self.seed(session, f"{path}:x.json")
+                self.assertIn(needle, str(caught.exception))
+
+
+class SeedDestinationRefusalTests(_SeedTestCase):
+    """T-10.6: the destination half (D-1 .. D-4), plus the argument grammar (D-6.1)."""
+
+    def test_t106_every_refused_destination_form_is_refused(self) -> None:
+        session = self.build()
+        source = self.source("auth.json")
+        for dest in ("../escape", "/abs", "a b/x", "key/x", "subject/x",
+                     "adjudications/x", "answer_key.json", "x\\y", "<x>"):
+            with self.subTest(dest):
+                with self.assertRaises(review_isolation.IsolationError):
+                    self.seed(session, f"{source}:{dest}")
+        with self.assertRaises(review_isolation.IsolationError):
+            self.seed(session, f"{source}:dup.json", f"{source}:dup.json")
+        self.assertEqual(list((session / "home").iterdir()), [],
+                         "no partial session is left behind")
+
+    def test_t106b_the_argument_grammar_is_exit_one_not_exit_four(self) -> None:
+        # A grammar failure builds nothing, so there is nothing to remove -- which is why
+        # it is EvalInputError (exit 1) and not IsolationError (exit 4).
+        source = self.source("auth.json")
+        for pair in (f"{source}", f"{source}:a:b", f"{source}:", "relative:a.json",
+                     "/a/../b:a.json", "/a//b:a.json"):
+            with self.subTest(pair):
+                with self.assertRaises(review_isolation.IsolationSeedGrammarError):
+                    review_isolation.read_seed_sources(
+                        [pair], key=self.key(), fixture=FIXTURE, repo_root=REPO_ROOT
+                    )
+        self.assertTrue(
+            issubclass(review_isolation.IsolationSeedGrammarError,
+                       review_isolation.final_review_eval.EvalInputError)
+        )
+
+
+class _StatShim:
+    """A stat result whose `st_size` lies, and nothing else. See T-10.17."""
+
+    def __init__(self, st_mode: int, st_size: int, st_dev: int, st_ino: int) -> None:
+        self.st_mode = st_mode
+        self.st_size = st_size
+        self.st_dev = st_dev
+        self.st_ino = st_ino
+
+
+class SeedCliExitCodeTests(_SeedTestCase):
+    """D-6.1/D-6.8's two exit codes, asserted at the PRODUCTION entry point.
+
+    An in-process `assertRaises` proves which exception is raised, not which code an
+    operator sees. These run the CLI.
+    """
+
+    def test_a_grammar_failure_is_exit_one_with_a_message_not_a_traceback(self) -> None:
+        completed = run_cli(
+            "isolate", "--run-id", "run_cli_grammar",
+            "--seed", "/no/colon/here", "--enforcement", "none",
+        )
+        self.assertEqual(completed.returncode, 1, completed.stderr)
+        self.assertIn("input error:", completed.stderr)
+        self.assertNotIn("Traceback", completed.stderr)
+
+    def test_a_refused_source_is_exit_four_with_no_session_left(self) -> None:
+        contaminated = self.source(
+            "notes.json", f'{{"m": "{review_isolation.KEY_CONTENT_MARKER}"}}\n'
+        )
+        base = Path(os.path.realpath(self.base)) / "sessions"
+        base.mkdir()
+        completed = run_cli(
+            "isolate", "--run-id", "run_cli_refusal", "--session-base", str(base),
+            "--seed", f"{contaminated}:notes.json", "--enforcement", "none",
+        )
+        self.assertEqual(completed.returncode, 4, completed.stderr)
+        self.assertIn("isolation failure:", completed.stderr)
+        self.assertEqual(list(base.iterdir()), [],
+                         "a refused seed leaves no session behind")
+
+
+class SeedSubstitutionRaceTests(_SeedTestCase):
+    """T-10.13 .. T-10.17: F-001, made deterministic by driving the phase seam."""
+
+    def test_t1013_a_substitution_between_the_phases_changes_nothing_observable(
+        self,
+    ) -> None:
+        fixture = self.synthetic_fixture()
+        key_file = fixture / "key" / "answer_key.json"
+        for label, substitute in (
+            ("replaced by a different regular file",
+             lambda p: p.write_text('{"token": "SWAPPED"}\n', encoding="utf-8")),
+            ("replaced by a symlink into the fixture's key/",
+             lambda p: (p.unlink(), os.symlink(str(key_file), str(p)))),
+            ("replaced by a directory", lambda p: (p.unlink(), p.mkdir())),
+            ("deleted outright", lambda p: p.unlink()),
+        ):
+            with self.subTest(label):
+                session = self.build()
+                source = self.source(
+                    "auth.json", '{"token": "the-original-and-only-bytes"}\n'
+                )
+                original = source.read_bytes()
+
+                sources = self.read_sources(
+                    f"{source}:.codex/auth.json", fixture=fixture
+                )
+                substitute(source)                        # <-- the race, deterministic
+                (record,) = review_isolation.place_seed_sources(session, sources)
+
+                dest = session / "home" / ".codex" / "auth.json"
+                self.assertEqual(dest.read_bytes(), original,
+                                 "phase 2 writes the BUFFER, never a re-read source")
+                self.assertEqual(
+                    record.seeded_sha256, review_isolation.sha256_bytes(original)
+                )
+                self.assertFalse(dest.is_symlink())
+                self.assert_no_key_byte_under_home(session, fixture)
+                self.origin_reset()
+
+    def origin_reset(self) -> None:
+        shutil.rmtree(self.origin, ignore_errors=True)
+        self.origin.mkdir()
+
+    def test_t1014_a_substitution_can_never_bypass_a_refusal(self) -> None:
+        fixture = self.synthetic_fixture()
+        key_file = fixture / "key" / "answer_key.json"
+        session = self.build()
+
+        # (i) a source S-3 refuses stays refused whatever it is replaced with afterwards:
+        # phase 1 raised, so there is no `sources` tuple for phase 2 to be handed.
+        with self.assertRaises(review_isolation.IsolationError):
+            self.read_sources(f"{key_file}:.codex/auth.json", fixture=fixture)
+        replacement = self.source("innocuous.json")
+        self.assertEqual(list((session / "home").iterdir()), [])
+
+        # (ii) a source valid at phase 1 cannot be turned into one that should have been
+        # refused, because phase 2 NEVER LOOKS -- not even at the answer key itself.
+        sources = self.read_sources(f"{replacement}:.codex/auth.json", fixture=fixture)
+        original = replacement.read_bytes()
+        replacement.write_bytes(key_file.read_bytes())    # byte-identical to the key
+        (record,) = review_isolation.place_seed_sources(session, sources)
+
+        dest = session / "home" / ".codex" / "auth.json"
+        self.assertEqual(dest.read_bytes(), original)
+        self.assertEqual(record.seeded_bytes, len(original))
+        self.assert_no_key_byte_under_home(session, fixture)
+
+    def test_t1015_the_walk_decides_over_components_not_over_a_pathname(self) -> None:
+        fixture = self.synthetic_fixture()
+        session = self.build()
+        inside = fixture / "adjudications"
+        (inside / "auth.json").write_text('{"token": "x"}\n', encoding="utf-8")
+        os.chmod(inside / "auth.json", 0o600)
+
+        os.symlink(str(inside), str(self.origin / "a"))
+        with self.assertRaises(review_isolation.IsolationError) as caught:
+            self.seed(session, f"{self.origin / 'a' / 'auth.json'}:auth.json",
+                      fixture=fixture)
+        self.assertIn(caught.exception.__cause__.errno, (errno.ELOOP, errno.ENOTDIR))
+        self.assertFalse((session / "home" / "auth.json").exists())
+
+        real = self.origin / "b"
+        real.mkdir()
+        (real / "auth.json").write_text('{"token": "y"}\n', encoding="utf-8")
+        os.chmod(real / "auth.json", 0o600)
+        self.seed(session, f"{real / 'auth.json'}:auth.json", fixture=fixture)
+        self.assertTrue((session / "home" / "auth.json").is_file())
+
+    def test_t1016_s8_refuses_a_hard_link_alias_of_key_material(self) -> None:
+        fixture = self.synthetic_fixture()
+        session = self.build()
+
+        # (a) a hard link to the answer key, planted OUTSIDE every refused root. S-4 and
+        # S-8 each refuse it; each is asserted with the OTHER disabled, so neither is
+        # carrying the other.
+        alias = self.origin / "alias.json"
+        os.link(str(fixture / "key" / "answer_key.json"), str(alias))
+        os.chmod(alias, 0o600)
+
+        with mock.patch.object(review_isolation, "_key_bearing_inodes",
+                               return_value=set()):
+            with self.assertRaises(review_isolation.IsolationError) as caught:
+                self.seed(session, f"{alias}:a.json", fixture=fixture)
+        self.assertNotIn("S-8", str(caught.exception))       # S-4 alone
+
+        with mock.patch.object(review_isolation, "_answer_key_digest",
+                               return_value=None), \
+             mock.patch.object(review_isolation.final_review_eval,
+                               "key_leak_tokens", return_value=set()):
+            with self.assertRaises(review_isolation.IsolationError) as caught:
+                self.seed(session, f"{alias}:a.json", fixture=fixture)
+        self.assertIn("S-8", str(caught.exception))          # S-8 alone
+
+        # (b) the case S-4 ALONE would pass: a hard link to a non-key regular file under
+        # `key/` whose content carries no key vocabulary at all.
+        plain = fixture / "key" / "state.json"
+        plain.write_text('{"session": "nothing secret here"}\n', encoding="utf-8")
+        os.chmod(plain, 0o600)
+        plain_alias = self.origin / "state.json"
+        os.link(str(plain), str(plain_alias))
+        self.assertEqual(
+            evaluator.scan_leak_text(
+                plain_alias, plain_alias.read_text(encoding="utf-8"),
+                evaluator.key_leak_tokens(self.key(fixture)),
+            ),
+            [], "the control: S-4 alone would let this through",
+        )
+        with self.assertRaises(review_isolation.IsolationError) as caught:
+            self.seed(session, f"{plain_alias}:s.json", fixture=fixture)
+        self.assertIn("S-8", str(caught.exception))
+
+        # (c) the cap fails CLOSED rather than running against a truncated set.
+        with mock.patch.object(review_isolation, "MAX_KEY_INODES", 0):
+            with self.assertRaises(review_isolation.IsolationError) as caught:
+                review_isolation._key_bearing_inodes(fixture)
+        self.assertIn("MAX_KEY_INODES", str(caught.exception))
+        self.assertEqual(list((session / "home").iterdir()), [])
+
+    def test_t1017_the_by_construction_guarantees_hold(self) -> None:
+        source = self.source("auth.json")
+        (seed_source,) = self.read_sources(f"{source}:.codex/auth.json")
+        session = self.build()
+        (record,) = review_isolation.place_seed_sources(session, [seed_source])
+
+        for frozen, field in ((seed_source, "dest"), (record, "seeded_sha256")):
+            with self.subTest(type(frozen).__name__):
+                with self.assertRaises(dataclasses.FrozenInstanceError):
+                    setattr(frozen, field, "rewritten")
+
+        self.assertEqual(
+            seed_source.source, review_isolation.run_logging.FOREIGN_PATH_PLACEHOLDER
+        )
+        for name in ("dest", "source", "sha256"):
+            value = getattr(seed_source, name)
+            self.assertFalse(
+                os.path.exists(value),
+                f"SeedSource.{name} must not be a path phase 2 could re-open",
+            )
+        self.assertNotIn(str(self.origin), repr(seed_source))
+
+        # The READ CEILING, not the advisory `st_size`, is what binds. Simulated at the
+        # one seam where a real grow-after-fstat would show: `fstat` under-reports, the
+        # descriptor then yields more than the cap, and step 5 refuses.
+        big = self.source("grew.json", "z" * (review_isolation.MAX_SEED_BYTES + 64))
+        real_fstat = os.fstat
+
+        def lying_fstat(fd):
+            st = real_fstat(fd)
+            return _StatShim(st.st_mode, 12, st.st_dev, st.st_ino)
+
+        key = self.key()
+        with mock.patch.object(os, "fstat", lying_fstat):
+            with self.assertRaises(review_isolation.IsolationError) as caught:
+                self.read_sources(f"{big}:grew.json", key=key)
+        self.assertIn("read ceiling", str(caught.exception))
+
+    def test_the_seed_path_never_names_copyfile_or_sha256_path(self) -> None:
+        # The single-open-descriptor contract is the whole of F-001's answer, so the two
+        # pathname-oriented operations it removes are asserted absent by inspection.
+        text = (REPO_ROOT / "scripts" / "review_isolation.py").read_text(encoding="utf-8")
+        start = text.index("def read_seed_sources(")
+        end = text.index("def inventory_session_home(")
+        seed_path = text[start:end]
+        self.assertNotIn("shutil.copyfile", seed_path)
+        self.assertNotIn("sha256_path", seed_path)
+
+
+class SeedAttestationTests(_SeedTestCase):
+    """T-10.9 .. T-10.11, T-10.18, T-10.19: the two identities, and the single reader."""
+
+    def attest(self, session: Path, manifest):
+        inventory = review_isolation.inventory_session_home(session)
+        return review_isolation.attest_seeds(manifest, inventory), inventory
+
+    def test_t109_the_session_home_is_not_exempt_from_the_admission_scan(self) -> None:
+        # The seed door refuses key vocabulary (T-10.4), and the admission scan refuses it
+        # again over the root the seed lands in. This plants DIRECTLY, so what is under
+        # test is the scan's coverage of `<SESSION>/home` rather than the seed door.
+        session = self.build()
+        (session / "home" / "leak.json").write_text(
+            f'{{"m": "{review_isolation.KEY_CONTENT_MARKER}"}}\n', encoding="utf-8"
+        )
+        with self.assertRaises(review_isolation.IsolationError) as caught:
+            review_isolation.compute_readable_set(
+                session, self.key(), imm_candidates=()
+            )
+        self.assertIn("key material is reachable", str(caught.exception))
+
+    def test_t1010_the_record_shape_is_the_two_identity_one(self) -> None:
+        source = self.source("auth.json")
+        session = self.build()
+        manifest = self.seed(session, f"{source}:.codex/auth.json")
+        seeded, inventory = self.attest(session, manifest)
+
+        (row,) = seeded
+        for field in ("seeded_bytes", "seeded_sha256", "seeded_mode",
+                      "observed_bytes", "observed_sha256", "observed_mode", "state"):
+            self.assertIn(field, row)
+        for retired in ("bytes", "sha256", "mode"):
+            self.assertNotIn(retired, row, "iteration 2's single field is REMOVED")
+        review_isolation.run_logging.assert_retained_path_field(row["dest"])
+        for entry in inventory["entries"]:
+            review_isolation.run_logging.assert_retained_path_field(entry["path"])
+        self.assertEqual(
+            row["source"], review_isolation.run_logging.FOREIGN_PATH_PLACEHOLDER
+        )
+
+        document = review_isolation.build_attestation(
+            run_id="run_t", attempt=1, terminal="", session=session,
+            enforcement="none",
+            readable={"entries": [], "carve_outs": []},
+            traversal=[], writable=[], denied=[], profile_digest=None,
+            probes=[{"id": "NEG-1", "result": "PASS"}],
+            session_home={
+                "seed_policy": review_isolation.SEED_POLICY_STATEMENT,
+                "seeded": seeded, "inventory": inventory,
+                "scanned_by": ["compute_readable_set:USR", "NEG-5"],
+            },
+        )
+        review_isolation.assert_no_clock_value(document)
+        self.assertEqual(document["schema_version"], "1.1")
+        self.assertIn(review_isolation.SEED_DIGEST_LIMITATION, document["limitations"])
+
+    def test_t1011_the_inventory_is_the_single_reader_and_opens_nothing_it_should_not(
+        self,
+    ) -> None:
+        source = self.source("auth.json")
+        session = self.build()
+        manifest = self.seed(session, f"{source}:.codex/auth.json")
+        (session / "home" / "history.jsonl").write_text("{}\n", encoding="utf-8")
+        fifo = session / "home" / "agent.sock"
+        os.mkfifo(str(fifo))
+
+        started = time.monotonic()
+        seeded, inventory = self.attest(session, manifest)
+        self.assertLess(time.monotonic() - started, 30.0,
+                        "the walk lstat()s and NEVER opens a non-regular entry")
+
+        by_path = {entry["path"]: entry for entry in inventory["entries"]}
+        self.assertEqual(by_path["home/.codex/auth.json"]["origin"], "seed")
+        self.assertEqual(by_path["home/history.jsonl"]["origin"], "session")
+        self.assertEqual(by_path["home/agent.sock"]["kind"], "fifo")
+        self.assertNotIn("sha256", by_path["home/agent.sock"])
+        self.assertEqual(inventory["seeded_unmodified"], 1)
+        self.assertEqual(inventory["seeded_modified"], 0)
+        self.assertEqual(inventory["unseeded"], inventory["files"] - 1)
+        self.assertEqual(
+            by_path["home/.codex/auth.json"]["sha256"], seeded[0]["observed_sha256"],
+            "one read, so the two views cannot disagree",
+        )
+
+        with mock.patch.object(review_isolation, "MAX_HOME_INVENTORY", 1):
+            with self.assertRaises(review_isolation.IsolationError) as caught:
+                review_isolation.inventory_session_home(session)
+        self.assertIn("MAX_HOME_INVENTORY", str(caught.exception))
+
+    def test_t1011b_the_tree_digest_is_stable_across_two_identical_sessions(self) -> None:
+        digests = []
+        for _ in range(2):
+            session = self.build()
+            (session / "home" / "a.json").write_text("alpha\n", encoding="utf-8")
+            (session / "home" / "b").mkdir()
+            (session / "home" / "b" / "c.json").write_text("beta\n", encoding="utf-8")
+            digests.append(review_isolation.inventory_session_home(session)["tree_digest"])
+        self.assertEqual(digests[0], digests[1])
+
+    def test_t1018_a_modified_seed_keeps_both_identities(self) -> None:
+        source = self.source("auth.json", '{"token": "before"}\n')
+        before = source.read_bytes()
+        session = self.build()
+        manifest = self.seed(session, f"{source}:.codex/auth.json")
+
+        dest = session / "home" / ".codex" / "auth.json"
+        after = b'{"token": "after-the-agent-refreshed-it"}\n'
+        dest.write_bytes(after)                    # the agent rewriting its credential
+
+        seeded, inventory = self.attest(session, manifest)
+        (row,) = seeded
+        self.assertEqual(row["seeded_bytes"], len(before))
+        self.assertEqual(row["seeded_sha256"], review_isolation.sha256_bytes(before))
+        self.assertEqual(row["observed_bytes"], len(after))
+        self.assertEqual(row["observed_sha256"], review_isolation.sha256_bytes(after))
+        self.assertEqual(row["state"], "modified")
+        self.assertEqual(inventory["seeded_unmodified"], 0)
+        self.assertEqual(inventory["seeded_modified"], 1)
+        self.assertEqual(
+            inventory["entries"][0]["sha256"], row["observed_sha256"]
+        )
+
+        # A MODE-only change is not a `state` change: `state` answers "are these the bytes
+        # we supplied", which is B6's question.
+        dest.write_bytes(before)
+        os.chmod(dest, 0o644)
+        (row,) = self.attest(session, manifest)[0]
+        self.assertEqual(row["observed_mode"], "0644")
+        self.assertEqual(row["seeded_mode"], "0600")
+        self.assertEqual(row["state"], "unmodified")
+
+    def test_t1019_the_unmodified_case_and_the_immutability_guard(self) -> None:
+        source = self.source("auth.json")
+        session = self.build()
+        manifest = self.seed(session, f"{source}:.codex/auth.json")
+
+        seeded, inventory = self.attest(session, manifest)
+        (row,) = seeded
+        self.assertEqual(row["state"], "unmodified")
+        self.assertEqual(row["observed_sha256"], row["seeded_sha256"])
+        self.assertEqual(row["observed_bytes"], row["seeded_bytes"])
+        self.assertEqual(inventory["seeded_unmodified"], 1)
+
+        for field in ("seeded_bytes", "seeded_sha256", "seeded_mode", "dest", "source"):
+            with self.subTest(field):
+                with self.assertRaises(dataclasses.FrozenInstanceError):
+                    setattr(manifest[0], field, "rewritten")
+
+        # A declared destination absent from the inventory is exit 4 -- never a dropped
+        # row and never an invented one.
+        (session / "home" / ".codex" / "auth.json").unlink()
+        with self.assertRaises(review_isolation.IsolationError) as caught:
+            self.attest(session, manifest)
+        self.assertIn("absent from the session HOME", str(caught.exception))
+
+
+class AgentPathTests(_SeedTestCase):
+    """T-10.12: `--agent-path` can never exceed what `--allow-read` scanned."""
+
+    def test_t1012_an_unadmitted_entry_is_refused_and_an_admitted_one_leads_path(
+        self,
+    ) -> None:
+        session = self.build()
+        elsewhere = self.origin / "bin"
+        elsewhere.mkdir()
+        readable = review_isolation.compute_readable_set(
+            session, self.key(), imm_candidates=(), allow_read=[str(elsewhere)]
+        )
+
+        with self.assertRaises(review_isolation.IsolationError):
+            review_isolation.assert_agent_path_admitted([str(self.origin)], readable)
+
+        admitted = review_isolation.assert_agent_path_admitted(
+            [str(elsewhere)], readable
+        )
+        line = review_isolation.wrap_command(session, "AGENT", admitted)
+        self.assertIn(f"PATH={str(elsewhere)}:/usr/bin:", line)
+        self.assertLess(line.index(str(elsewhere)), line.index("/usr/bin"))
+        self.assertIn(f"TMPDIR={session / 'tmp'}", line)
+        self.assertIn(f"HOME={session / 'home'}", line)
+
+    def test_the_launch_line_is_byte_identical_with_no_agent_path(self) -> None:
+        session = self.build()
+        self.assertEqual(
+            review_isolation.wrap_command(session, "AGENT"),
+            review_isolation.wrap_command(session, "AGENT", ()),
+        )
+        self.assertNotIn("PATH=", review_isolation.wrap_command(session, "AGENT"))
+
+
+class WritableSetSpellingTests(_IsolationTestCase):
+    """F-402 at the unit level: one path, one spelling, decided where it enters.
+
+    The integration half lives in `NegativeContractTests.test_f402_*`, which runs the
+    real launch line against a real generated profile. This half is what makes the
+    regression cheap to catch on every run.
+    """
+
+    def test_build_session_returns_a_resolved_path(self) -> None:
+        session = self.build()
+        self.assertEqual(str(session), os.path.realpath(session))
+
+    def test_the_readable_and_writable_spellings_of_one_root_agree(self) -> None:
+        session = self.build()
+        readable = review_isolation.compute_readable_set(
+            session, review_isolation._load_key_with_source(FIXTURE), imm_candidates=()
+        )
+        admitted = {entry["path"] for entry in readable["entries"]}
+        for relative in ("review_root", "tmp", "home"):
+            with self.subTest(relative):
+                writable = str(review_isolation._realpath(session / relative))
+                self.assertEqual(writable, str(session / relative),
+                                 "the session path is already resolved, so these are the "
+                                 "same string and seatbelt sees one directory")
+                self.assertIn(writable, admitted,
+                              "a write clause naming a directory the read clause spells "
+                              "differently is a profile that allows nothing")
+
+
+class NonRegularScanTests(_IsolationTestCase):
+    """F-401: the scan COUNTS a non-regular entry and never opens one.
+
+    The finding as filed is `/dev`, whose 459 character and block devices SIGKILLed the
+    section 7 capture at 17m44s. `/dev/zero` cannot be reproduced in a unit test without
+    root, but a FIFO reproduces the same defect exactly -- `read_text()` on one never
+    returns -- and the fix is the same general policy for both.
+    """
+
+    def test_a_fifo_under_an_admitted_root_is_counted_and_not_opened(self) -> None:
+        root = Path(os.path.realpath(self.base)) / "root"
+        root.mkdir()
+        (root / "plain.txt").write_text("nothing to see\n", encoding="utf-8")
+        os.mkfifo(str(root / "pipe"))
+
+        started = time.monotonic()
+        scan = review_isolation.scan_readable_set(
+            review_isolation._load_key_with_source(FIXTURE), root
+        )
+        self.assertLess(time.monotonic() - started, 30.0)
+        self.assertEqual(scan["hits"], [])
+        self.assertEqual(scan["files"], 2, "a non-regular entry is still COUNTED")
+        self.assertEqual(scan["non_regular"], 1)
+        self.assertEqual(scan["content_scanned"], 1, "only the regular file was opened")
+
+    def test_a_non_regular_entry_named_like_an_archive_is_not_handed_to_tarfile(
+        self,
+    ) -> None:
+        # Pass D opens what it is handed too, so the S_ISREG gate has to precede it.
+        root = Path(os.path.realpath(self.base)) / "root_d"
+        root.mkdir()
+        os.mkfifo(str(root / "bundle.tar"))
+        started = time.monotonic()
+        scan = review_isolation.scan_readable_set(
+            review_isolation._load_key_with_source(FIXTURE), root
+        )
+        self.assertLess(time.monotonic() - started, 30.0)
+        self.assertEqual(scan["archives"], 0)
+        self.assertEqual(scan["non_regular"], 1)
+        self.assertEqual(scan["hits"], [])
+
+    def test_the_production_entry_point_terminates_on_a_non_regular_entry(self) -> None:
+        # BOUNDED, and at the entry point a capture actually uses: `compute_readable_set`
+        # over an `--allow-read` root. Run in a subprocess with a hard timeout so a
+        # regression FAILS rather than hanging the suite forever.
+        root = Path(os.path.realpath(self.base)) / "allowed"
+        root.mkdir()
+        (root / "notes.txt").write_text("ordinary\n", encoding="utf-8")
+        os.mkfifo(str(root / "agent.sock"))
+        session = self.build()
+
+        program = textwrap.dedent(
+            f"""
+            import sys
+            sys.path.insert(0, {str(REPO_ROOT / "scripts")!r})
+            sys.path.insert(0, {str(REPO_ROOT)!r})
+            from pathlib import Path
+            import review_isolation as ri
+            readable = ri.compute_readable_set(
+                Path({str(session)!r}),
+                ri._load_key_with_source(Path({str(FIXTURE)!r})),
+                imm_candidates=(), allow_read=[{str(root)!r}],
+            )
+            print(len(readable["entries"]))
+            """
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", program], cwd=REPO_ROOT, capture_output=True,
+            text=True, check=False, timeout=180,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.strip(), "4")
 
 
 if __name__ == "__main__":       # pragma: no cover
