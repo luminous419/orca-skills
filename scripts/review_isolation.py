@@ -20,10 +20,13 @@ SEPARATELY so a partial result can never be read as a whole one:
                        contain no key material and no path relationship to key/
     S2 unreadability   no absolute path outside the computed readable set is readable
                        OR STAT-ABLE, including via git
-    S3 cleanliness     every path that IS readable is covered by one of exactly two
-                       proofs -- exhaustively content-scanned (Class USR), or
-                       exhaustively proven immutable so that planting is impossible
-                       (Class IMM). There is no third way in.
+    S3 cleanliness     every path that IS readable is exhaustively content-scanned --
+                       BOTH classes, at NEG-5, the only per-class difference being pass
+                       B's vocabulary. The recursive immutability proof is what makes
+                       the Class IMM scan DURABLE (nothing unprivileged can add content
+                       after it), not what replaces it: the proof never opens a file and
+                       so says nothing about content that was already there. There is no
+                       third way in.
 
 The threat model is stated rather than implied: an unconstrained but WELL-BEHAVED
 reviewer agent, one that reads absolute paths, runs `git` and greps broadly because
@@ -484,11 +487,19 @@ def prove_immutable_narrowing(
 #     hundreds of vendor symlinks out of themselves, so treating them as hits would fail
 #     every capture on this host while proving nothing.
 SCAN_PASSES_ALL = ("A", "B", "C", "D", "S")
-# The passes that are a WALK rather than a READ, for a root whose immutability is already
-# proven. Pass A matches basenames and path components; pass D reads an archive's index.
-# Neither opens a regular file, so both are bounded by directory-entry count rather than
-# by bytes on disk -- the admitted IMM roots hold ~420,000 regular files.
-SCAN_PASSES_NAME_ONLY = ("A", "D")
+# Class IMM: every pass except S. Pass B is MANDATORY here, not flagged and not
+# default-off -- a content-cleanliness gate the default capture does not run is not a
+# gate, and the section 7 baseline is taken with the default (DESIGN D-5.1). The ONLY
+# per-class difference is pass B's vocabulary: Class IMM runs `key_material_tokens()`
+# and no count heuristics, because the eleven natural-language tokens
+# `key_leak_tokens()` adds are measured to produce 40 false hard failures under `/usr`
+# alone. The recursive immutability proof is NOT a substitute for this scan and is
+# nowhere offered as one: it establishes current write incapability and says nothing
+# about content that was already there, because it never opens a file.
+SCAN_PASSES_IMM = ("A", "B", "C", "D")
+
+
+SCAN_VOCABULARIES = ("key_leak", "key_material")
 
 
 def scan_readable_set(
@@ -497,8 +508,9 @@ def scan_readable_set(
     *,
     passes: Sequence[str] = SCAN_PASSES_ALL,
     carve_outs: Sequence[str] = (),
+    vocabulary: str = "key_leak",
 ) -> dict:
-    """Passes A-D over a Class USR root. Any hit is a hard failure at the call site.
+    """Passes A-S over an admitted root. Any hit is a hard failure at the call site.
 
     There is deliberately no `--ignore`: the operator's remedy is to remove the copy, or
     to stop allowing that root. A scanner that can be told to skip reviewer-visible
@@ -506,9 +518,15 @@ def scan_readable_set(
 
         A  name       a file named `answer_key.json`, or a `key`/`adjudications`
                       component under a directory that also holds a `subject/`
-        B  content    the existing `scan_leak()` -- token/shingle/expected-count, no
-                      exclusions, the same function the materialized workspace passes
-        C  key digest a renamed byte-identical copy
+        B  content    `scan_leak_text()` -- the same per-file test `scan_leak()` runs --
+                      over every regular file THIS walk reaches, so the carve-outs are
+                      honoured. Exhaustive over files: no size cap, no extension filter,
+                      no type gate, no sampling, each of which would leave a PLACEMENT
+                      that defeats the gate. `vocabulary` selects the token set, and it
+                      is the whole of the per-class difference.
+        C  key digest a renamed byte-identical copy, under a size prefilter that is an
+                      equivalence rather than an approximation: a file whose length
+                      differs from the key's cannot be byte-identical to it
         D  archive    member NAMES of every tar/zip under the root. Members are NEVER
                       extracted and never read; this is what catches a packaged copy in
                       `dist/orca-skills-*.tar.gz`. An archive that cannot be enumerated
@@ -518,16 +536,34 @@ def scan_readable_set(
                       the walk did not cover. Class USR only; see SCAN_PASSES_ALL for why
                       Class IMM settles this case the other way.
 
-    Walks follow no symlink.
+    Walks follow no symlink. Refusing to follow one costs no content coverage: a link
+    whose target is inside the root is reached as a real file by the walk itself, and a
+    link whose target is outside it is the target's own class's problem -- which is what
+    pass S says for Class USR and what the profile says for Class IMM.
     """
     import tarfile
     import zipfile
 
+    if vocabulary not in SCAN_VOCABULARIES:
+        raise IsolationError(
+            f"unknown scan vocabulary {vocabulary!r}; expected one of "
+            f"{SCAN_VOCABULARIES}"
+        )
     root = _realpath(root)
     carved = [_realpath(entry) for entry in carve_outs]
     hits: list[dict] = []
-    counters = {"files": 0, "archives": 0}
+    counters = {"files": 0, "archives": 0, "content_scanned": 0}
     key_digest = _answer_key_digest(key) if "C" in passes else None
+    key_size = _answer_key_size(key) if "C" in passes else None
+    b_tokens = (
+        (
+            final_review_eval.key_leak_tokens(key)
+            if vocabulary == "key_leak"
+            else final_review_eval.key_material_tokens(key)
+        )
+        if "B" in passes
+        else set()
+    )
 
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
         here = Path(dirpath)
@@ -559,8 +595,39 @@ def scan_readable_set(
             if "D" in passes and name.endswith((".tar", ".tar.gz", ".tgz", ".zip")):
                 counters["archives"] += 1
                 hits.extend(_scan_archive_members(entry, tarfile, zipfile))
+            if "B" in passes and "__pycache__" not in entry.parts:
+                # Driven from THIS walk, not from scan_leak()'s rglob. scan_leak() has
+                # no exclusion parameter by design, so delegating to it over a root that
+                # has carve-outs would scan beneath a boundary the profile denies -- and
+                # a Class IMM root is exactly the case that has carve-outs. The per-file
+                # test is the same one either way; only the walk differs.
+                try:
+                    text = entry.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError):
+                    pass
+                else:
+                    counters["content_scanned"] += 1
+                    hits.extend(
+                        {"pass": "B", **hit}
+                        for hit in final_review_eval.scan_leak_text(
+                            entry,
+                            text,
+                            b_tokens,
+                            count_heuristics=(vocabulary == "key_leak"),
+                        )
+                    )
             if key_digest is None:
                 continue
+            if key_size is not None:
+                # An equivalence, not an approximation: a file whose length differs from
+                # the key's cannot be byte-identical to it. An OSError from lstat() falls
+                # through to hashing, so the prefilter can never turn an unreadable file
+                # into a silent pass.
+                try:
+                    if entry.lstat().st_size != key_size:
+                        continue
+                except OSError:
+                    pass
             try:
                 digest = sha256_path(entry)
             except OSError:
@@ -568,17 +635,14 @@ def scan_readable_set(
             if key_digest and digest == key_digest:
                 hits.append({"pass": "C", "path": str(entry), "why": "key digest"})
 
-    if "B" in passes:
-        # scan_leak() has no exclusion parameter BY DESIGN, and that is right for a Class
-        # USR root -- which is the only class that runs pass B, and which never has a
-        # carve-out. A carve-out only ever arises inside a Class IMM root.
-        for hit in final_review_eval.scan_leak(key, [root]):           # pass B
-            hits.append({"pass": "B", **hit})
-
+    # Stable now that pass B's hits interleave with A/C/D's instead of being appended
+    # after them: the record an attestation carries must not depend on walk order.
+    hits.sort(key=lambda hit: (hit["pass"], hit["path"]))
     return {
         "root": str(root),
         **counters,
         "passes": list(passes),
+        "vocabulary": vocabulary,
         "carve_outs": [str(entry) for entry in carved],
         "hits": hits,
     }
@@ -618,6 +682,22 @@ def _answer_key_digest(key: dict) -> str | None:
         return None
     try:
         return sha256_path(Path(path))
+    except OSError:
+        return None
+
+
+def _answer_key_size(key: dict) -> int | None:
+    """Pass C's size prefilter, read from the SAME path `_answer_key_digest()` reads.
+
+    One source of truth for "which file is the key". Returns None on a missing path or
+    an OSError, exactly as `_answer_key_digest()` does -- and when it is None, pass C is
+    already inert because `key_digest` is None too.
+    """
+    path = key.get("__source_path__")
+    if not path:
+        return None
+    try:
+        return Path(path).stat().st_size
     except OSError:
         return None
 
@@ -858,8 +938,15 @@ def compute_readable_set(
     Symlinks are resolved before anything else -- `/tmp` -> `/private/tmp` on darwin --
     because an unresolved spelling in a seatbelt profile does not match.
 
-    Class IMM is admitted on `prove_immutable()` and is NOT content-scanned: the proof
-    makes planting impossible, so a scan would be scanning a set that cannot change.
+    Class IMM is admitted on `prove_immutable()` and is not additionally scanned AT
+    SESSION-BUILD TIME -- which is what the `scanned: false` field records, and all it
+    records. Class IMM roots ARE content-scanned: the scan runs once per capture, at
+    NEG-5, with the mandatory pass B of DESIGN D-5.1 and the `key_material` vocabulary,
+    and `probes[NEG-5].roots[].content_scanned` reports how many files it opened. The
+    proof is not a substitute for that scan and is nowhere offered as one -- it
+    establishes current write incapability and says nothing about pre-existing content,
+    because it never opens a file.
+
     Class USR is mutable and is admitted only after `scan_readable_set()` returns zero
     hits in every pass. A root that can be placed in neither class is not admitted.
     """
@@ -1312,28 +1399,29 @@ def run_probes(
         }
     )
 
-    # -- NEG-5 -- the readable-set scan re-run over EVERY admitted root, IMM and USR
-    # alike. Iteration 1 re-scanned Class USR only, which is why it could not have
-    # caught F-001.
-    # EVERY admitted root, IMM and USR alike. Iteration 1 re-scanned Class USR only,
-    # which is why it could not have caught F-001.
+    # -- NEG-5 -- the readable-set scan re-run IN PROCESS over EVERY admitted root, IMM
+    # and USR alike. Iteration 1 re-scanned Class USR only, which is why it could not
+    # have caught F-001.
     #
-    # The pass set differs by class, and the reason is stated rather than hidden. A Class
-    # USR root gets all four passes; it is small (a freshly created session tree) and
-    # mutable, so its content is the only evidence there is. A Class IMM root gets the two
-    # WALK passes -- basename and archive index -- and not the two READ passes, because
-    # passes B and C open and hash every regular file, and the admitted IMM roots hold
-    # ~420,000 of them (measured: minutes per capture). What passes B and C would be
-    # re-deriving is already established more strongly by the recursive proof: nothing
-    # unprivileged can create or overwrite content anywhere in that subtree. What they
-    # would NOT re-derive is a stray `answer_key.json` or a packaged copy shipped inside
-    # the tree by the OS vendor -- and passes A and D find exactly those, at walk cost.
+    # BOTH classes are content-scanned, and the only per-class difference is pass B's
+    # vocabulary (DESIGN D-5.1). A Class USR root gets all five passes with
+    # `key_leak_tokens()` and the count heuristics: it is small (a freshly created
+    # session tree) and mutable, so its content is the only evidence there is. A Class
+    # IMM root gets A/B/C/D with `key_material_tokens()` and no count heuristics --
+    # pass B is mandatory, on by default, and there is no flag that turns it off.
+    #
+    # The recursive immutability proof does NOT stand in for that scan. It establishes
+    # that nothing unprivileged can create or overwrite content in the subtree NOW; it
+    # says nothing about content that was already there when the proof ran, because it
+    # never opens a file. A pre-existing reformatted or partial rendering of the key is
+    # an initial-state condition, not an act by a privileged writer, and pass B is the
+    # only thing that finds it.
     rescan_hits = 0
     rescan_detail = []
     for entry in readable["entries"]:
-        passes = (
-            SCAN_PASSES_NAME_ONLY if entry["class"] == CLASS_IMM else SCAN_PASSES_ALL
-        )
+        is_imm = entry["class"] == CLASS_IMM
+        passes = SCAN_PASSES_IMM if is_imm else SCAN_PASSES_ALL
+        vocabulary = "key_material" if is_imm else "key_leak"
         # The carve-outs are part of the readable set's DEFINITION, not an exclusion
         # bolted onto the scan: the profile denies them for content and metadata alike,
         # so a path beneath one is not something the Reviewer can read and scanning it
@@ -1346,11 +1434,16 @@ def run_probes(
             if _is_within(_realpath(carve_out), _realpath(entry["path"]))
         ]
         scan = scan_readable_set(
-            key, Path(entry["path"]), passes=passes, carve_outs=root_carve_outs
+            key,
+            Path(entry["path"]),
+            passes=passes,
+            carve_outs=root_carve_outs,
+            vocabulary=vocabulary,
         )
         rescan_hits += len(scan["hits"])
         rescan_detail.append(
             {"path": entry["path"], "class": entry["class"], "passes": list(passes),
+             "vocabulary": vocabulary, "content_scanned": scan["content_scanned"],
              "carve_outs": len(root_carve_outs), "hits": len(scan["hits"])}
         )
     probes.append({"id": "NEG-5", "kind": "readable_set_rescan",
@@ -1619,10 +1712,15 @@ def build_attestation(
         "threat_model": (
             "unconstrained well-behaved reviewer agent; not a sandbox-escaping adversary"
         ),
+        # G.6, verbatim, and nothing broader. This entry is about the immutability
+        # proof's DURABILITY -- a privileged writer, outside the G.1 threat model. It
+        # makes no content claim, because content is established independently at
+        # NEG-5, whose per-root record carries `passes`, `vocabulary` and
+        # `content_scanned`.
         "limitations": [
-            "Class IMM roots are proven immutable recursively at session-build time "
-            "against the run user's own privileges, not content-scanned; the proof does "
-            "not bind a privileged (root) writer, who is outside the stated threat model"
+            "The recursive immutability proof is evaluated at session-build time "
+            "against the run user's own privileges, so it does not bind a privileged "
+            "(root) writer, who is outside the stated threat model"
         ],
     }
     assert_no_clock_value(document)

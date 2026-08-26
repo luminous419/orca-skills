@@ -1190,6 +1190,24 @@ EMBED_OMISSION_REASONS = (
 )
 
 
+def _residual_matches_are_self_output(text: str) -> bool:
+    """D-H.2 step 2. True when the policy has nothing left to REMOVE from `text`.
+
+    Not `redact_text(text)[0] == text`, and not `redact_text(text)[1] == ()`: the first
+    is a whole-string proxy for a per-match property -- a match that removed something
+    can be masked by matches elsewhere in the text -- and the second is a DIFFERENT
+    property that redaction/1.1 cannot satisfy on the very inputs this gate exists for,
+    because `env_secret_pattern` and `url_credential` preserve a readable anchor on
+    purpose and therefore re-match their own placeholder output while rewriting it to
+    identical bytes.
+    """
+    return all(
+        match.expand(replacement) == match.group(0)
+        for _name, pattern, replacement in REDACTION_CATEGORIES
+        for match in pattern.finditer(text)
+    )
+
+
 def safe_embedded_text(
     raw: str, *, redact: bool
 ) -> tuple[str | None, tuple[dict[str, int], ...], str]:
@@ -1208,21 +1226,25 @@ def safe_embedded_text(
     fixed point means no absolute path, no `dcap_...`, no `scheme://user:pass@` and no
     SECRET/TOKEN/PASSWORD/API_KEY-named assignment survived.
 
-    The fixed point is asserted on the TEXT (`again == candidate`), and that is the
-    whole of the security statement: a second pass that matched something and rewrote it
-    to different bytes breaks text equality, and a second pass that rewrote it to
-    IDENTICAL bytes removed nothing, because the only region a category can rewrite to
-    itself is a region that is already its own placeholder.
+    The fixed point is decided PER MATCH, by `_residual_matches_are_self_output()`:
+    every residual match of every category must expand to exactly its own span. The
+    second pass may still RECOGNISE text; it must have nothing left to REMOVE. Text
+    equality (`again == candidate`) is an immediate consequence -- a substitution whose
+    every replacement equals its own span cannot change the string -- so it is not
+    asserted separately. It is not asserted as a proxy either: comparing two whole
+    strings lets a match that removed something be masked by matches elsewhere in the
+    text, and the per-match rule cannot be masked that way.
 
     It is deliberately NOT additionally asserted that the second pass reports no
-    category at all. That would be strictly stronger, but this policy cannot satisfy it
-    and is not meant to: every category preserves a readable anchor on purpose --
-    `env_secret_pattern` keeps `KEY=` and its value class `[^\s\n]+` re-matches its own
-    `<REDACTED:env_secret_pattern>` output, and `url_credential` keeps `scheme://...@`
-    and re-matches likewise. Both rewrite to identical bytes, so both are counted on a
-    second pass while removing nothing. Requiring a zero count would omit the log from
-    every bundle that logged a secret-named assignment or a credentialed URL -- i.e.
-    exactly the bundles the sanitization exists for.
+    category at all. That is a DIFFERENT property, not a stricter one, and this policy
+    cannot satisfy it on exactly the inputs this gate exists for: every category
+    preserves a readable anchor on purpose -- `env_secret_pattern` keeps `KEY=` and its
+    value class `[^\s\n]+` re-matches its own `<REDACTED:env_secret_pattern>` output,
+    and `url_credential` keeps `scheme://...@` and re-matches likewise. Both rewrite to
+    identical bytes, so both are counted on a second pass while removing nothing.
+    Requiring a zero count would omit the log from every bundle that logged a
+    secret-named assignment or a credentialed URL -- i.e. exactly the bundles the
+    sanitization exists for.
 
     The structure check exists so that a FUTURE policy which introduced a newline or a
     `|` into a placeholder fails loudly here instead of silently corrupting the
@@ -1233,8 +1255,7 @@ def safe_embedded_text(
         candidate, redactions = redact_text(raw)
     else:
         candidate, redactions = raw, ()
-    again, _second_pass_counts = redact_text(candidate)
-    if again != candidate:
+    if not _residual_matches_are_self_output(candidate):
         return None, redactions, "redaction_residue"
     if redact:
         if candidate.count("\n") != raw.count("\n"):

@@ -283,6 +283,96 @@ class LeakScanTests(unittest.TestCase):
                 self.assertNotIn(allowed, tokens)
 
 
+class ScanLeakRefactorTests(unittest.TestCase):
+    """T-8.4g: extracting `scan_leak_text()` changed no record `scan_leak()` returns.
+
+    This is what licenses "behaviour unchanged" in DESIGN iteration 5's Components
+    table, rather than leaving it as an assertion. The reference below is the
+    pre-refactor per-file body, verbatim.
+    """
+
+    @staticmethod
+    def reference_scan_leak(key: dict, targets: list[Path]) -> list[dict]:
+        tokens = evaluator.key_leak_tokens(key)
+        hits: list[dict] = []
+        for target in targets:
+            files = (
+                [path for path in sorted(target.rglob("*")) if path.is_file()]
+                if target.is_dir()
+                else [target]
+            )
+            for path in files:
+                if "__pycache__" in path.parts:
+                    continue
+                try:
+                    raw = path.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError):
+                    continue
+                haystack = " ".join(raw.split()).casefold()
+                for token in sorted(tokens):
+                    if token in haystack:
+                        hits.append({"path": str(path), "token": token})
+                for pattern in (
+                    evaluator._EXPECTED_COUNT,
+                    evaluator._EXPECTED_COUNT_REVERSE,
+                ):
+                    match = pattern.search(haystack)
+                    if match is not None:
+                        hits.append(
+                            {
+                                "path": str(path),
+                                "expected_count_statement": match.group(0)[:120],
+                            }
+                        )
+                        break
+        return hits
+
+    def test_t84g_the_records_are_identical_over_every_hit_shape(self) -> None:
+        key = evaluator.load_key(KEY_PATH)
+        defect = key["seeded_defects"][0]
+        with tempfile.TemporaryDirectory() as directory:
+            tree = Path(directory) / "tree"
+            (tree / "__pycache__").mkdir(parents=True)
+            (tree / "token.py").write_text(
+                f"# {defect['id']} here, archetype {defect['archetype']}\n",
+                encoding="utf-8",
+            )
+            (tree / "counted.md").write_text(
+                "You should find five defects in this project.\n", encoding="utf-8"
+            )
+            (tree / "prose.md").write_text(defect["summary"], encoding="utf-8")
+            (tree / "clean.txt").write_text("nothing here\n", encoding="utf-8")
+            (tree / "undecodable.bin").write_bytes(b"\xff\xfe\x00\x01binary")
+            (tree / "__pycache__" / "skipped.py").write_text(
+                f"# {defect['id']}\n", encoding="utf-8"
+            )
+
+            observed = evaluator.scan_leak(key, [tree])
+            expected = self.reference_scan_leak(key, [tree])
+
+        self.assertEqual(observed, expected)
+        self.assertTrue(any("expected_count_statement" in hit for hit in observed))
+        self.assertTrue(any(hit.get("token") == defect["archetype"] for hit in observed))
+        self.assertNotIn(
+            "__pycache__", " ".join(hit["path"] for hit in observed)
+        )
+        for path in {hit["path"] for hit in observed}:
+            self.assertLessEqual(
+                len([h for h in observed if h["path"] == path
+                     and "expected_count_statement" in h]),
+                1,
+                "at most one expected-count record per file, as before",
+            )
+
+    def test_t84g_the_shipped_fixture_is_unchanged_too(self) -> None:
+        key = evaluator.load_key(KEY_PATH)
+        subject = FIXTURE / "subject"
+        self.assertEqual(
+            evaluator.scan_leak(key, [subject]),
+            self.reference_scan_leak(key, [subject]),
+        )
+
+
 class MaterializeTests(unittest.TestCase):
     def workspace(self, directory: str) -> Path:
         destination = Path(directory) / "ws"

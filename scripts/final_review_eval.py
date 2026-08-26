@@ -301,6 +301,50 @@ def _shingles(text: str, size: int = 6) -> set[str]:
     }
 
 
+def _is_identifier_form(marker: str) -> bool:
+    """True for `answer_key`, false for `answer key`, `seeded`, `정답`.
+
+    The whole rule, and it is deliberately mechanical rather than a curated list: a
+    marker spelled as an identifier cannot occur in running prose by accident, and a
+    marker spelled as a word or a phrase measurably can. `/usr/share/dict/web2` contains
+    `seeded`; `/usr/share/tokenizer/ko/dicrc` contains `정답`; AVFoundation's
+    `AVContentKeySession.h` contains "used to answer key requests". See DESIGN D-5.1
+    sec A. A marker added to FIXED_LEAK_MARKERS tomorrow is classified on the day it is
+    added, rather than needing an entry in a second list somebody has to remember.
+    """
+    return "_" in marker
+
+
+def _key_tokens(key: dict, *, include_labels: bool) -> set[str]:
+    """One construction, two questions. See DESIGN D-5.1.
+
+    include_labels=True  -> key_leak_tokens():     "does this file bear ANY trace of the fixture?"
+    include_labels=False -> key_material_tokens(): "is this file a RENDERING of the key?"
+
+    Deriving both from one construction is the point: `key_material_tokens(key)` is a
+    subset of `key_leak_tokens(key)` STRUCTURALLY rather than by inspection, so a sixth
+    marker or a new key field added tomorrow cannot make the Class IMM vocabulary drift
+    into something the Class USR vocabulary does not contain.
+    """
+    tokens = {
+        marker.casefold()
+        for marker in FIXED_LEAK_MARKERS
+        if include_labels or _is_identifier_form(marker)
+    }
+    fixture_id = key.get("fixture_id")
+    if isinstance(fixture_id, str) and fixture_id:
+        tokens.add(fixture_id.casefold())
+    for entry in key.get("seeded_defects", []):
+        if include_labels and entry.get("id"):
+            tokens.add(str(entry["id"]).casefold())
+        if entry.get("archetype"):
+            tokens.add(str(entry["archetype"]).casefold())
+        for field in ("summary", "negative_space_argument"):
+            text = entry.get(field) or ""
+            tokens.update(shingle.casefold() for shingle in _shingles(" ".join(text.split())))
+    return {token for token in tokens if token}
+
+
 def key_leak_tokens(key: dict) -> set[str]:
     """What must not appear in a reviewer's scope.
 
@@ -309,21 +353,19 @@ def key_leak_tokens(key: dict) -> set[str]:
     appear is the key's own vocabulary -- its ids, its archetype names, its fixture id,
     long verbatim runs of its prose, and the fixed marker set.
     """
-    tokens: set[str] = set(FIXED_LEAK_MARKERS)
-    fixture_id = key.get("fixture_id")
-    if isinstance(fixture_id, str) and fixture_id:
-        tokens.add(fixture_id.casefold())
-    for entry in key.get("seeded_defects", []):
-        identifier = entry.get("id")
-        if identifier:
-            tokens.add(str(identifier).casefold())
-        archetype = entry.get("archetype")
-        if archetype:
-            tokens.add(str(archetype).casefold())
-        for field in ("summary", "negative_space_argument"):
-            text = entry.get(field) or ""
-            tokens.update(shingle.casefold() for shingle in _shingles(" ".join(text.split())))
-    return {token for token in tokens if token}
+    return _key_tokens(key, include_labels=True)
+
+
+def key_material_tokens(key: dict) -> set[str]:
+    """The Class IMM vocabulary: is this file a RENDERING of the key? See DESIGN D-5.1.
+
+    `key_leak_tokens()` minus the natural-language markers and the `seeded_defects[].id`
+    labels -- the eleven tokens measured to collide with vendor files under `/usr`,
+    which a hard-failure gate over an OS tree offers no remedy for. What remains is the
+    key's own material: its fixture id, its archetype names, six-word runs of its prose,
+    and the three identifier-form markers. RK-14 records exactly what that excludes.
+    """
+    return _key_tokens(key, include_labels=False)
 
 
 def scan_leak(key: dict, targets: list[Path]) -> list[dict]:
@@ -350,20 +392,39 @@ def scan_leak(key: dict, targets: list[Path]) -> list[dict]:
                 raw = path.read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError):
                 continue
-            haystack = " ".join(raw.split()).casefold()
-            for token in sorted(tokens):
-                if token in haystack:
-                    hits.append({"path": str(path), "token": token})
-            for pattern in (_EXPECTED_COUNT, _EXPECTED_COUNT_REVERSE):
-                match = pattern.search(haystack)
-                if match is not None:
-                    hits.append(
-                        {
-                            "path": str(path),
-                            "expected_count_statement": match.group(0)[:120],
-                        }
-                    )
-                    break
+            hits.extend(scan_leak_text(path, raw, tokens))
+    return hits
+
+
+def scan_leak_text(
+    path: Path, text: str, tokens: set[str], *, count_heuristics: bool = True
+) -> list[dict]:
+    """`scan_leak()`'s per-file body, as one authority two callers share.
+
+    `scan_leak()` walks with `rglob` and has no exclusion parameter, by design.
+    `review_isolation.scan_readable_set()` needs the SAME per-file test driven from its
+    own carve-out-pruned walk, because a carve-out is part of the readable set's
+    definition and an `rglob` that ignores it scans what the Reviewer cannot read.
+    Extracting the body rather than duplicating it is what keeps "what counts as key
+    material" a single answer. See DESIGN D-5.1.
+
+    `count_heuristics=False` drops the two natural-language expected-count patterns,
+    which the Class IMM vocabulary does not run; the token test itself is identical.
+    """
+    haystack = " ".join(text.split()).casefold()
+    hits: list[dict] = []
+    for token in sorted(tokens):
+        if token in haystack:
+            hits.append({"path": str(path), "token": token})
+    if not count_heuristics:
+        return hits
+    for pattern in (_EXPECTED_COUNT, _EXPECTED_COUNT_REVERSE):
+        match = pattern.search(haystack)
+        if match is not None:
+            hits.append(
+                {"path": str(path), "expected_count_statement": match.group(0)[:120]}
+            )
+            break
     return hits
 
 

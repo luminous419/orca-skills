@@ -21,6 +21,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -217,15 +218,20 @@ class ReadableSetScanTests(_IsolationTestCase):
     def test_an_escaping_symlink_is_not_a_hit_for_a_proven_immutable_root(self) -> None:
         (self.root / "escape").symlink_to(KEY_PATH)
         hits = review_isolation.scan_readable_set(
-            self.key, self.root, passes=review_isolation.SCAN_PASSES_NAME_ONLY
+            self.key, self.root, passes=review_isolation.SCAN_PASSES_IMM
         )["hits"]
         self.assertEqual(
             [hit for hit in hits if hit["pass"] == "S"], [],
             "for Class IMM the PROFILE is the evidence: seatbelt evaluates the resolved "
             "target, so the link grants nothing the profile does not already grant",
         )
+        self.assertEqual(
+            [hit for hit in hits if hit["pass"] == "B"], [],
+            "and refusing to follow the link costs no CONTENT coverage either: the walk "
+            "never opens it, so mandatory pass B does not read the key through it",
+        )
         self.assertIn("S", review_isolation.SCAN_PASSES_ALL)
-        self.assertNotIn("S", review_isolation.SCAN_PASSES_NAME_ONLY)
+        self.assertNotIn("S", review_isolation.SCAN_PASSES_IMM)
 
     def test_a_carved_out_subtree_is_not_scanned_because_it_is_not_readable(self) -> None:
         # The carve-outs are part of the readable set's DEFINITION. Scanning beneath one
@@ -235,10 +241,15 @@ class ReadableSetScanTests(_IsolationTestCase):
         carved = self.root / "denied"
         carved.mkdir()
         (carved / "answer_key.json").write_bytes(KEY_PATH.read_bytes())
+        # The key's PROSE as well as its filename, so this proves the carve-out prunes
+        # mandatory pass B and not merely pass A. Pass B is driven by THIS walk rather
+        # than delegated to `scan_leak()`, whose `rglob` has no exclusion parameter and
+        # would therefore read beneath a boundary the profile denies.
+        (carved / "notes.txt").write_text(
+            self.key["seeded_defects"][0]["summary"], encoding="utf-8"
+        )
         # The IMM pass set, because a carve-out only ever arises inside a Class IMM root.
-        # (Pass B is `scan_leak()`, which has no exclusion parameter by design and is
-        # therefore never run over a root that has one.)
-        passes = review_isolation.SCAN_PASSES_NAME_ONLY
+        passes = review_isolation.SCAN_PASSES_IMM
         self.assertTrue(
             review_isolation.scan_readable_set(self.key, self.root, passes=passes)["hits"],
             "without the carve-out this is a hit",
@@ -249,6 +260,209 @@ class ReadableSetScanTests(_IsolationTestCase):
             )["hits"],
             [],
         )
+
+    # -- T-8.4b .. T-8.4f: the Class IMM pass set and its vocabulary (D-5.1) ----------
+
+    def test_t84b_pass_c_survives_the_imm_pass_set(self) -> None:
+        """A renamed byte-identical copy is a pass-C hit under `SCAN_PASSES_IMM`.
+
+        The shipped `("A", "D")` set returns ZERO hits over the same root -- that is the
+        gap D-5.1 closes. Mandatory pass B fires on this file too, and that is the
+        CORRECT relationship rather than a defect: a byte-identical copy of the key
+        contains all of the key's prose, so the two passes corroborate each other.
+        Asserting "exactly one hit in total" would have been asserting that pass B does
+        not work.
+        """
+        planted = self.root / "libfoo.dat"
+        planted.write_bytes(KEY_PATH.read_bytes())
+
+        hits = review_isolation.scan_readable_set(
+            self.key, self.root, passes=review_isolation.SCAN_PASSES_IMM
+        )["hits"]
+
+        c_hits = [hit for hit in hits if hit["pass"] == "C"]
+        self.assertEqual(len(c_hits), 1, c_hits)
+        self.assertEqual(c_hits[0]["path"], str(review_isolation._realpath(planted)))
+        self.assertTrue(
+            [
+                hit
+                for hit in hits
+                if hit["pass"] == "B"
+                and hit["path"] == str(review_isolation._realpath(planted))
+            ],
+            "pass B corroborates pass C on the same path",
+        )
+        self.assertEqual(
+            review_isolation.scan_readable_set(
+                self.key, self.root, passes=("A", "D")
+            )["hits"],
+            [],
+            "the shipped name-only pass set sees nothing here",
+        )
+
+    def test_t84c_the_pass_c_size_prefilter_is_an_equivalence(self) -> None:
+        """Not an approximation: a file whose length differs cannot be byte-identical."""
+        raw = KEY_PATH.read_bytes()
+        identical = self.root / "identical.dat"
+        identical.write_bytes(raw)
+        same_length = self.root / "same_length.dat"
+        same_length.write_bytes(raw[:-1] + bytes([raw[-1] ^ 0x01]))
+        one_longer = self.root / "one_longer.dat"
+        one_longer.write_bytes(raw + b"\n")
+
+        hits = review_isolation.scan_readable_set(
+            self.key, self.root, passes=("C",)
+        )["hits"]
+
+        self.assertEqual(
+            [hit["path"] for hit in hits],
+            [str(review_isolation._realpath(identical))],
+        )
+        self.assertEqual(len(same_length.read_bytes()), len(raw), "hashed, not skipped")
+        self.assertNotEqual(len(one_longer.read_bytes()), len(raw), "size-filtered out")
+
+    def test_t84d_mandatory_pass_b_catches_what_a_c_d_cannot_see(self) -> None:
+        """The DESIGN review's counterexample, reproduced and closed.
+
+        A reformatted copy, a partial excerpt and a quoted fragment, each under an
+        unrelated basename and none byte-identical to the key. Iteration 4's
+        `("A", "C", "D")` pass set finds NOTHING in any of the three; the mandatory
+        pass B of D-5.1 finds all three, because the key's own prose is what the Class
+        IMM vocabulary is made of and the match happens after the same normalisation on
+        both sides.
+        """
+        defect = self.key["seeded_defects"][0]
+        reformatted = self.root / "vendor.dat"
+        reformatted.write_text(
+            json.dumps(self.key, indent=4, ensure_ascii=False), encoding="utf-8"
+        )
+        excerpt = self.root / "notes.log"
+        excerpt.write_text(
+            textwrap.fill(defect["negative_space_argument"], 40), encoding="utf-8"
+        )
+        quoted = self.root / "chat.txt"
+        quoted.write_text(
+            "unrelated prose above\n"
+            + "\n".join("> " + line for line in textwrap.wrap(defect["summary"], 50))
+            + "\nunrelated prose below\n",
+            encoding="utf-8",
+        )
+
+        scan = review_isolation.scan_readable_set(
+            self.key,
+            self.root,
+            passes=review_isolation.SCAN_PASSES_IMM,
+            vocabulary="key_material",
+        )
+        b_paths = {hit["path"] for hit in scan["hits"] if hit["pass"] == "B"}
+        for planted in (reformatted, excerpt, quoted):
+            self.assertIn(
+                str(review_isolation._realpath(planted)), b_paths, scan["hits"]
+            )
+        self.assertEqual(scan["content_scanned"], 3)
+
+        self.assertEqual(
+            review_isolation.scan_readable_set(
+                self.key, self.root, passes=("A", "C", "D"), vocabulary="key_material"
+            )["hits"],
+            [],
+            "iteration 4's pass set is exactly the gap the DESIGN review named",
+        )
+
+    def test_t84e_the_imm_vocabulary_is_specific_not_merely_smaller(self) -> None:
+        """The measured `/usr` situation, reduced to a unit test.
+
+        A contributor who "simplifies" the two vocabularies back into one fails here
+        with the reason in front of them: these are the shapes that collide with vendor
+        files on this host, and a hard-failure gate offers no remedy for them.
+        """
+        vendor = self.root / "vendor"
+        vendor.mkdir()
+        excluded = [
+            marker
+            for marker in evaluator.FIXED_LEAK_MARKERS
+            if not evaluator._is_identifier_form(marker)
+        ] + [str(entry["id"]) for entry in self.key["seeded_defects"]]
+        (vendor / "collides.txt").write_text(
+            " ".join(excluded) + "\n"
+            # AVFoundation's AVContentKeySession.h, verbatim in shape.
+            "a persistable content key cannot be used to answer key requests\n"
+            # And a sentence the two expected-count heuristics recognise.
+            "you should find three defects\n",
+            encoding="utf-8",
+        )
+
+        self.assertEqual(
+            review_isolation.scan_readable_set(
+                self.key, vendor, passes=("B",), vocabulary="key_material"
+            )["hits"],
+            [],
+        )
+        self.assertTrue(
+            review_isolation.scan_readable_set(
+                self.key, vendor, passes=("B",), vocabulary="key_leak"
+            )["hits"],
+            "Class USR keeps the full vocabulary AND the count heuristics",
+        )
+
+        material = self.root / "material"
+        material.mkdir()
+        (material / "excerpt.txt").write_text(
+            "archetype: " + str(self.key["seeded_defects"][0]["archetype"]) + "\n",
+            encoding="utf-8",
+        )
+        for vocabulary in review_isolation.SCAN_VOCABULARIES:
+            self.assertTrue(
+                review_isolation.scan_readable_set(
+                    self.key, material, passes=("B",), vocabulary=vocabulary
+                )["hits"],
+                f"an archetype is key MATERIAL under {vocabulary!r}",
+            )
+
+    def test_t84f_the_two_vocabularies_cannot_drift_apart(self) -> None:
+        """Structural containment, computed rather than hard-coded to eleven strings."""
+        leak = evaluator.key_leak_tokens(self.key)
+        material = evaluator.key_material_tokens(self.key)
+
+        self.assertLess(material, leak, "proper subset, structurally")
+        self.assertEqual(
+            leak - material,
+            {
+                marker.casefold()
+                for marker in evaluator.FIXED_LEAK_MARKERS
+                if not evaluator._is_identifier_form(marker)
+            }
+            | {
+                str(entry["id"]).casefold()
+                for entry in self.key["seeded_defects"]
+                if entry.get("id")
+            },
+        )
+
+        counted = self.root / "counted.txt"
+        counted.write_text("you should find three defects\n", encoding="utf-8")
+        text = counted.read_text(encoding="utf-8")
+        self.assertTrue(
+            [
+                hit
+                for hit in evaluator.scan_leak_text(
+                    counted, text, material, count_heuristics=True
+                )
+                if "expected_count_statement" in hit
+            ],
+            "the heuristics are ON for the key_leak vocabulary",
+        )
+        self.assertEqual(
+            evaluator.scan_leak_text(counted, text, material, count_heuristics=False),
+            [],
+            "and OFF for the key_material vocabulary",
+        )
+
+    def test_the_unknown_vocabulary_is_refused_rather_than_defaulted(self) -> None:
+        with self.assertRaises(review_isolation.IsolationError):
+            review_isolation.scan_readable_set(
+                self.key, self.root, passes=("B",), vocabulary="whatever"
+            )
 
     def test_a_usr_root_with_a_hit_is_never_admitted(self) -> None:
         session = self.build()
@@ -782,6 +996,85 @@ class LaunchLineTests(_IsolationTestCase):
         self.assertIn(review_isolation.SANDBOX_EXEC, line)
         self.assertTrue(line.rstrip().endswith("AGENT"),
                         "isolation WRAPS the resolved agent command; it never rewrites it")
+
+
+@DARWIN_ONLY
+@NEEDS_SANDBOX
+class Neg5ContractTests(_IsolationTestCase):
+    """T-9.5: the NEG-5 contract, asserted at the probe record itself.
+
+    Runs against the real fixture with a deliberately small IMM candidate set: what is
+    under test is the per-class pass/vocabulary SELECTION and the record it writes, not
+    how long a scan of `/System` takes.
+    """
+
+    def neg5_record(self) -> dict:
+        session = review_isolation.build_session(
+            "run_neg5", fixture=FIXTURE, session_base=self.base
+        )
+        self.sessions.append(session)
+        key = review_isolation._load_key_with_source(FIXTURE)
+        readable = review_isolation.compute_readable_set(
+            session, key, imm_candidates=FAST_IMM
+        )
+        denied = review_isolation.discover_key_bearing_roots(FIXTURE)
+        traversal = review_isolation.compute_traversal_set(
+            [entry["path"] for entry in readable["entries"]], readable["carve_outs"]
+        )
+        profile = review_isolation.render_seatbelt_profile(
+            session=session,
+            imm=[e["path"] for e in readable["entries"] if e["class"] == "IMM"],
+            usr=[e["path"] for e in readable["entries"] if e["class"] == "USR"],
+            carve_outs=readable["carve_outs"],
+            traversal=traversal,
+            writable=[str(session / "review_root"), str(session / "tmp"),
+                      str(session / "home")],
+            denied=denied,
+        )
+        (session / "control" / review_isolation.PROFILE_FILENAME).write_text(
+            profile, encoding="utf-8"
+        )
+        probes = review_isolation.run_probes(
+            session, fixture=FIXTURE, readable=readable, denied=denied,
+            enforcement="seatbelt", plant=False,
+        )
+        return next(probe for probe in probes if probe["id"] == "NEG-5")
+
+    def test_t95_every_admitted_root_carries_its_class_pass_set_and_vocabulary(
+        self,
+    ) -> None:
+        record = self.neg5_record()
+
+        self.assertTrue(record["roots"], record)
+        classes = {entry["class"] for entry in record["roots"]}
+        self.assertIn("IMM", classes, "the selection is untested without an IMM root")
+        self.assertIn("USR", classes)
+        for entry in record["roots"]:
+            with self.subTest(path=entry["path"]):
+                if entry["class"] == "IMM":
+                    self.assertEqual(entry["passes"], ["A", "B", "C", "D"])
+                    self.assertEqual(entry["vocabulary"], "key_material")
+                else:
+                    self.assertEqual(entry["passes"], ["A", "B", "C", "D", "S"])
+                    self.assertEqual(entry["vocabulary"], "key_leak")
+                self.assertIsInstance(entry["content_scanned"], int)
+
+    def test_t95_there_is_no_opt_in_imm_content_scan_anywhere(self) -> None:
+        """The regression guard against reintroducing a default-off content gate.
+
+        A content-cleanliness gate the DEFAULT capture does not run is not a gate, and
+        the section 7 baseline is taken with the default.
+        """
+        record = self.neg5_record()
+        self.assertNotIn("imm_content_scan", json.dumps(record))
+        self.assertFalse(hasattr(review_isolation, "SCAN_PASSES_IMM_CONTENT"))
+
+        parser = evaluator.build_parser()
+        formatted = parser.format_help()
+        for action in parser._subparsers._group_actions:            # noqa: SLF001
+            formatted += action.choices["isolate"].format_help()
+        self.assertNotIn("--scan-imm-content", formatted)
+        self.assertNotIn("scan_imm_content", formatted)
 
 
 @DARWIN_ONLY

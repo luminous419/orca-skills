@@ -6,6 +6,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -3356,6 +3357,10 @@ class BundleSanitizationTests(_AuditTestCase):
 
         self.assert_not_in_bundle("ghp_deadbeefcafebabe0123", serialized)
         self.assertGreaterEqual(self.categories(bundle)["env_secret_pattern"], 1)
+        # D-4.1: the residual `env_secret_pattern` match on the second pass expands to
+        # its own span, so it is recognition and not residue. The log is EMBEDDED.
+        self.assertIsNotNone(bundle["orchestrator_log"]["content_redacted"])
+        self.assertEqual(bundle["orchestrator_log"]["content_omitted_reason"], "")
 
     def test_t74_a_url_credential_never_reaches_the_bundle(self) -> None:
         self.poison(detail="https://user:hunter2@example.test/x")
@@ -3364,6 +3369,10 @@ class BundleSanitizationTests(_AuditTestCase):
 
         self.assert_not_in_bundle("hunter2", serialized)
         self.assertGreaterEqual(self.categories(bundle)["url_credential"], 1)
+        # D-4.1: same shape as T-7.3 -- the residual `url_credential` match expands to
+        # its own span, so the log is EMBEDDED rather than omitted.
+        self.assertIsNotNone(bundle["orchestrator_log"]["content_redacted"])
+        self.assertEqual(bundle["orchestrator_log"]["content_omitted_reason"], "")
 
     def test_t75_a_dispatch_capability_never_reaches_the_bundle(self) -> None:
         self.poison(detail="dcap_AAAABBBBCCCCDDDDEEEEFFFF")
@@ -3442,14 +3451,22 @@ class BundleSanitizationTests(_AuditTestCase):
     # -- T-7.9: residue is omitted, and the export still ships ------------------------
 
     def test_t79_residual_text_is_omitted_with_a_reason_and_the_export_ships(self) -> None:
-        raw = self.poison(detail="/Volumes/ext/a")
+        raw = self.poison(detail="ZZ_LEAK")
 
-        def non_fixed_point(text, *, policy_version=None):
-            # A policy that keeps finding something to remove: the second pass differs
-            # from the first, which is exactly the residue signature.
-            return text + "!", ({"category": "foreign_absolute_path", "count": 1},)
-
-        with patch.object(run_logging, "redact_text", non_fixed_point):
+        # D-4.1: the corrected step 2 iterates REDACTION_CATEGORIES directly, so a
+        # stubbed `redact_text` would no longer drive it. The injected category's
+        # replacement does NOT expand to its own span, which is the residue signature:
+        # a second-pass match that still has something to REMOVE.
+        # `<REDACTED:t>` -- DESIGN T-7.9's illustrative replacement -- does not survive
+        # its own first pass: redact_text() substitutes it once and nothing matches on
+        # the second pass, so no residue exists to detect. See IMPLEMENTATION F-301.
+        # `ZZ_REDACTED_X` keeps the shape DESIGN specifies (a replacement that does NOT
+        # expand to its own span) and is reachable: `ZZ_[A-Z]+` matches `ZZ_REDACTED`
+        # inside it, and that match expands to `ZZ_REDACTED_X` != `ZZ_REDACTED`.
+        residual = ("t", re.compile(r"ZZ_[A-Z]+"), "ZZ_REDACTED_X")
+        with patch.object(
+            run_logging, "REDACTION_CATEGORIES", (residual,) + run_logging.REDACTION_CATEGORIES
+        ):
             path = run_logging.export_final_review_evidence(self.RUN_ID, base=self.base)
 
         bundle = json.loads(path.read_text(encoding="utf-8"))
@@ -3468,8 +3485,19 @@ class BundleSanitizationTests(_AuditTestCase):
     def test_t79b_a_structure_changing_policy_is_omitted_not_silently_shipped(self) -> None:
         self.poison(detail="/Volumes/ext/a")
 
-        def pipe_eating(text, *, policy_version=None):
-            return text.replace("|", ""), ()
+        real_redact_text = run_logging.redact_text
+
+        def pipe_eating(
+            text,
+            *,
+            policy_version=run_logging.FINAL_REVIEW_REDACTION_POLICY_VERSION,
+        ):
+            # The REAL policy still runs first: since D-4.1 the residue check is per
+            # match over REDACTION_CATEGORIES rather than a re-run of redact_text, so a
+            # stub that skipped redaction would trip the residue gate on the poison and
+            # this test would stop exercising the structure gate it is about.
+            redacted, counts = real_redact_text(text, policy_version=policy_version)
+            return redacted.replace("|", ""), counts
 
         with patch.object(run_logging, "redact_text", pipe_eating):
             path = run_logging.export_final_review_evidence(self.RUN_ID, base=self.base)
@@ -3554,6 +3582,101 @@ class BundleSanitizationTests(_AuditTestCase):
         )
 
     # -- the gate itself, as a unit ------------------------------------------------------
+
+    # -- T-7.13 / T-7.14: the per-match residue rule (D-4.1) --------------------------
+
+    def test_t713_two_anchored_categories_are_recognised_again_and_still_embedded(
+        self,
+    ) -> None:
+        """The F-101 regression guard.
+
+        Both `env_secret_pattern` and `url_credential` preserve a readable anchor on
+        purpose, so both are COUNTED again on a second pass while removing nothing.
+        A gate that required a zero second-pass count would omit the log from exactly
+        the bundles the sanitization exists for. This test states that out loud, so a
+        contributor who re-adds `extra == ()` fails here with the reason in front of
+        them.
+        """
+        self.poison(
+            result="GITHUB_TOKEN=ghp_deadbeef1234",
+            detail="https://user:hunter2@example.test/x",
+        )
+
+        bundle, serialized = self.export()
+        log = bundle["orchestrator_log"]
+
+        self.assert_not_in_bundle("ghp_deadbeef1234", serialized)
+        self.assert_not_in_bundle("hunter2", serialized)
+        self.assertGreaterEqual(self.categories(bundle)["env_secret_pattern"], 1)
+        self.assertGreaterEqual(self.categories(bundle)["url_credential"], 1)
+        self.assertIsNotNone(log["content_redacted"])
+        self.assertEqual(log["content_omitted_reason"], "")
+
+        second_pass = run_logging.redact_text(log["content_redacted"])[1]
+        self.assertNotEqual(
+            second_pass,
+            (),
+            "a NON-EMPTY second-pass count is expected and safe: these two categories "
+            "re-match their own placeholder output and rewrite it to identical bytes",
+        )
+        self.assertTrue(
+            run_logging._residual_matches_are_self_output(log["content_redacted"]),
+            "recognition is not residue -- every residual match expands to its own span",
+        )
+
+    def test_t714_residue_is_decided_per_match_not_by_whole_string_equality(
+        self,
+    ) -> None:
+        """A category whose replacement does not reproduce its own span is residue.
+
+        And the converse, in the same test: a category shaped like categories 2 and 3 --
+        one whose placeholder output re-matches and expands to its own span -- is
+        embedded. The two halves together are the whole of D-4.1.
+        """
+        # See T-7.9 above and IMPLEMENTATION F-301 for why the replacement is not the
+        # literal `<REDACTED:t>` DESIGN uses to illustrate the shape.
+        removing = ("t", re.compile(r"ZZ_[A-Z]+"), "ZZ_REDACTED_X")
+        preserving = ("t2", re.compile(r"ZZ2_([A-Z]+)=(\S+)"), r"ZZ2_\1=<REDACTED:t2>")
+
+        raw = self.poison(detail="ZZ_LEAK")
+        with patch.object(
+            run_logging,
+            "REDACTION_CATEGORIES",
+            (removing,) + run_logging.REDACTION_CATEGORIES,
+        ):
+            path = run_logging.export_final_review_evidence(self.RUN_ID, base=self.base)
+
+        bundle = json.loads(path.read_text(encoding="utf-8"))
+        log = bundle["orchestrator_log"]
+        self.assertIsNone(log["content_redacted"])
+        self.assertEqual(log["content_omitted_reason"], "redaction_residue")
+        self.assertEqual(log["digest_pre_redaction"], run_logging.sha256_text(raw))
+        self.assertIn(
+            {"path": ORCHESTRATOR_LOG_FILENAME, "reason": "redaction_residue"},
+            bundle["integrity"]["omitted_content"],
+        )
+        self.assertTrue(path.is_file(), "the export must still return a written path")
+
+        self.tearDown()
+        self.setUp()
+        self.poison(detail="ZZ2_ABC=disclosed_value")
+        with patch.object(
+            run_logging,
+            "REDACTION_CATEGORIES",
+            (preserving,) + run_logging.REDACTION_CATEGORIES,
+        ):
+            path = run_logging.export_final_review_evidence(self.RUN_ID, base=self.base)
+
+        serialized = path.read_text(encoding="utf-8")
+        log = json.loads(serialized)["orchestrator_log"]
+        self.assertIsNotNone(
+            log["content_redacted"],
+            "a category that REMOVES on the first pass and only RECOGNISES on the "
+            "second is not residue",
+        )
+        self.assertEqual(log["content_omitted_reason"], "")
+        self.assert_not_in_bundle("disclosed_value", serialized)
+        self.assertIn("ZZ2_ABC=<REDACTED:t2>", log["content_redacted"])
 
     def test_safe_embedded_text_verifies_without_transforming_when_redact_is_false(
         self,
