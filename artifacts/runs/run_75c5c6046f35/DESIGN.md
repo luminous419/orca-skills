@@ -2936,7 +2936,10 @@ Step 3 rewrites wholesale.
 
 ## DESIGN iteration 2 (Run `run_75c5c6046f35`) — the O-2 credential/state provisioning decision
 
-STATUS: COMPLETE
+STATUS: COMPLETE — **partially superseded by DESIGN iteration 3** (the section at the end of this
+document), which corrects `REVIEW_DESIGN_iteration2.md`'s F-001 (the source-read TOCTOU) in **D-6.8**
+and F-002 (the lost as-copied digest) in **D-6.9**. D-6.0, D-6.1, D-6.5, D-6.6 and the placement of
+`seed_session_home()` in D-6.3 stand as approved; the superseded passages below carry inline markers.
 
 This iteration designs the one thing iteration 1's **O-2** named and explicitly deferred: an
 attested way to put the agent's credentials and state into `<SESSION>/home` **before** the
@@ -3127,14 +3130,17 @@ python3 scripts/final_review_eval.py isolate \
 #### D-6.2 — what MUST NOT be seedable: twelve rules, checked before a byte is copied
 
 `seed_session_home()` validates **every** pair completely before it copies **any** of them, so a
-rejected pair never leaves a partially seeded session behind. Every violation is exit `4` (the
+rejected pair never leaves a partially seeded session behind. *(The all-before-any ordering stands.
+**How** each rule is decided is superseded by D-6.8: every source is opened once through a
+no-follow descriptor walk and every check runs over the bytes read from that descriptor, so no
+pathname is re-resolved between validation and copy. F-001.)* Every violation is exit `4` (the
 leak/fixture code, per G.7) except the argument-grammar violations, which are exit `1`.
 
 **Source rules.**
 
 | # | rule | why it is load-bearing |
 |---|---|---|
-| **S-1** | `os.lstat(src)` must be `S_ISREG`. Not a directory, not a symlink, not a FIFO, socket, character or block device. | This is what makes "no directory copy" a construction rather than a policy (§D), and it keeps F-401's defect class out of the seed path: the operator's real `$CODEX_HOME` **contains a unix socket**, measured. |
+| **S-1** | *(superseded by D-6.8: decided from `os.fstat(fd)` on the one no-follow descriptor, and a symlink is refused by `O_NOFOLLOW` at the open itself.)* `os.lstat(src)` must be `S_ISREG`. Not a directory, not a symlink, not a FIFO, socket, character or block device. | This is what makes "no directory copy" a construction rather than a policy (§D), and it keeps F-401's defect class out of the seed path: the operator's real `$CODEX_HOME` **contains a unix socket**, measured. |
 | **S-2** | `st_size ≤ 1 MiB`, and the total across all pairs `≤ 4 MiB`. | Bounds the fixed routine and the two scans that follow it. |
 | **S-3** | `src` must not be within `REPO_ROOT`, within the `--fixture` tree, or within any root `discover_key_bearing_roots()` returns; no path component may be named `key` or `adjudications`; the basename must not be `answer_key.json`. | **Unconditional, and therefore strictly stricter than pass A**, whose `key`/`adjudications` rule only fires under a directory that also holds a `subject/`. This is the rule that stops the mechanism becoming an exfiltration path: no file the fixture owns can be nominated as a seed, whatever it is named. |
 | **S-4** | `sha256(src)` must not equal the answer key's digest, **and** `scan_leak_text(src, text, key_leak_tokens(key), count_heuristics=True)` must return zero hits. | The same per-file test pass B runs, applied **before** the copy. The post-copy scan would catch it anyway (§C, measured), but pre-screening means a contaminated source never lands in the session at all — so the exit-4 path has nothing to remove and no window in which key material sits in the session directory. |
@@ -3150,7 +3156,7 @@ leak/fixture code, per G.7) except the argument-grammar violations, which are ex
 | **D-2** | No path component may be named `key`, `adjudications` or `subject`, and the basename must not be `answer_key.json`. | A seed must not be able to construct a path that *looks* like fixture material to a later reader of the session or of the inventory, and must not collide with pass A's names. |
 | **D-3** | `(session / "home" / dest)` resolved must be strictly within `_realpath(session / "home")`; every intermediate directory is created by the routine itself with mode `0700`, and the routine refuses to descend through anything it did not create. | Belt to D-1's braces. Because the routine creates every intermediate itself, no intermediate can be a pre-existing symlink. |
 | **D-4** | The destination must not already exist, and no two `--seed` pairs may name the same destination. | Two pairs writing one path would make the attestation's record ambiguous about which source is in the session. |
-| **D-5** | The copy is `shutil.copyfile()` — contents only — followed by `os.chmod(dest, 0o600)`. **Not `copy2`.** | Mode, mtime, flags and xattrs are not carried across: a fixed `0600` is both safer than an inherited mode and byte-reproducible in the attestation, and the attestation carries no clock value (`assert_no_clock_value`), so an inherited mtime has nowhere to go anyway. |
+| **D-5** | *(**Superseded by D-6.8**, F-001: `shutil.copyfile()` is a pathname-to-pathname operation and is removed from this design. The copy writes the already-validated buffer to an `O_CREAT|O_EXCL|O_NOFOLLOW` descriptor and `fchmod`s it `0600`. The reason below is unchanged and is why the write is not `copy2`.)* The copy is `shutil.copyfile()` — contents only — followed by `os.chmod(dest, 0o600)`. **Not `copy2`.** | Mode, mtime, flags and xattrs are not carried across: a fixed `0600` is both safer than an inherited mode and byte-reproducible in the attestation, and the attestation carries no clock value (`assert_no_clock_value`), so an inherited mtime has nowhere to go anyway. |
 
 **The routine is fixed and non-configurable.** `seed_session_home(session, pairs, *, key, fixture,
 repo_root)` is one function, called from exactly one place, with no parameter that relaxes any rule
@@ -3185,7 +3191,10 @@ Two contract assertions, both hard failures, both in `isolate()` after `run_prob
 * `assert_home_scanned(readable)` — `<SESSION>/home` must appear in `readable["entries"]` as a
   `class: "USR"` entry with `scanned: true`, and in the NEG-5 probe record. A seed mechanism whose
   root somehow left the scanned set is a silent hole; this makes it a loud one.
-* `assert_seeds_present(session, manifest)` — every declared destination must still exist and be a
+* `assert_seeds_present(session, manifest)` — *(**superseded by D-6.9**, F-002: replaced by
+  `attest_seeds(manifest, inventory)`, which records the as-copied and observed identities as
+  separate immutable fields and derives `state` from comparing them. The hard failure on a missing
+  seed is unchanged; the digest replacement described below is not.)* every declared destination must still exist and be a
   regular file. A **missing** seed is a hard failure (something removed it; the session is not what
   it claims). A seed whose digest **changed** is *not* a failure: the agent legitimately rewrites a
   refreshed credential during the pre-flight. It is recorded as `state: "modified"` with the new
@@ -3201,14 +3210,14 @@ see a different number rather than a silently richer document.
 ```json
 "session_home": {
   "seed_policy": "enumerated regular files only, copied by a fixed routine before the readable-set scan; no pass is exempted and no flag disables a check",
-  "seeded": [
+  "seeded": [                         // record shape superseded by D-6.9 (F-002)
     {"dest": "home/.codex/auth.json",
      "source": "<REDACTED:foreign_absolute_path>",
      "bytes": 4048, "sha256": "sha256:…", "mode": "0600", "state": "present"}
   ],
   "inventory": {
     "files": 215, "bytes": 32041688, "tree_digest": "sha256:…",
-    "seeded_present": 1, "seeded_modified": 0, "unseeded": 214, "truncated": false,
+    "seeded_present": 1, "seeded_modified": 0, "unseeded": 214, "truncated": false,   // seeded_present -> seeded_unmodified, D-6.9
     "entries": [
       {"path": "home/.codex/auth.json", "bytes": 4048, "sha256": "sha256:…", "origin": "seed"},
       {"path": "home/.codex/history.jsonl", "bytes": 812, "sha256": "sha256:…", "origin": "session"}
@@ -3336,6 +3345,7 @@ isolate(run_id, …, seed=(), agent_path=(), …)
   |      1. parse+validate ALL pairs (S-1..S-7, D-1..D-4) before copying ANY
   |      2. copyfile + chmod 0600 + 0700 parents, in argument order
   |      3. return manifest[] = {dest, source, bytes, sha256, mode}
+  |      (steps 1-3 superseded by D-6.8/D-6.9; see the iteration-3 data-flow block)
   |    materialize() / policy copy / scan_leak(review_root)   (unchanged)
   |
   +- compute_readable_set(...)   <SESSION>/home scanned A/B/C/D/S, key_leak   (unchanged code)
@@ -3346,6 +3356,8 @@ isolate(run_id, …, seed=(), agent_path=(), …)
   +- assert_home_scanned(readable)                                     <-- NEW, exit 4
   +- assert_seeds_present(session, manifest)                           <-- NEW, exit 4
   +- inventory_session_home(session, manifest)                         <-- NEW
+       (both superseded by D-6.9: inventory_session_home(session) runs FIRST as the single
+        reader, then attest_seeds(manifest, inventory) replaces assert_seeds_present())
   |      lstat-only walk; digests regular files; never opens a non-regular entry
   +- build_attestation(..., session_home=…)   schema 1.1               <-- one new object
 ```
@@ -3364,7 +3376,7 @@ Its docstring already explains why `TMPDIR`/`HOME` are launch-line values rather
 | `<SESSION>/home` absent from the scanned Class USR set, or missing from the NEG-5 record | `4` | session removed |
 | a declared seed destination missing at attestation time | `4` | session removed |
 | inventory exceeds `MAX_HOME_INVENTORY` | `4` | session removed, count printed |
-| a seed's digest differs at attestation time | `0` | recorded as `state: "modified"` with the observed digest — an outcome, not a failure |
+| a seed's digest differs at attestation time | `0` | recorded as `state: "modified"` with the observed digest — an outcome, not a failure. *(**Superseded by D-6.9**: both the as-copied and the observed identities are retained; nothing is replaced.)* |
 
 **No new exit code**, consistent with G.7 and with iterations 2-5.
 
@@ -3384,7 +3396,7 @@ redaction policy and `release_manifest.py` are all unmodified.
 
 | step | file | change | hard? |
 |---|---|---|---|
-| **1** | `scripts/review_isolation.py` | `seed_session_home()`, `inventory_session_home()`, `assert_home_scanned()`, `assert_seeds_present()`, `assert_agent_path_admitted()`; `MAX_SEEDS`/`MAX_SEED_BYTES`/`MAX_HOME_INVENTORY`; `build_session(..., seed=())`; `isolate(..., seed=(), agent_path=())`; `wrap_command(..., agent_path=())` adds `PATH`; `build_attestation(..., session_home=…)`; `ISOLATION_SCHEMA_VERSION = "1.1"` | **HARD** |
+| **1** | `scripts/review_isolation.py` | *(revised by iteration 3, step 1 — build that list, not this one)* `seed_session_home()`, `inventory_session_home()`, `assert_home_scanned()`, `assert_seeds_present()`, `assert_agent_path_admitted()`; `MAX_SEEDS`/`MAX_SEED_BYTES`/`MAX_HOME_INVENTORY`; `build_session(..., seed=())`; `isolate(..., seed=(), agent_path=())`; `wrap_command(..., agent_path=())` adds `PATH`; `build_attestation(..., session_home=…)`; `ISOLATION_SCHEMA_VERSION = "1.1"` | **HARD** |
 | **2** | `scripts/final_review_eval.py` | `isolate` parser: `--seed` and `--agent-path`, both `action="append"`, both defaulting to `[]`, with help text carrying the low-entropy-secret caveat; threaded into `_dispatch_isolate()` | **HARD**, same commit as 1 |
 | **3** | `scripts/test_review_isolation.py` | T-10.1 … T-10.12 below | **HARD**, same commit as 1-2 |
 | **4** | docs (`COMPATIBILITY.md` untouched; the isolate section of the operator doc) | the `--seed`/`--agent-path` contract and the closed refusal list | no |
@@ -3401,7 +3413,7 @@ credential.
 
 | id | asserts |
 |---|---|
-| **T-10.1** | a valid pair lands at `<SESSION>/home/<dest>` with mode `0600`, parents `0700`, content byte-identical to the source |
+| **T-10.1** | a valid pair lands at `<SESSION>/home/<dest>` with mode `0600`, parents `0700`, content byte-identical to the source *(amended by iteration 3; T-10.13…T-10.19 are added there)* |
 | **T-10.2** | S-1: a directory, a symlink and a **FIFO** source are each refused, and the FIFO case must complete in bounded time — the same reproduction shape F-401 needs, pointed at the seed door |
 | **T-10.3** | S-3: a source inside the fixture, inside `key/`, inside `adjudications/`, inside the repo, and one merely *named* `answer_key.json` are each refused |
 | **T-10.4** | S-4: a source containing key vocabulary is refused **before** the copy — the destination must not exist afterwards |
@@ -3410,7 +3422,7 @@ credential.
 | **T-10.7** | S-2: the per-file and total caps, and `MAX_SEEDS` |
 | **T-10.8** | validate-all-then-copy: with pair 1 valid and pair 2 invalid, **neither** is present |
 | **T-10.9** | the seed is visible to the admission scan: a seeded file carrying key vocabulary makes `isolate` exit 4 with the session removed — i.e. the scan is not bypassed |
-| **T-10.10** | the attestation: `session_home.seeded[]` digests match; `dest`/`inventory.entries[].path` pass `assert_retained_path_field()`; `source` is the redacted placeholder; `assert_no_clock_value()` still passes; `schema_version == "1.1"` |
+| **T-10.10** | *(amended by iteration 3 for the two-identity record)* the attestation: `session_home.seeded[]` digests match; `dest`/`inventory.entries[].path` pass `assert_retained_path_field()`; `source` is the redacted placeholder; `assert_no_clock_value()` still passes; `schema_version == "1.1"` |
 | **T-10.11** | the inventory: a file created in `home/` **after** the admission scan appears with `origin: "session"`; a **non-regular** entry is recorded with `kind` and **no digest** and is never opened; the `MAX_HOME_INVENTORY` cap fails closed; `tree_digest` is stable across two runs over identical content |
 | **T-10.12** | `--agent-path`: an entry not in the readable set exits 4; an admitted entry appears in `wrap_command()`'s `PATH` ahead of `/usr/bin`, and `TMPDIR`/`HOME` are unchanged |
 
@@ -3460,3 +3472,474 @@ evidence.
   mandatory pass B (D-5.1), pass C's size prefilter, pass S's Class-USR-only scope, pass D's
   extension list, D-I, `COMPATIBILITY.md`, O-1 and O-3. **O-1 remains open and undischarged** —
   `orca_check_probe()` still has no caller; wiring it is IMPLEMENTATION's, per F-403.
+
+## DESIGN iteration 3 (Run `run_75c5c6046f35`) — correction for F-001/F-002
+
+STATUS: COMPLETE
+
+Scope of this iteration: **the seed source-read contract (F-001) and the seed record's identity
+fields (F-002), and nothing else.** `REVIEW_DESIGN_iteration2.md` confirmed the placement of
+`seed_session_home()` inside `build_session()`, the admission-scan and NEG-5 coverage of
+`<SESSION>/home`, and the `--agent-path` widening as sound; none of them is reopened, and neither
+are F-401, F-402, D-H.2, RK-7, mandatory pass B (D-5.1) or D-I. D-6.0, D-6.1, D-6.5, D-6.6 and
+D-6.7's S1/S2/S3 rows stand exactly as approved. What changes below is **how** the rules D-6.2
+already states are enforced, and **what a seed record records** — two mechanisms, no new policy.
+
+Where iteration 2's text is now superseded, the passage carries an inline
+*(superseded by D-6.8 / D-6.9)* marker rather than being deleted, so a reader of the review thread
+can still see what the finding was filed against.
+
+### Summary / Requirements
+
+| review finding | disposition |
+|---|---|
+| **F-001** — D-6.2 validated every pair by pathname (`lstat`, containment, digest, mode, UTF-8) and D-5 then *reopened* each pathname through `shutil.copyfile()`. Nothing tied the validated bytes to the copied bytes, so a source replaced between the phases — including by a symlink into the repository, fixture or a key-bearing root — reached the session past S-1/S-3. | **Closed by D-6.8.** Each source is opened exactly once through a component-by-component `O_NOFOLLOW` walk; every check from the size ceiling onward runs over the bytes read from **that** descriptor; those same bytes are what is written to the destination and what `seeded_sha256` digests. `shutil.copyfile()` and `sha256_path()` are removed from the seed path. Phase 1 and phase 2 become two functions, and phase 2 is handed no re-openable source pathname, so re-resolution is impossible by construction rather than forbidden by prose. S-8 closes the one alias a symlink-free walk cannot see (a hard link into key material). Five new tests, T-10.13…T-10.17. |
+| **F-002** — a modified seed's `seeded[].sha256` was *replaced* with the observed digest, so the single digest/size field could not answer both "what did `seed_session_home()` copy" and "what is there now". B6's honesty requirement was unsatisfiable. | **Closed by D-6.9.** Each record carries two disjoint groups: immutable `seeded_bytes`/`seeded_sha256`/`seeded_mode`, written once by the routine that copied the bytes into a **frozen** dataclass, and `observed_bytes`/`observed_sha256`/`observed_mode`, written once at attestation time from the inventory's single read. `state` is *derived* from comparing them. `assert_seeds_present()` is replaced by `attest_seeds()`, which cannot recompute or overwrite the as-copied side. Two new tests, T-10.18 and T-10.19. |
+
+Every primitive this iteration relies on was executed on this host before being written into the
+spec, the same way iteration 2 measured the seed set:
+
+```text
+python 3.11.8, macOS-26.5.2-arm64
+os.open / os.mkdir / os.stat / os.unlink / os.rmdir  in os.supports_dir_fd  -> True (all five)
+O_NOFOLLOW, O_DIRECTORY, O_CLOEXEC                   -> present
+os.open(<symlink>, O_RDONLY|O_NOFOLLOW)              -> OSError ELOOP
+os.open("link", O_RDONLY|O_NOFOLLOW, dir_fd=<dir>)   -> OSError ELOOP
+os.open("real", O_RDONLY|O_DIRECTORY|O_NOFOLLOW, …)  -> OSError ENOTDIR   (regular file)
+os.open("real", O_RDONLY|O_NOFOLLOW, dir_fd=<dir>)   -> ok, fstat().st_size correct
+```
+
+So the no-follow descriptor walk is available on the capture host, and the two error codes the
+design keys refusals on are the ones the platform actually raises. Nothing here needs a new
+dependency.
+
+### Current Architecture
+
+Unchanged from iteration 2 and re-verified rather than assumed:
+
+* `scripts/review_isolation.py:192-197` — `sha256_bytes(data)` and `sha256_path(path)`. The
+  buffer-oriented one already exists, so D-6.8 adds no digest helper; it only stops the seed path
+  from using the pathname-oriented one.
+* `scripts/review_isolation.py:200` `_realpath()`, `:204` `_is_within()`, `:913` `discover_key_bearing_roots()` —
+  unchanged, and still the authority S-3 is evaluated against.
+* `scripts/final_review_eval.py:348` `key_leak_tokens()`, `:399` `scan_leak_text(path, text, tokens, *, count_heuristics=True)` —
+  the per-file body takes **text already in hand**, which is precisely what D-6.8 needs: S-4 runs
+  over the decoded buffer and never over a re-read file.
+* `scripts/run_logging.py:1082` `FOREIGN_PATH_PLACEHOLDER = "<REDACTED:foreign_absolute_path>"`,
+  `:1336` `assert_retained_path_field()`, `:1314` `normalize_retained_path_field()` — unchanged;
+  D-1 and the `source` field's redaction still go through them.
+* Fixture key-bearing material, measured for S-8's bound: `scripts/fixtures/final_review_eval/key`
+  holds **1** regular file and `…/adjudications` holds **1**, against 29 files in the whole
+  fixture. The inode set S-8 collects is two entries on this host.
+
+`seed_session_home()`, `inventory_session_home()`, `assert_home_scanned()`,
+`assert_seeds_present()` and `assert_agent_path_admitted()` are all still *proposed* — none exists
+in `scripts/`, so this iteration revises a design, not shipped code.
+
+### Proposed Design
+
+#### D-6.8 — the atomic source-read contract (supersedes D-6.2's S-1 `lstat` and D-5)
+
+**The split that makes the fix checkable.** `seed_session_home()` becomes a two-line composition of
+two functions with a deliberately narrow interface between them:
+
+```python
+def seed_session_home(session, pairs, *, key, fixture, repo_root):
+    sources = read_seed_sources(pairs, key=key, fixture=fixture, repo_root=repo_root)  # phase 1
+    return place_seed_sources(session, sources)                                        # phase 2
+```
+
+```python
+@dataclass(frozen=True)
+class SeedSource:
+    dest: str          # HOME-relative POSIX string, already D-1..D-4 validated
+    source: str        # ALREADY redacted: run_logging._path_field(<abs source>)
+    data: bytes        # the exact validated bytes, read from the one descriptor
+    sha256: str        # sha256_bytes(data) -- over the buffer, never sha256_path()
+```
+
+The interface carries **no absolute source pathname**. That is the whole of F-001's structural
+answer: `place_seed_sources()` is not given a value it could pass to `open()`, `stat()`,
+`shutil.copyfile()` or `sha256_path()`, so "no later step may re-resolve the source pathname" is a
+property a reviewer can verify by reading one dataclass, not a rule someone must remember. The
+split is also the seam the race tests drive (T-10.13), which is why it is two public functions
+rather than one function with a test-only hook: a test seam that only exists for tests is a
+different code path from the one that ships.
+
+**The no-follow walk.** `_open_no_follow(abs_source) -> (fd, parts)`:
+
+1. `dfd = os.open("/", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)`.
+2. For each intermediate component: `nxt = os.open(part, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC, dir_fd=dfd)`,
+   then close the previous descriptor. A symlink component raises `ELOOP`; a non-directory raises
+   `ENOTDIR`. Both are exit `4`.
+3. Final component: `fd = os.open(base, O_RDONLY | O_NOFOLLOW | O_CLOEXEC, dir_fd=dfd)`. `ELOOP`
+   here **is** S-1's symlink refusal — now enforced by the kernel in the same call that obtains the
+   descriptor, instead of by a separate `lstat` on a pathname that could be re-pointed afterwards.
+4. Return the descriptor and `parts`, the literal component sequence the walk actually opened.
+
+`os.close()` on every descriptor in a `finally:`; the walk holds at most two at a time.
+
+Two grammar additions in `read_seed_sources()`, both exit `1` with the offending argument printed
+(consistent with D-6.1's other grammar failures): the source must be absolute (already required)
+and **must contain no empty, `.` or `..` component**. A `..` would let the walk climb back above a
+directory it had just proved, which would make `parts` stop being the whole story.
+
+**Why lexical containment is now sound — the S-3 repair.** Iteration 2's S-3 compared a pathname
+against realpath'd refused roots, which is only equivalent to a realpath comparison when no
+component of that pathname is a symlink. The walk proves exactly that, component by component,
+while holding each descriptor. S-3 is therefore evaluated over `parts` — the sequence the walk
+opened — and gives the same answer a `realpath()` would have, **without a second resolution that
+could observe a different filesystem than the one the descriptor came from.** No rule in D-6.2's
+source table changes; the evidence each rule is decided on does.
+
+**S-8, new — the one alias a symlink-free walk cannot see.** A hard link has no symlink component
+and no distinguishing pathname, so a hard link to key material planted outside every refused root
+survives both the walk and S-3. `read_seed_sources()` therefore collects `(st_dev, st_ino)` for
+`answer_key.json` and for every regular file under the fixture's `key/` and `adjudications/`
+subtrees, and refuses (exit `4`) any source whose `os.fstat(fd)` identity is in that set.
+
+* Bounded: `MAX_KEY_INODES = 4096`; exceeding it is exit `4` naming the count, fail-closed. Measured
+  on this host the set is **2** entries, so the collection walk is free.
+* Not redundant with S-4: S-4's digest test already catches a hard link to the *answer key* by
+  content, but a hard link to other key-bearing material whose bytes do not happen to match the
+  current key vocabulary would pass S-4 and pass a pathname test. That is F-001's gap restated at
+  the inode level, and S-8 is what closes it.
+* Only runs when at least one `--seed` is declared, so the default invocation pays nothing.
+
+**Per-pair validation, every check from the one descriptor and then from the one buffer.**
+
+| # | check | decided from |
+|---|---|---|
+| 1 | walk each component no-follow; `ELOOP`/`ENOTDIR` → exit 4 | the walk |
+| 2 | **S-1** `stat.S_ISREG(st.st_mode)` on `st = os.fstat(fd)` — refuses a directory, FIFO, socket, character or block device. A symlink can no longer reach this check at all | `fstat(fd)` |
+| 3 | **S-5** `st.st_mode & 0o111 == 0` | `fstat(fd)` |
+| 4 | **S-2** `st.st_size <= MAX_SEED_BYTES` — a cheap pre-read reject, advisory only | `fstat(fd)` |
+| 5 | read the descriptor to EOF with a hard ceiling of `MAX_SEED_BYTES + 1` bytes; more than `MAX_SEED_BYTES` taken → exit 4. **This, not step 4, is the enforced cap**: it binds the bytes actually taken rather than a size that could change after it was sampled | `os.read(fd, …)` |
+| 6 | **S-2 (total)** running sum over the retained buffers `<= MAX_SEED_TOTAL_BYTES` (4 MiB) | the buffers |
+| 7 | **S-6** archive extension; **S-3** containment and component names | `parts` |
+| 8 | **S-8** `(st_dev, st_ino)` not in the key-bearing inode set | `fstat(fd)` |
+| 9 | **S-7** `data.decode("utf-8")` | the buffer |
+| 10 | **S-4** `sha256_bytes(data) != <answer key digest>` **and** `scan_leak_text(<redacted source>, text, key_leak_tokens(key), count_heuristics=True) == []` | the buffer |
+| 11 | **D-1…D-4** destination rules (unchanged), including no duplicate `dest` across pairs | `dest` |
+| 12 | `os.close(fd)`; retain `SeedSource(dest, _path_field(src), data, sha256_bytes(data))` | — |
+
+All pairs complete steps 1-12 before phase 2 runs at all, so D-6.2's "a rejected pair never leaves
+a partially seeded session behind" is unchanged and T-10.8 still holds.
+
+**Why there is no post-read `fstat` identity re-check, and why that is the stronger answer.** It
+would be natural to `fstat` again and require `(st_dev, st_ino, st_size, st_mode)` unchanged. That
+would be decoration: a file can be replaced and restored between two `fstat`s, so the comparison
+cannot fail closed, and a check that cannot fail closed is not a control. The property that does
+hold needs no comparison:
+
+> **The buffer is the artefact.** Steps 5-10 decide over `data`; phase 2 writes `data`;
+> `seeded_sha256` digests `data`. Nothing reads the source a second time, so there is no second
+> value for the three to disagree about. A source replaced, truncated, deleted, or turned into a
+> symlink into the repository, the fixture or a key-bearing root at **any** moment after step 5
+> changes nothing observable: the bytes in the session are the bytes that passed S-3, S-4, S-6,
+> S-7 and S-8, and the attestation's digest is theirs.
+
+So `read_seed_sources()` performs no post-read `fstat`, and the design deliberately does not ask
+for one.
+
+**Phase 2 — placement: no-follow, exclusive, descriptor-scoped (supersedes D-5).** For each
+`SeedSource`, in argument order, only after every pair passed phase 1:
+
+1. Open `<SESSION>/home` `O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC` and walk `dest`'s parents
+   from it, creating each missing one with `os.mkdir(part, 0o700, dir_fd=parent_fd)` and re-opening
+   it with the same no-follow directory flags. D-3's *"the routine creates every intermediate itself
+   and refuses to descend through anything it did not create"* becomes literal: a pre-existing
+   symlink intermediate fails the re-open with `ELOOP` instead of being resolved.
+2. `out = os.open(base, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600, dir_fd=parent_fd)`.
+   `O_EXCL` is **D-4 enforced by the kernel in the same call that creates the file**, so the
+   destination has no TOCTOU window either.
+3. `os.write(out, data)` until the whole buffer is written; `os.fchmod(out, 0o600)` — the
+   descriptor, not the pathname; `os.close(out)`.
+4. Emit the frozen `SeededRecord` of D-6.9.
+
+`shutil.copyfile()` is **removed from this design.** It is a pathname-to-pathname operation and it
+is exactly what F-001 caught. D-5's *reason* survives intact and is why the write is `os.write` +
+`fchmod(0o600)` rather than `copy2`: mode, mtime, flags and xattrs are still not carried across, a
+fixed `0600` is still safer than an inherited mode, and the attestation still carries no clock
+value. `sha256_path()` MUST NOT be applied to a seed source anywhere.
+
+**The invariant, written so it can be checked by inspection:**
+
+> After `read_seed_sources()` returns, the absolute source pathname exists nowhere in the process
+> except as the already-redacted string `"<REDACTED:foreign_absolute_path>"`. No function
+> downstream of phase 1 — `place_seed_sources()`, `inventory_session_home()`, `attest_seeds()`,
+> `build_attestation()` — receives a value it could pass to `open`, `stat`, `copyfile` or
+> `sha256_path` to re-resolve it.
+
+**Memory, bounded by a cap that already existed.** "Retain the bytes" is only acceptable when it is
+bounded: `MAX_SEED_TOTAL_BYTES` = 4 MiB (S-2) bounds the retained set, held for the duration of one
+`seed_session_home()` call inside `build_session()`. Measured requirement: one file, 4,048 bytes.
+
+#### D-6.9 — two identities per seed (supersedes D-6.3's `assert_seeds_present` bullet and D-6.4's seed record)
+
+One digest field could not answer two questions. The fix is two disjoint field groups with
+different writers, different lifetimes, and a single reader on the observed side.
+
+| group | fields | written by | when | mutable? |
+|---|---|---|---|---|
+| **as-copied** | `seeded_bytes`, `seeded_sha256`, `seeded_mode` | `place_seed_sources()` | at the copy, from the buffer it wrote | **no** — a frozen dataclass; assignment raises `dataclasses.FrozenInstanceError` |
+| **observed** | `observed_bytes`, `observed_sha256`, `observed_mode` | `attest_seeds()` | after the pre-flight and after NEG-5, from the inventory's single read | written once |
+
+```json
+"seeded": [
+  {"dest": "home/.codex/auth.json",
+   "source": "<REDACTED:foreign_absolute_path>",
+   "seeded_bytes": 4048,
+   "seeded_sha256": "sha256:…",
+   "seeded_mode": "0600",
+   "observed_bytes": 4102,
+   "observed_sha256": "sha256:…",
+   "observed_mode": "0600",
+   "state": "modified"}
+]
+```
+
+Iteration 2's `bytes`, `sha256`, `mode` and `state: "present"` are **removed, not aliased**. A field
+whose meaning silently changed between two readers is the drift this finding is about, and the
+`1.0` → `1.1` bump has not shipped, so there is nothing to stay compatible with. `1.1` remains the
+right bump: still additive against the released `1.0`, which had no `session_home` object at all.
+
+**`state` is derived, never asserted.**
+
+* `"unmodified"` — `observed_sha256 == seeded_sha256` (and therefore `observed_bytes == seeded_bytes`);
+* `"modified"` — otherwise.
+
+There is no `"present"` and no `"missing"`. Presence is not a state a record can carry, because a
+declared destination that is missing at attestation time is exit `4` and **no attestation is
+written at all** (unchanged from D-6.3). Because `state` is a pure function of the two digest
+fields, it can never disagree with them, and a reader who does not trust it can recompute it.
+
+**`observed_mode` is recorded even though D-5 fixes `0600`.** The pre-flight's agent can `chmod` its
+own credential file, and a mode change under an unchanged digest is exactly the kind of drift the
+single-field record hid. It is deliberately **not** part of `state`: `state` answers *"are these the
+bytes we supplied"*, which is B6's question.
+
+**One reader, so the two views cannot disagree.** `inventory_session_home(session)` becomes the
+*only* thing that reads `<SESSION>/home` at attestation time, and `attest_seeds(manifest, inventory)`
+derives every `observed_*` value by looking each declared `dest` up in the entries that walk
+produced. Consequences, each one a reason the call order is this and not the iteration-2 order:
+
+* exactly one `lstat`-only walk and one read per regular file, so the observed side has no
+  second-read TOCTOU either — D-6.8's lesson applied to the other end of the window;
+* `inventory.entries[dest].sha256` and `seeded[].observed_sha256` are **the same value by
+  construction**, not by a comparison that could pass on a lucky day, so no cross-check assertion is
+  needed and none is added;
+* `assert_seeds_present()` is replaced by `attest_seeds()`, which exits `4` when a declared `dest`
+  has no inventory entry or has one that is not a regular file. The meaning is unchanged: a missing
+  seed is a session that is not what it claims. What it can no longer do is recompute or overwrite
+  the as-copied side — it is handed frozen records.
+
+`inventory_session_home()` reads each regular entry through the same no-follow, read-once discipline
+as D-6.8 (`O_RDONLY | O_NOFOLLOW` from the walk's own directory descriptor). A non-regular entry is
+still `lstat`-recorded with `kind`, with no digest and no open — unchanged from D-6.4, and still
+the F-401 lesson applied to the one new walk this design introduces.
+
+**Inventory counters.** `seeded_present` → `seeded_unmodified`; `seeded_modified` unchanged;
+`unseeded`, `files`, `bytes`, `tree_digest`, `truncated` and `MAX_HOME_INVENTORY` unchanged.
+
+**What `ISOLATION.json` can now always answer, for every declared seed, in one place:**
+
+| question | field |
+|---|---|
+| what did we put there | `seeded_bytes` / `seeded_sha256` / `seeded_mode` — written by the routine that copied the bytes, from the buffer it copied |
+| what is there now | `observed_bytes` / `observed_sha256` / `observed_mode` — from the single attestation-time read that also produced the inventory |
+| did it change | `state`, derived from the two |
+| what else is there | `inventory.entries[]` with `origin: "session"` (unchanged) |
+
+B6's honesty requirement is satisfied at **both** ends of the seed window rather than at the later
+one only.
+
+**Residuals restated, not widened.** D-6.4's digest-as-verifier residual is unchanged in kind but
+now applies to two values per seed instead of one; the `limitations[]` sentence and the `--seed`
+help text say *"the seeded and observed digests"* rather than *"the digest"*. No other
+`limitations[]` entry changes.
+
+#### D-6.7, amended — the two rows this iteration re-backs
+
+| property | what could weaken it | what holds it (revised) |
+|---|---|---|
+| **S1** — the Reviewer cannot see key material | a seed carrying key vocabulary; a seed nominated *from* the fixture; **a source substituted after validation**; **a hard link into key material** | S-3 over the walk's own component sequence, S-4 and S-7 over the retained buffer, **S-8** over the descriptor's `(st_dev, st_ino)`, and **D-6.8's single-read contract**, which leaves no window between the decision and the copy; then the admission scan and NEG-5 over `<SESSION>/home` |
+| **B6's honesty** | content entering after the attestation; a swapped seed; **a modified seed erasing what was supplied** | D-6.3's call site, **D-6.9's frozen as-copied fields plus separate observed fields derived from the inventory's single read**, and D-6.4's digest-bearing inventory of everything actually present |
+
+The other four rows (S2/S3, the no-unscanned-descendant invariant, byte-reproducibility, and "no new
+exfiltration path") are unchanged — and byte-reproducibility is *strengthened*, since `os.write` +
+`fchmod` carries even less across than `copyfile` did.
+
+### Components / Interfaces / Data Flow
+
+```text
+isolate(run_id, …, seed=(), agent_path=(), …)
+  |
+  +- build_session(...)                                     scripts/review_isolation.py
+  |    (session/"home").mkdir()
+  |    seed_session_home(session, seed, key=…, fixture=…, repo_root=…)          <-- NEW
+  |      = place_seed_sources(session, read_seed_sources(seed, key=…, …))
+  |
+  |      read_seed_sources(pairs, *, key, fixture, repo_root) -> (SeedSource, …)   PHASE 1
+  |        _open_no_follow(src)  -> one fd via a component-wise O_NOFOLLOW walk
+  |        fstat(fd)             -> S-1, S-5, S-2(advisory), S-8
+  |        read(fd) <= CAP+1     -> the retained buffer; S-2 enforced here
+  |        over the buffer       -> S-7, S-4 (sha256_bytes + scan_leak_text)
+  |        over `parts`/`dest`   -> S-3, S-6, D-1..D-4
+  |        yields SeedSource(dest, source=<REDACTED>, data, sha256)  -- NO abs path
+  |
+  |      place_seed_sources(session, sources) -> (SeededRecord, …)                 PHASE 2
+  |        mkdir(0700, dir_fd=) + O_DIRECTORY|O_NOFOLLOW re-open per parent
+  |        O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW, 0600  +  write(data)  +  fchmod
+  |        yields frozen SeededRecord(dest, source, seeded_bytes, seeded_sha256, seeded_mode)
+  |
+  |    materialize() / policy copy / scan_leak(review_root)   (unchanged)
+  |
+  +- compute_readable_set(...)   <SESSION>/home scanned A/B/C/D/S, key_leak   (unchanged code)
+  +- render_seatbelt_profile(...)                                             (unchanged)
+  +- assert_agent_path_admitted(agent_path, readable)                  (unchanged from iter 2)
+  +- preflight_probe(session, agent_command=<resolved>)     (F-403 wiring, IMPLEMENTATION-owned)
+  +- run_probes(...)             NEG-5 re-scans <SESSION>/home                (unchanged code)
+  +- assert_home_scanned(readable)                                     (unchanged from iter 2)
+  +- inventory_session_home(session) -> inventory            <-- REORDERED: the ONLY reader
+  |      lstat-only walk; regular entries read once through O_RDONLY|O_NOFOLLOW; never
+  |      opens a non-regular entry
+  +- attest_seeds(manifest, inventory) -> seeded[]           <-- REPLACES assert_seeds_present()
+  |      exit 4 on a declared dest absent from the inventory or not a regular file;
+  |      fills observed_* from the inventory entry; derives `state`
+  +- build_attestation(..., session_home={"seeded": …, "inventory": …, …})  schema 1.1
+```
+
+Signature deltas against iteration 2, and nothing else changes:
+
+| iteration 2 | iteration 3 |
+|---|---|
+| `seed_session_home(session, pairs, *, key, fixture, repo_root)` — one body | same signature, now a composition of `read_seed_sources()` + `place_seed_sources()` |
+| — | `read_seed_sources(pairs, *, key, fixture, repo_root) -> tuple[SeedSource, ...]` |
+| — | `place_seed_sources(session, sources) -> tuple[SeededRecord, ...]` |
+| — | `_open_no_follow(abs_path) -> tuple[int, tuple[str, ...]]` |
+| `inventory_session_home(session, manifest)` | `inventory_session_home(session)` — the manifest is no longer an input; correlation moves to `attest_seeds()` |
+| `assert_seeds_present(session, manifest)` | `attest_seeds(manifest, inventory) -> list[dict]` |
+| manifest rows `{dest, source, bytes, sha256, mode}` | frozen `SeededRecord{dest, source, seeded_bytes, seeded_sha256, seeded_mode}` |
+
+`wrap_command()`, `assert_agent_path_admitted()`, `assert_home_scanned()`, `build_session()`'s and
+`isolate()`'s parameter lists, `render_seatbelt_profile()`, `compute_readable_set()`,
+`scan_readable_set()` and every probe are untouched by this iteration.
+
+### Error Handling / Compatibility
+
+Deltas against iteration 2's table; every other row stands.
+
+| condition | exit | effect |
+|---|---|---|
+| source contains an empty, `.` or `..` component | `1` | nothing built (grammar, printed with the offending argument) |
+| a source path **component** is a symlink (`ELOOP`) or a non-directory (`ENOTDIR`) during the walk | `4` | session removed; the message names the component index, and any path in it goes through `_path_field()` |
+| the final component is a symlink (`ELOOP`) — S-1 | `4` | session removed; replaces iteration 2's `lstat`-based symlink refusal |
+| more than `MAX_SEED_BYTES` read from the descriptor — S-2 enforced | `4` | session removed; catches a source that grows after `fstat` |
+| **S-8**: the source's `(st_dev, st_ino)` is a key-bearing file's | `4` | session removed |
+| key-bearing inode set exceeds `MAX_KEY_INODES` | `4` | session removed, count printed (fail-closed) |
+| a destination parent already exists as a symlink (`ELOOP` on the no-follow re-open) — D-3 | `4` | session removed |
+| the destination already exists (`O_EXCL` → `EEXIST`) — D-4 | `4` | session removed |
+| a declared seed destination missing, or not a regular file, at attestation time | `4` | session removed *(unchanged in meaning; now decided by `attest_seeds()` from the inventory)* |
+| a seed's observed digest differs from its seeded digest | `0` | `state: "modified"`, **both** identities retained — *supersedes iteration 2's "recorded with the observed digest"* |
+
+**No new exit code**, consistent with G.7 and with iterations 2-5 — every row above is `1` or `4`,
+both already in use. No `IsolationContractError` (exit `2`) path is added: the single-reader
+construction of D-6.9 removes the internal inconsistency that would have needed one.
+
+**Compatibility.** Unchanged from iteration 2 in every respect that faces an operator: `--seed` and
+`--agent-path` still default to empty, every existing invocation behaves exactly as it does today,
+and `--seed` is still the only way to run the real agent. `ISOLATION.json` still gains exactly one
+top-level object and one MINOR bump to `"1.1"`; the object's *interior* shape changes relative to
+iteration 2's unreleased proposal, which is not a compatibility event. No `run_logging.py` change,
+so the byte-identical mirror at `orca-worker-reviewer-orchestration/tools/run_logging.py` stays
+untouched. `VERSION`, `LICENSE-DECISION.md`, the fixture trees, the answer key, the scorer, the
+adjudication schema, the redaction policy, `release_manifest.py` and `COMPATIBILITY.md` are all
+unmodified.
+
+**Portability.** `dir_fd` on `os.open`/`os.mkdir`/`os.stat` is required. It is present on this host
+(measured above) and on Linux; it is absent on Windows, which `sandbox-exec` already excludes. The
+implementation asserts `os.open in os.supports_dir_fd` once at module import of the seed path and
+fails exit `4` if not, so an unsupported platform is a loud refusal rather than a silent fallback to
+pathname operations — the fallback would be F-001 again.
+
+### Expected Changed Files / Implementation Steps
+
+| step | file | change | hard? |
+|---|---|---|---|
+| **1** | `scripts/review_isolation.py` | *(revises iteration 2's step 1)* `SeedSource` and `SeededRecord` (both `@dataclass(frozen=True)`), `_open_no_follow()`, `read_seed_sources()`, `place_seed_sources()`, `seed_session_home()` as their composition, `inventory_session_home(session)`, `attest_seeds(manifest, inventory)`, `assert_home_scanned()`, `assert_agent_path_admitted()`; `MAX_SEEDS`/`MAX_SEED_BYTES`/`MAX_SEED_TOTAL_BYTES`/`MAX_HOME_INVENTORY`/`MAX_KEY_INODES`; the `os.supports_dir_fd` guard; `build_session(..., seed=())`; `isolate(..., seed=(), agent_path=())`; `wrap_command(..., agent_path=())` adds `PATH`; `build_attestation(..., session_home=…)`; `ISOLATION_SCHEMA_VERSION = "1.1"`. **`shutil.copyfile` and `sha256_path` must not appear on the seed path.** | **HARD** |
+| **2** | `scripts/final_review_eval.py` | unchanged from iteration 2's step 2 (`--seed`, `--agent-path`), except the `--seed` help text says *"the seeded and observed digests"* | **HARD**, same commit as 1 |
+| **3** | `scripts/test_review_isolation.py` | T-10.1 … T-10.12 as amended below, plus **T-10.13 … T-10.19** | **HARD**, same commit as 1-2 |
+| **4** | docs (the isolate section of the operator doc; `COMPATIBILITY.md` untouched) | the `--seed`/`--agent-path` contract, the closed refusal list, and the two-identity seed record | no |
+
+Ordering against the open findings is unchanged: F-401's and F-402's fixes and F-403's pre-flight
+wiring must all be in before `B-1′` is re-attempted, and this design does not depend on their order
+among themselves.
+
+### Testing Strategy
+
+All in `scripts/test_review_isolation.py`, over synthetic roots, with no network and no real
+credential. **Every race test below is deterministic** — the substitution happens between two
+ordinary function calls in the test body, with no threads, no timing and no retries.
+
+**Amended from iteration 2** (same intent, new field names / new enforcement point):
+
+| id | amendment |
+|---|---|
+| **T-10.1** | also asserts `seeded_bytes == len(source bytes)` and `seeded_sha256 == sha256_bytes(source bytes)`, and that the destination was created by `O_EXCL` (a pre-existing destination raises, covered by T-10.6) |
+| **T-10.2** | S-1's symlink case now asserts the refusal comes from the **no-follow open** (`ELOOP`), and adds a symlink at an **intermediate** component; the FIFO bounded-time case is unchanged |
+| **T-10.10** | asserts the full new record shape: `seeded_bytes`/`seeded_sha256`/`seeded_mode`, `observed_bytes`/`observed_sha256`/`observed_mode`, `state`; that `bytes`/`sha256`/`mode` are **absent**; that `dest` and `inventory.entries[].path` pass `assert_retained_path_field()`; that `source` is the redacted placeholder; `assert_no_clock_value()` still passes; `schema_version == "1.1"` |
+| **T-10.11** | `seeded_present` → `seeded_unmodified` in the counter assertions; adds that `inventory.entries[<seed dest>].sha256` **is** `seeded[].observed_sha256` (same value, one read) |
+
+**New for F-001:**
+
+| id | asserts |
+|---|---|
+| **T-10.13** | **the substitution race, driven through the phase seam.** For each of four substitutions performed *between* `read_seed_sources()` and `place_seed_sources()` — (a) the source replaced by a different regular file, (b) replaced by a **symlink into the fixture's `key/`**, (c) replaced by a directory, (d) deleted outright — `place_seed_sources()` still succeeds, the destination's bytes are **byte-identical to the original source**, its digest equals the returned `seeded_sha256`, and no byte of the answer key appears anywhere under `<SESSION>/home`. This is the exact scenario F-001 filed, made deterministic. |
+| **T-10.14** | **substitution cannot bypass a refusal.** The mirror of T-10.13: a source that S-3/S-4 **refuses** stays refused no matter what it is replaced with afterwards, and a source that is *valid at phase 1* cannot be turned into one that should have been refused — because phase 2 never looks. Asserted by (b) above plus a case where the replacement is the answer key itself, byte-identical. |
+| **T-10.15** | **the no-follow walk over intermediate components.** `<tmp>/a/b/auth.json` where `a` is a symlink to a directory inside the fixture is refused with exit 4 and no destination is created; the same layout with `a` a real directory is accepted. Proves S-3 is decided over the walked sequence, not over a resolvable pathname. |
+| **T-10.16** | **S-8, the hard-link alias.** A hard link to `answer_key.json` placed outside every refused root is refused (by S-4 *and* independently by S-8, each asserted with the other's check disabled in a unit-level call); a hard link to a non-key regular file under `key/` whose content carries **no** key vocabulary — which S-4 alone would pass — is refused by S-8. Also asserts the `MAX_KEY_INODES` cap fails closed. |
+| **T-10.17** | **the by-construction guarantees.** `SeedSource` and `SeededRecord` are frozen (assignment raises `FrozenInstanceError`); `SeedSource.source` is the redacted placeholder and **no field of `SeedSource` is a path that exists on the filesystem**; a source whose size grows past `MAX_SEED_BYTES` between `fstat` and the final read is refused by the read ceiling (step 5), not merely by the advisory `st_size`. |
+
+**New for F-002:**
+
+| id | asserts |
+|---|---|
+| **T-10.18** | **the pre-flight legitimately mutates a seed and both identities survive.** Seed a file, capture the returned `SeededRecord`, then rewrite the destination in place inside the session (standing in for the agent refreshing its credential), then build the attestation. Asserts: `seeded_sha256`/`seeded_bytes` still equal the values from the copy — **not** the new ones; `observed_sha256`/`observed_bytes` equal the new bytes; `state == "modified"`; `inventory.entries[dest].sha256 == observed_sha256`; `seeded_unmodified == 0` and `seeded_modified == 1`; exit code is `0`. Then a mode-only change (`chmod 0644`, same bytes) asserts `observed_mode == "0644"` with `state == "unmodified"`. |
+| **T-10.19** | **the unmodified case and the immutability guard.** With no mutation: `state == "unmodified"`, `observed_sha256 == seeded_sha256`, `observed_bytes == seeded_bytes`, `seeded_unmodified == 1`. And `attest_seeds()` cannot rewrite history: assigning to any `seeded_*` field of a `SeededRecord` raises `FrozenInstanceError`, and `attest_seeds()` given a manifest whose `dest` is absent from the inventory exits `4` rather than dropping or inventing the row. |
+
+**And one end-to-end gate that belongs to the capture, not to CI** (unchanged from iteration 2): the
+pre-flight's real-agent check is what proves the seed actually authenticated. It needs a live
+credential, is not a unit test, is a mandatory step of `B-1′`, and its `preflight.log` is the
+evidence.
+
+### Risks / Open Issues
+
+* **The `dir_fd` requirement is a hard platform dependency, and deliberately so.** Measured present
+  on the capture host. The implementation asserts it once and refuses (exit `4`) rather than falling
+  back to pathname operations, because the fallback is F-001. Named here so a future port does not
+  quietly reintroduce it.
+* **S-8 is bounded by the fixture, not by the repository.** It enumerates the fixture's `key/` and
+  `adjudications/` subtrees and `answer_key.json` (2 files measured), not every root
+  `discover_key_bearing_roots()` returns — walking the whole repository checkout for inodes on every
+  seeded run would be unbounded. A hard link to a repository file *outside* `key/`/`adjudications/`
+  is therefore caught by S-3 (path) and S-4 (content) but not by S-8. That is the same coverage
+  iteration 2 had for those files; S-8 strictly adds to it and does not claim more.
+* **Retaining seed bytes in memory** is bounded at 4 MiB by S-2's existing total cap and lives for
+  one `seed_session_home()` call. It is not written to a temporary file at any point, so the bytes
+  never exist outside the process and the session.
+* **Everything O-2 named as residual in iteration 2 is unchanged**: content written into the session
+  HOME *during the dispatch*, after the attestation, is still outside the attestation's reach
+  (RK-8's class); the digest-as-verifier residual still forbids seeding a low-entropy secret and is
+  still recorded in `limitations[]` rather than turned into an entropy check; a colon in a source
+  path still cannot be seeded; `--agent-path`'s redundancy with `--allow-read` is still the safety
+  property.
+* **This design's scan coverage still depends on F-401's fix** being written as the general policy
+  (pass B reads only `S_ISREG` entries), for the reason iteration 2 recorded. Unchanged, not
+  reopened. D-6.8's and D-6.9's walks are `lstat`-first and no-follow for the same reason.
+* **`.pptx`/`.docx` in the session HOME** remains named-not-closed and out of scope, unchanged.
+* **Not reopened:** F-401, F-402, D-H.2, D-4.1, RK-7, mandatory pass B (D-5.1), pass C's size
+  prefilter, pass S's Class-USR-only scope, pass D's extension list, D-I, `COMPATIBILITY.md`, O-1
+  and O-3, and — new to this iteration's list — the seed placement/admission-scan integration,
+  `--agent-path`, D-6.0, D-6.1, D-6.5 and D-6.6, all confirmed sound by
+  `REVIEW_DESIGN_iteration2.md`. **O-1 remains open and undischarged.**
