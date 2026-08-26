@@ -690,12 +690,22 @@ A failing pre-flight is exit 4 with the message printed — never a silently wid
 root added in response is added by an explicit `--allow-read` on the next invocation, so every
 widening is a recorded operator decision and is then subject to the G.3 scan.
 
-`orca orchestration send/check/ask` must keep working from inside the sandbox: the `orca`
-executable lives outside the repository, `(allow default)` leaves network and process rights
-untouched, and the dispatch capability is passed in the preamble rather than read from the repo.
-The pre-flight probe asserts this concretely by running `orca orchestration check --terminal
-<handle>` inside the sandbox and requiring exit 0. If it fails, that is a blocking finding for
-IMPLEMENTATION, not something to work around silently — see `## Risks / Open Issues` **O-1**.
+*(**Corrected in iteration 4 — the paragraph below is FALSE and is kept only so the finding can be
+read against what it was filed against. See `## DESIGN iteration 4 … F-501 worker_done channel,
+F-503 A.6 scope`, D-7. Clause 1 of the generated profile is `(deny file-read*)`, an allowlist, so
+living outside the repository is not an exemption — it is the reason `orca` cannot be executed from
+inside the sandbox at all. Measured: `rc=71`, `execvp() of 'orca' failed`. The corrected rule is
+that `orca` does not and must not run inside the sandbox; `send` reaches the Coordinator through the
+D-7 outbound relay, and `check`/`ask` are not available to an isolated dispatch by design (D-7.6).
+`orca_check_probe()` is rewritten to probe the relay channel and is promoted to the first sandboxed
+check, ahead of the pre-flight and the negative battery.**)*
+
+> ~~`orca orchestration send/check/ask` must keep working from inside the sandbox: the `orca`
+> executable lives outside the repository, `(allow default)` leaves network and process rights
+> untouched, and the dispatch capability is passed in the preamble rather than read from the repo.
+> The pre-flight probe asserts this concretely by running `orca orchestration check --terminal
+> \<handle>` inside the sandbox and requiring exit 0. If it fails, that is a blocking finding for
+> IMPLEMENTATION, not something to work around silently — see `## Risks / Open Issues` **O-1**.~~
 
 #### G.6 `ISOLATION.json` — the attestation
 
@@ -800,7 +810,9 @@ which:
 1. copies `<SESSION>/review_root/artifacts/runs/<run>/FINAL_REVIEW.md` to
    `artifacts/runs/<run>/FINAL_REVIEW.md` in the main checkout — **byte-for-byte**, no
    normalization, no re-wrapping (the retained report is a digest-bound snapshot; see D-A.6 and the
-   `.gitattributes` whitespace exemption already in place);
+   `.gitattributes` whitespace exemption already in place — **its scope is extended from one rule to
+   exactly three by D-A.6′ in iteration 4**, so that `B-5′`'s repatriated report and workspace are
+   covered too);
 2. copies `<SESSION>/control/ISOLATION.json` to
    `artifacts/runs/<run>/FINAL_REVIEW_ISOLATION.json`;
 3. records the copied report's sha256 **before and after** the copy and refuses (exit 2) on any
@@ -1367,14 +1379,21 @@ any artifact.
 
 ### Open issues — raised, not designed around
 
-* **O-1 — `orca` CLI behaviour from inside the sandbox is asserted by a probe, not proven here.**
-  `orca orchestration send/check/ask` must work with cwd set to a non-worktree directory and the
-  repository unreadable. `(allow default)` leaves network and process rights intact and the CLI
-  binary is outside the repository, so there is no known blocker — but the CLI may resolve a
-  worktree from cwd for some subcommands. G.5 makes this a **mandatory, fail-closed pre-flight
-  assertion** rather than an assumption. If it fails, IMPLEMENTATION must report it as a blocker;
-  the fallback (dispatching into a registered throwaway Orca worktree that is itself denied by the
-  profile) is a design change, not an implementation detail, and must come back through DESIGN.
+* **O-1 — CLOSED in iteration 4 by D-7.** *The probe fired and the assumption was false.* The
+  original entry read: *"`orca orchestration send/check/ask` must work with cwd set to a
+  non-worktree directory and the repository unreadable … there is no known blocker … the fallback
+  (dispatching into a registered throwaway Orca worktree that is itself denied by the profile) is a
+  design change."* Measured (F-501, independently confirmed): `orca` is not in the computed readable
+  set and cannot be put in it, so it cannot be executed from inside the sandbox — `rc=71`,
+  `execvp() of 'orca' failed`. The named fallback is **withdrawn**. It is superseded by **D-7, the
+  attested outbound relay**: a session-local shim on the sandboxed agent's `PATH` enqueues a typed
+  message into a session-local outbox, and an unsandboxed relay — started by the launch line before
+  the `exec`, so `exec` and the one-sandboxed-process invariant are preserved — builds the real
+  `orca orchestration send` argv from a credential the sandbox provably cannot read (measured
+  `Operation not permitted` for data, metadata and directory listing). The channel is outbound only;
+  `check` and `ask` are unavailable to an isolated dispatch by design. See `## DESIGN iteration 4 …`
+  D-7.1 (why the other three options were rejected) through D-7.9 (why `B1`'s criterion text does
+  not change).
 * **O-2 — the agent's own state directory may be shared with non-isolated sessions.** If the
   reviewer agent caches transcripts or files under a `--allow-read` root shared with the
   Coordinator's own sessions, key material could in principle arrive there from an unrelated
@@ -3943,3 +3962,697 @@ evidence.
   and O-3, and — new to this iteration's list — the seed placement/admission-scan integration,
   `--agent-path`, D-6.0, D-6.1, D-6.5 and D-6.6, all confirmed sound by
   `REVIEW_DESIGN_iteration2.md`. **O-1 remains open and undischarged.**
+
+---
+
+## DESIGN iteration 4 (Run `run_75c5c6046f35`) — F-501 worker_done channel, F-503 A.6 scope
+
+STATUS: COMPLETE
+
+Scope of this iteration: **two decisions and nothing else.** (1) F-501 — how an isolated dispatch's
+`worker_done` genuinely reaches the Coordinator, which is a DESIGN decision because every available
+shape changes something DESIGN fixed. (2) F-503 — the scope of A.6's `.gitattributes` exemption,
+which is a DESIGN decision because A.6 chose its narrow scope deliberately and a regression test
+exists specifically to stop that scope drifting.
+
+Not reopened, and not touched below: **F-401, F-402, D-H.2, RK-7, mandatory pass B (D-5.1), D-I,
+and the whole D-6.0…D-6.9 seed-provisioning contract** — all confirmed sound and closed. The
+readable-set classification (Class IMM / Class USR), `prove_immutable_narrowing()`, the carve-out
+list, the profile's six-clause order, the negative battery NEG-1…NEG-8, the session layout, the
+exit-code table and the bundle schema are all unchanged. **F-502 is not addressed here**; it is
+`implementation`-owned and its Required Action stands as TEST wrote it.
+
+Where G.5's O-1 paragraph and the `## Risks / Open Issues` **O-1** entry are contradicted by
+measurement, they are corrected **in place** below rather than deleted, and the superseded sentence
+is quoted so a reader of the review thread can see what the finding was filed against.
+
+Every primitive this iteration relies on was **executed on this host before being written into the
+spec**, the same standard iterations 2 and 3 held to. The measurement log is `### Measurements`
+below; nothing in `### Proposed Design` is asserted that is not either measured there or a direct
+consequence of code quoted here.
+
+### Summary / Requirements
+
+| finding | disposition |
+|---|---|
+| **F-501** — G.5 asserted *"the `orca` executable lives outside the repository … so there is no known blocker"*. Clause 1 of the generated profile is `(deny file-read*)`, an **allowlist**, so living outside the repository is not sufficient — it is the problem. `orca` is not in the computed readable set, cannot be put in it (Reproduction 2), and the launch line's `PATH` cannot name its directory. A real dispatch completed its review and then died on `orca: command not found`; the Dispatch had to be abandoned. `B1` was unsatisfiable by **any** isolated capture. | **Closed by D-7, option (c) — the attested outbound relay.** A session-local shim named `orca`, on the sandboxed agent's `PATH`, whose only capability is enqueueing one JSON request into a session-local outbox; and an **unsandboxed** relay process, started by the launch line *before* the `exec`, which constructs the real `orca orchestration send` argv itself from a credential the sandbox provably cannot read, and relays it. Direction is **outbound only**. `orca_check_probe()` is rewritten to probe this channel end-to-end and is promoted to the **first** sandboxed check, ahead of the pre-flight and ahead of the ~13-minute negative battery. `B1`'s criterion text is **unchanged** (see D-7.9). Options (a), (b) and (d) are evaluated and rejected in D-7.1 with reasons, not dismissed. |
+| **F-503** — `B-5′` writes `artifacts/runs/<run>/FINAL_REVIEW*.md` (byte-identical to the exempted `report.md`, at a path the single A.6 rule does not match) and `artifacts/runs/<run>/final_review_workspace*/**` (a unified diff whose single-space context lines trip `git diff --check` on every line). Neither can be trimmed without breaking a digest binding. Any capture that reaches `B-5′` and commits its result fails the repository's own whitespace gate from that commit onward. | **Closed by D-A.6′.** The exemption goes from one rule to **exactly three**, each naming one path shape that `repatriate()` demonstrably writes, each justified individually in D-A.6′. `GITATTRIBUTES_RULE` becomes `GITATTRIBUTES_RULES` (an ordered 3-tuple) and `test_the_gitattributes_rule_is_exactly_the_one_designed` becomes `test_the_gitattributes_rules_are_exactly_the_ones_designed`, asserting the ordered list equals that tuple — so the test keeps doing the one job it was written for. Verified against a real `git check-attr` and a real `git diff --check --cached` (M-10, M-11). |
+
+### Measurements
+
+All measurements below were taken on the capture host (`darwin 25.5.0`) during this iteration.
+`M-1…M-9` use the **production** `render_seatbelt_profile()` and the **production** `wrap_command()`,
+imported unmodified from `scripts/review_isolation.py`; the Class IMM list is the shipped
+`DEFAULT_IMM_CANDIDATES` restricted to the roots a `/usr/bin/python3` shim actually needs, so the
+probe completes in seconds instead of re-proving `/System` — the clause structure, ordering and
+semantics are the shipped ones, and the two roots that were dropped and then restored (`/dev`,
+`/Library/Developer/CommandLineTools`) are recorded below because *why* they are needed is part of
+the design.
+
+| id | what was measured | result |
+|---|---|---|
+| **M-1** | a shim at `<SESSION>/relay/bin/orca`, with `<SESSION>/relay` admitted as a Class USR readable root and `<SESSION>/relay/bin` prepended to `PATH` by `wrap_command()`, is reachable **by the name `orca`** from inside the sandbox | `rc=0`, stdout `queued 4d5a…32db.json` |
+| **M-2** | the shim's write lands in a session-local outbox that is in the **writable** set but not in the readable set | the file exists; one `*.json` in `<SESSION>/outbox` |
+| **M-3** | `/bin/cat <SESSION>/control/relay_credential.json` from inside the sandbox | `rc=1`, `Operation not permitted` — **data denied** |
+| **M-4** | `/bin/ls -l` on the same file from inside the sandbox | `rc=1`, `Operation not permitted` — **metadata denied**, so its existence is hidden too |
+| **M-5** | `/bin/ls <SESSION>/control` from inside the sandbox | `rc=1`, `Operation not permitted` — the directory is not listable |
+| **M-6** | an executable **not** in the readable set, invoked by name through the real launch line | `rc=71`, `sandbox-exec: execvp() … No such file or directory` — the F-501 failure mode is still in force for everything except the shim |
+| **M-7** | `echo x > <SESSION>/relay/bin/orca` from inside the sandbox | `rc=1`, `Operation not permitted` — the shim is readable-and-executable but **not writable** from inside |
+| **M-8** | `echo x > <SESSION>/outbox/probe.txt` from inside the sandbox | `rc=0` — the outbox is the one thing the agent may write to outside `review_root`/`tmp`/`home` |
+| **M-9** | a process backgrounded by the launch line's outer (unsandboxed) shell **before** the `exec` survives that `exec` and keeps running | launcher `rc=0`; the orphan wrote its marker while the pane's foreground was the sandboxed process |
+| **M-9b** | with the relay prefix present, the launch line still ends in `exec <SANDBOX_EXEC> -f <profile> <agent>` | confirmed textually — the sandboxed side is still exactly one process |
+| **M-9c** | a **detached child of the dispatched pane's shell** — the relay's exact situation — delivers a real message through the real `orca` CLI using the pane's inherited identity | `{"ok": true, "result": {"message": {"id": "msg_cd12f652835c", "run_id": "run_75c5c6046f35", …}}}` |
+| **M-10** | `git check-attr whitespace` in a real `git init` checkout, over the three-rule `.gitattributes` of D-A.6′, against twelve representative paths | the three `B-5′` shapes and `report.md` come back `unset`; `FINAL_REVIEW_ISOLATION.json`, `FINAL_REVIEW_EVIDENCE_BUNDLE.json`, `TEST.md`, `ORCHESTRATOR_LOG.md` and `artifacts/FINAL_REVIEW_something.md` come back `unspecified` |
+| **M-11** | `git diff --check --cached` in that checkout with `FINAL_REVIEW.md` (`+ID: F-001  `), `final_review_workspace/DIFF.patch` (a real unified diff), `final_review_audit/u1/report.md` and one non-exempt `NOT_EXEMPT.md` staged | `rc=2`, and the **only** complaint is `NOT_EXEMPT.md:1: trailing whitespace`. Unstage that one file and it is `rc=0`, no output. |
+
+Two residuals recorded from the same session, because they are load-bearing:
+
+* **M-1 emits the known-benign `xcrun` diagnostic.** `python3: error: couldn't create cache file
+  '/var/folders/…/xcrun_db-…' (errno=Operation not permitted)` appears on stderr with `rc=0`. This
+  is precisely the residual G.5 already documents (`confstr(_CS_DARWIN_USER_TEMP_DIR)` ignores
+  `TMPDIR`) and already instructs the pre-flight to classify as benign. The relay probe must
+  classify it the same way and must **not** be "fixed" by granting write access to the host
+  per-user temp directory — G.5's existing prohibition applies unchanged.
+* **`/dev` and `/Library/Developer/CommandLineTools` are not optional for the shim.** With `/dev`
+  omitted the shim dies at `Fatal Python error: _Py_HashRandomization_Init: failed to get random
+  numbers`; with the CommandLineTools root omitted the `/usr/bin/python3` shim cannot resolve a
+  toolchain at all. Both are already members of `DEFAULT_IMM_CANDIDATES`, so the shipped readable
+  set already satisfies this — the measurement is recorded so a future narrowing of
+  `DEFAULT_IMM_CANDIDATES` knows it would break the relay shim, not merely the pre-flight.
+
+### Current Architecture — what F-501 actually proves about the boundary
+
+Three facts from the code as it stands, each quoted rather than summarized, because the decision
+turns on them.
+
+1. **`compute_readable_set()` admits four things and only four things** (`review_isolation.py`,
+   `usr_roots`): `<SESSION>/review_root`, `<SESSION>/tmp`, `<SESSION>/home`, and whatever the
+   operator passed as `--allow-read`. **`<SESSION>/control` is not among them.** Clause 1 is
+   `(deny file-read*)`, so `control/` — which holds the generated profile, the probe logs and the
+   attestation — is unreadable and un-stat-able from inside the sandbox. That is not incidental;
+   `build_session()`'s docstring says `control/` is a **sibling** of `review_root/` precisely
+   because it names the denied roots. **This is the property the whole of D-7 is built on**, and
+   M-3/M-4/M-5 measure it directly rather than inferring it from the clause text.
+2. **`assert_agent_path_admitted()` requires every `--agent-path` entry to be an admitted
+   readable-set root.** So `PATH` can never name a root the readable set did not scan — which is
+   exactly why `/usr/local/bin` cannot be added to reach `orca`, and equally why a new
+   `<SESSION>/relay` root **can** be, once it is admitted through the same `--allow-read`-shaped
+   scan every other Class USR root goes through.
+3. **The shell that runs the `--command` text is not sandboxed; `exec` is what applies the
+   sandbox.** G.5 says so and `wrap_command()` implements it: `cd … && TMPDIR=… HOME=… PATH=… exec
+   <SANDBOX_EXEC> -f <profile> <agent>`. There is therefore already an unsandboxed moment inside
+   the launch line, before the `exec`, and it runs with the dispatched pane's environment and
+   identity. D-7 uses that moment and nothing else; it does not create a new privileged context.
+
+### Proposed Design
+
+#### D-7.1 The four options, evaluated
+
+The requirement is: an isolated dispatch's `worker_done` must genuinely reach the Coordinator,
+without weakening the fail-closed content scanner and without reopening D-6.0…D-6.9 / D-G.
+
+**(a) Let the reporting channel run outside the sandbox after the reviewer process exits.**
+`cd … && sandbox-exec … <agent>; <unsandboxed settlement>`. Rejected — but note that D-7 keeps its
+one good idea (an unsandboxed sender) and discards the rest.
+* It gives up `exec`. The sandboxed agent becomes a **child** of a surviving shell, so
+  "the agent process is the only process that ever sees the review" stops being true by
+  construction and starts being true only by inspection.
+* It cannot deliver a **heartbeat**. The whole review — the long part — passes with the Coordinator
+  unable to distinguish "still thinking" from "hung", which is the one thing heartbeats exist for.
+* It cannot deliver an **escalation**, which is by definition pre-completion.
+* It still has to get the report *content* from the agent, so it still needs a file the agent wrote
+  and still needs to validate it. It does not avoid the validation problem; it only defers it and
+  loses two message types on the way.
+* Worst: the settlement's `--outcome` would be derived from the sandboxed process's exit status,
+  which for an agent CLI says nothing about whether the review succeeded.
+
+**(b) Admit the `orca` CLI through a mechanism that survives the fail-closed content scan.**
+Rejected, and this is the one option that is not a judgement call. TEST.md's Reproduction 2 measured
+it: `/Applications/Orca.app` is 3,157 files, 37 pass-B hits, exit 4; the entry point alone
+(`…/out/cli`) is clean at 0 hits but **cannot run without** `out/shared` (6 hits) and `out/main`
+(3 hits). There is no narrower admissible subtree. Making it admissible means giving
+`scan_readable_set()` an ignore mechanism, and D-6.1 records that *"there is deliberately no
+`--ignore`"*. Admitting a third-party Electron bundle into the readable set would also hand the
+isolated agent ~3,000 files of unscanned-by-intent surface for the sole purpose of sending one
+message. The cost/benefit is not close.
+
+**(c) A session-local, narrowly-scoped attested shim whose only capability is delivering
+`worker_done`, provisioned the same seeded way credentials now are.** **Chosen.** Measured feasible
+end-to-end (M-1…M-9c) before being written here. It is the only option that:
+* keeps `exec` and the one-sandboxed-process invariant (M-9b);
+* delivers `heartbeat` and `escalation` **during** the review, not only after it;
+* puts the enforcement at a point the sandboxed side cannot reach (M-3/M-4/M-5), so the security
+  property does not depend on the shim being intact (M-7 shows it is also not writable, but that is
+  belt, not braces — see D-7.4);
+* constructs the privileged argv from a credential the request never supplies, so the channel is a
+  *typed message pipe*, not a remote shell.
+
+Its costs are real and are stated, not minimized: one more session directory, one more unsandboxed
+process, a new attestation block, and the loss of `orca orchestration ask` for isolated dispatches
+(D-7.6). It is more implementation work than (d). That is the correct trade.
+
+**(d) Redefine `B1`'s settlement for isolated captures and say so in `B-3`.** Rejected. The task
+asked that this not be defaulted to, and independently of that it is wrong here: `B1` exists to
+prove the *pipeline* can run a Final Review end-to-end under isolation. Redefining "settled" to mean
+"the report exists and a human abandoned the Dispatch" removes the only part of `B1` that tests
+anything the other criteria do not — `B2`, `B4`, `B5` and `B6` already passed on the very capture
+that failed `B1`, so a redefined `B1` would assert nothing new. It would also make every future
+isolated capture require a manual `worker-abandon`, i.e. it converts a fixable defect into permanent
+operator toil. Option (c) is feasible on measured evidence, so (d) is not the least-work option — it
+is the option that spends the work on prose instead of on the defect.
+
+**No fifth option is proposed.** (c) as specified below already subsumes (a)'s mechanism.
+
+#### D-7.2 D-7 — the attested outbound relay, in full
+
+Four pieces. Nothing else in the session changes.
+
+```
+<SESSION>/relay/bin/orca      the shim.   Class USR readable root, mode 0555, on the agent's PATH.
+<SESSION>/outbox/             the queue.  In the WRITABLE set, NOT in the readable set.
+<SESSION>/control/relay_credential.json   mode 0600. control/ is unreadable from the sandbox (M-3..M-5).
+<SESSION>/control/RELAY_LOG.json          the relay's own append-only record. Also unreadable from inside.
+```
+
+```
+      ── inside the sandbox ─────────────┐ ┌──────────── outside, unsandboxed ────────────
+      agent  ── argv ──▶  shim  ── one JSON file ──▶  outbox  ──▶  relay  ── argv IT builds ──▶ orca CLI
+                          │                                          │
+                          └── prints "queued <id>", exit 0           └── receipt ──▶ control/RELAY_LOG.json
+                              and learns NOTHING about delivery          (unreadable from inside)
+```
+
+The arrow has one head. There is no return path into the sandbox at any point in the diagram, and
+that is the security property, not a limitation that was tolerated.
+
+#### D-7.3 Exactly what crosses the boundary
+
+**Outbound (sandbox → host), the only direction.** One JSON object per message, written by the shim
+into `<SESSION>/outbox/<uuid4hex>.json` via `O_CREAT|O_EXCL` to a `.part` name and then `rename(2)`,
+so the relay never reads a partial file. The relay accepts **exactly these keys** and refuses any
+request carrying an unknown key — fail-closed, like the rest of this design, never ignore-and-continue:
+
+| key | accepted values | enforcement |
+|---|---|---|
+| `type` | one of `RELAY_ALLOWED_TYPES = ("worker_done", "heartbeat", "escalation")` | anything else, including `ask` and `check`, is refused |
+| `subject` | ≤ `RELAY_MAX_SUBJECT_BYTES = 200` bytes UTF-8, single line, no ASCII control characters | refused, not truncated |
+| `body` | ≤ `RELAY_MAX_BODY_BYTES = 4096` bytes UTF-8 | refused, not truncated |
+| `outcome` | `succeeded` or `failed`; **required** when `type == "worker_done"`, **refused** otherwise | the CLI's own rule, enforced on our side too |
+| `phase` | `[a-z_]{1,32}`; permitted only when `type == "heartbeat"` | |
+| `files_modified` | ≤ 64 entries, each matching `[A-Za-z0-9._/-]{1,200}`, no leading `/`, no `..` component | joined by the relay into one `--files-modified` value |
+| `report_path` | must be lexically inside `artifacts/runs/<run_id>/`, where `<run_id>` comes from the **credential file**, not the request | |
+
+**Injected by the relay from `control/relay_credential.json`, never from the request:**
+`--from`, `--dispatch-capability`, `--task-id`, `--dispatch-id`. **Never emitted at all:** `--to`,
+`--run`, `--payload`, `--thread-id`, `--priority`, `--retry-request`, `--pairing-code`,
+`--environment`, `--json`'s consumers. The subcommand is hard-coded as the literal list
+`[orca, "orchestration", "send", …]` — the request cannot name a verb, a subcommand, or a flag.
+
+**Inbound (host → sandbox): nothing.** The relay writes its receipt to `control/RELAY_LOG.json`,
+which M-3/M-4/M-5 measure as unreadable and un-stat-able from inside. The shim prints
+`queued <id>` and exits 0 **without waiting**, so it cannot even learn whether the outbox file was
+consumed. There is no reply file, no exit-code channel, no shared FIFO, and no environment variable
+written back.
+
+**What the channel can carry, stated plainly.** Up to 4 KiB of agent-authored prose per message,
+at most `RELAY_MAX_MESSAGES = 200` messages, at most one of them a `worker_done`. That is a real,
+low-bandwidth outbound channel out of the sandbox. It is acceptable for a reason that is stronger
+than any filter: **the isolated agent has nothing secret on its side of the wall.** `review_root`
+holds only the materialized subject tree and the flattened policy files, and `build_session()`'s
+Rule 4 already leak-scans both with `final_review_eval.scan_leak()` and refuses the session on a
+single hit; NEG-1 re-asserts the same thing against the built session. The channel cannot carry key
+material because there is none within reach of it — not because it inspects what it carries.
+
+**The one thing it *can* carry that is not covered by that argument** is a description of the
+sandbox itself: absolute session paths, the local username in a path spelling. That is P-PATH's
+subject matter, and relayed messages land in the Run mailbox, which `B3`'s grep over the *retained
+artifact family* does not cover. Mitigation, using the shipped policy and adding no new one: the
+relay applies `run_logging.redact_text()` to `subject` and `body` before building the argv, and
+`RELAY_LOG.json` records both the redacted text it sent and `redaction_applied: true`. Recorded as
+**RK-16**.
+
+#### D-7.4 Where enforcement lives, and why the shim is not it
+
+**The relay is the enforcement point. The shim is a convenience.** This is the single most important
+sentence in D-7 and IMPLEMENTATION must not invert it.
+
+M-7 measures that the shim is not writable from inside the sandbox, and it is installed `0555`. That
+is worth having. But the design does **not** depend on it: if a future profile change made
+`<SESSION>/relay` writable, or if the agent simply ignored the shim and wrote its own JSON directly
+into `<SESSION>/outbox` (which M-8 shows it can), **nothing is gained**, because every constraint in
+D-7.3 is applied by the relay when it reads the file, against a credential the sandbox cannot read.
+The shim exists so that the isolated Reviewer's preamble can use the same `orca orchestration send …`
+spelling every other worker uses. It is ergonomics; it is not a control.
+
+Corollary for IMPLEMENTATION: **no validation may live only in the shim.** The shim may reject
+early for a good error message, but the relay must re-derive every decision from the file's bytes.
+
+#### D-7.5 The shim
+
+`<SESSION>/relay/bin/orca`, mode `0555`, `#!/usr/bin/python3` (measured working — M-1; `/usr` and
+the toolchain roots are already Class IMM). Accepted invocation, and only this one:
+
+```
+orca orchestration send --type <worker_done|heartbeat|escalation> --subject <text>
+                        [--body <text>] [--outcome <succeeded|failed>] [--phase <text>]
+                        [--files-modified <csv>] [--report-path <path>]
+```
+
+Anything else — a different verb, a different subcommand, `check`, `ask`, `dispatch-show`, an
+unrecognized flag — exits `2` with a message naming exactly which flags this channel accepts. The
+shim reads `<SESSION>/outbox` from `os.environ[RELAY_ENVVAR]` where `RELAY_ENVVAR =
+"ORCA_RELAY_OUTBOX"`, exported by `wrap_command()`. It writes the JSON, prints `queued <id>`, exits
+0. It has no network code, no subprocess call, and no path outside the outbox.
+
+The shim's source is a Class USR root member, so it goes through `scan_readable_set()` at admission
+exactly like `<SESSION>/home` does. Its `sha256` is recorded in the attestation.
+
+#### D-7.6 The isolated Reviewer's preamble must not carry the dispatch capability
+
+The Coordinator composes the isolated dispatch's preamble. For an isolated dispatch that preamble
+**must omit** `--from`, `--dispatch-capability`, `--task-id`, `--dispatch-id` and the coordinator
+handle, and must present the D-7.5 invocation instead. Two reasons:
+
+1. **Defense in depth.** M-3/M-4/M-5 make the credential file unreachable, but a preamble that
+   quotes the capability puts it *inside* the sandbox as prompt text, and the property "the
+   sandboxed side cannot obtain the dispatch capability" would then be false for a reason that has
+   nothing to do with the profile. With the preamble clean, that property holds unconditionally, and
+   it keeps holding even if some future change widened the readable set to admit the real CLI.
+2. **`orca orchestration ask` is not available to an isolated dispatch, deliberately.** `ask` blocks
+   until the Coordinator replies and then delivers **Coordinator-authored text into the sandbox
+   mid-review** — an inbound channel, composed after the session was built, attested and scanned,
+   and covered by no scan at all. The preamble is inbound too, but it is composed once, before
+   dispatch, and is the Coordinator's `B-2` artifact. A mid-review reply is un-attestable, so it is
+   refused. An isolated Reviewer that is blocked sends `type: "escalation"` and stops; it does not
+   wait for an answer.
+
+This is a real functional loss for isolated dispatches and is recorded as such, not glossed.
+IMPLEMENTATION owns a greppable assertion: the rendered isolated preamble contains none of
+`--dispatch-capability`, `--task-id`, `--dispatch-id`, `orchestration check`, `orchestration ask`.
+
+#### D-7.7 The relay process, and where it is started
+
+Started by the launch line's **outer, unsandboxed shell, before the `exec`** — the moment
+`wrap_command()`'s docstring already documents as unsandboxed. `wrap_command()` gains one keyword
+parameter and, when it is set, one prefix and two extra environment assignments:
+
+```python
+def wrap_command(session, command, agent_path=(), *, relay: bool = False) -> str
+```
+
+With `relay=False` the returned string is **byte-identical to today's** — the existing
+`LaunchLineTests` keep passing unchanged. With `relay=True`:
+
+```
+( <RELAY_LAUNCHER> --session <S> --daemon >/dev/null 2>&1 & ) ; \
+cd <review_root> && TMPDIR=<tmp> HOME=<home> \
+  ORCA_RELAY_OUTBOX=<S>/outbox \
+  PATH=<S>/relay/bin:<agent dirs>:/usr/bin:/bin:/usr/sbin:/sbin \
+  exec <SANDBOX_EXEC> -f <profile> <agent>
+```
+
+where `<RELAY_LAUNCHER>` is `<python3> <repo>/scripts/review_isolation.py relay-serve`. Four points,
+each measured or quoted:
+
+* **The `exec` survives.** M-9 measures that a process backgrounded before the `exec` keeps running
+  after the pane's foreground is replaced; M-9b confirms the line still ends in `exec`. The
+  *sandboxed* process tree is still exactly one process. The relay is not in it, is not a descendant
+  of the agent, and never opens anything under `review_root` — so *"the agent process is the only
+  process that ever sees the review"*, which is what G.5 actually claims, remains literally true.
+* **`PATH` is now set whenever `relay=True`, even with no `--agent-path`.** The relay directory is
+  prepended ahead of the agent directories, so the shim wins the name `orca` unconditionally. This is
+  the one property of `wrap_command()` that changes: *"With no `--agent-path` the launch line is
+  byte-identical to what it was before this parameter existed"* becomes *"with no `--agent-path`
+  **and no relay**…"*. `<S>/relay/bin` is not fed through `assert_agent_path_admitted()` because it
+  is not an operator-supplied `--agent-path` entry — it is generated by `install_relay()`, and
+  `<S>/relay` is admitted as a Class USR root by `compute_readable_set()` and scanned there. The
+  invariant `assert_agent_path_admitted()` protects — *"PATH can never name a root the readable set
+  did not scan"* — is therefore preserved, by scanning rather than by exemption. **IMPLEMENTATION
+  must assert this**, not assume it (T-11.8).
+* **The relay inherits the dispatched pane's environment**, because it is started by that pane's own
+  shell. M-9c measures that a detached child of the dispatched pane delivers a real message with
+  `ok: true`. This is why the relay is started *here* and not out-of-band: `orca orchestration send`
+  notes that *"when stable pane identity is unavailable, the sender handle must exactly match the
+  dispatch assignee"*, and the relay's `--from` is the dispatch assignee (the isolated terminal
+  handle) by construction.
+* **It terminates on its own**, on the first of: a `worker_done` relayed (it is the terminal
+  message); `RELAY_MAX_MESSAGES` reached; `RELAY_MAX_WALL_SECONDS = 14400` elapsed; or
+  `<SESSION>/control` no longer existing (`teardown()` ran). It polls the outbox every
+  `RELAY_POLL_SECONDS = 1.0`. No `signal`, no `atexit`, no pidfile in a shared location — the pid
+  goes in `control/RELAY_LOG.json`.
+
+#### D-7.8 New interfaces — exactly what IMPLEMENTATION builds
+
+All in `scripts/review_isolation.py` unless noted.
+
+```python
+RELAY_DIRNAME            = "relay"
+RELAY_BIN_DIRNAME        = "bin"
+RELAY_SHIM_FILENAME      = "orca"
+OUTBOX_DIRNAME           = "outbox"
+RELAY_CREDENTIAL_FILENAME = "relay_credential.json"   # under control/
+RELAY_LOG_FILENAME       = "RELAY_LOG.json"           # under control/
+RELAY_ENVVAR             = "ORCA_RELAY_OUTBOX"
+RELAY_ALLOWED_TYPES      = ("worker_done", "heartbeat", "escalation")
+RELAY_MAX_SUBJECT_BYTES  = 200
+RELAY_MAX_BODY_BYTES     = 4096
+RELAY_MAX_FILES          = 64
+RELAY_MAX_MESSAGES       = 200
+RELAY_POLL_SECONDS       = 1.0
+RELAY_MAX_WALL_SECONDS   = 14400
+RELAY_POLICY_STATEMENT   = (
+    "Outbound only. The sandboxed side may enqueue a typed message; the relay builds the "
+    "orca argv from a credential the sandbox cannot read (D-7.3) and returns nothing."
+)
+
+class RelayRefusal(IsolationContractError): ...
+
+@dataclasses.dataclass(frozen=True)
+class RelayCredential:
+    worker_terminal: str      # --from; the ISOLATED terminal handle, i.e. the dispatch assignee
+    dispatch_capability: str  # --dispatch-capability
+    task_id: str              # --task-id
+    dispatch_id: str          # --dispatch-id
+    run_id: str               # bounds report_path; NOT sent as a flag
+```
+
+`RelayCredential` is frozen for the same reason `SeededRecord` is (D-6.9): a value that is written
+once and must not be rewritten by a later phase.
+
+```python
+def install_relay(session: Path, *, credential: RelayCredential) -> dict
+```
+Creates `<S>/relay/bin/`, writes the shim (`0555`), creates `<S>/outbox/` (`0700`), writes
+`<S>/control/relay_credential.json` (`0600`). Returns
+`{"shim", "shim_sha256", "shim_mode", "outbox", "credential"}`. Called from `build_session()`
+**immediately after `(session / "home").mkdir()` and before the seed step**, so that `<S>/relay`
+exists before `compute_readable_set()` runs and is therefore scanned by it — the same placement
+argument D-6.3 makes for the seed.
+
+```python
+def relay_validate(request: dict, credential: RelayCredential) -> list[str]
+```
+The enforcement point. Returns the complete argv or raises `RelayRefusal`. Pure — no I/O, no
+subprocess — so it is unit-testable without a sandbox. Every rule in D-7.3's table is applied here
+and **nowhere else**.
+
+```python
+def relay_serve(session: Path, *, orca: str = "orca", once: bool = False,
+                max_wall_seconds: int = RELAY_MAX_WALL_SECONDS) -> dict
+```
+The loop of D-7.7. Reads the credential, polls the outbox, for each `*.json` in `st_mtime` order:
+`relay_validate()` → `run_logging.redact_text()` over `subject`/`body` → `subprocess.run(argv)` →
+append a record to `control/RELAY_LOG.json`. A `RelayRefusal` is recorded with its reason and the
+request is **discarded, not retried**; a non-zero CLI exit is recorded and retried at most twice
+with a fixed 5 s gap, then recorded as `delivered: false`. `once=True` drains the outbox and returns,
+for tests.
+
+CLI: `review_isolation.py relay-serve --session <S> [--daemon] [--once] [--orca <path>]`.
+`--daemon` double-forks, prints the child pid, and returns 0.
+
+```python
+def orca_check_probe(session: Path, terminal: str, orca: str = "orca", *,
+                     agent_path: Sequence[str] = ()) -> dict
+```
+**Rewritten.** It no longer runs `orca orchestration check` inside the sandbox — that command is
+exactly what D-7.6 forbids, and its failure is F-501 itself. It now asserts the relay channel:
+
+| check | what it runs | pass condition |
+|---|---|---|
+| `R1 shim_on_path` | the shim through the real `wrap_command(..., relay=True)`, with a `heartbeat` request | `rc == 0`; stderr may contain only the M-1 `xcrun` diagnostic |
+| `R2 outbox_write` | inspects `<S>/outbox` | exactly one new `*.json`, parseable, matching the request |
+| `R3 credential_denied` | `cat`, `ls -l` and `ls` on the credential and on `control/` from inside | all three non-zero with `Operation not permitted` |
+| `R4 real_cli_denied` | a name not in the readable set, by name, through the real launch line | `rc == 71` — proves the F-501 denial is still in force for everything but the shim |
+| `R5 shim_immutable` | a write to the shim from inside | non-zero |
+| `R6 forbidden_verb_refused` | `orca orchestration ask --question x` and `orca orchestration check --terminal <t>` through the shim | both `rc == 2`, and **no** new outbox file |
+| `R7 round_trip` | starts `relay_serve(session, once=True)`, then reads `control/RELAY_LOG.json` | the queued **heartbeat** was delivered with CLI `rc == 0` and a `message_id`. Runs only when `terminal` is non-empty; otherwise `"result": "SKIP", "reason": "no dispatch terminal supplied"` |
+
+`R7` uses a **heartbeat**, never a `worker_done`: it exercises byte-for-byte the same argv
+construction, the same credential and the same CLI path, while being idempotent and non-settling.
+Result shape: `{"id": "O-1", "kind": "relay_channel", "result": "PASS"|"FAIL", "checks": {…}}`,
+written to `control/probes/orca_check.log` as today.
+
+```python
+def build_session(..., relay: RelayCredential | None = None)
+def isolate(..., relay: RelayCredential | None = None)
+```
+`isolate()` gains `--relay-*` CLI flags (`--relay-capability`, `--relay-task`, `--relay-dispatch`);
+`--terminal` supplies `worker_terminal` and `run_id` is already a parameter. Supplying `--terminal`
+**without** a relay credential is exit `4` with the message *"an isolated dispatch cannot settle
+without the D-7 relay; pass --relay-capability/--relay-task/--relay-dispatch, or omit --terminal to
+run an exploratory capture"*. That is the fail-fast F-501 asks for, and it costs zero seconds.
+
+**Ordering inside `isolate()` — this is the F-501 Required Action, and it is a hard requirement.**
+`orca_check_probe()` moves to be the **first** thing run after the profile is written, i.e.:
+
+```
+… render_seatbelt_profile() → profile_path.write_text() → profile_digest
+→ orca_check_probe()        ← FIRST. unconditional. ~2 s.
+→ preflight_probe()         ← was first; the real agent start, tens of seconds
+→ run_probes()              ← the ~13-minute negative battery
+```
+
+It cannot precede profile generation, because there is no sandbox to probe until the profile exists;
+"first" therefore means *first among the sandboxed checks*, and that is where the cost is. A capture
+that cannot deliver `worker_done` now fails in about two seconds instead of after the full battery.
+It is **unconditional**: with no `--terminal`, R1–R6 still run and R7 records `SKIP`.
+
+`repatriate()` gains one destination: `control/RELAY_LOG.json` → `artifacts/runs/<run>/
+FINAL_REVIEW_RELAY{suffix}.json`. It is JSON emitted by `json.dumps`, so it carries no trailing
+whitespace and **deliberately gets no `.gitattributes` rule** (D-A.6′). Every path-bearing field in
+it goes through `_path_field()` — F-502's lesson applied to a new field on the way in, rather than
+found by a grep later.
+
+#### D-7.9 `B1` is unchanged; `B-3` gains one note
+
+`B1`'s criterion text stands exactly as written: *"at least one dispatch that settled with a usable
+report."* D-7 makes that satisfiable rather than redefining it. A relay-delivered `worker_done`
+carries the Dispatch's own `--task-id`/`--dispatch-id` and a `--from` equal to the dispatch assignee,
+so Orca records a real completion — `dispatch-show` reports a `completed_at` and the Task leaves
+`dispatched` — which is the same settlement any other worker produces. Nothing about `B1`'s
+verification changes: the operator still reads `dispatch-show`.
+
+`B-3` gains one recorded sentence, for the auditor rather than for the criterion:
+
+> For an isolated capture the `worker_done` is delivered by the D-7 relay rather than by the agent
+> process itself. `FINAL_REVIEW_RELAY.json` records the argv the relay built, the credential fields
+> it injected, and the CLI's exit code and message id, so the settlement is auditable to the same
+> standard as the report.
+
+#### D-A.6′ — the `.gitattributes` exemption goes from one rule to exactly three
+
+**Verified, not copied.** `repatriate()` writes, with `suffix = "" if attempt == 1 else
+f"_iteration{attempt}"`:
+
+| line | destination | shape |
+|---|---|---|
+| `:2621` | `root / f"FINAL_REVIEW{suffix}.md"` | `artifacts/runs/<run>/FINAL_REVIEW*.md` |
+| `:2636` | `root / f"FINAL_REVIEW_ISOLATION{suffix}.json"` | JSON — **no exemption** |
+| `:2642` | `root / f"{REPATRIATED_WORKSPACE_DIRNAME}{suffix}"` (`= "final_review_workspace"`), a `copytree` | `artifacts/runs/<run>/final_review_workspace*/**` |
+| new (D-7.8) | `root / f"FINAL_REVIEW_RELAY{suffix}.json"` | JSON — **no exemption** |
+
+The two shapes TEST named are the right ones, and the trailing `*` on each is required rather than
+defensive: the `_iteration{N}` suffix is generated on every retry, and the repository already
+contains `FINAL_REVIEW_iteration2.md` … `FINAL_REVIEW_iteration8.md` and
+`FINAL_REVIEW_iteration3_voided_ctx_55d1c349a3e5.md`.
+
+The new `.gitattributes`, in this order:
+
+```gitattributes
+# Retained Final Review reports are byte-exact snapshots of Reviewer-authored Markdown, digest-
+# bound by record.json and immutable under DESIGN A.3. Markdown hard breaks (two trailing spaces)
+# are legitimate there and must not be trimmed, so these paths are exempt from git's whitespace
+# rules. Scope is exactly the three shapes B-5' repatriates; every other path keeps the default
+# rules. See DESIGN D-A.6'. Adding a fourth rule is a DESIGN change, not a convenience.
+
+# 1. the published record unit's report (A.6, unchanged).
+artifacts/runs/*/final_review_audit/**/report.md -whitespace
+# 2. the repatriated report. Byte-identical to (1) and digest-bound by the same record.json;
+#    the `*` covers repatriate()'s `_iteration<N>` retry suffix.
+artifacts/runs/*/FINAL_REVIEW*.md -whitespace
+# 3. the repatriated subject tree. Contains DIFF.patch, whose unified-diff context lines are a
+#    single space on every line; the tree is bound by MANIFEST.json's fixture_digest and cannot
+#    be trimmed. The `*` covers the same retry suffix.
+artifacts/runs/*/final_review_workspace*/** -whitespace
+```
+
+**Why three rules is still narrow and deliberate, and not the drift the test exists to prevent.**
+The test's purpose was never "one rule"; it was *"a repo-wide or broadened pattern is a design
+violation"*. Each pattern below is justified on its own, and the count is a consequence:
+
+* **Rule 2 is not a widening of what is exempt, it is the same bytes at a second path.** TEST
+  verified with `shasum` that `FINAL_REVIEW.md` and the exempted `final_review_audit/**/report.md`
+  are the same digest (`sha256:53c2481456cc…c271`). Rule 1 already exempts those bytes. Rule 2
+  exempts them where `B-5′` also puts them. Refusing rule 2 while keeping rule 1 would be arbitrary.
+* **Rule 3 is the only one that exempts genuinely new content**, and it is forced: a unified diff's
+  context line *is* a line consisting of one space, `git diff --check` reports every one of them, and
+  the tree's `fixture_digest` (`sha256:b63f5a9f…70f1d`) forbids trimming. The alternative is not
+  "keep it narrow", it is "do not retain the workspace", which loses `B5`'s live `score --workspace`
+  path.
+* **Each pattern is anchored under `artifacts/runs/*/`** — verified by M-10, where
+  `artifacts/FINAL_REVIEW_something.md` comes back `unspecified`. None is repo-wide, none names a
+  bare extension, none uses a leading `**`.
+* **The exemption is still keyed to the same one justification** A.6 gave: digest-bound, immutable,
+  machine-produced or Reviewer-authored artifacts that cannot be edited without ceasing to be
+  evidence. Nothing that fails that test is added — in particular the two repatriated **JSON**
+  artifacts are deliberately left out, because `json.dumps` emits no trailing whitespace and an
+  exemption they do not need would be exactly the drift being guarded against.
+* **The guard gets stronger, not weaker.** M-11 measures that with all three rules in force a single
+  non-exempt file with trailing whitespace still fails the gate (`rc=2`, one complaint), and removing
+  it gives `rc=0`. The gate still catches everything it caught before.
+
+**What IMPLEMENTATION must change, exactly** (the edits are IMPLEMENTATION's; the values are fixed
+here):
+
+* `.gitattributes` — replace its contents with the block above, verbatim, comments included.
+* `scripts/test_run_logging.py:3946` —
+  ```python
+  GITATTRIBUTES_RULES = (
+      "artifacts/runs/*/final_review_audit/**/report.md -whitespace",
+      "artifacts/runs/*/FINAL_REVIEW*.md -whitespace",
+      "artifacts/runs/*/final_review_workspace*/** -whitespace",
+  )
+  ```
+  The name goes plural and the old singular `GITATTRIBUTES_RULE` is **removed**, not aliased, so a
+  stale reference is a `NameError` at import rather than a silently unasserted rule.
+* `test_the_gitattributes_rule_is_exactly_the_one_designed` → renamed
+  `test_the_gitattributes_rules_are_exactly_the_ones_designed`; body becomes
+  `self.assertEqual(rules, list(GITATTRIBUTES_RULES), "D-A.6' allows exactly these three scoped "
+  "rules, in this order; a fourth rule, a reordering, or a broadened pattern is a design violation")`.
+  The comparison stays an **ordered `assertEqual` against a fixed list** — not a set, not a subset,
+  not a length check — because that is what makes the test refuse a fourth rule.
+* No change to `test_the_whitespace_gate_passes_over_the_whole_os22_range`,
+  `test_every_retained_artifact_still_matches_its_recorded_digest`, `HARD_BREAK_REPORT_DIGEST` or
+  `HARD_BREAK_REPORT_BYTES`.
+
+**F-003 / F-103 is not reopened.** Iteration 4's note that those two failures belong to whoever
+committed the offending DESIGN review reports stands; D-A.6′ does not exempt them and must not.
+
+### Components / Interfaces / Data Flow
+
+`ISOLATION.json` gains one top-level block, `relay`, written by `build_attestation()` from
+`install_relay()`'s return value and `orca_check_probe()`'s result. Schema version goes `1.1 → 1.2`
+(additive; `COMPATIBILITY.md`'s existing additive-MINOR rule applies and D-I is untouched):
+
+```json
+"relay": {
+  "policy": "<RELAY_POLICY_STATEMENT>",
+  "direction": "outbound_only",
+  "shim": "<REDACTED:foreign_absolute_path>",
+  "shim_sha256": "sha256:…",
+  "shim_mode": "0555",
+  "outbox": "<REDACTED:foreign_absolute_path>",
+  "credential": "<REDACTED:foreign_absolute_path>",
+  "credential_reachable_from_sandbox": false,
+  "allowed_types": ["worker_done", "heartbeat", "escalation"],
+  "injected_flags": ["--from", "--dispatch-capability", "--task-id", "--dispatch-id"],
+  "request_fields": ["type", "subject", "body", "outcome", "phase",
+                     "files_modified", "report_path"],
+  "redaction_applied": true,
+  "probe": { "id": "O-1", "kind": "relay_channel", "result": "PASS", "checks": { … } }
+}
+```
+
+Every one of `shim`, `outbox`, `credential` goes through `_path_field()`. `RELAY_LOG.json` is a
+separate document (the relay runs *after* the attestation is sealed, so it cannot be a field of it)
+with `{"schema_version": "1.0", "document_kind": "final_review_relay_log", "pid": …,
+"messages": [{"seq": 1, "type": "heartbeat", "argv_shape": [...], "cli_rc": 0,
+"message_id": "msg_…", "delivered": true, "refused": null, "redaction_applied": true}, …]}`.
+`argv_shape` records flag **names** and value **lengths**, never the capability value.
+
+### Error Handling / Compatibility
+
+* New exit-`4` conditions, all fail-closed and all with the failing detail printed:
+  `--terminal` without a relay credential; `install_relay()` unable to write the shim `0555`;
+  `orca_check_probe()` returning `FAIL` on any of R1–R6, or on R7 when a terminal was supplied.
+* `RelayRefusal` inside `relay_serve()` is **not** exit 4 — the relay is a detached process and its
+  exit code reaches nobody. It is recorded in `RELAY_LOG.json` with the reason and the request is
+  discarded. A Coordinator that never receives a `worker_done` learns it from the Dispatch's own
+  timeout, and `FINAL_REVIEW_RELAY.json` tells it why.
+* `teardown()` is unchanged and still refuses anything not named `frv_iso_*` with a
+  `control/ISOLATION.json`. It removes `relay/`, `outbox/` and `control/` with the rest of the
+  session; the repatriated `FINAL_REVIEW_RELAY.json` is what survives.
+* `wrap_command(relay=False)` is byte-identical to today's output, so `LaunchLineTests` is
+  unaffected. `ISOLATION.json` `1.1 → 1.2` is additive; no consumer field is removed or retyped.
+* `run_probes()`, NEG-1…NEG-8, `assert_no_unscanned_descendant()` and `assert_home_scanned()` are
+  untouched. `<SESSION>/relay` joins the Class USR list and is scanned by the same
+  `scan_readable_set()` call every other USR root goes through; `<SESSION>/outbox` joins the
+  **writable** list only and is never made readable.
+
+### Expected Changed Files / Implementation Steps
+
+1. `scripts/review_isolation.py` — the D-7.8 constants, `RelayRefusal`, `RelayCredential`,
+   `install_relay()`, `relay_validate()`, `relay_serve()`, the `relay-serve` subcommand;
+   `wrap_command(..., relay=False)`; `<SESSION>/relay` into `usr_roots` and `<SESSION>/outbox` into
+   `writable`; `build_session(relay=…)`; `isolate(relay=…)` plus the `--relay-*` flags **and the
+   probe reordering of D-7.8**; `orca_check_probe()` rewritten; `build_attestation()`'s `relay`
+   block and `schema_version` `1.2`; `repatriate()`'s fourth destination.
+2. `.gitattributes` — the D-A.6′ block, verbatim.
+3. `scripts/test_run_logging.py` — `GITATTRIBUTES_RULES` and the renamed test (D-A.6′).
+4. `scripts/test_review_isolation.py` — the new `RelayChannelTests` (T-11.1…T-11.9).
+5. The isolated-dispatch preamble template — D-7.6's omissions and the D-7.5 invocation.
+
+Constraint carried forward unchanged: the relay prefix and `PATH` are part of the **launch line**,
+never folded into `agent_command`, for the W-20 reuse-gate reason G.5 already states.
+
+### Testing Strategy
+
+New class `RelayChannelTests` in `scripts/test_review_isolation.py`.
+
+| id | asserts |
+|---|---|
+| **T-11.1** | **the mechanism works against a real generated profile.** Build a real session, `install_relay()` with a synthetic `RelayCredential`, `compute_readable_set()`, `render_seatbelt_profile()`, write it, then through the real `wrap_command(..., relay=True)`: the shim is reachable as `orca` and exits 0; exactly one well-formed request lands in the outbox; `relay_serve(once=True)` with `orca` pointed at a **recording stub** on `PATH` produces a `RELAY_LOG.json` entry with `delivered: true` and an argv equal to the expected list. This is the positive assertion F-501 asks for — it asserts the channel *works*, not merely that `command not found` is gone. |
+| **T-11.2** | **the old failure mode is still in force for everything else.** Through the same launch line, an executable not in the readable set exits `71` with `execvp() … No such file or directory`, and `/bin/cat` on the shipped `orca` path is denied. The relay must not have made the sandbox porous. |
+| **T-11.3** | **the credential is unreachable from inside.** `cat`, `ls -l` and `ls` on `control/relay_credential.json` and on `control/` all fail from inside the sandbox; the same three succeed unsandboxed. Both halves asserted, so a profile that denied everything would not pass. |
+| **T-11.4** | **`relay_validate()` refuses, one case per rule** (pure, no sandbox): a forbidden `type` (`ask`, `check`, `dispatch`); an unknown key; a `subject` over 200 bytes; a `subject` with `\n` or `\x1b`; a `body` over 4096 bytes; `worker_done` with no `outcome`; `heartbeat` **with** an `outcome`; a `files_modified` entry containing `..`, one that is absolute, and a 65th entry; a `report_path` outside `artifacts/runs/<run_id>/`. Each raises `RelayRefusal`; **and** a valid request of each of the three allowed types returns the exact expected argv. |
+| **T-11.5** | **the request cannot reach the injected flags.** A request carrying `from`, `dispatch_capability`, `task_id`, `dispatch_id`, `to`, `run`, `payload` or `orca` — in any spelling, including `--`-prefixed keys — is refused; and the argv `relay_validate()` returns for a valid request contains each injected flag exactly once, with the value from the `RelayCredential`. |
+| **T-11.6** | **nothing flows inbound.** After `relay_serve(once=True)`, no file has appeared under `review_root`, `tmp`, `home` or `outbox` other than the request's own removal; `RELAY_LOG.json` is under `control/` and is unreadable from inside the sandbox. |
+| **T-11.7** | **`orca_check_probe()` fails closed and fails fast.** With the shim deliberately removed, it returns `result: "FAIL"` with `checks.shim_on_path.rc != 0`; with `terminal=""` it still returns `PASS` for R1–R6 and `SKIP` for R7. With the CLI stub made to exit non-zero, R7 is `FAIL`. |
+| **T-11.8** | **ordering and PATH, asserted rather than assumed.** Monkeypatch `orca_check_probe`, `preflight_probe` and `run_probes` to append to a list; assert `isolate()` calls them in exactly that order. Separately: `wrap_command(relay=True)` puts `<S>/relay/bin` **first** on `PATH` with an empty `agent_path`, and `wrap_command(relay=False)` is byte-identical to the pre-change output for the same inputs. |
+| **T-11.9** | **`--terminal` without a relay credential is exit 4**, with the D-7.8 message; and the attestation's `relay` block round-trips `assert_retained_path_field` on `shim`, `outbox` and `credential`. |
+
+And one end-to-end gate that belongs to the capture rather than to CI, exactly as D-6's real-agent
+pre-flight does: **the relayed `heartbeat` of R7 against the real `orca` CLI and a real dispatch
+terminal.** It needs a live Dispatch, is not a unit test, is a mandatory step of `B-1′`, and
+`control/probes/orca_check.log` plus `FINAL_REVIEW_RELAY.json` are its evidence. M-9c is that gate
+run once, by hand, during this iteration, and it returned `ok: true`.
+
+### Risks / Open Issues
+
+* **O-1 is now CLOSED, and G.5's claim is corrected in place.** The superseded sentence was:
+  *"`orca orchestration send/check/ask` must keep working from inside the sandbox: the `orca`
+  executable lives outside the repository, `(allow default)` leaves network and process rights
+  untouched…"*. It is false, for the reason F-501 gives: clause 1 is an allowlist, so being outside
+  the repository is the problem, not the exemption. The corrected statement is: **`orca` does not
+  and must not work from inside the sandbox** (T-11.2 asserts it still does not); `send` reaches the
+  Coordinator through the D-7 relay; `check` and `ask` are not available to an isolated dispatch at
+  all, by design (D-7.6). The `## Risks / Open Issues` **O-1** entry's fallback — *"dispatching into
+  a registered throwaway Orca worktree"* — is withdrawn, superseded by D-7.
+* **RK-16 (new) — the relay is a real outbound channel out of the sandbox.** Up to 4 KiB × 200
+  messages of agent-authored text reaches the Run mailbox. Mitigations, in order of strength:
+  (1) there is nothing secret on the sandboxed side — `build_session()` Rule 4 and NEG-1 both
+  establish that `review_root` is leak-clean before the agent ever starts; (2) `redact_text()` is
+  applied to `subject` and `body`, so the shipped `redaction/1.1` policy covers path and credential
+  spellings without a new policy being invented; (3) the caps are hard refusals, not truncations, so
+  a request that tries to exceed them is dropped and logged rather than silently trimmed. Residual:
+  the Run mailbox is not covered by `B3`'s P-PATH grep. Named, not closed.
+* **RK-17 (new) — the relay is a second process, and it is the one thing in this design that can be
+  orphaned.** If the pane dies between the background start and the `exec`, a relay can outlive its
+  session. Bounded by `RELAY_MAX_WALL_SECONDS` and by the `control/`-disappeared check, both of
+  which are unconditional. It holds no capability beyond the one Dispatch's `dcap`, and it can send
+  at most one `worker_done`.
+* **The relay's identity depends on pane-environment inheritance.** M-9c measures that it works
+  today. `orca orchestration send`'s own notes make the fallback explicit — *"when stable pane
+  identity is unavailable, the sender handle must exactly match the dispatch assignee"* — and the
+  relay's `--from` satisfies that by construction. Named because it is the one property D-7 borrows
+  from the host rather than proving from first principles; R7 is what catches it if it ever changes,
+  and it catches it in ~2 s.
+* **F-502 is untouched and still blocking.** `traversal_set[]` and the NEG-5 `roots[].path` records
+  still skip `_path_field()`. D-7.8 requires the new `relay` block's three path fields to go through
+  it on the way in, which is the same defect avoided rather than the existing one fixed.
+* **`.gitattributes` is now three rules and must not become four** without a DESIGN change. The
+  renamed test is the mechanism; the comment block in `.gitattributes` says so in the file itself.
+* **Not reopened:** F-401, F-402, D-H.2, D-4.1, RK-7, mandatory pass B (D-5.1), pass C's size
+  prefilter, pass S's Class-USR-only scope, pass D's extension list, D-I, `COMPATIBILITY.md`, O-2,
+  O-3, and the whole D-6.0…D-6.9 seed-provisioning contract. **O-1 is closed by D-7**; O-2 and O-3
+  stand as written. RK-1…RK-15 stand unchanged.
