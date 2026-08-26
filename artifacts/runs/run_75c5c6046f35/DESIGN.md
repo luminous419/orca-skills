@@ -3996,7 +3996,7 @@ consequence of code quoted here.
 | finding | disposition |
 |---|---|
 | **F-501** — G.5 asserted *"the `orca` executable lives outside the repository … so there is no known blocker"*. Clause 1 of the generated profile is `(deny file-read*)`, an **allowlist**, so living outside the repository is not sufficient — it is the problem. `orca` is not in the computed readable set, cannot be put in it (Reproduction 2), and the launch line's `PATH` cannot name its directory. A real dispatch completed its review and then died on `orca: command not found`; the Dispatch had to be abandoned. `B1` was unsatisfiable by **any** isolated capture. | **Closed by D-7, option (c) — the attested outbound relay.** A session-local shim named `orca`, on the sandboxed agent's `PATH`, whose only capability is enqueueing one JSON request into a session-local outbox; and an **unsandboxed** relay process, started by the launch line *before* the `exec`, which constructs the real `orca orchestration send` argv itself from a credential the sandbox provably cannot read, and relays it. Direction is **outbound only**. `orca_check_probe()` is rewritten to probe this channel end-to-end and is promoted to the **first** sandboxed check, ahead of the pre-flight and ahead of the ~13-minute negative battery. `B1`'s criterion text is **unchanged** (see D-7.9). Options (a), (b) and (d) are evaluated and rejected in D-7.1 with reasons, not dismissed. |
-| **F-503** — `B-5′` writes `artifacts/runs/<run>/FINAL_REVIEW*.md` (byte-identical to the exempted `report.md`, at a path the single A.6 rule does not match) and `artifacts/runs/<run>/final_review_workspace*/**` (a unified diff whose single-space context lines trip `git diff --check` on every line). Neither can be trimmed without breaking a digest binding. Any capture that reaches `B-5′` and commits its result fails the repository's own whitespace gate from that commit onward. | **Closed by D-A.6′.** The exemption goes from one rule to **exactly three**, each naming one path shape that `repatriate()` demonstrably writes, each justified individually in D-A.6′. `GITATTRIBUTES_RULE` becomes `GITATTRIBUTES_RULES` (an ordered 3-tuple) and `test_the_gitattributes_rule_is_exactly_the_one_designed` becomes `test_the_gitattributes_rules_are_exactly_the_ones_designed`, asserting the ordered list equals that tuple — so the test keeps doing the one job it was written for. Verified against a real `git check-attr` and a real `git diff --check --cached` (M-10, M-11). |
+| **F-503** — `B-5′` writes `artifacts/runs/<run>/FINAL_REVIEW*.md` (byte-identical to the exempted `report.md`, at a path the single A.6 rule does not match) and `artifacts/runs/<run>/final_review_workspace*/**` (a unified diff whose single-space context lines trip `git diff --check` on every line). Neither can be trimmed without breaking a digest binding. Any capture that reaches `B-5′` and commits its result fails the repository's own whitespace gate from that commit onward. | **Closed by D-A.6′, corrected by D-A.6″ (iteration 5).** The exemption goes from one rule to **seven**, each naming one path shape that `repatriate()` demonstrably writes, each justified individually. Iteration 4 said *"exactly three"* and used `*` wildcards that over-matched non-generated names (F-602); D-A.6″ uses numeric character classes instead and the count follows from the patterns. `GITATTRIBUTES_RULE` becomes `GITATTRIBUTES_RULES` (an ordered 3-tuple) and `test_the_gitattributes_rule_is_exactly_the_one_designed` becomes `test_the_gitattributes_rules_are_exactly_the_ones_designed`, asserting the ordered list equals that tuple — so the test keeps doing the one job it was written for. Verified against a real `git check-attr` and a real `git diff --check --cached` (M-10, M-11). |
 
 ### Measurements
 
@@ -4191,6 +4191,15 @@ relay applies `run_logging.redact_text()` to `subject` and `body` before buildin
 `RELAY_LOG.json` records both the redacted text it sent and `redaction_applied: true`. Recorded as
 **RK-16**.
 
+> **CORRECTED IN PLACE by D-7.3′ (iteration 5), for F-601.** The sentence above states the right
+> *intent* and the wrong *mechanism*: D-7.8 made `relay_validate()` return the finished argv, so
+> "before building the argv" could not be true of the interface as specified. The intent stands
+> verbatim; the mechanism that makes it true — a redacted-by-construction `RelayRequest` that is the
+> only type argv construction accepts — is **D-7.3′ / D-7.8′** below. `redact_text()` also returns
+> `(text, counts)`, not a string, and the caps move onto the redacted value; both are specified in
+> D-7.3′. Nothing else in D-7.3 changes: the key table, the injected-flag list, the never-emitted
+> list and the "nothing inbound" property are unaffected.
+
 #### D-7.4 Where enforcement lives, and why the shim is not it
 
 **The relay is the enforcement point. The shim is a convenience.** This is the single most important
@@ -4350,19 +4359,28 @@ exists before `compute_readable_set()` runs and is therefore scanned by it — t
 argument D-6.3 makes for the seed.
 
 ```python
-def relay_validate(request: dict, credential: RelayCredential) -> list[str]
+def relay_validate(request: dict, credential: RelayCredential) -> list[str]   # SUPERSEDED
 ```
-The enforcement point. Returns the complete argv or raises `RelayRefusal`. Pure — no I/O, no
-subprocess — so it is unit-testable without a sandbox. Every rule in D-7.3's table is applied here
-and **nowhere else**.
+> **SUPERSEDED by D-7.8′ (iteration 5), for F-601.** The withdrawn text was: *"The enforcement
+> point. Returns the complete argv or raises `RelayRefusal`. Pure — no I/O, no subprocess — so it is
+> unit-testable without a sandbox. Every rule in D-7.3's table is applied here and **nowhere
+> else**."* A function that returns argv **is** the defect: once argv exists, redacting the request
+> afterwards changes nothing. The replacement is
+> `relay_validate(request, credential) -> RelayRequest` plus a separate
+> `relay_build_argv(request: RelayRequest, credential, *, orca) -> list[str]`; see D-7.8′. The two
+> surviving claims — pure, and every D-7.3 rule applied here and nowhere else — carry over unchanged
+> to the replacement.
 
 ```python
 def relay_serve(session: Path, *, orca: str = "orca", once: bool = False,
                 max_wall_seconds: int = RELAY_MAX_WALL_SECONDS) -> dict
 ```
 The loop of D-7.7. Reads the credential, polls the outbox, for each `*.json` in `st_mtime` order:
-`relay_validate()` → `run_logging.redact_text()` over `subject`/`body` → `subprocess.run(argv)` →
-append a record to `control/RELAY_LOG.json`. A `RelayRefusal` is recorded with its reason and the
+~~`relay_validate()` → `run_logging.redact_text()` over `subject`/`body` → `subprocess.run(argv)`~~
+→ append a record to `control/RELAY_LOG.json`. **The struck sequence is the F-601 defect and is
+replaced by D-7.8′'s three-step loop** — `relay_validate()` → `relay_build_argv()` →
+`subprocess.run(argv)` — in which `relay_serve()` never calls `redact_text()` at all and never holds
+a raw value after `relay_validate()` returns. A `RelayRefusal` is recorded with its reason and the
 request is **discarded, not retried**; a non-zero CLI exit is recorded and retried at most twice
 with a fixed 5 s gap, then recorded as `delivered: false`. `once=True` drains the outbox and returns,
 for tests.
@@ -4441,6 +4459,14 @@ verification changes: the operator still reads `dispatch-show`.
 
 #### D-A.6′ — the `.gitattributes` exemption goes from one rule to exactly three
 
+> **SUPERSEDED IN PART by D-A.6″ (iteration 5), for F-602.** The *destination inventory* below
+> is correct and stands. The *patterns* chosen from it are not: `FINAL_REVIEW*.md` and
+> `final_review_workspace*/**` match names `repatriate()` cannot generate. D-A.6″ replaces the
+> three patterns with seven that match `repatriate()`'s output exactly; the rule **count** was
+> never the requirement and is not preserved. Every justification below that is about *scope*
+> (anchored under `artifacts/runs/*/`, JSON deliberately unexempted, the guard getting stronger)
+> carries over unchanged and is re-measured in iteration 5.
+
 **Verified, not copied.** `repatriate()` writes, with `suffix = "" if attempt == 1 else
 f"_iteration{attempt}"`:
 
@@ -4451,12 +4477,18 @@ f"_iteration{attempt}"`:
 | `:2642` | `root / f"{REPATRIATED_WORKSPACE_DIRNAME}{suffix}"` (`= "final_review_workspace"`), a `copytree` | `artifacts/runs/<run>/final_review_workspace*/**` |
 | new (D-7.8) | `root / f"FINAL_REVIEW_RELAY{suffix}.json"` | JSON — **no exemption** |
 
-The two shapes TEST named are the right ones, and the trailing `*` on each is required rather than
-defensive: the `_iteration{N}` suffix is generated on every retry, and the repository already
+The two shapes TEST named are the right ones. ~~and the trailing `*` on each is required rather
+than defensive: the `_iteration{N}` suffix is generated on every retry, and the repository already
 contains `FINAL_REVIEW_iteration2.md` … `FINAL_REVIEW_iteration8.md` and
-`FINAL_REVIEW_iteration3_voided_ctx_55d1c349a3e5.md`.
+`FINAL_REVIEW_iteration3_voided_ctx_55d1c349a3e5.md`.~~ **The struck sentence is the F-602 defect,
+and it refutes itself**: `FINAL_REVIEW_iteration3_voided_ctx_55d1c349a3e5.md` is cited as evidence
+*for* the `*`, but `repatriate()` cannot produce it — it is a hand-renamed voided attempt. A `*`
+wide enough to cover it is by construction wider than the generated language. What the retry suffix
+actually needs is a **numeric** class, not a wildcard: D-A.6″.
 
-The new `.gitattributes`, in this order:
+The new `.gitattributes`, in this order — **SUPERSEDED by D-A.6″; kept verbatim so a reader of the
+review thread can see what F-602 was filed against. IMPLEMENTATION must copy D-A.6″'s block, not
+this one:**
 
 ```gitattributes
 # Retained Final Review reports are byte-exact snapshots of Reviewer-authored Markdown, digest-
@@ -4477,6 +4509,10 @@ artifacts/runs/*/final_review_workspace*/** -whitespace
 ```
 
 **Why three rules is still narrow and deliberate, and not the drift the test exists to prevent.**
+*(Corrected by D-A.6″: the reasoning below is right about rules 1 and 3's* content *and wrong
+about the* patterns *— rule 2's `FINAL_REVIEW*.md` and rule 3's `final_review_workspace*` are
+what F-602 rejected. Read the bullets as the scope argument they are; take the patterns from
+D-A.6″.)*
 The test's purpose was never "one rule"; it was *"a repo-wide or broadened pattern is a design
 violation"*. Each pattern below is justified on its own, and the count is a consequence:
 
@@ -4504,23 +4540,27 @@ violation"*. Each pattern below is justified on its own, and the count is a cons
 **What IMPLEMENTATION must change, exactly** (the edits are IMPLEMENTATION's; the values are fixed
 here):
 
-* `.gitattributes` — replace its contents with the block above, verbatim, comments included.
+* `.gitattributes` — ~~replace its contents with the block above, verbatim, comments included.~~
+  **Replace its contents with D-A.6″'s block**, verbatim, comments included.
 * `scripts/test_run_logging.py:3946` —
   ```python
-  GITATTRIBUTES_RULES = (
+  GITATTRIBUTES_RULES = (   # SUPERSEDED by D-A.6″ — take the seven-tuple from there
       "artifacts/runs/*/final_review_audit/**/report.md -whitespace",
       "artifacts/runs/*/FINAL_REVIEW*.md -whitespace",
       "artifacts/runs/*/final_review_workspace*/** -whitespace",
   )
   ```
   The name goes plural and the old singular `GITATTRIBUTES_RULE` is **removed**, not aliased, so a
-  stale reference is a `NameError` at import rather than a silently unasserted rule.
+  stale reference is a `NameError` at import rather than a silently unasserted rule. *(That naming
+  decision stands; only the tuple's contents are replaced by D-A.6″.)*
 * `test_the_gitattributes_rule_is_exactly_the_one_designed` → renamed
   `test_the_gitattributes_rules_are_exactly_the_ones_designed`; body becomes
-  `self.assertEqual(rules, list(GITATTRIBUTES_RULES), "D-A.6' allows exactly these three scoped "
-  "rules, in this order; a fourth rule, a reordering, or a broadened pattern is a design violation")`.
-  The comparison stays an **ordered `assertEqual` against a fixed list** — not a set, not a subset,
-  not a length check — because that is what makes the test refuse a fourth rule.
+  `self.assertEqual(rules, list(GITATTRIBUTES_RULES), …)`. The comparison stays an **ordered
+  `assertEqual` against a fixed list** — not a set, not a subset, not a length check.
+  *(D-A.6″ corrects the message text — "exactly these three scoped rules" is no longer true — and,
+  more importantly, adds the `git check-attr` match-set test that F-602 showed a fixed-list
+  comparison alone can never provide: a literal-string assertion proves the patterns were copied,
+  never that they are narrow.)*
 * No change to `test_the_whitespace_gate_passes_over_the_whole_os22_range`,
   `test_every_retained_artifact_still_matches_its_recorded_digest`, `HARD_BREAK_REPORT_DIGEST` or
   `HARD_BREAK_REPORT_BYTES`.
@@ -4604,7 +4644,7 @@ New class `RelayChannelTests` in `scripts/test_review_isolation.py`.
 | **T-11.1** | **the mechanism works against a real generated profile.** Build a real session, `install_relay()` with a synthetic `RelayCredential`, `compute_readable_set()`, `render_seatbelt_profile()`, write it, then through the real `wrap_command(..., relay=True)`: the shim is reachable as `orca` and exits 0; exactly one well-formed request lands in the outbox; `relay_serve(once=True)` with `orca` pointed at a **recording stub** on `PATH` produces a `RELAY_LOG.json` entry with `delivered: true` and an argv equal to the expected list. This is the positive assertion F-501 asks for — it asserts the channel *works*, not merely that `command not found` is gone. |
 | **T-11.2** | **the old failure mode is still in force for everything else.** Through the same launch line, an executable not in the readable set exits `71` with `execvp() … No such file or directory`, and `/bin/cat` on the shipped `orca` path is denied. The relay must not have made the sandbox porous. |
 | **T-11.3** | **the credential is unreachable from inside.** `cat`, `ls -l` and `ls` on `control/relay_credential.json` and on `control/` all fail from inside the sandbox; the same three succeed unsandboxed. Both halves asserted, so a profile that denied everything would not pass. |
-| **T-11.4** | **`relay_validate()` refuses, one case per rule** (pure, no sandbox): a forbidden `type` (`ask`, `check`, `dispatch`); an unknown key; a `subject` over 200 bytes; a `subject` with `\n` or `\x1b`; a `body` over 4096 bytes; `worker_done` with no `outcome`; `heartbeat` **with** an `outcome`; a `files_modified` entry containing `..`, one that is absolute, and a 65th entry; a `report_path` outside `artifacts/runs/<run_id>/`. Each raises `RelayRefusal`; **and** a valid request of each of the three allowed types returns the exact expected argv. |
+| **T-11.4** | **`relay_validate()` refuses, one case per rule** (pure, no sandbox): a forbidden `type` (`ask`, `check`, `dispatch`); an unknown key; a `subject` over 200 bytes; a `subject` with `\n` or `\x1b`; a `body` over 4096 bytes; `worker_done` with no `outcome`; `heartbeat` **with** an `outcome`; a `files_modified` entry containing `..`, one that is absolute, and a 65th entry; a `report_path` outside `artifacts/runs/<run_id>/`. Each raises `RelayRefusal`; **and** a valid request of each of the three allowed types returns a `RelayRequest` from which `relay_build_argv()` produces the exact expected argv (D-7.8′; iteration 4's *"returns the exact expected argv"* described the superseded signature). |
 | **T-11.5** | **the request cannot reach the injected flags.** A request carrying `from`, `dispatch_capability`, `task_id`, `dispatch_id`, `to`, `run`, `payload` or `orca` — in any spelling, including `--`-prefixed keys — is refused; and the argv `relay_validate()` returns for a valid request contains each injected flag exactly once, with the value from the `RelayCredential`. |
 | **T-11.6** | **nothing flows inbound.** After `relay_serve(once=True)`, no file has appeared under `review_root`, `tmp`, `home` or `outbox` other than the request's own removal; `RELAY_LOG.json` is under `control/` and is unreadable from inside the sandbox. |
 | **T-11.7** | **`orca_check_probe()` fails closed and fails fast.** With the shim deliberately removed, it returns `result: "FAIL"` with `checks.shim_on_path.rc != 0`; with `terminal=""` it still returns `PASS` for R1–R6 and `SKIP` for R7. With the CLI stub made to exit non-zero, R7 is `FAIL`. |
@@ -4633,9 +4673,13 @@ run once, by hand, during this iteration, and it returned `ok: true`.
   (1) there is nothing secret on the sandboxed side — `build_session()` Rule 4 and NEG-1 both
   establish that `review_root` is leak-clean before the agent ever starts; (2) `redact_text()` is
   applied to `subject` and `body`, so the shipped `redaction/1.1` policy covers path and credential
-  spellings without a new policy being invented; (3) the caps are hard refusals, not truncations, so
-  a request that tries to exceed them is dropped and logged rather than silently trimmed. Residual:
-  the Run mailbox is not covered by `B3`'s P-PATH grep. Named, not closed.
+  spellings without a new policy being invented — **and per D-7.3′ that application is now an
+  invariant of the `RelayRequest` type rather than a step in a sequence, so mitigation (2) is
+  structural rather than procedural**; (3) the caps are hard refusals, not truncations, so
+  a request that tries to exceed them is dropped and logged rather than silently trimmed —
+  **D-7.3′ moves the caps onto the redacted value, because that is the value that actually reaches
+  the mailbox (M-12g)**. Residual: the Run mailbox is not covered by `B3`'s P-PATH grep. Named, not
+  closed.
 * **RK-17 (new) — the relay is a second process, and it is the one thing in this design that can be
   orphaned.** If the pane dies between the background start and the `exec`, a relay can outlive its
   session. Bounded by `RELAY_MAX_WALL_SECONDS` and by the `control/`-disappeared check, both of
@@ -4650,9 +4694,453 @@ run once, by hand, during this iteration, and it returned `ok: true`.
 * **F-502 is untouched and still blocking.** `traversal_set[]` and the NEG-5 `roots[].path` records
   still skip `_path_field()`. D-7.8 requires the new `relay` block's three path fields to go through
   it on the way in, which is the same defect avoided rather than the existing one fixed.
-* **`.gitattributes` is now three rules and must not become four** without a DESIGN change. The
-  renamed test is the mechanism; the comment block in `.gitattributes` says so in the file itself.
+* ~~**`.gitattributes` is now three rules and must not become four** without a DESIGN change.~~
+  **Corrected by D-A.6″:** `.gitattributes` is now **seven** rules, and the invariant is not a count
+  — it is the *match set*. A rule may be added only for a path shape `repatriate()` actually
+  generates. The mechanism is the renamed fixed-list test **plus** the `git check-attr` positive and
+  negative match-set test D-A.6″ adds; the comment block in `.gitattributes` says so in the file
+  itself.
 * **Not reopened:** F-401, F-402, D-H.2, D-4.1, RK-7, mandatory pass B (D-5.1), pass C's size
   prefilter, pass S's Class-USR-only scope, pass D's extension list, D-I, `COMPATIBILITY.md`, O-2,
   O-3, and the whole D-6.0…D-6.9 seed-provisioning contract. **O-1 is closed by D-7**; O-2 and O-3
   stand as written. RK-1…RK-15 stand unchanged.
+
+---
+
+## DESIGN iteration 5 — correction for F-601/F-602
+
+STATUS: COMPLETE
+
+Scope: **exactly the two findings of `REVIEW_DESIGN_iteration4.md`, and nothing else.** F-601 —
+the relay's redaction/argv order and type boundary. F-602 — the `.gitattributes` match set. Both
+are corrections *to iteration 4's own D-7 and D-A.6′*, not new design; the iteration-4 sections are
+annotated in place above and the authoritative replacements are D-7.3′ / D-7.8′ / D-A.6″ below.
+
+**Not reopened, and not touched:** F-501's architecture choice (option (c), confirmed sound by the
+iteration-4 review), the option (a)/(b)/(d) analysis, `B1`'s criterion text and its preservation,
+the probe ordering (`orca_check_probe()` first among the sandboxed checks), F-401, F-402, D-H.2,
+RK-7, mandatory pass B (D-5.1), D-I, and the whole D-6.0…D-6.9 seed-provisioning contract. The
+readable-set classification, the NEG battery, the exit-code table, the bundle schema, D-7.1, D-7.2,
+D-7.4, D-7.5, D-7.6, D-7.7 and D-7.9 are unchanged. **F-502 remains `implementation`-owned and
+untouched.**
+
+Both corrections were **executed on this host before being written here**, the same standard every
+DESIGN iteration in this Run has held to. `M-12` traces a real unredacted value through the
+specified data flow against the shipped `run_logging`; `M-13` runs real `git check-attr` and real
+`git diff --check --cached` against real and near-miss filenames. Nothing below is asserted that is
+not measured there or a direct consequence of code quoted here.
+
+Host: `darwin 25.5.0`, `git version 2.50.1 (Apple Git-155)`, `python 3.11.8`.
+
+### Summary / Requirements
+
+| finding | disposition |
+|---|---|
+| **F-601** — D-7.3 claims the relay redacts `subject`/`body` *"before building the argv"*, but D-7.8 specified `relay_validate(request, credential) -> list[str]` as returning *"the complete argv"*, with `relay_serve()` applying `redact_text()` **after** `relay_validate()` returned. Redacting a request after argv exists redacts nothing that is sent. An implementation following the stated sequence relays raw session paths, usernames and credential-shaped text into the Run mailbox, which is outside `B3`'s retained-family grep, while RK-16 counts that redaction as its mitigation. | **Closed by D-7.3′ / D-7.8′.** Redaction stops being a *step* and becomes an *invariant of a type*. `relay_validate()` returns a frozen `RelayRequest` whose `__post_init__` refuses construction unless **every** string field is a fixed point of the shipped redaction policy (`run_logging.safe_embedded_text(value, redact=False)`); `relay_build_argv()` accepts **only** a `RelayRequest` and raises `TypeError` on a mapping. `relay_serve()` never calls `redact_text()` and never holds a raw value after `relay_validate()` returns. Argv built from unredacted text is therefore unconstructible, not merely out of order. Measured end-to-end in **M-12**, including the two negative constructions. |
+| **F-602** — `FINAL_REVIEW*.md` and `final_review_workspace*/**` are wildcards over a language `repatriate()` cannot produce. They exempt `FINAL_REVIEW_secret.md`, this Run's own hand-renamed `FINAL_REVIEW_iteration3_voided_ctx_55d1c349a3e5.md`, and `final_review_workspace_backup/**`. A fixed-list test over rule strings proves the patterns were copied, never that their match set is narrow. | **Closed by D-A.6″.** The `*` becomes a **numeric character class**: the base name is a literal, and the retry form is `_iteration[2-9]` / `_iteration[1-9][0-9]`. Measured in **M-13**, the resulting match set is **exactly** `FINAL_REVIEW.md` ∪ `FINAL_REVIEW_iteration{2…99}.md` (and the workspace analogues) — **zero overmatch**, including zero for `_iteration0`, `_iteration1` and leading-zero forms. The residual is an **undermatch** above attempt 99, stated and justified in D-A.6″ rather than called exact. The rule count goes 3 → **7** as a consequence; no count is preserved as a goal. A `git check-attr` match-set test with same-directory negatives replaces "the strings match" as the guard. |
+
+### Measurements
+
+#### M-12 — the relay data flow, traced with a real unredacted value
+
+A prototype implementing **exactly** the D-7.8′ interfaces below was run against the **shipped,
+unmodified** `scripts/run_logging.py`. The raw request carried this Run's real dispatch capability,
+a `/Users/<username>` spelling and an `frv_iso_*` session path — all three P-PATH subject matter.
+
+| id | what was measured | result |
+|---|---|---|
+| **M-12a** | the argv `relay_build_argv()` produced from a `worker_done` whose `subject` and `body` carried a raw username spelling and a raw session path | `--subject` = `review done under /Users/<REDACTED:absolute_local_path>/aiAssistedProjects/orca-skills`; `--body` = `session <REDACTED:foreign_absolute_path> ; cap <REDACTED:orca_dispatch_capability> ; done`. Substring audit over the whole argv: raw username spelling **absent**, raw session path **absent** |
+| **M-12b** | `redact_text()`'s second return value, which iteration 4 never accounted for | `({'category': 'absolute_local_path', 'count': 1}, {'category': 'orca_dispatch_capability', 'count': 1}, {'category': 'foreign_absolute_path', 'count': 1})` — a per-category count list, recorded into `RELAY_LOG.json` |
+| **M-12c** | `relay_build_argv(<the raw dict>, credential)` | `TypeError: relay_build_argv() accepts only a RelayRequest; a mapping, a dict or a raw request can never reach argv construction` |
+| **M-12d** | `RelayRequest(subject="at /Users/luminous/x", …)` — direct construction, bypassing `relay_validate()` entirely | `RelayRefusal: subject: unredacted text may not enter a RelayRequest (redaction_residue)` |
+| **M-12e** | the same with a raw session path in `body` | `RelayRefusal: body: unredacted text may not enter a RelayRequest (redaction_residue)` |
+| **M-12f** | the same with an absolute `report_path` (a field iteration 4 protected by validation only) | `RelayRefusal: report_path: unredacted text may not enter a RelayRequest (redaction_residue)` |
+| **M-12g** | a 197-byte `subject` consisting of 66 minimal absolute paths (`/a`), i.e. **under** `RELAY_MAX_SUBJECT_BYTES` before redaction | redacted length **2177 bytes** → `RelayRefusal: subject: over cap after redaction`. Redaction *expands*; a cap checked on the raw value does not bound what reaches the mailbox |
+| **M-12h** | `run_logging.safe_embedded_text(value, redact=False)` as the invariant predicate, on raw and on redacted text | raw → `reason='redaction_residue'`, redacted → `reason=''`. The predicate separates the two cases exactly, and `redact_text(redact_text(x)) == redact_text(x)` held for both fields |
+
+M-12g is the measurement that changed a decision: iteration 4 implied the caps bound the raw
+request. They must bound the **redacted** value, because that is the value that is sent.
+
+#### M-13 — the `.gitattributes` match set, by real `git check-attr`
+
+A real `git init` checkout, the D-A.6″ seven-rule `.gitattributes`, `git check-attr whitespace`.
+
+| id | what was measured | result |
+|---|---|---|
+| **M-13a** | the nine generated shapes: `final_review_audit/u1/report.md`, `FINAL_REVIEW.md`, `FINAL_REVIEW_iteration2.md`, `_iteration8.md`, `_iteration12.md`, `_iteration99.md`, `final_review_workspace/DIFF.patch`, `final_review_workspace_iteration3/DIFF.patch`, `final_review_workspace_iteration42/a/b/DIFF.patch` | all nine `whitespace: unset` — **exempt** |
+| **M-13b** | the two negatives `REVIEW_DESIGN_iteration4.md` named explicitly: `FINAL_REVIEW_secret.md` and `final_review_workspace_backup/DIFF.patch` | both `whitespace: unspecified` — **not exempt** |
+| **M-13c** | this Run's own real voided-attempt filename shape, in both spellings: `FINAL_REVIEW_iteration3_voided_ctx_55d1c349a3e5.md` and `final_review_workspace_iteration3_voided_ctx_55d1c349a3e5/DIFF.patch` | both `unspecified` — **not exempt**. Under iteration 4's `FINAL_REVIEW*.md` this file *was* exempt; that is the concrete over-exemption F-602 identified |
+| **M-13d** | the numeric near-misses `_iteration0`, `_iteration1`, `_iteration01`, `_iteration` (no number), `_iteration100`, and the workspace forms `_iteration0`, `_iteration1` | all seven `unspecified`. `[2-9]` and `[1-9][0-9]` exclude the two integers `repatriate()` cannot emit **and** leading-zero spellings, which `f"{attempt}"` never produces |
+| **M-13e** | the unexempted JSON destinations and the outside-run near miss: `FINAL_REVIEW_ISOLATION.json`, `FINAL_REVIEW_ISOLATION_iteration2.json`, `FINAL_REVIEW_RELAY.json`, `FINAL_REVIEW_EVIDENCE_BUNDLE.json`, `TEST.md`, `ORCHESTRATOR_LOG.md`, `artifacts/FINAL_REVIEW_something.md` | all `unspecified` — M-10's result reproduced under the narrower rules |
+| **M-13f** | the **real repository's** 26 existing `artifacts/runs/*/FINAL_REVIEW*.md` and `artifacts/runs/*/final_review_audit/*/report.md` paths, fed through `git check-attr --stdin` | 25 `unset`, 1 `unspecified` — and the single `unspecified` is exactly `run_804e35d29531/FINAL_REVIEW_iteration3_voided_ctx_55d1c349a3e5.md`. The patterns discriminate on real data, not only on constructed cases |
+| **M-13g** | `git diff --check --cached` with `FINAL_REVIEW.md` (`+ID: F-001  `), `FINAL_REVIEW_iteration12.md`, `final_review_audit/u1/report.md`, two `DIFF.patch` trees, plus `NOT_EXEMPT.md` **and** `FINAL_REVIEW_secret.md` (both trailing-whitespace) staged | `rc=2` with exactly two complaints — `FINAL_REVIEW_secret.md:1` and `NOT_EXEMPT.md:1`. Unstage those two: `rc=0`, no output |
+| **M-13h** | whether leaving the real voided file unexempted costs anything | `grep -cP ' +$'` over `run_804e35d29531/FINAL_REVIEW_iteration3_voided_ctx_55d1c349a3e5.md` = **0**. It has no trailing-whitespace line, so the narrow rules cost it nothing; it is also already committed, and under today's shipped single-rule `.gitattributes` it is *already* unexempted. No regression |
+
+**M-13g is the finding-closing measurement.** Under iteration 4's patterns `FINAL_REVIEW_secret.md`
+would have been silently exempted and its trailing whitespace would have passed the gate. Under
+D-A.6″ the gate catches it. That is the difference between "the strings match" and "the match set is
+narrow", and it is why the new test is a `check-attr` test.
+
+### Current Architecture
+
+Three facts from the shipped code, quoted rather than summarized, because both corrections turn on
+them.
+
+1. **`run_logging.redact_text()` returns `tuple[str, tuple[dict[str, int], ...]]`,** not a string
+   (`run_logging.py:1129`). Iteration 4 wrote *"`redact_text()` over `subject`/`body`"* as though it
+   were a string→string transform. It is not, and the second element is evidence D-7.8′ records.
+2. **`run_logging.safe_embedded_text(raw, *, redact)` already is the residue predicate this design
+   needs** (`run_logging.py:1210`). With `redact=False` it *verifies only* and returns
+   `omission_reason == "redaction_residue"` for text that still carries an absolute path, a
+   `dcap_…`, a `scheme://user:pass@`, or a SECRET/TOKEN/PASSWORD/API_KEY-named assignment. Its
+   docstring states why the check is `_residual_matches_are_self_output()` per match rather than
+   `redact_text(x) == x`: *"comparing two whole strings lets a match that removed something be
+   masked by matches elsewhere in the text, and the per-match rule cannot be masked that way."*
+   D-7.3′ reuses that predicate rather than inventing a second one — the same discipline D-H already
+   applies to the evidence bundle, and the same reason iteration 4 refused to invent a new
+   redaction policy for the relay.
+3. **`repatriate()`'s suffix language is finite and numeric** (`review_isolation.py`, the
+   `suffix = "" if attempt == 1 else f"_iteration{attempt}"` line). `f"{attempt}"` on an `int`
+   emits no leading zero, no sign for the values in range, and no non-digit. The generated set is
+   therefore `{FINAL_REVIEW.md}` ∪ `{FINAL_REVIEW_iteration<N>.md : N ≥ 2}` and the two workspace
+   analogues — a language a numeric character class describes and a `*` does not.
+
+### Proposed Design
+
+#### D-7.3′ — the order and the type boundary (replaces the F-601 defect)
+
+The rule, stated once, and it is the whole correction:
+
+> **Argv is constructed from a `RelayRequest`, and a `RelayRequest` cannot hold text that carries
+> redaction residue. Redaction is therefore not a step that can be performed in the wrong order —
+> it is a precondition of the only type argv construction accepts.**
+
+Four consequences, each of which IMPLEMENTATION must preserve:
+
+1. **`relay_validate()` returns a `RelayRequest`, never argv.** It parses the raw mapping, applies
+   every rule of D-7.3's table to the **raw** values (the closed key set, the type vocabulary, the
+   control-character and newline refusals, the `outcome`/`phase` co-occurrence rules, the
+   `files_modified` grammar, the `report_path` prefix), then makes **the one `redact_text()` call in
+   the module** over `subject` and `body`, then constructs the `RelayRequest`.
+2. **`RelayRequest.__post_init__` re-proves the invariant, over every string field it holds** —
+   `type`, `subject`, `body`, `outcome`, `phase`, `report_path` and each `files_modified` entry —
+   by calling `run_logging.safe_embedded_text(value, redact=False)` and raising `RelayRefusal` if
+   the returned reason is non-empty. For `phase`, `outcome`, `type` and the repo-relative path
+   fields the check can never fire, because their grammars already exclude everything the policy
+   removes; it is applied to them anyway so the invariant is **uniform over the type** rather than
+   an argument about which fields happen to be safe. M-12f shows it firing on `report_path` when
+   the grammar is bypassed by direct construction.
+3. **`relay_build_argv()` takes a `RelayRequest` and refuses anything else** with `TypeError`
+   (M-12c). It has no `raw`/`mapping` parameter at all, so there is nothing for a future edit to
+   accidentally thread through. It is pure and does no redaction, because by its signature there is
+   nothing left to redact.
+4. **`relay_serve()` never calls `redact_text()`.** Its loop is
+   `relay_validate()` → `relay_build_argv()` → `subprocess.run(argv)` → log. The raw mapping goes
+   out of scope when `relay_validate()` returns. This is greppable and T-11.12 greps it.
+
+**The caps move onto the redacted value, and this is a decision, not a restatement.** M-12g
+measures 197 raw bytes redacting to 2177 — `foreign_absolute_path` replaces a match **whole**, so a
+2-byte `/a` becomes a 30-byte placeholder, a ~15× worst case. `RELAY_MAX_SUBJECT_BYTES` and
+`RELAY_MAX_BODY_BYTES` therefore bound the **redacted** value, checked in `__post_init__` alongside
+the residue gate, with the distinct refusal reason `over cap after redaction`. Three notes:
+
+* This keeps *"refused, not truncated"* exactly as D-7.3 wrote it. Truncating a redacted value is
+  the one thing that must not happen: it can cut a placeholder in half.
+* The direction of the trade is stated plainly. A `subject` that is 197 bytes of dense absolute
+  paths is now refused where iteration 4 would have accepted it. That content is, by construction,
+  almost entirely the sandbox-description leak RK-16 exists to bound; refusing it is the intended
+  behaviour, and the refusal is recorded in `RELAY_LOG.json` with its reason.
+* For a realistic message the effect is nil or favourable: a long absolute path *shrinks* under
+  category 5 (a 60-byte path becomes 30), and a `/Users/<name>/…` path grows by only
+  `30 − len(name)` bytes under category 4 (M-12a: +22 for this host's username).
+
+**A separate, earlier bound protects the read itself.** `RELAY_MAX_REQUEST_BYTES = 16384` is checked
+against the outbox file's size *before* `json.loads`, so an oversized or truncated request is
+refused without being parsed. This is new in iteration 5 and exists because moving the caps onto the
+post-redaction value removed the only bound that previously applied to what the relay reads.
+
+**Credential-injected values are host-authored and deliberately outside the invariant.** The
+`dcap_…` value reaches argv from `RelayCredential`, never from a `RelayRequest` field, and must be
+sent verbatim — it *is* the authority. M-12a records it present in argv as the
+`--dispatch-capability` value and **absent** from `--body`. This is exactly why D-7.8's
+`argv_shape` records flag **names and value lengths, never values**, and iteration 5 does not
+relax that.
+
+#### D-A.6″ — the `.gitattributes` match set (replaces the F-602 patterns)
+
+**The requirement is a match set, not a rule count.** The count below is 7 because that is how many
+rules the narrow patterns need; iteration 4's "exactly three" was an artifact of using `*`.
+
+```gitattributes
+# Retained Final Review reports are byte-exact snapshots of Reviewer-authored Markdown, digest-
+# bound by record.json and immutable under DESIGN A.3. Markdown hard breaks (two trailing spaces)
+# are legitimate there and must not be trimmed, so these paths are exempt from git's whitespace
+# rules. Every other path keeps the default rules.
+#
+# SCOPE IS THE MATCH SET, NOT THE RULE COUNT. Each pattern below matches exactly one shape that
+# repatriate() generates: the base name as a literal, and the retry name with a NUMERIC class,
+# never a `*` wildcard. repatriate() computes suffix = "" if attempt == 1 else
+# f"_iteration{attempt}", so the generated language is FINAL_REVIEW.md and
+# FINAL_REVIEW_iteration<N>.md for integer N >= 2 -- and nothing else. A `*` here would also
+# exempt hand-renamed files such as FINAL_REVIEW_iteration3_voided_ctx_<hex>.md, which is the
+# over-exemption DESIGN F-602 rejected. See DESIGN D-A.6".
+#
+# Adding a rule is a DESIGN change, and it is admissible only for a path shape repatriate()
+# actually generates. scripts/test_run_logging.py asserts BOTH the rule strings AND, via
+# `git check-attr`, that the match set includes every generated name and excludes near misses.
+
+# 1. the published record unit's report (A.6, unchanged).
+artifacts/runs/*/final_review_audit/**/report.md -whitespace
+
+# 2-4. the repatriated report: the base name, then the numeric retry forms. Byte-identical to (1)
+#      and digest-bound by the same record.json.
+artifacts/runs/*/FINAL_REVIEW.md -whitespace
+artifacts/runs/*/FINAL_REVIEW_iteration[2-9].md -whitespace
+artifacts/runs/*/FINAL_REVIEW_iteration[1-9][0-9].md -whitespace
+
+# 5-7. the repatriated subject tree, same three forms. Contains DIFF.patch, whose unified-diff
+#      context lines are a single space on every line; the tree is bound by MANIFEST.json's
+#      fixture_digest and cannot be trimmed.
+artifacts/runs/*/final_review_workspace/** -whitespace
+artifacts/runs/*/final_review_workspace_iteration[2-9]/** -whitespace
+artifacts/runs/*/final_review_workspace_iteration[1-9][0-9]/** -whitespace
+```
+
+**Why `[2-9]` and `[1-9][0-9]` rather than `[0-9]*` or `*`.**
+
+* `[2-9]` excludes `_iteration0` and `_iteration1`, which `repatriate()` cannot emit — attempt 1
+  takes the empty suffix and there is no attempt 0. M-13d measures both as `unspecified`.
+* `[1-9][0-9]` excludes leading-zero spellings (`_iteration01`), which `f"{attempt}"` on an `int`
+  never produces. M-13d measures it as `unspecified`.
+* Neither class admits a trailing tail, so `_iteration3_voided_ctx_<hex>` and `_secret` cannot
+  match (M-13b, M-13c). A `*` cannot express "digits and then immediately `.md`"; a character
+  class can.
+* **Measured overmatch: zero.** Every path M-13 exempts is a name `repatriate()` generates.
+
+**The one residual, stated rather than hidden: an undermatch above attempt 99.**
+`FINAL_REVIEW_iteration100.md` is **not** exempt (M-13d). `.gitattributes` globbing has no
+`{2,}`-style repetition, so an exact match of the unbounded integer language is not expressible;
+covering three digits would be one more rule pair, four digits one more again, and so on without
+end. The bound is set at two digits, and the choice is defensible on three grounds:
+
+1. **It is the safe failure direction.** An unmatched path keeps git's *default* whitespace rules,
+   so a hypothetical attempt 100 makes `git diff --check` **fail loudly** on a legitimate file. That
+   is visible and fixable by a one-line DESIGN change. The overmatch direction — which is what
+   iteration 4 chose — silently exempts files nobody designed, and nothing ever reports it.
+2. **The generated range is bounded in practice by the retry contract, not by optimism.** This
+   Run's `max-iterations` budget is 5; the repository's highest artifact in seven runs is
+   `FINAL_REVIEW_iteration8.md` (M-13f); and `repatriate()`'s own rule — *"a retry never overwrites
+   the predecessor's evidence"* — means a hundredth attempt at one Final Review is a pathology the
+   pipeline should surface, not a case a `.gitattributes` rule should smooth over.
+3. **It is not called exact.** F-602's Required Action asks that irreducible slack be stated and
+   justified rather than dressed up. There is **no** overmatch to state; the slack that exists is
+   this undermatch, it is named here, it is asserted by a test (T-12.3 pins
+   `FINAL_REVIEW_iteration100.md` as `unspecified`), and the comment block in `.gitattributes`
+   points at this paragraph.
+
+**What carries over from D-A.6′ unchanged**, because F-602 did not challenge it and it was measured
+again here: each pattern is anchored under `artifacts/runs/*/` and none is repo-wide (M-13e); the
+`*` in that prefix is A.6's settled anchor and its match set is exactly "one path segment directly
+under `artifacts/runs/`", i.e. the run directories; the two repatriated **JSON** destinations
+(`FINAL_REVIEW_ISOLATION*.json`, `FINAL_REVIEW_RELAY*.json`) are deliberately **not** exempted
+because `json.dumps` emits no trailing whitespace (M-13e); and the gate still catches every
+non-exempt file (M-13g). **F-003 / F-103 is not reopened** and D-A.6″ does not exempt them.
+
+### Components / Interfaces / Data Flow
+
+#### D-7.8′ — the corrected relay interfaces
+
+Replaces D-7.8's `relay_validate()` entry and its `relay_serve()` loop description. Every other
+constant, dataclass and function in D-7.8 stands.
+
+```python
+RELAY_MAX_REQUEST_BYTES = 16384          # NEW: bounds the outbox file, checked before json.loads
+RELAY_REQUEST_KEYS = ("type", "subject", "body", "outcome", "phase",
+                      "files_modified", "report_path")   # NEW: the closed key set, named once
+
+@dataclasses.dataclass(frozen=True)
+class RelayRequest:
+    """A validated, NORMALIZED, ALREADY-REDACTED relay request.
+
+    The invariant, and the reason this type exists: no field of a RelayRequest carries
+    redaction residue under the shipped policy. It is enforced in __post_init__, so the
+    invariant is a property of the type rather than of a call order. relay_build_argv()
+    accepts only this type, which is what makes argv-from-raw-text unconstructible.
+    """
+    type: str
+    subject: str                 # post-redaction
+    body: str                    # post-redaction
+    outcome: str | None
+    phase: str | None
+    files_modified: tuple[str, ...]
+    report_path: str | None
+
+    def __post_init__(self) -> None:
+        # every string field, uniformly -- see D-7.3' consequence 2
+        for name, value in _relay_string_fields(self):
+            text, _, reason = run_logging.safe_embedded_text(value, redact=False)
+            if text is None:
+                raise RelayRefusal(
+                    f"{name}: unredacted text may not enter a RelayRequest ({reason})")
+        if len(self.subject.encode("utf-8")) > RELAY_MAX_SUBJECT_BYTES:
+            raise RelayRefusal("subject: over cap after redaction")
+        if len(self.body.encode("utf-8")) > RELAY_MAX_BODY_BYTES:
+            raise RelayRefusal("body: over cap after redaction")
+
+
+def relay_validate(request: dict, credential: RelayCredential
+                   ) -> tuple[RelayRequest, tuple[dict[str, int], ...]]:
+    """The enforcement point. Returns a redacted RelayRequest and the redaction counts,
+    or raises RelayRefusal. Pure -- no I/O, no subprocess. Every rule in D-7.3's table is
+    applied here and NOWHERE else. This is the ONLY call site of run_logging.redact_text()
+    in review_isolation.py (T-11.12)."""
+
+
+def relay_build_argv(request: RelayRequest, credential: RelayCredential, *,
+                     orca: str = "orca") -> list[str]:
+    """Pure. Accepts ONLY a RelayRequest; a mapping raises TypeError. Injects --from,
+    --dispatch-capability, --task-id and --dispatch-id from the credential. Performs no
+    redaction, because by its signature there is nothing left to redact."""
+```
+
+`relay_serve()`'s loop, per outbox `*.json` in `st_mtime` order, in this and only this order:
+
+```
+stat()  → size > RELAY_MAX_REQUEST_BYTES ? refuse
+json.loads(bytes)
+relay_validate(request, credential)   → (RelayRequest, redactions)     # the one redact_text() call
+relay_build_argv(relay_request, credential, orca=orca)                 # raw is out of scope here
+subprocess.run(argv)
+append a record to control/RELAY_LOG.json
+os.unlink(<the request file>)          # ALWAYS, including on RelayRefusal
+```
+
+The `unlink` is unconditional and is part of the contract: the raw request file is the only place
+the raw text ever existed, and it does not outlive the message. (`teardown()` would remove it with
+the session anyway; the unlink makes the window a message, not a session.)
+
+`RELAY_LOG.json`'s per-message record, corrected from D-7.8:
+
+```json
+{"seq": 1, "type": "heartbeat", "argv_shape": [["--subject", 84], ["--body", 96], …],
+ "subject": "<the REDACTED subject>", "body": "<the REDACTED body>",
+ "redactions": [{"category": "absolute_local_path", "count": 1}],
+ "redaction_applied": true, "cli_rc": 0, "message_id": "msg_…",
+ "delivered": true, "refused": null}
+```
+
+Two corrections to iteration 4's shape, both from M-12b: `redactions` carries `redact_text()`'s
+actual second return value rather than only a boolean; and the recorded `subject`/`body` are
+`RelayRequest` fields, which by the type's invariant cannot be raw. `argv_shape` records flag names
+and **redacted** value lengths — never a value, and never a *raw* length, because a raw length next
+to redacted text is the localization leak `redact_text()`'s own docstring refuses to create.
+
+`ISOLATION.json`'s `relay` block is unchanged from D-7.8 except that `redaction_applied: true` is
+now a statement about a type invariant rather than about a step, and one field is added next to it:
+
+```json
+"redaction_enforced_by": "RelayRequest.__post_init__ (D-7.3'); relay_build_argv() accepts no other type"
+```
+
+### Error Handling / Compatibility
+
+* `RelayRefusal` from `__post_init__` is handled exactly as `RelayRefusal` from `relay_validate()`
+  already is (D-7.8, unchanged): recorded in `RELAY_LOG.json` with its reason, request discarded,
+  **not** retried, **not** exit 4 — the relay is detached and its exit code reaches nobody.
+* `TypeError` from `relay_build_argv()` is a **programming error, not a request error**, and is
+  deliberately not caught: it can only be raised by a future code change that tries to reintroduce
+  the F-601 defect, and it must fail loudly in CI rather than be logged as a refusal.
+* New refusal reasons, all fail-closed: `over cap after redaction`,
+  `request file over RELAY_MAX_REQUEST_BYTES`, and the per-field
+  `<field>: unredacted text may not enter a RelayRequest (redaction_residue)`.
+* **No compatibility surface moves.** `relay_validate()`, `relay_build_argv()`, `RelayRequest` and
+  `RELAY_MAX_REQUEST_BYTES` are all new in this change set; nothing shipped is retyped.
+  `ISOLATION.json` stays at `1.2` — `redaction_enforced_by` is an additive field inside the `relay`
+  block that `1.2` introduces, so it is part of the same additive bump, not a second one.
+  `wrap_command(relay=False)`, `LaunchLineTests`, `run_probes()`, NEG-1…NEG-8, `teardown()` and
+  D-I are all untouched.
+* `.gitattributes` compatibility: the new rules are a **strict narrowing** of iteration 4's proposal
+  and a **widening** of what is on disk today (one rule). M-13f measures that all 25 real
+  `repatriate()`-shaped paths in the repository become exempt and the one hand-renamed path does
+  not; M-13h measures that the hand-renamed path has no trailing-whitespace line, is already
+  committed, and is already unexempted today — so nothing regresses.
+
+### Expected Changed Files / Implementation Steps
+
+Deltas to iteration 4's list; the rest of that list stands.
+
+1. `scripts/review_isolation.py` — add `RELAY_MAX_REQUEST_BYTES`, `RELAY_REQUEST_KEYS`,
+   `RelayRequest` (with `__post_init__`) and `_relay_string_fields()`; `relay_validate()` returns
+   `(RelayRequest, redactions)`; add `relay_build_argv()`; `relay_serve()` uses the five-step loop
+   above and **contains no `redact_text()` call**; `RELAY_LOG.json`'s record shape;
+   `build_attestation()`'s `redaction_enforced_by`.
+2. `.gitattributes` — replace its contents with **D-A.6″'s** block, verbatim, comments included.
+3. `scripts/test_run_logging.py` — `GITATTRIBUTES_RULES` becomes the **seven**-tuple below, and the
+   new `git check-attr` match-set test is added next to the renamed fixed-list test:
+   ```python
+   GITATTRIBUTES_RULES = (
+       "artifacts/runs/*/final_review_audit/**/report.md -whitespace",
+       "artifacts/runs/*/FINAL_REVIEW.md -whitespace",
+       "artifacts/runs/*/FINAL_REVIEW_iteration[2-9].md -whitespace",
+       "artifacts/runs/*/FINAL_REVIEW_iteration[1-9][0-9].md -whitespace",
+       "artifacts/runs/*/final_review_workspace/** -whitespace",
+       "artifacts/runs/*/final_review_workspace_iteration[2-9]/** -whitespace",
+       "artifacts/runs/*/final_review_workspace_iteration[1-9][0-9]/** -whitespace",
+   )
+   ```
+   The renamed test's message drops "three": *"D-A.6″ allows exactly these scoped rules, in this
+   order; a broadened pattern, a reordering, or a rule for a shape `repatriate()` does not generate
+   is a design violation."*
+4. `scripts/test_review_isolation.py` — `RelayChannelTests` gains T-11.10…T-11.12 below; T-11.4's
+   positive half is restated against `relay_build_argv()`.
+5. The isolated-dispatch preamble template — unchanged from D-7.6.
+
+### Testing Strategy
+
+Three new cases in `RelayChannelTests` and one new case in
+`RetainedReportWhitespaceExemptionTests`. T-11.1…T-11.9 stand as iteration 4 wrote them, with
+T-11.4's positive half restated.
+
+| id | asserts |
+|---|---|
+| **T-11.10** | **the F-601 test the review asked for, end to end.** Build a real session, `install_relay()`, and enqueue a `worker_done` whose `subject` and `body` contain a **real P-PATH-rejected spelling**: the current `os.getlogin()`-derived `/Users/<name>/…` path, the session's own absolute `frv_iso_*` path, and a `dcap_`-shaped literal. Run `relay_serve(once=True)` with `orca` pointed at a recording stub. Then assert **four** things: (a) the stub's recorded argv contains the redacted spelling and **not** the raw one; (b) neither raw substring occurs in any byte of `control/RELAY_LOG.json`; (c) after the run, a recursive byte-grep for the raw substrings over the **entire session tree** — `review_root`, `tmp`, `home`, `outbox`, `control`, `relay` — finds them nowhere, which is what makes the unconditional `unlink` load-bearing rather than tidy; (d) the same grep over the repatriated `artifacts/runs/<run>/FINAL_REVIEW_RELAY*.json`. The raw value must be reachable from nothing the run leaves behind. |
+| **T-11.11** | **the boundary is structural, not ordered.** `relay_build_argv(<a plain dict>, credential)` raises `TypeError` (M-12c). `RelayRequest(subject=<raw /Users/… text>, …)` raises `RelayRefusal` (M-12d); likewise for a raw `body` (M-12e) and a raw absolute `report_path` (M-12f) — i.e. constructing the argv-bearing type from unredacted text fails **without `relay_validate()` being involved at all**. And a `subject` under `RELAY_MAX_SUBJECT_BYTES` raw that exceeds it redacted is refused with the `over cap after redaction` reason (M-12g). |
+| **T-11.12** | **the order cannot regress silently.** Source-level: `run_logging.redact_text` appears exactly **once** in `scripts/review_isolation.py`, and it is inside `relay_validate()`; `relay_serve()`'s body contains no `redact_text` and no `redact` identifier. Behavioural: monkeypatch `relay_build_argv` to record its argument's type and assert `relay_serve()` only ever passes a `RelayRequest`. A grep-only assertion would be brittle alone and a behavioural one alone would miss a reintroduced second call site; both together pin it. |
+| **T-12** | **the `.gitattributes` match set, by real `git check-attr`** — the assertion F-602 says a fixed-list comparison can never make. In a `tmp_path` `git init` checkout seeded with the repository's real `.gitattributes`, run `git check-attr whitespace --stdin` over a fixed inventory and assert per path: **T-12.1 positives** — the nine M-13a shapes are `unset`; **T-12.2 negatives** — `FINAL_REVIEW_secret.md`, `final_review_workspace_backup/DIFF.patch`, `FINAL_REVIEW_iteration3_voided_ctx_55d1c349a3e5.md` and its workspace spelling are `unspecified`; **T-12.3 numeric near-misses and the stated bound** — `_iteration0`, `_iteration1`, `_iteration01`, `_iteration` and `_iteration100` are `unspecified`, with `_iteration100` carrying a comment naming D-A.6″'s undermatch paragraph so a future reader knows it is asserted deliberately, not by accident; **T-12.4 unexempted destinations** — the four JSON/`.md` M-13e paths and `artifacts/FINAL_REVIEW_something.md` are `unspecified`. The positive list is derived in the test from `repatriate()`'s own suffix expression, so a future change to that expression breaks the test rather than drifting past it. |
+
+`test_the_gitattributes_rules_are_exactly_the_ones_designed` (the ordered fixed-list comparison) is
+**kept**, not replaced: it refuses a broadened pattern that T-12's inventory happens not to probe,
+and T-12 refuses a pattern that is copied correctly but means something wider than intended. Neither
+subsumes the other, which is exactly the F-602 lesson.
+
+No change to `test_the_whitespace_gate_passes_over_the_whole_os22_range`,
+`test_every_retained_artifact_still_matches_its_recorded_digest`, `HARD_BREAK_REPORT_DIGEST` or
+`HARD_BREAK_REPORT_BYTES`.
+
+### Risks / Open Issues
+
+* **RK-16 is strengthened, not closed.** Mitigation (2) becomes structural (D-7.3′) and the caps now
+  bound the value that is actually sent (M-12g). The residual is unchanged and still named: the Run
+  mailbox is not covered by `B3`'s P-PATH grep, so the guarantee is "what the relay sends is
+  residue-free under `redaction/1.1`", not "the mailbox is audited". A category the shipped policy
+  does not know about is a policy gap, and the relay inherits it — which is the correct place for it
+  to live, since inventing a second policy here is precisely what iterations 4 and 5 both refused.
+* **RK-18 (new) — the post-redaction cap can refuse a message whose raw form was in budget.**
+  M-12g's 197 → 2177 expansion is the worst case (dense minimal absolute paths, ~15×). A
+  `worker_done` refused this way settles nothing, and the Coordinator learns it from the Dispatch
+  timeout plus `FINAL_REVIEW_RELAY.json`'s recorded reason rather than from a fast failure. Bounded
+  by: realistic prose does not approach the ratio (M-12a measured +22 bytes on a real subject); the
+  shim may pre-check the raw length for an early error message (D-7.4 permits an early reject for a
+  good message, and forbids only enforcement living *only* there); and the refusal is explicit and
+  logged, never silent. Accepted as the cost of bounding what reaches the mailbox.
+* **RK-19 (new) — `.gitattributes` undermatches above attempt 99.** Stated in full in D-A.6″ with
+  its three justifications and pinned by T-12.3. The failure direction is a loud gate failure on a
+  legitimate file, never a silent exemption. Fixed by adding one rule pair as a DESIGN change if a
+  pipeline ever legitimately reaches three-digit attempts.
+* **The `.gitattributes` invariant is the match set, not the rule count.** A rule may be added only
+  for a shape `repatriate()` generates; the fixed-list test and T-12 together are the mechanism, and
+  the comment block in the file says so.
+* **F-502 is untouched and still blocking**, exactly as iteration 4 left it.
+* **Not reopened:** F-501's option (c), `B1` preservation, the probe ordering, F-401, F-402, D-H.2,
+  RK-7, mandatory pass B (D-5.1), D-I, D-6.0…D-6.9, `COMPATIBILITY.md`, O-2 and O-3. **O-1 remains
+  closed by D-7.** RK-1…RK-15 and RK-17 stand unchanged.
