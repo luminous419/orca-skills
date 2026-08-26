@@ -2249,6 +2249,24 @@ class AttemptDomainTests(_IsolationTestCase):
             "a refused attempt must leave no run directory behind",
         )
 
+    def sessions_under_base(self) -> set:
+        """Where `isolate(session_base=self.base)` would ACTUALLY put a session.
+
+        F-1001: this glob used to run over `tempfile.gettempdir()`. `build_session()`
+        creates the session as a direct child of the `session_base` it is handed
+        (`review_isolation.py`, `tempfile.mkdtemp(prefix=SESSION_PREFIX, dir=str(base))`),
+        so a bare-temp-dir glob observed a directory the call under test never writes to
+        and the assertion could not fail -- moving GATE 2 after `build_session()` left it
+        green. The glob has to follow the `session_base` actually passed in.
+        """
+        return set(self.base.glob(f"{review_isolation.SESSION_PREFIX}*"))
+
+    def assertNoSessionBuilt(self, before: set) -> None:
+        self.assertEqual(
+            self.sessions_under_base(), before,
+            "a session is expensive to build and must not be built on a bad argument",
+        )
+
     # ---- T-13.1 -------------------------------------------------------------------
 
     def test_t131_repatriate_refuses_zero_and_negatives_and_creates_nothing(self) -> None:
@@ -2267,9 +2285,7 @@ class AttemptDomainTests(_IsolationTestCase):
                 self.assertNothingCreated()
 
     def test_t131_isolate_refuses_zero_and_negatives_and_builds_no_session(self) -> None:
-        before = set(Path(tempfile.gettempdir()).glob(
-            f"{review_isolation.SESSION_PREFIX}*"
-        ))
+        before = self.sessions_under_base()
         for attempt in self.OUT_OF_RANGE:
             with self.subTest(attempt=attempt):
                 with self.assertRaises(
@@ -2282,14 +2298,15 @@ class AttemptDomainTests(_IsolationTestCase):
                 self.assertEqual(
                     str(caught.exception), f"attempt must be >= 1, got {attempt!r}"
                 )
-                self.assertNothingCreated()
-        self.assertEqual(
-            set(Path(tempfile.gettempdir()).glob(
-                f"{review_isolation.SESSION_PREFIX}*"
-            )),
-            before,
-            "a session is expensive to build and must not be built on a bad argument",
-        )
+                # Per attempt, so a leak names the value that leaked. NOT
+                # `assertNothingCreated()`: that checks `self.base / "artifacts"`, which
+                # `isolate()` never creates -- its artifacts land under
+                # `<session>/review_root/artifacts/`, so the check was inert here for the
+                # same root cause as the old glob (F-1001). The session glob below is the
+                # complete evidence: a session directory is the ONLY thing `isolate()`
+                # writes into `self.base`.
+                self.assertNoSessionBuilt(before)
+        self.assertNoSessionBuilt(before)
 
     # ---- T-13.3 -------------------------------------------------------------------
 

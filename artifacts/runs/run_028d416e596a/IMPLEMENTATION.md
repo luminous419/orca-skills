@@ -93,7 +93,7 @@ artifacts/runs/run_028d416e596a/IMPLEMENTATION.md   (new, this report)
 
 | id | class / file | what it pins |
 |---|---|---|
-| **T-13.1** | `AttemptDomainTests` (`test_review_isolation.py`) | `repatriate()` and `isolate()` refuse `0`, `-1`, `-12` with `"attempt must be >= 1, got <repr>"` **and create nothing** — no `artifacts/` under the tmp base, and no new session directory (the half a bare `assertRaises` would miss; M-14 measured the shipped code creating the run directory before it looked at `attempt`) |
+| **T-13.1** | `AttemptDomainTests` (`test_review_isolation.py`) | `repatriate()` and `isolate()` refuse `0`, `-1`, `-12` with `"attempt must be >= 1, got <repr>"` **and create nothing** — for `repatriate()`, no `artifacts/` under the tmp base; for `isolate()`, no new session directory under the `session_base` it was handed (the half a bare `assertRaises` would miss; M-14 measured the shipped code creating the run directory before it looked at `attempt`). **Corrected in iteration 3** — the `isolate()` half observed the wrong directory until then (F-1001) |
 | **T-13.3** | same | (a) `False`, `True`, `2.0`, `"2"`, `None` refused at both function boundaries with `"must be an int >= 1"`, bools named with the M-14 citation; (b) `abc`/`1.5`/`0x2`/`1e3` at the CLI still exit **2** with `invalid int value`, commented as pre-existing and deliberate (D-A.7.5); (c) `001`/`+2`/`1_0`/` 3 ` parse to `1`/`2`/`10`/`3` and are accepted |
 | **T-13.4′** | same | the census made executable, **corrected**: D-A.7's reachability clause about `build_attestation()` is deleted. AST-level, the gate is the **first** statement of `repatriate()`, `isolate()`, `build_attestation()`, `final_review_report_ladder_path()`, `read_final_review_attempt_provenance()` and `final_review_artifact_path()`; `review_isolation` still declares no `__main__`, no `import argparse`, no `main()`; and the two `run_logging.py` copies are **byte-identical** (C-10 / RK-22's second tripwire) |
 | **T-13.5** | same | `attempt ∈ {1,2,3,9,10,42,99,100}` returns M-18's exact destinations and `report_digest == sha256_path(source)`. `100` is in the list for D-A.7.2's reason |
@@ -296,3 +296,133 @@ Result: PASS (no regression; the one test that governs this file's rule passes).
 * No non-blocking findings were filed. RK-19 and RK-21 remain open and deliberately unaddressed, as
   recorded in iteration 1, along with the note that D-A.6″'s seven-rule `.gitattributes` block is
   not implemented in this tree.
+
+---
+
+## IMPLEMENTATION iteration 3 -- correction for F-1001
+
+### Summary
+
+**Option (a): the assertion was made live, and the fix was proved by re-running the exact mutation
+that exposed it.** F-1001 is a missing-evidence defect, not a correctness defect -- GATE 2 itself is
+right -- so the smaller and more valuable correction is the one that actually closes the evidence
+gap rather than the one that documents it away. Option (b) would have left GATE 2's no-side-effect
+property resting on T-13.4' alone; the AST census pins *where the gate is written*, which is a
+weaker statement than *no session was built*, since the census cannot see a gate that is
+first-in-source but skipped or short-circuited at run time. Two independent kinds of evidence for
+one invariant is the point of having both tests, so the corrected runtime assertion is worth more
+than an accurate disclaimer.
+
+Root cause, single and shared by both inert checks: **the test observed a directory the call under
+test never writes to.** `test_t131_isolate_...` passes `session_base=self.base`, and `build_session()`
+does `tempfile.mkdtemp(prefix=SESSION_PREFIX, dir=str(base))` (`scripts/review_isolation.py:1896-1897`)
+-- so the session is a direct child of `self.base`. The test globbed
+`Path(tempfile.gettempdir())` instead, which the call never touches when a `session_base` is
+supplied. The companion `assertNothingCreated()` checks `self.base / "artifacts"`, but `isolate()`'s
+artifacts land at `<session>/review_root/artifacts/`, so it was inert in this test for the same
+reason.
+
+This is a **test-file-only** change plus this report. No production gate, shared predicate, exception
+facade, Skill mirror, `.gitattributes` line, or any other test file or test class was touched.
+
+### Changes
+
+1. `scripts/test_review_isolation.py`, `AttemptDomainTests` -- two new helpers next to
+   `assertNothingCreated()`:
+   * `sessions_under_base()` -- `set(self.base.glob(f"{review_isolation.SESSION_PREFIX}*"))`, i.e.
+     the glob follows the `session_base` actually passed in. Its docstring records F-1001 so the
+     next reader cannot re-derive the bare-temp-dir spelling.
+   * `assertNoSessionBuilt(before)` -- asserts that set is unchanged, keeping the original
+     "a session is expensive to build and must not be built on a bad argument" message.
+2. `test_t131_isolate_refuses_zero_and_negatives_and_builds_no_session`: `before` now comes from
+   `sessions_under_base()`; the per-attempt `assertNothingCreated()` inside the loop is **replaced**
+   by `assertNoSessionBuilt(before)` (checked per attempt, so a leak names the value that leaked),
+   and the trailing aggregate assertion is the same helper.
+3. The now-redundant `assertNothingCreated()` call was **dropped from this test only**, with an
+   inline comment giving the reason: the corrected glob is complete evidence, because a session
+   directory is the only thing `isolate()` writes into `self.base`.
+
+**Explicitly unchanged:** `assertNothingCreated()` itself and its use in
+`test_t131_repatriate_refuses_zero_and_negatives_and_creates_nothing` -- there it is **live**, since
+`repatriate(base=self.base)` really does create `self.base / "artifacts" / runs / ...`, and the
+iteration-2 TEST phase confirmed by relocation that removing GATE 1's ordering breaks it (3 failed).
+Also unchanged: the `tempfile` import (still used by `_IsolationTestCase.setUp`), every other test in
+the class, and all seven production gates.
+
+4. `artifacts/runs/run_028d416e596a/IMPLEMENTATION.md`, the T-13.1 row of "Added / Modified Tests":
+   the "and create nothing" claim now attributes each half to the call it actually covers
+   (`artifacts/` for `repatriate()`, no session directory under the supplied `session_base` for
+   `isolate()`) and records that the `isolate()` half was corrected in this iteration.
+
+### Modified Files
+
+| file | change |
+|---|---|
+| `scripts/test_review_isolation.py` | `AttemptDomainTests`: 2 helpers added; T-13.1's `isolate` test rewired onto them |
+| `artifacts/runs/run_028d416e596a/IMPLEMENTATION.md` | T-13.1 coverage row corrected + this appended section |
+
+### Unit Tests
+
+**1. The mutation proof -- the fix works, rather than merely looking more correct.** A throwaway
+detached worktree at HEAD (`378d0ce`), in which GATE 2 was moved out of `isolate()`'s first
+statement to immediately after `build_session(...)` and nothing else changed:
+
+```
+git worktree add --detach <scratch>/f1001_mutant HEAD          # 378d0ce
+# scripts/review_isolation.py:2699 removed, re-inserted at 2716 as
+#   attempt = assert_attempt_in_domain(attempt)  # MUTANT: GATE 2 relocated
+# git diff --stat -> scripts/review_isolation.py | 2 +-  (1 insertion, 1 deletion)
+
+# (i) the ORIGINAL test on the mutant, reproducing F-1001:
+python3 -m pytest scripts/test_review_isolation.py -q -k 't131_isolate'
+  -> 1 passed, 122 deselected, 1 warning, 3 subtests passed in 0.28s, exit 0   # INERT
+
+# (ii) the CORRECTED test on the same mutant:
+python3 -m pytest scripts/test_review_isolation.py -q -k 't131_isolate'
+  -> 4 failed, 122 deselected in 0.36s, exit 1
+     SUBFAILED(attempt=0), SUBFAILED(attempt=-1), SUBFAILED(attempt=-12), plus the aggregate
+     AssertionError: Items in the first set but not the second:
+       PosixPath('/var/folders/.../tmpumtlzwqk/frv_iso_v35p49dc')
+       PosixPath('/var/folders/.../tmpumtlzwqk/frv_iso_gm50_i1n')
+       PosixPath('/var/folders/.../tmpumtlzwqk/frv_iso_pixyspfq')
+       : a session is expensive to build and must not be built on a bad argument
+```
+
+Same mutant, same command, same commit: green before the fix, red after it, and red once per
+out-of-range value. The three leaked directories are the real sessions the relocated gate allowed
+`build_session()` to create -- the exact side effect the assertion claims to forbid. The worktree
+was then removed (`git worktree remove`/`prune`); the mutant is not committed anywhere.
+
+**2. The corrected test on the unmodified tree:**
+
+```
+python3 -m pytest scripts/test_review_isolation.py -q -k 't131_isolate'
+  -> 1 passed, 122 deselected, 3 subtests passed in 0.04s, exit 0
+```
+
+**3. The whole owning suite, for regression:**
+
+```
+python3 -m pytest scripts/test_review_isolation.py -q
+  -> 123 passed, 90 subtests passed in 463.20s (0:07:43), exit 0
+```
+
+No failures, and in particular T-13.4' (the AST first-statement census) and the `repatriate()` half
+of T-13.1 are unaffected. The two known pre-existing `RetainedReportWhitespaceExemptionTests`
+failures live in `scripts/test_run_logging.py`, which this change does not touch and which the
+iteration-2 TEST phase already reproduced on an unmodified baseline worktree at `8411cce`.
+
+Result: PASS.
+
+### Review Feedback Resolution
+
+* **F-1001 (MAJOR / G5 / BLOCKING) -- RESOLVED via option (a).** The session snapshot now globs
+  `self.base` rather than `tempfile.gettempdir()`, is checked per attempt as well as in aggregate,
+  and the inert `assertNothingCreated()` call was dropped from the `isolate()` test (kept, because
+  live, in the `repatriate()` test). The Required Action's proof obligation is discharged above: the
+  same GATE 2 relocation that left the old assertion green now fails the corrected one.
+* TEST.md's non-blocking notes N-1 through N-5 were **not** acted on -- explicitly out of scope for
+  this correction, per the task boundary.
+* Nothing on the do-not-reopen list was touched: no production gate, shared predicate, exception
+  facade, Skill mirror, `.gitattributes`, sandbox mechanism, F-501 relay shim, F-601 redaction
+  ordering, evidence-bundle sanitization, D-6.x, pass B, D-I, VERSION, or LICENSE-DECISION.md.
