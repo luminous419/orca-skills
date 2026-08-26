@@ -452,7 +452,8 @@ Everything else that must be readable, admitted **only** as an exact path and al
 |---|---|---|
 | **A — name** | walk the root; any file whose basename is `answer_key.json`, or whose path contains a component named `key` or `adjudications` **under a directory that also contains a `subject/`** | a fixture tree is reachable |
 | **B — content** | `scan_leak(key, [root])` — the existing D.6 token/shingle/expected-count scan, no exclusions | key material is reachable |
-| **C — key digest** | any file whose sha256 equals the answer key file's sha256 | a renamed copy is reachable |
+| **C — key digest** | any file whose sha256 equals the answer key file's sha256. **Size prefilter (iteration 4):** a file whose `st_size` differs from the key file's byte length can never have the key's sha256, so only size-matching files are opened and hashed. This is an *equivalence*, not an approximation — it detects exactly the set the unfiltered pass detects — and it is what makes pass C affordable over a Class IMM root. | a renamed copy is reachable |
+| **S — escaping symlink** | a symlink whose realpath leaves the root — an allowed read path the walk did not cover. **Class USR only** (recorded here in iteration 4 to match what ships): for a Class IMM root the *profile* is the evidence, seatbelt evaluates the resolved target, so such a link reaches the target's own class or is denied on the target's own terms. | the scan did not cover an allowed read path |
 | **D — archive members** | for every `*.tar`, `*.tar.gz`, `*.tgz`, `*.zip` under the root, list members with `tarfile`/`zipfile` (**names only — members are never extracted and never read**) and match member names by pass A's rule | a packaged copy is reachable (this is what catches `dist/orca-skills-*.tar.gz`) |
 
 A hit in any pass is a **hard failure** (exit 4) with the offending path printed. There is
@@ -461,8 +462,8 @@ that root and re-run the pre-flight probe. Pass D reads only the archive's index
 unreadable or malformed it counts as a hit, because an archive whose contents cannot be enumerated
 cannot be certified clean.
 
-Class IMM roots are **not** content-scanned, and the justification is now the proof rather than an
-assertion about the root directory: G.3.1's I-1…I-6 establish that no unprivileged process can
+Class IMM roots are **not** content-scanned *at session-build time*, and the justification is now
+the proof rather than an assertion about the root directory: G.3.1's I-1…I-6 establish that no unprivileged process can
 create or overwrite readable content anywhere in the subtree, so there is nothing a scan could
 find that the proof allows to exist. `ISOLATION.json` records, per root, the full proof counters
 (directories walked, files walked, writable directories, writable regular files, boundaries found,
@@ -472,6 +473,15 @@ or dropped. The residual limitation is now precisely one sentence: *the proof is
 session-build time against the run user's own privileges, so it does not bind a privileged
 (root) writer* — and that writer is outside the G.1 threat model. That sentence, and nothing
 broader, is what `ISOLATION.json.limitations[]` carries.
+
+**Iteration 4 (IMPLEMENTATION review F-001).** "Not content-scanned at session-build time" is
+not the same statement as "never content-scanned". NEG-5 re-runs the scan **from inside the
+sandbox**, and there its job is precisely *not* to trust this classification — that is what makes it
+the check F-001 would have failed. G.9's NEG-5 row therefore runs passes **A, C, D** over each Class
+IMM root: the proof bounds what an unprivileged process can *write* into the subtree, it says
+nothing about what is *already there*, and pass C under the size prefilter above costs a walk. Pass
+B remains the one pass Class IMM does not run, and `## DESIGN iteration 4` records exactly what that
+gives up and why.
 
 Bounding: pass A/B/C walks skip nothing and follow no symlinks (`os.walk(..., followlinks=False)`),
 and every symlink encountered whose realpath escapes the root is itself a hit — an escaping symlink
@@ -788,7 +798,7 @@ tested in CI and re-proved at every capture.
 | **NEG-2** | Inside the sandbox: `open(<key abs path>)`, `open(<adjudications file>)`. | both raise `PermissionError` |
 | **NEG-3** | Inside the sandbox: `os.path.exists(<key abs path>)`, `os.stat`, `os.listdir(<key dir>)`, `os.listdir(<repo root>)`. | `exists` is `False`; the other three raise `PermissionError` — *discovery*, not just reading, is blocked |
 | **NEG-4** | Inside the sandbox: `git -C <repo> show HEAD:scripts/fixtures/final_review_eval/key/answer_key.json`; `git -C <repo> grep seeded_defects`; `tar -tzf <repo>/dist/*.tar.gz`. | all exit non-zero and none prints key content |
-| **NEG-5** | The G.3 readable-set scan over **every admitted root, IMM and USR alike**, re-run from inside the sandbox using only paths the profile permits. (Iteration 1 re-scanned Class USR only, which is why it could not have caught F-001.) | zero hits in passes A–D |
+| **NEG-5** | The G.3 readable-set scan over **every admitted root, IMM and USR alike**, re-run from inside the sandbox using only paths the profile permits. (Iteration 1 re-scanned Class USR only, which is why it could not have caught F-001.) **The pass set is per class, decided in iteration 4 and stated rather than left to IMPLEMENTATION:** Class USR gets **A, B, C, D, S**; Class IMM gets **A, C, D** — the two walk passes plus the key-digest pass, which is run under the size prefilter of G.3.3 and is therefore walk-cost. Pass **B is deliberately not run over Class IMM**, and pass **S is Class-USR-only**; both reductions are justified in `## DESIGN iteration 4`. The per-root pass list is recorded in the NEG-5 probe record. | zero hits in every pass the root's class runs |
 | **NEG-6** | Profile integrity: `sha256(scope.sb)` equals `ISOLATION.json.profile_digest`, and the profile parses (`sandbox-exec -f scope.sb /usr/bin/true` exits 0). | both hold |
 | **NEG-7** | **The writable-descendant probe (iteration 2, F-001).** Plants, in the current user's *resolved* mutable roots, (a) a byte-identical copy of the answer key and (b) a second file carrying the fixture's real seeded-defect identity strings. Then runs `open`, `os.path.exists`, `os.stat`, `os.listdir` on the plant and on its parent, `os.listdir` on the temp root itself, `/bin/cat`, `/bin/ls`, `/usr/bin/find -name answer_key.json`, `/usr/bin/grep -rl <key content marker>`, a read through a **symlink placed inside `review_root` pointing at the plant**, and a read through the plant's `/System/Volumes/Data` alias. | **every one is denied**: `open`/`stat`/`listdir`/`cat`/`ls` raise `PermissionError` or exit non-zero, `os.path.exists` returns `False`, and `find`/`grep` produce **no stdout** |
 | **NEG-8** | **Alias probe.** For every denied root and every carve-out, the same read/stat/list battery through each alias spelling derived from the mount table and `/usr/share/firmlinks` — in particular `/System/Volumes/Data<path>`. | all denied, exactly as the canonical spelling is |
@@ -868,15 +878,40 @@ Steps, in order:
 
 1. `candidate, redactions = redact_text(raw)` when `redact` is true; otherwise
    `candidate, redactions = raw, ()`.
-2. **Residue check (fixed point).** `again, extra = redact_text(candidate)`. Require
-   `again == candidate` **and** `extra == ()`. Because category 5 (`foreign_absolute_path`) matches
-   *every* absolute POSIX path with no minimum segment count and replaces it whole, and category 4
-   owns the three home spellings, a fixed point means **no absolute path, no `dcap_…`, no
-   `scheme://user:pass@`, and no `SECRET`/`TOKEN`/`PASSWORD`/`API_KEY`-named environment assignment
-   survives**. That is a closed statement over the policy's own categories, not an inspection.
+2. **Residue check — every residual match is already its own output.**
+
+   > **Corrected in iteration 4 (IMPLEMENTATION review F-001/F-002).** The iteration-1 rule read
+   > *"`again, extra = redact_text(candidate)`; require `again == candidate` **and**
+   > `extra == ()`"*. The second clause is **not a stricter version of the intended property; it
+   > is a different property**, and `redaction/1.1` cannot satisfy it on exactly the inputs this
+   > gate exists for. See `## DESIGN iteration 4` for the derivation and the measured
+   > counterexamples.
+
+   For every `(name, pattern, replacement)` in `REDACTION_CATEGORIES`, in policy order, **every**
+   match `m` of `pattern` in `candidate` must satisfy `m.expand(replacement) == m.group(0)`. In
+   words: the second pass may still *recognise* text, but it must have nothing left to *remove*.
+   This is the whole security statement, and it is decided per match rather than by comparing two
+   whole strings, so no combination of matches elsewhere in the text can mask one that removed
+   something.
+
+   `again == candidate` is an immediate consequence (a substitution whose every replacement equals
+   its own span cannot change the string), so the text fixed point does not need to be asserted
+   separately — but asserting it costs nothing and IMPLEMENTATION may keep it as a redundant
+   check.
+
+   Because category 5 (`foreign_absolute_path`) matches *every* absolute POSIX path with no
+   minimum segment count and replaces it whole, and category 4 owns the three home spellings,
+   satisfying this rule means **no absolute path, no `dcap_…`, no `scheme://user:pass@`, and no
+   `SECRET`/`TOKEN`/`PASSWORD`/`API_KEY`-named environment assignment survives in a form the
+   policy could still remove**. That is a closed statement over the policy's own categories, not
+   an inspection.
+
    Verified for the concrete cases: `/Users/<u>/x/y`, `/private/tmp/claude-501/foo`, `/luminous`,
-   `file:///Users/<u>/a`, `AWS_SECRET_ACCESS_KEY=…`, `https://u:p@h/p`, `dcap_…` are all fixed
-   points after one pass, and `<REPO>/scripts/x.py` is untouched.
+   `file:///Users/<u>/a`, `AWS_SECRET_ACCESS_KEY=…`, `https://u:p@h/p`, `dcap_…` all satisfy the
+   rule after one pass, and `<REPO>/scripts/x.py` is untouched. Two of those seven —
+   `AWS_SECRET_ACCESS_KEY=…` and `https://u:p@h/p` — report `extra=(env_secret_pattern, 1)` and
+   `extra=(url_credential, 1)` respectively while removing nothing, which is why the deleted
+   `extra == ()` clause was unsatisfiable rather than merely strict.
 3. **Structure check (log only, `redact=True`).** `candidate.count("\n") == raw.count("\n")`, and
    for every line, `candidate` line's `|` count equals `raw` line's `|` count. Placeholders contain
    no `|` and no newline today; this makes a future policy that introduced one fail loudly instead
@@ -1154,13 +1189,13 @@ not only on the log object — a leak that moved to another key is still a leak.
 |---|---|---|
 | T-7.1 | `detail="artifact at /Volumes/ext/build/out.md"` (foreign absolute path) | the raw substring is absent from the serialized bundle; `redactions` reports `foreign_absolute_path ≥ 1`; `content_redacted` contains the placeholder |
 | T-7.2 | `detail="/Users/<user>/aiAssistedProjects/x"` (username-bearing path) | the user-name segment is absent; `/Users/<REDACTED:absolute_local_path>/aiAssistedProjects/x` present |
-| T-7.3 | `result="GITHUB_TOKEN=ghp_deadbeef…"` | `ghp_deadbeef…` absent; `env_secret_pattern ≥ 1` |
-| T-7.4 | `detail="https://user:hunter2@example.test/x"` | `hunter2` absent; `url_credential ≥ 1` |
+| T-7.3 | `result="GITHUB_TOKEN=ghp_deadbeef…"` | `ghp_deadbeef…` absent; `env_secret_pattern ≥ 1`; **the log is embedded, not omitted** — `content_redacted is not None` and `content_omitted_reason == ""`. *(iteration 4: this is one of the two rows the deleted `extra == ()` clause made unsatisfiable; the residual `env_secret_pattern` match on the second pass expands to itself and is therefore not residue.)* |
+| T-7.4 | `detail="https://user:hunter2@example.test/x"` | `hunter2` absent; `url_credential ≥ 1`; **the log is embedded, not omitted** — `content_redacted is not None` and `content_omitted_reason == ""`. *(iteration 4: the second of the two rows above; the residual `url_credential` match expands to itself.)* |
 | T-7.5 | `detail="dcap_AAAABBBBCCCC…"` | the literal absent; `orca_dispatch_capability ≥ 1` |
 | T-7.6 | a clean log | `redactions == []`, `content_redacted == raw`, `digest_post_redaction == digest_pre_redaction`, `content_omitted_reason == ""` |
 | T-7.7 | identity/auditability | `digest_pre_redaction == sha256(local file)` and `digest_post_redaction == sha256(redact_text(local file)[0])`, recomputed independently in the test |
-| T-7.8 | table structure | for every poisoned case, the embedded text has the same line count as the raw log and the same per-line `|` count |
-| T-7.9 | residue path (monkeypatched `redact_text` returning a non-fixed-point value) | `content_redacted is None`, `content_omitted_reason == "redaction_residue"`, `digest_pre_redaction` still present, `integrity["omitted_content"]` names the log, **and the export still returns a written path** |
+| T-7.8 | table structure | for every poisoned case, the embedded text has the same line count as the raw log and the same per-line `|` count. *(iteration 4: "the embedded text" presupposes every poisoned case is embedded — T-7.3/T-7.4 included — which the corrected H.2 step 2 makes true and the iteration-1 rule did not.)* |
+| T-7.9 | residue path. *(iteration 4: the monkeypatch target moves from `redact_text` to `REDACTION_CATEGORIES`, because the corrected step 2 iterates the category tuple directly and a stubbed `redact_text` would no longer drive it. Inject one synthetic category whose replacement does not expand to its own span — e.g. `("t", re.compile(r"ZZ_[A-Z]+"), "<REDACTED:t>")` — over a log containing `ZZ_LEAK`.)* | `content_redacted is None`, `content_omitted_reason == "redaction_residue"`, `digest_pre_redaction` still present, `integrity["omitted_content"]` names the log, **and the export still returns a written path** |
 | T-7.10 | residue in a retained `report.md` (written with a stub that bypasses redaction) | content omitted with reason; `digest_recorded`/`digest_recomputed` still present; export does not raise |
 | T-7.11 | the raw local log is untouched | its bytes and mtime-independent digest are identical before and after export |
 | T-7.12 | schema | `schema_version == "2.0"`, `component_versions.export_schema == "2.0"`, `"content" not in bundle["orchestrator_log"]` |
@@ -1269,7 +1304,7 @@ any artifact.
 | **RK-4** | The generated profile is too tight and the agent half-works — producing a *worse* review that gets mistaken for a detection signal. | The pre-flight probe runs the real agent command and `orca orchestration check` before any Task is dispatched, and B6's verdict is separate from the review's. Also: the baseline draws no detection conclusion at all, by design. |
 | **RK-5** | Someone reads `scope_enforcement: unenforced` as "isolated enough". | It is a distinct enum value, `S2` is `FAIL`, probes read `NOT_APPLICABLE_UNENFORCED` rather than `SKIP`, and B6 fails. Three independent places say the same thing. |
 | **RK-6** | A future contributor re-adds `content` to the bundle for convenience. | The key no longer exists; the H.1 rule is in the exporter docstring; T-7.12 asserts `"content" not in bundle["orchestrator_log"]`. |
-| **RK-7** | The residue check turns out not to be a fixed point for some real input, making every export omit the log. | Checked against the seven concrete shapes listed in H.2 step 2 (all fixed points). If a real non-fixed-point input appears, the correct response is a redaction-policy fix (a MINOR bump), not relaxing the check — stated here so the next contributor does not relax it. |
+| **RK-7** | The residue check turns out not to be satisfiable for some real input, making every export omit the log. | **Rewritten in iteration 4.** The iteration-1 cell described this as a hypothetical; it was already true, and the cell's own remedy contradicted *Explicitly not designed*. Both are fixed. (a) The class of input that actually triggered it — a category that re-matches its own placeholder — is **no longer residue at all** under the corrected H.2 step 2, because such a match expands to its own span. That is the whole of `env_secret_pattern` and `url_credential`, i.e. every observed instance. (b) For a genuine residue — a match that expands to *different* bytes — the designed response is the one already built and unchanged: the affected value is omitted with `content_omitted_reason: "redaction_residue"`, the digests are kept, `integrity.omitted_content[]` records it, and **the bundle is still written**. Nothing is blocked and no policy change is required to stay safe. (c) Closing such a gap in the policy itself is a **separate work package** under a `redaction/1.x` MINOR bump; it is out of this design's scope, which is what *Explicitly not designed* fences, and that fence is therefore intact. Relaxing the residue check is never the remedy. |
 
 ### Open issues — raised, not designed around
 
@@ -1598,3 +1633,440 @@ iterations 1 and 2. The only verification this iteration needs is documentary, a
   the one-word fix is "scanned" → "scanned or proven immutable". IMPLEMENTATION must apply D-I as
   written and must not "improve" it.
 * No other open issue is added. O-1…O-3, RK-1…RK-9 stand as written.
+
+---
+
+## DESIGN iteration 4 — correction for the IMPLEMENTATION review's F-001/F-002
+
+STATUS: COMPLETE
+
+### Summary / Requirements
+
+Two DESIGN decisions, both raised by the IMPLEMENTATION Worker as Findings rather than shipped
+silently, and both escalated by the IMPLEMENTATION Reviewer as blocking G1 violations:
+
+| review id | IMPLEMENTATION.md id | subject | decision |
+|---|---|---|---|
+| **F-002** | **F-101** | D-H.2 step 2's `extra == ()` residue clause | **The clause was never a correct formalization. Replaced** — not relaxed — by a *per-match* rule that is strictly stronger than the text equality the implementation shipped. |
+| **F-001** | **F-102** | NEG-5's reduced pass set over Class IMM roots | **Partly upheld, partly rejected.** Pass **C is required** over Class IMM roots — the reduction to A/D left exactly the gap the review names — but it is redefined with a size prefilter that makes it *walk-cost*. Pass **B stays out**, now as an explicit, justified decision with its residual named. |
+
+What this iteration changes, and nothing else:
+
+* **D-H**: H.2 step 2 (rewritten), T-7.3 / T-7.4 / T-7.8 / T-7.9 (reconciled), RK-7 (rewritten).
+* **D-G**: G.3.3's pass table (pass C gains the size prefilter; pass S is recorded), G.3.3's "not
+  content-scanned" paragraph (scoped to session-build time), G.9's NEG-5 row (per-class pass set).
+* **New**: T-7.13, T-7.14, T-8.4b, T-8.4c, T-9.5; RK-11, RK-12; one additive CLI flag.
+
+What this iteration does **not** touch, restated so a re-review does not have to re-derive it:
+
+* **Iteration 2's F-001 fix** — `prove_immutable()` I-1…I-6, the carve-outs, the removal of
+  `/private/var` and `/Library`, the closed metadata traversal set, NEG-7, NEG-8, T-9.9. Settled.
+* **Iteration 3's F-002 fix** — the single-authority D-I. **D-I is not touched**, `COMPATIBILITY.md`
+  is not touched, and `ISOLATION.json.limitations[]` keeps its single entry with its existing
+  wording. See "Error Handling / Compatibility" for why that entry already covers the one residual
+  this iteration creates.
+* The bundle schema (`2.0`), the five redaction categories, the exit-code table, the profile
+  clause order, the session layout, the baseline procedure.
+* **F-003 / F-103** (the two `RetainedReportWhitespaceExemptionTests` failures caused by trailing
+  whitespace in two committed DESIGN review reports) is not a design defect and is not addressed
+  here. It is a conflict between the `.gitattributes` exemption scope and an artifact the
+  Coordinator committed, and it belongs to whoever owns that commit.
+
+---
+
+### Current Architecture
+
+Everything below was re-derived on this host against the code as it stands at `cac283b`, not taken
+from the IMPLEMENTATION Worker's report.
+
+#### A. D-H.2 — what `extra == ()` actually asserts
+
+`redact_text()` applies five `(name, pattern, replacement)` triples in order. The question the
+residue check is trying to answer is *"is there anything left that this policy would still
+remove?"*. `extra == ()` answers a different question: *"is there anything left that this policy
+still **recognises**?"* Those two coincide only for a policy in which no placeholder can re-match
+its own producing pattern. `redaction/1.1` is deliberately not such a policy: categories 4 and 2
+and 3 are documented as *readability-preserving* — they keep a readable anchor and replace only the
+identifying part.
+
+Measured, by running each category's own placeholder output back through its own pattern:
+
+| # | category | replacement | can its output re-match its pattern? | why |
+|---|---|---|---|---|
+| 1 | `orca_dispatch_capability` | constant `<REDACTED:orca_dispatch_capability>` | **no** | the pattern is `\bdcap_[A-Za-z0-9_\-]{8,}`; the placeholder begins `<` |
+| 2 | `url_credential` | `\1://<REDACTED:url_credential>@` | **yes** | the anchor `scheme://…@` is preserved on purpose, and `<REDACTED` / `url_credential>` are a legal `user` / `pass` pair for the pattern |
+| 3 | `env_secret_pattern` | `\1\2<REDACTED:env_secret_pattern>` | **yes** | the anchor `KEY=` is preserved on purpose, and the value class `[^\s\n]+` matches the placeholder |
+| 4 | `absolute_local_path` | `\1<REDACTED:absolute_local_path>` | **no** | the `(?!<\|\{)` lookahead is exactly a guard against re-matching a placeheld segment |
+| 5 | `foreign_absolute_path` | constant `<REDACTED:foreign_absolute_path>` | **no** | the pattern requires a leading `/` and carries `(?!<)`; the placeholder has neither |
+
+So `extra` is non-empty *by construction* for any text that ever contained an
+`env_secret_pattern`-shaped assignment or a credentialed URL — and those are precisely the two
+things a sanitizer for an orchestrator log exists to remove. The two counterexamples reproduce
+exactly as IMPLEMENTATION.md F-101 reports them:
+
+```text
+'GITHUB_TOKEN=ghp_deadbeef1234'      -> 'GITHUB_TOKEN=<REDACTED:env_secret_pattern>'
+                                        again == candidate : True
+                                        extra              : (('env_secret_pattern', 1),)
+'https://user:hunter2@example.test/x' -> 'https://<REDACTED:url_credential>@example.test/x'
+                                        again == candidate : True
+                                        extra              : (('url_credential', 1),)
+```
+
+Run over the fifteen canonical shapes — H.2 step 2's own seven, T-7.1…T-7.5's five, a table row,
+`<REPO>/scripts/x.py`, and one row mixing all five categories — **all fifteen** are text fixed
+points and **five** have non-empty `extra`, including **two of H.2's own seven "verified fixed
+point" cases** (`AWS_SECRET_ACCESS_KEY=…`, `https://u:p@h/p`) and **both of T-7.3 and T-7.4**.
+
+That is the finding, and it is upheld in full: enforcing `extra == ()` literally would omit the
+orchestrator log from every bundle that ever logged a secret-named assignment or a credentialed
+URL, and would make T-7.3 / T-7.4 / T-7.8 unsatisfiable, since each requires the content to be
+*embedded* with a non-zero count. **The design was wrong; the implementation was right to stop and
+say so.**
+
+#### B. Is bare text equality the complete security statement?
+
+The IMPLEMENTATION Worker's argument is: *"the only region a category can rewrite to itself is a
+region that is already its own placeholder."* That is true per match, and it is the right idea.
+Checked against the five categories, self-rewrite forces the removed region to be the placeholder
+exactly:
+
+* category 2 self-rewrite ⟹ `user:pass` is literally `<REDACTED:url_credential>`. It cannot be
+  anything else: `pass` excludes `@` and `user` excludes `:`, so the matched span and the
+  replacement can only be equal as whole strings, never as a prefix of one another.
+* category 3 self-rewrite ⟹ the value is literally `<REDACTED:env_secret_pattern>`.
+* categories 1, 4, 5 cannot self-rewrite at all (table above), so any match they make must change
+  the text.
+
+Where the Worker's argument is **incomplete** is one step up, at the whole-string level.
+`again == candidate` compares two strings; a match that rewrote to *different* bytes is invisible to
+that comparison only if some other match's length change compensates for it exactly. Ruling that
+out requires a per-category, first-differing-character argument — I did work it through for
+`redaction/1.1` and found no construction, and a 400,000-trial randomized search over an alphabet
+seeded with every placeholder literal, `dcap_`, `TOKEN`, `://`, `/Users/` and path punctuation found
+**zero** texts that are text fixed points while containing a non-self-expanding match.
+
+But that argument is *policy-specific*. It is exactly the shape of reasoning this design has twice
+punished: `extra == ()` was defended as "a closed statement over the policy's own categories" and
+was not one, and the P-PATH note two hundred lines below says in as many words that a postcondition
+phrased as "redaction is a fixed point of this value" is **circular** — a value the policy does not
+recognise satisfies it trivially. A sixth category added tomorrow could invalidate the
+compensation argument silently, and nothing in the codebase would notice.
+
+The per-match rule has no such dependency. It is the property itself, stated directly.
+
+#### C. D-G.9 — what the recursive proof does and does not establish
+
+`prove_immutable()`'s I-1…I-6 is a statement about **write capability**: *no unprivileged process
+can cause new readable content to appear anywhere in the subtree*, evaluated against the run user's
+privileges at session-build time. It is emphatically **not** a statement about **existing content**.
+A file already sitting in an admitted IMM root — placed there at any time in the past, by anything
+— passes the proof unexamined, because the proof never opens it.
+
+So the review's hypothetical is real as stated: *a pre-existing byte-identical answer-key copy
+already sitting under an unexpected filename inside an admitted IMM root* passes I-1…I-6, is
+invisible to pass A (wrong basename) and to pass D (not inside an archive), and is caught **only**
+by pass C. Under the shipped A/D-only pass set it is not caught at all. The claim in
+`review_isolation.py`'s NEG-5 comment that what B and C "would be re-deriving is already
+established more strongly by the recursive proof" is **false for pass C**: the proof establishes
+nothing whatever about content that predates it.
+
+**Verified, not asserted.** Against a temporary root holding (a) a byte-identical copy of
+`scripts/fixtures/final_review_eval/key/answer_key.json` renamed to `libfoo.dat`, (b) a file of
+exactly 9,347 bytes differing from the key in one byte, and (c) the key's bytes plus a trailing
+newline, the shipped code gives:
+
+```text
+passes=('A', 'D')       hits=[]                         <- the review's gap, reproduced
+passes=('A', 'C', 'D')  hits=[('C', 'libfoo.dat')]      <- pass C is what closes it
+passes=('C',)           hits=[('C', 'libfoo.dat')]      <- (b) and (c) are not hits either way
+```
+
+There is a second, more important reason not to lean on the proof here, and it is the reason NEG-5
+exists in the form iteration 2 gave it. **NEG-5's job is to not trust the classification.** It runs
+*from inside the sandbox*, over the profile's own admitted set, precisely so that a wrong
+classification shows up as a hit rather than as a silent admission. F-001 was a classification bug;
+a rescan that assumes the classification is correct cannot catch the next one. Justifying a reduced
+NEG-5 pass set *by citing the proof* is therefore circular in the same way `extra == ()` was: it
+assumes the thing the test exists to check.
+
+#### D. What pass C over a Class IMM root actually costs
+
+Measured on this host, walking each admitted IMM root with `os.walk(followlinks=False)`, carve-outs
+pruned, counting directory entries (symlinks included, hence counts above G.3.2's file counts):
+
+| root | entries | bytes | walk only | walk + `st_size` compare | walk + sha256 of every file |
+|---|---:|---:|---:|---:|---:|
+| `/usr` | 43,422 | 2.29 GB | 0.49 s | **0.79 s** | 9.17 s |
+| `/Library/Developer/CommandLineTools` | 109,959 | 5.87 GB | 2.22 s | **2.03 s** | 23.83 s |
+| `/System` (8 carve-outs pruned) | 286,743 | 18.69 GB | — | **9.8 s** | not run — 18.69 GB |
+| **total** | **440,124** | **26.85 GB** | — | **~13 s** | **minutes, and ~27 GB of reads** |
+
+And the number that decides it:
+
+> The answer key is `scripts/fixtures/final_review_eval/key/answer_key.json`, **9,347 bytes**,
+> `sha256:953c9748…`. Across all 440,124 entries in all three admitted IMM roots, the number of
+> regular files whose size is exactly 9,347 bytes is **one**.
+
+A file whose sha256 equals the key's sha256 is byte-identical to the key and therefore has the
+key's exact byte length. Filtering pass C's hash set by `st_size == len(key_bytes)` is an
+**equivalence, not an approximation**: it detects exactly the set the unfiltered pass detects, and
+it reduces the work from 26.85 GB of reads to a walk plus **one** sha256 of a 9 KB file.
+
+Pass **B** cannot be prefiltered that way. `scan_leak()` is a token/shingle/expected-count scan, so
+any file long enough to hold a shingle is a candidate; there is no sound size, name or type gate,
+and it costs the full 26.85 GB. That, and only that, is the pass this iteration declines to run
+over Class IMM roots.
+
+---
+
+### Proposed Design
+
+#### Decision D-4.1 — the residue rule is per-match self-output
+
+> **For every `(name, pattern, replacement)` in `REDACTION_CATEGORIES`, in policy order, every match
+> `m` of `pattern` in `candidate` must satisfy `m.expand(replacement) == m.group(0)`.**
+>
+> The second pass may still *recognise* text; it must have nothing left to *remove*.
+
+Properties, each of which is why this and not one of the two alternatives:
+
+1. **It is the security statement, not a proxy for it.** "Nothing left to remove" is what the H.1
+   rule means. Text equality is a *consequence* of it (a substitution whose every replacement
+   equals its own span cannot change the string), so the corrected rule is **strictly stronger than
+   what the implementation shipped**, and strictly weaker than nothing else.
+2. **It is satisfiable.** All fifteen canonical shapes satisfy it, T-7.3 / T-7.4 / T-7.8 become
+   satisfiable exactly as written, and a clean log still produces `redactions == []`.
+3. **It is policy-independent.** No appeal to "category 5 matches every absolute path" and no
+   appeal to a compensation-impossibility argument. A sixth category added tomorrow is covered on
+   the day it is added, and a category whose replacement does *not* reproduce its own span fails
+   loudly at the first log that trips it — which is the behaviour H.2 step 3's structure check was
+   already written to provide for a different future-policy hazard.
+4. **It costs one extra pass of `finditer` over a log-sized string.** The current code already runs
+   `redact_text(candidate)` a second time and throws the counts away; this replaces that call.
+
+`safe_embedded_text()`'s signature, its `redact=True`/`redact=False` split, step 1, step 3 and the
+closed `EMBED_OMISSION_REASONS` vocabulary are **unchanged**. `"redaction_residue"` remains the one
+reason this check can produce.
+
+#### Decision D-4.2 — NEG-5's pass set is per class, and pass C is required over Class IMM
+
+| class | passes | rationale |
+|---|---|---|
+| **USR** | **A, B, C, D, S** | unchanged. The root is small (a freshly created session tree), mutable, and the scan is the only evidence there is. |
+| **IMM** | **A, C, D** | A and D are walk passes. **C is required**, under the size prefilter — the proof says nothing about pre-existing content, and NEG-5 must not assume the classification it is checking. Cost: a walk plus, on this host, one 9 KB hash. |
+
+Pass **B is not run over Class IMM roots.** This is an explicit design decision, recorded here
+rather than left as silence or as an implementation note, and it is bounded as follows.
+
+**What running pass B over Class IMM would add over A + C + D:** detection of key material present
+in a form that is neither byte-identical to the key file (C) nor named like the fixture (A) nor
+packaged in an archive whose index names it (D) — i.e. a *reformatted or partial* rendering: a
+pretty-printed copy, an excerpt, a quoted fragment in a log.
+
+**Why that is an acceptable residual:**
+
+1. **I-3 proves the run user cannot have written it.** Admission as IMM requires that *no regular
+   file anywhere in the subtree* satisfies `os.access(f, W_OK)`, exhaustively, over the whole
+   subtree at session-build time. So key material in an IMM root cannot have arrived by any
+   unprivileged write. It requires a **privileged (root) writer** — which is the residual G.3.3,
+   RK-2, RK-8 and `ISOLATION.json.limitations[]` already state in exactly those terms, and which
+   G.1 places outside the threat model. Pass B over Class IMM would be a partial mitigation of a
+   threat this design has already, and separately, declared out of scope.
+2. **The one in-scope way key material reaches an admitted root is a classification bug** — the
+   F-001 shape, where a subtree the run user *can* write is wrongly admitted as immutable. That
+   case is covered four independent ways and none of them is pass B:
+   `assert_no_unscanned_descendant()` refuses the structural shape, `assert_carve_outs_denied()`
+   refuses the profile shape, **NEG-7 plants a real byte-identical key copy plus an identity-string
+   file in the resolved mutable roots and asserts every read, stat, list, `cat`, `ls`, `find`,
+   `grep`, symlink and `/System/Volumes/Data` alias is denied**, and NEG-5's passes A and C find a
+   planted copy by name or by digest. T-9.9 is the regression guard for the classification rule
+   itself.
+3. **Cost, honestly stated:** 26.85 GB of reads per capture, on top of the ~3.5 minutes the proof
+   already costs (IMPLEMENTATION.md F-102's measurement, which supersedes G.3.2's "< 20 s" —
+   G.3.2's mechanism is correct and only its constant was wrong). Unlike pass C, no prefilter makes
+   it cheaper without weakening it.
+4. **It is not a permanent refusal.** `--scan-imm-content` (below) runs it on demand and records
+   that it ran.
+
+**Additive escape hatch — `isolate --scan-imm-content`.** Default **off**. When passed, Class IMM
+roots run **A, B, C, D**, and `ISOLATION.json`'s NEG-5 probe record carries
+`"imm_content_scan": true` alongside the per-root `passes` list it already carries. This gives the
+operator a one-command way to discharge residual 1 above on a host they have reason to doubt — a
+shared machine, a machine where something was once installed with `sudo` from this repository —
+without paying 26.85 GB on every capture. A capture taken with the flag is *more* attested, never
+less, and the flag can only widen the pass set, never narrow it.
+
+**Rejected alternative — full A–D over every root at every capture.** It is the option the review
+offers, and it is defensible; it is rejected because pass C's prefilter already closes the concrete
+gap the review names at walk cost, leaving only residual 1 — a threat G.1 excludes and
+`limitations[]` already discloses — to justify minutes of I/O per capture. Buying a partial
+mitigation of an out-of-scope threat at that price, on every capture, is not a good trade, and
+`--scan-imm-content` makes it available to anyone who disagrees on a given host.
+
+**Rejected alternative — keep A/D only and document it.** Rejected outright. It leaves the review's
+named gap open, and its stated justification ("the proof establishes it more strongly") is false
+for pass C.
+
+---
+
+### Components / Interfaces / Data Flow
+
+No new module, no new dependency, no schema version change, no exit-code change, no profile-clause
+change, no `ISOLATION.json` field removal or rename.
+
+**`scripts/run_logging.py`**
+
+```python
+def _residual_matches_are_self_output(text: str) -> bool:
+    """D-H.2 step 2. True when the policy has nothing left to REMOVE from `text`.
+
+    Not `redact_text(text)[0] == text`, and not `redact_text(text)[1] == ()`:
+    the first is a whole-string proxy for a per-match property, and the second is
+    a DIFFERENT property that redaction/1.1 cannot satisfy on the very inputs this
+    gate exists for -- env_secret_pattern and url_credential preserve a readable
+    anchor on purpose and therefore re-match their own placeholder output while
+    rewriting it to identical bytes.
+    """
+    return all(
+        match.expand(replacement) == match.group(0)
+        for _name, pattern, replacement in REDACTION_CATEGORIES
+        for match in pattern.finditer(text)
+    )
+```
+
+`safe_embedded_text()` step 2 becomes `if not _residual_matches_are_self_output(candidate): return
+None, redactions, "redaction_residue"`. The `again, _second_pass_counts = redact_text(candidate)`
+call is **removed**, not kept alongside — one authority for one property. Its docstring's
+"It is deliberately NOT additionally asserted…" paragraph is replaced with the corrected statement,
+including why `extra == ()` is a different property rather than a stricter one.
+
+**`scripts/review_isolation.py`**
+
+| symbol | change |
+|---|---|
+| `SCAN_PASSES_ALL` | unchanged: `("A", "B", "C", "D", "S")` |
+| `SCAN_PASSES_NAME_ONLY` | **renamed** `SCAN_PASSES_IMM`, value `("A", "C", "D")`; comment rewritten to the D-4.2 rationale. The old name is removed, not aliased — it no longer describes the value. |
+| `SCAN_PASSES_IMM_CONTENT` | **new**, `("A", "B", "C", "D")`, used only under `--scan-imm-content` |
+| `scan_readable_set()` | pass C gains the size prefilter. Add `_answer_key_size(key)` next to the existing `_answer_key_digest(key)`, reading the size from the **same** `key["__source_path__"]` and returning `None` on a missing path or `OSError`, exactly as `_answer_key_digest()` does — one source of truth for "which file is the key". In the walk, `continue` before `sha256_path(entry)` when `key_size is not None and entry.lstat().st_size != key_size`. When `key_size is None` pass C is already inert (`key_digest` is `None` too) and nothing changes. Applied on **both** classes — it is an equivalence, so it is strictly a speedup for Class USR too. An `OSError` from `lstat()` falls through to hashing rather than skipping, so the prefilter can never turn an unreadable file into a silent pass. |
+| `run_negative_probes()` | the NEG-5 loop selects `SCAN_PASSES_ALL` / `SCAN_PASSES_IMM` / `SCAN_PASSES_IMM_CONTENT`; the probe record gains `"imm_content_scan": bool` at the probe level. `rescan_detail[]`'s existing `passes` list is unchanged in shape. The duplicated comment paragraph at `review_isolation.py:1315-1319` is deduplicated in the same edit. |
+| `build_parser()` | `--scan-imm-content`, `action="store_true"`, default `False`, on the `isolate` subcommand only. Threaded through to `run_negative_probes()`. |
+
+**Data flow, unchanged everywhere else.** `ISOLATION.json`'s `readable_set[]` entries keep
+`scanned: false` for Class IMM: that field describes the **session-build-time** scan (G.3.3), which
+this iteration does not change, and T-8.7's assertion on it stands as written. The NEG-5 probe
+record is where the from-inside-the-sandbox pass set is reported, and it already carries a per-root
+`passes` list.
+
+---
+
+### Error Handling / Compatibility
+
+* **Exit codes: unchanged.** A pass-C hit inside a Class IMM root is a hit like any other — exit 4,
+  offending path printed. There is still no `--ignore`.
+* **`--scan-imm-content` is purely additive** and defaults off, so every existing invocation
+  behaves identically. It can only widen the pass set.
+* **Bundle schema stays `2.0`.** The residue rule changes *which* inputs are embedded versus
+  omitted, but relative to what is deployed at `cac283b` (text equality) the corrected rule embeds a
+  subset, and no input is known — after a 400,000-trial search — on which the two differ. Relative
+  to the *approved* iteration-1 rule it embeds a strict superset, which is the whole point. No
+  reader-visible key, field or version changes, so no compatibility surface moves.
+* **`COMPATIBILITY.md` is not touched.** D-I stands exactly as iteration 3 settled it, and RK-10's
+  observation about D-I's "exhaustively scanned" wording is unchanged in truth-value by this
+  iteration: Class IMM roots were partly unscanned before and are partly unscanned after, and
+  reopening D-I remains out of bounds.
+* **`ISOLATION.json.limitations[]` keeps its single existing entry.** The one residual D-4.2
+  creates — pass B is not run over Class IMM roots — is a mitigation gap against a **privileged
+  writer**, and that entry already states exactly that boundary: *the proof is evaluated at
+  session-build time against the run user's own privileges, so it does not bind a privileged (root)
+  writer*. Adding a second entry would restate the same limitation in different words, which is the
+  drift R1 punished. The pass-set detail lives in the NEG-5 probe record, where a reader can see it
+  per root.
+* **Failure posture on the new `stat` call:** an `OSError` from `entry.lstat()` in the prefilter is
+  treated as "cannot certify" and falls through to hashing the file rather than skipping it, so the
+  prefilter can never turn an unreadable file into a silent pass.
+
+---
+
+### Expected Changed Files / Implementation Steps
+
+| # | file | change | hard? |
+|---|---|---|---|
+| 1 | `scripts/run_logging.py` | `_residual_matches_are_self_output()`; `safe_embedded_text()` step 2; docstring correction | **HARD** |
+| 2 | `scripts/test_run_logging.py` | T-7.3 / T-7.4 / T-7.8 assertions extended; T-7.9 monkeypatch retargeted; T-7.13, T-7.14 added | **HARD**, same commit as 1 |
+| 3 | `scripts/review_isolation.py` | `SCAN_PASSES_IMM`, `SCAN_PASSES_IMM_CONTENT`, pass-C size prefilter, NEG-5 pass selection + `imm_content_scan`, comment dedup | **HARD** |
+| 4 | `scripts/final_review_eval.py` | `--scan-imm-content` on `isolate`, threaded through | same commit as 3 |
+| 5 | `scripts/test_review_isolation.py` | T-8.4b, T-8.4c, T-9.5 | **HARD**, same commit as 3-4 |
+| 6 | `orca-worker-reviewer-orchestration/tools/run_logging.py` | mirror of 1 — `cmp` with `scripts/run_logging.py` must stay byte-identical, as the existing gate requires | same commit as 1 |
+| 7 | *§7 baseline re-capture* | re-run per the amended B-1′…B-7 once 1-6 are green | after 1-6 |
+
+No documentation file changes. `CHANGELOG.md` is untouched: the schema version does not move and
+the CLI flag is additive within the same MINOR. `SKILL.md` §9's description of the export is
+unchanged.
+
+---
+
+### Testing Strategy
+
+**Corrected in place** (see the T-7 and G.9 tables above): T-7.3, T-7.4, T-7.8, T-7.9, and NEG-5's
+row.
+
+**New — D-H (`scripts/test_run_logging.py`):**
+
+| id | asserts |
+|---|---|
+| **T-7.13** | *The F-101 regression guard.* A log containing **both** `GITHUB_TOKEN=ghp_deadbeef1234` and `https://user:hunter2@example.test/x` exports with `content_redacted is not None`, `content_omitted_reason == ""`, `env_secret_pattern ≥ 1` and `url_credential ≥ 1`, and neither secret appears in the serialized bundle. Independently asserts that `redact_text(content_redacted)[1]` is **non-empty** — i.e. the test states out loud that a non-empty second-pass count is expected and safe, so a future contributor who re-adds `extra == ()` fails here with the reason in front of them. |
+| **T-7.14** | *The residue path, per-match.* Monkeypatch `REDACTION_CATEGORIES` with one synthetic category whose replacement does not reproduce its own span (`("t", re.compile(r"ZZ_[A-Z]+"), "<REDACTED:t>")`), log a line containing `ZZ_LEAK`, and assert `content_redacted is None`, `content_omitted_reason == "redaction_residue"`, `digest_pre_redaction` present, `integrity["omitted_content"]` names the log, and the export still returns a written path. Also asserts the converse: a synthetic category whose placeholder *does* re-match and expands to its own span (the shape of categories 2 and 3) is **embedded**. |
+
+**New — D-G (`scripts/test_review_isolation.py`):**
+
+| id | asserts |
+|---|---|
+| **T-8.4b** | *Pass C survives the reduced IMM pass set.* `scan_readable_set(key, root, passes=SCAN_PASSES_IMM)` over a fixture root containing a byte-identical copy of the answer key under an unrelated basename (`libfoo.dat`) returns exactly one hit, `pass == "C"`. This is the review's named gap, asserted directly: the same call with the shipped `("A", "D")` set returns zero hits, and the test says so in its docstring. |
+| **T-8.4c** | *The size prefilter is an equivalence, not an approximation.* Over a fixture root holding (a) a byte-identical key copy, (b) a file of exactly the key's byte length whose content differs in one byte, and (c) a file with the key's content plus a trailing newline: `passes=("C",)` returns exactly one hit and it is (a). Asserts (b) is hashed and not a hit, and (c) is size-filtered out and not a hit — a file that is not byte-identical is not a hit under either implementation, which is what makes the two equivalent. |
+| **T-9.5** | *The NEG-5 contract, at the probe record.* Against the synthetic fixture, the NEG-5 record's `roots[]` has `passes == ["A", "C", "D"]` for every `class == "IMM"` entry and `["A", "B", "C", "D", "S"]` for every `class == "USR"` entry, and `imm_content_scan is False`. With `--scan-imm-content`, every IMM entry reads `["A", "B", "C", "D"]` and `imm_content_scan is True`. Darwin-only, skipped with an explicit reason elsewhere, like the rest of T-9. |
+
+**Unchanged and still required:** T-7.1, T-7.2, T-7.5…T-7.7, T-7.10…T-7.12; T-8.1…T-8.11 (T-8.4's
+existing pass A/B/C/D assertions still run with the full USR pass set); T-9.1…T-9.4, T-9.6…T-9.9;
+T-10; NEG-0…NEG-8. `python3 -m unittest discover -s scripts -p 'test_*.py'`,
+`validate_skills.py`, `verify_package.py`, and the `cmp` of the two `run_logging.py` copies are the
+gate, exactly as before.
+
+---
+
+### Risks / Open Issues
+
+* **RK-7** — rewritten in place; see the risk table above. The contradiction the IMPLEMENTATION
+  Worker identified between RK-7's "the remedy is a redaction-policy fix" and *Explicitly not
+  designed*'s "no change to the redaction policy's five categories" is resolved by separating the
+  two claims that were conflated: the **safe** response to a genuine residue is omission, which is
+  already built and requires no policy change; **closing** the policy gap is a separate work
+  package under a MINOR bump and is out of this design's scope, which is exactly what the
+  *Explicitly not designed* fence says. Neither statement now claims the other's ground.
+* **RK-11 (new).** The corrected residue rule is strictly stronger than what is deployed at
+  `cac283b`. If some real log ever contains a match that expands to different bytes, that log is
+  omitted where the deployed code would have embedded it. That is the fail-safe direction, it is
+  the direction H.1 mandates, and no such input is known after a 400,000-trial search — but a first
+  occurrence would show up as a bundle with `content_omitted_reason: "redaction_residue"` rather
+  than as a leak, and should be investigated as a policy bug under RK-7(c).
+* **RK-12 (new).** Pass B is not run over Class IMM roots. What that gives up is detection of a
+  *non-byte-identical* rendering of key material inside an OS-owned, run-user-unwritable subtree —
+  reachable only by a privileged writer, which G.1 excludes and which
+  `ISOLATION.json.limitations[]` already discloses. `--scan-imm-content` discharges it on demand
+  and records that it did. This is a decision, not an omission, and D-4.2 states its cost
+  (26.85 GB per capture) and its alternatives.
+* **RK-13 (new, small).** `SCAN_PASSES_NAME_ONLY` is removed rather than aliased. Any out-of-tree
+  caller breaks loudly at import. That is intended: the name asserts "name-only", the new pass set
+  is not name-only, and a silently-wrong name is how F-001 was defended for an iteration.
+* **G.3.2's cost figure is superseded, and this is the record of it.** G.3.2 states the full proof
+  at "under 20 s in total"; IMPLEMENTATION.md F-102 measured ~3.5 minutes on this host (`/System`
+  210 s), and my own walk timings are consistent with that order. The *mechanism* G.3.2 specifies
+  is unchanged and correct; only the constant was wrong, and no design decision in this document
+  rested on it — including D-4.2, which is decided on the 26.85 GB of pass-B reads, not on the
+  proof's cost.
+* **O-1, O-2, O-3 stand unchanged.** O-1 (the `orca` CLI's behaviour from inside the sandbox)
+  remains undischarged and is still a blocking pre-flight assertion for the Step 7 capture; O-2 (a
+  shared agent state directory) is the one place where in-scope key material could reach a
+  `--allow-read` root, and that root is Class USR and gets the full pass set, so D-4.2 does not
+  touch it.
+* **RK-1…RK-6, RK-8…RK-10 stand unchanged.**
