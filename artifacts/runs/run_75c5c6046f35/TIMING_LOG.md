@@ -31,3 +31,9 @@
 | 2026-08-26T10:15:05.553163+00:00 | iteration_start | DESIGN |  | 3 | 2026-08-26T10:15:05.553163+00:00 |  |  | high |  |
 | 2026-08-26T10:23:12.535593+00:00 | dispatch_settled | DESIGN | worker | 3 | 2026-08-26T10:15:05.553163+00:00 | 2026-08-26T10:23:12.503881+00:00 | 486.951 | high | F-001/F-002 closed, D-6.8 atomic contract, committed a6afadc |
 | 2026-08-26T10:25:24.670927+00:00 | dispatch_settled | DESIGN | reviewer | 3 | 2026-08-26T10:23:32.720146+00:00 | 2026-08-26T10:25:24.640524+00:00 | 111.920 | high | DESIGN phase gate PASS, O-2 mechanism fully closed |
+| 2026-08-26T10:25:24.640524+00:00 | iteration_end | DESIGN |  | 3 | 2026-08-26T10:15:05.553163+00:00 | 2026-08-26T10:25:24.640524+00:00 | 619.087 | high |  |
+| 2026-08-26T10:25:24.640524+00:00 | phase_end | DESIGN |  |  | 2026-08-26T09:54:56.571122+00:00 | 2026-08-26T10:25:24.640524+00:00 | 1828.069 | high |  |
+| 2026-08-26T10:27:14.877417+00:00 | phase_start | IMPLEMENTATION |  |  | 2026-08-26T10:27:14.877417+00:00 |  |  | high |  |
+| 2026-08-26T10:27:14.877417+00:00 | iteration_start | IMPLEMENTATION |  | 2 | 2026-08-26T10:27:14.877417+00:00 |  |  | high |  |
+| 2026-08-26T11:26:12.058455+00:00 | dispatch_settled | IMPLEMENTATION | worker | 2 | 2026-08-26T10:43:34.569973+00:00 | 2026-08-26T11:26:12.032509+00:00 | 2557.463 | high | F-401/402/403 closed, real seeded isolate() succeeded, committed c06f8b5 |
+| 2026-08-26T11:45:30.258667+00:00 | dispatch_settled | IMPLEMENTATION | reviewer | 2 | 2026-08-26T11:26:34.678904+00:00 | 2026-08-26T11:45:30.231973+00:00 | 1135.553 | high | IMPLEMENTATION phase gate PASS, F-401/402/403 closed and independently reproduced |
