@@ -286,7 +286,9 @@ Creates, via `tempfile.mkdtemp(prefix="frv_iso_")`, and prints a descriptor:
             …one per --policy-file
         artifacts/runs/<run-id>/    <- created empty; the Reviewer's only write target
     tmp/                        <- the sandboxed agent's TMPDIR (created empty)
-    home/                       <- the sandboxed agent's HOME   (created empty)
+    home/                       <- the sandboxed agent's HOME   (created empty, then
+                                   seeded by `--seed` if the operator supplied any --
+                                   see iteration 2's D-6.1..D-6.3)
     control/
         scope.sb
         ISOLATION.json
@@ -446,8 +448,12 @@ Everything else that must be readable, admitted **only** as an exact path and al
 * `<SESSION>/tmp` and `<SESSION>/home` — the session-scoped `TMPDIR` and `HOME` (G.2, G.5). These
   exist *because* the host's per-user temp and home are no longer admitted: the agent still needs a
   writable scratch and config root, and giving it a session-private one is what makes removing
-  `/private/var` and `/Library` survivable. They are created empty by `isolate`, so their scan is
-  trivially clean, and they are destroyed with the session;
+  `/private/var` and `/Library` survivable. `tmp/` is created empty by `isolate`, so its scan is
+  trivially clean; `home/` is created empty and then, if the operator supplied `--seed`, carries
+  the enumerated seed files **before this scan runs** (iteration 2, D-6.3), so its scan is a real
+  gate rather than a formality -- and the pre-flight's own agent run adds more, which NEG-5 re-scans
+  and `ISOLATION.json.session_home.inventory` enumerates (D-6.4). Both are destroyed with the
+  session;
 * any further root the pre-flight probe proves necessary, supplied by an explicit `--allow-read`.
 
 **Not admitted, and named here so a future edit cannot re-add them by habit:** the host
@@ -639,6 +645,9 @@ metadata that outlives the ephemeral directory).
 orca terminal create --worktree current \
   --title "final-review-isolated-<attempt>" \
   --command "cd <SESSION>/review_root && TMPDIR=<SESSION>/tmp HOME=<SESSION>/home exec /usr/bin/sandbox-exec -f <SESSION>/control/scope.sb <resolved agent command>"
+
+# Iteration 2 (D-6.6) adds one more launch-line environment variable, for the same reason
+# TMPDIR/HOME are launch-line values:  PATH=<--agent-path dirs>:/usr/bin:/bin:/usr/sbin:/sbin
 ```
 
 Why this is correct rather than a trick:
@@ -722,6 +731,7 @@ and **copied into the run artifact root at repatriation time** (G.8) as
   "writable_set": ["<REDACTED:foreign_absolute_path>"],
   "denied_roots": ["<REDACTED:foreign_absolute_path>"],
   "key_bearing_roots_discovered": 2,
+  "session_home": {"seed_policy": "…", "seeded": [], "inventory": {}, "scanned_by": []},
   "properties": {"S1": "PASS", "S2": "PASS", "S3": "PASS"},
   "probes": [
     {"id": "NEG-0", "kind": "positive_control", "result": "PASS"},
@@ -1373,6 +1383,11 @@ any artifact.
   agent's environment: give the isolated agent a session-scoped state directory via environment
   variables. Recorded as a known residual, and it is a *narrow* one — it requires the key to reach
   that directory from another session during the dispatch window.
+  **Superseded — see `## DESIGN iteration 2 (Run run_75c5c6046f35)`.** TEST's F-403 proved the
+  deferred half is a *precondition* rather than a hardening: with `<SESSION>/home` created empty and
+  no supported way to provision it before the scan, the real agent cannot authenticate and `B-2′`
+  cannot run at all. Iteration 2 designs the provisioning mechanism (D-6.1…D-6.7) and closes O-2 as
+  a decision; what remains is RK-8's class, restated there.
 * **O-3 — `.git` denial removes legitimate reviewer capability.** An isolated Reviewer cannot run
   `git log`/`git blame` on the subject, because the subject is not a git checkout. That is
   unchanged from the existing `materialize()` design (rule 2: no `.git` is created or copied) and is
@@ -1573,7 +1588,8 @@ reopened.
   described. The residual it named — key material arriving from another session *during* the
   dispatch — no longer has a shared directory to arrive in. O-2 stays on the list because an agent
   configured with an absolute state path via `--allow-read` could still reintroduce it, and that
-  root is then subject to the G.3 scan.
+  root is then subject to the G.3 scan. (**Closed as a decision** in this Run's iteration 2, which
+  designs how content gets *into* that session-scoped directory under attestation.)
 * **New, and named rather than implied:** the readable set is now tight enough that a different
   reviewer agent may need roots this host's probe did not surface. That is what the mandatory
   pre-flight probe is for, and every widening is an explicit `--allow-read` that is then proven or
@@ -2915,3 +2931,532 @@ F-202 already account for. One cosmetic code artifact was observed and is **not*
 separate finding because iteration 5 already schedules its removal by name: the sentence duplicated
 at `scripts/review_isolation.py:1316-1317` and `1318-1319`, inside the same NEG-5 comment block
 Step 3 rewrites wholesale.
+
+---
+
+## DESIGN iteration 2 (Run `run_75c5c6046f35`) — the O-2 credential/state provisioning decision
+
+STATUS: COMPLETE
+
+This iteration designs the one thing iteration 1's **O-2** named and explicitly deferred: an
+attested way to put the agent's credentials and state into `<SESSION>/home` **before** the
+readable-set scan runs. TEST's **F-403** — independently confirmed in
+`REVIEW_TEST_iteration1.md` — proves the deferral is no longer tenable: with `<SESSION>/home`
+created empty and no supported way to place anything in it before `isolate()` scans it, writes
+`ISOLATION.json` and returns, the project's real Final Review agent cannot authenticate, so
+`B-2′` cannot run at all. This is a **precondition for the isolated §7 baseline**, not optional
+hardening.
+
+Nothing else is reopened. F-401 and F-402 stay IMPLEMENTATION-owned and are not re-litigated here
+(§ *Risks / Open Issues* records one **new, verified dependency** on F-401's fix that IMPLEMENTATION
+must know about, which is not a reopening of the finding). D-H.2, D-4.1, RK-7, mandatory pass B
+(D-5.1), pass C's size prefilter, pass S's Class-USR-only scope, D-I, the pass-D extension list,
+`COMPATIBILITY.md`, and every lifecycle/Risk/Quality/Agent-Profile semantic stand exactly as
+approved.
+
+### Summary / Requirements
+
+| # | requirement (from the dispatch) | where it is satisfied |
+|---|---|---|
+| **R-a** | A concrete seed-list interface | **D-6.1** — `isolate --seed <ABS_SOURCE>:<HOME_RELATIVE_DEST>`, repeatable, capped, no config file, no directory form |
+| **R-b** | What MUST NOT be seedable | **D-6.2** — twelve fail-closed rules, checked before a byte is copied; the answer key, anything under `key/`/`adjudications/`, anything under the repository or a key-bearing root, every executable, every archive, every non-regular file and every destination outside `<SESSION>/home` are refused |
+| **R-c** | Seeded content is scanned by the **same** readable-set scan and the **same** NEG-5 battery | **D-6.3** — seeding happens inside `build_session()`, so `<SESSION>/home` is a Class USR root scanned A/B/C/D/S at admission and A/B/C/D/S again at NEG-5. There is no exemption, no allowlist and no `--seed-no-scan`. Measured below: a contaminated seed is caught by pass B, and a renamed answer key by passes B *and* C |
+| **R-d** | `ISOLATION.json` records what was **actually** seeded, not what the design intended | **D-6.4** — a new `session_home` object carrying the declared seed manifest (dest, redacted source, bytes, sha256, mode, present/modified state) **and** a digest-bearing inventory of everything in `<SESSION>/home` at attestation time, each entry labelled `seed` or `session`. Schema `1.0` → `1.1` |
+| **R-e** | The agent binary's `--allow-read` question | **D-6.6** — answered with measurements, and the answer is *partly no*: the existing mechanism covers it only with the **resolved** binary directory, because the obvious widening (`/opt/homebrew/bin`) is refused by the shipped scanner with 77 pass-S hits. The launch line therefore also needs `PATH`, by exactly the TMPDIR/HOME rule |
+| **R-f** | Do not open a new hole | **D-6.7** — the six properties the mechanism must not weaken, each with the check that holds it, plus the residuals named rather than absorbed |
+
+**The shape TEST suggested is adopted, but only after being verified and then tightened.** TEST
+proposed *"an explicit, operator-supplied seed list copied into `<SESSION>/home` before the
+readable-set scan runs."* Re-derived here, that shape is right about **where** and **when** and
+silent about **what** — and "what" is where the exfiltration and contamination paths live. Four
+alternatives were measured and rejected (D-6.0), and the adopted mechanism is narrower than TEST's
+sentence: enumerated **regular, non-executable, UTF-8-decodable, ≤1 MiB, pre-screened** files
+copied by a fixed non-configurable routine, never a directory, never a symlink, never a binary.
+
+### Current Architecture
+
+Everything below was measured on this host, today, against the code at `959a6b4`. No claim in this
+section is inherited from TEST, from `REVIEW_TEST_iteration1.md`, or from a predecessor artifact;
+where a measurement agrees with TEST's it is an independent reproduction.
+
+#### A. The order the running code already has
+
+`isolate()` (`scripts/review_isolation.py:1823`) runs, in this order:
+
+```text
+build_session()        -> (session/"home").mkdir()          <- home is created EMPTY, and returns
+compute_readable_set() -> scan_readable_set(key, home)      <- Class USR, A/B/C/D/S, key_leak
+render_seatbelt_profile() / write scope.sb
+preflight_probe()                                            <- G.5: runs the REAL agent (F-403 wiring)
+run_probes()           -> NEG-5 re-scans every admitted root <- home again, A/B/C/D/S
+build_attestation() / write_attestation()
+```
+
+There is exactly one window in which content can be placed in `<SESSION>/home` and still be covered
+by **both** scans: inside `build_session()`, after `(session / "home").mkdir()` and before it
+returns. That window is where D-6.3 puts the seed routine. Every other placement — including
+"after `isolate()` returns, before the dispatch", which is the improvisation TEST correctly refused
+— post-dates the attestation and is precisely the undisclosed drift `B6` exists to prevent.
+
+#### B. What the real agent actually needs — the minimum seed set, measured
+
+| probe | result |
+|---|---|
+| `HOME=<fresh empty dir>` + **only** `.codex/auth.json` (4,048 bytes, mode `0600`) copied in, then `codex-sol exec "reply with the single word ok"` | **rc=0**, stdout `ok`, **6.0 s** |
+| the same `auth.json`, staged as a Class USR root and scanned with the shipped `scan_readable_set(key, root)` (A/B/C/D/S, `key_leak`) | `files 1, content_scanned 1, ` **`hits 0`** |
+
+**One file, 4,048 bytes, and it scans clean.** That is the whole requirement, and it is what makes
+an enumerated-file seed list sufficient rather than a compromise. (It independently reproduces
+TEST's control row *"same, with `auth.json` copied into `<fresh HOME>/.codex/`" → rc=0*.)
+
+#### C. Why the scan is a real gate on seeded content, not a formality
+
+Three controls over the same staged root, with the shipped scanner and no modification:
+
+| staged content | scan result |
+|---|---|
+| a realistic credential file only | `files 1, content_scanned 1, hits 0` — **no false positive** |
+| the same, plus `notes.md` containing *"the answer key for this fixture lists seeded defect sd-1"* | **4 pass-B hits** (`answer key`, `seeded defect`, `seeded`, `sd-1`) → exit 4 |
+| the real `answer_key.json`, byte-identical, renamed to `creds.json` | **718 hits across passes B and C** → exit 4 |
+
+A seed that carries key material is refused, and renaming it to look like a credential does not
+help: pass C is a digest equality and pass B does not care about the filename.
+
+#### D. Why a directory copy is not merely inelegant — it is a measured contamination path
+
+The obvious convenience ("just copy `$CODEX_HOME`") was measured on this host's real
+`~/.codex`:
+
+| fact | measured |
+|---|---|
+| size of the tree | **2,118 files, 723,865,664 bytes** |
+| entry kinds | 1,957 regular, 160 symlinks, **1 unix socket** (`ipc/ipc.sock`) |
+| `history.jsonl` (2,652,660 bytes) scanned with `scan_leak_text()` and the full `key_leak` vocabulary | **7 hits** — `answer key`, `answer_key`, `seeded defect`, `seeded`, `sd-1`, `sd-5`, and one expected-count heuristic |
+
+Three independent disqualifications, none of them hypothetical:
+
+1. **Contamination.** The operator's own agent history already contains the fixture's answer-key
+   vocabulary, because the operator has been working on this fixture. Copying that directory into
+   the isolated session would put answer-key vocabulary in front of the isolated Reviewer — the
+   exact thing S1 exists to prevent. The scan would catch it and fail the capture (correctly), but
+   a mechanism whose normal use is guaranteed to fail the gate is not a mechanism.
+2. **A non-regular entry.** A directory copy would traverse a unix socket. Pass B `read_text()`s
+   every non-symlink entry the walk reaches, which is F-401's exact defect class — see
+   *Risks / Open Issues*.
+3. **Unboundedness.** 723 MB copied and then content-scanned twice per capture, for a 4 KB
+   requirement.
+
+**Directory seeding is therefore refused by construction, not by policy** (D-6.2 rule S-1: the
+source must be a regular file).
+
+#### E. What the pre-flight's own agent run leaves behind — measured, because D-6.4 depends on it
+
+G.5 makes the pre-flight run the **real** agent, and F-403's required IMPLEMENTATION wiring will
+make that true. The agent therefore writes into `<SESSION>/home` *after* the admission scan and
+*before* NEG-5. Measured, from the rc=0 run in §B:
+
+| fact | measured |
+|---|---|
+| files in the seeded HOME after **one** trivial prompt | **214 regular files, 32,037,640 bytes** |
+| non-regular entries created | **0** |
+| largest entry | a 7,330,920-byte `.pptx` in the agent's own plugin cache |
+
+Three consequences, all designed for below: the inventory cap of 1,024 entries (D-6.4) has ~4.8×
+headroom against the measured 214; NEG-5's re-scan of the session HOME is bounded at tens of MB;
+and the plugin cache introduces `.pptx`/`.docx` files, which are ZIP containers that pass D does
+**not** enumerate (its extension list is `.tar/.tar.gz/.tgz/.zip`) and pass B cannot decode. That
+is named as a residual in *Risks / Open Issues* and covered — not closed — by the inventory's
+per-entry digests. Reopening pass D's extension list is out of this iteration's scope.
+
+#### F. The agent binary's reachability, measured against the shipped scanner
+
+| candidate `--allow-read` root | what lives there | shipped `scan_readable_set()` result |
+|---|---|---|
+| `~/bin` | `codex-sol` (a 91-byte `bash` wrapper: `exec codex --model … "$@"`) | 2 files, **0 hits**, 8 ms → **admissible** |
+| `/opt/homebrew/bin` | the `codex` name that `exec codex` resolves through `PATH` | 78 entries, 77 of them symlinks escaping into `Caskroom`/`Cellar` → **77 pass-S hits → exit 4** |
+| `/opt/homebrew/Caskroom/codex/0.149.1/bin` | the real `codex` binary (`realpath` of the shim) | 2 files, **0 hits**, 105 ms → **admissible** |
+
+This is the fact TEST's note did not have: the *obvious* widening is refused by the shipped code,
+by design and correctly. See **D-6.6**.
+
+### Proposed Design
+
+#### D-6.0 — the four alternatives, and why each is rejected
+
+Recorded so a future contributor does not re-propose one as an obvious simplification.
+
+| alternative | verdict |
+|---|---|
+| **(a) whole-directory copy of `$CODEX_HOME`** | **Rejected on measurement** (§D): 723 MB, a unix socket, and 7 answer-key-vocabulary hits in the operator's own agent history. It is a contamination path, an F-401 hazard, and unbounded. |
+| **(b) the credential as an environment variable on the launch line** | **Rejected on leak surface**, independently of whether the agent supports it (not verified, and deliberately not verified, because the argument does not depend on it). `wrap_command()`'s output is passed to `orca terminal create --command`, i.e. recorded by Orca and visible in the process table. That converts a `0600` file-scoped secret into a globally readable one and makes `run_logging`'s `env_secret_pattern` redaction load-bearing over a **live** credential. A file the sandbox alone can read is strictly safer than an argument every process can read. |
+| **(c) `CODEX_HOME` pointing at a host directory holding the credential** | **Rejected on measured behaviour and on O-2's own reasoning.** TEST measured `CODEX_HOME=<read-only dir>` → rc=1, *"failed to initialize in-process app-server client: Permission denied"*: the agent requires the state directory to be **writable**. A writable *host* directory admitted into the readable set is exactly the shared state directory O-2 exists to eliminate, and iteration 2's session-scoped `HOME` closed. |
+| **(d) a symlink from `<SESSION>/home/.codex/auth.json` to the host file** | **Rejected by construction, twice over.** G.2 rule 2 forbids creating or following a symlink in the session, and a symlink whose realpath escapes a Class USR root is a **pass-S hit** — so the shipped scanner would fail the capture on it. The design does not need a new rule here; the existing ones already refuse it. |
+
+#### D-6.1 — the interface: `--seed SRC:DEST`, enumerated, capped, non-configurable
+
+```bash
+python3 scripts/final_review_eval.py isolate \
+    --run-id <orca run id> \
+    --seed /Users/<user>/.codex/auth.json:.codex/auth.json \
+    [--seed <ABS_SOURCE>:<HOME_RELATIVE_DEST>]...    # repeatable; default: NONE
+    …
+```
+
+* **A CLI flag, not a config file.** `--allow-read` and `--policy-file` already establish the
+  convention that every widening of what the isolated agent can see is *an explicit argument on the
+  recorded command line*. A seed manifest file would be a second place where the declared set could
+  drift from the set the command actually copied, and the whole point of this iteration is that the
+  attestation must describe what happened rather than what was intended.
+* **Source is an absolute path; destination is always relative to `<SESSION>/home`.** There is no
+  `--seed-into`, no `${SESSION}` interpolation, and no way to name `review_root/`, `tmp/` or
+  `control/`. Seeding into `review_root/` would put operator-chosen content into the reviewed tree,
+  whose membership is closed by `materialize()` plus `--policy-file`; seeding into `control/` would
+  let an operator write the evidence directory the attestation is built from.
+* **Grammar, fail-closed:** the argument must contain **exactly one** `:`. Zero or two or more →
+  exit `1` with the offending argument printed. (A path containing a colon cannot be seeded; that
+  is an accepted limitation, stated in the `--help` text, and it buys an unambiguous grammar.)
+* **Caps:** `MAX_SEEDS = 8` pairs and `MAX_SEED_BYTES = 1 MiB` per source. The measured requirement
+  is **one** file of 4,048 bytes (§B); eight files of a megabyte is two orders of magnitude of
+  headroom and still bounds the routine. Exceeding either is exit `4` with the measured count/size
+  printed. An operator who needs more than this is describing a directory copy, which is what
+  D-6.2 S-1 refuses.
+* **No flag disables any check.** There is no `--seed-no-scan`, no `--seed-force`, no `--seed-dir`.
+  Symmetrically with G.3.3's "there is deliberately no `--ignore`": a gate that can be told to skip
+  what it is gating proves nothing about what it skipped.
+
+#### D-6.2 — what MUST NOT be seedable: twelve rules, checked before a byte is copied
+
+`seed_session_home()` validates **every** pair completely before it copies **any** of them, so a
+rejected pair never leaves a partially seeded session behind. Every violation is exit `4` (the
+leak/fixture code, per G.7) except the argument-grammar violations, which are exit `1`.
+
+**Source rules.**
+
+| # | rule | why it is load-bearing |
+|---|---|---|
+| **S-1** | `os.lstat(src)` must be `S_ISREG`. Not a directory, not a symlink, not a FIFO, socket, character or block device. | This is what makes "no directory copy" a construction rather than a policy (§D), and it keeps F-401's defect class out of the seed path: the operator's real `$CODEX_HOME` **contains a unix socket**, measured. |
+| **S-2** | `st_size ≤ 1 MiB`, and the total across all pairs `≤ 4 MiB`. | Bounds the fixed routine and the two scans that follow it. |
+| **S-3** | `src` must not be within `REPO_ROOT`, within the `--fixture` tree, or within any root `discover_key_bearing_roots()` returns; no path component may be named `key` or `adjudications`; the basename must not be `answer_key.json`. | **Unconditional, and therefore strictly stricter than pass A**, whose `key`/`adjudications` rule only fires under a directory that also holds a `subject/`. This is the rule that stops the mechanism becoming an exfiltration path: no file the fixture owns can be nominated as a seed, whatever it is named. |
+| **S-4** | `sha256(src)` must not equal the answer key's digest, **and** `scan_leak_text(src, text, key_leak_tokens(key), count_heuristics=True)` must return zero hits. | The same per-file test pass B runs, applied **before** the copy. The post-copy scan would catch it anyway (§C, measured), but pre-screening means a contaminated source never lands in the session at all — so the exit-4 path has nothing to remove and no window in which key material sits in the session directory. |
+| **S-5** | `st_mode & 0o111 == 0` — the source must not be executable by anyone. | A binary is **never** seeded. The agent's own executable reaches the session through `--allow-read` over its own scanned directory (D-6.6), which keeps `resolved_agent_command()` — and therefore the W-20 reuse gate — untouched. |
+| **S-6** | The basename must not end in `.tar`, `.tar.gz`, `.tgz` or `.zip`. | Pass D enumerates archive member **names** only and never reads a member, so an archive is the one file type the battery certifies less completely than its content. Refusing it at the door is cheaper than arguing about it. |
+| **S-7** | The bytes must decode as UTF-8. | A file pass B cannot decode is a file pass B silently skips (`UnicodeDecodeError → pass`). This design refuses to *place* content in the session that the mandatory content gate cannot read. Measured: the real `auth.json` is 4,048 bytes of decodable JSON. **If a future agent needs a binary credential, that comes back through DESIGN** — it is not an operator decision. |
+
+**Destination rules.**
+
+| # | rule | why it is load-bearing |
+|---|---|---|
+| **D-1** | `run_logging.assert_retained_path_field("home/" + dest)` must pass. | *Anything that cannot be honestly recorded in the attestation cannot be seeded.* This single rule is not a convenience: `_SAFE_RELATIVE_PATH` (`scripts/run_logging.py:1295`) already forbids a leading `/`, a drive letter, any `..` component, whitespace, `<`, `>`, `\` and any URL form — so D-1 subsumes the entire traversal-escape check **and** guarantees D-6.4's record is P-PATH-clean by construction rather than by a second, drifting validator. |
+| **D-2** | No path component may be named `key`, `adjudications` or `subject`, and the basename must not be `answer_key.json`. | A seed must not be able to construct a path that *looks* like fixture material to a later reader of the session or of the inventory, and must not collide with pass A's names. |
+| **D-3** | `(session / "home" / dest)` resolved must be strictly within `_realpath(session / "home")`; every intermediate directory is created by the routine itself with mode `0700`, and the routine refuses to descend through anything it did not create. | Belt to D-1's braces. Because the routine creates every intermediate itself, no intermediate can be a pre-existing symlink. |
+| **D-4** | The destination must not already exist, and no two `--seed` pairs may name the same destination. | Two pairs writing one path would make the attestation's record ambiguous about which source is in the session. |
+| **D-5** | The copy is `shutil.copyfile()` — contents only — followed by `os.chmod(dest, 0o600)`. **Not `copy2`.** | Mode, mtime, flags and xattrs are not carried across: a fixed `0600` is both safer than an inherited mode and byte-reproducible in the attestation, and the attestation carries no clock value (`assert_no_clock_value`), so an inherited mtime has nowhere to go anyway. |
+
+**The routine is fixed and non-configurable.** `seed_session_home(session, pairs, *, key, fixture,
+repo_root)` is one function, called from exactly one place, with no parameter that relaxes any rule
+above. It is not a general-purpose copy utility and must never grow into one.
+
+#### D-6.3 — ordering: the invariant, and the assertion that holds it
+
+> **The seed invariant.** Every byte in `<SESSION>/home` at the moment `ISOLATION.json` is written
+> was either (i) copied by `seed_session_home()` **before** `compute_readable_set()` scanned that
+> root, or (ii) written **inside the session** by the pre-flight's own agent process, after that
+> scan and before NEG-5 re-scanned the same root. There is no third origin, and both are covered
+> by NEG-5 and enumerated in the attestation.
+
+Placement: `seed_session_home()` is called **inside `build_session()`**, immediately after
+`(session / "home").mkdir()` and inside the existing `try:` whose `except BaseException:` removes a
+half-built session. Consequences, each of them the reason the call site is there and not elsewhere:
+
+* it precedes `compute_readable_set()`, so `<SESSION>/home` — already a Class USR root — is scanned
+  A/B/C/D/S with the full `key_leak` vocabulary **with the seed in it**;
+* it precedes `render_seatbelt_profile()`, so nothing about the profile changes: the seed lands
+  inside an already-readable, already-writable session root and adds no clause;
+* it precedes the pre-flight, so the real agent can authenticate on its first attempt — which is
+  the whole of F-403's blocking half;
+* it precedes NEG-5, so the seed is re-scanned against the readable set the profile **actually**
+  grants;
+* it precedes `build_attestation()`, so `B6`'s document is written after everything it describes;
+* and a failure at any point removes the session, seed included, before `isolate` exits.
+
+Two contract assertions, both hard failures, both in `isolate()` after `run_probes()` and before
+`build_attestation()`:
+
+* `assert_home_scanned(readable)` — `<SESSION>/home` must appear in `readable["entries"]` as a
+  `class: "USR"` entry with `scanned: true`, and in the NEG-5 probe record. A seed mechanism whose
+  root somehow left the scanned set is a silent hole; this makes it a loud one.
+* `assert_seeds_present(session, manifest)` — every declared destination must still exist and be a
+  regular file. A **missing** seed is a hard failure (something removed it; the session is not what
+  it claims). A seed whose digest **changed** is *not* a failure: the agent legitimately rewrites a
+  refreshed credential during the pre-flight. It is recorded as `state: "modified"` with the new
+  digest (D-6.4), which is the honest outcome — the attestation says what is there, not what was
+  put there.
+
+#### D-6.4 — the attestation: `session_home`, and schema `1.0` → `1.1`
+
+`ISOLATION.json` gains exactly one new top-level object. `ISOLATION_SCHEMA_VERSION` goes `"1.0"` →
+`"1.1"` in the same commit — an additive field is a MINOR bump, and a reader that pins `1.0` should
+see a different number rather than a silently richer document.
+
+```json
+"session_home": {
+  "seed_policy": "enumerated regular files only, copied by a fixed routine before the readable-set scan; no pass is exempted and no flag disables a check",
+  "seeded": [
+    {"dest": "home/.codex/auth.json",
+     "source": "<REDACTED:foreign_absolute_path>",
+     "bytes": 4048, "sha256": "sha256:…", "mode": "0600", "state": "present"}
+  ],
+  "inventory": {
+    "files": 215, "bytes": 32041688, "tree_digest": "sha256:…",
+    "seeded_present": 1, "seeded_modified": 0, "unseeded": 214, "truncated": false,
+    "entries": [
+      {"path": "home/.codex/auth.json", "bytes": 4048, "sha256": "sha256:…", "origin": "seed"},
+      {"path": "home/.codex/history.jsonl", "bytes": 812, "sha256": "sha256:…", "origin": "session"}
+    ]
+  },
+  "scanned_by": ["compute_readable_set:USR", "NEG-5"]
+}
+```
+
+Rules, each one a decision rather than a shape:
+
+* **`seeded[].source` goes through `_path_field()`** like every other path-bearing field, so an
+  operator's home directory lands as `<REDACTED:foreign_absolute_path>`. **`seeded[].dest` and
+  `inventory.entries[].path` are session-relative POSIX strings** and are validated with
+  `assert_retained_path_field()` directly — never through `_relative_artifact_path()`, which would
+  resolve a relative path against the process cwd and destroy the information. They are P1-category
+  values by D-1's construction, verified against `run_logging._SAFE_RELATIVE_PATH`.
+* **The digest is recorded, and that is a deliberate decision.** `B6`'s entire job is to let a
+  reader verify what the session contained; a seed record without a digest is a claim, not
+  evidence, and a size-only record would let a swapped file pass unnoticed — which is the exact
+  drift this mechanism exists to prevent. A sha256 is not a credential: it is not invertible, and a
+  bearer token's key space is not searchable. The one residual is named honestly rather than
+  waved away: **a digest is a verifier for a *guessed* plaintext**, so a low-entropy secret (a
+  passphrase, a PIN) must not be seeded. That cannot be detected mechanically, so it goes in
+  `limitations[]` and in the `--seed` help text rather than into a check that would pretend to
+  enforce it.
+* **Content is never recorded.** No seed record, no inventory entry, and no error message carries a
+  byte of a seeded file. The pre-screen (S-4) reports only the *offending path and the matched key
+  token*, exactly as every other scan hit does.
+* **`origin` is `"seed"` or `"session"` — never a guess about who wrote it.** `"session"` means
+  "present at attestation time and not in the seed manifest", which after the pre-flight means the
+  agent. The document does not claim more than it knows.
+* **`inventory.tree_digest`** is `sha256` over the sorted `"<path>\n<bytes>\n<sha256>\n"` records —
+  one value a `B6` reader can compare across captures on the same host without diffing 215 rows.
+* **Cap, fail-closed:** `MAX_HOME_INVENTORY = 1024` entries. Above it, `isolate` exits `4` naming
+  the count. Measured headroom: one trivial pre-flight prompt produces **214** entries (§E). A
+  session HOME that gains more than a thousand files from a single trivial prompt is not one whose
+  contents can be meaningfully attested, and the operator's remedy is to reduce what the agent
+  does at start-up — never a larger cap quietly added later. `truncated` is in the schema only so
+  that a future *deliberate* relaxation has an honest place to say so; it is always `false` today.
+* **No clock value**, so `assert_no_clock_value()` continues to pass unchanged, and the document
+  stays byte-reproducible from the same session.
+* **Non-regular entries in the inventory walk** are recorded as
+  `{"path": …, "kind": "socket"|"fifo"|…, "origin": "session"}` with **no digest and no read**.
+  The walk `lstat()`s and never opens. This is the same lesson F-401 teaches, applied to the one
+  new walk this design introduces, so the new code cannot inherit the old defect.
+
+#### D-6.5 — the closed list of what MUST NOT be seedable, stated once
+
+Refused, every one of them before a byte is copied: the answer key (by name, by digest, by
+containing directory); anything under the fixture's `key/` or `adjudications/`; anything under the
+repository root or under any root `discover_key_bearing_roots()` returns; any directory; any
+symlink; any FIFO, socket or device node; any executable; any archive; anything larger than 1 MiB
+or that is not UTF-8-decodable; anything whose content produces a `scan_leak_text()` hit; and any
+destination outside `<SESSION>/home`, containing `..`, naming a `key`/`adjudications`/`subject`
+component, or already occupied.
+
+And, stated positively so the boundary is unambiguous: **seeding is never the path for the agent's
+executable** (that is `--allow-read`, D-6.6), **never the path for policy documents** (that is the
+closed `--policy-file` list, G.2 rule 3), and **never the path for subject material** (that is
+`materialize()`).
+
+#### D-6.6 — the adjacent item: the agent binary's `--allow-read`, answered with measurements
+
+TEST recorded this as *"operator-fixable through the designed `--allow-read` widening … not itself
+the finding."* Verified here rather than accepted: **that is true only for the resolved binary
+directory, and this design has to say so explicitly, because the obvious widening fails.**
+
+* `--allow-read ~/bin` (the `codex-sol` wrapper) → 2 files, 0 hits, 8 ms → **admissible**.
+* `--allow-read /opt/homebrew/bin` — the directory `exec codex` resolves through — → **77 pass-S
+  hits, exit 4**. Every Homebrew shim is a symlink escaping to `Caskroom`/`Cellar`, and an escaping
+  symlink out of a Class USR root is a hit by G.3.3's pass-S rule. The shipped scanner is right to
+  refuse it: admitting that root would grant reads the scan did not cover.
+* `--allow-read /opt/homebrew/Caskroom/codex/0.149.1/bin` (the shim's `realpath`) → 2 files,
+  0 hits, 105 ms → **admissible**.
+
+So the resolved-directory widening works, and the PATH-directory widening cannot. The gap that
+leaves — `codex-sol` is `exec codex …`, and that lookup happens **inside** the sandbox — is closed
+by one addition, and it is the *only* launch-line change this iteration makes:
+
+> **`wrap_command()` also sets `PATH`.** The launch line becomes
+> `cd <review_root> && TMPDIR=… HOME=… PATH=<admitted agent dirs>:/usr/bin:/bin:/usr/sbin:/sbin exec /usr/bin/sandbox-exec -f <scope.sb> <resolved agent command>`,
+> where `<admitted agent dirs>` are supplied by the operator as `--agent-path <abs dir>` (repeatable)
+> and **must each already be an admitted readable-set root** — enforced, not assumed:
+> `assert_agent_path_admitted()` fails the command (exit 4) if a `--agent-path` entry is not in the
+> computed readable set. The operator therefore passes each directory twice, once as `--allow-read`
+> (which scans it) and once as `--agent-path` (which puts it on `PATH`), and the second cannot
+> silently exceed the first.
+
+`PATH` is an environment variable **on the launch line**, exactly like `TMPDIR` and `HOME`, and for
+exactly the reason G.5 already states: the W-20 reuse gate compares the resolved role command, so
+wrapping must be applied at launch and must never be folded into `agent_command`. Nothing about
+`resolved_agent_command()` changes.
+
+Two further notes, recorded so the next capture does not rediscover them:
+
+* The Caskroom path carries a **version number** (`0.149.1`). The widening is host- **and
+  version**-specific and must be re-derived by the pre-flight at each capture, never hard-coded.
+  It is recorded per capture in `ISOLATION.json.readable_set[]` as a Class USR entry like any other
+  widening, and the operator's decision is visible in the recorded command line.
+* `/opt/homebrew` is on `NEVER_ADMITTED`, and admitting `/opt/homebrew/Caskroom/codex/<v>/bin` does
+  **not** violate that: the rule refuses a never-admitted path *or an ancestor of one*, and this is
+  a **descendant** — the same reading that lets the session live under `tempfile.gettempdir()`.
+  `scripts/review_isolation.py:1006-1018` states that direction explicitly; verified, not assumed.
+
+#### D-6.7 — the six properties this mechanism must not weaken, and what holds each
+
+| property | what could weaken it | what holds it |
+|---|---|---|
+| **S1** — the Reviewer cannot see key material | a seed carrying key vocabulary; a seed nominated *from* the fixture | S-3 (unconditional path refusal), S-4 (pre-screen with pass B's own test), then the admission scan and NEG-5 over `<SESSION>/home`. Measured: 4 pass-B hits on a contaminated seed, 718 hits on a renamed key |
+| **S2/S3** — the profile denies what it claims | a seed changing the profile | It cannot: the seed lands inside an already-admitted, already-writable session root and adds **no clause**. `--agent-path` can only name roots already in the readable set (`assert_agent_path_admitted()`) |
+| **the no-unscanned-descendant invariant** | a destination escaping `home/` | D-1 (`assert_retained_path_field`, which forbids `..` and absolute forms) plus D-3 (resolved containment), plus the routine creating every intermediate itself |
+| **B6's honesty** | content entering after the attestation; a swapped seed | D-6.3's call site (the only window covered by both scans), `assert_seeds_present()`, and D-6.4's digest-bearing inventory of everything actually present |
+| **byte-reproducibility of the attestation** | inherited mtimes; a clock field | D-5 (`copyfile` + fixed `0600`, no `copy2`), and `assert_no_clock_value()` unchanged |
+| **"no new exfiltration path"** | the seed becoming a way to move fixture bytes into the session | S-3 refuses any source under the repo, the fixture, or a key-bearing root, **whatever it is named**; S-4 refuses any source whose content matches the key; and the destination can only ever be `<SESSION>/home`, which the Reviewer's report is not copied out of (G.8 repatriates from `review_root/artifacts/` only) |
+
+### Components / Interfaces / Data Flow
+
+```text
+isolate(run_id, …, seed=(), agent_path=(), …)
+  |
+  +- build_session(...)                                     scripts/review_isolation.py
+  |    (session/"home").mkdir()
+  |    seed_session_home(session, seed, key=…, fixture=…, repo_root=…)   <-- NEW
+  |      1. parse+validate ALL pairs (S-1..S-7, D-1..D-4) before copying ANY
+  |      2. copyfile + chmod 0600 + 0700 parents, in argument order
+  |      3. return manifest[] = {dest, source, bytes, sha256, mode}
+  |    materialize() / policy copy / scan_leak(review_root)   (unchanged)
+  |
+  +- compute_readable_set(...)   <SESSION>/home scanned A/B/C/D/S, key_leak   (unchanged code)
+  +- render_seatbelt_profile(...)                                             (unchanged)
+  +- assert_agent_path_admitted(agent_path, readable)                  <-- NEW, exit 4
+  +- preflight_probe(session, agent_command=<resolved>)     (F-403 wiring, IMPLEMENTATION-owned)
+  +- run_probes(...)             NEG-5 re-scans <SESSION>/home                (unchanged code)
+  +- assert_home_scanned(readable)                                     <-- NEW, exit 4
+  +- assert_seeds_present(session, manifest)                           <-- NEW, exit 4
+  +- inventory_session_home(session, manifest)                         <-- NEW
+  |      lstat-only walk; digests regular files; never opens a non-regular entry
+  +- build_attestation(..., session_home=…)   schema 1.1               <-- one new object
+```
+
+`wrap_command(session, command, agent_path=())` gains one environment variable and no other change.
+Its docstring already explains why `TMPDIR`/`HOME` are launch-line values rather than part of
+`agent_command`; `PATH` is added to the same sentence for the same reason.
+
+### Error Handling / Compatibility
+
+| condition | exit | effect |
+|---|---|---|
+| `--seed` argument does not contain exactly one `:`; source not absolute | `1` | nothing built |
+| any of S-1…S-7 or D-1…D-4 fails; caps exceeded | `4` | validated before any copy, so the session is removed with **no** seeded byte ever written |
+| `--agent-path` entry not in the computed readable set | `4` | session removed |
+| `<SESSION>/home` absent from the scanned Class USR set, or missing from the NEG-5 record | `4` | session removed |
+| a declared seed destination missing at attestation time | `4` | session removed |
+| inventory exceeds `MAX_HOME_INVENTORY` | `4` | session removed, count printed |
+| a seed's digest differs at attestation time | `0` | recorded as `state: "modified"` with the observed digest — an outcome, not a failure |
+
+**No new exit code**, consistent with G.7 and with iterations 2-5.
+
+**Compatibility.** `--seed` and `--agent-path` both default to empty, so every existing invocation
+behaves exactly as it does today — with one honest consequence: **an existing invocation still
+cannot run the real agent**, because that is F-403 and this design does not pretend a default
+closes it. The operator of the §7 capture must pass the seed explicitly, and that is the point: the
+credential's presence in the session is a recorded decision, not an ambient property of the host.
+
+`ISOLATION.json` gains one object and a MINOR schema bump; `FINAL_REVIEW_ISOLATION.json` carries it
+through `repatriate()` unchanged. No `run_logging.py` change, so the byte-identical mirror at
+`orca-worker-reviewer-orchestration/tools/run_logging.py` is untouched. `VERSION`,
+`LICENSE-DECISION.md`, the fixture trees, the answer key, the scorer, the adjudication schema, the
+redaction policy and `release_manifest.py` are all unmodified.
+
+### Expected Changed Files / Implementation Steps
+
+| step | file | change | hard? |
+|---|---|---|---|
+| **1** | `scripts/review_isolation.py` | `seed_session_home()`, `inventory_session_home()`, `assert_home_scanned()`, `assert_seeds_present()`, `assert_agent_path_admitted()`; `MAX_SEEDS`/`MAX_SEED_BYTES`/`MAX_HOME_INVENTORY`; `build_session(..., seed=())`; `isolate(..., seed=(), agent_path=())`; `wrap_command(..., agent_path=())` adds `PATH`; `build_attestation(..., session_home=…)`; `ISOLATION_SCHEMA_VERSION = "1.1"` | **HARD** |
+| **2** | `scripts/final_review_eval.py` | `isolate` parser: `--seed` and `--agent-path`, both `action="append"`, both defaulting to `[]`, with help text carrying the low-entropy-secret caveat; threaded into `_dispatch_isolate()` | **HARD**, same commit as 1 |
+| **3** | `scripts/test_review_isolation.py` | T-10.1 … T-10.12 below | **HARD**, same commit as 1-2 |
+| **4** | docs (`COMPATIBILITY.md` untouched; the isolate section of the operator doc) | the `--seed`/`--agent-path` contract and the closed refusal list | no |
+
+Ordering against the open findings: **F-401's fix must land before this is exercised end to end**
+(see *Risks*), F-402's fix must land before the seeded session is usable at all, and F-403's
+pre-flight wiring is what makes the seed observable. This design does not depend on the *order* of
+the three fixes among themselves, only on all three being in before `B-1′` is re-attempted.
+
+### Testing Strategy
+
+All in `scripts/test_review_isolation.py`, over synthetic roots, with no network and no real
+credential.
+
+| id | asserts |
+|---|---|
+| **T-10.1** | a valid pair lands at `<SESSION>/home/<dest>` with mode `0600`, parents `0700`, content byte-identical to the source |
+| **T-10.2** | S-1: a directory, a symlink and a **FIFO** source are each refused, and the FIFO case must complete in bounded time — the same reproduction shape F-401 needs, pointed at the seed door |
+| **T-10.3** | S-3: a source inside the fixture, inside `key/`, inside `adjudications/`, inside the repo, and one merely *named* `answer_key.json` are each refused |
+| **T-10.4** | S-4: a source containing key vocabulary is refused **before** the copy — the destination must not exist afterwards |
+| **T-10.5** | S-5/S-6/S-7: an executable, a `.zip`, and a non-UTF-8 file are each refused |
+| **T-10.6** | D-1/D-2/D-3: `../escape`, `/abs`, `a b/x` (whitespace), `key/x`, `subject/x`, `answer_key.json`, and a duplicate destination are each refused; and no partial session is left behind |
+| **T-10.7** | S-2: the per-file and total caps, and `MAX_SEEDS` |
+| **T-10.8** | validate-all-then-copy: with pair 1 valid and pair 2 invalid, **neither** is present |
+| **T-10.9** | the seed is visible to the admission scan: a seeded file carrying key vocabulary makes `isolate` exit 4 with the session removed — i.e. the scan is not bypassed |
+| **T-10.10** | the attestation: `session_home.seeded[]` digests match; `dest`/`inventory.entries[].path` pass `assert_retained_path_field()`; `source` is the redacted placeholder; `assert_no_clock_value()` still passes; `schema_version == "1.1"` |
+| **T-10.11** | the inventory: a file created in `home/` **after** the admission scan appears with `origin: "session"`; a **non-regular** entry is recorded with `kind` and **no digest** and is never opened; the `MAX_HOME_INVENTORY` cap fails closed; `tree_digest` is stable across two runs over identical content |
+| **T-10.12** | `--agent-path`: an entry not in the readable set exits 4; an admitted entry appears in `wrap_command()`'s `PATH` ahead of `/usr/bin`, and `TMPDIR`/`HOME` are unchanged |
+
+**And one end-to-end gate that belongs to the capture, not to CI:** the pre-flight's real-agent
+check (F-403's wiring) is what proves the seed actually authenticated. It needs a live credential
+and is therefore not a unit test; it is a mandatory step of `B-1′`, and its `preflight.log` is the
+evidence.
+
+### Risks / Open Issues
+
+* **O-2 is now CLOSED as a design decision**, and its residual is restated narrowly: the agent's
+  state directory is session-scoped (iteration 2), the only content that enters it before the scan
+  is an enumerated, pre-screened, twice-scanned seed (this iteration), and everything the agent
+  itself writes before the attestation is scanned by NEG-5 and enumerated in `session_home.inventory`.
+  What remains — **and it is unchanged from RK-8's class** — is that content written into the
+  session HOME **during the dispatch**, after the attestation, is outside the attestation's reach.
+  The window is one dispatch, the directory is session-private and destroyed with the session, and
+  the threat model is a well-behaved agent. Named, not designed around.
+* **NEW, verified, and IMPLEMENTATION must know it: this design's own scan coverage depends on
+  F-401's fix.** The pre-flight runs the real agent inside `<SESSION>/home`, and NEG-5 then re-scans
+  that root with pass B, which `read_text()`s every non-symlink entry the walk reaches. The
+  operator's real `$CODEX_HOME` **contains a unix socket** (measured, §D). This host's *fresh*
+  seeded HOME produced 214 files and **no** non-regular entry after one trivial prompt (§E), so the
+  hazard did not fire here — but it is one agent version away from firing, and inside the session
+  HOME rather than in `/dev`. **F-401's fix must therefore be the general policy — pass B reads only
+  `S_ISREG` entries — and not a `/dev` special case.** This is not a reopening of F-401: its
+  severity, ownership and required action are unchanged. It is one more reason its required action
+  must be written generally, and D-6.4's inventory walk is written `lstat`-only for the same reason.
+* **Newly reachable, named rather than closed: `.pptx`/`.docx` in the session HOME.** The agent's
+  plugin cache writes ZIP-container documents whose extensions pass D does not enumerate
+  (`.tar/.tar.gz/.tgz/.zip`) and which pass B cannot decode (§E). They are the agent's own
+  network-fetched assets and cannot contain the key under the stated threat model, and they are
+  enumerated with digests in `session_home.inventory`. Widening pass D's extension set is a
+  **separate work package**, out of this iteration's scope, and this design does not silently
+  assume it.
+* **The digest-as-verifier residual (D-6.4)**: a recorded sha256 lets a holder of the attestation
+  test a *guessed* plaintext. Harmless for a high-entropy bearer token, not harmless for a
+  passphrase. Goes into `ISOLATION.json.limitations[]` and the `--seed` help text; deliberately
+  not turned into a check that would pretend to measure entropy.
+* **A colon in a source path cannot be seeded** (D-6.1's grammar). Accepted, stated in `--help`.
+* **`--agent-path` is a second flag naming what `--allow-read` already scanned.** The redundancy is
+  the safety property: the second flag cannot exceed the first, and
+  `assert_agent_path_admitted()` enforces it. A future "simplification" that derives `PATH` from
+  the readable set automatically would put every admitted root on the agent's `PATH`, which is a
+  strictly larger surface than the operator asked for.
+* **Not reopened:** F-401, F-402 (both IMPLEMENTATION-owned, unchanged), D-H.2, D-4.1, RK-7,
+  mandatory pass B (D-5.1), pass C's size prefilter, pass S's Class-USR-only scope, pass D's
+  extension list, D-I, `COMPATIBILITY.md`, O-1 and O-3. **O-1 remains open and undischarged** —
+  `orca_check_probe()` still has no caller; wiring it is IMPLEMENTATION's, per F-403.
