@@ -5752,3 +5752,513 @@ to `test_the_gitattributes_rules_are_exactly_the_ones_designed`, `HARD_BREAK_REP
   D-I, `COMPATIBILITY.md`, F-401, F-402, D-H.2, RK-7, O-1/O-2/O-3, B1's criterion text, the probe
   ordering, and **D-A.6″'s seven rules**. RK-1…RK-18 stand unchanged. **F-502 remains
   `implementation`-owned, untouched, and still blocking.**
+
+---
+
+## DESIGN iteration 2 — correction for F-801
+
+# Worker Result
+
+STATUS: COMPLETE
+
+## Summary / Requirements
+
+**What F-801 said.** D-A.7 (iteration 1) declares the `attempt` domain — exact type `int`, `bool`
+excluded, `>= 1` — and enforces it at three boundaries: `repatriate()`, `isolate()`, and the
+`final_review_eval.py isolate --attempt` CLI door. D-A.7.4 then *declined* a check in
+`build_attestation()` on a reachability argument, and RK-20 *declined* one in
+`run_logging.final_review_report_ladder_path()` on the same kind of argument. F-801 is that a
+reachability argument is the wrong argument: **both functions are public, module-level, and callable
+directly from Python**, so "no shipped caller reaches them unchecked" is a statement about today's
+call graph, not an enforced invariant.
+
+**F-801 is accepted in full. Iteration 1's two declines are withdrawn.** The replacement rule is
+stated once and is not conditional on any call graph:
+
+> **INV-ATTEMPT-2 (supersedes and strengthens D-A.7.4's third column).** *Every* public,
+> module-level function in this repository that receives an `attempt` and turns it into
+> **identity, a path, retained document content, or reported output** validates the domain as its
+> first statement, independently of who calls it. Reachability is never a reason to omit a gate; it
+> is at most a reason to rank which gate to write first.
+
+**Two things this correction adds beyond F-801's literal text**, both because the task asked for a
+genuinely exhaustive re-census and the census found them:
+
+* **A third path producer F-801 did not name** — `e2e_harness.final_review_artifact_path()`
+  (`scripts/e2e_harness.py:423`). It has the `< 1` half and not the type half, exactly like the
+  ladder path, and it builds `artifacts/runs/<run>/FINAL_REVIEW_iteration2.0.md` from `2.0`.
+  **Reproduced against shipped code** (M-24b).
+* **A second CLI door, and one unguarded subcommand behind it** —
+  `run_logging.py final-review-audit-provenance --attempt <n>` (documented at `README.md:201` and
+  `orca-worker-reviewer-orchestration/SKILL.md:1327`) reaches
+  `read_final_review_attempt_provenance()`, which is public, takes `attempt`, and today **exits 0
+  and prints a report containing `"final_review_attempt": 0`**. **Reproduced against shipped code**
+  (M-26). Iteration 1's census recorded this module's `--attempt` as "already guarded — M-17"; that
+  is true of `final-review-audit-write` and **false** of `final-review-audit-provenance`.
+
+**One correction to iteration 1's own claim, stated plainly:** D-A.7.6 asserted "There is exactly
+one CLI door into this code." That is correct about `review_isolation`'s code and **wrong as a
+statement about the `attempt` quantity** — `run_logging.py` has its own `argparse` CLI with two
+`--attempt` subcommands, and it ships to users inside the Skill as `tools/run_logging.py`. There are
+**two** doors. C-4 and C-5 below are the searches that show it.
+
+**Scope held.** The CLI/`repatriate()`/`isolate()` gates confirmed sound in iteration 1 are
+unchanged. The sandbox isolation mechanism, the F-501 relay shim, the F-601 redaction-ordering fix,
+the evidence-bundle sanitization, D-6.0–D-6.9, mandatory pass B, D-I, and D-A.6″'s seven
+`.gitattributes` rules are not reopened. D-A.7.1 (the domain), D-A.7.2 (no upper bound), D-A.7.5
+(fail-closed behaviour and the 1-vs-2 exit-code asymmetry) and D-A.7.7 (INV-ATTEMPT) stand as
+written; D-A.7.3, D-A.7.4 and D-A.7.6 are corrected below, and RK-20 is closed.
+
+## Current Architecture
+
+### C-0 — the census methodology, stated so a reviewer can re-run it
+
+Iteration 1's census was asserted ("Answered by grep over the whole repository") without the
+commands. These are the exact commands, run from the repository root on branch
+`agent/final-review-observability-evaluation`. Every claim in this section is an output of one of
+them; nothing below is from memory or from M-19.
+
+```bash
+# C-1  every function whose signature line mentions `attempt` (single-line signatures)
+git ls-files '*.py' | grep -v '^scripts/fixtures/' \
+  | xargs grep -nE '^[[:space:]]*(def|async def) .*\battempt\b'
+
+# C-2  the other half: multi-line signatures and keyword call sites, i.e. an
+#      `attempt`-named parameter or argument on its own continuation line
+git ls-files '*.py' | grep -v '^scripts/fixtures/' \
+  | xargs grep -nE '^[[:space:]]+attempt[a-z_]*[:=]' | grep -v 'self\.'
+
+# C-3  every reader of the parsed CLI value, and every reader/writer of the field name
+git ls-files '*.py' | grep -v '^scripts/fixtures/' | xargs grep -n 'args\.attempt'
+git ls-files '*.py' | grep -v '^scripts/fixtures/' | xargs grep -n 'final_review_attempt'
+
+# C-4  every CLI declaration of the flag -- this is what found the SECOND door
+git ls-files '*.py' | grep -v '^scripts/fixtures/' | xargs grep -n '"--attempt"'
+
+# C-5  the flag outside Python and outside artifacts/ (docs, skills, CI, shell)
+git ls-files | grep -v '\.py$' | grep -v '^artifacts/' | xargs grep -ln -- '--attempt'
+
+# C-6  a non-int literal passed as `attempt=` anywhere on a non-test path
+git ls-files 'scripts/*.py' | grep -v '^scripts/test_' | grep -v fixtures \
+  | xargs grep -nE "attempt=(True|False|'|\"|[0-9]+\.)"
+
+# C-7  is there a CLI door inside the two library modules themselves?
+grep -nE "__main__|import argparse|^def main\(" scripts/review_isolation.py
+grep -nE "__main__|import argparse|^def main\(" scripts/e2e_harness.py
+```
+
+**C-6 returns nothing** (no non-int literal is passed as `attempt=` on any non-test path).
+**C-7 returns nothing for either module** — neither `review_isolation.py` nor `e2e_harness.py` has
+a `__main__` block, an `argparse` import, or a `main()`; both are library-only. **C-5 returns
+exactly two files**, `README.md` and `orca-worker-reviewer-orchestration/SKILL.md`, both of which
+document `run_logging.py`'s `--attempt` — which is how the second door was found.
+
+### C-8 — the complete census result, every hit classified
+
+`attempt`-consuming or `attempt`-producing surfaces, from C-1 through C-7, with nothing dropped.
+`RuntimeAttempt`/`attempts`-collection hits (`orca_runtime_harness.py:381/3107`,
+`test_orca_runtime_contract.py:2705`, `run_logging.py:2558`) are a **different quantity** — a
+dataclass of dispatch state, not the ordinal — and are listed so the reader can see they were looked
+at rather than skipped.
+
+| # | surface | class | does it turn `attempt` into identity / path / retained content / output? | status before this correction |
+|---|---|---|---|---|
+| 1 | `review_isolation.repatriate()` `:2612` | public fn | **path** — `FINAL_REVIEW_iteration<N>.md`, workspace dir | **GATED** (D-A.7.4 boundary 1) |
+| 2 | `review_isolation.isolate()` `:2665` | public fn | **retained** — via `build_attestation()` | **GATED** (boundary 2) |
+| 3 | `final_review_eval._dispatch_isolate()` `:1394/:1407` (`args.attempt`) | CLI door 1 | forwards to 1 and 2 | **GATED** (boundary 3) |
+| 4 | `review_isolation.build_attestation()` `:2451` | public fn | **retained** — writes `ISOLATION.json`'s `final_review_attempt` | **UNGATED — F-801(a)** |
+| 5 | `run_logging.final_review_report_ladder_path()` `:1494` | public fn | **path** — same filename family | **PARTIAL — F-801(b)**: has `< 1`, no type check |
+| 6 | `e2e_harness.final_review_artifact_path()` `:423` | public fn | **path** — same filename family | **PARTIAL — new, this census**: has `< 1`, no type check |
+| 7 | `run_logging.read_final_review_attempt_provenance()` `:2413` | public fn | **output** — echoes into the returned/printed provenance JSON | **UNGATED — new, this census** |
+| 8 | `run_logging.py final-review-audit-provenance --attempt` `:2832/:2926` | CLI door 2 | forwards to 7 | **UNGATED — new, this census** |
+| 9 | `run_logging.py final-review-audit-write --attempt` `:2801/:2907` | CLI door 2 | forwards to 10 | **GATED** transitively (see 10) |
+| 10 | `run_logging.final_review_dispatch_key()` `:1697` | public fn | **identity** — the dispatch-key directory name | **GATED** (shipped; M-17) |
+| 11 | `run_logging.publish_final_review_audit_record()` `:2101` | public fn | identity + path | **GATED** — calls 10 at `:2138` before 5 at `:2152` |
+| 12 | `run_logging.resolve_final_review_report()` `:1504` | public fn | path | **covered transitively** — its only path construction is 5 |
+| 13 | `run_logging.probe_final_review_report()` `:1619` | public fn | path (read-only) | **covered transitively** — delegates to 12 |
+| 14 | `run_logging._log_audit_event()` `:2296` | **private** (`_`-prefixed) | log detail text | not a public boundary; every caller is 11, after 10's gate |
+| 15 | `e2e_harness.FinalReviewRunner._write_final_review_audit()` `:1345` | **method**, not module-level | delegates to 6 and 11 | **covered transitively** by 6 and 10 |
+| 16 | `orca_runtime_harness.py:2242` `final_review_attempt=attempt.iteration` | call site | forwards to `write_final_review_audit_record` | **covered transitively** by 10 |
+| 17 | `review_isolation.attempt()` `:1988` | local helper | **not this quantity** — `attempt(label, thunk)` is a probe-runner; the name collides, the meaning does not | n/a |
+| 18 | `orca_runtime_harness.RuntimeAttempt` / `attempts` collections | dataclass/list | **not this quantity** | n/a |
+| 19 | `scripts/test_*.py` direct calls to 1/2/4/5/6/10 | tests | — | tests; they are the *reason* the direct-call boundary is real, not an entry point to gate |
+
+**The census yields four surfaces to gate: 4, 5, 6 and 7** (and 8 is closed by gating 7). 12 and 13
+need no gate of their own because their only route to a path is 5, which is gated — and unlike
+iteration 1's declines, that is a statement about a **call inside the same function body**, not
+about the shape of the wider call graph.
+
+### C-9 — the import graph, measured, because it decides the shared-helper question
+
+The task asks to prefer a single shared validator unless it would introduce a prohibited import
+cycle. Measured:
+
+| module | imports `run_logging`? | imports `review_isolation`? | imports `e2e_harness`? |
+|---|---|---|---|
+| `scripts/run_logging.py` | — | **no** (`grep -n 'review_isolation\|final_review_eval' scripts/run_logging.py` → no hits) | no |
+| `scripts/review_isolation.py` | **yes, module level** (`:68`) | — | no |
+| `scripts/e2e_harness.py` | **yes, module level** (`:17`, `from scripts import run_logging`) | no | — |
+| `scripts/final_review_eval.py` | **yes, module level** (`:49`) | yes, **function-local** (`:1383`) | no |
+
+`scripts/run_logging.py` imports **only the standard library** (`argparse, hashlib, json, math, os,
+re, secrets, shutil, subprocess, sys, datetime, pathlib, typing`). It is the **sink** of this
+dependency graph.
+
+**Conclusion: a shared helper hosted in `run_logging.py` introduces ZERO new imports anywhere**, and
+therefore cannot introduce a cycle. All three consumers already import it at module level. The
+alternative — hosting it in `review_isolation.py` — *would* create a cycle, because `run_logging`
+would have to import back. So the two-independent-identical-checks fallback is **not needed**, and
+this design does not use it.
+
+### C-10 — the constraint iteration 1 missed: `run_logging.py` is byte-mirrored into the Skill
+
+`scripts/run_logging.py` and `orca-worker-reviewer-orchestration/tools/run_logging.py` are
+**byte-identical** (`diff -q` reports no difference; 134,092 bytes each), and that identity is
+**enforced by a validator**, `scripts/validate_skills.py:2074-2098`, with its own test at
+`scripts/test_validate_skills.py:129`. A global or project-local Skill install never copies this
+repository's `scripts/`, so the Skill ships its own copy. Measured (M-27): editing
+`scripts/run_logging.py` without mirroring turns
+`python3 scripts/validate_skills.py` from `PASSED (463 checks)` into
+`FAILED (1 errors, 463 checks)` with
+`orca-worker-reviewer-orchestration: tools/run_logging.py differs from scripts/run_logging.py`.
+
+**Any change to `run_logging.py` must be mirrored in the same commit.** This is a mechanical `cp`,
+but omitting it breaks the build, and it means the corrected boundary genuinely ships to users
+rather than only existing in this repository.
+
+## Proposed Design
+
+### D-A.7.3′ — the validator, corrected: one predicate, two exception facades
+
+D-A.7.3 put `ATTEMPT_MIN` and `assert_attempt_in_domain()` in `review_isolation.py`. **That
+placement is withdrawn.** The rule must now be enforced in three modules, and C-9 shows only one
+placement is cycle-free.
+
+**The rule lives once, in `scripts/run_logging.py`, as a predicate that raises nothing**, placed
+immediately above `final_review_dispatch_key()` — the function that already contains this exact
+check, so the new code is an *extraction*, not an invention:
+
+```python
+ATTEMPT_MIN = 1
+
+
+def attempt_domain_violation(attempt: object, label: str = "attempt") -> str | None:
+    """The Final Review attempt domain, as ONE predicate. Message, or None if legal.
+
+    Domain: exact type `int` (a `bool` is NOT an int here), and `>= ATTEMPT_MIN`.
+
+    It deliberately RAISES NOTHING. Three modules enforce this same rule and each
+    owns a different exception contract -- `run_logging` raises `RunLoggingError`,
+    `review_isolation` must raise an `EvalInputError` subclass so
+    `_dispatch_isolate`'s dual-module-identity `except` maps it to exit 1, and
+    `e2e_harness` raises a plain `ValueError`. A shared *raiser* would force one of
+    them to change its error contract; a shared *predicate* gives all of them the
+    identical rule and the identical message text while each keeps its own type.
+    """
+    if not isinstance(attempt, int) or isinstance(attempt, bool):
+        return f"{label} must be an int >= {ATTEMPT_MIN}, got {attempt!r}"
+    if attempt < ATTEMPT_MIN:
+        return f"{label} must be >= {ATTEMPT_MIN}, got {attempt!r}"
+    return None
+
+
+def assert_attempt_in_domain(attempt: object, *, label: str = "attempt") -> int:
+    """`run_logging`'s facade over `attempt_domain_violation()`. Returns the value."""
+    message = attempt_domain_violation(attempt, label)
+    if message is not None:
+        raise RunLoggingError(message)
+    return attempt
+```
+
+**Why a predicate and not one shared raiser** — this is the design's one real decision, so it is
+argued rather than asserted:
+
+* `review_isolation` **cannot** raise `RunLoggingError`. Its refusal has to be a
+  `final_review_eval.EvalInputError` subclass, because `_dispatch_isolate`'s `except` clause is what
+  maps it to exit `1`, and that clause exists *at all* only because `final_review_eval` runs as
+  `__main__` while `review_isolation` does its own `import final_review_eval` — two `EvalInputError`
+  classes, no subclass relationship across them. A `RunLoggingError` escaping that clause is
+  IMPLEMENTATION F-503's defect, exactly.
+* `e2e_harness` **can** reuse `run_logging`'s raiser, and does — because `RunLoggingError` is
+  declared `class RunLoggingError(ValueError)` (`run_logging.py:161`), so every existing
+  `except ValueError` / `assertRaises(ValueError)` around `final_review_artifact_path()` still
+  catches it. This is a subtype-compatible substitution, verified in M-25b, not a contract change.
+* So: **two facades, not three.** `run_logging.assert_attempt_in_domain()` serves `run_logging`
+  *and* `e2e_harness`; `review_isolation.assert_attempt_in_domain()` is a four-line facade over the
+  same predicate. **The rule and the message text exist exactly once.** The prohibited alternative —
+  "two independent but textually identical checks" — is explicitly **not** used here, because C-9
+  proves it is not necessary.
+
+`review_isolation.py`'s facade, placed immediately above `IsolationSeedGrammarError` as D-A.7.3
+specified:
+
+```python
+class IsolationAttemptDomainError(final_review_eval.EvalInputError):
+    """`attempt` outside its declared domain. Maps to EXIT_INPUT_ERROR (1), like every
+    other argument-grammar failure -- nothing is built, so there is nothing to remove."""
+
+
+def assert_attempt_in_domain(attempt: object, *, label: str = "attempt") -> int:
+    """This module's facade over `run_logging.attempt_domain_violation()`.
+
+    Same rule, same message text, different exception type -- the type has to be an
+    `EvalInputError` subclass or `_dispatch_isolate`'s `except` cannot map it to
+    exit 1 (IMPLEMENTATION F-503's defect).
+    """
+    message = run_logging.attempt_domain_violation(attempt, label)
+    if message is not None:
+        raise IsolationAttemptDomainError(message)
+    return attempt
+```
+
+`review_isolation.ATTEMPT_MIN` from D-A.7.3 is **dropped** — the constant lives once, in
+`run_logging`, and `review_isolation` never interpolates it because the message comes from the
+shared predicate. Gates 1, 2 and 3 keep the call shape D-A.7.4 specified
+(`attempt = assert_attempt_in_domain(attempt)`, and `label="--attempt"` at the CLI); only the
+*body* of `review_isolation.assert_attempt_in_domain()` changes, from an inline check to a
+delegation. **Iteration 1's three gates need no other edit.**
+
+### D-A.7.4′ — the boundaries, corrected: seven, not three
+
+D-A.7.4's table stands for boundaries 1–3. Its **third column for `build_attestation()` is
+withdrawn** — "unreachable with an unchecked `attempt` from any shipped call path" is a call-graph
+fact, and INV-ATTEMPT-2 does not accept call-graph facts as substitutes for gates. RK-20's decline
+is withdrawn for the same reason.
+
+| # | boundary | placement | why |
+|---|---|---|---|
+| **1** | `review_isolation.repatriate()` | first statement | **unchanged from D-A.7.4** |
+| **2** | `review_isolation.isolate()` | first statement | **unchanged from D-A.7.4** |
+| **3** | `final_review_eval._dispatch_isolate()` | first statement inside the existing `try:` | **unchanged from D-A.7.4** |
+| **4** | `review_isolation.build_attestation()` | **first statement of the body**, before `verdicts = {…}` and therefore before any field of the document is computed | **F-801(a).** The value goes into `ISOLATION.json`'s `final_review_attempt` — a **retained** artifact, and `json.dumps` happily serializes `false`, `null`, `2.0` and `"2"` into a schema-1.2 document (M-24c). `scripts/test_review_isolation.py:803/1918` already calls this function directly. Uses `review_isolation.assert_attempt_in_domain()`, so the CLI's `except` maps it to exit 1 if it ever fires through gate 3's module |
+| **5** | `run_logging.final_review_report_ladder_path()` | **replaces** the existing `if attempt < 1:` block, same position (first statement) | **F-801(b).** Same filename family as boundary 1. It has the `< 1` half and not the type half, so `2.0` yields `FINAL_REVIEW_iteration2.0.md` (M-24a) — an **unexempted, digest-bound, generatable** path, which is the precise thing D-A.6″'s pattern derivation assumes cannot exist. Uses `run_logging.assert_attempt_in_domain(…, label="final_review_attempt")` |
+| **6** | `e2e_harness.final_review_artifact_path()` | **replaces** the existing `if attempt < 1:` block, same position | **New in this census.** A third public producer of the same filename family, with the same half-check and the same `2.0` outcome (M-24b). Uses `run_logging.assert_attempt_in_domain()`; `RunLoggingError` **is** a `ValueError`, so the existing raise contract is preserved |
+| **7** | `run_logging.read_final_review_attempt_provenance()` | **first statement of the body**, before the record scan | **New in this census.** Public, and the only thing standing behind CLI door 2's `final-review-audit-provenance` subcommand, which today exits **0** and prints `"final_review_attempt": 0` (M-26). It writes no file, but it emits a report that a reader would take as an answer about a run. Uses `run_logging.assert_attempt_in_domain(…, label="final_review_attempt")` |
+
+**`final_review_dispatch_key()` is refactored, not re-checked.** Its two inline checks are the ones
+being extracted into the shared predicate; it calls
+`assert_attempt_in_domain(final_review_attempt, label="final_review_attempt")` instead. This is why
+`label` exists, and it is why the shared messages are **byte-identical to the shipped ones** (M-24d,
+proven for every value that reaches those branches today) — the extraction is behaviour-preserving
+by construction, not by hope.
+
+**No gate for surfaces 12, 13, 14, 15, 16** (C-8). The distinction that makes this a rule rather
+than a second reachability excuse: each of those either is **private** (14), is a **method rather
+than a public module-level function** (15), or **constructs no path/identity/retained value of its
+own** — its only route to one is a call to a gated function *in its own body* (12, 13, 16). A
+reviewer can confirm that by reading one function; it does not require trusting a call graph.
+
+### D-A.7.6′ — the other-entry-point question, corrected
+
+D-A.7.6's bullet "There is exactly one CLI door into this code" is **withdrawn and replaced**:
+
+* **There are two CLI doors to the `attempt` quantity** (C-4, C-5):
+  1. `final_review_eval.py isolate --attempt N` (`final_review_eval.py:1361`) — gate 3.
+  2. `run_logging.py final-review-audit-write|final-review-audit-provenance --attempt N`
+     (`run_logging.py:2801`, `:2832`), **which also ships to users** as
+     `python3 <SKILL_DIR>/tools/run_logging.py …` (`README.md:199-201`,
+     `orca-worker-reviewer-orchestration/SKILL.md:1320/1327`). Its `-write` form is gated
+     transitively by `final_review_dispatch_key()`; its `-provenance` form is **not**, and gate 7
+     closes it.
+* **`review_isolation.py` and `e2e_harness.py` each have no CLI door of their own** — C-7 returns
+  nothing for `__main__`, `import argparse` and `def main(` in both. That half of D-A.7.6 is
+  re-verified and stands.
+* **Seven public Python callables take `attempt` and turn it into identity/path/retained
+  content/output**, all seven now gated (C-8 rows 1, 2, 4, 5, 6, 7, 10). The repository's own tests
+  call five of them directly, which is what makes the direct-call boundary a real boundary rather
+  than a hypothetical one.
+* **No shell script, workflow, CI config or `Makefile` passes `--attempt`** — C-5 returns exactly
+  two files, both Markdown documentation of door 2.
+
+**RK-20 is CLOSED**, not carried forward: the ladder path now has both halves of the check.
+
+## Components / Interfaces / Data Flow
+
+New and changed surfaces, complete. Deltas to D-A.7's table; rows it declared that are unchanged are
+not repeated.
+
+| surface | kind | shape |
+|---|---|---|
+| `run_logging.ATTEMPT_MIN` | **new** module constant | `ATTEMPT_MIN = 1` — the single home of the number; `review_isolation.ATTEMPT_MIN` from D-A.7.3 is **not** created |
+| `run_logging.attempt_domain_violation` | **new** function | `(attempt: object, label: str = "attempt") -> str | None` — raises nothing; the single implementation of the rule and of the message text |
+| `run_logging.assert_attempt_in_domain` | **new** function | `(attempt: object, *, label: str = "attempt") -> int` — raises `RunLoggingError` (a `ValueError`) |
+| `run_logging.final_review_dispatch_key` | **unchanged signature**, two inline checks → one call | messages byte-identical (M-24d) |
+| `run_logging.final_review_report_ladder_path` | **unchanged signature**, `if attempt < 1:` → one call | **gains** the type half |
+| `run_logging.read_final_review_attempt_provenance` | **unchanged signature**, one added first statement | **gains** the whole check |
+| `review_isolation.IsolationAttemptDomainError` | **new** exception | as D-A.7.3 specified, unchanged |
+| `review_isolation.assert_attempt_in_domain` | **new** function | same signature as D-A.7.3; **body delegates** to the shared predicate |
+| `review_isolation.build_attestation` | **unchanged signature**, one added first statement | **gains** the check |
+| `e2e_harness.final_review_artifact_path` | **unchanged signature**, `if attempt < 1:` → one call | **gains** the type half; raise type widens `ValueError` → `RunLoggingError(ValueError)` — a subtype, so no caller contract moves |
+| `orca-worker-reviewer-orchestration/tools/run_logging.py` | **mirror** | byte-identical copy of the changed `scripts/run_logging.py`; enforced by `validate_skills.py` (C-10, M-27) |
+
+Data flow — D-A.7.4's diagram, extended with the four new gates and the second door:
+
+```
+DOOR 1: final_review_eval.py isolate --attempt <text>
+        │  argparse type=int  (non-integer text: usage error, exit 2, nothing built)
+        ▼
+   _dispatch_isolate ──[GATE 3]──> exit 1 on refusal
+        ├── --teardown   ──> teardown()                       (gate 3 still applied)
+        ├── --repatriate ──> repatriate()   ──[GATE 1]──> suffix ──> paths
+        └── (default)    ──> isolate()      ──[GATE 2]──> build_session()
+                                                  └─> build_attestation() ──[GATE 4]──> ISOLATION.json
+
+DOOR 2: run_logging.py | <SKILL_DIR>/tools/run_logging.py --attempt <text>
+        │  argparse type=int, required=True
+        ├── final-review-audit-write      ──> publish_… ──> final_review_dispatch_key() ──[GATE 0*]
+        │                                            └──> final_review_report_ladder_path() ──[GATE 5]
+        └── final-review-audit-provenance ──> read_final_review_attempt_provenance() ──[GATE 7]
+
+LIBRARY-ONLY (no door of its own):
+        e2e_harness.final_review_artifact_path()  ──[GATE 6]──> artifacts/runs/<run>/FINAL_REVIEW*.md
+
+        * GATE 0 = the shipped check in final_review_dispatch_key(), refactored onto the
+          shared predicate with byte-identical messages (M-24d).
+```
+
+Every gate is the same rule, from the same predicate, with the same message text. **A direct Python
+caller entering at any of GATE 1, 2, 4, 5, 6, 7 or 0 is refused identically** — that is the property
+F-801 asked for, and it no longer depends on any statement about who calls what.
+
+## Error Handling / Compatibility
+
+* **No new exit code, no new exception hierarchy.** `IsolationAttemptDomainError` is D-A.7.3's, and
+  `RunLoggingError` is shipped. Gates 5, 6, 7 and 0 raise `RunLoggingError`; gates 1, 2, 3 and 4
+  raise `IsolationAttemptDomainError`, which `_dispatch_isolate`'s widened `except` tuple (D-A.7.4,
+  unchanged) maps to exit `1`.
+* **Zero message-text changes at the shipped boundaries.** M-24d proves the extracted predicate
+  reproduces `final_review_dispatch_key()`'s two messages, `final_review_report_ladder_path()`'s
+  message and `e2e_harness.final_review_artifact_path()`'s message **byte-for-byte** for every value
+  that reaches those branches under shipped code. New text appears only where shipped code produced
+  *no* message at all (the type half at gates 5/6, and all of gate 4 and gate 7).
+* **`e2e_harness`'s raise type widens from `ValueError` to `RunLoggingError`, which subclasses
+  `ValueError`.** Named because it is the one type change in this design. `except ValueError` and
+  `assertRaises(ValueError)` both still catch it (M-25b); no test in the repository asserts the
+  exact type or the exact message of that raise (C-3 over `scripts/test_*.py` for
+  `must be >= 1` returns nothing).
+* **`ISOLATION.json` schema is unchanged at `1.2`.** What changes is that `final_review_attempt` can
+  no longer be `false`, `null`, `2.0` or `"2"` — all four were accepted and serialized by shipped
+  code (M-24c). The field's declared type and meaning were always `int >= 1`; the gate makes the
+  document match its own schema.
+* **`final-review-audit-provenance --attempt 0` changes from exit 0 with a report to exit 1 with a
+  refusal.** This is the intended behaviour change and the only externally visible one at door 2. It
+  matches what its sibling `final-review-audit-write --attempt 0` already does today
+  (M-26 measured shipped `rc=1`, nothing written), so door 2 becomes **internally consistent** rather
+  than gaining a new convention.
+* **The Skill mirror must be updated in the same commit** (C-10). Otherwise `validate_skills.py`
+  fails the build (M-27) and, worse, an installed Skill would keep the ungated `tools/run_logging.py`.
+* **No behaviour change for any valid attempt**, at any of the seven boundaries, measured across
+  `attempt ∈ {1, 2, 3, 9, 10, 42, 99, 100}` (M-25a/b/c) — same names, same digests, same reports.
+* **No signature changes, no default changes, no `--attempt` declaration changes** at either door.
+
+## Expected Changed Files / Implementation Steps
+
+Deltas to D-A.7's list; steps 1–3 of that list stand except where amended here. **Prototype size,
+measured** (`git diff --numstat`, prototype applied to the real tree and then reverted):
+`run_logging.py` **+36/−13**, `review_isolation.py` **+19/−0**, `e2e_harness.py` **+1/−2**, plus the
+byte-identical mirror.
+
+1. **`scripts/run_logging.py`** — add `ATTEMPT_MIN`, `attempt_domain_violation()` and
+   `assert_attempt_in_domain()` immediately above `final_review_dispatch_key()`; replace
+   `final_review_dispatch_key()`'s two inline checks with one call
+   (`label="final_review_attempt"`); replace `final_review_report_ladder_path()`'s
+   `if attempt < 1:` block with one call (**GATE 5**); add one call as the first statement of
+   `read_final_review_attempt_provenance()` (**GATE 7**). **Nothing else in this file changes** — in
+   particular the `suffix` expression is left exactly as shipped.
+2. **`orca-worker-reviewer-orchestration/tools/run_logging.py`** — `cp scripts/run_logging.py` onto
+   it, **in the same commit**. Verify with `python3 scripts/validate_skills.py` (must stay
+   `PASSED (463 checks)`; M-27 shows what a missed mirror looks like).
+3. **`scripts/review_isolation.py`** — add `IsolationAttemptDomainError` and the delegating
+   `assert_attempt_in_domain()` above `IsolationSeedGrammarError`; **do not** add `ATTEMPT_MIN`
+   here (D-A.7.3′); add `attempt = assert_attempt_in_domain(attempt)` as the first statement of
+   `build_attestation()`'s body, before `verdicts = {…}` (**GATE 4**), and as the first statement of
+   `repatriate()` and `isolate()` (**GATES 1 and 2**, unchanged from D-A.7.4).
+4. **`scripts/e2e_harness.py`** — replace `final_review_artifact_path()`'s
+   `if attempt < 1: raise ValueError(...)` with
+   `attempt = run_logging.assert_attempt_in_domain(attempt)` (**GATE 6**). No new import —
+   `run_logging` is already imported at `:17`.
+5. **`scripts/final_review_eval.py`** — **unchanged from D-A.7.4 step 2** (GATE 3 plus the widened
+   `except` tuple).
+6. **`.gitattributes`** — **unchanged from D-A.7 step 3** (the two comment lines), except that the
+   comment text must now name **seven** boundaries and the shared predicate
+   `run_logging.attempt_domain_violation()`, not three boundaries and
+   `review_isolation.assert_attempt_in_domain()`. No rule is added, removed, reordered or
+   re-spelled; `GITATTRIBUTES_RULES` stays the same seven-tuple (M-20a).
+7. **`scripts/test_review_isolation.py`** — T-13.1, T-13.3, T-13.4′, T-13.5 and the new **T-13.6**.
+8. **`scripts/test_final_review_eval.py`** — T-13.2, unchanged.
+9. **`scripts/test_run_logging.py`** — the new **T-13.7** and **T-13.8**. (D-A.7 step 6 said "no
+   change" to this file; that is **withdrawn** — gates 5 and 7 live in this module.)
+10. **`scripts/test_e2e_harness.py`** — the new **T-13.9**.
+
+Steps 1–10 land in **one commit**, for D-A.7's stated reason: a domain check without its negative
+tests is the shape of defect this remediation has been closing.
+
+## Testing Strategy
+
+T-13.1, T-13.2, T-13.3 and T-13.5 stand as D-A.7 wrote them. T-13.4 is corrected and four tests are
+added — one per newly gated boundary, each following the established shape (invalid values including
+`0`, negative, `bool`, `float`, malformed; valid values including the existing positive-path
+regression case).
+
+| id | file | asserts |
+|---|---|---|
+| **T-13.4′** | `test_review_isolation.py` | **the census made executable — corrected.** D-A.7's T-13.4 asserted a *reachability* claim about `build_attestation()`; that clause is **deleted**, because gate 4 now makes the claim unnecessary. What remains and is extended: source-level, `assert_attempt_in_domain` appears in the body of `repatriate()`, `isolate()` **and `build_attestation()`**, and in each it precedes every other statement; and the module still declares no `__main__`, no `import argparse` and no `main()`. **Added:** the same source-level assertion over `run_logging.final_review_report_ladder_path`, `run_logging.read_final_review_attempt_provenance` and `e2e_harness.final_review_artifact_path`, so a future contributor cannot delete a gate and stay green. **Added:** an assertion that `scripts/run_logging.py` and `orca-worker-reviewer-orchestration/tools/run_logging.py` are byte-identical (C-10) — cheap here, and it fails loudly if a later attempt-domain edit forgets the mirror |
+| **T-13.6** | `test_review_isolation.py` | **GATE 4 — `build_attestation()`.** Invalid: for `attempt ∈ {0, -1, -12, False, True, 2.0, "2", None}`, `assertRaises(IsolationAttemptDomainError)` with the message `"<label> must be >= 1"` for the first three and `"must be an int >= 1"` for the rest. **And the half a bare `assertRaises` would miss:** the refusal happens before any document field is built, asserted by calling with an *otherwise-invalid* `readable` that would raise `IsolationError` if the body ran — the domain error must win. Valid: `attempt ∈ {1, 2, 100}` returns a document whose `final_review_attempt` is exactly that `int`, and `json.dumps(document)` round-trips it as a JSON number — the positive-path regression, and the direct counter-assertion to M-24c's `false`/`null`/`"2"` leak |
+| **T-13.7** | `test_run_logging.py` | **GATE 5 — `final_review_report_ladder_path()`.** Invalid: the same eight values raise `RunLoggingError`, with `"must be an int >= 1"` for the type failures — the half shipped code lacked (M-24a). Valid: `attempt ∈ {1, 2, 3, 9, 10, 42, 99, 100}` returns exactly `FINAL_REVIEW.md` for 1 and `FINAL_REVIEW_iteration<N>.md` otherwise, `100` included for D-A.7.2's reason. **Plus the extraction's own regression:** `final_review_dispatch_key()`'s refusal messages for `0`, `-1`, `False`, `2.0`, `"2"` are asserted **verbatim** against the shipped strings, so the refactor in step 1 cannot silently reword a message that another test or a human reads (M-24d, pinned) |
+| **T-13.8** | `test_run_logging.py` | **GATE 7 and CLI door 2.** Function: `read_final_review_attempt_provenance(run, 0)` raises `RunLoggingError` and **scans no record directory** (assert by pointing it at a base containing a well-formed record that a successful call would have listed — the returned `records` list is never reached). CLI: `run_logging.py final-review-audit-provenance --run-id r --attempt 0` exits **non-zero** and prints **no JSON** on stdout — the direct counter-assertion to M-26's shipped `rc=0` plus `"final_review_attempt": 0`. Valid: `--attempt 1` against a seeded record still prints the provenance JSON unchanged, and `--attempt 2` still groups by the record's own field. **Also asserts the sibling parity** named in Error Handling: `final-review-audit-write --attempt 0` and `final-review-audit-provenance --attempt 0` now both exit non-zero and write nothing |
+| **T-13.9** | `test_e2e_harness.py` | **GATE 6 — `final_review_artifact_path()`.** Invalid: the same eight values raise, and the assertion is written as `assertRaises(ValueError)` **on purpose**, with a comment that `RunLoggingError` subclasses `ValueError` so the shipped raise contract is preserved — this is what pins the substitution in D-A.7.3′ rather than leaving it to a reader to notice. Valid: `attempt ∈ {1, 2, 3, 99, 100}` returns exactly the shipped strings, and the existing `test_final_review_artifact_paths_follow_the_attempt_suffix_rule` (`test_e2e_harness.py:2168`) is left untouched as the end-to-end positive regression |
+
+**Measured against the real tree, not asserted.** The whole design above was implemented as a
+prototype, applied to the real `scripts/` tree with the mirror updated, and the suites were run:
+
+| id | measured | result |
+|---|---|---|
+| **M-24a/b/c** | shipped `final_review_report_ladder_path`, `e2e_harness.final_review_artifact_path` and `build_attestation` with out-of-domain values | **all three leak.** `2.0` → `FINAL_REVIEW_iteration2.0.md` from both path producers; `build_attestation` accepted `0`, `-1`, `2.0`, `False`, `True`, `"2"` and `None` and serialized them as `0`, `-1`, `2.0`, `false`, `true`, `"2"`, `null` into `final_review_attempt`. **F-801 confirmed independently, and a third producer found** |
+| **M-24d** | the extracted predicate's message text vs. the shipped text at all three existing check sites, for `{0, -1, -12, 1, 2, 100}` and `{False, True, 2.0, "2", None}` | **byte-identical in every cell.** The extraction is behaviour-preserving on messages |
+| **M-25a/b/c** | the prototype at gates 5, 6, 4 | all eight invalid values refused at each, with the right exception type per module (`RunLoggingError`, `RunLoggingError`(`isinstance ValueError` → `True`), `IsolationAttemptDomainError`); all valid values in `{1,2,3,9,10,42,99,100}` return the shipped result unchanged |
+| **M-26** | shipped CLI door 2, then the prototype | shipped `final-review-audit-provenance --attempt 0` → **rc 0** and a JSON report carrying `"final_review_attempt": 0`; shipped `final-review-audit-write --attempt 0` → rc 1, nothing written. Prototype: **both** → rc 1, nothing written, `--attempt 1` unchanged |
+| **M-27** | `python3 scripts/validate_skills.py`, prototype applied, mirror **omitted** then **restored** | omitted → `FAILED (1 errors, 463 checks)`, `tools/run_logging.py differs from scripts/run_logging.py`; restored → `PASSED (463 checks)`. **The mirror step is load-bearing and is now proven so** |
+| **M-28** | `pytest scripts/test_run_logging.py scripts/test_e2e_harness.py scripts/test_os22_required_tests.py scripts/test_orca_runtime_contract.py scripts/test_validate_skills.py -q`, prototype applied | **716 passed, 4647 subtests passed, 2 failed.** The two failures are `RetainedReportWhitespaceExemptionTests::test_the_whitespace_gate_passes_over_the_whole_os22_range` and `::test_the_gate_fails_again_once_the_exemption_is_removed` |
+| **M-28b** | the same two tests on the **unmodified** tree (prototype stashed) | **the same 2 failures.** They are a **pre-existing baseline failure unrelated to `attempt`** — trailing whitespace in committed review artifacts under `artifacts/runs/run_4d1c47c838db/`. Recorded rather than hidden: this design neither causes nor fixes them |
+| **M-29** | `pytest scripts/test_review_isolation.py scripts/test_final_review_eval.py -q`, prototype applied — the full isolation mechanism under real `sandbox-exec`, the NEG-0…NEG-8 battery, the relay channel, repatriation, teardown, and every CLI subcommand | **190 passed, 312 subtests passed, 0 failed** in `704.72s` (11m45s), exit 0. **No existing test changes behaviour at any of the seven gates.** (The GATE 7 edit landed after this run was launched; neither suite references `read_final_review_attempt_provenance` — `grep -c` returns 0 in both files — so the result is valid for the complete prototype) |
+
+The prototype was reverted after measurement (`git checkout -- scripts/
+orca-worker-reviewer-orchestration/`); `scripts/` carries no change from this DESIGN phase.
+
+## Risks / Open Issues
+
+* **RK-19 stands unchanged** — `.gitattributes` undermatches above attempt 99, stated, justified and
+  pinned by T-12.3, paired with T-13.5's assertion that attempt 100 remains legal. Unaffected by
+  this correction.
+* **RK-20 is CLOSED.** `final_review_report_ladder_path()` now has both halves of the check
+  (GATE 5). Iteration 1 declined it on a reachability argument; INV-ATTEMPT-2 withdraws that class
+  of argument.
+* **RK-21 (new, and explicitly out of scope) — `run_logging.py`'s CLI has no `except
+  RunLoggingError` mapping, so a domain refusal at door 2 surfaces as a Python traceback with
+  exit 1**, where door 1 prints `input error: …`. This is **shipped, pre-existing behaviour**
+  (M-26 measured `final-review-audit-write --attempt 0` doing exactly this today) and it is
+  **fail-closed** — exit 1, nothing written — so the safety property F-801 is about is satisfied.
+  Gates 5 and 7 inherit that convention rather than inventing a second one inside the same CLI.
+  **Not fixed here** because it is a presentation change to `run_logging`'s whole `main()` error
+  path, touching every `RunLoggingError` raise site in a settled module, and F-801 is about the
+  domain invariant. Named so it cannot be mistaken for an oversight; the remedy, if a future DESIGN
+  wants it, is one `except RunLoggingError` clause in `main()` mapping to a message and exit 1.
+* **RK-22 (new) — the Skill mirror is a manual step that a validator catches, not a build that
+  performs it.** `validate_skills.py` fails on drift (M-27), so it cannot ship broken, but the fix
+  is a `cp` a contributor must remember. T-13.4′'s byte-identity assertion adds a second, faster
+  tripwire inside the test suite.
+* **The strictness increase on `bool` now applies at seven boundaries instead of three.** Bounded
+  by the same evidence as D-A.7: C-6 shows no non-int literal is passed as `attempt=` on any
+  non-test path, and both CLI doors declare `type=int`, which cannot produce a `bool`.
+* **`e2e_harness`'s raise type widens to a `ValueError` subclass** — the one type change, named in
+  Error Handling, pinned by T-13.9.
+* **Pre-existing baseline failure, recorded not hidden:** `RetainedReportWhitespaceExemptionTests`'
+  two tests fail on the unmodified tree (M-28b) because committed artifacts under
+  `artifacts/runs/run_4d1c47c838db/` carry trailing whitespace. Unrelated to `attempt`; this design
+  does not change them either way.
+* **Not reopened:** the CLI/`repatriate()`/`isolate()` gates, the sandbox isolation session-build
+  and scan mechanism, the F-501 relay shim (D-7.1…D-7.9), the F-601 redaction-ordering fix, the
+  evidence-bundle sanitization (D-H.x, `safe_embedded_text`), D-6.0…D-6.9, mandatory pass B (D-5.1),
+  D-I, `COMPATIBILITY.md`, F-401, F-402, D-H.2, RK-7, O-1/O-2/O-3, B1's criterion text, the probe
+  ordering, and D-A.6″'s seven rules. RK-1…RK-19 stand unchanged. **F-502 remains
+  `implementation`-owned, untouched, and still blocking.**
