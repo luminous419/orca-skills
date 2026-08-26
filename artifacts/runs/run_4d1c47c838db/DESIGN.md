@@ -471,7 +471,7 @@ IMM: it is either narrowed by a carve-out and re-proven, demoted to Class USR an
 or dropped. The residual limitation is now precisely one sentence: *the proof is evaluated at
 session-build time against the run user's own privileges, so it does not bind a privileged
 (root) writer* — and that writer is outside the G.1 threat model. That sentence, and nothing
-broader, is what `ISOLATION.json.limitations[]` and D-I carry.
+broader, is what `ISOLATION.json.limitations[]` carries.
 
 Bounding: pass A/B/C walks skip nothing and follow no symlinks (`os.walk(..., followlinks=False)`),
 and every symlink encountered whose realpath escapes the root is itself a hit — an escaping symlink
@@ -1262,7 +1262,7 @@ any artifact.
 | id | risk | mechanism |
 |---|---|---|
 | **RK-1** | The allowlist is widened during pre-flight until the agent starts, and the widening quietly re-admits a key copy. | Every widening is an explicit `--allow-read` on a re-invocation, and every Class USR root is scanned by G.3 passes A-D *after* the widening. A root that cannot be scanned clean cannot be allowed. Recorded per-root in `ISOLATION.json.readable_set[]`. |
-| **RK-2** | Class IMM roots are not content-scanned. | **Rewritten in iteration 2 (F-001); the previous mechanism — "admission requires `os.access(root, W_OK) == False`" — was the defect.** Admission now requires G.3.1's recursive proof I-1…I-6 over the whole subtree, every boundary it finds is denied in the profile (G.4 clause 4), `assert_no_unscanned_descendant()` refuses an admitted ancestor of an unproven mutable path, and NEG-5/NEG-7/NEG-8 re-prove it from inside the sandbox at every capture. What remains is only that the proof is evaluated against the run user's privileges at session-build time, so it does not bind a privileged writer — who is outside G.1's threat model. Stated in `limitations[]` and in D-I in exactly those terms. |
+| **RK-2** | Class IMM roots are not content-scanned. | **Rewritten in iteration 2 (F-001); the previous mechanism — "admission requires `os.access(root, W_OK) == False`" — was the defect.** Admission now requires G.3.1's recursive proof I-1…I-6 over the whole subtree, every boundary it finds is denied in the profile (G.4 clause 4), `assert_no_unscanned_descendant()` refuses an admitted ancestor of an unproven mutable path, and NEG-5/NEG-7/NEG-8 re-prove it from inside the sandbox at every capture. What remains is only that the proof is evaluated against the run user's privileges at session-build time, so it does not bind a privileged writer — who is outside G.1's threat model. Stated in exactly those terms in G.3.3 and in `ISOLATION.json.limitations[]`; D-I's `COMPATIBILITY.md` wording is unchanged. |
 | **RK-8** | The proof is a session-build-time snapshot: a root proven IMM could in principle be mutated *during* the dispatch by a privileged writer or an OS update. | Same class of residual as **O-2**, and bounded by the same reasoning: it requires privilege the threat model excludes, and the window is one dispatch. `ISOLATION.json` records the proof counters so a re-run on the same host is comparable; a differing count on re-capture is a signal worth investigating, not silently absorbed. Not designed around further, and named rather than implied. |
 | **RK-9** | A future contributor "simplifies" G.4 clause 2 back to a global `(allow file-read-metadata)` because the traversal set is fiddly to compute. | NEG-7 fails immediately and loudly on exactly that change — measured: with a global metadata allow and an otherwise-correct readable set, `os.path.exists(plant)` is `True` and `os.stat(plant).st_size` is the key's real size. The comment in the generated profile says so at the point of edit. |
 | **RK-3** | `sandbox-exec` is deprecated by Apple and could be removed. | The backend is behind `render_profile()`/`wrap_command()`; `--enforcement` is an enum with a fail-closed default. If the backend disappears, captures fail B6 loudly rather than degrading silently. |
@@ -1316,9 +1316,12 @@ STATUS: COMPLETE
 
 Scope of this iteration: **D-G's Class SYS handling only**. D-H (evidence-bundle sanitization) and
 D-I (`COMPATIBILITY.md` wording) were confirmed concretely resolved by
-`REVIEW_DESIGN_iteration1.md` and are **not touched** — no sentence of either changed, and nothing
-below depends on either changing. `D-I` gains no new claim: the one limitation sentence it carries
-is narrowed, not widened, and the narrowed text is quoted in §4 below.
+`REVIEW_DESIGN_iteration1.md` and are **not touched** — both stand byte-for-byte at their approved
+iteration-1 text, no `COMPATIBILITY.md` replacement block changes, and nothing below depends on
+either changing. The narrower residual that the recursive proof earns is recorded only where D-G
+owns the text — G.3.3's prose and `ISOLATION.json.limitations[]` (G.6) — and is not carried into
+D-I's `COMPATIBILITY.md` wording. *(Corrected in iteration 3 for F-002; see the section at the end
+of this document.)*
 
 ### Summary / Requirements
 
@@ -1455,15 +1458,13 @@ on disk, so there is no reader to break. The `class` value changes from `SYS` to
 `readable_set[].proof` is added; `scanned: false` now additionally requires a complete `proof`
 object with zero writable directories and zero writable regular files.
 
-**D-I's limitation sentence narrows** — this is the only D-I-adjacent change and it removes a
-claim rather than adding one. It reads, in the corrected form:
-
-> System paths admitted to the Reviewer's readable set are proven immutable by an exhaustive
-> recursive check of the whole subtree at session-build time, evaluated against the run user's own
-> privileges; the proof does not bind a privileged (root) writer, who is outside the stated threat
-> model.
-
-Nothing else in D-I, and nothing at all in D-H, changes.
+**No compatibility-document change.** D-I's two `COMPATIBILITY.md` replacement blocks stand exactly
+as approved in iteration 1, and D-H is likewise untouched. The narrower residual that the recursive
+proof earns — *the proof is evaluated at session-build time against the run user's own privileges,
+so it does not bind a privileged (root) writer, who is outside the G.1 threat model* — is recorded
+only where D-G owns the text: in G.3.3's prose and verbatim in `ISOLATION.json.limitations[]`
+(G.6). It is an attestation field and a design-internal statement, not a public compatibility
+claim, so `COMPATIBILITY.md` needs no edit for it. *(Corrected in iteration 3 for F-002.)*
 
 ### Expected Changed Files / Implementation Steps
 
@@ -1498,3 +1499,102 @@ reopened.
   `enumerate_boundaries()` finds on the host at session-build time. The concrete list in G.3.2 is
   this host's result, recorded so the implementation has a known-good target to test against, and
   `ISOLATION.json` records the host's own list per capture. No Linux/Windows backend is claimed.
+
+---
+
+## DESIGN iteration 3 — correction for F-002
+
+STATUS: COMPLETE
+
+### Summary / Requirements
+
+F-002 is a consistency defect in the iteration-2 delta, not in the designed behaviour. The delta
+asserted that D-I was byte-for-byte untouched and, in the same section, supplied a corrected
+`COMPATIBILITY.md` limitation sentence that it called "the only D-I-adjacent change". The main D-I
+block (line 965 onward) still carried its approved iteration-1 wording, so IMPLEMENTATION would
+have faced two competing specifications for the same `COMPATIBILITY.md` text.
+
+The correction takes the review's first branch — the lower-risk one: **D-I stays exactly as
+approved and no boundary change is requested.** The narrower residual the recursive proof earns is
+recorded only where D-G already owns the text. Nothing about F-001's actual fix is reopened: the
+recursive `prove_immutable()` I-1…I-6 proof, the carve-outs, the removal of `/private/var` and
+`/Library`, the closed metadata traversal set, NEG-7, NEG-8 and T-9.9 are untouched. D-H is
+untouched.
+
+### Current Architecture
+
+The narrower limitation already had a home before this correction. It is stated in D-G twice:
+
+* **G.3.3** (line 464 onward), as the justification for not content-scanning Class IMM roots: *the
+  proof is evaluated at session-build time against the run user's own privileges, so it does not
+  bind a privileged (root) writer*.
+* **G.6**, verbatim, as the single entry of `ISOLATION.json.limitations[]` (line 690).
+
+**RK-2** and **RK-8** carry the same residual in the risk table. So the sentence iteration 2 wanted
+to push into `COMPATIBILITY.md` was already recorded in two authoritative places inside D-G, which
+is why removing the D-I replacement loses no information.
+
+### Proposed Design
+
+Four textual corrections to the already-written design, all of them removals of a claim about D-I.
+No behaviour, interface, file list, exit code or test changes.
+
+| # | location | before | after |
+|---|---|---|---|
+| 1 | G.3.3, end of the "not content-scanned" paragraph | "…is what `ISOLATION.json.limitations[]` and D-I carry." | "…is what `ISOLATION.json.limitations[]` carries." |
+| 2 | iteration-2 scope declaration | "no sentence of either changed … `D-I` gains no new claim: the one limitation sentence it carries is narrowed … quoted in §4 below" | D-H and D-I stand byte-for-byte at their approved iteration-1 text; the narrower residual is recorded only in G.3.3 and `ISOLATION.json.limitations[]`, not carried into D-I |
+| 3 | RK-2 mitigation cell | "Stated in `limitations[]` and in D-I in exactly those terms." | "Stated in exactly those terms in G.3.3 and in `ISOLATION.json.limitations[]`; D-I's `COMPATIBILITY.md` wording is unchanged." |
+| 4 | iteration-2 Error Handling / Compatibility | the "**D-I's limitation sentence narrows**" paragraph plus the block-quoted replacement sentence | "**No compatibility-document change.**" — D-I's two replacement blocks stand as approved; the residual is an attestation field and a design-internal statement, not a public compatibility claim |
+
+After these, the document contains exactly one specification of the `COMPATIBILITY.md` text: the
+D-I block at line 965.
+
+### Components / Interfaces / Data Flow
+
+Unchanged. No component, interface, function signature, JSON field, exit code or profile clause is
+added, removed or renamed by this iteration. `ISOLATION.json.limitations[]` keeps the same single
+entry with the same wording it already had.
+
+### Error Handling / Compatibility
+
+Unchanged, and that is the point of the correction. `COMPATIBILITY.md:120-122` and
+`COMPATIBILITY.md:124-127` are replaced with exactly the two blocks quoted in D-I, and with nothing
+else. The MINOR version bump justification in D-I is unaffected, since the compatibility surface is
+now provably identical to what iteration 1 approved.
+
+### Expected Changed Files / Implementation Steps
+
+The implementation file list is unchanged from iteration 2. Restated for the implementer so no
+search is needed:
+
+* `scripts/review_isolation.py`, `scripts/test_review_isolation.py` — per iteration 2 (D-G).
+* `scripts/run_logging.py`, `CHANGELOG.md` — per iteration 1 (D-H).
+* `COMPATIBILITY.md` — the two replacements in **D-I as written at line 965**, verbatim. If any
+  other text in this document appears to specify `COMPATIBILITY.md`, it is stale and D-I wins.
+
+### Testing Strategy
+
+No test is added, removed or altered. NEG-0…NEG-8, T-8, T-9.1…T-9.9 stand as designed in
+iterations 1 and 2. The only verification this iteration needs is documentary, and it was run:
+
+* Extracted the `### D-I` block and the `### D-H` block from `565e5a8` (the approved iteration-1
+  commit) and from the corrected working copy and compared them byte-for-byte — both identical
+  (D-I: 2952 bytes each).
+* Confirmed the deletions in `git diff 565e5a8..HEAD` for this file all fall inside D-G.
+* Grepped every remaining `D-I` mention. What is left is: the section itself (line 965); four
+  index/file-map rows that only name it (lines 32, 46, 1110, 1130); the threat-model sentence at
+  line 250, which is unchanged iteration-1 text and accurate, because D-I does state that boundary;
+  and the three corrected pointers above, none of which now claims D-I changes.
+
+### Risks / Open Issues
+
+* **RK-10 (new, documentation-only).** D-I's approved iteration-1 text says the isolated reviewer's
+  every readable path "has been exhaustively scanned for key material", while both iteration 1
+  (Class SYS) and iteration 2 (Class IMM) admit some roots on a non-scan proof instead. This
+  imprecision is **pre-existing and approved** — it is identical in truth-value before and after
+  the F-001 fix, since unscanned-SYS became unscanned-IMM — so it is *not* corrected here, and
+  correcting it would require exactly the boundary change F-002 says must not be taken
+  unilaterally. Recorded for the boundary owner: if a future iteration is allowed to reopen D-I,
+  the one-word fix is "scanned" → "scanned or proven immutable". IMPLEMENTATION must apply D-I as
+  written and must not "improve" it.
+* No other open issue is added. O-1…O-3, RK-1…RK-9 stand as written.
