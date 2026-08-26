@@ -39,3 +39,7 @@
 | 2026-08-26T16:30:51.733847+00:00 | iteration_start | test |  | 2 | 2026-08-26T16:30:51.733847+00:00 |  |  | high |  |
 | 2026-08-26T16:46:09.079149+00:00 | dispatch_settled | test | worker | 2 | 2026-08-26T16:30:51.733847+00:00 | 2026-08-26T16:46:09.027926+00:00 | 917.294 | high | TEST iteration 2 worker_done succeeded, own verdict PASS |
 | 2026-08-26T17:00:31.111363+00:00 | dispatch_settled | test | reviewer | 2 | 2026-08-26T16:46:36.494637+00:00 | 2026-08-26T17:00:31.059383+00:00 | 834.565 | high | TEST review iteration 2 worker_done succeeded, RESULT: PASS. All requested phases now PASS. |
+| 2026-08-26T17:00:31.059383+00:00 | iteration_end | test |  | 2 | 2026-08-26T16:30:51.733847+00:00 | 2026-08-26T17:00:31.059383+00:00 | 1779.326 | high |  |
+| 2026-08-26T17:00:31.059383+00:00 | phase_end | test |  |  | 2026-08-26T16:30:51.733847+00:00 | 2026-08-26T17:00:31.059383+00:00 | 1779.326 | high |  |
+| 2026-08-26T17:04:35.188299+00:00 | phase_start | final_review |  |  | 2026-08-26T17:04:35.188299+00:00 |  |  | high |  |
+| 2026-08-26T17:04:35.188299+00:00 | iteration_start | final_review |  | 1 | 2026-08-26T17:04:35.188299+00:00 |  |  | high |  |
