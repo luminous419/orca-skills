@@ -284,3 +284,218 @@ Non-blocking observations. None of these was treated as a finding, and none bloc
   committed artifacts listed above is addressed. It is outside this run's scope and outside the
   attempt domain, but it is not self-healing, and it means these suites cannot currently reach a
   green exit 0.
+
+---
+
+## TEST iteration 2 -- confirm F-1001 closed
+
+STATUS: COMPLETE
+
+**RESULT (this iteration's own judgment): PASS.** F-1001 is closed, independently re-proved rather
+than accepted on IMPLEMENTATION's word, and the fix introduced no regression. The TEST phase gate
+for `run_028d416e596a` is clean.
+
+### Test Scope / Existing Test Assessment
+
+Verification-only, on branch `agent/final-review-observability-evaluation` at `aa7b455`
+(iteration 1 ran at `104be57`). No file was modified except this report. Scope was deliberately
+narrowed per the task boundary to the three things that could have changed since iteration 1:
+
+1. F-1001 specifically -- is T-13.1's `isolate()` no-session assertion now genuinely live?
+2. A fresh full run, to catch a regression introduced by the F-1001 fix itself.
+3. Change-scope containment -- did anything other than what IMPLEMENTATION iteration 3 declared
+   change?
+
+The seven-gate mutation battery from iteration 1 was **not** re-run, and does not need to be: the
+diff below shows no production file changed, so every gate is byte-identical to the one that battery
+measured. Iteration 1's other conclusions (all seven gates sound, negative matrices genuinely
+exercised, regression assertions value-producing, the two whitespace failures pre-existing) stand.
+
+**(3) Change-scope containment -- confirmed, and tighter than "no production code changed."**
+
+```
+git diff --name-only 104be57..HEAD | grep -v '^artifacts/'
+  -> scripts/test_review_isolation.py          # the ONLY non-artifact file
+git diff --stat 104be57..HEAD -- scripts/
+  -> scripts/test_review_isolation.py | 39 ++++++++++++++++++-----------------
+```
+
+The 39 lines are exactly the T-13.1 correction: two new helpers (`sessions_under_base()`,
+`assertNoSessionBuilt()`) added beside `assertNothingCreated()`, and the `isolate()` test rewired
+onto them. `assertNothingCreated()` itself, the `repatriate()` half of T-13.1, T-13.3, T-13.4', all
+other classes in the file, and all seven production gates are untouched. This matches IMPLEMENTATION
+iteration 3's declaration exactly -- nothing undeclared rode along.
+
+Incidentally this also closes **N-3** from iteration 1 (the `tempfile.gettempdir()` snapshot as a
+latent cross-process flakiness source): `grep -n gettempdir scripts/test_review_isolation.py` now
+returns no glob inside `AttemptDomainTests` -- only two prose comments and line 1246, an unrelated
+F-402 probe that intentionally targets the real temp root. The `tempfile` import remains live
+(`_IsolationTestCase.setUp`, line 88).
+
+### Added / Modified Tests
+
+**None.** Verification-only phase, as in iteration 1.
+
+### Behavior Covered
+
+**(1) F-1001, verified live by independent mutation -- with a control, so the result is a
+contrast and not a single observation.**
+
+The mutant was constructed from scratch in a throwaway detached worktree at current HEAD
+(`aa7b455`), not reused from IMPLEMENTATION's or the Reviewer's runs: GATE 2 was deleted from its
+position as the first executable statement of `isolate()` and re-inserted immediately after the
+`session = build_session(...)` call, changing nothing else.
+
+```
+git worktree add --detach <scratch>/f1001_verify HEAD          # aa7b455
+# scripts/review_isolation.py:2699  -  attempt = assert_attempt_in_domain(attempt)
+# scripts/review_isolation.py:2716  +  attempt = assert_attempt_in_domain(attempt)  # MUTANT: GATE 2 relocated
+git diff --stat  ->  scripts/review_isolation.py | 2 +-   (1 insertion, 1 deletion)
+```
+
+| # | test file on the mutant | command | result |
+|---|---|---|---|
+| a | **corrected** (`HEAD`) | `pytest scripts/test_review_isolation.py -q -k 't131_isolate'` | **4 failed** in 0.40s, exit 1 |
+| b | **pre-fix** (`13a5c87^`, `git checkout 13a5c87^ -- scripts/test_review_isolation.py`) | same command, same mutant | **1 passed, 3 subtests passed** in 0.25s, exit 0 |
+
+Row (a) failure detail -- the assertion fires per attempt *and* in aggregate, and names the real
+leaked sessions:
+
+```
+SUBFAILED(attempt=0), SUBFAILED(attempt=-1), SUBFAILED(attempt=-12)
+FAILED ...::AttemptDomainTests::test_t131_isolate_refuses_zero_and_negatives_and_builds_no_session
+AssertionError: Items in the first set but not the second:
+  PosixPath('/var/folders/.../tmpmb07ttng/frv_iso_i829_u82')
+  PosixPath('/var/folders/.../tmpmb07ttng/frv_iso_2pfoi376')
+  PosixPath('/var/folders/.../tmpmb07ttng/frv_iso_n56_rgc0')
+  : a session is expensive to build and must not be built on a bad argument
+```
+
+Row (b) is the control that makes row (a) meaningful: **same worktree, same mutated production
+file, same command** -- only the test file differs. Green before the fix, red after it. That is
+F-1001 reproduced and then killed under identical conditions, which rules out the alternative
+explanation that my mutant simply differs from the one that originally defeated the assertion. The
+three `frv_iso_*` directories are the actual sessions the relocated gate permitted `build_session()`
+to create -- the precise side effect the assertion claims to forbid, now observed at the directory
+the call under test really writes to (`self.base`, the `session_base` it was handed).
+
+**(1b) The corrected assertion is live without being over-tight.** A second, different mutation in
+the same worktree -- GATE 1 relocated from `repatriate()`'s first statement to just after
+`root.mkdir(parents=True, exist_ok=True)` -- was run to check two things at once:
+
+```
+pytest scripts/test_review_isolation.py -q -k 't131_repatriate'
+  -> 3 failed, 1 passed, 122 deselected in 0.21s, exit 1
+     assertNothingCreated: "a refused attempt must leave no run directory behind"
+     SUBFAILED(attempt=0), SUBFAILED(attempt=-1), SUBFAILED(attempt=-12)
+```
+
+* The `repatriate()` half's `assertNothingCreated()` is **still live** -- the F-1001 edit did not
+  collaterally weaken the sibling test it left in place.
+* The `1 passed` in that run is the corrected `isolate()` test, correctly staying green under a
+  mutation that does not affect GATE 2. It fails on its own gate's relocation and not on an
+  unrelated one, so it is a real discriminator rather than a test that fails on any perturbation.
+
+The worktree was removed (`git worktree remove --force` + `prune`); `git worktree list` shows only
+the main checkout and `git status --porcelain scripts/` is empty. The mutants exist nowhere.
+
+**(2) Fresh full regression at HEAD -- pattern unchanged.**
+
+`562 passed` (four suites) + `370 passed` (broader set) = **932 passed, 2 failed**, identical to
+iteration 1 and to the TEST Reviewer's independent reproduction. No count moved.
+
+The two failures are the same pre-existing `RetainedReportWhitespaceExemptionTests` pair, and I
+checked something narrower than "same names" -- **which artifacts they cite**, since the iteration-3
+commits added new committed artifact text that could have introduced fresh violations:
+
+```
+grep -oE 'artifacts/runs/run_[0-9a-f]+/[A-Za-z_0-9.]+' <four-suite output> | sort -u
+  -> artifacts/runs/run_4d1c47c838db/REVIEW_DESIGN_iteration1.md
+     artifacts/runs/run_4d1c47c838db/REVIEW_DESIGN_iteration2.md
+     artifacts/runs/run_75c5c6046f35/DESIGN.md
+     artifacts/runs/run_75c5c6046f35/REVIEW_DESIGN_iteration2.md
+     artifacts/runs/run_75c5c6046f35/REVIEW_TEST_iteration1.md
+grep -c 'run_028d416e596a' <four-suite output>  -> 0
+```
+
+Only the two long-standing foreign runs appear. `run_028d416e596a` is cited zero times, so neither
+the F-1001 fix nor any iteration-3 artifact added a new whitespace violation. The failure set is
+unchanged in membership *and* in cause.
+
+### Execution
+
+```
+Command: git worktree add --detach <scratch>/f1001_verify HEAD   # aa7b455, GATE 2 relocated after build_session()
+Command: python3 -m pytest scripts/test_review_isolation.py -q -k 't131_isolate'     [corrected test on mutant]
+Result: FAIL (intended) -- 4 failed, 122 deselected in 0.40s, exit 1; 3 real frv_iso_* sessions named
+
+Command: git checkout 13a5c87^ -- scripts/test_review_isolation.py; same pytest command   [control]
+Result: PASS (intended) -- 1 passed, 122 deselected, 3 subtests passed in 0.25s, exit 0  => F-1001 reproduced
+
+Command: python3 -m pytest scripts/test_review_isolation.py -q -k 't131_repatriate'  [GATE 1 relocated mutant]
+Result: FAIL (intended) -- 3 failed, 1 passed, 122 deselected in 0.21s, exit 1
+
+Command: python3 -m pytest scripts/test_review_isolation.py scripts/test_final_review_eval.py \
+           scripts/test_run_logging.py scripts/test_e2e_harness.py -q
+Result: 2 failed, 562 passed, 1 warning, 1462 subtests passed in 720.94s (0:12:00), exit 1
+        (the 2 = pre-existing RetainedReportWhitespaceExemptionTests, foreign runs only)
+
+Command: python3 -m pytest scripts/test_os22_required_tests.py scripts/test_orca_runtime_contract.py \
+           scripts/test_validate_skills.py -q
+Result: 370 passed, 8 warnings, 3590 subtests passed in 16.60s, exit 0
+
+Command: python3 scripts/validate_skills.py
+Result: PASS -- "Skill validation PASSED (463 checks)", exit 0
+
+Command: python3 -m pytest scripts/test_review_isolation.py -q -k 't131 or t134'   [clean HEAD, targeted]
+Result: PASS -- 5 passed, 118 deselected, 12 subtests passed in 0.10s, exit 0
+        (corrected T-13.1 both halves + T-13.4' AST census all green on the unmutated tree)
+
+Command: git diff --name-only 104be57..HEAD | grep -v '^artifacts/'
+Result: scripts/test_review_isolation.py  -- the only non-artifact file changed since iteration 1
+```
+
+Result: **PASS**.
+
+### Failures / Findings
+
+**None. No blocking findings; no new findings of any severity.**
+
+**F-1001 (MAJOR / G5 / BLOCKING, iteration 1) -- CLOSED.** The required action's option (a) was
+taken and its proof obligation is discharged by evidence I generated myself, not inherited: the
+snapshot now globs `self.base` (the `session_base` the call under test is actually handed), is
+checked per attempt as well as in aggregate, and the same GATE-2 relocation that left the old
+assertion green now fails the corrected one -- demonstrated side by side in one worktree. The
+companion inert `assertNothingCreated()` was dropped from the `isolate()` test only and remains
+live where it belongs, in the `repatriate()` test, which I re-proved by mutation. IMPLEMENTATION.md's
+T-13.1 coverage row was also corrected, so no document now claims evidence that does not exist --
+which was the substance of the G5 violation.
+
+The two `RetainedReportWhitespaceExemptionTests` failures remain, unchanged and unrelated. They were
+established pre-existing in iteration 1 by reproduction on a baseline worktree at `8411cce` (the
+parent of the attempt-domain work), the TEST Reviewer reproduced the same, and this iteration
+additionally confirms they cite only foreign runs. They are **not** a finding against this phase.
+
+### Remaining Gaps
+
+Non-blocking, carried forward from iteration 1 and re-checked, none blocking this phase:
+
+* **N-1** (CLI wrong-type matrix covered by equivalence rather than literally) -- unchanged, still
+  adequate as written.
+* **N-2** (`test_review_isolation.py:2409` cites T-12.3, which does not exist in this tree -- a
+  dangling forward reference inherited from the unimplemented D-A.6") -- unchanged; the underlying
+  claim was verified true in iteration 1.
+* **N-3** (the `tempfile.gettempdir()` snapshot as a latent flakiness source) -- **now closed** as a
+  side effect of option (a), as recorded above.
+* **N-4** (RK-19 and RK-21 remain open, as the approved DESIGN permits) -- unchanged, no action
+  implied for this phase.
+* **N-5** (the two whitespace failures are a live repository-hygiene issue that will keep failing
+  every future run until the trailing whitespace in the committed artifacts of `run_4d1c47c838db`
+  and `run_75c5c6046f35` is addressed) -- unchanged and still not self-healing. It remains outside
+  this run's scope and outside the attempt domain, but it does mean these suites cannot reach a
+  green exit 0 today. **Escalated as a note, not a finding**, exactly as in iteration 1.
+
+**TEST phase gate verdict for `run_028d416e596a`: PASS.** The invariant is correct, the negative
+evidence is genuine, the one inert assertion is now live and independently proved so, the change is
+contained to a single test file, and the full-suite pattern is bit-for-bit the one iteration 1
+recorded.
