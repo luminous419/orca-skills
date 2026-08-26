@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import ast
 import inspect
 import json
@@ -1361,6 +1362,93 @@ class NoTargetCountTests(unittest.TestCase):
 
             with self.assertRaises(evaluator.EvalContractError):
                 evaluator.load_key(path)
+
+
+class IsolateCliWiringTests(unittest.TestCase):
+    """T-10: the subcommand family's wiring, exit codes and mutual exclusions."""
+
+    def test_the_docstring_subcommand_count_matches_the_parser(self) -> None:
+        parser = evaluator.build_parser()
+        subparsers = [
+            action for action in parser._actions
+            if isinstance(action, argparse._SubParsersAction)
+        ][0]
+        self.assertEqual(sorted(subparsers.choices), [
+            "isolate", "materialize", "parse-report", "scan-leak", "score",
+            "verify-fixture",
+        ])
+        # The module docstring's count is part of the contract: a sixth subcommand added
+        # without updating it leaves the file lying about itself.
+        self.assertIn("Six subcommands", evaluator.__doc__)
+        self.assertEqual(len(subparsers.choices), 6)
+
+    def test_repatriate_and_teardown_are_mutually_exclusive(self) -> None:
+        completed = run_cli(
+            "isolate", "--run-id", "r", "--repatriate", "/a", "--teardown", "/b"
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("not allowed with", completed.stderr)
+
+    def test_teardown_refuses_a_stranger_with_a_contract_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            completed = run_cli("isolate", "--run-id", "r", "--teardown", directory)
+            self.assertEqual(
+                completed.returncode, evaluator.EXIT_CONTRACT_VIOLATION
+            )
+            self.assertTrue(Path(directory).is_dir())
+
+    def test_repatriate_without_a_report_is_a_contract_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            completed = run_cli("isolate", "--run-id", "r", "--repatriate", directory)
+            self.assertEqual(
+                completed.returncode, evaluator.EXIT_CONTRACT_VIOLATION
+            )
+
+    def test_a_session_base_inside_the_repository_is_a_contract_exit(self) -> None:
+        inside = REPO_ROOT / "artifacts" / "_t10_probe"
+        inside.mkdir(parents=True, exist_ok=True)
+        try:
+            completed = run_cli(
+                "isolate", "--run-id", "r", "--session-base", str(inside),
+                "--enforcement", "none", "--no-plant",
+            )
+            self.assertEqual(
+                completed.returncode, evaluator.EXIT_CONTRACT_VIOLATION
+            )
+            self.assertEqual(list(inside.iterdir()), [])
+        finally:
+            import shutil
+
+            shutil.rmtree(inside, ignore_errors=True)
+
+    def test_an_unknown_enforcement_backend_is_rejected_by_the_parser(self) -> None:
+        completed = run_cli("isolate", "--run-id", "r", "--enforcement", "bwrap")
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("invalid choice", completed.stderr)
+
+    def test_a_leak_in_an_allowed_root_is_exit_four(self) -> None:
+        import shutil
+
+        with tempfile.TemporaryDirectory() as directory:
+            planted = Path(directory) / "extra"
+            planted.mkdir()
+            shutil.copy2(str(KEY_PATH), str(planted / "harmless.json"))
+            completed = run_cli(
+                "isolate", "--run-id", "r", "--enforcement", "none", "--no-plant",
+                "--allow-read", str(planted), "--session-base", directory,
+            )
+            self.assertEqual(completed.returncode, evaluator.EXIT_LEAK_OR_FIXTURE)
+            self.assertIn("key material is reachable", completed.stderr)
+
+    def test_a_missing_policy_file_is_a_contract_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            completed = run_cli(
+                "isolate", "--run-id", "r", "--enforcement", "none", "--no-plant",
+                "--policy-file", "no/such/file.md", "--session-base", directory,
+            )
+            self.assertEqual(
+                completed.returncode, evaluator.EXIT_CONTRACT_VIOLATION
+            )
 
 
 if __name__ == "__main__":

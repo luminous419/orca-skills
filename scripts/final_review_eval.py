@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Final Review evaluation: materialize a subject workspace, and score a review.
 
-OS-22 sections 5 and 6. Five subcommands, deliberately separate:
+OS-22 sections 5 and 6. Six subcommands, deliberately separate:
 
     materialize      build a reviewable workspace out of scripts/fixtures/final_review_eval
     verify-fixture   prove the fixture is what the key says it is, before anyone reviews it
@@ -9,6 +9,8 @@ OS-22 sections 5 and 6. Five subcommands, deliberately separate:
                      retained reviewer input OS-22 now keeps
     parse-report     turn a section 11/17 shaped review into a normalized findings document
     score            compute the metric block from findings + key + optional adjudications
+    isolate          build the kernel-enforced isolation session a section 7 baseline
+                     dispatch runs inside, and its --repatriate / --teardown forms
 
 `parse-report` and `score` are separate commands on purpose: section 5 requires reviewer
 execution and scoring to be separated, and separating PARSING from scoring additionally
@@ -1217,7 +1219,110 @@ def build_parser() -> argparse.ArgumentParser:
             "a clock, and the sidecar is never merged into the metrics document."
         ),
     )
+    command = subparsers.add_parser(
+        "isolate",
+        help=(
+            "build (or repatriate from, or tear down) the kernel-enforced isolation "
+            "session a section 7 baseline dispatch runs inside"
+        ),
+    )
+    command.add_argument("--run-id", required=True)
+    command.add_argument("--fixture", default=str(DEFAULT_FIXTURE_DIR))
+    command.add_argument("--session-base", default="")
+    command.add_argument(
+        "--policy-file",
+        action="append",
+        default=[],
+        help=(
+            "repeatable. A CLOSED copy list -- there is no glob and no "
+            "'copy the skill directory'. Defaults to reviews/common.md."
+        ),
+    )
+    command.add_argument(
+        "--allow-read",
+        action="append",
+        default=[],
+        help=(
+            "repeatable. An extra Class USR root the agent needs. Every widening is an "
+            "explicit operator decision and is then exhaustively scanned; a root that "
+            "cannot be scanned clean cannot be allowed."
+        ),
+    )
+    command.add_argument(
+        "--enforcement",
+        choices=("seatbelt", "none"),
+        default="seatbelt",
+        help=(
+            "`none` is the ONLY supported way to run without enforcement, and it fails "
+            "the baseline's B6 criterion"
+        ),
+    )
+    command.add_argument("--attempt", type=int, default=1)
+    command.add_argument("--terminal", default="")
+    command.add_argument("--base", default="")
+    command.add_argument("--out", default="")
+    command.add_argument(
+        "--no-plant",
+        action="store_true",
+        help="skip NEG-7's plant. For a host where writing a key copy is unacceptable.",
+    )
+    exclusive = command.add_mutually_exclusive_group()
+    exclusive.add_argument("--repatriate", default="")
+    exclusive.add_argument("--teardown", default="")
     return parser
+
+
+def _dispatch_isolate(args: argparse.Namespace) -> int:
+    """A thin CLI wrapper over review_isolation. Imported HERE, not at module scope.
+
+    review_isolation imports this module for materialize/scan_leak/load_key -- one
+    implementation, not two -- so importing it back at module scope would be a cycle.
+    A local import inside the one handler that needs it is the whole fix.
+    """
+    import review_isolation
+
+    try:
+        if args.teardown:
+            review_isolation.teardown(Path(args.teardown))
+            print(json.dumps({"teardown": args.teardown}, indent=2))
+            return EXIT_OK
+        if args.repatriate:
+            result = review_isolation.repatriate(
+                Path(args.repatriate),
+                args.run_id,
+                attempt=args.attempt,
+                base=Path(args.base) if args.base else None,
+            )
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+            return EXIT_OK
+        result = review_isolation.isolate(
+            args.run_id,
+            fixture=Path(args.fixture),
+            session_base=Path(args.session_base) if args.session_base else None,
+            policy_files=tuple(args.policy_file)
+            or review_isolation.DEFAULT_POLICY_FILES,
+            allow_read=tuple(args.allow_read),
+            enforcement=args.enforcement,
+            attempt=args.attempt,
+            terminal=args.terminal,
+            plant=not args.no_plant,
+        )
+    except review_isolation.IsolationContractError as error:
+        print(f"isolation contract violation: {error}", file=sys.stderr)
+        return EXIT_CONTRACT_VIOLATION
+    except review_isolation.IsolationError as error:
+        print(f"isolation failure: {error}", file=sys.stderr)
+        return EXIT_LEAK_OR_FIXTURE
+    if args.enforcement == "none":
+        # Three independent places say the same thing, so "isolated enough" has nowhere
+        # to hide: this warning, `scope_enforcement: unenforced`, and S2 == FAIL.
+        print(
+            "WARNING: --enforcement none. scope_enforcement is 'unenforced', S2 is FAIL, "
+            "and this capture FAILS B6 -- it may not be recorded as a section 7 baseline.",
+            file=sys.stderr,
+        )
+    _dump(result, Path(args.out) if args.out else None)
+    return EXIT_OK
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1260,6 +1365,9 @@ def _dispatch(args: argparse.Namespace) -> int:
             return EXIT_LEAK_OR_FIXTURE
         print("leak scan PASSED")
         return EXIT_OK
+
+    if args.command == "isolate":
+        return _dispatch_isolate(args)
 
     if args.command == "parse-report":
         report_path = Path(args.report)

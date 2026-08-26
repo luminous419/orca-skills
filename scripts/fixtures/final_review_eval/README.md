@@ -53,3 +53,24 @@ This fixture is an evaluation input. It is not a test of this repository's own c
 is not imported by anything under `scripts/`, and its `subject/` tree shares no
 vocabulary with orchestration: no run, dispatch, reviewer, attempt, phase, verdict or
 artifact-root concept appears anywhere in it.
+
+## Reproducing a §7 baseline
+
+`materialize` alone builds a clean *tree*; it does not constrain the *process* that reads
+it. A capture that is to be called a §7 baseline is dispatched through `isolate`, which
+builds an ephemeral session containing only the materialized subject and a closed list of
+review-policy files, proves every path the reviewer can read is either exhaustively scanned
+for key material or exhaustively proven immutable, generates a kernel-enforced scope
+profile that denies the key-bearing roots for content *and* metadata, and records the
+result in `ISOLATION.json`:
+
+```bash
+python3 scripts/final_review_eval.py isolate --run-id <run> --enforcement seatbelt
+# ... dispatch one Final Review attempt into <SESSION>/review_root ...
+python3 scripts/final_review_eval.py isolate --repatriate <SESSION> --run-id <run>
+python3 scripts/final_review_eval.py isolate --teardown <SESSION>
+```
+
+`--enforcement none` is the only supported way to run without a backend, and a capture
+recorded that way **fails B6 and is not a baseline** — it is an exploratory run and is
+labelled as one.

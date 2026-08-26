@@ -1234,6 +1234,14 @@ parsing도, digest도, export도, count도, provenance 답변도 하지 않는�
 publication은 삭제되지 않고 보존되며 `final_review_audit_incomplete_publication` row와 bundle의
 `integrity.incomplete_publications`로 보고된다.
 
+**export bundle은 sanitize된 사본만 담는다.** bundle에 들어가는 모든 text는 기록된 redaction policy
+아래에서 residue-free임이 증명된 것뿐이다. `ORCHESTRATOR_LOG.md`는 post-redaction artifact가 아니므로
+embed 직전에 같은 policy로 sanitize되어 `orchestrator_log.content_redacted`로 들어가고,
+`digest_pre_redaction`/`digest_post_redaction`이 원본과 embed된 bytes의 identity 관계를 재도출 가능하게
+만든다. residue-free로 만들 수 없는 text는 사유(`content_omitted_reason`)와 digest만 남기고 **생략**되며
+`integrity.omitted_content[]`에 보고된다 — 잘라내지 않고, 몰래 넣지도 않는다. 권위 있는 local log는
+읽기 전용으로만 열리며 절대 다시 쓰이지 않는다. export bundle schema는 이 변경으로 `2.0`이다.
+
 **record는 한 번 쓰이고 절대 수정되지 않는다.** 이미 published된 `<dispatch_key>/`에 다시 쓰는 경로는
 없다 — force도, overwrite flag도, update 함수도 없다. retry는 새 Task/Dispatch identity를 갖고 따라서
 새 dispatch_key를 갖는다. record를 "정정"한다는 것은 새 record를 쓰는 것이다.
