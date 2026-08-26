@@ -42,3 +42,4 @@
 | 2026-08-26T11:46:56.434263+00:00 | phase_start | TEST |  |  | 2026-08-26T11:46:56.434263+00:00 |  |  | high |  |
 | 2026-08-26T11:46:56.434263+00:00 | iteration_start | TEST |  | 2 | 2026-08-26T11:46:56.434263+00:00 |  |  | high |  |
 | 2026-08-26T12:34:58.342837+00:00 | dispatch_settled | TEST | worker | 2 | 2026-08-26T11:46:56.434263+00:00 | 2026-08-26T12:34:58.317967+00:00 | 2881.884 | high | TEST BLOCKED, F-401/402/403 confirmed closed, new F-501/502/503 found, B1/B3 fail |
+| 2026-08-26T12:50:28.903395+00:00 | dispatch_settled | TEST | reviewer | 2 | 2026-08-26T12:36:04.354158+00:00 | 2026-08-26T12:50:28.879179+00:00 | 864.525 | high | F-501/502/503 independently confirmed, correctly routed |
