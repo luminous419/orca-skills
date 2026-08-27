@@ -1721,6 +1721,184 @@ class ProbeFailClosedTests(unittest.TestCase):
         self.assertEqual(review_isolation.SYSTEM_PYTHON, "/usr/bin/python3")
 
 
+class ProbeInterpreterShimTests(unittest.TestCase):
+    """T-14: the probe interpreter is resolved PAST Apple's xcode-select tool shim.
+
+    The regression: on darwin `/usr/bin/python3` is not an interpreter. It is
+    `com.apple.dt.xcode_select.tool-shim-public`, whose only libxcselect entry point is
+    `xcselect_invoke_xcrun` -- the one code path that asks macOS to present the Command
+    Line Tools installer. `_probe_python()` handed that shim to `_run_probe()` and to
+    `preflight_probe()`, so every isolated dispatch exec'd it, and an operator whose
+    developer directory did not resolve got the installer dialog thrown at them mid-run.
+
+    Every test here is PORTABLE: the shim, the developer directory and the real
+    interpreter behind it are all synthesised in a temporary directory, so Linux CI runs
+    the whole mechanism rather than skipping it. The one darwin-gated test below asserts
+    the property on the REAL host binary, which is the only part that needs a real shim.
+    """
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.base = Path(self.temporary.name)
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def fake_shim(self, name: str = "python3") -> Path:
+        """A file that answers to the shim's own identifier. Not executable, on purpose:
+        the resolver must decide from the BYTES, never from having run anything."""
+        path = self.base / "usr" / "bin" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"\x00" * 64 + review_isolation.TOOL_SHIM_MARKER + b"\x00" * 64)
+        return path
+
+    def fake_developer_dir(self, name: str = "python3", *, shim: bool = False) -> Path:
+        """A developer directory offering `usr/bin/<name>`, real or shimmed."""
+        directory = self.base / ("devdir_shim" if shim else "devdir")
+        target = directory / "usr" / "bin" / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if shim:
+            target.write_bytes(review_isolation.TOOL_SHIM_MARKER)
+        else:
+            target.symlink_to(sys.executable)
+        return directory
+
+    # -- the discriminator ---------------------------------------------------------
+
+    def test_a_tool_shim_is_identified_by_its_own_marker(self) -> None:
+        self.assertTrue(review_isolation.is_tool_shim(self.fake_shim()))
+
+    def test_a_real_interpreter_is_not_a_tool_shim(self) -> None:
+        self.assertFalse(review_isolation.is_tool_shim(sys.executable))
+
+    def test_the_marker_is_found_across_a_read_boundary(self) -> None:
+        # The scan is chunked, so a marker straddling two reads is the case a naive
+        # implementation misses -- and missing it puts the shim back on the launch line.
+        path = self.base / "straddle"
+        chunk = 1 << 20
+        marker = review_isolation.TOOL_SHIM_MARKER
+        path.write_bytes(b"\x00" * (chunk - len(marker) // 2) + marker + b"\x00" * 8)
+        self.assertTrue(review_isolation.is_tool_shim(path))
+
+    def test_an_unreadable_candidate_is_a_hard_failure_not_a_false(self) -> None:
+        # "I could not look" and "it is not a shim" are different answers and only one of
+        # them may be allowed to return the shim.
+        with self.assertRaises(review_isolation.IsolationError) as raised:
+            review_isolation.is_tool_shim(self.base / "absent")
+        self.assertIn("fail-closed", str(raised.exception))
+
+    # -- resolution ----------------------------------------------------------------
+
+    def test_a_system_python_that_is_not_a_shim_is_returned_unchanged(self) -> None:
+        # Every Linux, and any darwin host whose /usr/bin/python3 is a real interpreter.
+        self.assertEqual(
+            review_isolation.resolve_probe_interpreter(sys.executable), sys.executable
+        )
+
+    def test_a_missing_system_python_still_falls_back_to_the_running_one(self) -> None:
+        self.assertEqual(
+            review_isolation.resolve_probe_interpreter(str(self.base / "absent")),
+            sys.executable,
+        )
+
+    def test_the_shim_is_resolved_to_the_real_interpreter_behind_it(self) -> None:
+        shim = self.fake_shim()
+        resolved = review_isolation.resolve_probe_interpreter(
+            str(shim), developer_dirs=[str(self.fake_developer_dir())]
+        )
+        self.assertNotEqual(resolved, str(shim))
+        self.assertFalse(review_isolation.is_tool_shim(resolved))
+        self.assertEqual(resolved, os.path.realpath(sys.executable))
+
+    def test_resolution_fails_closed_and_never_falls_back_to_the_shim(self) -> None:
+        # The reverted behaviour -- return the shim when nothing better is found -- is
+        # exactly what put the installer dialog in front of the operator.
+        shim = self.fake_shim()
+        with self.assertRaises(review_isolation.IsolationError) as raised:
+            review_isolation.resolve_probe_interpreter(
+                str(shim), developer_dirs=[str(self.base / "no_such_developer_dir")]
+            )
+        message = str(raised.exception)
+        self.assertIn("tool shim", message)
+        self.assertIn("Command Line Tools installer", message)
+
+    def test_a_developer_dir_that_only_offers_another_shim_is_refused(self) -> None:
+        shim = self.fake_shim()
+        with self.assertRaises(review_isolation.IsolationError):
+            review_isolation.resolve_probe_interpreter(
+                str(shim),
+                developer_dirs=[str(self.fake_developer_dir(shim=True))],
+            )
+
+    def test_the_first_developer_dir_that_offers_a_real_tool_wins(self) -> None:
+        shim = self.fake_shim()
+        resolved = review_isolation.resolve_probe_interpreter(
+            str(shim),
+            developer_dirs=[
+                str(self.base / "no_such_developer_dir"),
+                str(self.fake_developer_dir(shim=True)),
+                str(self.fake_developer_dir()),
+            ],
+        )
+        self.assertEqual(resolved, os.path.realpath(sys.executable))
+
+    # -- where the developer directory comes from ----------------------------------
+
+    def test_an_explicit_developer_dir_override_outranks_recorded_state(self) -> None:
+        candidates = review_isolation.developer_dir_candidates({"DEVELOPER_DIR": "/o/v"})
+        self.assertEqual(candidates[0], "/o/v")
+
+    def test_a_blank_developer_dir_is_not_a_candidate(self) -> None:
+        candidates = review_isolation.developer_dir_candidates({"DEVELOPER_DIR": "  "})
+        self.assertNotIn("  ", candidates)
+
+    def test_the_documented_default_is_always_the_last_resort(self) -> None:
+        candidates = review_isolation.developer_dir_candidates({"DEVELOPER_DIR": "/o/v"})
+        self.assertEqual(candidates[-1], review_isolation.DEFAULT_DEVELOPER_DIR)
+        self.assertEqual(len(candidates), len(set(candidates)))
+
+    def test_no_xcselect_linked_binary_is_executed_to_resolve_the_developer_dir(
+        self,
+    ) -> None:
+        # /usr/bin/xcode-select imports _xcselect_trigger_install_request, so ASKING it
+        # is not provably free of the prompt this resolution exists to avoid.
+        source = textwrap.dedent(
+            inspect.getsource(review_isolation.developer_dir_candidates)
+        )
+        for forbidden in ("subprocess", "xcode-select", "xcrun", "os.system", "popen"):
+            self.assertNotIn(forbidden, source.split('"""')[-1])
+
+    # -- the wiring, and the property on the real host ------------------------------
+
+    def test_the_probe_interpreter_goes_through_the_resolver(self) -> None:
+        self.assertEqual(
+            _function_body_statements(review_isolation._probe_python),
+            ["return resolve_probe_interpreter()"],
+        )
+
+    def test_the_resolved_probe_interpreter_is_never_a_tool_shim(self) -> None:
+        self.assertFalse(review_isolation.is_tool_shim(review_isolation._probe_python()))
+
+    @DARWIN_ONLY
+    def test_on_darwin_the_shimmed_system_python_is_actually_resolved_away(self) -> None:
+        # The regression assertion against the REAL host binary. If /usr/bin/python3 is
+        # the shim -- which is what it is on a stock macOS -- then the interpreter the
+        # probes and the pre-flight exec must NOT be it.
+        if not Path(review_isolation.SYSTEM_PYTHON).exists():
+            self.skipTest("no /usr/bin/python3 on this darwin host")
+        if not review_isolation.is_tool_shim(review_isolation.SYSTEM_PYTHON):
+            self.skipTest("/usr/bin/python3 is a real interpreter on this darwin host")
+        resolved = review_isolation._probe_python()
+        self.assertNotEqual(resolved, review_isolation.SYSTEM_PYTHON)
+        self.assertFalse(review_isolation.is_tool_shim(resolved))
+        # And it still has to BE an interpreter, run out of an already-admitted root.
+        completed = subprocess.run(
+            [resolved, "-c", "print(1)"], capture_output=True, text=True, check=False
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.strip(), "1")
+
+
 # ---- T-10 the seed mechanism (DESIGN D-6.1 .. D-6.9) ---------------------------------
 #
 # Every test below runs over SYNTHETIC roots. None needs a network, a real credential or

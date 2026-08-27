@@ -62,7 +62,7 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 import final_review_eval
 import run_logging
@@ -96,12 +96,50 @@ SANDBOX_EXEC = "/usr/bin/sandbox-exec"
 # interpreter running `isolate` is frequently a user-installed one under $HOME (measured
 # on this host: an Anaconda build under /Users/<name>/...), and $HOME is never admitted.
 # A probe that cannot exec proves nothing, and -- worse -- would read as "everything
-# denied" to a naive oracle. The system python resolves through the `/usr/bin` shim into
-# the proven /Library/Developer/CommandLineTools tree, which the profile does admit.
+# denied" to a naive oracle.
+#
+# `SYSTEM_PYTHON` names the system python; it is NOT what gets exec'd on darwin. On darwin
+# `/usr/bin/python3` is not an interpreter at all -- it is Apple's xcode-select tool shim,
+# and `resolve_probe_interpreter()` is what turns it into the real interpreter behind it.
+# See `TOOL_SHIM_MARKER` for why running the shim is the thing to avoid.
 #
 # The AGENT's own interpreter is a different question, and it is the pre-flight probe's
 # job to surface it as an explicit `--allow-read` rather than to guess.
 SYSTEM_PYTHON = "/usr/bin/python3"
+
+# The darwin tool shim, and the reason the isolation path must never exec one.
+#
+# MEASURED on this host, not assumed: `/usr/bin/python3` and `/usr/bin/git` are the SAME
+# inode -- one 118,928-byte Mach-O with 78 hard links -- whose embedded Info.plist
+# identifies it as `com.apple.dt.xcode_select.tool-shim-public`. `dyld_info -imports` shows
+# that binary imports exactly ONE libxcselect symbol, `_xcselect_invoke_xcrun`; the real
+# interpreter under the developer directory, `/usr/bin/xcrun` and `/usr/bin/xcode-select`
+# carry no such marker. So every "the Command Line Tools are required" installer prompt a
+# shim can produce comes out of `xcselect_invoke_xcrun` -- there is no other entry point in
+# the shim's import table. A process that never execs a shim can never raise that prompt.
+#
+# That prompt is a GUI interruption for the operator and it cannot be answered by the run,
+# which is why the shim is resolved away rather than merely tolerated: the harness picks
+# its OWN probe interpreter and nothing depends on that choice being the shim.
+#
+# Deliberately NOT extended to the pre-flight's `git --version`. That check exists to prove
+# the agent's own `git` works inside the sandbox, and the agent will invoke `git` -- so
+# substituting the resolved binary would make the check prove something else. If git's shim
+# cannot resolve, the agent's git is genuinely broken and a loud pre-flight failure is the
+# correct outcome.
+TOOL_SHIM_MARKER = b"com.apple.dt.xcode_select.tool-shim-public"
+
+# Where the active developer directory is recorded, in the order `xcselect` itself consults
+# them -- read HERE, in the host process at session-build time, never from inside the
+# sandbox, so `/private/var` staying never-admitted is not in tension with this.
+#
+# `/Library/Developer/CommandLineTools` is the last resort and it is not a new claim about
+# this host: it is already a `DEFAULT_IMM_CANDIDATES` entry and still has to pass the
+# recursive immutability proof before one byte of it is admitted. Resolving an interpreter
+# inside it does not admit it; the proof does, exactly as before.
+XCODE_SELECT_LINK = "/var/db/xcode_select_link"
+DEFAULT_DEVELOPER_DIR = "/Library/Developer/CommandLineTools"
+
 FIRMLINKS_TABLE = Path("/usr/share/firmlinks")
 MOUNT_COMMAND = "/sbin/mount"
 
@@ -2069,8 +2107,114 @@ print(json.dumps({"mode": mode, "probes": out}))
 """
 
 
+def is_tool_shim(path: Path | str) -> bool:
+    """True when `path` is Apple's xcode-select tool shim rather than a real tool.
+
+    The discriminator is the shim's own Info.plist identifier, scanned out of the file --
+    not the path, not the platform, not a version guess. See `TOOL_SHIM_MARKER` for the
+    measurement behind it.
+
+    An unreadable candidate is a HARD failure, not a `False`. "I could not look" and "it is
+    not a shim" are different answers, and only one of them may be allowed to put the shim
+    back on the launch line.
+    """
+    window = len(TOOL_SHIM_MARKER) - 1
+    try:
+        with open(path, "rb") as handle:
+            tail = b""
+            while True:
+                chunk = handle.read(1 << 20)
+                if not chunk:
+                    return False
+                if TOOL_SHIM_MARKER in tail + chunk:
+                    return True
+                tail = chunk[-window:]
+    except OSError as error:
+        raise IsolationError(
+            f"cannot read {path} to decide whether it is Apple's xcode-select tool shim, "
+            f"so the probe interpreter cannot be resolved fail-closed: {error}"
+        ) from error
+
+
+def developer_dir_candidates(environ: Mapping[str, str] | None = None) -> tuple[str, ...]:
+    """The active developer directory, in the order `xcselect` resolves it, deduplicated.
+
+    `DEVELOPER_DIR` first because an explicit operator override outranks recorded state;
+    then `/var/db/xcode_select_link`, which is what `xcode-select --switch` writes and what
+    is absent on a host that has never switched; then the documented default.
+
+    Nothing here EXECUTES an xcselect-linked binary. `/usr/bin/xcode-select` would be the
+    obvious way to ask, and it is rejected on purpose: `dyld_info -imports` shows it
+    importing `_xcselect_trigger_install_request`, so asking it is not provably free of the
+    very prompt this resolution exists to avoid.
+    """
+    environ = os.environ if environ is None else environ
+    candidates: list[str] = []
+    explicit = environ.get("DEVELOPER_DIR", "").strip()
+    if explicit:
+        candidates.append(explicit)
+    if os.path.lexists(XCODE_SELECT_LINK):
+        candidates.append(str(_realpath(XCODE_SELECT_LINK)))
+    candidates.append(DEFAULT_DEVELOPER_DIR)
+    return tuple(dict.fromkeys(candidates))
+
+
+def resolve_probe_interpreter(
+    system_python: str = SYSTEM_PYTHON,
+    *,
+    developer_dirs: Sequence[str] | None = None,
+) -> str:
+    """The interpreter the probes and the pre-flight actually exec. Never a tool shim.
+
+    Three cases, and the third is the whole point:
+
+    * no system python at all -- `sys.executable`, exactly as before;
+    * a system python that is a REAL interpreter (every Linux, and any darwin host where
+      it is not shimmed) -- returned unchanged, so this changes nothing off darwin;
+    * a system python that IS the shim -- resolved to `<developer dir>/usr/bin/<name>`,
+      the same file `xcrun --find python3` reports, which on this host realpaths to
+      `/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/
+      Versions/3.9/bin/python3.9`: inside the already-proven, already-admitted Class IMM
+      root, so NOTHING new is admitted and the sandbox is not widened by one byte.
+
+    FAIL CLOSED. If the real interpreter cannot be resolved this raises. It never falls
+    back to the shim -- falling back is precisely how the operator gets the Command Line
+    Tools installer thrown at them mid-run -- and it never widens the profile to make the
+    shim work.
+    """
+    if not Path(system_python).exists():
+        return sys.executable
+    if not is_tool_shim(system_python):
+        return system_python
+    directories = (
+        developer_dir_candidates() if developer_dirs is None else tuple(developer_dirs)
+    )
+    name = Path(system_python).name
+    tried: list[str] = []
+    for directory in directories:
+        candidate = Path(directory) / "usr" / "bin" / name
+        tried.append(str(candidate))
+        if not candidate.exists() or is_tool_shim(candidate):
+            continue
+        return str(_realpath(candidate))
+    raise IsolationError(
+        f"{system_python} is Apple's xcode-select tool shim and the real interpreter "
+        f"behind it could not be resolved in any active developer directory "
+        f"(tried: {', '.join(tried) or 'none'}). Running the shim is what asks macOS to "
+        "present the Command Line Tools installer, so this is a hard failure and NOT a "
+        "fallback. On an Xcode-only host, point DEVELOPER_DIR at a developer directory "
+        f"that provides usr/bin/{name}."
+    )
+
+
 def _probe_python() -> str:
-    return SYSTEM_PYTHON if Path(SYSTEM_PYTHON).exists() else sys.executable
+    """The probe interpreter, resolved past the darwin tool shim.
+
+    Was `SYSTEM_PYTHON if it exists else sys.executable`, which on darwin exec'd
+    `/usr/bin/python3` -- the shim -- from `_run_probe()` AND from `preflight_probe()`,
+    i.e. from the launch path of every isolated dispatch.
+    """
+    return resolve_probe_interpreter()
 
 
 def _run_probe(session: Path | None, targets: dict[str, str], *, sandboxed: bool) -> dict:
