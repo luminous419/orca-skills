@@ -566,6 +566,63 @@ class ImmutabilityProofTests(_IsolationTestCase):
             )
         self.assertIn("immutability proof FAILED", str(caught.exception))
 
+    def test_a_supplied_candidate_list_replaces_the_default_and_never_widens_it(
+        self,
+    ) -> None:
+        """The `imm_candidates` seam is NARROWING-ONLY: it can only ever admit fewer.
+
+        The seam exists so a caller can supply FIXTURE-CONTROLLED Class IMM roots instead
+        of inheriting one host's real `/dev`, and the failure mode worth pinning is the
+        quiet one -- a list that EXTENDS the built-in default instead of replacing it, so
+        that naming one root still admits every real host root behind the caller's back.
+        A seam introduced to fix CI is exactly where that would hide.
+
+        What is under test here is therefore WHICH roots are considered, not whether they
+        prove: the proof is stubbed to `passed` so the assertion is about membership alone
+        and does not depend on this host's modes. Keeping the proof FATAL is a separate
+        assertion and is not stubbed -- see
+        `test_a_failing_root_is_never_admitted_as_imm` above and
+        `test_an_unprovable_candidate_is_fatal_through_isolate_under_seatbelt` below.
+        """
+        key = review_isolation._load_key_with_source(FIXTURE)
+        first = self.base / "cand_a"
+        second = self.base / "cand_b"
+        for candidate in (first, second):
+            candidate.mkdir()
+
+        # The narrowest end of the seam, with NOTHING stubbed: no candidates means no
+        # Class IMM entries at all, rather than a silent fall back to the default list.
+        empty = review_isolation.compute_readable_set(
+            self.build("run_e"), key, imm_candidates=()
+        )
+        self.assertEqual([e for e in empty["entries"] if e["class"] == "IMM"], [])
+
+        proven = (
+            {"passed": True, "writable_dirs": 0, "writable_files": 0, "failures": []},
+            [],
+        )
+        with mock.patch.object(
+            review_isolation, "prove_immutable_narrowing", return_value=proven
+        ):
+            readable = review_isolation.compute_readable_set(
+                self.build("run_n"), key, imm_candidates=(str(first), str(second))
+            )
+        admitted = [e["path"] for e in readable["entries"] if e["class"] == "IMM"]
+        self.assertEqual(
+            admitted,
+            [
+                str(review_isolation._realpath(first)),
+                str(review_isolation._realpath(second)),
+            ],
+            "the supplied list is the WHOLE Class IMM list, in the order supplied",
+        )
+        for default in review_isolation.DEFAULT_IMM_CANDIDATES:
+            self.assertNotIn(
+                str(review_isolation._realpath(default)),
+                admitted,
+                f"{default} was never named, so overriding the list must not admit it",
+            )
+
     def test_narrowing_carves_out_what_it_cannot_certify_and_never_what_is_mutable(
         self,
     ) -> None:
@@ -1106,6 +1163,71 @@ class UnenforcedTests(_IsolationTestCase):
                     (),
                     "no profile means no admission means nothing to prove",
                 )
+
+    def test_an_unprovable_candidate_is_fatal_through_isolate_under_seatbelt(
+        self,
+    ) -> None:
+        """The seam end-to-end, at the ONE boundary that decides: `isolate()` itself.
+
+        `imm_candidates_for_enforcement()` is tested above as a pure function and the CLI
+        flag is tested with `isolate` patched out, so between them sat the layer nobody
+        asserted: that `isolate()` actually HANDS its `imm_candidates` to
+        `compute_readable_set()`. An `isolate()` that quietly dropped the argument -- or
+        that passed `DEFAULT_IMM_CANDIDATES` no matter what it was given -- would keep
+        every other test in this file green.
+
+        So the same unprovable root is pushed through `isolate()` twice, and the two
+        outcomes are the contract: under `seatbelt` the proof runs, FAILS, and takes the
+        half-built session with it; under `none` no profile is rendered, so nothing is
+        admitted, nothing is proven, and the capture is reachable. The proof is not
+        stubbed here -- an ordinary mode-0755 directory is writable by the run user on
+        every host, which is I-2, which is the non-narrowable half of the proof.
+        """
+        unprovable = self.base / "unprovable"
+        unprovable.mkdir()
+        # `sandbox-exec` need only EXIST for `isolate()` to get past its B6 pre-check; it
+        # is never executed, because the readable set is computed -- and here refused --
+        # before any profile is rendered. That is what makes this assertion portable.
+        stand_in = self.base / "sandbox-exec-stand-in"
+        stand_in.write_text("", encoding="utf-8")
+        original = review_isolation.SANDBOX_EXEC
+        review_isolation.SANDBOX_EXEC = str(stand_in)
+        try:
+            with self.assertRaises(review_isolation.IsolationError) as caught:
+                review_isolation.isolate(
+                    "run_t", fixture=FIXTURE, session_base=self.base,
+                    enforcement="seatbelt", plant=False,
+                    imm_candidates=(str(unprovable),),
+                )
+        finally:
+            review_isolation.SANDBOX_EXEC = original
+        self.assertIn("immutability proof FAILED", str(caught.exception))
+        self.assertIn(
+            str(review_isolation._realpath(unprovable)),
+            str(caught.exception),
+            "the root named in the failure is the one the CALLER supplied",
+        )
+        self.assertEqual(
+            list(self.base.glob(f"{review_isolation.SESSION_PREFIX}*")),
+            [],
+            "a failed isolate() removes its half-built session",
+        )
+
+        result = review_isolation.isolate(
+            "run_t", fixture=FIXTURE, session_base=self.base,
+            enforcement="none", plant=False, imm_candidates=(str(unprovable),),
+        )
+        self.sessions.append(Path(result["session"]))
+        self.assertEqual(result["scope_enforcement"], "unenforced")
+        self.assertEqual(result["properties"]["S2"], "FAIL")
+        attestation = json.loads(
+            Path(result["attestation"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            [e for e in attestation["readable_set"] if e["class"] == "IMM"],
+            [],
+            "no profile means no admission means the candidate is never proven",
+        )
 
     def test_unenforced_still_refuses_a_usr_root_that_carries_key_material(self) -> None:
         """The half of the readable set the unenforced path DOES rest on, asserted here.
