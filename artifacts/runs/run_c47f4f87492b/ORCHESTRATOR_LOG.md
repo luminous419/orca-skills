@@ -1,0 +1,3 @@
+| timestamp | event | phase | role | iteration | task_id | dispatch_id | terminal | action | reuse | gate_result | review_verdict | risk | risk_source | requested_phases | round_kind | result | detail |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 2026-08-27T13:22:35.794427+00:00 | dispatch_created | implementation | worker | 1 | task_e33a34aa6c79 | ctx_52ac91065d5d | term_b73a399a-1b4d-4018-86a8-14783637719d | created | new |  |  | high |  |  | phase_gate | IMPLEMENTATION iteration 1 dispatched to claude-opus: fix 3 Linux CI test failures (macOS sandbox-exec-specific /dev immutability assumptions) without weakening macOS security semantics |  |
