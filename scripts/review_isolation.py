@@ -111,6 +111,11 @@ MOUNT_COMMAND = "/sbin/mount"
 # `enumerate_boundaries()`, because a hard-coded carve-out list is a claim about
 # someone else's machine.
 #
+# This list is a SEATBELT ADMISSION input and nothing else, so it is a darwin host list
+# and is read only on the `--enforcement seatbelt` path -- see
+# `imm_candidates_for_enforcement()`, which is the one place that decides. It is NOT a
+# claim that these roots exist, or mean the same thing, anywhere else.
+#
 # `/private/var` and `/Library` are absent BY CONSTRUCTION, and this is the F-001 fix:
 # the run user's real `tempfile.gettempdir()` is a writable descendant of `/private/var`,
 # and `/Library/Caches`, `/Library/Fonts` and `/Library/Frameworks/Python.framework` are
@@ -140,15 +145,61 @@ DEFAULT_IMM_CANDIDATES = (
 # into the entire data volume.
 MANDATORY_CARVE_OUTS = ("/System/Volumes",)
 
-# The one narrow I-6 exception beyond device nodes, named rather than assumed.
+# The one narrow I-6 exception beyond device nodes, DERIVED per host rather than asserted
+# about one.
 #
-# `/dev/fd/N` is the PROBING PROCESS'S OWN descriptor table, re-exposed as a directory.
-# Its entries are writable -- `/dev/fd/1` is this process's stdout -- but writing to one
-# writes to the caller's own open file, not to anything a later process can read back out
-# of `/dev`. It is therefore not a plant site, which is the only property I-2/I-3 exist to
-# establish. Counted separately in the proof so the exemption is visible in the
+# `<descriptor dir>/N` is the PROBING PROCESS'S OWN descriptor table, re-exposed as a
+# directory. Its entries are writable -- entry `1` is this process's stdout -- but writing
+# to one writes to the caller's own open file, not to anything a later process can read
+# back out of `/dev`. It is therefore not a plant site, which is the only property I-2/I-3
+# exist to establish. Counted separately in the proof so the exemption is visible in the
 # attestation rather than silently folded into `writable_files: 0`.
-OWN_DESCRIPTOR_DIR = "/dev/fd"
+#
+# The SPELLING was the problem. `"/dev/fd"` is a fact about darwin, and writing it down as
+# a constant stated one host's `/dev` topology as if it were every host's -- the same habit
+# that made the repository-side tests unrunnable off darwin. It is now proven per host by
+# `derive_own_descriptor_dir()`, and a host on which nothing can be proven gets NO
+# exemption, which is strictly stricter than the constant ever was.
+OWN_DESCRIPTOR_DIR_CANDIDATES = ("/dev/fd", "/proc/self/fd")
+
+
+def derive_own_descriptor_dir(
+    candidates: Sequence[str] = OWN_DESCRIPTOR_DIR_CANDIDATES,
+) -> str | None:
+    """The directory that IS this process's descriptor table, proven rather than named.
+
+    The test is the definition. Open a throwaway descriptor N, then ask whether
+    `<candidate>/N` is the SAME FILE -- same device, same inode -- as this process's own
+    fd N. Only a directory that answers yes is the caller's own descriptor table, so only
+    such a directory can earn I-6's exemption; every other writable entry in an IMM
+    candidate stays an ordinary I-3/I-6 failure that DROPS the root.
+
+    Returns `None` when no candidate proves it, and `None` means NO exemption at all. That
+    is the fail-closed direction: the exemption can only ever be lost by this derivation,
+    never granted to a directory that did not prove itself.
+    """
+    try:
+        handle = os.open(os.devnull, os.O_RDONLY)
+    except OSError:                                   # pragma: no cover - no /dev/null
+        return None
+    try:
+        reference = os.fstat(handle)
+        for candidate in candidates:
+            try:
+                observed = os.stat(os.path.join(candidate, str(handle)))
+            except OSError:
+                continue
+            if (observed.st_dev, observed.st_ino) == (
+                reference.st_dev,
+                reference.st_ino,
+            ):
+                return candidate
+    finally:
+        os.close(handle)
+    return None
+
+
+OWN_DESCRIPTOR_DIR = derive_own_descriptor_dir()
 
 NARROWABLE_CHECKS = ("I-1", "I-4")
 
@@ -415,7 +466,7 @@ def prove_immutable(root: Path, carve_outs: Sequence[str] = ()) -> dict:
                     proof["escaping_symlinks"] += 1
                 continue
             mode = stat.st_mode
-            if str(here) == OWN_DESCRIPTOR_DIR:
+            if OWN_DESCRIPTOR_DIR is not None and str(here) == OWN_DESCRIPTOR_DIR:
                 proof["own_descriptors"] += 1                       # I-6, exempted
                 continue
             if stat_module.S_ISREG(mode):
@@ -2674,12 +2725,46 @@ def repatriate(
 # ---- the driver ---------------------------------------------------------------------------
 
 
+def imm_candidates_for_enforcement(
+    enforcement: str, imm_candidates: Sequence[str] = DEFAULT_IMM_CANDIDATES
+) -> tuple[str, ...]:
+    """Class IMM candidates are a SEATBELT ADMISSION input, and only that.
+
+    The recursive immutability proof answers exactly one question: may this root be named
+    in an `(allow file-read* (subpath ...))` clause of a generated profile WITHOUT being
+    content-scanned at session-build time? Under `--enforcement none` no profile is
+    rendered, nothing is admitted and nothing is denied, so the question has no subject.
+
+    Asking it anyway was a real defect, not merely a redundancy. A host whose `/dev`
+    contains a writable directory -- `/dev/mqueue` and `/dev/shm` on an ordinary Linux
+    box -- failed the proof, so `isolate(..., enforcement="none")` exited 4 there and the
+    DOCUMENTED unenforced capture was unreachable on that host. A Seatbelt-only
+    precondition was gating the one path that has no Seatbelt, and it proved nothing about
+    that path in exchange.
+
+    Nothing the unenforced path actually rests on is weakened here, because none of it was
+    ever the IMM proof's job. Every Class USR root -- the session's `review_root`, `tmp`
+    and `home`, plus every `--allow-read` -- is still resolved, still refused if it is or
+    contains a never-admitted path, and still content-scanned with admission refused on a
+    hit. NEG-0's positive control and NEG-1's review_root walk still run and still raise.
+    `scope_enforcement` is still `unenforced`, S2 and S3 are still FAIL, and the capture
+    still FAILS B6.
+
+    Under `--enforcement seatbelt` the list is returned unchanged, so the macOS contract is
+    byte-for-byte what it was.
+    """
+    if enforcement == ENFORCEMENT_SEATBELT:
+        return tuple(imm_candidates)
+    return ()
+
+
 def isolate(
     run_id: str,
     *,
     fixture: Path,
     session_base: Path | None = None,
     policy_files: Sequence[str] = DEFAULT_POLICY_FILES,
+    imm_candidates: Sequence[str] = DEFAULT_IMM_CANDIDATES,
     allow_read: Sequence[str] = (),
     enforcement: str = ENFORCEMENT_SEATBELT,
     attempt: int = 1,
@@ -2695,6 +2780,23 @@ def isolate(
 
     A half-built isolation session is worse than none, because its existence would be
     read as a guarantee. Every failure below removes the session before it raises.
+
+    `imm_candidates` is the Class IMM CANDIDATE list, defaulting to
+    `DEFAULT_IMM_CANDIDATES` -- so a bare `isolate()` call is byte-for-byte what it has
+    always been, and this parameter changes NOTHING about the default macOS security
+    behaviour. It exists because `compute_readable_set()` has always taken the argument
+    (it is the only knob that says WHICH roots are worth proving) and `isolate()` was the
+    one layer that did not expose it, which made every caller a hostage to one hard-coded
+    list of real host paths. Overriding it is not a way around the proof: every candidate
+    still has to survive `enumerate_boundaries()` + `prove_immutable_narrowing()`, is
+    still refused outright if it is on `NEVER_ADMITTED`, and is still content-scanned at
+    NEG-5 by the mandatory pass B. A failing proof is still `IsolationError`, still fatal,
+    still with the session removed. Narrowing the list only ever admits FEWER roots.
+
+    The list is consumed through `imm_candidates_for_enforcement()`, which is what makes
+    it a Seatbelt input rather than a universal precondition: under `--enforcement none`
+    there is no profile to admit anything to, so no candidate is proven and the unenforced
+    capture is no longer blocked by a proof that exists only to support Seatbelt admission.
     """
     attempt = assert_attempt_in_domain(attempt)
     if enforcement not in (ENFORCEMENT_SEATBELT, ENFORCEMENT_NONE):
@@ -2716,7 +2818,12 @@ def isolate(
     )
     try:
         key = _load_key_with_source(fixture)
-        readable = compute_readable_set(session, key, allow_read=allow_read)
+        readable = compute_readable_set(
+            session,
+            key,
+            imm_candidates=imm_candidates_for_enforcement(enforcement, imm_candidates),
+            allow_read=allow_read,
+        )
         paths = [entry["path"] for entry in readable["entries"]]
         carve_outs = readable["carve_outs"]
         denied = discover_key_bearing_roots(fixture)

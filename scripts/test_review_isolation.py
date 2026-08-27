@@ -643,15 +643,151 @@ class ImmutabilityProofTests(_IsolationTestCase):
             os.chmod(root, 0o755)
 
     def test_private_var_and_library_are_not_admissible_by_habit(self) -> None:
+        """The CONSTANTS half. Portable, because it is about this module's own lists."""
         for forbidden in ("/private/var", "/Library"):
             self.assertIn(forbidden, review_isolation.NEVER_ADMITTED)
             self.assertNotIn(forbidden, review_isolation.DEFAULT_IMM_CANDIDATES)
+
+    def test_a_never_admitted_candidate_that_exists_is_refused_outright(self) -> None:
+        """The REFUSAL half, on a FIXTURE root, so it is asserted on every host.
+
+        Naming the real `/private/var` made this an assertion about darwin's topology
+        rather than about the rule. Off darwin that path does not exist,
+        `compute_readable_set()` skips a candidate that is not there, and the test reached
+        the never-admitted branch on exactly one operating system while reading as though
+        it covered the rule everywhere. The rule is "a candidate that IS on the list is
+        refused, wholesale, before any proof is attempted", so the LIST is what the fixture
+        controls and the root is one this test made.
+        """
+        root = self.base / "never_admitted_fixture"
+        root.mkdir()
+        resolved = str(review_isolation._realpath(root))
         key = review_isolation._load_key_with_source(FIXTURE)
         session = self.build()
-        with self.assertRaises(review_isolation.IsolationError):
+
+        # The control: without the entry the same candidate is admitted, so the refusal
+        # below is caused by the never-admitted list and not by the fixture root itself.
+        os.chmod(root, 0o555)
+        try:
+            admitted = review_isolation.compute_readable_set(
+                session, key, imm_candidates=(resolved,)
+            )
+        finally:
+            os.chmod(root, 0o755)
+        self.assertIn(
+            resolved, [entry["path"] for entry in admitted["entries"]],
+        )
+
+        with mock.patch.object(
+            review_isolation,
+            "NEVER_ADMITTED",
+            (*review_isolation.NEVER_ADMITTED, resolved),
+        ):
+            with self.assertRaises(review_isolation.IsolationError) as caught:
+                review_isolation.compute_readable_set(
+                    session, key, imm_candidates=(resolved,)
+                )
+        self.assertIn("never-admitted list", str(caught.exception))
+
+    @DARWIN_ONLY
+    def test_the_real_private_var_is_refused_on_the_supported_host(self) -> None:
+        """The host-topology half of the same rule, gated because it IS host topology.
+
+        `/private/var` is a real, existing, never-admitted path only on darwin -- which is
+        also the only host the Seatbelt backend runs on, so this is where the assertion
+        has a subject.
+        """
+        self.assertTrue(Path("/private/var").exists())
+        key = review_isolation._load_key_with_source(FIXTURE)
+        session = self.build()
+        with self.assertRaises(review_isolation.IsolationError) as caught:
             review_isolation.compute_readable_set(
                 session, key, imm_candidates=("/private/var",)
             )
+        self.assertIn("never-admitted list", str(caught.exception))
+
+    def test_the_own_descriptor_exemption_is_derived_and_never_assumed(self) -> None:
+        """I-6's second exception: proven per host, and it exempts nothing else.
+
+        The exemption used to be the literal string `"/dev/fd"`, i.e. a claim about one
+        host's `/dev`. `derive_own_descriptor_dir()` PROVES it instead -- `<dir>/N` must be
+        the same device and inode as this process's own fd N -- so the same code is correct
+        on a host that spells it `/proc/self/fd` and grants nothing on a host that cannot
+        prove it at all.
+        """
+        derived = review_isolation.derive_own_descriptor_dir()
+        self.assertIsNotNone(derived, "every supported host has a descriptor directory")
+        handle = os.open(os.devnull, os.O_RDONLY)
+        try:
+            observed = os.stat(os.path.join(derived, str(handle)))
+            reference = os.fstat(handle)
+        finally:
+            os.close(handle)
+        self.assertEqual(
+            (observed.st_dev, observed.st_ino), (reference.st_dev, reference.st_ino)
+        )
+        # A directory that is NOT the descriptor table proves nothing and is refused, so
+        # the derivation cannot be talked into exempting an ordinary writable directory.
+        self.assertIsNone(
+            review_isolation.derive_own_descriptor_dir((str(self.base),))
+        )
+
+    def test_only_the_derived_descriptor_directory_is_exempted_from_i3(self) -> None:
+        """The exemption applied to a FIXTURE tree, both ways round.
+
+        This is the assertion the hard-coded constant made unwritable off darwin: the
+        subtree is one this test built, so the check is that `prove_immutable()` exempts
+        THE directory it was told is the descriptor table and no other -- which is the
+        whole of I-6's second clause, on every host.
+        """
+        root = self.base / "i6"
+        table = root / "fdlike"
+        table.mkdir(parents=True)
+        (table / "1").write_text("stdout stand-in", encoding="utf-8")
+        os.chmod(root, 0o555)
+        try:
+            unexempted = review_isolation.prove_immutable(root)
+            self.assertFalse(unexempted["passed"])
+            self.assertEqual(unexempted["own_descriptors"], 0)
+            self.assertEqual(
+                sorted({failure["check"] for failure in unexempted["failures"]}),
+                ["I-2", "I-3"],
+                "a writable directory holding a writable file, exempted by nothing",
+            )
+
+            os.chmod(table, 0o555)
+            with mock.patch.object(
+                review_isolation,
+                "OWN_DESCRIPTOR_DIR",
+                str(review_isolation._realpath(table)),
+            ):
+                exempted = review_isolation.prove_immutable(root)
+            self.assertTrue(exempted["passed"], exempted["failures"])
+            self.assertEqual(exempted["own_descriptors"], 1)
+            self.assertEqual(exempted["writable_files"], 0)
+        finally:
+            os.chmod(table, 0o755)
+            os.chmod(root, 0o755)
+
+    def test_no_descriptor_directory_means_no_exemption_rather_than_a_wider_proof(
+        self,
+    ) -> None:
+        """`None` is fail-closed. A host that cannot prove one gets no exception."""
+        root = self.base / "i6b"
+        table = root / "fdlike"
+        table.mkdir(parents=True)
+        (table / "1").write_text("x", encoding="utf-8")
+        os.chmod(table, 0o555)
+        os.chmod(root, 0o555)
+        try:
+            with mock.patch.object(review_isolation, "OWN_DESCRIPTOR_DIR", None):
+                proof = review_isolation.prove_immutable(root)
+            self.assertFalse(proof["passed"])
+            self.assertEqual(proof["own_descriptors"], 0)
+            self.assertEqual(proof["writable_files"], 1)
+        finally:
+            os.chmod(table, 0o755)
+            os.chmod(root, 0o755)
 
 
 @DARWIN_ONLY
@@ -917,6 +1053,81 @@ class UnenforcedTests(_IsolationTestCase):
             # is -- an absence of ENFORCEMENT.
             self.assertEqual(probe["result"], "NOT_APPLICABLE_UNENFORCED")
             self.assertNotEqual(probe["result"], "SKIP")
+
+        # The unenforced path is not gated behind Seatbelt's admission proof. No profile
+        # is rendered, so no root is admitted to one, so no Class IMM entry is claimed --
+        # and the capture therefore cannot fail because some host's `/dev` happens to
+        # contain a writable directory.
+        self.assertEqual(
+            [e for e in attestation["readable_set"] if e["class"] == "IMM"], []
+        )
+        # And what unenforced DOES rest on is still there and still scanned: the three
+        # session roots -- review_root, tmp and home -- are Class USR entries with
+        # `scanned: true`. (Their `path` fields are P-PATH placeholders, so the assertion
+        # is on the class and the count; `assert_home_scanned()` is what names `home`, and
+        # it ran inside the `isolate()` this CLI call performed.)
+        self.assertEqual(
+            [e.get("scanned") for e in attestation["readable_set"]],
+            [True, True, True],
+        )
+        self.assertEqual(
+            {e["class"] for e in attestation["readable_set"]}, {"USR"}
+        )
+
+    def test_the_imm_proof_is_a_seatbelt_input_and_only_a_seatbelt_input(self) -> None:
+        """C4, as a unit: which enforcement backend asks the proof's question at all.
+
+        `prove_immutable()` answers "may this root be named in a profile read clause
+        WITHOUT being content-scanned at session-build time". `--enforcement none` renders
+        no profile, so the question has no subject -- and asking it anyway made the
+        documented unenforced capture exit 4 on any host whose `/dev` holds a writable
+        directory, proving nothing about the unenforced path in exchange.
+        """
+        self.assertEqual(
+            review_isolation.imm_candidates_for_enforcement(
+                review_isolation.ENFORCEMENT_SEATBELT
+            ),
+            tuple(review_isolation.DEFAULT_IMM_CANDIDATES),
+            "the seatbelt path gets the list unchanged -- byte-for-byte the old contract",
+        )
+        self.assertEqual(
+            review_isolation.imm_candidates_for_enforcement(
+                review_isolation.ENFORCEMENT_SEATBELT, ("/bin",)
+            ),
+            ("/bin",),
+            "an explicit --imm-candidate list still reaches the seatbelt path intact",
+        )
+        for enforcement in (review_isolation.ENFORCEMENT_NONE, "anything-else"):
+            with self.subTest(enforcement=enforcement):
+                self.assertEqual(
+                    review_isolation.imm_candidates_for_enforcement(
+                        enforcement, review_isolation.DEFAULT_IMM_CANDIDATES
+                    ),
+                    (),
+                    "no profile means no admission means nothing to prove",
+                )
+
+    def test_unenforced_still_refuses_a_usr_root_that_carries_key_material(self) -> None:
+        """The half of the readable set the unenforced path DOES rest on, asserted here.
+
+        Dropping the Class IMM proof from `--enforcement none` must not be readable as
+        "the unenforced path stopped checking". The Class USR scan is a property of the
+        TREE rather than of a profile, and it is still fatal.
+        """
+        planted = self.base / "extra"
+        planted.mkdir()
+        shutil.copy2(str(KEY_PATH), str(planted / "harmless.json"))
+        with self.assertRaises(review_isolation.IsolationError) as caught:
+            review_isolation.isolate(
+                "run_t", fixture=FIXTURE, session_base=self.base,
+                enforcement="none", plant=False, allow_read=(str(planted),),
+            )
+        self.assertIn("key material is reachable", str(caught.exception))
+        self.assertEqual(
+            list(self.base.glob(f"{review_isolation.SESSION_PREFIX}*")),
+            [],
+            "a failed isolate() removes its half-built session",
+        )
 
     def test_t89_seatbelt_on_a_host_without_the_backend_exits_four(self) -> None:
         original = review_isolation.SANDBOX_EXEC

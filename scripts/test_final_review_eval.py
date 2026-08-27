@@ -1530,6 +1530,41 @@ class IsolateCliWiringTests(unittest.TestCase):
             self.assertEqual(completed.returncode, evaluator.EXIT_LEAK_OR_FIXTURE)
             self.assertIn("key material is reachable", completed.stderr)
 
+    def test_the_imm_candidate_flag_replaces_the_default_list_and_defaults_to_it(
+        self,
+    ) -> None:
+        """T-10: `--imm-candidate` wiring, asserted in-process so it runs on every host.
+
+        The flag exists so a caller can supply FIXTURE-CONTROLLED Class IMM roots instead
+        of inheriting one host's real `/dev`. Its behaviour end-to-end is a Seatbelt
+        property and is darwin-only; its WIRING -- repeatable, replaces rather than
+        extends, and falls back to the built-in default when absent -- is not, so it is
+        pinned here rather than left to a platform-gated integration run.
+        """
+        import review_isolation
+
+        for argv, expected in (
+            (["--imm-candidate", "/bin", "--imm-candidate", "/sbin"], ("/bin", "/sbin")),
+            ([], tuple(review_isolation.DEFAULT_IMM_CANDIDATES)),
+        ):
+            with self.subTest(argv=argv):
+                with patch.object(review_isolation, "isolate") as isolate:
+                    isolate.return_value = {
+                        "session": "/s", "review_root": "/s/review_root",
+                        "attestation": "/s/control/ISOLATION.json",
+                        "launch_command": "AGENT", "scope_enforcement": "unenforced",
+                        "properties": {"S1": "PASS", "S2": "FAIL", "S3": "FAIL"},
+                    }
+                    with patch("sys.stdout"), patch("sys.stderr"):
+                        code = evaluator.main(
+                            ["isolate", "--run-id", "r", "--enforcement", "none",
+                             "--no-plant", *argv]
+                        )
+                self.assertEqual(code, evaluator.EXIT_OK)
+                self.assertEqual(
+                    isolate.call_args.kwargs["imm_candidates"], expected
+                )
+
     def test_a_missing_policy_file_is_a_contract_exit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             completed = run_cli(

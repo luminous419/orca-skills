@@ -1310,6 +1310,21 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     command.add_argument(
+        "--imm-candidate",
+        action="append",
+        default=[],
+        metavar="ABS_DIR",
+        help=(
+            "repeatable. REPLACE the Class IMM candidate list -- the roots that are "
+            "worth trying to PROVE immutable -- instead of the built-in default. This is "
+            "not a way around the proof: every entry still has to survive the recursive "
+            "immutability proof, is still refused if it is on the never-admitted list, "
+            "and is still content-scanned at NEG-5. Omit it and the built-in default is "
+            "used unchanged; that default is the host list a seatbelt capture needs and "
+            "narrowing it only ever admits fewer roots."
+        ),
+    )
+    command.add_argument(
         "--seed",
         action="append",
         default=[],
@@ -1409,6 +1424,8 @@ def _dispatch_isolate(args: argparse.Namespace) -> int:
             session_base=Path(args.session_base) if args.session_base else None,
             policy_files=tuple(args.policy_file)
             or review_isolation.DEFAULT_POLICY_FILES,
+            imm_candidates=tuple(args.imm_candidate)
+            or review_isolation.DEFAULT_IMM_CANDIDATES,
             allow_read=tuple(args.allow_read),
             enforcement=args.enforcement,
             attempt=args.attempt,
