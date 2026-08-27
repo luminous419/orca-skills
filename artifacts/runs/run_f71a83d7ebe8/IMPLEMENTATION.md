@@ -1,12 +1,22 @@
-# IMPLEMENTATION — run_f71a83d7ebe8 (iteration 1)
+# IMPLEMENTATION — run_f71a83d7ebe8 (iteration 2, corrected)
 
 Phase: IMPLEMENTATION
 Role: WORKER
 Branch: `agent/final-review-observability-evaluation` (Draft PR #20)
-Task: `task_fdff71d8b2ac` / Dispatch: `ctx_64de550407b3`
+Iteration 1 task: `task_fdff71d8b2ac` / Dispatch: `ctx_64de550407b3`
+Iteration 2 task: `task_60ca59ce0dcc` / Dispatch: `ctx_d1a82ec198b2`
 
 STATUS: COMPLETE
 UNIT_TEST_STATUS: PASS
+CI_STATUS: GREEN — GitHub Actions run 33080957741 on `f0c9275`, all three matrix jobs success
+
+> **Iteration 2 is a report correction only. It changes no production code.** The
+> iteration-1 fix was correct and is proven green on real CI. Iteration 1's *report*,
+> however, asserted three things that are false (a red-CI prediction, a fabricated causal
+> story, and a conflation of two different `git diff --check` invocations), and the Reviewer
+> relied on them to raise blocking finding F-IMPL-001. Those claims are corrected in place below — marked
+> **[CORRECTION]** and left visible rather than deleted, so the record shows both what was
+> wrong and what is true. See §"Correction of iteration 1's false claims (F-IMPL-001)".
 
 ---
 
@@ -39,10 +49,15 @@ No skip replaces an assertion anywhere. Every behaviour the three failing tests 
 supposed to establish is now **actually executed on Linux**, verified in Docker on CPython
 3.11.16, 3.12.14 and 3.13.15. Exactly **one** new skip was added, on **macOS: zero**.
 
-Two **pre-existing, out-of-scope** failures remain on every platform (`git diff --check`
-over the OS-22 range, caused by coordinator-committed `artifacts/runs/*/REVIEW_*.md`
-snapshots carrying Markdown hard breaks). They are proven below to exist at committed
-`HEAD` without this change and are **escalated to the Coordinator, not acted on**.
+**[CORRECTION]** Two pre-existing failures remain **on a full local checkout only** — not
+on CI. They are the retained-report whitespace gate tests, which compare `git diff --check`
+over the OS-22 range and trip on coordinator-committed `artifacts/runs/*/REVIEW_*.md`
+snapshots carrying Markdown hard breaks. On GitHub Actions these two tests **skip**, because
+`actions/checkout@v4` checks out shallow and the pinned base commit is unreachable; CI is
+therefore green. Iteration 1 wrongly reported them as failing on every platform and
+concluded PR #20 would stay red. They are proven below to exist at committed `HEAD` without
+this change, and they are **deliberately not acted on** — fixing them would require editing
+other runs' digest-bound artifacts, which the artifact contract forbids.
 
 ---
 
@@ -201,6 +216,53 @@ force-push.
 
 ## Validation
 
+### 0. AUTHORITATIVE: GitHub Actions CI run 33080957741 (commit `f0c9275`) — GREEN
+
+This is the result that settles the objective. It post-dates iteration 1's report.
+
+```
+$ gh run list --branch agent/final-review-observability-evaluation --limit 3
+completed  success  CI  ...  33080957741  2m13s  2026-08-27T14:12:31Z
+completed  failure  CI  ...  32994487855  2m8s   2026-08-26T17:29:53Z
+completed  failure  CI  ...  32974118219  2m6s   2026-08-26T13:25:32Z
+
+$ gh run view 33080957741 --json jobs --jq '.jobs[] | "\(.name)\t\(.conclusion)"'
+validate (3.12)  success
+validate (3.13)  success
+validate (3.11)  success
+```
+
+Per-job test totals, from the run log:
+
+| Job | Result |
+| --- | --- |
+| `validate (3.11)` | `Ran 1201 tests in 110.361s` — `OK (skipped=29)` |
+| `validate (3.12)` | `Ran 1201 tests in 120.345s` — `OK (skipped=29)` |
+| `validate (3.13)` | `Ran 1201 tests in 114.924s` — `OK (skipped=29)` |
+
+Delta against the last red run, 32994487855 on `c059dc0` (`Ran 1193 tests` /
+`FAILED (failures=3, skipped=28)`, identical on all three jobs):
+
+| Metric | 32994487855 (`c059dc0`) | 33080957741 (`f0c9275`) | Delta |
+| --- | --- | --- | --- |
+| Tests run | 1193 | 1201 | **+8** |
+| Failures | 3 | **0** | **-3** |
+| Skips | 28 | 29 | +1 |
+
+Every step of every job succeeded, including `Check whitespace`:
+
+```
+$ gh run view 33080957741 --json jobs --jq '.jobs[] | select(.name=="validate (3.11)") | .steps[] | "\(.name)\t\(.conclusion)"'
+Set up job                        success
+Check out repository              success
+Set up Python                     success
+Validate Skill packages           success
+Run deterministic tests           success
+Verify release package inputs     success
+Build and verify release archive  success
+Check whitespace                  success
+```
+
 ### 1. Full suite — macOS (darwin 25.5.0, CPython 3.11)
 
 ```
@@ -219,6 +281,22 @@ FAILED (failures=2, skipped=6)
 **+8 tests, 0 new failures, 0 new skips.** Both failures are the same pre-existing pair
 (section 6 below).
 
+**Iteration-2 re-run**, same host, no production change since `f0c9275`:
+
+```
+$ python3 -m unittest discover -s scripts -p 'test_*.py'
+Ran 1201 tests in 297.350s
+FAILED (failures=2, skipped=6)
+
+$ python3 -m unittest discover -s scripts -p 'test_*.py' 2>&1 | grep -E '^(FAIL|ERROR):'
+FAIL: test_run_logging.RetainedReportWhitespaceExemptionTests.test_the_gate_fails_again_once_the_exemption_is_removed
+FAIL: test_run_logging.RetainedReportWhitespaceExemptionTests.test_the_whitespace_gate_passes_over_the_whole_os22_range
+```
+
+These two failures are **local-only**, for the mechanism in §7: a full local checkout can
+reach the pinned base commit `1045815`, so the gate actually evaluates; CI's shallow
+checkout cannot, so the same two tests skip there. The 1201 test count matches CI exactly.
+
 ### 2. Full suite — Linux (MANDATORY LINUX PROOF)
 
 Docker was available. Each run copies the checkout into the container, runs `git clean -xdff`
@@ -236,8 +314,17 @@ $ docker run --rm -v "$PWD":/src:ro -v .../linux_run.sh:/linux_run.sh:ro python:
 | Python 3.12.14 | — | `Ran 1201 tests in 208.586s` — `FAILED (failures=2, skipped=25)` |
 | Python 3.13.15 | — | `Ran 1201 tests in 209.011s` — `FAILED (failures=2, skipped=25)` |
 
-The baseline's five failures were the three CI failures plus the two pre-existing whitespace
-failures. The three CI failures are **gone on all three interpreters**. Verbatim baseline
+**[CORRECTION] These Docker runs are not equivalent to a GitHub Actions job, and iteration 1
+wrongly treated them as such.** The container receives a *full* copy of the local checkout,
+so the pinned base commit `1045815` is reachable and the two whitespace gate tests **run and
+fail**. On GitHub Actions the checkout is shallow, the base commit is unreachable, and the
+same two tests **skip**. That difference — not any property of Linux — is the entire reason
+these runs show `failures=2` while the real Linux matrix jobs show `OK`. The residual
+`failures=2` above is therefore an artifact of the local harness, and the correct Linux
+matrix result is §0's `OK (skipped=29)` on all three interpreters.
+
+The baseline's five failures were the three CI failures plus the two whitespace failures. The
+three CI failures are **gone on all three interpreters**. Verbatim baseline
 evidence for the primary one:
 
 ```
@@ -388,17 +475,127 @@ deletion or reset of worktree state.
 | Gate | Assessment |
 | --- | --- |
 | G1 explicit requirement violation | None. C1–C5 all met. |
-| G2 result does not work | No. The three target failures pass on 3.11/3.12/3.13. |
+| G2 result does not work | No. CI run 33080957741 on `f0c9275` is green on all three matrix jobs (`Ran 1201 tests` / `OK (skipped=29)` each). The three target failures pass on 3.11/3.12/3.13. |
 | G3 severe regression | None. macOS is byte-identical in pass/fail/skip; `validate_skills`, `verify_package` and the archive build all pass. |
 | G4 data loss / security / irreversible side effect | None. Every change to the security path is strictly *stricter* or *inert* on the enforced backend. |
-| G5 missing validation evidence | None. Real Linux runs on all three supported interpreters, with before/after counts and verbatim output. |
+| G5 missing validation evidence | None. Real GitHub Actions matrix result (§0) plus local runs on all three supported interpreters, with before/after counts and verbatim output. |
 
 ---
 
-## OUT OF SCOPE — escalated, not acted on
+## Correction of iteration 1's false claims (F-IMPL-001)
 
-Two further tests fail on **every** platform, including at committed `HEAD` **without** this
-change:
+Reviewer finding **F-IMPL-001** (G2, MAJOR, blocking) concluded that "PR #20 CI is not
+fixed" and that the change leaves "every matrix job failing." That conclusion was reasonable
+**given what iteration 1's report said** — and what it said was wrong in three places. The
+premise is contradicted by CI run 33080957741. Each error is stated below rather than quietly
+removed.
+
+### C-1 — FALSE: "PR #20's CI will still be red after this change"
+
+**What iteration 1 claimed:** both the "Run deterministic tests" step and the "Check
+whitespace" step would fail, leaving the PR red.
+
+**Truth:** CI run 33080957741 on `f0c9275` is **green on all three matrix jobs**, and every
+step succeeded, `Check whitespace` included. Each job reports `Ran 1201 tests` /
+`OK (skipped=29)`. Evidence in §0.
+
+The "Check whitespace" step runs bare `git diff --check` — which compares the **working tree
+against the index**, and is empty on a fresh checkout. It never evaluates the OS-22 commit
+range, so retained-artifact history cannot make it fail. Iteration 1 conflated that step with
+the test's ranged `git diff --check 1045815..HEAD`. They are different commands.
+
+### C-2 — FALSE: the two whitespace failures were introduced after CI run 32994487855
+
+**What iteration 1 claimed:** the offending files were introduced by coordinator artifact
+commits `c059dc0` and `289d00f`, *after* run 32994487855 — offered as the explanation for why
+that run listed three failures rather than five.
+
+**Truth:** both files were already in the tree that run 32994487855 tested. Verified:
+
+```
+$ git log --oneline --diff-filter=A -- artifacts/runs/run_75c5c6046f35/REVIEW_TEST_iteration1.md
+959a6b4 Confirm TEST BLOCKED independently (F-401/402/403)
+
+$ git merge-base --is-ancestor 959a6b4 c059dc0 && echo YES
+YES
+
+$ git cat-file -e c059dc0:artifacts/runs/run_75c5c6046f35/REVIEW_TEST_iteration1.md && echo PRESENT
+PRESENT
+
+$ git log --oneline --diff-filter=A -- artifacts/runs/run_4d1c47c838db/REVIEW_DESIGN_iteration1.md
+289d00f Record DESIGN phase gate PASS for PR #20 remediation run
+
+$ git merge-base --is-ancestor 289d00f c059dc0 && echo YES
+YES
+
+$ git cat-file -e c059dc0:artifacts/runs/run_4d1c47c838db/REVIEW_DESIGN_iteration1.md && echo PRESENT
+PRESENT
+```
+
+`c059dc0` is the very commit run 32994487855 tested, and both files were present in it. The
+causal story was fabricated from an assumption about commit ordering that was never checked.
+The three-versus-five discrepancy has a different cause entirely — C-3.
+
+### C-3 — The real mechanism: shallow checkout makes the gate skip on CI
+
+`scripts/test_run_logging.py:3932` pins the comparison base:
+
+```python
+WHITESPACE_GATE_BASE_COMMIT = "1045815"
+```
+
+`_require_git_range()` (`scripts/test_run_logging.py:3970`) refuses to evaluate a gate it
+cannot evaluate, and **skips rather than silently passing**:
+
+```python
+probe = self._git("rev-parse", "--verify", "--quiet",
+                  f"{WHITESPACE_GATE_BASE_COMMIT}^{{commit}}", cwd=REPO_ROOT)
+if probe.returncode != 0:
+    self.skipTest(f"base commit {WHITESPACE_GATE_BASE_COMMIT} is unreachable "
+                  "(shallow or grafted checkout)")
+```
+
+`.github/workflows/ci.yml:21-22` checks out with `actions/checkout@v4` and sets **no**
+`fetch-depth`, so it takes the action's default shallow (`--depth=1`) fetch. The pinned base
+commit is therefore unreachable on the runner and the gate tests skip.
+
+Verified directly, not inferred — a `--depth=1` clone reproduces the runner's condition:
+
+```
+$ git clone --depth=1 file:///Users/luminous/aiAssistedProjects/orca-skills shallow
+$ git -C shallow rev-parse --verify --quiet '1045815^{commit}'   # -> rc=1, UNREACHABLE
+$ (cd shallow && python3 -m unittest discover -s scripts -p 'test_run_logging.py' \
+     -k RetainedReportWhitespaceExemption -v)
+test_the_whitespace_gate_passes_over_the_whole_os22_range ... skipped 'base commit 1045815 is unreachable (shallow or grafted checkout)'
+test_the_gate_fails_again_once_the_exemption_is_removed ... skipped 'base commit 1045815 is unreachable (shallow or grafted checkout)'
+test_only_retained_reports_are_exempt ... skipped 'base commit 1045815 is unreachable (shallow or grafted checkout)'
+test_the_pattern_does_not_leak_outside_the_audit_directories ... skipped 'base commit 1045815 is unreachable (shallow or grafted checkout)'
+test_every_retained_artifact_still_matches_its_recorded_digest ... ok
+test_the_gitattributes_rule_is_exactly_the_one_designed ... ok
+test_the_hard_break_report_keeps_its_forty_trailing_space_lines ... ok
+Ran 7 tests in 0.053s
+OK (skipped=4)
+```
+
+Locally, where `1045815` **is** reachable (`git rev-parse --verify 1045815^{commit}` ->
+`104581524c1d64165124269afb75048f935c15af`), the gate evaluates and two of those four fail.
+This also explains the skip asymmetry: CI reports `skipped=29` while a full macOS checkout
+reports `skipped=6`. The two directions have separate causes — CI skips the range-dependent
+gate tests that macOS runs, and macOS runs the Seatbelt/darwin tests that CI skips.
+
+*One refinement I am recording rather than glossing:* the shallow checkout causes **four**
+skips in this test class, not two. Two of them (`test_only_retained_reports_are_exempt`,
+`test_the_pattern_does_not_leak_outside_the_audit_directories`) pass locally, so only two
+show up as local failures. The skip-count arithmetic across the whole suite involves both
+this class and the darwin-gated tests; I have not attempted to reconcile the totals
+test-by-test, and I am not asserting a precise decomposition of CI's 29.
+
+---
+
+## OUT OF SCOPE — deliberately not acted on
+
+Two tests fail on a **full local checkout** (and skip on CI, per C-3), including at committed
+`HEAD` **without** this change:
 
 ```
 FAIL: test_run_logging.RetainedReportWhitespaceExemptionTests.test_the_whitespace_gate_passes_over_the_whole_os22_range
@@ -407,23 +604,44 @@ AssertionError: 2 != 0 : git diff --check must exit 0 over the OS-22 range
 ```
 
 **Proof they pre-exist:** a clean `git clone` of `agent/final-review-observability-evaluation`
-at `6cd2567` (no working diff at all) reproduces exactly these two, on macOS and in the
-container.
+at `6cd2567` (no working diff at all) reproduces exactly these two.
 
 **Cause:** tracked `artifacts/runs/*/REVIEW_*.md` snapshots carry Markdown hard breaks (two
 trailing spaces). `.gitattributes` exempts only
-`artifacts/runs/*/final_review_audit/**/report.md`. Offending files were introduced by
-coordinator artifact commits — `c059dc0` (`artifacts/runs/run_028d416e596a/REVIEW_TEST_iteration1.md`)
-and `289d00f` (`artifacts/runs/run_4d1c47c838db/REVIEW_DESIGN_iteration1.md`) — both after CI
-run 32994487855, which is why the authoritative failure list in this dispatch names three
-failures rather than five.
+`artifacts/runs/*/final_review_audit/**/report.md` — the retained Final Review report
+snapshots — and nothing else. The files that trip the ranged gate are:
 
-**Consequence:** PR #20's CI will still be red after this change — both the "Run deterministic
-tests" step (these two tests) and the separate "Check whitespace" step (`git diff --check`).
+```
+$ git diff --check 1045815..HEAD | sed 's/:.*//' | sort -u
+artifacts/runs/run_028d416e596a/REVIEW_TEST_iteration1.md
+artifacts/runs/run_4d1c47c838db/REVIEW_DESIGN_iteration1.md
+artifacts/runs/run_4d1c47c838db/REVIEW_DESIGN_iteration2.md
+artifacts/runs/run_75c5c6046f35/REVIEW_DESIGN_iteration2.md
+artifacts/runs/run_75c5c6046f35/REVIEW_TEST_iteration1.md
+```
 
-**Not acted on, deliberately.** The two candidate remedies are (a) stripping trailing
-whitespace from Reviewer-authored report snapshots, which the repository treats as byte-exact
-immutable evidence under DESIGN A.3, or (b) widening the `.gitattributes` exemption, which is
-an OS-22 scope decision. Both are artifact-governance calls that belong to the Coordinator,
-and neither is within this dispatch's stated scope (which names the three isolation failures
-as authoritative and forbids scope changes). **Coordinator decision requested.**
+**Why leaving them alone is correct, not an evasion.** Every offending file belongs to a
+**different run** — `run_028d416e596a`, `run_4d1c47c838db`, `run_75c5c6046f35`. The two
+candidate remedies are both out of bounds:
+
+1. **Strip the trailing whitespace.** This edits tracked, digest-bound retained review
+   artifacts owned by other runs. The orchestration artifact contract forbids migrating,
+   rewriting, or deleting another run's artifacts, and this dispatch repeats that
+   prohibition verbatim. It is also self-defeating on the test's own terms: the class
+   docstring at `scripts/test_run_logging.py:3952` states that "passing the gate is worthless
+   if it was bought by editing a digest-bound file," and the sibling assertion
+   `test_every_retained_artifact_still_matches_its_recorded_digest` would fail the moment
+   those bytes changed. The gate is deliberately built so this remedy cannot succeed.
+2. **Widen the `.gitattributes` exemption** to cover `REVIEW_*.md`. This is an OS-22
+   artifact-governance decision about which artifact classes are byte-exact evidence — out of
+   scope for this run, and untouchable under the standing "no OS-23 / no lifecycle-semantics"
+   prohibitions.
+
+**Consequence: none for PR #20.** CI is green (§0). This is a local-checkout-only condition
+with no effect on the merge gate. Iteration 1's decision to leave these alone was right; its
+stated reason was wrong, and is corrected above.
+
+**Still a Coordinator call, but not a blocker.** If the repository wants the ranged gate to
+be meaningful on CI, the fix is to give the checkout enough history (`fetch-depth: 0`) — at
+which point the exemption question in (2) becomes live and must be decided deliberately.
+Flagged for the Coordinator as follow-up; **not** proposed for this run.
