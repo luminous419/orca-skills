@@ -1899,6 +1899,155 @@ class ProbeInterpreterShimTests(unittest.TestCase):
         self.assertEqual(completed.stdout.strip(), "1")
 
 
+class ProbeLaunchWiringTests(unittest.TestCase):
+    """T-14.2: the resolver is only worth anything if the LAUNCH LINE goes through it.
+
+    `ProbeInterpreterShimTests` proves `_probe_python()` never returns the shim, and
+    `test_the_probe_interpreter_goes_through_the_resolver` proves `_probe_python()` calls
+    the resolver. Neither says anything about the two places that actually exec: the
+    interpreter string is built inside `_run_probe()` and inside `preflight_probe()`, and
+    an edit that spelled `SYSTEM_PYTHON` in either of them would put Apple's tool shim
+    back on the launch line with the whole shim suite still green. That gap is what these
+    close, behaviourally -- by substituting the resolver's answer and reading the command
+    that was actually handed to `/bin/sh`.
+
+    Portable: no shim, no sandbox and no real exec is involved. `subprocess.run` is
+    replaced by a recorder, so what is under test is the command STRING, which is the
+    thing that decides which binary runs.
+    """
+
+    SENTINEL = "/nonexistent/resolved/interpreter"
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.base = Path(self.temporary.name)
+        self.commands: list[str] = []
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def recorder(self, *, returncode: int = 0):
+        """Stands in for `subprocess.run`, recording the `/bin/sh -c` command."""
+        def run(argv, **_kwargs):
+            self.commands.append(argv[-1])
+            return subprocess.CompletedProcess(argv, returncode, "", "")
+        return run
+
+    def test_the_probe_launch_line_execs_the_resolved_interpreter(self) -> None:
+        with mock.patch.object(
+            review_isolation, "_probe_python", return_value=self.SENTINEL
+        ), mock.patch.object(review_isolation.subprocess, "run", self.recorder()):
+            review_isolation._run_probe(None, {"key": "/k"}, sandboxed=False)
+        self.assertEqual(len(self.commands), 1)
+        self.assertIn(self.SENTINEL, self.commands[0])
+        self.assertNotIn(review_isolation.SYSTEM_PYTHON, self.commands[0])
+
+    def test_the_preflight_launch_line_execs_the_resolved_interpreter(self) -> None:
+        session = self.base / "session"
+        (session / "review_root").mkdir(parents=True)
+        with mock.patch.object(
+            review_isolation, "_probe_python", return_value=self.SENTINEL
+        ), mock.patch.object(review_isolation.subprocess, "run", self.recorder()):
+            result = review_isolation.preflight_probe(session)
+        self.assertTrue(result["ok"], result["log"])
+        self.assertIn(self.SENTINEL, self.commands[0])
+        self.assertNotIn(review_isolation.SYSTEM_PYTHON, self.commands[0])
+
+    # -- N-003: the residual git shim, bounded by the ordering it rests on --------
+
+    def test_the_python_check_is_launched_before_the_git_check(self) -> None:
+        """N-003's argument, in test form rather than in prose.
+
+        `preflight_probe()` deliberately keeps `git --version` running Apple's shim, so
+        that the check proves the AGENT's real git. That is only safe because the python
+        interpreter is resolved -- and can fail -- before any check is launched. The
+        ordering is load-bearing, and today it is load-bearing PROSE: a future edit that
+        moved the git check first, or that resolved the interpreter lazily inside the
+        loop, would silently falsify the argument and nothing would notice.
+        """
+        session = self.base / "session"
+        (session / "review_root").mkdir(parents=True)
+        with mock.patch.object(
+            review_isolation, "_probe_python", return_value=self.SENTINEL
+        ), mock.patch.object(review_isolation.subprocess, "run", self.recorder()):
+            review_isolation.preflight_probe(session)
+        python_index = next(
+            index for index, command in enumerate(self.commands)
+            if self.SENTINEL in command
+        )
+        git_index = next(
+            index for index, command in enumerate(self.commands)
+            if "git --version" in command
+        )
+        self.assertLess(python_index, git_index)
+
+    def test_an_unresolvable_interpreter_raises_before_git_version_can_run(self) -> None:
+        """The other half of N-003's argument: the raise beats the shim to the exec.
+
+        `_probe_python()` is evaluated while the check LIST is built, so an unresolvable
+        interpreter propagates out of `preflight_probe()` with zero processes launched --
+        in particular the `git --version` that still runs the shim never happens. If a
+        later edit deferred resolution into the loop, `git --version` would reach the shim
+        on a host where python could not resolve, which is exactly the host that reported
+        the installer dialog.
+        """
+        session = self.base / "session"
+        (session / "review_root").mkdir(parents=True)
+        failure = review_isolation.IsolationError("no interpreter")
+        with mock.patch.object(
+            review_isolation, "_probe_python", side_effect=failure
+        ), mock.patch.object(review_isolation.subprocess, "run", self.recorder()):
+            with self.assertRaises(review_isolation.IsolationError):
+                review_isolation.preflight_probe(session)
+        self.assertEqual(
+            self.commands, [], "no check may launch once the interpreter is unresolvable"
+        )
+
+    # -- the delta admits nothing ---------------------------------------------------
+
+    def test_resolving_an_interpreter_admits_no_new_immutable_root(self) -> None:
+        """The admission lists are the sandbox's surface, and the delta must not move it.
+
+        `resolve_probe_interpreter()` returns a path under a developer directory, and the
+        tempting bug is to "make it work" by admitting that directory. Both lists are
+        pinned by value here, so adding a root -- or dropping a never-admitted one --
+        fails rather than quietly widening what the Reviewer can read.
+        """
+        self.assertEqual(
+            review_isolation.DEFAULT_IMM_CANDIDATES,
+            (
+                "/bin",
+                "/sbin",
+                "/private/etc",
+                "/dev",
+                "/private/var/select",
+                "/usr",
+                "/System",
+                "/Library/Developer/CommandLineTools",
+            ),
+        )
+        self.assertEqual(
+            review_isolation.NEVER_ADMITTED,
+            (
+                "/private/var",
+                "/private/tmp",
+                "/Library",
+                "/opt/homebrew",
+                "/Users",
+                "/Applications",
+                "/System/Volumes/Data",
+            ),
+        )
+        for forbidden in review_isolation.NEVER_ADMITTED:
+            self.assertNotIn(forbidden, review_isolation.DEFAULT_IMM_CANDIDATES)
+        # The resolver's own default target is inside an ALREADY-listed candidate; it is
+        # not a new root and it is not exempt from the proof that admits that root.
+        self.assertIn(
+            review_isolation.DEFAULT_DEVELOPER_DIR,
+            review_isolation.DEFAULT_IMM_CANDIDATES,
+        )
+
+
 # ---- T-10 the seed mechanism (DESIGN D-6.1 .. D-6.9) ---------------------------------
 #
 # Every test below runs over SYNTHETIC roots. None needs a network, a real credential or
