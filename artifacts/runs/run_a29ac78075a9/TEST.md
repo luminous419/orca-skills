@@ -587,4 +587,3 @@ property, unrelated to this delta, and I did not change it.
   shim detection is a byte scan (`is_tool_shim`), the mutation experiments patched Python
   objects rather than invoking binaries, and `developer_dir_candidates()` deliberately reads
   `/var/db/xcode_select_link` instead of asking `xcode-select`.
-
