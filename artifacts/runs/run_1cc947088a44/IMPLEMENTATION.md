@@ -1,6 +1,6 @@
 # IMPLEMENTATION — run_1cc947088a44
 
-Phase: IMPLEMENTATION · Iteration 2 · Risk: high
+Phase: IMPLEMENTATION · Iteration 3 · Risk: high
 Branch: `agent/final-review-observability-evaluation` (Draft PR #20)
 Baseline HEAD: `fc4f4a8`
 
@@ -26,10 +26,29 @@ different git entirely. `resolve_probe_git()` now **selects** the candidate from
 classifies it by its bytes: a real binary is verified as-is, a shim is resolved to the real
 tool behind it, and neither "no git on PATH" nor "unresolvable shim" has a fallback.
 
-24 tests are added net across the two iterations. Both properties are pinned non-vacuously:
-putting the raw `git --version` back on the launch line fails 6 tests, and reverting to
-fixed-path resolution fails 4 — demonstrated by actually breaking each and recording the
-output (§7).
+**Iteration 3 corrects F-002 and F-003, both introduced by iteration 2's own correction.**
+Following a PATH is a *read*, and iteration 2 followed it into directories nothing had
+admitted: with no `--agent-path`, the inherited `PATH` was searched and the selected
+candidate was **opened** by `is_tool_shim()` — in the host process, before Seatbelt exists,
+with no readable-set check anywhere on that branch. My own inherited-PATH test asserted that
+bypass as correct behaviour, over a `TemporaryDirectory` that realpaths under
+`/private/var`, i.e. `NEVER_ADMITTED` (§A7). Separately, `shutil.which(..., path=<whole
+PATH>)` resolves a relative or empty component against **this** process's directory while
+the agent resolves it against `<session>/review_root`, so the "exact effective-PATH
+fidelity" claim was wider than the behaviour (§A8).
+
+Selection is now one function, `select_launch_path_tool()`, which walks the PATH component
+by component and **refuses** — before any byte is read — a candidate whose realpath is
+outside the admitted readable set, and a relative or empty component that could still change
+which file is selected. `isolate()` threads its own `readable["entries"]` in; the parameter
+**defaults to admitting nothing**, so a caller that forgets it fails closed instead of
+searching ungated. What is *not* claimed is stated in the same places (§A8, §A9).
+
+34 tests are added net across the three iterations. Every property is pinned non-vacuously:
+putting the raw `git --version` back on the launch line fails 6 tests, reverting to
+fixed-path resolution fails 4, deleting the admission gate fails 4, and deleting the
+relative-component refusal fails 2 — demonstrated by actually breaking each and recording
+the output (§7).
 
 `STATUS: COMPLETE`
 `UNIT_TEST_STATUS: PASS`
@@ -195,16 +214,113 @@ call-site level; it does not cover operator-supplied `agent_command`.**
 
 | Launch shape | PATH the agent sees | What the pre-flight now checks |
 | --- | --- | --- |
-| `--agent-path A B` given | `A:B:/usr/bin:/bin:/usr/sbin:/sbin` (from `launch_path()`) | first executable `git` on that exact string; a shim among them is resolved, never exec'd |
-| no `--agent-path` | inherited from this process (no `PATH=` on the launch line) | first executable `git` on the inherited PATH, same treatment |
+| `--agent-path A B` given | `A:B:/usr/bin:/bin:/usr/sbin:/sbin` (from `launch_path()`) | first executable `git` on that exact string **whose realpath is inside the admitted readable set**; a shim among them is resolved, never exec'd |
+| no `--agent-path` | inherited from this process (no `PATH=` on the launch line) | same rule, on the inherited PATH — and the inherited PATH is where the admission gate does real work, because nothing has vetted it |
+| candidate outside the admitted readable set | — | **hard failure, raised before the file is opened** (F-002) |
+| relative or empty PATH component reached before the tool | — | **hard failure** — this process cannot resolve it the way the agent will (F-003) |
 | no `git` on the effective PATH | — | **hard failure before any check launches**; never a bare `git` fallback |
 
-Only already-admitted `--agent-path` entries are searched: `isolate()` runs
-`assert_agent_path_admitted(agent_path, readable)` *before* `preflight_probe()`, and
-`launch_path()` reads nothing beyond joining those directory strings. Nothing new is
-admitted, scanned or made readable; `NEVER_ADMITTED`, `DEFAULT_IMM_CANDIDATES`, the
-immutability proof and the NEG-5 mandatory scan are untouched (§6, and
-`test_resolving_an_interpreter_admits_no_new_immutable_root` pins both lists by value).
+**Iteration 2 claimed here that "only already-admitted `--agent-path` entries are searched".
+That was false, and it is F-002.** `assert_agent_path_admitted()` validates only the
+explicit `--agent-path` sequence; the inherited-PATH branch went through no admission
+decision at all, and `is_tool_shim()` opened whatever it selected. The gate that makes the
+sentence true is now written down rather than assumed: `select_launch_path_tool()` refuses a
+candidate whose realpath is outside `isolate()`'s own `readable["entries"]`, and refuses it
+*before* the read. Nothing new is admitted, scanned or made readable to buy that;
+`NEVER_ADMITTED`, `DEFAULT_IMM_CANDIDATES`, the immutability proof and the NEG-5 mandatory
+scan are untouched (§6, and `test_resolving_an_interpreter_admits_no_new_immutable_root`
+pins both lists by value). The gate only ever refuses **more**.
+
+### A7. F-002 — following a PATH is a read, and iteration 2 read what nothing admitted
+
+The correction I shipped in iteration 2 is right about *which* file the pre-flight must
+verify and wrong about *what it may do to find out*. Classification is
+`is_tool_shim(candidate)`, and that function `open()`s the candidate. It runs in the host
+process, at session-build time, **before** `sandbox-exec` is anywhere near the picture. So
+"select from the inherited PATH, then classify by bytes" is, on any host whose `PATH` names
+a directory the capture never scanned, an out-of-sandbox read of an unadmitted file.
+
+The gate that was supposed to prevent this — `assert_agent_path_admitted()` — only ever saw
+the explicit `--agent-path` sequence. The `launch_path()` branch that returns
+`os.environ["PATH"]` bypassed it completely, and on this host that PATH begins
+`/opt/homebrew/bin:/opt/homebrew/sbin:/Users/luminous/bin:…` — three directories the
+readable set refuses, two of them under `NEVER_ADMITTED` roots (`/opt/homebrew`, `/Users`).
+
+**My own test asserted the bypass as correct.** `test_an_inherited_path_git_is_followed_too`
+built its candidate under `TemporaryDirectory`, called `_probe_git()` with no admission
+argument, and asserted the file was read and returned. On this host that directory realpaths
+to `/private/var/folders/...`, and `/private/var` is the first entry of `NEVER_ADMITTED`.
+The test did not fail to cover the hole; it *documented the hole as the specification*. A
+later sandbox denial does not undo a read that already happened, which is why "the profile
+would have denied it anyway" is not an answer.
+
+The fix is the smallest thing that makes the sentence in §A5 true: thread the readable set
+`isolate()` already computed into the one place that turns a PATH into a filename, and
+refuse there. `admitted_roots` defaults to `()`, so the refusing behaviour is what a caller
+gets by forgetting — `test_the_default_admits_nothing_so_an_unthreaded_call_reads_nothing`
+pins that, and asserts (on darwin) that the temporary directory really is under a
+`NEVER_ADMITTED` root, so the test still describes the reported bypass and not something
+weaker.
+
+Admission is decided on the candidate's **realpath**, and that is deliberate rather than
+lax: an `open()` returns the realpath's bytes, and the readable set is stated in realpaths
+for the same reason the seatbelt profile is. A different *spelling* of an admitted file
+(`/var/...` for `/private/var/...`) exposes nothing extra and is followed
+(`test_a_differently_spelled_but_admitted_candidate_is_still_followed`); a candidate whose
+realpath leaves the set is refused however innocent its spelling
+(`test_a_candidate_whose_realpath_escapes_the_admitted_set_is_refused`) — which is exactly
+the `/opt/homebrew/bin` → `Cellar` shape `wrap_command()` already documents.
+
+### A8. F-003 — `shutil.which()` resolves relative components in the WRONG directory
+
+`wrap_command()` is `cd <session>/review_root && … exec …`. The agent therefore resolves a
+PATH component spelled `bin`, or an empty component, against `<session>/review_root`. The
+pre-flight resolved the same string against **the review process's own current directory**,
+because that is what `shutil.which(name, path=value)` does. Same PATH string, two different
+files.
+
+Measured on the pre-fix code, with a `bin/git` in each directory:
+
+```
+resolver cwd : /private/var/folders/…/T/tmphfdsjep6/resolver_cwd
+agent cwd    : /var/folders/…/T/tmphfdsjep6/launch_cwd   (what wrap_command cds to)
+PICKED       : /private/var/folders/…/T/tmphfdsjep6/resolver_cwd/bin/git
+agent would  : /var/folders/…/T/tmphfdsjep6/launch_cwd/bin/git
+```
+
+**I chose refusal over reproduction**, and the reason is the same one F-002 turns on:
+resolving the component the agent's way would mean `os.access()`-ing and then opening files
+under a directory chosen by a relative string, inside a session the agent has not been
+launched in — buying exactness by widening what the pre-flight touches. Refusing costs
+nothing real: an absolute `--agent-path` entry is already the documented way to put a
+directory on the agent's PATH, and `launch_path()` realpaths every one of them, so **no
+`--agent-path` configuration can hit this refusal at all**. It is reachable only from an
+inherited PATH that carries a relative or empty component.
+
+The refusal is scoped to components that could actually change the answer. The walk is
+left-to-right and stops at the first match, so a relative component *after* the directory
+that supplies `git` is never reached — and cannot be reached by the agent either, whose own
+left-to-right lookup has already matched. That limit is a stated behaviour with a test
+(`test_a_relative_component_after_the_match_is_never_reached`), not an accident.
+
+What this buys is the positive claim, now true as stated: every component the selection
+consults is absolute, so the answer does not depend on the process's current directory —
+`test_the_selection_does_not_depend_on_this_processs_directory` runs the same resolution
+from the resolver's directory and from the launch directory, with a *different* `bin/git`
+planted in each, and requires the same absolute answer from both.
+
+### A9. What "PATH fidelity" now claims, exactly
+
+Three times on this branch the defect has been a claim wider than its evidence. So, narrowly:
+
+| Claim | True? | Bounded by |
+| --- | --- | --- |
+| The pre-flight verifies the git the agent's own effective PATH selects | **yes**, for every PATH the selection accepts | `PreflightGitPathSelectionTests`, incl. the end-to-end launch-line test |
+| …for an admitted `--agent-path` directory that outranks `/usr/bin` | **yes** | `test_an_admitted_agent_path_git_outranks_the_system_git` |
+| …for an inherited PATH | **only when the candidate's realpath is inside the admitted readable set**; otherwise the run fails closed | F-002 gate + 4 tests |
+| …for a PATH with a relative or empty component before the tool | **no — refused**, deliberately, because this process cannot resolve it as the agent will | F-003 gate + 2 tests |
+| The candidate is never executed to classify it | **yes** | byte scan only; `ProbeLaunchWiringTests` |
+| Nothing outside the admitted readable set is opened by *this* resolution | **yes for the PATH-selected candidate**; the developer-directory target read by `resolve_developer_tool()` is out of this gate's scope and unchanged | stated in `resolve_probe_git()`'s docstring and §A6 |
 
 ### A6. What I did NOT verify
 
@@ -230,6 +346,29 @@ Stated explicitly, because accuracy is part of the deliverable.
   `preflight_probe()` run against the recorded launch line), and the real seatbelt session
   in §6 exercises the **inherited-PATH** branch of the same code. I state this rather than
   implying the real session covered both branches.
+- I did **not** exercise the F-002 **refusal** in a real seatbelt session. The live session
+  in §6 exercises the *accepting* side: its inherited PATH selects `/usr/bin/git`, whose
+  realpath is inside the proven Class IMM root `/usr`, so the gate passes it. Driving the
+  refusal live would mean planting a git in an unscanned directory ahead of `/usr/bin` on my
+  own PATH and watching the capture abort — which proves nothing the portable tests do not,
+  and which I will not do by widening admission. The refusing side is therefore covered by
+  four portable tests plus the end-to-end `preflight_probe()` one, and I say so here rather
+  than implying the live session covered both sides. This is the same reasoning the
+  Reviewer endorsed for `--agent-path` above.
+- I did **not** exercise the F-003 refusal in a real session either, for the same reason:
+  it is unreachable from any `--agent-path` configuration (every entry is realpath'd and
+  absolute), so provoking it live would mean editing my own shell `PATH` to carry a relative
+  component. Two portable tests plus the recorded pre-fix divergence measurement (§A8) carry
+  it.
+- I did **not** extend the admission gate to the developer-directory read inside
+  `resolve_developer_tool()` — the `<developer dir>/usr/bin/<tool>` file it opens when the
+  candidate IS the shim. That path comes from `developer_dir_candidates()`, is shared
+  byte-for-byte with the probe interpreter, and the dispatch freezes both
+  (`resolve_developer_tool()` and the python path stay exactly as they are). It is stated as
+  an explicit limit in `resolve_probe_git()`'s docstring and in §A9 rather than left for a
+  reader to discover. On this host that directory is
+  `/Library/Developer/CommandLineTools`, which **is** a `DEFAULT_IMM_CANDIDATES` root and
+  is admitted only after passing the recursive immutability proof.
 - I did **not** push. The Coordinator pushes.
 
 ---
@@ -259,33 +398,52 @@ Stated explicitly, because accuracy is part of the deliverable.
    `PATH`. `wrap_command()` was rewired to build its `PATH=` assignment from it, so the
    string on the launch line and the string the pre-flight searches are *the same string
    from the same function*. `wrap_command()`'s output is byte-identical to before.
-5. **`resolve_probe_git(path_value=None, *, agent_path=(), developer_dirs=None)`**
-   *(iteration 2, rewritten)* — **selects** the candidate from `launch_path(agent_path)` via
-   `shutil.which()`, then classifies it by its bytes: a real binary is returned as-is, a shim
-   goes through `resolve_developer_tool(candidate, candidate)`. Raises `IsolationError` when
-   no `git` is on the effective PATH, naming that PATH. Iteration 1's signature took a fixed
-   `system_git` and is gone; that fixed address was the defect.
-6. **`_probe_git(agent_path=())`** — mirrors `_probe_python()`; one statement, pinned by AST
-   test *including the `agent_path=agent_path` argument*, because dropping it is exactly the
-   fixed-path regression.
-7. **`preflight_probe()`** — `"git --version"` →
-   `f"{shlex.quote(_probe_git(agent_path))} --version"`. This is the one-line change that
-   closes the finding; everything above exists to make it correct, PATH-faithful,
-   fail-closed and general.
-8. **Commentary.** The `TOOL_SHIM_MARKER` block's "Deliberately NOT extended to the
+5. **`select_launch_path_tool(name, path_value, admitted_roots=())`** *(iteration 3, new)*
+   — the one place a PATH becomes a filename, and therefore the one place both new gates
+   belong. It walks the components left to right and, per component: refuses a **relative or
+   empty** one (F-003 — this process cannot resolve it in the agent's directory), otherwise
+   looks the name up in that single directory, and on the first match refuses the candidate
+   unless its **realpath is inside an admitted root** (F-002) — a metadata-only decision,
+   taken *before* `is_tool_shim()` can open anything. `admitted_roots` defaults to `()`,
+   which admits nothing, so forgetting to thread it fails closed. Falling off the end raises
+   the same "no git on the effective launch PATH" error as before, with the same wording.
+6. **`resolve_probe_git(path_value=None, *, agent_path=(), admitted_roots=(), developer_dirs=None)`**
+   *(iteration 2, rewritten; iteration 3, gated)* — **selects** the candidate through
+   `select_launch_path_tool()`, then classifies it by its bytes: a real binary is returned
+   as-is, a shim goes through `resolve_developer_tool(candidate, candidate)`. Iteration 1's
+   signature took a fixed `system_git` and is gone; that fixed address was the defect. Its
+   docstring now states the *limits* of the PATH-fidelity claim, and names the one read that
+   is out of the gate's scope.
+7. **`_probe_git(agent_path=(), *, admitted_roots=())`** — mirrors `_probe_python()`; one
+   statement, pinned by AST test *including both keyword arguments*: dropping `agent_path`
+   is the fixed-path regression, dropping `admitted_roots` is F-002.
+8. **`preflight_probe()`** — `"git --version"` →
+   `f"{shlex.quote(_probe_git(agent_path, admitted_roots=admitted_roots))} --version"`, with
+   `admitted_roots` a new keyword-only parameter defaulting to `()`. This is the one-line
+   change that closes the original finding; everything above exists to make it correct,
+   PATH-faithful, fail-closed, general — and, since iteration 3, incapable of reading
+   outside the readable set to get there.
+9. **`isolate()`** — passes `admitted_roots=paths` to `preflight_probe()`, where `paths` is
+   the list it already derived from `readable["entries"]` for the profile itself. One
+   expression, no new computation, no second source of truth for what is admitted; pinned by
+   `test_isolate_passes_the_readable_set_it_computed_to_the_preflight`.
+10. **Commentary.** The `TOOL_SHIM_MARKER` block's "Deliberately NOT extended to the
    pre-flight's `git --version`" paragraph is replaced by the measurement that refutes it
    and by a statement of the reasoning error, so the next reader cannot re-derive the narrow
    argument from the source. `preflight_probe()`'s docstring carries the §A5 scope statement,
    and now also states that the git spelling is PATH-*selected* before it is shim-resolved.
    `resolve_probe_git()`'s docstring no longer claims the resolved path is unconditionally
    the git the agent would run; it states the two properties and the condition under which
-   each holds.
+   each holds. `launch_path()`'s docstring no longer reads as "the inherited PATH is
+   followed wherever it leads" — the sentence that produced F-002 — and says instead that it
+   *reports* a PATH it does not vouch for.
 
 ### `scripts/test_review_isolation.py`
 
-+24 net across the two iterations (13 in iteration 1, +12 in the new
-`PreflightGitPathSelectionTests`, −1 iteration-1 test replaced). See
-§"Unit Tests / Testing Strategy".
++34 net across the three iterations (13 in iteration 1, +12 in the new
+`PreflightGitPathSelectionTests`, −1 iteration-1 test replaced, +10 in iteration 3). One
+iteration-2 test — `test_an_inherited_path_git_is_followed_too` — is **rewritten**, because
+what it asserted was the F-002 bypass. See §"Unit Tests / Testing Strategy".
 
 ### Not changed
 
@@ -301,8 +459,8 @@ or LICENSE change. No new PR, no merge, no force-push. No prior run's artifacts 
 
 | Path | Change |
 | --- | --- |
-| `scripts/review_isolation.py` | generalized resolver + `launch_path()` + PATH-selecting `resolve_probe_git()` + `_probe_git(agent_path)` + call-site fix + commentary |
-| `scripts/test_review_isolation.py` | +24 net (13 iteration-1, +12 `PreflightGitPathSelectionTests`, −1 replaced); 2 existing N-003 tests retargeted |
+| `scripts/review_isolation.py` | generalized resolver + `launch_path()` + PATH-selecting `resolve_probe_git()` + **`select_launch_path_tool()` (admission-before-bytes and cwd-safe component walk)** + `_probe_git(agent_path, admitted_roots=…)` + `preflight_probe(admitted_roots=…)` + `isolate()` threading its own readable set + call-site fix + commentary |
+| `scripts/test_review_isolation.py` | +34 net (13 iteration-1, +12 `PreflightGitPathSelectionTests`, −1 replaced, +10 iteration-3); 1 iteration-2 test rewritten because it encoded F-002; existing calls now state their admitted roots |
 | `artifacts/runs/run_1cc947088a44/IMPLEMENTATION.md` | this artifact |
 
 ---
@@ -311,22 +469,22 @@ or LICENSE change. No new PR, no merge, no force-push. No prior run's artifacts 
 
 ### 1. Full suite, macOS
 
-**Iteration 2 (this delta):**
+**Iteration 3 (this delta):**
 
 ```
 $ python3 -m unittest discover -s scripts -p 'test_*.py'
-Ran 1249 tests in 290.342s
-FAILED (failures=2, skipped=6)
-
-$ python3 -m unittest discover -s scripts -p 'test_*.py' 2>&1 | grep -E "^(FAIL|ERROR):"
 FAIL: test_the_gate_fails_again_once_the_exemption_is_removed (test_run_logging.RetainedReportWhitespaceExemptionTests...)
 FAIL: test_the_whitespace_gate_passes_over_the_whole_os22_range (test_run_logging.RetainedReportWhitespaceExemptionTests...)
+Ran 1259 tests in 301.176s
+FAILED (failures=2, skipped=6)
 ```
 
-1225 baseline + 24 net new = **1249** (iteration 1 recorded 1238 at +13). The only two
-failures are the **expected, pre-existing** `RetainedReportWhitespaceExemptionTests` pair,
-which skip on CI because `actions/checkout@v4` fetches `--depth=1`. Not fixed: every
-offending file belongs to another run and is digest-bound.
+1225 baseline + 34 net new = **1259** (iteration 1 recorded 1238 at +13; iteration 2, 1249
+at +24). The only two failures are the **expected, pre-existing**
+`RetainedReportWhitespaceExemptionTests` pair, which skip on CI because
+`actions/checkout@v4` fetches `--depth=1`. Not fixed: every offending file belongs to
+another run and is digest-bound. `skipped=6` is unchanged from iteration 2 — none of the ten
+new tests is a skip on darwin either.
 
 ### 2. `validate_skills.py`
 
@@ -365,28 +523,53 @@ $ for v in 3.11 3.12 3.13; do
 ########## python:3.11 (non-root, CI-like) ##########
 FAIL: test_the_gate_fails_again_once_the_exemption_is_removed (test_run_logging.RetainedReportWhitespaceExemptionTests...)
 FAIL: test_the_whitespace_gate_passes_over_the_whole_os22_range (test_run_logging.RetainedReportWhitespaceExemptionTests...)
-Ran 1249 tests in 197.506s
+Ran 1259 tests in 185.554s
 FAILED (failures=2, skipped=28)
 
 ########## python:3.12 (non-root, CI-like) ##########
+ERROR: test_t83_a_symlink_in_the_policy_copy_list_is_refused (test_review_isolation.SessionLayoutTests...)
 FAIL: test_the_gate_fails_again_once_the_exemption_is_removed (test_run_logging.RetainedReportWhitespaceExemptionTests...)
 FAIL: test_the_whitespace_gate_passes_over_the_whole_os22_range (test_run_logging.RetainedReportWhitespaceExemptionTests...)
-Ran 1249 tests in 226.220s
-FAILED (failures=2, skipped=28)
+Ran 1259 tests in 209.211s
+FAILED (failures=2, errors=1, skipped=28)
 
 ########## python:3.13 (non-root, CI-like) ##########
 FAIL: test_the_gate_fails_again_once_the_exemption_is_removed (test_run_logging.RetainedReportWhitespaceExemptionTests...)
 FAIL: test_the_whitespace_gate_passes_over_the_whole_os22_range (test_run_logging.RetainedReportWhitespaceExemptionTests...)
-Ran 1249 tests in 216.770s
+Ran 1259 tests in 211.960s
 FAILED (failures=2, skipped=28)
 ```
 
-All three: **1249 run, 2 failures**, and those two are the same
+All three: **1259 run**, and the constant two failures are the same
 `RetainedReportWhitespaceExemptionTests` pair that fails locally on macOS and skips on CI
 under `--depth=1`. `skipped=28` vs macOS's `6` is the 22 `@DARWIN_ONLY` tests, two of which
-are mine (§"Portability"). **`skipped=28` is unchanged from iteration 1**, which is the
-mechanical proof that all 12 new `PreflightGitPathSelectionTests` execute on Linux rather
-than skipping — the docker `git version 2.47.3` is the real, non-shim git those runs select.
+are mine (§"Portability"). **`skipped=28` is unchanged from iterations 1 and 2**, which is
+the mechanical proof that all 22 `PreflightGitPathSelectionTests` — the 12 from iteration 2
+and the 10 new ones — execute on Linux rather than skipping. The docker `git version 2.47.3`
+is the real, non-shim git those runs select.
+
+**The one-off `ERROR` on 3.12, reported rather than dropped.** That loop ran while the macOS
+full suite was running against the *same* working tree (docker mounts it live), and
+`test_t83_a_symlink_in_the_policy_copy_list_is_refused` reads repository policy files. It did
+not reproduce:
+
+```
+$ docker run --rm --user "$(id -u):$(id -g)" -v "$PWD":/w -w /w -e HOME=/tmp \
+    python:3.12 python3 -m unittest discover -s scripts -p 'test_*.py'      # alone
+FAIL: …RetainedReportWhitespaceExemptionTests… (×2 only)
+Ran 1259 tests in 217.509s
+FAILED (failures=2, skipped=28)
+
+$ docker run … python:3.12 python3 -m unittest test_review_isolation.SessionLayoutTests -v
+test_t83_a_symlink_in_the_policy_copy_list_is_refused … ok
+Ran 6 tests in 0.376s
+OK
+```
+
+Stated honestly: I **did not capture that error's traceback** — the loop piped through `grep`
+— so "concurrent access to the shared mount" is the most likely cause and not a measured
+one. What I did measure is that a clean 3.12 full run and the class in isolation both pass,
+and that the test touches nothing this delta changes.
 
 The default-**root** docker invocation was also re-run for continuity with §5a: all three
 versions reported `Ran 1249 tests … FAILED (failures=8, errors=1, skipped=28)` — the same
@@ -426,30 +609,57 @@ whitespace pair, as shown above. The numbers reported in §5 are the non-root on
 
 ### 6. A real macOS seatbelt `isolate()` session
 
-Re-run against the **iteration-2** code, not carried over from iteration 1.
+Re-run against the **iteration-3** code, not carried over from iteration 2.
 
 ```
-$ isolate("run_1cc947088a44_f001", fixture=scripts/fixtures/final_review_eval,
+$ isolate("run_1cc947088a44_f002", fixture=scripts/fixtures/final_review_eval,
           enforcement="seatbelt")
 
 effective launch PATH (no --agent-path, inherited):
-  /opt/homebrew/bin:/opt/homebrew/sbin:/Users/luminous/bin:… ...
-resolved probe git    : /Library/Developer/CommandLineTools/usr/bin/git
+  /opt/homebrew/bin:/opt/homebrew/sbin:/Users/luminous/bin:/opt/homebrew/opt/node@24/bin: ...
 resolved probe python : /Library/Developer/CommandLineTools/Library/Frameworks/
                         Python3.framework/Versions/3.9/bin/python3.9
 
 scope_enforcement: seatbelt
 PROPERTIES: {"S1": "PASS", "S2": "PASS", "S3": "PASS"}
-SESSION:    /private/var/folders/nz/.../T/frv_iso_bn6v0ji3
-profile_digest: sha256:513061d94a10e42c43702def997b46958aa608116a670343876f72418eb444e0
+SESSION:    /private/var/folders/nz/.../T/frv_iso_usos7308
+profile_digest: sha256:57128c27dbfc92ab6eacb186ab2d568f73911f5faa23844160554464e4b6f7c4
+
+IMM/USR admitted roots (from the session's own attestation):
+  IMM  /bin          IMM  /private/var/select   IMM  /Library/Developer/CommandLineTools
+  IMM  /sbin         IMM  /usr                  USR  <session>/review_root
+  IMM  /private/etc  IMM  /System               USR  <session>/tmp
+  IMM  /dev                                     USR  <session>/home
 ```
 
-**The PATH selection is visible in that trace.** The inherited PATH begins
-`/opt/homebrew/bin`; there is no `/opt/homebrew/bin/git`, so `shutil.which()` falls through
-to `/usr/bin/git`; that file carries `TOOL_SHIM_MARKER`, so it is resolved — never exec'd —
-to `/Library/Developer/CommandLineTools/usr/bin/git`. This is the **inherited-PATH** branch;
-the `--agent-path` branch cannot be exercised in a real session without widening the profile
-and is proven by `PreflightGitPathSelectionTests` instead (§A6 states this).
+**The same 8 IMM roots as every previous capture.** Nothing was admitted to make the new
+gate pass; the gate passes because the git the inherited PATH selects was already inside an
+admitted root.
+
+**The PATH selection AND the new admission decision are both visible in that trace.** The
+inherited PATH begins `/opt/homebrew/bin`; there is no `/opt/homebrew/bin/git`, so the walk
+falls through — component by component — to `/usr/bin`, whose `git` realpaths to
+`/usr/bin/git`, **inside the admitted Class IMM root `/usr`**, so the gate admits it. Only
+then is it read: it carries `TOOL_SHIM_MARKER`, so it is resolved — never exec'd — to
+`/Library/Developer/CommandLineTools/usr/bin/git`. This is the **inherited-PATH** branch;
+the `--agent-path` branch and the *refusing* side of the gate cannot be exercised in a real
+session without widening the profile, and are proven by `PreflightGitPathSelectionTests`
+instead (§A6 states this).
+
+The gate's two answers, on this host's real PATH, side by side:
+
+```
+$ select_launch_path_tool("git", launch_path(), <the 8 admitted IMM roots>)
+SELECTED  : /usr/bin/git -> realpath /usr/bin/git
+admitted by: ['/usr']
+
+$ select_launch_path_tool("git", launch_path(), <the same list minus /usr>)
+IsolationError: the effective launch PATH selects /usr/bin/git (realpath /usr/bin/git)
+for 'git', and that file is outside every admitted readable-set root ([…]) …
+```
+
+The second call is the fail-closed behaviour on the very same host and the very same PATH,
+reached by removing one root from the admitted list rather than by planting anything.
 
 Read back out of the session's own `control/ISOLATION.json`:
 
@@ -504,8 +714,12 @@ Three things to read off it, side by side with the previous run's log quoted in 
    that the shim is no longer being exec'd — not merely an assertion that it should not be.
    **G1 met.**
 3. That binary is the one **this host's own PATH selects**, reached through
-   `launch_path()` → `shutil.which()` → shim resolution, rather than through a hard-coded
-   `/usr/bin/git`. **F-001 corrected in the live path, not only in unit tests.**
+   `launch_path()` → `select_launch_path_tool()` → shim resolution, rather than through a
+   hard-coded `/usr/bin/git`. **F-001 corrected in the live path, not only in unit tests.**
+4. The file that selection opened, `/usr/bin/git`, is inside the admitted Class IMM root
+   `/usr` — the admission was checked *before* the open, by the readable set this very
+   session computed. **F-002 corrected in the live path**, on its accepting side; §A6 is
+   explicit that the refusing side is covered portably rather than here.
 
 **No widening (G4).** The session's `readable_set` admits exactly the eight
 `DEFAULT_IMM_CANDIDATES` roots and no others (plus the three session-local Class USR roots,
@@ -517,13 +731,13 @@ which are the fixture's own and are `scanned: true`):
 ```
 
 `/Library/Developer/CommandLineTools` was already on that list before this change and still
-had to pass the recursive immutability proof to be admitted (`/System`: 169,297 dirs /
-286,743 files, `writable_files: 0`, `passed: true`). Resolving a tool inside it admits
-nothing; the proof admits it, exactly as before. `launch_path()` adds nothing to the
-readable set — it only joins directory strings that `assert_agent_path_admitted()` has
-already cleared.
+had to pass the recursive immutability proof to be admitted. Resolving a tool inside it
+admits nothing; the proof admits it, exactly as before. `launch_path()` adds nothing to the
+readable set — it only joins directory strings — and `select_launch_path_tool()` adds
+nothing either: it *consumes* the readable set and can only ever refuse more than before.
 
-The session was torn down after the evidence above was read.
+`grep -c xcrun_db control/probes/preflight.log` → **0**. No stale NEG-7 plant was left
+behind (`_plant_sites()` checked afterwards: none).
 
 
 ### 7. Both properties are pinned NON-VACUOUSLY — demonstrated by breaking each
@@ -599,10 +813,101 @@ Ran 46 tests in 0.056s
 OK
 ```
 
-So a future edit that puts a raw shim spelling back on the launch line fails 6 tests, and
-one that reverts to fixed-path resolution fails 4 to 8 — and
-`test_the_preflight_launch_line_checks_the_agent_path_git` catches **all three** mutations
-behaviourally, by reading the command actually handed to `/bin/sh`.
+**Mutation D — delete the F-002 admission gate** (`if not any(_is_within(target, root) …)`
+→ `if False:`), i.e. iteration 2's behaviour: select from the PATH, then open whatever was
+found.
+
+```
+$ python3 -m unittest test_review_isolation.PreflightGitPathSelectionTests
+
+FAIL: test_a_candidate_whose_realpath_escapes_the_admitted_set_is_refused
+FAIL: test_an_unadmitted_inherited_candidate_is_refused_without_being_opened
+      AssertionError: the candidate was opened
+FAIL: test_the_default_admits_nothing_so_an_unthreaded_call_reads_nothing
+      AssertionError: IsolationError not raised
+FAIL: test_the_preflight_refuses_an_unadmitted_git_before_anything_launches
+      AssertionError: IsolationError not raised
+Ran 22 tests in 0.019s
+FAILED (failures=4)
+```
+
+`AssertionError: the candidate was opened` is the finding itself: with the gate removed, the
+resolver reaches `is_tool_shim()` on a file under a directory the stated readable set does
+not contain. That test also records every path `open()` is called with, so a future edit
+that reads the candidate by some *other* spelling fails it too.
+
+**Mutation E — delete the F-003 relative/empty refusal** (`if not component or not
+os.path.isabs(component)` → `if False:`).
+
+```
+$ python3 -m unittest test_review_isolation.PreflightGitPathSelectionTests
+
+FAIL: test_a_relative_component_that_could_change_the_selection_is_refused
+      AssertionError: IsolationError not raised
+FAIL: test_an_empty_path_component_is_refused_the_same_way
+      AssertionError: IsolationError not raised
+Ran 22 tests in 0.019s
+FAILED (failures=2)
+```
+
+And on that same broken tree, the divergence measured directly — this is the output quoted
+in §A8, produced by the mutated code, not predicted:
+
+```
+resolver cwd : …/tmphfdsjep6/resolver_cwd
+agent cwd    : …/tmphfdsjep6/launch_cwd   (what wrap_command cds to)
+PICKED       : …/tmphfdsjep6/resolver_cwd/bin/git
+agent would  : …/tmphfdsjep6/launch_cwd/bin/git
+```
+
+**Mutation F — `isolate()` stops threading its readable set in** (drop
+`admitted_roots=paths`).
+
+```
+FAIL: test_isolate_passes_the_readable_set_it_computed_to_the_preflight
+      AssertionError: 'admitted_roots=paths' not found in 'def isolate(…'
+Ran 22 tests in 0.020s
+FAILED (failures=1)
+```
+
+**Mutation G — `_probe_git()` stops forwarding it** (`resolve_probe_git(agent_path=…)` with
+`admitted_roots` dropped), the subtlest form of F-002: the gate exists, the call site starves
+it.
+
+```
+ERROR: PreflightGitPathSelectionTests.test_an_admitted_agent_path_git_outranks_the_system_git
+ERROR: PreflightGitPathSelectionTests.test_an_admitted_inherited_path_git_is_followed_too
+ERROR: PreflightGitPathSelectionTests.test_the_first_admitted_agent_path_entry_wins_as_on_the_launch_line
+ERROR: PreflightGitPathSelectionTests.test_the_preflight_launch_line_checks_the_agent_path_git
+ERROR: ProbeInterpreterShimTests.test_on_darwin_the_shimmed_system_git_is_actually_resolved_away
+ERROR: ProbeInterpreterShimTests.test_the_resolved_preflight_git_is_never_a_tool_shim
+FAIL:  ProbeInterpreterShimTests.test_the_preflight_git_goes_through_the_resolver
+       Lists differ: ['…resolve_probe_git(agent_path=agent_path)']
+                  != ['…resolve_probe_git(agent_path=agent_path, admitted_roots=admitted_roots)']
+Ran 48 tests in 0.065s
+FAILED (failures=1, errors=6)
+```
+
+Starving the gate fails **closed**, loudly, in seven tests — which is the point: the failure
+mode of a forgotten argument is refusal, not a silent ungated search.
+
+**Restored, unmutated:**
+
+```
+$ python3 -m unittest test_review_isolation.PreflightGitPathSelectionTests \
+      test_review_isolation.ProbeInterpreterShimTests
+Ran 48 tests in 0.067s
+OK
+
+$ diff -q <throwaway copy>/scripts/review_isolation.py <working tree>/scripts/review_isolation.py
+(identical — the working tree was never mutated)
+```
+
+So: a raw shim spelling back on the launch line fails 6 tests; fixed-path resolution fails 4
+to 8; a deleted admission gate fails 4; a deleted relative-component refusal fails 2; an
+unthreaded readable set fails 1 at the wiring and 7 at the behaviour. Every mutation was run
+in a **throwaway copy of the repository** under the scratchpad and restored; the working
+tree was never edited to produce these numbers.
 
 ---
 
@@ -610,21 +915,18 @@ behaviourally, by reading the command actually handed to `/bin/sh`.
 
 `UNIT_TEST_STATUS: PASS`
 
-**+24 net.** `ProbeInterpreterShimTests` 17 → 26 (iteration 2 replaced one),
-`ProbeLaunchWiringTests` 5 → 8, and the new `PreflightGitPathSelectionTests` 0 → 12.
+**+34 net.** `ProbeInterpreterShimTests` 17 → 26 (iteration 2 replaced one),
+`ProbeLaunchWiringTests` 5 → 8, and `PreflightGitPathSelectionTests` 0 → 12 → **22**.
 
 ```
-$ python3 -m unittest discover -s scripts -p 'test_review_isolation.py' -k Shim
-Ran 26 tests in 0.091s
+$ python3 -m unittest test_review_isolation.PreflightGitPathSelectionTests \
+      test_review_isolation.ProbeInterpreterShimTests \
+      test_review_isolation.ProbeLaunchWiringTests
+Ran 56 tests in 0.067s
 OK
 
-$ python3 -m unittest discover -s scripts -p 'test_review_isolation.py' -k ProbeLaunchWiring
-Ran 8 tests in 0.005s
-OK
-
-$ python3 -m unittest discover -s scripts -p 'test_review_isolation.py' \
-      -k PreflightGitPathSelection
-Ran 12 tests in 0.017s
+$ python3 -m unittest test_review_isolation.PreflightGitPathSelectionTests
+Ran 22 tests in 0.018s
 OK
 ```
 
@@ -663,7 +965,7 @@ behaviourally by `PreflightGitPathSelectionTests` below, which is strictly stron
 | `test_no_agent_path_means_the_inherited_path_is_what_the_agent_gets` | no `PATH=` on the launch line ⇒ inherited PATH is the right thing to search |
 | **`test_an_admitted_agent_path_git_outranks_the_system_git`** | **THE F-001 regression** — an admitted `--agent-path` git is what gets checked, not the Command Line Tools git |
 | `test_the_first_admitted_agent_path_entry_wins_as_on_the_launch_line` | selection order matches the launch line's order |
-| `test_an_inherited_path_git_is_followed_too` | the no-`--agent-path` half of the same mismatch |
+| `test_an_admitted_inherited_path_git_is_followed_too` | the no-`--agent-path` half of the same mismatch — **rewritten in iteration 3**, see below |
 | `test_a_real_path_selected_git_is_used_exactly_as_selected` | **the Linux invariant** — a real candidate is verified as-is, never "improved" |
 | `test_a_path_selected_shim_is_resolved_rather_than_executed` | both properties at once: right candidate found, shim resolved by bytes not exec'd |
 | `test_an_unresolvable_path_selected_shim_fails_closed` | fail closed, with the installer wording |
@@ -671,6 +973,26 @@ behaviourally by `PreflightGitPathSelectionTests` below, which is strictly stron
 | `test_a_non_executable_git_on_path_is_not_selected` | selection uses the shell's `X_OK` rule, so it cannot bless a file the agent cannot run |
 | **`test_the_preflight_launch_line_checks_the_agent_path_git`** | **end-to-end with the REAL resolver: the agent's git is on the recorded launch line and `CommandLineTools` is not** |
 | `test_an_ungettable_git_stops_the_preflight_before_anything_launches` | zero processes launched when git cannot be produced |
+
+**F-002 — admission before bytes (6 new, all portable):**
+
+| Test | Guarantee |
+| --- | --- |
+| **`test_an_unadmitted_inherited_candidate_is_refused_without_being_opened`** | **THE F-002 regression** — an inherited-PATH candidate outside the stated readable set is refused, and *nothing opened it*: `is_tool_shim` is patched to fail the test if called, AND every `open()` path is recorded and asserted not to contain the candidate |
+| `test_the_default_admits_nothing_so_an_unthreaded_call_reads_nothing` | the default refuses; and on darwin it asserts the fixture directory really is under a `NEVER_ADMITTED` root, so the test still describes the reported bypass |
+| `test_a_candidate_whose_realpath_escapes_the_admitted_set_is_refused` | a symlink out of the admitted set is refused — admission is a realpath decision |
+| `test_a_differently_spelled_but_admitted_candidate_is_still_followed` | …and only a realpath decision: an alternate spelling of an admitted file is *not* refused, so the gate is not accidentally stricter than its reason |
+| `test_the_preflight_refuses_an_unadmitted_git_before_anything_launches` | end-to-end: zero processes launched |
+| `test_isolate_passes_the_readable_set_it_computed_to_the_preflight` | the wiring, at the one place it is decided — `admitted_roots=paths`, `isolate()`'s own entries |
+
+**F-003 — the lookup does not depend on this process's directory (4 new, all portable):**
+
+| Test | Guarantee |
+| --- | --- |
+| **`test_a_relative_component_that_could_change_the_selection_is_refused`** | **THE F-003 regression** — a *different* `bin/git` in the resolver's cwd and in the launch cwd; the old behaviour returns the resolver's copy, and returning **either** fails the test |
+| `test_an_empty_path_component_is_refused_the_same_way` | an empty component is `.` for the shell and carries the same divergence |
+| `test_the_selection_does_not_depend_on_this_processs_directory` | the positive claim: the same absolute PATH resolved from both directories gives the same answer |
+| `test_a_relative_component_after_the_match_is_never_reached` | the stated limit of the refusal, tested rather than implied |
 
 **The real host (2, `@DARWIN_ONLY`):**
 
@@ -720,6 +1042,25 @@ Iteration 2:
 - `test_the_preflight_git_goes_through_the_resolver` — now pins
   `resolve_probe_git(agent_path=agent_path)` including the argument.
 
+Iteration 3:
+
+- **`test_an_inherited_path_git_is_followed_too` → `test_an_admitted_inherited_path_git_is_followed_too`, rewritten.**
+  The old version built a git under `TemporaryDirectory` and asserted `_probe_git()` **read
+  and returned it** with no admission argument at all. On this host that directory realpaths
+  under `/private/var`, the first `NEVER_ADMITTED` entry — so what it pinned as correct was
+  F-002 itself. The rewritten test keeps the same synthetic directory and the same
+  inherited-PATH mechanism, and states the readable set that makes the read legitimate. The
+  scenario it used to bless is now asserted to *fail*, by
+  `test_the_default_admits_nothing_so_an_unthreaded_call_reads_nothing`.
+- `test_the_preflight_git_goes_through_the_resolver` — the AST pin now covers **both**
+  keywords, because `admitted_roots` is exactly as load-bearing as `agent_path`.
+- Every `resolve_probe_git()` / `_probe_git()` / `preflight_probe()` call in the existing
+  tests now states its admitted roots explicitly (`self.admitted()`, or for the two real-host
+  tests `host_git_roots()` — the candidate's own parent directory and its realpath's parent,
+  which is the narrowest admission that covers this host's PATH-selected git). That is a
+  test *parameter*, not a widening: no real capture admits a temporary directory, and
+  `compute_readable_set()` is untouched.
+
 ### Also verified green (G7 regressions, by name)
 
 Re-run against the iteration-2 delta:
@@ -741,9 +1082,9 @@ ImmutabilityProof  Ran 14 tests in   0.520s OK   (the recursive proof, untouched
 | Requirement | Status | Evidence |
 | --- | --- | --- |
 | **G1** remove the path by which the git shim can raise the CLT installer | **MET** | §6 — the resolved git on the real launch line, and the `xcrun_db` shim stderr gone |
-| **G2** preserve the pre-flight's purpose; verify the git the agent will actually use; do not delete the check | **MET (iteration 2)** | §A4 — the candidate is now selected from `launch_path(agent_path)`, the same string `wrap_command()` puts on the launch line, then shim-resolved by bytes; §6 — the check still runs and still returns `git version 2.50.1 (Apple Git-155)`; `PreflightGitPathSelectionTests` (12) pins it, and §7 mutation A/C shows the fixed-path form failing |
+| **G2** preserve the pre-flight's purpose; verify the git the agent will actually use; do not delete the check | **MET (iteration 3)** | §A4 — the candidate is selected from `launch_path(agent_path)`, the same string `wrap_command()` puts on the launch line, then shim-resolved by bytes; §6 — the check still runs and still returns `git version 2.50.1 (Apple Git-155)`; `PreflightGitPathSelectionTests` (22) pins it; §7 mutations A/C show the fixed-path form failing and E the cwd divergence. **Limits stated in §A9**: a candidate outside the readable set, or a relative/empty PATH component that could change the selection, is refused rather than followed |
 | **G3** resolve the real git or fail closed; no silent fallback, no silent widening | **MET** | `resolve_developer_tool()` raises; §7 shows the raise is load-bearing; §6 shows the admission list unmoved |
-| **G4** do not weaken readable-set or answer-key isolation | **MET** | §6 — same 8 IMM roots; NEG-0..NEG-8 PASS; `NegativeContract` 11 tests OK; `test_resolving_an_interpreter_admits_no_new_immutable_root` pins both lists by value |
+| **G4** do not weaken readable-set or answer-key isolation | **MET (iteration 3)** | §6 — same 8 IMM roots, same 3 session USR roots, NEG-0..NEG-8 PASS; `test_resolving_an_interpreter_admits_no_new_immutable_root` pins both lists by value. Iteration 2 *weakened* it in one direction the profile could not catch — an out-of-sandbox read of an unadmitted PATH candidate (F-002) — and that is now gated **before** the read, with the gate defaulting to admitting nothing |
 | **G5** do not reinstall the Command Line Tools | **MET** | nothing was installed; resolution is a byte scan plus a path join |
 | **G6** regression test at the ACTUAL EXECUTING CALL SITE | **MET** | §7 — three separate mutations, 6 / 4 / 8 failures, with the offending launch line quoted in each failure message |
 | **G7** Linux CI green; all isolation/security regressions preserved | **MET** | §5 (3.11/3.12/3.13, 1249 each, only the known local-only pair), §"Also verified green" |
@@ -763,8 +1104,33 @@ ImmutabilityProof  Ran 14 tests in   0.520s OK   (the recursive proof, untouched
 | **Fix** | `launch_path()` becomes the single definition of the agent's effective PATH and feeds *both* `wrap_command()`'s `PATH=` assignment and `resolve_probe_git()`'s search. Selection by `shutil.which()` (the shell's own rule), then byte-classification: real → verified as-is, shim → `resolve_developer_tool()`, otherwise raise. |
 | **Fail closed** | No candidate on PATH raises and names the PATH; an unresolvable shim raises out of `resolve_developer_tool()`. No bare-`git` fallback, no shim fallback, no profile widening. |
 | **Linux** | Unchanged binary; `test_a_real_path_selected_git_is_used_exactly_as_selected` and §5's three versions. |
-| **Security** | Only already-admitted `agent_path` entries are searched — `isolate()` runs `assert_agent_path_admitted()` before `preflight_probe()`. `NEVER_ADMITTED`, `DEFAULT_IMM_CANDIDATES`, the immutability proof and the NEG-5 scan are byte-for-byte untouched (§6, §A5). |
+| **Security** | ~~Only already-admitted `agent_path` entries are searched~~ — **this sentence was false when I wrote it, and is F-002.** `assert_agent_path_admitted()` gates only the explicit `--agent-path` sequence; the inherited-PATH branch was ungated and opened what it found. It is true now, and true because of a gate rather than because of an assumption: see F-002 below. `NEVER_ADMITTED`, `DEFAULT_IMM_CANDIDATES`, the immutability proof and the NEG-5 scan remain byte-for-byte untouched (§6, §A5). |
 | **Regression coverage** | The Reviewer's explicit ask: `PreflightGitPathSelectionTests` — 12 portable tests, including an admitted `agent_path` directory holding a **distinct** git candidate asserted to be the one checked, the inherited-PATH half, and an end-to-end `preflight_probe()` run with the real resolver. Non-vacuity in §7. |
+
+### F-002 (G4, MAJOR, BLOCKING) — RESOLVED
+
+| | |
+| --- | --- |
+| **Finding** | With no explicit `agent_path`, `launch_path()` returns the raw inherited `PATH`; `_probe_git()` selects from it and `is_tool_shim()` **opens** the candidate — outside Seatbelt, with no readable-set admission. My own new test encoded the bypass as expected behaviour. |
+| **Accepted** | Yes, entirely, including the part about my test. I re-derived it in the source: `assert_agent_path_admitted()` sees only the explicit sequence, the `os.environ["PATH"]` branch of `launch_path()` reaches `resolve_developer_tool(candidate, candidate)` directly, and that calls `is_tool_shim()`, which `open()`s the file. On this host the inherited PATH begins with three directories the readable set refuses, two of them under `NEVER_ADMITTED` roots. |
+| **Fix** | `select_launch_path_tool(name, path_value, admitted_roots)` — the single place a PATH becomes a filename. The candidate's **realpath** must be inside an admitted root; otherwise `IsolationError`, raised on a metadata-only decision, *before* any byte is read. `isolate()` threads its own `readable["entries"]` through `preflight_probe()` → `_probe_git()` → `resolve_probe_git()`. The parameter defaults to `()` — admitting nothing — so a caller that forgets it refuses rather than searches. |
+| **Inherited PATH preserved for admitted candidates** | Yes, and that is the live path: §6's real session selects `/usr/bin/git`, inside the proven Class IMM root `/usr`, and the capture runs exactly as before. |
+| **No widening** | Nothing was admitted to make this pass. §6 shows the same 8 IMM roots and the same 3 session USR roots; `NEVER_ADMITTED`, `DEFAULT_IMM_CANDIDATES`, `prove_immutable*`, the NEG-5 scan and the generated profile are untouched. The gate can only refuse **more** than before. |
+| **Regression proving no open** | `test_an_unadmitted_inherited_candidate_is_refused_without_being_opened` — patches `is_tool_shim` to fail the test if it is called, **and** records every path passed to `open()` and asserts the candidate is not among them, so the guarantee survives a re-spelling of the read. Mutation D (§7) shows it failing with `AssertionError: the candidate was opened`. |
+| **The bypass test rewritten** | `test_an_inherited_path_git_is_followed_too` → `test_an_admitted_inherited_path_git_is_followed_too`: same mechanism, same synthetic directory, but the readable set is now stated, and the old no-argument scenario is asserted to **fail** by `test_the_default_admits_nothing_so_an_unthreaded_call_reads_nothing` (which also asserts, on darwin, that the fixture really is under a `NEVER_ADMITTED` root). |
+| **Stated limit** | The developer-directory file that `resolve_developer_tool()` reads when the admitted candidate *is* the shim is **not** covered by this gate: it is shared with the frozen python path and the dispatch freezes both. Named in `resolve_probe_git()`'s docstring, §A6 and §A9. |
+
+### F-003 (G2, MAJOR, BLOCKING) — RESOLVED, by refusal
+
+| | |
+| --- | --- |
+| **Finding** | `shutil.which(..., path=value)` resolves relative and empty PATH components against the **review process's** cwd, while the launched check first `cd`s to `<session>/review_root`. So `PATH=bin:/usr/bin`, or an empty component, can select a different file than the agent will, and the "exact effective-path fidelity" claim was again wider than the behaviour. |
+| **Accepted** | Yes. Measured, not reasoned: with a distinct `bin/git` in each directory the pre-fix code returns the **resolver's** copy while `wrap_command()` sends the agent to the launch directory (output in §A8 and §7 mutation E). |
+| **Choice** | **Refuse**, not reproduce — the Reviewer allowed either. Justification: resolving the component the agent's way means `access()`-ing and opening files under a directory named by a relative string inside a session the agent has not been launched in, which buys exactness by widening what the pre-flight touches — the same trade F-002 just rejected. Refusal costs nothing real: `launch_path()` realpaths every `--agent-path` entry, so **no `--agent-path` configuration can reach this refusal**; only an inherited PATH carrying a relative or empty component can. |
+| **Scope of the refusal** | Components that could still change the selection. The walk is left-to-right and stops at the first match, so a relative component *after* the directory that supplies `git` is never reached — and cannot be reached by the agent either. Stated as behaviour and tested (`test_a_relative_component_after_the_match_is_never_reached`), not left implicit. |
+| **Regression with distinct candidates** | `test_a_relative_component_that_could_change_the_selection_is_refused` plants a *different* `bin/git` in the resolver cwd and in the launch cwd, stands in the resolver cwd, and fails if **either** is selected. `test_an_empty_path_component_is_refused_the_same_way` covers the empty form. |
+| **The positive claim, now true** | Every component the selection consults is absolute, so the answer is cwd-independent — `test_the_selection_does_not_depend_on_this_processs_directory` runs the same resolution from both directories and requires the same answer. |
+| **Claim narrowed** | §A9 states, line by line, what "PATH fidelity" now claims and where it stops. `resolve_probe_git()`'s docstring carries the same limits in the source. |
 
 ### On N-001 (non-blocking, remote CI)
 
@@ -796,8 +1162,8 @@ decision_priority: explicit requirements > current phase contract > minimal gene
 | G1 explicit requirement violation | none — every G1..G7 met, see table above |
 | G2 result does not work | no — real seatbelt session, S1/S2/S3 + NEG-0..NEG-8 PASS, pre-flight exec'ing the PATH-correct real git |
 | G3 severe regression | none — 1249 minus the 2 known pre-existing; Linux identical on 3.11/3.12/3.13 |
-| G4 data loss / security / irreversible | none — admission lists unmoved, no profile widening, only already-admitted `agent_path` entries searched, nothing installed, nothing pushed |
-| G5 missing evidence | none — every claim above has its command output; what I did not verify is named in §A6 |
+| G4 data loss / security / irreversible | none — admission lists unmoved, no profile widening, nothing installed, nothing pushed. The one G4 defect this branch did have (F-002, my own) is fixed by refusing more, never by admitting more; the PATH-selected candidate is now admission-checked before it is opened, and the one read outside that gate's scope is named in §A6/§A9 |
+| G5 missing evidence | none — every claim above has its command output; what I did not verify is named in §A6; what the PATH-fidelity claim does and does not cover is enumerated in §A9; the one-off 3.12 `ERROR` and the fact that I did not capture its traceback are recorded in §5 rather than dropped |
 
 ---
 

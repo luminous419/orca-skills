@@ -15,6 +15,7 @@ carries the fail-closed guarantee, so the guarantee is never merely unasserted.
 from __future__ import annotations
 
 import ast
+import builtins
 import dataclasses
 import errno
 import hashlib
@@ -1913,6 +1914,7 @@ class ProbeInterpreterShimTests(unittest.TestCase):
         with self.assertRaises(review_isolation.IsolationError) as raised:
             review_isolation.resolve_probe_git(
                 str(self.base / "usr" / "bin"),
+                admitted_roots=[str(self.base)],
                 developer_dirs=[str(self.base / "no_such_developer_dir")],
             )
         message = str(raised.exception)
@@ -1925,6 +1927,7 @@ class ProbeInterpreterShimTests(unittest.TestCase):
         with self.assertRaises(review_isolation.IsolationError):
             review_isolation.resolve_probe_git(
                 str(self.base / "usr" / "bin"),
+                admitted_roots=[str(self.base)],
                 developer_dirs=[str(self.fake_developer_dir("git", shim=True))],
             )
 
@@ -1939,19 +1942,40 @@ class ProbeInterpreterShimTests(unittest.TestCase):
     def test_the_resolved_probe_interpreter_is_never_a_tool_shim(self) -> None:
         self.assertFalse(review_isolation.is_tool_shim(review_isolation._probe_python()))
 
+    @staticmethod
+    def host_git_roots() -> list[str]:
+        """The narrowest admission that covers THIS host's PATH-selected git.
+
+        These tests are about shim resolution, not about admission, so they state the two
+        directories the selection gate will actually be asked about -- the candidate's own
+        parent and its realpath's parent -- instead of admitting anything wider. On a host
+        whose git is `/usr/bin/git` this is exactly `/usr/bin`, which the real capture
+        admits as part of the proven Class IMM `/usr`.
+        """
+        candidate = shutil.which(review_isolation.GIT_COMMAND)
+        if candidate is None:
+            return []
+        return sorted(
+            {str(Path(candidate).parent), str(Path(os.path.realpath(candidate)).parent)}
+        )
+
     def test_the_preflight_git_goes_through_the_resolver(self) -> None:
-        # `agent_path=agent_path` is load-bearing and is pinned here as part of the call:
-        # `resolve_probe_git()` with the argument dropped is the fixed-path regression --
-        # it avoids the shim and verifies the wrong git.
+        # Both keywords are load-bearing and are pinned here as part of the call.
+        # `agent_path` dropped is the fixed-path regression -- it avoids the shim and
+        # verifies the wrong git. `admitted_roots` dropped is F-002 -- it verifies the
+        # right git by opening a file no readable set ever admitted.
         self.assertEqual(
             _function_body_statements(review_isolation._probe_git),
-            ["return resolve_probe_git(agent_path=agent_path)"],
+            [
+                "return resolve_probe_git(agent_path=agent_path, "
+                "admitted_roots=admitted_roots)"
+            ],
         )
 
     def test_the_resolved_preflight_git_is_never_a_tool_shim(self) -> None:
         if shutil.which(review_isolation.GIT_COMMAND) is None:
             self.skipTest("no git on this host's PATH; the resolver correctly refuses")
-        resolved = review_isolation._probe_git()
+        resolved = review_isolation._probe_git(admitted_roots=self.host_git_roots())
         self.assertTrue(resolved.startswith("/"), resolved)
         self.assertFalse(review_isolation.is_tool_shim(resolved))
 
@@ -1984,7 +2008,7 @@ class ProbeInterpreterShimTests(unittest.TestCase):
             self.skipTest("no /usr/bin/git on this darwin host")
         if not review_isolation.is_tool_shim(review_isolation.SYSTEM_GIT):
             self.skipTest("/usr/bin/git is a real binary on this darwin host")
-        resolved = review_isolation._probe_git()
+        resolved = review_isolation._probe_git(admitted_roots=self.host_git_roots())
         self.assertNotEqual(resolved, review_isolation.SYSTEM_GIT)
         self.assertNotEqual(resolved, review_isolation.GIT_COMMAND)
         self.assertFalse(review_isolation.is_tool_shim(resolved))
@@ -2282,6 +2306,18 @@ class PreflightGitPathSelectionTests(unittest.TestCase):
         target.chmod(0o755)
         return directory
 
+    def admitted(self) -> list[str]:
+        """The synthetic readable set these tests state explicitly.
+
+        `self.base` is a temporary directory -- it is NOT admitted by any real capture and
+        nothing here makes it so. It is the argument value that says "for this test, these
+        are the roots the readable set contains", exactly as `developer_dirs=` says which
+        developer directories exist. The real admission decision still belongs to
+        `compute_readable_set()`, and `isolate()` still passes ITS entries and nothing
+        else.
+        """
+        return [str(self.base)]
+
     def recorder(self):
         def run(argv, **_kwargs):
             self.commands.append(argv[-1])
@@ -2319,7 +2355,9 @@ class PreflightGitPathSelectionTests(unittest.TestCase):
         `/usr/bin` on the launch line, so its `git` is the one the agent runs -- and it,
         not the Command Line Tools git behind `/usr/bin/git`, is what must be verified."""
         directory = self.git_dir("agentbin")
-        resolved = review_isolation._probe_git([str(directory)])
+        resolved = review_isolation._probe_git(
+            [str(directory)], admitted_roots=self.admitted()
+        )
         self.assertEqual(
             resolved, str(directory / review_isolation.GIT_COMMAND)
         )
@@ -2332,15 +2370,28 @@ class PreflightGitPathSelectionTests(unittest.TestCase):
         first = self.git_dir("first")
         second = self.git_dir("second")
         self.assertEqual(
-            review_isolation._probe_git([str(first), str(second)]),
+            review_isolation._probe_git(
+                [str(first), str(second)], admitted_roots=self.admitted()
+            ),
             str(first / review_isolation.GIT_COMMAND),
         )
 
-    def test_an_inherited_path_git_is_followed_too(self) -> None:
+    def test_an_admitted_inherited_path_git_is_followed_too(self) -> None:
+        """Inherited PATH still works -- FOR AN ADMITTED CANDIDATE, which is the whole of
+        the claim now.
+
+        The earlier version of this test built its git under `TemporaryDirectory` and
+        asserted `_probe_git()` read and returned it with no admission argument at all.
+        On darwin that directory realpaths under `/private/var`, i.e. `NEVER_ADMITTED`,
+        so what it actually pinned as correct was F-002: an out-of-sandbox read of a
+        never-admitted file. The directory here is the same synthetic one; the difference
+        is that the readable set is now stated, and stating it is what makes the read
+        legitimate.
+        """
         directory = self.git_dir("inherited")
         with mock.patch.dict(os.environ, {"PATH": str(directory)}, clear=False):
             self.assertEqual(
-                review_isolation._probe_git(),
+                review_isolation._probe_git(admitted_roots=[str(directory)]),
                 str(directory / review_isolation.GIT_COMMAND),
             )
 
@@ -2352,7 +2403,10 @@ class PreflightGitPathSelectionTests(unittest.TestCase):
         candidate = str(directory / review_isolation.GIT_COMMAND)
         self.assertFalse(review_isolation.is_tool_shim(candidate))
         self.assertEqual(
-            review_isolation.resolve_probe_git(str(directory)), candidate
+            review_isolation.resolve_probe_git(
+                str(directory), admitted_roots=self.admitted()
+            ),
+            candidate,
         )
 
     # -- selection never turns into execution --------------------------------------
@@ -2364,7 +2418,9 @@ class PreflightGitPathSelectionTests(unittest.TestCase):
         directory = self.git_dir("agentbin", shim=True)
         developer = self.developer_dir()
         resolved = review_isolation.resolve_probe_git(
-            str(directory), developer_dirs=[str(developer)]
+            str(directory),
+            admitted_roots=self.admitted(),
+            developer_dirs=[str(developer)],
         )
         self.assertNotEqual(
             resolved, str(directory / review_isolation.GIT_COMMAND)
@@ -2379,7 +2435,9 @@ class PreflightGitPathSelectionTests(unittest.TestCase):
         directory = self.git_dir("agentbin", shim=True)
         with self.assertRaises(review_isolation.IsolationError) as raised:
             review_isolation.resolve_probe_git(
-                str(directory), developer_dirs=[str(self.base / "absent")]
+                str(directory),
+                admitted_roots=self.admitted(),
+                developer_dirs=[str(self.base / "absent")],
             )
         self.assertIn("Command Line Tools installer", str(raised.exception))
 
@@ -2402,7 +2460,9 @@ class PreflightGitPathSelectionTests(unittest.TestCase):
         (blocked / review_isolation.GIT_COMMAND).write_bytes(b"not executable")
         usable = self.git_dir("usable")
         self.assertEqual(
-            review_isolation.resolve_probe_git(f"{blocked}:{usable}"),
+            review_isolation.resolve_probe_git(
+                f"{blocked}:{usable}", admitted_roots=self.admitted()
+            ),
             str(usable / review_isolation.GIT_COMMAND),
         )
 
@@ -2423,7 +2483,9 @@ class PreflightGitPathSelectionTests(unittest.TestCase):
         with mock.patch.object(
             review_isolation, "_probe_python", return_value=self.SENTINEL
         ), mock.patch.object(review_isolation.subprocess, "run", self.recorder()):
-            review_isolation.preflight_probe(session, agent_path=[str(directory)])
+            review_isolation.preflight_probe(
+                session, agent_path=[str(directory)], admitted_roots=self.admitted()
+            )
         self.assertTrue(
             any(f"{shlex.quote(candidate)} --version" in command
                 for command in self.commands),
@@ -2451,8 +2513,239 @@ class PreflightGitPathSelectionTests(unittest.TestCase):
             review_isolation, "_probe_python", return_value=self.SENTINEL
         ), mock.patch.object(review_isolation.subprocess, "run", self.recorder()):
             with self.assertRaises(review_isolation.IsolationError):
-                review_isolation.preflight_probe(session)
+                review_isolation.preflight_probe(session, admitted_roots=self.admitted())
         self.assertEqual(self.commands, [], "no check may launch once git is unresolvable")
+
+    # -- F-002: selection may not read what the readable set never admitted ---------
+
+    def opened_paths(self):
+        """Every path `open()` is called with, recorded while still really opening.
+
+        The property under test is "the file is not OPENED", and asserting it through
+        `is_tool_shim` alone would only pin the current spelling of the read. This pins
+        the read itself, so a future edit that opens the candidate some other way before
+        the admission gate fails here too.
+        """
+        opened: list[str] = []
+        real_open = builtins.open
+
+        def recording_open(file, *args, **kwargs):
+            opened.append(str(file))
+            return real_open(file, *args, **kwargs)
+
+        return opened, mock.patch.object(builtins, "open", recording_open)
+
+    def test_an_unadmitted_inherited_candidate_is_refused_without_being_opened(
+        self,
+    ) -> None:
+        """F-002. The inherited PATH is not an admission decision, and classifying a
+        candidate means READING it -- in the host process, before Seatbelt exists.
+
+        So the gate has to fire on the address, before the bytes. The candidate here is a
+        real executable `git` in a directory the stated readable set does not contain;
+        the assertion is both that it is refused AND that nothing opened it, because a
+        later sandbox denial does not undo a read that already happened.
+        """
+        directory = self.git_dir("unadmitted")
+        candidate = str(directory / review_isolation.GIT_COMMAND)
+        admitted = self.base / "admitted_elsewhere"
+        admitted.mkdir()
+        opened, recorder = self.opened_paths()
+        with mock.patch.dict(os.environ, {"PATH": str(directory)}, clear=False), \
+                mock.patch.object(
+                    review_isolation, "is_tool_shim",
+                    side_effect=AssertionError("the candidate was opened"),
+                ), recorder:
+            with self.assertRaises(review_isolation.IsolationError) as raised:
+                review_isolation._probe_git(admitted_roots=[str(admitted)])
+        message = str(raised.exception)
+        self.assertIn("outside every admitted readable-set root", message)
+        self.assertIn(candidate, message)
+        self.assertNotIn(candidate, opened, "the refused candidate was opened anyway")
+
+    def test_the_default_admits_nothing_so_an_unthreaded_call_reads_nothing(self) -> None:
+        """The default is the refusing one, which is what makes forgetting to thread the
+        readable set a loud failure instead of a silent ungated PATH search.
+
+        This is also the exact scenario the superseded inherited-PATH test asserted as
+        CORRECT: a git under a `TemporaryDirectory`, which on darwin realpaths beneath
+        `/private/var` -- a `NEVER_ADMITTED` root -- reached with no admission argument
+        at all.
+        """
+        directory = self.git_dir("temporary")
+        opened, recorder = self.opened_paths()
+        with mock.patch.dict(os.environ, {"PATH": str(directory)}, clear=False), recorder:
+            with self.assertRaises(review_isolation.IsolationError):
+                review_isolation._probe_git()
+        self.assertNotIn(
+            str(directory / review_isolation.GIT_COMMAND), opened,
+            "an unthreaded call still read the candidate",
+        )
+        if sys.platform == "darwin":
+            never = [Path(os.path.realpath(entry))
+                     for entry in review_isolation.NEVER_ADMITTED]
+            self.assertTrue(
+                any(root in self.base.parents for root in never),
+                f"{self.base} is not under a NEVER_ADMITTED root on this host, so this "
+                "test no longer describes the reported bypass",
+            )
+
+    def test_a_candidate_whose_realpath_escapes_the_admitted_set_is_refused(self) -> None:
+        """Both spellings have to be admitted: the bytes come from the realpath, and the
+        readable set is stated in realpaths. This is the `/opt/homebrew/bin` -> `Cellar`
+        shape `wrap_command()` documents, reduced to its essentials."""
+        outside = self.git_dir("outside_the_set")
+        admitted = self.base / "admitted"
+        admitted.mkdir()
+        link = admitted / review_isolation.GIT_COMMAND
+        link.symlink_to(outside / review_isolation.GIT_COMMAND)
+        with self.assertRaises(review_isolation.IsolationError) as raised:
+            review_isolation.resolve_probe_git(
+                str(admitted), admitted_roots=[str(admitted)]
+            )
+        self.assertIn("outside every admitted readable-set root", str(raised.exception))
+
+    def test_a_differently_spelled_but_admitted_candidate_is_still_followed(self) -> None:
+        """Admission is decided on the REALPATH, so an unresolved PATH spelling of an
+        admitted file -- `/var/...` for `/private/var/...` on darwin, and this symlinked
+        directory portably -- is followed rather than refused. It exposes nothing the
+        admitted realpath does not already expose, and refusing it would fail closed on a
+        configuration that is in fact inside the readable set."""
+        directory = self.git_dir("spelled_once")
+        link = self.base / "spelled_twice"
+        link.symlink_to(directory)
+        self.assertEqual(
+            review_isolation.resolve_probe_git(
+                str(link), admitted_roots=[str(directory)]
+            ),
+            str(link / review_isolation.GIT_COMMAND),
+        )
+
+    def test_the_preflight_refuses_an_unadmitted_git_before_anything_launches(
+        self,
+    ) -> None:
+        """End to end through the real resolver: an unadmitted candidate stops the
+        pre-flight while the check LIST is being built, so no check runs at all."""
+        directory = self.git_dir("agentbin")
+        session = self.base / "session"
+        (session / "review_root").mkdir(parents=True)
+        with mock.patch.object(
+            review_isolation, "_probe_python", return_value=self.SENTINEL
+        ), mock.patch.object(review_isolation.subprocess, "run", self.recorder()):
+            with self.assertRaises(review_isolation.IsolationError):
+                review_isolation.preflight_probe(
+                    session, agent_path=[str(directory)], admitted_roots=[]
+                )
+        self.assertEqual(self.commands, [], "a check launched on an unadmitted git")
+
+    def test_isolate_passes_the_readable_set_it_computed_to_the_preflight(self) -> None:
+        """The wiring, pinned where it is decided: the pre-flight's admitted roots are
+        `isolate()`'s own readable-set entry paths -- not a wider list, not a constant,
+        and not omitted."""
+        source = textwrap.dedent(inspect.getsource(review_isolation.isolate))
+        self.assertIn("admitted_roots=paths", source)
+        self.assertIn(
+            'paths = [entry["path"] for entry in readable["entries"]]', source
+        )
+
+    # -- F-003: the lookup may not depend on THIS process's directory ---------------
+
+    def relative_component_case(self):
+        """Two directories that both contain `bin/git`, with distinct bytes: the one this
+        process stands in, and the one the launch line cds to. A PATH component spelled
+        `bin` means a different file in each."""
+        resolver_cwd = self.base / "resolver_cwd"
+        launch_cwd = self.base / "session" / "review_root"
+        for parent, label in ((resolver_cwd, "resolver"), (launch_cwd, "launch")):
+            candidate = parent / "bin" / review_isolation.GIT_COMMAND
+            candidate.parent.mkdir(parents=True)
+            candidate.write_bytes(b"#!/bin/sh\n" + label.encode())
+            candidate.chmod(0o755)
+        return resolver_cwd, launch_cwd
+
+    def chdir(self, directory: Path) -> None:
+        previous = os.getcwd()
+        os.chdir(directory)
+        self.addCleanup(os.chdir, previous)
+
+    def test_a_relative_component_that_could_change_the_selection_is_refused(
+        self,
+    ) -> None:
+        """F-003. `shutil.which(..., path=...)` resolves `bin` against THIS process's
+        directory; the launched agent resolves it against `<session>/review_root`,
+        because `wrap_command()` cds there first. Two directories, one PATH string.
+
+        The test stands in `resolver_cwd` and puts a DIFFERENT `bin/git` in each, so
+        following the old behaviour returns the resolver's copy -- and returning either
+        copy fails here. Refusing is the answer: reproducing the agent's cwd would mean
+        opening files under a directory the agent has not been launched in yet.
+        """
+        resolver_cwd, launch_cwd = self.relative_component_case()
+        self.chdir(resolver_cwd)
+        absolute = self.git_dir("absolute_tail")
+        with self.assertRaises(review_isolation.IsolationError) as raised:
+            review_isolation.resolve_probe_git(
+                f"bin:{absolute}", admitted_roots=self.admitted()
+            )
+        message = str(raised.exception)
+        self.assertIn("relative or empty component", message)
+        self.assertIn("'bin'", message)
+        # And the fixture really does distinguish the two, so "neither was returned" is
+        # a property of the code rather than of two identical files.
+        self.assertNotEqual(
+            (resolver_cwd / "bin" / review_isolation.GIT_COMMAND).read_bytes(),
+            (launch_cwd / "bin" / review_isolation.GIT_COMMAND).read_bytes(),
+        )
+
+    def test_an_empty_path_component_is_refused_the_same_way(self) -> None:
+        # An empty component IS `.` for the shell, so it carries the same divergence.
+        resolver_cwd, _ = self.relative_component_case()
+        self.chdir(resolver_cwd)
+        absolute = self.git_dir("absolute_tail")
+        with self.assertRaises(review_isolation.IsolationError) as raised:
+            review_isolation.resolve_probe_git(
+                f":{absolute}", admitted_roots=self.admitted()
+            )
+        self.assertIn("relative or empty component", str(raised.exception))
+
+    def test_the_selection_does_not_depend_on_this_processs_directory(self) -> None:
+        """The positive half, and the reason the refusal above is enough: every component
+        the walk consults is absolute, so the same PATH gives the same answer from the
+        review process's directory and from the launch directory."""
+        resolver_cwd, launch_cwd = self.relative_component_case()
+        absolute = self.git_dir("absolute_only")
+        expected = str(absolute / review_isolation.GIT_COMMAND)
+        results = []
+        for directory in (resolver_cwd, launch_cwd):
+            previous = os.getcwd()
+            os.chdir(directory)
+            try:
+                results.append(
+                    review_isolation.resolve_probe_git(
+                        str(absolute), admitted_roots=self.admitted()
+                    )
+                )
+            finally:
+                os.chdir(previous)
+        self.assertEqual(results, [expected, expected])
+
+    def test_a_relative_component_after_the_match_is_never_reached(self) -> None:
+        """The refusal is scoped to components that could actually change the selection.
+
+        A relative component AFTER the directory that supplies git cannot be reached by
+        this walk -- and cannot be reached by the agent either, whose own left-to-right
+        lookup has already matched. Refusing it would reject working configurations for
+        no property, so the limit is stated here rather than left implicit.
+        """
+        resolver_cwd, _ = self.relative_component_case()
+        self.chdir(resolver_cwd)
+        absolute = self.git_dir("first_and_absolute")
+        self.assertEqual(
+            review_isolation.resolve_probe_git(
+                f"{absolute}:bin", admitted_roots=self.admitted()
+            ),
+            str(absolute / review_isolation.GIT_COMMAND),
+        )
 
 
 # ---- T-10 the seed mechanism (DESIGN D-6.1 .. D-6.9) ---------------------------------

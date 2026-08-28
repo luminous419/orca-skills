@@ -1032,7 +1032,12 @@ def launch_path(
     With no `--agent-path` the launch line carries no `PATH=` assignment at all, so the
     agent inherits this process's PATH -- which is what is returned. That inherited PATH is
     equally free to name a non-system git before `/usr/bin`, and the pre-flight has to
-    follow it there too.
+    follow it there too -- but only as far as it may. This function REPORTS the PATH; it
+    does not vouch for it. An inherited PATH has been through no admission decision at
+    all, so `select_launch_path_tool()` is what decides which of its entries this process
+    may open, and it refuses the unadmitted ones instead of reading them (F-002). Reading
+    this docstring as "the inherited PATH is followed wherever it leads" is what produced
+    that finding.
     """
     if agent_path:
         directories = [str(_realpath(entry)) for entry in agent_path]
@@ -2279,23 +2284,120 @@ def resolve_probe_interpreter(
     )
 
 
+def select_launch_path_tool(
+    name: str, path_value: str, admitted_roots: Sequence[str] = ()
+) -> str:
+    """The file the launched agent's own PATH lookup of `name` reaches -- selected
+    WITHOUT opening it, and refused unless the readable set already admits it.
+
+    Selection is the step between "which PATH will the agent use" and "what may this
+    process do with what it finds there", and both of the gates below are on this side of
+    that line ON PURPOSE: everything after selection reads bytes.
+
+    ADMISSION BEFORE BYTES (F-002). `is_tool_shim()` OPENS the candidate, and it runs in
+    the host process, before Seatbelt exists. An inherited PATH is not an admission
+    decision -- it is whatever the operator's shell happened to export, and on this host
+    that includes `/opt/homebrew/bin` and `$HOME` directories the readable set refuses --
+    so a candidate found there is rejected HERE, while the only thing that has touched it
+    is `shutil.which()`'s metadata check. A later sandbox denial does not undo a read that
+    already happened. `--agent-path` entries reach this gate already admitted, by
+    `assert_agent_path_admitted()`, and `LAUNCH_PATH_TAIL` reaches it inside the proven
+    Class IMM roots, so the ordinary launch is unaffected; what changes is that an
+    UNADMITTED directory can no longer contribute the file this process opens.
+
+    Admission is decided on the candidate's REALPATH, and that is the whole of it: the
+    bytes an `open()` returns are the realpath's bytes, and the readable set is stated in
+    realpaths for the same reason the seatbelt profile is. A PATH entry that merely SPELLS
+    an admitted file differently -- `/var/...` for `/private/var/...` on darwin -- exposes
+    nothing extra and is followed; a candidate whose realpath leaves the admitted set is
+    refused however innocent its spelling, which is exactly the `/opt/homebrew/bin` ->
+    `Cellar` shape `wrap_command()` documents. The remedy is `--allow-read` plus
+    `--agent-path`, which scans the directory first; it is deliberately an operator
+    decision, not an inference.
+
+    CWD-INDEPENDENT LOOKUP (F-003). `shutil.which(..., path=<whole PATH>)` resolves a
+    relative or empty component against THIS process's current directory, while the
+    launched agent resolves it against `<session>/review_root` -- `wrap_command()` cds
+    there before exec. Two different directories, one PATH string, so `PATH=bin:/usr/bin`
+    can select `<repo>/bin/git` here and `<session>/review_root/bin/git` there. Rather
+    than reproduce the agent's cwd (which would mean opening files under a directory the
+    agent has not been launched in yet), such a component is REFUSED. The walk is
+    component by component, left to right, and stops at the first match, so the refusal is
+    scoped to components that could actually change the selection: a relative component
+    AFTER the directory that supplies the tool is never reached, and cannot be reached by
+    the agent either -- its own left-to-right lookup has already matched. Every component
+    this function does consult is absolute, so its answer does not depend on the process's
+    cwd at all.
+
+    FAIL CLOSED, and empty `admitted_roots` admits NOTHING. The default is the refusing
+    one on purpose: a caller that forgets to thread the readable set gets a loud error,
+    never an ungated PATH search.
+    """
+    roots = [_realpath(root) for root in admitted_roots]
+    for component in path_value.split(os.pathsep):
+        if not component or not os.path.isabs(component):
+            raise IsolationError(
+                f"the effective launch PATH ({path_value!r}) reaches the relative or "
+                f"empty component {component!r} before it offers {name!r}. Such a "
+                "component names a DIFFERENT directory for this process than for the "
+                "launched agent -- the launch line cds to <session>/review_root first -- "
+                f"so the {name!r} selected here need not be the one the agent runs, and "
+                "the pre-flight would be verifying the wrong file. This is refused "
+                "rather than guessed at: pass the directory absolutely, as --allow-read "
+                "and --agent-path."
+            )
+        candidate = shutil.which(name, path=component)
+        if candidate is None:
+            continue
+        target = _realpath(candidate)
+        if not any(_is_within(target, root) for root in roots):
+            raise IsolationError(
+                f"the effective launch PATH selects {candidate} (realpath {target}) for "
+                f"{name!r}, and that file is outside every admitted readable-set root "
+                f"({[str(root) for root in roots]}). Reading it to decide whether it is "
+                "Apple's tool shim would be an out-of-sandbox read of a directory this "
+                "capture never scanned, so it is refused BEFORE the file is opened. Pass "
+                "its directory as --allow-read (which scans it) and --agent-path (which "
+                "puts it on the agent's PATH), or put the agent on a git the readable "
+                "set already admits."
+            )
+        return candidate
+    raise IsolationError(
+        f"no {name!r} on the effective launch PATH ({path_value!r}), so the "
+        "pre-flight cannot verify the git the agent would resolve. This is a hard "
+        "failure and NOT a fallback: checking some other git -- or a bare name that "
+        "on darwin execs Apple's tool shim -- would prove nothing about the agent's "
+        "launch. Put a git on PATH, or pass its directory with --agent-path."
+    )
+
+
 def resolve_probe_git(
     path_value: str | None = None,
     *,
     agent_path: Sequence[str] = (),
+    admitted_roots: Sequence[str] = (),
     developer_dirs: Sequence[str] | None = None,
 ) -> str:
     """The git the pre-flight actually execs: the AGENT'S git, never a tool shim.
 
     TWO properties, and the pre-flight is only worth running when it has BOTH.
 
-    PATH FIDELITY. The candidate is selected from `launch_path()` -- the very PATH the
-    launched agent resolves `git` against -- so an admitted `--agent-path` directory that
-    outranks `/usr/bin`, or an inherited PATH that names a non-system git first, is
-    followed here exactly as the agent will follow it. A fixed `/usr/bin/git` is NOT
-    equivalent and was the defect: it let the pre-flight report success for Apple Git while
-    the agent went on to run something else entirely. The bare `git` the check used to
-    carry had this property; it just paid for it by exec'ing the shim.
+    PATH FIDELITY, AND ITS EXACT LIMITS. The candidate is selected from `launch_path()`
+    -- the very PATH the launched agent resolves `git` against -- so an admitted
+    `--agent-path` directory that outranks `/usr/bin`, or an inherited PATH that names an
+    ADMITTED non-system git first, is followed here exactly as the agent will follow it. A
+    fixed `/usr/bin/git` is NOT equivalent and was the defect: it let the pre-flight report
+    success for Apple Git while the agent went on to run something else entirely. The bare
+    `git` the check used to carry had this property; it just paid for it by exec'ing the
+    shim.
+
+    Fidelity is claimed only over what `select_launch_path_tool()` actually resolves, and
+    that is narrower than "any PATH": a candidate outside the admitted readable set, and a
+    relative or empty PATH component that could still change the selection, are both
+    REFUSED rather than followed. Refusing is the only honest answer for them -- the first
+    would require reading an unscanned file to classify it, the second would require this
+    process to resolve names in a directory it is not standing in. Neither is silently
+    approximated, and neither falls back to a fixed path.
 
     NO SHIM EXECUTION. The selected candidate is then classified by its BYTES, not by its
     address. A real binary is returned as-is -- it IS the agent's git and it is what gets
@@ -2307,21 +2409,21 @@ def resolve_probe_git(
     On Linux nothing on PATH is ever a shim, so this returns the same real git the bare
     name always selected -- the behaviour is identical, only now stated absolutely.
 
-    FAIL CLOSED, both ways. No git anywhere on the effective PATH raises here rather than
-    launching a check that would fail obscurely inside the sandbox; a shim whose real tool
-    cannot be found raises out of `resolve_developer_tool()`. Neither falls back to the
-    shim and neither widens the profile.
+    FAIL CLOSED, every way. No git anywhere on the effective PATH, a candidate outside the
+    admitted readable set, and a PATH component this process cannot resolve the way the
+    agent will all raise here rather than launching a check that proves the wrong thing or
+    reading a file nothing scanned; a shim whose real tool cannot be found raises out of
+    `resolve_developer_tool()`. None of them falls back to the shim and none widens the
+    profile.
+
+    ONE READ IS OUT OF THIS GATE'S SCOPE, stated rather than left to be discovered: when
+    the ADMITTED candidate is the shim, `resolve_developer_tool()` reads
+    `<developer dir>/usr/bin/git` to classify it. That path comes from
+    `developer_dir_candidates()`, is shared byte for byte with the probe interpreter, and
+    is unchanged here.
     """
     value = launch_path(agent_path) if path_value is None else path_value
-    candidate = shutil.which(GIT_COMMAND, path=value)
-    if candidate is None:
-        raise IsolationError(
-            f"no {GIT_COMMAND!r} on the effective launch PATH ({value!r}), so the "
-            "pre-flight cannot verify the git the agent would resolve. This is a hard "
-            "failure and NOT a fallback: checking some other git -- or a bare name that "
-            "on darwin execs Apple's tool shim -- would prove nothing about the agent's "
-            "launch. Put a git on PATH, or pass its directory with --agent-path."
-        )
+    candidate = select_launch_path_tool(GIT_COMMAND, value, admitted_roots)
     return resolve_developer_tool(candidate, candidate, developer_dirs=developer_dirs)
 
 
@@ -2335,7 +2437,9 @@ def _probe_python() -> str:
     return resolve_probe_interpreter()
 
 
-def _probe_git(agent_path: Sequence[str] = ()) -> str:
+def _probe_git(
+    agent_path: Sequence[str] = (), *, admitted_roots: Sequence[str] = ()
+) -> str:
     """The pre-flight's git: selected by the agent's own PATH, resolved past the shim.
 
     Was the literal string `git` on `preflight_probe()`'s check list, which on darwin
@@ -2345,9 +2449,12 @@ def _probe_git(agent_path: Sequence[str] = ()) -> str:
 
     `agent_path` is threaded through rather than defaulted away because the launch line's
     PATH is what decides WHICH git the agent gets. Dropping it here is the fixed-path
-    regression: same shim avoidance, wrong git.
+    regression: same shim avoidance, wrong git. `admitted_roots` is threaded through for
+    the mirror-image reason: the PATH decides which file is a candidate, and the readable
+    set decides whether this process may open it. Dropping THAT argument is F-002 --
+    the same right git, read out of a directory nothing admitted.
     """
-    return resolve_probe_git(agent_path=agent_path)
+    return resolve_probe_git(agent_path=agent_path, admitted_roots=admitted_roots)
 
 
 def _run_probe(session: Path | None, targets: dict[str, str], *, sandboxed: bool) -> dict:
@@ -3133,7 +3240,8 @@ def isolate(
             # caller ever made true: every prior capture ran four read-only checks and
             # called it a pre-flight, on a session in which the agent could not start.
             preflight = preflight_probe(
-                session, agent_command or None, agent_path=agent_path
+                session, agent_command or None,
+                agent_path=agent_path, admitted_roots=paths,
             )
             (session / "control" / "probes" / "preflight.log").write_text(
                 preflight["log"], encoding="utf-8"
@@ -3212,6 +3320,7 @@ def preflight_probe(
     agent_command: str | None = None,
     *,
     agent_path: Sequence[str] = (),
+    admitted_roots: Sequence[str] = (),
 ) -> dict:
     """Mandatory, before the real dispatch. Runs the launch line for real.
 
@@ -3232,8 +3341,13 @@ def preflight_probe(
     the list go through `resolve_developer_tool()`, and the git one is first SELECTED from
     `launch_path(agent_path)` -- the same PATH the agent is launched with -- so the check
     verifies the git the agent will actually resolve, not a fixed `/usr/bin/git` that an
-    admitted `--agent-path` entry or an inherited PATH could outrank. The other two are
-    ABSOLUTE paths to binaries measured on this host as carrying no `TOOL_SHIM_MARKER` --
+    admitted `--agent-path` entry or an inherited PATH could outrank. `admitted_roots` is
+    the readable set that selection is allowed to reach into: it comes from `isolate()`'s
+    own `readable["entries"]`, and it DEFAULTS TO NOTHING, so a pre-flight that was not
+    told what was admitted refuses every PATH candidate rather than opening one.
+
+    The other two checks are ABSOLUTE paths to binaries measured on this host as carrying
+    no `TOOL_SHIM_MARKER` --
     `/bin/echo` (inode 1152921500312571396) and `/bin/ls` (inode 1152921500312571414),
     neither of which is the shim inode 1152921500312571585 -- so no fixed check can reach
     a shim, and `test_no_fixed_preflight_check_execs_a_tool_shim` asserts that over the
@@ -3247,7 +3361,7 @@ def preflight_probe(
     checks = [
         f"{shlex.quote(_probe_python())} -c {shlex.quote('print(1)')}",
         "/bin/echo preflight",
-        f"{shlex.quote(_probe_git(agent_path))} --version",
+        f"{shlex.quote(_probe_git(agent_path, admitted_roots=admitted_roots))} --version",
         "/bin/ls .",
     ]
     if agent_command:
