@@ -107,14 +107,20 @@ SANDBOX_EXEC = "/usr/bin/sandbox-exec"
 # job to surface it as an explicit `--allow-read` rather than to guess.
 SYSTEM_PYTHON = "/usr/bin/python3"
 
-# The other developer tool the LAUNCH PATH execs, and the launch spelling it used before
-# shim resolution reached it. `GIT_COMMAND` is a bare name on purpose: the pre-flight's
-# job is to prove the git the AGENT will reach, and the agent reaches it through PATH.
-# Off the shimmed path -- every Linux, and any darwin host whose `/usr/bin/git` is real --
-# `resolve_probe_git()` hands this back untouched, so the check string stays byte-identical
-# to what it was.
+# The other developer tool the LAUNCH PATH execs. `GIT_COMMAND` is a bare name on purpose,
+# but NOT because the check string stays bare: it is the name `resolve_probe_git()` looks
+# up ON THE AGENT'S OWN EFFECTIVE PATH (`launch_path()`), because the pre-flight's job is
+# to prove the git the AGENT will reach and the agent reaches it through PATH. `SYSTEM_GIT`
+# is the darwin shim's usual address; it is documentation and test material, and it is
+# deliberately NOT the thing the resolution keys off -- keying off it is what made the
+# pre-flight verify a git the agent might never run.
 SYSTEM_GIT = "/usr/bin/git"
 GIT_COMMAND = "git"
+
+# The tail `wrap_command()` appends after the admitted `--agent-path` entries. Named once
+# so the PATH the agent is launched with and the PATH `resolve_probe_git()` searches can
+# never drift apart: they are the same string, from the same function.
+LAUNCH_PATH_TAIL = ("/usr/bin", "/bin", "/usr/sbin", "/sbin")
 
 # The darwin tool shim, and the reason the isolation path must never exec one.
 #
@@ -1007,6 +1013,34 @@ def render_seatbelt_profile(
 """
 
 
+def launch_path(
+    agent_path: Sequence[str] = (), environ: Mapping[str, str] | None = None
+) -> str:
+    """The PATH value the launched agent actually resolves bare names against.
+
+    ONE definition, two consumers. `wrap_command()` puts this on the launch line when
+    `--agent-path` was given, and `resolve_probe_git()` searches it to find the git the
+    pre-flight must verify. Splitting those two would recreate exactly the defect this
+    exists to close: a pre-flight that proves a git the agent never runs.
+
+    With `--agent-path` the agent sees the admitted directories first, in order, then the
+    system tail -- so an admitted directory can and does outrank `/usr/bin`, which is the
+    whole reason the pre-flight cannot just look at `/usr/bin/git`. Every entry has already
+    been through `assert_agent_path_admitted()`; nothing here admits, scans or reads
+    anything new.
+
+    With no `--agent-path` the launch line carries no `PATH=` assignment at all, so the
+    agent inherits this process's PATH -- which is what is returned. That inherited PATH is
+    equally free to name a non-system git before `/usr/bin`, and the pre-flight has to
+    follow it there too.
+    """
+    if agent_path:
+        directories = [str(_realpath(entry)) for entry in agent_path]
+        return ":".join([*directories, *LAUNCH_PATH_TAIL])
+    env = os.environ if environ is None else environ
+    return env.get("PATH", os.defpath)
+
+
 def wrap_command(session: Path, command: str, agent_path: Sequence[str] = ()) -> str:
     """The launch line, and it is the one thing the negative test must not re-implement.
 
@@ -1042,10 +1076,7 @@ def wrap_command(session: Path, command: str, agent_path: Sequence[str] = ()) ->
     profile = shlex.quote(str(session / "control" / PROFILE_FILENAME))
     path = ""
     if agent_path:
-        directories = [str(_realpath(entry)) for entry in agent_path]
-        path = "PATH=" + shlex.quote(
-            ":".join([*directories, "/usr/bin", "/bin", "/usr/sbin", "/sbin"])
-        ) + " "
+        path = "PATH=" + shlex.quote(launch_path(agent_path)) + " "
     return (
         f"cd {review_root} && TMPDIR={tmp} HOME={home} {path}"
         f"exec {SANDBOX_EXEC} -f {profile} {command}"
@@ -2191,7 +2222,8 @@ def resolve_developer_tool(
     returned unchanged whenever `system_path` is absent or is a REAL tool -- which is every
     Linux and every unshimmed darwin host -- so nothing off the shimmed path is changed by
     one byte, and the caller keeps ownership of what "no shim involved" means for it
-    (`sys.executable` for the probe interpreter, a bare `git` for the pre-flight's git).
+    (`sys.executable` for the probe interpreter; for the pre-flight's git it is the
+    PATH-selected candidate itself, which is the agent's own git).
 
     When `system_path` IS the shim, the real tool is taken from `<developer dir>/usr/bin/
     <name>` -- the same file `xcrun --find <name>` reports. On this host that is
@@ -2248,24 +2280,49 @@ def resolve_probe_interpreter(
 
 
 def resolve_probe_git(
-    system_git: str = SYSTEM_GIT,
+    path_value: str | None = None,
     *,
+    agent_path: Sequence[str] = (),
     developer_dirs: Sequence[str] | None = None,
 ) -> str:
-    """The git the pre-flight actually execs. Never a tool shim.
+    """The git the pre-flight actually execs: the AGENT'S git, never a tool shim.
 
-    The unshimmed spelling is the bare `git`, NOT `/usr/bin/git`: the pre-flight exists to
-    prove the git the agent will reach, and the agent reaches it through PATH. So on Linux
-    the check string is byte-identical to what it always was.
+    TWO properties, and the pre-flight is only worth running when it has BOTH.
 
-    On darwin the bare `git` resolves through PATH to `/usr/bin/git`, which is the shim,
-    which is the door the operator actually walked through in another project. Substituting
-    the resolved binary does not make the check prove something weaker: the shim's ONLY job
-    is to exec `<developer dir>/usr/bin/git`, so the resolved path is the same real git the
-    agent's own `git` would have ended up running -- reached without the exec that can put
-    an installer dialog on the operator's screen.
+    PATH FIDELITY. The candidate is selected from `launch_path()` -- the very PATH the
+    launched agent resolves `git` against -- so an admitted `--agent-path` directory that
+    outranks `/usr/bin`, or an inherited PATH that names a non-system git first, is
+    followed here exactly as the agent will follow it. A fixed `/usr/bin/git` is NOT
+    equivalent and was the defect: it let the pre-flight report success for Apple Git while
+    the agent went on to run something else entirely. The bare `git` the check used to
+    carry had this property; it just paid for it by exec'ing the shim.
+
+    NO SHIM EXECUTION. The selected candidate is then classified by its BYTES, not by its
+    address. A real binary is returned as-is -- it IS the agent's git and it is what gets
+    verified. A candidate that is Apple's tool shim is resolved through
+    `resolve_developer_tool()` to the real implementation behind it, which is the same file
+    the shim would have exec'd, reached without the exec that can put a Command Line Tools
+    installer on the operator's screen.
+
+    On Linux nothing on PATH is ever a shim, so this returns the same real git the bare
+    name always selected -- the behaviour is identical, only now stated absolutely.
+
+    FAIL CLOSED, both ways. No git anywhere on the effective PATH raises here rather than
+    launching a check that would fail obscurely inside the sandbox; a shim whose real tool
+    cannot be found raises out of `resolve_developer_tool()`. Neither falls back to the
+    shim and neither widens the profile.
     """
-    return resolve_developer_tool(system_git, GIT_COMMAND, developer_dirs=developer_dirs)
+    value = launch_path(agent_path) if path_value is None else path_value
+    candidate = shutil.which(GIT_COMMAND, path=value)
+    if candidate is None:
+        raise IsolationError(
+            f"no {GIT_COMMAND!r} on the effective launch PATH ({value!r}), so the "
+            "pre-flight cannot verify the git the agent would resolve. This is a hard "
+            "failure and NOT a fallback: checking some other git -- or a bare name that "
+            "on darwin execs Apple's tool shim -- would prove nothing about the agent's "
+            "launch. Put a git on PATH, or pass its directory with --agent-path."
+        )
+    return resolve_developer_tool(candidate, candidate, developer_dirs=developer_dirs)
 
 
 def _probe_python() -> str:
@@ -2278,15 +2335,19 @@ def _probe_python() -> str:
     return resolve_probe_interpreter()
 
 
-def _probe_git() -> str:
-    """The pre-flight's git, resolved past the darwin tool shim.
+def _probe_git(agent_path: Sequence[str] = ()) -> str:
+    """The pre-flight's git: selected by the agent's own PATH, resolved past the shim.
 
     Was the literal string `git` on `preflight_probe()`'s check list, which on darwin
     resolves through PATH to `/usr/bin/git` -- the same shim inode as `/usr/bin/python3`,
     reaching the same `xcselect_invoke_xcrun`. Resolving python alone left this door open,
     and it is the door the reported Command Line Tools dialog came through.
+
+    `agent_path` is threaded through rather than defaulted away because the launch line's
+    PATH is what decides WHICH git the agent gets. Dropping it here is the fixed-path
+    regression: same shim avoidance, wrong git.
     """
-    return resolve_probe_git()
+    return resolve_probe_git(agent_path=agent_path)
 
 
 def _run_probe(session: Path | None, targets: dict[str, str], *, sandboxed: bool) -> dict:
@@ -3168,12 +3229,15 @@ def preflight_probe(
     would re-admit a host-wide mutable path.
 
     SHIM SCOPE OF THE FIXED CHECK LIST, stated rather than assumed. Both tool spellings on
-    the list go through `resolve_developer_tool()`. The other two are ABSOLUTE paths to
-    binaries measured on this host as carrying no `TOOL_SHIM_MARKER` -- `/bin/echo` (inode
-    1152921500312571396) and `/bin/ls` (inode 1152921500312571414), neither of which is the
-    shim inode 1152921500312571585 -- so no fixed check can reach a shim, and
-    `test_no_fixed_preflight_check_execs_a_tool_shim` asserts that over the real list
-    rather than over this sentence.
+    the list go through `resolve_developer_tool()`, and the git one is first SELECTED from
+    `launch_path(agent_path)` -- the same PATH the agent is launched with -- so the check
+    verifies the git the agent will actually resolve, not a fixed `/usr/bin/git` that an
+    admitted `--agent-path` entry or an inherited PATH could outrank. The other two are
+    ABSOLUTE paths to binaries measured on this host as carrying no `TOOL_SHIM_MARKER` --
+    `/bin/echo` (inode 1152921500312571396) and `/bin/ls` (inode 1152921500312571414),
+    neither of which is the shim inode 1152921500312571585 -- so no fixed check can reach
+    a shim, and `test_no_fixed_preflight_check_execs_a_tool_shim` asserts that over the
+    real list rather than over this sentence.
 
     `agent_command` is NOT covered and cannot be: it is an arbitrary operator-supplied
     string, so if an operator passes `cc ...` or `make ...` -- both the same shim inode on
@@ -3183,7 +3247,7 @@ def preflight_probe(
     checks = [
         f"{shlex.quote(_probe_python())} -c {shlex.quote('print(1)')}",
         "/bin/echo preflight",
-        f"{shlex.quote(_probe_git())} --version",
+        f"{shlex.quote(_probe_git(agent_path))} --version",
         "/bin/ls .",
     ]
     if agent_command:

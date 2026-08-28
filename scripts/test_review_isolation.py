@@ -1906,11 +1906,14 @@ class ProbeInterpreterShimTests(unittest.TestCase):
 
     def test_git_resolution_fails_closed_and_never_falls_back_to_the_shim(self) -> None:
         # The whole point of the T-14.3 finding: a git that cannot be resolved must be a
-        # loud error, NOT a quiet `git --version` that execs Apple's shim.
-        shim = self.fake_shim("git")
+        # loud error, NOT a quiet `git --version` that execs Apple's shim. Driven through
+        # a PATH whose only `git` IS the shim, because that is how the resolution is
+        # reached now -- by selection, never by a fixed address.
+        self.fake_shim("git").chmod(0o755)
         with self.assertRaises(review_isolation.IsolationError) as raised:
             review_isolation.resolve_probe_git(
-                str(shim), developer_dirs=[str(self.base / "no_such_developer_dir")]
+                str(self.base / "usr" / "bin"),
+                developer_dirs=[str(self.base / "no_such_developer_dir")],
             )
         message = str(raised.exception)
         self.assertIn("tool shim", message)
@@ -1918,20 +1921,12 @@ class ProbeInterpreterShimTests(unittest.TestCase):
         self.assertNotIn("interpreter", message)
 
     def test_a_developer_dir_that_only_offers_another_git_shim_is_refused(self) -> None:
+        self.fake_shim("git").chmod(0o755)
         with self.assertRaises(review_isolation.IsolationError):
             review_isolation.resolve_probe_git(
-                str(self.fake_shim("git")),
+                str(self.base / "usr" / "bin"),
                 developer_dirs=[str(self.fake_developer_dir("git", shim=True))],
             )
-
-    def test_an_unshimmed_git_keeps_the_bare_path_lookup_the_agent_uses(self) -> None:
-        # G2: the pre-flight proves the git the AGENT reaches, and the agent reaches it
-        # through PATH. Off the shimmed path the spelling must therefore stay bare.
-        self.assertEqual(review_isolation.GIT_COMMAND, "git")
-        self.assertEqual(
-            review_isolation.resolve_probe_git(sys.executable),
-            review_isolation.GIT_COMMAND,
-        )
 
     # -- the wiring, and the property on the real host ------------------------------
 
@@ -1945,17 +1940,19 @@ class ProbeInterpreterShimTests(unittest.TestCase):
         self.assertFalse(review_isolation.is_tool_shim(review_isolation._probe_python()))
 
     def test_the_preflight_git_goes_through_the_resolver(self) -> None:
+        # `agent_path=agent_path` is load-bearing and is pinned here as part of the call:
+        # `resolve_probe_git()` with the argument dropped is the fixed-path regression --
+        # it avoids the shim and verifies the wrong git.
         self.assertEqual(
             _function_body_statements(review_isolation._probe_git),
-            ["return resolve_probe_git()"],
+            ["return resolve_probe_git(agent_path=agent_path)"],
         )
 
     def test_the_resolved_preflight_git_is_never_a_tool_shim(self) -> None:
+        if shutil.which(review_isolation.GIT_COMMAND) is None:
+            self.skipTest("no git on this host's PATH; the resolver correctly refuses")
         resolved = review_isolation._probe_git()
-        if resolved == review_isolation.GIT_COMMAND:
-            # Unshimmed host, which is every Linux: the bare name, byte-identical to what
-            # the check always was. There is no file to scan and that IS the answer.
-            return
+        self.assertTrue(resolved.startswith("/"), resolved)
         self.assertFalse(review_isolation.is_tool_shim(resolved))
 
     @DARWIN_ONLY
@@ -2230,6 +2227,232 @@ class ProbeLaunchWiringTests(unittest.TestCase):
             review_isolation.DEFAULT_DEVELOPER_DIR,
             review_isolation.DEFAULT_IMM_CANDIDATES,
         )
+
+
+class PreflightGitPathSelectionTests(unittest.TestCase):
+    """F-001: the pre-flight must verify the git THE AGENT WILL ACTUALLY RESOLVE.
+
+    Two properties have to hold at once, and the first delta held only one of them:
+
+      G1  no Apple tool shim on the launch line, and
+      G2  the checked git is the one the launched agent's own PATH selects.
+
+    The pre-delta bare `git --version` had G2 for free -- same shell, same PATH -- and
+    paid for it by exec'ing the shim. Resolving a fixed `/usr/bin/git` bought G1 and lost
+    G2: `wrap_command()` prepends every admitted `--agent-path` directory BEFORE
+    `/usr/bin`, so the agent can resolve a completely different git than the one the
+    pre-flight just blessed. The same mismatch exists with no `--agent-path` at all
+    whenever the inherited PATH names a git before `/usr/bin`.
+
+    Everything here is PORTABLE: the candidate gits, the shim and the developer directory
+    are synthesised in a temporary directory, so Linux CI executes this mechanism instead
+    of skipping it. Nothing is admitted, scanned or read outside that directory.
+    """
+
+    SENTINEL = "/nonexistent/resolved/interpreter"
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        # Realpath first: `launch_path()` realpaths every `--agent-path` entry, so an
+        # unresolved `/var/folders/...` base would compare unequal on darwin for a reason
+        # that has nothing to do with the property under test.
+        self.base = Path(os.path.realpath(self.temporary.name))
+        self.commands: list[str] = []
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def git_dir(self, label: str, *, shim: bool = False) -> Path:
+        """A PATH directory offering an EXECUTABLE `git`, distinguished by its label so a
+        wrong selection is visible in the failure message. Executable matters: selection
+        is `shutil.which()`, which is the shell's own first-match-plus-X_OK rule."""
+        directory = self.base / label
+        directory.mkdir(parents=True, exist_ok=True)
+        candidate = directory / review_isolation.GIT_COMMAND
+        marker = review_isolation.TOOL_SHIM_MARKER if shim else b""
+        candidate.write_bytes(b"#!/bin/sh\n" + marker + label.encode())
+        candidate.chmod(0o755)
+        return directory
+
+    def developer_dir(self, label: str = "devdir") -> Path:
+        directory = self.base / label
+        target = directory / "usr" / "bin" / review_isolation.GIT_COMMAND
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"#!/bin/sh\nreal-git-behind-the-shim")
+        target.chmod(0o755)
+        return directory
+
+    def recorder(self):
+        def run(argv, **_kwargs):
+            self.commands.append(argv[-1])
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        return run
+
+    # -- the PATH the pre-flight searches IS the PATH the agent is launched with ----
+
+    def test_the_searched_path_is_literally_the_launch_line_path(self) -> None:
+        """The anti-drift pin. Two copies of "what PATH will the agent see" is how this
+        defect comes back, so the launch line has to carry the same string
+        `resolve_probe_git()` searches -- asserted, not asserted-about."""
+        directory = self.git_dir("agentbin")
+        session = self.base / "session"
+        value = review_isolation.launch_path([str(directory)])
+        self.assertEqual(
+            value, f"{directory}:/usr/bin:/bin:/usr/sbin:/sbin"
+        )
+        launch = review_isolation.wrap_command(session, "true", [str(directory)])
+        self.assertIn(f"PATH={shlex.quote(value)} ", launch)
+
+    def test_no_agent_path_means_the_inherited_path_is_what_the_agent_gets(self) -> None:
+        # No `PATH=` assignment on the launch line, so the agent inherits this process's
+        # PATH -- and that is the PATH the pre-flight has to follow.
+        session = self.base / "session"
+        self.assertNotIn("PATH=", review_isolation.wrap_command(session, "true"))
+        self.assertEqual(
+            review_isolation.launch_path(environ={"PATH": "/a:/b"}), "/a:/b"
+        )
+
+    # -- selection: the agent's git, not the system's ------------------------------
+
+    def test_an_admitted_agent_path_git_outranks_the_system_git(self) -> None:
+        """THE F-001 regression. An admitted `--agent-path` directory sits before
+        `/usr/bin` on the launch line, so its `git` is the one the agent runs -- and it,
+        not the Command Line Tools git behind `/usr/bin/git`, is what must be verified."""
+        directory = self.git_dir("agentbin")
+        resolved = review_isolation._probe_git([str(directory)])
+        self.assertEqual(
+            resolved, str(directory / review_isolation.GIT_COMMAND)
+        )
+        self.assertNotEqual(resolved, review_isolation.SYSTEM_GIT)
+        self.assertNotIn("CommandLineTools", resolved)
+
+    def test_the_first_admitted_agent_path_entry_wins_as_on_the_launch_line(
+        self,
+    ) -> None:
+        first = self.git_dir("first")
+        second = self.git_dir("second")
+        self.assertEqual(
+            review_isolation._probe_git([str(first), str(second)]),
+            str(first / review_isolation.GIT_COMMAND),
+        )
+
+    def test_an_inherited_path_git_is_followed_too(self) -> None:
+        directory = self.git_dir("inherited")
+        with mock.patch.dict(os.environ, {"PATH": str(directory)}, clear=False):
+            self.assertEqual(
+                review_isolation._probe_git(),
+                str(directory / review_isolation.GIT_COMMAND),
+            )
+
+    def test_a_real_path_selected_git_is_used_exactly_as_selected(self) -> None:
+        """The Linux invariant, and the reason a real candidate is never "improved":
+        nothing on a Linux PATH is a shim, so selection alone is the whole answer and the
+        binary executed is the same one the bare name always reached."""
+        directory = self.git_dir("realgit")
+        candidate = str(directory / review_isolation.GIT_COMMAND)
+        self.assertFalse(review_isolation.is_tool_shim(candidate))
+        self.assertEqual(
+            review_isolation.resolve_probe_git(str(directory)), candidate
+        )
+
+    # -- selection never turns into execution --------------------------------------
+
+    def test_a_path_selected_shim_is_resolved_rather_than_executed(self) -> None:
+        """Both properties at once: the shim IS the agent's PATH-selected git, so it is
+        the right thing to have found -- and it is resolved by its bytes to the real tool
+        behind it instead of being exec'd."""
+        directory = self.git_dir("agentbin", shim=True)
+        developer = self.developer_dir()
+        resolved = review_isolation.resolve_probe_git(
+            str(directory), developer_dirs=[str(developer)]
+        )
+        self.assertNotEqual(
+            resolved, str(directory / review_isolation.GIT_COMMAND)
+        )
+        self.assertFalse(review_isolation.is_tool_shim(resolved))
+        self.assertEqual(
+            resolved,
+            str(developer / "usr" / "bin" / review_isolation.GIT_COMMAND),
+        )
+
+    def test_an_unresolvable_path_selected_shim_fails_closed(self) -> None:
+        directory = self.git_dir("agentbin", shim=True)
+        with self.assertRaises(review_isolation.IsolationError) as raised:
+            review_isolation.resolve_probe_git(
+                str(directory), developer_dirs=[str(self.base / "absent")]
+            )
+        self.assertIn("Command Line Tools installer", str(raised.exception))
+
+    def test_no_git_on_the_effective_path_is_a_loud_failure(self) -> None:
+        """Fail closed, and say which PATH. Falling back to a bare `git` here is the
+        exact regression -- on darwin that name execs the shim."""
+        empty = self.base / "empty"
+        empty.mkdir()
+        with self.assertRaises(review_isolation.IsolationError) as raised:
+            review_isolation.resolve_probe_git(str(empty))
+        message = str(raised.exception)
+        self.assertIn("effective launch PATH", message)
+        self.assertIn(str(empty), message)
+
+    def test_a_non_executable_git_on_path_is_not_selected(self) -> None:
+        # The shell would skip it, so the pre-flight must skip it: selecting it would
+        # verify a file the agent can never run.
+        blocked = self.base / "blocked"
+        blocked.mkdir()
+        (blocked / review_isolation.GIT_COMMAND).write_bytes(b"not executable")
+        usable = self.git_dir("usable")
+        self.assertEqual(
+            review_isolation.resolve_probe_git(f"{blocked}:{usable}"),
+            str(usable / review_isolation.GIT_COMMAND),
+        )
+
+    # -- and the launch line carries the selected git ------------------------------
+
+    def test_the_preflight_launch_line_checks_the_agent_path_git(self) -> None:
+        """End to end, with the REAL git resolver: `preflight_probe()` must put the
+        `--agent-path` git on the recorded launch line.
+
+        This is the test that fails if `_probe_git()` goes back to ignoring `agent_path`,
+        and it fails behaviourally -- by reading the command handed to `/bin/sh` -- rather
+        than by inspecting source, so no re-spelling escapes it.
+        """
+        directory = self.git_dir("agentbin")
+        candidate = str(directory / review_isolation.GIT_COMMAND)
+        session = self.base / "session"
+        (session / "review_root").mkdir(parents=True)
+        with mock.patch.object(
+            review_isolation, "_probe_python", return_value=self.SENTINEL
+        ), mock.patch.object(review_isolation.subprocess, "run", self.recorder()):
+            review_isolation.preflight_probe(session, agent_path=[str(directory)])
+        self.assertTrue(
+            any(f"{shlex.quote(candidate)} --version" in command
+                for command in self.commands),
+            f"the agent's own git is on no launch line: {self.commands}",
+        )
+        for command in self.commands:
+            self.assertNotIn(review_isolation.SYSTEM_GIT, command)
+            self.assertNotIn("CommandLineTools", command)
+
+    def test_an_ungettable_git_stops_the_preflight_before_anything_launches(self) -> None:
+        """The inherited-PATH half, and the reason the failure is raised while the check
+        LIST is built: a host that cannot produce the agent's git execs nothing at all
+        rather than getting two checks in and then failing on the third.
+
+        Driven through the inherited PATH because that is the only case where the git can
+        genuinely be missing -- `--agent-path` always appends the `/usr/bin` tail.
+        """
+        empty = self.base / "empty"
+        empty.mkdir()
+        session = self.base / "session"
+        (session / "review_root").mkdir(parents=True)
+        with mock.patch.dict(
+            os.environ, {"PATH": str(empty)}, clear=False
+        ), mock.patch.object(
+            review_isolation, "_probe_python", return_value=self.SENTINEL
+        ), mock.patch.object(review_isolation.subprocess, "run", self.recorder()):
+            with self.assertRaises(review_isolation.IsolationError):
+                review_isolation.preflight_probe(session)
+        self.assertEqual(self.commands, [], "no check may launch once git is unresolvable")
 
 
 # ---- T-10 the seed mechanism (DESIGN D-6.1 .. D-6.9) ---------------------------------
