@@ -107,6 +107,15 @@ SANDBOX_EXEC = "/usr/bin/sandbox-exec"
 # job to surface it as an explicit `--allow-read` rather than to guess.
 SYSTEM_PYTHON = "/usr/bin/python3"
 
+# The other developer tool the LAUNCH PATH execs, and the launch spelling it used before
+# shim resolution reached it. `GIT_COMMAND` is a bare name on purpose: the pre-flight's
+# job is to prove the git the AGENT will reach, and the agent reaches it through PATH.
+# Off the shimmed path -- every Linux, and any darwin host whose `/usr/bin/git` is real --
+# `resolve_probe_git()` hands this back untouched, so the check string stays byte-identical
+# to what it was.
+SYSTEM_GIT = "/usr/bin/git"
+GIT_COMMAND = "git"
+
 # The darwin tool shim, and the reason the isolation path must never exec one.
 #
 # MEASURED on this host, not assumed: `/usr/bin/python3` and `/usr/bin/git` are the SAME
@@ -120,13 +129,19 @@ SYSTEM_PYTHON = "/usr/bin/python3"
 #
 # That prompt is a GUI interruption for the operator and it cannot be answered by the run,
 # which is why the shim is resolved away rather than merely tolerated: the harness picks
-# its OWN probe interpreter and nothing depends on that choice being the shim.
+# its OWN launch spelling and nothing depends on that choice being the shim.
 #
-# Deliberately NOT extended to the pre-flight's `git --version`. That check exists to prove
-# the agent's own `git` works inside the sandbox, and the agent will invoke `git` -- so
-# substituting the resolved binary would make the check prove something else. If git's shim
-# cannot resolve, the agent's git is genuinely broken and a loud pre-flight failure is the
-# correct outcome.
+# SHIMMING IS A PROPERTY OF THE LAUNCH PATH, NOT OF PYTHON. Re-measured on this host with
+# `os.stat` over the same-inode set: `/usr/bin/git`, `/usr/bin/cc`, `/usr/bin/clang`,
+# `/usr/bin/make` and `/usr/bin/dyld_info` are all inode 1152921500312571585 -- byte for
+# byte the same shim as `/usr/bin/python3`, reaching the same `xcselect_invoke_xcrun`.
+# An earlier revision resolved python only and argued the retained `git --version` was
+# bounded because python resolves first and raises first. That argument is true and
+# IRRELEVANT: it bounds the case where python CANNOT resolve, while the reported failure
+# is the ordinary case where python resolves fine and `git --version` execs the shim on
+# its own. An ordering guarantee about one tool says nothing about another tool's own
+# call site, which is why resolution is now tool-agnostic -- `resolve_developer_tool()` --
+# and the two call sites go through it.
 TOOL_SHIM_MARKER = b"com.apple.dt.xcode_select.tool-shim-public"
 
 # Where the active developer directory is recorded, in the order `xcselect` itself consults
@@ -2159,37 +2174,44 @@ def developer_dir_candidates(environ: Mapping[str, str] | None = None) -> tuple[
     return tuple(dict.fromkeys(candidates))
 
 
-def resolve_probe_interpreter(
-    system_python: str = SYSTEM_PYTHON,
+def resolve_developer_tool(
+    system_path: str,
+    unshimmed: str,
     *,
     developer_dirs: Sequence[str] | None = None,
 ) -> str:
-    """The interpreter the probes and the pre-flight actually exec. Never a tool shim.
+    """The launch spelling for one developer tool, resolved past Apple's tool shim.
 
-    Three cases, and the third is the whole point:
+    TOOL-AGNOSTIC on purpose. `python3` and `git` are the same hardlinked shim on darwin,
+    and so are `cc`, `clang`, `make` and `dyld_info`; a resolver that knows about one tool
+    is a resolver that will be re-fixed for the next one. Everything here decides from the
+    FILE at `system_path`, never from the tool's name.
 
-    * no system python at all -- `sys.executable`, exactly as before;
-    * a system python that is a REAL interpreter (every Linux, and any darwin host where
-      it is not shimmed) -- returned unchanged, so this changes nothing off darwin;
-    * a system python that IS the shim -- resolved to `<developer dir>/usr/bin/<name>`,
-      the same file `xcrun --find python3` reports, which on this host realpaths to
-      `/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/
-      Versions/3.9/bin/python3.9`: inside the already-proven, already-admitted Class IMM
-      root, so NOTHING new is admitted and the sandbox is not widened by one byte.
+    `unshimmed` is the spelling this call site would launch if shims did not exist. It is
+    returned unchanged whenever `system_path` is absent or is a REAL tool -- which is every
+    Linux and every unshimmed darwin host -- so nothing off the shimmed path is changed by
+    one byte, and the caller keeps ownership of what "no shim involved" means for it
+    (`sys.executable` for the probe interpreter, a bare `git` for the pre-flight's git).
 
-    FAIL CLOSED. If the real interpreter cannot be resolved this raises. It never falls
-    back to the shim -- falling back is precisely how the operator gets the Command Line
-    Tools installer thrown at them mid-run -- and it never widens the profile to make the
-    shim work.
+    When `system_path` IS the shim, the real tool is taken from `<developer dir>/usr/bin/
+    <name>` -- the same file `xcrun --find <name>` reports. On this host that is
+    `/Library/Developer/CommandLineTools/usr/bin/git` and, for python3, a path under the
+    same root: inside the already-proven, already-admitted Class IMM root, so NOTHING new
+    is admitted and the sandbox is not widened.
+
+    FAIL CLOSED. If the real tool cannot be resolved this raises. It never falls back to
+    the shim -- falling back is precisely how the operator gets the Command Line Tools
+    installer thrown at them mid-run -- and it never widens the profile to make the shim
+    work.
     """
-    if not Path(system_python).exists():
-        return sys.executable
-    if not is_tool_shim(system_python):
-        return system_python
+    # Short-circuit order matters: `is_tool_shim()` raises on an unreadable file, and an
+    # absent tool is not unreadable -- it is simply the caller's `unshimmed` case.
+    if not Path(system_path).exists() or not is_tool_shim(system_path):
+        return unshimmed
     directories = (
         developer_dir_candidates() if developer_dirs is None else tuple(developer_dirs)
     )
-    name = Path(system_python).name
+    name = Path(system_path).name
     tried: list[str] = []
     for directory in directories:
         candidate = Path(directory) / "usr" / "bin" / name
@@ -2198,13 +2220,52 @@ def resolve_probe_interpreter(
             continue
         return str(_realpath(candidate))
     raise IsolationError(
-        f"{system_python} is Apple's xcode-select tool shim and the real interpreter "
+        f"{system_path} is Apple's xcode-select tool shim and the real {name} "
         f"behind it could not be resolved in any active developer directory "
         f"(tried: {', '.join(tried) or 'none'}). Running the shim is what asks macOS to "
         "present the Command Line Tools installer, so this is a hard failure and NOT a "
         "fallback. On an Xcode-only host, point DEVELOPER_DIR at a developer directory "
         f"that provides usr/bin/{name}."
     )
+
+
+def resolve_probe_interpreter(
+    system_python: str = SYSTEM_PYTHON,
+    *,
+    developer_dirs: Sequence[str] | None = None,
+) -> str:
+    """The interpreter the probes and the pre-flight actually exec. Never a tool shim.
+
+    A thin specialization of `resolve_developer_tool()`: the only python-specific thing
+    left is what to launch when no shim is involved -- `/usr/bin/python3` when it is a
+    real interpreter, and the running `sys.executable` when there is no `/usr/bin/python3`
+    at all, which is the Linux CI case and is exactly the pre-existing behaviour.
+    """
+    unshimmed = system_python if Path(system_python).exists() else sys.executable
+    return resolve_developer_tool(
+        system_python, unshimmed, developer_dirs=developer_dirs
+    )
+
+
+def resolve_probe_git(
+    system_git: str = SYSTEM_GIT,
+    *,
+    developer_dirs: Sequence[str] | None = None,
+) -> str:
+    """The git the pre-flight actually execs. Never a tool shim.
+
+    The unshimmed spelling is the bare `git`, NOT `/usr/bin/git`: the pre-flight exists to
+    prove the git the agent will reach, and the agent reaches it through PATH. So on Linux
+    the check string is byte-identical to what it always was.
+
+    On darwin the bare `git` resolves through PATH to `/usr/bin/git`, which is the shim,
+    which is the door the operator actually walked through in another project. Substituting
+    the resolved binary does not make the check prove something weaker: the shim's ONLY job
+    is to exec `<developer dir>/usr/bin/git`, so the resolved path is the same real git the
+    agent's own `git` would have ended up running -- reached without the exec that can put
+    an installer dialog on the operator's screen.
+    """
+    return resolve_developer_tool(system_git, GIT_COMMAND, developer_dirs=developer_dirs)
 
 
 def _probe_python() -> str:
@@ -2215,6 +2276,17 @@ def _probe_python() -> str:
     i.e. from the launch path of every isolated dispatch.
     """
     return resolve_probe_interpreter()
+
+
+def _probe_git() -> str:
+    """The pre-flight's git, resolved past the darwin tool shim.
+
+    Was the literal string `git` on `preflight_probe()`'s check list, which on darwin
+    resolves through PATH to `/usr/bin/git` -- the same shim inode as `/usr/bin/python3`,
+    reaching the same `xcselect_invoke_xcrun`. Resolving python alone left this door open,
+    and it is the door the reported Command Line Tools dialog came through.
+    """
+    return resolve_probe_git()
 
 
 def _run_probe(session: Path | None, targets: dict[str, str], *, sandboxed: bool) -> dict:
@@ -3094,11 +3166,24 @@ def preflight_probe(
     directory: that was tried, it does not even help -- the shim resolves its cache
     directory through `confstr(_CS_DARWIN_USER_TEMP_DIR)`, which ignores TMPDIR -- and it
     would re-admit a host-wide mutable path.
+
+    SHIM SCOPE OF THE FIXED CHECK LIST, stated rather than assumed. Both tool spellings on
+    the list go through `resolve_developer_tool()`. The other two are ABSOLUTE paths to
+    binaries measured on this host as carrying no `TOOL_SHIM_MARKER` -- `/bin/echo` (inode
+    1152921500312571396) and `/bin/ls` (inode 1152921500312571414), neither of which is the
+    shim inode 1152921500312571585 -- so no fixed check can reach a shim, and
+    `test_no_fixed_preflight_check_execs_a_tool_shim` asserts that over the real list
+    rather than over this sentence.
+
+    `agent_command` is NOT covered and cannot be: it is an arbitrary operator-supplied
+    string, so if an operator passes `cc ...` or `make ...` -- both the same shim inode on
+    this host -- that exec is theirs. `resolve_developer_tool()` is the tool-agnostic seam
+    to route it through if that ever becomes a real launch path.
     """
     checks = [
         f"{shlex.quote(_probe_python())} -c {shlex.quote('print(1)')}",
         "/bin/echo preflight",
-        "git --version",
+        f"{shlex.quote(_probe_git())} --version",
         "/bin/ls .",
     ]
     if agent_command:

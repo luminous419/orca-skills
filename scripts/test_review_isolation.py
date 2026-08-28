@@ -21,6 +21,7 @@ import hashlib
 import inspect
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -1731,6 +1732,13 @@ class ProbeInterpreterShimTests(unittest.TestCase):
     `preflight_probe()`, so every isolated dispatch exec'd it, and an operator whose
     developer directory did not resolve got the installer dialog thrown at them mid-run.
 
+    T-14.3: and it was never about python. `/usr/bin/git` is the SAME INODE as
+    `/usr/bin/python3` on a stock macOS -- as are `cc`, `clang`, `make` and `dyld_info` --
+    so the pre-flight's `git --version` exec'd the identical shim through its own call
+    site, which is how an operator hit the installer dialog again after python was fixed.
+    Resolution is therefore tool-agnostic (`resolve_developer_tool()`) and the tests below
+    drive it with a fake shim NAMED git as well as one named python3.
+
     Every test here is PORTABLE: the shim, the developer directory and the real
     interpreter behind it are all synthesised in a temporary directory, so Linux CI runs
     the whole mechanism rather than skipping it. The one darwin-gated test below asserts
@@ -1868,6 +1876,63 @@ class ProbeInterpreterShimTests(unittest.TestCase):
         for forbidden in ("subprocess", "xcode-select", "xcrun", "os.system", "popen"):
             self.assertNotIn(forbidden, source.split('"""')[-1])
 
+    # -- the resolver is tool-agnostic (T-14.3) ------------------------------------
+
+    def test_the_resolver_decides_from_the_file_not_from_the_tool_name(self) -> None:
+        # A fake shim named `git`, resolved through a developer dir that offers a real
+        # `git`. Nothing in the resolver may key off the name being `python3`.
+        shim = self.fake_shim("git")
+        resolved = review_isolation.resolve_developer_tool(
+            str(shim),
+            review_isolation.GIT_COMMAND,
+            developer_dirs=[str(self.fake_developer_dir("git"))],
+        )
+        self.assertNotEqual(resolved, str(shim))
+        self.assertFalse(review_isolation.is_tool_shim(resolved))
+        self.assertEqual(resolved, os.path.realpath(sys.executable))
+
+    def test_the_unshimmed_spelling_is_returned_untouched_for_a_real_tool(self) -> None:
+        # The Linux invariant, stated at the generic seam: /usr/bin/git is a real binary
+        # there, so the launch spelling must come back byte-identical.
+        self.assertEqual(
+            review_isolation.resolve_developer_tool(sys.executable, "git"), "git"
+        )
+
+    def test_the_unshimmed_spelling_is_returned_when_the_tool_is_absent(self) -> None:
+        self.assertEqual(
+            review_isolation.resolve_developer_tool(str(self.base / "absent"), "git"),
+            "git",
+        )
+
+    def test_git_resolution_fails_closed_and_never_falls_back_to_the_shim(self) -> None:
+        # The whole point of the T-14.3 finding: a git that cannot be resolved must be a
+        # loud error, NOT a quiet `git --version` that execs Apple's shim.
+        shim = self.fake_shim("git")
+        with self.assertRaises(review_isolation.IsolationError) as raised:
+            review_isolation.resolve_probe_git(
+                str(shim), developer_dirs=[str(self.base / "no_such_developer_dir")]
+            )
+        message = str(raised.exception)
+        self.assertIn("tool shim", message)
+        self.assertIn("Command Line Tools installer", message)
+        self.assertNotIn("interpreter", message)
+
+    def test_a_developer_dir_that_only_offers_another_git_shim_is_refused(self) -> None:
+        with self.assertRaises(review_isolation.IsolationError):
+            review_isolation.resolve_probe_git(
+                str(self.fake_shim("git")),
+                developer_dirs=[str(self.fake_developer_dir("git", shim=True))],
+            )
+
+    def test_an_unshimmed_git_keeps_the_bare_path_lookup_the_agent_uses(self) -> None:
+        # G2: the pre-flight proves the git the AGENT reaches, and the agent reaches it
+        # through PATH. Off the shimmed path the spelling must therefore stay bare.
+        self.assertEqual(review_isolation.GIT_COMMAND, "git")
+        self.assertEqual(
+            review_isolation.resolve_probe_git(sys.executable),
+            review_isolation.GIT_COMMAND,
+        )
+
     # -- the wiring, and the property on the real host ------------------------------
 
     def test_the_probe_interpreter_goes_through_the_resolver(self) -> None:
@@ -1878,6 +1943,20 @@ class ProbeInterpreterShimTests(unittest.TestCase):
 
     def test_the_resolved_probe_interpreter_is_never_a_tool_shim(self) -> None:
         self.assertFalse(review_isolation.is_tool_shim(review_isolation._probe_python()))
+
+    def test_the_preflight_git_goes_through_the_resolver(self) -> None:
+        self.assertEqual(
+            _function_body_statements(review_isolation._probe_git),
+            ["return resolve_probe_git()"],
+        )
+
+    def test_the_resolved_preflight_git_is_never_a_tool_shim(self) -> None:
+        resolved = review_isolation._probe_git()
+        if resolved == review_isolation.GIT_COMMAND:
+            # Unshimmed host, which is every Linux: the bare name, byte-identical to what
+            # the check always was. There is no file to scan and that IS the answer.
+            return
+        self.assertFalse(review_isolation.is_tool_shim(resolved))
 
     @DARWIN_ONLY
     def test_on_darwin_the_shimmed_system_python_is_actually_resolved_away(self) -> None:
@@ -1898,6 +1977,39 @@ class ProbeInterpreterShimTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(completed.stdout.strip(), "1")
 
+    @DARWIN_ONLY
+    def test_on_darwin_the_shimmed_system_git_is_actually_resolved_away(self) -> None:
+        # T-14.3's regression assertion against the REAL host binary, and the one the
+        # python-only fix could not make. `/usr/bin/git` is the shim inode on a stock
+        # macOS, so the git the pre-flight execs must not be a shim -- and must still be
+        # a working git, out of the already-admitted Class IMM root.
+        if not Path(review_isolation.SYSTEM_GIT).exists():
+            self.skipTest("no /usr/bin/git on this darwin host")
+        if not review_isolation.is_tool_shim(review_isolation.SYSTEM_GIT):
+            self.skipTest("/usr/bin/git is a real binary on this darwin host")
+        resolved = review_isolation._probe_git()
+        self.assertNotEqual(resolved, review_isolation.SYSTEM_GIT)
+        self.assertNotEqual(resolved, review_isolation.GIT_COMMAND)
+        self.assertFalse(review_isolation.is_tool_shim(resolved))
+        completed = subprocess.run(
+            [resolved, "--version"], capture_output=True, text=True, check=False
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("git version", completed.stdout)
+
+    @DARWIN_ONLY
+    def test_on_darwin_the_two_shimmed_tools_are_literally_the_same_file(self) -> None:
+        # The measurement the whole T-14.3 generalization rests on, asserted rather than
+        # quoted: python3 and git are one hardlinked binary, so "we fixed python" was
+        # never a statement about a python-specific problem.
+        for path in (review_isolation.SYSTEM_PYTHON, review_isolation.SYSTEM_GIT):
+            if not Path(path).exists() or not review_isolation.is_tool_shim(path):
+                self.skipTest(f"{path} is not the shim on this darwin host")
+        self.assertEqual(
+            os.stat(review_isolation.SYSTEM_PYTHON).st_ino,
+            os.stat(review_isolation.SYSTEM_GIT).st_ino,
+        )
+
 
 class ProbeLaunchWiringTests(unittest.TestCase):
     """T-14.2: the resolver is only worth anything if the LAUNCH LINE goes through it.
@@ -1917,6 +2029,9 @@ class ProbeLaunchWiringTests(unittest.TestCase):
     """
 
     SENTINEL = "/nonexistent/resolved/interpreter"
+    # Deliberately spells no substring of `git`: a sentinel containing "git" would make
+    # `assertNotIn("git --version", ...)` pass for the wrong reason.
+    SCM_SENTINEL = "/nonexistent/resolved/scm-tool"
 
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -1943,65 +2058,134 @@ class ProbeLaunchWiringTests(unittest.TestCase):
         self.assertNotIn(review_isolation.SYSTEM_PYTHON, self.commands[0])
 
     def test_the_preflight_launch_line_execs_the_resolved_interpreter(self) -> None:
-        session = self.base / "session"
-        (session / "review_root").mkdir(parents=True)
-        with mock.patch.object(
-            review_isolation, "_probe_python", return_value=self.SENTINEL
-        ), mock.patch.object(review_isolation.subprocess, "run", self.recorder()):
-            result = review_isolation.preflight_probe(session)
+        result = self.preflight_commands()
         self.assertTrue(result["ok"], result["log"])
         self.assertIn(self.SENTINEL, self.commands[0])
         self.assertNotIn(review_isolation.SYSTEM_PYTHON, self.commands[0])
 
-    # -- N-003: the residual git shim, bounded by the ordering it rests on --------
+    # -- T-14.3: the git check execs the RESOLVED git, not the shim ----------------
+    #
+    # N-003 previously argued the retained `git --version` was a bounded residual because
+    # `_probe_python()` resolves -- and can raise -- before any check is launched. That is
+    # true and it bounds the wrong case. It says what happens when python CANNOT resolve;
+    # the reported failure is the ordinary case where python resolves fine and the git
+    # check execs the shim entirely on its own. These tests pin the git CALL SITE, which
+    # is the thing an ordering argument can never speak for.
 
-    def test_the_python_check_is_launched_before_the_git_check(self) -> None:
-        """N-003's argument, in test form rather than in prose.
-
-        `preflight_probe()` deliberately keeps `git --version` running Apple's shim, so
-        that the check proves the AGENT's real git. That is only safe because the python
-        interpreter is resolved -- and can fail -- before any check is launched. The
-        ordering is load-bearing, and today it is load-bearing PROSE: a future edit that
-        moved the git check first, or that resolved the interpreter lazily inside the
-        loop, would silently falsify the argument and nothing would notice.
-        """
+    def preflight_commands(self) -> dict:
+        """Run `preflight_probe()` with BOTH resolvers substituted, recording every
+        command handed to `/bin/sh`. Both, not one: a test that leaves a resolver real
+        execs whatever the host happens to have and stops being portable evidence."""
         session = self.base / "session"
-        (session / "review_root").mkdir(parents=True)
+        (session / "review_root").mkdir(parents=True, exist_ok=True)
         with mock.patch.object(
             review_isolation, "_probe_python", return_value=self.SENTINEL
+        ), mock.patch.object(
+            review_isolation, "_probe_git", return_value=self.SCM_SENTINEL
         ), mock.patch.object(review_isolation.subprocess, "run", self.recorder()):
-            review_isolation.preflight_probe(session)
-        python_index = next(
-            index for index, command in enumerate(self.commands)
-            if self.SENTINEL in command
-        )
-        git_index = next(
-            index for index, command in enumerate(self.commands)
-            if "git --version" in command
-        )
-        self.assertLess(python_index, git_index)
+            return review_isolation.preflight_probe(session)
 
-    def test_an_unresolvable_interpreter_raises_before_git_version_can_run(self) -> None:
-        """The other half of N-003's argument: the raise beats the shim to the exec.
+    def launch_index(self, spelling: str) -> int:
+        """Where a spelling appears on the recorded launch lines. Absent is a FAILURE,
+        not a `StopIteration`: "the resolved git never ran" is the regression."""
+        for index, command in enumerate(self.commands):
+            if spelling in command:
+                return index
+        self.fail(f"{spelling} is on no recorded launch line: {self.commands}")
 
-        `_probe_python()` is evaluated while the check LIST is built, so an unresolvable
-        interpreter propagates out of `preflight_probe()` with zero processes launched --
-        in particular the `git --version` that still runs the shim never happens. If a
-        later edit deferred resolution into the loop, `git --version` would reach the shim
-        on a host where python could not resolve, which is exactly the host that reported
-        the installer dialog.
+    def test_the_preflight_git_check_execs_the_resolved_git(self) -> None:
+        """THE regression test for T-14.3, at the site that actually execs.
+
+        The previous run's lesson, applied: 17 tests asserted on the resolver while
+        nothing asserted the launch line, so re-spelling the raw constant at a call site
+        restored the defect with every test still green. Substituting `_probe_git()` and
+        reading the command handed to `/bin/sh` is what makes that impossible here --
+        putting the literal `git --version` back fails both halves of this assertion.
         """
+        self.preflight_commands()
+        self.assertTrue(
+            any(f"{self.SCM_SENTINEL} --version" in command
+                for command in self.commands),
+            f"the resolved git is not on the launch line: {self.commands}",
+        )
+        for command in self.commands:
+            self.assertNotIn("git --version", command)
+            self.assertNotIn(review_isolation.SYSTEM_GIT, command)
+
+    def test_the_python_check_is_launched_before_the_git_check(self) -> None:
+        """Ordering is still worth pinning -- it is just no longer the ARGUMENT.
+
+        Both spellings are resolved while the check LIST is built, so neither can reach a
+        shim; this only keeps the cheap `print(1)` first, so a broken launch line fails on
+        the check whose failure is easiest to read.
+        """
+        self.preflight_commands()
+        self.assertLess(
+            self.launch_index(self.SENTINEL), self.launch_index(self.SCM_SENTINEL)
+        )
+
+    def test_an_unresolvable_interpreter_raises_before_any_check_can_run(self) -> None:
+        """`_probe_python()` is evaluated while the check LIST is built, so an
+        unresolvable interpreter propagates out with zero processes launched."""
         session = self.base / "session"
         (session / "review_root").mkdir(parents=True)
         failure = review_isolation.IsolationError("no interpreter")
         with mock.patch.object(
             review_isolation, "_probe_python", side_effect=failure
+        ), mock.patch.object(
+            review_isolation, "_probe_git", return_value=self.SCM_SENTINEL
         ), mock.patch.object(review_isolation.subprocess, "run", self.recorder()):
             with self.assertRaises(review_isolation.IsolationError):
                 review_isolation.preflight_probe(session)
         self.assertEqual(
             self.commands, [], "no check may launch once the interpreter is unresolvable"
         )
+
+    def test_an_unresolvable_git_raises_before_any_check_can_run(self) -> None:
+        """The symmetric guarantee, which is the one that was missing.
+
+        G3: an unresolvable real git is a loud failure, never a silent fallback to a
+        spelling that execs the shim. And it fails BEFORE the launch line runs, so a host
+        that cannot resolve git never execs anything at all rather than getting three
+        checks in and then an installer dialog.
+        """
+        session = self.base / "session"
+        (session / "review_root").mkdir(parents=True)
+        failure = review_isolation.IsolationError("no git")
+        with mock.patch.object(
+            review_isolation, "_probe_python", return_value=self.SENTINEL
+        ), mock.patch.object(
+            review_isolation, "_probe_git", side_effect=failure
+        ), mock.patch.object(review_isolation.subprocess, "run", self.recorder()):
+            with self.assertRaises(review_isolation.IsolationError):
+                review_isolation.preflight_probe(session)
+        self.assertEqual(
+            self.commands, [], "no check may launch once git is unresolvable"
+        )
+
+    def test_no_fixed_preflight_check_execs_a_tool_shim(self) -> None:
+        """The SCOPE STATEMENT, enforced over the real list instead of asserted in prose.
+
+        Every fixed check's leading word is either a resolver's answer or an absolute path
+        to a real binary. `agent_command` is excluded here for the honest reason that it
+        is arbitrary operator input -- it is not passed, and the docstring says so.
+        """
+        self.preflight_commands()
+        launched = []
+        for command in self.commands:
+            tokens = shlex.split(command)
+            # `... exec <SANDBOX_EXEC> -f <profile> <inner command ...>`
+            sandbox = tokens.index(review_isolation.SANDBOX_EXEC)
+            launched.append(tokens[sandbox + 3])
+        self.assertEqual(len(launched), 4, self.commands)
+        for executable in launched:
+            if executable in (self.SENTINEL, self.SCM_SENTINEL):
+                continue
+            self.assertTrue(
+                executable.startswith("/"),
+                f"{executable!r} is a PATH lookup, which on darwin can land on the shim",
+            )
+            self.assertFalse(review_isolation.is_tool_shim(executable))
 
     # -- the delta admits nothing ---------------------------------------------------
 
