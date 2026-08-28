@@ -1,6 +1,6 @@
 # IMPLEMENTATION — run_1cc947088a44
 
-Phase: IMPLEMENTATION · Iteration 3 · Risk: high
+Phase: IMPLEMENTATION · Iteration 4 (report-only correction over the iteration-3 code) · Risk: high
 Branch: `agent/final-review-observability-evaluation` (Draft PR #20)
 Baseline HEAD: `fc4f4a8`
 
@@ -44,14 +44,28 @@ which file is selected. `isolate()` threads its own `readable["entries"]` in; th
 **defaults to admitting nothing**, so a caller that forgets it fails closed instead of
 searching ungated. What is *not* claimed is stated in the same places (§A8, §A9).
 
-34 tests are added net across the three iterations. Every property is pinned non-vacuously:
+**Iteration 4 corrects F-004, and it is a REPORT correction only — no production code and
+no test changed.** Two claims in this artifact were wider than their evidence. "Linux is
+unchanged in behaviour" was false as stated: the F-002 admission gate has no platform
+predicate, so an unadmitted PATH candidate is now refused on Linux too, where the bare `git`
+would previously have been used. §A4 now separates what is genuinely unchanged (no shim, so
+no substitution; an **admitted** candidate is executed exactly as selected) from what
+changed (unadmitted candidates fail closed, everywhere). And G7 "Linux CI green" was marked
+`MET` while this HEAD was unpushed; the branch has since been pushed, and G7 is now met by
+citing **Actions run 33187763926 on `headSha a02b1226774233984dc8520c3720959c74c955d9`** —
+3.11/3.12/3.13 all `success`, `Ran 1259 tests` / `OK (skipped=32)` each (§5b). The
+non-reproducing 3.12 error in §5 is updated with that matrix as *consistent-with* evidence
+and is **not** upgraded to a diagnosis; the disclosure stays.
+
+34 tests are added net across the first three iterations. Every property is pinned non-vacuously:
 putting the raw `git --version` back on the launch line fails 6 tests, reverting to
 fixed-path resolution fails 4, deleting the admission gate fails 4, and deleting the
 relative-component refusal fails 2 — demonstrated by actually breaking each and recording
 the output (§7).
 
 `STATUS: COMPLETE`
-`UNIT_TEST_STATUS: PASS`
+`UNIT_TEST_STATUS: PASS` — iteration 4 changed no production code and no test, so the gate
+is the iteration-3 evidence plus a re-confirmation that nothing drifted (§1–§4, §5b).
 
 ---
 
@@ -176,10 +190,26 @@ why it cannot be the mechanism.
    unresolvable shim raises out of `resolve_developer_tool()`. Neither falls back to a bare
    `git`, to the shim, or to a widened profile.
 
-**Linux is unchanged in behaviour.** Nothing on a Linux PATH is a shim, so step 3 returns
-the candidate step 2 selected — the same binary the bare name always reached. The check
-*string* is now the absolute path rather than the bare word; that is a spelling change that
-makes the selection explicit and auditable, and it executes the identical file.
+**What is unchanged on Linux — and what changed there too.** Those are two different
+statements, and iteration 3's report collapsed them into one sentence that was wider than
+the code. Separated:
+
+*Unchanged.* Nothing on a Linux PATH is a shim, so step 3 performs **no resolution and no
+substitution**: it returns the candidate step 2 selected. For a candidate that **is
+admitted**, the file executed is byte-for-byte the one the bare name always reached. Only
+the check *string* differs — that candidate's absolute path instead of the bare word —
+which makes the selection explicit and auditable while exec'ing the identical file.
+
+*Changed, on Linux exactly as on darwin.* Step 2 now **refuses** a candidate whose realpath
+falls outside the admitted readable set, and refuses a relative or empty PATH component
+before it. Where the bare `git` would previously just have been used, such a run now raises
+`IsolationError`. That is the F-002/F-003 correction behaving as designed, it fails closed,
+and it is **not darwin-only**: `select_launch_path_tool()` has no platform predicate, and
+the 22 `PreflightGitPathSelectionTests` that pin it carry no `@DARWIN_ONLY` marker and run
+on Linux CI. So the claim "Linux behaviour is unchanged" is **false as stated**; the true
+claim is the narrow one above. What green CI on 3.11/3.12/3.13 (§5b) shows is not that
+nothing changed, but that no test in this repository exercises an unadmitted candidate and
+expects it to be followed.
 
 §6 shows the check still returning `git version 2.50.1 (Apple Git-155)` from inside a real
 seatbelt session.
@@ -321,6 +351,9 @@ Three times on this branch the defect has been a claim wider than its evidence. 
 | …for a PATH with a relative or empty component before the tool | **no — refused**, deliberately, because this process cannot resolve it as the agent will | F-003 gate + 2 tests |
 | The candidate is never executed to classify it | **yes** | byte scan only; `ProbeLaunchWiringTests` |
 | Nothing outside the admitted readable set is opened by *this* resolution | **yes for the PATH-selected candidate**; the developer-directory target read by `resolve_developer_tool()` is out of this gate's scope and unchanged | stated in `resolve_probe_git()`'s docstring and §A6 |
+| Non-darwin behaviour is *unconditionally* unchanged | **no.** Unchanged for an **admitted** candidate — no substitution, same file, absolute spelling. An **unadmitted** candidate, or a relative/empty component, that previously would have been used now raises | §A4; F-002 gate + 4 tests; F-003 gate + 2 tests |
+| The behaviour change is confined to darwin | **no.** `select_launch_path_tool()` has no platform predicate; the admission refusal and the component refusal apply identically on Linux. Only the *shim substitution* in step 3 is darwin-specific **in effect**, because only darwin has a shim to substitute | §A4; the 22 `PreflightGitPathSelectionTests` carry no `@DARWIN_ONLY` marker and run on Linux CI (§5b) |
+| A caller that omits `admitted_roots` still resolves | **no — it admits nothing and refuses everything** | `test_the_default_admits_nothing_so_an_unthreaded_call_reads_nothing` |
 
 ### A6. What I did NOT verify
 
@@ -486,6 +519,32 @@ at +24). The only two failures are the **expected, pre-existing**
 another run and is digest-bound. `skipped=6` is unchanged from iteration 2 — none of the ten
 new tests is a skip on darwin either.
 
+**Iteration 4 re-confirmation (no-drift check).** Because iteration 4 changes no code, its
+gate is the evidence above plus a re-run proving nothing moved. Re-run on this tree:
+
+```
+$ python3 -m unittest discover -s scripts -p 'test_*.py'
+Ran 1259 tests in 294.067s
+FAILED (failures=2, skipped=6)
+
+$ python3 scripts/validate_skills.py
+Skill validation PASSED (463 checks)
+
+$ python3 scripts/verify_package.py
+Package verification PASSED (109 source files)
+
+$ git diff --check
+(no output)
+
+$ git diff --stat HEAD -- scripts/
+(no output — the production and test files are byte-identical to the commit the
+ iteration-3 Reviewer inspected, a02b1226774233984dc8520c3720959c74c955d9)
+```
+
+Same 1259, same two failures, same `skipped=6`, same 463 and 109. The two failures are the
+whitespace pair: their output is the trailing-whitespace listing over `run_a29ac78075a9`'s
+retained review artifact, which belongs to another run and is digest-bound (above).
+
 ### 2. `validate_skills.py`
 
 ```
@@ -571,11 +630,29 @@ Stated honestly: I **did not capture that error's traceback** — the loop piped
 one. What I did measure is that a clean 3.12 full run and the class in isolation both pass,
 and that the test touches nothing this delta changes.
 
-The default-**root** docker invocation was also re-run for continuity with §5a: all three
+**Update (iteration 4), with what is now known and no more than that.** The full CI matrix
+has since run on this exact commit (§5b): `validate (3.11)`, `validate (3.12)` and
+`validate (3.13)` all succeeded, each reporting `Ran 1259 tests` / `OK (skipped=32)` — no
+failures, no errors, and in particular no error in `SessionLayoutTests` on 3.12. Together
+with the clean solo re-runs above, that is evidence **consistent with** concurrency-induced
+interference on the live-mounted working tree rather than a defect in this delta. It is
+**not** a proof of cause, and I am not upgrading it to one: I never captured the traceback,
+a green re-run cannot diagnose a non-reproducing error, and **I still cannot explain what
+that error was**. The disclosure stays for the next reader.
+
+The default-**root** docker invocation was also run for continuity with §5a: all three
 versions reported `Ran 1249 tests … FAILED (failures=8, errors=1, skipped=28)` — the same
 **nine** pre-existing results §5a root-caused. Their names were re-listed on 3.11 and match
 exactly: seven `ImmutabilityProofTests` (root ignores the mode bits the proof relies on)
 plus the whitespace pair. So the delta is `+24 tests, +0 failures` under both invocations.
+
+**Narrowed in iteration 4.** Those figures — `1249` and `+24` — are **iteration-2**
+arithmetic (`1225 + 24`), and I cannot attest that the root invocation was re-measured after
+iteration 3 added its 10 tests; on this tree the count is `1259` / `+34`. So read this
+paragraph as: under the root invocation *as last measured*, the failure set was exactly the
+nine pre-existing root-caused results and none of them was mine. The number this report
+relies on for the iteration-3 tree is the **non-root** `1259` above, and remote CI (§5b),
+which is also non-root, agrees at `1259`.
 
 #### 5a. A correction to my own first Docker run, recorded because it matters
 
@@ -606,6 +683,55 @@ $ git stash pop
 root-caused, none of them mine** — and the delta my change contributes is `+13 tests, +0
 failures`. Re-running non-root (which is what GitHub Actions does) leaves only the expected
 whitespace pair, as shown above. The numbers reported in §5 are the non-root ones.
+
+#### 5b. Remote Linux CI, on this exact commit — the evidence G7 previously lacked
+
+Iteration 3 marked G7 `MET` while this HEAD was unpushed, so no Actions run existed for it;
+the Reviewer was right to call that a claim without evidence (F-004). The branch has since
+been pushed, and CI has now run **on `a02b122` itself**. Verified here rather than assumed:
+
+```
+$ gh run list --branch agent/final-review-observability-evaluation --limit 3
+completed  success  Build Final Review observability and evaluation foundation  CI  \
+    agent/final-review-observability-evaluation  pull_request  33187763926  2m4s  2026-08-28T15:59:02Z
+completed  success  …                                                        33099895008  …
+completed  success  …                                                        33099629674  …
+
+$ gh run view 33187763926 --json headSha,jobs \
+    --jq '{sha: .headSha, jobs: [.jobs[] | {name, conclusion}]}'
+{"jobs":[{"conclusion":"success","name":"validate (3.12)"},
+         {"conclusion":"success","name":"validate (3.11)"},
+         {"conclusion":"success","name":"validate (3.13)"}],
+ "sha":"a02b1226774233984dc8520c3720959c74c955d9"}
+
+$ gh run view 33187763926 --log | grep -E "Ran [0-9]+ tests|OK \(|FAILED \("
+validate (3.12)  Run deterministic tests  Ran 1259 tests in 108.920s
+validate (3.12)  Run deterministic tests  OK (skipped=32)
+validate (3.11)  Run deterministic tests  Ran 1259 tests in 110.378s
+validate (3.11)  Run deterministic tests  OK (skipped=32)
+validate (3.13)  Run deterministic tests  Ran 1259 tests in 111.298s
+validate (3.13)  Run deterministic tests  OK (skipped=32)
+```
+
+**What this does and does not establish.**
+
+- It **does** establish, for the reviewed commit and no other: `headSha` is
+  `a02b1226774233984dc8520c3720959c74c955d9`, which is this HEAD; all three matrix jobs
+  concluded `success`; each ran the same **1259** tests as the local macOS run; and each
+  ended `OK` — zero failures, zero errors. `OK (skipped=32)`, not `FAILED (…)`.
+- It **does not** establish that Linux behaviour is unchanged by this delta. It cannot:
+  green CI means no existing test exercises the newly-refused case, not that the case does
+  not exist. §A4 and §A9 state what actually changed on Linux.
+- The `skipped=32` here versus `skipped=28` in §5's local Docker runs is **fully accounted
+  for by four tests, none of them mine**: the four
+  `RetainedReportWhitespaceExemptionTests` methods gated by `_require_git_range()`, which
+  calls `skipTest` when the whitespace gate's base commit is unreachable — exactly the case
+  under `actions/checkout@v4`'s `--depth=1` checkout. `28 + 4 = 32`. Two of those four are
+  the pair that *fails* on a full local checkout (§1, §5); the other two pass locally. I
+  reached this by reading the skip conditions in `scripts/test_run_logging.py` and checking
+  the arithmetic — **not** by reading a per-skip listing, which `unittest` does not emit
+  without `-v`, so treat it as a source-level derivation rather than a direct measurement.
+  What is directly measured either way is that the count is a skip count on a green run.
 
 ### 6. A real macOS seatbelt `isolate()` session
 
@@ -1003,14 +1129,24 @@ behaviourally by `PreflightGitPathSelectionTests` below, which is strictly stron
 
 ### Portability
 
-**22 of 24 are portable** and run in full on Linux CI: the shim, the developer
-directories, the PATH candidate gits and the real tool behind them are all synthesised in a
-temporary directory, and the launch-line tests replace `subprocess.run` with a recorder so
-no shim, no sandbox and no real exec is involved. **All 12 `PreflightGitPathSelectionTests`
-are portable**, which is not merely asserted: §5's Linux runs report `skipped=28`, exactly
-the iteration-1 number, so none of the 12 turned into a skip. Only the 2 `@DARWIN_ONLY`
-tests skip off darwin, and they are not smoke tests — one execs the resolved git and asserts
-its version string.
+**34 of the 36 added tests are portable** and run in full on Linux CI (36 added, 2 removed,
+`+34` net — `git diff fc4f4a8..HEAD -- scripts/test_review_isolation.py` counts them): the
+shim, the developer directories, the PATH candidate gits and the real tool behind them are
+all synthesised in a temporary directory, and the launch-line tests replace `subprocess.run`
+with a recorder so no shim, no sandbox and no real exec is involved. **All 22
+`PreflightGitPathSelectionTests` are portable** — the class contains no `@DARWIN_ONLY`
+marker — and that is corroborated mechanically rather than asserted: §5a's baseline root run
+reports `skipped=26` and §5's delta runs report `skipped=28`, so **exactly 2** of the 36
+added tests skip on Linux, which are exactly the 2 that carry the marker. Neither is a smoke
+test — one execs the resolved git and asserts its version string.
+
+(The earlier figures "22 of 24" and "all 12" in this paragraph were iteration-2 counts left
+un-updated when iteration 3 added 10 more tests. Corrected above; no test changed.)
+
+Remote CI on this commit reports `skipped=32` rather than 28 (§5b). Those 4 extra skips are
+`RetainedReportWhitespaceExemptionTests` methods that skip on a `--depth=1` checkout, not
+tests of this delta; the reconciliation, and its status as a source-level derivation rather
+than a measured per-skip listing, is in §5b.
 
 ### Existing tests retargeted; one replaced, with the reason
 
@@ -1031,7 +1167,8 @@ Iteration 2:
   asserted `resolve_probe_git()` returns the bare `git`, which is precisely the spelling the
   F-001 fix must not emit; keeping it would have pinned the defect. The property it stood
   for is PATH fidelity, and that is now covered behaviourally and much more strongly by the
-  12 `PreflightGitPathSelectionTests`, including the end-to-end launch-line assertion.
+  12 `PreflightGitPathSelectionTests` as of iteration 2 (22 after iteration 3), including the
+  end-to-end launch-line assertion.
 - `test_git_resolution_fails_closed_and_never_falls_back_to_the_shim` and
   `test_a_developer_dir_that_only_offers_another_git_shim_is_refused` — same guarantees,
   now driven through a PATH whose only `git` is the shim, because selection is how the
@@ -1087,8 +1224,8 @@ ImmutabilityProof  Ran 14 tests in   0.520s OK   (the recursive proof, untouched
 | **G4** do not weaken readable-set or answer-key isolation | **MET (iteration 3)** | §6 — same 8 IMM roots, same 3 session USR roots, NEG-0..NEG-8 PASS; `test_resolving_an_interpreter_admits_no_new_immutable_root` pins both lists by value. Iteration 2 *weakened* it in one direction the profile could not catch — an out-of-sandbox read of an unadmitted PATH candidate (F-002) — and that is now gated **before** the read, with the gate defaulting to admitting nothing |
 | **G5** do not reinstall the Command Line Tools | **MET** | nothing was installed; resolution is a byte scan plus a path join |
 | **G6** regression test at the ACTUAL EXECUTING CALL SITE | **MET** | §7 — three separate mutations, 6 / 4 / 8 failures, with the offending launch line quoted in each failure message |
-| **G7** Linux CI green; all isolation/security regressions preserved | **MET** | §5 (3.11/3.12/3.13, 1249 each, only the known local-only pair), §"Also verified green" |
-| Non-darwin behaviour unchanged | **MET** | nothing on a Linux PATH is a shim, so selection alone is the whole answer and the **same binary** the bare `git` always reached is executed — `test_a_real_path_selected_git_is_used_exactly_as_selected`. The check *string* is now that binary's absolute path rather than the bare word; that is a spelling change, and §5 shows all three Linux versions unchanged in outcome |
+| **G7** Linux CI green; all isolation/security regressions preserved | **MET — by remote CI on this exact commit** | GitHub Actions run **33187763926**, `headSha a02b1226774233984dc8520c3720959c74c955d9` — this HEAD. `validate (3.11)` success, `validate (3.12)` success, `validate (3.13)` success; each job's log records `Ran 1259 tests` then `OK (skipped=32)`: zero failures, zero errors. Commands, raw output and the skip-count reconciliation in **§5b**; local Docker corroboration (1259 each) in §5; named regression re-runs in §"Also verified green" — those were recorded against the **iteration-2** delta and are labelled as such there; the iteration-3/4 coverage of the same suites is the 1259-test run itself, locally and on CI. *Bound:* green CI shows no existing test exercises the newly-refused unadmitted-candidate case — it is not evidence that Linux behaviour is unchanged (§A4) |
+| Non-darwin behaviour unchanged | **MET ONLY AS NARROWED — see §A4** | **Unchanged part:** nothing on a Linux PATH is a shim, so no resolution or substitution occurs; for an **admitted** candidate, selection alone is the whole answer and the **same binary** the bare `git` always reached is executed — `test_a_real_path_selected_git_is_used_exactly_as_selected`. Only the check *string* becomes that binary's absolute path instead of the bare word. **Changed part, stated plainly:** the F-002 admission gate and the F-003 relative/empty-component refusal have **no platform predicate**, so on Linux too a candidate whose realpath is outside the admitted readable set now raises where the bare `git` would previously have been used. That is intended and fail-closed, but it means this requirement is **not** met unconditionally, and iteration 3's unqualified "unchanged" was wrong. §5b's green CI on 3.11/3.12/3.13 shows only that no existing test exercises the refused case |
 | Never exec an xcselect-linked binary to resolve | **MET** | unchanged `developer_dir_candidates()`; `test_no_xcselect_linked_binary_is_executed_to_resolve_the_developer_dir` still passes |
 | Consider ALL pre-flight checks; honest scope statement | **MET** | §A5 table + `preflight_probe()` docstring + `test_no_fixed_preflight_check_execs_a_tool_shim` |
 | Do not trigger the CLT installer GUI | **HELD** | no shim was executed at any point; every classification is a marker scan + `os.stat`. `/usr/bin/dyld_info` is itself the shim inode, so `dyld_info` was deliberately NOT run (§A6) |
@@ -1103,7 +1240,7 @@ ImmutabilityProof  Ran 14 tests in   0.520s OK   (the recursive proof, untouched
 | **My own overclaim** | `resolve_probe_git()`'s iteration-1 docstring, and §A4, asserted the resolved path "is the same real git the agent's own `git` would have ended up running." That holds **only when PATH resolution lands on `/usr/bin/git`** and was written without the condition. Both the docstring and §A4 now state the two properties and when each holds. |
 | **Fix** | `launch_path()` becomes the single definition of the agent's effective PATH and feeds *both* `wrap_command()`'s `PATH=` assignment and `resolve_probe_git()`'s search. Selection by `shutil.which()` (the shell's own rule), then byte-classification: real → verified as-is, shim → `resolve_developer_tool()`, otherwise raise. |
 | **Fail closed** | No candidate on PATH raises and names the PATH; an unresolvable shim raises out of `resolve_developer_tool()`. No bare-`git` fallback, no shim fallback, no profile widening. |
-| **Linux** | Unchanged binary; `test_a_real_path_selected_git_is_used_exactly_as_selected` and §5's three versions. |
+| **Linux** | For an **admitted** candidate: unchanged binary, no substitution — `test_a_real_path_selected_git_is_used_exactly_as_selected`, plus §5's three Docker versions and §5b's three CI jobs. For an **unadmitted** candidate: now refused, on Linux as everywhere (§A4, F-002). Not an unconditional "Linux is unchanged". |
 | **Security** | ~~Only already-admitted `agent_path` entries are searched~~ — **this sentence was false when I wrote it, and is F-002.** `assert_agent_path_admitted()` gates only the explicit `--agent-path` sequence; the inherited-PATH branch was ungated and opened what it found. It is true now, and true because of a gate rather than because of an assumption: see F-002 below. `NEVER_ADMITTED`, `DEFAULT_IMM_CANDIDATES`, the immutability proof and the NEG-5 scan remain byte-for-byte untouched (§6, §A5). |
 | **Regression coverage** | The Reviewer's explicit ask: `PreflightGitPathSelectionTests` — 12 portable tests, including an admitted `agent_path` directory holding a **distinct** git candidate asserted to be the one checked, the inherited-PATH half, and an end-to-end `preflight_probe()` run with the real resolver. Non-vacuity in §7. |
 
@@ -1132,11 +1269,29 @@ ImmutabilityProof  Ran 14 tests in   0.520s OK   (the recursive proof, untouched
 | **The positive claim, now true** | Every component the selection consults is absolute, so the answer is cwd-independent — `test_the_selection_does_not_depend_on_this_processs_directory` runs the same resolution from both directories and requires the same answer. |
 | **Claim narrowed** | §A9 states, line by line, what "PATH fidelity" now claims and where it stops. `resolve_probe_git()`'s docstring carries the same limits in the source. |
 
-### On N-001 (non-blocking, remote CI)
+### On N-001 (non-blocking, remote CI) — now CLOSED
 
-Correct and still outstanding: HEAD is local-only, so the branch's green Actions runs do not
-cover this delta. I do not push — the Coordinator does. Linux evidence here is reproduced
-locally in Docker on 3.11/3.12/3.13 and is offered as exactly that, not as CI.
+When iteration 3 was written this was correct and outstanding: HEAD was local-only, so the
+branch's green Actions runs covered `fc4f4a8`, not this delta, and the Linux evidence on
+offer was Docker reproduction rather than CI. Marking G7 `MET` anyway was the overclaim the
+Reviewer raised as F-004(b).
+
+It is closed now, and by evidence rather than by narrowing: the Coordinator pushed the
+branch, and **GitHub Actions run 33187763926 ran on `a02b1226774233984dc8520c3720959c74c955d9`
+— this commit** — with `validate (3.11)`, `validate (3.12)` and `validate (3.13)` all
+`success`, each `Ran 1259 tests` / `OK (skipped=32)`. Confirmed from `gh` in §5b rather than
+taken on report. I still do not push; the Coordinator does.
+
+### On F-004 (G2, MAJOR, BLOCKING) — RESOLVED, in the report only
+
+| | |
+| --- | --- |
+| **Finding** | The report's Linux and CI claims were wider than their evidence: "Linux is unchanged in behaviour" contradicted the deliberately cross-platform admission rule, and G7 "Linux CI green" was marked `MET` while HEAD was unpushed and no Actions run existed for it. |
+| **Accepted** | Yes, both parts, without qualification. The admission gate has no platform predicate — I wrote it that way on purpose for F-002 — so "Linux unchanged" was false as stated, and my own N-001 disposition three sections later said the CI evidence did not exist, which made the report internally inconsistent. |
+| **Fix (a)** | §A4 now separates *unchanged* (no shim, so no resolution or substitution; an **admitted** candidate is executed exactly as selected, same file, absolute spelling) from *changed* (an unadmitted candidate, or a relative/empty component, now raises — on Linux as on darwin). §A9 gains two rows answering "is non-darwin behaviour unconditionally unchanged?" and "is the change confined to darwin?" with **no**. The G7 and "Non-darwin behaviour unchanged" rows carry the same split, the latter re-marked **MET ONLY AS NARROWED**. |
+| **Fix (b)** | G7 is now `MET` by citation, not assertion: run **33187763926**, `headSha a02b122…`, three green matrix jobs, `Ran 1259 tests` / `OK (skipped=32)` each, verified with the three `gh` commands recorded verbatim in §5b. |
+| **Also** | §5's non-reproducing 3.12 `SessionLayoutTests` error is updated with the green matrix on this commit as evidence *consistent with* concurrency-induced interference — explicitly **not** upgraded to a diagnosis, and the disclosure that I never captured the traceback is kept. Stale iteration-2 test counts in §"Portability" ("22 of 24", "all 12") are corrected to 36 added / 34 portable / 22 in `PreflightGitPathSelectionTests`, and the stale `1249` figures in the G7 and G3 rows to `1259`. |
+| **Scope** | **No production code and no test changed in this iteration.** `git diff fc4f4a8..HEAD -- scripts/` is byte-identical to what the iteration-3 Reviewer inspected and passed; the only file this iteration touches is this artifact. |
 
 ### On N-003 specifically
 
@@ -1161,9 +1316,9 @@ decision_priority: explicit requirements > current phase contract > minimal gene
 | --- | --- |
 | G1 explicit requirement violation | none — every G1..G7 met, see table above |
 | G2 result does not work | no — real seatbelt session, S1/S2/S3 + NEG-0..NEG-8 PASS, pre-flight exec'ing the PATH-correct real git |
-| G3 severe regression | none — 1249 minus the 2 known pre-existing; Linux identical on 3.11/3.12/3.13 |
+| G3 severe regression | none — locally 1259 with only the 2 known pre-existing macOS-only `RetainedReportWhitespaceExemptionTests` failures; remote CI on this exact commit is `Ran 1259 tests` / `OK (skipped=32)` on 3.11, 3.12 and 3.13 with zero failures and zero errors (run 33187763926, §5b) |
 | G4 data loss / security / irreversible | none — admission lists unmoved, no profile widening, nothing installed, nothing pushed. The one G4 defect this branch did have (F-002, my own) is fixed by refusing more, never by admitting more; the PATH-selected candidate is now admission-checked before it is opened, and the one read outside that gate's scope is named in §A6/§A9 |
-| G5 missing evidence | none — every claim above has its command output; what I did not verify is named in §A6; what the PATH-fidelity claim does and does not cover is enumerated in §A9; the one-off 3.12 `ERROR` and the fact that I did not capture its traceback are recorded in §5 rather than dropped |
+| G5 missing evidence | none — every claim above has its command output; what I did not verify is named in §A6; what the PATH-fidelity claim does and does not cover is enumerated in §A9; the one-off 3.12 `ERROR` and the fact that I did not capture its traceback are recorded in §5 rather than dropped, and its §5 update adds the green matrix on this commit as *consistent-with* evidence without claiming a diagnosis |
 
 ---
 
