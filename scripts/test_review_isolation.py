@@ -16,10 +16,12 @@ from __future__ import annotations
 
 import ast
 import builtins
+import contextlib
 import dataclasses
 import errno
 import hashlib
 import inspect
+import io
 import json
 import os
 import shlex
@@ -2519,21 +2521,44 @@ class PreflightGitPathSelectionTests(unittest.TestCase):
     # -- F-002: selection may not read what the readable set never admitted ---------
 
     def opened_paths(self):
-        """Every path `open()` is called with, recorded while still really opening.
+        """Every path a READ is opened with, recorded while still really opening.
 
         The property under test is "the file is not OPENED", and asserting it through
         `is_tool_shim` alone would only pin the current spelling of the read. This pins
         the read itself, so a future edit that opens the candidate some other way before
         the admission gate fails here too.
+
+        THREE doors, not one, and the difference is measured rather than assumed.
+        `builtins.open` is what `is_tool_shim()` happens to use today; patching it alone
+        does NOT observe `pathlib.Path.read_bytes()`, which reaches the same function
+        through `io.open` -- a separate name binding that a `builtins` patch leaves
+        untouched -- nor a raw `os.open()`. An edit that read the candidate either of
+        those ways, before the admission gate, would have been invisible here. All three
+        are recorded, so the assertion is about the read and not about one spelling.
         """
         opened: list[str] = []
-        real_open = builtins.open
+        real_open, real_io_open, real_os_open = builtins.open, io.open, os.open
 
         def recording_open(file, *args, **kwargs):
             opened.append(str(file))
             return real_open(file, *args, **kwargs)
 
-        return opened, mock.patch.object(builtins, "open", recording_open)
+        def recording_io_open(file, *args, **kwargs):
+            opened.append(str(file))
+            return real_io_open(file, *args, **kwargs)
+
+        def recording_os_open(path, *args, **kwargs):
+            opened.append(str(path))
+            return real_os_open(path, *args, **kwargs)
+
+        @contextlib.contextmanager
+        def recorder():
+            with mock.patch.object(builtins, "open", recording_open), \
+                    mock.patch.object(io, "open", recording_io_open), \
+                    mock.patch.object(os, "open", recording_os_open):
+                yield
+
+        return opened, recorder()
 
     def test_an_unadmitted_inherited_candidate_is_refused_without_being_opened(
         self,
@@ -2647,6 +2672,56 @@ class PreflightGitPathSelectionTests(unittest.TestCase):
         self.assertIn(
             'paths = [entry["path"] for entry in readable["entries"]]', source
         )
+
+    def test_isolate_really_hands_the_preflight_the_set_it_computed(self) -> None:
+        """The same wiring, BEHAVIOURALLY -- because the test above is a source pin.
+
+        `test_isolate_passes_the_readable_set_it_computed_to_the_preflight` matches two
+        substrings in `inspect.getsource(isolate)`, and that is the shape this branch was
+        bitten by once already: green source pins over an unasserted runtime value. It
+        fails on a rename that fixes nothing, and it PASSES on a defect that widens the
+        list -- `paths = [...] + ["/"]` still contains the pinned substring.
+
+        So `preflight_probe()` is replaced by a recorder that captures the keyword it was
+        actually called with and then raises, before any process is launched, and the
+        captured value is compared with the roots `isolate()` itself computed.
+        `imm_candidates=()` is what keeps this PORTABLE: no host root is proven, so the
+        readable set is exactly the session's own three Class USR roots on every
+        platform, and `sandbox-exec` need only EXIST -- the recorder raises before
+        anything could execute it. Nothing here admits, scans or reads outside the
+        temporary session.
+        """
+        captured: dict = {}
+
+        def recorder(session, agent_command=None, *, agent_path=(), admitted_roots=()):
+            captured["session"] = session
+            captured["admitted_roots"] = list(admitted_roots)
+            raise review_isolation.IsolationError("recorded; nothing was launched")
+
+        stand_in = self.base / "sandbox-exec-stand-in"
+        stand_in.write_text("", encoding="utf-8")
+        original = review_isolation.SANDBOX_EXEC
+        review_isolation.SANDBOX_EXEC = str(stand_in)
+        try:
+            with mock.patch.object(review_isolation, "preflight_probe", recorder):
+                with self.assertRaises(review_isolation.IsolationError):
+                    review_isolation.isolate(
+                        "run_t", fixture=FIXTURE, session_base=self.base,
+                        enforcement="seatbelt", plant=False, imm_candidates=(),
+                    )
+        finally:
+            review_isolation.SANDBOX_EXEC = original
+
+        session = captured["session"]
+        expected = [
+            str(review_isolation._realpath(session / name))
+            for name in ("review_root", "tmp", "home")
+        ]
+        self.assertEqual(captured["admitted_roots"], expected)
+        # An empty list would satisfy "is a subset of what was computed" while being the
+        # F-002-adjacent defect in the other direction: a pre-flight told nothing was
+        # admitted refuses every candidate. The set has to be the computed one exactly.
+        self.assertNotEqual(captured["admitted_roots"], [])
 
     # -- F-003: the lookup may not depend on THIS process's directory ---------------
 

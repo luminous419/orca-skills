@@ -375,7 +375,7 @@ Stated explicitly, because accuracy is part of the deliverable.
   temporary directory lives under `/private/var`, which is in `NEVER_ADMITTED`. Admitting it
   would mean widening the profile — the one thing the dispatch forbids and the whole point
   of the gate. The `--agent-path` selection behaviour is therefore proven by
-  `PreflightGitPathSelectionTests` (12 portable tests, including an end-to-end
+  `PreflightGitPathSelectionTests` (22 portable tests, including an end-to-end
   `preflight_probe()` run against the recorded launch line), and the real seatbelt session
   in §6 exercises the **inherited-PATH** branch of the same code. I state this rather than
   implying the real session covered both branches.
@@ -1317,7 +1317,7 @@ decision_priority: explicit requirements > current phase contract > minimal gene
 | G1 explicit requirement violation | none — every G1..G7 met, see table above |
 | G2 result does not work | no — real seatbelt session, S1/S2/S3 + NEG-0..NEG-8 PASS, pre-flight exec'ing the PATH-correct real git |
 | G3 severe regression | none — locally 1259 with only the 2 known pre-existing macOS-only `RetainedReportWhitespaceExemptionTests` failures; remote CI on this exact commit is `Ran 1259 tests` / `OK (skipped=32)` on 3.11, 3.12 and 3.13 with zero failures and zero errors (run 33187763926, §5b) |
-| G4 data loss / security / irreversible | none — admission lists unmoved, no profile widening, nothing installed, nothing pushed. The one G4 defect this branch did have (F-002, my own) is fixed by refusing more, never by admitting more; the PATH-selected candidate is now admission-checked before it is opened, and the one read outside that gate's scope is named in §A6/§A9 |
+| G4 data loss / security / irreversible | none — admission lists unmoved, no profile widening, nothing installed; the Worker did not push (the Coordinator pushed `a02b122`, §5b). The one G4 defect this branch did have (F-002, my own) is fixed by refusing more, never by admitting more; the PATH-selected candidate is now admission-checked before it is opened, and the one read outside that gate's scope is named in §A6/§A9 |
 | G5 missing evidence | none — every claim above has its command output; what I did not verify is named in §A6; what the PATH-fidelity claim does and does not cover is enumerated in §A9; the one-off 3.12 `ERROR` and the fact that I did not capture its traceback are recorded in §5 rather than dropped, and its §5 update adds the green matrix on this commit as *consistent-with* evidence without claiming a diagnosis |
 
 ---
