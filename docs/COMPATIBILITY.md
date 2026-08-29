@@ -1,6 +1,6 @@
 # Compatibility and Verification Status
 
-The repository version is read from [`VERSION`](VERSION). This document distinguishes
+The repository version is read from [`VERSION`](../VERSION). This document distinguishes
 supported deterministic tooling from runtime configurations that have only been verified
 in a specific environment.
 
@@ -72,7 +72,11 @@ close it, and the terminal role gate is what keeps the coordinator's own session
 tabs, and adopted terminals permanently out of the close path. Residual terminals are
 still cleaned up only through the installed version-matched guides and runtime receipts;
 arbitrary process kills or undocumented cleanup remain unacceptable. Detailed evidence is
-in [`STEP5_REAL_GLM_GEMMA_SMOKE_REPORT.md`](STEP5_REAL_GLM_GEMMA_SMOKE_REPORT.md).
+in the dated
+[`GLM/Gemma smoke report`](validation/historical/GLM_GEMMA_SMOKE_REPORT_2026-08-20.md).
+Use the separate
+[`GLM/Gemma smoke procedure`](validation/GLM_GEMMA_SMOKE_PROCEDURE.md) for a new
+point verification; do not rewrite the historical report.
 
 ## Agent Profile
 

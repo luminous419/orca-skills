@@ -3,7 +3,9 @@
 Reusable Orca skills for structured software-development workflows.
 
 The current pre-1.0 version is defined only in [`VERSION`](VERSION). Compatibility
-and verification status are maintained in [`COMPATIBILITY.md`](COMPATIBILITY.md).
+and verification status are maintained in
+[`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md). Project direction, milestones,
+and priority principles are maintained in [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
 ## Available Skills
 
@@ -641,6 +643,7 @@ The validator uses only the Python standard library and validates both
 - required phase templates and review policies
 - phase routing against the files on disk
 - identical shared `templates/` and `reviews/` content across both skills
+- valid relative links across maintained repository documentation
 - absence of user-specific absolute paths
 - required error codes, test gates, and the `max-iterations` range
 - the orchestration-only lifecycle accounting contract block, including the never-close and close-eligible terminal role sets
@@ -722,7 +725,8 @@ CI intentionally does not run Orca Desktop/runtime integration or real
 `claude-glm`/`claude-gemma` agents. Orca integration remains the opt-in local command
 above. Real GLM/Gemma smoke testing is **VERIFIED in the tested company environment on
 Orca 1.4.178-rc.2**; see the
-[`Step 5 report`](STEP5_REAL_GLM_GEMMA_SMOKE_REPORT.md). This is a point verification,
+[`historical GLM/Gemma report`](docs/validation/historical/GLM_GEMMA_SMOKE_REPORT_2026-08-20.md).
+This is a point verification,
 not a claim of compatibility across an Orca version range. A stable production-ready
 release is not yet claimed because the license decision remains open.
 
@@ -733,8 +737,8 @@ python3 scripts/build_release.py
 python3 scripts/verify_package.py --archive "dist/orca-skills-$(tr -d '\n' < VERSION).tar.gz"
 ```
 
-See [`RELEASING.md`](RELEASING.md) for SemVer rules and the release checklist.
-No license has been selected; [`LICENSE-DECISION.md`](LICENSE-DECISION.md) records the
+See [`docs/RELEASING.md`](docs/RELEASING.md) for SemVer rules and the release checklist.
+No license has been selected; [`docs/LICENSE-DECISION.md`](docs/LICENSE-DECISION.md) records the
 required owner decision rather than inventing a grant.
 
 ## Execution-layer Difference

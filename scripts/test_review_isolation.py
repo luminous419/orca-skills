@@ -166,7 +166,7 @@ class SessionLayoutTests(_IsolationTestCase):
 
     def test_t83_a_symlink_in_the_policy_copy_list_is_refused(self) -> None:
         link = REPO_ROOT / "artifacts" / "_isolation_policy_link.md"
-        link.symlink_to(REPO_ROOT / "COMPATIBILITY.md")
+        link.symlink_to(REPO_ROOT / "docs" / "COMPATIBILITY.md")
         try:
             with self.assertRaises(review_isolation.IsolationError):
                 review_isolation.build_session(

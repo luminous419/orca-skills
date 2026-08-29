@@ -41,7 +41,7 @@ Do not put arguments, paths, whitespace, or shell metacharacters in `worker=` or
 `claude;echo` are rejected rather than executed.
 
 Repository validation and packaging support CPython 3.11, 3.12, and 3.13 and use
-only the standard library. Read [`COMPATIBILITY.md`](COMPATIBILITY.md) before treating
+only the standard library. Read [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) before treating
 a runtime configuration as verified.
 
 The orchestration variant additionally requires:
@@ -75,7 +75,8 @@ The validator checks both `orca-worker-reviewer-loop` and
 `orca-worker-reviewer-orchestration`. Its purpose is to catch malformed
 `SKILL.md` frontmatter, missing or incorrect phase routing, drift between the
 shared templates/review policies, user-specific absolute paths, and missing
-workflow policy gates before the skill directories are copied into place.
+workflow policy gates before the skill directories are copied into place. It
+also rejects stale relative links in the maintained repository documentation.
 
 The validator uses only the Python standard library. A successful run ends with
 `Skill validation PASSED` and exits with status `0`. The accompanying regression
@@ -87,8 +88,8 @@ subprocesses in disposable workspaces; it never invokes a real LLM or Orca runti
 The default suite and CI do not start Orca Desktop or real agents. The Step 5
 `claude-glm`/`claude-gemma` smoke test is **VERIFIED in the tested company environment
 on Orca 1.4.178-rc.2**. See
-[`STEP5_REAL_GLM_GEMMA_SMOKE_REPORT.md`](STEP5_REAL_GLM_GEMMA_SMOKE_REPORT.md) for the
-evidence and [`COMPATIBILITY.md`](COMPATIBILITY.md) for its deliberately narrow scope.
+[`historical GLM/Gemma smoke report`](docs/validation/historical/GLM_GEMMA_SMOKE_REPORT_2026-08-20.md)
+for the evidence and [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) for its deliberately narrow scope.
 Stable production readiness is not yet claimed because the license decision remains open.
 
 The optional real-Orca integration suite is separate so Orca availability never

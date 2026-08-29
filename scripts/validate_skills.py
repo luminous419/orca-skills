@@ -6,6 +6,7 @@ from __future__ import annotations
 import re
 import sys
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 import run_logging
 from skill_policy import PolicyContractError, load_policy_contract, load_risk_contract
@@ -73,11 +74,15 @@ REPOSITORY_DOCS = (
     "README.md",
     "INSTALL.md",
     "CHANGELOG.md",
-    "COMPATIBILITY.md",
-    "RELEASING.md",
-    "LICENSE-DECISION.md",
-    "STEP5_REAL_GLM_GEMMA_SMOKE_REPORT.md",
+    "docs/ROADMAP.md",
+    "docs/COMPATIBILITY.md",
+    "docs/RELEASING.md",
+    "docs/LICENSE-DECISION.md",
+    "docs/validation/GLM_GEMMA_SMOKE_PROCEDURE.md",
+    "docs/validation/historical/GLM_GEMMA_SMOKE_REPORT_2026-08-20.md",
 )
+MARKDOWN_LINK_PATTERN = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
+MARKDOWN_FENCE_PATTERN = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 SEMVER_PATTERN = re.compile(
     r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
 )
@@ -831,6 +836,84 @@ def validate_no_user_absolute_paths(validation: Validation) -> None:
                 if match
                 else "",
             )
+
+
+def validate_repository_links(validation: Validation) -> None:
+    """Reject stale relative links in the repository's maintained documents."""
+
+    for relative in REPOSITORY_DOCS:
+        document = REPO_ROOT / relative
+        validation.check(document.is_file(), f"missing repository document: {relative}")
+        if not document.is_file():
+            continue
+        text = markdown_prose_without_block_code(document.read_text(encoding="utf-8"))
+        for raw_target in MARKDOWN_LINK_PATTERN.findall(text):
+            target = markdown_link_destination(raw_target)
+            parsed = urlsplit(target)
+            if parsed.scheme or parsed.netloc or not parsed.path:
+                continue
+            linked = document.parent / unquote(parsed.path)
+            validation.check(
+                linked.exists(),
+                f"{relative}: broken relative link {raw_target!r}",
+            )
+
+
+def markdown_prose_without_block_code(text: str) -> str:
+    """Return Markdown prose while omitting fenced and indented code blocks."""
+
+    prose: list[str] = []
+    active_fence: tuple[str, int] | None = None
+    in_indented_code = False
+    previous_line_blank = True
+
+    for line in text.splitlines():
+        fence = MARKDOWN_FENCE_PATTERN.match(line)
+        if active_fence is not None:
+            if fence:
+                marker, trailing = fence.groups()
+                if (
+                    marker[0] == active_fence[0]
+                    and len(marker) >= active_fence[1]
+                    and not trailing.strip()
+                ):
+                    active_fence = None
+            continue
+
+        if fence:
+            marker = fence.group(1)
+            active_fence = (marker[0], len(marker))
+            in_indented_code = False
+            continue
+
+        if not line.strip():
+            if not in_indented_code:
+                prose.append(line)
+            previous_line_blank = True
+            continue
+
+        indented = line.startswith("    ") or line.startswith("\t")
+        if indented and (previous_line_blank or in_indented_code):
+            in_indented_code = True
+            previous_line_blank = False
+            continue
+
+        in_indented_code = False
+        previous_line_blank = False
+        prose.append(line)
+
+    return "\n".join(prose)
+
+
+def markdown_link_destination(raw_target: str) -> str:
+    """Extract a Markdown link destination without discarding bracketed spaces."""
+
+    stripped = raw_target.strip()
+    if stripped.startswith("<"):
+        closing_bracket = stripped.find(">", 1)
+        if closing_bracket != -1:
+            return stripped[1:closing_bracket]
+    return stripped.split(maxsplit=1)[0]
 
 
 def validate_version(validation: Validation) -> None:
@@ -2159,6 +2242,7 @@ def main() -> int:
     validate_run_logging_contract(validation)
     validate_run_logging_tool_parity(validation)
     validate_version(validation)
+    validate_repository_links(validation)
     validate_no_user_absolute_paths(validation)
 
     if validation.errors:
