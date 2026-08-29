@@ -82,6 +82,7 @@ REPOSITORY_DOCS = (
     "docs/validation/historical/GLM_GEMMA_SMOKE_REPORT_2026-08-20.md",
 )
 MARKDOWN_LINK_PATTERN = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
+MARKDOWN_FENCE_PATTERN = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 SEMVER_PATTERN = re.compile(
     r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
 )
@@ -845,9 +846,9 @@ def validate_repository_links(validation: Validation) -> None:
         validation.check(document.is_file(), f"missing repository document: {relative}")
         if not document.is_file():
             continue
-        text = document.read_text(encoding="utf-8")
+        text = markdown_prose_without_block_code(document.read_text(encoding="utf-8"))
         for raw_target in MARKDOWN_LINK_PATTERN.findall(text):
-            target = raw_target.strip().split(maxsplit=1)[0].strip("<>")
+            target = markdown_link_destination(raw_target)
             parsed = urlsplit(target)
             if parsed.scheme or parsed.netloc or not parsed.path:
                 continue
@@ -856,6 +857,63 @@ def validate_repository_links(validation: Validation) -> None:
                 linked.exists(),
                 f"{relative}: broken relative link {raw_target!r}",
             )
+
+
+def markdown_prose_without_block_code(text: str) -> str:
+    """Return Markdown prose while omitting fenced and indented code blocks."""
+
+    prose: list[str] = []
+    active_fence: tuple[str, int] | None = None
+    in_indented_code = False
+    previous_line_blank = True
+
+    for line in text.splitlines():
+        fence = MARKDOWN_FENCE_PATTERN.match(line)
+        if active_fence is not None:
+            if fence:
+                marker, trailing = fence.groups()
+                if (
+                    marker[0] == active_fence[0]
+                    and len(marker) >= active_fence[1]
+                    and not trailing.strip()
+                ):
+                    active_fence = None
+            continue
+
+        if fence:
+            marker = fence.group(1)
+            active_fence = (marker[0], len(marker))
+            in_indented_code = False
+            continue
+
+        if not line.strip():
+            if not in_indented_code:
+                prose.append(line)
+            previous_line_blank = True
+            continue
+
+        indented = line.startswith("    ") or line.startswith("\t")
+        if indented and (previous_line_blank or in_indented_code):
+            in_indented_code = True
+            previous_line_blank = False
+            continue
+
+        in_indented_code = False
+        previous_line_blank = False
+        prose.append(line)
+
+    return "\n".join(prose)
+
+
+def markdown_link_destination(raw_target: str) -> str:
+    """Extract a Markdown link destination without discarding bracketed spaces."""
+
+    stripped = raw_target.strip()
+    if stripped.startswith("<"):
+        closing_bracket = stripped.find(">", 1)
+        if closing_bracket != -1:
+            return stripped[1:closing_bracket]
+    return stripped.split(maxsplit=1)[0]
 
 
 def validate_version(validation: Validation) -> None:

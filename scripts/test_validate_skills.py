@@ -266,6 +266,43 @@ class ValidatorRegressionTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("broken relative link", result.stdout)
 
+    def test_angle_bracket_repository_link_with_space_passes(self) -> None:
+        linked = self.repo_root / "docs/my file.md"
+        linked.write_text("# Linked document\n", encoding="utf-8")
+        roadmap = self.repo_root / "docs/ROADMAP.md"
+        roadmap.write_text(
+            roadmap.read_text(encoding="utf-8") + "\n[Linked](<my file.md>)\n",
+            encoding="utf-8",
+        )
+
+        result = self.run_validator()
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_link_in_fenced_code_block_is_ignored(self) -> None:
+        roadmap = self.repo_root / "docs/ROADMAP.md"
+        roadmap.write_text(
+            roadmap.read_text(encoding="utf-8")
+            + "\n```text\n[Example](missing-fenced-example.md)\n```\n",
+            encoding="utf-8",
+        )
+
+        result = self.run_validator()
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_link_in_indented_code_block_is_ignored(self) -> None:
+        roadmap = self.repo_root / "docs/ROADMAP.md"
+        roadmap.write_text(
+            roadmap.read_text(encoding="utf-8")
+            + "\n    [Example](missing-indented-example.md)\n",
+            encoding="utf-8",
+        )
+
+        result = self.run_validator()
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def mutate_orchestration_skill(self, old: str, new: str) -> None:
         skill_path = (
             self.repo_root / "orca-worker-reviewer-orchestration" / "SKILL.md"
