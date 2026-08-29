@@ -7,6 +7,7 @@ import re
 import sys
 from pathlib import Path
 
+import run_logging
 from skill_policy import PolicyContractError, load_policy_contract, load_risk_contract
 from workflow_contract import WorkflowContractError, load_workflow_output_contract
 
@@ -270,9 +271,17 @@ FINAL_REVIEW_CONTRACT: dict[str, tuple[str, ...]] = {
         "agent_profile_final_review_then_explicit_then_defaults",
     ),
     "FINAL_REVIEW_RISK_INDEPENDENCE": ("mandatory_and_identical_at_every_risk_level",),
+    # OS-22: where the per-dispatch audit record for an attempt lives, and what a
+    # reader that cannot determine provenance must conclude. Both are policy
+    # statements in the block's existing style (lowercase snake, no paths), not
+    # paths -- the path rule itself lives in section 9.
+    "FINAL_REVIEW_AUDIT_RECORD": ("artifact_root_final_review_audit_per_dispatch",),
+    "FINAL_REVIEW_PROVENANCE_DEFAULT": ("unknown",),
 }
 
-FINAL_REVIEW_CONTRACT_MAX_LINES = 15    # was 14; the 15th key is OS-4's agent resolution
+# was 15; the 16th and 17th keys are OS-22's audit record location and its
+# fail-closed provenance default.
+FINAL_REVIEW_CONTRACT_MAX_LINES = 17
 FINAL_REVIEW_SECTION_HEADING = "## 17. Final Adversarial Review"
 FINAL_REVIEW_SECTION_END = "\n## 18."
 # Rewritten by D-1.7 S-5: the pre-OS-3 wording anchored the anti-anchoring rule on a
@@ -1941,6 +1950,126 @@ def validate_run_logging_contract(validation: Validation) -> None:
         )
 
 
+# The full heading, including the ticket tag: sections 16 and 17 both REFERENCE
+# "#### Final Review audit artifacts", and a prefix anchor would silently start
+# extracting from one of those references if the real subsection were renamed.
+FINAL_REVIEW_AUDIT_SECTION_HEADING = "#### Final Review audit artifacts (OS-22)"
+FINAL_REVIEW_AUDIT_SECTION_END = "\n## 10."
+# Each anchor is a claim the SKILL text has to make in its own words, not a
+# paraphrase this validator would accept a weaker version of.
+FINAL_REVIEW_AUDIT_ANCHORS = (
+    "final_review_audit/",
+    "FINAL_REVIEW_AUDIT_SCHEMA_VERSION = 1.0",
+    "FINAL_REVIEW_REDACTION_POLICY_VERSION = redaction/1.1",
+    "FINAL_REVIEW_EVIDENCE_BUNDLE.json",
+    "final-review-audit-write",
+    "final-review-audit-provenance",
+    "final-review-audit-export",
+    "final_review_audit_incomplete_publication",
+    "dispatch_input_rejected",
+    "superseded_by_retry",
+)
+# The .staging/-is-never-a-record reader rule, the three authorities, and the
+# run_end-is-not-terminal rule, each anchored on the sentence that carries it.
+FINAL_REVIEW_AUDIT_STAGING_ANCHORS = (".staging/", "record가 아니다")
+FINAL_REVIEW_AUDIT_AUTHORITY_ANCHORS = (
+    "ORCHESTRATOR_LOG.md",
+    "per-dispatch audit records",
+    "FINAL_RESULT.md",
+)
+FINAL_REVIEW_AUDIT_RUN_END_ANCHOR = "run_end는 terminal이 아니다"
+FINAL_REVIEW_STEP8_ARTIFACT_ROOT_ANCHOR = "`<ARTIFACT_ROOT>FINAL_REVIEW*`"
+FINAL_REVIEW_STEP8_STALE_PATH = "artifacts/FINAL_REVIEW_"
+
+
+def validate_final_review_audit_contract(validation: Validation) -> None:
+    """OS-22 section 9's audit-artifact subsection, and section 16's path fix.
+
+    The schema version is stated in two places by necessity -- the constant in
+    run_logging.py and the prose a live Coordinator reads -- so this validator is
+    what keeps them one value instead of two that drift.
+    """
+    skill_path = LIFECYCLE_SKILL_DIR / "SKILL.md"
+    if not skill_path.is_file():
+        return
+    skill_text = skill_path.read_text(encoding="utf-8")
+
+    start = skill_text.find(FINAL_REVIEW_AUDIT_SECTION_HEADING)
+    end = skill_text.find(FINAL_REVIEW_AUDIT_SECTION_END, start) if start != -1 else -1
+    section = skill_text[start:end] if start != -1 and end != -1 else ""
+    validation.check(
+        bool(section),
+        f"{LIFECYCLE_SKILL_DIR.name}: section 9's Final Review audit artifact "
+        "subsection is missing, renamed, or has escaped section 9",
+    )
+    for anchor in FINAL_REVIEW_AUDIT_ANCHORS:
+        validation.check(
+            anchor in section,
+            f"{LIFECYCLE_SKILL_DIR.name}: the Final Review audit subsection is "
+            f"missing {anchor!r}",
+        )
+    for anchor in FINAL_REVIEW_AUDIT_STAGING_ANCHORS:
+        validation.check(
+            anchor in section,
+            f"{LIFECYCLE_SKILL_DIR.name}: the Final Review audit subsection does not "
+            f"state the .staging/-is-never-a-record reader rule ({anchor!r} absent); "
+            "a reader that parses a half-written staging directory would read an "
+            "incomplete record as a record",
+        )
+    for anchor in FINAL_REVIEW_AUDIT_AUTHORITY_ANCHORS:
+        validation.check(
+            anchor in section,
+            f"{LIFECYCLE_SKILL_DIR.name}: the three-authority statement is missing "
+            f"{anchor!r}",
+        )
+    validation.check(
+        FINAL_REVIEW_AUDIT_RUN_END_ANCHOR in section,
+        f"{LIFECYCLE_SKILL_DIR.name}: the audit subsection does not state that "
+        "run_end is not terminal; a reader that stops at the first run_end reports a "
+        "run that continued as finished",
+    )
+    validation.check(
+        f"FINAL_REVIEW_AUDIT_SCHEMA_VERSION = {run_logging.FINAL_REVIEW_AUDIT_SCHEMA_VERSION}"
+        in section,
+        f"{LIFECYCLE_SKILL_DIR.name}: the audit subsection's schema version differs "
+        f"from run_logging.FINAL_REVIEW_AUDIT_SCHEMA_VERSION "
+        f"({run_logging.FINAL_REVIEW_AUDIT_SCHEMA_VERSION!r})",
+    )
+    validation.check(
+        f"FINAL_REVIEW_REDACTION_POLICY_VERSION = {run_logging.FINAL_REVIEW_REDACTION_POLICY_VERSION}"
+        in section,
+        f"{LIFECYCLE_SKILL_DIR.name}: the audit subsection's redaction policy version "
+        f"differs from run_logging.FINAL_REVIEW_REDACTION_POLICY_VERSION",
+    )
+
+    final_verification = extract_section(skill_text, "## 16. Final Verification", "\n## 17.")
+    validation.check(
+        FINAL_REVIEW_STEP8_ARTIFACT_ROOT_ANCHOR in final_verification,
+        f"{LIFECYCLE_SKILL_DIR.name}: section 16 step 8 does not name "
+        f"{FINAL_REVIEW_STEP8_ARTIFACT_ROOT_ANCHOR}; the run-scoped path is section "
+        "9's contract and a run-external path contradicts it",
+    )
+    validation.check(
+        FINAL_REVIEW_STEP8_STALE_PATH not in final_verification,
+        f"{LIFECYCLE_SKILL_DIR.name}: section 16 still names the stale "
+        f"{FINAL_REVIEW_STEP8_STALE_PATH!r} path",
+    )
+    validation.check(
+        "FINAL_REVIEW_AUDIT:" in final_verification,
+        f"{LIFECYCLE_SKILL_DIR.name}: section 16's Final Adversarial Review block "
+        "does not cite the per-dispatch audit record",
+    )
+    validation.check(
+        # The Final Result template's own line, not the prose that references it:
+        # trimming the serialization while leaving the prose behind is exactly the
+        # shape DEC-5 refuses.
+        "## Orca Orchestration State\n## Final Adversarial Review" in final_verification,
+        f"{LIFECYCLE_SKILL_DIR.name}: the Final Result template lost its four-axis "
+        "## Orca Orchestration State ledger; OS-22 adds an authority, it does not "
+        "trim the existing one",
+    )
+
+
 def validate_run_logging_tool_parity(validation: Validation) -> None:
     """scripts/run_logging.py and the copy installed inside the Skill must match.
 
@@ -2019,6 +2148,7 @@ def main() -> int:
     validate_workflow_output_contracts(validation)
     validate_lifecycle_accounting_contract(validation)
     validate_final_review_contract(validation)
+    validate_final_review_audit_contract(validation)
     validate_reuse_contract(validation)
     validate_task_boundary_contract(validation)
     validate_reviewer_context_contract(validation)

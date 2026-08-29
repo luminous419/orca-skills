@@ -10,6 +10,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import run_logging
+
 
 SOURCE_ROOT = Path(__file__).resolve().parents[1]
 SKILL_NAMES = (
@@ -1428,6 +1430,143 @@ class ValidatorRegressionTests(unittest.TestCase):
 
         self.assert_lifecycle_contract_rejected(
             "run-scoped orchestration/timing log section is missing"
+        )
+
+    # ---- OS-22 Final Review audit contract (I-9) --------------------------------
+
+    def test_dropping_the_audit_subsection_fails(self) -> None:
+        """Section 9's audit-artifact subsection is what a live Coordinator reads to
+        find out that per-dispatch records exist at all. Without it the feature is
+        code with no contract."""
+        self.mutate_orchestration_skill(
+            "#### Final Review audit artifacts (OS-22)",
+            "#### Some other subsection",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "section 9's Final Review audit artifact subsection is missing, renamed, "
+            "or has escaped section 9"
+        )
+
+    def test_a_schema_version_that_drifts_from_the_writer_fails(self) -> None:
+        """The version is stated in two places by necessity -- the constant and the
+        prose. This validator is what keeps them one value instead of two."""
+        self.mutate_orchestration_skill(
+            "FINAL_REVIEW_AUDIT_SCHEMA_VERSION = 1.0",
+            "FINAL_REVIEW_AUDIT_SCHEMA_VERSION = 2.0",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "schema version differs from run_logging.FINAL_REVIEW_AUDIT_SCHEMA_VERSION"
+        )
+
+    def test_a_redaction_policy_version_that_drifts_fails(self) -> None:
+        self.mutate_orchestration_skill(
+            f"FINAL_REVIEW_REDACTION_POLICY_VERSION = "
+            f"{run_logging.FINAL_REVIEW_REDACTION_POLICY_VERSION}",
+            "FINAL_REVIEW_REDACTION_POLICY_VERSION = redaction/9.9",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "redaction policy version differs"
+        )
+
+    def test_dropping_the_staging_is_never_a_record_rule_fails(self) -> None:
+        """Without it a reader parses a half-written staging directory and reports an
+        incomplete record as a record."""
+        self.mutate_orchestration_skill(
+            ".staging/                       record가 아니다. reader는 전부 무시한다",
+            ".staging/                       임시 디렉터리",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "does not state the .staging/-is-never-a-record reader rule"
+        )
+
+    def test_dropping_the_run_end_is_not_terminal_rule_fails(self) -> None:
+        """ANALYSIS F5b: a reader that stops at the first run_end reports a run that
+        continued as finished."""
+        self.mutate_orchestration_skill(
+            "run_end는 terminal이 아니다",
+            "run_end가 마지막 row다",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "does not state that run_end is not terminal"
+        )
+
+    def test_dropping_a_cli_call_point_fails(self) -> None:
+        self.mutate_orchestration_skill(
+            "final-review-audit-export", "final-review-audit-dump"
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "the Final Review audit subsection is missing"
+        )
+
+    def test_section_16_reverting_to_the_stale_artifacts_path_fails(self) -> None:
+        """DEC-10(i): `artifacts/FINAL_REVIEW_*` contradicts section 9's run-scoped
+        ladder -- it names a shared root outside any run."""
+        self.mutate_orchestration_skill(
+            "attempt마다 `<ARTIFACT_ROOT>FINAL_REVIEW*`가 있는지",
+            "attempt마다 artifacts/FINAL_REVIEW_*가 있는지",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "section 16 still names the stale"
+        )
+
+    def test_section_16_losing_the_audit_record_citation_fails(self) -> None:
+        self.mutate_orchestration_skill(
+            "FINAL_REVIEW_AUDIT: attempt <n> task_<id>",
+            "AUDIT_NOTE: attempt <n> task_<id>",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "does not cite the per-dispatch audit record"
+        )
+
+    def test_section_16_losing_the_four_axis_ledger_fails(self) -> None:
+        """DEC-5: OS-22 adds an authority, it does not trim the existing one."""
+        self.mutate_orchestration_skill(
+            "## Orca Orchestration State\n## Final Adversarial Review",
+            "## Orchestration Notes\n## Final Adversarial Review",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "lost its four-axis ## Orca Orchestration State ledger"
+        )
+
+    def test_the_final_review_contract_block_carries_the_two_new_keys(self) -> None:
+        for key in ("FINAL_REVIEW_AUDIT_RECORD", "FINAL_REVIEW_PROVENANCE_DEFAULT"):
+            with self.subTest(key=key):
+                self.assertIn(
+                    key,
+                    self.orchestration_section(
+                        "#### Final review contract", "\n## 18."
+                    ),
+                )
+
+    def test_dropping_a_new_final_review_contract_key_fails(self) -> None:
+        self.mutate_orchestration_skill(
+            "FINAL_REVIEW_PROVENANCE_DEFAULT = unknown\n", ""
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "final review contract keys differ from the validator source of truth"
+        )
+
+    def test_flipping_the_provenance_default_to_accepted_fails(self) -> None:
+        """No default anywhere, on any surface, may be `accepted`."""
+        self.mutate_orchestration_skill(
+            "FINAL_REVIEW_AUDIT_RECORD = artifact_root_final_review_audit_per_dispatch\n"
+            "FINAL_REVIEW_PROVENANCE_DEFAULT = unknown",
+            "FINAL_REVIEW_AUDIT_RECORD = artifact_root_final_review_audit_per_dispatch\n"
+            "FINAL_REVIEW_PROVENANCE_DEFAULT = accepted",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "final review contract values differ from the validator source of truth"
         )
 
 if __name__ == "__main__":

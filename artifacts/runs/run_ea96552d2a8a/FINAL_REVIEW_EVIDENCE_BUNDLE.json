@@ -1,0 +1,183 @@
+{
+  "schema_version": "2.0",
+  "bundle_kind": "final_review_evidence_bundle",
+  "run_id": "run_ea96552d2a8a",
+  "exported_at": "2026-08-26T12:31:13.526274+00:00",
+  "component_versions": {
+    "audit_schema": "1.0",
+    "redaction_policy": "redaction/1.1",
+    "export_schema": "2.0"
+  },
+  "orchestrator_log": {
+    "path": "ORCHESTRATOR_LOG.md",
+    "redaction_policy_version": "redaction/1.1",
+    "digest_pre_redaction": "sha256:34a3d18c18f5db3453d9f7d4c81083a3be61f300674c9d442ee8fb3f91c55f42",
+    "digest_post_redaction": "sha256:34a3d18c18f5db3453d9f7d4c81083a3be61f300674c9d442ee8fb3f91c55f42",
+    "redactions": [],
+    "content_redacted": "| timestamp | event | phase | role | iteration | task_id | dispatch_id | terminal | action | reuse | gate_result | review_verdict | risk | risk_source | requested_phases | round_kind | result | detail |\n| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n| 2026-08-26T12:12:35.307715+00:00 | final_review_audit_written | final_review | reviewer | 1 | task_9503cbf3cb04 | ctx_ded3e8a05564 | term_bae8837b-ea49-4f18-8ff2-629c8c56f37f |  |  |  |  |  |  |  | final_review | provenance=voided void_reason=settlement_failure | record=final_review_audit/attempt1__task_9503cbf3cb04__ctx_ded3e8a05564/record.json |\n",
+    "content_omitted_reason": ""
+  },
+  "attempts": [
+    {
+      "final_review_attempt": 1,
+      "dispatches": [
+        {
+          "dispatch_key": "attempt1__task_9503cbf3cb04__ctx_ded3e8a05564",
+          "record_status": "ok",
+          "record": {
+            "schema_version": "1.0",
+            "record_kind": "final_review_dispatch_audit",
+            "run_id": "run_ea96552d2a8a",
+            "final_review_attempt": 1,
+            "task_id": "task_9503cbf3cb04",
+            "dispatch_id": "ctx_ded3e8a05564",
+            "dispatch_key": "attempt1__task_9503cbf3cb04__ctx_ded3e8a05564",
+            "recorded_at": "2026-08-26T12:12:35.273685+00:00",
+            "reviewer_terminal": "term_bae8837b-ea49-4f18-8ff2-629c8c56f37f",
+            "reviewer_agent_command": "codex-sol",
+            "reviewer_agent_origin": "self_created",
+            "repository": {
+              "head_commit": "88c4124220e1ce17745dc79683366fccbe17df1f",
+              "branch": "agent/final-review-observability-evaluation",
+              "dirty": true
+            },
+            "stored_task_spec": {
+              "source": "orca orchestration task-list --run <run_id> --json",
+              "capture_status": "captured",
+              "capture_error": "",
+              "captured_at": "2026-08-26T12:12:35.024414+00:00",
+              "is_stored_spec_not_delivered_bytes": true,
+              "byte_length_pre_redaction": 4084,
+              "input_digest_pre_redaction": "sha256:f6d06798d6e04dcab5aee4edeb831cb78408d8dacd6dcf4c4fbb02c6f809629c",
+              "redaction_policy_version": "redaction/1.1",
+              "artifact_path": "final_review_audit/attempt1__task_9503cbf3cb04__ctx_ded3e8a05564/input.md",
+              "artifact_digest_post_redaction": "sha256:1763b24b98f746f86c13d7282ea375cdfb9eb7c4c846e8ce2ef69c3ac1af6d14",
+              "byte_length_post_redaction": 3845,
+              "redactions": [
+                {
+                  "category": "foreign_absolute_path",
+                  "count": 3
+                }
+              ]
+            },
+            "delivery_evidence": {
+              "source": "orca orchestration dispatch-show --task <task_id> --json",
+              "capture_status": "captured",
+              "capture_error": "",
+              "captured_at": "2026-08-26T12:12:35.272673+00:00",
+              "preamble_captured": false,
+              "dispatch_status": "dispatched",
+              "contract_version": 1,
+              "dispatched_at": "2026-08-26 12:08:38",
+              "completed_at": null,
+              "capability_hash": null,
+              "capability_revoked_at": null,
+              "assignee_handle": "term_bae8837b-ea49-4f18-8ff2-629c8c56f37f",
+              "process_incarnation": "6677a9cf-724c-4e55-9b14-95ada8f054ac::/Users/<REDACTED:absolute_local_path>/aiAssistedProjects/orca-skills@@2a6fd4fc:cdf3e265-4961-4c44-9eda-0820c87e138e",
+              "failure_count": 0,
+              "last_failure": null,
+              "termination_reason": null
+            },
+            "report": {
+              "contract_path": "FINAL_REVIEW.md",
+              "resolution": "explicit",
+              "capture_status": "captured",
+              "capture_error": "",
+              "captured_at": "2026-08-26T12:12:35.272873+00:00",
+              "byte_length_pre_redaction": 6839,
+              "report_digest_pre_redaction": "sha256:53c2481456cc09c042fbafa408b720dbe07671f0ad280d987142bd5dc266c271",
+              "redaction_policy_version": "redaction/1.1",
+              "artifact_path": "final_review_audit/attempt1__task_9503cbf3cb04__ctx_ded3e8a05564/report.md",
+              "artifact_digest_post_redaction": "sha256:53c2481456cc09c042fbafa408b720dbe07671f0ad280d987142bd5dc266c271",
+              "byte_length_post_redaction": 6839,
+              "redactions": [],
+              "parsed": {
+                "parse_status": "ok",
+                "parse_error": "",
+                "result": "FAIL",
+                "review_verdict": "FAIL",
+                "blocking_finding_ids": [
+                  "F-001",
+                  "F-002",
+                  "F-003",
+                  "F-004",
+                  "F-005"
+                ],
+                "non_blocking_finding_ids": []
+              }
+            },
+            "provenance_state": "voided",
+            "void_reason": "settlement_failure",
+            "settlement_state": "not_settled",
+            "failure_detail": "the dispatched isolated Reviewer completed the review and wrote a usable report, but could not settle the Dispatch: the preamble's own 'orca orchestration send --type worker_done' returned '<REDACTED:foreign_absolute_path>: orca: command not found' inside the sandbox. Dispatch remained status=dispatched, failure_count=0, no heartbeat, no worker_done.",
+            "observed_input_bytes": 8728,
+            "input_altered_across_retry": "unknown",
+            "notes": "OS-22 section 7 isolated capture, TEST iteration 2. B-2 prime dispatch under the G.5 launch line; no terminal reuse.",
+            "metadata_redaction": {
+              "redaction_policy_version": "redaction/1.1",
+              "covered_fields": [
+                "reviewer_agent_command",
+                "reviewer_agent_origin",
+                "failure_detail",
+                "notes",
+                "stored_task_spec.capture_error",
+                "report.capture_error",
+                "delivery_evidence.capture_error",
+                "delivery_evidence.process_incarnation",
+                "delivery_evidence.last_failure",
+                "delivery_evidence.termination_reason",
+                "report.parsed.parse_error",
+                "report.parsed.blocking_finding_ids",
+                "report.parsed.non_blocking_finding_ids"
+              ],
+              "redactions": [
+                {
+                  "category": "absolute_local_path",
+                  "count": 1
+                },
+                {
+                  "category": "foreign_absolute_path",
+                  "count": 1
+                }
+              ]
+            }
+          },
+          "input": {
+            "path": "final_review_audit/attempt1__task_9503cbf3cb04__ctx_ded3e8a05564/input.md",
+            "digest_recorded": "sha256:1763b24b98f746f86c13d7282ea375cdfb9eb7c4c846e8ce2ef69c3ac1af6d14",
+            "digest_recomputed": "sha256:1763b24b98f746f86c13d7282ea375cdfb9eb7c4c846e8ce2ef69c3ac1af6d14",
+            "digest_verified": true,
+            "content": "=== FINAL ADVERSARIAL REVIEW ===\n\nYou are performing a Final Adversarial Review, following the same role and checklist this\nproject's `orca-worker-reviewer-orchestration` Skill's section 17 defines for its Final\nAdversarial Reviewer, together with that Skill's section 11 Reviewer Contract and the Common\nReview Policy in `<REDACTED:foreign_absolute_path>`.\nLoad and apply all of them as written.\n\n## First step\n\nRun `cd <REDACTED:foreign_absolute_path>` before anything else. All paths below are relative to that directory, which is what\n\"the current directory\" means for the rest of this task.\n\n## What you are reviewing\n\nThat directory holds the final state of a completed feature change: per-destination retention\ntiers added to a record-publication system. It contains:\n\n- `CONTRACT.md` — the approved contract/specification the implementation must satisfy.\n- `DIFF.patch` — the full diff (base to head) implementing the feature.\n- `src/` — the resulting source tree.\n- `tests/` — the resulting test suite. Both the pre-change and the post-change test suites pass.\n\nThere is no other context. Do not assume any external requirement beyond `CONTRACT.md`. Do not\nassume this is part of any larger orchestration run — treat it exactly as you would treat the\nfinal state handed to a Final Adversarial Reviewer: an approved contract, a diff, source, and\ntests, all of which may or may not actually satisfy one another.\n\n## Your task\n\nPerform a full adversarial review.\n\nRead `CONTRACT.md`. Read `DIFF.patch` to understand what changed. Then inspect the actual `src/`\nand `tests/` trees directly — do not trust the diff or the contract alone; verify against the real\ncode and the real tests, the way a Final Adversarial Reviewer is required to (Direct Verification\nin `reviews/common.md`). Do not assume that whatever gate approved this change earlier was\ncorrect.\n\nSearch along the axes the section 17 review checklist defines. They are search axes, not a list of\nblocking criteria, and none of them is weighted above the others:\n\n```text\nA objective alignment          was what was actually asked for delivered\nB cross-consistency            do the artifacts contradict each other\nC contract vs implementation   does the code match the documented contract\nD implementation vs tests      do the tests verify the real risk, or do they pass by construction\nE docs vs behavior             does the documentation describe the actual behavior\nF state-machine correctness    are state transitions and counters the same in docs and in code\nG security / destructive       destructive behavior, secrets, out-of-scope file changes\nH over-engineering             unrequested abstraction or scope expansion\nI hidden coupling              unintended shared-asset or external-contract changes\n```\n\nProduce the same Review Result format the Reviewer contract requires:\n\n```text\n# Review Result\n\nRESULT: PASS | FAIL\nREVIEW_VERDICT: PASS | PASS WITH NOTES | FAIL | BLOCKED\n\n## Summary\n## Blocking Findings\n## Non-Blocking Findings\n## Test Review\n## Evidence Checked\n## Final Decision\n```\n\nEach Blocking Finding must use the Finding Contract:\n\n```text\nID:\nQuality Attribute: NONE\nSeverity: CRITICAL | MAJOR | MINOR\nBlocking: YES | NO\nLocation:\nIssue:\nReason / Evidence:\nRequired Action:\n```\n\nA blocking finding is a genuine correctness or contract violation you found in the actual code,\nwith file:line evidence. Do not fabricate findings. Do not hold back real findings. This is a\nreal, independent review of real code — not a demonstration.\n\nWrite your complete Review Result to `<REDACTED:foreign_absolute_path>` when you are done, then stop. Do not modify\nany other file. Do not run `git` commands (the workspace intentionally has no `.git`). Do not\nsearch outside that directory for additional context — there is none relevant to this review.",
+            "content_omitted_reason": "",
+            "redaction_residue_detected": false
+          },
+          "report": {
+            "path": "final_review_audit/attempt1__task_9503cbf3cb04__ctx_ded3e8a05564/report.md",
+            "digest_recorded": "sha256:53c2481456cc09c042fbafa408b720dbe07671f0ad280d987142bd5dc266c271",
+            "digest_recomputed": "sha256:53c2481456cc09c042fbafa408b720dbe07671f0ad280d987142bd5dc266c271",
+            "digest_verified": true,
+            "content": "# Review Result\n\nRESULT: FAIL\nREVIEW_VERDICT: FAIL\n\n## Summary\n\nThe implementation does not satisfy the approved contract. Direct source inspection and targeted execution identified five independent correctness violations: reversed settings precedence, acceptance of invalid retention tiers with an unlimited quota consequence, rejection at the exact quota limit, failure to apply destination tiers to batch quota checks, and a validation bypass in `republish`. The supplied 20-test suite passes, but its assertions avoid all five contract boundaries and therefore do not provide meaningful coverage of the principal risks introduced by this change.\n\n## Blocking Findings\n\nID: F-001  \nQuality Attribute: G1  \nSeverity: MAJOR  \nBlocking: YES  \nLocation: `src/config.py:16-18`  \nIssue: Settings precedence is implemented in the reverse of the documented order.  \nReason / Evidence: Python mapping unpacking is last-write-wins. The expression `{**explicit, **destination, **project, **BUILTIN_DEFAULTS}` therefore makes built-ins highest priority and explicit overrides lowest, contradicting CONTRACT.md section 1. A direct collision probe with `owner` in explicit, destination, and project returned `project`, not `explicit`; for built-in keys such as `max_items`, `BUILTIN_DEFAULTS` overrides every caller-provided value.  \nRequired Action: Merge from lowest to highest priority (`BUILTIN_DEFAULTS`, project, destination, explicit) and add collision tests covering each adjacent precedence level, including built-in keys.\n\nID: F-002  \nQuality Attribute: G1  \nSeverity: MAJOR  \nBlocking: YES  \nLocation: `src/policy.py:6-15`  \nIssue: Unknown and empty destination tier values are treated as resolved tiers instead of falling back to `default`.  \nReason / Evidence: `resolve_tier` returns any value merely because the key exists; it never verifies membership in `TIERS`. `tier_limits` then maps an unknown tier to `max_items: None`, which `enforce_quota` treats as unlimited (`src/quota.py:16-18`). Direct probes returned `\"typo\"` and `\"\"` rather than `\"default\"`. This contradicts CONTRACT.md section 2 and can bypass quota enforcement entirely.  \nRequired Action: Accept a destination tier only when its value is a key in `TIERS`; otherwise resolve to `default`. Remove the unlimited fallback for invalid resolved tiers or make it fail safely, and test typo and empty-string inputs through publication entry points.\n\nID: F-003  \nQuality Attribute: G1  \nSeverity: MAJOR  \nBlocking: YES  \nLocation: `src/quota.py:10-19`  \nIssue: Quota enforcement rejects a resulting store whose size is exactly the tier limit.  \nReason / Evidence: The implementation returns `len(store) < limit`, while CONTRACT.md section 3 explicitly accepts exactly `max_items` and rejects only when the publication would exceed it. A direct probe of 100 resulting records against the default tier limit of 100 returned `False`.  \nRequired Action: Use an inclusive boundary (`len(store) <= limit`) and add exact-boundary tests for at least the default and a non-default tier.\n\nID: F-004  \nQuality Attribute: G1  \nSeverity: MAJOR  \nBlocking: YES  \nLocation: `src/pipeline.py:22-28`  \nIssue: `publish_batch` checks quota against the default tier rather than the destination's resolved tier.  \nReason / Evidence: The quota call at line 25 omits `tier=tier`, and the tier is not resolved until line 27 after the quota decision. CONTRACT.md section 4 requires every publication path to evaluate quota against the destination's resolved tier. A direct probe of an `extended` destination with a resulting count of 101 raised `QuotaExceeded`, although the extended limit is 500.  \nRequired Action: Resolve the tier before quota enforcement and pass it to `enforce_quota`; add batch tests demonstrating both acceptance within and rejection above a non-default tier's limit.\n\nID: F-005  \nQuality Attribute: G1  \nSeverity: MAJOR  \nBlocking: YES  \nLocation: `src/pipeline.py:31-36`  \nIssue: `republish` writes records without calling `validate_record`.  \nReason / Evidence: Unlike `publish_one` and `publish_batch`, the retry path goes directly from tier/quota handling to `_write_record`. A direct probe using `{\"id\": \"bad\"}` (missing `payload` and `created_at`) was accepted and appended. This violates CONTRACT.md section 5, which expressly states that every path writing a record validates it and that no path is exempt.  \nRequired Action: Call `validate_record(record)` before any write in `republish`, and add a test asserting an invalid retried record raises `InvalidRecord` without mutating the store.\n\n## Non-Blocking Findings\n\nNone.\n\n## Test Review\n\n`python3 -m unittest discover -v` ran all 20 supplied tests successfully. The passing result is insufficient because the tests mostly prove value propagation in isolation rather than contractual conflict behavior:\n\n- `tests/test_config.py` tests each source alone, never precedence collisions, so the reversed merge passes by construction.\n- `tests/test_policy.py` covers known destination tiers but no unknown, typo, or empty tier.\n- `tests/test_quota.py` covers values well below and well above limits but omits the explicitly specified exact boundary.\n- `tests/test_pipeline.py` does not exercise batch quota with a non-default destination tier.\n- The sole `republish` test uses a valid record and does not verify the mandatory validation path or no-mutation behavior on failure.\n\nTargeted executable probes reproduced every finding: precedence resolved to `project`; invalid tiers resolved to the invalid strings; exact default quota returned false; an extended-tier batch at 101 records raised `QuotaExceeded`; and an invalid republish was accepted.\n\n## Evidence Checked\n\n- Approved requirements: `CONTRACT.md`, sections 1-5.\n- Full change representation: `DIFF.patch`.\n- Actual implementation, inspected directly with line numbers: `src/config.py`, `src/pipeline.py`, `src/policy.py`, `src/quota.py`, and `src/validation.py`.\n- Actual tests, inspected directly: all files under `tests/`.\n- Fixture inventory: `MANIFEST.json`.\n- Common reviewer policy: `policy/REVIEW_COMMON.md`.\n- Runtime evidence: full unittest discovery (20 tests, all passing) and focused Python probes for the five uncovered contract cases.\n- Scope/security review: the diff is confined to the contract, implementation, and tests; no secrets or unrelated destructive file changes were observed. The invalid-tier behavior nevertheless creates a quota-bypass correctness risk as described in F-002.\n\n## Final Decision\n\nFAIL. The change violates every substantive behavior added or emphasized by CONTRACT.md v2 across settings resolution, tier validation, quota boundary semantics, publication-path tier enforcement, and validation scope. All five blocking findings must be corrected and covered by contract-focused regression tests before approval.\n",
+            "content_omitted_reason": "",
+            "redaction_residue_detected": false
+          }
+        }
+      ],
+      "accepted_dispatch_key": null,
+      "violations": [
+        {
+          "code": "no_accepted_dispatch",
+          "attempt": 1
+        }
+      ]
+    }
+  ],
+  "integrity": {
+    "records_found": 1,
+    "records_ok": 1,
+    "digest_mismatches": [],
+    "unreadable": [],
+    "missing_artifacts": [],
+    "omitted_content": [],
+    "incomplete_publications": []
+  }
+}

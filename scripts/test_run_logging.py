@@ -3,6 +3,10 @@
 
 from __future__ import annotations
 
+import ast
+import hashlib
+import json
+import re
 import shutil
 import subprocess
 import sys
@@ -12,6 +16,7 @@ from contextlib import redirect_stdout
 from datetime import datetime
 from io import StringIO
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts import run_logging
 from scripts.run_logging import (
@@ -1769,6 +1774,2601 @@ class RunLoggingTwinParityTests(unittest.TestCase):
             / "run_logging.py"
         )
         self.assertEqual(canonical.read_bytes(), installed.read_bytes())
+
+
+# ---- OS-22: the Final Review per-dispatch audit record family ----------------------
+# release_manifest.USER_PATH_PATTERNS refuses a literal home-directory path anywhere
+# under scripts/, and verify_package.py enforces that over every packaged file -- so
+# the redaction fixtures below are assembled at runtime instead of written out. The
+# placeholder form the redactor emits is exempt from that scan and stays literal.
+_HOME = "/" + "Users" + "/"
+
+
+def _local_path(user: str, rest: str = "") -> str:
+    return f"{_HOME}{user}/{rest}"
+
+
+
+
+class _AuditTestCase(unittest.TestCase):
+    """One temporary run root, and the small helpers every audit test needs."""
+
+    RUN_ID = "run_os22"
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.base = Path(self.temporary_directory.name)
+        self.root = self.base / "artifacts" / "runs" / self.RUN_ID
+        self.root.mkdir(parents=True)
+
+    def tearDown(self) -> None:
+        self.temporary_directory.cleanup()
+
+    def write_report(self, text: str, attempt: int = 1) -> Path:
+        suffix = "" if attempt == 1 else f"_iteration{attempt}"
+        path = self.root / f"FINAL_REVIEW{suffix}.md"
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def write_record(self, **kwargs):
+        kwargs.setdefault("final_review_attempt", 1)
+        kwargs.setdefault("task_id", "task_aaa")
+        kwargs.setdefault("dispatch_id", "ctx_bbb")
+        kwargs.setdefault("capture", False)
+        return run_logging.write_final_review_audit_record(
+            self.RUN_ID, base=self.base, **kwargs
+        )
+
+    def record_json(self, directory: Path) -> dict:
+        return json.loads((directory / "record.json").read_text(encoding="utf-8"))
+
+    def log_rows(self) -> list[str]:
+        path = self.root / ORCHESTRATOR_LOG_FILENAME
+        if not path.exists():
+            return []
+        return [
+            line
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.startswith("| 2") or line.startswith("| 1")
+        ]
+
+
+PASSING_REPORT = (
+    "# Final Adversarial Review\n\nRESULT: PASS\nREVIEW_VERDICT: PASS\n\n"
+    "## Findings\n\nID: R1\nBlocking: NO\nLocation: scripts/x.py\n"
+)
+FAILING_REPORT = (
+    "RESULT: FAIL\nREVIEW_VERDICT: FAIL\n\nID: R1\nBlocking: YES\nLocation: a.py\n\n"
+    "ID: R2\nBlocking: NO\nLocation: b.py\n"
+)
+
+
+class FinalReviewDispatchKeyTests(_AuditTestCase):
+    """A.2: the key is validated before any file is touched."""
+
+    def test_the_key_leads_with_the_attempt_and_carries_both_ids(self) -> None:
+        self.assertEqual(
+            run_logging.final_review_dispatch_key(2, "task_a", "ctx_b"),
+            "attempt2__task_a__ctx_b",
+        )
+
+    def test_a_missing_dispatch_id_reads_nodispatch(self) -> None:
+        """A pre-dispatch failure has no dispatch id, and that is a real state."""
+        self.assertEqual(
+            run_logging.final_review_dispatch_key(1, "task_a"),
+            "attempt1__task_a__nodispatch",
+        )
+
+    def test_every_component_is_validated_fail_closed(self) -> None:
+        for attempt, task_id, dispatch_id in (
+            (0, "task_a", "ctx_b"),
+            (1, "../etc", "ctx_b"),
+            (1, "task_a", "../etc"),
+            (1, "", "ctx_b"),
+            (1, ".hidden", "ctx_b"),
+            (1, "task a", "ctx_b"),
+        ):
+            with self.subTest(attempt=attempt, task=task_id, dispatch=dispatch_id):
+                with self.assertRaises(RunLoggingError):
+                    run_logging.final_review_dispatch_key(
+                        attempt, task_id, dispatch_id
+                    )
+
+    def test_a_bool_is_not_an_attempt_number(self) -> None:
+        with self.assertRaises(RunLoggingError):
+            run_logging.final_review_dispatch_key(True, "task_a", "ctx_b")
+
+    def test_an_invalid_key_touches_no_file(self) -> None:
+        with self.assertRaises(RunLoggingError):
+            self.write_record(task_id="../escape")
+        self.assertFalse((self.root / "final_review_audit").exists())
+
+
+class AuditRecordWriteTests(_AuditTestCase):
+    """A.3/A.4: what a published record is, and what it holds."""
+
+    def test_the_published_unit_is_a_directory_holding_exactly_three_files(
+        self,
+    ) -> None:
+        self.write_report(PASSING_REPORT)
+
+        published = self.write_record(
+            provenance_state="accepted", settlement_state="settled"
+        )
+
+        self.assertTrue(published.is_dir())
+        self.assertEqual(
+            sorted(entry.name for entry in published.iterdir()),
+            ["input.md", "record.json", "report.md"],
+        )
+        self.assertEqual(published.name, "attempt1__task_aaa__ctx_bbb")
+
+    def test_schema_version_is_the_first_key_of_the_file(self) -> None:
+        published = self.write_record()
+
+        text = (published / "record.json").read_text(encoding="utf-8")
+        self.assertTrue(text.lstrip().startswith('{\n  "schema_version"'))
+        self.assertTrue(text.endswith("\n"))
+        self.assertEqual(
+            self.record_json(published)["schema_version"],
+            run_logging.FINAL_REVIEW_AUDIT_SCHEMA_VERSION,
+        )
+
+    def test_every_required_field_is_present(self) -> None:
+        record = self.record_json(self.write_record())
+
+        for field in run_logging._REQUIRED_RECORD_FIELDS:
+            with self.subTest(field=field):
+                self.assertIn(field, record)
+        self.assertEqual(record["record_kind"], "final_review_dispatch_audit")
+        self.assertEqual(record["dispatch_key"], "attempt1__task_aaa__ctx_bbb")
+        self.assertTrue(record["stored_task_spec"]["is_stored_spec_not_delivered_bytes"])
+        self.assertFalse(record["delivery_evidence"]["preamble_captured"])
+
+    def test_the_writer_refuses_to_overwrite_a_published_record(self) -> None:
+        """A retry must never clobber the record of the dispatch it replaced."""
+        self.write_report(PASSING_REPORT)
+        published = self.write_record(
+            provenance_state="accepted", settlement_state="settled"
+        )
+        before = (published / "record.json").read_bytes()
+
+        with self.assertRaises(run_logging.FinalReviewAuditCollision):
+            self.write_record(provenance_state="unknown")
+
+        self.assertEqual((published / "record.json").read_bytes(), before)
+        self.assertTrue(
+            any("final_review_audit_collision" in row for row in self.log_rows())
+        )
+
+    def test_a_retry_under_a_new_identity_produces_a_separate_record(self) -> None:
+        self.write_report(PASSING_REPORT)
+
+        first = self.write_record(
+            task_id="task_one", dispatch_id="ctx_one",
+            provenance_state="voided", void_reason="dispatch_input_rejected",
+            settlement_state="not_settled", failure_detail="agent_prompt_blocked",
+            observed_input_bytes=14805,
+        )
+        second = self.write_record(
+            task_id="task_two", dispatch_id="ctx_two",
+            provenance_state="accepted", settlement_state="settled",
+        )
+
+        self.assertNotEqual(first, second)
+        self.assertEqual(self.record_json(first)["provenance_state"], "voided")
+        self.assertEqual(self.record_json(second)["provenance_state"], "accepted")
+        self.assertEqual(
+            self.record_json(first)["failure_detail"], "agent_prompt_blocked"
+        )
+        self.assertEqual(self.record_json(first)["observed_input_bytes"], 14805)
+
+    def test_the_report_snapshot_is_parsed_verbatim(self) -> None:
+        self.write_report(FAILING_REPORT)
+
+        record = self.record_json(
+            self.write_record(provenance_state="accepted", settlement_state="settled")
+        )
+
+        parsed = record["report"]["parsed"]
+        self.assertEqual(parsed["parse_status"], "ok")
+        self.assertEqual(parsed["result"], "FAIL")
+        self.assertEqual(parsed["review_verdict"], "FAIL")
+        self.assertEqual(parsed["blocking_finding_ids"], ["R1"])
+        self.assertEqual(parsed["non_blocking_finding_ids"], ["R2"])
+
+    def test_review_verdict_is_not_collapsed_into_the_two_valued_gate(self) -> None:
+        self.write_report("RESULT: PASS\nREVIEW_VERDICT: PASS WITH NOTES\n")
+
+        record = self.record_json(self.write_record())
+
+        self.assertEqual(record["report"]["parsed"]["result"], "PASS")
+        self.assertEqual(
+            record["report"]["parsed"]["review_verdict"], "PASS WITH NOTES"
+        )
+
+    def test_report_resolution_records_which_path_rule_applied(self) -> None:
+        self.write_report(PASSING_REPORT, attempt=1)
+        laddered = self.record_json(
+            self.write_record(final_review_attempt=1, dispatch_id="ctx_one")
+        )
+        self.assertEqual(laddered["report"]["resolution"], "ladder")
+
+        # Attempt 2 with no _iteration2 file: the deferred suffix defect, recorded
+        # as data rather than silently absorbed.
+        fallback = self.record_json(
+            self.write_record(final_review_attempt=2, dispatch_id="ctx_two")
+        )
+        self.assertEqual(fallback["report"]["resolution"], "fallback_unsuffixed")
+        self.assertEqual(fallback["report"]["capture_status"], "captured")
+
+        explicit_path = self.base / "elsewhere.md"
+        explicit_path.write_text(PASSING_REPORT, encoding="utf-8")
+        explicit = self.record_json(
+            self.write_record(dispatch_id="ctx_three", report_path=explicit_path)
+        )
+        self.assertEqual(explicit["report"]["resolution"], "explicit")
+
+    def test_a_written_record_is_logged_with_no_new_column(self) -> None:
+        self.write_report(PASSING_REPORT)
+
+        self.write_record(provenance_state="accepted", settlement_state="settled")
+
+        rows = self.log_rows()
+        self.assertTrue(rows)
+        row = rows[-1]
+        self.assertIn("final_review_audit", row)
+        self.assertIn("provenance=accepted", row)
+        self.assertIn("task_aaa", row)
+        self.assertIn("ctx_bbb", row)
+        header = (
+            (self.root / ORCHESTRATOR_LOG_FILENAME)
+            .read_text(encoding="utf-8")
+            .splitlines()[0]
+        )
+        self.assertEqual(
+            header, "| " + " | ".join(ORCHESTRATOR_LOG_COLUMNS) + " |"
+        )
+
+
+class AuditProvenanceTests(_AuditTestCase):
+    """D-B: the state machine, and the reader that refuses to pick a winner."""
+
+    def test_the_default_provenance_is_unknown_and_never_accepted(self) -> None:
+        record = self.record_json(self.write_record())
+
+        self.assertEqual(record["provenance_state"], "unknown")
+        self.assertEqual(record["void_reason"], "")
+
+    def test_every_void_reason_round_trips(self) -> None:
+        for index, reason in enumerate(run_logging.VOID_REASONS):
+            with self.subTest(reason=reason):
+                published = self.write_record(
+                    task_id=f"task_v{index}",
+                    provenance_state="voided",
+                    void_reason=reason,
+                    settlement_state="not_settled",
+                )
+                self.assertEqual(self.record_json(published)["void_reason"], reason)
+
+    def test_the_writer_is_fail_closed_in_every_direction(self) -> None:
+        for kwargs in (
+            {"provenance_state": "APPROVED"},
+            {"provenance_state": "voided"},
+            {"provenance_state": "accepted", "void_reason": "report_missing"},
+            {"provenance_state": "voided", "void_reason": "made_up"},
+            {"settlement_state": "maybe"},
+            {"input_altered_across_retry": "probably"},
+        ):
+            with self.subTest(**kwargs):
+                with self.assertRaises(RunLoggingError):
+                    self.write_record(**kwargs)
+
+    def test_one_accepted_dispatch_is_returned(self) -> None:
+        self.write_record(task_id="task_one", provenance_state="voided",
+                          void_reason="dispatch_input_rejected")
+        self.write_record(task_id="task_two", provenance_state="accepted",
+                          settlement_state="settled")
+
+        provenance = run_logging.read_final_review_attempt_provenance(
+            self.RUN_ID, 1, base=self.base
+        )
+
+        self.assertEqual(
+            provenance["accepted_dispatch_key"], "attempt1__task_two__ctx_bbb"
+        )
+        self.assertEqual(provenance["violations"], [])
+        self.assertEqual(len(provenance["records"]), 2)
+
+    def test_two_accepted_dispatches_are_reported_not_resolved(self) -> None:
+        self.write_record(task_id="task_one", provenance_state="accepted",
+                          settlement_state="settled")
+        self.write_record(task_id="task_two", provenance_state="accepted",
+                          settlement_state="settled")
+
+        provenance = run_logging.read_final_review_attempt_provenance(
+            self.RUN_ID, 1, base=self.base
+        )
+
+        self.assertIsNone(provenance["accepted_dispatch_key"])
+        self.assertEqual(
+            [violation["code"] for violation in provenance["violations"]],
+            ["multiple_accepted_dispatches"],
+        )
+
+    def test_an_attempt_with_no_accepted_dispatch_produced_no_verdict(self) -> None:
+        self.write_record(provenance_state="voided", void_reason="report_missing",
+                          settlement_state="settled")
+
+        provenance = run_logging.read_final_review_attempt_provenance(
+            self.RUN_ID, 1, base=self.base
+        )
+
+        self.assertIsNone(provenance["accepted_dispatch_key"])
+        self.assertEqual(
+            [violation["code"] for violation in provenance["violations"]],
+            ["no_accepted_dispatch"],
+        )
+
+    def test_a_voided_record_is_never_returned_as_a_verdict(self) -> None:
+        self.write_report(FAILING_REPORT)
+        self.write_record(provenance_state="voided", void_reason="superseded_by_retry",
+                          settlement_state="settled")
+
+        provenance = run_logging.read_final_review_attempt_provenance(
+            self.RUN_ID, 1, base=self.base
+        )
+
+        self.assertIsNone(provenance["accepted_dispatch_key"])
+
+    def test_attempt_grouping_comes_from_the_field_not_the_filename(self) -> None:
+        self.write_record(final_review_attempt=1, task_id="task_one",
+                          provenance_state="accepted", settlement_state="settled")
+        self.write_record(final_review_attempt=2, task_id="task_two",
+                          provenance_state="accepted", settlement_state="settled")
+
+        first = run_logging.read_final_review_attempt_provenance(
+            self.RUN_ID, 1, base=self.base
+        )
+        second = run_logging.read_final_review_attempt_provenance(
+            self.RUN_ID, 2, base=self.base
+        )
+
+        self.assertEqual(first["records"], ["attempt1__task_one__ctx_bbb"])
+        self.assertEqual(second["records"], ["attempt2__task_two__ctx_bbb"])
+
+
+class AuditReaderCompatibilityTests(_AuditTestCase):
+    """A.5: every failure mode reads unknown, never accepted."""
+
+    def test_a_missing_record_reads_missing(self) -> None:
+        record, status = run_logging.read_final_review_audit_record(
+            self.root / "nope.json"
+        )
+        self.assertEqual((record, status), (None, "missing"))
+
+    def test_an_unparseable_record_reads_malformed(self) -> None:
+        path = self.root / "broken.json"
+        path.write_text("{not json", encoding="utf-8")
+
+        self.assertEqual(
+            run_logging.read_final_review_audit_record(path), (None, "malformed")
+        )
+
+    def test_a_record_missing_a_required_field_reads_malformed(self) -> None:
+        published = self.write_record(provenance_state="accepted",
+                                      settlement_state="settled")
+        record = self.record_json(published)
+        del record["task_id"]
+        (published / "record.json").write_text(json.dumps(record), encoding="utf-8")
+
+        parsed, status = run_logging.read_final_review_audit_record(
+            published / "record.json"
+        )
+
+        self.assertEqual((parsed, status), (None, "malformed"))
+
+    def test_an_unknown_major_is_refused_outright(self) -> None:
+        published = self.write_record(provenance_state="accepted",
+                                      settlement_state="settled")
+        record = self.record_json(published)
+        record["schema_version"] = "2.0"
+        (published / "record.json").write_text(json.dumps(record), encoding="utf-8")
+
+        parsed, status = run_logging.read_final_review_audit_record(
+            published / "record.json"
+        )
+
+        self.assertEqual((parsed, status), (None, "unknown_major"))
+
+    def test_a_higher_minor_is_read_and_unknown_fields_ignored(self) -> None:
+        published = self.write_record(provenance_state="accepted",
+                                      settlement_state="settled")
+        record = self.record_json(published)
+        record["schema_version"] = "1.7"
+        record["a_field_from_the_future"] = 42
+        (published / "record.json").write_text(json.dumps(record), encoding="utf-8")
+
+        parsed, status = run_logging.read_final_review_audit_record(
+            published / "record.json"
+        )
+
+        self.assertEqual(status, "ok")
+        self.assertEqual(parsed["provenance_state"], "accepted")
+
+    def test_an_unreadable_record_can_never_be_the_accepted_one(self) -> None:
+        published = self.write_record(provenance_state="accepted",
+                                      settlement_state="settled")
+        (published / "record.json").write_text("{}", encoding="utf-8")
+
+        provenance = run_logging.read_final_review_attempt_provenance(
+            self.RUN_ID, 1, base=self.base
+        )
+
+        self.assertIsNone(provenance["accepted_dispatch_key"])
+        self.assertEqual(
+            provenance["unreadable"],
+            [{"dispatch_key": published.name, "status": "malformed"}],
+        )
+
+
+class AuditWriteBoundaryFaultTests(_AuditTestCase):
+    """A.3 P4/P5/P6: a failure at any boundary publishes nothing and blocks nothing."""
+
+    BOUNDARIES = ("mkdir", "write", "fsync", "rename")
+
+    def _fail_at(self, boundary: str):
+        if boundary == "mkdir":
+            return patch("scripts.run_logging.os.mkdir", side_effect=OSError("boom"))
+        if boundary == "write":
+            return patch(
+                "scripts.run_logging._write_staged_file", side_effect=OSError("boom")
+            )
+        if boundary == "fsync":
+            return patch("scripts.run_logging.os.fsync", side_effect=OSError("boom"))
+        return patch("scripts.run_logging.os.rename", side_effect=OSError("boom"))
+
+    def test_a_failure_at_any_boundary_publishes_nothing(self) -> None:
+        for boundary in self.BOUNDARIES:
+            with self.subTest(boundary=boundary):
+                audit_dir = self.root / "final_review_audit"
+                shutil.rmtree(audit_dir, ignore_errors=True)
+                with self._fail_at(boundary):
+                    with self.assertRaises(run_logging.FinalReviewAuditWriteFailed):
+                        self.write_record()
+                self.assertFalse((audit_dir / "attempt1__task_aaa__ctx_bbb").exists())
+                self.assertTrue(
+                    any(
+                        "final_review_audit_write_failed" in row
+                        for row in self.log_rows()
+                    )
+                )
+
+    def test_a_failed_write_never_blocks_the_same_dispatch_key_later(self) -> None:
+        """The D-003 failure mode: the old protocol could orphan a dispatch forever."""
+        with self._fail_at("write"):
+            with self.assertRaises(run_logging.FinalReviewAuditWriteFailed):
+                self.write_record()
+
+        published = self.write_record(
+            provenance_state="accepted", settlement_state="settled"
+        )
+
+        self.assertTrue(published.is_dir())
+        self.assertEqual(self.record_json(published)["provenance_state"], "accepted")
+
+    def test_an_abandoned_staging_entry_with_no_record_is_retained_and_reported(
+        self,
+    ) -> None:
+        staging = self.root / "final_review_audit" / ".staging"
+        staging.mkdir(parents=True)
+        orphan = staging / "attempt9__task_dead__ctx_dead.1234-abcd"
+        orphan.mkdir()
+        (orphan / "input.md").write_text("partial", encoding="utf-8")
+
+        incomplete = run_logging.sweep_final_review_audit_staging(
+            self.RUN_ID, base=self.base
+        )
+
+        self.assertTrue(orphan.exists(), "the only evidence of that attempt")
+        self.assertEqual(
+            incomplete,
+            [
+                {
+                    "dispatch_key": "attempt9__task_dead__ctx_dead",
+                    "staging_dir": orphan.name,
+                    "files_present": ["input.md"],
+                    "files_absent": ["report.md", "record.json"],
+                }
+            ],
+        )
+
+    def test_an_abandoned_staging_entry_whose_record_published_is_scratch(
+        self,
+    ) -> None:
+        published = self.write_record(provenance_state="accepted",
+                                      settlement_state="settled")
+        staging = self.root / "final_review_audit" / ".staging"
+        staging.mkdir(parents=True, exist_ok=True)
+        redundant = staging / f"{published.name}.9999-ffff"
+        redundant.mkdir()
+
+        incomplete = run_logging.sweep_final_review_audit_staging(
+            self.RUN_ID, base=self.base
+        )
+
+        self.assertEqual(incomplete, [])
+        self.assertFalse(redundant.exists())
+        self.assertTrue(published.is_dir(), "the published bytes are untouched")
+
+    def test_staging_is_never_read_as_a_record(self) -> None:
+        staging = self.root / "final_review_audit" / ".staging"
+        (staging / "attempt1__task_x__ctx_y.1-2").mkdir(parents=True)
+
+        self.assertEqual(
+            run_logging.iter_final_review_audit_records(self.RUN_ID, base=self.base),
+            [],
+        )
+        provenance = run_logging.read_final_review_attempt_provenance(
+            self.RUN_ID, 1, base=self.base
+        )
+        self.assertEqual(provenance["records"], [])
+        self.assertIsNone(provenance["accepted_dispatch_key"])
+
+
+class RedactionPolicyTests(unittest.TestCase):
+    """D-C: deterministic, ordered, and carrying no redacted value."""
+
+    def test_a_dispatch_capability_never_survives(self) -> None:
+        redacted, counts = run_logging.redact_text(
+            "dcap_wU0XeTEkK6NvqvqcHdWD7tmS7Q87vP3Ne8_bZ0crt04 is the token"
+        )
+
+        self.assertNotIn("dcap_wU0XeTEkK6", redacted)
+        self.assertIn("<REDACTED:orca_dispatch_capability>", redacted)
+        self.assertEqual(
+            counts, ({"category": "orca_dispatch_capability", "count": 1},)
+        )
+
+    def test_only_the_user_segment_of_a_local_path_is_replaced(self) -> None:
+        redacted, _counts = run_logging.redact_text(
+            _local_path("someone", "aiAssistedProjects/orca-skills/scripts/x.py")
+        )
+
+        self.assertEqual(
+            redacted,
+            _HOME
+            + "<REDACTED:absolute_local_path>/aiAssistedProjects/orca-skills"
+            + "/scripts/x.py",
+        )
+
+    def test_an_already_placeheld_path_is_not_double_redacted(self) -> None:
+        text = _HOME + "<name>/skills"
+        self.assertEqual(run_logging.redact_text(text), (text, ()))
+
+    def test_an_env_secret_keeps_its_name_and_loses_its_value(self) -> None:
+        redacted, counts = run_logging.redact_text('GITHUB_TOKEN="ghp_abc123"')
+
+        self.assertIn("GITHUB_TOKEN", redacted)
+        self.assertNotIn("ghp_abc123", redacted)
+        self.assertEqual(counts, ({"category": "env_secret_pattern", "count": 1},))
+
+    def test_a_url_credential_loses_its_userinfo(self) -> None:
+        redacted, counts = run_logging.redact_text(
+            "clone https://alice:s3cret@example.com/repo.git"
+        )
+
+        self.assertNotIn("s3cret", redacted)
+        self.assertNotIn("alice", redacted)
+        self.assertEqual(counts, ({"category": "url_credential", "count": 1},))
+
+    def test_identifiers_that_are_not_credentials_are_preserved(self) -> None:
+        """Section 1 explicitly requires reviewer terminal identity."""
+        text = (
+            "term_6ac06c14-6bb5-4e56-ac30-4ecb313371f3 task_2d0a6f4fc5a4 "
+            "ctx_ab12cd34ef56 capability_hash=a5f41c33c097c51c"
+        )
+        self.assertEqual(run_logging.redact_text(text), (text, ()))
+
+    def test_redaction_is_deterministic(self) -> None:
+        text = (
+            f"dcap_AAAAAAAAAAAA {_local_path('one', 'a')} "
+            f"{_local_path('two', 'b')} API_KEY=zzz "
+            "https://u:p@h/x dcap_BBBBBBBBBBBB"
+        )
+
+        first = run_logging.redact_text(text)
+        second = run_logging.redact_text(text)
+
+        self.assertEqual(first, second)
+        self.assertEqual(
+            run_logging.sha256_text(first[0]), run_logging.sha256_text(second[0])
+        )
+
+    def test_the_counts_are_ordered_by_policy_and_omit_zero(self) -> None:
+        redacted, counts = run_logging.redact_text(
+            f"dcap_AAAAAAAAAAAA and {_local_path('one', 'a')} "
+            f"and {_local_path('two', 'b')}"
+        )
+
+        self.assertEqual(
+            counts,
+            (
+                {"category": "orca_dispatch_capability", "count": 1},
+                {"category": "absolute_local_path", "count": 2},
+            ),
+        )
+        self.assertNotIn("url_credential", redacted)
+
+    def test_nothing_matched_reads_as_an_empty_list(self) -> None:
+        self.assertEqual(run_logging.redact_text("plain text"), ("plain text", ()))
+
+    def test_the_counts_carry_no_redacted_value_and_no_offset(self) -> None:
+        _redacted, counts = run_logging.redact_text("dcap_SECRETVALUE1234")
+
+        for entry in counts:
+            self.assertEqual(set(entry), {"category", "count"})
+            self.assertNotIn("SECRETVALUE", json.dumps(entry))
+
+    def test_an_unknown_policy_version_is_refused(self) -> None:
+        with self.assertRaises(RunLoggingError):
+            run_logging.redact_text("x", policy_version="redaction/9.9")
+
+    def test_the_superseded_policy_version_is_refused_too(self) -> None:
+        """Older records keep their redaction/1.0 stamp as DATA; readers read that
+        string, they never re-run the policy from it."""
+        with self.assertRaises(RunLoggingError):
+            run_logging.redact_text("x", policy_version="redaction/1.0")
+
+
+class ForeignAbsolutePathRedactionTests(unittest.TestCase):
+    """T-3's R1 regression guard: category 5, positives and negatives, one by one.
+
+    The shipped baseline carried a /private/tmp/... path through untouched and reported
+    zero redactions, because redaction/1.0 stated the absolute-path rule as an allowlist
+    of three roots. The count assertion below is itself part of the guard.
+    """
+
+    PLACEHOLDER = "<REDACTED:foreign_absolute_path>"
+
+    POSITIVES = (
+        "/private/tmp/claude-501/-Users-luminous-aiAssistedProjects-orca-skills"
+        "/9b570fb8-7a72/scratchpad/os22/REPORT.md",
+        "/var/folders/ab/cd/T/tmpxyz",
+        "/tmp/a/b",
+        "/opt/homebrew/bin/python3",
+        "/etc/passwd",
+        # D3-001: one-segment absolute paths. Each identifies a user, a uid-derived
+        # workspace or a session, so the >= 2-segment floor the first draft carried was
+        # an exclusion carved out of a default-deny rule -- the same fail-open shape as
+        # the prefix allowlist, one level down.
+        "/tmp",
+        "/luminous",
+        "/workspace-501",
+        "/session-1f2e3d4c-9a8b",
+    )
+    NEGATIVES = (
+        "https://host/a/b",
+        "postgres://host/db",
+        "<ARTIFACT_ROOT>/final_review_audit/k/input.md",
+        "artifacts/runs/run_x/report.md",
+        "PASS/FAIL",
+        "and/or",
+        "redaction/1.1",
+    )
+
+    def test_every_non_home_absolute_path_is_replaced_whole(self) -> None:
+        for value in self.POSITIVES:
+            with self.subTest(value=value):
+                redacted, counts = run_logging.redact_text(value)
+
+                self.assertEqual(redacted, self.PLACEHOLDER)
+                self.assertEqual(
+                    [dict(entry) for entry in counts],
+                    [{"category": "foreign_absolute_path", "count": 1}],
+                )
+                for fragment in ("luminous", "501", "1f2e3d4c", "9b570fb8"):
+                    self.assertNotIn(fragment, redacted)
+
+    def test_a_file_url_keeps_its_scheme_and_loses_its_path(self) -> None:
+        redacted, counts = run_logging.redact_text("file:///private/tmp/a/b")
+
+        self.assertEqual(redacted, "file://" + self.PLACEHOLDER)
+        self.assertEqual(counts[0]["category"], "foreign_absolute_path")
+
+    def test_the_four_guaranteed_exemptions_survive(self) -> None:
+        for value in self.NEGATIVES:
+            with self.subTest(value=value):
+                self.assertEqual(run_logging.redact_text(value), (value, ()))
+
+    def test_a_home_path_stays_readable_and_is_not_swallowed_whole(self) -> None:
+        path = _local_path("luminous", "repo/x.py")
+        redacted, counts = run_logging.redact_text(path)
+
+        self.assertEqual(
+            redacted, _HOME + "<REDACTED:absolute_local_path>/repo/x.py"
+        )
+        self.assertEqual(
+            [entry["category"] for entry in counts], ["absolute_local_path"]
+        )
+
+    def test_the_policy_is_idempotent_over_both_tables(self) -> None:
+        for value in (
+            *self.POSITIVES,
+            *self.NEGATIVES,
+            "file:///private/tmp/a/b",
+            _local_path("luminous", "repo/x.py"),
+            "built under /luminous with dcap_AAAAAAAAAAAA",
+        ):
+            with self.subTest(value=value):
+                once = run_logging.redact_text(value)[0]
+
+                self.assertEqual(run_logging.redact_text(once)[0], once)
+
+
+class RetainedPathFieldClassifierTests(unittest.TestCase):
+    """C.7: the classifier is TOTAL, and D3-001's loophole is closed by name."""
+
+    PLACEHOLDER = "<REDACTED:foreign_absolute_path>"
+
+    REPLACED = (
+        # Every one of these four is ONE segment -- the exact shape the >= 2-segment
+        # floor plus a fixed-point test let through.
+        "/luminous",
+        "/tmp",
+        "/workspace-501",
+        "/session-1f2e3d4c",
+        "/private/tmp/a/b",
+        "file:///private/tmp/a/b",
+        # A PARTIALLY substituted home path is still an absolute path, so the field
+        # form replaces it whole: category 4's readability-preserving behaviour is a
+        # free-text rule and deliberately does not apply to a whole-value path field.
+        _HOME + "<REDACTED:absolute_local_path>/repo/x.py",
+        "C:" + "\\Users\\bob\\x",
+        "C:" + "/Users/bob",
+        "a/../../etc/passwd",
+        "..",
+        "built under /luminous",
+    )
+    UNCHANGED = (
+        "final_review_audit/k/input.md",
+        "artifacts/runs/run_x/report.md",
+        "<REPO>/artifacts/x/FINAL_REVIEW.md",
+        "https://example.com/a",
+        "HTTPS://EX.COM/a",
+        "",
+        "<REDACTED:foreign_absolute_path>",
+    )
+
+    def test_everything_outside_p1_to_p4_is_replaced_in_full(self) -> None:
+        for value in self.REPLACED:
+            with self.subTest(value=value):
+                self.assertEqual(
+                    run_logging.normalize_retained_path_field(value), self.PLACEHOLDER
+                )
+
+    def test_the_four_allowed_categories_are_returned_unchanged(self) -> None:
+        for value in self.UNCHANGED:
+            with self.subTest(value=value):
+                self.assertEqual(
+                    run_logging.normalize_retained_path_field(value), value
+                )
+
+    def test_the_classifier_is_total_and_the_postcondition_agrees_with_it(self) -> None:
+        for value in (*self.REPLACED, *self.UNCHANGED):
+            with self.subTest(value=value):
+                normalized = run_logging.normalize_retained_path_field(value)
+
+                self.assertEqual(
+                    run_logging.normalize_retained_path_field(normalized), normalized
+                )
+                run_logging.assert_retained_path_field(normalized)
+
+    def test_the_postcondition_is_not_a_fixed_point_test(self) -> None:
+        """redact_text("/luminous") was a fixed point under redaction/1.0, and the
+        writer would have accepted the value on exactly that reasoning (D3-001)."""
+        with self.assertRaises(RunLoggingError):
+            run_logging.assert_retained_path_field("/luminous")
+
+
+class RetainedArtifactSecurityTests(_AuditTestCase):
+    """T-3's shape: what reaches disk, and whether the digests re-derive."""
+
+    SECRET_REPORT = (
+        "RESULT: FAIL\nREVIEW_VERDICT: FAIL\n\n"
+        "Location: " + _local_path("luminous", "orca-skills/scripts/x.py") + "\n"
+        "capability: dcap_wU0XeTEkK6NvqvqcHdWD7tmS7Q87vP3Ne8_bZ0crt04\n"
+    )
+
+    def test_no_secret_survives_into_the_retained_report(self) -> None:
+        self.write_report(self.SECRET_REPORT)
+
+        published = self.write_record(provenance_state="accepted",
+                                      settlement_state="settled")
+
+        retained = (published / "report.md").read_text(encoding="utf-8")
+        self.assertNotIn("dcap_wU0XeTEkK6", retained)
+        self.assertNotIn(_local_path("luminous"), retained)
+        self.assertNotIn("luminous", retained)
+        self.assertIn("<REDACTED:orca_dispatch_capability>", retained)
+
+    def test_the_retained_artifact_carries_the_redacted_text_and_nothing_else(
+        self,
+    ) -> None:
+        """No header, no front matter: the digest is verifiable with read_bytes()."""
+        self.write_report(self.SECRET_REPORT)
+
+        published = self.write_record()
+
+        record = self.record_json(published)
+        data = (published / "report.md").read_bytes()
+        self.assertEqual(
+            run_logging.sha256_bytes(data),
+            record["report"]["artifact_digest_post_redaction"],
+        )
+        self.assertEqual(len(data), record["report"]["byte_length_post_redaction"])
+        self.assertEqual(
+            data.decode("utf-8"), run_logging.redact_text(self.SECRET_REPORT)[0]
+        )
+
+    def test_the_pre_and_post_identity_is_rederivable(self) -> None:
+        self.write_report(self.SECRET_REPORT)
+
+        record = self.record_json(self.write_record())
+
+        report = record["report"]
+        self.assertEqual(
+            report["report_digest_pre_redaction"],
+            run_logging.sha256_text(self.SECRET_REPORT),
+        )
+        redacted, counts = run_logging.redact_text(self.SECRET_REPORT)
+        self.assertEqual(
+            report["artifact_digest_post_redaction"], run_logging.sha256_text(redacted)
+        )
+        self.assertEqual(report["redactions"], [dict(entry) for entry in counts])
+        self.assertEqual(
+            report["redaction_policy_version"],
+            run_logging.FINAL_REVIEW_REDACTION_POLICY_VERSION,
+        )
+
+    def test_the_four_identity_fields_are_all_present(self) -> None:
+        self.write_report(PASSING_REPORT)
+
+        report = self.record_json(self.write_record())["report"]
+
+        for field in (
+            "report_digest_pre_redaction",
+            "redaction_policy_version",
+            "artifact_digest_post_redaction",
+            "redactions",
+        ):
+            with self.subTest(field=field):
+                self.assertIsNotNone(report[field])
+
+    def test_the_implementation_hard_codes_no_observed_input_size(self) -> None:
+        """ANALYSIS F6: an observed agent_prompt_blocked size is not a product
+        constant. `observed_input_bytes` is data the runtime reports, never a
+        threshold this module compares against."""
+        source = (REPO_ROOT / "scripts" / "run_logging.py").read_text(encoding="utf-8")
+        section = source.split("# ---- OS-22:")[1]
+        for forbidden in ("14805", "5553", "2269", "14.8", "5.5", "2.3"):
+            with self.subTest(constant=forbidden):
+                self.assertNotIn(forbidden, section)
+
+
+class RetainedPathFieldRecordTests(_AuditTestCase):
+    """C.7 P-PATH on the record itself, whatever code path wrote the value."""
+
+    PLACEHOLDER = "<REDACTED:foreign_absolute_path>"
+
+    def test_the_three_resolution_rungs_produce_the_three_allowed_forms(self) -> None:
+        inside = self.root / "FINAL_REVIEW.md"
+        inside.write_text(PASSING_REPORT, encoding="utf-8")
+        in_repo = self.base / "docs" / "FINAL_REVIEW.md"
+        in_repo.parent.mkdir(parents=True, exist_ok=True)
+        in_repo.write_text(PASSING_REPORT, encoding="utf-8")
+        with tempfile.TemporaryDirectory() as scratch:
+            outside = Path(scratch) / "REPORT.md"
+            outside.write_text(PASSING_REPORT, encoding="utf-8")
+
+            cases = (
+                (inside, "FINAL_REVIEW.md", "ctx_in"),
+                (in_repo, "<REPO>/docs/FINAL_REVIEW.md", "ctx_repo"),
+                (outside, self.PLACEHOLDER, "ctx_out"),
+            )
+            for path, expected, dispatch in cases:
+                with self.subTest(expected=expected):
+                    directory = self.write_record(
+                        report_path=path, dispatch_id=dispatch
+                    )
+                    record = self.record_json(directory)
+
+                    self.assertEqual(record["report"]["contract_path"], expected)
+
+    def test_a_scratch_path_leaves_no_fragment_in_the_record(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            outside = Path(scratch) / "luminous-workspace" / "REPORT.md"
+            outside.parent.mkdir(parents=True)
+            outside.write_text(PASSING_REPORT, encoding="utf-8")
+
+            directory = self.write_record(report_path=outside)
+
+        raw = (directory / "record.json").read_text(encoding="utf-8")
+        self.assertNotIn("luminous-workspace", raw)
+        self.assertIn(self.PLACEHOLDER, raw)
+
+    def test_no_string_anywhere_in_the_record_begins_with_a_separator(self) -> None:
+        """The generic sweep: it does not ask whether the policy RECOGNISED the value,
+        which is what makes it catch a newly added path field nobody routed through the
+        ladder."""
+        with tempfile.TemporaryDirectory() as scratch:
+            outside = Path(scratch) / "REPORT.md"
+            outside.write_text(PASSING_REPORT, encoding="utf-8")
+            directory = self.write_record(report_path=outside)
+
+        record = self.record_json(directory)
+
+        def walk(node):
+            if isinstance(node, str):
+                yield node
+            elif isinstance(node, dict):
+                for value in node.values():
+                    yield from walk(value)
+            elif isinstance(node, list):
+                for value in node:
+                    yield from walk(value)
+
+        for value in walk(record):
+            with self.subTest(value=value):
+                self.assertFalse(value.startswith("/"))
+
+        for dotted in run_logging.FINAL_REVIEW_RETAINED_PATH_FIELDS:
+            section, _, field = dotted.partition(".")
+            value = record[section][field]
+            with self.subTest(field=dotted):
+                self.assertEqual(
+                    run_logging.normalize_retained_path_field(value), value
+                )
+
+    def test_the_postcondition_raises_rather_than_writes(self) -> None:
+        """With the ladder stubbed, record assembly is the last line of defence -- and
+        the one-segment case must fail closed exactly like the multi-segment one."""
+        for forged in ("/private/tmp/a/b/REPORT.md", "/luminous"):
+            with self.subTest(forged=forged):
+                with patch.object(
+                    run_logging, "_relative_artifact_path", return_value=forged
+                ):
+                    with self.assertRaises(RunLoggingError):
+                        self.write_record(dispatch_id="ctx_forged")
+
+                audit = self.root / "final_review_audit"
+                published = [
+                    entry
+                    for entry in (audit.iterdir() if audit.is_dir() else [])
+                    if entry.name != ".staging"
+                ]
+                self.assertEqual(published, [])
+
+
+class RecordMetadataRedactionTests(_AuditTestCase):
+    """record.json is a retained artifact too: its free-form metadata is redacted.
+
+    Redaction of `input.md`/`report.md` alone leaves the record itself as a leak
+    channel -- a workspace path in `process_incarnation`, a credential quoted into
+    `last_failure`, an agent command line, a human note. Every one of those is
+    exercised here through the real writer, against the bytes that reach disk.
+    """
+
+    CAPABILITY = "dcap_AAAAAAAAAAAAAAAAAAAA"
+    SECRET = "ORCA_TOKEN=topsecretvalue"
+    USER = "alice"
+
+    def poisoned(self, label: str) -> str:
+        return (
+            f"{label}: {self.CAPABILITY} {self.SECRET} "
+            + _local_path(self.USER, "private/repo")
+        )
+
+    def evidence(self) -> dict:
+        return {
+            "status": "failed",
+            "contract_version": "1.0",
+            "capability_hash": "sha256:0123456789abcdef",
+            "assignee_handle": "term_assignee",
+            "process_incarnation": "pid:7:" + _local_path(self.USER, "private/repo"),
+            "failure_count": 2,
+            "last_failure": self.poisoned("last_failure"),
+            "termination_reason": self.poisoned("termination_reason"),
+        }
+
+    def poisoned_report(self) -> str:
+        """A well-formed report whose FINDING IDS are report-controlled hostile
+        tokens: one credential-shaped (ID-shaped, so redaction has to catch it) and
+        two that are not id-shaped at all (so the shape check has to)."""
+        return (
+            "RESULT: PASS\nREVIEW_VERDICT: PASS WITH NOTES\n\n"
+            f"ID: {self.CAPABILITY}\nBlocking: YES\nLocation: a.py\n\n"
+            f"ID: {self.SECRET}\nBlocking: NO\nLocation: b.py\n\n"
+            f"ID: {_local_path(self.USER, 'private/repo')}\n"
+            "Blocking: NO\nLocation: c.py\n"
+        )
+
+    def write_poisoned_record(self, report: str | None = None, **overrides):
+        """One record with a credential and a home path down every covered path."""
+        self.write_report(self.poisoned_report() if report is None else report)
+        with patch(
+            "scripts.run_logging.capture_stored_task_spec",
+            return_value=(None, self.poisoned("capture failed")),
+        ), patch(
+            "scripts.run_logging.capture_delivery_evidence",
+            return_value=(self.evidence(), ""),
+        ), patch(
+            "scripts.run_logging._capture_repository_state", return_value=None
+        ):
+            kwargs = dict(
+                capture=True,
+                reviewer_terminal="term_reviewer",
+                reviewer_agent_command=self.poisoned("claude --print"),
+                reviewer_agent_origin=self.poisoned("resolved_from"),
+                provenance_state="voided",
+                void_reason="settlement_failure",
+                settlement_state="not_settled",
+                failure_detail=self.poisoned("agent_prompt_blocked"),
+                notes=self.poisoned("see"),
+            )
+            kwargs.update(overrides)
+            return self.write_record(**kwargs)
+
+    def test_no_credential_and_no_home_path_survives_into_record_json(self) -> None:
+        published = self.write_poisoned_record()
+
+        raw = (published / "record.json").read_text(encoding="utf-8")
+        self.assertNotIn(self.CAPABILITY, raw)
+        self.assertNotIn("topsecretvalue", raw)
+        self.assertNotIn(self.USER, raw)
+        self.assertNotIn(_local_path(self.USER), raw)
+        self.assertIn("<REDACTED:orca_dispatch_capability>", raw)
+        self.assertIn("<REDACTED:env_secret_pattern>", raw)
+        self.assertIn("<REDACTED:absolute_local_path>", raw)
+
+    def test_every_injection_route_is_redacted_field_by_field(self) -> None:
+        """One assertion per route the correction names, so a partial fix fails."""
+        record = self.record_json(self.write_poisoned_record())
+
+        routes = {
+            "reviewer_agent_command": record["reviewer_agent_command"],
+            "reviewer_agent_origin": record["reviewer_agent_origin"],
+            "failure_detail": record["failure_detail"],
+            "notes": record["notes"],
+            "stored_task_spec.capture_error": record["stored_task_spec"][
+                "capture_error"
+            ],
+            "delivery_evidence.process_incarnation": record["delivery_evidence"][
+                "process_incarnation"
+            ],
+            "delivery_evidence.last_failure": record["delivery_evidence"][
+                "last_failure"
+            ],
+            "delivery_evidence.termination_reason": record["delivery_evidence"][
+                "termination_reason"
+            ],
+        }
+        for field, value in routes.items():
+            with self.subTest(field=field):
+                self.assertNotIn(self.CAPABILITY, value)
+                self.assertNotIn("topsecretvalue", value)
+                self.assertNotIn(self.USER, value)
+                self.assertIn("<REDACTED:absolute_local_path>", value)
+
+    def test_the_identities_the_record_exists_to_prove_are_not_redacted(self) -> None:
+        """The other half of secret-safe: over-redaction destroys the evidence."""
+        record = self.record_json(self.write_poisoned_record())
+
+        self.assertEqual(record["reviewer_terminal"], "term_reviewer")
+        self.assertEqual(record["task_id"], "task_aaa")
+        self.assertEqual(record["dispatch_id"], "ctx_bbb")
+        self.assertEqual(record["dispatch_key"], "attempt1__task_aaa__ctx_bbb")
+        delivery = record["delivery_evidence"]
+        self.assertEqual(delivery["assignee_handle"], "term_assignee")
+        self.assertEqual(delivery["capability_hash"], "sha256:0123456789abcdef")
+        self.assertEqual(delivery["failure_count"], 2)
+        self.assertEqual(record["provenance_state"], "voided")
+        self.assertEqual(record["void_reason"], "settlement_failure")
+
+    def test_the_record_states_what_was_covered_and_what_matched(self) -> None:
+        record = self.record_json(self.write_poisoned_record())
+
+        block = record["metadata_redaction"]
+        self.assertEqual(
+            block["redaction_policy_version"],
+            run_logging.FINAL_REVIEW_REDACTION_POLICY_VERSION,
+        )
+        self.assertEqual(
+            block["covered_fields"],
+            list(run_logging.FINAL_REVIEW_REDACTED_METADATA_FIELDS),
+        )
+        # C.4's shape: policy order, an entry only for a category that matched, no
+        # offset and no removed value anywhere in the block.
+        self.assertEqual(
+            [entry["category"] for entry in block["redactions"]],
+            ["orca_dispatch_capability", "env_secret_pattern", "absolute_local_path"],
+        )
+        for entry in block["redactions"]:
+            self.assertEqual(sorted(entry), ["category", "count"])
+            self.assertGreater(entry["count"], 0)
+
+    def test_a_clean_record_records_no_substitution(self) -> None:
+        """`[]` unambiguously means nothing was substituted."""
+        record = self.record_json(self.write_record(notes="nothing to hide"))
+
+        self.assertEqual(record["metadata_redaction"]["redactions"], [])
+        self.assertEqual(record["notes"], "nothing to hide")
+
+    def test_the_report_capture_error_route_is_covered(self) -> None:
+        """Exercised directly: this error is built from an already-relative path,
+        so the guarantee is the choke point, not the one message it usually holds."""
+        record = {"report": {"capture_error": self.poisoned("unreadable")}}
+
+        counts = run_logging._redact_record_metadata(record)
+
+        value = record["report"]["capture_error"]
+        self.assertNotIn(self.CAPABILITY, value)
+        self.assertNotIn(self.USER, value)
+        self.assertEqual(
+            [entry["category"] for entry in counts],
+            ["orca_dispatch_capability", "env_secret_pattern", "absolute_local_path"],
+        )
+
+    def test_the_choke_point_skips_absent_and_non_string_values(self) -> None:
+        """The record's shape is decided by its writer, never by the redactor."""
+        record = {"notes": None, "delivery_evidence": None, "failure_detail": ""}
+
+        self.assertEqual(run_logging._redact_record_metadata(record), [])
+        self.assertEqual(record, {"notes": None, "delivery_evidence": None,
+                                  "failure_detail": ""})
+
+    # I-002-R1. The report is the one input NOBODY on the writer side controls, and
+    # its parse output lands in the record. Each route below injects a capability
+    # token, an env-secret value and a `/Users/<name>/` path through the report and
+    # asserts against the bytes that reach disk.
+
+    def assert_record_bytes_are_clean(self, published) -> None:
+        raw = (published / "record.json").read_text(encoding="utf-8")
+        self.assertNotIn(self.CAPABILITY, raw)
+        self.assertNotIn("topsecretvalue", raw)
+        self.assertNotIn(self.USER, raw)
+        self.assertNotIn(_local_path(self.USER), raw)
+
+    def test_a_malformed_result_never_reaches_the_record_as_raw_text(self) -> None:
+        published = self.write_poisoned_record(
+            report=f"RESULT: {self.poisoned('nonsense')}\n"
+        )
+
+        parsed = self.record_json(published)["report"]["parsed"]
+        # The invalid capture is not the field's value; the field stays in its set.
+        self.assertEqual(parsed["result"], run_logging.PARSED_ENUM_INVALID)
+        self.assertEqual(parsed["parse_status"], "malformed")
+        # It is still said, once, in the field that exists to say it -- redacted.
+        self.assertIn("RESULT:", parsed["parse_error"])
+        self.assertIn("<REDACTED:orca_dispatch_capability>", parsed["parse_error"])
+        self.assertIn("<REDACTED:env_secret_pattern>", parsed["parse_error"])
+        self.assertIn("<REDACTED:absolute_local_path>", parsed["parse_error"])
+        self.assert_record_bytes_are_clean(published)
+
+    def test_a_malformed_review_verdict_never_reaches_the_record_raw(self) -> None:
+        published = self.write_poisoned_record(
+            report=f"RESULT: PASS\nREVIEW_VERDICT: {self.poisoned('nonsense')}\n"
+        )
+
+        parsed = self.record_json(published)["report"]["parsed"]
+        self.assertEqual(parsed["result"], "PASS")
+        self.assertEqual(parsed["review_verdict"], run_logging.PARSED_ENUM_INVALID)
+        self.assertEqual(parsed["parse_status"], "malformed")
+        self.assertIn("REVIEW_VERDICT:", parsed["parse_error"])
+        self.assertIn("<REDACTED:orca_dispatch_capability>", parsed["parse_error"])
+        self.assert_record_bytes_are_clean(published)
+
+    def test_report_controlled_finding_ids_are_constrained_and_redacted(self) -> None:
+        published = self.write_poisoned_record()
+
+        parsed = self.record_json(published)["report"]["parsed"]
+        self.assertEqual(parsed["parse_status"], "ok")
+        # ID-shaped but a credential: the shape check passes it, redaction does not.
+        blocking = parsed["blocking_finding_ids"]
+        self.assertEqual(len(blocking), 1)
+        self.assertNotIn(self.CAPABILITY, blocking[0])
+        self.assertIn("<REDACTED:", blocking[0])
+        # Not ID-shaped at all: replaced outright, and the count stays honest.
+        self.assertEqual(
+            parsed["non_blocking_finding_ids"],
+            [run_logging.PARSED_FINDING_ID_INVALID] * 2,
+        )
+        self.assert_record_bytes_are_clean(published)
+
+    def test_a_well_formed_report_keeps_its_ids_and_its_enums(self) -> None:
+        """The other half again: constraining must not destroy real evidence."""
+        published = self.write_poisoned_record(report=FAILING_REPORT)
+
+        parsed = self.record_json(published)["report"]["parsed"]
+        self.assertEqual(parsed["parse_status"], "ok")
+        self.assertEqual(parsed["parse_error"], "")
+        self.assertEqual(parsed["result"], "FAIL")
+        self.assertEqual(parsed["review_verdict"], "FAIL")
+        self.assertEqual(parsed["blocking_finding_ids"], ["R1"])
+        self.assertEqual(parsed["non_blocking_finding_ids"], ["R2"])
+
+    def test_no_free_form_string_field_escapes_the_covered_list(self) -> None:
+        """The durable guard: a new string field added to the record must be either
+        declared free-form (and redacted) or declared an identity here."""
+        record = self.record_json(self.write_poisoned_record())
+
+        def leaves(node, prefix=""):
+            if isinstance(node, dict):
+                for name, value in node.items():
+                    yield from leaves(value, f"{prefix}{name}.")
+            elif isinstance(node, list):
+                for value in node:
+                    yield from leaves(value, f"{prefix}[].")
+            elif isinstance(node, str):
+                yield prefix[:-1]
+
+        # Identities, enums, constants, digests, timestamps and paths that are
+        # relativized-or-redacted at construction. Anything NOT here must be covered.
+        exempt = {
+            "schema_version", "record_kind", "run_id", "task_id", "dispatch_id",
+            "dispatch_key", "recorded_at", "reviewer_terminal", "provenance_state",
+            "void_reason", "settlement_state", "input_altered_across_retry",
+            "stored_task_spec.source", "stored_task_spec.capture_status",
+            "stored_task_spec.captured_at",
+            "stored_task_spec.redaction_policy_version",
+            "stored_task_spec.artifact_path",
+            "delivery_evidence.source", "delivery_evidence.capture_status",
+            "delivery_evidence.captured_at", "delivery_evidence.dispatch_status",
+            "delivery_evidence.contract_version", "delivery_evidence.capability_hash",
+            "delivery_evidence.assignee_handle",
+            "report.contract_path", "report.resolution", "report.capture_status",
+            "report.captured_at", "report.redaction_policy_version",
+            "report.artifact_path",
+            "report.report_digest_pre_redaction",
+            "report.artifact_digest_post_redaction",
+            "report.redactions.[].category",
+            "report.parsed.parse_status",
+            "metadata_redaction.redaction_policy_version",
+            "metadata_redaction.covered_fields.[]",
+            "metadata_redaction.redactions.[].category",
+        }
+        # I-002-R1. Parser output is NOT exempt by being called an enum: a field is
+        # exempt here only if the writer constrains it to a closed set BEFORE it is
+        # persisted, and that claim is proved against the bytes on disk rather than
+        # asserted by listing the field's name. `parse_error` and the finding-id
+        # lists are constrained by nothing, so they are covered instead.
+        constrained = {
+            "report.parsed.result": {
+                "", run_logging.PARSED_ENUM_INVALID, *run_logging.RESULT_VALUES,
+            },
+            "report.parsed.review_verdict": {
+                "",
+                run_logging.PARSED_ENUM_INVALID,
+                *run_logging.REVIEW_VERDICT_VALUES,
+            },
+        }
+        covered = set(run_logging.FINAL_REVIEW_REDACTED_METADATA_FIELDS)
+
+        for field, allowed in constrained.items():
+            with self.subTest(field=field):
+                leaf = field.rpartition(".")[2]
+                self.assertIn(record["report"]["parsed"][leaf], allowed)
+
+        for field in sorted(set(leaves(record))):
+            with self.subTest(field=field):
+                # A list of strings is covered by its containing field.
+                known = covered | exempt | set(constrained)
+                self.assertTrue(
+                    field in known or field.removesuffix(".[]") in known,
+                    f"{field} is neither covered nor declared constrained/identity",
+                )
+
+
+class AuditCaptureFailureTests(_AuditTestCase):
+    """A record that says "the input could not be captured, here is why" is evidence.
+    A missing record is not."""
+
+    def test_an_unavailable_capture_still_writes_the_record(self) -> None:
+        with patch(
+            "scripts.run_logging.capture_stored_task_spec",
+            return_value=(None, "orca was not found on PATH"),
+        ), patch(
+            "scripts.run_logging.capture_delivery_evidence",
+            return_value=(None, "orca was not found on PATH"),
+        ), patch(
+            "scripts.run_logging._capture_repository_state", return_value=None
+        ):
+            published = self.write_record(
+                capture=True,
+                provenance_state="voided",
+                void_reason="dispatch_input_rejected",
+                settlement_state="not_settled",
+                failure_detail="agent_prompt_blocked",
+                observed_input_bytes=14805,
+            )
+
+        record = self.record_json(published)
+        self.assertEqual(record["stored_task_spec"]["capture_status"], "unavailable")
+        self.assertIn("PATH", record["stored_task_spec"]["capture_error"])
+        self.assertIsNone(record["stored_task_spec"]["input_digest_pre_redaction"])
+        self.assertEqual(record["stored_task_spec"]["artifact_path"], "")
+        self.assertEqual(record["observed_input_bytes"], 14805)
+        self.assertEqual(record["failure_detail"], "agent_prompt_blocked")
+        self.assertTrue(
+            any("final_review_audit_incomplete" in row for row in self.log_rows())
+        )
+
+    def test_a_captured_spec_is_redacted_before_it_reaches_disk(self) -> None:
+        spec = f"spec with dcap_AAAAAAAAAAAAAAAA and {_local_path('someone', 'work')}"
+        with patch(
+            "scripts.run_logging.capture_stored_task_spec", return_value=(spec, "")
+        ), patch(
+            "scripts.run_logging.capture_delivery_evidence",
+            return_value=({"status": "failed", "failure_count": 1}, ""),
+        ), patch(
+            "scripts.run_logging._capture_repository_state", return_value=None
+        ):
+            published = self.write_record(capture=True)
+
+        retained = (published / "input.md").read_text(encoding="utf-8")
+        self.assertNotIn("dcap_AAAAAAAAAAAAAAAA", retained)
+        self.assertNotIn("someone", retained)
+        record = self.record_json(published)
+        stored = record["stored_task_spec"]
+        self.assertEqual(stored["capture_status"], "captured")
+        self.assertEqual(
+            stored["input_digest_pre_redaction"], run_logging.sha256_text(spec)
+        )
+        self.assertEqual(
+            stored["artifact_path"],
+            "final_review_audit/attempt1__task_aaa__ctx_bbb/input.md",
+        )
+        self.assertEqual(record["delivery_evidence"]["dispatch_status"], "failed")
+        self.assertEqual(record["delivery_evidence"]["capture_status"], "captured")
+
+    def test_a_missing_report_is_recorded_as_absent(self) -> None:
+        record = self.record_json(
+            self.write_record(
+                provenance_state="voided",
+                void_reason="report_missing",
+                settlement_state="settled",
+            )
+        )
+
+        self.assertEqual(record["report"]["capture_status"], "absent")
+        self.assertEqual(record["report"]["parsed"]["parse_status"], "not_attempted")
+        self.assertEqual(record["void_reason"], "report_missing")
+
+    def test_a_malformed_report_is_still_snapshotted(self) -> None:
+        self.write_report("this report has no RESULT line at all\n")
+
+        published = self.write_record(
+            provenance_state="voided",
+            void_reason="report_malformed",
+            settlement_state="settled",
+        )
+
+        record = self.record_json(published)
+        self.assertEqual(record["report"]["capture_status"], "captured")
+        self.assertEqual(record["report"]["parsed"]["parse_status"], "malformed")
+        self.assertIn(
+            "this report has no RESULT line",
+            (published / "report.md").read_text(encoding="utf-8"),
+        )
+
+
+class EvidenceBundleTests(_AuditTestCase):
+    """D-F: self-contained, digest-checked, and honest about what is missing."""
+
+    def test_the_bundle_inlines_the_minimum_evidence_subset(self) -> None:
+        self.write_report(FAILING_REPORT)
+        self.write_record(provenance_state="accepted", settlement_state="settled")
+
+        path = run_logging.export_final_review_evidence(self.RUN_ID, base=self.base)
+
+        bundle = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(path.name, "FINAL_REVIEW_EVIDENCE_BUNDLE.json")
+        self.assertEqual(bundle["bundle_kind"], "final_review_evidence_bundle")
+        self.assertEqual(
+            bundle["component_versions"]["audit_schema"],
+            run_logging.FINAL_REVIEW_AUDIT_SCHEMA_VERSION,
+        )
+        self.assertIn(
+            "final_review_audit", bundle["orchestrator_log"]["content_redacted"]
+        )
+        dispatch = bundle["attempts"][0]["dispatches"][0]
+        self.assertEqual(dispatch["record_status"], "ok")
+        self.assertIn("RESULT: FAIL", dispatch["report"]["content"])
+        self.assertTrue(dispatch["report"]["digest_verified"])
+        self.assertEqual(
+            bundle["attempts"][0]["accepted_dispatch_key"], dispatch["dispatch_key"]
+        )
+
+    def test_a_digest_mismatch_is_reported_and_the_bundle_still_ships(self) -> None:
+        self.write_report(FAILING_REPORT)
+        published = self.write_record(provenance_state="accepted",
+                                      settlement_state="settled")
+        (published / "report.md").write_text("tampered", encoding="utf-8")
+
+        bundle = json.loads(
+            run_logging.export_final_review_evidence(
+                self.RUN_ID, base=self.base
+            ).read_text(encoding="utf-8")
+        )
+
+        self.assertEqual(len(bundle["integrity"]["digest_mismatches"]), 1)
+        self.assertFalse(
+            bundle["attempts"][0]["dispatches"][0]["report"]["digest_verified"]
+        )
+        self.assertIn("tampered", bundle["attempts"][0]["dispatches"][0]["report"]["content"])
+
+    def test_incomplete_publications_are_carried_not_hidden(self) -> None:
+        staging = self.root / "final_review_audit" / ".staging"
+        orphan = staging / "attempt1__task_gone__ctx_gone.7-8"
+        orphan.mkdir(parents=True)
+        (orphan / "input.md").write_text("partial", encoding="utf-8")
+
+        bundle = json.loads(
+            run_logging.export_final_review_evidence(
+                self.RUN_ID, base=self.base
+            ).read_text(encoding="utf-8")
+        )
+
+        self.assertEqual(bundle["integrity"]["records_found"], 0)
+        self.assertEqual(
+            bundle["integrity"]["incomplete_publications"][0]["dispatch_key"],
+            "attempt1__task_gone__ctx_gone",
+        )
+
+    def test_two_exports_of_the_same_run_differ_only_in_exported_at(self) -> None:
+        self.write_report(PASSING_REPORT)
+        self.write_record(provenance_state="accepted", settlement_state="settled")
+
+        first = json.loads(
+            run_logging.export_final_review_evidence(
+                self.RUN_ID, base=self.base, out=self.base / "a.json"
+            ).read_text(encoding="utf-8")
+        )
+        second = json.loads(
+            run_logging.export_final_review_evidence(
+                self.RUN_ID, base=self.base, out=self.base / "b.json"
+            ).read_text(encoding="utf-8")
+        )
+
+        first.pop("exported_at")
+        second.pop("exported_at")
+        self.assertEqual(first, second)
+
+    def test_this_module_runs_no_write_side_git_command(self) -> None:
+        """No IMPLEMENTATION work item may add an automatic `git add`, commit or
+        push of run artifacts, in this command or anywhere else. Asserted over the
+        parsed argv literals, not over the source text -- the prose that promises it
+        also contains the words."""
+        module = ast.parse(
+            (REPO_ROOT / "scripts" / "run_logging.py").read_text(encoding="utf-8")
+        )
+        read_only = {"rev-parse", "status", "--porcelain", "HEAD", "--abbrev-ref"}
+        seen = 0
+        for node in ast.walk(module):
+            if not isinstance(node, ast.List) or not node.elts:
+                continue
+            first = node.elts[0]
+            if not (isinstance(first, ast.Constant) and first.value == "git"):
+                continue
+            seen += 1
+            for element in node.elts[1:]:
+                if isinstance(element, ast.Starred):
+                    continue
+                self.assertIsInstance(element, ast.Constant)
+                self.assertIn(element.value, read_only)
+        self.assertTrue(seen, "the git argv literals were not found at all")
+
+
+class BundleSanitizationTests(_AuditTestCase):
+    """T-7 (D-H): the exported bundle cannot carry what the redaction policy removes.
+
+    Every case here is a POSITIVE control plus a NEGATIVE control, in the same test:
+    the poisoned value provably reaches the raw local log (that is the leak the
+    unsanitized exporter shipped), and provably does not reach the bundle. An assertion
+    that only checks the bundle is clean cannot distinguish "sanitized" from "the value
+    never got there".
+    """
+
+    # Composed rather than written as a literal: release_manifest.py forbids a
+    # `/Users/<name>/` literal anywhere in the source tree, and this test exists
+    # precisely because such a path can appear at RUNTIME.
+    HOME_PREFIX = "/Users/"
+    POISON_USER = "poisoned-operator"
+
+    def home_rooted_poison(self) -> str:
+        return f"{self.HOME_PREFIX}{self.POISON_USER}/aiAssistedProjects/x"
+
+    def poison(self, **columns: str) -> str:
+        """Write one poisoned row and return the raw local log text.
+
+        Asserts the poison actually landed in the raw log first -- the positive control
+        for every negative assertion that follows.
+        """
+        run_logging.log_orchestrator_event(
+            self.RUN_ID, base=self.base, event="poisoned", **columns
+        )
+        raw = (self.root / ORCHESTRATOR_LOG_FILENAME).read_text(encoding="utf-8")
+        for value in columns.values():
+            self.assertIn(
+                value,
+                raw,
+                "positive control: the poison must reach the raw local log, or the "
+                "negative assertion below proves nothing",
+            )
+        return raw
+
+    def export(self) -> tuple[dict, str]:
+        path = run_logging.export_final_review_evidence(self.RUN_ID, base=self.base)
+        serialized = path.read_text(encoding="utf-8")
+        return json.loads(serialized), serialized
+
+    def assert_not_in_bundle(self, needle: str, serialized: str) -> None:
+        """The whole serialized bundle, not just the log object.
+
+        A leak that moved to another key is still a leak.
+        """
+        self.assertNotIn(needle, serialized)
+
+    def categories(self, bundle: dict) -> dict[str, int]:
+        return {
+            entry["category"]: entry["count"]
+            for entry in bundle["orchestrator_log"]["redactions"]
+        }
+
+    # -- T-7.1 .. T-7.5: one poisoned cell per redaction category --------------------
+
+    def test_t71_a_foreign_absolute_path_in_detail_never_reaches_the_bundle(self) -> None:
+        self.poison(detail="artifact at /Volumes/ext/build/out.md")
+
+        bundle, serialized = self.export()
+
+        self.assert_not_in_bundle("/Volumes/ext/build/out.md", serialized)
+        self.assertGreaterEqual(self.categories(bundle)["foreign_absolute_path"], 1)
+        self.assertIn(
+            run_logging.FOREIGN_PATH_PLACEHOLDER,
+            bundle["orchestrator_log"]["content_redacted"],
+        )
+
+    def test_t72_a_username_bearing_path_keeps_its_tail_and_loses_the_name(self) -> None:
+        self.poison(detail=self.home_rooted_poison())
+
+        bundle, serialized = self.export()
+
+        self.assert_not_in_bundle(f"{self.HOME_PREFIX}{self.POISON_USER}", serialized)
+        self.assertIn(
+            "/Users/<REDACTED:absolute_local_path>/aiAssistedProjects/x",
+            bundle["orchestrator_log"]["content_redacted"],
+        )
+
+    def test_t73_a_secret_named_assignment_in_result_never_reaches_the_bundle(self) -> None:
+        self.poison(result="GITHUB_TOKEN=ghp_deadbeefcafebabe0123")
+
+        bundle, serialized = self.export()
+
+        self.assert_not_in_bundle("ghp_deadbeefcafebabe0123", serialized)
+        self.assertGreaterEqual(self.categories(bundle)["env_secret_pattern"], 1)
+        # D-4.1: the residual `env_secret_pattern` match on the second pass expands to
+        # its own span, so it is recognition and not residue. The log is EMBEDDED.
+        self.assertIsNotNone(bundle["orchestrator_log"]["content_redacted"])
+        self.assertEqual(bundle["orchestrator_log"]["content_omitted_reason"], "")
+
+    def test_t74_a_url_credential_never_reaches_the_bundle(self) -> None:
+        self.poison(detail="https://user:hunter2@example.test/x")
+
+        bundle, serialized = self.export()
+
+        self.assert_not_in_bundle("hunter2", serialized)
+        self.assertGreaterEqual(self.categories(bundle)["url_credential"], 1)
+        # D-4.1: same shape as T-7.3 -- the residual `url_credential` match expands to
+        # its own span, so the log is EMBEDDED rather than omitted.
+        self.assertIsNotNone(bundle["orchestrator_log"]["content_redacted"])
+        self.assertEqual(bundle["orchestrator_log"]["content_omitted_reason"], "")
+
+    def test_t75_a_dispatch_capability_never_reaches_the_bundle(self) -> None:
+        self.poison(detail="dcap_AAAABBBBCCCCDDDDEEEEFFFF")
+
+        bundle, serialized = self.export()
+
+        self.assert_not_in_bundle("dcap_AAAABBBBCCCCDDDDEEEEFFFF", serialized)
+        self.assertGreaterEqual(
+            self.categories(bundle)["orca_dispatch_capability"], 1
+        )
+
+    # -- T-7.6: the clean case is byte-identical, and says so ------------------------
+
+    def test_t76_a_clean_log_is_embedded_verbatim_with_no_redactions(self) -> None:
+        run_logging.log_orchestrator_event(
+            self.RUN_ID, base=self.base, event="clean", detail="nothing to see"
+        )
+        raw = (self.root / ORCHESTRATOR_LOG_FILENAME).read_text(encoding="utf-8")
+
+        bundle, _ = self.export()
+
+        log = bundle["orchestrator_log"]
+        self.assertEqual(log["redactions"], [])
+        self.assertEqual(log["content_redacted"], raw)
+        self.assertEqual(log["digest_post_redaction"], log["digest_pre_redaction"])
+        self.assertEqual(log["content_omitted_reason"], "")
+
+    # -- T-7.7: the identity relationship is re-derivable ----------------------------
+
+    def test_t77_both_digests_are_independently_recomputable(self) -> None:
+        raw = self.poison(
+            detail="/Volumes/ext/a", result="AWS_SECRET_ACCESS_KEY=zzz"
+        )
+
+        bundle, _ = self.export()
+
+        log = bundle["orchestrator_log"]
+        self.assertEqual(log["digest_pre_redaction"], run_logging.sha256_text(raw))
+        expected, _counts = run_logging.redact_text(
+            raw, policy_version=log["redaction_policy_version"]
+        )
+        self.assertEqual(
+            log["digest_post_redaction"], run_logging.sha256_text(expected)
+        )
+        self.assertEqual(log["content_redacted"], expected)
+
+    # -- T-7.8: the table survives sanitization ---------------------------------------
+
+    def test_t78_every_poisoned_case_keeps_the_table_structure(self) -> None:
+        poisons = (
+            {"detail": "artifact at /Volumes/ext/build/out.md"},
+            {"detail": self.home_rooted_poison()},
+            {"result": "GITHUB_TOKEN=ghp_deadbeefcafebabe0123"},
+            {"detail": "https://user:hunter2@example.test/x"},
+            {"detail": "dcap_AAAABBBBCCCCDDDDEEEEFFFF"},
+        )
+        for columns in poisons:
+            with self.subTest(columns=columns):
+                self.setUp()
+                try:
+                    raw = self.poison(**columns)
+                    bundle, _ = self.export()
+                    embedded = bundle["orchestrator_log"]["content_redacted"]
+                    self.assertIsNotNone(
+                        embedded,
+                        "a poisoned-but-sanitizable log must be EMBEDDED, not omitted",
+                    )
+                    self.assertEqual(raw.count("\n"), embedded.count("\n"))
+                    self.assertEqual(
+                        [line.count("|") for line in raw.splitlines()],
+                        [line.count("|") for line in embedded.splitlines()],
+                    )
+                finally:
+                    self.tearDown()
+
+    # -- T-7.9: residue is omitted, and the export still ships ------------------------
+
+    def test_t79_residual_text_is_omitted_with_a_reason_and_the_export_ships(self) -> None:
+        raw = self.poison(detail="ZZ_LEAK")
+
+        # D-4.1: the corrected step 2 iterates REDACTION_CATEGORIES directly, so a
+        # stubbed `redact_text` would no longer drive it. The injected category's
+        # replacement does NOT expand to its own span, which is the residue signature:
+        # a second-pass match that still has something to REMOVE.
+        # `<REDACTED:t>` -- DESIGN T-7.9's illustrative replacement -- does not survive
+        # its own first pass: redact_text() substitutes it once and nothing matches on
+        # the second pass, so no residue exists to detect. See IMPLEMENTATION F-301.
+        # `ZZ_REDACTED_X` keeps the shape DESIGN specifies (a replacement that does NOT
+        # expand to its own span) and is reachable: `ZZ_[A-Z]+` matches `ZZ_REDACTED`
+        # inside it, and that match expands to `ZZ_REDACTED_X` != `ZZ_REDACTED`.
+        residual = ("t", re.compile(r"ZZ_[A-Z]+"), "ZZ_REDACTED_X")
+        with patch.object(
+            run_logging, "REDACTION_CATEGORIES", (residual,) + run_logging.REDACTION_CATEGORIES
+        ):
+            path = run_logging.export_final_review_evidence(self.RUN_ID, base=self.base)
+
+        bundle = json.loads(path.read_text(encoding="utf-8"))
+        log = bundle["orchestrator_log"]
+        self.assertIsNone(log["content_redacted"])
+        self.assertEqual(log["content_omitted_reason"], "redaction_residue")
+        self.assertIn(log["content_omitted_reason"], run_logging.EMBED_OMISSION_REASONS)
+        self.assertEqual(log["digest_pre_redaction"], run_logging.sha256_text(raw))
+        self.assertIsNone(log["digest_post_redaction"])
+        self.assertIn(
+            {"path": ORCHESTRATOR_LOG_FILENAME, "reason": "redaction_residue"},
+            bundle["integrity"]["omitted_content"],
+        )
+        self.assertTrue(path.is_file(), "the export must still return a written path")
+
+    def test_t79b_a_structure_changing_policy_is_omitted_not_silently_shipped(self) -> None:
+        self.poison(detail="/Volumes/ext/a")
+
+        real_redact_text = run_logging.redact_text
+
+        def pipe_eating(
+            text,
+            *,
+            policy_version=run_logging.FINAL_REVIEW_REDACTION_POLICY_VERSION,
+        ):
+            # The REAL policy still runs first: since D-4.1 the residue check is per
+            # match over REDACTION_CATEGORIES rather than a re-run of redact_text, so a
+            # stub that skipped redaction would trip the residue gate on the poison and
+            # this test would stop exercising the structure gate it is about.
+            redacted, counts = real_redact_text(text, policy_version=policy_version)
+            return redacted.replace("|", ""), counts
+
+        with patch.object(run_logging, "redact_text", pipe_eating):
+            path = run_logging.export_final_review_evidence(self.RUN_ID, base=self.base)
+
+        log = json.loads(path.read_text(encoding="utf-8"))["orchestrator_log"]
+        self.assertIsNone(log["content_redacted"])
+        self.assertEqual(log["content_omitted_reason"], "table_structure_changed")
+
+    # -- T-7.10: residue in a retained report is omitted, not embedded -----------------
+
+    def test_t710_residue_in_a_retained_report_is_omitted_with_digests_kept(self) -> None:
+        self.write_report(FAILING_REPORT)
+        published = self.write_record(
+            provenance_state="accepted", settlement_state="settled"
+        )
+        # A report written by a stub that bypassed redaction: the bytes on disk carry a
+        # raw foreign absolute path, which no current writer would produce.
+        residual = FAILING_REPORT + "\nsee /Volumes/ext/secret/report.md\n"
+        (published / "report.md").write_text(residual, encoding="utf-8")
+
+        bundle, serialized = self.export()
+
+        embedded = bundle["attempts"][0]["dispatches"][0]["report"]
+        self.assert_not_in_bundle("/Volumes/ext/secret/report.md", serialized)
+        self.assertIsNone(embedded["content"])
+        self.assertEqual(embedded["content_omitted_reason"], "redaction_residue")
+        self.assertTrue(embedded["redaction_residue_detected"])
+        self.assertIsNotNone(embedded["digest_recorded"])
+        self.assertEqual(
+            embedded["digest_recomputed"], run_logging.sha256_text(residual)
+        )
+        self.assertIn(
+            {"path": embedded["path"], "reason": "redaction_residue"},
+            bundle["integrity"]["omitted_content"],
+        )
+
+    def test_t710b_a_clean_retained_report_is_embedded_unchanged(self) -> None:
+        self.write_report(FAILING_REPORT)
+        self.write_record(provenance_state="accepted", settlement_state="settled")
+
+        bundle, _ = self.export()
+
+        embedded = bundle["attempts"][0]["dispatches"][0]["report"]
+        self.assertIn("RESULT: FAIL", embedded["content"])
+        self.assertEqual(embedded["content_omitted_reason"], "")
+        self.assertFalse(embedded["redaction_residue_detected"])
+        self.assertTrue(embedded["digest_verified"])
+
+    # -- T-7.11: the authoritative local log is never rewritten -------------------------
+
+    def test_t711_the_raw_local_log_is_byte_identical_after_the_export(self) -> None:
+        self.poison(detail="/Volumes/ext/a", result="GITHUB_TOKEN=ghp_zzzz1111")
+        log_path = self.root / ORCHESTRATOR_LOG_FILENAME
+        before = log_path.read_bytes()
+
+        self.export()
+
+        self.assertEqual(log_path.read_bytes(), before)
+        self.assertEqual(
+            run_logging.sha256_bytes(log_path.read_bytes()),
+            run_logging.sha256_bytes(before),
+        )
+        self.assertIn("/Volumes/ext/a", log_path.read_text(encoding="utf-8"))
+
+    # -- T-7.12: the schema break is visible ---------------------------------------------
+
+    def test_t712_the_export_schema_is_two_zero_and_content_is_gone(self) -> None:
+        self.poison(detail="/Volumes/ext/a")
+
+        bundle, _ = self.export()
+
+        self.assertEqual(bundle["schema_version"], "2.0")
+        self.assertEqual(bundle["component_versions"]["export_schema"], "2.0")
+        self.assertEqual(
+            run_logging.FINAL_REVIEW_EXPORT_SCHEMA_VERSION, "2.0"
+        )
+        self.assertNotIn("content", bundle["orchestrator_log"])
+        self.assertNotIn("digest", bundle["orchestrator_log"])
+        self.assertEqual(
+            bundle["orchestrator_log"]["redaction_policy_version"],
+            run_logging.FINAL_REVIEW_REDACTION_POLICY_VERSION,
+        )
+
+    # -- the gate itself, as a unit ------------------------------------------------------
+
+    # -- T-7.13 / T-7.14: the per-match residue rule (D-4.1) --------------------------
+
+    def test_t713_two_anchored_categories_are_recognised_again_and_still_embedded(
+        self,
+    ) -> None:
+        """The F-101 regression guard.
+
+        Both `env_secret_pattern` and `url_credential` preserve a readable anchor on
+        purpose, so both are COUNTED again on a second pass while removing nothing.
+        A gate that required a zero second-pass count would omit the log from exactly
+        the bundles the sanitization exists for. This test states that out loud, so a
+        contributor who re-adds `extra == ()` fails here with the reason in front of
+        them.
+        """
+        self.poison(
+            result="GITHUB_TOKEN=ghp_deadbeef1234",
+            detail="https://user:hunter2@example.test/x",
+        )
+
+        bundle, serialized = self.export()
+        log = bundle["orchestrator_log"]
+
+        self.assert_not_in_bundle("ghp_deadbeef1234", serialized)
+        self.assert_not_in_bundle("hunter2", serialized)
+        self.assertGreaterEqual(self.categories(bundle)["env_secret_pattern"], 1)
+        self.assertGreaterEqual(self.categories(bundle)["url_credential"], 1)
+        self.assertIsNotNone(log["content_redacted"])
+        self.assertEqual(log["content_omitted_reason"], "")
+
+        second_pass = run_logging.redact_text(log["content_redacted"])[1]
+        self.assertNotEqual(
+            second_pass,
+            (),
+            "a NON-EMPTY second-pass count is expected and safe: these two categories "
+            "re-match their own placeholder output and rewrite it to identical bytes",
+        )
+        self.assertTrue(
+            run_logging._residual_matches_are_self_output(log["content_redacted"]),
+            "recognition is not residue -- every residual match expands to its own span",
+        )
+
+    def test_t714_residue_is_decided_per_match_not_by_whole_string_equality(
+        self,
+    ) -> None:
+        """A category whose replacement does not reproduce its own span is residue.
+
+        And the converse, in the same test: a category shaped like categories 2 and 3 --
+        one whose placeholder output re-matches and expands to its own span -- is
+        embedded. The two halves together are the whole of D-4.1.
+        """
+        # See T-7.9 above and IMPLEMENTATION F-301 for why the replacement is not the
+        # literal `<REDACTED:t>` DESIGN uses to illustrate the shape.
+        removing = ("t", re.compile(r"ZZ_[A-Z]+"), "ZZ_REDACTED_X")
+        preserving = ("t2", re.compile(r"ZZ2_([A-Z]+)=(\S+)"), r"ZZ2_\1=<REDACTED:t2>")
+
+        raw = self.poison(detail="ZZ_LEAK")
+        with patch.object(
+            run_logging,
+            "REDACTION_CATEGORIES",
+            (removing,) + run_logging.REDACTION_CATEGORIES,
+        ):
+            path = run_logging.export_final_review_evidence(self.RUN_ID, base=self.base)
+
+        bundle = json.loads(path.read_text(encoding="utf-8"))
+        log = bundle["orchestrator_log"]
+        self.assertIsNone(log["content_redacted"])
+        self.assertEqual(log["content_omitted_reason"], "redaction_residue")
+        self.assertEqual(log["digest_pre_redaction"], run_logging.sha256_text(raw))
+        self.assertIn(
+            {"path": ORCHESTRATOR_LOG_FILENAME, "reason": "redaction_residue"},
+            bundle["integrity"]["omitted_content"],
+        )
+        self.assertTrue(path.is_file(), "the export must still return a written path")
+
+        self.tearDown()
+        self.setUp()
+        self.poison(detail="ZZ2_ABC=disclosed_value")
+        with patch.object(
+            run_logging,
+            "REDACTION_CATEGORIES",
+            (preserving,) + run_logging.REDACTION_CATEGORIES,
+        ):
+            path = run_logging.export_final_review_evidence(self.RUN_ID, base=self.base)
+
+        serialized = path.read_text(encoding="utf-8")
+        log = json.loads(serialized)["orchestrator_log"]
+        self.assertIsNotNone(
+            log["content_redacted"],
+            "a category that REMOVES on the first pass and only RECOGNISES on the "
+            "second is not residue",
+        )
+        self.assertEqual(log["content_omitted_reason"], "")
+        self.assert_not_in_bundle("disclosed_value", serialized)
+        self.assertIn("ZZ2_ABC=<REDACTED:t2>", log["content_redacted"])
+
+    def test_safe_embedded_text_verifies_without_transforming_when_redact_is_false(
+        self,
+    ) -> None:
+        clean = "| a | b |\n"
+        text, redactions, reason = run_logging.safe_embedded_text(clean, redact=False)
+        self.assertEqual(text, clean)
+        self.assertEqual(redactions, ())
+        self.assertEqual(reason, "")
+
+        dirty = "| a | /Volumes/ext/a |\n"
+        text, redactions, reason = run_logging.safe_embedded_text(dirty, redact=False)
+        self.assertIsNone(text)
+        self.assertEqual(redactions, ())
+        self.assertEqual(reason, "redaction_residue")
+
+    def test_safe_embedded_text_transforms_when_redact_is_true(self) -> None:
+        text, redactions, reason = run_logging.safe_embedded_text(
+            "| a | /Volumes/ext/a |\n", redact=True
+        )
+        self.assertEqual(
+            text, f"| a | {run_logging.FOREIGN_PATH_PLACEHOLDER} |\n"
+        )
+        self.assertEqual(
+            redactions, ({"category": "foreign_absolute_path", "count": 1},)
+        )
+        self.assertEqual(reason, "")
+
+    def test_the_omission_reason_vocabulary_is_closed(self) -> None:
+        self.assertEqual(
+            run_logging.EMBED_OMISSION_REASONS,
+            ("redaction_residue", "table_structure_changed", "unreadable"),
+        )
+
+    def test_a_missing_log_is_reported_as_unreadable_not_as_clean(self) -> None:
+        bundle, _ = self.export()
+
+        log = bundle["orchestrator_log"]
+        self.assertIsNone(log["content_redacted"])
+        self.assertIsNone(log["digest_pre_redaction"])
+        self.assertEqual(log["content_omitted_reason"], "unreadable")
+        self.assertIn(
+            {"path": ORCHESTRATOR_LOG_FILENAME, "reason": "unreadable"},
+            bundle["integrity"]["omitted_content"],
+        )
+
+class AuditCliTests(_AuditTestCase):
+    """I-5: the three subcommands a live Coordinator actually calls."""
+
+    def run_cli(self, argv: list[str]) -> str:
+        buffer = StringIO()
+        with redirect_stdout(buffer):
+            code = cli_main(argv)
+        self.assertEqual(code, 0)
+        return buffer.getvalue()
+
+    def test_the_write_subcommand_publishes_a_record(self) -> None:
+        self.write_report(PASSING_REPORT)
+
+        output = self.run_cli(
+            [
+                "final-review-audit-write",
+                "--run-id", self.RUN_ID,
+                "--base", str(self.base),
+                "--attempt", "1",
+                "--task-id", "task_cli",
+                "--dispatch-id", "ctx_cli",
+                "--provenance", "accepted",
+                "--settlement", "settled",
+                "--no-capture",
+            ]
+        )
+
+        published = self.root / "final_review_audit" / "attempt1__task_cli__ctx_cli"
+        self.assertTrue(published.is_dir())
+        self.assertIn("attempt1__task_cli__ctx_cli", output)
+        self.assertEqual(self.record_json(published)["provenance_state"], "accepted")
+
+    def test_the_write_subcommand_defaults_to_unknown_provenance(self) -> None:
+        self.run_cli(
+            [
+                "final-review-audit-write",
+                "--run-id", self.RUN_ID,
+                "--base", str(self.base),
+                "--attempt", "1",
+                "--task-id", "task_cli",
+                "--no-capture",
+            ]
+        )
+
+        published = (
+            self.root / "final_review_audit" / "attempt1__task_cli__nodispatch"
+        )
+        self.assertEqual(self.record_json(published)["provenance_state"], "unknown")
+
+    def test_the_provenance_subcommand_prints_the_reader_result(self) -> None:
+        self.write_record(provenance_state="accepted", settlement_state="settled")
+
+        output = self.run_cli(
+            [
+                "final-review-audit-provenance",
+                "--run-id", self.RUN_ID,
+                "--base", str(self.base),
+                "--attempt", "1",
+            ]
+        )
+
+        parsed = json.loads(output)
+        self.assertEqual(
+            parsed["accepted_dispatch_key"], "attempt1__task_aaa__ctx_bbb"
+        )
+        self.assertEqual(parsed["violations"], [])
+
+    def test_the_export_subcommand_writes_the_bundle(self) -> None:
+        self.write_report(PASSING_REPORT)
+        self.write_record(provenance_state="accepted", settlement_state="settled")
+
+        self.run_cli(
+            [
+                "final-review-audit-export",
+                "--run-id", self.RUN_ID,
+                "--base", str(self.base),
+            ]
+        )
+
+        self.assertTrue((self.root / "FINAL_REVIEW_EVIDENCE_BUNDLE.json").is_file())
+
+    def test_no_cli_surface_can_ask_for_accepted_by_default(self) -> None:
+        parser = run_logging._build_parser()
+        actions = {
+            action.dest: action
+            for action in parser._subparsers._group_actions[0]
+            .choices["final-review-audit-write"]
+            ._actions
+        }
+        self.assertEqual(actions["provenance"].default, "unknown")
+        self.assertEqual(tuple(actions["provenance"].choices), run_logging.PROVENANCE_STATES)
+
+
+class ProvenanceLadderTests(_AuditTestCase):
+    """D-B B.2 evaluated once, in one place, so two emission points cannot disagree."""
+
+    def test_the_ladder_takes_the_earliest_matching_cause(self) -> None:
+        """Two causes at once resolve to the FIRST -- and the second survives
+        verbatim in failure_detail, which is why provenance is two fields and not
+        one flat enum."""
+        self.assertEqual(
+            run_logging.resolve_final_review_provenance(
+                input_rejected=True, capability_invalid=True
+            ),
+            ("voided", "dispatch_input_rejected", "not_settled"),
+        )
+
+    def test_every_row_of_the_ladder(self) -> None:
+        cases = (
+            ({"input_rejected": True}, ("voided", "dispatch_input_rejected", "not_settled")),
+            ({"capability_invalid": True}, ("voided", "dispatch_capability_invalid", "not_settled")),
+            ({"settled": False}, ("voided", "settlement_failure", "not_settled")),
+            (
+                {"settled": True, "report_capture_status": "absent"},
+                ("voided", "report_missing", "settled"),
+            ),
+            (
+                {"settled": True, "report_capture_status": "unreadable"},
+                ("voided", "report_missing", "settled"),
+            ),
+            (
+                {
+                    "settled": True,
+                    "report_capture_status": "captured",
+                    "report_parse_status": "malformed",
+                },
+                ("voided", "report_malformed", "settled"),
+            ),
+            (
+                {
+                    "settled": True,
+                    "report_capture_status": "captured",
+                    "report_parse_status": "ok",
+                    "superseded_by_retry": True,
+                },
+                ("voided", "superseded_by_retry", "settled"),
+            ),
+            (
+                {
+                    "settled": True,
+                    "report_capture_status": "captured",
+                    "report_parse_status": "ok",
+                },
+                ("accepted", "", "settled"),
+            ),
+            ({"determinable": False}, ("unknown", "", "unknown")),
+        )
+        for kwargs, expected in cases:
+            with self.subTest(**kwargs):
+                self.assertEqual(
+                    run_logging.resolve_final_review_provenance(**kwargs), expected
+                )
+
+    def test_the_ladder_never_yields_accepted_without_a_usable_report(self) -> None:
+        for capture in ("absent", "unreadable"):
+            for parse in ("not_attempted", "malformed", "ok"):
+                with self.subTest(capture=capture, parse=parse):
+                    state, _reason, _settlement = (
+                        run_logging.resolve_final_review_provenance(
+                            settled=True,
+                            report_capture_status=capture,
+                            report_parse_status=parse,
+                        )
+                    )
+                    self.assertNotEqual(state, "accepted")
+
+    def test_every_void_reason_the_ladder_emits_is_in_the_enum(self) -> None:
+        for kwargs in (
+            {"input_rejected": True},
+            {"capability_invalid": True},
+            {"settled": False},
+            {"settled": True},
+            {"settled": True, "report_capture_status": "captured",
+             "report_parse_status": "malformed"},
+            {"settled": True, "report_capture_status": "captured",
+             "report_parse_status": "ok", "superseded_by_retry": True},
+        ):
+            with self.subTest(**kwargs):
+                _state, reason, _settlement = (
+                    run_logging.resolve_final_review_provenance(**kwargs)
+                )
+                self.assertIn(reason, run_logging.VOID_REASONS)
+
+    def test_probe_reports_an_absent_report_without_writing_anything(self) -> None:
+        self.assertEqual(
+            run_logging.probe_final_review_report(self.RUN_ID, 1, base=self.base),
+            ("absent", "not_attempted"),
+        )
+        self.assertFalse((self.root / "final_review_audit").exists())
+
+    def test_probe_reads_the_laddered_path_and_parses_it(self) -> None:
+        self.write_report(PASSING_REPORT, attempt=1)
+        self.write_report("garbage\n", attempt=2)
+
+        self.assertEqual(
+            run_logging.probe_final_review_report(self.RUN_ID, 1, base=self.base),
+            ("captured", "ok"),
+        )
+        self.assertEqual(
+            run_logging.probe_final_review_report(self.RUN_ID, 2, base=self.base),
+            ("captured", "malformed"),
+        )
+
+
+# ---- T-5a: the retained-report whitespace exemption (DESIGN A.6, R5) ----------------
+
+WHITESPACE_GATE_BASE_COMMIT = "1045815"
+
+# The one retained report that actually carries Markdown hard breaks, and what
+# record.json commits its bytes to. Pinned literally so half (b) of this test cannot
+# be satisfied by an empty scan.
+HARD_BREAK_REPORT = (
+    "artifacts/runs/run_92759e0e1034/final_review_audit/"
+    "attempt1__task_936f73b5d2eb__ctx_1f82fd26c92b/report.md"
+)
+HARD_BREAK_REPORT_DIGEST = (
+    "sha256:6f91033e4e2f644ab64eb4e61292734671b588d51ff0eb1649c626f8ae748e18"
+)
+HARD_BREAK_REPORT_BYTES = 6028
+
+GITATTRIBUTES_RULE = (
+    "artifacts/runs/*/final_review_audit/**/report.md -whitespace"
+)
+
+
+class RetainedReportWhitespaceExemptionTests(unittest.TestCase):
+    """T-5a: `git diff --check` passes AND the exempted bytes were never trimmed.
+
+    DESIGN A.6. The two halves must hold together: passing the gate is worthless if
+    it was bought by editing a digest-bound file, and an intact digest is worthless
+    if the gate still fails. Neither assertion here can be satisfied by the other's
+    fix.
+    """
+
+    @staticmethod
+    def _git(*args: str, cwd: Path) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["git", *args],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def _require_git_range(self) -> None:
+        """Skip -- never silently pass -- when the gate cannot be evaluated."""
+        if shutil.which("git") is None:
+            self.skipTest("git is not available on PATH")
+        if not (REPO_ROOT / ".git").exists():
+            self.skipTest("not a git checkout; the whitespace gate cannot be run")
+        probe = self._git(
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            f"{WHITESPACE_GATE_BASE_COMMIT}^{{commit}}",
+            cwd=REPO_ROOT,
+        )
+        if probe.returncode != 0:
+            self.skipTest(
+                f"base commit {WHITESPACE_GATE_BASE_COMMIT} is unreachable "
+                "(shallow or grafted checkout)"
+            )
+
+    # -- (a) the gate passes ---------------------------------------------------------
+
+    def test_the_whitespace_gate_passes_over_the_whole_os22_range(self) -> None:
+        self._require_git_range()
+        checked = self._git(
+            "diff",
+            "--check",
+            f"{WHITESPACE_GATE_BASE_COMMIT}..HEAD",
+            cwd=REPO_ROOT,
+        )
+        self.assertEqual(
+            checked.returncode,
+            0,
+            "git diff --check must exit 0 over the OS-22 range; got "
+            f"{checked.returncode}:\n{checked.stdout}",
+        )
+        self.assertEqual(checked.stdout, "")
+
+    def test_the_gitattributes_rule_is_exactly_the_one_designed(self) -> None:
+        attributes = REPO_ROOT / ".gitattributes"
+        self.assertTrue(
+            attributes.is_file(), ".gitattributes must exist at the repository root"
+        )
+        rules = [
+            line.strip()
+            for line in attributes.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        self.assertEqual(
+            rules,
+            [GITATTRIBUTES_RULE],
+            "A.6 allows exactly one scoped rule; a repo-wide or broadened pattern "
+            "is a design violation",
+        )
+
+    # -- (b) the exempted bytes are untouched ----------------------------------------
+
+    def test_every_retained_artifact_still_matches_its_recorded_digest(self) -> None:
+        records = sorted(
+            REPO_ROOT.glob("artifacts/runs/*/final_review_audit/*/record.json")
+        )
+        self.assertTrue(records, "no published record units found to verify")
+        verified: list[str] = []
+        for record_path in records:
+            run_root = record_path.parents[2]
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            for block_name in ("report", "stored_task_spec"):
+                block = record.get(block_name) or {}
+                relative = block.get("artifact_path") or ""
+                if not relative:
+                    # Nothing was retained for this half of the unit (capture_status
+                    # is not "captured"); there are no bytes to bind.
+                    continue
+                artifact = run_root / relative
+                with self.subTest(record=str(record_path), block=block_name):
+                    self.assertTrue(artifact.is_file(), f"missing {artifact}")
+                    payload = artifact.read_bytes()
+                    self.assertEqual(
+                        "sha256:" + hashlib.sha256(payload).hexdigest(),
+                        block.get("artifact_digest_post_redaction"),
+                        f"{artifact} no longer hashes to its recorded digest -- the "
+                        "whitespace gate must never be satisfied by trimming bytes",
+                    )
+                    self.assertEqual(
+                        len(payload), block.get("byte_length_post_redaction")
+                    )
+                verified.append(
+                    str(artifact.relative_to(REPO_ROOT)).replace("\\", "/")
+                )
+        self.assertIn(
+            HARD_BREAK_REPORT,
+            verified,
+            "the hard-break report must be among the verified artifacts; without it "
+            "this test would pass vacuously",
+        )
+
+    def test_the_hard_break_report_keeps_its_forty_trailing_space_lines(self) -> None:
+        report = REPO_ROOT / HARD_BREAK_REPORT
+        self.assertTrue(report.is_file(), f"missing {report}")
+        payload = report.read_bytes()
+        self.assertEqual(
+            "sha256:" + hashlib.sha256(payload).hexdigest(), HARD_BREAK_REPORT_DIGEST
+        )
+        self.assertEqual(len(payload), HARD_BREAK_REPORT_BYTES)
+        hard_breaks = [
+            line
+            for line in payload.decode("utf-8").split("\n")
+            if line.rstrip() and line.endswith("  ")
+        ]
+        self.assertEqual(
+            len(hard_breaks),
+            40,
+            "the 40 Markdown hard breaks are the bytes the exemption exists to "
+            "protect; losing them means the file was trimmed",
+        )
+
+    # -- (c) the exemption is narrow, asserted rather than assumed --------------------
+
+    def test_only_retained_reports_are_exempt(self) -> None:
+        self._require_git_range()
+        reports = sorted(
+            REPO_ROOT.glob("artifacts/runs/*/final_review_audit/*/report.md")
+        )
+        self.assertTrue(reports, "no retained reports found to check attributes on")
+        still_gated = [
+            REPO_ROOT / "scripts" / "run_logging.py",
+            REPO_ROOT / "README.md",
+        ]
+        still_gated.extend(
+            sorted(REPO_ROOT.glob("artifacts/runs/*/final_review_audit/*/input.md"))
+        )
+        still_gated.extend(
+            sorted(REPO_ROOT.glob("artifacts/runs/*/final_review_audit/*/record.json"))
+        )
+        for path, expected in [(p, "unset") for p in reports] + [
+            (p, "unspecified") for p in still_gated
+        ]:
+            relative = str(path.relative_to(REPO_ROOT)).replace("\\", "/")
+            with self.subTest(path=relative):
+                attribute = self._git(
+                    "check-attr", "whitespace", "--", relative, cwd=REPO_ROOT
+                )
+                self.assertEqual(attribute.returncode, 0, attribute.stderr)
+                self.assertEqual(
+                    attribute.stdout.strip(),
+                    f"{relative}: whitespace: {expected}",
+                )
+
+    def test_the_pattern_does_not_leak_outside_the_audit_directories(self) -> None:
+        self._require_git_range()
+        for outsider in (
+            "report.md",
+            "artifacts/report.md",
+            "artifacts/runs/run_92759e0e1034/report.md",
+            "final_review_audit/x/report.md",
+        ):
+            with self.subTest(path=outsider):
+                attribute = self._git(
+                    "check-attr", "whitespace", "--", outsider, cwd=REPO_ROOT
+                )
+                self.assertEqual(
+                    attribute.stdout.strip(),
+                    f"{outsider}: whitespace: unspecified",
+                )
+
+    # -- (d) mutation check ----------------------------------------------------------
+
+    def test_the_gate_fails_again_once_the_exemption_is_removed(self) -> None:
+        """Without .gitattributes the same range must exit 2 -- otherwise this whole
+        test class would be passing because the condition happens not to occur."""
+        self._require_git_range()
+        with tempfile.TemporaryDirectory() as scratch:
+            clone = Path(scratch) / "clone"
+            cloned = self._git(
+                "clone",
+                "--quiet",
+                "--local",
+                "--no-hardlinks",
+                str(REPO_ROOT),
+                str(clone),
+                cwd=Path(scratch),
+            )
+            if cloned.returncode != 0:
+                self.skipTest(f"could not clone the repository: {cloned.stderr}")
+
+            attributes = clone / ".gitattributes"
+            self.assertTrue(
+                attributes.is_file(),
+                ".gitattributes must be COMMITTED, not just present in the working "
+                "tree, or a fresh clone still fails the gate",
+            )
+
+            with_exemption = self._git(
+                "diff",
+                "--check",
+                f"{WHITESPACE_GATE_BASE_COMMIT}..HEAD",
+                cwd=clone,
+            )
+            self.assertEqual(
+                with_exemption.returncode,
+                0,
+                f"fresh clone must pass the gate:\n{with_exemption.stdout}",
+            )
+
+            attributes.unlink()
+            without_exemption = self._git(
+                "diff",
+                "--check",
+                f"{WHITESPACE_GATE_BASE_COMMIT}..HEAD",
+                cwd=clone,
+            )
+            self.assertEqual(
+                without_exemption.returncode,
+                2,
+                "removing the exemption must bring the failure back; it did not, so "
+                "the gate is no longer proving anything",
+            )
+            self.assertIn("trailing whitespace", without_exemption.stdout)
+            self.assertIn(HARD_BREAK_REPORT, without_exemption.stdout)
+
+
+# The eight out-of-domain values every gate in DESIGN D-A.7 is tested against: three
+# out-of-RANGE ints and five wrong-TYPE objects. `False` and `True` are named cases --
+# M-14 measured `attempt=False` writing FINAL_REVIEW_iterationFalse.md and `attempt=True`
+# silently aliasing attempt 1, because `True == 1`.
+OUT_OF_RANGE_ATTEMPTS = (0, -1, -12)
+WRONG_TYPE_ATTEMPTS = (False, True, 2.0, "2", None)
+
+
+def expected_attempt_message(attempt: object, label: str = "attempt") -> str:
+    # `type(...) is int`, not membership: `False == 0`, so a membership test would
+    # classify the bool as out-of-RANGE and assert the wrong half of the contract.
+    if type(attempt) is int:
+        return f"{label} must be >= 1, got {attempt!r}"
+    return f"{label} must be an int >= 1, got {attempt!r}"
+
+
+class AttemptDomainLadderTests(unittest.TestCase):
+    """T-13.7 -- DESIGN D-A.7.4' GATE 5, plus the extraction's own regression."""
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.base = Path(self.temporary_directory.name)
+
+    def tearDown(self) -> None:
+        self.temporary_directory.cleanup()
+
+    def test_t137_the_ladder_path_refuses_every_out_of_domain_attempt(self) -> None:
+        # The type half is what shipped code lacked (M-24a): `2.0` produced a real
+        # artifacts/runs/<run>/FINAL_REVIEW_iteration2.0.md -- an unexempted,
+        # digest-bound, generatable path, which is exactly what D-A.6"'s pattern
+        # derivation assumes cannot exist.
+        for attempt in OUT_OF_RANGE_ATTEMPTS + WRONG_TYPE_ATTEMPTS:
+            with self.subTest(attempt=attempt):
+                with self.assertRaises(RunLoggingError) as caught:
+                    run_logging.final_review_report_ladder_path(
+                        "run_t", attempt, base=self.base
+                    )
+                self.assertEqual(
+                    str(caught.exception),
+                    expected_attempt_message(attempt, "final_review_attempt"),
+                )
+
+    def test_t137_valid_attempts_still_produce_the_shipped_ladder_names(self) -> None:
+        # 100 is kept legal by D-A.7.2 and left unexempted by D-A.6" (RK-19).
+        for attempt in (1, 2, 3, 9, 10, 42, 99, 100):
+            with self.subTest(attempt=attempt):
+                suffix = "" if attempt == 1 else f"_iteration{attempt}"
+                self.assertEqual(
+                    run_logging.final_review_report_ladder_path(
+                        "run_t", attempt, base=self.base
+                    ).name,
+                    f"FINAL_REVIEW{suffix}.md",
+                )
+
+    def test_t137_the_extraction_did_not_reword_the_dispatch_key_messages(self) -> None:
+        """The refactor's own regression, pinned VERBATIM against the shipped strings.
+
+        `final_review_dispatch_key()`'s two inline checks are the ones extracted into
+        `attempt_domain_violation()`. M-24d measured the extracted text byte-identical to
+        the shipped text; this is that measurement made executable, so the refactor
+        cannot silently reword a message another test or a human reads.
+        """
+        for attempt, message in (
+            (0, "final_review_attempt must be >= 1, got 0"),
+            (-1, "final_review_attempt must be >= 1, got -1"),
+            (False, "final_review_attempt must be an int >= 1, got False"),
+            (2.0, "final_review_attempt must be an int >= 1, got 2.0"),
+            ("2", "final_review_attempt must be an int >= 1, got '2'"),
+        ):
+            with self.subTest(attempt=attempt):
+                with self.assertRaises(RunLoggingError) as caught:
+                    run_logging.final_review_dispatch_key(attempt, "task_a", "ctx_b")
+                self.assertEqual(str(caught.exception), message)
+        self.assertEqual(
+            run_logging.final_review_dispatch_key(2, "task_a", "ctx_b"),
+            "attempt2__task_a__ctx_b",
+            "the positive path is untouched by the extraction",
+        )
+
+
+class AttemptDomainProvenanceTests(_AuditTestCase):
+    """T-13.8 -- DESIGN D-A.7.4' GATE 7 and CLI door 2.
+
+    Shipped `final-review-audit-provenance --attempt 0` exited 0 and printed a report
+    carrying `"final_review_attempt": 0` (M-26); its sibling `-write --attempt 0` already
+    exited 1 and wrote nothing. Gate 7 makes door 2 internally consistent.
+    """
+
+    def run_module_cli(self, argv: list[str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, str(REPO_ROOT / "scripts" / "run_logging.py"), *argv],
+            cwd=REPO_ROOT, capture_output=True, text=True, check=False,
+        )
+
+    def test_t138_the_reader_refuses_out_of_domain_attempts(self) -> None:
+        self.write_record(provenance_state="accepted", settlement_state="settled")
+        for attempt in OUT_OF_RANGE_ATTEMPTS + WRONG_TYPE_ATTEMPTS:
+            with self.subTest(attempt=attempt):
+                with self.assertRaises(RunLoggingError) as caught:
+                    run_logging.read_final_review_attempt_provenance(
+                        self.RUN_ID, attempt, base=self.base
+                    )
+                self.assertEqual(
+                    str(caught.exception),
+                    expected_attempt_message(attempt, "final_review_attempt"),
+                )
+
+    def test_t138_a_refused_attempt_scans_no_record_directory(self) -> None:
+        # A well-formed record IS present, so a successful call would have listed it.
+        # The gate is the first statement, so the scan never starts.
+        self.write_record(provenance_state="accepted", settlement_state="settled")
+        with patch.object(
+            run_logging, "iter_final_review_audit_records"
+        ) as iterator:
+            with self.assertRaises(RunLoggingError):
+                run_logging.read_final_review_attempt_provenance(
+                    self.RUN_ID, 0, base=self.base
+                )
+        iterator.assert_not_called()
+
+    def test_t138_door_two_refuses_and_prints_no_json(self) -> None:
+        self.write_record(provenance_state="accepted", settlement_state="settled")
+        completed = self.run_module_cli(
+            [
+                "final-review-audit-provenance",
+                "--run-id", self.RUN_ID,
+                "--base", str(self.base),
+                "--attempt", "0",
+            ]
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(completed.stdout.strip(), "")
+        self.assertIn("final_review_attempt must be >= 1, got 0", completed.stderr)
+
+    def test_t138_both_door_two_subcommands_now_refuse_alike(self) -> None:
+        # The sibling parity named in DESIGN Error Handling. RK-21 is why the refusal
+        # surfaces as a traceback rather than an `input error:` line: run_logging's
+        # main() has no `except RunLoggingError` mapping. That is shipped, pre-existing,
+        # and fail-closed -- exit non-zero, nothing written -- and gates 5 and 7 inherit
+        # the convention rather than inventing a second one inside the same CLI.
+        for argv in (
+            ["final-review-audit-provenance", "--run-id", self.RUN_ID,
+             "--base", str(self.base), "--attempt", "0"],
+            ["final-review-audit-write", "--run-id", self.RUN_ID,
+             "--base", str(self.base), "--attempt", "0", "--task-id", "task_cli",
+             "--no-capture"],
+        ):
+            with self.subTest(subcommand=argv[0]):
+                completed = self.run_module_cli(argv)
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertFalse(
+                    (self.root / "final_review_audit").exists(),
+                    "a refused attempt writes nothing at either subcommand",
+                )
+
+    def test_t138_valid_attempts_still_report_unchanged(self) -> None:
+        self.write_record(provenance_state="accepted", settlement_state="settled")
+        completed = self.run_module_cli(
+            [
+                "final-review-audit-provenance",
+                "--run-id", self.RUN_ID,
+                "--base", str(self.base),
+                "--attempt", "1",
+            ]
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        parsed = json.loads(completed.stdout)
+        self.assertEqual(
+            parsed["accepted_dispatch_key"], "attempt1__task_aaa__ctx_bbb"
+        )
+        # Attempt grouping comes from the record's own field, never the filename:
+        # attempt 2 finds nothing even though the record directory is right there.
+        second = self.run_module_cli(
+            [
+                "final-review-audit-provenance",
+                "--run-id", self.RUN_ID,
+                "--base", str(self.base),
+                "--attempt", "2",
+            ]
+        )
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(json.loads(second.stdout)["records"], [])
 
 
 if __name__ == "__main__":

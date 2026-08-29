@@ -14,6 +14,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from scripts import run_logging
 from scripts.quality_profile import resolve_quality_profile
 from scripts.skill_policy import load_risk_contract
 from scripts.agent_profile import (
@@ -427,8 +428,7 @@ def final_review_artifact_path(run_id: str, attempt: int) -> str:
     prefix (run_artifact_root, task_context's single root builder) is what keeps two
     runs' Final Review artifacts from landing in the same shared artifacts/ root.
     """
-    if attempt < 1:
-        raise ValueError(f"attempt must be >= 1, got {attempt}")
+    attempt = run_logging.assert_attempt_in_domain(attempt)
     suffix = "" if attempt == 1 else f"_iteration{attempt}"
     return f"{run_artifact_root(run_id)}FINAL_REVIEW{suffix}.md"
 
@@ -1341,6 +1341,53 @@ class E2EHarness:
             AgentAttempt(attempt, verdict, completed.stdout),
         )
 
+    def _write_final_review_audit(self, attempt_number: int, attempt) -> None:
+        """Materialize this attempt's review record, then audit the dispatch.
+
+        The review record is written to the section 9 laddered path this harness
+        already computes -- `final_review_artifact_path()` named it and nothing
+        materialized it, so the contracted artifact existed only as a string. A real
+        Final Reviewer writes that file; writing it here is what lets the audit
+        record snapshot a report rather than an absence.
+
+        Identities are this harness's own deterministic synthetic ones: there is no
+        Orca Task or Dispatch behind a fake-agent subprocess, and inventing one that
+        looked like a real orca id would put a fabricated identity into an evidence
+        record. `capture=False` for the same reason -- there is no run to read back.
+
+        A logging failure never changes a lifecycle judgement, so this swallows.
+        """
+        try:
+            report = (
+                ensure_run_artifact_root(self.run_id, base=self.workspace)
+                / Path(final_review_artifact_path(self.run_id, attempt_number)).name
+            )
+            report.write_text(attempt.output, encoding="utf-8")
+            capture_status, parse_status = run_logging.probe_final_review_report(
+                self.run_id, attempt_number, base=self.workspace
+            )
+            provenance, void_reason, settlement = (
+                run_logging.resolve_final_review_provenance(
+                    settled=True,
+                    report_capture_status=capture_status,
+                    report_parse_status=parse_status,
+                )
+            )
+            run_logging.write_final_review_audit_record(
+                self.run_id,
+                base=self.workspace,
+                final_review_attempt=attempt_number,
+                task_id=f"task_e2e_final_review_{attempt_number}",
+                dispatch_id=f"ctx_e2e_final_review_{attempt_number}",
+                provenance_state=provenance,
+                void_reason=void_reason,
+                settlement_state=settlement,
+                reviewer_agent_origin="e2e_harness",
+                capture=False,
+            )
+        except Exception:  # noqa: BLE001 -- section 9: logging never mutates state
+            return
+
     def _run_correction_round(
         self,
         phase: str,
@@ -1506,6 +1553,13 @@ class E2EHarness:
                 )
             final_review_attempts.append(attempt)
             final_review_verdict = verdict
+            # OS-22: the same snapshot -> redact -> write path the live runtime takes,
+            # here, immediately after the attempt settles and before the T1/T2/T3
+            # branch below reads the verdict. Placed here for the same reason it is
+            # placed there: attempt N+1 renders the same unsuffixed FINAL_REVIEW.md
+            # on the real dispatch path, so a snapshot deferred to run end is a
+            # snapshot of somebody else's report.
+            self._write_final_review_audit(final_review_iterations, attempt)
 
             # ---- T1
             if verdict == self.contract.reviewer_pass:

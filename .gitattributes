@@ -1,0 +1,16 @@
+# Retained Final Review reports are byte-exact snapshots of Reviewer-authored Markdown, digest-
+# bound by record.json and immutable under DESIGN A.3. Markdown hard breaks (two trailing spaces)
+# are legitimate there and must not be trimmed, so this path is exempt from git's whitespace
+# rules. Scope is exactly these snapshots; every other path keeps the default rules.
+#
+# THESE PATTERNS DEPEND ON AN INVARIANT ENFORCED ELSEWHERE: attempt is an int >= 1 (a bool is not
+# an int). One predicate, run_logging.attempt_domain_violation(), is enforced at all SEVEN
+# newly-specified public boundaries that turn an attempt into identity, a path, retained content or
+# reported output: review_isolation.repatriate(), .isolate(), .build_attestation(), the
+# final_review_eval.py `isolate --attempt` CLI door, run_logging.final_review_report_ladder_path(),
+# .read_final_review_attempt_provenance() and e2e_harness.final_review_artifact_path() -- plus the
+# pre-existing, already-guarded run_logging.final_review_dispatch_key(), whose shipped inline check
+# was refactored onto that same predicate. Weaken it and _iteration0 / _iteration-1 /
+# _iterationFalse / _iteration2.0 become generatable, unexempted, digest-bound paths that fail the
+# whitespace gate. See DESIGN D-A.7 and INV-ATTEMPT-2 (D-A.7.4-prime).
+artifacts/runs/*/final_review_audit/**/report.md -whitespace

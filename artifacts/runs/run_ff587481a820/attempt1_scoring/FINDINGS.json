@@ -1,0 +1,11 @@
+{
+  "schema_version": "1.0",
+  "record_kind": "quarantined_artifact_placeholder",
+  "quarantined_file": "FINDINGS.json",
+  "quarantined_on": "2026-08-25",
+  "quarantined_by": "OS-22 TEST iteration-2 correction round (findings R2 / R4)",
+  "reason": "quarantined alongside METRICS.json as the paired output of the same scorer step; it carries no key-derived content and is fully reproducible from the retained report.md with `final_review_eval.py parse-report`",
+  "original_sha256": "sha256:5ea5d517ce6bb9d1c1f4a2e1eaa884e54ce88a42eb7a6f7d25c78e74961f5b47",
+  "original_location": "moved out of this repository; not retained in version control",
+  "note": "This run is SUPERSEDED. The accepted baseline is run_92759e0e1034, written up in artifacts/runs/run_804e35d29531/BASELINE_RESULT.md. This directory is retained only as forensic evidence of the defect that correction fixes; its audit trail (record.json, input.md, report.md) is intact and is the evidence. The scorer output that made the key reachable is not."
+}

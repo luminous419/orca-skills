@@ -2191,6 +2191,76 @@ class OrcaRuntimeHarness:
             risk=self.risk,
             detail=f"task={attempt.task_id} dispatch={attempt.dispatch_id}",
         )
+        # OS-22: the Final Review dispatch's own audit record, written HERE --
+        # after four-axis finalization, before the caller reads the verdict.
+        # Deferring it to run end loses the report: task_context's
+        # phase_artifact_contract() hands every attempt the same unsuffixed
+        # FINAL_REVIEW.md, so attempt N+1's Reviewer can overwrite attempt N's.
+        if round_kind == "final_review":
+            self._log_final_review_audit(attempt=attempt, event=event)
+
+    def _log_final_review_audit(
+        self, *, attempt: "RuntimeAttempt", event: str
+    ) -> None:
+        """One immutable per-dispatch record for one Final Adversarial Review attempt.
+
+        Every write goes through _safe_log, so a collision, an OSError at any
+        staging boundary, or an unavailable capture lands in self._logging_errors as
+        one log row and the run continues. An audit-write failure never mutates
+        settled lifecycle state -- the same rule section 9 already states for the
+        two logs, applied to the record family that now sits beside them.
+
+        The ladder's rows 1 and 2 (a dispatch refused at input, an invalid or revoked
+        capability) are deliberately reported as NOT observed from here rather than
+        guessed at: a dispatch refused at input never reaches this method, because it
+        never produces a settled RuntimeAttempt at all. A live Coordinator records
+        those two through `final-review-audit-write --void-reason`, which is what
+        that flag exists for.
+        """
+        if not self.run_id or attempt.role != "reviewer":
+            return
+        report_capture, report_parse = run_logging.probe_final_review_report(
+            self.run_id, attempt.iteration, base=self.artifact_dir
+        )
+        provenance, void_reason, settlement = (
+            run_logging.resolve_final_review_provenance(
+                settled=attempt.settlement == "completed"
+                and event == "dispatch_settled",
+                report_capture_status=report_capture,
+                report_parse_status=report_parse,
+            )
+        )
+        entry = (
+            self.agent_routing.for_role("final_review", "final_reviewer")
+            if self.agent_routing is not None
+            else None
+        )
+        self._safe_log(
+            run_logging.write_final_review_audit_record,
+            self.run_id,
+            base=self.artifact_dir,
+            final_review_attempt=attempt.iteration,
+            task_id=attempt.task_id,
+            dispatch_id=attempt.dispatch_id,
+            provenance_state=provenance,
+            void_reason=void_reason,
+            settlement_state=settlement,
+            reviewer_terminal=attempt.terminal,
+            reviewer_agent_command=(
+                entry.command if entry is not None and entry.resolved else ""
+            ),
+            reviewer_agent_origin=(
+                entry.origin if entry is not None and entry.resolved else "unknown"
+            ),
+            # The runtime's OWN labels, verbatim. Never mapped into an enum, and
+            # never compared against a threshold constant.
+            failure_detail=(
+                ""
+                if provenance == run_logging.PROVENANCE_ACCEPTED
+                else f"outcome={attempt.outcome} settlement={attempt.settlement} "
+                f"dispatch_status={attempt.dispatch_status} event={event}"
+            ),
+        )
 
     def _log_pre_dispatch_failure(
         self, *, phase: str | None, role: str, iteration: int, error: Exception

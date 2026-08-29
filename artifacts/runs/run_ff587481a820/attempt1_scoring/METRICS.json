@@ -1,0 +1,11 @@
+{
+  "schema_version": "1.0",
+  "record_kind": "quarantined_artifact_placeholder",
+  "quarantined_file": "METRICS.json",
+  "quarantined_on": "2026-08-25",
+  "quarantined_by": "OS-22 TEST iteration-2 correction round (findings R2 / R4)",
+  "reason": "reproduced key-derived identities: the subject identifier, the entry total, individual entry ids, finding-to-entry mappings and the missed-id list",
+  "original_sha256": "sha256:d7b3d375621522840651811f002af7f835a632ac97c5b0e2ea41c08d54d7dd7f",
+  "original_location": "moved out of this repository; not retained in version control",
+  "note": "This run is SUPERSEDED. The accepted baseline is run_92759e0e1034, written up in artifacts/runs/run_804e35d29531/BASELINE_RESULT.md. This directory is retained only as forensic evidence of the defect that correction fixes; its audit trail (record.json, input.md, report.md) is intact and is the evidence. The scorer output that made the key reachable is not."
+}

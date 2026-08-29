@@ -88,6 +88,71 @@ cannot affect a run that does not ask for a profile.
 Profile files are plain data read with the repository's own restricted-subset YAML reader;
 no third-party dependency is introduced.
 
+## Final Review audit records and evaluation tooling
+
+The per-dispatch Final Adversarial Review audit records
+(`artifacts/runs/<run-id>/final_review_audit/`), the evidence-bundle export, the evaluation
+fixture and the scorer require no Orca version beyond what the two skills already need, and
+introduce no third-party dependency: standard library only, CPython 3.11+.
+
+**Additive by construction.** They add a directory under an existing artifact root, new
+`--event` values in a vocabulary that was already open (no `ORCHESTRATOR_LOG.md` column is
+added, so every file on disk keeps its width), new functions and subcommands in the shared
+`run_logging.py`, and a new repository-side `scripts/final_review_eval.py`. No existing
+column, path, schema or function signature changes. `RESULT:` stays two-valued and
+`REVIEW_VERDICT:` stays four-valued — both are copied verbatim into a record, never
+re-derived or collapsed.
+
+**No migration, and none is possible to need.** No existing artifact changes meaning, so no
+existing consumer can misread one. A run that completed before these records existed simply
+has no `final_review_audit/` directory, and every reader treats an absent record as
+`unknown` — the correct reading for a run that never wrote one. Historical runs are not
+backfilled, deliberately: a backfilled record would carry a `recorded_at` that is not the
+settlement time and a report snapshot taken long after any overwrite, which is precisely the
+stale self-referential provenance these records exist to prevent.
+
+**Capture degrades, it does not fail.** The two capture sources are post-dispatch `orca`
+CLI reads. If `orca` is absent from `PATH`, exits non-zero, times out or returns
+unparseable JSON, the record is still written with `capture_status: unavailable` and a
+non-empty `capture_error` — a record that says why the input could not be captured is
+evidence; a missing record is not.
+
+**Redaction policy `redaction/1.1` covers POSIX paths only.** The policy has five ordered
+categories: Orca dispatch capability, URL credential, secret-named environment assignment,
+home-rooted absolute path (the user-name segment is replaced, the rest stays readable), and
+— added in 1.1 — every other absolute POSIX path, replaced whole with no minimum segment
+count, so an unanticipated shape fails closed rather than being left unchanged. Windows
+`C:\Users\<name>` is deliberately not a category: this document does not claim Windows
+support for the runtime path, and an untested pattern is worse than a stated gap. Adding it
+is a MINOR policy bump. The same policy governs the exported evidence bundle, including the
+copy of `ORCHESTRATOR_LOG.md` embedded in it; text that is not residue-free under the policy
+is omitted from the bundle with a stated reason and a digest rather than embedded. The
+authoritative local log is never rewritten.
+
+**Packaging, and what the baseline capture guarantees.** `scripts/` is included in the release
+archive, so a downloaded tarball contains
+`scripts/fixtures/final_review_eval/key/answer_key.json`. That is unchanged and is stated rather
+than worked around: the key must ship for a downstream user to score anything.
+
+What changed is the claim, which is now about the *execution environment* rather than only about
+the retained input. A §7 baseline capture dispatches the Final Reviewer under an enforced
+filesystem scope (`scripts/review_isolation.py`, `sandbox-exec` on darwin): its working directory
+is an ephemeral session containing only the materialized subject and a closed list of review-policy
+files, every path it can read has been exhaustively scanned for key material, and the key-bearing
+roots — the repository checkout, its `.git`, and any release archive found by the scan — are denied
+for both content and metadata, so the key cannot be read *or discovered*. A negative test with a
+positive control proves this per capture and its result is recorded in
+`artifacts/runs/<run>/FINAL_REVIEW_ISOLATION.json`.
+
+Two boundaries, stated rather than implied. First, the guarantee is scoped to a capture whose
+attestation says `scope_enforcement: seatbelt`; a capture on a host without an enforcement backend
+records `scope_enforcement: unenforced`, fails the baseline's B6 criterion, and may not be called a
+baseline. Second, the threat model is an unconstrained but well-behaved reviewer agent — one that
+reads absolute paths, runs `git` and greps broadly — not an adversary that escapes a kernel
+sandbox. Ordinary (non-baseline) Final Review dispatches are unaffected and are not claimed to be
+isolated; for those, the older and narrower claim still holds and is still verified per run: no key
+material appears in the reviewer's retained input.
+
 ## Stable release blockers
 
 - **License decision:** the owner must select and add a license as documented in

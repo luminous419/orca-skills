@@ -1,0 +1,3 @@
+| timestamp | event | phase | role | iteration | task_id | dispatch_id | terminal | action | reuse | gate_result | review_verdict | risk | risk_source | requested_phases | round_kind | result | detail |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 2026-08-26T12:12:35.307715+00:00 | final_review_audit_written | final_review | reviewer | 1 | task_9503cbf3cb04 | ctx_ded3e8a05564 | term_bae8837b-ea49-4f18-8ff2-629c8c56f37f |  |  |  |  |  |  |  | final_review | provenance=voided void_reason=settlement_failure | record=final_review_audit/attempt1__task_9503cbf3cb04__ctx_ded3e8a05564/record.json |

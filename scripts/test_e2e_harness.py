@@ -3,7 +3,10 @@
 
 from __future__ import annotations
 
+import ast
+import inspect
 import json
+import re
 import tempfile
 import unittest
 from os import environ
@@ -13,6 +16,8 @@ from pathlib import Path
 
 from scripts.task_context import RISK_CONTEXT_KEYS
 import scripts.e2e_harness as e2e_module
+from scripts import run_logging
+import scripts.task_context as task_context_module
 from scripts.final_report import ORCHESTRATION_SKILL, render_final_report
 from scripts.orca_runtime_harness import OrcaRuntimeHarness
 
@@ -38,16 +43,41 @@ from scripts.e2e_harness import (
 )
 from scripts.e2e_harness import OutputContractError
 from scripts.workflow_contract import load_workflow_output_contract
-from scripts.quality_profile import DEFAULT_PROFILE_PATH, PROFILE_STATUS_LOADED
+from scripts.quality_profile import (
+    DEFAULT_PROFILE_PATH,
+    PROFILE_STATUS_ABSENT,
+    PROFILE_STATUS_LOADED,
+    QualityProfileResolution,
+)
+from scripts.agent_profile import (
+    PROJECT_PROFILE_RELATIVE_PATH,
+    RUNTIME_ORCHESTRATION,
+    SELECTION_SELECTED,
+    SOURCE_PROJECT_LOCAL,
+    AgentProfileSelection,
+    load_agent_profiles_text,
+    materialize_run_routing,
+)
 from scripts.task_context import (
     BOUNDARY_RECEIPT_HEADING,
     BOUNDARY_RECEIPT_PREFIX,
+    CANONICAL_PHASES,
+    FINAL_REVIEW_PHASE,
     QUALITY_GATE_KEYS,
     QUALITY_GATE_RECEIPT_KEY,
     REVIEWER_CONTEXT_KEYS,
     REVIEWER_CONTEXT_RECEIPT_KEY,
+    SPECIALIZED_PHASES,
     SPEC_VALUE_SEPARATOR,
     TASK_BOUNDARY_KEYS,
+    TASK_SPEC_END_MARKER,
+    build_agent_routing_context,
+    build_quality_gate_context,
+    build_reviewer_context,
+    build_risk_context,
+    build_task_boundary,
+    phase_artifact_contract,
+    render_task_spec,
 )
 
 
@@ -4288,6 +4318,814 @@ class RiskWorkflowTests(unittest.TestCase):
         result = self.run_workflow(scenario, risk="low")
         self.assertEqual((result.risk, result.risk_source), ("medium", "explicit"))
         self.assertEqual(len(self.reviewer_events(result)), 1)
+
+
+# ---- OS-22 N-1: the Final Review observability neutrality anchor -------------------
+# The "before" image for section 2 of OS-22: every Task spec this repository renders,
+# captured at commit 1045815 -- the last commit before OS-22 -- and compared BYTE for
+# byte against the current tree.
+#
+# This capture path is deliberately separate from capture_legacy_artifacts() and from
+# _normalize_artifact(). _normalize_artifact() splits every line on whitespace and
+# rejoins it, so it silently equates specs that differ in indentation, in repeated
+# interior spaces, in trailing spaces, or in the presence of a terminal newline -- and
+# render_task_spec() emits all four of those as real reviewer-visible content
+# (`new_claims: ` carries a trailing space when its value is empty; a worker report
+# quoted into `current_delta` carries its own interior double spaces). A golden built
+# on that normalizer would be a whitespace-insensitive comparison, not the identity
+# claim section 2 requires. OS-4's capture and fixture are therefore left untouched.
+NEUTRALITY_BASELINE = (
+    Path(__file__).resolve().parents[1]
+    / "scripts"
+    / "fixtures"
+    / "os22_neutrality"
+    / "pre_os22_task_specs.json"
+)
+
+# "Validate Final Adversarial Review effectiveness (#19)" -- the last commit before
+# OS-22. The golden was generated inside a `git archive` checkout of it.
+NEUTRALITY_COMMIT = "1045815"
+
+# The transform between render_task_spec() and the stored bytes, versioned so a
+# future change to it is a visible change to the claim rather than a silent one.
+NEUTRALITY_CANONICALIZATION = "task_spec/1.0"
+
+NEUTRALITY_RUN_ID = "run_golden"
+
+# Spelled out rather than aliased to GOLDEN_WORKFLOWS: a later edit to the OS-4
+# fixture's workflow set must not silently reshape section 2's coverage.
+NEUTRALITY_WORKFLOWS = {
+    "single_canonical": ("implementation",),
+    "multi_canonical": ("design", "implementation"),
+    "specialized_bugfix": ("bugfix",),
+}
+
+# profile=multi is required, not optional: e2e_harness renders a `final_review` spec
+# only when final_review_routing_context() is not None, i.e. only under a selected
+# Agent Profile. Without it family A would carry no Final Review spec at all.
+NEUTRALITY_PROFILES = (("none", None), ("multi", "diverse"))
+
+# Enumerated, closed, and each entry justified below. Nothing else is substituted.
+_TASK_SPEC_SUBSTITUTIONS = (
+    ("workspace_path", lambda ws: str(ws), "<WORKSPACE>"),
+)
+
+# Fail-closed residue check: if any of these survives canonicalization, the enumeration
+# above is INCOMPLETE and the capture must be fixed -- never silently normalized away.
+_TASK_SPEC_NONDETERMINISM_TRIPWIRES = (
+    re.compile(re.escape(tempfile.gettempdir())),
+    re.compile(r"/var/folders/"),
+    re.compile(r"/private/(?:tmp|var)/"),
+    re.compile(re.escape(str(Path(__file__).resolve().parents[1]))),
+    re.compile(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}"),   # ISO-8601 timestamp
+    re.compile(r"\b(?:task|ctx|dcap|term|run)_[0-9a-f]{8,}"),  # orca-assigned ids
+)
+
+
+def canonicalize_task_spec(spec: str, *, workspace: Path | None) -> str:
+    """The ONLY transform between render_task_spec() and the golden comparison.
+
+    One string replacement, nothing else. No splitlines(), no split(), no join(),
+    no strip(), no rstrip(), no reserialization -- every space, every run of
+    spaces, every trailing space and the presence or absence of a terminal
+    newline reaches the comparison exactly as render_task_spec() produced it.
+
+    The single substitution exists because family A runs a workflow inside a
+    TemporaryDirectory and exactly one reviewer-visible field carries that absolute
+    path: `drill_down=(str(self.workspace),)`. Family B renders directly from
+    test-owned literals and passes workspace=None, so the transform is the identity.
+    """
+    out = spec
+    if workspace is not None:
+        for _name, source, replacement in _TASK_SPEC_SUBSTITUTIONS:
+            out = out.replace(source(workspace), replacement)
+    for tripwire in _TASK_SPEC_NONDETERMINISM_TRIPWIRES:
+        match = tripwire.search(out)
+        if match is not None:
+            raise AssertionError(
+                f"unenumerated nondeterministic value in a captured Task spec: "
+                f"{match.group(0)!r}; extend _TASK_SPEC_SUBSTITUTIONS deliberately, "
+                f"never loosen the comparison"
+            )
+    return out
+
+
+def capture_neutrality_workflow_specs(
+    repo_root: Path, skill_name: str, workflow: str, *, profile: str | None = None
+) -> list[str]:
+    """Family A: every Task spec ONE workflow actually dispatches.
+
+    The same recording-wrapper technique capture_legacy_artifacts() uses, and
+    deliberately a separate function: this one canonicalizes byte-strictly and must
+    not drift into -- or be drifted into by -- the OS-4 capture.
+    """
+    phases = NEUTRALITY_WORKFLOWS[workflow]
+    skill_path = repo_root / skill_name / "SKILL.md"
+    rendered: list[str] = []
+    original = e2e_module.render_task_spec
+
+    def recording(*args, **kwargs):
+        spec = original(*args, **kwargs)
+        rendered.append(spec)
+        return spec
+
+    e2e_module.render_task_spec = recording
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            if profile is not None:
+                (workspace / ".orca").mkdir(parents=True, exist_ok=True)
+                (workspace / ".orca" / "agent-profiles.yaml").write_text(
+                    MULTIPHASE_PROFILE, encoding="utf-8"
+                )
+            kwargs = {} if profile is None else {"agent_profile": profile}
+            harness = E2EHarness(
+                skill_path,
+                phase=phases[0],
+                workspace=workspace,
+                run_id=NEUTRALITY_RUN_ID,
+                **kwargs,
+            )
+            harness.run_workflow(
+                WorkflowScenario(
+                    phases=phases,
+                    phase_scenarios={
+                        phase: FakeScenario(("complete",), ("pass",))
+                        for phase in phases
+                    },
+                    final_review=FinalReviewScenario(modes=("pass",)),
+                    run_id=NEUTRALITY_RUN_ID,
+                )
+            )
+            return [
+                canonicalize_task_spec(spec, workspace=workspace) for spec in rendered
+            ]
+    finally:
+        e2e_module.render_task_spec = original
+
+
+# The five optional-block combinations render_task_spec() can be handed. "none" is the
+# pre-OS-3/OS-4 legacy shape; "all" is every block a dispatch can carry today.
+NEUTRALITY_DIRECT_BLOCKS = (
+    "none",
+    "reviewer",
+    "reviewer+quality",
+    "reviewer+quality+risk",
+    "all",
+)
+
+_NEUTRALITY_ROLE_PHASES = (
+    ("worker", (*CANONICAL_PHASES, *SPECIALIZED_PHASES)),
+    ("reviewer", (*CANONICAL_PHASES, *SPECIALIZED_PHASES)),
+    ("final_reviewer", (FINAL_REVIEW_PHASE,)),
+)
+
+
+def _neutrality_direct_cases() -> tuple[tuple[str, str, int, str], ...]:
+    cases = []
+    for role, phases in _NEUTRALITY_ROLE_PHASES:
+        for phase in phases:
+            for iteration in (1, 2):
+                for blocks in NEUTRALITY_DIRECT_BLOCKS:
+                    cases.append((role, phase, iteration, blocks))
+    return tuple(cases)
+
+
+# Family B: the enumerated (role, phase, iteration, block-combination) matrix. Stronger
+# than family A as an anchor, because it does not depend on which specs a workflow
+# happens to dispatch -- a future harness change cannot silently shrink the coverage.
+NEUTRALITY_DIRECT_CASES = _neutrality_direct_cases()
+
+
+def _neutrality_routing():
+    """One materialized RunRouting for every direct case, built from literals."""
+    profiles = dict(
+        load_agent_profiles_text(
+            MULTIPHASE_PROFILE,
+            path=PROJECT_PROFILE_RELATIVE_PATH,
+            source=SOURCE_PROJECT_LOCAL,
+        )
+    )
+    selection = AgentProfileSelection(
+        status=SELECTION_SELECTED, name="diverse", profile=profiles["diverse"]
+    )
+    return materialize_run_routing(
+        runtime=RUNTIME_ORCHESTRATION,
+        selection=selection,
+        requested_phases=(*CANONICAL_PHASES, *SPECIALIZED_PHASES),
+        risk="high",
+    )
+
+
+def _neutrality_direct_spec(role: str, phase: str, iteration: int, blocks: str) -> str:
+    """One render_task_spec() call from test-owned literals only.
+
+    The literals are chosen to carry the bytes _normalize_artifact() would destroy:
+    an empty multi-value field (which renders as `<key>: ` with a trailing space) and
+    a delta line with an interior double space.
+    """
+    boundary = build_task_boundary(
+        current_role=role,
+        current_phase=phase,
+        current_iteration=iteration,
+        artifact_contract=phase_artifact_contract(
+            role=role, phase=phase, run_id=NEUTRALITY_RUN_ID
+        ),
+        relevant_previous_findings=()
+        if iteration == 1
+        else ("R1 blocking: precedence inverted", "R2 non-blocking: naming"),
+    )
+    reviewer_context = None
+    quality_gate = None
+    risk_context = None
+    agent_routing = None
+    if blocks != "none":
+        reviewer_context = build_reviewer_context(
+            original_objective=f"neutrality:{phase}",
+            current_phase=phase,
+            approved_baseline=()
+            if iteration == 1
+            else (f"artifacts/runs/{NEUTRALITY_RUN_ID}/{phase.upper()}.md",),
+            current_delta=("worker report line one", "worker  report  line  two"),
+            new_claims=(),
+            previous_findings=() if iteration == 1 else (("R1", "resolved"),),
+            validation=("unit tests: PASS",),
+            drill_down=("<WORKSPACE>",),
+        )
+    if blocks in ("reviewer+quality", "reviewer+quality+risk", "all"):
+        quality_gate = build_quality_gate_context(
+            resolution=QualityProfileResolution(
+                status=PROFILE_STATUS_ABSENT, path=DEFAULT_PROFILE_PATH
+            ),
+            current_phase=phase,
+            requested_phases=("implementation",)
+            if phase == FINAL_REVIEW_PHASE
+            else (),
+        )
+    if blocks in ("reviewer+quality+risk", "all"):
+        risk_context = build_risk_context(
+            risk="low" if iteration == 1 else "high",
+            risk_source="default" if iteration == 1 else "explicit",
+            current_phase=phase,
+        )
+    if blocks == "all":
+        agent_routing = build_agent_routing_context(
+            routing=_neutrality_routing(), current_phase=phase
+        )
+    return render_task_spec(
+        f"{role} {phase} iteration {iteration}",
+        boundary,
+        reviewer_context,
+        quality_gate,
+        risk_context,
+        agent_routing,
+    )
+
+
+def neutrality_direct_key(role: str, phase: str, iteration: int, blocks: str) -> str:
+    return f"{role}|{phase}|iter{iteration}|{blocks}"
+
+
+def capture_neutrality_direct_specs() -> dict:
+    """Family B, keyed by neutrality_direct_key(). workspace=None -> identity."""
+    return {
+        neutrality_direct_key(*case): canonicalize_task_spec(
+            _neutrality_direct_spec(*case), workspace=None
+        )
+        for case in NEUTRALITY_DIRECT_CASES
+    }
+
+
+def capture_neutrality_task_specs(repo_root: Path) -> dict:
+    """The whole golden document: both families, plus its own provenance.
+
+    This exact function, run inside a `git archive 1045815` checkout with this test
+    module copied in, built scripts/fixtures/os22_neutrality/pre_os22_task_specs.json.
+    """
+    workflow_specs: dict[str, dict[str, list[str]]] = {}
+    for skill_path in SKILL_PATHS:
+        skill = skill_path.parent.name
+        per_skill: dict[str, list[str]] = {}
+        for workflow in NEUTRALITY_WORKFLOWS:
+            for label, profile in NEUTRALITY_PROFILES:
+                per_skill[f"{workflow}|profile={label}"] = (
+                    capture_neutrality_workflow_specs(
+                        repo_root, skill, workflow, profile=profile
+                    )
+                )
+        workflow_specs[skill] = per_skill
+    return {
+        "captured_from_commit": NEUTRALITY_COMMIT,
+        "captured_by": "scripts/test_e2e_harness.py::capture_neutrality_task_specs",
+        "canonicalization": NEUTRALITY_CANONICALIZATION,
+        "workflow_specs": workflow_specs,
+        "direct_specs": capture_neutrality_direct_specs(),
+    }
+
+
+# The exact signature render_task_spec() had at 1045815: names, order and defaults.
+# A new parameter -- even an unused, defaulted one -- is a change to what a Reviewer
+# can be handed, so it fails here rather than passing quietly.
+NEUTRALITY_RENDER_TASK_SPEC_SIGNATURE = (
+    ("base_spec", inspect.Parameter.empty),
+    ("boundary", inspect.Parameter.empty),
+    ("reviewer_context", None),
+    ("quality_gate", None),
+    ("risk_context", None),
+    ("agent_routing", None),
+)
+
+
+class FinalReviewObservabilityNeutralityTests(unittest.TestCase):
+    """OS-22 section 2: adding Final Review observability changed no dispatched byte.
+
+    The baseline is a golden capture taken at 1045815, the last commit BEFORE OS-22,
+    and the comparison is on encoded bytes. See
+    scripts/fixtures/os22_neutrality/README.md -- if this fails, the current code
+    changed reviewer-visible bytes and the code is what needs fixing.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.golden = json.loads(NEUTRALITY_BASELINE.read_text(encoding="utf-8"))
+        cls.repo_root = Path(__file__).resolve().parents[1]
+
+    def assertSpecBytesEqual(self, current: str, stored: str, label: str) -> None:
+        """The one comparison helper the real assertions and the mutation test share."""
+        self.assertEqual(current.encode("utf-8"), stored.encode("utf-8"), label)
+
+    def test_the_golden_records_its_own_provenance(self) -> None:
+        self.assertEqual(self.golden["captured_from_commit"], NEUTRALITY_COMMIT)
+        self.assertEqual(
+            self.golden["canonicalization"], NEUTRALITY_CANONICALIZATION
+        )
+        self.assertEqual(
+            self.golden["captured_by"],
+            "scripts/test_e2e_harness.py::capture_neutrality_task_specs",
+        )
+
+    def test_the_golden_covers_both_skills_all_workflows_and_both_profiles(
+        self,
+    ) -> None:
+        """A shrunken fixture would silently shrink the claim."""
+        specs = self.golden["workflow_specs"]
+        self.assertEqual(len(specs), len(SKILL_PATHS))
+        for skill_path in SKILL_PATHS:
+            skill = skill_path.parent.name
+            self.assertIn(skill, specs)
+            for workflow in NEUTRALITY_WORKFLOWS:
+                for label, _profile in NEUTRALITY_PROFILES:
+                    key = f"{workflow}|profile={label}"
+                    with self.subTest(skill=skill, key=key):
+                        self.assertIn(key, specs[skill])
+                        self.assertTrue(specs[skill][key])
+
+    def test_the_golden_carries_a_final_review_spec(self) -> None:
+        """The whole point of covering profile=multi in family A."""
+        specs = self.golden["workflow_specs"][ORCHESTRATION_SKILL]
+        final_review_specs = [
+            spec
+            for key, rendered in specs.items()
+            if key.endswith("|profile=multi")
+            for spec in rendered
+            if "current_role: final_reviewer" in spec
+        ]
+        self.assertTrue(final_review_specs)
+
+        direct = self.golden["direct_specs"]
+        self.assertIn(
+            neutrality_direct_key("final_reviewer", FINAL_REVIEW_PHASE, 1, "all"),
+            direct,
+        )
+        self.assertIn(
+            neutrality_direct_key("final_reviewer", FINAL_REVIEW_PHASE, 2, "all"),
+            direct,
+        )
+
+    def test_every_workflow_spec_is_byte_identical_to_the_pre_os22_capture(
+        self,
+    ) -> None:
+        for skill_path in SKILL_PATHS:
+            skill = skill_path.parent.name
+            for workflow in NEUTRALITY_WORKFLOWS:
+                for label, profile in NEUTRALITY_PROFILES:
+                    key = f"{workflow}|profile={label}"
+                    with self.subTest(skill=skill, key=key):
+                        current = capture_neutrality_workflow_specs(
+                            self.repo_root, skill, workflow, profile=profile
+                        )
+                        stored = self.golden["workflow_specs"][skill][key]
+
+                        self.assertEqual(len(current), len(stored))
+                        for index, (actual, expected) in enumerate(
+                            zip(current, stored)
+                        ):
+                            self.assertSpecBytesEqual(
+                                actual, expected, f"{skill}::{key}[{index}]"
+                            )
+
+    def test_every_direct_spec_is_byte_identical_to_the_pre_os22_capture(self) -> None:
+        current = capture_neutrality_direct_specs()
+        stored = self.golden["direct_specs"]
+
+        self.assertEqual(sorted(current), sorted(stored))
+        for key in sorted(current):
+            with self.subTest(case=key):
+                self.assertSpecBytesEqual(current[key], stored[key], key)
+
+    def test_the_direct_matrix_covers_every_role_phase_iteration_and_block_set(
+        self,
+    ) -> None:
+        expected = {neutrality_direct_key(*case) for case in NEUTRALITY_DIRECT_CASES}
+        self.assertEqual(set(self.golden["direct_specs"]), expected)
+        self.assertEqual(
+            len(expected),
+            sum(len(phases) for _role, phases in _NEUTRALITY_ROLE_PHASES)
+            * 2
+            * len(NEUTRALITY_DIRECT_BLOCKS),
+        )
+
+    def test_no_captured_spec_ends_with_a_terminal_newline(self) -> None:
+        """N.2 1b: pinning render_task_spec()'s current terminator, so adding one
+        is a neutrality failure rather than an invisible change."""
+        for skill, specs in self.golden["workflow_specs"].items():
+            for key, rendered in specs.items():
+                for index, spec in enumerate(rendered):
+                    with self.subTest(skill=skill, key=key, spec=index):
+                        self.assertFalse(spec.endswith("\n"))
+                        self.assertTrue(spec.endswith(TASK_SPEC_END_MARKER))
+        for key, spec in self.golden["direct_specs"].items():
+            with self.subTest(case=key):
+                self.assertFalse(spec.endswith("\n"))
+                self.assertTrue(spec.endswith(TASK_SPEC_END_MARKER))
+
+    def test_a_whitespace_only_change_fails_the_neutrality_golden(self) -> None:
+        """N.2 1a: the golden is PROVEN byte-strict, not assumed to be.
+
+        Four whitespace-only mutations, one at a time, on a worker spec, a reviewer
+        spec and a final_reviewer spec. Each must fail the real comparison helper --
+        and the same test shows _normalize_artifact() would have accepted three of
+        them, which is exactly why this capture does not use it.
+        """
+        samples = {
+            "worker": self.golden["direct_specs"][
+                neutrality_direct_key("worker", "implementation", 1, "all")
+            ],
+            "reviewer": self.golden["direct_specs"][
+                neutrality_direct_key("reviewer", "design", 2, "all")
+            ],
+            "final_reviewer": self.golden["direct_specs"][
+                neutrality_direct_key("final_reviewer", FINAL_REVIEW_PHASE, 1, "all")
+            ],
+        }
+        workspace = Path("/nonexistent-neutrality-workspace")
+        for label, original in samples.items():
+            mutants = {
+                "strip a trailing space from an empty-valued key": original.replace(
+                    "new_claims: \n", "new_claims:\n", 1
+                ),
+                "add a trailing space to a line that has none": original.replace(
+                    "\n=== END TASK BOUNDARY ===",
+                    "\n=== END TASK BOUNDARY === ",
+                    1,
+                ),
+                "collapse an interior double space": original.replace("  ", " ", 1),
+                "append a terminal newline": original + "\n",
+            }
+            for mutation, mutant in mutants.items():
+                with self.subTest(spec=label, mutation=mutation):
+                    self.assertNotEqual(mutant, original, "the mutation was a no-op")
+                    with self.assertRaises(self.failureException):
+                        self.assertSpecBytesEqual(mutant, original, label)
+
+            for mutation in (
+                "strip a trailing space from an empty-valued key",
+                "add a trailing space to a line that has none",
+                "collapse an interior double space",
+            ):
+                with self.subTest(spec=label, normalizer=mutation):
+                    self.assertEqual(
+                        _normalize_artifact(mutants[mutation], workspace),
+                        _normalize_artifact(original, workspace),
+                        "the old normalizer was supposed to accept this mutation",
+                    )
+
+    def test_the_audit_module_is_not_reachable_from_the_dispatch_path(self) -> None:
+        """N.2 assertion 3: DEC-4's ordering invariant, enforced structurally.
+
+        Literal non-importability is not achievable -- the redaction code lives in
+        run_logging.py, which the dispatching module already imports for logging --
+        so the requirement is implemented as NON-INVOCATION and proved here. That is
+        strictly stronger evidence than an import graph: an import proves nothing
+        about a call, and this proves the call did not happen.
+
+        The patched entry points raise on ANY call, and a full workflow is then
+        driven through spec assembly and the dispatch call. The capture surfaces are
+        deliberately left out of the tripwire and re-patched below, because they are
+        SUPPOSED to run -- after the dispatch, from the settlement path.
+        """
+        tripwires = (
+            "redact_text",
+            "capture_stored_task_spec",
+            "capture_delivery_evidence",
+            "write_final_review_audit_record",
+        )
+        rendered: list[str] = []
+        original = e2e_module.render_task_spec
+
+        def recording(*args, **kwargs):
+            spec = original(*args, **kwargs)
+            # The tripwires are armed while THIS runs: a spec that renders without
+            # tripping one is a spec no audit code touched.
+            rendered.append(spec)
+            return spec
+
+        skill_path = [
+            path for path in SKILL_PATHS if not path.parent.name.endswith("-loop")
+        ][0]
+        e2e_module.render_task_spec = recording
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                workspace = Path(directory)
+                harness = E2EHarness(
+                    skill_path,
+                    phase="implementation",
+                    workspace=workspace,
+                    run_id="run_tripwire",
+                )
+                scenario = WorkflowScenario(
+                    phases=("implementation",),
+                    phase_scenarios={
+                        "implementation": FakeScenario(("complete",), ("pass",))
+                    },
+                    final_review=FinalReviewScenario(modes=("pass",)),
+                    run_id="run_tripwire",
+                )
+                patches = [
+                    patch.object(
+                        run_logging,
+                        name,
+                        side_effect=AssertionError(
+                            f"run_logging.{name} was reached from the "
+                            "spec-assembly -> dispatch path"
+                        ),
+                    )
+                    for name in tripwires
+                ]
+                # The audit emission point itself is on the settlement path, which
+                # this workflow also runs, so it is suppressed here rather than
+                # allowed to trip its own tripwire.
+                with patch.object(
+                    e2e_module.E2EHarness, "_write_final_review_audit", lambda *a: None
+                ):
+                    for entry in patches:
+                        entry.start()
+                    try:
+                        result = harness.run_workflow(scenario)
+                    finally:
+                        for entry in reversed(patches):
+                            entry.stop()
+        finally:
+            e2e_module.render_task_spec = original
+
+        self.assertEqual(result.final_status, "COMPLETED")
+        self.assertTrue(rendered, "no spec was rendered, so nothing was proved")
+
+    def test_the_audit_surfaces_this_test_arms_all_exist(self) -> None:
+        """A tripwire patched onto a name that no longer exists proves nothing, and
+        patch() on a missing attribute would be the only thing to say so."""
+        for name in (
+            "redact_text",
+            "capture_stored_task_spec",
+            "capture_delivery_evidence",
+            "write_final_review_audit_record",
+        ):
+            with self.subTest(name=name):
+                self.assertTrue(callable(getattr(run_logging, name)))
+
+    def test_render_task_spec_gained_no_parameter(self) -> None:
+        signature = inspect.signature(task_context_module.render_task_spec)
+        actual = tuple(
+            (name, parameter.default)
+            for name, parameter in signature.parameters.items()
+        )
+        self.assertEqual(actual, NEUTRALITY_RENDER_TASK_SPEC_SIGNATURE)
+
+    def test_the_os4_legacy_evidence_is_untouched(self) -> None:
+        """A separate capture function and a separate fixture file, as DEC-1 requires:
+        extending capture_legacy_artifacts() or pre_os4_artifacts.json in place would
+        change LegacyByteIdentityTests' input and destroy the OS-4 evidence."""
+        self.assertNotEqual(NEUTRALITY_BASELINE, LEGACY_BASELINE)
+        legacy = json.loads(LEGACY_BASELINE.read_text(encoding="utf-8"))
+        self.assertEqual(len(legacy), 6)
+        self.assertEqual(set(legacy), {
+            f"{skill_path.parent.name}::{workflow}"
+            for skill_path in SKILL_PATHS
+            for workflow in GOLDEN_WORKFLOWS
+        })
+
+        # The neutrality capture must never route a Task spec through the OS-4
+        # normalizer -- that is the whole reason canonicalize_task_spec() exists.
+        # Asserted over the parsed call graph, not over the text, so the explanatory
+        # comments that name the normalizer do not satisfy or break the check.
+        module = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+        capture_functions = {
+            "canonicalize_task_spec",
+            "capture_neutrality_workflow_specs",
+            "capture_neutrality_direct_specs",
+            "capture_neutrality_task_specs",
+            "_neutrality_direct_spec",
+            "_neutrality_routing",
+        }
+        found = set()
+        for node in module.body:
+            if isinstance(node, ast.FunctionDef) and node.name in capture_functions:
+                found.add(node.name)
+                called = {
+                    call.func.id
+                    for call in ast.walk(node)
+                    if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+                }
+                self.assertNotIn("_normalize_artifact", called, node.name)
+        self.assertEqual(found, capture_functions)
+
+
+class DeterministicFinalReviewAuditTests(unittest.TestCase):
+    """OS-22 I-10, harness side: the deterministic runtime takes the same path.
+
+    The point is not to re-test the writer -- test_run_logging.py does that -- but to
+    prove the EMISSION POINT exists on this path too, and that the workflow's own
+    verdict is unaffected by it.
+    """
+
+    def run_workflow(
+        self,
+        modes,
+        workspace: Path,
+        run_id: str = "run_audit_e2e",
+        *,
+        findings=(),
+        correction_scenarios=None,
+    ):
+        skill_path = [
+            path for path in SKILL_PATHS if not path.parent.name.endswith("-loop")
+        ][0]
+        harness = E2EHarness(
+            skill_path, phase="implementation", workspace=workspace, run_id=run_id
+        )
+        return harness.run_workflow(
+            WorkflowScenario(
+                phases=("implementation",),
+                phase_scenarios={
+                    "implementation": FakeScenario(("complete",), ("pass",))
+                },
+                final_review=FinalReviewScenario(modes=modes, findings=findings),
+                run_id=run_id,
+                correction_scenarios=correction_scenarios or {},
+            )
+        )
+
+    def records(self, workspace: Path, run_id: str) -> dict[str, dict]:
+        return {
+            key: json.loads((directory / "record.json").read_text(encoding="utf-8"))
+            for key, directory in run_logging.iter_final_review_audit_records(
+                run_id, base=workspace
+            )
+        }
+
+    def test_one_record_per_final_review_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+
+            result = self.run_workflow(("pass",), workspace)
+
+            records = self.records(workspace, "run_audit_e2e")
+            self.assertEqual(len(records), 1)
+            record = records["attempt1__task_e2e_final_review_1__ctx_e2e_final_review_1"]
+            self.assertEqual(record["final_review_attempt"], 1)
+            self.assertEqual(record["provenance_state"], "accepted")
+            self.assertEqual(record["settlement_state"], "settled")
+            self.assertEqual(result.final_review_iterations, 1)
+
+    def test_the_contracted_review_artifact_is_materialized_and_snapshotted(
+        self,
+    ) -> None:
+        """final_review_artifact_path() named the path and nothing wrote it, so the
+        contracted artifact existed only as a string in a result object."""
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+
+            result = self.run_workflow(("pass",), workspace)
+
+            report = workspace / result.final_review_artifacts[0]
+            self.assertTrue(report.is_file())
+            record = next(iter(self.records(workspace, "run_audit_e2e").values()))
+            self.assertEqual(record["report"]["capture_status"], "captured")
+            snapshot = (
+                workspace
+                / "artifacts"
+                / "runs"
+                / "run_audit_e2e"
+                / "final_review_audit"
+                / record["dispatch_key"]
+                / "report.md"
+            )
+            self.assertEqual(
+                run_logging.sha256_bytes(snapshot.read_bytes()),
+                record["report"]["artifact_digest_post_redaction"],
+            )
+
+    def test_a_second_attempt_never_overwrites_the_first_record(self) -> None:
+        """The whole point of a per-dispatch key: attempt 2's Reviewer can overwrite
+        attempt 1's FINAL_REVIEW.md, but not attempt 1's snapshot of it."""
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+
+            self.run_workflow(
+                ("fail", "pass"),
+                workspace,
+                findings=((("R1", "implementation"),), ()),
+                correction_scenarios={
+                    ("implementation", 1): FakeScenario(
+                        worker_modes=("correction",),
+                        reviewer_modes=("pass",),
+                        worker_resolutions=({"R1": "RESOLVED"},),
+                    )
+                },
+            )
+
+            records = self.records(workspace, "run_audit_e2e")
+            self.assertEqual(len(records), 2)
+            attempts = sorted(
+                record["final_review_attempt"] for record in records.values()
+            )
+            self.assertEqual(attempts, [1, 2])
+            audit_dir = (
+                workspace / "artifacts" / "runs" / "run_audit_e2e"
+                / "final_review_audit"
+            )
+            first = (
+                audit_dir
+                / "attempt1__task_e2e_final_review_1__ctx_e2e_final_review_1"
+                / "report.md"
+            ).read_text(encoding="utf-8")
+            second = (
+                audit_dir
+                / "attempt2__task_e2e_final_review_2__ctx_e2e_final_review_2"
+                / "report.md"
+            ).read_text(encoding="utf-8")
+            self.assertNotEqual(first, second)
+
+    def test_an_audit_failure_does_not_change_the_workflow_verdict(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+
+            with patch(
+                "scripts.run_logging.write_final_review_audit_record",
+                side_effect=OSError("disk full"),
+            ):
+                result = self.run_workflow(("pass",), workspace)
+
+            self.assertEqual(result.final_review_verdict, "PASS")
+            self.assertEqual(result.final_status, "COMPLETED")
+
+
+class FinalReviewArtifactPathAttemptDomainTests(unittest.TestCase):
+    """T-13.9 -- DESIGN D-A.7.4' GATE 6.
+
+    `final_review_artifact_path()` is the third public producer of the
+    FINAL_REVIEW.md / FINAL_REVIEW_iteration<N>.md filename family. It shipped with the
+    `< 1` half of the check and not the type half, so `2.0` built
+    artifacts/runs/<run>/FINAL_REVIEW_iteration2.0.md (M-24b).
+    """
+
+    OUT_OF_DOMAIN = (0, -1, -12, False, True, 2.0, "2", None)
+
+    def test_t139_every_out_of_domain_attempt_is_refused(self) -> None:
+        for attempt in self.OUT_OF_DOMAIN:
+            with self.subTest(attempt=attempt):
+                # assertRaises(ValueError) ON PURPOSE, not assertRaises(RunLoggingError).
+                # The gate now raises `run_logging.RunLoggingError`, which is declared
+                # `class RunLoggingError(ValueError)`, so the shipped raise contract is
+                # preserved: every existing `except ValueError` around this function
+                # still catches it. This assertion is what pins that substitution
+                # (D-A.7.3') rather than leaving a reader to notice it.
+                with self.assertRaises(ValueError):
+                    e2e_module.final_review_artifact_path("run_t", attempt)
+
+    def test_t139_the_refusal_is_the_shared_predicates_message(self) -> None:
+        with self.assertRaises(run_logging.RunLoggingError) as caught:
+            e2e_module.final_review_artifact_path("run_t", 2.0)
+        self.assertEqual(str(caught.exception), "attempt must be an int >= 1, got 2.0")
+
+    def test_t139_valid_attempts_return_the_shipped_strings(self) -> None:
+        for attempt in (1, 2, 3, 99, 100):
+            with self.subTest(attempt=attempt):
+                suffix = "" if attempt == 1 else f"_iteration{attempt}"
+                self.assertEqual(
+                    e2e_module.final_review_artifact_path("run_t", attempt),
+                    f"artifacts/runs/run_t/FINAL_REVIEW{suffix}.md",
+                )
 
 
 if __name__ == "__main__":

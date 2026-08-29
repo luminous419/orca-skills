@@ -1205,6 +1205,143 @@ worker-release/retain 여부)을 다시 mutate하지 않는다. 로그 호출은
 삭제되거나 압축되지 않는다. Bottleneck 분석, aggregate metric, dashboard 등 richer observability는
 OS-7 범위다 — 이 절이 남기는 것은 그 분석의 입력이 될 원시 evidence뿐이다.
 
+#### Final Review audit artifacts (OS-22)
+
+§17 Final Adversarial Review dispatch마다, 그 Reviewer가 **실제로 무엇을 받았고 무엇을 냈는지**를
+어떤 요약과도 독립적으로 보존하는 per-dispatch record를 남긴다. `ORCHESTRATOR_LOG.md`가 lifecycle을
+증명하듯 이 record가 attempt의 **내용**을 증명한다. 두 파일과 마찬가지로 소유자는
+`tools/run_logging.py`이며, Python 경로(`OrcaRuntimeHarness`)와 CLI 경로가 같은 writer를 공유한다.
+
+```text
+<ARTIFACT_ROOT>final_review_audit/
+    <dispatch_key>/                 published record -- 완전한 상태로만 존재한다
+        record.json                 audit record (schema_version = 1.0)
+        input.md                    보존된 redacted stored Task spec
+        report.md                   보존된 redacted report snapshot
+    .staging/                       record가 아니다. reader는 전부 무시한다
+<ARTIFACT_ROOT>FINAL_REVIEW_EVIDENCE_BUNDLE.json    export bundle (opt-in)
+
+dispatch_key = attempt<N>__<task_id>__<dispatch_id 또는 nodispatch>
+```
+
+`final_review_audit/`는 §9 artifact path contract의 flat namespace 밖에 있다 — `FINAL_REVIEW*` glob이
+audit 파일을 잡기 시작하면 안 되기 때문이다.
+
+**published directory 자체가 완전한 record다.** `<dispatch_key>/`라는 이름은 세 파일이 모두 쓰이고
+fsync된 staging directory를 단 한 번의 `os.rename()`으로 옮길 때에만 나타난다. 따라서 존재와 완전성이
+같은 사실이며 reader는 "다 쓰였는가"를 따로 판단하지 않는다. reader는 `.staging/`을 **읽지 않는다** —
+parsing도, digest도, export도, count도, provenance 답변도 하지 않는다. `.staging/` 아래의 미완성
+publication은 삭제되지 않고 보존되며 `final_review_audit_incomplete_publication` row와 bundle의
+`integrity.incomplete_publications`로 보고된다.
+
+**export bundle은 sanitize된 사본만 담는다.** bundle에 들어가는 모든 text는 기록된 redaction policy
+아래에서 residue-free임이 증명된 것뿐이다. `ORCHESTRATOR_LOG.md`는 post-redaction artifact가 아니므로
+embed 직전에 같은 policy로 sanitize되어 `orchestrator_log.content_redacted`로 들어가고,
+`digest_pre_redaction`/`digest_post_redaction`이 원본과 embed된 bytes의 identity 관계를 재도출 가능하게
+만든다. residue-free로 만들 수 없는 text는 사유(`content_omitted_reason`)와 digest만 남기고 **생략**되며
+`integrity.omitted_content[]`에 보고된다 — 잘라내지 않고, 몰래 넣지도 않는다. 권위 있는 local log는
+읽기 전용으로만 열리며 절대 다시 쓰이지 않는다. export bundle schema는 이 변경으로 `2.0`이다.
+
+**record는 한 번 쓰이고 절대 수정되지 않는다.** 이미 published된 `<dispatch_key>/`에 다시 쓰는 경로는
+없다 — force도, overwrite flag도, update 함수도 없다. retry는 새 Task/Dispatch identity를 갖고 따라서
+새 dispatch_key를 갖는다. record를 "정정"한다는 것은 새 record를 쓰는 것이다.
+
+**schema version과 reader 호환 규칙.** `record.json`의 첫 키는 `schema_version`이고 v1.0의 값은
+`FINAL_REVIEW_AUDIT_SCHEMA_VERSION = 1.0`이다. MAJOR가 1이 아니면 reader는 해석을 **거부**하고
+`unknown`으로 보고한다 — 어떤 필드로부터도 provenance를 추론하지 않는다. MAJOR가 1이고 MINOR가 더
+높으면 아는 필드만 읽고 모르는 필드는 무시한다. 필드 추가는 MINOR, 기존 필드의 의미 변경은 MAJOR다.
+
+**provenance는 fail-closed다.** `provenance_state`는 `accepted | voided | unknown`이고 어떤 기본값도
+`accepted`가 아니다 (`FINAL_REVIEW_PROVENANCE_DEFAULT = unknown`). 파일이 없거나, 파싱되지 않거나,
+required field가 빠졌거나, MAJOR를 모르면 전부 `unknown`으로 읽힌다. `voided`는
+`dispatch_input_rejected | dispatch_capability_invalid | settlement_failure | report_missing |
+report_malformed | superseded_by_retry` 중 하나의 `void_reason`을 반드시 갖는다. 한 attempt에
+`accepted`는 최대 하나이며, 둘 이상이면 reader는 승자를 고르지 않고 violation으로 보고한다.
+`voided` record는 어떤 함수도 verdict로 반환하지 않는다.
+
+**secret-safe.** `input.md`/`report.md`는 versioned redaction policy
+(`FINAL_REVIEW_REDACTION_POLICY_VERSION = redaction/1.1`)를 통과한 텍스트만 담는다 — dispatch
+capability token, URL credential, 이름이 secret인 환경변수 값, home-rooted 절대 경로의 사용자 이름
+segment (예: `/Users/<name>/…` → `/Users/<REDACTED:absolute_local_path>/…`), 그리고 **그 밖의 모든
+절대 경로 전체**가 치환된다 (`/private/tmp/…`, `/var/folders/…`, `/tmp` — segment 개수 하한은 없다 —
+→ `<REDACTED:foreign_absolute_path>`). 위험한 root를 allowlist로 세는 정책은 아무도 떠올리지 못한
+root에서 fail-open하므로, v1.1은 home 세 철자만 좁게 유지하고 **나머지 절대 경로는 기본적으로 전부**
+치환한다. 나아가 **retained record의 경로 field는 어떤 code path가 썼든** `<ARTIFACT_ROOT>`-relative,
+`<REPO>/`-relative, 경로가 아닌 값, 또는 통째로 치환된 `<REDACTED:foreign_absolute_path>` 네 가지 출력
+범주 중 하나여야 한다 (**P-PATH**). 네 범주 밖의 값은 record assembly에서 `RunLoggingError`로 막히고
+아무것도 published되지 않는다 — "policy가 바꾸지 않았다"는 통과 사유가 아니다. raw byte는 capture
+subprocess의 stdout pipe와 메모리 안에만 존재하고 어디에도 쓰이지 않는다. record는 redaction 전 digest,
+policy version, redaction 후 artifact digest, 그리고 category별 치환 횟수 네 가지를 갖는다 — 치환된
+값 자체나 그 offset은 갖지 않는다.
+
+`record.json` 자체도 보존되는 artifact다. 따라서 record가 담는 **free-form string** — `notes`,
+`failure_detail`, `reviewer_agent_command`, `reviewer_agent_origin`, 세 section의 `capture_error`,
+delivery evidence의 `process_incarnation` / `last_failure` / `termination_reason`, 그리고 report에서
+유래한 `report.parsed.parse_error` 와 finding id 목록 — 은 persist 직전 단 한 곳에서
+`input.md`/`report.md`와 **동일한 policy**를 통과한다. 무엇이 대상이었고
+어떤 category가 몇 번 치환됐는지는 `metadata_redaction` (`redaction_policy_version`,
+`covered_fields`, `redactions`)이 말한다. 반대로 record가 증명하려고 존재하는 **identity**는 절대
+치환되지 않는다 — `run_id`/`task_id`/`dispatch_id`/`dispatch_key`, `reviewer_terminal`,
+`assignee_handle`, 이미 hash인 `capability_hash`, 그리고 validated enum들. over-redaction은
+secret-safe의 반대쪽 실패다.
+
+**report는 writer가 통제하지 않는 유일한 input이다.** 그래서 `RESULT:` / `REVIEW_VERDICT:` 의 capture가
+enum 검증에 실패하면 그 raw text는 field 값이 되지 못한다 — field는 `INVALID` sentinel을 담고, 문제의
+byte는 `parse_error` 한 곳에서만, 그것도 redaction을 거쳐 남는다. 즉 `result` / `review_verdict` 가
+redaction 없이 persist되어도 안전한 이유는 "enum이라고 불러서"가 아니라 **persist 전에 닫힌 집합으로
+제한되기 때문**이다. finding id 역시 report가 고른 token이므로 id 형태(`[A-Za-z0-9][A-Za-z0-9._-]{0,63}`)가
+아니면 `INVALID_ID` 로 대체되고(목록 길이는 그대로 유지된다), 형태를 통과한 값도 redaction을 한 번 더 거친다.
+
+**세 authority.** 서로를 대체하지 않는다.
+
+```text
+1. ORCHESTRATOR_LOG.md   : run lifecycle provenance의 authority. append-only.
+                           run_end는 terminal이 아니다 -- reader는 파일 전체를 읽고
+                           마지막 run_status row를 authoritative status로 삼는다.
+                           run_end 뒤의 row는 유효하며 run이 계속됐다는 뜻이고,
+                           뒤의 run_end가 앞의 것을 대체한다.
+2. per-dispatch audit records : attempt 내용(input, report, finding, verdict,
+                           provenance)의 authority. 요약과 record가 어긋나면 record가
+                           이기며 reader는 조용히 화해시키지 않고 그렇게 말한다.
+3. FINAL_RESULT.md (§16) : 참조하는 요약이다. 보존된 reviewer artifact가 뒷받침하지 않는
+                           finding 수준의 주장을 하지 않는다.
+```
+
+**retention / export / commit.** export는 opt-in이며 어떤 workflow 단계도 자동으로 실행하지 않는다.
+bundle은 immutable한 record들로부터 언제든 다시 만들 수 있으므로 **덮어쓰기가 허용된다** — record의
+immutability와 의도적으로 다르다. 어떤 record도, log도, bundle도, run artifact도 삭제/압축/GC하지
+않는다 (retention/archive 정책은 OS-8 범위다). `.staging/` 정리는 예외가 아니다: 대응하는
+`<dispatch_key>/`가 이미 published된 scratch 상태만 지우고, publish되지 못한 entry는 그것이 그 attempt의
+유일한 증거이므로 **보존한다**. `artifacts/runs/`는 gitignore하지 않으며, 이 문서의 어떤 절차도
+run artifact를 저장소에 stage하거나 commit하지 않는다 — commit 여부는 run마다 사람이 내리는 결정이다.
+
+```text
+python3 <SKILL_DIR>/tools/run_logging.py final-review-audit-write --run-id <run-id> \
+  --attempt <n> --task-id <task_id> [--dispatch-id <dispatch_id>] \
+  [--provenance accepted|voided|unknown] [--void-reason <위 여섯 중 하나>] \
+  [--settlement settled|not_settled|unknown] [--report-path <path>] [--terminal <handle>] \
+  [--agent-command <cmd>] [--agent-origin <origin>] [--failure-detail <text>] \
+  [--observed-input-bytes <n>] [--no-capture] [--notes <text>]
+
+python3 <SKILL_DIR>/tools/run_logging.py final-review-audit-provenance --run-id <run-id> \
+  --attempt <n>
+
+python3 <SKILL_DIR>/tools/run_logging.py final-review-audit-export --run-id <run-id> \
+  [--out <path>]
+```
+
+호출 시점은 §17 Coordinator procedure 5단계 — 네 축 lifecycle 종결 **직후**, 6단계 verdict 분기
+**전** — 이다. 그 순서는 필수다: attempt N+1의 Reviewer가 같은 `FINAL_REVIEW.md`를 덮어쓸 수 있으므로
+snapshot을 run 종료까지 미루면 증거가 사라진다. audit write가 실패해도 이미 내려진 lifecycle 판단은
+무엇도 mutate하지 않는다 — 로깅과 동일한 규칙이며, 실패는 log row로 남고 run은 계속된다.
+
+새 event 값은 `--event` vocabulary에 추가될 뿐 column을 추가하지 않는다:
+`final_review_audit_written`, `final_review_audit_incomplete`, `final_review_audit_collision`,
+`final_review_audit_write_failed`, `final_review_audit_incomplete_publication`. log ↔ record join은
+이미 존재하는 `task_id`/`dispatch_id` column으로 한다.
+
+이 절은 orchestration skill 전용이다 — `orca-worker-reviewer-loop`에는 run-scoped log 자체가 없다.
+
 ## 10. Worker Contract
 
 Worker는 phase별 `templates/*.md`를 따른다.
@@ -1614,7 +1751,10 @@ Coordinator는 직접 production code를 수정하지 않는다.
    finalization이 정확히 한 번인지, 그리고 모든 lifecycle 동작이 그 Dispatch의 finalization
    게이트를 통과한 뒤에 수행되었는지 확인한다.
 8. Final Adversarial Review attempt마다 고유한 Task/Dispatch provenance와 새로 생성한 terminal,
-   axis (b) != reuse인 네 축 행이 있는지, 그리고 attempt마다 artifacts/FINAL_REVIEW_*가 있는지 확인한다.
+   axis (b) != reuse인 네 축 행이 있는지, 그리고 attempt마다 `<ARTIFACT_ROOT>FINAL_REVIEW*`가 있는지
+   확인한다 (§9 artifact path contract의 경로이며, run 밖의 공용 `artifacts/` root가 아니다).
+   attempt의 각 dispatch마다 §9 `#### Final Review audit artifacts`의 record가 존재하는지도 함께
+   확인한다.
    그리고 T5a에서 재검증된 downstream phase가 FINAL_REVIEW_REVALIDATIONS에 빠짐없이 기록되었는지 확인한다.
 9. reuse chain이 있다면 chain마다 terminal handle과 Dispatch 순서, chain의 종결 방식(retain/release/
    unsupervised)을 기록했는지, reuse 단계에서 lifecycle mutation 명령이 하나도 발행되지 않았는지,
@@ -1679,6 +1819,21 @@ FINAL_REVIEW_REVALIDATIONS: none
 ## Non-Blocking Recommendations
 ```
 
+`## Final Adversarial Review`에는 위 네 줄에 이어, attempt의 **dispatch마다** 그 dispatch의 audit
+record를 다음 형식으로 인용한다 (§9 `#### Final Review audit artifacts`). Coordinator가 §17 5단계에서
+이미 갖고 있는 값을 그대로 옮기는 것이며 새로 판단하지 않는다.
+
+```text
+FINAL_REVIEW_AUDIT: attempt <n> task_<id> / dispatch_<id> provenance=<accepted|voided|unknown>
+  -> <ARTIFACT_ROOT>final_review_audit/attempt<n>__task_<id>__<dispatch_id>/record.json
+```
+
+이 블록은 **참조하는 요약**이며, 보존된 reviewer artifact가 뒷받침하지 않는 finding 수준의 주장을 하지
+않는다 — record와 요약이 어긋나면 record가 이기고 요약은 그 사실을 적는다. `provenance_state`가
+`accepted`가 아닌 dispatch의 출력은 verdict가 아니므로 `FINAL_REVIEW:` 값의 근거로 인용하지 않으며,
+`voided/report_missing`은 verdict가 아니다. 위 `## Orca Orchestration State`의 네 축 ledger는 그대로
+유지한다 — audit record는 그것을 대체하지 않는다.
+
 `profile`이 선택된 run에서만 최종 보고에 다음 두 줄을 추가한다. profile이 없는 run의 최종 보고는
 지금과 문자 단위로 동일하며 이 두 줄이 존재하지 않는다 — `AGENT_PROFILE: none`이라고 적지도 않는다.
 
@@ -1724,7 +1879,10 @@ Agent Profile이 선택되었으면 `profile.final_review.reviewer` > explicit `
 4. 새 terminal을 생성하고 즉시 ledger에 handle + role(active_worker) + origin(self_created) +
    intended_role(phase_reviewer)를 기록한다. §6 placement ladder로 입양시켜 Dispatch에 연결한다.
 5. worker_done을 기다린 뒤 그 Dispatch의 lifecycle을 §6 four-axis 절차로 정확히 한 번 종결한다.
-   axis (b)는 reuse가 아니다.
+   axis (b)는 reuse가 아니다. 종결 직후, 6단계로 넘어가기 전에 §9
+   `#### Final Review audit artifacts`의 per-dispatch audit record를 이 dispatch에 대해
+   정확히 한 번 쓴다 (dispatch-layer failure로 report가 없는 경우도 포함한다 -- 그때는
+   record가 실패 자체의 증거다). 이 write는 lifecycle 판단을 무엇도 mutate하지 않는다.
 6. verdict를 평가하고 아래 T1/T2/T3로 분기한다.
 ```
 
@@ -1732,7 +1890,10 @@ dependency edge를 걸지 않는 것은 §6 Task graph ordering의 요구다. tr
 
 입력은 ORIGINAL_REQUEST / PHASES / provenance+ledger 요약 / FINAL_REVIEW_ITERATIONS와 max-iterations / 직전 attempt의
 finding·resolution 표를 inline으로, phase별 approved·REVIEW artifact, 전체 diff(base..HEAD), 변경된 production file 목록,
-test·validation 결과를 경로로 전달한다. 직전 attempt가 FAIL이었다면 이번 round에서 **어떤 phase가 어떤 finding id 때문에
+test·validation 결과를 경로로 전달한다. 이 입력은 dispatch 이후 §9
+`#### Final Review audit artifacts`의 규칙대로 **그 dispatch의 record에 따로 보존된다** — Reviewer에게
+전달되는 내용은 그 때문에 달라지지 않는다. 보존은 dispatch 이후의 read일 뿐이며 spec 조립 경로에는
+어떤 hook도 없다. 직전 attempt가 FAIL이었다면 이번 round에서 **어떤 phase가 어떤 finding id 때문에
 수정되었고, 그로 인해 어떤 downstream phase가 T5a에서 재검증되었는지** 반드시 명시한다. 이 attempt는 그 재검증을
 대체하는 것이 아니라 그 위에 추가로 걸리는 global gate다.
 
@@ -1863,7 +2024,9 @@ FAIL하면 §12 FAIL Loop가 그대로 적용된다.
 `MAX_ITERATIONS_REACHED (phase q)`다.
 
 review 기록은 attempt 1이 `<ARTIFACT_ROOT>FINAL_REVIEW.md`, attempt N>=2가
-`<ARTIFACT_ROOT>FINAL_REVIEW_iteration<N>.md`다.
+`<ARTIFACT_ROOT>FINAL_REVIEW_iteration<N>.md`다. 이 파일은 settlement 시점에 그 dispatch의 audit
+record로 **snapshot되며**(§9), 그 snapshot이 attempt 내용의 authority다 — 뒤따르는 attempt가 같은
+경로를 덮어써도 앞선 attempt의 증거는 record 안에 남는다.
 `_iteration1` 형태는 존재하지 않으며 `<N>`은 그 attempt의 `FINAL_REVIEW_ITERATIONS` 값이다. 이 파일은 review 기록이지
 production artifact가 아니므로 §11의 "Reviewer는 code/artifact를 직접 수정하지 않는다"에 위배되지 않으며, Final Adversarial
 Reviewer도 자신이 찾은 결함을 직접 고치지 않는다.
@@ -1886,6 +2049,8 @@ FINAL_REVIEW_DOWNSTREAM_REVALIDATION = all_requested_phases_after_earliest_corre
 FINAL_REVIEW_COMPLETION_GATE = requested_phases_pass_and_final_review_pass
 FINAL_REVIEW_RISK_INDEPENDENCE = mandatory_and_identical_at_every_risk_level
 FINAL_REVIEW_AGENT_RESOLUTION = agent_profile_final_review_then_explicit_then_defaults
+FINAL_REVIEW_AUDIT_RECORD = artifact_root_final_review_audit_per_dispatch
+FINAL_REVIEW_PROVENANCE_DEFAULT = unknown
 ```
 
 ## 18. Core Invariants
