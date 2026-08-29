@@ -31,12 +31,16 @@ class ValidatorRegressionTests(unittest.TestCase):
             "INSTALL.md",
             "VERSION",
             "CHANGELOG.md",
-            "COMPATIBILITY.md",
-            "RELEASING.md",
-            "LICENSE-DECISION.md",
-            "STEP5_REAL_GLM_GEMMA_SMOKE_REPORT.md",
+            "docs/ROADMAP.md",
+            "docs/COMPATIBILITY.md",
+            "docs/RELEASING.md",
+            "docs/LICENSE-DECISION.md",
+            "docs/validation/GLM_GEMMA_SMOKE_PROCEDURE.md",
+            "docs/validation/historical/GLM_GEMMA_SMOKE_REPORT_2026-08-20.md",
         ):
-            shutil.copy2(SOURCE_ROOT / filename, self.repo_root / filename)
+            destination = self.repo_root / filename
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(SOURCE_ROOT / filename, destination)
         for skill_name in SKILL_NAMES:
             shutil.copytree(SOURCE_ROOT / skill_name, self.repo_root / skill_name)
 
@@ -232,7 +236,10 @@ class ValidatorRegressionTests(unittest.TestCase):
         self.assertIn("VERSION must contain one SemVer", result.stdout)
 
     def test_user_specific_path_in_step5_report_fails(self) -> None:
-        report = self.repo_root / "STEP5_REAL_GLM_GEMMA_SMOKE_REPORT.md"
+        report = (
+            self.repo_root
+            / "docs/validation/historical/GLM_GEMMA_SMOKE_REPORT_2026-08-20.md"
+        )
         report.write_text(
             report.read_text(encoding="utf-8").replace(
                 "/Users/<user>/", "/Users/" + "private-user/", 1
@@ -244,6 +251,20 @@ class ValidatorRegressionTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("user-specific absolute path", result.stdout)
+
+    def test_broken_repository_link_fails(self) -> None:
+        roadmap = self.repo_root / "docs/ROADMAP.md"
+        roadmap.write_text(
+            roadmap.read_text(encoding="utf-8").replace(
+                "(COMPATIBILITY.md)", "(MISSING-COMPATIBILITY.md)", 1
+            ),
+            encoding="utf-8",
+        )
+
+        result = self.run_validator()
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("broken relative link", result.stdout)
 
     def mutate_orchestration_skill(self, old: str, new: str) -> None:
         skill_path = (

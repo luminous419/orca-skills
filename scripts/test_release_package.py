@@ -148,7 +148,12 @@ class ReleasePackageTests(unittest.TestCase):
         relative = {path.relative_to(REPO_ROOT).as_posix() for path in files}
         self.assertIn("orca-worker-reviewer-loop/SKILL.md", relative)
         self.assertIn("orca-worker-reviewer-orchestration/reviews/bugfix.md", relative)
-        self.assertIn("STEP5_REAL_GLM_GEMMA_SMOKE_REPORT.md", relative)
+        self.assertIn("docs/ROADMAP.md", relative)
+        self.assertIn("docs/validation/GLM_GEMMA_SMOKE_PROCEDURE.md", relative)
+        self.assertIn(
+            "docs/validation/historical/GLM_GEMMA_SMOKE_REPORT_2026-08-20.md",
+            relative,
+        )
         self.assertFalse(any("__pycache__" in path for path in relative))
 
     def test_archive_is_valid_and_reproducible(self) -> None:

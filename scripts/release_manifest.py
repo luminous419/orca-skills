@@ -22,17 +22,21 @@ PHASES = (
     "bugfix",
     "refactoring",
 )
-TOP_LEVEL_FILES = (
+ROOT_FILES = (
     "README.md",
     "INSTALL.md",
     "VERSION",
     "CHANGELOG.md",
-    "COMPATIBILITY.md",
-    "RELEASING.md",
-    "LICENSE-DECISION.md",
-    "STEP5_REAL_GLM_GEMMA_SMOKE_REPORT.md",
 )
-INCLUDED_ROOTS = (".github", "scripts", *SKILL_NAMES)
+REQUIRED_DOCS = (
+    "docs/ROADMAP.md",
+    "docs/COMPATIBILITY.md",
+    "docs/RELEASING.md",
+    "docs/LICENSE-DECISION.md",
+    "docs/validation/GLM_GEMMA_SMOKE_PROCEDURE.md",
+    "docs/validation/historical/GLM_GEMMA_SMOKE_REPORT_2026-08-20.md",
+)
+INCLUDED_ROOTS = (".github", "docs", "scripts", *SKILL_NAMES)
 EXECUTABLE_FILES = frozenset({"scripts/fake_bin/codex"})
 FORBIDDEN_PARTS = {
     ".git",
@@ -86,7 +90,7 @@ def archive_mode(relative_path: str) -> int:
 
 
 def release_files(root: Path = REPO_ROOT) -> tuple[Path, ...]:
-    files = [root / name for name in TOP_LEVEL_FILES]
+    files = [root / name for name in ROOT_FILES]
     for relative_root in INCLUDED_ROOTS:
         base = root / relative_root
         if not base.is_dir():
@@ -106,7 +110,7 @@ def release_files(root: Path = REPO_ROOT) -> tuple[Path, ...]:
 def verify_source_tree(root: Path = REPO_ROOT) -> tuple[Path, ...]:
     version = read_version(root)
     del version
-    for name in TOP_LEVEL_FILES:
+    for name in (*ROOT_FILES, *REQUIRED_DOCS):
         if not (root / name).is_file():
             raise PackageError(f"missing release file: {name}")
 

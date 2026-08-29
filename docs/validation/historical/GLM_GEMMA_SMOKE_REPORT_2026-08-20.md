@@ -1,7 +1,7 @@
-# Step 5 — Real GLM/Gemma Smoke Test 최종 보고
+# Historical Real GLM/Gemma Smoke Test Report — 2026-08-20
 
 > 이 문서는 실행 당시의 evidence snapshot이다. 이후 release-readiness 판정과 lifecycle
-> clarification은 [`COMPATIBILITY.md`](COMPATIBILITY.md)를 따른다.
+> clarification은 [`COMPATIBILITY.md`](../../COMPATIBILITY.md)를 따른다.
 
 > 실행 일자: 2026-08-20
 > 대상 Skill: `orca-worker-reviewer-orchestration`

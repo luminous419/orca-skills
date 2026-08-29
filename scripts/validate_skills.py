@@ -6,6 +6,7 @@ from __future__ import annotations
 import re
 import sys
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 import run_logging
 from skill_policy import PolicyContractError, load_policy_contract, load_risk_contract
@@ -73,11 +74,14 @@ REPOSITORY_DOCS = (
     "README.md",
     "INSTALL.md",
     "CHANGELOG.md",
-    "COMPATIBILITY.md",
-    "RELEASING.md",
-    "LICENSE-DECISION.md",
-    "STEP5_REAL_GLM_GEMMA_SMOKE_REPORT.md",
+    "docs/ROADMAP.md",
+    "docs/COMPATIBILITY.md",
+    "docs/RELEASING.md",
+    "docs/LICENSE-DECISION.md",
+    "docs/validation/GLM_GEMMA_SMOKE_PROCEDURE.md",
+    "docs/validation/historical/GLM_GEMMA_SMOKE_REPORT_2026-08-20.md",
 )
+MARKDOWN_LINK_PATTERN = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
 SEMVER_PATTERN = re.compile(
     r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
 )
@@ -830,6 +834,27 @@ def validate_no_user_absolute_paths(validation: Validation) -> None:
                 f"{path.relative_to(REPO_ROOT)}: user-specific absolute path {match.group(0)!r}"
                 if match
                 else "",
+            )
+
+
+def validate_repository_links(validation: Validation) -> None:
+    """Reject stale relative links in the repository's maintained documents."""
+
+    for relative in REPOSITORY_DOCS:
+        document = REPO_ROOT / relative
+        validation.check(document.is_file(), f"missing repository document: {relative}")
+        if not document.is_file():
+            continue
+        text = document.read_text(encoding="utf-8")
+        for raw_target in MARKDOWN_LINK_PATTERN.findall(text):
+            target = raw_target.strip().split(maxsplit=1)[0].strip("<>")
+            parsed = urlsplit(target)
+            if parsed.scheme or parsed.netloc or not parsed.path:
+                continue
+            linked = document.parent / unquote(parsed.path)
+            validation.check(
+                linked.exists(),
+                f"{relative}: broken relative link {raw_target!r}",
             )
 
 
@@ -2159,6 +2184,7 @@ def main() -> int:
     validate_run_logging_contract(validation)
     validate_run_logging_tool_parity(validation)
     validate_version(validation)
+    validate_repository_links(validation)
     validate_no_user_absolute_paths(validation)
 
     if validation.errors:

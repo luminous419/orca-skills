@@ -1,6 +1,6 @@
 # Changelog
 
-This project follows [Semantic Versioning](RELEASING.md). User-visible changes
+This project follows [Semantic Versioning](docs/RELEASING.md). User-visible changes
 are recorded here in a Keep a Changelog-inspired format.
 
 ## Unreleased
@@ -21,6 +21,7 @@ are recorded here in a Keep a Changelog-inspired format.
 
 ### Changed
 
+- Added `docs/ROADMAP.md` as the canonical project-direction document and reorganized compatibility, release, license-decision, and GLM/Gemma validation documentation under `docs/`. The dated 2026-08-20 GLM/Gemma report is now explicitly historical evidence, while the reusable procedure remains separate for OS-14 revalidation. Repository links, validators, release manifests, and package tests now enforce the new information architecture without changing either Skill's runtime behavior.
 - **BREAKING (opt-in artifact): the Final Review evidence bundle schema is `2.0`.** `FINAL_REVIEW_EVIDENCE_BUNDLE.json` inlined `ORCHESTRATOR_LOG.md` verbatim. That log's `detail` and `result` columns are free-form strings written from runtime and CLI values, so a foreign absolute path, a `file://` URL, a `dcap_...` dispatch capability or a `*_TOKEN=...` assignment could reach them and be copied unredacted into a bundle a human attaches to a PR — while every other embedded artifact in the same file was digest-bound and post-redaction. The exported copy is now sanitized through the same versioned `redact_text()` policy the records already use, never a second policy. `orchestrator_log.content` is **removed** and `orchestrator_log.digest` is **renamed**: the object now carries `redaction_policy_version`, `digest_pre_redaction`, `digest_post_redaction`, `redactions`, `content_redacted` and `content_omitted_reason`. The key rename is deliberate rather than additive — leaving `content` in place with new semantics would let an unchanged reader keep reading a key whose meaning changed — and both changes break a reader, so the MAJOR component moves. The identity relationship is re-derivable rather than asserted: `digest_pre_redaction` identifies which log this is, and because `redact_text()` is a pure deterministic function of `(text, policy_version)`, `digest_post_redaction == sha256(redact_text(local file, <recorded policy>)[0])` holds on any machine at any time. Text that cannot be proved residue-free is **omitted** with a closed-vocabulary reason and its digests kept, and reported in `integrity.omitted_content[]` — embedding known-residual content ships the leak, and aborting the export would make a legacy record permanently un-exportable with no remedy that does not violate record immutability. The same gate now runs over the retained `input.md`/`report.md`, which verifies without re-redacting so a clean artifact's `digest_verified` stays true. The authoritative local log is opened read-only and is never rewritten. A bundle is fully re-derivable from records that are themselves immutable, so there is no migration: an old bundle is regenerated, not upgraded, and a consumer accepts `2.x` and refuses `1.x` and `3.x`.
 
 ### Fixed

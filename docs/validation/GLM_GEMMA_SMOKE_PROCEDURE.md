@@ -1,6 +1,10 @@
-# Step 5 — Real GLM/Gemma Smoke Test
+# Real GLM/Gemma Smoke Test Procedure
 
-이 문서는 회사 개발 노트북에서 `orca-worker-reviewer-orchestration`을 실제 GLM/Gemma agent command로 smoke test하기 위한 실행 프롬프트다.
+이 문서는 회사 개발 노트북에서 `orca-worker-reviewer-orchestration`을 실제
+GLM/Gemma agent command로 smoke test하기 위한 현재 baseline 실행 절차다.
+OS-14의 최신 회사환경 검증은 이 절차를 출발점으로 사용하되, 실행 당시의
+repository와 Orca version-matched guide를 source of truth로 삼는다. 새로운 실행은
+새로운 dated report로 기록하며 기존 historical report를 수정하지 않는다.
 
 ## 실행 전 준비
 
@@ -18,7 +22,7 @@ command -v claude-glm
 command -v claude-gemma
 ```
 
-둘 중 하나라도 resolve되지 않으면 이번 Step 5를 시작하지 말고 다음으로 종료한다.
+둘 중 하나라도 resolve되지 않으면 이번 smoke test를 시작하지 말고 다음으로 종료한다.
 
 ```text
 STATUS: BLOCKED
@@ -33,7 +37,7 @@ REASON: AGENT_COMMAND_NOT_FOUND
 
 ---
 
-현재 `orca-skills` repository의 `main`을 기준으로 Step 5 실제 모델 smoke test를 수행해줘.
+현재 `orca-skills` repository의 `main`을 기준으로 실제 모델 smoke test를 수행해줘.
 
 이번 작업의 목적은 `orca-worker-reviewer-orchestration`이 실제 회사 환경의 두 agent command로 정상 동작하는지 검증하는 것이다.
 
@@ -397,7 +401,7 @@ FAIL → correction → PASS PASS
 
 ### 17. repository 변경 정책
 
-Step 5는 smoke test이므로 `orca-skills`의 Skill/policy/runtime implementation을 즉시 수정하지 않는다.
+이 절차는 smoke test이므로 `orca-skills`의 Skill/policy/runtime implementation을 즉시 수정하지 않는다.
 
 실제 모델 테스트에서 개선점이 발견되면 먼저 finding과 evidence를 정리한다.
 
@@ -405,22 +409,18 @@ Skill 변경이 필요하다면 별도 branch/PR로 분리하고, 기존 validat
 
 실제 GLM/Gemma smoke 결과를 repository 문서에 반영할 가치가 충분하면 별도 branch를 만들고 Draft PR을 생성한다. 반영 후보는 주로 다음이다.
 
-- `COMPATIBILITY.md` verification status
+- `docs/COMPATIBILITY.md` verification status
 - `CHANGELOG.md`
-- 필요한 경우 Step 5 결과 요약 문서
+- `docs/validation/historical/` 아래의 새로운 dated report
 
 실행하지 않은 결과를 repository에 기록하지 않는다.
 
 ---
 
-## 기대되는 다음 상태
+## 기대되는 결과 및 후속 조치
 
-Step 5가 성공하면 현재 `COMPATIBILITY.md`의 다음 상태를 업데이트할 근거가 생긴다.
-
-```text
-claude-glm Worker       BLOCKED / NOT YET VERIFIED → VERIFIED
-claude-gemma Reviewer   BLOCKED / NOT YET VERIFIED → VERIFIED
-Real GLM/Gemma smoke    BLOCKED / NOT YET VERIFIED → VERIFIED
-```
-
-그 이후 첫 stable release readiness를 다시 판단한다.
+성공, 실패, 또는 차단 결과를 실행일이 포함된 새 report로 보존한다. 그 evidence가
+현재 compatibility claim을 바꿀 만큼 충분한 경우에만 별도 branch/PR에서
+`docs/COMPATIBILITY.md`를 갱신한다. 이전 point verification과 historical report는
+그대로 유지하고, OS-14 acceptance criteria와 stable release readiness를 새 evidence로
+다시 판단한다.
