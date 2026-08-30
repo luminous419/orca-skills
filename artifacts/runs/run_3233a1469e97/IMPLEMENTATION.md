@@ -692,6 +692,140 @@ empty-facts reasoning.
 
 Commits: `ca42872` (contract, loader, validator, tests), `8cc5484` (DESIGN). Not pushed.
 
+## Correction — iteration 5 (Final Review attempt 3: FR-5)
+
+Scope held to FR-5. FR-1, FR-2, FR-3, FR-4 and RI3-1 are untouched and verified intact.
+
+### The defect — two APIs, opposite answers, same evidence
+
+`permitted_states()` and `validate_transition()` both decide whether a `user_decision` is evidence of
+user authority, and they decided it differently. Reproduced before any change:
+
+```text
+facts = {"explicit_user_authority": "reserved", "security": true,
+         "user_decision": {"source": "explicit_user_reply"}}
+
+permitted_states()    -> ['CLEAR']
+validate_transition() -> rejected: user_decision requires a non-empty 'where_recorded'
+```
+
+The permissive one is the one that gates the high-impact path. A bare **category claim** bought
+`CLEAR` for a reserved-authority, security-relevant item without showing where the answer is recorded
+or what it resolves.
+
+### The unified helper
+
+```text
+_user_decision_defect(policy, decision) -> str | None
+    returns the reason the decision is NOT valid evidence, or None when it is
+
+    the decision is a non-empty mapping
+    every field in policy.user_decision_fields is present and non-empty
+    source is a member of policy.user_decision_sources        (FR-2's allowlist, moved in)
+
+    read by:  _evaluate_predicate("explicit_user_authorization")  -> `defect is None`
+              validate_transition()                               -> raises with `defect`
+```
+
+Returning the *reason* rather than a boolean keeps `validate_transition`'s per-field diagnostics
+while giving the rule one home. A5-3 and INV-5 require the whole record because a source name is an
+assertion that a user decided; `where_recorded` and `resolves` are what make it checkable.
+
+### Before / after, both APIs
+
+| | before | after |
+|---|---|---|
+| `permitted_states` on the FR-5 facts | `['CLEAR']` | **`['NEEDS_INPUT']`** |
+| `validate_transition` on the same facts | rejected | rejected *(unchanged)* |
+
+Parity across every field omission, executed:
+
+```text
+drop 'source'          no CLEAR | rejected  AGREE
+drop 'where_recorded'  no CLEAR | rejected  AGREE     (was: CLEAR | rejected -- DISAGREE)
+drop 'resolves'        no CLEAR | rejected  AGREE     (was: CLEAR | rejected -- DISAGREE)
+complete record        CLEAR    | accepted  AGREE
+```
+
+### What the parity test asserts
+
+`test_the_two_apis_agree_on_every_field_omission` and `test_the_two_apis_agree_on_every_source`
+assert that `permitted_states()` and `validate_transition()` reach the **same** verdict for every
+declared field's omission and every source (2 allowlisted + 5 forbidden + 1 invented), **and** that
+the verdict is *correct* rather than merely consistent — two APIs agreeing on a wrong answer would
+otherwise pass. Both carry co-located cardinality guards (3 fields, 8 sources). This pair is the
+recurrence guard for the defect class.
+
+### Negative sweep and its positive control
+
+| | scope | guard |
+|---|---|---|
+| negative | 5 situations requiring authority (reserved, C-1, C-2, C-3, high-impact) × 4 incomplete records (source-only + one per dropped field) = **20** assertions that `CLEAR` is not permitted | `assertEqual(len(situations), 1 + len(clauses) + 1)`, `assertEqual(len(fields), 3)`, `assertEqual(len(incomplete), 4)`, `assertEqual(checked, 5 * 4)` — all co-located |
+| positive | the same 5 situations × both genuine sources with **complete** records, each required to equal exactly `{CLEAR}` = **10** assertions | `assertEqual((len(situations), len(sources)), (5, 2))`, `assertEqual(checked, 5 * 2)` |
+
+Refusing everything cannot satisfy the pair.
+
+### The two tests that were pinning the defect
+
+`test_an_allowlisted_authorization_permits_clear` built a **source-only** record, so it asserted that
+a category claim *is* authority — the test was holding the defect in place. Its sibling
+`test_a_forbidden_authority_source_does_not_permit_clear` did the same and would have passed for the
+wrong reason: with a source-only record it fails on the missing fields, not on the source. Both now
+use a complete record via a shared `complete_decision()` builder, whose docstring says that anything
+asserting a decision is *valid* must use it.
+
+### Concept comparison — run, not assumed
+
+FR-5's shape is "the same concept judged in two places". I compared the other concepts both APIs touch:
+
+| concept | result |
+|---|---|
+| `policy_source` validity — kind membership, role membership, missing `locator`, missing `kind` | **agree on all four** |
+| `reason_code` vs. state | **not a parity gap** — `permitted_states` takes *facts* and has no reason-code notion, so this is outside its contract, not a divergent judgement |
+| code ↔ `boundary_element` binding | **not a parity gap** — same domain difference |
+
+Authorization was the only genuine divergence. I did not widen scope beyond it.
+
+### Mutation verification — control green first, then 5/5 caught
+
+The control was confirmed green **before** running any mutation, since this run has produced three
+harness false positives and one red-control run whose results were void.
+
+```text
+M-0  control, no mutation                                     green
+M-1  revert the predicate to source-only (the FR-5 defect)     CAUGHT
+M-2  helper stops checking required fields                     CAUGHT
+M-3  helper stops checking the source allowlist                CAUGHT
+M-4  helper accepts a non-dict decision                        CAUGHT
+M-5  user_decision_fields trimmed in the contract              CAUGHT
+```
+
+M-1 through M-4 are caught **only by the loader tests** (validator passes); M-5 by all three. That
+split is consistent with where each rule lives and is why I read these as real detections.
+
+### Commands after the correction
+
+| command | result |
+|---|---|
+| `python3 scripts/validate_skills.py` | **PASSED (642 checks)** — unchanged |
+| `python3 -m unittest discover -s scripts -p 'test_*.py'` | **Ran 1408 tests in 308.840s — OK (skipped=6)** — was 1404 |
+| `python3 scripts/verify_package.py` | **PASSED (173 source files)** |
+| `python3 scripts/build_release.py` | built `dist/orca-skills-0.9.0.tar.gz` |
+| `python3 scripts/verify_package.py --archive …` | **PASSED (173 source files); Verified archive** |
+| `git diff --check` | no output |
+
+Check count is unchanged at 642 because the fix is in the loader and the tests, not a new validator
+check. Skips unchanged at 6. Protected-surface diff empty.
+
+### DESIGN.md
+
+New section **D2-2d**: the finding, the shared helper and why it returns a reason rather than a
+boolean, parity as a stated requirement, the two tests that were pinning the defect, and the concept
+comparison.
+
+Commits: `8dd899c` (helper, both call sites, corrected controls, parity and sweep tests), `0a55c83`
+(DESIGN). Not pushed.
+
 ## Review Feedback Resolution
 
 Iteration 1 of IMPLEMENTATION. No prior IMPLEMENTATION Reviewer findings.
