@@ -17,6 +17,8 @@ from pathlib import Path
 
 from scripts.decision_policy import (
     AXIS_TOKENS,
+    ENTRY_PREDICATES,
+    _evaluate_predicate,
     CANONICAL_INDEPENDENT_AXES,
     DECISION_STATES,
     DECLARATIVE_KEYS,
@@ -554,7 +556,16 @@ class AuthorityPrecedenceAcrossPredicates(DecisionPolicyTestCase):
         two reported cases: for every triggering element, every CONFLICT clause, and
         every pair of the two, a continuing state (CLEAR or ASSUMPTION_ALLOWED) is
         permitted ONLY with a determining policy source that A4-0 allows to resolve
-        that item, or an allowlisted user decision. 105 combinations."""
+        that item, or an allowlisted user decision.
+
+        COUNT, corrected: this asserts **63** cases -- 21 fact-cases (9 triggering
+        elements + 3 CONFLICT clauses + 9 element-with-C-1 pairs) x the 3 resolver
+        states that carry NO authority (none / supporting / forbidden). The earlier
+        "105" was an ad-hoc probe that also swept the two resolver states which DO
+        carry authority; those belong in the sibling test below, not here, because
+        their expected outcome is CLEAR rather than "no continuing state". A label
+        wider than what the code executes is the exact defect this run keeps hitting,
+        so the number now matches `assertEqual(checked, 21 * 3)`."""
         triggers = {
             name: (spec.triggering[0] if isinstance(spec.triggering, (list, tuple))
                    else True)
@@ -589,6 +600,120 @@ class AuthorityPrecedenceAcrossPredicates(DecisionPolicyTestCase):
                     self.assertTrue(permitted, "a declared item must permit something")
                     checked += 1
         self.assertEqual(checked, 21 * 3)
+
+    def test_a_resolver_bearing_authority_yields_clear_across_the_same_space(self) -> None:
+        """The other 42 of the ad-hoc 105, made permanent rather than dropped.
+
+        Same 21 fact-cases against the 2 resolver states that DO carry authority.
+        An allowlisted user decision resolves every case; a determining policy source
+        resolves every case EXCEPT the two A4-0 says it cannot. This is the positive
+        control for the sibling test above -- without it, refusing everything would
+        satisfy that one."""
+        triggers = {
+            name: (spec.triggering[0] if isinstance(spec.triggering, (list, tuple))
+                   else True)
+            for name, spec in self.policy.boundary_elements.items()
+            if spec.triggering is not None and spec.triggering != "at_minimum"
+        }
+        # D4-F guard
+        self.assertEqual(len(triggers), 9)
+        clauses = sorted(self.policy.entry_clauses["CONFLICT"])
+        self.assertEqual(len(clauses), 3)
+        cases = [({n: v}, {n}, False) for n, v in triggers.items()]
+        cases += [({"conflict_clause": c}, set(), True) for c in clauses]
+        cases += [({n: v, "conflict_clause": "C-1"}, {n}, True) for n, v in triggers.items()]
+        self.assertEqual(len(cases), 21)
+
+        checked = 0
+        for facts, trig, has_conflict in cases:
+            unresolvable = has_conflict or bool(
+                trig & set(self.policy.policy_source_cannot_resolve)
+            )
+            with self.subTest(facts=sorted(facts), resolver="authorized"):
+                self.assertEqual(
+                    permitted_states(self.policy, {**facts, **self.AUTHORIZED}),
+                    frozenset({"CLEAR"}),
+                )
+                checked += 1
+            with self.subTest(facts=sorted(facts), resolver="determining"):
+                permitted = permitted_states(self.policy, {**facts, **self.DETERMINES})
+                if unresolvable:
+                    self.assertNotIn("CLEAR", permitted)
+                else:
+                    self.assertEqual(permitted, frozenset({"CLEAR"}))
+                checked += 1
+        self.assertEqual(checked, 21 * 2)
+
+    def test_every_entry_predicate_is_satisfiable_and_falsifiable(self) -> None:
+        """Downstream revalidation, defect type (a): a predicate that can never be
+        true is a dead clause, and one that can never be false fixes its combinator's
+        outcome. Both directions, for all twelve."""
+        witnesses = {
+            "no_open_decision_item": ({"open_decision_item": False}, {}),
+            "determining_policy_source": (self.DETERMINES, {}),
+            "explicit_user_authorization": (self.AUTHORIZED, {}),
+            "reversible_in_run": (
+                {"reversibility": "reversible_in_run"},
+                {"reversibility": "irreversible"},
+            ),
+            "blast_radius_within_scope": (
+                {"blast_radius": "current_change"},
+                {"blast_radius": "external_system"},
+            ),
+            "no_high_impact_element": ({}, {"security": True}),
+            "supporting_policy_source": (self.SUPPORTS, {}),
+            "no_reserved_user_authority": ({}, {"explicit_user_authority": "reserved"}),
+            "undetermined_boundary_element": ({"security": True}, {}),
+            "absent_user_intent": ({"user_intent_absent": True}, {}),
+            "unclassifiable_item": ({"unclassifiable": True}, {}),
+            "declared_contradiction": ({"conflict_clause": "C-1"}, {}),
+        }
+        # D4-F guard: a witness for every predicate in the closed vocabulary, and none
+        # left over, so adding a predicate without a witness fails here.
+        self.assertEqual(set(witnesses), set(ENTRY_PREDICATES))
+        self.assertEqual(len(witnesses), 12)
+        for name, (true_facts, false_facts) in sorted(witnesses.items()):
+            with self.subTest(predicate=name):
+                self.assertTrue(
+                    _evaluate_predicate(name, self.policy, true_facts),
+                    f"{name} is unreachable -- a dead clause",
+                )
+                self.assertFalse(
+                    _evaluate_predicate(name, self.policy, false_facts),
+                    f"{name} cannot be falsified -- its combinator is fixed",
+                )
+
+    def test_every_predicate_is_used_by_some_entry_condition(self) -> None:
+        """The other half of (a): a predicate defined but never referenced is dead too."""
+        used = set()
+        for condition in self.policy.entry_conditions.values():
+            for predicates in condition.values():
+                used |= set(predicates)
+        self.assertEqual(used, set(ENTRY_PREDICATES))
+
+    def test_a_triggering_value_outside_the_elements_own_enum_is_rejected(self) -> None:
+        """Downstream revalidation, defect type (e) on the new surface: `triggering`
+        was checked for presence but never against the element's own value set. An
+        orphan value can never be matched -- _validate_declared_facts rejects
+        out-of-enum declarations -- so the element became a DEAD TRIGGER and stopped
+        escalating silently."""
+        mutated = json.loads(json.dumps(self.block))
+        mutated["boundary_elements"]["reversibility"]["triggering"] = ["not_a_member"]
+        with self.assertRaises(DecisionPolicyError):
+            parse_decision_policy(mutated)
+
+    def test_every_shipped_triggering_value_is_a_member_of_its_element(self) -> None:
+        """Positive control for the check above, over the real contract."""
+        checked = 0
+        for name, spec in sorted(self.policy.boundary_elements.items()):
+            if spec.kind != "enum" or not isinstance(spec.triggering, (list, tuple)):
+                continue
+            for value in spec.triggering:
+                with self.subTest(element=name, triggering=value):
+                    self.assertIn(value, spec.values)
+                    checked += 1
+        # D4-F guard: irreversible + repository + external_system.
+        self.assertEqual(checked, 3)
 
     def test_both_pausing_states_are_permitted_when_both_are_declared(self) -> None:
         """Not a defect, and recorded because my first sweep expectation said it was.

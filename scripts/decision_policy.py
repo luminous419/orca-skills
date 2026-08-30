@@ -276,12 +276,26 @@ def parse_decision_policy(block: Any) -> DecisionPolicy:
     _require(isinstance(raw_elements, dict), "boundary_elements must be an object")
     for name, spec in raw_elements.items():
         _require(isinstance(spec, dict), f"boundary element {name} must be an object")
-        boundary_elements[name] = BoundaryElement(
+        element = BoundaryElement(
             kind=str(spec.get("kind", "")),
             values=tuple(spec.get("values", ()) or ()),
             minimum=spec.get("minimum"),
             triggering=spec.get("triggering"),
         )
+        # Downstream revalidation: `triggering` was checked for PRESENCE but never for
+        # CONSISTENCY with the element's own value set, so an enum element could name
+        # a triggering value it does not declare. Nothing could then equal it --
+        # _validate_declared_facts rejects out-of-enum values -- so the element became
+        # a DEAD TRIGGER and stopped escalating silently. C27 catches drift from the
+        # pinned value; this catches a contract that is inconsistent on its own terms.
+        if element.kind == "enum" and isinstance(element.triggering, (list, tuple)):
+            orphans = [v for v in element.triggering if v not in element.values]
+            _require(
+                not orphans,
+                f"boundary element {name!r} names triggering value(s) {orphans} that "
+                f"are not in its own value set {list(element.values)}",
+            )
+        boundary_elements[name] = element
 
     precedence = block["authority_precedence"]
     _require(isinstance(precedence, dict), "authority_precedence must be an object")
