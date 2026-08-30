@@ -34,6 +34,7 @@ REQUIRED_DOCS = (
     "docs/RELEASING.md",
     "docs/LICENSE-DECISION.md",
     "docs/examples/FULL_WORKFLOW_FAIL_CORRECTION.md",
+    "docs/examples/FULL_WORKFLOW_FAIL_CORRECTION.ko.md",
     "docs/validation/GLM_GEMMA_SMOKE_PROCEDURE.md",
     "docs/validation/historical/GLM_GEMMA_SMOKE_REPORT_2026-08-20.md",
 )
