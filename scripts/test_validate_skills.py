@@ -403,7 +403,13 @@ class ValidatorRegressionTests(unittest.TestCase):
             '"values": ["reversible_in_run", "reversible_with_effort", "irreversible"]',
             '"values": []',
         )
-        self.assert_validator_fails_with("boundary element specifications drifted")
+        # The loader's triggering-vs-values consistency check now fires FIRST and
+        # names the exact inconsistency, so the mutation is caught earlier and more
+        # precisely than by C27's value pin. Still caught; the message moved.
+        self.assert_validator_fails_with(
+            "names triggering value(s) ['irreversible'] that are not in its own "
+            "value set []"
+        )
 
     def test_blast_radius_dropping_the_out_of_scope_values_fails(self) -> None:
         """INV-4's blast-radius clause names `repository` and `external_system`;
@@ -412,7 +418,12 @@ class ValidatorRegressionTests(unittest.TestCase):
             '"values": ["current_change", "module", "repository", "external_system"]',
             '"values": ["current_change", "module"]',
         )
-        self.assert_validator_fails_with("boundary element specifications drifted")
+        # Same: removing the two values INV-4's clause names now also orphans this
+        # element's triggering list, which the loader reports directly.
+        self.assert_validator_fails_with(
+            "names triggering value(s) ['repository', 'external_system'] that are "
+            "not in its own value set ['current_change', 'module']"
+        )
 
     def test_conflict_citation_minimum_on_the_element_lowered_fails(self) -> None:
         """A second citation minimum lives on the boundary element; lowering it there
