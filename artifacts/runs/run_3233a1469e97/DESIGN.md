@@ -806,11 +806,14 @@ makes omission illegal is caught by the fixtures it breaks.
 **What is deliberately NOT checked, and why.** Two element kinds declare no closed value set,
 so giving them one would be **new design**, not enforcement of the approved spec:
 
-- `explicit_user_authority` (kind `user_decision`) declares `triggering: ["reserved"]` but no
-  `values`. Restricting the domain to the triggering value alone would reject `delegated` —
-  the legitimate non-reserved case A4-0's truth table contrasts with `reserved`. **Residual
-  limit:** a misspelling such as `"RESERVED"` still reads as "not reserved". Recorded, not
-  silently fixed.
+- ~~`explicit_user_authority` (kind `user_decision`) declares `triggering: ["reserved"]` but
+  no `values`. Restricting the domain to the triggering value alone would reject
+  `delegated` — the legitimate non-reserved case A4-0's truth table contrasts with
+  `reserved`.~~ **This reasoning was wrong and the element is now closed — see D2-2h.**
+  `delegated` appears nowhere in either `SKILL.md` or `ANALYSIS.md`; it was my example, not
+  a contract value. The residual limit I recorded here — that `"RESERVED"` still reads as
+  "not reserved" — was correctly promoted to a blocking CRITICAL (RI8-1) rather than
+  accepted.
 - `repository_project_policy` (kind `policy_source`) declares no domain either. The
   `policy_source` **object**'s `role` and `kind` are separately closed sets and are checked
   (TR4-1); A4-1 row 10 also calls the cited path's *existence* checkable, which this contract
@@ -825,6 +828,55 @@ was enumerated and probed with a wrong-domain value, on identical input to both 
 **16 positions — 13 domain-checked, 3 declaring no domain (listed above), 0 divergences
 between the two APIs.** A test asserts the partition of element *kinds* into checked and
 open, so a newly introduced kind fails until someone decides which side it belongs on.
+
+
+
+#### D2-2h. Closing the authority element, and why the other two stay open (RI8-1)
+
+**The finding, and the argument I got wrong.** `explicit_user_authority` is the element that
+carries the user's reservation of authority — the boundary this ticket exists to protect.
+Before this change, `'RESERVED'` (one shifted key) returned `ASSUMPTION_ALLOWED` for a
+reserved item: **a typo silently removed the user's reservation and allowed autonomous
+progress.** So did `'anything'`, a number, an object, and `null`.
+
+Iteration 8 recorded this as an accepted residual limit on the grounds that closing the
+domain would reject `delegated`, "the legitimate non-reserved case". That was wrong on the
+facts: `delegated` occurs **zero times** in either `SKILL.md` and **zero times** in
+`ANALYSIS.md`. It was an example I introduced while writing the report, and then reasoned
+from as though the contract had defined it. The Reviewer's promotion to blocking CRITICAL is
+correct, and for the same reason FR-8 was CRITICAL — fail-open on the authority boundary is
+the one direction that matters.
+
+**The fix reads the contract, it does not extend it.** The domain is exactly the `triggering`
+list the contract already declares. No value was invented.
+
+**"Authority is not reserved" is expressed by omitting the element** — already legal, already
+yielding `ASSUMPTION_ALLOWED`, and exactly how every other element expresses "this does not
+apply". The case I thought needed an open domain already had a representation.
+
+| declared | before | after |
+|---|---|---|
+| `'reserved'` | `['NEEDS_INPUT']` | `['NEEDS_INPUT']` — unchanged |
+| `'RESERVED'` | `['ASSUMPTION_ALLOWED']` | **rejected** |
+| `'anything'`, `'reserverd'`, `1`, `{...}`, `null`, `[]` | `['ASSUMPTION_ALLOWED']` | **rejected** |
+| *omitted* | `['ASSUMPTION_ALLOWED']` | `['ASSUMPTION_ALLOWED']` — unchanged |
+
+**Why `repository_project_policy` stays open — and it is not symmetry.** Its `triggering` is
+`null`, so **no value can make it fire**. An element that cannot fire cannot be *prevented*
+from firing, so there is no fail-open direction for a domain check to protect: a wrong value
+changes no decision. The boundary it names is enforced through the `policy_source` **object**,
+whose `role` and `kind` are both closed sets and both checked (TR4-1). Closing it would mean
+inventing a value list the contract does not declare, to guard an outcome that cannot occur.
+
+**Why the locator stays open.** A4-1 row 10 calls the cited path's *existence* checkable, and
+it is — but by something that performs I/O. This contract layer is a pure function of
+(contract, declared facts); adding a filesystem read here would change what the layer is.
+Recorded as belonging to a layer that does I/O, not as an accepted silent gap.
+
+**The rule that now covers every element kind:** a domain is closed wherever the contract
+declares one, by reading what it declares — `values` for `enum`, the kind itself for
+`boolean` and `declared`, the shape for `citations`, and `triggering` for `user_decision`.
+Only `policy_source` remains open, with the reason above.
 
 
 #### D2-3. What the loader deliberately does not do

@@ -1296,3 +1296,130 @@ Untouched, verified by empty diff: `VERSION`, `LICENSE`, `skill_policy.py` (UD-3
 `quality_profile.py`, `agent_profile.py`, **both `SKILL.md` contracts**, `templates/**` and
 `reviews/**`. The contract needed no edit: it already declared each element's `kind`, and the
 code was reading that declaration for one kind and not the others.
+
+---
+
+## Correction — iteration 9 (RI8-1)
+
+FR-8 was confirmed resolved and was not touched. FR-9 is a separate round and was not
+touched.
+
+### The finding, and the argument I got wrong
+
+`explicit_user_authority` carries the user's reservation of authority — the boundary this
+ticket exists to protect — and it was fail-open. Reproduced before changing anything:
+
+| declared | before | after |
+|---|---|---|
+| `'reserved'` | `['NEEDS_INPUT']` | `['NEEDS_INPUT']` — **unchanged** |
+| `'RESERVED'` | `['ASSUMPTION_ALLOWED']` | **rejected** |
+| `'Reserved'` | `['ASSUMPTION_ALLOWED']` | **rejected** |
+| `'reserverd'` | `['ASSUMPTION_ALLOWED']` | **rejected** |
+| `'anything'` | `['ASSUMPTION_ALLOWED']` | **rejected** |
+| `'delegated'` | `['ASSUMPTION_ALLOWED']` | **rejected** |
+| `1` / `{'a': 1}` / `None` / `[]` | `['ASSUMPTION_ALLOWED']` | **rejected** |
+| *omitted* | `['ASSUMPTION_ALLOWED']` | `['ASSUMPTION_ALLOWED']` — **unchanged** |
+
+One shifted key removed the user's reservation and allowed autonomous progress.
+
+**I recorded this in iteration 8 as an accepted residual limit, and my reason was wrong.** I
+argued that closing the domain would reject `delegated`, "the legitimate non-reserved case
+A4-0's truth table contrasts with `reserved`". Checked this round rather than asserted again:
+
+```
+delegated in orca-worker-reviewer-orchestration/SKILL.md : 0 hits
+delegated in orca-worker-reviewer-loop/SKILL.md          : 0 hits
+delegated in ANALYSIS.md                                 : 0 hits
+delegated in my own DESIGN.md text                       : 1 hit
+```
+
+It was an example I introduced while writing the report, and then reasoned from as though the
+contract had defined it. The Reviewer's promotion to blocking CRITICAL is correct, and for
+the same reason FR-8 was CRITICAL: fail-open on the authority boundary is the one direction
+that matters. **The stale rationale in D2-2g has been struck through and corrected in place
+rather than left to read as though it still stood.**
+
+### The fix reads the contract; it does not extend it
+
+The domain is exactly the `triggering` list the contract already declares. **No value was
+invented, and no contract edit was needed.** It sits in `_domain_defect`, the shared path
+both APIs call, so evaluator and record validator reach the same verdict — asserted on
+identical input by a parity test.
+
+**"Authority is not reserved" is expressed by omitting the element** — already legal, already
+yielding `ASSUMPTION_ALLOWED`, and exactly how every other element expresses "this does not
+apply". The case I thought required an open domain already had a representation; I had not
+checked.
+
+### The other two open positions, re-examined
+
+**`repository_project_policy` stays open — and not by symmetry with the case above.** Its
+`triggering` is `null`, so **no value can make it fire**; an element that cannot fire cannot
+be prevented from firing, so there is no fail-open direction for a domain check to protect. A
+wrong value changes no decision. The boundary it names is enforced through the
+`policy_source` **object**, whose `role` and `kind` are both closed and both checked (TR4-1).
+Closing it would mean inventing a value list the contract does not declare, to guard an
+outcome that cannot occur. A test pins `triggering is None`, so if the contract ever gives it
+one, the decision is revisited instead of silently persisting.
+
+**The locator stays open**, because A4-1 row 10's existence check requires I/O and this layer
+is a pure function of (contract, declared facts). Adding a filesystem read here would change
+what the layer is. Recorded as belonging to a layer that does I/O — not as a silent gap.
+
+### No over-blocking
+
+| property | result |
+|---|---|
+| `'reserved'` still reserves | `['NEEDS_INPUT']` |
+| omission still legal | `['ASSUMPTION_ALLOWED']` |
+| **18/18 valid fixtures** | pass, counted before and after |
+
+### Mutations — control verified green first
+
+| # | Mutation | Result |
+|---|---|---|
+| A-0 | control | **green** |
+| A-1 | authority domain reopened — **the RI8-1 defect** | CAUGHT |
+| A-2 | case-insensitive match, so `'RESERVED'` slips through | CAUGHT |
+| A-3 | **over-block probe**: omission made illegal for this element | CAUGHT |
+| A-4 | **over-block probe**: `'reserved'` itself rejected | CAUGHT |
+| A-5 | `policy_source` closed too, needing an invented domain | CAUGHT |
+
+**5/5 CAUGHT.** A-2 matters most: `'RESERVED'` was the reported defect, so a
+case-insensitive "fix" would have looked correct while leaving it live. A-5 confirms the
+deliberate open case is pinned as a decision rather than left as an oversight.
+
+### Regression
+
+**12/12 intact** — FR-1 (both edges), FR-2, FR-3, FR-4, RI3-1, FR-5, FR-6, FR-8, RI8-1,
+TR4-1, TR4-2, TR4-3 — with **4/4 positive controls**, including that `reserved` still fires.
+
+### Every element kind now has a decided disposition
+
+| kind | domain | closed? |
+|---|---|---|
+| `enum` | `values` | yes |
+| `boolean` | Python `bool` | yes (FR-8) |
+| `declared` | Python `bool` | yes (FR-8) |
+| `citations` | list/tuple | yes (FR-8) |
+| `user_decision` | `triggering` | **yes (RI8-1)** |
+| `policy_source` | none, and none can matter — `triggering` is null | open, by decision, pinned by a test |
+
+Of sixteen value positions, **fifteen are now domain-checked**; the sixteenth is the locator,
+which belongs to a layer that does I/O.
+
+### Commands
+
+| Command | Result |
+|---|---|
+| `python3 scripts/validate_skills.py` | **PASSED (642 checks)** — unchanged; no contract edit was needed |
+| `python3 -m unittest discover -s scripts -p 'test_*.py'` | **1454 tests OK (skipped=6)** — was 1448; the +6 are the RI8-1 tests and **skips did not increase** |
+| `python3 scripts/verify_package.py` | **PASSED (173 source files)** |
+| `python3 scripts/build_release.py` | built `dist/orca-skills-0.9.0.tar.gz` |
+| `verify_package.py --archive …` | **PASSED (173 source files)**, archive verified |
+| `git diff --check` | clean |
+
+Untouched, verified by empty diff: `VERSION`, `LICENSE`, `skill_policy.py` (UD-3),
+`quality_profile.py`, `agent_profile.py`, **both `SKILL.md` contracts**, `templates/**` and
+`reviews/**`. The contract already declared `triggering: ["reserved"]`; the code simply was
+not reading it as a domain.
