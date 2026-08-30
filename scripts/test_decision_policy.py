@@ -1815,6 +1815,64 @@ class FactReadingApisShareEveryRule(DecisionPolicyTestCase):
             "each began",
         )
 
+    def test_the_evaluator_delegates_every_judgement(self) -> None:
+        """Closes the half of the closure device's blind spot that matters.
+
+        Executed check: an INLINE `_require` added to one API changes no name in its
+        call closure, so `test_both_fact_reading_apis_reach_the_same_helpers` passes
+        through it. The device catches a rule added as a HELPER CALL to one side, and
+        that is where FR-5, TR4-1 and TR4-2 each actually lived -- but the claim is
+        narrower than "any judgement".
+
+        For `permitted_states` the gap can be closed outright: it reads nothing but
+        declared facts, so it has no legitimate inline rule and today has exactly
+        zero. Pinning that means a fact rule cannot be added to the evaluator alone,
+        by helper or inline. The mirror is deliberately NOT asserted:
+        `validate_record` has twelve inline `_require` calls that are record-SHAPE
+        rules -- reason_code/state agreement, citation minimum, evidence presence --
+        which are not about declared facts and have no business in the evaluator.
+        """
+        source = (REPO_ROOT / "scripts" / "decision_policy.py").read_text(
+            encoding="utf-8"
+        )
+        functions = {
+            node.name: node
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.FunctionDef)
+        }
+        body = functions["permitted_states"]
+        inline = [
+            node
+            for node in ast.walk(body)
+            if isinstance(node, ast.Raise)
+            or (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "_require"
+            )
+        ]
+        self.assertEqual(
+            inline,
+            [],
+            "permitted_states() judges declared facts inline instead of through a "
+            "helper validate_record() also calls -- the TR4-1 shape",
+        )
+        # POSITIVE CONTROL: the AST walk must actually be able to see such a node,
+        # or the assertion above is satisfied by a broken query rather than by
+        # clean code.
+        probe = ast.parse("def f():\n    _require(x, 'y')\n    raise E('z')\n")
+        found = [
+            node
+            for node in ast.walk(probe)
+            if isinstance(node, ast.Raise)
+            or (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "_require"
+            )
+        ]
+        self.assertEqual(len(found), 2)
+
     def test_the_shared_helpers_include_every_fact_rule(self) -> None:
         """Names the rules explicitly, so deleting one from both APIs at once -- which
         equality alone would not notice -- still fails."""
