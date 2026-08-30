@@ -499,26 +499,59 @@ DECISION_POLICY_AUTHORITY_EDGES = {
 }
 # Found by the same-shape sweep FR-1 prompted: these four keys were also checked only
 # for names or membership, never for value. Each mutation below passed every check.
+# The fourth tuple slot is `triggering` -- which value(s) make the element TRUE in
+# A3-1's sense. FR-4 made these load-bearing for permitted_states, so they are pinned
+# by value like everything else; leaving them unpinned would be the FR-1 gap again.
 DECISION_POLICY_BOUNDARY_ELEMENT_SPECS = {
-    "ambiguity": ("declared", (), None),
-    "explicit_requirement_conflict": ("citations", (), 2),
+    "ambiguity": ("declared", (), None, True),
+    "explicit_requirement_conflict": ("citations", (), 2, "at_minimum"),
     "reversibility": (
         "enum",
         ("reversible_in_run", "reversible_with_effort", "irreversible"),
         None,
+        ("irreversible",),
     ),
     "blast_radius": (
         "enum",
         ("current_change", "module", "repository", "external_system"),
         None,
+        ("repository", "external_system"),
     ),
-    "monetary_cost": ("boolean", (), None),
-    "security": ("boolean", (), None),
-    "privacy": ("boolean", (), None),
-    "compliance": ("boolean", (), None),
-    "long_term_lock_in": ("boolean", (), None),
-    "repository_project_policy": ("policy_source", (), None),
-    "explicit_user_authority": ("user_decision", (), None),
+    "monetary_cost": ("boolean", (), None, True),
+    "security": ("boolean", (), None, True),
+    "privacy": ("boolean", (), None, True),
+    "compliance": ("boolean", (), None, True),
+    "long_term_lock_in": ("boolean", (), None, True),
+    "repository_project_policy": ("policy_source", (), None, None),
+    "explicit_user_authority": ("user_decision", (), None, ("reserved",)),
+}
+# FR-4: A3-1's entry conditions, made machine-evaluable. permitted_states() evaluates
+# these rather than assuming a fixed starting set, so they are the contract's most
+# authority-relevant data and are pinned cell by cell.
+DECISION_POLICY_ENTRY_CONDITIONS = {
+    "CLEAR": (
+        "any_of",
+        (
+            "no_open_decision_item",
+            "determining_policy_source",
+            "explicit_user_authorization",
+        ),
+    ),
+    "ASSUMPTION_ALLOWED": (
+        "all_of",
+        (
+            "reversible_in_run",
+            "blast_radius_within_scope",
+            "no_high_impact_element",
+            "supporting_policy_source",
+            "no_reserved_user_authority",
+        ),
+    ),
+    "NEEDS_INPUT": (
+        "any_of",
+        ("undetermined_boundary_element", "absent_user_intent", "unclassifiable_item"),
+    ),
+    "CONFLICT": ("any_of", ("declared_contradiction",)),
 }
 DECISION_POLICY_SOURCE_ROLES = ("determines", "supports")
 DECISION_POLICY_SOURCE_KINDS = (
@@ -2277,7 +2310,14 @@ def validate_decision_policy_contract(validation: Validation) -> None:
                 f"found {policy.transitions.get(edge)!r}",
             )
         observed_elements = {
-            element: (spec.kind, tuple(spec.values), spec.minimum)
+            element: (
+                spec.kind,
+                tuple(spec.values),
+                spec.minimum,
+                tuple(spec.triggering)
+                if isinstance(spec.triggering, list)
+                else spec.triggering,
+            )
             for element, spec in policy.boundary_elements.items()
         }
         validation.check(  # C27
@@ -2293,6 +2333,18 @@ def validate_decision_policy_contract(validation: Validation) -> None:
         validation.check(  # C29
             policy.state_scope == DECISION_POLICY_STATE_SCOPE,
             f"{name}: decision state scope drifted",
+        )
+        observed_conditions = {
+            state: next(
+                (combinator, tuple(predicates))
+                for combinator, predicates in condition.items()
+            )
+            for state, condition in policy.entry_conditions.items()
+        }
+        validation.check(  # C30
+            observed_conditions == DECISION_POLICY_ENTRY_CONDITIONS,
+            f"{name}: state entry conditions drifted -- permitted_states evaluates "
+            "these, so a change here moves the authority boundary",
         )
         validation.check(  # C17
             dict(policy.assumption_allowed_forbidden_when)

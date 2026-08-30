@@ -269,8 +269,16 @@ class Requirement5SafeItemIsPermitted(DecisionPolicyTestCase):
         """UD-2: permission level only -- see the sibling test's docstring."""
         record = load_fixture("valid/repository_policy.json")
         permitted = permitted_states(self.policy, record)
+        # The substantive UD-2 property: the contract does not FORCE NEEDS_INPUT here.
         self.assertNotEqual(permitted, frozenset({"NEEDS_INPUT"}))
-        self.assertIn("CLEAR", permitted)
+        self.assertNotIn("NEEDS_INPUT", permitted)
+        self.assertIn("ASSUMPTION_ALLOWED", permitted)
+        # FR-4 changed the correct answer for CLEAR here, and the old assertion was
+        # wrong rather than merely outdated: a safe item with a SUPPORTING policy
+        # source still has an open decision, which is why it is ASSUMPTION_ALLOWED.
+        # A3-1 admits CLEAR only when nothing is open, a policy source DETERMINES the
+        # choice, or an authorization decides it -- none of which holds here.
+        self.assertNotIn("CLEAR", permitted)
 
 
 class Requirement6ConfidenceIsNeverAuthority(DecisionPolicyTestCase):
@@ -288,6 +296,248 @@ class Requirement6ConfidenceIsNeverAuthority(DecisionPolicyTestCase):
                     validate_transition(
                         self.policy, case["from"], case["to"], case["record"]
                     )
+
+
+class Requirement4EntryConditionsAreEvaluated(DecisionPolicyTestCase):
+    """FR-4. permitted_states() previously fixed its result to
+    {CLEAR, NEEDS_INPUT, CONFLICT} and computed only whether to add
+    ASSUMPTION_ALLOWED, so an irreversible, external-system, security-relevant item
+    with no policy source and no authorization was reported as permitting CLEAR.
+    The old requirement-4 test asserted only the ABSENCE of ASSUMPTION_ALLOWED --
+    a narrower property than the one being claimed."""
+
+    HIGH_IMPACT = {
+        "reversibility": "irreversible",
+        "blast_radius": "external_system",
+        "security": True,
+    }
+
+    def test_unauthorized_high_impact_permits_only_needs_input(self) -> None:
+        """The FR-4 case itself. Negative AND positive in one assertion: CLEAR and
+        ASSUMPTION_ALLOWED are both refused, and NEEDS_INPUT is the sole survivor."""
+        permitted = permitted_states(self.policy, self.HIGH_IMPACT)
+        self.assertEqual(permitted, frozenset({"NEEDS_INPUT"}))
+        self.assertNotIn("CLEAR", permitted)
+        self.assertNotIn("ASSUMPTION_ALLOWED", permitted)
+
+    def test_each_high_impact_element_alone_refuses_clear_without_authority(self) -> None:
+        """One triggering element is enough. Co-located guard so emptying the
+        contract's element set cannot make this loop vacuous."""
+        cases = {
+            "reversibility": "irreversible",
+            "blast_radius": "external_system",
+            "monetary_cost": True,
+            "security": True,
+            "privacy": True,
+            "compliance": True,
+            "long_term_lock_in": True,
+            "explicit_user_authority": "reserved",
+        }
+        # D4-F guard
+        self.assertEqual(len(cases), 8)
+        for element, value in cases.items():
+            with self.subTest(element=element):
+                permitted = permitted_states(self.policy, {element: value})
+                self.assertNotIn("CLEAR", permitted, f"{element} allowed CLEAR")
+                self.assertIn("NEEDS_INPUT", permitted)
+
+    def test_a_determining_policy_source_permits_clear(self) -> None:
+        """Positive control: A3-1 admits CLEAR when a policy source DETERMINES the
+        choice. Without this the fix could be over-blocking."""
+        permitted = permitted_states(
+            self.policy, {**self.HIGH_IMPACT, "policy_source": {"role": "determines"}}
+        )
+        self.assertIn("CLEAR", permitted)
+        self.assertNotIn("ASSUMPTION_ALLOWED", permitted)
+
+    def test_an_allowlisted_authorization_permits_clear(self) -> None:
+        """Positive control: an explicit user authorization decides the item."""
+        for source in sorted(self.policy.user_decision_sources):
+            with self.subTest(source=source):
+                permitted = permitted_states(
+                    self.policy,
+                    {**self.HIGH_IMPACT, "user_decision": {"source": source}},
+                )
+                self.assertIn("CLEAR", permitted)
+
+    def test_a_forbidden_authority_source_does_not_permit_clear(self) -> None:
+        """FR-2 and FR-4 meet here: the allowlist gates this route too, so a
+        non-user source cannot buy CLEAR for a high-impact item."""
+        for source in sorted(self.policy.forbidden_authority_sources) + ["invented"]:
+            with self.subTest(source=source):
+                permitted = permitted_states(
+                    self.policy,
+                    {**self.HIGH_IMPACT, "user_decision": {"source": source}},
+                )
+                self.assertEqual(permitted, frozenset({"NEEDS_INPUT"}))
+
+    def test_nothing_open_permits_clear(self) -> None:
+        permitted = permitted_states(self.policy, {"open_decision_item": False})
+        self.assertEqual(permitted, frozenset({"CLEAR"}))
+
+    def test_conflict_is_not_permitted_without_a_declared_contradiction(self) -> None:
+        """CONFLICT was previously in the fixed starting set, so it was 'permitted'
+        for every input. It now requires a declared contradiction."""
+        for facts in ({"open_decision_item": False}, self.HIGH_IMPACT,
+                      load_fixture("valid/repository_policy.json")):
+            with self.subTest(facts=sorted(facts)):
+                self.assertNotIn("CONFLICT", permitted_states(self.policy, facts))
+
+    def test_a_declared_contradiction_permits_conflict(self) -> None:
+        for clause in sorted(self.policy.entry_clauses["CONFLICT"]):
+            with self.subTest(clause=clause):
+                self.assertIn(
+                    "CONFLICT",
+                    permitted_states(self.policy, {"conflict_clause": clause}),
+                )
+
+    def test_an_unknown_entry_predicate_fails_to_load(self) -> None:
+        mutated = json.loads(json.dumps(self.block))
+        mutated["entry_conditions"]["CLEAR"]["any_of"].append("anything_goes")
+        with self.assertRaises(DecisionPolicyError):
+            parse_decision_policy(mutated)
+
+    def test_relaxing_clear_to_admit_a_triggered_element_changes_the_verdict(self) -> None:
+        """Mutation resistance, executed in-process: if CLEAR's condition were
+        widened, the FR-4 case would permit CLEAR again. Proves this suite reads the
+        contract rather than a hardcoded expectation."""
+        mutated = json.loads(json.dumps(self.block))
+        mutated["entry_conditions"]["CLEAR"]["any_of"].append("unclassifiable_item")
+        widened = parse_decision_policy(mutated)
+        self.assertNotIn("CLEAR", permitted_states(widened, self.HIGH_IMPACT))
+        self.assertIn(
+            "CLEAR",
+            permitted_states(widened, {**self.HIGH_IMPACT, "unclassifiable": True}),
+        )
+
+
+class Requirement3BoundaryElementMustMatchTheCode(DecisionPolicyTestCase):
+    """FR-3. validate_record() checked only that the evidence field was non-empty, so
+    `security_impact` could be filed with boundary_element `privacy`. Misclassification
+    -- the thing a Reviewer is required to be able to judge -- was not machine-checkable.
+    The liveness test compared the two values in TEST code, which proves the fixture is
+    consistent, not that production rejects an inconsistent one."""
+
+    def test_every_bound_code_rejects_a_mismatched_boundary_element(self) -> None:
+        """One mismatch injected per boundary-bound code, with a co-located guard."""
+        bound = {
+            name: code.boundary_element
+            for name, code in self.policy.reason_codes.items()
+            if code.boundary_element is not None
+        }
+        # D4-F guard: 10 of the 11 NEEDS_INPUT codes bind an element;
+        # unclassifiable_decision deliberately does not.
+        self.assertEqual(len(bound), 10)
+        for name, element in sorted(bound.items()):
+            with self.subTest(reason_code=name):
+                record = load_fixture(f"valid/{name}.json")
+                self.assertEqual(record["boundary_element"], element)
+                wrong = next(
+                    other
+                    for other in self.policy.boundary_elements
+                    if other != element
+                )
+                record["boundary_element"] = wrong
+                with self.assertRaises(DecisionPolicyError):
+                    validate_record(self.policy, record)
+
+    def test_every_bound_code_accepts_its_declared_element(self) -> None:
+        """Positive control for the same 10 codes, so the check above cannot be
+        satisfied by rejecting everything."""
+        bound = [
+            name
+            for name, code in self.policy.reason_codes.items()
+            if code.boundary_element is not None
+        ]
+        # D4-F guard
+        self.assertEqual(len(bound), 10)
+        for name in sorted(bound):
+            with self.subTest(reason_code=name):
+                validate_record(self.policy, load_fixture(f"valid/{name}.json"))
+
+    def test_unclassifiable_decision_binds_no_element_and_must_not_declare_one(
+        self,
+    ) -> None:
+        """The deliberate override, kept as a separate positive control: the code has
+        no bound element, its fixture validates, and smuggling one in is rejected."""
+        code = self.policy.reason_codes["unclassifiable_decision"]
+        self.assertIsNone(code.boundary_element)
+        self.assertNotIn("boundary_element", code.required_evidence)
+        record = load_fixture("valid/unclassifiable_decision.json")
+        self.assertNotIn("boundary_element", record)
+        validate_record(self.policy, record)
+        with self.assertRaises(DecisionPolicyError):
+            validate_record(self.policy, {**record, "boundary_element": "security"})
+
+
+class DeclaredFactsMustBeConsistentWithTheContract(DecisionPolicyTestCase):
+    """The FR-3 axis, swept beyond the reported location. Three more fields were
+    checked for presence but never for membership in the set the contract declares.
+    An unrecognised enum value did not raise -- it matched no triggering value, so
+    permitted_states returned an EMPTY set: degenerate, not fail-closed."""
+
+    def test_an_enum_element_outside_its_closed_values_is_rejected(self) -> None:
+        cases = {
+            "reversibility": "sort_of_reversible",
+            "blast_radius": "the_whole_internet",
+        }
+        # D4-F guard: exactly the enum-kind elements the contract declares.
+        enum_elements = [
+            name
+            for name, spec in self.policy.boundary_elements.items()
+            if spec.kind == "enum"
+        ]
+        self.assertEqual(sorted(enum_elements), sorted(cases))
+        base = load_fixture("valid/repository_policy.json")
+        for element, bogus in sorted(cases.items()):
+            with self.subTest(element=element):
+                record = {**base, element: bogus}
+                with self.assertRaises(DecisionPolicyError):
+                    validate_record(self.policy, record)
+                with self.assertRaises(DecisionPolicyError):
+                    permitted_states(self.policy, record)
+
+    def test_every_declared_enum_value_is_accepted(self) -> None:
+        """Positive control: each legal member of each enum passes, so the check
+        above cannot be satisfied by rejecting all values."""
+        checked = 0
+        for name, spec in sorted(self.policy.boundary_elements.items()):
+            if spec.kind != "enum":
+                continue
+            for value in spec.values:
+                with self.subTest(element=name, value=value):
+                    permitted_states(self.policy, {name: value})
+                    checked += 1
+        # D4-F guard: 3 reversibility values + 4 blast_radius values.
+        self.assertEqual(checked, 7)
+
+    def test_a_policy_source_kind_outside_the_closed_set_is_rejected(self) -> None:
+        base = load_fixture("valid/repository_policy.json")
+        record = {**base, "policy_source": {**base["policy_source"], "kind": "model_hunch"}}
+        with self.assertRaises(DecisionPolicyError):
+            validate_record(self.policy, record)
+
+    def test_every_declared_policy_source_kind_is_accepted(self) -> None:
+        """Positive control for the same check."""
+        base = load_fixture("valid/repository_policy.json")
+        kinds = list(self.policy.policy_source_kinds)
+        # D4-F guard
+        self.assertEqual(len(kinds), 4)
+        for kind in kinds:
+            with self.subTest(kind=kind):
+                validate_record(
+                    self.policy,
+                    {**base, "policy_source": {**base["policy_source"], "kind": kind}},
+                )
+
+    def test_omitting_an_element_remains_legal(self) -> None:
+        """Over-blocking guard: only DECLARED values are checked, so a record that
+        simply does not mention an element is still valid."""
+        validate_record(self.policy, load_fixture("valid/repository_policy.json"))
+        self.assertEqual(
+            permitted_states(self.policy, {"open_decision_item": False}),
+            frozenset({"CLEAR"}),
+        )
 
 
 class Requirement6UserAuthorityIsAnAllowlist(DecisionPolicyTestCase):
@@ -429,7 +679,7 @@ class Requirement7RiskIndependence(DecisionPolicyTestCase):
         # D4-F guard: the walk must actually visit every selection input. The count
         # rose from 16 to 17 when FR-2 added user_decision_sources -- the guard doing
         # its job on a legitimate change, not just on a mutation.
-        self.assertEqual(len(STATE_SELECTION_INPUTS & set(self.block)), 17)
+        self.assertEqual(len(STATE_SELECTION_INPUTS & set(self.block)), 18)
         for key in sorted(STATE_SELECTION_INPUTS):
             walk(self.block[key], key)
         self.assertEqual(hits, [])

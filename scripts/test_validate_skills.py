@@ -418,8 +418,10 @@ class ValidatorRegressionTests(unittest.TestCase):
         """A second citation minimum lives on the boundary element; lowering it there
         was invisible even though C20 pins the one in `citation_minimum`."""
         self.edit_skills(
-            '"explicit_requirement_conflict": {"kind": "citations", "minimum": 2}',
-            '"explicit_requirement_conflict": {"kind": "citations", "minimum": 1}',
+            '"explicit_requirement_conflict": {"kind": "citations", "minimum": 2, '
+            '"triggering": "at_minimum"}',
+            '"explicit_requirement_conflict": {"kind": "citations", "minimum": 1, '
+            '"triggering": "at_minimum"}',
         )
         self.assert_validator_fails_with("boundary element specifications drifted")
 
@@ -448,6 +450,61 @@ class ValidatorRegressionTests(unittest.TestCase):
             '"state_scope": "per_check_only"',
         )
         self.assert_validator_fails_with("decision state scope drifted")
+
+    # ---- FR-4: entry conditions and triggering values are pinned --------------
+
+    def test_clear_entry_condition_widened_fails(self) -> None:
+        """permitted_states() evaluates these, so widening CLEAR's condition moves the
+        authority boundary itself."""
+        self.edit_skills(
+            '"CLEAR": {"any_of": ["no_open_decision_item", "determining_policy_source", '
+            '"explicit_user_authorization"]}',
+            '"CLEAR": {"any_of": ["no_open_decision_item", "determining_policy_source", '
+            '"explicit_user_authorization", "unclassifiable_item"]}',
+        )
+        self.assert_validator_fails_with("state entry conditions drifted")
+
+    def test_assumption_allowed_entry_condition_weakened_fails(self) -> None:
+        """Dropping a conjunct from an all_of condition is a relaxation."""
+        self.edit_skills(
+            '"all_of": ["reversible_in_run", "blast_radius_within_scope", '
+            '"no_high_impact_element", "supporting_policy_source", '
+            '"no_reserved_user_authority"]',
+            '"all_of": ["reversible_in_run", "supporting_policy_source", '
+            '"no_reserved_user_authority"]',
+        )
+        self.assert_validator_fails_with("state entry conditions drifted")
+
+    def test_needs_input_entry_condition_narrowed_fails(self) -> None:
+        """Narrowing the pausing state's condition is the FR-4 defect's shape."""
+        self.edit_skills(
+            '"NEEDS_INPUT": {"any_of": ["undetermined_boundary_element", '
+            '"absent_user_intent", "unclassifiable_item"]}',
+            '"NEEDS_INPUT": {"any_of": ["absent_user_intent", "unclassifiable_item"]}',
+        )
+        self.assert_validator_fails_with("state entry conditions drifted")
+
+    def test_a_triggering_value_removed_fails(self) -> None:
+        """`irreversible` no longer triggering would silently stop escalating
+        irreversible items."""
+        self.edit_skills(
+            '"triggering": ["irreversible"]', '"triggering": []'
+        )
+        self.assert_validator_fails_with("boundary element specifications drifted")
+
+    def test_blast_radius_triggering_narrowed_fails(self) -> None:
+        self.edit_skills(
+            '"triggering": ["repository", "external_system"]',
+            '"triggering": ["external_system"]',
+        )
+        self.assert_validator_fails_with("boundary element specifications drifted")
+
+    def test_a_boolean_element_made_non_triggering_fails(self) -> None:
+        self.edit_skills(
+            '"security": {"kind": "boolean", "triggering": true}',
+            '"security": {"kind": "boolean", "triggering": null}',
+        )
+        self.assert_validator_fails_with("boundary element specifications drifted")
 
     def test_valid_repository_passes(self) -> None:
         result = self.run_validator()

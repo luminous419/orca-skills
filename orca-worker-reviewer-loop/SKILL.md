@@ -274,18 +274,24 @@ DEFAULT_MAX_ITERATIONS = 5
       "requirement_vs_accepted_decision": {"state": "CONFLICT", "clause": "C-2"},
       "requirement_vs_safety_floor": {"state": "CONFLICT", "clause": "C-3"}
     },
+    "entry_conditions": {
+      "CLEAR": {"any_of": ["no_open_decision_item", "determining_policy_source", "explicit_user_authorization"]},
+      "ASSUMPTION_ALLOWED": {"all_of": ["reversible_in_run", "blast_radius_within_scope", "no_high_impact_element", "supporting_policy_source", "no_reserved_user_authority"]},
+      "NEEDS_INPUT": {"any_of": ["undetermined_boundary_element", "absent_user_intent", "unclassifiable_item"]},
+      "CONFLICT": {"any_of": ["declared_contradiction"]}
+    },
     "boundary_elements": {
-      "ambiguity": {"kind": "declared"},
-      "explicit_requirement_conflict": {"kind": "citations", "minimum": 2},
-      "reversibility": {"kind": "enum", "values": ["reversible_in_run", "reversible_with_effort", "irreversible"]},
-      "blast_radius": {"kind": "enum", "values": ["current_change", "module", "repository", "external_system"]},
-      "monetary_cost": {"kind": "boolean"},
-      "security": {"kind": "boolean"},
-      "privacy": {"kind": "boolean"},
-      "compliance": {"kind": "boolean"},
-      "long_term_lock_in": {"kind": "boolean"},
-      "repository_project_policy": {"kind": "policy_source"},
-      "explicit_user_authority": {"kind": "user_decision"}
+      "ambiguity": {"kind": "declared", "triggering": true},
+      "explicit_requirement_conflict": {"kind": "citations", "minimum": 2, "triggering": "at_minimum"},
+      "reversibility": {"kind": "enum", "values": ["reversible_in_run", "reversible_with_effort", "irreversible"], "triggering": ["irreversible"]},
+      "blast_radius": {"kind": "enum", "values": ["current_change", "module", "repository", "external_system"], "triggering": ["repository", "external_system"]},
+      "monetary_cost": {"kind": "boolean", "triggering": true},
+      "security": {"kind": "boolean", "triggering": true},
+      "privacy": {"kind": "boolean", "triggering": true},
+      "compliance": {"kind": "boolean", "triggering": true},
+      "long_term_lock_in": {"kind": "boolean", "triggering": true},
+      "repository_project_policy": {"kind": "policy_source", "triggering": null},
+      "explicit_user_authority": {"kind": "user_decision", "triggering": ["reserved"]}
     },
     "policy_source_roles": ["determines", "supports"],
     "policy_source_kinds": ["file_path", "requirement_id", "quality_attribute_id", "phase_contract_section"],

@@ -62,6 +62,7 @@ STATE_SELECTION_INPUTS: frozenset[str] = frozenset(
         "entry_clauses",
         "reason_codes",
         "boundary_elements",
+        "entry_conditions",
         "required_evidence",
         "assumption_allowed_requires",
         "assumption_allowed_forbidden_when",
@@ -88,6 +89,28 @@ AXIS_TOKENS: frozenset[str] = frozenset(
     {"risk", "quality_profile", "agent_profile", "profile", "low", "medium", "high"}
 )
 CANONICAL_INDEPENDENT_AXES: tuple[str, ...] = ("risk", "quality_profile", "agent_profile")
+
+# FR-4: the closed vocabulary of entry predicates. `permitted_states` evaluates a
+# state's entry condition rather than assuming a fixed starting set, so an unknown
+# predicate name must fail closed at load time -- otherwise a typo would silently
+# make a condition unsatisfiable and quietly narrow (or widen) the boundary.
+ENTRY_PREDICATES: frozenset[str] = frozenset(
+    {
+        "no_open_decision_item",
+        "determining_policy_source",
+        "explicit_user_authorization",
+        "reversible_in_run",
+        "blast_radius_within_scope",
+        "no_high_impact_element",
+        "supporting_policy_source",
+        "no_reserved_user_authority",
+        "undetermined_boundary_element",
+        "absent_user_intent",
+        "unclassifiable_item",
+        "declared_contradiction",
+    }
+)
+ENTRY_COMBINATORS: frozenset[str] = frozenset({"any_of", "all_of"})
 
 TRANSITION_VALUES: frozenset[str] = frozenset(
     {"allowed", "forbidden", "requires_user_decision", "requires_retraction"}
@@ -120,6 +143,10 @@ class BoundaryElement:
     kind: str
     values: tuple[str, ...] = ()
     minimum: int | None = None
+    triggering: Any = None
+    """Which value(s) of this element mean it is TRUE in A3-1's sense. `None` for
+    repository_project_policy, which A4-0 classifies as a boundary INPUT that resolves
+    items rather than a trigger that escalates them."""
 
 
 @dataclass(frozen=True)
@@ -146,6 +173,7 @@ class DecisionPolicy:
     entry_clauses: Mapping[str, Mapping[str, str]]
     reason_codes: Mapping[str, ReasonCode]
     boundary_elements: Mapping[str, BoundaryElement]
+    entry_conditions: Mapping[str, Mapping[str, tuple[str, ...]]]
     policy_source_roles: tuple[str, ...]
     policy_source_kinds: tuple[str, ...]
     required_evidence: Mapping[str, tuple[str, ...]]
@@ -250,7 +278,36 @@ def parse_decision_policy(block: Any) -> DecisionPolicy:
             kind=str(spec.get("kind", "")),
             values=tuple(spec.get("values", ()) or ()),
             minimum=spec.get("minimum"),
+            triggering=spec.get("triggering"),
         )
+
+    raw_conditions = block["entry_conditions"]
+    _require(
+        isinstance(raw_conditions, dict)
+        and set(raw_conditions) == set(DECISION_STATES),
+        "entry_conditions must cover exactly the four states",
+    )
+    entry_conditions: dict[str, Mapping[str, tuple[str, ...]]] = {}
+    for state, condition in raw_conditions.items():
+        _require(
+            isinstance(condition, dict) and len(condition) == 1,
+            f"entry_conditions[{state}] must name exactly one combinator",
+        )
+        (combinator, predicates), = condition.items()
+        _require(
+            combinator in ENTRY_COMBINATORS,
+            f"entry_conditions[{state}] combinator {combinator!r} is outside the closed set",
+        )
+        _require(
+            isinstance(predicates, list) and predicates,
+            f"entry_conditions[{state}] must list at least one predicate",
+        )
+        unknown = [name for name in predicates if name not in ENTRY_PREDICATES]
+        _require(
+            not unknown,
+            f"entry_conditions[{state}] names unknown predicate(s) {unknown}",
+        )
+        entry_conditions[str(state)] = {str(combinator): tuple(predicates)}
 
     raw_required = block["required_evidence"]
     _require(
@@ -326,6 +383,7 @@ def parse_decision_policy(block: Any) -> DecisionPolicy:
         entry_clauses=entry_clauses,
         reason_codes=reason_codes,
         boundary_elements=boundary_elements,
+        entry_conditions=entry_conditions,
         policy_source_roles=tuple(block["policy_source_roles"]),
         policy_source_kinds=tuple(block["policy_source_kinds"]),
         required_evidence=required_evidence,
@@ -413,32 +471,139 @@ def _policy_source_role(facts: Mapping[str, Any]) -> str | None:
     return None
 
 
+def _element_is_triggering(spec: BoundaryElement, value: Any) -> bool:
+    """Does this declared value make the element TRUE in A3-1's sense?
+
+    The triggering values come from the contract, not from this code: A4-1 already
+    fixed them (irreversible; blast radius in repository/external_system; the five
+    booleans true; authority reserved), and C27 pins them by value.
+    """
+    if spec.triggering is None:
+        return False
+    if isinstance(spec.triggering, bool):
+        return value is spec.triggering
+    if spec.triggering == "at_minimum":
+        minimum = spec.minimum or 0
+        try:
+            return len(value) >= minimum
+        except TypeError:
+            return False
+    if isinstance(spec.triggering, (list, tuple)):
+        return value in tuple(spec.triggering)
+    return value == spec.triggering
+
+
+def _validate_declared_facts(
+    policy: DecisionPolicy, facts: Mapping[str, Any]
+) -> None:
+    """Declared values must be members of the sets the contract declares.
+
+    Found by the FR-3 axis sweep ("checked for presence, never for consistency").
+    An unrecognised enum value did not raise: it simply matched no triggering value,
+    so `{"reversibility": "irrevrsible"}` produced an EMPTY permitted set -- a
+    degenerate outcome rather than a rejection. Fail-closed means rejecting the input,
+    not returning a state set nobody can act on. Only DECLARED keys are checked, so
+    omitting an element stays legal.
+    """
+    for element, spec in policy.boundary_elements.items():
+        if element not in facts or spec.kind != "enum":
+            continue
+        value = facts[element]
+        _require(
+            value in spec.values,
+            f"boundary element {element!r} declares {value!r}, which is outside its "
+            f"closed value set {list(spec.values)}",
+        )
+    source = facts.get("policy_source")
+    if isinstance(source, dict) and source.get("kind") is not None:
+        _require(
+            source["kind"] in policy.policy_source_kinds,
+            f"policy_source kind {source['kind']!r} is outside the closed set "
+            f"{list(policy.policy_source_kinds)}",
+        )
+
+
+def _evaluate_predicate(
+    name: str, policy: DecisionPolicy, facts: Mapping[str, Any]
+) -> bool:
+    """One entry predicate over the DECLARED facts. Closed vocabulary: a name not
+    handled here is rejected at load time by ENTRY_PREDICATES, so this cannot
+    silently return False for a typo."""
+    role = _policy_source_role(facts)
+    authorization = facts.get("user_decision") or {}
+    authorized = (
+        isinstance(authorization, dict)
+        and authorization.get("source") in policy.user_decision_sources
+    )
+    triggered = [
+        element
+        for element, spec in policy.boundary_elements.items()
+        if element in facts and _element_is_triggering(spec, facts[element])
+    ]
+
+    if name == "no_open_decision_item":
+        return facts.get("open_decision_item") is False
+    if name == "determining_policy_source":
+        return role == "determines"
+    if name == "explicit_user_authorization":
+        return authorized
+    if name == "reversible_in_run":
+        return facts.get("reversibility") == "reversible_in_run"
+    if name == "blast_radius_within_scope":
+        spec = policy.boundary_elements["blast_radius"]
+        return facts.get("blast_radius") not in tuple(spec.triggering or ())
+    if name == "no_high_impact_element":
+        return not _assumption_allowed_is_forbidden(policy, facts)
+    if name == "supporting_policy_source":
+        return role == "supports"
+    if name == "no_reserved_user_authority":
+        return facts.get("explicit_user_authority") != "reserved"
+    if name == "undetermined_boundary_element":
+        return bool(triggered) and role != "determines" and not authorized
+    if name == "absent_user_intent":
+        return facts.get("user_intent_absent") is True
+    if name == "unclassifiable_item":
+        return facts.get("unclassifiable") is True
+    if name == "declared_contradiction":
+        return facts.get("conflict_clause") in tuple(
+            policy.entry_clauses.get("CONFLICT", {})
+        )
+    raise DecisionPolicyError(f"unhandled entry predicate {name!r}")
+
+
 def permitted_states(
     policy: DecisionPolicy, facts: Mapping[str, Any]
 ) -> frozenset[str]:
     """The states the contract permits for these DECLARED boundary facts.
 
-    Pure function of (contract, declared facts): no I/O, no dispatch, no phase,
-    no gate, no wait. This is contract evaluation, not the OS-29 runtime check.
+    FR-4: this EVALUATES each state's entry condition. The previous version fixed the
+    result set to {CLEAR, NEEDS_INPUT, CONFLICT} and computed only whether to add
+    ASSUMPTION_ALLOWED, so an irreversible, external-system, security-relevant item
+    with no policy source and no authorization was reported as permitting CLEAR --
+    exactly the automatic approval of an irreversible high-impact decision without
+    explicit authority that the ticket forbids. Checking only that ASSUMPTION_ALLOWED
+    is absent was a narrower property than the one being claimed.
 
-    Risk-independence is STRUCTURAL, not a blacklist. This function iterates
-    `policy.boundary_elements` and reads only those keys out of `facts`, so a key
-    that is not a declared boundary element is unreachable by construction --
-    not merely unused. `risk`, `quality_profile` and `agent_profile` are kept out
-    of `boundary_elements` by the AXIS_TOKENS rule, so no `facts["risk"]` value
-    can reach this computation. There is deliberately NO `risk` parameter, and a
-    test asserts that via inspect.signature.
+    Pure function of (contract, declared facts): no I/O, no dispatch, no phase, no
+    gate, no wait. This is contract evaluation, not the OS-29 runtime check.
+
+    Risk-independence is STRUCTURAL. Every predicate reads only declared boundary
+    elements, the policy-source role, the user_decision, and the four explicitly
+    named flags -- never a risk, quality-profile or agent-profile key. There is
+    deliberately no `risk` parameter, and a test asserts that via inspect.signature.
     """
 
-    declared = {
-        name: facts[name] for name in policy.boundary_elements if name in facts
-    }
-    permitted = {"CLEAR", "NEEDS_INPUT", "CONFLICT"}
     role = _policy_source_role(facts)
     if role is not None and role not in policy.policy_source_roles:
         raise DecisionPolicyError(f"unknown policy_source role {role!r}")
-    if role == "supports" and not _assumption_allowed_is_forbidden(policy, declared):
-        permitted.add("ASSUMPTION_ALLOWED")
+    _validate_declared_facts(policy, facts)
+
+    permitted = set()
+    for state, condition in policy.entry_conditions.items():
+        (combinator, predicates), = condition.items()
+        results = [_evaluate_predicate(name, policy, facts) for name in predicates]
+        if (any(results) if combinator == "any_of" else all(results)):
+            permitted.add(state)
     return frozenset(permitted)
 
 
@@ -467,6 +632,26 @@ def validate_record(policy: DecisionPolicy, record: Mapping[str, Any]) -> None:
             f"state {state} must not carry a reason_code",
         )
 
+    if code is not None and code.boundary_element is not None:
+        # FR-3: the record must name the SAME element the code binds. Checking only
+        # that the field is non-empty let `security_impact` be filed with
+        # boundary_element "privacy", which makes misclassification -- the thing a
+        # Reviewer is required to be able to judge -- not machine-checkable.
+        declared = record.get("boundary_element")
+        _require(
+            declared == code.boundary_element,
+            f"reason code {code.name} binds boundary element "
+            f"{code.boundary_element!r}, but the record declares {declared!r}",
+        )
+    elif code is not None and "boundary_element" not in code.required_evidence:
+        # Positive control for the deliberate override: a code with no bound element
+        # (today only unclassifiable_decision) must not smuggle one in.
+        _require(
+            record.get("boundary_element") is None,
+            f"reason code {code.name} binds no boundary element, but the record "
+            f"declares {record.get('boundary_element')!r}",
+        )
+
     required = code.required_evidence if code else policy.required_evidence[str(state)]
     for field in required:
         if field == "reason_code":
@@ -475,6 +660,8 @@ def validate_record(policy: DecisionPolicy, record: Mapping[str, Any]) -> None:
             field in record and not _is_empty(record[field]),
             f"state {state} requires a non-empty {field!r}",
         )
+
+    _validate_declared_facts(policy, record)
 
     if state == "CONFLICT":
         minimum = policy.citation_minimum.get("CONFLICT", 2)
