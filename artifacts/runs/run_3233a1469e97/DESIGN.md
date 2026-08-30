@@ -649,6 +649,69 @@ directly: `policy_source` validity (kind and role membership, missing `locator`,
 **domain**, not judgement: `permitted_states` takes *facts* and has no reason-code notion, so those
 are outside its contract rather than a parity gap. Authorization was the only genuine divergence.
 
+
+#### D2-2e. One normative ASSUMPTION_ALLOWED rule, role parity, and what counts as text (TR4-1/2/3)
+
+TEST revalidation found the FR-5 shape twice more. D2-2d fixed one concept judged in two
+places; this section settles the remaining two and states the rule that ends the family.
+
+**TR4-2 — which ASSUMPTION_ALLOWED rule is normative.** The contract carries two
+statements about the state, and `permitted_states()` read one while `validate_record()`
+read the other:
+
+| statement | what it is | contract key |
+|---|---|---|
+| `entry_conditions.ASSUMPTION_ALLOWED` | the **permission gate** — what must hold to enter | `all_of` of five predicates |
+| `assumption_allowed_forbidden_when` | the **prohibition** — INV-4, what forbids the state | `reversibility_in`, `blast_radius_in_with_irreversible`, `any_true_of`, … |
+
+**The entry condition is normative.** ANALYSIS A3-1 states the ASSUMPTION_ALLOWED entry
+condition as "**all** of: reversible within this run's change scope; blast radius confined
+to the requested scope; **none** of {monetary cost, security, privacy, compliance,
+long-term lock-in} is true — no authorization exception exists (A4-0); a locatable policy
+source **supports but does not determine** the choice; no explicit user authority is
+reserved over it." That is a permission rule, and it is the one C30 pins by value.
+A4-0's per-element table is titled by what "forbids `ASSUMPTION_ALLOWED`" — a prohibition.
+**"Not forbidden" was never the same claim as "permitted."** Reading INV-4 as if it were a
+permission rule is what let record validation accept six combinations the evaluator
+refused.
+
+This is not a new design. It is a choice between two already-approved statements, made by
+reading which one the specification frames as the entry condition.
+
+**Why this does not narrow legitimate autonomy.** The entry condition is strictly stronger
+than the prohibition: across all 48 enumerated combinations, every divergence had the
+evaluator refusing and the record validator accepting — **never the reverse**. So adopting
+it narrows record validation to what `permitted_states()` already permitted and widens
+nothing. The set of items that may be `ASSUMPTION_ALLOWED` is unchanged; 2 of the 48
+combinations still permit it, and a test asserts that count so an over-blocking "fix"
+fails rather than passes. `validate_record` **keeps** the INV-4 check as well: INV-4 has
+no exception (A4-0, C9), and a non-overridable invariant should not be enforced only by
+implication from a stricter rule that a later edit might relax.
+
+**TR4-1 — role parity.** `policy_source.kind` membership lived in
+`_validate_declared_facts`, which both APIs call; `policy_source.role` membership lived
+inline in `permitted_states()`. Both are closed sets in the contract and both are pinned by
+C28, so there was never a reason for only one to be enforced on records. The role check
+moved beside the kind check. No contract change.
+
+**TR4-3 — whitespace is not evidence.** Judged **invalid**. `where_recorded` exists to
+prove *where* a decision is written down and `resolves` to say *what* it settles; three
+spaces point at nothing and settle nothing, so they are not checkable by the second party
+INV-5 and A5-3 require — which is the entire reason those fields exist instead of a bare
+`source`. Blanks would have let the FR-5 fix be satisfied by a record complete only in
+shape. `_is_empty` therefore strips strings, once, for required evidence and user-decision
+fields and retractions alike. The change is strictly narrowing — it rejects more, never
+accepts more — and a positive control keeps text that merely *contains* spaces valid.
+
+**The structural rule, so this family ends here.** All three defects had one cause: a rule
+written inline in one API rather than in a helper both call. `permitted_states()` and
+`validate_record()` both read declared boundary facts, so **every rule about those facts
+must be reachable from both**. A test compares their call closures and fails if a
+judgement is added to one and not the other — a cheaper guard than re-enumerating the
+concepts by hand. All nine multi-site concepts were enumerated and compared over 109 cases
+with zero divergences; the remaining four are single-site and have nothing to compare.
+
+
 #### D2-3. What the loader deliberately does not do
 
 No import from `orca_runtime_harness`, `run_logging`, `review_isolation`, `e2e_harness`, or

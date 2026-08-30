@@ -842,3 +842,185 @@ No new question requires user authority. UD-1 through UD-4 answered everything t
 and the two implementation details in *Analysis* are mechanics rather than authority choices.
 
 STATUS: COMPLETE
+
+---
+
+## Correction — iteration 6 (TEST revalidation findings TR4-1/2/3, authorized by UD-5)
+
+Three defects the TEST phase found and correctly declined to fix. All three are the same
+shape as FR-5 — **a rule written inline in one API instead of in a helper both call** — so
+all three are fixed the same way, and this round adds the structural guard that ends the
+family.
+
+### TR4-1 — `policy_source.role` membership was enforced on one side only
+
+**Reproduced first.** Same record to both APIs, only the role changed:
+
+```
+role='invented_role'   permitted_states: REJECT unknown policy_source role 'invented_role'
+                       validate_record : accept
+```
+
+`kind` membership lived in `_validate_declared_facts`, which both APIs call; `role`
+membership lived inline in `permitted_states()`. Both are closed sets in the contract, both
+are pinned by C28. The role check moved beside the kind check — no contract change, no new
+rule.
+
+**After:**
+
+```
+role='determines'      permitted_states: accept      validate_record: accept
+role='supports'        permitted_states: accept      validate_record: accept
+role='invented_role'   permitted_states: REJECT …    validate_record: REJECT (same message)
+```
+
+Negative: four invented spellings (`invented_role`, `determiness`, `DETERMINES`,
+`' supports'`) rejected by both. Positive control: both legal roles accepted by both, with a
+co-located cardinality guard — rejecting every role would otherwise satisfy the negative.
+
+### TR4-2 — two rules for one question, and which one is normative
+
+**The choice, made from the approved specification rather than invented.** The contract
+carries a permission gate (`entry_conditions.ASSUMPTION_ALLOWED`) and a prohibition
+(`assumption_allowed_forbidden_when`, INV-4). `permitted_states()` read the first;
+`validate_record()` read only the second.
+
+**The entry condition is normative.** ANALYSIS A3-1 states the ASSUMPTION_ALLOWED entry
+condition as "**all** of: reversible within this run's change scope; blast radius confined
+to the requested scope; **none** of {monetary cost, security, privacy, compliance,
+long-term lock-in} is true …; a locatable policy source **supports but does not determine**
+the choice; no explicit user authority is reserved over it." A4-0's table is framed by what
+*forbids* the state. **"Not forbidden" is not "permitted."** Reading INV-4 as a permission
+rule is exactly what let record validation accept six combinations the evaluator refused.
+
+Both APIs now call `_entry_condition_defect(policy, state, facts)`. `validate_record`
+**keeps** the INV-4 check as well — INV-4 has no exception (A4-0, C9), and a
+non-overridable invariant should not survive only by implication from a stricter rule.
+
+**This does not narrow legitimate autonomy, and that is asserted, not claimed.** Every one
+of the six divergences had the evaluator refusing and the validator accepting — never the
+reverse — so the entry condition is strictly stronger and adopting it widens nothing.
+Before and after, over the full enumeration:
+
+| | disagreements / 48 | combinations still permitting ASSUMPTION_ALLOWED |
+|---|---|---|
+| before | **6** | 2 |
+| after | **0** | **2** |
+
+The permitted count is unchanged and is pinned by an assertion, so an over-blocking "fix"
+that refuses everything fails the suite instead of passing it. Mutation **R-4** makes the
+entry condition unsatisfiable and is **CAUGHT**.
+
+Tests: all six middle-band cases asserted bidirectionally (both APIs must refuse); the two
+safe cases asserted as a positive control (both must permit); the seven hard cases
+(irreversible, each of the five high-impact flags, reserved authority) asserted as a
+negative control so the fix did not trade one divergence for another; and the Reviewer's
+whole 48-combination enumeration re-run as a test with a co-located `48` guard.
+
+### TR4-3 — whitespace-only text is not evidence
+
+**Judged invalid, and the reason is what the fields are for.** `where_recorded` must prove
+*where* a decision is written down; `resolves` must say *what* it settles. Three spaces
+point at nothing and settle nothing, so they are not checkable by the second party INV-5
+and A5-3 require — which is the whole reason those fields exist instead of a bare `source`.
+Blanks would have let the FR-5 fix be satisfied by a record complete only in shape.
+
+`_is_empty` now strips strings — once, so the rule is identical for required evidence,
+user-decision fields, and retractions. Strictly narrowing: it rejects more, never accepts
+more.
+
+```
+before  where_recorded='   '  ->  permitted_states ['CLEAR']
+after   where_recorded='   '  ->  permitted_states ['NEEDS_INPUT']
+                                  validate_transition: requires a non-empty 'where_recorded'
+after   where_recorded='USER_DECISIONS.md#UD-1'  ->  ['CLEAR']   (positive control)
+```
+
+Four whitespace variants (`'   '`, `'\t'`, `'\n'`, `' \t\n '`) × three declared fields = 12
+guarded assertions, plus a positive control that text merely *containing* spaces stays
+valid (`' USER_DECISIONS.md#UD-1 '`, `'a b'`) — the over-strip mutation R-7 is **CAUGHT**.
+
+### The cross-API concept enumeration — all of it
+
+Every concept judged by more than one public API, compared by execution. Two methodology
+rules made the result trustworthy: **identical input to both APIs**, and comparison of the
+**concept-specific message** rather than "did it raise at all" — two APIs can both reject a
+record for different reasons and look consistent while disagreeing about the concept under
+test.
+
+| # | concept | single rule | judged by | cases | verdict |
+|---|---|---|---|---|---|
+| 1 | boundary-element enum membership | `_validate_declared_facts` | evaluator + record | 9 | AGREE |
+| 2 | `policy_source.kind` membership | `_validate_declared_facts` | evaluator + record | 5 | AGREE |
+| 3 | `policy_source.role` membership | `_validate_declared_facts` **(TR4-1)** | evaluator + record | 3 | AGREE |
+| 4 | user_decision authorization | `_user_decision_defect` (FR-5) | evaluator + transition | 14 | AGREE |
+| 5 | emptiness of a required value | `_is_empty` **(TR4-3)** | all three | 6 | AGREE |
+| 6 | may ASSUMPTION_ALLOWED apply? | `_entry_condition_defect` **(TR4-2)** | evaluator + record | 48 | AGREE |
+| 7 | INV-4 prohibition | `_assumption_allowed_is_forbidden` | evaluator + record | 7 | AGREE |
+| 8 | boundary element is triggering | `_element_is_triggering` | evaluator + record | 12 | AGREE |
+| 9 | state-name membership | `policy.states` | record + `transition_rule` | 5 | AGREE |
+| — | transition rule lookup | `policy.transitions` | `validate_transition` only | — | single site |
+| — | retraction present | inline | `validate_transition` only | — | single site |
+| — | reason_code ↔ state / boundary_element | inline | `validate_record` only | — | single site |
+| — | citation minimum (CONFLICT) | inline | `validate_record` only | — | single site |
+
+**9 multi-site concepts, 109 cases, 0 divergences.** Four concepts are judged in exactly
+one place and have nothing to compare; they are listed so the enumeration is visibly
+complete rather than silently truncated.
+
+**A first pass at this table produced three false DIVERGE rows** — it passed bare facts to
+`permitted_states()` but a full record to `validate_record()`, and scored "raises at all"
+instead of "raises for this concept". Corrected before drawing any conclusion; the fifth
+self-caught measurement error in this run, and the reason the two methodology rules above
+are stated explicitly.
+
+### The structural guard, so this family ends here
+
+FR-5, TR4-1 and TR4-2 had one cause: a rule inline in one API instead of in a shared
+helper. `permitted_states()` and `validate_record()` both read declared boundary facts, so
+every rule about those facts must be reachable from both. `FactReadingApisShareEveryRule`
+compares their **call closures** and fails when a judgement is added to one and not the
+other, plus names the seven shared helpers so deleting one from both at once — which
+equality alone would not notice — still fails. Their closures are now identical.
+
+### Mutation results — control verified green before the run
+
+Run twice: once as each fix landed, once against the final tree. Both runs agree row for
+row, with a green control both times.
+
+| # | Mutation | Result |
+|---|---|---|
+| R-0 | control, unmodified tree | **green** — results below are valid |
+| R-1 | role check removed from the shared helper | CAUGHT |
+| R-2 | role check moved back into `permitted_states` only — **the TR4-1 defect** | CAUGHT |
+| R-3 | `validate_record` drops the entry-condition check — **the TR4-2 defect** | CAUGHT |
+| R-4 | **over-block probe**: entry condition never satisfiable | CAUGHT |
+| R-5 | combinator ignored (`all_of` evaluated as `any_of`) | CAUGHT |
+| R-6 | `_is_empty` stops stripping — **the TR4-3 defect** | CAUGHT |
+| R-7 | **over-strip probe**: any string containing a space is empty | CAUGHT |
+
+**7/7 CAUGHT.** R-4 and R-7 are the checks on the checks: a suite satisfiable by refusing
+everything would have missed both.
+
+### Regression — every prior fix still holds
+
+9/9 intact by execution: FR-1 (both named edges), FR-2, FR-3, FR-4, RI3-1, FR-5, plus
+TR4-1 and TR4-3. 3/3 positive controls hold — complete decision → CLEAR, ordinary +
+determining → CLEAR, safe + supporting → ASSUMPTION_ALLOWED.
+
+### Commands
+
+| Command | Result |
+|---|---|
+| `python3 scripts/validate_skills.py` | **PASSED (642 checks)** — unchanged; no contract or validator change was needed |
+| `python3 -m unittest discover -s scripts -p 'test_*.py'` | **1425 tests OK (skipped=6)** — was 1413; the +12 are the new tests and **skips did not increase** |
+| `python3 scripts/verify_package.py` | **PASSED (173 source files)** |
+| `python3 scripts/build_release.py` | built `dist/orca-skills-0.9.0.tar.gz` |
+| `verify_package.py --archive …` | **PASSED (173 source files)**, archive verified |
+| `git diff --check` | clean |
+
+Protected surfaces untouched, verified by empty diff: `VERSION`, `LICENSE`,
+`skill_policy.py` (so `evaluate_invocation()` is unchanged, UD-3), `quality_profile.py`,
+`agent_profile.py`, **both `SKILL.md` contracts**, `templates/**`, `reviews/**`. The three
+fixes are evaluator code only — no contract edit was required, because the contract already
+carried the right rule and only one API was reading it.
