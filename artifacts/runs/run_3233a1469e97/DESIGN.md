@@ -125,6 +125,7 @@ key of that JSON object, after `"errors"`. Byte-identical in both Skills; deep-e
     "repository_project_policy": {"kind": "policy_source"},
     "explicit_user_authority": {"kind": "user_decision"}
   },
+  "authority_precedence": {"policy_source_cannot_resolve": ["explicit_user_authority", "explicit_requirement_conflict"]},
   "policy_source_roles": ["determines", "supports"],
   "policy_source_kinds": ["file_path", "requirement_id", "quality_attribute_id", "phase_contract_section"],
   "required_evidence": {
@@ -520,6 +521,70 @@ element stays legal, so the fix does not over-block.
 reversible, supporting policy), and `CONFLICT` (declared contradiction) all remain reachable and are
 each asserted.
 
+#### D2-2c. Authority precedence across predicates, and the empty-facts contract (RI3-1)
+
+**The finding.** Entry predicates were evaluated **independently**, so each was correct alone and
+wrong in combination. A determining policy source satisfied `CLEAR` for an item whose user authority
+is reserved *and* suppressed its `NEEDS_INPUT`; and it left `CLEAR` beside `CONFLICT` for a declared
+contradiction. Reproduced before any change:
+
+```text
+reserved alone                -> ['NEEDS_INPUT']              correct
+reserved + determining policy -> ['CLEAR']                    WRONG, expected ['NEEDS_INPUT']
+C-1 alone                     -> ['CONFLICT']                 correct
+C-1 + determining policy      -> ['CLEAR', 'CONFLICT']        WRONG, expected ['CONFLICT']
+```
+
+**The rule, transcribed from A4-0.** That table already names exactly two cells a determining policy
+source cannot resolve — *"a policy source cannot un-reserve it → `NEEDS_INPUT`"* and *"a policy
+source cannot arbitrate two explicit requirements → `CONFLICT`"*. Those two element names are now
+contract data:
+
+```json
+"authority_precedence": {"policy_source_cannot_resolve": ["explicit_user_authority", "explicit_requirement_conflict"]}
+```
+
+**It has to be stated on both sides.** Applying it only to `determining_policy_source` removed
+`CLEAR` correctly but left `undetermined_boundary_element` still treating a determining source as
+resolving the item — so the reserved case returned an **empty set**: the same "right alone, wrong
+together" shape, one predicate over. `no_open_decision_item` is likewise refined to A3-1's actual
+wording (a triggering element or a declared contradiction *is* an open item), and
+`declared_contradiction` yields to a valid user decision, symmetric with
+`undetermined_boundary_element`, because A4-0 gives **one** destination per cell.
+
+**Combination sweep — 105 combinations, every trigger × every clause × every resolver.** The
+safety-relevant invariant is asserted permanently: *no combination permits a continuing state
+(`CLEAR` or `ASSUMPTION_ALLOWED`) without a determining policy source A4-0 allows to resolve that
+item, or an allowlisted user decision.* **0 leaks.**
+
+One sweep result deserves recording because my first expectation was wrong, not the code: facts
+declaring **both** a triggered element and a contradiction permit `{NEEDS_INPUT, CONFLICT}`. That is
+correct. A3-1 makes `NEEDS_INPUT` *missing* information and `CONFLICT` *contradictory* information —
+different decision items — and OQ-1 settled that state is per **item** with a per-check aggregate, so
+`aggregate_order` is what reduces a multi-item check to one reported state. Both are pausing states,
+so nothing is weakened.
+
+**Positive controls, because over-blocking is the mirror defect.** A determining policy source still
+resolves all **seven** ordinary elements to `CLEAR`; an allowlisted authorization still resolves both
+precedence cells to `CLEAR`; `open_decision_item: false` alone still yields `CLEAR`; and a safe
+supporting-policy item still yields `ASSUMPTION_ALLOWED`.
+
+##### Empty facts return an empty set — deliberate, and here is the reasoning
+
+`permitted_states(policy, {})` returns `frozenset()`. **This is intended fail-closed behaviour, not
+an oversight**, and it is documented here because it was previously written down nowhere.
+
+A3-1 admits `CLEAR` on three grounds, and the first is an **affirmative** one: *"no decision item is
+open"*. A caller that has declared nothing has not asserted that — it has asserted nothing at all.
+Returning `CLEAR` for silence would make *the absence of analysis* indistinguishable from *a clean
+result*, which is precisely the failure this contract exists to prevent; it is the same reasoning
+that makes the loader raise rather than return `None`. Reaching `CLEAR` therefore requires the caller
+to state `open_decision_item: false`, which is a claim someone can be held to.
+
+The empty set is a distinct and honest answer: *nothing has been declared, so nothing is permitted
+yet.* A caller must not read it as "proceed". `test_undeclared_facts_permit_nothing_by_design` pins
+it.
+
 #### D2-3. What the loader deliberately does not do
 
 No import from `orca_runtime_harness`, `run_logging`, `review_isolation`, `e2e_harness`, or
@@ -554,6 +619,7 @@ dependency direction `validate_risk_profile_contract` already has toward
 | C28 | `policy_source_roles` and `policy_source_kinds` equal their expected tuples | `<skill>: policy source roles or kinds drifted` |
 | C29 | `state_scope` equals OQ-1's settled value | `<skill>: decision state scope drifted` |
 | C30 | `entry_conditions` equals the expected combinator + predicate tuple per state (FR-4) — `permitted_states` evaluates these, so a change here moves the authority boundary | `<skill>: state entry conditions drifted` |
+| C31 | `authority_precedence.policy_source_cannot_resolve` equals A4-0's two "cannot" cells (RI3-1) | `<skill>: authority precedence drifted — a policy source must not resolve reserved user authority or an explicit requirement conflict` |
 | C27 *(extended)* | each boundary element's `triggering` value is pinned alongside `{kind, values, minimum}` (FR-4) | `<skill>: boundary element specifications drifted` |
 | C25 | `user_decision_sources` and `forbidden_authority_sources` are disjoint | `<skill>: the user-authority vocabulary admits a forbidden source` |
 | C11a | **partition completeness** — every key of `decision_policy` is in `STATE_SELECTION_INPUTS` or `DECLARATIVE_KEYS`, and their union equals the key set exactly (R-A2) | `decision policy key <name> is not classified as a selection input or declarative` |
@@ -601,7 +667,7 @@ STATE_SELECTION_INPUTS = {          # keys whose CONTENT may participate in sele
   "boundary_elements", "required_evidence",
   "assumption_allowed_requires", "assumption_allowed_forbidden_when",
   "user_decision_fields", "user_decision_sources", "forbidden_authority_sources",
-  "entry_conditions",
+  "entry_conditions", "authority_precedence",
   "citation_minimum", "downstream_rule", "aggregate_order",
   "policy_source_roles", "policy_source_kinds", "state_scope"
 }
