@@ -620,6 +620,15 @@ The new surface is the helper and the parity tests. Every row below was executed
 > been misled, and that gap is why FR-7 was raised against this document as well as against
 > the tests.
 
+
+> **Narrowed again in iteration 7, after FR-9.** Iteration 6 narrowed this to "the surface
+> swept". Four more value-domain defects surfaced afterwards — FR-8 (`boolean` values),
+> RI8-1 (`user_decision` element values), RI9-1 (the locator's shape) and the two RI9-1's lens
+> exposed (`where_recorded`/`resolves` text, citation entries) — every one of them alive
+> while this table said "clean". So the accurate scope is narrower still: **(c) and (e) were
+> swept over the CONTRACT and the shared helpers, never over the VALUE DOMAINS a declared
+> fact may carry.** That whole axis had no coverage until iteration 7's register.
+
 #### (b) — the collections were actually emptied
 
 Each of the four new loops was run with the contract collection it iterates replaced
@@ -917,6 +926,14 @@ stripped `_is_empty`, and the call-closure tests. Every row executed.
 | (i) | same concept judged in two places | 9 concepts, 109 cases, 0 divergences | clean |
 
 **Nothing new was found on the surfaces listed above.**
+> **Narrowed again in iteration 7, after FR-9.** Iteration 6 narrowed this to "the surface
+> swept". Four more value-domain defects surfaced afterwards — FR-8 (`boolean` values),
+> RI8-1 (`user_decision` element values), RI9-1 (the locator's shape) and the two RI9-1's lens
+> exposed (`where_recorded`/`resolves` text, citation entries) — every one of them alive
+> while this table said "clean". So the accurate scope is narrower still: **(c) and (e) were
+> swept over the CONTRACT and the shared helpers, never over the VALUE DOMAINS a declared
+> fact may carry.** That whole axis had no coverage until iteration 7's register.
+
 
 > **Claim narrowed in iteration 6, after FR-7.** As originally written this paragraph read as
 > a general all-clear. It was not one. The sweep covered `_entry_condition_defect`, the role
@@ -1084,3 +1101,120 @@ Untouched, verified by empty diff: `VERSION`, `LICENSE`, `skill_policy.py` (UD-3
 `templates/**` and `reviews/**`. This pass edited one test file and this document — no
 contract or evaluator semantics changed, and no defect was found that would have required
 reporting rather than fixing.
+
+---
+
+## Correction — iteration 7 (Final Review attempt 5, FR-9)
+
+FR-9 was raised as "the tests missed FR-8". By the time it reached me, implementation had
+run three more rounds and **four** value-domain defects had come and gone — FR-8, RI8-1,
+RI9-1, and the two RI9-1's lens exposed. Every one of them was alive while 1400+ tests and
+642 checks passed. The common cause is not four missing tests; it is that coverage was
+written **per defect, after the fact**, instead of **per value position, in advance**.
+
+### The register
+
+`Fr9EveryValuePositionHasADomainProbe` gives every position where the contract carries a
+value one row: a violating value, a valid value, whether the position is checked, and the
+**message its own rule produces**.
+
+| # | position | classified | how it is pinned |
+| --- | --- | --- | --- |
+| 1 | element value, `enum` | checked | rejected, message `outside its closed value set` |
+| 2 | element value, `boolean` | checked | rejected, `is a boolean element` |
+| 3 | element value, `declared` | checked | rejected, `is a declared element` |
+| 4 | element value, `citations` | checked | rejected, `is a citations element` |
+| 5 | element value, `user_decision` | checked | rejected, `is the authority boundary` |
+| 6 | element value, `policy_source` | **not checked** | **violation asserted ACCEPTED** |
+| 7 | `policy_source.kind` | checked | rejected, `policy_source kind` |
+| 8 | `policy_source.role` | checked | rejected, `unknown policy_source role` |
+| 9 | `policy_source.locator` shape | checked | rejected, `non-empty textual locator` |
+| 10 | `conflict_clause` | checked | rejected, `conflict_clause` |
+| 11 | `reason_code` | checked | rejected, `reason_code from the closed set` |
+| 12 | state name | checked | rejected, `unknown decision state` |
+| 13 | `user_decision.source` | checked | rejected, `not evidence of user authority` |
+| 14 | `user_decision.where_recorded` | checked | rejected, `'where_recorded' must be text` |
+| 15 | `user_decision.resolves` | checked | rejected, `'resolves' must be text` |
+| 16 | `citations` entries | checked | rejected, `citation 0 must be non-empty text` |
+| — | locator **existence** | **not checked** | **acceptance asserted** (this layer does no I/O) |
+
+**Positions classified "not checked" are pinned by asserting the violation is ACCEPTED.**
+That converts a limit from an assumption a reader might make in either direction into a
+decision on the record — and it fails if someone starts checking it without updating the
+table.
+
+**The count is guarded against a figure derived from the contract**, not the literal 16:
+one row per element kind, three for the `policy_source` object, one per `user_decision`
+field, four singletons. Adding a kind or a field fails this test until the new position has
+a row. That is the structural part: the register cannot silently go stale the way the
+per-defect tests did.
+
+### Proof: reverted copies
+
+The only evidence that a test would have caught a defect is watching it fail against that
+defect. Control first — the unmodified tree is green for the register.
+
+| fix reverted in a disposable copy | register |
+| --- | --- |
+| **FR-8** (boolean type check) | **FAILED (4)** |
+| **RI8-1** (authority value domain) | **FAILED (2)** |
+| **RI9-1** (locator shape) | **FAILED (2)** |
+| `where_recorded`/`resolves` text check | **FAILED (2)** |
+| citation entry text check | **FAILED (2)** |
+| enum membership check | **FAILED (1)** |
+| `policy_source.kind` check | **FAILED (2)** |
+| `policy_source.role` check | **FAILED (1)** |
+| `conflict_clause` check | **FAILED (2)** |
+| `_domain_defect` never called | **FAILED (9)** |
+
+**10/10 caught, control green.**
+
+### A row of mine that passed for the wrong reason
+
+The register's **first** version asserted only *"was it rejected?"* — and under a reverted
+enum check it stayed **green**. An out-of-set `reversibility` is rejected by the
+ASSUMPTION_ALLOWED entry condition whether or not the enum check exists, so the row was
+never probing the enum domain at all. Three `user_decision` rows had the same flaw: all
+three produced one generic CLEAR-grounds message that did not distinguish them.
+
+Found by reverting, not by reading — which is the whole argument for step 3 of this task.
+The fix is that **every row now anchors on the message its own rule produces**, so a
+rejection by some other rule fails the assertion. That is exactly the defect class FR-7
+named ("green but guards nothing"), reproduced inside the test written to prevent it, and
+caught before it shipped rather than three Final Reviews later.
+
+### Claims narrowed again
+
+Iteration 6 narrowed the (c)/(e) sweep verdicts to "the surface swept". Four defects
+surfaced after that, so the accurate scope is narrower still, and both tables now carry it:
+
+> **(c) and (e) were swept over the CONTRACT and the shared helpers, never over the VALUE
+> DOMAINS a declared fact may carry.** That axis had no coverage until this register.
+
+This is the second time these sentences have been narrowed. Recording it plainly: the
+original claims were wide, iteration 6's correction was still wide, and the reason both were
+wrong the same way is that a sweep's scope was described by *what it examined* while the
+verdict was written as though it covered *the subject*.
+
+### No over-blocking
+
+Every row carries a valid value, asserted to be **accepted** — 16/16. An implementation that
+refused everything would pass the negative test and fail the positive one. **18/18 valid
+fixtures** pass, counted before starting and after.
+
+### Commands after this pass
+
+| Command | Result |
+| --- | --- |
+| `python3 scripts/validate_skills.py` | **PASSED (642 checks)** — unchanged; this pass added tests, not validator checks |
+| `python3 -m unittest discover -s scripts -p 'test_*.py'` | **1469 tests OK (skipped=6)** — was 1463; the +6 are the register and **skips did not increase** |
+| `python3 scripts/verify_package.py` | **PASSED (173 source files)** |
+| `python3 scripts/build_release.py` | built `dist/orca-skills-0.9.0.tar.gz` |
+| `verify_package.py --archive …` | **PASSED (173 source files)**, archive verified |
+| `git diff --check` | clean |
+
+Untouched, verified by empty diff: `VERSION`, `LICENSE`, `skill_policy.py` (UD-3),
+`quality_profile.py`, `agent_profile.py`, **`decision_policy.py`**, both `SKILL.md`
+contracts, `templates/**` and `reviews/**`. This pass edited one test file and this
+document; no contract or evaluator semantics changed, and no new defect was found that
+would have required reporting rather than fixing.
