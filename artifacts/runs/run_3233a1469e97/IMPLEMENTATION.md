@@ -1423,3 +1423,146 @@ Untouched, verified by empty diff: `VERSION`, `LICENSE`, `skill_policy.py` (UD-3
 `quality_profile.py`, `agent_profile.py`, **both `SKILL.md` contracts**, `templates/**` and
 `reviews/**`. The contract already declared `triggering: ["reserved"]`; the code simply was
 not reading it as a domain.
+
+---
+
+## Correction — iteration 10 (RI9-1)
+
+RI8-1 was confirmed resolved and was not touched. FR-9 is a separate round and was not
+touched.
+
+### The finding, and the reasoning error behind it
+
+A `policy_source` could claim policy supports a decision while pointing nowhere:
+
+| declared | before | after |
+|---|---|---|
+| `locator` key absent | `['ASSUMPTION_ALLOWED']` | **rejected** |
+| `''` / `'   '` / `'\t'` | `['ASSUMPTION_ALLOWED']` | **rejected** |
+| `42` / `None` / `{'a':1}` / `[]` / `True` | `['ASSUMPTION_ALLOWED']` | **rejected** |
+| `'docs/x.md'`, `'OS-28#record-fields'`, `'DOMAIN-001'`, `'scripts/'` | `['ASSUMPTION_ALLOWED']` | `['ASSUMPTION_ALLOWED']` — **unchanged** |
+
+**I left this open in iterations 8 and 9 because "checking a locator needs I/O and this layer
+is a pure function". That was half right, and bundling the halves cost both:**
+
+| half | needs I/O? | now |
+|---|---|---|
+| **shape** — is there a non-empty piece of text? | **no** | **enforced** |
+| **existence** — does the cited artifact exist? | yes | not checked here, and not claimed |
+
+I treated one indivisible question where there were two. The Reviewer's split is the fix, and
+it is the second time this run that a limit I recorded as unavoidable was not.
+
+The check lives in `_validate_declared_facts`, beside `kind` and `role`, so both APIs judge it
+identically — asserted on identical input by a parity test. Whitespace is empty here for the
+same reason as in a `user_decision` (TR4-3).
+
+**Existence is recorded as not-checked, not as uncheckable**, and a test asserts that a
+locator pointing at nothing is *accepted* — so the limit is a decision on the record rather
+than something a reader must infer in either direction.
+
+### My own tests had been leaning on this fail-open
+
+Adding the check broke **97 assertions** across the suite: tests had used
+`{"role": ..., "kind": ...}` with no locator throughout. That shorthand was never a valid
+policy source — the tests were relying on exactly the gap RI9-1 reports. They now route
+through two builders so the valid shape lives in one place, and two tests that had been
+passing for the wrong reason were corrected rather than patched around:
+`test_a_determining_policy_source_permits_clear` (an incomplete source) and
+`test_role_membership_is_judged_by_the_shared_helper` (which would otherwise have failed on
+the missing locator instead of on the role it means to test).
+
+### The same lens swept across the other positions — two more found
+
+RI9-1's shape is *a checkable part bundled with an uncheckable one, and both abandoned*.
+Re-reading every text position for that shape:
+
+- **`user_decision.where_recorded` and `resolves`** were enforced as *non-empty* but not as
+  *text*, so `where_recorded: 42` passed as evidence of where a decision is written down. My
+  iteration-8 table called these "non-empty text" while only the emptiness half was checked —
+  **the claim was wider than the check.** Now enforced as text, in the shared helper.
+- **`citations`** had its count enforced but not its entries, so `[1, 2]` satisfied "at least
+  two citations". A citation names a locatable artifact; an integer cites nothing. Each entry
+  must now be non-empty text.
+
+**`repository_project_policy` re-examined and still open, reason restated:** no declared
+domain, `triggering` is `null` so no value can make it fire, and **no reason code binds it** —
+so no value it could carry changes any decision. Its machine-checkable half is the
+`policy_source` object, whose kind, role and now locator are all enforced. A test pins all
+three facts.
+
+### The 16 positions, with "not checked" and "cannot be checked" kept apart
+
+| # | position | checked | not checked at this layer |
+|---|---|---|---|
+| 1 | element value, `enum` | membership in `values` | — |
+| 2 | element value, `boolean` | is a Python `bool` | — |
+| 3 | element value, `declared` | is a Python `bool` | — |
+| 4 | element value, `citations` | is a list/tuple | — |
+| 5 | element value, `user_decision` | membership in `triggering` | — |
+| 6 | element value, `policy_source` | nothing — and nothing can matter | cannot fire; binds no reason code |
+| 7 | `policy_source.kind` | membership in closed set | — |
+| 8 | `policy_source.role` | membership in closed set | — |
+| 9 | `policy_source.locator` | **non-empty text (shape)** | that the target **exists** (I/O) |
+| 10 | `conflict_clause` | membership in `entry_clauses` | — |
+| 11 | `reason_code` | membership in closed set | — |
+| 12 | state name | one of the four | — |
+| 13 | `user_decision.source` | membership in allowlist | — |
+| 14 | `user_decision.where_recorded` | **non-empty text** | that the target **exists** (I/O) |
+| 15 | `user_decision.resolves` | **non-empty text** | whether it truly resolves (judgement) |
+| 16 | `citations` | count ≥ minimum, **each entry non-empty text** | that each cites a real artifact (I/O) |
+
+**15 of 16 carry a check**, each verified by a probe that must be rejected (15/15 verified);
+the sixteenth is inert by construction. **Every remaining gap is an I/O or judgement
+question, named as such — none is a shape that could have been checked here and was not.**
+
+### No over-blocking
+
+| property | result |
+|---|---|
+| the four locators the shipped fixtures carry | all still pass |
+| `'docs/x.md'`, `' padded/but/real.md '` | pass |
+| **18/18 valid fixtures** | pass, counted before and after |
+
+### Mutations — control verified green first
+
+| # | Mutation | Result |
+|---|---|---|
+| L-0 | control | **green** |
+| L-1 | locator check removed — **the RI9-1 defect** | CAUGHT |
+| L-2 | presence only, emptiness unchecked | CAUGHT |
+| L-3 | any type accepted if non-empty | CAUGHT |
+| L-4 | user_decision text check removed | CAUGHT |
+| L-5 | citation text check removed | CAUGHT |
+| L-6 | **over-block probe**: every locator rejected | CAUGHT |
+| L-7 | **over-block probe**: declaring no `policy_source` made illegal | CAUGHT |
+
+**7/7 CAUGHT.**
+
+### Regression
+
+**13/13 intact** — FR-1 (both edges), FR-2, FR-3, FR-4, RI3-1, FR-5, FR-6, FR-8, RI8-1,
+RI9-1, TR4-1, TR4-2, TR4-3 — with **5/5 positive controls**.
+
+### A probe artifact, caught by its own control
+
+The first citations sweep reported DIFFER on every row **including the all-valid control** —
+which is what exposed it. `permitted_states` reads `conflict_clause` while the record derives
+its clause from the reason code, so the two were being asked different questions. The finding
+underneath (integer citations accepted) was real and is fixed; the divergence was not. This
+is why every negative sweep in this run carries a positive control.
+
+### Commands
+
+| Command | Result |
+|---|---|
+| `python3 scripts/validate_skills.py` | **PASSED (642 checks)** — unchanged; no contract edit was needed |
+| `python3 -m unittest discover -s scripts -p 'test_*.py'` | **1463 tests OK (skipped=6)** — was 1454; the +9 are the RI9-1 and sweep tests and **skips did not increase** |
+| `python3 scripts/verify_package.py` | **PASSED (173 source files)** |
+| `python3 scripts/build_release.py` | built `dist/orca-skills-0.9.0.tar.gz` |
+| `verify_package.py --archive …` | **PASSED (173 source files)**, archive verified |
+| `git diff --check` | clean |
+
+Untouched, verified by empty diff: `VERSION`, `LICENSE`, `skill_policy.py` (UD-3),
+`quality_profile.py`, `agent_profile.py`, **both `SKILL.md` contracts**, `templates/**` and
+`reviews/**`.

@@ -816,8 +816,9 @@ so giving them one would be **new design**, not enforcement of the approved spec
   accepted.
 - `repository_project_policy` (kind `policy_source`) declares no domain either. The
   `policy_source` **object**'s `role` and `kind` are separately closed sets and are checked
-  (TR4-1); A4-1 row 10 also calls the cited path's *existence* checkable, which this contract
-  layer does not do because it performs no I/O. **Recorded as a known limit.**
+  (TR4-1); ~~A4-1 row 10 also calls the cited path's *existence* checkable, which this
+  contract layer does not do because it performs no I/O.~~ **That bundled the locator's
+  shape with its existence and abandoned both; the shape is now enforced — see D2-2i.**
 
 **`conflict_clause` gained a check** because the contract *does* declare its domain, in
 `entry_clauses.CONFLICT`. An unknown clause is now rejected instead of quietly making an item
@@ -868,15 +869,88 @@ changes no decision. The boundary it names is enforced through the `policy_sourc
 whose `role` and `kind` are both closed sets and both checked (TR4-1). Closing it would mean
 inventing a value list the contract does not declare, to guard an outcome that cannot occur.
 
-**Why the locator stays open.** A4-1 row 10 calls the cited path's *existence* checkable, and
-it is — but by something that performs I/O. This contract layer is a pure function of
-(contract, declared facts); adding a filesystem read here would change what the layer is.
-Recorded as belonging to a layer that does I/O, not as an accepted silent gap.
+**Why the locator stays open.** ~~A4-1 row 10 calls the cited path's *existence* checkable,
+and it is — but by something that performs I/O.~~ **Superseded by D2-2i.** Only the
+*existence* half needs I/O; the *shape* — non-empty text — needs none and is now enforced.
+Writing "the locator stays open" treated one indivisible question where there were two.
 
 **The rule that now covers every element kind:** a domain is closed wherever the contract
 declares one, by reading what it declares — `values` for `enum`, the kind itself for
 `boolean` and `declared`, the shape for `citations`, and `triggering` for `user_decision`.
 Only `policy_source` remains open, with the reason above.
+
+
+
+#### D2-2i. Shape and existence are different checks (RI9-1)
+
+**The finding.** A `policy_source` could claim policy supports a decision while pointing
+nowhere: a missing `locator`, `""`, `"   "`, `42`, or `null` all returned
+`ASSUMPTION_ALLOWED`. That defeats the ticket's requirement that an automatic decision
+**records the policy it applied** — the record asserted a source and cited none.
+
+**The reasoning error, named plainly.** Iterations 8 and 9 left this open because "checking a
+locator needs I/O and this layer is a pure function". That is half right, and bundling the
+halves cost both:
+
+| half | needs I/O? | status |
+|---|---|---|
+| **shape** — is there a non-empty piece of text? | **no** | **enforced** |
+| **existence** — does the cited artifact exist? | yes | not checked here, and not claimed |
+
+I treated one indivisible question where there were two. The Reviewer's split is the fix.
+
+**What is enforced.** A declared `policy_source` must carry a `locator` that is a string and
+non-empty after stripping — whitespace is empty for the same reason it is in a
+`user_decision` (TR4-3): three spaces point nowhere. It lives in `_validate_declared_facts`,
+beside `kind` and `role`, so both APIs judge it identically.
+
+**What is not, and why the phrasing matters.** Existence is *not checked here*; it is **not**
+*uncheckable*. It is checkable by a layer that does I/O, and this layer is a pure function of
+(contract, declared facts). A test asserts that a locator pointing at nothing is accepted, so
+the limit is a recorded decision rather than something a reader has to infer.
+
+**The same lens, swept across the other positions — two more found.** RI9-1's shape is "a
+checkable part bundled with an uncheckable one, and both abandoned":
+
+- **`user_decision.where_recorded` and `resolves`** were enforced as *non-empty* but not as
+  *text*, so `where_recorded: 42` passed as evidence of where a decision is written down. My
+  iteration-8 table described these as "non-empty text" while only the emptiness half was
+  checked — the claim was wider than the check. **Now enforced as text.**
+- **`citations`** had its count enforced but not its entries, so `[1, 2]` satisfied "at least
+  two citations". A citation names a locatable artifact; an integer cites nothing. **Now each
+  entry must be non-empty text.** Whether the cited artifact exists remains an I/O question.
+
+**`repository_project_policy` re-examined and still open — reason restated, not repeated.**
+It has no declared domain, its `triggering` is `null` so no value can make it fire, and **no
+reason code binds it**. No value it could carry changes any decision, so there is nothing for
+a shape check to protect. Its machine-checkable half is the `policy_source` **object**, whose
+`kind`, `role` and now `locator` are all enforced. A test pins all three facts so this stays
+a decision rather than an oversight.
+
+**Final state — 16 value positions, with "not checked" and "cannot be checked" kept apart:**
+
+| # | position | checked | not checked at this layer |
+|---|---|---|---|
+| 1 | element value, `enum` | membership in `values` | — |
+| 2 | element value, `boolean` | is a Python `bool` | — |
+| 3 | element value, `declared` | is a Python `bool` | — |
+| 4 | element value, `citations` | is a list/tuple | — |
+| 5 | element value, `user_decision` | membership in `triggering` | — |
+| 6 | element value, `policy_source` | nothing — and nothing can matter | cannot fire; binds no reason code |
+| 7 | `policy_source.kind` | membership in closed set | — |
+| 8 | `policy_source.role` | membership in closed set | — |
+| 9 | `policy_source.locator` | **non-empty text (shape)** | that the target **exists** (I/O) |
+| 10 | `conflict_clause` | membership in `entry_clauses` | — |
+| 11 | `reason_code` | membership in closed set | — |
+| 12 | state name | one of the four | — |
+| 13 | `user_decision.source` | membership in allowlist | — |
+| 14 | `user_decision.where_recorded` | **non-empty text** | that the target **exists** (I/O) |
+| 15 | `user_decision.resolves` | **non-empty text** | whether it truly resolves (judgement) |
+| 16 | `citations` | count ≥ minimum, **each entry non-empty text** | that each cites a real artifact (I/O) |
+
+**15 of 16 positions now carry a check**, each verified by a probe that must be rejected; the
+sixteenth is inert by construction. Every remaining gap is an **I/O or judgement** question,
+named as such — none is a shape that could have been checked here and was not.
 
 
 #### D2-3. What the loader deliberately does not do
