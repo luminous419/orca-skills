@@ -551,6 +551,147 @@ findings, the before/after probe output, the two-axis sweep, and the positive co
 
 Commits: `fa3a935` (contract, loader, validator, tests), `8f9c80c` (DESIGN). Not pushed.
 
+## Correction — iteration 4 (RI3-1: authority precedence)
+
+FR-3 was confirmed RESOLVED and is untouched. FR-1, FR-2 and FR-3 are all verified intact.
+
+### The defect — predicates evaluated independently
+
+Each predicate was **correct alone and wrong in combination**. Reproduced before any change:
+
+```text
+reserved alone                -> ['NEEDS_INPUT']           correct
+reserved + determining policy -> ['CLEAR']                 WRONG, expected ['NEEDS_INPUT']
+C-1 alone                     -> ['CONFLICT']              correct
+C-1 + determining policy      -> ['CLEAR', 'CONFLICT']     WRONG, expected ['CONFLICT']
+```
+
+### Where precedence went, and how
+
+ANALYSIS A4-0 already names exactly two cells a determining policy source cannot resolve — *"a
+policy source cannot un-reserve it → `NEEDS_INPUT`"* and *"a policy source cannot arbitrate two
+explicit requirements → `CONFLICT`"*. Transcribed, not redesigned, into contract data:
+
+```json
+"authority_precedence": {"policy_source_cannot_resolve": ["explicit_user_authority", "explicit_requirement_conflict"]}
+```
+
+Both names are existing `boundary_elements` entries, so the loader rejects an unknown one. The
+evaluator applies the rule in **one** place, and `validate_skills.py` pins the list by value (C31).
+
+**The rule had to be stated on both sides, and finding that was the real work.** Applying it only to
+`determining_policy_source` removed `CLEAR` correctly but left `undetermined_boundary_element` still
+treating a determining source as resolving the item — so the reserved case returned an **empty set**.
+That is the same "right alone, wrong together" shape RI3-1 reported, one predicate over, and my own
+expected-value check caught it. Two further refinements followed from the same reading:
+
+- `no_open_decision_item` now follows A3-1's actual wording — a triggering element or a declared
+  contradiction **is** an open decision item, so asserting `open_decision_item: false` beside one of
+  them is self-contradictory and must not reach `CLEAR`.
+- `declared_contradiction` yields to a valid user decision, symmetric with
+  `undetermined_boundary_element`, because A4-0 gives **one** destination per cell rather than
+  leaving the unresolved state simultaneously permitted.
+
+### Before / after
+
+| facts | before | after |
+|---|---|---|
+| reserved + determining policy | `['CLEAR']` | **`['NEEDS_INPUT']`** |
+| C-1 + determining policy | `['CLEAR','CONFLICT']` | **`['CONFLICT']`** |
+| C-2 / C-3 + determining policy | `['CLEAR','CONFLICT']` | **`['CONFLICT']`** |
+| C-1/2/3 + allowlisted authorization | `['CLEAR','CONFLICT']` | **`['CLEAR']`** |
+| open=false + triggered element | `['CLEAR','NEEDS_INPUT']` | **`['NEEDS_INPUT']`** |
+| open=false + contradiction | `['CLEAR','CONFLICT']` | **`['CONFLICT']`** |
+
+### Combination sweep — what I ran and what I found
+
+Every triggering element × every CONFLICT clause × every pair of the two × five resolver states
+(none / determining / supporting / allowlisted / forbidden) = **105 combinations**, executed.
+
+The brief's specific list, all now matching A4-0: reserved + supporting → `NEEDS_INPUT`; reserved +
+allowlisted → `CLEAR`; reserved + forbidden → `NEEDS_INPUT`; each of C-1/C-2/C-3 + determining →
+`CONFLICT`, + allowlisted → `CLEAR`; high-impact + determining → `CLEAR` (A4-0's row for
+monetary/security/privacy/compliance/lock-in, and for irreversible, is `→ CLEAR` with a determining
+source, so this is correct rather than a leak); `open_decision_item: false` + anything open → the
+open item's state.
+
+**A result I first mis-scored, and the correction.** The sweep flagged **36 mismatches**, all one
+case: a triggered element *and* a contradiction together yield `{NEEDS_INPUT, CONFLICT}` while my
+expectation said `{CONFLICT}`. Investigating rather than "fixing" it: **my expectation was wrong.**
+A3-1 makes `NEEDS_INPUT` *missing* information and `CONFLICT` *contradictory* information — different
+decision items — and OQ-1 settled that state is per **item** with a per-check aggregate, so
+`aggregate_order` (`CONFLICT` first) reduces a multi-item check to one reported state. Both are
+pausing states, so nothing is weakened. Re-run with the corrected expectation: **0 mismatches.**
+
+The safety-relevant invariant across all 105: **0 leaks** — no combination permits a continuing state
+without a valid resolver. It is now a permanent test,
+`test_no_combination_permits_a_continuing_state_without_a_resolver`, with a co-located cardinality
+guard.
+
+### Positive controls — the anti-over-blocking half
+
+| control | result |
+|---|---|
+| determining policy resolves all **7** ordinary elements (security, privacy, compliance, monetary_cost, long_term_lock_in, ambiguity, reversibility, blast_radius) | `['CLEAR']` each |
+| allowlisted authorization resolves **both** precedence cells and all three clauses | `['CLEAR']` each |
+| `open_decision_item: false` alone | `['CLEAR']` |
+| safe supporting-policy item | `['ASSUMPTION_ALLOWED']` |
+| a declared item always permits **something** | asserted for all 105 |
+
+The 7-element control carries a D4-F guard asserting it equals *every triggering element minus the
+two A4-0 excludes*, so the control cannot silently shrink.
+
+### Empty facts — judged, and now documented
+
+`permitted_states(policy, {})` returns `frozenset()`. **Deliberate fail-closed behaviour, not an
+oversight.** A3-1 admits `CLEAR` on three grounds and the first is *affirmative* — "no decision item
+is open". A caller that declared nothing has not asserted that; it asserted nothing. Returning
+`CLEAR` for silence would make **the absence of analysis indistinguishable from a clean result**,
+which is exactly what this contract exists to prevent, and it is the same reasoning that makes the
+loader raise rather than return `None`. Reaching `CLEAR` requires stating `open_decision_item: false`
+— a claim someone can be held to. Recorded in DESIGN **D2-2c** and pinned by
+`test_undeclared_facts_permit_nothing_by_design`.
+
+### Mutation verification — 7/7 caught, control green
+
+| id | mutation | verdict |
+|---|---|---|
+| R-0 | *(control)* none | **green** |
+| R-1 | precedence list emptied — **restores the RI3-1 defect** | CAUGHT |
+| R-2 | reserved-authority cell dropped | CAUGHT |
+| R-3 | conflict cell dropped | CAUGHT |
+| R-4 | precedence bar removed from `determining_policy_source` | CAUGHT |
+| R-5 | mirror rule removed from `undetermined_boundary_element` | CAUGHT |
+| R-6 | `no_open_decision_item` refinement removed | CAUGHT |
+| R-7 | `declared_contradiction` ignores a user decision | CAUGHT |
+
+R-4 through R-7 are caught **only by the loader tests** (validator passes); R-1/R-2/R-3 by all three.
+That split is why I read these as real detections. The harness does literal substitution only, aborts
+unless its target appears exactly once, and aborts rather than scoring an `ImportError` as detection.
+
+### Commands after the correction
+
+| command | result |
+|---|---|
+| `python3 scripts/validate_skills.py` | **PASSED (642 checks)** — was 640 |
+| `python3 -m unittest discover -s scripts -p 'test_*.py'` | **Ran 1399 tests in 302.533s — OK (skipped=6)** — was 1384 |
+| `python3 scripts/verify_package.py` | **PASSED (173 source files)** |
+| `python3 scripts/build_release.py` | built `dist/orca-skills-0.9.0.tar.gz` |
+| `python3 scripts/verify_package.py --archive …` | **PASSED (173 source files); Verified archive** |
+| `git diff --check` | no output |
+
+Skips unchanged at 6. Protected-surface diff is **empty**. FR-1's matrix constants, FR-2's
+`user_decision_sources`, and FR-3's code-element equality are all still present.
+
+### DESIGN.md updated in the same round
+
+D1-1 gains `authority_precedence`; D3 gains C31; the state-selection partition gains the new key; new
+section **D2-2c** records the finding, the A4-0 transcription, the both-sides requirement, the
+105-combination sweep including the 36 I mis-scored and why, the positive controls, and the
+empty-facts reasoning.
+
+Commits: `ca42872` (contract, loader, validator, tests), `8cc5484` (DESIGN). Not pushed.
+
 ## Review Feedback Resolution
 
 Iteration 1 of IMPLEMENTATION. No prior IMPLEMENTATION Reviewer findings.
