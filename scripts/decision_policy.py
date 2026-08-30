@@ -775,6 +775,110 @@ def permitted_states(
     )
 
 
+def _grounds_defect(
+    policy: DecisionPolicy, state: str, code: ReasonCode | None, record: Mapping[str, Any]
+) -> str | None:
+    """FR-6. Does the record's DECLARED EVIDENCE actually justify the state it claims?
+
+    Returns the reason it does not, or None when it does.
+
+    validate_record() checked the reason code, the state, the required fields and the
+    boundary element's NAME -- FR-3 made that name an exact match -- but never the
+    VALUE behind the name. So `security_impact` filed with `security: false`, and
+    `irreversible_action` filed with `reversibility: reversible_in_run`, were both
+    accepted: a `pause_and_ask` record for a boundary that never fired, and no way for
+    a Reviewer to reject the misclassification from the machine-readable contract.
+    That is the ticket's "exact entry condition per state" and "how a Reviewer judges
+    misclassification" both unmet.
+
+    Nothing here is new policy. A4-1 already fixed the triggering values, A3-1 and
+    A3-1a already fixed the entry conditions and the N-/C- clauses, and the triggering
+    test is `_element_is_triggering` -- the SAME helper `permitted_states()` reaches
+    through `_evaluate_predicate`, so the two cannot answer "did this element fire?"
+    differently. What was missing was reading it on this path at all.
+
+    The rule is stated per state because the four states declare their evidence in
+    different shapes, which is why one blanket entry-condition call does not fit: it
+    rejects six shipped valid fixtures, and over-blocking is a regression, not a fix.
+    """
+
+    if state == "CLEAR":
+        # A CLEAR record need not carry grounds at all -- required_evidence[CLEAR] is
+        # empty and UD-1 keeps the whole section optional. But grounds that ARE
+        # declared have to be the grounds A3-1 accepts: a determining policy source, a
+        # genuine authorization, or nothing open. A supporting-only source, a
+        # source-only user_decision, or a forbidden authority source were all accepted
+        # before, each of which is a claim of CLEAR the evaluator would refuse.
+        declared = [
+            key
+            for key in ("policy_source", "user_decision", "open_decision_item")
+            if key in record
+        ]
+        if not declared:
+            return None
+        defect = _entry_condition_defect(policy, "CLEAR", record)
+        if defect is not None:
+            return (
+                f"CLEAR declares {sorted(declared)} as grounds, but they do not "
+                f"satisfy the CLEAR entry condition -- {defect}"
+            )
+        return None
+
+    if code is None:
+        return None
+
+    if state == "NEEDS_INPUT" and code.boundary_element is not None:
+        element = code.boundary_element
+        spec = policy.boundary_elements[element]
+        if spec.kind == "declared":
+            # A4-1 row 1: for a `declared` element, naming it in `boundary_element`
+            # IS the declaration -- there is no separate value to carry, and the two
+            # shipped ambiguity fixtures carry none. Only a value that IS present and
+            # is non-triggering can be wrong here.
+            if element in record and not _element_is_triggering(spec, record[element]):
+                return (
+                    f"reason code {code.name} declares boundary element {element!r}, "
+                    f"but the record declares {record[element]!r}, which does not "
+                    f"make it true"
+                )
+            return None
+        if element not in record:
+            return (
+                f"reason code {code.name} rests on boundary element {element!r}, but "
+                f"the record does not declare it; a pause cannot rest on an element "
+                f"the record never asserts"
+            )
+        if not _element_is_triggering(spec, record[element]):
+            return (
+                f"reason code {code.name} rests on boundary element {element!r}, but "
+                f"the record declares {record[element]!r}, which is not a triggering "
+                f"value ({_triggering_text(spec)}) -- the boundary did not fire"
+            )
+        return None
+
+    if state == "CONFLICT" and code.clause is not None:
+        # A3-1a fixed three distinct clauses. The citation minimum is enforced above;
+        # what was missing is that a record could name a DIFFERENT clause than the one
+        # its reason code binds, so C-1 evidence could be filed under a C-3 code.
+        declared_clause = record.get("conflict_clause")
+        if declared_clause is not None and declared_clause != code.clause:
+            return (
+                f"reason code {code.name} rests on clause {code.clause}, but the "
+                f"record declares clause {declared_clause!r}"
+            )
+        return None
+
+    return None
+
+
+def _triggering_text(spec: BoundaryElement) -> str:
+    if spec.triggering == "at_minimum":
+        return f"at least {spec.minimum} citations"
+    if isinstance(spec.triggering, (list, tuple)):
+        return f"one of {list(spec.triggering)}"
+    return f"{spec.triggering!r}"
+
+
 def validate_record(policy: DecisionPolicy, record: Mapping[str, Any]) -> None:
     """Validate one decision record against the contract. Raises on any violation."""
 
@@ -858,6 +962,12 @@ def validate_record(policy: DecisionPolicy, record: Mapping[str, Any]) -> None:
         # permitted_states(), so the two cannot answer this differently again.
         defect = _entry_condition_defect(policy, "ASSUMPTION_ALLOWED", record)
         _require(defect is None, defect or "")
+
+    # FR-6: and for EVERY state, the declared evidence must actually justify it. The
+    # ASSUMPTION_ALLOWED branch above is the case that was already covered; this is
+    # the same question asked of the other three.
+    grounds = _grounds_defect(policy, str(state), code, record)
+    _require(grounds is None, grounds or "")
 
 
 def validate_transition(

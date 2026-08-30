@@ -19,6 +19,7 @@ from pathlib import Path
 from scripts.decision_policy import (
     AXIS_TOKENS,
     _validate_declared_facts,
+    _element_is_triggering,
     ENTRY_PREDICATES,
     _evaluate_predicate,
     CANONICAL_INDEPENDENT_AXES,
@@ -1802,17 +1803,34 @@ class FactReadingApisShareEveryRule(DecisionPolicyTestCase):
 
         return frozenset(walk(name, set()) & set(functions)) - {name}
 
+    #: Rules validate_record() reaches that permitted_states() legitimately does not.
+    #: These judge a RECORD -- whether its declared evidence justifies the state it
+    #: claims -- which the evaluator cannot ask, having neither a reason code nor a
+    #: claimed state. The set is pinned by name rather than allowed as a blanket
+    #: asymmetry, so adding a rule here is a deliberate edit that shows in the diff
+    #: instead of silently reopening the gap TR4-1 closed.
+    RECORD_ONLY_RULES = frozenset({"_grounds_defect", "_triggering_text"})
+
     def test_both_fact_reading_apis_reach_the_same_helpers(self) -> None:
         evaluator = self._closure("permitted_states")
         validator = self._closure("validate_record")
         # D4-F guard: the closure must be non-trivial, or equality is vacuous.
         self.assertGreaterEqual(len(evaluator), 6)
+        # The direction that matters, kept absolute: a rule about declared FACTS must
+        # never be reachable from the evaluator alone. That is the TR4-1 shape.
         self.assertEqual(
-            evaluator,
-            validator,
-            "permitted_states() and validate_record() no longer share every rule; a "
-            "judgement reachable from only one of them is how FR-5, TR4-1 and TR4-2 "
-            "each began",
+            evaluator - validator,
+            frozenset(),
+            "a rule is reachable from permitted_states() but not validate_record(); "
+            "that is how FR-5, TR4-1 and TR4-2 each began",
+        )
+        # And the other direction is bounded by the named list above, so a new
+        # one-sided rule fails here even though the legitimate ones are admitted.
+        self.assertEqual(
+            validator - evaluator,
+            self.RECORD_ONLY_RULES,
+            "validate_record() reaches a rule that is neither shared with the "
+            "evaluator nor declared as a record-only rule",
         )
 
     def test_the_evaluator_delegates_every_judgement(self) -> None:
@@ -1888,6 +1906,153 @@ class FactReadingApisShareEveryRule(DecisionPolicyTestCase):
         ):
             with self.subTest(helper=helper):
                 self.assertIn(helper, shared)
+
+
+class Fr6DeclaredEvidenceMustJustifyTheState(DecisionPolicyTestCase):
+    """FR-6. validate_record() checked the reason code, the state, the required fields
+    and the boundary element's NAME -- FR-3 made that name an exact match -- but never
+    the VALUE behind the name. `security_impact` filed with `security: false` was
+    accepted: a pause_and_ask record for a boundary that never fired, and no way for a
+    Reviewer to reject the misclassification from the machine-readable contract.
+
+    The triggering test is `_element_is_triggering`, the same helper permitted_states()
+    reaches through `_evaluate_predicate`, so the two cannot answer "did this element
+    fire?" differently.
+    """
+
+    #: The eight variants reproduced against the shipped fixtures, each flipping the
+    #: element its reason code rests on to a value that does NOT fire.
+    NON_TRIGGERING = (
+        ("security_impact", "security", False),
+        ("privacy_impact", "privacy", False),
+        ("monetary_cost", "monetary_cost", False),
+        ("compliance_impact", "compliance", False),
+        ("long_term_lock_in", "long_term_lock_in", False),
+        ("irreversible_action", "reversibility", "reversible_in_run"),
+        ("blast_radius_beyond_scope", "blast_radius", "current_change"),
+        ("authority_reserved_to_user", "explicit_user_authority", "delegated"),
+    )
+
+    def _rejects(self, record) -> bool:
+        return error_of(validate_record, self.policy, record) != ""
+
+    def test_a_non_triggering_boundary_value_is_rejected(self) -> None:
+        # D4-F guard, co-located: the enumeration must not shrink silently.
+        self.assertEqual(len(self.NON_TRIGGERING), 8)
+        checked = 0
+        for fixture, element, value in self.NON_TRIGGERING:
+            with self.subTest(fixture=fixture):
+                record = dict(load_fixture(f"valid/{fixture}.json"))
+                record[element] = value
+                self.assertTrue(
+                    self._rejects(record),
+                    f"{fixture} was accepted with {element}={value!r}, a boundary "
+                    "that never fired",
+                )
+                checked += 1
+        self.assertEqual(checked, 8)
+
+    def test_every_shipped_valid_fixture_still_passes(self) -> None:
+        """POSITIVE CONTROL, and the anti-over-blocking guard. Refusing more is not a
+        fix if it refuses records the contract calls valid."""
+        directory = FIXTURES / "valid"
+        fixtures = sorted(directory.glob("*.json"))
+        # D4-F guard: all eighteen, or the loop is not proving what it claims.
+        self.assertEqual(len(fixtures), 18)
+        for path in fixtures:
+            with self.subTest(fixture=path.stem):
+                self.assertEqual(
+                    error_of(validate_record, self.policy, load_fixture(f"valid/{path.name}")),
+                    "",
+                )
+
+    def test_the_boundary_element_must_be_declared_at_all(self) -> None:
+        """Omitting the element is the same defect as declaring it false: a pause
+        cannot rest on an element the record never asserts."""
+        for fixture, element, _ in self.NON_TRIGGERING:
+            with self.subTest(fixture=fixture):
+                record = {
+                    key: value
+                    for key, value in load_fixture(f"valid/{fixture}.json").items()
+                    if key != element
+                }
+                self.assertTrue(self._rejects(record))
+
+    def test_a_code_binding_no_boundary_element_is_still_accepted(self) -> None:
+        """The deliberate exception: `unclassifiable_decision` binds no element, and
+        `ambiguity` is declared BY being named (A4-1 row 1), so neither carries a
+        separate value to check."""
+        self.assertFalse(self._rejects(load_fixture("valid/unclassifiable_decision.json")))
+        self.assertFalse(self._rejects(load_fixture("valid/ambiguous_requirement.json")))
+        self.assertFalse(self._rejects(load_fixture("valid/missing_user_intent.json")))
+        # But a value that IS present and false is still wrong.
+        record = dict(load_fixture("valid/ambiguous_requirement.json"))
+        record["ambiguity"] = False
+        self.assertTrue(self._rejects(record))
+
+    def test_clear_grounds_must_satisfy_the_clear_entry_condition(self) -> None:
+        """Requirement 4. Declared grounds are judged; declaring none stays valid,
+        because required_evidence[CLEAR] is empty and UD-1 keeps the section
+        optional."""
+        self.assertEqual(self.policy.required_evidence["CLEAR"], ())
+        good = (
+            {"state": "CLEAR"},
+            {"state": "CLEAR", "open_decision_item": False},
+            {"state": "CLEAR", "policy_source": {"role": "determines", "kind": "file_path"}},
+            {"state": "CLEAR", "user_decision": complete_decision()},
+        )
+        bad = (
+            {"state": "CLEAR", "policy_source": {"role": "supports", "kind": "file_path"}},
+            {"state": "CLEAR", "user_decision": {"source": "explicit_user_reply"}},
+            {"state": "CLEAR", "user_decision": complete_decision("timeout")},
+        )
+        # D4-F guards, co-located.
+        self.assertEqual((len(good), len(bad)), (4, 3))
+        for record in good:
+            with self.subTest(good=sorted(record)):
+                self.assertFalse(self._rejects(record))
+        for record in bad:
+            with self.subTest(bad=sorted(record)):
+                self.assertTrue(self._rejects(record))
+
+    def test_a_conflict_record_may_not_declare_another_codes_clause(self) -> None:
+        """Requirement 3. A3-1a fixed three distinct clauses; filing C-1 evidence
+        under a C-3 code is a misclassification the contract can now reject."""
+        base = {
+            "state": "CONFLICT",
+            "reason_code": "requirement_contradiction",
+            "citations": ["OS-28#req-a", "OS-28#req-b"],
+            "why_they_cannot_both_hold": "satisfying either falsifies the other",
+        }
+        clauses = list(self.policy.entry_clauses["CONFLICT"])
+        # D4-F guard.
+        self.assertEqual(len(clauses), 3)
+        own = self.policy.reason_codes["requirement_contradiction"].clause
+        self.assertFalse(self._rejects(base))  # positive: declaring none is fine
+        self.assertFalse(self._rejects({**base, "conflict_clause": own}))
+        for clause in clauses:
+            if clause == own:
+                continue
+            with self.subTest(clause=clause):
+                self.assertTrue(self._rejects({**base, "conflict_clause": clause}))
+
+    def test_the_triggering_test_is_the_evaluators_own(self) -> None:
+        """Parity, on identical input: for each element the evaluator treats as
+        triggering, a record resting on it is accepted, and vice versa. The two must
+        not develop separate opinions about what 'fired' means."""
+        checked = 0
+        for fixture, element, non_triggering in self.NON_TRIGGERING:
+            with self.subTest(element=element):
+                spec = self.policy.boundary_elements[element]
+                record = dict(load_fixture(f"valid/{fixture}.json"))
+                fired = _element_is_triggering(spec, record[element])
+                self.assertTrue(fired)
+                self.assertFalse(self._rejects(record))
+                record[element] = non_triggering
+                self.assertFalse(_element_is_triggering(spec, non_triggering))
+                self.assertTrue(self._rejects(record))
+                checked += 1
+        self.assertEqual(checked, 8)
 
 
 if __name__ == "__main__":  # pragma: no cover
