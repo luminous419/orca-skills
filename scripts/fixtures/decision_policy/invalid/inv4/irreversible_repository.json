@@ -1,0 +1,13 @@
+{
+  "state": "ASSUMPTION_ALLOWED",
+  "reason_code": "repository_policy",
+  "policy_source": {
+    "kind": "file_path",
+    "locator": "scripts/",
+    "role": "supports"
+  },
+  "impact": "repository",
+  "retraction_condition": "n/a",
+  "reversibility": "irreversible",
+  "blast_radius": "repository"
+}

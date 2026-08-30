@@ -1,0 +1,276 @@
+{
+  "state_scope": "per_decision_item_with_derived_check_aggregate",
+  "aggregate_order": [
+    "CONFLICT",
+    "NEEDS_INPUT",
+    "ASSUMPTION_ALLOWED",
+    "CLEAR"
+  ],
+  "states": {
+    "CLEAR": {
+      "workflow": "continue",
+      "user_decision_required": false,
+      "reason_code_required": false
+    },
+    "ASSUMPTION_ALLOWED": {
+      "workflow": "continue_and_review",
+      "user_decision_required": false,
+      "reason_code_required": true
+    },
+    "NEEDS_INPUT": {
+      "workflow": "pause_and_ask",
+      "user_decision_required": true,
+      "reason_code_required": true
+    },
+    "CONFLICT": {
+      "workflow": "pause_and_request_resolution",
+      "user_decision_required": true,
+      "reason_code_required": true
+    }
+  },
+  "transitions": {
+    "CLEAR": {
+      "CLEAR": "allowed",
+      "ASSUMPTION_ALLOWED": "allowed",
+      "NEEDS_INPUT": "allowed",
+      "CONFLICT": "allowed"
+    },
+    "ASSUMPTION_ALLOWED": {
+      "CLEAR": "requires_retraction",
+      "ASSUMPTION_ALLOWED": "allowed",
+      "NEEDS_INPUT": "allowed",
+      "CONFLICT": "allowed"
+    },
+    "NEEDS_INPUT": {
+      "CLEAR": "requires_user_decision",
+      "ASSUMPTION_ALLOWED": "forbidden",
+      "NEEDS_INPUT": "allowed",
+      "CONFLICT": "allowed"
+    },
+    "CONFLICT": {
+      "CLEAR": "requires_user_decision",
+      "ASSUMPTION_ALLOWED": "forbidden",
+      "NEEDS_INPUT": "allowed",
+      "CONFLICT": "allowed"
+    }
+  },
+  "downstream_rule": "an unresolved NEEDS_INPUT or CONFLICT item may not be reported CLEAR by a later phase",
+  "entry_clauses": {
+    "NEEDS_INPUT": {
+      "N-1": "a boundary element is true, is not determined by a policy source, and is not decided by an explicit authorization",
+      "N-2": "required user intent is absent",
+      "N-3": "the item crosses the autonomy boundary but cannot be classified under these closed vocabularies"
+    },
+    "CONFLICT": {
+      "C-1": "two or more explicit requirements are contradictory",
+      "C-2": "an explicit requirement contradicts an already-accepted decision of this run",
+      "C-3": "an explicit requirement contradicts a non-overridable project invariant"
+    }
+  },
+  "reason_codes": {
+    "repository_policy": {
+      "state": "ASSUMPTION_ALLOWED"
+    },
+    "explicit_requirement": {
+      "state": "ASSUMPTION_ALLOWED"
+    },
+    "phase_contract": {
+      "state": "ASSUMPTION_ALLOWED"
+    },
+    "quality_profile_attribute": {
+      "state": "ASSUMPTION_ALLOWED"
+    },
+    "ambiguous_requirement": {
+      "state": "NEEDS_INPUT",
+      "clause": "N-1",
+      "boundary_element": "ambiguity"
+    },
+    "missing_user_intent": {
+      "state": "NEEDS_INPUT",
+      "clause": "N-2",
+      "boundary_element": "ambiguity"
+    },
+    "irreversible_action": {
+      "state": "NEEDS_INPUT",
+      "clause": "N-1",
+      "boundary_element": "reversibility"
+    },
+    "blast_radius_beyond_scope": {
+      "state": "NEEDS_INPUT",
+      "clause": "N-1",
+      "boundary_element": "blast_radius"
+    },
+    "monetary_cost": {
+      "state": "NEEDS_INPUT",
+      "clause": "N-1",
+      "boundary_element": "monetary_cost"
+    },
+    "security_impact": {
+      "state": "NEEDS_INPUT",
+      "clause": "N-1",
+      "boundary_element": "security"
+    },
+    "privacy_impact": {
+      "state": "NEEDS_INPUT",
+      "clause": "N-1",
+      "boundary_element": "privacy"
+    },
+    "compliance_impact": {
+      "state": "NEEDS_INPUT",
+      "clause": "N-1",
+      "boundary_element": "compliance"
+    },
+    "long_term_lock_in": {
+      "state": "NEEDS_INPUT",
+      "clause": "N-1",
+      "boundary_element": "long_term_lock_in"
+    },
+    "authority_reserved_to_user": {
+      "state": "NEEDS_INPUT",
+      "clause": "N-1",
+      "boundary_element": "explicit_user_authority"
+    },
+    "unclassifiable_decision": {
+      "state": "NEEDS_INPUT",
+      "clause": "N-3",
+      "required_evidence": [
+        "reason_code",
+        "what_is_missing",
+        "why_policy_cannot_decide",
+        "classification_attempted"
+      ]
+    },
+    "requirement_contradiction": {
+      "state": "CONFLICT",
+      "clause": "C-1"
+    },
+    "requirement_vs_accepted_decision": {
+      "state": "CONFLICT",
+      "clause": "C-2"
+    },
+    "requirement_vs_safety_floor": {
+      "state": "CONFLICT",
+      "clause": "C-3"
+    }
+  },
+  "boundary_elements": {
+    "ambiguity": {
+      "kind": "declared"
+    },
+    "explicit_requirement_conflict": {
+      "kind": "citations",
+      "minimum": 2
+    },
+    "reversibility": {
+      "kind": "enum",
+      "values": [
+        "reversible_in_run",
+        "reversible_with_effort",
+        "irreversible"
+      ]
+    },
+    "blast_radius": {
+      "kind": "enum",
+      "values": [
+        "current_change",
+        "module",
+        "repository",
+        "external_system"
+      ]
+    },
+    "monetary_cost": {
+      "kind": "boolean"
+    },
+    "security": {
+      "kind": "boolean"
+    },
+    "privacy": {
+      "kind": "boolean"
+    },
+    "compliance": {
+      "kind": "boolean"
+    },
+    "long_term_lock_in": {
+      "kind": "boolean"
+    },
+    "repository_project_policy": {
+      "kind": "policy_source"
+    },
+    "explicit_user_authority": {
+      "kind": "user_decision"
+    }
+  },
+  "policy_source_roles": [
+    "determines",
+    "supports"
+  ],
+  "policy_source_kinds": [
+    "file_path",
+    "requirement_id",
+    "quality_attribute_id",
+    "phase_contract_section"
+  ],
+  "required_evidence": {
+    "CLEAR": [],
+    "ASSUMPTION_ALLOWED": [
+      "reason_code",
+      "policy_source",
+      "reversibility",
+      "impact",
+      "retraction_condition"
+    ],
+    "NEEDS_INPUT": [
+      "reason_code",
+      "boundary_element",
+      "what_is_missing",
+      "why_policy_cannot_decide"
+    ],
+    "CONFLICT": [
+      "reason_code",
+      "citations",
+      "why_they_cannot_both_hold"
+    ]
+  },
+  "assumption_allowed_requires": {
+    "policy_source_role": "supports",
+    "all_required_evidence_non_empty": true
+  },
+  "assumption_allowed_forbidden_when": {
+    "reversibility_in": [
+      "irreversible"
+    ],
+    "blast_radius_in_with_irreversible": [
+      "repository",
+      "external_system"
+    ],
+    "any_true_of": [
+      "monetary_cost",
+      "security",
+      "privacy",
+      "compliance",
+      "long_term_lock_in"
+    ],
+    "explicit_user_authority_reserved": true,
+    "exception_allowed": false
+  },
+  "user_decision_fields": [
+    "source",
+    "where_recorded",
+    "resolves"
+  ],
+  "forbidden_authority_sources": [
+    "model_confidence",
+    "timeout",
+    "no_response",
+    "worker_reviewer_agreement",
+    "recommended_default"
+  ],
+  "citation_minimum": {
+    "CONFLICT": 2
+  },
+  "independent_axes": [
+    "risk",
+    "quality_profile",
+    "agent_profile"
+  ]
+}

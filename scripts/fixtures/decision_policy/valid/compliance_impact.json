@@ -1,0 +1,10 @@
+{
+  "state": "NEEDS_INPUT",
+  "reason_code": "compliance_impact",
+  "boundary_element": "compliance",
+  "what_is_missing": "confirmation the change is compliant",
+  "why_policy_cannot_decide": "the repository holds no compliance determination",
+  "no_determining_policy_source": true,
+  "no_explicit_authorization": true,
+  "compliance": true
+}

@@ -1,0 +1,9 @@
+{
+  "state": "NEEDS_INPUT",
+  "reason_code": "ambiguous_requirement",
+  "boundary_element": "ambiguity",
+  "what_is_missing": "which of the two readings is intended",
+  "why_policy_cannot_decide": "no policy source addresses the choice",
+  "no_determining_policy_source": true,
+  "no_explicit_authorization": true
+}

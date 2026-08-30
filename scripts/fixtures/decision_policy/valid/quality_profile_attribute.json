@@ -1,0 +1,12 @@
+{
+  "reversibility": "reversible_in_run",
+  "impact": "current_change",
+  "state": "ASSUMPTION_ALLOWED",
+  "reason_code": "quality_profile_attribute",
+  "policy_source": {
+    "kind": "quality_attribute_id",
+    "locator": "DOMAIN-001",
+    "role": "supports"
+  },
+  "retraction_condition": "the profile changes or the attribute is withdrawn"
+}

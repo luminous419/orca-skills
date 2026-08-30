@@ -1,0 +1,12 @@
+{
+  "reversibility": "reversible_in_run",
+  "impact": "current_change",
+  "state": "ASSUMPTION_ALLOWED",
+  "reason_code": "repository_policy",
+  "policy_source": {
+    "kind": "file_path",
+    "locator": "scripts/",
+    "role": "supports"
+  },
+  "retraction_condition": "a reviewer names a different location"
+}

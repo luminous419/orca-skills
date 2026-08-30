@@ -1,0 +1,12 @@
+{
+  "reversibility": "reversible_in_run",
+  "impact": "current_change",
+  "state": "ASSUMPTION_ALLOWED",
+  "reason_code": "explicit_requirement",
+  "policy_source": {
+    "kind": "requirement_id",
+    "locator": "OS-28#record-fields",
+    "role": "supports"
+  },
+  "retraction_condition": "the user states a different order"
+}

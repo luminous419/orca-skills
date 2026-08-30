@@ -1,0 +1,9 @@
+{
+  "state": "CONFLICT",
+  "reason_code": "requirement_vs_safety_floor",
+  "citations": [
+    "OS-28#req-d",
+    "orca-worker-reviewer-orchestration/SKILL.md:RISK_SAFETY_FLOOR"
+  ],
+  "why_they_cannot_both_hold": "the floor cannot be lowered at any risk level, so the requirement cannot be satisfied as written"
+}
