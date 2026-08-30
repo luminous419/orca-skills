@@ -770,6 +770,63 @@ half while the Reviewer applies the same standard to the judgement half (whether
 is actually right). Both copies were edited once and copied, so byte-parity holds.
 
 
+
+#### D2-2g. A domain check wherever the contract declares a domain (FR-8)
+
+**The finding.** `enum` elements were checked for membership in their declared `values`;
+`boolean` elements had **no counterpart**. Any non-boolean value simply matched no triggering
+value and was treated as "did not fire", so the boundary was bypassed. All seven of
+`security` ∈ {`'yes'`, `1`, `0`, `{'a': 1}`, `None`, `'false'`, `[]`} left an item reporting
+`ASSUMPTION_ALLOWED`. `'yes'` and `1` are plainly true to a reader.
+
+This is the one direction that matters: a contract that fails **closed** everywhere else was
+failing **open** on a malformed value. The wrong input bought autonomy instead of a pause.
+
+**The rule.** `_domain_defect(spec, value)` sits in `_validate_declared_facts` — the same
+shared path both APIs already call, so the evaluator and the record validator cannot answer
+"is this value in the domain?" differently. A domain is checked **wherever the contract
+declares one**:
+
+| kind | declared domain | checked |
+|---|---|---|
+| `enum` | closed `values` | yes (pre-existing, now routed through the same helper) |
+| `boolean` | Python `bool` | **new** |
+| `declared` | Python `bool` — its triggering value *is* `True` (A4-1 row 1) | **new** |
+| `citations` | a list or tuple, since the rule is `at_minimum` over a length | **new** |
+| `policy_source` | none declared | no — see below |
+| `user_decision` | none declared | no — see below |
+
+`bool` is tested **before** `int` deliberately: `isinstance(True, int)` is true in Python, and
+`1`/`0` are exactly the values that made this fail open.
+
+**Omission stays legal.** Not declaring an element and declaring it wrongly are different
+acts — the first is silence, the second is a claim the contract can check. A mutation that
+makes omission illegal is caught by the fixtures it breaks.
+
+**What is deliberately NOT checked, and why.** Two element kinds declare no closed value set,
+so giving them one would be **new design**, not enforcement of the approved spec:
+
+- `explicit_user_authority` (kind `user_decision`) declares `triggering: ["reserved"]` but no
+  `values`. Restricting the domain to the triggering value alone would reject `delegated` —
+  the legitimate non-reserved case A4-0's truth table contrasts with `reserved`. **Residual
+  limit:** a misspelling such as `"RESERVED"` still reads as "not reserved". Recorded, not
+  silently fixed.
+- `repository_project_policy` (kind `policy_source`) declares no domain either. The
+  `policy_source` **object**'s `role` and `kind` are separately closed sets and are checked
+  (TR4-1); A4-1 row 10 also calls the cited path's *existence* checkable, which this contract
+  layer does not do because it performs no I/O. **Recorded as a known limit.**
+
+**`conflict_clause` gained a check** because the contract *does* declare its domain, in
+`entry_clauses.CONFLICT`. An unknown clause is now rejected instead of quietly making an item
+look non-contradictory.
+
+**The exhaustive sweep, so this family closes.** Every value position the contract declares
+was enumerated and probed with a wrong-domain value, on identical input to both APIs:
+**16 positions — 13 domain-checked, 3 declaring no domain (listed above), 0 divergences
+between the two APIs.** A test asserts the partition of element *kinds* into checked and
+open, so a newly introduced kind fails until someone decides which side it belongs on.
+
+
 #### D2-3. What the loader deliberately does not do
 
 No import from `orca_runtime_harness`, `run_logging`, `review_isolation`, `e2e_harness`, or

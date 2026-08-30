@@ -1156,3 +1156,143 @@ Untouched, verified by empty diff: `VERSION`, `LICENSE`, `skill_policy.py` (so
 **both `SKILL.md` contracts**, and `templates/**`. The contract needed no edit: it already
 carried the triggering values and the entry conditions, and only one code path was reading
 them.
+
+---
+
+## Correction — iteration 8 (Final Review attempt 5, FR-8)
+
+FR-9 is a separate round and was not touched.
+
+### The defect, reproduced first
+
+`enum` elements were checked for membership in their declared `values`; `boolean` elements
+had **no counterpart**, so a non-boolean value matched no triggering value and was treated as
+"did not fire". All seven values in the finding left the item reporting
+`ASSUMPTION_ALLOWED`:
+
+| declared value | before | after |
+|---|---|---|
+| `security='yes'` | `['ASSUMPTION_ALLOWED']` | **rejected** |
+| `security=1` | `['ASSUMPTION_ALLOWED']` | **rejected** |
+| `security=0` | `['ASSUMPTION_ALLOWED']` | **rejected** |
+| `security={'a': 1}` | `['ASSUMPTION_ALLOWED']` | **rejected** |
+| `security=None` | `['ASSUMPTION_ALLOWED']` | **rejected** |
+| `security='false'` | `['ASSUMPTION_ALLOWED']` | **rejected** |
+| `security=[]` | `['ASSUMPTION_ALLOWED']` | **rejected** |
+
+`'yes'` and `1` are plainly true to a reader. This is the one direction that matters: a
+contract failing **closed** everywhere else was failing **open** on a malformed value — the
+wrong input bought autonomy instead of a pause.
+
+### The fix
+
+`_domain_defect(spec, value)` lives in `_validate_declared_facts`, the shared path both APIs
+already call, so the evaluator and the record validator cannot answer "is this value in the
+domain?" differently. A domain is checked **wherever the contract declares one**; the
+pre-existing `enum` membership check moved into the same helper rather than sitting beside it.
+
+`bool` is tested **before** `int`: `isinstance(True, int)` is true in Python, and `1`/`0` are
+exactly the values that made this fail open. Mutation **B-2** restores the `int` reading and
+is CAUGHT.
+
+### No over-blocking — the three properties that had to survive
+
+| property | result |
+|---|---|
+| `security=True` still fires the boundary | `['NEEDS_INPUT']` |
+| `security=False` still leaves the item safe | `['ASSUMPTION_ALLOWED']` |
+| omitting the element entirely is still legal | `['ASSUMPTION_ALLOWED']` |
+| **18/18 valid fixtures** | pass, counted before starting and after |
+
+Not declaring something and declaring it wrongly are different acts — the first is silence,
+the second is a claim the contract can check. Mutations **B-6** (omission made illegal) and
+**B-7** (`False` rejected with the bad values) are both CAUGHT.
+
+### Every value position the contract declares — the exhaustive table
+
+Probed with a wrong-domain value, on **identical input to both APIs**.
+
+| # | value position | declared domain | checked | both APIs |
+|---|---|---|---|---|
+| 1 | element value, `enum` | closed `values` | yes | same |
+| 2 | element value, `boolean` | Python `bool` | **new** | same |
+| 3 | element value, `declared` | Python `bool` (its triggering value *is* `True`, A4-1 row 1) | **new** | same |
+| 4 | element value, `citations` | list/tuple (the rule is `at_minimum` over a length) | **new** | same |
+| 5 | element value, `user_decision` kind | **none declared** | no — reported | same |
+| 6 | element value, `policy_source` kind | **none declared** | no — reported | same |
+| 7 | `policy_source.kind` | closed set | yes | same |
+| 8 | `policy_source.role` | closed set | yes (TR4-1) | same |
+| 9 | `policy_source` locator | **none declared** | no — reported | same |
+| 10 | `conflict_clause` | `entry_clauses.CONFLICT` | **new** | same |
+| 11 | `reason_code` | closed set | yes | same |
+| 12 | state name | the four | yes | same |
+| 13 | `user_decision.source` | allowlist | yes (FR-2) | same |
+| 14 | `user_decision.where_recorded` | non-empty text | yes (TR4-3) | same |
+| 15 | `user_decision.resolves` | non-empty text | yes (TR4-3) | same |
+| 16 | citation count on CONFLICT | minimum 2 | yes | same |
+
+**16 positions — 13 domain-checked, 3 declaring no domain, 0 divergences between the APIs.**
+
+### What is deliberately NOT checked, and why
+
+Three positions declare no domain in the contract. Giving them one would be **new design**,
+not enforcement of the approved spec, so they are recorded rather than invented:
+
+- **`explicit_user_authority`** declares `triggering: ["reserved"]` but no `values`.
+  Restricting the domain to the triggering value alone would reject `delegated` — the
+  legitimate non-reserved case A4-0's truth table contrasts with `reserved`. **Residual
+  limit: a misspelling such as `"RESERVED"` still reads as "not reserved."**
+- **`repository_project_policy`** declares no domain either. The `policy_source` *object*'s
+  `role` and `kind` are separately closed and are checked.
+- **The policy-source locator.** A4-1 row 10 calls the cited path's existence checkable; this
+  contract layer performs no I/O, so it does not check it.
+
+A test pins the partition of element **kinds** into checked and open, so a newly introduced
+kind fails until someone decides which side it belongs on — the enumeration cannot silently
+go stale.
+
+### Mutations — control verified green first
+
+| # | Mutation | Result |
+|---|---|---|
+| B-0 | control | **green** |
+| B-1 | boolean domain check removed — **the FR-8 defect** | CAUGHT |
+| B-2 | `bool` tested as `int`, so 1/0 pass again | CAUGHT |
+| B-3 | citations domain check removed | CAUGHT |
+| B-4 | `conflict_clause` domain check removed | CAUGHT |
+| B-5 | `_domain_defect` never called (the enum check goes too) | CAUGHT |
+| B-6 | **over-block probe**: omitting an element becomes illegal | CAUGHT |
+| B-7 | **over-block probe**: `False` rejected with the bad values | CAUGHT |
+
+**7/7 CAUGHT.** B-6 and B-7 are the checks on the check: a fix that simply refused more would
+have passed both.
+
+### Regression
+
+**11/11 intact** by execution — FR-1 (both edges), FR-2, FR-3, FR-4, RI3-1, FR-5, FR-6, FR-8,
+TR4-1, TR4-2, TR4-3 — with **3/3 positive controls**.
+
+### A measurement error, caught and corrected
+
+The first pass at the parity column reported three DIFFER rows. Two separate mistakes: the
+probe handed bare facts to one API and a full record to the other, and then, once that was
+fixed, it scored a raise as a refusal but *not-permitted* as an acceptance — when both are
+refusals. Corrected before any conclusion was drawn; all sixteen positions agree. Recorded
+because "compare the same input, and the same question" has now been the source of six
+mis-scorings in this run, mine and the Coordinator's.
+
+### Commands
+
+| Command | Result |
+|---|---|
+| `python3 scripts/validate_skills.py` | **PASSED (642 checks)** — unchanged; no contract or validator change was needed |
+| `python3 -m unittest discover -s scripts -p 'test_*.py'` | **1448 tests OK (skipped=6)** — was 1441; the +7 are the FR-8 tests and **skips did not increase** |
+| `python3 scripts/verify_package.py` | **PASSED (173 source files)** |
+| `python3 scripts/build_release.py` | built `dist/orca-skills-0.9.0.tar.gz` |
+| `verify_package.py --archive …` | **PASSED (173 source files)**, archive verified |
+| `git diff --check` | clean |
+
+Untouched, verified by empty diff: `VERSION`, `LICENSE`, `skill_policy.py` (UD-3),
+`quality_profile.py`, `agent_profile.py`, **both `SKILL.md` contracts**, `templates/**` and
+`reviews/**`. The contract needed no edit: it already declared each element's `kind`, and the
+code was reading that declaration for one kind and not the others.
