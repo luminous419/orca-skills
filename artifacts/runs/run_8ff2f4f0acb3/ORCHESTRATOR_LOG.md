@@ -1,0 +1,3 @@
+| timestamp | event | phase | role | iteration | task_id | dispatch_id | terminal | action | reuse | gate_result | review_verdict | risk | risk_source | requested_phases | round_kind | result | detail |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 2026-08-30T21:58:15.500161+00:00 | run_start | BUGFIX |  |  |  |  |  |  |  |  |  | high | explicit | bugfix |  |  | OS-28 external review correction; PR #25 review 5061977892 at head cef080b; worker=claude-opus reviewer=codex-sol; prior run run_3233a1469e97 artifacts are read-only inputs |
