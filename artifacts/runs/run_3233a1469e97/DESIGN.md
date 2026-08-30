@@ -712,6 +712,64 @@ concepts by hand. All nine multi-site concepts were enumerated and compared over
 with zero divergences; the remaining four are single-site and have nothing to compare.
 
 
+
+#### D2-2f. What `validate_record` checks, per state, and the Reviewer criteria that mirror it (FR-6)
+
+**The finding.** `validate_record()` verified the reason code, the state, the required
+fields, and the boundary element's **name** — FR-3 made that name an exact match — but never
+the **value** behind the name. Reproduced against the shipped fixtures, eight variants were
+accepted, each flipping the element its code rests on to a value that does not fire:
+`security_impact` with `security: false`, `irreversible_action` with
+`reversibility: reversible_in_run`, and so on. The consequence runs both ways: a
+`pause_and_ask` record could be justified by a boundary that never fired, and a Reviewer had
+no machine-readable ground on which to reject the misclassification — the two things the
+ticket asks for by name.
+
+**Why not one blanket entry-condition call.** The obvious move — call
+`_entry_condition_defect` for all four states, as `ASSUMPTION_ALLOWED` already does — was
+measured before being adopted and **rejects six of the eighteen shipped valid fixtures**.
+The four states declare their evidence in different shapes: a `CONFLICT` record carries
+`citations`, not a `conflict_clause` fact; an ambiguity record names the element rather than
+asserting a boolean. Over-blocking is a regression, not a fix.
+
+**The rule, per state, in one helper (`_grounds_defect`).**
+
+| state | what the record must show | source |
+|---|---|---|
+| `CLEAR` | grounds are optional, but grounds that ARE declared must satisfy the CLEAR entry condition — a `supports`-only source, a source-only `user_decision`, or a forbidden authority source are not grounds | A3-1, UD-1 |
+| `ASSUMPTION_ALLOWED` | unchanged: INV-4 **and** the entry condition (D2-2e) | A4-0, A3-1 |
+| `NEEDS_INPUT` | the boundary element the reason code rests on must be declared **and** carry a triggering value | A4-1 |
+| `CONFLICT` | citations ≥ the minimum (already enforced), and a declared clause must be the clause its code rests on | A3-1a |
+
+Nothing here is new policy. A4-1 already fixed the triggering values, A3-1/A3-1a already
+fixed the entry conditions and the N-/C- clauses. The triggering test is
+`_element_is_triggering` — the **same** helper `permitted_states()` reaches through
+`_evaluate_predicate` — so the evaluator and the record validator cannot develop separate
+opinions about what "fired" means. What was missing was reading it on this path at all.
+
+**Two exceptions kept, deliberately.** `unclassifiable_decision` binds no boundary element,
+so there is nothing to check. `ambiguity` is `kind: declared`, and A4-1 row 1 makes naming
+it in `boundary_element` the declaration itself — the two shipped ambiguity fixtures carry
+no separate value, and requiring one would break them. A value that IS present and false is
+still rejected.
+
+**The closure guard's claim, narrowed to stay true.** `_grounds_defect` and its message
+helper are reachable from `validate_record` and not from `permitted_states`, which is
+correct: they judge a **record** — whether declared evidence justifies a claimed state —
+and the evaluator has neither a reason code nor a claimed state to ask about. The guard now
+keeps `evaluator − validator` **empty** (the TR4-1 direction, absolute) and pins
+`validator − evaluator` to a **named** set, so a new one-sided rule still fails while the
+legitimate asymmetry is declared rather than blanket-allowed.
+
+**Reviewer criteria (`reviews/common.md`, byte-shared by both Skills).** The guidance
+previously gave a misclassification test for `ASSUMPTION_ALLOWED` only (INV-4 and the
+forbidden transitions), leaving a Reviewer no stated way to judge the other three. It now
+carries the same per-state criteria as the table above, under one rule — **look at the
+value, not the name** — and says explicitly that `validate_record()` performs the mechanical
+half while the Reviewer applies the same standard to the judgement half (whether the value
+is actually right). Both copies were edited once and copied, so byte-parity holds.
+
+
 #### D2-3. What the loader deliberately does not do
 
 No import from `orca_runtime_harness`, `run_logging`, `review_isolation`, `e2e_harness`, or

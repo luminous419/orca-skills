@@ -1024,3 +1024,135 @@ Protected surfaces untouched, verified by empty diff: `VERSION`, `LICENSE`,
 `agent_profile.py`, **both `SKILL.md` contracts**, `templates/**`, `reviews/**`. The three
 fixes are evaluator code only — no contract edit was required, because the contract already
 carried the right rule and only one API was reading it.
+
+---
+
+## Correction — iteration 7 (Final Review attempt 4, FR-6)
+
+FR-7 is a separate round and was not touched.
+
+### The defect, reproduced first
+
+`validate_record()` verified the reason code, the state, the required fields and the
+boundary element's **name** — FR-3 made that name an exact match — but never the **value**
+behind the name. Against the shipped fixtures, flipping the element each code rests on to a
+value that does not fire:
+
+| variant | before | after |
+|---|---|---|
+| `security_impact` + `security: false` | ACCEPTED | **rejected** |
+| `privacy_impact` + `privacy: false` | ACCEPTED | **rejected** |
+| `monetary_cost` + `monetary_cost: false` | ACCEPTED | **rejected** |
+| `compliance_impact` + `compliance: false` | ACCEPTED | **rejected** |
+| `long_term_lock_in` + `long_term_lock_in: false` | ACCEPTED | **rejected** |
+| `irreversible_action` + `reversibility: reversible_in_run` | ACCEPTED | **rejected** |
+| `blast_radius_beyond_scope` + `blast_radius: current_change` | ACCEPTED | **rejected** |
+| `authority_reserved_to_user` + `explicit_user_authority: delegated` | ACCEPTED | **rejected** |
+
+**8/8 accepted before, 0/8 after.** Each rejection names the element and the declared
+value: *"reason code security_impact rests on boundary element 'security', but the record
+declares False, which is not a triggering value (True) — the boundary did not fire."*
+
+### Why not one blanket entry-condition call
+
+The obvious extension — call `_entry_condition_defect` for all four states as
+`ASSUMPTION_ALLOWED` already does — was **measured before being adopted** and rejects **six
+of the eighteen** shipped valid fixtures (`ambiguous_requirement`, `missing_user_intent`,
+`unclassifiable_decision`, and all three CONFLICT fixtures). The four states declare their
+evidence in different shapes: a CONFLICT record carries `citations`, not a `conflict_clause`
+fact; an ambiguity record names the element instead of asserting a boolean. Over-blocking is
+a regression, not a fix, so the rule is stated per state in one helper.
+
+### The judgement path applied to each of the four states
+
+`_grounds_defect(policy, state, code, record)` — one helper, one place, returning the reason
+the declared evidence does not justify the claimed state.
+
+| state | rule | approved source | executed result |
+|---|---|---|---|
+| `CLEAR` | grounds are optional, but declared grounds must satisfy the CLEAR entry condition | A3-1, UD-1 | bare CLEAR, determining source, complete authorization, `open_decision_item: false` all **accepted**; `supports`-only source, source-only `user_decision`, forbidden authority source all **rejected** |
+| `ASSUMPTION_ALLOWED` | unchanged — INV-4 **and** the entry condition (D2-2e) | A4-0, A3-1 | unchanged |
+| `NEEDS_INPUT` | the element the code rests on must be **declared** and carry a **triggering** value | A4-1 | the 8 variants rejected; omitting the element entirely rejected too |
+| `CONFLICT` | citations ≥ minimum (already enforced), and a declared clause must be the code's own clause | A3-1a | C-1 code declaring C-3 **rejected**; declaring its own clause, or none, **accepted** |
+
+Nothing here is new policy. A4-1 already fixed the triggering values and A3-1/A3-1a the
+entry conditions and clauses. The triggering test is `_element_is_triggering` — the **same**
+helper `permitted_states()` reaches through `_evaluate_predicate` — so the evaluator and the
+record validator cannot develop separate opinions about what "fired" means. What was missing
+was reading it on this path at all.
+
+**Two exceptions kept.** `unclassifiable_decision` binds no boundary element. `ambiguity` is
+`kind: declared`, and A4-1 row 1 makes naming it in `boundary_element` the declaration
+itself; both shipped ambiguity fixtures carry no separate value. A value that IS present and
+false is still rejected. Mutation **F-6** removes this exception and is CAUGHT — by the
+fixtures it would break.
+
+### No over-blocking: all 18 valid fixtures still pass
+
+**18/18**, asserted by a test with a co-located `assertEqual(len(fixtures), 18)` guard so
+the enumeration cannot silently shrink. This was checked **before** starting, as the brief
+required, and again after.
+
+### The closure guard's claim, narrowed to stay true
+
+`_grounds_defect` and its message helper are reachable from `validate_record` and not from
+`permitted_states` — which is correct: they judge a **record**, and the evaluator has
+neither a reason code nor a claimed state to ask about. The guard added in iteration 5 fired
+on this, as designed. It now keeps `evaluator − validator` **empty** — the TR4-1 direction,
+absolute — and pins `validator − evaluator` to a **named** set, so a new one-sided rule
+still fails while the legitimate asymmetry is declared rather than blanket-allowed. This is
+narrowing the claim to what is true, not relaxing it to pass.
+
+### Reviewer guidance — `reviews/common.md`, both Skills
+
+The guidance gave a misclassification test for `ASSUMPTION_ALLOWED` only (INV-4 and the
+forbidden transitions), so a Reviewer had no stated way to judge the other three states. It
+now carries the same per-state criteria as the table above under one rule — **look at the
+value, not the name** — naming the triggering values (irreversible; repository or
+external_system; the five booleans true; authority reserved), the two exceptions, the
+CONFLICT clause-match rule, and what does **not** count as CLEAR grounds. It closes by
+saying `validate_record()` performs the mechanical half while the Reviewer applies the same
+standard to the judgement half.
+
+Both copies were edited once and copied, so **byte-parity holds** (`cmp` clean, identical
+md5). Mutation **F-8** diverges them and is CAUGHT by the validator's byte-equality check.
+
+### Mutations — control verified green first
+
+| # | Mutation | Result |
+|---|---|---|
+| F-0 | control | **green** |
+| F-1 | `_grounds_defect` never called — **the FR-6 defect** | CAUGHT |
+| F-2 | NEEDS_INPUT checks presence but not the value | CAUGHT |
+| F-3 | NEEDS_INPUT skips the absent-element check | CAUGHT |
+| F-4 | CLEAR grounds no longer judged | CAUGHT |
+| F-5 | CONFLICT clause mismatch allowed | CAUGHT |
+| F-6 | **over-block probe**: `declared` kind loses its exception | CAUGHT |
+| F-7 | **over-block probe**: CLEAR requires grounds when none are declared | CAUGHT |
+| F-8 | the two `reviews/common.md` copies diverge | CAUGHT |
+
+**8/8 CAUGHT.** F-6 and F-7 are the checks on the check: a fix that simply refused more
+would have passed both.
+
+### Regression
+
+**9/9 intact** by execution — FR-1 (both edges), FR-2, FR-3 (name equality still enforced,
+now alongside value), FR-4, RI3-1, FR-5, TR4-1, TR4-2, TR4-3 — with **3/3 positive
+controls**.
+
+### Commands
+
+| Command | Result |
+|---|---|
+| `python3 scripts/validate_skills.py` | **PASSED (642 checks)** — unchanged; no contract or validator change was needed |
+| `python3 -m unittest discover -s scripts -p 'test_*.py'` | **1433 tests OK (skipped=6)** — was 1426; the +7 are the FR-6 tests and **skips did not increase** |
+| `python3 scripts/verify_package.py` | **PASSED (173 source files)** |
+| `python3 scripts/build_release.py` | built `dist/orca-skills-0.9.0.tar.gz` |
+| `verify_package.py --archive …` | **PASSED (173 source files)**, archive verified |
+| `git diff --check` | clean |
+
+Untouched, verified by empty diff: `VERSION`, `LICENSE`, `skill_policy.py` (so
+`evaluate_invocation()` is unchanged, UD-3), `quality_profile.py`, `agent_profile.py`,
+**both `SKILL.md` contracts**, and `templates/**`. The contract needed no edit: it already
+carried the triggering values and the entry conditions, and only one code path was reading
+them.
