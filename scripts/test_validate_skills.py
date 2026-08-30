@@ -59,6 +59,10 @@ class ValidatorRegressionTests(unittest.TestCase):
             # empty stdout rather than the named failure a test is asserting on.
             "agent_profile.py",
             "quality_profile.py",
+            # OS-28: validate_skills imports the decision-policy loader. Same
+            # trap as the OS-4 note above -- omitting it here turns every
+            # validator regression test into an import crash with empty stdout.
+            "decision_policy.py",
         ):
             shutil.copy2(SOURCE_ROOT / "scripts" / filename, scripts_dir)
 

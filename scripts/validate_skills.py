@@ -9,6 +9,17 @@ from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
 import run_logging
+from decision_policy import (
+    AXIS_TOKENS,
+    CANONICAL_INDEPENDENT_AXES,
+    DECISION_POLICY_MAX_LINES,
+    DECLARATIVE_KEYS,
+    STATE_SELECTION_INPUTS,
+    TRANSITION_VALUES,
+    WORKFLOW_VALUES,
+    DecisionPolicyError,
+    load_decision_policy,
+)
 from skill_policy import PolicyContractError, load_policy_contract, load_risk_contract
 from workflow_contract import WorkflowContractError, load_workflow_output_contract
 
@@ -416,6 +427,73 @@ RISK_CONTRACT: dict[str, tuple[str, ...]] = {
     "RISK_SAFETY_FLOOR": ("mandatory_test_gates_apply_at_every_level",),
 }
 RISK_CONTRACT_MAX_LINES = 20
+# ---- OS-28: the decision policy contract --------------------------------------
+# The expected constant exists for the SIMULTANEOUS-DELETION blind spot: the shared
+# policy-contract JSON is asserted deep-equal between the Skills, which proves they
+# AGREE but not that they agree on something correct. Delete a reason code from both
+# blocks and deep-equality still passes. Same idiom as RISK_CONTRACT above.
+DECISION_POLICY_REASON_CODES: dict[str, tuple[str, str | None, str | None]] = {
+    "repository_policy": ("ASSUMPTION_ALLOWED", None, None),
+    "explicit_requirement": ("ASSUMPTION_ALLOWED", None, None),
+    "phase_contract": ("ASSUMPTION_ALLOWED", None, None),
+    "quality_profile_attribute": ("ASSUMPTION_ALLOWED", None, None),
+    "ambiguous_requirement": ("NEEDS_INPUT", "N-1", "ambiguity"),
+    "missing_user_intent": ("NEEDS_INPUT", "N-2", "ambiguity"),
+    "irreversible_action": ("NEEDS_INPUT", "N-1", "reversibility"),
+    "blast_radius_beyond_scope": ("NEEDS_INPUT", "N-1", "blast_radius"),
+    "monetary_cost": ("NEEDS_INPUT", "N-1", "monetary_cost"),
+    "security_impact": ("NEEDS_INPUT", "N-1", "security"),
+    "privacy_impact": ("NEEDS_INPUT", "N-1", "privacy"),
+    "compliance_impact": ("NEEDS_INPUT", "N-1", "compliance"),
+    "long_term_lock_in": ("NEEDS_INPUT", "N-1", "long_term_lock_in"),
+    "authority_reserved_to_user": ("NEEDS_INPUT", "N-1", "explicit_user_authority"),
+    "unclassifiable_decision": ("NEEDS_INPUT", "N-3", None),
+    "requirement_contradiction": ("CONFLICT", "C-1", None),
+    "requirement_vs_accepted_decision": ("CONFLICT", "C-2", None),
+    "requirement_vs_safety_floor": ("CONFLICT", "C-3", None),
+}
+DECISION_POLICY_CODE_COUNT = 18  # UD-4
+DECISION_POLICY_PER_STATE = {"ASSUMPTION_ALLOWED": 4, "NEEDS_INPUT": 11, "CONFLICT": 3}
+DECISION_POLICY_BOUNDARY_ELEMENTS = (
+    "ambiguity",
+    "explicit_requirement_conflict",
+    "reversibility",
+    "blast_radius",
+    "monetary_cost",
+    "security",
+    "privacy",
+    "compliance",
+    "long_term_lock_in",
+    "repository_project_policy",
+    "explicit_user_authority",
+)
+DECISION_POLICY_FORBIDDEN_CELLS = {
+    ("NEEDS_INPUT", "ASSUMPTION_ALLOWED"),
+    ("CONFLICT", "ASSUMPTION_ALLOWED"),
+}
+DECISION_POLICY_REJECT_LIST = (
+    "model_confidence",
+    "timeout",
+    "no_response",
+    "worker_reviewer_agreement",
+    "recommended_default",
+)
+DECISION_POLICY_BLOCK_PATTERN = re.compile(
+    r'\n  "decision_policy": \{\n(?P<body>.*?)\n  \}\n\}', re.DOTALL
+)
+# Sentences the machine block only INDEXES. Byte-equality catches divergence between
+# the Skills; it cannot catch a sentence deleted from BOTH copies. These anchors can.
+DECISION_POLICY_SKILL_PROSE_ANCHORS = (
+    "decision state는 RUN_STATUS / Worker STATUS / REVIEW_VERDICT와 별개의 축이다",
+    "NEEDS_INPUT은 정보가 없는 것이고 CONFLICT는 정보가 모순되는 것이다",
+    "답변을 받은 항목은 CLEAR가 되며 ASSUMPTION_ALLOWED가 되지 않는다",
+    "INV-4에는 예외가 없다",
+)
+DECISION_RECORD_OPTIONALITY_ANCHOR = (
+    "optional section이다. 없어도 계약 위반이 아니다."
+)
+DECISION_RECORD_TEMPLATE_ANCHOR = "## Decision Record (optional)"
+
 RISK_SECTION_HEADING = "## 8. Phase Sequence Contract"
 RISK_SECTION_END = "\n## 9."
 # The prose the block is only an index into. Each is a sentence the section would be
@@ -1939,6 +2017,183 @@ def validate_agent_profile_contract(validation: Validation) -> None:
         )
 
 
+def validate_decision_policy_contract(validation: Validation) -> None:
+    """OS-28 checks C1-C14. Imports the loader rather than re-parsing the block, the
+    same dependency direction validate_risk_profile_contract has toward
+    skill_policy.load_risk_contract -- so the runtime evaluator and this validator
+    cannot disagree about what the contract says."""
+
+    policies = {}
+    for skill_dir in SKILL_DIRS:
+        skill_path = skill_dir / "SKILL.md"
+        if not skill_path.is_file():
+            continue
+        try:  # C1
+            policies[skill_dir.name] = load_decision_policy(skill_path)
+        except (OSError, PolicyContractError, DecisionPolicyError) as exc:
+            validation.check(
+                False, f"{skill_dir.name}: decision policy contract is missing or malformed: {exc}"
+            )
+
+    if len(policies) != len(SKILL_DIRS):
+        return
+
+    for name, policy in policies.items():
+        observed = {
+            code: (spec.state, spec.clause, spec.boundary_element)
+            for code, spec in policy.reason_codes.items()
+        }
+        validation.check(  # C2
+            set(observed) == set(DECISION_POLICY_REASON_CODES),
+            f"{name}: decision policy contract keys drifted",
+        )
+        validation.check(  # C3
+            observed == DECISION_POLICY_REASON_CODES,
+            f"{name}: decision policy contract values drifted",
+        )
+        validation.check(  # C5
+            len(policy.reason_codes) == DECISION_POLICY_CODE_COUNT,
+            f"{name}: decision policy reason-code cardinality drifted "
+            f"(expected {DECISION_POLICY_CODE_COUNT})",
+        )
+        per_state = {
+            state: sum(1 for c in policy.reason_codes.values() if c.state == state)
+            for state in DECISION_POLICY_PER_STATE
+        }
+        validation.check(
+            per_state == DECISION_POLICY_PER_STATE,
+            f"{name}: decision policy per-state reason-code split drifted",
+        )
+        validation.check(
+            tuple(policy.boundary_elements) == DECISION_POLICY_BOUNDARY_ELEMENTS,
+            f"{name}: decision policy boundary elements drifted",
+        )
+        for code, spec in sorted(policy.reason_codes.items()):  # C6
+            if spec.state in policy.entry_clauses:
+                ok = spec.clause in policy.entry_clauses[spec.state]
+            else:
+                ok = spec.clause is None
+            validation.check(
+                ok, f"{name}: reason code {code} has no valid entry clause"
+            )
+        skill_text = (REPO_ROOT / name / "SKILL.md").read_text(encoding="utf-8")
+        match = DECISION_POLICY_BLOCK_PATTERN.search(skill_text)
+        validation.check(  # C7
+            match is not None
+            and 0 < len(match.group("body").splitlines()) <= DECISION_POLICY_MAX_LINES,
+            f"{name}: decision policy contract block exceeds "
+            f"{DECISION_POLICY_MAX_LINES} lines",
+        )
+        forbidden = {
+            pair for pair, rule in policy.transitions.items() if rule == "forbidden"
+        }
+        validation.check(  # C8
+            forbidden == DECISION_POLICY_FORBIDDEN_CELLS,
+            f"{name}: NEEDS_INPUT/CONFLICT -> ASSUMPTION_ALLOWED must be forbidden",
+        )
+        validation.check(  # C9
+            policy.assumption_allowed_forbidden_when.get("exception_allowed") is False,
+            f"{name}: INV-4 must have no exception",
+        )
+        validation.check(  # C10
+            tuple(sorted(policy.forbidden_authority_sources))
+            == tuple(sorted(DECISION_POLICY_REJECT_LIST)),
+            f"{name}: forbidden-authority reject list drifted",
+        )
+
+        block = load_policy_contract(REPO_ROOT / name / "SKILL.md")["decision_policy"]
+        validation.check(  # C11a
+            set(block) == STATE_SELECTION_INPUTS | DECLARATIVE_KEYS,
+            f"{name}: decision policy key "
+            f"{sorted(set(block) ^ (STATE_SELECTION_INPUTS | DECLARATIVE_KEYS))} "
+            "is not classified as a selection input or declarative",
+        )
+        hits = _axis_token_hits(block)
+        validation.check(  # C11b
+            not hits,
+            f"{name}: decision policy references axis token at {hits[:1]}, "
+            "which is a state-selection input",
+        )
+        closed = _closed_value_violations(block)
+        validation.check(  # C11c
+            not closed,
+            f"{name}: decision policy value {closed[:1]} is outside its closed set",
+        )
+        validation.check(  # C11d
+            policy.independent_axes == CANONICAL_INDEPENDENT_AXES,
+            f"{name}: independent_axes must name exactly the three canonical axes",
+        )
+
+        for anchor in DECISION_POLICY_SKILL_PROSE_ANCHORS:  # C12
+            validation.check(
+                anchor in skill_text,
+                f"{name}: missing decision policy prose anchor {anchor!r}",
+            )
+
+    left, right = (policies[d.name] for d in SKILL_DIRS)
+    validation.check(  # C4
+        left.reason_codes == right.reason_codes
+        and left.transitions == right.transitions
+        and left.raw == right.raw,
+        "decision policy contracts differ between skills",
+    )
+
+    for skill_dir in SKILL_DIRS:  # C13 / C14
+        for relative in (
+            *(f"templates/{phase.casefold()}.md" for phase in PHASE_ROUTES),
+            "reviews/common.md",
+        ):
+            path = skill_dir / relative
+            if not path.is_file():
+                continue
+            text = path.read_text(encoding="utf-8")
+            validation.check(
+                DECISION_RECORD_TEMPLATE_ANCHOR in text,
+                f"{skill_dir.name}: {relative} is missing the decision record section",
+            )
+            validation.check(
+                DECISION_RECORD_OPTIONALITY_ANCHOR in text,
+                f"{skill_dir.name}: {relative} is missing the decision record "
+                "optionality sentence",
+            )
+
+
+def _axis_token_hits(block: dict) -> list[str]:
+    """Exact-token axis references inside a STATE_SELECTION_INPUTS subtree (C11b)."""
+    hits: list[str] = []
+
+    def walk(node: object, path: str) -> None:
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key in AXIS_TOKENS:
+                    hits.append(f"{path}/{key} (key)")
+                walk(value, f"{path}/{key}")
+        elif isinstance(node, list):
+            for index, value in enumerate(node):
+                walk(value, f"{path}[{index}]")
+        elif isinstance(node, str) and node in AXIS_TOKENS:
+            hits.append(f"{path} (value)")
+
+    for key in sorted(STATE_SELECTION_INPUTS & set(block)):
+        walk(block[key], key)
+    return hits
+
+
+def _closed_value_violations(block: dict) -> list[str]:
+    """Enumerated positions carrying a value outside their closed set (C11c)."""
+    bad: list[str] = []
+    for source, row in block.get("transitions", {}).items():
+        if not isinstance(row, dict):
+            continue
+        for target, rule in row.items():
+            if rule not in TRANSITION_VALUES:
+                bad.append(f"transitions[{source}][{target}]={rule!r}")
+    for name, spec in block.get("states", {}).items():
+        if isinstance(spec, dict) and spec.get("workflow") not in WORKFLOW_VALUES:
+            bad.append(f"states[{name}].workflow={spec.get('workflow')!r}")
+    return bad
+
+
 def validate_phase_gate_neutrality(validation: Validation) -> None:
     """Phase transitions and the Final Review trigger must be risk-neutral.
 
@@ -2238,6 +2493,7 @@ def main() -> int:
     validate_quality_profile_contract(validation)
     validate_risk_profile_contract(validation)
     validate_agent_profile_contract(validation)
+    validate_decision_policy_contract(validation)
     validate_phase_gate_neutrality(validation)
     validate_run_logging_contract(validation)
     validate_run_logging_tool_parity(validation)
