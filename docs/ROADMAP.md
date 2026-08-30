@@ -7,11 +7,20 @@ acceptance criteria; this roadmap is not a copy of the Jira backlog.
 
 ## Vision
 
-`orca-skills` provides reusable, auditable software-development workflows in
-which one agent produces work and an independent agent verifies it before the
-workflow advances. The project aims to make that policy safe enough to reuse
-across projects and agent commands without hiding execution state, weakening
-quality gates, or relying on an in-memory conversation as evidence.
+`orca-skills` provides reusable, auditable software-development workflows that
+advance autonomously from requirements analysis through implementation and
+verification while they remain inside an explicit decision boundary. One agent
+produces work and an independent agent verifies it before the workflow advances.
+When user intent, authority, or a high-impact choice cannot be derived safely,
+the workflow escalates a minimal structured question, records the decision, and
+resumes from the interrupted phase.
+
+The goal is **bounded autonomy with principled escalation**, not zero user
+interaction. A workflow that stops at the correct decision boundary is behaving
+more safely than one that silently guesses. The project therefore aims to
+eliminate unnecessary intervention while preserving necessary human authority,
+without hiding execution state, weakening quality gates, or relying on an
+in-memory conversation as evidence.
 
 The long-term outcome is a compact verification-oriented orchestration system:
 
@@ -22,28 +31,58 @@ The long-term outcome is a compact verification-oriented orchestration system:
 - safe recovery and evidence whose validity is bound to the source it reviewed;
 - execution adapters that preserve one policy rather than reimplementing it.
 
+## Bounded Autonomy Model
+
+Decision checks apply continuously across ANALYSIS, PLAN, DESIGN,
+IMPLEMENTATION, TEST, and Final Review. A check is not itself a user pause. It
+produces one of four states:
+
+| State | Meaning | Workflow action |
+| --- | --- | --- |
+| `CLEAR` | No unresolved decision crosses the autonomy boundary | Continue |
+| `ASSUMPTION_ALLOWED` | A safe, reversible, policy-supported assumption is recorded | Continue and review |
+| `NEEDS_INPUT` | Correctness depends on user intent or authority | Pause and ask a structured question |
+| `CONFLICT` | Requirements or accepted decisions cannot all be satisfied | Pause and request resolution |
+
+The decision boundary considers ambiguity, contradiction, reversibility, blast
+radius, cost, security, privacy, compliance, long-term lock-in, existing project
+policy, and explicit user authority. Model confidence alone is not authority.
+Risk, Quality Profile, and Agent Profile remain separate axes and cannot silently
+expand what the workflow is allowed to decide.
+
+Success is not measured by maximizing question-free runs. The relevant outcomes
+include required-escalation recall, unnecessary-question rate, silent-assumption
+defects, valid autonomous decisions, decision-provenance completeness, resume
+reliability, and final requirement satisfaction.
+
 ## Architecture Principles
 
 1. **Independent verification is a gate.** A Reviewer does not repair its own
    findings, and completion requires the applicable phase gates plus the Final
    Adversarial Review.
-2. **Fail closed when provenance is uncertain.** Missing runtime state, malformed
+2. **Autonomy stops at authority boundaries.** Safe, reversible, policy-supported
+   choices may proceed with recorded assumptions; conflicting requirements and
+   high-impact choices that depend on user intent require explicit resolution.
+3. **A correct escalation is a valid workflow outcome.** `NEEDS_INPUT` and
+   `CONFLICT` are durable states, not failures to disguise or invitations to
+   guess. A response resumes the responsible phase without bypassing review.
+4. **Fail closed when provenance is uncertain.** Missing runtime state, malformed
    configuration, unknown review provenance, and unsupported phase combinations
    are reported rather than silently inferred.
-3. **Policy and execution are separate.** Workflow, risk, quality, and review
+5. **Policy and execution are separate.** Workflow, risk, quality, and review
    policy must not be coupled to one model name, CLI wrapper, or user path.
-4. **Deterministic checks precede subjective claims.** Validators, tests, manifests,
+6. **Deterministic checks precede subjective claims.** Validators, tests, manifests,
    and machine-readable contracts protect invariants that should not depend on an
    LLM's interpretation.
-5. **Artifacts are evidence, not conversation residue.** Run-scoped artifacts and
+7. **Artifacts are evidence, not conversation residue.** Run-scoped artifacts and
    append-only logs are the durable record; historical evidence is not rewritten
    to make a newer implementation look consistent.
-6. **Safety is independent of validation depth.** Risk settings may change review
+8. **Safety is independent of validation depth.** Risk settings may change review
    strength, but never remove mandatory test gates or authorize unsafe lifecycle
    cleanup.
-7. **Point verification is stated narrowly.** A successful run on one Orca version
+9. **Point verification is stated narrowly.** A successful run on one Orca version
    or company environment does not imply support for an untested range.
-8. **Prefer a small role vocabulary.** Worker, phase Reviewer, and fresh Final
+10. **Prefer a small role vocabulary.** Worker, phase Reviewer, and fresh Final
    Reviewer remain the primary roles; additional complexity must demonstrate value
    without multiplying handoff loss.
 
@@ -74,7 +113,10 @@ strengthening the surrounding control and evidence layers:
 
 ```text
 Task intent
-  -> workflow and risk resolution
+  -> workflow, risk, and decision-policy resolution
+  -> continuous decision / escalation checks
+  -> structured human clarification when required
+  -> durable wait and responsible-phase resume
   -> deterministic contract sensors
   -> Worker / Reviewer phase gates
   -> source-bound Final Review evidence
@@ -82,10 +124,11 @@ Task intent
   -> release and learning feedback
 ```
 
-The target is incremental. Adaptive workflow composition, durable resume,
-source-bound review receipts, and a harness-neutral core are candidates under
-discovery; they are not current behavior until their own Jira issues and
-acceptance criteria are approved.
+The target is incremental. The bounded-autonomy decision contract, continuous
+phase gates, structured clarification, durable decision resume, adaptive workflow
+composition, source-bound review receipts, and a harness-neutral core are not
+current behavior until their own Jira issues and acceptance criteria are
+implemented and validated.
 
 ## Current Status
 
@@ -123,10 +166,30 @@ evidence needed before expanding the workflow.
 - [OS-21](https://luminous419.atlassian.net/browse/OS-21) Final Review effectiveness validation
 - [OS-22](https://luminous419.atlassian.net/browse/OS-22) Final Review observability and evaluation foundation
 
-### Milestone 1 — Review quality and accountable handoff
+### Milestone 1 — Bounded autonomy and principled escalation
 
-**Status: next.** Improve what the review detects, prove reviewer behavior, and
-make correction ownership and human PR handoff explicit.
+**Status: next.** Establish the decision boundary that lets routine work proceed
+without intervention while making necessary human choices explicit, durable, and
+resumable. Every phase performs a decision check, but only `NEEDS_INPUT` and
+`CONFLICT` pause for the user.
+
+- [OS-28](https://luminous419.atlassian.net/browse/OS-28) Bounded Autonomy Decision Policy Contract
+- [OS-29](https://luminous419.atlassian.net/browse/OS-29) Continuous Decision and Escalation Gates
+- [OS-30](https://luminous419.atlassian.net/browse/OS-30) Structured Human Clarification and Decision Protocol
+- [OS-31](https://luminous419.atlassian.net/browse/OS-31) Durable Pause and Resume for Human Decisions
+- [OS-32](https://luminous419.atlassian.net/browse/OS-32) Bounded Autonomy Evaluation and Success Metrics
+
+The intended dependency flow is OS-28 → OS-29 → OS-30 → OS-31 → OS-32.
+Jira issue links are authoritative for the exact dependency graph. OS-28 relates
+to the deterministic engine/adapter analysis in OS-27; OS-31 concretizes the
+durable-resume candidate in OS-26; OS-32 reuses the audit/evaluation foundation
+from OS-22.
+
+### Milestone 2 — Review quality and accountable handoff
+
+**Status: planned.** Improve what the review detects, prove reviewer behavior,
+and make correction ownership and human PR handoff explicit. Work that does not
+compete with the Milestone 1 decision-policy foundation may proceed independently.
 
 - [OS-23](https://luminous419.atlassian.net/browse/OS-23) Final Review Detection Quality Improvement
 - [OS-24](https://luminous419.atlassian.net/browse/OS-24) Final Review Behavior Validation
@@ -134,7 +197,7 @@ make correction ownership and human PR handoff explicit.
 - [OS-5](https://luminous419.atlassian.net/browse/OS-5) Human PR Review Integration
 - [OS-18](https://luminous419.atlassian.net/browse/OS-18) Adaptive iteration budget
 
-### Milestone 2 — Operability and efficiency
+### Milestone 3 — Operability and efficiency
 
 **Status: planned.** Make long-running workflows easier to observe and operate
 while reducing unnecessary review and artifact cost.
@@ -145,7 +208,7 @@ while reducing unnecessary review and artifact cost.
 - [OS-9](https://luminous419.atlassian.net/browse/OS-9) Reviewer Efficiency Phase 2
 - [OS-10](https://luminous419.atlassian.net/browse/OS-10) Final Review Cost Optimization
 
-### Milestone 3 — Workflow evolution and architecture
+### Milestone 4 — Workflow evolution and architecture
 
 **Status: planned and exploratory.** Improve maintainability and workflow entry
 points, and compare alternative execution architectures without weakening the
@@ -155,8 +218,9 @@ current contract.
 - [OS-12](https://luminous419.atlassian.net/browse/OS-12) Workflow Presets
 - [OS-13](https://luminous419.atlassian.net/browse/OS-13) VirtusLab Orca Comparison PoC
 - [OS-16](https://luminous419.atlassian.net/browse/OS-16) Non-Orca orchestration alternatives
+- [OS-27](https://luminous419.atlassian.net/browse/OS-27) Deterministic flow execution and Orca adapter architecture
 
-### Milestone 4 — Environment validation and stable release
+### Milestone 5 — Environment validation and stable release
 
 **Status: planned.** Revalidate the latest Skill in the company environment,
 complete repository information architecture, and make an explicit 1.0 decision.
@@ -195,13 +259,14 @@ deduplication, and separate implementation tickets are required first.
 
 ## Backlog Summary
 
-The active backlog falls into five themes:
+The active backlog falls into six themes:
 
-1. review detection, behavior, ownership, and human handoff;
-2. workflow observability, progress, retention, and efficiency;
-3. workflow presets and maintainable Skill structure;
-4. alternative orchestration and AI-DLC architecture discovery;
-5. company-environment validation and 1.0 release readiness.
+1. bounded autonomy, decision policy, principled escalation, and durable resume;
+2. review detection, behavior, ownership, and human handoff;
+3. workflow observability, progress, retention, and efficiency;
+4. workflow presets and maintainable Skill structure;
+5. alternative orchestration and AI-DLC architecture discovery;
+6. company-environment validation and 1.0 release readiness.
 
 For live status, descriptions, and acceptance criteria, use the
 [OS project backlog](https://luminous419.atlassian.net/issues/?jql=project%20%3D%20OS%20ORDER%20BY%20key%20ASC).
@@ -215,6 +280,9 @@ The first stable release should meet all of these conditions:
 - README, installation, compatibility, and release documentation match behavior;
 - deterministic validation, unit tests, package verification, and archive
   reproducibility all pass;
+- the autonomy boundary, decision states, escalation path, and resume behavior
+  are explicit and covered by positive and negative tests;
+- unresolved high-impact assumptions cannot be reported as successful completion;
 - tested Orca and company environments are described as point observations with
   known limitations;
 - unresolved lifecycle or review-quality risks are either fixed or documented as
@@ -226,6 +294,9 @@ See [Releasing](RELEASING.md) and
 ## Non-Goals
 
 - Reproduce AI-DLC's full agent roster or stage count.
+- Eliminate all user interaction or guess preferences that were never supplied.
+- Treat Worker/Reviewer agreement, model confidence, or a recommended default as
+  evidence of user authorization.
 - Turn Jira into a generated copy of this document, or this document into a Jira dump.
 - Couple workflow policy to `claude-glm`, `claude-gemma`, Codex, or another command.
 - Claim compatibility for an Orca version range from one successful point test.
