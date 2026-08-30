@@ -61,6 +61,7 @@ STATE_SELECTION_INPUTS: frozenset[str] = frozenset(
         "transitions",
         "entry_clauses",
         "reason_codes",
+        "authority_precedence",
         "boundary_elements",
         "entry_conditions",
         "required_evidence",
@@ -174,6 +175,7 @@ class DecisionPolicy:
     reason_codes: Mapping[str, ReasonCode]
     boundary_elements: Mapping[str, BoundaryElement]
     entry_conditions: Mapping[str, Mapping[str, tuple[str, ...]]]
+    policy_source_cannot_resolve: frozenset[str]
     policy_source_roles: tuple[str, ...]
     policy_source_kinds: tuple[str, ...]
     required_evidence: Mapping[str, tuple[str, ...]]
@@ -281,6 +283,15 @@ def parse_decision_policy(block: Any) -> DecisionPolicy:
             triggering=spec.get("triggering"),
         )
 
+    precedence = block["authority_precedence"]
+    _require(isinstance(precedence, dict), "authority_precedence must be an object")
+    cannot_resolve = frozenset(precedence.get("policy_source_cannot_resolve", ()))
+    unknown_precedence = sorted(cannot_resolve - set(raw_elements))
+    _require(
+        not unknown_precedence,
+        f"authority_precedence names unknown boundary element(s) {unknown_precedence}",
+    )
+
     raw_conditions = block["entry_conditions"]
     _require(
         isinstance(raw_conditions, dict)
@@ -384,6 +395,7 @@ def parse_decision_policy(block: Any) -> DecisionPolicy:
         reason_codes=reason_codes,
         boundary_elements=boundary_elements,
         entry_conditions=entry_conditions,
+        policy_source_cannot_resolve=cannot_resolve,
         policy_source_roles=tuple(block["policy_source_roles"]),
         policy_source_kinds=tuple(block["policy_source_kinds"]),
         required_evidence=required_evidence,
@@ -541,10 +553,38 @@ def _evaluate_predicate(
         if element in facts and _element_is_triggering(spec, facts[element])
     ]
 
+    # RI3-1: authority PRECEDENCE. The predicates below were evaluated
+    # independently, so each was right alone and wrong in combination. A4-0 names
+    # exactly two things a determining policy source cannot resolve: it "cannot
+    # un-reserve" explicit user authority (-> NEEDS_INPUT) and "cannot arbitrate two
+    # explicit requirements" (-> CONFLICT). The contract carries those two element
+    # names in authority_precedence.policy_source_cannot_resolve; this is the one
+    # place they are applied.
+    contradiction = facts.get("conflict_clause") in tuple(
+        policy.entry_clauses.get("CONFLICT", {})
+    )
+    unresolvable_by_policy = (
+        "explicit_user_authority" in policy.policy_source_cannot_resolve
+        and facts.get("explicit_user_authority") == "reserved"
+    ) or (
+        "explicit_requirement_conflict" in policy.policy_source_cannot_resolve
+        and contradiction
+    )
+
     if name == "no_open_decision_item":
-        return facts.get("open_decision_item") is False
+        # A3-1 clause 1 is "no decision item is open". A triggering element or a
+        # declared contradiction IS an open item, so the caller asserting
+        # open_decision_item=false alongside one of them is self-contradictory and
+        # must not yield CLEAR.
+        return (
+            facts.get("open_decision_item") is False
+            and not triggered
+            and not contradiction
+        )
     if name == "determining_policy_source":
-        return role == "determines"
+        # A valid user decision outranks the precedence bar: A4-0's authorization
+        # column routes both "cannot" rows to CLEAR.
+        return role == "determines" and (authorized or not unresolvable_by_policy)
     if name == "explicit_user_authorization":
         return authorized
     if name == "reversible_in_run":
@@ -559,15 +599,23 @@ def _evaluate_predicate(
     if name == "no_reserved_user_authority":
         return facts.get("explicit_user_authority") != "reserved"
     if name == "undetermined_boundary_element":
-        return bool(triggered) and role != "determines" and not authorized
+        # The mirror of the determining_policy_source rule, and it has to be stated
+        # here too: a determining policy source resolves an ordinary element, but not
+        # one A4-0 says it cannot resolve. Without this the reserved-authority item
+        # left CLEAR (correctly) and lost NEEDS_INPUT (incorrectly), yielding an
+        # empty set -- the same "each predicate right alone, wrong together" shape
+        # RI3-1 reported, one predicate over.
+        resolved_by_policy = role == "determines" and not unresolvable_by_policy
+        return bool(triggered) and not resolved_by_policy and not authorized
     if name == "absent_user_intent":
         return facts.get("user_intent_absent") is True
     if name == "unclassifiable_item":
         return facts.get("unclassifiable") is True
     if name == "declared_contradiction":
-        return facts.get("conflict_clause") in tuple(
-            policy.entry_clauses.get("CONFLICT", {})
-        )
+        # Symmetric with undetermined_boundary_element: A4-0 gives ONE destination
+        # per cell, so an authorization relocates the item to CLEAR rather than
+        # leaving CONFLICT simultaneously permitted.
+        return contradiction and not authorized
     raise DecisionPolicyError(f"unhandled entry predicate {name!r}")
 
 

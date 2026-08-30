@@ -506,6 +506,34 @@ class ValidatorRegressionTests(unittest.TestCase):
         )
         self.assert_validator_fails_with("boundary element specifications drifted")
 
+    # ---- RI3-1: authority precedence -----------------------------------------
+
+    def test_authority_precedence_emptied_fails(self) -> None:
+        """Emptying the list restores the RI3-1 defect: a determining policy source
+        would again un-reserve user authority and arbitrate a contradiction."""
+        self.edit_skills(
+            '"policy_source_cannot_resolve": ["explicit_user_authority", '
+            '"explicit_requirement_conflict"]',
+            '"policy_source_cannot_resolve": []',
+        )
+        self.assert_validator_fails_with("authority precedence drifted")
+
+    def test_authority_precedence_losing_the_reserved_authority_cell_fails(self) -> None:
+        self.edit_skills(
+            '"policy_source_cannot_resolve": ["explicit_user_authority", '
+            '"explicit_requirement_conflict"]',
+            '"policy_source_cannot_resolve": ["explicit_requirement_conflict"]',
+        )
+        self.assert_validator_fails_with("authority precedence drifted")
+
+    def test_authority_precedence_losing_the_conflict_cell_fails(self) -> None:
+        self.edit_skills(
+            '"policy_source_cannot_resolve": ["explicit_user_authority", '
+            '"explicit_requirement_conflict"]',
+            '"policy_source_cannot_resolve": ["explicit_user_authority"]',
+        )
+        self.assert_validator_fails_with("authority precedence drifted")
+
     def test_valid_repository_passes(self) -> None:
         result = self.run_validator()
 

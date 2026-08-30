@@ -528,6 +528,14 @@ DECISION_POLICY_BOUNDARY_ELEMENT_SPECS = {
 # FR-4: A3-1's entry conditions, made machine-evaluable. permitted_states() evaluates
 # these rather than assuming a fixed starting set, so they are the contract's most
 # authority-relevant data and are pinned cell by cell.
+# RI3-1: the two cells A4-0 marks as things a determining policy source CANNOT
+# resolve -- "a policy source cannot un-reserve it" and "a policy source cannot
+# arbitrate two explicit requirements". Pinned by value like every other authority
+# datum, because widening this list is how the precedence would quietly come undone.
+DECISION_POLICY_CANNOT_RESOLVE = (
+    "explicit_user_authority",
+    "explicit_requirement_conflict",
+)
 DECISION_POLICY_ENTRY_CONDITIONS = {
     "CLEAR": (
         "any_of",
@@ -2341,6 +2349,12 @@ def validate_decision_policy_contract(validation: Validation) -> None:
             )
             for state, condition in policy.entry_conditions.items()
         }
+        validation.check(  # C31
+            tuple(sorted(policy.policy_source_cannot_resolve))
+            == tuple(sorted(DECISION_POLICY_CANNOT_RESOLVE)),
+            f"{name}: authority precedence drifted -- a policy source must not "
+            "resolve reserved user authority or an explicit requirement conflict",
+        )
         validation.check(  # C30
             observed_conditions == DECISION_POLICY_ENTRY_CONDITIONS,
             f"{name}: state entry conditions drifted -- permitted_states evaluates "

@@ -293,6 +293,7 @@ DEFAULT_MAX_ITERATIONS = 5
       "repository_project_policy": {"kind": "policy_source", "triggering": null},
       "explicit_user_authority": {"kind": "user_decision", "triggering": ["reserved"]}
     },
+    "authority_precedence": {"policy_source_cannot_resolve": ["explicit_user_authority", "explicit_requirement_conflict"]},
     "policy_source_roles": ["determines", "supports"],
     "policy_source_kinds": ["file_path", "requirement_id", "quality_attribute_id", "phase_contract_section"],
     "required_evidence": {

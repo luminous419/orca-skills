@@ -411,6 +411,209 @@ class Requirement4EntryConditionsAreEvaluated(DecisionPolicyTestCase):
         )
 
 
+class AuthorityPrecedenceAcrossPredicates(DecisionPolicyTestCase):
+    """RI3-1. The entry predicates were evaluated independently, so each was right
+    alone and wrong in combination: a determining policy source satisfied CLEAR while
+    also suppressing NEEDS_INPUT for a reserved-authority item, and left CLEAR
+    alongside CONFLICT for a declared contradiction. A4-0 names exactly two cells a
+    policy source cannot resolve, and the contract now carries them."""
+
+    DETERMINES = {"policy_source": {"kind": "file_path", "locator": "x", "role": "determines"}}
+    SUPPORTS = {"policy_source": {"kind": "file_path", "locator": "x", "role": "supports"}}
+    AUTHORIZED = {
+        "user_decision": {
+            "source": "explicit_user_reply",
+            "where_recorded": "USER_DECISIONS.md#UD-1",
+            "resolves": "the item",
+        }
+    }
+    FORBIDDEN = {
+        "user_decision": {
+            "source": "model_confidence",
+            "where_recorded": "x",
+            "resolves": "y",
+        }
+    }
+
+    def test_a_policy_source_cannot_un_reserve_user_authority(self) -> None:
+        """RI3-1 case 1. A4-0: 'a policy source cannot un-reserve it -> NEEDS_INPUT'."""
+        facts = {"explicit_user_authority": "reserved", **self.DETERMINES}
+        self.assertEqual(permitted_states(self.policy, facts), frozenset({"NEEDS_INPUT"}))
+
+    def test_a_policy_source_cannot_arbitrate_a_declared_contradiction(self) -> None:
+        """RI3-1 case 2. A4-0: 'a policy source cannot arbitrate two explicit
+        requirements -> CONFLICT'."""
+        for clause in sorted(self.policy.entry_clauses["CONFLICT"]):
+            with self.subTest(clause=clause):
+                facts = {"conflict_clause": clause, **self.DETERMINES}
+                self.assertEqual(
+                    permitted_states(self.policy, facts), frozenset({"CONFLICT"})
+                )
+
+    def test_a_supporting_policy_source_resolves_neither(self) -> None:
+        for label, facts in (
+            ("reserved", {"explicit_user_authority": "reserved"}),
+            ("contradiction", {"conflict_clause": "C-1"}),
+        ):
+            with self.subTest(case=label):
+                expected = "NEEDS_INPUT" if label == "reserved" else "CONFLICT"
+                self.assertEqual(
+                    permitted_states(self.policy, {**facts, **self.SUPPORTS}),
+                    frozenset({expected}),
+                )
+
+    def test_a_forbidden_authority_source_resolves_neither(self) -> None:
+        """FR-2's allowlist gates this route too."""
+        for label, facts, expected in (
+            ("reserved", {"explicit_user_authority": "reserved"}, "NEEDS_INPUT"),
+            ("contradiction", {"conflict_clause": "C-1"}, "CONFLICT"),
+        ):
+            with self.subTest(case=label):
+                self.assertEqual(
+                    permitted_states(self.policy, {**facts, **self.FORBIDDEN}),
+                    frozenset({expected}),
+                )
+
+    def test_a_determining_policy_source_still_resolves_ordinary_elements(self) -> None:
+        """POSITIVE CONTROL, and the anti-over-blocking half. Every element A4-0 routes
+        to CLEAR with a determining policy source must still reach CLEAR."""
+        resolvable = {
+            "security": True,
+            "privacy": True,
+            "compliance": True,
+            "monetary_cost": True,
+            "long_term_lock_in": True,
+            "ambiguity": True,
+            "reversibility": "irreversible",
+            "blast_radius": "external_system",
+        }
+        # D4-F guard: every boundary element that can trigger, minus the two A4-0 says
+        # a policy source cannot resolve.
+        triggering = {
+            name
+            for name, spec in self.policy.boundary_elements.items()
+            if spec.triggering is not None
+        }
+        self.assertEqual(
+            set(resolvable), triggering - set(self.policy.policy_source_cannot_resolve)
+        )
+        for element, value in sorted(resolvable.items()):
+            with self.subTest(element=element):
+                self.assertEqual(
+                    permitted_states(self.policy, {element: value, **self.DETERMINES}),
+                    frozenset({"CLEAR"}),
+                )
+
+    def test_an_allowlisted_authorization_resolves_both_cells(self) -> None:
+        """POSITIVE CONTROL: A4-0's authorization column routes both 'cannot' rows to
+        CLEAR, so the precedence bar must not block a real user decision."""
+        for label, facts in (
+            ("reserved", {"explicit_user_authority": "reserved"}),
+            ("C-1", {"conflict_clause": "C-1"}),
+            ("C-2", {"conflict_clause": "C-2"}),
+            ("C-3", {"conflict_clause": "C-3"}),
+        ):
+            with self.subTest(case=label):
+                self.assertEqual(
+                    permitted_states(self.policy, {**facts, **self.AUTHORIZED}),
+                    frozenset({"CLEAR"}),
+                )
+
+    def test_no_open_decision_item_is_false_when_something_is_open(self) -> None:
+        """A3-1 clause 1 is 'no decision item is open'. Declaring open_decision_item
+        false alongside a triggering element or a contradiction is self-contradictory
+        and must not yield CLEAR."""
+        for label, facts, expected in (
+            ("triggered element", {"security": True}, "NEEDS_INPUT"),
+            ("contradiction", {"conflict_clause": "C-1"}, "CONFLICT"),
+            ("reserved", {"explicit_user_authority": "reserved"}, "NEEDS_INPUT"),
+        ):
+            with self.subTest(case=label):
+                self.assertEqual(
+                    permitted_states(self.policy, {"open_decision_item": False, **facts}),
+                    frozenset({expected}),
+                )
+
+    def test_no_open_decision_item_alone_still_yields_clear(self) -> None:
+        """POSITIVE CONTROL for the refinement above."""
+        self.assertEqual(
+            permitted_states(self.policy, {"open_decision_item": False}),
+            frozenset({"CLEAR"}),
+        )
+
+    def test_undeclared_facts_permit_nothing_by_design(self) -> None:
+        """Empty facts return an EMPTY set, and that is deliberate, not an oversight.
+        A3-1 admits CLEAR only on an affirmative 'no decision item is open'; a caller
+        that has declared nothing has not asserted that. Returning CLEAR for silence
+        would make the absence of analysis look like a clean result, which is the
+        failure mode this contract exists to prevent. Documented in DESIGN D2-2c."""
+        self.assertEqual(permitted_states(self.policy, {}), frozenset())
+
+    def test_no_combination_permits_a_continuing_state_without_a_resolver(self) -> None:
+        """The invariant behind RI3-1, over the whole combination space rather than the
+        two reported cases: for every triggering element, every CONFLICT clause, and
+        every pair of the two, a continuing state (CLEAR or ASSUMPTION_ALLOWED) is
+        permitted ONLY with a determining policy source that A4-0 allows to resolve
+        that item, or an allowlisted user decision. 105 combinations."""
+        triggers = {
+            name: (spec.triggering[0] if isinstance(spec.triggering, (list, tuple))
+                   else True)
+            for name, spec in self.policy.boundary_elements.items()
+            if spec.triggering is not None and spec.triggering != "at_minimum"
+        }
+        # D4-F guard
+        self.assertEqual(len(triggers), 9)
+        clauses = sorted(self.policy.entry_clauses["CONFLICT"])
+        self.assertEqual(len(clauses), 3)
+
+        cases = [({name: value}, {name}, False) for name, value in triggers.items()]
+        cases += [({"conflict_clause": c}, set(), True) for c in clauses]
+        cases += [
+            ({name: value, "conflict_clause": "C-1"}, {name}, True)
+            for name, value in triggers.items()
+        ]
+        no_resolver = {
+            "none": {},
+            "supporting": self.SUPPORTS,
+            "forbidden": self.FORBIDDEN,
+        }
+        checked = 0
+        for facts, _, _ in cases:
+            for label, resolver in no_resolver.items():
+                with self.subTest(facts=sorted(facts), resolver=label):
+                    permitted = permitted_states(self.policy, {**facts, **resolver})
+                    self.assertFalse(
+                        permitted & {"CLEAR", "ASSUMPTION_ALLOWED"},
+                        f"{sorted(facts)} + {label} leaked {sorted(permitted)}",
+                    )
+                    self.assertTrue(permitted, "a declared item must permit something")
+                    checked += 1
+        self.assertEqual(checked, 21 * 3)
+
+    def test_both_pausing_states_are_permitted_when_both_are_declared(self) -> None:
+        """Not a defect, and recorded because my first sweep expectation said it was.
+        A3-1 makes NEEDS_INPUT 'missing information' and CONFLICT 'contradictory
+        information' -- different decision items. OQ-1 settled that state is per ITEM
+        with a per-check aggregate, so facts declaring both legitimately permit both;
+        `aggregate_order` is what reduces a multi-item check to one reported state.
+        Neither is a continuing state, so nothing is weakened."""
+        permitted = permitted_states(
+            self.policy, {"security": True, "conflict_clause": "C-1"}
+        )
+        self.assertEqual(permitted, frozenset({"NEEDS_INPUT", "CONFLICT"}))
+        self.assertEqual(self.policy.aggregate_order[0], "CONFLICT")
+
+    def test_widening_the_precedence_list_changes_the_verdict(self) -> None:
+        """Mutation resistance in-process: emptying the list restores the RI3-1 defect,
+        proving this suite reads the contract rather than a hardcoded expectation."""
+        mutated = json.loads(json.dumps(self.block))
+        mutated["authority_precedence"]["policy_source_cannot_resolve"] = []
+        widened = parse_decision_policy(mutated)
+        facts = {"explicit_user_authority": "reserved", **self.DETERMINES}
+        self.assertIn("CLEAR", permitted_states(widened, facts))
+        self.assertNotIn("CLEAR", permitted_states(self.policy, facts))
+
+
 class Requirement3BoundaryElementMustMatchTheCode(DecisionPolicyTestCase):
     """FR-3. validate_record() checked only that the evidence field was non-empty, so
     `security_impact` could be filed with boundary_element `privacy`. Misclassification
@@ -677,9 +880,10 @@ class Requirement7RiskIndependence(DecisionPolicyTestCase):
                 hits.append(f"{path} (value)")
 
         # D4-F guard: the walk must actually visit every selection input. The count
-        # rose from 16 to 17 when FR-2 added user_decision_sources -- the guard doing
-        # its job on a legitimate change, not just on a mutation.
-        self.assertEqual(len(STATE_SELECTION_INPUTS & set(self.block)), 18)
+        # has risen 16 -> 17 (FR-2 user_decision_sources) -> 18 (FR-4 entry_conditions)
+        # -> 19 (RI3-1 authority_precedence). Each time the guard flagged a legitimate
+        # change, which is what a cardinality guard is for.
+        self.assertEqual(len(STATE_SELECTION_INPUTS & set(self.block)), 19)
         for key in sorted(STATE_SELECTION_INPUTS):
             walk(self.block[key], key)
         self.assertEqual(hits, [])
