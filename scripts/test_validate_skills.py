@@ -210,6 +210,100 @@ class ValidatorRegressionTests(unittest.TestCase):
                 )
         self.assert_validator_fails_with("missing the decision record optionality sentence")
 
+    # ---- TEST phase: the semantic core, found unpinned by mutation ------------
+    # Each of these five mutations passed EVERY check before C15-C23 existed. They
+    # are the reason closed-set membership is not sufficient: "continue" is a legal
+    # workflow value, so C11c was satisfied while the state that must pause declared
+    # that it continues.
+
+    def test_decision_policy_needs_input_workflow_flipped_to_continue_fails(self) -> None:
+        """N-1: the most severe. NEEDS_INPUT declaring "continue" defeats bounded
+        autonomy outright, and "continue" is inside the closed workflow set."""
+        self.edit_skills(
+            '"NEEDS_INPUT": {"workflow": "pause_and_ask"',
+            '"NEEDS_INPUT": {"workflow": "continue"',
+        )
+        self.assert_validator_fails_with("decision policy state semantics drifted")
+
+    def test_decision_policy_assumption_allowed_review_dropped_fails(self) -> None:
+        """N-13: continue_and_review -> continue drops the review the ROADMAP requires
+        of a recorded assumption."""
+        self.edit_skills(
+            '"ASSUMPTION_ALLOWED": {"workflow": "continue_and_review"',
+            '"ASSUMPTION_ALLOWED": {"workflow": "continue"',
+        )
+        self.assert_validator_fails_with("decision policy state semantics drifted")
+
+    def test_decision_policy_user_decision_requirement_dropped_fails(self) -> None:
+        """N-14: NEEDS_INPUT no longer declaring that it needs a user decision."""
+        self.edit_skills(
+            '"NEEDS_INPUT": {"workflow": "pause_and_ask", "user_decision_required": true',
+            '"NEEDS_INPUT": {"workflow": "pause_and_ask", "user_decision_required": false',
+        )
+        self.assert_validator_fails_with("decision policy state semantics drifted")
+
+    def test_decision_policy_inv4_blast_radius_clause_emptied_fails(self) -> None:
+        """N-5: INV-4's blast-radius half silently removed."""
+        self.edit_skills(
+            '"blast_radius_in_with_irreversible": ["repository", "external_system"],',
+            '"blast_radius_in_with_irreversible": [],',
+        )
+        self.assert_validator_fails_with("INV-4 forbidden-when conditions drifted")
+
+    def test_decision_policy_aggregate_order_inverted_fails(self) -> None:
+        """N-8: inverting the order would let a check report CLEAR while an item is
+        in CONFLICT."""
+        self.edit_skills(
+            '"aggregate_order": ["CONFLICT", "NEEDS_INPUT", "ASSUMPTION_ALLOWED", "CLEAR"]',
+            '"aggregate_order": ["CLEAR", "ASSUMPTION_ALLOWED", "NEEDS_INPUT", "CONFLICT"]',
+        )
+        self.assert_validator_fails_with("decision policy aggregate order drifted")
+
+    def test_decision_policy_assumption_requires_determining_source_fails(self) -> None:
+        """N-4: INV-3 weakened to accept a determining policy source."""
+        self.edit_skills(
+            '"assumption_allowed_requires": {"policy_source_role": "supports"',
+            '"assumption_allowed_requires": {"policy_source_role": "determines"',
+        )
+        self.assert_validator_fails_with("INV-3 assumption requirements drifted")
+
+    def test_decision_policy_user_decision_fields_trimmed_fails(self) -> None:
+        """N-6: INV-5's evidence requirement weakened."""
+        self.edit_skills(
+            '"user_decision_fields": ["source", "where_recorded", "resolves"]',
+            '"user_decision_fields": ["source"]',
+        )
+        self.assert_validator_fails_with("user_decision required fields drifted")
+
+    def test_decision_policy_citation_minimum_lowered_fails(self) -> None:
+        """N-3: CONFLICT needs two citations by definition -- one side is not a
+        contradiction."""
+        self.edit_skills(
+            '"citation_minimum": {"CONFLICT": 2}', '"citation_minimum": {"CONFLICT": 1}'
+        )
+        self.assert_validator_fails_with("CONFLICT citation minimum drifted")
+
+    def test_decision_policy_downstream_rule_emptied_fails(self) -> None:
+        """N-12: T-F6 silently removed."""
+        self.edit_skills(
+            '"downstream_rule": "an unresolved NEEDS_INPUT or CONFLICT item may not '
+            'be reported CLEAR by a later phase"',
+            '"downstream_rule": ""',
+        )
+        self.assert_validator_fails_with("downstream rule drifted")
+
+    def test_decision_policy_entry_clause_prose_edited_in_both_skills_fails(self) -> None:
+        """M-21, two-file variant. DESIGN F-5 records the THREE-file coordinated
+        variant -- both Skills plus this expected constant -- as a residual gap that
+        only human diff review catches. That remains true; this closes the cheaper
+        variant, where the Skills are edited and the constant is not."""
+        self.edit_skills(
+            '"N-1": "a boundary element is true, is not determined by a policy source, '
+            'and is not decided by an explicit authorization"',
+            '"N-1": "a boundary element is true, unless the run risk is low"',
+        )
+        self.assert_validator_fails_with("entry clause text drifted")
+
     def test_valid_repository_passes(self) -> None:
         result = self.run_validator()
 

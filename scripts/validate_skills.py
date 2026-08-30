@@ -453,6 +453,92 @@ DECISION_POLICY_REASON_CODES: dict[str, tuple[str, str | None, str | None]] = {
     "requirement_vs_safety_floor": ("CONFLICT", "C-3", None),
 }
 DECISION_POLICY_CODE_COUNT = 18  # UD-4
+# TEST phase: the constant above pinned only the reason codes, which left the
+# semantic core unpinned. Five surgical mutations passed every check --
+# NEEDS_INPUT's workflow flipped to "continue" (a legal member of the closed set,
+# so C11c was satisfied while bounded autonomy was defeated), the two other state
+# flags, INV-4's blast-radius clause emptied, and aggregate_order inverted so CLEAR
+# would dominate CONFLICT. Closed-set membership is not the same as correct value;
+# these pin the values.
+DECISION_POLICY_STATES = {
+    "CLEAR": ("continue", False, False),
+    "ASSUMPTION_ALLOWED": ("continue_and_review", False, True),
+    "NEEDS_INPUT": ("pause_and_ask", True, True),
+    "CONFLICT": ("pause_and_request_resolution", True, True),
+}
+DECISION_POLICY_AGGREGATE_ORDER = (
+    "CONFLICT",
+    "NEEDS_INPUT",
+    "ASSUMPTION_ALLOWED",
+    "CLEAR",
+)
+DECISION_POLICY_FORBIDDEN_WHEN = {
+    "reversibility_in": ["irreversible"],
+    "blast_radius_in_with_irreversible": ["repository", "external_system"],
+    "any_true_of": [
+        "monetary_cost",
+        "security",
+        "privacy",
+        "compliance",
+        "long_term_lock_in",
+    ],
+    "explicit_user_authority_reserved": True,
+    "exception_allowed": False,
+}
+DECISION_POLICY_ASSUMPTION_REQUIRES = {
+    "policy_source_role": "supports",
+    "all_required_evidence_non_empty": True,
+}
+DECISION_POLICY_USER_DECISION_FIELDS = ("source", "where_recorded", "resolves")
+DECISION_POLICY_CITATION_MINIMUM = {"CONFLICT": 2}
+DECISION_POLICY_REQUIRED_EVIDENCE = {
+    "CLEAR": (),
+    "ASSUMPTION_ALLOWED": (
+        "reason_code",
+        "policy_source",
+        "reversibility",
+        "impact",
+        "retraction_condition",
+    ),
+    "NEEDS_INPUT": (
+        "reason_code",
+        "boundary_element",
+        "what_is_missing",
+        "why_policy_cannot_decide",
+    ),
+    "CONFLICT": ("reason_code", "citations", "why_they_cannot_both_hold"),
+}
+# Entry-clause prose and the downstream rule are pinned by VALUE. DESIGN F-5 records
+# that a coordinated edit of both Skills AND this constant still passes every static
+# check -- that remains true and is still only caught by human diff review. What this
+# does close is the two-file variant: editing the Skills alone now fails here.
+DECISION_POLICY_ENTRY_CLAUSES = {
+    "NEEDS_INPUT": {
+        "N-1": (
+            "a boundary element is true, is not determined by a policy source, and "
+            "is not decided by an explicit authorization"
+        ),
+        "N-2": "required user intent is absent",
+        "N-3": (
+            "the item crosses the autonomy boundary but cannot be classified under "
+            "these closed vocabularies"
+        ),
+    },
+    "CONFLICT": {
+        "C-1": "two or more explicit requirements are contradictory",
+        "C-2": (
+            "an explicit requirement contradicts an already-accepted decision of "
+            "this run"
+        ),
+        "C-3": (
+            "an explicit requirement contradicts a non-overridable project invariant"
+        ),
+    },
+}
+DECISION_POLICY_DOWNSTREAM_RULE = (
+    "an unresolved NEEDS_INPUT or CONFLICT item may not be reported CLEAR by a "
+    "later phase"
+)
 DECISION_POLICY_PER_STATE = {"ASSUMPTION_ALLOWED": 4, "NEEDS_INPUT": 11, "CONFLICT": 3}
 DECISION_POLICY_BOUNDARY_ELEMENTS = (
     "ambiguity",
@@ -2094,6 +2180,51 @@ def validate_decision_policy_contract(validation: Validation) -> None:
         validation.check(  # C9
             policy.assumption_allowed_forbidden_when.get("exception_allowed") is False,
             f"{name}: INV-4 must have no exception",
+        )
+        observed_states = {
+            state: (spec.workflow, spec.user_decision_required, spec.reason_code_required)
+            for state, spec in policy.states.items()
+        }
+        validation.check(  # C15
+            observed_states == DECISION_POLICY_STATES,
+            f"{name}: decision policy state semantics drifted "
+            "(workflow / user_decision_required / reason_code_required)",
+        )
+        validation.check(  # C16
+            policy.aggregate_order == DECISION_POLICY_AGGREGATE_ORDER,
+            f"{name}: decision policy aggregate order drifted",
+        )
+        validation.check(  # C17
+            dict(policy.assumption_allowed_forbidden_when)
+            == DECISION_POLICY_FORBIDDEN_WHEN,
+            f"{name}: INV-4 forbidden-when conditions drifted",
+        )
+        validation.check(  # C18
+            dict(policy.assumption_allowed_requires)
+            == DECISION_POLICY_ASSUMPTION_REQUIRES,
+            f"{name}: INV-3 assumption requirements drifted",
+        )
+        validation.check(  # C19
+            policy.user_decision_fields == DECISION_POLICY_USER_DECISION_FIELDS,
+            f"{name}: user_decision required fields drifted",
+        )
+        validation.check(  # C20
+            dict(policy.citation_minimum) == DECISION_POLICY_CITATION_MINIMUM,
+            f"{name}: CONFLICT citation minimum drifted",
+        )
+        validation.check(  # C21
+            {s: tuple(f) for s, f in policy.required_evidence.items()}
+            == DECISION_POLICY_REQUIRED_EVIDENCE,
+            f"{name}: per-state required evidence drifted",
+        )
+        validation.check(  # C22
+            {s: dict(c) for s, c in policy.entry_clauses.items()}
+            == DECISION_POLICY_ENTRY_CLAUSES,
+            f"{name}: entry clause text drifted",
+        )
+        validation.check(  # C23
+            policy.downstream_rule == DECISION_POLICY_DOWNSTREAM_RULE,
+            f"{name}: downstream rule drifted",
         )
         validation.check(  # C10
             tuple(sorted(policy.forbidden_authority_sources))
