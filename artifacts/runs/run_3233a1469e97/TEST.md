@@ -798,3 +798,150 @@ was reproduced by execution and is recorded above with the exact facts that prod
 None of them is a regression introduced by FR-5: TR4-1 and TR4-3 predate this run's
 corrections, and TR4-2 dates from FR-4, when `entry_conditions` was introduced beside
 the pre-existing `assumption_allowed_forbidden_when` without the two being reconciled.
+
+---
+
+## Downstream revalidation — iteration 5 (§17 T5a), after TR4-1/2/3
+
+The final TEST iteration. The IMPLEMENTATION correction changed evaluator code only —
+**no contract edit** — routing three rules through helpers both fact-reading APIs call, and
+adding a call-closure test as the structural guard. This pass re-ran the whole net on top
+of it, exercised that guard in both directions, and reproduced the parity numbers
+independently.
+
+### T1 — the safety net still bites (27 mutations, control green)
+
+Control verified green before either set. Both sets re-run against `a24e70d`.
+
+| Set | Mutations | Result |
+| --- | --- | --- |
+| contract value pins C15–C23 | T-1 … T-9 | **9/9 CAUGHT** |
+| transition matrix C26 / C26a | T-10 … T-12 | **3/3 CAUGHT** |
+| C27 / C28 / C29 | T-13 … T-16 | **4/4 CAUGHT** |
+| C30 / C31 entry conditions, precedence | T-17 … T-20 | **4/4 CAUGHT** |
+| TR4 fixes R-1 … R-7 (incl. both over-blocking probes) | R-1 … R-7 | **7/7 CAUGHT** |
+
+**27/27 CAUGHT, nothing flipped to MISSED.** `T-0` / `R-0` report MISSED by construction —
+those are the control rows, where an unmodified tree escaping detection is the desired
+result.
+
+### T2 — the call-closure device, exercised in both directions
+
+The guard's whole purpose is to fail when a fact rule reaches one API and not the other.
+That was tested by actually doing it, not by reading the test.
+
+| # | Mutation | Closure test | Expected |
+| --- | --- | --- | --- |
+| C-0 | none (control) | PASS | PASS |
+| C-1 | a new helper called from `validate_record` **only** | **FAIL** | FAIL |
+| C-2 | a new helper called from `permitted_states` **only** | **FAIL** | FAIL |
+| C-3 | the same helper called from **both** | **PASS** | PASS |
+| C-4 | an **inline** `_require` added to one API only | **PASS** | — see below |
+| C-5 | `_entry_condition_defect` removed from **both** | **FAIL** | FAIL |
+
+C-1 and C-2 show it bites symmetrically; C-3 shows it does not simply refuse change; C-5
+shows the named-helper guard catches the coordinated deletion that set equality alone would
+miss.
+
+**C-4 is the device's real boundary, found by executing it.** An inline `_require` adds no
+name to a call closure, so the closure test passes straight through it. The device catches
+a rule added as a **helper call** to one side — which is where FR-5, TR4-1 and TR4-2 each
+actually lived — but the DESIGN wording ("fails if a judgement is added to one and not the
+other") is slightly wider than what the mechanism does. Recorded rather than left implicit.
+
+**Half of that boundary is now closed, in the direction that matters.**
+`test_the_evaluator_delegates_every_judgement` asserts `permitted_states` contains zero
+inline `_require`/`raise` — it reads nothing but declared facts, so it has no legitimate
+inline rule, and today has exactly zero. Under the C-4 mutation the closure test passes and
+this one **fails**, which is the gap closing. The mirror is deliberately not asserted:
+`validate_record` has twelve inline `_require` calls that are record-**shape** rules
+(reason_code/state agreement, citation minimum, evidence presence), not fact rules, and
+forbidding them there would be over-blocking. The new test carries a positive control that
+its own AST query can see such a node, so it cannot pass by being broken.
+
+### T3 — parity reproduced independently
+
+Reproduced from scratch, with the base record's validity asserted **first** — a probe whose
+base fixture is invalid reports false divergences everywhere, which is exactly how an
+invalid reason code produced a false divergence earlier in this run.
+
+| Measure | Reported | Reproduced |
+| --- | --- | --- |
+| ASSUMPTION_ALLOWED combinations | 48 | **48** |
+| disagreements | 0 | **0** |
+| combinations still permitting the state | 2 | **2** |
+| multi-site concepts | 9 | **9** |
+| total parity cases | 109 | **109** |
+| divergences | 0 | **0** |
+
+The two permitted combinations are `reversible_in_run` × `current_change` and
+`reversible_in_run` × `module`, both with security false and no reserved authority. Fewer
+than two would be over-blocking; more would mean the contract had been loosened. It is
+exactly two.
+
+### T4 — the nine types, applied to the new surfaces for the last time
+
+Surfaces: `_entry_condition_defect`, the role check inside `_validate_declared_facts`, the
+stripped `_is_empty`, and the call-closure tests. Every row executed.
+
+| # | Type | Finding | Verdict |
+| --- | --- | --- | --- |
+| (a) | unreachable clause | both branches of `_entry_condition_defect` reached, for `all_of` and `any_of` states alike; R-4/R-5 confirm by mutation | clean |
+| (b) | vacuous / empty loop | collections actually emptied, see below | clean |
+| (c) | membership only, value unchecked | the entry predicates read values, not just key presence; R-5 (combinator ignored) is CAUGHT | clean |
+| (d) | denylist for a category | the entry condition is a positive gate; INV-4 remains as the prohibition rather than as the rule | clean |
+| (e) | presence without consistency | `_is_empty` now strips, so a present-but-blank field is empty; R-6 CAUGHT | clean |
+| (f) | forbid without permit | every negative paired with a positive control; R-4 and R-7 are the over-blocking probes and both are CAUGHT | clean |
+| (g) | predicates independent, broken in combination | RI3-1 precedence re-verified: determining + reserved → `{NEEDS_INPUT}`, determining + contradiction → `{CONFLICT}` | clean |
+| (h) | dead trigger | every enum element's `triggering` ⊆ its own `values`, enforced at load time | clean |
+| (i) | same concept judged in two places | 9 concepts, 109 cases, 0 divergences | clean |
+
+**Nothing new was found.** This is the first pass in the run where the nine-type sweep
+turned up no gap on the surface it was applied to.
+
+#### (b) — the collections were emptied, not inspected
+
+| Test | Collection emptied | Result |
+| --- | --- | --- |
+| `..._every_legal_role_is_accepted...` | `policy_source_roles` | **guard bit** |
+| `..._agree_on_all_forty_eight_combinations` | `reversibility` + `blast_radius` values | **guard bit** |
+| `..._refuse_every_middle_band_case` | same | **guard bit** |
+| `..._refuse_every_hard_case` | `assumption_allowed_forbidden_when.any_true_of` | **guard bit** |
+| `..._whitespace_only_evidence_is_refused...` | `user_decision_fields` | **guard bit** |
+| `..._an_invented_role_is_rejected...` | `policy_source_roles` | passes — iterates a literal tuple of four spellings, not the contract, so contract drift cannot empty it |
+
+### T5 — every fix still holds
+
+**10/10 by execution:** FR-1 (both named edges), FR-2, FR-3, FR-4, RI3-1, FR-5, TR4-1,
+TR4-2, TR4-3. **3/3 positive controls:** complete decision → `{CLEAR}`, ordinary +
+determining → `{CLEAR}`, safe + supporting → `{ASSUMPTION_ALLOWED}`.
+
+### What this suite still cannot detect
+
+Unchanged and restated so it is not lost: **no suite detects deletion of its own
+assertion** (mutation N-6, iteration 4). The C-4 boundary above is the second such honest
+limit, and it is now half-closed rather than merely documented.
+
+### Commands after this pass
+
+| Command | Result |
+| --- | --- |
+| `python3 scripts/validate_skills.py` | **PASSED (642 checks)** — unchanged; this pass added a test, not a validator check |
+| `python3 -m unittest discover -s scripts -p 'test_*.py'` | **1426 tests OK (skipped=6)** — was 1425; the +1 is the delegation test and **skips did not increase** |
+| `python3 scripts/verify_package.py` | **PASSED (173 source files)** |
+| `python3 scripts/build_release.py` | built `dist/orca-skills-0.9.0.tar.gz` |
+| `verify_package.py --archive …` | **PASSED (173 source files)**, archive verified |
+| `git diff --check` | clean |
+
+Protected surfaces re-checked and untouched: `VERSION`, `LICENSE`, `skill_policy.py` (so
+`evaluate_invocation()` is unchanged, UD-3), `quality_profile.py`, `agent_profile.py`,
+**both `SKILL.md` contracts**, `templates/**`, `reviews/**`, and `decision_policy.py`. This
+pass edited one test file.
+
+### Verdict
+
+The TEST-phase guarantees hold on top of the TR4 correction. 27/27 mutations caught with a
+verified-green control, the parity numbers reproduce exactly (48/0/2 and 9/109/0), the
+call-closure device bites in both directions and does not over-block, and the nine-type
+sweep found nothing new on the new surfaces. One bounded limit of that device was found by
+executing it, and the half that could be closed without over-blocking has been closed.
