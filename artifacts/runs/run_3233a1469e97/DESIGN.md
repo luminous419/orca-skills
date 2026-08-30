@@ -106,8 +106,14 @@ key of that JSON object, after `"errors"`. Byte-identical in both Skills; deep-e
     "requirement_vs_accepted_decision": {"state": "CONFLICT", "clause": "C-2"},
     "requirement_vs_safety_floor": {"state": "CONFLICT", "clause": "C-3"}
   },
+  "entry_conditions": {
+    "CLEAR": {"any_of": ["no_open_decision_item", "determining_policy_source", "explicit_user_authorization"]},
+    "ASSUMPTION_ALLOWED": {"all_of": ["reversible_in_run", "blast_radius_within_scope", "no_high_impact_element", "supporting_policy_source", "no_reserved_user_authority"]},
+    "NEEDS_INPUT": {"any_of": ["undetermined_boundary_element", "absent_user_intent", "unclassifiable_item"]},
+    "CONFLICT": {"any_of": ["declared_contradiction"]}
+  },
   "boundary_elements": {
-    "ambiguity": {"kind": "declared"},
+    "ambiguity": {"kind": "declared", "triggering": true},
     "explicit_requirement_conflict": {"kind": "citations", "minimum": 2},
     "reversibility": {"kind": "enum", "values": ["reversible_in_run", "reversible_with_effort", "irreversible"]},
     "blast_radius": {"kind": "enum", "values": ["current_change", "module", "repository", "external_system"]},
@@ -451,6 +457,69 @@ Those two are not gaps.
 the unmodified tree stays green — the unmutated control is run in the same sweep so a validator that
 merely failed on everything would be visible.
 
+#### D2-2b. `permitted_states` evaluates entry conditions (FR-4), and codes bind their element (FR-3)
+
+Final Adversarial Review attempt 2 raised two blocking findings, both reproduced before any change.
+
+**FR-4 (CRITICAL).** `permitted_states()` fixed its result to `{CLEAR, NEEDS_INPUT, CONFLICT}` and
+computed only whether to add `ASSUMPTION_ALLOWED`. So facts declaring an **irreversible,
+external-system, security-relevant** item with no policy source and no authorization returned
+`['CLEAR', 'CONFLICT', 'NEEDS_INPUT']` — automatic approval of an irreversible high-impact decision
+without explicit authority, which the ticket forbids outright. The requirement-4 test asserted only
+the **absence of `ASSUMPTION_ALLOWED`**, a narrower property than the one being claimed.
+
+A3-1's entry conditions are now **contract data rather than prose**, transcribed from the approved
+wording rather than newly designed:
+
+```text
+CLEAR              any_of  no_open_decision_item / determining_policy_source /
+                           explicit_user_authorization
+ASSUMPTION_ALLOWED all_of  reversible_in_run / blast_radius_within_scope /
+                           no_high_impact_element / supporting_policy_source /
+                           no_reserved_user_authority
+NEEDS_INPUT        any_of  undetermined_boundary_element / absent_user_intent /
+                           unclassifiable_item
+CONFLICT           any_of  declared_contradiction
+```
+
+Predicate names come from a **closed twelve-entry vocabulary** (`ENTRY_PREDICATES`), so a typo fails
+at load rather than silently making a condition unsatisfiable. Each boundary element gains a
+`triggering` value saying which of its values make it true in A3-1's sense — those values are A4-1's,
+not new: `irreversible`; blast radius in `{repository, external_system}`; the five booleans `true`;
+authority `reserved`; and `null` for `repository_project_policy`, which A4-0 classifies as a boundary
+**input** rather than a trigger.
+
+Verified before and after, same facts:
+
+```text
+before:  ['CLEAR', 'CONFLICT', 'NEEDS_INPUT']      <- CLEAR with no authority
+after :  ['NEEDS_INPUT']                            <- only the pausing state
+after + determining policy source:  ['CLEAR']
+after + allowlisted authorization:  ['CLEAR']
+after + FORBIDDEN authorization  :  ['NEEDS_INPUT'] <- FR-2's allowlist gates this route too
+```
+
+**FR-3.** `validate_record()` checked that the evidence field was non-empty but never that it
+**matched the element the reason code binds**, so `security_impact` could be filed with
+`boundary_element: privacy`. Misclassification — precisely what a Reviewer is required to be able to
+judge — was not machine-checkable, and the liveness test compared the two values in *test* code,
+which proves the fixture is self-consistent rather than that production rejects an inconsistent one.
+Exact equality is now enforced. `unclassifiable_decision`'s deliberate absence of a bound element is
+kept as a **separate positive control** that also rejects smuggling one in.
+
+**The two axes, swept further.** FR-4's shape is *"forbids but never permits"*; FR-3's is *"checks
+presence but never consistency"*. Sweeping both found **three more** on the FR-3 axis, each verified
+by probe: `reversibility` and `blast_radius` accepted values outside their own declared enums, and
+`policy_source.kind` accepted a kind outside the closed set. An unrecognised enum value did not
+raise — it matched no triggering value, so `permitted_states` returned an **empty set**: degenerate
+rather than fail-closed. Declared values are now checked for membership, while **omitting** an
+element stays legal, so the fix does not over-block.
+
+**Over-blocking is the mirror defect, so every negative check has a positive control.** Legitimate
+`CLEAR` (nothing open / determining policy / allowlisted authorization), `ASSUMPTION_ALLOWED` (safe,
+reversible, supporting policy), and `CONFLICT` (declared contradiction) all remain reachable and are
+each asserted.
+
 #### D2-3. What the loader deliberately does not do
 
 No import from `orca_runtime_harness`, `run_logging`, `review_isolation`, `e2e_harness`, or
@@ -484,6 +553,8 @@ dependency direction `validate_risk_profile_contract` already has toward
 | C27 | each boundary element's `{kind, values, minimum}` payload equals the expected spec — not just the element names | `<skill>: boundary element specifications drifted (kind / enum values / minimum)` |
 | C28 | `policy_source_roles` and `policy_source_kinds` equal their expected tuples | `<skill>: policy source roles or kinds drifted` |
 | C29 | `state_scope` equals OQ-1's settled value | `<skill>: decision state scope drifted` |
+| C30 | `entry_conditions` equals the expected combinator + predicate tuple per state (FR-4) — `permitted_states` evaluates these, so a change here moves the authority boundary | `<skill>: state entry conditions drifted` |
+| C27 *(extended)* | each boundary element's `triggering` value is pinned alongside `{kind, values, minimum}` (FR-4) | `<skill>: boundary element specifications drifted` |
 | C25 | `user_decision_sources` and `forbidden_authority_sources` are disjoint | `<skill>: the user-authority vocabulary admits a forbidden source` |
 | C11a | **partition completeness** — every key of `decision_policy` is in `STATE_SELECTION_INPUTS` or `DECLARATIVE_KEYS`, and their union equals the key set exactly (R-A2) | `decision policy key <name> is not classified as a selection input or declarative` |
 | C11b | **no axis token in a selection input** — no key name and no string value inside any `STATE_SELECTION_INPUTS` subtree **exactly equals** a member of `AXIS_TOKENS` (R-A3) | `decision policy references axis token <token> at <path>, which is a state-selection input` |
@@ -530,6 +601,7 @@ STATE_SELECTION_INPUTS = {          # keys whose CONTENT may participate in sele
   "boundary_elements", "required_evidence",
   "assumption_allowed_requires", "assumption_allowed_forbidden_when",
   "user_decision_fields", "user_decision_sources", "forbidden_authority_sources",
+  "entry_conditions",
   "citation_minimum", "downstream_rule", "aggregate_order",
   "policy_source_roles", "policy_source_kinds", "state_scope"
 }
