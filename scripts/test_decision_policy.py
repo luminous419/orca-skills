@@ -1039,6 +1039,42 @@ class UserDecisionJudgementIsSharedByBothApis(DecisionPolicyTestCase):
                 checked += 1
         self.assertEqual(checked, 4)
 
+    def test_an_empty_field_is_not_evidence_either(self) -> None:
+        """Closes the gap mutation N-4 exposed. Every test above removes a field with
+        `pop`, so a helper that checked only `field not in decision` -- presence
+        without content, recurring defect type (e) -- passed the whole suite. A
+        `where_recorded` of "" is a filled-in form with nothing written on it.
+        Both APIs must refuse it, exactly as they refuse the missing field."""
+        fields = list(self.policy.user_decision_fields)
+        # Whitespace-only is deliberately NOT in this tuple: `_is_empty` treats
+        # "   " as content, so a whitespace `where_recorded` is accepted as
+        # evidence today. That is reported as TR4-3, not asserted here in either
+        # direction -- pinning it would freeze the defect.
+        empties = ("", None, [], {})
+        # D4-F guards, co-located: neither loop may be empty.
+        self.assertEqual(len(fields), 3)
+        self.assertEqual(len(empties), 4)
+        checked = 0
+        for field in fields:
+            for empty in empties:
+                with self.subTest(field=field, empty=repr(empty)):
+                    decision = complete_decision()
+                    decision[field] = empty
+                    facts = {"security": True, "user_decision": decision}
+                    self.assertNotIn("CLEAR", permitted_states(self.policy, facts))
+                    with self.assertRaises(DecisionPolicyError):
+                        validate_transition(self.policy, "NEEDS_INPUT", "CLEAR", facts)
+                    checked += 1
+        self.assertEqual(checked, 12)
+        # POSITIVE CONTROL: the same record with real content is still accepted, so
+        # this test cannot be satisfied by refusing everything.
+        self.assertIn(
+            "CLEAR",
+            permitted_states(
+                self.policy, {"security": True, "user_decision": complete_decision()}
+            ),
+        )
+
     def test_the_two_apis_agree_on_every_source(self) -> None:
         """Parity over the source axis: allowlisted, each forbidden category, and an
         invented spelling — always with a COMPLETE record, so the source is the only
@@ -1369,6 +1405,123 @@ class OptionalDecisionRecord(DecisionPolicyTestCase):
         instance = load_fixture("clear/absence_is_valid.json")
         self.assertNotIn("state", instance)
         self.assertNotIn("reason_code", instance)
+
+
+class CrossApiConceptParity(DecisionPolicyTestCase):
+    """T2(i). FR-5 was one instance of a shape: the SAME concept judged in two
+    places, reaching different verdicts, with the permissive side gating the risky
+    path. This class sweeps the other concepts that more than one public API judges
+    and pins the ones that agree, so a future edit cannot quietly split them.
+
+    Two concepts are asserted here because both are routed through the shared
+    `_validate_declared_facts`: boundary-element enum membership and
+    `policy_source.kind` membership. Two further divergences were found by this
+    sweep and are REPORTED, not asserted either way, because closing them changes
+    evaluator semantics: `policy_source.role` membership (TR4-1) and the
+    ASSUMPTION_ALLOWED middle band (TR4-2). Asserting today's divergent behaviour
+    would pin a defect -- which is exactly the mistake FR-5 found in two tests.
+    """
+
+    SUPPORTS = {"role": "supports", "kind": "file_path"}
+
+    def _record(self, **extra) -> dict:
+        code = self.policy.reason_codes[codes_for_state(self.policy, "ASSUMPTION_ALLOWED")[0]]
+        record = {
+            "state": "ASSUMPTION_ALLOWED",
+            "reason_code": code.name,
+            "policy_source": dict(self.SUPPORTS),
+        }
+        if code.boundary_element:
+            record["boundary_element"] = code.boundary_element
+        for field in code.required_evidence:
+            if field in record:
+                continue
+            # A required field that is itself an enum boundary element must carry a
+            # LEGAL value, or the record fails on that instead of on what is under
+            # test -- the mistake FR-5 found in two tests, made here in miniature.
+            spec = self.policy.boundary_elements.get(field)
+            record[field] = spec.values[0] if spec and spec.kind == "enum" else "x"
+        record.update(extra)
+        return record
+
+    def _rejects(self, fn, *args) -> bool:
+        try:
+            fn(self.policy, *args)
+            return False
+        except DecisionPolicyError:
+            return True
+
+    def test_enum_membership_is_judged_identically_by_both_apis(self) -> None:
+        """An out-of-set boundary value must be REJECTED by permitted_states() and by
+        validate_record() alike -- one helper, not two opinions."""
+        enums = {
+            name: spec
+            for name, spec in self.policy.boundary_elements.items()
+            if spec.kind == "enum"
+        }
+        # D4-F guard, co-located: the loop below must not be empty.
+        self.assertGreaterEqual(len(enums), 2)
+        checked = 0
+        for name, spec in sorted(enums.items()):
+            with self.subTest(element=name):
+                good = spec.values[0]
+                self.assertFalse(self._rejects(permitted_states, {name: good}))
+                self.assertFalse(self._rejects(validate_record, self._record(**{name: good})))
+                bad = f"{good}_not_a_member"
+                self.assertTrue(self._rejects(permitted_states, {name: bad}))
+                self.assertTrue(self._rejects(validate_record, self._record(**{name: bad})))
+                checked += 1
+        self.assertEqual(checked, len(enums))
+
+    def test_policy_source_kind_membership_is_judged_identically(self) -> None:
+        kinds = sorted(self.policy.policy_source_kinds) + ["invented_kind"]
+        # D4-F guard: every declared kind plus one invented spelling.
+        self.assertEqual(len(kinds), len(self.policy.policy_source_kinds) + 1)
+        for kind in kinds:
+            with self.subTest(kind=kind):
+                source = {"role": "supports", "kind": kind}
+                legal = kind in self.policy.policy_source_kinds
+                self.assertEqual(
+                    self._rejects(permitted_states, {"policy_source": source}), not legal
+                )
+                self.assertEqual(
+                    self._rejects(validate_record, self._record(policy_source=source)),
+                    not legal,
+                )
+
+    def test_the_two_apis_agree_on_every_inv4_hard_case(self) -> None:
+        """The band that matters: whenever the item is irreversible, carries ANY
+        high-impact element, or reserves authority to the user, both APIs must refuse
+        ASSUMPTION_ALLOWED. TR4-2 is the middle band (reversible_with_effort, or a
+        wider blast radius with no high-impact flag), where they still disagree; it is
+        reported rather than asserted. This test pins the dangerous half so INV-4 and
+        the entry condition cannot drift apart where it counts."""
+        flags = tuple(self.policy.assumption_allowed_forbidden_when["any_true_of"])
+        # D4-F guard: the five high-impact flags INV-4 names.
+        self.assertEqual(len(flags), 5)
+        hard = [{"reversibility": "irreversible"}, {"explicit_user_authority": "reserved"}]
+        hard += [{flag: True} for flag in flags]
+        self.assertEqual(len(hard), 7)
+        for facts in hard:
+            with self.subTest(facts=sorted(facts)):
+                permitted = permitted_states(
+                    self.policy, {**facts, "policy_source": dict(self.SUPPORTS)}
+                )
+                self.assertNotIn("ASSUMPTION_ALLOWED", permitted)
+                self.assertTrue(self._rejects(validate_record, self._record(**facts)))
+
+    def test_a_safe_item_is_still_assumption_allowed_by_both(self) -> None:
+        """POSITIVE CONTROL for the test above. Refusing every item would satisfy the
+        hard-case sweep; it must not satisfy this."""
+        facts = {
+            "reversibility": "reversible_in_run",
+            "blast_radius": self.policy.boundary_elements["blast_radius"].values[0],
+        }
+        self.assertIn(
+            "ASSUMPTION_ALLOWED",
+            permitted_states(self.policy, {**facts, "policy_source": dict(self.SUPPORTS)}),
+        )
+        self.assertFalse(self._rejects(validate_record, self._record(**facts)))
 
 
 if __name__ == "__main__":  # pragma: no cover
