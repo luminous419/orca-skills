@@ -374,16 +374,76 @@ class Requirement9FailClosedSchema(DecisionPolicyTestCase):
         with self.assertRaises(DecisionPolicyError):
             parse_decision_policy("not-an-object")
 
-    def test_this_change_does_not_alter_evaluate_invocation_behaviour(self) -> None:
-        """UD-3: the missing schema_version gate in the existing evaluate_invocation()
-        is a PRE-EXISTING defect, out of scope, recorded as a follow-up candidate.
-        This change neither fixes nor worsens it. This test pins that: skill_policy
-        still exposes no schema-version gate of its own."""
+    def test_skill_policy_source_declares_no_schema_version_gate(self) -> None:
+        """UD-3, SOURCE SCOPE ONLY -- renamed for RI-N1.
+
+        The previous name promised a behavioural guarantee this body does not give:
+        it reads source text and checks for token absence, nothing more. Keeping the
+        old name would be exactly the "claim wider than the evidence" defect this run
+        kept hitting. The behavioural half is the characterization test below.
+        """
         import scripts.skill_policy as skill_policy
 
         source = Path(skill_policy.__file__).read_text(encoding="utf-8")
         self.assertNotIn("SUPPORTED_SCHEMA_VERSIONS", source)
         self.assertNotIn("schema_version", source)
+
+    def test_evaluate_invocation_still_accepts_an_unknown_top_level_schema_version(
+        self,
+    ) -> None:
+        """UD-3 characterization -- added for RI-N1. EXECUTES the shipped path.
+
+        This pins a PRE-EXISTING DEFECT's behaviour on purpose: evaluate_invocation()
+        has no schema_version gate, so a contract declaring an unsupported top-level
+        version still evaluates normally. UD-3 puts fixing that out of scope, so this
+        test asserts the defect is UNCHANGED -- neither fixed nor worsened by OS-28.
+
+        If a later change adds the gate, this test fails. That failure is the SIGNAL,
+        not a bug in the test: whoever adds the gate owns updating this test, and the
+        follow-up ticket for the defect is where that belongs. Do not "fix" it by
+        weakening the assertion.
+
+        Note the asymmetry this makes concrete: the same malformed-version input that
+        this shipped path accepts is REJECTED by the new decision-policy loader
+        (test_unknown_schema_version_raises). That contrast is requirement 9's scope.
+        """
+        import shutil
+        import tempfile
+
+        from scripts.skill_policy import evaluate_invocation
+
+        source_skill = REPO_ROOT / "orca-worker-reviewer-orchestration"
+        with tempfile.TemporaryDirectory() as raw:
+            temporary = Path(raw)
+            skill_dir = temporary / source_skill.name
+            skill_dir.mkdir()
+            text = (source_skill / "SKILL.md").read_text(encoding="utf-8")
+            # The TOP-LEVEL schema_version is the two-space-indented one; the
+            # decision_policy block's own key is indented four. Replacing only the
+            # first keeps this test about the pre-existing path.
+            marker = '\n  "schema_version": 1,\n'
+            self.assertEqual(text.count(marker), 1)
+            (skill_dir / "SKILL.md").write_text(
+                text.replace(marker, '\n  "schema_version": 99,\n', 1), encoding="utf-8"
+            )
+
+            binaries = temporary / "bin"
+            binaries.mkdir()
+            for command in ("claude-glm", "claude-gemma"):
+                executable = binaries / command
+                executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                executable.chmod(0o755)
+
+            decision = evaluate_invocation(
+                skill_dir / "SKILL.md",
+                f"/{source_skill.name} analysis for the login module",
+                project_root=temporary,
+                home=temporary,
+                which=lambda command: shutil.which(command, path=str(binaries)),
+            )
+
+        self.assertEqual(decision.status, "VALID")
+        self.assertTrue(decision.should_execute)
 
 
 class ReasonCodeLiveness(DecisionPolicyTestCase):
