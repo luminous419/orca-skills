@@ -4,3 +4,4 @@ dist/
 __pycache__/
 *.py[cod]
 artifacts/**/.timing_state.json
+.idea/
