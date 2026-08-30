@@ -66,6 +66,7 @@ STATE_SELECTION_INPUTS: frozenset[str] = frozenset(
         "assumption_allowed_requires",
         "assumption_allowed_forbidden_when",
         "user_decision_fields",
+        "user_decision_sources",
         "forbidden_authority_sources",
         "citation_minimum",
         "downstream_rule",
@@ -151,6 +152,7 @@ class DecisionPolicy:
     assumption_allowed_requires: Mapping[str, Any]
     assumption_allowed_forbidden_when: Mapping[str, Any]
     user_decision_fields: tuple[str, ...]
+    user_decision_sources: frozenset[str]
     forbidden_authority_sources: frozenset[str]
     citation_minimum: Mapping[str, int]
     independent_axes: tuple[str, ...]
@@ -296,6 +298,18 @@ def parse_decision_policy(block: Any) -> DecisionPolicy:
             required_evidence=effective,
         )
 
+    user_decision_sources = frozenset(block["user_decision_sources"])
+    _require(bool(user_decision_sources), "user_decision_sources must not be empty")
+    forbidden_sources = frozenset(block["forbidden_authority_sources"])
+    # FR-2: the denylist no longer enforces anything -- it guards the allowlist. If a
+    # forbidden category is ever added to the positive vocabulary, that is the defect
+    # this catches, and it catches it at load time in both Skills.
+    overlap = user_decision_sources & forbidden_sources
+    _require(
+        not overlap,
+        f"user_decision_sources must not admit a forbidden authority source: {sorted(overlap)}",
+    )
+
     independent_axes = tuple(block["independent_axes"])
     _require(
         independent_axes == CANONICAL_INDEPENDENT_AXES,
@@ -318,6 +332,7 @@ def parse_decision_policy(block: Any) -> DecisionPolicy:
         assumption_allowed_requires=dict(block["assumption_allowed_requires"]),
         assumption_allowed_forbidden_when=dict(block["assumption_allowed_forbidden_when"]),
         user_decision_fields=tuple(block["user_decision_fields"]),
+        user_decision_sources=user_decision_sources,
         forbidden_authority_sources=frozenset(block["forbidden_authority_sources"]),
         citation_minimum={k: int(v) for k, v in block["citation_minimum"].items()},
         independent_axes=independent_axes,
@@ -510,10 +525,24 @@ def validate_transition(
                 field in decision and not _is_empty(decision[field]),
                 f"user_decision requires a non-empty {field!r}",
             )
-        _require(
-            decision.get("source") not in policy.forbidden_authority_sources,
-            f"{decision.get('source')!r} is not evidence of user authority",
-        )
+        # FR-2: user authority is an ALLOWLIST, not an open string minus five tokens.
+        # A denylist of spellings cannot enforce a categorical rule -- `high_confidence`
+        # and `worker_reviewer_consensus` are the same categories as the listed
+        # `model_confidence` and `worker_reviewer_agreement` under a different spelling,
+        # and a denylist admits every synonym nobody thought of. Membership in the
+        # closed positive vocabulary is the gate; an unknown source is REJECTED.
+        claimed = decision.get("source")
+        if claimed not in policy.user_decision_sources:
+            category = (
+                " That source names a category the contract explicitly excludes from"
+                " user authority."
+                if claimed in policy.forbidden_authority_sources
+                else " An unrecognised source is rejected rather than assumed valid."
+            )
+            raise DecisionPolicyError(
+                f"{claimed!r} is not evidence of user authority; the contract admits "
+                f"only {sorted(policy.user_decision_sources)}.{category}"
+            )
     if rule == "requires_retraction":
         _require(
             not _is_empty(record.get("retraction")),

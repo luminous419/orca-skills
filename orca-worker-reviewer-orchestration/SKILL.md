@@ -308,6 +308,7 @@ DEFAULT_RISK = high
       "exception_allowed": false
     },
     "user_decision_fields": ["source", "where_recorded", "resolves"],
+    "user_decision_sources": ["explicit_user_reply", "prior_explicit_user_authorization"],
     "forbidden_authority_sources": ["model_confidence", "timeout", "no_response", "worker_reviewer_agreement", "recommended_default"],
     "citation_minimum": {"CONFLICT": 2},
     "independent_axes": ["risk", "quality_profile", "agent_profile"]

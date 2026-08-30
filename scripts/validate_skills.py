@@ -490,6 +490,15 @@ DECISION_POLICY_ASSUMPTION_REQUIRES = {
     "all_required_evidence_non_empty": True,
 }
 DECISION_POLICY_USER_DECISION_FIELDS = ("source", "where_recorded", "resolves")
+# FR-2: the closed POSITIVE vocabulary for user authority. The denylist below no
+# longer enforces anything -- enforcement is membership in this set, and an
+# unrecognised source is rejected. These two values are the only shapes ANALYSIS
+# A4-0 identifies: an in-run answer to a structured question, and a standing
+# authorization carried from the original request.
+DECISION_POLICY_USER_DECISION_SOURCES = (
+    "explicit_user_reply",
+    "prior_explicit_user_authorization",
+)
 DECISION_POLICY_CITATION_MINIMUM = {"CONFLICT": 2}
 DECISION_POLICY_REQUIRED_EVIDENCE = {
     "CLEAR": (),
@@ -2207,6 +2216,15 @@ def validate_decision_policy_contract(validation: Validation) -> None:
         validation.check(  # C19
             policy.user_decision_fields == DECISION_POLICY_USER_DECISION_FIELDS,
             f"{name}: user_decision required fields drifted",
+        )
+        validation.check(  # C24
+            tuple(sorted(policy.user_decision_sources))
+            == tuple(sorted(DECISION_POLICY_USER_DECISION_SOURCES)),
+            f"{name}: the user-authority positive vocabulary drifted",
+        )
+        validation.check(  # C25
+            not (policy.user_decision_sources & policy.forbidden_authority_sources),
+            f"{name}: the user-authority vocabulary admits a forbidden source",
         )
         validation.check(  # C20
             dict(policy.citation_minimum) == DECISION_POLICY_CITATION_MINIMUM,

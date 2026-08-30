@@ -1,0 +1,12 @@
+{
+  "from": "NEEDS_INPUT",
+  "to": "CLEAR",
+  "record": {
+    "user_decision": {
+      "source": "worker_reviewer_consensus",
+      "where_recorded": "n/a",
+      "resolves": "the item"
+    }
+  },
+  "note": "FR-2: must be rejected -- authority is an allowlist"
+}

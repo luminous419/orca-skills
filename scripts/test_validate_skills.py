@@ -304,6 +304,39 @@ class ValidatorRegressionTests(unittest.TestCase):
         )
         self.assert_validator_fails_with("entry clause text drifted")
 
+    # ---- FR-2: user authority is an allowlist ---------------------------------
+
+    def test_decision_policy_user_authority_vocabulary_drift_fails(self) -> None:
+        """C24. Widening the positive vocabulary is how a denylist bypass would come
+        back -- adding one permissive spelling reopens the whole hole."""
+        self.edit_skills(
+            '"user_decision_sources": ["explicit_user_reply", '
+            '"prior_explicit_user_authorization"]',
+            '"user_decision_sources": ["explicit_user_reply", '
+            '"prior_explicit_user_authorization", "high_confidence"]',
+        )
+        self.assert_validator_fails_with("user-authority positive vocabulary drifted")
+
+    def test_decision_policy_user_authority_vocabulary_emptied_fails(self) -> None:
+        """Over-blocking guard: an empty allowlist makes every user decision
+        unrepresentable, which the ticket also calls a wrong implementation."""
+        self.edit_skills(
+            '"user_decision_sources": ["explicit_user_reply", '
+            '"prior_explicit_user_authorization"]',
+            '"user_decision_sources": []',
+        )
+        self.assert_validator_fails_with("decision policy contract is missing or malformed")
+
+    def test_decision_policy_forbidden_source_admitted_as_authority_fails(self) -> None:
+        """C25. The retained denylist's remaining job: the two sets must stay
+        disjoint, so a forbidden category cannot be promoted into the allowlist."""
+        self.edit_skills(
+            '"user_decision_sources": ["explicit_user_reply", '
+            '"prior_explicit_user_authorization"]',
+            '"user_decision_sources": ["explicit_user_reply", "recommended_default"]',
+        )
+        self.assert_validator_fails_with("decision policy contract is missing or malformed")
+
     def test_valid_repository_passes(self) -> None:
         result = self.run_validator()
 

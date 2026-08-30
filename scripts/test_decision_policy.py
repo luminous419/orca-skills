@@ -44,6 +44,21 @@ EXPECTED_FORBIDDEN_CELLS = {
     ("CONFLICT", "ASSUMPTION_ALLOWED"),
 }
 EXPECTED_EVIDENCE_COUNTS = {"ASSUMPTION_ALLOWED": 5, "NEEDS_INPUT": 4, "CONFLICT": 3}
+EXPECTED_USER_DECISION_SOURCES = {
+    "explicit_user_reply",
+    "prior_explicit_user_authorization",
+}
+# FR-2: aliases of the forbidden CATEGORIES, none of which appears in any denylist.
+# These are the three the Final Reviewer used to demonstrate the bypass, plus an
+# invented source, an empty source, and a missing field.
+ADVERSARIAL_AUTHORITY_SOURCES = (
+    "high_confidence",
+    "worker_reviewer_consensus",
+    "automated_default",
+    "an_entirely_invented_source",
+    "empty_source",
+    "missing_source",
+)
 EXPECTED_REJECT_LIST = {
     "model_confidence",
     "timeout",
@@ -275,6 +290,115 @@ class Requirement6ConfidenceIsNeverAuthority(DecisionPolicyTestCase):
                     )
 
 
+class Requirement6UserAuthorityIsAnAllowlist(DecisionPolicyTestCase):
+    """FR-2. User authority was an open string minus five exact tokens, so
+    `high_confidence` and `worker_reviewer_consensus` -- the same categories as the
+    listed `model_confidence` and `worker_reviewer_agreement`, differently spelled --
+    satisfied a requires_user_decision transition. A denylist of spellings cannot
+    enforce a categorical rule. Enforcement is now membership in a closed positive
+    vocabulary, and an unrecognised source is rejected."""
+
+    def test_the_positive_vocabulary_is_exactly_the_two_recognised_shapes(self) -> None:
+        self.assertEqual(
+            set(self.policy.user_decision_sources), EXPECTED_USER_DECISION_SOURCES
+        )
+
+    def test_genuine_user_evidence_is_accepted(self) -> None:
+        """The other half of the FR-2 fix: over-blocking is also a wrong
+        implementation. The ticket says classifying everything as NEEDS_INPUT is a
+        defect, so the allowlist must still admit real user decisions."""
+        directory = FIXTURES / "authority_valid"
+        cases = sorted(directory.glob("*.json"))
+        # D4-F guard
+        self.assertEqual(len(cases), 2)
+        accepted = set()
+        for path in cases:
+            with self.subTest(fixture=path.name):
+                case = json.loads(path.read_text(encoding="utf-8"))
+                validate_transition(
+                    self.policy, case["from"], case["to"], case["record"]
+                )
+                accepted.add(case["record"]["user_decision"]["source"])
+        self.assertEqual(accepted, EXPECTED_USER_DECISION_SOURCES)
+
+    def test_every_recognised_source_has_a_passing_fixture(self) -> None:
+        """Bidirectional: a vocabulary entry with no fixture proving it usable would
+        be a dead entry, the RA-4 defect in a new place."""
+        proven = {
+            json.loads(p.read_text(encoding="utf-8"))["record"]["user_decision"]["source"]
+            for p in (FIXTURES / "authority_valid").glob("*.json")
+        }
+        self.assertEqual(proven, set(self.policy.user_decision_sources))
+
+    def test_alias_and_unknown_sources_are_rejected(self) -> None:
+        """The adversarial half. None of these appears in any denylist, which is
+        exactly why a denylist could not stop them."""
+        # D4-F guard
+        self.assertEqual(len(ADVERSARIAL_AUTHORITY_SOURCES), 6)
+        for name in ADVERSARIAL_AUTHORITY_SOURCES:
+            with self.subTest(source=name):
+                case = load_fixture(f"invalid/authority/{name}.json")
+                with self.assertRaises(DecisionPolicyError):
+                    validate_transition(
+                        self.policy, case["from"], case["to"], case["record"]
+                    )
+
+    def test_a_case_variant_of_a_recognised_source_is_rejected(self) -> None:
+        """Membership is exact. `EXPLICIT_USER_REPLY` is not `explicit_user_reply`."""
+        for variant in ("EXPLICIT_USER_REPLY", "Explicit_User_Reply", " explicit_user_reply"):
+            with self.subTest(variant=variant):
+                record = {
+                    "user_decision": {
+                        "source": variant,
+                        "where_recorded": "x",
+                        "resolves": "y",
+                    }
+                }
+                with self.assertRaises(DecisionPolicyError):
+                    validate_transition(self.policy, "NEEDS_INPUT", "CLEAR", record)
+
+    def test_the_denylist_no_longer_enforces_but_guards_the_allowlist(self) -> None:
+        """The retained denylist has one job now: the two sets must stay disjoint, so
+        adding a forbidden category to the positive vocabulary fails at load time."""
+        self.assertFalse(
+            set(self.policy.user_decision_sources)
+            & set(self.policy.forbidden_authority_sources)
+        )
+
+    def test_a_forbidden_source_added_to_the_vocabulary_fails_to_load(self) -> None:
+        mutated = json.loads(json.dumps(self.block))
+        mutated["user_decision_sources"] = list(mutated["user_decision_sources"]) + [
+            "recommended_default"
+        ]
+        with self.assertRaises(DecisionPolicyError):
+            parse_decision_policy(mutated)
+
+    def test_an_empty_positive_vocabulary_fails_to_load(self) -> None:
+        """Over-blocking guard: emptying the allowlist would make every user decision
+        unrepresentable, which the ticket also calls a wrong implementation."""
+        mutated = json.loads(json.dumps(self.block))
+        mutated["user_decision_sources"] = []
+        with self.assertRaises(DecisionPolicyError):
+            parse_decision_policy(mutated)
+
+    def test_the_four_recorded_user_decisions_are_expressible(self) -> None:
+        """The empirical test of the vocabulary's width. UD-1..UD-4 were each an
+        answer to a structured question the Coordinator put to the repository owner,
+        so each is `explicit_user_reply` with a locator into USER_DECISIONS.md. If the
+        vocabulary could not express them it would be too narrow."""
+        for identifier in ("UD-1", "UD-2", "UD-3", "UD-4"):
+            with self.subTest(user_decision=identifier):
+                record = {
+                    "user_decision": {
+                        "source": "explicit_user_reply",
+                        "where_recorded": f"USER_DECISIONS.md#{identifier}",
+                        "resolves": f"the question recorded as {identifier}",
+                    }
+                }
+                validate_transition(self.policy, "NEEDS_INPUT", "CLEAR", record)
+                validate_transition(self.policy, "CONFLICT", "CLEAR", record)
+
+
 class Requirement7RiskIndependence(DecisionPolicyTestCase):
     """DESIGN D4-G. Replaces iteration 1's single vacuous test, which iterated risk
     strings that reached no function argument."""
@@ -302,8 +426,10 @@ class Requirement7RiskIndependence(DecisionPolicyTestCase):
             elif isinstance(node, str) and node in AXIS_TOKENS:
                 hits.append(f"{path} (value)")
 
-        # D4-F guard: the walk must actually visit every selection input.
-        self.assertEqual(len(STATE_SELECTION_INPUTS & set(self.block)), 16)
+        # D4-F guard: the walk must actually visit every selection input. The count
+        # rose from 16 to 17 when FR-2 added user_decision_sources -- the guard doing
+        # its job on a legitimate change, not just on a mutation.
+        self.assertEqual(len(STATE_SELECTION_INPUTS & set(self.block)), 17)
         for key in sorted(STATE_SELECTION_INPUTS):
             walk(self.block[key], key)
         self.assertEqual(hits, [])
