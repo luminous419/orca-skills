@@ -149,6 +149,7 @@ class ReleasePackageTests(unittest.TestCase):
         self.assertIn("orca-worker-reviewer-loop/SKILL.md", relative)
         self.assertIn("orca-worker-reviewer-orchestration/reviews/bugfix.md", relative)
         self.assertIn("docs/ROADMAP.md", relative)
+        self.assertIn("docs/examples/FULL_WORKFLOW_FAIL_CORRECTION.md", relative)
         self.assertIn("docs/validation/GLM_GEMMA_SMOKE_PROCEDURE.md", relative)
         self.assertIn(
             "docs/validation/historical/GLM_GEMMA_SMOKE_REPORT_2026-08-20.md",
