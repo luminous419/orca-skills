@@ -1,8 +1,8 @@
 # 결정론적 Flow 실행 아이디어 — GPT-5.6 Sol 리뷰
 
-> 검토자: GPT-5.6 Sol  
-> 검토일: 2026-08-30  
-> 검토 기준 커밋: `6e40293`  
+> 검토자: GPT-5.6 Sol
+> 검토일: 2026-08-30
+> 검토 기준 커밋: `6e40293`
 > 성격: **discovery / architecture review.** 구현 승인이나 확정 설계가 아니며,
 > Jira 티켓과 acceptance criteria를 대체하지 않는다.
 
