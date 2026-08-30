@@ -10,6 +10,7 @@ co-located guard cannot. Six loops in this file carry such a guard, each marked
 
 from __future__ import annotations
 
+import ast
 import inspect
 import json
 import unittest
@@ -17,6 +18,7 @@ from pathlib import Path
 
 from scripts.decision_policy import (
     AXIS_TOKENS,
+    _validate_declared_facts,
     ENTRY_PREDICATES,
     _evaluate_predicate,
     CANONICAL_INDEPENDENT_AXES,
@@ -75,6 +77,40 @@ EXPECTED_HIGH_IMPACT = [
     "compliance",
     "long_term_lock_in",
 ]
+
+
+def error_of(fn, policy, *args) -> str:
+    """The message `fn` raises for these arguments, or "" when it accepts them.
+
+    Comparing the CONCEPT-SPECIFIC message rather than "did it raise at all" is what
+    makes a cross-API parity claim meaningful: two APIs can both reject a record for
+    different reasons and look consistent while judging the concept under test
+    differently."""
+    try:
+        fn(policy, *args)
+        return ""
+    except DecisionPolicyError as error:
+        return str(error)
+
+
+def assumption_allowed_record(policy, **overrides) -> dict:
+    """A complete, valid ASSUMPTION_ALLOWED record, usable as BOTH a record and a
+    facts mapping so the two APIs can be handed identical input."""
+    name = codes_for_state(policy, "ASSUMPTION_ALLOWED")[0]
+    code = policy.reason_codes[name]
+    record = {
+        "state": "ASSUMPTION_ALLOWED",
+        "reason_code": code.name,
+        "policy_source": {"role": "supports", "kind": "file_path"},
+        "blast_radius": "current_change",
+    }
+    for field in code.required_evidence:
+        if field in record:
+            continue
+        spec = policy.boundary_elements.get(field)
+        record[field] = spec.values[0] if spec and spec.kind == "enum" else "x"
+    record.update(overrides)
+    return record
 
 
 def complete_decision(source: str = "explicit_user_reply") -> dict:
@@ -1522,6 +1558,278 @@ class CrossApiConceptParity(DecisionPolicyTestCase):
             permitted_states(self.policy, {**facts, "policy_source": dict(self.SUPPORTS)}),
         )
         self.assertFalse(self._rejects(validate_record, self._record(**facts)))
+
+
+class Tr41PolicySourceRoleParity(DecisionPolicyTestCase):
+    """TR4-1. `policy_source.role` membership was enforced by permitted_states() and
+    not by validate_record(), so the evaluator rejected `invented_role` while record
+    validation accepted the identical value. The check moved into
+    `_validate_declared_facts`, beside the `kind` check that was always shared."""
+
+    def _both(self, role: str) -> tuple[bool, bool]:
+        record = assumption_allowed_record(
+            self.policy, policy_source={"role": role, "kind": "file_path"}
+        )
+        marker = "unknown policy_source role"
+        return (
+            marker in error_of(permitted_states, self.policy, record),
+            marker in error_of(validate_record, self.policy, record),
+        )
+
+    def test_an_invented_role_is_rejected_by_both_apis(self) -> None:
+        for role in ("invented_role", "determiness", "DETERMINES", " supports"):
+            with self.subTest(role=role):
+                self.assertEqual(self._both(role), (True, True))
+
+    def test_every_legal_role_is_accepted_by_both_apis(self) -> None:
+        """POSITIVE CONTROL: rejecting every role would satisfy the test above."""
+        roles = sorted(self.policy.policy_source_roles)
+        # D4-F guard, co-located.
+        self.assertEqual(len(roles), 2)
+        for role in roles:
+            with self.subTest(role=role):
+                self.assertEqual(self._both(role), (False, False))
+
+    def test_role_membership_is_judged_by_the_shared_helper(self) -> None:
+        """Structural: the rule is reached through _validate_declared_facts, so it
+        cannot be enforced on one API only. Deleting the call from either side is a
+        mutation both directions of the parity test above catch."""
+        self.assertIn(
+            "unknown policy_source role",
+            error_of(
+                _validate_declared_facts,
+                self.policy,
+                {"policy_source": {"role": "invented_role"}},
+            ),
+        )
+
+
+class Tr42AssumptionAllowedHasOneNormativeRule(DecisionPolicyTestCase):
+    """TR4-2. `permitted_states()` evaluated `entry_conditions` while
+    `validate_record()` checked only `assumption_allowed_forbidden_when`, so the two
+    disagreed on six of forty-eight boundary combinations, with record validation the
+    permissive side.
+
+    The NORMATIVE rule is the entry condition (ANALYSIS A3-1). INV-4 is a
+    prohibition; "not forbidden" was never the same claim as "permitted". Both APIs
+    now read `_entry_condition_defect`, and validate_record keeps the INV-4 check as
+    well because INV-4 has no exception (A4-0, C9).
+    """
+
+    SUPPORTS = {"role": "supports", "kind": "file_path"}
+
+    #: The six combinations the Reviewer enumerated, all with security false and no
+    #: reserved authority. Each was permitted=False / record_valid=True before the fix.
+    MIDDLE_BAND = (
+        ("reversible_in_run", "repository"),
+        ("reversible_in_run", "external_system"),
+        ("reversible_with_effort", "current_change"),
+        ("reversible_with_effort", "module"),
+        ("reversible_with_effort", "repository"),
+        ("reversible_with_effort", "external_system"),
+    )
+
+    def _both_permit(self, **facts) -> tuple[bool, bool]:
+        record = assumption_allowed_record(self.policy, **facts)
+        return (
+            "ASSUMPTION_ALLOWED" in permitted_states(self.policy, record),
+            error_of(validate_record, self.policy, record) == "",
+        )
+
+    def test_both_apis_refuse_every_middle_band_case(self) -> None:
+        """Bidirectional, all six. Not merely consistent -- both must REFUSE, because
+        the entry condition is the normative rule and none of these satisfies it."""
+        # D4-F guard, co-located: the enumeration must not shrink silently.
+        self.assertEqual(len(self.MIDDLE_BAND), 6)
+        checked = 0
+        for reversibility, blast_radius in self.MIDDLE_BAND:
+            with self.subTest(reversibility=reversibility, blast_radius=blast_radius):
+                self.assertEqual(
+                    self._both_permit(
+                        reversibility=reversibility, blast_radius=blast_radius
+                    ),
+                    (False, False),
+                )
+                checked += 1
+        self.assertEqual(checked, 6)
+
+    def test_both_apis_still_permit_the_safe_cases(self) -> None:
+        """POSITIVE CONTROL. The fix must not narrow legitimate ASSUMPTION_ALLOWED:
+        an item reversible within the run whose blast radius stays inside the
+        requested scope is still permitted -- by BOTH APIs."""
+        within_scope = ("current_change", "module")
+        checked = 0
+        for blast_radius in within_scope:
+            with self.subTest(blast_radius=blast_radius):
+                self.assertEqual(
+                    self._both_permit(
+                        reversibility="reversible_in_run", blast_radius=blast_radius
+                    ),
+                    (True, True),
+                )
+                checked += 1
+        self.assertEqual(checked, 2)
+
+    def test_both_apis_refuse_every_hard_case(self) -> None:
+        """NEGATIVE CONTROL on the other side: irreversible, any of the five
+        high-impact flags, or reserved authority. These agreed before the fix too;
+        they must still agree, so the fix did not trade one divergence for another."""
+        flags = tuple(self.policy.assumption_allowed_forbidden_when["any_true_of"])
+        self.assertEqual(len(flags), 5)
+        hard = [
+            {"reversibility": "irreversible"},
+            {"explicit_user_authority": "reserved"},
+        ] + [{flag: True} for flag in flags]
+        self.assertEqual(len(hard), 7)
+        for facts in hard:
+            with self.subTest(facts=sorted(facts)):
+                self.assertEqual(self._both_permit(**facts), (False, False))
+
+    def test_the_two_apis_agree_on_all_forty_eight_combinations(self) -> None:
+        """The Reviewer's whole enumeration, re-run as a test. 48 combinations, zero
+        disagreements -- and a co-located guard that the permitted set is neither
+        empty (over-blocking) nor everything (no rule at all)."""
+        reversibility = self.policy.boundary_elements["reversibility"].values
+        blast_radius = self.policy.boundary_elements["blast_radius"].values
+        # D4-F guard: 3 x 4 x 2 x 2 = 48.
+        self.assertEqual(len(reversibility) * len(blast_radius) * 2 * 2, 48)
+        permitted = 0
+        checked = 0
+        for rev in reversibility:
+            for blast in blast_radius:
+                for security in (False, True):
+                    for authority in (None, "reserved"):
+                        facts = {
+                            "reversibility": rev,
+                            "blast_radius": blast,
+                            "security": security,
+                        }
+                        if authority:
+                            facts["explicit_user_authority"] = authority
+                        with self.subTest(**facts):
+                            evaluator, validator = self._both_permit(**facts)
+                            self.assertEqual(evaluator, validator)
+                            permitted += evaluator
+                            checked += 1
+        self.assertEqual(checked, 48)
+        # Anti-over-blocking and anti-vacuity in one assertion.
+        self.assertEqual(permitted, 2)
+
+
+class Tr43WhitespaceIsNotEvidence(DecisionPolicyTestCase):
+    """TR4-3. `_is_empty` treated "   " as content, so a decision whose
+    `where_recorded` was three spaces bought CLEAR. A field that must prove WHERE the
+    decision is written down cannot be satisfied by blanks."""
+
+    WHITESPACE = ("   ", "\t", "\n", " \t\n ")
+
+    def test_whitespace_only_evidence_is_refused_by_both_apis(self) -> None:
+        fields = list(self.policy.user_decision_fields)
+        # D4-F guards, co-located: neither loop may be empty.
+        self.assertEqual(len(fields), 3)
+        self.assertEqual(len(self.WHITESPACE), 4)
+        checked = 0
+        for field in fields:
+            for blank in self.WHITESPACE:
+                with self.subTest(field=field, blank=repr(blank)):
+                    decision = complete_decision()
+                    decision[field] = blank
+                    facts = {"security": True, "user_decision": decision}
+                    self.assertNotIn("CLEAR", permitted_states(self.policy, facts))
+                    with self.assertRaises(DecisionPolicyError):
+                        validate_transition(
+                            self.policy, "NEEDS_INPUT", "CLEAR", facts
+                        )
+                    checked += 1
+        self.assertEqual(checked, 12)
+
+    def test_real_evidence_is_still_accepted(self) -> None:
+        """POSITIVE CONTROL: stripping must not reject text that merely contains
+        spaces. `USER_DECISIONS.md#UD-1 (see note)` is legitimate."""
+        for value in ("USER_DECISIONS.md#UD-1", " USER_DECISIONS.md#UD-1 ", "a b"):
+            with self.subTest(value=value):
+                decision = complete_decision()
+                decision["where_recorded"] = value
+                self.assertIn(
+                    "CLEAR",
+                    permitted_states(
+                        self.policy, {"security": True, "user_decision": decision}
+                    ),
+                )
+
+    def test_whitespace_is_empty_for_required_evidence_too(self) -> None:
+        """The rule is one definition, not a user_decision special case: a required
+        evidence field of blanks is empty for validate_record as well."""
+        record = assumption_allowed_record(self.policy, impact="   ")
+        self.assertIn("requires a non-empty", error_of(validate_record, self.policy, record))
+
+
+class FactReadingApisShareEveryRule(DecisionPolicyTestCase):
+    """The structural end of the FR-5 / TR4-1 / TR4-2 family.
+
+    Three times now the same concept was judged in two places and answered
+    differently: user-decision authorization (FR-5), `policy_source.role` membership
+    (TR4-1), and ASSUMPTION_ALLOWED permission (TR4-2). Each time the cause was the
+    same -- a rule written inline in one API instead of in a helper both call.
+
+    `permitted_states()` and `validate_record()` both read declared boundary facts,
+    so any rule about those facts must be reachable from both. This test compares
+    their call closures. An inline judgement added to one and not the other changes
+    one closure and fails here, which is a cheaper signal than enumerating the
+    concepts again by hand.
+    """
+
+    @staticmethod
+    def _closure(name: str) -> frozenset[str]:
+        source = (REPO_ROOT / "scripts" / "decision_policy.py").read_text(
+            encoding="utf-8"
+        )
+        tree = ast.parse(source)
+        functions = {
+            node.name: node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+        }
+
+        def walk(target: str, seen: set[str]) -> set[str]:
+            if target in seen or target not in functions:
+                return seen
+            seen.add(target)
+            for node in ast.walk(functions[target]):
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                    walk(node.func.id, seen)
+            return seen
+
+        return frozenset(walk(name, set()) & set(functions)) - {name}
+
+    def test_both_fact_reading_apis_reach_the_same_helpers(self) -> None:
+        evaluator = self._closure("permitted_states")
+        validator = self._closure("validate_record")
+        # D4-F guard: the closure must be non-trivial, or equality is vacuous.
+        self.assertGreaterEqual(len(evaluator), 6)
+        self.assertEqual(
+            evaluator,
+            validator,
+            "permitted_states() and validate_record() no longer share every rule; a "
+            "judgement reachable from only one of them is how FR-5, TR4-1 and TR4-2 "
+            "each began",
+        )
+
+    def test_the_shared_helpers_include_every_fact_rule(self) -> None:
+        """Names the rules explicitly, so deleting one from both APIs at once -- which
+        equality alone would not notice -- still fails."""
+        shared = self._closure("permitted_states")
+        for helper in (
+            "_validate_declared_facts",
+            "_entry_condition_defect",
+            "_evaluate_predicate",
+            "_user_decision_defect",
+            "_assumption_allowed_is_forbidden",
+            "_element_is_triggering",
+            "_is_empty",
+        ):
+            with self.subTest(helper=helper):
+                self.assertIn(helper, shared)
 
 
 if __name__ == "__main__":  # pragma: no cover

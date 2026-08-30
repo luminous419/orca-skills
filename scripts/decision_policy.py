@@ -449,9 +449,24 @@ def transition_rule(policy: DecisionPolicy, source: str, target: str) -> str:
 
 
 def _is_empty(value: Any) -> bool:
+    """TR4-3. A string of blanks is empty.
+
+    `where_recorded` has to prove WHERE a decision is written down, and `resolves`
+    has to say WHAT it settles. Three spaces point at nothing and settle nothing, so
+    they are not checkable by the second party INV-5 and A5-3 require -- which is the
+    whole reason those fields exist rather than a bare `source`. Treating blanks as
+    content would have let the FR-5 fix be satisfied by a record that is complete
+    only in shape.
+
+    Stripping here rather than in one caller keeps this the single definition of
+    empty for required evidence, user-decision fields, and retractions alike. The
+    change is strictly narrowing: it rejects more, never accepts more.
+    """
     if value is None:
         return True
-    if isinstance(value, (str, list, tuple, dict, set)):
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, (list, tuple, dict, set)):
         return len(value) == 0
     return False
 
@@ -588,6 +603,18 @@ def _validate_declared_facts(
             f"policy_source kind {source['kind']!r} is outside the closed set "
             f"{list(policy.policy_source_kinds)}",
         )
+    # TR4-1: role membership belongs HERE, beside kind, because this is the helper
+    # both permitted_states() and validate_record() call. It used to sit inline in
+    # permitted_states(), so the evaluator rejected `invented_role` while record
+    # validation accepted the identical value -- the FR-5 shape again, one concept
+    # judged in two places. Both roles are a closed set in the contract and both are
+    # pinned by C28; there was never a reason for only one of them to be enforced
+    # on records.
+    role = _policy_source_role(facts)
+    _require(
+        role is None or role in policy.policy_source_roles,
+        f"unknown policy_source role {role!r}",
+    )
 
 
 def _evaluate_predicate(
@@ -672,6 +699,49 @@ def _evaluate_predicate(
     raise DecisionPolicyError(f"unhandled entry predicate {name!r}")
 
 
+def _entry_condition_defect(
+    policy: DecisionPolicy, state: str, facts: Mapping[str, Any]
+) -> str | None:
+    """The ONE judgement of whether these facts satisfy a state's entry condition.
+
+    Returns the reason they do not, or None when they do. TR4-2: `permitted_states()`
+    evaluated `entry_conditions` while `validate_record()` checked only
+    `assumption_allowed_forbidden_when`, so the two answered "may this item be
+    ASSUMPTION_ALLOWED?" differently on six of forty-eight boundary combinations --
+    and the permissive side was record validation, the API a Reviewer uses to check
+    a filed record.
+
+    The NORMATIVE rule is the entry condition, per ANALYSIS A3-1, which states the
+    ASSUMPTION_ALLOWED entry condition as "**all** of: reversible within this run's
+    change scope; blast radius confined to the requested scope; none of {monetary
+    cost, security, privacy, compliance, long-term lock-in} is true; a locatable
+    policy source supports but does not determine the choice; no explicit user
+    authority is reserved over it."
+
+    INV-4 is a PROHIBITION, not a permission: A4-0's per-element table lists what
+    forbids the state, and "not forbidden" was never the same claim as "permitted".
+    The entry condition is strictly stronger than the prohibition -- every one of the
+    six divergences had the evaluator refusing and the record validator accepting,
+    never the reverse -- so adopting it as normative narrows record validation to
+    what the evaluator already permitted and widens nothing. `validate_record` keeps
+    the INV-4 check as well: INV-4 has no exception (A4-0, C9), and a non-overridable
+    invariant is not something to enforce only by implication.
+    """
+
+    (combinator, predicates), = policy.entry_conditions[state].items()
+    results = {
+        name: _evaluate_predicate(name, policy, facts) for name in predicates
+    }
+    satisfied = any(results.values()) if combinator == "any_of" else all(results.values())
+    if satisfied:
+        return None
+    unmet = sorted(name for name, value in results.items() if not value)
+    return (
+        f"state {state} requires {combinator} of {sorted(predicates)}; "
+        f"unsatisfied: {unmet}"
+    )
+
+
 def permitted_states(
     policy: DecisionPolicy, facts: Mapping[str, Any]
 ) -> frozenset[str]:
@@ -694,18 +764,15 @@ def permitted_states(
     deliberately no `risk` parameter, and a test asserts that via inspect.signature.
     """
 
-    role = _policy_source_role(facts)
-    if role is not None and role not in policy.policy_source_roles:
-        raise DecisionPolicyError(f"unknown policy_source role {role!r}")
+    # TR4-1: the role check now lives in _validate_declared_facts, the helper
+    # validate_record() also calls, so both APIs judge role membership identically.
     _validate_declared_facts(policy, facts)
 
-    permitted = set()
-    for state, condition in policy.entry_conditions.items():
-        (combinator, predicates), = condition.items()
-        results = [_evaluate_predicate(name, policy, facts) for name in predicates]
-        if (any(results) if combinator == "any_of" else all(results)):
-            permitted.add(state)
-    return frozenset(permitted)
+    return frozenset(
+        state
+        for state in policy.entry_conditions
+        if _entry_condition_defect(policy, state, facts) is None
+    )
 
 
 def validate_record(policy: DecisionPolicy, record: Mapping[str, Any]) -> None:
@@ -785,6 +852,12 @@ def validate_record(policy: DecisionPolicy, record: Mapping[str, Any]) -> None:
             not _assumption_allowed_is_forbidden(policy, record),
             "ASSUMPTION_ALLOWED is forbidden for this item (INV-4, no exception)",
         )
+        # TR4-2: and the item must actually SATISFY the entry condition, which is the
+        # normative permission rule. Passing INV-4 only means the state is not
+        # forbidden; it never meant the state was permitted. Same helper as
+        # permitted_states(), so the two cannot answer this differently again.
+        defect = _entry_condition_defect(policy, "ASSUMPTION_ALLOWED", record)
+        _require(defect is None, defect or "")
 
 
 def validate_transition(
