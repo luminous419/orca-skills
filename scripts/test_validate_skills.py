@@ -478,13 +478,55 @@ class ValidatorRegressionTests(unittest.TestCase):
     def test_assumption_allowed_entry_condition_weakened_fails(self) -> None:
         """Dropping a conjunct from an all_of condition is a relaxation."""
         self.edit_skills(
-            '"all_of": ["reversible_in_run", "blast_radius_within_scope", '
-            '"no_high_impact_element", "supporting_policy_source", '
-            '"no_reserved_user_authority"]',
+            '"all_of": ["all_safety_facts_declared", "reversible_in_run", '
+            '"blast_radius_within_scope", "no_high_impact_element", '
+            '"supporting_policy_source", "no_reserved_user_authority"]',
             '"all_of": ["reversible_in_run", "supporting_policy_source", '
             '"no_reserved_user_authority"]',
         )
         self.assert_validator_fails_with("state entry conditions drifted")
+
+    def test_the_safety_fact_presence_conjunct_removed_fails(self) -> None:
+        """F-001, isolated. Dropping only `all_safety_facts_declared` leaves an
+        ASSUMPTION_ALLOWED condition that still LOOKS complete -- every value
+        judgement is still there -- while restoring exactly the reading the external
+        review found: an undeclared blast radius or impact flag read as safe."""
+        self.edit_skills(
+            '"all_of": ["all_safety_facts_declared", "reversible_in_run", ',
+            '"all_of": ["reversible_in_run", ',
+        )
+        self.assert_validator_fails_with("state entry conditions drifted")
+
+    def test_shortening_the_declared_safety_facts_fails(self) -> None:
+        """F-001. A shorter list rejects nothing new, so every fixture and test would
+        stay green while a fact stopped having to be declared. That silence is why
+        this is pinned by value rather than by membership."""
+        self.edit_skills(
+            '"declared_safety_facts": ["blast_radius", "monetary_cost", "security", '
+            '"privacy", "compliance", "long_term_lock_in"]',
+            '"declared_safety_facts": ["blast_radius"]',
+        )
+        self.assert_validator_fails_with("INV-3 assumption requirements drifted")
+
+    def test_flipping_the_authority_absence_rule_fails(self) -> None:
+        """F-001. The rule is data, which is the point -- so a change to it must be
+        visible rather than silent."""
+        self.edit_skills(
+            '"absent_explicit_user_authority": "not_reserved"',
+            '"absent_explicit_user_authority": "reserved"',
+        )
+        self.assert_validator_fails_with("INV-3 assumption requirements drifted")
+
+    def test_repointing_a_clause_predicate_fails(self) -> None:
+        """F-002. Aiming N-2 at N-1's predicate restores the exact defect the review
+        found: `missing_user_intent` satisfied by evidence that says nothing about
+        user intent. Both values are legal members of the closed vocabulary, so
+        membership alone would not notice."""
+        self.edit_skills(
+            '"N-2": "absent_user_intent"',
+            '"N-2": "undetermined_boundary_element"',
+        )
+        self.assert_validator_fails_with("clause->predicate binding drifted")
 
     def test_needs_input_entry_condition_narrowed_fails(self) -> None:
         """Narrowing the pausing state's condition is the FR-4 defect's shape."""
