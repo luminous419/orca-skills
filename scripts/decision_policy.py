@@ -512,6 +512,57 @@ def _policy_source_role(facts: Mapping[str, Any]) -> str | None:
     return None
 
 
+def _domain_defect(spec: BoundaryElement, value: Any) -> str | None:
+    """FR-8. Is this declared value inside the domain the element's kind defines?
+
+    Returns the reason it is not, or None when it is.
+
+    `enum` membership was checked; `boolean` had no counterpart, so any non-boolean
+    value simply "did not fire" and the boundary was bypassed. `security: 'yes'` and
+    `security: 1` -- both plainly true to a reader -- left an irreversible,
+    security-relevant item reporting ASSUMPTION_ALLOWED. A contract that fails CLOSED
+    everywhere else was failing OPEN on a malformed value, which is the dangerous
+    direction: the wrong input silently bought autonomy instead of a pause.
+
+    A domain is checked wherever the contract DECLARES one. Two kinds declare none and
+    are deliberately left alone rather than given an invented one -- see D2-2g.
+    """
+
+    if spec.kind == "enum":
+        if value not in spec.values:
+            return (
+                f"declares {value!r}, which is outside its closed value set "
+                f"{list(spec.values)}"
+            )
+        return None
+    if spec.kind in ("boolean", "declared"):
+        # `declared` belongs here because its triggering value IS `True` (A4-1 row 1):
+        # naming the element declares it, and a value carried alongside is a boolean
+        # claim like any other. `isinstance(True, int)` is why bool is tested first --
+        # 1 and 0 must NOT pass as booleans, and they are exactly the values that
+        # made this fail open.
+        if not isinstance(value, bool):
+            return (
+                f"is a {spec.kind} element and must be declared true or false, but "
+                f"declares {value!r} of type {type(value).__name__}; a value outside "
+                "the domain is rejected, not treated as 'did not fire'"
+            )
+        return None
+    if spec.kind == "citations":
+        if not isinstance(value, (list, tuple)):
+            return (
+                f"is a citations element and must be declared as a list, but declares "
+                f"{value!r} of type {type(value).__name__}"
+            )
+        return None
+    # `policy_source` and `user_decision` kinds declare no closed value set in the
+    # contract, so there is nothing to check here without inventing one. The
+    # `policy_source` OBJECT's role and kind are checked below; the user-authority
+    # element's open domain is recorded as a known limit in D2-2g rather than
+    # narrowed by this code.
+    return None
+
+
 def _element_is_triggering(spec: BoundaryElement, value: Any) -> bool:
     """Does this declared value make the element TRUE in A3-1's sense?
 
@@ -588,14 +639,23 @@ def _validate_declared_facts(
     omitting an element stays legal.
     """
     for element, spec in policy.boundary_elements.items():
-        if element not in facts or spec.kind != "enum":
+        if element not in facts:
+            # Omitting an element stays legal. Not declaring something and declaring
+            # it wrongly are different acts: the first is silence, the second is a
+            # claim the contract can check.
             continue
-        value = facts[element]
+        defect = _domain_defect(spec, facts[element])
+        _require(defect is None, f"boundary element {element!r} {defect}")
+    clause = facts.get("conflict_clause")
+    if clause is not None:
+        # The contract declares this domain in entry_clauses, so a bogus clause is
+        # rejected rather than quietly making the item look non-contradictory.
+        known = tuple(policy.entry_clauses.get("CONFLICT", ()))
         _require(
-            value in spec.values,
-            f"boundary element {element!r} declares {value!r}, which is outside its "
-            f"closed value set {list(spec.values)}",
+            clause in known,
+            f"conflict_clause {clause!r} is outside the declared set {list(known)}",
         )
+
     source = facts.get("policy_source")
     if isinstance(source, dict) and source.get("kind") is not None:
         _require(

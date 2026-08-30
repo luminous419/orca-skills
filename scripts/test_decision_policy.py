@@ -20,6 +20,7 @@ from scripts.decision_policy import (
     AXIS_TOKENS,
     _validate_declared_facts,
     _element_is_triggering,
+    _domain_defect,
     ENTRY_PREDICATES,
     _evaluate_predicate,
     CANONICAL_INDEPENDENT_AXES,
@@ -2295,6 +2296,126 @@ class Fr7ClearGroundsBothWays(DecisionPolicyTestCase):
         grounds. This is the anti-over-blocking control for the class."""
         self.assertEqual(self.policy.required_evidence["CLEAR"], ())
         self.assertEqual(error_of(validate_record, self.policy, {"state": "CLEAR"}), "")
+
+
+class Fr8BooleanBoundariesFailClosed(DecisionPolicyTestCase):
+    """FR-8. `enum` elements had a membership check; `boolean` elements had no
+    counterpart, so any non-boolean value simply "did not fire" and the boundary was
+    bypassed. `security: 'yes'` and `security: 1` -- both plainly true to a reader --
+    left an irreversible, security-relevant item reporting ASSUMPTION_ALLOWED. A
+    contract that fails closed everywhere else was failing OPEN on a malformed value:
+    the wrong input bought autonomy instead of a pause.
+    """
+
+    SAFE = {
+        "reversibility": "reversible_in_run",
+        "blast_radius": "current_change",
+        "policy_source": {"role": "supports", "kind": "file_path"},
+    }
+
+    #: The seven values reproduced in the finding, each of which returned
+    #: ['ASSUMPTION_ALLOWED'] before the fix.
+    NON_BOOLEAN = ("yes", 1, 0, {"a": 1}, None, "false", [])
+
+    def _boolean_elements(self) -> list:
+        return sorted(
+            name
+            for name, spec in self.policy.boundary_elements.items()
+            if spec.kind == "boolean"
+        )
+
+    def test_a_non_boolean_value_is_rejected_for_every_boolean_element(self) -> None:
+        elements = self._boolean_elements()
+        # D4-F guards, co-located: five booleans, seven values, both non-empty.
+        self.assertEqual(len(elements), 5)
+        self.assertEqual(len(self.NON_BOOLEAN), 7)
+        checked = 0
+        for element in elements:
+            for value in self.NON_BOOLEAN:
+                with self.subTest(element=element, value=repr(value)):
+                    facts = {**self.SAFE, element: value}
+                    with self.assertRaises(DecisionPolicyError):
+                        permitted_states(self.policy, facts)
+                    checked += 1
+        self.assertEqual(checked, 35)
+
+    def test_one_and_zero_are_rejected_rather_than_read_as_true_and_false(self) -> None:
+        """`isinstance(True, int)` is why bool is tested before int. 1 and 0 are
+        exactly the values that made this fail open, so they get their own assertion
+        rather than living only inside the sweep above."""
+        for value in (1, 0):
+            with self.subTest(value=value):
+                with self.assertRaises(DecisionPolicyError):
+                    permitted_states(self.policy, {**self.SAFE, "security": value})
+
+    def test_real_booleans_still_work_in_both_directions(self) -> None:
+        """POSITIVE CONTROL. Rejecting every value would satisfy the sweep above; it
+        must not satisfy this. True fires the boundary, False does not."""
+        elements = self._boolean_elements()
+        self.assertEqual(len(elements), 5)
+        for element in elements:
+            with self.subTest(element=element):
+                fired = permitted_states(self.policy, {**self.SAFE, element: True})
+                self.assertNotIn("ASSUMPTION_ALLOWED", fired)
+                self.assertIn("NEEDS_INPUT", fired)
+                safe = permitted_states(self.policy, {**self.SAFE, element: False})
+                self.assertIn("ASSUMPTION_ALLOWED", safe)
+
+    def test_omitting_the_element_remains_legal(self) -> None:
+        """The other positive control, and the line the fix must not cross: not
+        declaring something and declaring it wrongly are different acts."""
+        self.assertIn(
+            "ASSUMPTION_ALLOWED", permitted_states(self.policy, dict(self.SAFE))
+        )
+        for element in self._boolean_elements():
+            with self.subTest(element=element):
+                self.assertNotIn(element, self.SAFE)
+
+    def test_both_apis_reject_a_malformed_value_identically(self) -> None:
+        """Parity on identical input -- the property that failed four times in this
+        run. Each mapping is handed to both APIs unchanged."""
+        record = assumption_allowed_record(self.policy)
+        checked = 0
+        for element in self._boolean_elements():
+            for value in self.NON_BOOLEAN:
+                with self.subTest(element=element, value=repr(value)):
+                    candidate = {**record, element: value}
+                    evaluator = error_of(permitted_states, self.policy, candidate) != ""
+                    validator = error_of(validate_record, self.policy, candidate) != ""
+                    self.assertTrue(evaluator)
+                    self.assertEqual(evaluator, validator)
+                    checked += 1
+        self.assertEqual(checked, 35)
+
+    def test_every_element_kind_has_a_stated_domain_disposition(self) -> None:
+        """The exhaustive half of FR-8: no element kind may be left unconsidered.
+        Every kind the contract uses is either domain-checked or listed here as
+        declaring no domain -- a new kind fails this until someone decides which."""
+        kinds = {spec.kind for spec in self.policy.boundary_elements.values()}
+        checked_kinds = {"enum", "boolean", "declared", "citations"}
+        open_kinds = {"policy_source", "user_decision"}
+        # D4-F guard: the partition must cover exactly the kinds in use.
+        self.assertEqual(kinds, checked_kinds | open_kinds)
+        self.assertFalse(checked_kinds & open_kinds)
+        for name, spec in sorted(self.policy.boundary_elements.items()):
+            if spec.kind not in checked_kinds:
+                continue
+            with self.subTest(element=name, kind=spec.kind):
+                bad = object()  # outside every declared domain
+                self.assertIsNotNone(_domain_defect(spec, bad))
+
+    def test_a_bogus_conflict_clause_is_rejected(self) -> None:
+        """The contract declares this domain in entry_clauses, so an unknown clause is
+        rejected rather than quietly making the item look non-contradictory."""
+        known = list(self.policy.entry_clauses["CONFLICT"])
+        self.assertEqual(len(known), 3)
+        with self.assertRaises(DecisionPolicyError):
+            permitted_states(self.policy, {"conflict_clause": "C-9"})
+        for clause in known:  # POSITIVE CONTROL
+            with self.subTest(clause=clause):
+                self.assertIn(
+                    "CONFLICT", permitted_states(self.policy, {"conflict_clause": clause})
+                )
 
 
 if __name__ == "__main__":  # pragma: no cover
