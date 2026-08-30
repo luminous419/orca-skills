@@ -1,5 +1,7 @@
 # Full Workflow Best-Practice Example
 
+[한국어판](FULL_WORKFLOW_FAIL_CORRECTION.ko.md)
+
 This example lets a Skill user exercise the complete
 `orca-worker-reviewer-orchestration` lifecycle:
 
