@@ -634,6 +634,16 @@ def _user_decision_defect(
     for field in policy.user_decision_fields:
         if field not in decision or _is_empty(decision[field]):
             return f"user_decision requires a non-empty {field!r}"
+        # RI9-1, swept: these are TEXT fields. `where_recorded` points at where the
+        # decision is written down and `resolves` says what it settles, so a value of
+        # 42 is not short evidence -- it is not evidence. Non-emptiness alone accepted
+        # it, the same shape gap the locator had. The earlier report described these
+        # as "non-empty text" while only the emptiness half was enforced.
+        if not isinstance(decision[field], str):
+            return (
+                f"user_decision {field!r} must be text, got "
+                f"{decision[field]!r} of type {type(decision[field]).__name__}"
+            )
     source = decision.get("source")
     if source not in policy.user_decision_sources:
         category = (
@@ -685,6 +695,25 @@ def _validate_declared_facts(
             source["kind"] in policy.policy_source_kinds,
             f"policy_source kind {source['kind']!r} is outside the closed set "
             f"{list(policy.policy_source_kinds)}",
+        )
+    if isinstance(source, dict):
+        # RI9-1. A4-1 row 10 requires a **locatable** policy source, and a claim that
+        # policy supports this choice while pointing nowhere is the claim the ticket
+        # exists to prevent: "an automatic decision records the policy it applied".
+        #
+        # Iterations 8 and 9 left this open on the grounds that checking a locator
+        # needs I/O and this layer is a pure function. That reason was HALF right, and
+        # bundling the two halves cost both. The SHAPE -- a non-empty piece of text --
+        # needs no I/O at all; only EXISTENCE does. The shape is enforced here; the
+        # existence check is not performed and is not claimed (see D2-2i).
+        #
+        # Emptiness is `_is_empty`, so whitespace is empty here for the same reason it
+        # is in a user_decision (TR4-3): a locator of three spaces points nowhere.
+        locator = source.get("locator")
+        _require(
+            isinstance(locator, str) and not _is_empty(locator),
+            "policy_source must carry a non-empty textual locator; a policy source "
+            f"that points nowhere cannot support a decision, got {locator!r}",
         )
     # TR4-1: role membership belongs HERE, beside kind, because this is the helper
     # both permitted_states() and validate_record() call. It used to sit inline in
@@ -1025,6 +1054,14 @@ def validate_record(policy: DecisionPolicy, record: Mapping[str, Any]) -> None:
             len(citations) >= minimum,
             f"CONFLICT requires at least {minimum} citations, got {len(citations)}",
         )
+        # Same sweep: a citation names a locatable artifact (A4-1), so an entry that
+        # is not text cites nothing. Shape only -- whether the cited artifact exists
+        # is not checked here, for the reason given in _validate_declared_facts.
+        for index, citation in enumerate(citations):
+            _require(
+                isinstance(citation, str) and not _is_empty(citation),
+                f"CONFLICT citation {index} must be non-empty text, got {citation!r}",
+            )
 
     if state == "ASSUMPTION_ALLOWED":
         source = record.get("policy_source") or {}

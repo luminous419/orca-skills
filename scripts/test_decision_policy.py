@@ -81,6 +81,21 @@ EXPECTED_HIGH_IMPACT = [
 ]
 
 
+#: RI9-1: a policy_source must carry a non-empty textual locator (A4-1 row 10), so a
+#: role/kind pair alone is NOT a valid source. Tests used that shorthand throughout and
+#: therefore leaned on the very fail-open RI9-1 reported. Both helpers below produce a
+#: complete source; anything asserting a source is VALID must use them.
+LOCATOR = "docs/policy.md#rule-1"
+
+
+def supporting_source(**overrides) -> dict:
+    return {"role": "supports", "kind": "file_path", "locator": LOCATOR, **overrides}
+
+
+def determining_source(**overrides) -> dict:
+    return {"role": "determines", "kind": "file_path", "locator": LOCATOR, **overrides}
+
+
 def error_of(fn, policy, *args) -> str:
     """The message `fn` raises for these arguments, or "" when it accepts them.
 
@@ -103,7 +118,7 @@ def assumption_allowed_record(policy, **overrides) -> dict:
     record = {
         "state": "ASSUMPTION_ALLOWED",
         "reason_code": code.name,
-        "policy_source": {"role": "supports", "kind": "file_path"},
+        "policy_source": supporting_source(),
         "blast_radius": "current_change",
     }
     for field in code.required_evidence:
@@ -397,7 +412,7 @@ class Requirement4EntryConditionsAreEvaluated(DecisionPolicyTestCase):
         """Positive control: A3-1 admits CLEAR when a policy source DETERMINES the
         choice. Without this the fix could be over-blocking."""
         permitted = permitted_states(
-            self.policy, {**self.HIGH_IMPACT, "policy_source": {"role": "determines"}}
+            self.policy, {**self.HIGH_IMPACT, "policy_source": determining_source()}
         )
         self.assertIn("CLEAR", permitted)
         self.assertNotIn("ASSUMPTION_ALLOWED", permitted)
@@ -1460,7 +1475,7 @@ class CrossApiConceptParity(DecisionPolicyTestCase):
     would pin a defect -- which is exactly the mistake FR-5 found in two tests.
     """
 
-    SUPPORTS = {"role": "supports", "kind": "file_path"}
+    SUPPORTS = supporting_source()
 
     def _record(self, **extra) -> dict:
         code = self.policy.reason_codes[codes_for_state(self.policy, "ASSUMPTION_ALLOWED")[0]]
@@ -1517,7 +1532,7 @@ class CrossApiConceptParity(DecisionPolicyTestCase):
         self.assertEqual(len(kinds), len(self.policy.policy_source_kinds) + 1)
         for kind in kinds:
             with self.subTest(kind=kind):
-                source = {"role": "supports", "kind": kind}
+                source = supporting_source(kind=kind)
                 legal = kind in self.policy.policy_source_kinds
                 self.assertEqual(
                     self._rejects(permitted_states, {"policy_source": source}), not legal
@@ -1570,7 +1585,7 @@ class Tr41PolicySourceRoleParity(DecisionPolicyTestCase):
 
     def _both(self, role: str) -> tuple[bool, bool]:
         record = assumption_allowed_record(
-            self.policy, policy_source={"role": role, "kind": "file_path"}
+            self.policy, policy_source=supporting_source(role=role)
         )
         marker = "unknown policy_source role"
         return (
@@ -1601,7 +1616,9 @@ class Tr41PolicySourceRoleParity(DecisionPolicyTestCase):
             error_of(
                 _validate_declared_facts,
                 self.policy,
-                {"policy_source": {"role": "invented_role"}},
+                # RI9-1: a COMPLETE source with only the role wrong, so this test
+                # fails on the role rather than on a missing locator.
+                {"policy_source": supporting_source(role="invented_role")},
             ),
         )
 
@@ -1618,7 +1635,7 @@ class Tr42AssumptionAllowedHasOneNormativeRule(DecisionPolicyTestCase):
     well because INV-4 has no exception (A4-0, C9).
     """
 
-    SUPPORTS = {"role": "supports", "kind": "file_path"}
+    SUPPORTS = supporting_source()
 
     #: The six combinations the Reviewer enumerated, all with security false and no
     #: reserved authority. Each was permitted=False / record_valid=True before the fix.
@@ -2002,11 +2019,11 @@ class Fr6DeclaredEvidenceMustJustifyTheState(DecisionPolicyTestCase):
         good = (
             {"state": "CLEAR"},
             {"state": "CLEAR", "open_decision_item": False},
-            {"state": "CLEAR", "policy_source": {"role": "determines", "kind": "file_path"}},
+            {"state": "CLEAR", "policy_source": determining_source()},
             {"state": "CLEAR", "user_decision": complete_decision()},
         )
         bad = (
-            {"state": "CLEAR", "policy_source": {"role": "supports", "kind": "file_path"}},
+            {"state": "CLEAR", "policy_source": supporting_source()},
             {"state": "CLEAR", "user_decision": {"source": "explicit_user_reply"}},
             {"state": "CLEAR", "user_decision": complete_decision("timeout")},
         )
@@ -2256,7 +2273,7 @@ class Fr7ClearGroundsBothWays(DecisionPolicyTestCase):
             "no_open_decision_item": {"state": "CLEAR", "open_decision_item": False},
             "determining_policy_source": {
                 "state": "CLEAR",
-                "policy_source": {"role": "determines", "kind": "file_path"},
+                "policy_source": determining_source(),
             },
             "explicit_user_authorization": {
                 "state": "CLEAR",
@@ -2276,7 +2293,7 @@ class Fr7ClearGroundsBothWays(DecisionPolicyTestCase):
         near_miss = {
             "supporting_not_determining": {
                 "state": "CLEAR",
-                "policy_source": {"role": "supports", "kind": "file_path"},
+                "policy_source": supporting_source(),
             },
             "source_only_decision": {
                 "state": "CLEAR",
@@ -2313,7 +2330,7 @@ class Fr8BooleanBoundariesFailClosed(DecisionPolicyTestCase):
     SAFE = {
         "reversibility": "reversible_in_run",
         "blast_radius": "current_change",
-        "policy_source": {"role": "supports", "kind": "file_path"},
+        "policy_source": supporting_source(),
     }
 
     #: The seven values reproduced in the finding, each of which returned
@@ -2436,7 +2453,7 @@ class Ri81AuthorityBoundaryFailsClosed(DecisionPolicyTestCase):
     SAFE = {
         "reversibility": "reversible_in_run",
         "blast_radius": "current_change",
-        "policy_source": {"role": "supports", "kind": "file_path"},
+        "policy_source": supporting_source(),
     }
     ELEMENT = "explicit_user_authority"
     BAD = ("RESERVED", "Reserved", "reserverd", "anything", "delegated", 1, {"a": 1}, None, [])
@@ -2510,6 +2527,158 @@ class Ri81AuthorityBoundaryFailsClosed(DecisionPolicyTestCase):
         # and both of those positions ARE closed.
         self.assertTrue(self.policy.policy_source_roles)
         self.assertTrue(self.policy.policy_source_kinds)
+
+
+class Ri91LocatorShapeIsEnforced(DecisionPolicyTestCase):
+    """RI9-1. A `policy_source` could claim policy supports a decision while pointing
+    nowhere: a missing `locator`, `""`, whitespace, a number, or null all returned
+    ASSUMPTION_ALLOWED. That defeats the ticket's requirement that an automatic
+    decision records the policy it applied.
+
+    Iterations 8 and 9 left this open because "checking a locator needs I/O and this
+    layer is a pure function". That was half right, and bundling the halves cost both:
+    the SHAPE -- non-empty text -- needs no I/O. Only EXISTENCE does.
+    """
+
+    SAFE = {"reversibility": "reversible_in_run", "blast_radius": "current_change"}
+    BAD_LOCATORS = ("", "   ", "\t", 42, None, {"a": 1}, [], True)
+
+    def test_a_source_without_a_locator_is_rejected(self) -> None:
+        source = {"role": "supports", "kind": "file_path"}
+        self.assertNotIn("locator", source)
+        with self.assertRaises(DecisionPolicyError):
+            permitted_states(self.policy, {**self.SAFE, "policy_source": source})
+
+    def test_every_malformed_locator_is_rejected(self) -> None:
+        # D4-F guard, co-located.
+        self.assertEqual(len(self.BAD_LOCATORS), 8)
+        checked = 0
+        for value in self.BAD_LOCATORS:
+            with self.subTest(locator=repr(value)):
+                with self.assertRaises(DecisionPolicyError):
+                    permitted_states(
+                        self.policy,
+                        {**self.SAFE, "policy_source": supporting_source(locator=value)},
+                    )
+                checked += 1
+        self.assertEqual(checked, 8)
+
+    def test_real_locators_still_pass(self) -> None:
+        """POSITIVE CONTROL, using the locators the shipped fixtures actually carry --
+        so this cannot drift away from what the repository really files."""
+        real = [
+            source["locator"]
+            for source in (
+                load_fixture(f"valid/{name}.json").get("policy_source")
+                for name in sorted(self.policy.reason_codes)
+            )
+            if isinstance(source, dict)
+        ]
+        # D4-F guard: the four fixtures that declare a policy_source.
+        self.assertEqual(len(real), 4)
+        for locator in real + ["docs/x.md", " padded/but/real.md "]:
+            with self.subTest(locator=locator):
+                self.assertIn(
+                    "ASSUMPTION_ALLOWED",
+                    permitted_states(
+                        self.policy,
+                        {**self.SAFE, "policy_source": supporting_source(locator=locator)},
+                    ),
+                )
+
+    def test_both_apis_judge_the_locator_identically(self) -> None:
+        """Parity on identical input."""
+        record = assumption_allowed_record(self.policy)
+        for value in self.BAD_LOCATORS:
+            with self.subTest(locator=repr(value)):
+                candidate = {**record, "policy_source": supporting_source(locator=value)}
+                evaluator = error_of(permitted_states, self.policy, candidate) != ""
+                validator = error_of(validate_record, self.policy, candidate) != ""
+                self.assertTrue(evaluator)
+                self.assertEqual(evaluator, validator)
+
+    def test_existence_is_not_checked_and_is_not_claimed(self) -> None:
+        """The half that genuinely needs I/O. A locator pointing at nothing is ACCEPTED
+        -- this layer is a pure function of (contract, declared facts) and performs no
+        filesystem access. Asserted so the limit is a recorded decision rather than an
+        assumption a reader might make in either direction."""
+        self.assertIn(
+            "ASSUMPTION_ALLOWED",
+            permitted_states(
+                self.policy,
+                {
+                    **self.SAFE,
+                    "policy_source": supporting_source(
+                        locator="no/such/file/anywhere.md#nope"
+                    ),
+                },
+            ),
+        )
+
+
+class Ri91SweptShapeGaps(DecisionPolicyTestCase):
+    """The same shape-versus-existence lens applied to every other text position.
+
+    Two more were found. Both had been described in my iteration-8 table as "non-empty
+    text" while only the emptiness half was enforced -- the claim was wider than the
+    check, which is the recurring failure of this run.
+    """
+
+    def _decision(self, **overrides) -> dict:
+        return {**complete_decision(), **overrides}
+
+    def test_user_decision_text_fields_must_be_text(self) -> None:
+        fields = list(self.policy.user_decision_fields)
+        non_text = (42, True, {"a": 1}, ["x"], 3.5)
+        # D4-F guards, co-located.
+        self.assertEqual(len(fields), 3)
+        self.assertEqual(len(non_text), 5)
+        checked = 0
+        for field in fields:
+            for value in non_text:
+                with self.subTest(field=field, value=repr(value)):
+                    facts = {
+                        "security": True,
+                        "user_decision": self._decision(**{field: value}),
+                    }
+                    self.assertNotIn("CLEAR", permitted_states(self.policy, facts))
+                    with self.assertRaises(DecisionPolicyError):
+                        validate_transition(self.policy, "NEEDS_INPUT", "CLEAR", facts)
+                    checked += 1
+        self.assertEqual(checked, 15)
+
+    def test_a_real_decision_is_still_accepted(self) -> None:
+        """POSITIVE CONTROL for the sweep above."""
+        facts = {"security": True, "user_decision": complete_decision()}
+        self.assertIn("CLEAR", permitted_states(self.policy, facts))
+
+    def test_conflict_citations_must_each_be_text(self) -> None:
+        base = load_fixture("valid/requirement_contradiction.json")
+        real = list(base["citations"])
+        self.assertGreaterEqual(len(real), 2)
+        for citations in ([1, 2], [1, real[1]], [[], []], ["   ", real[1]]):
+            with self.subTest(citations=repr(citations)):
+                with self.assertRaises(DecisionPolicyError):
+                    validate_record(self.policy, {**base, "citations": citations})
+        # POSITIVE CONTROL: the shipped citations still validate.
+        self.assertEqual(error_of(validate_record, self.policy, base), "")
+
+    def test_an_element_that_cannot_fire_has_nothing_to_check(self) -> None:
+        """`repository_project_policy` re-examined under the same lens rather than
+        carried forward. It has no declared domain, `triggering` is null so no value
+        can make it fire, and no reason code binds it -- so no value it could carry
+        changes any decision. Its machine-checkable half is the `policy_source`
+        OBJECT, whose kind, role and now locator are all enforced."""
+        spec = self.policy.boundary_elements["repository_project_policy"]
+        self.assertIsNone(spec.triggering)
+        self.assertEqual(spec.values, ())
+        bound = {
+            code.boundary_element
+            for code in self.policy.reason_codes.values()
+            if code.boundary_element
+        }
+        self.assertNotIn("repository_project_policy", bound)
+        self.assertFalse(_element_is_triggering(spec, "anything"))
 
 
 if __name__ == "__main__":  # pragma: no cover
