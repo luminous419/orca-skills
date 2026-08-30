@@ -438,11 +438,21 @@ entry-condition mutations and C31 catches the precedence one.
 |---|---|---|
 | **(a)** unreachable clause | every one of the 12 predicates given a witness that makes it **true**, a witness that makes it **false**, and checked for being **referenced** by some entry condition | **clean** — 12/12 satisfiable, 12/12 falsifiable, 0 defined-but-unused, 0 used-but-undeclared |
 | **(b)** vacuous pass / empty loop | all four entry conditions probed for satisfiability and refutability | **clean** — each is both |
-| **(c)** membership checked, value not | unknown predicate, unknown combinator, missing state, empty predicate list, two combinators in one condition, precedence naming an unknown element | **clean** — all six rejected at load |
+| **(c)** membership checked, value not | unknown predicate, unknown combinator, missing state, empty predicate list, two combinators in one condition, precedence naming an unknown element | **clean at the contract/loader level** — all six rejected at load. Says nothing about record validation; see the scope correction below |
 | **(d)** denylist enforcing a category | `authority_precedence` is a positive list of what a policy source *cannot* resolve, and `user_decision_sources` remains the allowlist | **clean** — no denylist introduced |
 | **(e)** presence checked, consistency not | `triggering` values checked against the element's **own value set** | **DEFECT FOUND** — see below |
 | **(f)** forbid-only, permit-unchecked | every predicate has a positive witness; every state is reachable | **clean** |
 | **(g)** predicates evaluated independently | the 63-case no-resolver sweep plus the new 42-case resolver sweep | **clean** — 0 leaks |
+
+
+> **Scope correction (added in iteration 6, after FR-7).** Every row above was executed, but
+> the verdicts are about **the surface this round introduced**, not about the decision-policy
+> code as a whole. The **Decision Record surface** — `validate_record()`'s per-reason-code
+> evidence path — was **not** inside this round's scope and was never swept for (c) or (e)
+> here. FR-6 lived exactly there: the reason code's boundary element was checked by name and
+> never by value. A reader who took "clean" as a statement about the whole surface would have
+> been misled, and that gap is why FR-7 was raised against this document as well as against
+> the tests.
 
 **The (e) finding, and why it mattered more than it looks.** An enum boundary element could name a
 `triggering` value it does **not declare** — `"reversibility": {"values": [...], "triggering":
@@ -592,13 +602,23 @@ The new surface is the helper and the parity tests. Every row below was executed
 | --- | --- | --- | --- |
 | (a) | unreachable clause | all three branches reached: non-mapping/empty → field missing/empty → source not allowlisted. The source branch is reachable only for a non-empty, non-allowlisted source, and six sources reach it. | clean |
 | (b) | vacuous / empty loop | see the emptying experiment below | clean |
-| (c) | membership only, value unchecked | source membership *is* the rule (allowlist); the fields are free text, so non-emptiness is the only checkable property | clean |
+| (c) | membership only, value unchecked | source membership *is* the rule (allowlist); the fields are free text, so non-emptiness is the only checkable property | clean **for this helper only** |
 | (d) | denylist for a category | the helper decides on `user_decision_sources` (allowlist). `forbidden_authority_sources` is read **only** to word the error message. Mutation N-3 reverts it to a denylist → **CAUGHT** | clean |
 | (e) | presence without consistency | **GAP FOUND** — mutation N-4 (`field not in decision`, dropping the emptiness half) was **MISSED**. Closed, see below | fixed |
 | (f) | forbid without permit | every negative sweep is paired with a positive control; P-5 confirms over-blocking is caught | clean |
 | (g) | predicates independent, broken in combination | RI3-1 precedence re-verified across the predicate grid | clean |
 | (h) | dead trigger | `validate_skills.py:2383` already forbids an allowlist/denylist overlap; today's overlap is empty | clean |
 | (i) | same concept judged differently in two places | **TWO FOUND** — TR4-1 and TR4-2 below | reported |
+
+
+> **Scope correction (added in iteration 6, after FR-7).** Every row above was executed, but
+> the verdicts are about **the surface this round introduced**, not about the decision-policy
+> code as a whole. The **Decision Record surface** — `validate_record()`'s per-reason-code
+> evidence path — was **not** inside this round's scope and was never swept for (c) or (e)
+> here. FR-6 lived exactly there: the reason code's boundary element was checked by name and
+> never by value. A reader who took "clean" as a statement about the whole surface would have
+> been misled, and that gap is why FR-7 was raised against this document as well as against
+> the tests.
 
 #### (b) — the collections were actually emptied
 
@@ -888,16 +908,31 @@ stripped `_is_empty`, and the call-closure tests. Every row executed.
 | --- | --- | --- | --- |
 | (a) | unreachable clause | both branches of `_entry_condition_defect` reached, for `all_of` and `any_of` states alike; R-4/R-5 confirm by mutation | clean |
 | (b) | vacuous / empty loop | collections actually emptied, see below | clean |
-| (c) | membership only, value unchecked | the entry predicates read values, not just key presence; R-5 (combinator ignored) is CAUGHT | clean |
+| (c) | membership only, value unchecked | the entry predicates read values, not just key presence; R-5 (combinator ignored) is CAUGHT | clean **for the entry predicates only** |
 | (d) | denylist for a category | the entry condition is a positive gate; INV-4 remains as the prohibition rather than as the rule | clean |
-| (e) | presence without consistency | `_is_empty` now strips, so a present-but-blank field is empty; R-6 CAUGHT | clean |
+| (e) | presence without consistency | `_is_empty` now strips, so a present-but-blank field is empty; R-6 CAUGHT | clean **for `_is_empty` only** |
 | (f) | forbid without permit | every negative paired with a positive control; R-4 and R-7 are the over-blocking probes and both are CAUGHT | clean |
 | (g) | predicates independent, broken in combination | RI3-1 precedence re-verified: determining + reserved → `{NEEDS_INPUT}`, determining + contradiction → `{CONFLICT}` | clean |
 | (h) | dead trigger | every enum element's `triggering` ⊆ its own `values`, enforced at load time | clean |
 | (i) | same concept judged in two places | 9 concepts, 109 cases, 0 divergences | clean |
 
-**Nothing new was found.** This is the first pass in the run where the nine-type sweep
-turned up no gap on the surface it was applied to.
+**Nothing new was found on the surfaces listed above.**
+
+> **Claim narrowed in iteration 6, after FR-7.** As originally written this paragraph read as
+> a general all-clear. It was not one. The sweep covered `_entry_condition_defect`, the role
+> check, `_is_empty` and the closure tests; it did **not** cover `validate_record()`'s
+> per-reason-code evidence path, where FR-6 was live and unfound at the time this was
+> written. The correct reading of that round is: **nothing new on four surfaces, one surface
+> never examined.**
+> **Scope correction (added in iteration 6, after FR-7).** Every row above was executed, but
+> the verdicts are about **the surface this round introduced**, not about the decision-policy
+> code as a whole. The **Decision Record surface** — `validate_record()`'s per-reason-code
+> evidence path — was **not** inside this round's scope and was never swept for (c) or (e)
+> here. FR-6 lived exactly there: the reason code's boundary element was checked by name and
+> never by value. A reader who took "clean" as a statement about the whole surface would have
+> been misled, and that gap is why FR-7 was raised against this document as well as against
+> the tests.
+
 
 #### (b) — the collections were emptied, not inspected
 
@@ -945,3 +980,107 @@ verified-green control, the parity numbers reproduce exactly (48/0/2 and 9/109/0
 call-closure device bites in both directions and does not over-block, and the nine-type
 sweep found nothing new on the new surfaces. One bounded limit of that device was found by
 executing it, and the half that could be closed without over-blocking has been closed.
+
+---
+
+## Correction — iteration 6 (Final Review attempt 4, FR-7)
+
+FR-6 was fixed by IMPLEMENTATION iteration 7. FR-7 is the other half of the same story:
+**the tests had the same defect as the code they were guarding.** They injected a boundary
+element **name** mismatch for all ten bound codes and never a non-triggering **value**, so
+1426 tests and 642 checks were green while FR-6 was live. And this document's own sweep
+tables claimed more than the sweeps had covered.
+
+### The evidence that matters: do the new tests actually catch FR-6?
+
+The only proof is a disposable copy with the FR-6 fix reverted. Four reverts were run — the
+whole `_grounds_defect` call, and each state branch on its own:
+
+| FR-6 reverted | new FR-7 tests | the pre-existing name-only tests |
+| --- | --- | --- |
+| the whole call | **FAILED (30 failures)** | **OK** |
+| `NEEDS_INPUT` branch only | **FAILED (19)** | **OK** |
+| `CLEAR` branch only | **FAILED (4)** | **OK** |
+| `CONFLICT` branch only | **FAILED (7)** | **OK** |
+
+The right-hand column is FR-7's finding restated as a measurement: with FR-6 fully reverted,
+`Requirement3BoundaryElementMustMatchTheCode` and `ReasonCodeLiveness` **still pass**. They
+could not have caught it, and saying so required running them against the defect rather than
+reasoning about them.
+
+### What was added
+
+Everything is derived from the contract rather than listed by hand, so a new bound code is
+covered the day it is added, not the day someone remembers to extend a tuple.
+
+| # | Test | Coverage | Co-located guard |
+| --- | --- | --- | --- |
+| 1a | `..._accepts_its_shipped_triggering_value` | POSITIVE, all 10 bound codes; each shipped value asserted to be genuinely triggering | `len(bound) == 10`, `checked == 10` |
+| 1b | `..._rejects_a_non_triggering_value` | NEGATIVE, all 10, value derived per element kind and asserted non-triggering before use | `len(bound) == 10`, `checked == 10` |
+| 1c | `..._absent_boundary_fact_is_judged_by_the_elements_kind` | 8 value-carrying elements: absence **rejected**; 2 `declared` elements: absence **accepted** | both partitions non-empty, `8 + 2 == 10` |
+| 2 | `..._accepts_its_own_clause_and_rejects_the_others` | 3 CONFLICT codes × own clause and none (accept) × 2 other clauses each (reject) | `(accepted, rejected) == (6, 6)`, clause set equality |
+| 2 | `..._citation_minimum_is_enforced_at_its_boundary` | exactly the minimum accepted, one fewer rejected, per code | `minimum == 2`, 3 codes |
+| 3 | `..._each_clear_entry_predicate_has_a_satisfying_record` | POSITIVE, one per CLEAR predicate | predicate set equality with the contract |
+| 3 | `..._each_near_miss_is_rejected` | NEGATIVE: supports-only, source-only decision, forbidden source, still-open item | `len(near_miss) == 4` |
+| 3 | `..._declaring_no_grounds_at_all_remains_valid` | anti-over-blocking control (UD-1) | — |
+
+**Item 1c is deliberately not uniform, and that is the point.** For a value-carrying element,
+omitting the fact is the same defect as declaring it false. For a `declared` element, A4-1
+row 1 makes naming it in `boundary_element` the declaration itself, so absence is *correct*.
+Asserting one rule for both would be over-blocking dressed up as coverage.
+
+### The new tests are not themselves vacuous
+
+Each collection they iterate was actually emptied in a disposable tree:
+
+| Collection emptied | Test | Result |
+| --- | --- | --- |
+| every `boundary_element` binding removed | 1a, 1b, 1c | **guard bit** (3/3) |
+| `entry_clauses["CONFLICT"]` | item 2 | **guard bit** |
+| `entry_conditions["CLEAR"]` predicates | item 3 | **guard bit** |
+
+### No over-blocking
+
+**18/18 valid fixtures pass**, checked before starting and again after. Every negative above
+is paired with a positive control in the same class.
+
+### Claims narrowed in this document — the other half of FR-7
+
+FR-7 is also a finding against TEST.md: conclusions were wider than the evidence. Three
+statements were narrowed **in place**, with the original analysis left intact so the record
+is corrected rather than rewritten:
+
+| Where | Was | Now |
+| --- | --- | --- |
+| iteration 3, type (c) | "**clean** — all six rejected at load" | "**clean at the contract/loader level**… says nothing about record validation" |
+| iteration 4, type (c) | "clean" | "clean **for this helper only**" |
+| iteration 5, type (c) | "clean" | "clean **for the entry predicates only**" |
+| iteration 5, type (e) | "clean" | "clean **for `_is_empty` only**" |
+| iteration 5, summary | "**Nothing new was found.** This is the first pass in the run where the nine-type sweep turned up no gap" | "**Nothing new was found on the surfaces listed above**", plus an explicit note that the correct reading is **nothing new on four surfaces, one surface never examined** |
+
+A scope correction was added under each of the three sweep tables naming what was **not**
+covered: `validate_record()`'s per-reason-code evidence path — the Decision Record surface,
+where FR-6 was live and unfound while those tables were being written.
+
+**The honest summary of the run's sweeps:** each was executed and each was accurate about
+the surface it was applied to. None of them ever covered the surface FR-6 was on, and the
+tables did not say so. "Clean" without a named scope is the same defect as a green suite
+that guards nothing — which is the failure mode this repository keeps producing, now
+recorded against my own reports rather than only against the code.
+
+### Commands after this pass
+
+| Command | Result |
+| --- | --- |
+| `python3 scripts/validate_skills.py` | **PASSED (642 checks)** — unchanged; this pass added tests, not validator checks |
+| `python3 -m unittest discover -s scripts -p 'test_*.py'` | **1441 tests OK (skipped=6)** — was 1433; the +8 are the FR-7 tests and **skips did not increase** |
+| `python3 scripts/verify_package.py` | **PASSED (173 source files)** |
+| `python3 scripts/build_release.py` | built `dist/orca-skills-0.9.0.tar.gz` |
+| `verify_package.py --archive …` | **PASSED (173 source files)**, archive verified |
+| `git diff --check` | clean |
+
+Untouched, verified by empty diff: `VERSION`, `LICENSE`, `skill_policy.py` (UD-3),
+`quality_profile.py`, `agent_profile.py`, `decision_policy.py`, both `SKILL.md` contracts,
+`templates/**` and `reviews/**`. This pass edited one test file and this document — no
+contract or evaluator semantics changed, and no defect was found that would have required
+reporting rather than fixing.
