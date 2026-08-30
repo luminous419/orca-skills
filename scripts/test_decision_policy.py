@@ -1931,6 +1931,9 @@ class Fr6DeclaredEvidenceMustJustifyTheState(DecisionPolicyTestCase):
         ("long_term_lock_in", "long_term_lock_in", False),
         ("irreversible_action", "reversibility", "reversible_in_run"),
         ("blast_radius_beyond_scope", "blast_radius", "current_change"),
+        # RI8-1: for this element the domain is now the triggering set, so a
+        # non-triggering value is also an out-of-domain value. Both are rejections,
+        # and the coincidence is the point -- see the parity assertion below.
         ("authority_reserved_to_user", "explicit_user_authority", "delegated"),
     )
 
@@ -2416,6 +2419,97 @@ class Fr8BooleanBoundariesFailClosed(DecisionPolicyTestCase):
                 self.assertIn(
                     "CONFLICT", permitted_states(self.policy, {"conflict_clause": clause})
                 )
+
+
+class Ri81AuthorityBoundaryFailsClosed(DecisionPolicyTestCase):
+    """RI8-1. `explicit_user_authority` carries the user's reservation of authority --
+    the boundary this ticket exists to protect -- and it was fail-open: `'RESERVED'`,
+    one shifted key, returned ASSUMPTION_ALLOWED for a reserved item. A typo silently
+    removed the reservation and allowed autonomous progress.
+
+    I recorded this in iteration 8 as an accepted residual limit, arguing that closing
+    the domain would reject `delegated`, "the legitimate non-reserved case". That was
+    wrong on the facts: `delegated` occurs zero times in either SKILL.md and zero times
+    in ANALYSIS.md -- my example, reasoned from as though the contract had defined it.
+    """
+
+    SAFE = {
+        "reversibility": "reversible_in_run",
+        "blast_radius": "current_change",
+        "policy_source": {"role": "supports", "kind": "file_path"},
+    }
+    ELEMENT = "explicit_user_authority"
+    BAD = ("RESERVED", "Reserved", "reserverd", "anything", "delegated", 1, {"a": 1}, None, [])
+
+    def test_only_the_declared_triggering_value_is_admitted(self) -> None:
+        spec = self.policy.boundary_elements[self.ELEMENT]
+        # D4-F guards, co-located: the domain is the contract's own triggering list,
+        # and it is a single value -- if the contract ever declares more, this fails
+        # rather than silently admitting them untested.
+        self.assertEqual(list(spec.triggering), ["reserved"])
+        self.assertEqual(len(self.BAD), 9)
+        checked = 0
+        for value in self.BAD:
+            with self.subTest(value=repr(value)):
+                with self.assertRaises(DecisionPolicyError):
+                    permitted_states(self.policy, {**self.SAFE, self.ELEMENT: value})
+                checked += 1
+        self.assertEqual(checked, 9)
+
+    def test_the_declared_value_still_reserves_authority(self) -> None:
+        """POSITIVE CONTROL 1. Rejecting everything would satisfy the test above."""
+        permitted = permitted_states(
+            self.policy, {**self.SAFE, self.ELEMENT: "reserved"}
+        )
+        self.assertEqual(permitted, frozenset({"NEEDS_INPUT"}))
+
+    def test_omitting_the_element_remains_the_way_to_say_not_reserved(self) -> None:
+        """POSITIVE CONTROL 2, and the reason closing the domain loses nothing: the
+        case iteration 8 thought needed an open domain already had a representation."""
+        self.assertNotIn(self.ELEMENT, self.SAFE)
+        self.assertIn(
+            "ASSUMPTION_ALLOWED", permitted_states(self.policy, dict(self.SAFE))
+        )
+
+    def test_both_apis_reject_an_unrecognised_authority_value_identically(self) -> None:
+        """Parity on identical input -- the property that has failed repeatedly in this
+        run. The same mapping is handed to both APIs unchanged."""
+        record = assumption_allowed_record(self.policy)
+        for value in self.BAD:
+            with self.subTest(value=repr(value)):
+                candidate = {**record, self.ELEMENT: value}
+                evaluator = error_of(permitted_states, self.policy, candidate) != ""
+                validator = error_of(validate_record, self.policy, candidate) != ""
+                self.assertTrue(evaluator)
+                self.assertEqual(evaluator, validator)
+
+    def test_the_authority_domain_equals_its_triggering_set(self) -> None:
+        """After RI8-1 these two coincide for this element, which is what makes an
+        unrecognised value impossible to read as 'not reserved'. Stated as its own
+        assertion because other tests describe the same values as 'non-triggering' and
+        the reader should know why both descriptions are now true."""
+        spec = self.policy.boundary_elements[self.ELEMENT]
+        for value in tuple(spec.triggering):
+            with self.subTest(value=value):
+                self.assertIsNone(_domain_defect(spec, value))
+                self.assertTrue(_element_is_triggering(spec, value))
+        self.assertIsNotNone(_domain_defect(spec, "not_reserved"))
+
+    def test_an_element_that_cannot_fire_is_left_open_deliberately(self) -> None:
+        """The judgement recorded for `repository_project_policy`, pinned so it is a
+        decision and not an oversight: its `triggering` is null, so no value can make
+        it fire and therefore no value can suppress a firing. A domain check would
+        protect nothing. If the contract ever gives it a triggering value, this fails
+        and the decision gets revisited."""
+        spec = self.policy.boundary_elements["repository_project_policy"]
+        self.assertEqual(spec.kind, "policy_source")
+        self.assertIsNone(spec.triggering)
+        self.assertFalse(_element_is_triggering(spec, "anything"))
+        self.assertIsNone(_domain_defect(spec, "anything"))
+        # The boundary it names is enforced through the policy_source OBJECT instead,
+        # and both of those positions ARE closed.
+        self.assertTrue(self.policy.policy_source_roles)
+        self.assertTrue(self.policy.policy_source_kinds)
 
 
 if __name__ == "__main__":  # pragma: no cover

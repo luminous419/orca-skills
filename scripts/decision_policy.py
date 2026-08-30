@@ -555,11 +555,34 @@ def _domain_defect(spec: BoundaryElement, value: Any) -> str | None:
                 f"{value!r} of type {type(value).__name__}"
             )
         return None
-    # `policy_source` and `user_decision` kinds declare no closed value set in the
-    # contract, so there is nothing to check here without inventing one. The
-    # `policy_source` OBJECT's role and kind are checked below; the user-authority
-    # element's open domain is recorded as a known limit in D2-2g rather than
-    # narrowed by this code.
+    if spec.kind == "user_decision" and isinstance(spec.triggering, (list, tuple)):
+        # RI8-1. This element IS the authority boundary, so a value outside the
+        # domain must not read as "authority is not reserved". Before this check,
+        # `'RESERVED'` -- one shifted key -- turned a reserved item into
+        # ASSUMPTION_ALLOWED: a typo silently removed the user's reservation and
+        # allowed autonomous progress. Same fail-open direction as FR-8, on the one
+        # element the ticket is actually about.
+        #
+        # The domain is what the contract declares -- `triggering` -- not a new list.
+        # Iteration 8 left this open arguing that closing it would reject `delegated`,
+        # a legitimate not-reserved case. That argument was wrong: `delegated` appears
+        # nowhere in either SKILL.md or ANALYSIS.md. It was my example, not a contract
+        # value. "Authority is not reserved" is expressed by OMITTING the element,
+        # which is already legal and already yields ASSUMPTION_ALLOWED -- the same way
+        # every other element expresses "this does not apply".
+        if value not in tuple(spec.triggering):
+            return (
+                f"is the authority boundary and admits only {list(spec.triggering)}, "
+                f"but declares {value!r}; authority that is not reserved is expressed "
+                "by omitting the element, never by an unrecognised value"
+            )
+        return None
+    # `policy_source` is left open deliberately, and the reason is not symmetry with
+    # the case above. Its `triggering` is null, so NO value can make it fire -- which
+    # means no value can suppress a firing either, and a domain check would protect
+    # nothing. The boundary it names is enforced through the `policy_source` OBJECT,
+    # whose `role` and `kind` are both closed sets and both checked (TR4-1). The
+    # locator stays open because this layer performs no I/O. See D2-2h.
     return None
 
 
