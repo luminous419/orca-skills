@@ -552,3 +552,249 @@ decision record section is still optional, requirement 5 is still permission-lev
 stated, `skill_policy.py` is still untouched, and the code set is still 18.
 
 STATUS: COMPLETE
+
+---
+
+## Downstream revalidation — iteration 4 (§17 T5a), after FR-5
+
+The FR-5 correction moved user-decision authorization into one helper,
+`_user_decision_defect(policy, decision) -> str | None`, read by both
+`permitted_states()` and `validate_transition()`. This pass re-ran the safety net on
+top of that change, swept the new surface for the nine recurring defect types, and
+re-confirmed every prior fix. **Nothing was loosened. Three defects were found and are
+reported, not fixed** — closing any of them changes evaluator semantics, and the
+implementation budget is spent.
+
+### T1 — the existing safety net still bites (20 mutations, control green)
+
+Control first: the unmodified tree passes `validate_skills.py`,
+`test_decision_policy`, and `test_validate_skills`, so the run below is valid.
+The set is the same one that scored 20/20 in iteration 3, re-executed against
+`a12bbe2`.
+
+| Group | Mutations | Result |
+| --- | --- | --- |
+| C15–C23 value pins | T-1 … T-9 | **9/9 CAUGHT** |
+| C26 / C26a transition matrix | T-10 … T-12 | **3/3 CAUGHT** |
+| C27 / C28 / C29 | T-13 … T-16 | **4/4 CAUGHT** |
+| C30 / C31 entry conditions and precedence | T-17 … T-20 | **4/4 CAUGHT** |
+
+**20/20 CAUGHT, nothing flipped to MISSED.** The set was run twice, independently,
+with a green control both times; the two runs agree row for row. `T-0` reports
+`MISSED` by construction — that is the control row, and an unmodified tree that
+"escapes detection" is the result you want there.
+
+### T2 — the nine recurring defect types, applied to the new surface
+
+The new surface is the helper and the parity tests. Every row below was executed.
+
+| # | Type | On `_user_decision_defect` / the parity tests | Verdict |
+| --- | --- | --- | --- |
+| (a) | unreachable clause | all three branches reached: non-mapping/empty → field missing/empty → source not allowlisted. The source branch is reachable only for a non-empty, non-allowlisted source, and six sources reach it. | clean |
+| (b) | vacuous / empty loop | see the emptying experiment below | clean |
+| (c) | membership only, value unchecked | source membership *is* the rule (allowlist); the fields are free text, so non-emptiness is the only checkable property | clean |
+| (d) | denylist for a category | the helper decides on `user_decision_sources` (allowlist). `forbidden_authority_sources` is read **only** to word the error message. Mutation N-3 reverts it to a denylist → **CAUGHT** | clean |
+| (e) | presence without consistency | **GAP FOUND** — mutation N-4 (`field not in decision`, dropping the emptiness half) was **MISSED**. Closed, see below | fixed |
+| (f) | forbid without permit | every negative sweep is paired with a positive control; P-5 confirms over-blocking is caught | clean |
+| (g) | predicates independent, broken in combination | RI3-1 precedence re-verified across the predicate grid | clean |
+| (h) | dead trigger | `validate_skills.py:2383` already forbids an allowlist/denylist overlap; today's overlap is empty | clean |
+| (i) | same concept judged differently in two places | **TWO FOUND** — TR4-1 and TR4-2 below | reported |
+
+#### (b) — the collections were actually emptied
+
+Each of the four new loops was run with the contract collection it iterates replaced
+by an empty one, in a disposable tree:
+
+| Test | `user_decision_fields` emptied | `user_decision_sources` emptied |
+| --- | --- | --- |
+| `..._agree_on_every_field_omission` | **guard bit** | guard bit (verdict assertion) |
+| `..._agree_on_every_source` | passes — iterates *sources*, still 8 | **guard bit** |
+| `..._never_permits_clear_anywhere` | **guard bit** | passes — iterates *fields*, still 3 |
+| `..._still_permits_clear_everywhere` | passes — iterates *sources* | **guard bit** |
+
+Every loop's own collection is cardinality-guarded inside the same function. A test
+passing when a collection it does not iterate is emptied is correct behaviour, not
+vacuity: its own loop still runs and its assertions still discriminate.
+
+#### (e) — the gap that was found, and closed
+
+`test_an_empty_field_is_not_evidence_either` (new). Every existing test removed a
+field with `pop`, so a helper checking only `field not in decision` — presence
+without content — passed the entire suite. A `where_recorded` of `""` is a filled-in
+form with nothing written on it. The new test drives each of the 3 declared fields
+through 4 empty values (`""`, `None`, `[]`, `{}`), 12 assertions, cardinality-guarded
+on both loops, with a positive control that the same record with real content is
+still accepted. Re-running the mutation as **P-1: CAUGHT**.
+
+### T2(i) — concept comparison, and what it found
+
+Every concept judged by more than one of the three public APIs was enumerated from
+the `_require`/`raise` sites and compared on a chosen sample, not assumed.
+
+| Concept | Where judged | Verdict |
+| --- | --- | --- |
+| user_decision authorization | `permitted_states` + `validate_transition` | **agree** — 12 cases (3 omissions × complete, 8 sources) |
+| boundary-element enum membership | `permitted_states` + `validate_record`, both via `_validate_declared_facts` | **agree** |
+| `policy_source.kind` membership | same shared helper | **agree** |
+| `policy_source.role` membership | `permitted_states` only | **DISAGREE → TR4-1** |
+| "may ASSUMPTION_ALLOWED apply?" | entry conditions vs `assumption_allowed_forbidden_when` | **DISAGREE → TR4-2** |
+
+The implementation report's claim that `policy_source` agrees is correct **for
+`kind`**, which goes through the shared helper. It does not hold for `role`.
+
+#### TR4-1 — `policy_source.role` membership is judged in one place only (MAJOR)
+
+`permitted_states` raises `unknown policy_source role 'invented_role'`.
+`validate_record` accepts the identical value on a `NEEDS_INPUT` record. Executed:
+
+```
+role='invented_role'  permitted_states: REJECT: unknown policy_source role 'invented_role'
+                      validate_record : accept
+```
+
+`kind` is checked inside `_validate_declared_facts`, which `validate_record` calls;
+`role` is checked inline in `permitted_states`, which it does not. The asymmetry is
+arbitrary — both are closed sets in the contract and both are pinned by C28. Effect:
+a record naming a misspelled role passes record validation, and the two APIs
+contradict each other on the same value. `ASSUMPTION_ALLOWED` is unaffected, because
+that branch compares the role by equality to `supports`.
+
+#### TR4-2 — the two ASSUMPTION_ALLOWED rules disagree on the middle band (MAJOR)
+
+`entry_conditions.ASSUMPTION_ALLOWED` requires `reversible_in_run` **and**
+`blast_radius_within_scope`. `assumption_allowed_forbidden_when` forbids only
+`irreversible`, and `repository`/`external_system` **with** `irreversible`. Over all
+48 combinations of reversibility × blast_radius × security × reserved authority, the
+two answers to "may this item be ASSUMPTION_ALLOWED?" differ on **6**:
+
+```
+reversible_in_run    + repository       + no flags : permitted=False  record_valid=True
+reversible_in_run    + external_system  + no flags : permitted=False  record_valid=True
+reversible_with_effort + current_change + no flags : permitted=False  record_valid=True
+reversible_with_effort + module         + no flags : permitted=False  record_valid=True
+reversible_with_effort + repository     + no flags : permitted=False  record_valid=True
+reversible_with_effort + external_system+ no flags : permitted=False  record_valid=True
+```
+
+The permissive side is `validate_record` — the API a Reviewer uses to check a filed
+record. It accepts an `ASSUMPTION_ALLOWED` record for an item the evaluator would
+never permit to enter that state, which is autonomous assumption on an item the entry
+contract excludes. The band is bounded: **all 42 other combinations agree**, and every
+case involving `irreversible`, any of the five high-impact flags, or reserved
+authority agrees. A prohibition list narrower than a permission gate is not a logical
+contradiction, but it does mean the contract's two enforcement points answer the same
+operational question differently — the FR-5 shape.
+
+#### TR4-3 — whitespace-only text counts as evidence (MINOR)
+
+`_is_empty` treats `"   "` as content, so a `user_decision` whose `where_recorded` is
+three spaces is accepted as evidence of user authority by both APIs. They agree, so
+this is not an (i) defect; it is (e) at the value level. `_is_empty` is shared by the
+whole loader, so narrowing it is an evaluator-semantics change. The new test's
+`empties` tuple deliberately excludes whitespace and says so in a comment rather than
+pinning either behaviour.
+
+#### What was added to the net, and what deliberately was not
+
+`CrossApiConceptParity` (new, 4 tests) pins the concepts that **do** agree —
+enum membership and `policy_source.kind` — over both APIs, and pins the
+**dangerous half** of the ASSUMPTION_ALLOWED question: whenever the item is
+irreversible, carries any of the five high-impact flags, or reserves authority to
+the user, both APIs must refuse. A positive control asserts a safe item is still
+ASSUMPTION_ALLOWED by both, so the class cannot be satisfied by refusing everything.
+
+TR4-1's and TR4-2's divergent bands are **not** asserted in either direction. A test
+that asserted today's behaviour would pin a defect — which is exactly the mistake
+FR-5 found in two tests — and a test that asserted the corrected behaviour would fail
+against code this phase is not permitted to change. Both are recorded here instead.
+
+### T3 — every prior fix still holds (11/11, executed)
+
+| Fix | Probe | Result |
+| --- | --- | --- |
+| FR-1 | `NEEDS_INPUT→CLEAR` is `requires_user_decision`; `CONFLICT→ASSUMPTION_ALLOWED` is `forbidden` | intact |
+| FR-2 | an invented source is rejected (allowlist, not denylist) | intact |
+| FR-3 | `security_impact` filed with `boundary_element: privacy` is rejected | intact |
+| FR-4 | irreversible + external_system + security does not permit CLEAR | intact |
+| RI3-1 | a determining policy source cannot un-reserve user authority → `{NEEDS_INPUT}` | intact |
+| FR-5 | a source-only record is refused by **both** APIs | intact |
+
+Positive controls, so this is not over-blocking:
+
+| Control | Result |
+| --- | --- |
+| complete decision → `['CLEAR']` | holds |
+| ordinary item + determining source → `['CLEAR']` | holds |
+| safe item + supporting source → `['ASSUMPTION_ALLOWED']` | holds |
+
+**8/8 regression probes intact, 3/3 positive controls hold.**
+
+### T4 — the two corrected tests pass for the right reason
+
+`test_a_forbidden_authority_source_does_not_permit_clear` now builds a **complete**
+record and varies only the source. Two independent demonstrations:
+
+1. Directly: with a complete record, the only defect the helper reports for each of
+   the five forbidden sources and one invented source names the **source**
+   (`'timeout' is not evidence of user authority; …`), never a missing field. The
+   contrast case — an allowlisted source with a source-only record — reports
+   `user_decision requires a non-empty 'where_recorded'`, a different message.
+2. By mutation: delete **only** the source-allowlist branch and leave the field
+   checks intact. The test fails on all six sources. Had it been passing because of
+   field omission, it would still have passed.
+
+`test_an_allowlisted_authorization_permits_clear` is the paired positive control: it
+asserts a complete authorization *does* buy CLEAR, and mutation N-2 (helper checks
+only the first declared field) is **CAUGHT**, so the assertion depends on the whole
+record rather than on the source alone.
+
+### The one thing this suite still cannot detect
+
+Mutation **N-6** — deleting the parity test's own "the verdict must be right"
+assertion — is **MISSED**. No test suite detects the removal of its own assertion;
+this is the same inherent limit recorded for V-3/V-4 in iteration 3, not a new
+weakness. It is stated here rather than left implicit.
+
+### Mutation results for this pass — control verified green first
+
+| # | Mutation | Result |
+| --- | --- | --- |
+| N-0 / P-0 | control, unmodified tree | **green** (results below are valid) |
+| N-1 | the predicate stops using the shared helper — the FR-5 defect itself | CAUGHT |
+| N-2 | the helper checks only the first declared field | CAUGHT |
+| N-3 | the helper reverts to a denylist for the source | CAUGHT |
+| N-4 | the helper checks presence but not non-emptiness | **MISSED** → gap closed, re-run as P-1 |
+| N-5 | `validate_transition` stops using the helper | CAUGHT |
+| N-6 | the parity test loses its own correctness assertion | **MISSED** (inherent limit) |
+| P-1 | N-4 re-run against the new test | **CAUGHT** |
+| P-2 | `validate_record` stops calling `_validate_declared_facts` | CAUGHT |
+| P-3 | the declared-facts check stops validating `policy_source.kind` | CAUGHT |
+| P-4 | the INV-4 forbidden-check is neutered in `validate_record` | CAUGHT |
+| P-5 | `permitted_states` refuses ASSUMPTION_ALLOWED always (over-blocking probe) | CAUGHT |
+
+P-5 is the check on the check: a suite that could be satisfied by refusing everything
+would not have caught it.
+
+### Commands after this pass
+
+| Command | Result |
+| --- | --- |
+| `python3 scripts/validate_skills.py` | **PASSED (642 checks)** — unchanged; this pass added tests, not validator checks |
+| `python3 -m unittest discover -s scripts -p 'test_*.py'` | **1413 tests OK (skipped=6)** — was 1408; the 5 new tests are the whole delta and **skips did not increase** |
+| `python3 scripts/verify_package.py` | **PASSED (173 source files)** |
+| `python3 scripts/build_release.py` | built `dist/orca-skills-0.9.0.tar.gz` |
+| `verify_package.py --archive …` | **PASSED (173 source files)**, archive verified |
+| `git diff --check` | clean |
+
+Protected surfaces re-checked and untouched: `VERSION`, `LICENSE`, `quality_profile.py`,
+`agent_profile.py`, `skill_policy.py`, and `evaluate_invocation()` (UD-3). No change to
+`decision_policy.py`, to either `SKILL.md`, or to any template or review file — this
+pass edited tests only.
+
+### What the next phase owns
+
+TR4-1, TR4-2 and TR4-3 are handed to the implementation phase, not to this one. Each
+was reproduced by execution and is recorded above with the exact facts that produce it.
+None of them is a regression introduced by FR-5: TR4-1 and TR4-3 predate this run's
+corrections, and TR4-2 dates from FR-4, when `entry_conditions` was introduced beside
+the pre-existing `assumption_allowed_forbidden_when` without the two being reconciled.
