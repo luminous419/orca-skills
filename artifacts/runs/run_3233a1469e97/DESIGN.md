@@ -586,6 +586,69 @@ The empty set is a distinct and honest answer: *nothing has been declared, so no
 yet.* A caller must not read it as "proceed". `test_undeclared_facts_permit_nothing_by_design` pins
 it.
 
+#### D2-2d. One judgement of user authority, shared by both APIs (FR-5)
+
+**The finding.** `permitted_states()` and `validate_transition()` both decide whether a
+`user_decision` is evidence of user authority, and they decided it **differently**.
+`permitted_states()` checked only that `source` was on the allowlist; `validate_transition()`
+required every field `user_decision_fields` declares. Reproduced before any change:
+
+```text
+facts = {"explicit_user_authority": "reserved", "security": true,
+         "user_decision": {"source": "explicit_user_reply"}}
+
+permitted_states()    -> ['CLEAR']
+validate_transition() -> rejected: user_decision requires a non-empty 'where_recorded'
+```
+
+Two production APIs, opposite answers to the same evidence — and the permissive one is the one that
+decides whether a high-impact, user-reserved item may proceed. A bare **category claim** bought
+`CLEAR` without showing where the answer is recorded or what it resolves, which is exactly the
+promotion of an approval-category assertion into evidence of explicit authority that the boundary
+forbids.
+
+**The single source of truth.**
+
+```text
+_user_decision_defect(policy, decision) -> str | None
+    returns the reason the decision is not valid evidence, or None when it is
+
+    checks, in order:  the decision is a non-empty mapping
+                       every field in policy.user_decision_fields is present and non-empty
+                       source is a member of policy.user_decision_sources   (FR-2's allowlist)
+
+    read by:  _evaluate_predicate("explicit_user_authorization")  -> `defect is None`
+              validate_transition()                               -> raises with `defect`
+```
+
+Returning the *reason* rather than a bare boolean keeps `validate_transition`'s specific diagnostics
+while giving the rule one home. A5-3 and INV-5 require the whole record precisely because a source
+name is an assertion that a user decided, and `where_recorded` plus `resolves` are what let someone
+else check that assertion.
+
+**Parity is now a requirement, not a coincidence.** `test_the_two_apis_agree_on_every_field_omission`
+and `test_the_two_apis_agree_on_every_source` assert that both APIs reach the **same** verdict for
+every declared field's omission and every source — allowlisted, each forbidden category, and an
+invented spelling — and additionally that the verdict is *correct*, not merely consistent. That pair
+is the recurrence guard for this defect class.
+
+**Two tests were pinning the defect.** The positive control for allowlisted authorization built a
+source-only record, so it asserted that a category claim is authority; its forbidden-source sibling
+did the same, and would have passed for the wrong reason. Both now use a complete record, so the
+source is the only variable in the sibling.
+
+**Negative sweep and its positive control.** Five situations that require authority (reserved
+authority, C-1, C-2, C-3, the high-impact case) × four incomplete records (source-only plus one per
+dropped field) = 20 assertions that `CLEAR` is not permitted, each with a co-located cardinality
+guard. The paired positive control runs the same five situations × both genuine sources with complete
+records and requires exactly `{CLEAR}`, so refusing everything cannot satisfy the sweep.
+
+**Concept comparison, run rather than assumed.** The other concepts both APIs touch were compared
+directly: `policy_source` validity (kind and role membership, missing `locator`, missing `kind`) —
+**both agree on all four**. `reason_code` vs. state and code↔`boundary_element` binding differ in
+**domain**, not judgement: `permitted_states` takes *facts* and has no reason-code notion, so those
+are outside its contract rather than a parity gap. Authorization was the only genuine divergence.
+
 #### D2-3. What the loader deliberately does not do
 
 No import from `orca_runtime_harness`, `run_logging`, `review_isolation`, `e2e_harness`, or
