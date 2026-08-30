@@ -403,6 +403,143 @@ table, and the two keys correctly checked by membership rather than value.
 
 Commits: `264a5cb` (validator + tests), `8e48993` (DESIGN). Not pushed.
 
+## Downstream revalidation — iteration 3 (§17 T5a)
+
+Not a correction. The FR-3/FR-4 and RI3-1 rounds materially enlarged the contract, so this pass
+re-checks whether the TEST-phase safety net still bites on the larger surface. Two gaps in the
+**verification layer** were found and closed; the contract semantics IMPLEMENTATION settled were not
+touched.
+
+### T1 — the existing safety net still bites (20 mutations, control green)
+
+Every pin from earlier TEST rounds was mutation-tested against the enlarged contract. Surgical
+substitution only; the harness aborts unless its target appears exactly once and refuses to score an
+`ImportError` as detection.
+
+```text
+T-0   control, no mutation                                      green
+T-1 .. T-9    C15-C23  states / aggregate_order / INV-4 / INV-3 / user_decision_fields /
+              citation_minimum / required_evidence / entry-clause prose / downstream_rule   9/9 CAUGHT
+T-10 .. T-12  C26, C26a  both authority edges + the retraction edge                         3/3 CAUGHT
+T-13 .. T-16  C27, C28, C29  enum values, triggering, policy_source_roles, state_scope      4/4 CAUGHT
+T-17 .. T-20  C30, C31  entry conditions (widened / conjunct dropped / combinator flipped),
+              authority precedence emptied                                                  4/4 CAUGHT
+```
+
+**20/20 caught with the control green.** The new surfaces do bite: C30 catches all three
+entry-condition mutations and C31 catches the precedence one.
+
+### T2 — the seven recurring defect types, applied to the new surfaces
+
+`entry_conditions`, the twelve `ENTRY_PREDICATES`, the per-element `triggering` values, and
+`authority_precedence` are all new since those types were catalogued. Each was applied deliberately.
+
+| type | applied to the new surfaces | result |
+|---|---|---|
+| **(a)** unreachable clause | every one of the 12 predicates given a witness that makes it **true**, a witness that makes it **false**, and checked for being **referenced** by some entry condition | **clean** — 12/12 satisfiable, 12/12 falsifiable, 0 defined-but-unused, 0 used-but-undeclared |
+| **(b)** vacuous pass / empty loop | all four entry conditions probed for satisfiability and refutability | **clean** — each is both |
+| **(c)** membership checked, value not | unknown predicate, unknown combinator, missing state, empty predicate list, two combinators in one condition, precedence naming an unknown element | **clean** — all six rejected at load |
+| **(d)** denylist enforcing a category | `authority_precedence` is a positive list of what a policy source *cannot* resolve, and `user_decision_sources` remains the allowlist | **clean** — no denylist introduced |
+| **(e)** presence checked, consistency not | `triggering` values checked against the element's **own value set** | **DEFECT FOUND** — see below |
+| **(f)** forbid-only, permit-unchecked | every predicate has a positive witness; every state is reachable | **clean** |
+| **(g)** predicates evaluated independently | the 63-case no-resolver sweep plus the new 42-case resolver sweep | **clean** — 0 leaks |
+
+**The (e) finding, and why it mattered more than it looks.** An enum boundary element could name a
+`triggering` value it does **not declare** — `"reversibility": {"values": [...], "triggering":
+["not_a_member"]}` loaded without complaint. Nothing could ever equal that value, because
+`_validate_declared_facts` already rejects out-of-enum declarations, so the element became a **dead
+trigger**: an irreversible item would silently stop escalating. Probed before and after:
+
+```text
+before:  irreversible declared, contract with an orphan triggering value -> []
+after :  the contract is rejected at load, naming the orphaned values
+```
+
+Type (e) producing type (a). **The shipped contract is correct** — every triggering value is a
+member — so this is a missing loader consistency check, not a contract change, which puts it on the
+verification side of the boundary. C27 catches *drift from the pinned value*; this catches a contract
+inconsistent **on its own terms**.
+
+### T3 — the count was wrong, corrected by counting
+
+The Reviewer's non-blocking finding is right. Counted directly:
+
+```text
+9 triggering elements + 3 CONFLICT clauses + 9 element-with-C-1 pairs = 21 fact-cases
+21 x 3 resolver states carrying NO authority (none / supporting / forbidden) = 63
+the test's own final assertion: assertEqual(checked, 21 * 3) -> 63
+```
+
+The docstring said **105**. That figure came from an ad-hoc probe that also swept the two resolver
+states which *do* carry authority. **Rather than only relabel**, those 42 are now a sibling test with
+their own expected outcome — an allowlisted decision resolves every case; a determining policy source
+resolves all but the two A4-0 excludes — which is also the positive control the no-resolver sweep
+needed. So the label is now 63 **and** the 42 it wrongly implied are permanently covered.
+
+### T4 — every prior fix still holds (11/11, executed)
+
+| fix | check | result |
+|---|---|---|
+| FR-1 | both authority edges still `requires_user_decision` | ok |
+| FR-2 | `high_confidence` rejected; `explicit_user_reply` accepted | ok |
+| FR-3 | mismatched `boundary_element` rejected; matching accepted | ok |
+| FR-4 | high-impact, no authority → `['NEEDS_INPUT']` | ok |
+| RI3-1 | reserved + determining → `['NEEDS_INPUT']`; C-1 + determining → `['CONFLICT']` | ok |
+| positive | ordinary element + determining → `['CLEAR']`; safe supporting item → `['ASSUMPTION_ALLOWED']` | ok |
+
+### A red control, and what it cost
+
+The first verification-layer mutation run reported `V-0 control: val=FAIL`. **The mutation results
+were unusable until that was fixed**, and it turned out two mutation assertions were stale rather
+than any check being broken: the new loader consistency rule fires *earlier* than C27 for two
+boundary-element mutations, so both were still caught but with a different, more specific message.
+The assertions were repointed at the message that now fires.
+
+Root cause worth naming: after changing the loader I re-ran the module I had edited
+(`test_decision_policy`) and not the module that depends on it (`test_validate_skills`). Running only
+the file you touched is how a dependent module goes red unnoticed.
+
+**With the control green, two results flipped from CAUGHT to MISSED**, and they are reported as
+MISSED:
+
+```text
+V-0  control                                          green
+V-1  triggering consistency check disabled            CAUGHT
+V-2  a predicate removed from ENTRY_PREDICATES        CAUGHT
+V-3  the 63-sweep cardinality guard -> tautology      MISSED
+V-4  the 42-sweep cardinality guard -> tautology      MISSED
+```
+
+**V-3/V-4 are a known and inherent limit, not a fixable gap.** Rewriting a D4-F guard as
+`assertEqual(checked, checked)` cannot be detected by the suite that contains it — no test suite
+detects the deletion of its own assertion. This is the same class as the M-21 coordinated-edit gap
+that DESIGN F-5 already records, and the mitigation is the same: a human reading the diff. It is
+stated here rather than left implied, and their earlier CAUGHT was a false positive from the red
+control.
+
+### Commands after this pass
+
+| command | result |
+|---|---|
+| `python3 scripts/validate_skills.py` | **PASSED (642 checks)** — unchanged |
+| `python3 -m unittest discover -s scripts -p 'test_*.py'` | **Ran 1404 tests in 305.920s — OK (skipped=6)** — was 1399 |
+| `python3 scripts/verify_package.py` | **PASSED (173 source files)** |
+| `python3 scripts/build_release.py` | built `dist/orca-skills-0.9.0.tar.gz` |
+| `python3 scripts/verify_package.py --archive …` | **PASSED (173 source files); Verified archive** |
+| `git diff --check` | no output |
+
+Check count is unchanged at 642 because both gaps were closed in the loader and the test suite rather
+than by adding a validator check. Skips unchanged at 6. Protected-surface diff empty.
+
+### DESIGN.md
+
+One row added to D2-2's fail-closed table: an enum element naming a `triggering` value outside its
+own value set is rejected at load. No other section needed changing — this pass altered verification,
+not contract semantics.
+
+Commits: `7fddd56` (loader consistency check, reachability tests, corrected count and its sibling
+test), `8532cb1` (two stale mutation assertions repointed). Not pushed.
+
 ## Review Feedback Resolution
 
 ```text

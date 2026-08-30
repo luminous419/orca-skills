@@ -377,6 +377,7 @@ partial object.
 | a transition marked `forbidden` | `validate_transition` |
 | a `requires_user_decision` transition with no `user_decision`, or whose `source` is **not in `user_decision_sources`** — an unknown or alias source is rejected, not merely an explicitly forbidden one (FR-2) | `validate_transition` |
 | `user_decision_sources` is empty, or overlaps `forbidden_authority_sources` | `load_decision_policy` |
+| an enum boundary element names a `triggering` value that is **not in its own value set** — an orphan can never be matched, so the element would become a dead trigger | `load_decision_policy` |
 | a `requires_retraction` transition with no retraction record | `validate_transition` |
 
 **The precedent this follows, and the one it does not (PLAN V3).** `quality_profile.py:521-528` and
