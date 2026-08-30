@@ -78,6 +78,138 @@ class ValidatorRegressionTests(unittest.TestCase):
             check=False,
         )
 
+    # ---- OS-28 decision policy contract (DESIGN D4-E) ------------------------
+    # These are the permanent form of the DESIGN D5-1 mutations: each one applies a
+    # weakening and asserts the validator fails with its NAMED message, so a check
+    # that stops working is a red test rather than a quiet gap.
+
+    DECISION_SKILLS = (
+        "orca-worker-reviewer-orchestration",
+        "orca-worker-reviewer-loop",
+    )
+
+    def edit_skills(self, old: str, new: str, *skills: str) -> None:
+        """Replace `old` with `new` in each named SKILL.md, asserting it was there."""
+        for name in skills or self.DECISION_SKILLS:
+            path = self.repo_root / name / "SKILL.md"
+            text = path.read_text(encoding="utf-8")
+            self.assertIn(old, text, f"{name}: mutation target not found")
+            path.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+    def assert_validator_fails_with(self, fragment: str) -> None:
+        result = self.run_validator()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(fragment, result.stdout)
+
+    def test_decision_policy_contract_removed_fails(self) -> None:
+        self.edit_skills('"decision_policy": {', '"decision_policy_removed": {')
+        self.assert_validator_fails_with("decision policy contract is missing or malformed")
+
+    def test_decision_policy_single_skill_drift_fails(self) -> None:
+        """M-2: one Skill only. The existing whole-dict deep-equality catches this."""
+        self.edit_skills(
+            '"citation_minimum": {"CONFLICT": 2}',
+            '"citation_minimum": {"CONFLICT": 3}',
+            "orca-worker-reviewer-loop",
+        )
+        self.assert_validator_fails_with(
+            "machine-readable policy contracts differ between skills"
+        )
+
+    def test_decision_policy_reason_code_removed_from_both_skills_fails(self) -> None:
+        """M-3: the simultaneous-deletion blind spot. Deep-equality still passes here,
+        so this is the mutation that justifies the expected Python constant."""
+        self.edit_skills(
+            '      "privacy_impact": {"state": "NEEDS_INPUT", "clause": "N-1", '
+            '"boundary_element": "privacy"},\n',
+            "",
+        )
+        self.assert_validator_fails_with("decision policy reason-code cardinality drifted")
+
+    def test_decision_policy_value_drift_fails(self) -> None:
+        self.edit_skills('"clause": "N-1", "boundary_element": "privacy"',
+                         '"clause": "N-2", "boundary_element": "privacy"')
+        self.assert_validator_fails_with("decision policy contract values drifted")
+
+    def test_decision_policy_forbidden_transition_relaxed_fails(self) -> None:
+        """M-4: the T-F2 cell. Relaxing it must not be silently acceptable."""
+        self.edit_skills(
+            '"NEEDS_INPUT": {"CLEAR": "requires_user_decision", '
+            '"ASSUMPTION_ALLOWED": "forbidden"',
+            '"NEEDS_INPUT": {"CLEAR": "requires_user_decision", '
+            '"ASSUMPTION_ALLOWED": "allowed"',
+        )
+        self.assert_validator_fails_with(
+            "NEEDS_INPUT/CONFLICT -> ASSUMPTION_ALLOWED must be forbidden"
+        )
+
+    def test_decision_policy_inv4_exception_fails(self) -> None:
+        """M-6: INV-4 has no exception (A4-0)."""
+        self.edit_skills('"exception_allowed": false', '"exception_allowed": true')
+        self.assert_validator_fails_with("INV-4 must have no exception")
+
+    def test_decision_policy_reject_list_trimmed_fails(self) -> None:
+        """M-7: model confidence is never authority."""
+        self.edit_skills('"model_confidence", ', "")
+        self.assert_validator_fails_with("forbidden-authority reject list drifted")
+
+    def test_decision_policy_unclassified_key_fails(self) -> None:
+        """M-18 / C11a: a new top-level key must be classified, or the enumeration
+        would silently become incomplete."""
+        self.edit_skills(
+            '"citation_minimum": {"CONFLICT": 2}',
+            '"risk_overrides": {}, "citation_minimum": {"CONFLICT": 2}',
+        )
+        self.assert_validator_fails_with("decision policy contract is missing or malformed")
+
+    def test_decision_policy_axis_token_in_a_selection_input_fails(self) -> None:
+        """M-16 / C11b: an exact axis token inside a state-selection input."""
+        self.edit_skills(
+            '"explicit_user_authority_reserved": true',
+            '"risk_in": ["high"],\n      "explicit_user_authority_reserved": true',
+        )
+        self.assert_validator_fails_with(
+            "references axis token at ['assumption_allowed_forbidden_when/risk_in[0] "
+            "(value)'], which is a state-selection input"
+        )
+
+    def test_decision_policy_transition_value_outside_closed_set_fails(self) -> None:
+        """M-17 / C11c: a risk-conditional value carrying NO exact axis token. This is
+        the mutation the token rule misses, and the reason C11c exists."""
+        self.edit_skills(
+            '"NEEDS_INPUT": {"CLEAR": "requires_user_decision"',
+            '"NEEDS_INPUT": {"CLEAR": "requires_user_decision_unless_risk_low"',
+        )
+        self.assert_validator_fails_with("is outside the closed set")
+
+    def test_decision_policy_independent_axes_drift_fails(self) -> None:
+        """M-19 / C11d: checked by positive equality, so the declarative position
+        cannot forbid itself."""
+        self.edit_skills(
+            '"independent_axes": ["risk", "quality_profile", "agent_profile"]',
+            '"independent_axes": ["risk"]',
+        )
+        self.assert_validator_fails_with("decision policy contract is missing or malformed")
+
+    def test_decision_policy_prose_anchor_removed_from_both_skills_fails(self) -> None:
+        """M-11: byte-equality cannot see a sentence deleted from BOTH copies."""
+        self.edit_skills("INV-4에는 예외가 없다", "INV-4는 중요하다")
+        self.assert_validator_fails_with("missing decision policy prose anchor")
+
+    def test_decision_record_optionality_sentence_removed_fails(self) -> None:
+        """M-13 / UD-1: making the section required would violate a user decision."""
+        for name in self.DECISION_SKILLS:
+            for path in sorted((self.repo_root / name / "templates").glob("*.md")):
+                text = path.read_text(encoding="utf-8")
+                path.write_text(
+                    text.replace(
+                        "optional section이다. 없어도 계약 위반이 아니다.",
+                        "필수 section이다.",
+                    ),
+                    encoding="utf-8",
+                )
+        self.assert_validator_fails_with("missing the decision record optionality sentence")
+
     def test_valid_repository_passes(self) -> None:
         result = self.run_validator()
 
