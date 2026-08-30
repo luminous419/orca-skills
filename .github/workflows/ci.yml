@@ -20,6 +20,10 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          # Full history is required by the retained-report whitespace tests.
+          # A shallow checkout makes their pinned base commits unreachable.
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
