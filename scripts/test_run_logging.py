@@ -3929,7 +3929,16 @@ class ProvenanceLadderTests(_AuditTestCase):
 
 # ---- T-5a: the retained-report whitespace exemption (DESIGN A.6, R5) ----------------
 
-WHITESPACE_GATE_BASE_COMMIT = "1045815"
+# Source files and immutable run evidence need different historical gates. The
+# source gate starts at the OS-22 merge and excludes run artifacts, whose bytes
+# are historical evidence. The retained-report gate reaches back before OS-22
+# and checks only the digest-bound report path covered by .gitattributes.
+SOURCE_WHITESPACE_GATE_BASE_COMMIT = "f30d03d"
+RETAINED_REPORT_GATE_BASE_COMMIT = "1045815"
+SOURCE_TREE_PATHS = (".", ":(exclude,glob)artifacts/runs/**")
+RETAINED_REPORT_PATHS = (
+    ":(glob)artifacts/runs/*/final_review_audit/**/report.md",
+)
 
 # The one retained report that actually carries Markdown hard breaks, and what
 # record.json commits its bytes to. Pinned literally so half (b) of this test cannot
@@ -3967,40 +3976,65 @@ class RetainedReportWhitespaceExemptionTests(unittest.TestCase):
             check=False,
         )
 
-    def _require_git_range(self) -> None:
-        """Skip -- never silently pass -- when the gate cannot be evaluated."""
+    def _require_git_history(self) -> None:
+        """Require pinned history whenever these tests run in a git checkout."""
         if shutil.which("git") is None:
             self.skipTest("git is not available on PATH")
         if not (REPO_ROOT / ".git").exists():
             self.skipTest("not a git checkout; the whitespace gate cannot be run")
-        probe = self._git(
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            f"{WHITESPACE_GATE_BASE_COMMIT}^{{commit}}",
-            cwd=REPO_ROOT,
-        )
-        if probe.returncode != 0:
-            self.skipTest(
-                f"base commit {WHITESPACE_GATE_BASE_COMMIT} is unreachable "
-                "(shallow or grafted checkout)"
+        for base_commit in (
+            SOURCE_WHITESPACE_GATE_BASE_COMMIT,
+            RETAINED_REPORT_GATE_BASE_COMMIT,
+        ):
+            probe = self._git(
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                f"{base_commit}^{{commit}}",
+                cwd=REPO_ROOT,
+            )
+            self.assertEqual(
+                probe.returncode,
+                0,
+                f"base commit {base_commit} is unreachable; fetch full git history "
+                "instead of skipping the whitespace gate",
             )
 
     # -- (a) the gate passes ---------------------------------------------------------
 
-    def test_the_whitespace_gate_passes_over_the_whole_os22_range(self) -> None:
-        self._require_git_range()
+    def test_source_whitespace_gate_passes_without_rewriting_run_evidence(self) -> None:
+        self._require_git_history()
         checked = self._git(
             "diff",
             "--check",
-            f"{WHITESPACE_GATE_BASE_COMMIT}..HEAD",
+            f"{SOURCE_WHITESPACE_GATE_BASE_COMMIT}..HEAD",
+            "--",
+            *SOURCE_TREE_PATHS,
             cwd=REPO_ROOT,
         )
         self.assertEqual(
             checked.returncode,
             0,
-            "git diff --check must exit 0 over the OS-22 range; got "
+            "git diff --check must exit 0 for source changes; got "
             f"{checked.returncode}:\n{checked.stdout}",
+        )
+        self.assertEqual(checked.stdout, "")
+
+    def test_retained_report_whitespace_gate_passes_with_the_exemption(self) -> None:
+        self._require_git_history()
+        checked = self._git(
+            "diff",
+            "--check",
+            f"{RETAINED_REPORT_GATE_BASE_COMMIT}..HEAD",
+            "--",
+            *RETAINED_REPORT_PATHS,
+            cwd=REPO_ROOT,
+        )
+        self.assertEqual(
+            checked.returncode,
+            0,
+            "digest-bound retained reports must pass through their narrow "
+            f"whitespace exemption:\n{checked.stdout}",
         )
         self.assertEqual(checked.stdout, "")
 
@@ -4085,7 +4119,7 @@ class RetainedReportWhitespaceExemptionTests(unittest.TestCase):
     # -- (c) the exemption is narrow, asserted rather than assumed --------------------
 
     def test_only_retained_reports_are_exempt(self) -> None:
-        self._require_git_range()
+        self._require_git_history()
         reports = sorted(
             REPO_ROOT.glob("artifacts/runs/*/final_review_audit/*/report.md")
         )
@@ -4115,7 +4149,7 @@ class RetainedReportWhitespaceExemptionTests(unittest.TestCase):
                 )
 
     def test_the_pattern_does_not_leak_outside_the_audit_directories(self) -> None:
-        self._require_git_range()
+        self._require_git_history()
         for outsider in (
             "report.md",
             "artifacts/report.md",
@@ -4136,7 +4170,7 @@ class RetainedReportWhitespaceExemptionTests(unittest.TestCase):
     def test_the_gate_fails_again_once_the_exemption_is_removed(self) -> None:
         """Without .gitattributes the same range must exit 2 -- otherwise this whole
         test class would be passing because the condition happens not to occur."""
-        self._require_git_range()
+        self._require_git_history()
         with tempfile.TemporaryDirectory() as scratch:
             clone = Path(scratch) / "clone"
             cloned = self._git(
@@ -4161,7 +4195,9 @@ class RetainedReportWhitespaceExemptionTests(unittest.TestCase):
             with_exemption = self._git(
                 "diff",
                 "--check",
-                f"{WHITESPACE_GATE_BASE_COMMIT}..HEAD",
+                f"{RETAINED_REPORT_GATE_BASE_COMMIT}..HEAD",
+                "--",
+                *RETAINED_REPORT_PATHS,
                 cwd=clone,
             )
             self.assertEqual(
@@ -4174,7 +4210,9 @@ class RetainedReportWhitespaceExemptionTests(unittest.TestCase):
             without_exemption = self._git(
                 "diff",
                 "--check",
-                f"{WHITESPACE_GATE_BASE_COMMIT}..HEAD",
+                f"{RETAINED_REPORT_GATE_BASE_COMMIT}..HEAD",
+                "--",
+                *RETAINED_REPORT_PATHS,
                 cwd=clone,
             )
             self.assertEqual(
