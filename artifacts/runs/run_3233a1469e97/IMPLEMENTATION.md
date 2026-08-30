@@ -396,6 +396,161 @@ replied. That is OS-30's clarification protocol and OS-31's durable record, both
 
 Commits: `699a6ed` (contract, loader, validator, tests, fixtures), `b912655` (DESIGN). Not pushed.
 
+## Correction — iteration 3 (Final Review attempt 2: FR-4 and FR-3)
+
+Both findings are Responsible Phase: implementation. FR-1 and FR-2 from attempt 1 are intact and were
+not touched — `user_decision_sources` is still in both Skills and the FR-1 matrix constants are still
+in the validator.
+
+### FR-4 (CRITICAL) — high-impact, unauthorized items were permitted `CLEAR`
+
+**Reproduced first.** `permitted_states()` fixed its result to `{CLEAR, NEEDS_INPUT, CONFLICT}` and
+computed only whether to add `ASSUMPTION_ALLOWED`:
+
+```text
+facts = {"reversibility": "irreversible", "blast_radius": "external_system", "security": True}
+        no policy source, no authorization
+  ->  ['CLEAR', 'CONFLICT', 'NEEDS_INPUT']        CLEAR permitted with no authority
+```
+
+That is automatic approval of an irreversible high-impact decision without explicit authority — the
+thing the ticket forbids outright. The old requirement-4 test asserted only the **absence of
+`ASSUMPTION_ALLOWED`**, which is a strictly narrower property than "this item is safe", so 638/1360
+were all green over a live defect.
+
+**The entry-condition contract data.** A3-1's approved wording, transcribed rather than redesigned:
+
+```json
+"entry_conditions": {
+  "CLEAR": {"any_of": ["no_open_decision_item", "determining_policy_source", "explicit_user_authorization"]},
+  "ASSUMPTION_ALLOWED": {"all_of": ["reversible_in_run", "blast_radius_within_scope",
+                                    "no_high_impact_element", "supporting_policy_source",
+                                    "no_reserved_user_authority"]},
+  "NEEDS_INPUT": {"any_of": ["undetermined_boundary_element", "absent_user_intent", "unclassifiable_item"]},
+  "CONFLICT": {"any_of": ["declared_contradiction"]}
+}
+```
+
+Predicate names are a **closed twelve-entry vocabulary** (`ENTRY_PREDICATES`), so a typo fails at
+load instead of silently making a condition unsatisfiable. Each boundary element also gains a
+`triggering` value — which of its values make it true in A3-1's sense. Those come from A4-1, not from
+me: `irreversible`; blast radius in `{repository, external_system}`; the five booleans `true`;
+authority `reserved`; `null` for `repository_project_policy`, which A4-0 classifies as a boundary
+*input* rather than a trigger.
+
+**`permitted_states()` before and after, same probe:**
+
+| facts | before | after |
+|---|---|---|
+| irreversible + external_system + security, no authority | `['CLEAR', 'CONFLICT', 'NEEDS_INPUT']` | **`['NEEDS_INPUT']`** |
+| …+ determining policy source | — | `['CLEAR']` |
+| …+ allowlisted authorization | — | `['CLEAR']` |
+| …+ **forbidden** authorization (`model_confidence`) | — | **`['NEEDS_INPUT']`** — FR-2's allowlist gates this route too |
+| safe item, supporting policy source | `['CLEAR', 'ASSUMPTION_ALLOWED', 'CONFLICT', 'NEEDS_INPUT']` | **`['ASSUMPTION_ALLOWED']`** |
+| nothing open | — | `['CLEAR']` |
+| declared contradiction | — | `['CONFLICT']` |
+
+One test assertion had to change, and it was **wrong rather than merely outdated**:
+`test_the_contract_does_not_require_needs_input_for_a_safe_item` asserted `CLEAR in permitted` for a
+safe item with a *supporting* policy source. A3-1 admits `CLEAR` only when nothing is open, a policy
+source **determines** the choice, or an authorization decides it — none of which holds for an item
+whose policy source merely supports. It now asserts the substantive UD-2 property: `ASSUMPTION_ALLOWED`
+is permitted and `NEEDS_INPUT` is not forced.
+
+### FR-3 — reason code and boundary element could disagree
+
+**Reproduced first:** the shipped fixture `valid/security_impact.json` with only its
+`boundary_element` changed to `privacy` **passed** `validate_record()`. `validate_record` checked
+that the effective evidence field was non-empty, never that it matched the element the code binds,
+so misclassification — the thing a Reviewer is required to be able to judge — was not
+machine-checkable. `ReasonCodeLiveness` compared the two values in *test* code, which proves the
+fixture is self-consistent, not that production rejects an inconsistent record.
+
+**Enforcement:** `validate_record()` now requires **exact equality** between the record's
+`boundary_element` and the element the reason code binds. `unclassifiable_decision`'s deliberate
+absence of a bound element is kept as a **separate positive control** that also rejects smuggling one
+in.
+
+**Negative test scope:** `test_every_bound_code_rejects_a_mismatched_boundary_element` injects a
+mismatch into **each** of the 10 boundary-bound codes, with a **co-located** guard asserting exactly
+10 (the eleventh `NEEDS_INPUT` code, `unclassifiable_decision`, deliberately binds none) — the D4-F
+rule. `test_every_bound_code_accepts_its_declared_element` is the paired positive control, so the
+check cannot be satisfied by rejecting everything.
+
+### The two-axis sweep — three more found
+
+FR-4's shape is *"forbids but never permits"*; FR-3's is *"checks presence but never consistency"*. I
+swept both axes and probed each candidate rather than reading:
+
+| axis | field | probe result before | now |
+|---|---|---|---|
+| (b) consistency | `reversibility` | accepted `sort_of_reversible`, outside its own enum | **rejected** |
+| (b) consistency | `blast_radius` | accepted `the_whole_internet` | **rejected** |
+| (b) consistency | `policy_source.kind` | accepted `model_hunch`, outside `policy_source_kinds` | **rejected** |
+| (b) consistency | `reason_code` vs state | already rejected | unchanged |
+| (b) consistency | CONFLICT record clause | records carry no `clause` field; the code→clause binding is validated at load | not a gap |
+| (a) permit-side | `CONFLICT` | was in the fixed starting set, so "permitted" for every input | now requires a declared contradiction |
+
+The enum gap was not a trigger escape but something subtler and still wrong: an unrecognised value
+matched no triggering value, so `permitted_states` returned an **empty set** — degenerate rather than
+fail-closed. Declared values are now checked for membership; **omitting** an element stays legal, so
+this does not over-block.
+
+### Over-blocking guard — legitimate states are still reachable
+
+Every negative check has a positive control beside it, and each is asserted in the suite:
+
+```text
+CLEAR              reachable via nothing-open, a determining policy source, and each of the
+                   two allowlisted authorization sources
+ASSUMPTION_ALLOWED reachable for a safe, reversible, scope-local item with a supporting source
+CONFLICT           reachable for each of the three declared clauses C-1/C-2/C-3
+enum values        all 7 declared enum members accepted; all 4 policy_source kinds accepted
+```
+
+### Mutation verification — 8/8 caught, control green
+
+| id | mutation | verdict |
+|---|---|---|
+| F-0 | *(control)* no mutation | **green**, as required |
+| F-1 | `CLEAR` condition widened | CAUGHT |
+| F-2 | `ASSUMPTION_ALLOWED` loses `no_high_impact_element` | CAUGHT |
+| F-3 | `NEEDS_INPUT` loses `undetermined_boundary_element` | CAUGHT |
+| F-4 | `irreversible` no longer triggering | CAUGHT |
+| F-5 | `security` made non-triggering | CAUGHT |
+| F-6 | FR-3 equality check disabled | CAUGHT |
+| F-7 | `permitted_states` reverted to a fixed starting set — **the FR-4 defect itself** | CAUGHT |
+| F-8 | declared-facts consistency check disabled | CAUGHT |
+
+F-6, F-7 and F-8 are caught **only by the loader tests** (validator passes), while F-1/F-2 are caught
+by the validator and F-3/F-4/F-5 by all three. That variety is why I read these as real detections
+rather than one blunt detector firing — this run has produced three harness false positives, so the
+harness does literal substitution only, aborts unless its target appears exactly once, and aborts
+rather than scoring an `ImportError` as detection.
+
+### Commands after the correction
+
+| command | result |
+|---|---|
+| `python3 scripts/validate_skills.py` | **PASSED (640 checks)** — was 638 |
+| `python3 -m unittest discover -s scripts -p 'test_*.py'` | **Ran 1384 tests in 302.894s — OK (skipped=6)** — was 1360 |
+| `python3 scripts/verify_package.py` | **PASSED (173 source files)** |
+| `python3 scripts/build_release.py` | built `dist/orca-skills-0.9.0.tar.gz` |
+| `python3 scripts/verify_package.py --archive …` | **PASSED (173 source files); Verified archive** |
+| `git diff --check` | no output |
+
+Skips unchanged at 6. `git diff --stat c264e79 HEAD -- VERSION LICENSE .orca scripts/skill_policy.py
+scripts/quality_profile.py scripts/agent_profile.py scripts/workflow_contract.py
+scripts/run_logging.py` is **empty**, so UD-3 and the protected surfaces hold.
+
+### DESIGN.md updated in the same round
+
+D1-1 gains `entry_conditions` and the per-element `triggering` values; D3 gains C30 and records C27's
+extension; the state-selection partition gains the new key; new section **D2-2b** states both
+findings, the before/after probe output, the two-axis sweep, and the positive controls.
+
+Commits: `fa3a935` (contract, loader, validator, tests), `8f9c80c` (DESIGN). Not pushed.
+
 ## Review Feedback Resolution
 
 Iteration 1 of IMPLEMENTATION. No prior IMPLEMENTATION Reviewer findings.
