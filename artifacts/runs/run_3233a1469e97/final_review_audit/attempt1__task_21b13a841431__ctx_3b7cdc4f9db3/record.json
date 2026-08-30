@@ -1,0 +1,108 @@
+{
+  "schema_version": "1.0",
+  "record_kind": "final_review_dispatch_audit",
+  "run_id": "run_3233a1469e97",
+  "final_review_attempt": 1,
+  "task_id": "task_21b13a841431",
+  "dispatch_id": "ctx_3b7cdc4f9db3",
+  "dispatch_key": "attempt1__task_21b13a841431__ctx_3b7cdc4f9db3",
+  "recorded_at": "2026-08-30T11:53:49.106488+00:00",
+  "reviewer_terminal": "term_71fb349b-112f-4e11-82b6-921f289a88e8",
+  "reviewer_agent_command": "codex-sol",
+  "reviewer_agent_origin": "self_created",
+  "repository": {
+    "head_commit": "1efcc549e49021d9a7375081933034ab6f11a848",
+    "branch": "feat/os-28-bounded-autonomy-policy",
+    "dirty": true
+  },
+  "stored_task_spec": {
+    "source": "orca orchestration task-list --run <run_id> --json",
+    "capture_status": "captured",
+    "capture_error": "",
+    "captured_at": "2026-08-30T11:53:48.834255+00:00",
+    "is_stored_spec_not_delivered_bytes": true,
+    "byte_length_pre_redaction": 10838,
+    "input_digest_pre_redaction": "sha256:7e6a878e48b39b8d5ae99c625a7f84c2f5cab43ef9a52f95f16a3af350a8ba85",
+    "redaction_policy_version": "redaction/1.1",
+    "artifact_path": "final_review_audit/attempt1__task_21b13a841431__ctx_3b7cdc4f9db3/input.md",
+    "artifact_digest_post_redaction": "sha256:af81b4161fdee18af71bf41f9512ebfe79ea7d5b0500e0258936a0287bdd2a00",
+    "byte_length_post_redaction": 10860,
+    "redactions": [
+      {
+        "category": "absolute_local_path",
+        "count": 1
+      }
+    ]
+  },
+  "delivery_evidence": {
+    "source": "orca orchestration dispatch-show --task <task_id> --json",
+    "capture_status": "captured",
+    "capture_error": "",
+    "captured_at": "2026-08-30T11:53:49.105275+00:00",
+    "preamble_captured": false,
+    "dispatch_status": "failed",
+    "contract_version": 1,
+    "dispatched_at": "2026-08-30 11:43:37",
+    "completed_at": "2026-08-30 11:53:26",
+    "capability_hash": "2e1406f60aee0868b80db721de559912b9ddb31c4ddce24d8ebca0121105da54",
+    "capability_revoked_at": "2026-08-30 11:53:26",
+    "assignee_handle": "term_71fb349b-112f-4e11-82b6-921f289a88e8",
+    "process_incarnation": "7b6ee134-05a2-4dbd-be45-91ea1c2d2d7e::/Users/<REDACTED:absolute_local_path>/aiAssistedProjects/orca-skills@@a918ff4f:c88e15a9-6fe0-4263-895c-933f70d52290",
+    "failure_count": 0,
+    "last_failure": "{\"provenance\":\"worker_report\",\"outcome\":\"failed\",\"messageId\":\"msg_4e042a74e86a\",\"reportedBy\":\"term_71fb349b-112f-4e11-82b6-921f289a88e8\",\"subject\":\"Final review FAIL: two authority-boundary defects\",\"body\":\"I completed the final adversarial review, reran all required repository and package checks, and wrote artifacts/runs/run_3233a1469e97/FINAL_REVIEW.md. I found two blocking defects: the validator permits simultaneous weakening of user-decision-required transitions, and the evaluator accepts arbitrary non-user authority aliases outside a five-token denylist. The implementation and tests must pin the exact transition matrix and use fail-closed positive user-authority evidence before Final Review can pass.\",\"completedBy\":\"term_71fb349b-112f-4e11-82b6-921f289a88e8\",\"filesModified\":[\"artifacts/runs/run_3233a1469e97/FINAL_REVIEW.md\"],\"reportPath\":\"artifacts/runs/run_3233a1469e97/FINAL_REVIEW.md\",\"completedAt\":\"2026-08-30T11:53:26.962Z\"}",
+    "termination_reason": null
+  },
+  "report": {
+    "contract_path": "FINAL_REVIEW.md",
+    "resolution": "explicit",
+    "capture_status": "captured",
+    "capture_error": "",
+    "captured_at": "2026-08-30T11:53:49.105492+00:00",
+    "byte_length_pre_redaction": 7705,
+    "report_digest_pre_redaction": "sha256:a6df61797521dbff795862d64a8eeddda21ba8822fd63c4250b1f3df973974dc",
+    "redaction_policy_version": "redaction/1.1",
+    "artifact_path": "final_review_audit/attempt1__task_21b13a841431__ctx_3b7cdc4f9db3/report.md",
+    "artifact_digest_post_redaction": "sha256:a6df61797521dbff795862d64a8eeddda21ba8822fd63c4250b1f3df973974dc",
+    "byte_length_post_redaction": 7705,
+    "redactions": [],
+    "parsed": {
+      "parse_status": "ok",
+      "parse_error": "",
+      "result": "FAIL",
+      "review_verdict": "FAIL",
+      "blocking_finding_ids": [],
+      "non_blocking_finding_ids": []
+    }
+  },
+  "provenance_state": "accepted",
+  "void_reason": "",
+  "settlement_state": "settled",
+  "failure_detail": "",
+  "observed_input_bytes": null,
+  "input_altered_across_retry": "unknown",
+  "notes": "Final Adversarial Review attempt 1; verdict FAIL with 2 blocking findings",
+  "metadata_redaction": {
+    "redaction_policy_version": "redaction/1.1",
+    "covered_fields": [
+      "reviewer_agent_command",
+      "reviewer_agent_origin",
+      "failure_detail",
+      "notes",
+      "stored_task_spec.capture_error",
+      "report.capture_error",
+      "delivery_evidence.capture_error",
+      "delivery_evidence.process_incarnation",
+      "delivery_evidence.last_failure",
+      "delivery_evidence.termination_reason",
+      "report.parsed.parse_error",
+      "report.parsed.blocking_finding_ids",
+      "report.parsed.non_blocking_finding_ids"
+    ],
+    "redactions": [
+      {
+        "category": "absolute_local_path",
+        "count": 1
+      }
+    ]
+  }
+}
