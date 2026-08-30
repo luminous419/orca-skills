@@ -596,7 +596,8 @@ For a copy-paste five-phase exercise that deliberately demonstrates
 `Reviewer FAIL → Worker correction → Reviewer PASS`, see
 [`Full Workflow Best-Practice Example`](docs/examples/FULL_WORKFLOW_FAIL_CORRECTION.md).
 It includes a run-artifact verifier so lifecycle evidence can be checked independently
-of the Coordinator's final prose.
+of the Coordinator's final prose. A
+[`한국어판`](docs/examples/FULL_WORKFLOW_FAIL_CORRECTION.ko.md) is also available.
 
 `claude` and `codex` are generic entry points. The Skill does not select or guarantee
 their models; model selection belongs to each CLI's current configuration. For a stable
