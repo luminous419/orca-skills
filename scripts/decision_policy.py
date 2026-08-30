@@ -519,6 +519,47 @@ def _element_is_triggering(spec: BoundaryElement, value: Any) -> bool:
     return value == spec.triggering
 
 
+def _user_decision_defect(
+    policy: DecisionPolicy, decision: Any
+) -> str | None:
+    """The ONE judgement of whether a user_decision is valid evidence of authority.
+
+    Returns the reason it is not, or None when it is. Both APIs call this: the
+    `explicit_user_authorization` entry predicate reads its boolean, and
+    validate_transition() raises with the reason it returns.
+
+    FR-5 existed because they judged it separately. permitted_states() checked only
+    that `source` was in the allowlist, so a user_decision carrying nothing but a
+    source name -- proving neither where the answer is recorded nor what it resolves
+    -- bought CLEAR for a reserved-authority, security-relevant item, while
+    validate_transition() rejected the same mapping. Two production APIs answered
+    the same evidence opposite ways, and the permissive one was the one that decides
+    whether a high-impact item may proceed.
+
+    A5-3 and INV-5 require the whole record, not a category claim: a source name is
+    an assertion that a user decided, and `where_recorded` plus `resolves` are what
+    make that assertion checkable by someone else.
+    """
+    if not isinstance(decision, dict) or not decision:
+        return "requires a user_decision record"
+    for field in policy.user_decision_fields:
+        if field not in decision or _is_empty(decision[field]):
+            return f"user_decision requires a non-empty {field!r}"
+    source = decision.get("source")
+    if source not in policy.user_decision_sources:
+        category = (
+            " That source names a category the contract explicitly excludes from"
+            " user authority."
+            if source in policy.forbidden_authority_sources
+            else " An unrecognised source is rejected rather than assumed valid."
+        )
+        return (
+            f"{source!r} is not evidence of user authority; the contract admits "
+            f"only {sorted(policy.user_decision_sources)}.{category}"
+        )
+    return None
+
+
 def _validate_declared_facts(
     policy: DecisionPolicy, facts: Mapping[str, Any]
 ) -> None:
@@ -556,11 +597,9 @@ def _evaluate_predicate(
     handled here is rejected at load time by ENTRY_PREDICATES, so this cannot
     silently return False for a typo."""
     role = _policy_source_role(facts)
-    authorization = facts.get("user_decision") or {}
-    authorized = (
-        isinstance(authorization, dict)
-        and authorization.get("source") in policy.user_decision_sources
-    )
+    # FR-5: one judgement, shared with validate_transition(). A source name alone is
+    # a category claim, not evidence; the whole record is what A5-3 requires.
+    authorized = _user_decision_defect(policy, facts.get("user_decision")) is None
     triggered = [
         element
         for element, spec in policy.boundary_elements.items()
@@ -764,33 +803,14 @@ def validate_transition(
             "a user_decision does not enable it"
         )
     if rule == "requires_user_decision":
-        decision = record.get("user_decision")
-        _require(
-            isinstance(decision, dict) and decision,
-            f"transition {source} -> {target} requires a user_decision record",
-        )
-        for field in policy.user_decision_fields:
-            _require(
-                field in decision and not _is_empty(decision[field]),
-                f"user_decision requires a non-empty {field!r}",
-            )
-        # FR-2: user authority is an ALLOWLIST, not an open string minus five tokens.
-        # A denylist of spellings cannot enforce a categorical rule -- `high_confidence`
-        # and `worker_reviewer_consensus` are the same categories as the listed
-        # `model_confidence` and `worker_reviewer_agreement` under a different spelling,
-        # and a denylist admits every synonym nobody thought of. Membership in the
-        # closed positive vocabulary is the gate; an unknown source is REJECTED.
-        claimed = decision.get("source")
-        if claimed not in policy.user_decision_sources:
-            category = (
-                " That source names a category the contract explicitly excludes from"
-                " user authority."
-                if claimed in policy.forbidden_authority_sources
-                else " An unrecognised source is rejected rather than assumed valid."
-            )
+        # FR-2 (allowlist) and FR-5 (whole record) both live in the shared helper, so
+        # this edge and the explicit_user_authorization predicate cannot drift apart.
+        defect = _user_decision_defect(policy, record.get("user_decision"))
+        if defect is not None:
             raise DecisionPolicyError(
-                f"{claimed!r} is not evidence of user authority; the contract admits "
-                f"only {sorted(policy.user_decision_sources)}.{category}"
+                f"transition {source} -> {target} {defect}"
+                if defect.startswith("requires")
+                else defect
             )
     if rule == "requires_retraction":
         _require(

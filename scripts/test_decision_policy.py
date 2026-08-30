@@ -77,6 +77,18 @@ EXPECTED_HIGH_IMPACT = [
 ]
 
 
+def complete_decision(source: str = "explicit_user_reply") -> dict:
+    """A user_decision carrying every field the contract declares.
+
+    FR-5: tests that built `{"source": ...}` by hand were asserting that a category
+    claim is authority. Anything asserting a decision is VALID must use this."""
+    return {
+        "source": source,
+        "where_recorded": "USER_DECISIONS.md#UD-1",
+        "resolves": "the open item",
+    }
+
+
 def load_fixture(relative: str) -> dict:
     return json.loads((FIXTURES / relative).read_text(encoding="utf-8"))
 
@@ -353,12 +365,17 @@ class Requirement4EntryConditionsAreEvaluated(DecisionPolicyTestCase):
         self.assertNotIn("ASSUMPTION_ALLOWED", permitted)
 
     def test_an_allowlisted_authorization_permits_clear(self) -> None:
-        """Positive control: an explicit user authorization decides the item."""
+        """Positive control: a COMPLETE explicit user authorization decides the item.
+
+        FR-5: this fixture was source-only, so the test was pinning the defect --
+        it asserted that a bare category claim buys CLEAR. The record now carries
+        every field `user_decision_fields` declares, which is what A5-3 requires and
+        what makes the claim checkable by someone else."""
         for source in sorted(self.policy.user_decision_sources):
             with self.subTest(source=source):
                 permitted = permitted_states(
                     self.policy,
-                    {**self.HIGH_IMPACT, "user_decision": {"source": source}},
+                    {**self.HIGH_IMPACT, "user_decision": complete_decision(source)},
                 )
                 self.assertIn("CLEAR", permitted)
 
@@ -367,9 +384,11 @@ class Requirement4EntryConditionsAreEvaluated(DecisionPolicyTestCase):
         non-user source cannot buy CLEAR for a high-impact item."""
         for source in sorted(self.policy.forbidden_authority_sources) + ["invented"]:
             with self.subTest(source=source):
+                # A COMPLETE record, so the source is the only reason it fails. A
+                # source-only record would pass this test for the wrong reason.
                 permitted = permitted_states(
                     self.policy,
-                    {**self.HIGH_IMPACT, "user_decision": {"source": source}},
+                    {**self.HIGH_IMPACT, "user_decision": complete_decision(source)},
                 )
                 self.assertEqual(permitted, frozenset({"NEEDS_INPUT"}))
 
@@ -975,6 +994,140 @@ class Requirement6UserAuthorityIsAnAllowlist(DecisionPolicyTestCase):
                 }
                 validate_transition(self.policy, "NEEDS_INPUT", "CLEAR", record)
                 validate_transition(self.policy, "CONFLICT", "CLEAR", record)
+
+
+class UserDecisionJudgementIsSharedByBothApis(DecisionPolicyTestCase):
+    """FR-5. permitted_states() accepted a user_decision carrying only a `source`,
+    so a bare category claim bought CLEAR for a reserved-authority, security-relevant
+    item, while validate_transition() rejected the same mapping. Two production APIs
+    answered the same evidence opposite ways and the permissive one gated the
+    high-impact path. Both now read one helper."""
+
+    HIGH_IMPACT = {
+        "reversibility": "irreversible",
+        "blast_radius": "external_system",
+        "security": True,
+    }
+
+    def test_the_two_apis_agree_on_every_field_omission(self) -> None:
+        """The parity test -- the recurrence guard for this defect. For each field the
+        contract declares, and for the complete record, permitted_states() and
+        validate_transition() must reach the SAME authorization verdict."""
+        fields = list(self.policy.user_decision_fields)
+        # D4-F guard: every declared field is exercised, plus the complete record.
+        self.assertEqual(len(fields), 3)
+        checked = 0
+        for dropped in fields + [None]:
+            with self.subTest(dropped=dropped or "(complete)"):
+                decision = complete_decision()
+                if dropped:
+                    decision.pop(dropped)
+                facts = {"security": True, "user_decision": decision}
+                clear_permitted = "CLEAR" in permitted_states(self.policy, facts)
+                try:
+                    validate_transition(self.policy, "NEEDS_INPUT", "CLEAR", facts)
+                    transition_ok = True
+                except DecisionPolicyError:
+                    transition_ok = False
+                self.assertEqual(
+                    clear_permitted,
+                    transition_ok,
+                    f"the two APIs disagree when {dropped!r} is missing",
+                )
+                # And the verdict itself must be right, not merely consistent.
+                self.assertEqual(clear_permitted, dropped is None)
+                checked += 1
+        self.assertEqual(checked, 4)
+
+    def test_the_two_apis_agree_on_every_source(self) -> None:
+        """Parity over the source axis: allowlisted, each forbidden category, and an
+        invented spelling — always with a COMPLETE record, so the source is the only
+        variable."""
+        sources = sorted(self.policy.user_decision_sources) + sorted(
+            self.policy.forbidden_authority_sources
+        ) + ["an_invented_source"]
+        # D4-F guard: 2 allowlisted + 5 forbidden + 1 invented.
+        self.assertEqual(len(sources), 8)
+        for source in sources:
+            with self.subTest(source=source):
+                facts = {"security": True, "user_decision": complete_decision(source)}
+                clear_permitted = "CLEAR" in permitted_states(self.policy, facts)
+                try:
+                    validate_transition(self.policy, "NEEDS_INPUT", "CLEAR", facts)
+                    transition_ok = True
+                except DecisionPolicyError:
+                    transition_ok = False
+                self.assertEqual(clear_permitted, transition_ok)
+                self.assertEqual(
+                    clear_permitted, source in self.policy.user_decision_sources
+                )
+
+    def test_an_incomplete_decision_never_permits_clear_anywhere(self) -> None:
+        """Cardinality-guarded negative sweep. For every situation that requires user
+        authority — reserved authority, each CONFLICT clause, and the high-impact case
+        — a source-only record and each single-field omission must NOT permit CLEAR."""
+        situations = {
+            "reserved_authority": {"explicit_user_authority": "reserved"},
+            "conflict_C-1": {"conflict_clause": "C-1"},
+            "conflict_C-2": {"conflict_clause": "C-2"},
+            "conflict_C-3": {"conflict_clause": "C-3"},
+            "high_impact": dict(self.HIGH_IMPACT),
+        }
+        fields = list(self.policy.user_decision_fields)
+        # D4-F guards, co-located: 5 situations (reserved + 3 clauses + high-impact)
+        # and 4 incomplete records (source-only + one per dropped field).
+        self.assertEqual(len(situations), 1 + len(self.policy.entry_clauses["CONFLICT"]) + 1)
+        self.assertEqual(len(fields), 3)
+
+        incomplete = {"source_only": {"source": "explicit_user_reply"}}
+        for dropped in fields:
+            decision = complete_decision()
+            decision.pop(dropped)
+            incomplete[f"missing_{dropped}"] = decision
+        self.assertEqual(len(incomplete), 4)
+
+        checked = 0
+        for situation, facts in sorted(situations.items()):
+            for label, decision in sorted(incomplete.items()):
+                with self.subTest(situation=situation, decision=label):
+                    permitted = permitted_states(
+                        self.policy, {**facts, "user_decision": decision}
+                    )
+                    self.assertNotIn(
+                        "CLEAR",
+                        permitted,
+                        f"{situation} + {label} bought CLEAR without complete evidence",
+                    )
+                    self.assertTrue(permitted, "a declared item must permit something")
+                    checked += 1
+        self.assertEqual(checked, 5 * 4)
+
+    def test_a_complete_decision_still_permits_clear_everywhere(self) -> None:
+        """POSITIVE CONTROL for the sweep above, over the same 5 situations and both
+        genuine sources. Refusing everything must not satisfy this pair."""
+        situations = [
+            {"explicit_user_authority": "reserved"},
+            {"conflict_clause": "C-1"},
+            {"conflict_clause": "C-2"},
+            {"conflict_clause": "C-3"},
+            dict(self.HIGH_IMPACT),
+        ]
+        sources = sorted(self.policy.user_decision_sources)
+        # D4-F guard
+        self.assertEqual((len(situations), len(sources)), (5, 2))
+        checked = 0
+        for facts in situations:
+            for source in sources:
+                with self.subTest(facts=sorted(facts), source=source):
+                    self.assertEqual(
+                        permitted_states(
+                            self.policy,
+                            {**facts, "user_decision": complete_decision(source)},
+                        ),
+                        frozenset({"CLEAR"}),
+                    )
+                    checked += 1
+        self.assertEqual(checked, 5 * 2)
 
 
 class Requirement7RiskIndependence(DecisionPolicyTestCase):
