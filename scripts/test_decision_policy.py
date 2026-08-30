@@ -2681,5 +2681,178 @@ class Ri91SweptShapeGaps(DecisionPolicyTestCase):
         self.assertFalse(_element_is_triggering(spec, "anything"))
 
 
+class Fr9EveryValuePositionHasADomainProbe(DecisionPolicyTestCase):
+    """FR-9. FR-8 lived through a green suite, and so did RI8-1, RI9-1 and the two gaps
+    RI9-1's lens exposed. Four value-domain defects in a row survived 1400+ passing
+    tests, because coverage was written per defect after the fact instead of per value
+    position in advance.
+
+    This is the register that closes that. Every position where the contract carries a
+    value gets a row: a violating value that must be REJECTED when the position is
+    checked, or -- when it is deliberately not checked -- an assertion that the
+    violation is ACCEPTED, which turns the limit into a recorded decision. Each row
+    also carries a valid value, so the class cannot be satisfied by refusing
+    everything.
+
+    **Each row anchors on the message its own rule produces.** Without that, a row
+    passes for the wrong reason: an out-of-set `reversibility` is rejected by the
+    ASSUMPTION_ALLOWED entry condition even with the enum check deleted, so a bare
+    "was it rejected?" assertion stayed green through a reverted enum check. That was
+    found by reverting, not by reading, and it is the same defect this class exists to
+    catch -- so the register asserts WHICH rule refused.
+
+    The count is guarded against a figure DERIVED from the contract, so a new element
+    kind or a new `user_decision` field fails here until it gets a row.
+    """
+
+    def _record(self, **overrides) -> dict:
+        return assumption_allowed_record(self.policy, **overrides)
+
+    def _conflict(self, **overrides) -> dict:
+        return {**load_fixture("valid/requirement_contradiction.json"), **overrides}
+
+    def _by_record(self, candidate) -> str:
+        return error_of(validate_record, self.policy, candidate)
+
+    def _by_transition(self, decision) -> str:
+        facts = {"security": True, "user_decision": decision}
+        return error_of(
+            validate_transition, self.policy, "NEEDS_INPUT", "CLEAR", facts
+        )
+
+    def register(self) -> list:
+        """(position, checked?, probe, violating value, valid value, message anchor)."""
+        src = supporting_source()
+        ud = complete_decision()
+        R, T = self._by_record, self._by_transition
+        return [
+            ("element/enum", True, R,
+             self._record(reversibility="bogus"), self._record(),
+             "outside its closed value set"),
+            ("element/boolean", True, R,
+             self._record(security="yes"), self._record(security=False),
+             "is a boolean element"),
+            ("element/declared", True, R,
+             self._record(ambiguity="sort of"), self._record(ambiguity=False),
+             "is a declared element"),
+            ("element/citations", True, R,
+             self._record(explicit_requirement_conflict="ab"),
+             self._record(explicit_requirement_conflict=["OS-28#a", "OS-28#b"]),
+             "is a citations element"),
+            ("element/user_decision", True, R,
+             self._record(explicit_user_authority="RESERVED"), self._record(),
+             "is the authority boundary"),
+            # The one position with nothing to check: `triggering` is null, so no value
+            # can make it fire and none can suppress a firing.
+            ("element/policy_source", False, R,
+             self._record(repository_project_policy=42), self._record(), ""),
+            ("policy_source.kind", True, R,
+             self._record(policy_source={**src, "kind": "bogus"}), self._record(),
+             "policy_source kind"),
+            ("policy_source.role", True, R,
+             self._record(policy_source={**src, "role": "bogus"}), self._record(),
+             "unknown policy_source role"),
+            ("policy_source.locator/shape", True, R,
+             self._record(policy_source={"role": "supports", "kind": "file_path"}),
+             self._record(), "non-empty textual locator"),
+            ("conflict_clause", True, R,
+             self._record(conflict_clause="C-9"), self._record(), "conflict_clause"),
+            ("reason_code", True, R,
+             {"state": "NEEDS_INPUT", "reason_code": "bogus",
+              "what_is_missing": "x", "why_policy_cannot_decide": "y"},
+             load_fixture("valid/security_impact.json"),
+             "reason_code from the closed set"),
+            ("state name", True, R, {"state": "BOGUS"}, {"state": "CLEAR"},
+             "unknown decision state"),
+            # The user_decision fields are probed through validate_transition, which
+            # names the field. validate_record refuses them too, but with one generic
+            # CLEAR-grounds message for all three -- which would not distinguish them.
+            ("user_decision.source", True, T,
+             {**ud, "source": "bogus"}, ud, "not evidence of user authority"),
+            ("user_decision.where_recorded", True, T,
+             {**ud, "where_recorded": 42}, ud, "'where_recorded' must be text"),
+            ("user_decision.resolves", True, T,
+             {**ud, "resolves": 42}, ud, "'resolves' must be text"),
+            ("citations", True, R,
+             self._conflict(citations=[1, 2]), self._conflict(),
+             "citation 0 must be non-empty text"),
+        ]
+
+    def test_the_register_covers_every_value_position(self) -> None:
+        """D4-F, tied to the contract rather than to the literal 16: one row per
+        element kind, three for the policy_source object, one per user_decision field,
+        and four singletons. Add a kind or a field and this fails until it has a row."""
+        kinds = {spec.kind for spec in self.policy.boundary_elements.values()}
+        expected = (
+            len(kinds) + 3 + len(self.policy.user_decision_fields) + 4
+        )
+        register = self.register()
+        self.assertEqual(len(register), expected)
+        self.assertEqual(len(register), 16)
+        self.assertEqual(len({row[0] for row in register}), 16)
+
+    def test_every_checked_position_rejects_for_its_own_reason(self) -> None:
+        """Not merely 'was it rejected' -- WHICH rule refused. This is what makes the
+        register a real probe of each position rather than of the suite as a whole."""
+        checked = [row for row in self.register() if row[1]]
+        # D4-F guard, co-located: fifteen checked, one deliberately not.
+        self.assertEqual(len(checked), 15)
+        for position, _, probe, violating, _valid, anchor in checked:
+            with self.subTest(position=position):
+                message = probe(violating)
+                self.assertNotEqual(message, "", f"{position}: violation accepted")
+                self.assertIn(
+                    anchor,
+                    message,
+                    f"{position}: rejected, but by {message!r} -- not by its own rule",
+                )
+
+    def test_every_position_accepts_its_valid_value(self) -> None:
+        """POSITIVE CONTROL for all sixteen. An implementation that refuses everything
+        passes the test above and fails this one."""
+        register = self.register()
+        self.assertEqual(len(register), 16)
+        for position, _checked, probe, _violating, valid, _anchor in register:
+            with self.subTest(position=position):
+                self.assertEqual(
+                    probe(valid), "", f"{position}: a valid value was rejected"
+                )
+
+    def test_the_unchecked_position_is_pinned_as_accepted(self) -> None:
+        """A position classified 'not checked' must be SHOWN to accept the violation,
+        so the limit is a decision on the record and not an assumption -- and so it
+        fails if someone starts checking it without updating the table."""
+        unchecked = [row for row in self.register() if not row[1]]
+        self.assertEqual(len(unchecked), 1)
+        position, _, probe, violating, _valid, _anchor = unchecked[0]
+        self.assertEqual(position, "element/policy_source")
+        self.assertEqual(probe(violating), "")
+
+    def test_locator_existence_is_pinned_as_unchecked(self) -> None:
+        """The locator's SHAPE is enforced (row above); its EXISTENCE is not, because
+        this layer performs no I/O. Asserted rather than assumed."""
+        record = self._record(
+            policy_source=supporting_source(locator="no/such/path/at/all.md#nope")
+        )
+        self.assertEqual(error_of(validate_record, self.policy, record), "")
+
+    def test_both_apis_agree_on_every_record_checked_position(self) -> None:
+        """Parity on identical input, for the rows validate_record drives. 'Refuses'
+        means a raise OR the claimed state not holding -- both are refusals, the
+        distinction two probes in this run got wrong."""
+        rows = [row for row in self.register() if row[1] and row[2] == self._by_record]
+        self.assertEqual(len(rows), 12)
+        for position, _, _, violating, _valid, _anchor in rows:
+            with self.subTest(position=position):
+                state = violating.get("state")
+                try:
+                    evaluator = state not in permitted_states(self.policy, violating)
+                except DecisionPolicyError:
+                    evaluator = True
+                validator = error_of(validate_record, self.policy, violating) != ""
+                self.assertTrue(validator)
+                self.assertEqual(evaluator, validator, f"{position}: APIs disagree")
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
