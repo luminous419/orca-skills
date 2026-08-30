@@ -2055,5 +2055,247 @@ class Fr6DeclaredEvidenceMustJustifyTheState(DecisionPolicyTestCase):
         self.assertEqual(checked, 8)
 
 
+class Fr7EveryBoundCodeIsJudgedByValueNotName(DecisionPolicyTestCase):
+    """FR-7. The suite injected a boundary-element NAME mismatch for all ten bound
+    codes (FR-3) but never a non-triggering VALUE or a missing boundary fact. That is
+    why 1426 tests and 642 checks were green while FR-6 was live: the tests had the
+    same defect as the code they were guarding -- membership checked, value not.
+
+    Every case here is derived from the contract rather than listed by hand, so a new
+    bound code is covered the day it is added instead of the day someone remembers to
+    extend a tuple.
+    """
+
+    def _non_triggering(self, spec) -> object:
+        """A value the CONTRACT says does not fire, derived from its own spec."""
+        if spec.kind == "enum":
+            return next(v for v in spec.values if v not in tuple(spec.triggering))
+        if spec.triggering is True:
+            return False
+        if isinstance(spec.triggering, (list, tuple)):
+            return f"not_{spec.triggering[0]}"
+        raise AssertionError(f"no non-triggering value derivable for {spec.kind}")
+
+    def _bound(self) -> dict:
+        return {
+            name: code.boundary_element
+            for name, code in self.policy.reason_codes.items()
+            if code.boundary_element is not None
+        }
+
+    def test_every_bound_code_accepts_its_shipped_triggering_value(self) -> None:
+        """(a) POSITIVE CONTROL for all ten, so the negatives below cannot be
+        satisfied by rejecting everything."""
+        bound = self._bound()
+        # D4-F guard: 10 of the 11 NEEDS_INPUT codes bind an element.
+        self.assertEqual(len(bound), 10)
+        checked = 0
+        for name, element in sorted(bound.items()):
+            with self.subTest(reason_code=name):
+                record = load_fixture(f"valid/{name}.json")
+                spec = self.policy.boundary_elements[element]
+                if element in record:
+                    # The shipped value must actually be a triggering one, or the
+                    # positive control proves nothing about triggering.
+                    self.assertTrue(_element_is_triggering(spec, record[element]))
+                self.assertEqual(error_of(validate_record, self.policy, record), "")
+                checked += 1
+        self.assertEqual(checked, 10)
+
+    def test_every_bound_code_rejects_a_non_triggering_value(self) -> None:
+        """(b) The negative FR-7 found missing, for all ten -- including the two
+        `ambiguity` codes, where a value that IS present and false is still wrong."""
+        bound = self._bound()
+        self.assertEqual(len(bound), 10)
+        checked = 0
+        for name, element in sorted(bound.items()):
+            with self.subTest(reason_code=name):
+                spec = self.policy.boundary_elements[element]
+                value = self._non_triggering(spec)
+                # Anti-vacuity: the injected value must really not fire, or the
+                # rejection below could be for some unrelated reason.
+                self.assertFalse(_element_is_triggering(spec, value))
+                record = dict(load_fixture(f"valid/{name}.json"))
+                record[element] = value
+                self.assertNotEqual(
+                    error_of(validate_record, self.policy, record),
+                    "",
+                    f"{name} accepted with {element}={value!r}, which does not fire",
+                )
+                checked += 1
+        self.assertEqual(checked, 10)
+
+    def test_an_absent_boundary_fact_is_judged_by_the_elements_kind(self) -> None:
+        """The other half of (b), and NOT uniform -- which is the point.
+
+        For a value-carrying element, omitting the fact is the same defect as
+        declaring it false: the pause rests on an element the record never asserts.
+        For a `declared` element, A4-1 row 1 makes naming it in `boundary_element` the
+        declaration itself, so absence is CORRECT and must stay accepted. Asserting
+        one rule for both would be over-blocking dressed as coverage.
+        """
+        bound = self._bound()
+        declared_kind = {
+            name: element
+            for name, element in bound.items()
+            if self.policy.boundary_elements[element].kind == "declared"
+        }
+        value_carrying = {
+            name: element for name, element in bound.items() if name not in declared_kind
+        }
+        # D4-F guards, co-located: both partitions non-empty and summing to ten.
+        self.assertEqual(len(declared_kind), 2)
+        self.assertEqual(len(value_carrying), 8)
+        self.assertEqual(len(declared_kind) + len(value_carrying), len(bound))
+
+        for name, element in sorted(value_carrying.items()):
+            with self.subTest(reason_code=name, kind="value-carrying"):
+                record = {
+                    key: value
+                    for key, value in load_fixture(f"valid/{name}.json").items()
+                    if key != element
+                }
+                self.assertNotEqual(error_of(validate_record, self.policy, record), "")
+        for name, element in sorted(declared_kind.items()):
+            with self.subTest(reason_code=name, kind="declared"):
+                record = load_fixture(f"valid/{name}.json")
+                self.assertNotIn(element, record)
+                self.assertEqual(error_of(validate_record, self.policy, record), "")
+
+
+class Fr7ConflictClauseAndCitationsBidirectional(DecisionPolicyTestCase):
+    """FR-7 item 2. A3-1a fixed three distinct clauses and a citation minimum; the
+    suite checked neither direction of the code/clause link on a record."""
+
+    def _base(self, name: str) -> dict:
+        return dict(load_fixture(f"valid/{name}.json"))
+
+    def _conflict_codes(self) -> dict:
+        return {
+            name: code.clause
+            for name, code in self.policy.reason_codes.items()
+            if code.state == "CONFLICT"
+        }
+
+    def test_each_conflict_code_accepts_its_own_clause_and_rejects_the_others(
+        self,
+    ) -> None:
+        codes = self._conflict_codes()
+        clauses = list(self.policy.entry_clauses["CONFLICT"])
+        # D4-F guards: three codes, three clauses, one clause each.
+        self.assertEqual(len(codes), 3)
+        self.assertEqual(len(clauses), 3)
+        self.assertEqual(sorted(codes.values()), sorted(clauses))
+        accepted = rejected = 0
+        for name, own in sorted(codes.items()):
+            record = self._base(name)
+            with self.subTest(reason_code=name, clause=own):
+                # POSITIVE: its own clause, and declaring none at all.
+                self.assertEqual(
+                    error_of(validate_record, self.policy, {**record, "conflict_clause": own}), ""
+                )
+                self.assertEqual(error_of(validate_record, self.policy, record), "")
+                accepted += 2
+            for other in clauses:
+                if other == own:
+                    continue
+                with self.subTest(reason_code=name, wrong_clause=other):
+                    self.assertNotEqual(
+                        error_of(
+                            validate_record, self.policy, {**record, "conflict_clause": other}
+                        ),
+                        "",
+                    )
+                    rejected += 1
+        self.assertEqual((accepted, rejected), (6, 6))
+
+    def test_the_citation_minimum_is_enforced_at_its_boundary(self) -> None:
+        """Bidirectional on the count itself: exactly the minimum is accepted, one
+        fewer is rejected. A test that only checked zero citations would pass against
+        a minimum of one."""
+        minimum = self.policy.citation_minimum["CONFLICT"]
+        self.assertEqual(minimum, 2)
+        codes = sorted(self._conflict_codes())
+        self.assertEqual(len(codes), 3)
+        for name in codes:
+            record = self._base(name)
+            citations = list(record["citations"])
+            self.assertGreaterEqual(len(citations), minimum)
+            with self.subTest(reason_code=name, citations=minimum):
+                self.assertEqual(
+                    error_of(
+                        validate_record, self.policy, {**record, "citations": citations[:minimum]}
+                    ),
+                    "",
+                )
+            with self.subTest(reason_code=name, citations=minimum - 1):
+                self.assertNotEqual(
+                    error_of(
+                        validate_record,
+                        self.policy,
+                        {**record, "citations": citations[: minimum - 1]},
+                    ),
+                    "",
+                )
+
+
+class Fr7ClearGroundsBothWays(DecisionPolicyTestCase):
+    """FR-7 item 3. FR-6 made CLEAR judge its declared grounds; this covers each
+    accepting ground and its nearest rejecting neighbour, derived from the contract's
+    own CLEAR entry predicates."""
+
+    def test_each_clear_entry_predicate_has_a_satisfying_record(self) -> None:
+        """POSITIVE, one per predicate, so the negatives cannot be met by refusing
+        every CLEAR record."""
+        (_, predicates), = self.policy.entry_conditions["CLEAR"].items()
+        satisfying = {
+            "no_open_decision_item": {"state": "CLEAR", "open_decision_item": False},
+            "determining_policy_source": {
+                "state": "CLEAR",
+                "policy_source": {"role": "determines", "kind": "file_path"},
+            },
+            "explicit_user_authorization": {
+                "state": "CLEAR",
+                "user_decision": complete_decision(),
+            },
+        }
+        # D4-F guard: every predicate the contract declares is exercised.
+        self.assertEqual(set(satisfying), set(predicates))
+        self.assertEqual(len(predicates), 3)
+        for predicate, record in sorted(satisfying.items()):
+            with self.subTest(predicate=predicate):
+                self.assertEqual(error_of(validate_record, self.policy, record), "")
+
+    def test_each_near_miss_is_rejected(self) -> None:
+        """NEGATIVE: grounds that look like the real thing and are not. Each one is a
+        claim of CLEAR the evaluator would refuse."""
+        near_miss = {
+            "supporting_not_determining": {
+                "state": "CLEAR",
+                "policy_source": {"role": "supports", "kind": "file_path"},
+            },
+            "source_only_decision": {
+                "state": "CLEAR",
+                "user_decision": {"source": "explicit_user_reply"},
+            },
+            "forbidden_authority_source": {
+                "state": "CLEAR",
+                "user_decision": complete_decision("timeout"),
+            },
+            "open_item_still_open": {"state": "CLEAR", "open_decision_item": True},
+        }
+        # D4-F guard, co-located.
+        self.assertEqual(len(near_miss), 4)
+        for label, record in sorted(near_miss.items()):
+            with self.subTest(near_miss=label):
+                self.assertNotEqual(error_of(validate_record, self.policy, record), "")
+
+    def test_declaring_no_grounds_at_all_remains_valid(self) -> None:
+        """UD-1 and the empty required_evidence: a CLEAR record need not carry
+        grounds. This is the anti-over-blocking control for the class."""
+        self.assertEqual(self.policy.required_evidence["CLEAR"], ())
+        self.assertEqual(error_of(validate_record, self.policy, {"state": "CLEAR"}), "")
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
