@@ -205,3 +205,28 @@ Decision Record가 **존재할 때만** 아래를 판정한다. 섹션이 없는
 - 오분류 판정: `ASSUMPTION_ALLOWED`인데 되돌릴 수 없거나 monetary/security/privacy/
   compliance/lock-in 중 하나가 참이면 INV-4 위반이다. `NEEDS_INPUT` / `CONFLICT`에서
   `ASSUMPTION_ALLOWED`로 간 항목이 있으면 그 자체가 위반이다.
+
+**오분류는 네 state 모두에서 같은 기준으로 판정한다 — 이름이 아니라 값을 보라.**
+`REASON_CODE`가 옳은 집합에서 왔고 필드가 채워져 있어도, **그 근거가 실제로 그 state를
+정당화하지 않으면 오분류다.** state별 판정 기준:
+
+- `CLEAR` — 근거를 **선언했다면** 그것이 CLEAR 진입 조건을 만족해야 한다: 열린 결정 항목이
+  없거나, policy source가 `determines`이거나, 사용자 권한의 근거가 완전해야 한다.
+  `supports`뿐인 policy source, `source`만 있고 어디에 기록되었는지 없는 `user_decision`,
+  금지 목록의 권한 출처는 CLEAR의 근거가 되지 못한다. 근거를 아예 선언하지 않은 `CLEAR`는
+  finding이 아니다.
+- `ASSUMPTION_ALLOWED` — INV-4(위)에 더해 진입 조건을 만족해야 한다: run 안에서 되돌릴 수
+  있고, blast radius가 요청 범위 안이며, policy source가 `supports`이고, 사용자 권한이
+  유보되어 있지 않아야 한다. **금지되지 않았다는 것은 허용되었다는 뜻이 아니다.**
+- `NEEDS_INPUT` — `REASON_CODE`가 가리키는 boundary element가 **실제로 발동했는지** 보라.
+  `security_impact`인데 `security`가 거짓이거나 선언되지 않았으면 오분류다. 되돌릴 수
+  없음은 `irreversible`, blast radius는 `repository` 또는 `external_system`, 다섯 boolean은
+  참, 사용자 권한은 `reserved`가 발동 값이다. boundary를 bind하지 않는
+  `unclassifiable_decision`은 예외이며, `ambiguity`는 `REASON_CODE`로 지목하는 것 자체가
+  선언이다.
+- `CONFLICT` — 인용이 최소 개수를 채웠는지, 그리고 record가 선언한 clause가
+  `REASON_CODE`가 rest하는 clause(C-1/C-2/C-3)와 **같은지** 보라. 다른 clause의 증거를
+  다른 code로 제출한 것은 오분류다.
+
+이 판정은 `scripts/decision_policy.py`의 `validate_record()`가 기계적으로 수행한다.
+Reviewer는 같은 기준을 사람의 판단(값이 실제로 옳은가)에 적용한다.
