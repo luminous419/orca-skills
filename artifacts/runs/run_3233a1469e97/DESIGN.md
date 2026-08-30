@@ -419,6 +419,38 @@ change makes an unknown or aliased source impossible to pass off as authority; i
 human actually replied. Establishing that a real user answered is OS-30's protocol and OS-31's
 durable record, neither of which is in scope here.
 
+#### D3-3. Every contract key is pinned by value, not by membership (FR-1)
+
+Final Adversarial Review FR-1 found that the transition matrix's *values* were never fixed. C8
+compared only the **set** of cells whose value is `forbidden`, and C11c only closed-set membership,
+so both Skills' `NEEDS_INPUT → CLEAR` could be relaxed from `requires_user_decision` to the equally
+legal `allowed` and the validator stayed green. Reproduced on a disposable `git archive HEAD` copy:
+`Skill validation PASSED (626 checks)`, exit 0. That accepts a change which removes two promises at
+once — an unresolved `NEEDS_INPUT` or `CONFLICT` cannot continue, and reaching `CLEAR` takes a real
+user decision.
+
+This is the same lesson C15-C23 already applied to the state semantics — **membership in a closed set
+is not the same as a correct value** — which had simply not been applied to the edges.
+
+**Sweeping the rest of the contract for the same shape found four more keys**, each verified by
+mutation rather than by reading. Before this correction, every one of these passed *every* check:
+
+| key | mutation that passed | now pinned by |
+|---|---|---|
+| `transitions` | `NEEDS_INPUT → CLEAR` and `CONFLICT → CLEAR` relaxed to `allowed` | C26, C26a |
+| `boundary_elements` *(payloads, not names)* | `reversibility.values` emptied; `blast_radius` losing `repository`/`external_system` — the two values INV-4's clause names; `explicit_requirement_conflict.minimum` lowered 2 → 1 | C27 |
+| `policy_source_roles` | dropping `supports`, the role INV-3 requires | C28 |
+| `policy_source_kinds` | widened with a bogus kind | C28 |
+| `state_scope` | reversed to `per_check_only`, undoing OQ-1 | C29 |
+
+`independent_axes` was already pinned by C11d's positive equality, and `schema_version` is correctly
+checked by *membership* in `SUPPORTED_SCHEMA_VERSIONS` — a supported version legitimately varies.
+Those two are not gaps.
+
+**Both halves are demonstrated.** Each mutation makes the validator fail with its named message, and
+the unmodified tree stays green — the unmutated control is run in the same sweep so a validator that
+merely failed on everything would be visible.
+
 #### D2-3. What the loader deliberately does not do
 
 No import from `orca_runtime_harness`, `run_logging`, `review_isolation`, `e2e_harness`, or
@@ -447,6 +479,11 @@ dependency direction `validate_risk_profile_contract` already has toward
 | C9 | `assumption_allowed_forbidden_when.exception_allowed` is `false` | `INV-4 must have no exception` |
 | C10 | `forbidden_authority_sources` equals the five-entry reject list | `forbidden-authority reject list drifted` |
 | C24 | `user_decision_sources` equals the closed positive vocabulary (FR-2) | `<skill>: the user-authority positive vocabulary drifted` |
+| C26 | **the full 4×4 transition matrix equals the expected mapping, cell by cell** (FR-1) | `<skill>: the transition matrix drifted -- every cell is pinned by value, not merely by closed-set membership` |
+| C26a | `NEEDS_INPUT → CLEAR` and `CONFLICT → CLEAR` each equal `requires_user_decision`, named separately so a failure says which promise broke | `<skill>: <from> -> <to> must require a user decision; found <value>` |
+| C27 | each boundary element's `{kind, values, minimum}` payload equals the expected spec — not just the element names | `<skill>: boundary element specifications drifted (kind / enum values / minimum)` |
+| C28 | `policy_source_roles` and `policy_source_kinds` equal their expected tuples | `<skill>: policy source roles or kinds drifted` |
+| C29 | `state_scope` equals OQ-1's settled value | `<skill>: decision state scope drifted` |
 | C25 | `user_decision_sources` and `forbidden_authority_sources` are disjoint | `<skill>: the user-authority vocabulary admits a forbidden source` |
 | C11a | **partition completeness** — every key of `decision_policy` is in `STATE_SELECTION_INPUTS` or `DECLARATIVE_KEYS`, and their union equals the key set exactly (R-A2) | `decision policy key <name> is not classified as a selection input or declarative` |
 | C11b | **no axis token in a selection input** — no key name and no string value inside any `STATE_SELECTION_INPUTS` subtree **exactly equals** a member of `AXIS_TOKENS` (R-A3) | `decision policy references axis token <token> at <path>, which is a state-selection input` |
