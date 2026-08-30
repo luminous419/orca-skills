@@ -4,7 +4,5 @@
   "boundary_element": "explicit_user_authority",
   "what_is_missing": "the user's decision on the reserved choice",
   "why_policy_cannot_decide": "a policy source cannot un-reserve it",
-  "no_determining_policy_source": true,
-  "no_explicit_authorization": true,
   "explicit_user_authority": "reserved"
 }

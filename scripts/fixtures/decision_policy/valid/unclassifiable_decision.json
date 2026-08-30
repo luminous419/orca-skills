@@ -7,5 +7,6 @@
     "CLEAR ruled out: no policy source determines the choice",
     "ASSUMPTION_ALLOWED ruled out: no policy source supports it either",
     "CONFLICT ruled out: nothing contradicts, information is absent rather than opposed"
-  ]
+  ],
+  "unclassifiable": true
 }

@@ -4,7 +4,5 @@
   "boundary_element": "monetary_cost",
   "what_is_missing": "spending authority",
   "why_policy_cannot_decide": "a repository file cannot authorize spending",
-  "no_determining_policy_source": true,
-  "no_explicit_authorization": true,
   "monetary_cost": true
 }

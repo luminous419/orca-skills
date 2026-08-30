@@ -4,7 +4,5 @@
   "boundary_element": "blast_radius",
   "what_is_missing": "authority to act outside the requested scope",
   "why_policy_cannot_decide": "policy cannot widen the scope the user set",
-  "no_determining_policy_source": true,
-  "no_explicit_authorization": true,
   "blast_radius": "external_system"
 }

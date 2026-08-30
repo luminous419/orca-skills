@@ -4,7 +4,5 @@
   "boundary_element": "reversibility",
   "what_is_missing": "authority to act irreversibly",
   "why_policy_cannot_decide": "a policy source cannot grant authority the user reserved",
-  "no_determining_policy_source": true,
-  "no_explicit_authorization": true,
   "reversibility": "irreversible"
 }

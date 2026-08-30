@@ -4,6 +4,5 @@
   "boundary_element": "ambiguity",
   "what_is_missing": "the intent itself",
   "why_policy_cannot_decide": "there is no text to interpret and no policy substitute",
-  "no_determining_policy_source": true,
-  "no_explicit_authorization": true
+  "user_intent_absent": true
 }

@@ -6,9 +6,13 @@
     "locator": "scripts/",
     "role": "supports"
   },
-  "impact": "repository",
+  "impact": "one edit inside this run's own change scope",
   "retraction_condition": "n/a",
   "reversibility": "reversible_in_run",
   "blast_radius": "current_change",
-  "privacy": true
+  "privacy": true,
+  "monetary_cost": false,
+  "security": false,
+  "compliance": false,
+  "long_term_lock_in": false
 }

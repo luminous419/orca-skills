@@ -4,7 +4,5 @@
   "boundary_element": "long_term_lock_in",
   "what_is_missing": "acceptance of the long-term commitment",
   "why_policy_cannot_decide": "policy cannot commit the project's future on its own",
-  "no_determining_policy_source": true,
-  "no_explicit_authorization": true,
   "long_term_lock_in": true
 }

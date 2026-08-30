@@ -60,6 +60,7 @@ STATE_SELECTION_INPUTS: frozenset[str] = frozenset(
         "states",
         "transitions",
         "entry_clauses",
+        "clause_predicates",
         "reason_codes",
         "authority_precedence",
         "boundary_elements",
@@ -101,6 +102,7 @@ ENTRY_PREDICATES: frozenset[str] = frozenset(
         "determining_policy_source",
         "explicit_user_authorization",
         "reversible_in_run",
+        "all_safety_facts_declared",
         "blast_radius_within_scope",
         "no_high_impact_element",
         "supporting_policy_source",
@@ -172,6 +174,7 @@ class DecisionPolicy:
     transitions: Mapping[tuple[str, str], str]
     downstream_rule: str
     entry_clauses: Mapping[str, Mapping[str, str]]
+    clause_predicates: Mapping[str, str]
     reason_codes: Mapping[str, ReasonCode]
     boundary_elements: Mapping[str, BoundaryElement]
     entry_conditions: Mapping[str, Mapping[str, tuple[str, ...]]]
@@ -270,6 +273,42 @@ def parse_decision_policy(block: Any) -> DecisionPolicy:
         _require(state in states, f"entry_clauses names unknown state {state!r}")
         _require(isinstance(clauses, dict) and clauses, f"entry_clauses[{state}] must be a non-empty object")
         entry_clauses[state] = dict(clauses)
+
+    # F-002: the clause a reason code names is now ENFORCED on the record path, and
+    # this is the binding that makes that possible. Before it, `_grounds_defect()`
+    # checked a NEEDS_INPUT code's boundary ELEMENT and never the N-1/N-2/N-3 clause
+    # the same code declares -- so `missing_user_intent` (N-2, "required user intent is
+    # absent") was accepted by a record that established N-1 instead and asserted
+    # nothing at all about user intent. The code->clause edge was documentation.
+    #
+    # The mapping is declared in the contract rather than inferred from the ORDER of
+    # `entry_conditions[NEEDS_INPUT]`, which happens to line up today: a positional
+    # convention would re-break silently the first time a clause or a predicate is
+    # added. Every declared clause must name a predicate and every predicate must be
+    # in the closed vocabulary, so a new clause without one fails at LOAD time in both
+    # Skills rather than becoming unenforced prose again.
+    raw_clause_predicates = block["clause_predicates"]
+    _require(
+        isinstance(raw_clause_predicates, dict),
+        "clause_predicates must be an object",
+    )
+    declared_clauses = {
+        clause for clauses in entry_clauses.values() for clause in clauses
+    }
+    _require(
+        set(raw_clause_predicates) == declared_clauses,
+        "clause_predicates must name exactly the declared entry clauses; "
+        f"unexpected={sorted(set(raw_clause_predicates) - declared_clauses)} "
+        f"missing={sorted(declared_clauses - set(raw_clause_predicates))}",
+    )
+    unknown_clause_predicates = sorted(
+        name for name in raw_clause_predicates.values() if name not in ENTRY_PREDICATES
+    )
+    _require(
+        not unknown_clause_predicates,
+        f"clause_predicates names unknown predicate(s) {unknown_clause_predicates}",
+    )
+    clause_predicates = {str(k): str(v) for k, v in raw_clause_predicates.items()}
 
     boundary_elements: dict[str, BoundaryElement] = {}
     raw_elements = block["boundary_elements"]
@@ -392,6 +431,37 @@ def parse_decision_policy(block: Any) -> DecisionPolicy:
         f"user_decision_sources must not admit a forbidden authority source: {sorted(overlap)}",
     )
 
+    # F-001. The two keys that close the fail-open hole, checked HERE so a contract
+    # that omits them cannot load and quietly restore "missing means safe".
+    requires = block["assumption_allowed_requires"]
+    _require(isinstance(requires, dict), "assumption_allowed_requires must be an object")
+    safety_facts = requires.get("declared_safety_facts")
+    _require(
+        isinstance(safety_facts, list) and bool(safety_facts),
+        "assumption_allowed_requires.declared_safety_facts must be a non-empty list; "
+        "ASSUMPTION_ALLOWED is permitted by PROVEN safety, and an empty list would "
+        f"prove nothing, got {safety_facts!r}",
+    )
+    unknown_facts = [name for name in safety_facts if name not in boundary_elements]
+    _require(
+        not unknown_facts,
+        f"declared_safety_facts names unknown boundary element(s) {unknown_facts}",
+    )
+    # Authority ABSENCE is a rule the contract states, never a default the code picks.
+    # `not_reserved` is the shipped reading and matches how every other element
+    # expresses "this does not apply" (RI8-1: the element admits only `reserved`, so
+    # omission is the ONLY way to say the user reserved nothing). Setting this to
+    # `reserved` instead makes an unstated authority block ASSUMPTION_ALLOWED, and it
+    # is a one-token contract change precisely because the rule is data, not an `!=`
+    # buried in a predicate.
+    absence_rule = requires.get("absent_explicit_user_authority")
+    _require(
+        absence_rule in ("not_reserved", "reserved"),
+        "assumption_allowed_requires.absent_explicit_user_authority must state what an "
+        "UNDECLARED explicit_user_authority means -- 'not_reserved' or 'reserved'; "
+        f"got {absence_rule!r}. Authority absence is not an implicit default.",
+    )
+
     independent_axes = tuple(block["independent_axes"])
     _require(
         independent_axes == CANONICAL_INDEPENDENT_AXES,
@@ -406,6 +476,7 @@ def parse_decision_policy(block: Any) -> DecisionPolicy:
         transitions=transitions,
         downstream_rule=str(block["downstream_rule"]),
         entry_clauses=entry_clauses,
+        clause_predicates=clause_predicates,
         reason_codes=reason_codes,
         boundary_elements=boundary_elements,
         entry_conditions=entry_conditions,
@@ -729,6 +800,36 @@ def _validate_declared_facts(
     )
 
 
+def _undeclared_safety_facts(
+    policy: DecisionPolicy, facts: Mapping[str, Any]
+) -> tuple[str, ...]:
+    """F-001. Which of the facts ASSUMPTION_ALLOWED rests on were never declared.
+
+    The contract names them (`assumption_allowed_requires.declared_safety_facts`);
+    this reads that list and nothing else, so the set cannot drift between the two
+    Skills and the evaluator.
+
+    This is the gap the external review found, and it is a DIFFERENT question from the
+    two the module already asked. `_domain_defect` checks a declared value against its
+    domain and `_assumption_allowed_is_forbidden` checks a declared value against
+    INV-4 -- both start from "the record declared something". Nobody asked whether it
+    declared anything, so an OMITTED blast radius read as within scope
+    (`None not in ("repository", "external_system")`) and an omitted security flag read
+    as false (`facts.get("security") is True` -> False). Every one of the six shipped
+    ASSUMPTION_ALLOWED positions was unknown, and unknown was being read as safe: a
+    record carrying only a free-text `impact` string bought autonomous progress.
+
+    Absence is therefore its OWN predicate rather than a presence test folded into
+    `blast_radius_within_scope` and `no_high_impact_element`. Those two answer "is the
+    declared value safe?", which is a claim about a value; this answers "is there a
+    value to judge?". Folding them together is what made "not forbidden" and
+    "permitted" the same sentence, and the module has already paid for that once
+    (TR4-2). Keeping them apart also makes the diagnostic name the actual defect.
+    """
+    required = tuple(policy.assumption_allowed_requires.get("declared_safety_facts", ()))
+    return tuple(name for name in required if name not in facts)
+
+
 def _evaluate_predicate(
     name: str, policy: DecisionPolicy, facts: Mapping[str, Any]
 ) -> bool:
@@ -781,6 +882,8 @@ def _evaluate_predicate(
         return authorized
     if name == "reversible_in_run":
         return facts.get("reversibility") == "reversible_in_run"
+    if name == "all_safety_facts_declared":
+        return not _undeclared_safety_facts(policy, facts)
     if name == "blast_radius_within_scope":
         spec = policy.boundary_elements["blast_radius"]
         return facts.get("blast_radius") not in tuple(spec.triggering or ())
@@ -789,7 +892,21 @@ def _evaluate_predicate(
     if name == "supporting_policy_source":
         return role == "supports"
     if name == "no_reserved_user_authority":
-        return facts.get("explicit_user_authority") != "reserved"
+        if "explicit_user_authority" in facts:
+            return facts["explicit_user_authority"] != "reserved"
+        # F-001. What an UNDECLARED authority means is read from the contract, never
+        # decided here. `!=` on a missing key is a default, and a default is exactly
+        # what the review objected to; `absent_explicit_user_authority` is the rule,
+        # it is pinned by C18, and parse_decision_policy refuses a contract that does
+        # not state it. The element itself is deliberately NOT in
+        # declared_safety_facts: its domain admits only `reserved` (RI8-1), so
+        # requiring it to be declared would make ASSUMPTION_ALLOWED unreachable rather
+        # than better-evidenced, and widening that domain would widen the very
+        # user-authority vocabulary FR-2 closed.
+        return (
+            policy.assumption_allowed_requires.get("absent_explicit_user_authority")
+            == "not_reserved"
+        )
     if name == "undetermined_boundary_element":
         # The mirror of the determining_policy_source rule, and it has to be stated
         # here too: a determining policy source resolves an ordinary element, but not
@@ -848,9 +965,17 @@ def _entry_condition_defect(
     if satisfied:
         return None
     unmet = sorted(name for name, value in results.items() if not value)
+    detail = ""
+    if "all_safety_facts_declared" in unmet:
+        # F-001: say WHICH facts are missing. "unsatisfied: [...]" alone sent the
+        # reader looking for a wrong value when the defect is that there is no value.
+        detail = (
+            f"; never declared: {list(_undeclared_safety_facts(policy, facts))} -- an "
+            "undeclared blast radius or impact flag is UNKNOWN, and unknown is not safe"
+        )
     return (
         f"state {state} requires {combinator} of {sorted(predicates)}; "
-        f"unsatisfied: {unmet}"
+        f"unsatisfied: {unmet}{detail}"
     )
 
 
@@ -885,6 +1010,54 @@ def permitted_states(
         for state in policy.entry_conditions
         if _entry_condition_defect(policy, state, facts) is None
     )
+
+
+def record_facts(
+    policy: DecisionPolicy, record: Mapping[str, Any]
+) -> Mapping[str, Any]:
+    """The facts a decision RECORD asserts, with the reason code's own declarations
+    made explicit, so `permitted_states()` and `validate_record()` can be handed
+    identical input.
+
+    Two of the contract's declarations are carried by the reason code rather than by a
+    separate field, and both were invisible to `permitted_states()`:
+
+    * a `declared`-kind boundary element (today only `ambiguity`) is declared by being
+      NAMED in `boundary_element` -- A4-1 row 1, and the rule `_grounds_defect` already
+      applies;
+    * a CONFLICT record's clause is fixed by its reason code, which is why
+      `conflict_clause` is optional on the record.
+
+    Measured on a pristine `git archive HEAD` copy of cef080b: SIX of the eighteen
+    shipped valid fixtures -- the two `ambiguity` records, `unclassifiable_decision`,
+    and all three CONFLICT records -- were accepted by `validate_record()` while
+    `permitted_states()` returned the EMPTY set for the same mapping. (The other twelve
+    declare a boundary value of their own, so they did not diverge; the divergence is
+    exactly the set whose declaration the reason code carries.) That is the FR-5/TR4-2
+    shape a third time: two production APIs answering the
+    same question differently because they were reading different inputs, not because
+    they disagreed. `setdefault` is deliberate: a record that declares a DIFFERENT
+    value keeps it, and the mismatch checks below reject it, so nothing here can paper
+    over a contradiction between a code and its record.
+    """
+
+    name = record.get("reason_code")
+    code = policy.reason_codes.get(name) if isinstance(name, str) else None
+    return _facts_of(policy, code, record)
+
+
+def _facts_of(
+    policy: DecisionPolicy, code: ReasonCode | None, record: Mapping[str, Any]
+) -> Mapping[str, Any]:
+    if code is None:
+        return record
+    facts = dict(record)
+    element = code.boundary_element
+    if element is not None and policy.boundary_elements[element].kind == "declared":
+        facts.setdefault(element, True)
+    if code.state == "CONFLICT" and code.clause is not None:
+        facts.setdefault("conflict_clause", code.clause)
+    return facts
 
 
 def _grounds_defect(
@@ -939,6 +1112,8 @@ def _grounds_defect(
     if code is None:
         return None
 
+    facts = _facts_of(policy, code, record)
+
     if state == "NEEDS_INPUT" and code.boundary_element is not None:
         element = code.boundary_element
         spec = policy.boundary_elements[element]
@@ -953,20 +1128,18 @@ def _grounds_defect(
                     f"but the record declares {record[element]!r}, which does not "
                     f"make it true"
                 )
-            return None
-        if element not in record:
+        elif element not in record:
             return (
                 f"reason code {code.name} rests on boundary element {element!r}, but "
                 f"the record does not declare it; a pause cannot rest on an element "
                 f"the record never asserts"
             )
-        if not _element_is_triggering(spec, record[element]):
+        elif not _element_is_triggering(spec, record[element]):
             return (
                 f"reason code {code.name} rests on boundary element {element!r}, but "
                 f"the record declares {record[element]!r}, which is not a triggering "
                 f"value ({_triggering_text(spec)}) -- the boundary did not fire"
             )
-        return None
 
     if state == "CONFLICT" and code.clause is not None:
         # A3-1a fixed three distinct clauses. The citation minimum is enforced above;
@@ -978,7 +1151,29 @@ def _grounds_defect(
                 f"reason code {code.name} rests on clause {code.clause}, but the "
                 f"record declares clause {declared_clause!r}"
             )
-        return None
+
+    # F-002. And the clause itself must HOLD. Everything above checks that the record
+    # names the right things; this checks that the facts it declares actually satisfy
+    # the clause its reason code rests on. `clause_predicates` binds the two, and the
+    # test is `_evaluate_predicate` -- the SAME function `permitted_states()` calls --
+    # so a clause cannot be satisfied on one path and unsatisfied on the other.
+    #
+    # This is what was missing. `missing_user_intent` rests on N-2, "required user
+    # intent is absent", and its shipped fixture asserted nothing about user intent at
+    # all: it named the `ambiguity` element and so established N-1, the clause a
+    # DIFFERENT code rests on. `unclassifiable_decision` rests on N-3 and never had to
+    # claim the item was unclassifiable. The evidence and the clause were free to
+    # disagree, which is precisely the misclassification a Reviewer is required to be
+    # able to judge from the contract.
+    if code.clause is not None:
+        predicate = policy.clause_predicates[code.clause]
+        if not _evaluate_predicate(predicate, policy, facts):
+            return (
+                f"reason code {code.name} rests on clause {code.clause} "
+                f"({policy.entry_clauses[code.state][code.clause]}), but the record "
+                f"does not establish it -- {predicate!r} is not satisfied by the facts "
+                f"it declares"
+            )
 
     return None
 
@@ -1082,6 +1277,18 @@ def validate_record(policy: DecisionPolicy, record: Mapping[str, Any]) -> None:
         # permitted_states(), so the two cannot answer this differently again.
         defect = _entry_condition_defect(policy, "ASSUMPTION_ALLOWED", record)
         _require(defect is None, defect or "")
+        # F-001 belt: the entry condition above is the normative rule and already
+        # rejects an undeclared safety fact. Naming the omission separately keeps the
+        # ONE sentence a Reviewer needs -- "unknown is not safe" -- out of a predicate
+        # list, and keeps the check standing if the entry condition is ever edited.
+        undeclared = _undeclared_safety_facts(policy, record)
+        _require(
+            not undeclared,
+            f"ASSUMPTION_ALLOWED requires every safety fact to be DECLARED; "
+            f"{list(undeclared)} {'is' if len(undeclared) == 1 else 'are'} absent. An "
+            "undeclared fact is unknown, not safe, and free text in 'impact' is not a "
+            "substitute for it.",
+        )
 
     # FR-6: and for EVERY state, the declared evidence must actually justify it. The
     # ASSUMPTION_ALLOWED branch above is the case that was already covered; this is

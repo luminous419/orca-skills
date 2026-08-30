@@ -1,6 +1,6 @@
 {
   "reversibility": "reversible_in_run",
-  "impact": "current_change",
+  "impact": "reorders two lines in one existing script; no behaviour change",
   "state": "ASSUMPTION_ALLOWED",
   "reason_code": "repository_policy",
   "policy_source": {
@@ -8,5 +8,11 @@
     "locator": "scripts/",
     "role": "supports"
   },
-  "retraction_condition": "a reviewer names a different location"
+  "retraction_condition": "a reviewer names a different location",
+  "blast_radius": "current_change",
+  "monetary_cost": false,
+  "security": false,
+  "privacy": false,
+  "compliance": false,
+  "long_term_lock_in": false
 }

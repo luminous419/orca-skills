@@ -218,12 +218,20 @@ Decision Record가 **존재할 때만** 아래를 판정한다. 섹션이 없는
 - `ASSUMPTION_ALLOWED` — INV-4(위)에 더해 진입 조건을 만족해야 한다: run 안에서 되돌릴 수
   있고, blast radius가 요청 범위 안이며, policy source가 `supports`이고, 사용자 권한이
   유보되어 있지 않아야 한다. **금지되지 않았다는 것은 허용되었다는 뜻이 아니다.**
+  그리고 blast radius / monetary cost / security / privacy / compliance / long-term
+  lock-in 여섯 fact가 record에 **모두 선언되어 있어야 한다.** 선언되지 않은 fact는 거짓이
+  아니라 미상이고, 미상은 안전의 증거가 아니다 — `impact`에 적힌 자유 서술 문장은 그
+  여섯 fact를 대신하지 못한다.
 - `NEEDS_INPUT` — `REASON_CODE`가 가리키는 boundary element가 **실제로 발동했는지** 보라.
   `security_impact`인데 `security`가 거짓이거나 선언되지 않았으면 오분류다. 되돌릴 수
   없음은 `irreversible`, blast radius는 `repository` 또는 `external_system`, 다섯 boolean은
   참, 사용자 권한은 `reserved`가 발동 값이다. boundary를 bind하지 않는
   `unclassifiable_decision`은 예외이며, `ambiguity`는 `REASON_CODE`로 지목하는 것 자체가
-  선언이다.
+  선언이다. **element만으로는 부족하다 — `REASON_CODE`가 rest하는 clause도 성립해야 한다.**
+  `missing_user_intent`(N-2)는 사용자 의도가 실제로 부재함을, `unclassifiable_decision`(N-3)은
+  항목이 실제로 분류 불가함을 record가 스스로 밝혀야 하고, N-1 code는 발동한 boundary element에
+  더해 그것을 결정하는 policy source도 완전한 사용자 권한도 없음을 만족해야 한다. 다른 clause의
+  증거를 가져온 것은 오분류다.
 - `CONFLICT` — 인용이 최소 개수를 채웠는지, 그리고 record가 선언한 clause가
   `REASON_CODE`가 rest하는 clause(C-1/C-2/C-3)와 **같은지** 보라. 다른 clause의 증거를
   다른 code로 제출한 것은 오분류다.

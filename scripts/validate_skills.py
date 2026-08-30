@@ -548,6 +548,7 @@ DECISION_POLICY_ENTRY_CONDITIONS = {
     "ASSUMPTION_ALLOWED": (
         "all_of",
         (
+            "all_safety_facts_declared",
             "reversible_in_run",
             "blast_radius_within_scope",
             "no_high_impact_element",
@@ -591,6 +592,34 @@ DECISION_POLICY_FORBIDDEN_WHEN = {
 DECISION_POLICY_ASSUMPTION_REQUIRES = {
     "policy_source_role": "supports",
     "all_required_evidence_non_empty": True,
+    # F-001. The facts an ASSUMPTION_ALLOWED record must DECLARE, pinned by value for
+    # the reason every other authority datum here is: shortening this list is how the
+    # fail-open would come back, and it would come back silently -- a shorter list
+    # rejects nothing new, so every test and fixture would stay green while an
+    # undeclared blast radius or security flag again read as safe.
+    "declared_safety_facts": [
+        "blast_radius",
+        "monetary_cost",
+        "security",
+        "privacy",
+        "compliance",
+        "long_term_lock_in",
+    ],
+    # Pinned because it is a RULE, not a default: flipping it to "reserved" changes
+    # what an unstated user authority means, and that must not happen unnoticed.
+    "absent_explicit_user_authority": "not_reserved",
+}
+# F-002. Which predicate PROVES each entry clause. Pinned by value: repointing N-2 at
+# `undetermined_boundary_element` would restore exactly the defect the review found --
+# `missing_user_intent` satisfied by evidence that says nothing about user intent --
+# and closed-set membership alone would not notice.
+DECISION_POLICY_CLAUSE_PREDICATES = {
+    "N-1": "undetermined_boundary_element",
+    "N-2": "absent_user_intent",
+    "N-3": "unclassifiable_item",
+    "C-1": "declared_contradiction",
+    "C-2": "declared_contradiction",
+    "C-3": "declared_contradiction",
 }
 DECISION_POLICY_USER_DECISION_FIELDS = ("source", "where_recorded", "resolves")
 # FR-2: the closed POSITIVE vocabulary for user authority. The denylist below no
@@ -686,6 +715,12 @@ DECISION_POLICY_SKILL_PROSE_ANCHORS = (
     "NEEDS_INPUT은 정보가 없는 것이고 CONFLICT는 정보가 모순되는 것이다",
     "답변을 받은 항목은 CLEAR가 되며 ASSUMPTION_ALLOWED가 되지 않는다",
     "INV-4에는 예외가 없다",
+    # F-001 / F-002: the two sentences the section would be WRONG without after this
+    # fix, held to the same standard as the four above. A reader who takes "not
+    # declared" for "false", or a code's clause for a proof of that clause, has the
+    # contract backwards -- and both readings were true of the shipped code.
+    "선언하지 않은 fact는 거짓이 아니라 미상이며",
+    "reason code가 rest하는 clause는 record에서 실제로",
 )
 DECISION_RECORD_OPTIONALITY_ANCHOR = (
     "optional section이다. 없어도 계약 위반이 아니다."
@@ -2396,6 +2431,12 @@ def validate_decision_policy_contract(validation: Validation) -> None:
             {s: dict(c) for s, c in policy.entry_clauses.items()}
             == DECISION_POLICY_ENTRY_CLAUSES,
             f"{name}: entry clause text drifted",
+        )
+        validation.check(  # C32
+            dict(policy.clause_predicates) == DECISION_POLICY_CLAUSE_PREDICATES,
+            f"{name}: clause->predicate binding drifted -- validate_record proves a "
+            "reason code's clause through these, so a change here lets a record be "
+            "filed under a clause its evidence does not establish",
         )
         validation.check(  # C23
             policy.downstream_rule == DECISION_POLICY_DOWNSTREAM_RULE,

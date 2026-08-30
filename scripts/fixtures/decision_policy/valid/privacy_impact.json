@@ -4,7 +4,5 @@
   "boundary_element": "privacy",
   "what_is_missing": "approval to process personal data",
   "why_policy_cannot_decide": "policy cannot accept privacy exposure on the user's behalf",
-  "no_determining_policy_source": true,
-  "no_explicit_authorization": true,
   "privacy": true
 }

@@ -258,6 +258,7 @@ DEFAULT_RISK = high
         "C-3": "an explicit requirement contradicts a non-overridable project invariant"
       }
     },
+    "clause_predicates": {"N-1": "undetermined_boundary_element", "N-2": "absent_user_intent", "N-3": "unclassifiable_item", "C-1": "declared_contradiction", "C-2": "declared_contradiction", "C-3": "declared_contradiction"},
     "reason_codes": {
       "repository_policy": {"state": "ASSUMPTION_ALLOWED"},
       "explicit_requirement": {"state": "ASSUMPTION_ALLOWED"},
@@ -280,7 +281,7 @@ DEFAULT_RISK = high
     },
     "entry_conditions": {
       "CLEAR": {"any_of": ["no_open_decision_item", "determining_policy_source", "explicit_user_authorization"]},
-      "ASSUMPTION_ALLOWED": {"all_of": ["reversible_in_run", "blast_radius_within_scope", "no_high_impact_element", "supporting_policy_source", "no_reserved_user_authority"]},
+      "ASSUMPTION_ALLOWED": {"all_of": ["all_safety_facts_declared", "reversible_in_run", "blast_radius_within_scope", "no_high_impact_element", "supporting_policy_source", "no_reserved_user_authority"]},
       "NEEDS_INPUT": {"any_of": ["undetermined_boundary_element", "absent_user_intent", "unclassifiable_item"]},
       "CONFLICT": {"any_of": ["declared_contradiction"]}
     },
@@ -306,7 +307,7 @@ DEFAULT_RISK = high
       "NEEDS_INPUT": ["reason_code", "boundary_element", "what_is_missing", "why_policy_cannot_decide"],
       "CONFLICT": ["reason_code", "citations", "why_they_cannot_both_hold"]
     },
-    "assumption_allowed_requires": {"policy_source_role": "supports", "all_required_evidence_non_empty": true},
+    "assumption_allowed_requires": {"policy_source_role": "supports", "all_required_evidence_non_empty": true, "declared_safety_facts": ["blast_radius", "monetary_cost", "security", "privacy", "compliance", "long_term_lock_in"], "absent_explicit_user_authority": "not_reserved"},
     "assumption_allowed_forbidden_when": {
       "reversibility_in": ["irreversible"],
       "blast_radius_in_with_irreversible": ["repository", "external_system"],
@@ -344,6 +345,19 @@ OS-28은 그 셋 중 어느 것도 바꾸지 않는다. decision state `CONFLICT
 compliance / long-term lock-in 중 하나가 참이면 `ASSUMPTION_ALLOWED`가 될 수 없으며, 이를
 결정하는 policy source나 명시적 authorization이 있어도 마찬가지다 — 그런 항목은
 `ASSUMPTION_ALLOWED`가 열리는 것이 아니라 `CLEAR`로 이동한다.
+
+**증명되지 않은 것은 안전이 아니다.** `ASSUMPTION_ALLOWED`는 `declared_safety_facts`가 지명한
+여섯 fact — blast radius, monetary cost, security, privacy, compliance, long-term lock-in —
+을 record가 **명시적으로 선언했을 때에만** 허용된다. 선언하지 않은 fact는 거짓이 아니라 미상이며,
+미상은 자동 진행의 근거가 되지 못한다. 자유 서술 `impact` 문자열은 이 여섯 fact를 대신하지 않는다.
+사용자 권한이 선언되지 않았을 때 그것이 무엇을 뜻하는지는 `absent_explicit_user_authority`가
+계약에서 명시한다 — 코드의 암묵적 default가 아니다.
+
+**clause는 선언이 아니라 증명이다.** reason code가 rest하는 clause는 record에서 실제로
+증명되어야 한다. `clause_predicates`가 각 clause(N-1/N-2/N-3, C-1/C-2/C-3)에 그것을 증명하는
+predicate를 지정하며, `validate_record()`는 `permitted_states()`와 같은 predicate로 그것을
+평가한다. `missing_user_intent`는 N-2를, `unclassifiable_decision`은 N-3를 스스로 증명해야
+하고, 다른 clause의 증거로 대신할 수 없다.
 
 **권한이 아닌 것.** 모델 확신, Worker/Reviewer 합의, 권고 default, timeout, 무응답은 사용자
 권한의 근거가 아니다.

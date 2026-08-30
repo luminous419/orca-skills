@@ -34,6 +34,7 @@ from scripts.decision_policy import (
     load_decision_policy,
     parse_decision_policy,
     permitted_states,
+    record_facts,
     validate_record,
     validate_transition,
 )
@@ -87,6 +88,24 @@ EXPECTED_HIGH_IMPACT = [
 #: complete source; anything asserting a source is VALID must use them.
 LOCATOR = "docs/policy.md#rule-1"
 
+#: F-001. Every fact `assumption_allowed_requires.declared_safety_facts` names, at a
+#: SAFE value. Before the fix these were simply absent from the helpers below, and the
+#: helpers were right to omit them by the semantics of the day: an undeclared blast
+#: radius read as within scope and an undeclared impact flag read as false, so a record
+#: carrying none of them was ASSUMPTION_ALLOWED. That is the reason this constant did
+#: not exist -- and the reason the whole class of "safe item" tests proved less than
+#: they claimed. Anything asserting an item IS safe must now declare it.
+#: `test_the_safe_baseline_covers_every_declared_safety_fact` pins this against the
+#: contract, so a seventh fact fails there rather than silently going unprobed.
+SAFE_FACTS = {
+    "blast_radius": "current_change",
+    "monetary_cost": False,
+    "security": False,
+    "privacy": False,
+    "compliance": False,
+    "long_term_lock_in": False,
+}
+
 
 def supporting_source(**overrides) -> dict:
     return {"role": "supports", "kind": "file_path", "locator": LOCATOR, **overrides}
@@ -119,7 +138,7 @@ def assumption_allowed_record(policy, **overrides) -> dict:
         "state": "ASSUMPTION_ALLOWED",
         "reason_code": code.name,
         "policy_source": supporting_source(),
-        "blast_radius": "current_change",
+        **SAFE_FACTS,
     }
     for field in code.required_evidence:
         if field in record:
@@ -733,6 +752,9 @@ class AuthorityPrecedenceAcrossPredicates(DecisionPolicyTestCase):
                 {"blast_radius": "external_system"},
             ),
             "no_high_impact_element": ({}, {"security": True}),
+            # F-001: the ONE predicate whose false witness is an OMISSION rather than
+            # a wrong value -- which is exactly why the hole existed.
+            "all_safety_facts_declared": (dict(SAFE_FACTS), {}),
             "supporting_policy_source": (self.SUPPORTS, {}),
             "no_reserved_user_authority": ({}, {"explicit_user_authority": "reserved"}),
             "undetermined_boundary_element": ({"security": True}, {}),
@@ -743,7 +765,7 @@ class AuthorityPrecedenceAcrossPredicates(DecisionPolicyTestCase):
         # D4-F guard: a witness for every predicate in the closed vocabulary, and none
         # left over, so adding a predicate without a witness fails here.
         self.assertEqual(set(witnesses), set(ENTRY_PREDICATES))
-        self.assertEqual(len(witnesses), 12)
+        self.assertEqual(len(witnesses), 13)
         for name, (true_facts, false_facts) in sorted(witnesses.items()):
             with self.subTest(predicate=name):
                 self.assertTrue(
@@ -1248,9 +1270,10 @@ class Requirement7RiskIndependence(DecisionPolicyTestCase):
 
         # D4-F guard: the walk must actually visit every selection input. The count
         # has risen 16 -> 17 (FR-2 user_decision_sources) -> 18 (FR-4 entry_conditions)
-        # -> 19 (RI3-1 authority_precedence). Each time the guard flagged a legitimate
-        # change, which is what a cardinality guard is for.
-        self.assertEqual(len(STATE_SELECTION_INPUTS & set(self.block)), 19)
+        # -> 19 (RI3-1 authority_precedence) -> 20 (F-002 clause_predicates). Each
+        # time the guard flagged a legitimate change, which is what a cardinality
+        # guard is for.
+        self.assertEqual(len(STATE_SELECTION_INPUTS & set(self.block)), 20)
         for key in sorted(STATE_SELECTION_INPUTS):
             walk(self.block[key], key)
         self.assertEqual(hits, [])
@@ -1483,6 +1506,7 @@ class CrossApiConceptParity(DecisionPolicyTestCase):
             "state": "ASSUMPTION_ALLOWED",
             "reason_code": code.name,
             "policy_source": dict(self.SUPPORTS),
+            **SAFE_FACTS,
         }
         if code.boundary_element:
             record["boundary_element"] = code.boundary_element
@@ -1568,6 +1592,7 @@ class CrossApiConceptParity(DecisionPolicyTestCase):
         hard-case sweep; it must not satisfy this."""
         facts = {
             "reversibility": "reversible_in_run",
+            **SAFE_FACTS,
             "blast_radius": self.policy.boundary_elements["blast_radius"].values[0],
         }
         self.assertIn(
@@ -1827,7 +1852,13 @@ class FactReadingApisShareEveryRule(DecisionPolicyTestCase):
     #: claimed state. The set is pinned by name rather than allowed as a blanket
     #: asymmetry, so adding a rule here is a deliberate edit that shows in the diff
     #: instead of silently reopening the gap TR4-1 closed.
-    RECORD_ONLY_RULES = frozenset({"_grounds_defect", "_triggering_text"})
+    #: `_facts_of` joined them with F-002: it makes a reason code's own declarations
+    #: explicit, and a reason code is precisely what the evaluator does not have. It
+    #: adds no rule -- `record_facts()` hands its output back to `permitted_states()`,
+    #: so the judgement stays shared; only the normalisation is one-sided.
+    RECORD_ONLY_RULES = frozenset(
+        {"_grounds_defect", "_triggering_text", "_facts_of"}
+    )
 
     def test_both_fact_reading_apis_reach_the_same_helpers(self) -> None:
         evaluator = self._closure("permitted_states")
@@ -2329,7 +2360,7 @@ class Fr8BooleanBoundariesFailClosed(DecisionPolicyTestCase):
 
     SAFE = {
         "reversibility": "reversible_in_run",
-        "blast_radius": "current_change",
+        **SAFE_FACTS,
         "policy_source": supporting_source(),
     }
 
@@ -2381,15 +2412,27 @@ class Fr8BooleanBoundariesFailClosed(DecisionPolicyTestCase):
                 safe = permitted_states(self.policy, {**self.SAFE, element: False})
                 self.assertIn("ASSUMPTION_ALLOWED", safe)
 
-    def test_omitting_the_element_remains_legal(self) -> None:
-        """The other positive control, and the line the fix must not cross: not
-        declaring something and declaring it wrongly are different acts."""
+    def test_omitting_the_element_remains_legal_but_is_no_longer_safe(self) -> None:
+        """The other positive control, and the line the fix must not cross -- restated
+        by F-001, because the line moved and the old wording had it in the wrong place.
+
+        Not declaring something and declaring it wrongly are still different acts, and
+        the difference is still real: an omitted element is ACCEPTED (no domain error)
+        where a malformed one RAISES. What changed is what an omission BUYS. It used to
+        buy ASSUMPTION_ALLOWED -- the five high-impact booleans defaulted to false and
+        the item read as safe. It now buys nothing: the state is refused until the fact
+        is declared, and declaring it false is what makes the item safe."""
         self.assertIn(
             "ASSUMPTION_ALLOWED", permitted_states(self.policy, dict(self.SAFE))
         )
         for element in self._boolean_elements():
             with self.subTest(element=element):
-                self.assertNotIn(element, self.SAFE)
+                omitted = {k: v for k, v in self.SAFE.items() if k != element}
+                # Legal: an undeclared element raises nothing.
+                permitted = permitted_states(self.policy, omitted)
+                # But unknown is not safe.
+                self.assertNotIn("ASSUMPTION_ALLOWED", permitted)
+                self.assertIs(self.SAFE[element], False)
 
     def test_both_apis_reject_a_malformed_value_identically(self) -> None:
         """Parity on identical input -- the property that failed four times in this
@@ -2452,7 +2495,7 @@ class Ri81AuthorityBoundaryFailsClosed(DecisionPolicyTestCase):
 
     SAFE = {
         "reversibility": "reversible_in_run",
-        "blast_radius": "current_change",
+        **SAFE_FACTS,
         "policy_source": supporting_source(),
     }
     ELEMENT = "explicit_user_authority"
@@ -2540,7 +2583,7 @@ class Ri91LocatorShapeIsEnforced(DecisionPolicyTestCase):
     the SHAPE -- non-empty text -- needs no I/O. Only EXISTENCE does.
     """
 
-    SAFE = {"reversibility": "reversible_in_run", "blast_radius": "current_change"}
+    SAFE = {"reversibility": "reversible_in_run", **SAFE_FACTS}
     BAD_LOCATORS = ("", "   ", "\t", 42, None, {"a": 1}, [], True)
 
     def test_a_source_without_a_locator_is_rejected(self) -> None:
@@ -2852,6 +2895,437 @@ class Fr9EveryValuePositionHasADomainProbe(DecisionPolicyTestCase):
                 validator = error_of(validate_record, self.policy, violating) != ""
                 self.assertTrue(validator)
                 self.assertEqual(evaluator, validator, f"{position}: APIs disagree")
+
+
+class F001UndeclaredSafetyFactsAreNotSafe(DecisionPolicyTestCase):
+    """F-001 (CRITICAL, external review 5061977892 on head cef080b).
+
+    Reproduced on that head before any change: `valid/repository_policy.json` carried
+    the keys ['impact', 'policy_source', 'reason_code', 'retraction_condition',
+    'reversibility', 'state'] and NOTHING about blast radius, monetary cost, security,
+    privacy, compliance or long-term lock-in -- and `validate_record()` accepted it
+    while `permitted_states()` returned ['ASSUMPTION_ALLOWED']. Both readings came from
+    absence: `blast_radius_within_scope` asked `None not in ("repository",
+    "external_system")` and `no_high_impact_element` asked `facts.get(element) is True`.
+    An unknown high-impact state was being read as a safe one, and the only thing
+    resembling an impact statement in the shipped record was the free-text `impact`
+    string, which nothing reads for meaning.
+
+    The invariant this class holds: a blast radius, monetary cost, security, privacy,
+    compliance or long-term lock-in state that is not PROVEN safe does not permit
+    ASSUMPTION_ALLOWED.
+    """
+
+    def _safe(self, **overrides) -> dict:
+        return assumption_allowed_record(self.policy, **overrides)
+
+    def test_the_safe_baseline_covers_every_declared_safety_fact(self) -> None:
+        """D4-F guard for the whole class: SAFE_FACTS is the contract's list, so a
+        seventh fact fails HERE rather than going silently unprobed by every test
+        below -- which is precisely how six facts went unprobed until the review."""
+        declared = self.policy.assumption_allowed_requires["declared_safety_facts"]
+        self.assertEqual(set(SAFE_FACTS), set(declared))
+        self.assertEqual(len(declared), 6)
+
+    def test_omitting_any_single_safety_fact_refuses_assumption_allowed(self) -> None:
+        """The reproduction, one fact at a time, through BOTH APIs on identical input."""
+        declared = list(self.policy.assumption_allowed_requires["declared_safety_facts"])
+        # D4-F guard, co-located.
+        self.assertEqual(len(declared), 6)
+        checked = 0
+        for fact in sorted(declared):
+            with self.subTest(undeclared=fact):
+                record = self._safe()
+                del record[fact]
+                self.assertNotIn(fact, record)
+                self.assertNotIn(
+                    "ASSUMPTION_ALLOWED", permitted_states(self.policy, record)
+                )
+                message = error_of(validate_record, self.policy, record)
+                self.assertNotEqual(message, "")
+                # Anchored on the rule that must refuse: a bare "it raised" would stay
+                # green if some unrelated check happened to reject the record.
+                self.assertIn(fact, message)
+                checked += 1
+        self.assertEqual(checked, 6)
+
+    def test_dropping_every_safety_fact_at_once_refuses_too(self) -> None:
+        """The shipped shape verbatim: a reversible, scope-declaring-nothing record
+        whose only impact statement is prose."""
+        record = self._safe()
+        for fact in self.policy.assumption_allowed_requires["declared_safety_facts"]:
+            record.pop(fact, None)
+        self.assertIn("impact", record)
+        self.assertNotIn("ASSUMPTION_ALLOWED", permitted_states(self.policy, record))
+        message = error_of(validate_record, self.policy, record)
+        self.assertIn("unknown", message)
+
+    def test_free_text_impact_is_not_a_substitute_for_the_facts(self) -> None:
+        """`impact` is prose and stays prose. Filling it with a string that LOOKS like
+        a blast radius -- which is what the shipped fixtures did, `"impact":
+        "current_change"` -- must not stand in for the machine-readable fact."""
+        for prose in ("current_change", "no security impact", "safe", "none"):
+            with self.subTest(impact=prose):
+                record = self._safe(impact=prose)
+                del record["blast_radius"]
+                self.assertNotIn(
+                    "ASSUMPTION_ALLOWED", permitted_states(self.policy, record)
+                )
+                self.assertNotEqual(
+                    error_of(validate_record, self.policy, record), ""
+                )
+
+    def test_an_unknown_or_mistyped_safety_fact_is_rejected_not_ignored(self) -> None:
+        """Declaring nonsense must RAISE, not read as "did not fire". Distinct from the
+        omission rows above: absence is refused, a bad domain is rejected."""
+        cases = {
+            "blast_radius": ("the_whole_internet", "unknown", 1, None),
+            "security": ("yes", "no", 1, 0, None),
+        }
+        checked = 0
+        for fact, values in sorted(cases.items()):
+            for value in values:
+                with self.subTest(fact=fact, value=repr(value)):
+                    record = self._safe(**{fact: value})
+                    with self.assertRaises(DecisionPolicyError):
+                        permitted_states(self.policy, record)
+                    with self.assertRaises(DecisionPolicyError):
+                        validate_record(self.policy, record)
+                    checked += 1
+        self.assertEqual(checked, 9)
+
+    def test_a_blast_radius_outside_the_requested_scope_is_refused(self) -> None:
+        triggering = list(self.policy.boundary_elements["blast_radius"].triggering)
+        # D4-F guard: the two values A4-1 fixes.
+        self.assertEqual(triggering, ["repository", "external_system"])
+        for value in triggering:
+            with self.subTest(blast_radius=value):
+                record = self._safe(blast_radius=value)
+                self.assertNotIn(
+                    "ASSUMPTION_ALLOWED", permitted_states(self.policy, record)
+                )
+                self.assertNotEqual(error_of(validate_record, self.policy, record), "")
+
+    def test_a_high_impact_boolean_declared_true_is_refused(self) -> None:
+        flags = list(self.policy.assumption_allowed_forbidden_when["any_true_of"])
+        # D4-F guard.
+        self.assertEqual(flags, EXPECTED_HIGH_IMPACT)
+        for flag in flags:
+            with self.subTest(flag=flag):
+                record = self._safe(**{flag: True})
+                self.assertNotIn(
+                    "ASSUMPTION_ALLOWED", permitted_states(self.policy, record)
+                )
+                self.assertNotEqual(error_of(validate_record, self.policy, record), "")
+
+    def test_a_fully_declared_safe_record_is_still_permitted(self) -> None:
+        """POSITIVE CONTROL. Refusing everything would satisfy every test above. A
+        reversible, scope-local record that declares all six facts false/in-scope must
+        still be ASSUMPTION_ALLOWED, through both APIs, for all four of its codes."""
+        codes = codes_for_state(self.policy, "ASSUMPTION_ALLOWED")
+        # D4-F guard.
+        self.assertEqual(len(codes), 4)
+        for name in codes:
+            with self.subTest(reason_code=name):
+                record = load_fixture(f"valid/{name}.json")
+                validate_record(self.policy, record)
+                self.assertIn(
+                    "ASSUMPTION_ALLOWED", permitted_states(self.policy, record)
+                )
+
+    def test_every_in_scope_blast_radius_still_permits_the_state(self) -> None:
+        """Second positive control, over the axis the fix narrows most."""
+        spec = self.policy.boundary_elements["blast_radius"]
+        within = [v for v in spec.values if v not in tuple(spec.triggering)]
+        # D4-F guard: 4 values, 2 of which escalate.
+        self.assertEqual(within, ["current_change", "module"])
+        for value in within:
+            with self.subTest(blast_radius=value):
+                record = self._safe(blast_radius=value)
+                validate_record(self.policy, record)
+                self.assertIn(
+                    "ASSUMPTION_ALLOWED", permitted_states(self.policy, record)
+                )
+
+    def test_the_clear_path_is_untouched_by_the_narrowing(self) -> None:
+        """The line the fix must not cross. CLEAR rests on a determining policy source
+        or a complete user decision, and neither has anything to do with declaring an
+        impact fact -- an over-broad fix would have taken these with it."""
+        for grounds in (
+            {"policy_source": determining_source()},
+            {"user_decision": complete_decision()},
+            {"user_decision": complete_decision("prior_explicit_user_authorization")},
+            {"open_decision_item": False},
+        ):
+            with self.subTest(grounds=sorted(grounds)):
+                self.assertIn("CLEAR", permitted_states(self.policy, grounds))
+        for state in ("NEEDS_INPUT", "CONFLICT"):
+            with self.subTest(state=state):
+                name = codes_for_state(self.policy, state)[0]
+                validate_record(self.policy, load_fixture(f"valid/{name}.json"))
+
+    def test_authority_absence_is_a_contract_rule_not_a_code_default(self) -> None:
+        """The review's third strand: the ABSENCE of reserved-authority evidence also
+        satisfied its predicate. The reading is unchanged -- omission means the user
+        reserved nothing, which is how RI8-1 requires it to be expressed -- but it is
+        now DECLARED in the contract and read from there, so flipping the rule flips
+        the behaviour with no code change."""
+        rule = self.policy.assumption_allowed_requires["absent_explicit_user_authority"]
+        self.assertEqual(rule, "not_reserved")
+        record = assumption_allowed_record(self.policy)
+        self.assertNotIn("explicit_user_authority", record)
+        self.assertIn("ASSUMPTION_ALLOWED", permitted_states(self.policy, record))
+
+        strict = parse_decision_policy(
+            {
+                **self.block,
+                "assumption_allowed_requires": {
+                    **self.block["assumption_allowed_requires"],
+                    "absent_explicit_user_authority": "reserved",
+                },
+            }
+        )
+        self.assertNotIn("ASSUMPTION_ALLOWED", permitted_states(strict, record))
+        # And a declared reservation is refused under BOTH readings.
+        reserved = assumption_allowed_record(
+            self.policy, explicit_user_authority="reserved"
+        )
+        for policy in (self.policy, strict):
+            self.assertNotIn(
+                "ASSUMPTION_ALLOWED", permitted_states(policy, reserved)
+            )
+
+    def test_a_contract_without_the_new_keys_does_not_load(self) -> None:
+        """Fail CLOSED at load time, in both Skills, rather than reverting to
+        "missing means safe" the moment the contract omits the list."""
+        for broken in (
+            {"policy_source_role": "supports", "all_required_evidence_non_empty": True},
+            {**self.block["assumption_allowed_requires"], "declared_safety_facts": []},
+            {
+                **self.block["assumption_allowed_requires"],
+                "declared_safety_facts": ["not_an_element"],
+            },
+            {
+                **self.block["assumption_allowed_requires"],
+                "absent_explicit_user_authority": "probably_fine",
+            },
+        ):
+            with self.subTest(requires=sorted(broken)):
+                with self.assertRaises(DecisionPolicyError):
+                    parse_decision_policy(
+                        {**self.block, "assumption_allowed_requires": broken}
+                    )
+
+
+class F002AReasonCodesClauseMustBeProven(DecisionPolicyTestCase):
+    """F-002 (MAJOR, same review).
+
+    Reproduced on head cef080b: `_grounds_defect()` verified that a NEEDS_INPUT code's
+    bound boundary ELEMENT had fired and never that the N-1/N-2/N-3 clause the same
+    code DECLARES actually held. So `valid/missing_user_intent.json` -- a code bound to
+    N-2, "required user intent is absent" -- carried no `user_intent_absent` at all. It
+    named the `ambiguity` element and therefore stood up as N-1, the clause a different
+    code rests on, and validation accepted it. `valid/unclassifiable_decision.json`
+    (N-3) never had to claim the item was unclassifiable either. The two fields those
+    fixtures did carry, `no_determining_policy_source` and `no_explicit_authorization`,
+    were read by nothing anywhere in the repository.
+    """
+
+    def test_every_declared_clause_names_the_predicate_that_proves_it(self) -> None:
+        clauses = {c for cs in self.policy.entry_clauses.values() for c in cs}
+        # D4-F guard: three NEEDS_INPUT clauses and three CONFLICT clauses.
+        self.assertEqual(len(clauses), 6)
+        self.assertEqual(set(self.policy.clause_predicates), clauses)
+        for clause, predicate in sorted(self.policy.clause_predicates.items()):
+            with self.subTest(clause=clause):
+                self.assertIn(predicate, ENTRY_PREDICATES)
+
+    def test_a_contract_whose_clause_binding_is_incomplete_does_not_load(self) -> None:
+        for broken in (
+            {},
+            {**self.block["clause_predicates"], "N-2": "no_such_predicate"},
+            {k: v for k, v in self.block["clause_predicates"].items() if k != "N-3"},
+        ):
+            with self.subTest(binding=sorted(broken)):
+                with self.assertRaises(DecisionPolicyError):
+                    parse_decision_policy({**self.block, "clause_predicates": broken})
+
+    def test_n2_requires_the_absence_of_user_intent_to_be_declared(self) -> None:
+        """The reproduction. Removing the N-2 fact leaves a record that still names a
+        triggering `ambiguity` element -- i.e. still establishes N-1 -- and it must now
+        be refused, because N-1 is not the clause this code rests on."""
+        record = load_fixture("valid/missing_user_intent.json")
+        self.assertIs(record["user_intent_absent"], True)
+        for value in (False, None):
+            with self.subTest(user_intent_absent=value):
+                broken = {**record, "user_intent_absent": value}
+                message = error_of(validate_record, self.policy, broken)
+                self.assertIn("N-2", message)
+        stripped = {k: v for k, v in record.items() if k != "user_intent_absent"}
+        self.assertIn("N-2", error_of(validate_record, self.policy, stripped))
+
+    def test_n3_requires_the_item_to_be_declared_unclassifiable(self) -> None:
+        record = load_fixture("valid/unclassifiable_decision.json")
+        self.assertIs(record["unclassifiable"], True)
+        stripped = {k: v for k, v in record.items() if k != "unclassifiable"}
+        self.assertIn("N-3", error_of(validate_record, self.policy, stripped))
+        self.assertIn(
+            "N-3", error_of(validate_record, self.policy, {**record, "unclassifiable": False})
+        )
+
+    def test_n1_requires_a_fired_element_and_no_resolving_authority(self) -> None:
+        """N-1 is "a boundary element is true, is NOT determined by a policy source,
+        and is NOT decided by an explicit authorization". The second and third halves
+        were never checked on the record path."""
+        n1 = sorted(
+            name
+            for name, code in self.policy.reason_codes.items()
+            if code.clause == "N-1"
+        )
+        # D4-F guard: nine of the eleven NEEDS_INPUT codes rest on N-1.
+        self.assertEqual(len(n1), 9)
+        # A4-0 names two elements a determining policy source CANNOT resolve, so for
+        # their codes a determining source is not a defect. Naming them keeps the sweep
+        # honest instead of asserting a blanket rule that has two exceptions.
+        immune = {
+            name
+            for name, code in self.policy.reason_codes.items()
+            if code.boundary_element in self.policy.policy_source_cannot_resolve
+        }
+        self.assertEqual(immune, {"authority_reserved_to_user"})
+        checked = 0
+        for name in n1:
+            with self.subTest(reason_code=name):
+                record = load_fixture(f"valid/{name}.json")
+                validate_record(self.policy, record)
+                authorized = {**record, "user_decision": complete_decision()}
+                self.assertIn("N-1", error_of(validate_record, self.policy, authorized))
+                determined = {**record, "policy_source": determining_source()}
+                message = error_of(validate_record, self.policy, determined)
+                if name in immune:
+                    self.assertEqual(message, "")
+                else:
+                    self.assertIn("N-1", message)
+                checked += 1
+        self.assertEqual(checked, 9)
+
+    def test_facts_of_another_clause_do_not_establish_this_one(self) -> None:
+        """The cross-clause probe: each pause code is offered the facts of a DIFFERENT
+        clause and must refuse them."""
+        cases = (
+            ("missing_user_intent", "N-2", {"unclassifiable": True}),
+            ("unclassifiable_decision", "N-3", {"user_intent_absent": True}),
+            ("unclassifiable_decision", "N-3", {"security": True}),
+        )
+        for name, clause, foreign in cases:
+            with self.subTest(reason_code=name, foreign=sorted(foreign)):
+                record = load_fixture(f"valid/{name}.json")
+                own = self.policy.clause_predicates[clause]
+                borrowed = {
+                    k: v
+                    for k, v in record.items()
+                    if k not in ("user_intent_absent", "unclassifiable")
+                }
+                borrowed.update(foreign)
+                message = error_of(validate_record, self.policy, borrowed)
+                self.assertIn(clause, message)
+                self.assertIn(own, message)
+
+    def test_a_conflict_record_may_not_borrow_another_clause(self) -> None:
+        for name, code in sorted(self.policy.reason_codes.items()):
+            if code.state != "CONFLICT":
+                continue
+            with self.subTest(reason_code=name):
+                record = load_fixture(f"valid/{name}.json")
+                validate_record(self.policy, record)
+                other = next(
+                    c for c in self.policy.entry_clauses["CONFLICT"] if c != code.clause
+                )
+                self.assertNotEqual(
+                    error_of(
+                        validate_record, self.policy, {**record, "conflict_clause": other}
+                    ),
+                    "",
+                )
+
+    def test_every_clause_has_a_valid_positive_fixture(self) -> None:
+        """POSITIVE CONTROL for all six clauses: refusing every pause record would
+        satisfy the sweeps above, and must not satisfy this."""
+        by_clause: dict[str, list[str]] = {}
+        for name, code in self.policy.reason_codes.items():
+            if code.clause is not None:
+                by_clause.setdefault(code.clause, []).append(name)
+        # D4-F guard: every declared clause is represented.
+        self.assertEqual(
+            set(by_clause), set(self.policy.clause_predicates)
+        )
+        checked = 0
+        for clause, names in sorted(by_clause.items()):
+            for name in sorted(names):
+                with self.subTest(clause=clause, reason_code=name):
+                    record = load_fixture(f"valid/{name}.json")
+                    validate_record(self.policy, record)
+                    checked += 1
+        self.assertEqual(checked, 14)
+
+    def test_the_two_apis_agree_on_every_shipped_record(self) -> None:
+        """Parity, on identical input. `record_facts()` is what makes the inputs
+        identical: a `declared` element named by a reason code and a CONFLICT clause
+        fixed by one are declarations the record makes through the code, and the
+        evaluator could not see either. Measured on a pristine `git archive HEAD`
+        copy of cef080b: SIX of the eighteen shipped valid fixtures -- the two
+        `ambiguity` records, `unclassifiable_decision`, and all three CONFLICT
+        records -- were accepted by validate_record() while permitted_states()
+        returned the EMPTY set for the same mapping. The other twelve declare a
+        boundary value of their own, which is why they did not diverge."""
+        # D4-F guard: one fixture per reason code.
+        self.assertEqual(len(self.policy.reason_codes), EXPECTED_CODE_COUNT)
+        checked = 0
+        for name in sorted(self.policy.reason_codes):
+            with self.subTest(reason_code=name):
+                record = load_fixture(f"valid/{name}.json")
+                validate_record(self.policy, record)
+                self.assertIn(
+                    record["state"],
+                    permitted_states(self.policy, record_facts(self.policy, record)),
+                )
+                checked += 1
+        self.assertEqual(checked, EXPECTED_CODE_COUNT)
+
+    def test_record_facts_never_overrides_what_the_record_declares(self) -> None:
+        """The normalisation must not be able to paper over a contradiction: a record
+        that declares a value keeps it, and the mismatch checks then reject it."""
+        record = load_fixture("valid/ambiguous_requirement.json")
+        self.assertIs(record_facts(self.policy, record)["ambiguity"], True)
+        contradicted = {**record, "ambiguity": False}
+        self.assertIs(record_facts(self.policy, contradicted)["ambiguity"], False)
+        self.assertNotEqual(error_of(validate_record, self.policy, contradicted), "")
+
+        conflict = load_fixture("valid/requirement_contradiction.json")
+        self.assertEqual(record_facts(self.policy, conflict)["conflict_clause"], "C-1")
+        borrowed = {**conflict, "conflict_clause": "C-2"}
+        self.assertEqual(record_facts(self.policy, borrowed)["conflict_clause"], "C-2")
+        self.assertNotEqual(error_of(validate_record, self.policy, borrowed), "")
+
+    def test_no_shipped_fixture_carries_an_unread_evidence_field(self) -> None:
+        """The decorative-field half of F-002. `no_determining_policy_source` and
+        `no_explicit_authorization` sat on eight shipped NEEDS_INPUT fixtures looking
+        like machine-checked evidence; grep found them in no contract, no validator and
+        no test. They asserted exactly what `undetermined_boundary_element` now proves
+        from real evidence, so they are gone rather than newly read -- a second,
+        unchecked way to state the same claim is how a record and its contract drift.
+        """
+        retired = ("no_determining_policy_source", "no_explicit_authorization")
+        for path in sorted(FIXTURES.rglob("*.json")):
+            with self.subTest(fixture=path.relative_to(FIXTURES).as_posix()):
+                text = path.read_text(encoding="utf-8")
+                for field in retired:
+                    self.assertNotIn(field, text)
+        for name in SKILL_NAMES:
+            with self.subTest(skill=name):
+                text = (REPO_ROOT / name / "SKILL.md").read_text(encoding="utf-8")
+                for field in retired:
+                    self.assertNotIn(field, text)
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -4,7 +4,5 @@
   "boundary_element": "security",
   "what_is_missing": "approval of the security-relevant change",
   "why_policy_cannot_decide": "policy cannot accept security risk on the user's behalf",
-  "no_determining_policy_source": true,
-  "no_explicit_authorization": true,
   "security": true
 }
