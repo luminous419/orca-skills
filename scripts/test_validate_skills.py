@@ -337,6 +337,118 @@ class ValidatorRegressionTests(unittest.TestCase):
         )
         self.assert_validator_fails_with("decision policy contract is missing or malformed")
 
+    # ---- FR-1: the transition matrix is pinned BY VALUE ----------------------
+    # C8 compared only the set of `forbidden` cells and C11c only closed-set
+    # membership, so relaxing an authority-requiring edge to the equally legal
+    # "allowed" left the validator green. These two edges carry the contract's
+    # central promise: an unresolved NEEDS_INPUT or CONFLICT cannot continue, and
+    # reaching CLEAR takes a real user decision.
+
+    def test_needs_input_to_clear_relaxed_to_allowed_fails(self) -> None:
+        """FR-1, first required edge. Before C26/C26a this mutation left
+        `Skill validation PASSED` at exit 0."""
+        self.edit_skills(
+            '"NEEDS_INPUT": {"CLEAR": "requires_user_decision",',
+            '"NEEDS_INPUT": {"CLEAR": "allowed",',
+        )
+        self.assert_validator_fails_with(
+            "NEEDS_INPUT -> CLEAR must require a user decision"
+        )
+
+    def test_conflict_to_clear_relaxed_to_allowed_fails(self) -> None:
+        """FR-1, second required edge."""
+        self.edit_skills(
+            '"CONFLICT": {"CLEAR": "requires_user_decision",',
+            '"CONFLICT": {"CLEAR": "allowed",',
+        )
+        self.assert_validator_fails_with(
+            "CONFLICT -> CLEAR must require a user decision"
+        )
+
+    def test_authority_edge_relaxed_to_a_retraction_also_fails(self) -> None:
+        """A subtler relaxation: still not `allowed`, still not a user decision.
+        The named edge check must reject any value that is not
+        `requires_user_decision`, not merely the `allowed` spelling."""
+        self.edit_skills(
+            '"NEEDS_INPUT": {"CLEAR": "requires_user_decision",',
+            '"NEEDS_INPUT": {"CLEAR": "requires_retraction",',
+        )
+        self.assert_validator_fails_with(
+            "NEEDS_INPUT -> CLEAR must require a user decision"
+        )
+
+    def test_assumption_allowed_to_clear_relaxed_fails(self) -> None:
+        """The retraction edge is pinned by the full-matrix check even though it is
+        not an authority edge."""
+        self.edit_skills(
+            '"ASSUMPTION_ALLOWED": {"CLEAR": "requires_retraction",',
+            '"ASSUMPTION_ALLOWED": {"CLEAR": "allowed",',
+        )
+        self.assert_validator_fails_with("the transition matrix drifted")
+
+    def test_a_permissive_cell_tightened_to_forbidden_also_fails(self) -> None:
+        """The matrix is pinned in both directions. Silently forbidding a legal edge
+        is drift too -- over-restriction is the mirror defect of relaxation."""
+        self.edit_skills(
+            '"CLEAR": {"CLEAR": "allowed", "ASSUMPTION_ALLOWED": "allowed",',
+            '"CLEAR": {"CLEAR": "allowed", "ASSUMPTION_ALLOWED": "forbidden",',
+        )
+        self.assert_validator_fails_with("the transition matrix drifted")
+
+    # ---- FR-1 sweep: four more keys checked only by name or membership --------
+
+    def test_boundary_element_enum_values_emptied_fails(self) -> None:
+        """`reversibility` kept its name while losing every value it can take."""
+        self.edit_skills(
+            '"values": ["reversible_in_run", "reversible_with_effort", "irreversible"]',
+            '"values": []',
+        )
+        self.assert_validator_fails_with("boundary element specifications drifted")
+
+    def test_blast_radius_dropping_the_out_of_scope_values_fails(self) -> None:
+        """INV-4's blast-radius clause names `repository` and `external_system`;
+        removing them from the element would make that clause unreachable."""
+        self.edit_skills(
+            '"values": ["current_change", "module", "repository", "external_system"]',
+            '"values": ["current_change", "module"]',
+        )
+        self.assert_validator_fails_with("boundary element specifications drifted")
+
+    def test_conflict_citation_minimum_on_the_element_lowered_fails(self) -> None:
+        """A second citation minimum lives on the boundary element; lowering it there
+        was invisible even though C20 pins the one in `citation_minimum`."""
+        self.edit_skills(
+            '"explicit_requirement_conflict": {"kind": "citations", "minimum": 2}',
+            '"explicit_requirement_conflict": {"kind": "citations", "minimum": 1}',
+        )
+        self.assert_validator_fails_with("boundary element specifications drifted")
+
+    def test_policy_source_roles_dropping_supports_fails(self) -> None:
+        """INV-3 requires the role `supports`; removing it from the contract would
+        make ASSUMPTION_ALLOWED unreachable."""
+        self.edit_skills(
+            '"policy_source_roles": ["determines", "supports"]',
+            '"policy_source_roles": ["determines"]',
+        )
+        self.assert_validator_fails_with("policy source roles or kinds drifted")
+
+    def test_policy_source_kinds_widened_fails(self) -> None:
+        """Admitting a new evidence kind is a contract change, not a free extension."""
+        self.edit_skills(
+            '"policy_source_kinds": ["file_path"',
+            '"policy_source_kinds": ["model_hunch", "file_path"',
+        )
+        self.assert_validator_fails_with("policy source roles or kinds drifted")
+
+    def test_state_scope_reversed_fails(self) -> None:
+        """OQ-1 settled on per-item states with a derived aggregate; reverting to
+        per-check would make the downstream rule undefinable."""
+        self.edit_skills(
+            '"state_scope": "per_decision_item_with_derived_check_aggregate"',
+            '"state_scope": "per_check_only"',
+        )
+        self.assert_validator_fails_with("decision state scope drifted")
+
     def test_valid_repository_passes(self) -> None:
         result = self.run_validator()
 

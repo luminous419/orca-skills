@@ -466,6 +466,68 @@ DECISION_POLICY_STATES = {
     "NEEDS_INPUT": ("pause_and_ask", True, True),
     "CONFLICT": ("pause_and_request_resolution", True, True),
 }
+# FR-1: the full 4x4 matrix, pinned BY VALUE. C8 compared only the set of cells whose
+# value is "forbidden" and C11c only closed-set membership, so both Skills'
+# NEEDS_INPUT -> CLEAR could be relaxed from requires_user_decision to the equally
+# legal "allowed" and the validator stayed green at 626 checks. Reproduced on a
+# disposable `git archive HEAD` copy before this constant existed. Membership in a
+# closed set is not the same as a correct value -- the same lesson C15-C23 applied to
+# the state semantics, now applied to the edges.
+DECISION_POLICY_TRANSITIONS = {
+    ("CLEAR", "CLEAR"): "allowed",
+    ("CLEAR", "ASSUMPTION_ALLOWED"): "allowed",
+    ("CLEAR", "NEEDS_INPUT"): "allowed",
+    ("CLEAR", "CONFLICT"): "allowed",
+    ("ASSUMPTION_ALLOWED", "CLEAR"): "requires_retraction",
+    ("ASSUMPTION_ALLOWED", "ASSUMPTION_ALLOWED"): "allowed",
+    ("ASSUMPTION_ALLOWED", "NEEDS_INPUT"): "allowed",
+    ("ASSUMPTION_ALLOWED", "CONFLICT"): "allowed",
+    ("NEEDS_INPUT", "CLEAR"): "requires_user_decision",
+    ("NEEDS_INPUT", "ASSUMPTION_ALLOWED"): "forbidden",
+    ("NEEDS_INPUT", "NEEDS_INPUT"): "allowed",
+    ("NEEDS_INPUT", "CONFLICT"): "allowed",
+    ("CONFLICT", "CLEAR"): "requires_user_decision",
+    ("CONFLICT", "ASSUMPTION_ALLOWED"): "forbidden",
+    ("CONFLICT", "NEEDS_INPUT"): "allowed",
+    ("CONFLICT", "CONFLICT"): "allowed",
+}
+# The two edges that carry the authority boundary. Named separately so a failure says
+# which promise broke, not merely that a table drifted.
+DECISION_POLICY_AUTHORITY_EDGES = {
+    ("NEEDS_INPUT", "CLEAR"),
+    ("CONFLICT", "CLEAR"),
+}
+# Found by the same-shape sweep FR-1 prompted: these four keys were also checked only
+# for names or membership, never for value. Each mutation below passed every check.
+DECISION_POLICY_BOUNDARY_ELEMENT_SPECS = {
+    "ambiguity": ("declared", (), None),
+    "explicit_requirement_conflict": ("citations", (), 2),
+    "reversibility": (
+        "enum",
+        ("reversible_in_run", "reversible_with_effort", "irreversible"),
+        None,
+    ),
+    "blast_radius": (
+        "enum",
+        ("current_change", "module", "repository", "external_system"),
+        None,
+    ),
+    "monetary_cost": ("boolean", (), None),
+    "security": ("boolean", (), None),
+    "privacy": ("boolean", (), None),
+    "compliance": ("boolean", (), None),
+    "long_term_lock_in": ("boolean", (), None),
+    "repository_project_policy": ("policy_source", (), None),
+    "explicit_user_authority": ("user_decision", (), None),
+}
+DECISION_POLICY_SOURCE_ROLES = ("determines", "supports")
+DECISION_POLICY_SOURCE_KINDS = (
+    "file_path",
+    "requirement_id",
+    "quality_attribute_id",
+    "phase_contract_section",
+)
+DECISION_POLICY_STATE_SCOPE = "per_decision_item_with_derived_check_aggregate"
 DECISION_POLICY_AGGREGATE_ORDER = (
     "CONFLICT",
     "NEEDS_INPUT",
@@ -2202,6 +2264,35 @@ def validate_decision_policy_contract(validation: Validation) -> None:
         validation.check(  # C16
             policy.aggregate_order == DECISION_POLICY_AGGREGATE_ORDER,
             f"{name}: decision policy aggregate order drifted",
+        )
+        validation.check(  # C26
+            dict(policy.transitions) == DECISION_POLICY_TRANSITIONS,
+            f"{name}: the transition matrix drifted -- every cell is pinned by value, "
+            "not merely by closed-set membership",
+        )
+        for edge in sorted(DECISION_POLICY_AUTHORITY_EDGES):  # C26a
+            validation.check(
+                policy.transitions.get(edge) == "requires_user_decision",
+                f"{name}: {edge[0]} -> {edge[1]} must require a user decision; "
+                f"found {policy.transitions.get(edge)!r}",
+            )
+        observed_elements = {
+            element: (spec.kind, tuple(spec.values), spec.minimum)
+            for element, spec in policy.boundary_elements.items()
+        }
+        validation.check(  # C27
+            observed_elements == DECISION_POLICY_BOUNDARY_ELEMENT_SPECS,
+            f"{name}: boundary element specifications drifted "
+            "(kind / enum values / minimum)",
+        )
+        validation.check(  # C28
+            policy.policy_source_roles == DECISION_POLICY_SOURCE_ROLES
+            and policy.policy_source_kinds == DECISION_POLICY_SOURCE_KINDS,
+            f"{name}: policy source roles or kinds drifted",
+        )
+        validation.check(  # C29
+            policy.state_scope == DECISION_POLICY_STATE_SCOPE,
+            f"{name}: decision state scope drifted",
         )
         validation.check(  # C17
             dict(policy.assumption_allowed_forbidden_when)
