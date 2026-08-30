@@ -177,4 +177,31 @@ REVIEW_VERDICT: PASS | PASS WITH NOTES | FAIL | BLOCKED
 ## Test Review
 ## Evidence Checked
 ## Final Decision
+## Decision Record (optional)
 ```
+
+### Decision Record (optional)
+
+`## Decision Record`는 **optional section이다. 없어도 계약 위반이 아니다.** 이번 phase에서
+자동으로 내린 결정이나 사용자 결정이 필요한 항목이 있을 때만 적는다. 적을 때는 SKILL.md의
+`decision_policy` 계약이 정한 형식을 따른다.
+
+```text
+DECISION_STATE: CLEAR | ASSUMPTION_ALLOWED | NEEDS_INPUT | CONFLICT
+REASON_CODE: <closed set; none for CLEAR>
+EVIDENCE: fields required by the state
+```
+
+- `CLEAR` 외 세 state는 `REASON_CODE` 없이 쓸 수 없다.
+- `NEEDS_INPUT` / `CONFLICT`는 진행하지 않고 멈춘다.
+- 답변을 받은 항목은 `CLEAR`가 되며 `ASSUMPTION_ALLOWED`가 되지 않는다.
+- 모델 확신, Worker/Reviewer 합의, 권고 default, timeout, 무응답은 사용자 권한의 근거가 아니다.
+
+Decision Record가 **존재할 때만** 아래를 판정한다. 섹션이 없는 것은 finding이 아니다.
+
+- state가 네 개 vocabulary 안에 있는가.
+- `CLEAR` 외 세 state에 closed set의 `REASON_CODE`가 있는가.
+- 그 state가 요구하는 evidence 필드가 모두 채워져 있는가.
+- 오분류 판정: `ASSUMPTION_ALLOWED`인데 되돌릴 수 없거나 monetary/security/privacy/
+  compliance/lock-in 중 하나가 참이면 INV-4 위반이다. `NEEDS_INPUT` / `CONFLICT`에서
+  `ASSUMPTION_ALLOWED`로 간 항목이 있으면 그 자체가 위반이다.
