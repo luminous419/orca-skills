@@ -3309,9 +3309,10 @@ class F002AReasonCodesClauseMustBeProven(DecisionPolicyTestCase):
 
     def test_no_shipped_fixture_carries_an_unread_evidence_field(self) -> None:
         """The decorative-field half of F-002. `no_determining_policy_source` and
-        `no_explicit_authorization` sat on eight shipped NEEDS_INPUT fixtures looking
-        like machine-checked evidence; grep found them in no contract, no validator and
-        no test. They asserted exactly what `undetermined_boundary_element` now proves
+        `no_explicit_authorization` sat on TEN shipped NEEDS_INPUT fixtures -- every
+        one that binds a boundary element; only `unclassifiable_decision`, which binds
+        none, was without them -- looking like machine-checked evidence. grep found
+        them in no contract, no validator and no test. They asserted exactly what `undetermined_boundary_element` now proves
         from real evidence, so they are gone rather than newly read -- a second,
         unchecked way to state the same claim is how a record and its contract drift.
         """
