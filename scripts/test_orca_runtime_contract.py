@@ -7924,6 +7924,82 @@ class DecisionGateLiveDispatchTests(unittest.TestCase):
             decision_gate.block_reason("CONFLICT", "requirement_contradiction"),
             self.orchestrator_log(harness),
         )
+    def test_p6b_row_5_a_stricter_live_verification_carries_the_reviewers_own_state(
+        self,
+    ) -> None:
+        """P6b ROW 5 on the LIVE path: a verification may move toward more blocking.
+
+        The contract half and the deterministic half of this row already exist
+        (`test_decision_gate.VerificationTests.test_a_stricter_verification_carries_
+        the_reviewers_own_state` and `test_e2e_harness.test_p6b_row_5_a_stricter_
+        verification_carries_the_reviewers_own_state`). The LIVE half became
+        reachable only once Final Adversarial Review F-001 was resolved, because
+        before that no live Reviewer could be admitted past an open blocking head at
+        all. That fix brought live cases for rows 2, 4, 6 and 7; row 5 is the one it
+        left without one, and this is it.
+
+        The Worker classifies NEEDS_INPUT and the Reviewer verifies it as CONFLICT,
+        so the terminal must carry the REVIEWER's state and code. The CONTROL at the
+        end differs in exactly one field -- the Reviewer CONFIRMS instead -- and
+        carries the WORKER's code, so "stricter" is a real branch rather than a
+        constant this assertion would pass against either way.
+        """
+        harness, recorder = self.verification_harness()
+        worker_key = self.settle_blocking_worker(harness, recorder, "NEEDS_INPUT")
+        recorder.body = self.reviewer_body("CONFLICT", worker_key)
+
+        harness.run_existing_task(
+            "reviewer", 1, "fail", "task_g", phase="implementation",
+            verifies=worker_key,
+        )
+
+        records = self.ledger()
+        self.assertEqual(records[2]["boundary"], "B3")
+        self.assertEqual(records[2]["state"], "CONFLICT")
+        self.assertEqual(records[2]["verifies"]["worker_record_key"], worker_key)
+        stricter_log = self.orchestrator_log(harness)
+        self.assertIn(
+            decision_gate.block_reason("CONFLICT", "requirement_contradiction"),
+            stricter_log,
+        )
+        self.assertNotIn(
+            decision_gate.block_reason("NEEDS_INPUT", "blast_radius_beyond_scope"),
+            stricter_log,
+        )
+        # ...and row 5 is as TERMINAL as row 4, in fact MORE so: the Worker's item is
+        # still open -- open_items() lets no `verifies`-bearing record resolve
+        # anything -- and the Reviewer's own stricter classification is a second open
+        # item beside it. The correction Worker a resolution would release is refused.
+        self.assertEqual(
+            decision_gate.open_items(harness._decision_policy, records),
+            {worker_key, decision_gate.ledger_key(records[2])},
+        )
+        self.assert_refused(
+            harness, recorder, role="worker", iteration=2, mode="correction",
+            task_id="task_g", phase="implementation",
+        )
+
+        # ---- CONTROL, in this same test: one field different, the other branch.
+        with tempfile.TemporaryDirectory() as control_directory:
+            self.artifact_dir = Path(control_directory)
+            control, control_recorder = self.verification_harness()
+            control_key = self.settle_blocking_worker(
+                control, control_recorder, "NEEDS_INPUT"
+            )
+            control_recorder.body = self.reviewer_body("NEEDS_INPUT", control_key)
+            control.run_existing_task(
+                "reviewer", 1, "fail", "task_g", phase="implementation",
+                verifies=control_key,
+            )
+            control_log = self.orchestrator_log(control)
+        self.assertIn(
+            decision_gate.block_reason("NEEDS_INPUT", "blast_radius_beyond_scope"),
+            control_log,
+        )
+        self.assertNotIn(
+            decision_gate.block_reason("CONFLICT", "requirement_contradiction"),
+            control_log,
+        )
 
     def test_every_other_dispatch_after_a_blocking_worker_stays_refused(self) -> None:
         """NEGATIVES at B1, against the SAME ledger the positive admits.

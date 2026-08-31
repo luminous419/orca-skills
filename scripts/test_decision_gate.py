@@ -867,9 +867,11 @@ class RiskIndependenceTests(PolicyMixin):
     GATE_FUNCTIONS = (
         "parse_gate_result",
         "parse_declared_state",
+        "declares_gate_result",
         "validate_gate_record",
         "validate_ledger_record",
         "admit_head",
+        "verification_admission_defect",
         "evaluate_verification",
         "verification_binding_defect",
         "open_items",
@@ -894,6 +896,38 @@ class RiskIndependenceTests(PolicyMixin):
         self.assertIn(
             "policy", set(inspect.signature(decision_gate.admit_head).parameters)
         )
+
+    def test_the_gate_function_list_is_every_public_function_in_the_module(
+        self,
+    ) -> None:
+        """The closed list above must not silently fall behind the module.
+
+        TEST iteration 3. `GATE_FUNCTIONS` is hand-written, so scenario 7's structural
+        claim -- "no gate function takes a risk or profile parameter" -- is only as
+        wide as whoever last edited it. Final Review F-001's fix added
+        `verification_admission_defect()`, a new decision-authority function, and the
+        list did not gain it: the assertion above was still green while the newest
+        gate function went uninspected. This guard makes the next such addition a
+        FAILURE here rather than a silent narrowing.
+        """
+        public = {
+            name
+            for name, value in vars(decision_gate).items()
+            if inspect.isfunction(value)
+            and not name.startswith("_")
+            and value.__module__ == decision_gate.__name__
+        }
+
+        self.assertEqual(public, set(self.GATE_FUNCTIONS))
+        # CONTROLS, so the equality above is a fact about the module and not about an
+        # empty or over-wide set: the enumeration really found functions; the private
+        # helpers are excluded; and `validate_transition`, which decision_gate imports
+        # from decision_policy and calls, is visible in the module namespace but is
+        # correctly NOT claimed as one of this module's own gate functions.
+        self.assertGreaterEqual(len(public), 13)
+        self.assertNotIn("_closed_field_defect", public)
+        self.assertIn("validate_transition", vars(decision_gate))
+        self.assertNotIn("validate_transition", public)
 
     def test_the_module_source_never_branches_on_a_risk_level(self) -> None:
         source = (REPO_ROOT / "scripts" / "decision_gate.py").read_text(
