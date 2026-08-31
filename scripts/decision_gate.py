@@ -232,6 +232,31 @@ class GateOutcome:
     block: tuple[str, str | None]
 
 
+@dataclass(frozen=True)
+class VerificationDispatch:
+    """The ONE dispatch an open blocking head may admit, described on every axis.
+
+    `DECISION_GATE_REVIEWER_PARTICIPATION = already_scheduled_reviewer_in_verification_mode`
+    is a permission with five bindings, not a role check. This record carries all of
+    them so verification_admission_defect() can refuse on each one separately and a
+    caller cannot obtain the exception by asserting a role:
+
+    * `role`      -- exactly `"reviewer"`. Not `"final_reviewer"`, not a Worker.
+    * `phase`     -- the SAME phase as the head Worker record.
+    * `iteration` -- the SAME iteration as the head Worker record.
+    * `verifies`  -- the head Worker record's own ledger key, required and matched.
+
+    It is NOT an admission by itself: admit_head() still evaluates A1-A4, A3 and A6
+    unchanged, and the exception replaces only A5's refusal, only when the head is
+    that Worker's own open B2 blocking record and nothing else in the ledger is open.
+    """
+
+    role: str
+    phase: str
+    iteration: int
+    verifies: str | None
+
+
 def block_reason(state: str, reason_code: str | None) -> str:
     """`DECISION_BLOCKED:<STATE>:<reason_code>` -- the ninth refusal shape."""
     return f"{BLOCK_REASON_PREFIX}:{state}:{reason_code}"
@@ -467,6 +492,15 @@ def open_items(policy: DecisionPolicy, records: Sequence[Mapping[str, Any]]) -> 
                 # -- agreement would become resolution, which is exactly what the
                 # decision contract forbids.
                 continue
+            if later.get("verifies") is not None:
+                # A B3-V VERIFICATION record resolves nothing either, whatever state
+                # it carries. L6 makes every verification terminal: an accepted
+                # downgrade is RECORDED and still blocks, because acting on it would
+                # be resume -- which is OS-31, not OS-29. Without this clause a
+                # Reviewer whose downgrade passes validate_transition() would close
+                # the Worker's item and re-admit the correction Worker and the next
+                # phase, which is the illegal-dispatch hole this ticket closes.
+                continue
             try:
                 validate_transition(policy, str(item["state"]), str(later["state"]), later)
             except DecisionPolicyError:
@@ -476,12 +510,75 @@ def open_items(policy: DecisionPolicy, records: Sequence[Mapping[str, Any]]) -> 
     return set(opened) - resolved
 
 
+def verification_admission_defect(
+    records: Sequence[Mapping[str, Any]],
+    head: Mapping[str, Any],
+    still_open: set[str],
+    dispatch: VerificationDispatch,
+    *,
+    run_id: str,
+) -> str | None:
+    """Is THIS dispatch the one Reviewer an open blocking head may admit? P6b row 2.
+
+    Returns None when it is, and a detail string naming the FIRST unmet binding when
+    it is not. Every clause is a conjunct: the exception exists only when all of them
+    hold at once, which is what keeps it from re-opening the illegal-dispatch hole.
+
+    Conjuncts, in the order they are reported:
+
+    1. the caller is the `reviewer` role -- a Worker (correction or otherwise) and a
+       `final_reviewer` are both excluded by exact match, not by prefix or suffix;
+    2. the head Worker record is the ONLY thing still open, so a second, older
+       unresolved item can never be dispatched past;
+    3. the head is a Worker's own B2 record, in an open blocking state;
+    4. that record binds this same run, phase and iteration -- a Reviewer of another
+       phase or another iteration is not the already-scheduled one;
+    5. the dispatch carries a `verifies` binding, and it is that record's key. An
+       UNBOUND verification is refused here, before dispatch, exactly as an unbound
+       verification RECORD is refused at B3-V afterwards;
+    6. no record in the ledger already verifies that key, so exactly ONE such
+       dispatch can ever be admitted for one Worker classification.
+    """
+    if dispatch.role != "reviewer":
+        return (
+            f"role {dispatch.role!r} is not the already-scheduled current-phase "
+            "Reviewer"
+        )
+    key = ledger_key(head)
+    if still_open != {key}:
+        return (
+            f"the open items {sorted(still_open)} are not exactly the head {key!r}"
+        )
+    if (
+        head.get("source") != "worker"
+        or head.get("role") != "worker"
+        or head.get("boundary") != "B2"
+    ):
+        return f"head {key} is not a Worker B2 record"
+    if head.get("state") not in BLOCKING_STATES or head.get("open_decision_item") is not True:
+        return f"head {key} is not an open blocking classification"
+    bound = (head.get("run"), head.get("phase"), head.get("iteration"))
+    expected = (run_id, dispatch.phase, dispatch.iteration)
+    if bound != expected:
+        return f"head binds {bound}, this dispatch is {expected}"
+    if dispatch.verifies is None:
+        return "the verification dispatch carries no `verifies` binding"
+    if dispatch.verifies != key:
+        return f"the dispatch verifies {dispatch.verifies!r}, expected {key!r}"
+    for record in records:
+        verifies = record.get("verifies")
+        if isinstance(verifies, dict) and verifies.get("worker_record_key") == key:
+            return f"{ledger_key(record)} already verified {key}"
+    return None
+
+
 def admit_head(
     policy: DecisionPolicy,
     records: Sequence[Mapping[str, Any]],
     *,
     run_id: str,
     expected_settled_round: tuple[str, str, int] | None,
+    verification: VerificationDispatch | None = None,
 ) -> Mapping[str, Any]:
     """A1-A6. Returns the admitted head record, or raises GateRefusal.
 
@@ -497,6 +594,14 @@ def admit_head(
     declaration that disagrees with the ledger is named as a producer defect rather
     than hidden behind the block it failed to declare. No ordering changes any
     OUTCOME: all six refusals are terminal and none can yield a CLEAR.
+
+    `verification` is the caller's description of the dispatch it is about to make,
+    and it is OMITTED by every caller that is not offering one. It can relax A5 and
+    NOTHING else: A1, A2, A4, A3 and A6 are evaluated identically either way, and
+    even at A5 it admits only the single Reviewer dispatch
+    verification_admission_defect() accepts on all six of its conjuncts. When it is
+    None -- the default, and therefore the behaviour of every pre-existing caller --
+    A5 refuses every open item exactly as before.
     """
     ordered = sorted(records, key=lambda record: record.get("sequence", 0))
 
@@ -565,20 +670,56 @@ def admit_head(
         policy, [record for record in ordered if record is not run_entry]
     )
     if declared != recomputed:
-        raise GateRefusal(
-            DECLARATION_DISAGREES_WITH_LEDGER,
-            f"declared={sorted(declared)} recomputed={sorted(recomputed)}",
+        # The run-entry declaration is written once, at run open, and states what was
+        # open AT RUN ENTRY; the ledger is append-only, so an item THIS RUN opened
+        # makes it disagree from then on. Every ordinary caller is refused for that,
+        # which is correct -- the round is terminal. The one permitted exception has
+        # to survive here as well as at A5, or the current-phase verification review
+        # would be unreachable in a real run: the Worker's own B2 record is always
+        # the disagreement at the moment the Reviewer is dispatched (Final
+        # Adversarial Review F-001).
+        #
+        # It is the SAME predicate on the SAME head, and it narrows A6 by one more
+        # conjunct than A5: the ENTIRE disagreement must be that head record, and the
+        # declaration may only UNDERSTATE it. A declaration claiming an item that is
+        # not open, or a second open item alongside the head, is still the producer
+        # defect A6 exists to name.
+        admissible = (
+            verification is not None
+            and declared <= recomputed
+            and verification_admission_defect(
+                ordered, head, recomputed, verification, run_id=run_id
+            )
+            is None
         )
+        if not admissible:
+            raise GateRefusal(
+                DECLARATION_DISAGREES_WITH_LEDGER,
+                f"declared={sorted(declared)} recomputed={sorted(recomputed)}",
+            )
 
-    # ---- A5: no unresolved open blocking item anywhere in the ledger.
+    # ---- A5: no unresolved open blocking item anywhere in the ledger, with the ONE
+    # bound exception P6b row 2 requires -- the already-scheduled current-phase
+    # Reviewer, in verification mode, bound to THIS head Worker record. The exception
+    # is evaluated here and only here: it changes which dispatch A5 admits, never
+    # what the block says, never whether the round is terminal, and never whether the
+    # item is resolved (open_items() refuses to let a verification resolve anything).
     still_open = open_items(policy, ordered)
     if still_open:
         blocker = next(
             record for record in ordered if ledger_key(record) in still_open
         )
+        detail = f"open at {ledger_key(blocker)}"
+        if verification is not None:
+            defect = verification_admission_defect(
+                ordered, head, still_open, verification, run_id=run_id
+            )
+            if defect is None:
+                return head
+            detail = f"{detail}; verification refused: {defect}"
         raise GateRefusal(
             block_reason(str(blocker.get("state")), blocker.get("reason_code")),
-            f"open at {ledger_key(blocker)}",
+            detail,
         )
 
     return head

@@ -3,12 +3,16 @@
 STATUS: COMPLETE
 UNIT_TEST_STATUS: PASS
 
-Run: run_35b221ea299d · Phase: implementation · Iteration: 3 · Role: worker
+Run: run_35b221ea299d · Phase: implementation · Iteration: 4 · Role: worker
 Branch: os-29-continuous-decision-gates (base main @ b13f191)
 Ticket: OS-29 "Add Continuous Decision and Escalation Gates to Every Phase"
 Approved input: `ANALYSIS.md`, `PLAN.md`, `DESIGN.md` — all PASSED their gates and **none is
 modified by this phase**. The approved PLAN and the explicit requirement are the specification
 implemented here; where DESIGN's prose is narrower than either, they govern (see *Iteration 3*).
+Correction input (iteration 4): `FINAL_REVIEW.md` — **RESULT: FAIL**, one blocking finding
+**F-001**, a G1 explicit-requirement violation whose Responsible Phase is implementation: the live
+pre-dispatch gate refused the PERMITTED current-phase verification Reviewer. `TEST.md` and every
+`REVIEW_*.md` are read-only here and are not modified.
 Correction input (iteration 3): `REVIEW_IMPLEMENTATION_iteration2.md` — **RESULT: FAIL**, one
 blocking finding **F-003**, a G1 explicit-requirement violation at the Final Review after-result
 boundary. F-001 and F-002 were verified **RESOLVED** at iteration 2 and are neither reopened nor
@@ -18,7 +22,77 @@ Correction input (iteration 2): `REVIEW_IMPLEMENTATION.md` — **RESULT: FAIL**,
 
 Every command output quoted below was executed on this branch during this phase. Nothing is
 inherited from an earlier phase's artifact. **Iteration 1 is commit `5e1a6cb`; iteration 2 is commit
-`0745a4d`; iteration 3 is a new commit on top of both — nothing was amended, rebased or pushed.**
+`0745a4d`; iteration 3 is commit `f072b4f`; iteration 4 is a new commit on top of all of them —
+nothing was amended, rebased or pushed.**
+
+---
+
+## Iteration 4 — the live B3-V verification exception (read this first)
+
+The Final Adversarial Review FAILED the run on one G1 finding, and it was right.
+
+**FINAL_REVIEW F-001 — RESOLVED.** The permitted transition is *"only the already-scheduled
+current-phase Reviewer may verify a decision classification"* — the Skill's own
+`DECISION_GATE_REVIEWER_PARTICIPATION = already_scheduled_reviewer_in_verification_mode`, and P6b
+row 2. The deterministic `E2EHarness.run()` implemented it; the live `OrcaRuntimeHarness` did not.
+`_b1_guard()` described the dispatch to the gate as **nothing at all** — no role, no phase identity,
+no verification binding — so `admit_head()` applied A5 to one anonymous caller and refused the
+verification Reviewer with the same `DECISION_BLOCKED:*` it owes a correction Worker or the next
+phase. Its green deterministic scenario coverage masked the live divergence exactly as the reviewer
+said.
+
+**What the fix is, and what it deliberately is not.** `admit_head()` is **not** loosened generally
+and no caller is admitted on the strength of a `role` string. The dispatch is now *described* to the
+gate as a `decision_gate.VerificationDispatch(role, phase, iteration, verifies)`, and the gate
+decides. The parameter defaults to `None` at every existing call site, so every ordinary caller is
+gated byte-for-byte as before. When it is supplied, `verification_admission_defect()` must accept it
+on **six conjuncts at once**:
+
+| # | Conjunct | What it stops |
+|---|---|---|
+| 1 | `role == "reviewer"` exactly | a correction Worker, and `final_reviewer` — matched exactly, not by suffix |
+| 2 | the still-open set is **exactly** the head | a dispatch past a second, older unresolved item |
+| 3 | the head is a Worker's own **open blocking B2** record | a SECOND Reviewer (the head is then a B3 record) |
+| 4 | the head binds this same run **and phase and iteration** | another phase's or another iteration's Reviewer |
+| 5 | `verifies` is present **and equals that record's key** | an UNBOUND verification, and one bound elsewhere |
+| 6 | no record already verifies that key | more than one verification of one classification |
+
+**Why the exception also had to be honoured at A6.** The run-entry declaration is written once, at
+run open, and always claims `prior_open_decision_items: []`; the ledger is append-only, so the item
+the run itself just opened makes A6 disagree from that moment on — and **A6 precedes A5**. A live
+reproduction confirmed this: with the ledger staged the way a real run stages it (a real Worker
+dispatch settling a `NEEDS_INPUT` body, *not* a hand-edited sequence-0 record), the Reviewer was
+refused at A6 before A5 was ever reached. An exception that lived only at A5 would therefore have
+been unreachable in production — the same class of defect the finding names. A6 now honours the
+**same predicate on the same head**, narrowed by one further conjunct: the *entire* disagreement
+must be that head record, and the declaration may only **understate** it. A declaration that
+overclaims, or a second open item alongside the head, is still the producer defect A6 exists to
+name. F-001's own reproduction had to hand-edit the declaration to reach A5; this implementation
+does not require that, and the new tests do not do it.
+
+**Terminality is enforced, not asserted.** `open_items()` now refuses to let a record carrying a
+`verifies` reference resolve anything, whatever state it carries. L6 already said an accepted
+downgrade is *recorded and still terminal* because acting on it would be resume (OS-31); without
+this clause a Reviewer whose `NEEDS_INPUT -> CLEAR` passed `validate_transition()` would have closed
+the Worker's item and re-admitted the correction Worker and the next phase — the illegal-dispatch
+hole this ticket exists to close. Downgrades are still decided **solely** by
+`decision_policy.validate_transition()`; OS-29 adds no downgrade rule of its own.
+
+**Admission is not acceptance.** B1 admits the dispatch because the Coordinator bound it; the
+*result* is then checked against that binding at B3-V through the **same**
+`decision_gate.verification_binding_defect()` the deterministic harness calls, and the terminal is
+computed by the **same** `decision_gate.evaluate_verification()`. A Reviewer that comes back unbound
+publishes no record and is named `DECISION_GATE_INPUT_UNBOUND`, never a silent fall-back to the
+Worker's classification. The mirror image is enforced too: a `verifies` claim outside verification
+mode — from a Worker, or from a normal-mode Reviewer — is unbound rather than extra evidence.
+
+**The exception has exactly one entry point.** `observe_unexpected_exit()` takes no `verifies`
+parameter and must not gain one: a recovery dispatch after a non-response is not the
+already-scheduled Reviewer verifying a classification. A test pins that signature.
+
+**No correction iteration is charged and no round is added.** The verification uses the dispatch the
+Coordinator had already scheduled; the ledger after it holds the two boundary records and nothing
+else, and no third `worker-start` ever happens.
 
 ---
 
@@ -155,7 +229,12 @@ The whole feature is nine things:
    branch that already exists.
 4. **`gate_attempts()` keyed on `decision_block` (W-6)** — one edit covering both terminal shapes.
 5. **The live-path B1 guard before `start_worker` (C4)**, plus the ledger record and the two columns
-   at `_log_attempt`.
+   at `_log_attempt`. **(iteration 4)** That guard now *describes* the dispatch it is about to make —
+   role, phase, iteration and the `verifies` binding — so the gate can admit the ONE dispatch P6b
+   row 2 permits (the already-scheduled current-phase Reviewer, in verification mode) and refuse
+   everything else; the settled result is then bound and evaluated by the same
+   `verification_binding_defect()` / `evaluate_verification()` the deterministic harness uses. The
+   round stays terminal because no `verifies`-bearing record may resolve anything.
 6. **The tenth orchestration-only anchor contract and the mirrored semantics (C5/C6/C7)**, with a
    validator that fails in all three drift directions.
 7. **The `DECISION_GATE_STATE` result contract (C8)** in both Skills, all fourteen templates and both
@@ -429,11 +508,11 @@ Production (C1–C12). Sizes are `git diff --numstat`.
 
 | File | ± | Item |
 | --- | --- | --- |
-| `scripts/decision_gate.py` **(new)** | 650 | C1 |
+| `scripts/decision_gate.py` **(new)** | 650, **+146 / −5 (iteration 4)** | C1 |
 | `scripts/e2e_harness.py` | +539 / −8 | C2 |
 | `scripts/run_logging.py` | +379 / −2 | C3 |
 | `orca-worker-reviewer-orchestration/tools/run_logging.py` | +379 / −2 | **C3b, byte-identical** |
-| `scripts/orca_runtime_harness.py` | +163 / −2 | C4 |
+| `scripts/orca_runtime_harness.py` | +163 / −2, **+197 / −3 (iteration 4)** | C4 |
 | `scripts/validate_skills.py` | +197 | C5 |
 | `orca-worker-reviewer-orchestration/SKILL.md` | +107 / −2 | C6 |
 | `orca-worker-reviewer-loop/SKILL.md` | +18 | C7 |
@@ -570,6 +649,96 @@ deletions are import lines and three capture-helper expressions. Each edit:
 ## Validation
 
 Every command below was run on this branch, in this phase. Output is verbatim.
+
+### Iteration 4 — executed after the FINAL_REVIEW F-001 fix
+
+| Check | Command | Result |
+| --- | --- | --- |
+| Full unittest discovery, **≥ 1600, no deletions** | `python3 -m unittest discover -s scripts -p 'test_*.py'` | `Ran 1613 tests in 316.829s` → `OK (skipped=6)`, exit 0 |
+| Skill validator, **check count above 648** | `python3 scripts/validate_skills.py` | `Skill validation PASSED (697 checks)`, exit 0 |
+| Package verification | `python3 scripts/verify_package.py` | `Package verification PASSED (189 source files)`, exit 0 |
+| Release build | `python3 scripts/build_release.py` | `Built reproducible release archive: dist/orca-skills-0.9.0.tar.gz`, exit 0 |
+| Whitespace | `git diff --check` | clean (no output, exit 0) |
+| **C3b parity** | `diff scripts/run_logging.py orca-worker-reviewer-orchestration/tools/run_logging.py` | byte-identical (no output, exit 0) |
+| Gate unit tests | `python3 -m unittest scripts.test_decision_gate` | `Ran 31 tests` → `OK` |
+| Live runtime tests | `python3 -m unittest scripts.test_orca_runtime_contract.DecisionGateLiveDispatchTests` | `Ran 23 tests` → `OK` |
+| Deterministic harness (unchanged semantics) | `python3 -m unittest scripts.test_e2e_harness` | `Ran 199 tests in 51.7s` → `OK` |
+
+The suite grew **1600 → 1613**: thirteen added, **none deleted or weakened**. Iteration 4 touches
+`scripts/decision_gate.py`, `scripts/orca_runtime_harness.py` and their two test modules only.
+
+#### The direct live-runtime reproduction
+
+The ledger is staged the way a real run stages it — a **real Worker dispatch** settling a
+`NEEDS_INPUT` body — and the sequence-0 declaration is **not** edited. `COMMAND_DELTA` is the number
+of Orca commands the dispatch issued; a refusal must leave no Task, no Dispatch and no terminal.
+
+```text
+staged Worker B2 head: run_live_os29/implementation/1/B2#1 state=NEEDS_INPUT
+run-entry prior_open_decision_items = []   (written once at run open -- NOT hand-edited)
+
+POSITIVE -- the already-scheduled current-phase Reviewer, bound:
+  reviewer/implementation/1 verifies=head    ADMITTED  COMMAND_DELTA 8   worker-start +1  -
+  -> ledger now 3 records; head B3 source=reviewer verifies=run_live_os29/implementation/1/B2#1
+
+NEGATIVES -- one changed binding each, against the SAME ledger:
+  a SECOND Reviewer (same binding)           REFUSED   COMMAND_DELTA 0   worker-start +0  DECISION_GATE_DECLARATION_DISAGREES_WITH_LEDGER
+  a correction Worker                        REFUSED   COMMAND_DELTA 0   worker-start +0  DECISION_GATE_DECLARATION_DISAGREES_WITH_LEDGER
+  the NEXT phase                             REFUSED   COMMAND_DELTA 0   worker-start +0  DECISION_GATE_DECLARATION_DISAGREES_WITH_LEDGER
+  the FINAL REVIEW                           REFUSED   COMMAND_DELTA 0   worker-start +0  DECISION_GATE_DECLARATION_DISAGREES_WITH_LEDGER
+
+NEGATIVES -- before any verification, against the staged Worker head:
+  an UNBOUND Reviewer (no verifies)          REFUSED   COMMAND_DELTA 0   worker-start +0  DECISION_GATE_DECLARATION_DISAGREES_WITH_LEDGER
+  a Reviewer bound ELSEWHERE                 REFUSED   COMMAND_DELTA 0   worker-start +0  DECISION_GATE_DECLARATION_DISAGREES_WITH_LEDGER
+  a Reviewer of another PHASE                REFUSED   COMMAND_DELTA 0   worker-start +0  DECISION_GATE_DECLARATION_DISAGREES_WITH_LEDGER
+  a Reviewer of another ITERATION            REFUSED   COMMAND_DELTA 0   worker-start +0  DECISION_GATE_DECLARATION_DISAGREES_WITH_LEDGER
+  a WORKER forging the binding               REFUSED   COMMAND_DELTA 0   worker-start +0  DECISION_GATE_DECLARATION_DISAGREES_WITH_LEDGER
+  observe_unexpected_exit (recovery)         REFUSED   COMMAND_DELTA 0   worker-start +0  DECISION_GATE_DECLARATION_DISAGREES_WITH_LEDGER
+
+CONTROL -- the bound Reviewer is still admitted against this same ledger:
+  reviewer/implementation/1 verifies=head    ADMITTED  COMMAND_DELTA 8   worker-start +1  -
+```
+
+Reported honestly rather than dressed up: every refusal above is **terminal, fail-closed and leaves
+nothing behind**, but the reason reported at B1 is `DECISION_GATE_DECLARATION_DISAGREES_WITH_LEDGER`
+(A6) rather than `DECISION_BLOCKED:<state>:<code>` (A5), because **A6 precedes A5** by PLAN's fixed
+evaluation order and the once-written run-entry declaration necessarily disagrees once the run has
+opened an item. That ordering is PLAN's, is unchanged by this iteration, and is not what F-001
+named. The `DECISION_BLOCKED:<state>:<code>` terminal is still emitted where the ticket requires it —
+at the boundary that produced the classification (B2 at LOW, B3-V at MEDIUM/HIGH), by
+`evaluate_verification()`, into the sparse `decision_state` / `decision_reason_code` columns:
+
+```text
+| decision_block | ... | NEEDS_INPUT | blast_radius_beyond_scope |
+    DECISION_BLOCKED:NEEDS_INPUT:blast_radius_beyond_scope verifies=run_live_os29/implementation/1/B2#1
+```
+
+#### Mutation / control pairs
+
+Each mutation removes exactly ONE conjunct of the narrow admission and re-runs
+`test_decision_gate.VerificationAdmissionTests`, `test_orca_runtime_contract.DecisionGateLiveDispatchTests`
+and `test_e2e_harness`. A mutation that stays green is a test that proves nothing.
+
+```text
+CONTROL (unmutated): PASS -- OK
+M1 remove the A5 exception: caught -- FAILED (errors=10)
+M2 remove the A6 exception: caught -- FAILED (errors=8)
+M3 admit any reviewer-ish role: caught -- FAILED (failures=1)
+M4 drop the `verifies` binding requirement: caught -- FAILED (failures=2, errors=1)
+M5 drop the same-phase/iteration binding: caught -- FAILED (failures=3, errors=1)
+M6 let a verification resolve its own item: caught -- FAILED (failures=1)
+M7 drop the already-verified conjunct: caught -- FAILED (failures=1)
+M8 stop checking the Reviewer's own record binding: caught -- FAILED (failures=3)
+M9 arm a verification for every admission: caught -- FAILED (failures=1)
+CONTROL (restored): PASS -- OK
+```
+
+M9 was **not** caught on the first run: nothing proved that an ORDINARY Worker-then-Reviewer round
+is never put into verification mode by the arming. `test_an_ordinary_round_is_never_put_into_verification_mode`
+was added for exactly that, and M9 is caught by it now. The gap is reported rather than quietly
+closed, because it is the one place this change could have regressed a healthy round.
+
+---
 
 All figures below are **iteration 3** runs, executed after the F-003 fix.
 
@@ -736,11 +905,11 @@ Production code changed, unit tests were added and modified, they were executed,
 
 | Module | Classes | What they own |
 | --- | --- | --- |
-| `scripts/test_decision_gate.py` **(new, 667 lines)** | `GateResultParsingTests`, `LedgerRecordValidationTests`, `AdmissibilityTests`, `VerificationTests`, `RiskIndependenceTests`, `ReasonVocabularyTests`, `SchemaVersionCompatibilityTests` | the parser/evaluator, A1–A6, F1–F8, F13/F14, the closed field set, the reason vocabulary, risk-inertness |
+| `scripts/test_decision_gate.py` **(new, 667 lines; +320 at iteration 4)** | `GateResultParsingTests`, `LedgerRecordValidationTests`, `AdmissibilityTests`, `VerificationTests`, **`VerificationAdmissionTests` (iteration 4)**, `RiskIndependenceTests`, `ReasonVocabularyTests`, `SchemaVersionCompatibilityTests` | the parser/evaluator, A1–A6, F1–F8, F13/F14, the closed field set, the reason vocabulary, risk-inertness |
 | `scripts/test_os29_decision_gate.py` **(new, 224 lines)** | `ImportDirectionTests`, `DispatchSiteCardinalityTests`, `WorkerVocabularyTests` | the cross-cutting residue: the two AST import-direction assertions, the `tools/` byte parity, INV-D3, the untouched vocabularies |
 | `scripts/test_e2e_harness.py` | `DecisionGateTransitionTests` (**20** after iteration 3), `DecisionGateNonDuplicationTests` (1) | every transition cell, F9–F14 end to end, NV-1, NV-2, NV-3/M-DUP; **(F-003)** the Final Review after-result boundary: a quality PASS over a blocking decision, seven defective-declaration shapes, and the record's binding of the next boundary, each with a co-located control |
 | `scripts/test_run_logging.py` | `DecisionLedgerProducerTests` (10), `DecisionRecordSectionDriftTests` (3) | the producer, idempotence, D8's writer-side exclusivity **with its ENOTEMPTY grounds executed**, the empty-payload precondition, append-only byte identity, two-writer allocation, the columns, the CLI, P-2 drift |
-| `scripts/test_orca_runtime_contract.py` | `DecisionGateLiveDispatchTests` (**15** after iteration 2, unchanged at iteration 3) | `start_run` writes the declaration; a missing one refuses with **no command issued**; an open item refuses; a declaring dispatch records a bound entry; a broken declaration poisons the next boundary; **(F-001)** a silent Worker result, a silent Reviewer result and the same silence seen through `_log_attempt` each poison it too, with the non-response control beside them; **(F-002)** five `observe_unexpected_exit` refusal shapes leaving no Task, no terminal and no `worker-start`, plus the clean-head admission control |
+| `scripts/test_orca_runtime_contract.py` | `DecisionGateLiveDispatchTests` (**15** after iteration 2, unchanged at iteration 3, **23** after iteration 4) | `start_run` writes the declaration; a missing one refuses with **no command issued**; an open item refuses; a declaring dispatch records a bound entry; a broken declaration poisons the next boundary; **(F-001)** a silent Worker result, a silent Reviewer result and the same silence seen through `_log_attempt` each poison it too, with the non-response control beside them; **(F-002)** five `observe_unexpected_exit` refusal shapes leaving no Task, no terminal and no `worker-start`, plus the clean-head admission control; **(FINAL_REVIEW F-001)** the live B3-V verification exception — one positive (`NEEDS_INPUT`) and its `CONFLICT` twin, the accepted-downgrade terminality case, eight B1 negatives with a co-located admission control, the recovery initiator's refusal and pinned signature, the row-7 unbound-record pair, the `verifies`-outside-verification-mode pair, and the ordinary-round regression control |
 | `scripts/test_validate_skills.py` | 7 new regressions | scenario 14 (a)(b)(c) plus the block-removed, value-drift, template and optionality cases |
 
 ### Behaviour covered
@@ -829,14 +998,46 @@ Skill's own limitations block:
 
 ## Review Feedback Resolution
 
+Source (iteration 4): `artifacts/runs/run_35b221ea299d/FINAL_REVIEW.md` (**RESULT: FAIL**, one
+blocking finding **F-001**, Responsible Phase implementation, no non-blocking findings).
 Source (iteration 3): `artifacts/runs/run_35b221ea299d/REVIEW_IMPLEMENTATION_iteration2.md`
 (**RESULT: FAIL**, one blocking finding, no non-blocking findings).
 Source (iteration 2): `artifacts/runs/run_35b221ea299d/REVIEW_IMPLEMENTATION.md` (**RESULT: FAIL**,
 two blocking findings, no non-blocking findings).
 
-FINDING F-003: RESOLVED
 FINDING F-001: RESOLVED
+FINDING F-003: RESOLVED
 FINDING F-002: RESOLVED
+
+**FINAL_REVIEW F-001 (G1, MAJOR) — the live gate refused the permitted verification Reviewer.**
+RESOLVED, clause by clause against the Required Action.
+
+* *"Implement a NARROWLY BOUND live B1 admission for EXACTLY the already-scheduled Reviewer of the
+  SAME phase and iteration when the head is that Worker's B2 blocking record."* Done, as
+  `decision_gate.VerificationDispatch` + `verification_admission_defect()`, six conjuncts, evaluated
+  by `admit_head()` at A5 **and** at A6 (see *Iteration 4* for why A6 was unavoidable). Every
+  conjunct is pinned by its own negative with a co-located control, and by a mutation pair.
+* *"REQUIRE and VALIDATE the Reviewer's `verifies` binding."* Done twice, at both ends: the
+  **dispatch's** binding is required and matched at B1 (conjunct 5), and the settled **record's**
+  binding is validated at B3-V by the shared `verification_binding_defect()`. An unbound record
+  publishes nothing and is named `DECISION_GATE_INPUT_UNBOUND`.
+* *"Apply the shared verification/downgrade rules."* Done by calling
+  `decision_gate.evaluate_verification()` — the same function the deterministic harness calls, with
+  no live-path variant. Downgrades remain decided solely by `decision_policy.validate_transition()`;
+  OS-29 adds no downgrade rule of its own.
+* *"Keep the round TERMINAL without dispatching a correction Worker or next phase."* Done
+  structurally, not by convention: `open_items()` lets no `verifies`-bearing record resolve
+  anything, so the Worker's item stays open and the next B1 refuses a second Reviewer, a correction
+  Worker, the next phase and the Final Review. No correction iteration is charged; no round or
+  dispatch site is added.
+* *"Add a live-runtime POSITIVE test ... PLUS NEGATIVE tests."* Done — one positive
+  (`test_the_already_scheduled_reviewer_verifies_a_blocking_classification`, plus the CONFLICT twin)
+  and the full negative set, all driven through the real `OrcaRuntimeHarness` dispatch initiators
+  against a ledger staged by a real Worker dispatch.
+
+The trap the task named is avoided and is checked: `admit_head()` is not loosened generally
+(`verification` defaults to `None`, and M1/M2 prove the exception is what admits), and no caller is
+admitted on a `role` string (M3 proves `final_reviewer` and a Worker are both refused).
 
 **F-003 (G1, MAJOR) — the Final Review after-result boundary could fail open.** RESOLVED, and
 resolved the way the Required Action words it, clause by clause.

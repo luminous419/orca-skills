@@ -537,6 +537,326 @@ class VerificationTests(PolicyMixin):
                 )
 
 
+class VerificationAdmissionTests(PolicyMixin):
+    """Final Adversarial Review F-001: the ONE dispatch an open blocking head admits.
+
+    P6b row 2 permits the already-scheduled current-phase Reviewer to verify a
+    blocking classification at MEDIUM/HIGH. A5 used to refuse it exactly as it
+    refuses a correction Worker, so the permitted transition could not happen at all.
+    The exception below is bound on six axes at once; every negative here differs
+    from the ADMITTED positive in exactly one of them, and the positive is asserted
+    in the same test as each negative so no refusal is vacuous.
+    """
+
+    WORKER_KEY = f"{RUN}/implementation/1/B2#1"
+
+    def setUp(self) -> None:
+        self.red = load_fixture("valid", "run_entry_declaration")
+        self.open_worker = dict(load_fixture("valid", "worker_needs_input"), sequence=1)
+        # A6 recomputes the run-entry declaration, so the open item must be declared
+        # there or the ledger fails A6 before A5 is ever reached.
+        self.red = dict(self.red, prior_open_decision_items=[self.WORKER_KEY])
+        self.settled = (RUN, "implementation", 1)
+
+    def dispatch(self, **kw) -> decision_gate.VerificationDispatch:
+        fields = {
+            "role": "reviewer",
+            "phase": "implementation",
+            "iteration": 1,
+            "verifies": self.WORKER_KEY,
+        }
+        fields.update(kw)
+        return decision_gate.VerificationDispatch(**fields)
+
+    def admit(self, records=None, *, verification, expected=None):
+        return decision_gate.admit_head(
+            self.policy,
+            self.ledger() if records is None else records,
+            run_id=RUN,
+            expected_settled_round=self.settled if expected is None else expected,
+            verification=verification,
+        )
+
+    def ledger(self) -> list[dict]:
+        return [self.red, self.open_worker]
+
+    def test_the_bound_current_phase_reviewer_is_admitted_and_nothing_else_is(
+        self,
+    ) -> None:
+        # POSITIVE: every binding holds, so A5 admits and returns the Worker head.
+        head = self.admit(verification=self.dispatch())
+        self.assertEqual(decision_gate.ledger_key(head), self.WORKER_KEY)
+        self.assertEqual(head["state"], "NEEDS_INPUT")
+
+        # CONTROL: the SAME ledger with NO verification offered still refuses, which
+        # is what proves the admission came from the binding and not from the ledger.
+        self.assertTrue(
+            self.refusal(
+                decision_gate.admit_head,
+                self.policy,
+                self.ledger(),
+                run_id=RUN,
+                expected_settled_round=self.settled,
+            ).startswith(decision_gate.BLOCK_REASON_PREFIX)
+        )
+
+        # NEGATIVES: one changed axis each, and each stays a DECISION_BLOCKED refusal
+        # rather than a different, softer error.
+        for label, verification in {
+            "a correction Worker": self.dispatch(role="worker"),
+            "the Final Reviewer": self.dispatch(role="final_reviewer"),
+            "another phase's Reviewer": self.dispatch(phase="test"),
+            "another iteration's Reviewer": self.dispatch(iteration=2),
+            "an unbound verification": self.dispatch(verifies=None),
+            "a verification bound elsewhere": self.dispatch(
+                verifies=f"{RUN}/implementation/9/B2#9"
+            ),
+        }.items():
+            with self.subTest(case=label):
+                self.assertTrue(
+                    self.refusal(
+                        self.admit, verification=verification
+                    ).startswith(decision_gate.BLOCK_REASON_PREFIX)
+                )
+
+    def test_the_exception_relaxes_a5_and_no_other_clause(self) -> None:
+        """A1-A4/A3/A6 are evaluated identically with a verification offered."""
+        good = self.dispatch()
+        for label, records, expected, reason in (
+            ("A1 empty", [], self.settled, decision_gate.GATE_INPUT_MISSING),
+            (
+                "A2 two entries",
+                [self.red, dict(self.red), self.open_worker],
+                self.settled,
+                decision_gate.LEDGER_INCONSISTENT,
+            ),
+            (
+                "A4-iv gap",
+                [self.red, dict(self.open_worker, sequence=2)],
+                self.settled,
+                decision_gate.GATE_INPUT_MALFORMED,
+            ),
+            (
+                "A3 unbound head",
+                self.ledger(),
+                (RUN, "implementation", 7),
+                decision_gate.GATE_INPUT_UNBOUND,
+            ),
+            (
+                # A declaration that OVERCLAIMS -- it names an item the ledger does
+                # not hold open -- is still the producer defect A6 exists to name.
+                "A6 overclaimed",
+                [
+                    dict(
+                        self.red,
+                        prior_open_decision_items=sorted(
+                            {self.WORKER_KEY, f"{RUN}/analysis/1/B2#4"}
+                        ),
+                    ),
+                    self.open_worker,
+                ],
+                self.settled,
+                decision_gate.DECLARATION_DISAGREES_WITH_LEDGER,
+            ),
+            (
+                # ...and so is a SECOND open item alongside the head, because the
+                # exception admits one verification of one classification, never a
+                # dispatch past an item nobody is verifying.
+                "A6 a second open item",
+                [
+                    dict(
+                        self.red,
+                        prior_open_decision_items=[f"{RUN}/analysis/1/B2#1"],
+                    ),
+                    dict(
+                        load_fixture("valid", "worker_conflict"),
+                        sequence=1,
+                        phase="analysis",
+                    ),
+                    dict(self.open_worker, sequence=2),
+                ],
+                (RUN, "implementation", 1),
+                decision_gate.DECLARATION_DISAGREES_WITH_LEDGER,
+            ),
+        ):
+            with self.subTest(clause=label):
+                self.assertEqual(
+                    self.refusal(
+                        self.admit, records, verification=good, expected=expected
+                    ),
+                    reason,
+                )
+        # CONTROL: the same `good` dispatch DOES admit the well-formed ledger, so the
+        # refusals above are attributable to their clause and not to the binding.
+        self.assertEqual(
+            decision_gate.ledger_key(self.admit(verification=good)), self.WORKER_KEY
+        )
+        # ...and the shape a REAL run actually produces is admitted too: the
+        # run-entry declaration is written once, at run open, and therefore claims
+        # NOTHING about the item this run itself opened a moment ago. Without this
+        # the permitted verification would be unreachable outside a hand-edited
+        # ledger, which is the way F-001's own reproduction had to be staged.
+        self.assertEqual(
+            decision_gate.ledger_key(
+                self.admit(
+                    [dict(self.red, prior_open_decision_items=[]), self.open_worker],
+                    verification=good,
+                )
+            ),
+            self.WORKER_KEY,
+        )
+        # CONTROL for THAT: the same undeclared ledger with no verification offered
+        # is still the A6 refusal it has always been.
+        self.assertEqual(
+            self.refusal(
+                decision_gate.admit_head,
+                self.policy,
+                [dict(self.red, prior_open_decision_items=[]), self.open_worker],
+                run_id=RUN,
+                expected_settled_round=self.settled,
+            ),
+            decision_gate.DECLARATION_DISAGREES_WITH_LEDGER,
+        )
+
+    def test_the_head_itself_must_be_that_workers_open_blocking_record(self) -> None:
+        good = self.dispatch()
+        self.assertEqual(
+            decision_gate.ledger_key(self.admit(verification=good)), self.WORKER_KEY
+        )
+        # A head that is a REVIEWER's B3 record is not a Worker classification, even
+        # when it is itself open and blocking -- this is what stops a SECOND
+        # verification Reviewer, and it is checked on the record, not on a counter.
+        reviewer_head = dict(
+            self.open_worker, role="reviewer", source="reviewer", boundary="B3"
+        )
+        self.assertTrue(
+            self.refusal(
+                self.admit,
+                [
+                    dict(
+                        self.red,
+                        prior_open_decision_items=[
+                            decision_gate.ledger_key(reviewer_head)
+                        ],
+                    ),
+                    reviewer_head,
+                ],
+                verification=self.dispatch(
+                    verifies=decision_gate.ledger_key(reviewer_head)
+                ),
+            ).startswith(decision_gate.BLOCK_REASON_PREFIX)
+        )
+
+    def test_only_one_reviewer_may_verify_one_worker_classification(self) -> None:
+        """The already-published verification closes the exception for that record."""
+        verification_record = dict(
+            load_fixture("valid", "worker_needs_input"),
+            sequence=2,
+            role="reviewer",
+            source="reviewer",
+            boundary="B3",
+            iteration=1,
+            verifies={
+                "run": RUN,
+                "phase": "implementation",
+                "iteration": 1,
+                "worker_record_key": self.WORKER_KEY,
+            },
+        )
+        second_key = decision_gate.ledger_key(verification_record)
+        records = [
+            dict(
+                self.red,
+                prior_open_decision_items=sorted({self.WORKER_KEY, second_key}),
+            ),
+            self.open_worker,
+            verification_record,
+        ]
+
+        # The head is now the Reviewer's record, and a second verification bound to
+        # the SAME Worker record is refused on the already-verified conjunct too.
+        self.assertIsNotNone(
+            decision_gate.verification_admission_defect(
+                records, self.open_worker, {self.WORKER_KEY}, self.dispatch(),
+                run_id=RUN,
+            )
+        )
+        # CONTROL: the identical call WITHOUT the published verification admits.
+        self.assertIsNone(
+            decision_gate.verification_admission_defect(
+                self.ledger(), self.open_worker, {self.WORKER_KEY}, self.dispatch(),
+                run_id=RUN,
+            )
+        )
+
+    def test_a_verification_record_resolves_nothing_whatever_it_says(self) -> None:
+        """L6: even an ACCEPTED downgrade is recorded and still blocks (resume is OS-31).
+
+        Without this the Reviewer's own CLEAR would close the Worker's item and
+        re-admit the correction Worker and the next phase at the next B1 -- exactly
+        the illegal dispatch this ticket exists to prevent.
+        """
+        downgrade = dict(
+            load_fixture("valid", "worker_clear"),
+            sequence=2,
+            role="reviewer",
+            source="reviewer",
+            boundary="B3",
+            iteration=1,
+            # NEEDS_INPUT -> CLEAR is `requires_user_decision`, so this is an
+            # ACCEPTED downgrade under the shared contract -- the strongest case
+            # there is, and it must STILL leave the item open.
+            user_decision={
+                "source": "explicit_user_reply",
+                "where_recorded": f"artifacts/runs/{RUN}/DECISION.md",
+                "resolves": self.WORKER_KEY,
+            },
+            verifies={
+                "run": RUN,
+                "phase": "implementation",
+                "iteration": 1,
+                "worker_record_key": self.WORKER_KEY,
+            },
+        )
+        records = [self.red, self.open_worker, downgrade]
+
+        self.assertEqual(
+            decision_gate.open_items(self.policy, records), {self.WORKER_KEY}
+        )
+        # CONTROL: the SAME CLEAR record with no `verifies` reference IS a resolution
+        # -- so the clause turns on the verification edge, not on the state.
+        self.assertEqual(
+            decision_gate.open_items(
+                self.policy, [self.red, self.open_worker, dict(downgrade, verifies=None)]
+            ),
+            set(),
+        )
+        # ...and the next boundary after the verification is therefore still refused,
+        # for a correction Worker AND for a second Reviewer bound to the same record.
+        for label, verification in {
+            "correction worker": None,
+            "second reviewer": self.dispatch(),
+        }.items():
+            with self.subTest(case=label):
+                self.assertTrue(
+                    self.refusal(
+                        decision_gate.admit_head,
+                        self.policy,
+                        [
+                            dict(
+                                self.red,
+                                prior_open_decision_items=[self.WORKER_KEY],
+                            ),
+                            self.open_worker,
+                            downgrade,
+                        ],
+                        run_id=RUN,
+                        expected_settled_round=self.settled,
+                        verification=verification,
+                    ).startswith(decision_gate.BLOCK_REASON_PREFIX)
+                )
+
+
 class RiskIndependenceTests(PolicyMixin):
     """Scenario 7 P1: risk is INERT here, not merely absent.
 
