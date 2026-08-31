@@ -5973,6 +5973,176 @@ class DecisionGateTransitionTests(unittest.TestCase):
         self.assertEqual(admitted.final_status, "COMPLETED")
         self.assertEqual(admitted.final_review_iterations, 1)
 
+    # ---- scenario 9, applied to the FINAL REVIEWER'S OWN decision result -------------
+    #
+    # The test above proves an ALREADY-OPEN ledger item is refused at B1, BEFORE the
+    # Final Review is dispatched. It cannot prove anything about a decision first
+    # discovered -- or first broken -- in the Final Reviewer's own settled body, which
+    # is the other half of "a run must not reach COMPLETED on the quality axis while
+    # the decision axis is blocking or defective". These three cases are that half.
+    def final_review_workflow(self, **final_review_kwargs):
+        """One CLEAR phase whose FINAL REVIEW attempt is the subject of the test."""
+        scenario = replace(
+            self.clear_workflow(phases=("implementation",)),
+            final_review=FinalReviewScenario(**final_review_kwargs),
+        )
+        return self.workflow(scenario)
+
+    def test_a_final_review_quality_pass_cannot_complete_over_a_blocking_decision(
+        self,
+    ) -> None:
+        """The Final Review's after-result boundary is B3, and O-2 orders the two axes:
+        a quality PASS carrying NEEDS_INPUT or CONFLICT blocks instead of completing."""
+        for state, code in (
+            ("NEEDS_INPUT", "blast_radius_beyond_scope"),
+            ("CONFLICT", "requirement_contradiction"),
+        ):
+            with self.subTest(state=state):
+                blocked, ledger = self.final_review_workflow(
+                    modes=("pass",), decision_states=(state,)
+                )
+                self.assertEqual(blocked.final_status, "BLOCKED")
+                self.assertEqual(blocked.reason, f"DECISION_BLOCKED:{state}:{code}")
+                self.assertEqual(blocked.decision_state, state)
+                self.assertEqual(blocked.decision_reason_code, code)
+                # THE POINT: the QUALITY axis really did pass. This is not a Final
+                # Review that failed for a quality reason and blocked incidentally --
+                # the decision axis alone is what stopped the completion.
+                self.assertEqual(blocked.final_review_verdict, "PASS")
+                self.assertEqual(blocked.final_review_iterations, 1)
+                self.assertEqual(len(blocked.final_review_attempts), 1)
+                # ...and the judgement survives as a bound, complete ledger record
+                # rather than only as a terminal status.
+                head = ledger[-1]
+                self.assertEqual(
+                    (head["phase"], head["boundary"], head["role"], head["source"]),
+                    (FINAL_REVIEW_PHASE, "B3", "reviewer", "reviewer"),
+                )
+                self.assertEqual(head["state"], state)
+                self.assertEqual(head["reason_code"], code)
+                self.assertEqual(head["verdict"], "PASS")
+                self.assertTrue(head["open_decision_item"])
+                self.assertIsNone(head["verifies"])
+                for field in decision_gate.REQUIRED_LEDGER_RECORD_FIELDS:
+                    self.assertIn(field, head)
+        # THE CONTROL: the SAME quality PASS with a valid CLEAR decision completes, so
+        # the branch above is not a Final Review that refuses everything.
+        completed, ledger = self.final_review_workflow(
+            modes=("pass",), decision_states=("CLEAR",)
+        )
+        self.assertEqual(completed.final_status, "COMPLETED")
+        self.assertEqual(completed.final_review_verdict, "PASS")
+        self.assertEqual(completed.decision_state, "")
+        self.assertEqual(ledger[-1]["phase"], FINAL_REVIEW_PHASE)
+        self.assertEqual(ledger[-1]["state"], "CLEAR")
+        self.assertIsNone(ledger[-1]["reason_code"])
+
+    def test_a_defective_final_review_decision_result_fails_closed(self) -> None:
+        """Row 10 at the Final Review, driven through the REAL fake-Reviewer
+        subprocess: missing, unknown, duplicated, unparseable, self-contradicting and
+        unbound all refuse, and none of them reaches T1."""
+        clear_plus_verifies = json.dumps(
+            {
+                "state": "CLEAR",
+                "reason_code": None,
+                "open_decision_item": False,
+                "grounds": (
+                    "No boundary element declared by this phase is triggering and no "
+                    "two explicit requirements contradict, so no decision item is "
+                    "open at this boundary."
+                ),
+                "scope": "This phase's own conduct at this iteration.",
+                # A Final Review round has no Worker, so there is no B2 record for
+                # this to verify: the reference cannot resolve and must not be read
+                # as extra evidence.
+                "verifies": {
+                    "run": self.RUN_ID,
+                    "phase": "implementation",
+                    "iteration": 1,
+                    "worker_record_key": f"{self.RUN_ID}/implementation/1/worker/B2",
+                },
+            }
+        )
+        cases = (
+            ("no state line", ("--decision-gate-omit-field",),
+             "DECISION_GATE_INPUT_MISSING"),
+            ("no record block", ("--decision-gate-omit-block",),
+             "DECISION_GATE_INPUT_MISSING"),
+            ("unknown state", ("--decision-gate-omit-field",
+                               "--decision-gate-state-line-raw", "NOT_A_STATE"),
+             "DECISION_GATE_INPUT_MALFORMED"),
+            ("two state lines", ("--decision-gate-state-line-raw", "CLEAR"),
+             "DECISION_GATE_INPUT_MALFORMED"),
+            ("unparseable record", ("--decision-gate-record-raw", "{not json"),
+             "DECISION_GATE_INPUT_MALFORMED"),
+            ("summary disagrees with record",
+             ("--decision-gate-record-raw", '{"state": "CONFLICT"}'),
+             "DECISION_GATE_SUMMARY_DISAGREES_WITH_RECORD"),
+            ("verifies a record that cannot exist",
+             ("--decision-gate-record-raw", clear_plus_verifies),
+             "DECISION_GATE_INPUT_UNBOUND"),
+        )
+        for label, args, expected in cases:
+            with self.subTest(defect=label):
+                blocked, ledger = self.final_review_workflow(
+                    modes=("pass",), decision_args=(args,)
+                )
+                self.assertEqual(blocked.final_status, "BLOCKED")
+                self.assertEqual(blocked.reason, expected)
+                self.assertEqual(blocked.decision_state, "INPUT")
+                self.assertEqual(blocked.decision_reason_code, expected)
+                # The quality axis passed and was still not enough.
+                self.assertEqual(blocked.final_review_verdict, "PASS")
+                # A refused result publishes NOTHING: the head is still the phase's
+                # own B3 record, so a defective declaration cannot leave a record
+                # that a later boundary would bind to.
+                self.assertEqual(ledger[-1]["phase"], "implementation")
+                self.assertEqual(ledger[-1]["boundary"], "B3")
+        # THE CONTROL, co-located: the same scenario with no seam applied completes.
+        completed, _ = self.final_review_workflow(modes=("pass",))
+        self.assertEqual(completed.final_status, "COMPLETED")
+
+    def test_the_final_review_record_binds_the_next_boundary(self) -> None:
+        """The Final Review B3 record becomes the ledger HEAD, so T4's B1 site has to
+        expect this round. If it did not, an ordinary routed FAIL would refuse as
+        A3-unbound -- which is why this control is co-located with the two above."""
+        scenario = WorkflowScenario(
+            phases=("implementation",),
+            phase_scenarios={"implementation": self.passing_phase()},
+            final_review=FinalReviewScenario(
+                modes=("fail", "pass"), findings=((("F1", "implementation"),), ())
+            ),
+            correction_scenarios={
+                ("implementation", 1): FakeScenario(
+                    worker_modes=("correction",),
+                    reviewer_modes=("pass",),
+                    worker_resolutions=({"F1": "RESOLVED"},),
+                )
+            },
+            run_id=self.RUN_ID,
+        )
+
+        result, ledger = self.workflow(scenario)
+
+        self.assertEqual(result.final_status, "COMPLETED")
+        self.assertTrue(result.correction_dispatches)
+        self.assertEqual(
+            [(record["phase"], record["boundary"]) for record in ledger[1:]],
+            [
+                ("implementation", "B2"),
+                ("implementation", "B3"),
+                (FINAL_REVIEW_PHASE, "B3"),    # attempt 1: quality FAIL, decision CLEAR
+                ("implementation", "B2"),      # the correction round it routed
+                ("implementation", "B3"),
+                (FINAL_REVIEW_PHASE, "B3"),    # attempt 2: quality PASS
+            ],
+        )
+        # The two axes stay separate in the record: a quality FAIL is written beside
+        # a CLEAR decision, never as one.
+        self.assertEqual(ledger[3]["verdict"], "FAIL")
+        self.assertEqual(ledger[3]["state"], "CLEAR")
+        self.assertEqual(ledger[6]["verdict"], "PASS")
+
     # ---- scenario 8 -------------------------------------------------------------------
     def test_a_downstream_expansion_is_a_new_decision_event_not_a_lineage_link(
         self,
@@ -6045,6 +6215,10 @@ class DecisionGateTransitionTests(unittest.TestCase):
                 ("analysis", "reviewer", "B3"),
                 ("implementation", "worker", "B2"),
                 ("implementation", "reviewer", "B3"),
+                # The Final Review's after-result boundary is a settled B3 like any
+                # other: the Final Reviewer's own decision result is recorded, not
+                # discarded, so "every settled boundary" includes this one.
+                (FINAL_REVIEW_PHASE, "reviewer", "B3"),
             ],
         )
         for record in ledger:
@@ -6078,7 +6252,12 @@ class DecisionGateTransitionTests(unittest.TestCase):
         self.assertEqual(result.decision_reason_code, "")
         # ...and the additions really are there, so this is a no-op in transitions
         # and NOT a build in which the gate never ran.
-        self.assertEqual(len(ledger), 5)
+        # Four phase boundaries + the Final Review B3 record, after the declaration.
+        self.assertEqual(len(ledger), 6)
+        self.assertEqual(
+            (ledger[-1]["phase"], ledger[-1]["boundary"], ledger[-1]["state"]),
+            (FINAL_REVIEW_PHASE, "B3", "CLEAR"),
+        )
 
 
 class DecisionGateNonDuplicationTests(unittest.TestCase):

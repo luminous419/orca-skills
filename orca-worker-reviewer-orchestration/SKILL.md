@@ -1092,6 +1092,7 @@ DECISION_GATE_BLOCKING_STATES = needs_input, conflict
 DECISION_GATE_TERMINAL_STATUS = blocked
 DECISION_GATE_LOW_TERMINAL_BOUNDARY = after_worker_result
 DECISION_GATE_MEDIUM_HIGH_TERMINAL_BOUNDARY = after_reviewer_result
+DECISION_GATE_FINAL_REVIEW_BOUNDARY = after_reviewer_result
 DECISION_GATE_REVIEWER_PARTICIPATION = already_scheduled_reviewer_in_verification_mode
 DECISION_GATE_NEW_DISPATCH_SITES = none
 DECISION_GATE_ITERATION_ACCOUNTING = decision_block_consumes_no_correction_iteration

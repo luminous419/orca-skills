@@ -267,6 +267,16 @@ def normalize_final_finding_spec(spec: FinalFindingSpec) -> tuple[str, str, str,
 class FinalReviewScenario:
     modes: tuple[str, ...]
     findings: tuple[tuple[FinalFindingSpec, ...], ...] = ()
+    # OS-29: the Final Reviewer's OWN decision declaration, per attempt and indexed
+    # exactly like `modes`. These are the same two knobs FakeScenario gives a phase
+    # Reviewer (`reviewer_decision_states` / `reviewer_decision_args`) and they mean
+    # the same thing here, because the Final Review after-result boundary IS B3 --
+    # the constrained knob for a well-formed state, and the unconstrained argv seam
+    # for the missing/malformed/unbound branches, driven through the REAL subprocess.
+    # An EMPTY tuple leaves the fake agent's always-armed CLEAR default in place, so
+    # every pre-existing Final Review scenario keeps its output byte-identical.
+    decision_states: tuple[str, ...] = ()
+    decision_args: tuple[tuple[str, ...], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1670,7 +1680,12 @@ class E2EHarness:
         return result
 
     def _run_final_review_attempt(
-        self, attempt: int, mode: str, findings: tuple[FinalFindingSpec, ...]
+        self,
+        attempt: int,
+        mode: str,
+        findings: tuple[FinalFindingSpec, ...],
+        decision_state: str | None = None,
+        decision_args: tuple[str, ...] = (),
     ) -> tuple[str | None, tuple[FinalFinding, ...], AgentAttempt | None]:
         """One Final Adversarial Review dispatch: a Reviewer-only invocation.
 
@@ -1708,6 +1723,13 @@ class E2EHarness:
         ]
         if self.protected_artifacts:
             command.extend(["--artifact", str(self.protected_artifacts[0])])
+        # OS-29: the Final Reviewer declares at B3 like any other Reviewer. The flags
+        # are appended only when the scenario asked for them, so a scenario that says
+        # nothing dispatches the exact argv it dispatched before OS-29 and the fake
+        # agent's armed CLEAR default still produces a real, parseable declaration.
+        if decision_state is not None:
+            command.extend(["--decision-gate-state", decision_state])
+        command.extend(decision_args)
         # OS-4: the Final Reviewer's own routing reaches the dispatch and the session
         # record. Rendered ONLY when a profile was selected -- a legacy Final Review
         # attempt keeps the exact argv it had before OS-4, with no --task-spec.
@@ -2049,6 +2071,12 @@ class E2EHarness:
                 scenario.final_review.findings[index]
                 if index < len(scenario.final_review.findings)
                 else (),
+                scenario.final_review.decision_states[index]
+                if index < len(scenario.final_review.decision_states)
+                else None,
+                scenario.final_review.decision_args[index]
+                if index < len(scenario.final_review.decision_args)
+                else (),
             )
             if attempt is None:                       # protected-artifact guard tripped,
                 return self._workflow_error(          # non-zero exit, or malformed output
@@ -2063,6 +2091,98 @@ class E2EHarness:
             # on the real dispatch path, so a snapshot deferred to run end is a
             # snapshot of somebody else's report.
             self._write_final_review_audit(final_review_iterations, attempt)
+
+            # ======== OS-29 B3, Final Review edge (PLAN P6b rows 8-10, W-4).
+            # The Final Review's after-result boundary IS B3: "after receiving the
+            # Reviewer result". The Final Reviewer is a Reviewer, so its result is
+            # read on the DECISION axis FIRST and on the quality axis (T1/T2/T3)
+            # only afterwards -- the same O-2 ordering run() applies at :1473, for
+            # the same reason. Placed BELOW the audit write on purpose: the audit
+            # record is evidence of a dispatch that physically happened and is never
+            # rewound by the judgement that follows it.
+            #
+            # This adds no dispatch, no subprocess site and no round. It is the
+            # attempt the loop already made, read a second way.
+            try:
+                final_gate = decision_gate.parse_gate_result(
+                    attempt.output, self.policy
+                )
+            except decision_gate.GateRefusal as refusal:
+                # Row 10: missing / malformed / unknown state / summary-vs-record
+                # drift. Fail closed -- a Final Reviewer that declared nothing is
+                # never presumed CLEAR, and quality PASS never reaches T1.
+                self._log_decision_event(
+                    run_logging.EVENT_DECISION_BLOCK,
+                    phase=FINAL_REVIEW_PHASE,
+                    role="reviewer",
+                    iteration=final_review_iterations,
+                    state=decision_gate.INPUT_DEFECT_STATE,
+                    reason_code=refusal.reason,
+                    detail=refusal.detail,
+                )
+                return snapshot(
+                    self.contract.blocked_status,
+                    refusal.reason,
+                    decision_state=decision_gate.INPUT_DEFECT_STATE,
+                    decision_reason_code=refusal.reason,
+                )
+            if final_gate.record.get("verifies") is not None:
+                # A Final Reviewer verifies no Worker B2 classification -- the Final
+                # Review round has no Worker at all -- so a record claiming to is
+                # unbound, not extra evidence. Same rule as B3-N at :1560.
+                self._log_decision_event(
+                    run_logging.EVENT_DECISION_BLOCK,
+                    phase=FINAL_REVIEW_PHASE,
+                    role="reviewer",
+                    iteration=final_review_iterations,
+                    state=decision_gate.INPUT_DEFECT_STATE,
+                    reason_code=decision_gate.GATE_INPUT_UNBOUND,
+                    detail="final_review verifies no worker record",
+                )
+                return snapshot(
+                    self.contract.blocked_status,
+                    decision_gate.GATE_INPUT_UNBOUND,
+                    decision_state=decision_gate.INPUT_DEFECT_STATE,
+                    decision_reason_code=decision_gate.GATE_INPUT_UNBOUND,
+                )
+            self._append_decision_record(
+                final_gate,
+                phase=FINAL_REVIEW_PHASE,
+                iteration=final_review_iterations,
+                role="reviewer",
+                boundary="B3",
+                source="reviewer",
+                verdict=verdict or "",
+                verifies=None,
+            )
+            # The Final Review record is now the ledger head, so the next B1 site --
+            # T4's correction guard -- must expect THIS round. Without this the head
+            # would fail to bind and a routed FAIL would refuse as A3-unbound.
+            last_settled = (
+                self.run_id, FINAL_REVIEW_PHASE, final_review_iterations
+            )
+            if final_gate.state in decision_gate.BLOCKING_STATES:
+                # Row 8 at the Final Review: the run must not reach COMPLETED on the
+                # quality axis while the decision axis blocks. This is the objective's
+                # scenario 9 applied to a decision the Final Reviewer itself raises.
+                self._log_decision_event(
+                    run_logging.EVENT_DECISION_BLOCK,
+                    phase=FINAL_REVIEW_PHASE,
+                    role="reviewer",
+                    iteration=final_review_iterations,
+                    state=final_gate.state,
+                    reason_code=final_gate.reason_code or "",
+                    detail="final_reviewer_discovered",
+                )
+                return snapshot(
+                    self.contract.blocked_status,
+                    decision_gate.block_reason(
+                        final_gate.state, final_gate.reason_code
+                    ),
+                    decision_state=final_gate.state,
+                    decision_reason_code=final_gate.reason_code or "",
+                )
+            # ======== end B3. The quality axis follows, unchanged.
 
             # ---- T1
             if verdict == self.contract.reviewer_pass:

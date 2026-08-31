@@ -3,21 +3,77 @@
 STATUS: COMPLETE
 UNIT_TEST_STATUS: PASS
 
-Run: run_35b221ea299d · Phase: implementation · Iteration: 2 · Role: worker
+Run: run_35b221ea299d · Phase: implementation · Iteration: 3 · Role: worker
 Branch: os-29-continuous-decision-gates (base main @ b13f191)
 Ticket: OS-29 "Add Continuous Decision and Escalation Gates to Every Phase"
 Approved input: `ANALYSIS.md`, `PLAN.md`, `DESIGN.md` — all PASSED their gates and **none is
-modified by this phase**. DESIGN is the specification implemented here.
-Correction input: `REVIEW_IMPLEMENTATION.md` — **RESULT: FAIL**, blocking findings **F-001** and
-**F-002**, both G1 explicit-requirement violations on the live Orca runtime path.
+modified by this phase**. The approved PLAN and the explicit requirement are the specification
+implemented here; where DESIGN's prose is narrower than either, they govern (see *Iteration 3*).
+Correction input (iteration 3): `REVIEW_IMPLEMENTATION_iteration2.md` — **RESULT: FAIL**, one
+blocking finding **F-003**, a G1 explicit-requirement violation at the Final Review after-result
+boundary. F-001 and F-002 were verified **RESOLVED** at iteration 2 and are neither reopened nor
+regressed here.
+Correction input (iteration 2): `REVIEW_IMPLEMENTATION.md` — **RESULT: FAIL**, blocking findings
+**F-001** and **F-002**, both G1 explicit-requirement violations on the live Orca runtime path.
 
 Every command output quoted below was executed on this branch during this phase. Nothing is
-inherited from an earlier phase's artifact. **Iteration 1 is commit `5e1a6cb`; iteration 2 is a new
-commit on top of it — nothing was amended, rebased or pushed.**
+inherited from an earlier phase's artifact. **Iteration 1 is commit `5e1a6cb`; iteration 2 is commit
+`0745a4d`; iteration 3 is a new commit on top of both — nothing was amended, rebased or pushed.**
 
 ---
 
-## Iteration 2 — what changed and why (read this first)
+## Iteration 3 — what changed and why (read this first)
+
+The Reviewer FAILED iteration 2 on one G1 finding, and it was right.
+
+**F-003 — RESOLVED.** The Final Review after-result boundary **is** B3, and it now behaves like one.
+`run_workflow()` no longer reads the settled Final Reviewer result on the quality axis alone. In the
+same place the attempt already settles — after the audit record is written, before T1 — it now:
+
+1. **parses and validates** the Final Reviewer's own `DECISION_GATE_STATE` declaration and its fenced
+   `decision-gate` record through `decision_gate.parse_gate_result()`, the same reader B2 and B3-N
+   use, and **refuses** on missing, unparseable, unknown-state, duplicated-line and
+   summary-disagrees-with-record inputs;
+2. **refuses an unbound record** — a Final Review round has no Worker, so a record claiming to
+   `verify` a B2 classification cannot resolve and is `DECISION_GATE_INPUT_UNBOUND`, never extra
+   evidence;
+3. **appends the bound B3 ledger record** (`phase: final_review`, `boundary: B3`, `role`/`source:
+   reviewer`, the quality verdict beside — never as — the decision state) and rebinds the round so
+   the next B1 site expects it;
+4. **terminates** with the standard decision/input block for `NEEDS_INPUT`, `CONFLICT` and every
+   defective shape, so a quality **PASS** can no longer reach `COMPLETED` over a blocking or broken
+   decision axis.
+
+**Iteration 2's third disclosure is WITHDRAWN, not re-argued.** Iteration 2 stated that PLAN W-4's
+"Final Review T1" B3 guard was superseded by DESIGN's narrower control-flow section, which lists only
+a B1 guard at the attempt open. That was not a defensible call. The B1 site refuses an **already
+open** ledger item *before* the Final Review is dispatched; it cannot see a decision that is first
+raised — or first broken — in the Final Reviewer's **own settled body**, which is the other half of
+ORIGINAL_REQUEST's requirement that the five phases and the Final Review use the same state/reason
+contract at "after receiving the Reviewer result". Where approved DESIGN prose is narrower than an
+explicit requirement plus the approved PLAN, the requirement and the PLAN govern and the prose is
+what was incomplete. The old scenario-9 test is **kept unchanged** — it still proves the B1 half —
+and three new tests prove the half it never covered.
+
+**The contract now says so in the Skill, not only in the tests.** The orchestration-only
+`#### Decision gate contract` block gains one line,
+`DECISION_GATE_FINAL_REVIEW_BOUNDARY = after_reviewer_result`, with its matching entry in
+`validate_skills.py`'s `DECISION_GATE_CONTRACT`. It declares that the Final Review is **not** a
+fourth boundary but the same `after_reviewer_result` boundary the five phases read — so "the Final
+Review is exempt" is now a validation failure rather than an unstated assumption. Deleting the line
+from the shipped Skill makes `validate_skills.py` FAIL with *decision gate contract keys drifted* /
+*values drifted* (executed; output in *Validation*). The key is orchestration-only, matching P5's
+"MUST NOT be mirrored" row; the loop Skill is untouched and still carries **zero** anchor contracts.
+
+**No test, assertion, case, fixture or validator was deleted or weakened.** Two existing assertions
+in `DecisionGateTransitionTests` were **extended** — the settled-boundary list gains
+`("final_review", "reviewer", "B3")` and the CLEAR-run ledger length moves 5 → 6, with an added
+assertion on the new record's phase/boundary/state. Both changes make those tests strictly stronger:
+they now assert the boundary exists rather than being silent about it.
+
+---
+
+## Iteration 2 — what changed and why (carried forward, unchanged by iteration 3)
 
 The Reviewer FAILED iteration 1 on two G1 findings, both on the live runtime, and both are now
 resolved in production code with the negative tests the findings demanded.
@@ -106,15 +162,21 @@ The whole feature is nine things:
    `reviews/common.md` — beside the **byte-unchanged** optionality sentence.
 8. **The always-armed fake agents (C10)** — the OS-3 opt-in precedent deliberately inverted.
 9. **The tests and fixtures (C13)**: two new modules, four new test classes in existing modules,
-   thirteen fixtures. **1496 → 1579 tests** (iteration 1 reached 1570; iteration 2 adds 9 net). The
-   only test function removed in the whole ticket is the one **the Reviewer required be replaced**
-   (F-001), and it is replaced by three that assert the opposite.
+   thirteen fixtures. **1496 → 1582 tests** (iteration 1 reached 1570; iteration 2 added 9 net;
+   iteration 3 adds 3). The only test function removed in the whole ticket is the one **the Reviewer
+   required be replaced** (F-001), and it is replaced by three that assert the opposite.
+
+Iteration 3 adds a tenth item: **the Final Review after-result boundary is a B3 like every other
+(C2)** — the same reader, the same ledger writer, the same terminal vocabulary — plus the
+orchestration-only `DECISION_GATE_FINAL_REVIEW_BOUNDARY` anchor-contract key that makes the
+five-phases-and-the-Final-Review parity a validator check.
 
 **One mechanism detail differs from DESIGN's prose and is disclosed rather than applied silently**
 (*Deviations* below). It does not change an approved conclusion, it is not irreversible, and it does
 not reach user authority — so, per the task spec, it is an ordinary settled implementation call and
-is recorded here with its evidence. **Iteration 1's second disclosure (D-2) was withdrawn, not
-carried forward**: the Reviewer found it to be a departure from an explicit requirement, and it is.
+is recorded here with its evidence. **Iteration 1's second disclosure (D-2) and iteration 2's third
+(D-3) were withdrawn, not carried forward**: in both cases the Reviewer found a departure from an
+explicit requirement, and in both cases it was right.
 
 ---
 
@@ -184,7 +246,7 @@ fixture relaxed anywhere.
 `GateRefusal` carries a **closed** `.reason` and a free-text `.detail`; the detail is for the log and
 is never routed on.
 
-### C2 `scripts/e2e_harness.py` — +539 / −8
+### C2 `scripts/e2e_harness.py` — +539 / −8 (iterations 1–2), +121 / −1 (iteration 3)
 
 * `WorkflowResult` gains `decision_block`, `decision_state`, `decision_reason_code`;
   `WorkflowRunResult` gains the two reporting fields; `snapshot()` propagates them.
@@ -199,6 +261,34 @@ is never routed on.
 * `gate_attempts()`: `if result.decision_block is not None: return 0`, then the existing expression.
 * `_decision_blocked`, `_append_decision_record`, `_log_decision_event` — three private helpers. None
   of them dispatches anything.
+
+**Iteration 3 (F-003), +121 / −1.** The Final Review after-result boundary, in `run_workflow()`'s
+`while True:` loop, between `self._write_final_review_audit(...)` and `# ---- T1`:
+
+* `parse_gate_result(attempt.output, self.policy)` inside a `try` whose `except GateRefusal` logs
+  `EVENT_DECISION_BLOCK` and returns `snapshot(blocked_status, refusal.reason, decision_state="INPUT",
+  decision_reason_code=refusal.reason)` — P6b row 10, at the Final Review.
+* the `record.get("verifies") is not None` refusal — the same rule B3-N applies, for the same reason:
+  a Final Review round has no Worker B2 record, so a verification claim cannot resolve.
+* `_append_decision_record(..., phase=FINAL_REVIEW_PHASE, iteration=final_review_iterations,
+  role="reviewer", boundary="B3", source="reviewer", verdict=verdict or "", verifies=None)` — the
+  **existing** writer, no new one, so the thirteen required fields and the binding half are stamped
+  exactly as they are for a phase Reviewer.
+* `last_settled = (self.run_id, FINAL_REVIEW_PHASE, final_review_iterations)` — the record is now the
+  ledger head, so T4's B1 site must expect *this* round. Without it an ordinary routed FAIL would
+  refuse as A3-unbound; `test_the_final_review_record_binds_the_next_boundary` is the control, and
+  deleting the line turns it red (mutation NV-FR3, executed below).
+* `if final_gate.state in decision_gate.BLOCKING_STATES:` → log + `snapshot(blocked_status,
+  block_reason(state, code), …)` — P6b row 8, at the Final Review.
+* `FinalReviewScenario` gains `decision_states` and `decision_args`; `_run_final_review_attempt()`
+  gains two defaulted parameters and appends `--decision-gate-state` / the raw argv **only when the
+  scenario asked**, so a scenario that says nothing dispatches the pre-OS-29 argv unchanged. These
+  are the same two knobs `FakeScenario` already gives a phase Reviewer, named the same way.
+
+**No new dispatch site, no new subprocess site and no new round.** This is the attempt the loop
+already made, read on the decision axis before the quality axis (O-2). The audit write stays *above*
+the parse on purpose: the audit record is evidence of a dispatch that physically happened and is
+never rewound by the judgement that follows it.
 
 ### C3 / C3b `scripts/run_logging.py` and the Skill's `tools/` copy — +379 / −2, **byte-identical**
 
@@ -237,15 +327,26 @@ invite exactly the coupling the contract forbids.
   reached neither boundary, publishes nothing, claims nothing and is guarded by B1 on the next
   dispatch instead.
 
-### C5 `scripts/validate_skills.py` — +197
+### C5 `scripts/validate_skills.py` — +197 (iterations 1–2), +6 (iteration 3)
 
-`DECISION_GATE_CONTRACT` (18 keys), its pattern and its 20-line budget, parsed with the **shared**
+`DECISION_GATE_CONTRACT` (**19** keys at iteration 3 — the new
+`DECISION_GATE_FINAL_REVIEW_BOUNDARY = after_reviewer_result`, still inside the 20-line budget), its
+pattern and its budget, parsed with the **shared**
 `parse_anchor_contract`; `MIRRORED_DECISION_SEMANTICS_ANCHORS` (3 sentences);
 `DECISION_GATE_RESULT_CONTRACT_ANCHOR`, built from `decision_gate`'s own constants so renaming the
 field in code without editing the documents is a validation failure. `validate_decision_gate_contract()`
 checks the block, its internal consistency against the code's own vocabulary, both mirrored
 directions, the loop Skill's **absence** of the block, the result contract in both Skills and in all
 sixteen routed documents, and the optionality sentence in the same place.
+
+**Iteration 3 (F-003).** One key added to `DECISION_GATE_CONTRACT` with its five-line rationale
+comment. It declares that the Final Review is **not** a fourth boundary but the same
+`after_reviewer_result` boundary the five phases read — which is exactly ORIGINAL_REQUEST's "the five
+phases and the Final Review use the same state/reason contract", now machine-checked. The existing
+`len(DECISION_GATE_BOUNDARIES) == len(BOUNDARIES)` check is untouched and still passes: the new key
+names a *participant*, not a boundary. Check count stays **697** because the block is validated by a
+fixed set of key/value drift checks over the parsed dict rather than one check per key — and the key
+is genuinely enforced: deleting the line from the shipped Skill FAILS the validator (executed below).
 
 ### C6 / C7 / C8 the Skill trees
 
@@ -254,7 +355,9 @@ sixteen routed documents, and the optionality sentence in the same place.
   `DECISION_GATE_STATE` line in §10 and §11 with the authority note; the decision-axis rule in §12;
   the iteration-accounting rule in §13; **Final Review axis J** (unresolved decisions, unapproved
   high-impact assumptions, decision drift, provenance); **L1–L8** written down; ten new Core
-  Invariants.
+  Invariants. **Iteration 3 adds exactly one line** to the anchor block —
+  `DECISION_GATE_FINAL_REVIEW_BOUNDARY = after_reviewer_result` — and nothing else in the file
+  changes (`+1 / −0`).
 * Loop `SKILL.md`: the same three mirrored paragraphs, the same result-contract line in §14/§16, an
   explicit statement that lifecycle is orchestration-only. Its "이 계약은 정의다 …" sentence **stays
   as-is**, because the loop Skill still does not gate. It still has **zero** anchor contracts.
@@ -282,9 +385,11 @@ implemented and restates what OS-30/OS-31 still do not do.
 
 ## Deviations from DESIGN's prose, disclosed
 
-Both preserve every approved conclusion. Neither is escalated, because neither is irreversible and
-neither touches security, privacy, compliance, monetary cost or long-term lock-in, and no two
-explicit requirements contradict.
+**One** deviation survives at iteration 3 (D-1). It preserves every approved conclusion and is not
+escalated, because it is not irreversible and does not touch security, privacy, compliance, monetary
+cost or long-term lock-in, and no two explicit requirements contradict. D-2 was withdrawn at
+iteration 2 and **D-3 is withdrawn here** — both because a disclosure never authorizes departing
+from an explicit requirement.
 
 **D-1. The live-path refusal is RAISED, not returned.** DESIGN's snippet shows
 `return self._pre_dispatch_refusal(refusal)`. `run_existing_task` returns
@@ -305,12 +410,16 @@ replaced it (a non-response is not a B2/B3 boundary at all, because no result wa
 in full under *Iteration 2* above with its own test and its two untouched lifecycle controls. The
 `_record_decision_from_attempt` docstring carries the same record in the code.
 
-**A third, smaller note.** PLAN W-4 mentions a B3 guard at "Final Review T1"; DESIGN's control-flow
-section places a **B1** guard at the Final-Review attempt open instead and lists no gate parse of the
-Final Reviewer's own body. DESIGN is implemented. Scenario 9 is satisfied at that B1 site — an
-unresolved decision stops the run **before** the Final Review dispatch, which is strictly earlier
-than T1 — and `test_an_unresolved_decision_forbids_final_review_completion` asserts
-`final_review_iterations == 0` and `final_review_attempts == []`.
+**D-3 — WITHDRAWN at iteration 3 (review F-003).** Iteration 2 disclosed that PLAN W-4's B3 guard at
+"Final Review T1" was superseded by DESIGN's narrower control-flow section, which places only a B1
+guard at the Final-Review attempt open. The Reviewer correctly classified that as a G1
+explicit-requirement violation, and the reasoning behind the disclosure was wrong in kind:
+**approved DESIGN prose that is narrower than an explicit requirement plus the approved PLAN does
+not override either — it is the thing that was incomplete.** The Final Review after-result boundary
+is now a full B3 (parse → validate → append → route), described under *Iteration 3* above. The B1
+half is unchanged and its test is untouched; what the B1 site could never cover — a decision first
+raised, or first broken, inside the Final Reviewer's own settled body — is covered by three new
+adversarial tests plus a valid-CLEAR control. Only **D-1** remains disclosed.
 
 ---
 
@@ -357,9 +466,30 @@ Tests and fixtures (C13):
 
 `git status --short` shows no other tracked file modified by this iteration.
 
+**Iteration 3 (F-003) touched four files and nothing else** — `git diff --numstat` against `0745a4d`:
+
+```text
+1	0	orca-worker-reviewer-orchestration/SKILL.md
+121	1	scripts/e2e_harness.py
+180	1	scripts/test_e2e_harness.py
+6	0	scripts/validate_skills.py
+```
+
+| File | ± | Why |
+| --- | --- | --- |
+| `scripts/e2e_harness.py` | +121 / −1 | C2: the Final Review B3 boundary, the two `FinalReviewScenario` knobs and their dispatch plumbing |
+| `scripts/test_e2e_harness.py` | +180 / −1 | C13: three added tests; two existing ledger assertions **extended**, none removed or relaxed |
+| `orca-worker-reviewer-orchestration/SKILL.md` | +1 | C6: `DECISION_GATE_FINAL_REVIEW_BOUNDARY = after_reviewer_result` |
+| `scripts/validate_skills.py` | +6 | C5: the matching `DECISION_GATE_CONTRACT` entry and its rationale comment |
+
+The single `−1` in each script is the one line each edit replaced in place (the widened
+`_run_final_review_attempt` signature; the widened settled-boundary assertion). `run_logging.py` and
+its Skill copy are **untouched at iteration 3** and remain byte-identical; `orca_runtime_harness.py`,
+`decision_policy.py`, `task_context.py` and `workflow_contract.py` have no iteration-3 diff.
+
 Artifacts written by this phase: `artifacts/runs/run_35b221ea299d/IMPLEMENTATION.md` (this file, in
 place at the contracted path) and `artifacts/runs/run_35b221ea299d/records/implementation_decision_record.json`
-(updated in place for iteration 2). **`ANALYSIS.md`, `PLAN.md` and `DESIGN.md` are unmodified**, and no
+(updated in place for iteration 3). **`ANALYSIS.md`, `PLAN.md` and `DESIGN.md` are unmodified**, and no
 `REVIEW_*.md` was written.
 
 ### Every existing-test diff, justified
@@ -416,44 +546,93 @@ deletions are import lines and three capture-helper expressions. Each edit:
    other stripper in that block already carries, so a build that stopped declaring turns these
    byte-identity tests red rather than green.
 
+**Iteration 3 adds exactly two more, both EXTENSIONS forced by F-003, and deletes nothing:**
+
+9. **`test_e2e_harness.py` — `test_every_settled_boundary_leaves_a_complete_bound_record`.** Its
+   settled-boundary list gains `(FINAL_REVIEW_PHASE, "reviewer", "B3")`. The test's own name states
+   the property — *every* settled boundary leaves a bound record — and before iteration 3 the Final
+   Review's settled boundary left none, so the old list encoded the omission rather than the
+   property. Every prior element and every prior assertion is unchanged; four became five.
+10. **`test_e2e_harness.py` — `test_a_fully_clear_run_adds_artifacts_without_changing_a_transition`.**
+    `len(ledger)` moves 5 → 6, and a new assertion pins the added record's `(phase, boundary, state)`
+    to `(final_review, B3, CLEAR)`. The test's claim is that a CLEAR run's **transitions** are the
+    pre-OS-29 ones while its **artifacts** grow; iteration 3 adds an artifact and no transition, which
+    is exactly what the surrounding assertions (`phase_iterations`, `correction_dispatches`,
+    `revalidation_dispatches`, `final_review_iterations`, `reason`, the two decision columns) still
+    assert, all unchanged.
+
+    Both edits are strictly stronger: the pre-edit forms passed on a build with **no** Final Review
+    decision boundary, which is the fail-open F-003 named. Mutation NV-FR1 confirms it — removing the
+    boundary now fails 13 of the 20 tests in that class.
+
 ---
 
 ## Validation
 
 Every command below was run on this branch, in this phase. Output is verbatim.
 
-All figures below are **iteration 2** runs, executed after the F-001/F-002 fixes.
+All figures below are **iteration 3** runs, executed after the F-003 fix.
 
 | Check | Command | Result |
 | --- | --- | --- |
 | Skill validator, **check count above 648** | `python3 scripts/validate_skills.py` | `Skill validation PASSED (697 checks)` |
-| Full unittest discovery, **≥ 1570, no deletions** | `python3 -m unittest discover -s scripts -p 'test_*.py'` | `Ran 1579 tests in 310.715s` → `OK (skipped=6)`, exit 0 |
+| Full unittest discovery, **≥ 1579, no deletions** | `python3 -m unittest discover -s scripts -p 'test_*.py'` | `Ran 1582 tests in 309.100s` → `OK (skipped=6)`, exit 0 |
 | Package verification | `python3 scripts/verify_package.py` | `Package verification PASSED (189 source files)` |
 | Release build | `python3 scripts/build_release.py` | `Built reproducible release archive: dist/orca-skills-0.9.0.tar.gz` |
-| Whitespace | `git diff --check` | clean (no output) |
+| Whitespace | `git diff --check` / `git diff --check main...HEAD` | clean (no output, exit 0) — both |
 | **C3b parity** | `cmp scripts/run_logging.py orca-worker-reviewer-orchestration/tools/run_logging.py` | byte-identical (no output, exit 0) |
 | **C-1: the shared block is untouched** | validator's own `DECISION_POLICY_BLOCK_PATTERN` | orchestration **90 / 90**, loop **90 / 90** |
-| **D6: anchor asymmetry** | `grep -c '^#### .* contract$'` | orchestration **10** (was 9), loop **0** (unchanged) |
+| **D6: anchor asymmetry** | `grep -c '^#### .* contract$'` | orchestration **10**, loop **0** (both unchanged by iteration 3) |
 
-The suite grew from **1496 → 1570** (iteration 1) **→ 1579** (iteration 2). Across the whole ticket
-exactly **one** test function was removed — the one review F-001 required be replaced — and it is
-replaced by three asserting the opposite behaviour. `grep -c "def test_"` on
-`scripts/test_orca_runtime_contract.py` reads **238**, against **229** at `HEAD` (`5e1a6cb`): one
-removed, ten added. No validator was deleted or weakened; see *Every existing-test diff, justified*
-above.
+The suite grew from **1496 → 1570** (iteration 1) **→ 1579** (iteration 2) **→ 1582** (iteration 3).
+Across the whole ticket exactly **one** test function was removed — the one review F-001 required be
+replaced — and it is replaced by three asserting the opposite behaviour. Iteration 3 removed none and
+added three. No validator was deleted or weakened; see *Every existing-test diff, justified* above.
 
-### The two blocking findings, re-verified as run output
+### F-003, verified as run output
 
 ```text
-$ python3 -m unittest scripts.test_orca_runtime_contract.DecisionGateLiveDispatchTests
-Ran 14 tests in 0.067s
+$ python3 -m unittest scripts.test_e2e_harness.DecisionGateTransitionTests
+Ran 20 tests in 4.668s
 OK
 ```
 
-Those fourteen are the F-001 and F-002 evidence in one class: three silent-result refusals (Worker
+Three of those twenty are new and are the F-003 evidence:
+`test_a_final_review_quality_pass_cannot_complete_over_a_blocking_decision` (NEEDS_INPUT and CONFLICT
+as subtests, plus the valid-CLEAR control that completes),
+`test_a_defective_final_review_decision_result_fails_closed` (seven defect subtests plus the
+unmodified control) and `test_the_final_review_record_binds_the_next_boundary`.
+
+### F-001 and F-002, re-verified as run output (not reopened, not regressed)
+
+```text
+$ python3 -m unittest scripts.test_orca_runtime_contract.DecisionGateLiveDispatchTests
+Ran 15 tests in 0.065s
+OK
+
+$ python3 -m unittest scripts.test_e2e_harness.DecisionGateNonDuplicationTests
+Ran 1 test in 0.196s
+OK
+```
+
+Those fifteen are the F-001 and F-002 evidence in one class: three silent-result refusals (Worker
 B2, Reviewer B3, and the live `_log_attempt` funnel), the non-response control, five
 `observe_unexpected_exit` refusal shapes each asserting no Task / no terminal / no `worker-start`,
-and the clean-head admission control that keeps those five non-vacuous.
+and the clean-head admission control that keeps those five non-vacuous. Iteration 3 touches no file
+they cover.
+
+### The `DECISION_GATE_FINAL_REVIEW_BOUNDARY` key is enforced, not decorative
+
+```text
+$ sed -i '' '/DECISION_GATE_FINAL_REVIEW_BOUNDARY = after_reviewer_result/d' \
+      orca-worker-reviewer-orchestration/SKILL.md   # in a throwaway copy of the tree
+$ python3 scripts/validate_skills.py
+Skill validation FAILED (2 errors, 697 checks)
+- orca-worker-reviewer-orchestration: decision gate contract keys drifted
+- orca-worker-reviewer-orchestration: decision gate contract values drifted
+```
+
+The mutated copy was deleted; the tree under review carries the line.
 
 ### The decision record was VALIDATED, not merely described
 
@@ -497,8 +676,20 @@ was standing in for before the code existed.
 | **NV-2** iteration non-consumption | `test_a_decision_block_charges_no_iteration_and_a_quality_fail_still_does` | blocked round: `phase_iterations == 0`, `correction_dispatches == []`. Co-located control: a quality-`FAIL` round still reaches **2** |
 | **NV-3 / M-DUP** non-duplication | `test_m_dup_fails_the_invariants_while_the_control_passes` | (1) the mutant's `sessions` and reviewer-event count are strictly greater than the control's — the mutation is not a no-op; (2) the four-value `round_kind` assertion **still passes on the mutant**, which demotes that proxy from proof to supplementary evidence; (3) INV-D1 rejects the mutant and returns **clean** on both the blocked control and a `CLEAR` control |
 
+**Iteration 3 adds three more, each executed against a mutated working tree and then reverted.**
+
+| Mutation | What was changed | Result |
+| --- | --- | --- |
+| **NV-FR1** — the boundary is removed | the whole `# ======== OS-29 B3, Final Review edge` block deleted (4 823 chars), leaving the pre-iteration-3 control flow | `Ran 20 tests ... FAILED (failures=13)` |
+| **NV-FR2** — the boundary is read but the block is ignored | `if final_gate.state in decision_gate.BLOCKING_STATES:` → `if False:` (parse, validate and ledger append all still happen) | `Ran 20 tests ... FAILED (failures=2)` |
+| **NV-FR3** — the head is not rebound | the `last_settled = (self.run_id, FINAL_REVIEW_PHASE, final_review_iterations)` statement deleted | `Ran 20 tests ... FAILED (failures=2)` |
+
+Restored tree: `Ran 20 tests in 4.668s ... OK`. NV-FR2 matters most: it proves the three new tests
+are not satisfied by *recording* the Final Reviewer's decision — only by acting on it. NV-FR3 proves
+the head rebinding is load-bearing rather than defensive.
+
 `test_e2e_harness.DecisionGateTransitionTests` and `DecisionGateNonDuplicationTests`:
-`Ran 17 tests ... OK` and `Ran 1 test ... OK` (both inside the full run above).
+`Ran 20 tests ... OK` and `Ran 1 test ... OK` (both inside the full run above).
 
 ### The exit criteria, one by one
 
@@ -510,6 +701,7 @@ was standing in for before the code existed.
 | every B1 check — **including the first phase of a new run** — consumes an explicit, validated, bound ledger head under A1–A6, and no path reaches `CLEAR` from an absent, malformed or unbound record | `AdmissibilityTests` (A1–A6, ordering, F11); `test_the_first_phase_needs_the_run_entry_declaration`; `test_a_pre_seeded_ledger_is_unbound_at_the_runs_first_boundary`; `test_an_unreadable_or_unsupported_ledger_record_blocks_end_to_end` |
 | a decision block consumes no correction iteration while quality FAIL still does | NV-2 above |
 | a missing or malformed gate result fails closed at **all three** boundaries | B1: `test_the_first_phase_needs_the_run_entry_declaration`, `AdmissibilityTests`. B2/B3: `test_a_silent_or_broken_agent_never_presumes_clear`, run at low/medium/high through the **real** subprocess |
+| **the five phases and the Final Review use the same state/reason contract at B3** *(F-003)* | Production: one B3 block, the same `parse_gate_result` reader, the same `_append_decision_record` writer and the same terminal vocabulary at both the phase and Final Review edges. Tests: `test_a_final_review_quality_pass_cannot_complete_over_a_blocking_decision`, `test_a_defective_final_review_decision_result_fails_closed`, `test_the_final_review_record_binds_the_next_boundary`. Contract: `DECISION_GATE_FINAL_REVIEW_BOUNDARY = after_reviewer_result`, enforced by `validate_skills.py` |
 | the mandatory IMPLEMENTATION test gate, with affirmative evidence | `UNIT_TEST_STATUS: PASS` at the top and *Unit Tests* below |
 | full CI green | *Validation* table |
 
@@ -525,7 +717,7 @@ was standing in for before the code existed.
 | 6 | Worker auto-approves → Reviewer FAILs it as blocking | `test_a_reviewer_discovered_block_records_its_finding_and_charges_nothing`, with the axis-separation control |
 | 7 | LOW risk does not expand authority | `RiskIndependenceTests` (P1: `inspect.signature` over eleven functions + a source scan; P2/P3: the cross-risk equality above) |
 | 8 | downstream expansion → new decision event, not lineage | `test_a_downstream_expansion_is_a_new_decision_event_not_a_lineage_link` (asserts every OS-30 field is absent from every record) |
-| 9 | Final Review with an unresolved decision → completion forbidden | `test_an_unresolved_decision_forbids_final_review_completion` |
+| 9 | Final Review with an unresolved decision → completion forbidden | **Both halves.** (a) *already open before dispatch*: `test_an_unresolved_decision_forbids_final_review_completion` (unchanged — `final_review_iterations == 0`, `final_review_attempts == []`). (b) **iteration 3 (F-003)** *first raised or first broken in the Final Reviewer's own settled body*: `test_a_final_review_quality_pass_cannot_complete_over_a_blocking_decision`, `test_a_defective_final_review_decision_result_fails_closed`, `test_the_final_review_record_binds_the_next_boundary`, with mutations NV-FR1/NV-FR2/NV-FR3 |
 | 10 | Worker+Reviewer agree on an unauthorized assumption → no approval | `test_a_worker_reviewer_agreement_never_resolves_an_open_item` (with the closed five-item cardinality precheck), `test_a_downgrade_is_decided_by_the_shared_contract_alone` |
 | 11 | timeout / non-response → no approval, no iteration | `ReasonVocabularyTests` + NV-2; `forbidden_authority_sources` is asserted to contain `timeout`/`no_response` and to have exactly five members; **iteration 2** adds the live-path half, `test_a_non_response_is_not_a_boundary_and_is_never_presumed_clear` (no record, no state, no `gate_result`, and the following dispatch still B1-guarded) |
 | 12 | illegal dispatch after a block → fail closed | `test_an_open_ledger_item_blocks_the_next_phase_dispatch` (e2e), `test_an_unresolved_open_item_refuses_the_next_dispatch` (live); **iteration 2 (F-002)** closes the second live dispatch initiator with five `test_unexpected_exit_refuses_*` tests and their clean-head admission control |
@@ -546,9 +738,9 @@ Production code changed, unit tests were added and modified, they were executed,
 | --- | --- | --- |
 | `scripts/test_decision_gate.py` **(new, 667 lines)** | `GateResultParsingTests`, `LedgerRecordValidationTests`, `AdmissibilityTests`, `VerificationTests`, `RiskIndependenceTests`, `ReasonVocabularyTests`, `SchemaVersionCompatibilityTests` | the parser/evaluator, A1–A6, F1–F8, F13/F14, the closed field set, the reason vocabulary, risk-inertness |
 | `scripts/test_os29_decision_gate.py` **(new, 224 lines)** | `ImportDirectionTests`, `DispatchSiteCardinalityTests`, `WorkerVocabularyTests` | the cross-cutting residue: the two AST import-direction assertions, the `tools/` byte parity, INV-D3, the untouched vocabularies |
-| `scripts/test_e2e_harness.py` | `DecisionGateTransitionTests` (17), `DecisionGateNonDuplicationTests` (1) | every transition cell, F9–F14 end to end, NV-1, NV-2, NV-3/M-DUP |
+| `scripts/test_e2e_harness.py` | `DecisionGateTransitionTests` (**20** after iteration 3), `DecisionGateNonDuplicationTests` (1) | every transition cell, F9–F14 end to end, NV-1, NV-2, NV-3/M-DUP; **(F-003)** the Final Review after-result boundary: a quality PASS over a blocking decision, seven defective-declaration shapes, and the record's binding of the next boundary, each with a co-located control |
 | `scripts/test_run_logging.py` | `DecisionLedgerProducerTests` (10), `DecisionRecordSectionDriftTests` (3) | the producer, idempotence, D8's writer-side exclusivity **with its ENOTEMPTY grounds executed**, the empty-payload precondition, append-only byte identity, two-writer allocation, the columns, the CLI, P-2 drift |
-| `scripts/test_orca_runtime_contract.py` | `DecisionGateLiveDispatchTests` (**14** after iteration 2) | `start_run` writes the declaration; a missing one refuses with **no command issued**; an open item refuses; a declaring dispatch records a bound entry; a broken declaration poisons the next boundary; **(F-001)** a silent Worker result, a silent Reviewer result and the same silence seen through `_log_attempt` each poison it too, with the non-response control beside them; **(F-002)** five `observe_unexpected_exit` refusal shapes leaving no Task, no terminal and no `worker-start`, plus the clean-head admission control |
+| `scripts/test_orca_runtime_contract.py` | `DecisionGateLiveDispatchTests` (**15** after iteration 2, unchanged at iteration 3) | `start_run` writes the declaration; a missing one refuses with **no command issued**; an open item refuses; a declaring dispatch records a bound entry; a broken declaration poisons the next boundary; **(F-001)** a silent Worker result, a silent Reviewer result and the same silence seen through `_log_attempt` each poison it too, with the non-response control beside them; **(F-002)** five `observe_unexpected_exit` refusal shapes leaving no Task, no terminal and no `worker-start`, plus the clean-head admission control |
 | `scripts/test_validate_skills.py` | 7 new regressions | scenario 14 (a)(b)(c) plus the block-removed, value-drift, template and optionality cases |
 
 ### Behaviour covered
@@ -568,37 +760,42 @@ precondition's positive/negative pair.
 
 ```text
 Command: python3 -m unittest discover -s scripts -p 'test_*.py'
-Result:  Ran 1579 tests in 310.715s
+Result:  Ran 1582 tests in 309.100s
          OK (skipped=6)
          exit 0
 ```
 
-Targeted, all re-executed at iteration 2:
+Targeted, all re-executed at iteration 3:
 
 ```text
 python3 -m unittest scripts.test_decision_gate            -> Ran  21 tests ... OK
 python3 -m unittest scripts.test_os29_decision_gate       -> Ran   9 tests ... OK
-python3 -m unittest scripts.test_e2e_harness              -> Ran 186 tests ... OK
+python3 -m unittest scripts.test_e2e_harness              -> Ran 189 tests ... OK
 python3 -m unittest scripts.test_run_logging              -> Ran 205 tests ... OK
 python3 -m unittest scripts.test_orca_runtime \
                     scripts.test_orca_runtime_contract    -> Ran 244 tests ... OK (skipped=6)
 cd scripts && python3 -m unittest test_validate_skills    -> Ran 181 tests ... OK
 python3 -m unittest scripts.test_e2e_harness.DecisionGateTransitionTests \
                     scripts.test_e2e_harness.DecisionGateNonDuplicationTests
-                                                          -> Ran  18 tests ... OK
+                                                          -> Ran  20 tests ... OK
 python3 -m unittest \
   scripts.test_orca_runtime_contract.DecisionGateLiveDispatchTests
-                                                          -> Ran  14 tests ... OK
+                                                          -> Ran  15 tests ... OK
 ```
 
-The last two lines are the NV-1 / NV-2 / NV-3-M-DUP mutation and non-vacuity runs and the F-001 /
-F-002 evidence class respectively; both are inside the full run above and are quoted separately only
-because they are the ones the correction turns on.
+The last two lines are the F-003 / NV-1 / NV-2 / NV-3-M-DUP transition-and-mutation runs and the
+F-001 / F-002 evidence class respectively; both are inside the full run above and are quoted
+separately only because they are the ones the corrections turn on.
 
-**No existing test or validator was deleted or weakened.** The single removed test function is the
-one review F-001 required be REPLACED, and its replacement asserts refusal where it asserted
-admission. Every other edit to an existing test module is enumerated and justified under *Every
-existing-test diff, justified*.
+**No existing test or validator was deleted or weakened.** The single removed test function in the
+whole ticket is the one review F-001 required be REPLACED, and its replacement asserts refusal where
+it asserted admission. **Iteration 3 removed none.** Its only edits to existing assertions are two
+**extensions** in `DecisionGateTransitionTests` — the settled-boundary list gains
+`("final_review", "reviewer", "B3")`, and the CLEAR-run ledger length moves 5 → 6 with an added
+assertion pinning the new record's phase, boundary and state. Both are strictly stronger than what
+they replaced: the old forms would have passed on a build with no Final Review boundary at all, which
+is precisely the fail-open F-003 named. Every other edit to an existing test module is enumerated and
+justified under *Every existing-test diff, justified*.
 
 ---
 
@@ -632,11 +829,54 @@ Skill's own limitations block:
 
 ## Review Feedback Resolution
 
-Source: `artifacts/runs/run_35b221ea299d/REVIEW_IMPLEMENTATION.md` (**RESULT: FAIL**, two blocking
-findings, no non-blocking findings).
+Source (iteration 3): `artifacts/runs/run_35b221ea299d/REVIEW_IMPLEMENTATION_iteration2.md`
+(**RESULT: FAIL**, one blocking finding, no non-blocking findings).
+Source (iteration 2): `artifacts/runs/run_35b221ea299d/REVIEW_IMPLEMENTATION.md` (**RESULT: FAIL**,
+two blocking findings, no non-blocking findings).
 
+FINDING F-003: RESOLVED
 FINDING F-001: RESOLVED
 FINDING F-002: RESOLVED
+
+**F-003 (G1, MAJOR) — the Final Review after-result boundary could fail open.** RESOLVED, and
+resolved the way the Required Action words it, clause by clause.
+
+* *"PARSE and VALIDATE the Final Reviewer's explicit decision-gate result BEFORE T1 quality
+  routing."* Done. `decision_gate.parse_gate_result(attempt.output, self.policy)` — the **same**
+  reader B2 and B3-N use, not a second one — runs between the audit write and `# ---- T1`. Nothing
+  between the two reads the quality verdict.
+* *"APPEND its bound B3 ledger record."* Done, through the **existing** `_append_decision_record()`,
+  so the thirteen required fields, the harness-stamped binding half, the allocated sequence and the
+  `EVENT_DECISION_RECORD_WRITTEN` row are produced exactly as they are for a phase Reviewer. The
+  record carries `phase: final_review`, `boundary: B3`, `role`/`source: reviewer`, `verifies: null`,
+  and the quality verdict in `verdict` **beside** — never as — the decision state.
+* *"TERMINATE with the standard decision/input-block outcome for NEEDS_INPUT, CONFLICT, missing,
+  malformed, unknown or unbound results."* Done, in the standard vocabulary and with no new one:
+  `DECISION_BLOCKED:<state>:<code>` with the state and code in the two sparse columns for the two
+  blocking states; `DECISION_GATE_INPUT_MISSING` / `_MALFORMED` /
+  `DECISION_GATE_SUMMARY_DISAGREES_WITH_RECORD` / `DECISION_GATE_INPUT_UNBOUND` with
+  `decision_state = INPUT` for the defective ones. No new `RUN_STATUS`, no new reason constant, no
+  new round_kind.
+* *"Add adversarial tests proving a Final Reviewer quality PASS CANNOT complete when its decision
+  result blocks or is defective, plus a valid-CLEAR control."* Done — three test functions, eleven
+  adversarial cases and three controls. Every blocked case asserts
+  `final_review_verdict == "PASS"` alongside `final_status == "BLOCKED"`, which is the precise claim:
+  the quality axis passed and it was not enough.
+* *"This is the objective's required scenario 9 applied to a decision the Final Reviewer itself
+  raises."* Understood and implemented as the second half of scenario 9. The first half — an
+  already-open ledger item refused at B1 before dispatch — is **kept exactly as it was**; the row in
+  *The fourteen required scenarios* now names both halves.
+* *On the disputed reasoning.* The Reviewer is right and I withdraw the iteration-2 position without
+  qualification. Approved DESIGN prose that is narrower than an explicit requirement plus the
+  approved PLAN does not override either; the prose was the incomplete artifact. DESIGN is **not**
+  modified by this phase — the correction is in production code, in the tests, and in the
+  orchestration Skill's own anchor contract, which now states the parity in machine-checked form.
+* *On the conflict check the decision discipline requires.* I looked for one and it is **not** real.
+  Reading the decision axis first and leaving the quality routing byte-identical are both satisfiable
+  at once: the new boundary either terminates the run or falls through untouched, and
+  `test_the_final_review_record_binds_the_next_boundary` executes a full quality-FAIL → correction →
+  quality-PASS run through the new code to prove the fall-through path is unchanged. So there is
+  nothing to escalate, and STATUS is COMPLETE rather than BLOCKED.
 
 **F-001 (G1, CRITICAL) — the live runtime failed open on a silent settled result.** RESOLVED, and
 resolved the way the Required Action words it, not around it.
@@ -716,7 +956,7 @@ REASON_CODE: (none — CLEAR carries no reason code)
 EVIDENCE: open_decision_item=false; grounds and scope as recorded in the JSON above
 ```
 
-Re-validated at iteration 2 against **both** Skills with three negative controls:
+Re-validated at iteration 3 against **both** Skills with three negative controls:
 
 ```text
 POSITIVE (orca-worker-reviewer-orchestration): accepted.
@@ -727,9 +967,15 @@ the CLEAR entry condition -- state C...
 CONTROL-3 (closed field set): DECISION_GATE_INPUT_MALFORMED
 ```
 
-`CLEAR` here is **not** the iteration-1 grounds restated. Iteration 1 classified the phase `CLEAR`
-while carrying a disclosed departure from an explicit requirement; the Reviewer judged those grounds
-substantively invalid and it was right. The departure is now removed rather than re-disclosed, and
-the record's `grounds` field says so and states the conflict check that was actually performed.
+`CLEAR` here is **not** the iteration-1 or iteration-2 grounds restated. Iteration 1 classified the
+phase `CLEAR` while carrying a disclosed departure from an explicit requirement (D-2); iteration 2
+did the same with a second one (D-3, the Final Review boundary). In both cases the Reviewer judged
+those grounds substantively invalid and in both cases it was right. **Both departures are now
+removed rather than re-disclosed**, and the record's `grounds` field says so, names the precedence
+rule that settles it — an explicit requirement plus the approved PLAN over narrower approved DESIGN
+prose — and states the conflict check that was actually performed and its negative result.
+
+No explicit requirement is knowingly left unmet by this iteration; that is the condition under which
+`CLEAR` is the honest classification, and it is the condition the two earlier iterations failed.
 
 No `NEEDS_INPUT` and no `CONFLICT` item arose in this phase, so this phase does not stop.

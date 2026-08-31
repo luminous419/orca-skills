@@ -769,6 +769,12 @@ DECISION_GATE_CONTRACT: dict[str, tuple[str, ...]] = {
     "DECISION_GATE_TERMINAL_STATUS": ("blocked",),
     "DECISION_GATE_LOW_TERMINAL_BOUNDARY": ("after_worker_result",),
     "DECISION_GATE_MEDIUM_HIGH_TERMINAL_BOUNDARY": ("after_reviewer_result",),
+    # The Final Review is not a fourth boundary: it settles a Reviewer result, so it
+    # reads the SAME after_reviewer_result boundary the five phases read. Locked here
+    # because "the five phases and the Final Review use the same state/reason
+    # contract" is otherwise only asserted by tests, and a contract that the Final
+    # Review is exempt is precisely the fail-open this key forbids.
+    "DECISION_GATE_FINAL_REVIEW_BOUNDARY": ("after_reviewer_result",),
     "DECISION_GATE_REVIEWER_PARTICIPATION": (
         "already_scheduled_reviewer_in_verification_mode",
     ),
