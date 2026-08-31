@@ -663,5 +663,241 @@ class SchemaVersionCompatibilityTests(PolicyMixin):
         )
 
 
+# =====================================================================================
+# OS-29 TEST phase: the named fixtures PLAN P4 places in THIS module and had no case of
+# their own after IMPLEMENTATION. Additive; nothing above was edited.
+# =====================================================================================
+
+
+class TimeoutAndNonResponseTests(PolicyMixin):
+    """Scenario 11 at the contract level: a timeout is not an answer.
+
+    The e2e half -- that the same refusal charges no correction iteration -- lives in
+    test_e2e_harness.DecisionGateNamedScenarioTests, because "was an iteration
+    charged" is a question about a transition and not about this parser.
+    """
+
+    def setUp(self) -> None:
+        self.worker = decision_gate.GateResult(
+            declared_state="NEEDS_INPUT",
+            record=decision_half(load_fixture("valid", "worker_needs_input")),
+        )
+
+    def downgrade_offering(self, source: str) -> decision_gate.GateResult:
+        """A Reviewer proposing NEEDS_INPUT -> CLEAR and naming `source` as the user
+        authority for it. This is the shape a fail-open would actually take: not a
+        missing record, but a present one whose authority is not authority."""
+        record = dict(
+            decision_half(load_fixture("valid", "worker_clear")),
+            user_decision={
+                "source": source,
+                "where_recorded": f"artifacts/runs/{RUN}/DECISION.md",
+                "resolves": f"{RUN}/implementation/1/B2#1",
+            },
+        )
+        return decision_gate.GateResult(declared_state="CLEAR", record=record)
+
+    def test_timeout_no_response_is_never_an_approval(self) -> None:
+        forbidden = self.policy.forbidden_authority_sources
+        # D4-F guard, before the loop: the closed set really is the five the contract
+        # names, so the loop below is not iterating over a set that quietly shrank.
+        self.assertEqual(len(forbidden), 5)
+        self.assertEqual(
+            forbidden,
+            frozenset(
+                {
+                    "timeout",
+                    "no_response",
+                    "model_confidence",
+                    "recommended_default",
+                    "worker_reviewer_agreement",
+                }
+            ),
+        )
+
+        for source in sorted(forbidden):
+            with self.subTest(source=source):
+                self.assertNotIn(source, self.policy.user_decision_sources)
+                outcome = decision_gate.evaluate_verification(
+                    self.policy, self.worker, self.downgrade_offering(source)
+                )
+                self.assertEqual(outcome.reason, decision_gate.DOWNGRADE_REJECTED)
+                # The Worker's classification survives the rejected downgrade.
+                self.assertEqual(
+                    outcome.block, ("NEEDS_INPUT", "blast_radius_beyond_scope")
+                )
+
+        # THE CONTROL, co-located: the SAME downgrade offered with a source the
+        # contract DOES admit is decided differently -- the transition is accepted and
+        # the round is still terminal (L6). Without this, DOWNGRADE_REJECTED above
+        # would also be produced by a gate that rejects every downgrade whatsoever.
+        for source in sorted(self.policy.user_decision_sources):
+            with self.subTest(admitted_source=source):
+                outcome = decision_gate.evaluate_verification(
+                    self.policy, self.worker, self.downgrade_offering(source)
+                )
+                self.assertNotEqual(outcome.reason, decision_gate.DOWNGRADE_REJECTED)
+                self.assertEqual(
+                    outcome.reason,
+                    decision_gate.block_reason(
+                        "NEEDS_INPUT", "blast_radius_beyond_scope"
+                    ),
+                )
+
+    def test_a_timeout_never_resolves_an_open_ledger_item(self) -> None:
+        """A5's half of the same claim: waiting does not close an item either."""
+        red = load_fixture("valid", "run_entry_declaration")
+        open_record = load_fixture("valid", "worker_needs_input")
+        open_key = decision_gate.ledger_key(open_record)
+        timed_out = dict(
+            load_fixture("valid", "worker_clear"),
+            sequence=2,
+            role="reviewer",
+            boundary="B3",
+            source="reviewer",
+            user_decision={
+                "source": "no_response",
+                "where_recorded": f"artifacts/runs/{RUN}/DECISION.md",
+                "resolves": open_key,
+            },
+        )
+
+        self.assertEqual(
+            decision_gate.open_items(self.policy, [red, open_record, timed_out]),
+            {open_key},
+        )
+        # THE CONTROL: an admissible authority in the same position DOES resolve it,
+        # so "still open" is a fact about the source and not about open_items().
+        answered = dict(
+            timed_out,
+            user_decision=dict(timed_out["user_decision"], source="explicit_user_reply"),
+        )
+        self.assertEqual(
+            decision_gate.open_items(self.policy, [red, open_record, answered]), set()
+        )
+
+
+class DownstreamExpansionTests(PolicyMixin):
+    """Scenario 8's drift rule: an expansion is a NEW decision event, never a link."""
+
+    def test_downstream_expands_decision_opens_a_new_item_and_links_nothing(
+        self,
+    ) -> None:
+        red = load_fixture("valid", "run_entry_declaration")
+        earlier = dict(
+            load_fixture("valid", "worker_assumption_allowed"),
+            phase="analysis",
+            responsible_phase="analysis",
+        )
+        # POSITIVE `downstream_expands_decision`: a later phase widens the earlier
+        # assumption past its declared scope, which is a NEW blocking item.
+        expanded = dict(
+            load_fixture("valid", "worker_conflict"),
+            sequence=2,
+            phase="implementation",
+            responsible_phase="implementation",
+        )
+
+        opened = decision_gate.open_items(self.policy, [red, earlier, expanded])
+
+        self.assertEqual(opened, {decision_gate.ledger_key(expanded)})
+        # It is a NEW event and NOT a lineage edge: no record may name the decision it
+        # widened. That boundary is OS-30's (L3 / R-10) and it is a CHECK here.
+        for record in (earlier, expanded):
+            for reserved in decision_gate.OS30_RESERVED_FIELDS:
+                with self.subTest(record=record["phase"], field=reserved):
+                    self.assertNotIn(reserved, record)
+                    smuggled = dict(record, **{reserved: decision_gate.ledger_key(earlier)})
+                    self.assertEqual(
+                        self.refusal(
+                            decision_gate.validate_ledger_record, self.policy, smuggled
+                        ),
+                        decision_gate.GATE_INPUT_MALFORMED,
+                    )
+        # NEGATIVE `downstream_within_original_decision`: the same later phase staying
+        # inside the earlier decision opens nothing, so "a new item appeared" above is
+        # attributable to the expansion and not to the presence of a second record.
+        inside = dict(
+            load_fixture("valid", "worker_clear"),
+            sequence=2,
+            phase="implementation",
+            responsible_phase="implementation",
+        )
+        self.assertEqual(
+            decision_gate.open_items(self.policy, [red, earlier, inside]), set()
+        )
+
+
+class MarkdownVersusMachineDriftTests(PolicyMixin):
+    """P7's anti-drift requirement, on the exact defect this run produced.
+
+    At ANALYSIS iteration 1 this run wrote, in Markdown, a line that reads as correct
+    -- `REASON_CODE: (none - CLEAR carries no reason code)` -- beside a machine record
+    that supplied that very string as the record's `reason_code`. The prose is fine;
+    the record is not. A validator that reads only the prose passes it.
+    """
+
+    #: The historical string, byte-for-byte. Not paraphrased: the point of the
+    #: fixture is that it is the real defect and not a constructed lookalike.
+    F001_PROSE_LINE = "REASON_CODE: (none - CLEAR carries no reason code)"
+
+    def test_the_iteration_one_reason_code_string_is_refused_by_the_gate(self) -> None:
+        defective = decision_half(load_fixture("invalid", "clear_carries_a_reason_code"))
+        # The fixture IS the historical defect, asserted rather than assumed.
+        self.assertEqual(defective["state"], "CLEAR")
+        self.assertEqual(
+            defective["reason_code"], "(none - CLEAR carries no reason code)"
+        )
+
+        body = gate_body("CLEAR", defective, narrative=False)
+        body = body.replace(
+            "STATUS: COMPLETE",
+            "STATUS: COMPLETE\n\n## Decision Record (optional)\n\n"
+            "DECISION_STATE: CLEAR\n" + self.F001_PROSE_LINE,
+        )
+        # The human half of the document reads exactly as it did in iteration 1 ...
+        self.assertIn(self.F001_PROSE_LINE, body)
+        self.assertIn("DECISION_STATE: CLEAR", body)
+        # ... and the document is still refused, on the machine record.
+        self.assertEqual(
+            self.refusal(decision_gate.parse_gate_result, body, self.policy),
+            decision_gate.GATE_INPUT_MALFORMED,
+        )
+
+        # THE CONTROL, co-located and differing in exactly one field: the SAME
+        # document with `reason_code: null` -- the correction this run actually made
+        # -- is ADMITTED, prose unchanged. So the refusal is attributable to the
+        # record's reason_code and not to the prose, to the section, or to the state.
+        corrected = dict(defective, reason_code=None)
+        control = gate_body("CLEAR", corrected, narrative=False).replace(
+            "STATUS: COMPLETE",
+            "STATUS: COMPLETE\n\n## Decision Record (optional)\n\n"
+            "DECISION_STATE: CLEAR\n" + self.F001_PROSE_LINE,
+        )
+        self.assertIn(self.F001_PROSE_LINE, control)
+        self.assertEqual(
+            decision_gate.parse_gate_result(control, self.policy).state, "CLEAR"
+        )
+        self.assertIsNone(
+            decision_gate.parse_gate_result(control, self.policy).reason_code
+        )
+
+    def test_the_same_string_is_refused_as_a_ledger_record(self) -> None:
+        """A4-iii: the defect is refused when the record is read BACK off the ledger
+        too, not only when it is parsed out of an agent result."""
+        defective = load_fixture("invalid", "clear_carries_a_reason_code")
+
+        self.assertEqual(
+            self.refusal(
+                decision_gate.validate_ledger_record, self.policy, defective
+            ),
+            decision_gate.GATE_INPUT_MALFORMED,
+        )
+        # CONTROL: the same record with a null reason code validates.
+        decision_gate.validate_ledger_record(
+            self.policy, dict(defective, reason_code=None)
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

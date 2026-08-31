@@ -108,6 +108,11 @@ def add_decision_gate_arguments(parser: argparse.ArgumentParser) -> None:
     # driven through the REAL subprocess rather than by calling the parser directly.
     parser.add_argument("--decision-gate-state-line-raw", action="append", default=None)
     parser.add_argument("--decision-gate-record-raw", default=None)
+    # OS-29 TEST phase: merge JSON into the DEFAULT record for the state, keeping the
+    # harness-stamped `verifies` binding that --decision-gate-record-raw discards.
+    # A record that must be BOTH bound and unusual -- a Reviewer offering a timeout as
+    # user authority, say -- is otherwise unreachable through the real subprocess.
+    parser.add_argument("--decision-gate-record-extend", default=None)
     parser.add_argument("--decision-gate-omit-field", action="store_true")
     parser.add_argument("--decision-gate-omit-block", action="store_true")
 
@@ -130,7 +135,11 @@ def render_decision_gate(args: argparse.Namespace, extra: dict | None = None) ->
         lines.extend(["```decision-gate", args.decision_gate_record_raw, "```"])
     elif state and not args.decision_gate_omit_block:
         record = dict(_DECISION_GATE_RECORDS[state])
+        if getattr(args, "decision_gate_record_extend", None):
+            record.update(json.loads(args.decision_gate_record_extend))
         if extra:
+            # LAST, so the harness-supplied binding always wins over a test's
+            # extension: a test may add fields, never forge the `verifies` edge.
             record.update(extra)
         lines.extend(
             ["```decision-gate", json.dumps(record, indent=2, sort_keys=True), "```"]

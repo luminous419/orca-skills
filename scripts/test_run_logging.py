@@ -4700,5 +4700,124 @@ class DecisionRecordSectionDriftTests(unittest.TestCase):
         )
 
 
+# =====================================================================================
+# OS-29 TEST phase: the ledger-DURABILITY halves PLAN P4 places in this module.
+# Additive; nothing above was edited. The A1-A6 JUDGEMENT over the same bytes stays in
+# scripts/test_decision_gate.py, because run_logging may not depend on the gate.
+# =====================================================================================
+class DecisionLedgerTestPhaseTests(unittest.TestCase):
+    RUN = "run_os29_ledger"
+    FIXTURES = (
+        Path(__file__).resolve().parents[1] / "scripts" / "fixtures" / "decision_gate"
+    )
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.base = Path(self.temporary_directory.name)
+        run_logging.open_decision_ledger(
+            self.RUN,
+            base=self.base,
+            phases=("implementation",),
+            risk="high",
+            ledger_schema_version=1,
+        )
+
+    def tearDown(self) -> None:
+        self.temporary_directory.cleanup()
+
+    def fixture(self, kind: str, name: str) -> dict:
+        return json.loads(
+            (self.FIXTURES / kind / f"{name}.json").read_text(encoding="utf-8")
+        )
+
+    def records(self):
+        return run_logging.read_decision_ledger(self.RUN, base=self.base)
+
+    def test_scenario_2_the_assumption_and_its_grounds_survive_the_round_trip(
+        self,
+    ) -> None:
+        """`assumption_allowed_six_facts_declared`, producer half: "record THEN
+        proceed" is only true if what was recorded is still there afterwards."""
+        record = dict(self.fixture("valid", "worker_assumption_allowed"), run=self.RUN)
+
+        run_logging.append_decision_ledger_record(
+            self.RUN, record, base=self.base, ledger_schema_version=1
+        )
+
+        written = self.records()[1]
+        self.assertEqual(written["state"], "ASSUMPTION_ALLOWED")
+        self.assertEqual(written["reason_code"], "repository_policy")
+        self.assertEqual(written["assumption"], "the module-local default applies")
+        self.assertTrue(written["grounds"])
+        self.assertEqual(written["policy_source"]["role"], "supports")
+        facts = (
+            "blast_radius", "monetary_cost", "security", "privacy", "compliance",
+            "long_term_lock_in",
+        )
+        self.assertEqual(len(facts), 6)                        # co-located guard
+        for fact in facts:
+            with self.subTest(fact=fact):
+                self.assertIn(fact, written)
+        self.assertEqual(written["blast_radius"], "module")
+        # CONTROL: the round trip is lossless in general, not lucky for these keys.
+        self.assertEqual(
+            {key: written[key] for key in record if key != "sequence"},
+            {key: record[key] for key in record if key != "sequence"},
+        )
+
+    def test_f10_the_declaration_is_never_rewritten_by_a_later_open_item(self) -> None:
+        """F10, producer half. `open_decision_ledger` is first-writer-wins, so a reused
+        run id keeps its ORIGINAL declaration even after the ledger gains an open
+        blocking record. That is precisely why A6 recomputes instead of trusting it:
+        the producer will not, and must not, retro-edit an append-only record."""
+        blocking = dict(self.fixture("valid", "worker_needs_input"), run=self.RUN)
+
+        run_logging.append_decision_ledger_record(
+            self.RUN, blocking, base=self.base, ledger_schema_version=1
+        )
+        # Re-opening the run -- what a second run with the same id does -- writes
+        # nothing and corrects nothing.
+        run_logging.open_decision_ledger(
+            self.RUN,
+            base=self.base,
+            phases=("implementation",),
+            risk="high",
+            ledger_schema_version=1,
+        )
+
+        records = self.records()
+        self.assertEqual(len(records), 2)
+        self.assertEqual(records[0]["sequence"], 0)
+        self.assertEqual(records[0]["prior_open_decision_items"], [])
+        self.assertIs(records[0]["open_decision_item"], False)
+        # ...while the ledger it describes demonstrably DOES hold an open item, so
+        # the declaration is stale rather than trivially true.
+        self.assertIs(records[1]["open_decision_item"], True)
+        self.assertEqual(records[1]["state"], "NEEDS_INPUT")
+
+    def test_a_published_record_is_never_edited_in_place(self) -> None:
+        """The append-only property the audit depends on: correcting a record means
+        writing a NEW one, so a later record can never launder an earlier claim."""
+        first = dict(self.fixture("valid", "worker_needs_input"), run=self.RUN)
+        _, first_sequence = run_logging.append_decision_ledger_record(
+            self.RUN, first, base=self.base, ledger_schema_version=1
+        )
+        before = json.dumps(self.records()[1], sort_keys=True)
+
+        _, second_sequence = run_logging.append_decision_ledger_record(
+            self.RUN,
+            dict(self.fixture("valid", "worker_clear"), run=self.RUN),
+            base=self.base,
+            ledger_schema_version=1,
+        )
+
+        self.assertEqual(second_sequence, first_sequence + 1)
+        self.assertEqual(json.dumps(self.records()[1], sort_keys=True), before)
+        # CONTROL: the second record really was written, so "unchanged" is not the
+        # answer of a writer that did nothing.
+        self.assertEqual(len(self.records()), 3)
+        self.assertEqual(self.records()[2]["state"], "CLEAR")
+
+
 if __name__ == "__main__":
     unittest.main()
