@@ -7030,11 +7030,18 @@ def quality_fail_consumes_iteration() -> FakeScenario:
 
 
 def implementation_midwork_block() -> FakeScenario:
-    """Scenario 5 POSITIVE: the Worker discovered it mid-work and returned BLOCKED."""
+    """Scenario 5 POSITIVE: the Worker discovered it mid-work and returned BLOCKED.
+
+    The Reviewer is supplied because P4 requires this scenario "at HIGH through P6b
+    row 2 -> row 4": B2 sets verification_only and the ALREADY-SCHEDULED Reviewer
+    confirms the classification at B3-V. At LOW the same fixture is terminal at B2 and
+    the Reviewer half is never reached, so one fixture serves both routes.
+    """
     return FakeScenario(
         worker_modes=("blocked",),
-        reviewer_modes=(),
+        reviewer_modes=("pass",),
         worker_decision_states=("CONFLICT",),
+        reviewer_decision_states=("CONFLICT",),
     )
 
 
@@ -7117,10 +7124,12 @@ def final_review_all_decisions_resolved() -> WorkflowScenario:
 
 #: (scenario, polarity, fixture name, builder, kind, status, reason, risk)
 #: `kind` is "round" for one Worker->Reviewer round and "workflow" for a full run.
-#: `risk` exists for ONE row: scenario 5's positive is asserted at LOW here, because at
-#: MEDIUM/HIGH the shipped build does not produce the decision terminal PLAN P4 requires
-#: of it. That gap is TEST-phase finding T-001 and it is pinned by the expectedFailure
-#: case below -- not papered over by asserting whatever the build does today.
+#: `risk` is carried per row rather than fixed at the module level so a row that must
+#: be asserted on a particular route can say so. Every row now runs at HIGH, scenario
+#: 5's positive included: TEST-phase finding T-001 -- the MEDIUM/HIGH midwork-block
+#: terminal collapsing to WORKER_BLOCKED -- was resolved under REVIEW_TEST.md F-001,
+#: and DecisionGateFindingT001Tests below asserts the LOW/MEDIUM/HIGH terminals are
+#: now equal rather than asserting whatever the build does today.
 OS29_SCENARIO_MATRIX = (
     (1, "+", "clear_pass_proceeds", clear_pass_proceeds,
      "workflow", "COMPLETED", None, "high"),
@@ -7139,10 +7148,10 @@ OS29_SCENARIO_MATRIX = (
      "round", "BLOCKED", "DECISION_BLOCKED:CONFLICT:requirement_contradiction", "high"),
     (4, "-", "conflict_downgraded_without_grounds", conflict_downgraded_without_grounds,
      "round", "BLOCKED", "DECISION_DOWNGRADE_REJECTED", "high"),
-    # T-001: at MEDIUM/HIGH this same fixture returns WORKER_BLOCKED with empty
-    # decision columns. Asserted at LOW here and pinned as a finding below.
+    # P4: "asserted at HIGH through P6b row 2 -> row 4". The LOW route (row 2's B2
+    # terminal) and the cross-risk equality are asserted in DecisionGateFindingT001Tests.
     (5, "+", "implementation_midwork_block", implementation_midwork_block,
-     "round", "BLOCKED", "DECISION_BLOCKED:CONFLICT:requirement_contradiction", "low"),
+     "round", "BLOCKED", "DECISION_BLOCKED:CONFLICT:requirement_contradiction", "high"),
     (5, "-", "implementation_same_item_declared_clear", implementation_same_item_declared_clear,
      "round", "COMPLETED", None, "high"),
     (6, "+", "worker_unauthorized_high_impact", worker_unauthorized_high_impact,
@@ -7224,7 +7233,7 @@ class DecisionGateScenarioMatrixTests(_OS29HarnessMixin, unittest.TestCase):
 
 
 class DecisionGateFindingT001Tests(_OS29HarnessMixin, unittest.TestCase):
-    """TEST-phase finding T-001, pinned as an executable case.
+    """TEST-phase finding T-001 / REVIEW_TEST.md F-001, kept as an executable case.
 
     THE REQUIREMENT. PLAN P6b row 2 says a valid `NEEDS_INPUT`/`CONFLICT` Worker gate
     result is terminal at LOW at B2 and, at MEDIUM/HIGH, sets `verification_only` and
@@ -7238,21 +7247,20 @@ class DecisionGateFindingT001Tests(_OS29HarnessMixin, unittest.TestCase):
     row 2 -> row 4, and at LOW through row 2's B2 terminal", and "`reason` must be
     `DECISION_BLOCKED:...`, NOT `WORKER_BLOCKED`".
 
-    THE BUILD. `e2e_harness.run()` does set `verification_only` for this shape, and
-    then the very next branch -- `if worker_status == self.contract.worker_blocked:` --
-    returns `WORKER_BLOCKED` before the Reviewer is reached. The guard is above the
-    branch, but its RESULT is not carried across it.
+    THE DEFECT, as reported at TEST iteration 1. `e2e_harness.run()` set
+    `verification_only` for this shape and then the very next branch -- `if
+    worker_status == self.contract.worker_blocked:` -- returned `WORKER_BLOCKED` before
+    the Reviewer was reached. The guard was above the branch, but its RESULT was not
+    carried across it, so the LOW round ended with (`BLOCKED`, `CONFLICT`,
+    `requirement_contradiction`) and the MEDIUM/HIGH round with (`BLOCKED`, `''`, `''`).
 
-    THE CONSEQUENCE, which is why this is a finding and not a note: the LOW round ends
-    with (`BLOCKED`, `CONFLICT`, `requirement_contradiction`) and the MEDIUM/HIGH round
-    with (`BLOCKED`, `''`, `''`). The terminal is not risk-independent, the machine-
-    readable decision state and reason code that ORIGINAL_REQUEST's provenance section
-    requires are absent on two of three risk levels, and no verification Reviewer runs.
-
-    The case below asserts the REQUIREMENT and is marked expectedFailure. It is not
-    marked skip: a skip would stop reporting, and an unexpected success is itself a
-    failure, so the marker has to be deleted deliberately when the defect is fixed.
-    The TEST phase does not repair production code (template `Mandatory Invariants`).
+    THE FIX, made at TEST iteration 2 under the phase Reviewer's Required Action: that
+    branch now reads `and not verification_only`, so the round stays on the decision
+    axis and reaches B3-V. The requirement case below is no longer `expectedFailure` --
+    it passes normally, which is the only reason the marker was removed. The control in
+    `test_the_worker_blocked_terminal_still_exists` is what keeps the fix narrow: a
+    Worker-declared BLOCKED with NO decision block never sets `verification_only`, so
+    it still terminates as a plain `WORKER_BLOCKED` at every risk level.
     """
 
     def midwork(self, risk: str):
@@ -7271,10 +7279,18 @@ class DecisionGateFindingT001Tests(_OS29HarnessMixin, unittest.TestCase):
                 self.RUN_ID, base=workspace
             )
 
-    def test_the_low_terminal_is_correct_today(self) -> None:
-        """The half that HOLDS, asserted so the finding below is scoped to MEDIUM/HIGH
-        and is not read as "scenario 5 is broken everywhere"."""
-        low, _ = self.midwork("low")
+    def test_the_ledger_records_the_route_each_risk_level_actually_took(self) -> None:
+        """The terminals are equal across risks; the LEDGERS are not, and must not be.
+
+        Equality of the terminal is the requirement. It is not the same claim as "the
+        two risk levels ran the same machinery", and asserting only the terminal would
+        pass on a build that reached it by skipping the Reviewer. So this case pins the
+        ROUTE: LOW stops at row 2's B2 terminal with no Reviewer, MEDIUM/HIGH carry the
+        B2 classification across to the already-scheduled Reviewer and add its B3
+        verification record. One Worker attempt either way -- a decision block charges
+        no correction iteration on any route.
+        """
+        low, low_ledger = self.midwork("low")
 
         self.assertEqual(low.final_status, "BLOCKED")
         self.assertEqual(
@@ -7283,21 +7299,57 @@ class DecisionGateFindingT001Tests(_OS29HarnessMixin, unittest.TestCase):
         self.assertEqual(low.decision_state, "CONFLICT")
         self.assertEqual(low.decision_reason_code, "requirement_contradiction")
         self.assertIsNotNone(low.decision_block)
-        # The B2 ledger record IS written correctly before the terminal, at every risk
-        # level. That is what bounds T-001 to the TRANSITION rather than the record --
-        # and it is asserted here rather than assumed, because "the provenance is lost"
-        # would be a different and larger finding.
-        for risk in ("low", "medium", "high"):
+        self.assertEqual(len(low.worker_attempts), 1)
+        self.assertEqual(len(low.reviewer_attempts), 0)
+        self.assertEqual(
+            [(record["state"], record["boundary"]) for record in low_ledger],
+            [("CLEAR", "B1"), ("CONFLICT", "B2")],
+        )
+        self.assertEqual(low_ledger[1]["reason_code"], "requirement_contradiction")
+
+        for risk in ("medium", "high"):
             with self.subTest(risk=risk):
                 result, ledger = self.midwork(risk)
                 self.assertEqual(len(result.worker_attempts), 1)
+                # The verification Reviewer that T-001 reported as never running.
+                self.assertEqual(len(result.reviewer_attempts), 1)
                 self.assertEqual(
                     [(record["state"], record["boundary"]) for record in ledger],
-                    [("CLEAR", "B1"), ("CONFLICT", "B2")],
+                    [("CLEAR", "B1"), ("CONFLICT", "B2"), ("CONFLICT", "B3")],
                 )
                 self.assertEqual(ledger[1]["reason_code"], "requirement_contradiction")
+                # B3-V is BOUND to the B2 record it verified, not a free-standing
+                # second opinion: that binding is what makes the equal terminal
+                # provenance rather than coincidence.
+                self.assertEqual(
+                    ledger[2]["verifies"]["worker_record_key"],
+                    decision_gate.ledger_key(ledger[1]),
+                )
 
-    @unittest.expectedFailure
+    def test_the_worker_blocked_terminal_still_exists(self) -> None:
+        """THE CONTROL for the F-001 fix, at the risk levels the fix touched.
+
+        The fix skips the `WORKER_BLOCKED` branch only when B2 set `verification_only`.
+        A Worker-declared BLOCKED with no decision block must therefore be unchanged --
+        otherwise the fix would have deleted a real terminal instead of narrowing one.
+        """
+        for risk in ("low", "medium", "high"):
+            with self.subTest(risk=risk):
+                with tempfile.TemporaryDirectory() as directory:
+                    plain = self.harness(Path(directory), risk=risk).run(
+                        FakeScenario(
+                            worker_modes=("blocked",), reviewer_modes=("pass",)
+                        )
+                    )
+                self.assertEqual(plain.final_status, "BLOCKED")
+                self.assertEqual(plain.reason, "WORKER_BLOCKED")
+                self.assertIsNone(plain.decision_block)
+                self.assertEqual(plain.decision_state, "")
+                self.assertEqual(plain.decision_reason_code, "")
+                # It never reached the Reviewer either: the quality axis owns this
+                # terminal, exactly as before.
+                self.assertEqual(len(plain.reviewer_attempts), 0)
+
     def test_t001_a_midwork_block_must_be_a_decision_terminal_at_every_risk_level(
         self,
     ) -> None:

@@ -1281,7 +1281,18 @@ class E2EHarness:
                 verification_only = True
             # ======== end B2
 
-            if worker_status == self.contract.worker_blocked:
+            if worker_status == self.contract.worker_blocked and not verification_only:
+                # O-2, completed: the decision axis is evaluated BEFORE the quality
+                # axis, so a Worker that discovered a blocking decision mid-work and
+                # declared it stays on the decision axis. Setting `verification_only`
+                # above is not enough on its own -- its RESULT has to be carried
+                # ACROSS this branch, or the MEDIUM/HIGH round is swallowed as a
+                # generic WORKER_BLOCKED before the already-scheduled verification
+                # Reviewer runs, and the terminal loses the machine-readable state and
+                # reason code the LOW terminal carries. A Worker-declared BLOCKED with
+                # NO blocking decision never sets `verification_only`, so it still
+                # terminates here as a plain WORKER_BLOCKED -- that distinction is the
+                # point of the guard, not a casualty of it.
                 return WorkflowResult(
                     current_phase=self.phase,
                     current_iteration=iteration,
