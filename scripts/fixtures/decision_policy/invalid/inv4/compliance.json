@@ -1,0 +1,18 @@
+{
+  "state": "ASSUMPTION_ALLOWED",
+  "reason_code": "repository_policy",
+  "policy_source": {
+    "kind": "file_path",
+    "locator": "scripts/",
+    "role": "supports"
+  },
+  "impact": "one edit inside this run's own change scope",
+  "retraction_condition": "n/a",
+  "reversibility": "reversible_in_run",
+  "blast_radius": "current_change",
+  "compliance": true,
+  "monetary_cost": false,
+  "security": false,
+  "privacy": false,
+  "long_term_lock_in": false
+}

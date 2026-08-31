@@ -1,0 +1,12 @@
+{
+  "state": "NEEDS_INPUT",
+  "reason_code": "unclassifiable_decision",
+  "what_is_missing": "which treatment the user wants for this item",
+  "why_policy_cannot_decide": "no policy source addresses it and no closed-set code matches",
+  "classification_attempted": [
+    "CLEAR ruled out: no policy source determines the choice",
+    "ASSUMPTION_ALLOWED ruled out: no policy source supports it either",
+    "CONFLICT ruled out: nothing contradicts, information is absent rather than opposed"
+  ],
+  "unclassifiable": true
+}

@@ -1,0 +1,18 @@
+{
+  "reversibility": "reversible_in_run",
+  "impact": "chooses the wording of one generated section",
+  "state": "ASSUMPTION_ALLOWED",
+  "reason_code": "quality_profile_attribute",
+  "policy_source": {
+    "kind": "quality_attribute_id",
+    "locator": "DOMAIN-001",
+    "role": "supports"
+  },
+  "retraction_condition": "the profile changes or the attribute is withdrawn",
+  "blast_radius": "current_change",
+  "monetary_cost": false,
+  "security": false,
+  "privacy": false,
+  "compliance": false,
+  "long_term_lock_in": false
+}

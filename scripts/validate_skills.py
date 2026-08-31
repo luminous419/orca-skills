@@ -9,6 +9,17 @@ from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
 import run_logging
+from decision_policy import (
+    AXIS_TOKENS,
+    CANONICAL_INDEPENDENT_AXES,
+    DECISION_POLICY_MAX_LINES,
+    DECLARATIVE_KEYS,
+    STATE_SELECTION_INPUTS,
+    TRANSITION_VALUES,
+    WORKFLOW_VALUES,
+    DecisionPolicyError,
+    load_decision_policy,
+)
 from skill_policy import PolicyContractError, load_policy_contract, load_risk_contract
 from workflow_contract import WorkflowContractError, load_workflow_output_contract
 
@@ -416,6 +427,306 @@ RISK_CONTRACT: dict[str, tuple[str, ...]] = {
     "RISK_SAFETY_FLOOR": ("mandatory_test_gates_apply_at_every_level",),
 }
 RISK_CONTRACT_MAX_LINES = 20
+# ---- OS-28: the decision policy contract --------------------------------------
+# The expected constant exists for the SIMULTANEOUS-DELETION blind spot: the shared
+# policy-contract JSON is asserted deep-equal between the Skills, which proves they
+# AGREE but not that they agree on something correct. Delete a reason code from both
+# blocks and deep-equality still passes. Same idiom as RISK_CONTRACT above.
+DECISION_POLICY_REASON_CODES: dict[str, tuple[str, str | None, str | None]] = {
+    "repository_policy": ("ASSUMPTION_ALLOWED", None, None),
+    "explicit_requirement": ("ASSUMPTION_ALLOWED", None, None),
+    "phase_contract": ("ASSUMPTION_ALLOWED", None, None),
+    "quality_profile_attribute": ("ASSUMPTION_ALLOWED", None, None),
+    "ambiguous_requirement": ("NEEDS_INPUT", "N-1", "ambiguity"),
+    "missing_user_intent": ("NEEDS_INPUT", "N-2", "ambiguity"),
+    "irreversible_action": ("NEEDS_INPUT", "N-1", "reversibility"),
+    "blast_radius_beyond_scope": ("NEEDS_INPUT", "N-1", "blast_radius"),
+    "monetary_cost": ("NEEDS_INPUT", "N-1", "monetary_cost"),
+    "security_impact": ("NEEDS_INPUT", "N-1", "security"),
+    "privacy_impact": ("NEEDS_INPUT", "N-1", "privacy"),
+    "compliance_impact": ("NEEDS_INPUT", "N-1", "compliance"),
+    "long_term_lock_in": ("NEEDS_INPUT", "N-1", "long_term_lock_in"),
+    "authority_reserved_to_user": ("NEEDS_INPUT", "N-1", "explicit_user_authority"),
+    "unclassifiable_decision": ("NEEDS_INPUT", "N-3", None),
+    "requirement_contradiction": ("CONFLICT", "C-1", None),
+    "requirement_vs_accepted_decision": ("CONFLICT", "C-2", None),
+    "requirement_vs_safety_floor": ("CONFLICT", "C-3", None),
+}
+DECISION_POLICY_CODE_COUNT = 18  # UD-4
+# TEST phase: the constant above pinned only the reason codes, which left the
+# semantic core unpinned. Five surgical mutations passed every check --
+# NEEDS_INPUT's workflow flipped to "continue" (a legal member of the closed set,
+# so C11c was satisfied while bounded autonomy was defeated), the two other state
+# flags, INV-4's blast-radius clause emptied, and aggregate_order inverted so CLEAR
+# would dominate CONFLICT. Closed-set membership is not the same as correct value;
+# these pin the values.
+DECISION_POLICY_STATES = {
+    "CLEAR": ("continue", False, False),
+    "ASSUMPTION_ALLOWED": ("continue_and_review", False, True),
+    "NEEDS_INPUT": ("pause_and_ask", True, True),
+    "CONFLICT": ("pause_and_request_resolution", True, True),
+}
+# FR-1: the full 4x4 matrix, pinned BY VALUE. C8 compared only the set of cells whose
+# value is "forbidden" and C11c only closed-set membership, so both Skills'
+# NEEDS_INPUT -> CLEAR could be relaxed from requires_user_decision to the equally
+# legal "allowed" and the validator stayed green at 626 checks. Reproduced on a
+# disposable `git archive HEAD` copy before this constant existed. Membership in a
+# closed set is not the same as a correct value -- the same lesson C15-C23 applied to
+# the state semantics, now applied to the edges.
+DECISION_POLICY_TRANSITIONS = {
+    ("CLEAR", "CLEAR"): "allowed",
+    ("CLEAR", "ASSUMPTION_ALLOWED"): "allowed",
+    ("CLEAR", "NEEDS_INPUT"): "allowed",
+    ("CLEAR", "CONFLICT"): "allowed",
+    ("ASSUMPTION_ALLOWED", "CLEAR"): "requires_retraction",
+    ("ASSUMPTION_ALLOWED", "ASSUMPTION_ALLOWED"): "allowed",
+    ("ASSUMPTION_ALLOWED", "NEEDS_INPUT"): "allowed",
+    ("ASSUMPTION_ALLOWED", "CONFLICT"): "allowed",
+    ("NEEDS_INPUT", "CLEAR"): "requires_user_decision",
+    ("NEEDS_INPUT", "ASSUMPTION_ALLOWED"): "forbidden",
+    ("NEEDS_INPUT", "NEEDS_INPUT"): "allowed",
+    ("NEEDS_INPUT", "CONFLICT"): "allowed",
+    ("CONFLICT", "CLEAR"): "requires_user_decision",
+    ("CONFLICT", "ASSUMPTION_ALLOWED"): "forbidden",
+    ("CONFLICT", "NEEDS_INPUT"): "allowed",
+    ("CONFLICT", "CONFLICT"): "allowed",
+}
+# The two edges that carry the authority boundary. Named separately so a failure says
+# which promise broke, not merely that a table drifted.
+DECISION_POLICY_AUTHORITY_EDGES = {
+    ("NEEDS_INPUT", "CLEAR"),
+    ("CONFLICT", "CLEAR"),
+}
+# Found by the same-shape sweep FR-1 prompted: these four keys were also checked only
+# for names or membership, never for value. Each mutation below passed every check.
+# The fourth tuple slot is `triggering` -- which value(s) make the element TRUE in
+# A3-1's sense. FR-4 made these load-bearing for permitted_states, so they are pinned
+# by value like everything else; leaving them unpinned would be the FR-1 gap again.
+DECISION_POLICY_BOUNDARY_ELEMENT_SPECS = {
+    "ambiguity": ("declared", (), None, True),
+    "explicit_requirement_conflict": ("citations", (), 2, "at_minimum"),
+    "reversibility": (
+        "enum",
+        ("reversible_in_run", "reversible_with_effort", "irreversible"),
+        None,
+        ("irreversible",),
+    ),
+    "blast_radius": (
+        "enum",
+        ("current_change", "module", "repository", "external_system"),
+        None,
+        ("repository", "external_system"),
+    ),
+    "monetary_cost": ("boolean", (), None, True),
+    "security": ("boolean", (), None, True),
+    "privacy": ("boolean", (), None, True),
+    "compliance": ("boolean", (), None, True),
+    "long_term_lock_in": ("boolean", (), None, True),
+    "repository_project_policy": ("policy_source", (), None, None),
+    "explicit_user_authority": ("user_decision", (), None, ("reserved",)),
+}
+# FR-4: A3-1's entry conditions, made machine-evaluable. permitted_states() evaluates
+# these rather than assuming a fixed starting set, so they are the contract's most
+# authority-relevant data and are pinned cell by cell.
+# RI3-1: the two cells A4-0 marks as things a determining policy source CANNOT
+# resolve -- "a policy source cannot un-reserve it" and "a policy source cannot
+# arbitrate two explicit requirements". Pinned by value like every other authority
+# datum, because widening this list is how the precedence would quietly come undone.
+DECISION_POLICY_CANNOT_RESOLVE = (
+    "explicit_user_authority",
+    "explicit_requirement_conflict",
+)
+DECISION_POLICY_ENTRY_CONDITIONS = {
+    "CLEAR": (
+        "any_of",
+        (
+            "no_open_decision_item",
+            "determining_policy_source",
+            "explicit_user_authorization",
+        ),
+    ),
+    "ASSUMPTION_ALLOWED": (
+        "all_of",
+        (
+            "all_safety_facts_declared",
+            "reversible_in_run",
+            "blast_radius_within_scope",
+            "no_high_impact_element",
+            "supporting_policy_source",
+            "no_reserved_user_authority",
+        ),
+    ),
+    "NEEDS_INPUT": (
+        "any_of",
+        ("undetermined_boundary_element", "absent_user_intent", "unclassifiable_item"),
+    ),
+    "CONFLICT": ("any_of", ("declared_contradiction",)),
+}
+DECISION_POLICY_SOURCE_ROLES = ("determines", "supports")
+DECISION_POLICY_SOURCE_KINDS = (
+    "file_path",
+    "requirement_id",
+    "quality_attribute_id",
+    "phase_contract_section",
+)
+DECISION_POLICY_STATE_SCOPE = "per_decision_item_with_derived_check_aggregate"
+DECISION_POLICY_AGGREGATE_ORDER = (
+    "CONFLICT",
+    "NEEDS_INPUT",
+    "ASSUMPTION_ALLOWED",
+    "CLEAR",
+)
+DECISION_POLICY_FORBIDDEN_WHEN = {
+    "reversibility_in": ["irreversible"],
+    "blast_radius_in_with_irreversible": ["repository", "external_system"],
+    "any_true_of": [
+        "monetary_cost",
+        "security",
+        "privacy",
+        "compliance",
+        "long_term_lock_in",
+    ],
+    "explicit_user_authority_reserved": True,
+    "exception_allowed": False,
+}
+DECISION_POLICY_ASSUMPTION_REQUIRES = {
+    "policy_source_role": "supports",
+    "all_required_evidence_non_empty": True,
+    # F-001. The facts an ASSUMPTION_ALLOWED record must DECLARE, pinned by value for
+    # the reason every other authority datum here is: shortening this list is how the
+    # fail-open would come back, and it would come back silently -- a shorter list
+    # rejects nothing new, so every test and fixture would stay green while an
+    # undeclared blast radius or security flag again read as safe.
+    "declared_safety_facts": [
+        "blast_radius",
+        "monetary_cost",
+        "security",
+        "privacy",
+        "compliance",
+        "long_term_lock_in",
+    ],
+    # Pinned because it is a RULE, not a default: flipping it to "reserved" changes
+    # what an unstated user authority means, and that must not happen unnoticed.
+    "absent_explicit_user_authority": "not_reserved",
+}
+# F-002. Which predicate PROVES each entry clause. Pinned by value: repointing N-2 at
+# `undetermined_boundary_element` would restore exactly the defect the review found --
+# `missing_user_intent` satisfied by evidence that says nothing about user intent --
+# and closed-set membership alone would not notice.
+DECISION_POLICY_CLAUSE_PREDICATES = {
+    "N-1": "undetermined_boundary_element",
+    "N-2": "absent_user_intent",
+    "N-3": "unclassifiable_item",
+    "C-1": "declared_contradiction",
+    "C-2": "declared_contradiction",
+    "C-3": "declared_contradiction",
+}
+DECISION_POLICY_USER_DECISION_FIELDS = ("source", "where_recorded", "resolves")
+# FR-2: the closed POSITIVE vocabulary for user authority. The denylist below no
+# longer enforces anything -- enforcement is membership in this set, and an
+# unrecognised source is rejected. These two values are the only shapes ANALYSIS
+# A4-0 identifies: an in-run answer to a structured question, and a standing
+# authorization carried from the original request.
+DECISION_POLICY_USER_DECISION_SOURCES = (
+    "explicit_user_reply",
+    "prior_explicit_user_authorization",
+)
+DECISION_POLICY_CITATION_MINIMUM = {"CONFLICT": 2}
+DECISION_POLICY_REQUIRED_EVIDENCE = {
+    "CLEAR": (),
+    "ASSUMPTION_ALLOWED": (
+        "reason_code",
+        "policy_source",
+        "reversibility",
+        "impact",
+        "retraction_condition",
+    ),
+    "NEEDS_INPUT": (
+        "reason_code",
+        "boundary_element",
+        "what_is_missing",
+        "why_policy_cannot_decide",
+    ),
+    "CONFLICT": ("reason_code", "citations", "why_they_cannot_both_hold"),
+}
+# Entry-clause prose and the downstream rule are pinned by VALUE. DESIGN F-5 records
+# that a coordinated edit of both Skills AND this constant still passes every static
+# check -- that remains true and is still only caught by human diff review. What this
+# does close is the two-file variant: editing the Skills alone now fails here.
+DECISION_POLICY_ENTRY_CLAUSES = {
+    "NEEDS_INPUT": {
+        "N-1": (
+            "a boundary element is true, is not determined by a policy source, and "
+            "is not decided by an explicit authorization"
+        ),
+        "N-2": "required user intent is absent",
+        "N-3": (
+            "the item crosses the autonomy boundary but cannot be classified under "
+            "these closed vocabularies"
+        ),
+    },
+    "CONFLICT": {
+        "C-1": "two or more explicit requirements are contradictory",
+        "C-2": (
+            "an explicit requirement contradicts an already-accepted decision of "
+            "this run"
+        ),
+        "C-3": (
+            "an explicit requirement contradicts a non-overridable project invariant"
+        ),
+    },
+}
+DECISION_POLICY_DOWNSTREAM_RULE = (
+    "an unresolved NEEDS_INPUT or CONFLICT item may not be reported CLEAR by a "
+    "later phase"
+)
+DECISION_POLICY_PER_STATE = {"ASSUMPTION_ALLOWED": 4, "NEEDS_INPUT": 11, "CONFLICT": 3}
+DECISION_POLICY_BOUNDARY_ELEMENTS = (
+    "ambiguity",
+    "explicit_requirement_conflict",
+    "reversibility",
+    "blast_radius",
+    "monetary_cost",
+    "security",
+    "privacy",
+    "compliance",
+    "long_term_lock_in",
+    "repository_project_policy",
+    "explicit_user_authority",
+)
+DECISION_POLICY_FORBIDDEN_CELLS = {
+    ("NEEDS_INPUT", "ASSUMPTION_ALLOWED"),
+    ("CONFLICT", "ASSUMPTION_ALLOWED"),
+}
+DECISION_POLICY_REJECT_LIST = (
+    "model_confidence",
+    "timeout",
+    "no_response",
+    "worker_reviewer_agreement",
+    "recommended_default",
+)
+DECISION_POLICY_BLOCK_PATTERN = re.compile(
+    r'\n  "decision_policy": \{\n(?P<body>.*?)\n  \}\n\}', re.DOTALL
+)
+# Sentences the machine block only INDEXES. Byte-equality catches divergence between
+# the Skills; it cannot catch a sentence deleted from BOTH copies. These anchors can.
+DECISION_POLICY_SKILL_PROSE_ANCHORS = (
+    "decision state는 RUN_STATUS / Worker STATUS / REVIEW_VERDICT와 별개의 축이다",
+    "NEEDS_INPUT은 정보가 없는 것이고 CONFLICT는 정보가 모순되는 것이다",
+    "답변을 받은 항목은 CLEAR가 되며 ASSUMPTION_ALLOWED가 되지 않는다",
+    "INV-4에는 예외가 없다",
+    # F-001 / F-002: the two sentences the section would be WRONG without after this
+    # fix, held to the same standard as the four above. A reader who takes "not
+    # declared" for "false", or a code's clause for a proof of that clause, has the
+    # contract backwards -- and both readings were true of the shipped code.
+    "선언하지 않은 fact는 거짓이 아니라 미상이며",
+    "reason code가 rest하는 clause는 record에서 실제로",
+)
+DECISION_RECORD_OPTIONALITY_ANCHOR = (
+    "optional section이다. 없어도 계약 위반이 아니다."
+)
+DECISION_RECORD_TEMPLATE_ANCHOR = "## Decision Record (optional)"
+
 RISK_SECTION_HEADING = "## 8. Phase Sequence Contract"
 RISK_SECTION_END = "\n## 9."
 # The prose the block is only an index into. Each is a sentence the section would be
@@ -1939,6 +2250,297 @@ def validate_agent_profile_contract(validation: Validation) -> None:
         )
 
 
+def validate_decision_policy_contract(validation: Validation) -> None:
+    """OS-28 checks C1-C14. Imports the loader rather than re-parsing the block, the
+    same dependency direction validate_risk_profile_contract has toward
+    skill_policy.load_risk_contract -- so the runtime evaluator and this validator
+    cannot disagree about what the contract says."""
+
+    policies = {}
+    for skill_dir in SKILL_DIRS:
+        skill_path = skill_dir / "SKILL.md"
+        if not skill_path.is_file():
+            continue
+        try:  # C1
+            policies[skill_dir.name] = load_decision_policy(skill_path)
+        except (OSError, PolicyContractError, DecisionPolicyError) as exc:
+            validation.check(
+                False, f"{skill_dir.name}: decision policy contract is missing or malformed: {exc}"
+            )
+
+    if len(policies) != len(SKILL_DIRS):
+        return
+
+    for name, policy in policies.items():
+        observed = {
+            code: (spec.state, spec.clause, spec.boundary_element)
+            for code, spec in policy.reason_codes.items()
+        }
+        validation.check(  # C2
+            set(observed) == set(DECISION_POLICY_REASON_CODES),
+            f"{name}: decision policy contract keys drifted",
+        )
+        validation.check(  # C3
+            observed == DECISION_POLICY_REASON_CODES,
+            f"{name}: decision policy contract values drifted",
+        )
+        validation.check(  # C5
+            len(policy.reason_codes) == DECISION_POLICY_CODE_COUNT,
+            f"{name}: decision policy reason-code cardinality drifted "
+            f"(expected {DECISION_POLICY_CODE_COUNT})",
+        )
+        per_state = {
+            state: sum(1 for c in policy.reason_codes.values() if c.state == state)
+            for state in DECISION_POLICY_PER_STATE
+        }
+        validation.check(
+            per_state == DECISION_POLICY_PER_STATE,
+            f"{name}: decision policy per-state reason-code split drifted",
+        )
+        validation.check(
+            tuple(policy.boundary_elements) == DECISION_POLICY_BOUNDARY_ELEMENTS,
+            f"{name}: decision policy boundary elements drifted",
+        )
+        for code, spec in sorted(policy.reason_codes.items()):  # C6
+            if spec.state in policy.entry_clauses:
+                ok = spec.clause in policy.entry_clauses[spec.state]
+            else:
+                ok = spec.clause is None
+            validation.check(
+                ok, f"{name}: reason code {code} has no valid entry clause"
+            )
+        skill_text = (REPO_ROOT / name / "SKILL.md").read_text(encoding="utf-8")
+        match = DECISION_POLICY_BLOCK_PATTERN.search(skill_text)
+        validation.check(  # C7
+            match is not None
+            and 0 < len(match.group("body").splitlines()) <= DECISION_POLICY_MAX_LINES,
+            f"{name}: decision policy contract block exceeds "
+            f"{DECISION_POLICY_MAX_LINES} lines",
+        )
+        forbidden = {
+            pair for pair, rule in policy.transitions.items() if rule == "forbidden"
+        }
+        validation.check(  # C8
+            forbidden == DECISION_POLICY_FORBIDDEN_CELLS,
+            f"{name}: NEEDS_INPUT/CONFLICT -> ASSUMPTION_ALLOWED must be forbidden",
+        )
+        validation.check(  # C9
+            policy.assumption_allowed_forbidden_when.get("exception_allowed") is False,
+            f"{name}: INV-4 must have no exception",
+        )
+        observed_states = {
+            state: (spec.workflow, spec.user_decision_required, spec.reason_code_required)
+            for state, spec in policy.states.items()
+        }
+        validation.check(  # C15
+            observed_states == DECISION_POLICY_STATES,
+            f"{name}: decision policy state semantics drifted "
+            "(workflow / user_decision_required / reason_code_required)",
+        )
+        validation.check(  # C16
+            policy.aggregate_order == DECISION_POLICY_AGGREGATE_ORDER,
+            f"{name}: decision policy aggregate order drifted",
+        )
+        validation.check(  # C26
+            dict(policy.transitions) == DECISION_POLICY_TRANSITIONS,
+            f"{name}: the transition matrix drifted -- every cell is pinned by value, "
+            "not merely by closed-set membership",
+        )
+        for edge in sorted(DECISION_POLICY_AUTHORITY_EDGES):  # C26a
+            validation.check(
+                policy.transitions.get(edge) == "requires_user_decision",
+                f"{name}: {edge[0]} -> {edge[1]} must require a user decision; "
+                f"found {policy.transitions.get(edge)!r}",
+            )
+        observed_elements = {
+            element: (
+                spec.kind,
+                tuple(spec.values),
+                spec.minimum,
+                tuple(spec.triggering)
+                if isinstance(spec.triggering, list)
+                else spec.triggering,
+            )
+            for element, spec in policy.boundary_elements.items()
+        }
+        validation.check(  # C27
+            observed_elements == DECISION_POLICY_BOUNDARY_ELEMENT_SPECS,
+            f"{name}: boundary element specifications drifted "
+            "(kind / enum values / minimum)",
+        )
+        validation.check(  # C28
+            policy.policy_source_roles == DECISION_POLICY_SOURCE_ROLES
+            and policy.policy_source_kinds == DECISION_POLICY_SOURCE_KINDS,
+            f"{name}: policy source roles or kinds drifted",
+        )
+        validation.check(  # C29
+            policy.state_scope == DECISION_POLICY_STATE_SCOPE,
+            f"{name}: decision state scope drifted",
+        )
+        observed_conditions = {
+            state: next(
+                (combinator, tuple(predicates))
+                for combinator, predicates in condition.items()
+            )
+            for state, condition in policy.entry_conditions.items()
+        }
+        validation.check(  # C31
+            tuple(sorted(policy.policy_source_cannot_resolve))
+            == tuple(sorted(DECISION_POLICY_CANNOT_RESOLVE)),
+            f"{name}: authority precedence drifted -- a policy source must not "
+            "resolve reserved user authority or an explicit requirement conflict",
+        )
+        validation.check(  # C30
+            observed_conditions == DECISION_POLICY_ENTRY_CONDITIONS,
+            f"{name}: state entry conditions drifted -- permitted_states evaluates "
+            "these, so a change here moves the authority boundary",
+        )
+        validation.check(  # C17
+            dict(policy.assumption_allowed_forbidden_when)
+            == DECISION_POLICY_FORBIDDEN_WHEN,
+            f"{name}: INV-4 forbidden-when conditions drifted",
+        )
+        validation.check(  # C18
+            dict(policy.assumption_allowed_requires)
+            == DECISION_POLICY_ASSUMPTION_REQUIRES,
+            f"{name}: INV-3 assumption requirements drifted",
+        )
+        validation.check(  # C19
+            policy.user_decision_fields == DECISION_POLICY_USER_DECISION_FIELDS,
+            f"{name}: user_decision required fields drifted",
+        )
+        validation.check(  # C24
+            tuple(sorted(policy.user_decision_sources))
+            == tuple(sorted(DECISION_POLICY_USER_DECISION_SOURCES)),
+            f"{name}: the user-authority positive vocabulary drifted",
+        )
+        validation.check(  # C25
+            not (policy.user_decision_sources & policy.forbidden_authority_sources),
+            f"{name}: the user-authority vocabulary admits a forbidden source",
+        )
+        validation.check(  # C20
+            dict(policy.citation_minimum) == DECISION_POLICY_CITATION_MINIMUM,
+            f"{name}: CONFLICT citation minimum drifted",
+        )
+        validation.check(  # C21
+            {s: tuple(f) for s, f in policy.required_evidence.items()}
+            == DECISION_POLICY_REQUIRED_EVIDENCE,
+            f"{name}: per-state required evidence drifted",
+        )
+        validation.check(  # C22
+            {s: dict(c) for s, c in policy.entry_clauses.items()}
+            == DECISION_POLICY_ENTRY_CLAUSES,
+            f"{name}: entry clause text drifted",
+        )
+        validation.check(  # C32
+            dict(policy.clause_predicates) == DECISION_POLICY_CLAUSE_PREDICATES,
+            f"{name}: clause->predicate binding drifted -- validate_record proves a "
+            "reason code's clause through these, so a change here lets a record be "
+            "filed under a clause its evidence does not establish",
+        )
+        validation.check(  # C23
+            policy.downstream_rule == DECISION_POLICY_DOWNSTREAM_RULE,
+            f"{name}: downstream rule drifted",
+        )
+        validation.check(  # C10
+            tuple(sorted(policy.forbidden_authority_sources))
+            == tuple(sorted(DECISION_POLICY_REJECT_LIST)),
+            f"{name}: forbidden-authority reject list drifted",
+        )
+
+        block = load_policy_contract(REPO_ROOT / name / "SKILL.md")["decision_policy"]
+        validation.check(  # C11a
+            set(block) == STATE_SELECTION_INPUTS | DECLARATIVE_KEYS,
+            f"{name}: decision policy key "
+            f"{sorted(set(block) ^ (STATE_SELECTION_INPUTS | DECLARATIVE_KEYS))} "
+            "is not classified as a selection input or declarative",
+        )
+        hits = _axis_token_hits(block)
+        validation.check(  # C11b
+            not hits,
+            f"{name}: decision policy references axis token at {hits[:1]}, "
+            "which is a state-selection input",
+        )
+        closed = _closed_value_violations(block)
+        validation.check(  # C11c
+            not closed,
+            f"{name}: decision policy value {closed[:1]} is outside its closed set",
+        )
+        validation.check(  # C11d
+            policy.independent_axes == CANONICAL_INDEPENDENT_AXES,
+            f"{name}: independent_axes must name exactly the three canonical axes",
+        )
+
+        for anchor in DECISION_POLICY_SKILL_PROSE_ANCHORS:  # C12
+            validation.check(
+                anchor in skill_text,
+                f"{name}: missing decision policy prose anchor {anchor!r}",
+            )
+
+    left, right = (policies[d.name] for d in SKILL_DIRS)
+    validation.check(  # C4
+        left.reason_codes == right.reason_codes
+        and left.transitions == right.transitions
+        and left.raw == right.raw,
+        "decision policy contracts differ between skills",
+    )
+
+    for skill_dir in SKILL_DIRS:  # C13 / C14
+        for relative in (
+            *(f"templates/{phase.casefold()}.md" for phase in PHASE_ROUTES),
+            "reviews/common.md",
+        ):
+            path = skill_dir / relative
+            if not path.is_file():
+                continue
+            text = path.read_text(encoding="utf-8")
+            validation.check(
+                DECISION_RECORD_TEMPLATE_ANCHOR in text,
+                f"{skill_dir.name}: {relative} is missing the decision record section",
+            )
+            validation.check(
+                DECISION_RECORD_OPTIONALITY_ANCHOR in text,
+                f"{skill_dir.name}: {relative} is missing the decision record "
+                "optionality sentence",
+            )
+
+
+def _axis_token_hits(block: dict) -> list[str]:
+    """Exact-token axis references inside a STATE_SELECTION_INPUTS subtree (C11b)."""
+    hits: list[str] = []
+
+    def walk(node: object, path: str) -> None:
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key in AXIS_TOKENS:
+                    hits.append(f"{path}/{key} (key)")
+                walk(value, f"{path}/{key}")
+        elif isinstance(node, list):
+            for index, value in enumerate(node):
+                walk(value, f"{path}[{index}]")
+        elif isinstance(node, str) and node in AXIS_TOKENS:
+            hits.append(f"{path} (value)")
+
+    for key in sorted(STATE_SELECTION_INPUTS & set(block)):
+        walk(block[key], key)
+    return hits
+
+
+def _closed_value_violations(block: dict) -> list[str]:
+    """Enumerated positions carrying a value outside their closed set (C11c)."""
+    bad: list[str] = []
+    for source, row in block.get("transitions", {}).items():
+        if not isinstance(row, dict):
+            continue
+        for target, rule in row.items():
+            if rule not in TRANSITION_VALUES:
+                bad.append(f"transitions[{source}][{target}]={rule!r}")
+    for name, spec in block.get("states", {}).items():
+        if isinstance(spec, dict) and spec.get("workflow") not in WORKFLOW_VALUES:
+            bad.append(f"states[{name}].workflow={spec.get('workflow')!r}")
+    return bad
+
+
 def validate_phase_gate_neutrality(validation: Validation) -> None:
     """Phase transitions and the Final Review trigger must be risk-neutral.
 
@@ -2238,6 +2840,7 @@ def main() -> int:
     validate_quality_profile_contract(validation)
     validate_risk_profile_contract(validation)
     validate_agent_profile_contract(validation)
+    validate_decision_policy_contract(validation)
     validate_phase_gate_neutrality(validation)
     validate_run_logging_contract(validation)
     validate_run_logging_tool_parity(validation)

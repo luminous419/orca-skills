@@ -1,0 +1,11 @@
+{
+  "from": "NEEDS_INPUT",
+  "to": "CLEAR",
+  "record": {
+    "user_decision": {
+      "source": "prior_explicit_user_authorization",
+      "where_recorded": "the original request text",
+      "resolves": "the open item"
+    }
+  }
+}

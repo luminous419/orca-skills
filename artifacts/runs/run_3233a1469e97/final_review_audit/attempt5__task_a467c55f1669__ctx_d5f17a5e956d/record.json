@@ -1,0 +1,111 @@
+{
+  "schema_version": "1.0",
+  "record_kind": "final_review_dispatch_audit",
+  "run_id": "run_3233a1469e97",
+  "final_review_attempt": 5,
+  "task_id": "task_a467c55f1669",
+  "dispatch_id": "ctx_d5f17a5e956d",
+  "dispatch_key": "attempt5__task_a467c55f1669__ctx_d5f17a5e956d",
+  "recorded_at": "2026-08-30T16:57:52.860674+00:00",
+  "reviewer_terminal": "term_c54cf804-c29a-497d-bff5-9ec72da807c0",
+  "reviewer_agent_command": "codex-sol",
+  "reviewer_agent_origin": "self_created",
+  "repository": {
+    "head_commit": "21f06e18140b5c48f39087eec0091115e7d5490b",
+    "branch": "feat/os-28-bounded-autonomy-policy",
+    "dirty": true
+  },
+  "stored_task_spec": {
+    "source": "orca orchestration task-list --run <run_id> --json",
+    "capture_status": "captured",
+    "capture_error": "",
+    "captured_at": "2026-08-30T16:57:52.586499+00:00",
+    "is_stored_spec_not_delivered_bytes": true,
+    "byte_length_pre_redaction": 15954,
+    "input_digest_pre_redaction": "sha256:ff3942adb684751b8141bcbcfe056cfe7682e31a591cac0ab45c6433ec074ebd",
+    "redaction_policy_version": "redaction/1.1",
+    "artifact_path": "final_review_audit/attempt5__task_a467c55f1669__ctx_d5f17a5e956d/input.md",
+    "artifact_digest_post_redaction": "sha256:2ab2775a1d250113d144ae6f2eb0bc8be261eb41ca7ce4abc793c6cb4f306e20",
+    "byte_length_post_redaction": 15976,
+    "redactions": [
+      {
+        "category": "absolute_local_path",
+        "count": 1
+      }
+    ]
+  },
+  "delivery_evidence": {
+    "source": "orca orchestration dispatch-show --task <task_id> --json",
+    "capture_status": "captured",
+    "capture_error": "",
+    "captured_at": "2026-08-30T16:57:52.859804+00:00",
+    "preamble_captured": false,
+    "dispatch_status": "completed",
+    "contract_version": 1,
+    "dispatched_at": "2026-08-30 16:50:34",
+    "completed_at": "2026-08-30 16:57:36",
+    "capability_hash": "5929cda6afca387c560c896d230d45a32ef946d0cfe984f7e9413e8d0239ff90",
+    "capability_revoked_at": "2026-08-30 16:57:36",
+    "assignee_handle": "term_c54cf804-c29a-497d-bff5-9ec72da807c0",
+    "process_incarnation": "7b6ee134-05a2-4dbd-be45-91ea1c2d2d7e::/Users/<REDACTED:absolute_local_path>/aiAssistedProjects/orca-skills@@b4f9aff4:b719deab-cb50-4745-94b3-adc08ce02c0f",
+    "failure_count": 0,
+    "last_failure": null,
+    "termination_reason": null
+  },
+  "report": {
+    "contract_path": "FINAL_REVIEW.md",
+    "resolution": "explicit",
+    "capture_status": "captured",
+    "capture_error": "",
+    "captured_at": "2026-08-30T16:57:52.860000+00:00",
+    "byte_length_pre_redaction": 6771,
+    "report_digest_pre_redaction": "sha256:516de2828e3308836ecb949c9db4a8dde5521484e72f807a9e85caa9a6ab21c1",
+    "redaction_policy_version": "redaction/1.1",
+    "artifact_path": "final_review_audit/attempt5__task_a467c55f1669__ctx_d5f17a5e956d/report.md",
+    "artifact_digest_post_redaction": "sha256:516de2828e3308836ecb949c9db4a8dde5521484e72f807a9e85caa9a6ab21c1",
+    "byte_length_post_redaction": 6771,
+    "redactions": [],
+    "parsed": {
+      "parse_status": "ok",
+      "parse_error": "",
+      "result": "FAIL",
+      "review_verdict": "FAIL",
+      "blocking_finding_ids": [
+        "FR-8",
+        "FR-9"
+      ],
+      "non_blocking_finding_ids": []
+    }
+  },
+  "provenance_state": "accepted",
+  "void_reason": "",
+  "settlement_state": "settled",
+  "failure_detail": "",
+  "observed_input_bytes": null,
+  "input_altered_across_retry": "unknown",
+  "notes": "Final Adversarial Review attempt 5; verdict FAIL; FR-8 CRITICAL FR-9 MAJOR",
+  "metadata_redaction": {
+    "redaction_policy_version": "redaction/1.1",
+    "covered_fields": [
+      "reviewer_agent_command",
+      "reviewer_agent_origin",
+      "failure_detail",
+      "notes",
+      "stored_task_spec.capture_error",
+      "report.capture_error",
+      "delivery_evidence.capture_error",
+      "delivery_evidence.process_incarnation",
+      "delivery_evidence.last_failure",
+      "delivery_evidence.termination_reason",
+      "report.parsed.parse_error",
+      "report.parsed.blocking_finding_ids",
+      "report.parsed.non_blocking_finding_ids"
+    ],
+    "redactions": [
+      {
+        "category": "absolute_local_path",
+        "count": 1
+      }
+    ]
+  }
+}

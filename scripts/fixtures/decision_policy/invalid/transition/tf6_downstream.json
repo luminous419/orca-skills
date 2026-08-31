@@ -1,0 +1,10 @@
+{
+  "from": "NEEDS_INPUT",
+  "to": "CLEAR",
+  "record": {
+    "user_decision": {
+      "source": "explicit_user_reply"
+    }
+  },
+  "note": "user_decision missing where_recorded/resolves"
+}

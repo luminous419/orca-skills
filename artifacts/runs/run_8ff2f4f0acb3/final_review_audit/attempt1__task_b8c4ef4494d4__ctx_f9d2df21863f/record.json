@@ -1,0 +1,108 @@
+{
+  "schema_version": "1.0",
+  "record_kind": "final_review_dispatch_audit",
+  "run_id": "run_8ff2f4f0acb3",
+  "final_review_attempt": 1,
+  "task_id": "task_b8c4ef4494d4",
+  "dispatch_id": "ctx_f9d2df21863f",
+  "dispatch_key": "attempt1__task_b8c4ef4494d4__ctx_f9d2df21863f",
+  "recorded_at": "2026-08-30T22:59:10.158084+00:00",
+  "reviewer_terminal": "term_3fa6e2f8-a4c2-43aa-9cf7-65508a42188d",
+  "reviewer_agent_command": "codex-sol",
+  "reviewer_agent_origin": "self_created",
+  "repository": {
+    "head_commit": "2afc5edc5caac713c46afeb952d4ffd521ee407a",
+    "branch": "feat/os-28-bounded-autonomy-policy",
+    "dirty": true
+  },
+  "stored_task_spec": {
+    "source": "orca orchestration task-list --run <run_id> --json",
+    "capture_status": "captured",
+    "capture_error": "",
+    "captured_at": "2026-08-30T22:59:09.894185+00:00",
+    "is_stored_spec_not_delivered_bytes": true,
+    "byte_length_pre_redaction": 12094,
+    "input_digest_pre_redaction": "sha256:29293e4b25cec6b7a6bcfa74ec4d3a82281a97396461d34562b3d224f70c86ca",
+    "redaction_policy_version": "redaction/1.1",
+    "artifact_path": "final_review_audit/attempt1__task_b8c4ef4494d4__ctx_f9d2df21863f/input.md",
+    "artifact_digest_post_redaction": "sha256:f56d8c64acd6a791e8b45d61552704690a59dbad8901883250b74156ca793c73",
+    "byte_length_post_redaction": 12116,
+    "redactions": [
+      {
+        "category": "absolute_local_path",
+        "count": 1
+      }
+    ]
+  },
+  "delivery_evidence": {
+    "source": "orca orchestration dispatch-show --task <task_id> --json",
+    "capture_status": "captured",
+    "capture_error": "",
+    "captured_at": "2026-08-30T22:59:10.156782+00:00",
+    "preamble_captured": false,
+    "dispatch_status": "completed",
+    "contract_version": 1,
+    "dispatched_at": "2026-08-30 22:53:04",
+    "completed_at": "2026-08-30 22:58:48",
+    "capability_hash": "4618d5698b904b194456541b4dd08cbcb0cd71441bf1b0b2d7da50d3e4d613dc",
+    "capability_revoked_at": "2026-08-30 22:58:48",
+    "assignee_handle": "term_3fa6e2f8-a4c2-43aa-9cf7-65508a42188d",
+    "process_incarnation": "7b6ee134-05a2-4dbd-be45-91ea1c2d2d7e::/Users/<REDACTED:absolute_local_path>/aiAssistedProjects/orca-skills@@a10367ed:900e9303-9f01-4075-8648-fb62d7a429b4",
+    "failure_count": 0,
+    "last_failure": null,
+    "termination_reason": null
+  },
+  "report": {
+    "contract_path": "FINAL_REVIEW.md",
+    "resolution": "explicit",
+    "capture_status": "captured",
+    "capture_error": "",
+    "captured_at": "2026-08-30T22:59:10.156999+00:00",
+    "byte_length_pre_redaction": 7558,
+    "report_digest_pre_redaction": "sha256:86693c9bce863aaa484fed3c41b36bbbba80364fb00254d711929d28a6935cd6",
+    "redaction_policy_version": "redaction/1.1",
+    "artifact_path": "final_review_audit/attempt1__task_b8c4ef4494d4__ctx_f9d2df21863f/report.md",
+    "artifact_digest_post_redaction": "sha256:86693c9bce863aaa484fed3c41b36bbbba80364fb00254d711929d28a6935cd6",
+    "byte_length_post_redaction": 7558,
+    "redactions": [],
+    "parsed": {
+      "parse_status": "ok",
+      "parse_error": "",
+      "result": "PASS",
+      "review_verdict": "PASS WITH NOTES",
+      "blocking_finding_ids": [],
+      "non_blocking_finding_ids": []
+    }
+  },
+  "provenance_state": "accepted",
+  "void_reason": "",
+  "settlement_state": "settled",
+  "failure_detail": "",
+  "observed_input_bytes": null,
+  "input_altered_across_retry": "unknown",
+  "notes": "Final Adversarial Review attempt 1; PASS WITH NOTES; external review F-001/F-002/F-003 all resolved",
+  "metadata_redaction": {
+    "redaction_policy_version": "redaction/1.1",
+    "covered_fields": [
+      "reviewer_agent_command",
+      "reviewer_agent_origin",
+      "failure_detail",
+      "notes",
+      "stored_task_spec.capture_error",
+      "report.capture_error",
+      "delivery_evidence.capture_error",
+      "delivery_evidence.process_incarnation",
+      "delivery_evidence.last_failure",
+      "delivery_evidence.termination_reason",
+      "report.parsed.parse_error",
+      "report.parsed.blocking_finding_ids",
+      "report.parsed.non_blocking_finding_ids"
+    ],
+    "redactions": [
+      {
+        "category": "absolute_local_path",
+        "count": 1
+      }
+    ]
+  }
+}

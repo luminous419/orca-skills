@@ -1,0 +1,9 @@
+{
+  "state": "CONFLICT",
+  "reason_code": "requirement_vs_accepted_decision",
+  "citations": [
+    "OS-28#req-c",
+    "USER_DECISIONS.md#UD-1"
+  ],
+  "why_they_cannot_both_hold": "the new requirement reverses a decision already made and relied on"
+}

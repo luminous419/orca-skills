@@ -1,0 +1,8 @@
+{
+  "state": "NEEDS_INPUT",
+  "reason_code": "monetary_cost",
+  "boundary_element": "monetary_cost",
+  "what_is_missing": "spending authority",
+  "why_policy_cannot_decide": "a repository file cannot authorize spending",
+  "monetary_cost": true
+}

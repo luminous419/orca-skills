@@ -1,0 +1,11 @@
+{
+  "from": "NEEDS_INPUT",
+  "to": "CLEAR",
+  "record": {
+    "user_decision": {
+      "source": "recommended_default",
+      "where_recorded": "n/a",
+      "resolves": "the item"
+    }
+  }
+}

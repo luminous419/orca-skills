@@ -1,0 +1,11 @@
+{
+  "from": "NEEDS_INPUT",
+  "to": "CLEAR",
+  "record": {
+    "user_decision": {
+      "source": "timeout",
+      "where_recorded": "n/a",
+      "resolves": "the item"
+    }
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "reversibility": "reversible_in_run",
+  "impact": "sets the depth of one section of this run's own report",
+  "state": "ASSUMPTION_ALLOWED",
+  "reason_code": "phase_contract",
+  "policy_source": {
+    "kind": "phase_contract_section",
+    "locator": "templates/analysis.md#result-contract",
+    "role": "supports"
+  },
+  "retraction_condition": "a reviewer names a different depth",
+  "blast_radius": "current_change",
+  "monetary_cost": false,
+  "security": false,
+  "privacy": false,
+  "compliance": false,
+  "long_term_lock_in": false
+}

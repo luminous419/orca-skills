@@ -228,9 +228,145 @@ DEFAULT_RISK = high
     "invalid_agent_profile": "INVALID_AGENT_PROFILE",
     "unknown_agent_profile": "UNKNOWN_AGENT_PROFILE",
     "agent_role_unresolved": "AGENT_ROLE_UNRESOLVED"
+  },
+  "decision_policy": {
+    "schema_version": 1,
+    "state_scope": "per_decision_item_with_derived_check_aggregate",
+    "aggregate_order": ["CONFLICT", "NEEDS_INPUT", "ASSUMPTION_ALLOWED", "CLEAR"],
+    "states": {
+      "CLEAR": {"workflow": "continue", "user_decision_required": false, "reason_code_required": false},
+      "ASSUMPTION_ALLOWED": {"workflow": "continue_and_review", "user_decision_required": false, "reason_code_required": true},
+      "NEEDS_INPUT": {"workflow": "pause_and_ask", "user_decision_required": true, "reason_code_required": true},
+      "CONFLICT": {"workflow": "pause_and_request_resolution", "user_decision_required": true, "reason_code_required": true}
+    },
+    "transitions": {
+      "CLEAR": {"CLEAR": "allowed", "ASSUMPTION_ALLOWED": "allowed", "NEEDS_INPUT": "allowed", "CONFLICT": "allowed"},
+      "ASSUMPTION_ALLOWED": {"CLEAR": "requires_retraction", "ASSUMPTION_ALLOWED": "allowed", "NEEDS_INPUT": "allowed", "CONFLICT": "allowed"},
+      "NEEDS_INPUT": {"CLEAR": "requires_user_decision", "ASSUMPTION_ALLOWED": "forbidden", "NEEDS_INPUT": "allowed", "CONFLICT": "allowed"},
+      "CONFLICT": {"CLEAR": "requires_user_decision", "ASSUMPTION_ALLOWED": "forbidden", "NEEDS_INPUT": "allowed", "CONFLICT": "allowed"}
+    },
+    "downstream_rule": "an unresolved NEEDS_INPUT or CONFLICT item may not be reported CLEAR by a later phase",
+    "entry_clauses": {
+      "NEEDS_INPUT": {
+        "N-1": "a boundary element is true, is not determined by a policy source, and is not decided by an explicit authorization",
+        "N-2": "required user intent is absent",
+        "N-3": "the item crosses the autonomy boundary but cannot be classified under these closed vocabularies"
+      },
+      "CONFLICT": {
+        "C-1": "two or more explicit requirements are contradictory",
+        "C-2": "an explicit requirement contradicts an already-accepted decision of this run",
+        "C-3": "an explicit requirement contradicts a non-overridable project invariant"
+      }
+    },
+    "clause_predicates": {"N-1": "undetermined_boundary_element", "N-2": "absent_user_intent", "N-3": "unclassifiable_item", "C-1": "declared_contradiction", "C-2": "declared_contradiction", "C-3": "declared_contradiction"},
+    "reason_codes": {
+      "repository_policy": {"state": "ASSUMPTION_ALLOWED"},
+      "explicit_requirement": {"state": "ASSUMPTION_ALLOWED"},
+      "phase_contract": {"state": "ASSUMPTION_ALLOWED"},
+      "quality_profile_attribute": {"state": "ASSUMPTION_ALLOWED"},
+      "ambiguous_requirement": {"state": "NEEDS_INPUT", "clause": "N-1", "boundary_element": "ambiguity"},
+      "missing_user_intent": {"state": "NEEDS_INPUT", "clause": "N-2", "boundary_element": "ambiguity"},
+      "irreversible_action": {"state": "NEEDS_INPUT", "clause": "N-1", "boundary_element": "reversibility"},
+      "blast_radius_beyond_scope": {"state": "NEEDS_INPUT", "clause": "N-1", "boundary_element": "blast_radius"},
+      "monetary_cost": {"state": "NEEDS_INPUT", "clause": "N-1", "boundary_element": "monetary_cost"},
+      "security_impact": {"state": "NEEDS_INPUT", "clause": "N-1", "boundary_element": "security"},
+      "privacy_impact": {"state": "NEEDS_INPUT", "clause": "N-1", "boundary_element": "privacy"},
+      "compliance_impact": {"state": "NEEDS_INPUT", "clause": "N-1", "boundary_element": "compliance"},
+      "long_term_lock_in": {"state": "NEEDS_INPUT", "clause": "N-1", "boundary_element": "long_term_lock_in"},
+      "authority_reserved_to_user": {"state": "NEEDS_INPUT", "clause": "N-1", "boundary_element": "explicit_user_authority"},
+      "unclassifiable_decision": {"state": "NEEDS_INPUT", "clause": "N-3", "required_evidence": ["reason_code", "what_is_missing", "why_policy_cannot_decide", "classification_attempted"]},
+      "requirement_contradiction": {"state": "CONFLICT", "clause": "C-1"},
+      "requirement_vs_accepted_decision": {"state": "CONFLICT", "clause": "C-2"},
+      "requirement_vs_safety_floor": {"state": "CONFLICT", "clause": "C-3"}
+    },
+    "entry_conditions": {
+      "CLEAR": {"any_of": ["no_open_decision_item", "determining_policy_source", "explicit_user_authorization"]},
+      "ASSUMPTION_ALLOWED": {"all_of": ["all_safety_facts_declared", "reversible_in_run", "blast_radius_within_scope", "no_high_impact_element", "supporting_policy_source", "no_reserved_user_authority"]},
+      "NEEDS_INPUT": {"any_of": ["undetermined_boundary_element", "absent_user_intent", "unclassifiable_item"]},
+      "CONFLICT": {"any_of": ["declared_contradiction"]}
+    },
+    "boundary_elements": {
+      "ambiguity": {"kind": "declared", "triggering": true},
+      "explicit_requirement_conflict": {"kind": "citations", "minimum": 2, "triggering": "at_minimum"},
+      "reversibility": {"kind": "enum", "values": ["reversible_in_run", "reversible_with_effort", "irreversible"], "triggering": ["irreversible"]},
+      "blast_radius": {"kind": "enum", "values": ["current_change", "module", "repository", "external_system"], "triggering": ["repository", "external_system"]},
+      "monetary_cost": {"kind": "boolean", "triggering": true},
+      "security": {"kind": "boolean", "triggering": true},
+      "privacy": {"kind": "boolean", "triggering": true},
+      "compliance": {"kind": "boolean", "triggering": true},
+      "long_term_lock_in": {"kind": "boolean", "triggering": true},
+      "repository_project_policy": {"kind": "policy_source", "triggering": null},
+      "explicit_user_authority": {"kind": "user_decision", "triggering": ["reserved"]}
+    },
+    "authority_precedence": {"policy_source_cannot_resolve": ["explicit_user_authority", "explicit_requirement_conflict"]},
+    "policy_source_roles": ["determines", "supports"],
+    "policy_source_kinds": ["file_path", "requirement_id", "quality_attribute_id", "phase_contract_section"],
+    "required_evidence": {
+      "CLEAR": [],
+      "ASSUMPTION_ALLOWED": ["reason_code", "policy_source", "reversibility", "impact", "retraction_condition"],
+      "NEEDS_INPUT": ["reason_code", "boundary_element", "what_is_missing", "why_policy_cannot_decide"],
+      "CONFLICT": ["reason_code", "citations", "why_they_cannot_both_hold"]
+    },
+    "assumption_allowed_requires": {"policy_source_role": "supports", "all_required_evidence_non_empty": true, "declared_safety_facts": ["blast_radius", "monetary_cost", "security", "privacy", "compliance", "long_term_lock_in"], "absent_explicit_user_authority": "not_reserved"},
+    "assumption_allowed_forbidden_when": {
+      "reversibility_in": ["irreversible"],
+      "blast_radius_in_with_irreversible": ["repository", "external_system"],
+      "any_true_of": ["monetary_cost", "security", "privacy", "compliance", "long_term_lock_in"],
+      "explicit_user_authority_reserved": true,
+      "exception_allowed": false
+    },
+    "user_decision_fields": ["source", "where_recorded", "resolves"],
+    "user_decision_sources": ["explicit_user_reply", "prior_explicit_user_authorization"],
+    "forbidden_authority_sources": ["model_confidence", "timeout", "no_response", "worker_reviewer_agreement", "recommended_default"],
+    "citation_minimum": {"CONFLICT": 2},
+    "independent_axes": ["risk", "quality_profile", "agent_profile"]
   }
 }
 ```
+
+## Decision Policy
+
+위 `decision_policy` block은 bounded autonomy의 machine-readable 계약이다. 네 decision state는
+`CLEAR` / `ASSUMPTION_ALLOWED` / `NEEDS_INPUT` / `CONFLICT`이며, 아래는 그 block이 강제하는
+규칙의 *이유*다 — 규칙만 알고 이유를 모르면 막혔을 때 우회하게 된다.
+
+**축 분리.** decision state는 RUN_STATUS / Worker STATUS / REVIEW_VERDICT와 별개의 축이다.
+OS-28은 그 셋 중 어느 것도 바꾸지 않는다. decision state `CONFLICT`는 invocation 검증 error code
+`PHASE_CONFLICT`와 무관하고, `NEEDS_INPUT`은 Worker의 `STATUS: BLOCKED`와 다르다.
+
+**두 pause state의 구분.** NEEDS_INPUT은 정보가 없는 것이고 CONFLICT는 정보가 모순되는 것이다.
+전자는 "무엇을 원하는가"를 묻고 후자는 "둘 다 만족할 수 없으니 어느 쪽인가"를 묻는다.
+
+**답변의 귀결.** 답변을 받은 항목은 CLEAR가 되며 ASSUMPTION_ALLOWED가 되지 않는다. 사용자가
+결정한 뒤에는 가정할 것이 남지 않기 때문이다. `NEEDS_INPUT`/`CONFLICT`에서 `ASSUMPTION_ALLOWED`로
+가는 전이는 `user_decision` 유무와 무관하게 금지다.
+
+**고영향 항목.** INV-4에는 예외가 없다. 되돌릴 수 없거나 monetary / security / privacy /
+compliance / long-term lock-in 중 하나가 참이면 `ASSUMPTION_ALLOWED`가 될 수 없으며, 이를
+결정하는 policy source나 명시적 authorization이 있어도 마찬가지다 — 그런 항목은
+`ASSUMPTION_ALLOWED`가 열리는 것이 아니라 `CLEAR`로 이동한다.
+
+**증명되지 않은 것은 안전이 아니다.** `ASSUMPTION_ALLOWED`는 `declared_safety_facts`가 지명한
+여섯 fact — blast radius, monetary cost, security, privacy, compliance, long-term lock-in —
+을 record가 **명시적으로 선언했을 때에만** 허용된다. 선언하지 않은 fact는 거짓이 아니라 미상이며,
+미상은 자동 진행의 근거가 되지 못한다. 자유 서술 `impact` 문자열은 이 여섯 fact를 대신하지 않는다.
+사용자 권한이 선언되지 않았을 때 그것이 무엇을 뜻하는지는 `absent_explicit_user_authority`가
+계약에서 명시한다 — 코드의 암묵적 default가 아니다.
+
+**clause는 선언이 아니라 증명이다.** reason code가 rest하는 clause는 record에서 실제로
+증명되어야 한다. `clause_predicates`가 각 clause(N-1/N-2/N-3, C-1/C-2/C-3)에 그것을 증명하는
+predicate를 지정하며, `validate_record()`는 `permitted_states()`와 같은 predicate로 그것을
+평가한다. `missing_user_intent`는 N-2를, `unclassifiable_decision`은 N-3를 스스로 증명해야
+하고, 다른 clause의 증거로 대신할 수 없다.
+
+**권한이 아닌 것.** 모델 확신, Worker/Reviewer 합의, 권고 default, timeout, 무응답은 사용자
+권한의 근거가 아니다.
+
+**축 독립성.** risk / quality profile / agent profile은 decision authority와 독립적인 축이며
+state 선택 입력이 아니다. risk level을 바꾸어도 자동으로 결정할 수 있는 범위는 넓어지지 않는다.
+
+이 계약은 **정의**다. 각 phase gate에서 검사를 실행하는 것(OS-29), 질문을 구성하는 것(OS-30),
+응답을 기다렸다 재개하는 것(OS-31)은 이 Skill에 아직 구현되어 있지 않다.
 
 ## 5. Agent Policy
 

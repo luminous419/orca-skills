@@ -1,0 +1,11 @@
+{
+  "from": "NEEDS_INPUT",
+  "to": "CLEAR",
+  "record": {
+    "user_decision": {
+      "source": "explicit_user_reply",
+      "where_recorded": "USER_DECISIONS.md#UD-1",
+      "resolves": "the open item"
+    }
+  }
+}

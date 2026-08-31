@@ -1,0 +1,10 @@
+{
+  "note": "a Result Contract instance with NO decision record section",
+  "sections": [
+    "Summary",
+    "Analysis",
+    "Changes",
+    "Modified Files / Artifacts",
+    "Validation"
+  ]
+}

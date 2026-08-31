@@ -1,0 +1,23 @@
+{
+  "state": "ASSUMPTION_ALLOWED",
+  "reason_code": "repository_policy",
+  "policy_source": {
+    "kind": "file_path",
+    "locator": "scripts/",
+    "role": "supports"
+  },
+  "impact": "one edit inside this run's own change scope",
+  "retraction_condition": "n/a",
+  "reversibility": "irreversible",
+  "blast_radius": "repository",
+  "user_decision": {
+    "source": "explicit_user_reply",
+    "where_recorded": "USER_DECISIONS.md#UD-1",
+    "resolves": "the open item"
+  },
+  "monetary_cost": false,
+  "security": false,
+  "privacy": false,
+  "compliance": false,
+  "long_term_lock_in": false
+}

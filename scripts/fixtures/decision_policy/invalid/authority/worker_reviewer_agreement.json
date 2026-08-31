@@ -1,0 +1,11 @@
+{
+  "from": "NEEDS_INPUT",
+  "to": "CLEAR",
+  "record": {
+    "user_decision": {
+      "source": "worker_reviewer_agreement",
+      "where_recorded": "n/a",
+      "resolves": "the item"
+    }
+  }
+}

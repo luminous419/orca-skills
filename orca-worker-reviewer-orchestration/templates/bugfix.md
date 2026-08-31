@@ -47,4 +47,22 @@ Before Fix: FAIL | NOT_VERIFIED
 After Fix: PASS | FAIL
 ## Related Unit Tests / Validation
 ## Review Feedback Resolution
+## Decision Record (optional)
 ```
+
+### Decision Record (optional)
+
+`## Decision Record`는 **optional section이다. 없어도 계약 위반이 아니다.** 이번 phase에서
+자동으로 내린 결정이나 사용자 결정이 필요한 항목이 있을 때만 적는다. 적을 때는 SKILL.md의
+`decision_policy` 계약이 정한 형식을 따른다.
+
+```text
+DECISION_STATE: CLEAR | ASSUMPTION_ALLOWED | NEEDS_INPUT | CONFLICT
+REASON_CODE: <closed set; none for CLEAR>
+EVIDENCE: fields required by the state
+```
+
+- `CLEAR` 외 세 state는 `REASON_CODE` 없이 쓸 수 없다.
+- `NEEDS_INPUT` / `CONFLICT`는 진행하지 않고 멈춘다.
+- 답변을 받은 항목은 `CLEAR`가 되며 `ASSUMPTION_ALLOWED`가 되지 않는다.
+- 모델 확신, Worker/Reviewer 합의, 권고 default, timeout, 무응답은 사용자 권한의 근거가 아니다.

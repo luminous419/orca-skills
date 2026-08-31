@@ -1,0 +1,9 @@
+{
+  "state": "CONFLICT",
+  "reason_code": "requirement_contradiction",
+  "citations": [
+    "OS-28#req-a",
+    "OS-28#req-b"
+  ],
+  "why_they_cannot_both_hold": "satisfying either falsifies the other"
+}

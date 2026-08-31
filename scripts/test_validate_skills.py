@@ -59,6 +59,10 @@ class ValidatorRegressionTests(unittest.TestCase):
             # empty stdout rather than the named failure a test is asserting on.
             "agent_profile.py",
             "quality_profile.py",
+            # OS-28: validate_skills imports the decision-policy loader. Same
+            # trap as the OS-4 note above -- omitting it here turns every
+            # validator regression test into an import crash with empty stdout.
+            "decision_policy.py",
         ):
             shutil.copy2(SOURCE_ROOT / "scripts" / filename, scripts_dir)
 
@@ -73,6 +77,515 @@ class ValidatorRegressionTests(unittest.TestCase):
             capture_output=True,
             check=False,
         )
+
+    # ---- OS-28 decision policy contract (DESIGN D4-E) ------------------------
+    # These are the permanent form of the DESIGN D5-1 mutations: each one applies a
+    # weakening and asserts the validator fails with its NAMED message, so a check
+    # that stops working is a red test rather than a quiet gap.
+
+    DECISION_SKILLS = (
+        "orca-worker-reviewer-orchestration",
+        "orca-worker-reviewer-loop",
+    )
+
+    def edit_skills(self, old: str, new: str, *skills: str) -> None:
+        """Replace `old` with `new` in each named SKILL.md, asserting it was there."""
+        for name in skills or self.DECISION_SKILLS:
+            path = self.repo_root / name / "SKILL.md"
+            text = path.read_text(encoding="utf-8")
+            self.assertIn(old, text, f"{name}: mutation target not found")
+            path.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+    def assert_validator_fails_with(self, fragment: str) -> None:
+        result = self.run_validator()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(fragment, result.stdout)
+
+    def test_decision_policy_contract_removed_fails(self) -> None:
+        self.edit_skills('"decision_policy": {', '"decision_policy_removed": {')
+        self.assert_validator_fails_with("decision policy contract is missing or malformed")
+
+    def test_decision_policy_single_skill_drift_fails(self) -> None:
+        """M-2: one Skill only. The existing whole-dict deep-equality catches this."""
+        self.edit_skills(
+            '"citation_minimum": {"CONFLICT": 2}',
+            '"citation_minimum": {"CONFLICT": 3}',
+            "orca-worker-reviewer-loop",
+        )
+        self.assert_validator_fails_with(
+            "machine-readable policy contracts differ between skills"
+        )
+
+    def test_decision_policy_reason_code_removed_from_both_skills_fails(self) -> None:
+        """M-3: the simultaneous-deletion blind spot. Deep-equality still passes here,
+        so this is the mutation that justifies the expected Python constant."""
+        self.edit_skills(
+            '      "privacy_impact": {"state": "NEEDS_INPUT", "clause": "N-1", '
+            '"boundary_element": "privacy"},\n',
+            "",
+        )
+        self.assert_validator_fails_with("decision policy reason-code cardinality drifted")
+
+    def test_decision_policy_value_drift_fails(self) -> None:
+        self.edit_skills('"clause": "N-1", "boundary_element": "privacy"',
+                         '"clause": "N-2", "boundary_element": "privacy"')
+        self.assert_validator_fails_with("decision policy contract values drifted")
+
+    def test_decision_policy_forbidden_transition_relaxed_fails(self) -> None:
+        """M-4: the T-F2 cell. Relaxing it must not be silently acceptable."""
+        self.edit_skills(
+            '"NEEDS_INPUT": {"CLEAR": "requires_user_decision", '
+            '"ASSUMPTION_ALLOWED": "forbidden"',
+            '"NEEDS_INPUT": {"CLEAR": "requires_user_decision", '
+            '"ASSUMPTION_ALLOWED": "allowed"',
+        )
+        self.assert_validator_fails_with(
+            "NEEDS_INPUT/CONFLICT -> ASSUMPTION_ALLOWED must be forbidden"
+        )
+
+    def test_decision_policy_inv4_exception_fails(self) -> None:
+        """M-6: INV-4 has no exception (A4-0)."""
+        self.edit_skills('"exception_allowed": false', '"exception_allowed": true')
+        self.assert_validator_fails_with("INV-4 must have no exception")
+
+    def test_decision_policy_reject_list_trimmed_fails(self) -> None:
+        """M-7: model confidence is never authority."""
+        self.edit_skills('"model_confidence", ', "")
+        self.assert_validator_fails_with("forbidden-authority reject list drifted")
+
+    def test_decision_policy_unclassified_key_fails(self) -> None:
+        """M-18 / C11a: a new top-level key must be classified, or the enumeration
+        would silently become incomplete."""
+        self.edit_skills(
+            '"citation_minimum": {"CONFLICT": 2}',
+            '"risk_overrides": {}, "citation_minimum": {"CONFLICT": 2}',
+        )
+        self.assert_validator_fails_with("decision policy contract is missing or malformed")
+
+    def test_decision_policy_axis_token_in_a_selection_input_fails(self) -> None:
+        """M-16 / C11b: an exact axis token inside a state-selection input."""
+        self.edit_skills(
+            '"explicit_user_authority_reserved": true',
+            '"risk_in": ["high"],\n      "explicit_user_authority_reserved": true',
+        )
+        self.assert_validator_fails_with(
+            "references axis token at ['assumption_allowed_forbidden_when/risk_in[0] "
+            "(value)'], which is a state-selection input"
+        )
+
+    def test_decision_policy_transition_value_outside_closed_set_fails(self) -> None:
+        """M-17 / C11c: a risk-conditional value carrying NO exact axis token. This is
+        the mutation the token rule misses, and the reason C11c exists."""
+        self.edit_skills(
+            '"NEEDS_INPUT": {"CLEAR": "requires_user_decision"',
+            '"NEEDS_INPUT": {"CLEAR": "requires_user_decision_unless_risk_low"',
+        )
+        self.assert_validator_fails_with("is outside the closed set")
+
+    def test_decision_policy_independent_axes_drift_fails(self) -> None:
+        """M-19 / C11d: checked by positive equality, so the declarative position
+        cannot forbid itself."""
+        self.edit_skills(
+            '"independent_axes": ["risk", "quality_profile", "agent_profile"]',
+            '"independent_axes": ["risk"]',
+        )
+        self.assert_validator_fails_with("decision policy contract is missing or malformed")
+
+    def test_decision_policy_prose_anchor_removed_from_both_skills_fails(self) -> None:
+        """M-11: byte-equality cannot see a sentence deleted from BOTH copies."""
+        self.edit_skills("INV-4에는 예외가 없다", "INV-4는 중요하다")
+        self.assert_validator_fails_with("missing decision policy prose anchor")
+
+    def test_decision_record_optionality_sentence_removed_fails(self) -> None:
+        """M-13 / UD-1: making the section required would violate a user decision."""
+        for name in self.DECISION_SKILLS:
+            for path in sorted((self.repo_root / name / "templates").glob("*.md")):
+                text = path.read_text(encoding="utf-8")
+                path.write_text(
+                    text.replace(
+                        "optional section이다. 없어도 계약 위반이 아니다.",
+                        "필수 section이다.",
+                    ),
+                    encoding="utf-8",
+                )
+        self.assert_validator_fails_with("missing the decision record optionality sentence")
+
+    # ---- TEST phase: the semantic core, found unpinned by mutation ------------
+    # Each of these five mutations passed EVERY check before C15-C23 existed. They
+    # are the reason closed-set membership is not sufficient: "continue" is a legal
+    # workflow value, so C11c was satisfied while the state that must pause declared
+    # that it continues.
+
+    def test_decision_policy_needs_input_workflow_flipped_to_continue_fails(self) -> None:
+        """N-1: the most severe. NEEDS_INPUT declaring "continue" defeats bounded
+        autonomy outright, and "continue" is inside the closed workflow set."""
+        self.edit_skills(
+            '"NEEDS_INPUT": {"workflow": "pause_and_ask"',
+            '"NEEDS_INPUT": {"workflow": "continue"',
+        )
+        self.assert_validator_fails_with("decision policy state semantics drifted")
+
+    def test_decision_policy_assumption_allowed_review_dropped_fails(self) -> None:
+        """N-13: continue_and_review -> continue drops the review the ROADMAP requires
+        of a recorded assumption."""
+        self.edit_skills(
+            '"ASSUMPTION_ALLOWED": {"workflow": "continue_and_review"',
+            '"ASSUMPTION_ALLOWED": {"workflow": "continue"',
+        )
+        self.assert_validator_fails_with("decision policy state semantics drifted")
+
+    def test_decision_policy_user_decision_requirement_dropped_fails(self) -> None:
+        """N-14: NEEDS_INPUT no longer declaring that it needs a user decision."""
+        self.edit_skills(
+            '"NEEDS_INPUT": {"workflow": "pause_and_ask", "user_decision_required": true',
+            '"NEEDS_INPUT": {"workflow": "pause_and_ask", "user_decision_required": false',
+        )
+        self.assert_validator_fails_with("decision policy state semantics drifted")
+
+    def test_decision_policy_inv4_blast_radius_clause_emptied_fails(self) -> None:
+        """N-5: INV-4's blast-radius half silently removed."""
+        self.edit_skills(
+            '"blast_radius_in_with_irreversible": ["repository", "external_system"],',
+            '"blast_radius_in_with_irreversible": [],',
+        )
+        self.assert_validator_fails_with("INV-4 forbidden-when conditions drifted")
+
+    def test_decision_policy_aggregate_order_inverted_fails(self) -> None:
+        """N-8: inverting the order would let a check report CLEAR while an item is
+        in CONFLICT."""
+        self.edit_skills(
+            '"aggregate_order": ["CONFLICT", "NEEDS_INPUT", "ASSUMPTION_ALLOWED", "CLEAR"]',
+            '"aggregate_order": ["CLEAR", "ASSUMPTION_ALLOWED", "NEEDS_INPUT", "CONFLICT"]',
+        )
+        self.assert_validator_fails_with("decision policy aggregate order drifted")
+
+    def test_decision_policy_assumption_requires_determining_source_fails(self) -> None:
+        """N-4: INV-3 weakened to accept a determining policy source."""
+        self.edit_skills(
+            '"assumption_allowed_requires": {"policy_source_role": "supports"',
+            '"assumption_allowed_requires": {"policy_source_role": "determines"',
+        )
+        self.assert_validator_fails_with("INV-3 assumption requirements drifted")
+
+    def test_decision_policy_user_decision_fields_trimmed_fails(self) -> None:
+        """N-6: INV-5's evidence requirement weakened."""
+        self.edit_skills(
+            '"user_decision_fields": ["source", "where_recorded", "resolves"]',
+            '"user_decision_fields": ["source"]',
+        )
+        self.assert_validator_fails_with("user_decision required fields drifted")
+
+    def test_decision_policy_citation_minimum_lowered_fails(self) -> None:
+        """N-3: CONFLICT needs two citations by definition -- one side is not a
+        contradiction."""
+        self.edit_skills(
+            '"citation_minimum": {"CONFLICT": 2}', '"citation_minimum": {"CONFLICT": 1}'
+        )
+        self.assert_validator_fails_with("CONFLICT citation minimum drifted")
+
+    def test_decision_policy_downstream_rule_emptied_fails(self) -> None:
+        """N-12: T-F6 silently removed."""
+        self.edit_skills(
+            '"downstream_rule": "an unresolved NEEDS_INPUT or CONFLICT item may not '
+            'be reported CLEAR by a later phase"',
+            '"downstream_rule": ""',
+        )
+        self.assert_validator_fails_with("downstream rule drifted")
+
+    def test_decision_policy_entry_clause_prose_edited_in_both_skills_fails(self) -> None:
+        """M-21, two-file variant. DESIGN F-5 records the THREE-file coordinated
+        variant -- both Skills plus this expected constant -- as a residual gap that
+        only human diff review catches. That remains true; this closes the cheaper
+        variant, where the Skills are edited and the constant is not."""
+        self.edit_skills(
+            '"N-1": "a boundary element is true, is not determined by a policy source, '
+            'and is not decided by an explicit authorization"',
+            '"N-1": "a boundary element is true, unless the run risk is low"',
+        )
+        self.assert_validator_fails_with("entry clause text drifted")
+
+    # ---- FR-2: user authority is an allowlist ---------------------------------
+
+    def test_decision_policy_user_authority_vocabulary_drift_fails(self) -> None:
+        """C24. Widening the positive vocabulary is how a denylist bypass would come
+        back -- adding one permissive spelling reopens the whole hole."""
+        self.edit_skills(
+            '"user_decision_sources": ["explicit_user_reply", '
+            '"prior_explicit_user_authorization"]',
+            '"user_decision_sources": ["explicit_user_reply", '
+            '"prior_explicit_user_authorization", "high_confidence"]',
+        )
+        self.assert_validator_fails_with("user-authority positive vocabulary drifted")
+
+    def test_decision_policy_user_authority_vocabulary_emptied_fails(self) -> None:
+        """Over-blocking guard: an empty allowlist makes every user decision
+        unrepresentable, which the ticket also calls a wrong implementation."""
+        self.edit_skills(
+            '"user_decision_sources": ["explicit_user_reply", '
+            '"prior_explicit_user_authorization"]',
+            '"user_decision_sources": []',
+        )
+        self.assert_validator_fails_with("decision policy contract is missing or malformed")
+
+    def test_decision_policy_forbidden_source_admitted_as_authority_fails(self) -> None:
+        """C25. The retained denylist's remaining job: the two sets must stay
+        disjoint, so a forbidden category cannot be promoted into the allowlist."""
+        self.edit_skills(
+            '"user_decision_sources": ["explicit_user_reply", '
+            '"prior_explicit_user_authorization"]',
+            '"user_decision_sources": ["explicit_user_reply", "recommended_default"]',
+        )
+        self.assert_validator_fails_with("decision policy contract is missing or malformed")
+
+    # ---- FR-1: the transition matrix is pinned BY VALUE ----------------------
+    # C8 compared only the set of `forbidden` cells and C11c only closed-set
+    # membership, so relaxing an authority-requiring edge to the equally legal
+    # "allowed" left the validator green. These two edges carry the contract's
+    # central promise: an unresolved NEEDS_INPUT or CONFLICT cannot continue, and
+    # reaching CLEAR takes a real user decision.
+
+    def test_needs_input_to_clear_relaxed_to_allowed_fails(self) -> None:
+        """FR-1, first required edge. Before C26/C26a this mutation left
+        `Skill validation PASSED` at exit 0."""
+        self.edit_skills(
+            '"NEEDS_INPUT": {"CLEAR": "requires_user_decision",',
+            '"NEEDS_INPUT": {"CLEAR": "allowed",',
+        )
+        self.assert_validator_fails_with(
+            "NEEDS_INPUT -> CLEAR must require a user decision"
+        )
+
+    def test_conflict_to_clear_relaxed_to_allowed_fails(self) -> None:
+        """FR-1, second required edge."""
+        self.edit_skills(
+            '"CONFLICT": {"CLEAR": "requires_user_decision",',
+            '"CONFLICT": {"CLEAR": "allowed",',
+        )
+        self.assert_validator_fails_with(
+            "CONFLICT -> CLEAR must require a user decision"
+        )
+
+    def test_authority_edge_relaxed_to_a_retraction_also_fails(self) -> None:
+        """A subtler relaxation: still not `allowed`, still not a user decision.
+        The named edge check must reject any value that is not
+        `requires_user_decision`, not merely the `allowed` spelling."""
+        self.edit_skills(
+            '"NEEDS_INPUT": {"CLEAR": "requires_user_decision",',
+            '"NEEDS_INPUT": {"CLEAR": "requires_retraction",',
+        )
+        self.assert_validator_fails_with(
+            "NEEDS_INPUT -> CLEAR must require a user decision"
+        )
+
+    def test_assumption_allowed_to_clear_relaxed_fails(self) -> None:
+        """The retraction edge is pinned by the full-matrix check even though it is
+        not an authority edge."""
+        self.edit_skills(
+            '"ASSUMPTION_ALLOWED": {"CLEAR": "requires_retraction",',
+            '"ASSUMPTION_ALLOWED": {"CLEAR": "allowed",',
+        )
+        self.assert_validator_fails_with("the transition matrix drifted")
+
+    def test_a_permissive_cell_tightened_to_forbidden_also_fails(self) -> None:
+        """The matrix is pinned in both directions. Silently forbidding a legal edge
+        is drift too -- over-restriction is the mirror defect of relaxation."""
+        self.edit_skills(
+            '"CLEAR": {"CLEAR": "allowed", "ASSUMPTION_ALLOWED": "allowed",',
+            '"CLEAR": {"CLEAR": "allowed", "ASSUMPTION_ALLOWED": "forbidden",',
+        )
+        self.assert_validator_fails_with("the transition matrix drifted")
+
+    # ---- FR-1 sweep: four more keys checked only by name or membership --------
+
+    def test_boundary_element_enum_values_emptied_fails(self) -> None:
+        """`reversibility` kept its name while losing every value it can take."""
+        self.edit_skills(
+            '"values": ["reversible_in_run", "reversible_with_effort", "irreversible"]',
+            '"values": []',
+        )
+        # The loader's triggering-vs-values consistency check now fires FIRST and
+        # names the exact inconsistency, so the mutation is caught earlier and more
+        # precisely than by C27's value pin. Still caught; the message moved.
+        self.assert_validator_fails_with(
+            "names triggering value(s) ['irreversible'] that are not in its own "
+            "value set []"
+        )
+
+    def test_blast_radius_dropping_the_out_of_scope_values_fails(self) -> None:
+        """INV-4's blast-radius clause names `repository` and `external_system`;
+        removing them from the element would make that clause unreachable."""
+        self.edit_skills(
+            '"values": ["current_change", "module", "repository", "external_system"]',
+            '"values": ["current_change", "module"]',
+        )
+        # Same: removing the two values INV-4's clause names now also orphans this
+        # element's triggering list, which the loader reports directly.
+        self.assert_validator_fails_with(
+            "names triggering value(s) ['repository', 'external_system'] that are "
+            "not in its own value set ['current_change', 'module']"
+        )
+
+    def test_conflict_citation_minimum_on_the_element_lowered_fails(self) -> None:
+        """A second citation minimum lives on the boundary element; lowering it there
+        was invisible even though C20 pins the one in `citation_minimum`."""
+        self.edit_skills(
+            '"explicit_requirement_conflict": {"kind": "citations", "minimum": 2, '
+            '"triggering": "at_minimum"}',
+            '"explicit_requirement_conflict": {"kind": "citations", "minimum": 1, '
+            '"triggering": "at_minimum"}',
+        )
+        self.assert_validator_fails_with("boundary element specifications drifted")
+
+    def test_policy_source_roles_dropping_supports_fails(self) -> None:
+        """INV-3 requires the role `supports`; removing it from the contract would
+        make ASSUMPTION_ALLOWED unreachable."""
+        self.edit_skills(
+            '"policy_source_roles": ["determines", "supports"]',
+            '"policy_source_roles": ["determines"]',
+        )
+        self.assert_validator_fails_with("policy source roles or kinds drifted")
+
+    def test_policy_source_kinds_widened_fails(self) -> None:
+        """Admitting a new evidence kind is a contract change, not a free extension."""
+        self.edit_skills(
+            '"policy_source_kinds": ["file_path"',
+            '"policy_source_kinds": ["model_hunch", "file_path"',
+        )
+        self.assert_validator_fails_with("policy source roles or kinds drifted")
+
+    def test_state_scope_reversed_fails(self) -> None:
+        """OQ-1 settled on per-item states with a derived aggregate; reverting to
+        per-check would make the downstream rule undefinable."""
+        self.edit_skills(
+            '"state_scope": "per_decision_item_with_derived_check_aggregate"',
+            '"state_scope": "per_check_only"',
+        )
+        self.assert_validator_fails_with("decision state scope drifted")
+
+    # ---- FR-4: entry conditions and triggering values are pinned --------------
+
+    def test_clear_entry_condition_widened_fails(self) -> None:
+        """permitted_states() evaluates these, so widening CLEAR's condition moves the
+        authority boundary itself."""
+        self.edit_skills(
+            '"CLEAR": {"any_of": ["no_open_decision_item", "determining_policy_source", '
+            '"explicit_user_authorization"]}',
+            '"CLEAR": {"any_of": ["no_open_decision_item", "determining_policy_source", '
+            '"explicit_user_authorization", "unclassifiable_item"]}',
+        )
+        self.assert_validator_fails_with("state entry conditions drifted")
+
+    def test_assumption_allowed_entry_condition_weakened_fails(self) -> None:
+        """Dropping a conjunct from an all_of condition is a relaxation."""
+        self.edit_skills(
+            '"all_of": ["all_safety_facts_declared", "reversible_in_run", '
+            '"blast_radius_within_scope", "no_high_impact_element", '
+            '"supporting_policy_source", "no_reserved_user_authority"]',
+            '"all_of": ["reversible_in_run", "supporting_policy_source", '
+            '"no_reserved_user_authority"]',
+        )
+        self.assert_validator_fails_with("state entry conditions drifted")
+
+    def test_the_safety_fact_presence_conjunct_removed_fails(self) -> None:
+        """F-001, isolated. Dropping only `all_safety_facts_declared` leaves an
+        ASSUMPTION_ALLOWED condition that still LOOKS complete -- every value
+        judgement is still there -- while restoring exactly the reading the external
+        review found: an undeclared blast radius or impact flag read as safe."""
+        self.edit_skills(
+            '"all_of": ["all_safety_facts_declared", "reversible_in_run", ',
+            '"all_of": ["reversible_in_run", ',
+        )
+        self.assert_validator_fails_with("state entry conditions drifted")
+
+    def test_shortening_the_declared_safety_facts_fails(self) -> None:
+        """F-001. A shorter list rejects nothing new, so every fixture and test would
+        stay green while a fact stopped having to be declared. That silence is why
+        this is pinned by value rather than by membership."""
+        self.edit_skills(
+            '"declared_safety_facts": ["blast_radius", "monetary_cost", "security", '
+            '"privacy", "compliance", "long_term_lock_in"]',
+            '"declared_safety_facts": ["blast_radius"]',
+        )
+        self.assert_validator_fails_with("INV-3 assumption requirements drifted")
+
+    def test_flipping_the_authority_absence_rule_fails(self) -> None:
+        """F-001. The rule is data, which is the point -- so a change to it must be
+        visible rather than silent."""
+        self.edit_skills(
+            '"absent_explicit_user_authority": "not_reserved"',
+            '"absent_explicit_user_authority": "reserved"',
+        )
+        self.assert_validator_fails_with("INV-3 assumption requirements drifted")
+
+    def test_repointing_a_clause_predicate_fails(self) -> None:
+        """F-002. Aiming N-2 at N-1's predicate restores the exact defect the review
+        found: `missing_user_intent` satisfied by evidence that says nothing about
+        user intent. Both values are legal members of the closed vocabulary, so
+        membership alone would not notice."""
+        self.edit_skills(
+            '"N-2": "absent_user_intent"',
+            '"N-2": "undetermined_boundary_element"',
+        )
+        self.assert_validator_fails_with("clause->predicate binding drifted")
+
+    def test_needs_input_entry_condition_narrowed_fails(self) -> None:
+        """Narrowing the pausing state's condition is the FR-4 defect's shape."""
+        self.edit_skills(
+            '"NEEDS_INPUT": {"any_of": ["undetermined_boundary_element", '
+            '"absent_user_intent", "unclassifiable_item"]}',
+            '"NEEDS_INPUT": {"any_of": ["absent_user_intent", "unclassifiable_item"]}',
+        )
+        self.assert_validator_fails_with("state entry conditions drifted")
+
+    def test_a_triggering_value_removed_fails(self) -> None:
+        """`irreversible` no longer triggering would silently stop escalating
+        irreversible items."""
+        self.edit_skills(
+            '"triggering": ["irreversible"]', '"triggering": []'
+        )
+        self.assert_validator_fails_with("boundary element specifications drifted")
+
+    def test_blast_radius_triggering_narrowed_fails(self) -> None:
+        self.edit_skills(
+            '"triggering": ["repository", "external_system"]',
+            '"triggering": ["external_system"]',
+        )
+        self.assert_validator_fails_with("boundary element specifications drifted")
+
+    def test_a_boolean_element_made_non_triggering_fails(self) -> None:
+        self.edit_skills(
+            '"security": {"kind": "boolean", "triggering": true}',
+            '"security": {"kind": "boolean", "triggering": null}',
+        )
+        self.assert_validator_fails_with("boundary element specifications drifted")
+
+    # ---- RI3-1: authority precedence -----------------------------------------
+
+    def test_authority_precedence_emptied_fails(self) -> None:
+        """Emptying the list restores the RI3-1 defect: a determining policy source
+        would again un-reserve user authority and arbitrate a contradiction."""
+        self.edit_skills(
+            '"policy_source_cannot_resolve": ["explicit_user_authority", '
+            '"explicit_requirement_conflict"]',
+            '"policy_source_cannot_resolve": []',
+        )
+        self.assert_validator_fails_with("authority precedence drifted")
+
+    def test_authority_precedence_losing_the_reserved_authority_cell_fails(self) -> None:
+        self.edit_skills(
+            '"policy_source_cannot_resolve": ["explicit_user_authority", '
+            '"explicit_requirement_conflict"]',
+            '"policy_source_cannot_resolve": ["explicit_requirement_conflict"]',
+        )
+        self.assert_validator_fails_with("authority precedence drifted")
+
+    def test_authority_precedence_losing_the_conflict_cell_fails(self) -> None:
+        self.edit_skills(
+            '"policy_source_cannot_resolve": ["explicit_user_authority", '
+            '"explicit_requirement_conflict"]',
+            '"policy_source_cannot_resolve": ["explicit_user_authority"]',
+        )
+        self.assert_validator_fails_with("authority precedence drifted")
 
     def test_valid_repository_passes(self) -> None:
         result = self.run_validator()

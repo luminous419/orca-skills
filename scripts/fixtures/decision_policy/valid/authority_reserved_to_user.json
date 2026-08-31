@@ -1,0 +1,8 @@
+{
+  "state": "NEEDS_INPUT",
+  "reason_code": "authority_reserved_to_user",
+  "boundary_element": "explicit_user_authority",
+  "what_is_missing": "the user's decision on the reserved choice",
+  "why_policy_cannot_decide": "a policy source cannot un-reserve it",
+  "explicit_user_authority": "reserved"
+}

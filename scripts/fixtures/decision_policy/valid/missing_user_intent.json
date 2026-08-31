@@ -1,0 +1,8 @@
+{
+  "state": "NEEDS_INPUT",
+  "reason_code": "missing_user_intent",
+  "boundary_element": "ambiguity",
+  "what_is_missing": "the intent itself",
+  "why_policy_cannot_decide": "there is no text to interpret and no policy substitute",
+  "user_intent_absent": true
+}
