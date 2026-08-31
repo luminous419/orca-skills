@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import ast
 import inspect
 import json
@@ -20,7 +21,7 @@ from pathlib import Path
 from typing import Any, NamedTuple
 from unittest.mock import patch
 
-from scripts import orca_runtime_harness
+from scripts import fake_worker, orca_runtime_harness
 from scripts import decision_gate, run_logging
 from scripts.orca_fake_agent import send_done
 from scripts.orca_runtime_harness import (
@@ -76,6 +77,31 @@ from scripts.task_context import (
     render_boundary_receipt,
 )
 
+# ---- OS-29 round 2 (review F-001): the settled bodies the recorders hand back -------
+# Round 1's doubles answered a bare "ok", which declares no gate result at all. The
+# runtime used to treat that as a legacy non-participant and let the next B1 admit the
+# unchanged run-entry head -- the fail-OPEN exception F-001 required removing. Now that
+# a silent settled result poisons the boundary, a double that stays silent would be
+# asserting the very exception that was removed, so the doubles DECLARE instead. The
+# text comes from fake_worker.render_decision_gate(), the same renderer the real fake
+# agents use, so the doubles and the subprocess agents cannot drift apart and no
+# decision vocabulary is restated here.
+def gate_declaration(state: str = "CLEAR") -> str:
+    """One valid `DECISION_GATE_STATE` line plus its fenced record, for `state`."""
+    return fake_worker.render_decision_gate(
+        argparse.Namespace(
+            decision_gate_state=state,
+            decision_gate_state_line_raw=None,
+            decision_gate_record_raw=None,
+            decision_gate_omit_field=False,
+            decision_gate_omit_block=False,
+        )
+    )
+
+
+DECLARED_DONE_BODY = "ok\n" + gate_declaration()
+
+
 # validate_skills.py imports its siblings by top-level module name, so scripts/ must be
 # importable before it can be loaded. `unittest discover -s scripts` already arranges
 # that; this keeps the other invocation forms working too.
@@ -109,7 +135,7 @@ DONE = {
     "payload": json.dumps(
         {"taskId": "task_g", "dispatchId": "ctx_1", "outcome": "succeeded"}
     ),
-    "body": "ok",
+    "body": DECLARED_DONE_BODY,
 }
 # The completion timestamp axis (a) requires alongside a settled status. The live
 # runtime writes `completed_at` on both the completed and the failed Dispatch row.
@@ -129,7 +155,7 @@ def done_for(
         "payload": json.dumps(
             {"taskId": task_id, "dispatchId": dispatch_id, "outcome": outcome}
         ),
-        "body": "ok",
+        "body": DECLARED_DONE_BODY,
     }
 
 
@@ -194,7 +220,8 @@ class RecordingExec:
                 "payload": json.dumps(
                     {"taskId": "task_g", "dispatchId": "ctx_1", "outcome": "succeeded"}
                 ),
-                "body": "ok",
+                # Declares CLEAR rather than staying silent -- see gate_declaration().
+                "body": DECLARED_DONE_BODY,
             }
         ],
     }
@@ -326,7 +353,7 @@ class SequentialDispatchExec(SequentialTerminalExec):
                                 "outcome": "succeeded",
                             }
                         ),
-                        "body": "ok",
+                        "body": DECLARED_DONE_BODY,
                     }
                 ],
             }
@@ -365,8 +392,11 @@ class EchoingTerminalExec(SequentialTerminalExec):
         elif verb == "check" and result.get("messages"):
             for message in result["messages"]:
                 task_id = json.loads(message["payload"])["taskId"]
-                message["body"] = "ok" + render_boundary_receipt(
-                    self.specs.get(task_id, "")
+                message["body"] = (
+                    "ok"
+                    + render_boundary_receipt(self.specs.get(task_id, ""))
+                    + "\n"
+                    + gate_declaration()
                 )
             return code, json.dumps(body)
         return code, payload
@@ -2692,7 +2722,7 @@ class SameRoleSessionReuseTests(OfflineHarnessTestCase):
                             "outcome": "succeeded",
                         }
                     ),
-                    "body": "ok",
+                    "body": DECLARED_DONE_BODY,
                 }
             ],
         }
@@ -3961,7 +3991,7 @@ class FinalReviewFreshnessTests(OfflineHarnessTestCase):
                             "outcome": "succeeded",
                         }
                     ),
-                    "body": "ok",
+                    "body": DECLARED_DONE_BODY,
                 }
             ],
         }
@@ -4566,7 +4596,7 @@ class ScenarioKExec(EchoingTerminalExec):
                                 "outcome": "succeeded",
                             }
                         ),
-                        "body": "ok",
+                        "body": DECLARED_DONE_BODY,
                     }
                 ],
             }
@@ -5041,7 +5071,7 @@ class AutoSequencedExec(EchoingTerminalExec):
                                 "outcome": "succeeded",
                             }
                         ),
-                        "body": "ok",
+                        "body": DECLARED_DONE_BODY,
                     }
                 ],
             }
@@ -5424,7 +5454,7 @@ quality_attributes:
                                 "outcome": "succeeded",
                             }
                         ),
-                        "body": "ok",
+                        "body": DECLARED_DONE_BODY,
                     }
                 ],
             }
@@ -5956,7 +5986,7 @@ class RunLoggingIntegrationTests(OfflineHarnessTestCase):
         self.arm(recorder, "ctx_w1", "task_w1")
         worker1, _ = harness.run_attempt("worker", 1, "complete", phase="implementation")
         self.arm(recorder, "ctx_r1", "task_r1")
-        recorder.results["check"]["messages"][0]["body"] = "RESULT: FAIL"
+        recorder.results["check"]["messages"][0]["body"] = "RESULT: FAIL" + "\n" + gate_declaration()
         reviewer1, _ = harness.run_attempt(
             "reviewer", 1, "fail", phase="implementation", findings=("R1",)
         )
@@ -5965,7 +5995,7 @@ class RunLoggingIntegrationTests(OfflineHarnessTestCase):
             "worker", 2, "correction", phase="implementation", findings=("R1",)
         )
         self.arm(recorder, "ctx_r2", "task_r2")
-        recorder.results["check"]["messages"][0]["body"] = "RESULT: PASS"
+        recorder.results["check"]["messages"][0]["body"] = "RESULT: PASS" + "\n" + gate_declaration()
         reviewer2, _ = harness.run_attempt("reviewer", 2, "pass", phase="implementation")
         run_id = harness.run_id
         # finish() is what closes whatever phase/iteration is still open when a
@@ -6293,7 +6323,7 @@ class RunLoggingIntegrationTests(OfflineHarnessTestCase):
         self.arm(recorder, "ctx_w1", "task_w1")
         worker1, _ = harness.run_attempt("worker", 1, "complete", phase="implementation")
         self.arm(recorder, "ctx_r1", "task_r1")
-        recorder.results["check"]["messages"][0]["body"] = "RESULT: FAIL"
+        recorder.results["check"]["messages"][0]["body"] = "RESULT: FAIL" + "\n" + gate_declaration()
         reviewer1, _ = harness.run_attempt(
             "reviewer", 1, "fail", phase="implementation", findings=("R1",)
         )
@@ -6302,7 +6332,7 @@ class RunLoggingIntegrationTests(OfflineHarnessTestCase):
             "worker", 2, "correction", phase="implementation", findings=("R1",)
         )
         self.arm(recorder, "ctx_r2", "task_r2")
-        recorder.results["check"]["messages"][0]["body"] = "RESULT: PASS"
+        recorder.results["check"]["messages"][0]["body"] = "RESULT: PASS" + "\n" + gate_declaration()
         reviewer2, _ = harness.run_attempt("reviewer", 2, "pass", phase="implementation")
         run_id = harness.run_id
         harness.finish(
@@ -6404,7 +6434,7 @@ class RunLoggingIntegrationTests(OfflineHarnessTestCase):
             harness.run_attempt("worker", 1, "complete", phase="implementation")[0]
         )
         self.arm(recorder, "ctx_r1", "task_r1")
-        recorder.results["check"]["messages"][0]["body"] = "RESULT: FAIL"
+        recorder.results["check"]["messages"][0]["body"] = "RESULT: FAIL" + "\n" + gate_declaration()
         attempts.append(
             harness.run_attempt(
                 "reviewer", 1, "fail", phase="implementation", findings=("R1",)
@@ -6418,14 +6448,14 @@ class RunLoggingIntegrationTests(OfflineHarnessTestCase):
             )[0]
         )
         self.arm(recorder, "ctx_r2", "task_r2")
-        recorder.results["check"]["messages"][0]["body"] = "RESULT: PASS"
+        recorder.results["check"]["messages"][0]["body"] = "RESULT: PASS" + "\n" + gate_declaration()
         attempts.append(
             harness.run_attempt(
                 "reviewer", 2, "pass", phase="implementation", round_kind="correction"
             )[0]
         )
         self.arm(recorder, "ctx_f1", "task_f1")
-        recorder.results["check"]["messages"][0]["body"] = "RESULT: FAIL"
+        recorder.results["check"]["messages"][0]["body"] = "RESULT: FAIL" + "\n" + gate_declaration()
         attempts.append(
             harness.run_attempt(
                 "reviewer", 1, "fail", phase="final_review",
@@ -6436,7 +6466,7 @@ class RunLoggingIntegrationTests(OfflineHarnessTestCase):
         # re-opens design at a NEW iteration number -- the exact path DESIGN
         # iteration 7 (-1296s) came down in the real run.
         self.arm(recorder, "ctx_d7", "task_d7")
-        recorder.results["check"]["messages"][0]["body"] = "RESULT: PASS"
+        recorder.results["check"]["messages"][0]["body"] = "RESULT: PASS" + "\n" + gate_declaration()
         attempts.append(
             harness.run_attempt(
                 "worker", 7, "correction", phase="design",
@@ -6606,7 +6636,7 @@ class RunLoggingIntegrationTests(OfflineHarnessTestCase):
         recorder = SequentialTerminalExec()
         harness = self.started_harness(recorder)
         self.arm(recorder, "ctx_r1", "task_r1")
-        recorder.results["check"]["messages"][0]["body"] = "RESULT: FAIL"
+        recorder.results["check"]["messages"][0]["body"] = "RESULT: FAIL" + "\n" + gate_declaration()
 
         attempt, _ = harness.run_attempt(
             "reviewer", 1, "fail", phase="implementation", findings=("R1",)
@@ -6623,12 +6653,12 @@ class RunLoggingIntegrationTests(OfflineHarnessTestCase):
         recorder = SequentialTerminalExec()
         harness = self.started_harness(recorder)
         self.arm(recorder, "ctx_r1", "task_r1")
-        recorder.results["check"]["messages"][0]["body"] = "RESULT: FAIL"
+        recorder.results["check"]["messages"][0]["body"] = "RESULT: FAIL" + "\n" + gate_declaration()
         harness.run_attempt(
             "reviewer", 1, "fail", phase="implementation", findings=("R1",)
         )
         self.arm(recorder, "ctx_r2", "task_r2")
-        recorder.results["check"]["messages"][0]["body"] = "RESULT: PASS"
+        recorder.results["check"]["messages"][0]["body"] = "RESULT: PASS" + "\n" + gate_declaration()
         harness.run_attempt("reviewer", 2, "pass", phase="implementation")
 
         rows = self.read_orchestrator_rows(harness.run_id)
@@ -6646,7 +6676,7 @@ class RunLoggingIntegrationTests(OfflineHarnessTestCase):
         harness = self.started_harness(recorder)
         self.arm(recorder, "ctx_w1", "task_w1")
         # Ignored: gate-result parsing only applies to a reviewer-role dispatch.
-        recorder.results["check"]["messages"][0]["body"] = "RESULT: FAIL"
+        recorder.results["check"]["messages"][0]["body"] = "RESULT: FAIL" + "\n" + gate_declaration()
 
         harness.run_attempt("worker", 1, "complete", phase="implementation")
 
@@ -6662,6 +6692,8 @@ class RunLoggingIntegrationTests(OfflineHarnessTestCase):
         self.arm(recorder, "ctx_r1", "task_r1")
         recorder.results["check"]["messages"][0]["body"] = (
             "# Review Result\n\n## Summary\nMissing result field"
+            + "\n"
+            + gate_declaration()
         )
 
         harness.run_attempt("reviewer", 1, "fail", phase="implementation")
@@ -6676,7 +6708,7 @@ class RunLoggingIntegrationTests(OfflineHarnessTestCase):
         recorder = SequentialTerminalExec()
         harness = self.started_harness(recorder)
         self.arm(recorder, "ctx_f1", "task_f1")
-        recorder.results["check"]["messages"][0]["body"] = "RESULT: FAIL"
+        recorder.results["check"]["messages"][0]["body"] = "RESULT: FAIL" + "\n" + gate_declaration()
 
         harness.run_attempt(
             "reviewer", 1, "fail", phase="final_review", findings=("R1",)
@@ -6704,7 +6736,9 @@ class RunLoggingIntegrationTests(OfflineHarnessTestCase):
         }
         for iteration, (dispatch_id, body) in enumerate(bodies.items(), start=1):
             self.arm(recorder, dispatch_id, f"task_{dispatch_id}")
-            recorder.results["check"]["messages"][0]["body"] = body
+            recorder.results["check"]["messages"][0]["body"] = (
+                body + "\n" + gate_declaration()
+            )
             harness.run_attempt(
                 "reviewer", iteration, "fail", phase="implementation"
             )
@@ -6733,7 +6767,7 @@ class RunLoggingIntegrationTests(OfflineHarnessTestCase):
         recorder = SequentialTerminalExec()
         harness = self.started_harness(recorder)
         self.arm(recorder, "ctx_r1", "task_r1")
-        recorder.results["check"]["messages"][0]["body"] = "RESULT: PASS"
+        recorder.results["check"]["messages"][0]["body"] = "RESULT: PASS" + "\n" + gate_declaration()
 
         harness.run_attempt("reviewer", 1, "pass", phase="implementation")
 
@@ -6747,6 +6781,8 @@ class RunLoggingIntegrationTests(OfflineHarnessTestCase):
         self.arm(recorder, "ctx_f1", "task_f1")
         recorder.results["check"]["messages"][0]["body"] = (
             "RESULT: PASS\nREVIEW_VERDICT: PASS WITH NOTES"
+            + "\n"
+            + gate_declaration()
         )
 
         harness.run_attempt("reviewer", 1, "pass", phase="final_review")
@@ -7273,19 +7309,26 @@ class DecisionGateLiveDispatchTests(unittest.TestCase):
         )
 
     @staticmethod
-    def attempt(*, body: str) -> orca_runtime_harness.RuntimeAttempt:
+    def attempt(
+        *,
+        body: str,
+        role: str = "worker",
+        iteration: int = 1,
+        outcome: str = "succeeded",
+        worker_done_count: int = 1,
+    ) -> orca_runtime_harness.RuntimeAttempt:
         return orca_runtime_harness.RuntimeAttempt(
-            role="worker",
-            iteration=1,
+            role=role,
+            iteration=iteration,
             task_id="task_x",
             dispatch_id="ctx_x",
-            outcome="succeeded",
+            outcome=outcome,
             task_status="done",
             dispatch_status="settled",
             worker_state="done",
             terminal_state="live",
             lifecycle_action="release",
-            worker_done_count=1,
+            worker_done_count=worker_done_count,
             execution_path="supervised",
             body=body,
         )
@@ -7329,8 +7372,13 @@ class DecisionGateLiveDispatchTests(unittest.TestCase):
         self.assertIn("pre_dispatch_failure", log)
         self.assertIn("DECISION_GATE_INPUT_MISSING", log)
 
-    def test_an_unresolved_open_item_refuses_the_next_dispatch(self) -> None:
-        harness, recorder = self.started_harness()
+    def plant_unresolved_open_item(self, harness: OrcaRuntimeHarness) -> None:
+        """Append a NEEDS_INPUT record and declare it open on the run entry.
+
+        Factored out of test_an_unresolved_open_item_refuses_the_next_dispatch so the
+        SAME planted shape can be driven through both live dispatch initiators
+        (round 2 review F-002); the assertions themselves stay in the tests.
+        """
         open_record = json.loads(
             (
                 Path(__file__).resolve().parents[1]
@@ -7358,6 +7406,10 @@ class DecisionGateLiveDispatchTests(unittest.TestCase):
             json.dumps(declaration, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
         harness._last_settled = (harness.run_id, "implementation", 1)
+
+    def test_an_unresolved_open_item_refuses_the_next_dispatch(self) -> None:
+        harness, recorder = self.started_harness()
+        self.plant_unresolved_open_item(harness)
         commands_before = len(recorder.commands)
 
         with self.assertRaises(orca_runtime_harness.DecisionGateRefused) as caught:
@@ -7414,22 +7466,139 @@ class DecisionGateLiveDispatchTests(unittest.TestCase):
         # which is the control proving _last_settled and the record agree.
         harness._b1_guard(phase="implementation", role="reviewer", iteration=1)
 
-    def test_a_legacy_body_that_declares_nothing_is_not_a_ledger_participant(
-        self,
-    ) -> None:
-        """A body with no declaration at all is the pre-OS-29 shape. It records no
-        ledger entry and leaves `_last_settled` alone, so the B1 chain still admits
-        -- which is what keeps the gate's live authority at B1, as R-11 states."""
-        harness, _ = self.started_harness()
+    # ---- F-001: a settled result that declares NOTHING is the missing-record case.
+    # Round 1 shipped a test here asserting the opposite -- that such a body is "not
+    # a ledger participant", leaves `_last_settled` untouched, and therefore lets the
+    # following B1 admit the unchanged run-entry head. Round 2 review F-001 required
+    # that test to be REPLACED, because it enshrined a fail-OPEN exception against
+    # ORIGINAL_REQUEST's unconditional list ("missing decision record" is its first
+    # item) and PLAN P10 criterion 6. The two tests below are its replacement and
+    # assert refusal, on the Worker boundary (B2) and the Reviewer boundary (B3).
 
-        self.assertFalse(decision_gate.declares_gate_result("# Worker Result\n\nSTATUS: COMPLETE\n"))
-        harness._record_decision_from_attempt(
+    SILENT_WORKER_BODY = "# Worker Result\n\nSTATUS: COMPLETE\n"
+    SILENT_REVIEWER_BODY = "# Review Result\n\nRESULT: PASS\n"
+
+    def test_a_silent_worker_result_poisons_the_next_boundary(self) -> None:
+        """B2. A Worker body carrying no gate declaration publishes NO ledger record,
+        binds the round that settled anyway, and therefore leaves the next B1 unable
+        to admit the unchanged head. No later dispatch survives it."""
+        harness, recorder = self.started_harness()
+        self.assertFalse(decision_gate.declares_gate_result(self.SILENT_WORKER_BODY))
+
+        state, reason = harness._record_decision_from_attempt(
+            event="dispatch_settled",
             phase="implementation",
-            attempt=self.attempt(body="# Worker Result\n\nSTATUS: COMPLETE\n"),
+            attempt=self.attempt(body=self.SILENT_WORKER_BODY),
         )
 
+        # Never CLEAR, and never blank: silence is named as the input defect it is.
+        self.assertEqual(state, decision_gate.INPUT_DEFECT_STATE)
+        self.assertEqual(reason, decision_gate.GATE_INPUT_MISSING)
+        # Nothing was published -- a body with no result cannot become a record.
+        self.assertEqual(len(self.ledger()), 1)
+        # ... but the settled round IS bound, which is what poisons the next B1.
+        self.assertEqual(harness._last_settled, (harness.run_id, "implementation", 1))
+
+        commands_before = len(recorder.commands)
+        with self.assertRaises(orca_runtime_harness.DecisionGateRefused) as caught:
+            harness.run_existing_task(
+                "worker", 2, "complete", "task_next", phase="implementation"
+            )
+        self.assertEqual(caught.exception.reason, decision_gate.GATE_INPUT_UNBOUND)
+        self.assertEqual(len(recorder.commands), commands_before)
+        self.assertNotIn("worker-start", recorder.verbs)
+
+    def test_a_silent_reviewer_result_poisons_the_next_boundary(self) -> None:
+        """B3. Identical refusal from the Reviewer boundary, and it holds for BOTH
+        live dispatch initiators -- neither the correction Worker nor the unexpected-
+        exit path can run after a Reviewer settled without a gate result."""
+        harness, recorder = self.started_harness()
+        self.assertFalse(decision_gate.declares_gate_result(self.SILENT_REVIEWER_BODY))
+
+        state, reason = harness._record_decision_from_attempt(
+            event="dispatch_settled",
+            phase="implementation",
+            attempt=self.attempt(body=self.SILENT_REVIEWER_BODY, role="reviewer"),
+        )
+
+        self.assertEqual(state, decision_gate.INPUT_DEFECT_STATE)
+        self.assertEqual(reason, decision_gate.GATE_INPUT_MISSING)
+        self.assertEqual(len(self.ledger()), 1)
+        self.assertEqual(harness._last_settled, (harness.run_id, "implementation", 1))
+
+        commands_before = len(recorder.commands)
+        with self.assertRaises(orca_runtime_harness.DecisionGateRefused) as caught:
+            harness.run_existing_task(
+                "worker", 2, "correct", "task_next", phase="implementation"
+            )
+        self.assertEqual(caught.exception.reason, decision_gate.GATE_INPUT_UNBOUND)
+        with self.assertRaises(orca_runtime_harness.DecisionGateRefused) as crashed:
+            harness.observe_unexpected_exit("worker", 2, phase="implementation")
+        self.assertEqual(crashed.exception.reason, decision_gate.GATE_INPUT_UNBOUND)
+        self.assertEqual(len(recorder.commands), commands_before)
+        self.assertNotIn("worker-start", recorder.verbs)
+
+    def test_a_silent_result_is_named_as_a_defect_on_the_live_log_row(self) -> None:
+        """The same refusal through the REAL settled-dispatch funnel rather than the
+        private recorder: _log_attempt() is what every live dispatch passes, and the
+        row it writes has to say INPUT/DECISION_GATE_INPUT_MISSING rather than the
+        blank columns a tolerated legacy body used to leave behind."""
+        harness, _ = self.started_harness()
+
+        harness._log_attempt(
+            phase="implementation",
+            attempt=self.attempt(body=self.SILENT_WORKER_BODY),
+            terminal_created=True,
+            started_at=run_logging.now_iso(),
+            ended_at=run_logging.now_iso(),
+        )
+
+        log = (
+            self.artifact_dir
+            / "artifacts" / "runs" / harness.run_id / "ORCHESTRATOR_LOG.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn(f"| {decision_gate.INPUT_DEFECT_STATE} |", log)
+        self.assertIn(decision_gate.GATE_INPUT_MISSING, log)
+        self.assertEqual(len(self.ledger()), 1)
+        self.assertEqual(harness._last_settled, (harness.run_id, "implementation", 1))
+        with self.assertRaises(orca_runtime_harness.DecisionGateRefused):
+            harness._b1_guard(phase="implementation", role="reviewer", iteration=1)
+
+    def test_a_non_response_is_not_a_boundary_and_is_never_presumed_clear(self) -> None:
+        """The complement of the two tests above, and the reason they are scoped to a
+        DELIVERED result: an unexpected exit reached neither B2 nor B3, because no
+        Worker or Reviewer result was ever received. It therefore asserts NOTHING --
+        no ledger record, no decision columns, no gate_result -- rather than
+        asserting CLEAR, and it does not consume the binding of a round that never
+        produced one. What stops a non-response from becoming progress is B1 on the
+        NEXT dispatch, which observe_unexpected_exit() now runs too (F-002 above);
+        poisoning here instead would brick the lifecycle recovery path, which OS-29
+        is explicitly forbidden to weaken."""
+        harness, _ = self.started_harness()
+
+        harness._log_attempt(
+            phase="implementation",
+            attempt=self.attempt(body="", outcome="unknown", worker_done_count=0),
+            terminal_created=True,
+            started_at=run_logging.now_iso(),
+            ended_at=run_logging.now_iso(),
+            event="unexpected_exit",
+        )
+
+        # Nothing was recorded and nothing was claimed: no state, no reason code.
         self.assertEqual(len(self.ledger()), 1)
         self.assertIsNone(harness._last_settled)
+        row = [
+            line
+            for line in (
+                self.artifact_dir
+                / "artifacts" / "runs" / harness.run_id / "ORCHESTRATOR_LOG.md"
+            ).read_text(encoding="utf-8").splitlines()
+            if "unexpected_exit" in line
+        ]
+        self.assertEqual(len(row), 1)
+        self.assertNotIn("CLEAR", row[0])
+        self.assertNotIn(decision_gate.INPUT_DEFECT_STATE, row[0].split("|"))
 
     def test_a_declared_but_broken_body_poisons_the_next_boundary(self) -> None:
         """The fail-closed direction: a declaration that does not parse publishes no
@@ -7441,6 +7610,7 @@ class DecisionGateLiveDispatchTests(unittest.TestCase):
         )
 
         state, reason = harness._record_decision_from_attempt(
+            event="dispatch_settled",
             phase="implementation",
             attempt=self.attempt(body=broken),
         )
@@ -7454,6 +7624,135 @@ class DecisionGateLiveDispatchTests(unittest.TestCase):
                 "worker", 2, "complete", "task_next", phase="implementation"
             )
         self.assertEqual(caught.exception.reason, decision_gate.GATE_INPUT_UNBOUND)
+
+    # ---- F-002: observe_unexpected_exit() is the OTHER live dispatch initiator -----
+    # It calls dispatch_context(), create_task(), create_fake_terminal() and
+    # start_worker() exactly as run_existing_task() does. Round 1 gave it no B1 guard
+    # at all, so every refusal shape below still reached worker-start through it while
+    # the sibling path refused. Each test drives ONE refusal shape and asserts the
+    # three absences the requirement actually names: no Task, no terminal, no
+    # worker-start.
+
+    def _run_entry_record_path(self, harness: OrcaRuntimeHarness) -> Path:
+        return (
+            run_logging.decision_ledger_dir(harness.run_id, base=self.artifact_dir)
+            / "000000" / "record.json"
+        )
+
+    def _rewrite_run_entry(self, harness: OrcaRuntimeHarness, **fields: Any) -> None:
+        path = self._run_entry_record_path(harness)
+        record = json.loads(path.read_text(encoding="utf-8"))
+        for name, value in fields.items():
+            if value is self.DROP:
+                record.pop(name, None)
+            else:
+                record[name] = value
+        path.write_text(
+            json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+
+    DROP = object()
+
+    def assert_unexpected_exit_refuses(
+        self,
+        harness: OrcaRuntimeHarness,
+        recorder: RecordingExec,
+        *,
+        reason: str,
+        reason_is_prefix: bool = False,
+    ) -> None:
+        """Drive observe_unexpected_exit() and prove it left NOTHING behind."""
+        commands_before = len(recorder.commands)
+
+        with self.assertRaises(orca_runtime_harness.DecisionGateRefused) as caught:
+            harness.observe_unexpected_exit("worker", 2, phase="implementation")
+
+        if reason_is_prefix:
+            self.assertTrue(caught.exception.reason.startswith(reason))
+        else:
+            self.assertEqual(caught.exception.reason, reason)
+        # No Task, no terminal, no Dispatch: the refusal happened before the runtime
+        # issued a single further command on this path. Scoped to the commands this
+        # call could have added -- start_run() legitimately created the run and the
+        # Coordinator's own terminal before the boundary under test existed.
+        issued = recorder.commands[commands_before:]
+        self.assertEqual(issued, [])
+        self.assertNotIn("task-create", [cmd[1] for cmd in issued if len(cmd) > 1])
+        self.assertNotIn("worker-start", recorder.verbs)
+        self.assertNotIn(("terminal", "create"), [cmd[:2] for cmd in issued])
+        log = (
+            self.artifact_dir
+            / "artifacts" / "runs" / harness.run_id / "ORCHESTRATOR_LOG.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("pre_dispatch_failure", log)
+
+    def test_unexpected_exit_refuses_when_the_ledger_is_absent(self) -> None:
+        harness, recorder = self.started_harness()
+        shutil.rmtree(
+            self.artifact_dir
+            / "artifacts" / "runs" / harness.run_id / "decision_ledger"
+        )
+
+        self.assert_unexpected_exit_refuses(
+            harness, recorder, reason=decision_gate.GATE_INPUT_MISSING
+        )
+
+    def test_unexpected_exit_refuses_on_an_unsupported_ledger_schema(self) -> None:
+        harness, recorder = self.started_harness()
+        self._rewrite_run_entry(
+            harness,
+            ledger_schema_version=decision_gate.LEDGER_RECORD_SCHEMA_VERSION + 99,
+        )
+
+        self.assert_unexpected_exit_refuses(
+            harness, recorder, reason=decision_gate.LEDGER_SCHEMA_UNSUPPORTED
+        )
+
+    def test_unexpected_exit_refuses_on_a_malformed_ledger_record(self) -> None:
+        harness, recorder = self.started_harness()
+        self._rewrite_run_entry(harness, reason_code=self.DROP)
+
+        self.assert_unexpected_exit_refuses(
+            harness, recorder, reason=decision_gate.GATE_INPUT_MALFORMED
+        )
+
+    def test_unexpected_exit_refuses_on_an_unbound_head(self) -> None:
+        """The shape F-001 now produces: a round settled without publishing a record,
+        so the head no longer binds the round the runtime knows settled."""
+        harness, recorder = self.started_harness()
+        harness._last_settled = (harness.run_id, "implementation", 1)
+
+        self.assert_unexpected_exit_refuses(
+            harness, recorder, reason=decision_gate.GATE_INPUT_UNBOUND
+        )
+
+    def test_unexpected_exit_refuses_on_an_unresolved_open_item(self) -> None:
+        harness, recorder = self.started_harness()
+        self.plant_unresolved_open_item(harness)
+
+        self.assert_unexpected_exit_refuses(
+            harness,
+            recorder,
+            reason=f"{decision_gate.BLOCK_REASON_PREFIX}:",
+            reason_is_prefix=True,
+        )
+
+    def test_unexpected_exit_admits_when_the_ledger_head_is_clean(self) -> None:
+        """The non-vacuity control for the five refusals above: with the very same
+        guard in place and an admissible head, this path still dispatches."""
+        harness, recorder = self.started_harness()
+        recorder.results["check"] = {"messages": []}
+        recorder.results["worker-show"] = {
+            "dispatch": {"status": "failed", "completed_at": None},
+            "worker": {"state": "stopped"},
+            "terminalResource": {"releaseState": "released"},
+        }
+
+        attempt = harness.observe_unexpected_exit("worker", 1, phase="implementation")
+
+        self.assertIn("worker-start", recorder.verbs)
+        self.assertIn("task-create", recorder.verbs)
+        self.assertTrue(attempt.terminal)
 
 
 if __name__ == "__main__":

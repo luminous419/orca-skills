@@ -1171,6 +1171,25 @@ def strip_os29_spec_additions(spec: str) -> str:
     return OS29_SPEC_DECLARATION.sub("", spec)
 
 
+# Round 2 (review F-001): the settled agent bodies the offline recorders deliver now
+# DECLARE a gate result, because a silent settled result fails closed and would end
+# the run at the next boundary. The `detail` column quotes the first 160 characters
+# of that body, so the declaration reaches this log as a truncated INLINE suffix --
+# not a whole line and not necessarily a whole record. Cut at the field name and, if
+# the truncation landed inside it, at the longest prefix of it that ends the cell.
+OS29_LOG_DETAIL_MARKER = f"{decision_gate.GATE_STATE_FIELD}:"
+
+
+def strip_os29_detail_declaration(cell: str) -> str:
+    """One `detail` cell, minus the gate declaration excerpt appended to it."""
+    head = cell.split(OS29_LOG_DETAIL_MARKER)[0]
+    for length in range(len(OS29_LOG_DETAIL_MARKER) - 1, 0, -1):
+        if head.endswith(OS29_LOG_DETAIL_MARKER[:length]):
+            head = head[:-length]
+            break
+    return head.strip()
+
+
 def strip_os29_spec_list(specs: list[str]) -> list[str]:
     """Every spec, with the non-vacuity guard applied to the LIST.
 
@@ -1201,16 +1220,29 @@ def strip_os29_log_additions(log: str) -> str:
         )
     drop = {header.index(column) for column in OS29_LOG_COLUMNS}
     event_index = header.index("event")
+    detail_index = header.index("detail")
+    declared = False
     kept: list[str] = []
-    for line in lines:
+    for index, line in enumerate(lines):
         cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
         if len(cells) != len(header):
             kept.append(line)
             continue
         if cells[event_index] in OS29_LOG_EVENTS:
             continue
+        if index and OS29_LOG_DETAIL_MARKER in cells[detail_index]:
+            declared = True
+        cells[detail_index] = strip_os29_detail_declaration(cells[detail_index])
         remaining = [cell for index, cell in enumerate(cells) if index not in drop]
         kept.append("| " + " | ".join(remaining) + " |")
+    if not declared:
+        # The same non-vacuity half the other strippers carry: a build whose settled
+        # bodies declared nothing would sail through this comparison while having
+        # reintroduced exactly the fail-open shape F-001 removed.
+        raise RuntimeError(
+            "no logged dispatch quoted an OS-29 gate declaration; the stripper "
+            "would make this byte-identity comparison vacuous"
+        )
     return "\n".join(kept)
 
 

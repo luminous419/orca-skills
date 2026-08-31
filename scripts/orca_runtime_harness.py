@@ -2183,7 +2183,7 @@ class OrcaRuntimeHarness:
         # the single funnel every settled dispatch passes; it can never be the GATE,
         # which is why the gate itself runs before start_worker instead.
         decision_state, decision_reason_code = self._record_decision_from_attempt(
-            phase=phase, attempt=attempt
+            phase=phase, attempt=attempt, event=event
         )
         # The most recent reviewer-role gate result, and this attempt's own
         # ended_at, observed for the currently open iteration/phase become that
@@ -2349,29 +2349,53 @@ class OrcaRuntimeHarness:
             raise error
 
     def _record_decision_from_attempt(
-        self, *, phase: str | None, attempt: "RuntimeAttempt"
+        self, *, phase: str | None, attempt: "RuntimeAttempt", event: str
     ) -> tuple[str, str]:
         """The settled attempt's own gate declaration -> a ledger record + two columns.
 
-        Three cases, and the difference between them is the whole fail-closed
-        behaviour this path can offer:
+        Two cases, and the difference between them is the whole fail-closed
+        behaviour this path can offer. A settled B2/B3 boundary that produced no
+        usable gate result is NOT a third, tolerated case:
 
-        * The body declares NOTHING. It is not a ledger participant, `_last_settled`
-          is untouched, and the columns stay blank. This is the legacy shape, and the
-          gate's authority over such a run is B1 only -- which is exactly what R-11
-          says is enforceable here and what the decision gate contract block records
-          as the Coordinator's obligation instead.
-        * The body declares something and it is DEFECTIVE. No record is published and
-          `_last_settled` IS advanced, so the very next B1 refuses with
-          DECISION_GATE_INPUT_UNBOUND. A broken declaration poisons the next
-          dispatch; it never passes for a good one.
+        * The body does not yield a valid gate result -- because it declared
+          NOTHING AT ALL (the missing-record case, DECISION_GATE_INPUT_MISSING),
+          or because what it declared is defective. No record is published and
+          `_last_settled` IS advanced either way, so the very next B1 refuses with
+          DECISION_GATE_INPUT_UNBOUND: the ledger head is still the round before
+          this one, which no longer matches the round that actually settled.
+          Silence poisons the next dispatch exactly as a broken declaration does;
+          neither can ever pass for a good one, and neither is presumed CLEAR.
         * The body declares a valid gate result. The record is published, bound to
           the round that actually settled, and the columns carry it.
+
+        Round 2 review F-001: an earlier version returned ("", "") and left
+        `_last_settled` untouched when `declares_gate_result()` was false, so a
+        legacy non-declaring agent left the following B1 still admitting the
+        sequence-0 run-entry head as though no round had settled. That is the
+        missing-decision-record case, which ORIGINAL_REQUEST's fail-closed list
+        names first and forbids unconditionally; a legacy exception is not
+        available here no matter how it is disclosed.
         """
-        body = attempt.body or ""
-        if not decision_gate.declares_gate_result(body):
+        # B2/B3 are "after RECEIVING the Worker/Reviewer result". A dispatch that
+        # delivered no result never reached either boundary, so there is no gate
+        # result to be missing: an unexpected exit is a NON-RESPONSE, which the
+        # lifecycle recovery path already owns (outcome=unknown, worker_done_count=0,
+        # its own `unexpected_exit` event) and which this method must not convert
+        # into a settled boundary. It is still never presumed CLEAR -- no record is
+        # published, the columns stay blank, no gate_result is recorded, and the
+        # recovery dispatch that follows is itself B1-guarded (round 2 review F-002).
+        # This is a statement about WHICH attempts are gate boundaries, not a
+        # tolerated shape of result at one; see the docstring above for why no
+        # exception of the latter kind exists any more.
+        if event != "dispatch_settled" or attempt.worker_done_count < 1:
             return "", ""
+        body = attempt.body or ""
         settled = (self.run_id, phase or "", attempt.iteration)
+        if not decision_gate.declares_gate_result(body):
+            # Named separately from the parse failure below only so the reason code
+            # says WHICH fail-closed clause fired; the effect is identical.
+            self._last_settled = settled
+            return decision_gate.INPUT_DEFECT_STATE, decision_gate.GATE_INPUT_MISSING
         try:
             gate = decision_gate.parse_gate_result(body, self._decision_policy)
         except decision_gate.GateRefusal as refusal:
@@ -2731,6 +2755,20 @@ class OrcaRuntimeHarness:
         phase: str | None = None,
         round_kind: str = "phase_gate",
     ) -> RuntimeAttempt:
+        """The second of the two centralized dispatch initiators.
+
+        Round 2 review F-002: this path creates a Task, a terminal and a Dispatch
+        exactly as run_existing_task() does, so it carries the SAME OS-29 B1
+        obligation. It previously reached start_worker() without consulting the
+        ledger at all, which let an unresolved, malformed, unsupported-schema or
+        unbound head reach worker-start through here while the sibling path
+        refused it.
+        """
+        # ---- OS-29 B1. Before dispatch_context, before create_task, before the
+        # terminal and before start_worker -- the same "no Task, no Dispatch, no
+        # terminal" placement run_existing_task() uses, and ahead of
+        # _open_phase_iteration_boundary() so a refused dispatch opens no scope.
+        self._b1_guard(phase=phase, role=role, iteration=iteration)
         dispatch_started_at = run_logging.now_iso()
         try:
             spec, _, _ = dispatch_context(

@@ -3,14 +3,77 @@
 STATUS: COMPLETE
 UNIT_TEST_STATUS: PASS
 
-Run: run_35b221ea299d · Phase: implementation · Iteration: 1 · Role: worker
+Run: run_35b221ea299d · Phase: implementation · Iteration: 2 · Role: worker
 Branch: os-29-continuous-decision-gates (base main @ b13f191)
 Ticket: OS-29 "Add Continuous Decision and Escalation Gates to Every Phase"
 Approved input: `ANALYSIS.md`, `PLAN.md`, `DESIGN.md` — all PASSED their gates and **none is
 modified by this phase**. DESIGN is the specification implemented here.
+Correction input: `REVIEW_IMPLEMENTATION.md` — **RESULT: FAIL**, blocking findings **F-001** and
+**F-002**, both G1 explicit-requirement violations on the live Orca runtime path.
 
 Every command output quoted below was executed on this branch during this phase. Nothing is
-inherited from an earlier phase's artifact.
+inherited from an earlier phase's artifact. **Iteration 1 is commit `5e1a6cb`; iteration 2 is a new
+commit on top of it — nothing was amended, rebased or pushed.**
+
+---
+
+## Iteration 2 — what changed and why (read this first)
+
+The Reviewer FAILED iteration 1 on two G1 findings, both on the live runtime, and both are now
+resolved in production code with the negative tests the findings demanded.
+
+**F-001 — RESOLVED.** `_record_decision_from_attempt()` no longer has a legacy exception. A settled
+Worker or Reviewer result whose body declares no gate result is now the **missing-decision-record**
+case: no ledger record is published, `_last_settled` **is** advanced, and the very next `_b1_guard()`
+refuses `DECISION_GATE_INPUT_UNBOUND` — the identical fail-closed shape a declared-but-broken body
+already produced. The columns say `INPUT` / `DECISION_GATE_INPUT_MISSING` rather than staying blank.
+Iteration 1's D-2 deviation is **withdrawn, not re-disclosed**: disclosure does not authorize a
+departure from an explicit requirement, and the Reviewer is right that it did not.
+
+**F-002 — RESOLVED.** `observe_unexpected_exit()` — the second of the two centralized dispatch
+initiators — now calls the **same** `_b1_guard()` as `run_existing_task()`, before `dispatch_context`,
+before `create_task`, before the terminal and before `start_worker`. Five adversarial tests drive one
+refusal shape each (absent ledger, unsupported schema, malformed record, unbound head, unresolved
+open item) and assert **no Task, no terminal, no `worker-start`**; a sixth is the non-vacuity control
+showing the same guard still admits a clean head.
+
+**The one test the finding required be REPLACED.**
+`test_a_legacy_body_that_declares_nothing_is_not_a_ledger_participant` asserted the removed
+fail-open behaviour positively. It is deleted and replaced by three tests that assert refusal —
+Worker (B2), Reviewer (B3), and the same refusal observed through the real `_log_attempt()` funnel.
+**This is the correction the Reviewer demanded, not a weakening**; the count moved 229 → 238 test
+functions in that module, one removed and ten added, and no other test, assertion, case or validator
+was deleted or relaxed anywhere in the tree.
+
+**The conflict the task told me to look for is NOT real, and here is the check.** Backward
+compatibility for a non-declaring *settled* agent is not a competing explicit requirement — it was an
+implementation convenience, and it is gone. What IS an explicit requirement is that OS-29 may not
+weaken the existing lifecycle guarantees, and a **non-response** (`observe_unexpected_exit`:
+`outcome=unknown`, `worker_done_count=0`, its own `unexpected_exit` event) is a different thing from
+a settled result that stayed silent. B2 and B3 are defined by ORIGINAL_REQUEST as "after **receiving**
+the Worker/Reviewer result", so a dispatch that delivered no result never reached either boundary and
+has no gate result to be missing. The rule is therefore scoped to attempts that actually delivered a
+result — a statement about *which attempts are gate boundaries*, not a tolerated shape of result at
+one. Nothing is presumed `CLEAR` for a crashed round either: no record is published, the columns stay
+blank, no `gate_result` is recorded, and the recovery dispatch that follows is itself B1-guarded by
+F-002's fix. Poisoning there instead would have bricked crash recovery, which is exactly the
+"weakening lifecycle guarantees" ORIGINAL_REQUEST puts out of scope. `test_a_non_response_is_not_a_
+boundary_and_is_never_presumed_clear` pins this, and the two lifecycle regression tests that would
+otherwise have had to be weakened
+(`UnexpectedExitSettlementTests.test_recovery_path_mutates_once_and_replays_thereafter`,
+`SameRoleSessionReuseTests.test_a_dispatch_in_lifecycle_recovery_forces_a_fresh_terminal`) are
+**untouched and green**.
+
+**Why the fixture edits were unavoidable, and why they are not a weakening.** The Reviewer's own
+words: "the green suite CANNOT establish the required property because it currently encodes the
+exception." The offline recorders answered every settled `worker_done` with a bare `"ok"` — a silent
+result — which the removed exception tolerated and the new rule correctly refuses at the *next*
+boundary. Those doubles now **declare**, using `fake_worker.render_decision_gate()` — the same
+renderer the real fake agent subprocesses already use, so no decision vocabulary is restated and the
+doubles cannot drift from the agents. `test_e2e_harness`'s byte-identity stripper gained one more
+enumerated OS-29 addition (the declaration excerpt that now reaches the `detail` column) and, like
+every other stripper in that block, **raises** when the thing it strips is absent — so a build that
+stopped declaring turns those tests red instead of green.
 
 ---
 
@@ -43,12 +106,15 @@ The whole feature is nine things:
    `reviews/common.md` — beside the **byte-unchanged** optionality sentence.
 8. **The always-armed fake agents (C10)** — the OS-3 opt-in precedent deliberately inverted.
 9. **The tests and fixtures (C13)**: two new modules, four new test classes in existing modules,
-   thirteen fixtures. **1496 → 1570 tests, none removed.**
+   thirteen fixtures. **1496 → 1579 tests** (iteration 1 reached 1570; iteration 2 adds 9 net). The
+   only test function removed in the whole ticket is the one **the Reviewer required be replaced**
+   (F-001), and it is replaced by three that assert the opposite.
 
-**Two mechanism details differ from DESIGN's prose and are disclosed rather than applied silently**
-(*Deviations* below). Neither changes an approved conclusion, neither is irreversible, and neither
-reaches user authority — so, per the task spec, both are ordinary settled implementation calls and
-are recorded here with their evidence.
+**One mechanism detail differs from DESIGN's prose and is disclosed rather than applied silently**
+(*Deviations* below). It does not change an approved conclusion, it is not irreversible, and it does
+not reach user authority — so, per the task spec, it is an ordinary settled implementation call and
+is recorded here with its evidence. **Iteration 1's second disclosure (D-2) was withdrawn, not
+carried forward**: the Reviewer found it to be a departure from an explicit requirement, and it is.
 
 ---
 
@@ -152,16 +218,24 @@ is never routed on.
 record's field set is closed and excludes it, because a decision record carrying a risk level would
 invite exactly the coupling the contract forbids.
 
-### C4 `scripts/orca_runtime_harness.py` — +163 / −2
+### C4 `scripts/orca_runtime_harness.py` — +163 / −2 (iteration 1), +55 / −13 (iteration 2)
 
 * `DecisionGateRefused(OrcaRuntimeError)`; `_b1_guard()` at the **top** of `run_existing_task`,
   before `dispatch_context`, before any terminal is created and before `start_worker`.
+* **Iteration 2 (F-002):** the *same* `_b1_guard()` call is now also the first statement of
+  `observe_unexpected_exit()` — the other centralized dispatch initiator — ahead of
+  `dispatch_context`, `create_task`, the terminal, `start_worker` and the timing-boundary open.
+  Both dispatch initiators are now guarded; there is no third.
 * `start_run` → `open_decision_ledger(...)`, adjacent to the existing log opens.
-* `_record_decision_from_attempt()` at `_log_attempt`: three cases, and the difference between them
-  is the whole fail-closed behaviour available on this path — a body that declares nothing is a
-  legacy body and not a ledger participant; a body that declares something **defective** publishes
-  no record and still advances `_last_settled`, so the next B1 refuses as `UNBOUND`; a valid one is
-  published, bound and indexed in the two columns.
+* `_record_decision_from_attempt()` at `_log_attempt`: **two** cases, and the difference between them
+  is the whole fail-closed behaviour available on this path — a body that does not yield a valid gate
+  result (whether it declared **nothing at all** or declared something **defective**) publishes no
+  record and advances `_last_settled`, so the next B1 refuses as `UNBOUND`; a valid one is published,
+  bound and indexed in the two columns. **Iteration 2 (F-001)** merged what used to be a third,
+  tolerated case into the first. The method now takes the caller's `event`, because B2/B3 exist only
+  for an attempt that actually **delivered** a result: an `unexpected_exit` (`worker_done_count == 0`)
+  reached neither boundary, publishes nothing, claims nothing and is guarded by B1 on the next
+  dispatch instead.
 
 ### C5 `scripts/validate_skills.py` — +197
 
@@ -221,16 +295,15 @@ this class already gives every other pre-dispatch failure: log through the exist
 no Dispatch, no terminal is created* — and `test_a_missing_declaration_refuses_before_any_dispatch_exists`
 asserts the recorder's command count is unchanged across the refusal.
 
-**D-2. On the live path a body that declares NOTHING is not a ledger participant.** DESIGN says
-`_log_attempt` is where `_last_settled` is recorded; it does not say what happens to a body carrying
-no declaration. Treating silence there as a defect would make every existing live-path body fail the
-*next* boundary, and the live runtime has no B2/B3 to fail closed *at* — it has no verdict routing
-and no deterministic iteration counter, which is R-11/L7's whole subject. So: silence is legacy and
-leaves the chain untouched; a **declared-but-broken** body publishes nothing and *does* advance
-`_last_settled`, so the next B1 refuses `DECISION_GATE_INPUT_UNBOUND`. The gate's authority on the
-live path is therefore B1, exactly as PLAN R-11/W-8 scope it, and this is written down as **L8**'s
-neighbour in the Skill's limitations block rather than left to be discovered. Both branches have
-their own test.
+**D-2 — WITHDRAWN at iteration 2 (review F-001).** Iteration 1 disclosed that on the live path a
+body declaring NOTHING was "not a ledger participant" and left the B1 chain untouched. The Reviewer
+correctly classified that as a G1 explicit-requirement violation: ORIGINAL_REQUEST's fail-closed list
+opens with *missing decision record*, and it is unconditional. The exception is **removed**, not
+re-argued. Silence and a declared-but-broken body now behave identically — no record published,
+`_last_settled` advanced, the next B1 refusing `DECISION_GATE_INPUT_UNBOUND` — and the reasoning that
+replaced it (a non-response is not a B2/B3 boundary at all, because no result was received) is stated
+in full under *Iteration 2* above with its own test and its two untouched lifecycle controls. The
+`_record_decision_from_attempt` docstring carries the same record in the code.
 
 **A third, smaller note.** PLAN W-4 mentions a B3 guard at "Final Review T1"; DESIGN's control-flow
 section places a **B1** guard at the Final-Review attempt open instead and lists no gate parse of the
@@ -273,9 +346,21 @@ Tests and fixtures (C13):
 | `scripts/test_validate_skills.py` | +91 |
 | `scripts/fixtures/decision_gate/{valid,invalid}/` **(new)** | 13 fixtures |
 
+**Iteration 2 (F-001 + F-002) touched three files and nothing else** — `git diff --numstat` against
+`5e1a6cb`:
+
+| File | ± | Why |
+| --- | --- | --- |
+| `scripts/orca_runtime_harness.py` | +54 / −16 | C4: the F-001 fail-closed merge and the F-002 B1 guard |
+| `scripts/test_orca_runtime_contract.py` | +342 / −43 | C13: the required replacement, the six `observe_unexpected_exit` tests, the non-response control, the declaring doubles |
+| `scripts/test_e2e_harness.py` | +33 / −1 | C13: one more enumerated OS-29 stripper, with its own non-vacuity raise |
+
+`git status --short` shows no other tracked file modified by this iteration.
+
 Artifacts written by this phase: `artifacts/runs/run_35b221ea299d/IMPLEMENTATION.md` (this file, in
 place at the contracted path) and `artifacts/runs/run_35b221ea299d/records/implementation_decision_record.json`
-(new). **`ANALYSIS.md`, `PLAN.md` and `DESIGN.md` are unmodified**, and no `REVIEW_*.md` was written.
+(updated in place for iteration 2). **`ANALYSIS.md`, `PLAN.md` and `DESIGN.md` are unmodified**, and no
+`REVIEW_*.md` was written.
 
 ### Every existing-test diff, justified
 
@@ -301,25 +386,74 @@ deletions are import lines and three capture-helper expressions. Each edit:
    the file's own comment at that list documents.
 4. **`test_run_logging.py`** — additive only.
 
+**Iteration 2 adds exactly four more, all forced by F-001 and all enumerated:**
+
+5. **`test_orca_runtime_contract.py` — the one required REPLACEMENT.**
+   `test_a_legacy_body_that_declares_nothing_is_not_a_ledger_participant` asserted the fail-open
+   behaviour F-001 required be removed, so leaving it would have meant shipping a suite that proves
+   the violation. It is replaced by `test_a_silent_worker_result_poisons_the_next_boundary`,
+   `test_a_silent_reviewer_result_poisons_the_next_boundary` and
+   `test_a_silent_result_is_named_as_a_defect_on_the_live_log_row`. **This is a correction the
+   Reviewer demanded, not a weakening.**
+6. **`test_orca_runtime_contract.py` — the offline recorders now DECLARE.** `RecordingExec`'s
+   `ACCEPTED_DONE`, seven other settled `worker_done` fixtures and the reviewer-body overrides gain a
+   real `DECISION_GATE_STATE` line and its fenced record, rendered by
+   `fake_worker.render_decision_gate()` — the same function the real fake-agent subprocesses call, so
+   the doubles cannot drift from the agents and no vocabulary is duplicated. Nothing was relaxed: the
+   two refusal fixtures that must stay silent (the stale and rejected `worker_done` payloads) are
+   untouched, and every existing assertion in those tests still runs.
+7. **`test_orca_runtime_contract.py` — one helper factored out.**
+   `plant_unresolved_open_item()` is lifted verbatim out of
+   `test_an_unresolved_open_item_refuses_the_next_dispatch` so the same planted shape can be driven
+   through **both** dispatch initiators (F-002). The assertions stayed in the test; only the setup
+   moved. `attempt()` gains three defaulted keyword arguments, so every existing call site binds
+   unchanged.
+8. **`test_e2e_harness.py` — one more enumerated OS-29 stripper.** The settled bodies now declare, so
+   the declaration excerpt reaches `ORCHESTRATOR_LOG.md`'s `detail` column and the pre-OS-4 golden
+   comparison would otherwise fail on an addition it cannot contain by construction.
+   `strip_os29_detail_declaration()` removes exactly that suffix and `strip_os29_log_additions()`
+   now **raises** when no logged dispatch quoted a declaration — the same non-vacuity half every
+   other stripper in that block already carries, so a build that stopped declaring turns these
+   byte-identity tests red rather than green.
+
 ---
 
 ## Validation
 
 Every command below was run on this branch, in this phase. Output is verbatim.
 
+All figures below are **iteration 2** runs, executed after the F-001/F-002 fixes.
+
 | Check | Command | Result |
 | --- | --- | --- |
 | Skill validator, **check count above 648** | `python3 scripts/validate_skills.py` | `Skill validation PASSED (697 checks)` |
-| Full unittest discovery, **≥ 1496, no deletions** | `python3 -m unittest discover -s scripts -p 'test_*.py'` | `Ran 1570 tests in 312.669s` → `OK (skipped=6)`, exit 0 |
+| Full unittest discovery, **≥ 1570, no deletions** | `python3 -m unittest discover -s scripts -p 'test_*.py'` | `Ran 1579 tests in 310.715s` → `OK (skipped=6)`, exit 0 |
 | Package verification | `python3 scripts/verify_package.py` | `Package verification PASSED (189 source files)` |
 | Release build | `python3 scripts/build_release.py` | `Built reproducible release archive: dist/orca-skills-0.9.0.tar.gz` |
-| Whitespace | `git diff --check` | clean |
-| **C3b parity** | `cmp scripts/run_logging.py orca-worker-reviewer-orchestration/tools/run_logging.py` | byte-identical |
+| Whitespace | `git diff --check` | clean (no output) |
+| **C3b parity** | `cmp scripts/run_logging.py orca-worker-reviewer-orchestration/tools/run_logging.py` | byte-identical (no output, exit 0) |
 | **C-1: the shared block is untouched** | validator's own `DECISION_POLICY_BLOCK_PATTERN` | orchestration **90 / 90**, loop **90 / 90** |
 | **D6: anchor asymmetry** | `grep -c '^#### .* contract$'` | orchestration **10** (was 9), loop **0** (unchanged) |
 
-The suite grew from **1496 to 1570** (+74). `git diff` confirms no test function was removed or
-weakened; see *Every existing-test diff, justified* above.
+The suite grew from **1496 → 1570** (iteration 1) **→ 1579** (iteration 2). Across the whole ticket
+exactly **one** test function was removed — the one review F-001 required be replaced — and it is
+replaced by three asserting the opposite behaviour. `grep -c "def test_"` on
+`scripts/test_orca_runtime_contract.py` reads **238**, against **229** at `HEAD` (`5e1a6cb`): one
+removed, ten added. No validator was deleted or weakened; see *Every existing-test diff, justified*
+above.
+
+### The two blocking findings, re-verified as run output
+
+```text
+$ python3 -m unittest scripts.test_orca_runtime_contract.DecisionGateLiveDispatchTests
+Ran 14 tests in 0.067s
+OK
+```
+
+Those fourteen are the F-001 and F-002 evidence in one class: three silent-result refusals (Worker
+B2, Reviewer B3, and the live `_log_attempt` funnel), the non-response control, five
+`observe_unexpected_exit` refusal shapes each asserting no Task / no terminal / no `worker-start`,
+and the clean-head admission control that keeps those five non-vacuous.
 
 ### The decision record was VALIDATED, not merely described
 
@@ -393,9 +527,9 @@ was standing in for before the code existed.
 | 8 | downstream expansion → new decision event, not lineage | `test_a_downstream_expansion_is_a_new_decision_event_not_a_lineage_link` (asserts every OS-30 field is absent from every record) |
 | 9 | Final Review with an unresolved decision → completion forbidden | `test_an_unresolved_decision_forbids_final_review_completion` |
 | 10 | Worker+Reviewer agree on an unauthorized assumption → no approval | `test_a_worker_reviewer_agreement_never_resolves_an_open_item` (with the closed five-item cardinality precheck), `test_a_downgrade_is_decided_by_the_shared_contract_alone` |
-| 11 | timeout / non-response → no approval, no iteration | `ReasonVocabularyTests` + NV-2; `forbidden_authority_sources` is asserted to contain `timeout`/`no_response` and to have exactly five members |
-| 12 | illegal dispatch after a block → fail closed | `test_an_open_ledger_item_blocks_the_next_phase_dispatch` (e2e), `test_an_unresolved_open_item_refuses_the_next_dispatch` (live) |
-| 13 | missing/malformed → no `CLEAR` presumption | `GateResultParsingTests` (F1–F6), `LedgerRecordValidationTests` (F13/F14 + the cross-object control), `AdmissibilityTests` (F9–F12), and the end-to-end halves |
+| 11 | timeout / non-response → no approval, no iteration | `ReasonVocabularyTests` + NV-2; `forbidden_authority_sources` is asserted to contain `timeout`/`no_response` and to have exactly five members; **iteration 2** adds the live-path half, `test_a_non_response_is_not_a_boundary_and_is_never_presumed_clear` (no record, no state, no `gate_result`, and the following dispatch still B1-guarded) |
+| 12 | illegal dispatch after a block → fail closed | `test_an_open_ledger_item_blocks_the_next_phase_dispatch` (e2e), `test_an_unresolved_open_item_refuses_the_next_dispatch` (live); **iteration 2 (F-002)** closes the second live dispatch initiator with five `test_unexpected_exit_refuses_*` tests and their clean-head admission control |
+| 13 | missing/malformed → no `CLEAR` presumption | `GateResultParsingTests` (F1–F6), `LedgerRecordValidationTests` (F13/F14 + the cross-object control), `AdmissibilityTests` (F9–F12), and the end-to-end halves; **iteration 2 (F-001)** adds the live-path halves that were missing — `test_a_silent_worker_result_poisons_the_next_boundary` (B2), `test_a_silent_reviewer_result_poisons_the_next_boundary` (B3) and `test_a_silent_result_is_named_as_a_defect_on_the_live_log_row` |
 | 14 | decision-semantics drift between the two Skills | `test_validate_skills`: one-Skill drift, deleted-from-both, the block leaking into the loop, plus the template and optionality checks |
 
 ---
@@ -414,7 +548,7 @@ Production code changed, unit tests were added and modified, they were executed,
 | `scripts/test_os29_decision_gate.py` **(new, 224 lines)** | `ImportDirectionTests`, `DispatchSiteCardinalityTests`, `WorkerVocabularyTests` | the cross-cutting residue: the two AST import-direction assertions, the `tools/` byte parity, INV-D3, the untouched vocabularies |
 | `scripts/test_e2e_harness.py` | `DecisionGateTransitionTests` (17), `DecisionGateNonDuplicationTests` (1) | every transition cell, F9–F14 end to end, NV-1, NV-2, NV-3/M-DUP |
 | `scripts/test_run_logging.py` | `DecisionLedgerProducerTests` (10), `DecisionRecordSectionDriftTests` (3) | the producer, idempotence, D8's writer-side exclusivity **with its ENOTEMPTY grounds executed**, the empty-payload precondition, append-only byte identity, two-writer allocation, the columns, the CLI, P-2 drift |
-| `scripts/test_orca_runtime_contract.py` | `DecisionGateLiveDispatchTests` (6) | `start_run` writes the declaration; a missing one refuses with **no command issued**; an open item refuses; a declaring dispatch records a bound entry; a legacy body is not a participant; a broken declaration poisons the next boundary |
+| `scripts/test_orca_runtime_contract.py` | `DecisionGateLiveDispatchTests` (**14** after iteration 2) | `start_run` writes the declaration; a missing one refuses with **no command issued**; an open item refuses; a declaring dispatch records a bound entry; a broken declaration poisons the next boundary; **(F-001)** a silent Worker result, a silent Reviewer result and the same silence seen through `_log_attempt` each poison it too, with the non-response control beside them; **(F-002)** five `observe_unexpected_exit` refusal shapes leaving no Task, no terminal and no `worker-start`, plus the clean-head admission control |
 | `scripts/test_validate_skills.py` | 7 new regressions | scenario 14 (a)(b)(c) plus the block-removed, value-drift, template and optionality cases |
 
 ### Behaviour covered
@@ -434,24 +568,37 @@ precondition's positive/negative pair.
 
 ```text
 Command: python3 -m unittest discover -s scripts -p 'test_*.py'
-Result:  Ran 1570 tests in 312.669s
+Result:  Ran 1579 tests in 310.715s
          OK (skipped=6)
          exit 0
 ```
 
-Targeted, also executed this phase:
+Targeted, all re-executed at iteration 2:
 
 ```text
-python3 -m unittest scripts.test_decision_gate            -> Ran 21 tests ... OK
-python3 -m unittest scripts.test_os29_decision_gate       -> Ran  9 tests ... OK
+python3 -m unittest scripts.test_decision_gate            -> Ran  21 tests ... OK
+python3 -m unittest scripts.test_os29_decision_gate       -> Ran   9 tests ... OK
 python3 -m unittest scripts.test_e2e_harness              -> Ran 186 tests ... OK
 python3 -m unittest scripts.test_run_logging              -> Ran 205 tests ... OK
-python3 -m unittest scripts.test_orca_runtime_contract    -> Ran 229 tests ... OK  (with test_orca_runtime)
+python3 -m unittest scripts.test_orca_runtime \
+                    scripts.test_orca_runtime_contract    -> Ran 244 tests ... OK (skipped=6)
 cd scripts && python3 -m unittest test_validate_skills    -> Ran 181 tests ... OK
+python3 -m unittest scripts.test_e2e_harness.DecisionGateTransitionTests \
+                    scripts.test_e2e_harness.DecisionGateNonDuplicationTests
+                                                          -> Ran  18 tests ... OK
+python3 -m unittest \
+  scripts.test_orca_runtime_contract.DecisionGateLiveDispatchTests
+                                                          -> Ran  14 tests ... OK
 ```
 
-**No existing test or validator was deleted or weakened.** The only edits to existing test modules are
-enumerated and justified under *Every existing-test diff, justified*.
+The last two lines are the NV-1 / NV-2 / NV-3-M-DUP mutation and non-vacuity runs and the F-001 /
+F-002 evidence class respectively; both are inside the full run above and are quoted separately only
+because they are the ones the correction turns on.
+
+**No existing test or validator was deleted or weakened.** The single removed test function is the
+one review F-001 required be REPLACED, and its replacement asserts refusal where it asserted
+admission. Every other edit to an existing test module is enumerated and justified under *Every
+existing-test diff, justified*.
 
 ---
 
@@ -485,7 +632,55 @@ Skill's own limitations block:
 
 ## Review Feedback Resolution
 
-Not applicable. This is IMPLEMENTATION **iteration 1**; no `REVIEW_IMPLEMENTATION*.md` exists.
+Source: `artifacts/runs/run_35b221ea299d/REVIEW_IMPLEMENTATION.md` (**RESULT: FAIL**, two blocking
+findings, no non-blocking findings).
+
+FINDING F-001: RESOLVED
+FINDING F-002: RESOLVED
+
+**F-001 (G1, CRITICAL) — the live runtime failed open on a silent settled result.** RESOLVED, and
+resolved the way the Required Action words it, not around it.
+
+* *Poison the transition.* `scripts/orca_runtime_harness.py` `_record_decision_from_attempt()` no
+  longer short-circuits on `declares_gate_result(body) == False`. A settled result with no
+  declaration publishes no ledger record, returns
+  `(decision_gate.INPUT_DEFECT_STATE, decision_gate.GATE_INPUT_MISSING)` for the two log columns, and
+  **advances `_last_settled`**.
+* *Bind the settled round so the next B1 cannot admit the old head.* Because `_last_settled` now
+  binds, `admit_head()` sees a ledger whose head is still the previous round and refuses
+  `DECISION_GATE_INPUT_UNBOUND`. The legacy branch and the defective branch are now one branch with
+  one behaviour.
+* *Replace the legacy-pass test with Worker AND Reviewer negative tests.* Done — see the tests named
+  under *Iteration 2* and item 5 of *Every existing-test diff, justified*. The replacement asserts
+  that no later dispatch can occur through **either** dispatch initiator after a missing gate result.
+* *No Skill or contract text needed changing, which is itself evidence the finding is right.* The
+  shipped orchestration `#### Decision gate contract` block already reads
+  `DECISION_GATE_INPUT = explicit_machine_readable_record_never_absence`. Iteration 1's code
+  contradicted the contract this very ticket wrote; iteration 2 makes the code match it. No SKILL.md,
+  template, `reviews/common.md`, policy-contract or validator byte was touched, so the two Skills'
+  shared decision semantics are untouched and `validate_skills.py` still reports **697 checks**.
+* *On disclosure.* The iteration-1 Decision Record disclosed the exception and still classified the
+  phase `CLEAR`. The Reviewer is right that disclosure does not authorize a departure; D-2 is
+  withdrawn and the Decision Record for iteration 2 records that finding explicitly.
+* *On the CONFLICT the task told me to test for.* I checked and it is **not** real. See *Iteration 2*
+  above: the surviving requirement on the other side is "do not weaken existing lifecycle
+  guarantees", and it is satisfied without any fail-open by observing that a **non-response** never
+  reached B2 or B3 at all. Both requirements hold simultaneously, so there is nothing to escalate and
+  STATUS is COMPLETE rather than BLOCKED.
+
+**F-002 (G1, MAJOR) — `observe_unexpected_exit()` bypassed the B1 ledger guard.** RESOLVED.
+
+* *The same pre-dispatch B1 guard before EVERY effect.* `self._b1_guard(phase=..., role=...,
+  iteration=...)` is now the first statement in `observe_unexpected_exit()` — ahead of
+  `dispatch_context()`, `create_task()`, `create_fake_terminal()`, `start_worker()` **and** ahead of
+  `_open_phase_iteration_boundary()`, so a refused dispatch does not even open a timing scope. That
+  is strictly the placement `run_existing_task()` already used.
+* *Adversarial tests per refusal shape.* Five, one shape each — absent ledger
+  (`DECISION_GATE_INPUT_MISSING`), unsupported schema (`DECISION_LEDGER_SCHEMA_UNSUPPORTED`),
+  malformed record (`DECISION_GATE_INPUT_MALFORMED`), unbound head (`DECISION_GATE_INPUT_UNBOUND`)
+  and an unresolved open item (`DECISION_BLOCKED:…`). Each asserts the recorder issued **zero**
+  further commands, and separately that no `task-create`, no `terminal create` and no `worker-start`
+  appears. A sixth test admits a clean head through the same guard, so the five are not vacuous.
 
 Findings closed in the approved upstream phases stay closed, and their lessons are carried rather than
 cited:
@@ -521,6 +716,20 @@ REASON_CODE: (none — CLEAR carries no reason code)
 EVIDENCE: open_decision_item=false; grounds and scope as recorded in the JSON above
 ```
 
-Validated against **both** Skills with three negative controls; verbatim output under *Validation*.
+Re-validated at iteration 2 against **both** Skills with three negative controls:
+
+```text
+POSITIVE (orca-worker-reviewer-orchestration): accepted.
+POSITIVE (orca-worker-reviewer-loop): accepted.
+NEGATIVE CONTROL: rejected -> state CLEAR must not carry a reason_code
+CONTROL-2: rejected -> CLEAR declares ['open_decision_item'] as grounds, but they do not satisfy
+the CLEAR entry condition -- state C...
+CONTROL-3 (closed field set): DECISION_GATE_INPUT_MALFORMED
+```
+
+`CLEAR` here is **not** the iteration-1 grounds restated. Iteration 1 classified the phase `CLEAR`
+while carrying a disclosed departure from an explicit requirement; the Reviewer judged those grounds
+substantively invalid and it was right. The departure is now removed rather than re-disclosed, and
+the record's `grounds` field says so and states the conflict check that was actually performed.
 
 No `NEEDS_INPUT` and no `CONFLICT` item arose in this phase, so this phase does not stop.
