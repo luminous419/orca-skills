@@ -81,6 +81,16 @@ ORCHESTRATOR_LOG_COLUMNS = (
     "risk_source",
     "requested_phases",
     "round_kind",
+    # OS-29. Sparse by design, the same way gate_result/review_verdict and OS-3's
+    # four columns are: `decision_state` and `decision_reason_code` are written on
+    # the rows that carry a decision judgement (a settled dispatch whose agent
+    # declared one, a decision_record_written event, a decision_gate_refused
+    # refusal, a decision_block terminal) and blank everywhere else. They are the
+    # INDEX; the append-only decision ledger record is the AUTHORITY. Columns exist
+    # so "which run blocked, and on what" is a column scan rather than a directory
+    # walk, and so workflow control never depends on reading free-form Markdown.
+    "decision_state",
+    "decision_reason_code",
     "result",
     "detail",
 )
@@ -114,6 +124,26 @@ ROUND_KIND_VALUES = (
     "downstream_revalidation",
     "final_review",
 )
+
+# OS-29 decision ledger. The run-scoped, append-only record family the decision gate
+# reads at every boundary. It lives in its own subdirectory for the same reason
+# final_review_audit/ does: section 9's flat <ARTIFACT_ROOT> namespace already has
+# assigned meanings and a ledger record is not one of them.
+DECISION_LEDGER_DIRNAME = "decision_ledger"
+DECISION_LEDGER_RECORD_FILENAME = "record.json"
+# A sibling INSIDE decision_ledger/, so staging and the rename target are on the
+# same filesystem by construction -- the same rule final_review_audit/ follows.
+DECISION_LEDGER_STAGING_DIRNAME = ".staging"
+DECISION_LEDGER_KEY_WIDTH = 6
+# Bounded, because a run has ONE writer in practice (E2EHarness is single-threaded
+# and the Orca path serialises dispatches). This is a DETECTION mechanism that
+# happens to recover, not a contention one; an unbounded retry would turn a
+# corrupted ledger into a spin.
+DECISION_LEDGER_MAX_ALLOCATION_ATTEMPTS = 8
+# Three new values in the `--event` vocabulary, which has no `choices` by design.
+EVENT_DECISION_RECORD_WRITTEN = "decision_record_written"
+EVENT_DECISION_GATE_REFUSED = "decision_gate_refused"
+EVENT_DECISION_BLOCK = "decision_block"
 
 # OS-19 fail-safe markers. A duration that cannot be measured leaves `duration_s`
 # empty and appends one of these to the row's own `detail`, so "no duration" and
@@ -362,6 +392,8 @@ def log_orchestrator_event(
     risk_source: str = "",
     requested_phases: str = "",
     round_kind: str = "",
+    decision_state: str = "",
+    decision_reason_code: str = "",
     result: str = "",
     detail: str = "",
     timestamp: str | None = None,
@@ -403,6 +435,8 @@ def log_orchestrator_event(
             "risk_source": risk_source,
             "requested_phases": requested_phases,
             "round_kind": round_kind,
+            "decision_state": decision_state,
+            "decision_reason_code": decision_reason_code,
             "result": result,
             "detail": detail,
         },
@@ -1000,6 +1034,28 @@ class FinalReviewAuditCollision(FinalReviewAuditError):
             f"at {published_path}; a published record is never overwritten"
         )
         self.dispatch_key = dispatch_key
+        self.published_path = published_path
+
+
+class DecisionLedgerError(RunLoggingError):
+    """Base for every refusal the OS-29 decision ledger writer raises."""
+
+
+class DecisionLedgerCollision(DecisionLedgerError):
+    """A record for this ledger sequence is already published. Never an overwrite.
+
+    The same immutability rule the Final Review audit record already has: a
+    published key IS a complete record and correcting one means writing a NEW
+    record under a new key. There is no force, no --overwrite and no update
+    function anywhere in this module.
+    """
+
+    def __init__(self, key: str, published_path: Path) -> None:
+        super().__init__(
+            f"a decision ledger record for {key!r} is already published at "
+            f"{published_path}; a published record is never overwritten"
+        )
+        self.key = key
         self.published_path = published_path
 
 
@@ -1797,6 +1853,18 @@ def _stage_and_publish_audit_record(
     directory, so existence and completeness are the same fact and no reader needs an
     "is it finished yet?" heuristic.
     """
+    # OS-29: the ONE precondition the generalization needs. A rename onto a
+    # NON-EMPTY directory is refused by POSIX, which is where the exclusivity below
+    # comes from -- but a rename onto an EMPTY one succeeds. A published key only
+    # ever appears via a rename of an already-populated staging directory, so it is
+    # never empty at any instant; this makes that an enforced precondition instead
+    # of an argument.
+    if not files:
+        raise RunLoggingError(
+            f"a published record must never be empty, got no files for "
+            f"{dispatch_key!r}; an empty staging directory would rename onto an "
+            "empty published directory and silently replace it"
+        )
     published = audit_dir / dispatch_key
     if published.exists():
         raise FinalReviewAuditCollision(dispatch_key, published)
@@ -1809,9 +1877,14 @@ def _stage_and_publish_audit_record(
         # os.mkdir is exclusive by definition, so two concurrent writers cannot
         # share one staging directory.
         os.mkdir(staging_dir)
-        for name in FINAL_REVIEW_AUDIT_FILENAMES:
+        # OS-29: iterate the mapping the caller supplied rather than the module
+        # constant, so the decision ledger's one-file record and the Final Review
+        # audit's three-file record share ONE durability scheme instead of two.
+        # Both existing callers pass exactly FINAL_REVIEW_AUDIT_FILENAMES, so this
+        # is behaviour-preserving for them.
+        for name, text in files.items():
             boundary = f"write:{name}"
-            _write_staged_file(staging_dir / name, files[name])
+            _write_staged_file(staging_dir / name, text)
         boundary = "fsync:staging_dir"
         _fsync_directory(staging_dir)
         boundary = "rename"
@@ -1826,6 +1899,302 @@ def _stage_and_publish_audit_record(
         raise FinalReviewAuditWriteFailed(dispatch_key, boundary, error) from error
     _fsync_directory(audit_dir)
     return published
+
+
+# ---- OS-29: the run-scoped, append-only decision ledger ---------------------------
+# The gate's input at every boundary. Its properties are INHERITED from the Final
+# Review audit record above, not re-invented: staged-then-published by one os.rename
+# (so a published key IS a complete record), a closed required field set, never
+# edited, and a correction is a NEW record under a new key.
+#
+# This module WRITES and READS the ledger; it does not judge it. The admissibility
+# rules A1-A6 -- including the record-version check -- belong to scripts/decision_gate.py,
+# which this file may not import (see the module docstring: ZERO imports from
+# scripts/, because INSTALL.md's documented global install never copies scripts/ and
+# this exact file is duplicated into the installed Skill's tools/). That is why
+# `ledger_schema_version` arrives as a REQUIRED keyword argument with no default
+# rather than being imported: the caller supplies it, and the gate re-checks whatever
+# was written at the next boundary. A caller that passes a wrong or unsupported value
+# produces a terminal refusal there, never a CLEAR.
+
+
+def decision_ledger_dir(run_id: str, *, base: Path | None = None) -> Path:
+    """artifacts/runs/<run_id>/decision_ledger/, provisioning the run root.
+
+    A subdirectory for the same reason final_review_audit/ is one: section 9's flat
+    <ARTIFACT_ROOT> namespace already assigns meaning to its names, and a ledger
+    record is not one of them.
+    """
+    return _ensure_run_artifact_root(run_id, base=base) / DECISION_LEDGER_DIRNAME
+
+
+def decision_ledger_sequence_key(sequence: int) -> str:
+    """The published directory name for one sequence. Zero-padded so a plain
+    directory listing sorts in ledger order without parsing anything."""
+    if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 0:
+        raise DecisionLedgerError(
+            f"a ledger sequence must be a non-negative integer, got {sequence!r}"
+        )
+    return f"{sequence:0{DECISION_LEDGER_KEY_WIDTH}d}"
+
+
+def _published_ledger_keys(ledger_dir: Path) -> list[int]:
+    """Every published sequence, ascending. A name that is not a sequence key is
+    skipped -- `.staging` is one by construction, and skipping is what keeps a
+    foreign directory from crashing the reader instead of being reported by A2/A4."""
+    if not ledger_dir.is_dir():
+        return []
+    keys: list[int] = []
+    for entry in ledger_dir.iterdir():
+        if not entry.is_dir() or not entry.name.isdigit():
+            continue
+        keys.append(int(entry.name))
+    return sorted(keys)
+
+
+def read_decision_ledger(run_id: str, *, base: Path | None = None) -> list[dict]:
+    """Every published record, ordered by `sequence`. Provisions nothing.
+
+    It READS and ORDERS. The A1-A6 judgement is the gate's, not the reader's: a
+    record whose JSON cannot be parsed is returned as a sentinel object rather than
+    dropped, because dropping it would turn a corrupt record into an absence and an
+    absence is exactly what must never become a CLEAR.
+    """
+    ledger_dir = (
+        (Path(base) if base is not None else Path("."))
+        / "artifacts"
+        / "runs"
+        / run_id
+        / DECISION_LEDGER_DIRNAME
+    )
+    records: list[dict] = []
+    for sequence in _published_ledger_keys(ledger_dir):
+        path = ledger_dir / f"{sequence:0{DECISION_LEDGER_KEY_WIDTH}d}" / DECISION_LEDGER_RECORD_FILENAME
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            # A malformed published record is surfaced, never swallowed. The gate
+            # refuses it under A4; a reader that dropped it would hand the gate a
+            # shorter ledger and an unbound head, which is a different -- and less
+            # honest -- failure.
+            records.append(
+                {"sequence": sequence, "_unreadable": " ".join(str(error).split())}
+            )
+            continue
+        if not isinstance(payload, dict):
+            records.append({"sequence": sequence, "_unreadable": "not a JSON object"})
+            continue
+        records.append(payload)
+    records.sort(key=lambda record: record.get("sequence", 0))
+    return records
+
+
+def append_decision_ledger_record(
+    run_id: str,
+    record: dict,
+    *,
+    base: Path | None = None,
+    ledger_schema_version: int,
+) -> tuple[Path, int]:
+    """Allocate the next free sequence and publish ONE immutable record.
+
+    Never edits a published record. A second writer that claims an already-published
+    sequence receives DecisionLedgerCollision from the shared publisher and this
+    function retries with the next free sequence, bounded -- so two processes sharing
+    a run id get two different sequences and neither overwrites the other.
+
+    Returns (published directory, sequence).
+    """
+    if not isinstance(record, dict):
+        raise DecisionLedgerError("a decision ledger record must be a dict")
+    ledger_dir = decision_ledger_dir(run_id, base=base)
+    ledger_dir.mkdir(parents=True, exist_ok=True)
+    existing = _published_ledger_keys(ledger_dir)
+    sequence = (existing[-1] + 1) if existing else 0
+    for _attempt in range(DECISION_LEDGER_MAX_ALLOCATION_ATTEMPTS):
+        key = decision_ledger_sequence_key(sequence)
+        payload = dict(record)
+        payload["sequence"] = sequence
+        payload["ledger_schema_version"] = ledger_schema_version
+        text = json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+        try:
+            published = _stage_and_publish_audit_record(
+                ledger_dir, key, {DECISION_LEDGER_RECORD_FILENAME: text}
+            )
+        except FinalReviewAuditCollision:
+            # Another writer published this sequence first. Re-read and claim the
+            # next free one; the loser never overwrites the winner.
+            sequence = _published_ledger_keys(ledger_dir)[-1] + 1
+            continue
+        return published, sequence
+    key = decision_ledger_sequence_key(sequence)
+    raise DecisionLedgerCollision(key, ledger_dir / key)
+
+
+RUN_ENTRY_DECLARATION_GROUNDS = (
+    "This run's append-only decision ledger was empty when the run root was "
+    "provisioned, so no decision item is open at run entry. This declares the "
+    "ledger's state; it declares nothing about any phase's judgement, which is "
+    "produced at the Worker and Reviewer boundaries and is fail-closed there."
+)
+RUN_ENTRY_DECLARATION_SCOPE = (
+    "Run entry only. It authorizes the first phase-entry transition and nothing "
+    "after it."
+)
+
+
+def open_decision_ledger(
+    run_id: str,
+    *,
+    base: Path | None = None,
+    phases: tuple[str, ...] | list[str] = (),
+    risk: str = "",
+    ledger_schema_version: int,
+) -> Path:
+    """Provision the run artifact root AND write ledger sequence 0, in ONE statement.
+
+    Returns the run artifact root, exactly as ensure_run_artifact_root() does, so a
+    run-open call site changes function and not shape.
+
+    The sequence-0 record is the RUN-ENTRY DECLARATION. It exists because the FIRST
+    boundary of a run has no agent judgement to read yet, and "no record is present,
+    therefore CLEAR" is the presumption the ticket forbids. The declaration asserts
+    ONE machine-recomputable fact -- that this ledger holds no open blocking item --
+    and the gate RECOMPUTES it (A6) rather than trusting it, which is what keeps it
+    from degenerating into a rubber stamp.
+
+    Idempotent, first-writer-wins, the same way _ensure_table() and
+    _ensure_run_artifact_root() are: re-opening a run whose ledger already carries a
+    sequence-0 record is a no-op and never writes a second one.
+
+    `risk` is validated and deliberately NOT recorded. The ledger record's field set
+    is closed and excludes it on purpose: a decision record carrying a risk level
+    would invite exactly the coupling the contract forbids, since risk never expands
+    decision authority. Validating it here means an impossible level fails at run
+    open rather than at a boundary far away from the mistake.
+    """
+    if risk and risk not in RISK_VALUES:
+        raise DecisionLedgerError(
+            f"unknown risk level: {risk!r}; expected one of {RISK_VALUES}"
+        )
+    root = _ensure_run_artifact_root(run_id, base=base)
+    ledger_dir = root / DECISION_LEDGER_DIRNAME
+    ledger_dir.mkdir(parents=True, exist_ok=True)
+    if 0 in _published_ledger_keys(ledger_dir):
+        return root
+    entry_phase = str(phases[0]) if phases else ""
+    declaration = {
+        "ledger_schema_version": ledger_schema_version,
+        "state": "CLEAR",
+        "reason_code": None,
+        "open_decision_item": False,
+        "run": run_id,
+        "phase": entry_phase,
+        "iteration": 0,
+        "responsible_phase": entry_phase,
+        "role": "coordinator",
+        "boundary": "B1",
+        "sequence": 0,
+        "source": "coordinator:run_entry",
+        "prior_open_decision_items": [],
+        "verifies": None,
+        "evidence": {},
+        "assumption": None,
+        "open_item": None,
+        "verdict": "",
+        "source_binding": f"artifacts/runs/{run_id}/",
+        "recorded_at": now_iso(),
+        "grounds": RUN_ENTRY_DECLARATION_GROUNDS,
+        "scope": RUN_ENTRY_DECLARATION_SCOPE,
+    }
+    try:
+        append_decision_ledger_record(
+            run_id,
+            declaration,
+            base=base,
+            ledger_schema_version=ledger_schema_version,
+        )
+    except DecisionLedgerCollision:
+        # Another writer got there first. First-writer-wins is the contract, and a
+        # second declaration would be exactly the A2 defect the gate refuses.
+        pass
+    return root
+
+
+# ---- OS-29 P-2: the Markdown summary against the machine record --------------------
+DECISION_RECORD_SECTION = re.compile(
+    r"(?ms)^##\s+Decision Record\b[^\n]*\n(?P<body>.*?)(?=^##\s+|\Z)"
+)
+DECISION_RECORD_STATE_LINE = re.compile(
+    r"(?m)^DECISION_STATE:\s*(?P<value>[A-Z_]+)\s*$"
+)
+DECISION_RECORD_REASON_LINE = re.compile(r"(?m)^REASON_CODE:\s*(?P<value>.+?)\s*$")
+# The OS-28 reason-code grammar, spelled here because this module imports nothing
+# from scripts/. decision_policy owns the closed SET; this is only its SHAPE.
+DECISION_REASON_CODE_TOKEN = re.compile(r"[a-z][a-z0-9_]*")
+
+
+def parse_decision_record_section(text: str) -> tuple[str, str | None] | None:
+    """The NARRATIVE `## Decision Record` section's (state, reason_code), or None.
+
+    None means the section is absent, which is NOT a finding: that section is
+    optional by the OS-28 contract and OS-29 does not change that. The GATE result
+    is a different object with a different name (DECISION_GATE_STATE), a different
+    home (a fenced record) and a different failure mode (absence is terminal).
+
+    Returned so a validator can reconcile the human summary against the machine
+    record. The record is the authority; this is the explanation of it.
+    """
+    section = DECISION_RECORD_SECTION.search(text)
+    if section is None:
+        return None
+    body = section.group("body")
+    state_match = DECISION_RECORD_STATE_LINE.search(body)
+    if state_match is None:
+        return None
+    reason_match = DECISION_RECORD_REASON_LINE.search(body)
+    reason = reason_match.group("value") if reason_match else None
+    return state_match.group("value"), reason
+
+
+def reconcile_decision_record_section(
+    text: str, record: dict
+) -> str | None:
+    """Drift between the Markdown summary and its machine record, or None.
+
+    Modelled on parse_final_review_report()'s reconciliation of a human report
+    against its audit record. An ABSENT section reconciles trivially -- optionality
+    survives -- and a PRESENT one that contradicts the record is drift, which is
+    what the OS-29 validator turns into a failure.
+    """
+    parsed = parse_decision_record_section(text)
+    if parsed is None:
+        return None
+    state, reason = parsed
+    if state != record.get("state"):
+        return (
+            f"Decision Record section declares {state!r} but the machine record "
+            f"carries {record.get('state')!r}"
+        )
+    recorded = record.get("reason_code")
+    if recorded is None:
+        # A CLEAR carries no reason code. A summary that spells the absence out in
+        # prose -- "(none - CLEAR carries no reason code)" -- is the human half
+        # saying the right thing, and the OS-28 reason codes are lowercase snake
+        # tokens, so "names an actual code" is a decidable question rather than a
+        # judgement about prose.
+        if reason is not None and DECISION_REASON_CODE_TOKEN.fullmatch(reason.strip()):
+            return (
+                f"Decision Record section names reason code {reason!r} but the "
+                "machine record carries none"
+            )
+        return None
+    if reason is None or recorded not in reason:
+        return (
+            f"Decision Record section reason {reason!r} does not name the machine "
+            f"record's reason code {recorded!r}"
+        )
+    return None
 
 
 def sweep_final_review_audit_staging(
@@ -2788,6 +3157,12 @@ def _build_parser() -> argparse.ArgumentParser:
     orchestrator.add_argument(
         "--round-kind", default="", choices=("", *ROUND_KIND_VALUES)
     )
+    # OS-29. Deliberately unconstrained the way --gate-result and --review-verdict
+    # are: the closed vocabulary is decision_gate.py's, and this module imports
+    # nothing from scripts/ (see the docstring). A value this CLI writes is
+    # re-validated by the gate at the next boundary, never trusted here.
+    orchestrator.add_argument("--decision-state", default="")
+    orchestrator.add_argument("--decision-reason-code", default="")
     orchestrator.add_argument("--result", default="")
     orchestrator.add_argument("--detail", default="")
 
@@ -2902,6 +3277,8 @@ def main(argv: list[str] | None = None) -> int:
             risk_source=args.risk_source,
             requested_phases=args.requested_phases,
             round_kind=args.round_kind,
+            decision_state=args.decision_state,
+            decision_reason_code=args.decision_reason_code,
             result=args.result,
             detail=args.detail,
         )

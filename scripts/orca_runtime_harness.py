@@ -35,7 +35,7 @@ try:
         require_workflow_phase,
         strip_task_context,
     )
-    from scripts import run_logging
+    from scripts import decision_gate, decision_policy, run_logging
     from scripts.workflow_contract import load_workflow_output_contract
 except ModuleNotFoundError:  # direct `python3 scripts/...` execution
     from quality_profile import (
@@ -59,6 +59,8 @@ except ModuleNotFoundError:  # direct `python3 scripts/...` execution
         require_workflow_phase,
         strip_task_context,
     )
+    import decision_gate
+    import decision_policy
     import run_logging
     from workflow_contract import load_workflow_output_contract
 
@@ -241,6 +243,22 @@ def completion_timestamp(dispatch_row: dict[str, Any]) -> str | None:
 
 class OrcaRuntimeError(RuntimeError):
     pass
+
+
+class DecisionGateRefused(OrcaRuntimeError):
+    """OS-29 B1: a boundary refused BEFORE any Task or Dispatch was created.
+
+    Raised rather than returned, which is the shape this class already gives every
+    other pre-dispatch failure (an invalid quality profile, an undeclared
+    requested_phases at the final gate): the refusal is logged through
+    _log_pre_dispatch_failure and then re-raised unchanged, so no caller can mistake
+    it for a settled attempt and no Dispatch id ever comes into existence.
+    """
+
+    def __init__(self, reason: str, detail: str = "") -> None:
+        super().__init__(f"{reason}{(' -- ' + detail) if detail else ''}")
+        self.reason = reason
+        self.detail = detail
 
 
 class UnsupportedOrcaContract(OrcaRuntimeError):
@@ -704,6 +722,18 @@ class OrcaRuntimeHarness:
         # _log_attempt(). Empty in the overwhelmingly common case; a test can assert
         # against it to catch a real bug in the logging helper itself.
         self._logging_errors: list[str] = []
+        # ---- OS-29. The decision policy this harness's B1 guard evaluates against,
+        # resolved once from the orchestration Skill this runtime IS -- the same
+        # one-resolution rule quality_profile above follows.
+        self._decision_policy = decision_policy.load_decision_policy(
+            REPO_ROOT / "orca-worker-reviewer-orchestration" / "SKILL.md"
+        )
+        # The (run, phase, iteration) of the round this PROCESS last settled and
+        # recorded in the ledger, or None. A3's binding expectation, held in memory
+        # and never read back off the ledger it validates. It is deliberately
+        # process-local: OS-31 owns cross-session resume, so a fresh Coordinator
+        # meeting a non-trivial ledger fails closed rather than guessing (L7).
+        self._last_settled: tuple[str, str, int] | None = None
         # OS-17 review round 4 MAJOR: the currently-open phase/iteration TIMING_LOG
         # boundary, if any -- advanced automatically by _open_phase_iteration_
         # boundary(), called just before a dispatch starts (run_existing_task(),
@@ -1526,7 +1556,18 @@ class OrcaRuntimeHarness:
         # directory. Scoped under artifact_dir (this harness's own scratch space),
         # never the real repository's artifacts/ root, so exercising this path in
         # tests cannot litter the working tree with run directories.
-        ensure_run_artifact_root(self.run_id, base=self.artifact_dir)
+        # OS-29: the run root and the run-entry decision declaration in ONE
+        # statement, at the same point the run root was already provisioned and
+        # adjacent to the ORCHESTRATOR_LOG/TIMING_LOG opens below -- so the first
+        # pre-dispatch B1 guard has an explicit, validated record to read instead of
+        # an absence, and a run root can never exist without a ledger.
+        run_logging.open_decision_ledger(
+            self.run_id,
+            base=self.artifact_dir,
+            phases=self.requested_phases,
+            risk=self.risk or "",
+            ledger_schema_version=decision_gate.LEDGER_RECORD_SCHEMA_VERSION,
+        )
         # OS-17: ORCHESTRATOR_LOG.md/TIMING_LOG.md open here, in the same
         # already-provisioned root, one line each -- the run's own start
         # timestamp is recorded once and reused by log_run_status() for the
@@ -2137,6 +2178,13 @@ class OrcaRuntimeHarness:
         # to know either verdict before the write it belongs to.
         gate_result = _reviewer_gate_result(attempt.role, attempt.body or "")
         review_verdict = _reviewer_review_verdict(attempt.role, attempt.body or "")
+        # OS-29: the settled attempt's own decision declaration becomes an immutable
+        # ledger record and this row's two sparse columns. Done HERE because this is
+        # the single funnel every settled dispatch passes; it can never be the GATE,
+        # which is why the gate itself runs before start_worker instead.
+        decision_state, decision_reason_code = self._record_decision_from_attempt(
+            phase=phase, attempt=attempt
+        )
         # The most recent reviewer-role gate result, and this attempt's own
         # ended_at, observed for the currently open iteration/phase become that
         # boundary's own eventual iteration_end/phase_end `detail`/`ended_at`
@@ -2166,6 +2214,8 @@ class OrcaRuntimeHarness:
             # OS-17's workflow-path requirement asks. Only pre_dispatch_failure --
             # which has no dispatch at all -- leaves it blank.
             round_kind=round_kind,
+            decision_state=decision_state,
+            decision_reason_code=decision_reason_code,
             result=(
                 f"outcome={attempt.outcome} settlement={attempt.settlement} "
                 f"lifecycle={attempt.lifecycle_action} "
@@ -2261,6 +2311,109 @@ class OrcaRuntimeHarness:
                 f"dispatch_status={attempt.dispatch_status} event={event}"
             ),
         )
+
+    def _b1_guard(self, *, phase: str | None, role: str, iteration: int) -> None:
+        """A1-A6 over this run's ledger head. Raises DecisionGateRefused, or returns.
+
+        A run this process never opened has no ledger of its own to read, so the
+        guard is a no-op before start_run() -- there is no boundary to gate yet and
+        no run root to read from.
+        """
+        if not self.run_id:
+            return
+        try:
+            decision_gate.admit_head(
+                self._decision_policy,
+                run_logging.read_decision_ledger(self.run_id, base=self.artifact_dir),
+                run_id=self.run_id,
+                expected_settled_round=self._last_settled,
+            )
+        except decision_gate.GateRefusal as refusal:
+            error = DecisionGateRefused(refusal.reason, refusal.detail)
+            self._log_pre_dispatch_failure(
+                phase=phase, role=role, iteration=iteration, error=error
+            )
+            self._safe_log(
+                run_logging.log_orchestrator_event,
+                self.run_id,
+                base=self.artifact_dir,
+                event=run_logging.EVENT_DECISION_GATE_REFUSED,
+                phase=phase or "",
+                role=role,
+                iteration=iteration,
+                risk=self.risk,
+                decision_state=decision_gate.decision_columns(refusal.reason)[0],
+                decision_reason_code=decision_gate.decision_columns(refusal.reason)[1],
+                detail=" ".join(refusal.detail.split())[:200],
+            )
+            raise error
+
+    def _record_decision_from_attempt(
+        self, *, phase: str | None, attempt: "RuntimeAttempt"
+    ) -> tuple[str, str]:
+        """The settled attempt's own gate declaration -> a ledger record + two columns.
+
+        Three cases, and the difference between them is the whole fail-closed
+        behaviour this path can offer:
+
+        * The body declares NOTHING. It is not a ledger participant, `_last_settled`
+          is untouched, and the columns stay blank. This is the legacy shape, and the
+          gate's authority over such a run is B1 only -- which is exactly what R-11
+          says is enforceable here and what the decision gate contract block records
+          as the Coordinator's obligation instead.
+        * The body declares something and it is DEFECTIVE. No record is published and
+          `_last_settled` IS advanced, so the very next B1 refuses with
+          DECISION_GATE_INPUT_UNBOUND. A broken declaration poisons the next
+          dispatch; it never passes for a good one.
+        * The body declares a valid gate result. The record is published, bound to
+          the round that actually settled, and the columns carry it.
+        """
+        body = attempt.body or ""
+        if not decision_gate.declares_gate_result(body):
+            return "", ""
+        settled = (self.run_id, phase or "", attempt.iteration)
+        try:
+            gate = decision_gate.parse_gate_result(body, self._decision_policy)
+        except decision_gate.GateRefusal as refusal:
+            self._last_settled = settled
+            return decision_gate.INPUT_DEFECT_STATE, refusal.reason
+        record = dict(gate.record)
+        record.update(
+            {
+                "ledger_schema_version": decision_gate.LEDGER_RECORD_SCHEMA_VERSION,
+                "run": self.run_id,
+                "phase": phase or "",
+                "iteration": attempt.iteration,
+                "role": "reviewer" if attempt.role.endswith("reviewer") else "worker",
+                "boundary": "B3" if attempt.role.endswith("reviewer") else "B2",
+                "source": "reviewer" if attempt.role.endswith("reviewer") else "worker",
+                "verdict": _reviewer_gate_result(attempt.role, body),
+                "verifies": record.get("verifies"),
+                "prior_open_decision_items": [],
+                "recorded_at": run_logging.now_iso(),
+            }
+        )
+        record.setdefault("responsible_phase", phase or "")
+        record.setdefault("evidence", {})
+        record.setdefault("assumption", None)
+        record.setdefault("open_item", None)
+        record.setdefault("source_binding", f"artifacts/runs/{self.run_id}/")
+        try:
+            run_logging.append_decision_ledger_record(
+                self.run_id,
+                record,
+                base=self.artifact_dir,
+                ledger_schema_version=decision_gate.LEDGER_RECORD_SCHEMA_VERSION,
+            )
+        except Exception as error:  # noqa: BLE001 -- section 9: logging never gates
+            # The write failed, so no record binds this round. `_last_settled` is
+            # advanced anyway: the next B1 then refuses as UNBOUND, which is the
+            # fail-closed direction. A logging failure may not turn a settled
+            # dispatch into a failure, and it may not turn a refusal into an
+            # admission either.
+            self._logging_errors.append(f"append_decision_ledger_record: {error}")
+        self._last_settled = settled
+        return str(record.get("state", "")), str(record.get("reason_code") or "")
 
     def _log_pre_dispatch_failure(
         self, *, phase: str | None, role: str, iteration: int, error: Exception
@@ -2408,6 +2561,14 @@ class OrcaRuntimeHarness:
         caller that supplied one and not the other would dispatch a different
         boundary than the one it created the Task with.
         """
+        # ---- OS-29 B1. BEFORE dispatch_context, before any terminal is created and
+        # before start_worker: an unresolved blocking decision must leave no Task, no
+        # Dispatch and no terminal behind. This is the one OS-29 guarantee the live
+        # path can enforce structurally; the rest of the gate is the Coordinator's
+        # documented obligation (the decision gate contract block in SKILL.md), for
+        # the reason recorded in this class's own docstring -- there is no
+        # deterministic in-process iteration counter here (L7/R-11).
+        self._b1_guard(phase=phase, role=role, iteration=iteration)
         # Before the dispatch, not after it. `spec` is what start_worker sends on the
         # low-level path and what a caller passes to task-create on the supervised
         # one, so the boundary has to be inside it by the time either happens.

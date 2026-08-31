@@ -174,7 +174,7 @@ resumable. Every phase performs a decision check, but only `NEEDS_INPUT` and
 `CONFLICT` pause for the user.
 
 - [OS-28](https://luminous419.atlassian.net/browse/OS-28) Bounded Autonomy Decision Policy Contract
-- [OS-29](https://luminous419.atlassian.net/browse/OS-29) Continuous Decision and Escalation Gates
+- [OS-29](https://luminous419.atlassian.net/browse/OS-29) Continuous Decision and Escalation Gates — **implemented** in the orchestration Skill: the OS-28 policy is enforced at phase entry, after the Worker result and after the Reviewer result, `NEEDS_INPUT`/`CONFLICT` block the correction Worker and the next phase without consuming an iteration, and every judgement is recorded in a run-scoped append-only decision ledger. A blocked run terminates and is not resumable; asking the user (OS-30) and resuming across sessions (OS-31) are still not implemented.
 - [OS-30](https://luminous419.atlassian.net/browse/OS-30) Structured Human Clarification and Decision Protocol
 - [OS-31](https://luminous419.atlassian.net/browse/OS-31) Durable Pause and Resume for Human Decisions
 - [OS-32](https://luminous419.atlassian.net/browse/OS-32) Bounded Autonomy Evaluation and Success Metrics

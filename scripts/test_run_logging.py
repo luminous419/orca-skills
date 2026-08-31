@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import ast
+import errno
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -4407,6 +4409,295 @@ class AttemptDomainProvenanceTests(_AuditTestCase):
         )
         self.assertEqual(second.returncode, 0, second.stderr)
         self.assertEqual(json.loads(second.stdout)["records"], [])
+
+
+# ---------------------------------------------------------------------------------
+# OS-29: the decision ledger's PRODUCER, its collision primitive and its columns.
+#
+# The subject here is durability and shape -- who wrote it, whether a second writer
+# can overwrite it, whether a published name is a complete record. The A1-A6
+# JUDGEMENT over the same bytes belongs to scripts/test_decision_gate.py, because
+# this module may not depend on the gate any more than run_logging.py may.
+# ---------------------------------------------------------------------------------
+class DecisionLedgerProducerTests(unittest.TestCase):
+    RUN = "run_ledger"
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.base = Path(self.temporary_directory.name)
+
+    def tearDown(self) -> None:
+        self.temporary_directory.cleanup()
+
+    def open_ledger(self, **kwargs):
+        return run_logging.open_decision_ledger(
+            self.RUN,
+            base=self.base,
+            phases=kwargs.pop("phases", ("implementation",)),
+            risk=kwargs.pop("risk", "high"),
+            ledger_schema_version=kwargs.pop("ledger_schema_version", 1),
+        )
+
+    def records(self):
+        return run_logging.read_decision_ledger(self.RUN, base=self.base)
+
+    def test_a_run_root_can_never_exist_without_a_declaration(self) -> None:
+        root = self.open_ledger()
+
+        self.assertTrue(root.is_dir())
+        declaration = self.records()[0]
+        self.assertEqual(declaration["sequence"], 0)
+        self.assertEqual(declaration["source"], "coordinator:run_entry")
+        self.assertEqual(declaration["boundary"], "B1")
+        self.assertEqual(declaration["state"], "CLEAR")
+        self.assertIsNone(declaration["reason_code"])
+        self.assertIs(declaration["open_decision_item"], False)
+        self.assertEqual(declaration["prior_open_decision_items"], [])
+        self.assertEqual(declaration["run"], self.RUN)
+        self.assertEqual(declaration["ledger_schema_version"], 1)
+
+    def test_f12_the_producer_is_idempotent_and_first_writer_wins(self) -> None:
+        self.open_ledger()
+        first = json.dumps(self.records()[0], sort_keys=True)
+
+        self.open_ledger()
+        self.open_ledger(phases=("plan",))
+
+        self.assertEqual(len(self.records()), 1)
+        self.assertEqual(json.dumps(self.records()[0], sort_keys=True), first)
+        # F12's other half: a SECOND sequence-0 record planted by hand is a ledger
+        # the reader still returns -- detecting it is the gate's job, and the reader
+        # must not hide it by dropping one.
+        ledger = self.base / "artifacts" / "runs" / self.RUN / "decision_ledger"
+        (ledger / "000001").mkdir()
+        (ledger / "000001" / "record.json").write_text(
+            json.dumps(dict(self.records()[0]), sort_keys=True), encoding="utf-8"
+        )
+        self.assertEqual(len([r for r in self.records() if r["sequence"] == 0]), 2)
+
+    def test_an_unknown_risk_level_fails_at_run_open(self) -> None:
+        with self.assertRaises(run_logging.DecisionLedgerError):
+            self.open_ledger(risk="critical")
+        # CONTROL: every real level is accepted, so the guard is not refusing all.
+        for level in run_logging.RISK_VALUES + ("",):
+            with self.subTest(risk=level):
+                shutil.rmtree(self.base / "artifacts", ignore_errors=True)
+                self.open_ledger(risk=level)
+                self.assertEqual(len(self.records()), 1)
+        # ...and `risk` is deliberately NOT recorded: the record's field set is
+        # closed and a decision record carrying a risk level would couple two axes
+        # the contract keeps independent.
+        self.assertNotIn("risk", self.records()[0])
+
+    def test_a_published_record_is_never_overwritten(self) -> None:
+        """D8 writer-side exclusivity, on the REAL shared publisher."""
+        self.open_ledger()
+        ledger = run_logging.decision_ledger_dir(self.RUN, base=self.base)
+        key = run_logging.decision_ledger_sequence_key(0)
+        before = (ledger / key / "record.json").read_bytes()
+
+        with self.assertRaises(run_logging.FinalReviewAuditCollision):
+            run_logging._stage_and_publish_audit_record(
+                ledger, key, {"record.json": "SECOND WRITER"}
+            )
+
+        self.assertEqual((ledger / key / "record.json").read_bytes(), before)
+        # ...and the reason it is refused: POSIX will not rename a directory onto a
+        # NON-EMPTY directory. Executed rather than cited.
+        source = self.base / "src"
+        source.mkdir()
+        (source / "x").write_text("x", encoding="utf-8")
+        with self.assertRaises(OSError) as caught:
+            os.rename(source, ledger / key)
+        self.assertEqual(caught.exception.errno, errno.ENOTEMPTY)
+
+    def test_an_empty_payload_is_refused_before_anything_is_staged(self) -> None:
+        """The precondition that closes D8's one residual hazard: a rename onto an
+        EMPTY directory DOES succeed, so a record must never be empty."""
+        self.open_ledger()
+        ledger = run_logging.decision_ledger_dir(self.RUN, base=self.base)
+
+        with self.assertRaises(RunLoggingError):
+            run_logging._stage_and_publish_audit_record(ledger, "000099", {})
+
+        self.assertFalse((ledger / "000099").exists())
+        staging = ledger / run_logging.DECISION_LEDGER_STAGING_DIRNAME
+        self.assertEqual(
+            [entry.name for entry in staging.iterdir()] if staging.is_dir() else [], []
+        )
+        # THE CONTROL: a non-empty payload publishes, so the precondition is not
+        # refusing every write.
+        published = run_logging._stage_and_publish_audit_record(
+            ledger, "000099", {"record.json": "{}"}
+        )
+        self.assertTrue((published / "record.json").is_file())
+
+    def test_append_is_gapless_and_append_only(self) -> None:
+        self.open_ledger()
+        first = json.dumps(self.records()[0], sort_keys=True)
+
+        sequences = []
+        for index in range(3):
+            _, sequence = run_logging.append_decision_ledger_record(
+                self.RUN,
+                {"state": "CLEAR", "phase": f"p{index}"},
+                base=self.base,
+                ledger_schema_version=1,
+            )
+            sequences.append(sequence)
+
+        self.assertEqual(sequences, [1, 2, 3])
+        self.assertEqual([r["sequence"] for r in self.records()], [0, 1, 2, 3])
+        # Append-only: the earlier records are byte-identical afterwards.
+        self.assertEqual(json.dumps(self.records()[0], sort_keys=True), first)
+        # The writer STAMPS the version and the sequence, so a caller cannot claim
+        # either of them.
+        for record in self.records()[1:]:
+            self.assertEqual(record["ledger_schema_version"], 1)
+
+    def test_two_writers_claiming_the_same_sequence_get_different_ones(self) -> None:
+        """A detection mechanism that happens to recover: a run has one writer in
+        practice, but a shared run id across two processes is reachable."""
+        self.open_ledger()
+        ledger = run_logging.decision_ledger_dir(self.RUN, base=self.base)
+        # Force the contention by publishing the sequence the next append will claim.
+        run_logging._stage_and_publish_audit_record(
+            ledger,
+            run_logging.decision_ledger_sequence_key(1),
+            {"record.json": json.dumps({"sequence": 1, "state": "CLEAR"})},
+        )
+
+        _, sequence = run_logging.append_decision_ledger_record(
+            self.RUN, {"state": "CLEAR"}, base=self.base, ledger_schema_version=1
+        )
+
+        self.assertEqual(sequence, 2)
+        self.assertEqual([r["sequence"] for r in self.records()], [0, 1, 2])
+
+    def test_an_unreadable_published_record_is_surfaced_not_dropped(self) -> None:
+        """Dropping it would turn a corrupt record into an ABSENCE, and an absence is
+        exactly what must never be read as CLEAR."""
+        self.open_ledger()
+        ledger = run_logging.decision_ledger_dir(self.RUN, base=self.base)
+        (ledger / "000001").mkdir()
+        (ledger / "000001" / "record.json").write_text("{not json", encoding="utf-8")
+
+        records = self.records()
+
+        self.assertEqual(len(records), 2)
+        self.assertIn("_unreadable", records[1])
+        # THE CONTROL: the honest record beside it still reads normally.
+        self.assertEqual(records[0]["state"], "CLEAR")
+
+    def test_the_two_sparse_columns_exist_and_stay_blank_by_default(self) -> None:
+        self.assertIn("decision_state", ORCHESTRATOR_LOG_COLUMNS)
+        self.assertIn("decision_reason_code", ORCHESTRATOR_LOG_COLUMNS)
+        self.assertNotIn("decision_state", TIMING_LOG_COLUMNS)
+
+        path = log_orchestrator_event(self.RUN, base=self.base, event="run_start")
+        blank = path.read_text(encoding="utf-8").splitlines()[-1]
+        log_orchestrator_event(
+            self.RUN,
+            base=self.base,
+            event=run_logging.EVENT_DECISION_BLOCK,
+            decision_state="NEEDS_INPUT",
+            decision_reason_code="blast_radius_beyond_scope",
+        )
+        filled = path.read_text(encoding="utf-8").splitlines()[-1]
+
+        def cells(row: str) -> list[str]:
+            return [cell.strip() for cell in row.split("|")[1:-1]]
+
+        header = cells(path.read_text(encoding="utf-8").splitlines()[0])
+        index = header.index("decision_state")
+        self.assertEqual(len(header), len(ORCHESTRATOR_LOG_COLUMNS))
+        self.assertEqual(cells(blank)[index], "")
+        self.assertEqual(cells(filled)[index], "NEEDS_INPUT")
+        self.assertEqual(len(RUN_STATUS_VALUES), 4)
+
+    def test_the_cli_can_write_the_two_columns(self) -> None:
+        with redirect_stdout(StringIO()):
+            code = cli_main(
+                [
+                    "orchestrator-event",
+                    "--run-id",
+                    self.RUN,
+                    "--base",
+                    str(self.base),
+                    "--event",
+                    run_logging.EVENT_DECISION_GATE_REFUSED,
+                    "--decision-state",
+                    "INPUT",
+                    "--decision-reason-code",
+                    "DECISION_GATE_INPUT_MISSING",
+                ]
+            )
+
+        self.assertEqual(code, 0)
+        log = orchestrator_log_path(self.RUN, base=self.base).read_text(encoding="utf-8")
+        self.assertIn("DECISION_GATE_INPUT_MISSING", log)
+        self.assertIn(run_logging.EVENT_DECISION_GATE_REFUSED, log)
+
+
+class DecisionRecordSectionDriftTests(unittest.TestCase):
+    """P-2: the Markdown summary reconciled against its machine record.
+
+    An ABSENT section reconciles trivially -- the OS-28 optionality survives -- and a
+    PRESENT one that contradicts the record is drift.
+    """
+
+    def test_an_absent_section_is_not_a_finding(self) -> None:
+        self.assertIsNone(run_logging.parse_decision_record_section("# Worker Result\n"))
+        self.assertIsNone(
+            run_logging.reconcile_decision_record_section(
+                "# Worker Result\n", {"state": "CLEAR", "reason_code": None}
+            )
+        )
+
+    def test_a_present_section_must_agree_with_the_record(self) -> None:
+        agreeing = (
+            "# Worker Result\n\n## Decision Record (optional)\n\n"
+            "DECISION_STATE: NEEDS_INPUT\nREASON_CODE: blast_radius_beyond_scope\n"
+        )
+        record = {"state": "NEEDS_INPUT", "reason_code": "blast_radius_beyond_scope"}
+
+        self.assertEqual(
+            run_logging.parse_decision_record_section(agreeing),
+            ("NEEDS_INPUT", "blast_radius_beyond_scope"),
+        )
+        self.assertIsNone(
+            run_logging.reconcile_decision_record_section(agreeing, record)
+        )
+        # State drift.
+        drifted = agreeing.replace("DECISION_STATE: NEEDS_INPUT", "DECISION_STATE: CLEAR")
+        self.assertIsNotNone(
+            run_logging.reconcile_decision_record_section(drifted, record)
+        )
+        # Reason-code drift.
+        other = agreeing.replace(
+            "REASON_CODE: blast_radius_beyond_scope", "REASON_CODE: security_impact"
+        )
+        self.assertIsNotNone(
+            run_logging.reconcile_decision_record_section(other, record)
+        )
+
+    def test_the_motivating_drift_case_of_this_run(self) -> None:
+        """A CLEAR whose prose spells the absence out is fine; one that names an
+        actual reason code is drift. This is the ANALYSIS iteration-1 defect."""
+        clear = {"state": "CLEAR", "reason_code": None}
+        prose = (
+            "## Decision Record (optional)\n\nDECISION_STATE: CLEAR\n"
+            "REASON_CODE: (none - CLEAR carries no reason code)\n"
+        )
+
+        self.assertIsNone(run_logging.reconcile_decision_record_section(prose, clear))
+        named = prose.replace(
+            "REASON_CODE: (none - CLEAR carries no reason code)",
+            "REASON_CODE: repository_policy",
+        )
+        self.assertIsNotNone(
+            run_logging.reconcile_decision_record_section(named, clear)
+        )
 
 
 if __name__ == "__main__":

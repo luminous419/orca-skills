@@ -367,6 +367,22 @@ state 선택 입력이 아니다. risk level을 바꾸어도 자동으로 결정
 이 Skill에는 risk 축이 없지만 decision policy 계약은 동일하다 — 계약이 risk에 의존하지 않으므로
 risk 축이 있는 Skill과 같은 문언을 읽는다.
 
+**gate 결과와 문서 section은 다른 객체다.** gate 경계에서 decision 결과는 필수이며 명시적이다.
+섹션의 optional 여부와 다른 객체다. `## Decision Record` section은 여전히 optional이며 없어도
+계약 위반이 아니다. 그러나 결과 본문의 `DECISION_GATE_STATE`와 그 record는 경계마다 필수이고,
+없으면 그 경계는 진행하지 않는다.
+
+**부재는 CLEAR가 아니다.** "결정할 것이 없었다"는 CLEAR로 단언되어야 하며 기록의 부재로 추정될
+수 없다. 기록 없음, 형식 오류, 알 수 없는 schema, 빠진 safety fact, 알 수 없는 state나 reason
+code, 모델 확신, Worker/Reviewer 합의, timeout, 무응답, 권고 default의 존재 — 어느 것도 CLEAR로
+진행할 근거가 되지 못한다.
+
+**두 채널, 하나의 권위.** 기계가 읽는 record가 authority이고 Markdown 요약은 사람을 위한
+설명이다. 둘이 어긋나면 진행하지 않고 막힌다.
+
+decision **semantics**는 두 Skill이 동일하다. Orca lifecycle 위에서 gate가 실행되는 위치·terminal
+기록·dispatch 차단은 orchestration Skill 전용이며 이 Skill에는 없다.
+
 ## 5. Agent Command Policy
 
 기본 known commands:
@@ -877,6 +893,7 @@ PREVIOUS REVIEW FINDINGS
 # Worker Result
 
 STATUS: COMPLETE | BLOCKED
+DECISION_GATE_STATE: CLEAR | ASSUMPTION_ALLOWED | NEEDS_INPUT | CONFLICT
 
 ## Summary
 ## Analysis
@@ -919,6 +936,7 @@ Reviewer는 실제 repository, diff, artifact, tests, test result를 가능한 �
 # Review Result
 
 RESULT: PASS | FAIL
+DECISION_GATE_STATE: CLEAR | ASSUMPTION_ALLOWED | NEEDS_INPUT | CONFLICT
 
 ## Summary
 ## Blocking Findings

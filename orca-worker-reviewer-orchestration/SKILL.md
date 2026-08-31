@@ -365,8 +365,22 @@ predicate를 지정하며, `validate_record()`는 `permitted_states()`와 같은
 **축 독립성.** risk / quality profile / agent profile은 decision authority와 독립적인 축이며
 state 선택 입력이 아니다. risk level을 바꾸어도 자동으로 결정할 수 있는 범위는 넓어지지 않는다.
 
-이 계약은 **정의**다. 각 phase gate에서 검사를 실행하는 것(OS-29), 질문을 구성하는 것(OS-30),
-응답을 기다렸다 재개하는 것(OS-31)은 이 Skill에 아직 구현되어 있지 않다.
+이 계약은 **정의**다. 각 phase gate에서 이 정의를 실행하는 decision gate(OS-29)는 이 Skill에
+구현되어 있으며 §8의 `#### Decision gate contract`가 그 lifecycle 계약이다. 질문을 구성하는
+것(OS-30), 응답을 기다렸다 재개하는 것(OS-31)은 아직 구현되어 있지 않다.
+
+**gate 결과와 문서 section은 다른 객체다.** gate 경계에서 decision 결과는 필수이며 명시적이다.
+섹션의 optional 여부와 다른 객체다. `## Decision Record` section은 여전히 optional이며 없어도
+계약 위반이 아니다. 그러나 gate가 읽는 `DECISION_GATE_STATE` 결과와 그 record는 경계마다
+필수이고, 없으면 그 경계는 진행하지 않는다.
+
+**부재는 CLEAR가 아니다.** "결정할 것이 없었다"는 CLEAR로 단언되어야 하며 기록의 부재로 추정될
+수 없다. 기록 없음, 형식 오류, 알 수 없는 schema, 빠진 safety fact, 알 수 없는 state나 reason
+code, 모델 확신, Worker/Reviewer 합의, timeout, 무응답, 권고 default의 존재 — 어느 것도 CLEAR로
+진행할 근거가 되지 못한다.
+
+**두 채널, 하나의 권위.** 기계가 읽는 record가 authority이고 Markdown 요약은 사람을 위한
+설명이다. 둘이 어긋나면 run은 어느 쪽으로도 진행하지 않고 막힌다.
 
 ## 5. Agent Policy
 
@@ -1059,6 +1073,34 @@ RISK_FINAL_REVIEW = mandatory_at_every_level
 RISK_SAFETY_FLOOR = mandatory_test_gates_apply_at_every_level
 ```
 
+#### Decision gate contract
+
+아래 블록은 decision gate가 이 runtime의 lifecycle 위에서 **어디서 실행되고 무엇을 읽으며 어떤
+terminal을 남기는가**를 잠근다. decision state의 의미·reason code·entry clause·evidence 요구는
+공유된 `decision_policy` block의 것이며 여기서 다시 정의하지 않는다. 이 블록은 orchestration
+전용이고 loop skill과 공유되지 않는다.
+
+```text
+DECISION_GATE_BOUNDARIES = before_phase_entry, after_worker_result, after_reviewer_result
+DECISION_GATE_INPUT = explicit_machine_readable_record_never_absence
+DECISION_GATE_AXIS_ORDER = decision_axis_then_quality_axis
+DECISION_GATE_LEDGER = artifact_root_decision_ledger_append_only
+DECISION_GATE_LEDGER_ENTRY_SEQUENCE = zero
+DECISION_GATE_LEDGER_PRODUCER = coordinator_at_run_open
+DECISION_GATE_ADMISSIBILITY = non_empty, single_entry_declaration, schema_supported, bound_head, declaration_recomputed, no_unresolved_open_item
+DECISION_GATE_BLOCKING_STATES = needs_input, conflict
+DECISION_GATE_TERMINAL_STATUS = blocked
+DECISION_GATE_LOW_TERMINAL_BOUNDARY = after_worker_result
+DECISION_GATE_MEDIUM_HIGH_TERMINAL_BOUNDARY = after_reviewer_result
+DECISION_GATE_REVIEWER_PARTICIPATION = already_scheduled_reviewer_in_verification_mode
+DECISION_GATE_NEW_DISPATCH_SITES = none
+DECISION_GATE_ITERATION_ACCOUNTING = decision_block_consumes_no_correction_iteration
+DECISION_GATE_DOWNGRADE_AUTHORITY = policy_contract_transition_rule_only
+DECISION_GATE_RISK_INDEPENDENCE = identical_terminal_outcome_at_every_risk_level
+DECISION_GATE_RESUME = not_implemented_terminal_only
+DECISION_GATE_AUTHORITY = machine_record_over_markdown_summary
+```
+
 ## 9. Approved Phase Output
 
 PASS된 이전 phase 결과는 다음 phase의 approved input이다.
@@ -1488,6 +1530,7 @@ Worker는 phase별 `templates/*.md`를 따른다.
 # Worker Result
 
 STATUS: COMPLETE | BLOCKED
+DECISION_GATE_STATE: CLEAR | ASSUMPTION_ALLOWED | NEEDS_INPUT | CONFLICT
 
 ## Summary
 ## Analysis
@@ -1497,6 +1540,12 @@ STATUS: COMPLETE | BLOCKED
 ## Unit Tests / Testing Strategy
 ## Review Feedback Resolution
 ```
+
+`DECISION_GATE_STATE`는 **선언**이고, 결과 본문에 정확히 하나 있어야 하는 ```` ```decision-gate ````
+fenced JSON record가 그 **권위**다. 둘 중 하나라도 없거나, 둘 이상이거나, 서로 어긋나거나,
+record가 OS-28 계약을 통과하지 못하면 그 경계는 fail-closed로 막힌다 — CLEAR로 추정되지 않는다.
+이 필드는 optional `## Decision Record` section과 **다른 객체**이며 그 section의 optional 여부를
+바꾸지 않는다.
 
 Worker는 active Dispatch의 lifecycle preamble/guide를 따라 완료를 Orca orchestration에 보고해야 한다.
 Coordinator는 terminal output만 보고 임의로 완료 처리하지 않는다.
@@ -1514,6 +1563,7 @@ Reviewer는 code/artifact를 직접 수정하지 않는다.
 
 RESULT: PASS | FAIL
 REVIEW_VERDICT: PASS | PASS WITH NOTES | FAIL | BLOCKED
+DECISION_GATE_STATE: CLEAR | ASSUMPTION_ALLOWED | NEEDS_INPUT | CONFLICT
 
 ## Summary
 ## Blocking Findings
@@ -1521,6 +1571,17 @@ REVIEW_VERDICT: PASS | PASS WITH NOTES | FAIL | BLOCKED
 ## Test Review
 ## Final Decision
 ```
+
+`DECISION_GATE_STATE`는 **선언**이고, 결과 본문에 정확히 하나 있어야 하는 ```` ```decision-gate ````
+fenced JSON record가 그 **권위**다. 둘 중 하나라도 없거나, 둘 이상이거나, 서로 어긋나거나,
+record가 OS-28 계약을 통과하지 못하면 그 경계는 fail-closed로 막힌다 — CLEAR로 추정되지 않는다.
+이 필드는 optional `## Decision Record` section과 **다른 객체**이며 그 section의 optional 여부를
+바꾸지 않는다.
+
+Reviewer는 현재 phase의 decision 분류와 그 근거를 **검증**할 수 있다. 그러나 사용자를 대신해
+결정할 수는 없다. `NEEDS_INPUT`/`CONFLICT`를 근거 없이 `CLEAR`/`ASSUMPTION_ALLOWED`로 낮추는
+것은 금지이며, 허용 여부는 공유 `decision_policy` block의 transition rule만이 정한다 — OS-29는
+자체 downgrade rule을 만들지 않는다. Worker와 Reviewer의 합의는 사용자 권한을 대신하지 않는다.
 
 Finding:
 
@@ -1711,6 +1772,11 @@ AGENT_PROFILE_LEGACY = omitted_profile_preserves_existing_behavior
 
 ## 12. FAIL Loop
 
+**decision 축이 먼저다.** 모든 경계에서 gate 결과를 먼저 읽고 검증한 뒤에야 quality 축의
+PASS/FAIL 라우팅을 평가한다. `NEEDS_INPUT`/`CONFLICT`이거나 gate 결과가 없거나 깨졌으면 그
+round는 `RUN_STATUS: BLOCKED`로 종료되고 correction Worker도 다음 phase도 dispatch되지 않는다.
+decision 축은 기존 라우팅을 **허용**하거나 **종료**할 뿐이며 PASS를 만들어내지 않는다.
+
 이 절의 PASS/FAIL은 그 phase의 **phase gate** 판정을 뜻하며, phase gate가 무엇인지는 risk가
 정한다(§8 Risk Axis). LOW에서는 Worker 자신의 결과(§6 8단계, §14)이고, MEDIUM/HIGH에서는 phase
 Reviewer의 `RESULT:` 판정이다. 아래 두 전이는 그 gate 판정에 대한 것이며 특정 risk level의
@@ -1778,6 +1844,12 @@ REASON: INVALID_MAX_ITERATIONS
 
 각 phase별 gate attempt를 iteration으로 센다 — MEDIUM/HIGH에서는 Reviewer attempt 하나가,
 LOW에서는 Worker attempt 하나가 gate attempt 하나다(아래 counter 정의).
+
+**decision block은 iteration을 소비하지 않는다.** `NEEDS_INPUT`/`CONFLICT`, 그리고 gate 입력
+결함으로 종료된 round는 quality 실패가 아니므로 그 phase의 correction iteration을 차감하지
+않는다 — risk level과 무관하게 그렇다. 이미 물리적으로 일어난 dispatch는 되감지 않는다: attempt
+ledger와 provenance는 그대로 남고, 줄어들지 않는 것은 correction **budget**이다. quality
+`FAIL`은 종전대로 iteration 하나를 소비한다.
 최대치를 넘기면 추가 Dispatch를 만들지 않는다.
 
 ```text
@@ -2055,7 +2127,15 @@ F lifecycle state machine    상태 전이와 counter가 문서와 코드에서 
 G security destructive       파괴적 동작, secret, 범위 밖 파일 변경이 없는가
 H over-engineering           요청되지 않은 abstraction이나 범위 확대가 없는가
 I hidden coupling            의도치 않은 공유 자산/외부 계약 변경이 없는가
+J decision provenance        미해결 decision, 승인되지 않은 고영향 가정, decision drift가 없는가
 ```
+
+축 J는 OS-29가 추가한 것이며 다음을 본다: (1) run의 decision ledger에 해결되지 않은
+`NEEDS_INPUT`/`CONFLICT` 항목이 남아 있는가 — 남아 있으면 완료는 금지다, (2) 사용자 권한 없이
+승인된 고영향 가정이 있는가, (3) 앞선 phase에서 확정된 decision을 downstream이 확장했는데 새
+decision event나 escalation 없이 진행했는가, (4) 각 경계의 gate 결과와 그 근거·responsible
+phase·reviewer verdict가 run-scoped artifact와 log에 남아 있는가. 이 축은 blocking finding을 찾는
+탐색 축이며, 미해결 decision은 그 자체로 완료 금지 사유다.
 
 앞선 phase gate가 PASS였다는 사실을 옳다고 가정하지 않는다. 그 gate는 MEDIUM/HIGH에서는
 이전 phase Reviewer의 PASS 판정이고, LOW에서는 어떤 phase Reviewer도 검증한 적 없는
@@ -2189,6 +2269,22 @@ FINAL_REVIEW_AUDIT_RECORD = artifact_root_final_review_audit_per_dispatch
 FINAL_REVIEW_PROVENANCE_DEFAULT = unknown
 ```
 
+#### Decision gate limitations (OS-30 / OS-31 부재의 귀결)
+
+OS-29는 blocked outcome과 그 증거를 남기는 데까지이며 그 이후는 구현되어 있지 않다. 아래는
+현재 한계이며 향후 계획이 아니라 **지금 사실**이다.
+
+```text
+L1 blocked run은 종료된다. 답을 주는 것은 재개가 아니라 새 run이다 (resume은 OS-31).
+L2 질문을 구조화된 형태로 사용자에게 제시하는 UX는 없다 (OS-30).
+L3 supersession lineage가 없다. downstream 확장의 답은 링크가 아니라 새 decision/escalation이다.
+L4 timeout 의미론은 계약의 부정 규칙(권한이 아님) 외에 없다.
+L5 LOW에는 phase Reviewer가 없으므로 LOW Worker의 오분류는 Final Adversarial Review에서만 잡힌다.
+L6 유효하게 승인된 downgrade여도 그 round는 여전히 terminal이다 — 그에 따라 계속 진행하는 것이 resume이다.
+L7 live Orca 경로의 gate는 run을 연 Coordinator process 안에서만 bound된다. 새 process는 fail-closed로 막힌다.
+L8 logging CLI 경로는 ledger record를 계약 검증하지 않는다. 쓰고 읽을 뿐이며 판정은 gate가 한다.
+```
+
 ## 18. Core Invariants
 
 ```text
@@ -2243,4 +2339,13 @@ Missing project quality profile never restores the broad generic checklist
 Invalid project quality profile is a pre-dispatch validation failure, never a silent fallback
 PASS WITH NOTES and BLOCKED are review report annotations, never new lifecycle states
 Worker and Reviewer receive the same applicable quality attributes from one resolution
+Decision state and quality verdict are separate axes; the decision axis is read first and never creates a PASS
+Every gate boundary requires an explicit machine-readable decision result; absence, malformation and an unsupported schema all fail closed
+A missing decision result is never CLEAR, and neither is model confidence, worker/reviewer agreement, a recommended default, a timeout or a non-response
+NEEDS_INPUT and CONFLICT block the correction worker and the next phase, and consume no correction iteration
+Only the already-scheduled current-phase reviewer may verify a decision classification; no new dispatch site, round or reviewer exists
+A reviewer may verify a classification but never decide on the user's behalf; a downgrade is decided by the shared policy contract alone
+A decision block is terminal at every risk level; risk never changes the terminal status, decision state or reason code
+The machine-readable decision record is the authority and the markdown summary explains it; a disagreement blocks
+The decision ledger is append-only; a correction is a new record and no published record is ever edited
 ```

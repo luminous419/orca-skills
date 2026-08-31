@@ -21,7 +21,7 @@ from typing import Any, NamedTuple
 from unittest.mock import patch
 
 from scripts import orca_runtime_harness
-from scripts import run_logging
+from scripts import decision_gate, run_logging
 from scripts.orca_fake_agent import send_done
 from scripts.orca_runtime_harness import (
     CLOSE_ELIGIBLE_ROLES,
@@ -501,6 +501,18 @@ class DuplicateSettlementTests(unittest.TestCase):
             harness = OrcaRuntimeHarness(self.artifact_dir)
         harness._exec_orca = recorder  # the only process boundary
         harness.run_owner, harness.run_id = "term_owner", "run_offline"
+        # OS-29: this helper bypasses start_run(), which is where a real run opens
+        # its decision ledger, so it stubs that too. Without it the pre-dispatch B1
+        # guard refuses with DECISION_GATE_INPUT_MISSING -- correctly, because a run
+        # id with no ledger is exactly the "no record present" state the gate must
+        # never read as CLEAR. Same shape as the requested_phases stub beside it.
+        run_logging.open_decision_ledger(
+            harness.run_id,
+            base=self.artifact_dir,
+            phases=harness.requested_phases or ("implementation",),
+            risk=harness.risk or "",
+            ledger_schema_version=decision_gate.LEDGER_RECORD_SCHEMA_VERSION,
+        )
         harness.register_terminal(
             "term_worker",
             role="active_worker",
@@ -865,6 +877,18 @@ class OfflineHarnessTestCase(unittest.TestCase):
         # any test that uses build(); FinalReviewQualityProfileTests declares its own
         # meaningful set through the real start_run() path instead of this stub.
         harness.requested_phases = ("implementation",)
+        # OS-29: this helper bypasses start_run(), which is where a real run opens
+        # its decision ledger, so it stubs that too. Without it the pre-dispatch B1
+        # guard refuses with DECISION_GATE_INPUT_MISSING -- correctly, because a run
+        # id with no ledger is exactly the "no record present" state the gate must
+        # never read as CLEAR. Same shape as the requested_phases stub beside it.
+        run_logging.open_decision_ledger(
+            harness.run_id,
+            base=self.artifact_dir,
+            phases=harness.requested_phases or ("implementation",),
+            risk=harness.risk or "",
+            ledger_schema_version=decision_gate.LEDGER_RECORD_SCHEMA_VERSION,
+        )
         return harness
 
     def worker_terminal(
@@ -6798,6 +6822,18 @@ class RiskGraphContractTests(unittest.TestCase):
         harness._exec_orca = recorder
         harness.run_owner, harness.run_id = "term_owner", "run_offline"
         harness.requested_phases = ("implementation",)
+        # OS-29: this helper bypasses start_run(), which is where a real run opens
+        # its decision ledger, so it stubs that too. Without it the pre-dispatch B1
+        # guard refuses with DECISION_GATE_INPUT_MISSING -- correctly, because a run
+        # id with no ledger is exactly the "no record present" state the gate must
+        # never read as CLEAR. Same shape as the requested_phases stub beside it.
+        run_logging.open_decision_ledger(
+            harness.run_id,
+            base=self.artifact_dir,
+            phases=harness.requested_phases or ("implementation",),
+            risk=harness.risk or "",
+            ledger_schema_version=decision_gate.LEDGER_RECORD_SCHEMA_VERSION,
+        )
         return harness
 
     @staticmethod
@@ -7200,6 +7236,224 @@ class FinalReviewAuditEmissionTests(OfflineHarnessTestCase):
         entry = routing.for_role("final_review", "final_reviewer")
         self.assertEqual(record["reviewer_agent_command"], entry.command)
         self.assertEqual(record["reviewer_agent_origin"], entry.origin)
+
+
+# ---------------------------------------------------------------------------------
+# OS-29: the live pre-dispatch half.
+#
+# W-8 enforces the ONE thing that is enforceable on this path -- no Task, no Dispatch
+# and no terminal is created when the gate refuses. The rest of the gate is the
+# Coordinator's documented obligation (SKILL.md's `#### Decision gate contract`),
+# because this runtime has no deterministic in-process iteration counter (R-11/L7).
+# ---------------------------------------------------------------------------------
+class DecisionGateLiveDispatchTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.artifact_dir = Path(self.temporary_directory.name)
+
+    def tearDown(self) -> None:
+        self.temporary_directory.cleanup()
+
+    def started_harness(self) -> tuple[OrcaRuntimeHarness, RecordingExec]:
+        recorder = RecordingExec(
+            results={
+                "run-create": {"run": {"id": "run_live_os29"}},
+                "check": RecordingExec.ACCEPTED_DONE,
+            }
+        )
+        with patch.dict(environ, {"ORCA_CLI_COMMAND": "/opt/orca-dev"}):
+            harness = OrcaRuntimeHarness(self.artifact_dir)
+        harness._exec_orca = recorder
+        harness.start_run("os29 live", requested_phases=("implementation",))
+        return harness, recorder
+
+    def ledger(self):
+        return run_logging.read_decision_ledger(
+            "run_live_os29", base=self.artifact_dir
+        )
+
+    @staticmethod
+    def attempt(*, body: str) -> orca_runtime_harness.RuntimeAttempt:
+        return orca_runtime_harness.RuntimeAttempt(
+            role="worker",
+            iteration=1,
+            task_id="task_x",
+            dispatch_id="ctx_x",
+            outcome="succeeded",
+            task_status="done",
+            dispatch_status="settled",
+            worker_state="done",
+            terminal_state="live",
+            lifecycle_action="release",
+            worker_done_count=1,
+            execution_path="supervised",
+            body=body,
+        )
+
+    def test_start_run_writes_the_run_entry_declaration(self) -> None:
+        harness, _ = self.started_harness()
+
+        records = self.ledger()
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["sequence"], 0)
+        self.assertEqual(records[0]["source"], "coordinator:run_entry")
+        self.assertEqual(records[0]["run"], harness.run_id)
+        self.assertEqual(records[0]["phase"], "implementation")
+        self.assertEqual(
+            records[0]["ledger_schema_version"],
+            decision_gate.LEDGER_RECORD_SCHEMA_VERSION,
+        )
+
+    def test_a_missing_declaration_refuses_before_any_dispatch_exists(self) -> None:
+        harness, recorder = self.started_harness()
+        shutil.rmtree(
+            self.artifact_dir
+            / "artifacts" / "runs" / harness.run_id / "decision_ledger"
+        )
+        commands_before = len(recorder.commands)
+
+        with self.assertRaises(orca_runtime_harness.DecisionGateRefused) as caught:
+            harness.run_existing_task(
+                "worker", 1, "complete", "task_os29", phase="implementation"
+            )
+
+        self.assertEqual(caught.exception.reason, "DECISION_GATE_INPUT_MISSING")
+        # NO Task, NO Dispatch, NO terminal: the refusal happened before the runtime
+        # issued a single further command.
+        self.assertEqual(len(recorder.commands), commands_before)
+        log = (
+            self.artifact_dir
+            / "artifacts" / "runs" / harness.run_id / "ORCHESTRATOR_LOG.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("pre_dispatch_failure", log)
+        self.assertIn("DECISION_GATE_INPUT_MISSING", log)
+
+    def test_an_unresolved_open_item_refuses_the_next_dispatch(self) -> None:
+        harness, recorder = self.started_harness()
+        open_record = json.loads(
+            (
+                Path(__file__).resolve().parents[1]
+                / "scripts" / "fixtures" / "decision_gate" / "valid"
+                / "worker_needs_input.json"
+            ).read_text(encoding="utf-8")
+        )
+        planted = dict(open_record, run=harness.run_id, phase="implementation")
+        _, sequence = run_logging.append_decision_ledger_record(
+            harness.run_id,
+            planted,
+            base=self.artifact_dir,
+            ledger_schema_version=decision_gate.LEDGER_RECORD_SCHEMA_VERSION,
+        )
+        ledger_dir = run_logging.decision_ledger_dir(
+            harness.run_id, base=self.artifact_dir
+        )
+        declaration = json.loads(
+            (ledger_dir / "000000" / "record.json").read_text(encoding="utf-8")
+        )
+        declaration["prior_open_decision_items"] = [
+            decision_gate.ledger_key(dict(planted, sequence=sequence))
+        ]
+        (ledger_dir / "000000" / "record.json").write_text(
+            json.dumps(declaration, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        harness._last_settled = (harness.run_id, "implementation", 1)
+        commands_before = len(recorder.commands)
+
+        with self.assertRaises(orca_runtime_harness.DecisionGateRefused) as caught:
+            harness.run_existing_task(
+                "worker", 2, "complete", "task_os29", phase="implementation"
+            )
+
+        self.assertTrue(caught.exception.reason.startswith("DECISION_BLOCKED:"))
+        self.assertEqual(len(recorder.commands), commands_before)
+
+    def test_a_declaring_dispatch_records_a_bound_ledger_entry(self) -> None:
+        """The live path's own recording: a settled attempt whose body carries a valid
+        gate result becomes a bound ledger record and fills the two log columns.
+
+        The body is produced by the REAL fake worker, so this exercises the same
+        bytes a live dispatch would deliver rather than a hand-written string.
+        """
+        harness, _ = self.started_harness()
+        body = subprocess.run(
+            [
+                sys.executable,
+                str(Path(__file__).resolve().parent / "fake_worker.py"),
+                "--mode", "complete", "--field", "STATUS",
+                "--complete-value", "COMPLETE", "--blocked-value", "BLOCKED",
+                "--iteration", "1",
+            ],
+            text=True, capture_output=True, check=True,
+        ).stdout
+
+        harness._log_attempt(
+            phase="implementation",
+            attempt=self.attempt(body=body),
+            terminal_created=True,
+            started_at=run_logging.now_iso(),
+            ended_at=run_logging.now_iso(),
+        )
+
+        records = self.ledger()
+        self.assertEqual(len(records), 2)
+        self.assertEqual(records[1]["source"], "worker")
+        self.assertEqual(records[1]["boundary"], "B2")
+        self.assertEqual(records[1]["phase"], "implementation")
+        self.assertEqual(records[1]["iteration"], 1)
+        self.assertEqual(records[1]["state"], "CLEAR")
+        self.assertEqual(records[1]["run"], harness.run_id)
+        self.assertEqual(harness._last_settled, (harness.run_id, "implementation", 1))
+        log = (
+            self.artifact_dir
+            / "artifacts" / "runs" / harness.run_id / "ORCHESTRATOR_LOG.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("decision_state", log.splitlines()[0])
+        self.assertIn("| CLEAR |", log)
+        # The chain now BINDS: the next boundary is admitted rather than unbound,
+        # which is the control proving _last_settled and the record agree.
+        harness._b1_guard(phase="implementation", role="reviewer", iteration=1)
+
+    def test_a_legacy_body_that_declares_nothing_is_not_a_ledger_participant(
+        self,
+    ) -> None:
+        """A body with no declaration at all is the pre-OS-29 shape. It records no
+        ledger entry and leaves `_last_settled` alone, so the B1 chain still admits
+        -- which is what keeps the gate's live authority at B1, as R-11 states."""
+        harness, _ = self.started_harness()
+
+        self.assertFalse(decision_gate.declares_gate_result("# Worker Result\n\nSTATUS: COMPLETE\n"))
+        harness._record_decision_from_attempt(
+            phase="implementation",
+            attempt=self.attempt(body="# Worker Result\n\nSTATUS: COMPLETE\n"),
+        )
+
+        self.assertEqual(len(self.ledger()), 1)
+        self.assertIsNone(harness._last_settled)
+
+    def test_a_declared_but_broken_body_poisons_the_next_boundary(self) -> None:
+        """The fail-closed direction: a declaration that does not parse publishes no
+        record AND advances the binding expectation, so the next B1 refuses."""
+        harness, _ = self.started_harness()
+        broken = (
+            "# Worker Result\n\nSTATUS: COMPLETE\n"
+            f"{decision_gate.GATE_STATE_FIELD}: CLEAR\n"
+        )
+
+        state, reason = harness._record_decision_from_attempt(
+            phase="implementation",
+            attempt=self.attempt(body=broken),
+        )
+
+        self.assertEqual(state, decision_gate.INPUT_DEFECT_STATE)
+        self.assertEqual(reason, decision_gate.GATE_INPUT_MISSING)
+        self.assertEqual(len(self.ledger()), 1)
+        self.assertEqual(harness._last_settled, (harness.run_id, "implementation", 1))
+        with self.assertRaises(orca_runtime_harness.DecisionGateRefused) as caught:
+            harness.run_existing_task(
+                "worker", 2, "complete", "task_next", phase="implementation"
+            )
+        self.assertEqual(caught.exception.reason, decision_gate.GATE_INPUT_UNBOUND)
 
 
 if __name__ == "__main__":

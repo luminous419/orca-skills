@@ -9,6 +9,12 @@ from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
 import run_logging
+from decision_gate import (
+    BLOCKING_STATES,
+    BOUNDARIES,
+    DECISION_STATES,
+    GATE_STATE_FIELD,
+)
 from decision_policy import (
     AXIS_TOKENS,
     CANONICAL_INDEPENDENT_AXES,
@@ -726,6 +732,74 @@ DECISION_RECORD_OPTIONALITY_ANCHOR = (
     "optional section이다. 없어도 계약 위반이 아니다."
 )
 DECISION_RECORD_TEMPLATE_ANCHOR = "## Decision Record (optional)"
+
+# ---- OS-29: the tenth orchestration-only anchor contract -------------------------
+# The SHARED `decision_policy` block owns every decision SEMANTIC -- the four states,
+# their entry clauses, the closed reason codes and the required evidence -- and it is
+# at its documented line budget, which is one reason this block exists at all. What
+# this block owns is strictly the Orca LIFECYCLE half: where the gate runs, what it
+# reads, where the terminal is recorded, whether a dispatch site is added, how the
+# correction counter behaves, and whether resume exists. None of its keys redefines a
+# state's meaning, so the two skills' decision semantics cannot drift through it.
+DECISION_GATE_CONTRACT_HEADING = "#### Decision gate contract"
+DECISION_GATE_CONTRACT_BLOCK_PATTERN = re.compile(
+    r"####\s*Decision gate contract\s*\n(?P<body>.*?)```text\n(?P<values>.*?)\n```",
+    re.DOTALL,
+)
+DECISION_GATE_CONTRACT: dict[str, tuple[str, ...]] = {
+    "DECISION_GATE_BOUNDARIES": (
+        "before_phase_entry",
+        "after_worker_result",
+        "after_reviewer_result",
+    ),
+    "DECISION_GATE_INPUT": ("explicit_machine_readable_record_never_absence",),
+    "DECISION_GATE_AXIS_ORDER": ("decision_axis_then_quality_axis",),
+    "DECISION_GATE_LEDGER": ("artifact_root_decision_ledger_append_only",),
+    "DECISION_GATE_LEDGER_ENTRY_SEQUENCE": ("zero",),
+    "DECISION_GATE_LEDGER_PRODUCER": ("coordinator_at_run_open",),
+    "DECISION_GATE_ADMISSIBILITY": (
+        "non_empty",
+        "single_entry_declaration",
+        "schema_supported",
+        "bound_head",
+        "declaration_recomputed",
+        "no_unresolved_open_item",
+    ),
+    "DECISION_GATE_BLOCKING_STATES": ("needs_input", "conflict"),
+    "DECISION_GATE_TERMINAL_STATUS": ("blocked",),
+    "DECISION_GATE_LOW_TERMINAL_BOUNDARY": ("after_worker_result",),
+    "DECISION_GATE_MEDIUM_HIGH_TERMINAL_BOUNDARY": ("after_reviewer_result",),
+    "DECISION_GATE_REVIEWER_PARTICIPATION": (
+        "already_scheduled_reviewer_in_verification_mode",
+    ),
+    "DECISION_GATE_NEW_DISPATCH_SITES": ("none",),
+    "DECISION_GATE_ITERATION_ACCOUNTING": (
+        "decision_block_consumes_no_correction_iteration",
+    ),
+    "DECISION_GATE_DOWNGRADE_AUTHORITY": ("policy_contract_transition_rule_only",),
+    "DECISION_GATE_RISK_INDEPENDENCE": (
+        "identical_terminal_outcome_at_every_risk_level",
+    ),
+    "DECISION_GATE_RESUME": ("not_implemented_terminal_only",),
+    "DECISION_GATE_AUTHORITY": ("machine_record_over_markdown_summary",),
+}
+DECISION_GATE_CONTRACT_MAX_LINES = 20
+# The decision SEMANTICS both skills must state identically. Byte-equality between
+# the two files would catch a sentence changed in ONE of them; it cannot catch a
+# sentence deleted from BOTH. These anchors can -- the same reason
+# DECISION_POLICY_SKILL_PROSE_ANCHORS exists.
+MIRRORED_DECISION_SEMANTICS_ANCHORS = (
+    "gate 경계에서 decision 결과는 필수이며 명시적이다.",
+    "CLEAR로 단언되어야 하며 기록의 부재로 추정될",
+    "기계가 읽는 record가 authority이고 Markdown 요약은 사람을 위한",
+)
+# The result-contract line itself, mirrored into both SKILL.md files and into every
+# templates/*.md and reviews/common.md. Built from decision_gate's own constants, so
+# renaming the field in code without editing the documents is a validation failure
+# rather than a silent divergence between the contract and its implementation.
+DECISION_GATE_RESULT_CONTRACT_ANCHOR = (
+    f"{GATE_STATE_FIELD}: " + " | ".join(DECISION_STATES)
+)
 
 RISK_SECTION_HEADING = "## 8. Phase Sequence Contract"
 RISK_SECTION_END = "\n## 9."
@@ -2250,6 +2324,128 @@ def validate_agent_profile_contract(validation: Validation) -> None:
         )
 
 
+def validate_decision_gate_contract(validation: Validation) -> None:
+    """OS-29: the orchestration-only gate contract, and the semantics both skills share.
+
+    Three drift directions, all of which must FAIL, and each of which the other two
+    cannot catch:
+
+    (a) a mirrored semantics sentence changed or deleted in ONE skill;
+    (b) the same sentence deleted from BOTH -- which byte-equality between the two
+        files would report as agreement;
+    (c) the orchestration-only lifecycle block copied INTO the loop skill, which is
+        the drift that would make the loop claim an Orca lifecycle it does not have.
+
+    Reuses parse_anchor_contract rather than adding an eleventh parser, on the
+    condition that function's own docstring names: this block has no test coupling of
+    its own.
+    """
+    skill_path = LIFECYCLE_SKILL_DIR / "SKILL.md"
+    loop_dir = next(d for d in SKILL_DIRS if d != LIFECYCLE_SKILL_DIR)
+    loop_path = loop_dir / "SKILL.md"
+    if not skill_path.is_file() or not loop_path.is_file():
+        return
+    skill_text = skill_path.read_text(encoding="utf-8")
+    loop_text = loop_path.read_text(encoding="utf-8")
+
+    parsed = parse_anchor_contract(skill_text, DECISION_GATE_CONTRACT_BLOCK_PATTERN)
+    validation.check(
+        parsed is not None,
+        f"{LIFECYCLE_SKILL_DIR.name}: decision gate contract block is missing or "
+        "malformed",
+    )
+    if parsed is not None:
+        validation.check(
+            set(parsed) == set(DECISION_GATE_CONTRACT),
+            f"{LIFECYCLE_SKILL_DIR.name}: decision gate contract keys drifted",
+        )
+        validation.check(
+            parsed == DECISION_GATE_CONTRACT,
+            f"{LIFECYCLE_SKILL_DIR.name}: decision gate contract values drifted",
+        )
+        validation.check(
+            0
+            < anchor_contract_block_lines(
+                skill_text, DECISION_GATE_CONTRACT_BLOCK_PATTERN
+            )
+            <= DECISION_GATE_CONTRACT_MAX_LINES,
+            f"{LIFECYCLE_SKILL_DIR.name}: decision gate contract block exceeds "
+            f"{DECISION_GATE_CONTRACT_MAX_LINES} lines",
+        )
+        # Internal consistency: the block's own vocabulary must be the code's. A
+        # block that named a boundary or a blocking state the gate does not
+        # implement would be a contract for something else.
+        validation.check(
+            tuple(
+                value.upper() for value in parsed["DECISION_GATE_BLOCKING_STATES"]
+            )
+            == tuple(BLOCKING_STATES),
+            "DECISION_GATE_BLOCKING_STATES must name exactly the blocking states",
+        )
+        validation.check(
+            len(parsed["DECISION_GATE_BOUNDARIES"]) == len(BOUNDARIES),
+            "DECISION_GATE_BOUNDARIES must name one value per gate boundary",
+        )
+
+    # (a) + (b): the mirrored semantics, checked in BOTH skills by anchor.
+    for anchor in MIRRORED_DECISION_SEMANTICS_ANCHORS:
+        for skill_dir, text in (
+            (LIFECYCLE_SKILL_DIR, skill_text),
+            (loop_dir, loop_text),
+        ):
+            validation.check(
+                anchor in text,
+                f"{skill_dir.name}: missing mirrored decision semantics anchor "
+                f"{anchor!r}",
+            )
+
+    # (c): the lifecycle block is orchestration-only and must stay that way.
+    validation.check(
+        DECISION_GATE_CONTRACT_HEADING in skill_text,
+        f"{LIFECYCLE_SKILL_DIR.name}: missing {DECISION_GATE_CONTRACT_HEADING!r}",
+    )
+    validation.check(
+        DECISION_GATE_CONTRACT_HEADING not in loop_text,
+        f"{loop_dir.name}: carries the orchestration-only "
+        f"{DECISION_GATE_CONTRACT_HEADING!r}; decision SEMANTICS are mirrored, Orca "
+        "lifecycle is not",
+    )
+    validation.check(
+        parse_anchor_contract(loop_text, DECISION_GATE_CONTRACT_BLOCK_PATTERN) is None,
+        f"{loop_dir.name}: must carry no decision gate anchor contract block",
+    )
+
+    # The result contract itself, in both skills and in every routed document.
+    for skill_dir, text in ((LIFECYCLE_SKILL_DIR, skill_text), (loop_dir, loop_text)):
+        validation.check(
+            text.count(DECISION_GATE_RESULT_CONTRACT_ANCHOR) >= 2,
+            f"{skill_dir.name}: the Worker and Reviewer result contracts must both "
+            f"declare {DECISION_GATE_RESULT_CONTRACT_ANCHOR!r}",
+        )
+    for skill_dir in SKILL_DIRS:
+        for relative in (
+            *(f"templates/{phase.casefold()}.md" for phase in PHASE_ROUTES),
+            "reviews/common.md",
+        ):
+            path = skill_dir / relative
+            if not path.is_file():
+                continue
+            document = path.read_text(encoding="utf-8")
+            validation.check(
+                DECISION_GATE_RESULT_CONTRACT_ANCHOR in document,
+                f"{skill_dir.name}: {relative} is missing the decision gate result "
+                "contract",
+            )
+            # The gate result is REQUIRED and the narrative section stays OPTIONAL.
+            # Checked together, in one place, because the whole risk of adding the
+            # first is that it quietly makes the second mandatory.
+            validation.check(
+                DECISION_RECORD_OPTIONALITY_ANCHOR in document,
+                f"{skill_dir.name}: {relative} lost the decision record optionality "
+                "sentence while gaining the gate result contract",
+            )
+
+
 def validate_decision_policy_contract(validation: Validation) -> None:
     """OS-28 checks C1-C14. Imports the loader rather than re-parsing the block, the
     same dependency direction validate_risk_profile_contract has toward
@@ -2841,6 +3037,7 @@ def main() -> int:
     validate_risk_profile_contract(validation)
     validate_agent_profile_contract(validation)
     validate_decision_policy_contract(validation)
+    validate_decision_gate_contract(validation)
     validate_phase_gate_neutrality(validation)
     validate_run_logging_contract(validation)
     validate_run_logging_tool_parity(validation)

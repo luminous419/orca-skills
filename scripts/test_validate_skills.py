@@ -63,6 +63,11 @@ class ValidatorRegressionTests(unittest.TestCase):
             # trap as the OS-4 note above -- omitting it here turns every
             # validator regression test into an import crash with empty stdout.
             "decision_policy.py",
+            # OS-29: validate_skills imports decision_gate for the gate field name,
+            # the four states and the blocking pair, so the copied tree needs it for
+            # the same reason -- an omitted dependency here is an import crash with
+            # empty stdout, not the named failure the test is asserting on.
+            "decision_gate.py",
         ):
             shutil.copy2(SOURCE_ROOT / "scripts" / filename, scripts_dir)
 
@@ -100,6 +105,92 @@ class ValidatorRegressionTests(unittest.TestCase):
         result = self.run_validator()
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn(fragment, result.stdout)
+
+    # ---- OS-29 scenario 14: decision-semantics drift between the two skills ------
+    # Three directions, each of which the other two cannot catch, and each with the
+    # unmutated pair as its control (test_valid_repository_passes above).
+
+    def test_decision_gate_contract_removed_fails(self) -> None:
+        # The HEADING, not the prose reference to it -- edit_skills replaces the
+        # first occurrence and the Decision Policy section mentions the block by name.
+        self.edit_skills(
+            "\n#### Decision gate contract\n",
+            "\n#### Decision gate contract removed\n",
+            "orca-worker-reviewer-orchestration",
+        )
+        self.assert_validator_fails_with(
+            "decision gate contract block is missing or malformed"
+        )
+
+    def test_decision_gate_contract_value_drift_fails(self) -> None:
+        self.edit_skills(
+            "DECISION_GATE_ITERATION_ACCOUNTING = "
+            "decision_block_consumes_no_correction_iteration",
+            "DECISION_GATE_ITERATION_ACCOUNTING = "
+            "decision_block_consumes_one_correction_iteration",
+            "orca-worker-reviewer-orchestration",
+        )
+        self.assert_validator_fails_with("decision gate contract values drifted")
+
+    def test_os29_mirrored_semantics_changed_in_one_skill_fails(self) -> None:
+        """(a) drift in ONE skill: the two files disagree."""
+        self.edit_skills(
+            "gate 경계에서 decision 결과는 필수이며 명시적이다.",
+            "gate 경계에서 decision 결과는 있으면 좋다.",
+            "orca-worker-reviewer-loop",
+        )
+        self.assert_validator_fails_with("missing mirrored decision semantics anchor")
+
+    def test_os29_mirrored_semantics_deleted_from_both_skills_fails(self) -> None:
+        """(b) deleted from BOTH: byte-equality between the two files would call this
+        agreement. The anchor SET is what catches it."""
+        self.edit_skills(
+            "기계가 읽는 record가 authority이고 Markdown 요약은 사람을 위한",
+            "기계와 사람은 각자 알아서 읽는다",
+        )
+        self.assert_validator_fails_with("missing mirrored decision semantics anchor")
+
+    def test_the_orchestration_only_gate_block_leaking_into_the_loop_fails(self) -> None:
+        """(c) the Orca lifecycle block copied into the loop skill, which has no such
+        lifecycle. Decision SEMANTICS mirror; lifecycle does not."""
+        loop = self.repo_root / "orca-worker-reviewer-loop" / "SKILL.md"
+        source = self.repo_root / "orca-worker-reviewer-orchestration" / "SKILL.md"
+        block_start = source.read_text(encoding="utf-8").index(
+            "\n#### Decision gate contract\n"
+        ) + 1
+        block = source.read_text(encoding="utf-8")[block_start:]
+        block = block[: block.index("\n```", block.index("```text")) + 4]
+
+        loop.write_text(
+            loop.read_text(encoding="utf-8") + "\n" + block + "\n", encoding="utf-8"
+        )
+
+        self.assert_validator_fails_with("carries the orchestration-only")
+
+    def test_the_gate_result_contract_removed_from_a_template_fails(self) -> None:
+        path = self.repo_root / "orca-worker-reviewer-loop" / "templates" / "plan.md"
+        text = path.read_text(encoding="utf-8")
+        anchor = "DECISION_GATE_STATE: CLEAR | ASSUMPTION_ALLOWED | NEEDS_INPUT | CONFLICT"
+        self.assertIn(anchor, text)
+        path.write_text(text.replace(anchor, "DECISION_STATE_ONLY", 1), encoding="utf-8")
+
+        self.assert_validator_fails_with("is missing the decision gate result contract")
+
+    def test_the_optionality_sentence_removed_beside_the_gate_result_fails(self) -> None:
+        """The whole risk of adding a REQUIRED gate result is that it quietly makes
+        the OPTIONAL narrative section mandatory. Both are checked in one place."""
+        path = (
+            self.repo_root
+            / "orca-worker-reviewer-orchestration" / "reviews" / "common.md"
+        )
+        text = path.read_text(encoding="utf-8")
+        anchor = "optional section이다. 없어도 계약 위반이 아니다."
+        self.assertIn(anchor, text)
+        path.write_text(text.replace(anchor, "필수 section이다.", 1), encoding="utf-8")
+
+        self.assert_validator_fails_with(
+            "lost the decision record optionality sentence"
+        )
 
     def test_decision_policy_contract_removed_fails(self) -> None:
         self.edit_skills('"decision_policy": {', '"decision_policy_removed": {')
