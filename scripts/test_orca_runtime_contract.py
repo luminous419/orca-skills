@@ -8579,6 +8579,31 @@ class DecisionGateLiveDispatchTests(unittest.TestCase):
             decision_gate.GATE_INPUT_UNBOUND,
         )
 
+    def test_a_phantom_declared_item_is_not_laundered_into_a_block(self) -> None:
+        """A6 with an OVERSTATED declaration is a producer defect even though a real
+        block exists beside it: `refused_with == A6` proves the structural clauses
+        passed, not that the mismatch is the ordinary understatement."""
+        harness, _ = self.started_harness()
+        self._blocking_head(harness)
+        self._rewrite_run_entry(harness, prior_open_decision_items=["phantom"])
+
+        self.assertEqual(
+            self.assert_defect_is_not_laundered(harness),
+            decision_gate.DECLARATION_DISAGREES_WITH_LEDGER,
+        )
+
+    def test_two_open_items_are_not_laundered_into_a_block(self) -> None:
+        """The A6 exception requires the ENTIRE discrepancy to be one bound item, so
+        the terminal reclassification may not be looser than the admission."""
+        harness, _ = self.started_harness()
+        self._blocking_head(harness)
+        self._copy_record(harness, 1, 2)  # a second, unrelated open item
+
+        self.assertEqual(
+            self.assert_defect_is_not_laundered(harness),
+            decision_gate.DECLARATION_DISAGREES_WITH_LEDGER,
+        )
+
     # ================= external review MAJOR =====================================
     # `source_binding` is one of the thirteen required fields and is what makes a
     # ledger entry a BOUND entry. It used to be a setdefault, so an agent that put

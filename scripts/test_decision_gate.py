@@ -879,6 +879,7 @@ class RiskIndependenceTests(PolicyMixin):
         "decision_columns",
         "ledger_key",
         "unresolved_block_reason",
+        "declaration_understatement_defect",
     )
     AXIS_TOKENS = ("risk", "profile", "quality_profile", "agent_profile", "severity")
 
@@ -1386,6 +1387,69 @@ class UnresolvedBlockReasonTests(PolicyMixin):
                         self.policy, records, refused_with=refused_with
                     )
                 )
+
+    def test_an_overstated_declaration_stays_a_producer_defect(self) -> None:
+        """A6 exists to name a declaration that disagrees with the ledger. A block
+        alongside a PHANTOM claim is still that defect: `refused_with == A6` proves
+        the structural clauses passed, not that the mismatch is the ordinary
+        understatement (external re-review MAJOR)."""
+        records = [
+            self.entry(prior_open_decision_items=["phantom"]),
+            self.blocking("worker_needs_input"),
+        ]
+
+        self.assertIsNone(
+            decision_gate.unresolved_block_reason(
+                self.policy, records, refused_with=self.A6
+            )
+        )
+
+    def test_multiple_unrelated_open_items_stay_a_producer_defect(self) -> None:
+        """The verification exception requires the ENTIRE discrepancy to be one bound
+        item; a terminal reclassification may not be looser than the admission."""
+        records = [
+            self.entry(),
+            self.blocking("worker_needs_input", sequence=1),
+            self.blocking("worker_conflict", sequence=2),
+        ]
+
+        self.assertIsNone(
+            decision_gate.unresolved_block_reason(
+                self.policy, records, refused_with=self.A6
+            )
+        )
+
+    def test_the_ordinary_single_understated_block_is_still_reclassified(self) -> None:
+        """The positive control for the two negatives above: the permitted shape --
+        one open item, it is the head, nothing overstated -- still reclassifies."""
+        records = [self.entry(), self.blocking("worker_needs_input")]
+
+        self.assertEqual(
+            decision_gate.unresolved_block_reason(
+                self.policy, records, refused_with=self.A6
+            ),
+            "DECISION_BLOCKED:NEEDS_INPUT:blast_radius_beyond_scope",
+        )
+
+    def test_the_shape_predicate_names_each_rejected_shape(self) -> None:
+        head = self.blocking("worker_needs_input")
+        key = decision_gate.ledger_key(head)
+
+        self.assertIsNone(
+            decision_gate.declaration_understatement_defect(set(), {key}, head)
+        )
+        self.assertIn(
+            "not open",
+            decision_gate.declaration_understatement_defect(
+                {"phantom"}, {key}, head
+            ),
+        )
+        self.assertIn(
+            "not exactly the head",
+            decision_gate.declaration_understatement_defect(
+                set(), {key, "other"}, head
+            ),
+        )
 
     def test_it_admits_nothing_and_takes_no_risk_parameter(self) -> None:
         """It reclassifies an existing refusal; it is never a second admission path,

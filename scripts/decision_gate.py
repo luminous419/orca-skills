@@ -510,6 +510,39 @@ def open_items(policy: DecisionPolicy, records: Sequence[Mapping[str, Any]]) -> 
     return set(opened) - resolved
 
 
+def declaration_understatement_defect(
+    declared: set[str], recomputed: set[str], head: Mapping[str, Any]
+) -> str | None:
+    """Is this A6 mismatch the ONE permitted shape? None when it is.
+
+    A6 fires whenever the run-entry declaration disagrees with the recomputed open
+    set. Exactly one disagreement is ordinary rather than a producer defect: the
+    declaration is written once at run open, so it UNDERSTATES the single item this
+    round opened. Everything else is the defect A6 exists to name -- a declaration
+    that OVERSTATES the ledger by claiming an item that is not open, a phantom or
+    stale entry alongside a real block, or several unrelated open items.
+
+    Two conjuncts, and both are needed (external re-review MAJOR):
+
+    1. `declared <= recomputed` -- nothing is claimed that is not actually open;
+    2. the open set is EXACTLY the head -- one item, and it is the record this
+       round settled.
+
+    Conjunct 2 is the same condition `verification_admission_defect` states as its
+    own conjunct 2, which is why A6's admission and the terminal reclassification
+    can share this predicate instead of drifting into two readings of "understates".
+    """
+    overstated = declared - recomputed
+    if overstated:
+        return (
+            f"the declaration claims {sorted(overstated)}, which is not open"
+        )
+    key = ledger_key(head)
+    if recomputed != {key}:
+        return f"the open items {sorted(recomputed)} are not exactly the head {key!r}"
+    return None
+
+
 def verification_admission_defect(
     records: Sequence[Mapping[str, Any]],
     head: Mapping[str, Any],
@@ -686,7 +719,7 @@ def admit_head(
         # defect A6 exists to name.
         admissible = (
             verification is not None
-            and declared <= recomputed
+            and declaration_understatement_defect(declared, recomputed, head) is None
             and verification_admission_defect(
                 ordered, head, recomputed, verification, run_id=run_id
             )
@@ -776,11 +809,21 @@ def unresolved_block_reason(
             validate_ledger_record(policy, record)
         except GateRefusal:
             return None
-    still_open = open_items(policy, ordered)
-    if not still_open:
+    run_entry = next((r for r in ordered if r.get("sequence") == 0), None)
+    if run_entry is None:
         return None
-    blocker = next(record for record in ordered if ledger_key(record) in still_open)
-    return block_reason(str(blocker.get("state")), blocker.get("reason_code"))
+    head = ordered[-1]
+    declared = set(run_entry.get("prior_open_decision_items") or ())
+    recomputed = open_items(
+        policy, [record for record in ordered if record is not run_entry]
+    )
+    # The SAME predicate A6 admits on. `refused_with == A6` proved the ledger-level
+    # clauses passed; this proves the mismatch is the ordinary understatement rather
+    # than an overstated, phantom or multi-item declaration, each of which stays the
+    # producer defect A6 named (external re-review MAJOR).
+    if declaration_understatement_defect(declared, recomputed, head) is not None:
+        return None
+    return block_reason(str(head.get("state")), head.get("reason_code"))
 
 
 def verification_binding_defect(
