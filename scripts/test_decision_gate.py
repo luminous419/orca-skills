@@ -881,6 +881,8 @@ class RiskIndependenceTests(PolicyMixin):
         "unresolved_block_reason",
         "declaration_understatement_defect",
         "verification_record_defect",
+        "record_identity",
+        "record_identity_defect",
     )
     AXIS_TOKENS = ("risk", "profile", "quality_profile", "agent_profile", "severity")
 
@@ -1451,6 +1453,59 @@ class UnresolvedBlockReasonTests(PolicyMixin):
                 set(), {key, "other"}, head
             ),
         )
+
+    def test_a_forged_direct_terminal_identity_is_rejected_centrally(self) -> None:
+        """Shape A's counterpart of the shape-B identity finding. A B2 record wearing
+        a reviewer identity, or a B3 wearing a worker one, is schema-valid field by
+        field and used to be laundered into a normal DECISION_BLOCKED terminal. It is
+        now refused by validate_ledger_record(), so no classifier ever sees it."""
+        for label, fields in (
+            ("B2 with reviewer identity", {"source": "reviewer", "role": "reviewer"}),
+            ("B3 with worker identity",
+             {"boundary": "B3", "source": "worker", "role": "worker"}),
+            ("mixed source", {"source": "reviewer"}),
+            ("mixed role", {"role": "reviewer"}),
+        ):
+            with self.subTest(identity=label):
+                forged = self.blocking("worker_needs_input")
+                forged.update(fields)
+
+                self.assertIsNotNone(decision_gate.record_identity_defect(forged))
+                with self.assertRaises(decision_gate.GateRefusal) as caught:
+                    decision_gate.validate_ledger_record(self.policy, forged)
+                self.assertEqual(
+                    caught.exception.reason, decision_gate.GATE_INPUT_MALFORMED
+                )
+                # ...and the classifier therefore refuses to name it a block.
+                self.assertIsNone(
+                    decision_gate.unresolved_block_reason(
+                        self.policy, [self.entry(), forged], refused_with=self.A6
+                    )
+                )
+
+    def test_only_a_reviewer_b3_record_may_claim_a_verification(self) -> None:
+        """`verifies` is a claim a Worker never makes."""
+        worker = self.blocking("worker_needs_input")
+        worker["verifies"] = {
+            "run": RUN, "phase": "implementation", "iteration": 1,
+            "worker_record_key": "k",
+        }
+
+        defect = decision_gate.record_identity_defect(worker)
+
+        self.assertIsNotNone(defect)
+        self.assertIn("verifies", defect)
+
+    def test_the_three_legitimate_identities_are_accepted(self) -> None:
+        """The control: central validation narrows the schema, it does not break the
+        identities the publisher actually stamps."""
+        self.assertIsNone(decision_gate.record_identity_defect(self.entry()))
+        self.assertIsNone(
+            decision_gate.record_identity_defect(self.blocking("worker_needs_input"))
+        )
+        reviewer = self.blocking("worker_needs_input")
+        reviewer.update(boundary="B3", source="reviewer", role="reviewer")
+        self.assertIsNone(decision_gate.record_identity_defect(reviewer))
 
     def test_it_admits_nothing_and_takes_no_risk_parameter(self) -> None:
         """It reclassifies an existing refusal; it is never a second admission path,

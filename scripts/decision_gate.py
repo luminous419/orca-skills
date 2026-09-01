@@ -73,6 +73,19 @@ RUN_ENTRY_SOURCE = "coordinator:run_entry"
 AGENT_SOURCES: tuple[str, ...] = ("worker", "reviewer")
 SOURCES: tuple[str, ...] = (RUN_ENTRY_SOURCE,) + AGENT_SOURCES
 ROLES: tuple[str, ...] = ("coordinator", "worker", "reviewer")
+# `boundary`, `source` and `role` each have their own enum above, but the three are
+# not independent: only three combinations are meaningful, and A4 validated them
+# only field by field, so a B2 record claiming a reviewer identity (or a B3 claiming
+# a worker one) stayed schema-valid and could be laundered into a normal terminal
+# (external re-review MAJOR). The relationship is part of the persisted schema and
+# is enforced centrally, in validate_ledger_record().
+AGENT_TERMINAL_IDENTITIES: tuple[tuple[str, str, str], ...] = (
+    ("B2", "worker", "worker"),
+    ("B3", "reviewer", "reviewer"),
+)
+RECORD_IDENTITIES: tuple[tuple[str, str, str], ...] = (
+    ("B1", RUN_ENTRY_SOURCE, "coordinator"),
+) + AGENT_TERMINAL_IDENTITIES
 
 # The gate's own field name. NOT `DECISION_STATE`: reviews/common.md already emits
 # that inside the OPTIONAL narrative `## Decision Record` section, and reusing the
@@ -319,6 +332,37 @@ def validate_gate_record(policy: DecisionPolicy, record: Any) -> None:
         raise GateRefusal(GATE_INPUT_MALFORMED, str(exc)) from exc
 
 
+def record_identity(record: Mapping[str, Any]) -> tuple[Any, Any, Any]:
+    """The (boundary, source, role) triple this record claims to be."""
+    return (record.get("boundary"), record.get("source"), record.get("role"))
+
+
+def record_identity_defect(record: Mapping[str, Any]) -> str | None:
+    """Do this record's boundary, source and role form a real identity? A4-i.
+
+    Three combinations exist and no others: the coordinator's run entry, a Worker
+    result, and a Reviewer result. `verifies` is a claim only the Reviewer B3 form
+    may make -- a Worker record that carries one is asserting it verified something,
+    which no Worker ever does.
+
+    Called from validate_ledger_record(), so EVERY consumer of a persisted ledger
+    inherits it -- admit_head's A4, both terminal classifiers, and anything added
+    later. That is deliberate: the previous two findings were the same relational
+    gap patched at one call site at a time (external re-review MAJOR).
+    """
+    identity = record_identity(record)
+    if identity not in RECORD_IDENTITIES:
+        return (
+            f"boundary/source/role {identity} is not one of "
+            f"{[list(i) for i in RECORD_IDENTITIES]}"
+        )
+    if record.get("verifies") is not None and identity not in (
+        ("B3", "reviewer", "reviewer"),
+    ):
+        return f"only a Reviewer B3 record may carry `verifies`, not {identity}"
+    return None
+
+
 def validate_ledger_record(policy: DecisionPolicy, record: Any) -> None:
     """A4-i / A4-ii / A4-iii plus the closed field set, for ONE ledger record.
 
@@ -386,6 +430,9 @@ def validate_ledger_record(policy: DecisionPolicy, record: Any) -> None:
                 f"{key} verifies must be null or carry exactly {list(VERIFIES_FIELDS)} "
                 "(A4-i)",
             )
+    identity_defect = record_identity_defect(record)
+    if identity_defect is not None:
+        raise GateRefusal(GATE_INPUT_MALFORMED, f"{key} {identity_defect} (A4-i)")
     try:
         validate_record(policy, record)
     except DecisionPolicyError as exc:
@@ -831,6 +878,10 @@ def unresolved_block_reason(
     # B3 that discovered the block itself -- the Final Review's own decision. Both
     # are A6's admission shape: the declaration understates exactly this record.
     if recomputed == {head_key}:
+        # Central validation already proved the head is ONE of the three identities;
+        # a terminal is specifically one of the two AGENT forms, never a run entry.
+        if record_identity(head) not in AGENT_TERMINAL_IDENTITIES:
+            return None
         return block_reason(str(head.get("state")), head.get("reason_code"))
 
     # ---- Terminal shape B: the head is the ONE bound B3 verification of the sole

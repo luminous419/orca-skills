@@ -8726,10 +8726,53 @@ class DecisionGateLiveDispatchTests(unittest.TestCase):
                     self.ledger()[-1]["verifies"]["worker_record_key"], worker_key
                 )
 
+                # Refused at A4 now, not at A6: record_identity_defect() runs inside
+                # validate_ledger_record(), so a forged identity never reaches the
+                # classifier at all. Still an input defect, still never a block --
+                # the central check subsumes the shape-local one rather than
+                # replacing its guarantee.
                 self.assertEqual(
                     self.assert_defect_is_not_laundered(harness),
-                    decision_gate.DECLARATION_DISAGREES_WITH_LEDGER,
+                    decision_gate.GATE_INPUT_MALFORMED,
                 )
+
+    def test_a_forged_direct_terminal_identity_is_not_reclassified(self) -> None:
+        """Shape A on the completion path. The blocking head is the sole open item and
+        would otherwise be named a normal terminal; a forged boundary/source/role
+        combination must stay an input defect (external re-review MAJOR)."""
+        for label, fields in (
+            ("B2 with reviewer identity", {"source": "reviewer", "role": "reviewer"}),
+            ("B3 with worker identity",
+             {"boundary": "B3", "source": "worker", "role": "worker"}),
+        ):
+            with self.subTest(identity=label):
+                self.tearDown()
+                self.setUp()
+                harness, recorder = self.verification_harness()
+                self.settle_blocking_worker(harness, recorder)
+                path = self._ledger_dir(harness) / "000001" / "record.json"
+                record = json.loads(path.read_text(encoding="utf-8"))
+                record.update(fields)
+                path.write_text(
+                    json.dumps(record, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+
+                self.assertEqual(
+                    self.assert_defect_is_not_laundered(harness),
+                    decision_gate.GATE_INPUT_MALFORMED,
+                )
+
+    def test_a_valid_direct_worker_terminal_still_completes_as_a_block(self) -> None:
+        """The control for the two forgeries above: an untouched Worker B2 terminal
+        is still named DECISION_BLOCKED, so the check narrows nothing legitimate."""
+        harness, recorder = self.verification_harness()
+        self.settle_blocking_worker(harness, recorder)
+
+        self.assertEqual(
+            self.assert_completion_refused(harness),
+            decision_gate.block_reason("NEEDS_INPUT", "blast_radius_beyond_scope"),
+        )
 
     def test_the_verification_identity_predicate_names_each_wrong_field(self) -> None:
         good = {"boundary": "B3", "source": "reviewer", "role": "reviewer"}
