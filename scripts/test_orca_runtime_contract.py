@@ -8604,6 +8604,112 @@ class DecisionGateLiveDispatchTests(unittest.TestCase):
             decision_gate.DECLARATION_DISAGREES_WITH_LEDGER,
         )
 
+    # ---- external re-review MAJOR: completion AFTER the permitted verification ----
+    # The real MEDIUM/HIGH sequence is Worker B2 block -> Reviewer B3 record with
+    # `verifies` -> completion. At that point the ledger HEAD is the Reviewer record
+    # while open_items() deliberately keeps the WORKER item open, because a
+    # verification never resolves anything. A6's admission predicate is written for
+    # the state BEFORE that dispatch, so reusing it alone made MEDIUM/HIGH fall back
+    # to DECLARATION_DISAGREES_WITH_LEDGER while LOW kept its DECISION_BLOCKED --
+    # risk-dependent terminal provenance, which the contract forbids.
+
+    def complete_after_verification(self, reviewer_state: str) -> str:
+        """Drive Worker block -> bound Reviewer verification -> completion.
+
+        Returns the terminal reason the completion boundary recorded.
+        """
+        harness, recorder = self.verification_harness()
+        worker_key = self.settle_blocking_worker(harness, recorder)
+        recorder.body = self.reviewer_body(reviewer_state, worker_key)
+        harness.run_existing_task(
+            "reviewer", 1, "fail", "task_g",
+            phase="implementation", verifies=worker_key,
+        )
+        # The head really is the Reviewer record, and the WORKER item is what is open.
+        records = self.ledger()
+        self.assertEqual(records[-1]["boundary"], "B3")
+        self.assertEqual(records[-1]["verifies"]["worker_record_key"], worker_key)
+
+        return self.assert_completion_refused(harness)
+
+    def test_completion_after_a_confirming_verification_keeps_the_low_terminal(
+        self,
+    ) -> None:
+        """P6b row 4. A confirmation carries the WORKER's own state and code -- the
+        LOW terminal byte for byte, which is the whole content of `risk never
+        expands decision authority`."""
+        reason = self.complete_after_verification("NEEDS_INPUT")
+
+        self.assertEqual(
+            reason,
+            decision_gate.block_reason("NEEDS_INPUT", "blast_radius_beyond_scope"),
+        )
+        self.assertEqual(
+            decision_gate.decision_columns(reason),
+            ("NEEDS_INPUT", "blast_radius_beyond_scope"),
+        )
+
+    def test_completion_after_a_stricter_verification_carries_the_reviewer_terminal(
+        self,
+    ) -> None:
+        """P6b row 5. A verification may move toward MORE blocking, never away."""
+        reason = self.complete_after_verification("CONFLICT")
+
+        self.assertEqual(
+            reason,
+            decision_gate.block_reason("CONFLICT", "requirement_contradiction"),
+        )
+
+    def test_completion_after_a_rejected_downgrade_is_still_terminal(self) -> None:
+        """P6b row 6. A downgrade is decided solely by validate_transition(), and a
+        rejected one is reported as such rather than as a producer defect."""
+        reason = self.complete_after_verification("CLEAR")
+
+        self.assertEqual(reason, decision_gate.DOWNGRADE_REJECTED)
+        self.assertNotEqual(
+            reason, decision_gate.DECLARATION_DISAGREES_WITH_LEDGER
+        )
+
+    def test_the_terminal_is_identical_with_and_without_the_verification(self) -> None:
+        """The risk-independence claim, asserted directly: the LOW terminal (block is
+        the head) and the MEDIUM/HIGH terminal (head is its bound confirmation) must
+        report the SAME state and reason code."""
+        harness, _ = self.started_harness()
+        self._blocking_head(harness)
+        low = self.assert_completion_refused(harness)
+
+        self.tearDown()  # release the first run's directory before replacing it
+        self.setUp()  # a fresh artifact dir for the second run
+        high = self.complete_after_verification("NEEDS_INPUT")
+
+        self.assertEqual(low, high)
+        self.assertEqual(
+            decision_gate.decision_columns(low), decision_gate.decision_columns(high)
+        )
+
+    def test_an_unbound_verification_head_is_not_reclassified(self) -> None:
+        """The negative that keeps shape 2 narrow: a B3 head whose `verifies` does not
+        bind the open Worker item is a producer defect, not a terminal block."""
+        harness, recorder = self.verification_harness()
+        worker_key = self.settle_blocking_worker(harness, recorder)
+        recorder.body = self.reviewer_body("NEEDS_INPUT", worker_key)
+        harness.run_existing_task(
+            "reviewer", 1, "fail", "task_g",
+            phase="implementation", verifies=worker_key,
+        )
+        ledger = self._ledger_dir(harness)
+        path = ledger / "000002" / "record.json"
+        record = json.loads(path.read_text(encoding="utf-8"))
+        record["verifies"]["worker_record_key"] = "run_live_os29/design/9/B2#5"
+        path.write_text(
+            json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+
+        self.assertEqual(
+            self.assert_defect_is_not_laundered(harness),
+            decision_gate.DECLARATION_DISAGREES_WITH_LEDGER,
+        )
+
     # ================= external review MAJOR =====================================
     # `source_binding` is one of the thirteen required fields and is what makes a
     # ledger entry a BOUND entry. It used to be a setdefault, so an agent that put

@@ -817,13 +817,60 @@ def unresolved_block_reason(
     recomputed = open_items(
         policy, [record for record in ordered if record is not run_entry]
     )
-    # The SAME predicate A6 admits on. `refused_with == A6` proved the ledger-level
-    # clauses passed; this proves the mismatch is the ordinary understatement rather
-    # than an overstated, phantom or multi-item declaration, each of which stays the
-    # producer defect A6 named (external re-review MAJOR).
-    if declaration_understatement_defect(declared, recomputed, head) is not None:
+    # Shape, in the order the defects were reported by review. An OVERSTATED or
+    # phantom declaration and several unrelated open items each stay the producer
+    # defect A6 named; only a single genuinely open Worker item may be reclassified.
+    if declared - recomputed:
         return None
-    return block_reason(str(head.get("state")), head.get("reason_code"))
+    by_key = {ledger_key(record): record for record in ordered}
+    head_key = ledger_key(head)
+
+    # ---- Terminal shape A: the head IS the sole open block.
+    # Two real cases share it. A Worker B2 classification that ended the round at
+    # B2 (LOW, and MEDIUM/HIGH without the permitted verification), and a Reviewer
+    # B3 that discovered the block itself -- the Final Review's own decision. Both
+    # are A6's admission shape: the declaration understates exactly this record.
+    if recomputed == {head_key}:
+        return block_reason(str(head.get("state")), head.get("reason_code"))
+
+    # ---- Terminal shape B: the head is the ONE bound B3 verification of the sole
+    # open Worker item. After the permitted MEDIUM/HIGH verification settles the head
+    # is the Reviewer record, and open_items() deliberately keeps the WORKER item
+    # open because a verification never resolves anything. A confirming or stricter
+    # Reviewer is itself blocking, so the open set legitimately holds BOTH -- which
+    # is why shape A's "open set equals the head" cannot be reused here, and why
+    # reusing it alone made MEDIUM/HIGH lose the terminal block LOW kept
+    # (external re-review MAJOR).
+    candidates = recomputed - {head_key}
+    if len(candidates) != 1:
+        return None
+    (open_key,) = tuple(candidates)
+    if recomputed - {open_key, head_key}:
+        return None
+    blocker = by_key.get(open_key)
+    if blocker is None:
+        return None
+    if (
+        blocker.get("boundary") != "B2"
+        or blocker.get("source") != "worker"
+        or blocker.get("role") != "worker"
+    ):
+        return None
+    if verification_binding_defect(
+        GateResult(str(head.get("state", "")), head),
+        worker_key=open_key,
+        run_id=str(blocker.get("run", "")),
+        phase=str(blocker.get("phase", "")),
+        iteration=int(blocker.get("iteration", 0)),
+    ) is not None:
+        return None
+    # The SAME evaluator the B3-V settlement used, so confirmation, stricter
+    # classification and a rejected downgrade report what they reported then.
+    return evaluate_verification(
+        policy,
+        GateResult(str(blocker.get("state", "")), blocker),
+        GateResult(str(head.get("state", "")), head),
+    ).reason
 
 
 def verification_binding_defect(
