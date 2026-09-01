@@ -1010,16 +1010,23 @@ class E2EHarness:
                 # it. A6 recomputes it from every OTHER record, this one included.
                 "prior_open_decision_items": [],
                 "recorded_at": run_logging.now_iso(),
+                # External review MAJOR: this was a setdefault, so an agent that put
+                # `source_binding` in its own fenced record kept it -- an arbitrary,
+                # null, cross-run or wrong-phase binding survived into the published
+                # ledger, and validate_ledger_record() only requires the field to be
+                # PRESENT, never that it matches the round this record belongs to.
+                # Harness-owned now, exactly like `run`, `phase`, `iteration` and
+                # `recorded_at` beside it: the agent describes its DECISION, never
+                # where that decision is recorded.
+                "source_binding": phase_artifact_contract(
+                    role=role, phase=phase, run_id=self.run_id
+                ),
             }
         )
         record.setdefault("responsible_phase", phase)
         record.setdefault("evidence", {})
         record.setdefault("assumption", None)
         record.setdefault("open_item", None)
-        record.setdefault(
-            "source_binding",
-            phase_artifact_contract(role=role, phase=phase, run_id=self.run_id),
-        )
         _, sequence = run_logging.append_decision_ledger_record(
             self.run_id,
             record,

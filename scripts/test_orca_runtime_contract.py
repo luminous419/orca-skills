@@ -120,6 +120,26 @@ def gate_declaration(state: str = "CLEAR", verifies: str | None = None) -> str:
 DECLARED_DONE_BODY = "ok\n" + gate_declaration()
 
 
+def gate_declaration_with(state: str, extra: dict) -> str:
+    """`gate_declaration`, plus arbitrary fields merged into the fenced record.
+
+    `extra` is applied LAST by render_decision_gate(), so this is the strongest form
+    of the forging attempt the external review MAJOR describes: whatever the agent
+    puts in its own record is what reaches the harness.
+    """
+    return fake_worker.render_decision_gate(
+        argparse.Namespace(
+            decision_gate_state=state,
+            decision_gate_state_line_raw=None,
+            decision_gate_record_raw=None,
+            decision_gate_omit_field=False,
+            decision_gate_omit_block=False,
+        ),
+        extra,
+    )
+
+
+
 # validate_skills.py imports its siblings by top-level module name, so scripts/ must be
 # importable before it can be loaded. `unittest discover -s scripts` already arranges
 # that; this keeps the other invocation forms working too.
@@ -8325,6 +8345,176 @@ class DecisionGateLiveDispatchTests(unittest.TestCase):
         self.assertIn("worker-start", recorder.verbs)
         self.assertIn("task-create", recorder.verbs)
         self.assertTrue(attempt.terminal)
+
+    # ================= external review CRITICAL ==================================
+    # Completion is its OWN decision boundary. Before this, the decision axis was
+    # enforced only by _b1_guard(), i.e. only when a LATER dispatch existed. After
+    # the Final Review there is none, so a Final Reviewer could return quality PASS
+    # beside a blocking or unusable decision and the run was still recorded
+    # COMPLETED. Each case below must refuse COMPLETED and terminate BLOCKED.
+
+    FINAL_QUALITY_PASS = "# Review Result\n\nRESULT: PASS\nREVIEW_VERDICT: PASS\n"
+
+    def settle_final_reviewer(self, harness, body: str):
+        """Settle a Final-Review-shaped result: quality PASS beside `body`'s gate."""
+        return harness._record_decision_from_attempt(
+            event="dispatch_settled",
+            phase="implementation",
+            attempt=self.attempt(body=body, role="reviewer"),
+        )
+
+    def assert_completion_refused(self, harness) -> str:
+        self.assertNotIn("| COMPLETED |", self.orchestrator_log(harness))
+        with self.assertRaises(orca_runtime_harness.DecisionGateRefused) as caught:
+            harness.log_run_status("COMPLETED", reason="every phase gate passed")
+        log = self.orchestrator_log(harness)
+        # COMPLETED is never written, and the run is recorded BLOCKED with the reason.
+        self.assertNotIn("| COMPLETED |", log)
+        self.assertIn("| BLOCKED |", log)
+        self.assertIn(caught.exception.reason, log)
+        return caught.exception.reason
+
+    def test_quality_pass_beside_needs_input_cannot_complete_the_run(self) -> None:
+        harness, _ = self.started_harness()
+        state, _ = self.settle_final_reviewer(
+            harness, self.FINAL_QUALITY_PASS + gate_declaration("NEEDS_INPUT")
+        )
+
+        self.assertEqual(state, "NEEDS_INPUT")
+        # The blocking decision really is the published head ...
+        self.assertEqual(self.ledger()[-1]["state"], "NEEDS_INPUT")
+        # ... and completion refuses. The reason is A6's producer defect rather than
+        # A5's DECISION_BLOCKED because A6 precedes A5 and the run-entry declaration
+        # is written once at run open, permanently claiming no open items -- so the
+        # item this run itself opened makes A6 disagree from then on. Both are
+        # terminal refusals under the same closed vocabulary; what matters here is
+        # that COMPLETED is unreachable, which assert_completion_refused proves.
+        reason = self.assert_completion_refused(harness)
+        self.assertIn(reason, decision_gate.GATE_REFUSAL_REASONS)
+
+    def test_quality_pass_beside_conflict_cannot_complete_the_run(self) -> None:
+        harness, _ = self.started_harness()
+        state, _ = self.settle_final_reviewer(
+            harness, self.FINAL_QUALITY_PASS + gate_declaration("CONFLICT")
+        )
+
+        self.assertEqual(state, "CONFLICT")
+        # The blocking decision really is the published head ...
+        self.assertEqual(self.ledger()[-1]["state"], "CONFLICT")
+        # ... and completion refuses. The reason is A6's producer defect rather than
+        # A5's DECISION_BLOCKED because A6 precedes A5 and the run-entry declaration
+        # is written once at run open, permanently claiming no open items -- so the
+        # item this run itself opened makes A6 disagree from then on. Both are
+        # terminal refusals under the same closed vocabulary; what matters here is
+        # that COMPLETED is unreachable, which assert_completion_refused proves.
+        reason = self.assert_completion_refused(harness)
+        self.assertIn(reason, decision_gate.GATE_REFUSAL_REASONS)
+
+    def test_a_silent_final_result_cannot_complete_the_run(self) -> None:
+        """The missing-declaration case: nothing is published and the round is bound
+        anyway, so the head no longer binds what settled -- and completion refuses."""
+        harness, _ = self.started_harness()
+        state, _ = self.settle_final_reviewer(harness, self.FINAL_QUALITY_PASS)
+
+        self.assertEqual(state, decision_gate.INPUT_DEFECT_STATE)
+        reason = self.assert_completion_refused(harness)
+        self.assertIn(reason, decision_gate.GATE_REFUSAL_REASONS)
+
+    def test_a_malformed_ledger_head_cannot_complete_the_run(self) -> None:
+        harness, _ = self.started_harness()
+        self._rewrite_run_entry(harness, reason_code=self.DROP)
+
+        self.assertEqual(
+            self.assert_completion_refused(harness),
+            decision_gate.GATE_INPUT_MALFORMED,
+        )
+
+    def test_a_clear_final_result_still_completes_the_run(self) -> None:
+        """The control that makes the four refusals above non-vacuous: the guard
+        blocks a blocking decision, not every completion."""
+        harness, _ = self.started_harness()
+        state, _ = self.settle_final_reviewer(
+            harness, self.FINAL_QUALITY_PASS + gate_declaration("CLEAR")
+        )
+
+        self.assertEqual(state, "CLEAR")
+        harness.log_run_status("COMPLETED", reason="every phase gate passed")
+
+        self.assertIn("| COMPLETED |", self.orchestrator_log(harness))
+
+    def test_only_completed_is_gated_so_a_blocked_run_still_records_why(self) -> None:
+        """BLOCKED/ERROR/ESCALATED must stay writable with an open head, or a run
+        stopped BY the decision gate could never record that it stopped."""
+        harness, _ = self.started_harness()
+        self.settle_final_reviewer(
+            harness, self.FINAL_QUALITY_PASS + gate_declaration("CONFLICT")
+        )
+
+        for status in ("BLOCKED", "ERROR", "ESCALATED"):
+            harness.log_run_status(status, reason="unresolved user decision")
+
+        log = self.orchestrator_log(harness)
+        for status in ("BLOCKED", "ERROR", "ESCALATED"):
+            self.assertIn(f"| {status} |", log)
+
+    def test_without_the_pre_completion_gate_the_same_run_would_complete(self) -> None:
+        """NON-VACUITY control for the guard itself. With admission stubbed to accept
+        anything, the identical NEEDS_INPUT fixture DOES reach COMPLETED -- so the
+        refusals above are the guard's doing, not an artefact of the fixture."""
+        harness, _ = self.started_harness()
+        self.settle_final_reviewer(
+            harness, self.FINAL_QUALITY_PASS + gate_declaration("NEEDS_INPUT")
+        )
+
+        with patch.object(decision_gate, "admit_head", lambda *a, **k: {}):
+            harness.log_run_status("COMPLETED", reason="every phase gate passed")
+
+        self.assertIn("| COMPLETED |", self.orchestrator_log(harness))
+
+    # ================= external review MAJOR =====================================
+    # `source_binding` is one of the thirteen required fields and is what makes a
+    # ledger entry a BOUND entry. It used to be a setdefault, so an agent that put
+    # the key in its own fenced record kept it, and validate_ledger_record() only
+    # requires the field to be PRESENT. The entry could claim provenance it was
+    # never bound to. It is harness-owned now.
+
+    def test_an_agent_cannot_supply_its_own_source_binding(self) -> None:
+        forgeries = (
+            "artifacts/runs/run_someone_elses/",   # cross-run
+            "artifacts/runs/run_live_os29/design/",  # wrong phase
+            "/etc/passwd",                          # arbitrary
+            "",                                     # empty
+            None,                                   # null
+        )
+        for forged in forgeries:
+            with self.subTest(forged=forged), tempfile.TemporaryDirectory() as scratch:
+                self.artifact_dir = Path(scratch)
+                harness, _ = self.started_harness()
+                body = self.FINAL_QUALITY_PASS + gate_declaration_with(
+                    "CLEAR", {"source_binding": forged}
+                )
+
+                state, _ = self.settle_final_reviewer(harness, body)
+
+                self.assertEqual(state, "CLEAR")
+                head = self.ledger()[-1]
+                self.assertEqual(
+                    head["source_binding"], f"artifacts/runs/{harness.run_id}/"
+                )
+                self.assertNotEqual(head["source_binding"], forged)
+
+    def test_the_authoritative_source_binding_is_still_recorded(self) -> None:
+        """Control: overwriting is not deleting -- the field is present and correct
+        when the agent says nothing about it."""
+        harness, _ = self.started_harness()
+
+        self.settle_final_reviewer(
+            harness, self.FINAL_QUALITY_PASS + gate_declaration("CLEAR")
+        )
+
+        head = self.ledger()[-1]
+        self.assertEqual(head["source_binding"], f"artifacts/runs/{harness.run_id}/")
+
 
 
 if __name__ == "__main__":

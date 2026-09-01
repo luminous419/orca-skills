@@ -2526,13 +2526,22 @@ class OrcaRuntimeHarness:
                 "verifies": record.get("verifies"),
                 "prior_open_decision_items": [],
                 "recorded_at": run_logging.now_iso(),
+                # External review MAJOR: this was a setdefault, so an agent that put
+                # `source_binding` in its own fenced record kept it -- an arbitrary,
+                # null, cross-run or wrong-phase binding survived into the published
+                # ledger, and validate_ledger_record() only requires the field to be
+                # PRESENT, never that it matches the run this record belongs to. The
+                # entry could therefore claim provenance it was never bound to. It is
+                # harness-owned now, exactly like `run`, `phase`, `iteration` and
+                # `recorded_at` beside it: the agent describes its DECISION, never
+                # where that decision is recorded.
+                "source_binding": f"artifacts/runs/{self.run_id}/",
             }
         )
         record.setdefault("responsible_phase", phase or "")
         record.setdefault("evidence", {})
         record.setdefault("assumption", None)
         record.setdefault("open_item", None)
-        record.setdefault("source_binding", f"artifacts/runs/{self.run_id}/")
         try:
             run_logging.append_decision_ledger_record(
                 self.run_id,
@@ -2648,6 +2657,50 @@ class OrcaRuntimeHarness:
             )
         if not self.run_id:
             return
+        # ---- OS-29 pre-completion decision gate (external review CRITICAL) --------
+        # The decision axis used to be enforced ONLY by _b1_guard(), i.e. only when a
+        # LATER dispatch existed to gate. After the Final Review there is no later
+        # dispatch, so a Final Reviewer could return quality PASS beside NEEDS_INPUT,
+        # CONFLICT, or a missing/malformed declaration and this method would still
+        # write COMPLETED -- exactly the completion the objective forbids while user
+        # authority is unresolved. Completion is therefore its own boundary and
+        # admits the ledger head under the SAME A1-A6 the dispatch boundaries use.
+        #
+        # No VerificationDispatch is offered: completing a run is never the one
+        # permitted classification review, so A5 refuses every open item here as it
+        # does for a correction Worker or the next phase.
+        #
+        # ONLY COMPLETED is gated. BLOCKED/ERROR/ESCALATED must stay writable or a
+        # blocked run could never record why it stopped -- and this method is how it
+        # records that, including on the refusal path immediately below.
+        if status == "COMPLETED":
+            try:
+                decision_gate.admit_head(
+                    self._decision_policy,
+                    run_logging.read_decision_ledger(
+                        self.run_id, base=self.artifact_dir
+                    ),
+                    run_id=self.run_id,
+                    expected_settled_round=self._last_settled,
+                )
+            except decision_gate.GateRefusal as refusal:
+                detail = " ".join(str(refusal.detail).split())[:200]
+                self._safe_log(
+                    run_logging.log_orchestrator_event,
+                    self.run_id,
+                    base=self.artifact_dir,
+                    event=run_logging.EVENT_DECISION_BLOCK,
+                    risk=self.risk,
+                    decision_state=decision_gate.INPUT_DEFECT_STATE,
+                    decision_reason_code=refusal.reason,
+                    detail=f"COMPLETED refused at the pre-completion gate: {detail}",
+                )
+                # Terminate BLOCKED instead of COMPLETED. This recurses exactly once:
+                # BLOCKED is not gated, so the branch above is not re-entered.
+                self.log_run_status(
+                    "BLOCKED", reason=f"{refusal.reason}: {detail}"
+                )
+                raise DecisionGateRefused(refusal.reason, refusal.detail)
         self._safe_log(
             run_logging.log_run_status,
             self.run_id,

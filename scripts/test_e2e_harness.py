@@ -7376,3 +7376,86 @@ class DecisionGateFindingT001Tests(_OS29HarnessMixin, unittest.TestCase):
                 "requirement_contradiction",
             ),
         )
+
+
+
+class DecisionGateSourceBindingTests(unittest.TestCase):
+    """External review MAJOR, deterministic half.
+
+    `source_binding` is one of the thirteen required fields and is what makes a
+    ledger entry a BOUND entry. It used to be a `setdefault`, so an agent that put
+    the key in its own fenced record kept it, and validate_ledger_record() only
+    requires the field to be PRESENT -- never that it matches the round the record
+    belongs to. The entry could therefore claim provenance it was never bound to.
+    The live half of this is in test_orca_runtime_contract.py.
+    """
+
+    ORCHESTRATION_SKILL = (
+        Path(__file__).resolve().parents[1]
+        / "orca-worker-reviewer-orchestration"
+        / "SKILL.md"
+    )
+    RUN_ID = "run_os29_binding"
+
+    def published(self, workspace: Path, record_extra: dict | None) -> dict:
+        """Publish one B2 record whose agent half optionally forges its binding."""
+        import argparse
+
+        from scripts import fake_worker
+
+        harness = E2EHarness(
+            self.ORCHESTRATION_SKILL,
+            phase="implementation",
+            workspace=workspace,
+            run_id=self.RUN_ID,
+            risk="high",
+        )
+        body = fake_worker.render_decision_gate(
+            argparse.Namespace(
+                decision_gate_state="CLEAR",
+                decision_gate_state_line_raw=None,
+                decision_gate_record_raw=None,
+                decision_gate_omit_field=False,
+                decision_gate_omit_block=False,
+            ),
+            record_extra,
+        )
+        gate = decision_gate.parse_gate_result(body, harness.policy)
+        harness._append_decision_record(
+            gate,
+            phase="implementation",
+            iteration=1,
+            role="worker",
+            boundary="B2",
+            source="worker",
+            verdict="",
+            verifies=None,
+        )
+        return run_logging.read_decision_ledger(self.RUN_ID, base=workspace)[-1]
+
+    def expected(self) -> str:
+        return phase_artifact_contract(
+            role="worker", phase="implementation", run_id=self.RUN_ID
+        )
+
+    def test_an_agent_cannot_supply_its_own_source_binding(self) -> None:
+        for forged in (
+            "artifacts/runs/run_someone_elses/",           # cross-run
+            "artifacts/runs/run_os29_binding/DESIGN.md",   # wrong phase artifact
+            "/etc/passwd",                                 # arbitrary
+            "",                                            # empty
+            None,                                          # null
+        ):
+            with self.subTest(forged=forged), tempfile.TemporaryDirectory() as scratch:
+                head = self.published(Path(scratch), {"source_binding": forged})
+
+                self.assertEqual(head["source_binding"], self.expected())
+                self.assertNotEqual(head["source_binding"], forged)
+
+    def test_the_authoritative_binding_is_still_recorded(self) -> None:
+        """Control: overwriting is not deleting. The field is present and correct
+        when the agent says nothing about it."""
+        with tempfile.TemporaryDirectory() as scratch:
+            head = self.published(Path(scratch), None)
+
+        self.assertEqual(head["source_binding"], self.expected())
