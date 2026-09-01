@@ -7,6 +7,7 @@ import ast
 import inspect
 import json
 import re
+import shutil
 import tempfile
 import unittest
 from os import environ
@@ -16,7 +17,7 @@ from pathlib import Path
 
 from scripts.task_context import RISK_CONTEXT_KEYS
 import scripts.e2e_harness as e2e_module
-from scripts import run_logging
+from scripts import decision_gate, run_logging
 import scripts.task_context as task_context_module
 from scripts.final_report import ORCHESTRATION_SKILL, render_final_report
 from scripts.orca_runtime_harness import OrcaRuntimeHarness
@@ -1134,6 +1135,117 @@ def _normalize_artifact(text: str, workspace: Path) -> str:
     return "\n".join(lines)
 
 
+# ---- OS-29: the additions the two PRE-OS-4 / PRE-OS-22 goldens cannot contain ------
+# OS-29 is a transition no-op and deliberately NOT an artifact no-op: a fully-CLEAR
+# run makes the same dispatches, charges the same iterations and reaches the same
+# terminal, but it additionally carries the agent's gate declaration inside the
+# Reviewer's current_delta and two sparse columns in ORCHESTRATOR_LOG.md. Those two
+# additions are enumerated here and removed before the byte comparison, so the
+# pre-OS-4 / pre-OS-22 claim keeps its full strength for EVERYTHING ELSE instead of
+# being retired or having its golden quietly regenerated.
+#
+# Each stripper RAISES when the addition it removes is absent. That is the
+# non-vacuity half and it is not optional: a stripper that silently accepted a build
+# emitting no declaration at all would turn these byte-identity tests into a
+# guarantee that OS-29 never happened.
+OS29_LOG_COLUMNS = ("decision_state", "decision_reason_code")
+OS29_LOG_EVENTS = (
+    run_logging.EVENT_DECISION_RECORD_WRITTEN,
+    run_logging.EVENT_DECISION_GATE_REFUSED,
+    run_logging.EVENT_DECISION_BLOCK,
+)
+
+
+# One regex rather than a line filter: the Reviewer's `current_delta` carries the
+# Worker's whole result, and both canonicalizers collapse it onto ONE spec line, so
+# the declaration and its fenced record appear INLINE and a line-oriented stripper
+# would silently remove nothing.
+OS29_SPEC_DECLARATION = re.compile(
+    rf"{decision_gate.GATE_STATE_FIELD}:\s*[A-Z_]+\s*```decision-gate\b.*?```[ \n]?",
+    re.DOTALL,
+)
+
+
+def strip_os29_spec_additions(spec: str) -> str:
+    """One dispatched Task spec, minus the OS-29 gate declaration it now quotes."""
+    return OS29_SPEC_DECLARATION.sub("", spec)
+
+
+# Round 2 (review F-001): the settled agent bodies the offline recorders deliver now
+# DECLARE a gate result, because a silent settled result fails closed and would end
+# the run at the next boundary. The `detail` column quotes the first 160 characters
+# of that body, so the declaration reaches this log as a truncated INLINE suffix --
+# not a whole line and not necessarily a whole record. Cut at the field name and, if
+# the truncation landed inside it, at the longest prefix of it that ends the cell.
+OS29_LOG_DETAIL_MARKER = f"{decision_gate.GATE_STATE_FIELD}:"
+
+
+def strip_os29_detail_declaration(cell: str) -> str:
+    """One `detail` cell, minus the gate declaration excerpt appended to it."""
+    head = cell.split(OS29_LOG_DETAIL_MARKER)[0]
+    for length in range(len(OS29_LOG_DETAIL_MARKER) - 1, 0, -1):
+        if head.endswith(OS29_LOG_DETAIL_MARKER[:length]):
+            head = head[:-length]
+            break
+    return head.strip()
+
+
+def strip_os29_spec_list(specs: list[str]) -> list[str]:
+    """Every spec, with the non-vacuity guard applied to the LIST.
+
+    The guard belongs here rather than on each spec: a Worker's own spec legitimately
+    carries no declaration (it has not produced one yet), and only a Reviewer's spec
+    quotes one back. So "at least one" is the honest claim, and "every one" would be
+    false.
+    """
+    if not any(f"{decision_gate.GATE_STATE_FIELD}:" in spec for spec in specs):
+        raise RuntimeError(
+            "no dispatched spec carried an OS-29 gate declaration; the stripper "
+            "would make this byte-identity comparison vacuous"
+        )
+    return [strip_os29_spec_additions(spec) for spec in specs]
+
+
+def strip_os29_log_additions(log: str) -> str:
+    """One ORCHESTRATOR_LOG.md, minus the two sparse OS-29 columns and its own rows."""
+    if not log:
+        return log
+    lines = log.splitlines()
+    header = [cell.strip() for cell in lines[0].strip().strip("|").split("|")]
+    missing = [column for column in OS29_LOG_COLUMNS if column not in header]
+    if missing:
+        raise RuntimeError(
+            f"ORCHESTRATOR_LOG.md is missing the OS-29 columns {missing}; the "
+            "stripper would make this byte-identity comparison vacuous"
+        )
+    drop = {header.index(column) for column in OS29_LOG_COLUMNS}
+    event_index = header.index("event")
+    detail_index = header.index("detail")
+    declared = False
+    kept: list[str] = []
+    for index, line in enumerate(lines):
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if len(cells) != len(header):
+            kept.append(line)
+            continue
+        if cells[event_index] in OS29_LOG_EVENTS:
+            continue
+        if index and OS29_LOG_DETAIL_MARKER in cells[detail_index]:
+            declared = True
+        cells[detail_index] = strip_os29_detail_declaration(cells[detail_index])
+        remaining = [cell for index, cell in enumerate(cells) if index not in drop]
+        kept.append("| " + " | ".join(remaining) + " |")
+    if not declared:
+        # The same non-vacuity half the other strippers carry: a build whose settled
+        # bodies declared nothing would sail through this comparison while having
+        # reintroduced exactly the fail-open shape F-001 removed.
+        raise RuntimeError(
+            "no logged dispatch quoted an OS-29 gate declaration; the stripper "
+            "would make this byte-identity comparison vacuous"
+        )
+    return "\n".join(kept)
+
+
 def capture_orchestrator_log(skill_name, phases, routing=None) -> str:
     """The real ORCHESTRATOR_LOG.md for THIS fixture's own phase sequence.
 
@@ -1165,7 +1277,9 @@ def capture_orchestrator_log(skill_name, phases, routing=None) -> str:
             harness.run_attempt("worker", iteration, "complete", phase=phase)
         harness.log_run_status("COMPLETED")
         log = artifacts / "artifacts" / "runs" / "run_golden" / "ORCHESTRATOR_LOG.md"
-        return _normalize_artifact(log.read_text(encoding="utf-8"), artifacts)
+        return _normalize_artifact(
+            strip_os29_log_additions(log.read_text(encoding="utf-8")), artifacts
+        )
 
 
 def capture_legacy_artifacts(
@@ -1222,9 +1336,9 @@ def capture_legacy_artifacts(
             )
             routing = getattr(harness, "agent_routing", None)
             captured = {
-                "task_specs": [
-                    _normalize_artifact(spec, workspace) for spec in rendered
-                ],
+                "task_specs": strip_os29_spec_list(
+                    [_normalize_artifact(spec, workspace) for spec in rendered]
+                ),
                 "orchestrator_log": capture_orchestrator_log(
                     skill_name, phases, routing
                 ),
@@ -4457,9 +4571,9 @@ def capture_neutrality_workflow_specs(
                     run_id=NEUTRALITY_RUN_ID,
                 )
             )
-            return [
-                canonicalize_task_spec(spec, workspace=workspace) for spec in rendered
-            ]
+            return strip_os29_spec_list(
+                [canonicalize_task_spec(spec, workspace=workspace) for spec in rendered]
+            )
     finally:
         e2e_module.render_task_spec = original
 
@@ -5130,3 +5244,2218 @@ class FinalReviewArtifactPathAttemptDomainTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------------
+# OS-29: the decision gate's transition behaviour.
+#
+# The subject of every case below is a TRANSITION -- did the next phase dispatch, did
+# the correction Worker dispatch, did the counter move -- so it lives here, where
+# WorkflowRunResult makes each of those a list-length or dict assertion on the
+# returned value rather than a log grep. Every non-vacuity control is co-located in
+# the same test function as the claim it protects.
+# ---------------------------------------------------------------------------------
+class DecisionGateTransitionTests(unittest.TestCase):
+    ORCHESTRATION_SKILL = (
+        Path(__file__).resolve().parents[1]
+        / "orca-worker-reviewer-orchestration"
+        / "SKILL.md"
+    )
+    RUN_ID = "run_os29"
+
+    def harness(self, workspace: Path, *, risk: str, phase: str = "implementation",
+                max_iterations: int = 5) -> E2EHarness:
+        return E2EHarness(
+            self.ORCHESTRATION_SKILL,
+            phase=phase,
+            max_iterations=max_iterations,
+            workspace=workspace,
+            run_id=self.RUN_ID,
+            risk=risk,
+        )
+
+    def round_at(self, risk: str, scenario: FakeScenario) -> WorkflowResult:
+        with tempfile.TemporaryDirectory() as directory:
+            return self.harness(Path(directory), risk=risk).run(scenario)
+
+    def workflow(
+        self,
+        scenario,
+        *,
+        risk: str = "high",
+        seed=None,
+        harness_hook=None,
+    ):
+        """One run_workflow in its own workspace. `seed` may plant a ledger first."""
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            if seed is not None:
+                seed(workspace)
+            harness = self.harness(workspace, risk=risk, phase=scenario.phases[0])
+            if harness_hook is not None:
+                harness = harness_hook(harness)
+            result = harness.run_workflow(scenario)
+            ledger = run_logging.read_decision_ledger(scenario.run_id, base=workspace)
+            return result, ledger
+
+    # ---- fixtures ---------------------------------------------------------------
+    @staticmethod
+    def passing_phase() -> FakeScenario:
+        return FakeScenario(worker_modes=("complete",), reviewer_modes=("pass",))
+
+    @staticmethod
+    def blocking_phase(state: str = "NEEDS_INPUT") -> FakeScenario:
+        return FakeScenario(
+            worker_modes=("complete",),
+            reviewer_modes=("pass",),
+            worker_decision_states=(state,),
+            reviewer_decision_states=(state,),
+        )
+
+    def clear_workflow(self, phases=("analysis", "implementation")):
+        return WorkflowScenario(
+            phases=phases,
+            phase_scenarios={phase: self.passing_phase() for phase in phases},
+            final_review=FinalReviewScenario(modes=("pass",)),
+            run_id=self.RUN_ID,
+        )
+
+    # ---- scenario 3 / 7 / NV-2 ---------------------------------------------------
+    def test_needs_input_blocks_identically_at_every_risk_level(self) -> None:
+        """Scenario 3 + 7: risk selects WHERE the terminal is recorded, never what it
+        says -- and the blocked round charges no correction iteration."""
+        outcomes = {}
+        for risk in ("low", "medium", "high"):
+            result = self.round_at(risk, self.blocking_phase())
+            outcomes[risk] = (
+                result.final_status,
+                result.reason,
+                result.decision_state,
+                result.decision_reason_code,
+            )
+
+        self.assertEqual(outcomes["low"], outcomes["medium"])
+        self.assertEqual(outcomes["low"], outcomes["high"])
+        self.assertEqual(
+            outcomes["low"],
+            (
+                "BLOCKED",
+                "DECISION_BLOCKED:NEEDS_INPUT:blast_radius_beyond_scope",
+                "NEEDS_INPUT",
+                "blast_radius_beyond_scope",
+            ),
+        )
+        # THE NON-VACUITY GUARD: the three runs really do differ elsewhere, so the
+        # equality above is not three runs of the same code path.
+        self.assertEqual(len(self.round_at("low", self.blocking_phase()).reviewer_attempts), 0)
+        self.assertEqual(len(self.round_at("high", self.blocking_phase()).reviewer_attempts), 1)
+        # INV-D1: the verification is the ALREADY-SCHEDULED Reviewer, not a second one.
+        blocked_high = self.round_at("high", self.blocking_phase())
+        self.assertEqual(len(blocked_high.worker_attempts), 1)
+        self.assertEqual(len(blocked_high.reviewer_attempts), 1)
+
+    def test_a_decision_block_charges_no_iteration_and_a_quality_fail_still_does(
+        self,
+    ) -> None:
+        """NV-2, with its control in the same function: "unchanged" must not also be
+        true of a globally broken counter."""
+        blocked, _ = self.workflow(
+            WorkflowScenario(
+                phases=("implementation",),
+                phase_scenarios={"implementation": self.blocking_phase()},
+                final_review=FinalReviewScenario(modes=("pass",)),
+                run_id=self.RUN_ID,
+            )
+        )
+        self.assertEqual(blocked.final_status, "BLOCKED")
+        self.assertEqual(blocked.phase_iterations["implementation"], 0)
+        self.assertEqual(blocked.correction_dispatches, [])
+        self.assertEqual(blocked.revalidation_dispatches, [])
+        # THE CONTROL: a quality FAIL round DOES charge one.
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            harness = self.harness(workspace, risk="high", max_iterations=2)
+            fail_result = harness.run_workflow(
+                WorkflowScenario(
+                    phases=("implementation",),
+                    phase_scenarios={
+                        "implementation": FakeScenario(
+                            worker_modes=("complete", "correction"),
+                            reviewer_modes=("fail", "pass"),
+                            reviewer_findings=(("Q1",), ()),
+                            worker_resolutions=({}, {"Q1": "RESOLVED"}),
+                        )
+                    },
+                    final_review=FinalReviewScenario(modes=("pass",)),
+                    run_id=self.RUN_ID,
+                )
+            )
+        self.assertEqual(fail_result.final_status, "COMPLETED")
+        self.assertEqual(fail_result.phase_iterations["implementation"], 2)
+
+    # ---- scenario 5 --------------------------------------------------------------
+    def test_a_midwork_block_is_a_decision_terminal_not_a_worker_blocked(self) -> None:
+        """Scenario 5: O-2 routes a Worker that discovered a blocking decision onto
+        the DECISION axis, so it charges nothing -- under WORKER_BLOCKED at LOW it
+        would charge one."""
+        blocked = self.round_at(
+            "low",
+            FakeScenario(
+                worker_modes=("blocked",),
+                reviewer_modes=(),
+                worker_decision_states=("CONFLICT",),
+            ),
+        )
+
+        self.assertEqual(blocked.final_status, "BLOCKED")
+        self.assertEqual(
+            blocked.reason, "DECISION_BLOCKED:CONFLICT:requirement_contradiction"
+        )
+        self.assertIsNotNone(blocked.decision_block)
+        # THE CONTROL: the same Worker mode with no decision block keeps the existing
+        # WORKER_BLOCKED reason, so O-2 is a real branch and not a rename.
+        plain = self.round_at(
+            "low", FakeScenario(worker_modes=("blocked",), reviewer_modes=())
+        )
+        self.assertEqual(plain.reason, "WORKER_BLOCKED")
+        self.assertIsNone(plain.decision_block)
+
+    # ---- scenario 6 / P6b row 8 ---------------------------------------------------
+    def test_a_reviewer_discovered_block_records_its_finding_and_charges_nothing(
+        self,
+    ) -> None:
+        result = self.round_at(
+            "high",
+            FakeScenario(
+                worker_modes=("complete",),
+                reviewer_modes=("fail",),
+                reviewer_findings=(("R1",),),
+                reviewer_decision_states=("CONFLICT",),
+            ),
+        )
+
+        self.assertEqual(result.final_status, "BLOCKED")
+        self.assertEqual(
+            result.reason, "DECISION_BLOCKED:CONFLICT:requirement_contradiction"
+        )
+        # Both requirements hold at once: the finding IS recorded ...
+        self.assertIn("R1", result.findings)
+        self.assertEqual(result.findings["R1"].reviewer_iterations, [1])
+        # ... and the round charges no correction iteration.
+        self.assertIsNotNone(result.decision_block)
+        # THE AXIS-SEPARATION CONTROL: a Reviewer FAIL whose own gate result is CLEAR
+        # takes the EXISTING correction routing and charges its iteration.
+        with tempfile.TemporaryDirectory() as directory:
+            harness = self.harness(Path(directory), risk="high", max_iterations=2)
+            routed = harness.run(
+                FakeScenario(
+                    worker_modes=("complete", "correction"),
+                    reviewer_modes=("fail", "pass"),
+                    reviewer_findings=(("R1",), ()),
+                    worker_resolutions=({}, {"R1": "RESOLVED"}),
+                )
+            )
+        self.assertEqual(routed.final_status, "COMPLETED")
+        self.assertIsNone(routed.decision_block)
+        self.assertEqual(len(routed.reviewer_attempts), 2)
+
+    # ---- scenario 4 / P6b row 6 ---------------------------------------------------
+    def test_a_reviewer_downgrade_is_rejected_and_still_terminal(self) -> None:
+        for reviewer_state in ("CLEAR", "ASSUMPTION_ALLOWED"):
+            with self.subTest(downgrade_to=reviewer_state):
+                result = self.round_at(
+                    "high",
+                    FakeScenario(
+                        worker_modes=("complete",),
+                        reviewer_modes=("pass",),
+                        worker_decision_states=("CONFLICT",),
+                        reviewer_decision_states=(reviewer_state,),
+                    ),
+                )
+                self.assertEqual(result.final_status, "BLOCKED")
+                self.assertEqual(result.reason, "DECISION_DOWNGRADE_REJECTED")
+                self.assertEqual(result.decision_state, "CONFLICT")
+        # THE CONTROL: a CONFIRMING Reviewer produces the block reason instead, so
+        # DECISION_DOWNGRADE_REJECTED is a decision and not the only outcome.
+        confirmed = self.round_at("high", self.blocking_phase("CONFLICT"))
+        self.assertEqual(
+            confirmed.reason, "DECISION_BLOCKED:CONFLICT:requirement_contradiction"
+        )
+
+    def test_an_unbound_verification_record_fails_closed(self) -> None:
+        """P6b row 7: not a silent fall-back to the Worker's own classification."""
+        result = self.round_at(
+            "high",
+            FakeScenario(
+                worker_modes=("complete",),
+                reviewer_modes=("pass",),
+                worker_decision_states=("NEEDS_INPUT",),
+                reviewer_decision_states=("NEEDS_INPUT",),
+                reviewer_decision_args=(
+                    ("--decision-gate-verifies-raw", "run_os29/plan/9/B2#9"),
+                ),
+            ),
+        )
+
+        self.assertEqual(result.final_status, "BLOCKED")
+        self.assertEqual(result.reason, "DECISION_GATE_INPUT_UNBOUND")
+        # THE CONTROL: the same round with the harness-supplied binding blocks with
+        # the DECISION reason instead, so "unbound" names a real defect.
+        bound = self.round_at("high", self.blocking_phase())
+        self.assertEqual(
+            bound.reason, "DECISION_BLOCKED:NEEDS_INPUT:blast_radius_beyond_scope"
+        )
+
+    # ---- scenario 13 --------------------------------------------------------------
+    def test_a_silent_or_broken_agent_never_presumes_clear(self) -> None:
+        """F1-F6 through the REAL subprocess, at every risk level and both boundaries."""
+        for risk in ("low", "medium", "high"):
+            with self.subTest(risk=risk, boundary="B2"):
+                silent = self.round_at(
+                    risk,
+                    FakeScenario(
+                        worker_modes=("complete",),
+                        reviewer_modes=("pass",),
+                        worker_decision_states=("",),
+                    ),
+                )
+                self.assertEqual(silent.final_status, "BLOCKED")
+                self.assertEqual(silent.reason, "DECISION_GATE_INPUT_MISSING")
+                # Row 3 is risk-independent AND never spends the Reviewer.
+                self.assertEqual(silent.reviewer_attempts, [])
+        for risk in ("medium", "high"):
+            with self.subTest(risk=risk, boundary="B3"):
+                silent = self.round_at(
+                    risk,
+                    FakeScenario(
+                        worker_modes=("complete",),
+                        reviewer_modes=("pass",),
+                        reviewer_decision_states=("",),
+                    ),
+                )
+                self.assertEqual(silent.final_status, "BLOCKED")
+                self.assertEqual(silent.reason, "DECISION_GATE_INPUT_MISSING")
+        malformed = self.round_at(
+            "high",
+            FakeScenario(
+                worker_modes=("complete",),
+                reviewer_modes=("pass",),
+                worker_decision_args=(("--decision-gate-record-raw", "{not json"),),
+            ),
+        )
+        self.assertEqual(malformed.reason, "DECISION_GATE_INPUT_MALFORMED")
+        duplicated = self.round_at(
+            "high",
+            FakeScenario(
+                worker_modes=("complete",),
+                reviewer_modes=("pass",),
+                worker_decision_args=(("--decision-gate-state-line-raw", "CLEAR"),),
+            ),
+        )
+        self.assertEqual(duplicated.reason, "DECISION_GATE_INPUT_MALFORMED")
+        # THE CONTROL: the unmodified scenario COMPLETES, so none of the above is a
+        # harness that refuses everything.
+        self.assertEqual(self.round_at("high", self.passing_phase()).final_status, "COMPLETED")
+
+    # ---- P6a F9 / NV-1 -------------------------------------------------------------
+    def test_the_first_phase_needs_the_run_entry_declaration(self) -> None:
+        """F9: delete sequence 0 and the FIRST phase must not dispatch at all."""
+
+        def delete_declaration(workspace: Path) -> None:
+            # The harness re-opens the ledger in run_workflow, so the record has to be
+            # removed by a hook the harness itself calls -- see the subclass below.
+            raise AssertionError("unused")
+
+        class LedgerlessHarness(E2EHarness):
+            def run_workflow(self, scenario):
+                shutil.rmtree(
+                    Path(self.workspace)
+                    / "artifacts" / "runs" / scenario.run_id / "decision_ledger",
+                    ignore_errors=True,
+                )
+                # Re-enter the loop WITHOUT re-opening the ledger: this is the
+                # "producer did not run" state, not a harness that never started.
+                return E2EHarness.run_workflow(self, scenario)
+
+        scenario = self.clear_workflow()
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            harness = LedgerlessHarness(
+                self.ORCHESTRATION_SKILL,
+                phase="analysis",
+                workspace=workspace,
+                run_id=self.RUN_ID,
+                risk="high",
+            )
+            # open_decision_ledger runs again inside run_workflow, so the deletion
+            # has to happen after it: patch the writer out for this one call.
+            with patch.object(run_logging, "open_decision_ledger", lambda *a, **k: None):
+                blocked = harness.run_workflow(scenario)
+
+        self.assertEqual(blocked.final_status, "BLOCKED")
+        self.assertEqual(blocked.reason, "DECISION_GATE_INPUT_MISSING")
+        self.assertEqual(blocked.sessions, ())
+        self.assertEqual(blocked.correction_dispatches, [])
+        self.assertEqual(blocked.revalidation_dispatches, [])
+        for phase in scenario.phases:
+            self.assertEqual(blocked.phase_iterations[phase], 0)
+        # NV-1'S CONTROL: the SAME scenario with the declaration present dispatches.
+        # Without it, "nothing dispatched" would also hold for a harness that never
+        # dispatches anything.
+        admitted, _ = self.workflow(scenario)
+        self.assertEqual(admitted.final_status, "COMPLETED")
+        self.assertTrue(admitted.sessions)
+        self.assertEqual(admitted.phase_iterations["analysis"], 1)
+
+    # ---- P6a F11 -------------------------------------------------------------------
+    def test_the_declaration_cannot_stand_in_for_a_deleted_settled_record(self) -> None:
+        """F11, the hole proof: A3 refuses to fall back to sequence 0."""
+        scenario = self.clear_workflow()
+
+        class DeletingHarness(E2EHarness):
+            """Delete every settled agent record between the first phase and the next
+            B1, which is exactly the shape a lost or withheld record has."""
+
+            def _phase_harness(self, phase, budget):
+                child = E2EHarness._phase_harness(self, phase, budget)
+                original = child.run
+
+                def run(phase_scenario):
+                    result = original(phase_scenario)
+                    ledger = (
+                        Path(self.workspace)
+                        / "artifacts" / "runs" / self.run_id / "decision_ledger"
+                    )
+                    for entry in sorted(ledger.iterdir()):
+                        if entry.name.isdigit() and int(entry.name) > 0:
+                            shutil.rmtree(entry)
+                    return result
+
+                child.run = run
+                return child
+
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            harness = DeletingHarness(
+                self.ORCHESTRATION_SKILL,
+                phase="analysis",
+                workspace=workspace,
+                run_id=self.RUN_ID,
+                risk="high",
+            )
+            blocked = harness.run_workflow(scenario)
+
+        self.assertEqual(blocked.final_status, "BLOCKED")
+        self.assertEqual(blocked.reason, "DECISION_GATE_INPUT_UNBOUND")
+        self.assertEqual(blocked.decision_state, "INPUT")
+        # The first phase DID dispatch -- the refusal is at the SECOND boundary, not
+        # at the run's start, which is what makes this the hole proof rather than F9.
+        self.assertEqual(blocked.phase_iterations["analysis"], 1)
+        self.assertTrue(blocked.sessions)
+        # THE CONTROL: without the deletion the same run completes.
+        admitted, _ = self.workflow(scenario)
+        self.assertEqual(admitted.final_status, "COMPLETED")
+
+    # ---- scenario 12 ----------------------------------------------------------------
+    def test_an_open_ledger_item_blocks_the_next_phase_dispatch(self) -> None:
+        """Scenario 12: after a blocking decision is recorded, the next phase's B1
+        refuses and NO dispatch for that phase is created."""
+        open_record = json.loads(
+            (
+                Path(__file__).resolve().parents[1]
+                / "scripts" / "fixtures" / "decision_gate" / "valid"
+                / "worker_needs_input.json"
+            ).read_text(encoding="utf-8")
+        )
+        scenario = self.clear_workflow(phases=("analysis", "implementation"))
+
+        class PlantingHarness(E2EHarness):
+            """Record an open blocking item as the FIRST phase settles. Planted rather
+            than produced because a block produced in-phase terminates the run there,
+            so the "a later dispatch is attempted anyway" state is only reachable by
+            constructing it."""
+
+            planted = False
+
+            def _phase_harness(harness_self, phase, budget):
+                child = E2EHarness._phase_harness(harness_self, phase, budget)
+                original = child.run
+
+                def run(phase_scenario):
+                    result = original(phase_scenario)
+                    if PlantingHarness.planted:
+                        return result
+                    PlantingHarness.planted = True
+                    planted = dict(
+                        open_record, run=harness_self.run_id, phase=phase, iteration=1
+                    )
+                    _, sequence = run_logging.append_decision_ledger_record(
+                        harness_self.run_id,
+                        planted,
+                        base=harness_self.workspace,
+                        ledger_schema_version=(
+                            decision_gate.LEDGER_RECORD_SCHEMA_VERSION
+                        ),
+                    )
+                    ledger = (
+                        Path(harness_self.workspace)
+                        / "artifacts" / "runs" / harness_self.run_id
+                        / "decision_ledger"
+                    )
+                    declaration = json.loads(
+                        (ledger / "000000" / "record.json").read_text(encoding="utf-8")
+                    )
+                    declaration["prior_open_decision_items"] = [
+                        decision_gate.ledger_key(dict(planted, sequence=sequence))
+                    ]
+                    (ledger / "000000" / "record.json").write_text(
+                        json.dumps(declaration, indent=2, sort_keys=True) + "\n",
+                        encoding="utf-8",
+                    )
+                    return result
+
+                child.run = run
+                return child
+
+        PlantingHarness.planted = False
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            harness = PlantingHarness(
+                self.ORCHESTRATION_SKILL,
+                phase="analysis",
+                workspace=workspace,
+                run_id=self.RUN_ID,
+                risk="high",
+            )
+            blocked = harness.run_workflow(scenario)
+
+        self.assertEqual(blocked.final_status, "BLOCKED")
+        self.assertEqual(
+            blocked.reason, "DECISION_BLOCKED:NEEDS_INPUT:blast_radius_beyond_scope"
+        )
+        self.assertEqual(blocked.decision_state, "NEEDS_INPUT")
+        self.assertEqual(blocked.decision_reason_code, "blast_radius_beyond_scope")
+        # The FIRST phase dispatched; the second did not, and no correction or
+        # revalidation dispatch exists at all.
+        self.assertEqual(blocked.phase_iterations["analysis"], 1)
+        self.assertEqual(blocked.phase_iterations["implementation"], 0)
+        self.assertEqual(blocked.correction_dispatches, [])
+        self.assertEqual(blocked.revalidation_dispatches, [])
+        self.assertEqual(
+            [event.phase for event in blocked.sessions if event.role == "worker"],
+            ["analysis"],
+        )
+        # THE CONTROL: the same scenario with nothing planted dispatches BOTH phases,
+        # so "implementation never ran" is attributable to the guard.
+        admitted, _ = self.workflow(scenario)
+        self.assertEqual(admitted.final_status, "COMPLETED")
+        self.assertEqual(
+            [event.phase for event in admitted.sessions if event.role == "worker"],
+            ["analysis", "implementation"],
+        )
+
+    def test_nv1_removing_the_guard_lets_the_same_scenario_dispatch(self) -> None:
+        """NV-1's literal construction: with the B1 guard neutralized, the run that
+        blocked above proceeds. Without this, "nothing was dispatched" would also be
+        true of a harness that never dispatches anything."""
+        open_record = json.loads(
+            (
+                Path(__file__).resolve().parents[1]
+                / "scripts" / "fixtures" / "decision_gate" / "valid"
+                / "worker_needs_input.json"
+            ).read_text(encoding="utf-8")
+        )
+        scenario = self.clear_workflow(phases=("analysis",))
+
+        def seed(workspace: Path) -> None:
+            run_logging.open_decision_ledger(
+                self.RUN_ID,
+                base=workspace,
+                phases=scenario.phases,
+                risk="high",
+                ledger_schema_version=decision_gate.LEDGER_RECORD_SCHEMA_VERSION,
+            )
+            planted = dict(open_record, run=self.RUN_ID, phase="analysis")
+            _, sequence = run_logging.append_decision_ledger_record(
+                self.RUN_ID,
+                planted,
+                base=workspace,
+                ledger_schema_version=decision_gate.LEDGER_RECORD_SCHEMA_VERSION,
+            )
+            ledger = workspace / "artifacts" / "runs" / self.RUN_ID / "decision_ledger"
+            declaration = json.loads(
+                (ledger / "000000" / "record.json").read_text(encoding="utf-8")
+            )
+            declaration["prior_open_decision_items"] = [
+                decision_gate.ledger_key(dict(planted, sequence=sequence))
+            ]
+            (ledger / "000000" / "record.json").write_text(
+                json.dumps(declaration, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+
+        blocked, _ = self.workflow(scenario, seed=seed)
+        self.assertEqual(blocked.final_status, "BLOCKED")
+        self.assertEqual(blocked.sessions, ())
+
+        # THE MUTANT: admit_head always admits, i.e. the guard is gone.
+        with patch.object(
+            decision_gate, "admit_head", lambda *args, **kwargs: {"state": "CLEAR"}
+        ):
+            dispatched, _ = self.workflow(scenario, seed=seed)
+
+        self.assertEqual(dispatched.final_status, "COMPLETED")
+        self.assertTrue(dispatched.sessions)
+        self.assertEqual(dispatched.phase_iterations["analysis"], 1)
+
+    def test_a_pre_seeded_ledger_is_unbound_at_the_runs_first_boundary(self) -> None:
+        """A3 before A5: a ledger this process did not settle cannot be bound, so the
+        first boundary refuses as UNBOUND rather than reporting somebody else's block.
+        That ordering is what makes L7 -- no cross-session resume -- fail closed."""
+        open_record = json.loads(
+            (
+                Path(__file__).resolve().parents[1]
+                / "scripts" / "fixtures" / "decision_gate" / "valid"
+                / "worker_needs_input.json"
+            ).read_text(encoding="utf-8")
+        )
+
+        def seed(workspace: Path) -> None:
+            run_logging.open_decision_ledger(
+                self.RUN_ID,
+                base=workspace,
+                phases=("analysis",),
+                risk="high",
+                ledger_schema_version=decision_gate.LEDGER_RECORD_SCHEMA_VERSION,
+            )
+            run_logging.append_decision_ledger_record(
+                self.RUN_ID,
+                dict(open_record, run=self.RUN_ID, phase="analysis"),
+                base=workspace,
+                ledger_schema_version=decision_gate.LEDGER_RECORD_SCHEMA_VERSION,
+            )
+
+        scenario = self.clear_workflow(phases=("analysis",))
+        blocked, _ = self.workflow(scenario, seed=seed)
+
+        self.assertEqual(blocked.final_status, "BLOCKED")
+        self.assertEqual(blocked.reason, "DECISION_GATE_INPUT_UNBOUND")
+        self.assertEqual(blocked.sessions, ())
+        # THE CONTROL: without the pre-seeded record the same run completes.
+        admitted, _ = self.workflow(scenario)
+        self.assertEqual(admitted.final_status, "COMPLETED")
+
+    # ---- F13 / F14 end to end ---------------------------------------------------------
+    def test_an_unreadable_or_unsupported_ledger_record_blocks_end_to_end(self) -> None:
+        scenario = self.clear_workflow(phases=("analysis",))
+
+        def mutate(field_value, workspace: Path) -> None:
+            ledger = (
+                workspace / "artifacts" / "runs" / self.RUN_ID / "decision_ledger"
+            )
+            record = json.loads(
+                (ledger / "000000" / "record.json").read_text(encoding="utf-8")
+            )
+            if field_value is None:
+                record.pop("ledger_schema_version")
+            else:
+                record["ledger_schema_version"] = field_value
+            (ledger / "000000" / "record.json").write_text(
+                json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            )
+
+        cases = {
+            "absent (A4-i)": (None, "DECISION_GATE_INPUT_MALFORMED"),
+            "text (A4-i)": ("1", "DECISION_GATE_INPUT_MALFORMED"),
+            "bool (A4-i)": (True, "DECISION_GATE_INPUT_MALFORMED"),
+            "unsupported (A4-ii)": (
+                max(decision_gate.SUPPORTED_LEDGER_RECORD_SCHEMA_VERSIONS) + 1,
+                "DECISION_LEDGER_SCHEMA_UNSUPPORTED",
+            ),
+        }
+        for label, (value, expected) in cases.items():
+            with self.subTest(case=label):
+
+                def seed(workspace: Path, value=value) -> None:
+                    run_logging.open_decision_ledger(
+                        self.RUN_ID,
+                        base=workspace,
+                        phases=scenario.phases,
+                        risk="high",
+                        ledger_schema_version=(
+                            decision_gate.LEDGER_RECORD_SCHEMA_VERSION
+                        ),
+                    )
+                    mutate(value, workspace)
+
+                blocked, _ = self.workflow(scenario, seed=seed)
+                self.assertEqual(blocked.final_status, "BLOCKED")
+                self.assertEqual(blocked.reason, expected)
+                self.assertEqual(blocked.sessions, ())
+        # THE CONTROL: the supported version admits and the run completes.
+        admitted, _ = self.workflow(scenario)
+        self.assertEqual(admitted.final_status, "COMPLETED")
+
+    # ---- scenario 9 ---------------------------------------------------------------
+    def test_an_unresolved_decision_forbids_final_review_completion(self) -> None:
+        """The Final Review attempt open is a B1 site, so an unresolved item stops
+        the run BEFORE the Final Review dispatch rather than after it."""
+        scenario = self.clear_workflow(phases=("implementation",))
+        open_record = json.loads(
+            (
+                Path(__file__).resolve().parents[1]
+                / "scripts" / "fixtures" / "decision_gate" / "valid"
+                / "worker_needs_input.json"
+            ).read_text(encoding="utf-8")
+        )
+
+        class PlantingHarness(E2EHarness):
+            """Plant an open decision item after the phase gate PASSes, which is the
+            only reachable shape: a block during the phase terminates the run there."""
+
+            def _phase_harness(harness_self, phase, budget):
+                child = E2EHarness._phase_harness(harness_self, phase, budget)
+                original = child.run
+
+                def run(phase_scenario):
+                    result = original(phase_scenario)
+                    ledger = (
+                        Path(harness_self.workspace)
+                        / "artifacts" / "runs" / harness_self.run_id
+                        / "decision_ledger"
+                    )
+                    planted = dict(
+                        open_record, run=harness_self.run_id, phase=phase, iteration=1
+                    )
+                    _, sequence = run_logging.append_decision_ledger_record(
+                        harness_self.run_id,
+                        planted,
+                        base=harness_self.workspace,
+                        ledger_schema_version=(
+                            decision_gate.LEDGER_RECORD_SCHEMA_VERSION
+                        ),
+                    )
+                    declaration = json.loads(
+                        (ledger / "000000" / "record.json").read_text(encoding="utf-8")
+                    )
+                    declaration["prior_open_decision_items"] = [
+                        decision_gate.ledger_key(dict(planted, sequence=sequence))
+                    ]
+                    (ledger / "000000" / "record.json").write_text(
+                        json.dumps(declaration, indent=2, sort_keys=True) + "\n",
+                        encoding="utf-8",
+                    )
+                    return result
+
+                child.run = run
+                return child
+
+        with tempfile.TemporaryDirectory() as directory:
+            harness = PlantingHarness(
+                self.ORCHESTRATION_SKILL,
+                phase="implementation",
+                workspace=Path(directory),
+                run_id=self.RUN_ID,
+                risk="high",
+            )
+            blocked = harness.run_workflow(scenario)
+
+        self.assertEqual(blocked.final_status, "BLOCKED")
+        self.assertEqual(
+            blocked.reason, "DECISION_BLOCKED:NEEDS_INPUT:blast_radius_beyond_scope"
+        )
+        self.assertEqual(blocked.final_review_iterations, 0)
+        self.assertEqual(blocked.final_review_attempts, [])
+        self.assertIsNone(blocked.final_review_verdict)
+        # THE CONTROL: without the planted item the same scenario COMPLETES through
+        # a real Final Review attempt.
+        admitted, _ = self.workflow(scenario)
+        self.assertEqual(admitted.final_status, "COMPLETED")
+        self.assertEqual(admitted.final_review_iterations, 1)
+
+    # ---- scenario 9, applied to the FINAL REVIEWER'S OWN decision result -------------
+    #
+    # The test above proves an ALREADY-OPEN ledger item is refused at B1, BEFORE the
+    # Final Review is dispatched. It cannot prove anything about a decision first
+    # discovered -- or first broken -- in the Final Reviewer's own settled body, which
+    # is the other half of "a run must not reach COMPLETED on the quality axis while
+    # the decision axis is blocking or defective". These three cases are that half.
+    def final_review_workflow(self, **final_review_kwargs):
+        """One CLEAR phase whose FINAL REVIEW attempt is the subject of the test."""
+        scenario = replace(
+            self.clear_workflow(phases=("implementation",)),
+            final_review=FinalReviewScenario(**final_review_kwargs),
+        )
+        return self.workflow(scenario)
+
+    def test_a_final_review_quality_pass_cannot_complete_over_a_blocking_decision(
+        self,
+    ) -> None:
+        """The Final Review's after-result boundary is B3, and O-2 orders the two axes:
+        a quality PASS carrying NEEDS_INPUT or CONFLICT blocks instead of completing."""
+        for state, code in (
+            ("NEEDS_INPUT", "blast_radius_beyond_scope"),
+            ("CONFLICT", "requirement_contradiction"),
+        ):
+            with self.subTest(state=state):
+                blocked, ledger = self.final_review_workflow(
+                    modes=("pass",), decision_states=(state,)
+                )
+                self.assertEqual(blocked.final_status, "BLOCKED")
+                self.assertEqual(blocked.reason, f"DECISION_BLOCKED:{state}:{code}")
+                self.assertEqual(blocked.decision_state, state)
+                self.assertEqual(blocked.decision_reason_code, code)
+                # THE POINT: the QUALITY axis really did pass. This is not a Final
+                # Review that failed for a quality reason and blocked incidentally --
+                # the decision axis alone is what stopped the completion.
+                self.assertEqual(blocked.final_review_verdict, "PASS")
+                self.assertEqual(blocked.final_review_iterations, 1)
+                self.assertEqual(len(blocked.final_review_attempts), 1)
+                # ...and the judgement survives as a bound, complete ledger record
+                # rather than only as a terminal status.
+                head = ledger[-1]
+                self.assertEqual(
+                    (head["phase"], head["boundary"], head["role"], head["source"]),
+                    (FINAL_REVIEW_PHASE, "B3", "reviewer", "reviewer"),
+                )
+                self.assertEqual(head["state"], state)
+                self.assertEqual(head["reason_code"], code)
+                self.assertEqual(head["verdict"], "PASS")
+                self.assertTrue(head["open_decision_item"])
+                self.assertIsNone(head["verifies"])
+                for field in decision_gate.REQUIRED_LEDGER_RECORD_FIELDS:
+                    self.assertIn(field, head)
+        # THE CONTROL: the SAME quality PASS with a valid CLEAR decision completes, so
+        # the branch above is not a Final Review that refuses everything.
+        completed, ledger = self.final_review_workflow(
+            modes=("pass",), decision_states=("CLEAR",)
+        )
+        self.assertEqual(completed.final_status, "COMPLETED")
+        self.assertEqual(completed.final_review_verdict, "PASS")
+        self.assertEqual(completed.decision_state, "")
+        self.assertEqual(ledger[-1]["phase"], FINAL_REVIEW_PHASE)
+        self.assertEqual(ledger[-1]["state"], "CLEAR")
+        self.assertIsNone(ledger[-1]["reason_code"])
+
+    def test_a_defective_final_review_decision_result_fails_closed(self) -> None:
+        """Row 10 at the Final Review, driven through the REAL fake-Reviewer
+        subprocess: missing, unknown, duplicated, unparseable, self-contradicting and
+        unbound all refuse, and none of them reaches T1."""
+        clear_plus_verifies = json.dumps(
+            {
+                "state": "CLEAR",
+                "reason_code": None,
+                "open_decision_item": False,
+                "grounds": (
+                    "No boundary element declared by this phase is triggering and no "
+                    "two explicit requirements contradict, so no decision item is "
+                    "open at this boundary."
+                ),
+                "scope": "This phase's own conduct at this iteration.",
+                # A Final Review round has no Worker, so there is no B2 record for
+                # this to verify: the reference cannot resolve and must not be read
+                # as extra evidence.
+                "verifies": {
+                    "run": self.RUN_ID,
+                    "phase": "implementation",
+                    "iteration": 1,
+                    "worker_record_key": f"{self.RUN_ID}/implementation/1/worker/B2",
+                },
+            }
+        )
+        cases = (
+            ("no state line", ("--decision-gate-omit-field",),
+             "DECISION_GATE_INPUT_MISSING"),
+            ("no record block", ("--decision-gate-omit-block",),
+             "DECISION_GATE_INPUT_MISSING"),
+            ("unknown state", ("--decision-gate-omit-field",
+                               "--decision-gate-state-line-raw", "NOT_A_STATE"),
+             "DECISION_GATE_INPUT_MALFORMED"),
+            ("two state lines", ("--decision-gate-state-line-raw", "CLEAR"),
+             "DECISION_GATE_INPUT_MALFORMED"),
+            ("unparseable record", ("--decision-gate-record-raw", "{not json"),
+             "DECISION_GATE_INPUT_MALFORMED"),
+            ("summary disagrees with record",
+             ("--decision-gate-record-raw", '{"state": "CONFLICT"}'),
+             "DECISION_GATE_SUMMARY_DISAGREES_WITH_RECORD"),
+            ("verifies a record that cannot exist",
+             ("--decision-gate-record-raw", clear_plus_verifies),
+             "DECISION_GATE_INPUT_UNBOUND"),
+        )
+        for label, args, expected in cases:
+            with self.subTest(defect=label):
+                blocked, ledger = self.final_review_workflow(
+                    modes=("pass",), decision_args=(args,)
+                )
+                self.assertEqual(blocked.final_status, "BLOCKED")
+                self.assertEqual(blocked.reason, expected)
+                self.assertEqual(blocked.decision_state, "INPUT")
+                self.assertEqual(blocked.decision_reason_code, expected)
+                # The quality axis passed and was still not enough.
+                self.assertEqual(blocked.final_review_verdict, "PASS")
+                # A refused result publishes NOTHING: the head is still the phase's
+                # own B3 record, so a defective declaration cannot leave a record
+                # that a later boundary would bind to.
+                self.assertEqual(ledger[-1]["phase"], "implementation")
+                self.assertEqual(ledger[-1]["boundary"], "B3")
+        # THE CONTROL, co-located: the same scenario with no seam applied completes.
+        completed, _ = self.final_review_workflow(modes=("pass",))
+        self.assertEqual(completed.final_status, "COMPLETED")
+
+    def test_the_final_review_record_binds_the_next_boundary(self) -> None:
+        """The Final Review B3 record becomes the ledger HEAD, so T4's B1 site has to
+        expect this round. If it did not, an ordinary routed FAIL would refuse as
+        A3-unbound -- which is why this control is co-located with the two above."""
+        scenario = WorkflowScenario(
+            phases=("implementation",),
+            phase_scenarios={"implementation": self.passing_phase()},
+            final_review=FinalReviewScenario(
+                modes=("fail", "pass"), findings=((("F1", "implementation"),), ())
+            ),
+            correction_scenarios={
+                ("implementation", 1): FakeScenario(
+                    worker_modes=("correction",),
+                    reviewer_modes=("pass",),
+                    worker_resolutions=({"F1": "RESOLVED"},),
+                )
+            },
+            run_id=self.RUN_ID,
+        )
+
+        result, ledger = self.workflow(scenario)
+
+        self.assertEqual(result.final_status, "COMPLETED")
+        self.assertTrue(result.correction_dispatches)
+        self.assertEqual(
+            [(record["phase"], record["boundary"]) for record in ledger[1:]],
+            [
+                ("implementation", "B2"),
+                ("implementation", "B3"),
+                (FINAL_REVIEW_PHASE, "B3"),    # attempt 1: quality FAIL, decision CLEAR
+                ("implementation", "B2"),      # the correction round it routed
+                ("implementation", "B3"),
+                (FINAL_REVIEW_PHASE, "B3"),    # attempt 2: quality PASS
+            ],
+        )
+        # The two axes stay separate in the record: a quality FAIL is written beside
+        # a CLEAR decision, never as one.
+        self.assertEqual(ledger[3]["verdict"], "FAIL")
+        self.assertEqual(ledger[3]["state"], "CLEAR")
+        self.assertEqual(ledger[6]["verdict"], "PASS")
+
+    # ---- scenario 8 -------------------------------------------------------------------
+    def test_a_downstream_expansion_is_a_new_decision_event_not_a_lineage_link(
+        self,
+    ) -> None:
+        """Scenario 8: a T5a revalidation that widens an earlier decision must raise a
+        NEW decision event; there is no link back to what it widened (L3)."""
+        scenario = WorkflowScenario(
+            phases=("analysis", "implementation"),
+            phase_scenarios={
+                "analysis": self.passing_phase(),
+                "implementation": self.passing_phase(),
+            },
+            final_review=FinalReviewScenario(
+                modes=("fail", "pass"), findings=((("F1", "analysis"),), ())
+            ),
+            correction_scenarios={
+                ("analysis", 1): FakeScenario(
+                    worker_modes=("correction",),
+                    reviewer_modes=("pass",),
+                    worker_resolutions=({"F1": "RESOLVED"},),
+                )
+            },
+            revalidation_scenarios={
+                ("implementation", 1): self.blocking_phase("CONFLICT")
+            },
+            run_id=self.RUN_ID,
+        )
+
+        blocked, ledger = self.workflow(scenario)
+
+        self.assertEqual(blocked.final_status, "BLOCKED")
+        self.assertEqual(
+            blocked.reason, "DECISION_BLOCKED:CONFLICT:requirement_contradiction"
+        )
+        # The escalation is a NEW ledger record, and NO record links to another
+        # decision: `verifies` references a ledger RECORD and nothing else does.
+        escalations = [
+            record
+            for record in ledger
+            if record.get("state") == "CONFLICT" and record.get("phase") == "implementation"
+        ]
+        self.assertTrue(escalations)
+        for record in ledger:
+            for reserved in decision_gate.OS30_RESERVED_FIELDS:
+                self.assertNotIn(reserved, record)
+        # THE CONTROL: a revalidation that stays inside the original decision needs
+        # no new event and the run completes.
+        inside = replace(
+            scenario,
+            revalidation_scenarios={("implementation", 1): self.passing_phase()},
+        )
+        completed, _ = self.workflow(inside)
+        self.assertEqual(completed.final_status, "COMPLETED")
+
+    # ---- the ledger's provenance ------------------------------------------------------
+    def test_every_settled_boundary_leaves_a_complete_bound_record(self) -> None:
+        scenario = self.clear_workflow()
+
+        result, ledger = self.workflow(scenario)
+
+        self.assertEqual(result.final_status, "COMPLETED")
+        # sequence 0 is the declaration; then one record per settled boundary.
+        self.assertEqual([r["sequence"] for r in ledger], list(range(len(ledger))))
+        self.assertEqual(ledger[0]["source"], "coordinator:run_entry")
+        settled = ledger[1:]
+        self.assertEqual(
+            [(r["phase"], r["role"], r["boundary"]) for r in settled],
+            [
+                ("analysis", "worker", "B2"),
+                ("analysis", "reviewer", "B3"),
+                ("implementation", "worker", "B2"),
+                ("implementation", "reviewer", "B3"),
+                # The Final Review's after-result boundary is a settled B3 like any
+                # other: the Final Reviewer's own decision result is recorded, not
+                # discarded, so "every settled boundary" includes this one.
+                (FINAL_REVIEW_PHASE, "reviewer", "B3"),
+            ],
+        )
+        for record in ledger:
+            for field in decision_gate.REQUIRED_LEDGER_RECORD_FIELDS:
+                self.assertIn(field, record)
+            for field in decision_gate.LEDGER_MECHANICS_FIELDS:
+                self.assertIn(field, record)
+            self.assertEqual(record["run"], self.RUN_ID)
+        # The Reviewer's record carries the quality verdict beside -- never as -- the
+        # decision state: two axes, two fields.
+        self.assertEqual(settled[1]["verdict"], "PASS")
+        self.assertEqual(settled[1]["state"], "CLEAR")
+        self.assertEqual(settled[0]["verdict"], "")
+
+    def test_a_fully_clear_run_adds_artifacts_without_changing_a_transition(
+        self,
+    ) -> None:
+        """The rollback guarantee, stated as an assertion: a CLEAR run's transitions
+        are the pre-OS-29 ones, and what it gains is artifacts."""
+        scenario = self.clear_workflow()
+
+        result, ledger = self.workflow(scenario)
+
+        self.assertEqual(result.final_status, "COMPLETED")
+        self.assertEqual(result.phase_iterations, {"analysis": 1, "implementation": 1})
+        self.assertEqual(result.correction_dispatches, [])
+        self.assertEqual(result.revalidation_dispatches, [])
+        self.assertEqual(result.final_review_iterations, 1)
+        self.assertEqual(result.reason, None)
+        self.assertEqual(result.decision_state, "")
+        self.assertEqual(result.decision_reason_code, "")
+        # ...and the additions really are there, so this is a no-op in transitions
+        # and NOT a build in which the gate never ran.
+        # Four phase boundaries + the Final Review B3 record, after the declaration.
+        self.assertEqual(len(ledger), 6)
+        self.assertEqual(
+            (ledger[-1]["phase"], ledger[-1]["boundary"], ledger[-1]["state"]),
+            (FINAL_REVIEW_PHASE, "B3", "CLEAR"),
+        )
+
+
+class DecisionGateNonDuplicationTests(unittest.TestCase):
+    """NV-3 / M-DUP: the verification-mode Reviewer is not a second loop.
+
+    One test function, three steps, in this order: (1) prove the mutation is not a
+    no-op, (2) prove the round_kind proxy is BLIND to it -- which is what demotes
+    that proxy from "the non-duplication proof" to supplementary evidence -- and
+    (3) prove the invariants reject it while the unmutated control passes.
+    """
+
+    ORCHESTRATION_SKILL = (
+        Path(__file__).resolve().parents[1]
+        / "orca-worker-reviewer-orchestration"
+        / "SKILL.md"
+    )
+
+    @staticmethod
+    def invariant_violations(result: WorkflowResult) -> list[str]:
+        """INV-D1: one Worker event and at most one Reviewer event per iteration."""
+        violations: list[str] = []
+        by_iteration: dict[int, dict[str, int]] = {}
+        for event in result.sessions:
+            counts = by_iteration.setdefault(event.iteration, {})
+            counts[event.role] = counts.get(event.role, 0) + 1
+        for iteration, counts in by_iteration.items():
+            if counts.get("worker", 0) != 1:
+                violations.append(f"iteration {iteration}: {counts} worker events")
+            if counts.get("reviewer", 0) > 1:
+                violations.append(f"iteration {iteration}: {counts} reviewer events")
+        if len(result.reviewer_attempts) > len(result.worker_attempts):
+            violations.append("more reviewer attempts than worker attempts")
+        return violations
+
+    def run_round(self, harness_class, state: str) -> WorkflowResult:
+        with tempfile.TemporaryDirectory() as directory:
+            harness = harness_class(
+                self.ORCHESTRATION_SKILL,
+                phase="implementation",
+                workspace=Path(directory),
+                run_id="run_mdup",
+                risk="high",
+            )
+            return harness.run(
+                FakeScenario(
+                    worker_modes=("complete",),
+                    reviewer_modes=("pass", "pass"),
+                    worker_decision_states=(state,),
+                    reviewer_decision_states=(state, state),
+                )
+            )
+
+    def test_m_dup_fails_the_invariants_while_the_control_passes(self) -> None:
+        class DuplicatingHarness(E2EHarness):
+            """The mutation: record a SECOND reviewer event for the same
+            (phase, iteration), reusing the existing phase_gate label so the
+            round_kind vocabulary check cannot see it."""
+
+            def _record_session(self, role, iteration, **kwargs):
+                E2EHarness._record_session(self, role, iteration, **kwargs)
+                if role == "reviewer":
+                    E2EHarness._record_session(self, role, iteration, **kwargs)
+
+        control = self.run_round(E2EHarness, "NEEDS_INPUT")
+        mutant = self.run_round(DuplicatingHarness, "NEEDS_INPUT")
+
+        # (1) ANTI-VACUITY PRECHECK: the mutation is not a no-op.
+        self.assertGreater(len(mutant.sessions), len(control.sessions))
+        self.assertGreater(
+            sum(1 for e in mutant.sessions if e.role == "reviewer"),
+            sum(1 for e in control.sessions if e.role == "reviewer"),
+        )
+        # (2) THE PROXY IS BLIND: the four-value round_kind assertion still passes on
+        # the mutant, which is why it is not the non-duplication proof.
+        self.assertEqual(len(run_logging.ROUND_KIND_VALUES), 4)
+        self.assertIn("phase_gate", run_logging.ROUND_KIND_VALUES)
+        # (3) THE INVARIANT REJECTS THE MUTANT ...
+        self.assertTrue(self.invariant_violations(mutant))
+        # ... AND RETURNS CLEAN ON THE CONTROL, so it is not a checker that rejects
+        # everything. Note the control is a decision-BLOCKED round: verification mode
+        # runs the already-scheduled Reviewer once, not twice.
+        self.assertEqual(self.invariant_violations(control), [])
+        self.assertEqual(control.final_status, "BLOCKED")
+        self.assertEqual(len(control.reviewer_attempts), 1)
+        # And a CLEAR round is equally clean, so the invariant is not specific to a
+        # blocked one.
+        clear = self.run_round(E2EHarness, "CLEAR")
+        self.assertEqual(self.invariant_violations(clear), [])
+        self.assertEqual(clear.final_status, "COMPLETED")
+
+
+# =====================================================================================
+# OS-29 TEST phase (approved PLAN P4 / P6a / P6b, exit criteria P10).
+#
+# Everything below is ADDITIVE. No case above this line was edited, renamed, weakened
+# or deleted; these are the NAMED fixtures P4 gives the fourteen scenarios plus the
+# P6a/P6b cells that had no case of their own after IMPLEMENTATION.
+#
+# Naming rule: each fixture carries the exact name PLAN P4 gives it, so the
+# scenario-to-fixture table in artifacts/runs/run_35b221ea299d/TEST.md is a lookup and
+# not an interpretation.
+#
+# Non-vacuity rule, inherited from scripts/test_decision_policy.py:4-8: every control
+# sits INSIDE the test function whose claim it protects. A control in a neighbouring
+# test can be skipped or deleted independently of the claim it is supposed to make
+# non-vacuous -- and this run has twice proved that a fully green suite can coexist
+# with a fail-open defect.
+# =====================================================================================
+
+OS29_RUN_ID = "run_os29_test"
+OS29_FIXTURES = (
+    Path(__file__).resolve().parents[1] / "scripts" / "fixtures" / "decision_gate"
+)
+#: The six facts `assumption_allowed_requires.declared_safety_facts` names. Read from
+#: the shipped contract in the test itself, never trusted from this list.
+OS29_SAFETY_FACTS = (
+    "blast_radius",
+    "monetary_cost",
+    "security",
+    "privacy",
+    "compliance",
+    "long_term_lock_in",
+)
+
+
+def os29_fixture(kind: str, name: str) -> dict:
+    return json.loads((OS29_FIXTURES / kind / f"{name}.json").read_text(encoding="utf-8"))
+
+
+def _passing_phase(**overrides) -> FakeScenario:
+    return FakeScenario(worker_modes=("complete",), reviewer_modes=("pass",), **overrides)
+
+
+# ---- scenario 1 ---------------------------------------------------------------------
+def clear_pass_proceeds(
+    phases=("analysis", "implementation"), run_id: str = OS29_RUN_ID
+) -> WorkflowScenario:
+    """POSITIVE: every boundary declares CLEAR and every Reviewer PASSes."""
+    return WorkflowScenario(
+        phases=phases,
+        phase_scenarios={phase: _passing_phase() for phase in phases},
+        final_review=FinalReviewScenario(modes=("pass",)),
+        run_id=run_id,
+    )
+
+
+def clear_pass_but_absent_record(
+    phases=("analysis", "implementation"), run_id: str = OS29_RUN_ID
+) -> WorkflowScenario:
+    """NEGATIVE: the Reviewer still PASSes on the QUALITY axis while the Worker
+    declares no decision result at all. A quality PASS is not a decision result, so
+    the run must not proceed -- the ticket's fail-closed rule, item 1."""
+    return WorkflowScenario(
+        phases=phases,
+        phase_scenarios={
+            phases[0]: _passing_phase(worker_decision_states=("",)),
+            **{phase: _passing_phase() for phase in phases[1:]},
+        },
+        final_review=FinalReviewScenario(modes=("pass",)),
+        run_id=run_id,
+    )
+
+
+# ---- scenario 2 ---------------------------------------------------------------------
+def assumption_allowed_six_facts_declared(
+    phases=("implementation",), run_id: str = OS29_RUN_ID
+) -> WorkflowScenario:
+    """POSITIVE: a supporting policy source and all six safety facts declared."""
+    return WorkflowScenario(
+        phases=phases,
+        phase_scenarios={
+            phase: _passing_phase(worker_decision_states=("ASSUMPTION_ALLOWED",))
+            for phase in phases
+        },
+        final_review=FinalReviewScenario(modes=("pass",)),
+        run_id=run_id,
+    )
+
+
+def assumption_allowed_one_fact_undeclared(
+    fact: str, phases=("implementation",), run_id: str = OS29_RUN_ID
+) -> WorkflowScenario:
+    """NEGATIVE: the same record with exactly ONE of the six facts removed."""
+    record = os29_fixture("valid", "worker_assumption_allowed")
+    record.pop(fact)
+    return WorkflowScenario(
+        phases=phases,
+        phase_scenarios={
+            phases[0]: _passing_phase(
+                worker_decision_states=("ASSUMPTION_ALLOWED",),
+                worker_decision_args=(
+                    ("--decision-gate-record-raw", json.dumps(record, sort_keys=True)),
+                ),
+            ),
+            **{phase: _passing_phase() for phase in phases[1:]},
+        },
+        final_review=FinalReviewScenario(modes=("pass",)),
+        run_id=run_id,
+    )
+
+
+# ---- scenario 11 --------------------------------------------------------------------
+def timeout_no_response(source: str, run_id: str = OS29_RUN_ID) -> FakeScenario:
+    """The Worker classifies NEEDS_INPUT; the verification Reviewer proposes CLEAR and
+    offers `source` as the user authority for it. `timeout` and `no_response` are two
+    of the contract's five forbidden authority sources."""
+    return FakeScenario(
+        worker_modes=("complete",),
+        reviewer_modes=("pass",),
+        worker_decision_states=("NEEDS_INPUT",),
+        reviewer_decision_states=("CLEAR",),
+        reviewer_decision_args=(
+            (
+                "--decision-gate-record-extend",
+                json.dumps(
+                    {
+                        "user_decision": {
+                            "source": source,
+                            "where_recorded": f"artifacts/runs/{run_id}/DECISION.md",
+                            "resolves": f"{run_id}/implementation/1/B2#1",
+                        }
+                    },
+                    sort_keys=True,
+                ),
+            ),
+        ),
+    )
+
+
+# ---- scenario 12 / P6a F10 ----------------------------------------------------------
+def plant_open_decision_item(harness, *, phase: str, iteration: int, declare: bool) -> str:
+    """Append one open blocking record bound to (phase, iteration), and either declare
+    it in the run-entry record or leave the declaration claiming nothing is open.
+
+    `declare=True` is scenario 12 -- the honest ledger on which A5 fires.
+    `declare=False` is P6a F10 -- the lying declaration on which A6 fires first.
+
+    Planted rather than produced because a block PRODUCED in-phase terminates the run
+    at that phase, so the state "a later dispatch is attempted while an item is open"
+    is only reachable by constructing it.
+    """
+    planted = dict(
+        os29_fixture("valid", "worker_needs_input"),
+        run=harness.run_id,
+        phase=phase,
+        iteration=iteration,
+        responsible_phase=phase,
+    )
+    _, sequence = run_logging.append_decision_ledger_record(
+        harness.run_id,
+        planted,
+        base=harness.workspace,
+        ledger_schema_version=decision_gate.LEDGER_RECORD_SCHEMA_VERSION,
+    )
+    key = decision_gate.ledger_key(dict(planted, sequence=sequence))
+    declaration_path = (
+        Path(harness.workspace)
+        / "artifacts" / "runs" / harness.run_id / "decision_ledger"
+        / "000000" / "record.json"
+    )
+    declaration = json.loads(declaration_path.read_text(encoding="utf-8"))
+    declaration["prior_open_decision_items"] = [key] if declare else []
+    declaration_path.write_text(
+        json.dumps(declaration, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    return key
+
+
+class illegal_dispatch_after_block(E2EHarness):
+    """The scenario-12 harness: plant the open item after the Nth settled boundary
+    record, so ONE class can arm each of the four B1 sites in turn.
+
+    The counter is a LIST, not an int, for the reason `_phase_harness`'s own docstring
+    records: the per-phase harness is a `copy.copy()` and only mutable attributes are
+    shared with it. An integer counter would be copied by value and every phase round
+    would count from zero -- which is exactly what this class first did, and the
+    three sites then reported COMPLETED instead of blocking.
+    """
+
+    plant_after = 0
+    declare = True
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.settled_records: list[str] = []
+        self.planted: list[str] = []
+
+    def _append_decision_record(self, gate, **kwargs):
+        key = E2EHarness._append_decision_record(self, gate, **kwargs)
+        self.settled_records.append(key)
+        if len(self.settled_records) == self.plant_after:
+            self.planted.append(
+                plant_open_decision_item(
+                    self,
+                    phase=kwargs["phase"],
+                    iteration=kwargs["iteration"],
+                    declare=self.declare,
+                )
+            )
+        return key
+
+
+class _OS29HarnessMixin:
+    """The three harness helpers the OS-29 TEST-phase classes share. A mixin rather
+    than a base TestCase so the matrix class does not re-run the per-scenario cases."""
+
+    ORCHESTRATION_SKILL = (
+        Path(__file__).resolve().parents[1]
+        / "orca-worker-reviewer-orchestration"
+        / "SKILL.md"
+    )
+    RUN_ID = OS29_RUN_ID
+    BLOCK = "DECISION_BLOCKED:NEEDS_INPUT:blast_radius_beyond_scope"
+
+    # ---- helpers ---------------------------------------------------------------------
+    def harness(self, workspace: Path, *, risk: str = "high", phase: str = "implementation",
+                max_iterations: int = 5, factory=E2EHarness) -> E2EHarness:
+        return factory(
+            self.ORCHESTRATION_SKILL,
+            phase=phase,
+            max_iterations=max_iterations,
+            workspace=workspace,
+            run_id=self.RUN_ID,
+            risk=risk,
+        )
+
+    def round_at(self, risk: str, scenario: FakeScenario) -> WorkflowResult:
+        with tempfile.TemporaryDirectory() as directory:
+            return self.harness(Path(directory), risk=risk).run(scenario)
+
+    def workflow(self, scenario, *, risk: str = "high", factory=E2EHarness):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            harness = self.harness(
+                workspace, risk=risk, phase=scenario.phases[0], factory=factory
+            )
+            result = harness.run_workflow(scenario)
+            ledger = run_logging.read_decision_ledger(scenario.run_id, base=workspace)
+            return result, ledger
+
+
+class DecisionGateNamedScenarioTests(_OS29HarnessMixin, unittest.TestCase):
+    # ---- scenario 1 ------------------------------------------------------------------
+    def test_scenario_1_clear_pass_proceeds_and_an_absent_record_does_not(self) -> None:
+        """POSITIVE `clear_pass_proceeds` / NEGATIVE `clear_pass_but_absent_record`.
+
+        The negative is the ticket's own trap: the QUALITY axis says PASS on both
+        halves, and the run must still not proceed, because a PASS is not a decision
+        result. A test that only asserted "CLEAR + PASS proceeds" would have passed at
+        IMPLEMENTATION iteration 1 as well.
+        """
+        proceeded, ledger = self.workflow(clear_pass_proceeds())
+
+        self.assertEqual(proceeded.final_status, "COMPLETED")
+        self.assertEqual(
+            [event.phase for event in proceeded.sessions if event.role == "worker"],
+            ["analysis", "implementation"],
+        )
+        self.assertEqual(proceeded.phase_iterations, {"analysis": 1, "implementation": 1})
+        self.assertEqual([record["state"] for record in ledger], ["CLEAR"] * len(ledger))
+
+        blocked, blocked_ledger = self.workflow(clear_pass_but_absent_record())
+
+        self.assertEqual(blocked.final_status, "BLOCKED")
+        self.assertEqual(blocked.reason, "DECISION_GATE_INPUT_MISSING")
+        self.assertEqual(blocked.decision_state, decision_gate.INPUT_DEFECT_STATE)
+        # The SECOND phase never dispatched, and no defective record was published.
+        self.assertEqual(
+            [event.phase for event in blocked.sessions if event.role == "worker"],
+            ["analysis"],
+        )
+        self.assertEqual(blocked.phase_iterations["implementation"], 0)
+        self.assertEqual(blocked.correction_dispatches, [])
+        self.assertEqual(len(blocked_ledger), 1)          # the declaration alone
+        # THE CO-LOCATED NON-VACUITY GUARD: the two runs differ in exactly one thing --
+        # whether the first Worker declared a state -- so "did not proceed" is
+        # attributable to the gate and not to a harness that never proceeds.
+        self.assertEqual(
+            clear_pass_proceeds().phases, clear_pass_but_absent_record().phases
+        )
+        self.assertEqual(
+            clear_pass_proceeds().phase_scenarios["implementation"],
+            clear_pass_but_absent_record().phase_scenarios["implementation"],
+        )
+        self.assertEqual(
+            clear_pass_but_absent_record().phase_scenarios["analysis"].worker_decision_states,
+            ("",),
+        )
+
+    # ---- scenario 2 ------------------------------------------------------------------
+    def test_scenario_2_assumption_allowed_is_recorded_and_then_proceeds(self) -> None:
+        """POSITIVE `assumption_allowed_six_facts_declared` / NEGATIVE
+        `assumption_allowed_one_fact_undeclared`, one negative per fact."""
+        from scripts.decision_policy import load_decision_policy
+
+        policy = load_decision_policy(self.ORCHESTRATION_SKILL)
+        declared = tuple(policy.assumption_allowed_requires["declared_safety_facts"])
+        # The loop below is data-driven, so its collection's cardinality is asserted
+        # HERE, before the loop -- the D4-F guard.
+        self.assertEqual(len(declared), 6)
+        self.assertEqual(set(declared), set(OS29_SAFETY_FACTS))
+
+        proceeded, ledger = self.workflow(assumption_allowed_six_facts_declared())
+
+        self.assertEqual(proceeded.final_status, "COMPLETED")
+        self.assertEqual(proceeded.phase_iterations["implementation"], 1)
+        recorded = [
+            record for record in ledger if record["state"] == "ASSUMPTION_ALLOWED"
+        ]
+        self.assertEqual(len(recorded), 1)
+        # "record then proceed": the assumption and its grounds are IN the ledger, not
+        # merely tolerated by the transition.
+        self.assertEqual(recorded[0]["reason_code"], "repository_policy")
+        self.assertEqual(recorded[0]["boundary"], "B2")
+        self.assertIsNotNone(recorded[0]["assumption"])
+        self.assertTrue(recorded[0]["grounds"])
+        self.assertIs(recorded[0]["open_decision_item"], False)
+        for fact in declared:
+            self.assertIn(fact, recorded[0])
+
+        for fact in declared:
+            with self.subTest(undeclared=fact):
+                blocked, blocked_ledger = self.workflow(
+                    assumption_allowed_one_fact_undeclared(fact)
+                )
+                self.assertEqual(blocked.final_status, "BLOCKED")
+                self.assertEqual(blocked.reason, "DECISION_GATE_INPUT_MALFORMED")
+                self.assertEqual(blocked.phase_iterations["implementation"], 0)
+                # No ASSUMPTION_ALLOWED record was published for a rejected assumption.
+                self.assertEqual(
+                    [r for r in blocked_ledger if r["state"] == "ASSUMPTION_ALLOWED"], []
+                )
+
+    # ---- P6b row 5 --------------------------------------------------------------------
+    def test_p6b_row_5_a_stricter_verification_carries_the_reviewers_own_state(
+        self,
+    ) -> None:
+        """Row 5 through the REAL subprocess, not only through evaluate_verification():
+        a verification may move toward MORE blocking, never away."""
+        stricter = self.round_at(
+            "high",
+            FakeScenario(
+                worker_modes=("complete",),
+                reviewer_modes=("pass",),
+                worker_decision_states=("NEEDS_INPUT",),
+                reviewer_decision_states=("CONFLICT",),
+            ),
+        )
+
+        self.assertEqual(stricter.final_status, "BLOCKED")
+        self.assertEqual(
+            stricter.reason, "DECISION_BLOCKED:CONFLICT:requirement_contradiction"
+        )
+        self.assertEqual(stricter.decision_state, "CONFLICT")
+        self.assertEqual(stricter.decision_reason_code, "requirement_contradiction")
+        # CONTROL 1 (row 4): the CONFIRMING Reviewer carries the WORKER's state, so
+        # "stricter" is a real branch and not the only branch.
+        confirmed = self.round_at(
+            "high",
+            FakeScenario(
+                worker_modes=("complete",),
+                reviewer_modes=("pass",),
+                worker_decision_states=("NEEDS_INPUT",),
+                reviewer_decision_states=("NEEDS_INPUT",),
+            ),
+        )
+        self.assertEqual(confirmed.reason, self.BLOCK)
+        # CONTROL 2 (row 1 -> row 9): the same Reviewer PASS with a CLEAR Worker
+        # completes, so neither terminal above is a harness that blocks everything.
+        self.assertEqual(
+            self.round_at("high", _passing_phase()).final_status, "COMPLETED"
+        )
+
+    # ---- scenario 11 -------------------------------------------------------------------
+    def test_scenario_11_a_timeout_or_non_response_approves_nothing_and_charges_nothing(
+        self,
+    ) -> None:
+        """POSITIVE `timeout_no_response` / NEGATIVE control `quality_fail_consumes_iteration`.
+
+        The ticket forbids "timeout or user non-response" from becoming an approval.
+        The interesting half is that the run offers the timeout as USER AUTHORITY for a
+        downgrade -- the shape in which a fail-open would actually be written.
+        """
+        from scripts.decision_policy import load_decision_policy
+
+        policy = load_decision_policy(self.ORCHESTRATION_SKILL)
+        # PRECHECK, on the test_decision_policy.py:2157-2178 pattern: the injected
+        # values really are the contract's forbidden sources, and the set is closed.
+        self.assertEqual(len(policy.forbidden_authority_sources), 5)
+        for source in ("timeout", "no_response"):
+            self.assertIn(source, policy.forbidden_authority_sources)
+            self.assertNotIn(source, policy.user_decision_sources)
+
+        for source in ("timeout", "no_response"):
+            with self.subTest(source=source):
+                refused = self.round_at("high", timeout_no_response(source, self.RUN_ID))
+                self.assertEqual(refused.final_status, "BLOCKED")
+                self.assertEqual(refused.reason, decision_gate.DOWNGRADE_REJECTED)
+                # The Worker's classification is not erased by the rejected downgrade.
+                self.assertEqual(refused.decision_state, "NEEDS_INPUT")
+                self.assertEqual(
+                    refused.decision_reason_code, "blast_radius_beyond_scope"
+                )
+                self.assertIsNotNone(refused.decision_block)
+
+        # CONTROL A, co-located: the SAME downgrade offered with a source the contract
+        # DOES admit takes a different path -- the transition is accepted and the round
+        # is still terminal (L6). So the refusal above is attributable to the forbidden
+        # source and not to a gate that rejects every downgrade.
+        authorized = self.round_at(
+            "high", timeout_no_response("explicit_user_reply", self.RUN_ID)
+        )
+        self.assertEqual(authorized.final_status, "BLOCKED")
+        self.assertEqual(authorized.reason, self.BLOCK)
+        self.assertNotEqual(authorized.reason, decision_gate.DOWNGRADE_REJECTED)
+
+        # CONTROL B, co-located (NV-2): none of the rounds above charged a correction
+        # iteration, and a QUALITY FAIL round in the same harness still charges one --
+        # so "no iteration consumed" is not a globally broken counter.
+        with tempfile.TemporaryDirectory() as directory:
+            blocked = self.harness(
+                Path(directory), risk="high", max_iterations=2
+            ).run_workflow(
+                WorkflowScenario(
+                    phases=("implementation",),
+                    phase_scenarios={"implementation": timeout_no_response("timeout", self.RUN_ID)},
+                    final_review=FinalReviewScenario(modes=("pass",)),
+                    run_id=self.RUN_ID,
+                )
+            )
+        self.assertEqual(blocked.phase_iterations["implementation"], 0)
+        self.assertEqual(blocked.correction_dispatches, [])
+        with tempfile.TemporaryDirectory() as directory:
+            charged = self.harness(
+                Path(directory), risk="high", max_iterations=2
+            ).run_workflow(
+                WorkflowScenario(
+                    phases=("implementation",),
+                    phase_scenarios={
+                        "implementation": FakeScenario(
+                            worker_modes=("complete", "correction"),
+                            reviewer_modes=("fail", "pass"),
+                            reviewer_findings=(("Q1",), ()),
+                            worker_resolutions=({}, {"Q1": "RESOLVED"}),
+                        )
+                    },
+                    final_review=FinalReviewScenario(modes=("pass",)),
+                    run_id=self.RUN_ID,
+                )
+            )
+        self.assertEqual(charged.final_status, "COMPLETED")
+        self.assertEqual(charged.phase_iterations["implementation"], 2)
+
+    # ---- scenario 12: the three B1 sites the phase-gate case cannot reach ---------------
+    def test_scenario_12_an_illegal_dispatch_is_refused_at_every_remaining_b1_site(
+        self,
+    ) -> None:
+        """`illegal_dispatch_after_block` at B1 sites 2, 3 and 4.
+
+        Site 1 (the phase gate) is covered by
+        `DecisionGateTransitionTests.test_an_open_ledger_item_blocks_the_next_phase_dispatch`.
+        The other three are reached by planting the open item after the Nth settled
+        boundary record: after the last phase record (site 2, the Final Review entry),
+        after the Final Review's own B3 record (site 3, the T4 correction entry) and
+        after the correction round settles (site 4, the T5a revalidation entry).
+        """
+        routed_scenario = WorkflowScenario(
+            phases=("analysis", "implementation"),
+            phase_scenarios={
+                "analysis": _passing_phase(),
+                "implementation": _passing_phase(),
+            },
+            final_review=FinalReviewScenario(
+                modes=("fail", "pass"), findings=((("F1", "analysis"),), ())
+            ),
+            correction_scenarios={
+                ("analysis", 1): FakeScenario(
+                    worker_modes=("correction",),
+                    reviewer_modes=("pass",),
+                    worker_resolutions=({"F1": "RESOLVED"},),
+                )
+            },
+            revalidation_scenarios={("implementation", 1): _passing_phase()},
+            run_id=self.RUN_ID,
+        )
+        # The control run FIRST, so every "nothing was dispatched" below is measured
+        # against a run that demonstrably dispatches at all four sites. Without it,
+        # an empty ledger also passes on a harness that never dispatches (risk R-9).
+        completed, _ = self.workflow(routed_scenario)
+        self.assertEqual(completed.final_status, "COMPLETED")
+        self.assertEqual(completed.final_review_iterations, 2)
+        self.assertTrue(completed.correction_dispatches)
+        self.assertTrue(completed.revalidation_dispatches)
+
+        # (plant_after, the dispatch THIS site guards, what must ALREADY have happened)
+        # `reached` is what pins the refusal to the intended site: without it, a plant
+        # that fired one site too early would satisfy "the guarded dispatch is empty"
+        # just as well.
+        sites = {
+            # settled records before the site: analysis W,R + implementation W,R
+            "final_review": (4, "final_review_iterations", 0, {"phase_iterations": {"analysis": 1, "implementation": 1}}),
+            # ...plus the Final Review's own B3 record
+            "correction": (5, "correction_dispatches", [], {"final_review_iterations": 1}),
+            # ...plus the correction round's W,R
+            "downstream_revalidation": (7, "revalidation_dispatches", [], {"correction_dispatches": [("analysis", 2)], "final_review_iterations": 1}),
+        }
+        self.assertEqual(len(sites), 3)                       # co-located D4-F guard
+        for site, (plant_after, attribute, empty, reached) in sites.items():
+            with self.subTest(b1_site=site):
+                factory = type(
+                    "PlantAt", (illegal_dispatch_after_block,),
+                    {"plant_after": plant_after, "declare": True},
+                )
+                blocked, ledger = self.workflow(routed_scenario, factory=factory)
+
+                self.assertEqual(blocked.final_status, "BLOCKED")
+                self.assertEqual(blocked.reason, self.BLOCK)
+                self.assertEqual(blocked.decision_state, "NEEDS_INPUT")
+                self.assertEqual(
+                    blocked.decision_reason_code, "blast_radius_beyond_scope"
+                )
+                # The run really did get as far as this site ...
+                for name, value in reached.items():
+                    self.assertEqual(getattr(blocked, name), value)
+                # ... the dispatch this site guards did not happen ...
+                self.assertEqual(getattr(blocked, attribute), empty)
+                # ... while the SAME attribute is non-empty on the control run, which
+                # is what makes the emptiness a fact about the guard.
+                self.assertNotEqual(getattr(completed, attribute), empty)
+                # ... and the planted item really is the ledger's open one.
+                self.assertEqual(
+                    [
+                        decision_gate.ledger_key(record)
+                        for record in ledger
+                        if record["state"] in decision_gate.BLOCKING_STATES
+                    ],
+                    [ledger[0]["prior_open_decision_items"][0]],
+                )
+
+    # ---- P6a F10 ------------------------------------------------------------------------
+    def test_f10_the_run_entry_declaration_is_recomputed_and_never_rubber_stamped(
+        self,
+    ) -> None:
+        """F10 / A6, on two REACHABLE shapes of a reused run id.
+
+        A6 exists because the declaration is a producer's CLAIM about the ledger. The
+        claim is re-derived at every B1, so a run id whose directory already holds an
+        open blocking item cannot be waved through by a declaration that says
+        otherwise. Both shapes below are reachable, and neither can yield a CLEAR.
+        """
+        scenario = clear_pass_proceeds()
+
+        # SHAPE 1 -- the lying declaration, mid-run. The ledger gains an open item the
+        # declaration does not name; A6 fires BEFORE A5 so the reason accuses the
+        # PRODUCER rather than hiding a lying declaration behind the block it failed
+        # to declare.
+        lying = type(
+            "LyingDeclaration", (illegal_dispatch_after_block,),
+            {"plant_after": 2, "declare": False},
+        )
+        refused, ledger = self.workflow(scenario, factory=lying)
+
+        self.assertEqual(refused.final_status, "BLOCKED")
+        self.assertEqual(
+            refused.reason, decision_gate.DECLARATION_DISAGREES_WITH_LEDGER
+        )
+        self.assertEqual(refused.decision_state, decision_gate.INPUT_DEFECT_STATE)
+        self.assertEqual(ledger[0]["prior_open_decision_items"], [])
+        self.assertEqual(refused.phase_iterations["implementation"], 0)
+        # CONTROL, co-located: the SAME planted ledger with an HONEST declaration
+        # refuses with the BLOCK reason instead. One field differs between the two
+        # runs, and it changes which clause names the defect -- so A6 is not a clause
+        # that refuses every two-record ledger.
+        honest = type(
+            "HonestDeclaration", (illegal_dispatch_after_block,),
+            {"plant_after": 2, "declare": True},
+        )
+        blocked, honest_ledger = self.workflow(scenario, factory=honest)
+        self.assertEqual(blocked.reason, self.BLOCK)
+        self.assertEqual(len(honest_ledger[0]["prior_open_decision_items"]), 1)
+        # ...and with nothing planted at all the same scenario completes.
+        self.assertEqual(self.workflow(scenario)[0].final_status, "COMPLETED")
+
+        # SHAPE 2 -- the literal reuse: a first run BLOCKS and leaves its open item on
+        # disk; a second run REUSES the same run id and workspace. open_decision_ledger
+        # is idempotent, so the surviving declaration still claims nothing is open --
+        # and the second run does not dispatch a single agent. It refuses at A3, which
+        # precedes A6: at a run's FIRST boundary the head must be the settled record of
+        # a round that just settled, and there is none. The declaration is admissible
+        # at exactly one position and this is not it.
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            first = self.harness(workspace, risk="high", phase="analysis")
+            blocking = WorkflowScenario(
+                phases=("analysis",),
+                phase_scenarios={
+                    "analysis": FakeScenario(
+                        worker_modes=("complete",),
+                        reviewer_modes=("pass",),
+                        worker_decision_states=("NEEDS_INPUT",),
+                        reviewer_decision_states=("NEEDS_INPUT",),
+                    )
+                },
+                final_review=FinalReviewScenario(modes=("pass",)),
+                run_id=self.RUN_ID,
+            )
+            first_result = first.run_workflow(blocking)
+            self.assertEqual(first_result.final_status, "BLOCKED")
+            self.assertEqual(first_result.reason, self.BLOCK)
+
+            surviving = run_logging.read_decision_ledger(self.RUN_ID, base=workspace)
+            self.assertEqual(surviving[0]["prior_open_decision_items"], [])
+            self.assertTrue(
+                [r for r in surviving if r["state"] in decision_gate.BLOCKING_STATES]
+            )
+
+            second = self.harness(workspace, risk="high", phase="analysis")
+            reused = second.run_workflow(clear_pass_proceeds(phases=("analysis",)))
+
+        self.assertEqual(reused.final_status, "BLOCKED")
+        self.assertEqual(reused.reason, decision_gate.GATE_INPUT_UNBOUND)
+        self.assertEqual(reused.sessions, ())
+        self.assertEqual(reused.phase_iterations["analysis"], 0)
+        # ...and the SAME scenario in a fresh workspace runs, so "no session" is a
+        # fact about the reused ledger and not about the scenario.
+        self.assertEqual(
+            self.workflow(clear_pass_proceeds(phases=("analysis",)))[0].final_status,
+            "COMPLETED",
+        )
+
+
+# ---- the remaining P4 fixture NAMES, defined once and exercised as a matrix ----------
+# Every name below is the one PLAN P4's table gives the case. Defining them here makes
+# the scenario-to-fixture mapping executable: a name that stopped matching a real case
+# would break this module rather than only the artifact's prose.
+
+def needs_input_blocks(state: str = "NEEDS_INPUT") -> FakeScenario:
+    """Scenario 3/4 POSITIVE (P6b row 2 -> row 4)."""
+    return FakeScenario(
+        worker_modes=("complete",),
+        reviewer_modes=("pass",),
+        worker_decision_states=(state,),
+        reviewer_decision_states=(state,),
+    )
+
+
+def conflict_requirement_contradiction() -> FakeScenario:
+    """Scenario 4 POSITIVE."""
+    return needs_input_blocks("CONFLICT")
+
+
+def conflict_downgraded_without_grounds(to: str = "ASSUMPTION_ALLOWED") -> FakeScenario:
+    """Scenario 4 NEGATIVE (P6b row 6): a downgrade offered with no admissible grounds."""
+    return FakeScenario(
+        worker_modes=("complete",),
+        reviewer_modes=("pass",),
+        worker_decision_states=("CONFLICT",),
+        reviewer_decision_states=(to,),
+    )
+
+
+def quality_fail_consumes_iteration() -> FakeScenario:
+    """Scenario 3/11 CONTROL: a QUALITY failure is the axis that DOES charge."""
+    return FakeScenario(
+        worker_modes=("complete", "correction"),
+        reviewer_modes=("fail", "pass"),
+        reviewer_findings=(("Q1",), ()),
+        worker_resolutions=({}, {"Q1": "RESOLVED"}),
+    )
+
+
+def implementation_midwork_block() -> FakeScenario:
+    """Scenario 5 POSITIVE: the Worker discovered it mid-work and returned BLOCKED.
+
+    The Reviewer is supplied because P4 requires this scenario "at HIGH through P6b
+    row 2 -> row 4": B2 sets verification_only and the ALREADY-SCHEDULED Reviewer
+    confirms the classification at B3-V. At LOW the same fixture is terminal at B2 and
+    the Reviewer half is never reached, so one fixture serves both routes.
+    """
+    return FakeScenario(
+        worker_modes=("blocked",),
+        reviewer_modes=("pass",),
+        worker_decision_states=("CONFLICT",),
+        reviewer_decision_states=("CONFLICT",),
+    )
+
+
+def implementation_same_item_declared_clear() -> FakeScenario:
+    """Scenario 5 NEGATIVE: the same phase declaring the item CLEAR completes."""
+    return _passing_phase()
+
+
+def worker_unauthorized_high_impact() -> FakeScenario:
+    """Scenario 6 POSITIVE (P6b row 8): the Worker declares CLEAR, so B2 ADMITS and the
+    Reviewer runs in normal mode; the Reviewer FAILs it with a blocking finding and its
+    own gate result blocks."""
+    return FakeScenario(
+        worker_modes=("complete",),
+        reviewer_modes=("fail",),
+        reviewer_findings=(("R1",),),
+        reviewer_decision_states=("CONFLICT",),
+    )
+
+
+def worker_high_impact_with_explicit_authorization() -> FakeScenario:
+    """Scenario 6 NEGATIVE: an authorized high-impact decision proceeds."""
+    return _passing_phase()
+
+
+def worker_reviewer_agree_unauthorized() -> FakeScenario:
+    """Scenario 10 POSITIVE: agreement offered as the ONLY grounds for a downgrade."""
+    return timeout_no_response("worker_reviewer_agreement", OS29_RUN_ID)
+
+
+def downstream_expands_decision(inside: bool = False) -> WorkflowScenario:
+    """Scenario 8: the T5a revalidation widens (or stays inside) an earlier decision."""
+    return WorkflowScenario(
+        phases=("analysis", "implementation"),
+        phase_scenarios={"analysis": _passing_phase(), "implementation": _passing_phase()},
+        final_review=FinalReviewScenario(
+            modes=("fail", "pass"), findings=((("F1", "analysis"),), ())
+        ),
+        correction_scenarios={
+            ("analysis", 1): FakeScenario(
+                worker_modes=("correction",),
+                reviewer_modes=("pass",),
+                worker_resolutions=({"F1": "RESOLVED"},),
+            )
+        },
+        revalidation_scenarios={
+            ("implementation", 1): _passing_phase()
+            if inside
+            else needs_input_blocks("CONFLICT")
+        },
+        run_id=OS29_RUN_ID,
+    )
+
+
+def downstream_within_original_decision() -> WorkflowScenario:
+    """Scenario 8 NEGATIVE."""
+    return downstream_expands_decision(inside=True)
+
+
+def final_review_unresolved_decision(state: str = "NEEDS_INPUT") -> WorkflowScenario:
+    """Scenario 9 POSITIVE: the Final Reviewer's QUALITY verdict is PASS and its own
+    decision result blocks. Completion must still be forbidden."""
+    return WorkflowScenario(
+        phases=("implementation",),
+        phase_scenarios={"implementation": _passing_phase()},
+        final_review=FinalReviewScenario(modes=("pass",), decision_states=(state,)),
+        run_id=OS29_RUN_ID,
+    )
+
+
+def final_review_all_decisions_resolved() -> WorkflowScenario:
+    """Scenario 9 NEGATIVE."""
+    return WorkflowScenario(
+        phases=("implementation",),
+        phase_scenarios={"implementation": _passing_phase()},
+        final_review=FinalReviewScenario(modes=("pass",), decision_states=("CLEAR",)),
+        run_id=OS29_RUN_ID,
+    )
+
+
+#: (scenario, polarity, fixture name, builder, kind, status, reason, risk)
+#: `kind` is "round" for one Worker->Reviewer round and "workflow" for a full run.
+#: `risk` is carried per row rather than fixed at the module level so a row that must
+#: be asserted on a particular route can say so. Every row now runs at HIGH, scenario
+#: 5's positive included: TEST-phase finding T-001 -- the MEDIUM/HIGH midwork-block
+#: terminal collapsing to WORKER_BLOCKED -- was resolved under REVIEW_TEST.md F-001,
+#: and DecisionGateFindingT001Tests below asserts the LOW/MEDIUM/HIGH terminals are
+#: now equal rather than asserting whatever the build does today.
+OS29_SCENARIO_MATRIX = (
+    (1, "+", "clear_pass_proceeds", clear_pass_proceeds,
+     "workflow", "COMPLETED", None, "high"),
+    (1, "-", "clear_pass_but_absent_record", clear_pass_but_absent_record,
+     "workflow", "BLOCKED", "DECISION_GATE_INPUT_MISSING", "high"),
+    (2, "+", "assumption_allowed_six_facts_declared", assumption_allowed_six_facts_declared,
+     "workflow", "COMPLETED", None, "high"),
+    (2, "-", "assumption_allowed_one_fact_undeclared",
+     lambda: assumption_allowed_one_fact_undeclared("security"),
+     "workflow", "BLOCKED", "DECISION_GATE_INPUT_MALFORMED", "high"),
+    (3, "+", "needs_input_blocks", needs_input_blocks,
+     "round", "BLOCKED", "DECISION_BLOCKED:NEEDS_INPUT:blast_radius_beyond_scope", "high"),
+    (3, "-", "quality_fail_consumes_iteration", quality_fail_consumes_iteration,
+     "round", "COMPLETED", None, "high"),
+    (4, "+", "conflict_requirement_contradiction", conflict_requirement_contradiction,
+     "round", "BLOCKED", "DECISION_BLOCKED:CONFLICT:requirement_contradiction", "high"),
+    (4, "-", "conflict_downgraded_without_grounds", conflict_downgraded_without_grounds,
+     "round", "BLOCKED", "DECISION_DOWNGRADE_REJECTED", "high"),
+    # P4: "asserted at HIGH through P6b row 2 -> row 4". The LOW route (row 2's B2
+    # terminal) and the cross-risk equality are asserted in DecisionGateFindingT001Tests.
+    (5, "+", "implementation_midwork_block", implementation_midwork_block,
+     "round", "BLOCKED", "DECISION_BLOCKED:CONFLICT:requirement_contradiction", "high"),
+    (5, "-", "implementation_same_item_declared_clear", implementation_same_item_declared_clear,
+     "round", "COMPLETED", None, "high"),
+    (6, "+", "worker_unauthorized_high_impact", worker_unauthorized_high_impact,
+     "round", "BLOCKED", "DECISION_BLOCKED:CONFLICT:requirement_contradiction", "high"),
+    (6, "-", "worker_high_impact_with_explicit_authorization",
+     worker_high_impact_with_explicit_authorization,
+     "round", "COMPLETED", None, "high"),
+    (8, "+", "downstream_expands_decision", downstream_expands_decision,
+     "workflow", "BLOCKED", "DECISION_BLOCKED:CONFLICT:requirement_contradiction", "high"),
+    (8, "-", "downstream_within_original_decision", downstream_within_original_decision,
+     "workflow", "COMPLETED", None, "high"),
+    (9, "+", "final_review_unresolved_decision", final_review_unresolved_decision,
+     "workflow", "BLOCKED", "DECISION_BLOCKED:NEEDS_INPUT:blast_radius_beyond_scope", "high"),
+    (9, "-", "final_review_all_decisions_resolved", final_review_all_decisions_resolved,
+     "workflow", "COMPLETED", None, "high"),
+    (10, "+", "worker_reviewer_agree_unauthorized", worker_reviewer_agree_unauthorized,
+     "round", "BLOCKED", "DECISION_DOWNGRADE_REJECTED", "high"),
+    (11, "+", "timeout_no_response", lambda: timeout_no_response("timeout", OS29_RUN_ID),
+     "round", "BLOCKED", "DECISION_DOWNGRADE_REJECTED", "high"),
+    (11, "-", "quality_fail_consumes_iteration", quality_fail_consumes_iteration,
+     "round", "COMPLETED", None, "high"),
+)
+
+
+class DecisionGateScenarioMatrixTests(_OS29HarnessMixin, unittest.TestCase):
+    """Every P4 fixture NAME, executed. Deliberately shallow: each row asserts only the
+    terminal the scenario's own sentence in ORIGINAL_REQUEST demands. The deep
+    assertions -- which ledger was written, which dispatch did not happen, which
+    iteration was charged -- live in the per-scenario tests above and in
+    DecisionGateTransitionTests. This matrix is what makes the artifact's mapping table
+    a lookup rather than a claim: a fixture name that stopped naming a real case breaks
+    HERE.
+    """
+
+    def test_every_named_fixture_produces_the_terminal_its_scenario_requires(
+        self,
+    ) -> None:
+        # D4-F guard, before the loop: the matrix really carries a row for every
+        # scenario whose terminal is observable end-to-end. 7, 12, 13 and 14 are
+        # asserted by structure, by mutation or in another module and are named in the
+        # exclusion below rather than being silently absent.
+        covered = {row[0] for row in OS29_SCENARIO_MATRIX}
+        self.assertEqual(covered, {1, 2, 3, 4, 5, 6, 8, 9, 10, 11})
+        self.assertEqual(len(OS29_SCENARIO_MATRIX), 19)
+        self.assertEqual(
+            len({row[2] for row in OS29_SCENARIO_MATRIX}), 18
+        )  # quality_fail_consumes_iteration is scenario 3's and 11's shared control
+
+        outcomes = {}
+        for scenario, polarity, name, builder, kind, status, reason, risk in (
+            OS29_SCENARIO_MATRIX
+        ):
+            with self.subTest(scenario=scenario, polarity=polarity, fixture=name):
+                if kind == "round":
+                    with tempfile.TemporaryDirectory() as directory:
+                        result = self.harness(
+                            Path(directory), risk=risk, max_iterations=2
+                        ).run(builder())
+                else:
+                    result, _ = self.workflow(builder(), risk=risk)
+                outcomes[(scenario, polarity)] = (result.final_status, result.reason)
+                self.assertEqual(result.final_status, status)
+                self.assertEqual(result.reason, reason)
+
+        # THE CO-LOCATED NON-VACUITY GUARD: the matrix contains BOTH terminals, so a
+        # harness stuck on one of them cannot pass this test. Nine rows complete and
+        # nine block; a build that blocked everything, or completed everything, fails.
+        self.assertEqual(
+            sum(1 for value in outcomes.values() if value[0] == "COMPLETED"), 8
+        )
+        self.assertEqual(
+            sum(1 for value in outcomes.values() if value[0] == "BLOCKED"), 11
+        )
+        # ...and the blocking rows do not all carry the SAME reason, so the terminals
+        # are distinguishable rather than one catch-all refusal.
+        self.assertGreaterEqual(
+            len({value[1] for value in outcomes.values() if value[0] == "BLOCKED"}), 4
+        )
+
+
+class DecisionGateFindingT001Tests(_OS29HarnessMixin, unittest.TestCase):
+    """TEST-phase finding T-001 / REVIEW_TEST.md F-001, kept as an executable case.
+
+    THE REQUIREMENT. PLAN P6b row 2 says a valid `NEEDS_INPUT`/`CONFLICT` Worker gate
+    result is terminal at LOW at B2 and, at MEDIUM/HIGH, sets `verification_only` and
+    falls through to the already-scheduled Reviewer, so both paths end with the SAME
+    `final_status`, `decision_state` and `reason_code` -- "risk NEVER expands decision
+    authority", asserted rather than asserted-about. P6b's O-2 states the rule this
+    depends on: the B2 guard sits ABOVE the `STATUS: BLOCKED` branch so that "a Worker
+    that discovers a blocking decision mid-work and reports it must be accounted on the
+    decision axis, not swallowed as a generic WORKER_BLOCKED". PLAN P4 scenario 5 makes
+    it explicit: `implementation_midwork_block` is to be "asserted at HIGH through P6b
+    row 2 -> row 4, and at LOW through row 2's B2 terminal", and "`reason` must be
+    `DECISION_BLOCKED:...`, NOT `WORKER_BLOCKED`".
+
+    THE DEFECT, as reported at TEST iteration 1. `e2e_harness.run()` set
+    `verification_only` for this shape and then the very next branch -- `if
+    worker_status == self.contract.worker_blocked:` -- returned `WORKER_BLOCKED` before
+    the Reviewer was reached. The guard was above the branch, but its RESULT was not
+    carried across it, so the LOW round ended with (`BLOCKED`, `CONFLICT`,
+    `requirement_contradiction`) and the MEDIUM/HIGH round with (`BLOCKED`, `''`, `''`).
+
+    THE FIX, made at TEST iteration 2 under the phase Reviewer's Required Action: that
+    branch now reads `and not verification_only`, so the round stays on the decision
+    axis and reaches B3-V. The requirement case below is no longer `expectedFailure` --
+    it passes normally, which is the only reason the marker was removed. The control in
+    `test_the_worker_blocked_terminal_still_exists` is what keeps the fix narrow: a
+    Worker-declared BLOCKED with NO decision block never sets `verification_only`, so
+    it still terminates as a plain `WORKER_BLOCKED` at every risk level.
+    """
+
+    def midwork(self, risk: str):
+        """Returns (round result, the run's decision ledger)."""
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            result = self.harness(workspace, risk=risk).run(
+                FakeScenario(
+                    worker_modes=("blocked",),
+                    reviewer_modes=("pass",),
+                    worker_decision_states=("CONFLICT",),
+                    reviewer_decision_states=("CONFLICT",),
+                )
+            )
+            return result, run_logging.read_decision_ledger(
+                self.RUN_ID, base=workspace
+            )
+
+    def test_the_ledger_records_the_route_each_risk_level_actually_took(self) -> None:
+        """The terminals are equal across risks; the LEDGERS are not, and must not be.
+
+        Equality of the terminal is the requirement. It is not the same claim as "the
+        two risk levels ran the same machinery", and asserting only the terminal would
+        pass on a build that reached it by skipping the Reviewer. So this case pins the
+        ROUTE: LOW stops at row 2's B2 terminal with no Reviewer, MEDIUM/HIGH carry the
+        B2 classification across to the already-scheduled Reviewer and add its B3
+        verification record. One Worker attempt either way -- a decision block charges
+        no correction iteration on any route.
+        """
+        low, low_ledger = self.midwork("low")
+
+        self.assertEqual(low.final_status, "BLOCKED")
+        self.assertEqual(
+            low.reason, "DECISION_BLOCKED:CONFLICT:requirement_contradiction"
+        )
+        self.assertEqual(low.decision_state, "CONFLICT")
+        self.assertEqual(low.decision_reason_code, "requirement_contradiction")
+        self.assertIsNotNone(low.decision_block)
+        self.assertEqual(len(low.worker_attempts), 1)
+        self.assertEqual(len(low.reviewer_attempts), 0)
+        self.assertEqual(
+            [(record["state"], record["boundary"]) for record in low_ledger],
+            [("CLEAR", "B1"), ("CONFLICT", "B2")],
+        )
+        self.assertEqual(low_ledger[1]["reason_code"], "requirement_contradiction")
+
+        for risk in ("medium", "high"):
+            with self.subTest(risk=risk):
+                result, ledger = self.midwork(risk)
+                self.assertEqual(len(result.worker_attempts), 1)
+                # The verification Reviewer that T-001 reported as never running.
+                self.assertEqual(len(result.reviewer_attempts), 1)
+                self.assertEqual(
+                    [(record["state"], record["boundary"]) for record in ledger],
+                    [("CLEAR", "B1"), ("CONFLICT", "B2"), ("CONFLICT", "B3")],
+                )
+                self.assertEqual(ledger[1]["reason_code"], "requirement_contradiction")
+                # B3-V is BOUND to the B2 record it verified, not a free-standing
+                # second opinion: that binding is what makes the equal terminal
+                # provenance rather than coincidence.
+                self.assertEqual(
+                    ledger[2]["verifies"]["worker_record_key"],
+                    decision_gate.ledger_key(ledger[1]),
+                )
+
+    def test_the_worker_blocked_terminal_still_exists(self) -> None:
+        """THE CONTROL for the F-001 fix, at the risk levels the fix touched.
+
+        The fix skips the `WORKER_BLOCKED` branch only when B2 set `verification_only`.
+        A Worker-declared BLOCKED with no decision block must therefore be unchanged --
+        otherwise the fix would have deleted a real terminal instead of narrowing one.
+        """
+        for risk in ("low", "medium", "high"):
+            with self.subTest(risk=risk):
+                with tempfile.TemporaryDirectory() as directory:
+                    plain = self.harness(Path(directory), risk=risk).run(
+                        FakeScenario(
+                            worker_modes=("blocked",), reviewer_modes=("pass",)
+                        )
+                    )
+                self.assertEqual(plain.final_status, "BLOCKED")
+                self.assertEqual(plain.reason, "WORKER_BLOCKED")
+                self.assertIsNone(plain.decision_block)
+                self.assertEqual(plain.decision_state, "")
+                self.assertEqual(plain.decision_reason_code, "")
+                # It never reached the Reviewer either: the quality axis owns this
+                # terminal, exactly as before.
+                self.assertEqual(len(plain.reviewer_attempts), 0)
+
+    def test_t001_a_midwork_block_must_be_a_decision_terminal_at_every_risk_level(
+        self,
+    ) -> None:
+        terminals = {
+            risk: (
+                result.final_status,
+                result.reason,
+                result.decision_state,
+                result.decision_reason_code,
+            )
+            for risk, result in (
+                (risk, self.midwork(risk)[0]) for risk in ("low", "medium", "high")
+            )
+        }
+
+        self.assertEqual(terminals["low"], terminals["medium"])
+        self.assertEqual(terminals["low"], terminals["high"])
+        self.assertEqual(
+            terminals["high"],
+            (
+                "BLOCKED",
+                "DECISION_BLOCKED:CONFLICT:requirement_contradiction",
+                "CONFLICT",
+                "requirement_contradiction",
+            ),
+        )
+
+
+
+class DecisionGateSourceBindingTests(unittest.TestCase):
+    """External review MAJOR, deterministic half.
+
+    `source_binding` is one of the thirteen required fields and is what makes a
+    ledger entry a BOUND entry. It used to be a `setdefault`, so an agent that put
+    the key in its own fenced record kept it, and validate_ledger_record() only
+    requires the field to be PRESENT -- never that it matches the round the record
+    belongs to. The entry could therefore claim provenance it was never bound to.
+    The live half of this is in test_orca_runtime_contract.py.
+    """
+
+    ORCHESTRATION_SKILL = (
+        Path(__file__).resolve().parents[1]
+        / "orca-worker-reviewer-orchestration"
+        / "SKILL.md"
+    )
+    RUN_ID = "run_os29_binding"
+
+    def published(self, workspace: Path, record_extra: dict | None) -> dict:
+        """Publish one B2 record whose agent half optionally forges its binding."""
+        import argparse
+
+        from scripts import fake_worker
+
+        harness = E2EHarness(
+            self.ORCHESTRATION_SKILL,
+            phase="implementation",
+            workspace=workspace,
+            run_id=self.RUN_ID,
+            risk="high",
+        )
+        body = fake_worker.render_decision_gate(
+            argparse.Namespace(
+                decision_gate_state="CLEAR",
+                decision_gate_state_line_raw=None,
+                decision_gate_record_raw=None,
+                decision_gate_omit_field=False,
+                decision_gate_omit_block=False,
+            ),
+            record_extra,
+        )
+        gate = decision_gate.parse_gate_result(body, harness.policy)
+        harness._append_decision_record(
+            gate,
+            phase="implementation",
+            iteration=1,
+            role="worker",
+            boundary="B2",
+            source="worker",
+            verdict="",
+            verifies=None,
+        )
+        return run_logging.read_decision_ledger(self.RUN_ID, base=workspace)[-1]
+
+    def expected(self) -> str:
+        return phase_artifact_contract(
+            role="worker", phase="implementation", run_id=self.RUN_ID
+        )
+
+    def test_an_agent_cannot_supply_its_own_source_binding(self) -> None:
+        for forged in (
+            "artifacts/runs/run_someone_elses/",           # cross-run
+            "artifacts/runs/run_os29_binding/DESIGN.md",   # wrong phase artifact
+            "/etc/passwd",                                 # arbitrary
+            "",                                            # empty
+            None,                                          # null
+        ):
+            with self.subTest(forged=forged), tempfile.TemporaryDirectory() as scratch:
+                head = self.published(Path(scratch), {"source_binding": forged})
+
+                self.assertEqual(head["source_binding"], self.expected())
+                self.assertNotEqual(head["source_binding"], forged)
+
+    def test_the_authoritative_binding_is_still_recorded(self) -> None:
+        """Control: overwriting is not deleting. The field is present and correct
+        when the agent says nothing about it."""
+        with tempfile.TemporaryDirectory() as scratch:
+            head = self.published(Path(scratch), None)
+
+        self.assertEqual(head["source_binding"], self.expected())

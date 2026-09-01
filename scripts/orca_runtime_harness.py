@@ -35,7 +35,7 @@ try:
         require_workflow_phase,
         strip_task_context,
     )
-    from scripts import run_logging
+    from scripts import decision_gate, decision_policy, run_logging
     from scripts.workflow_contract import load_workflow_output_contract
 except ModuleNotFoundError:  # direct `python3 scripts/...` execution
     from quality_profile import (
@@ -59,6 +59,8 @@ except ModuleNotFoundError:  # direct `python3 scripts/...` execution
         require_workflow_phase,
         strip_task_context,
     )
+    import decision_gate
+    import decision_policy
     import run_logging
     from workflow_contract import load_workflow_output_contract
 
@@ -241,6 +243,22 @@ def completion_timestamp(dispatch_row: dict[str, Any]) -> str | None:
 
 class OrcaRuntimeError(RuntimeError):
     pass
+
+
+class DecisionGateRefused(OrcaRuntimeError):
+    """OS-29 B1: a boundary refused BEFORE any Task or Dispatch was created.
+
+    Raised rather than returned, which is the shape this class already gives every
+    other pre-dispatch failure (an invalid quality profile, an undeclared
+    requested_phases at the final gate): the refusal is logged through
+    _log_pre_dispatch_failure and then re-raised unchanged, so no caller can mistake
+    it for a settled attempt and no Dispatch id ever comes into existence.
+    """
+
+    def __init__(self, reason: str, detail: str = "") -> None:
+        super().__init__(f"{reason}{(' -- ' + detail) if detail else ''}")
+        self.reason = reason
+        self.detail = detail
 
 
 class UnsupportedOrcaContract(OrcaRuntimeError):
@@ -441,6 +459,26 @@ class WorkflowEvidence:
     current_delta: tuple[str, ...] = ()
     new_claims: tuple[str, ...] = ()
     validation: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class _PendingVerification:
+    """The one admitted B3-V verification, remembered between B1 and B3.
+
+    OS-29 P6b row 2 lets a blocking Worker classification be verified by the
+    ALREADY-SCHEDULED current-phase Reviewer and by nothing else. B1 decides that
+    (decision_gate.admit_head with a VerificationDispatch); this carries the two
+    things the B3 side then needs and cannot re-derive safely: WHICH Worker record
+    the Reviewer owes a bound `verifies` reference to, and that Worker's own
+    classification, which decision_gate.evaluate_verification compares against.
+
+    `worker` is read off the ADMITTED LEDGER HEAD, not off the Reviewer's body, so a
+    Reviewer cannot restate the classification it is supposed to be verifying.
+    """
+
+    worker_key: str
+    worker: "decision_gate.GateResult"
+    round: tuple[str, str, int]
 
 
 def dispatch_context(
@@ -704,6 +742,25 @@ class OrcaRuntimeHarness:
         # _log_attempt(). Empty in the overwhelmingly common case; a test can assert
         # against it to catch a real bug in the logging helper itself.
         self._logging_errors: list[str] = []
+        # ---- OS-29. The decision policy this harness's B1 guard evaluates against,
+        # resolved once from the orchestration Skill this runtime IS -- the same
+        # one-resolution rule quality_profile above follows.
+        self._decision_policy = decision_policy.load_decision_policy(
+            REPO_ROOT / "orca-worker-reviewer-orchestration" / "SKILL.md"
+        )
+        # The (run, phase, iteration) of the round this PROCESS last settled and
+        # recorded in the ledger, or None. A3's binding expectation, held in memory
+        # and never read back off the ledger it validates. It is deliberately
+        # process-local: OS-31 owns cross-session resume, so a fresh Coordinator
+        # meeting a non-trivial ledger fails closed rather than guessing (L7).
+        self._last_settled: tuple[str, str, int] | None = None
+        # OS-29 B3-V. Armed by _b1_guard() at the ONE B1 that admits a
+        # verification Reviewer past an open blocking head, consumed by the very
+        # next settled Reviewer attempt of that same round, and cleared by
+        # anything else. It is never a permission of its own: the admission is
+        # decided by decision_gate.admit_head(), and this only remembers WHICH
+        # Worker record the admitted Reviewer owes a bound verification of.
+        self._pending_verification: _PendingVerification | None = None
         # OS-17 review round 4 MAJOR: the currently-open phase/iteration TIMING_LOG
         # boundary, if any -- advanced automatically by _open_phase_iteration_
         # boundary(), called just before a dispatch starts (run_existing_task(),
@@ -1526,7 +1583,18 @@ class OrcaRuntimeHarness:
         # directory. Scoped under artifact_dir (this harness's own scratch space),
         # never the real repository's artifacts/ root, so exercising this path in
         # tests cannot litter the working tree with run directories.
-        ensure_run_artifact_root(self.run_id, base=self.artifact_dir)
+        # OS-29: the run root and the run-entry decision declaration in ONE
+        # statement, at the same point the run root was already provisioned and
+        # adjacent to the ORCHESTRATOR_LOG/TIMING_LOG opens below -- so the first
+        # pre-dispatch B1 guard has an explicit, validated record to read instead of
+        # an absence, and a run root can never exist without a ledger.
+        run_logging.open_decision_ledger(
+            self.run_id,
+            base=self.artifact_dir,
+            phases=self.requested_phases,
+            risk=self.risk or "",
+            ledger_schema_version=decision_gate.LEDGER_RECORD_SCHEMA_VERSION,
+        )
         # OS-17: ORCHESTRATOR_LOG.md/TIMING_LOG.md open here, in the same
         # already-provisioned root, one line each -- the run's own start
         # timestamp is recorded once and reused by log_run_status() for the
@@ -2137,6 +2205,13 @@ class OrcaRuntimeHarness:
         # to know either verdict before the write it belongs to.
         gate_result = _reviewer_gate_result(attempt.role, attempt.body or "")
         review_verdict = _reviewer_review_verdict(attempt.role, attempt.body or "")
+        # OS-29: the settled attempt's own decision declaration becomes an immutable
+        # ledger record and this row's two sparse columns. Done HERE because this is
+        # the single funnel every settled dispatch passes; it can never be the GATE,
+        # which is why the gate itself runs before start_worker instead.
+        decision_state, decision_reason_code = self._record_decision_from_attempt(
+            phase=phase, attempt=attempt, event=event
+        )
         # The most recent reviewer-role gate result, and this attempt's own
         # ended_at, observed for the currently open iteration/phase become that
         # boundary's own eventual iteration_end/phase_end `detail`/`ended_at`
@@ -2166,6 +2241,8 @@ class OrcaRuntimeHarness:
             # OS-17's workflow-path requirement asks. Only pre_dispatch_failure --
             # which has no dispatch at all -- leaves it blank.
             round_kind=round_kind,
+            decision_state=decision_state,
+            decision_reason_code=decision_reason_code,
             result=(
                 f"outcome={attempt.outcome} settlement={attempt.settlement} "
                 f"lifecycle={attempt.lifecycle_action} "
@@ -2262,6 +2339,284 @@ class OrcaRuntimeHarness:
             ),
         )
 
+    def _b1_guard(
+        self,
+        *,
+        phase: str | None,
+        role: str,
+        iteration: int,
+        verifies: str | None = None,
+    ) -> None:
+        """A1-A6 over this run's ledger head. Raises DecisionGateRefused, or returns.
+
+        A run this process never opened has no ledger of its own to read, so the
+        guard is a no-op before start_run() -- there is no boundary to gate yet and
+        no run root to read from.
+
+        Final Adversarial Review F-001: this guard used to describe the dispatch to
+        the gate as nothing at all, so A5 saw one anonymous caller and refused the
+        PERMITTED current-phase verification Reviewer with the same
+        `DECISION_BLOCKED:*` it owes a correction Worker or the next phase. The
+        dispatch is now DESCRIBED -- role, phase, iteration and the `verifies`
+        binding the caller is offering -- and decision_gate.admit_head() decides.
+        Nothing about the refusal is decided here: this method still only logs and
+        re-raises whatever the gate says, and `verifies` defaults to None, so every
+        caller that offers no verification is gated exactly as before.
+
+        When the gate admits a verification, the admitted HEAD is remembered as
+        `_pending_verification` so the Reviewer's own B3 record can be bound to it
+        and evaluated under the shared verification/downgrade rules. Every other
+        admission clears it -- an ordinary round owes no verification, and a stale
+        arming must never survive into one.
+        """
+        if not self.run_id:
+            return
+        try:
+            head = decision_gate.admit_head(
+                self._decision_policy,
+                run_logging.read_decision_ledger(self.run_id, base=self.artifact_dir),
+                run_id=self.run_id,
+                expected_settled_round=self._last_settled,
+                verification=decision_gate.VerificationDispatch(
+                    role=role,
+                    phase=phase or "",
+                    iteration=iteration,
+                    verifies=verifies,
+                ),
+            )
+        except decision_gate.GateRefusal as refusal:
+            error = DecisionGateRefused(refusal.reason, refusal.detail)
+            self._log_pre_dispatch_failure(
+                phase=phase, role=role, iteration=iteration, error=error
+            )
+            self._safe_log(
+                run_logging.log_orchestrator_event,
+                self.run_id,
+                base=self.artifact_dir,
+                event=run_logging.EVENT_DECISION_GATE_REFUSED,
+                phase=phase or "",
+                role=role,
+                iteration=iteration,
+                risk=self.risk,
+                decision_state=decision_gate.decision_columns(refusal.reason)[0],
+                decision_reason_code=decision_gate.decision_columns(refusal.reason)[1],
+                detail=" ".join(refusal.detail.split())[:200],
+            )
+            raise error
+        # An admission past an OPEN head is a verification and nothing else: the gate
+        # only returns one when the head is that Worker's own open blocking B2 record
+        # and this dispatch is bound to it. Any other admission means the head is
+        # settled and closed, which owes no verification.
+        if head.get("open_decision_item") is True and head.get(
+            "state"
+        ) in decision_gate.BLOCKING_STATES:
+            self._pending_verification = _PendingVerification(
+                worker_key=decision_gate.ledger_key(head),
+                worker=decision_gate.GateResult(
+                    declared_state=str(head.get("state", "")), record=head
+                ),
+                round=(self.run_id, phase or "", iteration),
+            )
+        else:
+            self._pending_verification = None
+
+    def _record_decision_from_attempt(
+        self, *, phase: str | None, attempt: "RuntimeAttempt", event: str
+    ) -> tuple[str, str]:
+        """The settled attempt's own gate declaration -> a ledger record + two columns.
+
+        Two cases, and the difference between them is the whole fail-closed
+        behaviour this path can offer. A settled B2/B3 boundary that produced no
+        usable gate result is NOT a third, tolerated case:
+
+        * The body does not yield a valid gate result -- because it declared
+          NOTHING AT ALL (the missing-record case, DECISION_GATE_INPUT_MISSING),
+          or because what it declared is defective. No record is published and
+          `_last_settled` IS advanced either way, so the very next B1 refuses with
+          DECISION_GATE_INPUT_UNBOUND: the ledger head is still the round before
+          this one, which no longer matches the round that actually settled.
+          Silence poisons the next dispatch exactly as a broken declaration does;
+          neither can ever pass for a good one, and neither is presumed CLEAR.
+        * The body declares a valid gate result. The record is published, bound to
+          the round that actually settled, and the columns carry it.
+
+        Round 2 review F-001: an earlier version returned ("", "") and left
+        `_last_settled` untouched when `declares_gate_result()` was false, so a
+        legacy non-declaring agent left the following B1 still admitting the
+        sequence-0 run-entry head as though no round had settled. That is the
+        missing-decision-record case, which ORIGINAL_REQUEST's fail-closed list
+        names first and forbids unconditionally; a legacy exception is not
+        available here no matter how it is disclosed.
+        """
+        # B2/B3 are "after RECEIVING the Worker/Reviewer result". A dispatch that
+        # delivered no result never reached either boundary, so there is no gate
+        # result to be missing: an unexpected exit is a NON-RESPONSE, which the
+        # lifecycle recovery path already owns (outcome=unknown, worker_done_count=0,
+        # its own `unexpected_exit` event) and which this method must not convert
+        # into a settled boundary. It is still never presumed CLEAR -- no record is
+        # published, the columns stay blank, no gate_result is recorded, and the
+        # recovery dispatch that follows is itself B1-guarded (round 2 review F-002).
+        # This is a statement about WHICH attempts are gate boundaries, not a
+        # tolerated shape of result at one; see the docstring above for why no
+        # exception of the latter kind exists any more.
+        if event != "dispatch_settled" or attempt.worker_done_count < 1:
+            return "", ""
+        body = attempt.body or ""
+        settled = (self.run_id, phase or "", attempt.iteration)
+        if not decision_gate.declares_gate_result(body):
+            # Named separately from the parse failure below only so the reason code
+            # says WHICH fail-closed clause fired; the effect is identical.
+            self._last_settled = settled
+            return decision_gate.INPUT_DEFECT_STATE, decision_gate.GATE_INPUT_MISSING
+        try:
+            gate = decision_gate.parse_gate_result(body, self._decision_policy)
+        except decision_gate.GateRefusal as refusal:
+            self._pending_verification = None
+            self._last_settled = settled
+            return decision_gate.INPUT_DEFECT_STATE, refusal.reason
+        # ---- OS-29 B3-V. Consumed by exactly the Reviewer attempt of the round B1
+        # armed, and cleared by every other settled attempt, so a verification cannot
+        # be carried forward into a round that was never admitted as one.
+        pending = self._pending_verification
+        self._pending_verification = None
+        verifying = (
+            pending
+            if pending is not None
+            and attempt.role == "reviewer"
+            and pending.round == settled
+            else None
+        )
+        defect = self._verification_defect(verifying, gate, settled)
+        if defect is not None:
+            # Row 7, and its mirror image. An unbound verification record and a
+            # `verifies` claim made outside verification mode are BOTH unbound, and
+            # both are named rather than silently falling back to the Worker's
+            # classification: the fall-back would hide the defect behind a block that
+            # looks identical to a healthy one. Nothing is published, and the round is
+            # bound anyway, so the next B1 refuses too.
+            self._safe_log(
+                run_logging.log_orchestrator_event,
+                self.run_id,
+                base=self.artifact_dir,
+                event=run_logging.EVENT_DECISION_BLOCK,
+                phase=phase or "",
+                role=attempt.role,
+                iteration=attempt.iteration,
+                risk=self.risk,
+                decision_state=decision_gate.INPUT_DEFECT_STATE,
+                decision_reason_code=decision_gate.GATE_INPUT_UNBOUND,
+                detail=" ".join(defect.split())[:200],
+            )
+            self._last_settled = settled
+            return (
+                decision_gate.INPUT_DEFECT_STATE,
+                decision_gate.GATE_INPUT_UNBOUND,
+            )
+        record = dict(gate.record)
+        record.update(
+            {
+                "ledger_schema_version": decision_gate.LEDGER_RECORD_SCHEMA_VERSION,
+                "run": self.run_id,
+                "phase": phase or "",
+                "iteration": attempt.iteration,
+                "role": "reviewer" if attempt.role.endswith("reviewer") else "worker",
+                "boundary": "B3" if attempt.role.endswith("reviewer") else "B2",
+                "source": "reviewer" if attempt.role.endswith("reviewer") else "worker",
+                "verdict": _reviewer_gate_result(attempt.role, body),
+                "verifies": record.get("verifies"),
+                "prior_open_decision_items": [],
+                "recorded_at": run_logging.now_iso(),
+                # External review MAJOR: this was a setdefault, so an agent that put
+                # `source_binding` in its own fenced record kept it -- an arbitrary,
+                # null, cross-run or wrong-phase binding survived into the published
+                # ledger, and validate_ledger_record() only requires the field to be
+                # PRESENT, never that it matches the run this record belongs to. The
+                # entry could therefore claim provenance it was never bound to. It is
+                # harness-owned now, exactly like `run`, `phase`, `iteration` and
+                # `recorded_at` beside it: the agent describes its DECISION, never
+                # where that decision is recorded.
+                "source_binding": f"artifacts/runs/{self.run_id}/",
+            }
+        )
+        record.setdefault("responsible_phase", phase or "")
+        record.setdefault("evidence", {})
+        record.setdefault("assumption", None)
+        record.setdefault("open_item", None)
+        try:
+            run_logging.append_decision_ledger_record(
+                self.run_id,
+                record,
+                base=self.artifact_dir,
+                ledger_schema_version=decision_gate.LEDGER_RECORD_SCHEMA_VERSION,
+            )
+        except Exception as error:  # noqa: BLE001 -- section 9: logging never gates
+            # The write failed, so no record binds this round. `_last_settled` is
+            # advanced anyway: the next B1 then refuses as UNBOUND, which is the
+            # fail-closed direction. A logging failure may not turn a settled
+            # dispatch into a failure, and it may not turn a refusal into an
+            # admission either.
+            self._logging_errors.append(f"append_decision_ledger_record: {error}")
+        self._last_settled = settled
+        if verifying is not None:
+            # P6b rows 4-6, from the SHARED evaluator the deterministic harness uses.
+            # The columns carry the VERIFICATION's terminal -- confirmation keeps the
+            # Worker's own state and code, a stricter Reviewer carries its own, and a
+            # downgrade is decided solely by decision_policy.validate_transition().
+            # The round stays terminal either way: the Worker's item is still open
+            # (open_items() lets no verification resolve anything), so the correction
+            # Worker, the next phase, a second Reviewer and the Final Review all stay
+            # refused at the next B1, and no correction iteration is charged.
+            outcome = decision_gate.evaluate_verification(
+                self._decision_policy, verifying.worker, gate
+            )
+            self._safe_log(
+                run_logging.log_orchestrator_event,
+                self.run_id,
+                base=self.artifact_dir,
+                event=run_logging.EVENT_DECISION_BLOCK,
+                phase=phase or "",
+                role=attempt.role,
+                iteration=attempt.iteration,
+                risk=self.risk,
+                decision_state=outcome.block[0],
+                decision_reason_code=outcome.block[1] or "",
+                detail=f"{outcome.reason} verifies={verifying.worker_key}",
+            )
+            return decision_gate.decision_columns(outcome.reason)
+        return str(record.get("state", "")), str(record.get("reason_code") or "")
+
+    def _verification_defect(
+        self,
+        verifying: _PendingVerification | None,
+        gate: "decision_gate.GateResult",
+        settled: tuple[str, str, int],
+    ) -> str | None:
+        """Is this settled result's `verifies` field consistent with its mode?
+
+        Two symmetric defects, one check, matching the deterministic harness:
+
+        * in verification mode the record MUST carry a `verifies` reference bound to
+          the admitted Worker record -- decision_gate.verification_binding_defect()
+          is the same function E2EHarness.run() calls at B3-V;
+        * outside verification mode a record must carry NONE. A Worker verifies
+          nothing, and a normal-mode Reviewer has no classification to verify, so a
+          `verifies` claim there is unbound rather than extra evidence.
+        """
+        if verifying is None:
+            if gate.record.get("verifies") is None:
+                return None
+            return (
+                "a `verifies` reference outside verification mode; `verifies` "
+                "belongs to the already-scheduled Reviewer's B3 verification record"
+            )
+        return decision_gate.verification_binding_defect(
+            gate,
+            worker_key=verifying.worker_key,
+            run_id=settled[0],
+            phase=settled[1],
+            iteration=settled[2],
+        )
+
     def _log_pre_dispatch_failure(
         self, *, phase: str | None, role: str, iteration: int, error: Exception
     ) -> None:
@@ -2302,6 +2657,72 @@ class OrcaRuntimeHarness:
             )
         if not self.run_id:
             return
+        # ---- OS-29 pre-completion decision gate (external review CRITICAL) --------
+        # The decision axis used to be enforced ONLY by _b1_guard(), i.e. only when a
+        # LATER dispatch existed to gate. After the Final Review there is no later
+        # dispatch, so a Final Reviewer could return quality PASS beside NEEDS_INPUT,
+        # CONFLICT, or a missing/malformed declaration and this method would still
+        # write COMPLETED -- exactly the completion the objective forbids while user
+        # authority is unresolved. Completion is therefore its own boundary and
+        # admits the ledger head under the SAME A1-A6 the dispatch boundaries use.
+        #
+        # No VerificationDispatch is offered: completing a run is never the one
+        # permitted classification review, so A5 refuses every open item here as it
+        # does for a correction Worker or the next phase.
+        #
+        # ONLY COMPLETED is gated. BLOCKED/ERROR/ESCALATED must stay writable or a
+        # blocked run could never record why it stopped -- and this method is how it
+        # records that, including on the refusal path immediately below.
+        if status == "COMPLETED":
+            records = run_logging.read_decision_ledger(
+                self.run_id, base=self.artifact_dir
+            )
+            try:
+                decision_gate.admit_head(
+                    self._decision_policy,
+                    records,
+                    run_id=self.run_id,
+                    expected_settled_round=self._last_settled,
+                )
+            except decision_gate.GateRefusal as refusal:
+                # The refusal reason is this run's recorded TERMINAL classification,
+                # so it must name what actually stopped the run. admit_head()
+                # evaluates A6 before A5, and A6 disagrees for every item THIS RUN
+                # opened, so a valid NEEDS_INPUT/CONFLICT would otherwise be recorded
+                # as a producer defect and lose its state and reason code at the last
+                # boundary (external re-review MAJOR).
+                #
+                # The refusal REASON is passed in, and only A6 is reclassified:
+                # admit_head() evaluates A1 -> A2 -> A4 -> A3 -> A6, so reaching A6
+                # proves the ledger-level clauses already passed. A structurally
+                # invalid ledger -- duplicate or gapped sequences, a record from
+                # another run, a head bound to the wrong phase or iteration -- can
+                # still hold individually valid blocking records, and reclassifying
+                # those would replace a real defect with a valid-looking block.
+                reason = (
+                    decision_gate.unresolved_block_reason(
+                        self._decision_policy,
+                        records,
+                        refused_with=refusal.reason,
+                    )
+                    or refusal.reason
+                )
+                state, code = decision_gate.decision_columns(reason)
+                detail = " ".join(str(refusal.detail).split())[:200]
+                self._safe_log(
+                    run_logging.log_orchestrator_event,
+                    self.run_id,
+                    base=self.artifact_dir,
+                    event=run_logging.EVENT_DECISION_BLOCK,
+                    risk=self.risk,
+                    decision_state=state,
+                    decision_reason_code=code,
+                    detail=f"COMPLETED refused at the pre-completion gate: {detail}",
+                )
+                # Terminate BLOCKED instead of COMPLETED. This recurses exactly once:
+                # BLOCKED is not gated, so the branch above is not re-entered.
+                self.log_run_status("BLOCKED", reason=f"{reason}: {detail}")
+                raise DecisionGateRefused(reason, refusal.detail)
         self._safe_log(
             run_logging.log_run_status,
             self.run_id,
@@ -2396,6 +2817,7 @@ class OrcaRuntimeHarness:
         terminal: str | None = None,
         max_dispatches: int = 1,
         round_kind: str = "phase_gate",
+        verifies: str | None = None,
     ) -> tuple[RuntimeAttempt, str]:
         """Dispatch and settle a Task that already exists (the graph-first path).
 
@@ -2407,7 +2829,32 @@ class OrcaRuntimeHarness:
         with: this re-render is the text that actually reaches worker-start, so a
         caller that supplied one and not the other would dispatch a different
         boundary than the one it created the Task with.
+
+        `verifies` is the ledger key of the Worker B2 record this dispatch is being
+        sent to VERIFY, and it is meaningful only for the already-scheduled
+        current-phase Reviewer at MEDIUM/HIGH after that Worker recorded NEEDS_INPUT
+        or CONFLICT (OS-29 P6b row 2). Leaving it None -- the default, and what every
+        ordinary round passes -- means "this dispatch offers no verification", which
+        after an open blocking head is refused exactly as before. Supplying it is not
+        an admission either: decision_gate.admit_head() still requires the head to be
+        that same Worker record, in this same run, phase and iteration, still open,
+        the only thing open, and not already verified.
         """
+        # ---- OS-29 B1. BEFORE dispatch_context, before any terminal is created and
+        # before start_worker: an unresolved blocking decision must leave no Task, no
+        # Dispatch and no terminal behind. This is the one OS-29 guarantee the live
+        # path can enforce structurally; the rest of the gate is the Coordinator's
+        # documented obligation (the decision gate contract block in SKILL.md), for
+        # the reason recorded in this class's own docstring -- there is no
+        # deterministic in-process iteration counter here (L7/R-11).
+        # `verifies` is the ONE thing that can make this dispatch admissible past an
+        # open blocking head, and it is offered by the CALLER -- the Coordinator that
+        # already scheduled this Reviewer and knows which Worker record it is sending
+        # it to verify. It is not derived here from the ledger: deriving it would let
+        # the guard manufacture its own permission from the very file it is checking.
+        self._b1_guard(
+            phase=phase, role=role, iteration=iteration, verifies=verifies
+        )
         # Before the dispatch, not after it. `spec` is what start_worker sends on the
         # low-level path and what a caller passes to task-create on the supervised
         # one, so the boundary has to be inside it by the time either happens.
@@ -2510,6 +2957,7 @@ class OrcaRuntimeHarness:
         terminal: str | None = None,
         max_dispatches: int = 1,
         round_kind: str = "phase_gate",
+        verifies: str | None = None,
     ) -> tuple[RuntimeAttempt, str]:
         """Create the Task, then run it. Return type and behavior unchanged.
 
@@ -2560,6 +3008,7 @@ class OrcaRuntimeHarness:
             terminal=terminal,
             max_dispatches=max_dispatches,
             round_kind=round_kind,
+            verifies=verifies,
         )
 
     def observe_unexpected_exit(
@@ -2570,6 +3019,25 @@ class OrcaRuntimeHarness:
         phase: str | None = None,
         round_kind: str = "phase_gate",
     ) -> RuntimeAttempt:
+        """The second of the two centralized dispatch initiators.
+
+        Round 2 review F-002: this path creates a Task, a terminal and a Dispatch
+        exactly as run_existing_task() does, so it carries the SAME OS-29 B1
+        obligation. It previously reached start_worker() without consulting the
+        ledger at all, which let an unresolved, malformed, unsupported-schema or
+        unbound head reach worker-start through here while the sibling path
+        refused it.
+        """
+        # ---- OS-29 B1. Before dispatch_context, before create_task, before the
+        # terminal and before start_worker -- the same "no Task, no Dispatch, no
+        # terminal" placement run_existing_task() uses, and ahead of
+        # _open_phase_iteration_boundary() so a refused dispatch opens no scope.
+        #
+        # No `verifies` is offered and none may be: a recovery dispatch after a
+        # non-response is not the already-scheduled Reviewer verifying a
+        # classification, so this initiator stays refused after ANY open blocking
+        # head. The B3-V exception has exactly one entry point (F-001).
+        self._b1_guard(phase=phase, role=role, iteration=iteration)
         dispatch_started_at = run_logging.now_iso()
         try:
             spec, _, _ = dispatch_context(

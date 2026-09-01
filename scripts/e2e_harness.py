@@ -14,7 +14,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from scripts import run_logging
+from scripts import decision_gate, decision_policy, run_logging
 from scripts.quality_profile import resolve_quality_profile
 from scripts.skill_policy import load_risk_contract
 from scripts.agent_profile import (
@@ -140,6 +140,20 @@ class FakeScenario:
     # from the field above rather than loosening it: that one is the well-formed knob
     # every ordinary scenario uses, and it should stay impossible to misuse.
     worker_unit_test_status_lines: tuple[tuple[str, ...], ...] = ()
+    # OS-29: per-iteration decision declarations, indexed exactly like
+    # worker_unit_test_statuses. An EMPTY tuple means "say nothing extra", which
+    # leaves the fake agents' always-armed CLEAR default in place -- so every
+    # pre-OS-29 scenario keeps its transitions unchanged without being edited. A
+    # value of "" at some index is the deliberate silent-agent fixture.
+    worker_decision_states: tuple[str, ...] = ()
+    reviewer_decision_states: tuple[str, ...] = ()
+    # The unconstrained seams, the same role worker_unit_test_status_lines plays for
+    # OS-3: raw argv appended to that iteration's fake-agent command, so a scenario
+    # can drive the gate's malformed, duplicated and unbound branches through the
+    # REAL subprocess instead of by calling the parser in isolation. Kept separate
+    # from the constrained knobs above rather than loosening them.
+    worker_decision_args: tuple[tuple[str, ...], ...] = ()
+    reviewer_decision_args: tuple[tuple[str, ...], ...] = ()
 
 
 @dataclass
@@ -168,6 +182,16 @@ class WorkflowResult:
     final_status: str
     reason: str | None = None
     sessions: tuple[SessionEvent, ...] = ()
+    # OS-29. `decision_block` is the DECISION axis's answer for this round and is
+    # deliberately not derivable from `final_status`/`reason`: a round can be BLOCKED
+    # for a quality or contract reason (WORKER_BLOCKED, UNIT_TEST_BLOCKED) that DOES
+    # charge a correction iteration, and only this field distinguishes the two. It is
+    # the single key gate_attempts() reads, which is why one edit there covers both
+    # terminal shapes -- the LOW round that ends at B2 and the MEDIUM/HIGH round that
+    # ends at B3-V. The two string fields are the sparse log columns' values.
+    decision_block: tuple[str, str | None] | None = None
+    decision_state: str = ""
+    decision_reason_code: str = ""
 
 
 @dataclass(frozen=True)
@@ -243,6 +267,16 @@ def normalize_final_finding_spec(spec: FinalFindingSpec) -> tuple[str, str, str,
 class FinalReviewScenario:
     modes: tuple[str, ...]
     findings: tuple[tuple[FinalFindingSpec, ...], ...] = ()
+    # OS-29: the Final Reviewer's OWN decision declaration, per attempt and indexed
+    # exactly like `modes`. These are the same two knobs FakeScenario gives a phase
+    # Reviewer (`reviewer_decision_states` / `reviewer_decision_args`) and they mean
+    # the same thing here, because the Final Review after-result boundary IS B3 --
+    # the constrained knob for a well-formed state, and the unconstrained argv seam
+    # for the missing/malformed/unbound branches, driven through the REAL subprocess.
+    # An EMPTY tuple leaves the fake agent's always-armed CLEAR default in place, so
+    # every pre-existing Final Review scenario keeps its output byte-identical.
+    decision_states: tuple[str, ...] = ()
+    decision_args: tuple[tuple[str, ...], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -289,6 +323,10 @@ class WorkflowRunResult:
     # reading "none", so an empty tuple here is the absence itself rather than a
     # placeholder standing in for it.
     agent_profile_report: tuple[str, ...] = ()
+    # OS-29 reporting (never input). "" on every run that reached no decision
+    # boundary terminal -- an absence, not a placeholder standing in for CLEAR.
+    decision_state: str = ""
+    decision_reason_code: str = ""
 
 
 def _parse_choice(output: str, field_name: str, allowed: set[str]) -> str:
@@ -655,7 +693,24 @@ class E2EHarness:
         # directory) rather than the real repository's artifacts/ root, before the
         # first Worker/Reviewer subprocess -- run with cwd=workspace -- could be
         # told to write inside a directory nothing has created yet.
-        ensure_run_artifact_root(self.run_id, base=self.workspace)
+        # OS-29: the run root and the run-entry decision declaration are provisioned
+        # by ONE statement, so a run root can never exist without a ledger and the
+        # very first B1 has an explicit, validated, machine-readable input instead of
+        # an absence. Same shape, same returned root as ensure_run_artifact_root().
+        # The version is passed IN: run_logging may import nothing from scripts/, so
+        # decision_gate stays its sole owner and the writer is not trusted -- whatever
+        # is written is re-checked by A4 at the next boundary.
+        run_logging.open_decision_ledger(
+            self.run_id,
+            base=self.workspace,
+            phases=(self.phase,),
+            risk=self.risk or "",
+            ledger_schema_version=decision_gate.LEDGER_RECORD_SCHEMA_VERSION,
+        )
+        # OS-29: the OS-28 contract this harness's gate evaluates against, loaded ONCE
+        # from the same skill this harness was constructed for -- the same
+        # one-resolution rule the workflow contract and the risk contract follow.
+        self.policy = decision_policy.load_decision_policy(skill_path)
         # The first three MUST be mutable objects. _phase_harness() is a copy.copy(),
         # so a list / dict / count object is shared BY REFERENCE with every clone and
         # the state therefore survives phase, correction and revalidation boundaries.
@@ -883,6 +938,146 @@ class E2EHarness:
             sessions=tuple(self.sessions),
         )
 
+    # ---- OS-29 decision gate helpers ------------------------------------------
+    def _decision_blocked(
+        self,
+        iteration: int,
+        reason: str,
+        *,
+        block: tuple[str, str | None],
+        worker_attempts: list[AgentAttempt],
+        reviewer_attempts: list[AgentAttempt],
+        findings: dict[str, FindingTrace],
+    ) -> WorkflowResult:
+        """The one constructor for a decision-axis terminal.
+
+        The SAME WorkflowResult the surrounding code already builds, with
+        final_status = blocked_status and decision_block set. It adds no dispatch, no
+        round and no subprocess site -- a decision block is a way of ENDING a round
+        that already happened, never a new one.
+        """
+        return WorkflowResult(
+            current_phase=self.phase,
+            current_iteration=iteration,
+            max_iterations=self.max_iterations,
+            worker_attempts=worker_attempts,
+            reviewer_attempts=reviewer_attempts,
+            findings=findings,
+            final_status=self.contract.blocked_status,
+            reason=reason,
+            sessions=tuple(self.sessions),
+            decision_block=block,
+            decision_state=block[0],
+            decision_reason_code=block[1] or "",
+        )
+
+    def _append_decision_record(
+        self,
+        gate: decision_gate.GateResult,
+        *,
+        phase: str,
+        iteration: int,
+        role: str,
+        boundary: str,
+        source: str,
+        verdict: str,
+        verifies: dict | None,
+    ) -> str:
+        """Publish one immutable ledger record for a settled boundary. Returns its key.
+
+        The agent owns the DECISION half of the record (state, reason code, evidence,
+        assumption, open item, grounds); this harness stamps the BINDING half (run,
+        phase, iteration, role, boundary, source, verdict, the timestamp, the source
+        binding and the allocated sequence). Splitting it that way is what makes A3 a
+        real check: the ledger is written from the harness's own round state, so a
+        record that is later deleted or reordered fails to bind instead of quietly
+        being taken for the round that just settled.
+        """
+        record = dict(gate.record)
+        record.update(
+            {
+                "ledger_schema_version": decision_gate.LEDGER_RECORD_SCHEMA_VERSION,
+                "run": self.run_id,
+                "phase": phase,
+                "iteration": iteration,
+                "role": role,
+                "boundary": boundary,
+                "source": source,
+                "verdict": verdict,
+                "verifies": verifies,
+                # Agent records never carry the run-entry declaration's claim: it is
+                # a statement about the ledger at run entry and only sequence 0 makes
+                # it. A6 recomputes it from every OTHER record, this one included.
+                "prior_open_decision_items": [],
+                "recorded_at": run_logging.now_iso(),
+                # External review MAJOR: this was a setdefault, so an agent that put
+                # `source_binding` in its own fenced record kept it -- an arbitrary,
+                # null, cross-run or wrong-phase binding survived into the published
+                # ledger, and validate_ledger_record() only requires the field to be
+                # PRESENT, never that it matches the round this record belongs to.
+                # Harness-owned now, exactly like `run`, `phase`, `iteration` and
+                # `recorded_at` beside it: the agent describes its DECISION, never
+                # where that decision is recorded.
+                "source_binding": phase_artifact_contract(
+                    role=role, phase=phase, run_id=self.run_id
+                ),
+            }
+        )
+        record.setdefault("responsible_phase", phase)
+        record.setdefault("evidence", {})
+        record.setdefault("assumption", None)
+        record.setdefault("open_item", None)
+        _, sequence = run_logging.append_decision_ledger_record(
+            self.run_id,
+            record,
+            base=self.workspace,
+            ledger_schema_version=decision_gate.LEDGER_RECORD_SCHEMA_VERSION,
+        )
+        record["sequence"] = sequence
+        self._log_decision_event(
+            run_logging.EVENT_DECISION_RECORD_WRITTEN,
+            phase=phase,
+            role=role,
+            iteration=iteration,
+            state=str(record.get("state", "")),
+            reason_code=record.get("reason_code") or "",
+            detail=decision_gate.ledger_key(record),
+        )
+        return decision_gate.ledger_key(record)
+
+    def _log_decision_event(
+        self,
+        event: str,
+        *,
+        phase: str = "",
+        role: str = "",
+        iteration: int | str = "",
+        state: str = "",
+        reason_code: str = "",
+        detail: str = "",
+    ) -> None:
+        """One ORCHESTRATOR_LOG row. Logging never gates: a write failure is inert.
+
+        Section 9's rule, the same one OrcaRuntimeHarness._safe_log enforces on the
+        live path -- a logging failure must never turn a settled judgement into an
+        apparent failure, and it must never turn a refusal into an admission either.
+        """
+        try:
+            run_logging.log_orchestrator_event(
+                self.run_id,
+                base=self.workspace,
+                event=event,
+                phase=phase,
+                role=role,
+                iteration=iteration,
+                risk=self.risk or "",
+                decision_state=state,
+                decision_reason_code=reason_code,
+                detail=detail,
+            )
+        except Exception:  # noqa: BLE001 -- section 9: logging never mutates state
+            return
+
     def quality_gate(self) -> dict[str, object]:
         """The profile-first quality model both fake agents receive this phase.
 
@@ -970,6 +1165,12 @@ class E2EHarness:
             )
             for raw in raw_statuses:
                 worker_command.extend(["--unit-test-status-raw", raw])
+            if iteration <= len(scenario.worker_decision_states):
+                worker_command.extend(
+                    ["--decision-gate-state", scenario.worker_decision_states[iteration - 1]]
+                )
+            if iteration <= len(scenario.worker_decision_args):
+                worker_command.extend(scenario.worker_decision_args[iteration - 1])
             self._record_session(
                 "worker",
                 iteration,
@@ -1012,7 +1213,93 @@ class E2EHarness:
             worker_attempts.append(
                 AgentAttempt(iteration, worker_status, worker.stdout)
             )
-            if worker_status == self.contract.worker_blocked:
+
+            # ======== OS-29 B2. After the Worker result, ABOVE the STATUS: BLOCKED
+            # branch below and ABOVE the LOW gate return further down, so the check
+            # exists at EVERY risk level -- LOW has no phase Reviewer to notice a
+            # missing declaration, which is exactly why the guard cannot live on the
+            # Reviewer branch. O-2: the decision axis is evaluated BEFORE the quality
+            # axis, so a Worker that discovered a blocking decision mid-work is
+            # accounted on the decision axis (no iteration charged) instead of being
+            # swallowed as a generic WORKER_BLOCKED (which at LOW would charge one).
+            try:
+                gate = decision_gate.parse_gate_result(worker.stdout, self.policy)
+                if gate.record.get("verifies") is not None:
+                    raise decision_gate.GateRefusal(
+                        decision_gate.GATE_INPUT_UNBOUND,
+                        "a Worker record verifies nothing; `verifies` belongs to a "
+                        "Reviewer's B3 verification record",
+                    )
+            except decision_gate.GateRefusal as refusal:
+                # Row 3, and it is deliberately risk-independent: MEDIUM/HIGH must
+                # NOT spend the Reviewer here, because verification mode requires a
+                # valid classification to verify and there is none.
+                self._log_decision_event(
+                    run_logging.EVENT_DECISION_BLOCK,
+                    phase=self.phase,
+                    role="worker",
+                    iteration=iteration,
+                    state=decision_gate.INPUT_DEFECT_STATE,
+                    reason_code=refusal.reason,
+                    detail=refusal.detail,
+                )
+                return self._decision_blocked(
+                    iteration,
+                    refusal.reason,
+                    block=(decision_gate.INPUT_DEFECT_STATE, refusal.reason),
+                    worker_attempts=worker_attempts,
+                    reviewer_attempts=reviewer_attempts,
+                    findings=finding_traces,
+                )
+            worker_record_key = self._append_decision_record(
+                gate,
+                phase=self.phase,
+                iteration=iteration,
+                role="worker",
+                boundary="B2",
+                source="worker",
+                verdict="",
+                verifies=None,
+            )
+            verification_only = False
+            if gate.state in decision_gate.BLOCKING_STATES:
+                if self._risk_or_default() == "low":
+                    # Row 2 at LOW: terminal HERE. There is no phase Reviewer at LOW.
+                    self._log_decision_event(
+                        run_logging.EVENT_DECISION_BLOCK,
+                        phase=self.phase,
+                        role="worker",
+                        iteration=iteration,
+                        state=gate.state,
+                        reason_code=gate.reason_code or "",
+                        detail=worker_record_key,
+                    )
+                    return self._decision_blocked(
+                        iteration,
+                        decision_gate.block_reason(gate.state, gate.reason_code),
+                        block=(gate.state, gate.reason_code),
+                        worker_attempts=worker_attempts,
+                        reviewer_attempts=reviewer_attempts,
+                        findings=finding_traces,
+                    )
+                # Row 2 at MEDIUM/HIGH: NOT terminal here. Fall through to the
+                # ALREADY-SCHEDULED Reviewer at the existing dispatch site, in
+                # verification mode. No new dispatch site, no new round.
+                verification_only = True
+            # ======== end B2
+
+            if worker_status == self.contract.worker_blocked and not verification_only:
+                # O-2, completed: the decision axis is evaluated BEFORE the quality
+                # axis, so a Worker that discovered a blocking decision mid-work and
+                # declared it stays on the decision axis. Setting `verification_only`
+                # above is not enough on its own -- its RESULT has to be carried
+                # ACROSS this branch, or the MEDIUM/HIGH round is swallowed as a
+                # generic WORKER_BLOCKED before the already-scheduled verification
+                # Reviewer runs, and the terminal loses the machine-readable state and
+                # reason code the LOW terminal carries. A Worker-declared BLOCKED with
+                # NO blocking decision never sets `verification_only`, so it still
+                # terminates here as a plain WORKER_BLOCKED -- that distinction is the
+                # point of the guard, not a casualty of it.
                 return WorkflowResult(
                     current_phase=self.phase,
                     current_iteration=iteration,
@@ -1145,6 +1432,22 @@ class E2EHarness:
                 reviewer_command.extend(
                     ["--artifact", str(self.protected_artifacts[0])]
                 )
+            if verification_only:
+                # OS-29 B3-V: the ALREADY-SCHEDULED Reviewer, told which B2 record it
+                # is verifying. Passed only in verification mode, so every ordinary
+                # round's dispatched command stays byte-identical.
+                reviewer_command.extend(
+                    ["--decision-gate-verifies", worker_record_key]
+                )
+            if reviewer_index < len(scenario.reviewer_decision_states):
+                reviewer_command.extend(
+                    [
+                        "--decision-gate-state",
+                        scenario.reviewer_decision_states[reviewer_index],
+                    ]
+                )
+            if reviewer_index < len(scenario.reviewer_decision_args):
+                reviewer_command.extend(scenario.reviewer_decision_args[reviewer_index])
             self._record_session(
                 "reviewer",
                 iteration,
@@ -1194,6 +1497,152 @@ class E2EHarness:
             reviewer_attempts.append(
                 AgentAttempt(iteration, review_result, reviewer.stdout)
             )
+
+            # ======== OS-29 B3. Two modes on ONE code path: B3-V (verification, set
+            # by B2 above) and B3-N (normal). Neither adds a dispatch, a subprocess
+            # site or a round -- this is the same Reviewer attempt the loop already
+            # made, read on the decision axis before the quality axis (O-2).
+            try:
+                reviewer_gate = decision_gate.parse_gate_result(
+                    reviewer.stdout, self.policy
+                )
+            except decision_gate.GateRefusal as refusal:
+                self._log_decision_event(
+                    run_logging.EVENT_DECISION_BLOCK,
+                    phase=self.phase,
+                    role="reviewer",
+                    iteration=iteration,
+                    state=decision_gate.INPUT_DEFECT_STATE,
+                    reason_code=refusal.reason,
+                    detail=refusal.detail,
+                )
+                return self._decision_blocked(
+                    iteration,
+                    refusal.reason,
+                    block=(decision_gate.INPUT_DEFECT_STATE, refusal.reason),
+                    worker_attempts=worker_attempts,
+                    reviewer_attempts=reviewer_attempts,
+                    findings=finding_traces,
+                )
+            if verification_only:
+                # ---- B3-V, rows 4-7.
+                defect = decision_gate.verification_binding_defect(
+                    reviewer_gate,
+                    worker_key=worker_record_key,
+                    run_id=self.run_id,
+                    phase=self.phase,
+                    iteration=iteration,
+                )
+                if defect is not None:
+                    # Row 7. Deliberately NOT a silent fall-back to the Worker's
+                    # classification: both outcomes block, but only this one makes
+                    # the defect visible.
+                    self._log_decision_event(
+                        run_logging.EVENT_DECISION_BLOCK,
+                        phase=self.phase,
+                        role="reviewer",
+                        iteration=iteration,
+                        state=decision_gate.INPUT_DEFECT_STATE,
+                        reason_code=decision_gate.GATE_INPUT_UNBOUND,
+                        detail=defect,
+                    )
+                    return self._decision_blocked(
+                        iteration,
+                        decision_gate.GATE_INPUT_UNBOUND,
+                        block=(
+                            decision_gate.INPUT_DEFECT_STATE,
+                            decision_gate.GATE_INPUT_UNBOUND,
+                        ),
+                        worker_attempts=worker_attempts,
+                        reviewer_attempts=reviewer_attempts,
+                        findings=finding_traces,
+                    )
+                self._append_decision_record(
+                    reviewer_gate,
+                    phase=self.phase,
+                    iteration=iteration,
+                    role="reviewer",
+                    boundary="B3",
+                    source="reviewer",
+                    verdict=review_result,
+                    verifies=dict(reviewer_gate.record["verifies"]),
+                )
+                outcome = decision_gate.evaluate_verification(
+                    self.policy, gate, reviewer_gate
+                )
+                self._log_decision_event(
+                    run_logging.EVENT_DECISION_BLOCK,
+                    phase=self.phase,
+                    role="reviewer",
+                    iteration=iteration,
+                    state=outcome.block[0],
+                    reason_code=outcome.block[1] or "",
+                    detail=outcome.reason,
+                )
+                return self._decision_blocked(
+                    iteration,
+                    outcome.reason,
+                    block=outcome.block,
+                    worker_attempts=worker_attempts,
+                    reviewer_attempts=reviewer_attempts,
+                    findings=finding_traces,
+                )
+            if reviewer_gate.record.get("verifies") is not None:
+                # A normal-mode Reviewer verifies no classification -- there is none
+                # to verify -- so a record claiming otherwise is unbound, not extra
+                # evidence.
+                return self._decision_blocked(
+                    iteration,
+                    decision_gate.GATE_INPUT_UNBOUND,
+                    block=(
+                        decision_gate.INPUT_DEFECT_STATE,
+                        decision_gate.GATE_INPUT_UNBOUND,
+                    ),
+                    worker_attempts=worker_attempts,
+                    reviewer_attempts=reviewer_attempts,
+                    findings=finding_traces,
+                )
+            self._append_decision_record(
+                reviewer_gate,
+                phase=self.phase,
+                iteration=iteration,
+                role="reviewer",
+                boundary="B3",
+                source="reviewer",
+                verdict=review_result,
+                verifies=None,
+            )
+            if reviewer_gate.state in decision_gate.BLOCKING_STATES:
+                # ---- B3-N, row 8. The Reviewer discovered the blocking decision.
+                # Its findings are recorded FIRST, so "the phase Reviewer can FAIL it
+                # as a blocking finding" is satisfied by a recorded finding, while
+                # "a user-decision block consumes no correction iteration" is
+                # satisfied by decision_block. Two requirements, two mechanisms.
+                for finding_id in parsed_findings:
+                    trace = finding_traces.setdefault(
+                        finding_id, FindingTrace(finding_id, iteration)
+                    )
+                    trace.reviewer_iterations.append(iteration)
+                self._log_decision_event(
+                    run_logging.EVENT_DECISION_BLOCK,
+                    phase=self.phase,
+                    role="reviewer",
+                    iteration=iteration,
+                    state=reviewer_gate.state,
+                    reason_code=reviewer_gate.reason_code or "",
+                    detail="reviewer_discovered",
+                )
+                return self._decision_blocked(
+                    iteration,
+                    decision_gate.block_reason(
+                        reviewer_gate.state, reviewer_gate.reason_code
+                    ),
+                    block=(reviewer_gate.state, reviewer_gate.reason_code),
+                    worker_attempts=worker_attempts,
+                    reviewer_attempts=reviewer_attempts,
+                    findings=finding_traces,
+                )
+            # ======== end B3. Row 9: the existing PASS/FAIL routing, untouched.
 
             if review_result == self.contract.reviewer_pass:
                 return WorkflowResult(
@@ -1249,7 +1698,12 @@ class E2EHarness:
         return result
 
     def _run_final_review_attempt(
-        self, attempt: int, mode: str, findings: tuple[FinalFindingSpec, ...]
+        self,
+        attempt: int,
+        mode: str,
+        findings: tuple[FinalFindingSpec, ...],
+        decision_state: str | None = None,
+        decision_args: tuple[str, ...] = (),
     ) -> tuple[str | None, tuple[FinalFinding, ...], AgentAttempt | None]:
         """One Final Adversarial Review dispatch: a Reviewer-only invocation.
 
@@ -1287,6 +1741,13 @@ class E2EHarness:
         ]
         if self.protected_artifacts:
             command.extend(["--artifact", str(self.protected_artifacts[0])])
+        # OS-29: the Final Reviewer declares at B3 like any other Reviewer. The flags
+        # are appended only when the scenario asked for them, so a scenario that says
+        # nothing dispatches the exact argv it dispatched before OS-29 and the fake
+        # agent's armed CLEAR default still produces a real, parseable declaration.
+        if decision_state is not None:
+            command.extend(["--decision-gate-state", decision_state])
+        command.extend(decision_args)
         # OS-4: the Final Reviewer's own routing reaches the dispatch and the session
         # record. Rendered ONLY when a profile was selected -- a legacy Final Review
         # attempt keeps the exact argv it had before OS-4, with no --task-spec.
@@ -1433,7 +1894,11 @@ class E2EHarness:
         reviewer_gates_skipped: list[str] = []
 
         def snapshot(
-            final_status: str = "", reason: str | None = None
+            final_status: str = "",
+            reason: str | None = None,
+            *,
+            decision_state: str = "",
+            decision_reason_code: str = "",
         ) -> WorkflowRunResult:
             return WorkflowRunResult(
                 phases=scenario.phases,
@@ -1452,6 +1917,8 @@ class E2EHarness:
                 risk_source=self.risk_source,
                 reviewer_gates_skipped=list(reviewer_gates_skipped),
                 agent_profile_report=self.agent_routing_report_lines(),
+                decision_state=decision_state,
+                decision_reason_code=decision_reason_code,
             )
 
         # The only write of session_policy in this run: every _phase_harness clone
@@ -1487,7 +1954,15 @@ class E2EHarness:
         self.run_id = scenario.run_id
         # Re-provisioned here because run_id may differ from the constructor's
         # default: the phase loop below dispatches into this directory immediately.
-        ensure_run_artifact_root(self.run_id, base=self.workspace)
+        # OS-29: and with it the run-entry decision declaration, so the very first
+        # B1 below reads an explicit validated record rather than an absence.
+        run_logging.open_decision_ledger(
+            self.run_id,
+            base=self.workspace,
+            phases=scenario.phases,
+            risk=self.risk or "",
+            ledger_schema_version=decision_gate.LEDGER_RECORD_SCHEMA_VERSION,
+        )
         # OS-4: the routing for THIS workflow's whole requested phase set, resolved
         # once here -- before the first dispatch, which is this harness's equivalent
         # of "before the Run exists". The constructor could only see one phase; the
@@ -1501,10 +1976,56 @@ class E2EHarness:
         def gate_attempts(result: WorkflowResult) -> int:
             """SKILL.md section 13: a gate attempt is a Reviewer attempt at
             MEDIUM/HIGH and a Worker attempt at LOW, so the per-phase budget stays
-            reachable -- and the dispatch ledgers stay non-empty -- at every level."""
+            reachable -- and the dispatch ledgers stay non-empty -- at every level.
+
+            OS-29: a decision block is not a quality failure, so it charges no
+            correction iteration -- at any risk level. Keyed on `decision_block` and
+            NOT on risk, which is what lets ONE rule cover both terminal shapes: the
+            LOW round that ends at B2 with a Worker attempt appended, and the
+            MEDIUM/HIGH round that ends at B3-V with a Reviewer attempt appended. The
+            attempts themselves are NOT rewound -- a dispatch that physically
+            happened stays in its ledger; only the correction BUDGET is untouched.
+            """
+            if result.decision_block is not None:
+                return 0
             return len(
                 result.worker_attempts if risk == "low" else result.reviewer_attempts
             )
+
+        # ---- OS-29 B1. One guard, four call sites. It lives where the loop is, so
+        # the three round-dispatch sites cannot drift apart (R-8).
+        last_settled: tuple[str, str, int] | None = None
+
+        def b1(site: str) -> tuple[str, str, str] | None:
+            """(reason, decision_state, decision_reason_code) on refusal, else None.
+
+            The input is the admitted HEAD of this run's append-only ledger under
+            A1-A6 -- never an agent result, never an absence. `expected_settled_round`
+            is this loop's own in-memory round state and is never read back off the
+            ledger, which is what makes A3 a binding check rather than a restatement
+            of the file it validates.
+            """
+            try:
+                decision_gate.admit_head(
+                    self.policy,
+                    run_logging.read_decision_ledger(
+                        self.run_id, base=self.workspace
+                    ),
+                    run_id=self.run_id,
+                    expected_settled_round=last_settled,
+                )
+            except decision_gate.GateRefusal as refusal:
+                columns = decision_gate.decision_columns(refusal.reason)
+                self._log_decision_event(
+                    run_logging.EVENT_DECISION_GATE_REFUSED,
+                    phase=site,
+                    iteration="",
+                    state=columns[0],
+                    reason_code=columns[1],
+                    detail=f"{site}: {refusal.detail}",
+                )
+                return refusal.reason, columns[0], columns[1]
+            return None
 
         # ---- sequential phase gates (SKILL.md section 8: PASS before the next phase)
         for phase in scenario.phases:
@@ -1517,8 +2038,17 @@ class E2EHarness:
                 return self._workflow_error(
                     "SCENARIO_PHASE_MISSING:" + phase, snapshot()
                 )
+            refusal = b1("phase_gate")                       # ---- B1 site 1
+            if refusal is not None:
+                return snapshot(
+                    self.contract.blocked_status,
+                    refusal[0],
+                    decision_state=refusal[1],
+                    decision_reason_code=refusal[2],
+                )
             result = self._phase_harness(phase, self.max_iterations).run(phase_scenario)
             phase_iterations[phase] += gate_attempts(result)
+            last_settled = (self.run_id, phase, result.current_iteration)
             if result.final_status != self.contract.completed_status:
                 # S-R7: a round that did not PASS leaves both roles in recovery, so
                 # neither chain may be carried forward.
@@ -1526,9 +2056,22 @@ class E2EHarness:
                 self.invalidate_session("reviewer")
                 # BLOCKED worker, malformed output, or the phase's own budget exhausted:
                 # the gate is never reached and the phase's status/reason is propagated.
-                return snapshot(result.final_status, result.reason)
+                return snapshot(
+                    result.final_status,
+                    result.reason,
+                    decision_state=result.decision_state,
+                    decision_reason_code=result.decision_reason_code,
+                )
 
         while True:
+            refusal = b1("final_review")                      # ---- B1 site 2
+            if refusal is not None:
+                return snapshot(
+                    self.contract.blocked_status,
+                    refusal[0],
+                    decision_state=refusal[1],
+                    decision_reason_code=refusal[2],
+                )
             # ---- T0: every requested phase has PASSed. Open a fresh attempt.
             final_review_iterations += 1
             final_review_artifacts.append(
@@ -1546,6 +2089,12 @@ class E2EHarness:
                 scenario.final_review.findings[index]
                 if index < len(scenario.final_review.findings)
                 else (),
+                scenario.final_review.decision_states[index]
+                if index < len(scenario.final_review.decision_states)
+                else None,
+                scenario.final_review.decision_args[index]
+                if index < len(scenario.final_review.decision_args)
+                else (),
             )
             if attempt is None:                       # protected-artifact guard tripped,
                 return self._workflow_error(          # non-zero exit, or malformed output
@@ -1560,6 +2109,98 @@ class E2EHarness:
             # on the real dispatch path, so a snapshot deferred to run end is a
             # snapshot of somebody else's report.
             self._write_final_review_audit(final_review_iterations, attempt)
+
+            # ======== OS-29 B3, Final Review edge (PLAN P6b rows 8-10, W-4).
+            # The Final Review's after-result boundary IS B3: "after receiving the
+            # Reviewer result". The Final Reviewer is a Reviewer, so its result is
+            # read on the DECISION axis FIRST and on the quality axis (T1/T2/T3)
+            # only afterwards -- the same O-2 ordering run() applies at :1473, for
+            # the same reason. Placed BELOW the audit write on purpose: the audit
+            # record is evidence of a dispatch that physically happened and is never
+            # rewound by the judgement that follows it.
+            #
+            # This adds no dispatch, no subprocess site and no round. It is the
+            # attempt the loop already made, read a second way.
+            try:
+                final_gate = decision_gate.parse_gate_result(
+                    attempt.output, self.policy
+                )
+            except decision_gate.GateRefusal as refusal:
+                # Row 10: missing / malformed / unknown state / summary-vs-record
+                # drift. Fail closed -- a Final Reviewer that declared nothing is
+                # never presumed CLEAR, and quality PASS never reaches T1.
+                self._log_decision_event(
+                    run_logging.EVENT_DECISION_BLOCK,
+                    phase=FINAL_REVIEW_PHASE,
+                    role="reviewer",
+                    iteration=final_review_iterations,
+                    state=decision_gate.INPUT_DEFECT_STATE,
+                    reason_code=refusal.reason,
+                    detail=refusal.detail,
+                )
+                return snapshot(
+                    self.contract.blocked_status,
+                    refusal.reason,
+                    decision_state=decision_gate.INPUT_DEFECT_STATE,
+                    decision_reason_code=refusal.reason,
+                )
+            if final_gate.record.get("verifies") is not None:
+                # A Final Reviewer verifies no Worker B2 classification -- the Final
+                # Review round has no Worker at all -- so a record claiming to is
+                # unbound, not extra evidence. Same rule as B3-N at :1560.
+                self._log_decision_event(
+                    run_logging.EVENT_DECISION_BLOCK,
+                    phase=FINAL_REVIEW_PHASE,
+                    role="reviewer",
+                    iteration=final_review_iterations,
+                    state=decision_gate.INPUT_DEFECT_STATE,
+                    reason_code=decision_gate.GATE_INPUT_UNBOUND,
+                    detail="final_review verifies no worker record",
+                )
+                return snapshot(
+                    self.contract.blocked_status,
+                    decision_gate.GATE_INPUT_UNBOUND,
+                    decision_state=decision_gate.INPUT_DEFECT_STATE,
+                    decision_reason_code=decision_gate.GATE_INPUT_UNBOUND,
+                )
+            self._append_decision_record(
+                final_gate,
+                phase=FINAL_REVIEW_PHASE,
+                iteration=final_review_iterations,
+                role="reviewer",
+                boundary="B3",
+                source="reviewer",
+                verdict=verdict or "",
+                verifies=None,
+            )
+            # The Final Review record is now the ledger head, so the next B1 site --
+            # T4's correction guard -- must expect THIS round. Without this the head
+            # would fail to bind and a routed FAIL would refuse as A3-unbound.
+            last_settled = (
+                self.run_id, FINAL_REVIEW_PHASE, final_review_iterations
+            )
+            if final_gate.state in decision_gate.BLOCKING_STATES:
+                # Row 8 at the Final Review: the run must not reach COMPLETED on the
+                # quality axis while the decision axis blocks. This is the objective's
+                # scenario 9 applied to a decision the Final Reviewer itself raises.
+                self._log_decision_event(
+                    run_logging.EVENT_DECISION_BLOCK,
+                    phase=FINAL_REVIEW_PHASE,
+                    role="reviewer",
+                    iteration=final_review_iterations,
+                    state=final_gate.state,
+                    reason_code=final_gate.reason_code or "",
+                    detail="final_reviewer_discovered",
+                )
+                return snapshot(
+                    self.contract.blocked_status,
+                    decision_gate.block_reason(
+                        final_gate.state, final_gate.reason_code
+                    ),
+                    decision_state=final_gate.state,
+                    decision_reason_code=final_gate.reason_code or "",
+                )
+            # ======== end B3. The quality axis follows, unchanged.
 
             # ---- T1
             if verdict == self.contract.reviewer_pass:
@@ -1609,6 +2250,14 @@ class E2EHarness:
 
             # ---- T4: one correction round per responsible phase, upstream first.
             for phase in responsible:
+                refusal = b1("correction")                    # ---- B1 site 3
+                if refusal is not None:
+                    return snapshot(
+                        self.contract.blocked_status,
+                        refusal[0],
+                        decision_state=refusal[1],
+                        decision_reason_code=refusal[2],
+                    )
                 if phase_iterations[phase] >= self.max_iterations:
                     return snapshot(
                         self.contract.escalated_status,
@@ -1625,6 +2274,7 @@ class E2EHarness:
                 result, accepted, bridge_reason = self._run_correction_round(
                     phase, budget, correction, frozenset(routed[phase])
                 )
+                last_settled = (self.run_id, phase, result.current_iteration)
                 # The ledger is written BEFORE any verdict is applied: these Reviewer
                 # dispatches physically happened and are never rewound, whatever the
                 # bridge decides.
@@ -1652,7 +2302,12 @@ class E2EHarness:
                         f"MAX_ITERATIONS_REACHED ({phase})",
                     )
                 if result.final_status != self.contract.completed_status:
-                    return snapshot(result.final_status, result.reason)
+                    return snapshot(
+                        result.final_status,
+                        result.reason,
+                        decision_state=result.decision_state,
+                        decision_reason_code=result.decision_reason_code,
+                    )
                 # accepted round -> the DECISION P1 table for the next attempt's prompt
                 for finding_id in routed[phase]:
                     corrected_findings.append(
@@ -1689,6 +2344,14 @@ class E2EHarness:
                 else ()
             )
             for phase in downstream:
+                refusal = b1("downstream_revalidation")       # ---- B1 site 4
+                if refusal is not None:
+                    return snapshot(
+                        self.contract.blocked_status,
+                        refusal[0],
+                        decision_state=refusal[1],
+                        decision_reason_code=refusal[2],
+                    )
                 if phase_iterations[phase] >= self.max_iterations:
                     return snapshot(
                         self.contract.escalated_status,
@@ -1703,6 +2366,7 @@ class E2EHarness:
                     )
                 budget = self.max_iterations - phase_iterations[phase]
                 result = self._phase_harness(phase, budget).run(revalidation)
+                last_settled = (self.run_id, phase, result.current_iteration)
                 # Ledger BEFORE verdict, exactly as T4: these Reviewer dispatches
                 # physically happened and are never rewound.
                 for offset in range(1, gate_attempts(result) + 1):
@@ -1719,6 +2383,11 @@ class E2EHarness:
                         f"MAX_ITERATIONS_REACHED ({phase})",
                     )
                 if result.final_status != self.contract.completed_status:
-                    return snapshot(result.final_status, result.reason)
+                    return snapshot(
+                        result.final_status,
+                        result.reason,
+                        decision_state=result.decision_state,
+                        decision_reason_code=result.decision_reason_code,
+                    )
                 # No corrected_findings row: a revalidation resolves no finding.
             # ---- T5: every corrected and revalidated phase PASSed. Loop to T0 for a fresh attempt.

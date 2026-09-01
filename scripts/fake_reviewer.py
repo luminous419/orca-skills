@@ -10,8 +10,13 @@ from pathlib import Path
 
 try:
     from scripts.task_context import render_boundary_receipt
+    # OS-29: ONE definition of the gate declaration, shared by the two fake agents.
+    # A second copy here would be a place for the two fakes' decision semantics to
+    # drift, which is the exact failure mode this ticket adds validators against.
+    from scripts.fake_worker import add_decision_gate_arguments, render_decision_gate
 except ModuleNotFoundError:  # run directly as scripts/fake_*.py
     from task_context import render_boundary_receipt
+    from fake_worker import add_decision_gate_arguments, render_decision_gate
 
 
 def main() -> int:
@@ -31,7 +36,34 @@ def main() -> int:
     # Same contract as fake_worker: the dispatched Task spec is this agent's input,
     # and the receipt is read back out of it.
     parser.add_argument("--task-spec", default="")
+    add_decision_gate_arguments(parser)
+    # OS-29 B3-V: the ledger key of the Worker B2 record this Reviewer is verifying.
+    # Supplied by the harness ONLY in verification mode, so an ordinary round's
+    # dispatched command -- and this agent's output -- stay byte-identical. The
+    # -raw seam lets a scenario emit a binding that does not resolve, which is P6b
+    # row 7 and must fail closed rather than fall back to the Worker's own answer.
+    parser.add_argument("--decision-gate-verifies", default="")
+    parser.add_argument("--decision-gate-verifies-raw", default=None)
     args = parser.parse_args()
+
+    def gate_text() -> str:
+        extra: dict | None = None
+        key = (
+            args.decision_gate_verifies_raw
+            if args.decision_gate_verifies_raw is not None
+            else args.decision_gate_verifies
+        )
+        if key:
+            run, phase, iteration = key.split("/")[0:3]
+            extra = {
+                "verifies": {
+                    "run": run,
+                    "phase": phase,
+                    "iteration": int(iteration),
+                    "worker_record_key": key,
+                }
+            }
+        return render_decision_gate(args, extra)
 
     if args.mode == "exit":
         return 23
@@ -86,6 +118,7 @@ def main() -> int:
             print("\n## Non-Blocking Findings")
             for finding_id in findings:
                 emit(finding_id, "MINOR", False)
+        print(gate_text(), end="")
         print(render_boundary_receipt(args.task_spec), end="")
         return 0
     if mode not in {"fail", "fail-mixed"}:
@@ -97,6 +130,7 @@ def main() -> int:
         print("\n## Blocking Findings")
         for finding_id in findings:
             emit(finding_id, "MAJOR", is_blocking(finding_id, True))
+        print(gate_text(), end="")
         print(render_boundary_receipt(args.task_spec), end="")
         return 0
 
@@ -116,6 +150,7 @@ def main() -> int:
     print("\n## Non-Blocking Findings")
     for finding_id in note_ids:
         emit(finding_id, "MAJOR", False)
+    print(gate_text(), end="")
     print(render_boundary_receipt(args.task_spec), end="")
     return 0
 

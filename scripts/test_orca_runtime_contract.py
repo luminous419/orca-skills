@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import ast
 import inspect
 import json
@@ -20,8 +21,8 @@ from pathlib import Path
 from typing import Any, NamedTuple
 from unittest.mock import patch
 
-from scripts import orca_runtime_harness
-from scripts import run_logging
+from scripts import fake_worker, orca_runtime_harness
+from scripts import decision_gate, run_logging
 from scripts.orca_fake_agent import send_done
 from scripts.orca_runtime_harness import (
     CLOSE_ELIGIBLE_ROLES,
@@ -76,6 +77,69 @@ from scripts.task_context import (
     render_boundary_receipt,
 )
 
+# ---- OS-29 round 2 (review F-001): the settled bodies the recorders hand back -------
+# Round 1's doubles answered a bare "ok", which declares no gate result at all. The
+# runtime used to treat that as a legacy non-participant and let the next B1 admit the
+# unchanged run-entry head -- the fail-OPEN exception F-001 required removing. Now that
+# a silent settled result poisons the boundary, a double that stays silent would be
+# asserting the very exception that was removed, so the doubles DECLARE instead. The
+# text comes from fake_worker.render_decision_gate(), the same renderer the real fake
+# agents use, so the doubles and the subprocess agents cannot drift apart and no
+# decision vocabulary is restated here.
+def gate_declaration(state: str = "CLEAR", verifies: str | None = None) -> str:
+    """One valid `DECISION_GATE_STATE` line plus its fenced record, for `state`.
+
+    `verifies` is a Worker B2 ledger key, and it is expanded into the record's
+    `verifies` reference exactly the way fake_reviewer.py expands its own
+    --decision-gate-verifies flag -- so a live-path double and the subprocess
+    Reviewer build the same binding from the same key.
+    """
+    extra = None
+    if verifies is not None:
+        run, phase, iteration = verifies.split("/")[0:3]
+        extra = {
+            "verifies": {
+                "run": run,
+                "phase": phase,
+                "iteration": int(iteration),
+                "worker_record_key": verifies,
+            }
+        }
+    return fake_worker.render_decision_gate(
+        argparse.Namespace(
+            decision_gate_state=state,
+            decision_gate_state_line_raw=None,
+            decision_gate_record_raw=None,
+            decision_gate_omit_field=False,
+            decision_gate_omit_block=False,
+        ),
+        extra,
+    )
+
+
+DECLARED_DONE_BODY = "ok\n" + gate_declaration()
+
+
+def gate_declaration_with(state: str, extra: dict) -> str:
+    """`gate_declaration`, plus arbitrary fields merged into the fenced record.
+
+    `extra` is applied LAST by render_decision_gate(), so this is the strongest form
+    of the forging attempt the external review MAJOR describes: whatever the agent
+    puts in its own record is what reaches the harness.
+    """
+    return fake_worker.render_decision_gate(
+        argparse.Namespace(
+            decision_gate_state=state,
+            decision_gate_state_line_raw=None,
+            decision_gate_record_raw=None,
+            decision_gate_omit_field=False,
+            decision_gate_omit_block=False,
+        ),
+        extra,
+    )
+
+
+
 # validate_skills.py imports its siblings by top-level module name, so scripts/ must be
 # importable before it can be loaded. `unittest discover -s scripts` already arranges
 # that; this keeps the other invocation forms working too.
@@ -109,7 +173,7 @@ DONE = {
     "payload": json.dumps(
         {"taskId": "task_g", "dispatchId": "ctx_1", "outcome": "succeeded"}
     ),
-    "body": "ok",
+    "body": DECLARED_DONE_BODY,
 }
 # The completion timestamp axis (a) requires alongside a settled status. The live
 # runtime writes `completed_at` on both the completed and the failed Dispatch row.
@@ -129,7 +193,7 @@ def done_for(
         "payload": json.dumps(
             {"taskId": task_id, "dispatchId": dispatch_id, "outcome": outcome}
         ),
-        "body": "ok",
+        "body": DECLARED_DONE_BODY,
     }
 
 
@@ -194,7 +258,8 @@ class RecordingExec:
                 "payload": json.dumps(
                     {"taskId": "task_g", "dispatchId": "ctx_1", "outcome": "succeeded"}
                 ),
-                "body": "ok",
+                # Declares CLEAR rather than staying silent -- see gate_declaration().
+                "body": DECLARED_DONE_BODY,
             }
         ],
     }
@@ -326,13 +391,57 @@ class SequentialDispatchExec(SequentialTerminalExec):
                                 "outcome": "succeeded",
                             }
                         ),
-                        "body": "ok",
+                        "body": DECLARED_DONE_BODY,
                     }
                 ],
             }
         return super().__call__(args)
 
     LIVE_TERMINAL_RESOURCE = {"releaseState": "live", "processState": "running"}
+
+
+class VerificationDispatchExec(SequentialTerminalExec):
+    """A recorder that can settle SEVERAL dispatches, each with its own body.
+
+    Final Adversarial Review F-001 needs one Worker round and then the Reviewer round
+    that verifies it, against a ledger staged the way a real run stages it. The base
+    recorder pins ONE dispatch id, which the finalize-once gate correctly treats as a
+    replay on the second attempt, and pins ONE settled body, which is the only thing
+    those two rounds differ in. This is the minimum extension for both -- the same
+    role SequentialTerminalExec already plays for `terminal create`.
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.body = DECLARED_DONE_BODY
+        self.dispatched: list[str] = []
+
+    def __call__(self, args: tuple[str, ...]) -> tuple[int, str]:
+        args = tuple(args)
+        verb = args[1] if len(args) > 1 else args[0]
+        if verb == "worker-start":
+            dispatch_id = f"ctx_v{len(self.dispatched) + 1}"
+            self.dispatched.append(dispatch_id)
+            self.results["worker-start"] = {"dispatchId": dispatch_id}
+            self.results["check"] = {
+                "deliveryId": f"dlv_{dispatch_id}",
+                "timedOut": False,
+                "messages": [
+                    {
+                        "id": f"msg_{dispatch_id}",
+                        "type": "worker_done",
+                        "payload": json.dumps(
+                            {
+                                "taskId": "task_g",
+                                "dispatchId": dispatch_id,
+                                "outcome": "succeeded",
+                            }
+                        ),
+                        "body": self.body,
+                    }
+                ],
+            }
+        return super().__call__(args)
 
 
 class EchoingTerminalExec(SequentialTerminalExec):
@@ -365,8 +474,11 @@ class EchoingTerminalExec(SequentialTerminalExec):
         elif verb == "check" and result.get("messages"):
             for message in result["messages"]:
                 task_id = json.loads(message["payload"])["taskId"]
-                message["body"] = "ok" + render_boundary_receipt(
-                    self.specs.get(task_id, "")
+                message["body"] = (
+                    "ok"
+                    + render_boundary_receipt(self.specs.get(task_id, ""))
+                    + "\n"
+                    + gate_declaration()
                 )
             return code, json.dumps(body)
         return code, payload
@@ -501,6 +613,18 @@ class DuplicateSettlementTests(unittest.TestCase):
             harness = OrcaRuntimeHarness(self.artifact_dir)
         harness._exec_orca = recorder  # the only process boundary
         harness.run_owner, harness.run_id = "term_owner", "run_offline"
+        # OS-29: this helper bypasses start_run(), which is where a real run opens
+        # its decision ledger, so it stubs that too. Without it the pre-dispatch B1
+        # guard refuses with DECISION_GATE_INPUT_MISSING -- correctly, because a run
+        # id with no ledger is exactly the "no record present" state the gate must
+        # never read as CLEAR. Same shape as the requested_phases stub beside it.
+        run_logging.open_decision_ledger(
+            harness.run_id,
+            base=self.artifact_dir,
+            phases=harness.requested_phases or ("implementation",),
+            risk=harness.risk or "",
+            ledger_schema_version=decision_gate.LEDGER_RECORD_SCHEMA_VERSION,
+        )
         harness.register_terminal(
             "term_worker",
             role="active_worker",
@@ -865,6 +989,18 @@ class OfflineHarnessTestCase(unittest.TestCase):
         # any test that uses build(); FinalReviewQualityProfileTests declares its own
         # meaningful set through the real start_run() path instead of this stub.
         harness.requested_phases = ("implementation",)
+        # OS-29: this helper bypasses start_run(), which is where a real run opens
+        # its decision ledger, so it stubs that too. Without it the pre-dispatch B1
+        # guard refuses with DECISION_GATE_INPUT_MISSING -- correctly, because a run
+        # id with no ledger is exactly the "no record present" state the gate must
+        # never read as CLEAR. Same shape as the requested_phases stub beside it.
+        run_logging.open_decision_ledger(
+            harness.run_id,
+            base=self.artifact_dir,
+            phases=harness.requested_phases or ("implementation",),
+            risk=harness.risk or "",
+            ledger_schema_version=decision_gate.LEDGER_RECORD_SCHEMA_VERSION,
+        )
         return harness
 
     def worker_terminal(
@@ -2668,7 +2804,7 @@ class SameRoleSessionReuseTests(OfflineHarnessTestCase):
                             "outcome": "succeeded",
                         }
                     ),
-                    "body": "ok",
+                    "body": DECLARED_DONE_BODY,
                 }
             ],
         }
@@ -3937,7 +4073,7 @@ class FinalReviewFreshnessTests(OfflineHarnessTestCase):
                             "outcome": "succeeded",
                         }
                     ),
-                    "body": "ok",
+                    "body": DECLARED_DONE_BODY,
                 }
             ],
         }
@@ -4542,7 +4678,7 @@ class ScenarioKExec(EchoingTerminalExec):
                                 "outcome": "succeeded",
                             }
                         ),
-                        "body": "ok",
+                        "body": DECLARED_DONE_BODY,
                     }
                 ],
             }
@@ -5017,7 +5153,7 @@ class AutoSequencedExec(EchoingTerminalExec):
                                 "outcome": "succeeded",
                             }
                         ),
-                        "body": "ok",
+                        "body": DECLARED_DONE_BODY,
                     }
                 ],
             }
@@ -5400,7 +5536,7 @@ quality_attributes:
                                 "outcome": "succeeded",
                             }
                         ),
-                        "body": "ok",
+                        "body": DECLARED_DONE_BODY,
                     }
                 ],
             }
@@ -5932,7 +6068,7 @@ class RunLoggingIntegrationTests(OfflineHarnessTestCase):
         self.arm(recorder, "ctx_w1", "task_w1")
         worker1, _ = harness.run_attempt("worker", 1, "complete", phase="implementation")
         self.arm(recorder, "ctx_r1", "task_r1")
-        recorder.results["check"]["messages"][0]["body"] = "RESULT: FAIL"
+        recorder.results["check"]["messages"][0]["body"] = "RESULT: FAIL" + "\n" + gate_declaration()
         reviewer1, _ = harness.run_attempt(
             "reviewer", 1, "fail", phase="implementation", findings=("R1",)
         )
@@ -5941,7 +6077,7 @@ class RunLoggingIntegrationTests(OfflineHarnessTestCase):
             "worker", 2, "correction", phase="implementation", findings=("R1",)
         )
         self.arm(recorder, "ctx_r2", "task_r2")
-        recorder.results["check"]["messages"][0]["body"] = "RESULT: PASS"
+        recorder.results["check"]["messages"][0]["body"] = "RESULT: PASS" + "\n" + gate_declaration()
         reviewer2, _ = harness.run_attempt("reviewer", 2, "pass", phase="implementation")
         run_id = harness.run_id
         # finish() is what closes whatever phase/iteration is still open when a
@@ -6269,7 +6405,7 @@ class RunLoggingIntegrationTests(OfflineHarnessTestCase):
         self.arm(recorder, "ctx_w1", "task_w1")
         worker1, _ = harness.run_attempt("worker", 1, "complete", phase="implementation")
         self.arm(recorder, "ctx_r1", "task_r1")
-        recorder.results["check"]["messages"][0]["body"] = "RESULT: FAIL"
+        recorder.results["check"]["messages"][0]["body"] = "RESULT: FAIL" + "\n" + gate_declaration()
         reviewer1, _ = harness.run_attempt(
             "reviewer", 1, "fail", phase="implementation", findings=("R1",)
         )
@@ -6278,7 +6414,7 @@ class RunLoggingIntegrationTests(OfflineHarnessTestCase):
             "worker", 2, "correction", phase="implementation", findings=("R1",)
         )
         self.arm(recorder, "ctx_r2", "task_r2")
-        recorder.results["check"]["messages"][0]["body"] = "RESULT: PASS"
+        recorder.results["check"]["messages"][0]["body"] = "RESULT: PASS" + "\n" + gate_declaration()
         reviewer2, _ = harness.run_attempt("reviewer", 2, "pass", phase="implementation")
         run_id = harness.run_id
         harness.finish(
@@ -6380,7 +6516,7 @@ class RunLoggingIntegrationTests(OfflineHarnessTestCase):
             harness.run_attempt("worker", 1, "complete", phase="implementation")[0]
         )
         self.arm(recorder, "ctx_r1", "task_r1")
-        recorder.results["check"]["messages"][0]["body"] = "RESULT: FAIL"
+        recorder.results["check"]["messages"][0]["body"] = "RESULT: FAIL" + "\n" + gate_declaration()
         attempts.append(
             harness.run_attempt(
                 "reviewer", 1, "fail", phase="implementation", findings=("R1",)
@@ -6394,14 +6530,14 @@ class RunLoggingIntegrationTests(OfflineHarnessTestCase):
             )[0]
         )
         self.arm(recorder, "ctx_r2", "task_r2")
-        recorder.results["check"]["messages"][0]["body"] = "RESULT: PASS"
+        recorder.results["check"]["messages"][0]["body"] = "RESULT: PASS" + "\n" + gate_declaration()
         attempts.append(
             harness.run_attempt(
                 "reviewer", 2, "pass", phase="implementation", round_kind="correction"
             )[0]
         )
         self.arm(recorder, "ctx_f1", "task_f1")
-        recorder.results["check"]["messages"][0]["body"] = "RESULT: FAIL"
+        recorder.results["check"]["messages"][0]["body"] = "RESULT: FAIL" + "\n" + gate_declaration()
         attempts.append(
             harness.run_attempt(
                 "reviewer", 1, "fail", phase="final_review",
@@ -6412,7 +6548,7 @@ class RunLoggingIntegrationTests(OfflineHarnessTestCase):
         # re-opens design at a NEW iteration number -- the exact path DESIGN
         # iteration 7 (-1296s) came down in the real run.
         self.arm(recorder, "ctx_d7", "task_d7")
-        recorder.results["check"]["messages"][0]["body"] = "RESULT: PASS"
+        recorder.results["check"]["messages"][0]["body"] = "RESULT: PASS" + "\n" + gate_declaration()
         attempts.append(
             harness.run_attempt(
                 "worker", 7, "correction", phase="design",
@@ -6582,7 +6718,7 @@ class RunLoggingIntegrationTests(OfflineHarnessTestCase):
         recorder = SequentialTerminalExec()
         harness = self.started_harness(recorder)
         self.arm(recorder, "ctx_r1", "task_r1")
-        recorder.results["check"]["messages"][0]["body"] = "RESULT: FAIL"
+        recorder.results["check"]["messages"][0]["body"] = "RESULT: FAIL" + "\n" + gate_declaration()
 
         attempt, _ = harness.run_attempt(
             "reviewer", 1, "fail", phase="implementation", findings=("R1",)
@@ -6599,12 +6735,12 @@ class RunLoggingIntegrationTests(OfflineHarnessTestCase):
         recorder = SequentialTerminalExec()
         harness = self.started_harness(recorder)
         self.arm(recorder, "ctx_r1", "task_r1")
-        recorder.results["check"]["messages"][0]["body"] = "RESULT: FAIL"
+        recorder.results["check"]["messages"][0]["body"] = "RESULT: FAIL" + "\n" + gate_declaration()
         harness.run_attempt(
             "reviewer", 1, "fail", phase="implementation", findings=("R1",)
         )
         self.arm(recorder, "ctx_r2", "task_r2")
-        recorder.results["check"]["messages"][0]["body"] = "RESULT: PASS"
+        recorder.results["check"]["messages"][0]["body"] = "RESULT: PASS" + "\n" + gate_declaration()
         harness.run_attempt("reviewer", 2, "pass", phase="implementation")
 
         rows = self.read_orchestrator_rows(harness.run_id)
@@ -6622,7 +6758,7 @@ class RunLoggingIntegrationTests(OfflineHarnessTestCase):
         harness = self.started_harness(recorder)
         self.arm(recorder, "ctx_w1", "task_w1")
         # Ignored: gate-result parsing only applies to a reviewer-role dispatch.
-        recorder.results["check"]["messages"][0]["body"] = "RESULT: FAIL"
+        recorder.results["check"]["messages"][0]["body"] = "RESULT: FAIL" + "\n" + gate_declaration()
 
         harness.run_attempt("worker", 1, "complete", phase="implementation")
 
@@ -6638,6 +6774,8 @@ class RunLoggingIntegrationTests(OfflineHarnessTestCase):
         self.arm(recorder, "ctx_r1", "task_r1")
         recorder.results["check"]["messages"][0]["body"] = (
             "# Review Result\n\n## Summary\nMissing result field"
+            + "\n"
+            + gate_declaration()
         )
 
         harness.run_attempt("reviewer", 1, "fail", phase="implementation")
@@ -6652,7 +6790,7 @@ class RunLoggingIntegrationTests(OfflineHarnessTestCase):
         recorder = SequentialTerminalExec()
         harness = self.started_harness(recorder)
         self.arm(recorder, "ctx_f1", "task_f1")
-        recorder.results["check"]["messages"][0]["body"] = "RESULT: FAIL"
+        recorder.results["check"]["messages"][0]["body"] = "RESULT: FAIL" + "\n" + gate_declaration()
 
         harness.run_attempt(
             "reviewer", 1, "fail", phase="final_review", findings=("R1",)
@@ -6680,7 +6818,9 @@ class RunLoggingIntegrationTests(OfflineHarnessTestCase):
         }
         for iteration, (dispatch_id, body) in enumerate(bodies.items(), start=1):
             self.arm(recorder, dispatch_id, f"task_{dispatch_id}")
-            recorder.results["check"]["messages"][0]["body"] = body
+            recorder.results["check"]["messages"][0]["body"] = (
+                body + "\n" + gate_declaration()
+            )
             harness.run_attempt(
                 "reviewer", iteration, "fail", phase="implementation"
             )
@@ -6709,7 +6849,7 @@ class RunLoggingIntegrationTests(OfflineHarnessTestCase):
         recorder = SequentialTerminalExec()
         harness = self.started_harness(recorder)
         self.arm(recorder, "ctx_r1", "task_r1")
-        recorder.results["check"]["messages"][0]["body"] = "RESULT: PASS"
+        recorder.results["check"]["messages"][0]["body"] = "RESULT: PASS" + "\n" + gate_declaration()
 
         harness.run_attempt("reviewer", 1, "pass", phase="implementation")
 
@@ -6723,6 +6863,8 @@ class RunLoggingIntegrationTests(OfflineHarnessTestCase):
         self.arm(recorder, "ctx_f1", "task_f1")
         recorder.results["check"]["messages"][0]["body"] = (
             "RESULT: PASS\nREVIEW_VERDICT: PASS WITH NOTES"
+            + "\n"
+            + gate_declaration()
         )
 
         harness.run_attempt("reviewer", 1, "pass", phase="final_review")
@@ -6798,6 +6940,18 @@ class RiskGraphContractTests(unittest.TestCase):
         harness._exec_orca = recorder
         harness.run_owner, harness.run_id = "term_owner", "run_offline"
         harness.requested_phases = ("implementation",)
+        # OS-29: this helper bypasses start_run(), which is where a real run opens
+        # its decision ledger, so it stubs that too. Without it the pre-dispatch B1
+        # guard refuses with DECISION_GATE_INPUT_MISSING -- correctly, because a run
+        # id with no ledger is exactly the "no record present" state the gate must
+        # never read as CLEAR. Same shape as the requested_phases stub beside it.
+        run_logging.open_decision_ledger(
+            harness.run_id,
+            base=self.artifact_dir,
+            phases=harness.requested_phases or ("implementation",),
+            risk=harness.risk or "",
+            ledger_schema_version=decision_gate.LEDGER_RECORD_SCHEMA_VERSION,
+        )
         return harness
 
     @staticmethod
@@ -7200,6 +7354,1507 @@ class FinalReviewAuditEmissionTests(OfflineHarnessTestCase):
         entry = routing.for_role("final_review", "final_reviewer")
         self.assertEqual(record["reviewer_agent_command"], entry.command)
         self.assertEqual(record["reviewer_agent_origin"], entry.origin)
+
+
+# ---------------------------------------------------------------------------------
+# OS-29: the live pre-dispatch half.
+#
+# W-8 enforces the ONE thing that is enforceable on this path -- no Task, no Dispatch
+# and no terminal is created when the gate refuses. The rest of the gate is the
+# Coordinator's documented obligation (SKILL.md's `#### Decision gate contract`),
+# because this runtime has no deterministic in-process iteration counter (R-11/L7).
+# ---------------------------------------------------------------------------------
+class DecisionGateLiveDispatchTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.artifact_dir = Path(self.temporary_directory.name)
+
+    def tearDown(self) -> None:
+        self.temporary_directory.cleanup()
+
+    def started_harness(
+        self, done_body: str | None = None
+    ) -> tuple[OrcaRuntimeHarness, RecordingExec]:
+        """`done_body` replaces the body the settled `worker_done` carries.
+
+        Only the BODY changes; the delivery, the payload identities and every other
+        modelled verb stay the ones every other test in this class uses, so a
+        difference in outcome is attributable to the decision declaration alone.
+        """
+        done = RecordingExec.ACCEPTED_DONE
+        if done_body is not None:
+            messages = [dict(done["messages"][0], body=done_body)]
+            done = dict(done, messages=messages)
+        recorder = RecordingExec(
+            results={
+                "run-create": {"run": {"id": "run_live_os29"}},
+                "check": done,
+            }
+        )
+        with patch.dict(environ, {"ORCA_CLI_COMMAND": "/opt/orca-dev"}):
+            harness = OrcaRuntimeHarness(self.artifact_dir)
+        harness._exec_orca = recorder
+        harness.start_run("os29 live", requested_phases=("implementation",))
+        return harness, recorder
+
+    def ledger(self):
+        return run_logging.read_decision_ledger(
+            "run_live_os29", base=self.artifact_dir
+        )
+
+    def orchestrator_log(self, harness: OrcaRuntimeHarness) -> str:
+        return (
+            self.artifact_dir
+            / "artifacts" / "runs" / harness.run_id / "ORCHESTRATOR_LOG.md"
+        ).read_text(encoding="utf-8")
+
+    @staticmethod
+    def attempt(
+        *,
+        body: str,
+        role: str = "worker",
+        iteration: int = 1,
+        outcome: str = "succeeded",
+        worker_done_count: int = 1,
+    ) -> orca_runtime_harness.RuntimeAttempt:
+        return orca_runtime_harness.RuntimeAttempt(
+            role=role,
+            iteration=iteration,
+            task_id="task_x",
+            dispatch_id="ctx_x",
+            outcome=outcome,
+            task_status="done",
+            dispatch_status="settled",
+            worker_state="done",
+            terminal_state="live",
+            lifecycle_action="release",
+            worker_done_count=worker_done_count,
+            execution_path="supervised",
+            body=body,
+        )
+
+    def test_start_run_writes_the_run_entry_declaration(self) -> None:
+        harness, _ = self.started_harness()
+
+        records = self.ledger()
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["sequence"], 0)
+        self.assertEqual(records[0]["source"], "coordinator:run_entry")
+        self.assertEqual(records[0]["run"], harness.run_id)
+        self.assertEqual(records[0]["phase"], "implementation")
+        self.assertEqual(
+            records[0]["ledger_schema_version"],
+            decision_gate.LEDGER_RECORD_SCHEMA_VERSION,
+        )
+
+    def test_a_missing_declaration_refuses_before_any_dispatch_exists(self) -> None:
+        harness, recorder = self.started_harness()
+        shutil.rmtree(
+            self.artifact_dir
+            / "artifacts" / "runs" / harness.run_id / "decision_ledger"
+        )
+        commands_before = len(recorder.commands)
+
+        with self.assertRaises(orca_runtime_harness.DecisionGateRefused) as caught:
+            harness.run_existing_task(
+                "worker", 1, "complete", "task_os29", phase="implementation"
+            )
+
+        self.assertEqual(caught.exception.reason, "DECISION_GATE_INPUT_MISSING")
+        # NO Task, NO Dispatch, NO terminal: the refusal happened before the runtime
+        # issued a single further command.
+        self.assertEqual(len(recorder.commands), commands_before)
+        log = (
+            self.artifact_dir
+            / "artifacts" / "runs" / harness.run_id / "ORCHESTRATOR_LOG.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("pre_dispatch_failure", log)
+        self.assertIn("DECISION_GATE_INPUT_MISSING", log)
+
+    def plant_unresolved_open_item(
+        self, harness: OrcaRuntimeHarness, fixture: str = "worker_needs_input"
+    ) -> str:
+        """Append a blocking Worker B2 record and declare it open on the run entry.
+
+        Factored out of test_an_unresolved_open_item_refuses_the_next_dispatch so the
+        SAME planted shape can be driven through both live dispatch initiators
+        (round 2 review F-002); the assertions themselves stay in the tests.
+
+        Returns the planted record's ledger key, which is what a Coordinator would
+        hand the already-scheduled Reviewer as its `verifies` binding. `fixture`
+        selects the blocking state, so NEEDS_INPUT and CONFLICT drive one code path.
+        """
+        open_record = json.loads(
+            (
+                Path(__file__).resolve().parents[1]
+                / "scripts" / "fixtures" / "decision_gate" / "valid"
+                / f"{fixture}.json"
+            ).read_text(encoding="utf-8")
+        )
+        planted = dict(open_record, run=harness.run_id, phase="implementation")
+        _, sequence = run_logging.append_decision_ledger_record(
+            harness.run_id,
+            planted,
+            base=self.artifact_dir,
+            ledger_schema_version=decision_gate.LEDGER_RECORD_SCHEMA_VERSION,
+        )
+        ledger_dir = run_logging.decision_ledger_dir(
+            harness.run_id, base=self.artifact_dir
+        )
+        declaration = json.loads(
+            (ledger_dir / "000000" / "record.json").read_text(encoding="utf-8")
+        )
+        declaration["prior_open_decision_items"] = [
+            decision_gate.ledger_key(dict(planted, sequence=sequence))
+        ]
+        (ledger_dir / "000000" / "record.json").write_text(
+            json.dumps(declaration, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        harness._last_settled = (harness.run_id, "implementation", 1)
+        return decision_gate.ledger_key(dict(planted, sequence=sequence))
+
+    def test_an_unresolved_open_item_refuses_the_next_dispatch(self) -> None:
+        harness, recorder = self.started_harness()
+        self.plant_unresolved_open_item(harness)
+        commands_before = len(recorder.commands)
+
+        with self.assertRaises(orca_runtime_harness.DecisionGateRefused) as caught:
+            harness.run_existing_task(
+                "worker", 2, "complete", "task_os29", phase="implementation"
+            )
+
+        self.assertTrue(caught.exception.reason.startswith("DECISION_BLOCKED:"))
+        self.assertEqual(len(recorder.commands), commands_before)
+
+    def test_a_declaring_dispatch_records_a_bound_ledger_entry(self) -> None:
+        """The live path's own recording: a settled attempt whose body carries a valid
+        gate result becomes a bound ledger record and fills the two log columns.
+
+        The body is produced by the REAL fake worker, so this exercises the same
+        bytes a live dispatch would deliver rather than a hand-written string.
+        """
+        harness, _ = self.started_harness()
+        body = subprocess.run(
+            [
+                sys.executable,
+                str(Path(__file__).resolve().parent / "fake_worker.py"),
+                "--mode", "complete", "--field", "STATUS",
+                "--complete-value", "COMPLETE", "--blocked-value", "BLOCKED",
+                "--iteration", "1",
+            ],
+            text=True, capture_output=True, check=True,
+        ).stdout
+
+        harness._log_attempt(
+            phase="implementation",
+            attempt=self.attempt(body=body),
+            terminal_created=True,
+            started_at=run_logging.now_iso(),
+            ended_at=run_logging.now_iso(),
+        )
+
+        records = self.ledger()
+        self.assertEqual(len(records), 2)
+        self.assertEqual(records[1]["source"], "worker")
+        self.assertEqual(records[1]["boundary"], "B2")
+        self.assertEqual(records[1]["phase"], "implementation")
+        self.assertEqual(records[1]["iteration"], 1)
+        self.assertEqual(records[1]["state"], "CLEAR")
+        self.assertEqual(records[1]["run"], harness.run_id)
+        self.assertEqual(harness._last_settled, (harness.run_id, "implementation", 1))
+        log = (
+            self.artifact_dir
+            / "artifacts" / "runs" / harness.run_id / "ORCHESTRATOR_LOG.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("decision_state", log.splitlines()[0])
+        self.assertIn("| CLEAR |", log)
+        # The chain now BINDS: the next boundary is admitted rather than unbound,
+        # which is the control proving _last_settled and the record agree.
+        harness._b1_guard(phase="implementation", role="reviewer", iteration=1)
+
+    # ---- F-001: a settled result that declares NOTHING is the missing-record case.
+    # Round 1 shipped a test here asserting the opposite -- that such a body is "not
+    # a ledger participant", leaves `_last_settled` untouched, and therefore lets the
+    # following B1 admit the unchanged run-entry head. Round 2 review F-001 required
+    # that test to be REPLACED, because it enshrined a fail-OPEN exception against
+    # ORIGINAL_REQUEST's unconditional list ("missing decision record" is its first
+    # item) and PLAN P10 criterion 6. The two tests below are its replacement and
+    # assert refusal, on the Worker boundary (B2) and the Reviewer boundary (B3).
+
+    SILENT_WORKER_BODY = "# Worker Result\n\nSTATUS: COMPLETE\n"
+    SILENT_REVIEWER_BODY = "# Review Result\n\nRESULT: PASS\n"
+
+    def test_a_silent_worker_result_poisons_the_next_boundary(self) -> None:
+        """B2. A Worker body carrying no gate declaration publishes NO ledger record,
+        binds the round that settled anyway, and therefore leaves the next B1 unable
+        to admit the unchanged head. No later dispatch survives it."""
+        harness, recorder = self.started_harness()
+        self.assertFalse(decision_gate.declares_gate_result(self.SILENT_WORKER_BODY))
+
+        state, reason = harness._record_decision_from_attempt(
+            event="dispatch_settled",
+            phase="implementation",
+            attempt=self.attempt(body=self.SILENT_WORKER_BODY),
+        )
+
+        # Never CLEAR, and never blank: silence is named as the input defect it is.
+        self.assertEqual(state, decision_gate.INPUT_DEFECT_STATE)
+        self.assertEqual(reason, decision_gate.GATE_INPUT_MISSING)
+        # Nothing was published -- a body with no result cannot become a record.
+        self.assertEqual(len(self.ledger()), 1)
+        # ... but the settled round IS bound, which is what poisons the next B1.
+        self.assertEqual(harness._last_settled, (harness.run_id, "implementation", 1))
+
+        commands_before = len(recorder.commands)
+        with self.assertRaises(orca_runtime_harness.DecisionGateRefused) as caught:
+            harness.run_existing_task(
+                "worker", 2, "complete", "task_next", phase="implementation"
+            )
+        self.assertEqual(caught.exception.reason, decision_gate.GATE_INPUT_UNBOUND)
+        self.assertEqual(len(recorder.commands), commands_before)
+        self.assertNotIn("worker-start", recorder.verbs)
+
+    def test_a_silent_reviewer_result_poisons_the_next_boundary(self) -> None:
+        """B3. Identical refusal from the Reviewer boundary, and it holds for BOTH
+        live dispatch initiators -- neither the correction Worker nor the unexpected-
+        exit path can run after a Reviewer settled without a gate result."""
+        harness, recorder = self.started_harness()
+        self.assertFalse(decision_gate.declares_gate_result(self.SILENT_REVIEWER_BODY))
+
+        state, reason = harness._record_decision_from_attempt(
+            event="dispatch_settled",
+            phase="implementation",
+            attempt=self.attempt(body=self.SILENT_REVIEWER_BODY, role="reviewer"),
+        )
+
+        self.assertEqual(state, decision_gate.INPUT_DEFECT_STATE)
+        self.assertEqual(reason, decision_gate.GATE_INPUT_MISSING)
+        self.assertEqual(len(self.ledger()), 1)
+        self.assertEqual(harness._last_settled, (harness.run_id, "implementation", 1))
+
+        commands_before = len(recorder.commands)
+        with self.assertRaises(orca_runtime_harness.DecisionGateRefused) as caught:
+            harness.run_existing_task(
+                "worker", 2, "correct", "task_next", phase="implementation"
+            )
+        self.assertEqual(caught.exception.reason, decision_gate.GATE_INPUT_UNBOUND)
+        with self.assertRaises(orca_runtime_harness.DecisionGateRefused) as crashed:
+            harness.observe_unexpected_exit("worker", 2, phase="implementation")
+        self.assertEqual(crashed.exception.reason, decision_gate.GATE_INPUT_UNBOUND)
+        self.assertEqual(len(recorder.commands), commands_before)
+        self.assertNotIn("worker-start", recorder.verbs)
+
+    def test_a_silent_result_is_named_as_a_defect_on_the_live_log_row(self) -> None:
+        """The same refusal through the REAL settled-dispatch funnel rather than the
+        private recorder: _log_attempt() is what every live dispatch passes, and the
+        row it writes has to say INPUT/DECISION_GATE_INPUT_MISSING rather than the
+        blank columns a tolerated legacy body used to leave behind."""
+        harness, _ = self.started_harness()
+
+        harness._log_attempt(
+            phase="implementation",
+            attempt=self.attempt(body=self.SILENT_WORKER_BODY),
+            terminal_created=True,
+            started_at=run_logging.now_iso(),
+            ended_at=run_logging.now_iso(),
+        )
+
+        log = (
+            self.artifact_dir
+            / "artifacts" / "runs" / harness.run_id / "ORCHESTRATOR_LOG.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn(f"| {decision_gate.INPUT_DEFECT_STATE} |", log)
+        self.assertIn(decision_gate.GATE_INPUT_MISSING, log)
+        self.assertEqual(len(self.ledger()), 1)
+        self.assertEqual(harness._last_settled, (harness.run_id, "implementation", 1))
+        with self.assertRaises(orca_runtime_harness.DecisionGateRefused):
+            harness._b1_guard(phase="implementation", role="reviewer", iteration=1)
+
+    def test_a_non_response_is_not_a_boundary_and_is_never_presumed_clear(self) -> None:
+        """The complement of the two tests above, and the reason they are scoped to a
+        DELIVERED result: an unexpected exit reached neither B2 nor B3, because no
+        Worker or Reviewer result was ever received. It therefore asserts NOTHING --
+        no ledger record, no decision columns, no gate_result -- rather than
+        asserting CLEAR, and it does not consume the binding of a round that never
+        produced one. What stops a non-response from becoming progress is B1 on the
+        NEXT dispatch, which observe_unexpected_exit() now runs too (F-002 above);
+        poisoning here instead would brick the lifecycle recovery path, which OS-29
+        is explicitly forbidden to weaken."""
+        harness, _ = self.started_harness()
+
+        harness._log_attempt(
+            phase="implementation",
+            attempt=self.attempt(body="", outcome="unknown", worker_done_count=0),
+            terminal_created=True,
+            started_at=run_logging.now_iso(),
+            ended_at=run_logging.now_iso(),
+            event="unexpected_exit",
+        )
+
+        # Nothing was recorded and nothing was claimed: no state, no reason code.
+        self.assertEqual(len(self.ledger()), 1)
+        self.assertIsNone(harness._last_settled)
+        row = [
+            line
+            for line in (
+                self.artifact_dir
+                / "artifacts" / "runs" / harness.run_id / "ORCHESTRATOR_LOG.md"
+            ).read_text(encoding="utf-8").splitlines()
+            if "unexpected_exit" in line
+        ]
+        self.assertEqual(len(row), 1)
+        self.assertNotIn("CLEAR", row[0])
+        self.assertNotIn(decision_gate.INPUT_DEFECT_STATE, row[0].split("|"))
+
+    def test_a_declared_but_broken_body_poisons_the_next_boundary(self) -> None:
+        """The fail-closed direction: a declaration that does not parse publishes no
+        record AND advances the binding expectation, so the next B1 refuses."""
+        harness, _ = self.started_harness()
+        broken = (
+            "# Worker Result\n\nSTATUS: COMPLETE\n"
+            f"{decision_gate.GATE_STATE_FIELD}: CLEAR\n"
+        )
+
+        state, reason = harness._record_decision_from_attempt(
+            event="dispatch_settled",
+            phase="implementation",
+            attempt=self.attempt(body=broken),
+        )
+
+        self.assertEqual(state, decision_gate.INPUT_DEFECT_STATE)
+        self.assertEqual(reason, decision_gate.GATE_INPUT_MISSING)
+        self.assertEqual(len(self.ledger()), 1)
+        self.assertEqual(harness._last_settled, (harness.run_id, "implementation", 1))
+        with self.assertRaises(orca_runtime_harness.DecisionGateRefused) as caught:
+            harness.run_existing_task(
+                "worker", 2, "complete", "task_next", phase="implementation"
+            )
+        self.assertEqual(caught.exception.reason, decision_gate.GATE_INPUT_UNBOUND)
+
+    # ---- Final Adversarial Review F-001: the LIVE B3-V verification exception ------
+    # The deterministic E2EHarness.run() already had it; the live runtime did not, so
+    # `run_existing_task('reviewer', ..., phase='implementation')` after a Worker
+    # NEEDS_INPUT returned DECISION_BLOCKED with COMMAND_DELTA 0 and the permitted
+    # MEDIUM/HIGH classification review could not happen at all.
+    #
+    # Every test below stages the ledger the way a REAL run stages it -- by settling
+    # an actual Worker dispatch whose body declares the blocking classification --
+    # rather than by hand-editing the sequence-0 declaration. That distinction is the
+    # point: the run-entry declaration is written once, at run open, so it never
+    # names the item the run itself just opened, and an exception that only worked
+    # against an edited declaration would still be unreachable in production.
+
+    def verification_harness(
+        self,
+    ) -> tuple[OrcaRuntimeHarness, VerificationDispatchExec]:
+        """A started harness whose recorder can settle more than one dispatch."""
+        recorder = VerificationDispatchExec(
+            results={"run-create": {"run": {"id": "run_live_os29"}}}
+        )
+        with patch.dict(environ, {"ORCA_CLI_COMMAND": "/opt/orca-dev"}):
+            harness = OrcaRuntimeHarness(self.artifact_dir)
+        harness._exec_orca = recorder
+        harness.start_run("os29 live", requested_phases=("implementation",))
+        return harness, recorder
+
+    @staticmethod
+    def worker_body(state: str) -> str:
+        return "# Worker Result\n\nSTATUS: COMPLETE\n" + gate_declaration(state)
+
+    @staticmethod
+    def reviewer_body(state: str, verifies: str | None) -> str:
+        return (
+            "# Review Result\n\nRESULT: FAIL\nREVIEW_VERDICT: FAIL\n"
+            + gate_declaration(state, verifies=verifies)
+        )
+
+    def settle_blocking_worker(
+        self,
+        harness: OrcaRuntimeHarness,
+        recorder: VerificationDispatchExec,
+        state: str = "NEEDS_INPUT",
+    ) -> str:
+        """Drive a REAL Worker dispatch that classifies the phase as blocking.
+
+        Returns the ledger key of the B2 record it published -- the key a Coordinator
+        then hands the already-scheduled Reviewer as its `verifies` binding.
+        """
+        recorder.body = self.worker_body(state)
+        harness.run_existing_task(
+            "worker", 1, "complete", "task_g", phase="implementation"
+        )
+        head = self.ledger()[-1]
+        self.assertEqual(head["state"], state)
+        self.assertEqual(head["boundary"], "B2")
+        self.assertEqual(head["source"], "worker")
+        return decision_gate.ledger_key(head)
+
+    def assert_refused(
+        self, harness: OrcaRuntimeHarness, recorder: RecordingExec, **dispatch
+    ) -> str:
+        """One dispatch that must leave NO Task, NO Dispatch and NO terminal behind.
+
+        Counted as a DELTA rather than an absolute, because some of these refusals
+        are asserted AFTER the one admitted verification has already dispatched --
+        "no further dispatch" is the claim, and an absolute count could not make it.
+        The reason is asserted to be one of OS-29's CLOSED refusal shapes, so a
+        refusal that happens for an unmodelled reason cannot pass for a gate block.
+        """
+        commands_before = len(recorder.commands)
+        starts_before = recorder.verbs.count("worker-start")
+        with self.assertRaises(orca_runtime_harness.DecisionGateRefused) as caught:
+            harness.run_existing_task(**dispatch)
+        self.assertEqual(len(recorder.commands), commands_before)
+        self.assertEqual(recorder.verbs.count("worker-start"), starts_before)
+        reason = caught.exception.reason
+        self.assertTrue(
+            reason in decision_gate.GATE_REFUSAL_REASONS
+            or decision_gate.BLOCK_REASON_PATTERN.match(reason) is not None,
+            f"{reason} is not a closed OS-29 refusal",
+        )
+        return reason
+
+    def test_the_already_scheduled_reviewer_verifies_a_blocking_classification(
+        self,
+    ) -> None:
+        """POSITIVE. The one dispatch P6b row 2 permits actually happens live.
+
+        Everything about it is bound: the same run, the same phase, the same
+        iteration, the head IS that Worker's own open B2 record, and the Reviewer
+        carries a `verifies` reference to it. The round is still terminal -- the item
+        stays open, so the assertions at the end prove nothing follows.
+        """
+        harness, recorder = self.verification_harness()
+        worker_key = self.settle_blocking_worker(harness, recorder)
+        recorder.body = self.reviewer_body("NEEDS_INPUT", worker_key)
+        starts_before = recorder.verbs.count("worker-start")
+
+        attempt, _ = harness.run_existing_task(
+            "reviewer",
+            1,
+            "fail",
+            "task_g",
+            phase="implementation",
+            verifies=worker_key,
+        )
+
+        # EXACTLY ONE further dispatch: the Reviewer really reached worker-start.
+        self.assertEqual(recorder.verbs.count("worker-start"), starts_before + 1)
+        self.assertEqual(attempt.role, "reviewer")
+        self.assertEqual(attempt.outcome, "succeeded")
+        # ...and its verification was RECORDED, bound to the Worker's record.
+        records = self.ledger()
+        self.assertEqual(len(records), 3)
+        self.assertEqual(records[2]["boundary"], "B3")
+        self.assertEqual(records[2]["source"], "reviewer")
+        self.assertEqual(records[2]["verifies"]["worker_record_key"], worker_key)
+        # The terminal is the SHARED evaluator's: a confirmation carries the WORKER's
+        # own state and code, which is the LOW terminal byte for byte.
+        log = self.orchestrator_log(harness)
+        self.assertIn("decision_block", log)
+        self.assertIn(
+            decision_gate.block_reason("NEEDS_INPUT", "blast_radius_beyond_scope"), log
+        )
+
+        # ---- and the round stays TERMINAL. Nothing follows the verification.
+        for label, dispatch in {
+            "a second Reviewer": dict(
+                role="reviewer", iteration=1, mode="fail", task_id="task_g",
+                phase="implementation", verifies=worker_key,
+            ),
+            "a correction Worker": dict(
+                role="worker", iteration=2, mode="correction", task_id="task_g",
+                phase="implementation",
+            ),
+            "the next phase": dict(
+                role="worker", iteration=1, mode="complete", task_id="task_g",
+                phase="test",
+            ),
+            "the Final Review": dict(
+                role="final_reviewer", iteration=1, mode="fail", task_id="task_g",
+                phase="final_review",
+            ),
+        }.items():
+            with self.subTest(case=label):
+                self.assert_refused(harness, recorder, **dispatch)
+        # No correction iteration was charged either: the ledger holds the two
+        # boundary records and nothing else, and no third dispatch ever started.
+        self.assertEqual(len(self.ledger()), 3)
+        self.assertEqual(recorder.verbs.count("worker-start"), starts_before + 1)
+
+    def test_an_accepted_downgrade_is_recorded_and_still_terminal(self) -> None:
+        """L6 on the live path: acting on a downgrade would be resume, which is OS-31.
+
+        The Reviewer proposes NEEDS_INPUT -> CLEAR, which the shared contract can
+        accept. The record is published, and the correction Worker and the next phase
+        are STILL refused -- a verification never resolves the item it verifies.
+        """
+        harness, recorder = self.verification_harness()
+        worker_key = self.settle_blocking_worker(harness, recorder)
+        recorder.body = self.reviewer_body("CLEAR", worker_key)
+
+        harness.run_existing_task(
+            "reviewer", 1, "fail", "task_g", phase="implementation",
+            verifies=worker_key,
+        )
+
+        records = self.ledger()
+        self.assertEqual(len(records), 3)
+        self.assertEqual(records[2]["state"], "CLEAR")
+        self.assertEqual(records[2]["verifies"]["worker_record_key"], worker_key)
+        # The Worker's item is STILL open after the downgrade was recorded.
+        self.assertEqual(
+            decision_gate.open_items(harness._decision_policy, records), {worker_key}
+        )
+        for label, dispatch in {
+            "a correction Worker": dict(
+                role="worker", iteration=2, mode="correction", task_id="task_g",
+                phase="implementation",
+            ),
+            "the next phase": dict(
+                role="worker", iteration=1, mode="complete", task_id="task_g",
+                phase="test",
+            ),
+            "a second Reviewer": dict(
+                role="reviewer", iteration=1, mode="fail", task_id="task_g",
+                phase="implementation", verifies=worker_key,
+            ),
+        }.items():
+            with self.subTest(case=label):
+                self.assert_refused(harness, recorder, **dispatch)
+
+    def test_a_conflict_classification_takes_the_same_live_verification_path(
+        self,
+    ) -> None:
+        """CONFLICT, not just NEEDS_INPUT -- both blocking states, one code path."""
+        harness, recorder = self.verification_harness()
+        worker_key = self.settle_blocking_worker(harness, recorder, "CONFLICT")
+        recorder.body = self.reviewer_body("CONFLICT", worker_key)
+        starts_before = recorder.verbs.count("worker-start")
+
+        harness.run_existing_task(
+            "reviewer", 1, "fail", "task_g", phase="implementation",
+            verifies=worker_key,
+        )
+
+        self.assertEqual(recorder.verbs.count("worker-start"), starts_before + 1)
+        self.assertEqual(self.ledger()[2]["state"], "CONFLICT")
+        self.assertIn(
+            decision_gate.block_reason("CONFLICT", "requirement_contradiction"),
+            self.orchestrator_log(harness),
+        )
+    def test_p6b_row_5_a_stricter_live_verification_carries_the_reviewers_own_state(
+        self,
+    ) -> None:
+        """P6b ROW 5 on the LIVE path: a verification may move toward more blocking.
+
+        The contract half and the deterministic half of this row already exist
+        (`test_decision_gate.VerificationTests.test_a_stricter_verification_carries_
+        the_reviewers_own_state` and `test_e2e_harness.test_p6b_row_5_a_stricter_
+        verification_carries_the_reviewers_own_state`). The LIVE half became
+        reachable only once Final Adversarial Review F-001 was resolved, because
+        before that no live Reviewer could be admitted past an open blocking head at
+        all. That fix brought live cases for rows 2, 4, 6 and 7; row 5 is the one it
+        left without one, and this is it.
+
+        The Worker classifies NEEDS_INPUT and the Reviewer verifies it as CONFLICT,
+        so the terminal must carry the REVIEWER's state and code. The CONTROL at the
+        end differs in exactly one field -- the Reviewer CONFIRMS instead -- and
+        carries the WORKER's code, so "stricter" is a real branch rather than a
+        constant this assertion would pass against either way.
+        """
+        harness, recorder = self.verification_harness()
+        worker_key = self.settle_blocking_worker(harness, recorder, "NEEDS_INPUT")
+        recorder.body = self.reviewer_body("CONFLICT", worker_key)
+
+        harness.run_existing_task(
+            "reviewer", 1, "fail", "task_g", phase="implementation",
+            verifies=worker_key,
+        )
+
+        records = self.ledger()
+        self.assertEqual(records[2]["boundary"], "B3")
+        self.assertEqual(records[2]["state"], "CONFLICT")
+        self.assertEqual(records[2]["verifies"]["worker_record_key"], worker_key)
+        stricter_log = self.orchestrator_log(harness)
+        self.assertIn(
+            decision_gate.block_reason("CONFLICT", "requirement_contradiction"),
+            stricter_log,
+        )
+        self.assertNotIn(
+            decision_gate.block_reason("NEEDS_INPUT", "blast_radius_beyond_scope"),
+            stricter_log,
+        )
+        # ...and row 5 is as TERMINAL as row 4, in fact MORE so: the Worker's item is
+        # still open -- open_items() lets no `verifies`-bearing record resolve
+        # anything -- and the Reviewer's own stricter classification is a second open
+        # item beside it. The correction Worker a resolution would release is refused.
+        self.assertEqual(
+            decision_gate.open_items(harness._decision_policy, records),
+            {worker_key, decision_gate.ledger_key(records[2])},
+        )
+        self.assert_refused(
+            harness, recorder, role="worker", iteration=2, mode="correction",
+            task_id="task_g", phase="implementation",
+        )
+
+        # ---- CONTROL, in this same test: one field different, the other branch.
+        with tempfile.TemporaryDirectory() as control_directory:
+            self.artifact_dir = Path(control_directory)
+            control, control_recorder = self.verification_harness()
+            control_key = self.settle_blocking_worker(
+                control, control_recorder, "NEEDS_INPUT"
+            )
+            control_recorder.body = self.reviewer_body("NEEDS_INPUT", control_key)
+            control.run_existing_task(
+                "reviewer", 1, "fail", "task_g", phase="implementation",
+                verifies=control_key,
+            )
+            control_log = self.orchestrator_log(control)
+        self.assertIn(
+            decision_gate.block_reason("NEEDS_INPUT", "blast_radius_beyond_scope"),
+            control_log,
+        )
+        self.assertNotIn(
+            decision_gate.block_reason("CONFLICT", "requirement_contradiction"),
+            control_log,
+        )
+
+    def test_every_other_dispatch_after_a_blocking_worker_stays_refused(self) -> None:
+        """NEGATIVES at B1, against the SAME ledger the positive admits.
+
+        Each row changes exactly one binding, and the control at the end admits the
+        fully bound Reviewer -- so every refusal here is attributable to the axis it
+        changed rather than to the ledger it was evaluated against.
+        """
+        harness, recorder = self.verification_harness()
+        worker_key = self.settle_blocking_worker(harness, recorder)
+
+        for label, dispatch in {
+            # An UNBOUND verification: the right role, phase and iteration, but no
+            # `verifies` reference at all. This is the shape that must never be
+            # admitted on the strength of the role alone.
+            "an unbound Reviewer": dict(
+                role="reviewer", iteration=1, mode="fail", task_id="task_g",
+                phase="implementation",
+            ),
+            "a Reviewer bound to another record": dict(
+                role="reviewer", iteration=1, mode="fail", task_id="task_g",
+                phase="implementation",
+                verifies=f"{harness.run_id}/implementation/9/B2#9",
+            ),
+            "a Reviewer of another phase": dict(
+                role="reviewer", iteration=1, mode="fail", task_id="task_g",
+                phase="test", verifies=worker_key,
+            ),
+            "a Reviewer of another iteration": dict(
+                role="reviewer", iteration=2, mode="fail", task_id="task_g",
+                phase="implementation", verifies=worker_key,
+            ),
+            "a correction Worker": dict(
+                role="worker", iteration=2, mode="correction", task_id="task_g",
+                phase="implementation",
+            ),
+            # Even a Worker that forges the binding: the role conjunct refuses it.
+            "a Worker claiming the verification": dict(
+                role="worker", iteration=1, mode="correction", task_id="task_g",
+                phase="implementation", verifies=worker_key,
+            ),
+            "the Final Review": dict(
+                role="final_reviewer", iteration=1, mode="fail", task_id="task_g",
+                phase="final_review", verifies=worker_key,
+            ),
+            "the next phase": dict(
+                role="worker", iteration=1, mode="complete", task_id="task_g",
+                phase="test",
+            ),
+        }.items():
+            with self.subTest(case=label):
+                self.assert_refused(harness, recorder, **dispatch)
+
+        # CONTROL, in this same test: the fully bound Reviewer IS admitted against
+        # the identical ledger, so none of the eight refusals above is vacuous.
+        starts_before = recorder.verbs.count("worker-start")
+        recorder.body = self.reviewer_body("NEEDS_INPUT", worker_key)
+        harness.run_existing_task(
+            "reviewer", 1, "fail", "task_g", phase="implementation",
+            verifies=worker_key,
+        )
+        self.assertEqual(recorder.verbs.count("worker-start"), starts_before + 1)
+
+    def test_the_recovery_initiator_offers_no_verification_and_stays_refused(
+        self,
+    ) -> None:
+        """observe_unexpected_exit() has no `verifies` parameter and must not gain one.
+
+        A recovery dispatch after a non-response is not the already-scheduled
+        Reviewer verifying a classification, so the exception has exactly ONE entry
+        point. The control below proves the ledger itself would admit that one.
+        """
+        harness, recorder = self.verification_harness()
+        worker_key = self.settle_blocking_worker(harness, recorder)
+        commands_before = len(recorder.commands)
+
+        with self.assertRaises(orca_runtime_harness.DecisionGateRefused):
+            harness.observe_unexpected_exit("reviewer", 1, phase="implementation")
+
+        self.assertEqual(len(recorder.commands), commands_before)
+        self.assertNotIn(
+            "verifies",
+            inspect.signature(OrcaRuntimeHarness.observe_unexpected_exit).parameters,
+        )
+        # CONTROL: the same head, through the initiator that DOES accept a binding.
+        recorder.body = self.reviewer_body("NEEDS_INPUT", worker_key)
+        starts_before = recorder.verbs.count("worker-start")
+        harness.run_existing_task(
+            "reviewer", 1, "fail", "task_g", phase="implementation",
+            verifies=worker_key,
+        )
+        self.assertEqual(recorder.verbs.count("worker-start"), starts_before + 1)
+
+    def test_an_admitted_reviewer_still_owes_a_bound_verification_record(self) -> None:
+        """P6b row 7 on the LIVE path: admission is not acceptance.
+
+        The dispatch is admitted because the Coordinator bound it; the RESULT is then
+        checked against that binding. A Reviewer that comes back without a `verifies`
+        reference, or with one pointing elsewhere, publishes NO record and is named as
+        the input defect it is -- never as a silent fall-back to the Worker's own
+        classification.
+        """
+        for label, elsewhere in {"no verifies at all": None, "bound elsewhere": True}.items():
+            with self.subTest(case=label):
+                self.tearDown()
+                self.setUp()
+                harness, recorder = self.verification_harness()
+                worker_key = self.settle_blocking_worker(harness, recorder)
+                recorder.body = self.reviewer_body(
+                    "NEEDS_INPUT",
+                    f"{harness.run_id}/implementation/9/B2#9" if elsewhere else None,
+                )
+                starts_before = recorder.verbs.count("worker-start")
+
+                harness.run_existing_task(
+                    "reviewer", 1, "fail", "task_g", phase="implementation",
+                    verifies=worker_key,
+                )
+
+                # The dispatch happened -- and published nothing.
+                self.assertEqual(
+                    recorder.verbs.count("worker-start"), starts_before + 1
+                )
+                self.assertEqual(len(self.ledger()), 2)
+                self.assertIn(
+                    decision_gate.GATE_INPUT_UNBOUND, self.orchestrator_log(harness)
+                )
+
+    def test_an_ordinary_round_is_never_put_into_verification_mode(self) -> None:
+        """The REGRESSION control for the arming: a CLEAR head owes no verification.
+
+        B1 remembers a pending verification only when it admitted one, so an ordinary
+        Worker-then-Reviewer round still publishes two plain B3/B2 records with
+        `verifies` null and is never asked for a binding it has no reason to carry.
+        """
+        harness, recorder = self.verification_harness()
+        recorder.body = self.worker_body("CLEAR")
+        harness.run_existing_task(
+            "worker", 1, "complete", "task_g", phase="implementation"
+        )
+        recorder.body = (
+            "# Review Result\n\nRESULT: PASS\nREVIEW_VERDICT: PASS\n"
+            + gate_declaration("CLEAR")
+        )
+
+        harness.run_existing_task(
+            "reviewer", 1, "pass", "task_g", phase="implementation"
+        )
+
+        records = self.ledger()
+        self.assertEqual(len(records), 3)
+        self.assertEqual(
+            [record["boundary"] for record in records], ["B1", "B2", "B3"]
+        )
+        self.assertEqual([record["state"] for record in records[1:]], ["CLEAR"] * 2)
+        self.assertIsNone(records[1]["verifies"])
+        self.assertIsNone(records[2]["verifies"])
+        self.assertIsNone(harness._pending_verification)
+        self.assertNotIn(
+            decision_gate.GATE_INPUT_UNBOUND, self.orchestrator_log(harness)
+        )
+
+    def test_a_verifies_claim_outside_verification_mode_is_unbound(self) -> None:
+        """The mirror image: a `verifies` reference with nothing to verify.
+
+        A Worker verifies nothing, and a normal-mode Reviewer has no classification in
+        front of it, so the claim is unbound rather than extra evidence.
+        """
+        harness, _ = self.started_harness()
+
+        state, reason = harness._record_decision_from_attempt(
+            event="dispatch_settled",
+            phase="implementation",
+            attempt=self.attempt(
+                body="ok\n"
+                + gate_declaration(
+                    "CLEAR", verifies=f"{harness.run_id}/implementation/1/B2#1"
+                )
+            ),
+        )
+
+        self.assertEqual(state, decision_gate.INPUT_DEFECT_STATE)
+        self.assertEqual(reason, decision_gate.GATE_INPUT_UNBOUND)
+        self.assertEqual(len(self.ledger()), 1)
+        # CONTROL: the SAME body without the claim publishes normally, so the refusal
+        # is the claim's and not the body's.
+        self.tearDown()
+        self.setUp()
+        harness, _ = self.started_harness()
+        state, _ = harness._record_decision_from_attempt(
+            event="dispatch_settled",
+            phase="implementation",
+            attempt=self.attempt(body=DECLARED_DONE_BODY),
+        )
+        self.assertEqual(state, "CLEAR")
+        self.assertEqual(len(self.ledger()), 2)
+
+    # ---- F-002: observe_unexpected_exit() is the OTHER live dispatch initiator -----
+    # It calls dispatch_context(), create_task(), create_fake_terminal() and
+    # start_worker() exactly as run_existing_task() does. Round 1 gave it no B1 guard
+    # at all, so every refusal shape below still reached worker-start through it while
+    # the sibling path refused. Each test drives ONE refusal shape and asserts the
+    # three absences the requirement actually names: no Task, no terminal, no
+    # worker-start.
+
+    def _run_entry_record_path(self, harness: OrcaRuntimeHarness) -> Path:
+        return (
+            run_logging.decision_ledger_dir(harness.run_id, base=self.artifact_dir)
+            / "000000" / "record.json"
+        )
+
+    def _rewrite_run_entry(self, harness: OrcaRuntimeHarness, **fields: Any) -> None:
+        path = self._run_entry_record_path(harness)
+        record = json.loads(path.read_text(encoding="utf-8"))
+        for name, value in fields.items():
+            if value is self.DROP:
+                record.pop(name, None)
+            else:
+                record[name] = value
+        path.write_text(
+            json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+
+    DROP = object()
+
+    def assert_unexpected_exit_refuses(
+        self,
+        harness: OrcaRuntimeHarness,
+        recorder: RecordingExec,
+        *,
+        reason: str,
+        reason_is_prefix: bool = False,
+    ) -> None:
+        """Drive observe_unexpected_exit() and prove it left NOTHING behind."""
+        commands_before = len(recorder.commands)
+
+        with self.assertRaises(orca_runtime_harness.DecisionGateRefused) as caught:
+            harness.observe_unexpected_exit("worker", 2, phase="implementation")
+
+        if reason_is_prefix:
+            self.assertTrue(caught.exception.reason.startswith(reason))
+        else:
+            self.assertEqual(caught.exception.reason, reason)
+        # No Task, no terminal, no Dispatch: the refusal happened before the runtime
+        # issued a single further command on this path. Scoped to the commands this
+        # call could have added -- start_run() legitimately created the run and the
+        # Coordinator's own terminal before the boundary under test existed.
+        issued = recorder.commands[commands_before:]
+        self.assertEqual(issued, [])
+        self.assertNotIn("task-create", [cmd[1] for cmd in issued if len(cmd) > 1])
+        self.assertNotIn("worker-start", recorder.verbs)
+        self.assertNotIn(("terminal", "create"), [cmd[:2] for cmd in issued])
+        log = (
+            self.artifact_dir
+            / "artifacts" / "runs" / harness.run_id / "ORCHESTRATOR_LOG.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("pre_dispatch_failure", log)
+
+    def test_unexpected_exit_refuses_when_the_ledger_is_absent(self) -> None:
+        harness, recorder = self.started_harness()
+        shutil.rmtree(
+            self.artifact_dir
+            / "artifacts" / "runs" / harness.run_id / "decision_ledger"
+        )
+
+        self.assert_unexpected_exit_refuses(
+            harness, recorder, reason=decision_gate.GATE_INPUT_MISSING
+        )
+
+    def test_unexpected_exit_refuses_on_an_unsupported_ledger_schema(self) -> None:
+        harness, recorder = self.started_harness()
+        self._rewrite_run_entry(
+            harness,
+            ledger_schema_version=decision_gate.LEDGER_RECORD_SCHEMA_VERSION + 99,
+        )
+
+        self.assert_unexpected_exit_refuses(
+            harness, recorder, reason=decision_gate.LEDGER_SCHEMA_UNSUPPORTED
+        )
+
+    def test_unexpected_exit_refuses_on_a_malformed_ledger_record(self) -> None:
+        harness, recorder = self.started_harness()
+        self._rewrite_run_entry(harness, reason_code=self.DROP)
+
+        self.assert_unexpected_exit_refuses(
+            harness, recorder, reason=decision_gate.GATE_INPUT_MALFORMED
+        )
+
+    def test_unexpected_exit_refuses_on_an_unbound_head(self) -> None:
+        """The shape F-001 now produces: a round settled without publishing a record,
+        so the head no longer binds the round the runtime knows settled."""
+        harness, recorder = self.started_harness()
+        harness._last_settled = (harness.run_id, "implementation", 1)
+
+        self.assert_unexpected_exit_refuses(
+            harness, recorder, reason=decision_gate.GATE_INPUT_UNBOUND
+        )
+
+    def test_unexpected_exit_refuses_on_an_unresolved_open_item(self) -> None:
+        harness, recorder = self.started_harness()
+        self.plant_unresolved_open_item(harness)
+
+        self.assert_unexpected_exit_refuses(
+            harness,
+            recorder,
+            reason=f"{decision_gate.BLOCK_REASON_PREFIX}:",
+            reason_is_prefix=True,
+        )
+
+    def test_unexpected_exit_admits_when_the_ledger_head_is_clean(self) -> None:
+        """The non-vacuity control for the five refusals above: with the very same
+        guard in place and an admissible head, this path still dispatches."""
+        harness, recorder = self.started_harness()
+        recorder.results["check"] = {"messages": []}
+        recorder.results["worker-show"] = {
+            "dispatch": {"status": "failed", "completed_at": None},
+            "worker": {"state": "stopped"},
+            "terminalResource": {"releaseState": "released"},
+        }
+
+        attempt = harness.observe_unexpected_exit("worker", 1, phase="implementation")
+
+        self.assertIn("worker-start", recorder.verbs)
+        self.assertIn("task-create", recorder.verbs)
+        self.assertTrue(attempt.terminal)
+
+    # ================= external review CRITICAL ==================================
+    # Completion is its OWN decision boundary. Before this, the decision axis was
+    # enforced only by _b1_guard(), i.e. only when a LATER dispatch existed. After
+    # the Final Review there is none, so a Final Reviewer could return quality PASS
+    # beside a blocking or unusable decision and the run was still recorded
+    # COMPLETED. Each case below must refuse COMPLETED and terminate BLOCKED.
+
+    FINAL_QUALITY_PASS = "# Review Result\n\nRESULT: PASS\nREVIEW_VERDICT: PASS\n"
+
+    def settle_final_reviewer(self, harness, body: str):
+        """Settle a Final-Review-shaped result: quality PASS beside `body`'s gate."""
+        return harness._record_decision_from_attempt(
+            event="dispatch_settled",
+            phase="implementation",
+            attempt=self.attempt(body=body, role="reviewer"),
+        )
+
+    def assert_completion_refused(self, harness) -> str:
+        self.assertNotIn("| COMPLETED |", self.orchestrator_log(harness))
+        with self.assertRaises(orca_runtime_harness.DecisionGateRefused) as caught:
+            harness.log_run_status("COMPLETED", reason="every phase gate passed")
+        log = self.orchestrator_log(harness)
+        # COMPLETED is never written, and the run is recorded BLOCKED with the reason.
+        self.assertNotIn("| COMPLETED |", log)
+        self.assertIn("| BLOCKED |", log)
+        self.assertIn(caught.exception.reason, log)
+        return caught.exception.reason
+
+    def test_quality_pass_beside_needs_input_cannot_complete_the_run(self) -> None:
+        harness, _ = self.started_harness()
+        state, _ = self.settle_final_reviewer(
+            harness, self.FINAL_QUALITY_PASS + gate_declaration("NEEDS_INPUT")
+        )
+
+        self.assertEqual(state, "NEEDS_INPUT")
+        # The blocking decision really is the published head ...
+        self.assertEqual(self.ledger()[-1]["state"], "NEEDS_INPUT")
+        # ... and completion refuses, naming the BLOCK -- not a producer defect.
+        # admit_head() evaluates A6 before A5 and A6 disagrees for every item this
+        # run opened, so the raw clause would report DECLARATION_DISAGREES_WITH_LEDGER
+        # and lose the state and reason code at the run's terminal boundary
+        # (external re-review MAJOR). The exact closed reason is asserted here.
+        reason = self.assert_completion_refused(harness)
+        self.assertEqual(reason, decision_gate.block_reason("NEEDS_INPUT", "blast_radius_beyond_scope"))
+        self.assertEqual(reason, "DECISION_BLOCKED:NEEDS_INPUT:blast_radius_beyond_scope")
+        # And the two sparse log columns carry the REAL state and reason code.
+        self.assertEqual(
+            decision_gate.decision_columns(reason), ("NEEDS_INPUT", "blast_radius_beyond_scope")
+        )
+        log = self.orchestrator_log(harness)
+        self.assertIn("blast_radius_beyond_scope", log)
+        self.assertNotIn(decision_gate.DECLARATION_DISAGREES_WITH_LEDGER, log)
+
+    def test_quality_pass_beside_conflict_cannot_complete_the_run(self) -> None:
+        harness, _ = self.started_harness()
+        state, _ = self.settle_final_reviewer(
+            harness, self.FINAL_QUALITY_PASS + gate_declaration("CONFLICT")
+        )
+
+        self.assertEqual(state, "CONFLICT")
+        # The blocking decision really is the published head ...
+        self.assertEqual(self.ledger()[-1]["state"], "CONFLICT")
+        # ... and completion refuses, naming the BLOCK -- not a producer defect.
+        # admit_head() evaluates A6 before A5 and A6 disagrees for every item this
+        # run opened, so the raw clause would report DECLARATION_DISAGREES_WITH_LEDGER
+        # and lose the state and reason code at the run's terminal boundary
+        # (external re-review MAJOR). The exact closed reason is asserted here.
+        reason = self.assert_completion_refused(harness)
+        self.assertEqual(reason, decision_gate.block_reason("CONFLICT", "requirement_contradiction"))
+        self.assertEqual(reason, "DECISION_BLOCKED:CONFLICT:requirement_contradiction")
+        # And the two sparse log columns carry the REAL state and reason code.
+        self.assertEqual(
+            decision_gate.decision_columns(reason), ("CONFLICT", "requirement_contradiction")
+        )
+        log = self.orchestrator_log(harness)
+        self.assertIn("requirement_contradiction", log)
+        self.assertNotIn(decision_gate.DECLARATION_DISAGREES_WITH_LEDGER, log)
+
+    def test_a_silent_final_result_cannot_complete_the_run(self) -> None:
+        """The missing-declaration case: nothing is published and the round is bound
+        anyway, so the head no longer binds what settled -- and completion refuses."""
+        harness, _ = self.started_harness()
+        state, _ = self.settle_final_reviewer(harness, self.FINAL_QUALITY_PASS)
+
+        self.assertEqual(state, decision_gate.INPUT_DEFECT_STATE)
+        # A genuinely unusable result keeps its INPUT-defect reason: the block
+        # reclassification above must never launder a defect into a valid state.
+        reason = self.assert_completion_refused(harness)
+        self.assertEqual(reason, decision_gate.GATE_INPUT_UNBOUND)
+        self.assertEqual(
+            decision_gate.decision_columns(reason),
+            (decision_gate.INPUT_DEFECT_STATE, decision_gate.GATE_INPUT_UNBOUND),
+        )
+
+    def test_a_malformed_ledger_head_cannot_complete_the_run(self) -> None:
+        harness, _ = self.started_harness()
+        self._rewrite_run_entry(harness, reason_code=self.DROP)
+
+        self.assertEqual(
+            self.assert_completion_refused(harness),
+            decision_gate.GATE_INPUT_MALFORMED,
+        )
+
+    def test_a_clear_final_result_still_completes_the_run(self) -> None:
+        """The control that makes the four refusals above non-vacuous: the guard
+        blocks a blocking decision, not every completion."""
+        harness, _ = self.started_harness()
+        state, _ = self.settle_final_reviewer(
+            harness, self.FINAL_QUALITY_PASS + gate_declaration("CLEAR")
+        )
+
+        self.assertEqual(state, "CLEAR")
+        harness.log_run_status("COMPLETED", reason="every phase gate passed")
+
+        self.assertIn("| COMPLETED |", self.orchestrator_log(harness))
+
+    def test_only_completed_is_gated_so_a_blocked_run_still_records_why(self) -> None:
+        """BLOCKED/ERROR/ESCALATED must stay writable with an open head, or a run
+        stopped BY the decision gate could never record that it stopped."""
+        harness, _ = self.started_harness()
+        self.settle_final_reviewer(
+            harness, self.FINAL_QUALITY_PASS + gate_declaration("CONFLICT")
+        )
+
+        for status in ("BLOCKED", "ERROR", "ESCALATED"):
+            harness.log_run_status(status, reason="unresolved user decision")
+
+        log = self.orchestrator_log(harness)
+        for status in ("BLOCKED", "ERROR", "ESCALATED"):
+            self.assertIn(f"| {status} |", log)
+
+    def test_without_the_pre_completion_gate_the_same_run_would_complete(self) -> None:
+        """NON-VACUITY control for the guard itself. With admission stubbed to accept
+        anything, the identical NEEDS_INPUT fixture DOES reach COMPLETED -- so the
+        refusals above are the guard's doing, not an artefact of the fixture."""
+        harness, _ = self.started_harness()
+        self.settle_final_reviewer(
+            harness, self.FINAL_QUALITY_PASS + gate_declaration("NEEDS_INPUT")
+        )
+
+        with patch.object(decision_gate, "admit_head", lambda *a, **k: {}):
+            harness.log_run_status("COMPLETED", reason="every phase gate passed")
+
+        self.assertIn("| COMPLETED |", self.orchestrator_log(harness))
+
+    # ---- external re-review MAJOR: a structurally invalid ledger keeps its defect
+    # unresolved_block_reason() reclassifies ONLY the A6 refusal, whose position in
+    # A1 -> A2 -> A4 -> A3 -> A6 proves the ledger-level clauses already passed. Each
+    # ledger below is invalid AS A LEDGER while still holding a VALID blocking
+    # record, so only the preserved reason distinguishes it from a real block.
+
+    def _ledger_dir(self, harness):
+        return run_logging.decision_ledger_dir(harness.run_id, base=self.artifact_dir)
+
+    def _copy_record(self, harness, source_sequence: int, target_sequence: int,
+                     *, claim: int | None = None, **fields) -> None:
+        """Publish a second record file directly, bypassing the append writer.
+
+        The writer allocates sequences and would refuse a duplicate, which is the
+        point: this models a ledger that is ALREADY corrupt on disk, which is what
+        the gate has to survive.
+        """
+        ledger = self._ledger_dir(harness)
+        record = json.loads(
+            (ledger / f"{source_sequence:06d}" / "record.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        # `claim` is what the record SAYS its sequence is, which is what makes a
+        # real duplicate: two published directories asserting the same sequence.
+        record["sequence"] = target_sequence if claim is None else claim
+        record.update(fields)
+        target = ledger / f"{target_sequence:06d}"
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "record.json").write_text(
+            json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+
+    def _blocking_head(self, harness) -> None:
+        self.settle_final_reviewer(
+            harness, self.FINAL_QUALITY_PASS + gate_declaration("NEEDS_INPUT")
+        )
+        self.assertEqual(self.ledger()[-1]["state"], "NEEDS_INPUT")
+
+    def assert_defect_is_not_laundered(self, harness) -> str:
+        reason = self.assert_completion_refused(harness)
+        self.assertNotIn(decision_gate.BLOCK_REASON_PREFIX, reason)
+        self.assertIn(reason, decision_gate.GATE_REFUSAL_REASONS)
+        self.assertEqual(
+            decision_gate.decision_columns(reason)[0],
+            decision_gate.INPUT_DEFECT_STATE,
+        )
+        return reason
+
+    def test_a_duplicate_sequence_is_not_laundered_into_a_block(self) -> None:
+        harness, _ = self.started_harness()
+        self._blocking_head(harness)
+        # Two published directories, both asserting sequence 1.
+        self._copy_record(harness, 1, 2, claim=1)
+
+        self.assertEqual(
+            self.assert_defect_is_not_laundered(harness),
+            decision_gate.GATE_INPUT_MALFORMED,
+        )
+
+    def test_a_gapped_sequence_is_not_laundered_into_a_block(self) -> None:
+        harness, _ = self.started_harness()
+        self._blocking_head(harness)
+        self._copy_record(harness, 1, 7)
+
+        self.assertEqual(
+            self.assert_defect_is_not_laundered(harness),
+            decision_gate.GATE_INPUT_MALFORMED,
+        )
+
+    def test_a_wrong_run_record_is_not_laundered_into_a_block(self) -> None:
+        harness, _ = self.started_harness()
+        self._blocking_head(harness)
+        self._rewrite_run_entry(harness, run="run_someone_elses")
+
+        self.assert_defect_is_not_laundered(harness)
+
+    def test_a_head_bound_to_the_wrong_round_is_not_laundered(self) -> None:
+        harness, _ = self.started_harness()
+        self._blocking_head(harness)
+        # The runtime knows a different round settled than the head records.
+        harness._last_settled = (harness.run_id, "test", 9)
+
+        self.assertEqual(
+            self.assert_defect_is_not_laundered(harness),
+            decision_gate.GATE_INPUT_UNBOUND,
+        )
+
+    def test_a_phantom_declared_item_is_not_laundered_into_a_block(self) -> None:
+        """A6 with an OVERSTATED declaration is a producer defect even though a real
+        block exists beside it: `refused_with == A6` proves the structural clauses
+        passed, not that the mismatch is the ordinary understatement."""
+        harness, _ = self.started_harness()
+        self._blocking_head(harness)
+        self._rewrite_run_entry(harness, prior_open_decision_items=["phantom"])
+
+        self.assertEqual(
+            self.assert_defect_is_not_laundered(harness),
+            decision_gate.DECLARATION_DISAGREES_WITH_LEDGER,
+        )
+
+    def test_two_open_items_are_not_laundered_into_a_block(self) -> None:
+        """The A6 exception requires the ENTIRE discrepancy to be one bound item, so
+        the terminal reclassification may not be looser than the admission."""
+        harness, _ = self.started_harness()
+        self._blocking_head(harness)
+        self._copy_record(harness, 1, 2)  # a second, unrelated open item
+
+        self.assertEqual(
+            self.assert_defect_is_not_laundered(harness),
+            decision_gate.DECLARATION_DISAGREES_WITH_LEDGER,
+        )
+
+    # ---- external re-review MAJOR: completion AFTER the permitted verification ----
+    # The real MEDIUM/HIGH sequence is Worker B2 block -> Reviewer B3 record with
+    # `verifies` -> completion. At that point the ledger HEAD is the Reviewer record
+    # while open_items() deliberately keeps the WORKER item open, because a
+    # verification never resolves anything. A6's admission predicate is written for
+    # the state BEFORE that dispatch, so reusing it alone made MEDIUM/HIGH fall back
+    # to DECLARATION_DISAGREES_WITH_LEDGER while LOW kept its DECISION_BLOCKED --
+    # risk-dependent terminal provenance, which the contract forbids.
+
+    def complete_after_verification(self, reviewer_state: str) -> str:
+        """Drive Worker block -> bound Reviewer verification -> completion.
+
+        Returns the terminal reason the completion boundary recorded.
+        """
+        harness, recorder = self.verification_harness()
+        worker_key = self.settle_blocking_worker(harness, recorder)
+        recorder.body = self.reviewer_body(reviewer_state, worker_key)
+        harness.run_existing_task(
+            "reviewer", 1, "fail", "task_g",
+            phase="implementation", verifies=worker_key,
+        )
+        # The head really is the Reviewer record, and the WORKER item is what is open.
+        records = self.ledger()
+        self.assertEqual(records[-1]["boundary"], "B3")
+        self.assertEqual(records[-1]["verifies"]["worker_record_key"], worker_key)
+
+        return self.assert_completion_refused(harness)
+
+    def test_completion_after_a_confirming_verification_keeps_the_low_terminal(
+        self,
+    ) -> None:
+        """P6b row 4. A confirmation carries the WORKER's own state and code -- the
+        LOW terminal byte for byte, which is the whole content of `risk never
+        expands decision authority`."""
+        reason = self.complete_after_verification("NEEDS_INPUT")
+
+        self.assertEqual(
+            reason,
+            decision_gate.block_reason("NEEDS_INPUT", "blast_radius_beyond_scope"),
+        )
+        self.assertEqual(
+            decision_gate.decision_columns(reason),
+            ("NEEDS_INPUT", "blast_radius_beyond_scope"),
+        )
+
+    def test_completion_after_a_stricter_verification_carries_the_reviewer_terminal(
+        self,
+    ) -> None:
+        """P6b row 5. A verification may move toward MORE blocking, never away."""
+        reason = self.complete_after_verification("CONFLICT")
+
+        self.assertEqual(
+            reason,
+            decision_gate.block_reason("CONFLICT", "requirement_contradiction"),
+        )
+
+    def test_completion_after_a_rejected_downgrade_is_still_terminal(self) -> None:
+        """P6b row 6. A downgrade is decided solely by validate_transition(), and a
+        rejected one is reported as such rather than as a producer defect."""
+        reason = self.complete_after_verification("CLEAR")
+
+        self.assertEqual(reason, decision_gate.DOWNGRADE_REJECTED)
+        self.assertNotEqual(
+            reason, decision_gate.DECLARATION_DISAGREES_WITH_LEDGER
+        )
+
+    def test_the_terminal_is_identical_with_and_without_the_verification(self) -> None:
+        """The risk-independence claim, asserted directly: the LOW terminal (block is
+        the head) and the MEDIUM/HIGH terminal (head is its bound confirmation) must
+        report the SAME state and reason code."""
+        harness, _ = self.started_harness()
+        self._blocking_head(harness)
+        low = self.assert_completion_refused(harness)
+
+        self.tearDown()  # release the first run's directory before replacing it
+        self.setUp()  # a fresh artifact dir for the second run
+        high = self.complete_after_verification("NEEDS_INPUT")
+
+        self.assertEqual(low, high)
+        self.assertEqual(
+            decision_gate.decision_columns(low), decision_gate.decision_columns(high)
+        )
+
+    def _mutate_verification_head(self, harness, **fields) -> None:
+        path = self._ledger_dir(harness) / "000002" / "record.json"
+        record = json.loads(path.read_text(encoding="utf-8"))
+        record.update(fields)
+        path.write_text(
+            json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+
+    def test_a_verification_head_that_is_not_a_reviewer_b3_is_not_reclassified(
+        self,
+    ) -> None:
+        """Shape B requires the head to BE a Reviewer B3 verification, not merely to
+        carry a well-shaped `verifies`. boundary/source/role each validate against
+        their own enum, but nothing else enforces their relationship, so an
+        individually valid Worker B2 record with a correct `verifies` could otherwise
+        be handed to evaluate_verification() and laundered into a valid terminal
+        (external re-review MAJOR)."""
+        for label, fields in (
+            ("worker B2 boundary", {"boundary": "B2"}),
+            ("worker source", {"source": "worker"}),
+            ("worker role", {"role": "worker"}),
+            ("all three", {"boundary": "B2", "source": "worker", "role": "worker"}),
+        ):
+            with self.subTest(head=label):
+                self.tearDown()
+                self.setUp()
+                harness, recorder = self.verification_harness()
+                worker_key = self.settle_blocking_worker(harness, recorder)
+                recorder.body = self.reviewer_body("NEEDS_INPUT", worker_key)
+                harness.run_existing_task(
+                    "reviewer", 1, "fail", "task_g",
+                    phase="implementation", verifies=worker_key,
+                )
+                # The binding itself stays correct: only the head's IDENTITY is wrong.
+                self._mutate_verification_head(harness, **fields)
+                self.assertEqual(
+                    self.ledger()[-1]["verifies"]["worker_record_key"], worker_key
+                )
+
+                # Refused at A4 now, not at A6: record_identity_defect() runs inside
+                # validate_ledger_record(), so a forged identity never reaches the
+                # classifier at all. Still an input defect, still never a block --
+                # the central check subsumes the shape-local one rather than
+                # replacing its guarantee.
+                self.assertEqual(
+                    self.assert_defect_is_not_laundered(harness),
+                    decision_gate.GATE_INPUT_MALFORMED,
+                )
+
+    def test_a_forged_direct_terminal_identity_is_not_reclassified(self) -> None:
+        """Shape A on the completion path. The blocking head is the sole open item and
+        would otherwise be named a normal terminal; a forged boundary/source/role
+        combination must stay an input defect (external re-review MAJOR)."""
+        for label, fields in (
+            ("B2 with reviewer identity", {"source": "reviewer", "role": "reviewer"}),
+            ("B3 with worker identity",
+             {"boundary": "B3", "source": "worker", "role": "worker"}),
+        ):
+            with self.subTest(identity=label):
+                self.tearDown()
+                self.setUp()
+                harness, recorder = self.verification_harness()
+                self.settle_blocking_worker(harness, recorder)
+                path = self._ledger_dir(harness) / "000001" / "record.json"
+                record = json.loads(path.read_text(encoding="utf-8"))
+                record.update(fields)
+                path.write_text(
+                    json.dumps(record, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+
+                self.assertEqual(
+                    self.assert_defect_is_not_laundered(harness),
+                    decision_gate.GATE_INPUT_MALFORMED,
+                )
+
+    def test_a_valid_direct_worker_terminal_still_completes_as_a_block(self) -> None:
+        """The control for the two forgeries above: an untouched Worker B2 terminal
+        is still named DECISION_BLOCKED, so the check narrows nothing legitimate."""
+        harness, recorder = self.verification_harness()
+        self.settle_blocking_worker(harness, recorder)
+
+        self.assertEqual(
+            self.assert_completion_refused(harness),
+            decision_gate.block_reason("NEEDS_INPUT", "blast_radius_beyond_scope"),
+        )
+
+    def test_the_verification_identity_predicate_names_each_wrong_field(self) -> None:
+        good = {"boundary": "B3", "source": "reviewer", "role": "reviewer"}
+
+        self.assertIsNone(decision_gate.verification_record_defect(good))
+        for field, wrong in (
+            ("boundary", "B2"), ("source", "worker"), ("role", "worker")
+        ):
+            with self.subTest(field=field):
+                defect = decision_gate.verification_record_defect(
+                    dict(good, **{field: wrong})
+                )
+                self.assertIsNotNone(defect)
+                self.assertIn(field, defect)
+
+    def test_an_unbound_verification_head_is_not_reclassified(self) -> None:
+        """The negative that keeps shape 2 narrow: a B3 head whose `verifies` does not
+        bind the open Worker item is a producer defect, not a terminal block."""
+        harness, recorder = self.verification_harness()
+        worker_key = self.settle_blocking_worker(harness, recorder)
+        recorder.body = self.reviewer_body("NEEDS_INPUT", worker_key)
+        harness.run_existing_task(
+            "reviewer", 1, "fail", "task_g",
+            phase="implementation", verifies=worker_key,
+        )
+        ledger = self._ledger_dir(harness)
+        path = ledger / "000002" / "record.json"
+        record = json.loads(path.read_text(encoding="utf-8"))
+        record["verifies"]["worker_record_key"] = "run_live_os29/design/9/B2#5"
+        path.write_text(
+            json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+
+        self.assertEqual(
+            self.assert_defect_is_not_laundered(harness),
+            decision_gate.DECLARATION_DISAGREES_WITH_LEDGER,
+        )
+
+    # ================= external review MAJOR =====================================
+    # `source_binding` is one of the thirteen required fields and is what makes a
+    # ledger entry a BOUND entry. It used to be a setdefault, so an agent that put
+    # the key in its own fenced record kept it, and validate_ledger_record() only
+    # requires the field to be PRESENT. The entry could claim provenance it was
+    # never bound to. It is harness-owned now.
+
+    def test_an_agent_cannot_supply_its_own_source_binding(self) -> None:
+        forgeries = (
+            "artifacts/runs/run_someone_elses/",   # cross-run
+            "artifacts/runs/run_live_os29/design/",  # wrong phase
+            "/etc/passwd",                          # arbitrary
+            "",                                     # empty
+            None,                                   # null
+        )
+        for forged in forgeries:
+            with self.subTest(forged=forged), tempfile.TemporaryDirectory() as scratch:
+                self.artifact_dir = Path(scratch)
+                harness, _ = self.started_harness()
+                body = self.FINAL_QUALITY_PASS + gate_declaration_with(
+                    "CLEAR", {"source_binding": forged}
+                )
+
+                state, _ = self.settle_final_reviewer(harness, body)
+
+                self.assertEqual(state, "CLEAR")
+                head = self.ledger()[-1]
+                self.assertEqual(
+                    head["source_binding"], f"artifacts/runs/{harness.run_id}/"
+                )
+                self.assertNotEqual(head["source_binding"], forged)
+
+    def test_the_authoritative_source_binding_is_still_recorded(self) -> None:
+        """Control: overwriting is not deleting -- the field is present and correct
+        when the agent says nothing about it."""
+        harness, _ = self.started_harness()
+
+        self.settle_final_reviewer(
+            harness, self.FINAL_QUALITY_PASS + gate_declaration("CLEAR")
+        )
+
+        head = self.ledger()[-1]
+        self.assertEqual(head["source_binding"], f"artifacts/runs/{harness.run_id}/")
+
 
 
 if __name__ == "__main__":

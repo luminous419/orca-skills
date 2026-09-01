@@ -68,3 +68,25 @@ EVIDENCE: fields required by the state
 - `NEEDS_INPUT` / `CONFLICT`는 진행하지 않고 멈춘다.
 - 답변을 받은 항목은 `CLEAR`가 되며 `ASSUMPTION_ALLOWED`가 되지 않는다.
 - 모델 확신, Worker/Reviewer 합의, 권고 default, timeout, 무응답은 사용자 권한의 근거가 아니다.
+
+#### Decision gate result (required, and a different object)
+
+`## Decision Record` section의 optional 여부와 무관하게, 결과 본문에는 **decision gate 결과가
+반드시** 있어야 한다. 두 객체는 이름도 집도 실패 모드도 다르다.
+
+```text
+DECISION_GATE_STATE: CLEAR | ASSUMPTION_ALLOWED | NEEDS_INPUT | CONFLICT
+```
+
+그리고 정확히 하나의 fenced record — 이것이 **authority**다:
+
+````text
+```decision-gate
+{ "state": "...", "reason_code": ..., "open_decision_item": ..., ... }
+```
+````
+
+- 선언 line과 record가 각각 정확히 하나 있어야 하고 서로 일치해야 한다.
+- "결정할 것이 없었다"는 `CLEAR`로 **단언**한다. 기록의 부재는 `CLEAR`가 아니다.
+- record가 없거나 깨졌거나 계약을 통과하지 못하면 그 경계는 fail-closed로 막힌다.
+- Markdown 요약과 record가 어긋나면 record가 authority이고 run은 막힌다.

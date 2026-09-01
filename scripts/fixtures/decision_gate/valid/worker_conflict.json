@@ -1,0 +1,29 @@
+{
+  "assumption": null,
+  "boundary": "B2",
+  "citations": [
+    "ORIGINAL_REQUEST.md#a",
+    "ORIGINAL_REQUEST.md#b"
+  ],
+  "evidence": {},
+  "grounds": "Two explicit requirements that cannot both hold.",
+  "iteration": 1,
+  "ledger_schema_version": 1,
+  "open_decision_item": true,
+  "open_item": "which requirement governs",
+  "phase": "implementation",
+  "prior_open_decision_items": [],
+  "reason_code": "requirement_contradiction",
+  "recorded_at": "2026-09-01T00:00:00+00:00",
+  "responsible_phase": "implementation",
+  "role": "worker",
+  "run": "run_fixture",
+  "scope": "Run entry only.",
+  "sequence": 1,
+  "source": "worker",
+  "source_binding": "artifacts/runs/run_fixture/IMPLEMENTATION.md",
+  "state": "CONFLICT",
+  "verdict": "",
+  "verifies": null,
+  "why_they_cannot_both_hold": "one demands the record, the other forbids its field"
+}
