@@ -8491,6 +8491,94 @@ class DecisionGateLiveDispatchTests(unittest.TestCase):
 
         self.assertIn("| COMPLETED |", self.orchestrator_log(harness))
 
+    # ---- external re-review MAJOR: a structurally invalid ledger keeps its defect
+    # unresolved_block_reason() reclassifies ONLY the A6 refusal, whose position in
+    # A1 -> A2 -> A4 -> A3 -> A6 proves the ledger-level clauses already passed. Each
+    # ledger below is invalid AS A LEDGER while still holding a VALID blocking
+    # record, so only the preserved reason distinguishes it from a real block.
+
+    def _ledger_dir(self, harness):
+        return run_logging.decision_ledger_dir(harness.run_id, base=self.artifact_dir)
+
+    def _copy_record(self, harness, source_sequence: int, target_sequence: int,
+                     *, claim: int | None = None, **fields) -> None:
+        """Publish a second record file directly, bypassing the append writer.
+
+        The writer allocates sequences and would refuse a duplicate, which is the
+        point: this models a ledger that is ALREADY corrupt on disk, which is what
+        the gate has to survive.
+        """
+        ledger = self._ledger_dir(harness)
+        record = json.loads(
+            (ledger / f"{source_sequence:06d}" / "record.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        # `claim` is what the record SAYS its sequence is, which is what makes a
+        # real duplicate: two published directories asserting the same sequence.
+        record["sequence"] = target_sequence if claim is None else claim
+        record.update(fields)
+        target = ledger / f"{target_sequence:06d}"
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "record.json").write_text(
+            json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+
+    def _blocking_head(self, harness) -> None:
+        self.settle_final_reviewer(
+            harness, self.FINAL_QUALITY_PASS + gate_declaration("NEEDS_INPUT")
+        )
+        self.assertEqual(self.ledger()[-1]["state"], "NEEDS_INPUT")
+
+    def assert_defect_is_not_laundered(self, harness) -> str:
+        reason = self.assert_completion_refused(harness)
+        self.assertNotIn(decision_gate.BLOCK_REASON_PREFIX, reason)
+        self.assertIn(reason, decision_gate.GATE_REFUSAL_REASONS)
+        self.assertEqual(
+            decision_gate.decision_columns(reason)[0],
+            decision_gate.INPUT_DEFECT_STATE,
+        )
+        return reason
+
+    def test_a_duplicate_sequence_is_not_laundered_into_a_block(self) -> None:
+        harness, _ = self.started_harness()
+        self._blocking_head(harness)
+        # Two published directories, both asserting sequence 1.
+        self._copy_record(harness, 1, 2, claim=1)
+
+        self.assertEqual(
+            self.assert_defect_is_not_laundered(harness),
+            decision_gate.GATE_INPUT_MALFORMED,
+        )
+
+    def test_a_gapped_sequence_is_not_laundered_into_a_block(self) -> None:
+        harness, _ = self.started_harness()
+        self._blocking_head(harness)
+        self._copy_record(harness, 1, 7)
+
+        self.assertEqual(
+            self.assert_defect_is_not_laundered(harness),
+            decision_gate.GATE_INPUT_MALFORMED,
+        )
+
+    def test_a_wrong_run_record_is_not_laundered_into_a_block(self) -> None:
+        harness, _ = self.started_harness()
+        self._blocking_head(harness)
+        self._rewrite_run_entry(harness, run="run_someone_elses")
+
+        self.assert_defect_is_not_laundered(harness)
+
+    def test_a_head_bound_to_the_wrong_round_is_not_laundered(self) -> None:
+        harness, _ = self.started_harness()
+        self._blocking_head(harness)
+        # The runtime knows a different round settled than the head records.
+        harness._last_settled = (harness.run_id, "test", 9)
+
+        self.assertEqual(
+            self.assert_defect_is_not_laundered(harness),
+            decision_gate.GATE_INPUT_UNBOUND,
+        )
+
     # ================= external review MAJOR =====================================
     # `source_binding` is one of the thirteen required fields and is what makes a
     # ledger entry a BOUND entry. It used to be a setdefault, so an agent that put

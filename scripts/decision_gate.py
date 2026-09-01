@@ -726,7 +726,10 @@ def admit_head(
 
 
 def unresolved_block_reason(
-    policy: DecisionPolicy, records: Sequence[Mapping[str, Any]]
+    policy: DecisionPolicy,
+    records: Sequence[Mapping[str, Any]],
+    *,
+    refused_with: str,
 ) -> str | None:
     """`DECISION_BLOCKED:<STATE>:<code>` when this ledger holds a VALID unresolved
     blocking item, else None.
@@ -741,12 +744,30 @@ def unresolved_block_reason(
     well-formed NEEDS_INPUT as a producer defect loses the state and reason code
     exactly where the evidence matters most (external re-review MAJOR).
 
-    Returns None -- deliberately, and NOT a block -- when any record fails
-    validate_ledger_record(). A ledger that cannot be read is a genuine input
-    defect, and `INPUT_DEFECT_STATE` with the producer reason is the honest answer
-    for it. This function only ever RECLASSIFIES an existing refusal; it never
-    admits anything and is never a substitute for admit_head().
+    `refused_with` is the reason admit_head() ACTUALLY raised, and reclassification
+    happens for exactly one value: DECLARATION_DISAGREES_WITH_LEDGER. That is not a
+    convention, it is a proof. admit_head() evaluates A1 -> A2 -> A4 -> A3 -> A6, so
+    reaching A6 is itself the certificate that the ledger is non-empty, has exactly
+    one valid sequence-0 run entry, has gapless unique 0..n-1 sequences, and has a
+    head bound to the expected settled round. Any OTHER refusal means one of those
+    LEDGER-LEVEL clauses failed, and a ledger that is invalid AS A LEDGER can still
+    contain individually valid blocking records -- duplicate or gapped sequences, an
+    agent record from another run, a head bound to the wrong phase or iteration.
+    Reclassifying those would replace a genuine structural defect with a valid-looking
+    decision block, which is precisely the laundering this function must not do
+    (external re-review MAJOR). Every other reason is therefore preserved unchanged.
+
+    The per-record validate_ledger_record() sweep below is kept as well. It is
+    redundant while `refused_with` is A6 -- A4 already passed -- and it is deliberate
+    defence in depth, so that a future caller who widens the precondition cannot turn
+    an unreadable record into a block without also deleting this loop.
+
+    This function only ever RECLASSIFIES an existing refusal; it never admits
+    anything, never returns a non-block reason, and is never a substitute for
+    admit_head().
     """
+    if refused_with != DECLARATION_DISAGREES_WITH_LEDGER:
+        return None
     ordered = sorted(records, key=lambda record: record.get("sequence", 0))
     if not ordered:
         return None

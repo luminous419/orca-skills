@@ -2690,12 +2690,20 @@ class OrcaRuntimeHarness:
                 # evaluates A6 before A5, and A6 disagrees for every item THIS RUN
                 # opened, so a valid NEEDS_INPUT/CONFLICT would otherwise be recorded
                 # as a producer defect and lose its state and reason code at the last
-                # boundary (external re-review MAJOR). unresolved_block_reason()
-                # returns the block only when every record validates, so a genuinely
-                # unreadable ledger keeps its own input-defect reason.
+                # boundary (external re-review MAJOR).
+                #
+                # The refusal REASON is passed in, and only A6 is reclassified:
+                # admit_head() evaluates A1 -> A2 -> A4 -> A3 -> A6, so reaching A6
+                # proves the ledger-level clauses already passed. A structurally
+                # invalid ledger -- duplicate or gapped sequences, a record from
+                # another run, a head bound to the wrong phase or iteration -- can
+                # still hold individually valid blocking records, and reclassifying
+                # those would replace a real defect with a valid-looking block.
                 reason = (
                     decision_gate.unresolved_block_reason(
-                        self._decision_policy, records
+                        self._decision_policy,
+                        records,
+                        refused_with=refusal.reason,
                     )
                     or refusal.reason
                 )

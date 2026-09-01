@@ -1264,6 +1264,8 @@ class UnresolvedBlockReasonTests(PolicyMixin):
     recorded terminal classification, so it has to be the real state and reason code.
     """
 
+    A6 = decision_gate.DECLARATION_DISAGREES_WITH_LEDGER
+
     def entry(self, **overrides) -> dict:
         record = load_fixture("valid", "run_entry_declaration")
         record.update(overrides)
@@ -1283,7 +1285,9 @@ class UnresolvedBlockReasonTests(PolicyMixin):
             with self.subTest(name=name):
                 records = [self.entry(), self.blocking(name)]
 
-                reason = decision_gate.unresolved_block_reason(self.policy, records)
+                reason = decision_gate.unresolved_block_reason(
+                    self.policy, records, refused_with=self.A6
+                )
 
                 self.assertEqual(reason, f"DECISION_BLOCKED:{state}:{code}")
                 self.assertEqual(
@@ -1295,11 +1299,15 @@ class UnresolvedBlockReasonTests(PolicyMixin):
         records = [self.entry(), self.blocking("worker_clear")]
 
         self.assertIsNone(
-            decision_gate.unresolved_block_reason(self.policy, records)
+            decision_gate.unresolved_block_reason(
+                    self.policy, records, refused_with=self.A6
+                )
         )
 
     def test_an_empty_ledger_names_no_block(self) -> None:
-        self.assertIsNone(decision_gate.unresolved_block_reason(self.policy, []))
+        self.assertIsNone(decision_gate.unresolved_block_reason(
+            self.policy, [], refused_with=self.A6
+        ))
 
     def test_an_invalid_record_is_never_laundered_into_a_valid_block(self) -> None:
         """The property that keeps this from becoming a fail-open path.
@@ -1313,7 +1321,9 @@ class UnresolvedBlockReasonTests(PolicyMixin):
         records = [self.entry(), broken]
 
         self.assertIsNone(
-            decision_gate.unresolved_block_reason(self.policy, records)
+            decision_gate.unresolved_block_reason(
+                    self.policy, records, refused_with=self.A6
+                )
         )
 
     def test_an_unsupported_ledger_schema_is_never_laundered_either(self) -> None:
@@ -1323,15 +1333,68 @@ class UnresolvedBlockReasonTests(PolicyMixin):
         )
 
         self.assertIsNone(
-            decision_gate.unresolved_block_reason(self.policy, [self.entry(), record])
+            decision_gate.unresolved_block_reason(
+                self.policy, [self.entry(), record], refused_with=self.A6
+            )
         )
+
+    def test_only_the_a6_refusal_is_ever_reclassified(self) -> None:
+        """The laundering guard. A ledger can be invalid AS A LEDGER while still
+        holding individually valid blocking records, so every refusal except A6 --
+        the one whose position in A1 -> A2 -> A4 -> A3 -> A6 proves the
+        ledger-level clauses passed -- must be preserved unchanged."""
+        records = [self.entry(), self.blocking("worker_needs_input")]
+        # Positive control first: with A6 this ledger DOES reclassify, so the
+        # negatives below fail for the reason under test and not by accident.
+        self.assertEqual(
+            decision_gate.unresolved_block_reason(
+                self.policy, records, refused_with=self.A6
+            ),
+            "DECISION_BLOCKED:NEEDS_INPUT:blast_radius_beyond_scope",
+        )
+
+        for reason in decision_gate.GATE_REFUSAL_REASONS:
+            if reason == self.A6:
+                continue
+            with self.subTest(refused_with=reason):
+                self.assertIsNone(
+                    decision_gate.unresolved_block_reason(
+                        self.policy, records, refused_with=reason
+                    )
+                )
+
+    def test_a_structurally_invalid_ledger_keeps_its_own_defect(self) -> None:
+        """The three shapes the re-review named. Each holds a VALID blocking record,
+        so only the refusal reason can tell them apart from a real block."""
+        duplicate = [
+            self.entry(),
+            self.blocking("worker_needs_input", sequence=1),
+            self.blocking("worker_conflict", sequence=1),  # same sequence twice
+        ]
+        gapped = [self.entry(), self.blocking("worker_needs_input", sequence=7)]
+        wrong_run = [self.entry(), self.blocking("worker_needs_input")]
+        wrong_run[1]["run"] = "run_someone_elses"
+
+        for name, records, refused_with in (
+            ("duplicate", duplicate, decision_gate.GATE_INPUT_MALFORMED),
+            ("gapped", gapped, decision_gate.GATE_INPUT_MALFORMED),
+            ("wrong_run", wrong_run, decision_gate.GATE_INPUT_UNBOUND),
+        ):
+            with self.subTest(shape=name):
+                self.assertIsNone(
+                    decision_gate.unresolved_block_reason(
+                        self.policy, records, refused_with=refused_with
+                    )
+                )
 
     def test_it_admits_nothing_and_takes_no_risk_parameter(self) -> None:
         """It reclassifies an existing refusal; it is never a second admission path,
         and like every other gate predicate it cannot read a risk level."""
         signature = inspect.signature(decision_gate.unresolved_block_reason)
 
-        self.assertEqual(list(signature.parameters), ["policy", "records"])
+        self.assertEqual(
+            list(signature.parameters), ["policy", "records", "refused_with"]
+        )
 
 
 if __name__ == "__main__":
