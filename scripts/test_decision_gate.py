@@ -880,6 +880,7 @@ class RiskIndependenceTests(PolicyMixin):
         "ledger_key",
         "unresolved_block_reason",
         "declaration_understatement_defect",
+        "verification_record_defect",
     )
     AXIS_TOKENS = ("risk", "profile", "quality_profile", "agent_profile", "severity")
 

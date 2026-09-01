@@ -856,6 +856,11 @@ def unresolved_block_reason(
         or blocker.get("role") != "worker"
     ):
         return None
+    # The head must BE a Reviewer B3 verification, not merely carry a well-shaped
+    # `verifies`. Checked before the binding, so the identity defect is the one
+    # reported when both are wrong.
+    if verification_record_defect(head) is not None:
+        return None
     if verification_binding_defect(
         GateResult(str(head.get("state", "")), head),
         worker_key=open_key,
@@ -871,6 +876,35 @@ def unresolved_block_reason(
         GateResult(str(blocker.get("state", "")), blocker),
         GateResult(str(head.get("state", "")), head),
     ).reason
+
+
+def verification_record_defect(record: Mapping[str, Any]) -> str | None:
+    """Is this ledger record IDENTIFIED as a Reviewer B3 verification? None when it is.
+
+    `boundary`, `source` and `role` each validate against their own enum in
+    validate_ledger_record(), but nothing there enforces their RELATIONSHIP, and
+    verification_binding_defect() inspects only the `verifies` object's contents.
+    Without this, an individually valid Worker B2 record carrying a correctly shaped
+    `verifies` reference could be accepted as the verification head and handed to
+    evaluate_verification(), turning a semantically invalid ledger into a valid
+    DECISION_BLOCKED terminal (external re-review MAJOR).
+
+    This is the Reviewer-side counterpart of conjunct 3 of
+    verification_admission_defect(), which asks the same question of the Worker B2
+    head it admits against. The gate validates PERSISTED input fail-closed, so the
+    combination the publisher normally stamps is checked here rather than assumed.
+    """
+    for field, expected in (
+        ("boundary", "B3"),
+        ("source", "reviewer"),
+        ("role", "reviewer"),
+    ):
+        actual = record.get(field)
+        if actual != expected:
+            return (
+                f"a verification record needs {field}={expected!r}, got {actual!r}"
+            )
+    return None
 
 
 def verification_binding_defect(

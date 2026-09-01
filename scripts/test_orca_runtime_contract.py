@@ -8687,6 +8687,64 @@ class DecisionGateLiveDispatchTests(unittest.TestCase):
             decision_gate.decision_columns(low), decision_gate.decision_columns(high)
         )
 
+    def _mutate_verification_head(self, harness, **fields) -> None:
+        path = self._ledger_dir(harness) / "000002" / "record.json"
+        record = json.loads(path.read_text(encoding="utf-8"))
+        record.update(fields)
+        path.write_text(
+            json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+
+    def test_a_verification_head_that_is_not_a_reviewer_b3_is_not_reclassified(
+        self,
+    ) -> None:
+        """Shape B requires the head to BE a Reviewer B3 verification, not merely to
+        carry a well-shaped `verifies`. boundary/source/role each validate against
+        their own enum, but nothing else enforces their relationship, so an
+        individually valid Worker B2 record with a correct `verifies` could otherwise
+        be handed to evaluate_verification() and laundered into a valid terminal
+        (external re-review MAJOR)."""
+        for label, fields in (
+            ("worker B2 boundary", {"boundary": "B2"}),
+            ("worker source", {"source": "worker"}),
+            ("worker role", {"role": "worker"}),
+            ("all three", {"boundary": "B2", "source": "worker", "role": "worker"}),
+        ):
+            with self.subTest(head=label):
+                self.tearDown()
+                self.setUp()
+                harness, recorder = self.verification_harness()
+                worker_key = self.settle_blocking_worker(harness, recorder)
+                recorder.body = self.reviewer_body("NEEDS_INPUT", worker_key)
+                harness.run_existing_task(
+                    "reviewer", 1, "fail", "task_g",
+                    phase="implementation", verifies=worker_key,
+                )
+                # The binding itself stays correct: only the head's IDENTITY is wrong.
+                self._mutate_verification_head(harness, **fields)
+                self.assertEqual(
+                    self.ledger()[-1]["verifies"]["worker_record_key"], worker_key
+                )
+
+                self.assertEqual(
+                    self.assert_defect_is_not_laundered(harness),
+                    decision_gate.DECLARATION_DISAGREES_WITH_LEDGER,
+                )
+
+    def test_the_verification_identity_predicate_names_each_wrong_field(self) -> None:
+        good = {"boundary": "B3", "source": "reviewer", "role": "reviewer"}
+
+        self.assertIsNone(decision_gate.verification_record_defect(good))
+        for field, wrong in (
+            ("boundary", "B2"), ("source", "worker"), ("role", "worker")
+        ):
+            with self.subTest(field=field):
+                defect = decision_gate.verification_record_defect(
+                    dict(good, **{field: wrong})
+                )
+                self.assertIsNotNone(defect)
+                self.assertIn(field, defect)
+
     def test_an_unbound_verification_head_is_not_reclassified(self) -> None:
         """The negative that keeps shape 2 narrow: a B3 head whose `verifies` does not
         bind the open Worker item is a producer defect, not a terminal block."""
