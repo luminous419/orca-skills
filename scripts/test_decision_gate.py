@@ -878,6 +878,7 @@ class RiskIndependenceTests(PolicyMixin):
         "block_reason",
         "decision_columns",
         "ledger_key",
+        "unresolved_block_reason",
     )
     AXIS_TOKENS = ("risk", "profile", "quality_profile", "agent_profile", "severity")
 
@@ -1251,6 +1252,86 @@ class MarkdownVersusMachineDriftTests(PolicyMixin):
         decision_gate.validate_ledger_record(
             self.policy, dict(defective, reason_code=None)
         )
+
+
+class UnresolvedBlockReasonTests(PolicyMixin):
+    """External re-review MAJOR: a terminal boundary must name the BLOCK.
+
+    admit_head() evaluates A6 before A5, and A6 disagrees for every item the run
+    itself opened, so the clause that fires first is the producer defect rather than
+    the block. That ordering is harmless on a dispatch boundary -- the caller is
+    refused either way -- but at the run's LAST boundary the refusal reason IS the
+    recorded terminal classification, so it has to be the real state and reason code.
+    """
+
+    def entry(self, **overrides) -> dict:
+        record = load_fixture("valid", "run_entry_declaration")
+        record.update(overrides)
+        record.setdefault("run", RUN)
+        return record
+
+    def blocking(self, name: str, sequence: int = 1) -> dict:
+        record = load_fixture("valid", name)
+        record.update({"run": RUN, "sequence": sequence})
+        return record
+
+    def test_a_valid_open_block_is_named_with_its_state_and_reason_code(self) -> None:
+        for name, state, code in (
+            ("worker_needs_input", "NEEDS_INPUT", "blast_radius_beyond_scope"),
+            ("worker_conflict", "CONFLICT", "requirement_contradiction"),
+        ):
+            with self.subTest(name=name):
+                records = [self.entry(), self.blocking(name)]
+
+                reason = decision_gate.unresolved_block_reason(self.policy, records)
+
+                self.assertEqual(reason, f"DECISION_BLOCKED:{state}:{code}")
+                self.assertEqual(
+                    decision_gate.decision_columns(reason), (state, code)
+                )
+
+    def test_a_clear_ledger_names_no_block(self) -> None:
+        """The control: reclassification only fires when something is actually open."""
+        records = [self.entry(), self.blocking("worker_clear")]
+
+        self.assertIsNone(
+            decision_gate.unresolved_block_reason(self.policy, records)
+        )
+
+    def test_an_empty_ledger_names_no_block(self) -> None:
+        self.assertIsNone(decision_gate.unresolved_block_reason(self.policy, []))
+
+    def test_an_invalid_record_is_never_laundered_into_a_valid_block(self) -> None:
+        """The property that keeps this from becoming a fail-open path.
+
+        A ledger that cannot be read is a genuine INPUT defect, and the caller must
+        keep its own producer reason. If this returned a block for a malformed
+        ledger, a defective record would be reported as a well-formed user decision.
+        """
+        broken = self.blocking("worker_needs_input")
+        broken.pop("reason_code")
+        records = [self.entry(), broken]
+
+        self.assertIsNone(
+            decision_gate.unresolved_block_reason(self.policy, records)
+        )
+
+    def test_an_unsupported_ledger_schema_is_never_laundered_either(self) -> None:
+        record = self.blocking("worker_needs_input")
+        record["ledger_schema_version"] = (
+            decision_gate.LEDGER_RECORD_SCHEMA_VERSION + 99
+        )
+
+        self.assertIsNone(
+            decision_gate.unresolved_block_reason(self.policy, [self.entry(), record])
+        )
+
+    def test_it_admits_nothing_and_takes_no_risk_parameter(self) -> None:
+        """It reclassifies an existing refusal; it is never a second admission path,
+        and like every other gate predicate it cannot read a risk level."""
+        signature = inspect.signature(decision_gate.unresolved_block_reason)
+
+        self.assertEqual(list(signature.parameters), ["policy", "records"])
 
 
 if __name__ == "__main__":

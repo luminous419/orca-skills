@@ -725,6 +725,43 @@ def admit_head(
     return head
 
 
+def unresolved_block_reason(
+    policy: DecisionPolicy, records: Sequence[Mapping[str, Any]]
+) -> str | None:
+    """`DECISION_BLOCKED:<STATE>:<code>` when this ledger holds a VALID unresolved
+    blocking item, else None.
+
+    A5's own classification, factored out so a TERMINAL boundary can name the block
+    rather than whatever clause happened to fire first. admit_head() evaluates
+    A6 before A5, and A6 disagrees whenever an item THIS RUN opened is absent from
+    the immutable run-entry declaration -- which is every real block. On a dispatch
+    boundary that ordering is harmless: the caller is refused either way and the
+    round is terminal. At the run's LAST boundary it is not, because the refusal
+    reason is the run's recorded terminal classification, and reporting a valid,
+    well-formed NEEDS_INPUT as a producer defect loses the state and reason code
+    exactly where the evidence matters most (external re-review MAJOR).
+
+    Returns None -- deliberately, and NOT a block -- when any record fails
+    validate_ledger_record(). A ledger that cannot be read is a genuine input
+    defect, and `INPUT_DEFECT_STATE` with the producer reason is the honest answer
+    for it. This function only ever RECLASSIFIES an existing refusal; it never
+    admits anything and is never a substitute for admit_head().
+    """
+    ordered = sorted(records, key=lambda record: record.get("sequence", 0))
+    if not ordered:
+        return None
+    for record in ordered:
+        try:
+            validate_ledger_record(policy, record)
+        except GateRefusal:
+            return None
+    still_open = open_items(policy, ordered)
+    if not still_open:
+        return None
+    blocker = next(record for record in ordered if ledger_key(record) in still_open)
+    return block_reason(str(blocker.get("state")), blocker.get("reason_code"))
+
+
 def verification_binding_defect(
     reviewer: GateResult, *, worker_key: str, run_id: str, phase: str, iteration: int
 ) -> str | None:

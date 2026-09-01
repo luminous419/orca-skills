@@ -8383,14 +8383,21 @@ class DecisionGateLiveDispatchTests(unittest.TestCase):
         self.assertEqual(state, "NEEDS_INPUT")
         # The blocking decision really is the published head ...
         self.assertEqual(self.ledger()[-1]["state"], "NEEDS_INPUT")
-        # ... and completion refuses. The reason is A6's producer defect rather than
-        # A5's DECISION_BLOCKED because A6 precedes A5 and the run-entry declaration
-        # is written once at run open, permanently claiming no open items -- so the
-        # item this run itself opened makes A6 disagree from then on. Both are
-        # terminal refusals under the same closed vocabulary; what matters here is
-        # that COMPLETED is unreachable, which assert_completion_refused proves.
+        # ... and completion refuses, naming the BLOCK -- not a producer defect.
+        # admit_head() evaluates A6 before A5 and A6 disagrees for every item this
+        # run opened, so the raw clause would report DECLARATION_DISAGREES_WITH_LEDGER
+        # and lose the state and reason code at the run's terminal boundary
+        # (external re-review MAJOR). The exact closed reason is asserted here.
         reason = self.assert_completion_refused(harness)
-        self.assertIn(reason, decision_gate.GATE_REFUSAL_REASONS)
+        self.assertEqual(reason, decision_gate.block_reason("NEEDS_INPUT", "blast_radius_beyond_scope"))
+        self.assertEqual(reason, "DECISION_BLOCKED:NEEDS_INPUT:blast_radius_beyond_scope")
+        # And the two sparse log columns carry the REAL state and reason code.
+        self.assertEqual(
+            decision_gate.decision_columns(reason), ("NEEDS_INPUT", "blast_radius_beyond_scope")
+        )
+        log = self.orchestrator_log(harness)
+        self.assertIn("blast_radius_beyond_scope", log)
+        self.assertNotIn(decision_gate.DECLARATION_DISAGREES_WITH_LEDGER, log)
 
     def test_quality_pass_beside_conflict_cannot_complete_the_run(self) -> None:
         harness, _ = self.started_harness()
@@ -8401,14 +8408,21 @@ class DecisionGateLiveDispatchTests(unittest.TestCase):
         self.assertEqual(state, "CONFLICT")
         # The blocking decision really is the published head ...
         self.assertEqual(self.ledger()[-1]["state"], "CONFLICT")
-        # ... and completion refuses. The reason is A6's producer defect rather than
-        # A5's DECISION_BLOCKED because A6 precedes A5 and the run-entry declaration
-        # is written once at run open, permanently claiming no open items -- so the
-        # item this run itself opened makes A6 disagree from then on. Both are
-        # terminal refusals under the same closed vocabulary; what matters here is
-        # that COMPLETED is unreachable, which assert_completion_refused proves.
+        # ... and completion refuses, naming the BLOCK -- not a producer defect.
+        # admit_head() evaluates A6 before A5 and A6 disagrees for every item this
+        # run opened, so the raw clause would report DECLARATION_DISAGREES_WITH_LEDGER
+        # and lose the state and reason code at the run's terminal boundary
+        # (external re-review MAJOR). The exact closed reason is asserted here.
         reason = self.assert_completion_refused(harness)
-        self.assertIn(reason, decision_gate.GATE_REFUSAL_REASONS)
+        self.assertEqual(reason, decision_gate.block_reason("CONFLICT", "requirement_contradiction"))
+        self.assertEqual(reason, "DECISION_BLOCKED:CONFLICT:requirement_contradiction")
+        # And the two sparse log columns carry the REAL state and reason code.
+        self.assertEqual(
+            decision_gate.decision_columns(reason), ("CONFLICT", "requirement_contradiction")
+        )
+        log = self.orchestrator_log(harness)
+        self.assertIn("requirement_contradiction", log)
+        self.assertNotIn(decision_gate.DECLARATION_DISAGREES_WITH_LEDGER, log)
 
     def test_a_silent_final_result_cannot_complete_the_run(self) -> None:
         """The missing-declaration case: nothing is published and the round is bound
@@ -8417,8 +8431,14 @@ class DecisionGateLiveDispatchTests(unittest.TestCase):
         state, _ = self.settle_final_reviewer(harness, self.FINAL_QUALITY_PASS)
 
         self.assertEqual(state, decision_gate.INPUT_DEFECT_STATE)
+        # A genuinely unusable result keeps its INPUT-defect reason: the block
+        # reclassification above must never launder a defect into a valid state.
         reason = self.assert_completion_refused(harness)
-        self.assertIn(reason, decision_gate.GATE_REFUSAL_REASONS)
+        self.assertEqual(reason, decision_gate.GATE_INPUT_UNBOUND)
+        self.assertEqual(
+            decision_gate.decision_columns(reason),
+            (decision_gate.INPUT_DEFECT_STATE, decision_gate.GATE_INPUT_UNBOUND),
+        )
 
     def test_a_malformed_ledger_head_cannot_complete_the_run(self) -> None:
         harness, _ = self.started_harness()

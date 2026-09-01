@@ -2674,16 +2674,32 @@ class OrcaRuntimeHarness:
         # blocked run could never record why it stopped -- and this method is how it
         # records that, including on the refusal path immediately below.
         if status == "COMPLETED":
+            records = run_logging.read_decision_ledger(
+                self.run_id, base=self.artifact_dir
+            )
             try:
                 decision_gate.admit_head(
                     self._decision_policy,
-                    run_logging.read_decision_ledger(
-                        self.run_id, base=self.artifact_dir
-                    ),
+                    records,
                     run_id=self.run_id,
                     expected_settled_round=self._last_settled,
                 )
             except decision_gate.GateRefusal as refusal:
+                # The refusal reason is this run's recorded TERMINAL classification,
+                # so it must name what actually stopped the run. admit_head()
+                # evaluates A6 before A5, and A6 disagrees for every item THIS RUN
+                # opened, so a valid NEEDS_INPUT/CONFLICT would otherwise be recorded
+                # as a producer defect and lose its state and reason code at the last
+                # boundary (external re-review MAJOR). unresolved_block_reason()
+                # returns the block only when every record validates, so a genuinely
+                # unreadable ledger keeps its own input-defect reason.
+                reason = (
+                    decision_gate.unresolved_block_reason(
+                        self._decision_policy, records
+                    )
+                    or refusal.reason
+                )
+                state, code = decision_gate.decision_columns(reason)
                 detail = " ".join(str(refusal.detail).split())[:200]
                 self._safe_log(
                     run_logging.log_orchestrator_event,
@@ -2691,16 +2707,14 @@ class OrcaRuntimeHarness:
                     base=self.artifact_dir,
                     event=run_logging.EVENT_DECISION_BLOCK,
                     risk=self.risk,
-                    decision_state=decision_gate.INPUT_DEFECT_STATE,
-                    decision_reason_code=refusal.reason,
+                    decision_state=state,
+                    decision_reason_code=code,
                     detail=f"COMPLETED refused at the pre-completion gate: {detail}",
                 )
                 # Terminate BLOCKED instead of COMPLETED. This recurses exactly once:
                 # BLOCKED is not gated, so the branch above is not re-entered.
-                self.log_run_status(
-                    "BLOCKED", reason=f"{refusal.reason}: {detail}"
-                )
-                raise DecisionGateRefused(refusal.reason, refusal.detail)
+                self.log_run_status("BLOCKED", reason=f"{reason}: {detail}")
+                raise DecisionGateRefused(reason, refusal.detail)
         self._safe_log(
             run_logging.log_run_status,
             self.run_id,
