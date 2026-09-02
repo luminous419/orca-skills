@@ -2745,13 +2745,10 @@ class OrcaRuntimeHarness:
     def _publish_clarifications_for_terminal_block(self) -> None:
         if not self.run_id:
             return
-        def valid(reviewer, worker):
-            verifies = reviewer.get("verifies")
-            return (isinstance(verifies, dict)
-                    and verifies.get("worker_record_key") == decision_gate.ledger_key(worker)
-                    and worker.get("role") == "worker" and worker.get("boundary") == "B2"
-                    and reviewer.get("boundary") == "B3"
-                    and all(reviewer.get(key) == worker.get(key) for key in ("run", "phase", "iteration")))
+        # One binding rule for the whole system: the OS-29 predicate, restated in
+        # clarification_protocol so a forged inner `verifies` cannot be folded here
+        # either. A local copy of this check is how the weaker variant survived.
+        valid = clarification_protocol.canonical_reviewer_binding
         try:
             records = run_logging.read_decision_ledger(self.run_id, base=self.artifact_dir)
             sources = clarification_protocol.terminal_block_sources(

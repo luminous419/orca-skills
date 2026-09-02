@@ -631,7 +631,8 @@ class HarnessClarificationSeamTests(unittest.TestCase):
                 "sequence":1,"state":"NEEDS_INPUT","reason_code":"user_choice_required","open_decision_item":True,
                 "open_item":"deployment_target","verifies":None}
         reviewer={**worker,"role":"reviewer","boundary":"B3","sequence":2,
-                  "verifies":{"worker_record_key":"run_seam/implementation/1/B2#1"}}
+                  "verifies":{"run":"run_seam","phase":"implementation","iteration":1,
+                              "worker_record_key":"run_seam/implementation/1/B2#1"}}
         return worker,reviewer
 
     def test_both_harness_seams_call_fake_port_once(self):
@@ -820,39 +821,97 @@ class DependentPromotionTests(unittest.TestCase):
         self.assertNotIn(b,self.published_item_ids(),
                          "abandonment is irreversible, so a dependent of a cancelled item stays unasked")
 
-    def test_promotion_reaches_dependents_through_the_shipped_harness_seams(self):
+    def test_dependent_chain_advances_through_the_installed_cli_after_respond(self):
+        """The post-response path must exist in the SHIPPED CLI, not only in Python.
+
+        The harness seam runs while recording terminal BLOCKED; by the time a human
+        answers, that run is over. So the chain is driven here exactly as an operator
+        would: one terminal-boundary publication, then `respond` through the installed
+        module. No second terminal-boundary invocation is simulated.
+        """
         from scripts.e2e_harness import E2EHarness
-        from scripts.orca_runtime_harness import OrcaRuntimeHarness
-        from scripts import run_logging
+        from scripts import clarification_protocol
         sources=self.chain_sources()
         declarations={source.source_ledger_key:source.request_input for source in sources}
         records=[{"run":self.RUN,"phase":"implementation","iteration":1,"role":"worker","boundary":"B2",
                   "sequence":index,"state":"NEEDS_INPUT","reason_code":"user_choice_required",
                   "open_decision_item":True,"open_item":label,"verifies":None}
                  for index,label in ((1,"choice_a"),(2,"choice_b"),(3,"choice_c"),(4,"choice_d"))]
-        a,b=self.item_id(1,"choice_a"),self.item_id(2,"choice_b")
-        for cls,base_attr in ((E2EHarness,"workspace"),(OrcaRuntimeHarness,"artifact_dir")):
-            with self.subTest(harness=cls.__name__), tempfile.TemporaryDirectory() as td:
-                port=ArtifactHumanApprovalPort(Path(td))
-                harness=object.__new__(cls); harness.run_id=self.RUN; setattr(harness,base_attr,Path(td))
-                harness.human_approval_port=port; harness.clarification_inputs=declarations
-                harness.clarification_errors=[]; harness.phase="implementation"
-                if cls is OrcaRuntimeHarness: harness._safe_log=lambda func,*a,**k: func(*a,**k)
-                with patch("scripts.run_logging.read_decision_ledger",return_value=records):
-                    harness._publish_clarifications_for_terminal_block()
-                    published=lambda: {v["decision_item_id"]
-                                       for p in (Path(td)/f"artifacts/runs/{self.RUN}/clarifications/requests").glob("request_*/record.json")
-                                       for v in json.loads(p.read_text())["items"]}
-                    self.assertNotIn(b,published(),"the dependent must not be asked before its predecessor")
-                    request=next(json.loads(p.read_text())
-                                 for p in (Path(td)/f"artifacts/runs/{self.RUN}/clarifications/requests").glob("request_*/record.json")
-                                 if any(v["decision_item_id"]==a for v in json.loads(p.read_text())["items"]))
-                    port.ingest(run_id=self.RUN,request_id=request["request_id"],decision_item_id=a,
-                        submission=ResponseSubmission("seam","alice","human","desk","2026-09-01T08:00:00Z","staging",None,False,"normal"))
-                    # A later terminal boundary must ask the newly unlocked question.
-                    harness._publish_clarifications_for_terminal_block()
-                    self.assertIn(b,published(),"the seam must promote the dependent after the answer lands")
-                self.assertEqual([],harness.clarification_errors)
+        a,b,c,d=(self.item_id(1,"choice_a"),self.item_id(2,"choice_b"),
+                 self.item_id(3,"choice_c"),self.item_id(4,"choice_d"))
+        module=Path(clarification_protocol.__file__)
+
+        harness=object.__new__(E2EHarness); harness.run_id=self.RUN; harness.workspace=self.base
+        harness.human_approval_port=self.port; harness.clarification_inputs=declarations
+        harness.clarification_errors=[]; harness.phase="implementation"
+        with patch("scripts.run_logging.read_decision_ledger",return_value=records):
+            harness._publish_clarifications_for_terminal_block()
+        self.assertEqual({a,d},self.published_item_ids(),"only the roots are asked at terminal BLOCKED")
+        self.assertEqual([],harness.clarification_errors)
+
+        def respond_via_cli(item_id, token):
+            root=self.base/f"artifacts/runs/{self.RUN}/clarifications/requests"
+            request=next(json.loads(path.read_text()) for path in root.glob("request_*/record.json")
+                         if any(v["decision_item_id"]==item_id for v in json.loads(path.read_text())["items"]))
+            completed=subprocess.run([sys.executable,str(module),"respond","--artifact-base",str(self.base),
+                "--run-id",self.RUN,"--request-id",request["request_id"],"--decision-item-id",item_id,
+                "--submission-id",token,"--actor-id","alice","--actor-type","human",
+                "--where-recorded","desk","--responded-at","2026-09-01T08:00:00Z","--option-id","staging"],
+                text=True,capture_output=True)
+            self.assertEqual(0,completed.returncode,completed.stderr)
+            return json.loads(completed.stdout)
+
+        first=respond_via_cli(a,"cli-a")
+        self.assertEqual("DECIDED",first["status"])
+        self.assertIn(b,self.published_item_ids(),"answering A through the CLI must make B askable")
+        self.assertNotIn(c,self.published_item_ids(),"C must still wait for B")
+        self.assertIn(b,first["promoted"]["item_ids"],"the CLI must report what it promoted")
+
+        second=respond_via_cli(b,"cli-b")
+        self.assertEqual("DECIDED",second["status"])
+        self.assertEqual({a,b,c,d},self.published_item_ids(),"answering B must make C askable")
+
+        asked=[v["decision_item_id"]
+               for path in (self.base/f"artifacts/runs/{self.RUN}/clarifications/requests").glob("request_*/record.json")
+               for v in json.loads(path.read_text())["items"]]
+        self.assertEqual(sorted(asked),sorted({a,b,c,d}),"no item may be asked twice across the chain")
+
+    def test_installed_cli_promote_is_explicit_and_idempotent(self):
+        from scripts import clarification_protocol
+        module=Path(clarification_protocol.__file__)
+        sources=self.chain_sources()
+        self.port.promote(run_id=self.RUN,sources=sources)  # persists the declarations
+        a=self.item_id(1,"choice_a")
+        self.answer(a,"reply-a")
+        completed=subprocess.run([sys.executable,str(module),"promote","--artifact-base",str(self.base),
+            "--run-id",self.RUN],text=True,capture_output=True)
+        self.assertEqual(0,completed.returncode,completed.stderr)
+        self.assertIn(self.item_id(2,"choice_b"),json.loads(completed.stdout)["item_ids"])
+        again=subprocess.run([sys.executable,str(module),"promote","--artifact-base",str(self.base),
+            "--run-id",self.RUN],text=True,capture_output=True)
+        self.assertEqual("EXISTING",json.loads(again.stdout)["status"],"a second promote must publish nothing new")
+
+    def test_blocked_sources_are_persisted_immutably_and_validated_on_read(self):
+        from scripts.clarification_protocol import ClarificationConflict, SchemaMalformed, SchemaUnsupported
+        sources=self.chain_sources()
+        self.port.promote(run_id=self.RUN,sources=sources)
+        path=self.base/f"artifacts/runs/{self.RUN}/clarifications/blocked_sources/record.json"
+        self.assertTrue(path.exists(),"promotion is unreachable later unless the declarations are on disk")
+        self.assertEqual(0o600,path.stat().st_mode & 0o777)
+        self.assertEqual(4,len(self.port.load_blocked_sources(self.RUN)))
+        # Re-declaring the same set is a no-op; a different set is a conflict.
+        self.assertFalse(self.port.persist_blocked_sources(self.RUN,sources))
+        with self.assertRaises(ClarificationConflict):
+            self.port.persist_blocked_sources(self.RUN,sources[:2])
+        for mutate,expected in ((lambda r: r.__setitem__("schema_version",99),SchemaUnsupported),
+                                (lambda r: r.__setitem__("schema","orca.other"),SchemaMalformed),
+                                (lambda r: r.__setitem__("run_id","run_other"),SchemaMalformed),
+                                (lambda r: r.__setitem__("extra",1),SchemaMalformed),
+                                (lambda r: r["sources"][0].__setitem__("extra",1),SchemaMalformed)):
+            record=json.loads(path.read_text()); mutate(record)
+            path.write_text(json.dumps(record))
+            with self.assertRaises(expected):
+                self.port.load_blocked_sources(self.RUN)
 
 
 class CliSourceLedgerKeysAuthenticationTests(unittest.TestCase):
@@ -875,7 +934,8 @@ class CliSourceLedgerKeysAuthenticationTests(unittest.TestCase):
         records=[worker]
         if reviewer:
             records.append({**worker,"role":"reviewer","boundary":"B3","sequence":2,
-                            "verifies":{"worker_record_key":self.PRIMARY} if verifies is None else verifies})
+                            "verifies":{"run":self.RUN,"phase":"implementation","iteration":1,
+                             "worker_record_key":self.PRIMARY} if verifies is None else verifies})
         records.extend(extra)
         return records
 
@@ -907,14 +967,16 @@ class CliSourceLedgerKeysAuthenticationTests(unittest.TestCase):
         other={"run":self.RUN,"phase":"implementation","iteration":1,"role":"reviewer","boundary":"B3",
                "sequence":3,"state":"NEEDS_INPUT","reason_code":"user_choice_required",
                "open_decision_item":True,"open_item":"deployment_target",
-               "verifies":{"worker_record_key":"run_keys/implementation/1/B2#7"}}
+               "verifies":{"run":self.RUN,"phase":"implementation","iteration":1,
+                           "worker_record_key":"run_keys/implementation/1/B2#7"}}
         self.assertRejected([self.PRIMARY,"run_keys/implementation/1/B3#3"],
                             self.ledger(reviewer=False,extra=[other]),
                             "a real B3 bound to a different producer is not this request's provenance")
 
     def test_invalid_verifies_worker_record_key_is_rejected(self):
         self.assertRejected([self.PRIMARY,self.REVIEWER],
-                            self.ledger(verifies={"worker_record_key":"run_keys/implementation/1/B2#42"}),
+                            self.ledger(verifies={"run":self.RUN,"phase":"implementation","iteration":1,
+                                                  "worker_record_key":"run_keys/implementation/1/B2#42"}),
                             "a B3 whose binding does not resolve to the producer must not be folded")
 
     def test_cross_item_key_injection_is_rejected(self):
@@ -938,3 +1000,25 @@ class CliSourceLedgerKeysAuthenticationTests(unittest.TestCase):
     def test_omitting_a_real_bound_reviewer_understates_provenance_and_is_rejected(self):
         self.assertRejected([self.PRIMARY],self.ledger(),
                             "the set is derived, so dropping a genuinely bound B3 is also a mismatch")
+
+    def test_forged_inner_verifies_fields_are_each_rejected(self):
+        """M-002 residual: `verifies` is a CLOSED four-field object and every field
+        binds authority. Checking only worker_record_key let a schema-valid B3 carry
+        forged inner run/phase/iteration and still be folded into the request."""
+        cases={
+            "forged_run":{"run":"run_other","phase":"implementation","iteration":1,"worker_record_key":self.PRIMARY},
+            "forged_phase":{"run":self.RUN,"phase":"design","iteration":1,"worker_record_key":self.PRIMARY},
+            "forged_iteration":{"run":self.RUN,"phase":"implementation","iteration":9,"worker_record_key":self.PRIMARY},
+            "missing_field":{"run":self.RUN,"phase":"implementation","worker_record_key":self.PRIMARY},
+            "extra_field":{"run":self.RUN,"phase":"implementation","iteration":1,
+                           "worker_record_key":self.PRIMARY,"extra":"x"},
+        }
+        for name,verifies in cases.items():
+            with self.subTest(case=name):
+                self.setUp()  # a rejected create must leave a clean tree per case
+                self.assertRejected([self.PRIMARY,self.REVIEWER],self.ledger(verifies=verifies),
+                                    f"{name}: a forged inner binding must not be folded")
+
+    def test_fully_valid_inner_verifies_is_still_accepted(self):
+        verifies={"run":self.RUN,"phase":"implementation","iteration":1,"worker_record_key":self.PRIMARY}
+        self.assertEqual(0,self.run_create([self.PRIMARY,self.REVIEWER],self.ledger(verifies=verifies)))

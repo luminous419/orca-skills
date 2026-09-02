@@ -226,14 +226,33 @@ def canonical_ledger_key(record: Mapping[str, object]) -> str:
     return f"{record.get('run')}/{record.get('phase')}/{record.get('iteration')}/{record.get('boundary')}#{record.get('sequence')}"
 
 
+# The OS-29 binding contract, restated here because clarification_protocol must not
+# import decision_gate. `verifies` is a CLOSED four-field object and every field is
+# authority-bearing: checking only worker_record_key lets a schema-valid B3 carry
+# forged inner run/phase/iteration and still be folded into a request's provenance.
+VERIFIES_FIELDS: tuple[str, ...] = ("run", "phase", "iteration", "worker_record_key")
+
+
 def canonical_reviewer_binding(reviewer: Mapping[str, object], worker: Mapping[str, object]) -> bool:
-    """The one B3 -> B2 binding rule, shared by the CLI and the harness seams."""
+    """The one B3 -> B2 binding rule, shared by the CLI and the harness seams.
+
+    This matches `decision_gate.verification_binding_defect()` field for field: the
+    closed `verifies` set, and all of run / phase / iteration / worker_record_key
+    compared against the worker's own identity rather than the reviewer's outer copy.
+    """
     verifies = reviewer.get("verifies")
-    return (isinstance(verifies, Mapping)
-            and verifies.get("worker_record_key") == canonical_ledger_key(worker)
-            and worker.get("role") == "worker" and worker.get("boundary") == "B2"
-            and reviewer.get("role") == "reviewer" and reviewer.get("boundary") == "B3"
-            and all(reviewer.get(key) == worker.get(key) for key in ("run", "phase", "iteration")))
+    if not isinstance(verifies, Mapping) or set(verifies) != set(VERIFIES_FIELDS):
+        return False
+    if not (worker.get("role") == "worker" and worker.get("boundary") == "B2"
+            and reviewer.get("role") == "reviewer" and reviewer.get("boundary") == "B3"):
+        return False
+    if any(reviewer.get(key) != worker.get(key) for key in ("run", "phase", "iteration")):
+        return False
+    actual = (verifies.get("run"), verifies.get("phase"), verifies.get("iteration"),
+              verifies.get("worker_record_key"))
+    expected = (worker.get("run"), worker.get("phase"), worker.get("iteration"),
+                canonical_ledger_key(worker))
+    return actual == expected
 
 
 def derive_source_ledger_keys(primary: str, records: Sequence[Mapping[str, object]]) -> tuple[str, ...]:
@@ -508,6 +527,78 @@ class ArtifactHumanApprovalPort:
     def __init__(self, artifact_base: Path | str = Path(".")) -> None:
         self.artifact_base = Path(artifact_base)
 
+    # The blocked source set is the only OS-30 input that lives outside the artifact
+    # tree: it is assembled in coordinator memory at terminal BLOCKED. Without it on
+    # disk, nothing after the run terminates can know that B exists, so promotion had
+    # no reachable entry point. Persisting it once, immutably, is what makes `promote`
+    # a real operation rather than a library call needing a live coordinator.
+    BLOCKED_SOURCES_SCHEMA = "orca.clarification.blocked_sources"
+    BLOCKED_SOURCES_SCHEMA_VERSION = 2
+
+    def _blocked_sources_path(self, run_id: str) -> Path:
+        return _clarification_root(self.artifact_base, run_id) / "blocked_sources" / "record.json"
+
+    def persist_blocked_sources(self, run_id: str, sources: Sequence[ClarificationSource]) -> bool:
+        """Publish the declared blocked source set write-once. Returns True if written.
+
+        Re-publishing an identical set is a no-op; a DIFFERENT set for the same run is
+        a conflict, because the declarations a request was derived from are immutable.
+        """
+        payload = {"schema": self.BLOCKED_SOURCES_SCHEMA,
+                   "schema_version": self.BLOCKED_SOURCES_SCHEMA_VERSION,
+                   "run_id": run_id,
+                   "sources": [{"open_item": source.open_item,
+                                "source_ledger_key": source.source_ledger_key,
+                                "source_ledger_keys": list(source.source_ledger_keys),
+                                "state": source.state, "reason_code": source.reason_code,
+                                "phase": source.phase, "iteration": source.iteration,
+                                "request_input": source.request_input}
+                               for source in sorted(sources, key=lambda value: value.source_ledger_key)]}
+        root = _clarification_root(self.artifact_base, run_id)
+        (root / ".staging").mkdir(parents=True, exist_ok=True, mode=0o700)
+        return _write_directory(root, Path("blocked_sources"), {"record.json": (_json_bytes(payload), 0o600)})
+
+    def load_blocked_sources(self, run_id: str) -> tuple[ClarificationSource, ...]:
+        """Reload the persisted declarations, validating the closed envelope."""
+        path = self._blocked_sources_path(run_id)
+        if not path.exists():
+            return ()
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise SchemaMalformed("blocked_sources: unreadable") from exc
+        if not isinstance(record, dict) or set(record) != {"schema", "schema_version", "run_id", "sources"}:
+            raise SchemaMalformed("blocked_sources: closed schema")
+        if record["schema"] != self.BLOCKED_SOURCES_SCHEMA:
+            raise SchemaMalformed("blocked_sources: schema")
+        if record["schema_version"] != self.BLOCKED_SOURCES_SCHEMA_VERSION:
+            raise SchemaUnsupported("blocked_sources: unsupported generation")
+        if record["run_id"] != run_id or not isinstance(record["sources"], list):
+            raise SchemaMalformed("blocked_sources: run binding")
+        sources = []
+        for value in record["sources"]:
+            if not isinstance(value, dict) or set(value) != {
+                    "open_item", "source_ledger_key", "source_ledger_keys", "state",
+                    "reason_code", "phase", "iteration", "request_input"}:
+                raise SchemaMalformed("blocked_sources: closed source schema")
+            sources.append(ClarificationSource(
+                open_item=value["open_item"], source_ledger_key=value["source_ledger_key"],
+                source_ledger_keys=tuple(value["source_ledger_keys"]), state=value["state"],
+                reason_code=value["reason_code"], phase=value["phase"],
+                iteration=int(value["iteration"]), request_input=value["request_input"]))
+        return tuple(sources)
+
+    def promote_pending(self, run_id: str) -> PublishResult:
+        """Promote from the PERSISTED declarations, with no live coordinator.
+
+        This is the post-response entry point: after a human answers, the next
+        dependency-ready antichain becomes askable without resuming the run.
+        """
+        sources = self.load_blocked_sources(run_id)
+        if not sources:
+            return PublishResult((), (), "EXISTING")
+        return self.promote(run_id=run_id, sources=sources, persist=False)
+
     def resolved_items(self, run_id: str) -> frozenset[str]:
         """Decision items that already carry an effective decision.
 
@@ -518,14 +609,20 @@ class ArtifactHumanApprovalPort:
         return frozenset(item_id for item_id in self._known_items(run_id)
                          if self._lineage_state(root, item_id)[2] == "effective")
 
-    def promote(self, *, run_id: str, sources: Sequence[ClarificationSource]) -> PublishResult:
+    def promote(self, *, run_id: str, sources: Sequence[ClarificationSource],
+                persist: bool = True) -> PublishResult:
         """Publish the dependency-ready antichains unlocked by effective decisions.
 
         This is the operation that lets a dependent question be asked after its
         predecessor is answered, without resuming the run and without republishing
         anything already asked.  It is a no-op returning EXISTING when nothing new
         is ready, so it is safe to call on every terminal boundary.
+
+        `persist` records the declared source set so `promote_pending()` can run the
+        same computation later with no coordinator alive.
         """
+        if persist:
+            self.persist_blocked_sources(run_id, sources)
         published = frozenset(self._known_items(run_id))
         batches = publication_batches(run_id, sources, resolved=self.resolved_items(run_id),
                                       already_published=published)
@@ -1127,7 +1224,8 @@ class ArtifactHumanApprovalPort:
 def _parser() -> argparse.ArgumentParser:
     parser=argparse.ArgumentParser(prog="clarification",add_help=True); sub=parser.add_subparsers(dest="operation",required=True)
     create=sub.add_parser("create"); respond=sub.add_parser("respond"); show=sub.add_parser("show")
-    for p in (create,respond,show): p.add_argument("--artifact-base",type=Path,default=Path(".")); p.add_argument("--run-id",required=True)
+    promote=sub.add_parser("promote")  # post-response entry point; needs no live coordinator
+    for p in (create,respond,show,promote): p.add_argument("--artifact-base",type=Path,default=Path(".")); p.add_argument("--run-id",required=True)
     create.add_argument("--ledger-key",action="append",required=True); create.add_argument("--input",type=Path,required=True)
     respond.add_argument("--request-id",required=True); respond.add_argument("--submission-id",required=True); respond.add_argument("--actor-id",required=True)
     respond.add_argument("--actor-type",choices=("human","service"),required=True); respond.add_argument("--where-recorded",required=True)
@@ -1163,6 +1261,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.operation=="respond":
             submission=ResponseSubmission(args.submission_id,args.actor_id,args.actor_type,args.where_recorded,args.responded_at or _now(),args.option_id,args.response_file,args.cancel,args.sensitivity)
             result=port.ingest(run_id=args.run_id,request_id=args.request_id,decision_item_id=args.decision_item_id,submission=submission); output={"schema_version":1,"operation":"respond",**dataclasses.asdict(result)}
+            # An answer is what unlocks the next question, so this is where promotion
+            # belongs. The response is already durable; a promotion failure is reported
+            # in the output rather than swallowed, and never unwinds the response.
+            try:
+                promoted=port.promote_pending(run_id=args.run_id)
+                output["promoted"]={"request_ids":list(promoted.request_ids),
+                                    "item_ids":list(promoted.item_ids),"status":promoted.status}
+            except ClarificationError as exc:
+                output["promoted"]={"request_ids":[],"item_ids":[],"status":"ERROR","code":exc.code}
+        elif args.operation=="promote":
+            result=port.promote_pending(run_id=args.run_id)
+            output={"schema_version":1,"operation":"promote",**dataclasses.asdict(result)}
         else: output=port.show(run_id=args.run_id,request_id=args.request_id)
         print(json.dumps(output,sort_keys=True,separators=(",",":"),ensure_ascii=False))
         return 3 if output.get("status") in {"STALE_REQUEST","RECLARIFICATION_CREATED","AMBIGUITY_LIMIT_REACHED"} else 0
