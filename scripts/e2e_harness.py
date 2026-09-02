@@ -1901,8 +1901,12 @@ class E2EHarness:
                 run_id=self.run_id, records=records, coordinator_input=self.clarification_inputs,
                 ledger_key=decision_gate.ledger_key, valid_reviewer_binding=valid)
             if sources:
-                for batch in clarification_protocol.publication_batches(self.run_id, sources):
-                    self.human_approval_port.publish(run_id=self.run_id, sources=batch)
+                # promote() covers the initial publication too: with nothing resolved
+                # and nothing published it selects exactly the ready roots, and on a
+                # later terminal boundary it selects the antichain unlocked by the
+                # answers that have landed since. Calling publication_batches()
+                # directly here would ask the roots once and never ask a dependent.
+                self.human_approval_port.promote(run_id=self.run_id, sources=sources)
         except Exception as exc:  # artifact failure never changes terminal BLOCKED
             keys = sorted(source.source_ledger_key for source in locals().get("sources", ()))
             error = json.dumps({"exception":type(exc).__name__,"message":str(exc),"ledger_keys":keys},

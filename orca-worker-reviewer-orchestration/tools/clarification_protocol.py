@@ -18,7 +18,7 @@ import sys
 import tempfile
 import unicodedata
 from pathlib import Path
-from typing import Mapping, Protocol, Sequence
+from typing import Collection, Mapping, Protocol, Sequence
 
 try:
     from scripts.run_logging import FINAL_REVIEW_REDACTION_POLICY_VERSION, read_decision_ledger
@@ -167,8 +167,20 @@ def terminal_block_sources(
     return tuple(sources)
 
 
-def publication_batches(run_id: str, sources: Sequence[ClarificationSource]) -> tuple[tuple[ClarificationSource, ...], ...]:
-    """Return every dependency-ready item in deterministic antichain bundles."""
+def publication_batches(run_id: str, sources: Sequence[ClarificationSource], *,
+                        resolved: Collection[str] = (),
+                        already_published: Collection[str] = ()) -> tuple[tuple[ClarificationSource, ...], ...]:
+    """Return every dependency-ready item in deterministic antichain bundles.
+
+    `resolved` names decision items that already carry an effective decision, so a
+    dependent whose predecessors are all resolved becomes ready.  Without it the
+    first call would be the only one that can ever publish anything: a dependent's
+    predecessor is in the source set, so it would be filtered out forever and the
+    Jira requirement that dependent questions are asked in dependency order would
+    have no executable path.  `already_published` names items whose request exists,
+    which is what makes promotion publish each item exactly once.
+    """
+    resolved=set(resolved); already_published=set(already_published)
     prepared=[]
     for source in sources:
         merged=dict(source.request_input)
@@ -186,10 +198,14 @@ def publication_batches(run_id: str, sources: Sequence[ClarificationSource]) -> 
             found.add(value); stack.extend(graph.get(value,()))
         return found
     closure={item_id:ancestors(item_id) for item_id in graph}
-    # At initial terminal publication only nodes without an unresolved known
-    # predecessor are ready. Persisted effective predecessors are admitted later
-    # by ArtifactHumanApprovalPort's complete-DAG validation.
-    remaining=sorted((item_id for item_id in graph if not (graph[item_id] & set(graph))),key=str)
+    # A node is ready when every predecessor inside this source set already carries
+    # an effective decision. At initial terminal publication `resolved` is empty, so
+    # this is exactly "no known predecessor"; after answers land, promotion passes
+    # the resolved set and the next dependency-ready antichain becomes selectable.
+    # Items whose request already exists are never re-selected.
+    unresolved_graph=set(graph)-resolved
+    remaining=sorted((item_id for item_id in graph
+                      if item_id not in already_published and not (graph[item_id] & unresolved_graph)),key=str)
     batches=[]
     while remaining:
         chosen=[]
@@ -204,6 +220,55 @@ def publication_batches(run_id: str, sources: Sequence[ClarificationSource]) -> 
             batch.append(dataclasses.replace(source,request_input=request_input))
         batches.append(tuple(batch)); remaining=[value for value in remaining if value not in member_set]
     return tuple(batches)
+
+
+def canonical_ledger_key(record: Mapping[str, object]) -> str:
+    return f"{record.get('run')}/{record.get('phase')}/{record.get('iteration')}/{record.get('boundary')}#{record.get('sequence')}"
+
+
+def canonical_reviewer_binding(reviewer: Mapping[str, object], worker: Mapping[str, object]) -> bool:
+    """The one B3 -> B2 binding rule, shared by the CLI and the harness seams."""
+    verifies = reviewer.get("verifies")
+    return (isinstance(verifies, Mapping)
+            and verifies.get("worker_record_key") == canonical_ledger_key(worker)
+            and worker.get("role") == "worker" and worker.get("boundary") == "B2"
+            and reviewer.get("role") == "reviewer" and reviewer.get("boundary") == "B3"
+            and all(reviewer.get(key) == worker.get(key) for key in ("run", "phase", "iteration")))
+
+
+def derive_source_ledger_keys(primary: str, records: Sequence[Mapping[str, object]]) -> tuple[str, ...]:
+    """Derive the authenticated key set a request may assert for `primary`.
+
+    Every asserted key must be a real open ledger record, the primary must be the
+    canonical B2 producer, and only Reviewer records validly bound to that producer
+    may join it.  The set is DERIVED, never taken from caller input: trusting the
+    input is what let a fabricated secondary key ride along on a genuine primary.
+    """
+    by_key = {canonical_ledger_key(record): record for record in records}
+    record = by_key.get(primary)
+    if record is None or record.get("boundary") not in {"B2", "B3"} or \
+            record.get("open_decision_item") is not True or record.get("state") not in SOURCE_STATES:
+        raise SourceNotOpen("ledger source is not a published open decision")
+    producer = record
+    if record.get("role") == "reviewer":
+        verifies = record.get("verifies")
+        worker_key = verifies.get("worker_record_key") if isinstance(verifies, Mapping) else None
+        worker = by_key.get(worker_key) if isinstance(worker_key, str) else None
+        if worker is None or not canonical_reviewer_binding(record, worker):
+            raise SourceNotOpen("reviewer source is not validly bound to a producer")
+        # A validly bound B3 folds onto its B2; the request must name the producer.
+        raise SourceNotOpen("source_ledger_key must name the canonical producer")
+    keys = {primary}
+    for candidate in records:
+        if candidate.get("role") != "reviewer" or candidate.get("boundary") != "B3":
+            continue
+        if candidate.get("open_decision_item") is not True or candidate.get("state") not in SOURCE_STATES:
+            continue
+        if canonical_reviewer_binding(candidate, producer):
+            if (candidate.get("state"), candidate.get("reason_code")) != (producer.get("state"), producer.get("reason_code")):
+                raise ClarificationError("folded judgements disagree")
+            keys.add(canonical_ledger_key(candidate))
+    return tuple(sorted(keys, key=_ledger_sort_key))
 
 
 def _ledger_sort_key(key: str) -> tuple[str, int, int]:
@@ -442,6 +507,35 @@ def _validate_request_record(raw: object, run_id: str, expected_request_id: str 
 class ArtifactHumanApprovalPort:
     def __init__(self, artifact_base: Path | str = Path(".")) -> None:
         self.artifact_base = Path(artifact_base)
+
+    def resolved_items(self, run_id: str) -> frozenset[str]:
+        """Decision items that already carry an effective decision.
+
+        `cancelled` is deliberately excluded: abandonment is irreversible, so a
+        dependent of a cancelled question must never be promoted.
+        """
+        root = _clarification_root(self.artifact_base, run_id)
+        return frozenset(item_id for item_id in self._known_items(run_id)
+                         if self._lineage_state(root, item_id)[2] == "effective")
+
+    def promote(self, *, run_id: str, sources: Sequence[ClarificationSource]) -> PublishResult:
+        """Publish the dependency-ready antichains unlocked by effective decisions.
+
+        This is the operation that lets a dependent question be asked after its
+        predecessor is answered, without resuming the run and without republishing
+        anything already asked.  It is a no-op returning EXISTING when nothing new
+        is ready, so it is safe to call on every terminal boundary.
+        """
+        published = frozenset(self._known_items(run_id))
+        batches = publication_batches(run_id, sources, resolved=self.resolved_items(run_id),
+                                      already_published=published)
+        request_ids: list[str] = []
+        item_ids: list[str] = []
+        for batch in batches:
+            result = self.publish(run_id=run_id, sources=batch)
+            request_ids.extend(result.request_ids)
+            item_ids.extend(result.item_ids)
+        return PublishResult(tuple(request_ids), tuple(item_ids), "CREATED" if request_ids else "EXISTING")
 
     def publish(self, *, run_id: str, sources: Sequence[ClarificationSource]) -> PublishResult:
         items = []
@@ -1051,7 +1145,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             data=json.loads(args.input.read_text(encoding="utf-8")); keys=args.ledger_key
             if sorted(keys)!=sorted(item.get("source_ledger_key") for item in data.get("items",[])): raise ClarificationError("ledger-key/input mismatch")
             ledger=read_decision_ledger(args.run_id,base=args.artifact_base)
-            by_key={f"{r.get('run')}/{r.get('phase')}/{r.get('iteration')}/{r.get('boundary')}#{r.get('sequence')}":r for r in ledger}
+            by_key={canonical_ledger_key(r):r for r in ledger}
             for item in data.get("items",[]):
                 record=by_key.get(item.get("source_ledger_key"))
                 if (record is None or record.get("boundary") not in {"B2","B3"} or
@@ -1059,6 +1153,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                         any(item.get(field)!=record.get(source) for field,source in
                             (("phase","phase"),("iteration","iteration"),("source_state","state"),("source_reason_code","reason_code")))):
                     raise SourceNotOpen("ledger source is not a published open decision")
+                # The primary key alone is not the request's provenance claim: every
+                # member of source_ledger_keys is authority-bearing, so derive the
+                # authenticated set and require the input to match it exactly.
+                derived=derive_source_ledger_keys(item["source_ledger_key"],ledger)
+                if tuple(item.get("source_ledger_keys") or ()) != derived:
+                    raise SourceNotOpen("source_ledger_keys are not the authenticated set")
             result=port.create(run_id=args.run_id,data=data); output={"schema_version":1,"operation":"create",**dataclasses.asdict(result)}
         elif args.operation=="respond":
             submission=ResponseSubmission(args.submission_id,args.actor_id,args.actor_type,args.where_recorded,args.responded_at or _now(),args.option_id,args.response_file,args.cancel,args.sensitivity)

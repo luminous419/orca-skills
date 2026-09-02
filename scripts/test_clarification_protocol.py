@@ -614,9 +614,16 @@ class ClarificationProtocolTests(unittest.TestCase):
 
 
 class HarnessClarificationSeamTests(unittest.TestCase):
-    class FakePort:
-        def __init__(self): self.calls=[]
-        def publish(self, **kwargs): self.calls.append(kwargs)
+    class FakePort(ArtifactHumanApprovalPort):
+        """Records publish calls while doing REAL work.
+
+        A pure stub cannot exercise promotion: promote() reads persisted requests
+        and lineage to decide what is newly ready, so a stub that only appends to a
+        list would make the seam tests agree with any implementation.
+        """
+        def __init__(self, base): super().__init__(base); self.calls=[]
+        def publish(self, **kwargs):
+            self.calls.append(kwargs); return super().publish(**kwargs)
 
     @staticmethod
     def records():
@@ -634,7 +641,7 @@ class HarnessClarificationSeamTests(unittest.TestCase):
         declaration["source_ledger_keys"]=[declaration["source_ledger_key"]]
         for cls,base_attr in ((E2EHarness,"workspace"),(OrcaRuntimeHarness,"artifact_dir")):
             with self.subTest(harness=cls.__name__), tempfile.TemporaryDirectory() as td:
-                harness=object.__new__(cls); port=self.FakePort()
+                harness=object.__new__(cls); port=self.FakePort(Path(td))
                 harness.run_id="run_seam"; setattr(harness,base_attr,Path(td)); harness.human_approval_port=port
                 harness.clarification_inputs={"run_seam/implementation/1/B2#1":declaration}; harness.clarification_errors=[]
                 harness.phase="implementation"
@@ -659,7 +666,7 @@ class HarnessClarificationSeamTests(unittest.TestCase):
                 declarations[key]=declaration
             for cls,base_attr in ((E2EHarness,"workspace"),(OrcaRuntimeHarness,"artifact_dir")):
                 with self.subTest(count=count,harness=cls.__name__), tempfile.TemporaryDirectory() as td:
-                    harness=object.__new__(cls); port=self.FakePort(); harness.run_id="run_seam"
+                    harness=object.__new__(cls); port=self.FakePort(Path(td)); harness.run_id="run_seam"
                     setattr(harness,base_attr,Path(td)); harness.human_approval_port=port
                     harness.clarification_inputs=declarations; harness.clarification_errors=[]; harness.phase="implementation"
                     if cls is OrcaRuntimeHarness: harness._safe_log=lambda func,*args,**kwargs: func(*args,**kwargs)
@@ -675,7 +682,7 @@ class HarnessClarificationSeamTests(unittest.TestCase):
         worker,reviewer=self.records()
         for cls,base_attr in ((E2EHarness,"workspace"),(OrcaRuntimeHarness,"artifact_dir")):
             with self.subTest(harness=cls.__name__), tempfile.TemporaryDirectory() as td:
-                harness=object.__new__(cls); port=self.FakePort()
+                harness=object.__new__(cls); port=self.FakePort(Path(td))
                 harness.run_id="run_seam"; setattr(harness,base_attr,Path(td)); harness.human_approval_port=port
                 harness.clarification_inputs={}; harness.clarification_errors=[]; harness.phase="implementation"
                 if cls is OrcaRuntimeHarness:
@@ -689,7 +696,7 @@ class HarnessClarificationSeamTests(unittest.TestCase):
         from scripts.orca_runtime_harness import OrcaRuntimeHarness
         worker,reviewer=self.records()
         with tempfile.TemporaryDirectory() as td:
-            harness=object.__new__(OrcaRuntimeHarness); port=self.FakePort()
+            harness=object.__new__(OrcaRuntimeHarness); port=self.FakePort(Path(td))
             harness.run_id="run_seam"; harness.artifact_dir=Path(td); harness.human_approval_port=port
             harness.clarification_inputs={}; harness.clarification_errors=[]; harness._logging_errors=[]
             harness._run_started_at="2026-09-01T00:00:00Z"; harness.risk="high"; harness.risk_source="explicit"
@@ -707,7 +714,7 @@ class HarnessClarificationSeamTests(unittest.TestCase):
         worker,reviewer=self.records()
         with tempfile.TemporaryDirectory() as td:
             harness=object.__new__(E2EHarness); harness.run_id="run_seam"; harness.workspace=Path(td)
-            harness.human_approval_port=self.FakePort(); harness.clarification_inputs={}; harness.clarification_errors=[]; harness.phase="implementation"
+            harness.human_approval_port=self.FakePort(Path(td)); harness.clarification_inputs={}; harness.clarification_errors=[]; harness.phase="implementation"
             # Disagreement is rejected before a port call and recorded durably.
             reviewer={**reviewer,"state":"CONFLICT","reason_code":"conflicting_instructions"}
             with patch("scripts.run_logging.read_decision_ledger",return_value=[worker,reviewer]):
@@ -718,3 +725,216 @@ class HarnessClarificationSeamTests(unittest.TestCase):
             self.assertIn("ledger_keys",detail); self.assertEqual([],harness.human_approval_port.calls)
 
 if __name__ == "__main__": unittest.main()
+
+
+class DependentPromotionTests(unittest.TestCase):
+    """M-001: a dependent question must actually become askable once its
+    predecessor carries an effective decision, through the shipped harness seam,
+    without resuming the run and without republishing anything already asked."""
+
+    RUN = "run_promote"
+
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory(); self.base=Path(self.tmp.name)
+        self.port=ArtifactHumanApprovalPort(self.base)
+
+    def tearDown(self): self.tmp.cleanup()
+
+    def key(self, index): return f"{self.RUN}/implementation/1/B2#{index}"
+
+    def item_id(self, index, label): return decision_item_id(self.RUN,"implementation",label,self.key(index))
+
+    def chain_sources(self):
+        """A -> B -> C plus an independent root D."""
+        from scripts.clarification_protocol import ClarificationSource
+        layout=[(1,"choice_a",[]),(2,"choice_b",[self.item_id(1,"choice_a")]),
+                (3,"choice_c",[self.item_id(2,"choice_b")]),(4,"choice_d",[])]
+        sources=[]
+        for index,label,depends in layout:
+            value=item(suffix=str(index),open_item=label)
+            value["source_ledger_key"]=self.key(index); value["source_ledger_keys"]=[self.key(index)]
+            value["depends_on"]=depends
+            sources.append(ClarificationSource(
+                open_item=label,source_ledger_key=self.key(index),source_ledger_keys=(self.key(index),),
+                state="NEEDS_INPUT",reason_code="user_choice_required",phase="implementation",
+                iteration=1,request_input=value))
+        return tuple(sources)
+
+    def published_item_ids(self):
+        root=self.base/f"artifacts/runs/{self.RUN}/clarifications/requests"
+        ids=set()
+        for path in root.glob("request_*/record.json"):
+            for value in json.loads(path.read_text())["items"]: ids.add(value["decision_item_id"])
+        return ids
+
+    def request_count(self):
+        return len(list((self.base/f"artifacts/runs/{self.RUN}/clarifications/requests").glob("request_*/record.json")))
+
+    def answer(self, item_id, token):
+        root=self.base/f"artifacts/runs/{self.RUN}/clarifications/requests"
+        for path in root.glob("request_*/record.json"):
+            record=json.loads(path.read_text())
+            if any(value["decision_item_id"]==item_id for value in record["items"]):
+                return self.port.ingest(run_id=self.RUN,request_id=record["request_id"],decision_item_id=item_id,
+                    submission=ResponseSubmission(token,"alice","human","desk","2026-09-01T08:00:00Z","staging",None,False,"normal"))
+        raise AssertionError(f"{item_id} was never published")
+
+    def test_dependent_items_are_published_only_after_predecessors_resolve(self):
+        sources=self.chain_sources()
+        a,b,c,d=(self.item_id(1,"choice_a"),self.item_id(2,"choice_b"),
+                 self.item_id(3,"choice_c"),self.item_id(4,"choice_d"))
+
+        self.port.promote(run_id=self.RUN,sources=sources)
+        self.assertEqual({a,d},self.published_item_ids(),"only dependency-free roots may be asked first")
+
+        # Nothing is ready yet, so a second promotion must be a no-op, not a duplicate.
+        before=self.request_count()
+        self.assertEqual("EXISTING",self.port.promote(run_id=self.RUN,sources=sources).status)
+        self.assertEqual(before,self.request_count())
+
+        self.answer(a,"reply-a")
+        self.port.promote(run_id=self.RUN,sources=sources)
+        self.assertEqual({a,d,b},self.published_item_ids(),"B becomes askable once A is effective")
+        self.assertNotIn(c,self.published_item_ids(),"C must wait for B")
+
+        self.answer(b,"reply-b")
+        self.port.promote(run_id=self.RUN,sources=sources)
+        self.assertEqual({a,b,c,d},self.published_item_ids(),"C becomes askable once B is effective")
+
+        # Every item was asked exactly once across the whole chain.
+        asked=[value["decision_item_id"]
+               for path in (self.base/f"artifacts/runs/{self.RUN}/clarifications/requests").glob("request_*/record.json")
+               for value in json.loads(path.read_text())["items"]]
+        self.assertEqual(sorted(asked),sorted({a,b,c,d}),"an item must never be published twice")
+
+    def test_cancelled_predecessor_never_promotes_its_dependent(self):
+        sources=self.chain_sources()
+        a,b=self.item_id(1,"choice_a"),self.item_id(2,"choice_b")
+        self.port.promote(run_id=self.RUN,sources=sources)
+        root=self.base/f"artifacts/runs/{self.RUN}/clarifications/requests"
+        request=next(json.loads(path.read_text()) for path in root.glob("request_*/record.json")
+                     if any(v["decision_item_id"]==a for v in json.loads(path.read_text())["items"]))
+        self.port.ingest(run_id=self.RUN,request_id=request["request_id"],decision_item_id=None,
+            submission=ResponseSubmission("cancel-a","alice","human","desk","2026-09-01T08:00:00Z",None,None,True,"normal"))
+        self.port.promote(run_id=self.RUN,sources=sources)
+        self.assertNotIn(b,self.published_item_ids(),
+                         "abandonment is irreversible, so a dependent of a cancelled item stays unasked")
+
+    def test_promotion_reaches_dependents_through_the_shipped_harness_seams(self):
+        from scripts.e2e_harness import E2EHarness
+        from scripts.orca_runtime_harness import OrcaRuntimeHarness
+        from scripts import run_logging
+        sources=self.chain_sources()
+        declarations={source.source_ledger_key:source.request_input for source in sources}
+        records=[{"run":self.RUN,"phase":"implementation","iteration":1,"role":"worker","boundary":"B2",
+                  "sequence":index,"state":"NEEDS_INPUT","reason_code":"user_choice_required",
+                  "open_decision_item":True,"open_item":label,"verifies":None}
+                 for index,label in ((1,"choice_a"),(2,"choice_b"),(3,"choice_c"),(4,"choice_d"))]
+        a,b=self.item_id(1,"choice_a"),self.item_id(2,"choice_b")
+        for cls,base_attr in ((E2EHarness,"workspace"),(OrcaRuntimeHarness,"artifact_dir")):
+            with self.subTest(harness=cls.__name__), tempfile.TemporaryDirectory() as td:
+                port=ArtifactHumanApprovalPort(Path(td))
+                harness=object.__new__(cls); harness.run_id=self.RUN; setattr(harness,base_attr,Path(td))
+                harness.human_approval_port=port; harness.clarification_inputs=declarations
+                harness.clarification_errors=[]; harness.phase="implementation"
+                if cls is OrcaRuntimeHarness: harness._safe_log=lambda func,*a,**k: func(*a,**k)
+                with patch("scripts.run_logging.read_decision_ledger",return_value=records):
+                    harness._publish_clarifications_for_terminal_block()
+                    published=lambda: {v["decision_item_id"]
+                                       for p in (Path(td)/f"artifacts/runs/{self.RUN}/clarifications/requests").glob("request_*/record.json")
+                                       for v in json.loads(p.read_text())["items"]}
+                    self.assertNotIn(b,published(),"the dependent must not be asked before its predecessor")
+                    request=next(json.loads(p.read_text())
+                                 for p in (Path(td)/f"artifacts/runs/{self.RUN}/clarifications/requests").glob("request_*/record.json")
+                                 if any(v["decision_item_id"]==a for v in json.loads(p.read_text())["items"]))
+                    port.ingest(run_id=self.RUN,request_id=request["request_id"],decision_item_id=a,
+                        submission=ResponseSubmission("seam","alice","human","desk","2026-09-01T08:00:00Z","staging",None,False,"normal"))
+                    # A later terminal boundary must ask the newly unlocked question.
+                    harness._publish_clarifications_for_terminal_block()
+                    self.assertIn(b,published(),"the seam must promote the dependent after the answer lands")
+                self.assertEqual([],harness.clarification_errors)
+
+
+class CliSourceLedgerKeysAuthenticationTests(unittest.TestCase):
+    """M-002: every member of source_ledger_keys is authority-bearing, so the CLI
+    must authenticate the whole derived set, not just the primary key."""
+
+    RUN = "run_keys"
+    PRIMARY = "run_keys/implementation/1/B2#1"
+    REVIEWER = "run_keys/implementation/1/B3#2"
+
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory(); self.base=Path(self.tmp.name)
+
+    def tearDown(self): self.tmp.cleanup()
+
+    def ledger(self, *, reviewer=True, verifies=None, extra=()):
+        worker={"run":self.RUN,"phase":"implementation","iteration":1,"role":"worker","boundary":"B2",
+                "sequence":1,"state":"NEEDS_INPUT","reason_code":"user_choice_required",
+                "open_decision_item":True,"open_item":"deployment_target","verifies":None}
+        records=[worker]
+        if reviewer:
+            records.append({**worker,"role":"reviewer","boundary":"B3","sequence":2,
+                            "verifies":{"worker_record_key":self.PRIMARY} if verifies is None else verifies})
+        records.extend(extra)
+        return records
+
+    def run_create(self, keys, records):
+        from scripts import clarification_protocol
+        value=item(); value["source_ledger_key"]=self.PRIMARY; value["source_ledger_keys"]=list(keys)
+        value["phase"]="implementation"; value["iteration"]=1
+        source=self.base/"request.json"; source.write_text(json.dumps(create_input([value])))
+        argv=["create","--artifact-base",str(self.base),"--run-id",self.RUN,
+              "--ledger-key",self.PRIMARY,"--input",str(source)]
+        with patch.object(clarification_protocol,"read_decision_ledger",return_value=records):
+            return clarification_protocol.main(argv)
+
+    def assertRejected(self, keys, records, message):
+        self.assertEqual(2,self.run_create(keys,records),message)
+        self.assertFalse((self.base/f"artifacts/runs/{self.RUN}/clarifications").exists(),
+                         "a rejected create must publish nothing")
+
+    def test_valid_b2_plus_bound_b3_fold_is_accepted(self):
+        self.assertEqual(0,self.run_create([self.PRIMARY,self.REVIEWER],self.ledger()))
+        record=next((self.base/f"artifacts/runs/{self.RUN}/clarifications/requests").glob("request_*/record.json"))
+        self.assertEqual([self.PRIMARY,self.REVIEWER],json.loads(record.read_text())["items"][0]["source_ledger_keys"])
+
+    def test_fabricated_b3_key_absent_from_the_ledger_is_rejected(self):
+        self.assertRejected([self.PRIMARY,"run_keys/implementation/1/B3#99"],self.ledger(reviewer=False),
+                            "a key that exists in no ledger record must not ride along on a genuine primary")
+
+    def test_unrelated_b3_key_bound_to_another_worker_is_rejected(self):
+        other={"run":self.RUN,"phase":"implementation","iteration":1,"role":"reviewer","boundary":"B3",
+               "sequence":3,"state":"NEEDS_INPUT","reason_code":"user_choice_required",
+               "open_decision_item":True,"open_item":"deployment_target",
+               "verifies":{"worker_record_key":"run_keys/implementation/1/B2#7"}}
+        self.assertRejected([self.PRIMARY,"run_keys/implementation/1/B3#3"],
+                            self.ledger(reviewer=False,extra=[other]),
+                            "a real B3 bound to a different producer is not this request's provenance")
+
+    def test_invalid_verifies_worker_record_key_is_rejected(self):
+        self.assertRejected([self.PRIMARY,self.REVIEWER],
+                            self.ledger(verifies={"worker_record_key":"run_keys/implementation/1/B2#42"}),
+                            "a B3 whose binding does not resolve to the producer must not be folded")
+
+    def test_cross_item_key_injection_is_rejected(self):
+        other={"run":self.RUN,"phase":"implementation","iteration":1,"role":"worker","boundary":"B2",
+               "sequence":5,"state":"NEEDS_INPUT","reason_code":"user_choice_required",
+               "open_decision_item":True,"open_item":"other_choice","verifies":None}
+        self.assertRejected([self.PRIMARY,"run_keys/implementation/1/B2#5"],
+                            self.ledger(reviewer=False,extra=[other]),
+                            "another item's producer key must not be injected into this item's set")
+
+    def test_reviewer_primary_without_folding_is_rejected(self):
+        from scripts import clarification_protocol
+        value=item(); value["source_ledger_key"]=self.REVIEWER; value["source_ledger_keys"]=[self.REVIEWER]
+        source=self.base/"request.json"; source.write_text(json.dumps(create_input([value])))
+        argv=["create","--artifact-base",str(self.base),"--run-id",self.RUN,
+              "--ledger-key",self.REVIEWER,"--input",str(source)]
+        with patch.object(clarification_protocol,"read_decision_ledger",return_value=self.ledger()):
+            self.assertEqual(2,clarification_protocol.main(argv),
+                             "a bound B3 folds onto its B2, so it may not stand as the primary source")
+
+    def test_omitting_a_real_bound_reviewer_understates_provenance_and_is_rejected(self):
+        self.assertRejected([self.PRIMARY],self.ledger(),
+                            "the set is derived, so dropping a genuinely bound B3 is also a mismatch")

@@ -2758,8 +2758,10 @@ class OrcaRuntimeHarness:
                 run_id=self.run_id, records=records, coordinator_input=self.clarification_inputs,
                 ledger_key=decision_gate.ledger_key, valid_reviewer_binding=valid)
             if sources:
-                for batch in clarification_protocol.publication_batches(self.run_id, sources):
-                    self.human_approval_port.publish(run_id=self.run_id, sources=batch)
+                # See the e2e seam: promote() is the initial publication AND the
+                # later dependency-ready promotion, so a dependent question is
+                # actually asked once its predecessor carries an effective decision.
+                self.human_approval_port.promote(run_id=self.run_id, sources=sources)
         except Exception as exc:  # publication cannot mutate status or dispatch
             keys = sorted(source.source_ledger_key for source in locals().get("sources", ()))
             error = json.dumps({"exception":type(exc).__name__,"message":str(exc),"ledger_keys":keys},
