@@ -535,34 +535,65 @@ class ArtifactHumanApprovalPort:
     BLOCKED_SOURCES_SCHEMA = "orca.clarification.blocked_sources"
     BLOCKED_SOURCES_SCHEMA_VERSION = 2
 
-    def _blocked_sources_path(self, run_id: str) -> Path:
-        return _clarification_root(self.artifact_base, run_id) / "blocked_sources" / "record.json"
+    @staticmethod
+    def _blocked_sources_payload(run_id: str, sources: Sequence[ClarificationSource]) -> dict:
+        return {"schema": ArtifactHumanApprovalPort.BLOCKED_SOURCES_SCHEMA,
+                "schema_version": ArtifactHumanApprovalPort.BLOCKED_SOURCES_SCHEMA_VERSION,
+                "run_id": run_id,
+                "sources": [{"open_item": source.open_item,
+                             "source_ledger_key": source.source_ledger_key,
+                             "source_ledger_keys": list(source.source_ledger_keys),
+                             "state": source.state, "reason_code": source.reason_code,
+                             "phase": source.phase, "iteration": source.iteration,
+                             "request_input": source.request_input}
+                            for source in sorted(sources, key=lambda value: value.source_ledger_key)]}
 
     def persist_blocked_sources(self, run_id: str, sources: Sequence[ClarificationSource]) -> bool:
         """Publish the declared blocked source set write-once. Returns True if written.
 
-        Re-publishing an identical set is a no-op; a DIFFERENT set for the same run is
-        a conflict, because the declarations a request was derived from are immutable.
+        The directory NAME is the content address of the payload, exactly as requests,
+        responses and decisions are named.  That is what makes an in-place edit
+        evident: a rewritten record.json no longer re-derives its own directory.
+        Mode bits and a write-once API do not do that on their own.
         """
-        payload = {"schema": self.BLOCKED_SOURCES_SCHEMA,
-                   "schema_version": self.BLOCKED_SOURCES_SCHEMA_VERSION,
-                   "run_id": run_id,
-                   "sources": [{"open_item": source.open_item,
-                                "source_ledger_key": source.source_ledger_key,
-                                "source_ledger_keys": list(source.source_ledger_keys),
-                                "state": source.state, "reason_code": source.reason_code,
-                                "phase": source.phase, "iteration": source.iteration,
-                                "request_input": source.request_input}
-                               for source in sorted(sources, key=lambda value: value.source_ledger_key)]}
+        payload = self._blocked_sources_payload(run_id, sources)
+        sources_id = _identifier("sources", "os30-blocked-sources-v2", payload)
         root = _clarification_root(self.artifact_base, run_id)
         (root / ".staging").mkdir(parents=True, exist_ok=True, mode=0o700)
-        return _write_directory(root, Path("blocked_sources"), {"record.json": (_json_bytes(payload), 0o600)})
+        return _write_directory(root, Path("blocked_sources") / sources_id,
+                                {"record.json": (_json_bytes(payload), 0o600)})
 
-    def load_blocked_sources(self, run_id: str) -> tuple[ClarificationSource, ...]:
-        """Reload the persisted declarations, validating the closed envelope."""
-        path = self._blocked_sources_path(run_id)
-        if not path.exists():
+    def load_blocked_sources(self, run_id: str, *,
+                             ledger: Sequence[Mapping[str, object]] | None = None) -> tuple[ClarificationSource, ...]:
+        """Reload the persisted declarations and AUTHENTICATE them before use.
+
+        This payload is authority-bearing: promotion mints later clarification
+        requests from it, so envelope validation alone would let an edit to an
+        unpublished dependent's question, options, action or provenance be published
+        as a well-formed content-addressed request. Three independent bindings apply:
+
+        1. content address -- the record must re-derive its own directory name, so an
+           in-place edit is evident;
+        2. ledger revalidation -- every ledger-owned field must still match an open
+           OS-29 record, with the source key set re-derived rather than trusted;
+        3. published-item cross-check -- a declaration for an item already asked must
+           still produce that item exactly, so editing an asked question is evident
+           against the immutable request that carries it.
+
+        Content the ledger does not own, in a declaration never yet published, rests
+        on binding 1 alone. That is the declared structural-integrity bound: a writer
+        who rewrites the bytes AND renames the directory is outside it, as it is for
+        every other content-addressed record in this protocol.
+        """
+        root = _clarification_root(self.artifact_base, run_id)
+        directories = sorted((root / "blocked_sources").glob("sources_*")) if (root / "blocked_sources").exists() else []
+        if not directories:
             return ()
+        if len(directories) > 1:
+            raise ClarificationConflict("blocked_sources: more than one declaration set")
+        path = directories[0] / "record.json"
+        if not path.exists():
+            raise SchemaMalformed("blocked_sources: missing record")
         try:
             record = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
@@ -586,7 +617,47 @@ class ArtifactHumanApprovalPort:
                 source_ledger_keys=tuple(value["source_ledger_keys"]), state=value["state"],
                 reason_code=value["reason_code"], phase=value["phase"],
                 iteration=int(value["iteration"]), request_input=value["request_input"]))
-        return tuple(sources)
+        sources = tuple(sources)
+
+        # (1) The record must re-derive its own content address.
+        if _identifier("sources", "os30-blocked-sources-v2",
+                       self._blocked_sources_payload(run_id, sources)) != directories[0].name:
+            raise SchemaMalformed("blocked_sources: content address mismatch")
+
+        # (2) Every ledger-owned field must still be backed by an open OS-29 record,
+        #     with the key set DERIVED from the ledger rather than read from the file.
+        records = list(ledger) if ledger is not None else read_decision_ledger(run_id, base=self.artifact_base)
+        by_key = {canonical_ledger_key(value): value for value in records}
+        for source in sources:
+            backing = by_key.get(source.source_ledger_key)
+            if backing is None or backing.get("open_decision_item") is not True or \
+                    backing.get("state") not in SOURCE_STATES:
+                raise SourceNotOpen("blocked_sources: declaration is not backed by an open ledger record")
+            if (source.state, source.reason_code, source.phase, int(source.iteration), source.open_item) != (
+                    backing.get("state"), backing.get("reason_code"), backing.get("phase"),
+                    int(backing.get("iteration")), backing.get("open_item")):
+                raise SourceNotOpen("blocked_sources: declaration contradicts its ledger record")
+            if tuple(source.source_ledger_keys) != derive_source_ledger_keys(source.source_ledger_key, records):
+                raise SourceNotOpen("blocked_sources: source key set is not the authenticated set")
+
+        # (3) A declaration for an item already asked must still produce that exact
+        #     item, so an edit to a published question cannot survive.
+        known = self._known_items(run_id)
+        if known:
+            for source in sources:
+                merged = dict(source.request_input)
+                merged.update(open_item=source.open_item, source_ledger_key=source.source_ledger_key,
+                              source_ledger_keys=list(source.source_ledger_keys), source_state=source.state,
+                              source_reason_code=source.reason_code, phase=source.phase, iteration=source.iteration)
+                candidate = _validate_item(merged, run_id)
+                published = known.get(candidate["decision_item_id"])
+                if published is None:
+                    continue
+                comparable = {key: value for key, value in published.items() if key in candidate}
+                if any(candidate[key] != comparable.get(key) for key in candidate
+                       if key not in {"independent_with", "narrowing_rationale"}):
+                    raise SchemaMalformed("blocked_sources: declaration contradicts a published item")
+        return sources
 
     def promote_pending(self, run_id: str) -> PublishResult:
         """Promote from the PERSISTED declarations, with no live coordinator.

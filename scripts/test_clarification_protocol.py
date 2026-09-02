@@ -738,8 +738,32 @@ class DependentPromotionTests(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory(); self.base=Path(self.tmp.name)
         self.port=ArtifactHumanApprovalPort(self.base)
+        self.write_ledger()
 
     def tearDown(self): self.tmp.cleanup()
+
+    def ledger_records(self):
+        return [{"run":self.RUN,"phase":"implementation","iteration":1,"role":"worker","boundary":"B2",
+                 "sequence":index,"state":"NEEDS_INPUT","reason_code":"user_choice_required",
+                 "open_decision_item":True,"open_item":label,"verifies":None}
+                for index,label in ((1,"choice_a"),(2,"choice_b"),(3,"choice_c"),(4,"choice_d"))]
+
+    def write_ledger(self):
+        """A REAL on-disk OS-29 ledger: promotion revalidates against it, and the
+        CLI runs as a subprocess where patching would not apply.
+
+        Sequence 0 is the coordinator's run-entry declaration in a real ledger and is
+        never a clarification source, so the B2 producers land at 1..4 exactly as they
+        do in production.
+        """
+        from scripts import run_logging
+        run_logging.append_decision_ledger_record(self.RUN,
+            {"run":self.RUN,"phase":"implementation","iteration":1,"role":"coordinator",
+             "boundary":"B1","sequence":0,"state":"CLEAR","reason_code":None,
+             "open_decision_item":False,"open_item":None,"verifies":None},
+            base=self.base,ledger_schema_version=1)
+        for record in self.ledger_records():
+            run_logging.append_decision_ledger_record(self.RUN,dict(record),base=self.base,ledger_schema_version=1)
 
     def key(self, index): return f"{self.RUN}/implementation/1/B2#{index}"
 
@@ -891,27 +915,168 @@ class DependentPromotionTests(unittest.TestCase):
             "--run-id",self.RUN],text=True,capture_output=True)
         self.assertEqual("EXISTING",json.loads(again.stdout)["status"],"a second promote must publish nothing new")
 
-    def test_blocked_sources_are_persisted_immutably_and_validated_on_read(self):
-        from scripts.clarification_protocol import ClarificationConflict, SchemaMalformed, SchemaUnsupported
+    def blocked_sources_record(self):
+        root=self.base/f"artifacts/runs/{self.RUN}/clarifications/blocked_sources"
+        return next(root.glob("sources_*/record.json"))
+
+    def test_blocked_sources_are_content_addressed_and_authenticated_on_read(self):
+        from scripts.clarification_protocol import ClarificationConflict, SchemaMalformed, SchemaUnsupported, SourceNotOpen
         sources=self.chain_sources()
         self.port.promote(run_id=self.RUN,sources=sources)
-        path=self.base/f"artifacts/runs/{self.RUN}/clarifications/blocked_sources/record.json"
-        self.assertTrue(path.exists(),"promotion is unreachable later unless the declarations are on disk")
+        path=self.blocked_sources_record()
+        self.assertTrue(path.parent.name.startswith("sources_"),
+                        "the directory name must be the content address, not a fixed name")
         self.assertEqual(0o600,path.stat().st_mode & 0o777)
         self.assertEqual(4,len(self.port.load_blocked_sources(self.RUN)))
-        # Re-declaring the same set is a no-op; a different set is a conflict.
-        self.assertFalse(self.port.persist_blocked_sources(self.RUN,sources))
-        with self.assertRaises(ClarificationConflict):
-            self.port.persist_blocked_sources(self.RUN,sources[:2])
-        for mutate,expected in ((lambda r: r.__setitem__("schema_version",99),SchemaUnsupported),
-                                (lambda r: r.__setitem__("schema","orca.other"),SchemaMalformed),
-                                (lambda r: r.__setitem__("run_id","run_other"),SchemaMalformed),
-                                (lambda r: r.__setitem__("extra",1),SchemaMalformed),
-                                (lambda r: r["sources"][0].__setitem__("extra",1),SchemaMalformed)):
-            record=json.loads(path.read_text()); mutate(record)
+        self.assertFalse(self.port.persist_blocked_sources(self.RUN,sources),"identical redeclaration is a no-op")
+
+        original=path.read_text()
+        for name,mutate,expected in (
+                ("schema_version",lambda r: r.__setitem__("schema_version",99),SchemaUnsupported),
+                ("schema",lambda r: r.__setitem__("schema","orca.other"),SchemaMalformed),
+                ("run_id",lambda r: r.__setitem__("run_id","run_other"),SchemaMalformed),
+                ("extra_envelope_field",lambda r: r.__setitem__("extra",1),SchemaMalformed),
+                ("extra_source_field",lambda r: r["sources"][0].__setitem__("extra",1),SchemaMalformed)):
+            with self.subTest(mutation=name):
+                record=json.loads(original); mutate(record); path.write_text(json.dumps(record))
+                with self.assertRaises(expected): self.port.load_blocked_sources(self.RUN)
+        path.write_text(original)
+
+    def test_editing_a_persisted_declaration_fails_closed_and_publishes_no_dependent(self):
+        """M-003: the persisted declaration is authority-bearing. An edit to an
+        unpublished dependent's CONTENT -- its action, options, provenance or graph --
+        must be evident, or `respond` would mint a forged B as a valid request."""
+        from scripts.clarification_protocol import SchemaMalformed, SourceNotOpen
+        from scripts import clarification_protocol
+        module=Path(clarification_protocol.__file__)
+        a,b=self.item_id(1,"choice_a"),self.item_id(2,"choice_b")
+
+        def forge(mutate):
+            self.setUp()
+            self.port.promote(run_id=self.RUN,sources=self.chain_sources())
+            path=self.blocked_sources_record()
+            record=json.loads(path.read_text())
+            dependent=next(s for s in record["sources"] if s["open_item"]=="choice_b")
+            mutate(record,dependent)
             path.write_text(json.dumps(record))
-            with self.assertRaises(expected):
-                self.port.load_blocked_sources(self.RUN)
+            return path
+
+        semantic=(
+            ("forged_action",lambda r,s: s["request_input"]["options"][1].__setitem__("action","deploy to production AND delete backups")),
+            ("forged_option_id",lambda r,s: s["request_input"]["options"][0].__setitem__("option_id","staging_but_prod")),
+            ("forged_question",lambda r,s: s["request_input"].__setitem__("question","Approve deleting production data?")),
+            ("forged_recommendation",lambda r,s: s["request_input"].__setitem__("recommended_option_id","production")),
+            ("forged_dependency",lambda r,s: s["request_input"].__setitem__("depends_on",[])),
+            ("forged_provenance",lambda r,s: s.__setitem__("source_ledger_keys",[s["source_ledger_key"],
+                                                                                f"{self.RUN}/implementation/1/B3#9"])),
+            ("forged_state",lambda r,s: s.__setitem__("reason_code","irreversible_action")),
+        )
+        for name,mutate in semantic:
+            with self.subTest(mutation=name):
+                forge(mutate)
+                # The library path fails closed...
+                with self.assertRaises((SchemaMalformed,SourceNotOpen)):
+                    self.port.load_blocked_sources(self.RUN)
+                # ...and so does the shipped post-response boundary.
+                root=self.base/f"artifacts/runs/{self.RUN}/clarifications/requests"
+                request=next(json.loads(p.read_text()) for p in root.glob("request_*/record.json")
+                             if any(v["decision_item_id"]==a for v in json.loads(p.read_text())["items"]))
+                completed=subprocess.run([sys.executable,str(module),"respond","--artifact-base",str(self.base),
+                    "--run-id",self.RUN,"--request-id",request["request_id"],"--decision-item-id",a,
+                    "--submission-id","forged","--actor-id","alice","--actor-type","human",
+                    "--where-recorded","desk","--responded-at","2026-09-01T08:00:00Z","--option-id","staging"],
+                    text=True,capture_output=True)
+                self.assertEqual(0,completed.returncode,completed.stderr)
+                payload=json.loads(completed.stdout)
+                self.assertEqual("DECIDED",payload["status"],"the human's answer stays durable")
+                self.assertEqual("ERROR",payload["promoted"]["status"],
+                                 f"{name}: promotion must fail closed rather than publish a forged dependent")
+                self.assertNotIn(b,self.published_item_ids(),f"{name}: no forged B may be published")
+                # The explicit recovery command must refuse too.
+                explicit=subprocess.run([sys.executable,str(module),"promote","--artifact-base",str(self.base),
+                    "--run-id",self.RUN],text=True,capture_output=True)
+                self.assertEqual(2,explicit.returncode,f"{name}: explicit promote must also refuse")
+                self.assertNotIn(b,self.published_item_ids())
+
+    def readdress(self, mutate):
+        """Forge the record AND rename the directory to the recomputed address.
+
+        A writer who only edits bytes is caught by the content address. The adversary
+        that matters for the other bindings recomputes it, so these tests make the
+        ledger revalidation and published-item cross-check the SOLE detector.
+        """
+        from scripts.clarification_protocol import ArtifactHumanApprovalPort as P, _identifier
+        path=self.blocked_sources_record()
+        record=json.loads(path.read_text())
+        mutate(record)
+        # The writer sorts by source_ledger_key, so a faithful re-address must too.
+        payload={"schema":record["schema"],"schema_version":record["schema_version"],
+                 "run_id":record["run_id"],
+                 "sources":sorted(record["sources"],key=lambda s: s["source_ledger_key"])}
+        new_id=_identifier("sources","os30-blocked-sources-v2",payload)
+        target=path.parent.parent/new_id
+        target.mkdir(parents=True,exist_ok=True)
+        (target/"record.json").write_text(json.dumps(payload))
+        for old in path.parent.parent.iterdir():
+            if old.name!=new_id:
+                (old/"record.json").unlink(missing_ok=True); old.rmdir()
+        return target
+
+    def test_readdressed_forgery_is_still_caught_by_ledger_revalidation(self):
+        """Bindings 2, 3 and 6 as the SOLE detector: the content address is valid."""
+        from scripts.clarification_protocol import SourceNotOpen
+        cases=(
+            ("provenance_key_set",lambda s: s.__setitem__("source_ledger_keys",
+                [s["source_ledger_key"],f"{self.RUN}/implementation/1/B3#9"])),
+            ("reason_code",lambda s: s.__setitem__("reason_code","irreversible_action")),
+            ("state",lambda s: s.__setitem__("state","CONFLICT")),
+            ("phase",lambda s: s.__setitem__("phase","design")),
+            ("iteration",lambda s: s.__setitem__("iteration",9)),
+            ("open_item",lambda s: s.__setitem__("open_item","choice_forged")),
+            ("unbacked_key",lambda s: s.__setitem__("source_ledger_key",f"{self.RUN}/implementation/1/B2#99")),
+        )
+        for name,mutate in cases:
+            with self.subTest(mutation=name):
+                self.setUp()
+                self.port.promote(run_id=self.RUN,sources=self.chain_sources())
+                target=self.readdress(lambda r: mutate(next(s for s in r["sources"] if s["open_item"]=="choice_b")
+                                                       if name!="open_item" else
+                                                       next(s for s in r["sources"] if s["open_item"]=="choice_b")))
+                self.assertTrue((target/"record.json").exists())
+                with self.assertRaises(SourceNotOpen,msg=f"{name} must be caught by ledger revalidation"):
+                    self.port.load_blocked_sources(self.RUN)
+                self.assertNotIn(self.item_id(2,"choice_b"),self.published_item_ids())
+
+    def test_readdressed_edit_to_a_published_item_is_caught_by_the_request_crosscheck(self):
+        """Binding 4 as the SOLE detector: address valid, ledger fields untouched."""
+        from scripts.clarification_protocol import SchemaMalformed
+        self.port.promote(run_id=self.RUN,sources=self.chain_sources())
+        self.readdress(lambda r: next(s for s in r["sources"] if s["open_item"]=="choice_a"
+                                      )["request_input"]["options"][1].__setitem__(
+                                          "action","deploy to production AND delete backups"))
+        with self.assertRaises(SchemaMalformed):
+            self.port.load_blocked_sources(self.RUN)
+
+    def test_editing_an_already_published_declaration_is_evident(self):
+        """Binding 3: an item already asked is carried by an immutable request, so a
+        later edit to its declaration must not be silently accepted."""
+        from scripts.clarification_protocol import SchemaMalformed
+        self.port.promote(run_id=self.RUN,sources=self.chain_sources())
+        path=self.blocked_sources_record()
+        record=json.loads(path.read_text())
+        published=next(s for s in record["sources"] if s["open_item"]=="choice_a")
+        published["request_input"]["options"][1]["action"]="deploy to production AND delete backups"
+        path.write_text(json.dumps(record))
+        with self.assertRaises(SchemaMalformed):
+            self.port.load_blocked_sources(self.RUN)
+
+    def test_a_second_declaration_set_is_refused(self):
+        from scripts.clarification_protocol import ClarificationConflict
+        sources=self.chain_sources()
+        self.port.promote(run_id=self.RUN,sources=sources)
+        self.port.persist_blocked_sources(self.RUN,sources[:2])  # a different, competing set
+        with self.assertRaises(ClarificationConflict):
+            self.port.load_blocked_sources(self.RUN)
 
 
 class CliSourceLedgerKeysAuthenticationTests(unittest.TestCase):

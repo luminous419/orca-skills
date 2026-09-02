@@ -2371,7 +2371,10 @@ python tools/clarification_protocol.py create --artifact-base PATH --run-id RUN 
 python tools/clarification_protocol.py respond --artifact-base PATH --run-id RUN --request-id ID --decision-item-id ITEM --submission-id TOKEN --actor-id ID --actor-type human --where-recorded LOCATION (--option-id ID | --response-file PATH)
 python tools/clarification_protocol.py respond --artifact-base PATH --run-id RUN --request-id ID --submission-id TOKEN --actor-id ID --actor-type human --where-recorded LOCATION --cancel
 python tools/clarification_protocol.py show --artifact-base PATH --run-id RUN --request-id ID --json
+python tools/clarification_protocol.py promote --artifact-base PATH --run-id RUN
 ```
+
+`respond` promotes automatically: answering an item publishes the next dependency-ready bundle unlocked by that answer and reports it under `promoted`. The explicit `promote` command is the idempotent recovery entry point for the same operation — it needs no live coordinator, publishes nothing when nothing is newly ready, and fails closed if the persisted blocked-source declaration no longer authenticates.
 
 Bundles contain at most three explicitly independent, dependency-ready items. New requests and responses use schema generation v2; historical homogeneous v1 single-item artifacts remain immutable and are never migrated or rewritten. Ambiguous answers preserve the response and create at most two immutable re-clarification revisions; changes supersede through append-only lineage and cancellation is explicit. Sensitive free text must use `--response-file`: its exact bytes have one authoritative `0600` copy, while JSON, CLI output, logs, lineage summaries, and decisions contain only safe metadata, digests, or a redacted bounded value.
 
