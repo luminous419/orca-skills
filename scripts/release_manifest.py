@@ -27,12 +27,16 @@ ROOT_FILES = (
     "INSTALL.md",
     "VERSION",
     "CHANGELOG.md",
+    "requirements-langgraph.txt",
 )
 REQUIRED_DOCS = (
     "docs/ROADMAP.md",
     "docs/COMPATIBILITY.md",
     "docs/RELEASING.md",
     "docs/LICENSE-DECISION.md",
+    "docs/DETERMINISTIC_WORKFLOW.md",
+    "docs/LANGGRAPH_DEPENDENCIES.md",
+    "docs/examples/DETERMINISTIC_WORKFLOW_TRACE.md",
     "docs/examples/FULL_WORKFLOW_FAIL_CORRECTION.md",
     "docs/examples/FULL_WORKFLOW_FAIL_CORRECTION.ko.md",
     "docs/validation/GLM_GEMMA_SMOKE_PROCEDURE.md",
@@ -85,6 +89,12 @@ def required_skill_paths(skill_name: str) -> set[str]:
         # distributable definition. The loop skill has no such tool.
         paths.add(f"{skill_name}/tools/run_logging.py")
         paths.add(f"{skill_name}/tools/clarification_protocol.py")
+        paths.add(f"{skill_name}/tools/run_workflow.py")
+        engine = REPO_ROOT / skill_name / "tools" / "deterministic_workflow"
+        paths.update(
+            f"{skill_name}/tools/deterministic_workflow/{path.relative_to(engine).as_posix()}"
+            for path in engine.rglob("*.py")
+        )
     return paths
 
 

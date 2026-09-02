@@ -1,0 +1,22 @@
+{
+  "assumption": null,
+  "boundary": "B3",
+  "evidence": {},
+  "grounds": "이 경계의 모든 판정이 검증 가능한 증거로 결정되었다. blocking finding F-001 은 Reviewer 가 직접 재현한 uncaught IndexError 이며 max_iterations 2~5 와 downstream revalidation 경로에서 결정론적으로 재현되고 OS-40 AC 3/AC 8 문언에 직접 대응한다. CF-7 의 mandatory unit-test gate 와 CF-6 이월 4건의 non-blocking 판정도 OS-40 AC/Scope/Out of Scope 문언과 git 사실관계, 그리고 Reviewer 가 직접 주입한 48건 mutation 결과로 결정되었고 모델 재량이나 사용자 권한을 필요로 하지 않았다. run-scoped decision ledger 30개 boundary 는 전부 CLEAR 이며 미해결 NEEDS_INPUT/CONFLICT 가 없다.",
+  "iteration": 2,
+  "ledger_schema_version": 1,
+  "open_decision_item": false,
+  "open_item": null,
+  "phase": "FINAL_REVIEW",
+  "reason_code": null,
+  "recorded_at": "2026-09-02T19:23:38.254283+00:00",
+  "responsible_phase": "FINAL_REVIEW",
+  "role": "reviewer",
+  "run": "run_0bcf4e7296c9",
+  "scope": "This phase's own conduct at this iteration.",
+  "sequence": 30,
+  "source": "reviewer",
+  "source_binding": "artifacts/runs/run_0bcf4e7296c9/",
+  "state": "CLEAR",
+  "verdict": "FAIL"
+}

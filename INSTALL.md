@@ -237,6 +237,19 @@ reviews/
 section 5).
 ### OS-30 clarification tool
 
+### OS-40 deterministic workflow engine
+
+The engine runtime is optional for legacy validation and required to execute the graph:
+
+```bash
+python3 -m pip install -r requirements-langgraph.txt
+python3 orca-worker-reviewer-orchestration/tools/run_workflow.py
+```
+
+Offline installations must obtain these pinned wheels through the organization's approved
+transfer/cache process. The command fails explicitly when LangGraph is absent or not version
+0.2.76; it does not use the prompt loop as a fallback.
+
 New clarification requests and responses use schema generation v2; homogeneous historical v1 single-item artifacts remain immutable and are never migrated or rewritten.
 
 Installing `orca-worker-reviewer-orchestration` with the documented directory copy also installs `tools/clarification_protocol.py` and its adjacent `run_logging.py` dependency. Run `python ~/.claude/skills/orca-worker-reviewer-orchestration/tools/clarification_protocol.py --help` to verify the self-contained CLI. The loop Skill intentionally has no artifact CLI.

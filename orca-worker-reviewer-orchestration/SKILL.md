@@ -151,6 +151,15 @@ DEFAULT_RISK = high
 
 ## Machine-Readable Policy Contract
 
+The deterministic engine owns phase transitions, retries, iteration budgets, downstream
+revalidation, and terminal routing. Coordinators execute the action selected by the graph and do
+not independently choose a next phase or retry. The following block is validated against the
+runtime-neutral graph specification.
+
+```workflow-graph-contract
+{"workflow_id":"os40.standard.v1","schema_version":"os40.workflow.v1","phases":["ANALYSIS","PLAN","DESIGN","IMPLEMENTATION","TEST"],"route_tokens":["BLOCK","ESCALATE","PREPARE_WORKER","PREPARE_PHASE_REVIEWER","ADVANCE_PHASE","PREPARE_FINAL_REVIEWER","PREPARE_CORRECTION","PREPARE_REVALIDATION","COMPLETE"],"terminal_statuses":["COMPLETED","BLOCKED","ESCALATED"],"iteration_domains":["PHASE_ITERATIONS","FINAL_REVIEW_ITERATIONS"],"decision_first":true,"final_review_mandatory":true,"downstream_revalidation":"high_only","launcher":"tools/run_workflow.py"}
+```
+
 다음 JSON block은 deterministic policy smoke test의 source of truth다.
 사람이 읽는 위/아래의 정책 설명과 의미가 일치해야 하며 두 Skill에서 동일하게 유지한다.
 자유 형식 자연어의 전체 의미 해석은 여전히 Coordinator/LLM의 책임이고,

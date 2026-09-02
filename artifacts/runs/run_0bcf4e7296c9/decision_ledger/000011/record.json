@@ -1,0 +1,22 @@
+{
+  "assumption": null,
+  "boundary": "B2",
+  "evidence": {},
+  "grounds": "The approved design and explicit carried-forward corrections determined all implementation choices; no user-authority decision remains open at this boundary.",
+  "iteration": 1,
+  "ledger_schema_version": 1,
+  "open_decision_item": false,
+  "open_item": null,
+  "phase": "IMPLEMENTATION",
+  "reason_code": null,
+  "recorded_at": "2026-09-02T15:40:59.212421+00:00",
+  "responsible_phase": "IMPLEMENTATION",
+  "role": "worker",
+  "run": "run_0bcf4e7296c9",
+  "scope": "This phase's own conduct at this iteration.",
+  "sequence": 11,
+  "source": "worker",
+  "source_binding": "artifacts/runs/run_0bcf4e7296c9/",
+  "state": "CLEAR",
+  "verdict": ""
+}

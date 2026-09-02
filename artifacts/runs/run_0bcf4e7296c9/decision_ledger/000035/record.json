@@ -1,0 +1,22 @@
+{
+  "assumption": null,
+  "boundary": "B3",
+  "evidence": {},
+  "grounds": "This review reached its verdict from directly reproduced evidence — full suite, targeted suite, dependency-absent lane, validators, mirror parity and a 20-mutation adversarial sweep — with no finding requiring user authority; the run's decision ledger holds 35 entries, all CLEAR, with no unresolved NEEDS_INPUT or CONFLICT.",
+  "iteration": 3,
+  "ledger_schema_version": 1,
+  "open_decision_item": false,
+  "open_item": null,
+  "phase": "FINAL_REVIEW",
+  "reason_code": null,
+  "recorded_at": "2026-09-02T23:55:50.487130+00:00",
+  "responsible_phase": "FINAL_REVIEW",
+  "role": "reviewer",
+  "run": "run_0bcf4e7296c9",
+  "scope": "This phase's own conduct at this iteration.",
+  "sequence": 35,
+  "source": "reviewer",
+  "source_binding": "artifacts/runs/run_0bcf4e7296c9/",
+  "state": "CLEAR",
+  "verdict": "PASS"
+}

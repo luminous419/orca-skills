@@ -750,6 +750,13 @@ required owner decision rather than inventing a grant.
 
 ## Execution-layer Difference
 
+## Deterministic workflow engine (OS-40)
+
+Install the optional pinned runtime with `requirements-langgraph.txt`, then use the
+runtime-neutral package in `scripts/deterministic_workflow`. It provides the LangGraph graph,
+pure routing, fake and Orca adapter boundaries, checkpoint/idempotency contracts, and normalized
+logical traces. See `docs/DETERMINISTIC_WORKFLOW.md` and `docs/LANGGRAPH_DEPENDENCIES.md`.
+
 The two skills intentionally share development policy but differ in execution mechanics:
 
 ```text

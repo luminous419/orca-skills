@@ -3000,6 +3000,34 @@ def validate_run_logging_tool_parity(validation: Validation) -> None:
     )
 
 
+def validate_deterministic_workflow_parity(validation: Validation) -> None:
+    canonical = REPO_ROOT / "scripts" / "deterministic_workflow"
+    installed = LIFECYCLE_SKILL_DIR / "tools" / "deterministic_workflow"
+    contract_validator = REPO_ROOT / "scripts" / "validate_workflow_graph_docs.py"
+    # Historical mutation fixtures intentionally contain only the policy surface
+    # under test.  OS-40 validation becomes applicable when either engine copy or
+    # its validator is present; older partial fixtures must remain valid inputs.
+    if not (canonical.exists() or contract_validator.exists()):
+        return
+    canonical_files = {path.relative_to(canonical) for path in canonical.rglob("*.py")}
+    installed_files = {path.relative_to(installed) for path in installed.rglob("*.py")} if installed.is_dir() else set()
+    validation.check(canonical_files == installed_files,
+                     "deterministic workflow source/installed file sets differ")
+    for relative in sorted(canonical_files & installed_files):
+        validation.check((canonical / relative).read_bytes() == (installed / relative).read_bytes(),
+                         f"deterministic workflow installed copy differs: {relative}")
+    try:
+        from validate_workflow_graph_docs import (
+            validate as validate_workflow_graph_document,
+        )
+
+        validate_workflow_graph_document()
+    except (ImportError, OSError, ValueError) as exc:
+        validation.check(False, f"workflow graph documentation contract: {exc}")
+    else:
+        validation.check(True, "workflow graph documentation contract")
+
+
 def validate_workflow_output_contracts(validation: Validation) -> None:
     contracts = []
     for skill_dir in SKILL_DIRS:
@@ -3081,6 +3109,7 @@ def main() -> int:
     validate_phase_gate_neutrality(validation)
     validate_run_logging_contract(validation)
     validate_run_logging_tool_parity(validation)
+    validate_deterministic_workflow_parity(validation)
     validate_os30_contract(validation)
     validate_version(validation)
     validate_repository_links(validation)
