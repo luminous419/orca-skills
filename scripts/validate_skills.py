@@ -106,6 +106,20 @@ SEMVER_PATTERN = re.compile(
 
 LIFECYCLE_SKILL_DIR = REPO_ROOT / "orca-worker-reviewer-orchestration"
 
+# OS-30 shared semantic anchors are deliberately value-pinned.  Both Skills
+# promise the same authority boundary even though only orchestration ships the
+# artifact tool; equality alone would allow simultaneous semantic drift.
+OS30_SHARED_ANCHORS = (
+    "OS30_SCHEMA_GENERATIONS = new_request_response_v2; immutable_historical_v1",
+    "OS30_AUTHORITY = explicit_response_plus_validated_append_only_lineage",
+    "OS30_NO_IMPLICIT_APPROVAL = recommendation_timeout_eof_are_not_decisions",
+    "OS30_RESUME_BOUNDARY = response_does_not_resume_run",
+)
+OS30_ORCHESTRATION_EXECUTABLE_ANCHOR = "OS30_EXECUTABLE_ARTIFACT_STORE = orchestration_only"
+OS30_LOOP_BOUNDARY_ANCHOR = "OS30_EXECUTABLE_ARTIFACT_STORE = unavailable_in_direct_loop"
+OS30_SCHEMA_DOC_TEXT = "New clarification requests and responses use schema generation v2; homogeneous historical v1 single-item artifacts remain immutable and are never migrated or rewritten."
+OS30_SCHEMA_DOCS = ("README.md","INSTALL.md","CHANGELOG.md","docs/ROADMAP.md","docs/COMPATIBILITY.md")
+
 # Re-exported so anchor_contract_block_lines() can measure the same block
 # load_risk_contract() parses -- one pattern, not two.
 from skill_policy import RISK_CONTRACT_BLOCK_PATTERN  # noqa: E402
@@ -3009,6 +3023,26 @@ def validate_workflow_output_contracts(validation: Validation) -> None:
         )
 
 
+def validate_os30_contract(validation: Validation) -> None:
+    texts={skill_dir.name:(skill_dir/"SKILL.md").read_text(encoding="utf-8") for skill_dir in SKILL_DIRS}
+    for skill_name,text in texts.items():
+        for anchor in OS30_SHARED_ANCHORS:
+            validation.check(text.count(anchor)==1,f"{skill_name}: OS-30 shared semantic anchor missing or duplicated: {anchor}")
+    orchestration=texts[LIFECYCLE_SKILL_DIR.name]
+    loop=texts["orca-worker-reviewer-loop"]
+    validation.check(orchestration.count(OS30_ORCHESTRATION_EXECUTABLE_ANCHOR)==1,
+                     "orca-worker-reviewer-orchestration: OS-30 executable anchor missing or duplicated")
+    validation.check(OS30_LOOP_BOUNDARY_ANCHOR not in orchestration,
+                     "orca-worker-reviewer-orchestration: false direct-loop OS-30 boundary")
+    validation.check(loop.count(OS30_LOOP_BOUNDARY_ANCHOR)==1,
+                     "orca-worker-reviewer-loop: OS-30 non-executable boundary missing or duplicated")
+    validation.check(OS30_ORCHESTRATION_EXECUTABLE_ANCHOR not in loop,
+                     "orca-worker-reviewer-loop: must not claim OS-30 executable artifact parity")
+    for relative in OS30_SCHEMA_DOCS:
+        validation.check(OS30_SCHEMA_DOC_TEXT in (REPO_ROOT/relative).read_text(encoding="utf-8"),
+                         f"{relative}: OS-30 v2/historical-v1 schema statement missing")
+
+
 def main() -> int:
     validation = Validation()
 
@@ -3047,6 +3081,7 @@ def main() -> int:
     validate_phase_gate_neutrality(validation)
     validate_run_logging_contract(validation)
     validate_run_logging_tool_parity(validation)
+    validate_os30_contract(validation)
     validate_version(validation)
     validate_repository_links(validation)
     validate_no_user_absolute_paths(validation)

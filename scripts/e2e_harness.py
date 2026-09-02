@@ -14,7 +14,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from scripts import decision_gate, decision_policy, run_logging
+from scripts import clarification_protocol, decision_gate, decision_policy, run_logging
 from scripts.quality_profile import resolve_quality_profile
 from scripts.skill_policy import load_risk_contract
 from scripts.agent_profile import (
@@ -653,6 +653,8 @@ class E2EHarness:
         run_id: str = "run_e2e",
         risk: str | None = None,
         agent_profile: str | None = None,
+        human_approval_port: clarification_protocol.HumanApprovalPort | None = None,
+        clarification_inputs: dict[str, dict[str, object]] | None = None,
     ) -> None:
         self.contract = load_workflow_output_contract(skill_path)
         # OS-3. Resolved ONCE, from the skill this harness was constructed for,
@@ -672,6 +674,9 @@ class E2EHarness:
         # its phase loop starts; a bare .run() call (no run_workflow) keeps this
         # default, which is why it is a real, non-empty run id rather than "".
         self.run_id = run_id
+        self.human_approval_port = human_approval_port or clarification_protocol.ArtifactHumanApprovalPort(workspace)
+        self.clarification_inputs = clarification_inputs or {}
+        self.clarification_errors: list[str] = []
         # Resolved once, from this instance's own workspace rather than the real
         # repository, for the same reason the artifact root is: a deterministic
         # scenario must not change its dispatched Task specs because the checkout it
@@ -1882,6 +1887,41 @@ class E2EHarness:
         )
         return result, accepted, None
 
+    def _publish_clarifications_for_terminal_block(self) -> None:
+        # One binding rule for the whole system: the OS-29 predicate, restated in
+        # clarification_protocol so a forged inner `verifies` cannot be folded here
+        # either. A local copy of this check is how the weaker variant survived.
+        valid = clarification_protocol.canonical_reviewer_binding
+        try:
+            records = run_logging.read_decision_ledger(self.run_id, base=self.workspace)
+            sources = clarification_protocol.terminal_block_sources(
+                run_id=self.run_id, records=records, coordinator_input=self.clarification_inputs,
+                ledger_key=decision_gate.ledger_key, valid_reviewer_binding=valid)
+            if sources:
+                # promote() covers the initial publication too: with nothing resolved
+                # and nothing published it selects exactly the ready roots, and on a
+                # later terminal boundary it selects the antichain unlocked by the
+                # answers that have landed since. Calling publication_batches()
+                # directly here would ask the roots once and never ask a dependent.
+                self.human_approval_port.promote(run_id=self.run_id, sources=sources)
+        except Exception as exc:  # artifact failure never changes terminal BLOCKED
+            keys = sorted(source.source_ledger_key for source in locals().get("sources", ()))
+            error = json.dumps({"exception":type(exc).__name__,"message":str(exc),"ledger_keys":keys},
+                               sort_keys=True,separators=(",",":"))
+            self.clarification_errors.append(error)
+            # The publication failure is already represented by the decision ledger
+            # and retained in-memory above.  The best additional durable evidence is
+            # this OS-30 row, but failure to write that evidence must not unwind the
+            # terminal BLOCKED result it describes.
+            try:
+                run_logging.log_orchestrator_event(
+                    self.run_id, base=self.workspace,
+                    event=run_logging.EVENT_CLARIFICATION_PUBLICATION_FAILED,
+                    phase=self.phase, result="BLOCKED", detail=error,
+                )
+            except Exception:  # noqa: BLE001 -- logging cannot mutate terminal state
+                return
+
     def run_workflow(self, scenario: WorkflowScenario) -> WorkflowRunResult:
         phase_iterations: dict[str, int] = {p: 0 for p in scenario.phases}
         correction_dispatches: list[tuple[str, int]] = []
@@ -1900,7 +1940,7 @@ class E2EHarness:
             decision_state: str = "",
             decision_reason_code: str = "",
         ) -> WorkflowRunResult:
-            return WorkflowRunResult(
+            result = WorkflowRunResult(
                 phases=scenario.phases,
                 phase_iterations=dict(phase_iterations),
                 final_review_iterations=final_review_iterations,
@@ -1920,6 +1960,11 @@ class E2EHarness:
                 decision_state=decision_state,
                 decision_reason_code=decision_reason_code,
             )
+            if final_status == self.contract.blocked_status:
+                self._publish_clarifications_for_terminal_block()
+            return result
+
+
 
         # The only write of session_policy in this run: every _phase_harness clone
         # copies it by value, so the phase gate, correction and revalidation rounds

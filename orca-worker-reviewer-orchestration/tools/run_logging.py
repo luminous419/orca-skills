@@ -55,6 +55,7 @@ TIMING_LOG_FILENAME = "TIMING_LOG.md"
 # lived process and keeps the same state in memory instead -- same class, same
 # transitions, only the storage differs.
 TIMING_STATE_FILENAME = ".timing_state.json"
+EVENT_CLARIFICATION_PUBLICATION_FAILED = "clarification_publication_failed"
 
 # The columns are the whole schema. Both tables are append-only and every row
 # fills every column (blank string where a field does not apply to that
@@ -442,6 +443,27 @@ def log_orchestrator_event(
         },
     )
     return path
+
+
+def read_clarification_publication_errors(
+    run_id: str, *, base: Path | None = None
+) -> tuple[dict[str, str], ...]:
+    """Read durable, fail-closed OS-30 publication errors from the run log."""
+    path = orchestrator_log_path(run_id, base=base)
+    if not path.exists():
+        return ()
+    rows = []
+    for line in path.read_text(encoding="utf-8").splitlines()[2:]:
+        if not line.startswith("|"):
+            continue
+        cells = re.split(r"(?<!\\)\|", line)[1:-1]
+        cells = [cell.strip().replace(r"\|", "|").replace(r"\\", "\\") for cell in cells]
+        if len(cells) != len(ORCHESTRATOR_LOG_COLUMNS):
+            continue
+        row = dict(zip(ORCHESTRATOR_LOG_COLUMNS, cells))
+        if row["event"] == EVENT_CLARIFICATION_PUBLICATION_FAILED:
+            rows.append(row)
+    return tuple(rows)
 
 
 def log_timing_event(

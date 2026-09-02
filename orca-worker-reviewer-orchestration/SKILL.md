@@ -366,8 +366,9 @@ predicate를 지정하며, `validate_record()`는 `permitted_states()`와 같은
 state 선택 입력이 아니다. risk level을 바꾸어도 자동으로 결정할 수 있는 범위는 넓어지지 않는다.
 
 이 계약은 **정의**다. 각 phase gate에서 이 정의를 실행하는 decision gate(OS-29)는 이 Skill에
-구현되어 있으며 §8의 `#### Decision gate contract`가 그 lifecycle 계약이다. 질문을 구성하는
-것(OS-30), 응답을 기다렸다 재개하는 것(OS-31)은 아직 구현되어 있지 않다.
+구현되어 있으며 §8의 `#### Decision gate contract`가 그 lifecycle 계약이다. OS-30의 구조화된
+질문 구성·request 게시·item별 응답·decision과 lineage는 구현되어 있다. 응답을 기다린 뒤
+중단된 run을 재개하는 OS-31은 아직 구현되어 있지 않다.
 
 **gate 결과와 문서 section은 다른 객체다.** gate 경계에서 decision 결과는 필수이며 명시적이다.
 섹션의 optional 여부와 다른 객체다. `## Decision Record` section은 여전히 optional이며 없어도
@@ -2270,15 +2271,16 @@ FINAL_REVIEW_AUDIT_RECORD = artifact_root_final_review_audit_per_dispatch
 FINAL_REVIEW_PROVENANCE_DEFAULT = unknown
 ```
 
-#### Decision gate limitations (OS-30 / OS-31 부재의 귀결)
+#### Decision gate limitations (OS-31 재개·소비 및 transport/UI 경계)
 
-OS-29는 blocked outcome과 그 증거를 남기는 데까지이며 그 이후는 구현되어 있지 않다. 아래는
-현재 한계이며 향후 계획이 아니라 **지금 사실**이다.
+OS-29는 blocked outcome과 그 증거를 남기고, OS-30은 구조화된 request·response·decision과
+append-only lineage를 게시한다. 그 decision을 소비해 중단된 run을 재개하는 OS-31과
+transport-specific UI는 구현되어 있지 않다. 아래는 현재 한계이며 향후 계획이 아니라 **지금 사실**이다.
 
 ```text
 L1 blocked run은 종료된다. 답을 주는 것은 재개가 아니라 새 run이다 (resume은 OS-31).
-L2 질문을 구조화된 형태로 사용자에게 제시하는 UX는 없다 (OS-30).
-L3 supersession lineage가 없다. downstream 확장의 답은 링크가 아니라 새 decision/escalation이다.
+L2 OS-30은 구조화된 request를 artifact로 게시하지만, 그것을 사용자에게 전달하는 transport-specific UI는 없다.
+L3 OS-30은 응답·변경·취소의 append-only lineage를 남기지만, 그 decision을 downstream run 재개로 연결하는 소비 lineage는 없다.
 L4 timeout 의미론은 계약의 부정 규칙(권한이 아님) 외에 없다.
 L5 LOW에는 phase Reviewer가 없으므로 LOW Worker의 오분류는 Final Adversarial Review에서만 잡힌다.
 L6 유효하게 승인된 downgrade여도 그 round는 여전히 terminal이다 — 그에 따라 계속 진행하는 것이 resume이다.
@@ -2350,3 +2352,30 @@ A decision block is terminal at every risk level; risk never changes the termina
 The machine-readable decision record is the authority and the markdown summary explains it; a disagreement blocks
 The decision ledger is append-only; a correction is a new record and no published record is ever edited
 ```
+## Structured Human Clarification (OS-30)
+
+```text
+OS30_SCHEMA_GENERATIONS = new_request_response_v2; immutable_historical_v1
+OS30_AUTHORITY = explicit_response_plus_validated_append_only_lineage
+OS30_NO_IMPLICIT_APPROVAL = recommendation_timeout_eof_are_not_decisions
+OS30_RESUME_BOUNDARY = response_does_not_resume_run
+OS30_EXECUTABLE_ARTIFACT_STORE = orchestration_only
+```
+
+An authoritative OS-29 `NEEDS_INPUT` or `CONFLICT` terminal result may be translated by the Coordinator into a run-scoped structured request under `artifacts/runs/<run-id>/clarifications/`. The request must include context, what is blocked, one or more actionable options and trade-offs, an explicit recommendation and rationale, `default_applicable: false`, and `on_timeout: no selection; run remains blocked`. Recommendations, defaults, silence, timeout, EOF, and process exit are never approval.
+
+Use the installed, non-interactive tool; it never reads a TTY or invokes Orca `ask`:
+
+```text
+python tools/clarification_protocol.py create --artifact-base PATH --run-id RUN --ledger-key KEY --input REQUEST.json
+python tools/clarification_protocol.py respond --artifact-base PATH --run-id RUN --request-id ID --decision-item-id ITEM --submission-id TOKEN --actor-id ID --actor-type human --where-recorded LOCATION (--option-id ID | --response-file PATH)
+python tools/clarification_protocol.py respond --artifact-base PATH --run-id RUN --request-id ID --submission-id TOKEN --actor-id ID --actor-type human --where-recorded LOCATION --cancel
+python tools/clarification_protocol.py show --artifact-base PATH --run-id RUN --request-id ID --json
+python tools/clarification_protocol.py promote --artifact-base PATH --run-id RUN
+```
+
+`respond` promotes automatically: answering an item publishes the next dependency-ready bundle unlocked by that answer and reports it under `promoted`. The explicit `promote` command is the idempotent recovery entry point for the same operation — it needs no live coordinator, publishes nothing when nothing is newly ready, and fails closed if the persisted blocked-source declaration no longer authenticates.
+
+Bundles contain at most three explicitly independent, dependency-ready items. New requests and responses use schema generation v2; historical homogeneous v1 single-item artifacts remain immutable and are never migrated or rewritten. Ambiguous answers preserve the response and create at most two immutable re-clarification revisions; changes supersede through append-only lineage and cancellation is explicit. Sensitive free text must use `--response-file`: its exact bytes have one authoritative `0600` copy, while JSON, CLI output, logs, lineage summaries, and decisions contain only safe metadata, digests, or a redacted bounded value.
+
+This protocol records a response and normalized decision but does not resume a run, dispatch an agent, consume the decision, or provide a transport/UI. Those capabilities remain OS-31 or transport-specific work.

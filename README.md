@@ -762,3 +762,8 @@ orca-worker-reviewer-orchestration
 ```
 
 The orchestration variant never claims a worker was orchestrated unless real Orca orchestration state exists.
+### Structured clarification and decisions (OS-30)
+
+New clarification requests and responses use schema generation v2; homogeneous historical v1 single-item artifacts remain immutable and are never migrated or rewritten.
+
+The orchestration Skill ships a runtime-neutral, non-interactive clarification tool at `tools/clarification_protocol.py`. It creates immutable requests for OS-29 `NEEDS_INPUT` and `CONFLICT` outcomes, accepts explicit option/file/cancel responses, preserves provenance and bounded supersession lineage, and keeps sensitive raw bytes in one restricted copy. It deliberately does not resume a run or implement a terminal/web/chat transport; see the Skill contract for CLI examples.

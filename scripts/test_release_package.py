@@ -6,6 +6,8 @@ from __future__ import annotations
 import hashlib
 import re
 import shutil
+import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -68,6 +70,21 @@ class InstalledSkillPortabilityTests(unittest.TestCase):
                         self.assertTrue(
                             (installed / "tools" / "run_logging.py").is_file()
                         )
+                        self.assertTrue(
+                            (installed / "tools" / "clarification_protocol.py").is_file()
+                        )
+
+    def test_os30_installed_tool_is_byte_identical_and_self_contained(self) -> None:
+        source = REPO_ROOT / "scripts" / "clarification_protocol.py"
+        installed = REPO_ROOT / "orca-worker-reviewer-orchestration" / "tools" / "clarification_protocol.py"
+        self.assertEqual(source.read_bytes(), installed.read_bytes())
+        with tempfile.TemporaryDirectory() as directory:
+            skill = self.install(Path(directory), "orca-worker-reviewer-orchestration")
+            completed = subprocess.run(
+                [sys.executable, str(skill / "tools" / "clarification_protocol.py"), "--help"],
+                cwd=skill, text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(0, completed.returncode, completed.stderr)
 
     def test_the_agent_profile_contract_survives_the_install(self) -> None:
         """The section exists in the installed copy, with both source paths."""

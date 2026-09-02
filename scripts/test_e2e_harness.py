@@ -5354,6 +5354,75 @@ class DecisionGateTransitionTests(unittest.TestCase):
         self.assertEqual(len(blocked_high.worker_attempts), 1)
         self.assertEqual(len(blocked_high.reviewer_attempts), 1)
 
+    def test_publication_error_and_log_write_error_preserve_real_blocked_result(self) -> None:
+        """I-302: even failure of the failure-evidence write cannot erase BLOCKED."""
+        source_key = "run_os29/implementation/1/B2#1"
+        injections = {"publish": 0, "log_failure": 0}
+        scenario = WorkflowScenario(
+            phases=("implementation",),
+            phase_scenarios={"implementation": self.blocking_phase()},
+            final_review=FinalReviewScenario(modes=("pass",)),
+            run_id=self.RUN_ID,
+        )
+
+        def break_publication_and_its_log(harness):
+            harness.clarification_inputs = {
+                source_key: {
+                    "open_item": "blast_radius_beyond_scope",
+                    "source_ledger_key": source_key,
+                    "source_ledger_keys": [source_key],
+                    "source_state": "NEEDS_INPUT",
+                    "source_reason_code": "blast_radius_beyond_scope",
+                    "phase": "implementation",
+                    "iteration": 1,
+                    "question": "Should implementation expand beyond the approved scope?",
+                    "context": "The Worker identified work outside the approved scope.",
+                    "what_is_blocked": "Implementation cannot continue without a scope decision.",
+                    "options": [{
+                        "option_id": "keep_scope",
+                        "label": "Keep approved scope",
+                        "action": "Do not expand the implementation scope.",
+                        "tradeoff": "The out-of-scope work remains deferred.",
+                    }],
+                    "recommended_option_id": "keep_scope",
+                    "recommendation_rationale": "This preserves the approved boundary.",
+                    "deadline_at": None,
+                    "depends_on": [],
+                    "independent_with": [],
+                    "custom_decision": {
+                        "allowed": False,
+                        "subject": "",
+                        "value_type": "none",
+                        "max_length": 0,
+                        "pattern": None,
+                        "allowed_values": [],
+                        "sensitive": False,
+                    },
+                    "narrowing_rationale": "",
+                }
+            }
+
+            def fail_publication(**kwargs):
+                injections["publish"] += 1
+                raise RuntimeError("publication unavailable")
+
+            harness.human_approval_port.publish = fail_publication
+            return harness
+
+        original = run_logging.log_orchestrator_event
+        def fail_only_publication_error(*args, **kwargs):
+            if kwargs.get("event") == run_logging.EVENT_CLARIFICATION_PUBLICATION_FAILED:
+                injections["log_failure"] += 1
+                raise OSError("disk full")
+            return original(*args, **kwargs)
+
+        with patch("scripts.run_logging.log_orchestrator_event", side_effect=fail_only_publication_error):
+            result, _ = self.workflow(scenario, harness_hook=break_publication_and_its_log)
+        self.assertEqual(self.harness(Path("."), risk="high").contract.blocked_status, result.final_status)
+        self.assertEqual({"publish": 1, "log_failure": 1}, injections)
+        self.assertEqual([], result.correction_dispatches)
+        self.assertEqual([], result.revalidation_dispatches)
+
     def test_a_decision_block_charges_no_iteration_and_a_quality_fail_still_does(
         self,
     ) -> None:

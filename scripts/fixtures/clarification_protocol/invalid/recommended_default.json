@@ -1,0 +1,18 @@
+{
+  "operation": "mutate_published_request",
+  "expected_error": "CLARIFICATION_INVALID",
+  "cases": [
+    {"name": "unsupported_schema_version", "operation": "replace", "path": ["schema_version"], "value": 99, "expected_error": "SCHEMA_UNSUPPORTED"},
+    {"name": "missing_schema_version", "operation": "remove", "path": ["schema_version"]},
+    {"name": "unknown_top_level_field", "operation": "replace", "path": ["authority"], "value": "coordinator"},
+    {"name": "unknown_nested_item_field", "operation": "replace", "path": ["items", 0, "authority"], "value": "coordinator"},
+    {"name": "unknown_nested_option_field", "operation": "replace", "path": ["items", 0, "options", 0, "default"], "value": true},
+    {"name": "default_applicable_true", "operation": "replace", "path": ["default_applicable"], "value": true},
+    {"name": "authority_bearing_timeout", "operation": "replace", "path": ["on_timeout"], "value": "select recommendation"},
+    {"name": "rewritten_timeout", "operation": "replace", "path": ["on_timeout"], "value": "run stays blocked"},
+    {"name": "dangling_recommendation", "operation": "replace", "path": ["items", 0, "recommended_option_id"], "value": "missing"},
+    {"name": "missing_what_is_blocked", "operation": "remove", "path": ["items", 0, "what_is_blocked"]},
+    {"name": "forged_decision_item_id", "operation": "replace", "path": ["items", 0, "decision_item_id"], "value": "item_000000000000000000000000"},
+    {"name": "unknown_response_mode", "operation": "replace", "path": ["accepted_response_modes"], "value": ["option_id", "automatic_default"]}
+  ]
+}
