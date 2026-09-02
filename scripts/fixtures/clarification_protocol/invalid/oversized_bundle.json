@@ -1,0 +1,6 @@
+{
+  "operation": "create",
+  "base_fixture": "valid/needs_input_request.json",
+  "repeat_items": 4,
+  "expected_error": "CLARIFICATION_INVALID"
+}

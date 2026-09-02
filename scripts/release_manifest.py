@@ -84,6 +84,7 @@ def required_skill_paths(skill_name: str) -> set[str]:
         # repository's scripts/), so this one extra file is part of this skill's
         # distributable definition. The loop skill has no such tool.
         paths.add(f"{skill_name}/tools/run_logging.py")
+        paths.add(f"{skill_name}/tools/clarification_protocol.py")
     return paths
 
 

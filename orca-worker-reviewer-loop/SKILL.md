@@ -361,8 +361,10 @@ predicate를 지정하며, `validate_record()`는 `permitted_states()`와 같은
 **축 독립성.** risk / quality profile / agent profile은 decision authority와 독립적인 축이며
 state 선택 입력이 아니다. risk level을 바꾸어도 자동으로 결정할 수 있는 범위는 넓어지지 않는다.
 
-이 계약은 **정의**다. 각 phase gate에서 검사를 실행하는 것(OS-29), 질문을 구성하는 것(OS-30),
-응답을 기다렸다 재개하는 것(OS-31)은 이 Skill에 아직 구현되어 있지 않다.
+이 계약은 **정의**다. OS-30의 구조화된 질문, item별 응답, decision과 append-only
+lineage 계약은 이 Skill에 구현되어 있다. 다만 이 direct-session Skill은 각 phase gate에서
+검사를 실행하는 OS-29 실행과 run-scoped artifact store/CLI를 제공하지 않으며, 응답을 기다린
+뒤 중단된 run을 재개하는 OS-31도 아직 구현되어 있지 않다.
 
 이 Skill에는 risk 축이 없지만 decision policy 계약은 동일하다 — 계약이 risk에 의존하지 않으므로
 risk 축이 있는 Skill과 같은 문언을 읽는다.
@@ -1251,3 +1253,16 @@ Invalid canonical order → BLOCK
 Explicit phases vs natural-language conflict → BLOCK
 Next phase starts only after current phase PASS
 ```
+## Structured Human Clarification (OS-30)
+
+```text
+OS30_SCHEMA_GENERATIONS = new_request_response_v2; immutable_historical_v1
+OS30_AUTHORITY = explicit_response_plus_validated_append_only_lineage
+OS30_NO_IMPLICIT_APPROVAL = recommendation_timeout_eof_are_not_decisions
+OS30_RESUME_BOUNDARY = response_does_not_resume_run
+OS30_EXECUTABLE_ARTIFACT_STORE = unavailable_in_direct_loop
+```
+
+For both `NEEDS_INPUT` and `CONFLICT`, clarification semantics require explicit actionable choices with trade-offs, a recommendation that is not approval, no implicit default or timeout approval, bounded ambiguity handling, actor/time/provenance evidence, and append-only change/cancellation/scope lineage. Sensitive raw replies have one restricted authoritative copy and must not be repeated into ordinary logs.
+
+This direct-session loop does not provide the orchestration Skill's run-scoped clarification artifact store or installed clarification CLI. It must not claim that a response resumes work: durable consumption/resume and transport-specific UI remain out of scope.

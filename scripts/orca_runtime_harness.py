@@ -35,7 +35,7 @@ try:
         require_workflow_phase,
         strip_task_context,
     )
-    from scripts import decision_gate, decision_policy, run_logging
+    from scripts import clarification_protocol, decision_gate, decision_policy, run_logging
     from scripts.workflow_contract import load_workflow_output_contract
 except ModuleNotFoundError:  # direct `python3 scripts/...` execution
     from quality_profile import (
@@ -62,6 +62,7 @@ except ModuleNotFoundError:  # direct `python3 scripts/...` execution
     import decision_gate
     import decision_policy
     import run_logging
+    import clarification_protocol
     from workflow_contract import load_workflow_output_contract
 
 
@@ -694,9 +695,14 @@ class OrcaRuntimeHarness:
         risk: str = "high",
         risk_source: str = "default",
         agent_routing: Any | None = None,
+        human_approval_port: Any | None = None,
+        clarification_inputs: dict[str, dict[str, object]] | None = None,
     ) -> None:
         self.orca = self._resolve_orca()
         self.artifact_dir = artifact_dir
+        self.human_approval_port = human_approval_port or clarification_protocol.ArtifactHumanApprovalPort(artifact_dir)
+        self.clarification_inputs = clarification_inputs or {}
+        self.clarification_errors: list[str] = []
         self.wait_timeout_ms = wait_timeout_ms
         self.artifact_dir.mkdir(parents=True, exist_ok=True)
         self.run_owner: str | None = None
@@ -2723,6 +2729,8 @@ class OrcaRuntimeHarness:
                 # BLOCKED is not gated, so the branch above is not re-entered.
                 self.log_run_status("BLOCKED", reason=f"{reason}: {detail}")
                 raise DecisionGateRefused(reason, refusal.detail)
+        if status == "BLOCKED":
+            self._publish_clarifications_for_terminal_block()
         self._safe_log(
             run_logging.log_run_status,
             self.run_id,
@@ -2733,6 +2741,36 @@ class OrcaRuntimeHarness:
             risk=self.risk,
             risk_source=self.risk_source,
         )
+
+    def _publish_clarifications_for_terminal_block(self) -> None:
+        if not self.run_id:
+            return
+        def valid(reviewer, worker):
+            verifies = reviewer.get("verifies")
+            return (isinstance(verifies, dict)
+                    and verifies.get("worker_record_key") == decision_gate.ledger_key(worker)
+                    and worker.get("role") == "worker" and worker.get("boundary") == "B2"
+                    and reviewer.get("boundary") == "B3"
+                    and all(reviewer.get(key) == worker.get(key) for key in ("run", "phase", "iteration")))
+        try:
+            records = run_logging.read_decision_ledger(self.run_id, base=self.artifact_dir)
+            sources = clarification_protocol.terminal_block_sources(
+                run_id=self.run_id, records=records, coordinator_input=self.clarification_inputs,
+                ledger_key=decision_gate.ledger_key, valid_reviewer_binding=valid)
+            if sources:
+                for batch in clarification_protocol.publication_batches(self.run_id, sources):
+                    self.human_approval_port.publish(run_id=self.run_id, sources=batch)
+        except Exception as exc:  # publication cannot mutate status or dispatch
+            keys = sorted(source.source_ledger_key for source in locals().get("sources", ()))
+            error = json.dumps({"exception":type(exc).__name__,"message":str(exc),"ledger_keys":keys},
+                               sort_keys=True,separators=(",",":"))
+            self.clarification_errors.append(error)
+            self._safe_log(
+                run_logging.log_orchestrator_event, self.run_id,
+                base=self.artifact_dir,
+                event=run_logging.EVENT_CLARIFICATION_PUBLICATION_FAILED,
+                result="BLOCKED", detail=error,
+            )
 
     # ---- OS-17 review: automatic phase/iteration boundaries in TIMING_LOG ---------
     # OS-17's own timing contract (section 3) named "phase start/end" and

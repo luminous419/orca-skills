@@ -235,3 +235,8 @@ reviews/
 
 `orca-worker-reviewer-orchestration` additionally distributes `tools/run_logging.py` (see
 section 5).
+### OS-30 clarification tool
+
+New clarification requests and responses use schema generation v2; homogeneous historical v1 single-item artifacts remain immutable and are never migrated or rewritten.
+
+Installing `orca-worker-reviewer-orchestration` with the documented directory copy also installs `tools/clarification_protocol.py` and its adjacent `run_logging.py` dependency. Run `python ~/.claude/skills/orca-worker-reviewer-orchestration/tools/clarification_protocol.py --help` to verify the self-contained CLI. The loop Skill intentionally has no artifact CLI.

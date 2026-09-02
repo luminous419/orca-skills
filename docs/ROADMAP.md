@@ -174,7 +174,7 @@ resumable. Every phase performs a decision check, but only `NEEDS_INPUT` and
 `CONFLICT` pause for the user.
 
 - [OS-28](https://luminous419.atlassian.net/browse/OS-28) Bounded Autonomy Decision Policy Contract
-- [OS-29](https://luminous419.atlassian.net/browse/OS-29) Continuous Decision and Escalation Gates — **implemented** in the orchestration Skill: the OS-28 policy is enforced at phase entry, after the Worker result and after the Reviewer result, `NEEDS_INPUT`/`CONFLICT` block the correction Worker and the next phase without consuming an iteration, and every judgement is recorded in a run-scoped append-only decision ledger. A blocked run terminates and is not resumable; asking the user (OS-30) and resuming across sessions (OS-31) are still not implemented.
+- [OS-29](https://luminous419.atlassian.net/browse/OS-29) Continuous Decision and Escalation Gates — **implemented** in the orchestration Skill: the OS-28 policy is enforced at phase entry, after the Worker result and after the Reviewer result, `NEEDS_INPUT`/`CONFLICT` block the correction Worker and the next phase without consuming an iteration, and every judgement is recorded in a run-scoped append-only decision ledger. A blocked run terminates and is not resumable. Structured human clarification (OS-30) is implemented on this branch; durable cross-session resume (OS-31) is not yet implemented.
 - [OS-30](https://luminous419.atlassian.net/browse/OS-30) Structured Human Clarification and Decision Protocol
 - [OS-31](https://luminous419.atlassian.net/browse/OS-31) Durable Pause and Resume for Human Decisions
 - [OS-32](https://luminous419.atlassian.net/browse/OS-32) Bounded Autonomy Evaluation and Success Metrics
@@ -310,3 +310,8 @@ Update this document when a milestone outcome, architecture principle, target
 direction, or release criterion changes. Routine Jira status changes do not require
 a roadmap edit unless they materially change the project's current position or
 recommended sequence.
+### OS-30 structured human clarification
+
+New clarification requests and responses use schema generation v2; homogeneous historical v1 single-item artifacts remain immutable and are never migrated or rewritten.
+
+Implemented as immutable run artifacts plus an explicit CLI response path for `NEEDS_INPUT` and `CONFLICT`. Stable request/decision identities, bounded bundles and ambiguity, provenance, append-only lifecycle lineage, and single-copy sensitive raw evidence are included. Durable resume/decision consumption remains OS-31.

@@ -68,6 +68,7 @@ class ValidatorRegressionTests(unittest.TestCase):
             # the same reason -- an omitted dependency here is an import crash with
             # empty stdout, not the named failure the test is asserting on.
             "decision_gate.py",
+            "clarification_protocol.py",
         ):
             shutil.copy2(SOURCE_ROOT / "scripts" / filename, scripts_dir)
 
@@ -2232,6 +2233,31 @@ class ValidatorRegressionTests(unittest.TestCase):
         self.assert_lifecycle_contract_rejected(
             "final review contract values differ from the validator source of truth"
         )
+
+    def test_os30_shared_anchor_deletion_fails(self) -> None:
+        self.edit_skills(
+            "OS30_RESUME_BOUNDARY = response_does_not_resume_run\n", ""
+        )
+        self.assert_lifecycle_contract_rejected("OS-30 shared semantic anchor missing")
+
+    def test_os30_shared_anchor_value_drift_fails(self) -> None:
+        self.edit_skills(
+            "OS30_AUTHORITY = explicit_response_plus_validated_append_only_lineage",
+            "OS30_AUTHORITY = latest_timestamped_response",
+        )
+        self.assert_lifecycle_contract_rejected("OS-30 shared semantic anchor missing")
+
+    def test_os30_loop_false_executable_parity_fails(self) -> None:
+        loop_path=self.repo_root/"orca-worker-reviewer-loop"/"SKILL.md"
+        loop_path.write_text(loop_path.read_text().replace(
+            "OS30_EXECUTABLE_ARTIFACT_STORE = unavailable_in_direct_loop",
+            "OS30_EXECUTABLE_ARTIFACT_STORE = orchestration_only"),encoding="utf-8")
+        self.assert_lifecycle_contract_rejected("must not claim OS-30 executable artifact parity")
+
+    def test_os30_schema_generation_document_drift_fails(self) -> None:
+        path=self.repo_root/"README.md"
+        path.write_text(path.read_text().replace("schema generation v2","schema generation v1",1),encoding="utf-8")
+        self.assert_lifecycle_contract_rejected("README.md: OS-30 v2/historical-v1 schema statement missing")
 
 if __name__ == "__main__":
     unittest.main()

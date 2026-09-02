@@ -1,0 +1,26 @@
+{
+  "accepted_response_modes": ["option_id", "response_file", "cancel"],
+  "bundle_rationale": "",
+  "independence_declared_by": {"actor_id": "coordinator", "actor_type": "service"},
+  "items": [{
+    "context": "A deployment target is required.",
+    "custom_decision": {"allowed": false, "allowed_values": [], "max_length": 0, "pattern": null, "sensitive": false, "subject": "", "value_type": "none"},
+    "deadline_at": null,
+    "depends_on": [],
+    "independent_with": [],
+    "iteration": 1,
+    "narrowing_rationale": "",
+    "open_item": "deployment_target",
+    "options": [{"action": "deploy to staging", "label": "Staging", "option_id": "staging", "tradeoff": "No production traffic."}],
+    "phase": "implementation",
+    "question": "Which target should be used?",
+    "recommendation_rationale": "Limits initial risk.",
+    "recommended_option_id": "staging",
+    "source_ledger_key": "run_fixture/implementation/1/B2#1",
+    "source_ledger_keys": ["run_fixture/implementation/1/B2#1"],
+    "source_reason_code": "user_choice_required",
+    "source_state": "NEEDS_INPUT",
+    "what_is_blocked": "Deployment cannot proceed."
+  }],
+  "sensitivity_guidance": "Use response-file for sensitive values."
+}

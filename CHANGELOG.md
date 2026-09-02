@@ -106,3 +106,6 @@ are recorded here in a Keep a Changelog-inspired format.
 - Verified Orca 1.4.178-rc.2 and 1.4.184 environments are separate point observations,
   not a supported version range.
 - A stable production-ready release is not yet claimed; the license decision remains open.
+## Unreleased
+
+- Add OS-30 structured human clarification artifacts and a non-interactive installed CLI for explicit option, bounded custom, ambiguity, supersession, cancellation, and sensitive-response handling. New clarification requests and responses use schema generation v2; homogeneous historical v1 single-item artifacts remain immutable and are never migrated or rewritten. OS-28/OS-29 schemas and blocked-run semantics remain unchanged; resume and transports remain out of scope.
