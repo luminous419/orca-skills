@@ -5,7 +5,8 @@ import json
 import re
 from typing import Any, TypedDict
 
-from .contracts import ALL_PHASES, CAPABILITIES, DECISION_STATES, RISKS, SCHEMA_VERSION, WORKFLOW_ID
+from .contracts import (ALL_PHASES, BASE_CAPABILITIES, CAPABILITIES, DECISION_STATES, RISKS,
+                        ROUND_KINDS, SCHEMA_VERSION, WORKFLOW_ID)
 
 
 class StateError(ValueError):
@@ -83,6 +84,21 @@ def validate_state(raw: dict[str, Any], *, expected_thread_id: str) -> WorkflowS
     json.dumps(raw, allow_nan=False)
     required = set(WorkflowState.__required_keys__)
     if set(raw) != required: raise StateError("MALFORMED_STATE:closed fields")
+    # Container types are checked before anything indexes them, so a wrong-typed field
+    # can never reach the trace/routing code as a silent KeyError or TypeError.
+    for key in ("requested_phases", "adapter_capabilities", "correction_queue", "corrected_phases",
+                "revalidation_queue", "blocking_findings", "processed_command_ids",
+                "processed_event_ids", "logical_trace"):
+        if type(raw[key]) is not list: raise StateError(f"MALFORMED_STATE:{key} type")
+    for key in ("phase_iterations", "remaining_phase_budget", "phase_passes", "artifact_binding",
+                "initial_repository_binding", "repository_binding"):
+        if type(raw[key]) is not dict: raise StateError(f"MALFORMED_STATE:{key} type")
+    for key in ("current_phase_index", "final_review_iterations", "remaining_final_budget",
+                "correction_index", "revalidation_index"):
+        if type(raw[key]) is not int: raise StateError(f"MALFORMED_STATE:{key} type")
+    for key in ("schema_version", "run_id", "thread_id", "workflow_id", "current_phase",
+                "round_kind", "risk"):
+        if type(raw[key]) is not str: raise StateError(f"MALFORMED_STATE:{key} type")
     if raw["schema_version"] != SCHEMA_VERSION or raw["workflow_id"] != WORKFLOW_ID:
         raise StateError("MALFORMED_STATE:schema")
     if raw["thread_id"] != expected_thread_id: raise StateError("MALFORMED_STATE:thread")
@@ -102,8 +118,47 @@ def validate_state(raw: dict[str, Any], *, expected_thread_id: str) -> WorkflowS
     if raw["remaining_final_budget"] != maximum - raw["final_review_iterations"]:
         raise StateError("MALFORMED_STATE:final budget")
     if raw["decision_state"] not in DECISION_STATES: raise StateError("MALFORMED_STATE:decision")
+    if raw["round_kind"] not in ROUND_KINDS: raise StateError("MALFORMED_STATE:round kind")
+    # Phase/index coherence: every field the trace indexes must resolve.  A CORRECTION or
+    # revalidation round legitimately points at a phase other than requested_phases[index],
+    # so the exact-match rule applies only to the forward PHASE_GATE path.
+    index = raw["current_phase_index"]
+    if not 0 <= index < len(phases): raise StateError("MALFORMED_STATE:phase index")
+    if raw["current_phase"] not in phases: raise StateError("MALFORMED_STATE:current phase")
+    if raw["round_kind"] == "PHASE_GATE" and raw["current_phase"] != phases[index]:
+        raise StateError("MALFORMED_STATE:phase index coherence")
     if len(raw["processed_command_ids"]) != len(set(raw["processed_command_ids"])) or len(raw["processed_event_ids"]) != len(set(raw["processed_event_ids"])):
         raise StateError("MALFORMED_STATE:duplicate identity")
     if raw["terminal_status"] is not None and any((raw["pending_role"], raw["pending_intent"], raw["pending_event"])):
         raise StateError("POST_TERMINAL_EVENT")
     return raw  # type: ignore[return-value]
+
+
+def normalize_malformed_state(raw: Any, *, code: str, message: str) -> dict[str, Any]:
+    """Project any malformed input onto a valid, closed, terminal-bound state.
+
+    ``validate_node`` cannot hand a malformed dictionary onward: the trace and routing code
+    index required fields unconditionally.  Instead of guessing, this rebuilds a minimally
+    valid state, keeping only the identity fields that survive validation on their own, and
+    binds it to the BLOCKED terminal path.
+    """
+    source = raw if isinstance(raw, dict) else {}
+    run_id = source.get("run_id")
+    if not isinstance(run_id, str) or not re.fullmatch(r"run_[a-z0-9]+", run_id):
+        run_id = "run_malformed"
+    thread_id = source.get("thread_id") if isinstance(source.get("thread_id"), str) else ""
+    phases = source.get("requested_phases")
+    if not isinstance(phases, list) or not phases or any(p not in ALL_PHASES for p in phases):
+        phases = [ALL_PHASES[0]]
+    risk = source.get("risk") if source.get("risk") in RISKS else "high"
+    maximum = source.get("max_iterations")
+    if type(maximum) is not int or not 1 <= maximum <= 10:
+        maximum = 5
+    capabilities = source.get("adapter_capabilities")
+    if not isinstance(capabilities, list) or set(capabilities) - CAPABILITIES:
+        capabilities = sorted(BASE_CAPABILITIES)
+    state = initial_state(run_id=run_id, thread_id=thread_id, phases=tuple(phases),
+                          capabilities=frozenset(capabilities), risk=risk, max_iterations=maximum)
+    state["route_token"] = "BLOCK"
+    state["terminal_reason"] = {"code": code, "message": message}
+    return dict(state)

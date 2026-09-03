@@ -1,0 +1,5 @@
+=== F-001 unknown-ONLY field submitted directly to the compiled graph (AFTER FIX) ===
+terminal_status : BLOCKED   (expected BLOCKED)
+reason          : MALFORMED_STATE   (expected MALFORMED_STATE)
+effect_count    : 0   (expected 0)
+unknown present : False

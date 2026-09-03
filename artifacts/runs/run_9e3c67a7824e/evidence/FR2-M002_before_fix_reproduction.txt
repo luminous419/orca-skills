@@ -1,0 +1,3 @@
+=== BEFORE FIX: public .compiled unwraps the guarded graph ===
+via facade    -> BLOCKED   MALFORMED_STATE     effects=0
+via .compiled -> COMPLETED WORKFLOW_COMPLETED  effects=3

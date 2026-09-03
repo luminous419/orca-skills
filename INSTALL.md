@@ -243,12 +243,67 @@ The engine runtime is optional for legacy validation and required to execute the
 
 ```bash
 python3 -m pip install -r requirements-langgraph.txt
-python3 orca-worker-reviewer-orchestration/tools/run_workflow.py
+python3 orca-worker-reviewer-orchestration/tools/run_workflow.py --check-runtime
 ```
 
 Offline installations must obtain these pinned wheels through the organization's approved
 transfer/cache process. The command fails explicitly when LangGraph is absent or not version
 0.2.76; it does not use the prompt loop as a fallback.
+
+`tools/run_workflow.py` is the engine's execution entry point, not only a runtime probe. It
+builds state, selects an adapter, invokes or resumes the compiled graph, prints the terminal
+result and exits with that result's code:
+
+| exit code | meaning |
+| --- | --- |
+| 0 | `COMPLETED` |
+| 1 | `BLOCKED` (decision block, quality block, or malformed input state) |
+| 2 | `ESCALATED` (phase or final-review iteration budget exhausted) |
+| 3 | unusable arguments, unreadable input, or missing/wrong LangGraph runtime |
+
+Run the canonical five-phase workflow end to end with no Orca runtime present:
+
+```bash
+python3 orca-worker-reviewer-orchestration/tools/run_workflow.py --demo --json
+```
+
+Supply your own scenario with a state specification and a scripted settlement list:
+
+```bash
+python3 orca-worker-reviewer-orchestration/tools/run_workflow.py \
+  --state state.json --results results.json --runtime-state runtime_state.json --json
+```
+
+`state.json` accepts `run_id`, `thread_id`, `phases`, `risk` and `max_iterations`;
+`results.json` is a JSON list of Worker/Reviewer result objects settled in order.
+
+**Durable idempotency is required, not optional.** Every path that can create an external
+Task/Dispatch needs a `RuntimeStatePort`: the engine claims each stable intent in that
+ledger *before* the external effect, so a process that dies and restarts recovers the
+existing receipt instead of creating a second Task/Dispatch. There is deliberately no
+port-less mode.
+
+- `build_graph(adapter)`, `execute_intent_node(adapter)` and `execute_state(...)` resolve
+  the port from their `runtime_state` argument, or from one bound to the adapter. If
+  neither is present they raise `IdempotencyPortRequired` — at build time, before any
+  state is processed, so a graph that could duplicate an effect cannot be constructed.
+  Supplying two different ports raises `RuntimeStateConflict`, because two ledgers for one
+  execution would split the receipts.
+- `run_workflow.py` always supplies one, so the shipped command line is crash-safe with no
+  extra flags. `--runtime-state PATH` chooses the file; without it the launcher writes
+  `<run_id>__<thread_id>.json` under `$ORCA_OS40_RUNTIME_STATE_DIR`, defaulting to a
+  `orca-os40-runtime-state` directory in the system temp location. That default is a real
+  file — it survives the process, which is what the crash window requires — but temp
+  directories are cleared periodically, so set `ORCA_OS40_RUNTIME_STATE_DIR` or pass
+  `--runtime-state` to keep the ledger somewhere you control.
+
+**Recursion limit.** LangGraph's default `recursion_limit` is 25 graph steps. One settled
+intent costs 5 steps and each phase advance costs 2, so the canonical five-phase workflow
+needs about 68 steps and aborts with `GraphRecursionError` under the default. The launcher
+therefore always sets the limit explicitly, computed from the requested phases and the
+iteration budget (`deterministic_workflow.launcher.default_recursion_limit`); `--recursion-limit`
+overrides it. Callers that embed `build_graph` directly must pass their own
+`config={"recursion_limit": ...}`.
 
 New clarification requests and responses use schema generation v2; homogeneous historical v1 single-item artifacts remain immutable and are never migrated or rewritten.
 

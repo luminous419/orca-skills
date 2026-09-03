@@ -14,6 +14,17 @@ def _langgraph_ok() -> bool:
     except importlib.metadata.PackageNotFoundError: return False
 
 
+def _ledger():
+    """An explicit process-local ledger.
+
+    These tests run inside one process, so an in-memory port is sufficient -- but it is
+    *chosen*, never defaulted: the engine has no port-less mode, because that default is
+    what allowed a restart to duplicate an external Task/Dispatch.
+    """
+    from scripts.deterministic_workflow.runtime_state import InMemoryRuntimeStateStore
+    return InMemoryRuntimeStateStore()
+
+
 @unittest.skipUnless(_langgraph_ok(), "requires pinned langgraph 0.2.76")
 class WorkflowGraphTests(unittest.TestCase):
     def setUp(self):
@@ -27,7 +38,7 @@ class WorkflowGraphTests(unittest.TestCase):
         adapter = FakeAdapter(results)
         state = initial_state(run_id="run_graph", thread_id="thread", phases=phases,
                               capabilities=self.capabilities, **kwargs)
-        return build_graph(adapter).invoke(state, config={"recursion_limit": 300}), adapter
+        return build_graph(adapter, runtime_state=_ledger()).invoke(state, config={"recursion_limit": 300}), adapter
 
     @staticmethod
     def worker(unit="NOT_APPLICABLE"): return {"status": "COMPLETE", "unit_test_status": unit}
@@ -123,7 +134,7 @@ class WorkflowGraphTests(unittest.TestCase):
             adapter=FakeAdapter([]); state=initial_state(run_id=f"run_{decision.lower().replace('_','')}",thread_id="t",phases=("ANALYSIS",),capabilities=self.capabilities)
             state["decision_state"]=decision; state["quality_verdict"]="PASS"; state["pending_clarification_id"]="clarification_x"
             before=(dict(state["phase_iterations"]),state["final_review_iterations"],dict(state["remaining_phase_budget"]))
-            out=build_graph(adapter).invoke(state)
+            out=build_graph(adapter, runtime_state=_ledger()).invoke(state)
             after=(out["phase_iterations"],out["final_review_iterations"],out["remaining_phase_budget"])
             self.assertEqual(out["terminal_status"],"BLOCKED"); self.assertEqual(out["terminal_reason"]["code"],decision)
             self.assertEqual(adapter.effect_count,0); self.assertEqual(after,before)
@@ -186,7 +197,7 @@ class WorkflowGraphTests(unittest.TestCase):
         capabilities=BASE_CAPABILITIES-frozenset({"agent_interrupt"})
         adapter=FakeAdapter([],capabilities=capabilities)
         state=initial_state(run_id="run_cap",thread_id="t",phases=("ANALYSIS",),capabilities=capabilities)
-        out=build_graph(adapter).invoke(state)
+        out=build_graph(adapter, runtime_state=_ledger()).invoke(state)
         self.assertEqual(out["terminal_status"],"BLOCKED")
         self.assertEqual(out["terminal_reason"]["code"],"ADAPTER_CAPABILITY_MISSING")
         self.assertEqual(adapter.effect_count,0)
@@ -229,7 +240,7 @@ class WorkflowGraphTests(unittest.TestCase):
         from scripts.deterministic_workflow.graph import build_graph
         from scripts.deterministic_workflow.state import initial_state
         adapter=FakeAdapter([self.worker(),self.review()]); saver=MemorySaver()
-        graph=build_graph(adapter,checkpointer=saver,interrupt_before=["APPLY_RESULT"])
+        graph=build_graph(adapter,checkpointer=saver,runtime_state=_ledger(),interrupt_before=["APPLY_RESULT"])
         config={"configurable":{"thread_id":"event-replay"},"recursion_limit":100}
         state=initial_state(run_id="run_eventgraph",thread_id="event-replay",phases=("ANALYSIS",),
                             capabilities=self.capabilities,risk="low")
@@ -249,7 +260,7 @@ class WorkflowGraphTests(unittest.TestCase):
         from scripts.deterministic_workflow.graph import build_graph
         from scripts.deterministic_workflow.state import initial_state
         adapter=FakeAdapter([self.worker(),self.review(),self.review()]); saver=MemorySaver()
-        graph=build_graph(adapter,checkpointer=saver,interrupt_after=["PREPARE_INTENT"]); config={"configurable":{"thread_id":"resume"},"recursion_limit":100}
+        graph=build_graph(adapter,checkpointer=saver,runtime_state=_ledger(),interrupt_after=["PREPARE_INTENT"]); config={"configurable":{"thread_id":"resume"},"recursion_limit":100}
         state=initial_state(run_id="run_resume",thread_id="resume",phases=("ANALYSIS",),capabilities=self.capabilities)
         graph.invoke(state,config); self.assertEqual(adapter.effect_count,0); self.assertEqual(graph.get_state(config).next,("EXECUTE_INTENT",))
         graph.invoke(None,config)

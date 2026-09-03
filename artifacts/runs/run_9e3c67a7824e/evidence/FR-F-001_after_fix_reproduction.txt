@@ -1,0 +1,13 @@
+=== AFTER FIX ===
+one stable intent: intent_9d7f856f7db38f58164d6947
+
+--- (a) DEFAULT call with no durable port anywhere -> refused before adapter.start ---
+  execute_intent_node(adapter)  refused: IDEMPOTENCY_PORT_REQUIRED: pass runtime_state=...
+  external_task_creates = 0   (was 1 per process before)
+  build_graph(adapter)          refused at build time
+  effects = 0
+
+--- (b) adapter-bound port derived; two fresh processes, one stable intent ---
+  process 1 (fresh harness + fresh adapter): external_task_creates=1
+  process 2 (fresh harness + fresh adapter): external_task_creates=0
+  -> total external Task creates for ONE stable intent: 1   (was 2)

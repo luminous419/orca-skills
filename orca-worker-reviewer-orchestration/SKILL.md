@@ -160,6 +160,83 @@ runtime-neutral graph specification.
 {"workflow_id":"os40.standard.v1","schema_version":"os40.workflow.v1","phases":["ANALYSIS","PLAN","DESIGN","IMPLEMENTATION","TEST"],"route_tokens":["BLOCK","ESCALATE","PREPARE_WORKER","PREPARE_PHASE_REVIEWER","ADVANCE_PHASE","PREPARE_FINAL_REVIEWER","PREPARE_CORRECTION","PREPARE_REVALIDATION","COMPLETE"],"terminal_statuses":["COMPLETED","BLOCKED","ESCALATED"],"iteration_domains":["PHASE_ITERATIONS","FINAL_REVIEW_ITERATIONS"],"decision_first":true,"final_review_mandatory":true,"downstream_revalidation":"high_only","launcher":"tools/run_workflow.py"}
 ```
 
+## Workflow Control Plane Authority
+
+phase 전이, phase gate, correction loop, iteration budget, Final Review routing 결정은 deterministic workflow engine이 단독으로 소유한다. Coordinator는 이 결정들을 독립적으로 재판정하지 않고 engine이 반환한 route token과 terminal status를 따른다.
+
+이 Skill은 workflow controller가 아니다. 아래 block이 engine이 소유한 결정과, engine이
+소유하지 **않는** — 따라서 이 문서가 계속 authoritative하게 규정하는 — 안전/지침 절을
+선언한다. graph-owned 절의 설명 산문은 사람이 읽기 위한 파생 문서로 강등되어 있고,
+`scripts/validate_workflow_graph_docs.py`가 engine의 decision 집합·route token 집합과
+대조해 drift(강등 표시 누락, normative routing 재도입, 안전 절 삭제/강등)를 자동 검출한다.
+
+```workflow-control-plane
+{
+  "authority": "deterministic_engine",
+  "engine": "tools/deterministic_workflow",
+  "launcher": "tools/run_workflow.py",
+  "graph_owned_decisions": [
+    {
+      "decision": "PHASE_TRANSITION",
+      "route_tokens": [
+        "ADVANCE_PHASE"
+      ],
+      "sections": [
+        "## 8. Phase Sequence Contract"
+      ]
+    },
+    {
+      "decision": "PHASE_GATE",
+      "route_tokens": [
+        "PREPARE_WORKER",
+        "PREPARE_PHASE_REVIEWER",
+        "BLOCK"
+      ],
+      "sections": [
+        "### Risk Axis"
+      ]
+    },
+    {
+      "decision": "CORRECTION_LOOP",
+      "route_tokens": [
+        "PREPARE_CORRECTION"
+      ],
+      "sections": [
+        "## 12. FAIL Loop"
+      ]
+    },
+    {
+      "decision": "ITERATION_BUDGET",
+      "route_tokens": [
+        "ESCALATE"
+      ],
+      "sections": [
+        "## 13. Iteration"
+      ]
+    },
+    {
+      "decision": "FINAL_REVIEW_ROUTING",
+      "route_tokens": [
+        "PREPARE_FINAL_REVIEWER",
+        "PREPARE_REVALIDATION",
+        "COMPLETE"
+      ],
+      "sections": [
+        "## 17. Final Adversarial Review"
+      ]
+    }
+  ],
+  "skill_owned_safety": [
+    "## 5. Agent Policy",
+    "## Decision Policy",
+    "### Completed Worker Lifecycle",
+    "## 14. Mandatory Test Gates",
+    "## 15. Repository / Security Policy",
+    "## Structured Human Clarification (OS-30)"
+  ]
+}
+```
+
 다음 JSON block은 deterministic policy smoke test의 source of truth다.
 사람이 읽는 위/아래의 정책 설명과 의미가 일치해야 하며 두 Skill에서 동일하게 유지한다.
 자유 형식 자연어의 전체 의미 해석은 여전히 Coordinator/LLM의 책임이고,
@@ -931,6 +1008,8 @@ REFACTORING    → templates/refactoring.md    + reviews/common.md + reviews/ref
 
 ## 8. Phase Sequence Contract
 
+> **NON-AUTHORITATIVE (graph-owned).** 이 절의 routing 규칙은 deterministic workflow engine이 소유한다. 아래 설명은 engine 동작의 파생 문서이며, engine과 어긋나면 engine이 정답이다.
+
 `phases=A,B,C`는 A → B → C의 실행 순서를 뜻한다.
 Sequential phase가 canonical order를 거스르면 자동 재정렬하지 않는다.
 
@@ -979,6 +1058,8 @@ phases=refactoring
 ```
 
 ### Risk Axis
+
+> **NON-AUTHORITATIVE (graph-owned).** 이 절의 routing 규칙은 deterministic workflow engine이 소유한다. 아래 설명은 engine 동작의 파생 문서이며, engine과 어긋나면 engine이 정답이다.
 
 `risk`는 요청된 phase를 얼마나 강하게 검증할지를 결정한다. `phases`가 결정하는 실행 대상은
 어떤 risk에서도 달라지지 않는다.
@@ -1783,6 +1864,8 @@ AGENT_PROFILE_LEGACY = omitted_profile_preserves_existing_behavior
 
 ## 12. FAIL Loop
 
+> **NON-AUTHORITATIVE (graph-owned).** 이 절의 routing 규칙은 deterministic workflow engine이 소유한다. 아래 설명은 engine 동작의 파생 문서이며, engine과 어긋나면 engine이 정답이다.
+
 **decision 축이 먼저다.** 모든 경계에서 gate 결과를 먼저 읽고 검증한 뒤에야 quality 축의
 PASS/FAIL 라우팅을 평가한다. `NEEDS_INPUT`/`CONFLICT`이거나 gate 결과가 없거나 깨졌으면 그
 round는 `RUN_STATUS: BLOCKED`로 종료되고 correction Worker도 다음 phase도 dispatch되지 않는다.
@@ -1833,6 +1916,8 @@ T5a는 HIGH에서만 실행되므로 그 round는 항상 2-node다.
 차이는 해소할 finding이 없다는 점이며, 첫 Worker에게 resolution trace를 요구하지 않는다.
 
 ## 13. Iteration
+
+> **NON-AUTHORITATIVE (graph-owned).** 이 절의 routing 규칙은 deterministic workflow engine이 소유한다. 아래 설명은 engine 동작의 파생 문서이며, engine과 어긋나면 engine이 정답이다.
 
 기본:
 
@@ -2070,6 +2155,8 @@ AGENT_ROUTING:
 Final Reviewer는 `AGENT_ROUTING:`에 `final_review reviewer=<command> (<origin>)`로 함께 기록한다.
 
 ## 17. Final Adversarial Review
+
+> **NON-AUTHORITATIVE (graph-owned).** 이 절의 routing 규칙은 deterministic workflow engine이 소유한다. 아래 설명은 engine 동작의 파생 문서이며, engine과 어긋나면 engine이 정답이다.
 
 모든 requested phase가 자신의 **phase gate**를 PASS한 직후 Coordinator는 예외 없이 Final Adversarial
 Review gate를 한 번 실행한다. phase gate는 risk가 정한다(§8) — LOW에서는 Worker 자신의 결과이고

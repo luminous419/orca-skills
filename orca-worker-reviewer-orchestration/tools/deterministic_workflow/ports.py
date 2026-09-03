@@ -32,8 +32,16 @@ class ArtifactStorePort(Protocol):
 
 @runtime_checkable
 class RuntimeStatePort(Protocol):
+    """Durable claim/receipt/settlement ledger keyed by stable intent identity.
+
+    ``claim`` is written *before* the external effect is attempted so that a restart can
+    distinguish "never started" from "may already exist" without re-running the effect.
+    """
+
     def get_receipt(self, intent_id: str) -> Mapping[str, Any] | None: ...
+    def get_settlement(self, intent_id: str) -> SettlementEvent | None: ...
     def claim(self, intent: ActionIntent) -> Mapping[str, Any]: ...
+    def record_receipt(self, intent_id: str, receipt: Mapping[str, Any]) -> Mapping[str, Any]: ...
     def settle(self, intent_id: str, event: SettlementEvent) -> Mapping[str, Any]: ...
 
 

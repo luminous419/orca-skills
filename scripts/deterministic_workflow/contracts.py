@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
+import re
 from typing import Any, Literal, TypedDict
 
 SCHEMA_VERSION = "os40.workflow.v1"
@@ -78,8 +80,12 @@ class EventValidationError(ValueError):
         self.code = code
 
 
+# A settlement rejected for any of these reasons must never have its result applied.
+EVENT_REJECTION_CODES = frozenset({"MALFORMED_EVENT", "UNKNOWN_EVENT", "SETTLEMENT_INTEGRITY"})
+
+
 def validate_event(intent: ActionIntent, event: dict[str, Any]) -> SettlementEvent:
-    """Validate the closed settlement vocabulary before its result is applied."""
+    """Validate the closed settlement vocabulary and identity before its result is applied."""
     if set(event) != set(SettlementEvent.__required_keys__) or not isinstance(event.get("result"), dict):
         raise EventValidationError("MALFORMED_EVENT", "closed settlement fields/result required")
     if (event.get("schema_version") != EVENT_SCHEMA_VERSION
@@ -92,7 +98,29 @@ def validate_event(intent: ActionIntent, event: dict[str, Any]) -> SettlementEve
             raise EventValidationError("UNKNOWN_EVENT", "unknown worker status")
     elif result.get("result") not in {"PASS", "FAIL"}:
         raise EventValidationError("UNKNOWN_EVENT", "unknown reviewer result")
+    # Identity is closed: a checkpointed settlement whose result, intent/command binding,
+    # digest, timestamp or event ID was altered no longer matches its canonical payload.
+    if event["intent_id"] != intent["intent_id"] or event["command_id"] != intent["command_id"]:
+        raise EventValidationError("SETTLEMENT_INTEGRITY", "settlement is bound to another intent/command")
+    if not _well_formed_timestamp(event["occurred_at"]):
+        raise EventValidationError("MALFORMED_EVENT", "settlement timestamp is malformed")
+    digest = settlement_digest(intent, result)
+    if not _constant_time_equal(event["payload_digest"], digest):
+        raise EventValidationError("SETTLEMENT_INTEGRITY", "settlement payload digest mismatch")
+    if not _constant_time_equal(event["event_id"], _event_id(digest)):
+        raise EventValidationError("SETTLEMENT_INTEGRITY", "settlement event identity mismatch")
     return event  # type: ignore[return-value]
+
+
+def _constant_time_equal(left: Any, right: str) -> bool:
+    return isinstance(left, str) and hmac.compare_digest(left, right)
+
+
+_TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})")
+
+
+def _well_formed_timestamp(value: Any) -> bool:
+    return isinstance(value, str) and bool(_TIMESTAMP.fullmatch(value))
 
 
 def canonical_bytes(value: Any) -> bytes:
@@ -126,4 +154,49 @@ def make_intent(state: dict[str, Any], role: Role, round_kind: str) -> ActionInt
         "final_review_iteration": identity["final_review_iteration"], "role": role,
         "round_kind": round_kind, "artifact_binding": state["artifact_binding"],
         "repository_binding": state["repository_binding"], "payload_digest": payload_digest,
+    }
+
+
+def settlement_payload(intent: ActionIntent, result: dict[str, Any]) -> dict[str, Any]:
+    """The canonical settlement payload: the closed input to digest and event identity.
+
+    Every field an applied settlement can influence is bound in here, so a mutation of
+    the result, of the role, or of the intent/command binding changes the digest.
+    """
+    return {
+        "schema_version": EVENT_SCHEMA_VERSION, "event_kind": "AGENT_SETTLED",
+        "outcome": "SUCCEEDED", "intent_id": intent["intent_id"],
+        "command_id": intent["command_id"], "role": intent["role"],
+        "intent_payload_digest": intent["payload_digest"], "result": result,
+    }
+
+
+def settlement_digest(intent: ActionIntent, result: dict[str, Any]) -> str:
+    return hashlib.sha256(canonical_bytes(settlement_payload(intent, result))).hexdigest()
+
+
+def _event_id(payload_digest: str) -> str:
+    return stable_id("event", {"payload_digest": payload_digest})
+
+
+def settlement_event_id(intent: ActionIntent, result: dict[str, Any]) -> str:
+    """Event identity is a pure function of the canonical payload.
+
+    ``occurred_at`` is deliberately excluded: identity must be reproducible when a restarted
+    process re-derives the same settlement, and it must be identical across adapters whose
+    clocks differ.  The timestamp is still validated for shape and, being read by no gate,
+    can influence no applied decision.
+    """
+    return _event_id(settlement_digest(intent, result))
+
+
+def make_settlement_event(intent: ActionIntent, result: dict[str, Any], *,
+                          occurred_at: str) -> SettlementEvent:
+    """Build the only settlement shape ``validate_event`` accepts for this intent."""
+    digest = settlement_digest(intent, result)
+    return {
+        "schema_version": EVENT_SCHEMA_VERSION, "event_id": _event_id(digest),
+        "intent_id": intent["intent_id"], "command_id": intent["command_id"],
+        "event_kind": "AGENT_SETTLED", "outcome": "SUCCEEDED", "result": result,
+        "occurred_at": occurred_at, "payload_digest": digest,
     }

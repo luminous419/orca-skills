@@ -20,6 +20,11 @@ ROUTE_TARGETS = {
     "PREPARE_CORRECTION": "PREPARE_INTENT", "PREPARE_REVALIDATION": "PREPARE_INTENT",
 }
 CYCLE_GUARDS = frozenset({"phase_budget", "final_budget", "phase_index_monotonic"})
+# The workflow decisions this graph owns outright.  The Skill document must declare exactly
+# this set and demote its own prose about them; ``validate_workflow_graph_docs`` enforces it,
+# so a decision added here fails validation until the document delegates it too.
+GRAPH_OWNED_DECISIONS = ("PHASE_TRANSITION", "PHASE_GATE", "CORRECTION_LOOP",
+                         "ITERATION_BUDGET", "FINAL_REVIEW_ROUTING")
 
 
 class GraphSpecError(ValueError): pass

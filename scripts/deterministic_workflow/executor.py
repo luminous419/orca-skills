@@ -4,27 +4,37 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
-from .contracts import BASE_CAPABILITIES, EventValidationError, make_intent, validate_event
+from .contracts import (BASE_CAPABILITIES, EVENT_REJECTION_CODES, EventValidationError,
+                        make_intent, validate_event)
 from .routing import active_correction_phase, downstream_revalidation_set, missing_capabilities, responsible_phases, route
-from .state import StateError, validate_state
+from .runtime_state import resolve_runtime_state
+from .state import StateError, normalize_malformed_state, validate_state
 
 
 def _trace(state: dict[str, Any], node: str, **extra: Any) -> list[dict[str, Any]]:
-    entry = {"sequence": len(state["logical_trace"]), "node": node,
-             "route": state.get("route_token"), "phase": state["current_phase"],
-             "phase_iteration": state["phase_iterations"][state["current_phase"]],
-             "final_review_iteration": state["final_review_iterations"],
-             "role": state.get("pending_role"), "round_kind": state["round_kind"],
+    # Read defensively: VALIDATE normalizes malformed input, and this stays total anyway so
+    # no trace append can turn a contracted BLOCKED terminal into an uncaught KeyError.
+    trace = state.get("logical_trace")
+    trace = trace if isinstance(trace, list) else []
+    phase = state.get("current_phase")
+    iterations = state.get("phase_iterations")
+    entry = {"sequence": len(trace), "node": node,
+             "route": state.get("route_token"), "phase": phase,
+             "phase_iteration": iterations.get(phase) if isinstance(iterations, dict) else None,
+             "final_review_iteration": state.get("final_review_iterations"),
+             "role": state.get("pending_role"), "round_kind": state.get("round_kind"),
              "intent_id": (state.get("pending_intent") or {}).get("intent_id"),
              "event_id": (state.get("pending_event") or {}).get("event_id"),
              "gate": None, "terminal_status": state.get("terminal_status"), "reason_code": None}
-    entry.update(extra); return [*state["logical_trace"], entry]
+    entry.update(extra); return [*trace, entry]
 
 
 def validate_node(state: dict[str, Any]) -> dict[str, Any]:
     try: validate_state(state, expected_thread_id=state.get("thread_id", ""))
-    except (StateError, TypeError, ValueError) as exc:
-        return {**state, "route_token": "BLOCK", "terminal_reason": {"code": "MALFORMED_STATE", "message": str(exc)}}
+    except (StateError, TypeError, ValueError, KeyError, AttributeError) as exc:
+        # Fail closed onto a *valid* state; returning the malformed dictionary made the very
+        # next trace append raise KeyError instead of reaching BLOCKED/MALFORMED_STATE.
+        return normalize_malformed_state(state, code="MALFORMED_STATE", message=str(exc))
     missing = missing_capabilities(BASE_CAPABILITIES, frozenset(state["adapter_capabilities"]))
     if missing:
         return {**state, "route_token": "BLOCK", "terminal_reason": {"code": "ADAPTER_CAPABILITY_MISSING", "message": ",".join(missing), "missing_capabilities": list(missing)}}
@@ -63,13 +73,50 @@ def prepare_intent_node(state: dict[str, Any]) -> dict[str, Any]:
     return new
 
 
-def execute_intent_node(adapter: Any):
+def _settle_now(adapter: Any, runtime_state: Any, intent: dict[str, Any]) -> dict[str, Any]:
+    adapter.start(intent)
+    event = adapter.settlement(intent["intent_id"])
+    if event is None: raise StateError("OUT_OF_ORDER_EVENT:settlement missing")
+    runtime_state.settle(intent["intent_id"], event)
+    return event
+
+
+def _execute_recoverable(adapter: Any, runtime_state: Any, intent: dict[str, Any]) -> dict[str, Any]:
+    """Claim the stable intent durably, then never create a second external effect for it."""
+    intent_id = intent["intent_id"]
+    record = runtime_state.get_receipt(intent_id)
+    if record is None:
+        # Intent-before-effect: the claim is durable before anything external can happen.
+        runtime_state.claim(intent)
+        return _settle_now(adapter, runtime_state, intent)
+    if record.get("payload_digest") != intent["payload_digest"]:
+        raise StateError(f"IDEMPOTENCY_CONFLICT:{intent_id}")
+    if record.get("status") == "SETTLED":
+        event = runtime_state.get_settlement(intent_id)
+        if event is not None: return event
+    # A claim survives without a settlement only when an earlier process died somewhere
+    # around the external effect.  Recover it by stable identity; never re-run it blindly.
+    event = adapter.settlement(intent_id)
+    if event is None:
+        raise StateError(f"IDEMPOTENCY_RECOVERY_REQUIRED:{record.get('status')}:{intent_id}")
+    runtime_state.settle(intent_id, event)
+    return event
+
+
+def execute_intent_node(adapter: Any, runtime_state: Any = None):
+    """Build the EXECUTE_INTENT node, refusing to run without a durable ledger.
+
+    The port is resolved once, at construction, so a path that cannot be crash-safe fails
+    before any state is processed rather than at the moment it would create the effect.
+    There is deliberately no port-less mode: that was how the default execution contract
+    stayed able to duplicate a Task/Dispatch across a restart.
+    """
+    ledger = resolve_runtime_state(adapter, runtime_state)
+
     def node(state: dict[str, Any]) -> dict[str, Any]:
         intent = state["pending_intent"]
         if not intent or state["intent_status"] != "PREPARED": raise StateError("OUT_OF_ORDER_EVENT:intent")
-        adapter.start(intent)
-        event = adapter.settlement(intent["intent_id"])
-        if event is None: raise StateError("OUT_OF_ORDER_EVENT:settlement missing")
+        event = _execute_recoverable(adapter, ledger, intent)
         return {**state, "pending_event": event, "intent_status": "SETTLED",
                 "logical_trace": _trace(state, "EXECUTE_INTENT", event_id=event["event_id"])}
     return node
@@ -91,7 +138,7 @@ def validate_settlement_node(state: dict[str, Any]) -> dict[str, Any]:
 
 def apply_result_node(state: dict[str, Any]) -> dict[str, Any]:
     new = deepcopy(state); intent, event = new["pending_intent"], new["pending_event"]
-    if (new.get("terminal_reason") or {}).get("code") in {"MALFORMED_EVENT", "UNKNOWN_EVENT"}:
+    if (new.get("terminal_reason") or {}).get("code") in EVENT_REJECTION_CODES:
         new["processed_command_ids"].append(intent["command_id"])
         new["processed_event_ids"].append(event["event_id"])
         new["pending_intent"] = None; new["pending_event"] = None; new["intent_status"] = "NONE"
