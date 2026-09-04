@@ -5,8 +5,12 @@ import json
 import re
 from typing import Any, TypedDict
 
-from .contracts import (ALL_PHASES, BASE_CAPABILITIES, CAPABILITIES, DECISION_STATES, RISKS,
-                        ROUND_KINDS, SCHEMA_VERSION, WORKFLOW_ID)
+from .contracts import (ACTION_SCHEMA_VERSION, ALL_PHASES, BASE_CAPABILITIES, CAPABILITIES,
+                        DECISION_STATES, EVENT_SCHEMA_VERSION, RISKS, ROLES, ROUND_KINDS,
+                        ROUTE_TOKENS, SCHEMA_VERSION, TERMINAL_STATUSES, WORKFLOW_ID,
+                        ActionIntent, SettlementEvent)
+
+INTENT_STATUSES = ("NONE", "PREPARED", "SETTLED")
 
 
 class StateError(ValueError):
@@ -79,6 +83,115 @@ def _checkpointable(value: Any, path: str = "state") -> None:
         raise StateError(f"NON_CHECKPOINTABLE_STATE:{path}")
 
 
+def _assert_iteration_domain(label: str, consumed: Any, remaining: Any, maximum: int) -> None:
+    """Every iteration domain is an exact integer pair inside ``0..max_iterations``.
+
+    The equality ``consumed + remaining == max`` alone is not an invariant: it is satisfied
+    by ``(-100, 105)`` for a maximum of 5, which grants 105 further attempts.  ``bool`` is
+    rejected explicitly because ``isinstance(True, int)`` is True and ``True + 4 == 5``, so
+    a boolean sails through both the type check and the sum.
+    """
+    for name, value in (("consumed", consumed), ("remaining", remaining)):
+        if type(value) is not int:
+            raise StateError(f"MALFORMED_STATE:{label} {name} type")
+        if not 0 <= value <= maximum:
+            raise StateError(f"MALFORMED_STATE:{label} {name} range")
+    if consumed + remaining != maximum:
+        raise StateError(f"MALFORMED_STATE:{label} sum")
+
+
+_OPTIONAL_STR_FIELDS = ("decision_reason_code", "quality_verdict", "pending_clarification_id")
+_OPTIONAL_DICT_FIELDS = ("worker_result", "reviewer_result", "final_reviewer_result",
+                         "terminal_reason")
+
+
+def _assert_value_domains(raw: dict[str, Any]) -> None:
+    """Check the *values* of every remaining known field, not just their names.
+
+    ``update_state`` merges caller-supplied values straight into a checkpoint, so a field
+    whose name is known but whose value is nonsense -- an invented decision state, a bogus
+    terminal status, a hand-built ``pending_intent`` -- would otherwise be committed and
+    then read back by the routing code as if the graph had produced it.
+    """
+    if raw["route_token"] is not None and raw["route_token"] not in ROUTE_TOKENS:
+        raise StateError("MALFORMED_STATE:route token")
+    if raw["terminal_status"] is not None and raw["terminal_status"] not in TERMINAL_STATUSES:
+        raise StateError("MALFORMED_STATE:terminal status")
+    if raw["intent_status"] not in INTENT_STATUSES:
+        raise StateError("MALFORMED_STATE:intent status")
+    if raw["pending_role"] is not None and raw["pending_role"] not in ROLES:
+        raise StateError("MALFORMED_STATE:pending role")
+    for key in _OPTIONAL_STR_FIELDS:
+        if raw[key] is not None and type(raw[key]) is not str:
+            raise StateError(f"MALFORMED_STATE:{key} type")
+    for key in _OPTIONAL_DICT_FIELDS:
+        if raw[key] is not None and type(raw[key]) is not dict:
+            raise StateError(f"MALFORMED_STATE:{key} type")
+    for phase, entry in raw["phase_passes"].items():
+        if entry is not None and type(entry) is not dict:
+            raise StateError(f"MALFORMED_STATE:phase pass {phase} type")
+    for finding in raw["blocking_findings"]:
+        if type(finding) is not dict:
+            raise StateError("MALFORMED_STATE:blocking finding type")
+    for key in ("processed_command_ids", "processed_event_ids", "requested_phases",
+                "correction_queue", "corrected_phases", "revalidation_queue",
+                "adapter_capabilities"):
+        if any(type(item) is not str for item in raw[key]):
+            raise StateError(f"MALFORMED_STATE:{key} member type")
+    for key, queue in (("correction_index", "correction_queue"),
+                       ("revalidation_index", "revalidation_queue")):
+        if not 0 <= raw[key] <= len(raw[queue]):
+            raise StateError(f"MALFORMED_STATE:{key} range")
+    if any(p not in ALL_PHASES for p in raw["correction_queue"] + raw["corrected_phases"]
+           + raw["revalidation_queue"]):
+        raise StateError("MALFORMED_STATE:queue phases")
+    _assert_pending_intent(raw)
+    _assert_pending_event(raw)
+
+
+def _assert_pending_intent(raw: dict[str, Any]) -> None:
+    intent = raw["pending_intent"]
+    if intent is None:
+        if raw["intent_status"] != "NONE":
+            raise StateError("MALFORMED_STATE:intent status without intent")
+        return
+    if type(intent) is not dict or set(intent) != set(ActionIntent.__required_keys__):
+        raise StateError("MALFORMED_STATE:pending intent shape")
+    if intent["schema_version"] != ACTION_SCHEMA_VERSION:
+        raise StateError("MALFORMED_STATE:pending intent schema")
+    if intent["role"] not in ROLES or intent["round_kind"] not in ROUND_KINDS:
+        raise StateError("MALFORMED_STATE:pending intent vocabulary")
+    if intent["phase"] not in ALL_PHASES or intent["run_id"] != raw["run_id"]:
+        raise StateError("MALFORMED_STATE:pending intent binding")
+    for key in ("intent_id", "command_id", "payload_digest", "action_kind"):
+        if type(intent[key]) is not str or not intent[key]:
+            raise StateError(f"MALFORMED_STATE:pending intent {key}")
+    for key in ("artifact_binding", "repository_binding"):
+        if type(intent[key]) is not dict:
+            raise StateError(f"MALFORMED_STATE:pending intent {key}")
+    for key in ("phase_iteration", "final_review_iteration"):
+        if type(intent[key]) is not int or intent[key] < 0:
+            raise StateError(f"MALFORMED_STATE:pending intent {key}")
+
+
+def _assert_pending_event(raw: dict[str, Any]) -> None:
+    event = raw["pending_event"]
+    if event is None:
+        return
+    if type(event) is not dict or set(event) != set(SettlementEvent.__required_keys__):
+        raise StateError("MALFORMED_STATE:pending event shape")
+    if event["schema_version"] != EVENT_SCHEMA_VERSION or type(event["result"]) is not dict:
+        raise StateError("MALFORMED_STATE:pending event schema")
+    for key in ("event_id", "intent_id", "command_id", "event_kind", "outcome",
+                "occurred_at", "payload_digest"):
+        if type(event[key]) is not str or not event[key]:
+            raise StateError(f"MALFORMED_STATE:pending event {key}")
+    if raw["pending_intent"] is not None and (
+            event["intent_id"] != raw["pending_intent"]["intent_id"]
+            or event["command_id"] != raw["pending_intent"]["command_id"]):
+        raise StateError("MALFORMED_STATE:pending event binding")
+
+
 def validate_state(raw: dict[str, Any], *, expected_thread_id: str) -> WorkflowState:
     _checkpointable(raw)
     json.dumps(raw, allow_nan=False)
@@ -112,13 +225,16 @@ def validate_state(raw: dict[str, Any], *, expected_thread_id: str) -> WorkflowS
     if set(raw["phase_iterations"]) != set(phases) or set(raw["phase_passes"]) != set(phases):
         raise StateError("MALFORMED_STATE:phase maps")
     maximum = raw["max_iterations"]
-    expected_remaining = {p: maximum - raw["phase_iterations"][p] for p in phases}
-    if raw["remaining_phase_budget"] != expected_remaining:
-        raise StateError("MALFORMED_STATE:phase budget")
-    if raw["remaining_final_budget"] != maximum - raw["final_review_iterations"]:
-        raise StateError("MALFORMED_STATE:final budget")
+    if set(raw["remaining_phase_budget"]) != set(phases):
+        raise StateError("MALFORMED_STATE:phase maps")
+    for phase in phases:
+        _assert_iteration_domain(f"phase budget:{phase}", raw["phase_iterations"][phase],
+                                 raw["remaining_phase_budget"][phase], maximum)
+    _assert_iteration_domain("final budget", raw["final_review_iterations"],
+                             raw["remaining_final_budget"], maximum)
     if raw["decision_state"] not in DECISION_STATES: raise StateError("MALFORMED_STATE:decision")
     if raw["round_kind"] not in ROUND_KINDS: raise StateError("MALFORMED_STATE:round kind")
+    _assert_value_domains(raw)
     # Phase/index coherence: every field the trace indexes must resolve.  A CORRECTION or
     # revalidation round legitimately points at a phase other than requested_phases[index],
     # so the exact-match rule applies only to the forward PHASE_GATE path.
@@ -162,3 +278,40 @@ def normalize_malformed_state(raw: Any, *, code: str, message: str) -> dict[str,
     state["route_token"] = "BLOCK"
     state["terminal_reason"] = {"code": code, "message": message}
     return dict(state)
+
+
+# ---- typed checkpoint updates -------------------------------------------------------
+# A raw dictionary update is the widest possible ingress: every known field is writable
+# with any value.  These commands narrow it to the small set of fields an operator has a
+# legitimate reason to set out of band, each with its own field-specific check.  The raw
+# dictionary path still exists (LangGraph's own signature) but is validated against the
+# complete merged checkpoint -- see ``GuardedWorkflowGraph.update_state``.
+UPDATE_COMMANDS: dict[str, tuple[str, ...]] = {
+    "SET_DECISION": ("decision_state", "decision_reason_code"),
+    "SET_CLARIFICATION": ("pending_clarification_id",),
+    "SET_REPOSITORY_BINDING": ("repository_binding",),
+    "SET_ARTIFACT_BINDING": ("artifact_binding",),
+    "CLEAR_PENDING": ("pending_intent", "pending_event", "intent_status"),
+}
+
+
+def typed_update(command: str, **fields: Any) -> dict[str, Any]:
+    """Build a checkpoint update from the closed command vocabulary.
+
+    The command names the exact field set it may write; an unknown command, a missing
+    field or an extra field is refused here, before the update reaches a checkpoint.
+    """
+    if command not in UPDATE_COMMANDS:
+        raise StateError(f"UNKNOWN_UPDATE_COMMAND:{command}")
+    allowed = set(UPDATE_COMMANDS[command])
+    if set(fields) != allowed:
+        raise StateError(
+            f"MALFORMED_UPDATE_COMMAND:{command}:expected {sorted(allowed)}, "
+            f"got {sorted(fields)}")
+    if command == "SET_DECISION" and fields["decision_state"] not in DECISION_STATES:
+        raise StateError("MALFORMED_UPDATE_COMMAND:SET_DECISION:decision_state")
+    if command == "CLEAR_PENDING" and (fields["pending_intent"] is not None
+                                       or fields["pending_event"] is not None
+                                       or fields["intent_status"] != "NONE"):
+        raise StateError("MALFORMED_UPDATE_COMMAND:CLEAR_PENDING:not a clear")
+    return dict(fields)

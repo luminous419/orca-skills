@@ -1,0 +1,22 @@
+{
+  "assumption": null,
+  "boundary": "phase_gate",
+  "evidence": {},
+  "grounds": "The blocking finding named the six reproduction cases, the two missing validation layers and the required guards exactly; the receipt key set was read off the adapters that actually write it (OrcaAdapter task_id/dispatch_id, FakeAdapter external_id, the lookup path intent_id) rather than guessed, and the settlement key set is the existing canonical SettlementEvent vocabulary. No option required user authority.",
+  "iteration": 2,
+  "ledger_schema_version": 1,
+  "open_decision_item": false,
+  "open_item": null,
+  "phase": "BUGFIX",
+  "reason_code": null,
+  "recorded_at": "2026-09-04T00:18:50.982326+00:00",
+  "responsible_phase": "BUGFIX",
+  "role": "worker",
+  "run": "run_8288bf8f1d89",
+  "scope": "This phase's own conduct at this iteration.",
+  "sequence": 3,
+  "source": "worker_result",
+  "source_binding": "artifacts/runs/run_8288bf8f1d89/",
+  "state": "CLEAR",
+  "verdict": ""
+}

@@ -1,0 +1,22 @@
+{
+  "assumption": null,
+  "boundary": "final_gate",
+  "evidence": {},
+  "grounds": "The final adversarial gate is an evidence-based code verdict, and the reproduced stale-owner write violates the explicit ownership contract without requiring any user-authority choice.",
+  "iteration": 1,
+  "ledger_schema_version": 1,
+  "open_decision_item": false,
+  "open_item": null,
+  "phase": "FINAL_REVIEW",
+  "reason_code": null,
+  "recorded_at": "2026-09-04T00:30:46.614918+00:00",
+  "responsible_phase": "FINAL_REVIEW",
+  "role": "reviewer",
+  "run": "run_8288bf8f1d89",
+  "scope": "This phase's own conduct at this iteration.",
+  "sequence": 5,
+  "source": "reviewer_result",
+  "source_binding": "artifacts/runs/run_8288bf8f1d89/",
+  "state": "CLEAR",
+  "verdict": "FAIL"
+}

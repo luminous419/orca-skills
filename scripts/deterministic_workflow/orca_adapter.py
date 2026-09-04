@@ -5,8 +5,8 @@ import json
 from copy import deepcopy
 from typing import Any, Callable
 
-from .contracts import (BASE_CAPABILITIES, ActionIntent, SettlementEvent,
-                        make_settlement_event)
+from .contracts import (BASE_CAPABILITIES, EXTERNAL_LOOKUP, ActionIntent,
+                        ExternalLookupUnavailable, SettlementEvent, make_settlement_event)
 
 
 class OrcaAdapter:
@@ -22,9 +22,73 @@ class OrcaAdapter:
         self._events: dict[str, SettlementEvent] = {}
 
     def capabilities(self) -> frozenset[str]:
+        """The capabilities Orca's primitives actually support -- and no others.
+
+        ``external_lookup`` is declared because ``orca orchestration task-list --run`` returns
+        each Task's full spec, and every spec this adapter creates is the canonical intent
+        JSON, so an existing Task can be found by stable ``intent_id``.
+
+        ``external_resume`` is deliberately **not** declared.  ``worker_done`` is delivered
+        once, to the message stream of the process that owns the run; a settlement delivered
+        to a process that has since died cannot be re-collected through any documented Orca
+        primitive, and ``task-create`` accepts no idempotency key that would let one be
+        reconstructed.  Rather than pretend otherwise, recovery of an already-dispatched
+        effect fails closed (``IDEMPOTENCY_RECOVERY_UNSUPPORTED`` -> BLOCKED) and the
+        remaining reconciliation is an operator decision.  Closing that window is OS-37's
+        production process/PTY ownership work, not OS-40's.
+        """
         return BASE_CAPABILITIES | frozenset(
-            {"dispatch_provenance", "dependency_edges", "runtime_ownership"}
+            {"dispatch_provenance", "dependency_edges", "runtime_ownership", EXTERNAL_LOOKUP}
         )
+
+    def lookup(self, intent: ActionIntent) -> dict[str, Any] | None:
+        """Find the Task created for this stable intent, or prove that none was.
+
+        Returns ``None`` only when the run's Task listing was read successfully and contains
+        no Task whose spec *is* this intent -- the one situation in which re-running the
+        effect is safe.  Matching parses each spec and compares the top-level ``intent_id``
+        rather than searching the raw text, so an unrelated spec that merely quotes the id is
+        not mistaken for this intent's Task.  Anything that leaves existence unknown raises
+        :class:`ExternalLookupUnavailable` so the caller stops instead of guessing.
+        """
+        run_id = getattr(self.harness, "run_id", None)
+        if not run_id:
+            raise ExternalLookupUnavailable("no run is bound; task existence cannot be read")
+        try:
+            payload = self.harness.call("orchestration", "task-list", "--run", run_id)
+            tasks = payload["result"]["tasks"]
+        except Exception as exc:  # noqa: BLE001 - any read failure is "unknown", not "absent"
+            raise ExternalLookupUnavailable(f"task listing unreadable: {exc}") from exc
+        if not isinstance(tasks, list):
+            raise ExternalLookupUnavailable("task listing has an unexpected shape")
+        for task in tasks:
+            if not isinstance(task, dict) or "spec" not in task:
+                raise ExternalLookupUnavailable(
+                    "task listing omits specs; intent identity cannot be matched")
+            if self._spec_intent_id(task["spec"]) == intent["intent_id"]:
+                return {"task_id": task.get("id"), "intent_id": intent["intent_id"]}
+        return None
+
+    @staticmethod
+    def _spec_intent_id(spec: Any) -> str | None:
+        """The top-level ``intent_id`` of a Task spec this adapter wrote, or ``None``.
+
+        Every spec ``start`` creates is the canonical intent JSON, so identity is a parsed
+        field comparison.  A substring search over the raw text would also match a spec that
+        merely *mentions* the id -- for example one whose payload quotes another intent --
+        and a foreign spec must not be mistaken for this intent's effect.  Anything that is
+        not a JSON object simply belongs to no intent.
+        """
+        if not isinstance(spec, str):
+            return None
+        try:
+            parsed = json.loads(spec)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        found = parsed.get("intent_id")
+        return found if isinstance(found, str) else None
 
     @staticmethod
     def _parse_result(attempt: Any, intent: ActionIntent) -> dict[str, Any]:
@@ -41,7 +105,13 @@ class OrcaAdapter:
         return {"WORKER": "worker", "PHASE_REVIEWER": "reviewer",
                 "FINAL_REVIEWER": "final_reviewer"}[intent["role"]]
 
-    def start(self, intent: ActionIntent) -> dict[str, Any]:
+    def start(self, intent: ActionIntent, *, lease_token: str | None = None) -> dict[str, Any]:
+        """Create the Task once, recording its identity under the caller's lease.
+
+        Every ledger write below is fenced by ``lease_token``: an executor whose lease was
+        taken over while it was blocked in ``create_task`` is refused here rather than
+        overwriting the successor's receipt with a second Task's identity.
+        """
         existing = self._receipts.get(intent["intent_id"]) or self._durable_receipt(intent)
         if existing is not None:
             if existing["payload_digest"] != intent["payload_digest"]:
@@ -51,7 +121,7 @@ class OrcaAdapter:
         task_id = self.harness.create_task(spec)
         # The external Task now exists.  Record its durable identity immediately so a crash
         # before the dispatch settles cannot look like "never started" on the next process.
-        self._record_receipt(intent, {"task_id": task_id})
+        self._record_receipt(intent, {"task_id": task_id}, lease_token)
         phase = "final_review" if intent["role"] == "FINAL_REVIEWER" else intent["phase"].lower()
         iteration = (intent["final_review_iteration"] if intent["role"] == "FINAL_REVIEWER"
                      else intent["phase_iteration"] + 1)
@@ -67,14 +137,16 @@ class OrcaAdapter:
         self._receipts[intent["intent_id"]] = receipt
         self._events[intent["intent_id"]] = event
         # ``terminal`` is a runtime handle and is deliberately never persisted.
-        self._record_receipt(intent, {"task_id": task_id, "dispatch_id": attempt.dispatch_id})
+        self._record_receipt(intent, {"task_id": task_id, "dispatch_id": attempt.dispatch_id},
+                             lease_token)
         if self.runtime_state is not None:
-            self.runtime_state.settle(intent["intent_id"], event)
+            self.runtime_state.settle(intent["intent_id"], event, lease_token)
         return deepcopy(receipt)
 
-    def _record_receipt(self, intent: ActionIntent, receipt: dict[str, Any]) -> None:
+    def _record_receipt(self, intent: ActionIntent, receipt: dict[str, Any],
+                        lease_token: str | None) -> None:
         if self.runtime_state is not None:
-            self.runtime_state.record_receipt(intent["intent_id"], receipt)
+            self.runtime_state.record_receipt(intent["intent_id"], receipt, lease_token)
 
     def _durable_receipt(self, intent: ActionIntent) -> dict[str, Any] | None:
         """Recover an external effect created by an earlier process, by stable identity."""

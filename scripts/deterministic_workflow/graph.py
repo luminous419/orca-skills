@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from copy import deepcopy
 from typing import Any
 from weakref import WeakKeyDictionary
 
@@ -10,9 +11,10 @@ from langgraph.graph import END, START, StateGraph
 from .executor import (advance_phase_node, apply_result_node, execute_intent_node,
                        prepare_intent_node, route_node, terminal_node,
                        validate_node, validate_settlement_node)
-from .graph_spec import ROUTE_TARGETS, validate_graph_spec
+from .graph_spec import NODES, ROUTE_TARGETS, validate_graph_spec
 from .runtime_state import resolve_runtime_state
-from .state import StateError, WorkflowState, normalize_malformed_state
+from .state import (StateError, WorkflowState, normalize_malformed_state, typed_update,
+                    validate_state)
 
 CLOSED_STATE_FIELDS = frozenset(WorkflowState.__required_keys__)
 
@@ -29,6 +31,18 @@ GUARDED_INGRESS = frozenset({
     "invoke", "ainvoke", "stream", "astream", "batch", "abatch",
     "update_state", "aupdate_state",
 })
+
+# Convenience wrappers around the closed ``state.UPDATE_COMMANDS`` vocabulary.  They are
+# not LangGraph ingress APIs -- each one funnels into the guarded ``update_state`` above --
+# so they are named separately from :data:`GUARDED_INGRESS`, which must keep matching the
+# installed runtime's own surface.
+TYPED_UPDATE_API = frozenset({"update_state_command", "aupdate_state_command"})
+
+# ``as_node`` selects which node a resumed run continues from, so it can skip VALIDATE
+# entirely.  Only real graph nodes are accepted, and -- because VALIDATE may be skipped --
+# every update is validated against the complete merged checkpoint at this boundary
+# instead of relying on VALIDATE running afterwards.
+ALLOWED_UPDATE_NODES = frozenset(NODES)
 
 # The only names ``__getattr__`` will delegate.  Each reads existing state, topology,
 # schema or metadata; none accepts graph state, and none hands back an unguarded runnable.
@@ -50,6 +64,23 @@ READ_ONLY_PASSTHROUGH = frozenset({
 # graph, which is what ``test_no_public_member_of_the_facade_yields_an_unguarded_graph``
 # asserts.  The map is weak so a discarded façade does not pin its graph in memory.
 _COMPILED_GRAPHS: "WeakKeyDictionary[Any, Any]" = WeakKeyDictionary()
+
+
+def _merge_checkpoint(current: dict[str, Any], values: Any) -> dict[str, Any]:
+    """The exact checkpoint an update would commit.
+
+    LangGraph omits a channel from a snapshot when its value is ``None``, so the closed
+    field set is restored explicitly before the caller's values are merged over it; the
+    result is the complete state ``validate_state`` has to accept.  An empty snapshot means
+    there is no checkpoint on this thread, and an update to a thread that has never run is
+    refused rather than seeded blind.
+    """
+    if not current:
+        raise StateError("MALFORMED_STATE:no checkpoint to update")
+    merged: dict[str, Any] = {field: None for field in CLOSED_STATE_FIELDS}
+    merged.update(deepcopy(current))
+    merged.update(deepcopy(dict(values)))
+    return merged
 
 
 class GuardedWorkflowGraph:
@@ -114,6 +145,45 @@ class GuardedWorkflowGraph:
         if unknown:
             raise StateError(f"MALFORMED_STATE:unknown fields:{','.join(unknown)}")
 
+    def _guard_update(self, config: Any, values: Any, as_node: Any) -> None:
+        """Validate the *whole merged checkpoint* an update would commit, or refuse.
+
+        Checking field names alone accepted any value for a known key, and LangGraph's
+        ``update_state`` writes straight into the checkpoint and can resume from the
+        selected node without passing through VALIDATE.  So the merge is performed here,
+        against the persisted state, and the result must satisfy exactly the same
+        :func:`validate_state` contract the graph enforces internally -- decision state,
+        phase/index coherence, every iteration budget, pending intent/event shapes and the
+        terminal combination included.
+        """
+        if as_node is not None and as_node not in ALLOWED_UPDATE_NODES:
+            raise StateError(f"MALFORMED_STATE:unknown as_node:{as_node}")
+        if values is None:
+            return
+        if not isinstance(values, Mapping):
+            raise StateError(
+                f"MALFORMED_STATE:update must be a mapping, got {type(values).__name__}")
+        self._assert_known_update(values)
+        snapshot = _COMPILED_GRAPHS[self].get_state(config)
+        current = dict(getattr(snapshot, "values", None) or {})
+        merged = _merge_checkpoint(current, values)
+        validate_state(merged, expected_thread_id=merged.get("thread_id", ""))
+
+    async def _aguard_update(self, config: Any, values: Any, as_node: Any) -> None:
+        """Async twin of :meth:`_guard_update`; the async ingress is guarded identically."""
+        if as_node is not None and as_node not in ALLOWED_UPDATE_NODES:
+            raise StateError(f"MALFORMED_STATE:unknown as_node:{as_node}")
+        if values is None:
+            return
+        if not isinstance(values, Mapping):
+            raise StateError(
+                f"MALFORMED_STATE:update must be a mapping, got {type(values).__name__}")
+        self._assert_known_update(values)
+        snapshot = await _COMPILED_GRAPHS[self].aget_state(config)
+        current = dict(getattr(snapshot, "values", None) or {})
+        merged = _merge_checkpoint(current, values)
+        validate_state(merged, expected_thread_id=merged.get("thread_id", ""))
+
     def _split_batch(self, inputs: list[Any], config: Any):
         """Partition a batch into refusals and the entries the native batch may run."""
         rejections = [self._rejection(item) for item in inputs]
@@ -172,12 +242,21 @@ class GuardedWorkflowGraph:
         return self._merge_batch(rejections, completed)
 
     def update_state(self, config: Any, values: Any, as_node: Any = None) -> Any:
-        self._assert_known_update(values)
+        self._guard_update(config, values, as_node)
         return _COMPILED_GRAPHS[self].update_state(config, values, as_node=as_node)
 
     async def aupdate_state(self, config: Any, values: Any, as_node: Any = None) -> Any:
-        self._assert_known_update(values)
+        await self._aguard_update(config, values, as_node)
         return await _COMPILED_GRAPHS[self].aupdate_state(config, values, as_node=as_node)
+
+    def update_state_command(self, config: Any, command: str, *, as_node: Any = None,
+                             **fields: Any) -> Any:
+        """Apply one of the closed :data:`state.UPDATE_COMMANDS` instead of a raw mapping."""
+        return self.update_state(config, typed_update(command, **fields), as_node=as_node)
+
+    async def aupdate_state_command(self, config: Any, command: str, *, as_node: Any = None,
+                                    **fields: Any) -> Any:
+        return await self.aupdate_state(config, typed_update(command, **fields), as_node=as_node)
 
 
 def build_graph(adapter: Any, *, checkpointer: Any = None, runtime_state: Any = None,

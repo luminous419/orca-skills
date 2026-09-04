@@ -24,8 +24,9 @@ from pathlib import Path
 from typing import Any
 
 from .contracts import BASE_CAPABILITIES
-from .executor import terminal_node
-from .runtime_state import resolve_runtime_state
+from .executor import IdempotencyRecoveryError, terminal_node
+from .runtime_state import (RuntimeStateConflict, resolve_runtime_state,
+                            runtime_state_error_code)
 from .state import StateError, initial_state, normalize_malformed_state, validate_state
 
 # Terminal status -> process exit code.  Distinct non-zero codes let a caller tell a
@@ -121,7 +122,25 @@ def execute_state(raw_state: dict[str, Any], *, adapter: Any, checkpointer: Any 
         config["configurable"] = {"thread_id": thread_id or raw_state["thread_id"]}
     graph = build_graph(adapter, checkpointer=checkpointer, runtime_state=runtime_state,
                         interrupt_before=interrupt_before, interrupt_after=interrupt_after)
-    return graph.invoke(raw_state, config)
+    try:
+        return graph.invoke(raw_state, config)
+    except RuntimeStateConflict as exc:
+        # A corrupt, incompatible or contended durable ledger stops the run *before* any
+        # further external effect, and is reported as BLOCKED rather than as a crash.  It is
+        # never silently treated as an empty ledger, which is what allowed every effect to be
+        # recreated.
+        blocked = dict(raw_state)
+        blocked["route_token"] = "BLOCK"
+        blocked["terminal_reason"] = {"code": runtime_state_error_code(exc), "message": str(exc)}
+        return terminal_node(blocked)
+    except IdempotencyRecoveryError as exc:
+        # An unreconcilable crash window is a terminal BLOCKED outcome, not a crash: the run
+        # stops with a named reason instead of re-creating an external effect it cannot prove
+        # is absent.  Exit code 1 distinguishes it from a completed or escalated run.
+        blocked = dict(raw_state)
+        blocked["route_token"] = "BLOCK"
+        blocked["terminal_reason"] = {"code": exc.code, "message": exc.detail}
+        return terminal_node(blocked)
 
 
 def demo_results() -> list[dict[str, Any]]:

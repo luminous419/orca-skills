@@ -14,6 +14,81 @@ the original effect, while the graph's processed event IDs prevent duplicate bud
 Process/terminal handles, credentials, clients, bytes, Paths, and unknown state fields are
 rejected from checkpoint state.
 
+Every checkpoint ingress is validated as a whole state, not by field name. `update_state` and
+`aupdate_state` merge the caller's values onto the persisted checkpoint and run the complete
+`validate_state` contract before committing, from every allowed `as_node`, because `as_node`
+can resume past `VALIDATE`. `state.UPDATE_COMMANDS` offers a closed typed-command vocabulary
+for the fields an operator legitimately sets out of band. Every iteration domain -- each phase
+budget and the Final Review budget -- must be an exact `int` (never `bool`) with
+`0 <= consumed <= max_iterations`, `0 <= remaining <= max_iterations` and
+`consumed + remaining == max_iterations`; the sum alone is not an invariant.
+
+## Ownership, leases, and recovery
+
+`FileRuntimeStateStore` runs `lock -> read -> validate -> claim -> persist -> unlock` as one
+inter-process critical section over a sidecar `fcntl.flock` file, and re-reads the ledger only
+*after* the lock is held, so two Coordinators racing one stable intent produce exactly one
+external start. Lock acquisition has an explicit, injectable timeout and never blocks forever.
+
+Each record carries `owner_id`, `lease_token`, `lease_expires_at` and `last_heartbeat_at`.
+While an owner keeps its lease fresh, another Coordinator's claim is refused and it takes the
+observer role (`observe`), which also has an explicit finite timeout: a silently killed owner
+cannot strand a successor. Lease arithmetic reads an injected `LeaseClockPort`, so no test
+sleeps. Ownership identity is the process (host + pid), so a second store object inside one
+process resumes its own work rather than locking itself out.
+
+The lease token is a **fence**, not just a renewal ticket. Exclusivity at claim time does not
+help if a superseded owner can still write: A claims, blocks inside a slow `create_task`, its
+lease expires, B takes over and starts its own Task, and A then returns and records *its*
+external identity — two external effects for one stable intent, arriving through the recovery
+path rather than the race path. Every ownership-sensitive transition (`record_receipt`,
+`settle`, `heartbeat`) therefore **requires** the current lease token and rejects a stale one
+(`RuntimeStateLeaseHeld`) or an absent one (`RuntimeStateLeaseRequired`); `lease_token=None`
+never means "skip the check". The executor carries the token minted by `claim()` into
+`AgentExecutionPort.start(intent, lease_token=...)`, and both adapters thread it into every
+ledger write, so the fence is live on the production path rather than an optional argument no
+caller passes.
+
+The ledger is validated strictly on read: schema version, top-level container, record
+container, closed record keys, status vocabulary, key/`intent_id` agreement, receipt and
+settlement shape, and settlement identity. A malformed or incompatible ledger raises
+`RuntimeStateCorrupt` *before* any external effect and is never read as an empty ledger.
+
+Records are closed at the field level too. A receipt holds only durable external identifiers
+(`RECEIPT_KEYS`: `task_id`, `dispatch_id`, `external_id`, `intent_id`), each a non-empty
+string, and once the effect exists (`EFFECTED`/`SETTLED`) it must name at least one of
+`RECEIPT_IDENTITY_KEYS` (`task_id`, `external_id`) — an `EFFECTED` record with an empty or
+identifier-free receipt asserts that an effect exists while naming nothing that could ever
+reconcile it, so it is corrupt on read rather than resumable. A stored settlement must carry
+exactly the canonical `SettlementEvent` vocabulary. `claim()` then re-checks the *stored*
+identity against the intent presenting itself across all of `IDENTITY_KEYS` (`run_id`,
+`phase`, `role`, `round_kind`, `command_id`, `payload_digest`) and raises
+`RuntimeStateConflict` on any mismatch: `validate_record` never sees the intent, so record
+coherence alone cannot prove the record belongs to *this* intent, and a digest-only
+comparison left every other identity field forgeable.
+
+Recovery of a claim left behind by a dead owner follows a fixed ladder that never duplicates
+an effect: ask the adapter for a settlement of the stable identity; resume/observe an
+`EFFECTED` record's already-named external effect; look an untracked `CLAIMED` record up by
+stable intent identity; re-run **only** when the lookup proves nothing was created; otherwise
+terminate `BLOCKED`. The two lookup/resume steps are *optional* adapter capabilities
+(`external_lookup`, `external_resume`); an adapter that cannot honestly implement one must not
+declare it, and the ladder then fails closed instead of guessing.
+
+## Repository and artifact binding
+
+A Worker settlement may carry a normalized `binding` (`repository`: `head_sha`, `tree_digest`,
+`dirty`; `artifact`: `artifact_root_id`, `relative_path`, `digest`, `evidence_ids`). It lives
+inside `result`, so it is covered by the settlement digest and a tampered binding fails the
+integrity check. `APPLY_RESULT` validates it against the intent -- the artifact root is pinned
+to the run's own -- and advances `repository_binding`/`artifact_binding` *before* the Reviewer
+is dispatched, so a Reviewer intent is always bound to the exact Worker output it judges. A
+review whose intent binding no longer matches state fails closed as `STALE_REVIEW_BINDING`.
+Gate passes record `head_sha`, `tree_digest`, `artifact_digest` and the full `reviewed_binding`;
+`routing.verify_final_review_binding` turns "the Final Reviewer reviewed the final head and
+artifacts" into a checkable fact, and a Final Review PASS bound to a stale tree cannot complete
+the run.
+
 ## Ports and adapters
 
 `ports.py` defines agent execution, artifact, runtime receipt, existing OS-30 human approval,
@@ -40,3 +115,29 @@ OS-31 may inject a durable LangGraph checkpointer and durable `RuntimeStatePort`
 tests and terminates NEEDS_INPUT/CONFLICT as BLOCKED. OS-37 implements `AgentExecutionPort` with
 structured argv, durable idempotency receipts, ownership, and capability declarations; the graph
 does not change. OS-38 source extraction remains out of scope.
+
+## Known limitations
+
+- **POSIX only.** The exclusive claim needs `fcntl.flock`. On a platform without it,
+  `FileRuntimeStateStore` refuses to construct (`RuntimeStateLockUnavailable`) rather than
+  degrade to the unlocked behaviour that allowed duplicate effects. Windows is unsupported.
+- **`OrcaAdapter` declares `external_lookup` but not `external_resume`.**
+  `orca orchestration task-list --run` returns each Task's full spec and every spec this
+  adapter creates is the canonical intent JSON, so an existing Task *can* be found by stable
+  `intent_id` — matching parses each spec and compares the top-level `intent_id`, so a foreign
+  spec that merely quotes the id is not mistaken for this intent's Task. But `worker_done` is delivered once, to the owning process's message stream:
+  a settlement delivered to a process that has since died cannot be re-collected through any
+  documented Orca primitive, and `task-create` accepts no idempotency key. Recovery of an
+  already-dispatched Orca effect therefore terminates `BLOCKED`
+  (`IDEMPOTENCY_RECOVERY_UNSUPPORTED`) and the reconciliation is an operator decision.
+  Closing that window is OS-37's production process/PTY ownership work.
+- **A residual create-then-crash window remains.** The durable claim is written before
+  `create_task`, so a crash is always detectable, but the external identifier only exists
+  after the call returns. Without a caller-supplied idempotency key the window cannot be
+  eliminated -- only made safe, which is what the lookup rung of the ladder does when the
+  adapter supports it.
+- **`InMemoryRuntimeStateStore` offers no inter-process exclusion.** Its lock is a thread
+  lock; it is for single-process tests and must not stand in for the file store.
+- **The runtime-state schema is `os40.runtime_state.v2`.** A `v1` ledger written by an earlier
+  build is refused as `INCOMPATIBLE_RUNTIME_STATE` (a BLOCKED terminal, exit code 1) rather
+  than silently ignored; stale ledgers must be removed deliberately.

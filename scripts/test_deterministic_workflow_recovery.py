@@ -73,8 +73,9 @@ class RuntimeStateStoreTests(unittest.TestCase):
         from scripts.deterministic_workflow.state import FORBIDDEN_KEYS
         intent = self.intent()
         store = self.store()
-        store.claim(intent)
-        store.record_receipt(intent["intent_id"], {"task_id": "task_1", "dispatch_id": "ctx_1"})
+        claimed = store.claim(intent)
+        store.record_receipt(intent["intent_id"], {"task_id": "task_1", "dispatch_id": "ctx_1"},
+                             claimed["lease_token"])
         raw = json.loads(self.path.read_text(encoding="utf-8"))
 
         def walk(node, path="root"):
@@ -180,7 +181,7 @@ class CrashWindowIdempotencyTests(unittest.TestCase):
         class DyingAdapter(FakeAdapter):
             """Creates the external effect, then dies before anything is recorded."""
 
-            def start(self, intent):
+            def start(self, intent, *, lease_token=None):
                 self.effect_count += 1
                 raise KeyboardInterrupt("process killed after external effect")
 
@@ -196,7 +197,7 @@ class CrashWindowIdempotencyTests(unittest.TestCase):
 
         second_store = self.store()
         second_adapter = FakeAdapter([WORKER], runtime_state=second_store)
-        with self.assertRaisesRegex(StateError, "IDEMPOTENCY_RECOVERY_REQUIRED"):
+        with self.assertRaisesRegex(StateError, "IDEMPOTENCY_RECOVERY_UNSUPPORTED"):
             execute_intent_node(second_adapter, runtime_state=second_store)(deepcopy(state))
         self.assertEqual(second_adapter.effect_count, 0, "crash window must not re-create the effect")
 

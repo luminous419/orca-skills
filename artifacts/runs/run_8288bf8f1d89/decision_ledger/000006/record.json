@@ -1,0 +1,22 @@
+{
+  "assumption": null,
+  "boundary": "phase_gate",
+  "evidence": {},
+  "grounds": "The blocking finding named one required correction with an explicit contract (make the lease token mandatory on every effect-writing transition and propagate it through the nine production call sites); the fix and its evidence follow directly from the existing ownership contract and needed no user-authority choice.",
+  "iteration": 3,
+  "ledger_schema_version": 1,
+  "open_decision_item": false,
+  "open_item": null,
+  "phase": "BUGFIX",
+  "reason_code": null,
+  "recorded_at": "2026-09-04T01:00:07.730175+00:00",
+  "responsible_phase": "BUGFIX",
+  "role": "worker",
+  "run": "run_8288bf8f1d89",
+  "scope": "This phase's own conduct at this iteration.",
+  "sequence": 6,
+  "source": "worker_result",
+  "source_binding": "artifacts/runs/run_8288bf8f1d89/",
+  "state": "CLEAR",
+  "verdict": ""
+}
