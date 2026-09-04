@@ -14,6 +14,7 @@ try:
     from scripts.orca_runtime_harness import (
         CLEANUP_AUTHORITY_STATES,
         CLOSE_ELIGIBLE_ROLES,
+        LATE_DEPENDENT_STATUSES,
         NEVER_CLOSE_ROLES,
         TERMINAL_ROLE_CLASSES,
         UNSETTLED_WORKER_STATES,
@@ -29,6 +30,7 @@ except ModuleNotFoundError:
     from orca_runtime_harness import (
         CLEANUP_AUTHORITY_STATES,
         CLOSE_ELIGIBLE_ROLES,
+        LATE_DEPENDENT_STATUSES,
         NEVER_CLOSE_ROLES,
         TERMINAL_ROLE_CLASSES,
         UNSETTLED_WORKER_STATES,
@@ -254,8 +256,20 @@ class OrcaRuntimeIntegrationTests(unittest.TestCase):
         self.assertEqual(timing_text.count("| iteration_end |"), 2)
 
     def assert_scenario_h(self, scenario_h) -> None:
-        """A dependent created after settlement stays pending; it is never dispatched."""
-        self.assertEqual(scenario_h.late_dependent_status, "pending")
+        """A dependent created after settlement is never dispatched.
+
+        OS-41: the STATUS such a Task reports at creation is runtime-defined and
+        differs between the two point verifications -- 1.4.184 leaves it `pending`,
+        1.4.196 evaluates the already-satisfied dependency and reports `ready`. It is
+        pinned to an allowlist so an unrecognized third value still fails closed,
+        while the invariant the scenario actually exists for -- the late dependent is
+        never dispatched -- is asserted on its own below rather than being smuggled
+        in through one runtime's spelling of "not dispatched yet".
+        """
+        self.assertIn(scenario_h.late_dependent_status, LATE_DEPENDENT_STATUSES)
+        # The harness records one RuntimeAttempt per dispatch it made, so exactly one
+        # attempt IS "the late dependent was never dispatched".
+        self.assertEqual(len(scenario_h.attempts), 1)
         self.assertEqual(scenario_h.attempts[0].task_status, "completed")
 
     def assert_scenario_i(self, scenario_i) -> None:
@@ -494,11 +508,38 @@ class FinalReviewRuntimeIntegrationTests(unittest.TestCase):
 
 
 class SessionReuseRuntimeIntegrationTests(unittest.TestCase):
-    """Opt-in scenario K: same-role session reuse against the real runtime (E-3).
+    """Opt-in scenario K: what the production reuse gate ANSWERS, against the real
+    runtime (E-3).
 
     Skipped unless ORCA_RUNTIME_TEST=1, exactly like the two integration classes
     above. Scenario K is deliberately outside run_runtime_scenarios(), whose A-I
     result set is pinned by an exact-set assertion; scenario J set that precedent.
+
+    OS-41 -- WHAT THIS COVERS, AND WHAT IT DELIBERATELY NO LONGER COVERS.
+
+    This scenario was written against Orca 1.4.184, where the deterministic fake agent
+    was adopted as a SUPERVISED worker and the reuse gate therefore had the evidence it
+    requires (`worker.state`, `terminalResource.releaseState`/`ownershipState`). It
+    asserted the granted path: two terminals, five dispatches each, every non-final
+    attempt recording `reuse:ownership-transfer-pending`.
+
+    On Orca 1.4.196 that supervised adoption is unavailable to any deterministic fake:
+    `worker-start` there runs a `dispatch_input` acknowledgement stage that only a real
+    recognized agent session completes. Every fake-agent dispatch is therefore TRACKED,
+    a tracked dispatch reports `worker.state: "unsupervised"` with no `terminalResource`
+    at all, and the gate refuses -- correctly, and by its own documented fail-closed
+    design, which forbids widening an allowlist to a value that does not prove what the
+    condition asks.
+
+    So on 1.4.196 this scenario verifies **that reuse is correctly REFUSED on the
+    tracked path**, with the gate's own named refusal reasons recorded, and that the
+    refusal really takes effect (a fresh session per phase). It does NOT verify that
+    supervised session reuse works. That claim belongs to the Orca 1.4.184 point
+    observation and to the offline contract suite, and `docs/COMPATIBILITY.md` records
+    the boundary. The assertions below are written to hold on either answer, and to
+    require that the accounting FOLLOWS the gate in both directions -- so a runtime
+    that grants reuse still has to produce the reused chains, and one that refuses
+    still has to produce fresh sessions.
 
     The four fields aggregated below are the ONLY first-order evidence D-4 allows for
     the efficiency numbers: the ledger's own `action` label is an accounting of a
@@ -564,23 +605,59 @@ class SessionReuseRuntimeIntegrationTests(unittest.TestCase):
         self.assertEqual(result.status, "COMPLETED")
         self.assertEqual(len(result.attempts), self.PHASES * 2)
 
-        # K-2: ten dispatches, two terminals -- one chain per role
-        self.assertEqual(result.terminal_creations, 2)
+        # K-2: the production gate was ASKED at every same-role transition, and it
+        # answered. A scenario that never reaches the gate proves nothing about it,
+        # so the count is exact rather than "at least one".
+        self.assertEqual(len(result.reuse_decisions), (self.PHASES - 1) * 2)
+        granted = [d for d in result.reuse_decisions if d["eligible"]]
+        refused = [d for d in result.reuse_decisions if not d["eligible"]]
+        for decision in result.reuse_decisions:
+            with self.subTest(dispatch=decision["dispatch_id"]):
+                self.assertIn(decision["role"], CLOSE_ELIGIBLE_ROLES)
+                self.assertTrue(decision["handle"])
+                if decision["eligible"]:
+                    # A granted decision that also names failures would mean the gate
+                    # returned eligible while a condition was failing.
+                    self.assertEqual(decision["reasons"], [])
+                else:
+                    # A refusal must SAY which condition refused. An empty reason list
+                    # is the "condition left as a placeholder" defect the gate's own
+                    # never-short-circuit design exists to catch.
+                    self.assertTrue(decision["reasons"])
+
+        # K-3: the terminal accounting FOLLOWS the gate, in both directions. Every
+        # attempt the gate did not hand a session to had to start a fresh one, and
+        # every attempt it did had to run on the session it named.
         self.assertEqual(
-            sum(1 for attempt in result.attempts if attempt.terminal_created), 2
+            result.terminal_creations, len(result.attempts) - len(granted)
         )
-        self.assertEqual(len({attempt.terminal for attempt in result.attempts}), 2)
-        self.assertEqual(len(result.reuse_chains), 2)
+        self.assertEqual(
+            sum(1 for attempt in result.attempts if attempt.terminal_created),
+            result.terminal_creations,
+        )
+        self.assertEqual(
+            len({attempt.terminal for attempt in result.attempts}),
+            result.terminal_creations,
+        )
+        # A chain is recorded only for a terminal that served more than one dispatch,
+        # so the chained dispatches and the fresh ones must add up to every attempt.
+        chained = sum(len(chain) for chain in result.reuse_chains.values())
+        self.assertEqual(
+            chained + (result.terminal_creations - len(result.reuse_chains)),
+            len(result.attempts),
+        )
         for handle, chain in result.reuse_chains.items():
             with self.subTest(handle=handle):
-                self.assertEqual(len(chain), self.PHASES)
-                self.assertEqual(len(set(chain)), self.PHASES)
+                self.assertEqual(len(set(chain)), len(chain))
 
-        # K-3: every attempt but the last of each role is a reuse, and a reuse never
-        # sends a lifecycle mutation, so axis (b) is the only place it is recorded.
+        # K-4: per-attempt lifecycle invariants, true on either answer.
         reuse_attempts = [
-            attempt for attempt in result.attempts if attempt.worker_resource == "reuse"
+            attempt
+            for attempt in result.attempts
+            if attempt.lifecycle_action.startswith("reuse:")
         ]
+        # Every attempt but the last of each role is handed onward alive, whether or
+        # not the gate then accepts the session for the next one.
         self.assertEqual(len(reuse_attempts), (self.PHASES - 1) * 2)
         for attempt in result.attempts:
             with self.subTest(dispatch=attempt.dispatch_id):
@@ -589,10 +666,13 @@ class SessionReuseRuntimeIntegrationTests(unittest.TestCase):
                 self.assertIn(attempt.terminal_role, TERMINAL_ROLE_CLASSES)
                 self.assertNotIn(attempt.worker_state, UNSETTLED_WORKER_STATES)
                 self.assertIn(attempt.cleanup_authority, CLEANUP_AUTHORITY_STATES)
+        # A reuse issues NO lifecycle mutation on either path; the label records which
+        # path produced it. Pinned as a closed set so a third spelling fails.
         for attempt in reuse_attempts:
             with self.subTest(dispatch=attempt.dispatch_id):
-                self.assertEqual(
-                    attempt.lifecycle_action, "reuse:ownership-transfer-pending"
+                self.assertIn(
+                    attempt.lifecycle_action,
+                    {"reuse:ownership-transfer-pending", "reuse:tracked-external"},
                 )
 
         # K-4: identity is new on every attempt even though the session is not
@@ -610,12 +690,33 @@ class SessionReuseRuntimeIntegrationTests(unittest.TestCase):
         self.assertTrue(snapshot_path.is_file(), snapshot_path)
         snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
         fields = self.receipt_fields(snapshot)
-        self.assertEqual(len(fields["terminal_effects"]), self.PHASES * 2)
-        # Two releases only: the last attempt of each role. Every other attempt is a
-        # reuse and issues nothing at all.
-        self.assertEqual(len(fields["release_process_actions"]), 2)
-        self.assertTrue(fields["retained_reasons"])
-        self.assertTrue(fields["ownership_states"])
+        # OS-41: these four fields are all read out of SUPERVISED receipts
+        # (`worker-start` effects, `worker-release`/`worker-retain` process actions,
+        # `worker-show`'s terminalResource). On a runtime that adopts the fake agent
+        # they are populated; on one where every dispatch is tracked there are no such
+        # receipts to read, and inventing a substitute is exactly the "the ledger's own
+        # label may not stand in for a receipt" error D-4 forbids. So the shape is
+        # tied to the path the run actually took rather than asserted unconditionally.
+        if fields["terminal_effects"]:
+            self.assertEqual(len(fields["terminal_effects"]), self.PHASES * 2)
+            # Two releases only: the last attempt of each role. Every other attempt is
+            # a reuse and issues nothing at all.
+            self.assertEqual(len(fields["release_process_actions"]), 2)
+            self.assertTrue(fields["retained_reasons"])
+            self.assertTrue(fields["ownership_states"])
+        else:
+            # The tracked path issues no worker-start, no release and no retain. Its
+            # release receipt is the agent process exiting, which the attempt records
+            # as `release:natural-exit` -- and there must be exactly one per role.
+            self.assertEqual(fields["release_process_actions"], [])
+            self.assertEqual(
+                sum(
+                    1
+                    for attempt in result.attempts
+                    if attempt.lifecycle_action == "release:natural-exit"
+                ),
+                2,
+            )
         self.assertEqual(
             snapshot["result"]["terminal_creations"], result.terminal_creations
         )

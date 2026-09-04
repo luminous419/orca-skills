@@ -104,9 +104,11 @@ python3 scripts/test_orca_runtime.py --orca-runtime \
 This uses only deterministic fake agents but creates real Orca Runs, Tasks,
 Dispatches, lifecycle messages, and terminal/resource observations. A custom
 fake executable that is not recognized for supervised attachment follows the
-version-matched guide's tracked-Dispatch fallback. The adapter currently supports
-Orca `1.4.184`; other versions or changed guide grammar are skipped before runtime
-state is created.
+version-matched guide's tracked-Dispatch fallback. The adapter is point-verified on
+Orca `1.4.184` and `1.4.196`; the check is exact set membership and not a range, so
+any other version — including one between those two — or changed guide grammar is
+skipped before runtime state is created. See
+[`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) for what each observation covers.
 
 ## 4. Global Installation — Recommended
 

@@ -11,7 +11,7 @@ in a specific environment.
 | `orca-worker-reviewer-loop` | Markdown Skill package; no Orca orchestration state required | Deterministic policy and fake-agent E2E verified |
 | `orca-worker-reviewer-orchestration` | Orca-native Run/Task/Dispatch lifecycle | Deterministic policy and fake-agent E2E verified |
 | Repository validator and tests | CPython 3.11, 3.12, and 3.13 | Supported by CI |
-| Real Orca runtime with fake agents | Orca 1.4.184 | **VERIFIED**, compatibility-gated by the opt-in Step 4 integration suite |
+| Real Orca runtime with fake agents | Orca 1.4.184 and Orca 1.4.196 | **VERIFIED** as two independent point observations, compatibility-gated by the opt-in Step 4 integration suite |
 | `claude-glm` Worker | Distinct PATH-resolved command in the tested company environment | **VERIFIED on Orca 1.4.178-rc.2** |
 | `claude-gemma` Reviewer | Separate PATH-resolved command and session in the tested company environment | **VERIFIED on Orca 1.4.178-rc.2** |
 | Real GLM/Gemma smoke | Isolated company fixture on Orca 1.4.178-rc.2 | **VERIFIED**; ANALYSIS, DESIGN, IMPLEMENTATION, BUGFIX, DESIGN → IMPLEMENTATION, and FAIL → correction → PASS |
@@ -24,21 +24,167 @@ standard library.
 
 - Deterministic policy validation: **VERIFIED**
 - Fake-agent E2E: **VERIFIED**
-- Real Orca with fake agents: **VERIFIED on Orca 1.4.184**
+- Real Orca with fake agents: **VERIFIED on Orca 1.4.184 and, separately, on Orca 1.4.196**
 - Real GLM/Gemma smoke test: **VERIFIED on Orca 1.4.178-rc.2 in the tested company environment**
 - Stable production-ready release: **NOT YET CLAIMED**
 
 Verified environments are point observations, not a continuous supported range:
 
 - Orca 1.4.184: deterministic real-Orca integration with fake agents.
+- Orca 1.4.196: deterministic real-Orca integration with fake agents (OS-41).
 - Orca 1.4.178-rc.2: real `claude-glm` Worker and `claude-gemma` Reviewer smoke test.
 
-The Step 4 runtime harness remains deliberately compatibility-gated to 1.4.184. The
+Nothing about the two fake-agent observations is a range. `validate_orca_contract()`
+tests **set membership** against `SUPPORTED_ORCA_APP_VERSIONS`, never an ordering
+comparison, so 1.4.190 (between the two verified points) and 1.4.197 (just past the
+newer one) are both refused, and adding an entry requires actually running the suite
+on that runtime. A version that is listed still has to pass the guide-grammar check.
+
+The Step 4 runtime harness remains deliberately compatibility-gated. The
 Step 5 environment's version-matched `orchestration` and `orca-cli` grammar contained
 the required contract and the real-agent scenarios passed, but that does not establish
 support for every version between these two observations. The Skill itself reads the
 installed version-matched guides and does not hard-code either version as universal
 command grammar.
+
+## Orca 1.4.196 point verification (OS-41)
+
+Verified by running `python3 scripts/test_orca_runtime.py --orca-runtime` against an
+installed Orca 1.4.196. This section records what 1.4.196 does **differently** from the
+1.4.184 observation. Every item below was read from the live runtime; none is inferred
+from a version number, and none of it is claimed for any version in between.
+
+### Supervised `worker-start --terminal` no longer adopts a non-agent process
+
+This is the substantive change. On 1.4.184 the repository's deterministic fake agent
+was adopted as a supervised worker, and 250 supervised attempts are recorded in the
+historical artifacts. On 1.4.196 `worker-start` runs a `dispatch_input` stage that
+delivers the task preamble into the terminal as a bracketed paste and then waits for the
+agent's own **acknowledgement** before promoting the Dispatch from `pending` to
+`dispatched`. Only a genuine recognized agent session produces that acknowledgement. A
+scripted process cannot, and this was tested rather than assumed: a fake that stays
+alive, echoes the prompt and prints continuously for 30+ seconds still leaves the
+Dispatch at `status: pending`, `worker.state: starting`, `worker.stage:
+authority_attached`, and `worker-start` ends with `state: failed`, `failedStage:
+dispatch_input`, `lastError: agent_prompt_stalled`. That outcome also marks the **Task**
+`failed`, and only `ready` tasks can be dispatched, so there is no recovery and no
+fallback from it. Orca exposes no way to register a custom agent command.
+
+Consequences, all of them deliberate:
+
+- The test-only shim is `scripts/fake_bin/fake-agent`, not `scripts/fake_bin/codex`. It
+  no longer borrows a recognized agent's name, so 1.4.196 refuses it up front with
+  `agent_unconfigured` — creating **no** Dispatch and leaving the Task `ready` — and the
+  run takes the version-matched guide's documented tracked-Dispatch path
+  (`orchestration dispatch` plus `terminal send`). That is rung 4 of the placement
+  ladder, and it is the path the guide itself prescribes for a target that is not a
+  recognized agent CLI.
+- On 1.4.196 the fake-agent suite therefore exercises the **tracked** lifecycle path.
+
+### NOT VERIFIED on Orca 1.4.196: supervised worker-resource adoption and reuse
+
+Stated plainly, because a reader must not infer it from the passing suite:
+
+**The supervised worker-resource adoption and reuse path is NOT VERIFIED on Orca
+1.4.196.** It cannot be, with deterministic fake agents: 1.4.196's `dispatch_input`
+acknowledgement stage is completable only by a genuine recognized agent session, and
+this repository's runtime suite is required to use deterministic fakes and never a real
+LLM worker. **Orca 1.4.184 remains the point observation for the supervised path**, and
+the offline contract suite in `scripts/test_orca_runtime_contract.py` continues to cover
+the supervised code paths deterministically.
+
+Concretely, on 1.4.196 the reuse gate `reuse_eligible()` refuses every same-role
+transition, naming `worker_state_not_reusable`, `release_state_missing`,
+`ownership_not_transferable` and `terminal_effect_unrecorded` — the four conditions
+whose evidence exists only for a supervised dispatch. Each refusal returns `None` and the
+attempt opens a fresh terminal, so the scenario records **eight refused decisions and ten
+terminals for ten dispatches**, not two
+(`artifacts/orca-runtime/os41-final/scenario-k.json`). That refusal is correct and is
+the gate's documented fail-closed behaviour; the gate was **not** widened to accept
+tracked evidence. Scenario K therefore verifies **"reuse correctly refused (fail-closed)
+on the tracked path"** on this runtime. It does **not** verify that session reuse works,
+and it must not be described that way.
+
+The 1.4.184 records above are unchanged; this section adds to them and edits none of
+them.
+
+### `worker-start` reports a non-ready launch with `ok: true`
+
+`orca agent-context --json` states that the call "exits 0 only for ready". The JSON body
+carries the real outcome in `state`, alongside `stage`, `failedStage`, `lastError`,
+`effects`, `residualResources` and `mutation` — and it carries a `dispatchId` **even for
+a failed start**, because the Dispatch row really was created. Reading that id and
+recording a supervised worker is exactly "prompt delivery inferred from Task/Dispatch
+existence", so the harness now admits a supervised attachment only for
+`state == "ready"`, and refuses every other value with the whole launch diagnosis
+attached. A result carrying no `state` key at all keeps its legacy reading, because that
+is the 1.4.184 shape and 1.4.184 is still a point verification.
+
+### A Dispatch is `pending` while its prompt is being delivered
+
+An agent holding the injected preamble reads `dispatch.status: pending` until
+`worker-start`'s composition finishes. `worker_done` sent against a pending Dispatch is
+refused (`inactive_dispatch`), so `pending` is not a state an agent may act on — but
+exiting on it is worse: it ends the agent process mid-start, and `worker-start` then
+fails the whole composition with `dispatch_inactive`. The fake agent therefore **waits**
+for `dispatched` under a bounded deadline, and still fails closed on a settled,
+abandoned or unrecognized status.
+
+### The runtime publishes its own unexpected-exit escalation
+
+When a dispatched agent process ends without settling, 1.4.196 sends an `escalation`
+("Agent exited unexpectedly (Agent process ended; this host cannot report why)") whose
+payload carries `taskId`, `dispatchId`, `exitCode`, `exitCause` and `handle`, and whose
+stored top-level `sender_pane_key` is **present and null**. 1.4.184 published nothing.
+
+The harness treats that message as **evidence**, and the distinction that makes it safe
+to do so is worth stating precisely, because getting it wrong once let a worker-authored
+message through:
+
+- **Not authorship evidence:** the message type, the subject wording, the `high`
+  priority, and every payload field — `taskId`, `dispatchId`, `handle`, `exitCode`,
+  `exitCause`. `orca orchestration send` accepts `--type`, `--subject`, `--priority` and
+  arbitrary `--payload`, so a dispatched agent can reproduce all of them. They are
+  checked as **identity and shape validation, and as defence in depth**: they bind the
+  message to the exact Task, Dispatch and terminal under observation and reject a
+  malformed report.
+- **The sole observed authorship discriminator:** `sender_pane_key`, a **top-level
+  stored field on the message record** rather than a payload member, which no
+  `orchestration send` flag can reach. It is required **present and null**; an absent
+  key is rejected rather than read as the runtime's null, and a non-null value is a
+  worker-authored message. Four attempts to null it from a dispatched terminal (a plain
+  send, `env -u ORCA_PANE_KEY`, `setsid`, and `nohup … & disown` / a no-tty subshell)
+  all produced a non-null pane key, so Orca resolves the sending pane from process
+  ancestry rather than from the agent's environment.
+
+Scope, and the direction it fails in: the authorship claim is proven for a dispatched
+agent sending through `orchestration send`, which is the channel this threat model
+covers; it is not a claim that no process anywhere can produce a null pane key. If a
+genuine runtime report ever arrives without the key or with a non-null value, the
+harness refuses it and the observation fails loudly rather than being downgraded to an
+acceptance.
+
+Any other message in that delivery, a `worker_done` above all, is still a contract
+violation, because the claim under test is that the dispatch produced no lifecycle
+result of its own.
+
+### A late dependent Task is `ready`, not `pending`
+
+`task-create --deps [<already-completed task>]` reports `ready` on 1.4.196 and reported
+`pending` on 1.4.184. This is a satisfied-dependency answer and not a lost edge: on the
+same runtime a dependent whose dependency is still open is `pending`. The scenario that
+covers this asserts the invariant it actually exists for — the coordinator never
+dispatches such a Task — and pins the status to a two-value allowlist so an
+unrecognized third value still fails closed.
+
+### One defect this uncovered was ours, not Orca's
+
+The OS-29 decision-gate cursor (`_last_settled`) was harness-scoped but is
+semantically **Run**-scoped, so a second Run started on the same harness inherited the
+previous Run's settled round and had its own legitimate first boundary refused as
+`DECISION_GATE_INPUT_UNBOUND`. The multi-Run sequence is exercised only by this opt-in
+suite, which had been skipping since the version pin — so the defect shipped unexecuted.
+It is reset in `start_run()` beside the other per-Run resets.
 
 ## Real-agent lifecycle observation
 
