@@ -447,8 +447,9 @@ class CrashRecoveryLadderTests(unittest.TestCase):
         adapter = FakeAdapter([worker_result(artifact_root="run_recover")],
                               runtime_state=store, external_world=world)
         with patch.object(executor_module, "_recover",
-                          lambda adapter, ledger, intent, record, lease_token:
-                          executor_module._settle_now(adapter, ledger, intent, lease_token)):
+                          lambda adapter, ledger, intent, record, lease_token, keeper=None:
+                          executor_module._settle_now(adapter, ledger, intent, lease_token,
+                                                      keeper)):
             self.node(adapter, store)(deepcopy(state))
         self.assertEqual(adapter.effect_count, 1,
                          "without the ladder the already-running effect is duplicated")

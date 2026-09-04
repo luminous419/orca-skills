@@ -7,6 +7,7 @@ from typing import Any
 from .contracts import (BASE_CAPABILITIES, EVENT_REJECTION_CODES, EXTERNAL_LOOKUP,
                         EXTERNAL_RESUME, EventValidationError, ExternalLookupUnavailable,
                         binding_snapshot, make_intent, validate_event)
+from .lease_keeper import LeaseRenewalFailed, lease_keeper_factory
 from .routing import (active_correction_phase, downstream_revalidation_set,
                       final_review_binding_current, missing_capabilities, responsible_phases,
                       route)
@@ -91,15 +92,52 @@ def prepare_intent_node(state: dict[str, Any]) -> dict[str, Any]:
     return new
 
 
+def _still_owned(keeper: Any) -> None:
+    """The ownership checkpoint taken before every write that follows an external call.
+
+    ``keeper`` is optional only so the helpers below stay directly callable; on every path
+    the executor takes, one is supplied and renewal is live for the whole blocking call.
+    """
+    if keeper is not None:
+        keeper.raise_if_lost()
+
+
+def _committed(keeper: Any, write: Any, *args: Any) -> Any:
+    """Perform one ownership-sensitive write between two checkpoints, not just one.
+
+    A checkpoint *before* the write is not enough, and the reason is easy to miss: a renewal
+    that fails after that checkpoint does not necessarily rotate the lease token.  A
+    ``RuntimeStateLockTimeout`` or a transient unreadable ledger leaves the token perfectly
+    valid, so the fence -- correctly -- accepts the write that follows, and the recorded
+    renewal failure would then be swallowed: the node would return success and advance the
+    workflow on a claim it can no longer vouch for.
+
+    So the checkpoint is taken again once the write returns.  Whatever the keeper learned
+    while the write was in flight is honoured before this executor writes anything further,
+    reports success, or advances any state.  The write that already landed is left standing
+    on purpose: it is the durable record of an external effect that really did settle, and a
+    successor claiming the intent adopts it as ``ALREADY_SETTLED`` instead of re-running it.
+    What fails closed is *this* executor -- it names the loss as ``IDEMPOTENCY_LEASE_LOST``
+    rather than pretending the claim was healthy.
+    """
+    _still_owned(keeper)
+    result = write(*args)
+    _still_owned(keeper)
+    return result
+
+
 def _settle_now(adapter: Any, runtime_state: Any, intent: dict[str, Any],
-                lease_token: str) -> dict[str, Any]:
+                lease_token: str, keeper: Any = None) -> dict[str, Any]:
     # The token travels with the effect: whatever the adapter writes about this intent is
     # fenced by the same lease this executor holds, so a predecessor that lost ownership
-    # mid-``start`` cannot land its own external identity here.
+    # mid-``start`` cannot land its own external identity here.  ``start`` is the long
+    # blocking call -- minutes, not milliseconds -- so the keeper renews the lease
+    # throughout it and the checkpoint below refuses to settle if renewal ever failed.
     adapter.start(intent, lease_token=lease_token)
+    _still_owned(keeper)
     event = adapter.settlement(intent["intent_id"])
     if event is None: raise StateError("OUT_OF_ORDER_EVENT:settlement missing")
-    runtime_state.settle(intent["intent_id"], event, lease_token)
+    _committed(keeper, runtime_state.settle, intent["intent_id"], event, lease_token)
     return event
 
 
@@ -111,7 +149,7 @@ def _adapter_capabilities(adapter: Any) -> frozenset[str]:
 
 
 def _collect(adapter: Any, runtime_state: Any, intent: dict[str, Any],
-             receipt: dict[str, Any], lease_token: str) -> dict[str, Any]:
+             receipt: dict[str, Any], lease_token: str, keeper: Any = None) -> dict[str, Any]:
     """Step 3 of the recovery ladder: settle from the effect that already exists."""
     intent_id = intent["intent_id"]
     if EXTERNAL_RESUME not in _adapter_capabilities(adapter):
@@ -119,19 +157,21 @@ def _collect(adapter: Any, runtime_state: Any, intent: dict[str, Any],
             "IDEMPOTENCY_RECOVERY_UNSUPPORTED",
             f"{intent_id}: the adapter declares no {EXTERNAL_RESUME} capability, so an "
             "effect created by an earlier process can be neither observed nor collected")
+    # ``resume`` blocks on the external runtime exactly like ``start`` does.
     event = adapter.resume(intent, receipt)
+    _still_owned(keeper)
     if event is None:
         # The Task exists and is still running (or its outcome is unreadable).  Ownership
         # has been taken over and the effect observed; it is never re-created.
         raise IdempotencyRecoveryError(
             "IDEMPOTENCY_RECOVERY_BLOCKED",
             f"{intent_id}: the existing external effect has not settled yet")
-    runtime_state.settle(intent_id, event, lease_token)
+    _committed(keeper, runtime_state.settle, intent_id, event, lease_token)
     return event
 
 
 def _recover(adapter: Any, runtime_state: Any, intent: dict[str, Any],
-             record: dict[str, Any], lease_token: str) -> dict[str, Any]:
+             record: dict[str, Any], lease_token: str, keeper: Any = None) -> dict[str, Any]:
     """Reconcile a claim an earlier owner left behind, without ever duplicating the effect.
 
     The ladder is fixed and fails closed at every rung:
@@ -145,11 +185,11 @@ def _recover(adapter: Any, runtime_state: Any, intent: dict[str, Any],
     intent_id = intent["intent_id"]
     event = adapter.settlement(intent_id)
     if event is not None:
-        runtime_state.settle(intent_id, event, lease_token)
+        _committed(keeper, runtime_state.settle, intent_id, event, lease_token)
         return event
     if record.get("status") == EFFECTED:
         return _collect(adapter, runtime_state, intent, dict(record.get("receipt") or {}),
-                        lease_token)
+                        lease_token, keeper)
     # CLAIMED with no durable external identifier: the previous process died around the
     # creation call.  Only a lookup keyed on the stable intent identity can tell whether
     # the Task exists, and Orca's task-create exposes no idempotency key of its own.
@@ -163,19 +203,26 @@ def _recover(adapter: Any, runtime_state: Any, intent: dict[str, Any],
     except ExternalLookupUnavailable as exc:
         raise IdempotencyRecoveryError(
             "IDEMPOTENCY_RECOVERY_BLOCKED", f"{intent_id}: {exc}") from exc
+    _still_owned(keeper)
     if found is None:
-        return _settle_now(adapter, runtime_state, intent, lease_token)
-    runtime_state.record_receipt(intent_id, dict(found), lease_token)
-    return _collect(adapter, runtime_state, intent, dict(found), lease_token)
+        return _settle_now(adapter, runtime_state, intent, lease_token, keeper)
+    _committed(keeper, runtime_state.record_receipt, intent_id, dict(found), lease_token)
+    return _collect(adapter, runtime_state, intent, dict(found), lease_token, keeper)
 
 
-def _execute_recoverable(adapter: Any, runtime_state: Any, intent: dict[str, Any]) -> dict[str, Any]:
+def _execute_recoverable(adapter: Any, runtime_state: Any, intent: dict[str, Any],
+                         keeper_factory: Any = None) -> dict[str, Any]:
     """Claim the stable intent exclusively, then never create a second effect for it.
 
     ``claim`` is the whole ``lock -> read -> validate -> claim -> persist`` critical section,
     so two processes racing on one intent produce exactly one ``CREATED`` outcome; the loser
     either sees a live lease (and is refused as a would-be second executor) or, once that
     lease lapses, resumes into the recovery ladder above.
+
+    A claim that is never renewed is only exclusive for one lease period, which is shorter
+    than the external work it guards, so every path that blocks on the adapter runs inside a
+    :class:`lease_keeper.LeaseKeeper`: it renews for the whole call and fails closed, turning
+    a lost lease into a named BLOCKED terminal instead of a write the successor would refuse.
     """
     intent_id = intent["intent_id"]
     record = runtime_state.claim(intent)
@@ -185,18 +232,31 @@ def _execute_recoverable(adapter: Any, runtime_state: Any, intent: dict[str, Any
     lease_token = record["lease_token"]
     outcome = record.get("claim_outcome")
     if outcome == ALREADY_SETTLED:
+        # Nothing external happens here, so there is no blocking window to keep alive.
         event = runtime_state.get_settlement(intent_id)
         if event is not None:
             return event
         raise IdempotencyRecoveryError(
             "IDEMPOTENCY_RECOVERY_BLOCKED", f"{intent_id}: settled record without settlement")
-    if outcome == CREATED:
-        return _settle_now(adapter, runtime_state, intent, lease_token)
-    return _recover(adapter, runtime_state, intent, record, lease_token)
+    factory = keeper_factory or lease_keeper_factory()
+    try:
+        # ``__exit__`` stops and joins the beat thread on success, exception and cancellation
+        # alike, so no keeper outlives the call it was renewing for -- and it *verifies* the
+        # shutdown, raising ``LeaseKeeperNotStopped`` rather than leaving a revoked-but-live
+        # thread behind that this executor would then be reporting success on top of.
+        with factory(runtime_state, intent_id, lease_token) as keeper:
+            if outcome == CREATED:
+                return _settle_now(adapter, runtime_state, intent, lease_token, keeper)
+            return _recover(adapter, runtime_state, intent, record, lease_token, keeper)
+    except LeaseRenewalFailed as exc:
+        # Fail closed and *stay* closed, for a renewal that failed and for a keeper that
+        # could not be retired alike: neither is a reason to re-enter the claim path,
+        # because this process may already have created the external effect.
+        raise IdempotencyRecoveryError("IDEMPOTENCY_LEASE_LOST", str(exc)) from exc
 
 
 def _observe_then_take_over(adapter: Any, ledger: Any, intent: dict[str, Any],
-                            timeout_seconds: float) -> dict[str, Any]:
+                            timeout_seconds: float, keeper_factory: Any = None) -> dict[str, Any]:
     """The observer role: another Coordinator owns this intent, so watch it, never re-run it.
 
     The wait is explicitly bounded.  When the owner settles, its settlement is adopted; when
@@ -214,13 +274,15 @@ def _observe_then_take_over(adapter: Any, ledger: Any, intent: dict[str, Any],
         if event is not None:
             return event
     try:
-        return _execute_recoverable(adapter, ledger, intent)
+        return _execute_recoverable(adapter, ledger, intent, keeper_factory)
     except RuntimeStateLeaseHeld as exc:
         raise IdempotencyRecoveryError("IDEMPOTENCY_LEASE_HELD", str(exc)) from exc
 
 
 def execute_intent_node(adapter: Any, runtime_state: Any = None, *,
-                        observe_timeout_seconds: float = DEFAULT_OBSERVE_TIMEOUT_SECONDS):
+                        observe_timeout_seconds: float = DEFAULT_OBSERVE_TIMEOUT_SECONDS,
+                        heartbeat_interval_seconds: float | None = None,
+                        keeper_factory: Any = None):
     """Build the EXECUTE_INTENT node, refusing to run without a durable ledger.
 
     The port is resolved once, at construction, so a path that cannot be crash-safe fails
@@ -230,16 +292,24 @@ def execute_intent_node(adapter: Any, runtime_state: Any = None, *,
 
     ``observe_timeout_seconds`` bounds the observer role taken when another Coordinator
     holds a live lease on the same intent; it is never unbounded.
+
+    ``heartbeat_interval_seconds`` overrides the lease-derived renewal period, and
+    ``keeper_factory`` replaces the keeper outright; both exist so a test can drive lease
+    renewal with a synchronisation primitive rather than wall-clock time.  Neither is needed
+    in production: the period is derived from the ledger's own ``lease_seconds``.
     """
     ledger = resolve_runtime_state(adapter, runtime_state)
+    factory = keeper_factory or lease_keeper_factory(
+        interval_seconds=heartbeat_interval_seconds)
 
     def node(state: dict[str, Any]) -> dict[str, Any]:
         intent = state["pending_intent"]
         if not intent or state["intent_status"] != "PREPARED": raise StateError("OUT_OF_ORDER_EVENT:intent")
         try:
-            event = _execute_recoverable(adapter, ledger, intent)
+            event = _execute_recoverable(adapter, ledger, intent, factory)
         except RuntimeStateLeaseHeld:
-            event = _observe_then_take_over(adapter, ledger, intent, observe_timeout_seconds)
+            event = _observe_then_take_over(adapter, ledger, intent, observe_timeout_seconds,
+                                            factory)
         return {**state, "pending_event": event, "intent_status": "SETTLED",
                 "logical_trace": _trace(state, "EXECUTE_INTENT", event_id=event["event_id"])}
     return node

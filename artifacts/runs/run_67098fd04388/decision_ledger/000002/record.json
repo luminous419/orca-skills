@@ -1,0 +1,22 @@
+{
+  "assumption": null,
+  "boundary": "phase_gate",
+  "evidence": {},
+  "grounds": "The phase can be judged against the explicit cleanup and deterministic-test requirements without any user-owned choice.",
+  "iteration": 1,
+  "ledger_schema_version": 1,
+  "open_decision_item": false,
+  "open_item": null,
+  "phase": "BUGFIX",
+  "reason_code": null,
+  "recorded_at": "2026-09-04T05:06:45.722211+00:00",
+  "responsible_phase": "BUGFIX",
+  "role": "reviewer",
+  "run": "run_67098fd04388",
+  "scope": "This phase's own conduct at this iteration.",
+  "sequence": 2,
+  "source": "reviewer_result",
+  "source_binding": "artifacts/runs/run_67098fd04388/",
+  "state": "CLEAR",
+  "verdict": "FAIL"
+}

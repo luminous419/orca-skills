@@ -1,0 +1,55 @@
+scripts/deterministic_workflow/executor.py:230:    except LeaseRenewalFailed as exc:
+orca-worker-reviewer-orchestration/tools/deterministic_workflow/executor.py:230:    except LeaseRenewalFailed as exc:
+orca-worker-reviewer-orchestration/tools/deterministic_workflow/launcher.py:127:    except RuntimeStateConflict as exc:
+scripts/deterministic_workflow/launcher.py:127:    except RuntimeStateConflict as exc:
+scripts/deterministic_workflow/executor.py:10:from .lease_keeper import LeaseRenewalFailed, lease_keeper_factory
+scripts/deterministic_workflow/executor.py:52:    try: validate_state(state, expected_thread_id=state.get("thread_id", ""))
+scripts/deterministic_workflow/executor.py:95:def _still_owned(keeper: Any) -> None:
+scripts/deterministic_workflow/executor.py:98:    ``keeper`` is optional only so the helpers below stay directly callable; on every path
+scripts/deterministic_workflow/executor.py:101:    if keeper is not None:
+scripts/deterministic_workflow/executor.py:102:        keeper.raise_if_lost()
+scripts/deterministic_workflow/executor.py:106:                lease_token: str, keeper: Any = None) -> dict[str, Any]:
+scripts/deterministic_workflow/executor.py:110:    # blocking call -- minutes, not milliseconds -- so the keeper renews the lease
+scripts/deterministic_workflow/executor.py:112:    adapter.start(intent, lease_token=lease_token)
+scripts/deterministic_workflow/executor.py:113:    _still_owned(keeper)
+scripts/deterministic_workflow/executor.py:116:    _still_owned(keeper)
+scripts/deterministic_workflow/executor.py:117:    runtime_state.settle(intent["intent_id"], event, lease_token)
+scripts/deterministic_workflow/executor.py:129:             receipt: dict[str, Any], lease_token: str, keeper: Any = None) -> dict[str, Any]:
+scripts/deterministic_workflow/executor.py:139:    _still_owned(keeper)
+scripts/deterministic_workflow/executor.py:146:    _still_owned(keeper)
+scripts/deterministic_workflow/executor.py:147:    runtime_state.settle(intent_id, event, lease_token)
+scripts/deterministic_workflow/executor.py:152:             record: dict[str, Any], lease_token: str, keeper: Any = None) -> dict[str, Any]:
+scripts/deterministic_workflow/executor.py:166:        _still_owned(keeper)
+scripts/deterministic_workflow/executor.py:167:        runtime_state.settle(intent_id, event, lease_token)
+scripts/deterministic_workflow/executor.py:171:                        lease_token, keeper)
+scripts/deterministic_workflow/executor.py:185:    _still_owned(keeper)
+scripts/deterministic_workflow/executor.py:187:        return _settle_now(adapter, runtime_state, intent, lease_token, keeper)
+scripts/deterministic_workflow/executor.py:188:    runtime_state.record_receipt(intent_id, dict(found), lease_token)
+scripts/deterministic_workflow/executor.py:189:    return _collect(adapter, runtime_state, intent, dict(found), lease_token, keeper)
+scripts/deterministic_workflow/executor.py:193:                         keeper_factory: Any = None) -> dict[str, Any]:
+scripts/deterministic_workflow/executor.py:203:    :class:`lease_keeper.LeaseKeeper`: it renews for the whole call and fails closed, turning
+scripts/deterministic_workflow/executor.py:211:    lease_token = record["lease_token"]
+scripts/deterministic_workflow/executor.py:220:    factory = keeper_factory or lease_keeper_factory()
+scripts/deterministic_workflow/executor.py:222:        # ``__exit__`` stops and joins the beat thread on success, exception and cancellation
+scripts/deterministic_workflow/executor.py:223:        # alike, so no keeper outlives the call it was renewing for -- and it *verifies* the
+scripts/deterministic_workflow/executor.py:225:        # thread behind that this executor would then be reporting success on top of.
+scripts/deterministic_workflow/executor.py:226:        with factory(runtime_state, intent_id, lease_token) as keeper:
+scripts/deterministic_workflow/executor.py:228:                return _settle_now(adapter, runtime_state, intent, lease_token, keeper)
+scripts/deterministic_workflow/executor.py:229:            return _recover(adapter, runtime_state, intent, record, lease_token, keeper)
+scripts/deterministic_workflow/executor.py:231:        # Fail closed and *stay* closed, for a renewal that failed and for a keeper that
+scripts/deterministic_workflow/executor.py:238:                            timeout_seconds: float, keeper_factory: Any = None) -> dict[str, Any]:
+scripts/deterministic_workflow/executor.py:256:        return _execute_recoverable(adapter, ledger, intent, keeper_factory)
+scripts/deterministic_workflow/executor.py:264:                        keeper_factory: Any = None):
+scripts/deterministic_workflow/executor.py:276:    ``keeper_factory`` replaces the keeper outright; both exist so a test can drive lease
+scripts/deterministic_workflow/executor.py:281:    factory = keeper_factory or lease_keeper_factory(
+scripts/deterministic_workflow/state.py:21:    schema_version: str; run_id: str; thread_id: str; workflow_id: str
+scripts/deterministic_workflow/state.py:42:FORBIDDEN_KEYS = re.compile(r"(?:process_handle|terminal_handle|session_handle|credential|access_token|client)", re.I)
+scripts/deterministic_workflow/state.py:45:def initial_state(*, run_id: str, thread_id: str, phases: tuple[str, ...],
+scripts/deterministic_workflow/state.py:51:        "schema_version": SCHEMA_VERSION, "run_id": run_id, "thread_id": thread_id,
+scripts/deterministic_workflow/state.py:71:    return validate_state(state, expected_thread_id=thread_id)
+scripts/deterministic_workflow/state.py:77:            if not isinstance(key, str) or FORBIDDEN_KEYS.search(key):
+scripts/deterministic_workflow/state.py:195:def validate_state(raw: dict[str, Any], *, expected_thread_id: str) -> WorkflowState:
+scripts/deterministic_workflow/state.py:212:    for key in ("schema_version", "run_id", "thread_id", "workflow_id", "current_phase",
+scripts/deterministic_workflow/state.py:217:    if raw["thread_id"] != expected_thread_id: raise StateError("MALFORMED_STATE:thread")
+scripts/deterministic_workflow/state.py:265:    thread_id = source.get("thread_id") if isinstance(source.get("thread_id"), str) else ""
+scripts/deterministic_workflow/state.py:276:    state = initial_state(run_id=run_id, thread_id=thread_id, phases=tuple(phases),

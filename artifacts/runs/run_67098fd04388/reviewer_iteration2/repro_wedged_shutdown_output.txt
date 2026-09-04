@@ -1,0 +1,5 @@
+stop_clean=False orphaned=True revoked=True
+handle_retained=True alive_after_stop=True
+calls_after_stop=1 beats_after_stop=0
+alive_after_release=False calls_after_release=1 beats_after_release=0
+new_keeper_threads=[]

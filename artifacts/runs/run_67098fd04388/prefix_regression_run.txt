@@ -1,0 +1,35 @@
+test_a_healthy_owner_outlasting_its_lease_keeps_it_and_b_never_takes_over (scripts.test_deterministic_workflow_lease_keeper.HealthyLongRunningOwnerTests.test_a_healthy_owner_outlasting_its_lease_keeps_it_and_b_never_takes_over)
+Scenarios 1-4, through the shipped executor with nothing injected. ... FAIL
+test_the_lease_keeper_is_load_bearing (scripts.test_deterministic_workflow_lease_keeper.HealthyLongRunningOwnerTests.test_the_lease_keeper_is_load_bearing)
+Mutation: put the un-renewed claim back and the healthy owner is taken over again. ... FAIL
+test_a_dead_owner_that_already_created_the_effect_is_collected_not_rerun (scripts.test_deterministic_workflow_lease_keeper.DeadOwnerRecoveryTests.test_a_dead_owner_that_already_created_the_effect_is_collected_not_rerun)
+The EFFECTED rung of the ladder still resumes rather than duplicating. ... ok
+test_when_the_beats_stop_the_lease_lapses_and_b_recovers (scripts.test_deterministic_workflow_lease_keeper.DeadOwnerRecoveryTests.test_when_the_beats_stop_the_lease_lapses_and_b_recovers)
+Scenario 5, on an injected clock: no beats, lease expires, B runs the ladder. ... ok
+
+======================================================================
+FAIL: test_a_healthy_owner_outlasting_its_lease_keeps_it_and_b_never_takes_over (scripts.test_deterministic_workflow_lease_keeper.HealthyLongRunningOwnerTests.test_a_healthy_owner_outlasting_its_lease_keeps_it_and_b_never_takes_over)
+Scenarios 1-4, through the shipped executor with nothing injected.
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/luminous/aiAssistedProjects/orca-skills/scripts/test_deterministic_workflow_lease_keeper.py", line 315, in test_a_healthy_owner_outlasting_its_lease_keeps_it_and_b_never_takes_over
+    renewed = self._wait_for_renewal_past(intent_id, deadline)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/luminous/aiAssistedProjects/orca-skills/scripts/test_deterministic_workflow_lease_keeper.py", line 361, in _wait_for_renewal_past
+    raise AssertionError(
+AssertionError: no lease renewal landed after the original expiry: the executor never kept the healthy claim alive (this is the round 3 MAJOR defect)
+
+======================================================================
+FAIL: test_the_lease_keeper_is_load_bearing (scripts.test_deterministic_workflow_lease_keeper.HealthyLongRunningOwnerTests.test_the_lease_keeper_is_load_bearing)
+Mutation: put the un-renewed claim back and the healthy owner is taken over again.
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/luminous/aiAssistedProjects/orca-skills/scripts/test_deterministic_workflow_lease_keeper.py", line 378, in test_the_lease_keeper_is_load_bearing
+    self.assertTrue(adapter_a.started.wait(JOIN_TIMEOUT))
+AssertionError: False is not true
+
+----------------------------------------------------------------------
+Ran 4 tests in 71.160s
+
+FAILED (failures=2)
+exit=1

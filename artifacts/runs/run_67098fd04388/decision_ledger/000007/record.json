@@ -1,0 +1,22 @@
+{
+  "assumption": null,
+  "boundary": "phase_gate",
+  "evidence": {},
+  "grounds": "The iteration-3 change and its acceptance boundary are determined by the already-authorized fail-closed, fencing, recovery, and no-duplicate-effect requirements; no user-owned product or scope decision remains open.",
+  "iteration": 3,
+  "ledger_schema_version": 1,
+  "open_decision_item": false,
+  "open_item": null,
+  "phase": "BUGFIX",
+  "reason_code": null,
+  "recorded_at": "2026-09-04T06:54:59.027663+00:00",
+  "responsible_phase": "BUGFIX",
+  "role": "reviewer",
+  "run": "run_67098fd04388",
+  "scope": "This phase's own conduct at this iteration.",
+  "sequence": 7,
+  "source": "reviewer_result",
+  "source_binding": "artifacts/runs/run_67098fd04388/",
+  "state": "CLEAR",
+  "verdict": "PASS"
+}

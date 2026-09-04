@@ -1,0 +1,2 @@
+Skill validation PASSED (730 checks)
+Validated both skills, shared templates/reviews, routing, and policy gates.

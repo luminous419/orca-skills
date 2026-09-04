@@ -606,19 +606,32 @@ class FileRuntimeStateStore(_RuntimeStateStore):
         self.owner_id = owner_id or default_owner_id()
         self.lease_seconds = float(lease_seconds)
         self.lock_timeout_seconds = float(lock_timeout_seconds)
+        # Re-entrancy is per *thread*, so the depth counter must be guarded by the same
+        # re-entrant lock that serialises threads: the executor's lease keeper renews from a
+        # background thread while the owning thread is inside its own critical section, and
+        # an unguarded counter would let the keeper skip ``flock`` entirely (reading and
+        # writing the ledger with no inter-process lock at all) or corrupt the depth.
+        self._mutex = threading.RLock()
         self._depth = 0
 
     @contextmanager
     def _locked(self) -> Iterator[None]:
-        # Re-entrant within one process so a composed operation does not deadlock on itself;
+        # Re-entrant within one thread so a composed operation does not deadlock on itself;
         # ``flock`` is per open file description, so the outermost frame owns the handle.
-        if self._depth:
-            self._depth += 1
-            try:
+        with self._mutex:
+            if self._depth:
+                self._depth += 1
+                try:
+                    yield
+                finally:
+                    self._depth -= 1
+                return
+            with self._flocked():
                 yield
-            finally:
-                self._depth -= 1
-            return
+
+    @contextmanager
+    def _flocked(self) -> Iterator[None]:
+        """The outermost frame: take the real inter-process lock, with a finite timeout."""
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
         try:

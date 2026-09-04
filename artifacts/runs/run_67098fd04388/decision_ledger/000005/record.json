@@ -1,0 +1,22 @@
+{
+  "assumption": null,
+  "boundary": "final_gate",
+  "evidence": {},
+  "grounds": "The adversarial review found a deterministic implementation defect within the already-authorized heartbeat fail-closed requirement; fixing and retesting it requires no user-owned product or scope decision.",
+  "iteration": 1,
+  "ledger_schema_version": 1,
+  "open_decision_item": false,
+  "open_item": null,
+  "phase": "FINAL_REVIEW",
+  "reason_code": null,
+  "recorded_at": "2026-09-04T06:05:39.344221+00:00",
+  "responsible_phase": "FINAL_REVIEW",
+  "role": "reviewer",
+  "run": "run_67098fd04388",
+  "scope": "This phase's own conduct at this iteration.",
+  "sequence": 5,
+  "source": "reviewer_result",
+  "source_binding": "artifacts/runs/run_67098fd04388/",
+  "state": "CLEAR",
+  "verdict": "FAIL"
+}

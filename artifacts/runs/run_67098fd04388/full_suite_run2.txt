@@ -1,0 +1,77 @@
+.......................................................................................................................................{"schema_version":1,"status":"ERROR","code":"SOURCE_NOT_OPEN"}
+.{"schema_version":1,"status":"ERROR","code":"SOURCE_NOT_OPEN"}
+./Users/luminous/program/anaconda/anaconda3/envs/common/lib/python3.11/tempfile.py:934: ResourceWarning: Implicitly cleaning up <TemporaryDirectory '/var/folders/nz/y8qy3cqx5m5gcm93pn0d945r0000gn/T/tmplbfl30xr'>
+  _warnings.warn(warn_message, ResourceWarning)
+{"schema_version":1,"status":"ERROR","code":"SOURCE_NOT_OPEN"}
+/Users/luminous/program/anaconda/anaconda3/envs/common/lib/python3.11/tempfile.py:934: ResourceWarning: Implicitly cleaning up <TemporaryDirectory '/var/folders/nz/y8qy3cqx5m5gcm93pn0d945r0000gn/T/tmpx9huigx8'>
+  _warnings.warn(warn_message, ResourceWarning)
+{"schema_version":1,"status":"ERROR","code":"SOURCE_NOT_OPEN"}
+/Users/luminous/program/anaconda/anaconda3/envs/common/lib/python3.11/tempfile.py:934: ResourceWarning: Implicitly cleaning up <TemporaryDirectory '/var/folders/nz/y8qy3cqx5m5gcm93pn0d945r0000gn/T/tmpvjtuavkm'>
+  _warnings.warn(warn_message, ResourceWarning)
+{"schema_version":1,"status":"ERROR","code":"SOURCE_NOT_OPEN"}
+/Users/luminous/program/anaconda/anaconda3/envs/common/lib/python3.11/tempfile.py:934: ResourceWarning: Implicitly cleaning up <TemporaryDirectory '/var/folders/nz/y8qy3cqx5m5gcm93pn0d945r0000gn/T/tmp596dz0z0'>
+  _warnings.warn(warn_message, ResourceWarning)
+{"schema_version":1,"status":"ERROR","code":"SOURCE_NOT_OPEN"}
+/Users/luminous/program/anaconda/anaconda3/envs/common/lib/python3.11/tempfile.py:934: ResourceWarning: Implicitly cleaning up <TemporaryDirectory '/var/folders/nz/y8qy3cqx5m5gcm93pn0d945r0000gn/T/tmphiz2keb0'>
+  _warnings.warn(warn_message, ResourceWarning)
+{"schema_version":1,"status":"ERROR","code":"SOURCE_NOT_OPEN"}
+..{"schema_version":1,"status":"ERROR","code":"SOURCE_NOT_OPEN"}
+.{"schema_version":1,"status":"ERROR","code":"SOURCE_NOT_OPEN"}
+.{"schema_version":1,"status":"ERROR","code":"SOURCE_NOT_OPEN"}
+.{"schema_version":1,"status":"ERROR","code":"SOURCE_NOT_OPEN"}
+......./Users/luminous/program/anaconda/anaconda3/envs/common/lib/python3.11/tempfile.py:934: ResourceWarning: Implicitly cleaning up <TemporaryDirectory '/var/folders/nz/y8qy3cqx5m5gcm93pn0d945r0000gn/T/tmp7yb9opwb'>
+  _warnings.warn(warn_message, ResourceWarning)
+/Users/luminous/program/anaconda/anaconda3/envs/common/lib/python3.11/tempfile.py:934: ResourceWarning: Implicitly cleaning up <TemporaryDirectory '/var/folders/nz/y8qy3cqx5m5gcm93pn0d945r0000gn/T/tmp4ovvur5g'>
+  _warnings.warn(warn_message, ResourceWarning)
+/Users/luminous/program/anaconda/anaconda3/envs/common/lib/python3.11/tempfile.py:934: ResourceWarning: Implicitly cleaning up <TemporaryDirectory '/var/folders/nz/y8qy3cqx5m5gcm93pn0d945r0000gn/T/tmpxc2_k3e1'>
+  _warnings.warn(warn_message, ResourceWarning)
+/Users/luminous/program/anaconda/anaconda3/envs/common/lib/python3.11/tempfile.py:934: ResourceWarning: Implicitly cleaning up <TemporaryDirectory '/var/folders/nz/y8qy3cqx5m5gcm93pn0d945r0000gn/T/tmpurtk2jvl'>
+  _warnings.warn(warn_message, ResourceWarning)
+/Users/luminous/program/anaconda/anaconda3/envs/common/lib/python3.11/tempfile.py:934: ResourceWarning: Implicitly cleaning up <TemporaryDirectory '/var/folders/nz/y8qy3cqx5m5gcm93pn0d945r0000gn/T/tmpw0irtjdb'>
+  _warnings.warn(warn_message, ResourceWarning)
+/Users/luminous/program/anaconda/anaconda3/envs/common/lib/python3.11/tempfile.py:934: ResourceWarning: Implicitly cleaning up <TemporaryDirectory '/var/folders/nz/y8qy3cqx5m5gcm93pn0d945r0000gn/T/tmpyo7m18gz'>
+  _warnings.warn(warn_message, ResourceWarning)
+/Users/luminous/program/anaconda/anaconda3/envs/common/lib/python3.11/tempfile.py:934: ResourceWarning: Implicitly cleaning up <TemporaryDirectory '/var/folders/nz/y8qy3cqx5m5gcm93pn0d945r0000gn/T/tmphxppjxoa'>
+  _warnings.warn(warn_message, ResourceWarning)
+..../Users/luminous/program/anaconda/anaconda3/envs/common/lib/python3.11/tempfile.py:934: ResourceWarning: Implicitly cleaning up <TemporaryDirectory '/var/folders/nz/y8qy3cqx5m5gcm93pn0d945r0000gn/T/tmpo5pr8jrd'>
+  _warnings.warn(warn_message, ResourceWarning)
+/Users/luminous/program/anaconda/anaconda3/envs/common/lib/python3.11/tempfile.py:934: ResourceWarning: Implicitly cleaning up <TemporaryDirectory '/var/folders/nz/y8qy3cqx5m5gcm93pn0d945r0000gn/T/tmphcs6b58c'>
+  _warnings.warn(warn_message, ResourceWarning)
+/Users/luminous/program/anaconda/anaconda3/envs/common/lib/python3.11/tempfile.py:934: ResourceWarning: Implicitly cleaning up <TemporaryDirectory '/var/folders/nz/y8qy3cqx5m5gcm93pn0d945r0000gn/T/tmphtm3osi5'>
+  _warnings.warn(warn_message, ResourceWarning)
+/Users/luminous/program/anaconda/anaconda3/envs/common/lib/python3.11/tempfile.py:934: ResourceWarning: Implicitly cleaning up <TemporaryDirectory '/var/folders/nz/y8qy3cqx5m5gcm93pn0d945r0000gn/T/tmpn85d8w2p'>
+  _warnings.warn(warn_message, ResourceWarning)
+/Users/luminous/program/anaconda/anaconda3/envs/common/lib/python3.11/tempfile.py:934: ResourceWarning: Implicitly cleaning up <TemporaryDirectory '/var/folders/nz/y8qy3cqx5m5gcm93pn0d945r0000gn/T/tmp7mvew6h3'>
+  _warnings.warn(warn_message, ResourceWarning)
+/Users/luminous/program/anaconda/anaconda3/envs/common/lib/python3.11/tempfile.py:934: ResourceWarning: Implicitly cleaning up <TemporaryDirectory '/var/folders/nz/y8qy3cqx5m5gcm93pn0d945r0000gn/T/tmpfpdh7w96'>
+  _warnings.warn(warn_message, ResourceWarning)
+/Users/luminous/program/anaconda/anaconda3/envs/common/lib/python3.11/tempfile.py:934: ResourceWarning: Implicitly cleaning up <TemporaryDirectory '/var/folders/nz/y8qy3cqx5m5gcm93pn0d945r0000gn/T/tmp2gil0m25'>
+  _warnings.warn(warn_message, ResourceWarning)
+..........................................................................................................................................................................................................................................................................................................................{"item_ids":["item_36c00480881ad16beeb5225e"],"operation":"create","request_ids":["request_a3774f39cab578abbc739727"],"schema_version":1,"status":"CREATED"}
+{"item_ids":["item_36c00480881ad16beeb5225e"],"operation":"create","request_ids":["request_a3774f39cab578abbc739727"],"schema_version":1,"status":"CREATED"}
+........................................................................................................................................................................................................................................................................................................................................................................................................................................ssssss..............................................................................................................................................................................................................................................................................................<unknown>:1292: DeprecationWarning: invalid escape sequence '\s'
+<unknown>:1292: DeprecationWarning: invalid escape sequence '\s'
+.<unknown>:1292: DeprecationWarning: invalid escape sequence '\s'
+.<unknown>:1292: DeprecationWarning: invalid escape sequence '\s'
+.<unknown>:1292: DeprecationWarning: invalid escape sequence '\s'
+.<unknown>:1292: DeprecationWarning: invalid escape sequence '\s'
+<unknown>:1292: DeprecationWarning: invalid escape sequence '\s'
+...<unknown>:1292: DeprecationWarning: invalid escape sequence '\s'
+.........<unknown>:1292: DeprecationWarning: invalid escape sequence '\s'
+................................................................................................................................................................................................................................................................................................................................................................................/Users/luminous/program/anaconda/anaconda3/envs/common/lib/python3.11/tempfile.py:934: ResourceWarning: Implicitly cleaning up <TemporaryDirectory '/var/folders/nz/y8qy3cqx5m5gcm93pn0d945r0000gn/T/tmp9qf7p2ex'>
+  _warnings.warn(warn_message, ResourceWarning)
+......usage: run_logging.py run-status [-h] --run-id RUN_ID [--base BASE] --status
+                                 {COMPLETED,BLOCKED,ERROR,ESCALATED}
+                                 [--reason REASON]
+                                 [--run-started-at RUN_STARTED_AT]
+                                 [--risk {,low,medium,high}]
+                                 [--risk-source {,explicit,default}]
+run_logging.py run-status: error: argument --status: invalid choice: 'NOT_A_REAL_STATUS' (choose from 'COMPLETED', 'BLOCKED', 'ERROR', 'ESCALATED')
+............................<unknown>:1292: DeprecationWarning: invalid escape sequence '\s'
+.......................................................................................................................................................................................................................................................................................................................................................................
+----------------------------------------------------------------------
+Ran 1960 tests in 340.319s
+
+OK (skipped=6)
+exit=0
+ALLDONE

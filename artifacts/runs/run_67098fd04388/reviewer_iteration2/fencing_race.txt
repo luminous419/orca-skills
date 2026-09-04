@@ -1,0 +1,8 @@
+test_two_processes_racing_one_intent_start_the_effect_exactly_once (scripts.test_deterministic_workflow_ownership.ConcurrentClaimTests.test_two_processes_racing_one_intent_start_the_effect_exactly_once) ... ok
+test_the_full_takeover_sequence_refuses_every_stale_write (scripts.test_deterministic_workflow_ownership.LeaseFencingTests.test_the_full_takeover_sequence_refuses_every_stale_write)
+The exact reported reproduction: heartbeat *and* both effect writes are refused. ... ok
+
+----------------------------------------------------------------------
+Ran 2 tests in 3.016s
+
+OK

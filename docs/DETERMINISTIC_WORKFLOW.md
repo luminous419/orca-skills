@@ -49,6 +49,77 @@ never means "skip the check". The executor carries the token minted by `claim()`
 ledger write, so the fence is live on the production path rather than an optional argument no
 caller passes.
 
+### Lease renewal during long external work
+
+A fence is only half of ownership: a claim is exclusive while the lease is *live*, and the
+lease is live only while somebody renews it. Nothing did. `claim()` minted a 60-second lease
+and the executor then blocked inside `adapter.start()` for as long as the external agent took
+— 5 to 15 minutes for a real Claude/Codex dispatch — so a healthy Coordinator was
+indistinguishable from a dead one: its lease lapsed, a second Coordinator took over, and the
+fence then refused the healthy owner's own receipt and settlement.
+
+`lease_keeper.LeaseKeeper` closes that gap. Every executor path that blocks on the adapter —
+`_settle_now` (`start`), `_collect` (`resume`) and the `_recover` ladder including `lookup` —
+runs inside a keeper that renews the claim on a background daemon thread for the whole
+duration of the call:
+
+* **Period.** Derived from the ledger's own `lease_seconds`
+  (`heartbeat_interval_for` = lease / 3, floor 1 ms), never hard-coded, so `interval < lease`
+  stays true when the lease is reconfigured. With the 60-second default that is a beat every
+  20 seconds. Both the period and the wait itself are injectable, which is how the tests drive
+  renewal with a synchronisation primitive instead of wall-clock time.
+* **Fail-closed.** The first failed renewal — rotated token, lost lease, unreadable ledger —
+  stops the keeper and is re-raised at the next ownership checkpoint. A Coordinator that lost
+  ownership records no receipt, no settlement, and advances no workflow state; the run stops
+  as BLOCKED with `IDEMPOTENCY_LEASE_LOST`. A lost lease deliberately does **not** re-enter
+  the claim path: this process may already have created the external effect.
+* **Checkpoints on both sides of a write, and at the exit.** A checkpoint taken only *before*
+  each write leaves a gap the fence cannot cover, because not every renewal failure is an
+  ownership rotation: a `RuntimeStateLockTimeout` or a transient unreadable ledger leaves the
+  lease token perfectly valid, so a failure landing between the last checkpoint and the write
+  is accepted by the fence and would otherwise be swallowed. So `executor._committed()` wraps
+  every ownership-sensitive write (`settle`, `record_receipt`) in a checkpoint on *each* side,
+  and `LeaseKeeper.__exit__` takes the last one — reporting a recorded renewal failure, not
+  only a failed cleanup, so a failure landing after the final write cannot die with the
+  keeper. The write that had already landed is deliberately left standing: it is the durable
+  record of an external effect that really did settle, and a successor adopts it as
+  `ALREADY_SETTLED` instead of re-running the work. What fails closed is the executor — it
+  names the loss rather than reporting success on a claim it can no longer vouch for. Exit
+  still never masks an exception the wrapped body was already raising.
+* **Cleanup, verified.** The keeper is a context manager, so success, exception and
+  cancellation all stop and join the beat thread — and `stop()` checks that the join actually
+  worked. It revokes the keeper *before* joining (the beat loop re-reads that flag immediately
+  before and immediately after each renewal, so a thread that outlives `stop()` writes no
+  further renewal), keeps the thread handle until the thread is really gone, and reports a
+  join that timed out as `LeaseKeeperNotStopped` — a `LeaseRenewalFailed`, so the executor
+  fails closed on it exactly as it does on a failed renewal, rather than reporting a clean
+  shutdown on top of a live orphan. That matters because an orphan is the mirror image of
+  this whole defect: a thread renewing the lease of an intent nobody is working on any more
+  would block a *legitimate* takeover. The failure is sticky (a cleanup that failed is never
+  later reported as clean), `stop()` stays safe to repeat, and it never masks an exception the
+  wrapped body was already raising. The thread is a daemon on top of all that, so a wedged
+  renewal cannot hold up process exit either.
+* **Takeover is preserved.** The keeper lives and dies with the process that owns the claim.
+  When that process is killed the beats stop, the lease lapses on schedule, and the existing
+  observe/takeover/recovery ladder runs exactly as before.
+
+Because renewal happens on a second thread, `FileRuntimeStateStore._locked()` guards its
+re-entrancy depth with a `threading.RLock`: re-entrancy is per *thread*, and an unguarded
+counter would let the keeper's thread skip `flock` entirely and read/write the ledger with no
+inter-process lock at all.
+
+Known limits: renewal cannot interrupt a blocking adapter call, so a lost lease is detected at
+the next checkpoint rather than the instant it happens. In that window a *rotated* token is
+refused by the fence; a renewal failure that leaves the token valid is caught instead by the
+checkpoint taken after the write (or, for the last write, at the keeper's exit), which stops
+the executor rather than un-writing what already landed. A renewal already inside the ledger when `stop()`
+runs cannot be recalled either: that one write lands, but it is not counted as a beat and no
+further renewal follows, so an abandoned lease lapses after at most one more period instead of
+being held indefinitely. The default beat waits in real seconds, so a run
+wired to a test clock must inject a waiter (as the tests do). And a lease is still lost if the
+whole process is stopped (`SIGSTOP`, a long GC pause, a suspended laptop) for longer than one
+lease period; that is the case the takeover ladder exists for.
+
 The ledger is validated strictly on read: schema version, top-level container, record
 container, closed record keys, status vocabulary, key/`intent_id` agreement, receipt and
 settlement shape, and settlement identity. A malformed or incompatible ledger raises

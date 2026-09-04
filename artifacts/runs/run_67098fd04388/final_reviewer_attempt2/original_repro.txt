@@ -1,0 +1,6 @@
+thread_alive=False
+executor_error=IdempotencyRecoveryError('IDEMPOTENCY_LEASE_LOST:LEASE_RENEWAL_FAILED:intent_e61b1c02802aa70d84a25aa7: the lease could not be renewed during the external call (RuntimeStateLockTimeout: injected renewal failure); this executor no longer owns the intent and must not record a receipt or settlement')
+executor_returned=False
+ledger_status=SETTLED
+settlement_written=True
+effect_count=1
