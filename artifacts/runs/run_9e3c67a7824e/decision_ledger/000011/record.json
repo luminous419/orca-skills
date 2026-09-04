@@ -1,0 +1,22 @@
+{
+  "assumption": null,
+  "boundary": "B2",
+  "evidence": {},
+  "grounds": "이번 phase의 모든 판단은 사용자가 번호로 지정한 5개 필수 수정과 PR #28 외부 리뷰 전문, 그리고 저장소의 기존 계약(unittest runner, mirror parity, FORBIDDEN_KEYS, ROUTE_TOKENS)에서 직접 도출되었다. 설계 재량이 필요한 두 지점 — (1) crash window에서 recovery 불가 시 fail-closed 할 것인가, (2) M-004에서 삭제 대신 강등을 택할 것인가 — 은 각각 리뷰가 요구한 '중복 생성 금지'와 '제거 **또는** 명확한 강등' 문언 안에 있는 선택지이며, 사용자 권한이 필요한 미해결 항목이 아니다. 새 권한, 비가역 작업, 범위 확대는 없었다.",
+  "iteration": 5,
+  "ledger_schema_version": 1,
+  "open_decision_item": false,
+  "open_item": null,
+  "phase": "BUGFIX",
+  "reason_code": null,
+  "recorded_at": "2026-09-03T22:08:41.880587+00:00",
+  "responsible_phase": "BUGFIX",
+  "role": "worker",
+  "run": "run_9e3c67a7824e",
+  "scope": "This phase's own conduct at this iteration.",
+  "sequence": 11,
+  "source": "worker",
+  "source_binding": "artifacts/runs/run_9e3c67a7824e/",
+  "state": "CLEAR",
+  "verdict": ""
+}

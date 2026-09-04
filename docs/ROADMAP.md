@@ -306,6 +306,13 @@ See [Releasing](RELEASING.md) and
 
 ## Maintaining This Roadmap
 
+### OS-40 deterministic workflow engine
+
+The runtime-neutral LangGraph StateGraph now owns the standard phase sequence, bounded
+correction, HIGH downstream revalidation, decision-first blocking, and mandatory final review.
+Orca is an execution/provenance adapter; durable resume remains OS-31 and a standalone CLI
+adapter remains OS-37. See `DETERMINISTIC_WORKFLOW.md`.
+
 Update this document when a milestone outcome, architecture principle, target
 direction, or release criterion changes. Routine Jira status changes do not require
 a roadmap edit unless they materially change the project's current position or

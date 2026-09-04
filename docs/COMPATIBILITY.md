@@ -168,6 +168,14 @@ constraint, not proof of a broader Orca version range. A 1.0.0 release is not de
 this document update and still requires an explicit final release decision.
 ### OS-30 compatibility
 
+### OS-40 deterministic engine compatibility
+
+The engine is verified on Python 3.11 and the exact optional versions in
+`requirements-langgraph.txt`. Existing standard-library validation remains usable without
+LangGraph; invoking the graph itself fails explicitly instead of falling back. The installed
+orchestration Skill carries a byte-equal engine copy and launcher. Durable checkpointers and
+cross-session resume are not claimed.
+
 New clarification requests and responses use schema generation v2; homogeneous historical v1 single-item artifacts remain immutable and are never migrated or rewritten.
 
 OS-30 adds a separate `clarifications/` namespace and does not widen or migrate the OS-28/OS-29 decision ledger. Historical blocked runs without that directory remain valid historical evidence. The installed orchestration tool uses only Python 3.11+ standard-library APIs and its adjacent shipped `run_logging.py`; the loop Skill documents the semantics but does not expose the artifact runtime.

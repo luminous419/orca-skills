@@ -1,0 +1,22 @@
+{
+  "assumption": null,
+  "boundary": "final_gate",
+  "evidence": {},
+  "grounds": "Attempt 2 found F-ADV-01 closed and no remaining G1-G5 defect; all judgments follow from the already-authorized fail-closed, recovery, fencing, and deterministic-test requirements.",
+  "iteration": 2,
+  "ledger_schema_version": 1,
+  "open_decision_item": false,
+  "open_item": null,
+  "phase": "FINAL_REVIEW",
+  "reason_code": null,
+  "recorded_at": "2026-09-04T07:01:34.312273+00:00",
+  "responsible_phase": "FINAL_REVIEW",
+  "role": "reviewer",
+  "run": "run_67098fd04388",
+  "scope": "This phase's own conduct at this iteration.",
+  "sequence": 8,
+  "source": "reviewer_result",
+  "source_binding": "artifacts/runs/run_67098fd04388/",
+  "state": "CLEAR",
+  "verdict": "PASS"
+}

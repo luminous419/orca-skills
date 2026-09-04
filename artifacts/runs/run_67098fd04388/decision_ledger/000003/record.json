@@ -1,0 +1,22 @@
+{
+  "assumption": null,
+  "boundary": "phase_gate",
+  "evidence": {},
+  "grounds": "Both blocking findings were fully specified by the reviewer (verify the join and block the orphan; make the scenario 1-4 proof and its mutation deterministic). Every remaining choice -- how to signal a failed shutdown, which primitive paces the observer -- is an engineering decision inside the phase contract, resolved against the existing fail-closed rule and the explicit determinism requirement, with no user-owned authority involved.",
+  "iteration": 2,
+  "ledger_schema_version": 1,
+  "open_decision_item": false,
+  "open_item": null,
+  "phase": "BUGFIX",
+  "reason_code": null,
+  "recorded_at": "2026-09-04T05:42:17.147534+00:00",
+  "responsible_phase": "BUGFIX",
+  "role": "worker",
+  "run": "run_67098fd04388",
+  "scope": "This phase's own conduct at this iteration.",
+  "sequence": 3,
+  "source": "worker_result",
+  "source_binding": "artifacts/runs/run_67098fd04388/",
+  "state": "CLEAR",
+  "verdict": ""
+}

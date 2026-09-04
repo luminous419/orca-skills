@@ -1,0 +1,23 @@
+FF..
+======================================================================
+FAIL: test_a_healthy_owner_outlasting_its_lease_keeps_it_and_b_never_takes_over (scripts.test_deterministic_workflow_lease_keeper.HealthyLongRunningOwnerTests.test_a_healthy_owner_outlasting_its_lease_keeps_it_and_b_never_takes_over)
+A's external call outlives its lease; B claims mid-flight and stays an observer.
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/luminous/aiAssistedProjects/orca-skills/scripts/test_deterministic_workflow_lease_keeper.py", line 650, in test_a_healthy_owner_outlasting_its_lease_keeps_it_and_b_never_takes_over
+    self.assertGreater(renewed["last_heartbeat_at"], deadline,
+AssertionError: 1000000.0 not greater than 1000060.0 : the executor must renew the lease during the external call
+
+======================================================================
+FAIL: test_a_healthy_owner_outlasting_its_lease_keeps_it_and_b_never_takes_over (scripts.test_deterministic_workflow_lease_keeper.HealthyLongRunningOwnerTests.test_a_healthy_owner_outlasting_its_lease_keeps_it_and_b_never_takes_over)
+A's external call outlives its lease; B claims mid-flight and stays an observer.
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/luminous/aiAssistedProjects/orca-skills/scripts/test_deterministic_workflow_lease_keeper.py", line 294, in _join_threads
+    self.assertFalse(thread.is_alive(), "a worker thread outlived its test")
+AssertionError: True is not false : a worker thread outlived its test
+
+----------------------------------------------------------------------
+Ran 3 tests in 30.092s
+
+FAILED (failures=2)

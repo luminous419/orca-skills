@@ -1,0 +1,22 @@
+{
+  "assumption": null,
+  "boundary": "B3",
+  "evidence": {},
+  "grounds": "The Final Review finding, corrected default-path contract, and directly executed regression evidence fully determine this correction review; no user-authority decision remains open.",
+  "iteration": 4,
+  "ledger_schema_version": 1,
+  "open_decision_item": false,
+  "open_item": null,
+  "phase": "BUGFIX",
+  "reason_code": null,
+  "recorded_at": "2026-09-03T21:45:59.498891+00:00",
+  "responsible_phase": "BUGFIX",
+  "role": "reviewer",
+  "run": "run_9e3c67a7824e",
+  "scope": "This phase's own conduct at this iteration.",
+  "sequence": 9,
+  "source": "reviewer",
+  "source_binding": "artifacts/runs/run_9e3c67a7824e/",
+  "state": "CLEAR",
+  "verdict": "PASS"
+}

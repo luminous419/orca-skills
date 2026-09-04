@@ -1,0 +1,3 @@
+threads_alive_after_stop=1
+keeper_reference_after_stop=None
+threads_alive_after_release=0

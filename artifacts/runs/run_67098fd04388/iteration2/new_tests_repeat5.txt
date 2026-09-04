@@ -1,0 +1,20 @@
+--- repetition 1 ---
+Ran 22 tests in 0.778s
+
+OK
+--- repetition 2 ---
+Ran 22 tests in 0.742s
+
+OK
+--- repetition 3 ---
+Ran 22 tests in 0.762s
+
+OK
+--- repetition 4 ---
+Ran 22 tests in 0.786s
+
+OK
+--- repetition 5 ---
+Ran 22 tests in 0.791s
+
+OK

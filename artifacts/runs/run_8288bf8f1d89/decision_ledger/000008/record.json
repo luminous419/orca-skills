@@ -1,0 +1,22 @@
+{
+  "assumption": null,
+  "boundary": "final_gate",
+  "evidence": {},
+  "grounds": "The attempt-1 stale-owner defect is closed, the iteration-3 interactions inspected here fail closed, and no remaining issue requires a user-authority decision.",
+  "iteration": 2,
+  "ledger_schema_version": 1,
+  "open_decision_item": false,
+  "open_item": null,
+  "phase": "FINAL_REVIEW",
+  "reason_code": null,
+  "recorded_at": "2026-09-04T01:10:56.991230+00:00",
+  "responsible_phase": "FINAL_REVIEW",
+  "role": "reviewer",
+  "run": "run_8288bf8f1d89",
+  "scope": "This phase's own conduct at this iteration.",
+  "sequence": 8,
+  "source": "reviewer_result",
+  "source_binding": "artifacts/runs/run_8288bf8f1d89/",
+  "state": "CLEAR",
+  "verdict": "PASS"
+}

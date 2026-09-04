@@ -1,0 +1,42 @@
+scripts/deterministic_workflow/executor.py:112:    adapter.start(intent, lease_token=lease_token)
+scripts/deterministic_workflow/executor.py:114:    event = adapter.settlement(intent["intent_id"])
+scripts/deterministic_workflow/executor.py:138:    event = adapter.resume(intent, receipt)
+scripts/deterministic_workflow/executor.py:164:    event = adapter.settlement(intent_id)
+scripts/deterministic_workflow/executor.py:181:        found = adapter.lookup(intent)
+scripts/deterministic_workflow/runtime_state.py:183:    def sleep(self, seconds: float) -> None:
+scripts/deterministic_workflow/runtime_state.py:184:        time.sleep(seconds)
+scripts/deterministic_workflow/runtime_state.py:196:    def sleep(self, seconds: float) -> None:
+scripts/deterministic_workflow/runtime_state.py:454:    def heartbeat(self, intent_id: str, lease_token: str) -> dict[str, Any]:
+scripts/deterministic_workflow/runtime_state.py:504:            self.clock.sleep(min(poll_seconds, max(deadline - self.clock.time(), 0.0)))
+scripts/deterministic_workflow/runtime_state.py:525:                "lease token returned by claim()/heartbeat()")
+scripts/deterministic_workflow/runtime_state.py:648:                    self.clock.sleep(LOCK_POLL_SECONDS)
+scripts/deterministic_workflow/lease_keeper.py:6:then blocked inside ``adapter.start()`` for the 5-15 minutes a real Claude/Codex dispatch
+scripts/deterministic_workflow/lease_keeper.py:84:    return stop.wait(interval)
+scripts/deterministic_workflow/lease_keeper.py:146:           currently blocked inside ``heartbeat()`` and will unblock later.  An abandoned
+scripts/deterministic_workflow/lease_keeper.py:257:                self._runtime_state.heartbeat(self._intent_id, self._lease_token)
+scripts/test_deterministic_workflow_lease_keeper.py:4:``adapter.start()`` for as long as the external agent took -- 5 to 15 minutes for a real
+scripts/test_deterministic_workflow_lease_keeper.py:86:        if not self.release.wait(JOIN_TIMEOUT):     # pragma: no cover - only on a wedged test
+scripts/test_deterministic_workflow_lease_keeper.py:91:class BeatPacer:
+scripts/test_deterministic_workflow_lease_keeper.py:154:        if not self.ready.wait(JOIN_TIMEOUT):      # pragma: no cover - only on a wedged test
+scripts/test_deterministic_workflow_lease_keeper.py:167:    def heartbeat(self, intent_id, lease_token):
+scripts/test_deterministic_workflow_lease_keeper.py:191:        if not self.go.wait(JOIN_TIMEOUT):          # pragma: no cover - only on a wedged test
+scripts/test_deterministic_workflow_lease_keeper.py:196:class PacedObserverClock:
+scripts/test_deterministic_workflow_lease_keeper.py:216:    def sleep(self, seconds: float) -> None:
+scripts/test_deterministic_workflow_lease_keeper.py:239:class WedgedLedger:
+scripts/test_deterministic_workflow_lease_keeper.py:254:    def heartbeat(self, intent_id, lease_token):
+scripts/test_deterministic_workflow_lease_keeper.py:257:        if not self.finish.wait(JOIN_TIMEOUT):      # pragma: no cover - only on a wedged test
+scripts/test_deterministic_workflow_lease_keeper.py:375:            def heartbeat(self, intent_id, lease_token):
+scripts/test_deterministic_workflow_lease_keeper.py:418:class KeeperShutdownTests(unittest.TestCase):
+scripts/test_deterministic_workflow_lease_keeper.py:441:        self.assertTrue(ledger.entered.wait(JOIN_TIMEOUT),
+scripts/test_deterministic_workflow_lease_keeper.py:516:        self.assertTrue(waiter.parked.wait(JOIN_TIMEOUT))
+scripts/test_deterministic_workflow_lease_keeper.py:581:            if not ledger_wedge.entered.wait(JOIN_TIMEOUT):   # pragma: no cover
+scripts/test_deterministic_workflow_lease_keeper.py:633:        self.assertTrue(adapter_a.started.wait(JOIN_TIMEOUT), "A never entered adapter.start()")
+scripts/test_deterministic_workflow_lease_keeper.py:709:        self.assertTrue(adapter_a.started.wait(JOIN_TIMEOUT))
+scripts/test_deterministic_workflow_lease_keeper.py:713:        # and still inside adapter.start(), and nothing renewed its lease.
+scripts/test_deterministic_workflow_lease_keeper.py:857:        self.assertTrue(adapter_a.started.wait(JOIN_TIMEOUT))
+scripts/test_deterministic_workflow_lease_keeper.py:900:            def heartbeat(self, intent_id, lease_token):
+scripts/test_deterministic_workflow_lease_keeper.py:909:        self.assertTrue(adapter.started.wait(JOIN_TIMEOUT))
+scripts/test_deterministic_workflow_lease_keeper.py:936:        self.assertTrue(adapter_a.started.wait(JOIN_TIMEOUT))
+scripts/test_deterministic_workflow_lease_keeper.py:998:                proceed.wait(JOIN_TIMEOUT)
+scripts/test_deterministic_workflow_lease_keeper.py:1001:            inside.wait(JOIN_TIMEOUT)
+scripts/test_deterministic_workflow_lease_keeper.py:1012:            self.assertFalse(entered.wait(0.3),

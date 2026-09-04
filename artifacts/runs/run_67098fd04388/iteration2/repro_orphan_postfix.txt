@@ -1,0 +1,7 @@
+stop() returned: False
+keeper._thread is now: <Thread(lease-keeper-intent_x, started daemon 6150221824)>
+keeper.orphaned: True
+   STILL LIVE: name=lease-keeper-intent_x alive=True daemon=True
+live lease-keeper threads after stop(): 1
+heartbeat calls in total: 1
+beats the keeper counted: 0

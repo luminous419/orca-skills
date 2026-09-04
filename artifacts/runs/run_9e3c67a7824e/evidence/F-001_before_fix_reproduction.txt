@@ -1,0 +1,5 @@
+=== F-001 unknown-ONLY field submitted directly to the compiled graph (BEFORE FIX) ===
+terminal_status : COMPLETED   (expected BLOCKED)
+reason          : WORKFLOW_COMPLETED   (expected MALFORMED_STATE)
+effect_count    : 3   (expected 0)
+unknown present : False   (LangGraph silently dropped it)

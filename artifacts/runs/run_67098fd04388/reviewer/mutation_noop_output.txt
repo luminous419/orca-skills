@@ -1,0 +1,14 @@
+test_the_keeper_renews_the_lease_and_stops_cleanly (scripts.test_deterministic_workflow_lease_keeper.LeaseKeeperUnitTests.test_the_keeper_renews_the_lease_and_stops_cleanly) ... FAIL
+
+======================================================================
+FAIL: test_the_keeper_renews_the_lease_and_stops_cleanly (scripts.test_deterministic_workflow_lease_keeper.LeaseKeeperUnitTests.test_the_keeper_renews_the_lease_and_stops_cleanly)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/luminous/aiAssistedProjects/orca-skills/scripts/test_deterministic_workflow_lease_keeper.py", line 248, in test_the_keeper_renews_the_lease_and_stops_cleanly
+    self.assertGreater(live["lease_expires_at"], store.clock.time(),
+AssertionError: 1000060.0 not greater than 1000180.0 : the lease must still be in the future after 3 lease periods
+
+----------------------------------------------------------------------
+Ran 1 test in 0.001s
+
+FAILED (failures=1)

@@ -1,0 +1,8 @@
+    from scripts.deterministic_workflow.graph_spec import GRAPH_OWNED_DECISIONS
+ImportError: cannot import name 'GRAPH_OWNED_DECISIONS' from 'scripts.deterministic_workflow.graph_spec' (/Users/luminous/aiAssistedProjects/orca-skills/scripts/deterministic_workflow/graph_spec.py)
+
+
+----------------------------------------------------------------------
+Ran 1 test in 0.000s
+
+FAILED (errors=1)

@@ -1,0 +1,22 @@
+{
+  "assumption": null,
+  "boundary": "B3",
+  "evidence": {},
+  "grounds": "이 경계의 판정은 전부 검증 가능한 증거로 결정되었다. 두 blocking finding은 명시적 요구사항(OS-40 AC 10, AC 7, AC 4)과 DESIGN.md의 문서화된 계약에 직접 대응하며, 내가 직접 재실행한 mutation 결과와 compiled graph 재현으로 뒷받침된다. carried-forward 다섯 항목의 non-blocking 판정도 OS-40 Scope/Out of Scope 문언과 git diff 사실관계로 결정되었고 모델 재량이나 사용자 권한을 필요로 하지 않았다. run-scoped decision ledger 21개 boundary는 전부 CLEAR이고 미해결 NEEDS_INPUT/CONFLICT가 없다. 사용자 권한이 필요한 열린 결정 항목은 없다.",
+  "iteration": 1,
+  "ledger_schema_version": 1,
+  "open_decision_item": false,
+  "open_item": null,
+  "phase": "FINAL_REVIEW",
+  "reason_code": null,
+  "recorded_at": "2026-09-02T17:37:48.664252+00:00",
+  "responsible_phase": "FINAL_REVIEW",
+  "role": "reviewer",
+  "run": "run_0bcf4e7296c9",
+  "scope": "This phase's own conduct at this iteration.",
+  "sequence": 21,
+  "source": "reviewer",
+  "source_binding": "artifacts/runs/run_0bcf4e7296c9/",
+  "state": "CLEAR",
+  "verdict": "FAIL"
+}

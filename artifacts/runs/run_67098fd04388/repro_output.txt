@@ -1,0 +1,16 @@
+=== pre-fix shape: no renewal (default mode) ===
+A claimed the intent and entered adapter.start()
+  A lease_token=9cdaa3a4b312  lease_expires_at=1000060.0
+clock +300s (A is healthy and still working, nothing renewing)
+B claim -> RESUMED   *** B TOOK OVER A HEALTHY OWNER ***
+  B lease_token=2573e05862f0 (rotated: True)
+A finishes its healthy work -> IdempotencyRecoveryError: IDEMPOTENCY_OBSERVATION_TIMEOUT:OBSERVATION_TIMEOUT:intent_0b558ec10142e78319434c68:owner=B
+ledger owner=B status=CLAIMED settlement=no
+
+=== post-fix: keeper renews across 300s (--paced) ===
+A claimed the intent and entered adapter.start()
+  A lease_token=a9bcbcef611a  lease_expires_at=1000060.0
+clock +300s via 15 lease renewals (A is healthy)
+B claim -> REFUSED (LEASE_HELD:intent_0b558ec10142e78319434c68:owner=A:expires_at=1000360.0)
+A finishes its healthy work -> SETTLED
+ledger owner=A status=SETTLED settlement=yes

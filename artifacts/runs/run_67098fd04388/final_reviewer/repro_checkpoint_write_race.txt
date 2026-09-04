@@ -1,0 +1,6 @@
+thread_alive=False
+executor_error=None
+executor_returned=True
+ledger_status=SETTLED
+settlement_written=True
+effect_count=1

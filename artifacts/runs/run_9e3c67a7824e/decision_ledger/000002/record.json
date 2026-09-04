@@ -1,0 +1,22 @@
+{
+  "assumption": null,
+  "boundary": "B3",
+  "evidence": {},
+  "grounds": "The explicit five review findings, repository evidence, and mandatory BUGFIX test gate fully determine this iteration's verdict; no user-authority decision remains open.",
+  "iteration": 1,
+  "ledger_schema_version": 1,
+  "open_decision_item": false,
+  "open_item": null,
+  "phase": "BUGFIX",
+  "reason_code": null,
+  "recorded_at": "2026-09-03T17:06:07.746302+00:00",
+  "responsible_phase": "BUGFIX",
+  "role": "reviewer",
+  "run": "run_9e3c67a7824e",
+  "scope": "This phase's own conduct at this iteration.",
+  "sequence": 2,
+  "source": "reviewer",
+  "source_binding": "artifacts/runs/run_9e3c67a7824e/",
+  "state": "CLEAR",
+  "verdict": "FAIL"
+}

@@ -1,0 +1,2 @@
+many_intents=32 beat_ok=True records_ok=True errors=[]
+corruptor_exit=0 all_keepers_lost=True ledger_not_repaired=True

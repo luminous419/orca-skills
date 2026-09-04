@@ -1,0 +1,22 @@
+{
+  "assumption": null,
+  "boundary": "B2",
+  "evidence": {},
+  "grounds": "All required test scenarios and mutation axes were executed with passing restored-state regressions; no user-authority decision is open at this boundary.",
+  "iteration": 1,
+  "ledger_schema_version": 1,
+  "open_decision_item": false,
+  "open_item": null,
+  "phase": "TEST",
+  "reason_code": null,
+  "recorded_at": "2026-09-02T16:59:24.981394+00:00",
+  "responsible_phase": "TEST",
+  "role": "worker",
+  "run": "run_0bcf4e7296c9",
+  "scope": "This phase's own conduct at this iteration.",
+  "sequence": 17,
+  "source": "worker",
+  "source_binding": "artifacts/runs/run_0bcf4e7296c9/",
+  "state": "CLEAR",
+  "verdict": ""
+}

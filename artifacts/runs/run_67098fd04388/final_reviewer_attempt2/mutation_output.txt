@@ -1,0 +1,14 @@
+..F..
+======================================================================
+FAIL: test_a_renewal_failing_during_the_receipt_write_stops_before_the_next_call (scripts.test_deterministic_workflow_lease_keeper.CheckpointToWriteRaceTests.test_a_renewal_failing_during_the_receipt_write_stops_before_the_next_call)
+The post-write checkpoint on its own rung: no further *external* call is made.
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/luminous/aiAssistedProjects/orca-skills/scripts/test_deterministic_workflow_lease_keeper.py", line 1249, in test_a_renewal_failing_during_the_receipt_write_stops_before_the_next_call
+    self.assertEqual(adapter.resume_calls, 0,
+AssertionError: 1 != 0 : an executor whose renewal failed during the receipt write must not go on to touch the external runtime again
+
+----------------------------------------------------------------------
+Ran 5 tests in 0.007s
+
+FAILED (failures=1)

@@ -1,0 +1,20 @@
+=== unknown-ONLY input through every state-ingress API (AFTER FIX) ===
+invoke   -> BLOCKED / MALFORMED_STATE / effects=0
+batch    -> BLOCKED / MALFORMED_STATE / effects=0
+ainvoke  -> BLOCKED / MALFORMED_STATE / effects=0
+abatch   -> BLOCKED / MALFORMED_STATE / effects=0
+stream   -> BLOCKED / MALFORMED_STATE / effects=0
+astream  -> BLOCKED / MALFORMED_STATE / effects=0
+
+=== previously-bypassing ingress APIs are now unreachable ===
+  batch_as_completed   denied
+  abatch_as_completed  denied
+  transform            denied
+  atransform           denied
+  astream_events       denied
+  astream_log          denied
+  bind                 denied
+  pipe                 denied
+  with_config          denied
+  copy                 denied
+  builder              denied

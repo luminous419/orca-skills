@@ -1,0 +1,13 @@
+=== AFTER FIX: no public path unwraps the guarded graph ===
+via facade    -> BLOCKED MALFORMED_STATE effects=0
+via .compiled   -> AttributeError (denied)
+via ._compiled  -> AttributeError (denied)
+via ._graph     -> AttributeError (denied)
+via .graph      -> AttributeError (denied)
+via .pregel     -> AttributeError (denied)
+via .raw        -> AttributeError (denied)
+via .builder    -> AttributeError (denied)
+via .validate   -> AttributeError (denied)
+via .copy       -> AttributeError (denied)
+members of the facade yielding a raw Pregel: none
+subgraphs reachable through the facade: none

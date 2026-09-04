@@ -1,0 +1,22 @@
+{
+  "assumption": null,
+  "boundary": "B3",
+  "evidence": {},
+  "grounds": "The five explicit remediation requirements, repository evidence, and mandatory validation results fully determine this review; no user-authority decision remains open.",
+  "iteration": 1,
+  "ledger_schema_version": 1,
+  "open_decision_item": false,
+  "open_item": null,
+  "phase": "FINAL_REVIEW",
+  "reason_code": null,
+  "recorded_at": "2026-09-03T21:12:04.284594+00:00",
+  "responsible_phase": "FINAL_REVIEW",
+  "role": "reviewer",
+  "run": "run_9e3c67a7824e",
+  "scope": "This phase's own conduct at this iteration.",
+  "sequence": 7,
+  "source": "reviewer",
+  "source_binding": "artifacts/runs/run_9e3c67a7824e/",
+  "state": "CLEAR",
+  "verdict": "FAIL"
+}
