@@ -159,7 +159,7 @@ class StateUpdateBoundaryTests(unittest.TestCase):
         ledger = InMemoryRuntimeStateStore()
         adapter = FakeAdapter(list(results), runtime_state=ledger)
         graph = build_graph(adapter, checkpointer=MemorySaver(), runtime_state=ledger,
-                            interrupt_before=["EXECUTE_INTENT"])
+                            interrupt_before=["EXECUTE_INTENT"], require_durable_checkpointer=False)
         config = _thread_config(thread_id)
         run_id = "run_" + re.sub(r"[^a-z0-9]", "", thread_id.lower())
         graph.invoke(base_state(run_id=run_id, thread_id=thread_id, phases=phases), config)
@@ -268,7 +268,7 @@ class StateUpdateBoundaryTests(unittest.TestCase):
         from scripts.deterministic_workflow.runtime_state import InMemoryRuntimeStateStore
         ledger = InMemoryRuntimeStateStore()
         graph = build_graph(FakeAdapter([], runtime_state=ledger), checkpointer=MemorySaver(),
-                            runtime_state=ledger)
+                            runtime_state=ledger, require_durable_checkpointer=False)
         with self.assertRaisesRegex(StateError, "no checkpoint"):
             graph.update_state(_thread_config("never-ran"), {"decision_state": "CLEAR"})
 
@@ -552,7 +552,8 @@ class CrashRecoveryLadderTests(unittest.TestCase):
         store.claim(intent)                       # a crashed predecessor's claim
         adapter = FakeAdapter([worker_result(artifact_root="run_blocked")],
                               runtime_state=store)
-        final = launcher.execute_state(state, adapter=adapter, runtime_state=store)
+        final = launcher.execute_state(state, adapter=adapter, runtime_state=store,
+                                       checkpoint_store_path=self.root / "cp.json")
         self.assertEqual(final["terminal_status"], "BLOCKED")
         self.assertEqual(final["terminal_reason"]["code"], "IDEMPOTENCY_RECOVERY_UNSUPPORTED")
         self.assertEqual(adapter.effect_count, 0)
@@ -772,7 +773,7 @@ class BindingAdvancementTests(unittest.TestCase):
         ledger = self.ledger()
         results = [worker_result(artifact_root="run_full"), REVIEW_PASS, REVIEW_PASS]
         adapter = FakeAdapter(results, runtime_state=ledger)
-        out = build_graph(adapter, runtime_state=ledger).invoke(
+        out = build_graph(adapter, runtime_state=ledger, require_durable_checkpointer=False).invoke(
             base_state(run_id="run_full", thread_id="t"), {"recursion_limit": 200})
         self.assertEqual(out["terminal_status"], "COMPLETED")
         self.assertEqual(out["repository_binding"]["head_sha"], HEAD_B)
@@ -807,7 +808,7 @@ def _child_restart_run(ledger_path, world_path):
     adapter = FakeAdapter(deepcopy(RESTART_RESULTS), runtime_state=ledger,
                           external_world=FileExternalWorld(world_path))
     graph = build_graph(adapter, checkpointer=MemorySaver(), runtime_state=ledger,
-                        interrupt_before=["VALIDATE_SETTLEMENT"])
+                        interrupt_before=["VALIDATE_SETTLEMENT"], require_durable_checkpointer=False)
     graph.invoke(base_state(run_id="run_restart", thread_id="restart"),
                  _thread_config("restart"))
     print(json.dumps({"effects": adapter.effect_count,
@@ -829,7 +830,7 @@ def _resume_restart_run(ledger_path, world_path):
     ledger = FileRuntimeStateStore(ledger_path)
     adapter = FakeAdapter(deepcopy(RESTART_RESULTS[len(before):]), runtime_state=ledger,
                           external_world=FileExternalWorld(world_path))
-    out = build_graph(adapter, runtime_state=ledger).invoke(
+    out = build_graph(adapter, runtime_state=ledger, require_durable_checkpointer=False).invoke(
         base_state(run_id="run_restart", thread_id="restart"), {"recursion_limit": 200})
     after = _settled_records(ledger_path)
     return {"terminal_status": out["terminal_status"], "new_effects": adapter.effect_count,

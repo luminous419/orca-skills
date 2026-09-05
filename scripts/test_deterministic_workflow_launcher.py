@@ -82,6 +82,9 @@ class LauncherExecutionTests(unittest.TestCase):
         """
         env = dict(os.environ)
         env["ORCA_OS40_RUNTIME_STATE_DIR"] = ledger_dir or self._ledger_dir.name
+        # OS-31: the checkpoint store is durable by default too, so it is isolated the same
+        # way -- otherwise the suite would write artifacts/runs/ into the working tree.
+        env["ORCA_OS40_CHECKPOINT_DIR"] = ledger_dir or self._ledger_dir.name
         return subprocess.run([sys.executable, str(LAUNCHER), *args],
                               capture_output=True, text=True, timeout=300, env=env)
 
@@ -103,7 +106,10 @@ class LauncherExecutionTests(unittest.TestCase):
         state = initial_state(run_id="run_canonical", thread_id="t", phases=CANONICAL_PHASES,
                               capabilities=BASE_CAPABILITIES)
         adapter = FakeAdapter(canonical_results())
-        out = execute_state(state, adapter=adapter, runtime_state=_ledger())
+        # OS-31: execute_state is checkpoint-durable by default, so the store is pointed at
+        # a per-test directory rather than at artifacts/runs/ in the working tree.
+        out = execute_state(state, adapter=adapter, runtime_state=_ledger(),
+                            checkpoint_store_path=Path(self._ledger_dir.name) / "cp.json")
         self.assertEqual(out["terminal_status"], "COMPLETED")
         self.assertEqual(adapter.effect_count, 11)
 
@@ -117,13 +123,17 @@ class LauncherExecutionTests(unittest.TestCase):
         state = initial_state(run_id="run_nolimit", thread_id="t", phases=CANONICAL_PHASES,
                               capabilities=BASE_CAPABILITIES)
         with self.assertRaises(GraphRecursionError):
-            build_graph(FakeAdapter(canonical_results()), runtime_state=_ledger()).invoke(state)
+            build_graph(FakeAdapter(canonical_results()), runtime_state=_ledger(), require_durable_checkpointer=False).invoke(state)
 
     def test_terminal_exit_codes_cover_every_terminal_status(self):
         from scripts.deterministic_workflow.launcher import EXIT_CODES
         self.assertEqual(EXIT_CODES["COMPLETED"], 0)
-        self.assertEqual(sorted(EXIT_CODES), ["BLOCKED", "COMPLETED", "ESCALATED"])
-        self.assertEqual(len(set(EXIT_CODES.values())), 3)
+        # OS-31 adds three: a paused run is not a failure, and cancel/abandon are its two
+        # explicit dispositions. Every code stays distinct.
+        self.assertEqual(sorted(EXIT_CODES),
+                         ["ABANDONED", "BLOCKED", "CANCELLED", "COMPLETED", "ESCALATED",
+                          "WAITING_FOR_INPUT"])
+        self.assertEqual(len(set(EXIT_CODES.values())), 6)
 
     def test_demo_scenario_runs_without_orca_and_exits_zero(self):
         completed = self.launch("--demo", "--json")

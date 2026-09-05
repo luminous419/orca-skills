@@ -176,11 +176,18 @@ class DispatchSiteCardinalityTests(unittest.TestCase):
         from scripts import run_logging
 
         self.assertEqual(len(run_logging.ROUND_KIND_VALUES), 4)
+        # OS-29 itself still adds nothing: the first four values are exactly the ones it
+        # inherited, and the terminal OS-29 uses is one that already existed. The three
+        # after them are OS-31's, and are named here so this assertion keeps attributing
+        # every value to the ticket that introduced it.
         self.assertEqual(
-            run_logging.RUN_STATUS_VALUES, ("COMPLETED", "BLOCKED", "ERROR", "ESCALATED")
+            run_logging.RUN_STATUS_VALUES[:4],
+            ("COMPLETED", "BLOCKED", "ERROR", "ESCALATED")
         )
-        self.assertNotIn("WAITING_FOR_INPUT", run_logging.RUN_STATUS_VALUES)
-        # The terminal OS-29 uses is one that already existed.
+        self.assertEqual(
+            run_logging.RUN_STATUS_VALUES[4:],
+            ("WAITING_FOR_INPUT", "CANCELLED", "ABANDONED")
+        )
         self.assertIn("BLOCKED", run_logging.RUN_STATUS_VALUES)
 
 

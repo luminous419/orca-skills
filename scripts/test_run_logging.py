@@ -4613,7 +4613,8 @@ class DecisionLedgerProducerTests(unittest.TestCase):
         self.assertEqual(len(header), len(ORCHESTRATOR_LOG_COLUMNS))
         self.assertEqual(cells(blank)[index], "")
         self.assertEqual(cells(filled)[index], "NEEDS_INPUT")
-        self.assertEqual(len(RUN_STATUS_VALUES), 4)
+        # Four inherited values plus OS-31's three; the decision-ledger columns added none.
+        self.assertEqual(len(RUN_STATUS_VALUES), 7)
 
     def test_the_cli_can_write_the_two_columns(self) -> None:
         with redirect_stdout(StringIO()):

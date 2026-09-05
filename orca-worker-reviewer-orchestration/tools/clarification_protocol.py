@@ -331,6 +331,37 @@ def _run_root(base: Path, run_id: str) -> Path:
     return base / "artifacts" / "runs" / run_id
 
 
+# OS-31 WU-12. A run that has been cancelled or abandoned must not have further
+# clarification bundles published on its behalf. This is a ~15-line closed-schema read of
+# the pause record's own status/disposition fields, implemented HERE rather than imported,
+# because this module deliberately imports nothing else from scripts/ (see the docstring).
+PAUSE_RECORD_FILENAME = ".pause_state.json"
+PAUSE_RECORD_SCHEMA_VERSION = "os31.pause_record.v2"
+PAUSE_DISPOSED_STATUSES = frozenset({"CANCELLED", "ABANDONED"})
+
+
+def run_disposition(base: Path, run_id: str) -> Mapping[str, object] | None:
+    """The run's terminal disposition, or None for any run that has none.
+
+    Returns None -- so behaviour is bit-for-bit unchanged -- for a run with no pause
+    record, an unreadable one, or one that is merely paused.
+    """
+    try:
+        path = _run_root(Path(base), run_id) / PAUSE_RECORD_FILENAME
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (ClarificationError, OSError, ValueError):
+        return None
+    if not isinstance(document, dict) or document.get("schema_version") != PAUSE_RECORD_SCHEMA_VERSION:
+        return None
+    record = document.get("record")
+    if not isinstance(record, dict) or record.get("run_id") != run_id:
+        return None
+    if record.get("status") not in PAUSE_DISPOSED_STATUSES:
+        return None
+    disposition = record.get("disposition")
+    return dict(disposition) if isinstance(disposition, dict) else {}
+
+
 def _clarification_root(base: Path, run_id: str) -> Path:
     root = _run_root(base, run_id) / "clarifications"
     for name in ("requests", "responses", "decisions", "lineage", ".staging"):
@@ -665,6 +696,10 @@ class ArtifactHumanApprovalPort:
         This is the post-response entry point: after a human answers, the next
         dependency-ready antichain becomes askable without resuming the run.
         """
+        # OS-31 WU-12: a disposed run publishes nothing further. Without this, the CLI's
+        # post-response promote would keep republishing a cancelled run's dependents.
+        if run_disposition(self.artifact_base, run_id) is not None:
+            return PublishResult((), (), "EXISTING")
         sources = self.load_blocked_sources(run_id)
         if not sources:
             return PublishResult((), (), "EXISTING")

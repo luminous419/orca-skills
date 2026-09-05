@@ -134,7 +134,7 @@ class CrashWindowIdempotencyTests(unittest.TestCase):
         from scripts.deterministic_workflow.graph import build_graph
         store = self.store()
         adapter = FakeAdapter([WORKER, REVIEW_PASS, REVIEW_PASS], runtime_state=store)
-        out = build_graph(adapter, runtime_state=store).invoke(
+        out = build_graph(adapter, runtime_state=store, require_durable_checkpointer=False).invoke(
             self.state(), config={"recursion_limit": 100})
         self.assertEqual(out["terminal_status"], "COMPLETED")
         self.assertTrue(self.path.exists(), "graph execution must persist runtime state")
@@ -154,7 +154,7 @@ class CrashWindowIdempotencyTests(unittest.TestCase):
         first_store = self.store()
         first_adapter = FakeAdapter(deepcopy(results), runtime_state=first_store)
         graph = build_graph(first_adapter, checkpointer=saver, runtime_state=first_store,
-                            interrupt_before=["APPLY_RESULT"])
+                            interrupt_before=["APPLY_RESULT"], require_durable_checkpointer=False)
         graph.invoke(self.state(), config)
         self.assertEqual(first_adapter.effect_count, 1)
 
@@ -163,7 +163,7 @@ class CrashWindowIdempotencyTests(unittest.TestCase):
         # recovered from the durable store, not re-driven through the adapter.
         second_store = self.store()
         second_adapter = FakeAdapter(deepcopy(results[1:]), runtime_state=second_store)
-        resumed = build_graph(second_adapter, checkpointer=saver, runtime_state=second_store)
+        resumed = build_graph(second_adapter, checkpointer=saver, runtime_state=second_store, require_durable_checkpointer=False)
         out = resumed.invoke(None, config)
 
         self.assertEqual(out["terminal_status"], "COMPLETED")
@@ -306,7 +306,7 @@ class DefaultPathIdempotencyTests(unittest.TestCase):
         from scripts.deterministic_workflow.runtime_state import IdempotencyPortRequired
         adapter = FakeAdapter([WORKER, REVIEW_PASS, REVIEW_PASS])
         with self.assertRaises(IdempotencyPortRequired):
-            build_graph(adapter)
+            build_graph(adapter, require_durable_checkpointer=False)
         self.assertEqual(adapter.effect_count, 0)
 
     def test_default_execute_state_refuses_without_a_durable_port(self):
@@ -326,7 +326,7 @@ class DefaultPathIdempotencyTests(unittest.TestCase):
         from scripts.deterministic_workflow.runtime_state import FileRuntimeStateStore
         store = FileRuntimeStateStore(self.root / "adapter_bound.json")
         adapter = FakeAdapter([WORKER, REVIEW_PASS, REVIEW_PASS], runtime_state=store)
-        out = build_graph(adapter).invoke(self.state(), config={"recursion_limit": 100})
+        out = build_graph(adapter, require_durable_checkpointer=False).invoke(self.state(), config={"recursion_limit": 100})
         self.assertEqual(out["terminal_status"], "COMPLETED")
         self.assertTrue((self.root / "adapter_bound.json").exists())
 
@@ -337,7 +337,7 @@ class DefaultPathIdempotencyTests(unittest.TestCase):
                                                                   RuntimeStateConflict)
         adapter = FakeAdapter([], runtime_state=FileRuntimeStateStore(self.root / "a.json"))
         with self.assertRaises(RuntimeStateConflict):
-            build_graph(adapter, runtime_state=FileRuntimeStateStore(self.root / "b.json"))
+            build_graph(adapter, runtime_state=FileRuntimeStateStore(self.root / "b.json"), require_durable_checkpointer=False)
 
     # ---- the Final Reviewer's scenario, through the public default path ----
 
@@ -368,7 +368,10 @@ class DefaultPathIdempotencyTests(unittest.TestCase):
 
     def test_cli_without_runtime_state_flag_still_persists_a_ledger(self):
         from scripts.deterministic_workflow import launcher
-        with patch.dict(os.environ, {launcher.RUNTIME_STATE_DIR_ENV: str(self.root)}), \
+        # OS-31: the shipped command line is checkpoint-durable by default, so the store
+        # is isolated per test rather than written into the working tree.
+        with patch.dict(os.environ, {launcher.RUNTIME_STATE_DIR_ENV: str(self.root),
+                                     launcher.CHECKPOINT_DIR_ENV: str(self.root)}), \
                 contextlib.redirect_stdout(io.StringIO()):
             exit_code = launcher.run_cli(["--demo", "--json"])
             path = launcher.default_runtime_state_path("run_demo", "demo")
@@ -381,7 +384,8 @@ class DefaultPathIdempotencyTests(unittest.TestCase):
     def test_cli_rerun_recovers_from_the_default_ledger_without_new_effects(self):
         """A second default run over the same ledger repeats no external effect."""
         from scripts.deterministic_workflow import launcher
-        with patch.dict(os.environ, {launcher.RUNTIME_STATE_DIR_ENV: str(self.root)}), \
+        with patch.dict(os.environ, {launcher.RUNTIME_STATE_DIR_ENV: str(self.root),
+                                     launcher.CHECKPOINT_DIR_ENV: str(self.root)}), \
                 contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(launcher.run_cli(["--demo", "--json"]), 0)
             path = launcher.default_runtime_state_path("run_demo", "demo")
@@ -482,7 +486,7 @@ class CheckpointedSettlementMutationTests(unittest.TestCase):
         # One ledger for both graph objects: this is a single logical process resuming.
         ledger = _ledger()
         graph = build_graph(adapter, checkpointer=saver, runtime_state=ledger,
-                            interrupt_before=["APPLY_RESULT"])
+                            interrupt_before=["APPLY_RESULT"], require_durable_checkpointer=False)
         config = {"configurable": {"thread_id": "tamper"}, "recursion_limit": 100}
         state = initial_state(run_id="run_tamper", thread_id="tamper", phases=("ANALYSIS",),
                               capabilities=BASE_CAPABILITIES)
@@ -498,7 +502,7 @@ class CheckpointedSettlementMutationTests(unittest.TestCase):
         graph.update_state(config, {"pending_event": tampered}, as_node="EXECUTE_INTENT")
 
         # Resume without the setup interrupt so the run reaches its terminal node.
-        out = build_graph(adapter, checkpointer=saver, runtime_state=ledger).invoke(None, config)
+        out = build_graph(adapter, checkpointer=saver, runtime_state=ledger, require_durable_checkpointer=False).invoke(None, config)
         self.assertEqual(out["terminal_status"], "BLOCKED")
         self.assertEqual(out["terminal_reason"]["code"], "SETTLEMENT_INTEGRITY")
         self.assertIsNone(out["phase_passes"]["ANALYSIS"])

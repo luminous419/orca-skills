@@ -7,8 +7,8 @@ from typing import Any, TypedDict
 
 from .contracts import (ACTION_SCHEMA_VERSION, ALL_PHASES, BASE_CAPABILITIES, CAPABILITIES,
                         DECISION_STATES, EVENT_SCHEMA_VERSION, RISKS, ROLES, ROUND_KINDS,
-                        ROUTE_TOKENS, SCHEMA_VERSION, TERMINAL_STATUSES, WORKFLOW_ID,
-                        ActionIntent, SettlementEvent)
+                        ROUTE_TOKENS, RUN_LIFECYCLE_STATES, SCHEMA_VERSION,
+                        TERMINAL_STATUSES, WORKFLOW_ID, ActionIntent, SettlementEvent)
 
 INTENT_STATUSES = ("NONE", "PREPARED", "SETTLED")
 
@@ -37,6 +37,15 @@ class WorkflowState(TypedDict):
     pending_event: dict[str, Any] | None; processed_command_ids: list[str]
     processed_event_ids: list[str]; logical_trace: list[dict[str, Any]]
     terminal_status: str | None; terminal_reason: dict[str, Any] | None
+    # ---- OS-31 durable pause and resume ----
+    # ``run_lifecycle`` names the one run state ``terminal_status`` cannot express.  Its
+    # overlap with ``terminal_status`` elsewhere is a cross-check, not a second authority:
+    # a disagreement is a refusal, never a preference (see _assert_lifecycle_coherence).
+    run_lifecycle: str; pause_binding: dict[str, Any] | None
+    # ``phase_pass_floor`` exists for the phase-pass currency rule alone (AC-6): a pass
+    # recorded before a change the engine has not re-run may not satisfy completion.  Both
+    # are inert -- ``{}`` and ``0`` -- in every run that never paused.
+    binding_generation: int; phase_pass_floor: dict[str, int]
 
 
 FORBIDDEN_KEYS = re.compile(r"(?:process_handle|terminal_handle|session_handle|credential|access_token|client)", re.I)
@@ -67,6 +76,8 @@ def initial_state(*, run_id: str, thread_id: str, phases: tuple[str, ...],
         "route_token": None, "pending_intent": None, "intent_status": "NONE",
         "pending_event": None, "processed_command_ids": [], "processed_event_ids": [],
         "logical_trace": [], "terminal_status": None, "terminal_reason": None,
+        "run_lifecycle": "ACTIVE", "pause_binding": None,
+        "binding_generation": 0, "phase_pass_floor": {},
     }
     return validate_state(state, expected_thread_id=thread_id)
 
@@ -119,6 +130,8 @@ def _assert_value_domains(raw: dict[str, Any]) -> None:
         raise StateError("MALFORMED_STATE:terminal status")
     if raw["intent_status"] not in INTENT_STATUSES:
         raise StateError("MALFORMED_STATE:intent status")
+    if raw["run_lifecycle"] not in RUN_LIFECYCLE_STATES:
+        raise StateError("MALFORMED_STATE:run lifecycle")
     if raw["pending_role"] is not None and raw["pending_role"] not in ROLES:
         raise StateError("MALFORMED_STATE:pending role")
     for key in _OPTIONAL_STR_FIELDS:
@@ -147,6 +160,52 @@ def _assert_value_domains(raw: dict[str, Any]) -> None:
         raise StateError("MALFORMED_STATE:queue phases")
     _assert_pending_intent(raw)
     _assert_pending_event(raw)
+    _assert_lifecycle_coherence(raw)
+
+
+def _assert_lifecycle_coherence(raw: dict[str, Any]) -> None:
+    """One place, fail-closed, for every rule relating lifecycle to terminal status.
+
+    The ``SETTLED <=> terminal_status is not None`` biconditional makes a state that "was
+    terminal and now is not" unrepresentable, which is what closes the forged-resume path
+    without any code path needing to be careful (OS-31 SS8.1).
+    """
+    lifecycle = raw["run_lifecycle"]
+    terminal = raw["terminal_status"]
+    if (lifecycle == "SETTLED") != (terminal is not None):
+        raise StateError("MALFORMED_STATE:lifecycle coherence")
+    if lifecycle == "WAITING_FOR_INPUT":
+        if raw["pause_binding"] is None:
+            raise StateError("MALFORMED_STATE:lifecycle coherence")
+        if raw["pending_intent"] is not None or raw["pending_event"] is not None:
+            raise StateError("MALFORMED_STATE:lifecycle coherence")
+        if raw["intent_status"] != "NONE":
+            raise StateError("MALFORMED_STATE:lifecycle coherence")
+    if lifecycle == "ACTIVE" and raw["pause_binding"] is not None:
+        raise StateError("MALFORMED_STATE:lifecycle coherence")
+    if raw["pause_binding"] is not None:
+        _assert_pause_binding(raw["pause_binding"])
+    for phase, floor in raw["phase_pass_floor"].items():
+        if phase not in raw["requested_phases"]:
+            raise StateError("MALFORMED_STATE:phase pass floor phase")
+        if type(floor) is not int or floor < 0:
+            raise StateError("MALFORMED_STATE:phase pass floor value")
+    if type(raw["binding_generation"]) is not int or raw["binding_generation"] < 0:
+        raise StateError("MALFORMED_STATE:binding generation")
+
+
+def _assert_pause_binding(binding: Any) -> None:
+    """Validate the closed pause binding, delegating to the pure policy module.
+
+    Imported lazily so ``state`` keeps the tiny import surface every other module relies
+    on; ``pause_policy`` is pure and carries no LangGraph or Orca dependency either way.
+    """
+    from .pause_policy import PauseRefused, validate_pause_binding
+
+    try:
+        validate_pause_binding(binding)
+    except PauseRefused as exc:
+        raise StateError(f"MALFORMED_STATE:pause binding:{exc.detail}") from exc
 
 
 def _assert_pending_intent(raw: dict[str, Any]) -> None:
@@ -204,13 +263,15 @@ def validate_state(raw: dict[str, Any], *, expected_thread_id: str) -> WorkflowS
                 "processed_event_ids", "logical_trace"):
         if type(raw[key]) is not list: raise StateError(f"MALFORMED_STATE:{key} type")
     for key in ("phase_iterations", "remaining_phase_budget", "phase_passes", "artifact_binding",
-                "initial_repository_binding", "repository_binding"):
+                "initial_repository_binding", "repository_binding", "phase_pass_floor"):
         if type(raw[key]) is not dict: raise StateError(f"MALFORMED_STATE:{key} type")
+    if raw["pause_binding"] is not None and type(raw["pause_binding"]) is not dict:
+        raise StateError("MALFORMED_STATE:pause_binding type")
     for key in ("current_phase_index", "final_review_iterations", "remaining_final_budget",
-                "correction_index", "revalidation_index"):
+                "correction_index", "revalidation_index", "binding_generation"):
         if type(raw[key]) is not int: raise StateError(f"MALFORMED_STATE:{key} type")
     for key in ("schema_version", "run_id", "thread_id", "workflow_id", "current_phase",
-                "round_kind", "risk"):
+                "round_kind", "risk", "run_lifecycle"):
         if type(raw[key]) is not str: raise StateError(f"MALFORMED_STATE:{key} type")
     if raw["schema_version"] != SCHEMA_VERSION or raw["workflow_id"] != WORKFLOW_ID:
         raise StateError("MALFORMED_STATE:schema")
@@ -292,6 +353,24 @@ UPDATE_COMMANDS: dict[str, tuple[str, ...]] = {
     "SET_REPOSITORY_BINDING": ("repository_binding",),
     "SET_ARTIFACT_BINDING": ("artifact_binding",),
     "CLEAR_PENDING": ("pending_intent", "pending_event", "intent_status"),
+    # ---- OS-31.  Neither command names worker_result, reviewer_result,
+    # final_reviewer_result, phase_passes, final_review_iterations or any budget, so no
+    # typed resume or disposition can touch a gate input (SS8.3).
+    # ``route_token`` and ``terminal_reason`` are cleared, never set: ``route_node``
+    # short-circuits to the recorded token whenever a terminal reason is present
+    # (executor.py), so a resume that left the pause's reason standing would re-route
+    # straight back into PAUSE instead of re-entering the workflow. Clearing them is what
+    # makes the re-entry a re-entry; neither is a gate input, and both stay refused on the
+    # raw ingress via PROTECTED_STATE_FIELDS.
+    "RESUME_PAUSE": ("run_lifecycle", "pause_binding", "decision_state",
+                     "decision_reason_code", "pending_clarification_id",
+                     "round_kind", "current_phase", "correction_queue",
+                     "correction_index", "binding_generation", "phase_pass_floor",
+                     "repository_binding", "artifact_binding",
+                     "route_token", "terminal_reason"),
+    # Same rule as RESUME_PAUSE: the recorded pause reason and token are CLEARED so the
+    # re-entry actually re-routes, and are refused on the raw ingress either way.
+    "REQUEST_DISPOSITION": ("pause_binding", "route_token", "terminal_reason"),
 }
 
 
@@ -314,4 +393,28 @@ def typed_update(command: str, **fields: Any) -> dict[str, Any]:
                                        or fields["pending_event"] is not None
                                        or fields["intent_status"] != "NONE"):
         raise StateError("MALFORMED_UPDATE_COMMAND:CLEAR_PENDING:not a clear")
+    if command == "RESUME_PAUSE":
+        if fields["run_lifecycle"] != "ACTIVE":
+            raise StateError("MALFORMED_UPDATE_COMMAND:RESUME_PAUSE:run_lifecycle")
+        if fields["pause_binding"] is not None:
+            raise StateError("MALFORMED_UPDATE_COMMAND:RESUME_PAUSE:pause_binding must clear")
+        if fields["decision_state"] not in DECISION_STATES:
+            raise StateError("MALFORMED_UPDATE_COMMAND:RESUME_PAUSE:decision_state")
+        if type(fields["binding_generation"]) is not int or fields["binding_generation"] < 0:
+            raise StateError("MALFORMED_UPDATE_COMMAND:RESUME_PAUSE:binding_generation")
+        if not isinstance(fields["phase_pass_floor"], dict):
+            raise StateError("MALFORMED_UPDATE_COMMAND:RESUME_PAUSE:phase_pass_floor")
+        if fields["route_token"] is not None or fields["terminal_reason"] is not None:
+            raise StateError(
+                "MALFORMED_UPDATE_COMMAND:RESUME_PAUSE:route_token and terminal_reason "
+                "may only be cleared")
+    if command == "REQUEST_DISPOSITION":
+        binding = fields["pause_binding"]
+        if not isinstance(binding, dict) or binding.get("disposition") is None:
+            raise StateError(
+                "MALFORMED_UPDATE_COMMAND:REQUEST_DISPOSITION:no disposition requested")
+        if fields["route_token"] is not None or fields["terminal_reason"] is not None:
+            raise StateError(
+                "MALFORMED_UPDATE_COMMAND:REQUEST_DISPOSITION:route_token and "
+                "terminal_reason may only be cleared")
     return dict(fields)

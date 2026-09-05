@@ -88,6 +88,82 @@ class RuntimeStatePort(Protocol):
 
 
 @runtime_checkable
+class RunPauseStatePort(Protocol):
+    """Run-scoped durable pause index, coordination fence and projection.
+
+    Deliberately separate from :class:`RuntimeStatePort`, which is keyed on ``intent_id``
+    and cannot answer a run-scoped question.  It is NEVER the authority for execution
+    state; that is the OS-40 checkpoint (PLAN D2/F-001).  ``projection`` is a subordinate
+    view of the checkpoint, kept so a discovery sweep can explain a paused run without
+    opening the Tier-1 store, and cross-checked (C3) rather than trusted.
+
+    Every mutating call is fenced by the ``lease_token`` :meth:`claim` minted.  There is
+    deliberately no "no token supplied" branch: an absent token is a missing capability,
+    not permission to skip the check.
+    """
+
+    def read(self, run_id: str) -> Mapping[str, Any] | None: ...
+    def create(self, record: Mapping[str, Any]) -> Mapping[str, Any]: ...
+    def claim(self, run_id: str) -> Mapping[str, Any]: ...
+    def heartbeat(self, run_id: str, lease_token: str) -> Mapping[str, Any]: ...
+    def release(self, run_id: str, lease_token: str) -> None: ...
+    def observe(self, run_id: str, *, timeout_seconds: float,
+                poll_seconds: float) -> Mapping[str, Any] | None: ...
+    def update_pointer(self, run_id: str, *, checkpoint_id: str, checkpoint_digest: str,
+                       projection: Mapping[str, Any],
+                       lease_token: str) -> Mapping[str, Any]: ...
+    def record_applied(self, run_id: str, entry: Mapping[str, Any],
+                       lease_token: str) -> Mapping[str, Any]:
+        """Write the ONE bundle-level applied entry, atomically.
+
+        ``entry`` is a whole applied bundle covering every decision item of the request --
+        never one item.  One call, one whole-record write under the store's critical
+        section, so there is no window in which a subset of a bundle's items is recorded
+        and the rest is not.  Refuses with ``PAUSE_LIFECYCLE_INCOHERENT`` when the items
+        are not exactly the record's ``decision_item_ids``, and with ``RESPONSE_CONFLICT``
+        when a *different* bundle is already applied.
+        """
+    def mark_resumed(self, run_id: str, lease_token: str) -> Mapping[str, Any]: ...
+    def settle_disposition(self, run_id: str, disposition: Mapping[str, Any],
+                           lease_token: str) -> Mapping[str, Any]: ...
+
+
+@runtime_checkable
+class LifecycleSettlementPort(Protocol):
+    """Settle a dispatch and account terminal ownership, for pause and disposal.
+
+    ``AgentExecutionPort.interrupt`` cannot express this: interrupting is not settling, and
+    it says nothing about the four axes.  Declared by an adapter as the capability
+    ``lifecycle_settlement``; an adapter that cannot honour it must not declare it, and
+    pause then correctly falls back to BLOCK.
+    """
+
+    def open_dispatches(self) -> tuple[str, ...]:
+        """Every dispatch of THIS run that is not yet finished, reconstructed durably.
+
+        Must be answerable by a process that holds none of the objects of the process that
+        created the dispatches.  An implementation that can only read its own memory does
+        not satisfy this method and must not declare the capability.  A source that cannot
+        be read is "unknown", never "empty": raise rather than return a short tuple.
+        """
+
+    def recover_handle(self, intent_id: str) -> Mapping[str, Any]:
+        """Resolve this row's live terminal handle, or say why it cannot.
+
+        Returns ``{"handle": str | None, "handle_recovery": <closed vocabulary member>}``.
+        Read-only: enumerates and verifies, mutates nothing, and is safe to repeat.  A
+        handle is returned ONLY for ``listing_verified`` -- i.e. only when a durable digest
+        proved it.  ``listing_candidate`` reports a title match with no verifier and MUST
+        NOT be acted on; it exists so an abandon report can name the terminal.  A source
+        that cannot be read raises rather than returning ``not_listed``.
+        """
+
+    def account_dispatch(self, intent_id: str) -> Mapping[str, Any]: ...
+    def recover_dispatch(self, intent_id: str, *, reason: str) -> Mapping[str, Any]: ...
+    def release_terminal(self, intent_id: str, *, authority: str) -> Mapping[str, Any]: ...
+
+
+@runtime_checkable
 class HumanApprovalPort(Protocol):
     def publish(self, *, run_id: str, sources: Sequence[ClarificationSource]) -> PublishResult: ...
     def show(self, *, run_id: str, request_id: str) -> Mapping[str, object]: ...

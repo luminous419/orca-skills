@@ -6,25 +6,30 @@ from dataclasses import dataclass
 from .contracts import ROUTE_TOKENS
 
 NODES = ("VALIDATE", "ROUTE", "ADVANCE_PHASE", "PREPARE_INTENT", "EXECUTE_INTENT",
-         "VALIDATE_SETTLEMENT", "APPLY_RESULT", "TERMINAL")
+         "VALIDATE_SETTLEMENT", "APPLY_RESULT", "PAUSE", "DISPOSE", "TERMINAL")
 STATIC_EDGES = (
     ("VALIDATE", "ROUTE"), ("ADVANCE_PHASE", "ROUTE"),
     ("PREPARE_INTENT", "EXECUTE_INTENT"),
     ("EXECUTE_INTENT", "VALIDATE_SETTLEMENT"),
     ("VALIDATE_SETTLEMENT", "APPLY_RESULT"), ("APPLY_RESULT", "ROUTE"),
+    # OS-31.  PAUSE and DISPOSE both fall through to TERMINAL, which stays the graph's one
+    # exit node: for route_token "PAUSE" it writes NO terminal status, which is what makes
+    # a pause genuinely non-terminal while leaving validate_graph_spec intact in shape.
+    ("PAUSE", "TERMINAL"), ("DISPOSE", "TERMINAL"),
 )
 ROUTE_TARGETS = {
     "BLOCK": "TERMINAL", "ESCALATE": "TERMINAL", "COMPLETE": "TERMINAL",
     "ADVANCE_PHASE": "ADVANCE_PHASE", "PREPARE_WORKER": "PREPARE_INTENT",
     "PREPARE_PHASE_REVIEWER": "PREPARE_INTENT", "PREPARE_FINAL_REVIEWER": "PREPARE_INTENT",
     "PREPARE_CORRECTION": "PREPARE_INTENT", "PREPARE_REVALIDATION": "PREPARE_INTENT",
+    "PAUSE": "PAUSE", "CANCEL": "DISPOSE", "ABANDON": "DISPOSE",
 }
 CYCLE_GUARDS = frozenset({"phase_budget", "final_budget", "phase_index_monotonic"})
 # The workflow decisions this graph owns outright.  The Skill document must declare exactly
 # this set and demote its own prose about them; ``validate_workflow_graph_docs`` enforces it,
 # so a decision added here fails validation until the document delegates it too.
 GRAPH_OWNED_DECISIONS = ("PHASE_TRANSITION", "PHASE_GATE", "CORRECTION_LOOP",
-                         "ITERATION_BUDGET", "FINAL_REVIEW_ROUTING")
+                         "ITERATION_BUDGET", "FINAL_REVIEW_ROUTING", "PAUSE_RESUME")
 
 
 class GraphSpecError(ValueError): pass

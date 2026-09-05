@@ -113,7 +113,12 @@ TIMING_LOG_COLUMNS = (
 # status this module invented -- it is a caller passing something that is not
 # one of the four the contract names, and that fails closed rather than being
 # written as an unrecognized string a later reader has to guess about.
-RUN_STATUS_VALUES = ("COMPLETED", "BLOCKED", "ERROR", "ESCALATED")
+# OS-31 adds three: a run waiting for a human decision is an explicit lifecycle state
+# rather than a failure or an undetermined settlement, and cancel/abandon are its two
+# explicit dispositions. The tuple stays closed and eagerly validated -- an unrecognized
+# value is still refused, at every enforcement point.
+RUN_STATUS_VALUES = ("COMPLETED", "BLOCKED", "ERROR", "ESCALATED",
+                     "WAITING_FOR_INPUT", "CANCELLED", "ABANDONED")
 # OS-3 column vocabularies. Spelled here rather than imported: this module
 # deliberately imports nothing from scripts/ (see the docstring), and the CLI's
 # existing `--action` choices are the precedent for constraining a column this way.
@@ -145,6 +150,16 @@ DECISION_LEDGER_MAX_ALLOCATION_ATTEMPTS = 8
 EVENT_DECISION_RECORD_WRITTEN = "decision_record_written"
 EVENT_DECISION_GATE_REFUSED = "decision_gate_refused"
 EVENT_DECISION_BLOCK = "decision_block"
+# OS-31 durable pause/resume. The `--event` column has no `choices` by design, so these
+# are named constants rather than a schema change.
+EVENT_RUN_PAUSED = "run_paused"
+EVENT_RUN_RESUMED = "run_resumed"
+EVENT_RUN_RESUME_REFUSED = "run_resume_refused"
+EVENT_RUN_CANCELLED = "run_cancelled"
+EVENT_RUN_ABANDONED = "run_abandoned"
+EVENT_PAUSE_SETTLEMENT = "pause_settlement_accounted"
+EVENT_PAUSE_TAKEOVER = "pause_takeover_claimed"
+EVENT_PAUSE_TAKEOVER_REFUSED = "pause_takeover_refused"
 
 # OS-19 fail-safe markers. A duration that cannot be measured leaves `duration_s`
 # empty and appends one of these to the row's own `detail`, so "no duration" and

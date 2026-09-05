@@ -978,7 +978,8 @@ class RenewalFailureTests(_LeaseFixture):
                                                "the lease could not be renewed")
 
         with patch.object(graph_module, "build_graph", lambda *args, **kwargs: LosingGraph()):
-            terminal = execute_state(state, adapter=adapter, runtime_state=store)
+            terminal = execute_state(state, adapter=adapter, runtime_state=store,
+                                     checkpoint_store_path=self.root / "cp.json")
         self.assertEqual(terminal["terminal_status"], "BLOCKED")
         self.assertEqual(terminal["terminal_reason"]["code"], "IDEMPOTENCY_LEASE_LOST")
         self.assertEqual(terminal["phase_iterations"]["ANALYSIS"], 0,

@@ -21,9 +21,13 @@ ROUND_KINDS = ("PHASE_GATE", "CORRECTION", "DOWNSTREAM_REVALIDATION", "FINAL_REV
 ROUTE_TOKENS = (
     "BLOCK", "ESCALATE", "PREPARE_WORKER", "PREPARE_PHASE_REVIEWER",
     "ADVANCE_PHASE", "PREPARE_FINAL_REVIEWER", "PREPARE_CORRECTION",
-    "PREPARE_REVALIDATION", "COMPLETE",
+    "PREPARE_REVALIDATION", "COMPLETE", "PAUSE", "CANCEL", "ABANDON",
 )
-TERMINAL_STATUSES = ("COMPLETED", "BLOCKED", "ESCALATED")
+TERMINAL_STATUSES = ("COMPLETED", "BLOCKED", "ESCALATED", "CANCELLED", "ABANDONED")
+# OS-31.  ``WAITING_FOR_INPUT`` is deliberately ABSENT from ``TERMINAL_STATUSES``: a run
+# waiting for a human decision has not ended, and naming it terminal is exactly the defect
+# OS-31 exists to remove.  It is a run *lifecycle* value, not a terminal status.
+RUN_LIFECYCLE_STATES = ("ACTIVE", "WAITING_FOR_INPUT", "SETTLED")
 DECISION_STATES = ("CLEAR", "ASSUMPTION_ALLOWED", "NEEDS_INPUT", "CONFLICT")
 BASE_CAPABILITIES = frozenset({
     "agent_start", "agent_command", "agent_status", "agent_interrupt",
@@ -35,13 +39,19 @@ BASE_CAPABILITIES = frozenset({
 EXTERNAL_LOOKUP = "external_lookup"      # find an existing effect by stable intent identity
 EXTERNAL_RESUME = "external_resume"      # observe/collect an effect an earlier process created
 RECOVERY_CAPABILITIES = frozenset({EXTERNAL_LOOKUP, EXTERNAL_RESUME})
+# OS-31.  A decision block may become a durable pause only when the adapter can BOTH ask
+# the question and settle what is running; an adapter that cannot honour either must not
+# declare it, and pause then correctly falls back to the pre-OS-31 BLOCK behaviour.
+LIFECYCLE_SETTLEMENT = "lifecycle_settlement"
+PAUSE_CAPABILITIES = frozenset({"human_approval", LIFECYCLE_SETTLEMENT})
 CAPABILITIES = BASE_CAPABILITIES | RECOVERY_CAPABILITIES | frozenset({
     "human_approval", "dispatch_provenance", "dependency_edges", "runtime_ownership",
+    LIFECYCLE_SETTLEMENT,
 })
 
 Phase = Literal["ANALYSIS", "PLAN", "DESIGN", "IMPLEMENTATION", "TEST", "BUGFIX", "REFACTORING"]
 Role = Literal["WORKER", "PHASE_REVIEWER", "FINAL_REVIEWER"]
-RouteToken = Literal["BLOCK", "ESCALATE", "PREPARE_WORKER", "PREPARE_PHASE_REVIEWER", "ADVANCE_PHASE", "PREPARE_FINAL_REVIEWER", "PREPARE_CORRECTION", "PREPARE_REVALIDATION", "COMPLETE"]
+RouteToken = Literal["BLOCK", "ESCALATE", "PREPARE_WORKER", "PREPARE_PHASE_REVIEWER", "ADVANCE_PHASE", "PREPARE_FINAL_REVIEWER", "PREPARE_CORRECTION", "PREPARE_REVALIDATION", "COMPLETE", "PAUSE", "CANCEL", "ABANDON"]
 
 
 class Finding(TypedDict):

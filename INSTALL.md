@@ -265,6 +265,28 @@ result and exits with that result's code:
 | 1 | `BLOCKED` (decision block, quality block, or malformed input state) |
 | 2 | `ESCALATED` (phase or final-review iteration budget exhausted) |
 | 3 | unusable arguments, unreadable input, or missing/wrong LangGraph runtime |
+| 4 | `WAITING_FOR_INPUT` (OS-31: a durable pause awaiting a human decision) |
+| 5 | `CANCELLED` (OS-31: an explicit human cancel of a paused run) |
+| 6 | `ABANDONED` (OS-31: an explicit human abandon of a paused run) |
+
+**The shipped command line is checkpoint-durable by default.** OS-31 installs a durable
+`FileCheckpointSaver` with no extra flags, beside the durable ledger, so a paused run can
+survive the process; `--checkpoint-store` and `$ORCA_OS40_CHECKPOINT_DIR` move it. This does
+not change the sentence above: LangGraph is still required to execute the graph, the runtime
+check still fails explicitly when it is absent, and there is still no prompt-loop fallback.
+
+OS-31 adds exactly two verbs, and no more:
+
+```bash
+python3 orca-worker-reviewer-orchestration/tools/run_workflow.py discover --artifact-base . --json
+python3 orca-worker-reviewer-orchestration/tools/run_workflow.py resume --run-id run_x --artifact-base .
+```
+
+`discover` lists every paused run under an artifact base and is read-only; without LangGraph
+it still works but reports every verdict as `CHECKPOINT_UNVERIFIED`, never `RESUMABLE`.
+`resume` applies the recorded human decision and re-enters the same run exactly once, or
+disposes it with `--cancel` / `--abandon`; without LangGraph it refuses with
+`LANGGRAPH_DEPENDENCY_MISSING` before taking any claim.
 
 Run the canonical five-phase workflow end to end with no Orca runtime present:
 
