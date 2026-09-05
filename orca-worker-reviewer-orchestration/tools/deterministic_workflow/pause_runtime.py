@@ -427,6 +427,49 @@ def continuation_evidence(record: Mapping[str, Any], saver: Any) -> str:
 
 
 @dataclass(frozen=True)
+class HeadClassification:
+    """What the thread's durable head says a successor may do with this pause record."""
+
+    verdict: str
+    in_flight: dict[str, Any] | None
+
+
+def classify_head(record: Mapping[str, Any], saver: Any) -> HeadClassification:
+    """The ONE classification of a pause record against its thread's head.
+
+    ``discover`` and ``resume_run`` ask the identical question -- is this head the pause
+    this record names, is it this bundle's own committed continuation, or is it neither?
+    -- so they answer it here and neither one re-implements it.  A second, parallel copy
+    is exactly how the two drifted apart before: ``resume_run`` consulted C5, ``discover``
+    went straight from C1 to C2, and every run C5 was written to recover was invisible to
+    the fresh Coordinator that was supposed to recover it.
+
+    * :data:`pause_policy.PAUSE_CONTINUATION_RECOVERABLE` -- the record holds an in-flight
+      bundle (claimed, not yet promoted) AND C5 proves the head descends from the pause
+      checkpoint.  A resume finishes that continuation from the head.
+    * :data:`pause_policy.PAUSE_RESUMABLE` -- C1 and C2 hold: the head still IS the pause
+      checkpoint and its payload still matches the recorded digest.  A resume runs from
+      the top.
+    * otherwise it RAISES :class:`PauseRefused`, whose ``code`` names the refusal --
+      ``PAUSE_CONTINUATION_UNRECOVERABLE`` for a head that neither is nor descends from
+      the pause, ``STALE_CHECKPOINT_HEAD`` for a moved head with no in-flight bundle to
+      speak for it, ``PAUSE_CHECKPOINT_MISSING`` for a record the store cannot honour.
+      A moved head is never rubber-stamped: only the lineage the checkpoint store's own
+      parent links prove can turn one into a recoverable verdict.
+
+    The evidence is durable and nothing else: the head pointer and the stored parent
+    links.  No in-memory state, no wall clock, no elapsed-time inference.
+    """
+    in_flight = pause_policy.in_flight_bundle(record)
+    if in_flight is not None and \
+            continuation_evidence(record, saver) == CONTINUATION_COMMITTED:
+        return HeadClassification(pause_policy.PAUSE_CONTINUATION_RECOVERABLE, in_flight)
+    assert_c1(record, saver)
+    assert_c2(record, saver)
+    return HeadClassification(pause_policy.PAUSE_RESUMABLE, None)
+
+
+@dataclass(frozen=True)
 class _Recovered:
     """What a successor finished, and what it PROVED while finishing it."""
 
@@ -516,9 +559,11 @@ def discover(artifact_base: str | os.PathLike[str], *,
         record = store.read(entry["run_id"])
         try:
             saver = open_saver(record, artifact_base=artifact_base)
-            assert_c1(record, saver)
-            assert_c2(record, saver)
-            entry["verdict"] = "RESUMABLE"
+            # The SAME classification resume_run acts on (C5 before C2), because a
+            # verdict a fresh Coordinator cannot act on is not a discovery.  A crashed
+            # continuation legitimately has a head that has moved off the pause; asking
+            # C2 first labelled it STALE_CHECKPOINT_HEAD and hid it forever.
+            entry["verdict"] = classify_head(record, saver).verdict
         except (PauseRefused, _checkpoint_store().CheckpointStoreError) as exc:
             entry["verdict"] = getattr(exc, "code", "PAUSE_RECORD_CORRUPT")
             entry["detail"] = str(exc)
@@ -699,11 +744,14 @@ def resume_run(run_id: str, *, artifact_base: str | os.PathLike[str], approval_p
             # have to repair from is ACTIVE and not WAITING_FOR_INPUT.  The record's own
             # applied set is the index into the evidence: a bundle that is claimed
             # (RECORDED or CONTINUING) but not yet promoted.
-            in_flight = pause_policy.in_flight_bundle(record)
-            if in_flight is not None and \
-                    continuation_evidence(record, saver) == CONTINUATION_COMMITTED:
+            #
+            # ``classify_head`` is that classification, and ``discover`` calls the very
+            # same function, so what a fresh Coordinator is told it may do and what this
+            # path actually does cannot drift apart.
+            classified = classify_head(record, saver)
+            if classified.verdict == pause_policy.PAUSE_CONTINUATION_RECOVERABLE:
                 recovered = _recover_continuation(
-                    run_id, record=record, entry=in_flight, saver=saver,
+                    run_id, record=record, entry=classified.in_flight, saver=saver,
                     graph_factory=graph_factory, keeper=keeper, store=store,
                     lease_token=lease_token, recursion_limit=recursion_limit,
                     artifact_base=artifact_base)

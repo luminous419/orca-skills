@@ -2427,6 +2427,7 @@ C3 projection과 checkpoint는 일치해야 한다           -> PAUSE_PROJECTION
 C4 checkpoint는 있고 record가 없으면 checkpoint에서 재도출한다 (반대 방향은 없다)
 C5 head가 pause를 벗어났으면 그것이 이 bundle의 continuation인지 durable하게 판정한다
    -> 아니면 PAUSE_CONTINUATION_UNRECOVERABLE, 맞으면 복구한다 (C2보다 먼저 평가된다)
+   discover와 resume은 이 판정을 각자 구현하지 않고 같은 함수 하나를 호출한다
 ```
 
 resume은 세 가지 durable fact를 순서대로 commit하며, 각 쌍 사이에 crash window가 있다.
@@ -2501,6 +2502,33 @@ claim한 Coordinator는 claimed section 전체 — decision 조회, 재검증, c
 recency로 중재하지 않는다. repository head, artifact 또는 policy digest가 바뀌었으면 응답을
 무조건 적용하지 않고 responsible phase부터 correction 경로로 재진입한다 — 따라서 phase
 Reviewer와 Final Adversarial Review gate는 재개로 우회되지 않는다.
+
+`discover`는 resume이 실제로 할 일과 **같은 분류**를 보고한다. 둘은 같은 함수
+(`pause_runtime.classify_head`, 즉 C5를 C2보다 먼저 보는 그 판정)를 호출하므로 갈라질 수 없다.
+갈라져 있던 동안 discovery는 C1 다음에 곧바로 C2를 적용했고, continuation boundary에서 crash한
+run — in-flight bundle이 있고 head가 pause checkpoint의 자손인 run — 을 STALE_CHECKPOINT_HEAD로
+보고했다. 즉 C5가 복구하려고 만들어진 바로 그 run들을 새 Coordinator는 발견할 수 없었고, run_id를
+이미 아는 operator만 복구할 수 있었다.
+
+```text
+PAUSE_DISCOVERY_VERDICTS = PAUSE_DISCOVERY_ACTIONABLE_VERDICTS | PAUSE_REFUSAL_CODES
+
+PAUSE_DISCOVERY_ACTIONABLE_VERDICTS (새 Coordinator가 실제로 손댈 수 있는 두 가지)
+  RESUMABLE                       head == record의 checkpoint (C1/C2 성립)
+                                  -> resume을 처음부터 구동한다
+  PAUSE_CONTINUATION_RECOVERABLE  in-flight bundle(RECORDED|CONTINUING)이 있고
+                                  head가 그 checkpoint의 검증된 자손이다 (C5 COMMITTED)
+                                  -> re-entry를 재실행하지 않고 head에서 continuation을 끝낸다
+그 외 (전부 PAUSE_REFUSAL_CODES, 행동 대상이 아니다)
+  PAUSE_CONTINUATION_UNRECOVERABLE  head가 pause도 그 자손도 아니다 -- 움직인 head라고
+                                    무조건 복구하지 않는다. 이 경우는 그대로 fail-closed다
+  STALE_CHECKPOINT_HEAD             in-flight bundle이 없는데 head가 움직였거나 digest가 다르다
+  RUN_ALREADY_RESUMED|CANCELLED|ABANDONED, PAUSE_RECORD_CORRUPT, PAUSE_CHECKPOINT_MISSING,
+  CHECKPOINT_UNVERIFIED (LangGraph 부재)
+두 actionable verdict는 뒤따르는 작업이 서로 다르므로 이름도 둘이다.
+RESUMABLE을 넓혀 둘을 겸하게 하지 않는다.
+discover는 여전히 read-only다: claim도, effect도, head 이동도 없다.
+```
 
 CLI는 정확히 두 verb만 늘어난다.
 

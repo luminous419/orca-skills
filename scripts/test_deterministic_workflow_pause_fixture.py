@@ -133,11 +133,14 @@ class PauseFixture(unittest.TestCase):
         return pause_store.store_for(self.RUN, artifact_base=self.base, owner_id=owner_id)
 
     def adapter(self, results=(), *, world=None, axes=None, worktree=WORKTREE_A,
-                journal=None, approval_port=None, ledger=None):
+                journal=None, approval_port=None, ledger=None, run_id=None):
+        """``run_id`` defaults to this fixture's run; a caller that only knows a run id it
+        DISCOVERED passes that one, so nothing about its driver is taken on trust."""
         from scripts.deterministic_workflow.fake_adapter import FakeAdapter
         return FakeAdapter(list(results), runtime_state=ledger or self.ledger(),
                            external_world=world if world is not None else self.world(),
-                           run_id=self.RUN, settlement_journal=journal or self.journal(),
+                           run_id=run_id or self.RUN,
+                           settlement_journal=journal or self.journal(),
                            approval_port=approval_port or self.approval_port(),
                            worktree=worktree, axes=axes)
 

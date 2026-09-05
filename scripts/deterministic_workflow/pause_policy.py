@@ -72,6 +72,28 @@ PAUSE_RECOVERY_CODES = frozenset({
     "PAUSE_CONTINUATION_ALREADY_COMPLETE",  # the head was already terminal / next-pause
 })
 
+# ---- discovery verdicts --------------------------------------------------------------
+# `discover` answers exactly one question per paused run -- "what may a Coordinator that
+# has never seen this run do with it?" -- and it must answer it with the SAME
+# classification `resume_run` acts on.  When it did not, a run crashed at the resume
+# continuation boundary was reported STALE_CHECKPOINT_HEAD, so the runs C5 exists to
+# recover were precisely the ones a fresh Coordinator could never find; recovery was
+# reachable only by an operator who already knew the run id.
+#
+# The two ACTIONABLE verdicts are deliberately two names and not one widened RESUMABLE,
+# because a caller may legitimately act differently on them: one is an untouched pause
+# whose resume runs from the top, the other is a crashed resume whose continuation is
+# already committed to the checkpoint and must be FINISHED from the head, never re-driven.
+PAUSE_RESUMABLE = "RESUMABLE"                                # head IS the pause checkpoint
+PAUSE_CONTINUATION_RECOVERABLE = "PAUSE_CONTINUATION_RECOVERABLE"  # validated descendant
+PAUSE_DISCOVERY_ACTIONABLE_VERDICTS = frozenset({PAUSE_RESUMABLE,
+                                                 PAUSE_CONTINUATION_RECOVERABLE})
+# Everything `discover` may report, and nothing else.  Every non-actionable verdict is a
+# refusal code -- including the RUN_ALREADY_* family for a run that is no longer waiting
+# and CHECKPOINT_UNVERIFIED for a degraded runtime -- so the closed discovery vocabulary
+# is the two actionable names plus the closed refusal vocabulary, with no third source.
+PAUSE_DISCOVERY_VERDICTS = PAUSE_DISCOVERY_ACTIONABLE_VERDICTS | PAUSE_REFUSAL_CODES
+
 # ---- four-axis settlement vocabularies -----------------------------------------------
 # The first three are re-exports of the harness's own vocabularies.  The engine must not
 # import the harness (PLAN D1), so a contract test asserts the copies are equal rather

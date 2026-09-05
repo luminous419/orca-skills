@@ -595,6 +595,33 @@ class ContinuationSchemaTests(unittest.TestCase):
             raise pause_policy.PauseRefused("PAUSE_CONTINUATION_UNRECOVERABLE", "x")
         self.assertEqual(ctx.exception.code, "PAUSE_CONTINUATION_UNRECOVERABLE")
 
+    def test_the_discovery_vocabulary_is_closed_and_names_both_actionable_verdicts(self):
+        """Discovery must be able to SAY "recoverable"; a widened RESUMABLE cannot.
+
+        The two actionable verdicts lead to different work -- run the resume from the top,
+        or finish a continuation already committed to the checkpoint -- so a caller that
+        acts on them differently needs two names, and they are closed.
+        """
+        self.assertEqual(pause_policy.PAUSE_DISCOVERY_ACTIONABLE_VERDICTS,
+                         frozenset({"RESUMABLE", "PAUSE_CONTINUATION_RECOVERABLE"}))
+        self.assertEqual(pause_policy.PAUSE_RESUMABLE, "RESUMABLE")
+        self.assertEqual(pause_policy.PAUSE_CONTINUATION_RECOVERABLE,
+                         "PAUSE_CONTINUATION_RECOVERABLE")
+        self.assertEqual(pause_policy.PAUSE_DISCOVERY_VERDICTS,
+                         pause_policy.PAUSE_DISCOVERY_ACTIONABLE_VERDICTS
+                         | pause_policy.PAUSE_REFUSAL_CODES)
+        # An actionable verdict is never a refusal, and the refused counterpart of the
+        # recoverable one is: the two are the two sides of C5 and must not collide.
+        self.assertEqual(pause_policy.PAUSE_DISCOVERY_ACTIONABLE_VERDICTS
+                         & pause_policy.PAUSE_REFUSAL_CODES, frozenset())
+        self.assertIn("PAUSE_CONTINUATION_UNRECOVERABLE",
+                      pause_policy.PAUSE_DISCOVERY_VERDICTS)
+        # Every run that is no longer waiting is reported by a code in the same closed set.
+        for status in pause_store.PAUSE_RECORD_STATUSES:
+            if status == "WAITING_FOR_INPUT":
+                continue
+            self.assertIn(f"RUN_ALREADY_{status}", pause_policy.PAUSE_DISCOVERY_VERDICTS)
+
     def test_the_record_schema_accepts_a_continuing_bundle_and_nothing_else_new(self):
         stored = record(applied={"bundle_1": {
             "resume_bundle_id": "bundle_1", "request_id": "request_1",
@@ -657,9 +684,12 @@ class CrashingGraph:
         return final
 
 
-@REQUIRES_LANGGRAPH
-class ResumeCrashBoundaryTests(PauseFixture):
-    """Every boundary of the claimed section, each one exactly-once or no-effect."""
+class _CrashBoundaryFixture(PauseFixture):
+    """Drive to a pause, answer it, and crash a resume at a chosen boundary.
+
+    Declares no test of its own: the resume-path suite and the discovery suite below both
+    need the same crash, and neither may own it.
+    """
 
     RUN = "run_crashboundary"
 
@@ -692,6 +722,44 @@ class ResumeCrashBoundaryTests(PauseFixture):
         super().setUp()
         _, self.paused, _ = self.drive_to_pause()
         self.answer_all()
+
+    def crash_at(self, when, *, owner_id=None, lease=0.4):
+        """Kill a resume at ``when`` and return the record the crash left behind."""
+        store = self.pause_store_for(owner_id, lease=lease) if owner_id else None
+        with self.assertRaises(CrashInjected):
+            self.attempt(self.paused, store=store,
+                         graph_wrapper=lambda graph: CrashingGraph(graph, when))
+        return self.store().read(self.RUN)
+
+    def fork_the_head_off_the_lineage_root(self, crashed):
+        """Move the head to a checkpoint that does NOT descend from the pause.
+
+        The forked head is written off the lineage ROOT, which predates the pause, so the
+        pause checkpoint is not among its ancestors -- the one case in which a moved head
+        must still be refused.
+        """
+        saver = self.saver()
+        lineage = pause_runtime.checkpoint_lineage(saver, "t", "", saver.head("t"))
+        self.assertIn(crashed["checkpoint_id"], lineage)
+        root = lineage[-1]
+        self.assertNotEqual(root, crashed["checkpoint_id"])
+        parent = {"configurable": {"thread_id": "t", "checkpoint_ns": "",
+                                   "checkpoint_id": root}}
+        tuple_ = saver.get_tuple(parent)
+        forked = dict(tuple_.checkpoint)
+        forked["id"] = "forked-off-the-root"
+        saver.put(parent, forked, dict(tuple_.metadata),
+                  dict(forked.get("channel_versions") or {}))
+        self.assertEqual(saver.head("t"), "forked-off-the-root")
+        self.assertNotIn(crashed["checkpoint_id"],
+                         pause_runtime.checkpoint_lineage(saver, "t", "",
+                                                          saver.head("t")))
+        return "forked-off-the-root"
+
+
+@REQUIRES_LANGGRAPH
+class ResumeCrashBoundaryTests(_CrashBoundaryFixture):
+    """Every boundary of the claimed section, each one exactly-once or no-effect."""
 
     def test_a_crash_before_the_applied_record_write_leaves_nothing_applied(self):
         crashing = CrashingStore(self.store(), "record_applied")
@@ -912,6 +980,171 @@ class ResumeCrashBoundaryTests(PauseFixture):
         self.assertEqual(second.status, "NO_EFFECT")
         self.assertEqual(second.code, "RUN_ALREADY_RESUMED")
         self.assertEqual(second_adapter.effect_count, 0)
+
+
+# ======================================================================================
+# MAJOR -- discovery must report what resume_run will actually do
+# ======================================================================================
+@REQUIRES_LANGGRAPH
+class DiscoveryContinuationTests(_CrashBoundaryFixture):
+    """MAJOR: ``discover`` applied C1 then C2 and never asked C5.
+
+    A run crashed at the continuation boundary legitimately has an in-flight ``CONTINUING``
+    bundle and a head that DESCENDS from the recorded pause checkpoint.  C2 sees only that
+    the head moved, so discovery reported ``STALE_CHECKPOINT_HEAD`` for exactly the runs
+    C5 was written to recover: ``resume_run`` could recover them, but only an operator who
+    already knew the run id could ever call it.  A Coordinator that scans durable state --
+    which is what OS-31 promises a new session can do -- never saw a candidate.
+
+    Every test here reads durable bytes only: no in-memory driver survives the crash.
+    """
+
+    def listing(self, run_id=None):
+        found = {entry["run_id"]: entry for entry in pause_runtime.discover(self.base)}
+        return found[run_id or self.RUN]
+
+    def actionable(self):
+        return [entry for entry in pause_runtime.discover(self.base)
+                if entry["verdict"] in pause_policy.PAUSE_DISCOVERY_ACTIONABLE_VERDICTS]
+
+    def head_lifecycle(self, crashed):
+        saver = self.saver()
+        return pause_runtime.reconstruct({**crashed, "checkpoint_id": saver.head("t")},
+                                         saver)["run_lifecycle"]
+
+    # ---- 1: boundary 3, an ACTIVE descendant head ------------------------------------
+    def test_discovery_reports_a_boundary_3_crash_as_a_recoverable_continuation(self):
+        """The head is ACTIVE and descends from the pause: recoverable, not stale."""
+        crashed = self.crash_at("after_checkpoint_update")
+        self.assertEqual(next(iter(crashed["applied"].values()))["stage"], "CONTINUING")
+        self.assertEqual(self.head_lifecycle(crashed), "ACTIVE")
+        entry = self.listing()
+        self.assertEqual(entry["status"], "WAITING_FOR_INPUT")
+        self.assertEqual(entry["verdict"],
+                         pause_policy.PAUSE_CONTINUATION_RECOVERABLE, entry["detail"])
+        self.assertNotEqual(entry["verdict"], "STALE_CHECKPOINT_HEAD",
+                            "the defect: the recoverable run was reported as stale")
+        self.assertIn(entry["verdict"], pause_policy.PAUSE_DISCOVERY_VERDICTS)
+
+    # ---- 2: boundary 4, a SETTLED descendant head ------------------------------------
+    def test_discovery_reports_a_boundary_4_crash_as_a_recoverable_continuation(self):
+        """The continuation already finished; the record never learned it.
+
+        Discovery reports the same actionable verdict as boundary 3 -- both are "this
+        head is this bundle's own continuation" -- and which side of the effect boundary
+        the dead process reached stays the resume's business, reported there by
+        ``PAUSE_CONTINUATION_ALREADY_COMPLETE``.
+        """
+        crashed = self.crash_at("after_invoke", owner_id="host:dead")
+        self.assertEqual(next(iter(crashed["applied"].values()))["stage"], "CONTINUING")
+        self.assertEqual(self.head_lifecycle(crashed), "SETTLED")
+        entry = self.listing()
+        self.assertEqual(entry["verdict"],
+                         pause_policy.PAUSE_CONTINUATION_RECOVERABLE, entry["detail"])
+        self.assertNotEqual(entry["verdict"], "STALE_CHECKPOINT_HEAD")
+
+    # ---- 3: the negative case, which must STILL refuse -------------------------------
+    def test_discovery_refuses_a_head_that_does_not_descend_from_the_pause(self):
+        """This fix must not turn C2 into a rubber stamp.
+
+        A forked head has moved just like a recoverable one has.  What separates them is
+        the checkpoint store's own parent links, and nothing else: the forked head does
+        not carry the pause checkpoint among its ancestors, so it is not this bundle's
+        continuation, it is not actionable, and it is named as such.
+        """
+        crashed = self.crash_at("after_checkpoint_update")
+        self.fork_the_head_off_the_lineage_root(crashed)
+        entry = self.listing()
+        self.assertEqual(entry["verdict"], "PAUSE_CONTINUATION_UNRECOVERABLE",
+                         entry["detail"])
+        self.assertNotIn(entry["verdict"],
+                         pause_policy.PAUSE_DISCOVERY_ACTIONABLE_VERDICTS)
+        self.assertEqual(self.actionable(), [],
+                         "a run nobody may drive is offered to nobody")
+        # ...and discovery is read-only: it took no claim and moved no head.
+        self.assertEqual(self.store().read(self.RUN)["owner_id"], crashed["owner_id"])
+        self.assertEqual(self.saver().head("t"), "forked-off-the-root")
+
+    # ---- 4: the whole path, driven by a Coordinator that knows only the base ----------
+    def test_a_fresh_coordinator_discovers_takes_over_and_resumes_exactly_once(self):
+        """discover -> takeover -> resume, end to end, with NO prior knowledge of the run.
+
+        The successor below is given one thing: the artifact base.  It learns the run id
+        from ``discover``, everything else from the durable record that discovery names,
+        and it has its own ``owner_id``, so it must observe the dead owner's lease lapse
+        and take the run over before it may touch anything.  This is the path the reviewer
+        found untested: the existing crash tests call ``resume_run`` directly with a run
+        id the test already held.
+        """
+        self.crash_at("after_checkpoint_update", owner_id="host:dead")
+
+        # ---- everything from here knows only ``self.base`` ---------------------------
+        candidates = self.actionable()
+        self.assertEqual(len(candidates), 1, "the crashed run is discoverable")
+        found = candidates[0]
+        self.assertEqual(found["verdict"], pause_policy.PAUSE_CONTINUATION_RECOVERABLE,
+                         found["detail"])
+        run_id = found["run_id"]
+
+        successor = pause_store.store_for(run_id, artifact_base=self.base,
+                                          owner_id="host:fresh", lease_seconds=0.4)
+        projection = successor.read(run_id)["projection"]
+        port = self.approval_port()
+        adapter = self.adapter((WORKER, REVIEW_PASS, REVIEW_PASS), run_id=run_id)
+        outcome = pause_runtime.resume_run(
+            run_id, artifact_base=self.base, approval_port=port,
+            graph_factory=lambda saver: self.graph(adapter, saver, approval_port=port),
+            current_repository=projection["repository_binding"],
+            current_artifact=projection["artifact_binding"],
+            current_policy_digest=projection["policy_digest"],
+            store=successor, recursion_limit=300, observe_timeout_seconds=None)
+
+        self.assertEqual(outcome.status, "RESUMED", outcome.detail)
+        self.assertEqual(outcome.code, "PAUSE_CONTINUATION_RECOVERED", outcome.detail)
+        self.assertEqual(outcome.state["terminal_status"], "COMPLETED")
+        self.assertEqual(adapter.effect_count, 3,
+                         "EXACTLY one round of effects exists for the whole run")
+        stored = successor.read(run_id)
+        self.assertEqual(stored["status"], "RESUMED")
+        self.assertEqual(stored["owner_id"], "host:fresh",
+                         "the run was taken over, not driven under the dead lease")
+        self.assertEqual(next(iter(stored["applied"].values()))["stage"], "RESUMED")
+
+        # ...and the run stops being offered: the next scan finds nothing actionable and
+        # a second Coordinator that acts on the settled verdict performs no effect.
+        self.assertEqual(self.actionable(), [])
+        self.assertEqual(self.listing(run_id)["verdict"], "RUN_ALREADY_RESUMED")
+        again, again_adapter = self.attempt(self.paused)
+        self.assertEqual(again.status, "NO_EFFECT")
+        self.assertEqual(again.code, "RUN_ALREADY_RESUMED")
+        self.assertEqual(again_adapter.effect_count, 0)
+
+    # ---- the agreement itself --------------------------------------------------------
+    def test_an_untouched_pause_is_still_reported_resumable(self):
+        """The fix widens nothing: with no in-flight bundle the verdict is unchanged."""
+        entry = self.listing()
+        self.assertEqual(entry["verdict"], pause_policy.PAUSE_RESUMABLE, entry["detail"])
+        self.assertIsNone(pause_policy.in_flight_bundle(self.store().read(self.RUN)))
+
+    def test_discovery_and_resume_read_the_same_classification(self):
+        """One implementation, so the two answers cannot drift apart.
+
+        Asserted against the durable record rather than by mocking: for the untouched
+        pause, the boundary-2 crash (stage ahead of the checkpoint) and the boundary-3
+        crash, the verdict discovery reports is the verdict ``classify_head`` returns
+        inside the claimed section.
+        """
+        for label, crash in (("untouched", None),
+                             ("stage ahead of the checkpoint", "before_checkpoint_update"),
+                             ("committed continuation", "after_checkpoint_update")):
+            with self.subTest(label):
+                if crash is not None:
+                    self.crash_at(crash)
+                record = self.store().read(self.RUN)
+                classified = pause_runtime.classify_head(record, self.saver())
+                self.assertEqual(self.listing()["verdict"], classified.verdict)
+        self.assertEqual(self.listing()["verdict"],
+                         pause_policy.PAUSE_CONTINUATION_RECOVERABLE)
 
 
 if __name__ == "__main__":  # pragma: no cover - unittest discovery is the entry point
