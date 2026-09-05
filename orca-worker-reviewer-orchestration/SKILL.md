@@ -241,6 +241,7 @@ phase 전이, phase gate, correction loop, iteration budget, Final Review routin
     "## 5. Agent Policy",
     "## Decision Policy",
     "### Completed Worker Lifecycle",
+    "## Coordinator Turn Quiescence and Delivery Ack Ordering (OS-44)",
     "## 14. Mandatory Test Gates",
     "## 15. Repository / Security Policy",
     "## Structured Human Clarification (OS-30)"
@@ -2540,6 +2541,120 @@ run_workflow.py resume --run-id RUN_ID [--artifact-base DIR] [--cancel | --aband
 LangGraph가 없으면 `discover`는 동작하되 모든 verdict가 `CHECKPOINT_UNVERIFIED`이고,
 `resume`은 claim을 잡기 전에 `LANGGRAPH_DEPENDENCY_MISSING`으로 거부된다.
 
+## Coordinator Turn Quiescence and Delivery Ack Ordering (OS-44)
+
+이 절은 routing 결정이 아니라 Coordinator loop의 **안전 규칙**이다. 어떤 node로 갈지는 여전히
+deterministic workflow engine이 정한다. 이 절이 규정하는 것은 "engine이 다음 할 일을 돌려줬는데
+Coordinator가 자기 turn을 끝내 버리는" 상황과 "delivery를 처리해 놓고 ack하지 않아 다음 waiter가
+그것을 자기 결과로 착각하는" 상황, 두 가지뿐이다.
+
+### 왜 있는가
+
+실제 run `run_c2166e75bb02`에서 Coordinator는 ANALYSIS Reviewer PASS를 settlement한 뒤 PLAN
+Task를 만들기 전에 turn을 끝냈다. Run은 terminal도 `WAITING_FOR_INPUT`도 아니었고 active agent가
+0이었으므로 그 run을 깨울 수 있는 것이 아무것도 없었다. 약 33분 정지했고 사용자 메시지 이후에만
+재개됐다. 재개 과정에서 ANALYSIS re-review delivery `delivery_5c541e7fe1bd`가 처리되고도 ack되지
+않았던 사실이 확인됐다. 새 PLAN waiter가 그 stale delivery로 즉시 깨어났고, completed ledger가
+중복 lifecycle action은 막았지만 wait cycle은 잘못 소비됐다.
+
+두 증상은 한 결함의 두 얼굴이다. 하나는 turn을 끝낼 자격, 다른 하나는 delivery 처리와 ack의 순서다.
+
+### Run-to-quiescence invariant
+
+Coordinator는 다음 상태 중 하나에 도달하기 전에는 자기 turn을 끝내지 않는다.
+
+1. active dispatch wait — 아직 finalize되지 않은 Dispatch가 있고 그것을 기다리는 중이다.
+2. `WAITING_FOR_INPUT` — durable human decision pause. (OS-31)
+3. `BLOCKED`
+4. `ESCALATED`
+5. `COMPLETED`
+
+`CANCELLED` / `ABANDONED`(OS-31이 추가한 terminal status)와 그 lifecycle 표기인 `SETTLED`,
+그리고 복구되지 않은 오류로 끝난 `ERROR`도 끝난 run이므로 같은 자격을 갖는다.
+
+- 실행 가능한 next node가 있고 active dispatch가 0이면, 같은 turn에서 그 다음 action 또는 active
+  wait까지 진행한다. 진행 보고만 남기고 끝내는 것은 이 규칙 위반이며, 자연어 요약은 turn을 끝낼
+  근거가 되지 못한다.
+- next node가 없더라도 non-terminal / non-waiting run을 active dispatch 없이 idle로 남기지 않는다.
+  깨울 수 있는 것이 아무것도 없는 상태는 next node 유무와 무관하게 위반이다.
+- turn 종료 **직전에** quiescence self-check를 실행하고 그 결과를 audit에 기록한다. 판정이 나중에
+  오면 그것은 gate가 아니라 사후 보고다.
+
+### Delivery provenance와 ack ordering
+
+- delivery의 `worker_done`은 expected Task ID와 expected Dispatch ID **양쪽 모두**와 일치할 때에만
+  현재 waiter의 결과로 채택한다. 한쪽만 일치하거나 어느 쪽도 없으면 채택하지 않고, 거절 사유를
+  audit에 남긴 뒤 버린다. dispatch 불일치를 task 불일치보다 먼저 보고한다 — stale delivery는 stale
+  delivery로 보고되어야 한다.
+- 처리 결과를 state와 settlement에 반영한 **뒤** delivery를 ack하고, ack가 완료되기 전에는 다음
+  waiter를 만들지 않는다. 처리되었으나 ack되지 않은 delivery가 하나라도 있으면 `check --wait`를
+  arm하지 않고 fail-closed로 거부한다. 반영이 **끝나기 전에** ack하는 것은 순서를 옮긴 것이지
+  닫은 것이 아니다 — ack 성공 직후 axis accounting이나 finalization에서 죽으면 runtime은 그
+  delivery를 소비된 것으로 보아 다시 보내지 않고, settlement ledger는 미완성으로 남는다. 즉
+  delivery가 유실된다.
+- settlement 진행 상태는 두 지점에서 durable하게 기록한다. settlement path의 **첫 명령 이전**에
+  claim을, 반영이 완료되고 **ack 이전**에 settled를. 이 두 record가 있어야 재시작한 successor가
+  "아무것도 mutate되지 않았다"(다시 처리)와 "lifecycle 명령이 이미 나갔을 수 있다"(명시적 복구),
+  "settle까지 끝나고 ack만 빠졌다"(ack만 하고 아무 lifecycle action도 하지 않음)를 구별할 수 있다.
+- 이미 처리·ack된 delivery가 재전송되면 lifecycle action을 **하나도** 하지 않고 다시 ack만 한다.
+  중복 settlement, release, artifact, dispatch, iteration budget 소비가 발생하지 않는다. replay는
+  유한하다. 같은 delivery가 한도를 넘겨 재전송되면 loop를 도는 대신 fail-closed로 거부한다.
+- ack가 실패하면 유한 횟수 재시도하고, 소진되면 fail-closed로 거부한다. 실패한 ack는 조용히
+  성공으로 바뀌지 않으며, 그 delivery는 계속 미승인 상태로 남아 다음 waiter와 turn 종료를 막는다.
+- process가 재시작되어 in-memory delivery ledger가 비어 있으면, 다음 waiter를 arm하기 전에
+  append-only audit에서 ledger를 복원한다. 복원하지 않으면 재전송된 delivery가 "처음 보는 것"으로
+  읽혀 같은 결함이 한 process 뒤에서 재현된다. 복원은 기존 run을 bind하는 production
+  start/resume/wait path 자체에 있어야 한다 — 호출을 기억해야 하는 helper로 두면 실제 Coordinator는
+  복원하지 않은 채로 `check --wait`를 arm할 수 있다. 복원이 의존하는 audit를 읽을 수 없으면
+  fail-closed로 거부한다.
+- 재전송된 delivery의 처분은 네 가지뿐이다: 처음 보는 것은 `process`, 소비되었지만 claim도 settle도
+  ack도 없으면 `resume`(아무것도 mutate되지 않았으므로 다시 처리한다 — replay로 버리면 유실이다),
+  claim만 있고 settled가 없으면 `recover`(lifecycle 명령이 중복될 수 있으므로 명시적 복구),
+  settled 또는 ack된 것은 `replay`.
+
+### Coordinator audit artifacts
+
+processing / ack / mismatch / replay / quiescence 판정은 run-scoped append-only audit에 기록한다.
+`<ARTIFACT_ROOT>coordinator_audit/`이며, `decision_ledger/`와 동일한 규칙을 따른다 — sequence key
+directory 하나가 record 하나, staged 후 하나의 rename으로 publish, 이미 publish된 record는 수정하지
+않고 정정은 새 key의 새 record다. `.staging/`은 record가 아니다.
+
+```text
+COORDINATOR_AUDIT_SCHEMA_VERSION = 1.0
+COORDINATOR_AUDIT_DIR = coordinator_audit/
+COORDINATOR_AUDIT_EVENTS = delivery_processed, delivery_acknowledged, delivery_ack_retry, delivery_ack_failed, delivery_replayed, delivery_mismatch, delivery_settlement_claimed, delivery_settled, delivery_recovery, quiescence_verified, quiescence_violation
+QUIESCENT_TURN_END_STATES = active_dispatch_wait, WAITING_FOR_INPUT, BLOCKED, ESCALATED, COMPLETED
+DELIVERY_ADOPTION = expected_task_id_and_expected_dispatch_id
+DELIVERY_ORDER = reflect_state_and_settlement, acknowledge_delivery, then_arm_next_waiter
+DELIVERY_REPLAY = acknowledge_only, zero_lifecycle_action, bounded_then_fail_closed
+ACK_FAILURE = bounded_retry_then_fail_closed
+QUIESCENCE_SELF_CHECK = immediately_before_turn_end
+DELIVERY_DISPOSITION = process, resume, recover, replay
+DELIVERY_RESTART_RECOVERY = restore_on_production_wait_path_before_arming_any_waiter
+COORDINATOR_AUDIT_WRITE_FAILURE = fail_closed
+DELIVERY_PROGRESS_COMMIT = publish_durable_record_then_set_in_memory_state
+```
+
+delivery의 진행 상태는 in-memory row와 durable audit 두 곳에 있고, 순서는 항상 durable이 먼저다.
+record를 publish한 뒤에만 in-memory 전이를 commit한다 — durable하게 기록할 수 없는 전이는 일어나지
+않은 것이다. 반대로 하면 `delivery_settled` 기록이 실패했을 때 memory는 "settled", audit는 "claim만"이
+되고, 이후 settle 재진입이 이미 finalize된 dispatch 경로에서 durable settled record가 없는 delivery를
+ack해 버린다. 재시작하면 그 row는 미완료 claim으로 읽히는데 runtime의 delivery는 이미 사라진 뒤다.
+같은 이유로 이미 finalize된 dispatch를 만난 settle 재진입은 그 delivery의 durable settled 상태가
+증명될 때만 ack한다 — claim만 있고 settled record가 없는 row는 fail-closed로 거부한다. wire ack가
+성공한 뒤 `delivery_acknowledged` publication이 실패하면 in-memory 전이를 commit하지 않으므로 그
+delivery는 미승인 obligation으로 남고, 재진입이 그 record를 다시 publish한다.
+
+이 audit는 사람이 읽는 log와 종류가 다르다. 재시작한 Coordinator가 delivery ledger를 복원할 수 있는
+**유일한** source이므로, 기록 실패를 삼키고 진행하면 다음 process가 이미 처리된 delivery를 새 것으로
+읽는다 — 이 절이 없애려는 결함이 logging guard 때문에 되살아난다. 따라서 publication 실패는 기록한
+뒤 fail-closed로 거부하고, 읽을 수 없는 audit도 같다. section 9의 "logging 실패는 lifecycle 결정을
+바꾸지 않는다"는 ORCHESTRATOR_LOG/TIMING_LOG에는 그대로 유지된다.
+
+CLI로 직접 orchestration을 운전하는 Coordinator는 `tools/run_logging.py`의
+`coordinator-audit-write` / `coordinator-audit-read` 서브커맨드를 사용한다. `--ledger`는 audit를
+접어 restart가 복원해야 할 delivery ledger를 돌려준다.
+
 ## 18. Core Invariants
 
 ```text
@@ -2558,6 +2673,14 @@ Reviewer delta context is a starting point, never a boundary on direct verificat
 Task graph created before worker dispatch; dependents never created after dependency completion
 Manual task readiness override is recovery-only
 Settlement, worker-resource registration, process liveness, and cleanup authority are four separate axes
+Coordinator turn ends only at active dispatch wait, WAITING_FOR_INPUT, BLOCKED, ESCALATED, or COMPLETED
+A worker_done is adopted only when it matches BOTH the expected task id and the expected dispatch id
+Reflect state and settlement, acknowledge the delivery, and only then arm the next waiter
+A replayed delivery is acknowledged with zero lifecycle action; ack failure retries boundedly then fails closed
+A restarted coordinator restores the delivery ledger on the production wait path before any waiter is armed
+The coordinator audit is the sole restart source; a record that cannot be written or read fails closed
+A delivery progress transition is committed in memory only after its durable audit record is published
+A settle re-entry on an already finalized dispatch acknowledges only when durable settled state is proven
 Terminal close requires proven cleanup authority; otherwise retain and report
 Cleanup authority requires a close eligible terminal role as well as proven ownership
 The coordinator never closes its own terminal, a setup terminal, or an adopted terminal

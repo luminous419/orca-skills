@@ -3051,6 +3051,121 @@ def validate_workflow_output_contracts(validation: Validation) -> None:
         )
 
 
+# ---- OS-44: the Coordinator turn-quiescence / delivery-ack-ordering contract ------
+# The section is registered in the workflow-control-plane block's `skill_owned_safety`
+# list, so validate_workflow_graph_docs already proves it EXISTS and stays
+# authoritative. What that validator cannot see is whether the section still says the
+# things a live Coordinator has to read, or whether its machine-readable block still
+# matches the executable vocabulary -- which is what these anchors are for. Same shape
+# as the Final Review audit contract validator above: the schema version and the event
+# set are stated in two places by necessity (a constant in run_logging.py and the prose
+# a Coordinator reads), and this is what keeps them one value instead of two.
+COORDINATOR_QUIESCENCE_SECTION_HEADING = (
+    "## Coordinator Turn Quiescence and Delivery Ack Ordering (OS-44)"
+)
+COORDINATOR_QUIESCENCE_SECTION_END = "\n## 18. Core Invariants"
+# Each anchor is a claim the section has to make in its own words.
+COORDINATOR_QUIESCENCE_ANCHORS = (
+    "run_c2166e75bb02",
+    "delivery_5c541e7fe1bd",
+    "active dispatch wait",
+    "WAITING_FOR_INPUT",
+    "coordinator_audit/",
+    "coordinator-audit-write",
+    "coordinator-audit-read",
+    "QUIESCENT_TURN_END_STATES",
+    "DELIVERY_ORDER = reflect_state_and_settlement, acknowledge_delivery, then_arm_next_waiter",
+    "ACK_FAILURE = bounded_retry_then_fail_closed",
+    "QUIESCENCE_SELF_CHECK = immediately_before_turn_end",
+    "DELIVERY_ADOPTION = expected_task_id_and_expected_dispatch_id",
+    "DELIVERY_REPLAY = acknowledge_only, zero_lifecycle_action, bounded_then_fail_closed",
+    # OS-44 BUGFIX iteration 2. The three rules the first iteration's document stated
+    # too weakly to bind: the ack sits BELOW the reflection, restart recovery lives on
+    # the production wait path rather than in an opt-in helper, and this audit family
+    # fails closed instead of following section 9's logging-never-blocks rule.
+    "DELIVERY_DISPOSITION = process, resume, recover, replay",
+    "DELIVERY_RESTART_RECOVERY = restore_on_production_wait_path_before_arming_any_waiter",
+    "COORDINATOR_AUDIT_WRITE_FAILURE = fail_closed",
+    # OS-44 BUGFIX iteration 3. The ordering INSIDE a progress transition: the durable
+    # record is published first and the in-memory state follows, so memory can never
+    # claim progress the artifact a successor recovers from does not carry.
+    "DELIVERY_PROGRESS_COMMIT = publish_durable_record_then_set_in_memory_state",
+)
+# The five turn-end states OS-44 enumerates, each of which must be named in the section
+# by the name the executable contract uses.
+COORDINATOR_QUIESCENCE_TURN_END_STATES = (
+    "BLOCKED",
+    "ESCALATED",
+    "COMPLETED",
+)
+# The invariants the section's rules are locked to in section 18.
+COORDINATOR_QUIESCENCE_INVARIANTS = (
+    "Coordinator turn ends only at active dispatch wait, WAITING_FOR_INPUT, BLOCKED, "
+    "ESCALATED, or COMPLETED",
+    "A worker_done is adopted only when it matches BOTH the expected task id and the "
+    "expected dispatch id",
+    "Reflect state and settlement, acknowledge the delivery, and only then arm the "
+    "next waiter",
+    "A restarted coordinator restores the delivery ledger on the production wait path "
+    "before any waiter is armed",
+    "The coordinator audit is the sole restart source; a record that cannot be written "
+    "or read fails closed",
+    "A delivery progress transition is committed in memory only after its durable "
+    "audit record is published",
+    "A settle re-entry on an already finalized dispatch acknowledges only when durable "
+    "settled state is proven",
+)
+
+
+def validate_coordinator_quiescence_contract(validation: Validation) -> None:
+    """OS-44's section, its machine-readable block, and its section 18 invariants."""
+    skill_path = LIFECYCLE_SKILL_DIR / "SKILL.md"
+    if not skill_path.is_file():
+        return
+    skill_text = skill_path.read_text(encoding="utf-8")
+
+    section = extract_section(
+        skill_text,
+        COORDINATOR_QUIESCENCE_SECTION_HEADING,
+        COORDINATOR_QUIESCENCE_SECTION_END,
+    )
+    validation.check(
+        bool(section),
+        f"{LIFECYCLE_SKILL_DIR.name}: the OS-44 Coordinator turn-quiescence section is "
+        "missing, renamed, or has escaped its position before section 18",
+    )
+    if not section:
+        return
+    for anchor in (
+        *COORDINATOR_QUIESCENCE_ANCHORS,
+        *COORDINATOR_QUIESCENCE_TURN_END_STATES,
+    ):
+        validation.check(
+            anchor in section,
+            f"{LIFECYCLE_SKILL_DIR.name}: the OS-44 section is missing {anchor!r}",
+        )
+    validation.check(
+        f"COORDINATOR_AUDIT_SCHEMA_VERSION = {run_logging.COORDINATOR_AUDIT_SCHEMA_VERSION}"
+        in section,
+        f"{LIFECYCLE_SKILL_DIR.name}: the OS-44 section's audit schema version differs "
+        f"from run_logging.COORDINATOR_AUDIT_SCHEMA_VERSION "
+        f"({run_logging.COORDINATOR_AUDIT_SCHEMA_VERSION!r})",
+    )
+    for event in run_logging.COORDINATOR_AUDIT_EVENTS:
+        validation.check(
+            event in section,
+            f"{LIFECYCLE_SKILL_DIR.name}: the OS-44 section's event vocabulary does "
+            f"not name {event!r}, which run_logging.py publishes; a reader following "
+            "the document would not know that record kind exists",
+        )
+    for invariant in COORDINATOR_QUIESCENCE_INVARIANTS:
+        validation.check(
+            invariant in skill_text,
+            f"{LIFECYCLE_SKILL_DIR.name}: section 18 lost the OS-44 invariant "
+            f"{invariant!r}",
+        )
+
+
 def validate_os30_contract(validation: Validation) -> None:
     texts={skill_dir.name:(skill_dir/"SKILL.md").read_text(encoding="utf-8") for skill_dir in SKILL_DIRS}
     for skill_name,text in texts.items():
@@ -3110,6 +3225,7 @@ def main() -> int:
     validate_run_logging_contract(validation)
     validate_run_logging_tool_parity(validation)
     validate_deterministic_workflow_parity(validation)
+    validate_coordinator_quiescence_contract(validation)
     validate_os30_contract(validation)
     validate_version(validation)
     validate_repository_links(validation)

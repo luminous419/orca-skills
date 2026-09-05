@@ -721,16 +721,24 @@ class DuplicateSettlementTests(unittest.TestCase):
         self.assertEqual(harness.lifecycle_commands("ctx_1"), ["worker-release"])
 
     def test_crashed_settlement_is_not_auto_retried(self) -> None:
-        # The crash point is the delivery ack (STEP 3), i.e. the first call *after*
-        # the lifecycle mutation. Anything earlier now fails in STEP 1b's settlement
+        # The crash point is the axis accounting, i.e. the first step *after* the
+        # lifecycle mutation. Anything earlier now fails in STEP 1b's settlement
         # verification, which by design leaves no mutation to be repeated.
-        recorder = RecordingExec(fail_on="check")
+        # OS-44: this used to crash the delivery ack instead, which sat directly above
+        # the accounting. The ack is now the LAST step of settle_attempt -- state and
+        # settlement are reflected before it -- so a crash there leaves a finalized
+        # row, and the claimed-but-unfinalized state this test is about is reached by
+        # failing the accounting itself.
+        recorder = RecordingExec()
         harness = self.make_harness(recorder)
 
-        with self.assertRaises(OrcaRuntimeError):
-            harness.settle_attempt(
-                "worker", 1, "task_g", "ctx_1", DONE, "dlv_1", terminal="term_worker"
-            )
+        with patch.object(
+            harness, "account_axes", side_effect=OrcaRuntimeError("crash after mutation")
+        ):
+            with self.assertRaises(OrcaRuntimeError):
+                harness.settle_attempt(
+                    "worker", 1, "task_g", "ctx_1", DONE, "dlv_1", terminal="term_worker"
+                )
         self.assertEqual(harness.lifecycle_commands("ctx_1"), ["worker-release"])
         self.assertEqual(harness._ledger["ctx_1"]["state"], "in_progress")
 
@@ -788,6 +796,14 @@ class DuplicateSettlementTests(unittest.TestCase):
         "task_status": "completed",
         "terminal": "term_worker",
         "status": "COMPLETED",
+        # OS-44. verify_quiescence()'s only required parameter. A terminal status is
+        # the right probe value: the sweep asks whether a method reverts a CLAIMED
+        # settlement row, not whether the quiescence contract refuses a status.
+        "run_status": "COMPLETED",
+        # OS-44. resume_run()'s two required arguments: the successor entry point binds
+        # an existing Run id to an existing run-owner terminal.
+        "run_id": "run_offline",
+        "run_owner": "term_owner",
     }
 
     def test_no_public_api_moves_a_claimed_row_back_to_absent(self) -> None:
@@ -801,15 +817,20 @@ class DuplicateSettlementTests(unittest.TestCase):
         this throwaway harness -- and asserts none of them reverts the claimed row.
         Forward movement (finalize_once) is allowed; only "absent" is not.
         """
-        # fail_on the delivery ack: the crash must land after the mutation, so the
-        # swept row really is "claimed, and one lifecycle command already went out".
-        recorder = RecordingExec(fail_on="check")
+        # Fail the axis accounting: the crash must land after the mutation and before
+        # finalization, so the swept row really is "claimed, and one lifecycle command
+        # already went out". OS-44 moved the delivery ack below the finalization, so
+        # crashing the ack would leave a finalized row instead of a claimed one.
+        recorder = RecordingExec()
         harness = self.make_harness(recorder)
 
-        with self.assertRaises(OrcaRuntimeError):
-            harness.settle_attempt(
-                "worker", 1, "task_g", "ctx_1", DONE, "dlv_1", terminal="term_worker"
-            )
+        with patch.object(
+            harness, "account_axes", side_effect=OrcaRuntimeError("crash after mutation")
+        ):
+            with self.assertRaises(OrcaRuntimeError):
+                harness.settle_attempt(
+                    "worker", 1, "task_g", "ctx_1", DONE, "dlv_1", terminal="term_worker"
+                )
         self.assertEqual(harness._ledger["ctx_1"]["state"], "in_progress")
         self.assertEqual(harness.lifecycle_commands("ctx_1"), ["worker-release"])
 
@@ -3974,7 +3995,7 @@ class TerminalEffectReceiptTests(OfflineHarnessTestCase):
         handle = harness.create_fake_terminal("worker", "complete", iteration=1)
         dispatch_id, supervised = harness.start_worker("task_g", handle, "spec")
         self.assertTrue(supervised)
-        done, delivery_id = harness.wait_for_done(dispatch_id)
+        done, delivery_id = harness.wait_for_done(dispatch_id, "task_g")
         attempt = harness.settle_attempt(
             "worker",
             1,
@@ -4505,7 +4526,7 @@ class SessionReuseGateTests(OfflineHarnessTestCase):
         self.assertTrue(supervised)
         self.assertEqual(harness.ledger_terminal(handle)["terminal_effect"], "reused")
 
-        done, delivery_id = harness.wait_for_done(dispatch_id)
+        done, delivery_id = harness.wait_for_done(dispatch_id, "task_g")
         attempt = harness.settle_attempt(
             "worker",
             1,
