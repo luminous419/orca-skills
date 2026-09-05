@@ -704,14 +704,31 @@ python3 scripts/test_orca_runtime.py --orca-runtime \
 The integration command resolves the installed Orca CLI, loads its
 version-matched `orchestration` and `orca-cli` guides, and requires a ready Orca
 runtime. It never launches `claude-glm`, `claude-gemma`, Codex, or another LLM.
-The current adapter is compatibility-gated to Orca `1.4.184` and exact required
-guide grammar; a different version or changed command contract is skipped before
-any Run or terminal is created. The resolved executable is passed into every
+The current adapter is compatibility-gated to the Orca version **this revision** has
+actually been run against — `1.4.196`, and only that one — plus exact required guide
+grammar. The version check is set membership, never a range, so an unverified version
+or a changed command contract is skipped before any Run or terminal is created.
+Orca `1.4.184` and `1.4.178-rc.2` are **historical point observations of earlier
+revisions of this repository**, preserved as records and refused as runtimes: they are
+listed in `HISTORICAL_ORCA_APP_VERSION_OBSERVATIONS`, which gates nothing. Re-listing
+one as supported requires running the current head against it. No version range is
+claimed anywhere. The resolved executable is passed into every
 fake-agent lifecycle call, including `ORCA_CLI_COMMAND` overrides.
 It tries supervised attachment first and, when the runtime classifies the custom
 fake executable as unrecognized, uses the guide's tracked-Dispatch plus terminal
-prompt fallback. One reviewer terminal is deliberately reused; all other fake
-processes exit after their settled attempt.
+prompt fallback. On Orca `1.4.196` that fallback is the path every fake-agent attempt
+takes: `worker-start` there requires a prompt acknowledgement only a real agent session
+produces, so the supervised worker-resource path is not verifiable with deterministic
+fakes on that runtime and is covered by the offline contract suite instead
+(see [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md)). In the A-I scenarios one reviewer
+terminal is deliberately reused across two dispatches — that chain passes `terminal=`
+directly rather than through the reuse gate — while the terminals settled with
+`lifecycle="release"` exit after their attempt. The separate session-reuse scenario asks
+the production reuse gate instead, and on 1.4.196 it records the gate REFUSING all eight
+decisions (`ownership_not_transferable`, `release_state_missing`,
+`terminal_effect_unrecorded`, `worker_state_not_reusable`), so that scenario creates ten
+terminals for ten dispatches and verifies a fail-closed refusal rather than session
+reuse.
 Alongside the first-pass, FAIL loop, max-iteration, blocked, and unexpected-exit
 scenarios, the suite covers graph-first dependency promotion, a late-created
 dependent that stays pending, and the never-close terminal roles. The harness never

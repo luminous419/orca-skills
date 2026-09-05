@@ -76,7 +76,15 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 # only the answer for a standalone call with no run behind it, and it is a constant
 # precisely so that even that path cannot re-read the file mid-sequence.
 REPO_QUALITY_PROFILE = resolve_quality_profile(REPO_ROOT)
-FAKE_CODEX = REPO_ROOT / "scripts" / "fake_bin" / "codex"
+# OS-41. Deliberately NOT named after any agent Orca recognizes. On Orca 1.4.196 a
+# terminal Orca believes is running a real agent CLI is driven through worker-start's
+# supervised prompt-acknowledgement stage, which only a genuine agent session can
+# complete; a shim borrowing the name `codex` was therefore pushed into an
+# unrecoverable `agent_prompt_stalled` that also marks the Task failed. Under an
+# honest name the runtime refuses up front with `agent_unconfigured`, creating no
+# Dispatch and leaving the Task `ready`, and the run takes the version-matched
+# guide's documented tracked-Dispatch path. See docs/COMPATIBILITY.md.
+FAKE_AGENT_SHIM = REPO_ROOT / "scripts" / "fake_bin" / "fake-agent"
 # OS-17 review: the same field/value vocabulary orca_fake_agent.py already reads
 # out of SKILL.md to build a fake reviewer's own response, read here once so
 # _reviewer_gate_result()/_reviewer_review_verdict() below can recognize that
@@ -86,7 +94,176 @@ REVIEWER_VERDICT_CONTRACT = load_workflow_output_contract(
     REPO_ROOT / "orca-worker-reviewer-orchestration" / "SKILL.md"
 )
 WAIT_TYPES = "worker_done,escalation,question"
-SUPPORTED_ORCA_APP_VERSION = "1.4.184"
+# ---- OS-41: worker-start launch outcome vocabulary ------------------------------
+# Orca 1.4.196 answers a `worker-start` that did NOT produce a running worker with
+# `ok: true` and a structured launch result whose `state` carries the real outcome
+# ("The call exits 0 only for ready" -- `orca agent-context --json`). `dispatchId` is
+# present on a FAILED start too, so reading it alone is exactly the "prompt delivery
+# inferred from Task/Dispatch existence" this repository must not do: an
+# `agent_prompt_stalled` start would be recorded as a supervised attachment for a
+# Dispatch the runtime had already given up on.
+WORKER_START_READY_STATE = "ready"
+# The ONE point observation whose `worker-start` success receipt carries no `state`
+# key at all. Orca 1.4.184 predates the field, so on that runtime -- and only there --
+# an absent `state` is the shape of a successful start rather than missing lifecycle
+# evidence. It is pinned to the exact version string, not to "any runtime older than
+# 1.4.196" and not to "any listed version": a stateless receipt from 1.4.196, from a
+# future point observation, or from a runtime this harness never identified is a
+# MALFORMED success receipt, and OS-41 requires that to fail closed. `preflight()`
+# is what supplies the identity, and it stores it only after validate_orca_contract()
+# has accepted the runtime, so the exception can never be unlocked by an unverified
+# version string. (BUGFIX-I1-MAJOR-1.)
+#
+# PR #29 review MAJOR-2 CONSEQUENCE: 1.4.184 is no longer in
+# SUPPORTED_ORCA_APP_VERSIONS, so preflight() can no longer produce this identity and
+# this allowance is UNREACHABLE FROM A LIVE RUN of the current head. It is kept, not
+# deleted, for two reasons: keeping it changes nothing about what the live gate
+# accepts (validate_orca_contract() already refuses 1.4.184 before start_worker() is
+# ever reached, so the effective behaviour is strictly fail-closed), and it preserves
+# the reading that was actually derived from 1.4.184 receipts so a future revision
+# that re-verifies that runtime does not have to re-derive it. Its coverage is
+# therefore OFFLINE ONLY -- the contract tests set the identity directly.
+WORKER_START_STATELESS_RECEIPT_VERSION = "1.4.184"
+
+# ---- OS-41: the runtime's own unexpected-exit report ---------------------------
+# Orca 1.4.196 publishes an `escalation` of its own when a dispatched agent process
+# ends without settling ("Agent exited unexpectedly (Agent process ended; this host
+# cannot report why)"), carrying taskId, dispatchId, exitCode, exitCause and handle
+# in its payload. Orca 1.4.184 published nothing, which is why observe_unexpected_exit
+# used to treat ANY message in that checkpoint as a contract violation. The report is
+# evidence, not a violation -- but only when it is bound to the very Dispatch, Task and
+# terminal being observed AND was written by the runtime rather than by the agent, which
+# is what _runtime_exit_report_defects() below proves. Anything else in the delivery, a
+# `worker_done` above all, still fails the scenario: the whole claim under test is that
+# this dispatch produced no lifecycle result.
+RUNTIME_EXIT_REPORT_TYPE = "escalation"
+# BUGFIX-I1-MAJOR-2. `type` plus the two identity fields is NOT a discriminator: an
+# agent's own escalation is the same type and, when it names the same round, carries
+# the same two ids. Both receipts were captured from the live 1.4.196 runtime in one
+# session so the difference is observed rather than imagined:
+#
+#   runtime exit report   subject "Agent exited unexpectedly (Agent process ended;
+#                                  this host cannot report why)"
+#                         priority "high"
+#                         payload {"taskId","dispatchId","exitCode":0,
+#                                  "exitCause":{"kind":"unknown",
+#                                               "reason":"host_status_unavailable"},
+#                                  "handle":"term_..."}
+#
+#   fake agent escalation subject "Blocked: deterministic fake"
+#                         priority "normal"
+#                         payload {"taskId","dispatchId"}          <- ID-ONLY
+#
+# Those two receipts differ in shape, and the shape difference is worth checking --
+# but it is NOT authorship evidence, and this block must not be read as claiming it is.
+# `orca orchestration send` accepts arbitrary `--payload`, plus `--subject` and
+# `--priority` (verified on the live 1.4.196 CLI: `orca orchestration send --help`
+# and `orca agent-context --json`). A dispatched agent can therefore reproduce the
+# runtime's subject, its `high` priority, and every payload field below --
+# `exitCode`, `exitCause` and `handle` included. Each of these clauses is FORGEABLE.
+#
+# They are kept as DEFENCE IN DEPTH and as IDENTITY/SHAPE VALIDATION only: they pin
+# the message to this Task, this Dispatch and this terminal, and they reject a
+# malformed report. The single observed AUTHORSHIP discriminator is the top-level
+# stored `sender_pane_key` field, immediately below.
+RUNTIME_EXIT_REPORT_SUBJECT_PREFIX = "Agent exited unexpectedly"
+RUNTIME_EXIT_REPORT_PRIORITY = "high"
+# ---- FINAL-I1-MAJOR-1: sender provenance is the load-bearing discriminator --------
+# The clauses above are all FORGEABLE. `orca orchestration send` on the live 1.4.196
+# CLI accepts --subject, --priority AND --payload (verified against
+# `orca orchestration send --help` and `orca agent-context --json`), so a dispatched
+# agent can reproduce the runtime's subject, its `high` priority and every payload
+# field -- exitCode, exitCause and handle included. An earlier revision of this file
+# claimed otherwise; that claim was wrong, and shape alone therefore proves nothing
+# about WHO wrote the message.
+#
+# `sender_pane_key` is the field the runtime controls. Note WHERE it lives: it is a
+# TOP-LEVEL STORED FIELD ON THE MESSAGE RECORD, written by the runtime when it stores
+# the message -- NOT a member of the JSON `payload`, and not settable by any
+# `orchestration send` flag. That is exactly why it is the one clause an agent cannot
+# reproduce: `--payload` reaches the payload object only.
+#
+# On the captured 1.4.196 receipts it is PRESENT-and-null on the runtime's own report
+# and PRESENT-and-non-null on an agent's message, and a dispatched agent could not
+# null it in any of four attempts made from its own dispatched terminal:
+#
+#   1. `orca orchestration send ...`                        -> pane key set
+#   2. `env -u ORCA_PANE_KEY orca orchestration send ...`    -> pane key set
+#   3. `setsid orca orchestration send ...`                  -> pane key set
+#   4. `nohup ... & disown`, and a no-tty subshell           -> pane key set
+#
+# So the runtime resolves the sending pane from process ancestry, not from the
+# environment the agent can edit. Requiring `None` is therefore a real authorship
+# check and not a cosmetic one.
+#
+# ABSENT IS REJECTED, NOT TREATED AS NULL. That is the whole correction: an omitted
+# key is indistinguishable from a null one, and under this run's fail-closed policy
+# "indistinguishable" is a reason to REJECT, never a reason to accept. The runtime's
+# real receipt always carries the key, so requiring its presence costs a genuine
+# report nothing.
+#
+# Scope of the claim, stated rather than implied: this is proven for a dispatched
+# agent sending through `orchestration send`, which is the channel the threat model
+# covers. It is not a claim that no process anywhere can ever produce a null pane key.
+#
+# False-negative behaviour, also explicit. If a genuine runtime report ever arrives
+# without the key, or carrying a non-null value, this predicate REFUSES it and the
+# observation fails loudly -- it is not silently downgraded to "accept anyway". A
+# false negative here is a visible test failure with the defect named; a false
+# positive would be a worker-authored message admitted as runtime evidence. Failing in
+# the first direction is the whole point, and if the runtime's schema ever changes the
+# correct response is to re-capture a receipt and re-derive the clause, never to
+# weaken it.
+RUNTIME_EXIT_REPORT_SENDER_PANE_KEY = None
+# What a dependent Task created AFTER its dependency already settled reports at
+# creation. Orca 1.4.184 left it `pending`; Orca 1.4.196 evaluates the dependency
+# immediately and reports `ready`. Verified directly against 1.4.196 rather than
+# inferred: a dependent whose dependency is still OPEN is `pending` there too, so
+# `ready` is a satisfied-dependency answer and not a lost dependency edge. Neither
+# value is a defect, and scenario H does not turn on which one appears -- what it
+# actually protects is that the coordinator never DISPATCHES such a Task, which is
+# asserted separately from this status.
+LATE_DEPENDENT_STATUSES = frozenset({"pending", "ready"})
+# OS-41. POINT VERIFICATIONS OF *THIS* REVISION, not a range and not a history.
+#
+# This tuple is an EXECUTABLE CLAIM: every entry is an Orca app version that the
+# CURRENT head of this repository has actually run the Step 4 real-runtime suite
+# against, end to end, and observed to pass. It is therefore not the list of every
+# version this repository has ever been observed on -- an observation made against an
+# OLDER harness revision does not carry forward across changes to that harness, and
+# re-listing it here would advertise support this revision has not demonstrated.
+#
+# Membership is exact-string set containment, never an ordering comparison, so an
+# unverified 1.4.190 or 1.4.197 still fails closed even though it sits between / after
+# observed points. Adding an entry REQUIRES a fresh runtime run OF THE REVISION THAT
+# ADDS IT, and the guide-grammar check below runs for every entry -- a version whose
+# live guides drifted is rejected on the grammar branch even while it is listed.
+#
+# PR #29 review MAJOR-2: 1.4.184 was listed here while the only real-runtime evidence
+# for this head was a 1.4.196 run. This revision changed worker-start admission, the
+# fake-agent shim name and path, unexpected-exit classification, scenario K, packaging
+# and the run-scoped decision cursor; the 1.4.184 artifacts predate all of that. The
+# 1.4.184 and 1.4.178-rc.2 records are PRESERVED -- unmodified on disk, and named in
+# HISTORICAL_ORCA_APP_VERSION_OBSERVATIONS below and in docs/COMPATIBILITY.md -- but
+# they are historical observations of older revisions, not current executable support.
+SUPPORTED_ORCA_APP_VERSIONS: tuple[str, ...] = ("1.4.196",)
+# The newest point verification. Kept as a single string because callers and tests
+# that only need "a version this harness accepts" read it; the gate itself reads the
+# tuple above and never this.
+SUPPORTED_ORCA_APP_VERSION = SUPPORTED_ORCA_APP_VERSIONS[-1]
+# HISTORICAL POINT OBSERVATIONS. Runtimes on which an OLDER revision of this
+# repository was observed to pass, recorded so the evidence is not lost and so the
+# distinction is machine-checkable rather than only prose. Deliberately NOT consulted
+# by validate_orca_contract(): this tuple grants nothing and gates nothing. A runtime
+# reporting one of these versions is refused exactly like any other unverified version
+# until THIS revision is actually run against it and the entry is moved above.
+#
+#   1.4.184     -- deterministic real-Orca integration with fake agents, on the
+#                  pre-OS-41 harness. That is the revision on which the SUPERVISED
+#                  fake-agent adoption path (and therefore granted session reuse) was
+#                  observed; see docs/validation/historical/ and docs/COMPATIBILITY.md.
+#   1.4.178-rc.2 -- real claude-glm / claude-gemma smoke test in the company fixture.
+HISTORICAL_ORCA_APP_VERSION_OBSERVATIONS: tuple[str, ...] = ("1.4.178-rc.2", "1.4.184")
 REQUIRED_ORCHESTRATION_GUIDE_SNIPPETS = (
     "orca orchestration run-create --objective <text> --json",
     # The bare "--spec <text>" form is a prefix of the entry below; keeping both would
@@ -269,9 +446,19 @@ class UnsupportedOrcaContract(OrcaRuntimeError):
 def validate_orca_contract(
     app_version: str, orchestration_guide: str, cli_guide: str
 ) -> None:
-    if app_version != SUPPORTED_ORCA_APP_VERSION:
+    # Fail closed on an absent or non-string version BEFORE the membership test:
+    # `None`/"" would otherwise reach the message below and read as a mere version
+    # mismatch, when what actually happened is that the runtime told us nothing about
+    # its identity. Unknown identity is not a version we can point-verify.
+    if not isinstance(app_version, str) or not app_version.strip():
         raise UnsupportedOrcaContract(
-            f"runtime harness supports Orca {SUPPORTED_ORCA_APP_VERSION}; "
+            "installed runtime did not report an app version; refusing to run the "
+            f"real-runtime suite against an unidentified Orca (got {app_version!r})"
+        )
+    if app_version not in SUPPORTED_ORCA_APP_VERSIONS:
+        raise UnsupportedOrcaContract(
+            "runtime harness point-verifies Orca "
+            f"{', '.join(SUPPORTED_ORCA_APP_VERSIONS)}; "
             f"installed runtime is {app_version}"
         )
     missing = [
@@ -416,7 +603,17 @@ class RuntimeScenarioResult:
     # ---- reuse aggregates (W-18), filled by finish() before the ledger is cleared
     reuse_chains: dict[str, list[str]] = field(default_factory=dict)
     terminal_creations: int = 0
+    # ---- OS-41: what the production reuse gate actually ANSWERED at each
+    # same-role transition, refusal reasons included. Scenario K used to prove
+    # only the granted path; on a runtime where the gate's supervised evidence
+    # does not exist the refusal is the result under test, and a refusal that
+    # is not recorded is indistinguishable from a gate nobody asked.
+    reuse_decisions: list[dict[str, Any]] = field(default_factory=list)
     retained_terminals: list[str] = field(default_factory=list)
+    # ---- PR #29 review MAJOR-1: the point-verified Orca app version this result was
+    # produced on, filled by finish() from the identity preflight() recorded on the far
+    # side of validate_orca_contract(). "" means no runtime identity was ever proven.
+    orca_app_version: str = ""
     # ---- OS-3: what strength this run enforced, and what the graph looked like.
     risk: str = ""
     risk_source: str = ""
@@ -760,6 +957,17 @@ class OrcaRuntimeHarness:
         # process-local: OS-31 owns cross-session resume, so a fresh Coordinator
         # meeting a non-trivial ledger fails closed rather than guessing (L7).
         self._last_settled: tuple[str, str, int] | None = None
+        # OS-41 diagnostic: the reuse gate's most recent answer (see
+        # terminal_for_next_dispatch). None until the gate has been asked once.
+        self.last_reuse_decision: dict[str, Any] | None = None
+        # OS-41 (BUGFIX-I1-MAJOR-1). The app version of the runtime this harness has
+        # VALIDATED, written only by preflight() and only after
+        # validate_orca_contract() accepted it. "" means "no runtime has been
+        # identified", which is the fail-closed default: version-conditional
+        # allowances are refused until an identity has actually been proven, so a
+        # harness that never ran preflight() cannot inherit another runtime's
+        # exceptions.
+        self.orca_app_version: str = ""
         # OS-29 B3-V. Armed by _b1_guard() at the ONE B1 that admits a
         # verification Reviewer past an open blocking head, consumed by the very
         # next settled Reviewer attempt of that same round, and cleared by
@@ -1170,7 +1378,7 @@ class OrcaRuntimeHarness:
         """
         if not handle or not dispatch_id:
             return None
-        eligible, _reasons = self.reuse_eligible(
+        eligible, reasons = self.reuse_eligible(
             handle,
             role=role,
             agent_command=agent_command,
@@ -1179,6 +1387,17 @@ class OrcaRuntimeHarness:
                 dispatch_id=dispatch_id, handle=handle
             ),
         )
+        # OS-41. Diagnostic only, written after the decision and read by nothing that
+        # can change it: the gate's own answer for this transition, so a scenario can
+        # assert WHICH conditions refused rather than only that a fresh terminal
+        # appeared. It records; it does not decide.
+        self.last_reuse_decision = {
+            "handle": handle,
+            "role": role,
+            "dispatch_id": dispatch_id,
+            "eligible": eligible,
+            "reasons": list(reasons),
+        }
         return handle if eligible else None
 
     def classify_terminal(
@@ -1527,6 +1746,11 @@ class OrcaRuntimeHarness:
             check=True,
         ).stdout
         validate_orca_contract(status["runtime"]["appVersion"], orchestration, cli)
+        # OS-41 (BUGFIX-I1-MAJOR-1). Recorded ONLY here and ONLY on the far side of
+        # validate_orca_contract(), so every version-conditional allowance downstream
+        # is keyed to an identity this harness actually point-verified rather than to
+        # whatever string the runtime happened to report.
+        self.orca_app_version = status["runtime"]["appVersion"]
         current = self.call("worktree", "current")
         return {
             "executable": self.orca,
@@ -1584,6 +1808,19 @@ class OrcaRuntimeHarness:
         self.requested_phases = tuple(requested_phases)
         self._signals = []
         self._ledger = {}
+        # OS-41. The OS-29 decision-gate cursor is RUN-SCOPED and must be cleared
+        # here, beside the other per-run resets, for the same reason they are: one
+        # OrcaRuntimeHarness starts several Runs in sequence (run_runtime_scenarios
+        # drives A..I on a single instance), and a new Run opens a brand-new ledger
+        # whose only record is its own run-entry declaration. Carrying the previous
+        # Run's settled round forward makes admit_head() refuse that legitimate first
+        # boundary as DECISION_GATE_INPUT_UNBOUND -- "the run-entry declaration is
+        # the head but this is not the run's first boundary" -- which is exactly what
+        # the 1.4.196 runtime suite hit on Scenario B's very first dispatch. The
+        # armed verification is per-round and belongs to the Run that armed it, so it
+        # is cleared with the same statement.
+        self._last_settled = None
+        self._pending_verification = None
         # Provisioned here, once, immediately after the run id is known -- and
         # BEFORE any caller can create a Task whose artifact_contract names this
         # directory. Scoped under artifact_dir (this harness's own scratch space),
@@ -1734,7 +1971,7 @@ class OrcaRuntimeHarness:
     ) -> str:
         command = [
             "exec",
-            str(FAKE_CODEX),
+            str(FAKE_AGENT_SHIM),
             "--role",
             role,
             "--mode",
@@ -1856,6 +2093,41 @@ class OrcaRuntimeHarness:
         )
         if started.get("ok"):
             result = started["result"]
+            # OS-41 STEP 3a. The acknowledgement gate, ABOVE the ledger write: a
+            # supervised attachment is recorded only for a start the runtime itself
+            # calls ready. Anything else raises with the whole launch diagnosis
+            # attached, having registered nothing -- a half-started Dispatch must not
+            # become a row that later reads like a live supervised worker.
+            if "state" not in result:
+                # A success receipt with no `state` at all. Legitimate on exactly one
+                # HISTORICAL point observation (see
+                # WORKER_START_STATELESS_RECEIPT_VERSION -- no longer in the current
+                # executable support set, so this branch is offline-covered only) and
+                # missing lifecycle evidence everywhere else -- including on a
+                # 1.4.196 runtime, where `state` is the field that carries the launch
+                # outcome, and on a harness that never identified its runtime.
+                # BUGFIX-I1-MAJOR-1: this branch used to be unconditional, which let a
+                # malformed 1.4.196 receipt be written to the ledger as an adopted
+                # supervised worker.
+                if self.orca_app_version != WORKER_START_STATELESS_RECEIPT_VERSION:
+                    raise OrcaRuntimeError(
+                        "worker-start returned a success receipt with no launch "
+                        "state; that shape is accepted only from the point-verified "
+                        f"Orca {WORKER_START_STATELESS_RECEIPT_VERSION} runtime, and "
+                        "this harness has validated "
+                        f"{self.orca_app_version or 'no runtime'}: "
+                        f"dispatchId={result.get('dispatchId')!r} result={result!r}"
+                    )
+            elif str(result.get("state")) != WORKER_START_READY_STATE:
+                raise OrcaRuntimeError(
+                    "worker-start did not reach a ready worker: "
+                    f"state={str(result.get('state'))!r} "
+                    f"stage={result.get('stage')!r} "
+                    f"failedStage={result.get('failedStage')!r} "
+                    f"lastError={result.get('lastError')!r} "
+                    f"dispatchId={result.get('dispatchId')!r} "
+                    f"residualResources={result.get('residualResources')!r}"
+                )
             dispatch_id = result["dispatchId"]
             self._attach_terminal(terminal, dispatch_id, "supervised_adopted")
             # W-21. Deliberately NOT widened into the return type: tuple[str, bool] is
@@ -3048,6 +3320,133 @@ class OrcaRuntimeHarness:
             verifies=verifies,
         )
 
+    @staticmethod
+    def _runtime_exit_report_defects(
+        message: dict[str, Any], *, dispatch_id: str, task_id: str, terminal: str
+    ) -> list[str]:
+        """Every way `message` fails to be Orca's own unexpected-exit report, named.
+
+        Returns [] only for a message that matches the live 1.4.196 receipt in EVERY
+        checked respect. Never short-circuits: a caller (and a negative test) sees each
+        failing clause by name, so a clause that stops being enforced is caught by the
+        name that stops appearing.
+
+        WHAT PROVES WHAT. Exactly one clause is authorship evidence: the top-level
+        stored `sender_pane_key`, required present-and-null. Every other clause --
+        type, subject, priority, taskId, dispatchId, handle, exitCode, exitCause -- is
+        settable by a dispatched agent through `orchestration send`
+        (`--type/--subject/--priority/--payload`), so they are IDENTITY AND SHAPE
+        VALIDATION plus defence in depth, never proof of who wrote the message. Reading
+        them as authorship is the error that made an earlier revision accept a
+        full-shape worker-authored escalation.
+
+        Nothing here is guessed. Every required field is present in the real receipt;
+        every VALUE constraint is a type/shape constraint rather than an allowlist of
+        observed values, because only one exit cause has been observed and pinning
+        `kind == "unknown"` would reject a genuine report of a different cause.
+        (BUGFIX-I1-MAJOR-2.)
+        """
+        defects: list[str] = []
+        if message.get("type") != RUNTIME_EXIT_REPORT_TYPE:
+            defects.append(f"type={message.get('type')!r}")
+        subject = message.get("subject")
+        if not isinstance(subject, str) or not subject.startswith(
+            RUNTIME_EXIT_REPORT_SUBJECT_PREFIX
+        ):
+            defects.append(f"subject={subject!r}")
+        if message.get("priority") != RUNTIME_EXIT_REPORT_PRIORITY:
+            defects.append(f"priority={message.get('priority')!r}")
+        # ---- authorship. Checked by PRESENCE first, then by value: a message that
+        # omits the field is refused rather than read as the runtime's null.
+        if "sender_pane_key" not in message:
+            defects.append("sender_pane_key absent")
+        elif message["sender_pane_key"] is not RUNTIME_EXIT_REPORT_SENDER_PANE_KEY:
+            defects.append(f"sender_pane_key={message['sender_pane_key']!r}")
+
+        try:
+            payload = json.loads(message.get("payload") or "null")
+        except (TypeError, ValueError):
+            return defects + ["unparseable payload"]
+        if not isinstance(payload, dict):
+            return defects + [f"payload is {type(payload).__name__}, not an object"]
+
+        # ---- identity: the two ids the round is bound to, plus the terminal.
+        if payload.get("taskId") != task_id:
+            defects.append(f"taskId={payload.get('taskId')!r} != {task_id!r}")
+        if payload.get("dispatchId") != dispatch_id:
+            defects.append(
+                f"dispatchId={payload.get('dispatchId')!r} != {dispatch_id!r}"
+            )
+        # A third IDENTITY binding, not an authorship one: the runtime names the
+        # terminal whose process ended, and it must be the terminal this observation
+        # is about. An agent can set this field too (`--payload`), so it narrows WHICH
+        # round a message may speak for; it never establishes WHO wrote it.
+        if payload.get("handle") != terminal:
+            defects.append(f"handle={payload.get('handle')!r} != {terminal!r}")
+
+        # ---- the payload SHAPE the captured runtime report carries. Forgeable via
+        # `--payload`, so this is malformed-report rejection and defence in depth --
+        # not evidence of runtime authorship.
+        exit_code = payload.get("exitCode")
+        # bool is a subclass of int and is NOT an exit code.
+        if not isinstance(exit_code, int) or isinstance(exit_code, bool):
+            defects.append(f"exitCode={exit_code!r}")
+        cause = payload.get("exitCause")
+        if not isinstance(cause, dict):
+            defects.append(f"exitCause={cause!r}")
+        else:
+            for field_name in ("kind", "reason"):
+                value = cause.get(field_name)
+                if not isinstance(value, str) or not value.strip():
+                    defects.append(f"exitCause.{field_name}={value!r}")
+        return defects
+
+    def _classify_exit_checkpoint(
+        self,
+        checkpoint: dict[str, Any],
+        *,
+        dispatch_id: str,
+        task_id: str,
+        terminal: str,
+    ) -> list[dict[str, Any]]:
+        """Split an unexpected-exit checkpoint into runtime exit reports and violations.
+
+        Returns the runtime's own exit reports for THIS dispatch, on THIS terminal.
+        Raises on anything else, which keeps the scenario's actual claim intact: this
+        dispatch produced no lifecycle result of its own.
+
+        A message is admitted only by satisfying every clause in
+        _runtime_exit_report_defects(): the identity and shape clauses -- type, subject
+        wording, priority, the three identity fields, the exitCode/exitCause schema --
+        AND the top-level stored `sender_pane_key`. Only the last is authorship
+        evidence; every other clause is reproducible by a dispatched agent through
+        `orchestration send --payload/--subject/--priority` and is kept as defence in
+        depth. An escalation that merely names the right round, which is exactly what a
+        fake agent's own `Blocked:` escalation does, is a violation and not a pass.
+
+        An empty delivery returns [] and is equally correct: that is what Orca 1.4.184
+        produces for the same scenario, and both point verifications must hold.
+        """
+        violations: list[str] = []
+        reports: list[dict[str, Any]] = []
+        for message in checkpoint.get("messages") or ():
+            defects = self._runtime_exit_report_defects(
+                message, dispatch_id=dispatch_id, task_id=task_id, terminal=terminal
+            )
+            if defects:
+                violations.append(
+                    f"{message.get('id')} is not this dispatch's runtime exit report ("
+                    + ", ".join(defects)
+                    + ")"
+                )
+            else:
+                reports.append(message)
+        if violations:
+            raise OrcaRuntimeError(
+                "unexpected exit produced a lifecycle message: " + "; ".join(violations)
+            )
+        return reports
+
     def observe_unexpected_exit(
         self,
         role: str,
@@ -3120,8 +3519,16 @@ class OrcaRuntimeHarness:
             return recorded
         self.confirm_terminal_exit(handle)
         checkpoint = self._check()
-        if checkpoint.get("messages"):
-            raise OrcaRuntimeError("unexpected exit produced a lifecycle message")
+        exit_reports = self._classify_exit_checkpoint(
+            checkpoint, dispatch_id=dispatch_id, task_id=task_id, terminal=handle
+        )
+        if exit_reports:
+            # The delivery held only the runtime's own identity-bound exit report(s);
+            # acknowledge it so the run mailbox does not replay it into the next
+            # observation of this same run (guide: process the whole Delivery, then
+            # acknowledge).
+            self._signals.extend(RUNTIME_EXIT_REPORT_TYPE for _ in exit_reports)
+            self._ack(checkpoint["deliveryId"])
         if supervised:
             shown = self.call("orchestration", "worker-show", "--dispatch", dispatch_id)["result"]
             state = shown["worker"]["state"]
@@ -3222,6 +3629,14 @@ class OrcaRuntimeHarness:
         assert self.run_id and self.run_owner
         result.signals = list(self._signals)
         result.run_owner_handle = self.run_owner
+        # PR #29 review MAJOR-1. The runtime IDENTITY this result was produced on,
+        # carried on the result (and therefore into the snapshot on disk) so an
+        # assertion can be bound to the runtime point it was validated for instead of
+        # being inferred from the outcome it observed. `self.orca_app_version` is
+        # written by preflight() ONLY after validate_orca_contract() accepted the
+        # runtime, so this is a point-verified identity or the empty string -- and an
+        # empty string is "no runtime proven", which every consumer must fail on.
+        result.orca_app_version = self.orca_app_version
         for handle, row in self._terminals.items():
             row["policy_commands"] = self.lifecycle_commands(handle=handle)
         result.ledger = [dict(row) for row in self._terminals.values()] + list(
@@ -3579,7 +3994,19 @@ def run_quality_profile_runtime_scenario(
 
 
 def run_session_reuse_runtime_scenario(artifact_dir: Path) -> RuntimeScenarioResult:
-    """Opt-in scenario K: one worker session and one reviewer session, five phases.
+    """Opt-in scenario K: what the production reuse gate ANSWERS across five phases.
+
+    ON ORCA 1.4.196 THIS SCENARIO VERIFIES THAT REUSE IS CORRECTLY REFUSED on the
+    tracked path. It does NOT verify that session reuse works, and it must never be
+    described as doing so. **Supervised session reuse is NOT VERIFIED on Orca
+    1.4.196.** That claim belongs to the HISTORICAL Orca 1.4.184 point observation of
+    an older harness revision -- see HISTORICAL_ORCA_APP_VERSION_OBSERVATIONS -- and to
+    the offline contract suite; see docs/COMPATIBILITY.md.
+
+    PR #29 review MAJOR-1: the eight refusals below are what the caller's assertion is
+    now BOUND to, keyed on `result.orca_app_version`. The result carries the identity
+    finish() copies off the harness so the expectation follows the runtime point
+    rather than the observed outcome.
 
     Deliberately NOT part of run_runtime_scenarios(): that function's A-I result set
     is pinned by an exact-set assertion in test_orca_runtime.py, which this change may
@@ -3591,15 +4018,37 @@ def run_session_reuse_runtime_scenario(artifact_dir: Path) -> RuntimeScenarioRes
 
     What `terminal=` each attempt gets is NOT decided by loop position: every attempt
     after the first of a role asks terminal_for_next_dispatch(), which takes a fresh
-    observation of the previous dispatch and runs the eight-condition gate. All eight
-    hold throughout this scenario -- same role, same agent command, live process,
-    settled and finalized predecessor, ownership transferable, not retained, not the
-    coordinator's own terminal, not in recovery -- so the run still creates exactly
-    two phase terminals for ten dispatches. A gate that refused would hand back None
-    and the attempt would open a fresh terminal instead, which is the failure this
-    wiring makes observable. Every attempt but the last of each role settles with
-    lifecycle="reuse", which issues zero lifecycle commands (W-15 / W-16) and leaves
-    ownership to transfer on the next worker-start.
+    observation of the previous dispatch and runs the eight-condition gate. That call
+    is the point of the scenario, and the gate's ANSWER is the result under test --
+    granted or refused.
+
+    WHAT THE 1.4.196 RUN ACTUALLY PRODUCED (artifacts/orca-runtime/os41-final/
+    scenario-k.json, and reproduced on every run since):
+
+      * 8 gate decisions, ALL `eligible: false`;
+      * each refusing with exactly these four condition names --
+        ownership_not_transferable, release_state_missing,
+        terminal_effect_unrecorded, worker_state_not_reusable;
+      * `terminal_creations: 10` and ten DISTINCT attempt terminals, because each
+        refusal returns None and the attempt opens a FRESH terminal.
+
+    Ten terminals for ten dispatches, not two. The four refusals above are the
+    conditions whose evidence exists only for a SUPERVISED dispatch
+    (`worker.state`, `terminalResource.releaseState`/`ownershipState`, the
+    worker-start terminal effect). On 1.4.196 every fake-agent dispatch is TRACKED --
+    `worker.state` reads "unsupervised" with no terminalResource at all -- so the gate
+    fails closed, correctly and by its own documented design. reuse_eligible() is NOT
+    widened to accept tracked evidence; it is byte-identical to main.
+
+    Every attempt but the last of each role still settles with lifecycle="reuse",
+    which issues zero lifecycle commands (W-15 / W-16); on the tracked path that is
+    recorded as `reuse:tracked-external` and the session is simply not handed onward,
+    because the gate declined it. The last attempt of each role settles with
+    lifecycle="release", recorded as `release:natural-exit`.
+
+    The assertions in test_orca_runtime.py are written to hold on EITHER answer and to
+    require the terminal accounting to follow the gate in both directions, so a
+    runtime that granted reuse would still have to produce the reused chains.
     """
     harness = OrcaRuntimeHarness(artifact_dir)
     preflight = harness.preflight()
@@ -3612,6 +4061,7 @@ def run_session_reuse_runtime_scenario(artifact_dir: Path) -> RuntimeScenarioRes
     attempts: list[RuntimeAttempt] = []
     worker_previous: RuntimeAttempt | None = None
     reviewer_previous: RuntimeAttempt | None = None
+    decisions: list[dict[str, Any]] = []
 
     def next_terminal(previous: RuntimeAttempt | None, role: str) -> str | None:
         """Ask the production gate which terminal the next attempt runs on.
@@ -3620,18 +4070,27 @@ def run_session_reuse_runtime_scenario(artifact_dir: Path) -> RuntimeScenarioRes
         exactly as create_fake_terminal spells it when it registers the row, so a
         role swap really is a mismatch rather than a value copied out of the row it
         is being compared against. The agent command is the one the ledger recorded
-        for the running session: the fake agent was started with --max-dispatches
-        len(phases) and serves every phase of the chain, so the command a reused
-        terminal needs IS the command it is already running. No new constant.
+        for the running session: a fresh session is started with a budget for the
+        phases that REMAIN, so the command a reused terminal needs IS the command it
+        is already running. No new constant.
+
+        OS-41: the gate's answer is recorded either way. On a runtime where the gate's
+        supervised worker-resource evidence exists it grants reuse; on one where the
+        dispatch is tracked rather than supervised that evidence does not exist and the
+        gate refuses, which is the correct fail-closed answer and is the thing under
+        test there. Neither outcome is decided here -- this only asks and records.
         """
         if previous is None:
             return None
-        return harness.terminal_for_next_dispatch(
+        handle = harness.terminal_for_next_dispatch(
             previous.terminal,
             role="phase_reviewer" if role.endswith("reviewer") else "phase_worker",
             agent_command=harness.ledger_terminal(previous.terminal)["agent_command"],
             dispatch_id=previous.dispatch_id,
         )
+        if harness.last_reuse_decision is not None:
+            decisions.append(dict(harness.last_reuse_decision))
+        return handle
 
     # Real workflow evidence, accumulated as the chain runs: an artifact joins the
     # baseline only after the Reviewer of its phase actually settled with a PASS, so
@@ -3677,7 +4136,16 @@ def run_session_reuse_runtime_scenario(artifact_dir: Path) -> RuntimeScenarioRes
             spec=worker_spec,
             lifecycle="release" if last else "reuse",
             terminal=next_terminal(worker_previous, "worker"),
-            max_dispatches=len(phases),
+            # OS-41: a budget for the phases that REMAIN, not for the whole chain.
+            # The fake agent exits once it has served this many dispatches, and that
+            # exit is the only release receipt the tracked path has. With the whole
+            # chain's count, a session that the reuse gate declines to hand onward is
+            # left holding an unspent budget and never exits, so the final
+            # `release` could not be observed. Remaining-count is correct on both
+            # answers: a granted chain still gets its full budget at the first
+            # attempt, and a refused one gets a fresh session whose budget is exactly
+            # the one dispatch it will serve.
+            max_dispatches=len(phases) - iteration + 1,
         )
         # Built AFTER the worker settled and BEFORE the Reviewer is dispatched, which
         # is the only window in which the Reviewer's delta can be a fact rather than
@@ -3725,7 +4193,16 @@ def run_session_reuse_runtime_scenario(artifact_dir: Path) -> RuntimeScenarioRes
             evidence=reviewer_evidence,
             lifecycle="release" if last else "reuse",
             terminal=next_terminal(reviewer_previous, "reviewer"),
-            max_dispatches=len(phases),
+            # OS-41: a budget for the phases that REMAIN, not for the whole chain.
+            # The fake agent exits once it has served this many dispatches, and that
+            # exit is the only release receipt the tracked path has. With the whole
+            # chain's count, a session that the reuse gate declines to hand onward is
+            # left holding an unspent budget and never exits, so the final
+            # `release` could not be observed. Remaining-count is correct on both
+            # answers: a granted chain still gets its full budget at the first
+            # attempt, and a refused one gets a fresh session whose budget is exactly
+            # the one dispatch it will serve.
+            max_dispatches=len(phases) - iteration + 1,
         )
         if reviewer.outcome == "succeeded":
             approved_baseline.append(worker_artifact)
@@ -3733,6 +4210,7 @@ def run_session_reuse_runtime_scenario(artifact_dir: Path) -> RuntimeScenarioRes
         attempts.extend((worker, reviewer))
 
     result = RuntimeScenarioResult("K", run_id, "COMPLETED", len(phases), attempts)
+    result.reuse_decisions = decisions
     result.phase_reviewer_terminals = [
         reviewer_previous.terminal if reviewer_previous else ""
     ]

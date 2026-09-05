@@ -43,7 +43,7 @@ REQUIRED_DOCS = (
     "docs/validation/historical/GLM_GEMMA_SMOKE_REPORT_2026-08-20.md",
 )
 INCLUDED_ROOTS = (".github", "docs", "scripts", *SKILL_NAMES)
-EXECUTABLE_FILES = frozenset({"scripts/fake_bin/codex"})
+EXECUTABLE_FILES = frozenset({"scripts/fake_bin/fake-agent"})
 FORBIDDEN_PARTS = {
     ".git",
     "artifacts",

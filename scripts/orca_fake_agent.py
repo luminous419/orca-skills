@@ -8,6 +8,7 @@ import json
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 try:
@@ -123,28 +124,68 @@ def send_done(
         raise SystemExit(result.returncode)
 
 
+# OS-41. The only Dispatch status that means "this Dispatch is live and this agent
+# may report against it". Unchanged from the value this file has always required --
+# what changed is WHEN a 1.4.196 runtime reaches it.
+ACTIVE_DISPATCH_STATUS = "dispatched"
+# Statuses that mean "the runtime is still starting this Dispatch; look again".
+# Orca 1.4.184 promoted the Dispatch to `dispatched` before the injected prompt
+# reached the agent, so one look was always enough. Orca 1.4.196 delivers the prompt
+# during `worker-start`'s own start composition, while the Dispatch row is still
+# `pending` (worker.state "starting", worker.stage "authority_attached"), and
+# promotes it only when that composition finishes. A deterministic fake is faster
+# than the composition, so it used to observe `pending`, treat it as fatal and exit
+# -- which killed the agent process mid-start and made `worker-start` itself fail
+# with `dispatch_inactive`. Waiting is therefore the fix, and acting on `pending` is
+# NOT: a `worker_done` sent against a still-pending Dispatch is rejected by the
+# runtime as an inactive dispatch, so the agent must reach `dispatched` first.
+STARTING_DISPATCH_STATUSES = frozenset({"pending"})
+# Bounded, so a Dispatch that never becomes active fails closed instead of hanging.
+# Comfortably above the ~3s promotion observed on 1.4.196 and below the 60s
+# `worker-start` timeoutMs the same runtime reports in `worker.start_options`.
+DISPATCH_READY_TIMEOUT_S = 45.0
+DISPATCH_READY_POLL_S = 0.5
+
+
 def confirm_dispatch_ready(dispatch_id: str, orca_command: str) -> None:
-    result = subprocess.run(
-        [
-            orca_command,
-            "orchestration",
-            "worker-show",
-            "--dispatch",
-            dispatch_id,
-            "--json",
-        ],
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        print(result.stdout, end="", flush=True)
-        print(result.stderr, file=sys.stderr, end="", flush=True)
-        raise SystemExit(result.returncode)
-    payload = json.loads(result.stdout)
-    status = payload["result"]["dispatch"]["status"]
-    if status != "dispatched":
-        raise SystemExit(f"dispatch is not active: {status}")
+    """Block until this Dispatch is actually active, or fail closed.
+
+    Returns only for ACTIVE_DISPATCH_STATUS. A status the runtime is still working
+    through (STARTING_DISPATCH_STATUSES) is re-read until the deadline; every other
+    value -- settled, abandoned, or simply unrecognized -- exits immediately, which
+    is the same fail-closed answer this function has always given.
+    """
+    deadline = time.monotonic() + DISPATCH_READY_TIMEOUT_S
+    while True:
+        result = subprocess.run(
+            [
+                orca_command,
+                "orchestration",
+                "worker-show",
+                "--dispatch",
+                dispatch_id,
+                "--json",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            print(result.stdout, end="", flush=True)
+            print(result.stderr, file=sys.stderr, end="", flush=True)
+            raise SystemExit(result.returncode)
+        payload = json.loads(result.stdout)
+        status = payload["result"]["dispatch"]["status"]
+        if status == ACTIVE_DISPATCH_STATUS:
+            return
+        if status not in STARTING_DISPATCH_STATUSES:
+            raise SystemExit(f"dispatch is not active: {status}")
+        if time.monotonic() >= deadline:
+            raise SystemExit(
+                f"dispatch stayed {status} for {DISPATCH_READY_TIMEOUT_S:.0f}s "
+                "without becoming active"
+            )
+        time.sleep(DISPATCH_READY_POLL_S)
 
 
 def main() -> int:

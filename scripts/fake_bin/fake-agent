@@ -1,0 +1,6 @@
+#!/bin/bash
+# Test-only shim. Deliberately NOT named after any agent Orca recognizes: on Orca
+# 1.4.196 a terminal Orca believes is running a real agent CLI is driven through
+# `worker-start`'s supervised prompt-acknowledgement stage, which only a genuine
+# agent session can complete. See docs/COMPATIBILITY.md (OS-41).
+exec -a fake-agent python3 "$(dirname "$0")/../orca_fake_agent.py" "$@"

@@ -23,9 +23,15 @@ from unittest.mock import patch
 
 from scripts import fake_worker, orca_runtime_harness
 from scripts import decision_gate, run_logging
-from scripts.orca_fake_agent import send_done
+from scripts.orca_fake_agent import (
+    ACTIVE_DISPATCH_STATUS,
+    STARTING_DISPATCH_STATUSES,
+    confirm_dispatch_ready,
+    send_done,
+)
 from scripts.orca_runtime_harness import (
     CLOSE_ELIGIBLE_ROLES,
+    HISTORICAL_ORCA_APP_VERSION_OBSERVATIONS,
     LIFECYCLE_MUTATION_COMMANDS,
     NEVER_CLOSE_ROLES,
     PROCESS_TERMINATING_ACTIONS,
@@ -34,6 +40,9 @@ from scripts.orca_runtime_harness import (
     REQUIRED_ORCA_CLI_GUIDE_SNIPPETS,
     REQUIRED_ORCHESTRATION_GUIDE_SNIPPETS,
     SUPPORTED_ORCA_APP_VERSION,
+    SUPPORTED_ORCA_APP_VERSIONS,
+    WORKER_START_READY_STATE,
+    WORKER_START_STATELESS_RECEIPT_VERSION,
     TERMINAL_ORIGINS,
     OrcaRuntimeError,
     OrcaRuntimeHarness,
@@ -240,7 +249,11 @@ class RecordingExec:
             "dispatch": {"status": "completed", "completed_at": COMPLETED_AT}
         },
         "dispatch": {"dispatch": {"id": "ctx_1"}},
-        "worker-start": {"dispatchId": "ctx_1"},
+        # OS-41: a SUCCESSFUL start on the runtime this repository currently
+        # point-verifies carries `state: "ready"`. The stateless 1.4.184 shape is
+        # no longer the shared default -- it is version-conditional now, and the
+        # tests that exercise it declare the 1.4.184 identity explicitly.
+        "worker-start": {"dispatchId": "ctx_1", "state": "ready"},
         "task-create": {"task": {"id": "task_g"}},
         "create": {"terminal": {"handle": "term_created"}},
         "send": {},
@@ -354,6 +367,7 @@ class SequentialDispatchExec(SequentialTerminalExec):
             self.dispatched.append(dispatch_id)
             self.results["worker-start"] = {
                 "dispatchId": dispatch_id,
+                "state": "ready",
                 "effects": [
                     {
                         "kind": "terminal",
@@ -422,7 +436,10 @@ class VerificationDispatchExec(SequentialTerminalExec):
         if verb == "worker-start":
             dispatch_id = f"ctx_v{len(self.dispatched) + 1}"
             self.dispatched.append(dispatch_id)
-            self.results["worker-start"] = {"dispatchId": dispatch_id}
+            self.results["worker-start"] = {
+                "dispatchId": dispatch_id,
+                "state": "ready",
+            }
             self.results["check"] = {
                 "deliveryId": f"dlv_{dispatch_id}",
                 "timedOut": False,
@@ -2741,7 +2758,8 @@ class GraphFirstOrderingTests(OfflineHarnessTestCase):
 
 
 class SameRoleSessionReuseTests(OfflineHarnessTestCase):
-    """DESIGN section 7.1 A-1: one terminal per role for a whole run of phases.
+    """DESIGN section 7.1 A-1: one terminal per role for a whole run of phases, in
+    the offline supervised model.
 
     Driven by SequentialTerminalExec, because the base recorder answers every
     `terminal create` with one pinned handle and would make "the chain kept ONE
@@ -2749,6 +2767,15 @@ class SameRoleSessionReuseTests(OfflineHarnessTestCase):
     dispatch id, the task id and the delivered worker_done together, so every attempt
     settles a different row with a different identity -- FinalReviewFreshnessTests
     keeps its own copy untouched, it is an unmodified regression class.
+
+    OFFLINE MODEL, NOT A 1.4.196 CLAIM (OS-41). This class drives the harness
+    through a stub that returns SUPERVISED worker-start/worker-show receipts, so
+    the reuse gate's evidence exists and it grants reuse. That is the point --
+    the supervised path stays covered here. Against the live Orca 1.4.196 runtime
+    every fake-agent dispatch is TRACKED instead, the same gate refuses all eight
+    decisions, and scenario K creates ten terminals for ten dispatches; supervised
+    session reuse is NOT VERIFIED on 1.4.196. See
+    run_session_reuse_runtime_scenario() and docs/COMPATIBILITY.md.
     """
 
     PHASES = ("analysis", "plan", "design", "implementation", "test")
@@ -2772,6 +2799,7 @@ class SameRoleSessionReuseTests(OfflineHarnessTestCase):
         }
         recorder.results["worker-start"] = {
             "dispatchId": dispatch_id,
+            "state": "ready",
             "effects": [
                 {
                     "kind": "terminal",
@@ -3463,6 +3491,15 @@ class ReuseEligibilityTests(OfflineHarnessTestCase):
     assertion because reuse_eligible() never short-circuits, so an unrelated
     condition silently failing would show up here as an extra name rather than
     hiding behind an early return.
+
+    OFFLINE MODEL, NOT A 1.4.196 CLAIM (OS-41). This class drives the harness
+    through a stub that returns SUPERVISED worker-start/worker-show receipts, so
+    the reuse gate's evidence exists and it grants reuse. That is the point --
+    the supervised path stays covered here. Against the live Orca 1.4.196 runtime
+    every fake-agent dispatch is TRACKED instead, the same gate refuses all eight
+    decisions, and scenario K creates ten terminals for ten dispatches; supervised
+    session reuse is NOT VERIFIED on 1.4.196. See
+    run_session_reuse_runtime_scenario() and docs/COMPATIBILITY.md.
     """
 
     HANDLE = "term_worker"
@@ -3876,6 +3913,7 @@ class TerminalEffectReceiptTests(OfflineHarnessTestCase):
     RUNG_3 = {
         "worker-start": {
             "dispatchId": "ctx_1",
+            "state": "ready",
             "effects": [
                 {"kind": "terminal", "action": "reused",
                  "id": "term_worker", "role": "agent"}
@@ -3898,6 +3936,7 @@ class TerminalEffectReceiptTests(OfflineHarnessTestCase):
         **RUNG_3,
         "worker-start": {
             "dispatchId": "ctx_1",
+            "state": "ready",
             "effects": [
                 {"kind": "terminal", "action": "created",
                  "id": "term_worker", "role": "agent"}
@@ -4058,7 +4097,10 @@ class FinalReviewFreshnessTests(OfflineHarnessTestCase):
         RecordingExec pins one dispatch id, so without this every attempt would
         settle the SAME row and the second one would read back as a replay.
         """
-        recorder.results["worker-start"] = {"dispatchId": dispatch_id}
+        recorder.results["worker-start"] = {
+            "dispatchId": dispatch_id,
+            "state": "ready",
+        }
         recorder.results["check"] = {
             "deliveryId": f"dlv_{dispatch_id}",
             "timedOut": False,
@@ -4323,6 +4365,15 @@ class SessionReuseGateTests(OfflineHarnessTestCase):
     Only the minimum this IMPLEMENTATION owes: one fully eligible positive, the
     fail-closed negatives for a missing/stale observation, and the read-only
     observation builder. The full 45-test placement is the TEST phase's job.
+
+    OFFLINE MODEL, NOT A 1.4.196 CLAIM (OS-41). This class drives the harness
+    through a stub that returns SUPERVISED worker-start/worker-show receipts, so
+    the reuse gate's evidence exists and it grants reuse. That is the point --
+    the supervised path stays covered here. Against the live Orca 1.4.196 runtime
+    every fake-agent dispatch is TRACKED instead, the same gate refuses all eight
+    decisions, and scenario K creates ten terminals for ten dispatches; supervised
+    session reuse is NOT VERIFIED on 1.4.196. See
+    run_session_reuse_runtime_scenario() and docs/COMPATIBILITY.md.
     """
 
     def eligible_harness(
@@ -4403,6 +4454,7 @@ class SessionReuseGateTests(OfflineHarnessTestCase):
     RUNG_3 = {
         "worker-start": {
             "dispatchId": "ctx_1",
+            "state": "ready",
             "effects": [
                 {
                     "kind": "terminal",
@@ -4427,7 +4479,12 @@ class SessionReuseGateTests(OfflineHarnessTestCase):
     }
 
     def test_a_real_flow_reaches_an_eligible_reuse_decision(self) -> None:
-        """The gate is reachable, not merely well-formed.
+        """The gate is reachable, not merely well-formed -- on SUPERVISED receipts.
+
+        "Real flow" means the production code path with nothing hand-placed in the
+        ledger; it does not mean the live runtime. The receipts come from a stub that
+        answers as a supervised dispatch. On Orca 1.4.196 the same gate refuses,
+        because a tracked dispatch carries none of that evidence.
 
         Every value the eight conditions read is written by the production path --
         create_fake_terminal records the agent command, start_worker records the
@@ -4655,6 +4712,7 @@ class ScenarioKExec(EchoingTerminalExec):
             task_id = args[args.index("--task") + 1]
             self.results["worker-start"] = {
                 "dispatchId": dispatch_id,
+                "state": "ready",
                 "effects": [
                     {
                         "kind": "terminal",
@@ -4695,6 +4753,15 @@ class ScenarioKDispatchedPhaseTests(OfflineHarnessTestCase):
     function itself against a self-arming stub and then read the dispatched Task
     specs back out of the command log, which is the text Orca replays into the
     agent's preamble.
+
+    OFFLINE MODEL, NOT A 1.4.196 CLAIM (OS-41). This class drives the harness
+    through a stub that returns SUPERVISED worker-start/worker-show receipts, so
+    the reuse gate's evidence exists and it grants reuse. That is the point --
+    the supervised path stays covered here. Against the live Orca 1.4.196 runtime
+    every fake-agent dispatch is TRACKED instead, the same gate refuses all eight
+    decisions, and scenario K creates ten terminals for ten dispatches; supervised
+    session reuse is NOT VERIFIED on 1.4.196. See
+    run_session_reuse_runtime_scenario() and docs/COMPATIBILITY.md.
     """
 
     ROLE_SEQUENCE = ("worker", "reviewer")
@@ -4819,7 +4886,13 @@ class ScenarioKDispatchedPhaseTests(OfflineHarnessTestCase):
         )
 
     def test_the_reuse_accounting_the_correction_had_to_preserve(self) -> None:
-        """Ten dispatches, two terminals, eight reuses -- unchanged by this wiring."""
+        """Ten dispatches, two terminals, eight reuses -- IN THE OFFLINE MODEL.
+
+        These numbers are the stub's supervised answer, and they are what this wiring
+        change had to leave alone. They are NOT what the live Orca 1.4.196 run
+        produces: there the gate refuses all eight decisions and ten terminals are
+        created (artifacts/orca-runtime/os41-final/scenario-k.json).
+        """
         result, _ = self.run_scenario()
 
         self.assertEqual(result.terminal_creations, 2)
@@ -5138,7 +5211,10 @@ class AutoSequencedExec(EchoingTerminalExec):
             self._dispatches += 1
             dispatch_id = f"ctx_L{self._dispatches}"
             task_id = self.task_ids[-1]
-            self.results["worker-start"] = {"dispatchId": dispatch_id}
+            self.results["worker-start"] = {
+                "dispatchId": dispatch_id,
+                "state": "ready",
+            }
             self.results["check"] = {
                 "deliveryId": f"dlv_{dispatch_id}",
                 "timedOut": False,
@@ -5521,7 +5597,10 @@ quality_attributes:
 
         handles = []
         for index in (1, 2):
-            recorder.results["worker-start"] = {"dispatchId": f"ctx_fr_{index}"}
+            recorder.results["worker-start"] = {
+                "dispatchId": f"ctx_fr_{index}",
+                "state": "ready",
+            }
             recorder.results["check"] = {
                 "deliveryId": f"dlv_fr_{index}",
                 "timedOut": False,
@@ -8854,6 +8933,761 @@ class DecisionGateLiveDispatchTests(unittest.TestCase):
 
         head = self.ledger()[-1]
         self.assertEqual(head["source_binding"], f"artifacts/runs/{harness.run_id}/")
+
+
+
+class Os41Orca1_4_196CompatibilityTests(unittest.TestCase):
+    """OS-41 regression cover for the three defects the 1.4.196 runtime exposed.
+
+    Every constant these tests pin was read from the installed Orca 1.4.196 runtime,
+    not from a guess: the app version from `orca status --json`, the `state` /
+    `failedStage` / `lastError` launch vocabulary from a real `worker-start` result,
+    and the `pending` -> `dispatched` promotion from a real `worker-show` taken by an
+    agent while it held the injected prompt.
+    """
+
+    LIVE_ORCHESTRATION_GUIDE = "\n".join(REQUIRED_ORCHESTRATION_GUIDE_SNIPPETS)
+    LIVE_CLI_GUIDE = "\n".join(REQUIRED_ORCA_CLI_GUIDE_SNIPPETS)
+
+    # ---- D0: the version gate that skipped all six tests --------------------
+
+    def test_orca_1_4_196_is_a_point_verification_and_is_accepted(self) -> None:
+        """The bug: 1.4.196's guide grammar matched, but the gate pinned 1.4.184
+        alone, so validate_orca_contract raised and the suite skipped six tests."""
+        self.assertIn("1.4.196", SUPPORTED_ORCA_APP_VERSIONS)
+        validate_orca_contract(
+            "1.4.196", self.LIVE_ORCHESTRATION_GUIDE, self.LIVE_CLI_GUIDE
+        )
+
+    def test_the_earlier_observation_is_historical_and_not_current_support(
+        self,
+    ) -> None:
+        """PR #29 review MAJOR-2: 1.4.184 is a RECORD, not an executable claim.
+
+        SUPPORTED_ORCA_APP_VERSIONS is a claim that the CURRENT head passes the Step 4
+        suite on every entry. The 1.4.184 evidence was produced against the pre-OS-41
+        harness -- before this revision changed worker-start admission, the fake-agent
+        shim, unexpected-exit classification, scenario K, packaging and the run-scoped
+        cursor -- and this head has not been run against 1.4.184. So it is preserved as
+        a historical observation and REFUSED as a runtime, exactly like any other
+        version this head has not been run against. This test asserts that negative
+        directly: an assertion that merely stopped checking membership would leave the
+        wrong claim re-addable without any test noticing.
+        """
+        self.assertNotIn("1.4.184", SUPPORTED_ORCA_APP_VERSIONS)
+        self.assertIn("1.4.184", HISTORICAL_ORCA_APP_VERSION_OBSERVATIONS)
+        with self.assertRaisesRegex(UnsupportedOrcaContract, "installed runtime"):
+            validate_orca_contract(
+                "1.4.184", self.LIVE_ORCHESTRATION_GUIDE, self.LIVE_CLI_GUIDE
+            )
+
+    def test_the_historical_record_is_preserved_and_grants_nothing(self) -> None:
+        """The historical observations are kept, and none of them is a support claim.
+
+        Both prior point observations stay named in the code so the evidence is not
+        lost, and NEITHER is consulted by the gate: every historical version is
+        refused by validate_orca_contract(), and the two tuples are disjoint.
+        """
+        self.assertEqual(
+            HISTORICAL_ORCA_APP_VERSION_OBSERVATIONS, ("1.4.178-rc.2", "1.4.184")
+        )
+        self.assertEqual(
+            set(SUPPORTED_ORCA_APP_VERSIONS)
+            & set(HISTORICAL_ORCA_APP_VERSION_OBSERVATIONS),
+            set(),
+        )
+        for historical in HISTORICAL_ORCA_APP_VERSION_OBSERVATIONS:
+            with self.subTest(version=historical):
+                with self.assertRaisesRegex(
+                    UnsupportedOrcaContract, "installed runtime"
+                ):
+                    validate_orca_contract(
+                        historical,
+                        self.LIVE_ORCHESTRATION_GUIDE,
+                        self.LIVE_CLI_GUIDE,
+                    )
+
+    def test_the_current_support_set_is_exactly_the_runtime_this_head_ran_on(
+        self,
+    ) -> None:
+        """One entry, and it is the runtime the Step 4 evidence in this PR came from."""
+        self.assertEqual(SUPPORTED_ORCA_APP_VERSIONS, ("1.4.196",))
+        self.assertEqual(SUPPORTED_ORCA_APP_VERSION, "1.4.196")
+
+    def test_the_gate_is_set_membership_and_never_a_range(self) -> None:
+        """A version BETWEEN or AFTER two point verifications is still unverified.
+
+        This is the assertion that keeps the fix from becoming the compatibility-range
+        claim OS-41 forbids: 1.4.190 sits between the historical 1.4.184 observation
+        and the verified point, 1.4.197 sits just past it, and neither is admissible.
+        1.4.184 itself is in the list for the same reason after PR #29 review MAJOR-2 --
+        being a prior observation is not being a supported runtime.
+        """
+        for unverified in (
+            "1.4.184",
+            "1.4.185",
+            "1.4.190",
+            "1.4.197",
+            "1.5.0",
+            "1.4.19",
+        ):
+            with self.subTest(version=unverified):
+                self.assertNotIn(unverified, SUPPORTED_ORCA_APP_VERSIONS)
+                with self.assertRaisesRegex(
+                    UnsupportedOrcaContract, "installed runtime"
+                ):
+                    validate_orca_contract(
+                        unverified,
+                        self.LIVE_ORCHESTRATION_GUIDE,
+                        self.LIVE_CLI_GUIDE,
+                    )
+
+    def test_an_unreported_app_version_fails_closed_as_unknown_identity(self) -> None:
+        """Absent identity is not a version mismatch and must not read as one."""
+        for missing in ("", "   ", None, 1.4196, {"appVersion": "1.4.196"}):
+            with self.subTest(app_version=missing):
+                with self.assertRaisesRegex(
+                    UnsupportedOrcaContract, "did not report an app version"
+                ):
+                    validate_orca_contract(
+                        missing,  # type: ignore[arg-type]
+                        self.LIVE_ORCHESTRATION_GUIDE,
+                        self.LIVE_CLI_GUIDE,
+                    )
+
+    def test_a_listed_version_still_needs_the_pinned_guide_grammar(self) -> None:
+        """Listing a version never exempts it from the grammar check."""
+        for listed in SUPPORTED_ORCA_APP_VERSIONS:
+            with self.subTest(version=listed):
+                with self.assertRaisesRegex(UnsupportedOrcaContract, "pinned grammar"):
+                    validate_orca_contract(listed, "", "")
+
+
+class Os41WorkerStartAcknowledgementTests(OfflineHarnessTestCase):
+    """OS-41 D1: a non-ready worker-start is not a supervised attachment.
+
+    Orca 1.4.196 answers a `worker-start` that never reached a running worker with
+    `ok: true` and a launch result carrying `state: "failed"`, `failedStage:
+    "dispatch_input"`, `lastError: "agent_prompt_stalled"` -- and a `dispatchId`,
+    because the Dispatch row really was created. Reading that id and returning
+    `supervised=True` is precisely "prompt delivery inferred from Task/Dispatch
+    existence alone", and it is what the harness did before this fix.
+    """
+
+    STALLED_START = {
+        "runId": "run_offline",
+        "taskId": "task_g",
+        "dispatchId": "ctx_1",
+        "state": "failed",
+        "stage": "dispatch_input",
+        "failedStage": "dispatch_input",
+        "lastError": "agent_prompt_stalled",
+        "effects": [{"kind": "terminal", "role": "agent", "action": "reused",
+                     "id": "term_worker"}],
+        "residualResources": [],
+    }
+
+    def test_a_stalled_prompt_is_not_recorded_as_a_supervised_worker(self) -> None:
+        recorder = RecordingExec(results={"worker-start": self.STALLED_START})
+        harness = self.build(recorder)
+        self.worker_terminal(harness, owner_dispatch_id=None)
+
+        with self.assertRaisesRegex(
+            OrcaRuntimeError, "worker-start did not reach a ready worker"
+        ):
+            harness.start_worker("task_g", "term_worker", "spec")
+
+        # The ledger must not carry a supervised adoption for a start that failed,
+        # and the ladder must not silently descend either: a Dispatch already exists,
+        # so a second one would settle under the wrong identity.
+        row = harness.ledger_terminal("term_worker")
+        self.assertNotEqual(row["created_by"], "supervised_adopted")
+        self.assertIsNone(row["owner_dispatch_id"])
+        self.assertEqual(recorder.verbs, ["wait", "worker-start"])
+        self.assertNotIn("dispatch", recorder.verbs)
+        self.assertNotIn("send", recorder.verbs)
+
+    def test_the_failure_message_carries_the_whole_launch_diagnosis(self) -> None:
+        """A fail-closed refusal is only useful if it says what the runtime reported."""
+        recorder = RecordingExec(results={"worker-start": self.STALLED_START})
+        harness = self.build(recorder)
+        self.worker_terminal(harness, owner_dispatch_id=None)
+
+        with self.assertRaises(OrcaRuntimeError) as caught:
+            harness.start_worker("task_g", "term_worker", "spec")
+
+        message = str(caught.exception)
+        for fragment in ("dispatch_input", "agent_prompt_stalled", "ctx_1"):
+            self.assertIn(fragment, message)
+
+    def test_every_non_ready_launch_state_fails_closed(self) -> None:
+        """`ready` is the only admissible state; unknown states are not guessed."""
+        for state in ("failed", "outcome_unknown", "starting", "cancelled", "??"):
+            with self.subTest(state=state):
+                recorder = RecordingExec(
+                    results={"worker-start": {**self.STALLED_START, "state": state}}
+                )
+                harness = self.build(recorder)
+                self.worker_terminal(harness, owner_dispatch_id=None)
+                with self.assertRaisesRegex(
+                    OrcaRuntimeError, "worker-start did not reach a ready worker"
+                ):
+                    harness.start_worker("task_g", "term_worker", "spec")
+
+    def test_a_ready_launch_state_still_attaches(self) -> None:
+        recorder = RecordingExec(
+            results={
+                "worker-start": {
+                    "dispatchId": "ctx_1",
+                    "state": WORKER_START_READY_STATE,
+                }
+            }
+        )
+        harness = self.build(recorder)
+        self.worker_terminal(harness, owner_dispatch_id=None)
+
+        self.assertEqual(
+            harness.start_worker("task_g", "term_worker", "spec"), ("ctx_1", True)
+        )
+        self.assertEqual(
+            harness.ledger_terminal("term_worker")["created_by"], "supervised_adopted"
+        )
+
+    # ---- BUGFIX-I1-MAJOR-1: the stateless receipt is VERSION-CONDITIONAL ----
+    #
+    # Iteration 1 accepted a success receipt with no `state` unconditionally, so a
+    # malformed 1.4.196 receipt was written to the ledger as `supervised_adopted`.
+    # The allowance is now bound to the one runtime whose receipts actually lack the
+    # field. These four tests are the guard: remove the version condition and the
+    # rejection cases below start passing where they must fail.
+
+    STATELESS = {"dispatchId": "ctx_1"}
+
+    def stateless_harness(self, app_version: str) -> tuple[Any, RecordingExec]:
+        recorder = RecordingExec(results={"worker-start": dict(self.STATELESS)})
+        harness = self.build(recorder)
+        harness.orca_app_version = app_version
+        self.worker_terminal(harness, owner_dispatch_id=None)
+        return harness, recorder
+
+    def test_a_stateless_receipt_is_accepted_under_the_1_4_184_identity(self) -> None:
+        """The HISTORICAL 1.4.184 reading, preserved offline only.
+
+        1.4.184 receipts carry no `state` key, and that reading is kept so a future
+        revision that re-verifies the runtime does not have to re-derive it. PR #29
+        review MAJOR-2: 1.4.184 is no longer in SUPPORTED_ORCA_APP_VERSIONS, so
+        preflight() can no longer produce this identity and the allowance is
+        unreachable from a live run -- the identity is set directly here. Live
+        behaviour is strictly fail-closed either way: validate_orca_contract() refuses
+        that runtime long before start_worker() is reached.
+        """
+        self.assertNotIn(
+            WORKER_START_STATELESS_RECEIPT_VERSION, SUPPORTED_ORCA_APP_VERSIONS
+        )
+        harness, _ = self.stateless_harness("1.4.184")
+
+        self.assertEqual(
+            harness.start_worker("task_g", "term_worker", "spec"), ("ctx_1", True)
+        )
+        self.assertEqual(
+            harness.ledger_terminal("term_worker")["created_by"], "supervised_adopted"
+        )
+
+    def test_a_stateless_receipt_is_rejected_under_the_1_4_196_identity(self) -> None:
+        """The finding's own example: {"dispatchId": "ctx_1"} from 1.4.196.
+
+        On 1.4.196 `state` is the field that carries the launch outcome, so a success
+        receipt without one is missing lifecycle evidence, not a legacy shape.
+        """
+        harness, recorder = self.stateless_harness("1.4.196")
+
+        with self.assertRaisesRegex(
+            OrcaRuntimeError, "success receipt with no launch state"
+        ):
+            harness.start_worker("task_g", "term_worker", "spec")
+
+        # Rejected BEFORE any ledger attachment, and without descending the ladder.
+        row = harness.ledger_terminal("term_worker")
+        self.assertNotEqual(row["created_by"], "supervised_adopted")
+        self.assertIsNone(row["owner_dispatch_id"])
+        self.assertEqual(recorder.verbs, ["wait", "worker-start"])
+
+    def test_a_stateless_receipt_is_rejected_when_no_runtime_was_identified(
+        self,
+    ) -> None:
+        """A harness that never ran preflight() has proven no identity, so it may not
+        inherit another runtime's exception. This is the constructor default."""
+        recorder = RecordingExec(results={"worker-start": dict(self.STATELESS)})
+        harness = self.build(recorder)
+        self.assertEqual(harness.orca_app_version, "")
+        self.worker_terminal(harness, owner_dispatch_id=None)
+
+        with self.assertRaisesRegex(OrcaRuntimeError, "this harness has validated no runtime"):
+            harness.start_worker("task_g", "term_worker", "spec")
+
+    def test_the_stateless_allowance_is_not_extended_to_other_versions(self) -> None:
+        """Pinned to the exact string -- not "older than 1.4.196", not "any listed
+        point". A future point observation must earn its own receipt."""
+        for version in ("1.4.196", "1.4.185", "1.4.197", "1.4.18", "1.4.1840", ""):
+            with self.subTest(app_version=version):
+                harness, _ = self.stateless_harness(version)
+                with self.assertRaises(OrcaRuntimeError):
+                    harness.start_worker("task_g", "term_worker", "spec")
+
+    def test_the_validated_version_is_only_written_after_the_contract_passes(
+        self,
+    ) -> None:
+        """The allowance can never be unlocked by an unverified version string."""
+        recorder = RecordingExec(
+            results={"status": {"runtime": {"state": "ready", "appVersion": "1.4.184"}}}
+        )
+        harness = self.build(recorder)
+        with patch(
+            "scripts.orca_runtime_harness.validate_orca_contract",
+            side_effect=UnsupportedOrcaContract("nope"),
+        ), patch("scripts.orca_runtime_harness.subprocess.run") as run:
+            run.return_value = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="", stderr=""
+            )
+            with self.assertRaises(UnsupportedOrcaContract):
+                harness.preflight()
+
+        self.assertEqual(harness.orca_app_version, "")
+
+    def test_agent_unconfigured_still_descends_one_rung(self) -> None:
+        """Control: the one branch signal is unchanged by the new gate.
+
+        This is the branch the 1.4.196 fake-agent path actually takes, so it is the
+        one that must keep working.
+        """
+        recorder = RecordingExec(errors={"worker-start": {"code": "agent_unconfigured"}})
+        harness = self.build(recorder)
+        self.worker_terminal(harness, owner_dispatch_id=None)
+
+        self.assertEqual(
+            harness.start_worker("task_g", "term_worker", "spec"), ("ctx_1", False)
+        )
+        self.assertEqual(recorder.verbs, ["wait", "worker-start", "dispatch", "send"])
+
+
+class Os41DispatchReadinessTests(unittest.TestCase):
+    """OS-41 D2: the fake agent waits for an active Dispatch instead of exiting.
+
+    On 1.4.196 `worker-start` delivers the injected prompt while the Dispatch row is
+    still `pending` and promotes it to `dispatched` only once its start composition
+    finishes. The agent used to compare against `dispatched` exactly once and exit --
+    which ended the agent process mid-start and turned the whole `worker-start` into
+    `dispatch_inactive`. Acting on `pending` is not the fix either: the runtime
+    rejects a `worker_done` sent against a pending Dispatch as an inactive dispatch.
+    """
+
+    ORCA = "/opt/orca-dev"
+
+    def show(self, status: str) -> subprocess.CompletedProcess:
+        return subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=json.dumps({"result": {"dispatch": {"status": status}}}),
+            stderr="",
+        )
+
+    def test_an_already_active_dispatch_returns_on_the_first_look(self) -> None:
+        """The 1.4.184 shape: one command, no waiting."""
+        with patch("scripts.orca_fake_agent.subprocess.run") as run:
+            run.return_value = self.show(ACTIVE_DISPATCH_STATUS)
+            confirm_dispatch_ready("ctx_1", self.ORCA)
+        self.assertEqual(run.call_count, 1)
+
+    def test_a_starting_dispatch_is_waited_out_not_treated_as_fatal(self) -> None:
+        """The 1.4.196 shape: `pending` first, `dispatched` once the start finishes."""
+        self.assertIn("pending", STARTING_DISPATCH_STATUSES)
+        with patch("scripts.orca_fake_agent.subprocess.run") as run, patch(
+            "scripts.orca_fake_agent.time.sleep"
+        ):
+            run.side_effect = [
+                self.show("pending"),
+                self.show("pending"),
+                self.show(ACTIVE_DISPATCH_STATUS),
+            ]
+            confirm_dispatch_ready("ctx_1", self.ORCA)
+        self.assertEqual(run.call_count, 3)
+
+    def test_a_settled_or_unknown_dispatch_still_fails_closed_immediately(self) -> None:
+        for status in ("completed", "failed", "abandoned", "", "dispatchd"):
+            with self.subTest(status=status):
+                with patch("scripts.orca_fake_agent.subprocess.run") as run, patch(
+                    "scripts.orca_fake_agent.time.sleep"
+                ):
+                    run.return_value = self.show(status)
+                    with self.assertRaises(SystemExit):
+                        confirm_dispatch_ready("ctx_1", self.ORCA)
+                # refused on the first look; never waited out
+                self.assertEqual(run.call_count, 1)
+
+    def test_a_dispatch_that_never_becomes_active_fails_closed_on_the_deadline(
+        self,
+    ) -> None:
+        """Bounded: a permanently pending Dispatch exits rather than hanging."""
+        with patch("scripts.orca_fake_agent.subprocess.run") as run, patch(
+            "scripts.orca_fake_agent.time.sleep"
+        ), patch("scripts.orca_fake_agent.time.monotonic", side_effect=[0.0, 10.0, 1e9]):
+            run.return_value = self.show("pending")
+            with self.assertRaises(SystemExit) as caught:
+                confirm_dispatch_ready("ctx_1", self.ORCA)
+        self.assertIn("without becoming active", str(caught.exception))
+
+
+
+
+class Os41RuntimeExitReportTests(OfflineHarnessTestCase):
+    """OS-41 D3 / BUGFIX-I1-MAJOR-2: the runtime's own exit report, narrowly identified.
+
+    Both constants below are VERBATIM from receipts captured off the live Orca 1.4.196
+    runtime in a single session -- one scenario that lets a dispatched agent die, and
+    one that lets the fake worker send its own `Blocked:` escalation:
+
+      runtime  subject "Agent exited unexpectedly (Agent process ended; this host
+                        cannot report why)", priority "high",
+               payload {taskId, dispatchId, exitCode, exitCause{kind,reason}, handle}
+      agent    subject "Blocked: deterministic fake", priority "normal",
+               payload {taskId, dispatchId}                            <- ID-ONLY
+
+    Iteration 1 admitted any `escalation` whose payload carried the two ids, so the
+    agent message on the right satisfied Scenario E while proving nothing about the
+    runtime behaviour the fix claims to recognize. Every negative below fails if the
+    corresponding clause is removed from _runtime_exit_report_defects().
+
+    WHAT PROVES WHAT. The shape difference above is real, but it is NOT authorship
+    evidence: `orca orchestration send` accepts `--subject`, `--priority` and arbitrary
+    `--payload`, so a dispatched agent can reproduce every field in the runtime row,
+    `exitCode`/`exitCause`/`handle` included. Those clauses are identity and shape
+    validation plus defence in depth. The one authorship discriminator is the
+    top-level stored `sender_pane_key` -- a field on the message record rather than in
+    the payload, and therefore not reachable by any `orchestration send` flag --
+    required present-and-null. The provenance tests near the end of this class are the
+    ones that stop a full-shape worker-authored escalation being read as runtime
+    evidence.
+    """
+
+    TASK_ID = "task_g"
+    DISPATCH_ID = "ctx_1"
+    TERMINAL = "term_worker"
+    # A real pane key, shaped like the captured one: "<tab uuid>:<pane uuid>".
+    WORKER_PANE_KEY = "f784d681-0e63-44b5-aec0-99011619ee32:6757cf02-95c3-44a3-80bf-1d63a64d8621"
+
+    def runtime_report(self, **payload_overrides: Any) -> dict:
+        """The live 1.4.196 runtime receipt, field for field."""
+        payload = {
+            "taskId": self.TASK_ID,
+            "dispatchId": self.DISPATCH_ID,
+            "exitCode": 0,
+            "exitCause": {"kind": "unknown", "reason": "host_status_unavailable"},
+            "handle": self.TERMINAL,
+        }
+        for key, value in payload_overrides.items():
+            if value is self.ABSENT:
+                payload.pop(key, None)
+            else:
+                payload[key] = value
+        return {
+            "id": "msg_exit",
+            "type": "escalation",
+            "priority": "high",
+            "subject": (
+                "Agent exited unexpectedly (Agent process ended; this host cannot "
+                "report why)"
+            ),
+            # PRESENT and null -- verified on the captured receipt with an explicit
+            # `"sender_pane_key" in message` check, not inferred from `.get()`.
+            "sender_pane_key": None,
+            "payload": json.dumps(payload),
+        }
+
+    ABSENT = object()
+
+    def agent_escalation(self) -> dict:
+        """The fake worker's own escalation, field for field, naming the SAME round."""
+        return {
+            "id": "msg_agent",
+            "type": "escalation",
+            "priority": "normal",
+            "subject": "Blocked: deterministic fake",
+            "sender_pane_key": self.WORKER_PANE_KEY,
+            "payload": json.dumps(
+                {"taskId": self.TASK_ID, "dispatchId": self.DISPATCH_ID}
+            ),
+        }
+
+    def checkpoint(self, *messages: dict) -> dict:
+        return {"deliveryId": "dlv_exit", "timedOut": False, "messages": list(messages)}
+
+    def classify(self, checkpoint: dict) -> list:
+        harness = self.build(RecordingExec())
+        return harness._classify_exit_checkpoint(
+            checkpoint,
+            dispatch_id=self.DISPATCH_ID,
+            task_id=self.TASK_ID,
+            terminal=self.TERMINAL,
+        )
+
+    def assert_rejected(self, message: dict, *fragments: str) -> None:
+        with self.assertRaises(OrcaRuntimeError) as caught:
+            self.classify(self.checkpoint(message))
+        text = str(caught.exception)
+        self.assertIn("unexpected exit produced a lifecycle message", text)
+        for fragment in fragments:
+            self.assertIn(fragment, text)
+
+    # ---- positives ---------------------------------------------------------
+
+    def test_the_live_1_4_196_receipt_is_accepted(self) -> None:
+        self.assertEqual(len(self.classify(self.checkpoint(self.runtime_report()))), 1)
+
+    def test_an_empty_delivery_is_still_the_1_4_184_answer(self) -> None:
+        self.assertEqual(self.classify(self.checkpoint()), [])
+
+    def test_an_unobserved_exit_cause_is_still_accepted(self) -> None:
+        """kind/reason are shape-checked, NOT allowlisted: only one cause has ever
+        been observed, and pinning it would reject a genuine report of another."""
+        self.assertEqual(
+            len(
+                self.classify(
+                    self.checkpoint(
+                        self.runtime_report(
+                            exitCode=137,
+                            exitCause={"kind": "signalled", "reason": "sigkill"},
+                        )
+                    )
+                )
+            ),
+            1,
+        )
+
+    # ---- the finding's four required negatives -----------------------------
+
+    def test_an_ordinary_agent_escalation_with_matching_ids_is_rejected(self) -> None:
+        """The exact message the fake worker really sends, naming the same round."""
+        self.assert_rejected(
+            self.agent_escalation(),
+            "subject='Blocked: deterministic fake'",
+            "priority='normal'",
+            "exitCode=None",
+        )
+
+    def test_an_id_only_escalation_is_rejected(self) -> None:
+        """Type plus two ids was the whole iteration-1 test, and is not a
+        discriminator: it is what the agent message above already satisfies."""
+        self.assert_rejected(
+            {
+                "id": "msg_ids_only",
+                "type": "escalation",
+                "payload": json.dumps(
+                    {"taskId": self.TASK_ID, "dispatchId": self.DISPATCH_ID}
+                ),
+            },
+            "exitCode=None",
+            "exitCause=None",
+            "handle=None",
+        )
+
+    def test_a_missing_or_invalid_exit_cause_is_rejected(self) -> None:
+        for label, override in (
+            ("absent", self.ABSENT),
+            ("null", None),
+            ("string", "unknown"),
+            ("list", ["unknown"]),
+            ("empty object", {}),
+            ("kind only", {"kind": "unknown"}),
+            ("reason only", {"reason": "host_status_unavailable"}),
+            ("blank kind", {"kind": "  ", "reason": "host_status_unavailable"}),
+            ("non-string reason", {"kind": "unknown", "reason": 7}),
+        ):
+            with self.subTest(exitCause=label):
+                self.assert_rejected(self.runtime_report(exitCause=override))
+
+    def test_a_missing_or_mismatched_handle_is_rejected(self) -> None:
+        """The third identity binding: the runtime names the terminal whose process
+        ended, and it must be the terminal this observation is about."""
+        for label, override in (
+            ("absent", self.ABSENT),
+            ("null", None),
+            ("another terminal", "term_someone_else"),
+            ("empty", ""),
+        ):
+            with self.subTest(handle=label):
+                self.assert_rejected(self.runtime_report(handle=override), "handle=")
+
+    # ---- the rest of the shape --------------------------------------------
+
+    def test_a_missing_or_non_integer_exit_code_is_rejected(self) -> None:
+        for label, override in (
+            ("absent", self.ABSENT),
+            ("null", None),
+            ("string", "0"),
+            # bool is a subclass of int and is not an exit code.
+            ("bool", True),
+            ("float", 0.0),
+        ):
+            with self.subTest(exitCode=label):
+                self.assert_rejected(self.runtime_report(exitCode=override), "exitCode=")
+
+    def test_a_foreign_subject_or_priority_is_rejected(self) -> None:
+        report = self.runtime_report()
+        self.assert_rejected({**report, "subject": "Blocked: something"}, "subject=")
+        self.assert_rejected({**report, "subject": None}, "subject=")
+        self.assert_rejected({**report, "priority": "normal"}, "priority=")
+
+    def test_an_exit_report_for_another_dispatch_is_a_violation(self) -> None:
+        """Identity is proven from the payload, never from the message existing."""
+        self.assert_rejected(self.runtime_report(dispatchId="ctx_other"), "dispatchId=")
+        self.assert_rejected(self.runtime_report(taskId="task_other"), "taskId=")
+
+    def test_a_worker_done_in_that_delivery_is_still_a_violation(self) -> None:
+        """The scenario's actual claim: this dispatch produced no lifecycle result."""
+        settled = {
+            "id": "msg_done",
+            "type": "worker_done",
+            "payload": json.dumps(
+                {
+                    "taskId": self.TASK_ID,
+                    "dispatchId": self.DISPATCH_ID,
+                    "outcome": "succeeded",
+                }
+            ),
+        }
+        self.assert_rejected(settled, "type='worker_done'")
+        with self.assertRaises(OrcaRuntimeError):
+            self.classify(self.checkpoint(self.runtime_report(), settled))
+
+    def test_an_unparseable_or_non_object_payload_fails_closed(self) -> None:
+        report = self.runtime_report()
+        for payload in ("not json", "[1, 2]", '"a string"', None, ""):
+            with self.subTest(payload=payload):
+                self.assert_rejected({**report, "payload": payload})
+
+    # ---- FINAL-I1-MAJOR-1: authorship, the only clause an agent cannot reproduce --
+    #
+    # Every other clause is forgeable: `orca orchestration send` accepts --subject,
+    # --priority and --payload, so a dispatched agent can reproduce the runtime's
+    # subject, its `high` priority and every payload field. `sender_pane_key` is a
+    # top-level stored field on the message record, not a payload member, so no send
+    # flag reaches it. These tests are the ones that stop a worker-authored message
+    # being read as runtime evidence.
+
+    def test_the_reviewers_attack_full_shape_with_worker_provenance_is_rejected(
+        self,
+    ) -> None:
+        """FINAL-I1-MAJOR-1, reproduced exactly.
+
+        Type `escalation`, the runtime subject prefix, priority `high`, matching
+        Task/Dispatch/terminal identity, valid exit fields -- and a NON-NULL worker
+        pane key. This returned `[]` (accepted) before the provenance clause existed.
+        A dispatch could publish it and exit without `worker_done`, and the checkpoint
+        would have treated it as the runtime's own report.
+        """
+        spoof = {**self.runtime_report(), "sender_pane_key": "pane:worker"}
+
+        self.assert_rejected(spoof, "sender_pane_key='pane:worker'")
+
+        # And the same message with a realistically-shaped pane key.
+        self.assert_rejected(
+            {**self.runtime_report(), "sender_pane_key": self.WORKER_PANE_KEY},
+            "sender_pane_key=",
+        )
+
+    def test_an_absent_provenance_field_is_rejected_not_read_as_null(self) -> None:
+        """Absent must NOT be equivalent to the runtime's null.
+
+        `.get("sender_pane_key")` returns None for both a present-null field and an
+        omitted one, which is exactly why presence is checked separately. Under a
+        fail-closed policy "indistinguishable" is a reason to reject.
+        """
+        without = {
+            key: value
+            for key, value in self.runtime_report().items()
+            if key != "sender_pane_key"
+        }
+        self.assertNotIn("sender_pane_key", without)
+
+        self.assert_rejected(without, "sender_pane_key absent")
+
+    def test_a_present_null_provenance_is_what_the_runtime_actually_sends(
+        self,
+    ) -> None:
+        """The positive half: the captured receipt carries the key, set to null."""
+        report = self.runtime_report()
+        self.assertIn("sender_pane_key", report)
+        self.assertIsNone(report["sender_pane_key"])
+        self.assertEqual(len(self.classify(self.checkpoint(report))), 1)
+
+    def test_a_falsy_lookalike_provenance_is_still_worker_authored(self) -> None:
+        """Only the runtime's null passes; "", 0 and False are not null."""
+        for lookalike in ("", 0, False, "null", "None", []):
+            with self.subTest(sender_pane_key=lookalike):
+                self.assert_rejected(
+                    {**self.runtime_report(), "sender_pane_key": lookalike},
+                    "sender_pane_key=",
+                )
+
+    def test_every_failing_clause_is_named_rather_than_short_circuited(self) -> None:
+        """A refusal must say WHICH clauses failed, so a clause that stops being
+        enforced is caught by the name that stops appearing."""
+        harness = self.build(RecordingExec())
+        defects = harness._runtime_exit_report_defects(
+            self.agent_escalation(),
+            dispatch_id=self.DISPATCH_ID,
+            task_id=self.TASK_ID,
+            terminal=self.TERMINAL,
+        )
+        joined = " ".join(defects)
+        for expected in (
+            "subject=",
+            "priority=",
+            "sender_pane_key=",
+            "exitCode=",
+            "exitCause=",
+            "handle=",
+        ):
+            self.assertIn(expected, joined)
+        self.assertEqual(
+            harness._runtime_exit_report_defects(
+                self.runtime_report(),
+                dispatch_id=self.DISPATCH_ID,
+                task_id=self.TASK_ID,
+                terminal=self.TERMINAL,
+            ),
+            [],
+        )
+
+
+class Os41RunScopedDecisionCursorTests(OfflineHarnessTestCase):
+    """OS-41 D4: the OS-29 decision-gate cursor is per-Run, not per-harness.
+
+    One OrcaRuntimeHarness starts several Runs in sequence. A new Run opens a ledger
+    whose only record is its own run-entry declaration, so carrying the previous
+    Run's settled round forward makes admit_head() refuse that Run's legitimate first
+    boundary as DECISION_GATE_INPUT_UNBOUND. That is what the 1.4.196 suite hit on
+    Scenario B's first dispatch -- the multi-Run sequence is exercised only by the
+    opt-in runtime suite, which had been skipping since the version pin.
+    """
+
+    def test_start_run_clears_the_previous_runs_settled_round(self) -> None:
+        recorder = RecordingExec(results={"run-create": {"run": {"id": "run_second"}}})
+        harness = self.build(recorder)
+        harness._last_settled = ("run_first", "implementation", 1)
+
+        harness.start_run("second run")
+
+        self.assertIsNone(harness._last_settled)
+
+    def test_start_run_clears_a_previous_runs_armed_verification(self) -> None:
+        recorder = RecordingExec(results={"run-create": {"run": {"id": "run_second"}}})
+        harness = self.build(recorder)
+        harness._pending_verification = object()
+
+        harness.start_run("second run")
+
+        self.assertIsNone(harness._pending_verification)
 
 
 

@@ -184,7 +184,7 @@ class ReleasePackageTests(unittest.TestCase):
             verify_archive(first)
             with tarfile.open(first, mode="r:gz") as archive:
                 shim = archive.getmember(
-                    f"orca-skills-{read_version()}/scripts/fake_bin/codex"
+                    f"orca-skills-{read_version()}/scripts/fake_bin/fake-agent"
                 )
             self.assertEqual(shim.mode, 0o755)
             self.assertEqual(
@@ -193,8 +193,8 @@ class ReleasePackageTests(unittest.TestCase):
             )
 
     def test_executable_manifest_matches_runtime_shim(self) -> None:
-        self.assertEqual(EXECUTABLE_FILES, {"scripts/fake_bin/codex"})
-        self.assertTrue((REPO_ROOT / "scripts/fake_bin/codex").stat().st_mode & 0o111)
+        self.assertEqual(EXECUTABLE_FILES, {"scripts/fake_bin/fake-agent"})
+        self.assertTrue((REPO_ROOT / "scripts/fake_bin/fake-agent").stat().st_mode & 0o111)
 
     def test_missing_required_skill_file_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
