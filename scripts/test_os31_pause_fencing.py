@@ -565,6 +565,58 @@ class RepeatedPauseGenerationE2ETests(PauseFixture):
 
 
 # ======================================================================================
+# C5 -- the closed schema the recovery is expressed in
+# ======================================================================================
+class ContinuationSchemaTests(unittest.TestCase):
+    """CRITICAL 1: the three durable facts, and the codes that report them, are closed."""
+
+    def test_the_applied_stage_distinguishes_intent_from_continuation(self):
+        self.assertEqual(pause_policy.APPLIED_STAGES,
+                         ("RECORDED", "CONTINUING", "RESUMED"),
+                         "resume intent, graph continuation and completed effect are "
+                         "three durable facts, not two")
+        self.assertEqual(pause_policy.APPLIED_IN_FLIGHT_STAGES,
+                         ("RECORDED", "CONTINUING"))
+        self.assertNotIn("RESUMED", pause_policy.APPLIED_IN_FLIGHT_STAGES,
+                         "a promoted bundle is finished and is not recovered again")
+
+    def test_the_new_codes_are_closed_and_the_three_sets_stay_disjoint(self):
+        self.assertIn("PAUSE_CONTINUATION_UNRECOVERABLE",
+                      pause_policy.PAUSE_REFUSAL_CODES)
+        self.assertEqual(pause_policy.PAUSE_RECOVERY_CODES,
+                         frozenset({"PAUSE_CONTINUATION_RECOVERED",
+                                    "PAUSE_CONTINUATION_ALREADY_COMPLETE"}))
+        for other in (pause_policy.PAUSE_REFUSAL_CODES,
+                      pause_policy.PAUSE_REVALIDATION_CODES):
+            self.assertEqual(pause_policy.PAUSE_RECOVERY_CODES & other, frozenset(),
+                             "a recovery is neither a refusal nor a revalidation")
+        # ...and the refusal really is refusable, i.e. it is a legal PauseRefused code.
+        with self.assertRaises(pause_policy.PauseRefused) as ctx:
+            raise pause_policy.PauseRefused("PAUSE_CONTINUATION_UNRECOVERABLE", "x")
+        self.assertEqual(ctx.exception.code, "PAUSE_CONTINUATION_UNRECOVERABLE")
+
+    def test_the_record_schema_accepts_a_continuing_bundle_and_nothing_else_new(self):
+        stored = record(applied={"bundle_1": {
+            "resume_bundle_id": "bundle_1", "request_id": "request_1",
+            "items": [{"decision_item_id": "item_a", "decision_id": "d1"}],
+            "stage": "CONTINUING", "recorded_at": "2026-01-01T00:00:00Z",
+            "resumed_at": "", "resumed_checkpoint_id": ""}})
+        self.assertEqual(pause_store.validate_pause_record(RUN, stored)["applied"]
+                         ["bundle_1"]["stage"], "CONTINUING")
+        with self.assertRaises(pause_store.PauseRecordCorrupt):
+            pause_store.validate_pause_record(RUN, record(applied={"bundle_1": {
+                **stored["applied"]["bundle_1"], "stage": "INVENTED"}}))
+
+    def test_in_flight_bundle_is_pure_and_reads_only_the_record(self):
+        self.assertIsNone(pause_policy.in_flight_bundle({"applied": {}}))
+        self.assertIsNone(pause_policy.in_flight_bundle(
+            {"applied": {"b": {"stage": "RESUMED"}}}))
+        for stage in pause_policy.APPLIED_IN_FLIGHT_STAGES:
+            self.assertEqual(pause_policy.in_flight_bundle(
+                {"applied": {"b": {"stage": stage}}})["stage"], stage)
+
+
+# ======================================================================================
 # crash boundaries
 # ======================================================================================
 class CrashingStore:
@@ -611,7 +663,12 @@ class ResumeCrashBoundaryTests(PauseFixture):
 
     RUN = "run_crashboundary"
 
+    def pause_store_for(self, owner_id, *, lease=pause_store.DEFAULT_LEASE_SECONDS):
+        return pause_store.store_for(self.RUN, artifact_base=self.base,
+                                     owner_id=owner_id, lease_seconds=lease)
+
     def attempt(self, paused, *, store=None, graph_wrapper=None,
+                observe_timeout_seconds=1.0,
                 results=(WORKER, REVIEW_PASS, REVIEW_PASS)):
         port = self.approval_port()
         adapter = self.adapter(results)
@@ -627,7 +684,8 @@ class ResumeCrashBoundaryTests(PauseFixture):
             current_repository=projection["repository_binding"],
             current_artifact=projection["artifact_binding"],
             current_policy_digest=projection["policy_digest"],
-            store=store, recursion_limit=300, observe_timeout_seconds=1.0)
+            store=store, recursion_limit=300,
+            observe_timeout_seconds=observe_timeout_seconds)
         return outcome, adapter
 
     def setUp(self):
@@ -647,57 +705,204 @@ class ResumeCrashBoundaryTests(PauseFixture):
         self.assertEqual(adapter.effect_count, 3, "exactly one round of effects")
 
     def test_a_crash_after_the_applied_write_and_before_the_checkpoint_update_re_drives(self):
+        """Boundary 2, and the safe half of the stage/checkpoint ordering.
+
+        ``CONTINUING`` is written strictly BEFORE ``update_state_command``, so a crash in
+        this window leaves the STAGE ahead of the CHECKPOINT.  That direction is the safe
+        one and is the whole point of the ordering: the head still carries the pause, so
+        C5 reads NOT_STARTED, the resume is re-driven from the top byte-identically, and
+        exactly one round of effects exists for the run.  The opposite direction -- a
+        checkpoint ahead of the stage -- is the state nothing could name, and this
+        ordering makes it unreachable.
+        """
         with self.assertRaises(CrashInjected):
             self.attempt(self.paused,
                          graph_wrapper=lambda graph: CrashingGraph(
                              graph, "before_checkpoint_update"))
         stored = self.store().read(self.RUN)
         self.assertEqual(len(stored["applied"]), 1)
-        self.assertEqual(next(iter(stored["applied"].values()))["stage"], "RECORDED")
+        self.assertEqual(next(iter(stored["applied"].values()))["stage"], "CONTINUING",
+                         "the intent to continue is durable before the head can move")
+        self.assertEqual(self.saver().head("t"), stored["checkpoint_id"],
+                         "the head did NOT move: the stage is ahead of the checkpoint")
+        self.assertEqual(
+            pause_runtime.continuation_evidence(stored, self.saver()),
+            pause_runtime.CONTINUATION_NOT_STARTED,
+            "durable evidence must say the continuation never committed")
         outcome, adapter = self.attempt(self.paused)
         self.assertEqual(outcome.status, "RESUMED", outcome.detail)
         self.assertEqual(adapter.effect_count, 3)
         self.assertEqual(self.store().read(self.RUN)["status"], "RESUMED")
 
-    def test_a_crash_after_the_checkpoint_update_refuses_rather_than_re_driving(self):
-        """The head moved without the effect committing: fail closed, never a second effect."""
+    def test_a_crash_after_the_checkpoint_update_is_recovered_to_a_terminal(self):
+        """Boundary 3 -- THE defect.  A successor recovers; it never refuses forever.
+
+        The head has moved to ACTIVE but no node has run, so the effect has NOT happened.
+        Refusing here (which is what ``STALE_CHECKPOINT_HEAD`` did) strands the run
+        permanently: ``reindex()`` cannot repair it either, because its repair direction
+        needs a head carrying WAITING_FOR_INPUT and this one carries ACTIVE.
+
+        What the successor must do instead is prove, from durable bytes alone, that this
+        head is this bundle's own committed continuation, and then finish it -- driving
+        the run to a terminal with the effect performed EXACTLY ONCE for the whole run,
+        not zero times and not twice.
+        """
         with self.assertRaises(CrashInjected):
             self.attempt(self.paused,
                          graph_wrapper=lambda graph: CrashingGraph(
                              graph, "after_checkpoint_update"))
+        # The durable evidence the successor reads, and nothing else.
+        crashed = self.store().read(self.RUN)
+        self.assertEqual(next(iter(crashed["applied"].values()))["stage"], "CONTINUING")
+        head_state = pause_runtime.reconstruct(
+            {**crashed, "checkpoint_id": self.saver().head("t")}, self.saver())
+        self.assertEqual(head_state["run_lifecycle"], "ACTIVE",
+                         "the head moved off the pause without the effect running")
+        self.assertEqual(pause_runtime.continuation_evidence(crashed, self.saver()),
+                         pause_runtime.CONTINUATION_COMMITTED)
+
         outcome, adapter = self.attempt(self.paused)
-        self.assertEqual(outcome.status, "REFUSED")
-        self.assertEqual(outcome.code, "STALE_CHECKPOINT_HEAD", outcome.detail)
-        self.assertEqual(adapter.effect_count, 0)
+        self.assertEqual(outcome.status, "RESUMED", outcome.detail)
+        self.assertEqual(outcome.code, "PAUSE_CONTINUATION_RECOVERED", outcome.detail)
+        self.assertTrue(outcome.effect_performed)
+        self.assertEqual(outcome.state["terminal_status"], "COMPLETED",
+                         "the successor drives the run to a terminal state")
+        self.assertEqual(adapter.effect_count, 3,
+                         "exactly ONE round of effects exists for the whole run")
         stored = self.store().read(self.RUN)
-        self.assertEqual(next(iter(stored["applied"].values()))["stage"], "RECORDED",
-                         "an unproven resume is never promoted")
-        self.assertEqual(stored["status"], "WAITING_FOR_INPUT")
+        self.assertEqual(next(iter(stored["applied"].values()))["stage"], "RESUMED")
+        self.assertEqual(stored["status"], "RESUMED")
+
+        # ...and it stays exactly-once: a third Coordinator performs no further effect.
+        again, again_adapter = self.attempt(self.paused)
+        self.assertEqual(again.status, "NO_EFFECT")
+        self.assertEqual(again.code, "RUN_ALREADY_RESUMED")
+        self.assertEqual(again_adapter.effect_count, 0)
 
     def test_a_crash_after_invoke_and_before_promotion_never_repeats_the_effect(self):
-        """The effect committed but the record never learned it: no second effect, ever.
+        """Boundary 4: the effect committed, the record never learned it.
 
-        The checkpoint -- the authority -- has moved past the pause, so the successor's C2
-        check refuses by name instead of re-driving a re-entry that already happened.  The
-        run is left exactly as the crash left it: the bundle stays RECORDED (an unproven
-        resume is never promoted) and no second round of effects exists anywhere.
+        This boundary IS durably distinguishable from boundary 3, and the persisted head
+        is what distinguishes it: boundary 3 leaves the head on the ACTIVE re-entry with
+        its supersteps still pending, boundary 4 leaves the head already SETTLED.  The
+        Tier-2 stage is ``CONTINUING`` in both cases -- the stage is deliberately the
+        weaker fact -- but Tier-1, the checkpoint, is the authority, and C5 reads it.  So
+        the two are reported by different codes: ``PAUSE_CONTINUATION_RECOVERED`` there,
+        ``PAUSE_CONTINUATION_ALREADY_COMPLETE`` here.
+
+        The original guarantee of this test is therefore kept exactly as it was -- the
+        committed effect is NEVER repeated -- and it is what the name still says.  What
+        changed is only the disposition of the RECORD.  Refusing with
+        ``STALE_CHECKPOINT_HEAD`` (the old behaviour) left the bundle permanently
+        ``RECORDED`` against a run that had already finished, and no repair path could
+        settle it.  Because the head is distinguishable, the successor can do better
+        without weakening anything: at a SETTLED head it recognises ALREADY_COMPLETE,
+        settles the record to match the checkpoint, and performs NO new effect.
+        """
+        crashing = self.pause_store_for("host:dead", lease=0.4)
+        with self.assertRaises(CrashInjected):
+            self.attempt(self.paused, store=crashing,
+                         graph_wrapper=lambda graph: CrashingGraph(graph, "after_invoke"))
+        crashed = self.store().read(self.RUN)
+        self.assertEqual(next(iter(crashed["applied"].values()))["stage"], "CONTINUING")
+        head_before = self.saver().head("t")
+        head_state = pause_runtime.reconstruct(
+            {**crashed, "checkpoint_id": head_before}, self.saver())
+        self.assertEqual(head_state["run_lifecycle"], "SETTLED",
+                         "the re-entry itself did commit, and ran to a terminal")
+        # ...and that is exactly what separates this boundary from boundary 3, whose head
+        # reconstructs to ACTIVE.  The durable states are NOT identical.
+        self.assertNotEqual(head_state["run_lifecycle"], "ACTIVE")
+
+        # A genuinely FRESH Coordinator: its own owner identity, so it has to observe the
+        # dead owner's lease lapse and take the run over before it may touch anything.
+        successor = self.pause_store_for("host:next", lease=0.4)
+        outcome, adapter = self.attempt(self.paused, store=successor,
+                                        observe_timeout_seconds=None)
+        self.assertEqual(outcome.status, "RESUMED", outcome.detail)
+        self.assertEqual(outcome.code, "PAUSE_CONTINUATION_ALREADY_COMPLETE",
+                         outcome.detail)
+        self.assertFalse(outcome.effect_performed,
+                         "a finished continuation performs nothing further")
+        self.assertEqual(adapter.effect_count, 0,
+                         "THE ORIGINAL GUARANTEE: the committed effect is never repeated")
+        self.assertEqual(self.saver().head("t"), head_before,
+                         "recovering a finished continuation moves no checkpoint")
+        stored = self.store().read(self.RUN)
+        self.assertEqual(next(iter(stored["applied"].values()))["stage"], "RESUMED",
+                         "the record is settled to match the checkpoint, not stranded")
+        self.assertEqual(stored["status"], "RESUMED")
+        self.assertEqual(stored["owner_id"], "host:next",
+                         "the run was settled by the fresh Coordinator, not the dead one")
+
+        # ...and it ends exactly-once: a further Coordinator performs no effect either.
+        again, again_adapter = self.attempt(self.paused)
+        self.assertEqual(again.status, "NO_EFFECT")
+        self.assertEqual(again.code, "RUN_ALREADY_RESUMED")
+        self.assertEqual(again_adapter.effect_count, 0,
+                         "the committed effect is still never repeated")
+
+    def test_a_genuinely_different_coordinator_recovers_the_stranded_continuation(self):
+        """Boundary 3 again, but the successor is a DIFFERENT owner identity.
+
+        The four boundary tests above already drop every in-memory object and rebuild the
+        driver over the same on-disk stores, which is what "a new Coordinator" means to
+        this fixture.  This one goes further and gives the successor its own ``owner_id``,
+        so it has to reach the run the way a real second machine does: observe the dead
+        owner's lease, watch it lapse, and take it over -- and only then recover.
+        """
+        crashing = self.pause_store_for("host:dead", lease=0.4)
+        with self.assertRaises(CrashInjected):
+            self.attempt(self.paused, store=crashing,
+                         graph_wrapper=lambda graph: CrashingGraph(
+                             graph, "after_checkpoint_update"))
+        successor = self.pause_store_for("host:next", lease=0.4)
+        outcome, adapter = self.attempt(self.paused, store=successor,
+                                        observe_timeout_seconds=None)
+        self.assertEqual(outcome.status, "RESUMED", outcome.detail)
+        self.assertEqual(outcome.code, "PAUSE_CONTINUATION_RECOVERED", outcome.detail)
+        self.assertEqual(outcome.state["terminal_status"], "COMPLETED")
+        self.assertEqual(adapter.effect_count, 3, "exactly one round of effects")
+        stored = self.store().read(self.RUN)
+        self.assertEqual(stored["status"], "RESUMED")
+        self.assertEqual(stored["owner_id"], "host:next")
+
+    def test_a_head_that_does_not_descend_from_the_pause_is_never_continued(self):
+        """The other half of C5: recovery is not "the head moved, so drive it".
+
+        A head that is neither the pause checkpoint nor a descendant of it is not this
+        bundle's continuation, and continuing it would drive a run this record does not
+        speak for.  That fails closed by name, and it is the one case in which a moved
+        head still refuses.
         """
         with self.assertRaises(CrashInjected):
             self.attempt(self.paused,
-                         graph_wrapper=lambda graph: CrashingGraph(graph, "after_invoke"))
-        stored = self.store().read(self.RUN)
-        self.assertEqual(next(iter(stored["applied"].values()))["stage"], "RECORDED")
-        head_state = pause_runtime.reconstruct(
-            {**stored, "checkpoint_id": self.saver().head("t")}, self.saver())
-        self.assertNotEqual(head_state["run_lifecycle"], "WAITING_FOR_INPUT",
-                            "the re-entry itself did commit before the crash")
+                         graph_wrapper=lambda graph: CrashingGraph(
+                             graph, "after_checkpoint_update"))
+        saver = self.saver()
+        crashed = self.store().read(self.RUN)
+        lineage = pause_runtime.checkpoint_lineage(saver, "t", "", saver.head("t"))
+        self.assertIn(crashed["checkpoint_id"], lineage)
+        root = lineage[-1]                       # predates the pause, so a fork off it
+        self.assertNotEqual(root, crashed["checkpoint_id"])
+        parent = {"configurable": {"thread_id": "t", "checkpoint_ns": "",
+                                   "checkpoint_id": root}}
+        tuple_ = saver.get_tuple(parent)
+        forked = dict(tuple_.checkpoint)
+        forked["id"] = "forked-off-the-root"
+        saver.put(parent, forked, dict(tuple_.metadata),
+                  dict(forked.get("channel_versions") or {}))
+        self.assertEqual(saver.head("t"), "forked-off-the-root")
+        self.assertNotIn(crashed["checkpoint_id"],
+                         pause_runtime.checkpoint_lineage(saver, "t", "",
+                                                          saver.head("t")))
+        with self.assertRaises(pause_policy.PauseRefused) as ctx:
+            pause_runtime.continuation_evidence(crashed, self.saver())
+        self.assertEqual(ctx.exception.code, "PAUSE_CONTINUATION_UNRECOVERABLE")
         outcome, adapter = self.attempt(self.paused)
         self.assertEqual(outcome.status, "REFUSED")
-        self.assertEqual(outcome.code, "STALE_CHECKPOINT_HEAD", outcome.detail)
-        self.assertEqual(adapter.effect_count, 0, "the committed effect is never repeated")
-        stored = self.store().read(self.RUN)
-        self.assertEqual(next(iter(stored["applied"].values()))["stage"], "RECORDED",
-                         "an unproven resume is never promoted")
+        self.assertEqual(outcome.code, "PAUSE_CONTINUATION_UNRECOVERABLE", outcome.detail)
+        self.assertEqual(adapter.effect_count, 0, "no effect on an unprovable head")
 
     def test_a_duplicate_resume_of_the_same_generation_performs_no_second_effect(self):
         first, first_adapter = self.attempt(self.paused)

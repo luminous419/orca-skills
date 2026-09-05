@@ -641,6 +641,37 @@ class FilePauseRecordStore:
             self._persist(record)
             return deepcopy(record)
 
+    def begin_continuation(self, run_id: str, resume_bundle_id: str, *,
+                           lease_token: str) -> dict[str, Any]:
+        """Move the bundle ``RECORDED`` -> ``CONTINUING``, BEFORE the checkpoint head moves.
+
+        This is the durable boundary the resume sequence was missing.  ``RECORDED`` said
+        "this answer is the one being applied"; the head then moved to ACTIVE and only
+        afterwards did the effect run, so a process that died in between left a record
+        saying the checkpoint had not been touched next to a checkpoint that had.  A
+        successor read the record, found the head moved, and refused forever.
+
+        Writing ``CONTINUING`` first makes the order safe in the only direction that
+        matters: the stage can be ahead of the checkpoint (the process died before
+        ``update_state_command``, and the head still carries the pause -- re-driving is
+        byte-identical), but the checkpoint can never be ahead of the stage.  So
+        "the head moved" is always covered by a stage that admits it.
+
+        Idempotent: a bundle already ``CONTINUING`` or ``RESUMED`` is returned untouched,
+        which is what lets a re-drive of the same crash window replay this call.
+        """
+        with self._section.locked():
+            record = self._fenced(self._read(run_id), run_id, lease_token)
+            entry = record["applied"].get(resume_bundle_id)
+            if entry is None:
+                raise pause_policy.PauseRefused(
+                    "PAUSE_LIFECYCLE_INCOHERENT",
+                    f"{run_id}: no applied entry to continue")
+            if entry["stage"] == "RECORDED":
+                entry["stage"] = "CONTINUING"
+                self._persist(record)
+            return deepcopy(record)
+
     def promote_applied(self, run_id: str, resume_bundle_id: str, *,
                         resumed_at: str, resumed_checkpoint_id: str,
                         lease_token: str) -> dict[str, Any]:

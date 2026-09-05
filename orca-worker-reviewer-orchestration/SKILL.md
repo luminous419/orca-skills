@@ -2425,6 +2425,36 @@ C1 record는 checkpoint commit 이후에만 쓰인다        -> PAUSE_CHECKPOINT
 C2 record가 가리키는 checkpoint는 자기 thread의 head -> STALE_CHECKPOINT_HEAD
 C3 projection과 checkpoint는 일치해야 한다           -> PAUSE_PROJECTION_DIVERGED
 C4 checkpoint는 있고 record가 없으면 checkpoint에서 재도출한다 (반대 방향은 없다)
+C5 head가 pause를 벗어났으면 그것이 이 bundle의 continuation인지 durable하게 판정한다
+   -> 아니면 PAUSE_CONTINUATION_UNRECOVERABLE, 맞으면 복구한다 (C2보다 먼저 평가된다)
+```
+
+resume은 세 가지 durable fact를 순서대로 commit하며, 각 쌍 사이에 crash window가 있다.
+셋을 구분하지 못하면 가운데 window에 빠진 run은 영구히 복구 불가능해진다.
+
+```text
+applied bundle stage (Tier 2 .pause_state.json)
+  RECORDED    resume intent가 durable하다. checkpoint는 아직 손대지 않았으므로
+              head는 여전히 이 record가 가리키는 pause다.
+  CONTINUING  graph continuation을 commit하기 직전에 기록된다 -- update_state_command
+              보다 반드시 먼저다. 따라서 stage가 checkpoint보다 앞설 수는 있어도
+              (안전하다: 재진입이 byte-identical하다) checkpoint가 stage보다
+              앞설 수는 없다. effect 완료 여부는 말하지 않는다.
+  RESUMED     continuation이 반환되었고 promotion이 durable하다.
+
+C5 판정 (durable evidence만 사용한다. memory도, wall clock도, 추정도 아니다)
+  head == record의 checkpoint         -> NOT_STARTED: 처음부터 다시 구동한다
+  head가 record의 checkpoint의 자손    -> COMMITTED: 이 bundle의 continuation이다
+  그 외                                -> PAUSE_CONTINUATION_UNRECOVERABLE (fail-closed)
+
+COMMITTED 복구는 update_state_command를 재실행하지 않는다. 이미 checkpoint에 있고
+checkpoint가 authority다. head에서 graph를 재진입하면 LangGraph가 결과가 commit되지 않은
+superstep만 실행하므로, run 전체에서 effect는 정확히 한 번 일어난다.
+  invoke 이전에 죽었다  -> pending superstep이 여기서 실행되고 head가 전진한다
+                          -> PAUSE_CONTINUATION_RECOVERED (effect_performed=true)
+  invoke 이후에 죽었다  -> pending superstep이 없으므로 아무 effect도 없고 head도 그대로다
+                          -> PAUSE_CONTINUATION_ALREADY_COMPLETE (effect_performed=false)
+두 코드는 PAUSE_RECOVERY_CODES에 속하며 refusal도 revalidation도 아니다 (세 집합은 disjoint).
 ```
 
 pause는 실행 중인 dispatch를 전부 정산한 뒤에만 성립한다. 정산되지 않은 dispatch가 남으면

@@ -45,6 +45,12 @@ PAUSE_REFUSAL_CODES = frozenset({
     # .create): an unanswered generation is still active, or the successor's lineage --
     # its own checkpoint and a non-decreasing binding_generation -- does not hold.
     "PAUSE_GENERATION_ACTIVE", "PAUSE_GENERATION_LINEAGE",
+    # A resume commits its graph continuation to the checkpoint BEFORE the effect can be
+    # proven complete (see APPLIED_STAGES).  A successor that finds such a continuation
+    # recovers it; this names the one case it may not -- the thread's head is not a
+    # descendant of the checkpoint this pause record names, so the head is not this
+    # bundle's continuation and continuing it would drive somebody else's run.
+    "PAUSE_CONTINUATION_UNRECOVERABLE",
     "SETTLEMENT_JOURNAL_CORRUPT",
     "RESPONSE_NOT_FOUND", "RESPONSE_ALREADY_APPLIED", "RESPONSE_STALE_REVISION",
     "RESPONSE_CONFLICT", "RESPONSE_ITEM_UNRESOLVED",
@@ -56,6 +62,14 @@ PAUSE_REFUSAL_CODES = frozenset({
 # never be mistaken for a revalidation (that would apply a stale answer).
 PAUSE_REVALIDATION_CODES = frozenset({
     "STALE_SOURCE_BINDING", "STALE_ARTIFACT_BINDING", "STALE_POLICY_DIGEST",
+})
+# Also disjoint from both sets above, and for the same reason: a RECOVERY is neither a
+# refusal (the run continued) nor a revalidation (no source changed).  These two name what
+# a successor PROVED about a continuation it inherited, and they are reported on a resume
+# that succeeded -- never on one that refused.
+PAUSE_RECOVERY_CODES = frozenset({
+    "PAUSE_CONTINUATION_RECOVERED",         # the head advanced under this successor
+    "PAUSE_CONTINUATION_ALREADY_COMPLETE",  # the head was already terminal / next-pause
 })
 
 # ---- four-axis settlement vocabularies -----------------------------------------------
@@ -108,7 +122,24 @@ SETTLEMENT_ROW_KEYS = (
 )
 APPLIED_ENTRY_KEYS = ("resume_bundle_id", "request_id", "items", "stage",
                       "recorded_at", "resumed_at", "resumed_checkpoint_id")
-APPLIED_STAGES = ("RECORDED", "RESUMED")
+#: The THREE durable facts a resume must be able to tell apart after the process dies.
+#: They were two, and conflating the middle one with the first is what stranded a run:
+#:
+#: ``RECORDED``    the resume INTENT is committed -- this bundle is the answer being
+#:                 applied -- and nothing has touched the checkpoint yet, so the thread's
+#:                 head is still the pause this record names.
+#: ``CONTINUING``  the graph continuation is committed, or is about to be: this stage is
+#:                 written strictly BEFORE ``update_state_command`` moves the head to
+#:                 ACTIVE, so a head that has moved past the pause is always covered by
+#:                 it.  It says nothing about whether the effect finished -- the
+#:                 CHECKPOINT says that, and it is the authority.
+#: ``RESUMED``     the continuation returned and the promotion is committed.
+#:
+#: A successor reads this stage plus the checkpoint head and needs nothing else: no
+#: in-memory state, no wall clock, no "it has probably finished by now".
+APPLIED_STAGES = ("RECORDED", "CONTINUING", "RESUMED")
+#: The stages a successor may still act on.  ``RESUMED`` is finished and is not here.
+APPLIED_IN_FLIGHT_STAGES = ("RECORDED", "CONTINUING")
 DISPOSITION_KEYS = ("kind", "cancellation_id", "actor_id", "actor_type",
                     "submission_id", "reason", "requested_at")
 DISPOSITION_KINDS = ("CANCEL", "ABANDON")
@@ -157,6 +188,20 @@ def pause_record_id(*, run_id: str, thread_id: str, request_id: str,
     return contracts.stable_id("pause", {
         "run_id": run_id, "thread_id": thread_id, "request_id": request_id,
         "decision_item_ids": sorted(decision_item_ids)})
+
+
+def in_flight_bundle(record: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The one applied bundle that is claimed but not yet PROVEN resumed, or ``None``.
+
+    ``FilePauseRecordStore.record_applied`` admits at most one bundle in any
+    :data:`APPLIED_STAGES` stage per record, so "the one" is a fact of the store and not an
+    assumption made here.  Pure: the record is the only input, and the answer is a
+    statement about durable bytes -- never about what some process was doing.
+    """
+    for entry in (record.get("applied") or {}).values():
+        if entry.get("stage") in APPLIED_IN_FLIGHT_STAGES:
+            return dict(entry)
+    return None
 
 
 def resume_bundle_id(*, run_id: str, request_id: str, pause_record_id: str,

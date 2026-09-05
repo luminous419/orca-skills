@@ -4,9 +4,20 @@ This is the only new module that opens the Tier-1 saver, and therefore the only 
 that needs LangGraph -- but it needs it lazily, because the documented no-LangGraph
 ``discover`` fallback reaches this module (see :func:`_checkpoint_store`).  Everything it
 decides is decided by :mod:`pause_policy`, which is pure; what lives here is the
-*sequencing* -- the commit point of a pause, the C1-C4 consistency rules, the run-scoped
+*sequencing* -- the commit point of a pause, the C1-C5 consistency rules, the run-scoped
 claim fence, and the strict "write the dedupe key before the effect" ordering that makes
 resume and disposal exactly-once across a crash.
+
+C5 is the resume-continuation boundary.  A resume commits three things in order -- the
+applied bundle (intent), the checkpoint re-entry (continuation), and the promotion
+(completion) -- and each pair of them has a crash window between it.  C1-C4 could not tell
+"the head moved because THIS run's continuation committed" from "the head is stale", so a
+crash in the middle window was refused forever as STALE_CHECKPOINT_HEAD and reindex()
+could not repair it either.  C5 tells them apart from durable bytes alone: the applied
+stage (``RECORDED`` -> ``CONTINUING`` -> ``RESUMED``) says a continuation may have
+committed, and the checkpoint's own head pointer and parent links say whether it did and
+how far it got.  A successor then finishes it exactly once -- LangGraph re-runs only the
+supersteps whose results the checkpoint does not already hold.
 
 The checkpointed ``WorkflowState`` is the sole reconstruction authority.  The Tier-2
 record's ``projection`` is read **only** inside :func:`assert_c3` and is never an input to
@@ -345,6 +356,141 @@ def validate_pause_consistency(record: Mapping[str, Any], saver: Any) -> dict[st
     return state
 
 
+# ---- C5: the resume-continuation boundary --------------------------------------------
+# C1-C4 answer "is this pause record and this checkpoint the same fact?".  None of them
+# answers the question a CRASHED resume leaves behind: the head has moved off the pause,
+# so is that this run's own committed continuation -- which a successor must finish -- or
+# a head that has nothing to do with this bundle?  C2 answered "stale, refuse" to both,
+# which is right for the second and permanently strands the first.
+#
+# C5 separates them, and it reads nothing but bytes: the thread's head pointer and the
+# parent links the checkpoint store already writes with every ``put``.  No in-memory
+# state, no wall clock, no "it has probably finished by now".
+CONTINUATION_NOT_STARTED = "NOT_STARTED"
+CONTINUATION_COMMITTED = "COMMITTED"
+
+
+def checkpoint_lineage(saver: Any, thread_id: str, checkpoint_ns: str, head: str, *,
+                       limit: int = 100_000) -> tuple[str, ...]:
+    """``head`` and every ancestor of it, newest first, from the stored parent links.
+
+    ``limit`` and the ``seen`` set only bound a store whose parent links are cyclic or
+    unbounded -- neither is producible by :meth:`FileCheckpointSaver.put`, which writes the
+    parent exactly once at creation -- but a walk over durable input terminates here by
+    construction rather than by trust.
+    """
+    lineage: list[str] = []
+    seen: set[str] = set()
+    cursor: str | None = head
+    while cursor and cursor not in seen and len(lineage) < limit:
+        seen.add(cursor)
+        lineage.append(cursor)
+        tuple_ = saver.get_tuple({"configurable": {"thread_id": thread_id,
+                                                   "checkpoint_ns": checkpoint_ns,
+                                                   "checkpoint_id": cursor}})
+        if tuple_ is None:
+            break
+        cursor = (tuple_.parent_config or {}).get("configurable", {}).get("checkpoint_id")
+    return tuple(lineage)
+
+
+def continuation_evidence(record: Mapping[str, Any], saver: Any) -> str:
+    """Which side of the effect boundary the dead process reached.  Durable evidence only.
+
+    * :data:`CONTINUATION_NOT_STARTED` -- the head IS the pause checkpoint this record
+      names.  Whatever the applied stage says, the continuation is not committed: no node
+      has run since the pause, and re-driving the whole resume is byte-identical.
+    * :data:`CONTINUATION_COMMITTED` -- the head has moved AND the pause checkpoint is one
+      of its ancestors, so this head is this bundle's own continuation.  How far it got is
+      the checkpoint's business and nobody else's: re-entering the graph replays exactly
+      the supersteps whose results are not committed, which is none of them for a
+      continuation that finished.
+    * otherwise ``PAUSE_CONTINUATION_UNRECOVERABLE`` -- the head neither is nor descends
+      from this pause.  Continuing it would drive a run this record does not speak for, so
+      it fails closed by name instead.
+    """
+    assert_c1(record, saver)
+    head = saver.head(record["thread_id"], checkpoint_ns=record["checkpoint_ns"])
+    if head is None:
+        raise PauseRefused("PAUSE_CHECKPOINT_MISSING",
+                           f"{record['run_id']}: {record['thread_id']} carries no head")
+    if head == record["checkpoint_id"]:
+        return CONTINUATION_NOT_STARTED
+    if record["checkpoint_id"] not in checkpoint_lineage(
+            saver, record["thread_id"], record["checkpoint_ns"], head):
+        raise PauseRefused(
+            "PAUSE_CONTINUATION_UNRECOVERABLE",
+            f"{record['run_id']}: head={head!r} does not descend from the pause "
+            f"checkpoint {record['checkpoint_id']!r}, so it is not this bundle's "
+            "continuation and must not be driven")
+    return CONTINUATION_COMMITTED
+
+
+@dataclass(frozen=True)
+class _Recovered:
+    """What a successor finished, and what it PROVED while finishing it."""
+
+    record: dict[str, Any]
+    final: dict[str, Any]
+    head: str
+    effect_performed: bool
+    code: str
+
+
+def _recover_continuation(run_id: str, *, record: Mapping[str, Any],
+                          entry: Mapping[str, Any], saver: Any, graph_factory: Any,
+                          keeper: Any, store: Any, lease_token: str,
+                          recursion_limit: int | None,
+                          artifact_base: str | os.PathLike[str]) -> _Recovered:
+    """Finish a continuation a dead process committed, exactly once, from the head.
+
+    The re-entry (``update_state_command``) is NOT replayed: it is already in the
+    checkpoint, which is the authority, and replaying it would rewind a run that has moved
+    on.  ``invoke(None, config)`` resumes the thread from its committed head, so LangGraph
+    itself decides what work remains -- every superstep, and therefore every effect, whose
+    result the checkpoint already holds is not re-run.  That is what keeps the whole run at
+    exactly one round of effects across the crash:
+
+    * died BEFORE ``invoke``         -> the head is the ACTIVE re-entry, the pending
+                                        supersteps run here, and the head advances.
+    * died AFTER ``invoke`` returned -> the head is already terminal (or the next pause),
+                                        nothing is pending, no effect is performed and the
+                                        head does not move.
+
+    The head pointer before and after the call is the durable evidence of which one
+    happened, and it is what the returned code reports.
+    """
+    thread_id, checkpoint_ns = record["thread_id"], record["checkpoint_ns"]
+    graph = graph_factory(saver)
+    config: dict[str, Any] = {"configurable": {"thread_id": thread_id,
+                                               "checkpoint_ns": checkpoint_ns}}
+    if recursion_limit:
+        config["recursion_limit"] = recursion_limit
+    before = saver.head(thread_id, checkpoint_ns=checkpoint_ns)
+    final = dict(graph.invoke(None, config))
+    _still_owned(keeper)
+    after = saver.head(thread_id, checkpoint_ns=checkpoint_ns) or ""
+    performed = after != before
+    code = ("PAUSE_CONTINUATION_RECOVERED" if performed
+            else "PAUSE_CONTINUATION_ALREADY_COMPLETE")
+    _committed(keeper, store.promote_applied, run_id, entry["resume_bundle_id"],
+               resumed_at=_now(), resumed_checkpoint_id=after, lease_token=lease_token)
+    promoted = dict(_committed(keeper, store.mark_resumed, run_id, lease_token,
+                               updated_at=_now()))
+    _timing(run_id, artifact_base, run_logging.EVENT_RUN_RESUMED,
+            phase=str(final.get("current_phase") or ""),
+            risk=str(final.get("risk") or ""),
+            detail=f"bundle={entry['resume_bundle_id']} recovery={code}")
+    _audit(run_id, artifact_base, run_logging.EVENT_RUN_RESUMED,
+           phase=str(final.get("current_phase") or ""),
+           risk=str(final.get("risk") or ""),
+           round_kind=str(final.get("round_kind") or "").lower(),
+           result=str(final.get("terminal_status") or "ACTIVE"),
+           detail=(f"bundle={entry['resume_bundle_id']} recovery={code} "
+                   f"checkpoint={after} inherited_from={before}"))
+    return _Recovered(promoted, final, after, performed, code)
+
+
 # ---- discovery and takeover ----------------------------------------------------------
 def discover(artifact_base: str | os.PathLike[str], *,
              langgraph_available: bool = True) -> tuple[dict[str, Any], ...]:
@@ -513,6 +659,15 @@ def resume_run(run_id: str, *, artifact_base: str | os.PathLike[str], approval_p
     finalised here, after the keeper has been retired, and is returned as
     ``next_pause_record``: without it the new pause would exist in the checkpoint and
     nowhere in the Tier-2 index, which is invisible to ``discover``.
+
+    **Recovering a continuation a dead process committed.**  Before anything else, the
+    claimed section asks C5 (:func:`continuation_evidence`) whether the head already
+    carries this bundle's own continuation.  If it does, the re-entry is NOT replayed --
+    it is in the checkpoint, which is the authority -- and the run is driven from the head
+    to its terminal or its next pause instead, with :data:`pause_policy.PAUSE_RECOVERY_CODES`
+    reporting which side of the effect boundary the dead process reached.  The outcome is
+    still ``RESUMED``; ``effect_performed`` is False exactly when the continuation had
+    already finished and nothing was left to run.
     """
     store = store or pause_store.store_for(run_id, artifact_base=artifact_base)
     try:
@@ -536,108 +691,127 @@ def resume_run(run_id: str, *, artifact_base: str | os.PathLike[str], approval_p
         # renewal that failed while that write was in flight cannot be swallowed.
         with factory(store, run_id, lease_token) as keeper:
             saver = open_saver(record, artifact_base=artifact_base)
-            state = validate_pause_consistency(record, saver)
-            binding = state["pause_binding"] or {}
-            decisions = read_decision_bundle(
-                approval_port, run_id=run_id, request_id=binding["request_id"],
-                decision_item_ids=list(binding["decision_item_ids"]))
-            bundle_id = pause_policy.resume_bundle_id(
-                run_id=run_id, request_id=binding["request_id"],
-                pause_record_id=binding["pause_record_id"],
-                decisions=tuple(sorted(decisions.items())))
-            stored = record["applied"].get(bundle_id)
-            if stored is not None and stored["stage"] == "RESUMED":
-                return ResumeOutcome("ALREADY_APPLIED", code="RESPONSE_ALREADY_APPLIED",
-                                     record=record,
-                                     resumed_checkpoint_id=stored["resumed_checkpoint_id"])
-            if stored is not None and stored["stage"] == "RECORDED":
-                # The crash window between the dedupe write and the effect.  Ask the
-                # AUTHORITY, not the record: if the head still carries the pause, the
-                # resume never committed and re-driving is byte-identical; if it moved
-                # past, it did commit.
-                head_state = reconstruct({**record,
-                                          "checkpoint_id": saver.head(record["thread_id"])},
-                                         saver)
-                if head_state.get("run_lifecycle") != "WAITING_FOR_INPUT":
-                    promoted = _committed(
-                        keeper, store.promote_applied, run_id, bundle_id,
-                        resumed_at=_now(),
-                        resumed_checkpoint_id=saver.head(record["thread_id"]) or "",
-                        lease_token=lease_token)
-                    _committed(keeper, store.mark_resumed, run_id, lease_token,
-                               updated_at=_now())
-                    return ResumeOutcome("ALREADY_APPLIED", code="RESPONSE_ALREADY_APPLIED",
-                                         record=promoted,
-                                         resumed_checkpoint_id=saver.head(record["thread_id"]) or "")
-            reentry = pause_policy.resume_reentry(
-                state, current_repository=current_repository,
-                current_artifact=current_artifact,
-                current_policy_digest=current_policy_digest)
-            entry = {"resume_bundle_id": bundle_id, "request_id": binding["request_id"],
-                     "items": pause_store.applied_items(decisions), "stage": "RECORDED",
-                     "recorded_at": _now(), "resumed_at": "", "resumed_checkpoint_id": ""}
-            record = dict(_committed(keeper, store.record_applied, run_id, entry,
-                                     lease_token))
-            # ---- THE single effect, owned by the bundle entry and by nothing else ----
-            graph = graph_factory(saver)
-            config: dict[str, Any] = {
-                "configurable": {"thread_id": record["thread_id"],
-                                 "checkpoint_ns": record["checkpoint_ns"]}}
-            if recursion_limit:
-                config["recursion_limit"] = recursion_limit
-            # ``as_node="VALIDATE"`` is what makes the update a RE-ENTRY rather than a
-            # write: the run continues from VALIDATE's outgoing edge, i.e. straight into
-            # ROUTE, which is the same pure function over the same predicates it was
-            # before the pause.
-            _committed(
-                keeper, graph.update_state_command,
-                config, "RESUME_PAUSE", as_node="VALIDATE",
-                run_lifecycle="ACTIVE", pause_binding=None,
-                decision_state="CLEAR", decision_reason_code=None,
-                pending_clarification_id=binding["request_id"],
-                round_kind=reentry.round_kind, current_phase=reentry.current_phase,
-                correction_queue=list(reentry.correction_queue),
-                correction_index=reentry.correction_index,
-                binding_generation=reentry.binding_generation,
-                phase_pass_floor=dict(reentry.phase_pass_floor),
-                repository_binding=dict(current_repository),
-                artifact_binding=dict(current_artifact),
-                route_token=None, terminal_reason=None)
-            # The long blocking call.  The keeper renews throughout it; the checkpoint
-            # immediately after it is what stops a superseded owner from writing the
-            # promotion of an effect a successor has already adopted.
-            final = graph.invoke(None, config)
-            _still_owned(keeper)
-            resumed_head = saver.head(record["thread_id"]) or ""
-            record = dict(_committed(keeper, store.promote_applied, run_id, bundle_id,
-                                     resumed_at=_now(),
-                                     resumed_checkpoint_id=resumed_head,
-                                     lease_token=lease_token))
-            record = dict(_committed(keeper, store.mark_resumed, run_id, lease_token,
-                                     updated_at=_now()))
-            _timing(run_id, artifact_base, run_logging.EVENT_RUN_RESUMED,
-                    phase=reentry.current_phase, risk=state["risk"],
-                    detail=f"bundle={bundle_id}")
-            _audit(run_id, artifact_base, run_logging.EVENT_RUN_RESUMED,
-                   phase=reentry.current_phase, risk=state["risk"],
-                   round_kind=str(reentry.round_kind).lower(),
-                   result=str(final.get("terminal_status") or "ACTIVE"),
-                   detail=(f"bundle={bundle_id} checkpoint={resumed_head} "
-                           f"revalidation={','.join(reentry.revalidation_codes) or 'none'}"))
+            # ---- C5, and it has to come BEFORE C2 -----------------------------------
+            # C2 asks "is the head still the pause this record names?", which is exactly
+            # the question a crashed continuation answers with "no" -- so asking it first
+            # turned every recoverable crash window into a permanent STALE_CHECKPOINT_HEAD
+            # refusal that reindex() could not repair either, because the head it would
+            # have to repair from is ACTIVE and not WAITING_FOR_INPUT.  The record's own
+            # applied set is the index into the evidence: a bundle that is claimed
+            # (RECORDED or CONTINUING) but not yet promoted.
+            in_flight = pause_policy.in_flight_bundle(record)
+            if in_flight is not None and \
+                    continuation_evidence(record, saver) == CONTINUATION_COMMITTED:
+                recovered = _recover_continuation(
+                    run_id, record=record, entry=in_flight, saver=saver,
+                    graph_factory=graph_factory, keeper=keeper, store=store,
+                    lease_token=lease_token, recursion_limit=recursion_limit,
+                    artifact_base=artifact_base)
+                record, final = recovered.record, recovered.final
+                resumed_head, outcome_code = recovered.head, recovered.code
+                effect_performed, revalidation_codes = recovered.effect_performed, ()
+            else:
+                # Not started: the head is still the pause, so this is an ordinary resume
+                # -- and a bundle already RECORDED or CONTINUING is re-driven from the
+                # top, which is byte-identical because nothing has moved.
+                state = validate_pause_consistency(record, saver)
+                binding = state["pause_binding"] or {}
+                decisions = read_decision_bundle(
+                    approval_port, run_id=run_id, request_id=binding["request_id"],
+                    decision_item_ids=list(binding["decision_item_ids"]))
+                bundle_id = pause_policy.resume_bundle_id(
+                    run_id=run_id, request_id=binding["request_id"],
+                    pause_record_id=binding["pause_record_id"],
+                    decisions=tuple(sorted(decisions.items())))
+                stored = record["applied"].get(bundle_id)
+                if stored is not None and stored["stage"] == "RESUMED":
+                    return ResumeOutcome(
+                        "ALREADY_APPLIED", code="RESPONSE_ALREADY_APPLIED", record=record,
+                        resumed_checkpoint_id=stored["resumed_checkpoint_id"])
+                reentry = pause_policy.resume_reentry(
+                    state, current_repository=current_repository,
+                    current_artifact=current_artifact,
+                    current_policy_digest=current_policy_digest)
+                entry = {"resume_bundle_id": bundle_id,
+                         "request_id": binding["request_id"],
+                         "items": pause_store.applied_items(decisions),
+                         "stage": "RECORDED", "recorded_at": _now(),
+                         "resumed_at": "", "resumed_checkpoint_id": ""}
+                record = dict(_committed(keeper, store.record_applied, run_id, entry,
+                                         lease_token))
+                # ---- the durable boundary between "intent" and "continuation" --------
+                # Written BEFORE the head moves, never after.  The stage may be ahead of
+                # the checkpoint -- harmless, because C5 then reads NOT_STARTED and the
+                # whole resume is re-driven byte-identically -- but the checkpoint must
+                # never be ahead of the stage, because that is precisely the state
+                # nothing could name and nothing could recover.
+                record = dict(_committed(keeper, store.begin_continuation, run_id,
+                                         bundle_id, lease_token=lease_token))
+                # ---- THE single effect, owned by the bundle entry and by nothing else -
+                graph = graph_factory(saver)
+                config: dict[str, Any] = {
+                    "configurable": {"thread_id": record["thread_id"],
+                                     "checkpoint_ns": record["checkpoint_ns"]}}
+                if recursion_limit:
+                    config["recursion_limit"] = recursion_limit
+                # ``as_node="VALIDATE"`` is what makes the update a RE-ENTRY rather than a
+                # write: the run continues from VALIDATE's outgoing edge, i.e. straight
+                # into ROUTE, which is the same pure function over the same predicates it
+                # was before the pause.
+                _committed(
+                    keeper, graph.update_state_command,
+                    config, "RESUME_PAUSE", as_node="VALIDATE",
+                    run_lifecycle="ACTIVE", pause_binding=None,
+                    decision_state="CLEAR", decision_reason_code=None,
+                    pending_clarification_id=binding["request_id"],
+                    round_kind=reentry.round_kind, current_phase=reentry.current_phase,
+                    correction_queue=list(reentry.correction_queue),
+                    correction_index=reentry.correction_index,
+                    binding_generation=reentry.binding_generation,
+                    phase_pass_floor=dict(reentry.phase_pass_floor),
+                    repository_binding=dict(current_repository),
+                    artifact_binding=dict(current_artifact),
+                    route_token=None, terminal_reason=None)
+                # The long blocking call.  The keeper renews throughout it; the checkpoint
+                # immediately after it is what stops a superseded owner from writing the
+                # promotion of an effect a successor has already adopted.
+                final = graph.invoke(None, config)
+                _still_owned(keeper)
+                resumed_head = saver.head(record["thread_id"]) or ""
+                record = dict(_committed(keeper, store.promote_applied, run_id, bundle_id,
+                                         resumed_at=_now(),
+                                         resumed_checkpoint_id=resumed_head,
+                                         lease_token=lease_token))
+                record = dict(_committed(keeper, store.mark_resumed, run_id, lease_token,
+                                         updated_at=_now()))
+                _timing(run_id, artifact_base, run_logging.EVENT_RUN_RESUMED,
+                        phase=reentry.current_phase, risk=state["risk"],
+                        detail=f"bundle={bundle_id}")
+                _audit(run_id, artifact_base, run_logging.EVENT_RUN_RESUMED,
+                       phase=reentry.current_phase, risk=state["risk"],
+                       round_kind=str(reentry.round_kind).lower(),
+                       result=str(final.get("terminal_status") or "ACTIVE"),
+                       detail=(f"bundle={bundle_id} checkpoint={resumed_head} "
+                               f"revalidation="
+                               f"{','.join(reentry.revalidation_codes) or 'none'}"))
+                outcome_code, effect_performed = None, True
+                revalidation_codes = reentry.revalidation_codes
         # ---- the NEXT pause generation, if the resumed run paused again ----------------
         # Deliberately outside the keeper: this generation's record is written with no
         # owner and no lease, exactly like the first pause, so the next Coordinator can
         # claim it -- and writing it under a lease this process is about to drop would
         # leave the run claimed by a process that has finished.  The generation above is
         # already RESUMED on disk, which is what makes the create() below a supersede
-        # rather than an overwrite of a live pause.
+        # rather than an overwrite of a live pause.  A RECOVERED continuation reaches this
+        # too, and must: the pause a dead process drove the run into is otherwise in the
+        # checkpoint and nowhere in the Tier-2 index, which is invisible to ``discover``.
         next_record = finalize_pause(final, saver=saver, store=store,
                                      checkpoint_store_path=record["checkpoint_store_path"],
                                      artifact_base=artifact_base)
-        return ResumeOutcome("RESUMED", record=record, state=dict(final),
-                             resumed_checkpoint_id=resumed_head,
-                             revalidation_codes=reentry.revalidation_codes,
-                             effect_performed=True,
+        return ResumeOutcome("RESUMED", code=outcome_code, record=record,
+                             state=dict(final), resumed_checkpoint_id=resumed_head,
+                             revalidation_codes=revalidation_codes,
+                             effect_performed=effect_performed,
                              next_pause_record=next_record)
     except LeaseRenewalFailed as exc:
         # Fail closed and STAY closed.  The lease was lost while this process was inside
