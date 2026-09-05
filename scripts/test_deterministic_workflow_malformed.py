@@ -61,7 +61,7 @@ class MalformedCompiledGraphEntryTests(unittest.TestCase):
         from scripts.deterministic_workflow.fake_adapter import FakeAdapter
         from scripts.deterministic_workflow.graph import build_graph
         adapter = FakeAdapter([])
-        out = build_graph(adapter, runtime_state=_ledger()).invoke(state, config={"recursion_limit": 50})
+        out = build_graph(adapter, runtime_state=_ledger(), require_durable_checkpointer=False).invoke(state, config={"recursion_limit": 50})
         return out, adapter
 
     def mutated(self, **changes):
@@ -129,7 +129,7 @@ class MalformedCompiledGraphEntryTests(unittest.TestCase):
         adapter = FakeAdapter([{"status": "COMPLETE", "unit_test_status": "NOT_APPLICABLE"},
                                {"result": "PASS", "review_verdict": "PASS", "findings": []},
                                {"result": "PASS", "review_verdict": "PASS", "findings": []}])
-        out = build_graph(adapter, runtime_state=_ledger()).invoke(self.mutated(surprise_field=1),
+        out = build_graph(adapter, runtime_state=_ledger(), require_durable_checkpointer=False).invoke(self.mutated(surprise_field=1),
                                           config={"recursion_limit": 100})
         self.assertEqual(out["terminal_status"], "BLOCKED")
         self.assertEqual(out["terminal_reason"]["code"], "MALFORMED_STATE")
@@ -153,7 +153,7 @@ class MalformedCompiledGraphEntryTests(unittest.TestCase):
         from scripts.deterministic_workflow.graph import build_graph
         from scripts.deterministic_workflow.state import StateError
         adapter = FakeAdapter([])
-        graph = build_graph(adapter, checkpointer=MemorySaver(), runtime_state=_ledger())
+        graph = build_graph(adapter, checkpointer=MemorySaver(), runtime_state=_ledger(), require_durable_checkpointer=False)
         config = {"configurable": {"thread_id": "thread"}, "recursion_limit": 50}
         emitted = list(graph.stream(self.mutated(surprise_field=1), config))
         self.assertEqual(emitted[-1]["terminal_status"], "BLOCKED")
@@ -184,7 +184,7 @@ class MalformedCompiledGraphEntryTests(unittest.TestCase):
                                {"result": "PASS", "review_verdict": "PASS", "findings": []},
                                {"result": "PASS", "review_verdict": "PASS", "findings": []}])
         graph = build_graph(adapter, checkpointer=MemorySaver(), runtime_state=_ledger(),
-                            interrupt_before=["APPLY_RESULT"])
+                            interrupt_before=["APPLY_RESULT"], require_durable_checkpointer=False)
         config = {"configurable": {"thread_id": "resume"}, "recursion_limit": 100}
         state = initial_state(run_id="run_guardok", thread_id="resume", phases=("ANALYSIS",),
                               capabilities=self.capabilities)
@@ -229,7 +229,7 @@ class GuardedIngressSurfaceTests(unittest.TestCase):
         from scripts.deterministic_workflow.fake_adapter import FakeAdapter
         from scripts.deterministic_workflow.graph import build_graph
         adapter = FakeAdapter([self.WORKER, self.REVIEW, self.REVIEW])
-        return build_graph(adapter, runtime_state=_ledger()), adapter
+        return build_graph(adapter, runtime_state=_ledger(), require_durable_checkpointer=False), adapter
 
     CONFIG = {"recursion_limit": 100}
 
@@ -298,7 +298,7 @@ class GuardedIngressSurfaceTests(unittest.TestCase):
         from scripts.deterministic_workflow.fake_adapter import FakeAdapter
         from scripts.deterministic_workflow.graph import build_graph
         from scripts.deterministic_workflow.state import StateError
-        graph = build_graph(FakeAdapter([]), checkpointer=MemorySaver(), runtime_state=_ledger())
+        graph = build_graph(FakeAdapter([]), checkpointer=MemorySaver(), runtime_state=_ledger(), require_durable_checkpointer=False)
         config = {"configurable": {"thread_id": "ingress"}, "recursion_limit": 50}
         with self.assertRaisesRegex(StateError, "MALFORMED_STATE:unknown fields"):
             graph.update_state(config, {"surprise_field": 1})
@@ -348,7 +348,7 @@ class GuardedIngressSurfaceTests(unittest.TestCase):
             with self.subTest(entry=label):
                 adapter = FakeAdapter([self.WORKER, self.REVIEW, self.REVIEW])
                 graph = build_graph(adapter, checkpointer=MemorySaver(), runtime_state=_ledger(),
-                                    interrupt_before=["APPLY_RESULT"])
+                                    interrupt_before=["APPLY_RESULT"], require_durable_checkpointer=False)
                 config = {"configurable": {"thread_id": f"resume-{label}"},
                           "recursion_limit": 100}
                 graph.invoke(self.valid_state(thread_id=f"resume-{label}"), config)
@@ -438,7 +438,7 @@ class GuardedIngressSurfaceTests(unittest.TestCase):
         from langgraph.checkpoint.memory import MemorySaver
         from scripts.deterministic_workflow.fake_adapter import FakeAdapter
         from scripts.deterministic_workflow.graph import build_graph
-        graph = build_graph(FakeAdapter([]), checkpointer=MemorySaver(), runtime_state=_ledger())
+        graph = build_graph(FakeAdapter([]), checkpointer=MemorySaver(), runtime_state=_ledger(), require_durable_checkpointer=False)
         config = {"configurable": {"thread_id": "introspect"}, "recursion_limit": 50}
         self.assertIsNotNone(graph.get_state(config))
         self.assertIsNotNone(graph.get_graph())

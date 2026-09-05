@@ -92,9 +92,9 @@ class LangGraphAdapterParityTests(unittest.TestCase):
                  {"result":"PASS","review_verdict":"PASS","findings":[]},
                  {"result":"PASS","review_verdict":"PASS","findings":[]}]
         state=initial_state(run_id="run_parity",thread_id="t",phases=("ANALYSIS",),capabilities=BASE_CAPABILITIES)
-        fake=FakeAdapter(results); fake_out=build_graph(fake, runtime_state=_ledger()).invoke(state)
+        fake=FakeAdapter(results); fake_out=build_graph(fake, runtime_state=_ledger(), require_durable_checkpointer=False).invoke(state)
         harness=OfflineHarness(results); orca=OrcaAdapter(harness)
-        orca_out=build_graph(orca, runtime_state=_ledger()).invoke(state)
+        orca_out=build_graph(orca, runtime_state=_ledger(), require_durable_checkpointer=False).invoke(state)
         self.assertEqual(normalize_trace(fake_out["logical_trace"]),normalize_trace(orca_out["logical_trace"]))
         self.assertTrue(harness.calls)
         self.assertEqual({call[0] for call in harness.calls},{"create_task","run_existing_task"})

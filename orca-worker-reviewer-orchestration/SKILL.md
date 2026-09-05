@@ -157,7 +157,7 @@ not independently choose a next phase or retry. The following block is validated
 runtime-neutral graph specification.
 
 ```workflow-graph-contract
-{"workflow_id":"os40.standard.v1","schema_version":"os40.workflow.v1","phases":["ANALYSIS","PLAN","DESIGN","IMPLEMENTATION","TEST"],"route_tokens":["BLOCK","ESCALATE","PREPARE_WORKER","PREPARE_PHASE_REVIEWER","ADVANCE_PHASE","PREPARE_FINAL_REVIEWER","PREPARE_CORRECTION","PREPARE_REVALIDATION","COMPLETE"],"terminal_statuses":["COMPLETED","BLOCKED","ESCALATED"],"iteration_domains":["PHASE_ITERATIONS","FINAL_REVIEW_ITERATIONS"],"decision_first":true,"final_review_mandatory":true,"downstream_revalidation":"high_only","launcher":"tools/run_workflow.py"}
+{"workflow_id":"os40.standard.v1","schema_version":"os40.workflow.v1","phases":["ANALYSIS","PLAN","DESIGN","IMPLEMENTATION","TEST"],"route_tokens":["BLOCK","ESCALATE","PREPARE_WORKER","PREPARE_PHASE_REVIEWER","ADVANCE_PHASE","PREPARE_FINAL_REVIEWER","PREPARE_CORRECTION","PREPARE_REVALIDATION","COMPLETE","PAUSE","CANCEL","ABANDON"],"terminal_statuses":["COMPLETED","BLOCKED","ESCALATED","CANCELLED","ABANDONED"],"iteration_domains":["PHASE_ITERATIONS","FINAL_REVIEW_ITERATIONS"],"decision_first":true,"final_review_mandatory":true,"downstream_revalidation":"high_only","launcher":"tools/run_workflow.py"}
 ```
 
 ## Workflow Control Plane Authority
@@ -223,6 +223,17 @@ phase 전이, phase gate, correction loop, iteration budget, Final Review routin
       ],
       "sections": [
         "## 17. Final Adversarial Review"
+      ]
+    },
+    {
+      "decision": "PAUSE_RESUME",
+      "route_tokens": [
+        "PAUSE",
+        "CANCEL",
+        "ABANDON"
+      ],
+      "sections": [
+        "## Durable Pause and Resume (OS-31)"
       ]
     }
   ],
@@ -2374,15 +2385,160 @@ append-only lineage를 게시한다. 그 decision을 소비해 중단된 run을 
 transport-specific UI는 구현되어 있지 않다. 아래는 현재 한계이며 향후 계획이 아니라 **지금 사실**이다.
 
 ```text
-L1 blocked run은 종료된다. 답을 주는 것은 재개가 아니라 새 run이다 (resume은 OS-31).
+L1 blocked run은 종료된다. **pause 가능한 decision block은 `WAITING_FOR_INPUT`으로 durable하게 보존되고 동일 run으로 재개된다** (OS-31).
 L2 OS-30은 구조화된 request를 artifact로 게시하지만, 그것을 사용자에게 전달하는 transport-specific UI는 없다.
-L3 OS-30은 응답·변경·취소의 append-only lineage를 남기지만, 그 decision을 downstream run 재개로 연결하는 소비 lineage는 없다.
+L3 OS-30의 append-only lineage를 run 재개로 연결하는 소비 lineage는 pause record의 applied set이다 (OS-31).
 L4 timeout 의미론은 계약의 부정 규칙(권한이 아님) 외에 없다.
 L5 LOW에는 phase Reviewer가 없으므로 LOW Worker의 오분류는 Final Adversarial Review에서만 잡힌다.
-L6 유효하게 승인된 downgrade여도 그 round는 여전히 terminal이다 — 그에 따라 계속 진행하는 것이 resume이다.
-L7 live Orca 경로의 gate는 run을 연 Coordinator process 안에서만 bound된다. 새 process는 fail-closed로 막힌다.
+L6 유효하게 승인된 downgrade round는 여전히 terminal이다. decision block 자체는 이제 재개 가능하다 (OS-31).
+L7 새 Coordinator process는 run-scoped claim으로 중단된 run을 인수해 정확히 한 번 재개하거나 폐기할 수 있다 (OS-31).
 L8 logging CLI 경로는 ledger record를 계약 검증하지 않는다. 쓰고 읽을 뿐이며 판정은 gate가 한다.
 ```
+
+## Durable Pause and Resume (OS-31)
+
+> **NON-AUTHORITATIVE (graph-owned).** 이 절의 routing 규칙은 deterministic workflow engine이 소유한다. 아래 설명은 engine 동작의 파생 문서이며, engine과 어긋나면 engine이 정답이다.
+
+`NEEDS_INPUT` 또는 `CONFLICT`로 멈춘 run은, adapter가 `human_approval`과
+`lifecycle_settlement`를 모두 선언한 경우에 한해 `BLOCK` 대신 route token `PAUSE`로 간다.
+그렇지 않으면 OS-31 이전과 동일하게 `BLOCK`/`BLOCKED`로 끝난다.
+
+```text
+RUN_LIFECYCLE_STATES = ACTIVE | WAITING_FOR_INPUT | SETTLED
+허용 transition   = ACTIVE-ENTER_PAUSE->WAITING_FOR_INPUT, ACTIVE-TERMINATE->SETTLED,
+                    WAITING_FOR_INPUT-RESUME->ACTIVE,
+                    WAITING_FOR_INPUT-CANCEL/ABANDON->SETTLED
+그 외 모든 transition은 PAUSE_TRANSITION_FORBIDDEN으로 fail-closed
+WAITING_FOR_INPUT은 terminal status가 아니다 -- 지울 terminal status 자체가 없다
+```
+
+두 개의 durable tier가 있고 권한은 하나뿐이다.
+
+```text
+Tier 1 (authority) : OS-40 checkpoint. 재구성의 유일한 입력이다.
+Tier 2 (index)     : artifacts/runs/<run_id>/.pause_state.json.
+                     discovery identity, run-scoped claim/lease fence, checkpoint pointer,
+                     disposition, applied set, 그리고 checkpoint의 projection.
+Tier 2b (journal)  : artifacts/runs/<run_id>/.settlement_journal.json.
+                     모든 row는 그것이 서술하는 external effect보다 먼저 기록된다.
+C1 record는 checkpoint commit 이후에만 쓰인다        -> PAUSE_CHECKPOINT_MISSING
+C2 record가 가리키는 checkpoint는 자기 thread의 head -> STALE_CHECKPOINT_HEAD
+C3 projection과 checkpoint는 일치해야 한다           -> PAUSE_PROJECTION_DIVERGED
+C4 checkpoint는 있고 record가 없으면 checkpoint에서 재도출한다 (반대 방향은 없다)
+C5 head가 pause를 벗어났으면 그것이 이 bundle의 continuation인지 durable하게 판정한다
+   -> 아니면 PAUSE_CONTINUATION_UNRECOVERABLE, 맞으면 복구한다 (C2보다 먼저 평가된다)
+   discover와 resume은 이 판정을 각자 구현하지 않고 같은 함수 하나를 호출한다
+```
+
+resume은 세 가지 durable fact를 순서대로 commit하며, 각 쌍 사이에 crash window가 있다.
+셋을 구분하지 못하면 가운데 window에 빠진 run은 영구히 복구 불가능해진다.
+
+```text
+applied bundle stage (Tier 2 .pause_state.json)
+  RECORDED    resume intent가 durable하다. checkpoint는 아직 손대지 않았으므로
+              head는 여전히 이 record가 가리키는 pause다.
+  CONTINUING  graph continuation을 commit하기 직전에 기록된다 -- update_state_command
+              보다 반드시 먼저다. 따라서 stage가 checkpoint보다 앞설 수는 있어도
+              (안전하다: 재진입이 byte-identical하다) checkpoint가 stage보다
+              앞설 수는 없다. effect 완료 여부는 말하지 않는다.
+  RESUMED     continuation이 반환되었고 promotion이 durable하다.
+
+C5 판정 (durable evidence만 사용한다. memory도, wall clock도, 추정도 아니다)
+  head == record의 checkpoint         -> NOT_STARTED: 처음부터 다시 구동한다
+  head가 record의 checkpoint의 자손    -> COMMITTED: 이 bundle의 continuation이다
+  그 외                                -> PAUSE_CONTINUATION_UNRECOVERABLE (fail-closed)
+
+COMMITTED 복구는 update_state_command를 재실행하지 않는다. 이미 checkpoint에 있고
+checkpoint가 authority다. head에서 graph를 재진입하면 LangGraph가 결과가 commit되지 않은
+superstep만 실행하므로, run 전체에서 effect는 정확히 한 번 일어난다.
+  invoke 이전에 죽었다  -> pending superstep이 여기서 실행되고 head가 전진한다
+                          -> PAUSE_CONTINUATION_RECOVERED (effect_performed=true)
+  invoke 이후에 죽었다  -> pending superstep이 없으므로 아무 effect도 없고 head도 그대로다
+                          -> PAUSE_CONTINUATION_ALREADY_COMPLETE (effect_performed=false)
+두 코드는 PAUSE_RECOVERY_CODES에 속하며 refusal도 revalidation도 아니다 (세 집합은 disjoint).
+```
+
+pause는 실행 중인 dispatch를 전부 정산한 뒤에만 성립한다. 정산되지 않은 dispatch가 남으면
+`DISPATCH_UNACCOUNTED`, terminal ownership이 확정되지 않으면 `TERMINAL_OWNERSHIP_UNKNOWN` /
+`TERMINAL_ORPHAN_POSSIBLE` / `TERMINAL_IDENTITY_UNVERIFIED`로 pause를 **거부**하고 `BLOCK`으로
+되돌아간다. 거부는 언제나 가능하고 언제나 안전하다.
+
+```text
+TERMINAL_DISPOSITIONS = released | exited | retained_by_named_owner | residual
+AC-1을 해소하는 값은 앞의 셋뿐이다. residual은 abandon 경로에서만 허용되고,
+그 run은 AC-1을 주장하지 않는다 (ac1_discharged=false). "transferred"라는 값은 없다.
+```
+
+하나의 run은 여러 번 pause할 수 있다. 각 pause는 자신의 **generation**이며
+`pause_record_id`, 자신의 checkpoint, 그리고 `binding_generation`으로 식별된다.
+
+```text
+generation 정책 (Tier 2 .pause_state.json)
+  record 없음                  -> generation 1을 기록한다
+  같은 generation 재기록         -> idempotent no-op (live lease column을 보존한다)
+  WAITING_FOR_INPUT generation -> 다른 generation으로 덮어쓰지 않는다: PAUSE_GENERATION_ACTIVE
+  CANCELLED / ABANDONED        -> 더 이상의 generation은 없다: RUN_ALREADY_CANCELLED / _ABANDONED
+  RESUMED generation           -> supersede한다. 답변된 generation은 superseded 이력으로
+                                  통째로 보존되고(applied set = OS-30 소비 lineage),
+                                  새 generation이 active record가 된다
+  lineage 위반(같은 checkpoint, 또는 binding_generation 역행) -> PAUSE_GENERATION_LINEAGE
+resume 도중 run이 다시 pause하면 그 generation은 resume 경로에서 finalize된다
+```
+
+claim한 Coordinator는 claimed section 전체 — decision 조회, 재검증, checkpoint 갱신,
+`graph.invoke()` — 동안 lease를 갱신한다. lease를 잃으면 그 즉시 멈추고 어떤 effect도 state
+변경도 더 하지 않으며 `PAUSE_CLAIM_LOST`로 fail-closed 처리된다.
+
+```text
+관측 창은 lease를 덮는다: observe 기본 timeout = lease + DEFAULT_OBSERVE_GRACE_SECONDS.
+  따라서 단 한 번의 observe-then-takeover 호출로 인수가 가능하다 (bounded, 무한 대기 없음).
+명시적으로 더 짧은 timeout을 준 caller는 그 값 그대로 bounded되며,
+  PAUSE_OBSERVATION_TIMEOUT은 아무것도 claim하지 않은 retryable 결과다 -- run에 대한 판정이 아니다.
+```
+
+응답 적용과 재개는 완전한 decision bundle 하나에 대한 단일 identity
+(`resume_bundle_id`)를 가진다. 중복 응답은 `RESPONSE_ALREADY_APPLIED`, 오래된 revision은
+`RESPONSE_STALE_REVISION`, 서로 충돌하는 응답은 `RESPONSE_CONFLICT`로 fail-closed 처리되며,
+recency로 중재하지 않는다. repository head, artifact 또는 policy digest가 바뀌었으면 응답을
+무조건 적용하지 않고 responsible phase부터 correction 경로로 재진입한다 — 따라서 phase
+Reviewer와 Final Adversarial Review gate는 재개로 우회되지 않는다.
+
+`discover`는 resume이 실제로 할 일과 **같은 분류**를 보고한다. 둘은 같은 함수
+(`pause_runtime.classify_head`, 즉 C5를 C2보다 먼저 보는 그 판정)를 호출하므로 갈라질 수 없다.
+갈라져 있던 동안 discovery는 C1 다음에 곧바로 C2를 적용했고, continuation boundary에서 crash한
+run — in-flight bundle이 있고 head가 pause checkpoint의 자손인 run — 을 STALE_CHECKPOINT_HEAD로
+보고했다. 즉 C5가 복구하려고 만들어진 바로 그 run들을 새 Coordinator는 발견할 수 없었고, run_id를
+이미 아는 operator만 복구할 수 있었다.
+
+```text
+PAUSE_DISCOVERY_VERDICTS = PAUSE_DISCOVERY_ACTIONABLE_VERDICTS | PAUSE_REFUSAL_CODES
+
+PAUSE_DISCOVERY_ACTIONABLE_VERDICTS (새 Coordinator가 실제로 손댈 수 있는 두 가지)
+  RESUMABLE                       head == record의 checkpoint (C1/C2 성립)
+                                  -> resume을 처음부터 구동한다
+  PAUSE_CONTINUATION_RECOVERABLE  in-flight bundle(RECORDED|CONTINUING)이 있고
+                                  head가 그 checkpoint의 검증된 자손이다 (C5 COMMITTED)
+                                  -> re-entry를 재실행하지 않고 head에서 continuation을 끝낸다
+그 외 (전부 PAUSE_REFUSAL_CODES, 행동 대상이 아니다)
+  PAUSE_CONTINUATION_UNRECOVERABLE  head가 pause도 그 자손도 아니다 -- 움직인 head라고
+                                    무조건 복구하지 않는다. 이 경우는 그대로 fail-closed다
+  STALE_CHECKPOINT_HEAD             in-flight bundle이 없는데 head가 움직였거나 digest가 다르다
+  RUN_ALREADY_RESUMED|CANCELLED|ABANDONED, PAUSE_RECORD_CORRUPT, PAUSE_CHECKPOINT_MISSING,
+  CHECKPOINT_UNVERIFIED (LangGraph 부재)
+두 actionable verdict는 뒤따르는 작업이 서로 다르므로 이름도 둘이다.
+RESUMABLE을 넓혀 둘을 겸하게 하지 않는다.
+discover는 여전히 read-only다: claim도, effect도, head 이동도 없다.
+```
+
+CLI는 정확히 두 verb만 늘어난다.
+
+```text
+run_workflow.py discover [--artifact-base DIR] [--json]
+run_workflow.py resume --run-id RUN_ID [--artifact-base DIR] [--cancel | --abandon] ...
+```
+
+LangGraph가 없으면 `discover`는 동작하되 모든 verdict가 `CHECKPOINT_UNVERIFIED`이고,
+`resume`은 claim을 잡기 전에 `LANGGRAPH_DEPENDENCY_MISSING`으로 거부된다.
 
 ## 18. Core Invariants
 
@@ -2444,7 +2600,13 @@ A missing decision result is never CLEAR, and neither is model confidence, worke
 NEEDS_INPUT and CONFLICT block the correction worker and the next phase, and consume no correction iteration
 Only the already-scheduled current-phase reviewer may verify a decision classification; no new dispatch site, round or reviewer exists
 A reviewer may verify a classification but never decide on the user's behalf; a downgrade is decided by the shared policy contract alone
-A decision block is terminal at every risk level; risk never changes the terminal status, decision state or reason code
+A decision block is terminal at every risk level unless it is admissible as a durable pause, in which case it is WAITING_FOR_INPUT at every risk level; risk never changes the terminal status, decision state or reason code
+WAITING_FOR_INPUT is never a terminal status
+A pause settles every dispatch before the run may wait
+Resume re-enters through the correction path and never clears a terminal status
+Exactly one Coordinator may resume or dispose a paused run
+The OS-40 checkpoint is authoritative for resume state; the pause record is an index
+Cancel and abandon are explicit human instructions, never a timeout
 The machine-readable decision record is the authority and the markdown summary explains it; a disagreement blocks
 The decision ledger is append-only; a correction is a new record and no published record is ever edited
 ```

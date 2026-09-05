@@ -8,15 +8,34 @@ from weakref import WeakKeyDictionary
 
 from langgraph.graph import END, START, StateGraph
 
-from .executor import (advance_phase_node, apply_result_node, execute_intent_node,
-                       prepare_intent_node, route_node, terminal_node,
-                       validate_node, validate_settlement_node)
+from .executor import (advance_phase_node, apply_result_node, dispose_node,
+                       execute_intent_node, pause_node, prepare_intent_node, route_node,
+                       terminal_node, validate_node, validate_settlement_node)
 from .graph_spec import NODES, ROUTE_TARGETS, validate_graph_spec
 from .runtime_state import resolve_runtime_state
 from .state import (StateError, WorkflowState, normalize_malformed_state, typed_update,
                     validate_state)
 
 CLOSED_STATE_FIELDS = frozenset(WorkflowState.__required_keys__)
+
+# OS-31 SS8.2.  The raw ``update_state`` ingress accepts any value for a *known* field, and
+# ``terminal_status`` is a known field -- which is precisely how a gate could be forged from
+# outside the graph.  After this guard, resume and cancel are expressible ONLY through the
+# typed commands, and a hand-written ``terminal_status = None`` or a fabricated
+# ``phase_passes`` entry is refused at the boundary.
+PROTECTED_STATE_FIELDS = frozenset({
+    "terminal_status", "terminal_reason", "run_lifecycle", "pause_binding",
+    "phase_passes", "phase_pass_floor", "binding_generation",
+    "processed_command_ids", "processed_event_ids",
+})
+
+class DurableCheckpointerRequired(ValueError):
+    """A production graph that can pause must be able to survive the process.
+
+    Mirrors ``IdempotencyPortRequired`` exactly: a required port, refused at build time, so
+    no graph capable of losing a paused run's state can be constructed.
+    ``require_durable_checkpointer=False`` is the named test-only escape hatch.
+    """
 
 
 def unknown_state_fields(value: Any) -> tuple[str, ...]:
@@ -145,7 +164,34 @@ class GuardedWorkflowGraph:
         if unknown:
             raise StateError(f"MALFORMED_STATE:unknown fields:{','.join(unknown)}")
 
-    def _guard_update(self, config: Any, values: Any, as_node: Any) -> None:
+    @staticmethod
+    def _assert_unprotected(values: Any, typed: bool) -> None:
+        """Refuse a *raw* update that names a protected field (OS-31 SS8.2)."""
+        if typed:
+            return
+        protected = sorted(set(values) & PROTECTED_STATE_FIELDS)
+        if protected:
+            raise StateError(f"MALFORMED_STATE:protected field:{protected[0]}")
+
+    @staticmethod
+    def _assert_monotonic(current: Mapping[str, Any], merged: Mapping[str, Any]) -> None:
+        """``RESUME_PAUSE`` may raise a floor and bump a generation, never lower either.
+
+        A resume can therefore only make completion harder, never easier, which is what
+        keeps the phase Reviewer and Final Review gates unbypassable after a resume.
+        """
+        if int(merged.get("binding_generation") or 0) < int(current.get("binding_generation") or 0):
+            raise StateError(
+                "MALFORMED_UPDATE_COMMAND:RESUME_PAUSE:generation must not decrease")
+        floors = current.get("phase_pass_floor") or {}
+        new_floors = merged.get("phase_pass_floor") or {}
+        for phase, floor in floors.items():
+            if int(new_floors.get(phase, 0)) < int(floor):
+                raise StateError(
+                    "MALFORMED_UPDATE_COMMAND:RESUME_PAUSE:generation must not decrease")
+
+    def _guard_update(self, config: Any, values: Any, as_node: Any,
+                      typed: bool = False) -> None:
         """Validate the *whole merged checkpoint* an update would commit, or refuse.
 
         Checking field names alone accepted any value for a known key, and LangGraph's
@@ -164,12 +210,15 @@ class GuardedWorkflowGraph:
             raise StateError(
                 f"MALFORMED_STATE:update must be a mapping, got {type(values).__name__}")
         self._assert_known_update(values)
+        self._assert_unprotected(values, typed)
         snapshot = _COMPILED_GRAPHS[self].get_state(config)
         current = dict(getattr(snapshot, "values", None) or {})
         merged = _merge_checkpoint(current, values)
         validate_state(merged, expected_thread_id=merged.get("thread_id", ""))
+        self._assert_monotonic(current, merged)
 
-    async def _aguard_update(self, config: Any, values: Any, as_node: Any) -> None:
+    async def _aguard_update(self, config: Any, values: Any, as_node: Any,
+                             typed: bool = False) -> None:
         """Async twin of :meth:`_guard_update`; the async ingress is guarded identically."""
         if as_node is not None and as_node not in ALLOWED_UPDATE_NODES:
             raise StateError(f"MALFORMED_STATE:unknown as_node:{as_node}")
@@ -179,10 +228,12 @@ class GuardedWorkflowGraph:
             raise StateError(
                 f"MALFORMED_STATE:update must be a mapping, got {type(values).__name__}")
         self._assert_known_update(values)
+        self._assert_unprotected(values, typed)
         snapshot = await _COMPILED_GRAPHS[self].aget_state(config)
         current = dict(getattr(snapshot, "values", None) or {})
         merged = _merge_checkpoint(current, values)
         validate_state(merged, expected_thread_id=merged.get("thread_id", ""))
+        self._assert_monotonic(current, merged)
 
     def _split_batch(self, inputs: list[Any], config: Any):
         """Partition a batch into refusals and the entries the native batch may run."""
@@ -241,27 +292,44 @@ class GuardedWorkflowGraph:
                      if accepted else [])
         return self._merge_batch(rejections, completed)
 
-    def update_state(self, config: Any, values: Any, as_node: Any = None) -> Any:
-        self._guard_update(config, values, as_node)
+    def update_state(self, config: Any, values: Any, as_node: Any = None,
+                     _typed: bool = False) -> Any:
+        self._guard_update(config, values, as_node, _typed)
         return _COMPILED_GRAPHS[self].update_state(config, values, as_node=as_node)
 
-    async def aupdate_state(self, config: Any, values: Any, as_node: Any = None) -> Any:
-        await self._aguard_update(config, values, as_node)
+    async def aupdate_state(self, config: Any, values: Any, as_node: Any = None,
+                            _typed: bool = False) -> Any:
+        await self._aguard_update(config, values, as_node, _typed)
         return await _COMPILED_GRAPHS[self].aupdate_state(config, values, as_node=as_node)
 
     def update_state_command(self, config: Any, command: str, *, as_node: Any = None,
                              **fields: Any) -> Any:
         """Apply one of the closed :data:`state.UPDATE_COMMANDS` instead of a raw mapping."""
-        return self.update_state(config, typed_update(command, **fields), as_node=as_node)
+        return self.update_state(config, typed_update(command, **fields), as_node=as_node,
+                                 _typed=True)
 
     async def aupdate_state_command(self, config: Any, command: str, *, as_node: Any = None,
                                     **fields: Any) -> Any:
-        return await self.aupdate_state(config, typed_update(command, **fields), as_node=as_node)
+        return await self.aupdate_state(config, typed_update(command, **fields),
+                                        as_node=as_node, _typed=True)
+
+
+def _is_durable_checkpointer(value: Any) -> bool:
+    try:
+        from langgraph.checkpoint.base import BaseCheckpointSaver
+        from langgraph.checkpoint.memory import InMemorySaver
+    except ImportError:  # pragma: no cover - graph.py already requires LangGraph
+        return False
+    return isinstance(value, BaseCheckpointSaver) and not isinstance(value, InMemorySaver)
 
 
 def build_graph(adapter: Any, *, checkpointer: Any = None, runtime_state: Any = None,
                 interrupt_before: list[str] | None = None,
-                interrupt_after: list[str] | None = None):
+                interrupt_after: list[str] | None = None,
+                require_durable_checkpointer: bool = True,
+                settlement_port: Any = None, approval_port: Any = None,
+                journal: Any = None, skill_path: Any = None, clock: Any = None,
+                sources_provider: Any = None):
     """Compile the workflow graph.
 
     A durable ``RuntimeStatePort`` is **required**: EXECUTE_INTENT claims each stable intent
@@ -275,7 +343,15 @@ def build_graph(adapter: Any, *, checkpointer: Any = None, runtime_state: Any = 
     ``.compiled`` for tests that need to observe the unguarded behaviour.
     """
     validate_graph_spec()
+    if require_durable_checkpointer and not _is_durable_checkpointer(checkpointer):
+        raise DurableCheckpointerRequired(
+            "DURABLE_CHECKPOINTER_REQUIRED: pass checkpointer=FileCheckpointSaver(...). "
+            "A production graph that can pause must be able to survive the process.")
     ledger = resolve_runtime_state(adapter, runtime_state)
+    settlement = settlement_port if settlement_port is not None else adapter
+    approval = (approval_port if approval_port is not None
+                else getattr(adapter, "approval_port", None))
+    journal = journal if journal is not None else getattr(adapter, "settlement_journal", None)
     graph = StateGraph(WorkflowState)
     graph.add_node("VALIDATE", validate_node)
     graph.add_node("ROUTE", route_node)
@@ -284,6 +360,10 @@ def build_graph(adapter: Any, *, checkpointer: Any = None, runtime_state: Any = 
     graph.add_node("EXECUTE_INTENT", execute_intent_node(adapter, ledger))
     graph.add_node("VALIDATE_SETTLEMENT", validate_settlement_node)
     graph.add_node("APPLY_RESULT", apply_result_node)
+    graph.add_node("PAUSE", pause_node(settlement, approval, clock=clock,
+                                       skill_path=skill_path, journal=journal,
+                                       sources_provider=sources_provider))
+    graph.add_node("DISPOSE", dispose_node(settlement, clock=clock, journal=journal))
     graph.add_node("TERMINAL", terminal_node)
     graph.add_edge(START, "VALIDATE")
     graph.add_edge("VALIDATE", "ROUTE")
@@ -293,6 +373,8 @@ def build_graph(adapter: Any, *, checkpointer: Any = None, runtime_state: Any = 
     graph.add_edge("EXECUTE_INTENT", "VALIDATE_SETTLEMENT")
     graph.add_edge("VALIDATE_SETTLEMENT", "APPLY_RESULT")
     graph.add_edge("APPLY_RESULT", "ROUTE")
+    graph.add_edge("PAUSE", "TERMINAL")
+    graph.add_edge("DISPOSE", "TERMINAL")
     graph.add_edge("TERMINAL", END)
     return GuardedWorkflowGraph(graph.compile(
         checkpointer=checkpointer, interrupt_before=interrupt_before,

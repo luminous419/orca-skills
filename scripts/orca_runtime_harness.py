@@ -11,7 +11,7 @@ import subprocess
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 try:
     from scripts.quality_profile import (
@@ -1177,6 +1177,45 @@ class OrcaRuntimeHarness:
             "owner_dispatch_ids": [],
         }
 
+    def list_terminals(
+        self, *, worktree: str = "current", limit: int | None = None
+    ) -> tuple[dict[str, Any], ...]:
+        """`orca terminal list --worktree <selector> --json`, verbatim. Read-only.
+
+        Grammar read from `orca terminal list --help`; the response shape was executed and
+        observed against a live runtime, and every element carries `handle` and `title`.
+        OS-31 consumes exactly three fields -- `handle`, `title` and `orphaned` (the last as
+        reporting evidence only) -- so response drift outside those three cannot affect it.
+        Issues no mutation, so it is safe to repeat.
+
+        `worktree` is defaulted only so the contract test's public-method sweep can bind it;
+        OS-31 always passes the stable `id:<repo-id>::<path>` selector it journalled, never
+        the `current`/`active` alias.
+        """
+        args = ["terminal", "list", "--worktree", worktree]
+        if limit is not None:
+            args.extend(["--limit", str(limit)])
+        payload = self.call(*args)
+        terminals = (payload.get("result") or {}).get("terminals")
+        if not isinstance(terminals, list):
+            raise OrcaRuntimeError("terminal listing has an unexpected shape")
+        return tuple(dict(item) for item in terminals if isinstance(item, dict))
+
+    def resolve_worktree(self, selector: str = "current") -> dict[str, Any] | None:
+        """`orca worktree show --worktree <selector> --json`, or None when it does not resolve.
+
+        A listing under an UNRESOLVABLE selector returns `ok: true` with an empty array --
+        indistinguishable, on its own, from a real worktree holding no terminals. So an
+        "absent" verdict must be PROVED with this guard rather than inferred from emptiness.
+        """
+        payload = self.call(
+            "worktree", "show", "--worktree", selector, allow_error=True
+        )
+        if not payload.get("ok"):
+            return None
+        worktree = (payload.get("result") or {}).get("worktree")
+        return dict(worktree) if isinstance(worktree, dict) else None
+
     def handles_with_intended_role(
         self, intended_role: str = "phase_reviewer"
     ) -> list[str]:
@@ -1968,7 +2007,19 @@ class OrcaRuntimeHarness:
         max_dispatches: int = 1,
         ask_before: bool = False,
         phase: str = "",
+        title: str | None = None,
+        worktree: str = "current",
     ) -> str:
+        """`title` and `worktree` are OS-31 seams, both defaulting to today's behaviour.
+
+        The hard-coded `fake-{role}-{iteration}` title is NOT run-unique -- two runs, or
+        two iterations of two runs, collide on it -- and the hard-coded `--worktree current`
+        is an ALIAS that the *reading* process re-resolves, so persisting it persists no
+        worktree at all. OS-31 passes a run-unique title and the stable
+        `id:<repo-id>::<path>` selector it journalled before the Task was created, so a
+        successor Coordinator can enumerate the terminal in the scope it was really made in.
+        Every existing call site omits both and binds unchanged.
+        """
         command = [
             "exec",
             str(FAKE_AGENT_SHIM),
@@ -2001,9 +2052,9 @@ class OrcaRuntimeHarness:
             "terminal",
             "create",
             "--worktree",
-            "current",
+            worktree,
             "--title",
-            f"fake-{role}-{iteration}",
+            title if title is not None else f"fake-{role}-{iteration}",
             "--command",
             agent_command,
         )
@@ -3001,7 +3052,10 @@ class OrcaRuntimeHarness:
                 # BLOCKED is not gated, so the branch above is not re-entered.
                 self.log_run_status("BLOCKED", reason=f"{reason}: {detail}")
                 raise DecisionGateRefused(reason, refusal.detail)
-        if status == "BLOCKED":
+        # OS-31: on the Skill-document path, WAITING_FOR_INPUT is now the status a
+        # PAUSABLE decision block writes, so it must publish the clarification exactly as
+        # BLOCKED does -- otherwise a paused run would wait for a question nobody asked.
+        if status in ("BLOCKED", "WAITING_FOR_INPUT"):
             self._publish_clarifications_for_terminal_block()
         self._safe_log(
             run_logging.log_run_status,
@@ -3127,8 +3181,18 @@ class OrcaRuntimeHarness:
         max_dispatches: int = 1,
         round_kind: str = "phase_gate",
         verifies: str | None = None,
+        terminal_observer: Callable[[str], None] | None = None,
+        terminal_title: str | None = None,
+        terminal_worktree: str | None = None,
     ) -> tuple[RuntimeAttempt, str]:
         """Dispatch and settle a Task that already exists (the graph-first path).
+
+        `terminal_observer`, `terminal_title` and `terminal_worktree` are the OS-31 seams
+        (SS4.2.1). The observer is invoked with the handle immediately after the terminal is
+        created and immediately BEFORE `start_worker`, which is the only point at which a
+        durable write can sit between the two effects; it issues no Orca command and
+        observes one string. All three default to None, so every existing call site binds
+        unchanged.
 
         Identical to run_attempt except that the Task is NOT created here.
 
@@ -3203,7 +3267,14 @@ class OrcaRuntimeHarness:
             max_dispatches=max_dispatches,
             ask_before=ask_before,
             phase=phase,
+            title=terminal_title,
+            worktree=terminal_worktree if terminal_worktree else "current",
         )
+        if terminal_observer is not None:
+            # Strictly between `terminal create` and `worker-start`: the digest becomes
+            # durable before the terminal is adopted, so a crash after adoption still
+            # leaves an identity a successor can verify against.
+            terminal_observer(handle)
         dispatch_started_at = run_logging.now_iso()
         # round 5 review MAJOR: opened here, before start_worker(), so phase_start/
         # iteration_start actually brackets this dispatch instead of trailing it.

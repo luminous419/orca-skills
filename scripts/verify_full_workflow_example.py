@@ -259,9 +259,12 @@ def verify_run(run_dir: Path) -> VerificationSummary:
         raise ExampleVerificationError(
             "ORCHESTRATOR_LOG.md has no medium-risk run_start with all five phases"
         )
-    if not any(
-        row["event"] == "run_end" and row["result"] == "COMPLETED" for row in rows
-    ):
+    # OS-31 WU-11. `run_end` is not terminal: a cancel/abandon appends a SECOND one, and
+    # the contract says the LAST row wins. An `any(...)` reader would report a cancelled
+    # run as still COMPLETED, so the authoritative status is the last run_end's result.
+    run_ends = [row for row in rows if row["event"] == "run_end"]
+    authoritative = run_ends[-1]["result"] if run_ends else None
+    if authoritative != "COMPLETED":
         raise ExampleVerificationError(
             "ORCHESTRATOR_LOG.md has no COMPLETED run_end event"
         )

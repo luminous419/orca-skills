@@ -4,7 +4,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Sequence
 from typing import Any
 
-from .contracts import BASE_CAPABILITIES, PHASES, ROUTE_TOKENS
+from .contracts import BASE_CAPABILITIES, PAUSE_CAPABILITIES, PHASES, ROUTE_TOKENS
 
 
 def missing_capabilities(required: frozenset[str], offered: frozenset[str]) -> tuple[str, ...]:
@@ -29,8 +29,29 @@ def responsible_phases(findings: Sequence[dict[str, Any]], requested: tuple[str,
     return tuple(sorted(phases, key=requested.index))
 
 
+def pause_admissible(state: dict[str, Any]) -> bool:
+    """A decision block may become a durable pause only when the adapter can both ask the
+    question and settle what is running.
+
+    An adapter that declares neither capability keeps the pre-OS-31 behaviour exactly: the
+    decision block routes to BLOCK, as every existing test asserts.
+    """
+    return (state["decision_state"] in ("NEEDS_INPUT", "CONFLICT")
+            and not missing_capabilities(PAUSE_CAPABILITIES,
+                                         frozenset(state["adapter_capabilities"])))
+
+
+def requested_disposition(state: dict[str, Any]) -> str | None:
+    """The typed cancel/abandon request carried inside ``pause_binding``, or None."""
+    disposition = (state.get("pause_binding") or {}).get("disposition")
+    if not isinstance(disposition, dict): return None
+    kind = disposition.get("kind")
+    return kind if kind in ("CANCEL", "ABANDON") else None
+
+
 def phase_gate(state: dict[str, Any]) -> str:
-    if state["decision_state"] in ("NEEDS_INPUT", "CONFLICT"): return "BLOCK"
+    if state["decision_state"] in ("NEEDS_INPUT", "CONFLICT"):
+        return "PAUSE" if pause_admissible(state) else "BLOCK"
     worker = state.get("worker_result")
     if worker is None: return "PENDING"
     if worker.get("status") != "COMPLETE": return "BLOCK"
@@ -51,7 +72,27 @@ def final_gate(state: dict[str, Any]) -> str:
 
 
 def all_phase_passes_current(state: dict[str, Any]) -> bool:
-    return all(state["phase_passes"].get(p) is not None for p in state["requested_phases"])
+    """Every requested phase has a pass, it names a reviewed binding, and it is current.
+
+    "Current" is expressed as a *floor*, not as equality with the head: a pass is
+    legitimately recorded against the tree that existed when the phase passed, and in an
+    ordinary forward run the head moves with every Worker settlement, so a naive equality
+    check would make COMPLETE unreachable.  The floor states exactly what AC-6 needs -- no
+    pass predating a change the engine has not re-run may satisfy completion -- and is a
+    no-op for every run that never paused, where the map is empty and every generation is 0.
+    """
+    floors = state.get("phase_pass_floor") or {}
+    for phase in state["requested_phases"]:
+        record = (state["phase_passes"] or {}).get(phase)
+        if record is None:
+            return False
+        try:
+            phase_pass_binding(state, phase)
+        except ValueError:
+            return False              # a pass with no reviewed_binding is not a pass
+        if record.get("binding_generation", 0) < floors.get(phase, 0):
+            return False
+    return True
 
 
 def final_review_binding_current(state: dict[str, Any]) -> bool:
@@ -99,7 +140,13 @@ def active_correction_phase(state: dict[str, Any]) -> str | None:
 def route(state: dict[str, Any]) -> str:
     """The sole workflow routing decision, evaluated in strict fail-closed order."""
     if state.get("terminal_status") is not None: return "COMPLETE" if state["terminal_status"] == "COMPLETED" else ("ESCALATE" if state["terminal_status"] == "ESCALATED" else "BLOCK")
-    if state["decision_state"] in ("NEEDS_INPUT", "CONFLICT"): return "BLOCK"
+    # OS-31.  Both checks sit ABOVE the decision axis so a disposition can leave a paused
+    # run, and re-entering a paused checkpoint re-routes to itself idempotently.
+    disposition = requested_disposition(state)
+    if disposition is not None: return disposition
+    if state.get("run_lifecycle") == "WAITING_FOR_INPUT": return "PAUSE"
+    if state["decision_state"] in ("NEEDS_INPUT", "CONFLICT"):
+        return "PAUSE" if pause_admissible(state) else "BLOCK"
     if missing_capabilities(BASE_CAPABILITIES, frozenset(state["adapter_capabilities"])): return "BLOCK"
     kind = state["round_kind"]
     if kind == "FINAL_REVIEW":
@@ -121,6 +168,7 @@ def route(state: dict[str, Any]) -> str:
         if state["remaining_phase_budget"][correction_phase] <= 0: return "ESCALATE"
         return "PREPARE_CORRECTION"
     gate = phase_gate(state)
+    if gate == "PAUSE": return "PAUSE"
     if gate == "BLOCK": return "BLOCK"
     if gate == "PENDING":
         if state.get("worker_result") is None:

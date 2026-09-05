@@ -706,7 +706,8 @@ class DurableLedgerValidationTests(unittest.TestCase):
         state = launcher.build_state({"run_id": "run_block", "thread_id": "t",
                                       "phases": ["ANALYSIS"]})
         final = launcher.execute_state(state, adapter=FakeAdapter([], runtime_state=store),
-                                       runtime_state=store)
+                                       runtime_state=store,
+                                       checkpoint_store_path=self.path.parent / "cp.json")
         self.assertEqual(final["terminal_status"], "BLOCKED")
         self.assertEqual(final["terminal_reason"]["code"], "INCOMPATIBLE_RUNTIME_STATE")
         self.assertEqual(launcher.EXIT_CODES[final["terminal_status"]], 1)

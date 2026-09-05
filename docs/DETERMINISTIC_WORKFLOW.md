@@ -160,9 +160,54 @@ Gate passes record `head_sha`, `tree_digest`, `artifact_digest` and the full `re
 artifacts" into a checkable fact, and a Final Review PASS bound to a stale tree cannot complete
 the run.
 
+## Durable pause and resume (OS-31)
+
+A decision block is no longer an absorbing terminal. When the adapter declares both
+`human_approval` and `lifecycle_settlement`, `NEEDS_INPUT`/`CONFLICT` routes to the new
+`PAUSE` node instead of `BLOCK`; the `TERMINAL` node then writes **no** terminal status and
+sets `run_lifecycle = "WAITING_FOR_INPUT"`, which is deliberately absent from
+`TERMINAL_STATUSES`. An adapter that declares neither capability keeps exactly the pre-OS-31
+behaviour.
+
+Two durable tiers, one authority:
+
+- **Tier 1, `checkpoint_store.py`** — `FileCheckpointSaver`, an in-repository
+  `BaseCheckpointSaver` over the already-pinned `langgraph-checkpoint` serializer (no new
+  pinned dependency). It is the **sole** input to state reconstruction, keeps an explicit
+  `head` pointer written inside the same critical section as the `put`, and *retires* a
+  disposed run's thread rather than deleting it.
+- **Tier 2, `pause_store.py`** — `.pause_state.json` per run: discovery identity, the
+  run-scoped claim/lease fence, the checkpoint pointer and digest, the disposition, the
+  applied set, and a subordinate `projection` of the checkpoint. Beside it,
+  `.settlement_journal.json` records one row per dispatch, every write landing strictly
+  **before** the external effect it describes, so a successor Coordinator can reconstruct
+  work the dead process held only in memory.
+
+`pause_runtime.py` ties them together and owns C1-C4: a record is written only after the
+checkpoint commits (C1), must name its own thread's head and digest (C2), must agree with the
+projection field for field (C3, refused rather than repaired in either direction), and a
+checkpoint with no record is re-derived **from the checkpoint** idempotently (C4). The repair
+direction is checkpoint → record and never the reverse.
+
+Resume is exactly-once by construction: one complete decision bundle yields one
+`resume_bundle_id`, written as one atomic applied entry **before** the single graph
+re-entry, so no partial per-item state can exist. A replay short-circuits with
+`RESPONSE_ALREADY_APPLIED`; a differing answer is `RESPONSE_CONFLICT`, never arbitrated by
+recency. A moved head, artifact digest or policy digest re-enters through the existing
+correction machinery rather than applying the answer unconditionally, so the phase Reviewer
+and Final Adversarial Review gates cannot be bypassed by a resume.
+
+Terminal ownership is settled before the run may wait. Every dispatch is accounted on the
+four axes and must reach `released`, `exited` or `retained_by_named_owner`; anything else
+refuses the pause (`TERMINAL_OWNERSHIP_UNKNOWN`, `TERMINAL_ORPHAN_POSSIBLE`,
+`TERMINAL_IDENTITY_UNVERIFIED`) and falls back to `BLOCK`. There is no `transferred`
+disposition: an abandon that cannot discharge a row records it `residual`, reports it, and
+the run then does **not** claim "no ambiguous terminal ownership".
+
 ## Ports and adapters
 
 `ports.py` defines agent execution, artifact, runtime receipt, existing OS-30 human approval,
+run-scoped pause state (`RunPauseStatePort`), lifecycle settlement (`LifecycleSettlementPort`),
 clock, and ID protocols. `fake_adapter.py` provides Orca-independent deterministic execution.
 `orca_adapter.py` composes OrcaRuntimeHarness-compatible execution primitives, strips runtime
 handles from settlements, and owns no routing rules. Missing declared capabilities block before
@@ -181,9 +226,11 @@ dispatch.
 
 ## Extension points
 
-OS-31 may inject a durable LangGraph checkpointer and durable `RuntimeStatePort`, then add a
-`WAITING_FOR_INPUT` node which consumes OS-30 responses. OS-40 uses MemorySaver for reconstruction
-tests and terminates NEEDS_INPUT/CONFLICT as BLOCKED. OS-37 implements `AgentExecutionPort` with
+OS-31 has landed: the durable checkpointer is installed by default, `WAITING_FOR_INPUT` is a
+real lifecycle state, and the PAUSE/DISPOSE nodes consume OS-30 responses (see above). A
+graph built without a durable checkpointer is refused at build time
+(`DurableCheckpointerRequired`); `require_durable_checkpointer=False` is the named test-only
+escape hatch that keeps the existing `MemorySaver` reconstruction tests valid. OS-37 implements `AgentExecutionPort` with
 structured argv, durable idempotency receipts, ownership, and capability declarations; the graph
 does not change. OS-38 source extraction remains out of scope.
 

@@ -8,9 +8,10 @@ from .contracts import (BASE_CAPABILITIES, EVENT_REJECTION_CODES, EXTERNAL_LOOKU
                         EXTERNAL_RESUME, EventValidationError, ExternalLookupUnavailable,
                         binding_snapshot, make_intent, validate_event)
 from .lease_keeper import LeaseRenewalFailed, lease_keeper_factory
+from . import pause_policy
 from .routing import (active_correction_phase, downstream_revalidation_set,
                       final_review_binding_current, missing_capabilities, responsible_phases,
-                      route)
+                      route, verify_final_review_binding)
 from .runtime_state import (ALREADY_SETTLED, CREATED, DEFAULT_OBSERVE_TIMEOUT_SECONDS,
                             EFFECTED, SETTLED, RuntimeStateLeaseHeld,
                             RuntimeStateObservationTimeout, resolve_runtime_state)
@@ -315,6 +316,266 @@ def execute_intent_node(adapter: Any, runtime_state: Any = None, *,
     return node
 
 
+# ---- OS-31: the PAUSE and DISPOSE nodes ---------------------------------------------
+# The engine owns pause/resume POLICY and stays runtime-neutral: every decision below is
+# taken by ``pause_policy`` (pure) over data an adapter merely *translated*.  The adapter
+# performs I/O; it never decides whether a pause may happen.
+
+
+class _WallClock:
+    def now(self) -> str:
+        from datetime import datetime, timezone
+        return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _refuse_pause(state: dict[str, Any], code: str, detail: str) -> dict[str, Any]:
+    """A refused pause falls back to exactly where a pre-OS-31 decision block left the run.
+
+    Refusing to pause is always available and always safe; pausing with an unresolved
+    terminal is neither.  No pause record is written and no half-paused state exists.
+    """
+    new = deepcopy(state)
+    new["route_token"] = "BLOCK"
+    new["terminal_reason"] = {"code": code, "message": detail, "phase": new["current_phase"]}
+    new["logical_trace"] = _trace(new, "PAUSE", route="BLOCK", reason_code=code)
+    return new
+
+
+def _settlement_row(port: Any, journal: Any, intent_id: str, *, now: str) -> dict[str, Any]:
+    """Account one dispatch on all four axes and finish its journal row.
+
+    Step 0 is the handle: ``account_axes`` and ``register_terminal`` both need a plaintext
+    handle, and in a fresh process it exists nowhere but the live runtime.  Any outcome
+    other than ``in_process``/``listing_verified`` refuses the row here, before a single
+    mutating verb is considered.
+    """
+    recovered = dict(port.recover_handle(intent_id))
+    outcome = recovered.get("handle_recovery") or "not_attempted"
+    stored = dict(journal.row(intent_id) or {}) if journal is not None else {}
+    if journal is not None:
+        journal.record(intent_id, stage=stored.get("stage") or "PLANNED",
+                       handle_recovery=outcome)
+    # The handle decides FIRST: a row whose terminal cannot be proved is refused before any
+    # question about who owns it, and long before any mutating verb is considered.
+    pause_policy.refuse_unrecovered_handle({**stored, "intent_id": intent_id}, outcome)
+    if outcome == "not_attempted":
+        # W-A: no terminal was ever requested, so there is nothing to own and nothing to
+        # leak.  The row is finished with no effect rather than refused.
+        row = {key: "" for key in pause_policy.SETTLEMENT_ROW_KEYS}
+        row.update({key: value for key, value in stored.items()
+                    if key in row and isinstance(value, str)})
+        row.update({"intent_id": intent_id, "settlement": "recovered",
+                    "worker_resource": "unsupervised",
+                    "process_liveness": "already exited",
+                    "cleanup_authority": "unknown", "recovery": "no_effect",
+                    "handle_recovery": outcome, "terminal_owner": "",
+                    "accounted_at": now})
+        row["terminal_disposition"] = pause_policy.require_pause_disposition(row)
+        if journal is not None:
+            journal.record(intent_id, stage="DISPOSED", disposed_at=now,
+                           recovery=row["recovery"],
+                           terminal_disposition=row["terminal_disposition"])
+        return pause_policy.validate_settlement_row(row)
+    # (a) decided, never assumed.  ``account_dispatch`` is read-only and issues zero
+    # commands, so repeating it after a crash is always safe.
+    row = dict(port.account_dispatch(intent_id))
+    row.setdefault("accounted_at", now)
+    row["handle_recovery"] = outcome
+    if journal is not None:
+        journal.record(intent_id, stage="ACCOUNTED", accounted_at=row["accounted_at"],
+                       dispatch_id=row.get("dispatch_id", ""),
+                       task_id=row.get("task_id", ""),
+                       handle_recovery=outcome or "",
+                       provenance_source=row.get("provenance_source", ""))
+    if row.get("settlement") == "not_settled":
+        recovery = dict(port.recover_dispatch(intent_id, reason="pause"))
+        row.update(recovery)
+        row["settlement"] = "recovered"          # recovered, never "settled"
+    if (row.get("cleanup_authority") == "authorized"
+            and row.get("worker_resource") == "release"):
+        released = dict(port.release_terminal(intent_id, authority="authorized"))
+        row.update(released)
+    row["terminal_disposition"] = pause_policy.require_pause_disposition(row)
+    if row["terminal_disposition"] in ("released", "exited"):
+        # Nobody owns a terminal that is proven ended: the owner column is blanked rather
+        # than left naming a party who no longer holds anything.
+        row["terminal_owner"] = ""
+    row = pause_policy.validate_settlement_row(
+        {key: row.get(key, "") for key in pause_policy.SETTLEMENT_ROW_KEYS})
+    if journal is not None:
+        journal.record(intent_id, stage="DISPOSED", disposed_at=now,
+                       recovery=row["recovery"],
+                       terminal_disposition=row["terminal_disposition"])
+    return row
+
+
+def pause_node(settlement_port: Any, approval_port: Any, *, clock: Any = None,
+               skill_path: Any = None, journal: Any = None,
+               sources_provider: Any = None):
+    """Build the PAUSE node: the ONE place the engine performs lifecycle settlement.
+
+    ``terminal_node`` still performs no external call.  Both ports are capability-gated
+    before this node is reachable at all, because ``routing.pause_admissible`` already
+    refused the route when either capability is missing.
+    """
+    ticker = clock or _WallClock()
+
+    def node(state: dict[str, Any]) -> dict[str, Any]:
+        now = ticker.now()
+        try:
+            intent_ids = tuple(settlement_port.open_dispatches())
+        except pause_policy.PauseRefused as exc:
+            return _refuse_pause(state, exc.code, exc.detail)
+        except Exception as exc:  # noqa: BLE001 - unreadable is unknown, never empty
+            return _refuse_pause(state, "DISPATCH_UNACCOUNTED", str(exc))
+        rows: list[dict[str, Any]] = []
+        for intent_id in intent_ids:
+            try:
+                rows.append(_settlement_row(settlement_port, journal, intent_id, now=now))
+            except pause_policy.PauseRefused as exc:
+                return _refuse_pause(state, exc.code, exc.detail)
+            except Exception as exc:  # noqa: BLE001
+                return _refuse_pause(state, "DISPATCH_UNACCOUNTED", f"{intent_id}: {exc}")
+        if any(row["settlement"] == "not_settled" for row in rows):
+            return _refuse_pause(state, "DISPATCH_UNACCOUNTED",
+                                 "a dispatch is still running; leaving one running is a leak")
+        sources = ()
+        if sources_provider is not None:
+            sources = tuple(sources_provider(state))
+        elif hasattr(approval_port, "load_blocked_sources"):
+            sources = tuple(approval_port.load_blocked_sources(state["run_id"]))
+        if not sources:
+            return _refuse_pause(state, "PAUSE_NOT_ADMISSIBLE",
+                                 "no clarification source is available to ask")
+        published = approval_port.publish(run_id=state["run_id"], sources=sources)
+        if not published.request_ids:
+            return _refuse_pause(state, "PAUSE_NOT_ADMISSIBLE",
+                                 "the approval port published no request")
+        request_id = published.request_ids[0]
+        item_ids = sorted(published.item_ids)
+        ledger_keys = sorted({key for source in sources
+                              for key in source.source_ledger_keys})
+        responsible = pause_policy.responsible_phase_for(
+            [{"phase": source.phase} for source in sources],
+            state["requested_phases"], state["current_phase"])
+        binding = {
+            "pause_record_id": pause_policy.pause_record_id(
+                run_id=state["run_id"], thread_id=state["thread_id"],
+                request_id=request_id, decision_item_ids=item_ids),
+            "paused_at": now, "request_id": request_id,
+            "decision_item_ids": item_ids, "source_ledger_keys": ledger_keys,
+            "responsible_phase": responsible,
+            "repository_binding": deepcopy(state["repository_binding"]),
+            "artifact_binding": deepcopy(state["artifact_binding"]),
+            "policy_digest": (pause_policy.policy_digest(skill_path) if skill_path
+                              else "no_policy_source"),
+            "settlement_ledger": rows, "disposition": None,
+        }
+        new = deepcopy(state)
+        new["pause_binding"] = pause_policy.validate_pause_binding(binding)
+        new["pending_clarification_id"] = request_id
+        new["run_lifecycle"] = "WAITING_FOR_INPUT"
+        new["route_token"] = "PAUSE"
+        new["pending_role"] = None; new["pending_intent"] = None
+        new["pending_event"] = None; new["intent_status"] = "NONE"
+        new["logical_trace"] = _trace(new, "PAUSE", route="PAUSE")
+        return new
+
+    return node
+
+
+def dispose_node(settlement_port: Any = None, *, clock: Any = None, journal: Any = None):
+    """Build the DISPOSE node: explicit cancel/abandon of an already-paused run.
+
+    Bindings are deliberately **frozen**, not re-validated: a moved head is not a reason to
+    refuse a cancel.  That is the exact opposite of the resume rule, and the pair is
+    asserted as a pair.
+    """
+    ticker = clock or _WallClock()
+
+    def node(state: dict[str, Any]) -> dict[str, Any]:
+        now = ticker.now()
+        new = deepcopy(state)
+        binding = deepcopy(new["pause_binding"] or {})
+        disposition = binding.get("disposition") or {}
+        rows = [dict(row) for row in binding.get("settlement_ledger") or ()]
+        if disposition.get("kind") == "ABANDON" and settlement_port is not None:
+            # TC-3: residual dispatches are discovered durably, so a Coordinator that never
+            # ran the original dispatch still finds them.  Abandon is the last-resort
+            # disposition and must be able to complete, so a row that reaches none of the
+            # discharging dispositions is recorded ``residual`` -- reported, never claimed.
+            accounted = {row["intent_id"] for row in rows}
+            try:
+                pending = [value for value in settlement_port.open_dispatches()
+                           if value not in accounted]
+            except Exception:  # noqa: BLE001 - report what is knowable, refuse nothing here
+                pending = []
+            for intent_id in pending:
+                rows.append(_residual_row(settlement_port, journal, intent_id, now=now,
+                                          cancellation_id=disposition.get(
+                                              "cancellation_id", "")))
+        binding["settlement_ledger"] = rows
+        new["pause_binding"] = binding
+        new["route_token"] = disposition.get("kind") or "CANCEL"
+        new["logical_trace"] = _trace(new, "DISPOSE", route=new["route_token"])
+        return new
+
+    return node
+
+
+def _residual_row(port: Any, journal: Any, intent_id: str, *, now: str,
+                  cancellation_id: str) -> dict[str, Any]:
+    """Account a residual dispatch on the abandon path, refusing nothing and claiming nothing."""
+    recovered: dict[str, Any] = {"handle": None, "handle_recovery": "not_attempted"}
+    try:
+        recovered = dict(port.recover_handle(intent_id))
+    except Exception:  # noqa: BLE001 - abandon must complete; the row records what is known
+        pass
+    row: dict[str, Any] = {key: "" for key in pause_policy.SETTLEMENT_ROW_KEYS}
+    stored = journal.row(intent_id) if journal is not None else None
+    for key in pause_policy.SETTLEMENT_ROW_KEYS:
+        value = (stored or {}).get(key)
+        if isinstance(value, str) and value:
+            row[key] = value
+    try:
+        accounted = dict(port.account_dispatch(intent_id))
+        for key, value in accounted.items():
+            if key in row and isinstance(value, str):
+                row[key] = value
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        recovery = dict(port.recover_dispatch(intent_id, reason=f"abandon:{cancellation_id}"))
+        for key, value in recovery.items():
+            if key in row and isinstance(value, str):
+                row[key] = value
+        row["settlement"] = "recovered"
+    except Exception:  # noqa: BLE001
+        row["settlement"] = row.get("settlement") or "not_settled"
+    row["intent_id"] = intent_id
+    row["accounted_at"] = row.get("accounted_at") or now
+    row["handle_recovery"] = recovered.get("handle_recovery") or "not_attempted"
+    row["settlement"] = row.get("settlement") or "not_settled"
+    row["worker_resource"] = row.get("worker_resource") or "unsupervised"
+    row["process_liveness"] = row.get("process_liveness") or "disputed"
+    row["cleanup_authority"] = row.get("cleanup_authority") or "unknown"
+    row["provenance_source"] = row.get("provenance_source") or "absent"
+    disposition = pause_policy.terminal_disposition(row)
+    row["terminal_disposition"] = disposition
+    if disposition == "residual":
+        # Not a transfer, and not called one.  Writing an actor id into a field would be an
+        # audit action, not an adoption, so the owner stays empty and the run does not
+        # claim AC-1 for this dispatch.
+        row["terminal_owner"] = ""
+        row["recovery"] = f"residual:{cancellation_id}"
+    if journal is not None:
+        journal.record(intent_id, stage="DISPOSED", disposed_at=now,
+                       recovery=row["recovery"],
+                       terminal_disposition=row["terminal_disposition"],
+                       handle_recovery=row["handle_recovery"])
+    return pause_policy.validate_settlement_row(row)
+
+
 def validate_settlement_node(state: dict[str, Any]) -> dict[str, Any]:
     intent, event = state["pending_intent"], state["pending_event"]
     if not intent or not event or event.get("intent_id") != intent["intent_id"] or event.get("command_id") != intent["command_id"]:
@@ -351,6 +612,8 @@ def _pass_record(state: dict[str, Any], phase: str, intent: dict[str, Any],
     artifact = (state["artifact_binding"] if intent["role"] == "WORKER"
                 else intent["artifact_binding"])
     return {"phase": phase, "generation": state["phase_iterations"][phase],
+            # OS-31 AC-6: the generation the phase-pass currency floor compares against.
+            "binding_generation": state.get("binding_generation", 0),
             "tree_digest": repository.get("tree_digest"),
             "head_sha": repository.get("head_sha"),
             "artifact_digest": artifact.get("digest"),
@@ -446,8 +709,45 @@ def advance_phase_node(state: dict[str, Any]) -> dict[str, Any]:
 
 def terminal_node(state: dict[str, Any]) -> dict[str, Any]:
     new = deepcopy(state); token = new["route_token"]
-    if token == "COMPLETE": status, code = "COMPLETED", "WORKFLOW_COMPLETED"
-    elif token == "ESCALATE":
+    if token == "PAUSE":
+        # OS-31.  TERMINAL is the graph *exit* node, not "the run is over".  For a pause it
+        # writes NO terminal status: the run is WAITING_FOR_INPUT, which is deliberately
+        # absent from TERMINAL_STATUSES, so there is nothing for a resume to clear.
+        new["run_lifecycle"] = "WAITING_FOR_INPUT"
+        new["terminal_status"] = None
+        new["terminal_reason"] = {"code": new["decision_state"],
+                                  "message": "WAITING_FOR_INPUT",
+                                  "phase": new["current_phase"]}
+        new["pending_role"] = None; new["pending_intent"] = None
+        new["pending_event"] = None; new["intent_status"] = "NONE"
+        new["logical_trace"] = _trace(new, "TERMINAL", terminal_status=None,
+                                      reason_code=new["decision_state"])
+        return new
+    if token in ("CANCEL", "ABANDON"):
+        status = "CANCELLED" if token == "CANCEL" else "ABANDONED"
+        disposition = (new.get("pause_binding") or {}).get("disposition") or {}
+        new["run_lifecycle"] = "SETTLED"
+        new["terminal_status"] = status
+        new["terminal_reason"] = {"code": f"RUN_{status}",
+                                  "message": disposition.get("cancellation_id", status),
+                                  "phase": new["current_phase"]}
+        new["pending_role"] = None; new["pending_intent"] = None
+        new["pending_event"] = None; new["intent_status"] = "NONE"
+        new["logical_trace"] = _trace(new, "TERMINAL", terminal_status=status,
+                                      reason_code=f"RUN_{status}")
+        return new
+    if token == "COMPLETE":
+        status, code = "COMPLETED", "WORKFLOW_COMPLETED"
+        # OS-31 SS7.3.  ``route`` already required final_review_binding_current before it
+        # emitted COMPLETE; verifying again at the stamping point is a fail-closed
+        # cross-check, and turns a helper that was test-only into production code.
+        try:
+            verify_final_review_binding(new)
+        except ValueError as exc:
+            token = "BLOCK"
+            new["route_token"] = "BLOCK"
+            new["terminal_reason"] = {"code": str(exc), "message": str(exc)}
+    if token == "ESCALATE":
         status = "ESCALATED"
         correction_phase = active_correction_phase(new)
         responsible_exhausted = (new["round_kind"] == "FINAL_REVIEW"
@@ -457,12 +757,18 @@ def terminal_node(state: dict[str, Any]) -> dict[str, Any]:
             "MAX_ITERATIONS_REACHED" if responsible_exhausted
             else ("FINAL_REVIEW_MAX_ITERATIONS_REACHED" if new["round_kind"] == "FINAL_REVIEW"
                   else "MAX_ITERATIONS_REACHED"))
-    else:
+    elif token != "COMPLETE":
         status = "BLOCKED"
         stale_final = (new["round_kind"] == "FINAL_REVIEW"
                        and (new.get("final_reviewer_result") or {}).get("result") == "PASS"
                        and not final_review_binding_current(new))
-        if new["decision_state"] in ("NEEDS_INPUT", "CONFLICT"): code = new["decision_state"]
+        refusal = (new.get("terminal_reason") or {}).get("code")
+        if refusal in pause_policy.PAUSE_REFUSAL_CODES:
+            # A refused pause falls back to exactly where a pre-OS-31 decision block left
+            # the run -- BLOCK/BLOCKED -- but it says WHY, so "the pause was refused" is
+            # never reported as an ordinary decision block.
+            code = refusal
+        elif new["decision_state"] in ("NEEDS_INPUT", "CONFLICT"): code = new["decision_state"]
         elif stale_final and not (new.get("terminal_reason") or {}).get("code"):
             code = "STALE_FINAL_REVIEW_BINDING"
         else: code = (new.get("terminal_reason") or {}).get("code") or ("UNIT_TEST_BLOCKED" if (new.get("worker_result") or {}).get("unit_test_status") == "BLOCKED" else "WORKER_BLOCKED")
@@ -470,7 +776,8 @@ def terminal_node(state: dict[str, Any]) -> dict[str, Any]:
     if (token == "ESCALATE" and new["round_kind"] == "FINAL_REVIEW"
             and code == "MAX_ITERATIONS_REACHED" and correction_phase is not None):
         reason_phase = correction_phase
-    new["terminal_status"] = status; new["terminal_reason"] = {"code": code, "message": code, "phase": reason_phase}
+    new["terminal_status"] = status; new["run_lifecycle"] = "SETTLED"
+    new["terminal_reason"] = {"code": code, "message": code, "phase": reason_phase}
     new["pending_role"] = None; new["pending_intent"] = None; new["pending_event"] = None; new["intent_status"] = "NONE"
     new["logical_trace"] = _trace(new, "TERMINAL", terminal_status=status, reason_code=code)
     return new
