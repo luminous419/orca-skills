@@ -40,6 +40,11 @@ PAUSE_REFUSAL_CODES = frozenset({
     "PAUSE_RECORD_MISSING", "PAUSE_RECORD_CORRUPT", "CHECKPOINT_STORE_RETIRED",
     "PAUSE_CLAIM_HELD", "PAUSE_CLAIM_LOST", "PAUSE_OBSERVATION_TIMEOUT",
     "PAUSE_TRANSITION_FORBIDDEN", "PAUSE_LIFECYCLE_INCOHERENT",
+    # A run pauses more than once.  Each pause is a generation; these two name the only
+    # ways a NEW generation may fail to become the active one (see FilePauseRecordStore
+    # .create): an unanswered generation is still active, or the successor's lineage --
+    # its own checkpoint and a non-decreasing binding_generation -- does not hold.
+    "PAUSE_GENERATION_ACTIVE", "PAUSE_GENERATION_LINEAGE",
     "SETTLEMENT_JOURNAL_CORRUPT",
     "RESPONSE_NOT_FOUND", "RESPONSE_ALREADY_APPLIED", "RESPONSE_STALE_REVISION",
     "RESPONSE_CONFLICT", "RESPONSE_ITEM_UNRESOLVED",

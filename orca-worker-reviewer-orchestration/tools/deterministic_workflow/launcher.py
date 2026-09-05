@@ -271,7 +271,16 @@ def build_pause_parser() -> argparse.ArgumentParser:
     resume.add_argument("--actor-type", default="human", choices=("human", "service"))
     resume.add_argument("--submission-id", default="")
     resume.add_argument("--reason", default="")
-    resume.add_argument("--observe-timeout", type=float, default=30.0)
+    # Default None, not a constant: the store derives a BOUNDED window that covers the
+    # incumbent's whole lease (pause_store.observe_timeout_for), because a window shorter
+    # than the lease -- which the old fixed 30s default was against a 60s lease -- can
+    # never legally reach takeover in this single call and forced an undocumented retry.
+    resume.add_argument("--observe-timeout", type=float, default=None,
+                        help="seconds to observe a run another Coordinator holds before "
+                             "taking over (default: the owner's whole lease plus "
+                             "pause_store.DEFAULT_OBSERVE_GRACE_SECONDS); a shorter "
+                             "explicit value is honoured and its PAUSE_OBSERVATION_TIMEOUT "
+                             "is a retryable outcome that claims nothing")
     resume.add_argument("--results",
                         help="JSON file with the fake adapter's scripted settlements for "
                              "the round the run re-enters")
@@ -360,7 +369,11 @@ def run_pause_cli(argv: list[str]) -> int:
             summary = {"run_id": args.run_id, "status": outcome.status,
                        "code": outcome.code, "detail": outcome.detail,
                        "resumed_checkpoint_id": outcome.resumed_checkpoint_id,
-                       "revalidation_codes": list(outcome.revalidation_codes)}
+                       "revalidation_codes": list(outcome.revalidation_codes),
+                       # A resumed run that paused AGAIN is still waiting on a human, and
+                       # reporting only "RESUMED" would hide the new question.
+                       "next_pause_record_id": (outcome.next_pause_record or {}).get(
+                           "pause_record_id", "")}
             exit_code = 0 if outcome.status in ("RESUMED", "ALREADY_APPLIED",
                                                 "NO_EFFECT") else 1
     except LauncherError as exc:

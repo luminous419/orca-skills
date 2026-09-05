@@ -2438,6 +2438,33 @@ AC-1을 해소하는 값은 앞의 셋뿐이다. residual은 abandon 경로에�
 그 run은 AC-1을 주장하지 않는다 (ac1_discharged=false). "transferred"라는 값은 없다.
 ```
 
+하나의 run은 여러 번 pause할 수 있다. 각 pause는 자신의 **generation**이며
+`pause_record_id`, 자신의 checkpoint, 그리고 `binding_generation`으로 식별된다.
+
+```text
+generation 정책 (Tier 2 .pause_state.json)
+  record 없음                  -> generation 1을 기록한다
+  같은 generation 재기록         -> idempotent no-op (live lease column을 보존한다)
+  WAITING_FOR_INPUT generation -> 다른 generation으로 덮어쓰지 않는다: PAUSE_GENERATION_ACTIVE
+  CANCELLED / ABANDONED        -> 더 이상의 generation은 없다: RUN_ALREADY_CANCELLED / _ABANDONED
+  RESUMED generation           -> supersede한다. 답변된 generation은 superseded 이력으로
+                                  통째로 보존되고(applied set = OS-30 소비 lineage),
+                                  새 generation이 active record가 된다
+  lineage 위반(같은 checkpoint, 또는 binding_generation 역행) -> PAUSE_GENERATION_LINEAGE
+resume 도중 run이 다시 pause하면 그 generation은 resume 경로에서 finalize된다
+```
+
+claim한 Coordinator는 claimed section 전체 — decision 조회, 재검증, checkpoint 갱신,
+`graph.invoke()` — 동안 lease를 갱신한다. lease를 잃으면 그 즉시 멈추고 어떤 effect도 state
+변경도 더 하지 않으며 `PAUSE_CLAIM_LOST`로 fail-closed 처리된다.
+
+```text
+관측 창은 lease를 덮는다: observe 기본 timeout = lease + DEFAULT_OBSERVE_GRACE_SECONDS.
+  따라서 단 한 번의 observe-then-takeover 호출로 인수가 가능하다 (bounded, 무한 대기 없음).
+명시적으로 더 짧은 timeout을 준 caller는 그 값 그대로 bounded되며,
+  PAUSE_OBSERVATION_TIMEOUT은 아무것도 claim하지 않은 retryable 결과다 -- run에 대한 판정이 아니다.
+```
+
 응답 적용과 재개는 완전한 decision bundle 하나에 대한 단일 identity
 (`resume_bundle_id`)를 가진다. 중복 응답은 `RESPONSE_ALREADY_APPLIED`, 오래된 revision은
 `RESPONSE_STALE_REVISION`, 서로 충돌하는 응답은 `RESPONSE_CONFLICT`로 fail-closed 처리되며,

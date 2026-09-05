@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from . import pause_policy, pause_store
+from .lease_keeper import LeaseRenewalFailed, lease_keeper_factory
 from .pause_policy import PauseRefused
 from .state import WorkflowState, validate_state
 
@@ -122,6 +123,39 @@ def _run_status(run_id: str, artifact_base: Any, status: str, *, reason: str = "
         pass
 
 
+# ---- keeping the run-scoped lease alive for the WHOLE claimed section ------------------
+# ``claim()`` mints a lease of ``store.lease_seconds`` and nothing renewed it, while the
+# claimed section -- read the decision, revalidate, update the checkpoint, and above all
+# ``graph.invoke()`` -- runs for as long as the resumed run takes.  A healthy owner was
+# therefore indistinguishable from a dead one after one lease period: its lease lapsed, a
+# second Coordinator legally claimed the same RECORDED bundle, saw a checkpoint that still
+# said WAITING_FOR_INPUT, and re-entered the same run concurrently.
+#
+# This is the identical defect ``lease_keeper`` already solves for the executor's blocking
+# adapter calls, so it is solved the identical way rather than with a second mechanism:
+# :class:`lease_keeper.LeaseKeeper` renews on a daemon thread for the whole call at a period
+# derived from the lease, and fails closed -- the first failed renewal stops the keeper and
+# is re-raised at the next ownership checkpoint.  ``FilePauseRecordStore`` already exposes
+# the ``heartbeat(id, token)`` / ``lease_seconds`` surface the keeper needs.
+def _still_owned(keeper: Any) -> None:
+    """The ownership checkpoint taken before and after every ownership-sensitive write."""
+    if keeper is not None:
+        keeper.raise_if_lost()
+
+
+def _committed(keeper: Any, write: Any, *args: Any, **kwargs: Any) -> Any:
+    """One fenced write between two ownership checkpoints, exactly as the executor does.
+
+    The checkpoint *after* the write matters as much as the one before it: a renewal that
+    fails while the write is in flight need not rotate the token, so the fence would accept
+    the write and the recorded loss would be swallowed.
+    """
+    _still_owned(keeper)
+    result = write(*args, **kwargs)
+    _still_owned(keeper)
+    return result
+
+
 @dataclass(frozen=True)
 class Takeover:
     """The outcome of exactly one run-scoped claim attempt."""
@@ -143,6 +177,9 @@ class ResumeOutcome:
     resumed_checkpoint_id: str = ""
     revalidation_codes: tuple[str, ...] = ()
     effect_performed: bool = False
+    #: The NEXT pause generation, when the resumed run paused again inside this same
+    #: re-entry.  ``None`` for a resume that ran to a terminal.
+    next_pause_record: dict[str, Any] | None = None
 
 
 @dataclass
@@ -343,13 +380,20 @@ def discover(artifact_base: str | os.PathLike[str], *,
     return tuple(listings)
 
 
-def takeover(run_id: str, *, store: Any,
-             observe_timeout_seconds: float = pause_store.DEFAULT_OBSERVE_TIMEOUT_SECONDS,
+def takeover(run_id: str, *, store: Any, observe_timeout_seconds: float | None = None,
              artifact_base: str | os.PathLike[str] | None = None) -> Takeover:
     """Exactly one claim attempt; a loser observes and performs NO effect at any point.
 
     Because the claim is taken strictly before any external work, a concurrent resume race
     creates no duplicate Task, Dispatch, artifact or log row.
+
+    ``observe_timeout_seconds`` defaults to ``None``, which means the store's own bounded
+    lease-derived window (:func:`pause_store.observe_timeout_for`).  That is what makes the
+    single call this docstring promises actually reach the takeover when the incumbent has
+    stopped heartbeating: a window shorter than the incumbent's lease -- which the previous
+    fixed 30s default was, against a 60s lease -- always ended in
+    ``PAUSE_OBSERVATION_TIMEOUT`` before takeover was even legal.  An explicit value is
+    still honoured exactly, and its timeout stays a retryable outcome that claims nothing.
     """
     try:
         record = dict(store.claim(run_id))
@@ -450,9 +494,26 @@ def resume_run(run_id: str, *, artifact_base: str | os.PathLike[str], approval_p
                graph_factory: Any, current_repository: Mapping[str, Any],
                current_artifact: Mapping[str, Any], current_policy_digest: str,
                store: Any = None, recursion_limit: int | None = None,
-               observe_timeout_seconds: float = pause_store.DEFAULT_OBSERVE_TIMEOUT_SECONDS,
-               ) -> ResumeOutcome:
-    """Apply the human decision and re-enter the SAME run exactly once."""
+               observe_timeout_seconds: float | None = None,
+               keeper_factory: Any = None) -> ResumeOutcome:
+    """Apply the human decision and re-enter the SAME run exactly once.
+
+    The claimed section is held under a live lease from the claim to the last state
+    mutation: the decision read, the C1-C3 revalidation, the checkpoint update and the
+    whole of ``graph.invoke()`` run inside a :class:`lease_keeper.LeaseKeeper`, which
+    renews on a background thread and fails closed.  Losing ownership at any point stops
+    this process immediately -- no further effect, no further state mutation -- and is
+    reported as ``PAUSE_CLAIM_LOST``, never as a silent success.
+
+    ``keeper_factory`` replaces the keeper outright and exists so a test can drive renewal
+    deterministically; it is called as ``factory(store, run_id, lease_token)`` exactly as
+    the executor calls its own.
+
+    A resumed run may pause AGAIN inside this same re-entry.  That next generation is
+    finalised here, after the keeper has been retired, and is returned as
+    ``next_pause_record``: without it the new pause would exist in the checkpoint and
+    nowhere in the Tier-2 index, which is invisible to ``discover``.
+    """
     store = store or pause_store.store_for(run_id, artifact_base=artifact_base)
     try:
         claimed = takeover(run_id, store=store, artifact_base=artifact_base,
@@ -467,88 +528,127 @@ def resume_run(run_id: str, *, artifact_base: str | os.PathLike[str], approval_p
         return ResumeOutcome("NO_EFFECT", code=code, record=claimed.record)
     record = claimed.record or {}
     lease_token = claimed.lease_token
+    factory = keeper_factory or lease_keeper_factory()
     try:
-        saver = open_saver(record, artifact_base=artifact_base)
-        state = validate_pause_consistency(record, saver)
-        binding = state["pause_binding"] or {}
-        decisions = read_decision_bundle(
-            approval_port, run_id=run_id, request_id=binding["request_id"],
-            decision_item_ids=list(binding["decision_item_ids"]))
-        bundle_id = pause_policy.resume_bundle_id(
-            run_id=run_id, request_id=binding["request_id"],
-            pause_record_id=binding["pause_record_id"],
-            decisions=tuple(sorted(decisions.items())))
-        stored = record["applied"].get(bundle_id)
-        if stored is not None and stored["stage"] == "RESUMED":
-            return ResumeOutcome("ALREADY_APPLIED", code="RESPONSE_ALREADY_APPLIED",
-                                 record=record,
-                                 resumed_checkpoint_id=stored["resumed_checkpoint_id"])
-        if stored is not None and stored["stage"] == "RECORDED":
-            # The crash window between the dedupe write and the effect.  Ask the AUTHORITY,
-            # not the record: if the head still carries the pause, the resume never
-            # committed and re-driving is byte-identical; if it moved past, it did commit.
-            head_state = reconstruct({**record,
-                                      "checkpoint_id": saver.head(record["thread_id"])},
-                                     saver)
-            if head_state.get("run_lifecycle") != "WAITING_FOR_INPUT":
-                promoted = store.promote_applied(
-                    run_id, bundle_id, resumed_at=_now(),
-                    resumed_checkpoint_id=saver.head(record["thread_id"]) or "",
-                    lease_token=lease_token)
-                store.mark_resumed(run_id, lease_token, updated_at=_now())
+        # Everything inside this block runs under a lease that is being renewed.  The
+        # keeper is stopped and VERIFIED on every exit path (success, refusal, crash), and
+        # its ``__exit__`` takes the last ownership checkpoint after the final write, so a
+        # renewal that failed while that write was in flight cannot be swallowed.
+        with factory(store, run_id, lease_token) as keeper:
+            saver = open_saver(record, artifact_base=artifact_base)
+            state = validate_pause_consistency(record, saver)
+            binding = state["pause_binding"] or {}
+            decisions = read_decision_bundle(
+                approval_port, run_id=run_id, request_id=binding["request_id"],
+                decision_item_ids=list(binding["decision_item_ids"]))
+            bundle_id = pause_policy.resume_bundle_id(
+                run_id=run_id, request_id=binding["request_id"],
+                pause_record_id=binding["pause_record_id"],
+                decisions=tuple(sorted(decisions.items())))
+            stored = record["applied"].get(bundle_id)
+            if stored is not None and stored["stage"] == "RESUMED":
                 return ResumeOutcome("ALREADY_APPLIED", code="RESPONSE_ALREADY_APPLIED",
-                                     record=promoted,
-                                     resumed_checkpoint_id=saver.head(record["thread_id"]) or "")
-        reentry = pause_policy.resume_reentry(
-            state, current_repository=current_repository,
-            current_artifact=current_artifact,
-            current_policy_digest=current_policy_digest)
-        entry = {"resume_bundle_id": bundle_id, "request_id": binding["request_id"],
-                 "items": pause_store.applied_items(decisions), "stage": "RECORDED",
-                 "recorded_at": _now(), "resumed_at": "", "resumed_checkpoint_id": ""}
-        record = dict(store.record_applied(run_id, entry, lease_token))
-        # ---- THE single effect, owned by the bundle entry and by nothing else ----
-        graph = graph_factory(saver)
-        config: dict[str, Any] = {
-            "configurable": {"thread_id": record["thread_id"],
-                             "checkpoint_ns": record["checkpoint_ns"]}}
-        if recursion_limit:
-            config["recursion_limit"] = recursion_limit
-        # ``as_node="VALIDATE"`` is what makes the update a RE-ENTRY rather than a write:
-        # the run continues from VALIDATE's outgoing edge, i.e. straight into ROUTE, which
-        # is the same pure function over the same predicates it was before the pause.
-        graph.update_state_command(
-            config, "RESUME_PAUSE", as_node="VALIDATE",
-            run_lifecycle="ACTIVE", pause_binding=None,
-            decision_state="CLEAR", decision_reason_code=None,
-            pending_clarification_id=binding["request_id"],
-            round_kind=reentry.round_kind, current_phase=reentry.current_phase,
-            correction_queue=list(reentry.correction_queue),
-            correction_index=reentry.correction_index,
-            binding_generation=reentry.binding_generation,
-            phase_pass_floor=dict(reentry.phase_pass_floor),
-            repository_binding=dict(current_repository),
-            artifact_binding=dict(current_artifact),
-            route_token=None, terminal_reason=None)
-        final = graph.invoke(None, config)
-        resumed_head = saver.head(record["thread_id"]) or ""
-        record = dict(store.promote_applied(run_id, bundle_id, resumed_at=_now(),
-                                            resumed_checkpoint_id=resumed_head,
-                                            lease_token=lease_token))
-        record = dict(store.mark_resumed(run_id, lease_token, updated_at=_now()))
-        _timing(run_id, artifact_base, run_logging.EVENT_RUN_RESUMED,
-                phase=reentry.current_phase, risk=state["risk"],
-                detail=f"bundle={bundle_id}")
-        _audit(run_id, artifact_base, run_logging.EVENT_RUN_RESUMED,
-               phase=reentry.current_phase, risk=state["risk"],
-               round_kind=str(reentry.round_kind).lower(),
-               result=str(final.get("terminal_status") or "ACTIVE"),
-               detail=(f"bundle={bundle_id} checkpoint={resumed_head} "
-                       f"revalidation={','.join(reentry.revalidation_codes) or 'none'}"))
+                                     record=record,
+                                     resumed_checkpoint_id=stored["resumed_checkpoint_id"])
+            if stored is not None and stored["stage"] == "RECORDED":
+                # The crash window between the dedupe write and the effect.  Ask the
+                # AUTHORITY, not the record: if the head still carries the pause, the
+                # resume never committed and re-driving is byte-identical; if it moved
+                # past, it did commit.
+                head_state = reconstruct({**record,
+                                          "checkpoint_id": saver.head(record["thread_id"])},
+                                         saver)
+                if head_state.get("run_lifecycle") != "WAITING_FOR_INPUT":
+                    promoted = _committed(
+                        keeper, store.promote_applied, run_id, bundle_id,
+                        resumed_at=_now(),
+                        resumed_checkpoint_id=saver.head(record["thread_id"]) or "",
+                        lease_token=lease_token)
+                    _committed(keeper, store.mark_resumed, run_id, lease_token,
+                               updated_at=_now())
+                    return ResumeOutcome("ALREADY_APPLIED", code="RESPONSE_ALREADY_APPLIED",
+                                         record=promoted,
+                                         resumed_checkpoint_id=saver.head(record["thread_id"]) or "")
+            reentry = pause_policy.resume_reentry(
+                state, current_repository=current_repository,
+                current_artifact=current_artifact,
+                current_policy_digest=current_policy_digest)
+            entry = {"resume_bundle_id": bundle_id, "request_id": binding["request_id"],
+                     "items": pause_store.applied_items(decisions), "stage": "RECORDED",
+                     "recorded_at": _now(), "resumed_at": "", "resumed_checkpoint_id": ""}
+            record = dict(_committed(keeper, store.record_applied, run_id, entry,
+                                     lease_token))
+            # ---- THE single effect, owned by the bundle entry and by nothing else ----
+            graph = graph_factory(saver)
+            config: dict[str, Any] = {
+                "configurable": {"thread_id": record["thread_id"],
+                                 "checkpoint_ns": record["checkpoint_ns"]}}
+            if recursion_limit:
+                config["recursion_limit"] = recursion_limit
+            # ``as_node="VALIDATE"`` is what makes the update a RE-ENTRY rather than a
+            # write: the run continues from VALIDATE's outgoing edge, i.e. straight into
+            # ROUTE, which is the same pure function over the same predicates it was
+            # before the pause.
+            _committed(
+                keeper, graph.update_state_command,
+                config, "RESUME_PAUSE", as_node="VALIDATE",
+                run_lifecycle="ACTIVE", pause_binding=None,
+                decision_state="CLEAR", decision_reason_code=None,
+                pending_clarification_id=binding["request_id"],
+                round_kind=reentry.round_kind, current_phase=reentry.current_phase,
+                correction_queue=list(reentry.correction_queue),
+                correction_index=reentry.correction_index,
+                binding_generation=reentry.binding_generation,
+                phase_pass_floor=dict(reentry.phase_pass_floor),
+                repository_binding=dict(current_repository),
+                artifact_binding=dict(current_artifact),
+                route_token=None, terminal_reason=None)
+            # The long blocking call.  The keeper renews throughout it; the checkpoint
+            # immediately after it is what stops a superseded owner from writing the
+            # promotion of an effect a successor has already adopted.
+            final = graph.invoke(None, config)
+            _still_owned(keeper)
+            resumed_head = saver.head(record["thread_id"]) or ""
+            record = dict(_committed(keeper, store.promote_applied, run_id, bundle_id,
+                                     resumed_at=_now(),
+                                     resumed_checkpoint_id=resumed_head,
+                                     lease_token=lease_token))
+            record = dict(_committed(keeper, store.mark_resumed, run_id, lease_token,
+                                     updated_at=_now()))
+            _timing(run_id, artifact_base, run_logging.EVENT_RUN_RESUMED,
+                    phase=reentry.current_phase, risk=state["risk"],
+                    detail=f"bundle={bundle_id}")
+            _audit(run_id, artifact_base, run_logging.EVENT_RUN_RESUMED,
+                   phase=reentry.current_phase, risk=state["risk"],
+                   round_kind=str(reentry.round_kind).lower(),
+                   result=str(final.get("terminal_status") or "ACTIVE"),
+                   detail=(f"bundle={bundle_id} checkpoint={resumed_head} "
+                           f"revalidation={','.join(reentry.revalidation_codes) or 'none'}"))
+        # ---- the NEXT pause generation, if the resumed run paused again ----------------
+        # Deliberately outside the keeper: this generation's record is written with no
+        # owner and no lease, exactly like the first pause, so the next Coordinator can
+        # claim it -- and writing it under a lease this process is about to drop would
+        # leave the run claimed by a process that has finished.  The generation above is
+        # already RESUMED on disk, which is what makes the create() below a supersede
+        # rather than an overwrite of a live pause.
+        next_record = finalize_pause(final, saver=saver, store=store,
+                                     checkpoint_store_path=record["checkpoint_store_path"],
+                                     artifact_base=artifact_base)
         return ResumeOutcome("RESUMED", record=record, state=dict(final),
                              resumed_checkpoint_id=resumed_head,
                              revalidation_codes=reentry.revalidation_codes,
-                             effect_performed=True)
+                             effect_performed=True,
+                             next_pause_record=next_record)
+    except LeaseRenewalFailed as exc:
+        # Fail closed and STAY closed.  The lease was lost while this process was inside
+        # the claimed section, so a successor may already own the run: this process writes
+        # nothing further and never re-enters the claim path.  The run itself is not
+        # damaged -- the checkpoint is the authority and C4 re-derives the record -- but
+        # this Coordinator no longer speaks for it.
+        _audit(run_id, artifact_base, run_logging.EVENT_RUN_RESUME_REFUSED,
+               result="PAUSE_CLAIM_LOST", detail=str(exc))
+        return ResumeOutcome("REFUSED", code="PAUSE_CLAIM_LOST", detail=str(exc),
+                             record=record)
     except PauseRefused as exc:
         store.release(run_id, lease_token)
         _audit(run_id, artifact_base, run_logging.EVENT_RUN_RESUME_REFUSED,
@@ -564,9 +664,15 @@ def dispose_run(run_id: str, *, artifact_base: str | os.PathLike[str], kind: str
                 actor_id: str, actor_type: str, submission_id: str, reason: str,
                 graph_factory: Any, approval_port: Any = None, store: Any = None,
                 settlement_port: Any = None, recursion_limit: int | None = None,
-                observe_timeout_seconds: float = pause_store.DEFAULT_OBSERVE_TIMEOUT_SECONDS,
-                ) -> DisposeOutcome:
-    """Explicit human cancel/abandon of a paused run.  Never a timeout, never automatic."""
+                observe_timeout_seconds: float | None = None,
+                keeper_factory: Any = None) -> DisposeOutcome:
+    """Explicit human cancel/abandon of a paused run.  Never a timeout, never automatic.
+
+    The claimed section is held under a renewed lease for exactly the same reason
+    :func:`resume_run` is: a disposal also revalidates, drives ``graph.invoke()`` and then
+    writes the terminal disposition, and a lease that lapses in the middle of that would
+    let a second Coordinator claim the same run and drive the same effect.
+    """
     if kind not in pause_policy.DISPOSITION_KINDS:
         raise ValueError(f"unknown disposition kind: {kind!r}")
     store = store or pause_store.store_for(run_id, artifact_base=artifact_base)
@@ -585,62 +691,74 @@ def dispose_run(run_id: str, *, artifact_base: str | os.PathLike[str], kind: str
                               record=claimed.record)
     record = claimed.record or {}
     lease_token = claimed.lease_token
+    factory = keeper_factory or lease_keeper_factory()
     try:
-        saver = open_saver(record, artifact_base=artifact_base)
-        state = validate_pause_consistency(record, saver)
-        binding = deepcopy(state["pause_binding"] or {})
-        disposition = {
-            "kind": kind,
-            "cancellation_id": pause_policy.cancellation_id(
-                run_id=run_id, pause_record_id=binding["pause_record_id"],
-                cancel_submission_id=submission_id, cancel_kind=kind),
-            "actor_id": actor_id, "actor_type": actor_type,
-            "submission_id": submission_id, "reason": reason, "requested_at": _now(),
-        }
-        pause_policy.validate_disposition(disposition)
-        # X1 -- OS-30 request cancellation, for CANCEL only.  ABANDON does NOT run it:
-        # there is no human answer to record, and writing a decision_cancelled event
-        # attributed to a decision nobody made is exactly what must not happen.
-        if kind == "CANCEL" and approval_port is not None:
-            _cancel_clarification(approval_port, run_id, binding, disposition)
-        binding["disposition"] = disposition
-        graph = graph_factory(saver)
-        config: dict[str, Any] = {
-            "configurable": {"thread_id": record["thread_id"],
-                             "checkpoint_ns": record["checkpoint_ns"]}}
-        if recursion_limit:
-            config["recursion_limit"] = recursion_limit
-        graph.update_state_command(config, "REQUEST_DISPOSITION", as_node="VALIDATE",
-                                   pause_binding=binding, route_token=None,
-                                   terminal_reason=None)
-        final = dict(graph.invoke(None, config))
-        rows = [dict(row) for row in (final.get("pause_binding") or {}).get(
-            "settlement_ledger") or ()]
-        # The candidate handle is read HERE, never carried through the graph: it stays in
-        # process memory and reaches exactly one durable place -- this disposition
-        # record's residual enumeration -- and never the checkpoint or the journal.
-        residual = [_residual_entry(row, _candidate_handle(settlement_port, row))
-                    for row in rows if row["terminal_disposition"] == "residual"]
-        discharged = pause_policy.ac1_discharged(rows)
-        # Retire, never delete: a disposed run's checkpoint is the audit evidence.
-        saver.retire_thread(record["thread_id"], reason=disposition["cancellation_id"])
-        record = dict(store.settle_disposition(
-            run_id, disposition, lease_token, updated_at=_now(),
-            residual_terminals=residual, ac1_discharged=discharged))
-        status = "CANCELLED" if kind == "CANCEL" else "ABANDONED"
-        reason = _disposition_reason(disposition, residual, discharged)
-        _audit(run_id, artifact_base,
-               run_logging.EVENT_RUN_CANCELLED if kind == "CANCEL"
-               else run_logging.EVENT_RUN_ABANDONED,
-               phase=str(final.get("current_phase") or ""), risk=str(final.get("risk") or ""),
-               result=status,
-               detail=f"{reason} residual_terminal_count={len(residual)}")
-        # The SECOND run_end: contract-legal, and the last row is the authoritative status.
-        _run_status(run_id, artifact_base, status, reason=reason,
-                    risk=str(final.get("risk") or ""), close_scopes=True)
-        return DisposeOutcome(status,
-                              record=record, state=final, residual_terminals=residual,
-                              ac1_discharged=discharged, effect_performed=True)
+        with factory(store, run_id, lease_token) as keeper:
+            saver = open_saver(record, artifact_base=artifact_base)
+            state = validate_pause_consistency(record, saver)
+            binding = deepcopy(state["pause_binding"] or {})
+            disposition = {
+                "kind": kind,
+                "cancellation_id": pause_policy.cancellation_id(
+                    run_id=run_id, pause_record_id=binding["pause_record_id"],
+                    cancel_submission_id=submission_id, cancel_kind=kind),
+                "actor_id": actor_id, "actor_type": actor_type,
+                "submission_id": submission_id, "reason": reason, "requested_at": _now(),
+            }
+            pause_policy.validate_disposition(disposition)
+            # X1 -- OS-30 request cancellation, for CANCEL only.  ABANDON does NOT run it:
+            # there is no human answer to record, and writing a decision_cancelled event
+            # attributed to a decision nobody made is exactly what must not happen.
+            if kind == "CANCEL" and approval_port is not None:
+                _cancel_clarification(approval_port, run_id, binding, disposition)
+            binding["disposition"] = disposition
+            graph = graph_factory(saver)
+            config: dict[str, Any] = {
+                "configurable": {"thread_id": record["thread_id"],
+                                 "checkpoint_ns": record["checkpoint_ns"]}}
+            if recursion_limit:
+                config["recursion_limit"] = recursion_limit
+            _committed(keeper, graph.update_state_command,
+                       config, "REQUEST_DISPOSITION", as_node="VALIDATE",
+                       pause_binding=binding, route_token=None, terminal_reason=None)
+            final = dict(graph.invoke(None, config))
+            _still_owned(keeper)
+            rows = [dict(row) for row in (final.get("pause_binding") or {}).get(
+                "settlement_ledger") or ()]
+            # The candidate handle is read HERE, never carried through the graph: it stays in
+            # process memory and reaches exactly one durable place -- this disposition
+            # record's residual enumeration -- and never the checkpoint or the journal.
+            residual = [_residual_entry(row, _candidate_handle(settlement_port, row))
+                        for row in rows if row["terminal_disposition"] == "residual"]
+            discharged = pause_policy.ac1_discharged(rows)
+            # Retire, never delete: a disposed run's checkpoint is the audit evidence.
+            _committed(keeper, saver.retire_thread, record["thread_id"],
+                       reason=disposition["cancellation_id"])
+            record = dict(_committed(
+                keeper, store.settle_disposition,
+                run_id, disposition, lease_token, updated_at=_now(),
+                residual_terminals=residual, ac1_discharged=discharged))
+            status = "CANCELLED" if kind == "CANCEL" else "ABANDONED"
+            reason = _disposition_reason(disposition, residual, discharged)
+            _audit(run_id, artifact_base,
+                   run_logging.EVENT_RUN_CANCELLED if kind == "CANCEL"
+                   else run_logging.EVENT_RUN_ABANDONED,
+                   phase=str(final.get("current_phase") or ""), risk=str(final.get("risk") or ""),
+                   result=status,
+                   detail=f"{reason} residual_terminal_count={len(residual)}")
+            # The SECOND run_end: contract-legal, and the last row is the authoritative status.
+            _run_status(run_id, artifact_base, status, reason=reason,
+                        risk=str(final.get("risk") or ""), close_scopes=True)
+            return DisposeOutcome(status,
+                                  record=record, state=final, residual_terminals=residual,
+                                  ac1_discharged=discharged, effect_performed=True)
+    except LeaseRenewalFailed as exc:
+        # Same fail-closed rule as resume: ownership was lost inside the claimed section,
+        # so this process writes nothing further and never re-enters the claim path.
+        _audit(run_id, artifact_base, run_logging.EVENT_RUN_RESUME_REFUSED,
+               result="PAUSE_CLAIM_LOST", detail=str(exc))
+        return DisposeOutcome("REFUSED", code="PAUSE_CLAIM_LOST", detail=str(exc),
+                              record=record)
     except _checkpoint_store().CheckpointThreadRetired as exc:
         return DisposeOutcome("REFUSED", code="CHECKPOINT_STORE_RETIRED", detail=str(exc),
                               record=record)

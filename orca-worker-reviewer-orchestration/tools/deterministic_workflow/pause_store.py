@@ -72,8 +72,32 @@ PAUSE_RECORD_FILENAME = ".pause_state.json"
 SETTLEMENT_JOURNAL_FILENAME = ".settlement_journal.json"
 
 DEFAULT_LEASE_SECONDS = 60.0
-DEFAULT_OBSERVE_TIMEOUT_SECONDS = 30.0
+#: Added on top of the lease an observer is waiting out.  An observation window SHORTER
+#: than the incumbent's lease can never legally reach takeover -- it expires while the
+#: owner is still (nominally) alive -- so the documented single-call
+#: observe-then-takeover path of :func:`pause_runtime.takeover` requires a window that
+#: covers the whole remaining lease plus a margin for the poll granularity and clock skew.
+DEFAULT_OBSERVE_GRACE_SECONDS = 5.0
+#: Bounded by construction: lease + grace, never unbounded and never shorter than the lease.
+DEFAULT_OBSERVE_TIMEOUT_SECONDS = DEFAULT_LEASE_SECONDS + DEFAULT_OBSERVE_GRACE_SECONDS
 OBSERVE_POLL_SECONDS = 0.05
+
+
+def observe_timeout_for(lease_seconds: Any) -> float:
+    """The bounded observation window that covers one whole lease of ``lease_seconds``.
+
+    Derived from the lease rather than hard-coded, for the same reason
+    :func:`lease_keeper.heartbeat_interval_for` derives the renewal period: a constant is
+    wrong the moment the lease is reconfigured, and "shorter than the lease" is exactly the
+    defect (an observer that gives up before takeover is even legal).
+    """
+    try:
+        lease = float(lease_seconds)
+    except (TypeError, ValueError):
+        lease = DEFAULT_LEASE_SECONDS
+    if not lease > 0.0:
+        lease = DEFAULT_LEASE_SECONDS
+    return lease + DEFAULT_OBSERVE_GRACE_SECONDS
 
 
 class PauseStoreError(ValueError):
@@ -209,6 +233,12 @@ def validate_pause_record(run_id: str, record: Any) -> dict[str, Any]:
     return dict(record)
 
 
+def _binding_generation(record: Mapping[str, Any]) -> int:
+    """The record's re-entry generation, or 0 for a projection that predates the field."""
+    value = (record.get("projection") or {}).get("binding_generation")
+    return value if type(value) is int else 0
+
+
 def applied_items(decisions: Mapping[str, str]) -> list[dict[str, str]]:
     """The bundle's items, sorted by ``decision_item_id`` -- the whole answer, never one."""
     return [{"decision_item_id": item, "decision_id": decisions[item]}
@@ -320,23 +350,47 @@ class FilePauseRecordStore:
         self.lease_seconds = float(lease_seconds)
 
     # -- raw document ------------------------------------------------------------
-    def _read(self, run_id: str) -> dict[str, Any] | None:
+    def _document(self) -> dict[str, Any]:
         document = read_json_document(self.path,
                                       schema_version=PAUSE_RECORD_SCHEMA_VERSION,
                                       corrupt_exc=PauseRecordCorrupt)
         if not document:
-            return None
-        if set(document) - {"schema_version", "record"}:
+            return {}
+        if set(document) - {"schema_version", "record", "superseded"}:
             raise PauseRecordCorrupt("PAUSE_RECORD_CORRUPT:top-level keys")
-        record = document.get("record")
+        return document
+
+    def _read(self, run_id: str) -> dict[str, Any] | None:
+        """The ACTIVE generation.  Superseded generations are read by :meth:`superseded`."""
+        record = self._document().get("record")
         if record is None:
             return None
         return validate_pause_record(run_id, record)
 
-    def _persist(self, record: dict[str, Any]) -> None:
+    def _read_superseded(self, run_id: str) -> list[dict[str, Any]]:
+        rows = self._document().get("superseded") or []
+        if not isinstance(rows, list):
+            raise PauseRecordCorrupt("PAUSE_RECORD_CORRUPT:superseded container")
+        return [validate_pause_record(run_id, row) for row in rows]
+
+    def _persist(self, record: dict[str, Any],
+                 superseded: list[dict[str, Any]] | None = None) -> None:
+        """Write the whole document: the active generation plus the retained history.
+
+        ``superseded`` defaults to whatever is already on disk, so every existing caller
+        keeps writing exactly the record it holds and no retained generation is dropped by
+        an ordinary fenced update.  The key is omitted entirely while the history is empty,
+        so a single-generation run's document stays byte-identical to the pre-OS-31.1 one
+        (which is what keeps the C4 "a second reindex is a byte-identical no-op" property).
+        """
         validate_pause_record(record["run_id"], record)
-        write_json_document(self.path, {
-            "schema_version": PAUSE_RECORD_SCHEMA_VERSION, "record": record})
+        rows = (self._read_superseded(record["run_id"]) if superseded is None
+                else [validate_pause_record(record["run_id"], row) for row in superseded])
+        document: dict[str, Any] = {"schema_version": PAUSE_RECORD_SCHEMA_VERSION,
+                                    "record": record}
+        if rows:
+            document["superseded"] = rows
+        write_json_document(self.path, document)
 
     def _now(self) -> float:
         return self.clock.time()
@@ -359,14 +413,85 @@ class FilePauseRecordStore:
             record = self._read(run_id)
             return deepcopy(record) if record is not None else None
 
-    def create(self, record: Mapping[str, Any]) -> dict[str, Any]:
-        """Write the record AFTER the checkpoint committed (C1), idempotently."""
-        candidate = validate_pause_record(record["run_id"], record)
+    def superseded(self, run_id: str) -> tuple[dict[str, Any], ...]:
+        """Every retained earlier generation of this run, oldest first."""
         with self._section.locked():
-            existing = self._read(candidate["run_id"])
-            if existing is not None:
-                return deepcopy(existing)
-            self._persist(candidate)
+            return tuple(deepcopy(row) for row in self._read_superseded(run_id))
+
+    def create(self, record: Mapping[str, Any]) -> dict[str, Any]:
+        """Write the record AFTER the checkpoint committed (C1), per PAUSE GENERATION.
+
+        A run may pause more than once: pause -> resume -> pause -> resume is a normal
+        life, and each pause is its own **generation**, identified by ``pause_record_id``
+        (a pure function of run, thread, request and decision items), pinned to its own
+        ``checkpoint_id`` and carrying its own ``projection['binding_generation']``.
+        Returning the run's existing record unconditionally -- which is what this did --
+        silently discarded every generation after the first: the new checkpoint pointer and
+        request never reached disk and the new pause became invisible to discovery.
+
+        The policy, in order, and every branch of it explicit:
+
+        * **no record**            -> persist it.  This is generation 1.
+        * **same generation**      -> idempotent: return the stored record unchanged, so a
+          re-finalise (a retry, a duplicate CLI call) is still a no-op and the live
+          ownership columns of a generation somebody has already claimed are preserved.
+        * **an ACTIVE generation** (``WAITING_FOR_INPUT``) that is NOT this one -> refuse
+          with ``PAUSE_GENERATION_ACTIVE``.  A waiting question is a human's open decision;
+          overwriting it would strand that decision with no record of what was asked, so
+          it fails closed and the incumbent must be answered, cancelled or abandoned first.
+        * **a DISPOSED run** (``CANCELLED`` / ``ABANDONED``) -> refuse with
+          ``RUN_ALREADY_CANCELLED`` / ``RUN_ALREADY_ABANDONED``.  A disposed run is over;
+          its thread is retired and it takes no further pause.
+        * **a RESUMED generation** -> supersede it: the answered generation is retained,
+          whole, in the document's ``superseded`` history (it is the evidence that its
+          bundle was applied exactly once) and the new generation becomes the active
+          record.  Retention is chosen over deletion deliberately: the applied set of a
+          resumed generation is the OS-30 consumption lineage and must not evaporate when
+          the run pauses again.
+
+        Superseding is lineage-checked, never positional: the successor must name a
+        DIFFERENT checkpoint than the generation it replaces (a generation is pinned to the
+        checkpoint that committed it, so an identical pointer means the "new" pause is the
+        old one under another name) and must not move ``binding_generation`` backwards.
+        Either violation is ``PAUSE_GENERATION_LINEAGE``.
+        """
+        candidate = validate_pause_record(record["run_id"], record)
+        run_id = candidate["run_id"]
+        with self._section.locked():
+            existing = self._read(run_id)
+            if existing is None:
+                self._persist(candidate)
+                return deepcopy(candidate)
+            same_request = existing["pause_record_id"] == candidate["pause_record_id"]
+            if existing["status"] == "WAITING_FOR_INPUT":
+                if same_request:
+                    return deepcopy(existing)
+                raise pause_policy.PauseRefused(
+                    "PAUSE_GENERATION_ACTIVE",
+                    f"{run_id}: generation {existing['pause_record_id']} is still "
+                    f"WAITING_FOR_INPUT; it must be answered, cancelled or abandoned "
+                    f"before {candidate['pause_record_id']} can become the active pause")
+            if existing["status"] in ("CANCELLED", "ABANDONED"):
+                raise pause_policy.PauseRefused(
+                    f"RUN_ALREADY_{existing['status']}",
+                    f"{run_id}: the run is {existing['status'].lower()}; a disposed run "
+                    "takes no further pause generation")
+            # existing["status"] == "RESUMED": the one supersedable generation.
+            if existing["checkpoint_id"] == candidate["checkpoint_id"]:
+                if same_request:
+                    return deepcopy(existing)
+                raise pause_policy.PauseRefused(
+                    "PAUSE_GENERATION_LINEAGE",
+                    f"{run_id}: {candidate['pause_record_id']} names the same checkpoint "
+                    f"{candidate['checkpoint_id']!r} as the generation it claims to "
+                    "follow; a new generation is pinned to its own checkpoint")
+            if _binding_generation(candidate) < _binding_generation(existing):
+                raise pause_policy.PauseRefused(
+                    "PAUSE_GENERATION_LINEAGE",
+                    f"{run_id}: binding_generation moved backwards, "
+                    f"{_binding_generation(existing)} -> {_binding_generation(candidate)}")
+            history = [*self._read_superseded(run_id), existing]
+            self._persist(candidate, superseded=history)
             return deepcopy(candidate)
 
     def replace(self, record: Mapping[str, Any]) -> dict[str, Any]:
@@ -424,14 +549,34 @@ class FilePauseRecordStore:
             record["lease_expires_at"] = self._now()
             self._persist(record)
 
-    def observe(self, run_id: str, *,
-                timeout_seconds: float = DEFAULT_OBSERVE_TIMEOUT_SECONDS,
+    def observe(self, run_id: str, *, timeout_seconds: float | None = None,
                 poll_seconds: float = OBSERVE_POLL_SECONDS) -> dict[str, Any] | None:
         """Watch a run another Coordinator owns, with an explicit, finite timeout.
 
         Returns the settled record when the owner finishes, or ``None`` when the owner's
         lease lapses (the caller may then attempt takeover exactly once).
+
+        **Observation/lease coherence.**  ``timeout_seconds`` defaults to
+        :func:`observe_timeout_for` over *this store's* lease, i.e. one whole lease plus
+        :data:`DEFAULT_OBSERVE_GRACE_SECONDS` -- bounded, finite, and long enough that a
+        single observe-then-takeover call can actually reach the takeover when the
+        incumbent stops heartbeating.  A window shorter than the lease could not: it
+        expired while the owner was still nominally alive, which is what made
+        ``takeover()``'s documented single-call path unreachable without an undocumented
+        manual retry.
+
+        **The retry contract, when a caller passes its own shorter window.**  An explicit
+        ``timeout_seconds`` is honoured exactly as given and still bounds the wait, so a
+        caller that deliberately wants to give up early keeps that behaviour.  Giving up is
+        reported as :class:`PauseObservationTimeout` (reason code
+        ``PAUSE_OBSERVATION_TIMEOUT``), which is a *retryable* outcome and never a verdict
+        about the run: it says only that this observer's window closed while a live lease
+        was still held.  A caller that sees it may call again -- nothing was claimed and no
+        effect was performed -- and a caller that does not want to retry should observe
+        with the default window instead.
         """
+        if timeout_seconds is None:
+            timeout_seconds = observe_timeout_for(self.lease_seconds)
         if timeout_seconds <= 0:
             raise ValueError("observe() requires a positive timeout")
         deadline = self.clock.time() + timeout_seconds
