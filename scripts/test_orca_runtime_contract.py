@@ -31,6 +31,7 @@ from scripts.orca_fake_agent import (
 )
 from scripts.orca_runtime_harness import (
     CLOSE_ELIGIBLE_ROLES,
+    HISTORICAL_ORCA_APP_VERSION_OBSERVATIONS,
     LIFECYCLE_MUTATION_COMMANDS,
     NEVER_CLOSE_ROLES,
     PROCESS_TERMINATING_ACTIONS,
@@ -41,6 +42,7 @@ from scripts.orca_runtime_harness import (
     SUPPORTED_ORCA_APP_VERSION,
     SUPPORTED_ORCA_APP_VERSIONS,
     WORKER_START_READY_STATE,
+    WORKER_START_STATELESS_RECEIPT_VERSION,
     TERMINAL_ORIGINS,
     OrcaRuntimeError,
     OrcaRuntimeHarness,
@@ -8957,20 +8959,78 @@ class Os41Orca1_4_196CompatibilityTests(unittest.TestCase):
             "1.4.196", self.LIVE_ORCHESTRATION_GUIDE, self.LIVE_CLI_GUIDE
         )
 
-    def test_the_earlier_point_verification_is_not_dropped(self) -> None:
-        self.assertIn("1.4.184", SUPPORTED_ORCA_APP_VERSIONS)
-        validate_orca_contract(
-            "1.4.184", self.LIVE_ORCHESTRATION_GUIDE, self.LIVE_CLI_GUIDE
+    def test_the_earlier_observation_is_historical_and_not_current_support(
+        self,
+    ) -> None:
+        """PR #29 review MAJOR-2: 1.4.184 is a RECORD, not an executable claim.
+
+        SUPPORTED_ORCA_APP_VERSIONS is a claim that the CURRENT head passes the Step 4
+        suite on every entry. The 1.4.184 evidence was produced against the pre-OS-41
+        harness -- before this revision changed worker-start admission, the fake-agent
+        shim, unexpected-exit classification, scenario K, packaging and the run-scoped
+        cursor -- and this head has not been run against 1.4.184. So it is preserved as
+        a historical observation and REFUSED as a runtime, exactly like any other
+        version this head has not been run against. This test asserts that negative
+        directly: an assertion that merely stopped checking membership would leave the
+        wrong claim re-addable without any test noticing.
+        """
+        self.assertNotIn("1.4.184", SUPPORTED_ORCA_APP_VERSIONS)
+        self.assertIn("1.4.184", HISTORICAL_ORCA_APP_VERSION_OBSERVATIONS)
+        with self.assertRaisesRegex(UnsupportedOrcaContract, "installed runtime"):
+            validate_orca_contract(
+                "1.4.184", self.LIVE_ORCHESTRATION_GUIDE, self.LIVE_CLI_GUIDE
+            )
+
+    def test_the_historical_record_is_preserved_and_grants_nothing(self) -> None:
+        """The historical observations are kept, and none of them is a support claim.
+
+        Both prior point observations stay named in the code so the evidence is not
+        lost, and NEITHER is consulted by the gate: every historical version is
+        refused by validate_orca_contract(), and the two tuples are disjoint.
+        """
+        self.assertEqual(
+            HISTORICAL_ORCA_APP_VERSION_OBSERVATIONS, ("1.4.178-rc.2", "1.4.184")
         )
+        self.assertEqual(
+            set(SUPPORTED_ORCA_APP_VERSIONS)
+            & set(HISTORICAL_ORCA_APP_VERSION_OBSERVATIONS),
+            set(),
+        )
+        for historical in HISTORICAL_ORCA_APP_VERSION_OBSERVATIONS:
+            with self.subTest(version=historical):
+                with self.assertRaisesRegex(
+                    UnsupportedOrcaContract, "installed runtime"
+                ):
+                    validate_orca_contract(
+                        historical,
+                        self.LIVE_ORCHESTRATION_GUIDE,
+                        self.LIVE_CLI_GUIDE,
+                    )
+
+    def test_the_current_support_set_is_exactly_the_runtime_this_head_ran_on(
+        self,
+    ) -> None:
+        """One entry, and it is the runtime the Step 4 evidence in this PR came from."""
+        self.assertEqual(SUPPORTED_ORCA_APP_VERSIONS, ("1.4.196",))
+        self.assertEqual(SUPPORTED_ORCA_APP_VERSION, "1.4.196")
 
     def test_the_gate_is_set_membership_and_never_a_range(self) -> None:
         """A version BETWEEN or AFTER two point verifications is still unverified.
 
         This is the assertion that keeps the fix from becoming the compatibility-range
-        claim OS-41 forbids: 1.4.190 sits between the two accepted points and 1.4.197
-        sits just past the newer one, and neither is admissible.
+        claim OS-41 forbids: 1.4.190 sits between the historical 1.4.184 observation
+        and the verified point, 1.4.197 sits just past it, and neither is admissible.
+        1.4.184 itself is in the list for the same reason after PR #29 review MAJOR-2 --
+        being a prior observation is not being a supported runtime.
         """
-        for unverified in ("1.4.185", "1.4.190", "1.4.197", "1.5.0", "1.4.19"):
+        for unverified in (
+            "1.4.184",
+            "1.4.185",
+            "1.4.190",
+            "1.4.197",
+            "1.5.0",
+            "1.4.19",
+        ):
             with self.subTest(version=unverified):
                 self.assertNotIn(unverified, SUPPORTED_ORCA_APP_VERSIONS)
                 with self.assertRaisesRegex(
@@ -9111,7 +9171,19 @@ class Os41WorkerStartAcknowledgementTests(OfflineHarnessTestCase):
         return harness, recorder
 
     def test_a_stateless_receipt_is_accepted_under_the_1_4_184_identity(self) -> None:
-        """1.4.184 is still a point verification and its receipt carries no `state`."""
+        """The HISTORICAL 1.4.184 reading, preserved offline only.
+
+        1.4.184 receipts carry no `state` key, and that reading is kept so a future
+        revision that re-verifies the runtime does not have to re-derive it. PR #29
+        review MAJOR-2: 1.4.184 is no longer in SUPPORTED_ORCA_APP_VERSIONS, so
+        preflight() can no longer produce this identity and the allowance is
+        unreachable from a live run -- the identity is set directly here. Live
+        behaviour is strictly fail-closed either way: validate_orca_contract() refuses
+        that runtime long before start_worker() is reached.
+        """
+        self.assertNotIn(
+            WORKER_START_STATELESS_RECEIPT_VERSION, SUPPORTED_ORCA_APP_VERSIONS
+        )
         harness, _ = self.stateless_harness("1.4.184")
 
         self.assertEqual(

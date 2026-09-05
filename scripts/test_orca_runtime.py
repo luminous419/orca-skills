@@ -14,8 +14,10 @@ try:
     from scripts.orca_runtime_harness import (
         CLEANUP_AUTHORITY_STATES,
         CLOSE_ELIGIBLE_ROLES,
+        HISTORICAL_ORCA_APP_VERSION_OBSERVATIONS,
         LATE_DEPENDENT_STATUSES,
         NEVER_CLOSE_ROLES,
+        SUPPORTED_ORCA_APP_VERSIONS,
         TERMINAL_ROLE_CLASSES,
         UNSETTLED_WORKER_STATES,
         WORKER_RESOURCE_OUTCOMES,
@@ -30,8 +32,10 @@ except ModuleNotFoundError:
     from orca_runtime_harness import (
         CLEANUP_AUTHORITY_STATES,
         CLOSE_ELIGIBLE_ROLES,
+        HISTORICAL_ORCA_APP_VERSION_OBSERVATIONS,
         LATE_DEPENDENT_STATUSES,
         NEVER_CLOSE_ROLES,
+        SUPPORTED_ORCA_APP_VERSIONS,
         TERMINAL_ROLE_CLASSES,
         UNSETTLED_WORKER_STATES,
         WORKER_RESOURCE_OUTCOMES,
@@ -507,6 +511,65 @@ class FinalReviewRuntimeIntegrationTests(unittest.TestCase):
         self.assertEqual(len(set(recorded)), 2)
 
 
+# ---- OS-41 / PR #29 review MAJOR-1: scenario K is bound to a RUNTIME POINT ------
+#
+# Scenario K's expectation is not "whatever answer the gate happened to give"; it is
+# what the gate answers ON A NAMED RUNTIME. An assertion that accepts either answer
+# cannot fail when a regression flips it, which is exactly the defect this block
+# exists to remove. The two runtime points are kept apart below, and only one of them
+# is reachable from the current executable support set.
+
+# The runtime point this head is actually verified on. Compared against the identity
+# the harness recorded on the far side of validate_orca_contract()
+# (RuntimeScenarioResult.orca_app_version) -- never inferred from the observed result.
+SCENARIO_K_VERIFIED_RUNTIME = "1.4.196"
+
+# What the gate ANSWERS there: all eight same-role transitions REFUSED, each naming
+# exactly these four conditions. The set was read out of the recorded run
+# (artifacts/orca-runtime/os41-final/scenario-k.json -- all eight `reuse_decisions`
+# entries carry `eligible: false` and exactly this reason set) and cross-checked
+# against the condition names reuse_eligible() can append. It is bound as an exact set
+# of NAMES: "reasons is non-empty" would still pass if the gate started refusing for a
+# different condition, and refusing for a different condition is a different runtime
+# answer, not the one this PR claims to have verified.
+SCENARIO_K_1_4_196_REFUSAL_REASONS = frozenset(
+    {
+        "ownership_not_transferable",
+        "release_state_missing",
+        "terminal_effect_unrecorded",
+        "worker_state_not_reusable",
+    }
+)
+# Five phases x two roles = ten dispatches; every refusal returns None, so every
+# attempt opens a FRESH session. Ten terminals for ten dispatches, not two.
+SCENARIO_K_1_4_196_TERMINAL_CREATIONS = 10
+
+# The SEPARATE, HISTORICAL supervised-path expectation. Orca 1.4.184 adopted the
+# deterministic fake agent as a SUPERVISED worker, so the gate had the evidence its
+# four conditions above ask for and GRANTED reuse: two terminals, five dispatches
+# each, every non-final attempt recording `reuse:ownership-transfer-pending`.
+#
+# That observation was made against the PRE-OS-41 harness revision and is preserved as
+# a historical record (docs/validation/historical/, docs/COMPATIBILITY.md,
+# HISTORICAL_ORCA_APP_VERSION_OBSERVATIONS). It is NOT an expectation of this head:
+# after PR #29 review MAJOR-2, 1.4.184 is not in the current executable support set,
+# so validate_orca_contract() refuses that runtime before scenario K can ever start
+# and this expectation is UNREACHABLE FROM A LIVE RUN. It is therefore recorded here
+# in a clearly-labelled, non-executing form rather than as a live assertion branch
+# that would silently never run, and
+# test_the_supervised_reuse_expectation_is_historical_not_current() below asserts that
+# unreachability instead of leaving it as a comment. Re-listing 1.4.184 as supported
+# requires running THIS head against it; the numbers below are then what to assert.
+SCENARIO_K_HISTORICAL_SUPERVISED_RUNTIME = "1.4.184"
+SCENARIO_K_HISTORICAL_SUPERVISED_EXPECTATION = {
+    "reuse_decisions_granted": 8,
+    "reuse_decisions_refused": 0,
+    "terminal_creations": 2,
+    "distinct_terminals": 2,
+    "reuse_lifecycle_action": "reuse:ownership-transfer-pending",
+}
+
+
 class SessionReuseRuntimeIntegrationTests(unittest.TestCase):
     """Opt-in scenario K: what the production reuse gate ANSWERS, against the real
     runtime (E-3).
@@ -534,12 +597,29 @@ class SessionReuseRuntimeIntegrationTests(unittest.TestCase):
     So on 1.4.196 this scenario verifies **that reuse is correctly REFUSED on the
     tracked path**, with the gate's own named refusal reasons recorded, and that the
     refusal really takes effect (a fresh session per phase). It does NOT verify that
-    supervised session reuse works. That claim belongs to the Orca 1.4.184 point
-    observation and to the offline contract suite, and `docs/COMPATIBILITY.md` records
-    the boundary. The assertions below are written to hold on either answer, and to
-    require that the accounting FOLLOWS the gate in both directions -- so a runtime
-    that grants reuse still has to produce the reused chains, and one that refuses
-    still has to produce fresh sessions.
+    supervised session reuse works. That claim belongs to the HISTORICAL Orca 1.4.184
+    point observation of an older harness revision and to the offline contract suite,
+    and `docs/COMPATIBILITY.md` records the boundary.
+
+    PR #29 review MAJOR-1 -- WHY THE ASSERTIONS ARE NO LONGER ANSWER-AGNOSTIC.
+
+    These assertions used to be written to hold on EITHER answer: they partitioned the
+    eight decisions into granted and refused and then required only that the terminal
+    accounting follow whichever answer came back. That is not a verification of the
+    result this PR claims. A regression that incorrectly GRANTED one or all eight
+    reuse decisions would have kept the accounting internally consistent and the test
+    would still have passed, and the four documented refusal reasons were never
+    required at all -- only that the reason list was non-empty.
+
+    So the assertions are now BOUND TO A RUNTIME POINT, identified by
+    `result.orca_app_version` (recorded by the harness only after
+    validate_orca_contract() accepted the runtime) rather than inferred from the
+    outcome observed. On SCENARIO_K_VERIFIED_RUNTIME the run MUST produce eight
+    refusals, zero grants, the exact four-name refusal reason set, and ten distinct
+    terminals; any grant is a failure. The 1.4.184 supervised expectation is kept
+    SEPARATE, above, in a non-executing historical form, because after review MAJOR-2
+    that runtime is no longer in the executable support set and a live branch for it
+    would silently never run.
 
     The four fields aggregated below are the ONLY first-order evidence D-4 allows for
     the efficiency numbers: the ledger's own `action` label is an accounting of a
@@ -566,6 +646,51 @@ class SessionReuseRuntimeIntegrationTests(unittest.TestCase):
                 except UnsupportedOrcaContract as exc:
                     self.skipTest(str(exc))
                 self.assert_scenario_k(result, artifact_dir)
+
+    def test_the_supervised_reuse_expectation_is_historical_not_current(self) -> None:
+        """PR #29 review MAJOR-1/MAJOR-2: the two runtime points, kept apart.
+
+        Runs OFFLINE and unconditionally -- it is about what this head CLAIMS, not
+        about what a runtime answers, so it must not be gated on ORCA_RUNTIME_TEST.
+
+        The 1.4.184 supervised expectation (granted reuse, two terminals, five
+        dispatches each) is a HISTORICAL point observation of an older harness
+        revision. This head has not been run against 1.4.184, so 1.4.184 is not in the
+        executable support set and scenario K can never execute against it -- which is
+        asserted here, rather than left as a live `if` branch that would silently
+        never run. The historical numbers stay recorded in
+        SCENARIO_K_HISTORICAL_SUPERVISED_EXPECTATION so re-verifying that runtime does
+        not have to re-derive them.
+        """
+        self.assertNotIn(
+            SCENARIO_K_HISTORICAL_SUPERVISED_RUNTIME, SUPPORTED_ORCA_APP_VERSIONS
+        )
+        self.assertIn(
+            SCENARIO_K_HISTORICAL_SUPERVISED_RUNTIME,
+            HISTORICAL_ORCA_APP_VERSION_OBSERVATIONS,
+        )
+        # The verified point is in the support set, and it is the ONLY one -- so the
+        # runtime identity assertion in assert_scenario_k() cannot be satisfied by a
+        # second, unverified entry quietly appearing beside it.
+        self.assertEqual(SUPPORTED_ORCA_APP_VERSIONS, (SCENARIO_K_VERIFIED_RUNTIME,))
+        # The two records name different runtimes and different answers; a historical
+        # entry that leaked into the executable set would collapse that distinction.
+        self.assertEqual(
+            set(SUPPORTED_ORCA_APP_VERSIONS)
+            & set(HISTORICAL_ORCA_APP_VERSION_OBSERVATIONS),
+            set(),
+        )
+        self.assertEqual(
+            SCENARIO_K_HISTORICAL_SUPERVISED_EXPECTATION["reuse_decisions_granted"], 8
+        )
+        self.assertEqual(
+            SCENARIO_K_HISTORICAL_SUPERVISED_EXPECTATION["terminal_creations"], 2
+        )
+        # ...and it is NOT the expectation asserted for the verified point.
+        self.assertNotEqual(
+            SCENARIO_K_HISTORICAL_SUPERVISED_EXPECTATION["terminal_creations"],
+            SCENARIO_K_1_4_196_TERMINAL_CREATIONS,
+        )
 
     @staticmethod
     def receipt_fields(snapshot: dict) -> dict[str, list]:
@@ -605,52 +730,78 @@ class SessionReuseRuntimeIntegrationTests(unittest.TestCase):
         self.assertEqual(result.status, "COMPLETED")
         self.assertEqual(len(result.attempts), self.PHASES * 2)
 
+        # K-1b (PR #29 review MAJOR-1): WHICH RUNTIME POINT produced this result.
+        # Everything from K-2 down is the answer expected on that point specifically,
+        # so the identity is asserted FIRST and read off the harness's own record --
+        # written by preflight() only after validate_orca_contract() accepted the
+        # runtime -- never inferred from the outcome that was observed. A result with
+        # no identity ("" = no runtime proven) fails here rather than being matched
+        # against whichever expectation happens to fit.
+        self.assertEqual(result.orca_app_version, SCENARIO_K_VERIFIED_RUNTIME)
+        # And that point is the one this head actually advertises, so the expectations
+        # below cannot drift away from the support set without failing.
+        self.assertEqual(SUPPORTED_ORCA_APP_VERSIONS, (SCENARIO_K_VERIFIED_RUNTIME,))
+
         # K-2: the production gate was ASKED at every same-role transition, and it
         # answered. A scenario that never reaches the gate proves nothing about it,
         # so the count is exact rather than "at least one".
         self.assertEqual(len(result.reuse_decisions), (self.PHASES - 1) * 2)
         granted = [d for d in result.reuse_decisions if d["eligible"]]
         refused = [d for d in result.reuse_decisions if not d["eligible"]]
+        # THE 1.4.196 RESULT THIS PR CLAIMS TO VERIFY. Not "granted or refused, as long
+        # as the books balance": on this runtime every fake-agent dispatch is TRACKED,
+        # the gate's supervised evidence does not exist, and the documented answer is
+        # eight fail-closed refusals. A regression that GRANTS any reuse here fails on
+        # the next line -- which is the whole point of binding to the runtime point.
+        self.assertEqual(granted, [])
+        self.assertEqual(len(refused), (self.PHASES - 1) * 2)
         for decision in result.reuse_decisions:
             with self.subTest(dispatch=decision["dispatch_id"]):
                 self.assertIn(decision["role"], CLOSE_ELIGIBLE_ROLES)
                 self.assertTrue(decision["handle"])
-                if decision["eligible"]:
-                    # A granted decision that also names failures would mean the gate
-                    # returned eligible while a condition was failing.
-                    self.assertEqual(decision["reasons"], [])
-                else:
-                    # A refusal must SAY which condition refused. An empty reason list
-                    # is the "condition left as a placeholder" defect the gate's own
-                    # never-short-circuit design exists to catch.
-                    self.assertTrue(decision["reasons"])
+                self.assertFalse(decision["eligible"])
+                # A refusal must SAY WHICH conditions refused, BY NAME. "reasons is
+                # non-empty" was the old check and it accepted any reason at all; the
+                # four names below are the documented fail-closed set for the tracked
+                # path, and refusing for a different condition is a different runtime
+                # answer that must not pass as this one.
+                self.assertEqual(
+                    set(decision["reasons"]), SCENARIO_K_1_4_196_REFUSAL_REASONS
+                )
+                # Named once each: a duplicated condition would make the set test
+                # above pass while the gate double-counted.
+                self.assertEqual(
+                    len(decision["reasons"]), len(SCENARIO_K_1_4_196_REFUSAL_REASONS)
+                )
 
-        # K-3: the terminal accounting FOLLOWS the gate, in both directions. Every
-        # attempt the gate did not hand a session to had to start a fresh one, and
-        # every attempt it did had to run on the session it named.
+        # K-3: the refusal really TAKES EFFECT. Ten dispatches, ten distinct fresh
+        # terminals -- pinned to the recorded number, not derived from `granted`, so
+        # the count cannot follow a regression that changed the gate's answer.
+        self.assertEqual(len(result.attempts), SCENARIO_K_1_4_196_TERMINAL_CREATIONS)
         self.assertEqual(
-            result.terminal_creations, len(result.attempts) - len(granted)
+            result.terminal_creations, SCENARIO_K_1_4_196_TERMINAL_CREATIONS
         )
         self.assertEqual(
             sum(1 for attempt in result.attempts if attempt.terminal_created),
-            result.terminal_creations,
+            SCENARIO_K_1_4_196_TERMINAL_CREATIONS,
         )
         self.assertEqual(
             len({attempt.terminal for attempt in result.attempts}),
-            result.terminal_creations,
+            SCENARIO_K_1_4_196_TERMINAL_CREATIONS,
         )
-        # A chain is recorded only for a terminal that served more than one dispatch,
-        # so the chained dispatches and the fresh ones must add up to every attempt.
+        # A chain is recorded only for a terminal that served more than one dispatch.
+        # Every decision was refused, so there is no chain at all; a non-empty mapping
+        # here means a session WAS carried across dispatches despite the refusals.
+        self.assertEqual(result.reuse_chains, {})
+        # The same accounting identity the answer-agnostic version asserted, kept so
+        # the ledger still has to add up and not merely match the pinned totals.
         chained = sum(len(chain) for chain in result.reuse_chains.values())
         self.assertEqual(
             chained + (result.terminal_creations - len(result.reuse_chains)),
             len(result.attempts),
         )
-        for handle, chain in result.reuse_chains.items():
-            with self.subTest(handle=handle):
-                self.assertEqual(len(set(chain)), len(chain))
 
-        # K-4: per-attempt lifecycle invariants, true on either answer.
+        # K-4: per-attempt lifecycle invariants.
         reuse_attempts = [
             attempt
             for attempt in result.attempts
@@ -666,13 +817,20 @@ class SessionReuseRuntimeIntegrationTests(unittest.TestCase):
                 self.assertIn(attempt.terminal_role, TERMINAL_ROLE_CLASSES)
                 self.assertNotIn(attempt.worker_state, UNSETTLED_WORKER_STATES)
                 self.assertIn(attempt.cleanup_authority, CLEANUP_AUTHORITY_STATES)
-        # A reuse issues NO lifecycle mutation on either path; the label records which
-        # path produced it. Pinned as a closed set so a third spelling fails.
+        # A reuse issues NO lifecycle mutation on either path; the label records WHICH
+        # path produced it, so on the verified runtime point it is pinned to the ONE
+        # label the tracked path produces. The supervised spelling
+        # ("reuse:ownership-transfer-pending") belongs to the historical 1.4.184
+        # observation recorded in SCENARIO_K_HISTORICAL_SUPERVISED_EXPECTATION; seeing
+        # it here would mean a supervised adoption this runtime cannot perform.
         for attempt in reuse_attempts:
             with self.subTest(dispatch=attempt.dispatch_id):
-                self.assertIn(
+                self.assertEqual(attempt.lifecycle_action, "reuse:tracked-external")
+                self.assertNotEqual(
                     attempt.lifecycle_action,
-                    {"reuse:ownership-transfer-pending", "reuse:tracked-external"},
+                    SCENARIO_K_HISTORICAL_SUPERVISED_EXPECTATION[
+                        "reuse_lifecycle_action"
+                    ],
                 )
 
         # K-4: identity is new on every attempt even though the session is not
@@ -696,27 +854,35 @@ class SessionReuseRuntimeIntegrationTests(unittest.TestCase):
         # they are populated; on one where every dispatch is tracked there are no such
         # receipts to read, and inventing a substitute is exactly the "the ledger's own
         # label may not stand in for a receipt" error D-4 forbids. So the shape is
-        # tied to the path the run actually took rather than asserted unconditionally.
-        if fields["terminal_effects"]:
-            self.assertEqual(len(fields["terminal_effects"]), self.PHASES * 2)
-            # Two releases only: the last attempt of each role. Every other attempt is
-            # a reuse and issues nothing at all.
-            self.assertEqual(len(fields["release_process_actions"]), 2)
-            self.assertTrue(fields["retained_reasons"])
-            self.assertTrue(fields["ownership_states"])
-        else:
-            # The tracked path issues no worker-start, no release and no retain. Its
-            # release receipt is the agent process exiting, which the attempt records
-            # as `release:natural-exit` -- and there must be exactly one per role.
-            self.assertEqual(fields["release_process_actions"], [])
-            self.assertEqual(
-                sum(
-                    1
-                    for attempt in result.attempts
-                    if attempt.lifecycle_action == "release:natural-exit"
-                ),
-                2,
-            )
+        # tied to the path the run actually took. PR #29 review MAJOR-1: WHICH path
+        # that is, is not discovered from the receipts -- it follows from the runtime
+        # point asserted at K-1b. On SCENARIO_K_VERIFIED_RUNTIME every dispatch is
+        # TRACKED, so there are no supervised receipts to read AT ALL, and a run that
+        # produced some would mean a supervised adoption this runtime cannot perform.
+        self.assertEqual(fields["terminal_effects"], [])
+        # One `worker-show` per same-role transition -- the gate's own observation --
+        # and every one of them reports NO terminalResource on the tracked path, which
+        # `receipt_fields` reads out as the empty string. Asserted as the exact list so
+        # both facts are pinned: how many observations were taken, and that not one of
+        # them carried the supervised evidence the gate asks for.
+        self.assertEqual(
+            fields["retained_reasons"], [""] * ((self.PHASES - 1) * 2)
+        )
+        self.assertEqual(
+            fields["ownership_states"], [""] * ((self.PHASES - 1) * 2)
+        )
+        # The tracked path issues no worker-start, no release and no retain. Its
+        # release receipt is the agent process exiting, which the attempt records
+        # as `release:natural-exit` -- and there must be exactly one per role.
+        self.assertEqual(fields["release_process_actions"], [])
+        self.assertEqual(
+            sum(
+                1
+                for attempt in result.attempts
+                if attempt.lifecycle_action == "release:natural-exit"
+            ),
+            2,
+        )
         self.assertEqual(
             snapshot["result"]["terminal_creations"], result.terminal_creations
         )

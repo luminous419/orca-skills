@@ -11,10 +11,10 @@ in a specific environment.
 | `orca-worker-reviewer-loop` | Markdown Skill package; no Orca orchestration state required | Deterministic policy and fake-agent E2E verified |
 | `orca-worker-reviewer-orchestration` | Orca-native Run/Task/Dispatch lifecycle | Deterministic policy and fake-agent E2E verified |
 | Repository validator and tests | CPython 3.11, 3.12, and 3.13 | Supported by CI |
-| Real Orca runtime with fake agents | Orca 1.4.184 and Orca 1.4.196 | **VERIFIED** as two independent point observations, compatibility-gated by the opt-in Step 4 integration suite |
-| `claude-glm` Worker | Distinct PATH-resolved command in the tested company environment | **VERIFIED on Orca 1.4.178-rc.2** |
-| `claude-gemma` Reviewer | Separate PATH-resolved command and session in the tested company environment | **VERIFIED on Orca 1.4.178-rc.2** |
-| Real GLM/Gemma smoke | Isolated company fixture on Orca 1.4.178-rc.2 | **VERIFIED**; ANALYSIS, DESIGN, IMPLEMENTATION, BUGFIX, DESIGN → IMPLEMENTATION, and FAIL → correction → PASS |
+| Real Orca runtime with fake agents | Orca 1.4.196 | **VERIFIED for the current head** as a single point observation, compatibility-gated by the opt-in Step 4 integration suite. Orca 1.4.184 is a **historical** observation of an earlier revision — see "Verified for this head vs. historical" below |
+| `claude-glm` Worker | Distinct PATH-resolved command in the tested company environment | **VERIFIED on Orca 1.4.178-rc.2** — *historical*, an observation of the revision current at that time |
+| `claude-gemma` Reviewer | Separate PATH-resolved command and session in the tested company environment | **VERIFIED on Orca 1.4.178-rc.2** — *historical*, an observation of the revision current at that time |
+| Real GLM/Gemma smoke | Isolated company fixture on Orca 1.4.178-rc.2 | **VERIFIED** — *historical*; ANALYSIS, DESIGN, IMPLEMENTATION, BUGFIX, DESIGN → IMPLEMENTATION, and FAIL → correction → PASS |
 
 Python 3.11 is the minimum supported version. The code may run on earlier versions,
 but they are outside the tested support policy. The project uses only the Python
@@ -24,35 +24,65 @@ standard library.
 
 - Deterministic policy validation: **VERIFIED**
 - Fake-agent E2E: **VERIFIED**
-- Real Orca with fake agents: **VERIFIED on Orca 1.4.184 and, separately, on Orca 1.4.196**
-- Real GLM/Gemma smoke test: **VERIFIED on Orca 1.4.178-rc.2 in the tested company environment**
+- Real Orca with fake agents: **VERIFIED for the current head on Orca 1.4.196**
+- Real GLM/Gemma smoke test: **VERIFIED on Orca 1.4.178-rc.2 in the tested company environment (historical: an earlier revision)**
 - Stable production-ready release: **NOT YET CLAIMED**
 
-Verified environments are point observations, not a continuous supported range:
+## Verified for this head vs. historical observations
 
-- Orca 1.4.184: deterministic real-Orca integration with fake agents.
-- Orca 1.4.196: deterministic real-Orca integration with fake agents (OS-41).
-- Orca 1.4.178-rc.2: real `claude-glm` Worker and `claude-gemma` Reviewer smoke test.
+Read this section before quoting any version number from this document.
 
-Nothing about the two fake-agent observations is a range. `validate_orca_contract()`
-tests **set membership** against `SUPPORTED_ORCA_APP_VERSIONS`, never an ordering
-comparison, so 1.4.190 (between the two verified points) and 1.4.197 (just past the
-newer one) are both refused, and adding an entry requires actually running the suite
-on that runtime. A version that is listed still has to pass the guide-grammar check.
+Every observation below is a **point observation**, never a continuous supported range,
+and an observation is bound to the **repository revision that produced it**. A run that
+passed against an older revision of this repository is evidence about that revision. It
+is not evidence that the current head still passes, and it is therefore not a support
+claim.
+
+**Verified for the current head** (this is what `SUPPORTED_ORCA_APP_VERSIONS` contains,
+and it is what the Step 4 gate accepts):
+
+| Orca version | What was run | Evidence |
+| --- | --- | --- |
+| 1.4.196 | Deterministic real-Orca integration with fake agents, opt-in Step 4 suite: all six runtime scenarios executed, `skipped=0` (OS-41) | `artifacts/orca-runtime/` runs recorded on this branch |
+
+**Historical point observations** (preserved, still true of the revision that produced
+them, and **not** current support). These are recorded in code as
+`HISTORICAL_ORCA_APP_VERSION_OBSERVATIONS`, a tuple that **gates nothing**: it grants no
+runtime, is never consulted by `validate_orca_contract()`, and every version in it is
+refused exactly like any other unverified version.
+
+| Orca version | What was observed | On which revision |
+| --- | --- | --- |
+| 1.4.184 | Deterministic real-Orca integration with fake agents, including the **supervised** fake-agent adoption path and therefore granted session reuse | Pre-OS-41 harness, before this revision changed worker-start admission, the fake-agent shim name and path, unexpected-exit classification, scenario K, packaging and the run-scoped decision cursor |
+| 1.4.178-rc.2 | Real `claude-glm` Worker and `claude-gemma` Reviewer smoke test in the company fixture | The revision current at that time |
+
+Moving a historical entry back into the supported set requires running **the head that
+makes the claim** against that runtime and recording the evidence. Until then the
+historical records stay exactly as they are: `docs/validation/historical/` and the
+existing run artifacts are unmodified, and this document adds to them rather than
+rewriting them.
+
+`validate_orca_contract()` tests **set membership** against
+`SUPPORTED_ORCA_APP_VERSIONS`, never an ordering comparison, so 1.4.190 and 1.4.197 are
+refused, 1.4.184 is refused, and adding an entry requires actually running the suite on
+that runtime. A version that is listed still has to pass the guide-grammar check.
+**No version range is claimed anywhere in this repository.**
 
 The Step 4 runtime harness remains deliberately compatibility-gated. The
 Step 5 environment's version-matched `orchestration` and `orca-cli` grammar contained
 the required contract and the real-agent scenarios passed, but that does not establish
-support for every version between these two observations. The Skill itself reads the
-installed version-matched guides and does not hard-code either version as universal
-command grammar.
+support for any other version, nor for any version between these observations. The
+Skill itself reads the installed version-matched guides and does not hard-code any
+version as universal command grammar.
 
 ## Orca 1.4.196 point verification (OS-41)
 
 Verified by running `python3 scripts/test_orca_runtime.py --orca-runtime` against an
-installed Orca 1.4.196. This section records what 1.4.196 does **differently** from the
-1.4.184 observation. Every item below was read from the live runtime; none is inferred
-from a version number, and none of it is claimed for any version in between.
+installed Orca 1.4.196. **1.4.196 is the only runtime the current head is verified on.**
+This section records what 1.4.196 does **differently** from the historical 1.4.184
+observation; the comparison is a description of two runtimes, not a support claim for
+the older one. Every item below was read from the live runtime; none is inferred from a
+version number, and none of it is claimed for any version in between.
 
 ### Supervised `worker-start --terminal` no longer adopts a non-agent process
 
@@ -89,9 +119,10 @@ Stated plainly, because a reader must not infer it from the passing suite:
 1.4.196.** It cannot be, with deterministic fake agents: 1.4.196's `dispatch_input`
 acknowledgement stage is completable only by a genuine recognized agent session, and
 this repository's runtime suite is required to use deterministic fakes and never a real
-LLM worker. **Orca 1.4.184 remains the point observation for the supervised path**, and
-the offline contract suite in `scripts/test_orca_runtime_contract.py` continues to cover
-the supervised code paths deterministically.
+LLM worker. **Orca 1.4.184 remains the HISTORICAL observation of the supervised path,
+made against an earlier revision of this repository and not a claim about the current
+head**, and the offline contract suite in `scripts/test_orca_runtime_contract.py`
+continues to cover the supervised code paths deterministically on every revision.
 
 Concretely, on 1.4.196 the reuse gate `reuse_eligible()` refuses every same-role
 transition, naming `worker_state_not_reusable`, `release_state_missing`,
@@ -99,7 +130,12 @@ transition, naming `worker_state_not_reusable`, `release_state_missing`,
 whose evidence exists only for a supervised dispatch. Each refusal returns `None` and the
 attempt opens a fresh terminal, so the scenario records **eight refused decisions and ten
 terminals for ten dispatches**, not two
-(`artifacts/orca-runtime/os41-final/scenario-k.json`). That refusal is correct and is
+(`artifacts/orca-runtime/os41-final/scenario-k.json`). Scenario K's assertion **requires
+exactly that** on this runtime and fails if any reuse is granted: it is keyed on the
+point-verified runtime identity the harness recorded, it requires all eight decisions
+refused with exactly those four reason names, and it requires ten distinct terminal
+creations. The 1.4.184 supervised expectation — granted reuse, two terminals — is kept
+separately as a historical record and is not an executable branch of that test. That refusal is correct and is
 the gate's documented fail-closed behaviour; the gate was **not** widened to accept
 tracked evidence. Scenario K therefore verifies **"reuse correctly refused (fail-closed)
 on the tracked path"** on this runtime. It does **not** verify that session reuse works,
@@ -117,8 +153,13 @@ a failed start**, because the Dispatch row really was created. Reading that id a
 recording a supervised worker is exactly "prompt delivery inferred from Task/Dispatch
 existence", so the harness now admits a supervised attachment only for
 `state == "ready"`, and refuses every other value with the whole launch diagnosis
-attached. A result carrying no `state` key at all keeps its legacy reading, because that
-is the 1.4.184 shape and 1.4.184 is still a point verification.
+attached. A result carrying no `state` key at all keeps its legacy reading, because
+that is the 1.4.184 shape. That allowance is pinned to the exact `1.4.184` identity and
+is now **unreachable from a live run**: 1.4.184 is a historical observation and is
+refused by `validate_orca_contract()` before `start_worker()` can be reached, so the
+reading survives only as offline contract coverage. It is kept rather than deleted so a
+future revision that re-verifies 1.4.184 does not have to re-derive it; keeping it makes
+the live gate no less strict.
 
 ### A Dispatch is `pending` while its prompt is being delivered
 

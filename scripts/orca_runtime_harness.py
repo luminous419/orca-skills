@@ -113,6 +113,16 @@ WORKER_START_READY_STATE = "ready"
 # is what supplies the identity, and it stores it only after validate_orca_contract()
 # has accepted the runtime, so the exception can never be unlocked by an unverified
 # version string. (BUGFIX-I1-MAJOR-1.)
+#
+# PR #29 review MAJOR-2 CONSEQUENCE: 1.4.184 is no longer in
+# SUPPORTED_ORCA_APP_VERSIONS, so preflight() can no longer produce this identity and
+# this allowance is UNREACHABLE FROM A LIVE RUN of the current head. It is kept, not
+# deleted, for two reasons: keeping it changes nothing about what the live gate
+# accepts (validate_orca_contract() already refuses 1.4.184 before start_worker() is
+# ever reached, so the effective behaviour is strictly fail-closed), and it preserves
+# the reading that was actually derived from 1.4.184 receipts so a future revision
+# that re-verifies that runtime does not have to re-derive it. Its coverage is
+# therefore OFFLINE ONLY -- the contract tests set the identity directly.
 WORKER_START_STATELESS_RECEIPT_VERSION = "1.4.184"
 
 # ---- OS-41: the runtime's own unexpected-exit report ---------------------------
@@ -214,18 +224,46 @@ RUNTIME_EXIT_REPORT_SENDER_PANE_KEY = None
 # actually protects is that the coordinator never DISPATCHES such a Task, which is
 # asserted separately from this status.
 LATE_DEPENDENT_STATUSES = frozenset({"pending", "ready"})
-# OS-41. POINT VERIFICATIONS, not a range. Every entry is an Orca app version this
-# repository has actually run the Step 4 real-runtime suite against and observed to
-# pass; membership is exact-string set containment, never an ordering comparison, so
-# an unverified 1.4.190 or 1.4.197 still fails closed even though it sits between /
-# after two verified points. Adding an entry REQUIRES a fresh runtime run, and the
-# guide-grammar check below runs for every entry -- a version whose live guides
-# drifted is rejected on the grammar branch even while its version string is listed.
-SUPPORTED_ORCA_APP_VERSIONS: tuple[str, ...] = ("1.4.184", "1.4.196")
+# OS-41. POINT VERIFICATIONS OF *THIS* REVISION, not a range and not a history.
+#
+# This tuple is an EXECUTABLE CLAIM: every entry is an Orca app version that the
+# CURRENT head of this repository has actually run the Step 4 real-runtime suite
+# against, end to end, and observed to pass. It is therefore not the list of every
+# version this repository has ever been observed on -- an observation made against an
+# OLDER harness revision does not carry forward across changes to that harness, and
+# re-listing it here would advertise support this revision has not demonstrated.
+#
+# Membership is exact-string set containment, never an ordering comparison, so an
+# unverified 1.4.190 or 1.4.197 still fails closed even though it sits between / after
+# observed points. Adding an entry REQUIRES a fresh runtime run OF THE REVISION THAT
+# ADDS IT, and the guide-grammar check below runs for every entry -- a version whose
+# live guides drifted is rejected on the grammar branch even while it is listed.
+#
+# PR #29 review MAJOR-2: 1.4.184 was listed here while the only real-runtime evidence
+# for this head was a 1.4.196 run. This revision changed worker-start admission, the
+# fake-agent shim name and path, unexpected-exit classification, scenario K, packaging
+# and the run-scoped decision cursor; the 1.4.184 artifacts predate all of that. The
+# 1.4.184 and 1.4.178-rc.2 records are PRESERVED -- unmodified on disk, and named in
+# HISTORICAL_ORCA_APP_VERSION_OBSERVATIONS below and in docs/COMPATIBILITY.md -- but
+# they are historical observations of older revisions, not current executable support.
+SUPPORTED_ORCA_APP_VERSIONS: tuple[str, ...] = ("1.4.196",)
 # The newest point verification. Kept as a single string because callers and tests
 # that only need "a version this harness accepts" read it; the gate itself reads the
 # tuple above and never this.
 SUPPORTED_ORCA_APP_VERSION = SUPPORTED_ORCA_APP_VERSIONS[-1]
+# HISTORICAL POINT OBSERVATIONS. Runtimes on which an OLDER revision of this
+# repository was observed to pass, recorded so the evidence is not lost and so the
+# distinction is machine-checkable rather than only prose. Deliberately NOT consulted
+# by validate_orca_contract(): this tuple grants nothing and gates nothing. A runtime
+# reporting one of these versions is refused exactly like any other unverified version
+# until THIS revision is actually run against it and the entry is moved above.
+#
+#   1.4.184     -- deterministic real-Orca integration with fake agents, on the
+#                  pre-OS-41 harness. That is the revision on which the SUPERVISED
+#                  fake-agent adoption path (and therefore granted session reuse) was
+#                  observed; see docs/validation/historical/ and docs/COMPATIBILITY.md.
+#   1.4.178-rc.2 -- real claude-glm / claude-gemma smoke test in the company fixture.
+HISTORICAL_ORCA_APP_VERSION_OBSERVATIONS: tuple[str, ...] = ("1.4.178-rc.2", "1.4.184")
 REQUIRED_ORCHESTRATION_GUIDE_SNIPPETS = (
     "orca orchestration run-create --objective <text> --json",
     # The bare "--spec <text>" form is a prefix of the entry below; keeping both would
@@ -572,6 +610,10 @@ class RuntimeScenarioResult:
     # is not recorded is indistinguishable from a gate nobody asked.
     reuse_decisions: list[dict[str, Any]] = field(default_factory=list)
     retained_terminals: list[str] = field(default_factory=list)
+    # ---- PR #29 review MAJOR-1: the point-verified Orca app version this result was
+    # produced on, filled by finish() from the identity preflight() recorded on the far
+    # side of validate_orca_contract(). "" means no runtime identity was ever proven.
+    orca_app_version: str = ""
     # ---- OS-3: what strength this run enforced, and what the graph looked like.
     risk: str = ""
     risk_source: str = ""
@@ -2058,7 +2100,9 @@ class OrcaRuntimeHarness:
             # become a row that later reads like a live supervised worker.
             if "state" not in result:
                 # A success receipt with no `state` at all. Legitimate on exactly one
-                # point observation (see WORKER_START_STATELESS_RECEIPT_VERSION) and
+                # HISTORICAL point observation (see
+                # WORKER_START_STATELESS_RECEIPT_VERSION -- no longer in the current
+                # executable support set, so this branch is offline-covered only) and
                 # missing lifecycle evidence everywhere else -- including on a
                 # 1.4.196 runtime, where `state` is the field that carries the launch
                 # outcome, and on a harness that never identified its runtime.
@@ -3585,6 +3629,14 @@ class OrcaRuntimeHarness:
         assert self.run_id and self.run_owner
         result.signals = list(self._signals)
         result.run_owner_handle = self.run_owner
+        # PR #29 review MAJOR-1. The runtime IDENTITY this result was produced on,
+        # carried on the result (and therefore into the snapshot on disk) so an
+        # assertion can be bound to the runtime point it was validated for instead of
+        # being inferred from the outcome it observed. `self.orca_app_version` is
+        # written by preflight() ONLY after validate_orca_contract() accepted the
+        # runtime, so this is a point-verified identity or the empty string -- and an
+        # empty string is "no runtime proven", which every consumer must fail on.
+        result.orca_app_version = self.orca_app_version
         for handle, row in self._terminals.items():
             row["policy_commands"] = self.lifecycle_commands(handle=handle)
         result.ledger = [dict(row) for row in self._terminals.values()] + list(
@@ -3947,8 +3999,14 @@ def run_session_reuse_runtime_scenario(artifact_dir: Path) -> RuntimeScenarioRes
     ON ORCA 1.4.196 THIS SCENARIO VERIFIES THAT REUSE IS CORRECTLY REFUSED on the
     tracked path. It does NOT verify that session reuse works, and it must never be
     described as doing so. **Supervised session reuse is NOT VERIFIED on Orca
-    1.4.196.** That claim belongs to the Orca 1.4.184 point observation and to the
-    offline contract suite; see docs/COMPATIBILITY.md.
+    1.4.196.** That claim belongs to the HISTORICAL Orca 1.4.184 point observation of
+    an older harness revision -- see HISTORICAL_ORCA_APP_VERSION_OBSERVATIONS -- and to
+    the offline contract suite; see docs/COMPATIBILITY.md.
+
+    PR #29 review MAJOR-1: the eight refusals below are what the caller's assertion is
+    now BOUND to, keyed on `result.orca_app_version`. The result carries the identity
+    finish() copies off the harness so the expectation follows the runtime point
+    rather than the observed outcome.
 
     Deliberately NOT part of run_runtime_scenarios(): that function's A-I result set
     is pinned by an exact-set assertion in test_orca_runtime.py, which this change may
