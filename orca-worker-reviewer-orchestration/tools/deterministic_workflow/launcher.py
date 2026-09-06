@@ -285,7 +285,9 @@ def build_turn_parser() -> argparse.ArgumentParser:
     # FINAL-R1.  The same boundary, as Claude Code's ``Stop`` hook: the runtime invokes
     # it when the model finishes responding, and a refusal BLOCKS the turn instead of
     # being reported after it.  Registration is the operator's opt-in act -- nothing here
-    # writes a settings file -- and the hook is inert in a session bound to no run.
+    # writes a settings file.  A session the hook cannot attribute to a Run is NOT
+    # ignored: what decides is the project's run state, and only proven absence is
+    # silent.  FINAL attempt-3 R1 -- see the --run-id help below for the three cases.
     hook = sub.add_parser(
         "turn-end-hook",
         help="the turn-end boundary as a Claude Code Stop hook: reads the hook payload "
@@ -294,8 +296,11 @@ def build_turn_parser() -> argparse.ArgumentParser:
         "--run-id", default="",
         help="the Run this session's Coordinator drives. Default: "
              f"${turn_boundary_env()}, else the durable session binding published by "
-             "`turn-end-bind`. With none of the three the hook allows the turn without "
-             "observing anything, and says so when the project holds runs")
+             "`turn-end-bind`. With none of the three the project's run state decides: "
+             "PROVEN ABSENT -> the turn is allowed in silence; RUNS PRESENT or the run "
+             "authority UNREADABLE -> the turn is BLOCKED, bounded by --block-cap; and "
+             "when the block budget cannot be recorded, or the cap is spent, the turn "
+             "is RELEASED with a diagnostic naming why")
     hook.add_argument("--artifact-base", default=".")
     hook.add_argument(
         "--declare", default="",

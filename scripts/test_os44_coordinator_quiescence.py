@@ -29,6 +29,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -4525,6 +4526,181 @@ class DocumentedStopHookRegistrationTests(unittest.TestCase):
             sorted(path.name for path in self.project.rglob("settings*.json")), []
         )
 
+
+# PR #31 review, second round. The MAJOR that survived every gate: both `launcher.py`
+# copies still described the pre-FINAL-attempt-3 fail-open in `turn-end-hook --help`,
+# because the source-level forbidden-claim validator scanned `turn_boundary.py` and
+# `orca_runtime_harness.py` and not the launchers. 873 checks passed while the shipped
+# CLI told operators the opposite of what the hook does.
+LAUNCHER_COPIES = (
+    REPO_ROOT / "scripts" / "deterministic_workflow" / "launcher.py",
+    SKILL_ROOT / "tools" / "deterministic_workflow" / "launcher.py",
+)
+# The two sentences the launchers actually shipped, verbatim.
+SUPERSEDED_FAIL_OPEN_PHRASES = (
+    "inert in a session bound to no run",
+    "allows the turn without observing",
+)
+
+
+def collapsed(text: str) -> str:
+    """Help output as a reader meets it, with argparse's own wrapping removed."""
+    return re.sub(r"\s+", " ", text)
+
+
+class TurnEndHookHelpContractTests(unittest.TestCase):
+    """The `--help` an operator reads before registering the hook says what it does.
+
+    Scanning the policy module was not enough: `turn_boundary.py` was correct while the
+    CLI contradicted it. These tests read the HELP TEXT -- the artifact the operator
+    actually sees -- and they run the real entry point rather than importing a formatter,
+    because the entry point is what a registration invokes.
+    """
+
+    def help_text(self) -> str:
+        completed = subprocess.run(  # noqa: S603 - fixed argv, no shell
+            [
+                sys.executable,
+                str(SKILL_ROOT / "tools" / "run_workflow.py"),
+                "turn-end-hook",
+                "--help",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            cwd=str(REPO_ROOT),
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        return collapsed(completed.stdout)
+
+    def test_the_help_no_longer_describes_the_superseded_fail_open(self) -> None:
+        text = self.help_text()
+        for phrase in SUPERSEDED_FAIL_OPEN_PHRASES:
+            self.assertNotIn(
+                phrase,
+                text,
+                f"`turn-end-hook --help` still tells the operator {phrase!r}, which is "
+                "the behaviour FINAL attempt-3 R1 removed",
+            )
+
+    def test_the_help_states_all_three_run_state_outcomes(self) -> None:
+        """Removing the false sentence is only half of it; the true one must be there.
+
+        A help text that simply dropped the fail-open claim would pass the forbidden-claim
+        scan while telling the operator nothing about when the hook blocks.
+        """
+        text = self.help_text()
+        for fragment in (
+            "PROVEN ABSENT -> the turn is allowed in silence",
+            "RUNS PRESENT or the run authority UNREADABLE -> the turn is BLOCKED",
+            "bounded by --block-cap",
+            "when the block budget cannot be recorded, or the cap is spent",
+            "RELEASED with a diagnostic",
+        ):
+            self.assertIn(
+                fragment,
+                text,
+                f"`turn-end-hook --help` does not state {fragment!r}; the tri-state "
+                "contract must be legible to whoever registers the hook",
+            )
+
+    def rendered_help(self, package_root: Path) -> str:
+        """Each copy's own help, rendered with ITS package as the import root.
+
+        A subprocess per copy rather than an in-process import: the launcher uses
+        relative imports, and the two copies share module names, so importing both into
+        one interpreter would render the first one twice and prove nothing.
+        """
+        completed = subprocess.run(  # noqa: S603 - fixed argv, no shell
+            [
+                sys.executable,
+                "-c",
+                "from deterministic_workflow.launcher import build_turn_parser;"
+                "print(build_turn_parser().format_help())",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            cwd=str(package_root),
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        return collapsed(completed.stdout)
+
+    def test_both_launcher_copies_produce_the_same_help(self) -> None:
+        """Byte parity is enforced elsewhere; this pins the USER-VISIBLE consequence."""
+        source_help = self.rendered_help(REPO_ROOT / "scripts")
+        packaged_help = self.rendered_help(SKILL_ROOT / "tools")
+        self.assertEqual(
+            source_help,
+            packaged_help,
+            "the two launcher copies render different help; an operator following the "
+            "installed Skill would read a different contract from the one in scripts/",
+        )
+        for phrase in SUPERSEDED_FAIL_OPEN_PHRASES:
+            self.assertNotIn(phrase, source_help)
+            self.assertNotIn(phrase, packaged_help)
+
+
+class LauncherForbiddenClaimValidationTests(unittest.TestCase):
+    """The validator must FAIL if the superseded wording returns to a launcher.
+
+    This is the guard whose absence let the MAJOR ship. It is mutation-sensitive on
+    purpose: it reintroduces the exact sentence into BOTH copies (keeping them
+    byte-identical, so the failure is attributable to the claim scan and not to the
+    parity check), runs the real validator, and requires it to name each file.
+    """
+
+    def run_validator(self) -> subprocess.CompletedProcess:
+        return subprocess.run(  # noqa: S603 - fixed argv, no shell
+            [sys.executable, str(REPO_ROOT / "scripts" / "validate_skills.py")],
+            capture_output=True,
+            text=True,
+            check=False,
+            cwd=str(REPO_ROOT),
+        )
+
+    def test_reintroducing_the_fail_open_wording_fails_validation(self) -> None:
+        originals = {copy: copy.read_bytes() for copy in LAUNCHER_COPIES}
+        marker = "# writes a settings file."
+        try:
+            for copy in LAUNCHER_COPIES:
+                text = copy.read_text(encoding="utf-8")
+                self.assertIn(marker, text, f"{copy}: mutation anchor moved")
+                copy.write_text(
+                    text.replace(
+                        marker,
+                        "# writes a settings file -- and the hook is inert in a session "
+                        "bound to no run.",
+                        1,
+                    ),
+                    encoding="utf-8",
+                )
+            completed = self.run_validator()
+            self.assertNotEqual(
+                completed.returncode,
+                0,
+                "validate_skills.py PASSED with the superseded fail-open wording back in "
+                "both launchers; the forbidden-claim scan does not cover them",
+            )
+            output = completed.stdout + completed.stderr
+            for copy in LAUNCHER_COPIES:
+                relative = copy.relative_to(REPO_ROOT).as_posix()
+                self.assertIn(
+                    relative,
+                    output,
+                    f"validation failed but never named {relative}; the scan must cover "
+                    "the source AND the installed launcher copy",
+                )
+        finally:
+            for copy, original in originals.items():
+                copy.write_bytes(original)
+        for copy, original in originals.items():
+            self.assertEqual(copy.read_bytes(), original, f"{copy}: not restored")
+        self.assertEqual(
+            self.run_validator().returncode,
+            0,
+            "validate_skills.py does not pass on the restored tree",
+        )
 
 
 if __name__ == "__main__":

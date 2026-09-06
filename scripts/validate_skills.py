@@ -3323,6 +3323,17 @@ COORDINATOR_QUIESCENCE_SOURCE_FILES = (
     / "deterministic_workflow"
     / "turn_boundary.py",
     Path("scripts") / "orca_runtime_harness.py",
+    # PR #31 review, second round. The launchers were NOT scanned, so both copies kept
+    # shipping the superseded fail-open description in `turn-end-hook --help` while all
+    # 873 checks passed. `--help` is the contract an operator actually reads before
+    # registering the hook; a policy module that is right while the CLI says the opposite
+    # is not a corrected claim, it is a hidden one. Both copies are listed because they
+    # are byte-identical by contract and a fix to one alone would ship the other.
+    Path("scripts") / "deterministic_workflow" / "launcher.py",
+    Path("orca-worker-reviewer-orchestration")
+    / "tools"
+    / "deterministic_workflow"
+    / "launcher.py",
 )
 
 COORDINATOR_QUIESCENCE_SOURCE_FORBIDDEN_CLAIMS = (
@@ -3348,6 +3359,20 @@ COORDINATOR_QUIESCENCE_SOURCE_FORBIDDEN_CLAIMS = (
     (
         r"(is|are)\s+TOLD\s+it\s+is\s+ungated",
         "same claim, reworded: the unbound session is refused, not merely told",
+    ),
+    # PR #31 review, second round: the exact two sentences the launchers shipped. Both
+    # describe the pre-FINAL-attempt-3 behaviour, and both are user-visible `--help`
+    # output rather than a comment, so an operator registering the hook was told the
+    # opposite of what the hook does.
+    (
+        r"inert in a session bound to no run",
+        "an unattributable session is not ignored; the project's run state decides, and "
+        "only RUN_STATE_PROVEN_ABSENT is silent",
+    ),
+    (
+        r"allows the turn without observing",
+        "an unbound session in a project that holds runs -- or whose run authority "
+        "cannot be read -- is BLOCKED on the consecutive-block budget, not allowed",
     ),
     # The code shape the wording described. ``project_has_runs()`` answers False for
     # BOTH proven absence and an unreadable authority, so branching the silent allow on
