@@ -82,6 +82,12 @@ QUIESCENCE_UNACKNOWLEDGED_DELIVERY = "QUIESCENCE_UNACKNOWLEDGED_DELIVERY"
 #: The caller handed a status this contract does not define.  Fail closed: an
 #: unrecognised status is not evidence of rest.
 QUIESCENCE_UNKNOWN_STATUS = "QUIESCENCE_UNKNOWN_STATUS"
+#: The turn DECLARED a rest state that the authoritative run state does not support: a
+#: run reported COMPLETED while Orca still holds a runnable or dispatched Task, or a
+#: run reported ``WAITING_FOR_INPUT`` with no durable wait actually armed.  A rest state
+#: a Coordinator merely asserts is a natural-language progress report wearing a status
+#: name, and OS-44 exists because that is what ended the turn in ``run_c2166e75bb02``.
+QUIESCENCE_UNSUPPORTED_REST_CLAIM = "QUIESCENCE_UNSUPPORTED_REST_CLAIM"
 
 QUIESCENCE_REASON_CODES = (
     QUIESCENCE_OK,
@@ -89,7 +95,13 @@ QUIESCENCE_REASON_CODES = (
     QUIESCENCE_IDLE_NON_TERMINAL,
     QUIESCENCE_UNACKNOWLEDGED_DELIVERY,
     QUIESCENCE_UNKNOWN_STATUS,
+    QUIESCENCE_UNSUPPORTED_REST_CLAIM,
 )
+
+#: The rest states that are claims about the RUN having ended rather than about
+#: something being able to wake it.  Each one is corroborated against authoritative run
+#: state before ``turn_end_verdict`` accepts it.
+_ENDED_RUN_STATES = (SETTLED, ERROR, *TERMINAL_STATUSES)
 
 #: Statuses a caller may legitimately report for a run that has NOT ended.  ``ACTIVE``
 #: is the OS-31 lifecycle value; the empty string is "the caller did not say", which is
@@ -278,6 +290,20 @@ DELIVERY_STATE_ACKNOWLEDGED = "acknowledged"
 #: Bounded ack retry ran out.  The row stays in this state; it never silently becomes
 #: acknowledged.
 DELIVERY_STATE_ACK_FAILED = "ack_failed"
+#: OS-44 (BUGFIX-I3-MAJOR-1).  The wire acknowledgement was ISSUED and its outcome was
+#: never recorded.  Published before the ``--ack`` command rather than after it, which
+#: is the whole point: Orca accepts ``--ack`` and consumes the delivery before this
+#: process can publish anything about it, so an audit that ends at ``delivery_settled``
+#: cannot tell "the ack never went out" from "the ack went out and the process died".
+#: Without that distinction a successor either re-drives a consumed delivery or, worse,
+#: silently drops the acknowledgement outcome it owes.
+DELIVERY_STATE_ACK_INTENT = "ack_intent"
+#: OS-44 (BUGFIX-I3-MAJOR-1).  A successor process CLOSED an acknowledgement its
+#: predecessor left open, by re-issuing the idempotent wire ack and recording the
+#: outcome.  Distinct from ``acknowledged`` on purpose: the run's audit must say which
+#: process discharged the obligation and that it was discharged by reconciliation rather
+#: than in the normal flow.  It is a terminal ack state -- nothing is outstanding.
+DELIVERY_STATE_ACK_RECONCILED = "ack_reconciled"
 
 #: The delivery-ledger row slot recording that the settlement for this delivery was
 #: CLAIMED -- written before the settlement path's first command, so a successor can
@@ -299,7 +325,95 @@ DELIVERY_STATES = (
     DELIVERY_STATE_PROCESSED,
     DELIVERY_STATE_ACKNOWLEDGED,
     DELIVERY_STATE_ACK_FAILED,
+    DELIVERY_STATE_ACK_INTENT,
+    DELIVERY_STATE_ACK_RECONCILED,
 )
+
+#: The two states in which this run owes nothing further for a delivery's
+#: acknowledgement.  Everything else is an open obligation of some kind, and which kind
+#: is what :func:`delivery_obligation` decides.
+ACK_CLOSED_STATES = (DELIVERY_STATE_ACKNOWLEDGED, DELIVERY_STATE_ACK_RECONCILED)
+
+#: The row slot recording that a wire acknowledgement was ISSUED for this delivery.
+#: Published (as ``delivery_ack_intent``) strictly before the ``--ack`` command, so the
+#: audit carries the intent even when the process dies inside the command.
+DELIVERY_ACK_INTENT_FIELD = "ack_intent"
+
+# ---- what a delivery row still owes ------------------------------------------------
+# OS-44 (BUGFIX-I3-MAJOR-1).  The previous round collapsed four different situations
+# into one boolean -- "is this row recovered?" -- and then EXCLUDED recovered rows from
+# the pending check.  That made an incomplete acknowledgement disappear rather than be
+# closed.  The exclusion existed for a real reason (counting a predecessor's
+# awaiting-redelivery obligation refuses to arm the very waiter the redelivery must
+# arrive on), so the fix is to distinguish the states rather than to drop either rule.
+
+#: Nothing outstanding.
+OBLIGATION_NONE = "none"
+#: THIS process consumed the delivery and has not acknowledged it.  Blocks the next
+#: waiter and blocks the turn end -- the original OS-44 rule, unchanged.
+OBLIGATION_ACK_PENDING = "ack_pending"
+#: A predecessor got far enough that redelivery can no longer be relied on to close the
+#: acknowledgement: it recorded the settlement, or it issued the wire ack, or both.  A
+#: successor MUST close this deterministically by reconciling; it must not wait for a
+#: redelivery that Orca has no obligation to send, and it must take no lifecycle action.
+OBLIGATION_ACK_RECONCILE = "ack_reconcile"
+#: A predecessor consumed the delivery, mutated nothing and never reached the ack, so
+#: Orca still holds it and replays it until acknowledged.  This obligation is discharged
+#: BY the redelivery, so it must not block arming the waiter that redelivery arrives on
+#: -- but it is a runnable next action, not rest, so it does block ending the turn.
+OBLIGATION_AWAITING_REDELIVERY = "awaiting_redelivery"
+#: A predecessor claimed the settlement and never recorded finishing it.  A lifecycle
+#: command may already have gone out, so this is recovered explicitly and never
+#: re-driven; see ``DELIVERY_RECOVER``.
+OBLIGATION_RECOVER = "recover"
+
+DELIVERY_OBLIGATIONS = (
+    OBLIGATION_NONE,
+    OBLIGATION_ACK_PENDING,
+    OBLIGATION_ACK_RECONCILE,
+    OBLIGATION_AWAITING_REDELIVERY,
+    OBLIGATION_RECOVER,
+)
+
+#: The two obligations a REDELIVERY discharges, and the only two the waiter gate may
+#: stand aside for.  Both belong to a predecessor that never reached the wire ack, so
+#: Orca still holds the delivery and replays it until it is acknowledged -- on the very
+#: waiter that counting them would refuse to arm.  Standing aside is not hiding them:
+#: they remain in :func:`delivery_obligation`'s answer, the turn-end boundary reports
+#: them as runnable work rather than rest, and ``OBLIGATION_RECOVER`` additionally fails
+#: closed when the redelivery is settled.  Every OTHER obligation blocks, including a
+#: predecessor's settled-but-unacknowledged row -- that one cannot be discharged by a
+#: redelivery that may never come, so it is closed by reconciliation instead.
+REDELIVERY_RESOLVED_OBLIGATIONS = (
+    OBLIGATION_AWAITING_REDELIVERY,
+    OBLIGATION_RECOVER,
+)
+
+
+def delivery_obligation(row: dict[str, Any]) -> str:
+    """What one delivery row still owes.  Pure; the single classifier both readers use.
+
+    ``row`` is a delivery-ledger row: the in-memory one the Coordinator holds, or the
+    one :func:`run_logging.replay_delivery_ledger` folds out of the durable audit.  The
+    two must never disagree about whether something is outstanding, which is why the
+    harness and the turn-end CLI both decide it here instead of each spelling the rule.
+
+    A row this process recovered from a predecessor's audit is judged by HOW FAR the
+    predecessor got, not by the fact that it was recovered.
+    """
+    if row.get(DELIVERY_STATE_FIELD) in ACK_CLOSED_STATES:
+        return OBLIGATION_NONE
+    recovered = bool(row.get(DELIVERY_RECOVERED_FIELD))
+    if not recovered:
+        # This process consumed it, so the acknowledgement is its own to discharge.
+        return OBLIGATION_ACK_PENDING
+    if row.get(DELIVERY_SETTLEMENT_CLAIMED_FIELD) and not row.get(
+        DELIVERY_SETTLED_FIELD
+    ):
+        return OBLIGATION_RECOVER
+    if row.get(DELIVERY_SETTLED_FIELD) or row.get(DELIVERY_ACK_INTENT_FIELD):
+        return OBLIGATION_ACK_RECONCILE
+    return OBLIGATION_AWAITING_REDELIVERY
 
 
 def worker_done_provenance(
@@ -364,9 +478,13 @@ def delivery_disposition(
     row = ledger.get(delivery_id)
     if row is None:
         return DELIVERY_PROCESS, ""
-    acknowledged = row.get(DELIVERY_STATE_FIELD) == DELIVERY_STATE_ACKNOWLEDGED
+    acknowledged = row.get(DELIVERY_STATE_FIELD) in ACK_CLOSED_STATES
     settled = bool(row.get(DELIVERY_SETTLED_FIELD))
-    if not acknowledged and not settled:
+    # OS-44 (BUGFIX-I3-MAJOR-1).  A recorded ack INTENT is as disqualifying as a
+    # recorded settlement: the wire ``--ack`` was issued, so Orca may already have
+    # consumed the delivery and this cannot be re-driven as a first processing.
+    ack_issued = bool(row.get(DELIVERY_ACK_INTENT_FIELD))
+    if not acknowledged and not settled and not ack_issued:
         if row.get(DELIVERY_SETTLEMENT_CLAIMED_FIELD):
             return DELIVERY_RECOVER, (
                 f"delivery {delivery_id} claimed a settlement that was never recorded "
@@ -391,3 +509,71 @@ def delivery_disposition(
         f"{row.get(DELIVERY_STATE_FIELD)!r}, replay {replays}); acknowledging it "
         "again and taking no lifecycle action"
     )
+
+
+# ---- the executable turn-end boundary's judgement ----------------------------------
+
+
+def turn_end_verdict(
+    *,
+    run_status: str,
+    next_node: str = "",
+    active_dispatches: int = 0,
+    unacknowledged_deliveries: tuple[str, ...] | list[str] = (),
+    runnable_actions: tuple[str, ...] | list[str] = (),
+    durable_wait_armed: bool = False,
+) -> dict[str, Any]:
+    """:func:`quiescence_verdict` with the DECLARED rest state corroborated.  Pure.
+
+    OS-44 (BUGFIX-I3-CRITICAL-1).  ``quiescence_verdict`` answers the question a
+    Coordinator asks itself, and it takes the reported ``run_status`` at face value
+    because inside one process that status is the process's own state.  An executable
+    boundary invoked by a *prompt-driven* Coordinator cannot do that: "COMPLETED" is
+    then a claim a language model typed, and accepting it unchecked reduces the whole
+    gate to the natural-language progress report OS-44 exists to refuse.
+
+    So the two extra inputs here are authoritative observations, not claims:
+
+    ``runnable_actions``
+        Work the run's own state says is runnable right now and has not been started --
+        Orca Tasks that are unblocked and undispatched, plus any route token the OS-40
+        checkpoint produced.  A declared ENDED run with runnable work is refused, and a
+        runnable action with no active dispatch is the ``run_c2166e75bb02`` shape.
+    ``durable_wait_armed``
+        Whether a durable artifact for the human wait actually exists.  A declared
+        ``WAITING_FOR_INPUT`` with nothing armed is a stall wearing a rest state's name.
+
+    The check order of :func:`quiescence_verdict` is preserved exactly -- an
+    unacknowledged delivery still outranks every status question -- and this function
+    can only ever downgrade a quiescent verdict, never upgrade a refusal.
+    """
+    pending_actions = tuple(str(action) for action in runnable_actions if str(action))
+    verdict = quiescence_verdict(
+        run_status=run_status,
+        next_node=next_node or (pending_actions[0] if pending_actions else ""),
+        active_dispatches=active_dispatches,
+        unacknowledged_deliveries=unacknowledged_deliveries,
+    )
+    verdict["runnable_actions"] = list(pending_actions)
+    verdict["durable_wait_armed"] = bool(durable_wait_armed)
+    if not verdict["quiescent"]:
+        return verdict
+    if run_status == WAITING_FOR_INPUT and not durable_wait_armed:
+        verdict["quiescent"] = False
+        verdict["reason_code"] = QUIESCENCE_UNSUPPORTED_REST_CLAIM
+        verdict["detail"] = (
+            "the turn declares WAITING_FOR_INPUT but no durable wait is armed for this "
+            "run; a human decision that exists only in the response text cannot wake "
+            "the run, so the turn must arm the durable wait before it ends"
+        )
+        return verdict
+    if run_status in _ENDED_RUN_STATES and (pending_actions or active_dispatches):
+        verdict["quiescent"] = False
+        verdict["reason_code"] = QUIESCENCE_UNSUPPORTED_REST_CLAIM
+        verdict["detail"] = (
+            f"the turn declares {run_status} but the run's own state does not support "
+            f"it: {active_dispatches} dispatch(es) still active and runnable work "
+            f"outstanding ({', '.join(pending_actions) or 'none'}); a run that has "
+            "ended has neither"
+        )
+    return verdict

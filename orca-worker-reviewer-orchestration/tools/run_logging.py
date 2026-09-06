@@ -2193,6 +2193,19 @@ EVENT_DELIVERY_PROCESSED = "delivery_processed"
 EVENT_DELIVERY_ACKNOWLEDGED = "delivery_acknowledged"
 EVENT_DELIVERY_ACK_RETRY = "delivery_ack_retry"
 EVENT_DELIVERY_ACK_FAILED = "delivery_ack_failed"
+# OS-44 (BUGFIX-I3-MAJOR-1).  The wire acknowledgement's INTENT, published strictly
+# BEFORE the `orca orchestration check --ack` command.  Orca accepts that command and
+# consumes the delivery before this process can publish anything about it, so without
+# an intent record an audit that ends at `delivery_settled` cannot distinguish "the ack
+# never went out, Orca still holds the delivery and will replay it" from "the ack went
+# out, Orca consumed the delivery, and the acknowledgement outcome this run owes was
+# never recorded".  A successor that cannot tell those apart either re-drives a consumed
+# delivery or silently drops the obligation, which is the finding.
+EVENT_DELIVERY_ACK_INTENT = "delivery_ack_intent"
+# The successor's terminal record for an acknowledgement its PREDECESSOR left open.
+# Written after the idempotent wire ack is re-issued, and it never depends on the
+# runtime redelivering anything.
+EVENT_DELIVERY_ACK_RECONCILED = "delivery_ack_reconciled"
 EVENT_DELIVERY_REPLAYED = "delivery_replayed"
 EVENT_DELIVERY_MISMATCH = "delivery_mismatch"
 # The two settlement-progress records.  They are what makes a crash recoverable at
@@ -2213,6 +2226,8 @@ COORDINATOR_AUDIT_EVENTS = (
     EVENT_DELIVERY_ACKNOWLEDGED,
     EVENT_DELIVERY_ACK_RETRY,
     EVENT_DELIVERY_ACK_FAILED,
+    EVENT_DELIVERY_ACK_INTENT,
+    EVENT_DELIVERY_ACK_RECONCILED,
     EVENT_DELIVERY_REPLAYED,
     EVENT_DELIVERY_MISMATCH,
     EVENT_DELIVERY_SETTLEMENT_CLAIMED,
@@ -2332,6 +2347,8 @@ DELIVERY_IDENTIFIED_AUDIT_EVENTS = (
     EVENT_DELIVERY_ACKNOWLEDGED,
     EVENT_DELIVERY_ACK_RETRY,
     EVENT_DELIVERY_ACK_FAILED,
+    EVENT_DELIVERY_ACK_INTENT,
+    EVENT_DELIVERY_ACK_RECONCILED,
     EVENT_DELIVERY_REPLAYED,
     EVENT_DELIVERY_MISMATCH,
     EVENT_DELIVERY_SETTLEMENT_CLAIMED,
@@ -2433,8 +2450,8 @@ def replay_delivery_ledger(run_id: str, *, base: Path | None = None) -> dict[str
     were processed, which were acknowledged, and how many times each was replayed.
 
     Returns ``{delivery_id: {"delivery_state", "replays", "task_id", "dispatch_id",
-    "settlement_claimed", "settled"}}``.  The state slot is named ``delivery_state``
-    rather than ``state`` because the Coordinator keeps a separate per-Dispatch
+    "settlement_claimed", "settled", "ack_intent"}}``.  The state slot is named
+    ``delivery_state`` rather than ``state`` because the Coordinator keeps a separate per-Dispatch
     finalize-once ledger whose rows carry a ``state`` slot, and the two must stay
     distinguishable in the source.  The two boolean slots are how far the previous
     process got with THIS delivery's settlement, which is what lets the successor
@@ -2464,6 +2481,7 @@ def replay_delivery_ledger(run_id: str, *, base: Path | None = None) -> dict[str
                 "dispatch_id": record.get("dispatch_id") or "",
                 "settlement_claimed": False,
                 "settled": False,
+                "ack_intent": False,
             },
         )
         event = record.get("event")
@@ -2473,6 +2491,13 @@ def replay_delivery_ledger(run_id: str, *, base: Path | None = None) -> dict[str
             row["delivery_state"] = "acknowledged"
         elif event == EVENT_DELIVERY_ACK_FAILED:
             row["delivery_state"] = "ack_failed"
+        elif event == EVENT_DELIVERY_ACK_INTENT:
+            # A state, not a slot flip only: an intent with no outcome after it is what
+            # a successor has to see as an OPEN acknowledgement rather than as silence.
+            row["ack_intent"] = True
+            row["delivery_state"] = "ack_intent"
+        elif event == EVENT_DELIVERY_ACK_RECONCILED:
+            row["delivery_state"] = "ack_reconciled"
         elif event == EVENT_DELIVERY_SETTLEMENT_CLAIMED:
             row["settlement_claimed"] = True
         elif event == EVENT_DELIVERY_SETTLED:

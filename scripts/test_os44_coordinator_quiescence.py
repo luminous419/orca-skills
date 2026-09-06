@@ -26,23 +26,33 @@ settlement; these prove the delivery never reaches that gate in the first place.
 """
 from __future__ import annotations
 
+import io
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from os import environ
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
 from scripts import decision_gate, run_logging
-from scripts.deterministic_workflow import quiescence
+from scripts.deterministic_workflow import launcher, quiescence, turn_boundary
 from scripts.orca_runtime_harness import (
     ACK_MAX_ATTEMPTS,
+    ACK_RECONCILED_NOT_OUTSTANDING,
+    ACK_RECONCILE_UNRESOLVED,
     DELIVERY_RECOVERED_FIELD,
     DELIVERY_SETTLED_FIELD,
     DELIVERY_SETTLEMENT_CLAIMED_FIELD,
     DELIVERY_STATE_ACKNOWLEDGED,
+    DELIVERY_ACK_INTENT_FIELD,
     DELIVERY_STATE_ACK_FAILED,
+    DELIVERY_STATE_ACK_INTENT,
+    DELIVERY_STATE_ACK_RECONCILED,
     DELIVERY_STATE_FIELD,
     DELIVERY_STATE_PROCESSED,
     OrcaRuntimeError,
@@ -96,7 +106,10 @@ class ScriptedExec:
 
     ``ack_failures`` maps a delivery id to how many ``--ack`` attempts fail before one
     succeeds, which is how the bounded-retry and fail-closed paths are exercised
-    without patching the harness itself.
+    without patching the harness itself.  ``ack_error_code`` is the code those failures
+    carry; it defaults to a generic transient rejection, because that is what an
+    unclassified failure IS -- a test that wants the runtime's authoritative
+    "no such delivery for this Run" answer has to ask for it by name.
     """
 
     def __init__(
@@ -104,12 +117,57 @@ class ScriptedExec:
         deliveries: list[dict[str, Any]],
         *,
         ack_failures: dict[str, int] | None = None,
+        ack_error_code: str = "ack_rejected",
     ) -> None:
         self.deliveries = list(deliveries)
         self.ack_failures = dict(ack_failures or {})
+        self.ack_error_code = ack_error_code
         self.commands: list[tuple[str, ...]] = []
         self.acked: list[str] = []
         self.waits = 0
+        # OS-44 (BUGFIX-I3-CRITICAL-1). Orca's OWN Task and Dispatch listings, which is
+        # what the turn-end boundary reads. Defaulted to "both Tasks completed, no
+        # worker rows" so every existing test keeps the state it was written against,
+        # and overridden by `dispatch_running()` / `dispatch_finished()` for the tests
+        # that need a genuinely live wait rather than a settlement-ledger stand-in.
+        self.tasks: list[dict[str, Any]] = [
+            {"id": ANALYSIS_TASK, "status": "completed", "deps": "[]"},
+            {"id": PLAN_TASK, "status": "completed", "deps": "[]"},
+        ]
+        self.workers: list[dict[str, Any]] = []
+
+    def dispatch_running(self, dispatch_id: str, task_id: str) -> None:
+        """Orca's state while a Worker/Reviewer is genuinely running.
+
+        The Task carries Orca's `dispatched` status because no result has been recorded
+        for it, and the Dispatch's worker row still reports a live worker. This is the
+        state the Coordinator is in INSIDE `wait_for_done()` -- before any settlement is
+        claimed, and therefore before the settlement ledger knows the Dispatch exists.
+        """
+        self.tasks = [
+            task for task in self.tasks if task["id"] != task_id
+        ] + [{"id": task_id, "status": "dispatched", "deps": "[]",
+              "dispatch_id": dispatch_id}]
+        self.workers = [
+            worker for worker in self.workers if worker["dispatchId"] != dispatch_id
+        ] + [{"dispatchId": dispatch_id, "taskId": task_id,
+              "dispatchStatus": "dispatched", "workerState": "ready"}]
+
+    def dispatch_finished(self, dispatch_id: str, task_id: str) -> None:
+        """The Worker has stopped but the Coordinator has recorded nothing for it.
+
+        Orca still says the Task is `dispatched` while the Dispatch says the worker is
+        done: a `worker_done` waiting to be collected. Not an active wait, and not rest.
+        """
+        self.dispatch_running(dispatch_id, task_id)
+        self.workers[-1] = {**self.workers[-1], "dispatchStatus": "completed",
+                            "workerState": "settled"}
+
+    def pending_task(self, task_id: str, *deps: str) -> None:
+        """A Task Orca holds as runnable-but-undispatched, with its dependencies."""
+        self.tasks = [task for task in self.tasks if task["id"] != task_id] + [
+            {"id": task_id, "status": "pending", "deps": json.dumps(list(deps))}
+        ]
 
     @property
     def verbs(self) -> list[str]:
@@ -128,7 +186,15 @@ class ScriptedExec:
             if remaining > 0:
                 self.ack_failures[delivery_id] = remaining - 1
                 return 0, json.dumps(
-                    {"ok": False, "error": {"code": "ack_rejected", "message": "transient"}}
+                    {
+                        "ok": False,
+                        "error": {
+                            "code": self.ack_error_code,
+                            "message": "transient"
+                            if self.ack_error_code == "ack_rejected"
+                            else f"Delivery {delivery_id} does not belong to this Run.",
+                        },
+                    }
                 )
             self.acked.append(delivery_id)
             return 0, json.dumps({"ok": True, "result": {}})
@@ -146,12 +212,8 @@ class ScriptedExec:
                 "terminalResource": {"releaseState": "released"},
             },
             "worker-release": {"state": "released", "processAction": "none"},
-            "task-list": {
-                "tasks": [
-                    {"id": ANALYSIS_TASK, "status": "completed"},
-                    {"id": PLAN_TASK, "status": "completed"},
-                ]
-            },
+            "task-list": {"tasks": list(self.tasks)},
+            "worker-list": {"workers": list(self.workers)},
         }
         return 0, json.dumps({"ok": True, "result": results.get(verb, {})})
 
@@ -211,6 +273,21 @@ class MailboxExec(RecordingExec):
         return super().__call__(args)
 
 
+def _langgraph_available() -> bool:
+    """Whether the durable OS-40 checkpoint store can be opened in this environment.
+
+    The checkpoint-authority tests write and read a real checkpoint through
+    ``FileCheckpointSaver``, which needs LangGraph. Everything else in this module is
+    deliberately independent of it.
+    """
+    try:
+        import langgraph  # noqa: F401
+        import langgraph.checkpoint.base  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
 class OS44TestCase(unittest.TestCase):
     """Offline harness wiring, shaped after ``OfflineHarnessTestCase``."""
 
@@ -258,6 +335,25 @@ class OS44TestCase(unittest.TestCase):
             run_id, run_owner="term_owner", requested_phases=("analysis", "plan")
         )
         return harness
+
+    def refused_successor(
+        self, recorder: Any, *, run_id: str = "run_c2166e75bb02"
+    ) -> tuple[OrcaRuntimeHarness, OrcaRuntimeError]:
+        """A successor whose restart recovery is EXPECTED to fail closed.
+
+        Identical to `successor()` -- the same production `resume_run()` entry point --
+        except that it hands back the half-bound harness alongside the refusal, so a
+        test can assert what state a fail-closed recovery leaves behind rather than only
+        that it raised.
+        """
+        with patch.dict(environ, {"ORCA_CLI_COMMAND": "/opt/orca-dev"}):
+            harness = OrcaRuntimeHarness(self.artifact_dir)
+        harness._exec_orca = recorder
+        with self.assertRaises(OrcaRuntimeError) as raised:
+            harness.resume_run(
+                run_id, run_owner="term_owner", requested_phases=("analysis", "plan")
+            )
+        return harness, raised.exception
 
     def audit(self, harness: OrcaRuntimeHarness, run_id: str = "") -> list[dict]:
         return run_logging.read_coordinator_audit(
@@ -364,9 +460,35 @@ class RecordedStallReproductionTests(OS44TestCase):
     def test_an_active_dispatch_wait_is_a_legitimate_place_to_end_a_turn(self) -> None:
         """The other half: the invariant must not forbid the normal case.
 
-        A dispatch this Coordinator has claimed and not finalized IS something that can
-        wake the run, so ending the turn there is correct -- and the audit records the
-        verification rather than a violation.
+        OS-44 (BUGFIX-I3-CRITICAL-1). The activity is a GENUINE one: Orca holds the Task
+        as `dispatched` and the Dispatch's worker row still reports a live worker, which
+        is the state a Coordinator is in inside `wait_for_done()`. Nothing here claims a
+        settlement. That is the whole difference from what this test used to do -- the
+        settlement ledger only learns a Dispatch exists through `claim_settlement()`,
+        which runs AFTER `wait_for_done()` returns, so a ledger row can never stand for
+        a Worker that is currently running.
+        """
+        recorder = ScriptedExec([])
+        recorder.dispatch_running(ANALYSIS_DISPATCH, ANALYSIS_TASK)
+        harness = self.build(recorder)
+
+        verdict = harness.verify_quiescence("ACTIVE", next_node="PREPARE_PHASE_REVIEWER")
+
+        self.assertTrue(verdict["quiescent"])
+        self.assertEqual(verdict["state"], quiescence.ACTIVE_DISPATCH_WAIT)
+        self.assertEqual(harness.active_dispatch_count(), 1)
+        # The settlement ledger knows nothing about it, and that is the point.
+        self.assertEqual(harness.unfinalized_ledger_dispatches(), 0)
+        self.assertEqual(self.events(harness), [run_logging.EVENT_QUIESCENCE_VERIFIED])
+
+    def test_a_claimed_settlement_is_not_evidence_that_a_worker_is_running(self) -> None:
+        """The PR #31 CRITICAL, stated as a test.
+
+        `claim_settlement()` runs only after `wait_for_done()` has already returned, so
+        a row in that ledger describes a Worker that has FINISHED. Reading it as an
+        active dispatch is what let a turn end on a run nothing could wake, and the
+        authoritative derivation must not reproduce it: Orca reports the Task completed,
+        so there is no active dispatch no matter what the ledger holds.
         """
         recorder = ScriptedExec([])
         harness = self.build(recorder)
@@ -379,12 +501,30 @@ class RecordedStallReproductionTests(OS44TestCase):
             role="worker", iteration=1,
         )
 
-        verdict = harness.verify_quiescence("ACTIVE", next_node="PREPARE_PHASE_REVIEWER")
+        self.assertEqual(harness.unfinalized_ledger_dispatches(), 1)
+        self.assertEqual(harness.active_dispatch_count(), 0)
+        with self.assertRaises(OrcaRuntimeError) as raised:
+            harness.verify_quiescence("ACTIVE", next_node="PREPARE_PHASE_REVIEWER")
+        self.assertIn(quiescence.QUIESCENCE_NEXT_NODE_UNCONSUMED, str(raised.exception))
 
-        self.assertTrue(verdict["quiescent"])
-        self.assertEqual(verdict["state"], quiescence.ACTIVE_DISPATCH_WAIT)
-        self.assertEqual(harness.active_dispatch_count(), 1)
-        self.assertEqual(self.events(harness), [run_logging.EVENT_QUIESCENCE_VERIFIED])
+    def test_a_finished_worker_whose_result_was_never_collected_is_not_a_wait(self) -> None:
+        """Orca's two authorities disagreeing is exactly the `run_c2166e75bb02` moment.
+
+        The Task is still `dispatched` because the Coordinator recorded no result, while
+        the Dispatch says the worker has stopped. Nothing will wake the run: the
+        `worker_done` is sitting there waiting to be collected. That is runnable WORK,
+        not an active wait, and the boundary has to say so.
+        """
+        recorder = ScriptedExec([])
+        recorder.dispatch_finished(ANALYSIS_DISPATCH, ANALYSIS_TASK)
+        harness = self.build(recorder)
+
+        self.assertEqual(harness.active_dispatch_count(), 0)
+        state = harness.observe_orca_dispatch_state()
+        self.assertEqual(
+            state["runnable_actions"],
+            [f"{turn_boundary.ACTION_COLLECT_WORKER_DONE}:{ANALYSIS_TASK}"],
+        )
 
     def test_every_permitted_turn_end_state_is_accepted(self) -> None:
         """The five OS-44 names the ticket enumerates, each proven individually."""
@@ -1252,6 +1392,10 @@ class CrashBetweenReflectionAndAckTests(OS44TestCase):
                 run_logging.EVENT_DELIVERY_PROCESSED,
                 run_logging.EVENT_DELIVERY_SETTLEMENT_CLAIMED,
                 run_logging.EVENT_DELIVERY_SETTLED,
+                # OS-44 (BUGFIX-I3-MAJOR-1). The ack intent sits between the settled
+                # record and the acknowledgement, because it is published BEFORE the
+                # wire command whose outcome the acknowledgement reports.
+                run_logging.EVENT_DELIVERY_ACK_INTENT,
                 run_logging.EVENT_DELIVERY_ACKNOWLEDGED,
             ],
         )
@@ -1410,13 +1554,17 @@ class DurableBeforeMemoryTransitionTests(OS44TestCase):
         self.assertEqual(recorder.acked, [PLAN_DELIVERY])
         self.assertTrue(row[DELIVERY_SETTLED_FIELD])
         # Pre-fix this was DELIVERY_STATE_ACKNOWLEDGED over an audit that has no such row.
-        self.assertEqual(row[DELIVERY_STATE_FIELD], DELIVERY_STATE_PROCESSED)
+        # It is now `ack_intent`: the wire ack WAS issued and its outcome was not
+        # recorded, which is precisely the state the audit has to be able to express.
+        self.assertEqual(row[DELIVERY_STATE_FIELD], DELIVERY_STATE_ACK_INTENT)
+        self.assertTrue(row[DELIVERY_ACK_INTENT_FIELD])
         self.assertEqual(
             self.events(harness),
             [
                 run_logging.EVENT_DELIVERY_PROCESSED,
                 run_logging.EVENT_DELIVERY_SETTLEMENT_CLAIMED,
                 run_logging.EVENT_DELIVERY_SETTLED,
+                run_logging.EVENT_DELIVERY_ACK_INTENT,
             ],
         )
         self.assertEqual(harness.unacknowledged_deliveries(), (PLAN_DELIVERY,))
@@ -1440,6 +1588,9 @@ class DurableBeforeMemoryTransitionTests(OS44TestCase):
                 run_logging.EVENT_DELIVERY_PROCESSED,
                 run_logging.EVENT_DELIVERY_SETTLEMENT_CLAIMED,
                 run_logging.EVENT_DELIVERY_SETTLED,
+                # One intent, not two: the re-entry re-issues the same intent, and the
+                # record is published once, before the first attempt.
+                run_logging.EVENT_DELIVERY_ACK_INTENT,
                 run_logging.EVENT_DELIVERY_ACKNOWLEDGED,
             ],
         )
@@ -1461,11 +1612,22 @@ class DurableBeforeMemoryTransitionTests(OS44TestCase):
         successor = self.successor(recorder)
 
         self.assertTrue(successor._deliveries[PLAN_DELIVERY][DELIVERY_SETTLED_FIELD])
+        # OS-44 (BUGFIX-I3-MAJOR-1). The successor does not wait to find out: binding
+        # the run RECONCILED the inherited acknowledgement, so the obligation is closed
+        # before anything else happens and the row carries a terminal state.
+        self.assertEqual(
+            successor._deliveries[PLAN_DELIVERY][DELIVERY_STATE_FIELD],
+            DELIVERY_STATE_ACK_RECONCILED,
+        )
+        self.assertEqual(recorder.acked, [PLAN_DELIVERY])
+        self.assertIn(run_logging.EVENT_DELIVERY_ACK_RECONCILED, self.events(successor))
+
         with self.assertRaises(OrcaRuntimeError) as raised:
             successor.wait_for_done(PLAN_DISPATCH, PLAN_TASK)
 
         self.assertIn("timed out", str(raised.exception))
-        self.assertEqual(recorder.acked, [PLAN_DELIVERY])
+        # The redelivery is still a replay, and it still settles nothing.
+        self.assertEqual(recorder.acked, [PLAN_DELIVERY, PLAN_DELIVERY])
         self.assertNotIn("worker-release", recorder.verbs)
         self.assertIn(run_logging.EVENT_DELIVERY_REPLAYED, self.events(successor))
 
@@ -1946,6 +2108,876 @@ class CorruptCoordinatorAuditTests(OS44TestCase):
         self.assertEqual(recorder.waits, 1)
 
 
+class PostWireAckCrashRecoveryTests(OS44TestCase):
+    """BUGFIX-I3-MAJOR-1. The window between the wire ack and its audit record.
+
+    ``orca orchestration check --ack`` is accepted -- and the delivery consumed --
+    before this process can publish anything about it. A process that dies in that
+    window leaves an audit that ends at ``delivery_settled`` while Orca no longer holds
+    the delivery, so there is no redelivery to recover on. The previous round's
+    successor marked the row ``recovered`` and ``unacknowledged_deliveries()`` excluded
+    recovered rows, so it carried on having never recorded the acknowledgement outcome
+    it owed.
+
+    Every test below therefore starts from a REAL published audit and a FRESH process
+    with an EMPTY mailbox: no redelivery, no same-process ``settle_attempt()`` re-entry,
+    and no patching of the recovery path under test.
+    """
+
+    def publish(self, *events: str, run_id: str = "run_c2166e75bb02") -> None:
+        """Write the audit a crashed predecessor would have left, for real."""
+        for event in events:
+            run_logging.append_coordinator_audit_record(
+                run_id,
+                event,
+                {
+                    "delivery_id": PLAN_DELIVERY,
+                    "task_id": PLAN_TASK,
+                    "dispatch_id": PLAN_DISPATCH,
+                },
+                base=self.artifact_dir,
+            )
+
+    def audit_ends_at_settled(self) -> None:
+        """The reviewer's exact shape: processed, claimed, settled, and nothing more."""
+        self.publish(
+            run_logging.EVENT_DELIVERY_PROCESSED,
+            run_logging.EVENT_DELIVERY_SETTLEMENT_CLAIMED,
+            run_logging.EVENT_DELIVERY_SETTLED,
+        )
+
+    def audit_ends_at_ack_intent(self) -> None:
+        """One record later: the wire ack was issued and its outcome never recorded."""
+        self.audit_ends_at_settled()
+        self.publish(run_logging.EVENT_DELIVERY_ACK_INTENT)
+
+    def test_a_fresh_process_over_an_audit_ending_at_settled_closes_the_ack(self) -> None:
+        """The finding, with the mailbox empty so redelivery cannot be the answer."""
+        self.audit_ends_at_settled()
+        recorder = ScriptedExec([])  # empty mailbox: nothing will ever be redelivered
+
+        successor = self.successor(recorder)
+
+        row = successor._deliveries[PLAN_DELIVERY]
+        self.assertEqual(row[DELIVERY_STATE_FIELD], DELIVERY_STATE_ACK_RECONCILED)
+        reconciled = [
+            record
+            for record in self.audit(successor)
+            if record["event"] == run_logging.EVENT_DELIVERY_ACK_RECONCILED
+        ]
+        self.assertEqual(len(reconciled), 1)
+        self.assertEqual(reconciled[0]["delivery_id"], PLAN_DELIVERY)
+        self.assertEqual(reconciled[0]["dispatch_id"], PLAN_DISPATCH)
+        # Deterministic and terminal: nothing is outstanding and nothing was guessed.
+        self.assertEqual(successor.unacknowledged_deliveries(), ())
+        self.assertEqual(successor.delivery_obligations(), {})
+
+    def test_the_same_holds_when_the_audit_ends_at_the_ack_intent(self) -> None:
+        """The other side of the wire command, recorded rather than inferred."""
+        self.audit_ends_at_ack_intent()
+        recorder = ScriptedExec([])
+
+        successor = self.successor(recorder)
+
+        self.assertEqual(
+            successor._deliveries[PLAN_DELIVERY][DELIVERY_STATE_FIELD],
+            DELIVERY_STATE_ACK_RECONCILED,
+        )
+        self.assertEqual(successor.unacknowledged_deliveries(), ())
+
+    def test_the_reconciliation_repeats_no_lifecycle_action(self) -> None:
+        """Closing the acknowledgement must not re-settle, re-release or re-dispatch."""
+        self.audit_ends_at_settled()
+        recorder = ScriptedExec([])
+
+        successor = self.successor(recorder)
+
+        self.assertEqual(recorder.acked, [PLAN_DELIVERY])
+        self.assertEqual(successor.lifecycle_commands(PLAN_DISPATCH), [])
+        for forbidden in ("worker-release", "worker-start", "task-create", "dispatch"):
+            self.assertNotIn(forbidden, recorder.verbs)
+
+    def test_the_documented_not_outstanding_answer_is_terminal(self) -> None:
+        """Orca states that it holds no such delivery for this Run: THAT is terminal.
+
+        The runtime's `acknowledgeRunDelivery` throws `stale_delivery` when no delivery
+        row for this Run carries the id, which is an authoritative absence: nothing will
+        be redelivered under it. The outcome is recorded under its own reason code and
+        the obligation is closed, because waiting for a redelivery that cannot arrive is
+        the very failure being fixed.
+
+        This test previously fed three GENERIC `ack_rejected` failures whose message was
+        literally `transient` and asserted the same terminal outcome, which asserted the
+        fail-open behaviour rather than this one. The generic case is now
+        `test_an_unclassified_ack_failure_preserves_the_obligation` and expects the
+        opposite.
+        """
+        self.audit_ends_at_ack_intent()
+        recorder = ScriptedExec(
+            [],
+            ack_failures={PLAN_DELIVERY: ACK_MAX_ATTEMPTS},
+            ack_error_code="stale_delivery",
+        )
+
+        successor = self.successor(recorder)
+
+        reconciled = [
+            record
+            for record in self.audit(successor)
+            if record["event"] == run_logging.EVENT_DELIVERY_ACK_RECONCILED
+        ]
+        self.assertEqual(
+            [row["reason_code"] for row in reconciled],
+            [ACK_RECONCILED_NOT_OUTSTANDING],
+        )
+        self.assertEqual(
+            successor._deliveries[PLAN_DELIVERY][DELIVERY_STATE_FIELD],
+            DELIVERY_STATE_ACK_RECONCILED,
+        )
+        self.assertEqual(successor.unacknowledged_deliveries(), ())
+
+    def test_the_authoritative_answer_is_not_retried_after_it_arrives(self) -> None:
+        """An authoritative absence is an answer, not a failure to retry past."""
+        self.audit_ends_at_ack_intent()
+        recorder = ScriptedExec(
+            [],
+            ack_failures={PLAN_DELIVERY: ACK_MAX_ATTEMPTS},
+            ack_error_code="stale_delivery",
+        )
+
+        self.successor(recorder)
+
+        self.assertEqual(
+            [command for command in recorder.commands if "--ack" in command].__len__(), 1
+        )
+
+    def test_an_unclassified_ack_failure_preserves_the_obligation(self) -> None:
+        """A generic failure is not evidence Orca consumed the delivery.
+
+        BUGFIX-I3-MAJOR-1A. Three transient rejections say nothing about whether the
+        delivery is outstanding, so nothing may be closed on them: the reconciliation
+        fails closed, publishes its failure under `reconcile_unresolved`, and the row
+        stays an open obligation that every downstream gate keeps refusing.
+        """
+        self.audit_ends_at_ack_intent()
+        recorder = ScriptedExec([], ack_failures={PLAN_DELIVERY: ACK_MAX_ATTEMPTS})
+
+        harness, error = self.refused_successor(recorder)
+
+        self.assertIn("not evidence the runtime consumed the delivery", str(error))
+        self.assertEqual(
+            [
+                record["reason_code"]
+                for record in self.audit(harness)
+                if record["event"] == run_logging.EVENT_DELIVERY_ACK_FAILED
+            ],
+            [ACK_RECONCILE_UNRESOLVED],
+        )
+        self.assertEqual(
+            [
+                record
+                for record in self.audit(harness)
+                if record["event"] == run_logging.EVENT_DELIVERY_ACK_RECONCILED
+            ],
+            [],
+        )
+        self.assertEqual(
+            harness.delivery_obligations(),
+            {PLAN_DELIVERY: quiescence.OBLIGATION_ACK_RECONCILE},
+        )
+        self.assertEqual(harness.unacknowledged_deliveries(), (PLAN_DELIVERY,))
+
+    def test_a_fenced_consumer_is_not_proof_of_absence_either(self) -> None:
+        """`consumer_fenced` says who owns the mailbox, not whether the delivery is gone."""
+        self.audit_ends_at_settled()
+        recorder = ScriptedExec(
+            [],
+            ack_failures={PLAN_DELIVERY: ACK_MAX_ATTEMPTS},
+            ack_error_code="consumer_fenced",
+        )
+
+        harness, _ = self.refused_successor(recorder)
+
+        self.assertEqual(harness.unacknowledged_deliveries(), (PLAN_DELIVERY,))
+
+    def test_an_unresolved_reconciliation_refuses_the_next_waiter(self) -> None:
+        """Fail closed means the successor cannot proceed, not merely that it logged."""
+        self.audit_ends_at_settled()
+        recorder = ScriptedExec([], ack_failures={PLAN_DELIVERY: ACK_MAX_ATTEMPTS})
+        harness, _ = self.refused_successor(recorder)
+
+        with self.assertRaises(OrcaRuntimeError) as raised:
+            harness.wait_for_done(PLAN_DISPATCH, PLAN_TASK)
+
+        self.assertIn("was processed and not acknowledged", str(raised.exception))
+
+    def test_the_successor_can_then_arm_a_waiter_and_end_its_turn(self) -> None:
+        """A closed obligation is closed for every gate, not only for the pending list."""
+        self.audit_ends_at_settled()
+        recorder = ScriptedExec([])
+        successor = self.successor(recorder)
+
+        with self.assertRaises(OrcaRuntimeError) as raised:
+            successor.wait_for_done(PLAN_DISPATCH, PLAN_TASK)
+        self.assertIn("timed out", str(raised.exception))
+        successor.verify_quiescence("COMPLETED")
+
+        self.assertIn(run_logging.EVENT_QUIESCENCE_VERIFIED, self.events(successor))
+
+    def test_the_obligation_is_visible_before_it_is_closed_never_excluded(self) -> None:
+        """2e: an incomplete acknowledgement must be CLOSED, not filtered out.
+
+        Restoring the ledger without reconciling leaves the row exactly where the
+        previous round hid it -- so the assertion is that it is REPORTED there, and that
+        it is reported as an obligation a successor must discharge rather than as one
+        that will resolve itself.
+        """
+        self.audit_ends_at_settled()
+        harness = self.build(ScriptedExec([]))
+        harness._deliveries = {}
+        harness._deliveries_restored_for = ""
+
+        harness.restore_delivery_ledger()
+
+        self.assertEqual(
+            harness.delivery_obligations(),
+            {PLAN_DELIVERY: quiescence.OBLIGATION_ACK_RECONCILE},
+        )
+        self.assertEqual(harness.unacknowledged_deliveries(), (PLAN_DELIVERY,))
+        with self.assertRaises(OrcaRuntimeError):
+            harness.verify_quiescence("COMPLETED")
+
+    def test_a_predecessor_that_never_reached_the_ack_still_waits_for_redelivery(self) -> None:
+        """The tension named in 2e, held from the other side.
+
+        A row consumed with nothing settled, nothing claimed and no ack issued IS
+        resolved by the redelivery Orca replays until acknowledged -- so counting it
+        would refuse the waiter that redelivery must arrive on. It stands aside from the
+        waiter gate by the NAME of its obligation, and it is still reported.
+        """
+        self.publish(run_logging.EVENT_DELIVERY_PROCESSED)
+        recorder = ScriptedExec([])
+
+        successor = self.successor(recorder)
+
+        self.assertEqual(
+            successor.delivery_obligations(),
+            {PLAN_DELIVERY: quiescence.OBLIGATION_AWAITING_REDELIVERY},
+        )
+        self.assertEqual(successor.unacknowledged_deliveries(), ())
+        self.assertEqual(recorder.acked, [])
+        self.assertNotIn(
+            run_logging.EVENT_DELIVERY_ACK_RECONCILED, self.events(successor)
+        )
+
+
+class FakeOrca:
+    """Orca's `--json` surface for the turn-end boundary: Tasks, Dispatches, gates."""
+
+    def __init__(self) -> None:
+        self.tasks: list[dict[str, Any]] = []
+        self.workers: list[dict[str, Any]] = []
+        self.gates: list[dict[str, Any]] = []
+        self.failing: set[str] = set()
+        self.commands: list[tuple[str, ...]] = []
+
+    def dispatch(self, dispatch_id: str, task_id: str, *, running: bool = True) -> None:
+        self.tasks.append(
+            {"id": task_id, "status": "dispatched", "deps": "[]", "dispatch_id": dispatch_id}
+        )
+        self.workers.append(
+            {
+                "dispatchId": dispatch_id,
+                "taskId": task_id,
+                "dispatchStatus": "dispatched" if running else "completed",
+                "workerState": "ready" if running else "settled",
+            }
+        )
+
+    def task(self, task_id: str, status: str, *deps: str) -> None:
+        self.tasks.append({"id": task_id, "status": status, "deps": json.dumps(list(deps))})
+
+    def uncorroborated_dispatch(self, dispatch_id: str, task_id: str) -> None:
+        """A Task Orca still calls `dispatched` with NO worker row to back it.
+
+        BUGFIX-I3-CRITICAL-1A. The Task status alone proves nothing is running: it is
+        the one field a crashed or fenced Coordinator leaves behind exactly as it was.
+        """
+        self.tasks.append(
+            {"id": task_id, "status": "dispatched", "deps": "[]", "dispatch_id": dispatch_id}
+        )
+
+    def __call__(self, args: tuple[str, ...]) -> tuple[int, str]:
+        args = tuple(args)
+        self.commands.append(args)
+        verb = args[1] if len(args) > 1 else args[0]
+        if verb in self.failing:
+            return 1, json.dumps(
+                {"ok": False, "error": {"code": "run_not_found", "message": verb}}
+            )
+        payload = {
+            "task-list": {"tasks": list(self.tasks)},
+            "worker-list": {"workers": list(self.workers)},
+            "gate-list": {"gates": list(self.gates)},
+        }.get(verb, {})
+        return 0, json.dumps({"ok": True, "result": payload})
+
+
+class TurnBoundaryCliDriver:
+    """The two helpers that drive the real ``turn-end`` CLI over one run.
+
+    A mixin rather than a base test case so the checkpoint-authority class below can
+    drive the same command without inheriting -- and re-running -- every test written
+    against a run that has no checkpoint store.
+    """
+
+    RUN = "run_c2166e75bb02"
+
+    def cli(self, *argv: str, orca: FakeOrca) -> int:
+        """The real CLI, stdout captured so a suite run stays readable."""
+        self.printed = io.StringIO()
+        with patch.object(turn_boundary, "_default_runner", orca):
+            with redirect_stdout(self.printed):
+                return launcher.run_cli(
+                    ["turn-end", "--run-id", self.RUN, "--artifact-base",
+                     str(self.artifact_dir), *argv]
+                )
+
+    def records(self) -> list[dict]:
+        return [
+            record
+            for record in run_logging.read_coordinator_audit(
+                self.RUN, base=self.artifact_dir
+            )
+            if record["event"]
+            in (
+                run_logging.EVENT_QUIESCENCE_VERIFIED,
+                run_logging.EVENT_QUIESCENCE_VIOLATION,
+            )
+        ]
+
+    def arm_pause_record(self) -> None:
+        """The OS-31 durable pause record, written in its real published shape."""
+        record_path = (
+            self.artifact_dir / "artifacts" / "runs" / self.RUN
+            / turn_boundary.PAUSE_RECORD_FILENAME
+        )
+        record_path.parent.mkdir(parents=True, exist_ok=True)
+        record_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": turn_boundary.PAUSE_RECORD_SCHEMA_VERSION,
+                    "record": {"run_id": self.RUN, "status": "WAITING_FOR_INPUT"},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+
+class TurnBoundaryCliTests(TurnBoundaryCliDriver, OS44TestCase):
+    """BUGFIX-I3-CRITICAL-1. The invocable boundary, driven through the real CLI.
+
+    The PR #31 CRITICAL is that OS-44's guarantee lived in ``finish()`` -- a harness
+    completion path -- plus prose. These tests drive ``run_workflow.py turn-end``: the
+    same argument parsing, the same derivation from Orca's own Task and Dispatch
+    listings, the same exit codes a live Coordinator gets.
+
+    What they can prove is the boundary's behaviour when it is INVOKED, and that a
+    skipped invocation stays deterministically detectable afterwards. They cannot prove
+    a model was forced to invoke it, because no such interception exists on this
+    platform; see ``turn_boundary``'s module docstring.
+    """
+
+    def test_the_recorded_stall_is_refused_at_the_boundary(self) -> None:
+        """``run_c2166e75bb02``: ANALYSIS settled, PLAN not created, nothing active.
+
+        Orca holds one completed Task and no Dispatch. Nothing can wake the run, and the
+        turn is refused with the code that names the state rather than reported on.
+        """
+        orca = FakeOrca()
+        orca.task(ANALYSIS_TASK, "completed")
+
+        self.assertEqual(self.cli(orca=orca), turn_boundary.EXIT_REFUSED)
+
+        records = self.records()
+        self.assertEqual(
+            [record["event"] for record in records],
+            [run_logging.EVENT_QUIESCENCE_VIOLATION],
+        )
+        self.assertEqual(
+            records[0]["reason_code"], quiescence.QUIESCENCE_IDLE_NON_TERMINAL
+        )
+
+    def test_a_created_but_undispatched_next_task_is_refused(self) -> None:
+        """The other half of the same gap: the PLAN Task exists and nothing runs it."""
+        orca = FakeOrca()
+        orca.task(ANALYSIS_TASK, "completed")
+        orca.task(PLAN_TASK, "pending", ANALYSIS_TASK)
+
+        self.assertEqual(self.cli(orca=orca), turn_boundary.EXIT_REFUSED)
+
+        self.assertEqual(
+            self.records()[0]["reason_code"],
+            quiescence.QUIESCENCE_NEXT_NODE_UNCONSUMED,
+        )
+
+    def test_a_dispatched_task_with_no_worker_row_is_not_an_active_wait(self) -> None:
+        """BUGFIX-I3-CRITICAL-1A. Missing evidence is not evidence.
+
+        Orca reports the Task as `dispatched` and reports no worker for it. The previous
+        round counted exactly this as an active wait -- one stale Task status was then
+        enough to call a dead run quiescent, which is the fail-open shape OS-44 exists
+        to remove. It is now recovery work, so the turn is refused and the run's audit
+        records zero active dispatches.
+        """
+        orca = FakeOrca()
+        orca.uncorroborated_dispatch(PLAN_DISPATCH, PLAN_TASK)
+
+        self.assertEqual(self.cli("--json", orca=orca), turn_boundary.EXIT_REFUSED)
+
+        summary = json.loads(self.printed.getvalue())
+        self.assertEqual(summary["active_dispatches"], [])
+        self.assertEqual(
+            summary["runnable_actions"],
+            [f"{turn_boundary.ACTION_RECONCILE_DISPATCH}:{PLAN_TASK}"],
+        )
+        record = self.records()[0]
+        self.assertEqual(record["event"], run_logging.EVENT_QUIESCENCE_VIOLATION)
+        self.assertEqual(record["active_dispatches"], 0)
+
+    def test_an_uncorroborated_dispatch_cannot_support_a_declared_completion(self) -> None:
+        """The same branch through the rest-claim path: nothing corroborates rest."""
+        orca = FakeOrca()
+        orca.uncorroborated_dispatch(PLAN_DISPATCH, PLAN_TASK)
+
+        self.assertEqual(
+            self.cli("--declare", "COMPLETED", orca=orca), turn_boundary.EXIT_REFUSED
+        )
+
+        self.assertEqual(
+            self.records()[0]["reason_code"],
+            quiescence.QUIESCENCE_UNSUPPORTED_REST_CLAIM,
+        )
+
+    def test_a_worker_row_for_a_different_dispatch_proves_nothing_about_this_one(self) -> None:
+        """Evidence has to be evidence FOR the dispatch in question.
+
+        One genuinely live Dispatch and one Task nothing corroborates. The turn may end
+        -- the live wait can still wake the run, which is what the contract calls rest --
+        but the uncorroborated Task is counted as recovery WORK, not as a second active
+        wait. That distinction is the whole finding: with the live Dispatch removed, the
+        same run has nothing to wake it and the turn is refused
+        (`test_a_dispatched_task_with_no_worker_row_is_not_an_active_wait`).
+        """
+        orca = FakeOrca()
+        orca.dispatch(ANALYSIS_DISPATCH, ANALYSIS_TASK)
+        orca.uncorroborated_dispatch(PLAN_DISPATCH, PLAN_TASK)
+
+        self.assertEqual(self.cli("--json", orca=orca), turn_boundary.EXIT_QUIESCENT)
+
+        summary = json.loads(self.printed.getvalue())
+        self.assertEqual(summary["active_dispatches"], [ANALYSIS_DISPATCH])
+        self.assertEqual(
+            summary["runnable_actions"],
+            [f"{turn_boundary.ACTION_RECONCILE_DISPATCH}:{PLAN_TASK}"],
+        )
+
+    def test_a_task_blocked_on_an_unfinished_dependency_is_not_runnable(self) -> None:
+        """Runnable means unblocked. A dependent Task is not work the turn skipped."""
+        orca = FakeOrca()
+        orca.dispatch(ANALYSIS_DISPATCH, ANALYSIS_TASK)
+        orca.task(PLAN_TASK, "pending", ANALYSIS_TASK)
+
+        self.assertEqual(self.cli(orca=orca), turn_boundary.EXIT_QUIESCENT)
+
+        record = self.records()[0]
+        self.assertEqual(record["event"], run_logging.EVENT_QUIESCENCE_VERIFIED)
+        self.assertEqual(record["active_dispatches"], 1)
+
+    def test_continuous_execution_from_phase_pass_to_the_next_active_wait(self) -> None:
+        """The whole point: refuse, act, and only then may the turn end.
+
+        The same command over the same run, three times, as the Coordinator does the
+        work it was refused for. Nothing about the refusal is advisory -- the exit code
+        changes only because the run's own state changed.
+        """
+        orca = FakeOrca()
+        orca.task(ANALYSIS_TASK, "completed")
+        self.assertEqual(self.cli(orca=orca), turn_boundary.EXIT_REFUSED)
+
+        orca.task(PLAN_TASK, "pending", ANALYSIS_TASK)  # the Coordinator creates it
+        self.assertEqual(self.cli(orca=orca), turn_boundary.EXIT_REFUSED)
+
+        orca.tasks = [task for task in orca.tasks if task["id"] != PLAN_TASK]
+        orca.dispatch(PLAN_DISPATCH, PLAN_TASK)         # ...and dispatches it
+        self.assertEqual(self.cli(orca=orca), turn_boundary.EXIT_QUIESCENT)
+
+        self.assertEqual(
+            [record["reason_code"] for record in self.records()],
+            [
+                quiescence.QUIESCENCE_IDLE_NON_TERMINAL,
+                quiescence.QUIESCENCE_NEXT_NODE_UNCONSUMED,
+                quiescence.QUIESCENCE_OK,
+            ],
+        )
+
+    def test_a_declared_rest_state_the_run_does_not_support_is_refused(self) -> None:
+        """1e. A status a model typed is not evidence; the run's own state is."""
+        orca = FakeOrca()
+        orca.dispatch(PLAN_DISPATCH, PLAN_TASK)
+
+        self.assertEqual(
+            self.cli("--declare", "COMPLETED", orca=orca), turn_boundary.EXIT_REFUSED
+        )
+
+        self.assertEqual(
+            self.records()[0]["reason_code"],
+            quiescence.QUIESCENCE_UNSUPPORTED_REST_CLAIM,
+        )
+
+    def test_a_declared_human_wait_with_nothing_armed_is_refused(self) -> None:
+        """A wait that exists only in the response text cannot wake the run."""
+        orca = FakeOrca()
+        orca.task(ANALYSIS_TASK, "completed")
+
+        self.assertEqual(
+            self.cli("--declare", "WAITING_FOR_INPUT", orca=orca),
+            turn_boundary.EXIT_REFUSED,
+        )
+        self.assertEqual(
+            self.records()[0]["reason_code"],
+            quiescence.QUIESCENCE_UNSUPPORTED_REST_CLAIM,
+        )
+
+    def test_a_declared_human_wait_backed_by_a_durable_pause_record_is_accepted(self) -> None:
+        """...and the same declaration IS accepted once the pause is actually armed."""
+        orca = FakeOrca()
+        orca.task(ANALYSIS_TASK, "completed")
+        self.arm_pause_record()
+
+        self.assertEqual(
+            self.cli("--declare", "WAITING_FOR_INPUT", orca=orca),
+            turn_boundary.EXIT_QUIESCENT,
+        )
+        self.assertEqual(
+            self.records()[0]["event"], run_logging.EVENT_QUIESCENCE_VERIFIED
+        )
+
+    def test_a_paused_run_needs_no_declaration_at_all(self) -> None:
+        """The pause record is an ARTEFACT, so it answers the status question itself.
+
+        A Coordinator that forgets to declare anything over a genuinely paused run must
+        not have that run reported as ACTIVE-and-idle: the durable record already says
+        what the run is doing.
+        """
+        orca = FakeOrca()
+        orca.task(ANALYSIS_TASK, "completed")
+        self.arm_pause_record()
+
+        self.assertEqual(self.cli("--json", orca=orca), turn_boundary.EXIT_QUIESCENT)
+
+        self.assertEqual(
+            self.records()[0]["run_status"], quiescence.WAITING_FOR_INPUT
+        )
+
+    def test_an_open_decision_gate_also_proves_the_wait(self) -> None:
+        orca = FakeOrca()
+        orca.task(ANALYSIS_TASK, "completed")
+        orca.gates.append({"id": "gate_1", "status": "pending"})
+
+        self.assertEqual(
+            self.cli("--declare", "WAITING_FOR_INPUT", orca=orca),
+            turn_boundary.EXIT_QUIESCENT,
+        )
+
+    def test_an_outstanding_delivery_refuses_the_turn_whatever_is_declared(self) -> None:
+        """The delivery half of OS-44, read out of the durable audit by a third party.
+
+        `delivery_5c541e7fe1bd` was processed and never acknowledged, and the turn ended
+        anyway. The boundary refuses that turn from the audit alone, with an active
+        dispatch present and COMPLETED declared -- neither of which outranks an open
+        delivery obligation.
+        """
+        run_logging.append_coordinator_audit_record(
+            self.RUN,
+            run_logging.EVENT_DELIVERY_PROCESSED,
+            {"delivery_id": STALE_DELIVERY, "task_id": ANALYSIS_TASK,
+             "dispatch_id": ANALYSIS_DISPATCH},
+            base=self.artifact_dir,
+        )
+        orca = FakeOrca()
+        orca.dispatch(PLAN_DISPATCH, PLAN_TASK)
+
+        self.assertEqual(
+            self.cli("--declare", "COMPLETED", orca=orca), turn_boundary.EXIT_REFUSED
+        )
+
+        record = self.records()[0]
+        self.assertEqual(
+            record["reason_code"], quiescence.QUIESCENCE_UNACKNOWLEDGED_DELIVERY
+        )
+        self.assertEqual(record["delivery_id"], STALE_DELIVERY)
+
+    def test_a_settled_but_unacknowledged_delivery_blocks_the_turn(self) -> None:
+        """The post-wire-ack row is an obligation, not a redelivery to wait for."""
+        for event in (
+            run_logging.EVENT_DELIVERY_PROCESSED,
+            run_logging.EVENT_DELIVERY_SETTLED,
+        ):
+            run_logging.append_coordinator_audit_record(
+                self.RUN,
+                event,
+                {"delivery_id": PLAN_DELIVERY, "task_id": PLAN_TASK,
+                 "dispatch_id": PLAN_DISPATCH},
+                base=self.artifact_dir,
+            )
+        orca = FakeOrca()
+        orca.dispatch(ANALYSIS_DISPATCH, ANALYSIS_TASK)
+
+        self.assertEqual(self.cli(orca=orca), turn_boundary.EXIT_REFUSED)
+
+        self.assertEqual(
+            self.records()[0]["reason_code"],
+            quiescence.QUIESCENCE_UNACKNOWLEDGED_DELIVERY,
+        )
+
+    def test_a_declared_next_node_can_only_add_work_never_remove_it(self) -> None:
+        orca = FakeOrca()
+        orca.dispatch(ANALYSIS_DISPATCH, ANALYSIS_TASK)
+
+        self.assertEqual(
+            self.cli("--declare", "COMPLETED", "--next-node", "PREPARE_WORKER",
+                     orca=orca),
+            turn_boundary.EXIT_REFUSED,
+        )
+
+    def test_unreachable_run_state_reports_no_verdict_at_all(self) -> None:
+        """"I could not find out" is not "the turn may end", and not a violation either."""
+        orca = FakeOrca()
+        orca.failing.add("task-list")
+
+        self.assertEqual(self.cli(orca=orca), turn_boundary.EXIT_UNAVAILABLE)
+
+        self.assertEqual(self.records(), [])
+
+    def test_a_corrupt_audit_reports_no_verdict_rather_than_a_pass(self) -> None:
+        """The delivery history is the only source of the run's obligations."""
+        run_logging.append_coordinator_audit_record(
+            self.RUN,
+            run_logging.EVENT_DELIVERY_PROCESSED,
+            {"delivery_id": PLAN_DELIVERY},
+            base=self.artifact_dir,
+        )
+        published = (
+            self.artifact_dir / "artifacts" / "runs" / self.RUN
+            / run_logging.COORDINATOR_AUDIT_DIRNAME
+            / run_logging.coordinator_audit_sequence_key(0)
+            / run_logging.COORDINATOR_AUDIT_RECORD_FILENAME
+        )
+        published.write_text("{ not json", encoding="utf-8")
+        orca = FakeOrca()
+        orca.dispatch(PLAN_DISPATCH, PLAN_TASK)
+
+        self.assertEqual(self.cli(orca=orca), turn_boundary.EXIT_UNAVAILABLE)
+
+    def test_the_verdict_is_durable_so_a_skipped_check_is_an_observable_absence(self) -> None:
+        """The honest scope: enforcement when invoked, detection when it is not.
+
+        Nothing can make a language model call this command. What the record buys is
+        that a run whose turn ended without it has NO verdict for that turn, and that
+        the same command run later -- by a successor, an operator, a scheduled check --
+        reaches the identical verdict from durable state with no live process.
+        """
+        orca = FakeOrca()
+        orca.task(ANALYSIS_TASK, "completed")
+        self.assertEqual(self.records(), [])
+
+        first = self.cli("--json", orca=orca)
+        later = self.cli("--json", orca=orca)
+
+        self.assertEqual(first, turn_boundary.EXIT_REFUSED)
+        self.assertEqual(later, turn_boundary.EXIT_REFUSED)
+        self.assertEqual(
+            [record["reason_code"] for record in self.records()],
+            [quiescence.QUIESCENCE_IDLE_NON_TERMINAL] * 2,
+        )
+
+
+@unittest.skipUnless(_langgraph_available(), "requires the pinned langgraph runtime")
+class TurnBoundaryCheckpointAuthorityTests(TurnBoundaryCliDriver, OS44TestCase):
+    """BUGFIX-I3-CRITICAL-1A. Run status and next node bound to the DURABLE checkpoint.
+
+    The review's requirement was that these two are derived from authoritative run and
+    runtime state rather than supplied by the caller. When the run has an OS-40
+    checkpoint store, they are: the status from the committed ``terminal_status`` /
+    ``run_lifecycle`` and the next node from the engine's own ``routing.route``. These
+    tests write a real checkpoint through ``FileCheckpointSaver`` -- the same writer the
+    engine uses -- and drive the same ``turn-end`` command as ``TurnBoundaryCliTests``,
+    whose own cases cover the run that has no checkpoint store at all.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        from scripts.deterministic_workflow.checkpoint_store import FileCheckpointSaver
+
+        self.saver_class = FileCheckpointSaver
+        self.store = (
+            self.artifact_dir / "artifacts" / "runs" / self.RUN / ".workflow_checkpoints.json"
+        )
+        self.store.parent.mkdir(parents=True, exist_ok=True)
+
+    def workflow_state(self, **overrides: Any) -> dict[str, Any]:
+        from scripts.deterministic_workflow.contracts import BASE_CAPABILITIES
+        from scripts.deterministic_workflow.state import initial_state
+
+        state = dict(
+            initial_state(
+                run_id=self.RUN,
+                thread_id="thread_main",
+                phases=("ANALYSIS", "PLAN"),
+                capabilities=BASE_CAPABILITIES,
+            )
+        )
+        state.update(overrides)
+        return state
+
+    def commit(self, values: dict[str, Any], *, thread_id: str = "thread_main") -> None:
+        """One committed checkpoint, written exactly as the engine writes one."""
+        checkpoint = {
+            "v": 1,
+            "id": f"chk_{thread_id}",
+            "ts": "2026-01-01T00:00:00Z",
+            "channel_values": dict(values),
+            "channel_versions": {key: 1 for key in values},
+            "versions_seen": {},
+            "pending_sends": [],
+        }
+        self.saver_class(self.store).put(
+            {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}},
+            checkpoint,
+            {"source": "loop", "step": 0},
+            {key: 1 for key in values},
+        )
+
+    def test_the_checkpoints_next_node_refuses_a_run_with_nothing_dispatched(self) -> None:
+        """The engine owes a step, so the turn owes it too -- derived, not declared."""
+        self.commit(self.workflow_state())
+        orca = FakeOrca()
+
+        self.assertEqual(self.cli("--json", orca=orca), turn_boundary.EXIT_REFUSED)
+
+        summary = json.loads(self.printed.getvalue())
+        self.assertEqual(summary["status_authority"], turn_boundary.STATUS_AUTHORITY_CHECKPOINT)
+        self.assertEqual(summary["run_status"], "ACTIVE")
+        self.assertEqual(
+            summary["runnable_actions"],
+            [f"{turn_boundary.ACTION_CHECKPOINT_ROUTE}:PREPARE_WORKER"],
+        )
+        self.assertEqual(
+            summary["reason_code"], quiescence.QUIESCENCE_NEXT_NODE_UNCONSUMED
+        )
+
+    def test_a_declared_status_the_checkpoint_contradicts_is_refused(self) -> None:
+        """A model's word never wins over the run's own durable state."""
+        self.commit(self.workflow_state())
+        orca = FakeOrca()
+        orca.dispatch(PLAN_DISPATCH, PLAN_TASK)
+
+        self.assertEqual(
+            self.cli("--declare", "COMPLETED", "--json", orca=orca),
+            turn_boundary.EXIT_REFUSED,
+        )
+
+        summary = json.loads(self.printed.getvalue())
+        self.assertEqual(summary["run_status"], "ACTIVE")
+        self.assertEqual(
+            summary["reason_code"], quiescence.QUIESCENCE_UNSUPPORTED_REST_CLAIM
+        )
+        self.assertIn("workflow_checkpoint", summary["detail"])
+
+    def test_a_terminal_checkpoint_supplies_the_rest_state_with_nothing_declared(self) -> None:
+        """A run that ended says so itself; the caller does not have to."""
+        self.commit(
+            self.workflow_state(
+                terminal_status="COMPLETED",
+                run_lifecycle="SETTLED",
+                pending_role=None,
+                route_token="COMPLETE",
+            )
+        )
+        orca = FakeOrca()
+        orca.task(ANALYSIS_TASK, "completed")
+
+        self.assertEqual(self.cli("--json", orca=orca), turn_boundary.EXIT_QUIESCENT)
+
+        summary = json.loads(self.printed.getvalue())
+        self.assertEqual(summary["run_status"], "COMPLETED")
+        self.assertEqual(summary["status_authority"], turn_boundary.STATUS_AUTHORITY_CHECKPOINT)
+        self.assertEqual(summary["runnable_actions"], [])
+
+    def test_a_paused_checkpoint_reports_the_wait_rather_than_a_next_node(self) -> None:
+        """A run already paused re-routes to its own pause; that is not outstanding work."""
+        self.commit(
+            self.workflow_state(
+                run_lifecycle="WAITING_FOR_INPUT",
+                decision_state="NEEDS_INPUT",
+                pending_clarification_id="req_1",
+                pause_binding={
+                    "pause_record_id": "pause_1",
+                    "paused_at": "2026-01-01T00:00:00Z",
+                    "request_id": "req_1",
+                    "decision_item_ids": [],
+                    "source_ledger_keys": [],
+                    "responsible_phase": "ANALYSIS",
+                    "repository_binding": {},
+                    "artifact_binding": {},
+                    "policy_digest": "digest",
+                    "settlement_ledger": [],
+                    "disposition": None,
+                },
+            )
+        )
+        orca = FakeOrca()
+        self.arm_pause_record()
+
+        self.assertEqual(self.cli("--json", orca=orca), turn_boundary.EXIT_QUIESCENT)
+
+        summary = json.loads(self.printed.getvalue())
+        self.assertEqual(summary["run_status"], quiescence.WAITING_FOR_INPUT)
+        self.assertEqual(summary["runnable_actions"], [])
+        self.assertEqual(
+            summary["durable_wait_evidence"], [turn_boundary.WAIT_EVIDENCE_PAUSE_RECORD]
+        )
+
+    def test_a_corrupt_checkpoint_store_yields_no_verdict(self) -> None:
+        """An unreadable authority is not an absent one: exit 3, and nothing recorded."""
+        self.store.write_text("{not json", encoding="utf-8")
+        orca = FakeOrca()
+
+        self.assertEqual(self.cli(orca=orca), turn_boundary.EXIT_UNAVAILABLE)
+
+        self.assertEqual(self.records(), [])
+
+    def test_threads_that_disagree_about_the_run_status_yield_no_verdict(self) -> None:
+        """The boundary does not pick a winner among live authorities."""
+        self.commit(self.workflow_state(thread_id="thread_main"), thread_id="thread_main")
+        self.commit(
+            self.workflow_state(
+                thread_id="thread_other",
+                terminal_status="COMPLETED",
+                run_lifecycle="SETTLED",
+                pending_role=None,
+                route_token="COMPLETE",
+            ),
+            thread_id="thread_other",
+        )
+        orca = FakeOrca()
+
+        self.assertEqual(self.cli(orca=orca), turn_boundary.EXIT_UNAVAILABLE)
+
+        self.assertIn("disagree about the run's status", self.printed.getvalue())
+
+
 class QuiescenceContractTests(unittest.TestCase):
     """The runtime-neutral half, tested without a harness at all."""
 
@@ -2072,6 +3104,1427 @@ class QuiescenceContractTests(unittest.TestCase):
             quiescence.delivery_disposition("dlv_1", ledger)[0],
             quiescence.DELIVERY_REPLAY_EXHAUSTED,
         )
+
+
+def deny_directory_read(case: unittest.TestCase, directory: Path) -> None:
+    """Make ``directory`` genuinely unreadable, or skip the test saying exactly why.
+
+    FINAL attempt-3 R1(e). A test that passes because a ``chmod`` quietly did nothing --
+    running as root, or on a filesystem that ignores the mode bits -- is the same class
+    of defect this branch keeps shipping: it asserts a behaviour it never exercised. So
+    the denial is VERIFIED rather than assumed. The directory is listed after the chmod;
+    if that still succeeds, the environment cannot express the state under test and the
+    test SKIPS with the reason, which is never the same thing as concluding that the
+    authority was proven absent.
+    """
+    original = directory.stat().st_mode
+
+    def restore() -> None:
+        # Tolerant on purpose: the enclosing fixture may already have removed the tree
+        # by the time cleanups unwind, and a teardown error would mask the assertion
+        # this helper exists to make possible.
+        try:
+            os.chmod(directory, original)
+        except OSError:
+            pass
+
+    case.addCleanup(restore)
+    os.chmod(directory, 0o000)
+    try:
+        os.listdir(directory)
+    except OSError:
+        return
+    raise unittest.SkipTest(
+        f"this environment ignores directory mode bits (euid={os.geteuid()}); "
+        f"{directory} is still listable at mode 000, so a genuinely unreadable Run-state "
+        "authority cannot be constructed here. The classification itself is still "
+        "covered portably by the not-a-directory case."
+    )
+
+
+def deny_write(case: unittest.TestCase, path: Path) -> None:
+    """Make ``path`` genuinely un-writable, or skip the test saying exactly why.
+
+    FINAL adversarial review R1. The sibling of ``deny_directory_read`` above, and it
+    verifies the denial for the same reason: a test that passes because a ``chmod`` did
+    nothing -- running as root, or on a filesystem that ignores mode bits -- asserts a
+    behaviour it never exercised. The probe is a real write attempt, not ``os.access``:
+    ``os.access`` is exactly the TOCTOU preflight whose insufficiency this review found,
+    so it is not evidence here either.
+    """
+    original = path.stat().st_mode
+
+    def restore() -> None:
+        try:
+            os.chmod(path, original)
+        except OSError:
+            pass
+
+    case.addCleanup(restore)
+    os.chmod(path, 0o555 if path.is_dir() else 0o444)
+    try:
+        if path.is_dir():
+            probe = path / ".write_probe"
+            probe.write_text("x", encoding="utf-8")
+            probe.unlink()
+        else:
+            with path.open("a", encoding="utf-8"):
+                pass
+    except OSError:
+        return
+    raise unittest.SkipTest(
+        f"this environment ignores mode bits (euid={os.geteuid()}); {path} is still "
+        "writable at a read-only mode, so a counter that cannot be persisted cannot be "
+        "constructed here."
+    )
+
+
+class StopHookBoundaryTests(TurnBoundaryCliDriver, OS44TestCase):
+    """FINAL-R1. The turn-end boundary as Claude Code's blocking ``Stop`` hook.
+
+    The previous round asserted that no hook runs when a model stops emitting tokens and
+    narrowed OS-44's scope on that premise. The premise was false. Observed on the
+    installed Claude Code 2.1.260: the live settings register hooks for a ``Stop`` event
+    (Orca's own is already one of them), the binary evaluates them from a query site
+    labelled ``blockable_turn_end``, and it turns a hook's blocking error into a message
+    pushed onto the conversation and re-invokes the model instead of ending the turn.
+
+    These tests drive the real ``turn-end-hook`` CLI over the real Stop payload shape.
+    They prove the four things the wiring has to get right -- it blocks a refused turn,
+    it fails closed on unreadable state, it cannot block forever, and it is inert in a
+    session that is not bound to a run -- and the two things it must never do: block on
+    its own defect, or touch a settings file.
+    """
+
+    def hook(
+        self,
+        payload: dict[str, Any],
+        *argv: str,
+        orca: "FakeOrca | None" = None,
+        bind: bool = True,
+    ) -> tuple[int, dict[str, Any]]:
+        """The real CLI, over the real stdin/stdout hook contract."""
+        self.printed = io.StringIO()
+        binding = ["--run-id", self.RUN] if bind else []
+        with patch.object(turn_boundary, "_default_runner", orca or FakeOrca()):
+            with patch.dict(environ, {turn_boundary.STOP_HOOK_RUN_ENV: ""}):
+                with patch.object(sys, "stdin", io.StringIO(json.dumps(payload))):
+                    with redirect_stdout(self.printed):
+                        code = launcher.run_cli(
+                            [
+                                "turn-end-hook",
+                                *binding,
+                                "--artifact-base",
+                                str(self.artifact_dir),
+                                *argv,
+                            ]
+                        )
+        return code, json.loads(self.printed.getvalue())
+
+    @staticmethod
+    def payload(**overrides: Any) -> dict[str, Any]:
+        """Claude Code's Stop hook stdin document, in the shape the runtime sends."""
+        document = {
+            "session_id": "session_os44",
+            "transcript_path": "/tmp/transcript.jsonl",
+            "cwd": "/repo",
+            "hook_event_name": "Stop",
+            "stop_hook_active": False,
+        }
+        document.update(overrides)
+        return document
+
+    def stalled(self) -> "FakeOrca":
+        """``run_c2166e75bb02``'s shape: ANALYSIS completed, PLAN pending, nothing runs."""
+        orca = FakeOrca()
+        orca.task(ANALYSIS_TASK, "completed")
+        orca.task(PLAN_TASK, "pending", ANALYSIS_TASK)
+        return orca
+
+    def test_a_refused_turn_is_blocked_with_an_actionable_reason(self) -> None:
+        """The whole point of R1: the refusal now PREVENTS the turn, it does not report.
+
+        ``decision: block`` is what makes the runtime push the reason onto the
+        conversation and re-invoke the model, so the reason has to say what is
+        outstanding rather than only that something is.
+        """
+        code, decision = self.hook(self.payload(), orca=self.stalled())
+
+        self.assertEqual(code, turn_boundary.EXIT_STOP_HOOK)
+        self.assertEqual(decision["decision"], "block")
+        self.assertIn(quiescence.QUIESCENCE_NEXT_NODE_UNCONSUMED, decision["reason"])
+        self.assertIn(f"{turn_boundary.ACTION_DISPATCH_TASK}:{PLAN_TASK}", decision["reason"])
+        records = self.records()
+        self.assertEqual(
+            [record["event"] for record in records],
+            [run_logging.EVENT_QUIESCENCE_VIOLATION],
+        )
+        self.assertEqual(records[0]["source"], turn_boundary.STOP_HOOK_SOURCE)
+
+    def test_a_quiescent_turn_is_allowed_and_the_block_budget_is_reset(self) -> None:
+        """An active dispatch is a legitimate turn end, and the hook stands aside."""
+        orca = FakeOrca()
+        orca.task(ANALYSIS_TASK, "completed")
+        orca.dispatch("ctx_live", PLAN_TASK)
+        turn_boundary.set_stop_hook_block_count(
+            self.RUN, "session_os44", 2, artifact_base=self.artifact_dir
+        )
+
+        code, decision = self.hook(self.payload(stop_hook_active=True), orca=orca)
+
+        self.assertEqual(code, turn_boundary.EXIT_STOP_HOOK)
+        self.assertNotIn("decision", decision)
+        self.assertEqual(
+            turn_boundary.stop_hook_block_count(
+                self.RUN, "session_os44", artifact_base=self.artifact_dir
+            ),
+            0,
+        )
+        self.assertEqual(
+            [record["event"] for record in self.records()],
+            [run_logging.EVENT_QUIESCENCE_VERIFIED],
+        )
+
+    def test_unreadable_authority_blocks_rather_than_allowing_the_turn(self) -> None:
+        """Exit 3 on the CLI is a block here. An unreadable authority is not an absent one."""
+        orca = self.stalled()
+        orca.failing.add("task-list")
+
+        code, decision = self.hook(self.payload(), orca=orca)
+
+        self.assertEqual(code, turn_boundary.EXIT_STOP_HOOK)
+        self.assertEqual(decision["decision"], "block")
+        self.assertIn("TURN_BOUNDARY_UNAVAILABLE", decision["reason"])
+
+    def test_the_block_budget_releases_the_turn_and_records_what_it_let_through(self) -> None:
+        """A hook that blocks forever wedges the session, so this one stops -- loudly.
+
+        The runtime has its own cap (8 consecutive blocks by default) and would override
+        the hook regardless; releasing first keeps the escape hatch ours and testable,
+        and the release itself is published so a stalled turn that got through is a fact
+        in the audit rather than something only the terminal saw.
+        """
+        orca = self.stalled()
+        turn_boundary.set_stop_hook_block_count(
+            self.RUN, "session_os44", 2, artifact_base=self.artifact_dir
+        )
+
+        code, decision = self.hook(
+            self.payload(stop_hook_active=True), "--block-cap", "2", orca=orca
+        )
+
+        self.assertEqual(code, turn_boundary.EXIT_STOP_HOOK)
+        self.assertNotIn("decision", decision)
+        self.assertIn("releasing this one rather than wedging", decision["systemMessage"])
+        sources = [record["source"] for record in self.records()]
+        self.assertEqual(
+            sources, [turn_boundary.STOP_HOOK_SOURCE, turn_boundary.STOP_HOOK_SOURCE_RELEASED]
+        )
+        self.assertEqual(
+            turn_boundary.stop_hook_block_count(
+                self.RUN, "session_os44", artifact_base=self.artifact_dir
+            ),
+            0,
+        )
+
+    def test_consecutive_blocks_are_counted_only_within_one_stop_chain(self) -> None:
+        """``stop_hook_active`` false means the model is not here because we blocked it.
+
+        The budget is per stop chain, so a later turn that stalls again is blocked again
+        rather than inheriting a spent budget from an earlier one.
+        """
+        orca = self.stalled()
+        turn_boundary.set_stop_hook_block_count(
+            self.RUN, "session_os44", 9, artifact_base=self.artifact_dir
+        )
+
+        _, decision = self.hook(
+            self.payload(stop_hook_active=False), "--block-cap", "2", orca=orca
+        )
+
+        self.assertEqual(decision["decision"], "block")
+        self.assertEqual(
+            turn_boundary.stop_hook_block_count(
+                self.RUN, "session_os44", artifact_base=self.artifact_dir
+            ),
+            1,
+        )
+
+    def test_an_unbound_session_in_a_project_with_runs_is_blocked_until_it_binds(
+        self,
+    ) -> None:
+        """FINAL attempt-2 R1. An unattributable session in a project that HAS runs is
+        refused, not announced.
+
+        The previous round allowed this turn and printed a notice. That reproduced the
+        OS-44 defect one level up: the model still had to REMEMBER an invocation
+        (``turn-end-bind``) before ending its turn, and forgetting it was still allowed.
+        An allow does not re-invoke the model, so the notice reaches nobody who could
+        act on it. A block does, and it carries the command to run.
+
+        The refusal is still cheap: nothing about the run is observed (no ``orca`` call,
+        no audit record), because there is no run to observe -- only the turn is held.
+        """
+        orca = self.stalled()
+        (self.artifact_dir / "artifacts" / "runs" / self.RUN).mkdir(parents=True, exist_ok=True)
+
+        code, decision = self.hook(self.payload(), orca=orca, bind=False)
+
+        self.assertEqual(code, turn_boundary.EXIT_STOP_HOOK)
+        self.assertEqual(decision["decision"], "block")
+        self.assertIn("turn-end-bind", decision["reason"])
+        self.assertIn("bound to no Orca Run", decision["reason"])
+        self.assertEqual(orca.commands, [])
+        self.assertEqual(self.records(), [])
+        self.assertEqual(
+            turn_boundary.stop_hook_block_count(
+                "", "session_os44", artifact_base=self.artifact_dir
+            ),
+            1,
+        )
+
+    def test_the_unbound_block_releases_itself_at_the_cap(self) -> None:
+        """And it is finite, which is what makes blocking an unattributable session safe.
+
+        A session that genuinely drives no Run pays a bounded number of extra turn ends
+        and is then let through, saying so. Being wrong here costs turns, never a wedged
+        session -- that bound is load-bearing for the whole fail-closed choice above.
+        """
+        (self.artifact_dir / "artifacts" / "runs" / self.RUN).mkdir(parents=True, exist_ok=True)
+        turn_boundary.set_stop_hook_block_count(
+            "", "session_os44", 2, artifact_base=self.artifact_dir
+        )
+
+        _, decision = self.hook(
+            self.payload(stop_hook_active=True),
+            "--block-cap",
+            "2",
+            orca=self.stalled(),
+            bind=False,
+        )
+
+        self.assertNotIn("decision", decision)
+        self.assertIn("releasing this one rather than wedging", decision["systemMessage"])
+        self.assertEqual(
+            turn_boundary.stop_hook_block_count(
+                "", "session_os44", artifact_base=self.artifact_dir
+            ),
+            0,
+        )
+
+    def test_an_unbound_session_in_a_project_with_no_runs_is_passed_over_silently(
+        self,
+    ) -> None:
+        """The other half of that judgement: no runs here, nothing to say.
+
+        A hook that chatters at every unrelated session in the project gets uninstalled,
+        and an uninstalled hook enforces nothing.
+        """
+        empty = self.artifact_dir / "no_runs_here"
+        empty.mkdir(parents=True, exist_ok=True)
+
+        self.printed = io.StringIO()
+        with patch.object(turn_boundary, "_default_runner", self.stalled()):
+            with patch.dict(environ, {turn_boundary.STOP_HOOK_RUN_ENV: ""}):
+                with patch.object(sys, "stdin", io.StringIO(json.dumps(self.payload()))):
+                    with redirect_stdout(self.printed):
+                        launcher.run_cli(
+                            ["turn-end-hook", "--artifact-base", str(empty)]
+                        )
+
+        self.assertEqual(json.loads(self.printed.getvalue()), {"suppressOutput": True})
+
+    def test_run_state_discovery_is_tri_state_not_a_boolean(self) -> None:
+        """FINAL attempt-3 R1. ``proven_absent`` and ``unreadable`` are different facts.
+
+        The shipped predicate caught every ``OSError`` from iterating ``artifacts/runs``
+        and answered ``False``, which made "I could not look" indistinguishable from
+        "there is positively nothing here" -- and only the second licenses this
+        boundary's single silent allow. Every layout is asserted, including the two that
+        need no permission bits at all, so the classification is pinned on every platform
+        this suite runs on.
+        """
+        cases = {
+            "runs present": (
+                lambda base: (base / "artifacts" / "runs" / "run_x").mkdir(parents=True),
+                turn_boundary.RUN_STATE_PRESENT,
+            ),
+            "runs root readable and empty": (
+                lambda base: (base / "artifacts" / "runs").mkdir(parents=True),
+                turn_boundary.RUN_STATE_PROVEN_ABSENT,
+            ),
+            "no runs root at all": (
+                lambda base: (base / "artifacts").mkdir(parents=True),
+                turn_boundary.RUN_STATE_PROVEN_ABSENT,
+            ),
+            "no artifacts directory at all": (
+                lambda base: None,
+                turn_boundary.RUN_STATE_PROVEN_ABSENT,
+            ),
+            "a file where the runs root belongs": (
+                lambda base: (
+                    (base / "artifacts").mkdir(parents=True),
+                    (base / "artifacts" / "runs").write_text("x", encoding="utf-8"),
+                ),
+                turn_boundary.RUN_STATE_UNREADABLE,
+            ),
+        }
+        for name, (build, expected) in cases.items():
+            with self.subTest(layout=name):
+                base = Path(tempfile.mkdtemp(dir=str(self.artifact_dir)))
+                build(base)
+                self.assertEqual(turn_boundary.project_run_state(base), expected)
+
+    def test_an_unreadable_runs_root_is_not_proven_absence(self) -> None:
+        """The reviewer's exact probe, on a REAL unreadable directory.
+
+        ``artifacts/runs/run_x`` exists and the runs root is at mode 000. Before this
+        fix, ``project_has_runs()`` answered ``False`` and the hook answered
+        ``{"suppressOutput": true}`` -- byte-identical to a project that genuinely holds
+        no runs, which is the silent turn gap OS-44 exists to close. It must classify as
+        ``unreadable`` and it must block.
+        """
+        base = Path(tempfile.mkdtemp(dir=str(self.artifact_dir)))
+        runs = base / "artifacts" / "runs"
+        (runs / "run_x").mkdir(parents=True)
+        self.assertEqual(turn_boundary.project_run_state(base), turn_boundary.RUN_STATE_PRESENT)
+        deny_directory_read(self, runs)
+
+        self.assertEqual(
+            turn_boundary.project_run_state(base), turn_boundary.RUN_STATE_UNREADABLE
+        )
+        decision = turn_boundary.unbound_session_decision(
+            self.payload(), artifact_base=base
+        )
+
+        self.assertEqual(decision.get("decision"), "block")
+        self.assertIn("could not be read", decision["reason"])
+        self.assertNotIn("suppressOutput", decision)
+
+    def test_an_unreadable_authority_on_the_way_to_the_runs_root_also_blocks(self) -> None:
+        """And it is the AUTHORITY that has to be readable, not just its last segment.
+
+        ``artifacts`` at mode 000 hides the runs root behind it. ``FileNotFoundError``
+        would be proof of absence; ``PermissionError`` is proof of nothing, and the two
+        arrive at the same call.
+        """
+        base = Path(tempfile.mkdtemp(dir=str(self.artifact_dir)))
+        (base / "artifacts" / "runs" / "run_x").mkdir(parents=True)
+        deny_directory_read(self, base / "artifacts")
+
+        self.assertEqual(
+            turn_boundary.project_run_state(base), turn_boundary.RUN_STATE_UNREADABLE
+        )
+        self.assertEqual(
+            turn_boundary.unbound_session_decision(
+                self.payload(), artifact_base=base
+            ).get("decision"),
+            "block",
+        )
+
+    def test_the_unreadable_refusal_is_finite_like_every_other_one(self) -> None:
+        """R1(b): the same cap, not a new unbounded path.
+
+        The counter cannot live under the runs root here -- that root is the very thing
+        that cannot be read -- so it falls outward to a directory that will take it. A
+        refusal whose budget is never recorded never advances and therefore never
+        releases, which is the one thing this boundary must not do to a live session.
+        """
+        base = Path(tempfile.mkdtemp(dir=str(self.artifact_dir)))
+        runs = base / "artifacts" / "runs"
+        (runs / "run_x").mkdir(parents=True)
+        deny_directory_read(self, runs)
+
+        chain = [
+            turn_boundary.unbound_session_decision(
+                self.payload(stop_hook_active=True), artifact_base=base, cap=3
+            ).get("decision", "release")
+            for _ in range(4)
+        ]
+
+        self.assertEqual(chain, ["block", "block", "block", "release"])
+        self.assertTrue(
+            (base / "artifacts" / turn_boundary.STOP_HOOK_UNBOUND_STATE_FILENAME).exists(),
+            "the refusal must record its budget somewhere it can actually write",
+        )
+
+    # -- FINAL adversarial review R1: an unpersistable budget releases -----------------
+    #
+    # The two directions of this boundary's fail-safe are deliberately opposite, and the
+    # tests below pin BOTH so a later reader cannot collapse one into the other:
+    #
+    #   unreadable Run authority   -> BLOCK, bounded   (the tests above this line)
+    #   unpersistable block budget -> RELEASE, with a reason (the tests below)
+    #
+    # The first asks what the boundary KNOWS about the run; the second asks whether the
+    # boundary can still keep its own promise to let go. A cap that cannot be written
+    # down guarantees nothing -- the next invocation reads zero and refuses again -- so a
+    # refusal that cannot be counted is never issued.
+
+    def test_a_counter_that_cannot_be_persisted_reports_the_failure(self) -> None:
+        """The signal the decision path needs, which the pre-fix version did not give.
+
+        ``set_stop_hook_block_count`` used to return ``None`` whether the write landed or
+        raised, so ``blocked_so_far`` could sit at zero forever while the hook refused
+        every turn. It now reads the counter back and reports whether the record took.
+        """
+        base = Path(tempfile.mkdtemp(dir=str(self.artifact_dir)))
+        (base / "artifacts" / "runs" / "run_x").mkdir(parents=True)
+        counter = base / "artifacts" / "runs" / turn_boundary.STOP_HOOK_UNBOUND_STATE_FILENAME
+
+        self.assertIs(
+            turn_boundary.set_stop_hook_block_count("", "s", 1, artifact_base=base), True
+        )
+        self.assertEqual(
+            turn_boundary.stop_hook_block_count("", "s", artifact_base=base), 1
+        )
+        deny_write(self, counter)
+        self.assertIs(
+            turn_boundary.set_stop_hook_block_count("", "s", 2, artifact_base=base), False
+        )
+        self.assertEqual(
+            turn_boundary.stop_hook_block_count("", "s", artifact_base=base),
+            1,
+            "the failed write must not be reported as having advanced the budget",
+        )
+
+    def test_an_unwritable_counter_releases_instead_of_blocking_forever(self) -> None:
+        """The reviewer's probe, reproduced: six consecutive active Stop invocations.
+
+        With the counter file at the chosen location unwritable, the pre-fix path
+        produced ``['block'] * 6`` against a cap of 3 -- an unbounded refusal from the
+        very mechanism that promises a bound, which wedges the session outright. Every
+        one of the six must now be a release, and each must SAY why.
+        """
+        base = Path(tempfile.mkdtemp(dir=str(self.artifact_dir)))
+        (base / "artifacts" / "runs" / "run_x").mkdir(parents=True)
+        counter = base / "artifacts" / "runs" / turn_boundary.STOP_HOOK_UNBOUND_STATE_FILENAME
+        counter.write_text("{}", encoding="utf-8")
+        deny_write(self, counter)
+
+        decisions = [
+            turn_boundary.unbound_session_decision(
+                self.payload(stop_hook_active=True), artifact_base=base, cap=3
+            )
+            for _ in range(6)
+        ]
+
+        self.assertEqual(
+            [decision.get("decision", "release") for decision in decisions],
+            ["release"] * 6,
+        )
+        for decision in decisions:
+            self.assertNotIn("decision", decision)
+            self.assertIn("was NOT gated", decision["systemMessage"])
+            self.assertIn("could not record", decision["systemMessage"])
+            self.assertIn(str(counter), decision["systemMessage"])
+
+    def test_the_release_still_happens_when_no_location_will_take_the_counter(
+        self,
+    ) -> None:
+        """Every candidate refuses, temp directory included -- the reviewer's other case.
+
+        The runs root, ``artifacts`` and the project root are all read-only, so
+        ``_unbound_state_dir`` falls all the way out to the temp directory, and the
+        counter there cannot be written either. There is nowhere left to count, so there
+        is no bounded refusal to issue.
+        """
+        base = Path(tempfile.mkdtemp(dir=str(self.artifact_dir)))
+        (base / "artifacts" / "runs" / "run_x").mkdir(parents=True)
+        fake_tmp = Path(tempfile.mkdtemp(dir=str(self.artifact_dir)))
+        fallback = fake_tmp / turn_boundary.STOP_HOOK_UNBOUND_STATE_FILENAME
+        fallback.write_text("{}", encoding="utf-8")
+        deny_write(self, fallback)
+        for directory in (base / "artifacts" / "runs", base / "artifacts", base):
+            deny_write(self, directory)
+        with patch.dict(environ, {"TMPDIR": str(fake_tmp)}):
+            with patch.object(tempfile, "tempdir", None):
+                self.assertEqual(turn_boundary._stop_hook_state_path("", base), fallback)
+                chain = [
+                    turn_boundary.unbound_session_decision(
+                        self.payload(stop_hook_active=True), artifact_base=base, cap=3
+                    ).get("decision", "release")
+                    for _ in range(6)
+                ]
+
+        self.assertEqual(chain, ["release"] * 6)
+
+    def test_a_run_bound_refusal_also_releases_when_its_budget_cannot_be_persisted(
+        self,
+    ) -> None:
+        """And the same, through the real hook CLI on a run it DID resolve.
+
+        The bound path is where the boundary does its actual work, and its counter lives
+        in the run's own directory -- which can be unwritable for exactly the reasons the
+        review named. A refusal there would be just as unbounded, so it is withheld the
+        same way, and the release is published to the audit like any other release the
+        cap grants.
+        """
+        counter = (
+            self.artifact_dir / "artifacts" / "runs" / self.RUN
+            / turn_boundary.STOP_HOOK_STATE_FILENAME
+        )
+        counter.parent.mkdir(parents=True, exist_ok=True)
+        counter.write_text("{}", encoding="utf-8")
+        deny_write(self, counter)
+
+        chain = []
+        for _ in range(6):
+            code, decision = self.hook(
+                self.payload(stop_hook_active=True), "--block-cap", "3", orca=self.stalled()
+            )
+            self.assertEqual(code, turn_boundary.EXIT_STOP_HOOK)
+            chain.append(decision.get("decision", "release"))
+
+        self.assertEqual(chain, ["release"] * 6)
+        self.assertIn(
+            turn_boundary.STOP_HOOK_SOURCE_RELEASED,
+            [record["source"] for record in self.records()],
+            "a release the boundary grants itself has to be observable in the audit",
+        )
+
+    def test_a_writable_counter_still_gives_the_bounded_refusal(self) -> None:
+        """The control, so the fix above cannot be a blanket weakening of the cap.
+
+        Same six invocations, same cap, nothing denied: block, block, block, release --
+        and then the budget starts over, which is what the counter is for. An unreadable
+        runs root is covered by ``..._unreadable_refusal_is_finite...`` above and must
+        keep blocking; only an unpersistable BUDGET releases early.
+        """
+        base = Path(tempfile.mkdtemp(dir=str(self.artifact_dir)))
+        (base / "artifacts" / "runs" / "run_x").mkdir(parents=True)
+
+        chain = [
+            turn_boundary.unbound_session_decision(
+                self.payload(stop_hook_active=True), artifact_base=base, cap=3
+            ).get("decision", "release")
+            for _ in range(6)
+        ]
+
+        self.assertEqual(
+            chain, ["block", "block", "block", "release", "block", "block"]
+        )
+
+    def test_the_session_binding_is_what_the_hook_resolves_the_run_from(self) -> None:
+        """The producer the previous round did not have, in process.
+
+        ``turn-end-bind`` writes the record; the hook finds it from the payload's
+        ``session_id`` alone, with no ``--run-id`` and no environment variable. The
+        subprocess contract tests below prove the same thing through the real registered
+        command; this one pins the resolution rules -- newest binding wins, a released
+        binding does not.
+        """
+        turn_boundary.bind_session_run(
+            self.RUN, session_id="session_os44", artifact_base=self.artifact_dir
+        )
+
+        code, decision = self.hook(self.payload(), orca=self.stalled(), bind=False)
+
+        self.assertEqual(code, turn_boundary.EXIT_STOP_HOOK)
+        self.assertEqual(decision["decision"], "block")
+
+        released_orca = self.stalled()
+        turn_boundary.release_session_run(
+            self.RUN, session_id="session_os44", artifact_base=self.artifact_dir
+        )
+        _, released = self.hook(self.payload(), orca=released_orca, bind=False)
+
+        # The release did what it is for: the run is no longer resolved, so the run is
+        # no longer observed and the refusal above is gone. What is left is the generic
+        # unattributable-session hold, because this project still holds run state -- and
+        # that hold is bounded by the cap rather than being an enforcement claim.
+        self.assertEqual(released_orca.commands, [])
+        self.assertNotIn(quiescence.QUIESCENCE_NEXT_NODE_UNCONSUMED, str(released))
+        self.assertIn("bound to no Orca Run", released["reason"])
+
+    def test_a_non_stop_event_is_ignored(self) -> None:
+        """A ``SubagentStop`` payload is a Worker finishing, not the Coordinator's turn."""
+        orca = self.stalled()
+
+        _, decision = self.hook(
+            self.payload(hook_event_name="SubagentStop"), orca=orca
+        )
+
+        self.assertNotIn("decision", decision)
+        self.assertEqual(orca.commands, [])
+
+    def test_the_hook_blocks_when_the_gate_itself_fails(self) -> None:
+        """FINAL attempt-2 R1. A defect in the boundary is a refusal, not an allow.
+
+        Fail-closed covers the boundary crashing too, once a run has been resolved: a
+        gate that could not run has observed nothing, and "we could not check" is not
+        evidence that there is nothing to check. It used to allow the turn and say so,
+        which is the same announce-and-allow shape the review rejected.
+        """
+        with patch.object(turn_boundary, "enforce", side_effect=MemoryError("boom")):
+            code, decision = self.hook(self.payload(), orca=self.stalled())
+
+        self.assertEqual(code, turn_boundary.EXIT_STOP_HOOK)
+        self.assertEqual(decision["decision"], "block")
+        self.assertIn(turn_boundary.STOP_HOOK_FAILURE_REASON_CODE, decision["reason"])
+        self.assertIn("boom", decision["reason"])
+        self.assertEqual(
+            turn_boundary.stop_hook_block_count(
+                self.RUN, "session_os44", artifact_base=self.artifact_dir
+            ),
+            1,
+        )
+
+    def test_the_hook_failure_block_releases_at_the_cap_and_records_it(self) -> None:
+        """And that refusal is bounded too, so a persistent internal defect cannot wedge
+        a live session -- with the release published to the run's audit under the same
+        ``cap_released`` source as any other, so a turn that got through on our own bug
+        is a fact in the artifacts rather than something only the terminal saw."""
+        turn_boundary.set_stop_hook_block_count(
+            self.RUN, "session_os44", 2, artifact_base=self.artifact_dir
+        )
+
+        with patch.object(turn_boundary, "enforce", side_effect=MemoryError("boom")):
+            _, decision = self.hook(
+                self.payload(stop_hook_active=True),
+                "--block-cap",
+                "2",
+                orca=self.stalled(),
+            )
+
+        self.assertNotIn("decision", decision)
+        self.assertIn("turn-end boundary hook failed", decision["systemMessage"])
+        self.assertIn("releasing this one", decision["systemMessage"])
+        records = self.records()
+        self.assertEqual(
+            [record["source"] for record in records],
+            [turn_boundary.STOP_HOOK_SOURCE_RELEASED],
+        )
+        self.assertEqual(
+            records[0]["reason_code"], turn_boundary.STOP_HOOK_FAILURE_REASON_CODE
+        )
+
+    def test_no_settings_file_is_written_and_the_live_global_one_is_untouched(self) -> None:
+        """The hard safety constraint, asserted rather than promised.
+
+        Registration is the operator's act. Running the hook writes the run's audit and
+        its own counter and nothing else -- in particular not the live global settings
+        file, which belongs to sessions that are running right now.
+        """
+        live = Path.home() / ".claude" / "settings.json"
+        before = live.read_bytes() if live.is_file() else None
+
+        self.hook(self.payload(), orca=self.stalled())
+
+        self.assertEqual(live.read_bytes() if live.is_file() else None, before)
+        self.assertEqual(
+            sorted(path.name for path in self.artifact_dir.rglob("settings*.json")), []
+        )
+
+    def test_registration_composes_with_the_existing_orca_stop_hook(self) -> None:
+        """Composing, not replacing -- over a fixture shaped like the live settings file.
+
+        The live global settings already carry Orca's own Stop hook. A registration that
+        replaced the ``Stop`` array would silently disable it, so the documented
+        transformation adds an entry, leaves every other event alone, and is idempotent.
+        Applied here to a temporary file; nothing in this repository applies it to a real
+        settings location.
+        """
+        settings_path = self.artifact_dir / "isolated" / "settings.json"
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        settings_path.write_text(
+            json.dumps(
+                {
+                    "hooks": {
+                        "SessionStart": [{"hooks": [{"type": "command", "command": "orca"}]}],
+                        "Stop": [
+                            {
+                                "hooks": [
+                                    {
+                                        "type": "command",
+                                        "command": "$HOME/.orca/agent-hooks/claude-hook.sh",
+                                        "timeout": 10,
+                                    }
+                                ]
+                            }
+                        ],
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        command = "python3 tools/run_workflow.py turn-end-hook"
+
+        merged = turn_boundary.merge_stop_hook_registration(
+            json.loads(settings_path.read_text(encoding="utf-8")), command
+        )
+        settings_path.write_text(json.dumps(merged), encoding="utf-8")
+
+        stop = merged["hooks"]["Stop"]
+        self.assertEqual(len(stop), 2)
+        self.assertEqual(
+            stop[0]["hooks"][0]["command"], "$HOME/.orca/agent-hooks/claude-hook.sh"
+        )
+        self.assertEqual(stop[1]["hooks"][0]["command"], command)
+        self.assertEqual(len(merged["hooks"]["SessionStart"]), 1)
+        self.assertEqual(
+            turn_boundary.merge_stop_hook_registration(merged, command), merged
+        )
+
+    def test_the_documented_registration_snippet_registers_this_command(self) -> None:
+        """The Skill's JSON block is the operator's copy-paste path; it has to be real.
+
+        BUGFIX-I4-R1-REAL-PATH. Asserting a substring is what let a command that could
+        not execute anything pass review, so the snippet is compared to the command the
+        code itself publishes, and :class:`DocumentedStopHookRegistrationTests` below
+        RUNS that command.
+        """
+        hooks = documented_registration()
+
+        self.assertEqual(hooks["type"], "command")
+        self.assertEqual(hooks["command"], turn_boundary.STOP_HOOK_COMMAND)
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SKILL_ROOT = REPO_ROOT / "orca-worker-reviewer-orchestration"
+STOP_HOOK_SECTION_MARKER = "### Stop hook으로의 자동 강제"
+
+
+def documented_registration() -> dict[str, Any]:
+    """The single ``Stop`` hook entry the Skill tells an operator to paste.
+
+    Read out of SKILL.md rather than restated here: these tests exist to prove that the
+    DOCUMENTED command works, so a test that ran its own spelling of it would prove
+    nothing about the thing an operator actually copies.
+    """
+    skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+    section = skill[skill.index(STOP_HOOK_SECTION_MARKER):]
+    block = section[section.index("```json") + len("```json"):]
+    snippet = json.loads(block[: block.index("```")])
+    return snippet["hooks"]["Stop"][0]["hooks"][0]
+
+
+class DocumentedStopHookRegistrationTests(unittest.TestCase):
+    """BUGFIX-I4-R1-REAL-PATH. The registration, EXECUTED, from a real project cwd.
+
+    The defect this class exists to prevent shipped past a passing suite because every
+    test entered through ``launcher.run_cli()`` with an explicit ``--run-id`` and the
+    only test of the registration itself asserted that a documentation string contained
+    a substring. Neither could notice that the command named an entry point no layout
+    resolves, or that its ``ORCA_QUIESCENCE_RUN_ID=$ORCA_QUIESCENCE_RUN_ID`` prefix was
+    a self-assignment of a variable nothing in the world produces.
+
+    So every test here runs the command string TAKEN FROM SKILL.md in a subprocess, with
+    ``shell=True`` because that is how Claude Code runs a hook command, from a temporary
+    project directory, with only the environment a hook really gets. The run binding is
+    established the way a Coordinator establishes it -- by running ``turn-end-bind`` in
+    a separate subprocess carrying ``CLAUDE_CODE_SESSION_ID`` -- so a hook that could no
+    longer resolve the entry point, or no longer find the binding, fails these tests
+    instead of quietly allowing every turn.
+
+    Nothing here reads or writes any real settings location. The registration fixture is
+    a temporary directory, and the live global settings file is asserted byte-identical
+    before and after.
+    """
+
+    RUN = "run_c2166e75bb02"
+    SESSION = "8f0f0f0f-9d64-493d-8112-bbbac21a5da4"
+    ANALYSIS_TASK = "task_analysis"
+    PLAN_TASK = "task_plan"
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.project = root / "project"
+        self.home = root / "home"
+        (self.home / ".claude").mkdir(parents=True)
+        self.project.mkdir(parents=True)
+        self.command = documented_registration()["command"]
+        self.orca = self._fake_orca(running=False)
+
+    # -- fixtures ---------------------------------------------------------------------
+
+    def _fake_orca(self, *, running: bool) -> Path:
+        """A stand-in ``orca`` binary on disk, because the hook shells out to one.
+
+        ``running=False`` is ``run_c2166e75bb02``'s recorded shape: ANALYSIS completed,
+        PLAN never dispatched, nothing executing -- the turn that must be refused.
+        """
+        tasks: list[dict[str, Any]] = [
+            {"id": self.ANALYSIS_TASK, "status": "completed", "deps": "[]"},
+            {
+                "id": self.PLAN_TASK,
+                "status": "dispatched" if running else "pending",
+                "deps": json.dumps([self.ANALYSIS_TASK]),
+                "dispatch_id": "ctx_live",
+            },
+        ]
+        workers: list[dict[str, Any]] = (
+            [
+                {
+                    "dispatchId": "ctx_live",
+                    "taskId": self.PLAN_TASK,
+                    "dispatchStatus": "dispatched",
+                    "workerState": "ready",
+                }
+            ]
+            if running
+            else []
+        )
+        path = self.project / ("orca_running" if running else "orca_stalled")
+        path.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            f"TASKS = {tasks!r}\n"
+            f"WORKERS = {workers!r}\n"
+            "verb = sys.argv[2] if len(sys.argv) > 2 else ''\n"
+            "result = {'task-list': {'tasks': TASKS}, 'worker-list': {'workers': WORKERS},\n"
+            "          'gate-list': {'gates': []}}.get(verb, {})\n"
+            "print(json.dumps({'ok': True, 'result': result}))\n",
+            encoding="utf-8",
+        )
+        path.chmod(0o755)
+        return path
+
+    def install_repository_checkout(self) -> Path:
+        """Layout 2: this repository checked out as the Claude project."""
+        link = self.project / SKILL_ROOT.name
+        link.symlink_to(SKILL_ROOT, target_is_directory=True)
+        return link
+
+    def install_user_skill(self) -> Path:
+        """Layout 4: the Skill where ``orca skills get`` puts it, project unaware."""
+        skills = self.home / ".claude" / "skills"
+        skills.mkdir(parents=True, exist_ok=True)
+        link = skills / SKILL_ROOT.name
+        link.symlink_to(SKILL_ROOT, target_is_directory=True)
+        return link
+
+    def hook_env(self, *, orca: Path | None = None, home: Path | None = None) -> dict[str, str]:
+        """Exactly what a Claude Code hook gets: PATH, HOME, CLAUDE_PROJECT_DIR.
+
+        Deliberately NOT the parent process's environment. ``ORCA_QUIESCENCE_RUN_ID`` is
+        absent from every one of these tests, which is the point: the previous
+        registration only ever looked there.
+        """
+        return {
+            "PATH": os.environ.get("PATH", ""),
+            "HOME": str(home if home is not None else self.home),
+            "CLAUDE_PROJECT_DIR": str(self.project),
+            "ORCA_CLI_COMMAND": str(orca if orca is not None else self.orca),
+        }
+
+    def bind(self, entry_root: Path, *, session: str = "") -> subprocess.CompletedProcess:
+        """Bind this session to the run the way a Coordinator does: its own command."""
+        return subprocess.run(  # noqa: S603 - fixed argv, no shell
+            [
+                sys.executable,
+                str(entry_root / "tools" / "run_workflow.py"),
+                "turn-end-bind",
+                "--run-id",
+                self.RUN,
+                "--artifact-base",
+                str(self.project),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            cwd=str(self.project),
+            env={
+                **self.hook_env(),
+                turn_boundary.SESSION_ID_ENV: session or self.SESSION,
+            },
+        )
+
+    def fire(self, *, env: dict[str, str] | None = None, **payload: Any) -> dict[str, Any]:
+        """Run the documented command as the runtime runs it, and parse its decision."""
+        document = {
+            "session_id": self.SESSION,
+            "transcript_path": str(self.project / "transcript.jsonl"),
+            "cwd": str(self.project),
+            "hook_event_name": "Stop",
+            "stop_hook_active": False,
+        }
+        document.update(payload)
+        completed = subprocess.run(  # noqa: S602 - a hook command IS a shell command
+            self.command,
+            shell=True,
+            input=json.dumps(document),
+            capture_output=True,
+            text=True,
+            check=False,
+            cwd=str(self.project),
+            env=env if env is not None else self.hook_env(),
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            f"a Stop hook must always exit 0; stderr={completed.stderr}",
+        )
+        self.assertTrue(
+            completed.stdout.strip(),
+            f"the hook command produced no decision at all; stderr={completed.stderr}",
+        )
+        return json.loads(completed.stdout)
+
+    # -- the contract -----------------------------------------------------------------
+
+    def test_the_documented_command_is_the_command_the_code_publishes(self) -> None:
+        """One spelling of the registration, shared by the Skill, the validator and these
+        tests, so none of the three can drift into describing a command nobody runs."""
+        self.assertEqual(self.command, turn_boundary.STOP_HOOK_COMMAND)
+        self.assertNotIn("ORCA_QUIESCENCE_RUN_ID=", self.command)
+
+    def test_a_refused_run_blocks_from_a_repository_checkout(self) -> None:
+        """The exact case the review probed and found broken, end to end.
+
+        No ``--run-id``, no ``ORCA_QUIESCENCE_RUN_ID``: the entry point is resolved from
+        ``CLAUDE_PROJECT_DIR`` and the Run comes from the binding ``turn-end-bind``
+        published for this session id. Both halves have to work or there is no block.
+        """
+        entry = self.install_repository_checkout()
+        bound = self.bind(entry)
+        self.assertEqual(bound.returncode, 0, bound.stderr)
+
+        decision = self.fire()
+
+        self.assertEqual(decision["decision"], "block")
+        self.assertIn(quiescence.QUIESCENCE_NEXT_NODE_UNCONSUMED, decision["reason"])
+        self.assertIn(self.PLAN_TASK, decision["reason"])
+        # The advice in a block has to be pastable too: the reason used to tell the
+        # model to re-derive with `python3 tools/run_workflow.py turn-end`, the same
+        # relative path that opens from no working directory.
+        self.assertNotIn("python3 tools/run_workflow.py", decision["reason"])
+        self.assertIn(str(entry / "tools" / "run_workflow.py"), decision["reason"])
+
+    def test_a_refused_run_blocks_from_an_installed_skill_with_no_repository(self) -> None:
+        """Layout 4: the project is not this repository at all.
+
+        An installed Skill does not make its own ``tools/`` the hook's working directory,
+        which is why a relative entry point could never work here.
+        """
+        entry = self.install_user_skill()
+        self.assertFalse((self.project / SKILL_ROOT.name).exists())
+        bound = self.bind(entry)
+        self.assertEqual(bound.returncode, 0, bound.stderr)
+
+        decision = self.fire()
+
+        self.assertEqual(decision["decision"], "block")
+
+    def test_a_quiescent_run_is_allowed_through_the_documented_command(self) -> None:
+        """The same command, over a run with a live dispatch: no block, no noise."""
+        entry = self.install_repository_checkout()
+        self.assertEqual(self.bind(entry).returncode, 0)
+
+        decision = self.fire(env=self.hook_env(orca=self._fake_orca(running=True)))
+
+        self.assertNotIn("decision", decision)
+
+    def test_an_unresolvable_entry_point_blocks_when_the_project_holds_run_state(
+        self,
+    ) -> None:
+        """FINAL attempt-2 R1, through the real registered command.
+
+        No layout resolves, so this module never runs and the decision is made by the
+        registration's own shell tail. In a project that holds Orca run state that
+        decision is ``block``: a boundary that could not execute has not established
+        that anything is at rest, and announcing that while ending the turn tells the
+        only party who could repair it nothing it can act on.
+        """
+        empty_home = Path(self.tmp.name) / "empty_home"
+        empty_home.mkdir()
+        (self.project / "artifacts" / "runs" / self.RUN).mkdir(parents=True)
+
+        decision = self.fire(env=self.hook_env(home=empty_home))
+
+        self.assertEqual(decision["decision"], "block")
+        self.assertIn("run_workflow.py", decision["reason"])
+        self.assertIn("Repair the registration", decision["reason"])
+
+    def test_an_unresolvable_entry_point_releases_the_turn_at_its_cap(self) -> None:
+        """And that refusal is finite, counted by the registration itself.
+
+        A registration nobody repairs must not wedge the session, so the shell tail
+        keeps its own counter beside the runs it is refusing on behalf of.
+        """
+        empty_home = Path(self.tmp.name) / "empty_home"
+        empty_home.mkdir()
+        (self.project / "artifacts" / "runs" / self.RUN).mkdir(parents=True)
+        env = self.hook_env(home=empty_home)
+
+        blocked = [
+            self.fire(env=env).get("decision")
+            for _ in range(turn_boundary.STOP_HOOK_BLOCK_CAP_DEFAULT)
+        ]
+        released = self.fire(env=env)
+
+        self.assertEqual(blocked, ["block"] * turn_boundary.STOP_HOOK_BLOCK_CAP_DEFAULT)
+        self.assertNotIn("decision", released)
+        self.assertIn("releasing this one", released["systemMessage"])
+
+    def test_an_unresolvable_entry_point_is_silent_where_there_is_no_run_state(
+        self,
+    ) -> None:
+        """The one exemption, kept: a project with no ``artifacts/runs`` directories is
+        positively unrelated to this boundary, so its turns end silently. A hook that
+        gates every unrelated session in every project gets uninstalled, and an
+        uninstalled hook enforces nothing."""
+        empty_home = Path(self.tmp.name) / "empty_home"
+        empty_home.mkdir()
+
+        decision = self.fire(env=self.hook_env(home=empty_home))
+
+        self.assertNotIn("decision", decision)
+        self.assertIn("enforcing nothing", decision["systemMessage"])
+
+    def test_an_unreadable_runs_root_blocks_when_the_entry_point_resolves(self) -> None:
+        """FINAL attempt-3 R1, through the real command, on a REAL unreadable directory.
+
+        The entry point resolves, so this is the Python boundary answering: the runs root
+        holds ``run_x`` and is at mode 000. The shipped build read that as positive
+        evidence that the project holds no runs and returned ``{"suppressOutput": true}``
+        -- an automatic, silent turn end in a project that may well have a stalled Run in
+        it. It has to refuse instead, and say which authority it could not read.
+        """
+        self.install_repository_checkout()
+        runs = self.project / "artifacts" / "runs"
+        (runs / self.RUN).mkdir(parents=True)
+        deny_directory_read(self, runs)
+
+        decision = self.fire()
+
+        self.assertEqual(decision["decision"], "block")
+        self.assertIn("could not be read", decision["reason"])
+        self.assertNotIn("suppressOutput", decision)
+
+    def test_an_unreadable_runs_root_blocks_a_session_that_HAD_bound_its_run(
+        self,
+    ) -> None:
+        """The other half of the matrix: the binding itself lives under that root.
+
+        A Coordinator that bound its Run correctly is unattributable again the moment the
+        record cannot be read, and the answer must still be a refusal rather than the
+        silence an unreadable authority used to buy.
+        """
+        entry = self.install_repository_checkout()
+        self.assertEqual(self.bind(entry).returncode, 0)
+        self.assertEqual(self.fire()["decision"], "block")
+        deny_directory_read(self, self.project / "artifacts" / "runs")
+
+        decision = self.fire()
+
+        self.assertEqual(decision["decision"], "block")
+        self.assertIn("could not be read", decision["reason"])
+
+    def test_an_unreadable_runs_root_blocks_when_no_entry_point_resolves(self) -> None:
+        """And the registration's own shell tail reaches the same verdict without us.
+
+        The reviewer's second half of R1: the tail's directory glob cannot establish a
+        child directory under a runs root it may not read, so it left its flag at "no
+        runs" and took the allow branch -- the same conflation, one layer down, in the
+        one code path that runs when this module cannot. The flag now STARTS at
+        "unreadable" and only positive evidence moves it off.
+        """
+        empty_home = Path(self.tmp.name) / "empty_home"
+        empty_home.mkdir()
+        runs = self.project / "artifacts" / "runs"
+        (runs / self.RUN).mkdir(parents=True)
+        deny_directory_read(self, runs)
+
+        decision = self.fire(env=self.hook_env(home=empty_home))
+
+        self.assertEqual(decision["decision"], "block")
+        self.assertIn("could not be read", decision["reason"])
+        self.assertIn("run_workflow.py", decision["reason"])
+
+    def test_the_unreadable_shell_refusal_releases_at_its_cap(self) -> None:
+        """R1(b), in the shell: the same finite budget, counted somewhere writable.
+
+        The tail's counter normally lives at the ``artifacts/runs`` root, which is
+        exactly the directory this refusal is about. A counter that cannot be written
+        never advances and a refusal that never advances never releases, so the tail
+        falls outward to the first directory that will take the file. The chain has to
+        end in a release, and the file has to be somewhere other than the unreadable
+        root.
+        """
+        empty_home = Path(self.tmp.name) / "empty_home"
+        empty_home.mkdir()
+        runs = self.project / "artifacts" / "runs"
+        (runs / self.RUN).mkdir(parents=True)
+        deny_directory_read(self, runs)
+        env = self.hook_env(home=empty_home)
+
+        blocked = [
+            self.fire(env=env).get("decision")
+            for _ in range(turn_boundary.STOP_HOOK_BLOCK_CAP_DEFAULT)
+        ]
+        released = self.fire(env=env)
+
+        self.assertEqual(blocked, ["block"] * turn_boundary.STOP_HOOK_BLOCK_CAP_DEFAULT)
+        self.assertNotIn("decision", released)
+        self.assertIn("releasing this one", released["systemMessage"])
+        # Written outside the unreadable root, which is the whole reason the chain above
+        # could reach a release at all. (The release itself removes it, so this asserts
+        # on the block that preceded it.)
+        counted_in = sorted(
+            str(path.parent.relative_to(self.project))
+            for path in (self.project / "artifacts").rglob(
+                turn_boundary.STOP_HOOK_UNRESOLVED_STATE_FILENAME
+            )
+        )
+        self.assertNotIn(
+            "artifacts/runs",
+            counted_in,
+            "the shell tail must not try to count inside the root it cannot read",
+        )
+
+    def test_the_shell_tail_releases_when_it_cannot_persist_its_own_budget(self) -> None:
+        """FINAL adversarial review R1, in the shell, over six consecutive invocations.
+
+        The tail used to run ``printf %s "$N" >"$C" 2>/dev/null``, ignore the outcome and
+        emit ``decision: block`` regardless, so a counter it could not write left the next
+        process reading zero and refusing again -- six blocks against a cap of three, and
+        a session with no way out. Every candidate location is denied here (the runs root,
+        ``artifacts``, the project root, and the temp fallback's own counter file), so
+        every one of the six must be a release that says the budget could not be recorded.
+
+        The directory ``-w`` tests in the tail are TOCTOU preflights, not proof; what
+        makes this pass is that the tail now checks ``printf``'s status and reads the
+        value back before it will emit a refusal.
+        """
+        empty_home = Path(self.tmp.name) / "empty_home_uncountable"
+        empty_home.mkdir()
+        fake_tmp = Path(self.tmp.name) / "faketmp"
+        fake_tmp.mkdir()
+        fallback = fake_tmp / turn_boundary.STOP_HOOK_UNRESOLVED_STATE_FILENAME
+        fallback.write_text("0", encoding="utf-8")
+        deny_write(self, fallback)
+        runs = self.project / "artifacts" / "runs"
+        (runs / self.RUN).mkdir(parents=True)
+        for directory in (runs, self.project / "artifacts", self.project):
+            deny_write(self, directory)
+        env = {**self.hook_env(home=empty_home), "TMPDIR": str(fake_tmp)}
+
+        decisions = [self.fire(env=env) for _ in range(6)]
+
+        self.assertEqual([decision.get("decision", "release") for decision in decisions], ["release"] * 6)
+        for decision in decisions:
+            self.assertNotIn("decision", decision)
+            self.assertIn("was NOT gated", decision["systemMessage"])
+            self.assertIn("could not record the refusal budget", decision["systemMessage"])
+        self.assertEqual(
+            fallback.read_text(encoding="utf-8"),
+            "0",
+            "nothing was persisted, which is precisely why no refusal was issued",
+        )
+
+    def test_the_shell_tail_still_blocks_where_it_can_persist_the_budget(self) -> None:
+        """The control for the test above: the cap is not weakened, only made honest.
+
+        Same unresolvable registration, same run state -- but a writable counter
+        location. The refusal has to hold for the full budget and only then release.
+        """
+        empty_home = Path(self.tmp.name) / "empty_home_countable"
+        empty_home.mkdir()
+        (self.project / "artifacts" / "runs" / self.RUN).mkdir(parents=True)
+        env = self.hook_env(home=empty_home)
+
+        chain = [
+            self.fire(env=env).get("decision", "release")
+            for _ in range(turn_boundary.STOP_HOOK_BLOCK_CAP_DEFAULT + 1)
+        ]
+
+        self.assertEqual(
+            chain, ["block"] * turn_boundary.STOP_HOOK_BLOCK_CAP_DEFAULT + ["release"]
+        )
+
+    def test_without_a_run_binding_the_same_command_blocks_and_says_how_to_bind(
+        self,
+    ) -> None:
+        """The reviewer's exact probe, and the outcome it must now have.
+
+        Identical layout, identical command, identical run artifacts -- only the
+        ``turn-end-bind`` record is missing. This test used to assert that the turn was
+        NOT blocked, which locked the defect in: OS-44 is about a Coordinator forgetting
+        a required invocation before ending its turn, and allowing the turn when the
+        binding is forgotten is that same defect wearing a different command name.
+        """
+        self.install_repository_checkout()
+        (self.project / "artifacts" / "runs" / self.RUN).mkdir(parents=True)
+
+        decision = self.fire()
+
+        self.assertEqual(decision["decision"], "block")
+        self.assertIn("turn-end-bind", decision["reason"])
+        self.assertIn("bound to no Orca Run", decision["reason"])
+
+    def test_an_unbound_session_is_silent_where_the_project_holds_no_run_state(
+        self,
+    ) -> None:
+        """And the exemption again, through the real command: no runs here, nothing to
+        say and nothing to hold."""
+        self.install_repository_checkout()
+
+        decision = self.fire()
+
+        self.assertEqual(decision, {"suppressOutput": True})
+
+    def test_an_unexpected_internal_failure_blocks_through_the_real_command(self) -> None:
+        """The third fail-open the review named, exercised end to end.
+
+        ``orca gate-list`` answers with a shape no build should produce, which reaches
+        the boundary as an unhandled ``TypeError`` after the run has already been
+        resolved. That is a defect in the gate, and the gate does not get to conclude
+        from its own defect that the turn may end.
+        """
+        entry = self.install_repository_checkout()
+        self.assertEqual(self.bind(entry).returncode, 0)
+        broken = self.project / "orca_broken"
+        broken.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            "verb = sys.argv[2] if len(sys.argv) > 2 else ''\n"
+            "result = {'task-list': {'tasks': []}, 'worker-list': {'workers': []},\n"
+            "          'gate-list': {'gates': 7}}.get(verb, {})\n"
+            "print(json.dumps({'ok': True, 'result': result}))\n",
+            encoding="utf-8",
+        )
+        broken.chmod(0o755)
+
+        decision = self.fire(env=self.hook_env(orca=broken))
+
+        self.assertEqual(decision["decision"], "block")
+        self.assertIn(turn_boundary.STOP_HOOK_FAILURE_REASON_CODE, decision["reason"])
+
+    def test_a_released_binding_stops_gating_that_session(self) -> None:
+        """A Coordinator that is done with a Run says so, and stops being gated on it."""
+        entry = self.install_repository_checkout()
+        self.assertEqual(self.bind(entry).returncode, 0)
+        self.assertEqual(self.fire()["decision"], "block")
+
+        released = subprocess.run(  # noqa: S603 - fixed argv, no shell
+            [
+                sys.executable,
+                str(entry / "tools" / "run_workflow.py"),
+                "turn-end-bind",
+                "--run-id",
+                self.RUN,
+                "--artifact-base",
+                str(self.project),
+                "--release",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            env={**self.hook_env(), turn_boundary.SESSION_ID_ENV: self.SESSION},
+        )
+
+        self.assertEqual(released.returncode, 0, released.stderr)
+        # The release stops gating this session on that RUN: the run-specific refusal is
+        # gone. The project still holds run state, so what remains is the bounded
+        # unattributable-session hold, which names no run and asks for a binding.
+        after = self.fire()
+        self.assertNotIn(quiescence.QUIESCENCE_NEXT_NODE_UNCONSUMED, str(after))
+        self.assertIn("bound to no Orca Run", after["reason"])
+
+    def test_binding_fails_loudly_when_there_is_no_session_to_bind(self) -> None:
+        """Outside Claude Code there is no session id, and pretending otherwise would
+        recreate the defect: a Coordinator believing it is gated when it is not."""
+        entry = self.install_repository_checkout()
+        env = self.hook_env()
+        env.pop(turn_boundary.SESSION_ID_ENV, None)
+
+        completed = subprocess.run(  # noqa: S603 - fixed argv, no shell
+            [
+                sys.executable,
+                str(entry / "tools" / "run_workflow.py"),
+                "turn-end-bind",
+                "--run-id",
+                self.RUN,
+                "--artifact-base",
+                str(self.project),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+        )
+
+        self.assertEqual(completed.returncode, turn_boundary.EXIT_UNAVAILABLE)
+        self.assertIn(turn_boundary.SESSION_ID_ENV, completed.stderr)
+
+    def test_the_registration_composes_with_the_existing_orca_stop_hook(self) -> None:
+        """Both hooks still run. Claude Code merges Stop hooks from every settings
+        source, so the risk is not that ours replaces Orca's inside one file -- it is an
+        operator pasting over the array. The documented transformation appends, and this
+        test then EXECUTES both commands of the merged array, in order, asserting Orca's
+        stand-in still ran and ours still blocked.
+
+        The fixture is a temporary settings tree. The live global settings file is
+        asserted byte-identical across the whole test.
+        """
+        live = Path.home() / ".claude" / "settings.json"
+        before = live.read_bytes() if live.is_file() else None
+        entry = self.install_repository_checkout()
+        self.assertEqual(self.bind(entry).returncode, 0)
+
+        marker = self.project / "orca-hook-ran"
+        orca_hook = f"touch {marker}"
+        settings_path = self.project / ".claude" / "settings.json"
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        settings_path.write_text(
+            json.dumps(
+                {
+                    "hooks": {
+                        "SessionStart": [{"hooks": [{"type": "command", "command": "orca"}]}],
+                        "Stop": [
+                            {"hooks": [{"type": "command", "command": orca_hook, "timeout": 10}]}
+                        ],
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        merged = turn_boundary.merge_stop_hook_registration(
+            json.loads(settings_path.read_text(encoding="utf-8")), self.command
+        )
+        settings_path.write_text(json.dumps(merged), encoding="utf-8")
+
+        commands = [
+            hook["command"]
+            for entry_group in merged["hooks"]["Stop"]
+            for hook in entry_group["hooks"]
+        ]
+        self.assertEqual(commands, [orca_hook, self.command])
+        self.assertEqual(len(merged["hooks"]["SessionStart"]), 1)
+        self.assertEqual(
+            turn_boundary.merge_stop_hook_registration(merged, self.command), merged
+        )
+
+        subprocess.run(  # noqa: S602 - a hook command IS a shell command
+            commands[0], shell=True, check=False, cwd=str(self.project), env=self.hook_env()
+        )
+        decision = self.fire()
+
+        self.assertTrue(marker.is_file(), "the pre-existing Orca Stop hook did not run")
+        self.assertEqual(decision["decision"], "block")
+        self.assertEqual(live.read_bytes() if live.is_file() else None, before)
+
+    def test_running_the_documented_command_writes_no_settings_file(self) -> None:
+        """The hard safety constraint, over the real subprocess this time."""
+        live = Path.home() / ".claude" / "settings.json"
+        before = live.read_bytes() if live.is_file() else None
+        entry = self.install_repository_checkout()
+        self.assertEqual(self.bind(entry).returncode, 0)
+
+        self.fire()
+
+        self.assertEqual(live.read_bytes() if live.is_file() else None, before)
+        self.assertEqual(
+            sorted(path.name for path in self.home.rglob("settings*.json")), []
+        )
+        self.assertEqual(
+            sorted(path.name for path in self.project.rglob("settings*.json")), []
+        )
+
 
 
 if __name__ == "__main__":

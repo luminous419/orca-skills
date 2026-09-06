@@ -249,6 +249,112 @@ def build_parser() -> argparse.ArgumentParser:
 # run administration and no general Orca-independent orchestration CLI here.
 PAUSE_VERBS = ("discover", "resume")
 
+# OS-44 (BUGFIX-I3-CRITICAL-1).  The invocable Coordinator turn-end boundary.  It is a
+# sibling of the pause verbs rather than a flag on the graph launcher because it is not
+# a way of RUNNING the workflow: it is the control point a live, prompt-driven
+# Coordinator invokes before it returns a response, and it needs no LangGraph -- the
+# state it derives is Orca's Task/Dispatch records and the run's own append-only audit.
+TURN_VERBS = ("turn-end", "turn-end-hook", "turn-end-bind")
+
+
+def build_turn_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="run_workflow.py",
+        description="The Coordinator turn-end boundary (OS-44).")
+    sub = parser.add_subparsers(dest="verb", required=True)
+    turn_end = sub.add_parser(
+        "turn-end",
+        help="derive the run's authoritative state and refuse an early turn end")
+    turn_end.add_argument("--run-id", required=True)
+    turn_end.add_argument("--artifact-base", default=".")
+    turn_end.add_argument(
+        "--declare", default="",
+        help="the rest state this turn claims to be ending in (COMPLETED, BLOCKED, "
+             "ESCALATED, WAITING_FOR_INPUT, ...); corroborated against run state and "
+             "never taken on trust")
+    turn_end.add_argument(
+        "--next-node", default="",
+        help="a next node the caller knows about; ADDED to the runnable work the "
+             "boundary derived, never a way to remove any of it. The AUTHORITATIVE next "
+             "node comes from the run's durable OS-40 checkpoint when it has one")
+    turn_end.add_argument(
+        "--checkpoint-store",
+        help="JSON file for the durable OS-40 checkpoint store, the authority for run "
+             "status and graph next node (default: the run artifact root)")
+    turn_end.add_argument("--json", action="store_true")
+    # FINAL-R1.  The same boundary, as Claude Code's ``Stop`` hook: the runtime invokes
+    # it when the model finishes responding, and a refusal BLOCKS the turn instead of
+    # being reported after it.  Registration is the operator's opt-in act -- nothing here
+    # writes a settings file -- and the hook is inert in a session bound to no run.
+    hook = sub.add_parser(
+        "turn-end-hook",
+        help="the turn-end boundary as a Claude Code Stop hook: reads the hook payload "
+             "on stdin, writes the hook decision as JSON on stdout, always exits 0")
+    hook.add_argument(
+        "--run-id", default="",
+        help="the Run this session's Coordinator drives. Default: "
+             f"${turn_boundary_env()}, else the durable session binding published by "
+             "`turn-end-bind`. With none of the three the hook allows the turn without "
+             "observing anything, and says so when the project holds runs")
+    hook.add_argument("--artifact-base", default=".")
+    hook.add_argument(
+        "--declare", default="",
+        help="a rest state to corroborate, for a registration that knows one; "
+             "corroborated against run state exactly as on `turn-end`")
+    hook.add_argument(
+        "--block-cap", type=int, default=None,
+        help="consecutive blocks this hook may issue in one stop chain before it "
+             "releases the turn and records the refusal it let through (default: "
+             f"${turn_boundary_env(cap=True)}, else "
+             "turn_boundary.STOP_HOOK_BLOCK_CAP_DEFAULT)")
+    # BUGFIX-I4-R1-REAL-PATH. The producer for the hook's run binding. The registered
+    # Stop hook cannot be told which Run a session drives -- the runtime does not know --
+    # so the Coordinator says it once here, keyed by the session id Claude Code exports
+    # into this process and sends in the hook payload.
+    bind = sub.add_parser(
+        "turn-end-bind",
+        help="bind this Claude Code session to a Run so the registered Stop hook gates "
+             "its turn ends (or --release it)")
+    bind.add_argument("--run-id", required=True)
+    bind.add_argument("--artifact-base", default=".")
+    bind.add_argument(
+        "--session-id", default="",
+        help=f"the session to bind (default: ${turn_boundary_session_env()}, which "
+             "Claude Code exports into every command it runs)")
+    bind.add_argument(
+        "--release", action="store_true",
+        help="record that this session has let the Run go, so its later turn ends are "
+             "no longer gated on it")
+    bind.add_argument("--json", action="store_true")
+    return parser
+
+
+def turn_boundary_session_env() -> str:
+    """The session-id variable name the ``turn-end-bind`` help quotes, from the module
+    that reads it, so help and behaviour cannot drift."""
+    from . import turn_boundary
+    return turn_boundary.SESSION_ID_ENV
+
+
+def turn_boundary_env(*, cap: bool = False) -> str:
+    """The environment variable names the ``turn-end-hook`` help text quotes.
+
+    Read from ``turn_boundary`` rather than respelled, so the help can never drift from
+    the variable the hook actually reads.
+    """
+    from . import turn_boundary
+    return turn_boundary.STOP_HOOK_CAP_ENV if cap else turn_boundary.STOP_HOOK_RUN_ENV
+
+
+def run_turn_cli(argv: list[str]) -> int:
+    from . import turn_boundary
+    args = build_turn_parser().parse_args(argv)
+    if args.verb == "turn-end-hook":
+        return turn_boundary.run_stop_hook_cli(args)
+    if args.verb == "turn-end-bind":
+        return turn_boundary.run_bind_cli(args)
+    return turn_boundary.run_turn_boundary_cli(args)
+
 
 def build_pause_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -398,6 +504,8 @@ def run_cli(argv: list[str] | None = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
     if raw and raw[0] in PAUSE_VERBS:
         return run_pause_cli(raw)
+    if raw and raw[0] in TURN_VERBS:
+        return run_turn_cli(raw)
     args = build_parser().parse_args(argv)
     try:
         version = require_runtime()

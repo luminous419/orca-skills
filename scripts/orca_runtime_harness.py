@@ -36,7 +36,7 @@ try:
         strip_task_context,
     )
     from scripts import clarification_protocol, decision_gate, decision_policy, run_logging
-    from scripts.deterministic_workflow import quiescence
+    from scripts.deterministic_workflow import quiescence, turn_boundary
     from scripts.workflow_contract import load_workflow_output_contract
 except ModuleNotFoundError:  # direct `python3 scripts/...` execution
     from quality_profile import (
@@ -64,7 +64,7 @@ except ModuleNotFoundError:  # direct `python3 scripts/...` execution
     import decision_policy
     import run_logging
     import clarification_protocol
-    from deterministic_workflow import quiescence
+    from deterministic_workflow import quiescence, turn_boundary
     from workflow_contract import load_workflow_output_contract
 
 
@@ -408,15 +408,42 @@ WORKER_DONE_IDENTITY_FIELDS = ("dispatchId", "taskId")
 # delivery unacknowledged -- is exactly the recorded defect: the next `check --wait`
 # replays that batch and the newly armed waiter wakes on the previous phase's result.
 ACK_MAX_ATTEMPTS = 3
+# OS-44 (BUGFIX-I3-MAJOR-1). The two terminal outcomes of reconciling an acknowledgement
+# a predecessor process left open. Both close the obligation; they differ only in what
+# the runtime still held when the successor asked, and the audit says which.
+ACK_RECONCILED_ACKNOWLEDGED = "reconciled_acknowledged"
+ACK_RECONCILED_NOT_OUTSTANDING = "reconciled_not_outstanding"
+# The third outcome, and the one the PR #31 review round 2 found missing: the successor
+# could not establish EITHER of the two above. It is not terminal, it closes nothing,
+# and the obligation stays open so every gate that reads it keeps failing closed.
+ACK_RECONCILE_UNRESOLVED = "reconcile_unresolved"
+# The ONLY error codes that authoritatively prove Orca no longer holds the delivery, so
+# the only ones a reconciliation may treat as terminal. Read out of the shipped runtime
+# rather than assumed: `acknowledgeRunDelivery` looks the delivery up by id and throws
+# `stale_delivery` ("Delivery <id> does not belong to this Run") when no row for this Run
+# carries it. Two neighbouring behaviours matter as much as the code itself and are why
+# this set is one element long:
+#   * a delivery Orca ALREADY consumed is still on file, so re-acking it RETURNS OK with
+#     `duplicate: true`. The success path above therefore already covers the ordinary
+#     "Orca consumed it" case; a failure is not needed to infer it and never proves it.
+#   * `consumer_fenced` means this mailbox consumer was replaced -- it says nothing about
+#     whether the delivery is outstanding, so it is deliberately NOT in this set.
+# Every other failure -- transport, runtime unavailable, permission, invalid argument, a
+# transient rejection, and any code a future runtime introduces -- leaves the obligation
+# open. A generic failure is not evidence of consumption.
+ACK_NOT_OUTSTANDING_ERROR_CODES = frozenset({"stale_delivery"})
 # The delivery-ledger vocabulary, re-exported from the runtime-neutral contract so this
 # module and the engine cannot spell the same state two ways.
 DELIVERY_STATE_FIELD = quiescence.DELIVERY_STATE_FIELD
 DELIVERY_STATE_PROCESSED = quiescence.DELIVERY_STATE_PROCESSED
 DELIVERY_STATE_ACKNOWLEDGED = quiescence.DELIVERY_STATE_ACKNOWLEDGED
 DELIVERY_STATE_ACK_FAILED = quiescence.DELIVERY_STATE_ACK_FAILED
+DELIVERY_STATE_ACK_INTENT = quiescence.DELIVERY_STATE_ACK_INTENT
+DELIVERY_STATE_ACK_RECONCILED = quiescence.DELIVERY_STATE_ACK_RECONCILED
 DELIVERY_SETTLEMENT_CLAIMED_FIELD = quiescence.DELIVERY_SETTLEMENT_CLAIMED_FIELD
 DELIVERY_SETTLED_FIELD = quiescence.DELIVERY_SETTLED_FIELD
 DELIVERY_RECOVERED_FIELD = quiescence.DELIVERY_RECOVERED_FIELD
+DELIVERY_ACK_INTENT_FIELD = quiescence.DELIVERY_ACK_INTENT_FIELD
 
 # Where a Dispatch row records the completion timestamp axis (a) requires as
 # provenance. The live runtime writes `completed_at` (snake_case, on both the
@@ -1877,6 +1904,14 @@ class OrcaRuntimeHarness:
             "orchestration", "run-create", "--objective", objective, "--from", self.run_owner
         )
         self.run_id = created["result"]["run"]["id"]
+        # OS-44 (BUGFIX-I4-R1-REAL-PATH). Bind this Claude Code session to the Run it
+        # just created, so a registered turn-end Stop hook knows which Run to gate this
+        # session's turn ends on. Best-effort by design: outside Claude Code there is no
+        # session to bind, and a run must never fail to start because a convenience
+        # binding could not be written -- the cost of a missing one is never a hook that
+        # guesses: a registered hook BLOCKS this session's turn ends, up to its cap,
+        # while the project holds Run state or its Run state cannot be read.
+        self._bind_turn_boundary_session()
         self.requested_phases = tuple(requested_phases)
         self._signals = []
         self._ledger = {}
@@ -2260,25 +2295,50 @@ class OrcaRuntimeHarness:
         self._attach_terminal(terminal, dispatch_id, "low_level_tracked")
         return dispatch_id, False
 
+    def delivery_obligations(self) -> dict[str, str]:
+        """Every open delivery obligation this Coordinator holds, by kind.
+
+        OS-44 (BUGFIX-I3-MAJOR-1). The previous round asked one question -- "is this row
+        recovered?" -- and EXCLUDED every recovered row from the pending check, which is
+        how an incomplete acknowledgement disappeared instead of being closed. The
+        exclusion was not arbitrary: counting a predecessor's awaiting-redelivery
+        obligation refuses to arm the very waiter that redelivery has to arrive on, a
+        permanent stall. Both rules are right about different rows, so the rows are now
+        told apart by HOW FAR the predecessor got, in one pure classifier
+        (`quiescence.delivery_obligation`) that this class and the turn-end CLI share.
+        """
+        return {
+            delivery_id: obligation
+            for delivery_id, row in self._deliveries.items()
+            for obligation in (quiescence.delivery_obligation(row),)
+            if obligation != quiescence.OBLIGATION_NONE
+        }
+
     def unacknowledged_deliveries(self) -> tuple[str, ...]:
-        """Every delivery this Coordinator has consumed and not yet acknowledged.
+        """Every delivery whose acknowledgement blocks arming a waiter or ending a turn.
 
         Read-only, and the single source both the waiter gate and the turn-end
         quiescence self-check read, so "may I arm the next waiter?" and "may this turn
         end?" can never disagree about which deliveries are outstanding.
 
-        A row RECOVERED from a predecessor process's audit is excluded, because an
-        outstanding acknowledgement is an obligation of the process that consumed the
-        delivery: this one cannot discharge it, and can only resolve it when the
-        runtime redelivers -- on the very waiter that counting it would refuse to arm.
-        The redelivery's disposition is what settles it, and the row becomes this
-        process's own obligation the moment this process consumes it.
+        Two obligation kinds stand aside, and they are named
+        (`quiescence.REDELIVERY_RESOLVED_OBLIGATIONS`) rather than merely "recovered":
+        the rows a predecessor left without ever issuing the wire ack. Orca replays such
+        a delivery until it is acknowledged, so the redelivery is what discharges them --
+        and it can only arrive on the waiter that counting them would refuse to arm.
+        They are not hidden: `delivery_obligations()` still reports them, the turn-end
+        boundary reports them as runnable work rather than as rest, and a claimed-but-
+        unsettled one still fails closed when its redelivery is settled.
+
+        Every other open obligation blocks, including a predecessor's settled-but-
+        unacknowledged row -- the post-wire-ack window, which no redelivery is
+        guaranteed to close. Those are closed by
+        `reconcile_recovered_acknowledgements()`, never by being excluded.
         """
         return tuple(
             delivery_id
-            for delivery_id, row in self._deliveries.items()
-            if row.get(DELIVERY_STATE_FIELD) != DELIVERY_STATE_ACKNOWLEDGED
-            and not row.get(DELIVERY_RECOVERED_FIELD)
+            for delivery_id, obligation in self.delivery_obligations().items()
+            if obligation not in quiescence.REDELIVERY_RESOLVED_OBLIGATIONS
         )
 
     def _assert_every_delivery_acknowledged(self, action: str) -> None:
@@ -2373,6 +2433,7 @@ class OrcaRuntimeHarness:
                 # progress the artifact a successor recovers from does not carry.
                 DELIVERY_SETTLEMENT_CLAIMED_FIELD: False,
                 DELIVERY_SETTLED_FIELD: False,
+                DELIVERY_ACK_INTENT_FIELD: False,
                 DELIVERY_RECOVERED_FIELD: False,
             },
         )
@@ -2431,6 +2492,24 @@ class OrcaRuntimeHarness:
             # report checkpoint. Record it now so the audit still carries a
             # processed/acknowledged pair for every acknowledgement this run issues.
             row = self._record_delivery_processed(delivery_id)
+        # OS-44 (BUGFIX-I3-MAJOR-1). The ack INTENT is published before the wire
+        # command, not after it. Orca accepts `--ack` and consumes the delivery before
+        # this process can publish anything, so a process that dies inside the command
+        # leaves an audit that -- without this record -- ends at `delivery_settled` and
+        # cannot say whether the delivery is still in the mailbox awaiting replay or has
+        # already been consumed with its acknowledgement outcome unrecorded. A successor
+        # that cannot tell those apart either re-drives a consumed delivery or silently
+        # drops the obligation. Published once, before the first attempt: the retries
+        # below are the same intent, not new ones.
+        if not row.get(DELIVERY_ACK_INTENT_FIELD):
+            self._record_delivery_settlement(
+                delivery_id,
+                DELIVERY_ACK_INTENT_FIELD,
+                run_logging.EVENT_DELIVERY_ACK_INTENT,
+                task_id=row.get("task_id", ""),
+                dispatch_id=row.get("dispatch_id", ""),
+            )
+            row[DELIVERY_STATE_FIELD] = DELIVERY_STATE_ACK_INTENT
         last_error: Any = None
         for attempt in range(1, ACK_MAX_ATTEMPTS + 1):
             response = self.call(
@@ -2490,6 +2569,149 @@ class OrcaRuntimeHarness:
             attempts=ACK_MAX_ATTEMPTS,
             detail=detail,
         )
+        raise OrcaRuntimeError(detail)
+
+    def reconcile_recovered_acknowledgements(self) -> tuple[str, ...]:
+        """Close every acknowledgement a PREDECESSOR process left open.  Deterministic.
+
+        OS-44 (BUGFIX-I3-MAJOR-1).  This is the restart half of the post-wire-ack crash
+        window.  A predecessor that recorded `delivery_settled` -- or that got as far as
+        `delivery_ack_intent` -- and then died left an acknowledgement outcome this run
+        owes and cannot infer: Orca may already have consumed the delivery, in which case
+        no redelivery is coming and waiting for one is waiting forever.
+
+        So the successor closes it instead of waiting -- when, and only when, it can
+        establish an outcome.  For each such row it re-issues the idempotent wire
+        acknowledgement and publishes ONE terminal `delivery_ack_reconciled` record for
+        either observation that settles the question: the runtime accepted the ack
+        (which includes the already-consumed case, since a duplicate ack succeeds), or
+        it answered with a documented `ACK_NOT_OUTSTANDING_ERROR_CODES` code, meaning it
+        holds no such delivery for this Run.  Any other failure establishes neither, so
+        the obligation is left OPEN and the reconciliation fails closed
+        (`_refuse_ack_reconciliation`) rather than inferring consumption from an error
+        it could not classify.
+
+        Repeating no lifecycle action is what makes this safe, and it is a property of
+        the rows it selects rather than of care taken here: every one of them already
+        carries a durable `settled` or `ack_intent` record, so
+        `quiescence.delivery_disposition` classifies it as a replay, and the
+        finalize-once ledger refuses a second settlement independently.  If the runtime
+        did still hold the delivery and this ack somehow does not land, the redelivery
+        arrives on the normal replay path and is acknowledged again with zero lifecycle
+        action -- correct either way, dependent on redelivery in neither.
+
+        Returns the deliveries it closed, in the order it closed them.
+        """
+        reconciled: list[str] = []
+        for delivery_id, obligation in sorted(self.delivery_obligations().items()):
+            if obligation != quiescence.OBLIGATION_ACK_RECONCILE:
+                continue
+            self._reconcile_ack(delivery_id)
+            reconciled.append(delivery_id)
+        return tuple(reconciled)
+
+    def _reconcile_ack(self, delivery_id: str) -> str:
+        """Re-issue one inherited acknowledgement and record its terminal outcome.
+
+        Exactly two observations are terminal, and neither is inferred from a failure
+        this method could not classify:
+
+        * the runtime ACCEPTED the acknowledgement (`ok`) -- which includes the case
+          where it had already consumed the delivery, because a re-ack of an
+          already-acknowledged delivery succeeds as a duplicate; or
+        * it refused with an error code in `ACK_NOT_OUTSTANDING_ERROR_CODES`, which is
+          the runtime stating that it holds no such delivery for this Run.
+
+        Anything else -- transport, runtime, permission, unknown, transient, a fenced
+        consumer -- proves nothing about whether Orca consumed the delivery, so the
+        obligation is PRESERVED and this method fails closed. The previous round turned
+        every exhausted retry into `reconciled_not_outstanding` and dropped the
+        obligation, which let a successor proceed on a reconciliation that had
+        established neither acceptance nor absence.
+        """
+        assert self.run_owner
+        row = self._deliveries[delivery_id]
+        last_error: Any = None
+        accepted = False
+        not_outstanding = False
+        for attempt in range(1, ACK_MAX_ATTEMPTS + 1):
+            response = self.call(
+                "orchestration",
+                "check",
+                "--terminal",
+                self.run_owner,
+                "--ack",
+                delivery_id,
+                allow_error=True,
+            )
+            if response.get("ok"):
+                accepted = True
+                break
+            last_error = response.get("error")
+            code = (last_error or {}).get("code") if isinstance(last_error, dict) else None
+            if code in ACK_NOT_OUTSTANDING_ERROR_CODES:
+                # Authoritative absence. Retrying it would only repeat the same answer.
+                not_outstanding = True
+                break
+        if not accepted and not not_outstanding:
+            return self._refuse_ack_reconciliation(delivery_id, row, last_error)
+        outcome = (
+            ACK_RECONCILED_ACKNOWLEDGED if accepted else ACK_RECONCILED_NOT_OUTSTANDING
+        )
+        detail = (
+            f"delivery {delivery_id} was settled or ack-issued by a previous process "
+            "and its acknowledgement outcome was never recorded; the successor "
+            + (
+                "re-issued the acknowledgement and the runtime accepted it"
+                if accepted
+                else "re-issued the acknowledgement and the runtime answered that it "
+                f"holds no such delivery for this run ({last_error}), which is itself "
+                "the terminal outcome"
+            )
+        )
+        # Durable first, as every other delivery progress transition in this class is:
+        # a reconciliation that cannot be recorded has not happened, and the row stays
+        # an open obligation that blocks the next waiter and the turn end.
+        self._audit_coordinator(
+            run_logging.EVENT_DELIVERY_ACK_RECONCILED,
+            delivery_id=delivery_id,
+            task_id=row.get("task_id", ""),
+            dispatch_id=row.get("dispatch_id", ""),
+            reason_code=outcome,
+            detail=detail,
+        )
+        row[DELIVERY_STATE_FIELD] = DELIVERY_STATE_ACK_RECONCILED
+        row[DELIVERY_ACK_INTENT_FIELD] = True
+        return outcome
+
+    def _refuse_ack_reconciliation(
+        self, delivery_id: str, row: dict[str, Any], last_error: Any
+    ) -> str:
+        """The reconciliation established nothing, so it closes nothing. Fail closed.
+
+        The row keeps its open obligation -- `delivery_obligation` still classifies it as
+        `ack_reconcile` -- so `unacknowledged_deliveries()`, the waiter gate and the
+        turn-end boundary all keep refusing until a later attempt reaches one of the two
+        terminal observations. The failure is published first, for the same reason every
+        other transition in this class is: a successor has to see the attempt.
+        """
+        detail = (
+            f"delivery {delivery_id} was settled or ack-issued by a previous process and "
+            f"its acknowledgement could not be reconciled after {ACK_MAX_ATTEMPTS} "
+            f"attempts (last error: {last_error}); that failure is not evidence the "
+            "runtime consumed the delivery, so the obligation stays open and the "
+            "Coordinator fails closed rather than closing it on an unclassified error"
+        )
+        self._audit_coordinator(
+            run_logging.EVENT_DELIVERY_ACK_FAILED,
+            delivery_id=delivery_id,
+            task_id=row.get("task_id", ""),
+            dispatch_id=row.get("dispatch_id", ""),
+            attempts=ACK_MAX_ATTEMPTS,
+            reason_code=ACK_RECONCILE_UNRESOLVED,
+            detail=detail,
+        )
+        row[DELIVERY_STATE_FIELD] = DELIVERY_STATE_ACK_FAILED
         raise OrcaRuntimeError(detail)
 
     def confirm_terminal_exit(self, terminal: str) -> str:
@@ -2964,12 +3186,48 @@ class OrcaRuntimeHarness:
                 "closed here instead of continuing unrecoverably"
             ) from error
 
+    def observe_orca_dispatch_state(self) -> dict[str, Any]:
+        """Orca's own answer to "what is running, and what is runnable?".
+
+        OS-44 (BUGFIX-I3-CRITICAL-1). The PR #31 review is right that the settlement
+        ledger cannot answer this: a Dispatch enters that ledger through
+        `claim_settlement()`, which runs only AFTER `wait_for_done()` has returned, so
+        a ledger row can only ever describe a Worker or Reviewer that has already
+        finished -- never one that is currently running. The authority is Orca's own
+        Task and Dispatch records, and the rule that reads them is the one the shipped
+        `run_workflow.py turn-end` boundary uses, not a second copy of it.
+        """
+        if not self.run_id:
+            return {"active_dispatches": [], "runnable_actions": [], "task_count": 0,
+                    "worker_count": 0}
+        tasks = self.call("orchestration", "task-list", "--run", self.run_id)[
+            "result"
+        ].get("tasks")
+        workers = self.call(
+            "orchestration", "worker-list", "--run", self.run_id, allow_error=True
+        )
+        return turn_boundary.classify_orca_state(
+            tasks, (workers.get("result") or {}).get("workers") if workers.get("ok") else []
+        )
+
     def active_dispatch_count(self) -> int:
+        """Dispatches Orca reports as currently running for this run.
+
+        OS-44 (BUGFIX-I3-CRITICAL-1). Derived from `observe_orca_dispatch_state()` --
+        Orca's Task status crossed with the Dispatch's own worker row -- and no longer
+        from the settlement ledger, for the reason given there. The ledger count remains
+        available under its own name (`unfinalized_ledger_dispatches()`) for the
+        questions it can actually answer, but it is not this one.
+        """
+        return len(self.observe_orca_dispatch_state()["active_dispatches"])
+
+    def unfinalized_ledger_dispatches(self) -> int:
         """Dispatches this Coordinator has claimed and not finalized.
 
-        The ledger's own answer to "is there an active dispatch?", so the quiescence
-        self-check reads the same rows the finalize-once gate writes rather than a
-        second count that could disagree with them.
+        The finalize-once ledger's own count. It answers "what has this process claimed
+        and not closed out?", which is a real question -- it is simply not the question
+        "is a Worker running right now?", and OS-44 iteration 3 stopped using it as if
+        it were.
         """
         return sum(
             1
@@ -3074,9 +3332,14 @@ class OrcaRuntimeHarness:
                 "task_id": row.get("task_id", ""),
                 "dispatch_id": row.get("dispatch_id", ""),
                 "message_id": "",
-                DELIVERY_STATE_FIELD: (
-                    row.get(DELIVERY_STATE_FIELD) or DELIVERY_STATE_ACKNOWLEDGED
-                ),
+                # OS-44 (BUGFIX-I3-MAJOR-1). The folded state is carried VERBATIM. It
+                # used to default to `acknowledged` when the audit named no state, which
+                # is the one direction a recovery must never guess in: it turned "the
+                # audit does not say this was acknowledged" into "it was", and that is
+                # exactly how the post-wire-ack crash window stayed invisible. A blank
+                # state now stays blank and `quiescence.delivery_obligation` decides
+                # what is owed from how far the predecessor actually got.
+                DELIVERY_STATE_FIELD: row.get(DELIVERY_STATE_FIELD) or "",
                 "replays": int(row.get("replays") or 0),
                 "ack_attempts": 0,
                 "ack_error": "",
@@ -3084,6 +3347,7 @@ class OrcaRuntimeHarness:
                     row.get(DELIVERY_SETTLEMENT_CLAIMED_FIELD)
                 ),
                 DELIVERY_SETTLED_FIELD: bool(row.get(DELIVERY_SETTLED_FIELD)),
+                DELIVERY_ACK_INTENT_FIELD: bool(row.get(DELIVERY_ACK_INTENT_FIELD)),
                 DELIVERY_RECOVERED_FIELD: True,
             }
         self._deliveries_restored_for = self.run_id
@@ -3102,6 +3366,14 @@ class OrcaRuntimeHarness:
         if not self.run_id or self._deliveries_restored_for == self.run_id:
             return
         self.restore_delivery_ledger()
+        # OS-44 (BUGFIX-I3-MAJOR-1). Recovery is not finished when the rows are back:
+        # an acknowledgement a predecessor left open has to be CLOSED, not merely
+        # observed. Closing it here -- inside the once-only restore, which both _check()
+        # and resume_run() go through -- is what makes the post-wire-ack crash window
+        # recoverable without depending on the runtime redelivering anything, and what
+        # stops a successor proceeding over an obligation it never recorded an outcome
+        # for.
+        self.reconcile_recovered_acknowledgements()
 
     def resume_run(
         self,
@@ -3126,6 +3398,11 @@ class OrcaRuntimeHarness:
             require_workflow_phase(candidate, field="requested_phases")
         self.run_id = run_id
         self.run_owner = run_owner
+        # OS-44 (BUGFIX-I4-R1-REAL-PATH). A successor process is a NEW Claude Code
+        # session driving an OLD Run, so it publishes its own binding here for the same
+        # reason start_run() does: the predecessor's binding names the predecessor's
+        # session and cannot gate this one's turn ends.
+        self._bind_turn_boundary_session()
         self.requested_phases = tuple(requested_phases)
         # A fresh process holds no rows for this run. Stated rather than assumed, so
         # binding a second run on one instance cannot inherit the first run's ledger.
@@ -3137,6 +3414,27 @@ class OrcaRuntimeHarness:
             )
         self._restore_delivery_ledger_once()
         return run_id
+
+    def _bind_turn_boundary_session(self) -> str:
+        """Publish the durable session -> Run binding the turn-end Stop hook reads.
+
+        OS-44 (BUGFIX-I4-R1-REAL-PATH). The registered hook is fired by the runtime for
+        a session, and the runtime has no idea which Orca Run that session drives; this
+        record is how it finds out. Written where the run's other durable state lives,
+        keyed by the session id Claude Code exports into this process and sends in the
+        hook payload, so the two are the same value by construction.
+
+        Returns the path written, or "" when there was nothing to bind or the record
+        could not be published. Never raises: this is a convenience for a hook that is
+        opt-in, and it may not be able to fail a Run.
+        """
+        try:
+            path = turn_boundary.bind_session_run(
+                self.run_id or "", artifact_base=self.artifact_dir
+            )
+        except Exception:  # noqa: BLE001 - a binding may never fail a Run
+            return ""
+        return str(path) if path is not None else ""
 
     def _emit_timing_row(self, **fields: Any) -> None:
         """The writer RunTimingTracker emits phase/iteration boundary rows through.
