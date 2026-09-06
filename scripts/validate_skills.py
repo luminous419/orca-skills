@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import json
 import re
 import sys
+import tempfile
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
@@ -3051,6 +3053,609 @@ def validate_workflow_output_contracts(validation: Validation) -> None:
         )
 
 
+# ---- OS-44: the Coordinator turn-quiescence / delivery-ack-ordering contract ------
+# The section is registered in the workflow-control-plane block's `skill_owned_safety`
+# list, so validate_workflow_graph_docs already proves it EXISTS and stays
+# authoritative. What that validator cannot see is whether the section still says the
+# things a live Coordinator has to read, or whether its machine-readable block still
+# matches the executable vocabulary -- which is what these anchors are for. Same shape
+# as the Final Review audit contract validator above: the schema version and the event
+# set are stated in two places by necessity (a constant in run_logging.py and the prose
+# a Coordinator reads), and this is what keeps them one value instead of two.
+COORDINATOR_QUIESCENCE_SECTION_HEADING = (
+    "## Coordinator Turn Quiescence and Delivery Ack Ordering (OS-44)"
+)
+COORDINATOR_QUIESCENCE_SECTION_END = "\n## 18. Core Invariants"
+# Each anchor is a claim the section has to make in its own words.
+COORDINATOR_QUIESCENCE_ANCHORS = (
+    "run_c2166e75bb02",
+    "delivery_5c541e7fe1bd",
+    "active dispatch wait",
+    "WAITING_FOR_INPUT",
+    "coordinator_audit/",
+    "coordinator-audit-write",
+    "coordinator-audit-read",
+    "QUIESCENT_TURN_END_STATES",
+    "DELIVERY_ORDER = reflect_state_and_settlement, acknowledge_delivery, then_arm_next_waiter",
+    "ACK_FAILURE = bounded_retry_then_fail_closed",
+    "QUIESCENCE_SELF_CHECK = immediately_before_turn_end",
+    "DELIVERY_ADOPTION = expected_task_id_and_expected_dispatch_id",
+    "DELIVERY_REPLAY = acknowledge_only, zero_lifecycle_action, bounded_then_fail_closed",
+    # OS-44 BUGFIX iteration 2. The three rules the first iteration's document stated
+    # too weakly to bind: the ack sits BELOW the reflection, restart recovery lives on
+    # the production wait path rather than in an opt-in helper, and this audit family
+    # fails closed instead of following section 9's logging-never-blocks rule.
+    "DELIVERY_DISPOSITION = process, resume, recover, replay",
+    "DELIVERY_RESTART_RECOVERY = restore_on_production_wait_path_before_arming_any_waiter",
+    "COORDINATOR_AUDIT_WRITE_FAILURE = fail_closed",
+    # OS-44 BUGFIX iteration 3. The ordering INSIDE a progress transition: the durable
+    # record is published first and the in-memory state follows, so memory can never
+    # claim progress the artifact a successor recovers from does not carry.
+    "DELIVERY_PROGRESS_COMMIT = publish_durable_record_then_set_in_memory_state",
+    # OS-44 PR #31 review, CRITICAL. The turn-end rule is now an invocable command, and
+    # the document has to name it, name what it derives the verdict from, and -- the
+    # part a validator can most easily lose -- state the platform limitation rather than
+    # claiming prevention. Each of these is a claim that would be false if the
+    # corresponding code were removed, which is what makes them worth binding.
+    "run_workflow.py turn-end",
+    "TURN_END_BOUNDARY = tools/run_workflow.py turn-end --run-id RUN_ID",
+    "TURN_END_AUTHORITY = orca_task_and_dispatch_state, workflow_checkpoint, "
+    "coordinator_audit, durable_wait_artifact",
+    "TURN_END_EXIT = 0 may_end, 1 refused, 3 no_verdict",
+    "TURN_END_SCOPE = fail_closed_when_invoked, deterministic_detection_when_skipped, "
+    "blocking_stop_hook_when_registered",
+    # OS-44 FINAL adversarial review, R1. The premise that no turn-end hook exists was
+    # false: Claude Code fires a blocking ``Stop`` hook when the model finishes
+    # responding. The boundary is wired to it, and each of these names a property of
+    # that wiring that would be false if the corresponding code were removed --
+    # including the two that bound it, because an unbounded blocking hook can wedge a
+    # live session and because nothing here may write a settings file.
+    "TURN_END_HOOK = tools/run_workflow.py turn-end-hook",
+    "TURN_END_HOOK_EVENT = claude_code_stop, blockable_turn_end, "
+    "decision_block_continues_conversation",
+    # OS-44 BUGFIX-I4-R1-REAL-PATH. The two claims the previous registration could not
+    # keep. The entry point has to resolve from the directory Claude Code actually runs
+    # a hook in, and the run binding has to be PRODUCED by something -- the earlier
+    # `ORCA_QUIESCENCE_RUN_ID=$ORCA_QUIESCENCE_RUN_ID` self-assignment had no producer
+    # anywhere, so the advertised registration was inert. Both are anchored here so the
+    # document cannot go back to advertising a registration that runs nothing.
+    "TURN_END_HOOK_BINDING = run_id_flag, else_ORCA_QUIESCENCE_RUN_ID, "
+    "else_durable_session_binding_from_turn_end_bind",
+    "TURN_END_HOOK_BIND = tools/run_workflow.py turn-end-bind --run-id RUN_ID, "
+    "keyed_by_CLAUDE_CODE_SESSION_ID",
+    "TURN_END_HOOK_ENTRY = resolved_from_CLAUDE_PROJECT_DIR_or_installed_skill_root, "
+    "never_relative_tools_path",
+    # OS-44 FINAL adversarial review attempt 2, R1. The anchor above USED to read
+    # ``allow_turn, announce_ungated_when_project_has_runs``, and it was pinning the
+    # defect in place: announcing an unbound session and allowing its turn moves the
+    # invocation the model must remember from ``turn-end`` to ``turn-end-bind`` and
+    # leaves forgetting it just as unpunished. Fail-closed everywhere except the one
+    # case with positive evidence the session is unrelated.
+    # OS-44 FINAL adversarial review attempt 3, R1. The judgement is TRI-STATE, and the
+    # anchor has to say so, because a boolean is what let "the authority is unreadable"
+    # be reported as "there is positively nothing here" -- the one answer that licenses a
+    # silent allow. The three names are checked against the constants the module
+    # publishes below, so dropping or renaming a state in the code fails validation
+    # rather than only drifting the prose.
+    "TURN_END_HOOK_RUN_STATE = runs_present, proven_absent, unreadable",
+    "TURN_END_HOOK_UNBOUND = block_when_runs_present_or_unreadable, "
+    "silent_allow_only_when_runs_proven_absent",
+    "TURN_END_HOOK_FAIL_CLOSED = unreadable_authority, unreadable_run_state_root, "
+    "unattributable_session, unresolved_entry_point, hook_internal_failure",
+    "TURN_END_HOOK_CAP = bounded_consecutive_blocks_then_release_and_record",
+    "TURN_END_HOOK_REGISTRATION = operator_opt_in, never_written_by_this_repository, "
+    "never_global_settings",
+    "TURN_END_HOOK_LIMIT = runtime_block_cap_overrides, "
+    "block_discarded_without_model_reinvoke",
+    # OS-44 FINAL adversarial review, R2. Which axes are derived and which single value
+    # stays a caller's declaration, said in the machine-readable block as well as prose.
+    "STATUS_DECLARED_AXIS = declare_flag_status_only, other_axes_derived",
+    "ACTIVE_DISPATCH_SOURCE = orca_task_status_and_dispatch_row, never_settlement_ledger",
+    # OS-44 PR #31 review round 2, CRITICAL. The three claims the round-1 document made
+    # more strongly than the code kept: activity needs a live worker row, run status and
+    # next node come from the durable checkpoint, and a run without one is SAID to have
+    # no status authority rather than having a declaration passed off as a derivation.
+    "ACTIVE_DISPATCH_EVIDENCE = dispatched_task_and_live_worker_row, "
+    "missing_worker_row_is_recovery_work",
+    "RUN_STATUS_AUTHORITY = workflow_checkpoint, else_os31_pause_record, "
+    "else_declared_only",
+    "NEXT_NODE_AUTHORITY = workflow_checkpoint_route, declared_next_node_only_adds",
+    "DECLARED_REST_STATE = corroborated_against_run_state_or_refused",
+    # OS-44 PR #31 review, MAJOR. The post-wire-ack window: the intent below the record,
+    # and the successor that closes it without waiting for a redelivery.
+    "ACK_INTENT = publish_durable_intent_before_wire_ack",
+    "ACK_RECONCILIATION = successor_closes_predecessor_acknowledgement_without_redelivery",
+    # OS-44 PR #31 review round 2, MAJOR. Only two answers close an inherited
+    # acknowledgement, and neither of them is "the command failed and we stopped asking".
+    "ACK_RECONCILE_TERMINAL = wire_ack_accepted, or_documented_not_outstanding_error",
+    "ACK_RECONCILE_UNCLASSIFIED = obligation_stays_open, fail_closed",
+)
+
+# The honest-scoping claim, checked as prose as well as vocabulary: a section that
+# names the CLI but drops the limitation would be overclaiming, which the reviewer
+# named a blocking defect in its own right.
+COORDINATOR_QUIESCENCE_SCOPE_ANCHORS = (
+    # OS-44 FINAL adversarial review, R1. What replaced ``hook은 없다``. That phrase was
+    # REQUIRED here, which is how a false premise survived a passing validation: the
+    # checker was pinning the overclaim in place. These four are the verified facts --
+    # the hook exists and blocks, the runtime's own cap has the last word, registration
+    # is the operator's act -- so the document cannot quietly go back to claiming either
+    # that no such hook exists or that this one cannot be overridden.
+    "turn-end-hook",
+    "stop_hook_active",
+    "연속 block 상한",
+    "등록은 operator의 opt-in 행위다",
+    # OS-44 BUGFIX-I4-R1-REAL-PATH. The prose has to keep naming the resolvable entry
+    # point and the real producer of the run binding, because the defect this round
+    # fixed was a registration section that read as if it worked.
+    "turn-end-bind",
+    "CLAUDE_PROJECT_DIR",
+    "CLAUDE_CODE_SESSION_ID",
+    "fail-closed로 강제된다",
+    "결정적으로 탐지된다",
+    # OS-44 PR #31 review round 2. The second honesty claim, and the one the reviewer
+    # found the document overstating: a run with no durable checkpoint has no run-status
+    # authority, and the section has to keep SAYING so instead of presenting a caller's
+    # declaration as something the boundary derived.
+    "포장하지 않는다",
+    # OS-44 FINAL adversarial review, R2. The section has to NAME the one caller-supplied
+    # value it cannot derive, not merely reassure that it derives things.
+    "호출자가 제공하는 입력은 `--declare`(status)와 `--next-node` 둘뿐이다",
+    "그 status 값 자체는 여전히 호출자의 선언으로 남는다",
+)
+
+# OS-44 FINAL adversarial review, R2. The anchors above check that reassuring phrases are
+# PRESENT, which a document can satisfy while an absolute overclaim sits three lines
+# above them -- exactly what happened. These are the opposite test: a claim in this list
+# is one the code does not support, and its presence FAILS validation no matter how many
+# narrowing phrases surround it. Regexes rather than literals so a reworded equivalent is
+# caught too.
+def published_stop_hook_command(validation: Validation) -> str | None:
+    """The Stop-hook registration the engine publishes, or ``None`` where it has none.
+
+    Imported lazily and gated on the package existing, for the same reason
+    ``validate_deterministic_workflow_parity`` gates itself: the historical mutation
+    fixtures carry only the policy surface under test, and a module-level import of the
+    engine would turn every one of those into an import crash with empty stdout instead
+    of the named failure each test asserts on. A tree that HAS the engine and cannot
+    import it is a real error, not a partial fixture, and is reported as one.
+    """
+    if not (REPO_ROOT / "scripts" / "deterministic_workflow").is_dir():
+        return None
+    try:
+        from deterministic_workflow import turn_boundary
+    except ImportError as exc:
+        validation.check(False, f"OS-44 turn-boundary module is unimportable: {exc}")
+        return None
+    return turn_boundary.STOP_HOOK_COMMAND
+
+
+def registered_stop_hook_commands(section: str) -> tuple[str, ...]:
+    """Every ``Stop`` hook command the section's copy-paste JSON blocks would register.
+
+    Parsed rather than substring-matched: the block is JSON, so the command carries
+    escaped quotes and a literal comparison against the source string would pass only by
+    accident. What the operator pastes is what is checked.
+    """
+    commands: list[str] = []
+    for block in re.findall(r"```json\n(.*?)```", section, flags=re.DOTALL):
+        try:
+            document = json.loads(block)
+        except ValueError:
+            continue
+        if not isinstance(document, dict):
+            continue
+        hooks = document.get("hooks")
+        entries = hooks.get("Stop") if isinstance(hooks, dict) else None
+        for entry in entries or []:
+            for hook in (entry.get("hooks") or []) if isinstance(entry, dict) else []:
+                if isinstance(hook, dict) and isinstance(hook.get("command"), str):
+                    commands.append(hook["command"])
+    return tuple(commands)
+
+
+COORDINATOR_QUIESCENCE_FORBIDDEN_CLAIMS = (
+    (
+        r"어느\s*입력도[^.]*주장이\s*아니다",
+        "the boundary takes `--declare` and `--next-node` from the caller, and in a run "
+        "with no checkpoint and no pause record the declared status IS the reported "
+        "status (status_authority = declared_only)",
+    ),
+    (
+        r"호출자의\s*주장은\s*(하나도|전혀)\s*없다",
+        "same overclaim, reworded: `--declare` is a caller claim",
+    ),
+    (
+        r"모든\s*입력을\s*(직접\s*)?조회",
+        "the status axis is not queried in the no-checkpoint path; it is declared",
+    ),
+    (
+        r"hook은\s*없다",
+        "Claude Code fires a blocking `Stop` hook when the model finishes responding, "
+        "and Orca has one registered in the live settings; this premise is false and it "
+        "was used to narrow the delivered scope",
+    ),
+    (
+        r"(막을\s*수\s*없다|막지\s*못한다)",
+        "a registered Stop hook does block the turn end; the honest statement is the "
+        "bounded one (the runtime overrides a hook that blocks past its cap)",
+    ),
+    # OS-44 BUGFIX-I4-R1-REAL-PATH. The exact shape of the registration that shipped
+    # unable to run: a relative entry point no layout resolves, and a self-assignment of
+    # a variable nothing produces. Anchored on the JSON key so the section can still
+    # QUOTE the old command while explaining why it was wrong.
+    (
+        r'"command"\s*:\s*"(python3\s+)?tools/run_workflow\.py',
+        "a hook command is run from the project directory, where there is no `tools/`; "
+        "the registration must resolve its entry point from $CLAUDE_PROJECT_DIR or an "
+        "installed Skill root",
+    ),
+    (
+        r'"command"\s*:\s*"ORCA_QUIESCENCE_RUN_ID=',
+        "assigning that variable to its own value binds nothing and nothing produces "
+        "it; the run binding comes from `turn-end-bind`, keyed by the session id the "
+        "runtime supplies",
+    ),
+    (
+        r"(언제나|항상|반드시|무조건)\s*막는다",
+        "the runtime keeps the last word: it overrides the hook past "
+        "CLAUDE_CODE_STOP_HOOK_BLOCK_CAP and discards a block when the turn ended with "
+        "no model re-invoke",
+    ),
+)
+# OS-44 FINAL adversarial review attempt 3, R2. The same discipline, applied to the
+# SOURCE rather than to the Skill. Every one of these sentences was still in
+# ``turn_boundary.py`` (and one in ``orca_runtime_harness.py``) after the behaviour they
+# describe had been inverted: the module told a reader that an unbound session's turn is
+# never blocked, and BOTH ``turn-end-bind`` failure diagnostics told an operator the hook
+# would merely report the session as ungated, while the shipped hook blocks it in any
+# project holding -- or unable to read -- Run state. ``validate_skills.py`` passed with
+# all of them present, which is precisely why they are bound here: a claim that only
+# prose review can catch is a claim that comes back.
+#
+# These are matched against CURRENT source only. Historical artifacts under
+# ``artifacts/`` are never read by this validator, so a past review that QUOTES the old
+# wording stays exactly as it was written.
+COORDINATOR_QUIESCENCE_SOURCE_FILES = (
+    Path("scripts") / "deterministic_workflow" / "turn_boundary.py",
+    Path("orca-worker-reviewer-orchestration")
+    / "tools"
+    / "deterministic_workflow"
+    / "turn_boundary.py",
+    Path("scripts") / "orca_runtime_harness.py",
+    # PR #31 review, second round. The launchers were NOT scanned, so both copies kept
+    # shipping the superseded fail-open description in `turn-end-hook --help` while all
+    # 873 checks passed. `--help` is the contract an operator actually reads before
+    # registering the hook; a policy module that is right while the CLI says the opposite
+    # is not a corrected claim, it is a hidden one. Both copies are listed because they
+    # are byte-identical by contract and a fix to one alone would ship the other.
+    Path("scripts") / "deterministic_workflow" / "launcher.py",
+    Path("orca-worker-reviewer-orchestration")
+    / "tools"
+    / "deterministic_workflow"
+    / "launcher.py",
+)
+
+COORDINATOR_QUIESCENCE_SOURCE_FORBIDDEN_CLAIMS = (
+    (
+        r"turn is never blocked",
+        "an unbound session's turn IS blocked, up to the cap, wherever the project "
+        "holds Run state or its Run state cannot be read",
+    ),
+    (
+        r"gates only a session that is bound",
+        "the hook also gates a session it cannot attribute to any Run; what decides is "
+        "the project's run state, not only the binding",
+    ),
+    (
+        r"(hook|it) that says it is ungated",
+        "a missing binding produces a hook that BLOCKS, not one that announces",
+    ),
+    (
+        r"report(s)?\s+(this|the)\s+session\s+as\s+ungated",
+        "the `turn-end-bind` diagnostics are read by the operator who has to act on "
+        "them; they must say the session's turn ends will be blocked",
+    ),
+    (
+        r"(is|are)\s+TOLD\s+it\s+is\s+ungated",
+        "same claim, reworded: the unbound session is refused, not merely told",
+    ),
+    # PR #31 review, second round: the exact two sentences the launchers shipped. Both
+    # describe the pre-FINAL-attempt-3 behaviour, and both are user-visible `--help`
+    # output rather than a comment, so an operator registering the hook was told the
+    # opposite of what the hook does.
+    (
+        r"inert in a session bound to no run",
+        "an unattributable session is not ignored; the project's run state decides, and "
+        "only RUN_STATE_PROVEN_ABSENT is silent",
+    ),
+    (
+        r"allows the turn without observing",
+        "an unbound session in a project that holds runs -- or whose run authority "
+        "cannot be read -- is BLOCKED on the consecutive-block budget, not allowed",
+    ),
+    # The code shape the wording described. ``project_has_runs()`` answers False for
+    # BOTH proven absence and an unreadable authority, so branching the silent allow on
+    # it is the R1 defect itself, whatever the surrounding comment says.
+    (
+        r"if\s+not\s+project_has_runs\(",
+        "`project_has_runs()` is False for an unreadable authority as well as for "
+        "proven absence; the silent allow must require "
+        "`project_run_state() == RUN_STATE_PROVEN_ABSENT`",
+    ),
+)
+
+# The tri-state, named in the source it is defined in, so the distinction cannot be
+# collapsed back into a boolean without failing here.
+COORDINATOR_QUIESCENCE_SOURCE_REQUIRED = (
+    "RUN_STATE_PRESENT",
+    "RUN_STATE_PROVEN_ABSENT",
+    "RUN_STATE_UNREADABLE",
+    "def project_run_state(",
+)
+
+
+def normalized_source_prose(text: str) -> str:
+    """The file's prose as a reader meets it, with the line breaks Python put in removed.
+
+    A forbidden sentence must not survive by being wrapped. Two wrappings hide one here:
+    a comment that continues on the next ``#`` line, and an implicitly concatenated
+    string literal split across lines. Both are joined before matching, then whitespace
+    is collapsed, so "An unbound session's turn is never\n# blocked" and
+    ``"...report this "\n"session as ungated"`` are matched exactly as the reader (or the
+    operator reading the diagnostic) sees them.
+    """
+    joined = re.sub(r'"\s*\n\s*"', "", text)
+    joined = re.sub(r"\n\s*#+ ?", " ", joined)
+    return re.sub(r"\s+", " ", joined)
+
+
+def validate_turn_boundary_source_claims(validation: Validation) -> None:
+    """OS-44 R1/R2: the turn boundary's own source says what the turn boundary does.
+
+    Two bindings the prose anchors above cannot make on their own: the tri-state exists
+    in the code, and no file has drifted back to describing the fail-open the branch
+    already shipped four times.
+    """
+    for relative in COORDINATOR_QUIESCENCE_SOURCE_FILES:
+        path = REPO_ROOT / relative
+        if not path.is_file():
+            continue
+        text = path.read_text(encoding="utf-8")
+        prose = normalized_source_prose(text)
+        for pattern, why in COORDINATOR_QUIESCENCE_SOURCE_FORBIDDEN_CLAIMS:
+            found = re.search(pattern, prose)
+            validation.check(
+                found is None,
+                f"{relative}: the source states a turn-boundary behaviour the code does "
+                f"not have -- {(found.group(0) if found else pattern)!r}. {why}. This is "
+                "current guidance or a user-visible diagnostic, not a historical "
+                "quotation; correct it rather than qualifying it elsewhere.",
+            )
+        if relative.name != "turn_boundary.py":
+            continue
+        for required in COORDINATOR_QUIESCENCE_SOURCE_REQUIRED:
+            validation.check(
+                required in text,
+                f"{relative}: OS-44 run-state discovery lost {required!r}. The judgement "
+                "is tri-state -- runs_present / proven_absent / unreadable -- because a "
+                "boolean cannot separate an unreadable authority from positive evidence "
+                "that there is nothing here, and only the second may end a turn in "
+                "silence.",
+            )
+
+
+def validate_turn_boundary_run_state_binding(validation: Validation) -> None:
+    """The tri-state, exercised rather than described.
+
+    The anchors are compared against the names the module publishes, and the two
+    decisions that matter are driven through the production helpers on real directories:
+    an empty, readable runs root is the ONE silent allow, and a runs root that cannot be
+    read as a directory blocks. Portable on purpose -- the unreadable case is produced
+    with a regular file where the runs root belongs, so this check does not depend on
+    permission bits taking effect (the process may be root, or the filesystem may ignore
+    the mode). The real chmod-based negatives live in the OS-44 test module, which skips
+    explicitly when the mode has no effect.
+    """
+    if not (REPO_ROOT / "scripts" / "deterministic_workflow").is_dir():
+        return
+    try:
+        from deterministic_workflow import turn_boundary
+    except ImportError as exc:
+        validation.check(False, f"OS-44 turn-boundary module is unimportable: {exc}")
+        return
+
+    skill_path = LIFECYCLE_SKILL_DIR / "SKILL.md"
+    if skill_path.is_file():
+        published = (
+            f"TURN_END_HOOK_RUN_STATE = {turn_boundary.RUN_STATE_PRESENT}, "
+            f"{turn_boundary.RUN_STATE_PROVEN_ABSENT}, "
+            f"{turn_boundary.RUN_STATE_UNREADABLE}"
+        )
+        validation.check(
+            published in skill_path.read_text(encoding="utf-8"),
+            f"{LIFECYCLE_SKILL_DIR.name}: the OS-44 section's run-state vocabulary is "
+            f"not the one turn_boundary.py publishes ({published!r})",
+        )
+
+    validation.check(
+        turn_boundary.STOP_HOOK_UNREADABLE_BLOCK_REASON in turn_boundary.STOP_HOOK_COMMAND,
+        "OS-44: the documented registration's no-entry-point tail has no "
+        "unreadable-run-state refusal. Its directory glob cannot establish a child "
+        "directory under a runs root it may not read, so without that branch the tail "
+        "takes the allow path on an unreadable authority.",
+    )
+
+    with tempfile.TemporaryDirectory() as raw:
+        base = Path(raw)
+        (base / "artifacts" / "runs").mkdir(parents=True)
+        validation.check(
+            turn_boundary.project_run_state(base) == turn_boundary.RUN_STATE_PROVEN_ABSENT
+            and turn_boundary.unbound_session_decision(
+                {"session_id": "validate_skills"}, artifact_base=base
+            )
+            == {"suppressOutput": True},
+            "OS-44: a readable, empty runs root must be proven_absent and the one silent "
+            "allow",
+        )
+        (base / "artifacts" / "runs" / "run_x").mkdir()
+        validation.check(
+            turn_boundary.project_run_state(base) == turn_boundary.RUN_STATE_PRESENT
+            and turn_boundary.unbound_session_decision(
+                {"session_id": "validate_skills"}, artifact_base=base
+            ).get("decision")
+            == "block",
+            "OS-44: a run directory present must be runs_present and must block an "
+            "unattributable session",
+        )
+
+    with tempfile.TemporaryDirectory() as raw:
+        base = Path(raw)
+        (base / "artifacts").mkdir()
+        (base / "artifacts" / "runs").write_text("not a directory", encoding="utf-8")
+        validation.check(
+            turn_boundary.project_run_state(base) == turn_boundary.RUN_STATE_UNREADABLE
+            and turn_boundary.unbound_session_decision(
+                {"session_id": "validate_skills"}, artifact_base=base
+            ).get("decision")
+            == "block",
+            "OS-44: a runs root that cannot be read as a directory must be unreadable "
+            "and must block -- never proven_absent",
+        )
+
+
+# The five turn-end states OS-44 enumerates, each of which must be named in the section
+# by the name the executable contract uses.
+COORDINATOR_QUIESCENCE_TURN_END_STATES = (
+    "BLOCKED",
+    "ESCALATED",
+    "COMPLETED",
+)
+# The invariants the section's rules are locked to in section 18.
+COORDINATOR_QUIESCENCE_INVARIANTS = (
+    "Coordinator turn ends only at active dispatch wait, WAITING_FOR_INPUT, BLOCKED, "
+    "ESCALATED, or COMPLETED",
+    "A worker_done is adopted only when it matches BOTH the expected task id and the "
+    "expected dispatch id",
+    "Reflect state and settlement, acknowledge the delivery, and only then arm the "
+    "next waiter",
+    "A restarted coordinator restores the delivery ledger on the production wait path "
+    "before any waiter is armed",
+    "The coordinator audit is the sole restart source; a record that cannot be written "
+    "or read fails closed",
+    "A delivery progress transition is committed in memory only after its durable "
+    "audit record is published",
+    "A settle re-entry on an already finalized dispatch acknowledges only when durable "
+    "settled state is proven",
+    "The turn-end boundary is an invocable command whose verdict is derived from run "
+    "state, never declared",
+    "Active dispatch is derived from Orca task and dispatch state, never from the "
+    "settlement ledger",
+    "A dispatched task with no live worker row is recovery work, never an active wait",
+    "Run status and next node come from the durable workflow checkpoint when the run "
+    "has one",
+    "A run with no checkpoint has no durable status authority, and the boundary reports "
+    "that rather than claiming one",
+    "A declared rest state is refused unless the run's own state corroborates it",
+    "The registered Stop hook fails closed on an unattributable session, an unresolved "
+    "entry point or its own failure, and allows silently only where the project is "
+    "proven to hold no run state",
+    "A declared status that contradicts an authoritative one is refused, never "
+    "preferred over it",
+    "The wire acknowledgement intent is published durably before the acknowledgement "
+    "is sent",
+    "A successor closes a predecessor's open acknowledgement without depending on "
+    "redelivery",
+    "An incomplete acknowledgement is closed by reconciliation, never hidden by "
+    "excluding its row",
+    "An acknowledgement reconciliation is terminal only on an accepted ack or a "
+    "documented not outstanding answer",
+    "An unclassified acknowledgement failure preserves the obligation and fails closed",
+    "Turn-end enforcement is fail-closed when invoked and deterministically detectable "
+    "when skipped",
+)
+
+
+def validate_coordinator_quiescence_contract(validation: Validation) -> None:
+    """OS-44's section, its machine-readable block, and its section 18 invariants."""
+    skill_path = LIFECYCLE_SKILL_DIR / "SKILL.md"
+    if not skill_path.is_file():
+        return
+    skill_text = skill_path.read_text(encoding="utf-8")
+
+    section = extract_section(
+        skill_text,
+        COORDINATOR_QUIESCENCE_SECTION_HEADING,
+        COORDINATOR_QUIESCENCE_SECTION_END,
+    )
+    validation.check(
+        bool(section),
+        f"{LIFECYCLE_SKILL_DIR.name}: the OS-44 Coordinator turn-quiescence section is "
+        "missing, renamed, or has escaped its position before section 18",
+    )
+    if not section:
+        return
+    for anchor in (
+        *COORDINATOR_QUIESCENCE_ANCHORS,
+        *COORDINATOR_QUIESCENCE_TURN_END_STATES,
+    ):
+        validation.check(
+            anchor in section,
+            f"{LIFECYCLE_SKILL_DIR.name}: the OS-44 section is missing {anchor!r}",
+        )
+    for anchor in COORDINATOR_QUIESCENCE_SCOPE_ANCHORS:
+        validation.check(
+            anchor in section,
+            f"{LIFECYCLE_SKILL_DIR.name}: the OS-44 section no longer states its own "
+            f"scope honestly -- {anchor!r} is gone. The turn-end boundary is fail-closed "
+            "when invoked, detectable when skipped, and blocking through a REGISTERED "
+            "Claude Code Stop hook whose consecutive blocks the runtime can override; a "
+            "document that stops saying any of that overclaims in one direction or the "
+            "other.",
+        )
+    for pattern, why in COORDINATOR_QUIESCENCE_FORBIDDEN_CLAIMS:
+        found = re.search(pattern, section)
+        validation.check(
+            found is None,
+            f"{LIFECYCLE_SKILL_DIR.name}: the OS-44 section makes a claim the code does "
+            f"not support -- {(found.group(0) if found else pattern)!r}. {why}. Narrowing "
+            "phrases elsewhere in the section do not cancel it; state the limitation "
+            "instead of asserting the absolute.",
+        )
+    # OS-44 BUGFIX-I4-R1-REAL-PATH. The copy-paste registration block is the operator's
+    # only path to enforcement, and the previous one could not execute anything. Bound to
+    # the command the code itself publishes, so the document cannot drift from what the
+    # tests actually run.
+    published = published_stop_hook_command(validation)
+    if published is not None:
+        validation.check(
+            published in registered_stop_hook_commands(section),
+            f"{LIFECYCLE_SKILL_DIR.name}: the OS-44 section's Stop-hook registration "
+            "block is not the command turn_boundary.STOP_HOOK_COMMAND publishes; a "
+            "registration the code does not stand behind is how an inert hook shipped",
+        )
+    validation.check(
+        f"COORDINATOR_AUDIT_SCHEMA_VERSION = {run_logging.COORDINATOR_AUDIT_SCHEMA_VERSION}"
+        in section,
+        f"{LIFECYCLE_SKILL_DIR.name}: the OS-44 section's audit schema version differs "
+        f"from run_logging.COORDINATOR_AUDIT_SCHEMA_VERSION "
+        f"({run_logging.COORDINATOR_AUDIT_SCHEMA_VERSION!r})",
+    )
+    for event in run_logging.COORDINATOR_AUDIT_EVENTS:
+        validation.check(
+            event in section,
+            f"{LIFECYCLE_SKILL_DIR.name}: the OS-44 section's event vocabulary does "
+            f"not name {event!r}, which run_logging.py publishes; a reader following "
+            "the document would not know that record kind exists",
+        )
+    for invariant in COORDINATOR_QUIESCENCE_INVARIANTS:
+        validation.check(
+            invariant in skill_text,
+            f"{LIFECYCLE_SKILL_DIR.name}: section 18 lost the OS-44 invariant "
+            f"{invariant!r}",
+        )
+
+
 def validate_os30_contract(validation: Validation) -> None:
     texts={skill_dir.name:(skill_dir/"SKILL.md").read_text(encoding="utf-8") for skill_dir in SKILL_DIRS}
     for skill_name,text in texts.items():
@@ -3110,6 +3715,9 @@ def main() -> int:
     validate_run_logging_contract(validation)
     validate_run_logging_tool_parity(validation)
     validate_deterministic_workflow_parity(validation)
+    validate_coordinator_quiescence_contract(validation)
+    validate_turn_boundary_source_claims(validation)
+    validate_turn_boundary_run_state_binding(validation)
     validate_os30_contract(validation)
     validate_version(validation)
     validate_repository_links(validation)

@@ -36,6 +36,7 @@ try:
         strip_task_context,
     )
     from scripts import clarification_protocol, decision_gate, decision_policy, run_logging
+    from scripts.deterministic_workflow import quiescence, turn_boundary
     from scripts.workflow_contract import load_workflow_output_contract
 except ModuleNotFoundError:  # direct `python3 scripts/...` execution
     from quality_profile import (
@@ -63,6 +64,7 @@ except ModuleNotFoundError:  # direct `python3 scripts/...` execution
     import decision_policy
     import run_logging
     import clarification_protocol
+    from deterministic_workflow import quiescence, turn_boundary
     from workflow_contract import load_workflow_output_contract
 
 
@@ -399,6 +401,50 @@ SETTLED_OUTCOMES = frozenset({"succeeded", "failed"})
 # EXPECTED Task and Dispatch ID; neither is optional, because a payload that names
 # no dispatch proves nothing about the dispatch we are about to mutate.
 WORKER_DONE_IDENTITY_FIELDS = ("dispatchId", "taskId")
+# ---- OS-44. Delivery acknowledgement and turn quiescence -------------------------
+# How many times one `check --ack` is attempted before the Coordinator fails closed.
+# Bounded because an ack that never lands is not a condition that improves by being
+# retried forever, and fail-closed because the alternative -- carrying on with the
+# delivery unacknowledged -- is exactly the recorded defect: the next `check --wait`
+# replays that batch and the newly armed waiter wakes on the previous phase's result.
+ACK_MAX_ATTEMPTS = 3
+# OS-44 (BUGFIX-I3-MAJOR-1). The two terminal outcomes of reconciling an acknowledgement
+# a predecessor process left open. Both close the obligation; they differ only in what
+# the runtime still held when the successor asked, and the audit says which.
+ACK_RECONCILED_ACKNOWLEDGED = "reconciled_acknowledged"
+ACK_RECONCILED_NOT_OUTSTANDING = "reconciled_not_outstanding"
+# The third outcome, and the one the PR #31 review round 2 found missing: the successor
+# could not establish EITHER of the two above. It is not terminal, it closes nothing,
+# and the obligation stays open so every gate that reads it keeps failing closed.
+ACK_RECONCILE_UNRESOLVED = "reconcile_unresolved"
+# The ONLY error codes that authoritatively prove Orca no longer holds the delivery, so
+# the only ones a reconciliation may treat as terminal. Read out of the shipped runtime
+# rather than assumed: `acknowledgeRunDelivery` looks the delivery up by id and throws
+# `stale_delivery` ("Delivery <id> does not belong to this Run") when no row for this Run
+# carries it. Two neighbouring behaviours matter as much as the code itself and are why
+# this set is one element long:
+#   * a delivery Orca ALREADY consumed is still on file, so re-acking it RETURNS OK with
+#     `duplicate: true`. The success path above therefore already covers the ordinary
+#     "Orca consumed it" case; a failure is not needed to infer it and never proves it.
+#   * `consumer_fenced` means this mailbox consumer was replaced -- it says nothing about
+#     whether the delivery is outstanding, so it is deliberately NOT in this set.
+# Every other failure -- transport, runtime unavailable, permission, invalid argument, a
+# transient rejection, and any code a future runtime introduces -- leaves the obligation
+# open. A generic failure is not evidence of consumption.
+ACK_NOT_OUTSTANDING_ERROR_CODES = frozenset({"stale_delivery"})
+# The delivery-ledger vocabulary, re-exported from the runtime-neutral contract so this
+# module and the engine cannot spell the same state two ways.
+DELIVERY_STATE_FIELD = quiescence.DELIVERY_STATE_FIELD
+DELIVERY_STATE_PROCESSED = quiescence.DELIVERY_STATE_PROCESSED
+DELIVERY_STATE_ACKNOWLEDGED = quiescence.DELIVERY_STATE_ACKNOWLEDGED
+DELIVERY_STATE_ACK_FAILED = quiescence.DELIVERY_STATE_ACK_FAILED
+DELIVERY_STATE_ACK_INTENT = quiescence.DELIVERY_STATE_ACK_INTENT
+DELIVERY_STATE_ACK_RECONCILED = quiescence.DELIVERY_STATE_ACK_RECONCILED
+DELIVERY_SETTLEMENT_CLAIMED_FIELD = quiescence.DELIVERY_SETTLEMENT_CLAIMED_FIELD
+DELIVERY_SETTLED_FIELD = quiescence.DELIVERY_SETTLED_FIELD
+DELIVERY_RECOVERED_FIELD = quiescence.DELIVERY_RECOVERED_FIELD
+DELIVERY_ACK_INTENT_FIELD = quiescence.DELIVERY_ACK_INTENT_FIELD
+
 # Where a Dispatch row records the completion timestamp axis (a) requires as
 # provenance. The live runtime writes `completed_at` (snake_case, on both the
 # `completed` and the `failed` row); the camelCase spellings are accepted so a
@@ -936,6 +982,20 @@ class OrcaRuntimeHarness:
         self._terminals: dict[str, dict[str, Any]] = {}
         # dispatch_id -> lifecycle row (axis outcomes + finalization state)
         self._ledger: dict[str, dict[str, Any]] = {}
+        # ---- OS-44. delivery_id -> {state, replays, task_id, dispatch_id, message_id}.
+        # The Coordinator's own message-loop ledger, and a different object from
+        # self._ledger above: that one answers "did I already finalize this Dispatch?",
+        # this one answers "did I already consume -- and acknowledge -- this Delivery?".
+        # The recorded `run_c2166e75bb02` failure needed both and had only the first,
+        # which is why its completed-dispatch ledger correctly blocked the duplicate
+        # settlement while the stale delivery still consumed a wait cycle.
+        self._deliveries: dict[str, dict[str, Any]] = {}
+        # OS-44. The run whose predecessor ledger this PROCESS has already recovered.
+        # Empty means "this process has not yet folded the run's audit forward", and
+        # _check() refuses to arm a waiter until it has -- which is what makes restart
+        # recovery a property of the production wait path rather than of a helper a
+        # caller has to remember to invoke.
+        self._deliveries_restored_for: str = ""
         # OS-17: when this run's ORCHESTRATOR_LOG.md/TIMING_LOG.md were first opened
         # (start_run()) and the wall-clock start log_run_status() diffs against.
         # Empty until start_run() runs, same lifecycle as run_id/run_owner.
@@ -1844,9 +1904,27 @@ class OrcaRuntimeHarness:
             "orchestration", "run-create", "--objective", objective, "--from", self.run_owner
         )
         self.run_id = created["result"]["run"]["id"]
+        # OS-44 (BUGFIX-I4-R1-REAL-PATH). Bind this Claude Code session to the Run it
+        # just created, so a registered turn-end Stop hook knows which Run to gate this
+        # session's turn ends on. Best-effort by design: outside Claude Code there is no
+        # session to bind, and a run must never fail to start because a convenience
+        # binding could not be written -- the cost of a missing one is never a hook that
+        # guesses: a registered hook BLOCKS this session's turn ends, up to its cap,
+        # while the project holds Run state or its Run state cannot be read.
+        self._bind_turn_boundary_session()
         self.requested_phases = tuple(requested_phases)
         self._signals = []
         self._ledger = {}
+        # OS-44. Run-scoped for the same reason self._ledger above is: a delivery id
+        # belongs to the Run whose mailbox produced it, and carrying one Run's
+        # acknowledged deliveries into the next would make a genuinely new delivery
+        # read as a replay.
+        self._deliveries = {}
+        # OS-44 (BUGFIX-I1-G1-2). A Run this process just created cannot have a
+        # predecessor process, so its recovery is complete by construction. Recorded
+        # explicitly rather than left empty so _check()'s restore gate is satisfied by
+        # a fact, not by a filesystem scan of an audit that cannot exist yet.
+        self._deliveries_restored_for = self.run_id or ""
         # OS-41. The OS-29 decision-gate cursor is RUN-SCOPED and must be cleared
         # here, beside the other per-run resets, for the same reason they are: one
         # OrcaRuntimeHarness starts several Runs in sequence (run_runtime_scenarios
@@ -2217,8 +2295,92 @@ class OrcaRuntimeHarness:
         self._attach_terminal(terminal, dispatch_id, "low_level_tracked")
         return dispatch_id, False
 
+    def delivery_obligations(self) -> dict[str, str]:
+        """Every open delivery obligation this Coordinator holds, by kind.
+
+        OS-44 (BUGFIX-I3-MAJOR-1). The previous round asked one question -- "is this row
+        recovered?" -- and EXCLUDED every recovered row from the pending check, which is
+        how an incomplete acknowledgement disappeared instead of being closed. The
+        exclusion was not arbitrary: counting a predecessor's awaiting-redelivery
+        obligation refuses to arm the very waiter that redelivery has to arrive on, a
+        permanent stall. Both rules are right about different rows, so the rows are now
+        told apart by HOW FAR the predecessor got, in one pure classifier
+        (`quiescence.delivery_obligation`) that this class and the turn-end CLI share.
+        """
+        return {
+            delivery_id: obligation
+            for delivery_id, row in self._deliveries.items()
+            for obligation in (quiescence.delivery_obligation(row),)
+            if obligation != quiescence.OBLIGATION_NONE
+        }
+
+    def unacknowledged_deliveries(self) -> tuple[str, ...]:
+        """Every delivery whose acknowledgement blocks arming a waiter or ending a turn.
+
+        Read-only, and the single source both the waiter gate and the turn-end
+        quiescence self-check read, so "may I arm the next waiter?" and "may this turn
+        end?" can never disagree about which deliveries are outstanding.
+
+        Two obligation kinds stand aside, and they are named
+        (`quiescence.REDELIVERY_RESOLVED_OBLIGATIONS`) rather than merely "recovered":
+        the rows a predecessor left without ever issuing the wire ack. Orca replays such
+        a delivery until it is acknowledged, so the redelivery is what discharges them --
+        and it can only arrive on the waiter that counting them would refuse to arm.
+        They are not hidden: `delivery_obligations()` still reports them, the turn-end
+        boundary reports them as runnable work rather than as rest, and a claimed-but-
+        unsettled one still fails closed when its redelivery is settled.
+
+        Every other open obligation blocks, including a predecessor's settled-but-
+        unacknowledged row -- the post-wire-ack window, which no redelivery is
+        guaranteed to close. Those are closed by
+        `reconcile_recovered_acknowledgements()`, never by being excluded.
+        """
+        return tuple(
+            delivery_id
+            for delivery_id, obligation in self.delivery_obligations().items()
+            if obligation not in quiescence.REDELIVERY_RESOLVED_OBLIGATIONS
+        )
+
+    def _assert_every_delivery_acknowledged(self, action: str) -> None:
+        """OS-44 ordering gate. Fail closed before arming another waiter.
+
+        The acceptance criterion this enforces is stated as an ordering, so it is
+        enforced as one: state and settlement are reflected first, the delivery is
+        acknowledged second, and only then may a new waiter exist. A Coordinator that
+        arms the next `check --wait` with a processed-but-unacknowledged delivery
+        outstanding gets that delivery replayed into the new waiter, which is how a
+        PLAN waiter woke on an ANALYSIS re-review result.
+        """
+        pending = self.unacknowledged_deliveries()
+        if not pending:
+            return
+        detail = (
+            f"refusing to {action}: delivery {', '.join(pending)} was processed and "
+            "not acknowledged; acknowledge it first or the next waiter wakes on the "
+            "replay"
+        )
+        self._audit_coordinator(
+            run_logging.EVENT_QUIESCENCE_VIOLATION,
+            reason_code=quiescence.QUIESCENCE_UNACKNOWLEDGED_DELIVERY,
+            detail=detail,
+            delivery_id=pending[0],
+        )
+        raise OrcaRuntimeError(detail)
+
     def _check(self) -> dict[str, Any]:
         assert self.run_owner
+        # OS-44 (BUGFIX-I1-G1-2). Restart recovery happens HERE, on the production wait
+        # path, and before the gate below -- not in a helper a caller could forget. Any
+        # route by which this process came to hold an existing run id (a successor
+        # binding through resume_run(), or any future one) passes through this method
+        # before it can arm a `check --wait`, so a redelivered batch is judged against
+        # the previous process's ledger rather than against an empty one. It runs above
+        # the acknowledgement gate because a recovered row can itself be outstanding.
+        self._restore_delivery_ledger_once()
+        # The gate is the FIRST gate, above the command, for the same reason
+        # claim_settlement() is settle_attempt()'s: a gate after the action it guards
+        # is a report, not a gate.
+        self._assert_every_delivery_acknowledged("arm the next delivery wait")
         return self.call(
             "orchestration",
             "check",
@@ -2231,11 +2393,326 @@ class OrcaRuntimeHarness:
             str(self.wait_timeout_ms),
         )["result"]
 
-    def _ack(self, delivery_id: str) -> None:
-        assert self.run_owner
-        self.call(
-            "orchestration", "check", "--terminal", self.run_owner, "--ack", delivery_id
+    def _record_delivery_processed(
+        self,
+        delivery_id: str,
+        *,
+        task_id: str = "",
+        dispatch_id: str = "",
+        message_id: str = "",
+    ) -> dict[str, Any]:
+        """Mark a delivery consumed, BEFORE the caller acts on what it contained.
+
+        Written first on purpose. The row is what makes the ack obligation visible to
+        the waiter gate and to the turn-end self-check, so a Coordinator that dies,
+        returns or raises between consuming a delivery and acknowledging it leaves an
+        outstanding obligation rather than a silent gap.
+
+        OS-44 (BUGFIX-I2-G1-1). Opening the row and COMMITTING the progress transition
+        are two different things, and they are ordered differently for that reason. The
+        row is opened first because an unopened row is an invisible obligation; the
+        transition to ``processed`` commits only after the durable record exists,
+        because a transition that could not be recorded has not happened. An
+        unpublished row stays in the obligation set (its state is not
+        ``acknowledged``), so the failure is fail-closed in both directions at once.
+        """
+        row = self._deliveries.setdefault(
+            delivery_id,
+            {
+                "delivery_id": delivery_id,
+                "task_id": task_id,
+                "dispatch_id": dispatch_id,
+                "message_id": message_id,
+                DELIVERY_STATE_FIELD: "",
+                "replays": 0,
+                "ack_attempts": 0,
+                "ack_error": "",
+                # How far this delivery's settlement got. Both flip through
+                # _record_delivery_settlement(), which publishes the matching audit
+                # record BEFORE the flag flips, so the in-memory row can never claim
+                # progress the artifact a successor recovers from does not carry.
+                DELIVERY_SETTLEMENT_CLAIMED_FIELD: False,
+                DELIVERY_SETTLED_FIELD: False,
+                DELIVERY_ACK_INTENT_FIELD: False,
+                DELIVERY_RECOVERED_FIELD: False,
+            },
         )
+        self._audit_coordinator(
+            run_logging.EVENT_DELIVERY_PROCESSED,
+            delivery_id=delivery_id,
+            task_id=task_id or row.get("task_id", ""),
+            dispatch_id=dispatch_id or row.get("dispatch_id", ""),
+            message_id=message_id or row.get("message_id", ""),
+        )
+        # Durably recorded above; only now does the in-memory transition commit.
+        row[DELIVERY_STATE_FIELD] = DELIVERY_STATE_PROCESSED
+        # THIS process has now consumed it, so the acknowledgement is its own
+        # obligation even if the row arrived here through restart recovery.
+        row[DELIVERY_RECOVERED_FIELD] = False
+        return row
+
+    def _record_delivery_settlement(
+        self, delivery_id: str, field: str, event: str, **fields: Any
+    ) -> None:
+        """Record how far this delivery's settlement got: DURABLY, then in memory.
+
+        OS-44 (BUGFIX-I1-G1-1). The two calls to this method are the boundaries a crash
+        has to be recoverable across: the claim, published before the settlement path's
+        first Orca command, and the settled record, published after state and settlement
+        are fully reflected and before the acknowledgement. The audit write is
+        fail-closed (see _audit_coordinator), so a boundary that could not be recorded
+        stops the run instead of leaving a successor to guess.
+
+        OS-44 (BUGFIX-I2-G1-1). The order inside this method is the whole point and is
+        not an implementation detail: the durable record is published FIRST and the
+        in-memory flag flips only if that publication succeeded. A transition that
+        cannot be durably recorded has not happened, so memory must never run ahead of
+        the artifact. Publishing second -- which is what iteration 2 did -- left the row
+        saying "settled" while the audit said only "claimed", and every later reader of
+        that row (the STEP 0 discharge, the waiter gate, a successor's recovery) then
+        decided from a fact no artifact supported.
+        """
+        self._audit_coordinator(event, delivery_id=delivery_id, **fields)
+        row = self._deliveries.get(delivery_id)
+        if row is not None:
+            row[field] = True
+
+    def _ack(self, delivery_id: str) -> None:
+        """Acknowledge one delivery, with a bounded retry and a fail-closed edge.
+
+        Every attempt, the success and the exhaustion are recorded in the run's
+        append-only Coordinator audit, so an ack failure is a named reason in an
+        artifact rather than an inference from a missing row.
+        """
+        assert self.run_owner
+        row = self._deliveries.get(delivery_id)
+        if row is None:
+            # A delivery acknowledged without having been recorded as processed --
+            # the non-matching batches wait_for_done() discards, and the runtime exit
+            # report checkpoint. Record it now so the audit still carries a
+            # processed/acknowledged pair for every acknowledgement this run issues.
+            row = self._record_delivery_processed(delivery_id)
+        # OS-44 (BUGFIX-I3-MAJOR-1). The ack INTENT is published before the wire
+        # command, not after it. Orca accepts `--ack` and consumes the delivery before
+        # this process can publish anything, so a process that dies inside the command
+        # leaves an audit that -- without this record -- ends at `delivery_settled` and
+        # cannot say whether the delivery is still in the mailbox awaiting replay or has
+        # already been consumed with its acknowledgement outcome unrecorded. A successor
+        # that cannot tell those apart either re-drives a consumed delivery or silently
+        # drops the obligation. Published once, before the first attempt: the retries
+        # below are the same intent, not new ones.
+        if not row.get(DELIVERY_ACK_INTENT_FIELD):
+            self._record_delivery_settlement(
+                delivery_id,
+                DELIVERY_ACK_INTENT_FIELD,
+                run_logging.EVENT_DELIVERY_ACK_INTENT,
+                task_id=row.get("task_id", ""),
+                dispatch_id=row.get("dispatch_id", ""),
+            )
+            row[DELIVERY_STATE_FIELD] = DELIVERY_STATE_ACK_INTENT
+        last_error: Any = None
+        for attempt in range(1, ACK_MAX_ATTEMPTS + 1):
+            response = self.call(
+                "orchestration",
+                "check",
+                "--terminal",
+                self.run_owner,
+                "--ack",
+                delivery_id,
+                allow_error=True,
+            )
+            if response.get("ok"):
+                # OS-44 (BUGFIX-I2-G1-1). Durable first here too. R8 requires the
+                # acknowledgement outcome to be IN the audit; publishing it after the
+                # in-memory transition meant a failed write left the row saying
+                # "acknowledged" over an audit that ended at `delivery_settled`, and
+                # the run then carried on past the one outcome it owed. If the record
+                # cannot be published the transition does not commit: the delivery
+                # stays an outstanding obligation, the waiter gate and the turn-end
+                # self-check both refuse, and _audit_coordinator raises. A re-entry
+                # re-publishes it -- the wire ack is idempotent and STEP 0 discharges
+                # an already-finalized dispatch -- so the outcome is recorded on the
+                # retry rather than permanently omitted.
+                self._audit_coordinator(
+                    run_logging.EVENT_DELIVERY_ACKNOWLEDGED,
+                    delivery_id=delivery_id,
+                    task_id=row.get("task_id", ""),
+                    dispatch_id=row.get("dispatch_id", ""),
+                    attempts=attempt,
+                )
+                row[DELIVERY_STATE_FIELD] = DELIVERY_STATE_ACKNOWLEDGED
+                row["ack_attempts"] = attempt
+                row["ack_error"] = ""
+                return
+            last_error = response.get("error")
+            row["ack_attempts"] = attempt
+            self._audit_coordinator(
+                run_logging.EVENT_DELIVERY_ACK_RETRY,
+                delivery_id=delivery_id,
+                task_id=row.get("task_id", ""),
+                dispatch_id=row.get("dispatch_id", ""),
+                attempts=attempt,
+                detail=f"ack attempt {attempt} of {ACK_MAX_ATTEMPTS} failed: {last_error}",
+            )
+        row[DELIVERY_STATE_FIELD] = DELIVERY_STATE_ACK_FAILED
+        row["ack_error"] = str(last_error)
+        detail = (
+            f"delivery {delivery_id} could not be acknowledged after "
+            f"{ACK_MAX_ATTEMPTS} attempts (last error: {last_error}); the Coordinator "
+            "fails closed rather than arm a waiter that would wake on the replay"
+        )
+        self._audit_coordinator(
+            run_logging.EVENT_DELIVERY_ACK_FAILED,
+            delivery_id=delivery_id,
+            task_id=row.get("task_id", ""),
+            dispatch_id=row.get("dispatch_id", ""),
+            attempts=ACK_MAX_ATTEMPTS,
+            detail=detail,
+        )
+        raise OrcaRuntimeError(detail)
+
+    def reconcile_recovered_acknowledgements(self) -> tuple[str, ...]:
+        """Close every acknowledgement a PREDECESSOR process left open.  Deterministic.
+
+        OS-44 (BUGFIX-I3-MAJOR-1).  This is the restart half of the post-wire-ack crash
+        window.  A predecessor that recorded `delivery_settled` -- or that got as far as
+        `delivery_ack_intent` -- and then died left an acknowledgement outcome this run
+        owes and cannot infer: Orca may already have consumed the delivery, in which case
+        no redelivery is coming and waiting for one is waiting forever.
+
+        So the successor closes it instead of waiting -- when, and only when, it can
+        establish an outcome.  For each such row it re-issues the idempotent wire
+        acknowledgement and publishes ONE terminal `delivery_ack_reconciled` record for
+        either observation that settles the question: the runtime accepted the ack
+        (which includes the already-consumed case, since a duplicate ack succeeds), or
+        it answered with a documented `ACK_NOT_OUTSTANDING_ERROR_CODES` code, meaning it
+        holds no such delivery for this Run.  Any other failure establishes neither, so
+        the obligation is left OPEN and the reconciliation fails closed
+        (`_refuse_ack_reconciliation`) rather than inferring consumption from an error
+        it could not classify.
+
+        Repeating no lifecycle action is what makes this safe, and it is a property of
+        the rows it selects rather than of care taken here: every one of them already
+        carries a durable `settled` or `ack_intent` record, so
+        `quiescence.delivery_disposition` classifies it as a replay, and the
+        finalize-once ledger refuses a second settlement independently.  If the runtime
+        did still hold the delivery and this ack somehow does not land, the redelivery
+        arrives on the normal replay path and is acknowledged again with zero lifecycle
+        action -- correct either way, dependent on redelivery in neither.
+
+        Returns the deliveries it closed, in the order it closed them.
+        """
+        reconciled: list[str] = []
+        for delivery_id, obligation in sorted(self.delivery_obligations().items()):
+            if obligation != quiescence.OBLIGATION_ACK_RECONCILE:
+                continue
+            self._reconcile_ack(delivery_id)
+            reconciled.append(delivery_id)
+        return tuple(reconciled)
+
+    def _reconcile_ack(self, delivery_id: str) -> str:
+        """Re-issue one inherited acknowledgement and record its terminal outcome.
+
+        Exactly two observations are terminal, and neither is inferred from a failure
+        this method could not classify:
+
+        * the runtime ACCEPTED the acknowledgement (`ok`) -- which includes the case
+          where it had already consumed the delivery, because a re-ack of an
+          already-acknowledged delivery succeeds as a duplicate; or
+        * it refused with an error code in `ACK_NOT_OUTSTANDING_ERROR_CODES`, which is
+          the runtime stating that it holds no such delivery for this Run.
+
+        Anything else -- transport, runtime, permission, unknown, transient, a fenced
+        consumer -- proves nothing about whether Orca consumed the delivery, so the
+        obligation is PRESERVED and this method fails closed. The previous round turned
+        every exhausted retry into `reconciled_not_outstanding` and dropped the
+        obligation, which let a successor proceed on a reconciliation that had
+        established neither acceptance nor absence.
+        """
+        assert self.run_owner
+        row = self._deliveries[delivery_id]
+        last_error: Any = None
+        accepted = False
+        not_outstanding = False
+        for attempt in range(1, ACK_MAX_ATTEMPTS + 1):
+            response = self.call(
+                "orchestration",
+                "check",
+                "--terminal",
+                self.run_owner,
+                "--ack",
+                delivery_id,
+                allow_error=True,
+            )
+            if response.get("ok"):
+                accepted = True
+                break
+            last_error = response.get("error")
+            code = (last_error or {}).get("code") if isinstance(last_error, dict) else None
+            if code in ACK_NOT_OUTSTANDING_ERROR_CODES:
+                # Authoritative absence. Retrying it would only repeat the same answer.
+                not_outstanding = True
+                break
+        if not accepted and not not_outstanding:
+            return self._refuse_ack_reconciliation(delivery_id, row, last_error)
+        outcome = (
+            ACK_RECONCILED_ACKNOWLEDGED if accepted else ACK_RECONCILED_NOT_OUTSTANDING
+        )
+        detail = (
+            f"delivery {delivery_id} was settled or ack-issued by a previous process "
+            "and its acknowledgement outcome was never recorded; the successor "
+            + (
+                "re-issued the acknowledgement and the runtime accepted it"
+                if accepted
+                else "re-issued the acknowledgement and the runtime answered that it "
+                f"holds no such delivery for this run ({last_error}), which is itself "
+                "the terminal outcome"
+            )
+        )
+        # Durable first, as every other delivery progress transition in this class is:
+        # a reconciliation that cannot be recorded has not happened, and the row stays
+        # an open obligation that blocks the next waiter and the turn end.
+        self._audit_coordinator(
+            run_logging.EVENT_DELIVERY_ACK_RECONCILED,
+            delivery_id=delivery_id,
+            task_id=row.get("task_id", ""),
+            dispatch_id=row.get("dispatch_id", ""),
+            reason_code=outcome,
+            detail=detail,
+        )
+        row[DELIVERY_STATE_FIELD] = DELIVERY_STATE_ACK_RECONCILED
+        row[DELIVERY_ACK_INTENT_FIELD] = True
+        return outcome
+
+    def _refuse_ack_reconciliation(
+        self, delivery_id: str, row: dict[str, Any], last_error: Any
+    ) -> str:
+        """The reconciliation established nothing, so it closes nothing. Fail closed.
+
+        The row keeps its open obligation -- `delivery_obligation` still classifies it as
+        `ack_reconcile` -- so `unacknowledged_deliveries()`, the waiter gate and the
+        turn-end boundary all keep refusing until a later attempt reaches one of the two
+        terminal observations. The failure is published first, for the same reason every
+        other transition in this class is: a successor has to see the attempt.
+        """
+        detail = (
+            f"delivery {delivery_id} was settled or ack-issued by a previous process and "
+            f"its acknowledgement could not be reconciled after {ACK_MAX_ATTEMPTS} "
+            f"attempts (last error: {last_error}); that failure is not evidence the "
+            "runtime consumed the delivery, so the obligation stays open and the "
+            "Coordinator fails closed rather than closing it on an unclassified error"
+        )
+        self._audit_coordinator(
+            run_logging.EVENT_DELIVERY_ACK_FAILED,
+            delivery_id=delivery_id,
+            task_id=row.get("task_id", ""),
+            dispatch_id=row.get("dispatch_id", ""),
+            attempts=ACK_MAX_ATTEMPTS,
+            reason_code=ACK_RECONCILE_UNRESOLVED,
+            detail=detail,
+        )
+        row[DELIVERY_STATE_FIELD] = DELIVERY_STATE_ACK_FAILED
+        raise OrcaRuntimeError(detail)
 
     def confirm_terminal_exit(self, terminal: str) -> str:
         waited = self.call(
@@ -2258,11 +2735,102 @@ class OrcaRuntimeHarness:
             raise OrcaRuntimeError("fake terminal did not exit after settlement")
         return "exited"
 
-    def wait_for_done(self, dispatch_id: str) -> tuple[dict[str, Any], str]:
+    def wait_for_done(self, dispatch_id: str, task_id: str) -> tuple[dict[str, Any], str]:
+        """Wait until THIS Dispatch's `worker_done` arrives, and adopt only that.
+
+        OS-44. Three properties this loop is required to hold, each of which the
+        recorded `run_c2166e75bb02` failure broke:
+
+        1. **Provenance before adoption.** A `worker_done` is adopted as this waiter's
+           result only when it names BOTH the expected Dispatch and the expected Task.
+           The loop used to compare `dispatchId` alone, and anything that failed that
+           one comparison was acknowledged away at the bottom of the loop with no
+           record of what had been discarded. A message that does not belong to this
+           waiter is now recorded as a mismatch and never becomes `done`.
+        2. **Replay is not a result.** A delivery this run has already processed and
+           acknowledged is acknowledged again and produces no lifecycle action at all
+           -- no settlement, no release, no artifact, no dispatch, no iteration
+           consumption -- and the loop keeps waiting for a real one. A replay is
+           bounded: past `DELIVERY_REPLAY_LIMIT` the Coordinator fails closed rather
+           than spin against a runtime that is not consuming the acknowledgement.
+        3. **The consumption is recorded before the return.** The matched delivery is
+           marked processed HERE, not at the settlement that follows, so the ack
+           obligation exists from the moment the delivery is consumed. Anything that
+           ends the turn, raises, or returns between this method and the settlement's
+           ack now leaves a visible outstanding obligation that both
+           `_assert_every_delivery_acknowledged` and `verify_quiescence` refuse.
+
+        `task_id` is required rather than optional. The pre-mutation settlement gate
+        already compares both identities, but it runs after adoption -- which is why an
+        optional expected-Task would leave exactly the gap this ticket exists to close.
+        """
         while True:
             delivery = self._check()
             if delivery.get("timedOut") or not delivery.get("messages"):
                 raise OrcaRuntimeError(f"timed out waiting for Dispatch {dispatch_id}")
+            delivery_id = delivery["deliveryId"]
+            disposition, reason = quiescence.delivery_disposition(
+                delivery_id, self._deliveries
+            )
+            if disposition == quiescence.DELIVERY_REPLAY_EXHAUSTED:
+                self._audit_coordinator(
+                    run_logging.EVENT_DELIVERY_REPLAYED,
+                    delivery_id=delivery_id,
+                    dispatch_id=dispatch_id,
+                    task_id=task_id,
+                    replays=int(self._deliveries[delivery_id].get("replays") or 0) + 1,
+                    reason_code=quiescence.DELIVERY_REPLAY_EXHAUSTED,
+                    detail=reason,
+                )
+                raise OrcaRuntimeError(reason)
+            if disposition == quiescence.DELIVERY_RECOVER:
+                # A previous process claimed this delivery's settlement and never
+                # recorded finishing it. A claim carries no proof of how many lifecycle
+                # commands already went out, so repeating one could DUPLICATE a
+                # release; the run stops here and is recovered explicitly, exactly as
+                # claim_settlement() does for an in_progress row inside one process.
+                self._audit_coordinator(
+                    run_logging.EVENT_DELIVERY_RECOVERY,
+                    delivery_id=delivery_id,
+                    dispatch_id=dispatch_id,
+                    task_id=task_id,
+                    reason_code=quiescence.DELIVERY_RECOVER,
+                    detail=reason,
+                )
+                raise OrcaRuntimeError(reason)
+            if disposition == quiescence.DELIVERY_RESUME:
+                # The other side of the same restart boundary: consumed, nothing
+                # claimed, nothing settled, never acknowledged. NOTHING was mutated for
+                # it, so the redelivery is how the result gets processed rather than
+                # lost -- discarding it as a replay here is precisely the loss this
+                # ticket forbids. It falls through into the ordinary message scan
+                # below; exactly-once is still the settlement ledger's job.
+                self._audit_coordinator(
+                    run_logging.EVENT_DELIVERY_RECOVERY,
+                    delivery_id=delivery_id,
+                    dispatch_id=dispatch_id,
+                    task_id=task_id,
+                    reason_code=quiescence.DELIVERY_RESUME,
+                    detail=reason,
+                )
+            if disposition == quiescence.DELIVERY_REPLAY:
+                # Zero lifecycle action, by construction: this branch acknowledges and
+                # loops. It never inspects the messages, so no replayed `worker_done`
+                # can reach `done` and no replayed question can be replied to twice.
+                row = self._deliveries[delivery_id]
+                row["replays"] = int(row.get("replays") or 0) + 1
+                self._audit_coordinator(
+                    run_logging.EVENT_DELIVERY_REPLAYED,
+                    delivery_id=delivery_id,
+                    dispatch_id=dispatch_id,
+                    task_id=task_id,
+                    replays=row["replays"],
+                    detail=reason,
+                )
+                row[DELIVERY_STATE_FIELD] = DELIVERY_STATE_PROCESSED
+                row[DELIVERY_RECOVERED_FIELD] = False
+                self._ack(delivery_id)
+                continue
             done = None
             for message in delivery["messages"]:
                 message_type = message["type"]
@@ -2281,16 +2849,46 @@ class OrcaRuntimeHarness:
                 elif message_type == "escalation":
                     pass
                 elif message_type == "worker_done":
-                    payload = json.loads(message["payload"])
-                    if payload.get("dispatchId") == dispatch_id:
-                        if done is not None:
-                            raise OrcaRuntimeError("worker_done was delivered more than once")
-                        if payload.get("_orcaLifecycleRejection"):
-                            raise OrcaRuntimeError("worker_done was rejected by Orca")
-                        done = message
+                    try:
+                        payload = json.loads(message["payload"])
+                    except (TypeError, ValueError) as error:
+                        payload = {"_unparsable": " ".join(str(error).split())}
+                    provenance, mismatch = quiescence.worker_done_provenance(
+                        payload,
+                        expected_task_id=task_id,
+                        expected_dispatch_id=dispatch_id,
+                    )
+                    if provenance == quiescence.PROVENANCE_MISMATCH:
+                        # Recorded and discarded. It is NOT this waiter's result, and
+                        # the reason it was refused is now an artifact rather than an
+                        # acknowledgement with nothing behind it.
+                        self._audit_coordinator(
+                            run_logging.EVENT_DELIVERY_MISMATCH,
+                            delivery_id=delivery_id,
+                            dispatch_id=dispatch_id,
+                            task_id=task_id,
+                            message_id=message.get("id", ""),
+                            reason_code=quiescence.PROVENANCE_MISMATCH,
+                            detail=mismatch,
+                        )
+                        continue
+                    if done is not None:
+                        raise OrcaRuntimeError("worker_done was delivered more than once")
+                    if payload.get("_orcaLifecycleRejection"):
+                        raise OrcaRuntimeError("worker_done was rejected by Orca")
+                    done = message
             if done is not None:
-                return done, delivery["deliveryId"]
-            self._ack(delivery["deliveryId"])
+                # Marked consumed BEFORE the return: settle_attempt's STEP 3 owes this
+                # delivery an ack, and until it lands nothing may arm another waiter
+                # and the turn may not end.
+                self._record_delivery_processed(
+                    delivery_id,
+                    task_id=task_id,
+                    dispatch_id=dispatch_id,
+                    message_id=done.get("id", ""),
+                )
+                return done, delivery_id
+            self._ack(delivery_id)
 
     def settle_attempt(
         self,
@@ -2318,7 +2916,61 @@ class OrcaRuntimeHarness:
             iteration=iteration,
         )
         if recorded is not None:
+            # OS-44. Zero LIFECYCLE mutations, which is what STEP 0's exactly-once
+            # property is about -- but the delivery that carried us here was consumed
+            # and still owes an acknowledgement. Discharging it here is the difference
+            # between "this dispatch was already settled, nothing to redo" and a
+            # Coordinator wedged behind an obligation nothing will ever clear: without
+            # it, the ordering gate and the turn-end self-check would both keep
+            # refusing forever. An already-acknowledged delivery issues no command at
+            # all, so the replay path stays command-free in the ordinary case.
+            #
+            # OS-44 (BUGFIX-I2-G1-1). Discharging is NOT unconditional. It is safe only
+            # where this delivery's own durable state proves there is nothing left to
+            # recover, which delivery_disposition() answers from the two settlement
+            # flags -- and those flags now flip only after their audit record is
+            # published, so the answer is durable-backed whether the row was built by
+            # this process or recovered from a predecessor's audit. A row that CLAIMED
+            # a settlement and carries no settled record is the fail-closed case: a
+            # lifecycle command may already have gone out and the record that would
+            # prove the settlement finished does not exist, so acknowledging here would
+            # hand the runtime's last copy of the delivery back over an audit that
+            # cannot account for it -- and a successor would then find an unfinished
+            # claim with no delivery left to recover it on. The claim-free rows -- a
+            # fresh delivery carrying a duplicate or out-of-order worker_done for a
+            # dispatch finalized elsewhere -- never entered the settlement path at all,
+            # and the finalized ledger row above is their proof; those still discharge.
+            if delivery_id in self.unacknowledged_deliveries():
+                disposition, reason = quiescence.delivery_disposition(
+                    delivery_id, self._deliveries
+                )
+                if disposition == quiescence.DELIVERY_RECOVER:
+                    self._audit_coordinator(
+                        run_logging.EVENT_DELIVERY_RECOVERY,
+                        delivery_id=delivery_id,
+                        dispatch_id=dispatch_id,
+                        task_id=task_id,
+                        reason_code=quiescence.DELIVERY_RECOVER,
+                        detail=reason,
+                    )
+                    raise OrcaRuntimeError(reason)
+                self._ack(delivery_id)
             return recorded
+
+        # ==== STEP 0b. DURABLE SETTLEMENT CLAIM =============================
+        # OS-44 (BUGFIX-I1-G1-1). Published BEFORE the first self.call(...) below, for
+        # the same reason claim_settlement() itself must run before it: from this point
+        # on a lifecycle command may have gone out, and a successor process that finds
+        # this record without a matching settled record must recover explicitly instead
+        # of repeating one. The write is fail-closed, so the claim cannot be missing
+        # while the commands it authorises go out.
+        self._record_delivery_settlement(
+            delivery_id,
+            DELIVERY_SETTLEMENT_CLAIMED_FIELD,
+            run_logging.EVENT_DELIVERY_SETTLEMENT_CLAIMED,
+            task_id=task_id,
+            dispatch_id=dispatch_id,
+        )
 
         # ==== STEP 1. read-only observation =================================
         if supervised:
@@ -2399,14 +3051,23 @@ class OrcaRuntimeHarness:
             observation["terminalState"] = terminal_state
             release_process_action = ""
 
-        # ==== STEP 3. delivery ack ==========================================
-        self._ack(delivery_id)
+        # ==== STEP 3. state + settlement reflection, COMPLETED before the ack ===
+        # OS-44 (BUGFIX-I1-G1-1). The acknowledgement used to sit HERE, above the axis
+        # accounting and the finalization below it. That ordering inverted the rule the
+        # ticket states: a crash or exception in account_axes(), the RuntimeAttempt
+        # construction or finalize_once() then landed AFTER a successful ack, so the
+        # runtime considered the delivery consumed, nothing would ever redeliver it,
+        # and the settlement ledger was left incomplete with no way back -- the
+        # delivery was simply lost. Reflection is therefore completed first and the ack
+        # is STEP 4; a failure anywhere in this block now leaves the delivery
+        # unacknowledged, which both blocks the next waiter and keeps the runtime's
+        # redelivery available as the recovery path.
+        #
         # Safe to index: STEP 1b proved this payload carries an explicit outcome from
         # SETTLED_OUTCOMES, above the mutation, so this read can no longer be the
         # first place a malformed worker_done is noticed.
         payload = json.loads(done["payload"])
 
-        # ==== STEP 4. axes + single-assignment finalization =================
         # The single allowed upward role transition, applied only after axis (a) has
         # confirmed a real completion for this dispatch.
         self.demote_or_promote_role(
@@ -2457,6 +3118,23 @@ class OrcaRuntimeHarness:
             cleanup_authority=axes[3],
             terminal_role=axes[4],
         )
+        # State and settlement are now fully reflected. Recorded durably here, in the
+        # one window where "settled but not yet acknowledged" is true, so a crash
+        # before the ack below is recovered as "acknowledge it, do nothing else"
+        # instead of as a second settlement.
+        self._record_delivery_settlement(
+            delivery_id,
+            DELIVERY_SETTLED_FIELD,
+            run_logging.EVENT_DELIVERY_SETTLED,
+            task_id=task_id,
+            dispatch_id=dispatch_id,
+        )
+
+        # ==== STEP 4. delivery ack ==========================================
+        # Only now, and before any next waiter: _check() refuses to arm one while this
+        # delivery is outstanding, so the contract's order -- reflect, acknowledge,
+        # then arm the next waiter -- is enforced by two gates rather than by comment.
+        self._ack(delivery_id)
         return attempt
 
     # ---- OS-17: run-scoped ORCHESTRATOR_LOG.md / TIMING_LOG.md -----------------
@@ -2475,6 +3153,288 @@ class OrcaRuntimeHarness:
             writer(*args, **kwargs)
         except Exception as error:  # noqa: BLE001 -- see the section note above
             self._logging_errors.append(f"{getattr(writer, '__name__', writer)}: {error}")
+
+    def _audit_coordinator(self, event: str, **fields: Any) -> None:
+        """One immutable record in this run's append-only Coordinator audit.
+
+        OS-44 (BUGFIX-I1-G1-2). Deliberately NOT routed through _safe_log, unlike every
+        other writer in this class. Section 9's "a logging failure never changes a
+        lifecycle decision" holds for logs that are only ever read by humans; this
+        family is different in kind, because it is the ONLY thing a successor process
+        can recover the delivery ledger from. Swallowing a publication failure here
+        would let processing and acknowledgement continue over an audit that no longer
+        describes them, and the next process would then read an already-settled
+        delivery as brand new -- the very defect this ticket removes, reintroduced by
+        the logging guard. The failure is recorded in self._logging_errors AND raised,
+        so the run stops at the boundary it could not record.
+
+        A record written before start_run() has no run to belong to and is dropped;
+        every OS-44 call site is inside a run.
+        """
+        if not self.run_id:
+            return
+        try:
+            run_logging.append_coordinator_audit_record(
+                self.run_id, event, dict(fields), base=self.artifact_dir
+            )
+        except Exception as error:  # noqa: BLE001 -- recorded and re-raised, never lost
+            self._logging_errors.append(f"append_coordinator_audit_record: {error}")
+            raise OrcaRuntimeError(
+                f"coordinator audit record {event!r} could not be published for run "
+                f"{self.run_id} ({error}); it is the only source a restarted "
+                "Coordinator can recover the delivery ledger from, so the run fails "
+                "closed here instead of continuing unrecoverably"
+            ) from error
+
+    def observe_orca_dispatch_state(self) -> dict[str, Any]:
+        """Orca's own answer to "what is running, and what is runnable?".
+
+        OS-44 (BUGFIX-I3-CRITICAL-1). The PR #31 review is right that the settlement
+        ledger cannot answer this: a Dispatch enters that ledger through
+        `claim_settlement()`, which runs only AFTER `wait_for_done()` has returned, so
+        a ledger row can only ever describe a Worker or Reviewer that has already
+        finished -- never one that is currently running. The authority is Orca's own
+        Task and Dispatch records, and the rule that reads them is the one the shipped
+        `run_workflow.py turn-end` boundary uses, not a second copy of it.
+        """
+        if not self.run_id:
+            return {"active_dispatches": [], "runnable_actions": [], "task_count": 0,
+                    "worker_count": 0}
+        tasks = self.call("orchestration", "task-list", "--run", self.run_id)[
+            "result"
+        ].get("tasks")
+        workers = self.call(
+            "orchestration", "worker-list", "--run", self.run_id, allow_error=True
+        )
+        return turn_boundary.classify_orca_state(
+            tasks, (workers.get("result") or {}).get("workers") if workers.get("ok") else []
+        )
+
+    def active_dispatch_count(self) -> int:
+        """Dispatches Orca reports as currently running for this run.
+
+        OS-44 (BUGFIX-I3-CRITICAL-1). Derived from `observe_orca_dispatch_state()` --
+        Orca's Task status crossed with the Dispatch's own worker row -- and no longer
+        from the settlement ledger, for the reason given there. The ledger count remains
+        available under its own name (`unfinalized_ledger_dispatches()`) for the
+        questions it can actually answer, but it is not this one.
+        """
+        return len(self.observe_orca_dispatch_state()["active_dispatches"])
+
+    def unfinalized_ledger_dispatches(self) -> int:
+        """Dispatches this Coordinator has claimed and not finalized.
+
+        The finalize-once ledger's own count. It answers "what has this process claimed
+        and not closed out?", which is a real question -- it is simply not the question
+        "is a Worker running right now?", and OS-44 iteration 3 stopped using it as if
+        it were.
+        """
+        return sum(
+            1
+            for row in self._ledger.values()
+            if row.get("state") not in {"finalized", None}
+        )
+
+    def verify_quiescence(
+        self,
+        run_status: str,
+        *,
+        next_node: str = "",
+        raise_on_violation: bool = True,
+    ) -> dict[str, Any]:
+        """OS-44. The self-check that runs immediately before the turn ends.
+
+        A Coordinator turn may only end at one of `quiescence.QUIESCENT_STATES`: an
+        active dispatch wait, WAITING_FOR_INPUT, BLOCKED, ESCALATED or COMPLETED (plus
+        the CANCELLED/ABANDONED terminal statuses and their SETTLED lifecycle
+        spelling). Ending anywhere else is the `run_c2166e75bb02` stall: a run that is
+        neither terminal nor waiting, with zero active agents and a runnable next node,
+        which nothing can wake.
+
+        The judgement itself is the runtime-neutral contract's; this method supplies
+        the two facts only the Coordinator holds -- how many dispatches are still
+        unfinalized, and which deliveries it has processed without acknowledging -- and
+        records the outcome either way. The verdict is returned as well as recorded so
+        a caller that legitimately wants to report rather than raise (an already-failing
+        error path, which must not have its original exception replaced) can pass
+        `raise_on_violation=False`.
+        """
+        verdict = quiescence.quiescence_verdict(
+            run_status=run_status,
+            next_node=next_node,
+            active_dispatches=self.active_dispatch_count(),
+            unacknowledged_deliveries=self.unacknowledged_deliveries(),
+        )
+        self._audit_coordinator(
+            run_logging.EVENT_QUIESCENCE_VERIFIED
+            if verdict["quiescent"]
+            else run_logging.EVENT_QUIESCENCE_VIOLATION,
+            run_status=run_status,
+            next_node=next_node,
+            active_dispatches=verdict["active_dispatches"],
+            reason_code=verdict["reason_code"],
+            detail=verdict["detail"],
+            delivery_id=(verdict["unacknowledged_deliveries"] or [""])[0],
+        )
+        if raise_on_violation and not verdict["quiescent"]:
+            raise OrcaRuntimeError(
+                f"coordinator turn may not end ({verdict['reason_code']}): "
+                f"{verdict['detail']}"
+            )
+        return verdict
+
+    def restore_delivery_ledger(self) -> dict[str, dict[str, Any]]:
+        """Rebuild the delivery ledger a previous PROCESS left in the run's audit.
+
+        The process-restart half of the contract. A fresh Coordinator over an existing
+        run starts with an empty in-memory ledger, so a redelivered and
+        already-acknowledged delivery would read as a first processing and be adopted
+        as the new waiter's result -- the same defect, one process later. Folding the
+        append-only audit forward restores which deliveries were processed, which were
+        acknowledged and how many times each was replayed.
+
+        Rows this process already holds win: a live row is newer than the artifact it
+        was derived from.
+
+        OS-44 (BUGFIX-I1-G1-2). An audit that cannot be READ is fatal, not a recorded
+        warning. This is the only source that can tell an already-processed delivery
+        from a new one; continuing without it means the next waiter may adopt a replay,
+        which is the defect itself. Callers reach this through
+        _restore_delivery_ledger_once() on the production wait path, so the recovery
+        cannot be skipped by forgetting to ask for it.
+
+        OS-44 (FINAL-R1). The replay itself now refuses a published audit record it
+        cannot fold verbatim, and it signals that with ``CoordinatorAuditError``. That
+        type is named in the except clause rather than left to its ``ValueError`` base,
+        because "a corrupt record reaches this handler and is converted into a refusal
+        BEFORE any waiter is armed" is the property being relied on, not an incidental
+        consequence of an exception hierarchy.
+        """
+        if not self.run_id:
+            return dict(self._deliveries)
+        try:
+            restored = run_logging.replay_delivery_ledger(
+                self.run_id, base=self.artifact_dir
+            )
+        except (OSError, run_logging.CoordinatorAuditError, ValueError) as error:
+            self._logging_errors.append(f"replay_delivery_ledger: {error}")
+            raise OrcaRuntimeError(
+                f"the coordinator audit for run {self.run_id} could not be read "
+                f"({error}); it is the only source that distinguishes an "
+                "already-processed delivery from a new one, so the Coordinator fails "
+                "closed rather than arm a waiter that could adopt a replay"
+            ) from error
+        for delivery_id, row in restored.items():
+            if delivery_id in self._deliveries:
+                continue
+            self._deliveries[delivery_id] = {
+                "delivery_id": delivery_id,
+                "task_id": row.get("task_id", ""),
+                "dispatch_id": row.get("dispatch_id", ""),
+                "message_id": "",
+                # OS-44 (BUGFIX-I3-MAJOR-1). The folded state is carried VERBATIM. It
+                # used to default to `acknowledged` when the audit named no state, which
+                # is the one direction a recovery must never guess in: it turned "the
+                # audit does not say this was acknowledged" into "it was", and that is
+                # exactly how the post-wire-ack crash window stayed invisible. A blank
+                # state now stays blank and `quiescence.delivery_obligation` decides
+                # what is owed from how far the predecessor actually got.
+                DELIVERY_STATE_FIELD: row.get(DELIVERY_STATE_FIELD) or "",
+                "replays": int(row.get("replays") or 0),
+                "ack_attempts": 0,
+                "ack_error": "",
+                DELIVERY_SETTLEMENT_CLAIMED_FIELD: bool(
+                    row.get(DELIVERY_SETTLEMENT_CLAIMED_FIELD)
+                ),
+                DELIVERY_SETTLED_FIELD: bool(row.get(DELIVERY_SETTLED_FIELD)),
+                DELIVERY_ACK_INTENT_FIELD: bool(row.get(DELIVERY_ACK_INTENT_FIELD)),
+                DELIVERY_RECOVERED_FIELD: True,
+            }
+        self._deliveries_restored_for = self.run_id
+        return dict(self._deliveries)
+
+    def _restore_delivery_ledger_once(self) -> None:
+        """Recover the predecessor process's delivery ledger, once, before any waiter.
+
+        OS-44 (BUGFIX-I1-G1-2). Called by _check(), which is the single point every
+        `check --wait` in this class goes through, so restart recovery belongs to the
+        production wait path rather than to a helper a caller has to remember. A run
+        this process created marks itself recovered in start_run(); a run it merely
+        BOUND (resume_run) is recovered here, or by resume_run itself, whichever comes
+        first -- and either way strictly before a waiter can be armed.
+        """
+        if not self.run_id or self._deliveries_restored_for == self.run_id:
+            return
+        self.restore_delivery_ledger()
+        # OS-44 (BUGFIX-I3-MAJOR-1). Recovery is not finished when the rows are back:
+        # an acknowledgement a predecessor left open has to be CLOSED, not merely
+        # observed. Closing it here -- inside the once-only restore, which both _check()
+        # and resume_run() go through -- is what makes the post-wire-ack crash window
+        # recoverable without depending on the runtime redelivering anything, and what
+        # stops a successor proceeding over an obligation it never recorded an outcome
+        # for.
+        self.reconcile_recovered_acknowledgements()
+
+    def resume_run(
+        self,
+        run_id: str,
+        *,
+        run_owner: str,
+        requested_phases: tuple[str, ...] = (),
+    ) -> str:
+        """Bind a successor Coordinator process to an EXISTING Run, and recover.
+
+        OS-44 (BUGFIX-I1-G1-2). start_run() creates a new Run and is therefore not the
+        path a restarted Coordinator takes; this is. A successor's in-memory delivery
+        ledger is empty, so without recovery a redelivered, already-handled delivery
+        reads as a first processing and is adopted as the new waiter's result -- the
+        recorded defect, one process later. The recovery happens HERE, before this
+        method returns and therefore before any caller can reach `check --wait`, and it
+        fails closed when the audit it depends on cannot be read.
+        """
+        if not run_id:
+            raise OrcaRuntimeError("resume_run requires the id of an existing Run")
+        for candidate in requested_phases:
+            require_workflow_phase(candidate, field="requested_phases")
+        self.run_id = run_id
+        self.run_owner = run_owner
+        # OS-44 (BUGFIX-I4-R1-REAL-PATH). A successor process is a NEW Claude Code
+        # session driving an OLD Run, so it publishes its own binding here for the same
+        # reason start_run() does: the predecessor's binding names the predecessor's
+        # session and cannot gate this one's turn ends.
+        self._bind_turn_boundary_session()
+        self.requested_phases = tuple(requested_phases)
+        # A fresh process holds no rows for this run. Stated rather than assumed, so
+        # binding a second run on one instance cannot inherit the first run's ledger.
+        self._deliveries = {}
+        self._deliveries_restored_for = ""
+        if run_owner not in self._terminals:
+            self.register_terminal(
+                run_owner, role="run_owner_fixture", origin="adopted"
+            )
+        self._restore_delivery_ledger_once()
+        return run_id
+
+    def _bind_turn_boundary_session(self) -> str:
+        """Publish the durable session -> Run binding the turn-end Stop hook reads.
+
+        OS-44 (BUGFIX-I4-R1-REAL-PATH). The registered hook is fired by the runtime for
+        a session, and the runtime has no idea which Orca Run that session drives; this
+        record is how it finds out. Written where the run's other durable state lives,
+        keyed by the session id Claude Code exports into this process and sends in the
+        hook payload, so the two are the same value by construction.
+
+        Returns the path written, or "" when there was nothing to bind or the record
+        could not be published. Never raises: this is a convenience for a hook that is
+        opt-in, and it may not be able to fail a Run.
+        """
+        try:
+            path = turn_boundary.bind_session_run(
+                self.run_id or "", artifact_base=self.artifact_dir
+            )
+        except Exception:  # noqa: BLE001 - a binding may never fail a Run
+            return ""
+        return str(path) if path is not None else ""
 
     def _emit_timing_row(self, **fields: Any) -> None:
         """The writer RunTimingTracker emits phase/iteration boundary rows through.
@@ -3282,7 +4242,7 @@ class OrcaRuntimeHarness:
             phase or "", iteration, opened_at=dispatch_started_at
         )
         dispatch_id, supervised = self.start_worker(task_id, handle, spec)
-        done, delivery_id = self.wait_for_done(dispatch_id)
+        done, delivery_id = self.wait_for_done(dispatch_id, task_id)
         attempt = self.settle_attempt(
             role,
             iteration,
@@ -3769,6 +4729,15 @@ class OrcaRuntimeHarness:
         # ESCALATED); log_run_status() still fails closed if that ever stops
         # being true, before self.run_id is cleared below.
         self.log_run_status(result.status, reason="; ".join(result.recovery))
+        # ---- OS-44. The quiescence self-check, immediately before the turn ends and
+        # after every artifact this run owes has been written. `result.status` is one
+        # of run_logging.RUN_STATUS_VALUES for every scenario this harness defines --
+        # all of them terminal or WAITING_FOR_INPUT -- so this reports rather than
+        # raises on the normal path; it raises exactly when the run is about to be left
+        # idle, non-terminal and unwakeable, or with a delivery still unacknowledged.
+        # It runs BEFORE the per-run state below is cleared, because clearing it first
+        # would make every turn look quiescent.
+        self.verify_quiescence(result.status)
         self.run_owner = None
         self.run_id = None
         self._timing = None
@@ -3776,6 +4745,8 @@ class OrcaRuntimeHarness:
         self._signals = []
         self._terminals = {}
         self._ledger = {}
+        self._deliveries = {}
+        self._deliveries_restored_for = ""
         return result
 
     def _release_terminated_process(self, handle: str) -> bool:

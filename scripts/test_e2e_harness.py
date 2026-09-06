@@ -1246,6 +1246,37 @@ def strip_os29_log_additions(log: str) -> str:
     return "\n".join(kept)
 
 
+class _SequentialDeliveryExec(_RecordingExec):
+    """``_RecordingExec`` whose mailbox hands back a FRESH delivery id per wait.
+
+    The base recorder pins one ``deliveryId`` for every ``check``, which is fine for a
+    test that drives ONE dispatch and wrong for this fixture, which drives one per
+    requested phase through the same harness.  A real Orca mailbox never reuses a
+    delivery id for a new batch, and a stub that does is indistinguishable from a
+    runtime redelivering an already-acknowledged batch forever -- which the OS-44
+    delivery loop correctly refuses after a bounded number of replays.
+
+    Only the id varies.  The messages, and therefore every byte this fixture captures,
+    are the base recorder's unchanged.
+    """
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._delivered = 0
+
+    def __call__(self, args):
+        args = tuple(args)
+        verb = args[1] if len(args) > 1 else args[0]
+        if verb == "check" and "--ack" not in args:
+            self._delivered += 1
+            pinned = self.results.get("check") or {}
+            self.results = {
+                **self.results,
+                "check": {**pinned, "deliveryId": f"dlv_{self._delivered}"},
+            }
+        return super().__call__(args)
+
+
 def capture_orchestrator_log(skill_name, phases, routing=None) -> str:
     """The real ORCHESTRATOR_LOG.md for THIS fixture's own phase sequence.
 
@@ -1262,7 +1293,7 @@ def capture_orchestrator_log(skill_name, phases, routing=None) -> str:
         return ""
     with tempfile.TemporaryDirectory() as directory:
         artifacts = Path(directory)
-        recorder = _RecordingExec(
+        recorder = _SequentialDeliveryExec(
             results={
                 "run-create": {"run": {"id": "run_golden"}},
                 "check": _RecordingExec.ACCEPTED_DONE,

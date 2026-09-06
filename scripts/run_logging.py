@@ -2158,6 +2158,355 @@ def open_decision_ledger(
     return root
 
 
+# ---- OS-44: the run-scoped, append-only Coordinator delivery/quiescence audit -------
+# The third append-only record family in this module, and it INHERITS its mechanics
+# from the two above rather than inventing a third scheme: one immutable record per
+# published sequence key, staged then published by one os.rename (so a published key IS
+# a complete record), never edited, and a correction is a NEW record under a NEW key.
+#
+# What is new is the subject.  ORCHESTRATOR_LOG.md records what a dispatch DID;
+# decision_ledger/ records what a boundary DECIDED.  Neither records what the
+# Coordinator's own message loop did with a delivery -- which is why the recorded
+# `run_c2166e75bb02` stall left no evidence of `delivery_5c541e7fe1bd` having been
+# processed and never acknowledged.  This family answers exactly that: which deliveries
+# were processed, which were acknowledged and after how many attempts, which were
+# refused as not belonging to the waiting waiter, which were replays that took no
+# lifecycle action, and what the quiescence self-check concluded immediately before the
+# Coordinator turn ended.
+#
+# It is an AUDIT, not a gate.  It records outcomes that were already decided elsewhere;
+# nothing in this module may change a lifecycle decision, and a write failure here must
+# never turn an already-settled Dispatch into an apparent failure (the same rule
+# section 9 states for ORCHESTRATOR_LOG.md).
+COORDINATOR_AUDIT_DIRNAME = "coordinator_audit"
+COORDINATOR_AUDIT_RECORD_FILENAME = "record.json"
+COORDINATOR_AUDIT_SCHEMA_VERSION = "1.0"
+# Same width and same allocation bound as the decision ledger: a plain directory
+# listing sorts in audit order without parsing anything.
+COORDINATOR_AUDIT_KEY_WIDTH = 6
+COORDINATOR_AUDIT_MAX_ALLOCATION_ATTEMPTS = 8
+
+# The closed event vocabulary.  An unknown event is refused at the writer rather than
+# published, for the same reason ROUND_KIND_VALUES is enforced: a typo that reaches the
+# artifact is a column that silently stops being queryable.
+EVENT_DELIVERY_PROCESSED = "delivery_processed"
+EVENT_DELIVERY_ACKNOWLEDGED = "delivery_acknowledged"
+EVENT_DELIVERY_ACK_RETRY = "delivery_ack_retry"
+EVENT_DELIVERY_ACK_FAILED = "delivery_ack_failed"
+# OS-44 (BUGFIX-I3-MAJOR-1).  The wire acknowledgement's INTENT, published strictly
+# BEFORE the `orca orchestration check --ack` command.  Orca accepts that command and
+# consumes the delivery before this process can publish anything about it, so without
+# an intent record an audit that ends at `delivery_settled` cannot distinguish "the ack
+# never went out, Orca still holds the delivery and will replay it" from "the ack went
+# out, Orca consumed the delivery, and the acknowledgement outcome this run owes was
+# never recorded".  A successor that cannot tell those apart either re-drives a consumed
+# delivery or silently drops the obligation, which is the finding.
+EVENT_DELIVERY_ACK_INTENT = "delivery_ack_intent"
+# The successor's terminal record for an acknowledgement its PREDECESSOR left open.
+# Written after the idempotent wire ack is re-issued, and it never depends on the
+# runtime redelivering anything.
+EVENT_DELIVERY_ACK_RECONCILED = "delivery_ack_reconciled"
+EVENT_DELIVERY_REPLAYED = "delivery_replayed"
+EVENT_DELIVERY_MISMATCH = "delivery_mismatch"
+# The two settlement-progress records.  They are what makes a crash recoverable at
+# EVERY boundary rather than only at the convenient ones: the claim is published before
+# the settlement path's first command, and the settled record is published after state
+# and settlement are fully reflected and BEFORE the acknowledgement.  A successor
+# process folds them forward and can then tell "nothing was mutated for this delivery"
+# (process it again) from "a lifecycle command may already have gone out" (recover
+# explicitly) from "it was settled, only the ack is missing" (acknowledge, do nothing).
+EVENT_DELIVERY_SETTLEMENT_CLAIMED = "delivery_settlement_claimed"
+EVENT_DELIVERY_SETTLED = "delivery_settled"
+# The restart-recovery decision itself, carrying the disposition as its reason code.
+EVENT_DELIVERY_RECOVERY = "delivery_recovery"
+EVENT_QUIESCENCE_VERIFIED = "quiescence_verified"
+EVENT_QUIESCENCE_VIOLATION = "quiescence_violation"
+COORDINATOR_AUDIT_EVENTS = (
+    EVENT_DELIVERY_PROCESSED,
+    EVENT_DELIVERY_ACKNOWLEDGED,
+    EVENT_DELIVERY_ACK_RETRY,
+    EVENT_DELIVERY_ACK_FAILED,
+    EVENT_DELIVERY_ACK_INTENT,
+    EVENT_DELIVERY_ACK_RECONCILED,
+    EVENT_DELIVERY_REPLAYED,
+    EVENT_DELIVERY_MISMATCH,
+    EVENT_DELIVERY_SETTLEMENT_CLAIMED,
+    EVENT_DELIVERY_SETTLED,
+    EVENT_DELIVERY_RECOVERY,
+    EVENT_QUIESCENCE_VERIFIED,
+    EVENT_QUIESCENCE_VIOLATION,
+)
+
+
+class CoordinatorAuditError(RunLoggingError):
+    """A Coordinator audit record was refused before anything was published."""
+
+
+def coordinator_audit_dir(run_id: str, *, base: Path | None = None) -> Path:
+    """artifacts/runs/<run_id>/coordinator_audit/, provisioning the run root."""
+    return _ensure_run_artifact_root(run_id, base=base) / COORDINATOR_AUDIT_DIRNAME
+
+
+def coordinator_audit_sequence_key(sequence: int) -> str:
+    """The published directory name for one sequence."""
+    if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 0:
+        raise CoordinatorAuditError(
+            f"an audit sequence must be a non-negative integer, got {sequence!r}"
+        )
+    return f"{sequence:0{COORDINATOR_AUDIT_KEY_WIDTH}d}"
+
+
+def append_coordinator_audit_record(
+    run_id: str, event: str, record: dict, *, base: Path | None = None
+) -> tuple[Path, int]:
+    """Allocate the next free sequence and publish ONE immutable audit record.
+
+    Never edits a published record.  A second writer that claims an already-published
+    sequence receives ``FinalReviewAuditCollision`` from the shared publisher and this
+    function retries with the next free sequence, bounded -- so two processes sharing a
+    run id get two different sequences and neither overwrites the other.
+
+    Returns (published directory, sequence).
+    """
+    if event not in COORDINATOR_AUDIT_EVENTS:
+        raise CoordinatorAuditError(
+            f"unknown coordinator audit event: {event!r}; expected one of "
+            f"{list(COORDINATOR_AUDIT_EVENTS)}"
+        )
+    if not isinstance(record, dict):
+        raise CoordinatorAuditError("a coordinator audit record must be a dict")
+    audit_dir = coordinator_audit_dir(run_id, base=base)
+    audit_dir.mkdir(parents=True, exist_ok=True)
+    existing = _published_ledger_keys(audit_dir)
+    sequence = (existing[-1] + 1) if existing else 0
+    for _attempt in range(COORDINATOR_AUDIT_MAX_ALLOCATION_ATTEMPTS):
+        key = coordinator_audit_sequence_key(sequence)
+        payload = dict(record)
+        payload["sequence"] = sequence
+        payload["event"] = event
+        payload["run_id"] = run_id
+        payload["audit_schema_version"] = COORDINATOR_AUDIT_SCHEMA_VERSION
+        payload.setdefault("recorded_at", now_iso())
+        text = json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+        try:
+            published = _stage_and_publish_audit_record(
+                audit_dir, key, {COORDINATOR_AUDIT_RECORD_FILENAME: text}
+            )
+        except FinalReviewAuditCollision:
+            sequence = _published_ledger_keys(audit_dir)[-1] + 1
+            continue
+        return published, sequence
+    key = coordinator_audit_sequence_key(sequence)
+    raise DecisionLedgerCollision(key, audit_dir / key)
+
+
+def read_coordinator_audit(run_id: str, *, base: Path | None = None) -> list[dict]:
+    """Every published audit record, ordered by ``sequence``.  Provisions nothing.
+
+    A record whose JSON cannot be parsed is returned as a sentinel rather than dropped,
+    for the same reason the decision ledger's reader keeps one: dropping it would turn
+    a corrupt record into an absence, and an absence reads as "nothing happened".
+    """
+    audit_dir = (
+        (Path(base) if base is not None else Path("."))
+        / "artifacts"
+        / "runs"
+        / run_id
+        / COORDINATOR_AUDIT_DIRNAME
+    )
+    records: list[dict] = []
+    for sequence in _published_ledger_keys(audit_dir):
+        path = (
+            audit_dir
+            / f"{sequence:0{COORDINATOR_AUDIT_KEY_WIDTH}d}"
+            / COORDINATOR_AUDIT_RECORD_FILENAME
+        )
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            records.append(
+                {"sequence": sequence, "_unreadable": " ".join(str(error).split())}
+            )
+            continue
+        if not isinstance(payload, dict):
+            records.append({"sequence": sequence, "_unreadable": "not a JSON object"})
+            continue
+        records.append(payload)
+    records.sort(key=lambda record: record.get("sequence", 0))
+    return records
+
+
+# The audit events whose whole purpose is to say something about ONE delivery.  A
+# published record carrying one of these without a usable delivery id cannot be folded
+# into the ledger at all, so it is refused rather than skipped (see
+# _refuse_unfoldable_audit_record).  The quiescence events are deliberately absent:
+# they carry a delivery id only when a turn end was refused because one was still
+# outstanding, and an empty slot there is a legitimate "none", not damage.
+DELIVERY_IDENTIFIED_AUDIT_EVENTS = (
+    EVENT_DELIVERY_PROCESSED,
+    EVENT_DELIVERY_ACKNOWLEDGED,
+    EVENT_DELIVERY_ACK_RETRY,
+    EVENT_DELIVERY_ACK_FAILED,
+    EVENT_DELIVERY_ACK_INTENT,
+    EVENT_DELIVERY_ACK_RECONCILED,
+    EVENT_DELIVERY_REPLAYED,
+    EVENT_DELIVERY_MISMATCH,
+    EVENT_DELIVERY_SETTLEMENT_CLAIMED,
+    EVENT_DELIVERY_SETTLED,
+    EVENT_DELIVERY_RECOVERY,
+)
+
+
+def _refuse_unfoldable_audit_record(record: dict, run_id: str) -> None:
+    """Raise unless this published record can be folded into the delivery ledger.
+
+    OS-44 (FINAL-R1).  ``read_coordinator_audit()`` deliberately keeps a record it
+    could not parse as an ``_unreadable`` sentinel instead of dropping it, precisely so
+    that a corrupt record cannot masquerade as an absence.  The replay below has to
+    honour that: a fold that merely skips what it does not understand converts the
+    sentinel back into the absence the reader refused to produce, and an absence reads
+    as "this delivery was never processed".  That is the ticket's own defect one layer
+    down -- a successor Coordinator would classify a redelivered, already-settled
+    delivery as new and adopt it.  This audit is the SOLE restart source, so anything
+    in it that cannot be folded VERBATIM fails closed here, before a ledger is returned
+    and therefore before any waiter can be armed.
+
+    An absent audit is not damage.  A run with no records at all folds to an empty
+    ledger and raises nothing: an empty history is a legitimate state, an unreadable
+    one is not.
+    """
+    sequence = record.get("sequence")
+    where = f"coordinator audit record {sequence!r} of run {run_id!r}"
+    unreadable = record.get("_unreadable")
+    if unreadable is not None:
+        raise CoordinatorAuditError(
+            f"{where} could not be read ({unreadable}); the coordinator audit is the "
+            "only source that distinguishes an already-processed delivery from a new "
+            "one, so the delivery ledger is refused rather than silently truncated"
+        )
+    if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 0:
+        raise CoordinatorAuditError(
+            f"{where} carries no usable sequence, so the audit cannot be folded in "
+            "order; the delivery ledger is refused rather than silently truncated"
+        )
+    if record.get("audit_schema_version") != COORDINATOR_AUDIT_SCHEMA_VERSION:
+        raise CoordinatorAuditError(
+            f"{where} declares audit schema "
+            f"{record.get('audit_schema_version')!r}, not "
+            f"{COORDINATOR_AUDIT_SCHEMA_VERSION!r}; its fields cannot be folded "
+            "safely, so the delivery ledger is refused rather than silently truncated"
+        )
+    if record.get("run_id") != run_id:
+        raise CoordinatorAuditError(
+            f"{where} belongs to run {record.get('run_id')!r}; a record filed under "
+            "another run cannot describe this one, so the delivery ledger is refused "
+            "rather than silently truncated"
+        )
+    event = record.get("event")
+    if event not in COORDINATOR_AUDIT_EVENTS:
+        raise CoordinatorAuditError(
+            f"{where} carries unknown event {event!r}; the writer refuses an unknown "
+            f"event, so a published one is damage -- expected one of "
+            f"{list(COORDINATOR_AUDIT_EVENTS)}"
+        )
+    delivery_id = record.get("delivery_id", "")
+    if delivery_id is not None and not isinstance(delivery_id, str):
+        raise CoordinatorAuditError(
+            f"{where} carries a non-string delivery id {delivery_id!r}; the delivery "
+            "ledger is refused rather than folded under an identity it cannot trust"
+        )
+    if event in DELIVERY_IDENTIFIED_AUDIT_EVENTS and not delivery_id:
+        raise CoordinatorAuditError(
+            f"{where} is a {event!r} record with no delivery id; it says something "
+            "about a delivery this fold can no longer name, so the delivery ledger is "
+            "refused rather than silently truncated"
+        )
+    for field in ("task_id", "dispatch_id"):
+        value = record.get(field)
+        if value is not None and not isinstance(value, str):
+            raise CoordinatorAuditError(
+                f"{where} carries a non-string {field} {value!r}; the delivery ledger "
+                "is refused rather than folded from a field it cannot trust"
+            )
+    replays = record.get("replays")
+    if event == EVENT_DELIVERY_REPLAYED and (
+        replays is not None
+        and (isinstance(replays, bool) or not isinstance(replays, int))
+    ):
+        raise CoordinatorAuditError(
+            f"{where} carries a non-integer replay count {replays!r}; the delivery "
+            "ledger is refused rather than folded from a field it cannot trust"
+        )
+
+
+def replay_delivery_ledger(run_id: str, *, base: Path | None = None) -> dict[str, dict]:
+    """Rebuild the delivery ledger a previous process left behind.
+
+    This is the process-restart half of the OS-44 contract.  A Coordinator that starts
+    fresh over an existing run has an EMPTY in-memory delivery ledger, so without this
+    it would read a redelivered, already-acknowledged delivery as a first processing and
+    adopt it as the current waiter's result -- the exact defect, one process later.
+    Folding the append-only audit forward in sequence order restores which deliveries
+    were processed, which were acknowledged, and how many times each was replayed.
+
+    Returns ``{delivery_id: {"delivery_state", "replays", "task_id", "dispatch_id",
+    "settlement_claimed", "settled", "ack_intent"}}``.  The state slot is named
+    ``delivery_state`` rather than ``state`` because the Coordinator keeps a separate per-Dispatch
+    finalize-once ledger whose rows carry a ``state`` slot, and the two must stay
+    distinguishable in the source.  The two boolean slots are how far the previous
+    process got with THIS delivery's settlement, which is what lets the successor
+    choose between processing it again, recovering explicitly, and acknowledging a
+    delivery whose work is already done.
+
+    OS-44 (FINAL-R1).  Raises ``CoordinatorAuditError`` -- a ``ValueError`` -- when ANY
+    published record in the audit cannot be folded verbatim, before returning a ledger.
+    Skipping such a record would hand back a silently truncated history, and a
+    truncated history is indistinguishable from "this delivery is new", which is the
+    stale-delivery adoption this ticket exists to prevent.  A run with no audit at all
+    is not damage and still folds to an empty ledger.
+    """
+    ledger: dict[str, dict] = {}
+    for record in read_coordinator_audit(run_id, base=base):
+        _refuse_unfoldable_audit_record(record, run_id)
+        delivery_id = record.get("delivery_id") or ""
+        if not delivery_id:
+            continue
+        row = ledger.setdefault(
+            delivery_id,
+            {
+                "delivery_id": delivery_id,
+                "delivery_state": "",
+                "replays": 0,
+                "task_id": record.get("task_id") or "",
+                "dispatch_id": record.get("dispatch_id") or "",
+                "settlement_claimed": False,
+                "settled": False,
+                "ack_intent": False,
+            },
+        )
+        event = record.get("event")
+        if event == EVENT_DELIVERY_PROCESSED:
+            row["delivery_state"] = "processed"
+        elif event == EVENT_DELIVERY_ACKNOWLEDGED:
+            row["delivery_state"] = "acknowledged"
+        elif event == EVENT_DELIVERY_ACK_FAILED:
+            row["delivery_state"] = "ack_failed"
+        elif event == EVENT_DELIVERY_ACK_INTENT:
+            # A state, not a slot flip only: an intent with no outcome after it is what
+            # a successor has to see as an OPEN acknowledgement rather than as silence.
+            row["ack_intent"] = True
+            row["delivery_state"] = "ack_intent"
+        elif event == EVENT_DELIVERY_ACK_RECONCILED:
+            row["delivery_state"] = "ack_reconciled"
+        elif event == EVENT_DELIVERY_SETTLEMENT_CLAIMED:
+            row["settlement_claimed"] = True
+        elif event == EVENT_DELIVERY_SETTLED:
+            row["settled"] = True
+        elif event == EVENT_DELIVERY_REPLAYED:
+            row["replays"] = max(int(row.get("replays") or 0), int(record.get("replays") or 0))
+    return ledger
+
+
 # ---- OS-29 P-2: the Markdown summary against the machine record --------------------
 DECISION_RECORD_SECTION = re.compile(
     r"(?ms)^##\s+Decision Record\b[^\n]*\n(?P<body>.*?)(?=^##\s+|\Z)"
@@ -3276,6 +3625,53 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     audit_export.add_argument("--out", default="")
 
+    # OS-44. Two surfaces for the Coordinator delivery/quiescence audit. The write
+    # command is deliberately event-first with a free-form --detail: this family
+    # RECORDS outcomes that were already decided by the delivery loop and the
+    # quiescence self-check, so nothing here re-derives or re-judges them.
+    coordinator_audit = subparsers.add_parser(
+        "coordinator-audit-write",
+        help=(
+            "append one immutable record to this run's Coordinator delivery/"
+            "quiescence audit"
+        ),
+    )
+    coordinator_audit.add_argument("--run-id", required=True)
+    coordinator_audit.add_argument(
+        "--base", default=None, help="defaults to the current directory"
+    )
+    coordinator_audit.add_argument(
+        "--event", required=True, choices=COORDINATOR_AUDIT_EVENTS
+    )
+    coordinator_audit.add_argument("--delivery-id", default="")
+    coordinator_audit.add_argument("--task-id", default="")
+    coordinator_audit.add_argument("--dispatch-id", default="")
+    coordinator_audit.add_argument("--message-id", default="")
+    coordinator_audit.add_argument("--phase", default="")
+    coordinator_audit.add_argument("--role", default="")
+    coordinator_audit.add_argument("--iteration", default="")
+    coordinator_audit.add_argument("--run-status", default="")
+    coordinator_audit.add_argument("--next-node", default="")
+    coordinator_audit.add_argument("--active-dispatches", default=None, type=int)
+    coordinator_audit.add_argument("--attempts", default=None, type=int)
+    coordinator_audit.add_argument("--replays", default=None, type=int)
+    coordinator_audit.add_argument("--reason-code", default="")
+    coordinator_audit.add_argument("--detail", default="")
+
+    coordinator_audit_read = subparsers.add_parser(
+        "coordinator-audit-read",
+        help="print this run's Coordinator delivery/quiescence audit as JSON",
+    )
+    coordinator_audit_read.add_argument("--run-id", required=True)
+    coordinator_audit_read.add_argument(
+        "--base", default=None, help="defaults to the current directory"
+    )
+    coordinator_audit_read.add_argument(
+        "--ledger",
+        action="store_true",
+        help="fold the audit forward into the delivery ledger a restart must restore",
+    )
+
     status = subparsers.add_parser(
         "run-status", help="append the one run-end row to both logs"
     )
@@ -3367,6 +3763,37 @@ def main(argv: list[str] | None = None) -> int:
                 ensure_ascii=False,
             )
         )
+        return 0
+    elif args.command == "coordinator-audit-write":
+        record = {
+            "delivery_id": args.delivery_id,
+            "task_id": args.task_id,
+            "dispatch_id": args.dispatch_id,
+            "message_id": args.message_id,
+            "phase": args.phase,
+            "role": args.role,
+            "iteration": args.iteration,
+            "run_status": args.run_status,
+            "next_node": args.next_node,
+            "reason_code": args.reason_code,
+            "detail": args.detail,
+        }
+        if args.active_dispatches is not None:
+            record["active_dispatches"] = args.active_dispatches
+        if args.attempts is not None:
+            record["attempts"] = args.attempts
+        if args.replays is not None:
+            record["replays"] = args.replays
+        path, _sequence = append_coordinator_audit_record(
+            args.run_id, args.event, record, base=base
+        )
+    elif args.command == "coordinator-audit-read":
+        payload = (
+            replay_delivery_ledger(args.run_id, base=base)
+            if args.ledger
+            else read_coordinator_audit(args.run_id, base=base)
+        )
+        print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
         return 0
     elif args.command == "final-review-audit-export":
         path = export_final_review_evidence(

@@ -241,6 +241,7 @@ phase 전이, phase gate, correction loop, iteration budget, Final Review routin
     "## 5. Agent Policy",
     "## Decision Policy",
     "### Completed Worker Lifecycle",
+    "## Coordinator Turn Quiescence and Delivery Ack Ordering (OS-44)",
     "## 14. Mandatory Test Gates",
     "## 15. Repository / Security Policy",
     "## Structured Human Clarification (OS-30)"
@@ -2540,6 +2541,427 @@ run_workflow.py resume --run-id RUN_ID [--artifact-base DIR] [--cancel | --aband
 LangGraph가 없으면 `discover`는 동작하되 모든 verdict가 `CHECKPOINT_UNVERIFIED`이고,
 `resume`은 claim을 잡기 전에 `LANGGRAPH_DEPENDENCY_MISSING`으로 거부된다.
 
+## Coordinator Turn Quiescence and Delivery Ack Ordering (OS-44)
+
+이 절은 routing 결정이 아니라 Coordinator loop의 **안전 규칙**이다. 어떤 node로 갈지는 여전히
+deterministic workflow engine이 정한다. 이 절이 규정하는 것은 "engine이 다음 할 일을 돌려줬는데
+Coordinator가 자기 turn을 끝내 버리는" 상황과 "delivery를 처리해 놓고 ack하지 않아 다음 waiter가
+그것을 자기 결과로 착각하는" 상황, 두 가지뿐이다.
+
+### 왜 있는가
+
+실제 run `run_c2166e75bb02`에서 Coordinator는 ANALYSIS Reviewer PASS를 settlement한 뒤 PLAN
+Task를 만들기 전에 turn을 끝냈다. Run은 terminal도 `WAITING_FOR_INPUT`도 아니었고 active agent가
+0이었으므로 그 run을 깨울 수 있는 것이 아무것도 없었다. 약 33분 정지했고 사용자 메시지 이후에만
+재개됐다. 재개 과정에서 ANALYSIS re-review delivery `delivery_5c541e7fe1bd`가 처리되고도 ack되지
+않았던 사실이 확인됐다. 새 PLAN waiter가 그 stale delivery로 즉시 깨어났고, completed ledger가
+중복 lifecycle action은 막았지만 wait cycle은 잘못 소비됐다.
+
+두 증상은 한 결함의 두 얼굴이다. 하나는 turn을 끝낼 자격, 다른 하나는 delivery 처리와 ack의 순서다.
+
+### Run-to-quiescence invariant
+
+Coordinator는 다음 상태 중 하나에 도달하기 전에는 자기 turn을 끝내지 않는다.
+
+1. active dispatch wait — 아직 finalize되지 않은 Dispatch가 있고 그것을 기다리는 중이다.
+2. `WAITING_FOR_INPUT` — durable human decision pause. (OS-31)
+3. `BLOCKED`
+4. `ESCALATED`
+5. `COMPLETED`
+
+`CANCELLED` / `ABANDONED`(OS-31이 추가한 terminal status)와 그 lifecycle 표기인 `SETTLED`,
+그리고 복구되지 않은 오류로 끝난 `ERROR`도 끝난 run이므로 같은 자격을 갖는다.
+
+- 실행 가능한 next node가 있고 active dispatch가 0이면, 같은 turn에서 그 다음 action 또는 active
+  wait까지 진행한다. 진행 보고만 남기고 끝내는 것은 이 규칙 위반이며, 자연어 요약은 turn을 끝낼
+  근거가 되지 못한다.
+- next node가 없더라도 non-terminal / non-waiting run을 active dispatch 없이 idle로 남기지 않는다.
+  깨울 수 있는 것이 아무것도 없는 상태는 next node 유무와 무관하게 위반이다.
+- turn 종료 **직전에** quiescence self-check를 실행하고 그 결과를 audit에 기록한다. 판정이 나중에
+  오면 그것은 gate가 아니라 사후 보고다.
+
+### 실행 가능한 turn-end boundary (`run_workflow.py turn-end`)
+
+위 invariant는 산문이 아니라 **실행되는 명령**으로 강제한다. Coordinator는 응답을 반환하기 직전에
+다음을 호출하고, 종료 코드가 0이 아니면 turn을 끝내지 않는다.
+
+```text
+python3 tools/run_workflow.py turn-end --run-id RUN_ID [--artifact-base DIR]
+       [--declare COMPLETED|BLOCKED|ESCALATED|WAITING_FOR_INPUT|...] [--next-node TOKEN] [--json]
+exit 0 = turn을 끝내도 된다 | exit 1 = 거부 | exit 3 = 권위 있는 state를 읽지 못해 판정 없음
+```
+
+이 명령은 한 번의 호출 안에서 다음을 **직접 조회해서** 판정한다. 도출되는 축은 active dispatch,
+runnable work, outstanding delivery, durable wait — 넷 모두 run의 durable state에서 나온다.
+**호출자가 제공하는 입력은 `--declare`(status)와 `--next-node` 둘뿐이다.** `--next-node`는 runnable
+work를 추가만 하므로 판정을 느슨하게 만들지 못한다. `--declare`는 durable OS-40 checkpoint도 OS-31
+pause record도 없는 run — prompt-driven Coordinator의 통상적인 경우 — 에서는 반증할 authority가
+없으므로 **그 status 값 자체는 여전히 호출자의 선언으로 남는다**(`status_authority = declared_only`).
+그 경우에도 나머지 네 축은 전부 도출된 것이며, 선언된 rest state는 그 넷에 의해 반증되거나(거부)
+뒷받침될 뿐이다. checkpoint나 pause record가 있으면 status는 거기서 도출되고 모순되는 선언은 거부된다.
+
+- active dispatch — `orca orchestration task-list --run`과 `orca orchestration worker-list --run`.
+  Task가 Orca의 `dispatched` 상태이고 **그 Dispatch의 worker row가 아직 실행 중이라고 말할 때에만**
+  active로 센다. 두 authority가 일치할 때에만 activity다. worker row가 아예 없는 `dispatched`
+  Task는 아무것도 실행 중임을 증명하지 못하므로 active wait가 아니라 **recovery work**로 보고하고
+  turn을 거부한다 — "증명하지 못했다"를 "괜찮다"로 읽는 것이 이 티켓이 없애려는 결함 그 자체다.
+  **settlement ledger는 이 질문의 근거가 될 수 없다** — Dispatch는 `wait_for_done()`이 이미
+  반환한 뒤 `claim_settlement()`을 통해서만 그 ledger에 들어가므로, ledger row는 언제나 *이미 끝난*
+  Worker/Reviewer를 가리킨다.
+- run status와 graph next node — run이 durable OS-40 checkpoint store를 가지고 있으면 거기서
+  가져온다. status는 commit된 `terminal_status` / `run_lifecycle`, next node는 engine 자신의
+  `routing.route`다. checkpoint를 열 수 없으면 판정하지 않는다(exit 3) — 읽지 못한 authority는
+  없는 authority가 아니다. checkpoint가 **없는** run — LangGraph engine을 실행하지 않는
+  prompt-driven Coordinator의 run이 그렇다 — 에는 durable한 run-status authority가 존재하지 않으며,
+  그 사실을 `status_authority = declared_only`로 그대로 보고한다. 선언을 derivation인 것처럼
+  포장하지 않는다. 이때에도 나머지 축(active dispatch, runnable work, delivery obligation, durable
+  wait)은 전부 조회로 도출되며, 선언된 rest state는 그것들에 의해 반증되거나(거부) 뒷받침될 뿐이다.
+- runnable work — 의존이 모두 `completed`인데 dispatch되지 않은 Task, worker는 끝났는데
+  `worker_done`이 아직 수거되지 않은 Task, worker row가 없는 `dispatched` Task, 그리고 checkpoint가
+  내놓은 next node. 하나라도 있고 active dispatch가 0이면 그것이 `run_c2166e75bb02`의 형태다.
+- outstanding delivery — run 자신의 append-only `coordinator_audit/`를 접어서 얻는다. 열려 있는
+  delivery obligation이 하나라도 있으면 거부한다. audit를 읽을 수 없으면 판정하지 않는다(exit 3).
+- durable wait — `--declare WAITING_FOR_INPUT`은 OS-31 pause record, 발행된 OS-30 clarification
+  request, 또는 열려 있는 Orca decision gate 중 하나로 뒷받침될 때에만 받아들인다.
+
+`--declare`한 rest state가 run의 실제 state와 모순되면 `QUIESCENCE_UNSUPPORTED_REST_CLAIM`으로
+거부한다 — Task가 아직 dispatched인데 `COMPLETED`라고 선언하거나, arm된 wait 없이
+`WAITING_FOR_INPUT`이라고 선언하거나, checkpoint/pause record가 다른 status를 말하는데 그와
+다른 status를 선언하는 경우다. 권위 있는 status가 존재하면 선언은 결코 그것을 이기지 못한다 —
+run을 정말로 block하거나 escalate한 Coordinator는 그것을 먼저 durable state에 기록한다.
+`--next-node`는 runnable work를 **추가**할 뿐이며 어떤 것도 제거하지 못한다. 판정은 성공이든
+거부든 `quiescence_verified` / `quiescence_violation` record로 audit에 남고, 그 record는 status를
+어디서 얻었는지(`status_authority`)까지 함께 남긴다.
+
+### Stop hook으로의 자동 강제 (`run_workflow.py turn-end-hook`)
+
+`turn-end`는 **누군가 호출해야** 실행된다. 그 호출을 잊는 것 자체가 이 티켓이 없애려는 결함이므로,
+같은 판정을 설치된 runtime이 turn을 끝낼 때 **자동으로** 부르는 지점에 연결한다.
+
+설치된 Claude Code 2.1.260과 live `~/.claude/settings.json`에서 **직접 확인한 사실**이다.
+
+- settings의 hook event 목록에 `Stop`이 있고, Orca 자신의 `~/.orca/agent-hooks/claude-hook.sh`가
+  이미 그 event에 등록되어 있다. 이론상의 surface가 아니라 이 환경에서 실제로 도는 hook이다.
+- 설치된 binary는 Stop hook을 `blockable_turn_end`라는 query site에서 평가하고, hook이 낸
+  `blockingError`를 대화에 message로 밀어 넣은 뒤 turn을 끝내는 대신 model을 다시 호출한다.
+  즉 **Stop hook은 turn 종료를 실제로 막을 수 있다.**
+- 단, 무제한이 아니다. `CLAUDE_CODE_STOP_HOOK_BLOCK_CAP ?? 8` — 연속 8회를 넘겨 block하면 runtime이
+  "A hook blocked the turn from ending N consecutive times — overriding and ending turn"을 내고
+  turn을 그냥 끝낸다. hook 입력에는 `stop_hook_active`가 실려 오고, runtime은 그것이 true인 동안
+  success를 반환하라고 명시한다.
+- tool result / MCP end-turn / loop tick으로 끝나 model 재호출이 없는 turn end에서는 block이
+  **폐기된다**(`[end-turn] Stop hook block discarded`).
+
+따라서 model이 토큰 방출을 멈추는 순간에 실행되는 hook이 존재하지 않는다던 이전 판의 전제는 **틀렸다**.
+그 전제 위에 세운 축소된 주장도 함께 철회한다.
+
+```text
+python3 <skill>/tools/run_workflow.py turn-end-bind --run-id RUN_ID [--artifact-base DIR] [--release]
+  = 이 Claude Code session이 어느 Run을 몰고 있는지 durable하게 기록한다 (exit 0 | 3)
+
+python3 <skill>/tools/run_workflow.py turn-end-hook [--run-id RUN_ID] [--artifact-base DIR] [--block-cap N]
+stdin  = Claude Code Stop hook payload (session_id, hook_event_name, stop_hook_active, ...)
+stdout = hook decision JSON | exit 0 always (판정은 exit code가 아니라 JSON으로 전달된다)
+```
+
+hook은 다음 순서로 판정한다.
+
+1. `Stop` event가 아니면 아무것도 관찰하지 않고 turn을 허용한다. `SubagentStop`은 Worker가 끝난
+   것이지 Coordinator의 turn이 아니다.
+2. **run binding이 없으면** 그 project의 Orca run state를 **세 갈래**로 판정한다
+   (`project_run_state()`: `runs_present` / `proven_absent` / `unreadable`). 이것이 이 boundary가
+   침묵으로 답해도 되는 **유일한** 질문이고, 침묵은 셋 중 하나에만 허용된다.
+   - `artifacts/runs/`를 **읽어서** run directory가 하나도 없음이 증명되면(`proven_absent`) →
+     **조용히 허용**한다. 그 session이 이 boundary와 무관하다는 적극적 증거이고, 무관한 session까지
+     막는 hook은 제거당한다 — 제거된 hook은 아무것도 강제하지 못한다.
+   - `artifacts/runs/`를 **읽지 못하면**(`unreadable`: 권한이 없거나, 가는 길의 directory를
+     나열하지 못하거나, 그 자리에 directory가 아닌 것이 있으면) → **block한다**(같은 상한에 묶인다).
+     "볼 수 없었다"는 "볼 것이 없다"가 아니다. 이전 판은 `OSError`를 전부 삼켜 이 경우를 `run이 없음`과
+     구별하지 못했고, 그래서 읽을 수 없는 authority가 조용한 통과를 만들어 냈다.
+   - run artifact가 하나라도 있으면 → **block한다**(아래와 같은 상한에 묶인다). run state를 가진
+     project에서 binding이 없는 session은 `turn-end-bind`를 잊은 Coordinator이거나 operator가 믿는
+     대로 동작하지 않는 등록이며, 둘 다 OS-44가 고치려는 결함 그 자체이지 예외가 아니다. 이전 판은
+     여기서 **알리기만 하고 통과**시켰는데 그것으로는 고쳐지지 않는다 — allow는 model을 다시 부르지
+     않으므로, binding을 고칠 수 있는 유일한 상대가 그 통지를 듣지 못한 채 turn이 끝난다. block의
+     reason은 `turn-end-bind` 명령을 그대로 붙여넣을 수 있게 실어 보낸다.
+3. **연속 block 상한을 다 썼으면** turn을 허용하고, 그때 통과시킨 거부를 `quiescence_violation`
+   record(`source = turn_boundary_stop_hook_cap_released`)로 audit에 남긴다. 잘못 막는 hook은 없는
+   hook보다 나쁘다 — 살아 있는 session을 wedge시킬 수 있기 때문이다. 그래서 상한은 runtime의 8보다
+   **낮게** 두어 해제 지점을 우리가 소유하고 시험한다.
+4. **거부되었거나 권위 있는 state를 읽지 못했으면** block한다. 읽지 못한 authority는 CLI의 exit 3과
+   똑같이 fail-closed이며, 같은 상한에 묶인다. block의 reason에는 reason code, detail, 남아 있는
+   runnable work와 미승인 delivery가 함께 실려 model이 무엇을 해야 하는지 알 수 있게 한다.
+5. **quiescent이면** 허용하고 상한 카운터를 되돌린다.
+
+**hook 자신의 결함도 fail-closed다.** run이 이미 resolve된 뒤에 예기치 못한 예외가 나면 turn을
+허용하지 않고 **거부한다** — 돌지 못한 gate는 run이 쉬고 있다는 것을 아무것도 확인하지 못했고, "확인할
+수 없었다"는 "확인할 것이 없다"가 아니다. 이것 역시 같은 연속 block 상한에 묶이며, 상한을 다 쓰면
+turn을 놓아 주고 그 해제를 `quiescence_violation`(`source = turn_boundary_stop_hook_cap_released`)로
+audit에 남긴다. 상한이 있기 때문에 hook의 결함이 살아 있는 session을 wedge시키지 못한다.
+
+**등록은 operator의 opt-in 행위다. 이 repository의 어떤 코드도 settings 파일을 쓰지 않는다.**
+특히 live global `~/.claude/settings.json`은 건드리지 않는다 — 그 파일은 지금 돌고 있는 session들의
+것이고, 거기에 잘못된 blocking hook을 넣으면 그 session들을 wedge시킨다. 등록은 Coordinator를 돌리는
+project의 `.claude/settings.json`에 추가한다. Claude Code는 여러 settings source의 hook을 **합쳐서**
+실행하므로 이 등록은 Orca가 global에 이미 걸어 둔 Stop hook을 대체하지 않고 나란히 동작한다.
+
+#### 등록 명령이 실제로 실행되게 하는 두 가지 (BUGFIX-I4-R1-REAL-PATH)
+
+이전 판의 등록 명령은 `python3 tools/run_workflow.py turn-end-hook`이었고, 앞에
+`ORCA_QUIESCENCE_RUN_ID=$ORCA_QUIESCENCE_RUN_ID`를 붙여 두었다. **둘 다 아무 일도 하지 않았다.**
+repository root에는 `tools/` 자체가 없어 그 경로는 열리지 않았고(`[Errno 2]`, exit 2), 설치된 Skill이
+자기 `tools/`를 hook의 working directory로 만들어 주지도 않는다. 그리고 환경변수를 자기 자신에게
+대입하는 것은 binding이 아니다 — 그 변수를 만들어 내는 producer가 이 repository에도, 다른 어디에도
+없었으므로 등록은 구조적으로 inert했다. 두 결함을 각각 고친다.
+
+**(1) entry point는 hook이 실제로 도는 cwd에서 resolve된다.** Claude Code는 hook을 project
+directory에서 실행하고 그 경로를 `$CLAUDE_PROJECT_DIR`로 내보낸다. 등록 명령은 그것을 기준으로 아래
+네 곳을 순서대로 찾아 첫 번째로 존재하는 entry point를 `exec`한다. **지원하는 layout**은 이 넷이다.
+
+| 순서 | root | layout |
+| --- | --- | --- |
+| 1 | `$ORCA_QUIESCENCE_HOME` | Skill을 다른 곳에 둔 operator |
+| 2 | `$CLAUDE_PROJECT_DIR/orca-worker-reviewer-orchestration` | 이 repository를 checkout한 project |
+| 3 | `$CLAUDE_PROJECT_DIR/.claude/skills/orca-worker-reviewer-orchestration` | project에 설치된 Skill |
+| 4 | `$HOME/.claude/skills/orca-worker-reviewer-orchestration` | `orca skills get`이 설치하는 위치 |
+
+**지원하지 않는 것**은 상대 경로 `tools/run_workflow.py`다 — 어떤 layout에서도 hook의 cwd 기준으로
+열리지 않는다. 넷 중 어느 것도 찾지 못하면 등록 명령의 꼬리가 **module과 똑같은 세 갈래 기준으로**
+판정한다. project를 **읽어서** run directory가 하나도 없음이 증명되면 "이 Stop hook은 아무것도 강제하지
+못하고 있다"를 systemMessage로 말하고 turn을 허용하고, run state가 있으면 **`decision: block`으로
+거부한다** — 실행되지 못한 boundary는 run이 쉬고 있다는 것을 확인한 적이 없기 때문이다. 그리고
+`artifacts/runs/`를 **읽지 못했으면 역시 `decision: block`이다**: glob은 읽을 수 없는 directory 아래의
+child directory를 증명하지 못하므로, 이전 판의 꼬리는 그 경우 "run이 없다"로 접어 통과시켰다. 지금은
+판정 변수가 `unreadable`에서 출발해서, `proven_absent`나 `runs_present` 중 하나가 **적극적으로**
+확인되지 않는 한 거부로 떨어진다. 이 거부도 무한하지 않다: `.stop_hook_unresolved_blocks`에 스스로
+카운터를 두어 연속 상한만큼만 거부하고 그 뒤에는 놓아 준다. 카운터는 기본적으로 `artifacts/runs/`에
+두지만, **거부의 원인이 바로 그 directory를 쓸 수 없다는 것일 수 있으므로** 쓸 수 있는 바깥
+directory로 물러난다 — 기록되지 못하는 카운터는 올라가지 않고, 올라가지 않는 카운터는 결코 놓아 주지
+않기 때문이다. entry point가 다시 resolve되면 module이 그 카운터들을 지우므로, 다음 고장은 온전한
+상한에서 다시 시작한다. 그리고 **물러날 곳이 하나도 없으면 거부 자체를 내지 않는다**: 꼬리는
+`printf`의 성공을 확인하고 쓴 값을 다시 읽어 본 뒤에만 `decision: block`을 낸다.
+
+#### fail-safe의 두 방향은 서로 반대다 (FINAL adversarial review R1)
+
+이 boundary의 안전한 방향은 **묻는 질문에 따라 반대로 뒤집힌다.** 하나를 다른 하나로 "고치지" 말 것.
+
+| 상황 | 안전한 방향 | 이유 |
+| --- | --- | --- |
+| Run 권위(`artifacts/runs`)를 **읽지 못함** | **BLOCK** (상한 있음) | "보지 못했다"는 "볼 것이 없다"가 아니다. 관측되지 않은 turn end를 통과시키는 것이 OS-44 결함 그 자체다. |
+| 거부의 **budget을 기록하지 못함** | **RELEASE** + 명시적 진단 | 상한은 탈출을 보장하려고 존재한다. 기록되지 못하는 상한은 아무것도 보장하지 못한다 — 다음 호출이 다시 0을 읽고 또 거부하며, 놓아 줄 주체가 없다. 무한 block은 session 전체를 wedge시키므로 관측되지 않은 turn end 하나보다 **더 나쁘다**. |
+
+앞의 규칙은 boundary가 run에 대해 **무엇을 아는가**를 묻고, 뒤의 규칙은 boundary가 **스스로 놓아 주겠다는
+약속을 지킬 수 있는가**를 묻는다. 그래서 module과 등록 꼬리 양쪽에서, 증가분이 실제로 persist되었음이
+(써 본 뒤 되읽어서) 확인될 때에만 거부가 발행되고, 확인되지 않으면 어느 경로가 왜 실패했는지를 말하는
+systemMessage와 함께 그 turn을 놓아 준다. `os.access` preflight는 TOCTOU 검사일 뿐 증거가 아니므로
+판정의 근거로 쓰지 않는다.
+
+**(2) run binding은 이 repository가 생산한다.** Claude Code는 자기가 실행하는 모든 명령에
+`CLAUDE_CODE_SESSION_ID`를 내보내고, **같은 값**을 Stop hook payload의 `session_id`로 보낸다(설치된
+2.1.260에서 직접 확인). 그래서 Coordinator는 run을 만든 직후 **한 번**
+
+```bash
+python3 <skill>/tools/run_workflow.py turn-end-bind --run-id <RUN_ID>
+```
+
+를 실행하고, 이것이 `artifacts/runs/<run-id>/coordinator_session/<session>.json`에 durable record를
+남긴다. hook은 자기 payload의 `session_id`로 그 record를 찾아 Run을 알아낸다. `OrcaRuntimeHarness`는
+`start_run()`과 `resume_run()`에서 이 binding을 자동으로 남긴다. run을 놓을 때는 `--release`로 기록을
+닫는다. `--run-id`와 `ORCA_QUIESCENCE_RUN_ID`는 그대로 우선순위 1·2로 남아 특정 run을 고정하려는
+operator를 위해 동작한다.
+
+```json
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "for r in \"$ORCA_QUIESCENCE_HOME\" \"${CLAUDE_PROJECT_DIR:-$PWD}/orca-worker-reviewer-orchestration\" \"${CLAUDE_PROJECT_DIR:-$PWD}/.claude/skills/orca-worker-reviewer-orchestration\" \"$HOME/.claude/skills/orca-worker-reviewer-orchestration\"; do [ -n \"$r\" ] && [ -f \"$r/tools/run_workflow.py\" ] && exec python3 \"$r/tools/run_workflow.py\" turn-end-hook --artifact-base \"${CLAUDE_PROJECT_DIR:-$PWD}\"; done; P=\"${CLAUDE_PROJECT_DIR:-$PWD}\"; A=\"$P/artifacts\"; R=\"$A/runs\"; H=2; if [ -d \"$P\" ] && [ -r \"$P\" ] && [ -x \"$P\" ]; then if [ ! -e \"$A\" ]; then H=0; elif [ -d \"$A\" ] && [ -r \"$A\" ] && [ -x \"$A\" ]; then if [ ! -e \"$R\" ]; then H=0; elif [ -d \"$R\" ] && [ -r \"$R\" ] && [ -x \"$R\" ]; then H=0; for d in \"$R\"/*/; do [ -d \"$d\" ] && H=1 && break; done; fi; fi; fi; if [ \"$H\" = 0 ]; then printf '{\"systemMessage\":\"orca turn-end boundary: run_workflow.py was not found under $ORCA_QUIESCENCE_HOME, $CLAUDE_PROJECT_DIR or ~/.claude/skills, so this Stop hook is enforcing nothing. This project was read and holds no Orca run state, so the turn was allowed. Fix the registration or remove it.\"}\\n'; else D=\"$P\"; [ -d \"$A\" ] && [ -w \"$A\" ] && [ -x \"$A\" ] && D=\"$A\"; [ -d \"$R\" ] && [ -w \"$R\" ] && [ -x \"$R\" ] && D=\"$R\"; { [ -d \"$D\" ] && [ -w \"$D\" ]; } || D=\"${TMPDIR:-/tmp}\"; C=\"$D/.stop_hook_unresolved_blocks\"; N=$(cat \"$C\" 2>/dev/null); case \"$N\" in \"\"|*[!0-9]*) N=0;; esac; N=$((N+1)); if [ \"$N\" -le 3 ]; then if { printf %s \"$N\" >\"$C\"; } 2>/dev/null && [ \"$(cat \"$C\" 2>/dev/null)\" = \"$N\" ]; then if [ \"$H\" = 1 ]; then printf '{\"decision\":\"block\",\"reason\":\"Coordinator turn-end boundary: this Stop hook is registered, but run_workflow.py was not found under $ORCA_QUIESCENCE_HOME, $CLAUDE_PROJECT_DIR or ~/.claude/skills, so the turn end could NOT be checked. This project holds Orca run state, so the turn is refused rather than passed: a boundary that cannot run has not established that the run is at rest. Repair the registration to point at the Skill root that contains tools/run_workflow.py, or remove the Stop hook. This refusal releases itself after a few consecutive turn ends so it cannot wedge the session.\"}\\n'; else printf '{\"decision\":\"block\",\"reason\":\"Coordinator turn-end boundary: this Stop hook is registered, but run_workflow.py was not found under $ORCA_QUIESCENCE_HOME, $CLAUDE_PROJECT_DIR or ~/.claude/skills, AND the Orca run state of this project, under artifacts/runs, could not be read, so it is not known whether there is a run to check. An unreadable authority is not evidence that this session is unrelated, so the turn is refused rather than passed. Repair the registration to point at the Skill root that contains tools/run_workflow.py, and make artifacts/runs readable, or remove the Stop hook. This refusal releases itself after a few consecutive turn ends so it cannot wedge the session.\"}\\n'; fi; else printf '{\"systemMessage\":\"orca turn-end boundary: this turn end was NOT gated. run_workflow.py was not found under $ORCA_QUIESCENCE_HOME, $CLAUDE_PROJECT_DIR or ~/.claude/skills, and the hook could not record the refusal budget that keeps its refusals finite -- no candidate directory (artifacts/runs, artifacts, the project root, $TMPDIR) would take the counter. A refusal that cannot be counted cannot release itself, and an unbounded block is worse than one unobserved turn end, so this turn is released instead of refused. Repair the registration, and make one of those directories writable.\"}\\n'; fi; else rm -f \"$C\"; printf '{\"systemMessage\":\"orca turn-end boundary: run_workflow.py is still not found under $ORCA_QUIESCENCE_HOME, $CLAUDE_PROJECT_DIR or ~/.claude/skills. The hook has already refused its budget of consecutive turn ends and is releasing this one rather than wedging the session. Nothing is being enforced until the registration is repaired.\"}\\n'; fi; fi",
+            "timeout": 60
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+### 이 boundary가 보장하는 것과 보장하지 못하는 것
+
+정직하게 적는다. **등록만으로 강제되는 것은 없다.** 강제되는 전제는 정확히 하나다 —
+`orca run state를 가진 project에서 hook이 등록되어 있을 것`. 이전 판은 "hook을 등록한 뒤"라고만 적었고,
+그 사이 `turn-end-bind`를 실행하지 않은 session의 turn은 전부 통과시켰다. 즉 model이 기억해야 하는
+호출이 `turn-end`에서 `turn-end-bind`로 옮겨졌을 뿐, 잊으면 통과한다는 원래 결함은 그대로였다.
+지금은 그 전제 아래 다음 넷이 **강제된다**.
+
+1. **turn이 끝나는 실제 지점에서 자동으로 호출된다.** model이 기억해서가 아니라 runtime이 실행하기
+   때문에 실행된다.
+2. **거부가 실제로 turn을 막는다.** turn은 끝나지 않고 거부 사유가 model에게 전달된다.
+3. **무관하다는 적극적 증거가 없는 한 fail-closed로 강제된다.** 판정은 선언이 아니라 조회로 도출되고, 명령은
+   보고가 아니라 거부를 반환하며, 거부는 durable하다. 권위 있는 state를 읽지 못한 경우, 어떤 Run에도
+   attribute할 수 없는 session, entry point가 resolve되지 않는 등록, 그리고 boundary 자신의 예기치 못한
+   실패 — **넷 모두 통과가 아니라 거부**이며 각각 같은 연속 block 상한에 묶인다. 조용히 통과시키는
+   경우는 단 하나, `artifacts/runs/`를 **읽어서** run directory가 하나도 없음이 증명된
+   project(`proven_absent`)다. 그것만이 이 session이 무관하다는 적극적 증거이고,
+   `project_run_state()`가 그 하나를 나머지 둘(`runs_present`, `unreadable`)에서 갈라낸다. 읽을 수
+   없는 authority는 `proven_absent`로 접히지 않는다 — 그것도 거부다.
+4. **통과한 turn도 막힌 turn도 기록으로 남는다.** 그래서 "이 turn은 확인 없이 끝났다"가 검증 불가능한
+   주장이 아니라 audit의 관찰 가능한 부재가 된다.
+
+**확인된 한계**는 다음 여섯이며, 어느 것도 추정이 아니라 위에서 관찰한 것이다.
+
+1. **마지막 말은 runtime이 한다.** 연속 block이 cap을 넘으면 runtime이 hook을 무시하고 turn을 끝낸다.
+   이 boundary는 그보다 낮은 자체 상한에서 먼저 해제하고 그 사실을 audit에 남긴다. 무한히 막을 수 있는
+   boundary는 session을 wedge시킬 수 있는 boundary다.
+2. **막을 수 없는 turn end가 있다.** tool result / MCP end-turn / loop tick으로 끝나 model 재호출이
+   없는 경우 block은 폐기된다.
+3. **등록은 이 repository가 하지 않는다.** hook을 등록하지 않은 session은 이전과 똑같이 gate되지
+   않는다. 등록했으나 `turn-end-bind`로 binding되지 않은 session은 이제 gate된다 — run state가 있는
+   project에서는 binding할 때까지, 또는 상한이 놓아 줄 때까지 거부된다.
+4. **run state가 없음이 증명된 project는 열려 있다.** `artifacts/runs/`를 읽을 수 있고 비어 있으면
+   binding 없는 session은 조용히 통과한다. 의도한 면제다 — 무관한 session까지 막는 hook은 제거당하고,
+   제거된 hook은 아무것도 강제하지 못한다. 그리고 이 면제 하나뿐이며, **증명을 요구한다**: 읽지 못한
+   `artifacts/runs/`는 면제가 아니라 거부다.
+5. **모든 거부는 유한하다.** 거부·읽기 실패·attribute 불가·entry point 미해결·내부 실패 어느 경로든
+   연속 상한만큼만 막고 그 뒤에는 그렇게 말하며 놓아 준다. 그 유한성이 attribute할 수 없는 session을
+   막는 선택을 안전하게 만든다 — 잘못 짚어도 대가는 turn 몇 번이지 wedge된 session이 아니다.
+6. **`--declare`의 status 값은 여전히 선언이다** — durable checkpoint도 pause record도 없는 run에서는
+   그것을 반증할 authority가 없다. 나머지 네 축은 전부 도출된다.
+
+hook이 등록되지 않은 경우, 그리고 run state가 없는 project에서 남는 보장은 이전과 같다.
+**호출되면 fail-closed로 강제되고, 건너뛰어도 결정적으로 탐지된다** — 이 명령은 durable state에 대한 순수한 관찰이므로, 다음 turn·successor process·
+감독하는 사람·주기적 점검 중 무엇이든 조용해진 run에 대해 나중에 같은 명령을 실행하면 건너뛴 turn이
+받았을 판정을 그대로 얻는다. `run_c2166e75bb02`의 정지는 사람이 33분짜리 timestamp 간격을 눈으로 읽어서
+발견했다 — 이제는 명령 하나로 확인되고, hook을 등록했다면 애초에 그 turn이 끝나지 않았을 것이다.
+
+### Delivery provenance와 ack ordering
+
+- delivery의 `worker_done`은 expected Task ID와 expected Dispatch ID **양쪽 모두**와 일치할 때에만
+  현재 waiter의 결과로 채택한다. 한쪽만 일치하거나 어느 쪽도 없으면 채택하지 않고, 거절 사유를
+  audit에 남긴 뒤 버린다. dispatch 불일치를 task 불일치보다 먼저 보고한다 — stale delivery는 stale
+  delivery로 보고되어야 한다.
+- 처리 결과를 state와 settlement에 반영한 **뒤** delivery를 ack하고, ack가 완료되기 전에는 다음
+  waiter를 만들지 않는다. 처리되었으나 ack되지 않은 delivery가 하나라도 있으면 `check --wait`를
+  arm하지 않고 fail-closed로 거부한다. 반영이 **끝나기 전에** ack하는 것은 순서를 옮긴 것이지
+  닫은 것이 아니다 — ack 성공 직후 axis accounting이나 finalization에서 죽으면 runtime은 그
+  delivery를 소비된 것으로 보아 다시 보내지 않고, settlement ledger는 미완성으로 남는다. 즉
+  delivery가 유실된다.
+- settlement 진행 상태는 두 지점에서 durable하게 기록한다. settlement path의 **첫 명령 이전**에
+  claim을, 반영이 완료되고 **ack 이전**에 settled를. 이 두 record가 있어야 재시작한 successor가
+  "아무것도 mutate되지 않았다"(다시 처리)와 "lifecycle 명령이 이미 나갔을 수 있다"(명시적 복구),
+  "settle까지 끝나고 ack만 빠졌다"(ack만 하고 아무 lifecycle action도 하지 않음)를 구별할 수 있다.
+- 이미 처리·ack된 delivery가 재전송되면 lifecycle action을 **하나도** 하지 않고 다시 ack만 한다.
+  중복 settlement, release, artifact, dispatch, iteration budget 소비가 발생하지 않는다. replay는
+  유한하다. 같은 delivery가 한도를 넘겨 재전송되면 loop를 도는 대신 fail-closed로 거부한다.
+- ack가 실패하면 유한 횟수 재시도하고, 소진되면 fail-closed로 거부한다. 실패한 ack는 조용히
+  성공으로 바뀌지 않으며, 그 delivery는 계속 미승인 상태로 남아 다음 waiter와 turn 종료를 막는다.
+- wire ack는 **intent를 먼저 durable하게 기록한 뒤에** 보낸다. Orca는 `--ack`를 받아들이면서
+  delivery를 소비하는데 그 사실을 이 process가 기록하기 전에 죽을 수 있고, intent record가 없으면
+  `delivery_settled`에서 끝난 audit이 "ack는 나가지 않았고 runtime이 아직 delivery를 들고 있다"와
+  "ack가 나갔고 runtime은 이미 소비했으며 이 run이 갚아야 할 acknowledgement outcome은 기록되지
+  않았다"를 구별하지 못한다. 구별하지 못하는 successor는 이미 소비된 delivery를 다시 처리하거나,
+  갚아야 할 obligation을 조용히 버린다.
+- successor는 predecessor가 열어 둔 acknowledgement를 **redelivery에 기대지 않고 스스로 닫는다.**
+  durable `settled` 또는 `ack_intent` record를 가진 row는 재전송이 온다는 보장이 없으므로,
+  idempotent wire ack를 다시 보낸 뒤 관찰한 결과를 `delivery_ack_reconciled` record 하나로 남긴다.
+  **terminal한 관찰은 정확히 둘뿐이다**: runtime이 ack를 받아들였거나(이미 소비한 delivery의 재-ack도
+  duplicate로 성공한다), 문서화된 not-outstanding error code로 "이 Run에는 그런 delivery가 없다"고
+  답했거나. 그 밖의 실패 — transport, runtime, permission, unknown, transient, fenced consumer — 는
+  Orca가 delivery를 소비했다는 증거가 아니므로 아무것도 닫지 못한다. obligation은 **열린 채로
+  유지되고** reconciliation은 fail-closed로 거부하며, 그 시도는 `delivery_ack_failed`
+  (`reason_code = reconcile_unresolved`)로 기록된다. 이 reconciliation은 lifecycle action을 하나도
+  반복하지 않는다 — 대상 row는 이미 durable settled/ack_intent를 갖고 있어 replay로 분류되고,
+  finalize-once ledger가 두 번째 settlement를 독립적으로 거부한다.
+- 미완료 acknowledgement를 pending 목록에서 **제외하는 방식으로 없애지 않는다.** 제외되는 것은
+  redelivery가 닫아 주는 두 obligation뿐이고, 그것도 "recovered라서"가 아니라 이름으로 구별한다:
+  predecessor가 wire ack를 끝내 보내지 않은 row(`awaiting_redelivery`, `recover`)는 Orca가 ack될
+  때까지 재전송하므로, 그것을 세면 바로 그 재전송이 도착해야 할 waiter를 arm하지 못하게 된다. 그
+  외의 모든 열린 obligation은 waiter와 turn 종료를 막고, reconciliation으로 닫힌다.
+- process가 재시작되어 in-memory delivery ledger가 비어 있으면, 다음 waiter를 arm하기 전에
+  append-only audit에서 ledger를 복원한다. 복원하지 않으면 재전송된 delivery가 "처음 보는 것"으로
+  읽혀 같은 결함이 한 process 뒤에서 재현된다. 복원은 기존 run을 bind하는 production
+  start/resume/wait path 자체에 있어야 한다 — 호출을 기억해야 하는 helper로 두면 실제 Coordinator는
+  복원하지 않은 채로 `check --wait`를 arm할 수 있다. 복원이 의존하는 audit를 읽을 수 없으면
+  fail-closed로 거부한다.
+- 재전송된 delivery의 처분은 네 가지뿐이다: 처음 보는 것은 `process`, 소비되었지만 claim도 settle도
+  ack도 없으면 `resume`(아무것도 mutate되지 않았으므로 다시 처리한다 — replay로 버리면 유실이다),
+  claim만 있고 settled가 없으면 `recover`(lifecycle 명령이 중복될 수 있으므로 명시적 복구),
+  settled 또는 ack된 것은 `replay`.
+
+### Coordinator audit artifacts
+
+processing / ack / mismatch / replay / quiescence 판정은 run-scoped append-only audit에 기록한다.
+`<ARTIFACT_ROOT>coordinator_audit/`이며, `decision_ledger/`와 동일한 규칙을 따른다 — sequence key
+directory 하나가 record 하나, staged 후 하나의 rename으로 publish, 이미 publish된 record는 수정하지
+않고 정정은 새 key의 새 record다. `.staging/`은 record가 아니다.
+
+```text
+COORDINATOR_AUDIT_SCHEMA_VERSION = 1.0
+COORDINATOR_AUDIT_DIR = coordinator_audit/
+COORDINATOR_AUDIT_EVENTS = delivery_processed, delivery_acknowledged, delivery_ack_retry, delivery_ack_failed, delivery_ack_intent, delivery_ack_reconciled, delivery_replayed, delivery_mismatch, delivery_settlement_claimed, delivery_settled, delivery_recovery, quiescence_verified, quiescence_violation
+QUIESCENT_TURN_END_STATES = active_dispatch_wait, WAITING_FOR_INPUT, BLOCKED, ESCALATED, COMPLETED
+DELIVERY_ADOPTION = expected_task_id_and_expected_dispatch_id
+DELIVERY_ORDER = reflect_state_and_settlement, acknowledge_delivery, then_arm_next_waiter
+DELIVERY_REPLAY = acknowledge_only, zero_lifecycle_action, bounded_then_fail_closed
+ACK_FAILURE = bounded_retry_then_fail_closed
+QUIESCENCE_SELF_CHECK = immediately_before_turn_end
+DELIVERY_DISPOSITION = process, resume, recover, replay
+DELIVERY_RESTART_RECOVERY = restore_on_production_wait_path_before_arming_any_waiter
+COORDINATOR_AUDIT_WRITE_FAILURE = fail_closed
+DELIVERY_PROGRESS_COMMIT = publish_durable_record_then_set_in_memory_state
+TURN_END_BOUNDARY = tools/run_workflow.py turn-end --run-id RUN_ID
+TURN_END_AUTHORITY = orca_task_and_dispatch_state, workflow_checkpoint, coordinator_audit, durable_wait_artifact
+TURN_END_EXIT = 0 may_end, 1 refused, 3 no_verdict
+TURN_END_SCOPE = fail_closed_when_invoked, deterministic_detection_when_skipped, blocking_stop_hook_when_registered
+TURN_END_HOOK = tools/run_workflow.py turn-end-hook
+TURN_END_HOOK_EVENT = claude_code_stop, blockable_turn_end, decision_block_continues_conversation
+TURN_END_HOOK_BINDING = run_id_flag, else_ORCA_QUIESCENCE_RUN_ID, else_durable_session_binding_from_turn_end_bind
+TURN_END_HOOK_BIND = tools/run_workflow.py turn-end-bind --run-id RUN_ID, keyed_by_CLAUDE_CODE_SESSION_ID
+TURN_END_HOOK_ENTRY = resolved_from_CLAUDE_PROJECT_DIR_or_installed_skill_root, never_relative_tools_path
+TURN_END_HOOK_RUN_STATE = runs_present, proven_absent, unreadable
+TURN_END_HOOK_UNBOUND = block_when_runs_present_or_unreadable, silent_allow_only_when_runs_proven_absent
+TURN_END_HOOK_FAIL_CLOSED = unreadable_authority, unreadable_run_state_root, unattributable_session, unresolved_entry_point, hook_internal_failure
+TURN_END_HOOK_CAP = bounded_consecutive_blocks_then_release_and_record
+TURN_END_HOOK_REGISTRATION = operator_opt_in, never_written_by_this_repository, never_global_settings
+TURN_END_HOOK_LIMIT = runtime_block_cap_overrides, block_discarded_without_model_reinvoke
+STATUS_DECLARED_AXIS = declare_flag_status_only, other_axes_derived
+ACTIVE_DISPATCH_SOURCE = orca_task_status_and_dispatch_row, never_settlement_ledger
+ACTIVE_DISPATCH_EVIDENCE = dispatched_task_and_live_worker_row, missing_worker_row_is_recovery_work
+RUN_STATUS_AUTHORITY = workflow_checkpoint, else_os31_pause_record, else_declared_only
+NEXT_NODE_AUTHORITY = workflow_checkpoint_route, declared_next_node_only_adds
+DECLARED_REST_STATE = corroborated_against_run_state_or_refused
+ACK_INTENT = publish_durable_intent_before_wire_ack
+ACK_RECONCILIATION = successor_closes_predecessor_acknowledgement_without_redelivery
+ACK_RECONCILE_TERMINAL = wire_ack_accepted, or_documented_not_outstanding_error
+ACK_RECONCILE_UNCLASSIFIED = obligation_stays_open, fail_closed
+```
+
+delivery의 진행 상태는 in-memory row와 durable audit 두 곳에 있고, 순서는 항상 durable이 먼저다.
+record를 publish한 뒤에만 in-memory 전이를 commit한다 — durable하게 기록할 수 없는 전이는 일어나지
+않은 것이다. 반대로 하면 `delivery_settled` 기록이 실패했을 때 memory는 "settled", audit는 "claim만"이
+되고, 이후 settle 재진입이 이미 finalize된 dispatch 경로에서 durable settled record가 없는 delivery를
+ack해 버린다. 재시작하면 그 row는 미완료 claim으로 읽히는데 runtime의 delivery는 이미 사라진 뒤다.
+같은 이유로 이미 finalize된 dispatch를 만난 settle 재진입은 그 delivery의 durable settled 상태가
+증명될 때만 ack한다 — claim만 있고 settled record가 없는 row는 fail-closed로 거부한다. wire ack가
+성공한 뒤 `delivery_acknowledged` publication이 실패하면 in-memory 전이를 commit하지 않으므로 그
+delivery는 미승인 obligation으로 남고, 재진입이 그 record를 다시 publish한다.
+
+이 audit는 사람이 읽는 log와 종류가 다르다. 재시작한 Coordinator가 delivery ledger를 복원할 수 있는
+**유일한** source이므로, 기록 실패를 삼키고 진행하면 다음 process가 이미 처리된 delivery를 새 것으로
+읽는다 — 이 절이 없애려는 결함이 logging guard 때문에 되살아난다. 따라서 publication 실패는 기록한
+뒤 fail-closed로 거부하고, 읽을 수 없는 audit도 같다. section 9의 "logging 실패는 lifecycle 결정을
+바꾸지 않는다"는 ORCHESTRATOR_LOG/TIMING_LOG에는 그대로 유지된다.
+
+CLI로 직접 orchestration을 운전하는 Coordinator는 `tools/run_logging.py`의
+`coordinator-audit-write` / `coordinator-audit-read` 서브커맨드를 사용한다. `--ledger`는 audit를
+접어 restart가 복원해야 할 delivery ledger를 돌려준다. turn을 끝내기 직전의 판정은
+`tools/run_workflow.py turn-end`가 수행하며, Stop hook으로 등록된 `turn-end-hook`도 같은 판정을
+같은 audit에 기록한다. hook을 등록해 두었다면 Coordinator는 run을 만든(또는 이어받은) 직후 한 번
+`tools/run_workflow.py turn-end-bind --run-id <RUN_ID>`를 실행한다 — 이 record가 없으면 hook은 그
+session이 어느 Run을 모는지 알지 못해 gate하지 않는다.
+
 ## 18. Core Invariants
 
 ```text
@@ -2558,6 +2980,32 @@ Reviewer delta context is a starting point, never a boundary on direct verificat
 Task graph created before worker dispatch; dependents never created after dependency completion
 Manual task readiness override is recovery-only
 Settlement, worker-resource registration, process liveness, and cleanup authority are four separate axes
+Coordinator turn ends only at active dispatch wait, WAITING_FOR_INPUT, BLOCKED, ESCALATED, or COMPLETED
+A worker_done is adopted only when it matches BOTH the expected task id and the expected dispatch id
+Reflect state and settlement, acknowledge the delivery, and only then arm the next waiter
+A replayed delivery is acknowledged with zero lifecycle action; ack failure retries boundedly then fails closed
+A restarted coordinator restores the delivery ledger on the production wait path before any waiter is armed
+The coordinator audit is the sole restart source; a record that cannot be written or read fails closed
+A delivery progress transition is committed in memory only after its durable audit record is published
+A settle re-entry on an already finalized dispatch acknowledges only when durable settled state is proven
+The turn-end boundary is an invocable command whose verdict is derived from run state, never declared
+Active dispatch is derived from Orca task and dispatch state, never from the settlement ledger
+A dispatched task with no live worker row is recovery work, never an active wait
+Run status and next node come from the durable workflow checkpoint when the run has one
+A run with no checkpoint has no durable status authority, and the boundary reports that rather than claiming one
+A declared rest state is refused unless the run's own state corroborates it
+The registered Stop hook fails closed on an unattributable session, an unresolved entry point or its own failure, and allows silently only where the project is proven to hold no run state
+A declared status that contradicts an authoritative one is refused, never preferred over it
+The wire acknowledgement intent is published durably before the acknowledgement is sent
+A successor closes a predecessor's open acknowledgement without depending on redelivery
+An incomplete acknowledgement is closed by reconciliation, never hidden by excluding its row
+An acknowledgement reconciliation is terminal only on an accepted ack or a documented not outstanding answer
+An unclassified acknowledgement failure preserves the obligation and fails closed
+Turn-end enforcement is fail-closed when invoked and deterministically detectable when skipped
+The registered Stop hook invokes the turn-end boundary automatically and a refusal blocks the turn
+The Stop hook releases the turn after a bounded number of consecutive blocks and records the refusal it let through
+Stop hook registration is the operator's opt-in act; no code here writes a settings file
+The declared status is the only caller-supplied value the boundary cannot derive
 Terminal close requires proven cleanup authority; otherwise retain and report
 Cleanup authority requires a close eligible terminal role as well as proven ownership
 The coordinator never closes its own terminal, a setup terminal, or an adopted terminal
