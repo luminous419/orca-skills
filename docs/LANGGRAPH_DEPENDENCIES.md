@@ -19,11 +19,15 @@ SET, not a count: `scripts/langgraph_skip_manifest.txt` names every test expecte
 without the runtime, the absent lane requires that set to be skipped exactly (no missing
 entry, no extra one), and the present lane requires every one of those tests to have
 executed. Every OTHER skip is held to the same kind of contract by
-`scripts/tolerated_skip_manifest.txt`, which declares each one as (test id, exact reason)
-and is matched exactly in both lanes -- so an extra test carrying an already-declared
-reason fails, not just a differently worded one. A count or a reason pattern would drift
-silently as tests are added and removed; the identity sets make each such change show up as
-a manifest diff. The pinned set above was checked to resolve, install and
+`scripts/tolerated_skip_manifest.txt`, which declares each one as
+(condition, test id, exact reason) and is matched exactly in both lanes -- so an extra test
+carrying an already-declared reason fails, not just a differently worded one. The condition
+is what makes the contract portable: the seatbelt isolation tests are expected to skip on
+Linux and expected to RUN on macOS, and violating either direction fails the lane. The
+LangGraph manifest needs no condition because a LangGraph gate is a dependency gate,
+identical on every platform; a test asserts that no test is gated on both, which is the one
+way that could stop being true. A count or a reason pattern would drift silently as tests
+are added and removed; the identity sets make each such change show up as a manifest diff. The pinned set above was checked to resolve, install and
 import on all three declared versions; 3.11 remains the version the full OS-40 runtime
 verification ran on.
 

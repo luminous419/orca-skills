@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import tempfile
 import textwrap
 import unittest
 from pathlib import Path
@@ -394,7 +395,7 @@ class SkipBudgetTests(unittest.TestCase):
                 result.started_ids = set(self.EXPECTED)
                 problems = self.check(lane, result)
                 self.assertTrue(
-                    any("does not declare" in problem for problem in problems),
+                    any("does not expect HERE" in problem for problem in problems),
                     f"lane {lane} tolerated an undeclared skip: {problems}")
 
     def test_the_declared_tolerated_set_passes_the_absent_lane(self) -> None:
@@ -480,7 +481,7 @@ class ToleratedSkipContractTests(unittest.TestCase):
                 problems = (self.absent(extra) if lane == ci_lane.LANE_ABSENT
                             else self.present(extra))
                 self.assertTrue(problems, f"lane {lane} accepted a seventh live skip")
-                self.assertTrue(any("does not declare" in p for p in problems), problems)
+                self.assertTrue(any("does not expect HERE" in p for p in problems), problems)
                 self.assertTrue(any("m.R.test_live_SEVENTH" in p for p in problems),
                                 f"the excess test is not named: {problems}")
 
@@ -491,14 +492,14 @@ class ToleratedSkipContractTests(unittest.TestCase):
         seven = frozenset((f"m.Arbitrary.test_{n}", self.LIVE_REASON) for n in range(7))
         problems = self.present(seven)
         self.assertTrue(problems, "the reviewer's reproduction still passes")
-        self.assertTrue(any("does not declare" in p for p in problems), problems)
+        self.assertTrue(any("does not expect HERE" in p for p in problems), problems)
 
     def test_five_hundred_identical_skips_fail(self) -> None:
         """The scale the finding named. A count would have to be updated; identity does not."""
         flood = self.TOLERATED | {(f"m.Flood.test_{n}", self.LIVE_REASON)
                                   for n in range(500)}
         problems = self.absent(flood)
-        self.assertTrue(any("500" in p and "does not declare" in p for p in problems),
+        self.assertTrue(any("500" in p and "does not expect HERE" in p for p in problems),
                         f"500 undeclared skips passed the lane: {problems}")
 
     # -- MISSING: a declared skip that stopped happening --------------------------------
@@ -547,19 +548,396 @@ class ToleratedSkipContractTests(unittest.TestCase):
         """The review asked for both contracts to be visible in one line."""
         line = ci_lane.summarize(ci_lane.LANE_ABSENT, self.result(self.TOLERATED),
                                  expected=self.EXPECTED, tolerated=self.TOLERATED)
-        self.assertIn("tolerated skips: manifest=2 matched=2 missing=0 unexpected=0", line)
+        self.assertIn("tolerated skips: platform=", line)
+        self.assertIn("expected-here=2 matched=2 missing=0 unexpected=0", line)
         self.assertIn("manifest tests SKIPPED", line)
         self.assertIn("other=2", line)
+
+
+class ToleratedSkipConditionTests(unittest.TestCase):
+    """Review round 3: a tolerated skip is expected UNDER A CONDITION, on every platform.
+
+    CI run 34092393153 failed all six jobs on c1bd97b. The contract was not wrong about what
+    it asserted -- both manifests matched their declared sets -- it was wrong about SCOPE: it
+    modelled which tests may skip but not under what condition, so a manifest generated on
+    macOS was exact on macOS and reported 22 undeclared skips on ubuntu-latest.
+
+    Adding those 22 unconditionally would have inverted the defect: green on Linux, red on
+    every developer Mac, where the same tests RUN. So each direction below is asserted for
+    BOTH platforms, and the Linux side is SIMULATED rather than skipped -- a test that
+    skipped on macOS "because it needs Linux" would be the very defect under repair.
+    """
+
+    DARWIN_REASON = ("the seatbelt backend is darwin-only; T-8.9 carries the fail-closed "
+                     "guarantee on every other platform")
+    SANDBOX_REASON = "/usr/bin/sandbox-exec is not present on this host"
+    LIVE_REASON = "requires --orca-runtime and a ready Orca runtime"
+
+    #: A stand-in declaration with one entry of each shape, including a double-gated test.
+    #: These tests assert the CONTRACT, so they must not drift when the real manifest does.
+    ALTERNATIVES = {
+        "m.Live.test_needs_runtime": [("always", LIVE_REASON)],
+        "m.Seatbelt.test_darwin_only": [("not_darwin", DARWIN_REASON)],
+        "m.Seatbelt.test_both_gates": [("not_darwin", DARWIN_REASON),
+                                       ("no_sandbox_exec", SANDBOX_REASON)],
+        "m.Profile.test_needs_binary": [("no_sandbox_exec", SANDBOX_REASON)],
+    }
+    EXPECTED_LANGGRAPH = frozenset({"m.C.test_alpha"})
+
+    # Environments, as the predicate table `expected_tolerated_skips` consumes.
+    LINUX = {"always": lambda: True,
+             "not_darwin": lambda: True,
+             "no_sandbox_exec": lambda: True}
+    MACOS = {"always": lambda: True,
+             "not_darwin": lambda: False,
+             "no_sandbox_exec": lambda: False}
+    MACOS_NO_BINARY = {"always": lambda: True,
+                       "not_darwin": lambda: False,
+                       "no_sandbox_exec": lambda: True}
+
+    def expected(self, environment):
+        return ci_lane.expected_tolerated_skips(self.ALTERNATIVES, conditions=environment)
+
+    def result(self, skipped_pairs, *, started=()):
+        entries = [(SkipBudgetTests._Test(i), r) for i, r in skipped_pairs]
+        result = SkipBudgetTests._Result(entries)
+        result.started_ids = set(started) | set(self.EXPECTED_LANGGRAPH)
+        return result
+
+    def check(self, environment, skipped_pairs):
+        return ci_lane.check_skip_budget(
+            ci_lane.LANE_PRESENT, self.result(skipped_pairs),
+            expected=self.EXPECTED_LANGGRAPH, tolerated=self.expected(environment))
+
+    # -- resolution ---------------------------------------------------------------------
+
+    def test_linux_expects_the_platform_gated_tests_to_skip(self) -> None:
+        self.assertEqual(self.expected(self.LINUX), frozenset({
+            ("m.Live.test_needs_runtime", self.LIVE_REASON),
+            ("m.Seatbelt.test_darwin_only", self.DARWIN_REASON),
+            # Both conditions hold; the FIRST declared wins, mirroring unittest's own
+            # resolution of stacked gates.
+            ("m.Seatbelt.test_both_gates", self.DARWIN_REASON),
+            ("m.Profile.test_needs_binary", self.SANDBOX_REASON),
+        }))
+
+    def test_macos_expects_only_the_unconditional_skip(self) -> None:
+        """On macOS the platform-gated tests RUN, so they are absent from the expected set."""
+        self.assertEqual(self.expected(self.MACOS),
+                         frozenset({("m.Live.test_needs_runtime", self.LIVE_REASON)}))
+
+    def test_a_darwin_host_without_the_binary_falls_to_the_second_arm(self) -> None:
+        """The reason the double-gated entries need TWO lines and not one.
+
+        A single (test, reason) pair keyed on `not_darwin` would report this host's real
+        sandbox skip as UNEXPECTED. The second arm is what keeps the contract exact on a
+        macOS box that lacks sandbox-exec.
+        """
+        self.assertEqual(self.expected(self.MACOS_NO_BINARY), frozenset({
+            ("m.Live.test_needs_runtime", self.LIVE_REASON),
+            ("m.Seatbelt.test_both_gates", self.SANDBOX_REASON),
+            ("m.Profile.test_needs_binary", self.SANDBOX_REASON),
+        }))
+
+    # -- the exact set passes, on each platform ------------------------------------------
+
+    def test_the_exact_expected_set_passes_on_linux(self) -> None:
+        self.assertEqual(self.check(self.LINUX, self.expected(self.LINUX)), [])
+
+    def test_the_exact_expected_set_passes_on_macos(self) -> None:
+        self.assertEqual(self.check(self.MACOS, self.expected(self.MACOS)), [])
+
+    # -- the two directions the CI failure and its naive fix each represent ---------------
+
+    def test_a_platform_gated_test_that_RAN_on_linux_fails(self) -> None:
+        """The naive fix's blind spot, on the runner: a seatbelt test that stopped skipping.
+
+        If `DARWIN_ONLY` were dropped from a test, it would execute on ubuntu-latest, where
+        the seatbelt backend does not exist, and quietly fail or pass for the wrong reason.
+        The lane must catch the absence, not the presence.
+        """
+        ran = self.expected(self.LINUX) - {("m.Seatbelt.test_darwin_only",
+                                            self.DARWIN_REASON)}
+        problems = self.check(self.LINUX, ran)
+        self.assertTrue(problems, "linux accepted a platform-gated test that ran")
+        self.assertTrue(any("did NOT produce" in p for p in problems), problems)
+        self.assertTrue(any("m.Seatbelt.test_darwin_only" in p for p in problems), problems)
+
+    def test_a_platform_gated_test_that_SKIPPED_on_macos_fails(self) -> None:
+        """THE direction that makes 'just add the 22' wrong.
+
+        On macOS these tests carry the real proof of the isolation guarantee. If one starts
+        skipping there, the guarantee silently stops being checked anywhere -- Linux never
+        checked it either. A manifest that tolerated them unconditionally would be blind to
+        exactly this.
+        """
+        skipped = self.expected(self.MACOS) | {("m.Seatbelt.test_darwin_only",
+                                                self.DARWIN_REASON)}
+        problems = self.check(self.MACOS, skipped)
+        self.assertTrue(problems, "macos accepted a platform-gated test that skipped")
+        self.assertTrue(any("does not expect HERE" in p for p in problems), problems)
+        self.assertTrue(any("m.Seatbelt.test_darwin_only" in p for p in problems), problems)
+
+    def test_all_twenty_two_skipping_on_macos_fails(self) -> None:
+        """The naive fix, at full scale, measured on the platform it would have broken."""
+        skipped = self.expected(self.MACOS) | {
+            (test_id, entries[0][1]) for test_id, entries in self.ALTERNATIVES.items()
+            if entries[0][0] != "always"}
+        self.assertTrue(any("does not expect HERE" in p
+                            for p in self.check(self.MACOS, skipped)))
+
+    def test_an_undeclared_skip_fails_on_either_platform(self) -> None:
+        for name, environment in (("linux", self.LINUX), ("macos", self.MACOS)):
+            with self.subTest(platform=name):
+                extra = self.expected(environment) | {("m.New.test_thing", "no idea")}
+                problems = self.check(environment, extra)
+                self.assertTrue(any("does not expect HERE" in p for p in problems), problems)
+
+    def test_a_declared_skip_may_not_be_spelled_as_tolerated_anywhere(self) -> None:
+        """No condition means 'always', unless it literally says `always`.
+
+        `expected_tolerated_skips` resolves per environment, so a `not_darwin` entry is NOT
+        in the macOS expected set. This asserts that directly, because it is the property
+        the whole round turns on.
+        """
+        for test_id, entries in self.ALTERNATIVES.items():
+            if entries[0][0] == "always":
+                continue
+            with self.subTest(test_id=test_id):
+                self.assertNotIn(
+                    test_id, {i for i, _ in self.expected(self.MACOS)},
+                    f"{test_id} is tolerated on a platform where it is supposed to run")
+
+    def test_an_unknown_condition_token_is_refused_at_load(self) -> None:
+        """A typo'd condition must not silently become a tolerated-anywhere entry."""
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as handle:
+            handle.write("sometimes\tm.C.test_x\tbecause\n")
+            path = Path(handle.name)
+        self.addCleanup(path.unlink)
+        with self.assertRaises(ValueError) as caught:
+            ci_lane.load_tolerated_alternatives(path)
+        self.assertIn("unknown condition", str(caught.exception))
+
+    def test_a_malformed_line_is_refused_at_load(self) -> None:
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as handle:
+            handle.write("m.C.test_x\tbecause\n")   # the OLD two-column format
+            path = Path(handle.name)
+        self.addCleanup(path.unlink)
+        with self.assertRaises(ValueError):
+            ci_lane.load_tolerated_alternatives(path)
+
+
+class ToleratedManifestProvenanceTests(unittest.TestCase):
+    """The writer may not pass a one-platform observation off as a universal one."""
+
+    def test_the_checked_in_manifest_declares_both_platform_conditions(self) -> None:
+        """If this is ever regenerated into a macOS-only view, CI goes red on the runner."""
+        alternatives = ci_lane.load_tolerated_alternatives()
+        conditions = {name for entries in alternatives.values() for name, _ in entries}
+        self.assertIn("not_darwin", conditions)
+        self.assertIn("no_sandbox_exec", conditions)
+        self.assertIn("always", conditions)
+
+    def test_the_manifest_records_the_host_it_was_generated_on(self) -> None:
+        text = ci_lane.TOLERATED_SKIP_MANIFEST.read_text(encoding="utf-8")
+        self.assertRegex(text, r"# generated on: platform=\w+")
+        self.assertIn("simulated environment", text)
+
+    def test_the_writer_refuses_a_manifest_with_no_conditional_arm(self) -> None:
+        """The guard itself: a derivation that saw only this host must not be written.
+
+        Driven through the real `write_manifest` with the derivation stubbed to return the
+        one-platform view, and with the manifest path redirected so a refusal that did NOT
+        happen would be visible as a rewritten file rather than passing silently.
+        """
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "tolerated.txt"
+            target.write_text("SENTINEL\n", encoding="utf-8")
+            original_derive = ci_lane.derive_tolerated_alternatives
+            original_path = ci_lane.TOLERATED_SKIP_MANIFEST
+            original_run = ci_lane.unittest.TextTestRunner
+            ci_lane.derive_tolerated_alternatives = lambda observed: {
+                "m.Live.test_needs_runtime": [("always", "requires a live runtime")]}
+            ci_lane.TOLERATED_SKIP_MANIFEST = target
+            try:
+                captured = io.StringIO()
+                with contextlib.redirect_stderr(captured):
+                    code = self._write_manifest_with_stub_result()
+            finally:
+                ci_lane.derive_tolerated_alternatives = original_derive
+                ci_lane.TOLERATED_SKIP_MANIFEST = original_path
+                ci_lane.unittest.TextTestRunner = original_run
+            self.assertEqual(code, 1, "the writer emitted a one-platform view")
+            self.assertIn("one-platform view", captured.getvalue())
+            self.assertEqual(target.read_text(encoding="utf-8"), "SENTINEL\n",
+                             "the writer overwrote the manifest despite refusing")
+
+    def _write_manifest_with_stub_result(self) -> int:
+        """Run `write_manifest`'s body against a canned result, without the real suite."""
+        import contextlib
+        import io
+
+        langgraph_manifest = ci_lane.LANGGRAPH_SKIP_MANIFEST
+        with tempfile.TemporaryDirectory() as directory:
+            ci_lane.LANGGRAPH_SKIP_MANIFEST = Path(directory) / "langgraph.txt"
+            stub = SkipBudgetTests._Result(
+                [(SkipBudgetTests._Test("m.C.test_alpha"), "requires pinned langgraph 0.2.76")])
+
+            class _Runner:
+                def __init__(self, *args, **kwargs):
+                    pass
+
+                def run(self, suite):
+                    return stub
+
+            ci_lane.unittest.TextTestRunner = _Runner
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    return ci_lane.write_manifest(ci_lane.LANE_ABSENT)
+            finally:
+                ci_lane.LANGGRAPH_SKIP_MANIFEST = langgraph_manifest
+
+
+class ManifestMatchesTheDeclaredGatesTests(unittest.TestCase):
+    """Cross-check the checked-in manifest against the gates the source actually declares.
+
+    A second, INDEPENDENT mechanism. The manifest is produced by loading the suite under a
+    simulated environment and reading `__unittest_skip_why__`; this reads the decorator
+    names straight out of the AST. Neither derives from the other, so agreement is evidence
+    and disagreement is a real defect -- a test that gained or lost a gate without the
+    manifest being regenerated, or a derivation that dropped an arm.
+
+    It is not circular: the manifest is a checked-in file, so a gate added tomorrow makes
+    this test fail rather than being silently absorbed.
+    """
+
+    GATE_CONDITIONS = {"DARWIN_ONLY": "not_darwin", "NEEDS_SANDBOX": "no_sandbox_exec"}
+    MODULE = "test_review_isolation"
+
+    @classmethod
+    def declared_gates(cls) -> dict[str, set[str]]:
+        """`{test id: {condition, ...}}` read from the decorators in the source."""
+        import ast
+
+        source = (REPO_ROOT / "scripts" / f"{cls.MODULE}.py").read_text(encoding="utf-8")
+
+        def conditions(decorators):
+            return {cls.GATE_CONDITIONS[node.id] for node in decorators
+                    if isinstance(node, ast.Name) and node.id in cls.GATE_CONDITIONS}
+
+        gates: dict[str, set[str]] = {}
+        for node in ast.parse(source).body:
+            if not isinstance(node, ast.ClassDef):
+                continue
+            class_conditions = conditions(node.decorator_list)
+            for member in node.body:
+                if (isinstance(member, ast.FunctionDef)
+                        and member.name.startswith("test")):
+                    found = class_conditions | conditions(member.decorator_list)
+                    if found:
+                        gates[f"{cls.MODULE}.{node.name}.{member.name}"] = found
+        return gates
+
+    def test_the_source_declares_platform_gates_at_all(self) -> None:
+        """Guards the two tests below from passing vacuously if the AST walk breaks."""
+        gates = self.declared_gates()
+        self.assertGreater(len(gates), 10, "the AST walk found almost no gates; it is broken")
+        self.assertTrue(any(len(c) > 1 for c in gates.values()),
+                        "no double-gated test found; the two-arm case would go unchecked")
+
+    def test_every_declared_gate_has_its_arm_in_the_manifest(self) -> None:
+        """Kills a derivation that drops the second arm of a double-gated test.
+
+        Thirteen isolation tests carry BOTH gates. With only the `not_darwin` arm the
+        contract is still exact on Linux and on a normal Mac -- and wrong on a Mac without
+        sandbox-exec, where those tests skip for a reason the manifest does not expect. That
+        is a narrower version of the very bug this round is fixing, so it gets its own test.
+        """
+        manifest = ci_lane.load_tolerated_alternatives()
+        for test_id, expected_conditions in sorted(self.declared_gates().items()):
+            with self.subTest(test_id=test_id):
+                declared = {condition for condition, _ in manifest.get(test_id, [])}
+                self.assertEqual(
+                    declared, expected_conditions,
+                    f"{test_id} declares gates {sorted(expected_conditions)} in the source "
+                    f"but {sorted(declared)} in {ci_lane.TOLERATED_SKIP_MANIFEST.name}; "
+                    "regenerate the manifest")
+
+    def test_the_manifest_declares_no_platform_arm_the_source_does_not(self) -> None:
+        """The other direction: a stale entry for a gate that was removed."""
+        gates = self.declared_gates()
+        for test_id, entries in sorted(ci_lane.load_tolerated_alternatives().items()):
+            conditions = {condition for condition, _ in entries if condition != "always"}
+            if not conditions:
+                continue
+            with self.subTest(test_id=test_id):
+                self.assertEqual(
+                    conditions, gates.get(test_id, set()),
+                    f"{ci_lane.TOLERATED_SKIP_MANIFEST.name} expects {test_id} to skip under "
+                    f"{sorted(conditions)}, but the source declares "
+                    f"{sorted(gates.get(test_id, set()))}")
+
+    def test_the_darwin_arm_precedes_the_sandbox_arm(self) -> None:
+        """Precedence is the contract, not a formatting detail.
+
+        On Linux both conditions hold and `unittest` records the OUTERMOST decorator's
+        reason -- `@DARWIN_ONLY` sits above `@NEEDS_SANDBOX` on those classes. If the arms
+        were listed the other way round the manifest would expect the sandbox reason and the
+        runner would report a reason mismatch on all thirteen.
+        """
+        for test_id, entries in ci_lane.load_tolerated_alternatives().items():
+            conditions = [condition for condition, _ in entries]
+            if {"not_darwin", "no_sandbox_exec"} <= set(conditions):
+                with self.subTest(test_id=test_id):
+                    self.assertLess(conditions.index("not_darwin"),
+                                    conditions.index("no_sandbox_exec"))
+
+    def test_the_sandbox_exec_path_matches_the_isolation_module(self) -> None:
+        """`ci_lane` duplicates the constant to stay importable in the absent lane."""
+        from scripts import review_isolation
+
+        self.assertEqual(ci_lane.SANDBOX_EXEC, review_isolation.SANDBOX_EXEC)
+
+
+class LangGraphManifestIsPlatformIndependentTests(unittest.TestCase):
+    """Round 3 asked whether the 240-id manifest is correct BY CONSTRUCTION or by luck.
+
+    By construction, and this is the assertion that keeps it so: a LangGraph gate is a
+    DEPENDENCY condition, identical on every platform, and the two lanes are defined by it.
+    The one way it could become platform-dependent is a test carrying BOTH a LangGraph gate
+    and a platform gate -- then on Linux the platform reason could win, the test would
+    vanish from the LangGraph manifest and appear as an undeclared tolerated skip. The two
+    sets must therefore stay disjoint.
+    """
+
+    def test_no_test_is_both_langgraph_gated_and_platform_gated(self) -> None:
+        langgraph = ci_lane.load_expected_langgraph_skips()
+        platform_gated = {
+            test_id for test_id, entries in ci_lane.load_tolerated_alternatives().items()
+            if any(name != "always" for name, _ in entries)}
+        overlap = sorted(langgraph & platform_gated)
+        self.assertEqual(
+            overlap, [],
+            "these tests are gated on BOTH the LangGraph runtime and the platform, so which "
+            "reason the runner records depends on decorator order and the LangGraph manifest "
+            "is no longer platform-independent: " + ", ".join(overlap))
 
 
 class ToleratedSkipManifestTests(unittest.TestCase):
     """The checked-in tolerated manifest must be real, and must match the live gates."""
 
     def test_every_declared_entry_is_a_test_id_and_a_non_empty_reason(self) -> None:
-        for test_id, reason in ci_lane.load_tolerated_skips():
+        for test_id, entries in ci_lane.load_tolerated_alternatives().items():
             with self.subTest(test_id=test_id):
                 self.assertRegex(test_id, r"^[A-Za-z_][\w.]*\.[A-Za-z_]\w*\.[A-Za-z_]\w*$")
-                self.assertTrue(reason.strip(), "a tolerated skip must declare its reason")
+                self.assertTrue(entries, "a declared test must carry a condition")
+                for condition, reason in entries:
+                    self.assertIn(condition, ci_lane.CONDITIONS)
+                    self.assertTrue(reason.strip(),
+                                    "a tolerated skip must declare its reason")
 
     def test_the_git_availability_skips_are_deliberately_NOT_tolerated(self) -> None:
         """If the whitespace gate stops running because git is missing, the lane goes red.
@@ -567,7 +945,8 @@ class ToleratedSkipManifestTests(unittest.TestCase):
         That gate silently not running is the same class of defect as an incidental skip,
         so it must not be tolerated. Asserted rather than left to a comment.
         """
-        reasons = {reason for _, reason in ci_lane.load_tolerated_skips()}
+        reasons = {reason for entries in ci_lane.load_tolerated_alternatives().values()
+                   for _condition, reason in entries}
         for forbidden in ("git is not available on PATH", "not a git checkout"):
             with self.subTest(reason=forbidden):
                 self.assertNotIn(forbidden, reasons)
@@ -578,7 +957,8 @@ class ToleratedSkipManifestTests(unittest.TestCase):
         Reads the reason out of the test module's source, so a change there that is not
         reconciled into the manifest fails here rather than at the next full lane run.
         """
-        declared = {reason for _, reason in ci_lane.load_tolerated_skips()}
+        declared = {reason for entries in ci_lane.load_tolerated_alternatives().values()
+                    for condition, reason in entries if condition == 'always'}
         source = (REPO_ROOT / "scripts" / "test_orca_runtime.py").read_text(encoding="utf-8")
         for reason in declared:
             with self.subTest(reason=reason):

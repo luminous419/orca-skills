@@ -7,6 +7,8 @@
 #
 # The dependency-ABSENT lane requires this set to be skipped EXACTLY -- no missing entry,
 # no extra one. The dependency-PRESENT lane requires every one of them to have EXECUTED.
+# No platform condition applies: a LangGraph gate is a dependency gate, and no test is
+# gated on both the runtime and the platform (asserted by test_ci_lanes.py).
 test_deterministic_workflow_adapters.LangGraphAdapterParityTests.test_fake_and_orca_adapter_have_identical_graph_trace
 test_deterministic_workflow_cancel.AbandonTests.test_a_residual_row_completes_the_abandon_but_never_claims_ac1
 test_deterministic_workflow_cancel.AbandonTests.test_a_residual_row_is_never_labelled_transferred_and_never_names_an_actor
