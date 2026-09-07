@@ -63,6 +63,7 @@ from scripts.orca_runtime_harness import (
 from scripts.test_orca_runtime_contract import (
     COMPLETED_AT,
     DECLARED_DONE_BODY,
+    bind_gate_body,
     RecordingExec,
 )
 
@@ -80,7 +81,8 @@ PLAN_DELIVERY = "delivery_plan_first"
 
 
 def worker_done_message(
-    task_id: str, dispatch_id: str, *, message_id: str = "", outcome: str = "succeeded"
+    task_id: str, dispatch_id: str, *, message_id: str = "", outcome: str = "succeeded",
+    body: str = DECLARED_DONE_BODY,
 ) -> dict[str, Any]:
     return {
         "id": message_id or f"msg_{dispatch_id}",
@@ -88,8 +90,25 @@ def worker_done_message(
         "payload": json.dumps(
             {"taskId": task_id, "dispatchId": dispatch_id, "outcome": outcome}
         ),
-        "body": DECLARED_DONE_BODY,
+        "body": body,
     }
+
+
+def bound_done_body(run_id: str, *, phase: str = "implementation", iteration: int = 1,
+                    role: str = "worker") -> str:
+    """`DECLARED_DONE_BODY` with the mechanics identity of THIS dispatch filled in.
+
+    OS-42 round 3: the live ingress no longer accepts a settlement that omits its
+    mechanics identity, and these deliveries are hand-built rather than driven through a
+    recorder that can read the dispatched spec, so the identity is supplied here.
+    """
+    agent = "reviewer" if role.endswith("reviewer") else "worker"
+    return bind_gate_body(DECLARED_DONE_BODY, {
+        "ledger_schema_version": decision_gate.LEDGER_RECORD_SCHEMA_VERSION,
+        "boundary": "B3" if agent == "reviewer" else "B2",
+        "source": agent, "role": agent,
+        "run": run_id, "phase": phase, "iteration": iteration,
+    })
 
 
 def delivery(delivery_id: str, *messages: dict[str, Any]) -> dict[str, Any]:
@@ -956,7 +975,9 @@ class DuplicateDeliverySideEffectTests(OS44TestCase):
         one = self.ATTEMPT_ONE
         recorder = MailboxExec(
             [
-                delivery(one["delivery"], worker_done_message(one["task"], one["dispatch"])),
+                delivery(one["delivery"], worker_done_message(
+                    one["task"], one["dispatch"],
+                    body=bound_done_body(self.RUN_ID, iteration=1))),
                 *extra_deliveries,
             ]
         )
@@ -978,19 +999,25 @@ class DuplicateDeliverySideEffectTests(OS44TestCase):
         FIRST attempt settled -- everything the replays are forbidden to change.
         """
         one, two = self.ATTEMPT_ONE, self.ATTEMPT_TWO
-        stale = worker_done_message(one["task"], one["dispatch"], message_id="msg_stale")
+        first = bound_done_body(self.RUN_ID, iteration=1)
+        second = bound_done_body(self.RUN_ID, iteration=2)
+        stale = worker_done_message(one["task"], one["dispatch"],
+                                    message_id="msg_stale", body=first)
         recorder = MailboxExec(
             [
                 # attempt 1's own result
-                delivery(one["delivery"], worker_done_message(one["task"], one["dispatch"])),
+                delivery(one["delivery"], worker_done_message(
+                    one["task"], one["dispatch"], body=first)),
                 # DUPLICATE: the same delivery id again, which is what an unconsumed
                 # acknowledgement produces.
-                delivery(one["delivery"], worker_done_message(one["task"], one["dispatch"])),
+                delivery(one["delivery"], worker_done_message(
+                    one["task"], one["dispatch"], body=first)),
                 # OUT OF ORDER: a fresh delivery id carrying the PREVIOUS attempt's
                 # worker_done, arriving while attempt 2's waiter is armed.
                 delivery("dlv_out_of_order", stale),
                 # attempt 2's own result
-                delivery(two["delivery"], worker_done_message(two["task"], two["dispatch"])),
+                delivery(two["delivery"], worker_done_message(
+                    two["task"], two["dispatch"], body=second)),
             ]
         )
         recorder.results["run-create"] = {"run": {"id": self.RUN_ID}}

@@ -147,6 +147,23 @@ def route(state: dict[str, Any]) -> str:
     if state.get("run_lifecycle") == "WAITING_FOR_INPUT": return "PAUSE"
     if state["decision_state"] in ("NEEDS_INPUT", "CONFLICT"):
         return "PAUSE" if pause_admissible(state) else "BLOCK"
+    # ---- OS-42.  AFTER the decision axis and BEFORE the capability and quality axes.
+    # After, so a run whose decision_state is already blocking returns PAUSE/BLOCK before
+    # the repair branch is even evaluated -- that ordering is what makes "NEEDS_INPUT and
+    # CONFLICT are never bypassed by schema repair" a property of the state machine rather
+    # than a rule someone has to remember.  Before, so phase_gate -- and therefore
+    # PREPARE_PHASE_REVIEWER -- is never consulted for a defective round.
+    #
+    # The branch READS the code the classifier already computed with `kinds == {"FORM"}`
+    # as an equality; it never re-classifies.  It consults the budget ONLY on the FORM
+    # arm, so a SEMANTIC or LIFECYCLE defect can never spend a repair attempt, not even by
+    # exhausting one.
+    defect = state.get("pending_gate_defect")
+    if defect is not None:
+        return ("PREPARE_REPAIR"
+                if defect["code"] == "DECISION_GATE_FORM_DEFECT"
+                and state["remaining_repair_budget"] > 0
+                else "BLOCK")
     if missing_capabilities(BASE_CAPABILITIES, frozenset(state["adapter_capabilities"])): return "BLOCK"
     kind = state["round_kind"]
     if kind == "FINAL_REVIEW":

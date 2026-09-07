@@ -157,7 +157,7 @@ not independently choose a next phase or retry. The following block is validated
 runtime-neutral graph specification.
 
 ```workflow-graph-contract
-{"workflow_id":"os40.standard.v1","schema_version":"os40.workflow.v1","phases":["ANALYSIS","PLAN","DESIGN","IMPLEMENTATION","TEST"],"route_tokens":["BLOCK","ESCALATE","PREPARE_WORKER","PREPARE_PHASE_REVIEWER","ADVANCE_PHASE","PREPARE_FINAL_REVIEWER","PREPARE_CORRECTION","PREPARE_REVALIDATION","COMPLETE","PAUSE","CANCEL","ABANDON"],"terminal_statuses":["COMPLETED","BLOCKED","ESCALATED","CANCELLED","ABANDONED"],"iteration_domains":["PHASE_ITERATIONS","FINAL_REVIEW_ITERATIONS"],"decision_first":true,"final_review_mandatory":true,"downstream_revalidation":"high_only","launcher":"tools/run_workflow.py"}
+{"workflow_id":"os40.standard.v1","schema_version":"os40.workflow.v2","phases":["ANALYSIS","PLAN","DESIGN","IMPLEMENTATION","TEST"],"route_tokens":["BLOCK","ESCALATE","PREPARE_WORKER","PREPARE_PHASE_REVIEWER","ADVANCE_PHASE","PREPARE_FINAL_REVIEWER","PREPARE_CORRECTION","PREPARE_REVALIDATION","COMPLETE","PAUSE","CANCEL","ABANDON","PREPARE_REPAIR"],"terminal_statuses":["COMPLETED","BLOCKED","ESCALATED","CANCELLED","ABANDONED"],"iteration_domains":["PHASE_ITERATIONS","FINAL_REVIEW_ITERATIONS","REPAIR_ATTEMPTS"],"decision_first":true,"final_review_mandatory":true,"downstream_revalidation":"high_only","launcher":"tools/run_workflow.py"}
 ```
 
 ## Workflow Control Plane Authority
@@ -234,6 +234,15 @@ phase 전이, phase gate, correction loop, iteration budget, Final Review routin
       ],
       "sections": [
         "## Durable Pause and Resume (OS-31)"
+      ]
+    },
+    {
+      "decision": "VALIDATION_REPAIR",
+      "route_tokens": [
+        "PREPARE_REPAIR"
+      ],
+      "sections": [
+        "## Validation Repair (OS-42)"
       ]
     }
   ],
@@ -2540,6 +2549,41 @@ run_workflow.py resume --run-id RUN_ID [--artifact-base DIR] [--cancel | --aband
 
 LangGraph가 없으면 `discover`는 동작하되 모든 verdict가 `CHECKPOINT_UNVERIFIED`이고,
 `resume`은 claim을 잡기 전에 `LANGGRAPH_DEPENDENCY_MISSING`으로 거부된다.
+
+## Validation Repair (OS-42)
+
+> **NON-AUTHORITATIVE (graph-owned).** 이 절의 routing 규칙은 deterministic workflow engine이 소유한다. 아래 설명은 engine 동작의 파생 문서이며, engine과 어긋나면 engine이 정답이다.
+
+decision gate의 machine-control 출력이 **형식**만 잘못되었을 때, engine은 같은 phase/iteration
+안에서 같은 role에게 **한정된 횟수만** 다시 요청한다. 이것은 quality correction이 아니며 Worker/
+Reviewer correction budget을 소비하지 않는다.
+
+```text
+VALIDATION_REPAIR_CLASSES = form, semantic, lifecycle
+VALIDATION_REPAIR_REPAIRABLE = form_only
+VALIDATION_REPAIR_DEFAULT = fail_closed_not_repairable
+VALIDATION_REPAIR_BUDGET_DOMAIN = repair_attempts_disjoint_from_phase_and_final_review
+VALIDATION_REPAIR_ROUTE_TOKEN = prepare_repair
+VALIDATION_REPAIR_SAME_ROUND = same_phase_same_iteration_same_role
+VALIDATION_REPAIR_ARTIFACT_IDENTITY = gate_iteration_never_repair_attempt
+VALIDATION_REPAIR_INPUT = validator_error_and_expected_schema_only
+VALIDATION_REPAIR_INFERENCE = coordinator_never_selects_a_value
+VALIDATION_REPAIR_SEMANTIC_BLOCK = never_bypassed_by_repair
+VALIDATION_REPAIR_EXHAUSTION = block_with_error_field_allowed_values_and_count
+```
+
+**세 부류.** FORM은 표현의 결함이다 — 닫힌 enum 밖의 값, boolean 자리의 문자열, 빠진 field,
+닫힌 집합 밖의 key, null, 잘못된 type. SEMANTIC은 판단이다 — INV-4, 선언되지 않은 safety fact,
+clause 증명, 그리고 record가 실제로 선언한 `NEEDS_INPUT`/`CONFLICT`. LIFECYCLE은 ledger·build·
+binding의 결함이다. **FORM으로 적극적으로 분류되지 않은 것은 절대 repair되지 않는다** — 분류되지
+않은 code는 LIFECYCLE로 떨어지며, 그것이 이 기능의 fail-closed default다.
+
+**의미적 차단은 우회되지 않는다.** repair 분기는 decision 축 **뒤에** 놓인다. 이미 blocking인
+run은 repair 분기를 평가하기도 전에 PAUSE/BLOCK으로 나가고, budget은 FORM 갈래에서만 조회되므로
+SEMANTIC/LIFECYCLE 결함은 repair 시도를 한 번도 소비할 수 없다.
+
+**Coordinator는 값을 고르지 않는다.** repair 입력은 validator의 error, field path, agent가 보낸
+값, 그리고 **허용 집합 전체**만 담는다. 후보 값을 제안하는 field는 닫힌 key set 어디에도 없다.
 
 ## Coordinator Turn Quiescence and Delivery Ack Ordering (OS-44)
 

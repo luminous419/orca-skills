@@ -23,12 +23,18 @@ except ModuleNotFoundError:  # run directly as scripts/fake_*.py
 # engine presuming one.
 DECISION_GATE_STATE_FIELD = "DECISION_GATE_STATE"
 DECISION_GATE_STATES = ("CLEAR", "ASSUMPTION_ALLOWED", "NEEDS_INPUT", "CONFLICT")
+# The mechanics identity keys a dispatched record is GIVEN and must declare back. The
+# set is closed here so a malformed `--decision-gate-mechanics-json` cannot smuggle an
+# arbitrary key into the record and turn an identity test into a closed-key-set test.
+MECHANICS_KEYS = (
+    "ledger_schema_version", "boundary", "source", "role", "run", "phase", "iteration",
+)
 
 # One record per state, each the minimum the shipped OS-28 contract accepts for that
-# state. They are the DECISION half only: run/phase/iteration/boundary/sequence and
-# the rest of the ledger mechanics are stamped by the harness, which is what makes
-# the ledger bind to the round that actually settled rather than to what an agent
-# claimed about itself.
+# state. They are the DECISION half only. The MECHANICS half -- the seven identity
+# fields -- is merged in by `render_decision_gate` from the contract block the dispatch
+# actually carried; see `decision_gate_mechanics` below for why these fakes now declare
+# it instead of leaving it to the harness.
 _DECISION_GATE_RECORDS = {
     "CLEAR": {
         "state": "CLEAR",
@@ -115,6 +121,39 @@ def add_decision_gate_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--decision-gate-record-extend", default=None)
     parser.add_argument("--decision-gate-omit-field", action="store_true")
     parser.add_argument("--decision-gate-omit-block", action="store_true")
+    # OS-42 round 3. The mechanics identity THIS dispatch was given, as JSON, read by
+    # `orca_fake_agent` out of the generated contract block in the prompt -- which is
+    # exactly where a real agent reads it. Per-DISPATCH, so it is passed here rather
+    # than baked into the terminal's launch command line: the session-reuse gate
+    # compares that command line, and a per-phase value in it would deny reuse that the
+    # reuse rules allow.
+    parser.add_argument("--decision-gate-mechanics-json", default="{}")
+
+
+def decision_gate_mechanics(args: argparse.Namespace) -> dict:
+    """The seven mechanics identity fields this dispatch's record must declare.
+
+    OS-42 round 3. The live OS-29 ingress used to accept a settlement that declared no
+    mechanics at all and fill every identity field in from local context before
+    publishing it -- so an agent could dodge the identity check by saying nothing. That
+    exemption is gone: absent required mechanics is now a FORM defect the bounded repair
+    loop re-asks. These fakes stand in for a CONFORMING agent, and a conforming agent
+    copies the values out of the generated contract block it was dispatched with, so
+    that is what they do. `orca_fake_agent` parses the block and hands the result over
+    as `--decision-gate-mechanics-json`.
+
+    An EMPTY mapping is a legitimate answer and is passed through untouched: a dispatch
+    that carried no contract block (a hand-built double, a legacy spec) declares no
+    mechanics, and the ingress then reports the absence rather than this function
+    inventing a value the agent was never given.
+    """
+    try:
+        mechanics = json.loads(getattr(args, "decision_gate_mechanics_json", "") or "{}")
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(mechanics, dict):
+        return {}
+    return {key: value for key, value in mechanics.items() if key in MECHANICS_KEYS}
 
 
 def render_decision_gate(args: argparse.Namespace, extra: dict | None = None) -> str:
@@ -134,7 +173,9 @@ def render_decision_gate(args: argparse.Namespace, extra: dict | None = None) ->
     if args.decision_gate_record_raw is not None:
         lines.extend(["```decision-gate", args.decision_gate_record_raw, "```"])
     elif state and not args.decision_gate_omit_block:
-        record = dict(_DECISION_GATE_RECORDS[state])
+        # Mechanics FIRST, so the state record, `--decision-gate-record-extend` and
+        # `extra` can each still override one for a negative scenario.
+        record = {**decision_gate_mechanics(args), **_DECISION_GATE_RECORDS[state]}
         if getattr(args, "decision_gate_record_extend", None):
             record.update(json.loads(args.decision_gate_record_extend))
         if extra:

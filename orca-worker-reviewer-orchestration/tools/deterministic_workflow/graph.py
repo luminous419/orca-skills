@@ -8,7 +8,9 @@ from weakref import WeakKeyDictionary
 
 from langgraph.graph import END, START, StateGraph
 
-from .executor import (advance_phase_node, apply_result_node, dispose_node,
+from . import audit
+from .executor import (advance_phase_node, apply_result_node, audit_gate_transition,
+                       audit_repair_request, audit_terminal, dispose_node,
                        execute_intent_node, pause_node, prepare_intent_node, route_node,
                        terminal_node, validate_node, validate_settlement_node)
 from .graph_spec import NODES, ROUTE_TARGETS, validate_graph_spec
@@ -27,7 +29,67 @@ PROTECTED_STATE_FIELDS = frozenset({
     "terminal_status", "terminal_reason", "run_lifecycle", "pause_binding",
     "phase_passes", "phase_pass_floor", "binding_generation",
     "processed_command_ids", "processed_event_ids",
+    # OS-42.  A forged repair counter is a forged budget, and a forged defect list is a
+    # forged reason to re-ask an agent.  Repair state is produced only by the graph:
+    # `UPDATE_COMMANDS` names none of these either, so there is no typed out-of-band
+    # write and no raw one.
+    "repair_attempts", "remaining_repair_budget", "repair_binding", "pending_gate_defect",
+    # Forging an outbox entry would forge an audit row about a transition that never
+    # happened, so it is refused on the raw ingress exactly as a forged budget is.
+    "audit_outbox",
 })
+
+def _audited(node: Any, sink: Any, emitter: Any) -> Any:
+    """Wrap a node so the audit INTENT rides the checkpoint and delivery is retried.
+
+    The wrapper, not the node body, is where this happens, so the node functions keep
+    their signatures and no existing caller or test moves.
+
+    Order matters and each step is deliberate:
+
+    1. the node computes the transition;
+    2. the pure emitter turns that transition into outbox entries;
+    3. the entries are merged into ``audit_outbox`` -- which is CHECKPOINTED, so an
+       undelivered intent survives a crash and is retried by the next node or by a
+       resume of this thread;
+    4. delivery is attempted and only DELIVERED entries are removed.
+
+    Step 4 cannot raise and cannot alter anything the node decided: ``flush_outbox`` is
+    total, and its result is written only back into the outbox itself.  So an audit
+    failure leaves a retriable intent and changes no lifecycle decision -- both
+    constraints at once.
+
+    Every node is wrapped, not only the three that emit: a node that emits nothing still
+    retries whatever an EARLIER node failed to deliver, which is what makes "retried on
+    the next node" true rather than aspirational.
+    """
+
+    def wrapped(state: dict[str, Any]) -> dict[str, Any]:
+        new_state = node(state)
+        entries = emitter(state, new_state) if emitter is not None else ()
+        outbox = audit.merge_outbox(new_state, entries)
+        if not outbox:
+            return new_state
+        return {**new_state, "audit_outbox": audit.flush_outbox(sink, outbox)}
+
+    return wrapped
+
+
+def _resolve_gate_contract(skill_path: Any) -> tuple[Any, Any]:
+    """The decision policy and the classifier, resolved ONCE at build time.
+
+    Imported lazily and here rather than at ``executor`` module scope: ``executor`` is
+    inside the shipped engine package and ``decision_contract`` is a ``tools/`` sibling,
+    so a module-scope import would make the whole engine unimportable whenever the
+    sibling is absent -- turning a packaging mistake into a total failure instead of the
+    named build-time refusal below.
+    """
+    try:  # repository layout
+        from scripts import decision_contract
+    except ImportError:  # installed Skill layout exposes sibling tools directly
+        import decision_contract  # type: ignore[no-redef]
+    return decision_contract.resolve_policy(skill_path), decision_contract.classify_gate
+
 
 class DurableCheckpointerRequired(ValueError):
     """A production graph that can pause must be able to survive the process.
@@ -329,7 +391,7 @@ def build_graph(adapter: Any, *, checkpointer: Any = None, runtime_state: Any = 
                 require_durable_checkpointer: bool = True,
                 settlement_port: Any = None, approval_port: Any = None,
                 journal: Any = None, skill_path: Any = None, clock: Any = None,
-                sources_provider: Any = None):
+                sources_provider: Any = None, audit_sink: Any = None):
     """Compile the workflow graph.
 
     A durable ``RuntimeStatePort`` is **required**: EXECUTE_INTENT claims each stable intent
@@ -353,18 +415,24 @@ def build_graph(adapter: Any, *, checkpointer: Any = None, runtime_state: Any = 
                 else getattr(adapter, "approval_port", None))
     journal = journal if journal is not None else getattr(adapter, "settlement_journal", None)
     graph = StateGraph(WorkflowState)
-    graph.add_node("VALIDATE", validate_node)
-    graph.add_node("ROUTE", route_node)
-    graph.add_node("ADVANCE_PHASE", advance_phase_node)
-    graph.add_node("PREPARE_INTENT", prepare_intent_node)
-    graph.add_node("EXECUTE_INTENT", execute_intent_node(adapter, ledger))
-    graph.add_node("VALIDATE_SETTLEMENT", validate_settlement_node)
-    graph.add_node("APPLY_RESULT", apply_result_node)
+    graph.add_node("VALIDATE", _audited(validate_node, audit_sink, None))
+    graph.add_node("ROUTE", _audited(route_node, audit_sink, None))
+    graph.add_node("ADVANCE_PHASE", _audited(advance_phase_node, audit_sink, None))
+    graph.add_node("PREPARE_INTENT",
+                   _audited(prepare_intent_node, audit_sink, audit_repair_request))
+    graph.add_node("EXECUTE_INTENT",
+                   _audited(execute_intent_node(adapter, ledger), audit_sink, None))
+    gate_policy, gate_classifier = _resolve_gate_contract(skill_path)
+    graph.add_node("VALIDATE_SETTLEMENT",
+                   _audited(validate_settlement_node(gate_policy, gate_classifier),
+                            audit_sink, audit_gate_transition))
+    graph.add_node("APPLY_RESULT", _audited(apply_result_node, audit_sink, None))
     graph.add_node("PAUSE", pause_node(settlement, approval, clock=clock,
                                        skill_path=skill_path, journal=journal,
                                        sources_provider=sources_provider))
     graph.add_node("DISPOSE", dispose_node(settlement, clock=clock, journal=journal))
-    graph.add_node("TERMINAL", terminal_node)
+    graph.add_node("TERMINAL",
+                   _audited(terminal_node, audit_sink, audit_terminal))
     graph.add_edge(START, "VALIDATE")
     graph.add_edge("VALIDATE", "ROUTE")
     graph.add_conditional_edges("ROUTE", lambda state: state["route_token"], ROUTE_TARGETS)

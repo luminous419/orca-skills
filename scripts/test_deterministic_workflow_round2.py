@@ -57,12 +57,21 @@ def base_state(run_id="run_r2", thread_id="t", phases=("ANALYSIS",), **kwargs):
                               capabilities=BASE_CAPABILITIES, **kwargs))
 
 
-def worker_result(head=HEAD_B, digest="tree-b", artifact_root="run_r2", **extra):
+# OS-42: the artifact a WORKER in the ANALYSIS phase is contracted to write. It used to
+# be the placeholder "artifacts/x.md", which predates the contract; `apply_result_node`
+# now refuses a settlement reporting a path it was not contracted to write
+# (ARTIFACT_IDENTITY_DRIFT), so the fixture states the real one. Nothing these tests
+# assert -- repository/artifact binding advancement -- is affected.
+CONTRACTED_ARTIFACT = "artifacts/runs/run_r2/ANALYSIS.md"
+
+
+def worker_result(head=HEAD_B, digest="tree-b", artifact_root="run_r2",
+                  relative_path=CONTRACTED_ARTIFACT, **extra):
     result = {"status": "COMPLETE", "unit_test_status": "PASS",
               "binding": {"repository": {"head_sha": head, "tree_digest": digest,
                                          "dirty": False},
                           "artifact": {"artifact_root_id": artifact_root,
-                                       "relative_path": "artifacts/x.md",
+                                       "relative_path": relative_path,
                                        "digest": "art-1", "evidence_ids": ["ev-1"]}}}
     result.update(extra)
     return result
@@ -576,6 +585,13 @@ class BindingAdvancementTests(unittest.TestCase):
 
     def applied(self, state, role, result, round_kind="PHASE_GATE"):
         from scripts.deterministic_workflow.executor import apply_result_node
+        if role == "FINAL_REVIEWER" and state["final_review_iterations"] == 0:
+            # OS-42: `prepare_intent_node` PRE-increments final_review_iterations before
+            # calling make_intent, so a Final Reviewer intent always sees a one-based
+            # ordinal. These tests build the intent by hand, so they do the same rather
+            # than presenting a state production never produces.
+            state = dict(state, final_review_iterations=1,
+                         remaining_final_budget=state["remaining_final_budget"] - 1)
         intent = make_intent(state, role, round_kind)
         event = make_settlement_event(intent, result, occurred_at="2026-01-01T00:00:01Z")
         working = deepcopy(state)
@@ -771,7 +787,9 @@ class BindingAdvancementTests(unittest.TestCase):
         from scripts.deterministic_workflow.graph import build_graph
         from scripts.deterministic_workflow.routing import verify_final_review_binding
         ledger = self.ledger()
-        results = [worker_result(artifact_root="run_full"), REVIEW_PASS, REVIEW_PASS]
+        results = [worker_result(artifact_root="run_full",
+                                 relative_path="artifacts/runs/run_full/ANALYSIS.md"),
+                   REVIEW_PASS, REVIEW_PASS]
         adapter = FakeAdapter(results, runtime_state=ledger)
         out = build_graph(adapter, runtime_state=ledger, require_durable_checkpointer=False).invoke(
             base_state(run_id="run_full", thread_id="t"), {"recursion_limit": 200})

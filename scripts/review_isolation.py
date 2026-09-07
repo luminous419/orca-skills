@@ -3067,7 +3067,15 @@ def repatriate(
     session = Path(session)
     root = (Path(base) if base else Path.cwd()) / "artifacts" / "runs" / run_id
     root.mkdir(parents=True, exist_ok=True)
-    suffix = "" if attempt == 1 else f"_iteration{attempt}"
+    # OS-42: the shared ladder, not a fourth copy of the same expression. This module is
+    # also run as a standalone script, so it needs both import forms.
+    try:
+        from scripts.deterministic_workflow.artifact_identity import _iteration_suffix
+    except ImportError:  # pragma: no cover - direct `python3 scripts/...` execution
+        from deterministic_workflow.artifact_identity import (  # type: ignore[no-redef]
+            _iteration_suffix)
+
+    suffix = _iteration_suffix(attempt)
     source = session / "review_root" / "artifacts" / "runs" / run_id / FINAL_REVIEW_REPORT_FILENAME
     if not source.is_file():
         raise IsolationContractError(

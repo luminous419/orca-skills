@@ -96,7 +96,8 @@ def validate(path: Path = SKILL) -> None:
     actual=json.loads(matches[0])
     expected={"workflow_id":WORKFLOW_ID,"schema_version":SCHEMA_VERSION,"phases":list(PHASES),
               "route_tokens":list(ROUTE_TOKENS),"terminal_statuses":list(TERMINAL_STATUSES),
-              "iteration_domains":["PHASE_ITERATIONS","FINAL_REVIEW_ITERATIONS"],
+              "iteration_domains":["PHASE_ITERATIONS","FINAL_REVIEW_ITERATIONS",
+                                   "REPAIR_ATTEMPTS"],
               "decision_first":True,"final_review_mandatory":True,"downstream_revalidation":"high_only",
               "launcher":"tools/run_workflow.py"}
     if actual!=expected: raise ValueError(f"workflow graph contract mismatch: {actual!r}")

@@ -7,6 +7,7 @@ import argparse
 import ast
 import inspect
 import json
+import re
 import subprocess
 import sys
 import shutil
@@ -95,7 +96,65 @@ from scripts.task_context import (
 # text comes from fake_worker.render_decision_gate(), the same renderer the real fake
 # agents use, so the doubles and the subprocess agents cannot drift apart and no
 # decision vocabulary is restated here.
-def gate_declaration(state: str = "CLEAR", verifies: str | None = None) -> str:
+# ---- OS-42 round 3: the doubles declare the mechanics identity too ------------------
+# The live ingress no longer accepts a settlement that omits its mechanics identity: the
+# generated contract block hands every dispatch those seven values and a record that
+# leaves them out is a correctable FORM defect. The subprocess fakes read them out of the
+# prompt (see `orca_fake_agent.extract_gate_mechanics`). The offline doubles below have
+# no prompt, but they DO see the dispatched Task spec go past on `task-create` -- which
+# carries the same block -- so they read it from there and fill in whatever the body left
+# absent. Filling only ABSENT keys is the load-bearing part: a scenario that deliberately
+# declares a foreign or unknown value keeps it, so every negative test still tests what
+# it says it does.
+_GATE_FENCE = re.compile(r"(?ms)^```decision-gate\n(?P<body>.*?)\n```")
+_MECHANICS_KEYS = (
+    "ledger_schema_version", "boundary", "source", "role", "run", "phase", "iteration",
+)
+
+
+def _flag_value(args: tuple[str, ...], flag: str) -> str:
+    """The value that follows `flag`, or "". Mirrors `orca_runtime_harness._flag_value`."""
+    for index, token in enumerate(args):
+        if token == flag and index + 1 < len(args):
+            return args[index + 1]
+    return ""
+
+
+def gate_mechanics_of(spec: str) -> dict:
+    """The mechanics identity the generated contract block in `spec` names, or ``{}``."""
+    match = _GATE_FENCE.search(spec or "")
+    if match is None:
+        return {}
+    try:
+        skeleton = json.loads(match.group("body"))
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(skeleton, dict):
+        return {}
+    return {key: skeleton[key] for key in _MECHANICS_KEYS if key in skeleton}
+
+
+def bind_gate_body(body: str, mechanics: dict) -> str:
+    """Fill the mechanics keys a settled body left ABSENT. Declared keys are untouched."""
+    if not mechanics or not isinstance(body, str):
+        return body
+
+    def fill(match: "re.Match[str]") -> str:
+        try:
+            record = json.loads(match.group("body"))
+        except json.JSONDecodeError:
+            return match.group(0)
+        if not isinstance(record, dict):
+            return match.group(0)
+        merged = {**mechanics, **record}
+        return ("```decision-gate\n"
+                + json.dumps(merged, indent=2, sort_keys=True) + "\n```")
+
+    return _GATE_FENCE.sub(fill, body)
+
+
+def gate_declaration(state: str = "CLEAR", verifies: str | None = None, *,
+                     mechanics: dict | None = None) -> str:
     """One valid `DECISION_GATE_STATE` line plus its fenced record, for `state`.
 
     `verifies` is a Worker B2 ledger key, and it is expanded into the record's
@@ -121,6 +180,11 @@ def gate_declaration(state: str = "CLEAR", verifies: str | None = None) -> str:
             decision_gate_record_raw=None,
             decision_gate_omit_field=False,
             decision_gate_omit_block=False,
+            # Usually left empty: the recorder fills the identity in from the dispatched
+            # spec, exactly as the subprocess fake reads it from the prompt. A caller
+            # that settles a body WITHOUT a recorder in the path -- the direct
+            # `_record_decision_from_attempt` tests -- passes its own.
+            decision_gate_mechanics_json=json.dumps(mechanics or {}),
         ),
         extra,
     )
@@ -293,6 +357,9 @@ class RecordingExec:
         # An unmodelled verb answers with an empty ok result instead of raising, so a
         # method sweep cannot be silently truncated by the first command nobody pinned.
         self.unmodelled: list[str] = []
+        # OS-42 round 3: the mechanics identity of the dispatch currently in flight,
+        # read off the Task spec as it goes past. See `bind_gate_body`.
+        self.dispatch_mechanics: dict = {}
 
     @property
     def verbs(self) -> list[str]:
@@ -302,6 +369,8 @@ class RecordingExec:
         args = tuple(args)
         self.commands.append(args)
         verb = args[1] if len(args) > 1 else args[0]
+        if verb == "task-create":
+            self.dispatch_mechanics = gate_mechanics_of(_flag_value(args, "--spec"))
         if verb == self.fail_on:
             return 1, json.dumps(
                 {"ok": False, "error": f"simulated failure in {verb}"}
@@ -310,7 +379,25 @@ class RecordingExec:
             return 0, json.dumps({"ok": False, "error": self.errors[verb]})
         if verb not in self.results:
             self.unmodelled.append(verb)
-        return 0, json.dumps({"ok": True, "result": self.results.get(verb, {})})
+        result = self.results.get(verb, {})
+        if verb == "check":
+            result = self.bound_delivery(result)
+        return 0, json.dumps({"ok": True, "result": result})
+
+    def bound_delivery(self, delivery: Any) -> Any:
+        """The delivery, with each settled body's ABSENT mechanics filled in."""
+        if not self.dispatch_mechanics or not isinstance(delivery, dict):
+            return delivery
+        messages = delivery.get("messages")
+        if not isinstance(messages, list):
+            return delivery
+        return {**delivery, "messages": [
+            ({**message, "body": bind_gate_body(message["body"],
+                                                self.dispatch_mechanics)}
+             if isinstance(message, dict) and isinstance(message.get("body"), str)
+             else message)
+            for message in messages
+        ]}
 
 
 class SequentialTerminalExec(RecordingExec):
@@ -491,11 +578,14 @@ class EchoingTerminalExec(SequentialTerminalExec):
         elif verb == "check" and result.get("messages"):
             for message in result["messages"]:
                 task_id = json.loads(message["payload"])["taskId"]
-                message["body"] = (
+                # Bound EXPLICITLY: this subclass rewrites the body after the base
+                # class has already served it, so the base's binding would be lost.
+                message["body"] = bind_gate_body(
                     "ok"
                     + render_boundary_receipt(self.specs.get(task_id, ""))
                     + "\n"
-                    + gate_declaration()
+                    + gate_declaration(),
+                    gate_mechanics_of(self.specs.get(task_id, "")),
                 )
             return code, json.dumps(body)
         return code, payload
@@ -4821,13 +4911,19 @@ class ScenarioKDispatchedPhaseTests(OfflineHarnessTestCase):
             [int(boundary["current_iteration"]) for boundary in boundaries],
             [index for index in range(1, len(CANONICAL_PHASES) + 1) for _ in self.ROLE_SEQUENCE],
         )
-        # Each side's artifact contract is the one its phase names.
+        # Each side's artifact contract is the one its phase names -- and, since OS-42,
+        # the one its GATE ITERATION names. Passing the boundary's own current_iteration
+        # here is what makes this assert the COUPLING (the ordinal in the task context and
+        # the ordinal in the artifact path are the same number) rather than a constant.
         self.assertEqual(
             [boundary["artifact_contract"] for boundary in boundaries],
             [
-                phase_artifact_contract(role=role, phase=phase, run_id=result.run_id)
-                for phase in CANONICAL_PHASES
-                for role in self.ROLE_SEQUENCE
+                phase_artifact_contract(role=role, phase=phase, run_id=result.run_id,
+                                        gate_iteration=int(boundary["current_iteration"]))
+                for boundary, (phase, role) in zip(
+                    boundaries,
+                    [(phase, role) for phase in CANONICAL_PHASES
+                     for role in self.ROLE_SEQUENCE])
             ],
         )
         for boundary in boundaries:
@@ -7508,8 +7604,30 @@ class DecisionGateLiveDispatchTests(unittest.TestCase):
             / "artifacts" / "runs" / harness.run_id / "ORCHESTRATOR_LOG.md"
         ).read_text(encoding="utf-8")
 
-    @staticmethod
+    # The one binding every direct settle in this class uses. The dispatches here are
+    # constructed by hand rather than driven through a recorder, so there is no Task
+    # spec to read the identity out of -- these are the same three values the generated
+    # contract block would have carried.
+    RUN = "run_live_os29"
+    PHASE = "implementation"
+
+    @classmethod
+    def gate_mechanics(cls, *, role: str, iteration: int) -> dict:
+        """The mechanics identity THIS dispatch's record must declare (OS-42 round 3)."""
+        agent = "reviewer" if role.endswith("reviewer") else "worker"
+        return {
+            "ledger_schema_version": decision_gate.LEDGER_RECORD_SCHEMA_VERSION,
+            "boundary": "B3" if agent == "reviewer" else "B2",
+            "source": agent,
+            "role": agent,
+            "run": cls.RUN,
+            "phase": cls.PHASE,
+            "iteration": iteration,
+        }
+
+    @classmethod
     def attempt(
+        cls,
         *,
         body: str,
         role: str = "worker",
@@ -7517,6 +7635,9 @@ class DecisionGateLiveDispatchTests(unittest.TestCase):
         outcome: str = "succeeded",
         worker_done_count: int = 1,
     ) -> orca_runtime_harness.RuntimeAttempt:
+        # ABSENT mechanics keys only: a scenario that deliberately declares a foreign or
+        # unknown value keeps it, so every negative test below still tests what it says.
+        body = bind_gate_body(body, cls.gate_mechanics(role=role, iteration=iteration))
         return orca_runtime_harness.RuntimeAttempt(
             role=role,
             iteration=iteration,
@@ -7860,13 +7981,20 @@ class DecisionGateLiveDispatchTests(unittest.TestCase):
 
     @staticmethod
     def worker_body(state: str) -> str:
-        return "# Worker Result\n\nSTATUS: COMPLETE\n" + gate_declaration(state)
+        # These two go through `run_existing_task`, whose Task already exists, so no
+        # `task-create` -- and therefore no dispatched spec -- ever reaches the
+        # recorder. The identity is bound here instead, from the same class constant.
+        return bind_gate_body(
+            "# Worker Result\n\nSTATUS: COMPLETE\n" + gate_declaration(state),
+            DecisionGateLiveDispatchTests.gate_mechanics(role="worker", iteration=1),
+        )
 
     @staticmethod
     def reviewer_body(state: str, verifies: str | None) -> str:
-        return (
+        return bind_gate_body(
             "# Review Result\n\nRESULT: FAIL\nREVIEW_VERDICT: FAIL\n"
-            + gate_declaration(state, verifies=verifies)
+            + gate_declaration(state, verifies=verifies),
+            DecisionGateLiveDispatchTests.gate_mechanics(role="reviewer", iteration=1),
         )
 
     def settle_blocking_worker(
@@ -8260,9 +8388,10 @@ class DecisionGateLiveDispatchTests(unittest.TestCase):
         harness.run_existing_task(
             "worker", 1, "complete", "task_g", phase="implementation"
         )
-        recorder.body = (
+        recorder.body = bind_gate_body(
             "# Review Result\n\nRESULT: PASS\nREVIEW_VERDICT: PASS\n"
-            + gate_declaration("CLEAR")
+            + gate_declaration("CLEAR"),
+            self.gate_mechanics(role="reviewer", iteration=1),
         )
 
         harness.run_existing_task(
