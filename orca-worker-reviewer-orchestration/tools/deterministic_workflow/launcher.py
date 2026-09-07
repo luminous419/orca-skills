@@ -447,7 +447,11 @@ PAUSE_VERBS = ("discover", "resume")
 # a way of RUNNING the workflow: it is the control point a live, prompt-driven
 # Coordinator invokes before it returns a response, and it needs no LangGraph -- the
 # state it derives is Orca's Task/Dispatch records and the run's own append-only audit.
-TURN_VERBS = ("turn-end", "turn-end-hook", "turn-end-bind")
+TURN_VERBS = ("turn-end", "turn-end-hook", "turn-end-bind",
+              "turn-end-liveness")
+#: OS-43.  New top-level verbs, registered beside the existing tables; every
+#: existing dispatch path is untouched, so a revert is dropping the registration.
+WATCHDOG_VERBS = ("watchdog", "recover")
 
 
 def build_turn_parser() -> argparse.ArgumentParser:
@@ -524,6 +528,34 @@ def build_turn_parser() -> argparse.ArgumentParser:
         help="record that this session has let the Run go, so its later turn ends are "
              "no longer gated on it")
     bind.add_argument("--json", action="store_true")
+    # OS-43.  The liveness lease is a SEPARATE record from the binding, and this flag
+    # says whether binding also starts publishing it.  Default on, so the ordinary
+    # Coordinator gets AC-1's premise without an extra step; `--no-liveness` is for an
+    # operator who publishes it from somewhere else.
+    liveness = bind.add_mutually_exclusive_group()
+    liveness.add_argument("--liveness", dest="liveness", action="store_true",
+                          default=True,
+                          help="also publish and refresh this run's OS-43 Coordinator "
+                               "liveness lease (default)")
+    liveness.add_argument("--no-liveness", dest="liveness", action="store_false",
+                          help="bind only; publish no liveness lease")
+    # A Coordinator that does not run under the harness still needs a way to publish the
+    # lease.  Read-only `--status` reports the four-valued read without writing anything.
+    live = sub.add_parser(
+        "turn-end-liveness",
+        help="publish, refresh or report this run's OS-43 Coordinator liveness lease")
+    live.add_argument("--run-id", required=True)
+    live.add_argument("--artifact-base", default=".")
+    live.add_argument("--session-id", default="")
+    live.add_argument("--seconds", type=float, default=0.0,
+                      help="how long to keep refreshing before releasing; 0 publishes "
+                           "one lease and returns, which is what a cron-style caller "
+                           "wants")
+    live.add_argument("--status", action="store_true",
+                      help="report the four-valued liveness read and write nothing")
+    live.add_argument("--release", action="store_true",
+                      help="record that this Coordinator let the run go")
+    live.add_argument("--json", action="store_true")
     return parser
 
 
@@ -550,8 +582,61 @@ def run_turn_cli(argv: list[str]) -> int:
     if args.verb == "turn-end-hook":
         return turn_boundary.run_stop_hook_cli(args)
     if args.verb == "turn-end-bind":
-        return turn_boundary.run_bind_cli(args)
+        code = turn_boundary.run_bind_cli(args)
+        if getattr(args, "liveness", False) and not getattr(args, "release", False):
+            # Additive: the binding's own result is unchanged either way, and a liveness
+            # record that cannot be published never fails the bind.
+            turn_boundary.begin_run_liveness(
+                args.run_id, session_id=args.session_id,
+                artifact_base=args.artifact_base)
+        return code
+    if args.verb == "turn-end-liveness":
+        return run_liveness_cli(args)
     return turn_boundary.run_turn_boundary_cli(args)
+
+
+def run_liveness_cli(args: argparse.Namespace) -> int:
+    """`turn-end-liveness`: publish, refresh, release or report the liveness lease."""
+    from . import coordinator_liveness
+    base = Path(args.artifact_base)
+    if args.status:
+        status = coordinator_liveness.liveness_status(args.run_id, artifact_base=base)
+        payload = {"run_id": args.run_id, "liveness_status": status}
+        print(json.dumps(payload, sort_keys=True) if args.json
+              else f"run={args.run_id} liveness={status}")
+        return 0
+    if args.release:
+        coordinator_liveness.end_coordinator_liveness(None, args.run_id,
+                                                      artifact_base=base)
+        status = coordinator_liveness.liveness_status(args.run_id, artifact_base=base)
+        payload = {"run_id": args.run_id, "liveness_status": status,
+                   "released": True}
+        print(json.dumps(payload, sort_keys=True) if args.json
+              else f"run={args.run_id} liveness={status} released=1")
+        return 0
+    keeper = coordinator_liveness.begin_coordinator_liveness(
+        args.run_id, artifact_base=base, session_id=args.session_id)
+    if keeper is None:
+        print(f"run_workflow: could not publish a liveness lease for {args.run_id}",
+              file=sys.stderr)
+        return USAGE_EXIT_CODE
+    if args.seconds and args.seconds > 0:
+        import threading
+        threading.Event().wait(float(args.seconds))
+        coordinator_liveness.end_coordinator_liveness(keeper, args.run_id,
+                                                      artifact_base=base)
+    else:
+        # A cron-style caller publishes ONE lease and returns.  It is deliberately NOT
+        # released here: releasing would make the record read ABSENT the instant the
+        # command exits, which is the opposite of what a periodic publisher wants.  The
+        # lease simply expires on schedule unless the next invocation refreshes it, and
+        # the beat thread is retired so nothing outlives the process.
+        keeper.stop()
+    status = coordinator_liveness.liveness_status(args.run_id, artifact_base=base)
+    payload = {"run_id": args.run_id, "liveness_status": status}
+    print(json.dumps(payload, sort_keys=True) if args.json
+          else f"run={args.run_id} liveness={status}")
+    return 0
 
 
 def build_pause_parser() -> argparse.ArgumentParser:
@@ -588,6 +673,19 @@ def build_pause_parser() -> argparse.ArgumentParser:
     resume.add_argument("--results",
                         help="JSON file with the fake adapter's scripted settlements for "
                              "the round the run re-enters")
+    # OS-43 (F-E).  This CLI built FakeAdapter unconditionally, so the shipped one-shot
+    # recovery could not resume a real Orca run at all.  The selection DEFAULTS to today's
+    # behaviour, so no existing invocation changes meaning and the revert is one line.
+    resume.add_argument("--adapter", choices=ADAPTERS, default=FAKE_ADAPTER,
+                        help="which execution adapter the resumed round re-enters with "
+                             f"(default: {FAKE_ADAPTER})")
+    resume.add_argument("--run-owner", default="",
+                        help="terminal handle that owns the existing Orca Run; required "
+                             "by --adapter orca, which adopts a run rather than creating "
+                             "one")
+    resume.add_argument("--project-root", default="",
+                        help="project root the Orca adapter reads its quality profile "
+                             "and agent routing from (default: the working directory)")
     resume.add_argument("--json", action="store_true")
     return parser
 
@@ -632,8 +730,14 @@ def run_pause_cli(argv: list[str]) -> int:
         ledger = FileRuntimeStateStore(default_runtime_state_path(args.run_id,
                                                                  record["thread_id"]))
         journal = pause_store.journal_for(args.run_id, artifact_base=base)
-        adapter = FakeAdapter(results, runtime_state=ledger, run_id=args.run_id,
-                              settlement_journal=journal)
+        if getattr(args, "adapter", FAKE_ADAPTER) == ORCA_ADAPTER:
+            adapter = build_orca_adapter_for_run(
+                args.run_id, artifact_base=base, runtime_state=ledger,
+                run_owner=args.run_owner,
+                project_root=Path(args.project_root) if args.project_root else None)
+        else:
+            adapter = FakeAdapter(results, runtime_state=ledger, run_id=args.run_id,
+                                  settlement_journal=journal)
 
         def graph_factory(saver: Any) -> Any:
             from .graph import build_graph
@@ -690,6 +794,342 @@ def run_pause_cli(argv: list[str]) -> int:
     return exit_code
 
 
+def declared_phases_for_run(run_id: str, *, artifact_base: Path) -> tuple[str, ...]:
+    """The workflow phases the STALLED run was launched with, read off its checkpoint.
+
+    ``start_run`` receives ``requested_phases`` from the launch specification, but a
+    recovery has no launch specification -- it adopts a run someone else started -- and
+    ``resume_run`` leaves the field empty when nobody supplies it.  Empty is not a
+    harmless default: ``build_quality_gate_context`` refuses the ``final_review`` gate
+    without it ("the final gate re-checks the requested workflow, not a single phase"),
+    so an adopted run that reaches its final gate could not dispatch a Final Reviewer at
+    all.  The run's own committed checkpoint is the durable authority for what it was
+    asked to do, and it is the same document the recovery is about to resume, so reading
+    it here cannot disagree with what the engine goes on to execute.
+
+    Lower-cased for the same reason ``build_orca_adapter`` lower-cases the launch
+    spec's phases: the engine's state names them in upper case and the task-context
+    vocabulary is lower case.
+
+    Returns ``()`` when the head cannot be read, which is exactly the behaviour every
+    caller had before this function existed: an unreadable checkpoint fails at the
+    engine's own read, not here, and this is not the boundary that should decide it.
+    """
+    from . import recovery_runtime
+    try:
+        head = recovery_runtime.resolve_head(run_id, artifact_base=artifact_base)
+    except Exception:  # noqa: BLE001 - an unreadable head is the engine's refusal, not ours
+        return ()
+    if head is None:
+        return ()
+    phases = head.state.get("requested_phases") or ()
+    return tuple(str(phase).lower() for phase in phases)
+
+
+def build_orca_adapter_for_run(run_id: str, *, artifact_base: Path,
+                               runtime_state: Any = None, run_owner: str = "",
+                               project_root: Path | None = None,
+                               harness_factory: Any = None) -> Any:
+    """An ``OrcaAdapter`` bound to an EXISTING Run, for recovery rather than for launch.
+
+    ``build_orca_adapter`` CREATES a Run, which is exactly wrong here: a recovery adopts
+    the run that is already stalled.  ``OrcaRuntimeHarness.resume_run`` is the documented
+    adoption path and it restores the delivery ledger before returning, so the adapter this
+    returns is a successor process in the OS-44 sense rather than a fresh one.
+    """
+    runtime = _import_orca_runtime()
+    if not run_owner:
+        raise LauncherError(
+            f"{ORCA_ADAPTER_REQUIRES_STATE}: --adapter orca adopts an existing Run and "
+            "needs --run-owner, the terminal handle that owns it")
+    root = Path(project_root) if project_root is not None else Path.cwd()
+    factory = harness_factory or runtime.OrcaRuntimeHarness
+    try:
+        harness = factory(artifact_base, quality_profile_root=root)
+        harness.resume_run(run_id, run_owner=run_owner,
+                           requested_phases=declared_phases_for_run(
+                               run_id, artifact_base=artifact_base))
+    except runtime.OrcaRuntimeError as exc:
+        raise LauncherError(f"{ORCA_RUNTIME_UNAVAILABLE}: {exc}") from exc
+    from .orca_adapter import OrcaAdapter
+    return OrcaAdapter(harness, runtime_state=runtime_state)
+
+
+def build_watchdog_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="run_workflow.py",
+        description="Stalled-run watchdog and one-shot recovery (OS-43).")
+    sub = parser.add_subparsers(dest="verb", required=True)
+    watchdog = sub.add_parser("watchdog", help="observe and recover stalled runs")
+    modes = watchdog.add_subparsers(dest="mode", required=True)
+    for name, help_text in (("once", "exactly one sweep, then return"),
+                            ("run", "sweep, wait, repeat until shutdown"),
+                            ("status", "fold the ledgers and report; takes no claim")):
+        mode = modes.add_parser(name, help=help_text)
+        mode.add_argument("--artifact-base", default=".")
+        mode.add_argument("--run-id", default="",
+                          help="restrict the sweep to one run (default: every run "
+                               "discovery reaches)")
+        mode.add_argument("--json", action="store_true")
+        if name != "status":
+            mode.add_argument("--results",
+                              help="JSON file with the fake adapter's scripted "
+                                   "settlements for the rounds a recovery re-enters")
+            mode.add_argument("--max-concurrent-runs", type=int, default=None,
+                              help="bound on the per-sweep pool; the default contains "
+                                   "sweep amplification against the Orca CLI")
+            _add_adapter_selection(mode)
+        if name == "run":
+            mode.add_argument("--interval-seconds", type=float, default=None,
+                              help="sweep cadence (default: the store's own "
+                                   "lease-derived observation window)")
+            mode.add_argument("--max-sweeps", type=int, default=None)
+    recover = sub.add_parser(
+        "recover",
+        help="one-shot recovery of ONE stalled run through the engine's own API; shares "
+             "no state with the watchdog and works with it stopped")
+    recover.add_argument("--run-id", required=True)
+    recover.add_argument("--artifact-base", default=".")
+    recover.add_argument("--results",
+                         help="JSON file with the fake adapter's scripted settlements")
+    recover.add_argument("--actor-id", default="")
+    recover.add_argument("--recursion-limit", type=int, default=None)
+    _add_adapter_selection(recover)
+    recover.add_argument("--json", action="store_true")
+    return parser
+
+
+def _add_adapter_selection(mode: argparse.ArgumentParser) -> None:
+    """CON-5's two compositions, selectable on every verb that can ACT.
+
+    One Supervisor core, two compositions: the standalone/fake one a runtime with no Orca
+    can still drive, and the real Orca one an automatically detected stalled Orca run
+    needs.  Neither is hardwired -- a watchdog that could only ever build ``FakeAdapter``
+    cannot recover a real run at all, and one that could only ever build ``OrcaAdapter``
+    would not be runtime-neutral.  The DEFAULT is the fake composition, so no existing
+    invocation changes meaning.
+    """
+    mode.add_argument("--adapter", choices=ADAPTERS, default=FAKE_ADAPTER,
+                      help="which execution adapter a recovery re-enters with "
+                           f"(default: {FAKE_ADAPTER})")
+    mode.add_argument("--run-owner", default="",
+                      help="terminal handle that owns the existing Orca Run; required by "
+                           "--adapter orca, which adopts a run rather than creating one")
+    mode.add_argument("--project-root", default="",
+                      help="project root the Orca adapter reads its quality profile and "
+                           "agent routing from (default: the working directory)")
+
+
+def _watchdog_wiring(args: argparse.Namespace, *, runner: Any = None,
+                     harness_factory: Any = None) -> dict[str, Any]:
+    """Build the five injected ports for one CLI invocation.
+
+    Every concrete implementation is named HERE, at the wiring boundary, and never inside
+    the supervisor core -- which is the whole of CON-5 and is why the same core serves a
+    standalone runtime.  ``--adapter`` chooses WHICH composition is built; ``runner`` and
+    ``harness_factory`` are the two process boundaries (the ``orca`` CLI and the runtime
+    harness) an integration test replaces to drive this same wiring offline.
+    """
+    from . import recovery_runtime, watchdog_audit
+    from .fake_adapter import FakeAdapter
+    from .runtime_state import FileRuntimeStateStore, SystemLeaseClock
+    from . import pause_store
+    base = Path(args.artifact_base)
+    results = _read_json(args.results, "--results") if getattr(args, "results", "") else []
+    approval_port = _artifact_approval_port(base)
+    adapter_name = getattr(args, "adapter", FAKE_ADAPTER)
+    if adapter_name == ORCA_ADAPTER:
+        # Refused HERE, before discovery lists a single run: an incomplete Orca
+        # composition must not be discovered halfway through a sweep, one run at a time.
+        if results:
+            raise LauncherError(
+                f"{ORCA_ADAPTER_REQUIRES_STATE}: --results is the fake adapter's scripted "
+                "input; --adapter orca scripts nothing")
+        if not getattr(args, "run_owner", ""):
+            raise LauncherError(
+                f"{ORCA_ADAPTER_REQUIRES_STATE}: --adapter orca adopts an existing Run "
+                "and needs --run-owner, the terminal handle that owns it")
+
+    adapters: dict[str, Any] = {}
+    bindings: dict[str, Any] = {}
+
+    def bindings_for(run_id: str) -> Any:
+        """This run's durable ledger and journal.  Adopts nothing and claims nothing."""
+        if run_id not in bindings:
+            record = pause_store.store_for(run_id, artifact_base=base).read(run_id)
+            thread_id = (record or {}).get("thread_id") or run_id
+            bindings[run_id] = (
+                FileRuntimeStateStore(default_runtime_state_path(run_id, thread_id)),
+                pause_store.journal_for(run_id, artifact_base=base))
+        return bindings[run_id]
+
+    def adapter_for(run_id: str) -> Any:
+        if run_id not in adapters:
+            ledger, journal = bindings_for(run_id)
+            if adapter_name == ORCA_ADAPTER:
+                # The REAL runtime, adopting the run that is already stalled.  Built per
+                # run, because the harness a recovery adopts is the stalled run's own.
+                adapter: Any = build_orca_adapter_for_run(
+                    run_id, artifact_base=base, runtime_state=ledger,
+                    run_owner=args.run_owner,
+                    project_root=(Path(args.project_root)
+                                  if getattr(args, "project_root", "") else None),
+                    harness_factory=harness_factory)
+            else:
+                adapter = FakeAdapter(list(results), runtime_state=ledger,
+                                      run_id=run_id, settlement_journal=journal,
+                                      approval_port=approval_port)
+            adapters[run_id] = (adapter, ledger, journal)
+        return adapters[run_id]
+
+    def graph_factory_for(run_id: str) -> Any:
+        adapter, ledger, journal = adapter_for(run_id)
+
+        def factory(saver: Any) -> Any:
+            from .graph import build_graph
+            return build_graph(adapter, checkpointer=saver, runtime_state=ledger,
+                               approval_port=approval_port, journal=journal)
+        return factory
+
+    def capabilities_for(run_id: str) -> Any:
+        """F11's capability authority: the adapter that would EXECUTE the recovery.
+
+        Wired here rather than in the core, so a standalone runtime supplies its own and
+        the Watchdog never has to guess what a runtime can do.
+
+        The Orca composition answers from an adapter built over this run's ledger and
+        journal but bound to NO harness, because ``capabilities()`` is a declaration of
+        what the adapter type and its wiring support and reads no harness at all.  That
+        matters: adopting the Run is what ``OrcaRuntimeHarness.resume_run`` does, and it
+        publishes a Coordinator liveness lease -- so adopting a run merely to ASK what it
+        can do would make the run look alive to the very gate that is about to decide
+        whether it is stalled.  Adoption therefore happens at recovery time, for runs the
+        gate has already cleared, and never during observation.
+        """
+        if adapter_name == ORCA_ADAPTER:
+            from .orca_adapter import OrcaAdapter
+            ledger, journal = bindings_for(run_id)
+            return OrcaAdapter(None, runtime_state=ledger, settlement_journal=journal,
+                               approval_port=approval_port).capabilities()
+        return adapter_for(run_id)[0].capabilities()
+
+    from . import turn_boundary
+    return {
+        "discovery": recovery_runtime.RunDiscovery(base),
+        # The Orca listing authority is the real CLI boundary.  Where no `orca` binary
+        # answers, the read RAISES and the sweep fails closed at R1 -- it never reads
+        # "no dispatch is running" out of silence.
+        "observation": recovery_runtime.RunObservationAdapter(
+            base, runner=runner or turn_boundary._default_runner,
+            capabilities=capabilities_for),
+        "liveness": recovery_runtime.CoordinatorLivenessReader(base),
+        # The gate and the outcome->action table BOTH read this clock: `react` stamps a
+        # backoff deadline on it and a later sweep -- in a later process -- decides
+        # against it whether that deadline has lapsed.  Without one, `watchdog_state`
+        # reads `0.0` for "now" on both sides, so every deadline it wrote stayed in the
+        # future forever and one REFUSED or CONFLICT outcome blocked its identity
+        # permanently.  SC-7 is a BOUNDED retry with backoff, not a stop.
+        "clock": SystemLeaseClock(),
+        # The factory is handed over PER RUN and resolved at request time, so every run
+        # discovery reaches -- not merely a single `--run-id` -- gets the graph for its
+        # own thread, ledger, journal and adapter.  The placeholder that returned `None`
+        # for the default all-runs mode is gone: it could only ever raise inside
+        # `graph.invoke`, and a sweep would have reported that as a run it had acted on.
+        "recovery": recovery_runtime.EngineRecoveryInvocation(
+            artifact_base=base, approval_port=approval_port,
+            graph_factory_for=graph_factory_for,
+            recursion_limit=getattr(args, "recursion_limit", None)),
+        "audit": watchdog_audit.FileWatchdogAudit(base),
+    }
+
+
+def run_watchdog_cli(argv: list[str], *, runner: Any = None,
+                     harness_factory: Any = None) -> int:
+    """The ``watchdog`` and ``recover`` verbs."""
+    from . import ports, recovery_runtime, watchdog_audit, watchdog_supervisor
+    args = build_watchdog_parser().parse_args(argv)
+    base = Path(args.artifact_base)
+    if args.verb == "recover":
+        # AC-9: this path calls the engine API DIRECTLY and imports no watchdog module.
+        try:
+            wiring = _watchdog_wiring(args, runner=runner,
+                                      harness_factory=harness_factory)
+            request = wiring["recovery"].build_request(
+                run_id=args.run_id,
+                recovery_kind=recovery_runtime.RECOVERY_KIND_STALLED_ACTIVE)
+        except LauncherError as exc:
+            print(f"run_workflow: {exc}", file=sys.stderr)
+            return USAGE_EXIT_CODE
+        except ports.RecoveryPreconditionUnavailable as exc:
+            # Named, and reported as a REFUSAL to start rather than as an outcome: no
+            # claim was taken and no effect was attempted.
+            summary = {"run_id": args.run_id, "status": "", "code": exc.code,
+                       "recovery_id": "", "recovery_kind": "",
+                       "effect_performed": False, "head_before": "", "head_after": "",
+                       "detail": exc.detail}
+            print(json.dumps(summary, sort_keys=True, ensure_ascii=False, default=str)
+                  if args.json
+                  else f"run={args.run_id} status=- code={exc.code}")
+            return 1
+        outcome = recovery_runtime.recover_stalled_run(request)
+        summary = {"run_id": args.run_id, "status": outcome.status,
+                   "code": outcome.code, "recovery_id": outcome.recovery_id,
+                   "recovery_kind": outcome.recovery_kind,
+                   "effect_performed": outcome.effect_performed,
+                   "head_before": outcome.head_before, "head_after": outcome.head_after,
+                   "detail": outcome.detail}
+        print(json.dumps(summary, sort_keys=True, ensure_ascii=False, default=str)
+              if args.json
+              else f"run={args.run_id} status={outcome.status} code={outcome.code}")
+        return 0 if outcome.status in (recovery_runtime.RECOVERED,
+                                       recovery_runtime.NO_EFFECT) else 1
+    if args.mode == "status":
+        audit = watchdog_audit.FileWatchdogAudit(base)
+        rows = []
+        for listing in recovery_runtime.RunDiscovery(base).discover():
+            run_id = str(listing["run_id"])
+            if args.run_id and run_id != args.run_id:
+                continue
+            try:
+                folded = audit.fold(run_id)
+            except watchdog_audit.WatchdogAuditError as exc:
+                rows.append({"run_id": run_id, "ledger": "UNREADABLE",
+                             "detail": str(exc)})
+                continue
+            rows.append({"run_id": run_id, "verdict": listing["verdict"],
+                         "identities": {key: dict(value)
+                                        for key, value in folded.items()}})
+        print(json.dumps(rows, sort_keys=True, ensure_ascii=False, default=str)
+              if args.json
+              else "\n".join(f"{row['run_id']} {row.get('verdict', '')} "
+                             f"identities={len(row.get('identities', {}))}"
+                             for row in rows))
+        return 0
+    try:
+        wiring = _watchdog_wiring(args, runner=runner, harness_factory=harness_factory)
+    except LauncherError as exc:
+        print(f"run_workflow: {exc}", file=sys.stderr)
+        return USAGE_EXIT_CODE
+    deps: dict[str, Any] = dict(wiring)
+    if args.max_concurrent_runs:
+        deps["max_concurrent_runs"] = int(args.max_concurrent_runs)
+    if args.run_id:
+        deps["run_ids"] = (args.run_id,)
+    if args.mode == "once":
+        report = watchdog_supervisor.run_once(**deps)
+    else:
+        report = watchdog_supervisor.run_continuous(
+            interval_seconds=args.interval_seconds, max_sweeps=args.max_sweeps, **deps)
+    summary = {"runs_observed": report.runs_observed, "runs_acted": report.runs_acted,
+               "escalations": list(report.escalations),
+               "runs": [vars(row) for row in report.runs]}
+    print(json.dumps(summary, sort_keys=True, ensure_ascii=False, default=str)
+          if args.json
+          else (f"observed={report.runs_observed} acted={report.runs_acted} "
+                f"escalations={len(report.escalations)}"))
+    return report.exit_code
+
+
 def _artifact_approval_port(base: Path) -> Any:
     try:
         from scripts.clarification_protocol import ArtifactHumanApprovalPort
@@ -704,6 +1144,8 @@ def run_cli(argv: list[str] | None = None) -> int:
         return run_pause_cli(raw)
     if raw and raw[0] in TURN_VERBS:
         return run_turn_cli(raw)
+    if raw and raw[0] in WATCHDOG_VERBS:
+        return run_watchdog_cli(raw)
     args = build_parser().parse_args(argv)
     try:
         version = require_runtime()

@@ -1090,6 +1090,45 @@ def release_session_run(
     )
 
 
+def begin_run_liveness(
+    run_id: str, *, session_id: str = "", artifact_base: Any = ".", env: Any = None,
+    lease_seconds: float | None = None, waiter: Any = None
+) -> Any | None:
+    """Start publishing this Coordinator's OS-43 liveness lease for ``run_id``.
+
+    ADDITIVE.  It wraps ``coordinator_liveness.begin_coordinator_liveness`` and nothing
+    else: the session binding above is unchanged, keeps its own schema and gains no field,
+    so nothing that reads the binding sees a new one.  Liveness is a SEPARATE record for
+    the same reason the binding is separate from the pause record -- a binding is a record
+    of INTENT, and liveness is a record of a beating heart.
+
+    Returns ``None`` and changes nothing when there is no session to bind or the record
+    cannot be published, exactly as :func:`bind_session_run` does: a Coordinator's run must
+    not fail because a liveness record could not be written.  The consequence of a missing
+    record is never a Watchdog that guesses -- it is the four-valued ``ABSENT`` read, which
+    DECLINES.
+    """
+    from .coordinator_liveness import begin_coordinator_liveness
+    from .runtime_state import DEFAULT_LEASE_SECONDS
+    session = session_id or current_session_id(env)
+    if not run_id:
+        return None
+    return begin_coordinator_liveness(
+        run_id, artifact_base=artifact_base, session_id=session,
+        lease_seconds=DEFAULT_LEASE_SECONDS if lease_seconds is None
+        else float(lease_seconds), waiter=waiter)
+
+
+def end_run_liveness(keeper: Any, run_id: str, *, artifact_base: Any = ".") -> bool:
+    """Retire the liveness keeper and record the release.  True on a clean shutdown.
+
+    ADDITIVE, and the mirror of :func:`begin_run_liveness`.  Releasing is a WRITTEN record
+    rather than a deleted file, for the same reason :func:`release_session_run` is.
+    """
+    from .coordinator_liveness import end_coordinator_liveness
+    return end_coordinator_liveness(keeper, run_id, artifact_base=artifact_base)
+
+
 def session_bound_run_id(session_id: str, *, artifact_base: Any = ".") -> str:
     """The Run this session bound most recently and has not released, or ``""``.
 

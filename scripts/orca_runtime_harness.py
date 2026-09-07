@@ -3500,7 +3500,63 @@ class OrcaRuntimeHarness:
             )
         except Exception:  # noqa: BLE001 - a binding may never fail a Run
             return ""
+        # OS-43. The one additive call: start publishing this Coordinator's LIVENESS
+        # lease for the Run it just bound. The binding above is a record of INTENT and
+        # says nothing about a beating heart; the liveness lease is refreshed on a
+        # cadence INDEPENDENT of any claimed section, which is what makes "the
+        # Coordinator's heartbeat expired" a fact rather than a false positive.
+        # Under the same never-raises discipline as the binding: a liveness record may
+        # no more fail a Run than a binding may.
+        self._begin_turn_boundary_liveness()
         return str(path) if path is not None else ""
+
+    #: Opt-out for the liveness producer, for an operator who runs the Coordinator loop
+    #: somewhere else and publishes the lease with `run_workflow.py turn-end-liveness`.
+    #: Any value other than "0"/"false"/"no" leaves it on.
+    LIVENESS_ENV = "ORCA_OS43_COORDINATOR_LIVENESS"
+
+    def _begin_turn_boundary_liveness(self) -> None:
+        """Start the OS-43 liveness keeper for `self.run_id`, retiring any predecessor.
+
+        Never raises, for the same reason `_bind_turn_boundary_session` does not: this is
+        an observability producer, and it may not fail a Run. Binding a second Run on one
+        instance retires the first Run's keeper first, so an instance never keeps a lease
+        alive for a Run it has moved on from -- the mirror of `stop()`'s own rule in
+        `lease_keeper`.
+        """
+        if os.environ.get(self.LIVENESS_ENV, "1").strip().lower() in (
+            "0",
+            "false",
+            "no",
+        ):
+            return
+        self._end_turn_boundary_liveness()
+        run_id = self.run_id or ""
+        if not run_id:
+            return
+        try:
+            self._liveness_keeper = turn_boundary.begin_run_liveness(
+                run_id, artifact_base=self.artifact_dir
+            )
+            self._liveness_run_id = run_id
+        except Exception:  # noqa: BLE001 - liveness may never fail a Run
+            self._liveness_keeper = None
+            self._liveness_run_id = ""
+
+    def _end_turn_boundary_liveness(self) -> None:
+        """Retire the liveness keeper and record the release. Never raises."""
+        keeper = getattr(self, "_liveness_keeper", None)
+        run_id = getattr(self, "_liveness_run_id", "")
+        self._liveness_keeper = None
+        self._liveness_run_id = ""
+        if keeper is None or not run_id:
+            return
+        try:
+            turn_boundary.end_run_liveness(
+                keeper, run_id, artifact_base=self.artifact_dir
+            )
+        except Exception:  # noqa: BLE001 - cleanup may never fail a Run
+            return
 
     def _emit_timing_row(self, **fields: Any) -> None:
         """The writer RunTimingTracker emits phase/iteration boundary rows through.
