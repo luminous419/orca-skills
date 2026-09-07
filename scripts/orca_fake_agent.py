@@ -43,6 +43,36 @@ def extract_lifecycle(prompt: str) -> tuple[str, str, str | None]:
     )
 
 
+# OS-42 round 3. The generated DECISION GATE CONTRACT block the dispatch carries holds
+# one fenced skeleton per state, and the FIRST of them is the CLEAR one. Its mechanics
+# identity is what this dispatch was told to declare, so a conforming agent copies it --
+# which is precisely what this fake now does, rather than staying silent and letting the
+# ingress invent an identity for it.
+GATE_SKELETON = re.compile(r"(?ms)^```decision-gate\n(?P<body>.*?)\n```")
+MECHANICS_KEYS = (
+    "ledger_schema_version", "boundary", "source", "role", "run", "phase", "iteration",
+)
+
+
+def extract_gate_mechanics(prompt: str) -> dict:
+    """The mechanics identity the dispatched contract block names, or ``{}``.
+
+    Empty is a legitimate answer and is NOT filled in from anywhere else: a prompt that
+    carries no contract block gave this dispatch no identity to declare, and inventing
+    one here would rebuild the very hole round 3 closed, one process further out.
+    """
+    match = GATE_SKELETON.search(prompt)
+    if match is None:
+        return {}
+    try:
+        skeleton = json.loads(match.group("body"))
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(skeleton, dict):
+        return {}
+    return {key: skeleton[key] for key in MECHANICS_KEYS if key in skeleton}
+
+
 def fake_command(args: argparse.Namespace) -> list[str]:
     contract = load_workflow_output_contract(
         SCRIPT_DIR.parent / "orca-worker-reviewer-orchestration" / "SKILL.md"
@@ -81,6 +111,9 @@ def fake_command(args: argparse.Namespace) -> list[str]:
             "--findings-json",
             args.findings_json,
         ]
+    mechanics = getattr(args, "decision_gate_mechanics", None)
+    if mechanics:
+        command.extend(["--decision-gate-mechanics-json", json.dumps(mechanics)])
     return command
 
 
@@ -229,6 +262,9 @@ def main() -> int:
             confirm_dispatch_ready(dispatch_id, args.orca_command)
         args.mode = modes[min(completed_dispatches, len(modes) - 1)]
         args.iteration = completed_dispatches + 1
+        # Read per DISPATCH, from this dispatch's own prompt: one terminal can serve
+        # several dispatches and each carries its own gate iteration.
+        args.decision_gate_mechanics = extract_gate_mechanics(prompt)
         if args.ask_before and completed_dispatches == 0:
             ask_command = [
                 args.orca_command,

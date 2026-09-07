@@ -8,10 +8,66 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
+from . import artifact_identity
 from . import pause_policy
 from .contracts import (BASE_CAPABILITIES, EXTERNAL_LOOKUP, EXTERNAL_RESUME,
-                        LIFECYCLE_SETTLEMENT, ActionIntent, RECOVERY_CAPABILITIES,
-                        SettlementEvent, make_settlement_event)
+                        GATE_ENVELOPE_KEYS, LIFECYCLE_SETTLEMENT, ActionIntent,
+                        RECOVERY_CAPABILITIES, SettlementEvent, make_settlement_event)
+
+def stipulated_gate_envelope(intent: ActionIntent) -> dict[str, Any]:
+    """A well-formed CLEAR gate envelope for a SCRIPTED settlement.
+
+    OS-42 makes an ABSENT gate envelope a repairable FORM defect, which is right for a
+    real agent: "it said nothing" must be re-asked, never presumed CLEAR.  A scripted
+    ``FakeAdapter`` result is not an agent body, though -- it is a stipulation of what a
+    settlement WAS -- so a script that says nothing about the gate is stipulating a clean
+    one, exactly as it stipulates ``status`` or ``result``.
+
+    Building it here rather than relaxing the classifier keeps the production rule strict
+    and makes the double COMPLETE: every graph test now exercises the real classifier on
+    a real record instead of skipping it.  A test that wants a malformed gate sets
+    ``result["gate"]`` explicitly and this default never fires.
+    """
+    role = "reviewer" if intent["role"].endswith("REVIEWER") else "worker"
+    # OS-42 F-001: the SAME phase the dispatched contract is rendered with, read from the
+    # one derivation. A Final Reviewer's contract says `final_review`, not the workflow
+    # phase the state is sitting on, and the settlement validator binds the returned
+    # record to that value -- so a stipulation that used `intent["phase"]` raw would
+    # stipulate a record the real validator rejects.
+    phase = artifact_identity.contract_phase(intent["role"], intent["phase"])
+    record = {
+        "ledger_schema_version": 1,
+        "boundary": "B3" if role == "reviewer" else "B2",
+        "source": role,
+        "role": role,
+        "run": intent["run_id"],
+        "phase": phase,
+        "iteration": intent["gate_iteration"],
+        "responsible_phase": intent["phase"],
+        "state": "CLEAR",
+        "reason_code": None,
+        "open_decision_item": False,
+        "open_item": None,
+        "assumption": None,
+        "evidence": {},
+        "verdict": "",
+        "source_binding": f"artifacts/runs/{intent['run_id']}/",
+        # Fixed, not a clock: a scripted settlement has to be byte-reproducible or its
+        # event id would change on every replay.
+        "recorded_at": "2026-01-01T00:00:00+00:00",
+        "prior_open_decision_items": [],
+    }
+    envelope = {
+        "declared_state": "CLEAR",
+        "declaration_count": 1,
+        "fence_count": 1,
+        "record": record,
+        "record_text": None,
+        "truncated": False,
+    }
+    assert set(envelope) == set(GATE_ENVELOPE_KEYS)
+    return envelope
+
 
 # Reserved top-level keys in the external world document.  An intent id is always
 # ``intent_<hex>``, so these cannot collide with one.
@@ -282,6 +338,7 @@ class FakeAdapter:
             return deepcopy(existing)
         if not self.results: raise RuntimeError("fake result script exhausted")
         result = deepcopy(self.results.pop(0)); self.effect_count += 1
+        result.setdefault("gate", stipulated_gate_envelope(intent))
         occurred_at = f"2026-01-01T00:00:{self.effect_count:02d}Z"
         if self.external_world is not None:
             # The effect becomes discoverable before it produces an outcome, so a crash in

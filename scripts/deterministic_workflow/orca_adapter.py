@@ -5,6 +5,7 @@ import json
 from copy import deepcopy
 from typing import Any, Callable
 
+from . import artifact_identity
 from . import pause_policy
 from .contracts import (BASE_CAPABILITIES, EXTERNAL_LOOKUP, LIFECYCLE_SETTLEMENT,
                         ActionIntent, ExternalLookupUnavailable, SettlementEvent,
@@ -16,6 +17,21 @@ from .contracts import (BASE_CAPABILITIES, EXTERNAL_LOOKUP, LIFECYCLE_SETTLEMENT
 WORKTREE_ALIASES = frozenset({"current", "active"})
 
 
+def _default_result_parser(attempt: Any, intent: ActionIntent) -> dict[str, Any]:
+    """`decision_contract.parse_agent_settlement`, imported lazily.
+
+    Lazy and here rather than at module scope for the same reason `graph._resolve_gate_
+    contract` is: this module is inside the shipped engine package and
+    `decision_contract` is a `tools/` sibling, so a module-scope import would make the
+    package unimportable whenever the sibling is absent.
+    """
+    try:  # repository layout
+        from scripts import decision_contract
+    except ImportError:  # pragma: no cover - flat installed layout
+        import decision_contract  # type: ignore[no-redef]
+    return decision_contract.parse_agent_settlement(attempt, intent)
+
+
 class OrcaAdapter:
     """Synchronous façade over ``create_task`` and ``run_existing_task``."""
 
@@ -24,7 +40,10 @@ class OrcaAdapter:
                  runtime_state: Any = None, settlement_journal: Any = None,
                  approval_port: Any = None):
         self.harness = harness
-        self.result_parser = result_parser or self._parse_result
+        # OS-42: the default parser now TRANSPORTS an agent's decision-gate output into
+        # `result["gate"]` instead of refusing any body that is not JSON. A JSON body
+        # still parses exactly as before, so every scripted path is unchanged.
+        self.result_parser = result_parser or _default_result_parser
         self.runtime_state = runtime_state
         # OS-31: the durable, run-scoped, append-then-promote journal. Every write lands
         # strictly BEFORE the external effect it describes, because process memory
@@ -152,9 +171,16 @@ class OrcaAdapter:
         self._record_receipt(intent, {"task_id": task_id}, lease_token)
         self._journal(intent["intent_id"], stage="OPENED", task_id=task_id,
                       opened_at=_now())
-        phase = "final_review" if intent["role"] == "FINAL_REVIEWER" else intent["phase"].lower()
-        iteration = (intent["final_review_iteration"] if intent["role"] == "FINAL_REVIEWER"
-                     else intent["phase_iteration"] + 1)
+        # OS-42 F-001: read the ONE derivation. `validate_settlement_node` binds the
+        # returned record with the identical call, so ingress and egress cannot drift.
+        phase = artifact_identity.contract_phase(intent["role"], intent["phase"])
+        # OS-42: READ the one authoritative one-based ordinal instead of recomputing it.
+        # The expression that used to live here -- final_review_iteration for a Final
+        # Reviewer, phase_iteration + 1 otherwise -- IS the derivation, and it is now
+        # single-sourced in `artifact_identity.gate_iteration` and stamped on the intent,
+        # so the dispatched task context, the artifact path and the applied result can no
+        # longer disagree about which gate attempt this was.
+        iteration = intent["gate_iteration"]
         mode = "complete" if intent["role"] == "WORKER" else "pass"
         attempt, terminal = self.harness.run_existing_task(
             self._role(intent), iteration, mode, task_id,
@@ -163,6 +189,7 @@ class OrcaAdapter:
             terminal_worktree=(planned or {}).get("terminal_worktree"),
             terminal_observer=(self._journal_intended(intent["intent_id"])
                                if planned else None),
+            repair_instruction=intent.get("repair_instruction"),
         )
         result = self.result_parser(attempt, intent)
         event = make_settlement_event(intent, result, occurred_at="1970-01-01T00:00:00Z")

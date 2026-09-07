@@ -44,6 +44,31 @@ REQUIRED_DOCS = (
 )
 INCLUDED_ROOTS = (".github", "docs", "scripts", *SKILL_NAMES)
 EXECUTABLE_FILES = frozenset({"scripts/fake_bin/fake-agent"})
+# OS-42: the full local-import closure of the decision-gate contract, in dependency
+# order. Computed once by AST walk and pinned here; the test that recomputes it is what
+# keeps this honest as the closure evolves.
+DECISION_CONTRACT_CLOSURE = (
+    "decision_contract",
+    "decision_gate",
+    "decision_policy",
+    "skill_policy",
+    "agent_profile",
+    "quality_profile",
+)
+# OS-42 F-002: the local-import closure of the PRODUCTION Orca execution path, in
+# dependency order. `OrcaAdapter` ships inside the engine package and takes its runtime by
+# injection, but the runtime it is given -- `orca_runtime_harness` -- lived only in this
+# repository, so an installed launcher could offer nothing but the fake adapter and the
+# bounded validation-repair loop could never reach a real dispatch. These three modules
+# are the difference between the two closures; every other module the harness imports is
+# already installed by DECISION_CONTRACT_CLOSURE or ships beside it.
+# `test_installed_orca_runtime_is_self_contained` recomputes the closure by walking ASTs,
+# so a future import fails the test until this list is updated.
+ORCA_RUNTIME_CLOSURE = (
+    "orca_runtime_harness",
+    "task_context",
+    "workflow_contract",
+)
 FORBIDDEN_PARTS = {
     ".git",
     "artifacts",
@@ -90,6 +115,27 @@ def required_skill_paths(skill_name: str) -> set[str]:
         paths.add(f"{skill_name}/tools/run_logging.py")
         paths.add(f"{skill_name}/tools/clarification_protocol.py")
         paths.add(f"{skill_name}/tools/run_workflow.py")
+        # OS-42. The decision-gate contract is the single source of truth for the
+        # Worker's machine-control output, so an installed Coordinator must be able to
+        # GENERATE the instructions from it and VALIDATE what comes back. That needs the
+        # whole import closure, not just the entry point: decision_contract imports
+        # decision_gate and decision_policy, decision_policy imports skill_policy,
+        # skill_policy imports agent_profile, and agent_profile imports quality_profile.
+        # Shipping a prefix of that chain yields an ImportError on the first
+        # load_decision_policy call in exactly the environment the packaging exists for.
+        # `test_installed_contract_modules_are_self_contained` recomputes this closure by
+        # walking ASTs, so a future import fails the test until this list is updated.
+        paths.update(
+            f"{skill_name}/tools/{module}.py"
+            for module in DECISION_CONTRACT_CLOSURE
+        )
+        # OS-42 F-002. Without these the installed `--adapter orca` path would import a
+        # module that is not in the package, which is an ImportError in exactly the
+        # environment the packaging exists for.
+        paths.update(
+            f"{skill_name}/tools/{module}.py"
+            for module in ORCA_RUNTIME_CLOSURE
+        )
         engine = REPO_ROOT / skill_name / "tools" / "deterministic_workflow"
         paths.update(
             f"{skill_name}/tools/deterministic_workflow/{path.relative_to(engine).as_posix()}"

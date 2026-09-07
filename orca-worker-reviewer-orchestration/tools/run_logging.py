@@ -150,6 +150,16 @@ DECISION_LEDGER_MAX_ALLOCATION_ATTEMPTS = 8
 EVENT_DECISION_RECORD_WRITTEN = "decision_record_written"
 EVENT_DECISION_GATE_REFUSED = "decision_gate_refused"
 EVENT_DECISION_BLOCK = "decision_block"
+# OS-42 bounded validation repair. Four new `--event` values and NO new column: the
+# vocabulary has no `choices` by design, while ORCHESTRATOR_LOG_COLUMNS is the whole
+# schema and every row fills every column. `decision_state` carries INPUT and
+# `decision_reason_code` the defect code; the repair ordinal, field path and allowed
+# values go in `detail`. The `iteration` column keeps meaning the GATE iteration -- a
+# repair attempt is not an iteration and must not be written as one.
+EVENT_DECISION_GATE_FORM_DEFECT = "decision_gate_form_defect"
+EVENT_VALIDATION_REPAIR_REQUESTED = "validation_repair_requested"
+EVENT_VALIDATION_REPAIR_SUCCEEDED = "validation_repair_succeeded"
+EVENT_VALIDATION_REPAIR_EXHAUSTED = "validation_repair_exhausted"
 # OS-31 durable pause/resume. The `--event` column has no `choices` by design, so these
 # are named constants rather than a schema change.
 EVENT_RUN_PAUSED = "run_paused"
@@ -1588,8 +1598,15 @@ def final_review_report_ladder_path(
 ) -> Path:
     """Section 9's ladder: attempt 1 unsuffixed, attempt N>=2 _iteration<N>."""
     attempt = assert_attempt_in_domain(attempt, label="final_review_attempt")
-    suffix = "" if attempt == 1 else f"_iteration{attempt}"
-    return _ensure_run_artifact_root(run_id, base=base) / f"FINAL_REVIEW{suffix}.md"
+    # OS-42: the filename comes from the one shared ladder; this module still owns where
+    # the run root is and still raises its own error type above.
+    try:
+        from scripts.deterministic_workflow.artifact_identity import _iteration_suffix
+    except ImportError:  # pragma: no cover - flat installed layout
+        from deterministic_workflow.artifact_identity import (  # type: ignore[no-redef]
+            _iteration_suffix)
+    return (_ensure_run_artifact_root(run_id, base=base)
+            / f"FINAL_REVIEW{_iteration_suffix(attempt)}.md")
 
 
 def resolve_final_review_report(
@@ -1936,6 +1953,204 @@ def _stage_and_publish_audit_record(
         raise FinalReviewAuditWriteFailed(dispatch_key, boundary, error) from error
     _fsync_directory(audit_dir)
     return published
+
+
+# ---- OS-42: the validation-repair audit outbox ------------------------------------
+# The durable half of the validation-repair audit trail. It INHERITS the decision
+# ledger's durability scheme rather than inventing a second one: staged then published
+# by ONE os.rename, so a published key IS a complete record, and a rename onto an
+# existing non-empty directory is refused by POSIX -- which is where the exclusivity
+# comes from, atomically, instead of from a precheck that races.
+AUDIT_OUTBOX_DIRNAME = "validation_repair_audit"
+AUDIT_OUTBOX_RECORD_FILENAME = "record.json"
+# The human-readable view. It is REGENERATED from the published record set, never
+# appended to. That is the whole point: an independent append into a shared file cannot
+# be made exactly-once without deciding whether a competing writer is alive, and that
+# decision is the defect class this design removes rather than manages. A derived file is
+# a pure function of a SET, so it cannot contain a duplicate however many writers race.
+AUDIT_OUTBOX_PROJECTION_FILENAME = "VALIDATION_REPAIR_AUDIT.md"
+AUDIT_OUTBOX_PROJECTION_COLUMNS = (
+    "event", "phase", "role", "iteration", "round_kind",
+    "decision_state", "decision_reason_code", "result", "detail",
+)
+# Bound for the snapshot-project-replace-RECHECK loop below. The loop converges because
+# the record set is append-only and finite; this only stops a pathological live-lock from
+# spinning forever, and exhausting it is reported as a FAILED delivery, never a silent one.
+AUDIT_OUTBOX_PROJECTION_ATTEMPTS = 8
+_AUDIT_KEY_SAFE = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def audit_outbox_dir(run_id: str, *, base: Path | None = None) -> Path:
+    """artifacts/runs/<run_id>/validation_repair_audit/, provisioning the run root."""
+    return _ensure_run_artifact_root(run_id, base=base) / AUDIT_OUTBOX_DIRNAME
+
+
+def audit_outbox_key(key: str) -> str:
+    """One path segment for an audit key, injective on the keys OS-42 produces.
+
+    The engine's keys are built from ids and coordinates, so the substitution below is
+    reversible in practice; the hash suffix makes it injective in principle, so two
+    different transitions can never share a published directory.
+    """
+    safe = _AUDIT_KEY_SAFE.sub("_", key)[:96]
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
+    return f"{safe}.{digest}"
+
+
+def publish_audit_outbox_record(
+    run_id: str, key: str, payload: dict, *, base: Path | None = None
+) -> tuple[Path, bool]:
+    """Publish ONE audit record atomically. Returns (published dir, newly_published).
+
+    ``newly_published`` is False when the record was already there -- which is not an
+    error and not a duplicate: the record is the same deterministic payload either way,
+    and a caller resuming after a crash needs to CONTINUE rather than stop.
+    """
+    directory = audit_outbox_dir(run_id, base=base)
+    directory.mkdir(parents=True, exist_ok=True)
+    published = directory / audit_outbox_key(key)
+    if published.exists():
+        return published, False
+    text = json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+    try:
+        return _stage_and_publish_audit_record(
+            directory, audit_outbox_key(key), {AUDIT_OUTBOX_RECORD_FILENAME: text}
+        ), True
+    except FinalReviewAuditCollision:
+        # Another writer published first. The record is complete either way.
+        return published, False
+
+
+def read_audit_outbox_records(
+    run_id: str, *, base: Path | None = None
+) -> list[dict]:
+    """Every published audit record, in a deterministic order.
+
+    A published directory IS a complete record -- that name only ever appears via the
+    one os.rename of an already-populated staging directory -- so no reader needs an
+    "is it finished yet?" heuristic, and a partially written record can never be read.
+    """
+    directory = audit_outbox_dir(run_id, base=base)
+    records: list[dict] = []
+    if not directory.exists():
+        return records
+    for child in sorted(directory.iterdir()):
+        if not child.is_dir() or child.name == FINAL_REVIEW_AUDIT_STAGING_DIRNAME:
+            continue
+        record = child / AUDIT_OUTBOX_RECORD_FILENAME
+        if not record.is_file():
+            continue
+        try:
+            payload = json.loads(record.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(payload, dict):
+            records.append(payload)
+    records.sort(key=lambda payload: str(payload.get("key", "")))
+    return records
+
+
+def audit_outbox_projection_path(run_id: str, *, base: Path | None = None) -> Path:
+    """Where the derived table lives. One place, so no caller rebuilds the name."""
+    return audit_outbox_dir(run_id, base=base) / AUDIT_OUTBOX_PROJECTION_FILENAME
+
+
+def _render_audit_projection(records: list[dict]) -> str:
+    """The table text for a record set. A pure function of the set, deliberately."""
+    columns = AUDIT_OUTBOX_PROJECTION_COLUMNS
+    lines = ["| " + " | ".join(columns) + " |",
+             "| " + " | ".join("---" for _ in columns) + " |"]
+    for payload in records:
+        fields = payload.get("fields") or {}
+        values = {"event": payload.get("event", "")}
+        values.update({name: fields.get(name, "") for name in columns[1:]})
+        lines.append("| " + " | ".join(_escape(values.get(name, "")) for name in columns)
+                     + " |")
+    return "\n".join(lines) + "\n"
+
+
+def audit_projection_row_count(run_id: str, *, base: Path | None = None) -> int:
+    """Data rows in the PUBLISHED table -- the header and separator are not rows."""
+    path = audit_outbox_projection_path(run_id, base=base)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return 0
+    return max(0, len([line for line in text.splitlines() if line.strip()]) - 2)
+
+
+def audit_projection_covers(
+    run_id: str, key: str, *, base: Path | None = None
+) -> bool:
+    """Is `key`'s row present in the table that is published RIGHT NOW?
+
+    Answered without parsing rows, because counting is exact here and parsing is not.
+    The record set only ever grows, so every table was rendered from some snapshot S of
+    it, and S is necessarily a SUBSET of the set read back now. If the published table
+    has at least as many rows as the set has records, then |S| >= |set| and S subset
+    set, which forces S == set. `key`'s record is in the set -- the caller published it
+    before asking -- so `key`'s row is in the table.
+
+    A stale table left by a lost update has FEWER rows than the set has records, so this
+    returns False and the caller keeps its outbox entry. That is the second half of why
+    a row cannot be dropped: an intent is never discarded on the strength of a write
+    whose visible effect was not confirmed.
+    """
+    records = read_audit_outbox_records(run_id, base=base)
+    if not any(str(payload.get("key", "")) == key for payload in records):
+        return False
+    return audit_projection_row_count(run_id, base=base) >= len(records)
+
+
+def project_audit_outbox(
+    run_id: str, *, base: Path | None = None,
+    attempts: int = AUDIT_OUTBOX_PROJECTION_ATTEMPTS,
+) -> Path:
+    """Regenerate the human-readable audit table from the published record SET.
+
+    Rendering is a pure function of the set, but PUBLISHING that rendering is a
+    read-modify-write, and a read-modify-write needs its own serialisation or it loses
+    updates. It did: writer A could snapshot {A}, pause, let B publish and project
+    {A, B}, then replace the table with its stale {A} -- dropping B's row permanently
+    while both deliveries reported success.
+
+    The fix exploits the one property the record set actually has: it is APPEND-ONLY and
+    its records are IMMUTABLE, so it grows monotonically towards a finite limit. That
+    makes a bounded snapshot-project-replace-RECHECK loop correct and terminating:
+
+      * snapshot the set, render it, replace the table with one os.replace;
+      * RE-READ the set and count the rows now published. If the published table covers
+        the set, stop -- whatever wrote it (this call or a concurrent one) wrote a table
+        that includes everything the set held at that instant;
+      * otherwise the set grew, or a staler writer clobbered us. Go round again.
+
+    Each iteration re-snapshots a set at least as large as the last, the set is finite,
+    and a table rendered from the final set covers it -- so the loop converges. Nothing
+    in it asks whether another writer is alive, holds a lock, or has crashed; the
+    liveness judgement that produced the earlier race is still absent.
+
+    Raises `RunLoggingError` if the bound is exhausted, so a caller cannot mistake an
+    unconverged projection for a durable one.
+    """
+    directory = audit_outbox_dir(run_id, base=base)
+    directory.mkdir(parents=True, exist_ok=True)
+    path = audit_outbox_projection_path(run_id, base=base)
+    for _ in range(max(1, attempts)):
+        records = read_audit_outbox_records(run_id, base=base)
+        staged = (directory /
+                  f".{AUDIT_OUTBOX_PROJECTION_FILENAME}.{os.getpid()}-{secrets.token_hex(4)}")
+        staged.write_text(_render_audit_projection(records), encoding="utf-8")
+        # os.replace, not a write in place: a reader never sees a half-regenerated table,
+        # and two concurrent regenerations both leave a complete one.
+        os.replace(staged, path)
+        # The RECHECK. `records` is what we just published; re-read the authority.
+        if audit_projection_row_count(run_id, base=base) >= len(
+                read_audit_outbox_records(run_id, base=base)):
+            return path
+    raise RunLoggingError(
+        f"the audit projection for {run_id!r} did not converge in {attempts} attempts; "
+        "the caller must keep its outbox entry rather than treat this as delivered"
+    )
 
 
 # ---- OS-29: the run-scoped, append-only decision ledger ---------------------------

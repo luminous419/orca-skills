@@ -6,7 +6,8 @@ import re
 from typing import Any, TypedDict
 
 from .contracts import (ACTION_SCHEMA_VERSION, ALL_PHASES, BASE_CAPABILITIES, CAPABILITIES,
-                        DECISION_STATES, EVENT_SCHEMA_VERSION, RISKS, ROLES, ROUND_KINDS,
+                        DECISION_STATES, EVENT_SCHEMA_VERSION, MAX_REPAIR_ATTEMPTS,
+                        REPAIR_INSTRUCTION_KEYS, RISKS, ROLES, ROUND_KINDS,
                         ROUTE_TOKENS, RUN_LIFECYCLE_STATES, SCHEMA_VERSION,
                         TERMINAL_STATUSES, WORKFLOW_ID, ActionIntent, SettlementEvent)
 
@@ -46,6 +47,21 @@ class WorkflowState(TypedDict):
     # recorded before a change the engine has not re-run may not satisfy completion.  Both
     # are inert -- ``{}`` and ``0`` -- in every run that never paused.
     binding_generation: int; phase_pass_floor: dict[str, int]
+    # ---- OS-42 bounded validation repair ----
+    # ``repair_attempts``/``remaining_repair_budget`` are the THIRD iteration domain and
+    # borrow from neither of the other two.  ``pending_gate_defect`` is deliberately NOT
+    # ``terminal_reason``: a gate defect is not terminal until ROUTE says so, and writing
+    # a terminal reason here would make ``route_node`` short-circuit and the repair
+    # branch unreachable.  All four are inert -- ``0``, ``MAX``, ``None``, ``None`` -- in
+    # every run that never repairs.
+    repair_attempts: int; remaining_repair_budget: int
+    repair_binding: dict[str, Any] | None
+    pending_gate_defect: dict[str, Any] | None
+    # The CHECKPOINTED INTENT to emit an audit row.  Delivery is retried from here, so a
+    # write that failed is never permanently lost -- and because delivery happens outside
+    # the lifecycle path, its failure never changes what the workflow does next.  Empty in
+    # every run that never repairs, and empty again as soon as delivery succeeds.
+    audit_outbox: list[dict[str, Any]]
 
 
 FORBIDDEN_KEYS = re.compile(r"(?:process_handle|terminal_handle|session_handle|credential|access_token|client)", re.I)
@@ -78,6 +94,8 @@ def initial_state(*, run_id: str, thread_id: str, phases: tuple[str, ...],
         "logical_trace": [], "terminal_status": None, "terminal_reason": None,
         "run_lifecycle": "ACTIVE", "pause_binding": None,
         "binding_generation": 0, "phase_pass_floor": {},
+        "repair_attempts": 0, "remaining_repair_budget": MAX_REPAIR_ATTEMPTS,
+        "repair_binding": None, "pending_gate_defect": None, "audit_outbox": [],
     }
     return validate_state(state, expected_thread_id=thread_id)
 
@@ -113,7 +131,7 @@ def _assert_iteration_domain(label: str, consumed: Any, remaining: Any, maximum:
 
 _OPTIONAL_STR_FIELDS = ("decision_reason_code", "quality_verdict", "pending_clarification_id")
 _OPTIONAL_DICT_FIELDS = ("worker_result", "reviewer_result", "final_reviewer_result",
-                         "terminal_reason")
+                         "terminal_reason", "repair_binding", "pending_gate_defect")
 
 
 def _assert_value_domains(raw: dict[str, Any]) -> None:
@@ -161,6 +179,69 @@ def _assert_value_domains(raw: dict[str, Any]) -> None:
     _assert_pending_intent(raw)
     _assert_pending_event(raw)
     _assert_lifecycle_coherence(raw)
+    _assert_repair_state(raw)
+
+
+REPAIR_BINDING_KEYS = ("phase", "phase_iteration", "role", "round_kind")
+GATE_DEFECT_STATE_KEYS = ("defects", "code")
+
+
+def _assert_repair_state(raw: dict[str, Any]) -> None:
+    """OS-42.  The repair domain, its binding, and the defect list it owns.
+
+    The budget pair goes through the SAME ``_assert_iteration_domain`` the two existing
+    domains use, so a forged counter is refused for the same three reasons: ``bool`` is
+    not an int here, each side is inside ``0..MAX``, and the pair sums to MAX.  The sum
+    alone would not be enough -- ``(-100, 105)`` satisfies it and grants 105 attempts.
+    """
+    from .contracts import MAX_REPAIR_ATTEMPTS as _max
+
+    _assert_iteration_domain("repair budget", raw["repair_attempts"],
+                             raw["remaining_repair_budget"], _max)
+    for entry in raw["audit_outbox"]:
+        if type(entry) is not dict or set(entry) != {"event", "key", "fields"}:
+            raise StateError("MALFORMED_STATE:audit outbox entry shape")
+        if type(entry["event"]) is not str or not entry["event"]:
+            raise StateError("MALFORMED_STATE:audit outbox event")
+        if type(entry["key"]) is not str or not entry["key"]:
+            raise StateError("MALFORMED_STATE:audit outbox key")
+        if type(entry["fields"]) is not dict:
+            raise StateError("MALFORMED_STATE:audit outbox fields")
+    binding = raw["repair_binding"]
+    if binding is not None:
+        if set(binding) != set(REPAIR_BINDING_KEYS):
+            raise StateError("MALFORMED_STATE:repair binding shape")
+        if binding["phase"] not in ALL_PHASES or binding["role"] not in ROLES:
+            raise StateError("MALFORMED_STATE:repair binding vocabulary")
+        if binding["round_kind"] not in ROUND_KINDS:
+            raise StateError("MALFORMED_STATE:repair binding vocabulary")
+        if type(binding["phase_iteration"]) is not int or binding["phase_iteration"] < 0:
+            raise StateError("MALFORMED_STATE:repair binding iteration")
+    defect = raw["pending_gate_defect"]
+    if defect is None:
+        return
+    # One direction only.  A defect with no binding would be an unowned counter; the
+    # converse is legal, because PREPARE_REPAIR clears the defect once it has been copied
+    # onto the intent while keeping the binding that says which round owns the counter.
+    if binding is None:
+        raise StateError("MALFORMED_STATE:gate defect without a repair binding")
+    if set(defect) != set(GATE_DEFECT_STATE_KEYS):
+        raise StateError("MALFORMED_STATE:gate defect shape")
+    if type(defect["code"]) is not str or not defect["code"]:
+        raise StateError("MALFORMED_STATE:gate defect code")
+    entries = defect["defects"]
+    if type(entries) is not list or not entries:
+        raise StateError("MALFORMED_STATE:gate defect list")
+    try:  # repository layout
+        from scripts import decision_gate as _dg
+    except ImportError:  # installed Skill layout exposes sibling tools directly
+        import decision_gate as _dg  # type: ignore[no-redef]
+
+    for entry in entries:
+        if type(entry) is not dict or set(entry) != set(_dg.DEFECT_KEYS):
+            raise StateError("MALFORMED_STATE:gate defect entry shape")
+        if entry["kind"] not in _dg.DEFECT_KINDS:
+            raise StateError("MALFORMED_STATE:gate defect kind")
 
 
 def _assert_lifecycle_coherence(raw: dict[str, Any]) -> None:
@@ -228,9 +309,26 @@ def _assert_pending_intent(raw: dict[str, Any]) -> None:
     for key in ("artifact_binding", "repository_binding"):
         if type(intent[key]) is not dict:
             raise StateError(f"MALFORMED_STATE:pending intent {key}")
-    for key in ("phase_iteration", "final_review_iteration"):
+    for key in ("phase_iteration", "final_review_iteration", "repair_attempt"):
         if type(intent[key]) is not int or intent[key] < 0:
             raise StateError(f"MALFORMED_STATE:pending intent {key}")
+    # ---- OS-42 ----
+    if type(intent["gate_iteration"]) is not int or intent["gate_iteration"] < 1:
+        raise StateError("MALFORMED_STATE:pending intent gate_iteration")
+    if type(intent["artifact_contract_path"]) is not str or not intent["artifact_contract_path"]:
+        raise StateError("MALFORMED_STATE:pending intent artifact_contract_path")
+    instruction = intent["repair_instruction"]
+    if (intent["repair_attempt"] >= 1) != (instruction is not None):
+        raise StateError("MALFORMED_STATE:repair instruction coherence")
+    if instruction is not None:
+        if type(instruction) is not dict or set(instruction) != set(REPAIR_INSTRUCTION_KEYS):
+            raise StateError("MALFORMED_STATE:repair instruction shape")
+        if type(instruction["attempt"]) is not int or instruction["attempt"] < 1:
+            raise StateError("MALFORMED_STATE:repair instruction attempt")
+        if instruction["max_attempts"] != MAX_REPAIR_ATTEMPTS:
+            raise StateError("MALFORMED_STATE:repair instruction max_attempts")
+        if type(instruction["defects"]) is not list or not instruction["defects"]:
+            raise StateError("MALFORMED_STATE:repair instruction defects")
 
 
 def _assert_pending_event(raw: dict[str, Any]) -> None:
@@ -260,7 +358,7 @@ def validate_state(raw: dict[str, Any], *, expected_thread_id: str) -> WorkflowS
     # can never reach the trace/routing code as a silent KeyError or TypeError.
     for key in ("requested_phases", "adapter_capabilities", "correction_queue", "corrected_phases",
                 "revalidation_queue", "blocking_findings", "processed_command_ids",
-                "processed_event_ids", "logical_trace"):
+                "processed_event_ids", "logical_trace", "audit_outbox"):
         if type(raw[key]) is not list: raise StateError(f"MALFORMED_STATE:{key} type")
     for key in ("phase_iterations", "remaining_phase_budget", "phase_passes", "artifact_binding",
                 "initial_repository_binding", "repository_binding", "phase_pass_floor"):
@@ -268,7 +366,8 @@ def validate_state(raw: dict[str, Any], *, expected_thread_id: str) -> WorkflowS
     if raw["pause_binding"] is not None and type(raw["pause_binding"]) is not dict:
         raise StateError("MALFORMED_STATE:pause_binding type")
     for key in ("current_phase_index", "final_review_iterations", "remaining_final_budget",
-                "correction_index", "revalidation_index", "binding_generation"):
+                "correction_index", "revalidation_index", "binding_generation",
+                "repair_attempts", "remaining_repair_budget"):
         if type(raw[key]) is not int: raise StateError(f"MALFORMED_STATE:{key} type")
     for key in ("schema_version", "run_id", "thread_id", "workflow_id", "current_phase",
                 "round_kind", "risk", "run_lifecycle"):

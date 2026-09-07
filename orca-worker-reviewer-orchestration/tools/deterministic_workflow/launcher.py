@@ -3,7 +3,9 @@
 This is the runnable half of the engine: it builds state, selects an adapter, invokes or
 resumes the compiled graph with an explicit recursion limit, and maps the terminal status
 onto a process exit code.  With the fake adapter it runs a complete workflow with no Orca
-runtime present.
+runtime present; with ``--adapter orca`` it runs the SAME graph against a real Orca Run
+through ``OrcaAdapter``, which is the path the bounded OS-42 validation-repair loop has
+to be reachable on.
 
 Recursion limit
 ---------------
@@ -18,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -153,6 +156,14 @@ def execute_state(raw_state: dict[str, Any], *, adapter: Any, checkpointer: Any 
         checkpointer = FileCheckpointSaver(resolve_checkpoint_path(
             raw_state["run_id"], thread_id or raw_state["thread_id"],
             explicit=checkpoint_store_path, artifact_base=artifact_base))
+    if "audit_sink" not in graph_options:
+        # OS-42.  The run's own append-only ORCHESTRATOR_LOG.md is where the
+        # validation-repair audit trail lands, and this is the entry point that knows
+        # where that run root is.  Passing `audit_sink=None` explicitly still disables it,
+        # which is what every in-process test does so a suite run writes no artifacts.
+        from .audit import RunLoggingAuditSink
+        graph_options["audit_sink"] = RunLoggingAuditSink(
+            raw_state["run_id"], artifact_base=artifact_base)
     config: dict[str, Any] = {"recursion_limit": recursion_limit or default_recursion_limit(raw_state)}
     # Unconditional: a thread id is what makes a run addressable by a successor process.
     config["configurable"] = {"thread_id": thread_id or raw_state["thread_id"],
@@ -162,7 +173,7 @@ def execute_state(raw_state: dict[str, Any], *, adapter: Any, checkpointer: Any 
                         require_durable_checkpointer=require_durable_checkpointer,
                         **graph_options)
     try:
-        return graph.invoke(raw_state, config)
+        final = graph.invoke(raw_state, config)
     except RuntimeStateConflict as exc:
         # A corrupt, incompatible or contended durable ledger stops the run *before* any
         # further external effect, and is reported as BLOCKED rather than as a crash.  It is
@@ -180,6 +191,175 @@ def execute_state(raw_state: dict[str, Any], *, adapter: Any, checkpointer: Any 
         blocked["route_token"] = "BLOCK"
         blocked["terminal_reason"] = {"code": exc.code, "message": exc.detail}
         return terminal_node(blocked)
+    # OS-42.  A settled run executes no further node, so the outbox needs one retry point
+    # after the graph has stopped -- this is it.  Outside the lifecycle path by
+    # construction: it reads the final state, delivers, and writes nothing back, so it can
+    # neither raise into the run nor change what the run decided.
+    from .audit import drain
+    drain(graph_options.get("audit_sink"), final)
+    return final
+
+
+# ---- OS-42 F-002: the production Orca execution path ---------------------------------
+# Before this, the shipped launcher offered `--adapter fake` and nothing else, so the
+# bounded validation-repair loop could only ever run against scripted settlements. The
+# feature could not reach the path where OS-42 actually failed.
+#
+# `OrcaAdapter` itself was always installed and takes its runtime by injection, so what
+# was missing was (a) a way to SELECT it from the shipped command line and (b) the
+# runtime to hand it. `release_manifest.ORCA_RUNTIME_CLOSURE` now installs that runtime
+# beside the engine, which is why the import below resolves inside the installed package
+# and no longer reaches for a repository-only module.
+
+FAKE_ADAPTER = "fake"
+ORCA_ADAPTER = "orca"
+ADAPTERS = (FAKE_ADAPTER, ORCA_ADAPTER)
+
+# Refusals the production path raises BEFORE any Orca effect exists.
+ORCA_ADAPTER_REQUIRES_STATE = "ORCA_ADAPTER_REQUIRES_STATE"
+ORCA_ADAPTER_REQUIRES_OBJECTIVE = "ORCA_ADAPTER_REQUIRES_OBJECTIVE"
+ORCA_ADAPTER_REQUIRES_AGENT_PROFILE = "ORCA_ADAPTER_REQUIRES_AGENT_PROFILE"
+ORCA_RUNTIME_UNAVAILABLE = "ORCA_RUNTIME_UNAVAILABLE"
+
+
+def _skill_md_path() -> Path:
+    """The orchestration SKILL.md this engine belongs to, in either layout."""
+    return _import_orca_runtime().SKILL_MD_PATH
+
+
+def _import_orca_runtime() -> Any:
+    """`orca_runtime_harness`, imported lazily and from either layout.
+
+    Lazy for the same reason `orca_adapter._default_result_parser` is: this module is
+    inside the shipped engine package and the harness is a `tools/` sibling, so a
+    module-scope import would make the whole package unimportable in an installation
+    that carries only the engine.
+    """
+    try:  # repository layout
+        from scripts import orca_runtime_harness
+    except ImportError:  # pragma: no cover - flat installed Skill layout
+        import orca_runtime_harness  # type: ignore[no-redef]
+    return orca_runtime_harness
+
+
+def _import_agent_profile() -> Any:
+    try:  # repository layout
+        from scripts import agent_profile
+    except ImportError:  # pragma: no cover - flat installed Skill layout
+        import agent_profile  # type: ignore[no-redef]
+    return agent_profile
+
+
+def _import_skill_policy() -> Any:
+    try:  # repository layout
+        from scripts import skill_policy
+    except ImportError:  # pragma: no cover - flat installed Skill layout
+        import skill_policy  # type: ignore[no-redef]
+    return skill_policy
+
+
+def orca_run_routing(*, agent_profile_name: str, requested_phases: tuple[str, ...],
+                     risk: str, project_root: Path) -> Any:
+    """Materialize the run's agent routing, or refuse.
+
+    A routing is REQUIRED on this path and is not defaulted. Without one the harness
+    falls back to its repository-local fake-agent shim, which does not exist in an
+    installed tree -- so an installed run with no routing would create a terminal that
+    can never settle. Refusing here means no Task, no Dispatch and no terminal is made.
+    """
+    agent_profile = _import_agent_profile()
+    if not agent_profile_name:
+        raise LauncherError(
+            f"{ORCA_ADAPTER_REQUIRES_AGENT_PROFILE}: --adapter orca dispatches real "
+            "agents and needs --agent-profile <name>; there is no default agent")
+    selection = agent_profile.select_agent_profile(
+        agent_profile_name, project_root=project_root)
+    if not selection.is_selected:
+        raise LauncherError(
+            f"{ORCA_ADAPTER_REQUIRES_AGENT_PROFILE}: agent profile "
+            f"{agent_profile_name!r} did not resolve ({selection.reason})")
+    # The agent-command trust boundary, in the order `skill_policy._resolve_agent_routing`
+    # applies it: whole-definition token/allowlist safety first, then availability for
+    # the entries this run will actually dispatch. Both read the SAME policy contract the
+    # Coordinator reads, so the shipped launcher cannot be a weaker door into the same
+    # runtime than the documented one.
+    skill_policy = _import_skill_policy()
+    contract = skill_policy.load_policy_contract(_skill_md_path())
+    known_commands = set(contract["known_agent_commands"])
+    custom_pattern = re.compile(str(contract["custom_agent_command_pattern"]), re.ASCII)
+    try:
+        agent_profile.validate_profile_command_safety(
+            selection.profile, token_pattern=skill_policy.AGENT_COMMAND_PATTERN,
+            known_commands=known_commands, custom_command_pattern=custom_pattern)
+    except agent_profile.AgentProfileError as exc:
+        raise LauncherError(
+            f"{ORCA_ADAPTER_REQUIRES_AGENT_PROFILE}: {exc.reason}: {exc}") from exc
+    routing = agent_profile.materialize_run_routing(
+        runtime="orchestration", selection=selection,
+        requested_phases=requested_phases, risk=risk)
+    try:
+        agent_profile.validate_routing_commands(
+            routing, token_pattern=skill_policy.AGENT_COMMAND_PATTERN,
+            known_commands=known_commands, custom_command_pattern=custom_pattern)
+    except agent_profile.AgentProfileError as exc:
+        raise LauncherError(
+            f"{ORCA_ADAPTER_REQUIRES_AGENT_PROFILE}: {exc.reason}: {exc}") from exc
+    unresolved = routing.unresolved_required()
+    if unresolved:
+        raise LauncherError(
+            f"{ORCA_ADAPTER_REQUIRES_AGENT_PROFILE}: profile {agent_profile_name!r} "
+            "leaves required roles unrouted: "
+            + ", ".join(f"{entry.phase}/{entry.role}" for entry in unresolved))
+    return routing
+
+
+def build_orca_adapter(spec: dict[str, Any], *, objective: str, artifact_base: Path,
+                       runtime_state: Any = None, agent_profile_name: str = "",
+                       project_root: Path | None = None,
+                       harness_factory: Any = None) -> tuple[Any, dict[str, Any]]:
+    """Create the Orca Run and return ``(adapter, state)`` bound to it.
+
+    The state is built AFTER the Run exists and carries the Orca Run's own id, so the
+    engine's artifact paths, the generated decision-gate contract and the settlement
+    validator's binding all name one run rather than three.
+
+    ``harness_factory`` exists so a test can substitute the process boundary without
+    substituting the adapter, the harness, the graph or the launcher -- everything this
+    finding is about stays real.
+    """
+    runtime = _import_orca_runtime()
+    if not objective:
+        raise LauncherError(
+            f"{ORCA_ADAPTER_REQUIRES_OBJECTIVE}: --adapter orca creates an Orca Run and "
+            "needs --objective")
+    root = Path(project_root) if project_root is not None else Path.cwd()
+    phases = tuple(spec.get("phases") or CANONICAL_PHASES)
+    risk = spec.get("risk", "high")
+    # `task_context.RISK_SELECTION_SOURCES` is a closed pair, and which member applies is
+    # a fact about the launch specification: a run that names its own risk selected it
+    # explicitly, a run that does not took the default.
+    risk_source = "explicit" if "risk" in spec else "default"
+    routing = orca_run_routing(
+        agent_profile_name=agent_profile_name,
+        requested_phases=tuple(phase.lower() for phase in phases),
+        risk=risk, project_root=root)
+    factory = harness_factory or runtime.OrcaRuntimeHarness
+    try:
+        # `artifact_dir` is the BASE the run root is provisioned under -- run_logging
+        # appends `artifacts/runs/<run_id>/` itself -- so it is passed before the Run
+        # exists and is never rebound afterwards. Rebinding it after `start_run` would
+        # move the run's decision ledger out from under the very first pre-dispatch B1
+        # guard, which then reads an absence and refuses.
+        harness = factory(artifact_base, risk=risk, risk_source=risk_source,
+                          agent_routing=routing, quality_profile_root=root)
+        harness.preflight()
+        run_id = harness.start_run(
+            objective, requested_phases=tuple(phase.lower() for phase in phases))
+    except runtime.OrcaRuntimeError as exc:
+        raise LauncherError(f"{ORCA_RUNTIME_UNAVAILABLE}: {exc}") from exc
+    state = build_state({**spec, "run_id": run_id})
+    from .orca_adapter import OrcaAdapter
+    return OrcaAdapter(harness, runtime_state=runtime_state), state
 
 
 def demo_results() -> list[dict[str, Any]]:
@@ -229,8 +409,21 @@ def build_parser() -> argparse.ArgumentParser:
                         help="run the canonical 5-phase workflow with the fake adapter")
     parser.add_argument("--state", help="JSON file describing the initial state")
     parser.add_argument("--results", help="JSON file with the fake adapter's scripted settlements")
-    parser.add_argument("--adapter", choices=("fake",), default="fake",
-                        help="adapter to execute with (only the Orca-independent fake ships here)")
+    parser.add_argument("--adapter", choices=ADAPTERS, default=FAKE_ADAPTER,
+                        help="adapter to execute with: `fake` runs the workflow with no "
+                             "Orca runtime present; `orca` is the production path -- it "
+                             "creates a real Orca Run and dispatches real agents through "
+                             "OrcaAdapter, which is where the bounded validation-repair "
+                             "loop actually runs")
+    parser.add_argument("--objective", default="",
+                        help="the Run objective (required by --adapter orca)")
+    parser.add_argument("--agent-profile", default="",
+                        help="agent profile name that routes each role to a real agent "
+                             "command (required by --adapter orca)")
+    parser.add_argument("--project-root", default=None,
+                        help="the project the run drives, used to resolve the agent "
+                             "profile and the quality profile (default: the working "
+                             "directory)")
     parser.add_argument("--runtime-state",
                         help="JSON file for the durable idempotency ledger "
                              f"(default: ${RUNTIME_STATE_DIR_ENV} or the system temp dir)")
@@ -517,16 +710,29 @@ def run_cli(argv: list[str] | None = None) -> int:
         if args.check_runtime:
             print(f"deterministic workflow runtime ready (langgraph {version})")
             return 0
-        state, results = _launch_inputs(args)
+        state, results, orca_spec = _launch_inputs(args)
         from .runtime_state import FileRuntimeStateStore
+        if args.adapter == ORCA_ADAPTER:
+            # The production path.  The Run is created FIRST, because the run id it
+            # returns is what the state, the artifact paths and the ledger are all named
+            # after -- deriving any of them from the launch specification would name a
+            # run that does not exist.  Nothing durable is written before this point, so
+            # a refusal here leaves no Task, no Dispatch, no terminal and no ledger.
+            adapter, state = build_orca_adapter(
+                orca_spec, objective=args.objective,
+                artifact_base=Path(args.artifact_base),
+                agent_profile_name=args.agent_profile, project_root=args.project_root)
         # Durable by default: without an explicit path the run still gets a real on-disk
         # ledger, because an unguarded default is exactly what lets a restart duplicate an
         # external Task/Dispatch.
         ledger_path = Path(args.runtime_state) if args.runtime_state else default_runtime_state_path(
             state["run_id"], state["thread_id"])
         runtime_state = FileRuntimeStateStore(ledger_path)
-        from .fake_adapter import FakeAdapter
-        adapter = FakeAdapter(results, runtime_state=runtime_state)
+        if args.adapter == ORCA_ADAPTER:
+            adapter.runtime_state = runtime_state
+        else:
+            from .fake_adapter import FakeAdapter
+            adapter = FakeAdapter(results, runtime_state=runtime_state)
         final = execute_state(state, adapter=adapter, runtime_state=runtime_state,
                               recursion_limit=args.recursion_limit,
                               checkpoint_store_path=args.checkpoint_store,
@@ -544,16 +750,35 @@ def run_cli(argv: list[str] | None = None) -> int:
     return summary["exit_code"]
 
 
-def _launch_inputs(args: argparse.Namespace) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+def _launch_inputs(
+    args: argparse.Namespace,
+) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
+    """``(state, scripted results, the raw launch spec)``.
+
+    The raw spec is returned as well because the production adapter rebuilds the state
+    around the Orca Run id it is about to create, which is not knowable here.
+    """
+    if args.adapter == ORCA_ADAPTER:
+        # A production run scripts nothing: `--results` is the fake adapter's input and
+        # naming one here would be a contradiction, not a convenience.
+        if not args.state:
+            raise LauncherError(
+                f"{ORCA_ADAPTER_REQUIRES_STATE}: --adapter orca needs --state")
+        spec = _read_json(args.state, "--state")
+        if not isinstance(spec, dict):
+            raise LauncherError("state specification must be a JSON object")
+        return build_state(spec), [], spec
     if args.demo:
-        return build_state({"run_id": "run_demo", "thread_id": "demo",
-                            "phases": list(CANONICAL_PHASES)}), demo_results()
+        spec = {"run_id": "run_demo", "thread_id": "demo",
+                "phases": list(CANONICAL_PHASES)}
+        return build_state(spec), demo_results(), spec
     if not args.state or not args.results:
         raise LauncherError("--demo, or both --state and --results, are required")
     results = _read_json(args.results, "--results")
     if not isinstance(results, list) or not all(isinstance(item, dict) for item in results):
         raise LauncherError("--results must be a JSON list of settlement result objects")
-    return build_state(_read_json(args.state, "--state")), results
+    spec = _read_json(args.state, "--state")
+    return build_state(spec), results, spec
 
 
 def require_runtime() -> str:

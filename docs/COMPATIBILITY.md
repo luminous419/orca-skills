@@ -1,5 +1,30 @@
 # Compatibility and Verification Status
 
+## OS-42 — validation repair: two schema versions move (breaking for in-flight runs)
+
+`SCHEMA_VERSION` moves `os40.workflow.v1` -> `os40.workflow.v2` and
+`ACTION_SCHEMA_VERSION` moves `os40.action.v1` -> `os40.action.v2`. `EVENT_SCHEMA_VERSION`
+and `CHECKPOINT_STORE_SCHEMA_VERSION` do **not** move: `SettlementEvent`'s key set is
+unchanged (the new gate data lives inside `result`, which was always an open dict) and the
+checkpoint store's own document format is unchanged.
+
+**Drain in-flight runs before upgrading.** A checkpoint written by the previous build
+carries `os40.workflow.v1`; `validate_state` refuses it with `MALFORMED_STATE:schema` and
+`validate_node` routes the run to a BLOCKED terminal. The same holds for an in-flight
+`pending_intent` written under `os40.action.v1`. That is the fail-closed direction and it
+is deliberate: a run interrupted across the upgrade must be RESTARTED, not resumed.
+
+No migration shim is provided, and that is a decision rather than an omission. A shim
+would have to invent `repair_attempt`, `gate_iteration`, `artifact_contract_path` and
+`repair_instruction` for an intent created without them, and inventing an artifact path
+for an in-flight dispatch is precisely the class of error OS-42 exists to remove.
+
+`decision_gate.LEDGER_RECORD_SCHEMA_VERSION` stays `1` and
+`decision_policy.SUPPORTED_SCHEMA_VERSIONS` stays `(1,)`: no field is added to a decision
+ledger record and the `decision_policy` block is unchanged, so historical records stay
+readable and `artifacts/runs/**` is neither read nor written by this change.
+
+
 The repository version is read from [`VERSION`](../VERSION). This document distinguishes
 supported deterministic tooling from runtime configurations that have only been verified
 in a specific environment.

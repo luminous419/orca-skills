@@ -1,5 +1,120 @@
 # Changelog
 
+## OS-42 — schema-derived decision-gate contract with bounded validation repair
+
+**Added**
+- `scripts/decision_contract.py`: the single schema projection, the generated Worker
+  contract, the settlement parser, and the FORM/SEMANTIC/LIFECYCLE classifier. Every enum
+  token in the generated block is interpolated from the schema; a test asserts the
+  renderer contains no enum string literal.
+- `scripts/deterministic_workflow/artifact_identity.py`: ONE one-based `gate_iteration`
+  derivation for all three roles and ONE implementation of SKILL.md section 9's artifact
+  path ladder, replacing three separate copies.
+- A bounded validation repair in the OS-40 engine: the `PREPARE_REPAIR` route token
+  (mapped to the existing `PREPARE_INTENT` node, so no graph node is added), four new
+  closed `WorkflowState` fields, and a repair budget disjoint from the phase and
+  final-review budgets.
+- `result["gate"]`, a closed settlement envelope carrying what the agent declared,
+  verbatim. The parser transports; it never classifies.
+- Four `--event` values: `decision_gate_form_defect`, `validation_repair_requested`,
+  `validation_repair_succeeded`, `validation_repair_exhausted`. No new column on
+  `ORCHESTRATOR_LOG.md`.
+- A durable validation-repair audit trail under
+  `artifacts/runs/<run-id>/validation_repair_audit/`. The AUTHORITY is one record per
+  logical transition, published atomically by a single `os.rename` under a key derived
+  from the checkpointed transition -- it inherits the decision ledger's durability scheme
+  rather than inventing a second one, so a published key IS a complete record.
+  `VALIDATION_REPAIR_AUDIT.md` beside it is a DERIVED PROJECTION: regenerated in full from
+  the published record set and swapped in with one `os.replace`, never appended to. That
+  is what makes a duplicate row impossible rather than unlikely under concurrent delivery,
+  crash and replay -- there is no claim, no scan of a shared file, and so no need to decide
+  whether a competing writer is alive. The intent to emit rides the LangGraph checkpoint in
+  the closed `audit_outbox` state field, so a failed write is retried by the next node, by
+  a resume, or at settlement; and no engine path reads the delivery result, so an audit
+  write can never change a lifecycle decision.
+- `tools/` now ships the full six-module decision-contract import closure, with a test
+  that RECOMPUTES the closure by AST walk rather than asserting a list.
+- `run_workflow.py --adapter orca`: the PRODUCTION Orca execution path on the installed
+  Skill. It creates a real Orca Run, materializes the run's agent routing through the same
+  profile gate the Coordinator uses, and dispatches through `OrcaAdapter` over
+  `OrcaRuntimeHarness` -- so the bounded validation-repair loop runs where OS-42 actually
+  failed and not only under scripted fake settlements. `--adapter fake` is unchanged and
+  still needs no Orca runtime.
+- `tools/` now also ships `ORCA_RUNTIME_CLOSURE` (`orca_runtime_harness`, `task_context`,
+  `workflow_contract`), completing the production dependency closure so the installed
+  package imports no repository-only module. The closure is likewise recomputed by AST
+  walk, and an end-to-end test drives the INSTALLED copy in its own interpreter -- with
+  `import scripts` proven to fail there -- through malformed output, bounded repair,
+  success, and retry exhaustion.
+
+**Fixed**
+- F-001: `classify_gate` accepted its expected `role` and discarded it, and no
+  classification path called `decision_gate.record_identity_defect()`. A Worker settlement
+  could declare the Reviewer identity `B3/reviewer/reviewer`, the impossible combination
+  `B2/reviewer/worker`, or the unknown boundary `B9`, and no defect was raised. The
+  classifier now checks each mechanics field against its own closed domain (FORM,
+  repairable), then the relational identity against the ACTIVE dispatch (LIFECYCLE, fails
+  closed and is never repaired into acceptance), and binds `run`/`phase`/`iteration` to the
+  values the generated contract was rendered with. `artifact_identity.contract_phase` is
+  the one derivation both the dispatched contract and the settlement validator read.
+- F-001 (round 2): the LIVE OS-29 ingress normalized forged mechanics identity into a
+  valid ledger row before the engine classifier could see it.
+  `OrcaRuntimeHarness._record_decision_from_attempt` parsed the agent record with
+  `parse_gate_result` -- which binds nothing to the active dispatch -- and then
+  unconditionally overwrote `run`, `phase`, `iteration`, `boundary`, `source` and `role`
+  with local values before appending the result to the decision ledger, so a settlement
+  declaring `run_foreign/design/99/B3/reviewer/reviewer` was published as this run's own
+  `B2/worker/worker` record. `decision_contract.declared_mechanics_defects()` now judges
+  the RAW record at that boundary, before any normalization and before the append. A
+  field the record OMITS is still the Coordinator's to supply -- that is the division of
+  labour the live path is built on -- but a field it DECLARES is a claim and must match
+  the active dispatch.
+- F-001 (round 2): `run`, `phase` and `iteration` mismatches classified as repairable
+  FORM defects, so `route_node` prepared a REPAIR for a record claiming another dispatch.
+  They are LIFECYCLE now. The line the taxonomy draws: a value OUTSIDE
+  its declared domain (`boundary: "B9"`, a wrongly-typed field, `iteration: 0`) is a
+  format error and stays repairable; a WELL-FORMED value naming another dispatch is an
+  identity claim and fails closed. `_identity_defects` reports nothing for an
+  out-of-domain member, which is what keeps `record_identity_defect`'s "not one of
+  RECORD_IDENTITIES" from reclassifying an unknown token as forgery.
+- F-001 (round 3): the live ingress judged only the mechanics a record DECLARED, so a
+  record that omitted its identity entirely had no ingress defect at all -- it was
+  normalized from local context and published as `CLEAR`, while `classify_gate` called
+  the same record a FORM defect. Two validators disagreed about whether omission is a
+  defect and the permissive one ran first and wrote the ledger. Absence is now FORM on
+  both paths (`mechanics_identity_defects`, renamed from `declared_mechanics_defects`),
+  so the bounded repair loop re-asks for a complete record instead of the Coordinator
+  inventing one. The three-way taxonomy is now: ABSENT required mechanics -> FORM,
+  repairable; UNKNOWN token -> FORM, repairable; WELL-FORMED but FOREIGN -> LIFECYCLE,
+  fail closed and repair disarmed.
+- F-001 (round 3): the repository's fake agents declare their mechanics identity now,
+  read out of the generated contract block in the dispatched prompt -- which is where a
+  real agent reads it. `orca_fake_agent.extract_gate_mechanics` parses the block per
+  DISPATCH and passes it on as `--decision-gate-mechanics-json`; it is deliberately not
+  part of the terminal's launch command line, which the session-reuse gate compares.
+- A dispatch decides ONCE. `_log_attempt` is the single funnel every settled dispatch
+  passes and it runs on the REPLAY path too, so a replayed settlement was judged a second
+  time: before this it was relabelled with the second call's phase and published as a
+  mislabelled DUPLICATE ledger row. `_settled_dispatch_decisions` answers a replay with
+  what the dispatch already decided, publishes nothing and advances no binding.
+- F-002: `OrcaRuntimeHarness._b1_guard` refused a bounded validation repair. A settled
+  boundary with a defective declaration publishes no record and advances `_last_settled`
+  anyway, so the OS-29 guard correctly refused the NEXT dispatch -- including the repair
+  that re-asks the same boundary. The guard now admits exactly that dispatch (a
+  `repair_instruction` for the same run/phase/gate iteration whose previous attempt
+  recorded an input defect) and nothing else; every non-repair dispatch meets the
+  identical refusal unless a record was actually published.
+- A pre-existing crash: `validate_settlement_node`'s processed-event short-circuit cleared
+  `pending_intent`/`pending_event` and `apply_result_node` then subscripted `None`,
+  raising `TypeError`. Replay now passes through.
+
+**Changed (breaking for in-flight runs)**
+- `SCHEMA_VERSION` -> `os40.workflow.v2`, `ACTION_SCHEMA_VERSION` -> `os40.action.v2`.
+  See `docs/COMPATIBILITY.md`.
+- `result["iteration"]` for a FINAL_REVIEWER settlement is now the final-review ordinal
+  rather than the current phase's counter, which is what the adapter already used.
+
+
 This project follows [Semantic Versioning](docs/RELEASING.md). User-visible changes
 are recorded here in a Keep a Changelog-inspired format.
 

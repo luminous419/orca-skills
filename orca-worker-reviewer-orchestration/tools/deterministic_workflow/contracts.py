@@ -5,11 +5,12 @@ import hashlib
 import hmac
 import json
 import re
+from copy import deepcopy
 from typing import Any, Literal, TypedDict
 
-SCHEMA_VERSION = "os40.workflow.v1"
+SCHEMA_VERSION = "os40.workflow.v2"
 WORKFLOW_ID = "os40.standard.v1"
-ACTION_SCHEMA_VERSION = "os40.action.v1"
+ACTION_SCHEMA_VERSION = "os40.action.v2"
 EVENT_SCHEMA_VERSION = "os40.event.v1"
 
 PHASES = ("ANALYSIS", "PLAN", "DESIGN", "IMPLEMENTATION", "TEST")
@@ -22,6 +23,11 @@ ROUTE_TOKENS = (
     "BLOCK", "ESCALATE", "PREPARE_WORKER", "PREPARE_PHASE_REVIEWER",
     "ADVANCE_PHASE", "PREPARE_FINAL_REVIEWER", "PREPARE_CORRECTION",
     "PREPARE_REVALIDATION", "COMPLETE", "PAUSE", "CANCEL", "ABANDON",
+    # OS-42.  A bounded validation-repair re-asks the SAME role in the SAME phase and
+    # iteration for a well-formed decision-gate record.  It maps to the EXISTING
+    # PREPARE_INTENT node, so no graph node is added and validate_graph_spec's
+    # reachability and dead-end proofs are untouched.
+    "PREPARE_REPAIR",
 )
 TERMINAL_STATUSES = ("COMPLETED", "BLOCKED", "ESCALATED", "CANCELLED", "ABANDONED")
 # OS-31.  ``WAITING_FOR_INPUT`` is deliberately ABSENT from ``TERMINAL_STATUSES``: a run
@@ -29,6 +35,40 @@ TERMINAL_STATUSES = ("COMPLETED", "BLOCKED", "ESCALATED", "CANCELLED", "ABANDONE
 # OS-31 exists to remove.  It is a run *lifecycle* value, not a terminal status.
 RUN_LIFECYCLE_STATES = ("ACTIVE", "WAITING_FOR_INPUT", "SETTLED")
 DECISION_STATES = ("CLEAR", "ASSUMPTION_ALLOWED", "NEEDS_INPUT", "CONFLICT")
+
+# ---- OS-42 validation repair --------------------------------------------------------
+# How many times ONE gate round may re-ask an agent for a well-formed record.  It is a
+# module constant and NOT a user-facing parameter (SKILL.md section 13 says the ticket
+# adds none), and it is deliberately NOT derived from max_iterations: a generous
+# correction budget must not buy unbounded re-asks, because the two counters answer
+# different questions.
+MAX_REPAIR_ATTEMPTS: int = 2
+# The closed shape `result["gate"]` carries.  Duplicated from
+# `decision_contract.GATE_ENVELOPE_KEYS` and pinned equal by a parity test: this module
+# is the runtime-neutral core of the shipped engine and takes no tools/ sibling import.
+GATE_ENVELOPE_KEYS: tuple[str, ...] = (
+    "declared_state", "declaration_count", "fence_count",
+    "record", "record_text", "truncated",
+)
+# The closed shape a REPAIR dispatch carries to the agent.  There is deliberately no
+# `suggestion`, `candidate` or `recommended` key: the Coordinator never chooses a value
+# for the agent, and a closed tuple is where that is enforced rather than promised.
+REPAIR_INSTRUCTION_KEYS: tuple[str, ...] = ("attempt", "max_attempts", "defects")
+# The three terminal codes a gate defect can produce.  They are NOT event-rejection
+# codes: an event rejection is a node deciding the run is over, while a gate defect is
+# not terminal until ROUTE says so.
+GATE_DEFECT_CODES = frozenset({
+    "DECISION_GATE_FORM_DEFECT",
+    "DECISION_GATE_SEMANTIC_BLOCK",
+    "DECISION_GATE_LIFECYCLE_DEFECT",
+})
+GATE_REPAIR_EXHAUSTED = "DECISION_GATE_REPAIR_EXHAUSTED"
+# What TERMINAL may stamp for a gate outcome, so the structured payload is attached to
+# exactly these and to nothing else.
+GATE_TERMINAL_CODES = frozenset({GATE_REPAIR_EXHAUSTED}) | (
+    GATE_DEFECT_CODES - {"DECISION_GATE_FORM_DEFECT"}
+)
+ARTIFACT_IDENTITY_DRIFT = "ARTIFACT_IDENTITY_DRIFT"
 BASE_CAPABILITIES = frozenset({
     "agent_start", "agent_command", "agent_status", "agent_interrupt",
     "settlement", "idempotent_intent", "artifact_immutable", "checkpoint",
@@ -51,7 +91,7 @@ CAPABILITIES = BASE_CAPABILITIES | RECOVERY_CAPABILITIES | frozenset({
 
 Phase = Literal["ANALYSIS", "PLAN", "DESIGN", "IMPLEMENTATION", "TEST", "BUGFIX", "REFACTORING"]
 Role = Literal["WORKER", "PHASE_REVIEWER", "FINAL_REVIEWER"]
-RouteToken = Literal["BLOCK", "ESCALATE", "PREPARE_WORKER", "PREPARE_PHASE_REVIEWER", "ADVANCE_PHASE", "PREPARE_FINAL_REVIEWER", "PREPARE_CORRECTION", "PREPARE_REVALIDATION", "COMPLETE", "PAUSE", "CANCEL", "ABANDON"]
+RouteToken = Literal["BLOCK", "ESCALATE", "PREPARE_WORKER", "PREPARE_PHASE_REVIEWER", "ADVANCE_PHASE", "PREPARE_FINAL_REVIEWER", "PREPARE_CORRECTION", "PREPARE_REVALIDATION", "COMPLETE", "PAUSE", "CANCEL", "ABANDON", "PREPARE_REPAIR"]
 
 
 class Finding(TypedDict):
@@ -76,6 +116,11 @@ class ActionIntent(TypedDict):
     artifact_binding: dict[str, Any]
     repository_binding: dict[str, Any]
     payload_digest: str
+    # ---- OS-42 ----
+    repair_attempt: int                          # 0 ordinary, n>=1 the n-th repair
+    gate_iteration: int                          # >= 1, artifact_identity's derivation
+    artifact_contract_path: str                  # the ONE file this dispatch may write
+    repair_instruction: dict[str, Any] | None    # REPAIR_INSTRUCTION_KEYS, or None
 
 
 class SettlementEvent(TypedDict):
@@ -110,6 +155,10 @@ class EventValidationError(ValueError):
 
 # A settlement rejected for any of these reasons must never have its result applied.
 EVENT_REJECTION_CODES = frozenset({"MALFORMED_EVENT", "UNKNOWN_EVENT", "SETTLEMENT_INTEGRITY"})
+# OS-42: a gate DEFECT is consumed without being applied too, but it is signalled through
+# `pending_gate_defect` rather than `terminal_reason`, because whether it ends the run
+# depends on its kind AND on the repair budget -- and that is a routing decision.  See
+# `executor.consume_without_apply`.
 
 
 # ---- repository / artifact bindings -------------------------------------------------
@@ -174,6 +223,27 @@ def binding_snapshot(repository: dict[str, Any], artifact: dict[str, Any]) -> di
     return {"repository": dict(repository), "artifact": dict(artifact)}
 
 
+def _validate_gate_envelope(envelope: Any) -> None:
+    """Shape only. Nothing here looks at the record's CONTENTS -- that is the
+    classifier's job, and doing it here would turn a repairable defect into an
+    unrepairable event-integrity failure."""
+    if not isinstance(envelope, dict) or set(envelope) != set(GATE_ENVELOPE_KEYS):
+        raise EventValidationError(
+            "MALFORMED_EVENT", f"result['gate'] must carry exactly {list(GATE_ENVELOPE_KEYS)}")
+    if envelope["declared_state"] is not None and type(envelope["declared_state"]) is not str:
+        raise EventValidationError("MALFORMED_EVENT", "gate declared_state must be text or null")
+    for key in ("declaration_count", "fence_count"):
+        value = envelope[key]
+        if type(value) is not int or value < 0:
+            raise EventValidationError("MALFORMED_EVENT", f"gate {key} must be a count >= 0")
+    if envelope["record"] is not None and type(envelope["record"]) is not dict:
+        raise EventValidationError("MALFORMED_EVENT", "gate record must be an object or null")
+    if envelope["record_text"] is not None and type(envelope["record_text"]) is not str:
+        raise EventValidationError("MALFORMED_EVENT", "gate record_text must be text or null")
+    if type(envelope["truncated"]) is not bool:
+        raise EventValidationError("MALFORMED_EVENT", "gate truncated must be a boolean")
+
+
 def validate_event(intent: ActionIntent, event: dict[str, Any]) -> SettlementEvent:
     """Validate the closed settlement vocabulary and identity before its result is applied."""
     if set(event) != set(SettlementEvent.__required_keys__) or not isinstance(event.get("result"), dict):
@@ -188,6 +258,13 @@ def validate_event(intent: ActionIntent, event: dict[str, Any]) -> SettlementEve
             raise EventValidationError("UNKNOWN_EVENT", "unknown worker status")
     elif result.get("result") not in {"PASS", "FAIL"}:
         raise EventValidationError("UNKNOWN_EVENT", "unknown reviewer result")
+    # OS-42.  The gate envelope's SHAPE, and only its shape.  A malformed envelope is the
+    # ADAPTER's product, not the agent's, so it is an event-integrity failure and is never
+    # repairable.  An ABSENT envelope is legal here and becomes the FORM defect
+    # DECISION_GATE_INPUT_MISSING downstream -- "the agent said nothing" is a repairable
+    # defect and must not be disguised as an integrity failure.
+    if "gate" in result:
+        _validate_gate_envelope(result["gate"])
     # Only a Worker settlement may advance the repository/artifact binding, and only with a
     # fully normalized one; a malformed or out-of-scope binding is never applied.
     if "binding" in result:
@@ -232,27 +309,71 @@ def stable_id(namespace: str, value: Any) -> str:
 
 
 def make_intent(state: dict[str, Any], role: Role, round_kind: str) -> ActionIntent:
+    """Build the one intent this dispatch is, including everything derived from state.
+
+    OS-42 adds four fields, and WHERE each one goes is load-bearing.
+
+    ``repair_attempt`` is in ``identity``, so it changes ``command_id``.  It has to be:
+    ``apply_result_node`` appends ``command_id`` to ``processed_command_ids`` even on the
+    consume-without-apply path, and ``prepare_intent_node`` refuses a prepared intent
+    whose ``command_id`` is already there.  Without the identity slot a repair -- same
+    phase, same iteration, same role, same round kind -- would be refused outright, and
+    if that guard were bypassed ``OrcaAdapter.start`` would return the FIRST attempt's
+    cached receipt and repair would appear to succeed while doing nothing.
+
+    ``gate_iteration``, ``artifact_contract_path`` and ``repair_instruction`` are in the
+    ``payload``, not the identity.  All three are functions of fields already in
+    ``identity``, so adding them there would be redundant; putting them in the payload
+    makes them digest-bound, and therefore re-checked by ``runtime_state.claim`` -- so a
+    successor process that re-derives this intent and computes a different artifact path,
+    or a different defect list, is refused rather than silently writing elsewhere.
+    """
+    from . import artifact_identity      # local: keeps the module import graph acyclic
+
+    phase = state["current_phase"]
+    gate_iteration = artifact_identity.gate_iteration(state, role, phase)
+    artifact_contract_path = artifact_identity.artifact_relative_path(
+        run_id=state["run_id"], phase=phase, role=role, gate_iteration=gate_iteration)
+    repair_attempt = state.get("repair_attempts", 0)
+    defect = state.get("pending_gate_defect")
+    repair_instruction = None if defect is None else {
+        "attempt": repair_attempt,
+        "max_attempts": MAX_REPAIR_ATTEMPTS,
+        "defects": deepcopy(defect["defects"]),
+    }
+    # The biconditional makes "a repair dispatch with no defect payload" -- and its
+    # mirror, "a defect payload on an ordinary dispatch" -- UNREPRESENTABLE rather than
+    # merely discouraged.
+    if (repair_attempt >= 1) != (repair_instruction is not None):
+        raise ValueError("MALFORMED_STATE:repair instruction coherence")
     identity = {
         "workflow_id": state["workflow_id"], "run_id": state["run_id"],
-        "phase": state["current_phase"],
-        "phase_iteration": state["phase_iterations"][state["current_phase"]],
+        "phase": phase,
+        "phase_iteration": state["phase_iterations"][phase],
         "final_review_iteration": state["final_review_iterations"],
         "role": role, "round_kind": round_kind, "action_kind": "RUN_AGENT",
+        "repair_attempt": repair_attempt,
     }
     command_id = stable_id("cmd", identity)
     payload = {
         "command_id": command_id, "artifact_binding": state["artifact_binding"],
         "repository_binding": state["repository_binding"],
+        "gate_iteration": gate_iteration,
+        "artifact_contract_path": artifact_contract_path,
+        "repair_instruction": repair_instruction,
     }
     payload_digest = hashlib.sha256(canonical_bytes(payload)).hexdigest()
     return {
         "schema_version": ACTION_SCHEMA_VERSION,
         "intent_id": stable_id("intent", {**payload, "payload_digest": payload_digest}),
         "command_id": command_id, "action_kind": "RUN_AGENT", "run_id": state["run_id"],
-        "phase": state["current_phase"], "phase_iteration": identity["phase_iteration"],
+        "phase": phase, "phase_iteration": identity["phase_iteration"],
         "final_review_iteration": identity["final_review_iteration"], "role": role,
         "round_kind": round_kind, "artifact_binding": state["artifact_binding"],
         "repository_binding": state["repository_binding"], "payload_digest": payload_digest,
+        "repair_attempt": repair_attempt, "gate_iteration": gate_iteration,
+        "artifact_contract_path": artifact_contract_path,
+        "repair_instruction": repair_instruction,
     }
 
 

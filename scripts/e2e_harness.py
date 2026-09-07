@@ -467,8 +467,17 @@ def final_review_artifact_path(run_id: str, attempt: int) -> str:
     runs' Final Review artifacts from landing in the same shared artifacts/ root.
     """
     attempt = run_logging.assert_attempt_in_domain(attempt)
-    suffix = "" if attempt == 1 else f"_iteration{attempt}"
-    return f"{run_artifact_root(run_id)}FINAL_REVIEW{suffix}.md"
+    # OS-42: one ladder, in the engine package, instead of three copies of the same
+    # expression. This module keeps its own domain raiser above -- the shared rule is a
+    # PREDICATE precisely so each caller can keep its own exception contract.
+    try:
+        from scripts.deterministic_workflow.artifact_identity import artifact_basename
+    except ImportError:  # pragma: no cover - direct `python3 scripts/...` execution
+        from deterministic_workflow.artifact_identity import (  # type: ignore[no-redef]
+            artifact_basename)
+
+    return run_artifact_root(run_id) + artifact_basename(
+        phase="final_review", role="final_reviewer", gate_iteration=attempt)
 
 
 def lower_to_requested_phase(phase: str, requested: tuple[str, ...]) -> str | None:

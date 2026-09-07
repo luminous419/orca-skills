@@ -4,9 +4,13 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
-from .contracts import (BASE_CAPABILITIES, EVENT_REJECTION_CODES, EXTERNAL_LOOKUP,
-                        EXTERNAL_RESUME, EventValidationError, ExternalLookupUnavailable,
+from .contracts import (ARTIFACT_IDENTITY_DRIFT, BASE_CAPABILITIES, EVENT_REJECTION_CODES,
+                        EXTERNAL_LOOKUP, EXTERNAL_RESUME, GATE_DEFECT_CODES,
+                        GATE_REPAIR_EXHAUSTED, GATE_TERMINAL_CODES, MAX_REPAIR_ATTEMPTS,
+                        EventValidationError, ExternalLookupUnavailable,
                         binding_snapshot, make_intent, validate_event)
+from . import artifact_identity
+from . import audit
 from .lease_keeper import LeaseRenewalFailed, lease_keeper_factory
 from . import pause_policy
 from .routing import (active_correction_phase, downstream_revalidation_set,
@@ -69,7 +73,20 @@ def route_node(state: dict[str, Any]) -> dict[str, Any]:
 def prepare_intent_node(state: dict[str, Any]) -> dict[str, Any]:
     token = state["route_token"]
     new = deepcopy(state)
-    if token == "PREPARE_FINAL_REVIEWER":
+    if token == "PREPARE_REPAIR":
+        # OS-42.  The SAME role, the SAME phase and the SAME round are re-asked; only the
+        # representation was wrong.  Nothing about current_phase, phase_iterations,
+        # correction_queue or correction_index moves.
+        if new["pending_gate_defect"] is None:
+            raise StateError("OUT_OF_ORDER_EVENT:repair without a defect")
+        role, kind = new["pending_role"], new["round_kind"]
+        new["repair_attempts"] += 1
+        new["remaining_repair_budget"] -= 1
+        # pending_gate_defect is deliberately STILL SET here: make_intent reads it to
+        # build the intent's repair_instruction.  Clearing it before make_intent -- which
+        # an earlier draft of this design did -- is exactly how a repair dispatch ends up
+        # carrying no defect and re-asking for nothing.
+    elif token == "PREPARE_FINAL_REVIEWER":
         role, kind = "FINAL_REVIEWER", "FINAL_REVIEW"
         new["final_review_iterations"] += 1
         new["remaining_final_budget"] -= 1
@@ -84,11 +101,23 @@ def prepare_intent_node(state: dict[str, Any]) -> dict[str, Any]:
             if correction_phase is None: raise StateError("OUT_OF_ORDER_EVENT:correction queue consumed")
             new["current_phase"] = correction_phase
         new["worker_result"] = None; new["reviewer_result"] = None
+    if token != "PREPARE_REPAIR":
+        # Every ordinary preparation opens a NEW gate round, so the repair domain resets.
+        new["repair_attempts"] = 0
+        new["remaining_repair_budget"] = MAX_REPAIR_ATTEMPTS
+        new["repair_binding"] = None
+        new["pending_gate_defect"] = None
     new["pending_role"] = role
     intent = make_intent(new, role, kind)
     if intent["command_id"] in new["processed_command_ids"]:
         raise StateError("OUT_OF_ORDER_EVENT:processed command prepared")
     new["pending_intent"] = intent; new["intent_status"] = "PREPARED"; new["route_token"] = None
+    if token == "PREPARE_REPAIR":
+        # Cleared only NOW.  The defects have been copied onto the intent, where they are
+        # digest-bound and survive a crash with the intent itself.  repair_binding is kept:
+        # it says which gate round owns the counter, and clearing it would leave
+        # repair_attempts >= 1 with nothing owning it.
+        new["pending_gate_defect"] = None
     new["logical_trace"] = _trace(new, "PREPARE_INTENT")
     return new
 
@@ -576,18 +605,188 @@ def _residual_row(port: Any, journal: Any, intent_id: str, *, now: str,
     return pause_policy.validate_settlement_row(row)
 
 
-def validate_settlement_node(state: dict[str, Any]) -> dict[str, Any]:
-    intent, event = state["pending_intent"], state["pending_event"]
-    if not intent or not event or event.get("intent_id") != intent["intent_id"] or event.get("command_id") != intent["command_id"]:
-        raise StateError("OUT_OF_ORDER_EVENT:settlement binding")
-    if event["event_id"] in state["processed_event_ids"]:
-        return {**state, "pending_intent": None, "pending_event": None, "intent_status": "NONE"}
-    try:
-        validate_event(intent, event)
-    except EventValidationError as exc:
-        return {**state, "terminal_reason": {"code": exc.code, "message": str(exc)},
-                "logical_trace": _trace(state, "VALIDATE_SETTLEMENT", reason_code=exc.code)}
-    return {**state, "logical_trace": _trace(state, "VALIDATE_SETTLEMENT")}
+def validate_settlement_node(policy: Any = None, classifier: Any = None):
+    """Build the VALIDATE_SETTLEMENT node, closing over the decision policy.
+
+    A FACTORY, mirroring ``execute_intent_node(adapter, runtime_state)``: the policy is
+    resolved once at graph construction so the node performs no I/O, and the classifier
+    is injected so ``executor`` needs no module-level import of the ``tools/`` sibling
+    that owns it -- a packaging mistake then fails at build time with a named refusal
+    instead of making the whole engine package unimportable.
+
+    Called with no arguments it behaves exactly as before OS-42: no policy, no gate
+    classification, every existing path unchanged.
+    """
+
+    def node(state: dict[str, Any]) -> dict[str, Any]:
+        intent, event = state["pending_intent"], state["pending_event"]
+        if not intent or not event or event.get("intent_id") != intent["intent_id"] or event.get("command_id") != intent["command_id"]:
+            raise StateError("OUT_OF_ORDER_EVENT:settlement binding")
+        # Step 2 stays ABOVE the classification below: a replayed settlement must exit
+        # before it can be re-classified, or a crash-restart would re-derive a defect for
+        # a settlement that was already consumed and would move the repair counter twice.
+        if event["event_id"] in state["processed_event_ids"]:
+            return {**state, "pending_intent": None, "pending_event": None, "intent_status": "NONE"}
+        try:
+            validate_event(intent, event)
+        except EventValidationError as exc:
+            return {**state, "terminal_reason": {"code": exc.code, "message": str(exc)},
+                    "logical_trace": _trace(state, "VALIDATE_SETTLEMENT", reason_code=exc.code)}
+        if policy is None or classifier is None:
+            return {**state, "logical_trace": _trace(state, "VALIDATE_SETTLEMENT")}
+        # OS-42 F-001. The classifier is given BOTH halves of the record's identity: the
+        # role this dispatch was sent out under, and the run/phase/gate-iteration the
+        # contract was rendered with. `artifact_identity.contract_phase` is the SAME
+        # derivation `OrcaAdapter.start` renders with, so the record an agent is told to
+        # write is the record the validator accepts.
+        defects = classifier(
+            policy, (event.get("result") or {}).get("gate"), role=intent["role"],
+            binding={"run": intent["run_id"],
+                     "phase": artifact_identity.contract_phase(intent["role"],
+                                                               intent["phase"]),
+                     "iteration": intent["gate_iteration"]})
+        if not defects:
+            return {**state, "logical_trace": _trace(state, "VALIDATE_SETTLEMENT")}
+        kinds = {defect.kind for defect in defects}
+        # An EQUALITY, not a membership test: a mixed list containing even one SEMANTIC or
+        # LIFECYCLE defect is not repairable.  This is the fail-closed default expressed
+        # at the classification boundary; `routing.route` expresses it again.
+        code = ("DECISION_GATE_FORM_DEFECT" if kinds == {"FORM"}
+                else "DECISION_GATE_SEMANTIC_BLOCK" if "SEMANTIC" in kinds
+                else "DECISION_GATE_LIFECYCLE_DEFECT")
+        # terminal_reason is DELIBERATELY NOT SET, for ANY kind.  `route_node` calls
+        # `route(state)` only when terminal_reason is falsy, so writing one here would
+        # make the repair branch unreachable and would block every repairable defect
+        # immediately.  A gate defect is not terminal until ROUTE says so, because whether
+        # it ends the run depends on its kind AND on the repair budget.
+        return {**state,
+                "pending_gate_defect": {
+                    "defects": [defect.as_dict() for defect in defects], "code": code},
+                "repair_binding": {"phase": intent["phase"],
+                                   "phase_iteration": intent["phase_iteration"],
+                                   "role": intent["role"],
+                                   "round_kind": intent["round_kind"]},
+                "logical_trace": _trace(state, "VALIDATE_SETTLEMENT", reason_code=code)}
+
+    return node
+
+
+# ---- OS-42: the three audit emitters ------------------------------------------------
+# Each is a PURE function of (state_before, state_after) returning the outbox entries the
+# transition owes.  They perform no I/O and touch no state: the graph appends what they
+# return to the checkpointed `audit_outbox`, so the INTENT to emit survives a crash and is
+# retried, while the DELIVERY stays outside the lifecycle path and its failure changes
+# nothing.  Purity is what makes that split possible -- and what makes each emitter
+# testable without a filesystem.
+
+
+def audit_gate_transition(before: dict[str, Any],
+                          after: dict[str, Any]) -> tuple[dict[str, Any], ...]:
+    """VALIDATE_SETTLEMENT: a FORM defect was detected, or a repair settled clean."""
+    intent, event = before.get("pending_intent"), before.get("pending_event")
+    if not intent or not event:
+        return ()
+    defect = after.get("pending_gate_defect")
+    if defect is not None and before.get("pending_gate_defect") is None:
+        if defect["code"] != "DECISION_GATE_FORM_DEFECT":
+            # SEMANTIC and LIFECYCLE defects are not repair events; their audit is the
+            # terminal the run is about to record.  Emitting a "form defect" row for them
+            # would put the wrong name on a judgement.
+            return ()
+        key = audit.gate_defect_key(event["event_id"])
+        return (audit.outbox_entry(
+            audit.EVENT_GATE_FORM_DEFECT, key,
+            phase=intent["phase"], role=_audit_role(intent),
+            iteration=intent["gate_iteration"],
+            round_kind=intent["round_kind"].lower(),
+            decision_state=audit.INPUT_DEFECT_STATE,
+            decision_reason_code=defect["defects"][0].get("code", ""),
+            detail=audit.defect_detail(defect["defects"], key=key,
+                                       repair_attempt=intent["repair_attempt"],
+                                       max_attempts=MAX_REPAIR_ATTEMPTS),
+        ),)
+    if defect is None and intent["repair_attempt"] >= 1:
+        # The repaired dispatch came back clean.  This is the ONLY place that fact is
+        # knowable: after APPLY_RESULT the intent is gone and the round looks ordinary.
+        key = audit.repair_succeeded_key(event["event_id"])
+        return (audit.outbox_entry(
+            audit.EVENT_REPAIR_SUCCEEDED, key,
+            phase=intent["phase"], role=_audit_role(intent),
+            iteration=intent["gate_iteration"],
+            round_kind=intent["round_kind"].lower(),
+            detail=audit.defect_detail((), key=key,
+                                       repair_attempt=intent["repair_attempt"],
+                                       max_attempts=MAX_REPAIR_ATTEMPTS),
+        ),)
+    return ()
+
+
+def audit_repair_request(before: dict[str, Any],
+                         after: dict[str, Any]) -> tuple[dict[str, Any], ...]:
+    """PREPARE_INTENT: a repair dispatch was prepared for this gate round."""
+    if before.get("route_token") != "PREPARE_REPAIR":
+        return ()
+    intent = after.get("pending_intent")
+    if not intent:
+        return ()
+    instruction = intent.get("repair_instruction") or {}
+    key = audit.repair_requested_key(intent["command_id"])
+    return (audit.outbox_entry(
+        audit.EVENT_REPAIR_REQUESTED, key,
+        phase=intent["phase"], role=_audit_role(intent),
+        iteration=intent["gate_iteration"],
+        round_kind=intent["round_kind"].lower(),
+        decision_state=audit.INPUT_DEFECT_STATE,
+        decision_reason_code=(instruction.get("defects") or [{}])[0].get("code", ""),
+        detail=audit.defect_detail(instruction.get("defects") or (), key=key,
+                                   repair_attempt=intent["repair_attempt"],
+                                   max_attempts=MAX_REPAIR_ATTEMPTS),
+    ),)
+
+
+def audit_terminal(before: dict[str, Any],
+                   after: dict[str, Any]) -> tuple[dict[str, Any], ...]:
+    """TERMINAL: the repair budget was spent and the round failed closed."""
+    del before
+    reason = after.get("terminal_reason") or {}
+    if reason.get("code") != GATE_REPAIR_EXHAUSTED:
+        return ()
+    binding = after.get("repair_binding") or {}
+    defects = reason.get("defects") or ()
+    key = audit.repair_exhausted_key(
+        after["run_id"], reason.get("phase", ""),
+        (after.get("phase_iterations") or {}).get(reason.get("phase", ""), ""),
+        reason.get("repair_attempts", ""))
+    return (audit.outbox_entry(
+        audit.EVENT_REPAIR_EXHAUSTED, key,
+        phase=reason.get("phase", ""),
+        role=str(binding.get("role", "")).lower(),
+        round_kind=str(binding.get("round_kind", "")).lower(),
+        decision_state=audit.INPUT_DEFECT_STATE,
+        decision_reason_code=GATE_REPAIR_EXHAUSTED,
+        result="BLOCKED",
+        detail=audit.defect_detail(defects, key=key,
+                                   repair_attempt=reason.get("repair_attempts"),
+                                   max_attempts=reason.get("max_repair_attempts")),
+    ),)
+
+
+def _audit_role(intent: dict[str, Any]) -> str:
+    return "reviewer" if intent["role"].endswith("REVIEWER") else "worker"
+
+
+def consume_without_apply(state: dict[str, Any]) -> str | None:
+    """The reason this settlement must be consumed but never applied, or None.
+
+    Two sources, deliberately.  An EVENT-level rejection is a node deciding the run is
+    over and carries ``terminal_reason``; a GATE defect is not terminal until ROUTE says
+    so and carries ``pending_gate_defect`` instead.
+    """
+    code = (state.get("terminal_reason") or {}).get("code")
+    if code in EVENT_REJECTION_CODES:
+        return code
+    defect = state.get("pending_gate_defect")
+    return defect["code"] if defect is not None else None
 
 
 def role_binding_is_stale(state: dict[str, Any], intent: dict[str, Any]) -> bool:
@@ -636,7 +835,22 @@ def _reject_settlement(new: dict[str, Any], intent: dict[str, Any], event: dict[
 
 def apply_result_node(state: dict[str, Any]) -> dict[str, Any]:
     new = deepcopy(state); intent, event = new["pending_intent"], new["pending_event"]
-    if (new.get("terminal_reason") or {}).get("code") in EVENT_REJECTION_CODES:
+    if intent is None or event is None:
+        # VALIDATE_SETTLEMENT short-circuited an already-processed settlement and cleared
+        # both.  There is nothing to apply and nothing to consume -- the pass that really
+        # processed it already appended both ids, and appending them again would trip
+        # state.py's duplicate-identity check.  A pass-through, not a rejection: nothing
+        # about a replay is a defect.  Before this guard the node reached
+        # `role_binding_is_stale(new, None)` and raised
+        # `TypeError: 'NoneType' object is not subscriptable`.
+        new["logical_trace"] = _trace(new, "APPLY_RESULT")
+        return new
+    if consume_without_apply(new) is not None:
+        # Consumed, never applied.  worker_result / reviewer_result / final_reviewer_result,
+        # phase_passes, the bindings and every budget are untouched, which is what makes a
+        # gate defect cost no phase or final-review iteration.  pending_gate_defect and
+        # repair_binding are deliberately PRESERVED: ROUTE reads both, and clearing them
+        # here would make the repair branch unreachable one node later.
         new["processed_command_ids"].append(intent["command_id"])
         new["processed_event_ids"].append(event["event_id"])
         new["pending_intent"] = None; new["pending_event"] = None; new["intent_status"] = "NONE"
@@ -648,9 +862,21 @@ def apply_result_node(state: dict[str, Any]) -> dict[str, Any]:
         # than record a pass against a tree nobody reviewed.
         return _reject_settlement(new, intent, event, "STALE_REVIEW_BINDING",
                                   "reviewer intent binding does not match current state")
+    reported = ((event["result"].get("binding") or {}).get("artifact") or {}).get("relative_path")
+    if reported is not None and reported != intent["artifact_contract_path"]:
+        # The path-level counterpart of validate_settlement_binding's root-level
+        # SETTLEMENT_BINDING_SCOPE check.  Never repairable: a dispatch writing somewhere
+        # other than the file it was contracted to write is not a representation defect.
+        return _reject_settlement(
+            new, intent, event, ARTIFACT_IDENTITY_DRIFT,
+            f"settlement reports {reported!r}, intent contracted "
+            f"{intent['artifact_contract_path']!r}")
     result = deepcopy(event["result"]); role = intent["role"]; phase = intent["phase"]
+    # OS-42: READ the derived ordinal rather than recomputing `phase_iteration + 1` here.
+    # The adapter reads the same field, so the dispatched task context and the applied
+    # result can no longer disagree about which gate attempt this was.
     result.update({"intent_id": intent["intent_id"], "phase": phase,
-                   "iteration": intent["phase_iteration"] + (1 if role != "FINAL_REVIEWER" else 0)})
+                   "iteration": intent["gate_iteration"]})
     if role == "WORKER":
         # Advance the repository/artifact binding from the settlement *before* anything
         # downstream (the phase Reviewer dispatch above all) reads it.
@@ -705,6 +931,23 @@ def advance_phase_node(state: dict[str, Any]) -> dict[str, Any]:
     else: new["round_kind"] = "FINAL_REVIEW"; new["final_reviewer_result"] = None
     new["logical_trace"] = _trace(new, "ADVANCE_PHASE")
     return new
+
+
+def _gate_terminal_extras(state: dict[str, Any], code: str) -> dict[str, Any]:
+    """The structured payload a GATE terminal carries, and nothing else carries.
+
+    This is where the ticket's "terminal reason records the validation error, field path,
+    allowed values and retry count" is actually met: the error and field path and allowed
+    set live in each defect, and the retry count is the repair counter beside them.
+    """
+    defect = state.get("pending_gate_defect")
+    if code not in GATE_TERMINAL_CODES or defect is None:
+        return {}
+    extras: dict[str, Any] = {"defects": deepcopy(defect["defects"])}
+    if code == GATE_REPAIR_EXHAUSTED:
+        extras["repair_attempts"] = state["repair_attempts"]
+        extras["max_repair_attempts"] = MAX_REPAIR_ATTEMPTS
+    return extras
 
 
 def terminal_node(state: dict[str, Any]) -> dict[str, Any]:
@@ -771,13 +1014,26 @@ def terminal_node(state: dict[str, Any]) -> dict[str, Any]:
         elif new["decision_state"] in ("NEEDS_INPUT", "CONFLICT"): code = new["decision_state"]
         elif stale_final and not (new.get("terminal_reason") or {}).get("code"):
             code = "STALE_FINAL_REVIEW_BINDING"
+        elif not refusal and new.get("pending_gate_defect") is not None:
+            # OS-42.  Placed AFTER the pause-refusal and decision_state clauses so the
+            # OS-31 and OS-28 blocks keep exactly the precedence they have today.  A FORM
+            # defect only reaches TERMINAL when the repair budget is spent, which is what
+            # the exhaustion code names.
+            gate_code = new["pending_gate_defect"]["code"]
+            code = (GATE_REPAIR_EXHAUSTED if gate_code == "DECISION_GATE_FORM_DEFECT"
+                    else gate_code)
         else: code = (new.get("terminal_reason") or {}).get("code") or ("UNIT_TEST_BLOCKED" if (new.get("worker_result") or {}).get("unit_test_status") == "BLOCKED" else "WORKER_BLOCKED")
     reason_phase = new["current_phase"]
     if (token == "ESCALATE" and new["round_kind"] == "FINAL_REVIEW"
             and code == "MAX_ITERATIONS_REACHED" and correction_phase is not None):
         reason_phase = correction_phase
     new["terminal_status"] = status; new["run_lifecycle"] = "SETTLED"
-    new["terminal_reason"] = {"code": code, "message": code, "phase": reason_phase}
+    # OS-42.  This assignment REBUILDS terminal_reason, so structured keys written by an
+    # earlier node would be discarded -- which is why the gate payload is composed HERE,
+    # from pending_gate_defect, rather than upstream.  `extras` is empty for every
+    # terminal that is not a gate terminal, so no existing terminal reason changes shape.
+    new["terminal_reason"] = {"code": code, "message": code, "phase": reason_phase,
+                              **_gate_terminal_extras(new, code)}
     new["pending_role"] = None; new["pending_intent"] = None; new["pending_event"] = None; new["intent_status"] = "NONE"
     new["logical_trace"] = _trace(new, "TERMINAL", terminal_status=status, reason_code=code)
     return new

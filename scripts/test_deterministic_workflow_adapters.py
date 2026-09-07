@@ -85,7 +85,15 @@ class LangGraphAdapterParityTests(unittest.TestCase):
             def run_existing_task(self, role, iteration, mode, task_id, *, phase=None,
                                   spec=None, round_kind="phase_gate", **kwargs):
                 self.calls.append(("run_existing_task",role,iteration,mode,task_id,phase,round_kind))
-                return SimpleNamespace(body=json.dumps(self.results.pop(0)),dispatch_id=f"dispatch_{len(self.calls)}"), "term_offline"
+                # OS-42: a real agent emits a decision-gate record, and the FakeAdapter
+                # stipulates one for a scripted settlement. For the two adapters to be
+                # comparable they must see the same agent output, so this offline
+                # harness stipulates the same envelope from the intent it was handed.
+                from scripts.deterministic_workflow.fake_adapter import (
+                    stipulated_gate_envelope)
+                result = dict(self.results.pop(0))
+                result.setdefault("gate", stipulated_gate_envelope(json.loads(spec)))
+                return SimpleNamespace(body=json.dumps(result),dispatch_id=f"dispatch_{len(self.calls)}"), "term_offline"
             def task_status(self, task_id): return "completed"
             def call(self, *args, **kwargs): return {"ok":True,"args":args}
         results=[{"status":"COMPLETE","unit_test_status":"NOT_APPLICABLE"},

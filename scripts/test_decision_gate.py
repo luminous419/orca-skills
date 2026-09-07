@@ -883,6 +883,14 @@ class RiskIndependenceTests(PolicyMixin):
         "verification_record_defect",
         "record_identity",
         "record_identity_defect",
+        # OS-42. Declared here because this guard exists to make every new gate function
+        # visible to the risk-independence assertion, and all three genuinely take no
+        # risk, quality-profile or agent-profile parameter: `defect_kind` reads a code,
+        # `collect_form_defects` reads the policy's own declared domains, and
+        # `truncate_actual` bounds a repr.
+        "defect_kind",
+        "collect_form_defects",
+        "truncate_actual",
     )
     AXIS_TOKENS = ("risk", "profile", "quality_profile", "agent_profile", "severity")
 

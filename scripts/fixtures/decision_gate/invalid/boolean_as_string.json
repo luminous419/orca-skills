@@ -1,0 +1,21 @@
+{
+  "assumption": null,
+  "boundary": "B2",
+  "evidence": {},
+  "iteration": 1,
+  "ledger_schema_version": 1,
+  "open_decision_item": false,
+  "open_item": null,
+  "phase": "ANALYSIS",
+  "prior_open_decision_items": [],
+  "reason_code": null,
+  "recorded_at": "2026-01-01T00:00:00+00:00",
+  "responsible_phase": "ANALYSIS",
+  "role": "worker",
+  "run": "run_fixture",
+  "security": "true",
+  "source": "worker",
+  "source_binding": "artifacts/runs/run_fixture/",
+  "state": "CLEAR",
+  "verdict": ""
+}

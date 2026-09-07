@@ -4778,6 +4778,12 @@ NEUTRALITY_RENDER_TASK_SPEC_SIGNATURE = (
     ("quality_gate", None),
     ("risk_context", None),
     ("agent_routing", None),
+    # OS-42 appends two more, LAST and DEFAULTED, exactly as OS-3's `risk_context` and
+    # OS-4's `agent_routing` were appended. The neutrality property this test guards is
+    # unchanged and is still asserted: a caller that omits them renders a byte-identical
+    # spec, which is what the golden-capture tests beside this one prove.
+    ("decision_gate_contract", None),
+    ("validation_repair", None),
 )
 
 

@@ -209,6 +209,12 @@ the run then does **not** claim "no ambiguous terminal ownership".
 `ports.py` defines agent execution, artifact, runtime receipt, existing OS-30 human approval,
 run-scoped pause state (`RunPauseStatePort`), lifecycle settlement (`LifecycleSettlementPort`),
 clock, and ID protocols. `fake_adapter.py` provides Orca-independent deterministic execution.
+The installed launcher selects between them with `--adapter`: `fake` runs a complete
+workflow with no Orca runtime present, and `orca` is the production path — it creates a
+real Orca Run, materializes the run's agent routing through the same profile safety gate
+the Coordinator applies, and dispatches through `OrcaAdapter`. Both ship: the Skill's
+`tools/` carries the harness's full import closure, so the installed package imports no
+repository-only module.
 `orca_adapter.py` composes OrcaRuntimeHarness-compatible execution primitives, strips runtime
 handles from settlements, and owns no routing rules. Missing declared capabilities block before
 dispatch.

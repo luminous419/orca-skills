@@ -23,13 +23,17 @@ ROUTE_TARGETS = {
     "PREPARE_PHASE_REVIEWER": "PREPARE_INTENT", "PREPARE_FINAL_REVIEWER": "PREPARE_INTENT",
     "PREPARE_CORRECTION": "PREPARE_INTENT", "PREPARE_REVALIDATION": "PREPARE_INTENT",
     "PAUSE": "PAUSE", "CANCEL": "DISPOSE", "ABANDON": "DISPOSE",
+    # OS-42.  A repair re-uses the EXISTING PREPARE_INTENT node: no node is added, so the
+    # reachability and dead-end proofs below hold unchanged.
+    "PREPARE_REPAIR": "PREPARE_INTENT",
 }
 CYCLE_GUARDS = frozenset({"phase_budget", "final_budget", "phase_index_monotonic"})
 # The workflow decisions this graph owns outright.  The Skill document must declare exactly
 # this set and demote its own prose about them; ``validate_workflow_graph_docs`` enforces it,
 # so a decision added here fails validation until the document delegates it too.
 GRAPH_OWNED_DECISIONS = ("PHASE_TRANSITION", "PHASE_GATE", "CORRECTION_LOOP",
-                         "ITERATION_BUDGET", "FINAL_REVIEW_ROUTING", "PAUSE_RESUME")
+                         "ITERATION_BUDGET", "FINAL_REVIEW_ROUTING", "PAUSE_RESUME",
+                         "VALIDATION_REPAIR")
 
 
 class GraphSpecError(ValueError): pass

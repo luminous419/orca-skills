@@ -225,11 +225,13 @@ class WorkflowGraphTests(unittest.TestCase):
         adapter.start(intent); event=adapter.settlement(intent["intent_id"])
         state.update(pending_intent=intent,pending_event=event,intent_status="SETTLED")
         state["processed_event_ids"].append(event["event_id"])
-        replayed=validate_settlement_node(state)
+        # OS-42: the node is now a factory closing over the gate policy. Called with no
+        # arguments it behaves exactly as before, which is what this test asserts.
+        replayed=validate_settlement_node()(state)
         self.assertIsNone(replayed["pending_event"]); self.assertEqual(replayed["intent_status"],"NONE")
         malformed=deepcopy(state); malformed["processed_event_ids"]=[]
         malformed["pending_event"]["command_id"]="wrong"
-        with self.assertRaisesRegex(StateError,"settlement binding"): validate_settlement_node(malformed)
+        with self.assertRaisesRegex(StateError,"settlement binding"): validate_settlement_node()(malformed)
         terminal=initial_state(run_id="run_terminal",thread_id="t",phases=("ANALYSIS",),capabilities=self.capabilities)
         # OS-31: run_lifecycle and terminal_status are cross-checked, so a terminal state
         # names both. The assertion below is unchanged -- POST_TERMINAL_EVENT still wins.
