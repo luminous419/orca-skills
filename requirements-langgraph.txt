@@ -1,4 +1,10 @@
-# OS-40 verified runtime set (Python 3.11). Optional for legacy Skill validation.
+# OS-40 verified runtime set. Optional for legacy Skill validation; REQUIRED by the
+# `langgraph-present` CI lane, which refuses to run if this install did not take effect.
+#
+# Verified against every Python version the CI matrix declares: this pinned set
+# resolves, installs and imports on 3.11, 3.12 and 3.13 (OS-42 CI fix). 3.11 remains
+# the version OS-40 ran its full runtime verification on. No version is declared in the
+# matrix that the pinned set cannot take.
 langgraph==0.2.76
 langgraph-checkpoint==2.1.1
 langgraph-sdk==0.1.74

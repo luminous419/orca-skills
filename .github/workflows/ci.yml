@@ -9,13 +9,32 @@ on:
 permissions:
   contents: read
 
+# Two lanes, and each one asserts the condition it is named for.
+#
+# Before OS-42's CI fix there was one job with NO `pip install` step at all, so every
+# matrix entry ran with LangGraph absent: 259 graph, repair, crash/restart and replay
+# tests skipped, and the suite still reported OK. The PR's "2614 passed / 6 skipped" had
+# been measured on a developer machine where LangGraph was installed, so nothing in the
+# pipeline could see the difference.
+#
+# `scripts/ci_lane.py` is what stops that recurring. `assert` refuses to run a lane whose
+# environment does not match its name -- a silently failed install fails the job instead
+# of quietly reverting it to the other lane -- and `run` executes the SAME discovery the
+# repository's `unittest` invocation does, then holds every skip against a closed set of
+# allowed reasons. Neither lane can be green by accident.
 jobs:
-  validate:
+  langgraph-present:
+    name: "tests (langgraph installed, py${{ matrix.python-version }})"
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
+        # All three versions are declared honestly: the pinned set in
+        # requirements-langgraph.txt resolves, installs and imports on each of them.
+        # requirements-langgraph.txt records which of these was runtime-verified.
         python-version: ["3.11", "3.12", "3.13"]
+    env:
+      ORCA_CI_LANGGRAPH_LANE: present
 
     steps:
       - name: Check out repository
@@ -30,11 +49,81 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      - name: Install the pinned LangGraph runtime
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -r requirements-langgraph.txt
+
+      - name: Assert the lane really has the pinned runtime
+        run: python3 -m scripts.ci_lane assert --lane present
+
       - name: Validate Skill packages
         run: python3 scripts/validate_skills.py
 
-      - name: Run deterministic tests
-        run: python3 -m unittest discover -s scripts -p 'test_*.py'
+      - name: Validate workflow graph documentation
+        run: python3 scripts/validate_workflow_graph_docs.py
+
+      # The summary line this prints reports TWO identity checks, not counts. In this
+      # lane every test in scripts/langgraph_skip_manifest.txt must have EXECUTED, and the
+      # non-LangGraph skips must match scripts/tolerated_skip_manifest.txt exactly.
+      - name: Run deterministic tests and assert the expected LangGraph set executed
+        run: python3 -m scripts.ci_lane run --lane present
+
+      - name: Verify release package inputs
+        run: python3 scripts/verify_package.py
+
+      - name: Build and verify release archive
+        run: |
+          python3 scripts/build_release.py
+          python3 scripts/verify_package.py --archive "dist/orca-skills-$(tr -d '\n' < VERSION).tar.gz"
+
+      - name: Check whitespace
+        run: git diff --check
+
+  langgraph-absent:
+    name: "tests (langgraph absent, py${{ matrix.python-version }})"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    env:
+      ORCA_CI_LANGGRAPH_LANE: absent
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          # Full history is required by the retained-report whitespace tests.
+          # A shallow checkout makes their pinned base commits unreachable.
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # Deliberately NO install step: this lane exists to exercise the degraded,
+      # fail-closed behaviour of a checkout without the optional runtime. It PASSES
+      # INTENTIONALLY -- `ci_lane assert --lane absent` checks the named refusals hold and
+      # that the LangGraph-free modules still work, and `run` requires every skip to be
+      # an accounted-for one.
+      - name: Assert the lane is genuinely without the runtime, and degrades as documented
+        run: python3 -m scripts.ci_lane assert --lane absent
+
+      - name: Validate Skill packages
+        run: python3 scripts/validate_skills.py
+
+      - name: Validate workflow graph documentation
+        run: python3 scripts/validate_workflow_graph_docs.py
+
+      # In this lane the skipped set must EQUAL scripts/langgraph_skip_manifest.txt --
+      # no missing entry and no extra one -- and every other skip must match
+      # scripts/tolerated_skip_manifest.txt by test id AND exact reason. A bare
+      # "something was skipped" check is what let 259 incidental skips pass for success
+      # before OS-42's CI fix.
+      - name: Run deterministic tests and assert the expected LangGraph set skipped exactly
+        run: python3 -m scripts.ci_lane run --lane absent
 
       - name: Verify release package inputs
         run: python3 scripts/verify_package.py

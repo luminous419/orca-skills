@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -30,11 +31,30 @@ import textwrap
 import unittest
 from pathlib import Path
 
-from scripts import release_manifest
+from scripts import ci_lane, release_manifest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SKILL = REPO_ROOT / release_manifest.ORCHESTRATION_SKILL_NAME
 INSTALLED_TOOLS = SKILL / "tools"
+
+# The agent commands this module routes to. They are NOT host tools: `drive()` writes an
+# executable shim for each one into the temporary project and puts that directory first on
+# the child's PATH. Naming a host agent here -- `claude` -- is what made every test below
+# fail on a GitHub runner with `AGENT_COMMAND_NOT_FOUND` before reaching F-001/F-002, and
+# made a green local run mean only "this developer has a Claude CLI installed".
+#
+# The names still have to clear the real agent-command trust boundary, so they are not
+# arbitrary: they match the pinned `custom_agent_command_pattern` from SKILL.md
+# (`(?:claude|codex)-[A-Za-z0-9._-]+`). So the routing below is validated by the SAME
+# token, allowlist and PATH gates a production profile is, rather than by a relaxed one.
+WORKER_COMMAND = "claude-os42-e2e-worker"
+REVIEWER_COMMAND = "claude-os42-e2e-reviewer"
+SHIM_COMMANDS = (WORKER_COMMAND, REVIEWER_COMMAND)
+
+# Host agent CLIs that must never appear in the routing above. `known_agent_commands` in
+# SKILL.md names the real ones; a test that routes to any of them is asserting a fact
+# about the developer's machine instead of about the installed Skill.
+HOST_AGENT_COMMANDS = frozenset({"claude", "codex", "claude-glm", "claude-gemma"})
 
 # The profile that routes every role of the requested phase to a real agent command.
 # `--adapter orca` refuses to run without one, because the harness's no-routing fallback
@@ -44,10 +64,10 @@ AGENT_PROFILE = (
     "profiles:\n"
     "  installed:\n"
     "    defaults:\n"
-    "      worker: claude\n"
-    "      reviewer: claude\n"
+    f"      worker: {WORKER_COMMAND}\n"
+    f"      reviewer: {REVIEWER_COMMAND}\n"
     "    final_review:\n"
-    "      reviewer: claude\n"
+    f"      reviewer: {REVIEWER_COMMAND}\n"
 )
 
 # The verbatim value that ended run_8e8f9451ad44: a natural-language sentence where a
@@ -271,10 +291,85 @@ FINAL_PASS = _body("Review Result", "RESULT: PASS",
                    _reviewer_record(phase="final_review", iteration=1))
 
 
+# Reports, from inside the child, where its agent commands actually resolve.
+PROBE_AGENT_RESOLUTION = """
+import shutil
+# `shutil.which` returns the PATH entry verbatim; the sandbox root is compared after
+# symlink resolution (/var -> /private/var on macOS), so both sides are realpaths.
+def _real(found):
+    return os.path.realpath(found) if found else found
+
+
+commands = {commands}
+host = {host}
+print("RESULT_JSON " + json.dumps({{
+    "path": os.environ["PATH"],
+    "resolved": {{name: _real(shutil.which(name)) for name in commands}},
+    "host_resolved": {{name: _real(shutil.which(name)) for name in host}},
+    "project": os.path.realpath(os.getcwd()),
+}}))
+"""
+
+
+# Every driver below that calls `launcher.execute_state` builds and runs the REAL compiled
+# graph inside the child, so it needs the pinned LangGraph runtime exactly as the engine
+# tests do. Declared through `ci_lane` rather than a private copy so the CI lanes and this
+# module can never disagree about what "installed" means -- and so the dependency-absent
+# lane records these as accounted-for langgraph skips instead of ModuleNotFoundError.
+#
+# The tests that assert PACKAGING and ROUTING -- the closure, the CLI refusals, and the
+# host-independence checks below -- are deliberately NOT gated: they must hold in both lanes.
+REQUIRES_LANGGRAPH = unittest.skipUnless(
+    ci_lane.langgraph_available(),
+    f"requires pinned langgraph {ci_lane.pinned_langgraph_version()}")
+
+
+def agent_bin(project: Path) -> Path:
+    """The one directory the run's agent commands may be resolved from."""
+    return project / "agent-bin"
+
+
+def write_agent_shims(project: Path) -> Path:
+    """Create an executable shim per routed agent command inside the sandbox.
+
+    The launcher's availability gate is ``shutil.which(command)``, so what the gate needs
+    is a real executable on the child's PATH -- not a Claude CLI. These shims are that,
+    and nothing more: the harness's only process boundary is stubbed at ``_exec_orca``, so
+    no shim is ever executed. Making them runnable anyway keeps the fixture honest -- the
+    gate passes because a command genuinely exists, not because a check was relaxed.
+    """
+    directory = agent_bin(project)
+    directory.mkdir(parents=True, exist_ok=True)
+    for command in SHIM_COMMANDS:
+        shim = directory / command
+        shim.write_text(
+            "#!/bin/sh\n"
+            f"echo '{command}: OS-42 installed-E2E shim; the harness never runs it' >&2\n"
+            "exit 0\n",
+            encoding="utf-8")
+        shim.chmod(0o755)
+    return directory
+
+
 class InstalledProductionPathTestCase(unittest.TestCase):
     """Runs a driver script against the installed copy, in its own interpreter."""
 
     maxDiff = None
+
+    @staticmethod
+    def sandbox_path(shim_directory: Path) -> str:
+        """The child's PATH: the sandbox shims, then the system directories only.
+
+        The developer's PATH is deliberately NOT inherited. Inheriting it is what let a
+        host ``claude`` satisfy this fixture on a laptop while the same tests failed on
+        every CI runner, so the sandbox has to be the whole answer and the parent
+        environment must not be able to complete it.
+
+        ``/usr/bin`` and ``/bin`` are kept because the child still needs a POSIX shell for
+        the shims' shebang; neither the driver interpreter (``sys.executable``) nor the
+        fake Orca CLI (``ORCA_CLI_COMMAND``) is resolved through PATH at all.
+        """
+        return os.pathsep.join([str(shim_directory), "/usr/bin", "/bin"])
 
     def drive(self, driver_body: str, *, expect_success: bool = True) -> dict:
         with tempfile.TemporaryDirectory() as directory:
@@ -282,6 +377,7 @@ class InstalledProductionPathTestCase(unittest.TestCase):
             (project / ".orca").mkdir(parents=True)
             (project / ".orca" / "agent-profiles.yaml").write_text(
                 AGENT_PROFILE, encoding="utf-8")
+            write_agent_shims(project)
             # The two verbs `preflight` issues through a RAW subprocess rather than
             # through `_exec_orca` need a real executable, so this is the only Orca
             # command file the driver needs. Its guide text is DERIVED from the pinned
@@ -296,7 +392,10 @@ class InstalledProductionPathTestCase(unittest.TestCase):
             }
             fake_orca = project / "fake-orca"
             fake_orca.write_text(
-                "#!/usr/bin/env python3\n"
+                # An ABSOLUTE interpreter, not `/usr/bin/env python3`: the child's PATH
+                # below is deliberately minimal, and a shebang that has to search it
+                # would reintroduce exactly the host dependency this sandbox removes.
+                f"#!{sys.executable}\n"
                 "import json, sys\n"
                 f"GUIDES = {guides!r}\n"
                 "args = sys.argv[1:]\n"
@@ -309,7 +408,7 @@ class InstalledProductionPathTestCase(unittest.TestCase):
             driver = project / "driver.py"
             driver.write_text(driver_body, encoding="utf-8")
             environment = {
-                "PATH": os.environ.get("PATH", ""),
+                "PATH": self.sandbox_path(agent_bin(project)),
                 "HOME": str(project),          # never the developer's real profile file
                 "INSTALLED_TOOLS": str(INSTALLED_TOOLS),
                 "ARTIFACT_BASE": str(project),
@@ -331,6 +430,106 @@ class InstalledProductionPathTestCase(unittest.TestCase):
                       f"{completed.stderr}")
         return {"returncode": completed.returncode, "stderr": completed.stderr,
                 "stdout": completed.stdout}
+
+
+class HostAgentIndependenceTests(InstalledProductionPathTestCase):
+    """The installed E2E must prove things about the SKILL, never about the host.
+
+    Every test in this module used to route `analysis.worker` at `claude` and hand the
+    child the developer's own PATH. On a machine with a Claude CLI that passed; on all
+    three CI runners it raised
+
+        ORCA_ADAPTER_REQUIRES_AGENT_PROFILE: AGENT_COMMAND_NOT_FOUND:
+        analysis.worker: 'claude' was not found on PATH
+
+    before a single F-001/F-002 assertion ran. These tests fail if that dependency ever
+    comes back -- by naming a host agent in the routing, or by letting the parent
+    environment supply a command the sandbox did not create.
+    """
+
+    def test_the_routing_names_no_host_agent_cli(self) -> None:
+        """Read off the profile the fixture actually writes, not off a comment."""
+        routed = {line.split(":", 1)[1].strip()
+                  for line in AGENT_PROFILE.splitlines()
+                  if line.strip().startswith(("worker:", "reviewer:"))}
+        self.assertEqual(routed, set(SHIM_COMMANDS))
+        self.assertEqual(routed & HOST_AGENT_COMMANDS, set(),
+                         "the installed E2E routes at a host agent CLI again")
+
+    def test_every_routed_command_clears_the_real_agent_trust_boundary(self) -> None:
+        """The sandbox names must not be a hole in the gate they pass through.
+
+        Derived from the pinned policy contract rather than transcribed, so renaming a
+        shim to something a production profile could not use fails here.
+        """
+        from scripts import skill_policy
+
+        contract = skill_policy.load_policy_contract(SKILL / "SKILL.md")
+        known = set(contract["known_agent_commands"])
+        # Keep the "never route at these" list tied to the policy rather than to a copy
+        # that can rot: if a new host agent CLI is added to the contract, it lands in
+        # HOST_AGENT_COMMANDS too, and the routing test above starts checking it.
+        self.assertEqual(
+            known, set(HOST_AGENT_COMMANDS),
+            "HOST_AGENT_COMMANDS has drifted from the policy's known_agent_commands")
+        custom = re.compile(str(contract["custom_agent_command_pattern"]), re.ASCII)
+        for command in SHIM_COMMANDS:
+            with self.subTest(command=command):
+                self.assertTrue(
+                    skill_policy.AGENT_COMMAND_PATTERN.fullmatch(command),
+                    f"{command!r} is not a simple PATH command token")
+                self.assertTrue(
+                    command in known or custom.fullmatch(command),
+                    f"{command!r} is outside the agent trust boundary")
+
+    def test_the_child_resolves_every_agent_command_inside_its_own_sandbox(self) -> None:
+        """The decisive one: ask the CHILD where its agent commands came from.
+
+        `shutil.which` is the exact call the launcher's availability gate makes, so this
+        reports the resolution the run itself will get. Every routed command must resolve
+        under the temporary project, and no host agent CLI may be reachable at all --
+        which is what makes the pass below independent of the machine it runs on.
+        """
+        driver = _PRELUDE + textwrap.dedent(PROBE_AGENT_RESOLUTION).format(
+            commands=repr(list(SHIM_COMMANDS)),
+            host=repr(sorted(HOST_AGENT_COMMANDS)))
+        result = self.drive(driver)
+        for command, resolved in result["resolved"].items():
+            with self.subTest(command=command):
+                self.assertIsNotNone(
+                    resolved,
+                    f"{command} is not on the sandbox PATH; the availability gate "
+                    "would refuse the run")
+                self.assertTrue(
+                    resolved.startswith(result["project"]),
+                    f"{command} resolved to {resolved}, outside the test sandbox")
+        self.assertEqual(
+            {name: found for name, found in result["host_resolved"].items() if found},
+            {},
+            "a host agent CLI is reachable from the sandbox; a green run here would "
+            "again be a fact about this machine")
+        self.assertNotEqual(
+            result["path"], os.environ.get("PATH", ""),
+            "the child inherited the developer's PATH")
+
+    @REQUIRES_LANGGRAPH
+    def test_the_production_path_still_runs_with_no_host_agent_available(self) -> None:
+        """The half that stops this becoming a hollow fix.
+
+        MAJOR 1 could be 'fixed' by no longer reaching the adapter at all. This drives the
+        SAME malformed -> repair -> success scenario F-002 asks for and asserts it
+        completed through the real `OrcaAdapter`, while the sandbox above guarantees no
+        host agent was available to it.
+        """
+        driver = (_PRELUDE + _RECORDER
+                  + "RECORDER = Recorder("
+                  + repr([WORKER_MALFORMED, WORKER_CLEAN, REVIEWER_PASS, FINAL_PASS])
+                  + ")\n" + _RUN)
+        result = self.drive(driver)
+        self.assertEqual(result["adapter"], "OrcaAdapter")
+        self.assertEqual(result["terminal_status"], "COMPLETED", result)
+        self.assertEqual(result["tokens"].count("PREPARE_REPAIR"), 1,
+                         "the bounded repair branch was not reached without a host agent")
 
 
 class InstalledClosureTests(InstalledProductionPathTestCase):
@@ -433,6 +632,7 @@ class InstalledCommandLineTests(InstalledProductionPathTestCase):
         self.assertNotIn("artifacts", result["effects"])
 
 
+@REQUIRES_LANGGRAPH
 class InstalledRepairLoopTests(InstalledProductionPathTestCase):
     """The behavioural half: malformed -> bounded repair -> success, and exhaustion."""
 
@@ -493,6 +693,7 @@ class InstalledRepairLoopTests(InstalledProductionPathTestCase):
         self.assertNotIn("PREPARE_PHASE_REVIEWER", result["tokens"])
 
 
+@REQUIRES_LANGGRAPH
 class InstalledIdentityIngressTests(InstalledProductionPathTestCase):
     """Round-2 F-001, on the installed Orca path rather than on a validator in isolation.
 
@@ -575,6 +776,7 @@ class InstalledIdentityIngressTests(InstalledProductionPathTestCase):
             self.assertIn(row["boundary"], ("B2", "B3"))
 
 
+@REQUIRES_LANGGRAPH
 class InstalledOmittedIdentityTests(InstalledProductionPathTestCase):
     """Round-3 F-001 on the installed Orca path: OMISSION is a repairable FORM defect.
 

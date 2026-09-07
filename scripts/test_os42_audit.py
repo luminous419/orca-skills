@@ -237,7 +237,10 @@ class NeverMutatesLifecycleTests(AuditTestCase):
         """Constraint (ii)'s "no MISSING row" half: a failed write is retriable, never
         silently dropped.  This is the defect D2 named -- the swallowed write plus an
         advancing checkpoint -- and the outbox is what closes it."""
-        from scripts.deterministic_workflow.graph import _audited
+        # `audit_wrapper`, not `graph`: the wrapper is LangGraph-free, so this test runs
+        # in BOTH CI lanes. Importing it from `graph` pulled in `langgraph.graph` and made
+        # this an unconditional ModuleNotFoundError on every dependency-absent job.
+        from scripts.deterministic_workflow.audit_wrapper import _audited
         broken = RecordingSink(fail=True)
         node = _audited(self.node, broken, audit_gate_transition)
         _, before, _, _ = self.settle(self.state, gate=self.malformed())
@@ -285,7 +288,7 @@ class DurableCrashBoundaryTests(AuditTestCase):
         one durable row for this transition" rather than "one row in the file I happen to
         write today". That is what lets it fail against a design that appends the row
         somewhere else, which is precisely how the previous implementation duplicated.
-        
+
         Every real row carries ``audit_key=<key>`` as the first element of its ``detail``
         cell (``audit.defect_detail``), so the count is well defined.  If a change ever
         dropped that, this returns 0 and the callers below fail on ``0 != 1`` -- loudly,
