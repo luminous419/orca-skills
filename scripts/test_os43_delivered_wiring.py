@@ -1217,6 +1217,12 @@ class ClaimRendezvousStore(recovery_store.FileRecoveryStateStore):
     attempt once its rival's lease has lapsed -- deliberately does not wait: there is no
     second party left to meet, and waiting for one would deadlock the very path under
     test.
+
+    It supplies NO identity of its own.  Constructed without ``owner_id`` it is a
+    production-default store, exactly the one ``recovery_store.store_for`` builds, and its
+    ``claimant_id`` is minted by the delivered code path -- which is what lets the
+    in-process subclass below race two of them without manufacturing the distinctness the
+    exclusion is supposed to provide.
     """
 
     def __init__(self, *args: Any, barrier: threading.Barrier,
@@ -1229,7 +1235,10 @@ class ClaimRendezvousStore(recovery_store.FileRecoveryStateStore):
     def claim(self, run_id: str, **kwargs: Any):
         if not self._met:
             self._met = True
-            self._arrivals.append(self.owner_id)
+            # The CLAIMANT, not the process: two attempts in one process share an
+            # ``owner_id``, so recording that would report one arrival twice and the
+            # concurrency assertion would stop meaning anything in the in-process case.
+            self._arrivals.append(self.claimant_id)
             self._barrier.wait()
         return super().claim(run_id, **kwargs)
 
@@ -1296,7 +1305,30 @@ class ConcurrentClaimRaceTests(DeliveredWiringFixture):
     #: milliseconds.  It exists so a BROKEN exclusion mechanism fails the test instead of
     #: hanging the suite.
     RENDEZVOUS_TIMEOUT = 20.0
-    OWNERS = ("host:pid8001", "host:pid8002")
+    #: The claimant identity each party is HANDED, or ``None`` for the composition case.
+    #:
+    #: A tuple states two SEPARATE-PROCESS identities -- the deployed topology, and one
+    #: two threads cannot be on their own.  That case is real and stays covered.
+    #:
+    #: ``None`` hands neither party anything: both stores are built the production-default
+    #: way, so both carry the SAME ``owner_id`` and whatever separates them is the
+    #: product's.  See :class:`SameProcessWatchdogRaceTests`.
+    OWNERS: tuple[str, str] | None = ("host:pid8001", "host:pid8002")
+    #: Test-local NAMES for the two parties, used to say which one reached the graph.
+    #: Never an identity: nothing under test ever sees them.
+    LABELS = ("claimant-0", "claimant-1")
+
+    def contender(self, index: int, *, path, barrier: threading.Barrier,
+                  arrivals: list[str]) -> Any:
+        """The store one contending attempt claims through.
+
+        ``OWNERS is None`` supplies nothing at all, so the identity is minted by
+        ``recovery_store.new_claimant_id`` through the ordinary constructor -- the same
+        one ``recovery_store.store_for`` and ``launcher._execution_authority`` use.
+        """
+        owner = None if self.OWNERS is None else self.OWNERS[index]
+        return ClaimRendezvousStore(path, owner_id=owner, barrier=barrier,
+                                    arrivals=arrivals)
 
     def engine_request(self, index: int, *, released_by: threading.Event,
                        invocations: list[str], **overrides: Any):
@@ -1312,7 +1344,7 @@ class ConcurrentClaimRaceTests(DeliveredWiringFixture):
                                             runtime_state=ledger, run_id=self.RUN,
                                             settlement_journal=journal),
                                 checkpointer=saver, runtime_state=ledger, journal=journal)
-            return HoldingGraph(inner, owner=self.OWNERS[index],
+            return HoldingGraph(inner, owner=self.LABELS[index],
                                 released_by=released_by,
                                 timeout=self.RENDEZVOUS_TIMEOUT, log=invocations)
 
@@ -1331,17 +1363,18 @@ class ConcurrentClaimRaceTests(DeliveredWiringFixture):
         outcomes: list[Any] = [None, None]
         errors: list[str] = []
 
+        stores = [self.contender(index, path=path, barrier=barrier, arrivals=arrivals)
+                  for index in (0, 1)]
+
         def contend(index: int) -> None:
             try:
-                store = ClaimRendezvousStore(path, owner_id=self.OWNERS[index],
-                                             barrier=barrier, arrivals=arrivals)
                 outcomes[index] = recovery_runtime.recover_stalled_run(
                     self.engine_request(index, released_by=settled[1 - index],
                                         invocations=invocations,
                                         observe_timeout_seconds=0.001),
-                    store=store)
+                    store=stores[index])
             except BaseException as exc:                  # reported, never swallowed
-                errors.append(f"{self.OWNERS[index]}: {type(exc).__name__}: {exc}")
+                errors.append(f"{self.LABELS[index]}: {type(exc).__name__}: {exc}")
             finally:
                 settled[index].set()
 
@@ -1362,9 +1395,13 @@ class ConcurrentClaimRaceTests(DeliveredWiringFixture):
         return SimpleNamespace(
             before=before, outcomes=tuple(outcomes), recovered=tuple(recovered),
             refused=tuple(refused), arrivals=tuple(arrivals),
-            invocations=tuple(invocations), barrier=barrier,
-            owners={id(item): self.OWNERS[index]
-                    for index, item in enumerate(outcomes)})
+            invocations=tuple(invocations), barrier=barrier, stores=tuple(stores),
+            labels={id(item): self.LABELS[index]
+                    for index, item in enumerate(outcomes)},
+            claimants={id(item): stores[index].claimant_id
+                       for index, item in enumerate(outcomes)},
+            owner_ids={id(item): stores[index].owner_id
+                       for index, item in enumerate(outcomes)})
 
     def one_winner(self, race: SimpleNamespace) -> Any:
         self.assertEqual(
@@ -1405,7 +1442,7 @@ class ConcurrentClaimRaceTests(DeliveredWiringFixture):
     def test_the_race_performs_exactly_ONE_effect_and_ONE_head_transition(self):
         race = self.race()
         winner = self.one_winner(race)
-        self.assertEqual(list(race.invocations), [race.owners[id(winner)]],
+        self.assertEqual(list(race.invocations), [race.labels[id(winner)]],
                          "exactly one claimant may reach the graph at all; two "
                          f"invocations is two resumes of one run ({race.invocations})")
         self.assertEqual(winner.head_before, race.before)
@@ -1421,8 +1458,10 @@ class ConcurrentClaimRaceTests(DeliveredWiringFixture):
         winner = self.one_winner(race)
         record = recovery_store.store_for(self.RUN,
                                           artifact_base=self.base).read(self.RUN)
-        self.assertEqual(record["owner_id"], race.owners[id(winner)],
+        self.assertEqual(record["claimant_id"], race.claimants[id(winner)],
                          "the durable lease names a claimant that did not win")
+        self.assertEqual(record["owner_id"], race.owner_ids[id(winner)],
+                         "the durable lease names a host that did not win")
         self.assertEqual(list(record["attempts"]), [winner.recovery_id],
                          "one race, one attempt lineage")
         entry = record["attempts"][winner.recovery_id]
@@ -1430,6 +1469,45 @@ class ConcurrentClaimRaceTests(DeliveredWiringFixture):
         self.assertEqual(entry["outcome"], recovery_runtime.RECOVERED)
         self.assertEqual(entry["head_before"], race.before)
         self.assertEqual(entry["head_after"], winner.head_after)
+
+    # -- 5. the settled winner survives a RETRY and a REPLAY ---------------------------
+    def test_a_RETRY_and_a_REPLAY_leave_the_WINNER_and_the_OUTCOME_unchanged(self):
+        """R6: whoever won stays won, and re-driving the loser's work adds nothing.
+
+        The race decides one winner; this asks whether that decision is DURABLE.  Two
+        further ``recover_stalled_run`` invocations run over the settled run -- the retry
+        the loser is entitled to make and a replay of the same request afterwards -- and
+        neither may reach the graph, move the head, create an effect, add an attempt
+        lineage, or rewrite the durable record's claimant.
+        """
+        race = self.race()
+        winner = self.one_winner(race)
+        store = recovery_store.store_for(self.RUN, artifact_base=self.base)
+        record_before = store.read(self.RUN)
+        head_before = self.head(self.RUN)
+        replayed: list[str] = []
+        released = threading.Event()
+        released.set()                       # nothing to hold open: nothing may run
+        for attempt in ("retry", "replay"):
+            outcome = recovery_runtime.recover_stalled_run(
+                self.engine_request(0, released_by=released, invocations=replayed,
+                                    observe_timeout_seconds=0.001))
+            self.assertNotEqual(
+                outcome.status, recovery_runtime.RECOVERED,
+                f"the {attempt} recovered a run the race had already settled: "
+                f"{outcome.status}/{outcome.code} {outcome.detail}")
+            self.assertFalse(outcome.effect_performed,
+                             f"the {attempt} performed an external effect")
+        self.assertEqual(replayed, [],
+                         "a retry or a replay entered graph.invoke; that is a second "
+                         f"transition over one settled run -- {replayed}")
+        self.assertEqual(self.head(self.RUN), head_before,
+                         "a retry or a replay moved the head a second time")
+        self.assertEqual(store.read(self.RUN), record_before,
+                         "a retry or a replay rewrote the durable authority record -- "
+                         "the winner, its claimant, or its attempt lineage changed")
+        self.assertEqual(record_before["claimant_id"], race.claimants[id(winner)],
+                         "the record must still name the attempt that won the race")
 
     # -- the race really WAS concurrent, and this test says so --------------------------
     def test_both_claimants_really_were_INSIDE_the_claim_at_the_same_instant(self):
@@ -1441,9 +1519,55 @@ class ConcurrentClaimRaceTests(DeliveredWiringFixture):
         entered: the contention is real, not a story about the order the threads ran in.
         """
         race = self.race()
-        self.assertEqual(sorted(race.arrivals), sorted(self.OWNERS))
+        self.assertEqual(sorted(race.arrivals),
+                         sorted(store.claimant_id for store in race.stores))
+        self.assertEqual(len(set(race.arrivals)), 2,
+                         "two ATTEMPTS arrived, or this is one attempt counted twice")
         self.assertFalse(race.barrier.broken,
                          "the barrier broke: a claimant never reached the claim")
+
+
+@REQUIRES_LANGGRAPH
+class SameProcessWatchdogRaceTests(ConcurrentClaimRaceTests):
+    """F-001.  The SAME race, between two Watchdogs in ONE process, identities UNSUPPLIED.
+
+    The suite above hands the two claimants ``host:pid8001`` and ``host:pid8002``.  That
+    states the deployed separate-process topology, and it stays covered -- but it also
+    MANUFACTURES the distinctness the exclusion depends on, so it proves the property it
+    assumed rather than the property the product has.  With the identities supplied, a
+    store that identified its claimant by process, or by process and role together, passed
+    it while admitting two concurrent same-role actors in one process: both claims were
+    granted, the second rotated the first's token, and the already-decided winner failed
+    its next fence.
+
+    Here ``OWNERS`` is ``None``.  Both stores are built the production-default way, so
+    both carry the SAME ``owner_id`` and BOTH claim with ``owner_kind="recovery"`` -- the
+    Watchdog-vs-Watchdog composition ``watchdog_supervisor`` makes reachable in one
+    process by construction (CON-5).  Every assertion inherited from the suite above then
+    applies to a race in which nothing about either claimant came from this file: exactly
+    one ``RECOVERED``, one refusal and it came from the atomic claim, one effect and one
+    head transition, one durable claimant with one attempt lineage, an unchanged winner
+    under retry and replay, and two genuinely simultaneous arrivals inside the claim.
+    """
+
+    RUN = "run_inprocessrace"
+    OWNERS = None
+
+    def test_the_two_contenders_really_are_INDISTINGUISHABLE_by_process(self):
+        """The premise, asserted rather than assumed.
+
+        If ``default_owner_id`` ever stopped returning one value per process, this suite
+        would quietly become a second copy of the separate-process one and would stop
+        covering the case it exists for.
+        """
+        path = recovery_store.recovery_record_path(self.RUN, artifact_base=self.base)
+        barrier = threading.Barrier(2, timeout=self.RENDEZVOUS_TIMEOUT)
+        first, second = (self.contender(index, path=path, barrier=barrier, arrivals=[])
+                         for index in (0, 1))
+        self.assertEqual(first.owner_id, second.owner_id,
+                         "the two contenders must share a process identity")
+        self.assertNotEqual(first.claimant_id, second.claimant_id,
+                            "two live execution attempts must be two claimants")
 
 
 @REQUIRES_LANGGRAPH

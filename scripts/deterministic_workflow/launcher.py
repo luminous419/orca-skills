@@ -26,6 +26,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from . import recovery_store
 from .contracts import BASE_CAPABILITIES
 from .executor import IdempotencyRecoveryError, terminal_node
 from .runtime_state import (RuntimeStateConflict, resolve_runtime_state,
@@ -121,6 +122,92 @@ def build_state(spec: dict[str, Any]) -> dict[str, Any]:
         raise LauncherError(f"invalid state specification: {exc}") from exc
 
 
+# ---- OS-43 CRITICAL: the Coordinator's half of the run-scoped execution authority -----
+def _execution_authority(checkpointer: Any) -> tuple[Any, str]:
+    """The authority guarding THIS run's checkpoint store, or ``(None, "")``.
+
+    Keyed on the checkpoint store rather than on the run id, because the thing being
+    serialised is "who may advance THIS checkpoint", and for the canonical run-rooted
+    layout ``recovery_store.authority_path_for_checkpoint`` resolves to exactly the
+    record ``recovery_runtime._recover_active`` claims -- one file, one lock, one owner.
+
+    ``None`` when the graph has no durable checkpoint store at all.  Such a run is not
+    addressable by any other process: it publishes no checkpoint for a Watchdog to
+    discover, so there is no second claimant for it to be serialised against.  Production
+    never takes this branch -- ``build_graph`` refuses a non-durable checkpointer unless
+    the caller explicitly asks for the named test-only escape hatch.
+    """
+    path = getattr(checkpointer, "path", None)
+    if path is None:
+        return None, ""
+    try:
+        return recovery_store.FileRecoveryStateStore(
+            recovery_store.authority_path_for_checkpoint(path)), ""
+    except recovery_store.RecoveryStoreLockUnavailable:  # pragma: no cover - non-POSIX
+        # No inter-process lock means no exclusive claim is possible.  Reported as an
+        # absent authority rather than as a claim that cannot be enforced.
+        return None, ""
+
+
+def _authority_keeper(authority: Any, run_id: str, lease_token: str) -> Any:
+    """Renew the authority for the whole run, so a healthy owner is never taken over.
+
+    The same ``LeaseKeeper`` the executor and ``coordinator_liveness`` already use,
+    unmodified: a lease that is never renewed is exclusive for one lease period, which is
+    far shorter than a workflow.
+    """
+    if authority is None:
+        return None
+    from .lease_keeper import LeaseKeeper, heartbeat_interval_for
+    return LeaseKeeper(
+        authority, run_id, lease_token,
+        interval_seconds=heartbeat_interval_for(authority.lease_seconds)).start()
+
+
+def _authority_now() -> str:
+    from .turn_boundary import authority_now
+    return authority_now()
+
+
+def _authority_blocked(raw_state: dict[str, Any], code: str, message: str) -> dict[str, Any]:
+    """Stop this Coordinator, closed, with a named reason and no external effect.
+
+    Exactly the shape ``RuntimeStateConflict`` already produces below: the run terminates
+    BLOCKED (exit code 1) rather than crashing, and -- because this happens before
+    ``graph.invoke`` -- it performs nothing at all.
+    """
+    blocked = dict(raw_state)
+    blocked["route_token"] = "BLOCK"
+    blocked["terminal_reason"] = {"code": code, "message": message}
+    return terminal_node(blocked)
+
+
+# ---- OS-43 F-001: FINISHED and INTERRUPTED are different durable facts ----------------
+# The authority made the two parties exclusive WHILE one of them runs, and nothing more:
+# a Coordinator that finished released an `ACTIVE` record, its lease then lapsed, and the
+# next `execute_state` over the same run found a takeable record, minted a fresh
+# claimant, rotated the token and drove the graph again.  R6 forbids exactly that -- a
+# retry, a process restart or a replayed message may not change the winner and may not
+# perform a second transition -- so terminal completion has to become DURABLE, not merely
+# unheld.
+#
+# The rule itself, the FINISHED / INTERRUPTED / PAUSED / UNREADABLE table and the reasons
+# behind each row live in ONE place -- `turn_boundary.settle_or_release`, beside the
+# `classify_checkpoint_state` the whole decision rests on -- because the Watchdog closes
+# its own hold through the SAME function.  Two parallel implementations of this are what
+# the last two review gates each failed on, in mirror image; there is now one.
+def _committed_terminal_state(checkpointer: Any, thread_id: str) -> dict[str, Any] | None:
+    from .turn_boundary import committed_terminal_state
+    return committed_terminal_state(checkpointer, thread_id)
+
+
+def _settle_or_release(authority: Any, run_id: str, lease_token: str, checkpointer: Any,
+                       thread_id: str) -> str:
+    from .turn_boundary import settle_or_release
+    return settle_or_release(authority, run_id, lease_token, checkpointer=checkpointer,
+                             thread_id=thread_id)
+
+
 def execute_state(raw_state: dict[str, Any], *, adapter: Any, checkpointer: Any = None,
                   runtime_state: Any = None, recursion_limit: int | None = None,
                   thread_id: str | None = None, interrupt_before: list[str] | None = None,
@@ -128,6 +215,7 @@ def execute_state(raw_state: dict[str, Any], *, adapter: Any, checkpointer: Any 
                   checkpoint_store_path: str | Path | None = None,
                   artifact_base: Path | None = None,
                   require_durable_checkpointer: bool = True,
+                  execution_authority: Any = None,
                   **graph_options: Any) -> dict[str, Any]:
     """Run the compiled graph to a terminal state, failing closed on malformed input.
 
@@ -139,6 +227,13 @@ def execute_state(raw_state: dict[str, Any], *, adapter: Any, checkpointer: Any 
     A durable ``RuntimeStatePort`` is required, here as everywhere: it is resolved (and
     refused if absent) before the state is even inspected.  ``run_cli`` supplies one by
     default, so the shipped command line is crash-safe without extra flags.
+
+    ``execution_authority`` is a PORT INSTANCE for test injection -- the run-scoped claim
+    authority, the same role ``recover_stalled_run``'s ``store`` plays
+    (``recovery_runtime.py:372-380``).  It is not a decision and cannot express one: the
+    only thing a caller can vary is WHICH record (and which process identity) the claim is
+    taken against, never whether one is taken.  Production leaves it ``None`` and the
+    authority is derived from the run's own durable checkpoint store.
     """
     from .graph import build_graph
 
@@ -156,24 +251,93 @@ def execute_state(raw_state: dict[str, Any], *, adapter: Any, checkpointer: Any 
         checkpointer = FileCheckpointSaver(resolve_checkpoint_path(
             raw_state["run_id"], thread_id or raw_state["thread_id"],
             explicit=checkpoint_store_path, artifact_base=artifact_base))
-    if "audit_sink" not in graph_options:
-        # OS-42.  The run's own append-only ORCHESTRATOR_LOG.md is where the
-        # validation-repair audit trail lands, and this is the entry point that knows
-        # where that run root is.  Passing `audit_sink=None` explicitly still disables it,
-        # which is what every in-process test does so a suite run writes no artifacts.
-        from .audit import RunLoggingAuditSink
-        graph_options["audit_sink"] = RunLoggingAuditSink(
-            raw_state["run_id"], artifact_base=artifact_base)
-    config: dict[str, Any] = {"recursion_limit": recursion_limit or default_recursion_limit(raw_state)}
-    # Unconditional: a thread id is what makes a run addressable by a successor process.
-    config["configurable"] = {"thread_id": thread_id or raw_state["thread_id"],
-                              "checkpoint_ns": ""}
-    graph = build_graph(adapter, checkpointer=checkpointer, runtime_state=runtime_state,
-                        interrupt_before=interrupt_before, interrupt_after=interrupt_after,
-                        require_durable_checkpointer=require_durable_checkpointer,
-                        **graph_options)
+    # ---- OS-43 CRITICAL: the run-scoped EXECUTION AUTHORITY -------------------------
+    # This is the Coordinator's ordinary path to ``graph.invoke``, and before this it took
+    # NO run-scoped authority: the recovery lease serialised Watchdog-vs-Watchdog and the
+    # Coordinator never participated, so a Coordinator that revived after a Watchdog had
+    # observed it stale could drive the same checkpoint concurrently.  Both now pass
+    # through ``recovery_store.claim``, and whichever gets there first owns the run.
+    #
+    # ``takeover=False``: this claimant has a run in hand and cannot observe.  A live
+    # holder is a final refusal, reported as BLOCKED with a stable code -- it neither
+    # waits nor proceeds.
+    authority, authority_token = ((execution_authority, "")
+                                  if execution_authority is not None
+                                  else _execution_authority(checkpointer))
+    if authority is not None:
+        try:
+            claimed = authority.claim(
+                raw_state["run_id"],
+                thread_id=thread_id or raw_state["thread_id"], checkpoint_ns="",
+                now_iso=_authority_now(),
+                owner_kind=recovery_store.OWNER_KIND_COORDINATOR, takeover=False)
+        except recovery_store.RecoveryAuthorityHeld as exc:
+            # ``takeover=False`` makes this the ONLY held-claim exception reachable here,
+            # which is exactly the point: a Coordinator has no observe branch to fall into.
+            return _authority_blocked(raw_state,
+                                      recovery_store.EXECUTION_AUTHORITY_HELD, str(exc))
+        except recovery_store.RecoveryRecordCorrupt as exc:
+            return _authority_blocked(raw_state, "RECOVERY_RECORD_CORRUPT", str(exc))
+        if claimed["claim_outcome"] == recovery_store.ALREADY_SETTLED:
+            # R6.  This run FINISHED and its authority records that, so a restart owes the
+            # caller the outcome the run already reached -- read back from the committed
+            # checkpoint -- and no second transition.  `claim` returns ALREADY_SETTLED
+            # WITHOUT touching the record, so the winner's `claimant_id` and `lease_token`
+            # are still the winner's after this returns.  Returning before `audit_sink` is
+            # resolved is deliberate: a restart publishes no audit record either.
+            settled = _committed_terminal_state(checkpointer,
+                                                thread_id or raw_state["thread_id"])
+            if settled is not None:
+                return settled
+            # SETTLED with no readable terminal head: something sealed a run whose outcome
+            # this process cannot read, so it refuses rather than inventing one.
+            return _authority_blocked(
+                raw_state, recovery_store.EXECUTION_AUTHORITY_HELD,
+                f"{raw_state['run_id']}: this run's execution authority is SETTLED")
+        authority_token = claimed["lease_token"]
+        # R4.  Carried into the graph so EXECUTE_INTENT / PAUSE / DISPOSE revalidate the
+        # token before every external effect, and checked once more immediately before the
+        # transition below.
+        graph_options.setdefault(
+            "execution_fence",
+            lambda: authority.fence(raw_state["run_id"], authority_token))
+    # EVERYTHING from here to the `finally` runs while this Coordinator HOLDS the run's
+    # execution authority, so everything from here is inside the `try`: building the graph
+    # or starting the lease keeper can raise, and a raise outside the held section would
+    # leave the record ACTIVE with nothing closing it -- the same class of leak as an
+    # unsettled completion, one step earlier.
+    keeper = None
     try:
+        if "audit_sink" not in graph_options:
+            # OS-42.  The run's own append-only ORCHESTRATOR_LOG.md is where the
+            # validation-repair audit trail lands, and this is the entry point that knows
+            # where that run root is.  Passing `audit_sink=None` explicitly still disables
+            # it, which is what every in-process test does so a suite run writes no
+            # artifacts.
+            from .audit import RunLoggingAuditSink
+            graph_options["audit_sink"] = RunLoggingAuditSink(
+                raw_state["run_id"], artifact_base=artifact_base)
+        config: dict[str, Any] = {
+            "recursion_limit": recursion_limit or default_recursion_limit(raw_state)}
+        # Unconditional: a thread id is what makes a run addressable by a successor.
+        config["configurable"] = {"thread_id": thread_id or raw_state["thread_id"],
+                                  "checkpoint_ns": ""}
+        graph = build_graph(adapter, checkpointer=checkpointer,
+                            runtime_state=runtime_state,
+                            interrupt_before=interrupt_before,
+                            interrupt_after=interrupt_after,
+                            require_durable_checkpointer=require_durable_checkpointer,
+                            **graph_options)
+        keeper = _authority_keeper(authority, raw_state["run_id"], authority_token)
+        if authority is not None:
+            # Immediately before the transition, atomically.  A token that no longer
+            # matches means a successor already owns this run.
+            authority.fence(raw_state["run_id"], authority_token)
         final = graph.invoke(raw_state, config)
+    except recovery_store.RecoveryClaimLost as exc:
+        # The fence refused -- at the transition or inside a node, before its effect.  The
+        # run stops with a named reason; it does not finish work a successor now owns.
+        return _authority_blocked(raw_state, "EXECUTION_AUTHORITY_LOST", str(exc))
     except RuntimeStateConflict as exc:
         # A corrupt, incompatible or contended durable ledger stops the run *before* any
         # further external effect, and is reported as BLOCKED rather than as a crash.  It is
@@ -191,6 +355,17 @@ def execute_state(raw_state: dict[str, Any], *, adapter: Any, checkpointer: Any 
         blocked["route_token"] = "BLOCK"
         blocked["terminal_reason"] = {"code": exc.code, "message": exc.detail}
         return terminal_node(blocked)
+    finally:
+        # The authority is closed on every exit path -- success, refusal and crash alike
+        # -- so a Coordinator that stops holds nothing.  WHICH way it is closed is decided
+        # by the run's own committed head and nothing else (`_settle_or_release`): a run
+        # that FINISHED is SETTLED, and one that stopped short of finishing is released,
+        # so it becomes legitimately recoverable again the instant this owner lets go.
+        if keeper is not None:
+            keeper.stop()
+        if authority is not None:
+            _settle_or_release(authority, raw_state["run_id"], authority_token,
+                               checkpointer, thread_id or raw_state["thread_id"])
     # OS-42.  A settled run executes no further node, so the outbox needs one retry point
     # after the graph has stopped -- this is it.  Outside the lifecycle path by
     # construction: it reads the final state, delivers, and writes nothing back, so it can

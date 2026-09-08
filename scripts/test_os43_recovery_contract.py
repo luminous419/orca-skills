@@ -277,8 +277,12 @@ class RecoveryStoreAttemptLedgerTests(unittest.TestCase):
                                   promoted_at="t", lease_token=token)
 
     def test_a_corrupt_record_is_never_read_as_no_prior_attempt(self):
-        self.path.write_text('{"schema_version": "os43.recovery_state.v1", '
-                             '"record": {"run_id": "run_x"}}', encoding="utf-8")
+        # The CURRENT schema version, read from the module: this test is about a malformed
+        # RECORD, and pinning the version literal would silently turn it into a second
+        # copy of the incompatible-version test below the next time the schema is bumped.
+        self.path.write_text(
+            '{"schema_version": "%s", "record": {"run_id": "run_x"}}'
+            % recovery_store.RECOVERY_RECORD_SCHEMA_VERSION, encoding="utf-8")
         with self.assertRaises(recovery_store.RecoveryRecordCorrupt):
             self.store().read(RUN)
 

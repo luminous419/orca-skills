@@ -77,7 +77,9 @@ RECOVERY_OUTCOME_CODES: dict[str, frozenset[str]] = {
     CONFLICT: frozenset({"PAUSE_CLAIM_HELD", "PAUSE_CLAIM_LOST",
                          "PAUSE_OBSERVATION_TIMEOUT", "RECOVERY_CLAIM_HELD",
                          "RECOVERY_CLAIM_LOST", "LEASE_LOST",
-                         "IDEMPOTENCY_LEASE_LOST", "IDEMPOTENCY_LEASE_HELD"}),
+                         "IDEMPOTENCY_LEASE_LOST", "IDEMPOTENCY_LEASE_HELD",
+                         recovery_store.EXECUTION_AUTHORITY_HELD,
+                         "EXECUTION_AUTHORITY_LOST"}),
     UNSUPPORTED: frozenset({"IDEMPOTENCY_RECOVERY_UNSUPPORTED",
                             "LANGGRAPH_DEPENDENCY_MISSING"}),
     REFUSED: frozenset({"PAUSE_RECORD_CORRUPT", "RECOVERY_RECORD_CORRUPT",
@@ -496,6 +498,7 @@ def _recover_active(request: RecoveryRequest, *, store: Any, saver: Any,
     """The stalled-ACTIVE branch: the run-scoped recovery lease is the claim authority."""
     from .checkpoint_store import CheckpointStoreError, FileCheckpointSaver
     from .lease_keeper import LeaseKeeper
+    from .turn_boundary import settle_or_release
 
     run_id, base = request.run_id, request.artifact_base
     try:
@@ -526,7 +529,18 @@ def _recover_active(request: RecoveryRequest, *, store: Any, saver: Any,
     try:
         claimed = dict(lease_store.claim(run_id, thread_id=head.thread_id,
                                          checkpoint_ns=head.checkpoint_ns,
-                                         now_iso=_now()))
+                                         now_iso=_now(),
+                                         owner_kind=recovery_store.OWNER_KIND_RECOVERY))
+    except recovery_store.RecoveryAuthorityHeld as exc:
+        # A LIVE Coordinator owns this run.  There is nothing to observe and nothing to
+        # take over: it is not a crashed peer, it is the owner, and the window this closes
+        # is exactly the one where it revived after the Watchdog looked.  This claimant
+        # therefore NEITHER waits NOR proceeds -- it fails closed here, having performed
+        # nothing, with the one stable code that names why.
+        return RecoveryOutcome(CONFLICT, recovery_store.EXECUTION_AUTHORITY_HELD,
+                               recovery_id=recovery_id,
+                               recovery_kind=RECOVERY_KIND_STALLED_ACTIVE,
+                               detail=str(exc))
     except recovery_store.RecoveryClaimHeld as exc:
         try:
             settled = lease_store.observe(
@@ -548,9 +562,15 @@ def _recover_active(request: RecoveryRequest, *, store: Any, saver: Any,
                                    detail=f"{run_id}: the winner settled this run")
         del exc
         try:                                     # the lease lapsed: ONE takeover attempt
-            claimed = dict(lease_store.claim(run_id, thread_id=head.thread_id,
-                                             checkpoint_ns=head.checkpoint_ns,
-                                             now_iso=_now()))
+            claimed = dict(lease_store.claim(
+                run_id, thread_id=head.thread_id, checkpoint_ns=head.checkpoint_ns,
+                now_iso=_now(), owner_kind=recovery_store.OWNER_KIND_RECOVERY))
+        except recovery_store.RecoveryAuthorityHeld as owned:
+            # A Coordinator took the run while this claimant was observing.  Same rule.
+            return RecoveryOutcome(CONFLICT, recovery_store.EXECUTION_AUTHORITY_HELD,
+                                   recovery_id=recovery_id,
+                                   recovery_kind=RECOVERY_KIND_STALLED_ACTIVE,
+                                   detail=str(owned))
         except recovery_store.RecoveryClaimHeld as again:
             return RecoveryOutcome(CONFLICT, "RECOVERY_CLAIM_HELD",
                                    recovery_id=recovery_id,
@@ -566,23 +586,36 @@ def _recover_active(request: RecoveryRequest, *, store: Any, saver: Any,
                                detail=f"{run_id}: this run's recovery is already settled")
 
     lease_token = claimed["lease_token"]
-    stored = (claimed.get("attempts") or {}).get(recovery_id)
-    if stored is not None and stored["stage"] == "PROMOTED":
-        # The identity is already promoted: the run has not moved since a completed
-        # attempt, so there is nothing to do and no second effect to perform.
-        lease_store.release(run_id, lease_token)
-        return RecoveryOutcome(NO_EFFECT, pause_policy.RECOVERY_ALREADY_APPLIED,
-                               recovery_id=recovery_id,
-                               recovery_kind=RECOVERY_KIND_STALLED_ACTIVE,
-                               head_before=stored["head_before"],
-                               head_after=stored["head_after"],
-                               detail=f"{run_id}: attempt {recovery_id} is promoted")
-
-    factory = keeper_factory or _default_keeper_factory()
-    revalidation = _stale_active_codes(head.state,
-                                       current_repository=request.current_repository,
-                                       current_artifact=request.current_artifact)
+    # ---- OS-43 F-001 (iteration 5): the HELD SECTION, and it starts HERE ---------------
+    # Past this line this Watchdog owns the run's execution authority, so past this line
+    # every path -- the already-promoted short-circuit, a keeper factory that raises, a
+    # refusal, a crash, and success -- leaves through ONE `finally`, and that `finally`
+    # closes the hold through the SAME `turn_boundary.settle_or_release` the Coordinator
+    # uses.  Before this, the successful path fell through an unconditional `release`, so
+    # a Watchdog that FINISHED a run left the record ACTIVE and a later Coordinator
+    # restart took the completed run as new work.
+    checkpoint = None
+    revalidation: tuple[str, ...] = ()
     try:
+        stored = (claimed.get("attempts") or {}).get(recovery_id)
+        if stored is not None and stored["stage"] == "PROMOTED":
+            # The identity is already promoted: the run has not moved since a completed
+            # attempt, so there is nothing to do and no second effect to perform.  This
+            # branch is only REACHABLE for a non-terminal head -- `resolve_head` above
+            # refuses `RECOVERY_NO_RUNNABLE_NODE` before any claim when the committed head
+            # owes no next node -- so the shared discipline necessarily RELEASES here, and
+            # says so for the same reason the Coordinator's does rather than by omission.
+            return RecoveryOutcome(NO_EFFECT, pause_policy.RECOVERY_ALREADY_APPLIED,
+                                   recovery_id=recovery_id,
+                                   recovery_kind=RECOVERY_KIND_STALLED_ACTIVE,
+                                   head_before=stored["head_before"],
+                                   head_after=stored["head_after"],
+                                   detail=f"{run_id}: attempt {recovery_id} is promoted")
+
+        factory = keeper_factory or _default_keeper_factory()
+        revalidation = _stale_active_codes(
+            head.state, current_repository=request.current_repository,
+            current_artifact=request.current_artifact)
         with factory(lease_store, run_id, lease_token) as keeper:
             checkpoint = saver or FileCheckpointSaver(checkpoint_path(run_id,
                                                                       artifact_base=base))
@@ -597,6 +630,17 @@ def _recover_active(request: RecoveryRequest, *, store: Any, saver: Any,
                 "outcome": "", "code": "", "actor_id": request.actor_id,
                 "opened_at": _now(), "promoted_at": None}, lease_token=lease_token)
             keeper.raise_if_lost()
+            # R4.  The token is validated again HERE, atomically, immediately before the
+            # transition -- and the same fence is carried on the checkpoint store the
+            # graph is built over, so every node that creates an external effect
+            # revalidates it too (``graph.build_graph``).  A caller-supplied
+            # ``graph_factory`` needs no new parameter to inherit it: it already receives
+            # this saver and hands it straight to ``build_graph``.
+            def _fence(_run: str = run_id, _token: str = lease_token) -> None:
+                lease_store.fence(_run, _token)
+
+            _fence()
+            checkpoint.execution_fence = _fence
             graph = request.graph_factory(checkpoint)
             if graph is None or not hasattr(graph, "invoke"):
                 # Second line of defence behind the port's own resolution.  The attempt
@@ -617,6 +661,7 @@ def _recover_active(request: RecoveryRequest, *, store: Any, saver: Any,
             # checkpoint already holds is not re-run.
             graph.invoke(None, config)
             keeper.raise_if_lost()
+            _fence()
             after = checkpoint.head(head.thread_id,
                                     checkpoint_ns=head.checkpoint_ns) or ""
             performed = after != before
@@ -635,18 +680,29 @@ def _recover_active(request: RecoveryRequest, *, store: Any, saver: Any,
         return RecoveryOutcome(REFUSED, "RECOVERY_RECORD_CORRUPT", recovery_id=recovery_id,
                                recovery_kind=RECOVERY_KIND_STALLED_ACTIVE, detail=str(exc))
     except pause_policy.PauseRefused as exc:
-        lease_store.release(run_id, lease_token)
         bucket = (NOT_RECOVERABLE if exc.code in RECOVERY_OUTCOME_CODES[NOT_RECOVERABLE]
                   else REFUSED)
         return RecoveryOutcome(bucket, exc.code, recovery_id=recovery_id,
                                recovery_kind=RECOVERY_KIND_STALLED_ACTIVE,
                                detail=exc.detail)
     except CheckpointStoreError as exc:
-        lease_store.release(run_id, lease_token)
         return RecoveryOutcome(REFUSED, "PAUSE_RECORD_CORRUPT", recovery_id=recovery_id,
                                recovery_kind=RECOVERY_KIND_STALLED_ACTIVE, detail=str(exc))
     finally:
-        lease_store.release(run_id, lease_token)
+        # The fence is scoped to the lease it validates, so it does not outlive it on an
+        # injected saver the caller may reuse.
+        if checkpoint is not None and hasattr(checkpoint, "execution_fence"):
+            del checkpoint.execution_fence
+        # The one way this role gives up the authority, and it is the SAME function the
+        # Coordinator gives it up through: a run whose own committed head says it FINISHED
+        # is SETTLED, and everything else -- interrupted, paused, unreadable, refused,
+        # crashed, or a checkpointer this attempt never even built (`checkpoint is None`)
+        # -- is RELEASED and stays recoverable.  The explicit `release` calls the two
+        # refusal branches above used to make are gone WITH their branches, not replaced
+        # beside them: two ways to end one hold is how the Coordinator half and the
+        # Watchdog half came to disagree in the first place.
+        settle_or_release(lease_store, run_id, lease_token, checkpointer=checkpoint,
+                          thread_id=head.thread_id, checkpoint_ns=head.checkpoint_ns)
     return RecoveryOutcome(RECOVERED, pause_policy.RECOVERY_ADVANCED,
                            recovery_id=recovery_id,
                            recovery_kind=RECOVERY_KIND_STALLED_ACTIVE,

@@ -350,13 +350,37 @@ def _is_durable_checkpointer(value: Any) -> bool:
     return isinstance(value, BaseCheckpointSaver) and not isinstance(value, InMemorySaver)
 
 
+def _fenced(node: Any, fence: Any) -> Any:
+    """Revalidate the run's execution-authority token before an external effect.
+
+    OS-43 R4.  The three nodes this wraps -- EXECUTE_INTENT, PAUSE and DISPOSE -- are the
+    only ones that reach an adapter, so "before every external side effect" is exactly
+    "on entry to each of these".  The check is a fenced compare inside the authority
+    record's own critical section (``recovery_store.fence``), not a second look at the
+    world: a superseded owner cannot pass it, because ``claim`` rotated the token.
+
+    ``fence is None`` leaves the node byte-identical, so a graph built without an
+    execution authority -- an in-process test graph, or any pre-OS-43 caller -- behaves
+    exactly as before.
+    """
+    if fence is None:
+        return node
+
+    def guarded(state: Any) -> Any:
+        fence()
+        return node(state)
+
+    return guarded
+
+
 def build_graph(adapter: Any, *, checkpointer: Any = None, runtime_state: Any = None,
                 interrupt_before: list[str] | None = None,
                 interrupt_after: list[str] | None = None,
                 require_durable_checkpointer: bool = True,
                 settlement_port: Any = None, approval_port: Any = None,
                 journal: Any = None, skill_path: Any = None, clock: Any = None,
-                sources_provider: Any = None, audit_sink: Any = None):
+                sources_provider: Any = None, audit_sink: Any = None,
+                execution_fence: Any = None):
     """Compile the workflow graph.
 
     A durable ``RuntimeStatePort`` is **required**: EXECUTE_INTENT claims each stable intent
@@ -375,6 +399,11 @@ def build_graph(adapter: Any, *, checkpointer: Any = None, runtime_state: Any = 
             "DURABLE_CHECKPOINTER_REQUIRED: pass checkpointer=FileCheckpointSaver(...). "
             "A production graph that can pause must be able to survive the process.")
     ledger = resolve_runtime_state(adapter, runtime_state)
+    # The fence travels ON the checkpoint store when the caller did not pass one, so an
+    # engine recovery's graph inherits it through the saver it is already handed and no
+    # ``graph_factory`` signature has to change to receive it.
+    fence = (execution_fence if execution_fence is not None
+             else getattr(checkpointer, "execution_fence", None))
     settlement = settlement_port if settlement_port is not None else adapter
     approval = (approval_port if approval_port is not None
                 else getattr(adapter, "approval_port", None))
@@ -386,16 +415,19 @@ def build_graph(adapter: Any, *, checkpointer: Any = None, runtime_state: Any = 
     graph.add_node("PREPARE_INTENT",
                    _audited(prepare_intent_node, audit_sink, audit_repair_request))
     graph.add_node("EXECUTE_INTENT",
-                   _audited(execute_intent_node(adapter, ledger), audit_sink, None))
+                   _fenced(_audited(execute_intent_node(adapter, ledger), audit_sink,
+                                    None), fence))
     gate_policy, gate_classifier = _resolve_gate_contract(skill_path)
     graph.add_node("VALIDATE_SETTLEMENT",
                    _audited(validate_settlement_node(gate_policy, gate_classifier),
                             audit_sink, audit_gate_transition))
     graph.add_node("APPLY_RESULT", _audited(apply_result_node, audit_sink, None))
-    graph.add_node("PAUSE", pause_node(settlement, approval, clock=clock,
-                                       skill_path=skill_path, journal=journal,
-                                       sources_provider=sources_provider))
-    graph.add_node("DISPOSE", dispose_node(settlement, clock=clock, journal=journal))
+    graph.add_node("PAUSE", _fenced(pause_node(settlement, approval, clock=clock,
+                                               skill_path=skill_path, journal=journal,
+                                               sources_provider=sources_provider),
+                                    fence))
+    graph.add_node("DISPOSE", _fenced(dispose_node(settlement, clock=clock,
+                                                   journal=journal), fence))
     graph.add_node("TERMINAL",
                    _audited(terminal_node, audit_sink, audit_terminal))
     graph.add_edge(START, "VALIDATE")

@@ -87,6 +87,11 @@ RECOVERY_REFUSAL_CODES = frozenset({
     "RECOVERY_CLAIM_HELD",         # another owner holds the run-scoped recovery lease
     "RECOVERY_CLAIM_LOST",         # a fenced write presented a token the record rejected
     "RECOVERY_RECORD_CORRUPT",     # the recovery record fails its closed schema
+    # OS-43 CRITICAL.  The run's execution authority is held by a LIVE owner, so this
+    # claimant neither waits nor proceeds; and the fence refused mid-flight, so this owner
+    # stops at the next irreversible step instead of finishing a successor's work.
+    "EXECUTION_AUTHORITY_HELD",
+    "EXECUTION_AUTHORITY_LOST",
 })
 # Disjoint by construction, for the same reason the three OS-31 sets are: a refusal must
 # never be mistaken for progress, and progress must never be mistaken for a refusal.
