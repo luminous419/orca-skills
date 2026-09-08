@@ -72,6 +72,31 @@ PAUSE_RECOVERY_CODES = frozenset({
     "PAUSE_CONTINUATION_ALREADY_COMPLETE",  # the head was already terminal / next-pause
 })
 
+# ---- OS-43: the general (non-paused) recovery vocabulary ------------------------------
+# ADDITIVE ONLY.  Nothing above is removed, renamed or reordered: a closed vocabulary may
+# be widened, never narrowed.  These name what ``recovery_runtime.recover_stalled_run``
+# reports for a run that is ACTIVE and stalled -- the branch OS-31 has no record for --
+# and they are a sibling set rather than new members of PAUSE_REFUSAL_CODES because a
+# stalled ACTIVE run is not a pause refusal and must never be folded into one.
+RECOVERY_ADVANCED = "RECOVERY_ADVANCED"                  # the head moved under this caller
+RECOVERY_ALREADY_APPLIED = "RECOVERY_ALREADY_APPLIED"    # this identity is already promoted
+RECOVERY_PROGRESS_CODES = frozenset({RECOVERY_ADVANCED, RECOVERY_ALREADY_APPLIED})
+RECOVERY_REFUSAL_CODES = frozenset({
+    "RECOVERY_HEAD_MISSING",       # no committed head for this run: nothing to continue
+    "RECOVERY_NO_RUNNABLE_NODE",   # the head's own routing owes no next node
+    "RECOVERY_CLAIM_HELD",         # another owner holds the run-scoped recovery lease
+    "RECOVERY_CLAIM_LOST",         # a fenced write presented a token the record rejected
+    "RECOVERY_RECORD_CORRUPT",     # the recovery record fails its closed schema
+    # OS-43 CRITICAL.  The run's execution authority is held by a LIVE owner, so this
+    # claimant neither waits nor proceeds; and the fence refused mid-flight, so this owner
+    # stops at the next irreversible step instead of finishing a successor's work.
+    "EXECUTION_AUTHORITY_HELD",
+    "EXECUTION_AUTHORITY_LOST",
+})
+# Disjoint by construction, for the same reason the three OS-31 sets are: a refusal must
+# never be mistaken for progress, and progress must never be mistaken for a refusal.
+assert not (RECOVERY_PROGRESS_CODES & RECOVERY_REFUSAL_CODES)
+
 # ---- discovery verdicts --------------------------------------------------------------
 # `discover` answers exactly one question per paused run -- "what may a Coordinator that
 # has never seen this run do with it?" -- and it must answer it with the SAME

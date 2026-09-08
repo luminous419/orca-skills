@@ -170,6 +170,15 @@ EVENT_RUN_ABANDONED = "run_abandoned"
 EVENT_PAUSE_SETTLEMENT = "pause_settlement_accounted"
 EVENT_PAUSE_TAKEOVER = "pause_takeover_claimed"
 EVENT_PAUSE_TAKEOVER_REFUSED = "pause_takeover_refused"
+# OS-43 stalled-run watchdog.  Four more names in the same OPEN `--event` vocabulary,
+# which "has no `choices` by design" (see the note above): the human-readable narrative of
+# a recovery and of an escalation.  The strictly folded COORDINATOR_AUDIT_EVENTS is
+# deliberately NOT widened -- a watchdog record in that tuple would make every reader whose
+# copy predates the extension refuse the whole delivery fold for the run (DI-2 beta).
+EVENT_RUN_RECOVERY_STARTED = "run_recovery_started"
+EVENT_RUN_RECOVERED = "run_recovered"
+EVENT_RUN_RECOVERY_REFUSED = "run_recovery_refused"
+EVENT_WATCHDOG_ESCALATION = "watchdog_escalation"
 
 # OS-19 fail-safe markers. A duration that cannot be measured leaves `duration_s`
 # empty and appends one of these to the row's own `detail`, so "no duration" and

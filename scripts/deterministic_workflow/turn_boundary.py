@@ -436,6 +436,110 @@ def classify_checkpoint_state(
     return lifecycle or "ACTIVE", str(route(state) or "")
 
 
+# ---- OS-43 F-001: the ONE way an execution authority is given up ---------------------
+# Both roles that can hold a run's execution authority -- the Coordinator through
+# `launcher.execute_state` and the Watchdog through `recovery_runtime._recover_active` --
+# end their hold HERE, through `settle_or_release`, and through nothing else.  It lives
+# beside `classify_checkpoint_state` because that function is the whole decision: the two
+# roles cannot disagree about whether one checkpoint FINISHED if neither of them owns a
+# second opinion about it.
+#
+# The previous two gates each failed on a MIRROR of the fix before it: the Coordinator
+# path learned to settle and the Watchdog path did not.  A single shared function is the
+# structural answer to that, not a second implementation kept in step by review.
+#
+#   FINISHED     the committed head carries a `terminal_status`, so the run itself says it
+#                ENDED, and `classify_checkpoint_state` therefore reports NO next node.
+#                The authority is SETTLED.  `recovery_store.claim` then answers
+#                ALREADY_SETTLED to every claimant of EITHER role, so nobody can take the
+#                run as new work, and nothing rotates: the winner's `claimant_id` and
+#                `lease_token` stay exactly as the winner left them (R6).
+#
+#   INTERRUPTED  the committed head carries no `terminal_status` and its own routing owes
+#                a next node.  Nothing is sealed: the record stays ACTIVE, the lease is
+#                released, and the run is legitimately recoverable the instant it is --
+#                which is the whole point of OS-43 and the failure mode DI-3 already cost
+#                this project once.
+#
+#   PAUSED       no `terminal_status`, lifecycle WAITING_FOR_INPUT, so its own routing owes
+#                no next node either.  NOT sealed -- a human decision still has to resume
+#                it -- and not swept, because the Watchdog reads the same predicate.
+#
+#   UNREADABLE   every failure to read the head answers `None` and therefore RELEASES.  A
+#                store hiccup may not seal a live run, because an inert Watchdog is the one
+#                outcome this feature may not have.
+def committed_terminal_state(checkpointer: Any, thread_id: str, *,
+                             checkpoint_ns: str = "") -> dict[str, Any] | None:
+    """The run's OWN durable statement that it ENDED, or ``None``.
+
+    Never the in-memory value ``graph.invoke`` returned -- a crash destroys that and a
+    caller can fabricate it.  Unreadable is not terminal: every failure answers ``None``,
+    which leaves the run ACTIVE and recoverable.
+    """
+    if checkpointer is None:
+        return None
+    try:
+        from . import routing
+        from .checkpoint_store import CheckpointStoreError
+        from .pause_runtime import restore_closed_state
+        from .state import StateError, validate_state
+    except ImportError:            # the LangGraph-bound half is absent: not terminal
+        return None
+    try:
+        head = checkpointer.head(thread_id, checkpoint_ns=checkpoint_ns)
+        if not head:
+            return None
+        committed = checkpointer.get_tuple({"configurable": {
+            "thread_id": thread_id, "checkpoint_ns": checkpoint_ns,
+            "checkpoint_id": head}})
+        if committed is None:
+            return None
+        state = dict(validate_state(
+            restore_closed_state(committed.checkpoint.get("channel_values") or {}),
+            expected_thread_id=thread_id))
+        _status, next_node = classify_checkpoint_state(state, route=routing.route)
+    except (CheckpointStoreError, StateError, AttributeError, OSError, ValueError,
+            KeyError, TypeError):
+        return None
+    if not state.get("terminal_status") or next_node:
+        return None
+    return state
+
+
+def authority_now() -> str:
+    """The one timestamp format the authority record is written with, for both roles."""
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def settle_or_release(authority: Any, run_id: str, lease_token: str, *,
+                      checkpointer: Any, thread_id: str,
+                      checkpoint_ns: str = "") -> str:
+    """Close this owner's hold on ``run_id``: ``"SETTLED"`` or ``"RELEASED"``.
+
+    Called from the ``finally`` of every held section in both roles, so success, refusal
+    and crash alike close the same way, and WHICH way is decided by the run's own
+    committed head and nothing else -- never by the outcome value the caller computed,
+    which is exactly the asymmetry that let one role seal and the other not.
+
+    Released is the fallback in every ambiguous case, including a ``settle`` the record
+    refuses because a successor already owns it: the seal belongs to whoever actually
+    holds the run, and a release the record does not recognise is already a no-op.
+    """
+    from . import recovery_store
+    if authority is None:
+        return "RELEASED"
+    if committed_terminal_state(checkpointer, thread_id,
+                                checkpoint_ns=checkpoint_ns) is not None:
+        try:
+            authority.settle(run_id, lease_token=lease_token, updated_at=authority_now())
+            return "SETTLED"
+        except recovery_store.RecoveryStoreError:
+            pass
+    authority.release(run_id, lease_token)
+    return "RELEASED"
+
+
 def workflow_checkpoint_path(
     run_id: str, *, artifact_base: Path, explicit: Any = None
 ) -> Path:
@@ -1088,6 +1192,45 @@ def release_session_run(
     return bind_session_run(
         run_id, session_id=session_id, artifact_base=artifact_base, env=env, release=True
     )
+
+
+def begin_run_liveness(
+    run_id: str, *, session_id: str = "", artifact_base: Any = ".", env: Any = None,
+    lease_seconds: float | None = None, waiter: Any = None
+) -> Any | None:
+    """Start publishing this Coordinator's OS-43 liveness lease for ``run_id``.
+
+    ADDITIVE.  It wraps ``coordinator_liveness.begin_coordinator_liveness`` and nothing
+    else: the session binding above is unchanged, keeps its own schema and gains no field,
+    so nothing that reads the binding sees a new one.  Liveness is a SEPARATE record for
+    the same reason the binding is separate from the pause record -- a binding is a record
+    of INTENT, and liveness is a record of a beating heart.
+
+    Returns ``None`` and changes nothing when there is no session to bind or the record
+    cannot be published, exactly as :func:`bind_session_run` does: a Coordinator's run must
+    not fail because a liveness record could not be written.  The consequence of a missing
+    record is never a Watchdog that guesses -- it is the four-valued ``ABSENT`` read, which
+    DECLINES.
+    """
+    from .coordinator_liveness import begin_coordinator_liveness
+    from .runtime_state import DEFAULT_LEASE_SECONDS
+    session = session_id or current_session_id(env)
+    if not run_id:
+        return None
+    return begin_coordinator_liveness(
+        run_id, artifact_base=artifact_base, session_id=session,
+        lease_seconds=DEFAULT_LEASE_SECONDS if lease_seconds is None
+        else float(lease_seconds), waiter=waiter)
+
+
+def end_run_liveness(keeper: Any, run_id: str, *, artifact_base: Any = ".") -> bool:
+    """Retire the liveness keeper and record the release.  True on a clean shutdown.
+
+    ADDITIVE, and the mirror of :func:`begin_run_liveness`.  Releasing is a WRITTEN record
+    rather than a deleted file, for the same reason :func:`release_session_run` is.
+    """
+    from .coordinator_liveness import end_coordinator_liveness
+    return end_coordinator_liveness(keeper, run_id, artifact_base=artifact_base)
 
 
 def session_bound_run_id(session_id: str, *, artifact_base: Any = ".") -> str:

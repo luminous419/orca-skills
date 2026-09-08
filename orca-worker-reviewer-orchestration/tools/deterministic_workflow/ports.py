@@ -188,3 +188,155 @@ class LeaseClockPort(Protocol):
 
 class IdGeneratorPort(Protocol):
     def stable_id(self, namespace: str, canonical_payload: bytes) -> str: ...
+
+
+# ---- OS-43: the Watchdog's five ports (additive; nothing above is touched) -------------
+# They follow this file's existing conventions exactly, including the durability rule
+# stated at ``LifecycleSettlementPort.open_dispatches``: every one of them must be
+# answerable by a process that holds none of the objects of the process that created the
+# state, and a source that cannot be read is "unknown", never "empty".
+@runtime_checkable
+class RunDiscoveryPort(Protocol):
+    """Every run under one artifact base that a supervisor may have to consider.
+
+    Symmetric with ``pause_store.discover_paused_runs`` and deliberately wider: that
+    function ``continue``s past every directory with no pause record, so a stalled ACTIVE
+    run is invisible to it.  This port reaches those runs too.  Read-only: it takes no
+    claim and performs no effect, the same discipline ``pause_runtime.discover`` states.
+
+    A run root that cannot be read is reported as a listing whose ``verdict`` names the
+    defect -- never omitted.  An unreadable RUNS ROOT raises: "unknown" is not "empty".
+    """
+
+    def discover(self) -> tuple[Mapping[str, Any], ...]: ...
+
+
+@runtime_checkable
+class RunObservationPort(Protocol):
+    """One atomic read of every durable authority a fact vector needs, for ONE run.
+
+    ``turn_boundary.observe`` already has exactly this shape -- everything the verdict
+    needs, gathered in one atomic invocation -- and the classifier's determinism argument
+    rests on the vector being ONE snapshot with no re-read mid-classification.
+
+    Every method RAISES when its authority exists but cannot be read, and reports a
+    legitimately ABSENT authority as an absence.  The port never collapses the two:
+    turning a refusal into the F1 fact is the snapshot builder's job, so no implementation
+    of this port ever has to lie.  ``durable_wait`` is TRI-VALUED for this reason and must
+    not reuse ``turn_boundary.observe_durable_wait``, whose three witnesses each fail
+    OPEN -- safe for a turn end, which only refuses a turn, and unsafe here, where it
+    would auto-resume a human wait.
+    """
+
+    def orca_state(self, run_id: str) -> Mapping[str, Any]: ...
+    def checkpoint_state(self, run_id: str) -> Mapping[str, Any]: ...
+    def pause_state(self, run_id: str) -> Mapping[str, Any] | None: ...
+    def durable_wait(self, run_id: str) -> Mapping[str, Any]: ...
+    def delivery_obligations(self, run_id: str) -> tuple[str, ...]: ...
+    def foreign_lease(self, run_id: str) -> Mapping[str, Any] | None: ...
+    def declared_capabilities(self, run_id: str) -> frozenset[str]: ...
+
+
+@runtime_checkable
+class CoordinatorLivenessPort(Protocol):
+    """The run-scoped Coordinator liveness lease, READ ONLY.
+
+    ``status`` is deliberately four-valued and never boolean.  ABSENT is not EXPIRED: a
+    run whose Coordinator never published a lease has no liveness evidence at all, and
+    reading that as "expired" would reinstate the false positive the record exists to
+    remove.  UNREADABLE is not EXPIRED either; it is routed to F1.
+    """
+
+    def status(self, run_id: str) -> str: ...
+    def record(self, run_id: str) -> Mapping[str, Any] | None: ...
+
+
+#: The named, fail-closed reason a recovery could not even be REQUESTED for one run.
+#: It is deliberately NOT a member of the engine's closed outcome vocabulary: nothing was
+#: claimed, nothing was invoked and no effect was attempted, so reporting it as an outcome
+#: would be reporting work that never started.
+RECOVERY_GRAPH_UNAVAILABLE = "RECOVERY_GRAPH_UNAVAILABLE"
+
+
+class RecoveryPreconditionUnavailable(Exception):
+    """A port cannot supply, FOR THIS RUN, something a recovery needs before it begins.
+
+    Raised by :meth:`RecoveryInvocationPort.build_request` (and by the engine as a second
+    line of defence) instead of handing on a graph factory that would produce ``None`` and
+    fail with an ``AttributeError`` mid-invocation.  The distinction is the whole point:
+    an ``AttributeError`` caught by a generic handler is indistinguishable from a run that
+    was acted upon and failed, whereas this is a NAMED refusal that a supervisor must
+    report and must not count as an action.
+    """
+
+    def __init__(self, code: str, detail: str = "") -> None:
+        super().__init__(f"{code}: {detail}" if detail else code)
+        self.code = code
+        self.detail = detail
+
+
+@runtime_checkable
+class RecoveryInvocationPort(Protocol):
+    """The ONLY action the supervisor core can take, and it is the ENGINE's action.
+
+    The core holds no other route into the engine: it does not import ``routing``,
+    ``graph``, ``executor``, ``pause_runtime.resume_run``, ``pause_store.claim`` or
+    ``runtime_state.claim``, so recoverability, the next node, the claim, the fence and
+    the resume semantics are unreachable from it by construction rather than by
+    convention.
+
+    ``recover`` takes ONE frozen request whose field set is closed and contains no
+    verdict, next node, phase, decision-bundle id, lease token or force flag, and returns
+    ONE outcome from a closed set.  A refusal outcome carries no continuation handle -- no
+    token, no saver, no state, no graph -- so there is nothing on it a caller could use to
+    proceed anyway.
+    """
+
+    def recover(self, request: Any) -> Any: ...
+
+    def identity(self, *, run_id: str, thread_id: str, checkpoint_ns: str,
+                 head_checkpoint_id: str, recovery_kind: str) -> str:
+        """The ENGINE's own idempotency identity for one attempt.  Pure, and not an action.
+
+        It lives on this port rather than in the supervisor core for the same reason
+        ``recover`` does: the identity is the engine's, and two spellings of it would let
+        the budget and the attempt entry key on different things.
+        """
+
+    def build_request(self, *, run_id: str, recovery_kind: str) -> Any:
+        """Assemble the closed request from observations the supervisor supplies.
+
+        Here rather than in the core for the same reason: the core must not be able to
+        construct an engine type at all.  There is no parameter through which a caller
+        could express a next node, a verdict, a phase, a decision-bundle id, a lease token
+        or a force flag -- ``run_id`` and ``recovery_kind`` are both observations.
+
+        The request is assembled FOR ``run_id``, so everything run-specific on it -- the
+        graph the engine would resume above all -- is resolved here, per run, and never
+        once for a whole sweep.  An implementation that cannot resolve it for this run
+        raises :class:`RecoveryPreconditionUnavailable` rather than returning a request
+        that would fail inside the engine.
+        """
+
+
+@runtime_checkable
+class SupervisorAuditPort(Protocol):
+    """The append-only watchdog ledger: the supervisor's SOLE durable memory.
+
+    ``append`` publishes ONE immutable, sequence-allocated record and refuses an unknown
+    event before publishing, exactly as ``append_coordinator_audit_record`` does.
+    ``fold`` rebuilds the retry budget, backoff deadline and escalation state a previous
+    process left behind, and RAISES rather than returning a truncated history --
+    ``replay_delivery_ledger``'s rule, for the same reason: a truncated history is
+    indistinguishable from "nothing has been attempted", which is how a bounded retry
+    becomes an unbounded one.
+
+    An ABSENT ledger is not damage and folds to an empty state.  Unlike OS-31's ``_audit``
+    helper, which swallows every exception because there "audit is evidence, never a
+    gate", ``append`` IS a gate here: it is the budget's only source, so a record that
+    cannot be published means the attempt it precedes must not be made.
+    """
+
+    def append(self, run_id: str, event: str,
+               record: Mapping[str, Any]) -> tuple[str, int]: ...
+    def fold(self, run_id: str) -> Mapping[str, Mapping[str, Any]]: ...

@@ -26,6 +26,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from . import recovery_store
 from .contracts import BASE_CAPABILITIES
 from .executor import IdempotencyRecoveryError, terminal_node
 from .runtime_state import (RuntimeStateConflict, resolve_runtime_state,
@@ -121,6 +122,92 @@ def build_state(spec: dict[str, Any]) -> dict[str, Any]:
         raise LauncherError(f"invalid state specification: {exc}") from exc
 
 
+# ---- OS-43 CRITICAL: the Coordinator's half of the run-scoped execution authority -----
+def _execution_authority(checkpointer: Any) -> tuple[Any, str]:
+    """The authority guarding THIS run's checkpoint store, or ``(None, "")``.
+
+    Keyed on the checkpoint store rather than on the run id, because the thing being
+    serialised is "who may advance THIS checkpoint", and for the canonical run-rooted
+    layout ``recovery_store.authority_path_for_checkpoint`` resolves to exactly the
+    record ``recovery_runtime._recover_active`` claims -- one file, one lock, one owner.
+
+    ``None`` when the graph has no durable checkpoint store at all.  Such a run is not
+    addressable by any other process: it publishes no checkpoint for a Watchdog to
+    discover, so there is no second claimant for it to be serialised against.  Production
+    never takes this branch -- ``build_graph`` refuses a non-durable checkpointer unless
+    the caller explicitly asks for the named test-only escape hatch.
+    """
+    path = getattr(checkpointer, "path", None)
+    if path is None:
+        return None, ""
+    try:
+        return recovery_store.FileRecoveryStateStore(
+            recovery_store.authority_path_for_checkpoint(path)), ""
+    except recovery_store.RecoveryStoreLockUnavailable:  # pragma: no cover - non-POSIX
+        # No inter-process lock means no exclusive claim is possible.  Reported as an
+        # absent authority rather than as a claim that cannot be enforced.
+        return None, ""
+
+
+def _authority_keeper(authority: Any, run_id: str, lease_token: str) -> Any:
+    """Renew the authority for the whole run, so a healthy owner is never taken over.
+
+    The same ``LeaseKeeper`` the executor and ``coordinator_liveness`` already use,
+    unmodified: a lease that is never renewed is exclusive for one lease period, which is
+    far shorter than a workflow.
+    """
+    if authority is None:
+        return None
+    from .lease_keeper import LeaseKeeper, heartbeat_interval_for
+    return LeaseKeeper(
+        authority, run_id, lease_token,
+        interval_seconds=heartbeat_interval_for(authority.lease_seconds)).start()
+
+
+def _authority_now() -> str:
+    from .turn_boundary import authority_now
+    return authority_now()
+
+
+def _authority_blocked(raw_state: dict[str, Any], code: str, message: str) -> dict[str, Any]:
+    """Stop this Coordinator, closed, with a named reason and no external effect.
+
+    Exactly the shape ``RuntimeStateConflict`` already produces below: the run terminates
+    BLOCKED (exit code 1) rather than crashing, and -- because this happens before
+    ``graph.invoke`` -- it performs nothing at all.
+    """
+    blocked = dict(raw_state)
+    blocked["route_token"] = "BLOCK"
+    blocked["terminal_reason"] = {"code": code, "message": message}
+    return terminal_node(blocked)
+
+
+# ---- OS-43 F-001: FINISHED and INTERRUPTED are different durable facts ----------------
+# The authority made the two parties exclusive WHILE one of them runs, and nothing more:
+# a Coordinator that finished released an `ACTIVE` record, its lease then lapsed, and the
+# next `execute_state` over the same run found a takeable record, minted a fresh
+# claimant, rotated the token and drove the graph again.  R6 forbids exactly that -- a
+# retry, a process restart or a replayed message may not change the winner and may not
+# perform a second transition -- so terminal completion has to become DURABLE, not merely
+# unheld.
+#
+# The rule itself, the FINISHED / INTERRUPTED / PAUSED / UNREADABLE table and the reasons
+# behind each row live in ONE place -- `turn_boundary.settle_or_release`, beside the
+# `classify_checkpoint_state` the whole decision rests on -- because the Watchdog closes
+# its own hold through the SAME function.  Two parallel implementations of this are what
+# the last two review gates each failed on, in mirror image; there is now one.
+def _committed_terminal_state(checkpointer: Any, thread_id: str) -> dict[str, Any] | None:
+    from .turn_boundary import committed_terminal_state
+    return committed_terminal_state(checkpointer, thread_id)
+
+
+def _settle_or_release(authority: Any, run_id: str, lease_token: str, checkpointer: Any,
+                       thread_id: str) -> str:
+    from .turn_boundary import settle_or_release
+    return settle_or_release(authority, run_id, lease_token, checkpointer=checkpointer,
+                             thread_id=thread_id)
+
+
 def execute_state(raw_state: dict[str, Any], *, adapter: Any, checkpointer: Any = None,
                   runtime_state: Any = None, recursion_limit: int | None = None,
                   thread_id: str | None = None, interrupt_before: list[str] | None = None,
@@ -128,6 +215,7 @@ def execute_state(raw_state: dict[str, Any], *, adapter: Any, checkpointer: Any 
                   checkpoint_store_path: str | Path | None = None,
                   artifact_base: Path | None = None,
                   require_durable_checkpointer: bool = True,
+                  execution_authority: Any = None,
                   **graph_options: Any) -> dict[str, Any]:
     """Run the compiled graph to a terminal state, failing closed on malformed input.
 
@@ -139,6 +227,13 @@ def execute_state(raw_state: dict[str, Any], *, adapter: Any, checkpointer: Any 
     A durable ``RuntimeStatePort`` is required, here as everywhere: it is resolved (and
     refused if absent) before the state is even inspected.  ``run_cli`` supplies one by
     default, so the shipped command line is crash-safe without extra flags.
+
+    ``execution_authority`` is a PORT INSTANCE for test injection -- the run-scoped claim
+    authority, the same role ``recover_stalled_run``'s ``store`` plays
+    (``recovery_runtime.py:372-380``).  It is not a decision and cannot express one: the
+    only thing a caller can vary is WHICH record (and which process identity) the claim is
+    taken against, never whether one is taken.  Production leaves it ``None`` and the
+    authority is derived from the run's own durable checkpoint store.
     """
     from .graph import build_graph
 
@@ -156,24 +251,93 @@ def execute_state(raw_state: dict[str, Any], *, adapter: Any, checkpointer: Any 
         checkpointer = FileCheckpointSaver(resolve_checkpoint_path(
             raw_state["run_id"], thread_id or raw_state["thread_id"],
             explicit=checkpoint_store_path, artifact_base=artifact_base))
-    if "audit_sink" not in graph_options:
-        # OS-42.  The run's own append-only ORCHESTRATOR_LOG.md is where the
-        # validation-repair audit trail lands, and this is the entry point that knows
-        # where that run root is.  Passing `audit_sink=None` explicitly still disables it,
-        # which is what every in-process test does so a suite run writes no artifacts.
-        from .audit import RunLoggingAuditSink
-        graph_options["audit_sink"] = RunLoggingAuditSink(
-            raw_state["run_id"], artifact_base=artifact_base)
-    config: dict[str, Any] = {"recursion_limit": recursion_limit or default_recursion_limit(raw_state)}
-    # Unconditional: a thread id is what makes a run addressable by a successor process.
-    config["configurable"] = {"thread_id": thread_id or raw_state["thread_id"],
-                              "checkpoint_ns": ""}
-    graph = build_graph(adapter, checkpointer=checkpointer, runtime_state=runtime_state,
-                        interrupt_before=interrupt_before, interrupt_after=interrupt_after,
-                        require_durable_checkpointer=require_durable_checkpointer,
-                        **graph_options)
+    # ---- OS-43 CRITICAL: the run-scoped EXECUTION AUTHORITY -------------------------
+    # This is the Coordinator's ordinary path to ``graph.invoke``, and before this it took
+    # NO run-scoped authority: the recovery lease serialised Watchdog-vs-Watchdog and the
+    # Coordinator never participated, so a Coordinator that revived after a Watchdog had
+    # observed it stale could drive the same checkpoint concurrently.  Both now pass
+    # through ``recovery_store.claim``, and whichever gets there first owns the run.
+    #
+    # ``takeover=False``: this claimant has a run in hand and cannot observe.  A live
+    # holder is a final refusal, reported as BLOCKED with a stable code -- it neither
+    # waits nor proceeds.
+    authority, authority_token = ((execution_authority, "")
+                                  if execution_authority is not None
+                                  else _execution_authority(checkpointer))
+    if authority is not None:
+        try:
+            claimed = authority.claim(
+                raw_state["run_id"],
+                thread_id=thread_id or raw_state["thread_id"], checkpoint_ns="",
+                now_iso=_authority_now(),
+                owner_kind=recovery_store.OWNER_KIND_COORDINATOR, takeover=False)
+        except recovery_store.RecoveryAuthorityHeld as exc:
+            # ``takeover=False`` makes this the ONLY held-claim exception reachable here,
+            # which is exactly the point: a Coordinator has no observe branch to fall into.
+            return _authority_blocked(raw_state,
+                                      recovery_store.EXECUTION_AUTHORITY_HELD, str(exc))
+        except recovery_store.RecoveryRecordCorrupt as exc:
+            return _authority_blocked(raw_state, "RECOVERY_RECORD_CORRUPT", str(exc))
+        if claimed["claim_outcome"] == recovery_store.ALREADY_SETTLED:
+            # R6.  This run FINISHED and its authority records that, so a restart owes the
+            # caller the outcome the run already reached -- read back from the committed
+            # checkpoint -- and no second transition.  `claim` returns ALREADY_SETTLED
+            # WITHOUT touching the record, so the winner's `claimant_id` and `lease_token`
+            # are still the winner's after this returns.  Returning before `audit_sink` is
+            # resolved is deliberate: a restart publishes no audit record either.
+            settled = _committed_terminal_state(checkpointer,
+                                                thread_id or raw_state["thread_id"])
+            if settled is not None:
+                return settled
+            # SETTLED with no readable terminal head: something sealed a run whose outcome
+            # this process cannot read, so it refuses rather than inventing one.
+            return _authority_blocked(
+                raw_state, recovery_store.EXECUTION_AUTHORITY_HELD,
+                f"{raw_state['run_id']}: this run's execution authority is SETTLED")
+        authority_token = claimed["lease_token"]
+        # R4.  Carried into the graph so EXECUTE_INTENT / PAUSE / DISPOSE revalidate the
+        # token before every external effect, and checked once more immediately before the
+        # transition below.
+        graph_options.setdefault(
+            "execution_fence",
+            lambda: authority.fence(raw_state["run_id"], authority_token))
+    # EVERYTHING from here to the `finally` runs while this Coordinator HOLDS the run's
+    # execution authority, so everything from here is inside the `try`: building the graph
+    # or starting the lease keeper can raise, and a raise outside the held section would
+    # leave the record ACTIVE with nothing closing it -- the same class of leak as an
+    # unsettled completion, one step earlier.
+    keeper = None
     try:
+        if "audit_sink" not in graph_options:
+            # OS-42.  The run's own append-only ORCHESTRATOR_LOG.md is where the
+            # validation-repair audit trail lands, and this is the entry point that knows
+            # where that run root is.  Passing `audit_sink=None` explicitly still disables
+            # it, which is what every in-process test does so a suite run writes no
+            # artifacts.
+            from .audit import RunLoggingAuditSink
+            graph_options["audit_sink"] = RunLoggingAuditSink(
+                raw_state["run_id"], artifact_base=artifact_base)
+        config: dict[str, Any] = {
+            "recursion_limit": recursion_limit or default_recursion_limit(raw_state)}
+        # Unconditional: a thread id is what makes a run addressable by a successor.
+        config["configurable"] = {"thread_id": thread_id or raw_state["thread_id"],
+                                  "checkpoint_ns": ""}
+        graph = build_graph(adapter, checkpointer=checkpointer,
+                            runtime_state=runtime_state,
+                            interrupt_before=interrupt_before,
+                            interrupt_after=interrupt_after,
+                            require_durable_checkpointer=require_durable_checkpointer,
+                            **graph_options)
+        keeper = _authority_keeper(authority, raw_state["run_id"], authority_token)
+        if authority is not None:
+            # Immediately before the transition, atomically.  A token that no longer
+            # matches means a successor already owns this run.
+            authority.fence(raw_state["run_id"], authority_token)
         final = graph.invoke(raw_state, config)
+    except recovery_store.RecoveryClaimLost as exc:
+        # The fence refused -- at the transition or inside a node, before its effect.  The
+        # run stops with a named reason; it does not finish work a successor now owns.
+        return _authority_blocked(raw_state, "EXECUTION_AUTHORITY_LOST", str(exc))
     except RuntimeStateConflict as exc:
         # A corrupt, incompatible or contended durable ledger stops the run *before* any
         # further external effect, and is reported as BLOCKED rather than as a crash.  It is
@@ -191,6 +355,17 @@ def execute_state(raw_state: dict[str, Any], *, adapter: Any, checkpointer: Any 
         blocked["route_token"] = "BLOCK"
         blocked["terminal_reason"] = {"code": exc.code, "message": exc.detail}
         return terminal_node(blocked)
+    finally:
+        # The authority is closed on every exit path -- success, refusal and crash alike
+        # -- so a Coordinator that stops holds nothing.  WHICH way it is closed is decided
+        # by the run's own committed head and nothing else (`_settle_or_release`): a run
+        # that FINISHED is SETTLED, and one that stopped short of finishing is released,
+        # so it becomes legitimately recoverable again the instant this owner lets go.
+        if keeper is not None:
+            keeper.stop()
+        if authority is not None:
+            _settle_or_release(authority, raw_state["run_id"], authority_token,
+                               checkpointer, thread_id or raw_state["thread_id"])
     # OS-42.  A settled run executes no further node, so the outbox needs one retry point
     # after the graph has stopped -- this is it.  Outside the lifecycle path by
     # construction: it reads the final state, delivers, and writes nothing back, so it can
@@ -447,7 +622,11 @@ PAUSE_VERBS = ("discover", "resume")
 # a way of RUNNING the workflow: it is the control point a live, prompt-driven
 # Coordinator invokes before it returns a response, and it needs no LangGraph -- the
 # state it derives is Orca's Task/Dispatch records and the run's own append-only audit.
-TURN_VERBS = ("turn-end", "turn-end-hook", "turn-end-bind")
+TURN_VERBS = ("turn-end", "turn-end-hook", "turn-end-bind",
+              "turn-end-liveness")
+#: OS-43.  New top-level verbs, registered beside the existing tables; every
+#: existing dispatch path is untouched, so a revert is dropping the registration.
+WATCHDOG_VERBS = ("watchdog", "recover")
 
 
 def build_turn_parser() -> argparse.ArgumentParser:
@@ -524,6 +703,34 @@ def build_turn_parser() -> argparse.ArgumentParser:
         help="record that this session has let the Run go, so its later turn ends are "
              "no longer gated on it")
     bind.add_argument("--json", action="store_true")
+    # OS-43.  The liveness lease is a SEPARATE record from the binding, and this flag
+    # says whether binding also starts publishing it.  Default on, so the ordinary
+    # Coordinator gets AC-1's premise without an extra step; `--no-liveness` is for an
+    # operator who publishes it from somewhere else.
+    liveness = bind.add_mutually_exclusive_group()
+    liveness.add_argument("--liveness", dest="liveness", action="store_true",
+                          default=True,
+                          help="also publish and refresh this run's OS-43 Coordinator "
+                               "liveness lease (default)")
+    liveness.add_argument("--no-liveness", dest="liveness", action="store_false",
+                          help="bind only; publish no liveness lease")
+    # A Coordinator that does not run under the harness still needs a way to publish the
+    # lease.  Read-only `--status` reports the four-valued read without writing anything.
+    live = sub.add_parser(
+        "turn-end-liveness",
+        help="publish, refresh or report this run's OS-43 Coordinator liveness lease")
+    live.add_argument("--run-id", required=True)
+    live.add_argument("--artifact-base", default=".")
+    live.add_argument("--session-id", default="")
+    live.add_argument("--seconds", type=float, default=0.0,
+                      help="how long to keep refreshing before releasing; 0 publishes "
+                           "one lease and returns, which is what a cron-style caller "
+                           "wants")
+    live.add_argument("--status", action="store_true",
+                      help="report the four-valued liveness read and write nothing")
+    live.add_argument("--release", action="store_true",
+                      help="record that this Coordinator let the run go")
+    live.add_argument("--json", action="store_true")
     return parser
 
 
@@ -550,8 +757,61 @@ def run_turn_cli(argv: list[str]) -> int:
     if args.verb == "turn-end-hook":
         return turn_boundary.run_stop_hook_cli(args)
     if args.verb == "turn-end-bind":
-        return turn_boundary.run_bind_cli(args)
+        code = turn_boundary.run_bind_cli(args)
+        if getattr(args, "liveness", False) and not getattr(args, "release", False):
+            # Additive: the binding's own result is unchanged either way, and a liveness
+            # record that cannot be published never fails the bind.
+            turn_boundary.begin_run_liveness(
+                args.run_id, session_id=args.session_id,
+                artifact_base=args.artifact_base)
+        return code
+    if args.verb == "turn-end-liveness":
+        return run_liveness_cli(args)
     return turn_boundary.run_turn_boundary_cli(args)
+
+
+def run_liveness_cli(args: argparse.Namespace) -> int:
+    """`turn-end-liveness`: publish, refresh, release or report the liveness lease."""
+    from . import coordinator_liveness
+    base = Path(args.artifact_base)
+    if args.status:
+        status = coordinator_liveness.liveness_status(args.run_id, artifact_base=base)
+        payload = {"run_id": args.run_id, "liveness_status": status}
+        print(json.dumps(payload, sort_keys=True) if args.json
+              else f"run={args.run_id} liveness={status}")
+        return 0
+    if args.release:
+        coordinator_liveness.end_coordinator_liveness(None, args.run_id,
+                                                      artifact_base=base)
+        status = coordinator_liveness.liveness_status(args.run_id, artifact_base=base)
+        payload = {"run_id": args.run_id, "liveness_status": status,
+                   "released": True}
+        print(json.dumps(payload, sort_keys=True) if args.json
+              else f"run={args.run_id} liveness={status} released=1")
+        return 0
+    keeper = coordinator_liveness.begin_coordinator_liveness(
+        args.run_id, artifact_base=base, session_id=args.session_id)
+    if keeper is None:
+        print(f"run_workflow: could not publish a liveness lease for {args.run_id}",
+              file=sys.stderr)
+        return USAGE_EXIT_CODE
+    if args.seconds and args.seconds > 0:
+        import threading
+        threading.Event().wait(float(args.seconds))
+        coordinator_liveness.end_coordinator_liveness(keeper, args.run_id,
+                                                      artifact_base=base)
+    else:
+        # A cron-style caller publishes ONE lease and returns.  It is deliberately NOT
+        # released here: releasing would make the record read ABSENT the instant the
+        # command exits, which is the opposite of what a periodic publisher wants.  The
+        # lease simply expires on schedule unless the next invocation refreshes it, and
+        # the beat thread is retired so nothing outlives the process.
+        keeper.stop()
+    status = coordinator_liveness.liveness_status(args.run_id, artifact_base=base)
+    payload = {"run_id": args.run_id, "liveness_status": status}
+    print(json.dumps(payload, sort_keys=True) if args.json
+          else f"run={args.run_id} liveness={status}")
+    return 0
 
 
 def build_pause_parser() -> argparse.ArgumentParser:
@@ -588,6 +848,19 @@ def build_pause_parser() -> argparse.ArgumentParser:
     resume.add_argument("--results",
                         help="JSON file with the fake adapter's scripted settlements for "
                              "the round the run re-enters")
+    # OS-43 (F-E).  This CLI built FakeAdapter unconditionally, so the shipped one-shot
+    # recovery could not resume a real Orca run at all.  The selection DEFAULTS to today's
+    # behaviour, so no existing invocation changes meaning and the revert is one line.
+    resume.add_argument("--adapter", choices=ADAPTERS, default=FAKE_ADAPTER,
+                        help="which execution adapter the resumed round re-enters with "
+                             f"(default: {FAKE_ADAPTER})")
+    resume.add_argument("--run-owner", default="",
+                        help="terminal handle that owns the existing Orca Run; required "
+                             "by --adapter orca, which adopts a run rather than creating "
+                             "one")
+    resume.add_argument("--project-root", default="",
+                        help="project root the Orca adapter reads its quality profile "
+                             "and agent routing from (default: the working directory)")
     resume.add_argument("--json", action="store_true")
     return parser
 
@@ -632,8 +905,14 @@ def run_pause_cli(argv: list[str]) -> int:
         ledger = FileRuntimeStateStore(default_runtime_state_path(args.run_id,
                                                                  record["thread_id"]))
         journal = pause_store.journal_for(args.run_id, artifact_base=base)
-        adapter = FakeAdapter(results, runtime_state=ledger, run_id=args.run_id,
-                              settlement_journal=journal)
+        if getattr(args, "adapter", FAKE_ADAPTER) == ORCA_ADAPTER:
+            adapter = build_orca_adapter_for_run(
+                args.run_id, artifact_base=base, runtime_state=ledger,
+                run_owner=args.run_owner,
+                project_root=Path(args.project_root) if args.project_root else None)
+        else:
+            adapter = FakeAdapter(results, runtime_state=ledger, run_id=args.run_id,
+                                  settlement_journal=journal)
 
         def graph_factory(saver: Any) -> Any:
             from .graph import build_graph
@@ -690,6 +969,342 @@ def run_pause_cli(argv: list[str]) -> int:
     return exit_code
 
 
+def declared_phases_for_run(run_id: str, *, artifact_base: Path) -> tuple[str, ...]:
+    """The workflow phases the STALLED run was launched with, read off its checkpoint.
+
+    ``start_run`` receives ``requested_phases`` from the launch specification, but a
+    recovery has no launch specification -- it adopts a run someone else started -- and
+    ``resume_run`` leaves the field empty when nobody supplies it.  Empty is not a
+    harmless default: ``build_quality_gate_context`` refuses the ``final_review`` gate
+    without it ("the final gate re-checks the requested workflow, not a single phase"),
+    so an adopted run that reaches its final gate could not dispatch a Final Reviewer at
+    all.  The run's own committed checkpoint is the durable authority for what it was
+    asked to do, and it is the same document the recovery is about to resume, so reading
+    it here cannot disagree with what the engine goes on to execute.
+
+    Lower-cased for the same reason ``build_orca_adapter`` lower-cases the launch
+    spec's phases: the engine's state names them in upper case and the task-context
+    vocabulary is lower case.
+
+    Returns ``()`` when the head cannot be read, which is exactly the behaviour every
+    caller had before this function existed: an unreadable checkpoint fails at the
+    engine's own read, not here, and this is not the boundary that should decide it.
+    """
+    from . import recovery_runtime
+    try:
+        head = recovery_runtime.resolve_head(run_id, artifact_base=artifact_base)
+    except Exception:  # noqa: BLE001 - an unreadable head is the engine's refusal, not ours
+        return ()
+    if head is None:
+        return ()
+    phases = head.state.get("requested_phases") or ()
+    return tuple(str(phase).lower() for phase in phases)
+
+
+def build_orca_adapter_for_run(run_id: str, *, artifact_base: Path,
+                               runtime_state: Any = None, run_owner: str = "",
+                               project_root: Path | None = None,
+                               harness_factory: Any = None) -> Any:
+    """An ``OrcaAdapter`` bound to an EXISTING Run, for recovery rather than for launch.
+
+    ``build_orca_adapter`` CREATES a Run, which is exactly wrong here: a recovery adopts
+    the run that is already stalled.  ``OrcaRuntimeHarness.resume_run`` is the documented
+    adoption path and it restores the delivery ledger before returning, so the adapter this
+    returns is a successor process in the OS-44 sense rather than a fresh one.
+    """
+    runtime = _import_orca_runtime()
+    if not run_owner:
+        raise LauncherError(
+            f"{ORCA_ADAPTER_REQUIRES_STATE}: --adapter orca adopts an existing Run and "
+            "needs --run-owner, the terminal handle that owns it")
+    root = Path(project_root) if project_root is not None else Path.cwd()
+    factory = harness_factory or runtime.OrcaRuntimeHarness
+    try:
+        harness = factory(artifact_base, quality_profile_root=root)
+        harness.resume_run(run_id, run_owner=run_owner,
+                           requested_phases=declared_phases_for_run(
+                               run_id, artifact_base=artifact_base))
+    except runtime.OrcaRuntimeError as exc:
+        raise LauncherError(f"{ORCA_RUNTIME_UNAVAILABLE}: {exc}") from exc
+    from .orca_adapter import OrcaAdapter
+    return OrcaAdapter(harness, runtime_state=runtime_state)
+
+
+def build_watchdog_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="run_workflow.py",
+        description="Stalled-run watchdog and one-shot recovery (OS-43).")
+    sub = parser.add_subparsers(dest="verb", required=True)
+    watchdog = sub.add_parser("watchdog", help="observe and recover stalled runs")
+    modes = watchdog.add_subparsers(dest="mode", required=True)
+    for name, help_text in (("once", "exactly one sweep, then return"),
+                            ("run", "sweep, wait, repeat until shutdown"),
+                            ("status", "fold the ledgers and report; takes no claim")):
+        mode = modes.add_parser(name, help=help_text)
+        mode.add_argument("--artifact-base", default=".")
+        mode.add_argument("--run-id", default="",
+                          help="restrict the sweep to one run (default: every run "
+                               "discovery reaches)")
+        mode.add_argument("--json", action="store_true")
+        if name != "status":
+            mode.add_argument("--results",
+                              help="JSON file with the fake adapter's scripted "
+                                   "settlements for the rounds a recovery re-enters")
+            mode.add_argument("--max-concurrent-runs", type=int, default=None,
+                              help="bound on the per-sweep pool; the default contains "
+                                   "sweep amplification against the Orca CLI")
+            _add_adapter_selection(mode)
+        if name == "run":
+            mode.add_argument("--interval-seconds", type=float, default=None,
+                              help="sweep cadence (default: the store's own "
+                                   "lease-derived observation window)")
+            mode.add_argument("--max-sweeps", type=int, default=None)
+    recover = sub.add_parser(
+        "recover",
+        help="one-shot recovery of ONE stalled run through the engine's own API; shares "
+             "no state with the watchdog and works with it stopped")
+    recover.add_argument("--run-id", required=True)
+    recover.add_argument("--artifact-base", default=".")
+    recover.add_argument("--results",
+                         help="JSON file with the fake adapter's scripted settlements")
+    recover.add_argument("--actor-id", default="")
+    recover.add_argument("--recursion-limit", type=int, default=None)
+    _add_adapter_selection(recover)
+    recover.add_argument("--json", action="store_true")
+    return parser
+
+
+def _add_adapter_selection(mode: argparse.ArgumentParser) -> None:
+    """CON-5's two compositions, selectable on every verb that can ACT.
+
+    One Supervisor core, two compositions: the standalone/fake one a runtime with no Orca
+    can still drive, and the real Orca one an automatically detected stalled Orca run
+    needs.  Neither is hardwired -- a watchdog that could only ever build ``FakeAdapter``
+    cannot recover a real run at all, and one that could only ever build ``OrcaAdapter``
+    would not be runtime-neutral.  The DEFAULT is the fake composition, so no existing
+    invocation changes meaning.
+    """
+    mode.add_argument("--adapter", choices=ADAPTERS, default=FAKE_ADAPTER,
+                      help="which execution adapter a recovery re-enters with "
+                           f"(default: {FAKE_ADAPTER})")
+    mode.add_argument("--run-owner", default="",
+                      help="terminal handle that owns the existing Orca Run; required by "
+                           "--adapter orca, which adopts a run rather than creating one")
+    mode.add_argument("--project-root", default="",
+                      help="project root the Orca adapter reads its quality profile and "
+                           "agent routing from (default: the working directory)")
+
+
+def _watchdog_wiring(args: argparse.Namespace, *, runner: Any = None,
+                     harness_factory: Any = None) -> dict[str, Any]:
+    """Build the five injected ports for one CLI invocation.
+
+    Every concrete implementation is named HERE, at the wiring boundary, and never inside
+    the supervisor core -- which is the whole of CON-5 and is why the same core serves a
+    standalone runtime.  ``--adapter`` chooses WHICH composition is built; ``runner`` and
+    ``harness_factory`` are the two process boundaries (the ``orca`` CLI and the runtime
+    harness) an integration test replaces to drive this same wiring offline.
+    """
+    from . import recovery_runtime, watchdog_audit
+    from .fake_adapter import FakeAdapter
+    from .runtime_state import FileRuntimeStateStore, SystemLeaseClock
+    from . import pause_store
+    base = Path(args.artifact_base)
+    results = _read_json(args.results, "--results") if getattr(args, "results", "") else []
+    approval_port = _artifact_approval_port(base)
+    adapter_name = getattr(args, "adapter", FAKE_ADAPTER)
+    if adapter_name == ORCA_ADAPTER:
+        # Refused HERE, before discovery lists a single run: an incomplete Orca
+        # composition must not be discovered halfway through a sweep, one run at a time.
+        if results:
+            raise LauncherError(
+                f"{ORCA_ADAPTER_REQUIRES_STATE}: --results is the fake adapter's scripted "
+                "input; --adapter orca scripts nothing")
+        if not getattr(args, "run_owner", ""):
+            raise LauncherError(
+                f"{ORCA_ADAPTER_REQUIRES_STATE}: --adapter orca adopts an existing Run "
+                "and needs --run-owner, the terminal handle that owns it")
+
+    adapters: dict[str, Any] = {}
+    bindings: dict[str, Any] = {}
+
+    def bindings_for(run_id: str) -> Any:
+        """This run's durable ledger and journal.  Adopts nothing and claims nothing."""
+        if run_id not in bindings:
+            record = pause_store.store_for(run_id, artifact_base=base).read(run_id)
+            thread_id = (record or {}).get("thread_id") or run_id
+            bindings[run_id] = (
+                FileRuntimeStateStore(default_runtime_state_path(run_id, thread_id)),
+                pause_store.journal_for(run_id, artifact_base=base))
+        return bindings[run_id]
+
+    def adapter_for(run_id: str) -> Any:
+        if run_id not in adapters:
+            ledger, journal = bindings_for(run_id)
+            if adapter_name == ORCA_ADAPTER:
+                # The REAL runtime, adopting the run that is already stalled.  Built per
+                # run, because the harness a recovery adopts is the stalled run's own.
+                adapter: Any = build_orca_adapter_for_run(
+                    run_id, artifact_base=base, runtime_state=ledger,
+                    run_owner=args.run_owner,
+                    project_root=(Path(args.project_root)
+                                  if getattr(args, "project_root", "") else None),
+                    harness_factory=harness_factory)
+            else:
+                adapter = FakeAdapter(list(results), runtime_state=ledger,
+                                      run_id=run_id, settlement_journal=journal,
+                                      approval_port=approval_port)
+            adapters[run_id] = (adapter, ledger, journal)
+        return adapters[run_id]
+
+    def graph_factory_for(run_id: str) -> Any:
+        adapter, ledger, journal = adapter_for(run_id)
+
+        def factory(saver: Any) -> Any:
+            from .graph import build_graph
+            return build_graph(adapter, checkpointer=saver, runtime_state=ledger,
+                               approval_port=approval_port, journal=journal)
+        return factory
+
+    def capabilities_for(run_id: str) -> Any:
+        """F11's capability authority: the adapter that would EXECUTE the recovery.
+
+        Wired here rather than in the core, so a standalone runtime supplies its own and
+        the Watchdog never has to guess what a runtime can do.
+
+        The Orca composition answers from an adapter built over this run's ledger and
+        journal but bound to NO harness, because ``capabilities()`` is a declaration of
+        what the adapter type and its wiring support and reads no harness at all.  That
+        matters: adopting the Run is what ``OrcaRuntimeHarness.resume_run`` does, and it
+        publishes a Coordinator liveness lease -- so adopting a run merely to ASK what it
+        can do would make the run look alive to the very gate that is about to decide
+        whether it is stalled.  Adoption therefore happens at recovery time, for runs the
+        gate has already cleared, and never during observation.
+        """
+        if adapter_name == ORCA_ADAPTER:
+            from .orca_adapter import OrcaAdapter
+            ledger, journal = bindings_for(run_id)
+            return OrcaAdapter(None, runtime_state=ledger, settlement_journal=journal,
+                               approval_port=approval_port).capabilities()
+        return adapter_for(run_id)[0].capabilities()
+
+    from . import turn_boundary
+    return {
+        "discovery": recovery_runtime.RunDiscovery(base),
+        # The Orca listing authority is the real CLI boundary.  Where no `orca` binary
+        # answers, the read RAISES and the sweep fails closed at R1 -- it never reads
+        # "no dispatch is running" out of silence.
+        "observation": recovery_runtime.RunObservationAdapter(
+            base, runner=runner or turn_boundary._default_runner,
+            capabilities=capabilities_for),
+        "liveness": recovery_runtime.CoordinatorLivenessReader(base),
+        # The gate and the outcome->action table BOTH read this clock: `react` stamps a
+        # backoff deadline on it and a later sweep -- in a later process -- decides
+        # against it whether that deadline has lapsed.  Without one, `watchdog_state`
+        # reads `0.0` for "now" on both sides, so every deadline it wrote stayed in the
+        # future forever and one REFUSED or CONFLICT outcome blocked its identity
+        # permanently.  SC-7 is a BOUNDED retry with backoff, not a stop.
+        "clock": SystemLeaseClock(),
+        # The factory is handed over PER RUN and resolved at request time, so every run
+        # discovery reaches -- not merely a single `--run-id` -- gets the graph for its
+        # own thread, ledger, journal and adapter.  The placeholder that returned `None`
+        # for the default all-runs mode is gone: it could only ever raise inside
+        # `graph.invoke`, and a sweep would have reported that as a run it had acted on.
+        "recovery": recovery_runtime.EngineRecoveryInvocation(
+            artifact_base=base, approval_port=approval_port,
+            graph_factory_for=graph_factory_for,
+            recursion_limit=getattr(args, "recursion_limit", None)),
+        "audit": watchdog_audit.FileWatchdogAudit(base),
+    }
+
+
+def run_watchdog_cli(argv: list[str], *, runner: Any = None,
+                     harness_factory: Any = None) -> int:
+    """The ``watchdog`` and ``recover`` verbs."""
+    from . import ports, recovery_runtime, watchdog_audit, watchdog_supervisor
+    args = build_watchdog_parser().parse_args(argv)
+    base = Path(args.artifact_base)
+    if args.verb == "recover":
+        # AC-9: this path calls the engine API DIRECTLY and imports no watchdog module.
+        try:
+            wiring = _watchdog_wiring(args, runner=runner,
+                                      harness_factory=harness_factory)
+            request = wiring["recovery"].build_request(
+                run_id=args.run_id,
+                recovery_kind=recovery_runtime.RECOVERY_KIND_STALLED_ACTIVE)
+        except LauncherError as exc:
+            print(f"run_workflow: {exc}", file=sys.stderr)
+            return USAGE_EXIT_CODE
+        except ports.RecoveryPreconditionUnavailable as exc:
+            # Named, and reported as a REFUSAL to start rather than as an outcome: no
+            # claim was taken and no effect was attempted.
+            summary = {"run_id": args.run_id, "status": "", "code": exc.code,
+                       "recovery_id": "", "recovery_kind": "",
+                       "effect_performed": False, "head_before": "", "head_after": "",
+                       "detail": exc.detail}
+            print(json.dumps(summary, sort_keys=True, ensure_ascii=False, default=str)
+                  if args.json
+                  else f"run={args.run_id} status=- code={exc.code}")
+            return 1
+        outcome = recovery_runtime.recover_stalled_run(request)
+        summary = {"run_id": args.run_id, "status": outcome.status,
+                   "code": outcome.code, "recovery_id": outcome.recovery_id,
+                   "recovery_kind": outcome.recovery_kind,
+                   "effect_performed": outcome.effect_performed,
+                   "head_before": outcome.head_before, "head_after": outcome.head_after,
+                   "detail": outcome.detail}
+        print(json.dumps(summary, sort_keys=True, ensure_ascii=False, default=str)
+              if args.json
+              else f"run={args.run_id} status={outcome.status} code={outcome.code}")
+        return 0 if outcome.status in (recovery_runtime.RECOVERED,
+                                       recovery_runtime.NO_EFFECT) else 1
+    if args.mode == "status":
+        audit = watchdog_audit.FileWatchdogAudit(base)
+        rows = []
+        for listing in recovery_runtime.RunDiscovery(base).discover():
+            run_id = str(listing["run_id"])
+            if args.run_id and run_id != args.run_id:
+                continue
+            try:
+                folded = audit.fold(run_id)
+            except watchdog_audit.WatchdogAuditError as exc:
+                rows.append({"run_id": run_id, "ledger": "UNREADABLE",
+                             "detail": str(exc)})
+                continue
+            rows.append({"run_id": run_id, "verdict": listing["verdict"],
+                         "identities": {key: dict(value)
+                                        for key, value in folded.items()}})
+        print(json.dumps(rows, sort_keys=True, ensure_ascii=False, default=str)
+              if args.json
+              else "\n".join(f"{row['run_id']} {row.get('verdict', '')} "
+                             f"identities={len(row.get('identities', {}))}"
+                             for row in rows))
+        return 0
+    try:
+        wiring = _watchdog_wiring(args, runner=runner, harness_factory=harness_factory)
+    except LauncherError as exc:
+        print(f"run_workflow: {exc}", file=sys.stderr)
+        return USAGE_EXIT_CODE
+    deps: dict[str, Any] = dict(wiring)
+    if args.max_concurrent_runs:
+        deps["max_concurrent_runs"] = int(args.max_concurrent_runs)
+    if args.run_id:
+        deps["run_ids"] = (args.run_id,)
+    if args.mode == "once":
+        report = watchdog_supervisor.run_once(**deps)
+    else:
+        report = watchdog_supervisor.run_continuous(
+            interval_seconds=args.interval_seconds, max_sweeps=args.max_sweeps, **deps)
+    summary = {"runs_observed": report.runs_observed, "runs_acted": report.runs_acted,
+               "escalations": list(report.escalations),
+               "runs": [vars(row) for row in report.runs]}
+    print(json.dumps(summary, sort_keys=True, ensure_ascii=False, default=str)
+          if args.json
+          else (f"observed={report.runs_observed} acted={report.runs_acted} "
+                f"escalations={len(report.escalations)}"))
+    return report.exit_code
+
+
 def _artifact_approval_port(base: Path) -> Any:
     try:
         from scripts.clarification_protocol import ArtifactHumanApprovalPort
@@ -704,6 +1319,8 @@ def run_cli(argv: list[str] | None = None) -> int:
         return run_pause_cli(raw)
     if raw and raw[0] in TURN_VERBS:
         return run_turn_cli(raw)
+    if raw and raw[0] in WATCHDOG_VERBS:
+        return run_watchdog_cli(raw)
     args = build_parser().parse_args(argv)
     try:
         version = require_runtime()
