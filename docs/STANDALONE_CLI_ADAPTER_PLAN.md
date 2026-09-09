@@ -121,7 +121,7 @@ forward unchanged rather than restated in weaker words.
 | **R7** | **Native PTY build burden** would break the portability posture (`package.json:95`). | Medium | Avoided entirely by the standard-library envelope. Residual: no Windows support (R-M1 below). |
 | **R8** | **Licence and provenance ambiguity** — copying MIT code into a repository with undefined outbound terms (`skills:docs/LICENSE-DECISION.md`). | Medium | Avoided: nothing is copied. AC-37-19 keeps it that way. |
 | **R9** | **Port churn.** Additive methods on the shared port risk breaking both existing adapters and the executor's capability gating. | Medium | AC-37-22: no signature changes; new capability tokens only. No PTY-level port is created. |
-| **R10** | **Version drift in documentation.** The compatibility matrix records 1.4.196; the pinned subject and installed runtime are 1.4.197. | Low | Recorded as an observation, not an edit. Correcting it requires a real integration run. |
+| **R10** | **Version drift in documentation.** The compatibility matrix records 1.4.196; the pinned subject is 1.4.197, and the runtime running on the investigating host was separately observed to be 1.4.197 ([`ORCA_RUNTIME_PRIMITIVES.md`](./ORCA_RUNTIME_PRIMITIVES.md#the-live-runtime-established-separately)). | Low | Recorded as an observation, not an edit. Correcting it requires a real integration run. |
 | **R11** | **Scope creep toward rebuilding Orca headlessly.** Orca's own Node daemon makes it look easy, and it is the first prohibition. | Medium | AC-37-18 and AC-37-24; the exclusion list is a rule, not a preference. |
 
 ### Risks specific to this MVP

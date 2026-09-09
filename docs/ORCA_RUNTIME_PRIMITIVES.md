@@ -29,13 +29,91 @@ codebase to take.
 | Commit | **`5ee4ace516080891731d100f843b074408a9ce0e`** | `git rev-parse HEAD` in the read-only checkout |
 | Declared version | `package.json:3` → `"version": "1.4.197"` | matches the tag |
 | Working tree | clean (`git status --porcelain` empty) | the evidence was not modified |
-| Installed runtime on the investigating host | `orca --version` → `1.4.197` | same version as the pinned source |
 
-Because the installed runtime and the pinned source are the same version, every claim below is a
-claim about the runtime this repository actually talks to, not about a different revision.
+Everything in that table is a fact about the **pinned source**. It says nothing about which
+build is running on the investigating host; that is a separate fact with a separate authority,
+established in [The live runtime, established separately](#the-live-runtime-established-separately)
+below.
 
 The checkout was **read-only throughout**. Every pinned read went through `git -C <checkout>
 show/ls-tree/grep` or a read-only file read; nothing was written, fetched or checked out inside it.
+
+### The live runtime, established separately
+
+The **pinned source version** and the **running application version** are two different facts. They
+are recorded here with two different authorities and are never inferred from one another.
+
+| Fact | Value | Authority |
+| --- | --- | --- |
+| Pinned source version | `v1.4.197` @ `5ee4ace516080891731d100f843b074408a9ce0e` | the git tag, the commit, and `package.json:3` at that commit — the table above |
+| Live runtime version on the investigating host | `1.4.197` | `orca status --json` → `result.runtime.appVersion`, produced by `src/cli/runtime/status.ts:40, 60` at the pinned commit |
+
+**Why `status --json` is the authority and `orca --version` is not.** The two commands read
+different things at this revision:
+
+- `orca --version` is a **disk read of the shipped CLI build's own package metadata**. The fast
+  path at `src/cli/index.ts:63-73` is taken only when `argv.length === 1`, and it calls
+  `readOrcaCliVersion()` (`src/cli/cli-version.ts:5-13`), which `readFileSync`s a sibling
+  `package.json` and returns `null` on any failure. It never contacts the running application, and
+  any second argument falls through to the generic parser, which prints help instead — which is how
+  a help page can be mistaken for a version. It is therefore not relied upon here.
+- `orca status --json` reports `result.runtime.appVersion` obtained **over RPC from the running
+  runtime** (`status.get`, `src/cli/runtime/status.ts:40`), spread into the response at
+  `src/cli/runtime/status.ts:60`.
+
+**What was actually run, and what it returned.** On the investigating host:
+
+```text
+$ /usr/local/bin/orca status --json     # exit 0
+  ok                            = true
+  result.runtime.appVersion     = "1.4.197"
+  result.runtime.reachable      = true
+  result.runtime.state          = "ready"
+```
+
+A redacted copy of that capture is preserved at
+`artifacts/runs/run_a4484a738299/orca_status_observed.json`; the artifact states what was
+removed and why.
+
+**Two traps this evidence deliberately avoids**, both read from the same file. `ok` is *not* a
+health signal — `buildCliStatusResponse` hardcodes `ok: true`
+(`src/cli/runtime/status.ts:91-100`), so even a stopped runtime answers `ok: true`. And
+`appVersion` is a *conditional* spread (`src/cli/runtime/status.ts:60`), absent whenever the RPC
+returned none — the `not_running` / `stale_bootstrap` / `starting` branches
+(`src/cli/runtime/status.ts:19-37, 71-88`), which also set `reachable: false`. So the observation
+above is only accepted because `reachable` is `true` (set only on the successful RPC path,
+`src/cli/runtime/status.ts:54`) *and* `appVersion` is present as a string *and* it equals the
+expected value.
+
+That acceptance rule is not prose. It is enforced by a reproducible check,
+`artifacts/runs/run_a4484a738299/check_runtime_version.py`, which takes the expected version as an
+explicit argument and reports three deliberately distinct outcomes. It **passes** (exit 0) only for
+a document that satisfies every check above. It **rejects the evidence** (exit 1) when a document
+*was* obtained but does not establish the version — help-page text, unparseable or truncated JSON,
+`ok: false`, an unreachable runtime, an absent or non-string `appVersion`, or a mismatched
+`appVersion` — and that includes the canonical case of a CLI that exits non-zero while still
+printing a help page. It reports a distinct **blocked** result (exit 2) — never a pass — when no
+document was obtained at all: an unreadable or absent source, or an empty or whitespace-only
+document from any input source, which covers a launched `orca status --json` that prints nothing on
+stdout whether it exits zero or non-zero. That last boundary is deliberate rather than incidental:
+a runtime that is simply down must be reported as *could not check*, not as *version evidence
+rejected*. A blocked command result carries the child's exit status and, deliberately, **no part
+of the child's stderr**: because `--orca-bin` can launch any executable, that stderr is arbitrary
+text that no finite denylist could make safe to reproduce, and an excerpt that merely *looks*
+scrubbed would invite the trust it cannot earn. The diagnostic therefore reports only facts *about*
+the stderr — whether it was empty, its length in bytes, and a truncated SHA-256 digest that lets two
+runs be compared without disclosing any content.
+
+**The derived observation.** Given both facts and their separate evidence, the pinned source and
+the live runtime on this host **happen to be the same version, 1.4.197**. That equality is an
+observation about this host at this moment, not a property of the pinned revision: it is what makes
+the claims below claims about the runtime this repository actually talks to, and it would have to
+be re-established on any other host.
+
+For completeness: `orca --version` also printed `1.4.197` (exit 0) on this host. That is recorded
+as a corroborating convenience observation only. It is **not** relied upon, because as shown above
+it reads shipped files rather than the running process and is not guaranteed to return a version on
+every installation.
 
 ### Citation convention
 
@@ -46,7 +124,7 @@ contain a `docs/` directory and a `README.md`.
 | --- | --- | --- |
 | `src/…`, `config/…`, `tests/…`, `package.json`, `pnpm-workspace.yaml`, `LICENSE` | the **pinned Orca checkout** | commit `5ee4ace516080891731d100f843b074408a9ce0e` (`v1.4.197`) |
 | `orca:docs/…`, `orca:README.md` | the **pinned Orca checkout**, where the root collides | same |
-| `orca-worker-reviewer-orchestration/…`, `scripts/…` | **this repository** (`orca-skills`) | branch working tree |
+| `orca-worker-reviewer-orchestration/…`, `scripts/…`, `artifacts/…` | **this repository** (`orca-skills`) | branch working tree |
 | `skills:docs/…` | **this repository**, where the root collides | branch working tree |
 
 A citation is a repo-relative path plus a line or line range. A bare `docs/…` or `README.md`
@@ -91,17 +169,20 @@ to "verified" by plausibility. The surviving unknowns are listed in
 
 `skills:docs/COMPATIBILITY.md` records the row *"Real Orca runtime with fake agents | Orca 1.4.196 |
 VERIFIED for the current head as a single point observation, compatibility-gated by the opt-in
-Step 4 integration suite."* The subject pinned here and the runtime installed on the investigating
-host are both **1.4.197**.
+Step 4 integration suite."* The subject pinned here is **1.4.197**, and the runtime running on the
+investigating host was separately observed to be **1.4.197** — see
+[The live runtime, established separately](#the-live-runtime-established-separately) for each
+side's evidence.
 
 That document's own governing rule is quoted here because it decides what may be done about the
 drift: *"Every observation below is a point observation, never a continuous supported range, and an
 observation is bound to the repository revision that produced it."*
 
-**No 1.4.197 integration suite was run in this ticket.** `orca --version` establishes a *version*
-fact, not a *verification* fact. Editing a verification matrix on the strength of a version string
-would assert a verification nobody performed, so `skills:docs/COMPATIBILITY.md` is **not modified**
-by this work. Updating that matrix is a separate act that requires a real run.
+**No 1.4.197 integration suite was run in this ticket.** A version observation — even the
+machine-readable `orca status --json` → `result.runtime.appVersion` one above — establishes a
+*version* fact, not a *verification* fact. Editing a verification matrix on the strength of a
+version string would assert a verification nobody performed, so `skills:docs/COMPATIBILITY.md` is
+**not modified** by this work. Updating that matrix is a separate act that requires a real run.
 
 ---
 
