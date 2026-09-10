@@ -222,11 +222,22 @@ class AccountDispatchTests(_Base):
                                      "'irrelevant' at every call site")
 
     def test_an_unobserved_dispatch_defaults_to_maximal_ignorance(self) -> None:
-        """A dispatch nobody has observed is not a dispatch that is fine."""
+        """A dispatch nobody has observed is not a dispatch that is fine.
+
+        The default is now stated in the PAUSE AUTHORITY's own vocabulary (external review
+        #5).  It used to read `settlement="unknown"` / `process_liveness="unverifiable"`,
+        two members `pause_policy` does not accept -- so this row could not be validated
+        AND `executor._settlement_row`'s `settlement == "not_settled"` recovery branch was
+        never entered for it.  `not_settled` and `disputed` say exactly the same thing about
+        what is known, in words the authority can act on: neither promotes anything, and
+        `already exited`/`live`/`settled` remain unreachable from ignorance.
+        """
         row = self.adapter.account_dispatch("intent-never")
-        self.assertEqual(row["settlement"], "unknown")
-        self.assertEqual(row["process_liveness"], "unverifiable")
+        self.assertEqual(row["settlement"], "not_settled")
+        self.assertEqual(row["process_liveness"], "disputed")
         self.assertEqual(row["cleanup_authority"], "unknown")
+        self.assertNotIn(row["process_liveness"], ("live", "already exited"),
+                         "ignorance may never be reported as a known liveness")
 
 
 # =====================================================================================
@@ -382,19 +393,33 @@ class BlockingStartContractTests(unittest.TestCase):
         from scripts.deterministic_workflow.orca_adapter import OrcaAdapter
         from scripts.deterministic_workflow.standalone_adapter import StandaloneAdapter
         from scripts.deterministic_workflow.standalone_runtime import StandaloneSession
-        for label, function in (("orca", OrcaAdapter.start),
-                                ("fake", FakeAdapter.start),
-                                ("standalone", StandaloneSession.run_dispatch)):
+        # The standalone start path is `run_dispatch` -> `_complete` -> `_settle`: the two
+        # exits of `run_dispatch` (the two delivery modes) both hand over to `_complete`,
+        # which awaits completion and settles a SUCCESS and a TYPED FAILURE alike.  The
+        # sources are read together so the property is "this path settles", not "this one
+        # function contains the call".
+        for label, functions in (("orca", (OrcaAdapter.start,)),
+                                 ("fake", (FakeAdapter.start,)),
+                                 ("standalone", (StandaloneSession.run_dispatch,
+                                                 StandaloneSession._complete))):
             with self.subTest(adapter=label):
-                tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
-                settles = [n for n in ast.walk(tree)
-                           if isinstance(n, ast.Call)
-                           and isinstance(n.func, ast.Attribute)
-                           and n.func.attr in ("settle", "_settle")]
+                settles = []
+                for function in functions:
+                    tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
+                    settles += [n for n in ast.walk(tree)
+                                if isinstance(n, ast.Call)
+                                and isinstance(n.func, ast.Attribute)
+                                and n.func.attr in ("settle", "_settle")]
                 self.assertTrue(
                     settles,
                     f"{label}'s start path never settles, so the engine's immediate "
                     "settlement read would find nothing")
+        # ... and `run_dispatch` really does reach `_complete` on BOTH of its exits, so the
+        # split above cannot hide a mode that returns without settling.
+        dispatch_source = inspect.getsource(StandaloneSession.run_dispatch)
+        self.assertEqual(
+            dispatch_source.count("self._complete("), 2,
+            "run_dispatch has an exit that does not reach the settling path")
         # And the port method really is the blocking one, not the spawn-only one.
         self.assertIn("run_dispatch", inspect.getsource(StandaloneAdapter.start))
         self.assertIn("session.start", inspect.getsource(StandaloneAdapter.spawn_only))

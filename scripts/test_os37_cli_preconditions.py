@@ -319,13 +319,19 @@ class PreflightFailClosedTests(unittest.TestCase):
 
     def test_g1_no_credential_refuses_before_any_spawn(self) -> None:
         """A login prompt is never READY.  Preflight refuses first, with a named reason."""
-        prof = profile(auth_secret_ref={"OS37_STUB_TOKEN": "OS37_STUB_TOKEN_SOURCE"})
+        # An ADMITTED credential name (external review #7's closed contract).  It used to be
+        # a fictional `OS37_STUB_TOKEN`, which the contract now refuses at construction --
+        # correctly, because a name the child-environment allowlist does not carry produces
+        # a profile that can only fail at spawn.  The assertion is unchanged: a declared
+        # credential that does not resolve is `auth_absent`, before anything is spawned.
+        prof = profile(auth_secret_ref={"ANTHROPIC_API_KEY": "OS37_STUB_TOKEN_SOURCE"})
         env = child_env(prof)          # include_secrets=False -> the name is absent
         outcome = preflight.check_auth(prof, env)
         self.assertEqual(outcome["verdict"], "fail")
         self.assertEqual(outcome["reason"], "auth_absent")
-        self.assertEqual(outcome["evidence"]["missing_env_names"], ["OS37_STUB_TOKEN"])
-        # Only NAMES are reported.
+        self.assertEqual(outcome["evidence"]["missing_env_names"], ["ANTHROPIC_API_KEY"])
+        # Only NAMES are reported.  The REFERENCE -- which names a real secret location --
+        # never appears.
         self.assertNotIn("OS37_STUB_TOKEN_SOURCE", str(outcome))
 
     def test_g1_an_interactive_login_probe_is_a_failure_never_a_pass(self) -> None:

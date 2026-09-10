@@ -164,8 +164,15 @@ def _r10_timeouts():
     configuration rather than code (`docs/ORCA_RUNTIME_PRIMITIVES.md` C11).
     """
     from scripts.deterministic_workflow.standalone_profile import Timeouts
-    return Timeouts(readiness_timeout_ms=900_000, preflight_timeout_ms=120_000,
+    # `readiness_timeout_ms` is back to a READINESS bound.  It was 900_000 because
+    # `await_completion` shared this field (external review #4), so the only way to let a
+    # multi-minute turn finish was to give a process fifteen minutes to become READY --
+    # which silently loosened the readiness gate as the price of a working completion gate.
+    # Completion now has `completion_timeout_ms` and each question is bounded by its own
+    # answer.
+    return Timeouts(readiness_timeout_ms=120_000, preflight_timeout_ms=120_000,
                     delivery_verify_timeout_ms=120_000,
+                    completion_timeout_ms=1_800_000,
                     graceful_force_timeout_ms=15_000, physical_exit_timeout_ms=20_000)
 
 
@@ -198,8 +205,8 @@ def _bin_dirs(*binaries: str) -> tuple[str, ...]:
 
 def claude_profile(worktree: str, **overrides):
     from scripts.deterministic_workflow.standalone_profile import (
-        CompletionSelector, DeliveryProofSelector, ReadinessSelector, StandaloneProfile,
-        Timeouts)
+        AuthProbe, CompletionSelector, DeliveryProofSelector, ReadinessSelector,
+        ResultBodySelector, StandaloneProfile, Timeouts)
     fields = dict(
         driver="claude", binary="claude", supported_range=((1, 0, 0), (99, 0, 0)),
         timeouts=R10_TIMEOUTS,
@@ -216,6 +223,17 @@ def claude_profile(worktree: str, **overrides):
                                                error_field="is_error",
                                                success_field="terminal_reason",
                                                success_values=("completed",)),),
+        # D4.0 M-14: the final assistant text is the `result` record's own `result` field.
+        # Declaring it is what lets the driver hand the SHARED settlement parser a BODY
+        # instead of the whole JSON event stream (external review #3).
+        result_body_records=(ResultBodySelector(channel="structured",
+                                                record_type="result",
+                                                body_field="result"),),
+        # D4.0 M-13: `claude auth status` is bounded, non-interactive and exits 0 when the
+        # CLI holds a usable session.  Declared here rather than injected into
+        # `StandaloneSession.start` by this harness, which is external review #6: the
+        # injection meant the launcher -> adapter -> session path was never exercised.
+        auth_probe=AuthProbe(args=("auth", "status")),
         auth_markers=(("error", "authentication_failed"),
                       ("is_api_error_message", "True"),
                       ("terminal_reason", "api_error")))
@@ -225,8 +243,8 @@ def claude_profile(worktree: str, **overrides):
 
 def codex_profile(worktree: str, codex_home: str, **overrides):
     from scripts.deterministic_workflow.standalone_profile import (
-        CompletionSelector, DeliveryProofSelector, ReadinessSelector, StandaloneProfile,
-        Timeouts)
+        AuthProbe, CompletionSelector, DeliveryProofSelector, ReadinessSelector,
+        ResultBodySelector, StandaloneProfile, Timeouts)
     fields = dict(
         driver="codex", binary="codex", supported_range=((0, 1, 0), (99, 0, 0)),
         timeouts=R10_TIMEOUTS,
@@ -248,6 +266,15 @@ def codex_profile(worktree: str, codex_home: str, **overrides):
                                                record_type="turn.completed"),),
         completion_records=(CompletionSelector(channel="structured",
                                                record_type="turn.completed"),),
+        # D4.0 M-8: the final assistant text arrives as an `item.completed` whose item type
+        # is `agent_message`; `-o` carries the same body as a second source, which
+        # `_Driver.result_body` consults after the selector.
+        result_body_records=(ResultBodySelector(channel="structured",
+                                                record_type="item.completed",
+                                                item_type="agent_message",
+                                                body_field="item.text"),),
+        # D4.0 M-13: `codex login status` is the measured bounded, non-interactive probe.
+        auth_probe=AuthProbe(args=("login", "status")),
         auth_markers=(("type", "turn.failed"),))
     fields.update(overrides)
     return StandaloneProfile(**fields)
@@ -298,14 +325,13 @@ def dispatch(*, cli: str, role: str, step: int, prompt: str, worktree: str,
                               "intent_id": intent_id,
                               "prompt_digest": hashlib.sha256(prompt.encode()).hexdigest(),
                               "started_at": _now()}
-    # M-13: BOTH installed CLIs offer a bounded, non-interactive credential probe, and
-    # preflight uses the real one -- `unknown is not pass`, so leaving it undeclared would
-    # refuse every run at `auth_probe_unreadable`.
-    auth_probe = ([profile.binary, "auth", "status"] if cli == "claude"
-                  else [profile.binary, "login", "status"])
+    # M-13's probe is DECLARED BY THE PROFILE now, not injected here.  This harness used to
+    # pass `auth_probe_argv` straight into `StandaloneSession.start`, below the production
+    # entry point -- which is external review #6 exactly: the evidence it produced said
+    # nothing about whether `launcher -> adapter -> session` can authenticate an existing
+    # OAuth session, because that path never carried the probe at all.
     try:
-        settled = session.run_dispatch(lease_token=claim["lease_token"], payload=prompt,
-                                       auth_probe_argv=auth_probe)
+        settled = session.run_dispatch(lease_token=claim["lease_token"], payload=prompt)
         record["outcome"] = "settled"
         record["settled"] = {k: v for k, v in settled.items() if k != "receipt"}
     except StandaloneDispatchFailed as failure:
@@ -652,8 +678,13 @@ def main(argv: list[str] | None = None) -> int:
     """Run the matrix and write the evidence.  Never prints or returns a verdict it chose."""
     import argparse
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--out", default=str(
-        REPO / "artifacts" / "runs" / "run_54d90086bd75" / "evidence" / "r10_real_agent"))
+    # REQUIRED, with no default (external review #1).  It used to default into
+    # `artifacts/runs/run_54d90086bd75/evidence/r10_real_agent` -- one particular untracked
+    # run's directory -- so a later invocation silently overwrote another run's evidence and
+    # a clean checkout had nowhere for this to mean anything.  Evidence about a real agent
+    # run belongs to THAT run, and the operator names it.
+    parser.add_argument("--out", required=True,
+                        help="the directory this run's real-agent evidence is written to")
     parser.add_argument("--repeats", type=int, default=3,
                         help="R-3: an agent verdict is a distribution, not an event")
     parser.add_argument("--clis", default="claude,codex")

@@ -1004,9 +1004,10 @@ class DeliveryIntentTests(unittest.TestCase):
         """
         self.assertNotIn("CLAIMED", journal_mod.RECORD_KINDS)
         row = self.journal.append_delivery_intent(self._intent())
-        self.assertEqual(row["axes"]["settlement"], "unknown")
-        self.assertEqual(row["axes"]["process_liveness"], "unverifiable",
-                         "the process does not exist yet, so nothing about it is verifiable")
+        self.assertEqual(row["axes"]["settlement"], "not_settled")
+        self.assertEqual(row["axes"]["process_liveness"], "disputed",
+                         "the process does not exist yet, so no authority establishes its "
+                         "liveness; `disputed` is the shared vocabulary's word for that")
         self.assertEqual(row["axes"]["cleanup_authority"], "unknown")
         self.assertEqual(row["outcome"], "",
                          "a delivery intent settles nothing and outcomes nothing")

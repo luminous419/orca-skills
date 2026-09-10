@@ -11,14 +11,36 @@
 SESSION_ID="${OS37_STUB_SESSION_ID:-}"
 WANT_VERSION=0
 WANT_HELP=0
+SUBCOMMAND=""
+LAST_POSITIONAL=""
+FIRST_POSITIONAL=1
 while [ $# -gt 0 ]; do
   case "$1" in
     --session-id) SESSION_ID="$2"; shift 2 ;;
     --version) WANT_VERSION=1; shift ;;
     --help) WANT_HELP=1; shift ;;
-    *) shift ;;
+    -*) shift ;;
+    *) if [ "$FIRST_POSITIONAL" = "1" ]; then SUBCOMMAND="$1"; FIRST_POSITIONAL=0; fi
+       LAST_POSITIONAL="$1"
+       shift ;;
   esac
 done
+
+# The CREDENTIAL PROBE, answered WHATEVER the mode is -- exactly as a real CLI answers
+# `claude auth status` / `codex login status` whatever else it was asked to do.  Keeping it
+# outside the mode table is what lets `OS37_STUB_MODE` describe the AGENT TURN while a
+# profile-declared auth probe still gets a real, bounded, non-interactive answer through
+# the production preflight path.  `OS37_STUB_AUTH` chooses the answer so the refusal legs
+# stay drivable.
+case "$SUBCOMMAND" in
+  auth|login)
+    case "${OS37_STUB_AUTH:-ok}" in
+      ok)          echo '{"loggedIn":true}'; exit 0 ;;
+      absent)      echo "You are not logged in."; exit 1 ;;
+      interactive) echo "Please log in to continue."; sleep 30; exit 0 ;;
+      *)           echo "unknown OS37_STUB_AUTH"; exit 64 ;;
+    esac ;;
+esac
 
 # A real CLI answers --version and --help WHATEVER else it is doing, and preflight relies on
 # that: `check_version` and the flag check run the same binary under the same child env, so a
@@ -79,7 +101,13 @@ case "${OS37_STUB_MODE:-ready}" in
                      printf '{"type":"system","session_id":"%s"}\n' "$SESSION_ID"
                      IFS= read -r PROMPT || PROMPT=""
                      printf '{"type":"message_start"}\n'
-                     printf '{"type":"result","subtype":"success"}\n'
+                     # `is_error` is EMITTED, and emitted false, because the profile
+                     # declares it as the error field and the real CLI always carries it.
+                     # `CompletionSelector`'s predicate treats a DECLARED-but-ABSENT error
+                     # field as unknown rather than as false, which is the fail-closed
+                     # direction; a fixture that omitted it was quietly relying on the old
+                     # behaviour where the record's mere existence meant success.
+                     printf '{"type":"result","subtype":"success","is_error":false,"result":"stub turn"}\n'
                      case "$PROMPT" in
                        *REVIEWER*) printf 'RESULT: PASS\n' ;;
                        *)          printf 'STATUS: COMPLETE\n' ;;
@@ -122,6 +150,33 @@ case "${OS37_STUB_MODE:-ready}" in
                      printf '{"type":"result","subtype":"success"}\n'
                      exit "${OS37_STUB_EXIT_CODE:-0}" ;;
   complete-codex)    printf '{"type":"turn.completed","usage":{"input_tokens":1}}\n'
+                     exit "${OS37_STUB_EXIT_CODE:-0}" ;;
+  replay-stream)     # Replay a RECORDED CLI stream byte-for-byte, then exit with a chosen
+                     # code.  The recordings under `scripts/fixtures/os37/streams/` are real
+                     # captured output from the two installed CLIs (D4.0 M-8, M-14, M-15),
+                     # so a dispatch driven through this mode exercises the runtime against
+                     # the bytes a real CLI actually produced -- including the CRLF line
+                     # endings a pty in canonical mode introduces -- rather than against a
+                     # hand-written idealisation of them.  `OS37_STUB_EXIT_CODE` carries the
+                     # measured rc that accompanied the capture.
+                     # The PREFLIGHT REHEARSAL is a different turn from the dispatch, and
+                     # a real CLI answers it differently: D6.1 spawns the same argv with a
+                     # trivial no-op prompt to prove the readiness selector fires, and only
+                     # then is the real prompt dispatched.  A profile whose rehearsal
+                     # succeeds and whose real turn then fails authentication is the exact
+                     # shape of a token that is present at preflight and rejected by the
+                     # API -- which is what D4.0 M-2 measured -- so the fixture can replay
+                     # one recording for the rehearsal and another for the turn.
+                     if [ -n "${OS37_STUB_REHEARSAL_STREAM:-}" ] \
+                        && [ "$LAST_POSITIONAL" = "${OS37_STUB_REHEARSAL_PROMPT:-Reply with exactly: OK}" ]; then
+                       cat "${OS37_STUB_REHEARSAL_STREAM}"
+                       exit "${OS37_STUB_REHEARSAL_EXIT_CODE:-0}"
+                     fi
+                     if [ -z "${OS37_STUB_STREAM:-}" ] || [ ! -f "${OS37_STUB_STREAM}" ]; then
+                       echo "replay-stream needs OS37_STUB_STREAM to name a readable file" >&2
+                       exit 64
+                     fi
+                     cat "${OS37_STUB_STREAM}"
                      exit "${OS37_STUB_EXIT_CODE:-0}" ;;
   exit-code)         exit "${OS37_STUB_EXIT_CODE:-0}" ;;
   *)                 echo "unknown OS37_STUB_MODE"; exit 64 ;;

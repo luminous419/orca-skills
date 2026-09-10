@@ -31,7 +31,9 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
-from .standalone_profile import ProfileError, StandaloneProfile
+from .standalone_profile import (ALLOWED_CONFIG_ROOT_NAMES,
+                                 ALLOWED_CREDENTIAL_NAMES, ProfileError,
+                                 StandaloneProfile)
 
 # ---- Tier A: inherited verbatim, and these only ----------------------------------------
 # ABSENT IN THE PARENT MEANS ABSENT IN THE CHILD.  None of these is ever defaulted to a
@@ -61,10 +63,23 @@ FORBIDDEN_CHILD_ENV_PREFIXES = (
     "CLAUDE", "CLAUDECODE", "CODEX", "ORCA_", "OPENCODE", "ANTHROPIC_",
     "AI_AGENT", "ECC_", "TERM_PROGRAM", "DISABLE_AUTOUPDATER",
 )
-#: The three names that legitimately survive.  `ANTHROPIC_API_KEY` and `CODEX_HOME` are
-#: Tier C -- the credential and the isolated config root the driver actually needs -- and
-#: the spawn token is this repository's own diagnostic marker.
-ALLOWED_EXCEPTIONS = frozenset({"ANTHROPIC_API_KEY", "CODEX_HOME", SPAWN_TOKEN_ENV})
+#: The names that legitimately survive the prefix sweep.  DERIVED from the profile module's
+#: closed credential contract rather than restated here (external review #7): there is one
+#: list of admitted credential names, `standalone_profile` refuses a profile that declares
+#: any other, and this allowlist is the same set plus the non-secret per-driver config roots
+#: and this repository's own diagnostic spawn-token marker.
+#:
+#: Deriving it is the point.  The literal set used to be `{ANTHROPIC_API_KEY, CODEX_HOME,
+#: <spawn token>}` while the forbidden prefixes included the whole of `CLAUDE`, so a profile
+#: declaring the CLI's own documented `CLAUDE_CODE_OAUTH_TOKEN` was accepted at construction
+#: and then refused at spawn as a session LEAK.  Two lists, one of which nobody updated.
+#:
+#: What is NOT admitted stays exactly as dangerous as it was: `CLAUDE_CODE_MESSAGING_TOKEN`,
+#: `CLAUDE_CODE_MESSAGING_SOCKET`, `ORCA_*`, `ORCA_AGENT_HOOK_TOKEN` and every other
+#: unenumerated `CLAUDE*` name are still absent by construction and still make
+#: `assert_clean` RAISE.
+ALLOWED_EXCEPTIONS = (ALLOWED_CREDENTIAL_NAMES | ALLOWED_CONFIG_ROOT_NAMES
+                      | frozenset({SPAWN_TOKEN_ENV}))
 
 #: Never set at all.  Enumerated separately from the prefix sweep so the reason is legible.
 NEVER_SET = ("TERM_PROGRAM", "TERM_PROGRAM_VERSION")

@@ -49,14 +49,16 @@ other's condition, which is what makes running both of them evidence.
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import os
 import re
 import subprocess
 import sys
 import unittest
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
+from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 REQUIREMENTS = REPO_ROOT / "requirements-langgraph.txt"
@@ -231,6 +233,179 @@ def load_tolerated_alternatives(
                 f"expected one of {sorted(CONDITIONS)}")
         alternatives.setdefault(test_id, []).append((condition, reason))
     return alternatives
+
+
+# ---- OS-37 external review #12: the manifest is bound to the DECLARED TEST -------------
+# The anti-drift check used to accept "this module contains the reason string somewhere AND
+# this module contains a `skipUnless(` or `skipIf(` somewhere". Both halves are module-wide,
+# so an entry could name `Foo.test_bar` while the reason lived in an unrelated docstring and
+# the decorator guarded an unrelated class -- manifest and gate drifted apart with the check
+# still green. What follows resolves the guards that actually apply to ONE test id, so an
+# entry can only pass by naming a test that really is guarded with that reason.
+#
+# It reads the source with `ast` rather than importing the module: importing would execute
+# module-level gates (and, for the live suites, probe the host), and the question here is a
+# static one about what the source declares.
+_SKIP_CALLS = ("skipUnless", "skipIf")
+
+#: One resolved guard: the text to show an operator, and the matcher it binds with.
+SkipGuard = tuple[str, "re.Pattern[str]"]
+
+
+def _exact(value: str) -> SkipGuard:
+    return value, re.compile("^" + re.escape(value) + "$", re.DOTALL)
+
+
+def _joined_str_guard(node: Any) -> SkipGuard | None:
+    """An f-string reason as an anchored pattern, or ``None``.
+
+    `test_review_isolation`'s ``NEEDS_SANDBOX`` gate is spelled
+    ``f"{review_isolation.SANDBOX_EXEC} is not present on this host"``, so its reason has no
+    literal form in the source at all. Rather than resolve it by importing the module -- an
+    import that would run that module's own gates -- each interpolation becomes ``.+`` and
+    every literal segment is matched EXACTLY, in order, anchored at both ends. A hole may
+    not be empty, so the literal text still has to be right.
+    """
+    if not isinstance(node, ast.JoinedStr):
+        return None
+    display: list[str] = []
+    parts: list[str] = []
+    for value in node.values:
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            display.append(value.value)
+            parts.append(re.escape(value.value))
+        elif isinstance(value, ast.FormattedValue):
+            display.append("{...}")
+            parts.append(".+")
+        else:                                    # pragma: no cover - defensive
+            return None
+    return "".join(display), re.compile("^" + "".join(parts) + "$", re.DOTALL)
+
+
+def _guard_for(node: Any, constants: Mapping[str, str]) -> SkipGuard | None:
+    """The guard a decorator ARGUMENT denotes: a literal, a module constant, or an f-string."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return _exact(node.value)
+    if isinstance(node, ast.Name) and node.id in constants:
+        return _exact(constants[node.id])
+    if isinstance(node, ast.Attribute) and node.attr in constants:
+        return _exact(constants[node.attr])
+    return _joined_str_guard(node)
+
+
+def _skip_call_guard(node: Any, constants: Mapping[str, str]) -> SkipGuard | None:
+    """``unittest.skipUnless(cond, REASON)`` / ``skipIf(...)`` -> its guard, else ``None``."""
+    if not isinstance(node, ast.Call):
+        return None
+    name = node.func.attr if isinstance(node.func, ast.Attribute) else (
+        node.func.id if isinstance(node.func, ast.Name) else "")
+    if name not in _SKIP_CALLS or len(node.args) < 2:
+        return None
+    return _guard_for(node.args[1], constants)
+
+
+def _module_skip_constants(tree: Any) -> tuple[dict[str, str], dict[str, SkipGuard]]:
+    """``({NAME: string}, {ALIAS: guard})`` for one module.
+
+    The second map is what makes ``@DARWIN_ONLY`` resolvable: `test_review_isolation` builds
+    its gates as module-level decorator objects, so the reason never appears at the
+    decorated class at all.
+    """
+    constants: dict[str, str] = {}
+    for node in tree.body:
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and isinstance(node.value, ast.Constant)
+                and isinstance(node.value.value, str)):
+            constants[node.targets[0].id] = node.value.value
+    aliases: dict[str, SkipGuard] = {}
+    for node in tree.body:
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)):
+            guard = _skip_call_guard(node.value, constants)
+            if guard is not None:
+                aliases[node.targets[0].id] = guard
+    return constants, aliases
+
+
+def _decorator_guards(decorators: Sequence[Any], constants: Mapping[str, str],
+                      aliases: Mapping[str, SkipGuard]) -> list[SkipGuard]:
+    found: list[SkipGuard] = []
+    for decorator in decorators:
+        guard = _skip_call_guard(decorator, constants)
+        if guard is not None:
+            found.append(guard)
+        elif isinstance(decorator, ast.Name) and decorator.id in aliases:
+            found.append(aliases[decorator.id])
+        elif isinstance(decorator, ast.Attribute) and decorator.attr in aliases:
+            found.append(aliases[decorator.attr])
+    return found
+
+
+def _skip_test_guards(body: Sequence[Any], constants: Mapping[str, str]) -> list[SkipGuard]:
+    """Every reason a ``self.skipTest(...)`` inside ``body`` can raise."""
+    found: list[SkipGuard] = []
+    for node in body:
+        for child in ast.walk(node):
+            if not isinstance(child, ast.Call) or not isinstance(child.func, ast.Attribute):
+                continue
+            if child.func.attr != "skipTest" or not child.args:
+                continue
+            guard = _guard_for(child.args[0], constants)
+            if guard is not None:
+                found.append(guard)
+    return found
+
+
+def skip_guards_for(module_path: Path, class_name: str, method_name: str) -> list[SkipGuard]:
+    """Every skip a single test id can raise, resolved from the source alone.
+
+    The union of four sources, and no fifth:
+
+    1. a ``skipUnless``/``skipIf`` decorator on the METHOD;
+    2. the same on the METHOD'S OWN CLASS, including a module-level decorator alias;
+    3. a ``self.skipTest("...")`` inside the method;
+    4. a ``self.skipTest("...")`` inside the class's ``setUp`` or a NON-test helper of the
+       same class -- `test_orca_runtime` and the OS-37 live suites both gate through one,
+       and a gate is no less real for having a name.
+
+    Another TEST'S ``skipTest`` is never a guard on this one, which is exactly the binding
+    the module-wide check lacked. A class the module does not define yields ``[]``, so a
+    manifest entry naming a test that no longer exists fails rather than passing vacuously.
+    """
+    tree = ast.parse(module_path.read_text(encoding="utf-8"), filename=str(module_path))
+    constants, aliases = _module_skip_constants(tree)
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef) or node.name != class_name:
+            continue
+        guards = _decorator_guards(node.decorator_list, constants, aliases)
+        method = next((item for item in node.body
+                       if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+                       and item.name == method_name), None)
+        if method is None:
+            # FAIL-CLOSED, and this is the binding's whole point: a manifest entry naming a
+            # method this class does not define must not inherit its class's gate and pass.
+            # A renamed or deleted test is exactly the drift this check exists to catch.
+            return []
+        guards += _decorator_guards(method.decorator_list, constants, aliases)
+        guards += _skip_test_guards(method.body, constants)
+        for item in node.body:
+            if (isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and item.name != method_name and not item.name.startswith("test_")):
+                guards += _skip_test_guards(item.body, constants)
+        return guards
+    return []
+
+
+def skip_guard_binds(test_id: str, reason: str, *, root: Path | None = None) -> bool:
+    """Whether the DECLARED test really is guarded by a skip carrying ``reason``."""
+    module, _, rest = test_id.partition(".")
+    class_name, _, method_name = rest.partition(".")
+    path = (root or REPO_ROOT / "scripts") / f"{module}.py"
+    if not path.exists():
+        return False
+    return any(pattern.match(reason)
+               for _display, pattern in skip_guards_for(path, class_name, method_name))
 
 
 def expected_tolerated_skips(

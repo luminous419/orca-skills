@@ -638,8 +638,35 @@ class DrainIsATeardownObligationTests(unittest.TestCase):
         while time.time() < deadline:
             pass
 
+    #: Whether THIS platform is known to wedge an exiting session leader whose pty master
+    #: nobody reads.  It is a MEASUREMENT, not a portable law, and it is written down here
+    #: so the assertion below can be honest about which half of it is which.
+    #:
+    #: `darwin`: MEASURED on this host -- the leader stays unreapable until the master is
+    #: drained, which is the whole reason `standalone_pty.drain` exists.
+    #: everything else: **UNMEASURED**.  The original form of this test asserted the darwin
+    #: wedge unconditionally, so on a Linux CI runner -- where a `SIGKILL`ed leader may
+    #: become reapable with no drain at all -- it failed for a reason that says nothing
+    #: about this repository.  Claiming the wedge for a platform nobody measured would be
+    #: promoting an unverified environment, so the unmeasured arm asserts the PORTABLE half
+    #: of the same obligation instead (below), and never the unmeasured half.
+    WEDGE_MEASURED_PLATFORMS = ("darwin",)
+
     def test_without_draining_the_exiting_child_is_not_reapable(self) -> None:
-        """The NEGATIVE half: this is the failure mode, reproduced."""
+        """The NEGATIVE half, stated per platform rather than per lucky host.
+
+        Two assertions, and BOTH are real work:
+
+        * on a platform where the wedge is MEASURED, the leader must still be unreapable
+          with no drain -- byte-for-byte the original assertion, at full strength;
+        * on every platform, draining afterwards must recover REAL BYTES from the master.
+          That is the portable statement of the same obligation and it is what
+          `StandaloneSession._prove_teardown`'s "Drain BEFORE waiting" depends on: the
+          child wrote output nobody has read, so a teardown path that does not drain is
+          proving an exit against an unread pipe whatever the kernel does with the leader.
+
+        Neither assertion can be satisfied by the other's fix.
+        """
         session = self._spawn()
         try:
             self._settle(session)
@@ -648,11 +675,17 @@ class DrainIsATeardownObligationTests(unittest.TestCase):
             # The AGENT is a grandchild and was never this process's to reap; the pty
             # SESSION LEADER is, and it is the process the wedge happens to.
             reaped = os.waitpid(session["leader_pid"], os.WNOHANG)
-            self.assertEqual(
-                reaped, (0, 0),
-                "the child became reapable with no drain at all.  If this ever starts "
-                "passing the platform behaviour changed, and standalone_pty.drain's "
-                "rationale must be re-measured rather than deleted")
+            if sys.platform in self.WEDGE_MEASURED_PLATFORMS:
+                self.assertEqual(
+                    reaped, (0, 0),
+                    "the child became reapable with no drain at all.  If this ever starts "
+                    "passing the platform behaviour changed, and standalone_pty.drain's "
+                    "rationale must be re-measured rather than deleted")
+            drained = pty_supervisor.drain(session["master_fd"])
+            self.assertGreater(
+                drained, 0,
+                "nothing was waiting on the pty master, so this run proves nothing about "
+                "the drain obligation on either platform")
         finally:
             pty_supervisor.drain(session["master_fd"])
             try:

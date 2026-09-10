@@ -331,8 +331,9 @@ class ClosedVocabularyTests(unittest.TestCase):
         for axis, members in OWNERSHIP_AXIS_VOCABULARIES.items():
             for member in members:
                 with self.subTest(axis=axis, member=member):
-                    axes = {"settlement": "unknown", "worker_resource": "unsupervised",
-                            "process_liveness": "unverifiable",
+                    axes = {"settlement": "not_settled",
+                            "worker_resource": "unsupervised",
+                            "process_liveness": "disputed",
                             "cleanup_authority": "unknown"}
                     axes[axis] = member
                     record = lifecycle.make_state_record(
@@ -380,9 +381,9 @@ class ClosedVocabularyTests(unittest.TestCase):
     def test_source_vocabulary_is_required_by_normalize(self) -> None:
         with self.assertRaises(lifecycle.LifecycleError):
             lifecycle.normalize(state="RUNNING", source_vocabulary={}, evidence={},
-                                axes={"settlement": "unknown",
+                                axes={"settlement": "not_settled",
                                       "worker_resource": "unsupervised",
-                                      "process_liveness": "unverifiable",
+                                      "process_liveness": "disputed",
                                       "cleanup_authority": "unknown"}, at="t")
 
     def test_host_scope_never_defaults_to_local(self) -> None:

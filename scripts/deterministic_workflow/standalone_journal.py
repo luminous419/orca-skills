@@ -137,8 +137,8 @@ def make_record(**fields: Any) -> JournalRecord:
     """
     record: dict[str, Any] = {key: "" for key in _RECORD_KEYS}
     record["seq"] = 0
-    record["axes"] = {"settlement": "unknown", "worker_resource": "unsupervised",
-                      "process_liveness": "unverifiable", "cleanup_authority": "unknown"}
+    record["axes"] = {"settlement": "not_settled", "worker_resource": "unsupervised",
+                      "process_liveness": "disputed", "cleanup_authority": "unknown"}
     record["source_vocabulary"] = {}
     unknown = set(fields) - set(_RECORD_KEYS)
     if unknown:
@@ -319,11 +319,12 @@ class ExecutionJournal:
                 "session_id": str(intent["session_id"]),
                 "process_incarnation": str(intent["attempt_incarnation"]),
                 # The axes are honest about the instant this record is written: the
-                # process DOES NOT EXIST YET, so liveness is `unverifiable` and settlement
-                # is `unknown`.  Nothing here asserts ownership of anything.
-                "axes": dict(axes or {"settlement": "unknown",
+                # process DOES NOT EXIST YET, so its liveness is `disputed` (no authority
+                # establishes it) and its settlement is `not_settled`.  Nothing here
+                # asserts ownership of anything.
+                "axes": dict(axes or {"settlement": "not_settled",
                                       "worker_resource": "retain",
-                                      "process_liveness": "unverifiable",
+                                      "process_liveness": "disputed",
                                       "cleanup_authority": "unknown"}),
                 "source_vocabulary": {
                     "prompt_digest": str(intent["prompt_digest"]),
@@ -516,15 +517,23 @@ class ExecutionJournal:
     def axes_for(self, intent_id: str) -> OwnershipAxes:
         """The last recorded axes for this intent.  All four, always.
 
-        The default is the maximally ignorant one -- unknown / unsupervised / unverifiable /
-        unknown -- because a dispatch nobody has observed is not a dispatch that is fine.
+        The default is the maximally ignorant one the SHARED vocabulary admits --
+        not_settled / unsupervised / disputed / unknown -- because a dispatch nobody has
+        observed is not a dispatch that is fine.
+
+        It used to say `unknown` / `unverifiable`, two members `pause_policy` does not
+        accept.  That made a default row BLOCK the pause twice over: `unknown` is not
+        `not_settled`, so `executor._settlement_row` never reached the branch that recovers
+        an unrecovered dispatch, and `unverifiable` then failed the row validator outright.
+        Both are now the authority's own members, and they say the same thing.
         """
         rows = self.rows_for(intent_id)
         for row in reversed(rows):
             if row["axes"]:
                 return validate_axes(row["axes"])
-        return validate_axes({"settlement": "unknown", "worker_resource": "unsupervised",
-                              "process_liveness": "unverifiable",
+        return validate_axes({"settlement": "not_settled",
+                              "worker_resource": "unsupervised",
+                              "process_liveness": "disputed",
                               "cleanup_authority": "unknown"})
 
 

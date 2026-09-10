@@ -649,6 +649,46 @@ def check_transition(*, source: str, target: str, event: str,
     return {"allowed": not violations, "violations": tuple(violations)}
 
 
+# ---- the TYPED FAILED SETTLEMENT (external review #2 and #8) ---------------------------
+#: The workflow's OWN failure vocabulary, per role.  It is READ here, never invented: a
+#: Worker settlement carries `status` (`contracts.validate_event` accepts COMPLETE|BLOCKED)
+#: and every Reviewer settlement carries `result` (PASS|FAIL).  A standalone dispatch that
+#: did not succeed reports itself in exactly those words, so the engine's existing policy --
+#: `routing.phase_gate`, which sends a Reviewer FAIL to the correction path and a Worker
+#: non-COMPLETE to a named BLOCK -- decides what happens.  Nothing here is a verdict policy
+#: of its own, and no module above `standalone_*` gains a branch.
+FAILED_RESULT_BY_ROLE = {"WORKER": ("status", "BLOCKED")}
+FAILED_RESULT_DEFAULT = ("result", "FAIL")
+
+
+def typed_failed_result(parsed: Mapping[str, Any], *, role: str,
+                        verdict: Mapping[str, Any]) -> dict[str, Any]:
+    """The parsed body, OVERRIDDEN by the runtime's typed failure.
+
+    The body is still parsed by the shared parser and still travels -- an agent that said
+    something before failing should not have it thrown away -- but the VERDICT field is the
+    runtime's, because the runtime is what observed the failure.  A CLI that exited 1 on an
+    authentication error and left `STATUS: COMPLETE` in a half-written report must not be
+    able to talk its way to a pass.
+
+    `standalone_failure` carries the named leg that refused, so an operator reading the
+    settlement sees `error_field_set` or `exit_code_nonzero` rather than a bare FAIL.
+    """
+    field, value = FAILED_RESULT_BY_ROLE.get(role, FAILED_RESULT_DEFAULT)
+    result = dict(parsed)
+    result[field] = value
+    if field == "status":
+        # A BLOCKED Worker settlement is never a phase pass, and `routing.phase_gate`
+        # additionally refuses a non-PASS unit-test status on the code-bearing phases.
+        result["unit_test_status"] = "BLOCKED"
+    result["standalone_failure"] = {
+        "reason": str(verdict.get("reason") or "dispatch_failed"),
+        "detail": str(verdict.get("detail") or ""),
+        "stage": str(verdict.get("stage") or "completion"),
+    }
+    return result
+
+
 # ---- D5.4 the single fail-closed resolver ----------------------------------------------
 def resolve_unknown(situation: str, **facts: Any) -> dict[str, Any]:
     """ONE place to audit every unknown's disposition.
@@ -685,7 +725,7 @@ def resolve_unknown(situation: str, **facts: Any) -> dict[str, Any]:
                 "route": "recovery", "note": "not a completion"}
     if situation == "liveness_unverifiable":
         return {"state": "LOST", "lost_reason": "stop_unverified",
-                "process_liveness": "unverifiable", "cleanup_authority": "unknown",
+                "process_liveness": "disputed", "cleanup_authority": "unknown",
                 "note": "never 'exited'; never permission to close"}
     if situation == "required_evidence_missing":
         return {"state": "LOST", "lost_reason": facts.get("lost_reason") or "evidence_unreadable",

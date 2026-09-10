@@ -115,9 +115,29 @@ CAPABILITIES = BASE_CAPABILITIES | RECOVERY_CAPABILITIES | STANDALONE_CAPABILITI
 # as released.  The vocabularies mirror `pause_policy`'s (which owns the pause half) and
 # are pinned equal to it by a parity test rather than by a cross-package import: this
 # module is the runtime-neutral core and takes no sibling import.
-SETTLEMENT_AXIS = ("settled", "recovered", "not_settled", "unknown")
+# OS-37 external review #5.  These four tuples were NOT equal to `pause_policy`'s, and the
+# comment above claimed a parity test that did not exist.  `settlement` carried a fifth
+# member `unknown` and `process_liveness` a fourth member `unverifiable`, neither of which
+# the pause/settlement authority accepts -- so every default and every recovered standalone
+# row reached `TERMINAL_OWNERSHIP_UNKNOWN` and BLOCKED, and `unknown != "not_settled"` also
+# skipped `executor._settlement_row`'s recovery-normalization branch on the way there.
+#
+# The reconciliation is by MEANING, not by widening the authority:
+#
+#   settlement       an outcome that has not been established is `not_settled` -- which is
+#                    exactly the state whose discharge `recover_dispatch` exists to perform.
+#                    "We have not established it" and "it is not settled" are the same fact;
+#                    spelling it `unknown` only hid it from the branch that handles it.
+#   process_liveness a liveness that cannot be READ is `disputed`: the authority's own
+#                    fail-closed member for "the answers do not establish this".  It is
+#                    NEVER `already exited` and never `live`, so nothing is promoted.
+#
+# `pause_policy` accepts no new member as a result of this change, and
+# `test_os37_lifecycle.OwnershipAxisParityTests` now pins the two side by side so they
+# cannot drift again.
+SETTLEMENT_AXIS = ("settled", "recovered", "not_settled")
 WORKER_RESOURCE_AXIS = ("reuse", "retain", "release", "unsupervised")
-PROCESS_LIVENESS_AXIS = ("live", "already exited", "disputed", "unverifiable")
+PROCESS_LIVENESS_AXIS = ("live", "already exited", "disputed")
 CLEANUP_AUTHORITY_AXIS = ("authorized", "not_authorized", "unknown")
 OWNERSHIP_AXIS_VOCABULARIES: dict[str, tuple[str, ...]] = {
     "settlement": SETTLEMENT_AXIS,

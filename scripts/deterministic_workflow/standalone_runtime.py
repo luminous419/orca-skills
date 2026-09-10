@@ -129,6 +129,11 @@ class StandaloneSession:
         self.journal = journal
         self.runtime_state = runtime_state
         self.driver = drivers.driver_for(profile)
+        #: The dispatch ROLE, carried so the journal can name who this pty session belongs
+        #: to.  `pause_policy.terminal_disposition` discharges a retained resource only when
+        #: its row names a role, an origin AND an owner; without those three a live,
+        #: perfectly accounted standalone dispatch is `residual` and BLOCKS the pause.
+        self.role = str(intent.get("role") or "")
         self.repo_id = repo_id
         self.worktree_path = worktree_path or os.getcwd()
         self.agent_id = agent_id
@@ -273,6 +278,25 @@ class StandaloneSession:
                 "process_liveness": process_liveness,
                 "cleanup_authority": cleanup_authority}
 
+    def _terminal_provenance(self) -> dict[str, str]:
+        """Who owns the pty session this dispatch created, in the PAUSE authority's columns.
+
+        `pause_policy` discharges a retained resource as ``retained_by_named_owner`` only
+        when the row carries a provenance source, a role, an origin and an owner.  The
+        standalone runtime can answer all four honestly and durably -- the role comes from
+        the intent, the origin is this runtime, and the owner is the identity fence a
+        stranger process re-reads off the journal -- so it writes them at spawn, when they
+        are facts, rather than leaving a live and fully accounted dispatch to be classified
+        ``residual`` and BLOCK the pause.
+
+        There is deliberately no fabrication: an intent that named no role yields
+        ``unknown_role``, which `pause_policy` refuses exactly as it should.
+        """
+        return {"terminal_role": self.role or "unknown_role",
+                "terminal_origin": "standalone_pty",
+                "terminal_owner": self.fence,
+                "agent_id": self.agent_id}
+
     def _journal(self, *, kind: str, derived_from: str, event: str = "",
                  state: str = "", lost_reason: str = "",
                  axes: Mapping[str, str] | None = None,
@@ -285,7 +309,7 @@ class StandaloneSession:
             session_id=self.session_id, process_incarnation=self.incarnation,
             axes=dict(axes or self._axes(settlement="not_settled",
                                          worker_resource="retain",
-                                         process_liveness="unverifiable",
+                                         process_liveness="disputed",
                                          cleanup_authority="not_authorized")),
             source_vocabulary=dict(vocabulary or {}), **extra))
 
@@ -442,6 +466,17 @@ class StandaloneSession:
         # R-B for the run that follows -- which is exactly the replay R-B exists to refuse.
         rehearsal_session_id = identity.mint_session_id(
             run_id=self.run_id, dispatch_id=self.dispatch_id, task_id=self.task_id)
+        # EXTERNAL REVIEW #6.  The probe comes from the PROFILE when the caller names none,
+        # which is what makes `launcher -> adapter -> session` able to authenticate an
+        # existing OAuth CLI session at all: `StandaloneAdapter.start` calls
+        # `run_dispatch(lease_token=...)` and has no argument to pass here, so before this
+        # the only way to supply a probe was to construct a `StandaloneSession` directly --
+        # below the production entry point, which is exactly what the finding says the
+        # real-CLI E2E was doing.  The keyword remains for the deterministic tests that
+        # drive the refusal branches; it now OVERRIDES a declaration rather than being the
+        # only source of one.
+        if auth_probe_argv is None:
+            auth_probe_argv = self.profile.auth_probe_argv()
         outcomes = preflight_mod.run_preflight(
             self.profile, self._child_env, auth_probe_argv=auth_probe_argv,
             help_text=help_text, prober=prober,
@@ -588,7 +623,8 @@ class StandaloneSession:
                       vocabulary={"pty_id": session["pty_id"], "pid": session["pid"],
                                   "captured_tty": self.record["captured_tty"],
                                   "argv_digest": argv_digest, "env_digest": env_digest,
-                                  "session_digest": argv_digest})
+                                  "session_digest": argv_digest,
+                                  **self._terminal_provenance()})
 
         # -- identity bind: the CHILD's own evidence that an execve happened -------------
         probe = self._await_spawn_record()
@@ -609,7 +645,9 @@ class StandaloneSession:
                       state="STARTING", vocabulary={"spawn_record": probe["record"] or {},
                                                     "pid": self.record["pid"],
                                                     "captured_tty": self.record["captured_tty"],
-                                                    "session_digest": argv_digest})
+                                                    "session_digest": argv_digest,
+                                                    "pty_id": str((self.pty or {}).get("pty_id", "")),
+                                                    **self._terminal_provenance()})
 
         # -- the ONE ledger write.  CLAIMED -> EFFECTED, under the caller's lease token ---
         if self.runtime_state is not None:
@@ -699,14 +737,8 @@ class StandaloneSession:
                                                     "on the channel; the run settles from "
                                                     "its own named cause",
                                           "delivery_mode": "launch_with_prompt"})
-                completion = self.await_completion()
-                if completion["state"] != "COMPLETED":
-                    raise StandaloneDispatchFailed(
-                        completion["state"].lower(),
-                        completion.get("lost_reason", ""), receipt)
-                event = self._settle(completion["evidence"], lease_token=lease_token,
-                                     result_parser=result_parser)
-                return {**receipt, "settled": True, "event_id": event["event_id"]}
+                return self._complete(receipt, lease_token=lease_token,
+                                      result_parser=result_parser)
             delivery = self.await_delivery()
             if delivery["delivery"] != "delivered_confirmed":
                 if not delivery.get("terminal_record_present"):
@@ -733,14 +765,30 @@ class StandaloneSession:
                     f"delivery_{delivery['delivery']}",
                     str(delivery.get("proof") or ""), receipt)
 
-        completion = self.await_completion()
-        if completion["state"] != "COMPLETED":
-            raise StandaloneDispatchFailed(
-                completion["state"].lower(), completion.get("lost_reason", ""), receipt)
+        return self._complete(receipt, lease_token=lease_token,
+                              result_parser=result_parser)
 
+    def _complete(self, receipt: Mapping[str, Any], *, lease_token: str | None,
+                  result_parser: Any = None) -> dict[str, Any]:
+        """Await completion and SETTLE it -- succeeded or failed alike.
+
+        ``COMPLETED`` and ``FAILED`` are BOTH settlements and both return a settlement
+        event; only a ``LOST``/``TIMED_OUT`` dispatch, which produced no verdict at all,
+        raises.  Before external review #2 and #8 a failing dispatch either persisted as a
+        SUCCESS (when it reached both gates) or escaped as an unhandled
+        `StandaloneDispatchFailed` (when it did not) -- and the second of those killed the
+        whole graph with a traceback rather than routing anywhere.
+        """
+        completion = self.await_completion()
+        if completion["state"] not in ("COMPLETED", "FAILED"):
+            raise StandaloneDispatchFailed(
+                completion["state"].lower(), completion.get("lost_reason", ""),
+                dict(receipt))
         event = self._settle(completion["evidence"], lease_token=lease_token,
-                             result_parser=result_parser)
-        return {**receipt, "settled": True, "event_id": event["event_id"]}
+                             result_parser=result_parser,
+                             verdict=completion.get("verdict"))
+        return {**dict(receipt), "settled": True, "event_id": event["event_id"],
+                "outcome": "succeeded" if completion["state"] == "COMPLETED" else "failed"}
 
     def _existing_receipt(self) -> dict[str, Any] | None:
         """The receipt this intent already has, or ``None``.  Idempotency, the Orca way.
@@ -763,15 +811,30 @@ class StandaloneSession:
                 "teardown": "not_required", "reused_existing_effect": True}
 
     def await_completion(self) -> dict[str, Any]:
-        """Bounded wait for BOTH gates: the structured result record AND a proven exit.
+        """Bounded wait for BOTH gates, then the profile's OWN success predicate.
 
-        Both, because either alone is exactly the confusion this ticket exists to prevent.
-        A structured result with no proven exit is a report from a process that may still be
-        running; a proven exit with no result record is a process that ended without saying
-        what it did.  ``COMPLETED`` needs both, and anything else is ``LOST`` with a named
-        reason -- never a completion inferred from half the evidence.
+        Both gates, because either alone is exactly the confusion this ticket exists to
+        prevent.  A structured result with no proven exit is a report from a process that
+        may still be running; a proven exit with no result record is a process that ended
+        without saying what it did.
+
+        **Two external-review findings live in this method.**
+
+        #4 -- the DEADLINE.  It waited under ``readiness_timeout_ms``, the bound on a
+        process becoming READY.  A healthy agent doing several minutes of real work was
+        therefore declared ``LOST/exit_status_absent`` while it was still running, and the
+        only workaround was to inflate the READINESS bound.  Completion now has its own
+        bound, ``completion_timeout_ms``, and readiness keeps its.
+
+        #2 -- the VERDICT.  Reaching both gates used to mean ``COMPLETED``, full stop, and
+        ``_settle`` then wrote ``outcome=succeeded`` unconditionally -- so a measured
+        authentication failure (``is_error=True``, ``terminal_reason='api_error'``,
+        ``rc=1``) was persisted as a success.  The driver now applies the profile's
+        conjunctive predicate, and a record that fails it settles ``FAILED`` with the leg
+        that refused NAMED.  ``FAILED`` is a settlement; ``LOST`` is not, and nothing here
+        can produce a success from half the evidence.
         """
-        deadline = self._clock() + self.profile.timeouts.readiness_timeout_ms / 1000.0
+        deadline = self._clock() + self.profile.timeouts.completion_timeout_ms / 1000.0
         evidence = self.completion()
         while self._clock() < deadline:
             if evidence["settlement_record"] is not None and evidence["exit_proven"]:
@@ -779,8 +842,27 @@ class StandaloneSession:
             self.pump(timeout_ms=200)
             evidence = self.completion()
         if evidence["settlement_record"] is not None and evidence["exit_proven"]:
+            verdict = self.driver.completion_verdict(evidence["settlement_record"],
+                                                    exit_status=evidence["exit_status"])
             self.event_log.append("exit_observed")
-            return {"state": "COMPLETED", "evidence": evidence, "lost_reason": ""}
+            if verdict["outcome"] == "succeeded":
+                return {"state": "COMPLETED", "evidence": evidence, "lost_reason": "",
+                        "verdict": verdict}
+            if verdict["outcome"] == "failed":
+                # A SETTLEMENT, not a loss: the run produced a declared terminal record and
+                # a proven exit, and they say it did not succeed.  Reporting that as LOST
+                # would throw away a fact the CLI stated plainly.
+                self._journal(kind="EVENT", derived_from="capture",
+                              event="evidence_unreadable", state=self.state,
+                              vocabulary={"completion_verdict": dict(verdict),
+                                          "detail": "the declared completion record does "
+                                                    "not satisfy the profile's success "
+                                                    "predicate"})
+                return {"state": "FAILED", "evidence": evidence, "lost_reason": "",
+                        "verdict": verdict}
+            return {"state": "LOST", "evidence": evidence,
+                    "lost_reason": lifecycle.resolve_unknown(
+                        "exit_status_absent")["lost_reason"], "verdict": verdict}
         if not evidence["capture_answerable"]:
             return {"state": "LOST", "evidence": evidence,
                     "lost_reason": lifecycle.resolve_unknown("capture_truncated")["lost_reason"]}
@@ -791,35 +873,64 @@ class StandaloneSession:
                                              self.profile.exit_code_map)
             self.event_log.append("exit_observed")
             return {"state": mapped["state"], "evidence": evidence,
-                    "lost_reason": mapped.get("lost_reason", "")}
+                    "lost_reason": mapped.get("lost_reason", ""),
+                    "verdict": {"outcome": "failed", "reason": "no_completion_record",
+                                "detail": f"exit {evidence['exit_status']!r} with no "
+                                          "declared result record"}}
         self.event_log.append("exit_unproven")
         return {"state": "LOST", "evidence": evidence,
                 "lost_reason": lifecycle.resolve_unknown(
                     "exit_status_absent")["lost_reason"]}
 
     def _settle(self, evidence: Mapping[str, Any], *, lease_token: str | None,
-                result_parser: Any = None) -> Any:
+                result_parser: Any = None,
+                verdict: Mapping[str, Any] | None = None) -> Any:
         """I-3's single entry edge.  The ONLY path to ``COMPLETED``/``FAILED``.
 
-        The result is parsed by the shared policy parser, the event is built by
+        The result is parsed by the SHARED policy parser, the event is built by
         ``contracts.make_settlement_event`` so ``validate_event`` accepts it unchanged, the
         journal records what was OBSERVED, and the ledger -- the settlement authority --
         is written under the caller's lease token.
+
+        **What it hands the shared parser (external review #3).**  The agent's FINAL
+        MESSAGE BODY, extracted by the driver from the profile-declared record -- not the
+        whole line-delimited JSON event stream.  Handing over the stream meant the parser
+        saw no `STATUS:`/`RESULT:` field lines and no fenced decision-gate record, so a body
+        that parsed perfectly when supplied directly lost every field inside the stream that
+        carries it.  The parser itself is untouched and is the same one the Orca and fake
+        paths use: a standalone-specific parser, or a standalone-specific verdict policy,
+        would be exactly the per-runtime divergence AC-37-20 forbids.
+
+        **What it does with a FAILURE (external review #2 and #8).**  ``outcome`` is no
+        longer the constant ``succeeded``.  A dispatch whose completion record fails the
+        profile's predicate settles as a TYPED FAILED settlement, in the WORKFLOW'S OWN
+        result vocabulary -- ``status=BLOCKED`` for a Worker, ``result=FAIL`` for a Reviewer
+        -- so the engine's existing policy routes it (a Reviewer FAIL to the correction
+        path, a Worker BLOCK to a named terminal) without a single CLI-specific branch
+        anywhere above this module.
         """
         from .contracts import make_settlement_event
         parser = result_parser or _default_result_parser
-        result = parser(_CapturedBody(self.capture.transcript()), self.intent)
+        extracted = self.driver.result_body(self.capture.transcript())
+        body = extracted["body"]
+        result = dict(parser(_CapturedBody(
+            body if body is not None else self.capture.transcript()), self.intent))
+        outcome = str((verdict or {}).get("outcome") or "succeeded")
+        if outcome != "succeeded":
+            result = lifecycle.typed_failed_result(
+                result, role=str(self.intent.get("role") or ""), verdict=verdict or {})
+        target = "COMPLETED" if outcome == "succeeded" else "FAILED"
         event = make_settlement_event(self.intent, result,
                                       occurred_at="1970-01-01T00:00:00Z")
 
         check = lifecycle.check_transition(
-            source=self.state, target="COMPLETED", event="settlement_confirmed",
+            source=self.state, target=target, event="settlement_confirmed",
             log=self.event_log, evidence={"tier": "structured_stream"},
             from_settlement_predicate=True)
         if not check["allowed"]:
             raise StandaloneDispatchFailed(
                 "settlement_edge_refused", "; ".join(check["violations"]), {})
-        self.state = "COMPLETED"
+        self.state = target
         self.event_log.append("settlement_confirmed")
 
         admitted = self.journal.admit(journal_mod.make_record(
@@ -827,22 +938,87 @@ class StandaloneSession:
             intent_id=self.intent_id,
             dispatch_id=self.dispatch_id, task_id=self.task_id,
             session_id=self.session_id, process_incarnation=self.incarnation,
-            event="settlement_confirmed", state="COMPLETED",
-            outcome="succeeded", message_id=event["event_id"], reported_by=self.fence,
+            event="settlement_confirmed", state=target,
+            outcome="succeeded" if outcome == "succeeded" else "failed",
+            message_id=event["event_id"], reported_by=self.fence,
             axes=self._axes(settlement="settled", worker_resource="release",
                             process_liveness="already exited",
                             cleanup_authority="authorized"),
             source_vocabulary={"event": dict(event),
                                "exit_status": evidence.get("exit_status"),
                                "driver": self.driver.name,
+                               "completion_verdict": dict(verdict or {}),
+                               "result_body_source": extracted["source"],
                                "pid": (self.record or {}).get("pid"),
-                               "captured_tty": (self.record or {}).get("captured_tty")}),
+                               "captured_tty": (self.record or {}).get("captured_tty"),
+                               **self._terminal_provenance()}),
             runtime_state=self.runtime_state)
         if admitted["outcome"] == "refused":
             raise StandaloneDispatchFailed("settlement_refused", admitted["code"], {})
         if self.runtime_state is not None:
             self.runtime_state.settle(self.intent_id, event, lease_token)
         return event
+
+    def settle_failed(self, failure: StandaloneDispatchFailed, *,
+                      lease_token: str | None = None) -> dict[str, Any]:
+        """Turn a NON-COMPLETION into a TYPED FAILED SETTLEMENT.  External review #8.
+
+        ``StandaloneDispatchFailed`` names a stage and a reason -- a refused preflight, a
+        readiness timeout, an unprovable delivery, a lost exit -- and it used to be RAISED
+        all the way out of ``adapter.start``, through ``executor._settle_now``, through
+        every graph node and out of ``run_cli`` as a traceback.  Auth expiry, an OOM kill, a
+        crash or a missing result therefore killed the whole run instead of settling one
+        dispatch, and nothing downstream ever saw a verdict it could route on.
+
+        This produces the verdict.  The result is the WORKFLOW'S OWN failure vocabulary for
+        the dispatch's role, so the engine's existing policy decides what happens next --
+        there is no standalone branch in `routing.py`, `graph.py` or any review module, and
+        none is needed.
+
+        It is deliberately NOT a success path and it invents nothing: the state becomes
+        ``FAILED`` through I-3's single entry edge, the journal records ``outcome=failed``
+        with the named stage, and the evidence tier is ``raw`` -- the process exit is what
+        was observed, not a structured settlement record.
+        """
+        from .contracts import make_settlement_event
+        verdict = {"outcome": "failed", "reason": failure.reason or failure.stage,
+                   "detail": str(failure), "stage": failure.stage}
+        extracted = self.driver.result_body(self.capture.transcript())
+        body = extracted["body"]
+        parsed = _default_result_parser(_CapturedBody(
+            body if body is not None else self.capture.transcript()), self.intent)
+        result = lifecycle.typed_failed_result(
+            parsed, role=str(self.intent.get("role") or ""), verdict=verdict)
+        event = make_settlement_event(self.intent, result,
+                                      occurred_at="1970-01-01T00:00:00Z")
+        check = lifecycle.check_transition(
+            source=self.state, target="FAILED", event="settlement_confirmed",
+            log=self.event_log, evidence={"tier": "raw"},
+            from_settlement_predicate=True)
+        if not check["allowed"]:      # pragma: no cover - I-3 admits this edge from any state
+            raise failure
+        self.state = "FAILED"
+        self.event_log.append("settlement_confirmed")
+        self.journal.admit(journal_mod.make_record(
+            kind="SETTLEMENT_OBSERVED", derived_from="runtime_state",
+            intent_id=self.intent_id, dispatch_id=self.dispatch_id, task_id=self.task_id,
+            session_id=self.session_id, process_incarnation=self.incarnation,
+            event="settlement_confirmed", state="FAILED", outcome="failed",
+            message_id=event["event_id"], reported_by=self.fence,
+            axes=self._axes(settlement="settled", worker_resource="release",
+                            process_liveness="disputed",
+                            cleanup_authority="not_authorized"),
+            source_vocabulary={"event": dict(event), "driver": self.driver.name,
+                               "completion_verdict": dict(verdict),
+                               "result_body_source": extracted["source"],
+                               **self._terminal_provenance()}),
+            runtime_state=self.runtime_state)
+        if self.runtime_state is not None:
+            self.runtime_state.settle(self.intent_id, event, lease_token)
+        return {**dict(failure.receipt or self._receipt("failed", failure.reason,
+                                                        teardown="not_required")),
+                "settled": True, "event_id": event["event_id"], "outcome": "failed",
+                "failure_stage": failure.stage}
 
     def _receipt(self, outcome: str, reason: str, *, teardown: str) -> StartReceipt:
         if outcome not in START_OUTCOMES:
@@ -1026,7 +1202,9 @@ class StandaloneSession:
             raise drivers.DeliveryModeMismatch(
                 "no DELIVERY_INTENT was journalled for this dispatch, so there is no "
                 "prompt digest to prove a delivery against")
-        deadline = self._clock() + self.profile.timeouts.readiness_timeout_ms / 1000.0
+        # Its OWN bound (external review #4): readiness, delivery and completion are three
+        # questions and they no longer share one deadline.
+        deadline = self._clock() + self.profile.timeouts.delivery_verify_timeout_ms / 1000.0
         argv = list(self.pty.get("argv", ())) if self.pty else []
         while True:
             self.pump()
@@ -1160,7 +1338,9 @@ class StandaloneSession:
     def status(self) -> dict[str, Any]:
         """The engine-visible status mapping.  Closed vocabularies throughout."""
         snapshot = self._snapshot()
-        liveness = "unverifiable"
+        # `disputed` is the shared vocabulary's member for "no authority establishes this".
+        # An unreadable process table is exactly that -- and it is never `already exited`.
+        liveness = "disputed"
         surface = "S2"
         tier = "none"
         if snapshot.get("readable", False) and self.record is not None:
@@ -1201,11 +1381,30 @@ class StandaloneSession:
 
     # -- interrupt -----------------------------------------------------------------------
     def interrupt(self, reason: str) -> dict[str, Any]:
-        """The four-rung ladder, gated at every rung.  Never reports an unproven exit."""
+        """The four-rung ladder, gated at every rung.  Never reports an unproven exit.
+
+        **A REFUSAL IS NOT A TRANSITION**, and this method now obeys that in code rather
+        than only in prose (external review #11).  When the ownership gates G1/G2 refuse --
+        an unbound tty, a shared tty, a recycled pid, or a process table that simply could
+        not be read this once -- NO signal was sent and NO lifecycle edge was taken, so:
+
+        * ``self.state`` and ``self.lost_reason`` are untouched (they already were);
+        * ``event_log`` gains NOTHING.  ``interrupt_requested`` used to be appended before
+          the ladder ran, so a refused request left a request in the transition log;
+        * the journal record carries the intent's EXISTING axes, unchanged.  It used to
+          append an ``exit_unproven`` observation whose axes said
+          ``process_liveness=unverifiable``, and `ExecutionJournal.axes_for` reads the LAST
+          record that carries axes -- so one transient unreadable process table permanently
+          replaced a healthy dispatch's `live`/`already exited` liveness with ignorance, and
+          fed exactly the ownership BLOCK finding #5 is about.
+
+        The refusal is still RECORDED -- an audit record, with the ladder and the named
+        refusal in its source vocabulary -- because "nothing happened" and "we never asked"
+        are different facts.  What it may not do is move any axis.
+        """
         if self.record is None:
             return {"intent_id": self.intent_id, "reason": reason,
                     "interrupt_outcome": "not_owned", "ladder": ()}
-        self.event_log.append("interrupt_requested")
         result = interrupt_mod.interrupt(
             self.intent_id, reason, record=self.record, profile=self.profile,
             table_reader=self._table_reader, supervisor_pid=self._supervisor_pid,
@@ -1215,11 +1414,24 @@ class StandaloneSession:
             # this run must keep.  One call satisfies both.
             drain=lambda: self.pump(timeout_ms=50))
         mapped = interrupt_mod.lifecycle_for(result["interrupt_outcome"])
-        if mapped["state"] is not None:
-            self.state = mapped["state"]
-            self.lost_reason = mapped["lost_reason"]
-            self.event_log.append(
-                "exit_observed" if mapped["state"] == "INTERRUPTED" else "exit_unproven")
+        if mapped["state"] is None:
+            # REFUSED.  No signal, no edge, no axis.  The axes written here are the ones
+            # already on the journal, re-stated verbatim, so `axes_for` answers exactly what
+            # it answered before this call.
+            self._journal(kind="REFUSED", derived_from="process_table", event="",
+                          state=self.state, lost_reason=self.lost_reason,
+                          axes=dict(self.journal.axes_for(self.intent_id)),
+                          vocabulary={"interrupt_outcome": result["interrupt_outcome"],
+                                      "refusal": "refusal_is_not_a_transition",
+                                      "ladder": [dict(step) for step in result["ladder"]],
+                                      "pid": self.record["pid"],
+                                      "captured_tty": self.record["captured_tty"]})
+            return result
+        self.event_log.append("interrupt_requested")
+        self.state = mapped["state"]
+        self.lost_reason = mapped["lost_reason"]
+        self.event_log.append(
+            "exit_observed" if mapped["state"] == "INTERRUPTED" else "exit_unproven")
         self._journal(kind="EVENT", derived_from="process_table",
                       event="exit_observed" if mapped["state"] == "INTERRUPTED"
                       else "exit_unproven",
@@ -1227,7 +1439,7 @@ class StandaloneSession:
                       axes=self._axes(
                           settlement="not_settled", worker_resource="retain",
                           process_liveness="already exited" if mapped["state"] == "INTERRUPTED"
-                          else "unverifiable",
+                          else "disputed",
                           cleanup_authority="not_authorized"),
                       vocabulary={"interrupt_outcome": result["interrupt_outcome"],
                                   "ladder": [dict(step) for step in result["ladder"]],

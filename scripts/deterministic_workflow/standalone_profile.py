@@ -93,8 +93,48 @@ RESUME_CHANNELS = ("none", "cli_resume_subcommand")
 TRUNCATION_CAUSES = ("total_bytes", "line_bytes", "record_count")
 
 
+# ---- OS-37 external review #7: ONE closed, validated credential contract ---------------
+# The environment policy forbids the whole `CLAUDE*` prefix, because the supervising
+# session carries `CLAUDE_CODE_MESSAGING_TOKEN` (a bearer credential) and a messaging
+# socket path.  But `CLAUDE_CODE_OAUTH_TOKEN` is the CLI's OWN documented credential
+# variable, so a profile that declared it was constructed happily and then had its child
+# environment REFUSED at spawn by the prefix sweep -- an explicit, correct configuration
+# that could not run, with the failure arriving as a `ChildEnvironmentLeak` naming the
+# operator's own variable as a leak.
+#
+# The contract is one closed set, declared once, in the module whose job is validation, and
+# `standalone_env` derives its allowlist from it so the two cannot drift.  A name outside
+# it is refused HERE -- at profile construction, before any process exists -- rather than
+# being discovered at spawn.
+#
+# VALUES never appear anywhere.  A credential is named in `auth_secret_ref`, whose values
+# are resolved at spawn by `standalone_env.resolve_secrets`, and `redacted()` publishes
+# NAMES only.  `driver_env` is non-secret by contract and is therefore refused a credential
+# name outright: a profile is a file an operator commits, and a `driver_env` entry carries
+# its value inside it.
+ALLOWED_CREDENTIAL_NAMES = frozenset({
+    "ANTHROPIC_API_KEY",         # Claude: API-key authentication
+    "CLAUDE_CODE_OAUTH_TOKEN",   # Claude: an explicitly configured OAuth token
+    "OPENAI_API_KEY",            # Codex: API-key authentication
+})
+
+#: Non-secret per-driver roots the child legitimately needs, and which the prefix sweep
+#: would otherwise remove.  A PATH is not a credential -- but the credential file it points
+#: at is, which is why `CodexDriver.seed_auth_home` copies exactly one file, `0600`, and
+#: journals the destination path only.
+ALLOWED_CONFIG_ROOT_NAMES = frozenset({"CODEX_HOME"})
+
+
 class ProfileError(ValueError):
     """A profile is malformed.  Raised at construction, never carried as a flag."""
+
+
+class CredentialContractViolation(ProfileError):
+    """A profile names a credential the closed contract does not admit.
+
+    A subclass of `ProfileError`, so every existing caller that refuses a malformed profile
+    already refuses this one, and callers that care can name it.
+    """
 
 
 _VERSION = re.compile(r"^(\d+)\.(\d+)\.(\d+)")
@@ -204,6 +244,12 @@ class CompletionSelector:
     #: Values of `success_field` the profile accepts.  Empty means "not consulted".
     success_field: str = ""
     success_values: tuple[str, ...] = ()
+    #: The exit statuses this selector accepts as a SUCCESS when the profile declares no
+    #: `exit_code_map`.  ``(0,)`` is not a guess: D4.0 M-2 and M-8 measured `rc=0` on both
+    #: installed CLIs' success legs and `rc=1` on both authentication-failure legs.  It can
+    #: only ever REFUSE -- a code outside it makes the dispatch a failure, never a success
+    #: it would not otherwise have been.
+    success_exit_codes: tuple[int, ...] = (0,)
 
     def __post_init__(self) -> None:
         if self.channel not in READINESS_CHANNELS:
@@ -218,6 +264,94 @@ class CompletionSelector:
             raise ProfileError(
                 "a completion selector naming success_field must declare success_values; "
                 "an empty accepted set would accept every value")
+        if (not isinstance(self.success_exit_codes, tuple)
+                or not self.success_exit_codes
+                or not all(isinstance(code, int) and not isinstance(code, bool)
+                           for code in self.success_exit_codes)):
+            raise ProfileError(
+                "success_exit_codes must be a non-empty tuple of ints; an empty one would "
+                "make every exit status a failure and a missing one would make none")
+
+
+@dataclass(frozen=True)
+class AuthProbe:
+    """The CLI's own bounded, NON-INTERACTIVE credential check, as a TYPED CONTRACT.
+
+    **External review #6.**  `StandaloneSession.start` has always accepted an
+    ``auth_probe_argv`` keyword, but nothing in the production composition could supply one:
+    `StandaloneAdapter.start` calls `run_dispatch(lease_token=...)` and the profile had no
+    place to declare a probe at all.  The only caller that ever passed one was the real-CLI
+    E2E harness, which constructed a `StandaloneSession` DIRECTLY -- below the production
+    entry point -- so the launcher -> adapter -> session path was never exercised and an
+    operator running the shipped command line got `auth_probe_unreadable` ("unknown is not
+    pass") on every dispatch, or a silent presence-only check.
+
+    Declaring it here makes the probe part of the profile an operator commits, and
+    `StandaloneSession.start` reads it when no caller overrides it -- which is what wires
+    launcher -> adapter -> session with nothing injected underneath.
+
+    ``args`` are appended to the profile's own ``binary``; the binary is never named twice
+    and a profile cannot point the probe at some other executable.  D4.0 M-13 measured both
+    installed CLIs' probes (`claude auth status`, `codex login status`): bounded, exit 0
+    when authenticated, and neither prompts.  A profile that declares none keeps the
+    existing G-2 branch -- a presence-only check on the declared credential names, and
+    ``unknown`` when the profile declares neither -- which is refused, never passed.
+    """
+
+    args: tuple[str, ...]
+    #: Flags this probe depends on, checked against the binary's own ``--help`` by
+    #: preflight exactly as `required_flags` are.  Usually empty: a subcommand is not a flag.
+    requires_flags: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.args, tuple) or not self.args:
+            raise ProfileError(
+                "an auth probe must declare a non-empty argument tuple; a probe with no "
+                "arguments would re-run the agent binary itself")
+        for item in self.args:
+            if not isinstance(item, str) or not item:
+                raise ProfileError("auth probe args must be non-empty strings")
+        if not isinstance(self.requires_flags, tuple) or \
+                not all(isinstance(flag, str) and flag for flag in self.requires_flags):
+            raise ProfileError("auth probe requires_flags must be a tuple of strings")
+
+
+@dataclass(frozen=True)
+class ResultBodySelector:
+    """Where the agent's FINAL MESSAGE BODY lives inside the structured stream.
+
+    External review #3.  `StandaloneSession._settle` used to hand the WHOLE captured
+    transcript to the SHARED settlement parser, which reads a Markdown or JSON
+    *body*.  A real CLI's stream is line-delimited JSON events, so the shared parser saw no
+    `STATUS:`/`RESULT:` field lines and no fenced decision-gate record at all: the same body
+    parsed correctly when supplied directly and was rejected downstream as `UNKNOWN_EVENT`
+    when wrapped in the stream that actually carries it.
+
+    The fix is a driver-side EXTRACTION, declared here as profile data rather than
+    hard-coded per CLI, feeding the SAME shared parser.  Nothing about the result vocabulary
+    or the verdict policy is duplicated: the standalone path derives its settlement result
+    through byte-identical policy to the Orca and fake paths, which is what AC-37-20
+    requires.
+
+    ``item_type`` narrows a generic envelope (Codex wraps everything in `item.completed`),
+    and ``body_field`` is a dotted path into the record.
+    """
+
+    channel: str
+    record_type: str
+    body_field: str
+    item_type: str = ""
+
+    def __post_init__(self) -> None:
+        if self.channel not in READINESS_CHANNELS:
+            raise ProfileError(
+                f"result body channel {self.channel!r} is not one of {READINESS_CHANNELS!r}")
+        for name in ("record_type", "body_field"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value:
+                raise ProfileError(f"result body {name} must be a non-empty string")
+        if not isinstance(self.item_type, str):
+            raise ProfileError("result body item_type must be a string")
 
 
 @dataclass(frozen=True)
@@ -259,6 +393,21 @@ class Timeouts:
 
     readiness_timeout_ms: int = 60_000
     delivery_verify_timeout_ms: int = 15_000
+    #: How long the AGENT'S OWN TURN may take -- external review #4.
+    #:
+    #: `await_completion` used to wait under `readiness_timeout_ms`, which is the bound on
+    #: a process becoming READY: three different questions ("has it started?", "did the
+    #: prompt arrive?", "has it finished?") shared one 60-second answer, so a perfectly
+    #: healthy agent doing several minutes of real work was declared
+    #: `LOST/exit_status_absent` while it was still running -- and the run's own harness had
+    #: to inflate `readiness_timeout_ms` to 900_000 to work around it, which silently
+    #: loosened the READINESS gate as the price of a working completion gate.
+    #:
+    #: A real agent turn routinely runs many minutes, so the default is sized for that
+    #: rather than for a question-and-answer probe.  It is still a BOUND and it still yields
+    #: `TIMED_OUT`, never `COMPLETED`; a workflow that owns a shorter execution deadline
+    #: declares it here, which is the point of it being a profile field.
+    completion_timeout_ms: int = 1_800_000
     settle_floor_ms: int = 120
     graceful_force_timeout_ms: int = 5_000
     physical_exit_timeout_ms: int = 8_000
@@ -355,6 +504,15 @@ class StandaloneProfile:
     delivery_proofs: tuple[DeliveryProofSelector, ...] = ()
     #: The declared completion candidates (D4.4).  Conjunctive with the exit table.
     completion_records: tuple[CompletionSelector, ...] = ()
+    #: Where the agent's FINAL MESSAGE BODY lives in the structured stream (review #3).
+    #: A profile that declares none keeps the pre-existing behaviour -- the whole captured
+    #: transcript is handed to the shared parser -- which is right for the scripted fixture
+    #: CLIs whose transcript IS a report, and wrong for every real CLI.  The two shipping
+    #: profiles declare one; `StandaloneSession._settle` records WHICH source it used, so a
+    #: profile that quietly falls back is visible in the journal rather than invisible.
+    result_body_records: tuple[ResultBodySelector, ...] = ()
+    #: The CLI's own credential check (review #6).  ``None`` means none is declared.
+    auth_probe: AuthProbe | None = None
     #: A member of :data:`RESUME_CHANNELS`.  `external_resume` is declared from THIS and
     #: from nothing else (D11.3).
     resume_channel: str = "none"
@@ -388,6 +546,22 @@ class StandaloneProfile:
         for name in tuple(self.auth_secret_ref) + tuple(self.driver_env):
             if not isinstance(name, str) or not name:
                 raise ProfileError("env names must be non-empty strings")
+        # The closed credential contract (review #7), checked before any process exists.
+        for name in self.auth_secret_ref:
+            if name not in ALLOWED_CREDENTIAL_NAMES:
+                raise CredentialContractViolation(
+                    f"auth_secret_ref names {name!r}, which is not one of the admitted "
+                    f"credential names {sorted(ALLOWED_CREDENTIAL_NAMES)!r}; the child "
+                    "environment policy is an ALLOWLIST and a name nobody enumerated is "
+                    "absent by construction, so declaring one here would produce a profile "
+                    "that can only fail at spawn")
+        for name in self.driver_env:
+            if name in ALLOWED_CREDENTIAL_NAMES:
+                raise CredentialContractViolation(
+                    f"driver_env names the credential {name!r}; driver_env is non-secret by "
+                    "contract and carries its VALUE inside a committed profile.  A "
+                    "credential is declared in auth_secret_ref, which names where the value "
+                    "comes from and never what it is")
         for selector in self.readiness_records:
             if not isinstance(selector, ReadinessSelector):
                 raise ProfileError("readiness_records must hold ReadinessSelector values")
@@ -424,6 +598,14 @@ class StandaloneProfile:
             if not isinstance(selector, CompletionSelector):
                 raise ProfileError(
                     "completion_records must hold CompletionSelector values")
+        for selector in self.result_body_records:
+            if not isinstance(selector, ResultBodySelector):
+                raise ProfileError(
+                    "result_body_records must hold ResultBodySelector values")
+        if self.auth_probe is not None and not isinstance(self.auth_probe, AuthProbe):
+            raise ProfileError(
+                "auth_probe must be an AuthProbe; a bare list would let a profile name "
+                "some other executable as this driver's credential check")
         if self.resume_channel not in RESUME_CHANNELS:
             raise ProfileError(
                 f"resume_channel {self.resume_channel!r} is not one of {RESUME_CHANNELS!r}")
@@ -439,6 +621,16 @@ class StandaloneProfile:
                     f"auth marker {marker!r} must be a (field, expected-value) string pair")
 
     # -- queries -------------------------------------------------------------------------
+    def auth_probe_argv(self) -> tuple[str, ...] | None:
+        """The full probe argv, or ``None`` when the profile declares no probe.
+
+        Composed from THIS profile's binary, so a probe can only ever check the credential
+        of the CLI it is declared for.
+        """
+        if self.auth_probe is None:
+            return None
+        return (self.binary, *self.auth_probe.args)
+
     def version_supported(self, version: tuple[int, int, int] | None) -> bool:
         """Whether ``version`` is inside the declared range.
 
@@ -477,8 +669,11 @@ class StandaloneProfile:
                 s.record_type for s in self.delivery_proofs),
             "completion_record_types": sorted(
                 s.record_type for s in self.completion_records),
+            "result_body_record_types": sorted(
+                s.record_type for s in self.result_body_records),
             "resume_channel": self.resume_channel,
             "auth_seed_declared": bool(self.auth_seed_source),
+            "auth_probe_args": list(self.auth_probe.args) if self.auth_probe else [],
             "rows": self.rows, "cols": self.cols, "term": self.term,
         }
 
@@ -511,7 +706,8 @@ def profile_from_mapping(spec: Any) -> StandaloneProfile:
         "home_policy", "capture", "timeouts", "exit_code_map", "graceful_hint",
         "extra_args", "no_session_persistence",
         "delivery_mode", "identity_binding", "identity_flag", "delivery_proofs",
-        "completion_records", "resume_channel", "resume_args",
+        "completion_records", "result_body_records", "auth_probe",
+        "resume_channel", "resume_args",
         "auth_seed_source", "auth_seed_dest_name", "auth_markers",
     }
     unknown = set(spec) - known
@@ -541,9 +737,29 @@ def profile_from_mapping(spec: Any) -> StandaloneProfile:
                            error_field=item.get("error_field", ""),
                            success_field=item.get("success_field", ""),
                            success_values=_as_tuple(item.get("success_values"),
-                                                    "success_values"))
+                                                    "success_values"),
+                           success_exit_codes=tuple(
+                               int(code) for code in item["success_exit_codes"])
+                           if "success_exit_codes" in item else (0,))
         for item in (spec.get("completion_records") or ())
         if isinstance(item, Mapping) or _raise_selector(item))
+    result_body_records = tuple(
+        ResultBodySelector(channel=item.get("channel", "structured"),
+                           record_type=item.get("record_type", ""),
+                           body_field=item.get("body_field", ""),
+                           item_type=item.get("item_type", ""))
+        for item in (spec.get("result_body_records") or ())
+        if isinstance(item, Mapping) or _raise_selector(item))
+    probe_spec = spec.get("auth_probe")
+    if probe_spec is None:
+        auth_probe = None
+    elif isinstance(probe_spec, Mapping):
+        auth_probe = AuthProbe(
+            args=_as_tuple(probe_spec.get("args"), "auth_probe.args"),
+            requires_flags=_as_tuple(probe_spec.get("requires_flags"),
+                                     "auth_probe.requires_flags"))
+    else:
+        raise ProfileError("auth_probe must be an object with an 'args' list")
     markers = tuple(
         (str(item[0]), str(item[1]))
         for item in (spec.get("auth_markers") or ())
@@ -585,6 +801,8 @@ def profile_from_mapping(spec: Any) -> StandaloneProfile:
         identity_flag=spec.get("identity_flag", ""),
         delivery_proofs=delivery_proofs,
         completion_records=completion_records,
+        result_body_records=result_body_records,
+        auth_probe=auth_probe,
         resume_channel=spec.get("resume_channel", "none"),
         resume_args=_as_tuple(spec.get("resume_args"), "resume_args"),
         auth_seed_source=spec.get("auth_seed_source", ""),

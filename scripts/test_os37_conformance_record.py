@@ -19,7 +19,15 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 BASELINE = REPO / "docs" / "ORCA_RUNTIME_PRIMITIVES.md"
-RECORD = REPO / "artifacts" / "runs" / "run_54d90086bd75" / "CONFORMANCE.md"
+#: The conformance record's SINGLE authority, and it is TRACKED.
+#:
+#: It used to be `artifacts/runs/run_54d90086bd75/CONFORMANCE.md`.  That directory is a run
+#: artifact and is deliberately not committed, so on a clean checkout every test in this
+#: module failed in `setUp` -- in all six CI matrix jobs -- while passing on the developer
+#: host where the untracked run directory happened to be present.  AC-37-21's record is a
+#: DELIVERABLE, so it lives in the repository; `ConformanceRecordIsTrackedTests` below
+#: asserts that this exact path is known to git, so the dependency cannot silently return.
+RECORD = REPO / "docs" / "conformance" / "OS37_CONFORMANCE.md"
 ENGINE = REPO / "scripts" / "deterministic_workflow"
 
 #: The three dispositions an unknown may carry.  There is no fourth, and no silence.

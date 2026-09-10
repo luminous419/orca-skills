@@ -54,8 +54,15 @@ printf '{"type":"system","session_id":"%s"}\n' "$SESSION_ID"
 IFS= read -r PROMPT || PROMPT=""
 
 # 3. The turn.  The structured turn-start is the delivery proof the driver verifies.
+#
+# `is_error` is EMITTED, and emitted false.  This fixture's profile declares it as the
+# completion selector's `error_field`, and D4.4's settlement predicate treats a
+# DECLARED-but-ABSENT error field as UNKNOWN rather than as false -- which is the
+# fail-closed direction, and is what OS-37's external review #2 asked for: a real CLI's
+# result record always carries the field, and a fixture that omitted it was relying on the
+# old behaviour where the record's mere existence meant success.
 printf '{"type":"message_start"}\n'
-printf '{"type":"result","subtype":"success"}\n'
+printf '{"type":"result","subtype":"success","is_error":false}\n'
 
 # 4. The body, bound to the dispatch.  One interpreter call, so the verdict line and the
 #    record can never disagree about which role, phase or iteration this dispatch is.

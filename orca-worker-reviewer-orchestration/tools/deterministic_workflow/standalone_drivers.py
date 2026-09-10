@@ -664,6 +664,109 @@ class _Driver:
                                       "exit_code": exit_status},
                 "at": _now_iso()}
 
+    # -- D4.4's CONJUNCTIVE settlement predicate, applied rather than described ----------
+    def completion_verdict(self, record: Mapping[str, Any] | None, *,
+                           exit_status: int | None) -> dict[str, Any]:
+        """``succeeded`` / ``failed`` / ``unknown`` for one completion record.
+
+        **External review #2.**  `await_completion` used to accept "a completion record
+        exists AND an exit was proven" and `_settle` then wrote `state=COMPLETED`,
+        `outcome=succeeded` UNCONDITIONALLY -- so a Claude authentication failure, which
+        D4.0 M-2 measured as `type='result' subtype='success' is_error=True
+        terminal_reason='api_error'` with `rc=1`, was persisted as a SUCCEEDED settlement.
+        `CompletionSelector`'s own docstring already said the rule was conjunctive; nothing
+        applied it.  This is where it is applied.
+
+        Every leg can only REFUSE.  There is no branch in which a missing field, an
+        unmapped exit code or an absent record becomes a success:
+
+        1. a declared selector must MATCH the record's type (and `item_type` where named);
+        2. `error_field`, when declared, must be PRESENT and falsy -- an absent error field
+           is unknown, not false;
+        3. `success_field`, when declared, must hold one of `success_values`;
+        4. the exit status must be proven and map to success: through the profile's
+           `exit_code_map` when it declares one (an UNMAPPED code is `unknown`, never a
+           pass), and otherwise through the selector's `success_exit_codes`.
+        """
+        if record is None:
+            return {"outcome": "failed", "reason": "no_completion_record",
+                    "detail": "the process ended without a declared result record"}
+        matched = None
+        for selector in self.profile.completion_records:
+            if record.get("type") != selector.record_type:
+                continue
+            matched = selector
+            break
+        if matched is None:
+            return {"outcome": "failed", "reason": "completion_record_undeclared",
+                    "detail": f"record type {record.get('type')!r} matches no declared "
+                              "completion selector"}
+        if matched.error_field:
+            observed = _dig(record, matched.error_field)
+            if observed is None:
+                return {"outcome": "failed", "reason": "error_field_absent",
+                        "detail": f"{matched.error_field!r} is declared and is not present; "
+                                  "an absent error field is unknown, never false"}
+            if _truthy(observed):
+                return {"outcome": "failed", "reason": "error_field_set",
+                        "detail": f"{matched.error_field}={observed!r}"}
+        if matched.success_field:
+            observed = _dig(record, matched.success_field)
+            if str(observed) not in matched.success_values:
+                return {"outcome": "failed", "reason": "terminal_reason_not_success",
+                        "detail": f"{matched.success_field}={observed!r} is not one of "
+                                  f"{list(matched.success_values)!r}"}
+        if exit_status is None:
+            return {"outcome": "unknown", "reason": "cause_unreported",
+                    "detail": "no waitpid-sourced exit status"}
+        table = dict(self.profile.exit_code_map)
+        if table:
+            mapped = table.get(exit_status)
+            if mapped is None:
+                return {"outcome": "unknown", "reason": "exit_code_unmapped",
+                        "detail": f"exit {exit_status} is outside the profile's table"}
+            if mapped != "COMPLETED":
+                return {"outcome": "failed", "reason": "exit_code_mapped_failure",
+                        "detail": f"exit {exit_status} maps to {mapped}"}
+        elif exit_status not in matched.success_exit_codes:
+            return {"outcome": "failed", "reason": "exit_code_nonzero",
+                    "detail": f"exit {exit_status} is not in "
+                              f"{list(matched.success_exit_codes)!r}"}
+        return {"outcome": "succeeded", "reason": "", "detail": ""}
+
+    # -- D4.4 / review #3: the FINAL MESSAGE BODY, and only it ---------------------------
+    def result_body(self, text: str) -> dict[str, Any]:
+        """``{"body": str|None, "source": str}`` -- the agent's own final message.
+
+        Profile-declared, so this base implementation serves every driver and no CLI name is
+        hard-coded here.  ``body=None`` means the profile declared no extraction, and the
+        caller then hands the WHOLE transcript to the shared parser exactly as before --
+        which is correct for the scripted fixture CLIs whose transcript IS a report.
+        """
+        for selector in self.profile.result_body_records:
+            for record in reversed(self.structured_records(text)):
+                if record.get("type") != selector.record_type:
+                    continue
+                if selector.item_type and _dig(record, "item.type") != selector.item_type:
+                    continue
+                value = _dig(record, selector.body_field)
+                if isinstance(value, str) and value:
+                    return {"body": value,
+                            "source": f"{selector.record_type}.{selector.body_field}"}
+        path = self.profile.output_last_message_path
+        if path and self.profile.result_body_records and os.path.exists(path):
+            # The `-o` file is a SECOND source for the same body, never a substitute for the
+            # exit proof.  It is consulted only when the profile declared an extraction at
+            # all, so a profile that declares none keeps the whole-transcript behaviour.
+            try:
+                with open(path, encoding="utf-8", errors="replace") as handle:
+                    text_body = handle.read()
+            except OSError:
+                text_body = ""
+            if text_body.strip():
+                return {"body": text_body, "source": "output_last_message_path"}
+        return {"body": None, "source": "whole_transcript"}
+
     # -- per-driver record selection ------------------------------------------------------
     def bound_readiness_signal(self, text: str, *, minted_session_id: str,
                                adopt: bool = False) -> dict[str, Any] | None:
@@ -1103,6 +1206,20 @@ def driver_for(profile: StandaloneProfile) -> _Driver:
         composed = type(f"{factory.__name__}PostReady", (_PostReadyDelivery, factory), {})
         _MODE_CLASSES[key] = composed
     return composed(profile)               # type: ignore[return-value]
+
+
+def _truthy(value: Any) -> bool:
+    """Whether a record field means TRUE, for a stream that may spell it either way.
+
+    Both installed CLIs emit real JSON booleans, and a captured stream replayed through a
+    text fixture can carry the string form.  ``"false"`` is FALSE and ``"true"`` is TRUE;
+    anything else non-empty is true, which is the fail-closed direction for an ERROR field.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() not in ("", "false", "0", "none", "null")
+    return bool(value)
 
 
 def _dig(record: Mapping[str, Any], path: str) -> Any:

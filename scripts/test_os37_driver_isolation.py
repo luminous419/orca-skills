@@ -71,9 +71,15 @@ POLICY_MODULE_DIGESTS = {
 #:               line this ticket edits -- the `CAPABILITIES` union.  It is inside the
 #:               excluded range precisely BECAUSE it changed; the assertion below pins what
 #:               it changed FROM, so the exclusion cannot be used to hide anything else.
-#:   (110, 198)  the ownership-axis vocabularies and their validator
+#:   (110, 218)  the ownership-axis vocabularies and their validator.  It grew at the
+#:               BUGFIX phase: external review #5 found `settlement` and `process_liveness`
+#:               carrying members `pause_policy` does not accept, so the two tuples were
+#:               narrowed to the authority's own and the reasoning was written down beside
+#:               them.  The range END moved with the added lines; the region OUTSIDE it is
+#:               still pinned byte-for-byte to `BASELINE_REV`, which is what the digest
+#:               below proves, so widening the range cannot hide a policy edit.
 #: The additive region itself is checked by V-5, per D4.1.
-CONTRACTS_ADDITIVE_RANGES = ((9, 9), (88, 105), (110, 198))
+CONTRACTS_ADDITIVE_RANGES = ((9, 9), (88, 105), (110, 218))
 
 #: The digest of `contracts.py`'s policy region.  Equal, byte for byte, to `BASELINE_REV`'s
 #: `contracts.py` minus the single line below -- which the test PROVES rather than asserts,

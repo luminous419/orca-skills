@@ -7,9 +7,10 @@ This module does exactly that, and it does it by RUNNING the repository's real
 `run_workflow.py --adapter standalone` in a process whose `PATH` cannot resolve `orca` and
 whose environment carries no `ORCA_*` marker.
 
-The harness is `artifacts/runs/run_54d90086bd75/evidence/r10_standalone_e2e.sh`, kept as a
-run artefact rather than inlined here so the evidence a reader inspects is the same script
-CI executes.  It refuses to start (exit 90) if `orca` is still resolvable, so a run that
+The harness is `scripts/os37_r10_standalone_e2e.sh`, a TRACKED script rather than an
+inlined string, so the evidence a reader inspects is the same script CI executes.  It used
+to live in an untracked run directory, which made this module unrunnable from a clean
+checkout (external review #1).  It refuses to start (exit 90) if `orca` is still resolvable, so a run that
 produced the right artefacts while quietly reaching an Orca binary cannot be mistaken for a
 pass.
 
@@ -29,8 +30,10 @@ from pathlib import Path
 from scripts import os37_r10_fixture as r10_fixture
 
 REPO = Path(__file__).resolve().parent.parent
-HARNESS = (REPO / "artifacts" / "runs" / "run_54d90086bd75" / "evidence"
-           / "r10_standalone_e2e.sh")
+#: The E2E driver, TRACKED (external review #1).  It used to be read out of
+#: `artifacts/runs/run_54d90086bd75/evidence/`, an untracked run directory -- a clean
+#: checkout has no such file, and only the ORCA_OS37_E2E gate kept CI from noticing.
+HARNESS = REPO / "scripts" / "os37_r10_standalone_e2e.sh"
 
 #: Gated on an env var nothing sets, and declared in `scripts/tolerated_skip_manifest.txt`
 #: with this exact reason.

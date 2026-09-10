@@ -317,14 +317,52 @@ class LauncherWiringTests(unittest.TestCase):
         from pathlib import Path as _Path
 
         from scripts.deterministic_workflow import launcher
+        from scripts.deterministic_workflow.runtime_state import InMemoryRuntimeStateStore
         adapter, state = launcher.build_standalone_adapter(
             {"run_id": "run_wiring", "thread_id": "t", "phases": ["IMPLEMENTATION"]},
             artifact_base=_Path(self.base), run_id="run_wiring",
+            runtime_state=InMemoryRuntimeStateStore(),
             profile_spec=self.profile_spec)
         self.assertEqual(frozenset(state["adapter_capabilities"]),
                          adapter.capabilities(),
                          "the standalone state and its adapter disagree about what the "
                          "runtime can do; D-2(b) exists to close exactly that gap")
+
+    def test_site_2_the_capability_snapshot_is_taken_after_the_ledger(self) -> None:
+        """External review #10: the snapshot must find the identity fence ARMED.
+
+        `build_standalone_state` reads `adapter.capabilities()` once and the result is
+        frozen into the run's state for the whole run.  `external_resume` is declared only
+        when a journal AND a ledger are both wired, so composing the adapter before the
+        ledger froze a declaration WITHOUT it -- and `executor._collect` then refuses every
+        post-receipt recovery with IDEMPOTENCY_RECOVERY_UNSUPPORTED, which is a crash after
+        the receipt being permanently uncollectable.
+
+        Two halves, and neither can be satisfied by the other's fix: the composition
+        REFUSES a ledger-less build by name, and the state it does build declares
+        `external_resume`.
+        """
+        from pathlib import Path as _Path
+
+        from scripts.deterministic_workflow import launcher
+        from scripts.deterministic_workflow.contracts import EXTERNAL_RESUME
+        from scripts.deterministic_workflow.runtime_state import InMemoryRuntimeStateStore
+        with self.assertRaises(launcher.LauncherError) as refused:
+            launcher.build_standalone_adapter(
+                {"run_id": "run_fence", "thread_id": "t", "phases": ["IMPLEMENTATION"]},
+                artifact_base=_Path(self.base), run_id="run_fence",
+                profile_spec=self.profile_spec)
+        self.assertIn(launcher.STANDALONE_ADAPTER_REQUIRES_LEDGER, str(refused.exception))
+        adapter, state = launcher.build_standalone_adapter(
+            {"run_id": "run_fence", "thread_id": "t", "phases": ["IMPLEMENTATION"]},
+            artifact_base=_Path(self.base), run_id="run_fence",
+            runtime_state=InMemoryRuntimeStateStore(),
+            profile_spec=self.profile_spec)
+        self.assertIn(
+            EXTERNAL_RESUME, state["adapter_capabilities"],
+            "the run's frozen capability declaration omits external_resume, so a crash "
+            "after the receipt can never be collected")
+        self.assertIn(EXTERNAL_RESUME, adapter.capabilities())
 
     def test_site_2_the_orca_and_fake_state_builders_are_unchanged(self) -> None:
         """D-2(a): reconciling the other two paths is authorized by no criterion (PR-1)."""

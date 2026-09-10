@@ -519,8 +519,17 @@ class LivePerDriverOutcomeMatrixTests(unittest.TestCase):
             supported_range=((1, 0, 0), (2, 0, 0)),
             driver_env=env,
             auth_secret_ref={"ANTHROPIC_API_KEY": "OS37_E2E_KEY_SOURCE"},
+            # `completion_timeout_ms` is DECLARED here, and it has to be: OS-37's external
+            # review #4 gave completion its own bound instead of borrowing the readiness
+            # one, and its production default is sized for a real agent turn (30 minutes).
+            # This matrix deliberately drives cases that never close both completion gates
+            # -- the timeout case and the unclassifiable-exit case -- so a fixture that did
+            # not declare a bound would sit in `await_completion` for half an hour each.
+            # A fixture's deadline belongs to the fixture; the default belongs to a real
+            # agent.
             timeouts=Timeouts(preflight_timeout_ms=4000, readiness_timeout_ms=6000,
                               delivery_verify_timeout_ms=6000,
+                              completion_timeout_ms=8000,
                               graceful_force_timeout_ms=1500,
                               physical_exit_timeout_ms=3000, force_retry_ms=100),
             **profile_overrides)

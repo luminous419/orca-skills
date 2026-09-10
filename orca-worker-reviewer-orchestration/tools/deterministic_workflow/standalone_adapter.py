@@ -27,8 +27,9 @@ AC-37-20 violation the contract forbids.
 
 The three structural obligations that appear in no signature are met by attributes the
 graph reads off the adapter: ``.runtime_state`` (so ``resolve_runtime_state`` finds a
-durable ledger and ``IDEMPOTENCY_PORT_REQUIRED`` cannot fire), ``.approval_port`` and
-``.settlement_journal``.
+durable ledger and ``IDEMPOTENCY_PORT_REQUIRED`` cannot fire), ``.approval_port``,
+``.settlement_journal`` and -- a DIFFERENT responsibility with a DIFFERENT interface --
+``.pause_row_journal``.
 """
 from __future__ import annotations
 
@@ -37,9 +38,11 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from . import standalone_identity as identity_mod
 from . import standalone_interrupt as interrupt_mod
 from . import standalone_journal as journal_mod
 from . import standalone_pty as pty_supervisor
+from . import standalone_runtime as runtime_mod
 from .contracts import (BASE_CAPABILITIES, EXTERNAL_LOOKUP, EXTERNAL_RESUME,
                         LIFECYCLE_SETTLEMENT, STANDALONE_CAPABILITIES, ActionIntent,
                         ExternalLookupUnavailable, SettlementEvent)
@@ -48,19 +51,45 @@ from .contracts import (BASE_CAPABILITIES, EXTERNAL_LOOKUP, EXTERNAL_RESUME,
 DISPATCH_UNACCOUNTED = "DISPATCH_UNACCOUNTED"
 
 
+def _now() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 class StandaloneAdapter:
     """The standalone runtime's ``AgentExecutionPort`` (+ recovery, + lifecycle settlement)."""
 
     def __init__(self, runtime: Any = None, *, runtime_state: Any = None,
                  settlement_journal: Any = None, approval_port: Any = None,
                  artifact_base: str | os.PathLike[str] = ".", run_id: str = "",
-                 table_reader: Any = None) -> None:
+                 table_reader: Any = None, pause_row_journal: Any = None) -> None:
         # `runtime=None` is a supported, deliberate wiring: `capabilities()` is a
         # declaration about the adapter TYPE and its wiring and reads no process at all, so
         # the capability authority can ask without spawning, adopting or touching anything.
         self.runtime = runtime
         self.runtime_state = runtime_state
+        # TWO journals, because they answer two different questions and have two
+        # different interfaces.  Conflating them is external review finding #9.
+        #
+        # `settlement_journal` is this runtime's own append-only `ExecutionJournal`: the
+        # LifecycleSettlementPort authority behind `open_dispatches`, `axes_for`,
+        # `rows_for` and `settlement_of`.  It is an NDJSON log of OBSERVATIONS.
+        #
+        # `pause_row_journal` is the engine's `pause_store.FileSettlementJournal`: ONE
+        # promotable row per intent, written by `executor`'s PAUSE and DISPOSE nodes
+        # through `row()` / `record()`.  `ExecutionJournal` has neither method, so wiring
+        # it in here (which `build_standalone_adapter` did) made every pause raise
+        # `AttributeError` inside `_settlement_row`'s broad `except Exception` and report
+        # the misleading `DISPATCH_UNACCOUNTED`.
+        #
+        # There is deliberately no duck-typed shim: a `row()` bolted onto the execution
+        # journal would hide exactly the distinction that got this wrong.  And
+        # `graph.build_graph` is NOT taught to look for this attribute -- it is a pinned
+        # policy module and the ticket's invariant is that the standalone work adds no
+        # branch to it.  The COMPOSITION ROOT passes this journal to `build_graph(journal=)`
+        # explicitly, which is the seam that already exists for exactly this.
         self.settlement_journal = settlement_journal
+        self.pause_row_journal = pause_row_journal
         self.approval_port = approval_port
         self.artifact_base = Path(artifact_base)
         self.run_id = run_id or getattr(runtime, "run_id", "")
@@ -126,7 +155,21 @@ class StandaloneAdapter:
         not this caller survives.  Both properties hold at once.
         """
         session = self._require_runtime().session_for(intent)
-        return session.run_dispatch(lease_token=lease_token)
+        self._journal_planned(intent, session)
+        try:
+            return session.run_dispatch(lease_token=lease_token)
+        except runtime_mod.StandaloneDispatchFailed as failure:
+            # EXTERNAL REVIEW #8.  This is the executor/launcher boundary, and before this
+            # it did not exist: `executor._settle_now` calls `adapter.start` and has no
+            # handler, so a readiness timeout, an auth expiry, an OOM kill or a missing
+            # result propagated out of the graph as a traceback and took the whole run with
+            # it.  A dispatch that could not produce a verdict is still an OUTCOME, and the
+            # engine has a vocabulary for it, so it is settled here as a TYPED FAILED
+            # settlement and routed by the engine's own policy.
+            #
+            # `settle_failed` re-raises if the lifecycle refuses the edge, so this is not a
+            # catch-all that can swallow an incoherent state.
+            return session.settle_failed(failure, lease_token=lease_token)
 
     def spawn_only(self, intent: ActionIntent, *,
                    lease_token: str | None = None, **kwargs: Any) -> Mapping[str, Any]:
@@ -175,11 +218,79 @@ class StandaloneAdapter:
         return session.interrupt(reason)
 
     # ---- 6/6 settlement -----------------------------------------------------------------
+    def _receipt_fence(self, intent_id: str) -> str:
+        """The ``session_id:process_incarnation`` the DURABLE RECEIPT for this intent names.
+
+        Empty when no ledger is wired or no receipt was recorded -- there is then nothing
+        to fence against, and an empty fence never rejects, exactly as in :meth:`resume`.
+        An unreadable ledger RAISES: unknown is not absence.
+        """
+        if self.runtime_state is None:
+            return ""
+        try:
+            stored = self.runtime_state.get_receipt(intent_id)
+        except Exception as exc:  # noqa: BLE001 - unreadable is unknown, not absent
+            raise ExternalLookupUnavailable(
+                f"the runtime-state ledger is unreadable: {exc}") from exc
+        return str(((stored or {}).get("receipt") or {}).get("external_id") or "")
+
+    def _journal_settlement(self, intent_id: str, *,
+                            expected_fence: str) -> SettlementEvent | None:
+        """This run's terminal journal row for ``intent_id``, FENCED against ``expected_fence``.
+
+        The journal is an append-only file under the run root and a *foreign or replayed*
+        incarnation can have written a terminal row into it.  A row whose
+        ``session_id:process_incarnation`` contradicts the fence is therefore not this
+        dispatch's settlement and is skipped -- the same rule :meth:`resume` applies to the
+        receipt it is handed.  ``expected_fence=""`` disables the comparison, because a
+        composition with no receipt to fence against has nothing to contradict.
+        """
+        rows = self.settlement_journal.rows_for(intent_id)   # raises when unreadable
+        for row in reversed(rows):
+            if row["kind"] != "SETTLEMENT_OBSERVED":
+                continue
+            event = (row.get("source_vocabulary") or {}).get("event")
+            if not isinstance(event, dict):
+                continue
+            fence = f"{row['session_id']}:{row['process_incarnation']}"
+            if expected_fence and fence != expected_fence:
+                continue
+            return event
+        return None
+
+    def _stored_settlement(self, intent_id: str) -> SettlementEvent | None:
+        """The settlement the authorities hold, WITHOUT the identity fence.
+
+        Private on purpose: the only callers are :meth:`settlement` and :meth:`resume`, and
+        each applies its OWN fence to the answer -- the ledger receipt's for the first, the
+        caller's receipt for the second.  Nothing outside this class may read a settlement
+        that no fence has been applied to.
+        """
+        rows_readable = self.settlement_journal.rows_for(intent_id)  # raises when unreadable
+        if self.runtime_state is not None:
+            stored = self.runtime_state.get_settlement(intent_id)
+            if stored is not None:
+                return stored
+        for row in reversed(rows_readable):
+            if row["kind"] == "SETTLEMENT_OBSERVED":
+                event = (row.get("source_vocabulary") or {}).get("event")
+                if isinstance(event, dict):
+                    return event
+        return None
+
     def settlement(self, intent_id: str) -> SettlementEvent | None:
         """``None`` **only** to prove absence; an unreadable authority RAISES.
 
         Answerable by a stranger process: it reads the ledger and the journal, both plain
         files under the run root, and holds none of the creating process's objects.
+
+        **The journal half is FENCED.**  ``executor._recover`` asks this question FIRST, and
+        harvests whatever it answers -- so with an unfenced answer here the identity fence
+        in :meth:`resume` was unreachable through the production recovery ladder and a
+        replayed terminal row from a foreign incarnation would have been collected as this
+        dispatch's verdict.  The LEDGER's settlement is not fenced and must not be: it is
+        written only by this run's executor under its own lease token, and it is the
+        authority the journal file mirrors.
         """
         if self.settlement_journal is None:
             if self.runtime_state is None:
@@ -187,8 +298,48 @@ class StandaloneAdapter:
                     f"{intent_id}: no settlement authority is wired; absence cannot be "
                     "proven and unknown is never None")
             return self.runtime_state.get_settlement(intent_id)
-        return self.settlement_journal.settlement_of(intent_id,
-                                                     runtime_state=self.runtime_state)
+        # Read the journal FIRST, exactly as `ExecutionJournal.settlement_of` did: an
+        # unreadable journal RAISES even when the ledger holds an answer, because a caller
+        # must not act on a partial view of the two authorities.
+        self.settlement_journal.rows_for(intent_id)          # raises when unreadable
+        if self.runtime_state is not None:
+            stored = self.runtime_state.get_settlement(intent_id)
+            if stored is not None:
+                return stored
+        return self._journal_settlement(intent_id,
+                                        expected_fence=self._receipt_fence(intent_id))
+
+    def _journal_planned(self, intent: ActionIntent, session: Any) -> None:
+        """Open this dispatch's PAUSE ROW, before the effect.  The ``OrcaAdapter`` pattern.
+
+        Part of external review #9.  `pause_store.FileSettlementJournal` is the store the
+        engine's PAUSE and DISPOSE nodes read and promote, and its rows carry a closed field
+        set that includes ``run_id`` -- so a dispatch that never opens a row makes
+        `executor._settlement_row` fail at its very first `journal.record(...)`, whatever
+        journal is wired.  Fixing the WIRING without also opening the row would have moved
+        the failure rather than removed it.
+
+        Every field is this caller's own choice rather than a runtime observation, exactly
+        as `OrcaAdapter._journal_planned`'s are, so none of it can be lost with the effect.
+        A composition with no pause-row journal simply writes nothing here.
+        """
+        if self.pause_row_journal is None:
+            return
+        intent_id = str(intent["intent_id"])
+        run_id = self.run_id or str(intent.get("run_id") or "")
+        role = "phase_reviewer" if intent.get("role") != "WORKER" else "phase_worker"
+        self.pause_row_journal.record(
+            intent_id, stage="PLANNED", run_id=run_id,
+            payload_digest=str(intent.get("payload_digest") or ""),
+            task_id=str(intent.get("task_id") or ""),
+            dispatch_id=str(getattr(session, "dispatch_id", "") or ""),
+            terminal_title=f"os37-{run_id}-{intent_id}",
+            terminal_worktree=str(getattr(session, "worktree_path", "") or ""),
+            terminal_role="active_worker", terminal_origin="standalone_pty",
+            terminal_intended_role=role,
+            terminal_owner=str(getattr(session, "fence", "") or run_id or intent_id),
+            created_by=run_id or intent_id, provenance_source="journal",
+            planned_at=_now())
 
     # ---- +2 ExternalRecoveryPort --------------------------------------------------------
     def lookup(self, intent: ActionIntent) -> Mapping[str, Any] | None:
@@ -248,11 +399,15 @@ class StandaloneAdapter:
         """
         intent_id = str(intent["intent_id"])
         expected_fence = str((receipt or {}).get("external_id") or "")
-        stored = self.settlement(intent_id)
+        if self.settlement_journal is None:
+            return self.settlement(intent_id)
+        # UNFENCED on purpose: the fence below is this method's own act, applied against
+        # the receipt THIS caller holds rather than against whatever the ledger last
+        # recorded.  Reading a pre-fenced value here would make the comparison below a
+        # tautology and the fence unfalsifiable.
+        stored = self._stored_settlement(intent_id)
         if stored is None:
             return None
-        if self.settlement_journal is None:
-            return stored
         rows = self.settlement_journal.rows_for(intent_id)   # raises when unreadable
         for row in reversed(rows):
             if row["kind"] != "SETTLEMENT_OBSERVED":
@@ -287,19 +442,53 @@ class StandaloneAdapter:
         return journal_mod.recover_handle(self.settlement_journal, intent_id,
                                          verified_digest=verified)
 
+    #: The pause-row columns the journal can answer, and the ``source_vocabulary`` key each
+    #: is read from.  Named as data so the mapping is legible and so nothing here invents a
+    #: value: a column the journal never recorded stays EMPTY and the pause authority
+    #: refuses the row, which is the correct outcome for a dispatch nothing named.
+    _PROVENANCE_COLUMNS = {"terminal_title": "pty_id", "terminal_digest": "session_digest",
+                           "terminal_role": "terminal_role",
+                           "terminal_origin": "terminal_origin",
+                           "terminal_owner": "terminal_owner"}
+
     def account_dispatch(self, intent_id: str) -> Mapping[str, Any]:
         """READ-ONLY: issues no mutation and no command, so repeating it is always safe.
 
-        It reads the four axes off the journal and, where a live session exists in this
-        process, refines the liveness axis from a process probe.  It sends no signal and
-        writes nothing -- which a syscall spy asserts rather than this docstring.
+        It reads the four axes and the terminal PROVENANCE off the journal.  It sends no
+        signal and writes nothing -- which a syscall spy asserts rather than this docstring.
+
+        **Why the provenance columns are here.**  They used to be absent, so every
+        standalone row reached ``pause_policy.require_pause_disposition`` with
+        ``provenance_source=""``, ``terminal_role=""`` and ``terminal_owner=""``; that is
+        ``residual``, which is not an AC-1 discharging disposition, so a perfectly accounted
+        standalone dispatch raised ``TERMINAL_OWNERSHIP_UNKNOWN`` and BLOCKED the pause.
+        The journal has known these facts since the spawn -- role, origin, the identity
+        fence, the pty id and its digest -- so the row now carries them and a retained
+        session is discharged as ``retained_by_named_owner``, by name, with an owner a
+        stranger process can re-read.  Nothing is fabricated: an intent whose journal never
+        named a role still reports ``unknown_role`` and is still refused.
         """
         if self.settlement_journal is None:
             raise RuntimeError(
                 f"{DISPATCH_UNACCOUNTED}: no durable settlement journal is wired")
+        rows = self.settlement_journal.rows_for(intent_id)     # raises when unreadable
         axes = dict(self.settlement_journal.axes_for(intent_id))
         row: dict[str, Any] = {"intent_id": intent_id, **axes,
-                               "terminal_disposition": "", "recovery": "observed"}
+                               "terminal_disposition": "", "recovery": "observed",
+                               "provenance_source": "journal" if rows else "absent"}
+        for column in self._PROVENANCE_COLUMNS:
+            row[column] = ""
+        for column, key in self._PROVENANCE_COLUMNS.items():
+            for record in reversed(rows):
+                value = (record.get("source_vocabulary") or {}).get(key)
+                if value:
+                    row[column] = str(value)
+                    break
+        for column in ("task_id", "dispatch_id"):
+            for record in reversed(rows):
+                if record.get(column):
+                    row[column] = str(record[column])
+                    break
         return row
 
     def recover_dispatch(self, intent_id: str, *, reason: str) -> Mapping[str, Any]:
@@ -316,7 +505,10 @@ class StandaloneAdapter:
             kind="EVENT", derived_from="runtime_state", intent_id=intent_id,
             event="settlement_accepted", state="LOST", lost_reason="settlement_unconfirmed",
             axes={"settlement": "recovered", "worker_resource": "retain",
-                  "process_liveness": "unverifiable", "cleanup_authority": "unknown"},
+                  # `disputed`, not `unverifiable`: the pause/settlement authority owns
+                  # this vocabulary and its fail-closed member for "no authority
+                  # establishes this" is `disputed`.  It is never `already exited`.
+                  "process_liveness": "disputed", "cleanup_authority": "unknown"},
             source_vocabulary={"reason": reason}))
         return {"settlement": "recovered",
                 "recovery": f"abandon:outcome_unknown:{reason}"}
@@ -346,10 +538,28 @@ class StandaloneAdapter:
         snapshot = session._snapshot()
         observed = pty_supervisor.row_for(snapshot, int(session.record["pid"])) \
             if snapshot.get("readable") else None
-        outcome = interrupt_mod.release_terminal(
-            session.record, authority=authority,
-            worker_resource=axes["worker_resource"], observed=observed,
-            releaser=lambda scope, permit: session.release())
+        try:
+            outcome = interrupt_mod.release_terminal(
+                session.record, authority=authority,
+                worker_resource=axes["worker_resource"], observed=observed,
+                releaser=lambda scope, permit: session.release())
+        except identity_mod.OwnershipRefused as refused:
+            # A REFUSAL, returned by name -- not an exception through the PAUSE node.
+            #
+            # This is the same family as external review #5 and #9: `executor._settlement_row`
+            # calls this verb for any row whose axes say `authorized`+`release`, which a
+            # SETTLED standalone dispatch's axes do, and the ownership re-verification then
+            # cannot succeed because the process has ALREADY EXITED and left the process
+            # table.  The exception escaped into the pause node's broad handler and every
+            # settled standalone run was reported `DISPATCH_UNACCOUNTED`.
+            #
+            # Nothing is released and nothing is claimed: the row keeps
+            # `process_liveness="already exited"` from its own settlement record, which is
+            # what discharges it as `exited`, and the refusal is named so an operator can
+            # see that this process did not perform a release rather than assuming one.
+            return {"recovery": "retained:ownership_unverifiable",
+                    "refusal": str(refused).split(":", 2)[0] or "ownership_refused",
+                    "process_liveness": axes["process_liveness"]}
         if outcome["released"]:
             self.settlement_journal.append(journal_mod.make_record(
                 kind="RELEASED", derived_from="pty", intent_id=intent_id,

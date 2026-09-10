@@ -137,6 +137,19 @@ def _standalone_observation(artifact_base: Any, capabilities: Any) -> Any:
         capabilities=capabilities)
 
 
+def _standalone_pause_row_journal(artifact_base: Any, run_id: str) -> Any:
+    """This run's PAUSE-ROW journal -- ``pause_store.FileSettlementJournal``, not the log.
+
+    A different object from :func:`_standalone_journal_for` on purpose (external review
+    #9): that one is the append-only `ExecutionJournal` the LifecycleSettlementPort reads,
+    this one is the promotable one-row-per-intent store `executor`'s PAUSE and DISPOSE
+    nodes write through ``row()``/``record()``.  Same run, same artifact base, two files,
+    two interfaces.
+    """
+    from .pause_store import journal_for
+    return journal_for(run_id, artifact_base=artifact_base)
+
+
 def build_standalone_state(spec: dict[str, Any], adapter: Any) -> dict[str, Any]:
     """OS-37 D-2(b): the standalone runtime carries ONE capability declaration, not two.
 
@@ -184,7 +197,25 @@ def build_standalone_adapter(spec: dict[str, Any], *, artifact_base: Path,
                                 journal=journal)
     adapter = StandaloneAdapter(runtime, runtime_state=runtime_state,
                                 settlement_journal=journal,
+                                pause_row_journal=_standalone_pause_row_journal(
+                                    artifact_base, resolved_run),
                                 artifact_base=artifact_base, run_id=resolved_run)
+    # ---- OS-37 external review #10: the capability SNAPSHOT comes LAST ----------------
+    # `build_standalone_state` reads `adapter.capabilities()`, and `external_resume` is
+    # declared only when the identity fence has an authority to live in -- i.e. only once
+    # `runtime_state` is attached.  `run_cli` used to build the adapter here, build the
+    # state from it, and only THEN construct the durable ledger, so the snapshot was taken
+    # with `runtime_state=None` and the run permanently declared no `external_resume`:
+    # `executor._collect` then refused every post-receipt recovery with
+    # IDEMPOTENCY_RECOVERY_UNSUPPORTED, making a crash after the receipt unrecoverable.
+    # The ledger is now threaded in BEFORE the snapshot, and this refusal makes the
+    # ordering structural rather than a comment.
+    if runtime_state is None:
+        raise LauncherError(
+            f"{STANDALONE_ADAPTER_REQUIRES_LEDGER}: the durable runtime-state ledger must "
+            "be constructed BEFORE the standalone adapter, because the capability "
+            "declaration this state carries is snapshotted from the live adapter and "
+            "external_resume is withdrawn while the identity fence has no ledger to live in")
     state = build_standalone_state({**spec, "run_id": resolved_run}, adapter)
     return adapter, state
 
@@ -469,6 +500,11 @@ ADAPTERS = (FAKE_ADAPTER, ORCA_ADAPTER, STANDALONE_ADAPTER)
 STANDALONE_ADAPTER_REQUIRES_STATE = "STANDALONE_ADAPTER_REQUIRES_STATE"
 STANDALONE_ADAPTER_REQUIRES_PROFILE = "STANDALONE_ADAPTER_REQUIRES_PROFILE"
 STANDALONE_ADAPTER_UNSUPPORTED_HERE = "STANDALONE_ADAPTER_UNSUPPORTED_HERE"
+#: OS-37 external review #10.  The capability declaration the standalone state carries is a
+#: SNAPSHOT of the live adapter, and `external_resume` is withdrawn while the identity fence
+#: has no ledger to live in -- so composing the adapter before the ledger silently produced
+#: a run that could never collect an effect an earlier process created.  Refused by name.
+STANDALONE_ADAPTER_REQUIRES_LEDGER = "STANDALONE_ADAPTER_REQUIRES_LEDGER"
 
 # Refusals the production path raises BEFORE any Orca effect exists.
 ORCA_ADAPTER_REQUIRES_STATE = "ORCA_ADAPTER_REQUIRES_STATE"
@@ -1261,6 +1297,7 @@ def _watchdog_wiring(args: argparse.Namespace, *, runner: Any = None,
                 adapter = StandaloneAdapter(
                     None, runtime_state=ledger,
                     settlement_journal=_standalone_journal_for(base, run_id),
+                    pause_row_journal=journal,
                     approval_port=approval_port, artifact_base=base, run_id=run_id)
             else:
                 adapter = FakeAdapter(list(results), runtime_state=ledger,
@@ -1464,14 +1501,24 @@ def run_cli(argv: list[str] | None = None) -> int:
             return 0
         state, results, orca_spec = _launch_inputs(args)
         from .runtime_state import FileRuntimeStateStore
+        runtime_state: Any = None
         if args.adapter == STANDALONE_ADAPTER:
             # OS-37 WI-13.  The standalone composition, in the SAME order the Orca path
-            # composes in: journal, ledger, adapter, state.  Unlike the Orca path it needs
-            # no Run to exist first -- there is no external Run at all -- so the run id
-            # comes from the launch spec and names only this runtime's own files.
+            # composes in -- with the LEDGER moved ahead of the adapter, which is external
+            # review finding #10.  The ledger has to exist first because the state this
+            # call returns carries a SNAPSHOT of `adapter.capabilities()`, and
+            # `external_resume` is withdrawn while the identity fence has no ledger to live
+            # in; taking the snapshot first made every standalone run declare no recovery
+            # capability at all.  Unlike the Orca path this needs no Run to exist -- there
+            # is no external Run -- so the run id comes from the launch spec and names only
+            # this runtime's own files.
+            resolved_run = orca_spec.get("run_id", "") or state.get("run_id", "")
+            runtime_state = FileRuntimeStateStore(
+                Path(args.runtime_state) if args.runtime_state
+                else default_runtime_state_path(resolved_run, state["thread_id"]))
             adapter, state = build_standalone_adapter(
                 orca_spec, artifact_base=Path(args.artifact_base),
-                run_id=orca_spec.get("run_id", "") or state.get("run_id", ""),
+                run_id=resolved_run, runtime_state=runtime_state,
                 profile_spec=_standalone_profile_spec(args))
         if args.adapter == ORCA_ADAPTER:
             # The production path.  The Run is created FIRST, because the run id it
@@ -1485,26 +1532,39 @@ def run_cli(argv: list[str] | None = None) -> int:
                 agent_profile_name=args.agent_profile, project_root=args.project_root)
         # Durable by default: without an explicit path the run still gets a real on-disk
         # ledger, because an unguarded default is exactly what lets a restart duplicate an
-        # external Task/Dispatch.
-        ledger_path = Path(args.runtime_state) if args.runtime_state else default_runtime_state_path(
-            state["run_id"], state["thread_id"])
-        runtime_state = FileRuntimeStateStore(ledger_path)
+        # external Task/Dispatch.  The standalone branch already built one above, and
+        # rebuilding it here would point the adapter at a ledger the capability snapshot
+        # was not taken against.
+        if runtime_state is None:
+            ledger_path = (Path(args.runtime_state) if args.runtime_state
+                           else default_runtime_state_path(state["run_id"],
+                                                           state["thread_id"]))
+            runtime_state = FileRuntimeStateStore(ledger_path)
         if args.adapter == ORCA_ADAPTER:
             adapter.runtime_state = runtime_state
         elif args.adapter == STANDALONE_ADAPTER:
-            # The adapter and its runtime were composed above around this run id; the
-            # durable ledger is threaded into BOTH, because `StandaloneSession.start`
-            # writes its one `record_receipt` through it under the caller's lease token.
-            adapter.runtime_state = runtime_state
-            if adapter.runtime is not None:
-                adapter.runtime.runtime_state = runtime_state
+            pass          # already threaded into the adapter AND its runtime, before the
+                          # capability snapshot that the state carries.
         else:
             from .fake_adapter import FakeAdapter
             adapter = FakeAdapter(results, runtime_state=runtime_state)
+        graph_extras: dict[str, Any] = {}
+        pause_rows = getattr(adapter, "pause_row_journal", None)
+        if pause_rows is not None:
+            # OS-37 external review #9, wired HERE rather than in `graph.py`.  `build_graph`
+            # otherwise falls back to `adapter.settlement_journal`, which for the standalone
+            # adapter is the append-only `ExecutionJournal` -- an object with no `row()` and
+            # no `record()`.  The PAUSE and DISPOSE nodes call both, the `AttributeError`
+            # was swallowed by `_settlement_row`'s broad handler, and every pause on a
+            # standalone run was reported as `DISPATCH_UNACCOUNTED`.  `graph.py` is a pinned
+            # policy module and this ticket adds no branch to it; the journal seam it
+            # already exposes is the correct place to say which journal this composition
+            # means.
+            graph_extras["journal"] = pause_rows
         final = execute_state(state, adapter=adapter, runtime_state=runtime_state,
                               recursion_limit=args.recursion_limit,
                               checkpoint_store_path=args.checkpoint_store,
-                              artifact_base=Path(args.artifact_base))
+                              artifact_base=Path(args.artifact_base), **graph_extras)
     except LauncherError as exc:
         print(f"run_workflow: {exc}", file=sys.stderr)
         return USAGE_EXIT_CODE

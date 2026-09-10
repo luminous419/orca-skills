@@ -83,7 +83,11 @@ def profile(**overrides) -> StandaloneProfile:
         completion_records=(CompletionSelector(channel="structured",
                                                record_type="result",
                                                error_field="is_error"),),
-        timeouts=Timeouts(preflight_timeout_ms=3000, readiness_timeout_ms=5000))
+        # The completion bound is DECLARED, not inherited.  Its production default is
+        # sized for a real agent turn (external review #4), so a fixture that drives a
+        # non-completing dispatch must name its own or wait half an hour.
+        timeouts=Timeouts(preflight_timeout_ms=3000, readiness_timeout_ms=5000,
+                          completion_timeout_ms=8000))
     fields.update(overrides)
     return StandaloneProfile(**fields)
 
@@ -683,6 +687,7 @@ class LiveInterruptLadderTests(unittest.TestCase):
                        auth_secret_ref={"ANTHROPIC_API_KEY": "OS37_E2E_KEY_SOURCE"},
                        timeouts=Timeouts(preflight_timeout_ms=4000,
                                           readiness_timeout_ms=8000,
+                                          completion_timeout_ms=8000,
                                           graceful_force_timeout_ms=1500,
                                           physical_exit_timeout_ms=3000,
                                           force_retry_ms=100))
@@ -741,6 +746,7 @@ class LiveInterruptLadderTests(unittest.TestCase):
                        auth_secret_ref={"ANTHROPIC_API_KEY": "OS37_E2E_KEY_SOURCE"},
                        timeouts=Timeouts(preflight_timeout_ms=4000,
                                           readiness_timeout_ms=8000,
+                                          completion_timeout_ms=8000,
                                           graceful_force_timeout_ms=1500,
                                           physical_exit_timeout_ms=3000,
                                           force_retry_ms=100))
@@ -797,8 +803,27 @@ class R10RealAgentEvidenceTests(unittest.TestCase):
     """
 
     HARNESS = Path(__file__).resolve().parent / "os37_r10_real_agent.py"
-    EVIDENCE = (Path(__file__).resolve().parent.parent / "artifacts" / "runs"
-                / "run_54d90086bd75" / "evidence" / "r10_real_agent")
+
+    #: WHERE the real-agent evidence of THIS run lives, named by the operator who produced
+    #: it.  It used to be the hard-coded `artifacts/runs/run_54d90086bd75/evidence/
+    #: r10_real_agent`, an untracked directory from one particular run -- so a clean
+    #: checkout could not run these cases at all, and a LATER run's evidence was silently
+    #: never read (external review #1).  There is deliberately no default: evidence about a
+    #: real agent run is evidence about THAT run, and inventing a path would either read
+    #: somebody else's or read nothing while looking like it read something.
+    EVIDENCE_ENV = "ORCA_OS37_R10_EVIDENCE"
+
+    @property
+    def EVIDENCE(self) -> Path:
+        raw = os.environ.get(self.EVIDENCE_ENV, "")
+        self.assertTrue(
+            raw,
+            f"set {self.EVIDENCE_ENV} to the directory the real-agent E2E wrote; these "
+            "cases assert over evidence a run produced and there is no default run")
+        directory = Path(raw)
+        self.assertTrue(directory.is_dir(),
+                        f"{self.EVIDENCE_ENV}={raw!r} is not a directory")
+        return directory
 
     def test_the_real_agent_harness_cannot_author_a_verdict(self) -> None:
         """R-5, as a STATIC property of the harness rather than a claim about it.

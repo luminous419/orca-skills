@@ -954,42 +954,77 @@ class ToleratedSkipManifestTests(unittest.TestCase):
     def test_the_declared_reasons_are_the_ones_the_tests_actually_raise(self) -> None:
         """The manifest must track the live gates, not a remembered wording.
 
-        Reads the reason out of THE MODULE THAT OWNS THE ENTRY, so a change there that is
-        not reconciled into the manifest fails here rather than at the next full lane run.
+        OS-37's external review #12: this check used to be MODULE-WIDE. It asserted that the
+        module owning the entry contained the reason string SOMEWHERE and contained a
+        `skipUnless(`/`skipIf(` SOMEWHERE -- two independent module-scope searches that never
+        met. An entry could name `Foo.test_bar` while the reason lived in an unrelated
+        docstring and the only decorator in the file guarded an unrelated class, and the
+        check stayed green while the manifest and the gate drifted apart.
 
-        OS-37 generalised this in two ways, both strengthening it.  It used to read one
-        hard-coded module (`test_orca_runtime.py`) and match one idiom
-        (`self.skipTest("...")`), so an `always` entry belonging to any other module was
-        checked against the wrong file and an entry using a class-level
-        `@skipUnless(cond, REASON)` gate was unmatchable.  Now the module is derived from
-        each entry's own test id and both idioms are accepted -- so every declared reason is
-        held to the module that really raises it.
+        It is now BOUND PER TEST, for EVERY entry rather than only the `always` ones:
+        `ci_lane.skip_guards_for` resolves the guards that actually apply to the declared
+        `module.Class.method` -- its own decorators, its class's decorators (including a
+        module-level decorator alias such as `@DARWIN_ONLY`), its own `self.skipTest`, and
+        its class's `setUp`/helper `self.skipTest` -- and the declared reason must match one
+        of THOSE. Another test's gate is not a gate on this one.
         """
-        import re
-        declared: dict[str, set[str]] = {}
-        for test_id, entries in ci_lane.load_tolerated_alternatives().items():
-            for condition, reason in entries:
-                if condition == "always":
-                    declared.setdefault(test_id.split(".", 1)[0], set()).add(reason)
-        self.assertTrue(declared, "no 'always' entry is declared at all")
-        for module, reasons in sorted(declared.items()):
+        alternatives = ci_lane.load_tolerated_alternatives()
+        self.assertTrue(alternatives, "the tolerated manifest declares nothing at all")
+        for test_id, entries in sorted(alternatives.items()):
+            module = test_id.split(".", 1)[0]
             path = REPO_ROOT / "scripts" / f"{module}.py"
             with self.subTest(module=module):
                 self.assertTrue(path.exists(),
                                 f"the manifest declares {module}, which does not exist")
-            source = path.read_text(encoding="utf-8")
-            for reason in sorted(reasons):
-                with self.subTest(module=module, reason=reason):
-                    literal = re.search(
-                        r'(?:"""|"|\')' + re.escape(reason) + r'(?:"""|"|\')', source)
+            class_name, _, method_name = test_id.partition(".")[2].partition(".")
+            guards = ci_lane.skip_guards_for(path, class_name, method_name)
+            with self.subTest(test_id=test_id):
+                self.assertTrue(
+                    guards,
+                    f"{test_id} carries NO skip gate of any kind; a manifest entry for a "
+                    "test that cannot skip is stale by construction")
+            for _condition, reason in entries:
+                with self.subTest(test_id=test_id, reason=reason):
                     self.assertTrue(
-                        literal,
-                        f"{module} contains no string literal {reason!r}; the tolerated "
-                        "manifest is stale")
-                    self.assertTrue(
-                        f'self.skipTest("{reason}")' in source
-                        or re.search(r"skipUnless\(|skipIf\(", source),
-                        f"{module} holds the reason but raises no skip with it")
+                        ci_lane.skip_guard_binds(test_id, reason),
+                        f"{test_id} is not guarded by any skip carrying {reason!r}; the "
+                        f"gates it really carries are "
+                        f"{sorted(display for display, _p in guards)!r}")
+
+    def test_the_binding_is_per_test_and_not_merely_per_module(self) -> None:
+        """The strengthening itself, asserted -- otherwise it could quietly regress.
+
+        Two mutations of a real entry, both of which the OLD module-wide check accepted:
+
+        * the same reason attributed to a DIFFERENT test in the same module;
+        * a reason that appears in the module (it is another gate's) but does not guard the
+          declared test.
+
+        Both must now fail to bind, and the true entry must still bind.
+        """
+        true_id = ("test_os37_r10_workflow_e2e.R10WorkflowE2ETests"
+                   ".test_the_workflow_reached_completed")
+        true_reason = ("requires ORCA_OS37_E2E=1; the R10 workflow E2E drives real local "
+                       "agent processes")
+        self.assertTrue(ci_lane.skip_guard_binds(true_id, true_reason))
+        self.assertFalse(
+            ci_lane.skip_guard_binds(
+                "test_os37_r10_workflow_e2e.R10WorkflowE2ETests.test_no_such_test",
+                true_reason),
+            "a reason bound to a test that does not exist must not pass")
+        self.assertFalse(
+            ci_lane.skip_guard_binds(true_id, "requires --orca-runtime and a ready Orca "
+                                              "runtime"),
+            "a reason belonging to another module's gate must not bind here")
+        # A gate that lives on a DIFFERENT class of the SAME module is not this test's gate.
+        self.assertFalse(
+            ci_lane.skip_guard_binds(
+                "test_review_isolation.ProfileRenderingTests"
+                ".test_t86f_a_generated_profile_actually_parses",
+                "the seatbelt backend is darwin-only; T-8.9 carries the fail-closed "
+                "guarantee on every other platform"),
+            "ProfileRenderingTests carries the sandbox gate, not the darwin one; a "
+            "module-wide search cannot tell the two apart")
 
 
 class LangGraphSkipManifestTests(unittest.TestCase):
