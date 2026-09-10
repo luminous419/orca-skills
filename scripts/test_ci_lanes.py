@@ -954,17 +954,42 @@ class ToleratedSkipManifestTests(unittest.TestCase):
     def test_the_declared_reasons_are_the_ones_the_tests_actually_raise(self) -> None:
         """The manifest must track the live gates, not a remembered wording.
 
-        Reads the reason out of the test module's source, so a change there that is not
-        reconciled into the manifest fails here rather than at the next full lane run.
+        Reads the reason out of THE MODULE THAT OWNS THE ENTRY, so a change there that is
+        not reconciled into the manifest fails here rather than at the next full lane run.
+
+        OS-37 generalised this in two ways, both strengthening it.  It used to read one
+        hard-coded module (`test_orca_runtime.py`) and match one idiom
+        (`self.skipTest("...")`), so an `always` entry belonging to any other module was
+        checked against the wrong file and an entry using a class-level
+        `@skipUnless(cond, REASON)` gate was unmatchable.  Now the module is derived from
+        each entry's own test id and both idioms are accepted -- so every declared reason is
+        held to the module that really raises it.
         """
-        declared = {reason for entries in ci_lane.load_tolerated_alternatives().values()
-                    for condition, reason in entries if condition == 'always'}
-        source = (REPO_ROOT / "scripts" / "test_orca_runtime.py").read_text(encoding="utf-8")
-        for reason in declared:
-            with self.subTest(reason=reason):
-                self.assertIn(
-                    f'self.skipTest("{reason}")', source,
-                    f"no test raises {reason!r}; the tolerated manifest is stale")
+        import re
+        declared: dict[str, set[str]] = {}
+        for test_id, entries in ci_lane.load_tolerated_alternatives().items():
+            for condition, reason in entries:
+                if condition == "always":
+                    declared.setdefault(test_id.split(".", 1)[0], set()).add(reason)
+        self.assertTrue(declared, "no 'always' entry is declared at all")
+        for module, reasons in sorted(declared.items()):
+            path = REPO_ROOT / "scripts" / f"{module}.py"
+            with self.subTest(module=module):
+                self.assertTrue(path.exists(),
+                                f"the manifest declares {module}, which does not exist")
+            source = path.read_text(encoding="utf-8")
+            for reason in sorted(reasons):
+                with self.subTest(module=module, reason=reason):
+                    literal = re.search(
+                        r'(?:"""|"|\')' + re.escape(reason) + r'(?:"""|"|\')', source)
+                    self.assertTrue(
+                        literal,
+                        f"{module} contains no string literal {reason!r}; the tolerated "
+                        "manifest is stale")
+                    self.assertTrue(
+                        f'self.skipTest("{reason}")' in source
+                        or re.search(r"skipUnless\(|skipIf\(", source),
+                        f"{module} holds the reason but raises no skip with it")
 
 
 class LangGraphSkipManifestTests(unittest.TestCase):

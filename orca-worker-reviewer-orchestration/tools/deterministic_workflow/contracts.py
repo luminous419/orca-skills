@@ -6,6 +6,7 @@ import hmac
 import json
 import re
 from copy import deepcopy
+from collections.abc import Mapping
 from typing import Any, Literal, TypedDict
 
 SCHEMA_VERSION = "os40.workflow.v2"
@@ -84,10 +85,116 @@ RECOVERY_CAPABILITIES = frozenset({EXTERNAL_LOOKUP, EXTERNAL_RESUME})
 # declare it, and pause then correctly falls back to the pre-OS-31 BLOCK behaviour.
 LIFECYCLE_SETTLEMENT = "lifecycle_settlement"
 PAUSE_CAPABILITIES = frozenset({"human_approval", LIFECYCLE_SETTLEMENT})
-CAPABILITIES = BASE_CAPABILITIES | RECOVERY_CAPABILITIES | frozenset({
+# ---- OS-37 standalone CLI execution adapter (ADDITIVE ONLY) -------------------------
+# The five tokens `docs/AGENT_EXECUTION_CONTRACT.md:403-405` proposes for a runtime that
+# owns local processes itself.  They are ADDITIVE: `CAPABILITIES` is only ever read as the
+# allowed SUPERSET (`state.py`'s subset validation), so widening it forbids nothing that
+# was previously allowed and changes no existing declaration.  `BASE_CAPABILITIES` above
+# is deliberately NOT touched -- `test_deterministic_workflow_graph.py` builds
+# `BASE_CAPABILITIES - {"agent_interrupt"}` to prove the validate gate fires, and adding a
+# member there would change what every existing adapter is required to declare.
+PTY_SESSION = "pty_session"                          # the runtime owns a real pty session
+PROMPT_DELIVERY_VERIFIED = "prompt_delivery_verified"  # delivery is PROVEN, not assumed
+INTERRUPT_LADDER = "interrupt_ladder"                # graceful -> bounded wait -> force
+PROCESS_GROUP_OWNERSHIP = "process_group_ownership"  # signals are ownership-scoped
+SESSION_REDISCOVERY = "session_rediscovery"          # a stranger process can re-query
+STANDALONE_CAPABILITIES = frozenset({
+    PTY_SESSION, PROMPT_DELIVERY_VERIFIED, INTERRUPT_LADDER, PROCESS_GROUP_OWNERSHIP,
+    SESSION_REDISCOVERY,
+})
+CAPABILITIES = BASE_CAPABILITIES | RECOVERY_CAPABILITIES | STANDALONE_CAPABILITIES | frozenset({
     "human_approval", "dispatch_provenance", "dependency_edges", "runtime_ownership",
     LIFECYCLE_SETTLEMENT,
 })
+
+# ---- OS-37 W-2 / AC-37-13: the four ownership axes, as four CLOSED vocabularies -------
+# `docs/AGENT_EXECUTION_CONTRACT.md` keeps these four questions apart on purpose: a
+# settled dispatch says nothing about whether its worker resource may be reused, which
+# says nothing about whether the process is alive, which says nothing about whether anyone
+# is authorized to clean it up.  Collapsing any pair is how a live process gets reported
+# as released.  The vocabularies mirror `pause_policy`'s (which owns the pause half) and
+# are pinned equal to it by a parity test rather than by a cross-package import: this
+# module is the runtime-neutral core and takes no sibling import.
+SETTLEMENT_AXIS = ("settled", "recovered", "not_settled", "unknown")
+WORKER_RESOURCE_AXIS = ("reuse", "retain", "release", "unsupervised")
+PROCESS_LIVENESS_AXIS = ("live", "already exited", "disputed", "unverifiable")
+CLEANUP_AUTHORITY_AXIS = ("authorized", "not_authorized", "unknown")
+OWNERSHIP_AXIS_VOCABULARIES: dict[str, tuple[str, ...]] = {
+    "settlement": SETTLEMENT_AXIS,
+    "worker_resource": WORKER_RESOURCE_AXIS,
+    "process_liveness": PROCESS_LIVENESS_AXIS,
+    "cleanup_authority": CLEANUP_AUTHORITY_AXIS,
+}
+OWNERSHIP_AXIS_KEYS = tuple(OWNERSHIP_AXIS_VOCABULARIES)
+
+
+class OwnershipAxes(TypedDict):
+    """All four axes, ALWAYS all four.  There is deliberately no default and no Optional.
+
+    A caller that can only answer three axes has an unknown on the fourth, and `unknown`
+    is a member of every vocabulary that admits one -- it is never expressed by omitting
+    the key, because an omitted key reads as "irrelevant" at every call site.
+    """
+
+    settlement: str
+    worker_resource: str
+    process_liveness: str
+    cleanup_authority: str
+
+
+class VocabularyError(ValueError):
+    """A value outside a closed vocabulary was offered where a member is required."""
+
+
+def validate_vocabulary_member(vocabulary: Any, value: Any, *, name: str = "value") -> str:
+    """Return ``value`` iff it is a member of ``vocabulary``; otherwise RAISE.
+
+    AC-37-07's mechanism.  It raises rather than substituting a default because a value
+    outside a closed set is an unknown, and reducing an unknown to a default -- or to a
+    boolean -- is exactly what the ticket forbids.
+    """
+    members = tuple(vocabulary)
+    if not isinstance(value, str) or value not in members:
+        raise VocabularyError(
+            f"{name}={value!r} is not a member of the closed vocabulary {members!r}")
+    return value
+
+
+def validate_axes(value: Any) -> OwnershipAxes:
+    """Validate all four axes together, or raise.
+
+    Validating them together is the point: three valid axes and one missing key is not a
+    partial answer, it is an invalid one.
+    """
+    if not isinstance(value, Mapping) or set(value) != set(OWNERSHIP_AXIS_KEYS):
+        raise VocabularyError(
+            f"ownership axes must carry exactly {OWNERSHIP_AXIS_KEYS!r}, got "
+            f"{sorted(value) if isinstance(value, Mapping) else type(value).__name__!r}")
+    return {  # type: ignore[return-value]
+        key: validate_vocabulary_member(OWNERSHIP_AXIS_VOCABULARIES[key], value[key],
+                                        name=key)
+        for key in OWNERSHIP_AXIS_KEYS
+    }
+
+
+# ---- OS-37 AC-37-14: host scope, as a CLOSED tagged union -----------------------------
+# The MVP owns local processes only.  A remote or GUI scope is not "not yet implemented
+# and therefore local"; it is unparsable, and `parse_host_scope` returns None for it.
+# None is a reportable absence, never a default that silently localises a remote handle.
+HOST_SCOPE_KINDS = ("local",)
+HostScope = Literal["local"]
+
+
+def parse_host_scope(value: Any) -> str | None:
+    """The parsed host scope, or ``None`` when the value names no scope this build knows.
+
+    Deliberately NOT ``value or "local"``.  Defaulting an unparsable scope to ``local``
+    would let a handle minted for another host be signalled here, which is the single
+    worst thing a process supervisor can get wrong.
+    """
+    if isinstance(value, str) and value in HOST_SCOPE_KINDS:
+        return value
+    return None
 
 Phase = Literal["ANALYSIS", "PLAN", "DESIGN", "IMPLEMENTATION", "TEST", "BUGFIX", "REFACTORING"]
 Role = Literal["WORKER", "PHASE_REVIEWER", "FINAL_REVIEWER"]

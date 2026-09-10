@@ -1,0 +1,128 @@
+#!/bin/sh
+# OS-37 G-fixture stub CLI.  Its behaviour is chosen by OS37_STUB_MODE so that one binary
+# covers the version, auth, update-notice, permission-prompt and readiness cases without any
+# real CLI being installed.  Following the `scripts/fake_bin/fake-agent` precedent, it is not
+# named after any agent.
+# The session id the runtime minted arrives on ARGV, exactly as a real driver passes it
+# (`--session-id <minted>`).  Reading it from argv rather than from the environment is what
+# makes the readiness quorum's R-B genuinely exercisable: R-B compares a value the CLI
+# echoes back against one minted locally microseconds before the spawn, so a fixture that
+# read it from the environment would be testing a different mechanism.
+SESSION_ID="${OS37_STUB_SESSION_ID:-}"
+WANT_VERSION=0
+WANT_HELP=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --session-id) SESSION_ID="$2"; shift 2 ;;
+    --version) WANT_VERSION=1; shift ;;
+    --help) WANT_HELP=1; shift ;;
+    *) shift ;;
+  esac
+done
+
+# A real CLI answers --version and --help WHATEVER else it is doing, and preflight relies on
+# that: `check_version` and the flag check run the same binary under the same child env, so a
+# stub that only answered them in a dedicated mode would make preflight refuse
+# (`version_unreadable`) before the mode under test ever ran.  The version-specific modes
+# below still override this, because they exist to exercise the parser's failure paths.
+case "${OS37_STUB_MODE:-ready}" in
+  version-garbage|version-old|version-silent) : ;;
+  *)
+    if [ "$WANT_VERSION" = "1" ]; then echo "os37-stub-cli 1.2.3"; exit 0; fi
+    if [ "$WANT_HELP" = "1" ]; then
+      echo "--bare --settings --strict-mcp-config --mcp-config --session-id -p"
+      echo "--output-format stream-json --include-partial-messages --permission-mode"
+      echo "--debug-file --no-session-persistence exec --json --ignore-user-config"
+      echo "--ephemeral -C --add-dir --skip-git-repo-check --color -s -o"
+      exit 0
+    fi ;;
+esac
+
+case "${OS37_STUB_MODE:-ready}" in
+  version-ok)        echo "os37-stub-cli 1.2.3"; exit 0 ;;
+  version-garbage)   echo "not a version at all"; exit 0 ;;
+  version-old)       echo "os37-stub-cli 0.0.1"; exit 0 ;;
+  version-silent)    exit 0 ;;
+  auth-absent)       echo "You are not logged in."; exit 1 ;;
+  auth-interactive)  echo "Please log in to continue."; sleep 30; exit 0 ;;
+  auth-ok)           exit 0 ;;
+  help)              echo "--bare --settings --session-id -p --output-format stream-json"; exit 0 ;;
+  update-notice)     echo "An update is available. Install now? [y/N]"; sleep 30; exit 0 ;;
+  permission)        echo "Allow this tool to write to /etc/hosts?"; sleep 30; exit 0 ;;
+  no-readiness)      echo '{"type":"banner","text":"hello"}'; exit 0 ;;
+  ready)             printf '{"type":"system","session_id":"%s"}\n' "$SESSION_ID"; exit 0 ;;
+  ready-foreign)     # A well-formed record of the DECLARED type carrying a FOREIGN session
+                     # id.  The negative half of the readiness quorum: live process, live
+                     # CLI, correct record shape, wrong identifier -- and that alone must be
+                     # enough to refuse, because R-B is equality against a locally minted
+                     # value and not a pattern.
+                     printf '{"type":"system","session_id":"s-someone-else"}\n'; exit 0 ;;
+  ready-slow)        # Emits the readiness record and then STAYS ALIVE, so R-A's liveness
+                     # legs can be observed while the process is genuinely running.
+                     sleep 0.3
+                     printf '{"type":"system","session_id":"%s"}\n' "$SESSION_ID"
+                     sleep 20; exit 0 ;;
+  agent)             # A WHOLE supervised turn, and it answers according to the ROLE it was
+                     # actually dispatched for.  The prompt this runtime delivers is the
+                     # canonical intent JSON, so the role is IN it -- which is what lets one
+                     # fixture drive a real Worker -> Reviewer workflow instead of only ever
+                     # answering as a Worker and making every reviewer settlement fail
+                     # `validate_event` with "unknown reviewer result".
+                     #
+                     # Emit readiness, read the delivered frame (one line, because the
+                     # runtime writes the frame then Enter), emit a structured turn-start and
+                     # result, then the body the SHARED settlement parser reads -- including a
+                     # well-formed OS-42 decision gate, because a body without one is
+                     # correctly refused by the gate and repaired to exhaustion.  Exit 0 so
+                     # the wrapper writes the exit sentinel, which is the second of the two
+                     # completion gates.
+                     printf '{"type":"system","session_id":"%s"}\n' "$SESSION_ID"
+                     IFS= read -r PROMPT || PROMPT=""
+                     printf '{"type":"message_start"}\n'
+                     printf '{"type":"result","subtype":"success"}\n'
+                     case "$PROMPT" in
+                       *REVIEWER*) printf 'RESULT: PASS\n' ;;
+                       *)          printf 'STATUS: COMPLETE\n' ;;
+                     esac
+                     printf 'DECISION_GATE_STATE: CLEAR\n'
+                     # The repository's OWN canonical CLEAR record, from
+                     # scripts/fixtures/decision_gate/valid/worker_clear.json, with the run,
+                     # phase, role and source binding substituted for the ones this dispatch
+                     # really carries.  Emitting the repo's fixture rather than hand-rolling
+                     # the nineteen-field schema keeps this E2E a test of the STANDALONE
+                     # RUNTIME instead of a test of whether the fixture author remembered
+                     # OS-42's gate contract.
+                     printf '```decision-gate\n'
+                     if [ -n "${OS37_STUB_GATE_RECORD:-}" ]; then
+                       printf '%s\n' "$OS37_STUB_GATE_RECORD"
+                     else
+                       cat "$(dirname "$0")/../decision_gate_clear.json"
+                     fi
+                     printf '```\n'
+                     exit 0 ;;
+  alive)             # A live child that emits NOTHING.  The interrupt ladder's fixture: it
+                     # must be interruptible without ever having produced a readiness or a
+                     # completion record, because the ladder does not depend on either.
+                     sleep 30; exit 0 ;;
+  deliver-claude)    # DELIVERY, per driver.  Emits nothing until the prompt frame arrives,
+                     # then answers with the record `ClaudeDriver.turn_start_evidence` looks
+                     # for -- and with NOTHING ELSE, so `delivered_confirmed` can only be
+                     # reached through that driver's own proof and never through the frame
+                     # echo.
+                     IFS= read -r _PROMPT || _PROMPT=""
+                     printf '{"type":"message_start"}\n'
+                     sleep 5; exit 0 ;;
+  deliver-codex)     # The same, through `CodexDriver.turn_start_evidence`'s record instead.
+                     IFS= read -r _PROMPT || _PROMPT=""
+                     printf '{"type":"item.started","item":{"id":"item_0"}}\n'
+                     sleep 5; exit 0 ;;
+  complete-claude)   # COMPLETION / FAILURE, per driver: the record
+                     # `ClaudeDriver.completion_record` selects, then a real exit whose code
+                     # the caller chooses so the exit-status half is a real waitpid status.
+                     printf '{"type":"result","subtype":"success"}\n'
+                     exit "${OS37_STUB_EXIT_CODE:-0}" ;;
+  complete-codex)    printf '{"type":"turn.completed","usage":{"input_tokens":1}}\n'
+                     exit "${OS37_STUB_EXIT_CODE:-0}" ;;
+  exit-code)         exit "${OS37_STUB_EXIT_CODE:-0}" ;;
+  *)                 echo "unknown OS37_STUB_MODE"; exit 64 ;;
+esac

@@ -122,6 +122,73 @@ def build_state(spec: dict[str, Any]) -> dict[str, Any]:
         raise LauncherError(f"invalid state specification: {exc}") from exc
 
 
+def _standalone_journal_for(artifact_base: Any, run_id: str) -> Any:
+    """This run's standalone execution journal.  Adopts nothing and claims nothing."""
+    from .standalone_journal import ExecutionJournal
+    return ExecutionJournal(artifact_base, run_id)
+
+
+def _standalone_observation(artifact_base: Any, capabilities: Any) -> Any:
+    """The OS-37 standalone ``RunObservationPort``.  Invokes no Orca CLI."""
+    from .standalone_adapter import StandaloneRunObservation
+    return StandaloneRunObservation(
+        artifact_base,
+        journal_factory=lambda run_id: _standalone_journal_for(artifact_base, run_id),
+        capabilities=capabilities)
+
+
+def build_standalone_state(spec: dict[str, Any], adapter: Any) -> dict[str, Any]:
+    """OS-37 D-2(b): the standalone runtime carries ONE capability declaration, not two.
+
+    ``build_state`` above reads ``spec["capabilities"]``, so an operator's JSON and the
+    adapter's own ``capabilities()`` are two independent declarations that nothing
+    reconciles -- and ``validate_node`` gates on the FORMER while the ladder depends on the
+    LATTER.  For a runtime born in this ticket that gap is closable at no cost, so the
+    standalone path populates ``adapter_capabilities`` from the LIVE adapter.
+
+    **The Orca and fake paths are deliberately NOT changed** -- D-2(a).  Reconciling them
+    there is authorized by no acceptance criterion and would change routing for existing
+    runs and for historical replay.  That residual is carried forward as PR-1, named, with a
+    follow-up ticket proposed rather than silently fixed here.
+    """
+    return build_state({**spec, "capabilities": sorted(adapter.capabilities())})
+
+
+def build_standalone_adapter(spec: dict[str, Any], *, artifact_base: Path,
+                             run_id: str = "", runtime_state: Any = None,
+                             profile_spec: Any = None) -> tuple[Any, dict[str, Any]]:
+    """Compose the standalone adapter and the state it declares, in the fixed order.
+
+    Composition order matches the Orca path's exactly -- journal, then ledger, then the
+    adapter, then the state -- because the state is named after the run the ledger is keyed
+    on, and deriving either from the other would name something that does not exist.
+    """
+    from .standalone_adapter import StandaloneAdapter
+    from .standalone_journal import ExecutionJournal
+    from .standalone_profile import profile_from_mapping
+    from .standalone_runtime import StandaloneRuntime
+
+    resolved_run = run_id or spec.get("run_id") or "run_standalone"
+    if profile_spec is None:
+        raise LauncherError(
+            f"{STANDALONE_ADAPTER_REQUIRES_PROFILE}: --adapter standalone needs an explicit "
+            "driver profile; there is deliberately no built-in CLI table (AC-37-03)")
+    try:
+        profile = profile_from_mapping(profile_spec)
+    except Exception as exc:  # noqa: BLE001 - a malformed profile refuses before any spawn
+        raise LauncherError(
+            f"{STANDALONE_ADAPTER_REQUIRES_PROFILE}: {exc}") from exc
+    journal = ExecutionJournal(artifact_base, resolved_run)
+    runtime = StandaloneRuntime(artifact_base=artifact_base, run_id=resolved_run,
+                                profile=profile, runtime_state=runtime_state,
+                                journal=journal)
+    adapter = StandaloneAdapter(runtime, runtime_state=runtime_state,
+                                settlement_journal=journal,
+                                artifact_base=artifact_base, run_id=resolved_run)
+    state = build_standalone_state({**spec, "run_id": resolved_run}, adapter)
+    return adapter, state
+
+
 # ---- OS-43 CRITICAL: the Coordinator's half of the run-scoped execution authority -----
 def _execution_authority(checkpointer: Any) -> tuple[Any, str]:
     """The authority guarding THIS run's checkpoint store, or ``(None, "")``.
@@ -388,7 +455,20 @@ def execute_state(raw_state: dict[str, Any], *, adapter: Any, checkpointer: Any 
 
 FAKE_ADAPTER = "fake"
 ORCA_ADAPTER = "orca"
-ADAPTERS = (FAKE_ADAPTER, ORCA_ADAPTER)
+# OS-37 WI-13.  The standalone runtime owns local agent processes itself and needs no Orca
+# process, binary, API or terminal lifecycle.  C-DESIGN-1: `--adapter` is declared at THREE
+# argparse sites over this one shared tuple, and dispatched at four more, so adding a member
+# here widens seven surfaces at once.  Every one of those seven is enumerated in DESIGN
+# D1.2, and the arms where `standalone` is meaningless are EXPLICIT REFUSALS rather than
+# fall-throughs -- a silent fall-through would compose a fake adapter under a standalone
+# flag, which is the worst possible reading of an operator's intent.
+STANDALONE_ADAPTER = "standalone"
+ADAPTERS = (FAKE_ADAPTER, ORCA_ADAPTER, STANDALONE_ADAPTER)
+
+# Refusals the standalone path raises BEFORE any process exists.
+STANDALONE_ADAPTER_REQUIRES_STATE = "STANDALONE_ADAPTER_REQUIRES_STATE"
+STANDALONE_ADAPTER_REQUIRES_PROFILE = "STANDALONE_ADAPTER_REQUIRES_PROFILE"
+STANDALONE_ADAPTER_UNSUPPORTED_HERE = "STANDALONE_ADAPTER_UNSUPPORTED_HERE"
 
 # Refusals the production path raises BEFORE any Orca effect exists.
 ORCA_ADAPTER_REQUIRES_STATE = "ORCA_ADAPTER_REQUIRES_STATE"
@@ -589,7 +669,17 @@ def build_parser() -> argparse.ArgumentParser:
                              "Orca runtime present; `orca` is the production path -- it "
                              "creates a real Orca Run and dispatches real agents through "
                              "OrcaAdapter, which is where the bounded validation-repair "
-                             "loop actually runs")
+                             "loop actually runs; `standalone` is the OS-37 headless "
+                             "runtime, which owns local agent processes itself and needs "
+                             "no Orca process, binary, API or terminal lifecycle")
+    parser.add_argument("--standalone-profile", default="",
+                        help="JSON file describing the driver profile --adapter standalone "
+                             "launches with (binary, supported version range, bin_dirs, "
+                             "auth secret REFERENCES, and the declared readiness records "
+                             "that are READY's only accepting evidence). May instead be "
+                             "given as `standalone_profile` inside --state. There is "
+                             "deliberately no default: AC-37-03 requires explicit "
+                             "configuration rather than a built-in CLI table")
     parser.add_argument("--objective", default="",
                         help="the Run objective (required by --adapter orca)")
     parser.add_argument("--agent-profile", default="",
@@ -905,11 +995,24 @@ def run_pause_cli(argv: list[str]) -> int:
         ledger = FileRuntimeStateStore(default_runtime_state_path(args.run_id,
                                                                  record["thread_id"]))
         journal = pause_store.journal_for(args.run_id, artifact_base=base)
-        if getattr(args, "adapter", FAKE_ADAPTER) == ORCA_ADAPTER:
+        selected = getattr(args, "adapter", FAKE_ADAPTER)
+        if selected == ORCA_ADAPTER:
             adapter = build_orca_adapter_for_run(
                 args.run_id, artifact_base=base, runtime_state=ledger,
                 run_owner=args.run_owner,
                 project_root=Path(args.project_root) if args.project_root else None)
+        elif selected == STANDALONE_ADAPTER:
+            # An EXPLICIT REFUSAL, not a fall-through to the fake composition.  `resume`
+            # re-enters a run whose paused round was dispatched to a process this
+            # invocation does not own: the standalone runtime's authority is its own
+            # journal and ledger, and re-entering a round with a fresh, process-less
+            # adapter would silently discard the identity fence the paused round holds.
+            # Named here so an operator gets a refusal rather than a wrong composition.
+            raise LauncherError(
+                f"{STANDALONE_ADAPTER_UNSUPPORTED_HERE}: --adapter standalone cannot "
+                "resume a paused round from this CLI; the standalone runtime's dispatch "
+                "state is re-queried through standalone_journal.rediscover in the process "
+                "that owns the session")
         else:
             adapter = FakeAdapter(results, runtime_state=ledger, run_id=args.run_id,
                                   settlement_journal=journal)
@@ -1150,6 +1253,15 @@ def _watchdog_wiring(args: argparse.Namespace, *, runner: Any = None,
                     project_root=(Path(args.project_root)
                                   if getattr(args, "project_root", "") else None),
                     harness_factory=harness_factory)
+            elif adapter_name == STANDALONE_ADAPTER:
+                # OS-37 W-3.  The standalone runtime a recovery re-enters with is bound to
+                # THIS run's own durable journal and ledger, exactly as the Orca branch
+                # binds the stalled run's own harness.
+                from .standalone_adapter import StandaloneAdapter
+                adapter = StandaloneAdapter(
+                    None, runtime_state=ledger,
+                    settlement_journal=_standalone_journal_for(base, run_id),
+                    approval_port=approval_port, artifact_base=base, run_id=run_id)
             else:
                 adapter = FakeAdapter(list(results), runtime_state=ledger,
                                       run_id=run_id, settlement_journal=journal,
@@ -1186,6 +1298,18 @@ def _watchdog_wiring(args: argparse.Namespace, *, runner: Any = None,
             ledger, journal = bindings_for(run_id)
             return OrcaAdapter(None, runtime_state=ledger, settlement_journal=journal,
                                approval_port=approval_port).capabilities()
+        if adapter_name == STANDALONE_ADAPTER:
+            # OS-37 D10.2.  `runtime=None` mirrors the Orca branch above for the same
+            # stated reason: asking what an adapter can do must not spawn, adopt or touch
+            # anything, or the run would look alive to the very gate deciding whether it
+            # is stalled.  This branch reads no process at all.
+            from .standalone_adapter import StandaloneAdapter
+            ledger, _journal = bindings_for(run_id)
+            return StandaloneAdapter(
+                None, runtime_state=ledger,
+                settlement_journal=_standalone_journal_for(base, run_id),
+                approval_port=approval_port, artifact_base=base,
+                run_id=run_id).capabilities()
         return adapter_for(run_id)[0].capabilities()
 
     from . import turn_boundary
@@ -1194,9 +1318,20 @@ def _watchdog_wiring(args: argparse.Namespace, *, runner: Any = None,
         # The Orca listing authority is the real CLI boundary.  Where no `orca` binary
         # answers, the read RAISES and the sweep fails closed at R1 -- it never reads
         # "no dispatch is running" out of silence.
-        "observation": recovery_runtime.RunObservationAdapter(
-            base, runner=runner or turn_boundary._default_runner,
-            capabilities=capabilities_for),
+        # OS-37 DD-3 / W-3.  A standalone deployment has no `orca` binary to list
+        # dispatches, so the Orca listing authority would raise for every run and the
+        # sweep would fail closed at R1 forever.  The standalone observation answers the
+        # same fact from the run's OWN durable journal, keeping the three-way discipline
+        # exactly: unreadable RAISES (F1), "no open dispatch" is an empty tuple -- an
+        # ABSENCE, not an UNSUPPORTED -- and an uncovered fact still raises
+        # ObservationUnsupported.  F6/F7 are NOT relaxed; they gain a real authority.
+        # The orca and fake arms are byte-unchanged.
+        "observation": (
+            _standalone_observation(base, capabilities_for)
+            if adapter_name == STANDALONE_ADAPTER
+            else recovery_runtime.RunObservationAdapter(
+                base, runner=runner or turn_boundary._default_runner,
+                capabilities=capabilities_for)),
         "liveness": recovery_runtime.CoordinatorLivenessReader(base),
         # The gate and the outcome->action table BOTH read this clock: `react` stamps a
         # backoff deadline on it and a later sweep -- in a later process -- decides
@@ -1329,6 +1464,15 @@ def run_cli(argv: list[str] | None = None) -> int:
             return 0
         state, results, orca_spec = _launch_inputs(args)
         from .runtime_state import FileRuntimeStateStore
+        if args.adapter == STANDALONE_ADAPTER:
+            # OS-37 WI-13.  The standalone composition, in the SAME order the Orca path
+            # composes in: journal, ledger, adapter, state.  Unlike the Orca path it needs
+            # no Run to exist first -- there is no external Run at all -- so the run id
+            # comes from the launch spec and names only this runtime's own files.
+            adapter, state = build_standalone_adapter(
+                orca_spec, artifact_base=Path(args.artifact_base),
+                run_id=orca_spec.get("run_id", "") or state.get("run_id", ""),
+                profile_spec=_standalone_profile_spec(args))
         if args.adapter == ORCA_ADAPTER:
             # The production path.  The Run is created FIRST, because the run id it
             # returns is what the state, the artifact paths and the ledger are all named
@@ -1347,6 +1491,13 @@ def run_cli(argv: list[str] | None = None) -> int:
         runtime_state = FileRuntimeStateStore(ledger_path)
         if args.adapter == ORCA_ADAPTER:
             adapter.runtime_state = runtime_state
+        elif args.adapter == STANDALONE_ADAPTER:
+            # The adapter and its runtime were composed above around this run id; the
+            # durable ledger is threaded into BOTH, because `StandaloneSession.start`
+            # writes its one `record_receipt` through it under the caller's lease token.
+            adapter.runtime_state = runtime_state
+            if adapter.runtime is not None:
+                adapter.runtime.runtime_state = runtime_state
         else:
             from .fake_adapter import FakeAdapter
             adapter = FakeAdapter(results, runtime_state=runtime_state)
@@ -1367,6 +1518,27 @@ def run_cli(argv: list[str] | None = None) -> int:
     return summary["exit_code"]
 
 
+def _standalone_profile_spec(args: argparse.Namespace) -> dict[str, Any] | None:
+    """The driver profile, from ``--standalone-profile`` or from the state spec.
+
+    Returns ``None`` when neither supplies one, so ``build_standalone_adapter`` refuses by
+    name.  There is deliberately no default profile: AC-37-03 requires explicit
+    configuration, and a built-in CLI table is exactly what U7 is routed around.
+    """
+    path = getattr(args, "standalone_profile", "")
+    if path:
+        spec = _read_json(path, "--standalone-profile")
+        if not isinstance(spec, dict):
+            raise LauncherError("the standalone profile must be a JSON object")
+        return spec
+    if getattr(args, "state", ""):
+        state_spec = _read_json(args.state, "--state")
+        if isinstance(state_spec, dict) and isinstance(
+                state_spec.get("standalone_profile"), dict):
+            return state_spec["standalone_profile"]
+    return None
+
+
 def _launch_inputs(
     args: argparse.Namespace,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
@@ -1381,6 +1553,23 @@ def _launch_inputs(
         if not args.state:
             raise LauncherError(
                 f"{ORCA_ADAPTER_REQUIRES_STATE}: --adapter orca needs --state")
+        spec = _read_json(args.state, "--state")
+        if not isinstance(spec, dict):
+            raise LauncherError("state specification must be a JSON object")
+        return build_state(spec), [], spec
+    if args.adapter == STANDALONE_ADAPTER:
+        # A standalone run scripts nothing either, for the same reason: it drives real
+        # local agent processes.  The state built here is PROVISIONAL -- `main` rebuilds it
+        # through `build_standalone_state` around the live adapter's own capabilities, which
+        # is D-2(b) -- so this call exists only to validate the spec and refuse early.
+        if not args.state:
+            raise LauncherError(
+                f"{STANDALONE_ADAPTER_REQUIRES_STATE}: --adapter standalone needs --state")
+        if args.results:
+            raise LauncherError(
+                f"{STANDALONE_ADAPTER_REQUIRES_STATE}: --results is the fake adapter's "
+                "scripted input; --adapter standalone drives real local processes and "
+                "scripts nothing")
         spec = _read_json(args.state, "--state")
         if not isinstance(spec, dict):
             raise LauncherError("state specification must be a JSON object")

@@ -1,0 +1,17 @@
+#!/bin/sh
+# OS-37 negative fixture stub: prints its own environment NAMES and its open descriptors,
+# then exits 0.  NAMES ONLY -- never a value.  The redaction discipline is the same one the
+# journal and every artefact hold: an environment VALUE printed into a test log is a leaked
+# credential, and `CLAUDE_CODE_MESSAGING_TOKEN` / `ORCA_AGENT_HOOK_TOKEN` are exactly that.
+#
+# Deliberately not named after any agent CLI: the child environment policy is what is under
+# test, not any real binary's behaviour.
+echo "--- env-names ---"
+env | sed 's/=.*//' | sort
+echo "--- open-fds ---"
+if [ -d /dev/fd ]; then
+  ls /dev/fd 2>/dev/null | sort
+fi
+echo "--- orca-on-path ---"
+if command -v orca >/dev/null 2>&1; then echo "REACHABLE"; else echo "UNREACHABLE"; fi
+exit 0
