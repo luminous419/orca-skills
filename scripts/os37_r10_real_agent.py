@@ -283,6 +283,27 @@ def codex_profile(worktree: str, codex_home: str, **overrides):
 PROFILES = {"claude": claude_profile, "codex": codex_profile}
 
 
+def profile_document(profile: Any) -> dict[str, Any]:
+    """The JSON document an operator writes, derived from the profile object.
+
+    `build_standalone_adapter` takes the operator's MAPPING and runs it through
+    `standalone_profile.profile_from_mapping`, which is the door AC-37-03 requires every
+    launch to pass.  Handing it a document rather than a pre-built object is what makes the
+    R10 evidence say something about that door; the round trip is exact (see
+    `test_os37_r10_composition_root`), so nothing about the profile is lost on the way.
+    """
+    import dataclasses
+
+    def plain(value: Any) -> Any:
+        if isinstance(value, (tuple, list)):
+            return [plain(item) for item in value]
+        if isinstance(value, dict):
+            return {key: plain(item) for key, item in value.items()}
+        return value
+
+    return plain(dataclasses.asdict(profile))
+
+
 # ---- one dispatch through the UNCHANGED standalone runtime -------------------------------
 def dispatch(*, cli: str, role: str, step: int, prompt: str, worktree: str,
              artifact_base: Path, run_id: str, codex_home: str = "",
@@ -295,10 +316,9 @@ def dispatch(*, cli: str, role: str, step: int, prompt: str, worktree: str,
     process with a FRESH IDENTITY -- step 4 is never step 2 resumed, which D13.6(a) requires
     of the "fresh Final Review".
     """
-    from scripts.deterministic_workflow import standalone_journal as sj
+    from scripts.deterministic_workflow import launcher
     from scripts.deterministic_workflow.runtime_state import InMemoryRuntimeStateStore
-    from scripts.deterministic_workflow.standalone_runtime import (StandaloneDispatchFailed,
-                                                                   StandaloneSession)
+    from scripts.deterministic_workflow.standalone_runtime import StandaloneDispatchFailed
     profile = (PROFILES[cli](worktree, codex_home) if cli == "codex"
                else PROFILES[cli](worktree))
     if cli == "codex":
@@ -315,14 +335,36 @@ def dispatch(*, cli: str, role: str, step: int, prompt: str, worktree: str,
               "round_kind": "PHASE_GATE"}
     ledger = InMemoryRuntimeStateStore()
     claim = ledger.claim(intent)
-    journal = sj.ExecutionJournal(artifact_base, run_id)
-    session = StandaloneSession(
-        intent=intent, profile=profile, artifact_base=artifact_base, run_id=run_id,
-        journal=journal, runtime_state=ledger, worktree_path=worktree,
-        agent_id=f"r10-{cli}-{role}")
+    # ---- OS-37 correction R3: the PRODUCTION COMPOSITION ROOT --------------------------
+    # This harness used to construct `StandaloneSession` itself, which is exactly what the
+    # Final Adversarial Review's R3 objected to: the evidence said nothing about whether the
+    # composition an operator actually gets can drive a real CLI.  It now goes through
+    # `launcher.build_standalone_adapter` -- the SAME call `run_cli` makes -- so the profile
+    # arrives through the operator's JSON door (`profile_from_mapping`), the journal, the
+    # pause-row journal, the durable ledger and the capability snapshot are all composed by
+    # the launcher, and the session below is the ADAPTER'S OWN.
+    #
+    # The one step that is NOT traversed, named rather than glossed: `graph.EXECUTE_INTENT`
+    # -> `AgentExecutionPort.start` composes its payload from the canonical intent, and
+    # `ActionIntent` carries no prose field (see `contracts.ActionIntent`), so the port
+    # method cannot hand a real Claude or Codex agent the Worker/Reviewer prompt this
+    # scenario requires.  Prompt composition is the AGENT PROFILE's responsibility on the
+    # Orca path.  Everything up to and including the adapter's session is the production
+    # composition; the payload is handed to that session's own `run_dispatch`.
+    adapter, launch_state = launcher.build_standalone_adapter(
+        {"run_id": run_id, "thread_id": f"r10-{cli}", "phases": ["IMPLEMENTATION"]},
+        artifact_base=artifact_base, run_id=run_id, runtime_state=ledger,
+        profile_spec=profile_document(profile))
+    journal = adapter.settlement_journal
+    session = adapter.runtime.session_for(intent)
     started = time.time()
     record: dict[str, Any] = {"cli": cli, "role": role, "step": step,
                               "intent_id": intent_id,
+                              # Evidence that the composition root really ran: the frozen
+                              # declaration `build_standalone_state` took off the LIVE
+                              # adapter, not a value this harness chose.
+                              "declared_capabilities": list(
+                                  launch_state["adapter_capabilities"]),
                               "prompt_digest": hashlib.sha256(prompt.encode()).hexdigest(),
                               "started_at": _now()}
     # M-13's probe is DECLARED BY THE PROFILE now, not injected here.  This harness used to
@@ -398,7 +440,12 @@ def four_step_run(cli_by_role: dict[str, str], *, run_index: int,
     subprocess.run(["git", "init", "-q", str(worktree)], check=False,
                    capture_output=True, timeout=60)
     codex_home = tempfile.mkdtemp(prefix=f"os37-r10-codexhome-{run_index}-")
-    run_id = f"r10_real_{run_index}_{uuid.uuid4().hex[:6]}"
+    # R3.  `run_<lowercase alnum>` is the ENGINE's own run-id rule (`state.validate_state`),
+    # and the previous `r10_real_1_ab12cd` form violated it in two ways at once.  That never
+    # showed while this harness built its own `StandaloneSession`; it is fatal the moment
+    # the dispatch goes through `launcher.build_standalone_adapter`, which builds real
+    # workflow state.  A run id the engine would refuse was never a production-shaped one.
+    run_id = f"run_r10x{run_index}x{uuid.uuid4().hex[:6]}"
     steps: list[dict[str, Any]] = []
     result: dict[str, Any] = {"run_index": run_index, "run_id": run_id,
                               "cli_by_role": dict(cli_by_role),

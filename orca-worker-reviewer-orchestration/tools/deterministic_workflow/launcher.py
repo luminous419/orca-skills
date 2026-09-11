@@ -31,7 +31,8 @@ from .contracts import BASE_CAPABILITIES
 from .executor import IdempotencyRecoveryError, terminal_node
 from .runtime_state import (RuntimeStateConflict, resolve_runtime_state,
                             runtime_state_error_code)
-from .state import StateError, initial_state, normalize_malformed_state, validate_state
+from .state import (StateError, initial_state, normalize_malformed_state, typed_update,
+                    validate_state)
 
 # Terminal status -> process exit code.  Distinct non-zero codes let a caller tell a
 # quality/decision block apart from an exhausted iteration budget.
@@ -104,7 +105,27 @@ def default_recursion_limit(state: dict[str, Any]) -> int:
 
 
 def build_state(spec: dict[str, Any]) -> dict[str, Any]:
-    """Build a validated initial state from a small JSON launch specification."""
+    """Build a validated initial state from a small JSON launch specification.
+
+    ---- OS-37 correction R4: the DECLARED decision block ------------------------------
+    ``decision_state`` is optional and defaults to ``initial_state``'s own ``CLEAR``, so a
+    specification that does not name one produces byte-for-byte the state it produced
+    before.  Naming one matters because ``decision_state`` is written by NO graph node --
+    ``state.SET_DECISION`` is its only writer -- so a run launched from this CLI could
+    never carry the NEEDS_INPUT/CONFLICT the pause route reads, and the graph's PAUSE node
+    was therefore unreachable from the command line for EVERY adapter, not just standalone.
+    The approval port alone does not fix that; both halves are the R4 wiring.
+
+    It is a DECLARATION, not an authority, and it buys nothing on its own: PAUSE still
+    requires a real ``human_approval`` port, still reconstructs the dispatch set durably,
+    and still refuses ``PAUSE_NOT_ADMISSIBLE`` unless the approval authority can produce
+    blocked sources that authenticate against this run's real OS-29 ledger.  A declared
+    block with nothing behind it therefore reaches BLOCK, exactly as before.
+
+    The value is applied through the engine's OWN ``SET_DECISION`` command rather than
+    written into the mapping, so an unknown member is refused by ``state.py``'s rule and
+    this function cannot become a second, laxer definition of the decision vocabulary.
+    """
     if not isinstance(spec, dict):
         raise LauncherError("state specification must be a JSON object")
     phases = spec.get("phases") or list(CANONICAL_PHASES)
@@ -113,11 +134,19 @@ def build_state(spec: dict[str, Any]) -> dict[str, Any]:
     capabilities = spec.get("capabilities")
     capabilities = frozenset(capabilities) if capabilities else BASE_CAPABILITIES
     try:
-        return dict(initial_state(
+        state = dict(initial_state(
             run_id=spec.get("run_id", "run_launcher"),
             thread_id=spec.get("thread_id", "launcher"),
             phases=tuple(phases), capabilities=capabilities,
             risk=spec.get("risk", "high"), max_iterations=spec.get("max_iterations", 5)))
+        declared = spec.get("decision_state")
+        if declared is not None:
+            state = dict(validate_state(
+                {**state, **typed_update(
+                    "SET_DECISION", decision_state=declared,
+                    decision_reason_code=spec.get("decision_reason_code"))},
+                expected_thread_id=state["thread_id"]))
+        return state
     except (StateError, TypeError, ValueError, KeyError, IndexError) as exc:
         raise LauncherError(f"invalid state specification: {exc}") from exc
 
@@ -169,12 +198,23 @@ def build_standalone_state(spec: dict[str, Any], adapter: Any) -> dict[str, Any]
 
 def build_standalone_adapter(spec: dict[str, Any], *, artifact_base: Path,
                              run_id: str = "", runtime_state: Any = None,
-                             profile_spec: Any = None) -> tuple[Any, dict[str, Any]]:
+                             profile_spec: Any = None,
+                             approval_port: Any = None) -> tuple[Any, dict[str, Any]]:
     """Compose the standalone adapter and the state it declares, in the fixed order.
 
     Composition order matches the Orca path's exactly -- journal, then ledger, then the
     adapter, then the state -- because the state is named after the run the ledger is keyed
     on, and deriving either from the other would name something that does not exist.
+
+    ``approval_port`` is R4's conditional human-approval authority and defaults to ``None``,
+    which is the pre-R4 composition unchanged: with no port the adapter declares no
+    ``human_approval``, ``routing.pause_admissible`` refuses the route and a decision block
+    still terminates as BLOCKED.  When an operator DOES name an authority
+    (``--approval-authority artifact``) it is threaded in here, BEFORE the capability
+    snapshot below, for exactly the reason external review #10 gives for the ledger: the
+    state carries a frozen copy of ``adapter.capabilities()``, so a port attached after the
+    snapshot would leave the run declaring a capability the adapter has and the state does
+    not -- and ``routing`` reads the state.
     """
     from .standalone_adapter import StandaloneAdapter
     from .standalone_journal import ExecutionJournal
@@ -192,13 +232,30 @@ def build_standalone_adapter(spec: dict[str, Any], *, artifact_base: Path,
         raise LauncherError(
             f"{STANDALONE_ADAPTER_REQUIRES_PROFILE}: {exc}") from exc
     journal = ExecutionJournal(artifact_base, resolved_run)
+    # ---- OS-37 correction R3: the DECLARED worktree reaches the child -----------------
+    # `StandaloneSession.worktree_path` defaults to `os.getcwd()`, and this composition
+    # root never overrode it -- so every agent a shipped `run_workflow.py --adapter
+    # standalone` launched ran in the LAUNCHER's working directory, whatever worktree the
+    # profile declared.  It went unnoticed because a driver whose argv template happens to
+    # carry the worktree still put the agent in the right place; a driver with no such
+    # template simply inherited the launcher's cwd.  (Which drivers those are is the DRIVER
+    # LAYER's business and is deliberately not named here -- D4.1.)  The defect was
+    # invisible until the R10 real-CLI
+    # evidence was re-driven through this function, which is exactly why R3 requires it to
+    # be.
+    #
+    # `or None` keeps the old behaviour for a profile that declares no worktree: the
+    # session then falls back to `os.getcwd()` as before, and nothing about a run that
+    # never named one changes.
     runtime = StandaloneRuntime(artifact_base=artifact_base, run_id=resolved_run,
                                 profile=profile, runtime_state=runtime_state,
-                                journal=journal)
+                                journal=journal,
+                                worktree_path=profile.worktree or None)
     adapter = StandaloneAdapter(runtime, runtime_state=runtime_state,
                                 settlement_journal=journal,
                                 pause_row_journal=_standalone_pause_row_journal(
                                     artifact_base, resolved_run),
+                                approval_port=approval_port,
                                 artifact_base=artifact_base, run_id=resolved_run)
     # ---- OS-37 external review #10: the capability SNAPSHOT comes LAST ----------------
     # `build_standalone_state` reads `adapter.capabilities()`, and `external_resume` is
@@ -470,7 +527,72 @@ def execute_state(raw_state: dict[str, Any], *, adapter: Any, checkpointer: Any 
     # neither raise into the run nor change what the run decided.
     from .audit import drain
     drain(graph_options.get("audit_sink"), final)
+    return _finalize_pause_if_waiting(final, checkpointer=checkpointer,
+                                      artifact_base=artifact_base)
+
+
+#: The named refusal a pause that cannot be RECORDED reports.  It is a member of
+#: `pause_policy.PAUSE_REFUSAL_CODES`, so `terminal_node` already prints it as the reason a
+#: run BLOCKED rather than folding it into an ordinary decision block.
+PAUSE_RECORD_NOT_WRITTEN = "PAUSE_RECORD_MISSING"
+
+
+def _finalize_pause_if_waiting(final: dict[str, Any], *, checkpointer: Any,
+                               artifact_base: Path | None) -> dict[str, Any]:
+    """Write the Tier-2 pause record after ``invoke`` returned.  R4's third wiring.
+
+    ``pause_runtime.finalize_pause`` had NO production caller: `resume_run` calls it for a
+    re-pause and the OS-31 fixtures call it themselves, but the ordinary graph entry point
+    -- this one, the one `run_workflow.py` uses -- never did.  A run that paused therefore
+    reached ``WAITING_FOR_INPUT``, published its clarification request and committed its
+    checkpoint, and then left NO durable pause record at all: `discover` could not list it,
+    `resume` refused it with `PAUSE_RECORD_MISSING`, and the pause was unrecoverable.  That
+    is the lifecycle-journal defect R4 suspected the missing approval port was masking, and
+    it was invisible for exactly that reason -- with no approval capability the PAUSE node
+    was unreachable, so nothing ever got far enough to notice.
+
+    Deliberately OUTSIDE the held execution-authority section: the record is the pause's
+    own durable authority and is claimed through `pause_store`, not through the run's
+    execution lease, and writing it under a lease that `_settle_or_release` has already let
+    go would be claiming an ownership this caller no longer has.
+
+    **Fail-closed.**  A pause that cannot be recorded must not be REPORTED as a pause:
+    nothing could ever resume it, and exit code 4 would tell an operator to wait for a
+    human on a run no `discover` will ever list.  The refusal is converted into the
+    ordinary BLOCKED terminal, named, exactly as `pause_node`'s own refusals are.
+
+    ``artifact_base is None`` means this caller named no run root, so there is nowhere a
+    pause record belongs; the state is returned untouched, which is what every in-process
+    test that drives the graph without an artifact tree already relies on.
+    """
+    if final.get("run_lifecycle") != "WAITING_FOR_INPUT" or artifact_base is None:
+        return final
+    from . import pause_runtime, pause_store
+    store_path = getattr(checkpointer, "path", None)
+    if store_path is None:
+        return _pause_not_recorded(
+            final, "the checkpointer names no durable store path, so a pause record "
+                   "would name a checkpoint store nothing can reopen")
+    try:
+        pause_runtime.finalize_pause(
+            final, saver=checkpointer,
+            store=pause_store.store_for(final["run_id"], artifact_base=artifact_base),
+            checkpoint_store_path=str(store_path), artifact_base=artifact_base)
+    except pause_runtime.PauseRefused as exc:
+        return _pause_not_recorded(final, str(exc), code=exc.code)
+    except (OSError, ValueError, KeyError) as exc:  # noqa: BLE001 - unrecorded is refused
+        return _pause_not_recorded(final, f"{type(exc).__name__}: {exc}")
     return final
+
+
+def _pause_not_recorded(final: dict[str, Any], detail: str,
+                        code: str = PAUSE_RECORD_NOT_WRITTEN) -> dict[str, Any]:
+    """Turn an unrecordable pause into the BLOCKED terminal, with the reason named."""
+    blocked = dict(final)
+    blocked["run_lifecycle"] = "ACTIVE"
+    blocked["route_token"] = "BLOCK"
+    blocked["terminal_reason"] = {"code": code, "message": detail}
+    return terminal_node(blocked)
 
 
 # ---- OS-42 F-002: the production Orca execution path ---------------------------------
@@ -505,6 +627,31 @@ STANDALONE_ADAPTER_UNSUPPORTED_HERE = "STANDALONE_ADAPTER_UNSUPPORTED_HERE"
 #: has no ledger to live in -- so composing the adapter before the ledger silently produced
 #: a run that could never collect an effect an earlier process created.  Refused by name.
 STANDALONE_ADAPTER_REQUIRES_LEDGER = "STANDALONE_ADAPTER_REQUIRES_LEDGER"
+
+# ---- OS-37 correction R4: the CONFIGURED human-approval authority --------------------
+# `routing.pause_admissible` requires BOTH `human_approval` and `lifecycle_settlement`, and
+# the standalone composition declared only the second, so the graph's own PAUSE node was
+# unreachable for `--adapter standalone` -- a decision block terminated the run as BLOCKED
+# instead of becoming a durable, resumable pause.
+#
+# The fix is a WIRING, not a policy change, and it is deliberately CONDITIONAL.  Declaring
+# `human_approval` unconditionally would assert of every standalone run that a human
+# authority exists to answer it, which is exactly the dishonest declaration
+# `StandaloneAdapter.capabilities` refuses to make for `external_resume` on a wiring that
+# cannot back it.  So the authority is named by the operator, once, at the composition
+# root, and `NO_APPROVAL_AUTHORITY` is the default: a run launched without it composes
+# byte-for-byte the adapter it composed before, declares no `human_approval`, and still
+# routes a decision block to BLOCK.
+#
+# `ARTIFACT_APPROVAL_AUTHORITY` names the real OS-30 `ArtifactHumanApprovalPort` over the
+# run's own artifact base -- the SAME authority `run_pause_cli` and `_watchdog_wiring`
+# already resolve through `_artifact_approval_port`, so a run that pauses is answerable by
+# the `discover`/`resume` verbs that already ship.  There is no third member and no
+# stand-in: an authority that cannot really publish, show and ingest a decision is not one.
+NO_APPROVAL_AUTHORITY = "none"
+ARTIFACT_APPROVAL_AUTHORITY = "artifact"
+APPROVAL_AUTHORITIES = (NO_APPROVAL_AUTHORITY, ARTIFACT_APPROVAL_AUTHORITY)
+UNKNOWN_APPROVAL_AUTHORITY = "UNKNOWN_APPROVAL_AUTHORITY"
 
 # Refusals the production path raises BEFORE any Orca effect exists.
 ORCA_ADAPTER_REQUIRES_STATE = "ORCA_ADAPTER_REQUIRES_STATE"
@@ -716,6 +863,17 @@ def build_parser() -> argparse.ArgumentParser:
                              "given as `standalone_profile` inside --state. There is "
                              "deliberately no default: AC-37-03 requires explicit "
                              "configuration rather than a built-in CLI table")
+    parser.add_argument("--approval-authority", choices=APPROVAL_AUTHORITIES,
+                        default=NO_APPROVAL_AUTHORITY,
+                        help="the human-approval authority --adapter standalone composes "
+                             "with. `none` (the default) declares no `human_approval` "
+                             "capability, so a decision block terminates the run as "
+                             "BLOCKED exactly as before; `artifact` names the real OS-30 "
+                             "ArtifactHumanApprovalPort over --artifact-base, which makes "
+                             "the graph's PAUSE node reachable and the run answerable by "
+                             "the `discover`/`resume` verbs. It is deliberately opt-in: "
+                             "declaring the capability on a run no human is watching would "
+                             "assert an authority that does not exist")
     parser.add_argument("--objective", default="",
                         help="the Run objective (required by --adapter orca)")
     parser.add_argument("--agent-profile", default="",
@@ -1485,6 +1643,28 @@ def _artifact_approval_port(base: Path) -> Any:
     return ArtifactHumanApprovalPort(base)
 
 
+def configured_approval_port(authority: str, base: Path) -> Any:
+    """The approval authority the OPERATOR named, or ``None``.  R4's whole conditionality.
+
+    ``None`` is not a degraded port and is never substituted for one: it is the absence of
+    an authority, and the adapter's own ``capabilities()`` reads it as such and withdraws
+    ``human_approval``.  That is the same discipline the recovery capabilities already
+    follow -- declared on the wiring that makes them honourable, withdrawn when it is
+    absent -- rather than a flag that turns a declaration on while nothing backs it.
+
+    Refused by name for an unknown member so a typo cannot silently compose a run with no
+    authority under a flag that says it has one; ``build_parser`` already constrains the
+    command line, and this is the second line of defence for a programmatic caller.
+    """
+    if authority == NO_APPROVAL_AUTHORITY:
+        return None
+    if authority == ARTIFACT_APPROVAL_AUTHORITY:
+        return _artifact_approval_port(base)
+    raise LauncherError(
+        f"{UNKNOWN_APPROVAL_AUTHORITY}: {authority!r} is not one of "
+        f"{', '.join(APPROVAL_AUTHORITIES)}")
+
+
 def run_cli(argv: list[str] | None = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
     if raw and raw[0] in PAUSE_VERBS:
@@ -1516,10 +1696,17 @@ def run_cli(argv: list[str] | None = None) -> int:
             runtime_state = FileRuntimeStateStore(
                 Path(args.runtime_state) if args.runtime_state
                 else default_runtime_state_path(resolved_run, state["thread_id"]))
+            # R4.  The approval authority is resolved HERE, at the composition root, and
+            # threaded in with the ledger -- before the capability snapshot the state
+            # carries.  `--adapter orca` and `--adapter fake` are deliberately NOT given
+            # this: what an Orca run declares is `OrcaAdapter`'s own answer and changing it
+            # is authorized by no acceptance criterion here.
             adapter, state = build_standalone_adapter(
                 orca_spec, artifact_base=Path(args.artifact_base),
                 run_id=resolved_run, runtime_state=runtime_state,
-                profile_spec=_standalone_profile_spec(args))
+                profile_spec=_standalone_profile_spec(args),
+                approval_port=configured_approval_port(
+                    args.approval_authority, Path(args.artifact_base)))
         if args.adapter == ORCA_ADAPTER:
             # The production path.  The Run is created FIRST, because the run id it
             # returns is what the state, the artifact paths and the ledger are all named

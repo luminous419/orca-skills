@@ -285,6 +285,18 @@ if __name__ == "__main__":
 
 
 # =====================================================================================
+def _is_codeish(line: str) -> bool:
+    """True for a line that could execute; False for prose inside a docstring.
+
+    Deliberately crude and INCLUSIVE -- anything it is unsure about counts as code, so the
+    guard errs towards failing rather than towards letting an edit through.
+    """
+    stripped = line.strip()
+    if not stripped or stripped.startswith(("#", "*", "|")):
+        return False
+    return any(token in stripped for token in ("=", "(", "return", "raise", "import"))
+
+
 class LauncherWiringTests(unittest.TestCase):
     """C-DESIGN-1: all SEVEN `--adapter` sites, and D-2(b)'s one-declaration state."""
 
@@ -364,8 +376,56 @@ class LauncherWiringTests(unittest.TestCase):
             "after the receipt can never be collected")
         self.assertIn(EXTERNAL_RESUME, adapter.capabilities())
 
+    #: The ONE change to `build_state` this ticket's correction R4 authorises: the optional
+    #: declared decision block, without which `decision_state` is written by no code on the
+    #: launch path at all and the graph's PAUSE node is unreachable from the CLI for EVERY
+    #: adapter.  Spelled out line by line, stripped, so the guard below stays a BYTE-level
+    #: check with exactly one enumerated exception rather than becoming a loose one.
+    DECLARED_DECISION_INSERTION = (
+        'declared = spec.get("decision_state")',
+        'if declared is not None:',
+        'state = dict(validate_state(',
+        '{**state, **typed_update(',
+        '"SET_DECISION", decision_state=declared,',
+        'decision_reason_code=spec.get("decision_reason_code"))},',
+        'expected_thread_id=state["thread_id"]))',
+        'return state',
+        # The `return` had to become a binding: the declaration is applied to the state the
+        # baseline returned directly, so the state now needs a name.  Enumerated with its
+        # exact baseline counterpart below rather than waived.
+        'state = dict(initial_state(',
+    )
+
+    #: The ONLY baseline lines the insertion above is allowed to displace, each with the
+    #: line that replaces it.  Anything else removed or rewritten fails.
+    AUTHORISED_REPLACEMENTS = {
+        'return dict(initial_state(': 'state = dict(initial_state(',
+        # The docstring's first line lost its closing quotes when the prose that explains
+        # the optional declaration was appended.  The SENTENCE is unchanged, and it is
+        # matched here in full so a rewrite of it would still be reported.
+        '"""Build a validated initial state from a small JSON launch specification."""':
+            '"""Build a validated initial state from a small JSON launch specification.',
+    }
+
     def test_site_2_the_orca_and_fake_state_builders_are_unchanged(self) -> None:
-        """D-2(a): reconciling the other two paths is authorized by no criterion (PR-1)."""
+        """D-2(a): reconciling the other two paths is authorized by no criterion (PR-1).
+
+        Still a byte-level guard, and deliberately still anchored on `d13b7fa` -- the
+        pre-OS-37 revision -- rather than re-frozen on the current text.  What changed is
+        that the single authorised insertion is now ENUMERATED instead of the whole function
+        being required to be identical:
+
+        * **nothing may be removed or modified.**  The line sequence of the baseline body
+          must still appear, in order, with no `delete` and no `replace` -- so a change to
+          how `spec["capabilities"]` is read, or a capability reconciliation slipped into the
+          Orca/fake path, fails exactly as it did before;
+        * **the only additions are the declared decision block**, matched line for line
+          against the tuple above.  Any other insertion fails and is named.
+
+        Plus two properties the byte check was standing in for, now asserted directly, so
+        PR-1 cannot be quietly closed even by an edit that somehow satisfied the above.
+        """
+        import difflib
         import inspect
         import subprocess
 
@@ -376,10 +436,63 @@ class LauncherWiringTests(unittest.TestCase):
         self.assertEqual(baseline.returncode, 0)
         before = baseline.stdout.split("def build_state(", 1)[1].split("\n\n\n", 1)[0]
         after = inspect.getsource(launcher.build_state).split("(", 1)[1]
+        before_lines = [line.strip() for line in before.strip().splitlines() if line.strip()]
+        after_lines = [line.strip() for line in after.strip().splitlines() if line.strip()]
+        matcher = difflib.SequenceMatcher(a=before_lines, b=after_lines, autojunk=False)
+        removed: list[str] = []
+        inserted: list[str] = []
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            if tag in ("delete", "replace"):
+                removed.extend(before_lines[i1:i2])
+            if tag in ("insert", "replace"):
+                inserted.extend(after_lines[j1:j2])
+        unauthorised = [line for line in removed if line not in self.AUTHORISED_REPLACEMENTS]
         self.assertEqual(
-            before.strip(), after.strip(),
-            "build_state changed; the Orca and fake paths must keep reading "
-            "spec['capabilities'] byte-for-byte, and PR-1 stays named rather than fixed")
+            unauthorised, [],
+            "build_state LOST or CHANGED a line it had at d13b7fa that this correction is "
+            "not authorised to touch; the Orca and fake paths must keep reading "
+            f"spec['capabilities'] byte-for-byte: {unauthorised}")
+        for gone, replacement in self.AUTHORISED_REPLACEMENTS.items():
+            if gone in removed:
+                self.assertIn(
+                    replacement, after_lines,
+                    f"{gone!r} was removed and its authorised replacement "
+                    f"{replacement!r} is not there either")
+        unexpected = [line for line in inserted
+                      if line not in self.DECLARED_DECISION_INSERTION
+                      and not line.startswith(("#", '"""', "*", "`"))
+                      and not line.endswith('"""')]
+        # Prose lines of the docstring are not code and are filtered above; every remaining
+        # inserted line must be one of the enumerated ones.
+        unexpected = [line for line in unexpected if _is_codeish(line)]
+        self.assertEqual(
+            unexpected, [],
+            "build_state gained code beyond the one authorised declared-decision "
+            f"insertion; PR-1 must stay named rather than fixed: {unexpected}")
+
+    def test_site_2b_build_state_still_consults_no_adapter(self) -> None:
+        """PR-1, asserted as the property rather than only as a byte pattern.
+
+        `build_standalone_state` reconciles the standalone path's declaration against the
+        LIVE adapter on purpose; `build_state` must not, for any adapter, because doing so
+        would change routing for existing Orca runs and for historical replay.
+        """
+        import ast
+        import inspect
+
+        from scripts.deterministic_workflow import launcher
+        tree = ast.parse(inspect.getsource(launcher.build_state).lstrip())
+        names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+        attrs = {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
+        self.assertNotIn("adapter", names,
+                         "build_state names an adapter; PR-1 would then be fixed here "
+                         "rather than named, for the Orca and fake paths too")
+        self.assertNotIn("capabilities", attrs,
+                         "build_state calls `.capabilities()`; the Orca and fake paths "
+                         "must keep reading the operator's declaration")
+        source = inspect.getsource(launcher.build_state)
+        self.assertIn('spec.get("capabilities")', source,
+                      "build_state no longer reads the operator's capability declaration")
 
     def test_site_3_a_profile_is_mandatory_and_has_no_default(self) -> None:
         """AC-37-03: explicit configuration, never a built-in CLI table."""

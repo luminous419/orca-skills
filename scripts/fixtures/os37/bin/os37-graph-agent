@@ -26,6 +26,10 @@
 #                                `StandaloneDispatchFailed` is raised for.  `<f>` is the
 #                                once-marker; later turns behave normally, so the run can
 #                                reach the correction route.  Finding #8.
+#   OS37_GA_EXIT_CODE_ONCE=<f>   the FIRST turn (only) emits readiness and a delivery proof
+#                                and then exits NON-ZERO with no completion record at all.
+#                                `OS37_GA_EXIT_CODE` names the status (default 9) and
+#                                `OS37_GA_EXIT_CODE_ROLE` scopes it the same way below.
 #   OS37_GA_NO_RESULT_ROLE=<R>   restrict the switch above to dispatches whose delivered
 #                                intent names role <R>, so the failure lands on the leg the
 #                                finding is about rather than on the first turn of the run.
@@ -129,6 +133,24 @@ if [ -n "${OS37_GA_NO_RESULT_ONCE:-}" ] && [ ! -f "$OS37_GA_NO_RESULT_ONCE" ]; t
   if [ "$SCOPED" = "1" ]; then
     : > "$OS37_GA_NO_RESULT_ONCE"
     exit 0
+  fi
+fi
+
+# ---- the NON-ZERO EXIT leg (correction R5) -------------------------------------------
+# The process dies with a non-zero status and NO completion record of any kind -- an OOM
+# kill, a crash, a `set -e` abort.  Distinct from the authentication leg below, which emits
+# a TYPED terminal record and then exits non-zero: there the runtime has a named cause to
+# settle from, here it has only an exit status.  Scoped by role the same way the
+# no-completion leg is, so a run can be steered into it for exactly one dispatch.
+if [ -n "${OS37_GA_EXIT_CODE_ONCE:-}" ] && [ ! -f "$OS37_GA_EXIT_CODE_ONCE" ]; then
+  SCOPED=1
+  if [ -n "${OS37_GA_EXIT_CODE_ROLE:-}" ]; then
+    SCOPED=0
+    case "$PROMPT" in *"$OS37_GA_EXIT_CODE_ROLE"*) SCOPED=1 ;; esac
+  fi
+  if [ "$SCOPED" = "1" ]; then
+    : > "$OS37_GA_EXIT_CODE_ONCE"
+    exit "${OS37_GA_EXIT_CODE:-9}"
   fi
 fi
 

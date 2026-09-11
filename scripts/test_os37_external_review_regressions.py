@@ -186,7 +186,22 @@ class F01CleanCheckoutTests(unittest.TestCase):
         self.assertEqual(
             case.WEDGE_MEASURED_PLATFORMS, ("darwin",),
             "the measured-platform declaration changed; a platform may only be added here "
-            "with a measurement, never to make a runner green")
+            "with a measurement, never to make a runner green.  Running the suite on a "
+            "platform is NOT such a measurement: the wedge equality sits behind a "
+            "`sys.platform` BRANCH, not behind a skip, so a green job on a platform absent "
+            "from this tuple evaluated only the portable half")
+        # ---- OS-37 correction R2: what the real ubuntu-latest run DID retire -----------
+        # The two declarations are separate on purpose and are asserted separately.  The
+        # suite has now really executed on Linux -- GitHub Actions run 34541433633 on
+        # commit 5f9f4c4, six green matrix jobs, `test_os37_pty_supervisor` in neither skip
+        # manifest -- so "Linux pty behaviour is reasoned from code, not measured" is no
+        # longer true and must not be re-asserted.  What that run did NOT do is evaluate
+        # the wedge equality, which is why the tuple above is unchanged.
+        self.assertEqual(
+            case.PTY_SUITE_EXERCISED_PLATFORMS, ("darwin", "linux"),
+            "the exercised-platform declaration changed; `linux` was established by a real "
+            "ubuntu-latest CI run and removing it would re-assert a limitation that has "
+            "been retired, while adding a platform needs a run of its own")
         source = inspect.getsource(case.test_without_draining_the_exiting_child_is_not_reapable)
         tree = ast.parse(source.lstrip() if source.startswith("    ") else source) \
             if not source.startswith("    ") else ast.parse(
@@ -210,6 +225,26 @@ class F01CleanCheckoutTests(unittest.TestCase):
             "assertGreater", source,
             "the PORTABLE half is gone; without it this test asserts nothing at all on a "
             "platform where the wedge was never measured")
+
+    def test_the_wedge_set_can_never_exceed_the_exercised_set(self) -> None:
+        """The structural form of the over-claim, refused rather than discouraged.
+
+        A platform may only be named MEASURED for the wedge if this suite has at least RUN
+        there -- so the strictly stronger claim can never be made without the weaker one.
+        Its own case, deliberately: the two tuple equalities above would fire first and mask
+        it, and an invariant that only ever fails behind another assertion is not locked.
+
+        Mutation-sensitivity: name a platform in `WEDGE_MEASURED_PLATFORMS` that is absent
+        from `PTY_SUITE_EXERCISED_PLATFORMS` and this reports exactly which one.
+        """
+        from scripts import test_os37_pty_supervisor as pty_tests
+        case = pty_tests.DrainIsATeardownObligationTests
+        overclaimed = sorted(set(case.WEDGE_MEASURED_PLATFORMS)
+                             - set(case.PTY_SUITE_EXERCISED_PLATFORMS))
+        self.assertEqual(
+            overclaimed, [],
+            "the wedge is claimed MEASURED on a platform this suite has never even run "
+            f"on: {overclaimed}")
 
 
 # =====================================================================================
@@ -2171,11 +2206,21 @@ def graph_profile_document(*, worktree: Path, driver_env: dict[str, str],
 def execute_graph_cli(room: Path, *, run_id: str, phases: tuple[str, ...] = ("DESIGN",),
                       driver_env: dict[str, str] | None = None, auth_probe: bool = True,
                       credential: bool = True, timeouts: dict[str, int] | None = None,
-                      preflight_ms: int = 1_500, max_iterations: int = 4) -> GraphRun:
+                      preflight_ms: int = 1_500, max_iterations: int = 4,
+                      approval_authority: str = "", thread_id: str = "graph",
+                      decision_state: str = "",
+                      decision_reason_code: str | None = None,
+                      checkpoint_name: str = "checkpoints.json") -> GraphRun:
     """`run_workflow.py --adapter standalone ...`, in this process, and nothing else.
 
     Re-invoking with the SAME `room` re-enters that run's durable files -- the same artifact
     base, the same ledger and the same checkpoint store -- which is what a restart is.
+
+    `approval_authority` is R4's `--approval-authority`.  The default is the EMPTY STRING,
+    not `"none"`, so a caller that does not name one produces exactly the argv this helper
+    produced before R4 existed -- the flag is absent from the command line entirely, and
+    every existing case here therefore still exercises `build_parser`'s own default rather
+    than a value this helper chose for it.
     """
     import contextlib
 
@@ -2194,8 +2239,13 @@ def execute_graph_cli(room: Path, *, run_id: str, phases: tuple[str, ...] = ("DE
     profile = graph_profile_document(worktree=worktree, driver_env=declared,
                                      auth_probe=auth_probe, credential=credential,
                                      preflight_ms=preflight_ms, timeouts=timeouts)
-    state = {"run_id": run_id, "thread_id": "graph", "phases": list(phases),
+    state = {"run_id": run_id, "thread_id": thread_id, "phases": list(phases),
              "risk": "high", "max_iterations": max_iterations}
+    if decision_state:
+        # R4.  The launch specification's own optional field; omitted entirely when no
+        # caller names one, so every existing case writes the same state.json as before.
+        state["decision_state"] = decision_state
+        state["decision_reason_code"] = decision_reason_code
     (room / "profile.json").write_text(json.dumps(profile, indent=2), encoding="utf-8")
     (room / "state.json").write_text(json.dumps(state, indent=2), encoding="utf-8")
 
@@ -2211,8 +2261,10 @@ def execute_graph_cli(room: Path, *, run_id: str, phases: tuple[str, ...] = ("DE
             "--standalone-profile", str(room / "profile.json"),
             "--artifact-base", str(artifact_base),
             "--runtime-state", str(room / "ledger.json"),
-            "--checkpoint-store", str(room / "checkpoints.json"),
+            "--checkpoint-store", str(room / checkpoint_name),
             "--project-root", str(REPO), "--json"]
+    if approval_authority:
+        argv += ["--approval-authority", approval_authority]
     try:
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = launcher.run_cli(argv)
@@ -2233,7 +2285,7 @@ def execute_graph_cli(room: Path, *, run_id: str, phases: tuple[str, ...] = ("DE
     return GraphRun(exit_code=code, summary=summary, escaped=escaped, base=room,
                     artifact_base=artifact_base, run_id=run_id,
                     ledger_path=room / "ledger.json",
-                    checkpoint_path=room / "checkpoints.json", intents=intents,
+                    checkpoint_path=room / checkpoint_name, intents=intents,
                     argv_dump=argv_dump, env_dump=env_dump,
                     stdout=out.getvalue(), stderr=err.getvalue())
 

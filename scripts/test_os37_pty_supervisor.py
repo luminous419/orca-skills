@@ -638,18 +638,37 @@ class DrainIsATeardownObligationTests(unittest.TestCase):
         while time.time() < deadline:
             pass
 
+    #: Platforms on which THIS SUITE HAS REALLY RUN.  Not a claim about kernel behaviour --
+    #: a claim about where these 56 cases have been executed and have passed.
+    #:
+    #: `darwin`: the development host.
+    #: `linux`:  ubuntu-latest, GitHub Actions run 34541433633 on commit 5f9f4c4, all six
+    #:           matrix jobs green.  `test_os37_pty_supervisor` is in NEITHER skip manifest
+    #:           and no pty skip appears in that run's tolerated-skip reconciliation
+    #:           (`platform=linux ... expected-here=54 matched=54 missing=0 unexpected=0`),
+    #:           so every case here EXECUTED on a real Linux runner -- the real spawn, the
+    #:           real `execve`, the real pty master, the real teardown and the portable
+    #:           drain obligation below.
+    #:
+    #: This retires the standing limitation that Linux pty behaviour was "reasoned from
+    #: code rather than measured".  It does NOT retire the narrower one immediately below,
+    #: and the two are separate declarations for exactly that reason.
+    PTY_SUITE_EXERCISED_PLATFORMS = ("darwin", "linux")
+
     #: Whether THIS platform is known to wedge an exiting session leader whose pty master
     #: nobody reads.  It is a MEASUREMENT, not a portable law, and it is written down here
     #: so the assertion below can be honest about which half of it is which.
     #:
     #: `darwin`: MEASURED on this host -- the leader stays unreapable until the master is
     #: drained, which is the whole reason `standalone_pty.drain` exists.
-    #: everything else: **UNMEASURED**.  The original form of this test asserted the darwin
-    #: wedge unconditionally, so on a Linux CI runner -- where a `SIGKILL`ed leader may
-    #: become reapable with no drain at all -- it failed for a reason that says nothing
-    #: about this repository.  Claiming the wedge for a platform nobody measured would be
-    #: promoting an unverified environment, so the unmeasured arm asserts the PORTABLE half
-    #: of the same obligation instead (below), and never the unmeasured half.
+    #: everything else: **the wedge itself is UNMEASURED**, Linux included.  Running the
+    #: suite on Linux did not measure it: the equality below sits behind a `sys.platform`
+    #: BRANCH, not behind a skip, so the CI run executed the case and evaluated only the
+    #: portable half.  A green Linux job is therefore evidence that the drain obligation
+    #: holds there and NO evidence at all about the wedge, and adding `linux` here would
+    #: assert a kernel behaviour nobody has observed -- which is the same class of claim
+    #: that made the original unconditioned form fail on a Linux runner for a reason that
+    #: says nothing about this repository.
     WEDGE_MEASURED_PLATFORMS = ("darwin",)
 
     def test_without_draining_the_exiting_child_is_not_reapable(self) -> None:
@@ -659,7 +678,9 @@ class DrainIsATeardownObligationTests(unittest.TestCase):
 
         * on a platform where the wedge is MEASURED, the leader must still be unreapable
           with no drain -- byte-for-byte the original assertion, at full strength;
-        * on every platform, draining afterwards must recover REAL BYTES from the master.
+        * on every platform -- and since commit 5f9f4c4 that demonstrably includes a real
+          ubuntu-latest runner, not only this developer host -- draining afterwards must
+          recover REAL BYTES from the master.
           That is the portable statement of the same obligation and it is what
           `StandaloneSession._prove_teardown`'s "Drain BEFORE waiting" depends on: the
           child wrote output nobody has read, so a teardown path that does not drain is

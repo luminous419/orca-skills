@@ -61,12 +61,22 @@ class StandaloneDispatchFailed(RuntimeError):
     """
 
     def __init__(self, stage: str, reason: str,
-                 receipt: Mapping[str, Any] | None = None) -> None:
+                 receipt: Mapping[str, Any] | None = None,
+                 exit_status: int | None = None) -> None:
         super().__init__(f"STANDALONE_DISPATCH_FAILED:{stage}"
                          + (f" ({reason})" if reason else ""))
         self.stage = stage
         self.reason = reason
         self.receipt = dict(receipt or {})
+        # ---- OS-37 correction R5 ------------------------------------------------------
+        # The waitpid-sourced exit status, when the failing leg observed one.  Without it a
+        # dispatch that DIED non-zero and one that exited CLEANLY without ever writing a
+        # completion record settle to byte-identical journal evidence -- both `LOST` with
+        # `exit_code_unmapped` -- so an operator cannot tell a crash from a silent CLI, and
+        # neither can a regression test claiming to lock two different causes.  `None` means
+        # "no exit status was observed", never "exited 0": the two are different facts and
+        # `map_exit_code` already refuses to conflate them.
+        self.exit_status = exit_status
 
 
 class _CapturedBody:
@@ -781,9 +791,13 @@ class StandaloneSession:
         """
         completion = self.await_completion()
         if completion["state"] not in ("COMPLETED", "FAILED"):
+            # R5.  The observed exit status travels WITH the refusal.  `await_completion`
+            # already resolved it (`map_exit_code`), and dropping it here is what made a
+            # crash and a silent clean exit indistinguishable in the durable journal.
             raise StandaloneDispatchFailed(
                 completion["state"].lower(), completion.get("lost_reason", ""),
-                dict(receipt))
+                dict(receipt),
+                exit_status=(completion.get("evidence") or {}).get("exit_status"))
         event = self._settle(completion["evidence"], lease_token=lease_token,
                              result_parser=result_parser,
                              verdict=completion.get("verdict"))
@@ -982,7 +996,12 @@ class StandaloneSession:
         """
         from .contracts import make_settlement_event
         verdict = {"outcome": "failed", "reason": failure.reason or failure.stage,
-                   "detail": str(failure), "stage": failure.stage}
+                   "detail": str(failure), "stage": failure.stage,
+                   # R5.  `None` is carried as a NAMED absence rather than dropped: a
+                   # dispatch whose exit status was never observed is a different fact from
+                   # one that exited 0, and the correction's three cause-specific
+                   # regression tests rest on that distinction being durable.
+                   "exit_status": failure.exit_status}
         extracted = self.driver.result_body(self.capture.transcript())
         body = extracted["body"]
         parsed = _default_result_parser(_CapturedBody(
