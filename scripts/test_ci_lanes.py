@@ -1092,6 +1092,120 @@ class LangGraphSkipManifestTests(unittest.TestCase):
         self.assertIn("matched=1", line)
 
 
+class DeclaredLangGraphGatesAreInTheManifestTests(unittest.TestCase):
+    """OS-37 correction iteration 6: the manifest is held to the gates the source declares,
+    from EITHER lane.
+
+    CI on 423bcb7: the absent lane failed with 30 LangGraph skips the manifest did not
+    declare -- `manifest=347 matched=347 missing=0 unexpected=30` -- because two modules had
+    gained `@unittest.skipUnless(_langgraph_ok(), ...)` classes without the manifest being
+    regenerated. The Worker and the Reviewer had both run only the present lane, and by
+    construction nothing there could have shown it: a `skipUnless` whose condition is true
+    leaves no trace on the class, and `ci_lane --lane absent` refuses to run on a host that
+    has langgraph. The absent lane was the only observer, and nobody had one.
+
+    `ci_lane.observe_declared_langgraph_gates` loads the suite in a child that REFUSES
+    `langgraph`, so every gate declares itself at load time exactly as it would in the
+    absent lane, and the manifest is compared with that set here -- in seconds, in both
+    lanes, on any host.
+
+    Mutation-sensitivity, applied and reverted in iteration 6: add one `test_` method to
+    `AuthFailureRoutingTests` (or any gated class) without touching the manifest and
+    `test_every_declared_gate_is_in_the_manifest` fails naming it.
+    """
+
+    #: The one manifest entry whose gate is raised at RUN time (`self.skipTest` after an
+    #: ImportError in the body) rather than declared by a decorator. The probe cannot see a
+    #: runtime gate, so it is NAMED: a second one is a decision, not drift.
+    RUNTIME_GATED = frozenset({
+        "test_os37_adapter_conformance.ContractParityTests"
+        ".test_build_graph_accepts_standalone_adapter",
+    })
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.probe = ci_lane.observe_declared_langgraph_gates()
+
+    def test_the_probe_sees_the_gates_the_absent_lane_skips(self) -> None:
+        """Vacuity guard: a probe that saw nothing would pass the subset check for free."""
+        gated = self.probe.langgraph_gated
+        self.assertGreater(len(gated), 100, "the probe saw almost no LangGraph gates")
+        # The very id CI named on 423bcb7.
+        self.assertIn("test_os37_dispatch_failure_routing.AuthFailureRoutingTests"
+                      ".test_nothing_escaped_the_graph_as_a_traceback", gated)
+        # A gate inherited from a fixture class in ANOTHER module. `skip_guards_for`'s AST
+        # walk cannot follow that; the probe reads the inherited attribute and must.
+        self.assertIn("test_deterministic_workflow_cancel.AbandonTests"
+                      ".test_abandon_settles_the_run_and_the_record", gated)
+        self.assertEqual(self.probe.unimportable, (),
+                         "a test module cannot be imported without langgraph")
+
+    def test_every_declared_gate_is_in_the_manifest(self) -> None:
+        """The 423bcb7 failure, made visible from a host that has langgraph."""
+        self.assertEqual(ci_lane.check_declared_langgraph_gates(self.probe), [])
+
+    def test_the_manifest_is_the_declared_gates_plus_the_named_runtime_gates(self) -> None:
+        """Both directions, by identity.
+
+        A manifest entry for a test that LOST its decorator gate would pass the present lane
+        (it simply runs) and fail only the absent lane (`missing`); this makes the present
+        lane see it too. The only tolerated excess is the named runtime-gated set.
+        """
+        expected = ci_lane.load_expected_langgraph_skips()
+        self.assertEqual(sorted(expected - self.probe.langgraph_gated),
+                         sorted(self.RUNTIME_GATED),
+                         "the manifest declares tests whose gate the probe cannot see and "
+                         "that are not named as runtime-gated here")
+        self.assertEqual(sorted(self.probe.langgraph_gated - expected), [])
+        self.assertTrue(self.RUNTIME_GATED <= self.probe.collected,
+                        "a named runtime-gated test is no longer collected")
+
+    # ---- the check itself, against canned observations -------------------------------
+    @staticmethod
+    def _probe(declared: dict[str, str], collected: set[str] | None = None,
+               unimportable: tuple[str, ...] = ()) -> ci_lane.LangGraphGateProbe:
+        return ci_lane.LangGraphGateProbe(
+            collected=frozenset(collected if collected is not None else declared),
+            declared=declared, unimportable=unimportable)
+
+    REASON = "requires pinned langgraph 0.2.76"
+
+    def test_an_undeclared_gate_is_reported_by_name(self) -> None:
+        probe = self._probe({"m.C.test_a": self.REASON, "m.C.test_b": self.REASON})
+        problems = ci_lane.check_declared_langgraph_gates(probe, frozenset({"m.C.test_a"}))
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("m.C.test_b", problems[0])
+        self.assertIn(ci_lane.LANGGRAPH_SKIP_MANIFEST.name, problems[0])
+        self.assertIn("write-manifest", problems[0])
+
+    def test_the_exact_declared_set_passes(self) -> None:
+        probe = self._probe({"m.C.test_a": self.REASON, "m.C.test_b": self.REASON})
+        self.assertEqual(ci_lane.check_declared_langgraph_gates(
+            probe, frozenset({"m.C.test_a", "m.C.test_b"})), [])
+
+    def test_a_gate_for_another_reason_is_not_the_manifests_business(self) -> None:
+        """The live-runtime suites declare themselves too; they belong to the OTHER
+        manifest."""
+        probe = self._probe({"m.Live.test_x": "requires ORCA_OS37_E2E=1"})
+        self.assertEqual(ci_lane.check_declared_langgraph_gates(probe, frozenset()), [])
+
+    def test_a_module_that_cannot_import_without_langgraph_is_reported(self) -> None:
+        probe = self._probe({}, collected=set(),
+                            unimportable=("unittest.loader._FailedTest.test_m",))
+        problems = ci_lane.check_declared_langgraph_gates(probe, frozenset())
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("test_m", problems[0])
+        self.assertIn("ERROR", problems[0])
+
+    def test_a_manifest_entry_the_suite_no_longer_collects_is_reported(self) -> None:
+        probe = self._probe({"m.C.test_a": self.REASON})
+        problems = ci_lane.check_declared_langgraph_gates(
+            probe, frozenset({"m.C.test_a", "m.C.test_renamed_away"}))
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("m.C.test_renamed_away", problems[0])
+        self.assertIn("no longer collects", problems[0])
+
+
 class AuditWrapperRunsInBothLanesTests(unittest.TestCase):
     """MAJOR 2's third item: the audit-outbox test must not need the graph runtime.
 

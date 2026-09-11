@@ -58,7 +58,7 @@ import sys
 import unittest
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 REQUIREMENTS = REPO_ROOT / "requirements-langgraph.txt"
@@ -890,6 +890,153 @@ def observe_declared_skips(*, platform: str, sandbox_present: bool) -> list[tupl
     # LangGraph skips belong to the other manifest; the platform derivation must not claim
     # them, or the absent lane would declare 240 tests as platform-conditional.
     return [(test_id, why) for test_id, why in observed if not is_langgraph_skip(why)]
+
+
+# ---- OS-37 correction iteration 6: the gates the SOURCE declares, held to the manifest --
+# CI on 423bcb7 failed the absent lane with 30 LangGraph skips the manifest did not declare,
+# from two modules whose gated classes had been added without regenerating it. Nothing
+# local had been able to see that. The absent lane refuses to run on a host that has
+# langgraph, and in the present lane `skipUnless(True, ...)` hands the class back untouched
+# -- the gate leaves no attribute to read -- so a green present lane, and a green
+# `test_ci_lanes`, said nothing about whether the manifest was complete.
+#
+# This probe makes the gate visible from EITHER lane. It loads the suite in a child whose
+# import system refuses `langgraph`, so every import-time `_langgraph_ok()` evaluates False
+# and every `skipUnless` gate sets the same `__unittest_skip__` / `__unittest_skip_why__`
+# attributes `TestCase.run` consults -- on the class it decorates and, through inheritance,
+# on every fixture subclass in every module, which is the binding the AST walk in
+# `skip_guards_for` cannot follow across modules. The set it reports is the set the absent
+# lane would skip at LOAD time, observed without being in that lane. No test body executes.
+#
+# Stated rather than implied: a gate raised at RUN time -- `self.skipTest(...)` after an
+# ImportError inside the test body -- leaves no attribute and is invisible here. Such a test
+# is reported only as COLLECTED, which is all the probe can honestly say about it; the
+# absent lane's identity check still holds it, and `test_ci_lanes` names each one so that a
+# second is a decision rather than drift.
+_LANGGRAPH_REFUSED_PROBE = r'''
+import json, sys, unittest
+
+
+class _RefuseLangGraph:
+    """A finder ahead of every other: in this child, `langgraph` does not exist."""
+
+    def find_spec(self, name, path=None, target=None):
+        if name.split(".")[0] == "langgraph":
+            raise ModuleNotFoundError("langgraph is refused in this probe", name=name)
+        return None
+
+
+sys.meta_path.insert(0, _RefuseLangGraph())
+sys.path.insert(0, ".")
+suite = unittest.TestLoader().discover(start_dir="scripts", pattern="test_*.py")
+assert "langgraph" not in sys.modules, "the refusal did not hold"
+
+
+def walk(item):
+    if isinstance(item, unittest.TestSuite):
+        for child in item:
+            yield from walk(child)
+    else:
+        yield item
+
+
+collected, declared, unimportable = [], [], []
+for test in walk(suite):
+    if isinstance(test, unittest.loader._FailedTest):
+        unimportable.append(test.id())
+        continue
+    collected.append(test.id())
+    method = getattr(test, test._testMethodName, None)
+    if (getattr(test.__class__, "__unittest_skip__", False)
+            or getattr(method, "__unittest_skip__", False)):
+        why = (getattr(test.__class__, "__unittest_skip_why__", "")
+               or getattr(method, "__unittest_skip_why__", ""))
+        declared.append([test.id(), why])
+
+print("PROBE_JSON " + json.dumps({"collected": sorted(collected),
+                                  "declared": sorted(declared),
+                                  "unimportable": sorted(unimportable)}))
+'''
+
+
+class LangGraphGateProbe(NamedTuple):
+    """What the suite declares when `langgraph` is refused at import: the OBSERVATION."""
+
+    #: Every test id the loader collected -- the ids the lanes run.
+    collected: frozenset[str]
+    #: `{test id: reason}` for every test declared skipped at load time, for ANY reason.
+    declared: dict[str, str]
+    #: Modules the loader could not import with `langgraph` refused; the absent lane would
+    #: ERROR on these rather than skip, so they are a defect in their own right.
+    unimportable: tuple[str, ...]
+
+    @property
+    def langgraph_gated(self) -> frozenset[str]:
+        return frozenset(test_id for test_id, why in self.declared.items()
+                         if is_langgraph_skip(why))
+
+
+def observe_declared_langgraph_gates() -> LangGraphGateProbe:
+    """Load the suite with `langgraph` refused and read what declares itself skipped.
+
+    A SUBPROCESS, for the same reason as the platform probe: the import refusal must not
+    leak into the interpreter that judges the result.
+    """
+    completed = subprocess.run(
+        [sys.executable, "-c", _LANGGRAPH_REFUSED_PROBE],
+        cwd=str(REPO_ROOT), capture_output=True, text=True, check=False)
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"langgraph-refused probe failed: {completed.stderr.strip()}")
+    for line in completed.stdout.splitlines():
+        if line.startswith("PROBE_JSON "):
+            payload = json.loads(line[len("PROBE_JSON "):])
+            return LangGraphGateProbe(
+                collected=frozenset(payload["collected"]),
+                declared={test_id: why for test_id, why in payload["declared"]},
+                unimportable=tuple(payload["unimportable"]))
+    raise RuntimeError(f"langgraph-refused probe printed no result: {completed.stdout!r}")
+
+
+def check_declared_langgraph_gates(probe: LangGraphGateProbe,
+                                   expected: frozenset[str] | None = None) -> list[str]:
+    """Hold the manifest to the gates the source declares. Runs in BOTH lanes.
+
+    Three problems, each the present-lane-visible form of something only the absent lane
+    used to be able to say:
+
+    * a test DECLARES a LangGraph gate the manifest does not list -- the absent lane's
+      `unexpected`, which is exactly the 423bcb7 failure, now visible from a host that has
+      langgraph installed;
+    * a test module cannot be IMPORTED without langgraph -- the absent lane's ERROR;
+    * a manifest entry names a test the suite no longer COLLECTS -- the present lane's
+      `never_ran`, without needing to run anything.
+    """
+    if expected is None:
+        expected = load_expected_langgraph_skips()
+    problems: list[str] = []
+    if probe.unimportable:
+        problems.append(
+            f"{len(probe.unimportable)} test module(s) cannot be imported without "
+            "langgraph, so the dependency-absent lane would ERROR on them rather than "
+            "skip: "
+            + _sample(sorted(probe.unimportable)))
+    undeclared = probe.langgraph_gated - expected
+    if undeclared:
+        problems.append(
+            f"{len(undeclared)} test(s) declare a LangGraph gate that "
+            f"{LANGGRAPH_SKIP_MANIFEST.name} does not list. The dependency-absent lane "
+            "will fail on them as 'unexpected', and coverage has left that lane without "
+            "anyone deciding it should: " + _sample(sorted(undeclared))
+            + " -- regenerate the manifest from an environment WITHOUT langgraph "
+              "(`ci_lane --lane absent write-manifest`) and read the diff")
+    uncollected = expected - probe.collected
+    if uncollected:
+        problems.append(
+            f"{len(uncollected)} entr(y/ies) in {LANGGRAPH_SKIP_MANIFEST.name} name a test "
+            "the suite no longer collects; it was deleted or renamed: "
+            + _sample(sorted(uncollected)) + " -- regenerate the manifest")
+    return problems
 
 
 def derive_tolerated_alternatives(

@@ -363,6 +363,46 @@ def _declare_blocked_source(run_id: str, artifact_base: Path, key: str) -> Clari
     return source
 
 
+class FixtureDeclarationAuthenticatesTests(unittest.TestCase):
+    """Binding (2) of `load_blocked_sources`, over the declaration the E2E fixtures publish
+    -- in BOTH CI lanes.
+
+    Correction iteration 6.  This case lived in `E2EStandalonePauseThroughTheGraphTests`
+    under its LangGraph gate, and the gate was wider than the case: run with that gate
+    disabled in an interpreter WITHOUT langgraph it passed, because nothing it reads is
+    written by the graph.  `_publish_open_decision` writes the ledger through the real
+    OS-29 port and `_declare_blocked_source` persists the question through the real OS-30
+    port, and both are LangGraph-free.  A case that needs no runtime must not leave the
+    dependency-absent lane because its neighbours do, so it runs here, ungated, against a
+    tree built by the same two helpers the gated fixtures call in `setUpClass`.
+
+    What stays gated is the CONSEQUENCE, which does drive the graph: that the PAUSE node
+    accepts this declaration (`..._reaches_a_durable_pause`, and
+    `..._published_a_real_clarification_request` binds the published item back to this
+    same ledger key) and refuses without it (`..._does_not_manufacture_a_pause`).
+    """
+
+    RUN = "run_r4decl"
+
+    def setUp(self) -> None:
+        room = Path(tempfile.mkdtemp(prefix="os37-r4-decl-"))
+        self.addCleanup(shutil.rmtree, room, True)
+        self.base = room / "artifact_base"
+        self.base.mkdir()
+        self.key = _publish_open_decision(self.RUN, self.base)
+        _declare_blocked_source(self.RUN, self.base, self.key)
+
+    def test_the_declaration_authenticates_against_the_runs_ledger(self) -> None:
+        """Without this the pause could be passing on a declaration nothing backs, which
+        is precisely the "asserted rather than measured" failure R4 is about."""
+        loaded = ArtifactHumanApprovalPort(self.base).load_blocked_sources(self.RUN)
+        self.assertEqual(len(loaded), 1)
+        self.assertEqual(loaded[0].source_ledger_key, self.key)
+        records = run_logging.read_decision_ledger(self.RUN, base=self.base)
+        self.assertTrue(any(record.get("open_decision_item") is True for record in records),
+                        "the run's ledger holds no open decision item at all")
+
+
 @unittest.skipUnless(_langgraph_ok(), LANGGRAPH_REASON)
 class E2EStandalonePauseThroughTheGraphTests(unittest.TestCase):
     """ONE room, three real `run_workflow.py --adapter standalone` invocations.
@@ -396,19 +436,6 @@ class E2EStandalonePauseThroughTheGraphTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls) -> None:
         shutil.rmtree(cls.room, ignore_errors=True)
-
-    def test_the_declaration_authenticates_against_the_runs_real_ledger(self) -> None:
-        """Binding (2) of `load_blocked_sources`, over the ledger a real run's tree holds.
-
-        Without this the pause below could be passing on a declaration nothing backs, which
-        is precisely the "asserted rather than measured" failure R4 is about.
-        """
-        loaded = ArtifactHumanApprovalPort(self.base).load_blocked_sources(self.RUN)
-        self.assertEqual(len(loaded), 1)
-        self.assertEqual(loaded[0].source_ledger_key, self.key)
-        records = run_logging.read_decision_ledger(self.RUN, base=self.base)
-        self.assertTrue(any(record.get("open_decision_item") is True for record in records),
-                        "the run's ledger holds no open decision item at all")
 
     def test_without_a_configured_authority_the_decision_block_still_blocks(self) -> None:
         """The BEFORE, produced by the same code as the after and differing in one flag.
