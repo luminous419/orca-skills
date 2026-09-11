@@ -121,6 +121,13 @@ TOLERATED_MANIFEST_HEADER = """\
 # platform-gated tests resolve to NOTHING and must RUN -- if one of them skips, the lane
 # fails. On Linux they must skip. Neither host gets the weaker contract.
 #
+# OS-37 adds twenty-one `always` entries.  All are opt-in live-runtime suites gated on an
+# env var no CI runner sets: the live per-CLI checks need a real agent CLI installed, the
+# standalone E2E spawns real local processes, and the R10 workflow E2E drives nine of them
+# through the real `run_workflow.py` with `orca` removed from PATH.  AC-37-24 requires a check that cannot run to be
+# recorded as "not established" rather than as a pass, which is what a declared skip is;
+# artifacts/runs/run_54d90086bd75/CONFORMANCE.md and TEST.md record all of them.
+#
 # Deliberately absent, so they fail the lane if they ever occur: the git-availability skips
 # in the retained-report whitespace gate. If that gate stops running because git is missing
 # or the checkout is shallow, CI must go red, not quietly tolerate it.
@@ -813,13 +820,16 @@ if platform != sys.platform:
     except ImportError:
         pass
     sys.platform = platform
-if not sandbox_present:
-    _real_exists = Path.exists
+# Symmetric on purpose: the sandbox binary is made to look PRESENT as readily as absent, so
+# that the "no condition holds" environment can be observed from a host that lacks it.
+_real_exists = Path.exists
 
-    def _patched_exists(self):
-        return False if str(self) == sandbox_exec else _real_exists(self)
 
-    Path.exists = _patched_exists
+def _patched_exists(self):
+    return sandbox_present if str(self) == sandbox_exec else _real_exists(self)
+
+
+Path.exists = _patched_exists
 
 suite = unittest.TestLoader().discover(start_dir="scripts", pattern="test_*.py")
 
@@ -1044,8 +1054,12 @@ def derive_tolerated_alternatives(
 ) -> dict[str, list[tuple[str, str]]]:
     """Build the full, multi-platform declaration -- never a one-host view.
 
-    Three observations, because one host cannot see the whole contract:
+    Four observations, because one host cannot see the whole contract:
 
+    * ``darwin`` + sandbox-exec present -- the environment in which NO platform condition
+      holds. Whatever still declares itself skipped there is gated on something the
+      platform conditions do not describe (an opt-in env var, for the live suites), and
+      that observation is what separates a platform gate from an unconditional one.
     * ``linux`` + no sandbox-exec -- every platform-gated test, each with the reason that
       WINS when both gates hold (the outermost decorator's, which is how `unittest`
       resolves it). These become the ``not_darwin`` alternatives.
@@ -1058,14 +1072,32 @@ def derive_tolerated_alternatives(
     A test carrying both gates therefore gets TWO lines and stays exact on both platforms,
     which is the whole point: adding the 22 unconditionally would be green on Linux and red
     on macOS, and observing only this host would be the reverse.
+
+    Why the first observation is not optional (OS-37 final review, R6): a decorator-style
+    env-var gate such as ``@unittest.skipUnless(E2E_ENABLED, ...)`` is visible to the
+    load-time probe in EVERY simulated environment. Without the unconditional baseline the
+    two platform simulations agree on it, and agreement between them was read as "the
+    sandbox binary alone explains it" -- 26 opt-in live-suite tests came out as
+    ``no_sandbox_exec``, a file that expected 6 skips on a Mac instead of 32. A skip that
+    is ALSO present when no condition holds is explained by neither condition.
     """
+    unconditional_reasons = dict(
+        observe_declared_skips(platform="darwin", sandbox_present=True))
     linux_rows = observe_declared_skips(platform="linux", sandbox_present=False)
     darwin_rows = observe_declared_skips(platform="darwin", sandbox_present=False)
     darwin_reasons = dict(darwin_rows)
 
     alternatives: dict[str, list[tuple[str, str]]] = {}
     for test_id, reason in linux_rows:
+        if unconditional_reasons.get(test_id) == reason:
+            # Skips identically when no platform condition holds: not a platform gate.
+            # It reaches the manifest through the runtime observation below, as `always`.
+            continue
         sandbox_reason = darwin_reasons.get(test_id)
+        if sandbox_reason is not None and unconditional_reasons.get(test_id) == sandbox_reason:
+            # The darwin-no-sandbox simulation shows the same reason the unconditional
+            # environment does, so the missing binary is not what this arm records.
+            sandbox_reason = None
         if sandbox_reason == reason:
             # The sandbox binary alone explains it; there is no darwin-specific arm.
             alternatives.setdefault(test_id, []).append(("no_sandbox_exec", reason))
@@ -1107,11 +1139,78 @@ def render_tolerated_manifest(alternatives: dict[str, list[tuple[str, str]]]) ->
         lines.extend(f"{condition}\t{test_id}\t{reason}" for test_id, reason in rows)
     return TOLERATED_MANIFEST_HEADER + "\n".join(lines) + "\n"
 
+#: The decorators that ARE the platform gates, and the one module that declares them. The
+#: anti-drift check in `test_ci_lanes` reads these names out of the AST and holds the
+#: checked-in manifest to them; the writer below holds its OWN output to the same reading
+#: before it is allowed to become the checked-in manifest.
+PLATFORM_GATE_DECORATORS = {"DARWIN_ONLY": "not_darwin", "NEEDS_SANDBOX": "no_sandbox_exec"}
+PLATFORM_GATED_MODULE = "test_review_isolation"
+
+
+def declared_platform_gates(root: Path | None = None) -> dict[str, set[str]]:
+    """`{test id: {condition, ...}}` -- the platform gates the SOURCE declares, from the AST.
+
+    Independent of the observation model on purpose: it never loads the suite and never
+    reads a ``__unittest_skip__`` attribute. It is the reading `test_ci_lanes` applies to
+    the checked-in file, made available to the writer so that a derivation which disagrees
+    with the source is refused at generation time rather than discovered by the next test
+    run.
+    """
+    path = (root or REPO_ROOT) / "scripts" / f"{PLATFORM_GATED_MODULE}.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+
+    def conditions(decorators: Sequence[Any]) -> set[str]:
+        return {PLATFORM_GATE_DECORATORS[node.id] for node in decorators
+                if isinstance(node, ast.Name) and node.id in PLATFORM_GATE_DECORATORS}
+
+    gates: dict[str, set[str]] = {}
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef):
+            continue
+        class_conditions = conditions(node.decorator_list)
+        for member in node.body:
+            if isinstance(member, ast.FunctionDef) and member.name.startswith("test"):
+                found = class_conditions | conditions(member.decorator_list)
+                if found:
+                    gates[f"{PLATFORM_GATED_MODULE}.{node.name}.{member.name}"] = found
+    return gates
+
+
+def check_tolerated_derivation(
+    alternatives: dict[str, list[tuple[str, str]]],
+    gates: dict[str, set[str]] | None = None,
+) -> list[str]:
+    """The anti-drift invariant, applied to a DERIVED declaration before it is written.
+
+    Both directions of `ManifestMatchesTheDeclaredGatesTests`: every platform arm the
+    derivation emits must be a gate the source declares for that very test, and every gate
+    the source declares must have its arm. A derivation that fails this is not a manifest,
+    it is the observation model being wrong -- which is exactly what happened when the
+    simulated environments agreed on an env-var gate and 26 opt-in tests were emitted under
+    ``no_sandbox_exec`` (OS-37 final review, R6). The writer exits non-zero on it and
+    leaves the checked-in file alone.
+    """
+    declared = gates if gates is not None else declared_platform_gates()
+    problems: list[str] = []
+    for test_id in sorted(set(alternatives) | set(declared)):
+        emitted = {condition for condition, _ in alternatives.get(test_id, [])
+                   if condition != "always"}
+        expected = declared.get(test_id, set())
+        if emitted != expected:
+            problems.append(
+                f"TOLERATED_DERIVATION_DRIFT: the derivation expects {test_id} to skip "
+                f"under {sorted(emitted)}, but the source declares {sorted(expected)}")
+    return problems
+
+
 def write_manifest(lane: str, *, verbosity: int = 0) -> int:
     """Regenerate LANGGRAPH_SKIP_MANIFEST from a real dependency-absent run.
 
     Refuses to run in the present lane: there is nothing to record there, and writing an
     empty manifest would silently disarm every assertion that depends on it.
+
+    Nothing is written until BOTH files have been derived and validated: a refusal leaves
+    the checked-in pair exactly as it found them, never one regenerated and one stale.
     """
     if lane != LANE_ABSENT:
         print("CI_LANE_ERROR: write-manifest requires --lane absent; the manifest is the "
@@ -1129,11 +1228,8 @@ def write_manifest(lane: str, *, verbosity: int = 0) -> int:
         print("CI_LANE_ERROR: nothing skipped for a langgraph reason; refusing to write "
               "an empty manifest", file=sys.stderr)
         return 1
-    LANGGRAPH_SKIP_MANIFEST.write_text(MANIFEST_HEADER + "\n".join(ids) + "\n",
-                                       encoding="utf-8")
-    print(f"wrote {len(ids)} test ids to {LANGGRAPH_SKIP_MANIFEST}")
 
-    # The other half of the contract, written from the same run so the two cannot be
+    # The other half of the contract, derived from the same run so the two cannot be
     # generated against different trees. An EMPTY tolerated set is legitimate -- it means
     # nothing outside the LangGraph gates skips -- so, unlike the manifest above, it is
     # written rather than refused.
@@ -1153,6 +1249,23 @@ def write_manifest(lane: str, *, verbosity: int = 0) -> int:
               "if it were universal.", file=sys.stderr)
         return 1
 
+    # Fail closed (OS-37 final review, R6): the derivation is held to the gates the source
+    # declares BEFORE it may become the checked-in file. Exit 0 after emitting a manifest
+    # that the suite's own anti-drift test rejects is not success, it is drift with a
+    # green light; the refusal names every disagreeing entry and writes nothing.
+    drift = check_tolerated_derivation(alternatives)
+    if drift:
+        for problem in drift:
+            print(f"CI_LANE_ERROR: {problem}", file=sys.stderr)
+        print(f"CI_LANE_ERROR: TOLERATED_DERIVATION_DRIFT: refusing to write "
+              f"{TOLERATED_SKIP_MANIFEST.name} ({len(drift)} entries disagree with the "
+              f"gates {PLATFORM_GATED_MODULE}.py declares); neither manifest was written",
+              file=sys.stderr)
+        return 1
+
+    LANGGRAPH_SKIP_MANIFEST.write_text(MANIFEST_HEADER + "\n".join(ids) + "\n",
+                                       encoding="utf-8")
+    print(f"wrote {len(ids)} test ids to {LANGGRAPH_SKIP_MANIFEST}")
     TOLERATED_SKIP_MANIFEST.write_text(render_tolerated_manifest(alternatives),
                                        encoding="utf-8")
     print(f"wrote {sum(counts.values())} tolerated-skip declarations for "
