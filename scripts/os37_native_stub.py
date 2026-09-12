@@ -76,3 +76,50 @@ def _build() -> Path | None:
     staged.chmod(0o755)
     os.replace(staged, target)          # atomic, so a parallel builder never sees a partial
     return out_dir
+
+
+#: The other reviewed shell fixtures under `fixtures/os37/bin/` that tests point a profile
+#: at.  Round 4, finding 10: preflight now refuses a `#!` wrapper by name
+#: (`binary_wrapper_unsupported`) because its kernel image is the interpreter, so every
+#: fixture a profile names must be a NATIVE image -- exactly the rule `native_stub_dir`
+#: already applied to `os37-stub-cli`, applied to the rest.  Each is the same C trampoline
+#: over its own script and reimplements none of its behaviour.
+FIXTURE_SCRIPTS = ("os37-stub-cli", "os37-mode-liar-cli", "os37-waiting-cli")
+
+
+def native_fixture_dir() -> Path | None:
+    """A directory holding NATIVE images of every fixture in :data:`FIXTURE_SCRIPTS`.
+
+    ``None`` when any of them cannot be built; callers refuse rather than fall back.
+    """
+    if "fixtures" in _cache:
+        return _cache["fixtures"]
+    _cache["fixtures"] = _build_fixtures()
+    return _cache["fixtures"]
+
+
+def _build_fixtures() -> Path | None:
+    scripts = [STUB_SCRIPT.with_name(name) for name in FIXTURE_SCRIPTS]
+    if not STUB_SRC.exists() or not all(script.exists() for script in scripts):
+        return None
+    tool = compiler()
+    if tool is None:
+        return None
+    key = hashlib.sha256(
+        STUB_SRC.read_bytes() + "".join(str(script) for script in scripts).encode()
+        + b"".join(script.read_bytes() for script in scripts)).hexdigest()[:16]
+    out_dir = Path(tempfile.gettempdir()) / f"os37-native-fixtures-{os.getuid()}-{key}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for script in scripts:
+        target = out_dir / script.name
+        if target.exists() and os.access(target, os.X_OK):
+            continue
+        staged = out_dir / f"{script.name}.{os.getpid()}"
+        result = subprocess.run(
+            [tool, "-O0", "-o", str(staged), f'-DSTUB_SCRIPT="{script}"', str(STUB_SRC)],
+            capture_output=True, text=True, check=False, timeout=120)
+        if result.returncode != 0 or not staged.exists():
+            return None
+        staged.chmod(0o755)
+        os.replace(staged, target)
+    return out_dir

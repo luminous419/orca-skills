@@ -29,6 +29,7 @@ import textwrap
 import unittest
 from pathlib import Path
 
+from scripts import os37_native_stub as native_stub
 from scripts.deterministic_workflow import standalone_journal as journal_mod
 from scripts.deterministic_workflow import standalone_pty as pty_supervisor
 from scripts.deterministic_workflow.contracts import (EXTERNAL_LOOKUP, EXTERNAL_RESUME,
@@ -587,6 +588,13 @@ if __name__ == "__main__":
 
 
 # =====================================================================================
+def _native_stub_dir() -> Path:
+    built = native_stub.native_stub_dir()
+    if built is None:                                     # pragma: no cover - CI has cc
+        raise AssertionError(native_stub.NO_COMPILER_REASON)
+    return built
+
+
 class PromptIdempotencyTests(unittest.TestCase):
     """DESIGN §D4.3e / USER DIRECTIVE D-D.5.  **A retry never re-executes the same prompt.**
 
@@ -613,7 +621,9 @@ class PromptIdempotencyTests(unittest.TestCase):
             # independent by design (AC-37-03 -- argv comes from the profile, never from a
             # table), and a case about idempotency has no business needing a vendor CLI.
             driver="claude", binary="os37-stub-cli",
-            bin_dirs=(str(Path(__file__).resolve().parent / "fixtures" / "os37" / "bin"),),
+            # The NATIVE image of the fixture (round 4, finding 10: a `#!` wrapper is
+            # refused by preflight by name, and this case is about idempotency).
+            bin_dirs=(str(_native_stub_dir()),),
             supported_range=((1, 0, 0), (99, 0, 0)),
             delivery_mode="launch_with_prompt", identity_binding="minted_echo",
             identity_flag="--session-id",

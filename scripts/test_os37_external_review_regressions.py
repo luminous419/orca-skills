@@ -917,10 +917,17 @@ class F06AuthProbeIsWiredThroughTheProductionPathTests(_ProductionPath):
         ("standalone_preflight.py", "check_auth", "read"): 2,
         ("standalone_preflight.py", "run_preflight", "parameter"): 1,
         ("standalone_preflight.py", "run_preflight", "forward"): 1,
+        # Round 4, finding 11: the preflight CACHE KEY.  `preflight_fingerprint` takes the
+        # probe argv as a parameter, READS it into the fingerprint payload under a mapping
+        # key of the same name, and manufactures nothing; `start` FORWARDS its own
+        # parameter to it exactly as it forwards it to `run_preflight` (hence 2).
+        ("standalone_preflight.py", "preflight_fingerprint", "parameter"): 1,
+        ("standalone_preflight.py", "preflight_fingerprint", "read"): 1,
+        ("standalone_preflight.py", "preflight_fingerprint", "mapping-key"): 1,
         ("standalone_runtime.py", "StandaloneSession.start", "parameter"): 1,
         ("standalone_runtime.py", "StandaloneSession.start", "read"): 1,
         ("standalone_runtime.py", "StandaloneSession.start", "profile-origin"): 1,
-        ("standalone_runtime.py", "StandaloneSession.start", "forward"): 1,
+        ("standalone_runtime.py", "StandaloneSession.start", "forward"): 2,
         # `self.profile.auth_probe_argv` -- the identifier as an ATTRIBUTE, which is the
         # right-hand side of the `profile-origin` assignment above.  Recorded so the
         # inventory covers non-`Name` occurrences too; not an origin, because reading the
@@ -953,6 +960,8 @@ class F06AuthProbeIsWiredThroughTheProductionPathTests(_ProductionPath):
         ("standalone_preflight.py", "run_preflight"):
             "hands its own `auth_probe_argv` parameter to `check_auth`",
     }
+    # `preflight_fingerprint` is neither an origin nor a forwarder: it reads the value
+    # into the cache key and hands it to nothing.
 
     #: ---------------------------------------------------------------------------------
     #: ASSIGNMENT-ORIGIN COVERAGE -- the bound this classifier can actually back.
@@ -1702,27 +1711,42 @@ class F08DispatchFailureIsSettledTests(_ProductionPath):
                          f"dispatch failure was not converted into a verdict: {event!r}")
 
     def test_a_reviewer_failure_routes_to_the_workflow_correction_path(self) -> None:
-        """The typed failure uses the WORKFLOW's own vocabulary, so routing decides.
-
-        A failed PHASE_REVIEWER dispatch settles `result=FAIL`, and `routing.phase_gate`
-        already sends that to `PREPARE_CORRECTION`.  No CLI-specific branch exists in
-        `routing.py`, and none is needed -- which is asserted here by driving the REAL
-        router with the state a failed reviewer settlement produces.
+        """Round 2 settled a failed PHASE_REVIEWER dispatch as `result=FAIL` and drove the
+        real router to `PREPARE_CORRECTION` with it.  Round 4 (consolidated review finding
+        6) forbids exactly that: a readiness timeout, an auth expiry or an OOM kill is a
+        RUNTIME failure and never a review verdict, so the reviewer dispatch is not settled
+        at all -- `adapter.start` stops the run as the typed `REVIEWER_RUNTIME_FAILURE`
+        terminal (through the engine's own `IdempotencyRecoveryError` projection), and the
+        router is never handed a FAIL it did not receive from a reviewer.  The router's own
+        FAIL -> PREPARE_CORRECTION edge is still asserted below, over a GENUINE reviewer
+        verdict, so no standalone branch was added to `routing.py` for this.
         """
         from scripts.deterministic_workflow import routing
+        from scripts.deterministic_workflow.executor import IdempotencyRecoveryError
         profile = self._unsatisfiable_profile()
         adapter, _state, ledger = self.compose(profile, run_id="run_rev")
         intent = self.intent("intent-rev", role="PHASE_REVIEWER", run_id="run_rev")
-        _receipt, event = self.dispatch(adapter, ledger, intent)
-        self.assertEqual(event["result"].get("result"), "FAIL",
-                         "a failed reviewer dispatch does not carry the workflow's own "
-                         f"FAIL verdict, so routing has nothing to act on: {event!r}")
-        contracts.validate_event(intent, dict(event))
+        claim = ledger.claim(intent)
+        with self.assertRaises(IdempotencyRecoveryError) as caught:
+            adapter.start(intent, lease_token=claim["lease_token"])
+        self.assertEqual(caught.exception.code, "REVIEWER_RUNTIME_FAILURE")
+        self.assertIsNone(ledger.get_settlement("intent-rev"),
+                          "a reviewer runtime failure was settled as a verdict")
+        self.assertIsNone(adapter.settlement("intent-rev"))
+        rows = journal_mod.ExecutionJournal(self.base, "run_rev").rows_for("intent-rev")
+        self.assertNotIn("SETTLEMENT_OBSERVED", [row["kind"] for row in rows])
+        failure = [row for row in rows if row["source_vocabulary"].get("runtime_failure")]
+        self.assertEqual(len(failure), 1)
+        self.assertIn(failure[0]["source_vocabulary"]["runtime_failure"]["stage"],
+                      ("start_failed", "readiness_timed_out"))
+        self.assertIn(failure[0]["axes"]["process_liveness"], ("already exited", "disputed"))
+        # The router's FAIL edge, over a verdict a Reviewer really produced.
+        genuine = {"result": "FAIL", "review_verdict": "FAIL", "findings": []}
         state = {
             "decision_state": "CLEAR", "round_kind": "PHASE_GATE",
             "current_phase": "IMPLEMENTATION", "risk": "high",
             "worker_result": {"status": "COMPLETE", "unit_test_status": "PASS"},
-            "reviewer_result": dict(event["result"]),
+            "reviewer_result": genuine,
             "remaining_phase_budget": {"IMPLEMENTATION": 3},
             "final_review_iterations": 0, "max_iterations": 5,
             "adapter_capabilities": sorted(contracts.BASE_CAPABILITIES),
@@ -1731,7 +1755,7 @@ class F08DispatchFailureIsSettledTests(_ProductionPath):
         }
         self.assertEqual(routing.phase_gate(state), "FAIL")
         self.assertEqual(routing.route(state), "PREPARE_CORRECTION",
-                         "a failed reviewer dispatch does not reach the correction path")
+                         "a genuine reviewer FAIL does not reach the correction path")
 
 
 # =====================================================================================
@@ -2556,7 +2580,16 @@ class E2ELongTurnCompletesTests(_GraphAssertions, unittest.TestCase):
 
 @unittest.skipUnless(_langgraph_ok(), LANGGRAPH_REASON)
 class E2EDispatchFailureRoutesToCorrectionTests(_GraphAssertions, unittest.TestCase):
-    """F8, at the graph.  A non-completing dispatch becomes a verdict the workflow routes."""
+    """F8, at the graph.  A non-completing dispatch never escapes as a traceback.
+
+    Round 2 asserted the non-completing PHASE_REVIEWER dispatch became a `result=FAIL`
+    settlement the engine's repair loop re-dispatched.  Round 4 (consolidated review
+    finding 6) supersedes that half: a Reviewer's runtime failure is not a verdict, so
+    the run stops as the typed `REVIEWER_RUNTIME_FAILURE` terminal, nothing is
+    re-dispatched, and no phase iteration or repair attempt is spent.  What F8 was
+    about -- no traceback out of the graph, a terminal the workflow decided on -- holds
+    unchanged.
+    """
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -2590,30 +2623,23 @@ class E2EDispatchFailureRoutesToCorrectionTests(_GraphAssertions, unittest.TestC
                          f"the run did not settle: {self.graph.summary!r}")
 
     def test_the_non_completing_dispatch_is_a_typed_failed_settlement(self) -> None:
-        """It is a VERDICT, in the engine's own vocabulary, not an absence."""
+        """Round 4: it is a typed RUNTIME FAILURE, journalled by name, and NOT a verdict."""
         self.assert_nothing_escaped(self.graph)
         failed = [row for row in self.graph.settlement_rows() if row["outcome"] == "failed"]
-        self.assertTrue(
-            failed,
-            "the dispatch that produced no completion record left no failed settlement; "
-            "there is then nothing for the workflow to route on")
-        for row in failed:
-            with self.subTest(intent=row["intent_id"]):
-                self.assertEqual(row["state"], "FAILED")
-                verdict = (row["source_vocabulary"] or {}).get("completion_verdict") or {}
-                self.assertTrue(verdict.get("stage"),
-                                "the failure names no stage, so an operator cannot see "
-                                "where the dispatch died")
-                event = (row["source_vocabulary"] or {}).get("event") or {}
-                result = event.get("result") or {}
-                self.assertEqual(result.get("result"), "FAIL",
-                                 "a failed REVIEWER dispatch must carry the reviewer "
-                                 "vocabulary's FAIL; that is the engine's own verdict "
-                                 "vocabulary, not a standalone one")
-                self.assertEqual(result.get("standalone_failure", {}).get("stage"),
-                                 verdict.get("stage"),
-                                 "the settlement result does not name the stage the "
-                                 "dispatch died at")
+        self.assertEqual(failed, [], "a reviewer runtime failure was settled as a verdict")
+        failures = [row for row in self.graph.journal_rows()
+                    if (row["source_vocabulary"] or {}).get("runtime_failure")]
+        self.assertEqual(len(failures), 1,
+                         "the dispatch that produced no completion record left no "
+                         "runtime-failure row")
+        verdict = failures[0]["source_vocabulary"]["runtime_failure"]
+        self.assertEqual(verdict.get("stage"), "lost")
+        self.assertEqual(verdict.get("exit_status"), 0)
+        self.assertEqual(failures[0]["source_vocabulary"]["code"], "REVIEWER_RUNTIME_FAILURE")
+        self.assertEqual(failures[0]["axes"]["settlement"], "not_settled")
+        self.assertEqual(self.graph.summary.get("terminal_status"), "BLOCKED")
+        self.assertEqual((self.graph.summary.get("terminal_reason") or {}).get("code"),
+                         "REVIEWER_RUNTIME_FAILURE")
 
     def test_the_engine_routes_on_the_typed_failure_with_no_standalone_branch(self) -> None:
         """And the workflow ACTS on the verdict -- observed at the process boundary.
@@ -2633,20 +2659,15 @@ class E2EDispatchFailureRoutesToCorrectionTests(_GraphAssertions, unittest.TestC
         self.assert_nothing_escaped(self.graph)
         delivered = self.graph.delivered_intents()
         self.assertTrue(delivered, "the agent recorded no delivered intent")
+        # Round 4 (finding 6): NOTHING is re-dispatched -- no repair attempt, no correction
+        # Worker -- because the engine received no verdict to act on.  The Worker's own
+        # intent is the only one the agent completed; the reviewer died before its dump.
         repairs = [intent for intent in delivered
                    if int(intent.get("repair_attempt") or 0) >= 1]
-        self.assertTrue(
-            repairs,
-            "nothing was re-dispatched after the dispatch failed, so the typed FAILED "
-            "settlement reached no policy at all. delivered: "
-            + repr([(i.get("role"), i.get("phase"), i.get("repair_attempt"))
-                    for i in delivered]))
-        for intent in repairs:
-            with self.subTest(intent=intent["intent_id"]):
-                instruction = intent.get("repair_instruction") or {}
-                codes = [defect.get("code") for defect in instruction.get("defects") or []]
-                self.assertIn("DECISION_GATE_INPUT_MISSING", codes,
-                              "the re-dispatch is not the engine's repair round")
+        self.assertEqual(repairs, [], "a repair round followed a reviewer runtime failure")
+        spawned = [row["source_vocabulary"].get("terminal_role")
+                   for row in self.graph.spawn_rows()]
+        self.assertEqual(sorted(spawned), ["PHASE_REVIEWER", "WORKER"], spawned)
         self.assertEqual(self.graph.summary.get("run_lifecycle"), "SETTLED")
 
 

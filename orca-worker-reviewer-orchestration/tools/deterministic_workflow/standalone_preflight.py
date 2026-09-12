@@ -52,6 +52,11 @@ VERDICTS = ("pass", "fail", "unknown")
 #: kind of failure: an unnamed refusal is indistinguishable from a mystery.
 REASONS = (
     "binary_absent", "binary_not_executable",
+    # Round 4, finding 10.  A `#!` wrapper (an npm-installed shim, a shell launcher): its
+    # KERNEL image is the interpreter, never the declared binary, so R-A leg 4 -- an
+    # executable-IMAGE equality -- could never close and every dispatch would time out at
+    # readiness with no named cause.  Refused HERE, by name, before any spawn.
+    "binary_wrapper_unsupported",
     "version_unreadable", "version_unparsable", "version_unsupported",
     "auth_absent", "auth_probe_interactive", "auth_probe_unreadable",
     "profile_invalid", "profile_flag_unsupported", "profile_path_unwritable",
@@ -249,8 +254,45 @@ def check_binary(profile: StandaloneProfile,
                          "searched_path_entries": len(child_env.get("PATH", "").split(os.pathsep))})
     if not os.access(resolved, os.X_OK):
         return _outcome("binary", "fail", "binary_not_executable", {"resolved": resolved})
-    return _outcome("binary", "pass", "",
-                    {"resolved": resolved, "realpath": os.path.realpath(resolved)})
+    real = os.path.realpath(resolved)
+    wrapper = interpreter_wrapper(real, child_env)
+    if wrapper is not None:
+        return _outcome("binary", "fail", "binary_wrapper_unsupported",
+                        {"resolved": resolved, "realpath": real, **wrapper,
+                         "detail": "the declared binary is a #! wrapper: the kernel image "
+                                   "of the foreground process would be its interpreter, "
+                                   "so the readiness proof's executable-identity leg "
+                                   "(R-A leg 4) can never hold; declare the native "
+                                   "executable the wrapper launches"})
+    return _outcome("binary", "pass", "", {"resolved": resolved, "realpath": real})
+
+
+def interpreter_wrapper(image: str, child_env: Mapping[str, str]) -> dict[str, Any] | None:
+    """``None`` for a native image; for a ``#!`` script, WHAT it would really run.
+
+    Reads the first line of the file and resolves the interpreter it names -- through
+    ``/usr/bin/env <name>`` against the CHILD's PATH when that is the shape -- so the
+    refusal names the image the kernel would actually load.  Unreadable is reported as a
+    wrapper of unknown interpreter rather than as native: an image whose identity cannot
+    be read is not one whose identity was verified.
+    """
+    try:
+        with open(image, "rb") as handle:
+            head = handle.readline(512)
+    except OSError as exc:
+        return {"shebang": "", "interpreter": "", "interpreter_image": "",
+                "unreadable": str(exc)}
+    if not head.startswith(b"#!"):
+        return None
+    line = head[2:].decode("utf-8", "replace").strip()
+    tokens = line.split()
+    interpreter = tokens[0] if tokens else ""
+    candidate = interpreter
+    if os.path.basename(interpreter) == "env" and len(tokens) > 1:
+        named = next((t for t in tokens[1:] if not t.startswith("-")), "")
+        candidate = shutil.which(named, path=child_env.get("PATH", "")) or named
+    return {"shebang": line, "interpreter": interpreter,
+            "interpreter_image": os.path.realpath(candidate) if candidate else ""}
 
 
 def check_version(profile: StandaloneProfile, child_env: Mapping[str, str], *,
@@ -564,26 +606,79 @@ def check_delivery_mode(profile: StandaloneProfile, child_env: Mapping[str, str]
 
 
 # ---- composition -----------------------------------------------------------------------
+#: The checks whose answer depends only on the profile, the binary image and the child
+#: environment -- and may therefore be REUSED within a run for an identical fingerprint
+#: (round 4, finding 11).  `auth` is deliberately absent: a credential is volatile and is
+#: re-probed on every dispatch, independently of the cached set.
+CACHEABLE_CHECKS = ("binary", "version", "profile", "delivery_mode")
+
+
+def preflight_fingerprint(profile: StandaloneProfile, child_env: Mapping[str, str], *,
+                          auth_probe_argv: Sequence[str] | None = None,
+                          help_text: str | None = None) -> str:
+    """What a cached preflight answer is keyed on.  ANY change re-runs everything.
+
+    The declared profile (every field), the RESOLVED binary image with its size and
+    modification time (an upgrade in place changes it), the child environment minus the
+    per-spawn token (so two dispatches under one profile share a key), and the probe
+    inputs.  Deliberately over-inclusive: a cache that ever answered for a changed
+    binary would be a preflight that never ran.
+    """
+    import hashlib
+    import json as _json
+    resolved = shutil.which(profile.binary, path=child_env.get("PATH", "")) or ""
+    image = os.path.realpath(resolved) if resolved else ""
+    try:
+        stat = os.stat(image) if image else None
+        image_identity = [image, stat.st_size, stat.st_mtime_ns, stat.st_ino] if stat else [image]
+    except OSError:
+        image_identity = [image, "unstat-able"]
+    env_view = {name: value for name, value in sorted(child_env.items())
+                if name != env_policy.SPAWN_TOKEN_ENV}
+    payload = _json.dumps({"profile": repr(profile), "image": image_identity,
+                           "env": env_view, "auth_probe_argv": list(auth_probe_argv or ()),
+                           "help_text": help_text}, sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def run_preflight(profile: StandaloneProfile, child_env: Mapping[str, str], *,
                   auth_probe_argv: Sequence[str] | None = None,
                   help_text: str | None = None, prober: Any = None,
                   rehearsal: Any = None, mode_rehearsal: Any = None,
-                  minted_session_id: str = "") -> tuple[PreflightOutcome, ...]:
+                  minted_session_id: str = "",
+                  reuse: Mapping[str, Mapping[str, Any]] | None = None
+                  ) -> tuple[PreflightOutcome, ...]:
     """Run all five checks and return all five outcomes.
 
     All five always run, even after one fails.  An operator fixing a deployment wants the
     whole picture, and the cost of finishing the checks is bounded by construction.
+
+    ``reuse`` (finding 11) maps a member of :data:`CACHEABLE_CHECKS` to a PASSING outcome
+    recorded earlier in this run for the SAME fingerprint; that check is then answered
+    from it, marked ``cached`` in its evidence, instead of being re-run -- so a real
+    agent's readiness and mode rehearsals (each a real model turn) are paid once per
+    run, not once per dispatch.  ``auth`` is never reusable and always runs.
     """
     env_policy.assert_clean(child_env)
+    cached = dict(reuse or {})
+
+    def _reused(name: str, run: Any) -> PreflightOutcome:
+        held = cached.get(name)
+        if held is not None and held.get("verdict") == "pass" and name in CACHEABLE_CHECKS:
+            return _outcome(name, "pass", "", {**dict(held.get("evidence") or {}),
+                                               "cached": True})
+        return run()
     return (
-        check_binary(profile, child_env),
-        check_version(profile, child_env, prober=prober),
+        _reused("binary", lambda: check_binary(profile, child_env)),
+        _reused("version", lambda: check_version(profile, child_env, prober=prober)),
         check_auth(profile, child_env, auth_probe_argv=auth_probe_argv, prober=prober),
-        check_profile(profile, child_env, help_text=help_text, prober=prober,
-                      rehearsal=rehearsal, minted_session_id=minted_session_id),
+        _reused("profile", lambda: check_profile(
+            profile, child_env, help_text=help_text, prober=prober,
+            rehearsal=rehearsal, minted_session_id=minted_session_id)),
         # LAST, and deliberately so: it is the later, stronger observation of the same auth
         # fact the third check probed, and D4.2b's ordering rule gives it precedence.
-        check_delivery_mode(profile, child_env, mode_rehearsal=mode_rehearsal),
+        _reused("delivery_mode", lambda: check_delivery_mode(
+            profile, child_env, mode_rehearsal=mode_rehearsal)),
     )
 
 

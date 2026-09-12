@@ -122,7 +122,15 @@ def failure_stage_for(exc: BaseException) -> str | None:
     a typed outcome.  The table is CLOSED: a `TypeError` or a `KeyError` is a programming
     error, not a dispatch outcome, and it still propagates.
     """
-    table: tuple[tuple[type[BaseException], str], ...] = (
+    for kind, stage in FAILURE_STAGE_TABLE:
+        if isinstance(exc, kind):
+            return stage
+    return None
+
+
+def _failure_stage_table() -> tuple[tuple[type[BaseException], str], ...]:
+    from .standalone_profile import ProfileError
+    return (
         (drivers.IdentityBindingUnverified, "identity_binding_violated"),
         (drivers.DeliveryModeMismatch, "delivery_mode_mismatch"),
         (identity.StandaloneTeardownUnproven, "teardown_unproven"),
@@ -130,12 +138,26 @@ def failure_stage_for(exc: BaseException) -> str | None:
         (pty_supervisor.ProcessTableUnreadable, "process_table_unreadable"),
         (pty_supervisor.PtyRefused, "pty_refused"),
         (journal_mod.ExecutionJournal.IntentNotDurable, "delivery_intent_not_durable"),
+        # ---- round 4, finding 7: the ENVIRONMENT construction failures ----------------
+        # `build_child_env` runs before preflight and RAISES on a declared credential that
+        # does not resolve and on a constructed environment that would leak a forbidden
+        # name to the child.  Both are production outcomes of an operator's host, not
+        # programming errors, and both escaped `adapter.start` as tracebacks that left the
+        # ledger CLAIMED with nothing to say why.
+        (env_policy.SecretUnavailable, "secret_unavailable"),
+        (env_policy.ChildEnvironmentLeak, "child_environment_leak"),
+        (preflight_mod.PreflightRefused, "preflight_refused"),
+        (journal_mod.JournalUnreadable, "journal_unreadable"),
+        (drivers.CapabilityDeclarationError, "profile_invalid"),
+        (ProfileError, "profile_invalid"),
+        (identity.IdentityError, "identity_record_invalid"),
         (OSError, "os_error"),
     )
-    for kind, stage in table:
-        if isinstance(exc, kind):
-            return stage
-    return None
+
+
+#: The CLOSED table (finding 6, round 3; extended by finding 7, round 4).  Module-level so
+#: a test can assert its membership rather than probe it one exception at a time.
+FAILURE_STAGE_TABLE: tuple[tuple[type[BaseException], str], ...] = _failure_stage_table()
 
 
 class _CapturedBody:
@@ -190,14 +212,19 @@ class StandaloneSession:
                  table_reader: Any = None, spawner: Any = None,
                  secret_resolver: Any = None, clock: Any = None,
                  supervisor_pid: int | None = None,
-                 measured_ingest_rate: float | None = None) -> None:
+                 measured_ingest_rate: float | None = None,
+                 preflight_cache: Any = None) -> None:
         self.intent = dict(intent)
+        #: The RUN's preflight cache (finding 11): fingerprint -> passing cacheable
+        #: outcomes.  Shared by every session of one `StandaloneRuntime`; a session built
+        #: alone gets a private one and caches nothing anybody else reads.
+        self._preflight_cache = preflight_cache if preflight_cache is not None else {}
+        self._preflight_evidence: dict[str, Any] = {}
         self.profile = profile
         self.artifact_base = Path(artifact_base)
         self.run_id = run_id
         self.journal = journal
         self.runtime_state = runtime_state
-        self.driver = drivers.driver_for(profile)
         #: The dispatch ROLE, carried so the journal can name who this pty session belongs
         #: to.  `pause_policy.terminal_disposition` discharges a retained resource only when
         #: its row names a role, an origin AND an owner; without those three a live,
@@ -220,6 +247,23 @@ class StandaloneSession:
         self.session_id = identity.mint_session_id(
             run_id=run_id, dispatch_id=self.dispatch_id, task_id=self.task_id)
         self.spawn_token = identity.mint_spawn_token()
+        # ---- round 4, finding 9: the result-body file is DISPATCH-SCOPED ---------------
+        # `output_last_message_path` is a profile field, i.e. one path per PROFILE, and a
+        # profile serves every dispatch of a run -- sequential, concurrent, and the two
+        # preflight rehearsals.  Read back as "the current result", a file the PREVIOUS
+        # dispatch (or a rehearsal) wrote was parsed as this dispatch's verdict whenever
+        # this dispatch's own stream carried no body.  The declared field is now an
+        # OPT-IN: the path the driver composes into `-o`, reads the body from and reports
+        # provenance for is minted here, under this session's own directory, named by
+        # this incarnation, and can therefore never be another dispatch's file.
+        self.last_message_path = ""
+        scoped = profile
+        if profile.output_last_message_path:
+            self.last_message_path = str(
+                capture_mod.capture_path(artifact_base, run_id, self.session_id).with_name(
+                    f"last_message.{self.incarnation}.md"))
+            scoped = profile.with_paths(output_last_message_path=self.last_message_path)
+        self.driver = drivers.driver_for(scoped)
 
         self.record: dict[str, Any] | None = None
         self.pty: dict[str, Any] | None = None
@@ -382,6 +426,14 @@ class StandaloneSession:
                                          cleanup_authority="not_authorized")),
             source_vocabulary=dict(vocabulary or {}), **extra))
 
+    def _rehearsal_profile(self, profile: StandaloneProfile, kind: str) -> StandaloneProfile:
+        """A rehearsal writes its `-o` body to ITS OWN file, never the dispatch's (finding 9)."""
+        if not profile.output_last_message_path or not self.last_message_path:
+            return profile
+        return profile.with_paths(output_last_message_path=str(
+            Path(self.last_message_path).with_name(
+                f"rehearsal.{kind}.{self.incarnation}.md")))
+
     # -- start ---------------------------------------------------------------------------
     def rehearse_delivery_mode(self, profile: StandaloneProfile,
                                child_env: Mapping[str, str]) -> dict[str, Any]:
@@ -399,7 +451,7 @@ class StandaloneSession:
         no prompt at all, and a spawn that reaches the quorum and then waits makes the
         declaration `delivery_mode_ambiguous`.
         """
-        driver = drivers.driver_for(profile)
+        driver = drivers.driver_for(self._rehearsal_profile(profile, "mode"))
         rehearsal_session = identity.mint_session_id(
             run_id=self.run_id, dispatch_id=self.dispatch_id, task_id=self.task_id)
         payload = REHEARSAL_PAYLOAD
@@ -477,7 +529,7 @@ class StandaloneSession:
         alone.  It returns the bound signal it observed, or ``None`` -- and ``None`` is what
         preflight turns into the named refusal.
         """
-        driver = drivers.driver_for(profile)
+        driver = drivers.driver_for(self._rehearsal_profile(profile, "readiness"))
         # The profile's OWN argv composition, in the mode it declares.  A `launch_with_prompt`
         # driver composed WITHOUT a payload emits nothing at all (D4.0 M-5, M-6, M-9), so a
         # rehearsal that omitted it would refuse every such profile at
@@ -546,14 +598,40 @@ class StandaloneSession:
         # only source of one.
         if auth_probe_argv is None:
             auth_probe_argv = self.profile.auth_probe_argv()
-        outcomes = preflight_mod.run_preflight(
+        if self.last_message_path:
+            Path(self.last_message_path).parent.mkdir(parents=True, exist_ok=True)
+        # ---- round 4, finding 11: the safe run-scoped checks are paid ONCE per run ------
+        # Keyed on the declared profile, the resolved binary image (path, size, mtime,
+        # inode) and the child environment minus the per-spawn token; a hit reuses the
+        # binary/version/profile/delivery-mode outcomes -- the two rehearsals among them
+        # -- and STILL runs the auth probe, which is volatile and refreshed every dispatch.
+        fingerprint = preflight_mod.preflight_fingerprint(
             self.profile, self._child_env, auth_probe_argv=auth_probe_argv,
+            help_text=help_text)
+        held = self._preflight_cache.get(fingerprint)
+        outcomes = preflight_mod.run_preflight(
+            self.driver.profile, self._child_env, auth_probe_argv=auth_probe_argv,
             help_text=help_text, prober=prober,
             rehearsal=rehearsal if rehearsal is not None else self.rehearse_readiness,
             mode_rehearsal=(mode_rehearsal if mode_rehearsal is not None
                             else self.rehearse_delivery_mode),
-            minted_session_id=rehearsal_session_id)
+            minted_session_id=rehearsal_session_id,
+            reuse=held)
         decision = preflight_mod.compose(outcomes)
+        cacheable = {o["check"]: dict(o) for o in outcomes
+                     if o["check"] in preflight_mod.CACHEABLE_CHECKS
+                     and o["verdict"] == "pass"}
+        if len(cacheable) == len(preflight_mod.CACHEABLE_CHECKS):
+            self._preflight_cache[fingerprint] = cacheable
+        # Recorded on the rows that already exist for every start (the refusal row below,
+        # or the `spawned` row), not as a row of its own: the journal's row sequence is a
+        # locked contract and the cache decision is evidence ABOUT a start, not an event.
+        self._preflight_evidence = {
+            "preflight_cache": "hit" if held else "miss",
+            "preflight_fingerprint": fingerprint,
+            "reused_checks": sorted(o["check"] for o in outcomes
+                                    if o.get("evidence", {}).get("cached")),
+            "auth_check": "refreshed"}
         if not decision["proceed"]:
             # Nothing was spawned, so teardown is NOT REQUIRED -- and saying so is different
             # from claiming a teardown was proven.
@@ -561,7 +639,8 @@ class StandaloneSession:
             self._journal(kind="REFUSED", derived_from="capture", event="evidence_unreadable",
                           state="FAILED",
                           vocabulary={"preflight": [dict(o) for o in outcomes],
-                                      "reason": decision["reason"]})
+                                      "reason": decision["reason"],
+                                      **self._preflight_evidence})
             return self._receipt("failed", decision["reason"], teardown="not_required")
 
         # D4.2a: the DECLARED mode chooses the argv, and `launch_argv` REFUSES to compose
@@ -666,6 +745,14 @@ class StandaloneSession:
                 argv_digest=argv_digest, env_digest=env_digest,
                 sentinel=str(sentinel), fence=self.fence,
                 image=self._resolved_binary())
+        except pty_supervisor.SpawnHandoffFailed as exc:
+            # Round 4, finding 4.  A leader was forked and an agent MAY have reached
+            # `execve`; the parent just never learned its pid.  Nothing is settled from
+            # that: the retained pty and leader are enough authority to find the child
+            # through its own spawn record, terminate it through the ownership ladder,
+            # reap and PROVE its exit -- or to leave it durably RETAINED and unsettled.
+            return self._teardown_after_handoff_failure(exc, argv_digest=argv_digest,
+                                                        env_digest=env_digest)
         except OSError as exc:
             self.state = "FAILED"
             self._journal(kind="REFUSED", derived_from="pty", event="evidence_unreadable",
@@ -697,6 +784,7 @@ class StandaloneSession:
                                   "captured_tty": self.record["captured_tty"],
                                   "argv_digest": argv_digest, "env_digest": env_digest,
                                   "session_digest": argv_digest,
+                                  **self._preflight_evidence,
                                   **self._terminal_provenance()})
 
         # -- identity bind: the CHILD's own evidence that an execve happened -------------
@@ -714,6 +802,7 @@ class StandaloneSession:
                                       "detail": probe["detail"]})
             return self._receipt(outcome, reason, teardown=teardown)
         self.event_log.append("identity_bound")
+        self._bind_start_identity(probe["record"] or {})
         self._journal(kind="SPAWN_OBSERVED", derived_from="pty", event="identity_bound",
                       state="STARTING", vocabulary={"spawn_record": probe["record"] or {},
                                                     "pid": self.record["pid"],
@@ -862,6 +951,16 @@ class StandaloneSession:
                 dict(receipt),
                 exit_status=(completion.get("evidence") or {}).get("exit_status"))
         verdict = dict(completion.get("verdict") or {})
+        if completion["state"] == "FAILED" and self._runtime_failure_is_not_a_verdict():
+            # Round 4, finding 6.  A FAILED completion is the RUNTIME's observation -- the
+            # declared error field set (auth expiry), a non-zero exit (OOM, crash), a
+            # process that ended without declaring a result -- and for a Reviewer that
+            # observation must not become `result: FAIL`.  It is routed as a runtime
+            # failure and settled by nothing.
+            raise StandaloneDispatchFailed(
+                "completion_failed", str(verdict.get("reason") or "completion_failed"),
+                dict(receipt),
+                exit_status=(completion.get("evidence") or {}).get("exit_status"))
         event = self._settle(completion["evidence"], lease_token=lease_token,
                              result_parser=result_parser, verdict=verdict)
         # Finding 10.  The reported outcome is the VERDICT's, the same value `_settle` just
@@ -1040,6 +1139,7 @@ class StandaloneSession:
                                "driver": self.driver.name,
                                "completion_verdict": dict(verdict or {}),
                                "result_body_source": extracted["source"],
+                               "result_body_provenance": self._body_provenance(extracted),
                                "pid": (self.record or {}).get("pid"),
                                "captured_tty": (self.record or {}).get("captured_tty"),
                                **self._terminal_provenance()}),
@@ -1101,6 +1201,8 @@ class StandaloneSession:
                    # regression tests rest on that distinction being durable.
                    "exit_status": exit_status,
                    "exit_proof": proof["how"]}
+        if self._runtime_failure_is_not_a_verdict():
+            raise self._runtime_failure_not_settled(verdict, proof, lease_token=lease_token)
         extracted = self.driver.result_body(self.capture.transcript())
         body = extracted["body"]
         parsed = _default_result_parser(_CapturedBody(
@@ -1135,6 +1237,7 @@ class StandaloneSession:
             source_vocabulary={"event": dict(event), "driver": self.driver.name,
                                "completion_verdict": dict(verdict),
                                "result_body_source": extracted["source"],
+                               "result_body_provenance": self._body_provenance(extracted),
                                "exit_status": exit_status,
                                "exit_proof": proof["how"],
                                "teardown": "proven" if spawned else "not_required",
@@ -1159,6 +1262,91 @@ class StandaloneSession:
                 "settled": True, "event_id": event["event_id"], "outcome": "failed",
                 "failure_stage": failure.stage, "exit_proof": proof["how"],
                 "teardown": "proven" if spawned else "not_required"}
+
+    def _body_provenance(self, extracted: Mapping[str, Any]) -> dict[str, Any]:
+        """WHERE the settled body came from, bound to this dispatch.  Finding 9.
+
+        A body read from the dispatch-scoped `-o` file names that file, its digest and
+        size, and the session/incarnation the path was minted for; a body taken from the
+        structured stream names the record.  Either way a reader of the journal can tell
+        which dispatch's evidence settled this intent, and the path itself carries the
+        session id and incarnation so it cannot name another dispatch's file.
+        """
+        provenance: dict[str, Any] = {"source": extracted["source"],
+                                      "session_id": self.session_id,
+                                      "process_incarnation": self.incarnation,
+                                      "dispatch_id": self.dispatch_id}
+        path = extracted.get("path")
+        if path:
+            provenance["path"] = str(path)
+            provenance["sha256"] = extracted.get("sha256")
+            provenance["bytes"] = extracted.get("bytes")
+            provenance["scoped_to_this_dispatch"] = (
+                self.last_message_path != "" and str(path) == self.last_message_path)
+        return provenance
+
+    def _runtime_failure_is_not_a_verdict(self) -> bool:
+        return self.role in lifecycle.RUNTIME_FAILURE_NOT_A_VERDICT_ROLES
+
+    def _runtime_failure_not_settled(self, verdict: Mapping[str, Any],
+                                     proof: Mapping[str, Any], *,
+                                     lease_token: str | None) -> StandaloneDispatchUnsettled:
+        """Round 4, finding 6: a Reviewer's RUNTIME failure, journalled and NOT settled.
+
+        Reached only after the process's exit is PROVEN (or was never spawned) and its
+        resources reclaimed, so the run stops over nothing live.  What it writes:
+
+        * a durable `EVENT` row naming the failure by stage, reason and exit status under
+          `runtime_failure`, with axes `not_settled / release / already exited /
+          authorized` -- the resource is gone and nothing is settled;
+        * NO `SETTLEMENT_OBSERVED` row and NO ledger settlement: there is no verdict to
+          record, and a `result: FAIL` here would be a judgement nobody made;
+        * for a dispatch that never spawned, the ledger claim's lease is RELEASED so a
+          successor may re-run the intent the moment the operator has fixed the host --
+          the claim stays CLAIMED (nothing external exists) and is recoverable by the
+          ordinary ladder (no settlement, no receipt, no spawn record -> re-run).
+
+        The typed error it returns carries `REVIEWER_RUNTIME_FAILURE`, which the adapter
+        projects onto the engine's BLOCKED terminal through `IdempotencyRecoveryError`:
+        no correction Worker is dispatched, no phase iteration is charged, and
+        `reviewer_result` stays `None`.
+        """
+        spawned = self.record is not None
+        self.state = "FAILED"
+        self._journal(kind="EVENT", derived_from="runtime_state", event="exit_observed",
+                      state="FAILED",
+                      axes=self._axes(settlement="not_settled", worker_resource="release",
+                                      process_liveness="already exited" if spawned
+                                      else "disputed",
+                                      cleanup_authority="authorized" if spawned
+                                      else "not_authorized"),
+                      vocabulary={"runtime_failure": dict(verdict),
+                                  "code": lifecycle.REVIEWER_RUNTIME_FAILURE,
+                                  "role": self.role, "driver": self.driver.name,
+                                  "exit_status": verdict.get("exit_status"),
+                                  "exit_proof": proof["how"],
+                                  "teardown": "proven" if spawned else "not_required",
+                                  "settled": False,
+                                  "detail": "a runtime/infrastructure failure of a Reviewer "
+                                            "dispatch is not a review verdict; nothing is "
+                                            "settled and no correction is dispatched",
+                                  "pid": (self.record or {}).get("pid"),
+                                  "captured_tty": (self.record or {}).get("captured_tty"),
+                                  **self._terminal_provenance()})
+        if not spawned and self.runtime_state is not None and lease_token:
+            try:
+                self.runtime_state.release(self.intent_id, lease_token)
+            except Exception:  # noqa: BLE001 - the lease lapses on its own; never mask
+                pass
+        return StandaloneDispatchUnsettled(
+            "runtime_failure",
+            f"{self.intent_id}: the {self.role} dispatch failed at {verdict.get('stage')} "
+            f"({verdict.get('reason')}); a runtime failure is not a review verdict, so "
+            "nothing is settled and no correction is dispatched",
+            code=lifecycle.REVIEWER_RUNTIME_FAILURE,
+            evidence={"stage": verdict.get("stage"), "reason": verdict.get("reason"),
+                      "exit_status": verdict.get("exit_status"), "exit_proof": proof["how"],
+                      "role": self.role, "pid": (self.record or {}).get("pid")})
 
     def _receipt(self, outcome: str, reason: str, *, teardown: str) -> StartReceipt:
         if outcome not in START_OUTCOMES:
@@ -1198,8 +1386,114 @@ class StandaloneSession:
                                         f"{recorded_pid!r}, not the spawned {spawned_pid}"})
         return probe
 
-    def _prove_teardown(self) -> str:
-        """A FAILED start proves its own teardown or RAISES (rule 1)."""
+    def _bind_start_identity(self, spawn_record: Mapping[str, Any]) -> None:
+        """Carry the child's OWN start identity on the ownership record.  Finding 3.
+
+        `standalone_identity.verify` already reads `boot_id` and `proc_start_ticks` off
+        the record as OPTIONAL axes -- nothing ever wrote them.  The spawn record is
+        written by the agent itself, before `execve`, from the kernel's own start time
+        for its pid, so it is the one same-incarnation identity a later exit proof can
+        compare a still-existing pid against.  A zero stays absent: it means the platform
+        reported nothing, and an absent axis is never a matching one.
+        """
+        if self.record is None:
+            return
+        for axis in ("proc_start_ticks", "boot_id"):
+            value = spawn_record.get(axis)
+            if value:
+                self.record[axis] = value
+
+    def _teardown_after_handoff_failure(self, failure: pty_supervisor.SpawnHandoffFailed, *,
+                                        argv_digest: str, env_digest: str) -> StartReceipt:
+        """Finding 4.  Bind whatever child exists, then prove or RETAIN it.
+
+        Three shapes, each proven rather than assumed:
+
+        * the child's spawn record for THIS incarnation is present -> an agent reached
+          `execve`.  Its pid, group and start identity come from the record; the ownership
+          record is built from them and the failed-start teardown runs through the SAME
+          ladder as any interruption (finding 5);
+        * no spawn record, and the leader (this process's own child) is reaped -> no agent
+          ever existed and nothing runs: `failed/spawn_handoff_failed`, teardown proven by
+          the reap and by the empty tty;
+        * no spawn record and the leader still present -> the leader is the retained
+          handle: it is signalled through the ladder in the pre-topology shape (it IS the
+          session), and its exit is proven or the dispatch stays RETAINED.
+        """
+        self.pty = dict(failure.retained_session())
+        self.event_log.append("spawned")
+        tty = _tty_name(failure.slave_name)
+        self._journal(kind="EVENT", derived_from="pty", event="evidence_unreadable",
+                      state="STARTING",
+                      vocabulary={"spawn_error": str(failure), "handoff": "failed",
+                                  "leader_pid": failure.leader_pid, "captured_tty": tty,
+                                  "pty_id": failure.pty_id, "argv_digest": argv_digest,
+                                  "env_digest": env_digest, "retained": True,
+                                  **self._terminal_provenance()})
+        probe = self._await_spawn_record(timeout_ms=2000)
+        if probe["outcome"] == "present":
+            record = probe["record"] or {}
+            pid = int(record.get("pid") or 0)
+            self.pty.update({"pid": pid, "pgid": int(record.get("pgid") or pid)})
+            self.record = self._ownership_record(
+                pid=pid, pgid=int(record.get("pgid") or pid),
+                sid=int(record.get("sid") or failure.leader_pid), tty=tty,
+                pty_id=failure.pty_id, argv_digest=argv_digest, env_digest=env_digest)
+            self._bind_start_identity(record)
+            self._journal(kind="SPAWN_OBSERVED", derived_from="pty", event="identity_bound",
+                          state="STARTING",
+                          vocabulary={"spawn_record": record, "pid": pid, "captured_tty": tty,
+                                      "session_digest": argv_digest, "pty_id": failure.pty_id,
+                                      "handoff": "failed; identity bound from the child's "
+                                                 "own spawn record",
+                                      **self._terminal_provenance()})
+        else:
+            # The leader is the only process this runtime can name.  In the pre-topology
+            # shape it is pid == pgid == sid on the captured tty, which is exactly what
+            # `setsid` + `TIOCSCTTY` made it, and the ladder signals descendants first.
+            self.record = self._ownership_record(
+                pid=failure.leader_pid, pgid=failure.leader_pid, sid=failure.leader_pid,
+                tty=tty, pty_id=failure.pty_id, argv_digest=argv_digest,
+                env_digest=env_digest)
+            self.record["proc_start_ticks"] = pty_supervisor.proc_start_ticks(
+                failure.leader_pid) or None
+        teardown = self._prove_teardown(reason="spawn_handoff_failed")
+        self.state = "FAILED"
+        self._journal(kind="REFUSED", derived_from="pty", event="exit_observed",
+                      state="FAILED",
+                      vocabulary={"failure_reason": "spawn_handoff_failed",
+                                  "spawn_record": probe["outcome"], "teardown": teardown,
+                                  "pid": self.record["pid"], "captured_tty": tty})
+        return self._receipt("failed", "spawn_handoff_failed", teardown=teardown)
+
+    def _ownership_record(self, *, pid: int, pgid: int, sid: int, tty: str, pty_id: str,
+                          argv_digest: str, env_digest: str) -> dict[str, Any]:
+        return dict(identity.make_record(
+            run_id=self.run_id, repo_id=self.repo_id,
+            worktree_selector=identity.stable_worktree_selector(self.repo_id,
+                                                                self.worktree_path),
+            agent_id=self.agent_id, task_id=self.task_id, dispatch_id=self.dispatch_id,
+            session_id=self.session_id, pid=pid, pgid=pgid, sid=sid, captured_tty=tty,
+            pty_id=pty_id, process_incarnation=self.incarnation, host_scope="local",
+            spawn_token=self.spawn_token, started_at=_now_iso(), argv_digest=argv_digest,
+            env_digest=env_digest, created_by_this_runtime=True,
+            resource_kind="pty_session", user_taken_over=False))
+
+    def _prove_teardown(self, *, reason: str = "failed_start") -> str:
+        """A FAILED start proves its own teardown or RAISES (rule 1).  Finding 5.
+
+        **No bare signal.**  The old shape `waitpid`ed a grandchild (which cannot succeed:
+        the agent is the watcher's child, not this process's) and then sent `SIGTERM` and
+        `SIGKILL` to the remembered pid with `os.kill` -- no identity re-verification, no
+        ownership decision, no permit.  During the spawn-record wait that pid can be reaped
+        and recycled, and a recycled pid is a stranger.  The failed-start teardown now
+        takes exactly the path an interruption takes: the fenced exit sentinel first (a
+        watcher that already reaped the agent needs no signal), else the four-rung ladder
+        -- every rung gated by `assert_may_act` and a fresh tty-scoped table, every signal
+        through `signal_target` under a permit -- and then the exit is PROVEN by
+        `exit_proven` (ESRCH, or a start-identity mismatch that proves the recycled pid
+        is not ours), never by the signal having been sent.
+        """
         if self.record is None or self.pty is None:
             return "not_required"
         # Drain BEFORE waiting.  A child with unflushed pty output cannot finish exiting
@@ -1208,40 +1502,31 @@ class StandaloneSession:
         # that was about to die cleanly.
         self.pump(timeout_ms=100)
         pid = int(self.record["pid"])
-        reaped = False
-        try:
-            done, _status = os.waitpid(pid, os.WNOHANG)
-            reaped = done == pid
-        except OSError:
-            reaped = False
-        if not reaped:
-            for sig in (15, 9):
-                try:
-                    os.kill(pid, sig)
-                except OSError:
-                    break
-                time.sleep(0.05)
-            try:
-                done, _status = os.waitpid(pid, os.WNOHANG)
-                reaped = done == pid
-            except OSError:
-                reaped = False
-        esrch = False
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            esrch = True
-        except OSError:
-            esrch = False
+        sentinel = self._read_sentinel()
+        how = "exit_sentinel"
+        if sentinel["outcome"] != "exited":
+            ladder = self.interrupt(f"{reason}:teardown")
+            outcome = str(ladder["interrupt_outcome"])
+            how = f"interrupt_ladder:{outcome}"
+            if outcome not in ("interrupted_confirmed", "terminated_forced"):
+                identity.prove_teardown(reaped=False, esrch=False, incarnation_absent=False,
+                                        detail=f"{how}; the resource is RETAINED")
+            deadline = self._clock() + self.profile.timeouts.physical_exit_timeout_ms / 1000.0
+            sentinel = self._read_sentinel()
+            while sentinel["outcome"] != "exited" and self._clock() < deadline:
+                time.sleep(0.02)
+                sentinel = self._read_sentinel()
         snapshot = self._snapshot()
-        incarnation_absent = (not snapshot.get("readable", False)
-                              or pty_supervisor.row_for(snapshot, pid) is None)
-        identity.prove_teardown(reaped=reaped, esrch=esrch,
-                                incarnation_absent=incarnation_absent and snapshot.get(
-                                    "readable", False))
+        proof = pty_supervisor.exit_proven(self.record, snapshot) \
+            if snapshot.get("readable", False) else {"proven": False,
+                                                    "reason": "process_table_unreadable"}
+        identity.prove_teardown(
+            reaped=sentinel["outcome"] == "exited",
+            esrch=bool(proof["proven"]), incarnation_absent=bool(proof["proven"]),
+            detail=f"{how}; exit_proven={proof['reason']}")
         # Finding 9: a proven teardown RECLAIMS what this process holds -- the exit watcher
         # (its child, otherwise a zombie) and the pty master (otherwise a leaked fd).
-        self._reclaim(reason="failed_start")
+        self._reclaim(reason=f"{reason}:{how}")
         return "proven"
 
     # -- finding 1 / finding 9: exit proof and resource reclamation ------------------------
@@ -1770,6 +2055,8 @@ class StandaloneRuntime:
         self._session_factory = session_factory or StandaloneSession
         self._session_kwargs = session_kwargs
         self.sessions: dict[str, StandaloneSession] = {}
+        #: Finding 11: one preflight cache per RUN, shared by its sessions.
+        self.preflight_cache: dict[str, dict[str, Any]] = {}
 
     def session_for(self, intent: Mapping[str, Any]) -> StandaloneSession:
         intent_id = str(intent.get("intent_id", ""))
@@ -1777,7 +2064,10 @@ class StandaloneRuntime:
             self.sessions[intent_id] = self._session_factory(
                 intent=intent, profile=self.profile, artifact_base=self.artifact_base,
                 run_id=self.run_id, journal=self.journal,
-                runtime_state=self.runtime_state, **self._session_kwargs)
+                runtime_state=self.runtime_state,
+                **({"preflight_cache": self.preflight_cache}
+                   if self._session_factory is StandaloneSession else {}),
+                **self._session_kwargs)
         return self.sessions[intent_id]
 
     def session(self, intent_id: str) -> StandaloneSession:

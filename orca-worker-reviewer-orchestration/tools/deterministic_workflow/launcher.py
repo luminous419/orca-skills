@@ -211,12 +211,7 @@ def persist_standalone_profile(artifact_base: Any, run_id: str,
     archive.parent.mkdir(parents=True, exist_ok=True)
 
     def _write(path: Path) -> None:
-        tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
-        with open(tmp, "w", encoding="utf-8") as handle:
-            handle.write(payload + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp, path)
+        _durable_write(path, payload + "\n")
     if not archive.exists():
         _write(archive)
     current = None
@@ -230,6 +225,94 @@ def persist_standalone_profile(artifact_base: Any, run_id: str,
     if current != payload + "\n":
         _write(target)
     return target
+
+
+def _durable_write(path: Path, text: str) -> None:
+    """``write`` -> ``fsync(file)`` -> ``rename`` -> ``fsync(dir)``.  Round 4, finding 8.
+
+    The directory fsync is the half that was missing: a rename is a directory entry
+    change, and until the directory's own metadata reaches stable storage a crash can
+    leave the run's effects and journal on disk with NO profile (or no authority record)
+    beside them -- exactly the file the Watchdog needs to rebuild the runtime.  The same
+    discipline `standalone_pty.write_spawn_record` already applies to the spawn record.
+    """
+    tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
+    with open(tmp, "w", encoding="utf-8") as handle:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+    _fsync_directory(path.parent)
+
+
+def _fsync_directory(directory: Path) -> None:
+    try:
+        dir_fd = os.open(str(directory), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(dir_fd)
+    except OSError:
+        pass
+    finally:
+        os.close(dir_fd)
+
+
+# ---- round 4, finding 2: the runtime-state AUTHORITY recorded by the original launch ----
+STANDALONE_AUTHORITY_SCHEMA = "os37.standalone_authority.v1"
+
+
+def standalone_authority_path(artifact_base: Any, run_id: str) -> Path:
+    """Where a standalone run records WHICH runtime-state ledger it was launched against.
+
+    Beside the persisted profile: `--runtime-state` names an operator-chosen ledger, and a
+    recovery that reconstructs the DEFAULT path instead reopens a different (empty)
+    authority, reads every claim as `CREATED`, re-executes an already-settled intent and
+    then fails `SETTLEMENT_IDENTITY_MISMATCH` against the real one.
+    """
+    from .standalone_journal import journal_path
+    return journal_path(artifact_base, run_id).with_name("runtime_state.json")
+
+
+def persist_standalone_authority(artifact_base: Any, run_id: str, *,
+                                 runtime_state_path: Any, thread_id: str = "") -> Path:
+    """Record the ledger location durably (tmp + fsync + rename + dir fsync)."""
+    target = standalone_authority_path(artifact_base, run_id)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps({"schema": STANDALONE_AUTHORITY_SCHEMA, "run_id": run_id,
+                          "runtime_state_path": str(Path(runtime_state_path).resolve()),
+                          "thread_id": thread_id}, sort_keys=True, indent=2)
+    current = None
+    if target.exists():
+        try:
+            current = target.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise LauncherError(
+                f"{STANDALONE_ADAPTER_REQUIRES_LEDGER}: the persisted runtime-state "
+                f"authority at {target} is unreadable ({exc})") from exc
+    if current != payload + "\n":
+        _durable_write(target, payload + "\n")
+    return target
+
+
+def load_standalone_authority(artifact_base: Any, run_id: str) -> dict[str, Any] | None:
+    """The recorded authority, or ``None`` when the run recorded none.  Unreadable RAISES."""
+    target = standalone_authority_path(artifact_base, run_id)
+    if not target.exists():
+        return None
+    try:
+        record = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise LauncherError(
+            f"{STANDALONE_ADAPTER_REQUIRES_LEDGER}: the persisted runtime-state authority "
+            f"at {target} is unreadable ({exc})") from exc
+    if (not isinstance(record, dict) or record.get("schema") != STANDALONE_AUTHORITY_SCHEMA
+            or not isinstance(record.get("runtime_state_path"), str)
+            or not record["runtime_state_path"]):
+        raise LauncherError(
+            f"{STANDALONE_ADAPTER_REQUIRES_LEDGER}: the persisted runtime-state authority "
+            f"at {target} does not name a ledger")
+    return record
 
 
 def load_standalone_profile(artifact_base: Any, run_id: str) -> dict[str, Any] | None:
@@ -352,6 +435,14 @@ def build_standalone_adapter(spec: dict[str, Any], *, artifact_base: Path,
     # Watchdog can rebuild this exact runtime for a recovery instead of binding the
     # recovered graph to an adapter with no runtime at all.
     persist_standalone_profile(artifact_base, resolved_run, profile_spec)
+    # Finding 2 (round 4).  The LEDGER the run is launched against is recorded beside the
+    # profile, so the Watchdog reopens exactly this authority rather than reconstructing
+    # the default path.  An in-memory ledger names no path and records nothing.
+    ledger_path = getattr(runtime_state, "path", None)
+    if ledger_path is not None:
+        persist_standalone_authority(artifact_base, resolved_run,
+                                     runtime_state_path=ledger_path,
+                                     thread_id=str(spec.get("thread_id") or ""))
     adapter = StandaloneAdapter(runtime, runtime_state=runtime_state,
                                 settlement_journal=journal,
                                 pause_row_journal=_standalone_pause_row_journal(
@@ -1554,8 +1645,21 @@ def _watchdog_wiring(args: argparse.Namespace, *, runner: Any = None,
                 except Exception:  # noqa: BLE001 - an unreadable head is refused later, by name
                     head = None
                 thread_id = getattr(head, "thread_id", "") or run_id
+            ledger_path = default_runtime_state_path(run_id, thread_id)
+            if adapter_name == STANDALONE_ADAPTER:
+                # Round 4, finding 2.  A standalone run launched with `--runtime-state`
+                # was recovered against the DEFAULT ledger -- a different, empty authority
+                # in which every claim reads CREATED -- so an already-settled intent was
+                # re-executed and the run then failed SETTLEMENT_IDENTITY_MISMATCH against
+                # the real one.  The launch records its ledger beside the profile, and the
+                # recovery reopens EXACTLY that.  A run that recorded none keeps the
+                # default, which is what its launch used.  The Orca and fake arms are
+                # untouched.
+                authority = load_standalone_authority(base, run_id)
+                if authority is not None:
+                    ledger_path = Path(authority["runtime_state_path"])
             bindings[run_id] = (
-                FileRuntimeStateStore(default_runtime_state_path(run_id, thread_id)),
+                FileRuntimeStateStore(ledger_path),
                 pause_store.journal_for(run_id, artifact_base=base))
         return bindings[run_id]
 
@@ -1657,7 +1761,7 @@ def _watchdog_wiring(args: argparse.Namespace, *, runner: Any = None,
         return adapter_for(run_id)[0].capabilities()
 
     from . import turn_boundary
-    return {
+    wiring = WatchdogWiring({
         "discovery": recovery_runtime.RunDiscovery(base),
         # The Orca listing authority is the real CLI boundary.  Where no `orca` binary
         # answers, the read RAISES and the sweep fails closed at R1 -- it never reads
@@ -1694,7 +1798,20 @@ def _watchdog_wiring(args: argparse.Namespace, *, runner: Any = None,
             graph_factory_for=graph_factory_for,
             recursion_limit=getattr(args, "recursion_limit", None)),
         "audit": watchdog_audit.FileWatchdogAudit(base),
-    }
+    })
+    # Round 4, finding 2: the per-run composition itself, as an ATTRIBUTE rather than a
+    # key -- the dict is unpacked straight into `watchdog_supervisor.sweep(**deps)`, whose
+    # signature is closed -- so a test can ask which ledger a recovery would reopen
+    # without driving a whole recovery.
+    wiring.adapter_for = adapter_for
+    return wiring
+
+
+class WatchdogWiring(dict):
+    """The five injected ports (a plain mapping for ``sweep(**deps)``) plus, as an
+    attribute the supervisor never sees, the per-run adapter composition."""
+
+    adapter_for: Any
 
 
 def run_watchdog_cli(argv: list[str], *, runner: Any = None,

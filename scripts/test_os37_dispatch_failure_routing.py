@@ -31,6 +31,15 @@ So this module MEASURES the route each of those three causes really takes throug
 None of that is standalone-specific, and `NoStandaloneBranchInThePolicyModulesTests` asserts
 it by inspection of the pinned modules rather than by assurance.
 
+**Round 4 (run_61c62f0bf91b, finding 6) narrows clauses 2-4 to the WORKER.**  For a
+Reviewer, a runtime failure -- a crash, a silent exit, an auth expiry, a timeout -- is NOT
+a settlement at all: `result: FAIL` is a judgement about the work, and routing it (through
+the repair loop or straight to correction) spent paid turns and phase iterations on a
+finding nobody made.  The two Reviewer-scoped cases below therefore lock the typed
+`REVIEWER_RUNTIME_FAILURE` terminal: no settlement row, no ledger settlement, no repair
+dispatch, no correction Worker, no phase iteration, and the process proven dead.  The
+Worker case (cause 1) keeps the OS-42 ordering exactly as the ruling required.
+
 **One product change belongs to R5.**  `StandaloneDispatchFailed` dropped the observed exit
 status, so a dispatch that DIED non-zero and one that exited CLEANLY without ever writing a
 completion record settled to byte-identical durable evidence -- both `LOST` /
@@ -42,6 +51,7 @@ from __future__ import annotations
 
 import ast
 import importlib.metadata
+import os
 import re
 import shutil
 import tempfile
@@ -114,21 +124,43 @@ class _FailingRun:
                         "the CLI printed no machine-readable summary at all, so it did not "
                         "return a terminal the workflow decided on")
 
-    def test_the_failure_became_a_typed_failed_settlement(self) -> None:
-        """R5's second clause: a VERDICT in the engine's own vocabulary, not an absence."""
+
+
+class _ReviewerRuntimeFailureRun(_FailingRun):
+    """A run whose PHASE_REVIEWER suffers a runtime failure.  Round 4, finding 6."""
+
+    def runtime_failures(self) -> list[dict]:
+        return [row for row in self.graph.journal_rows()
+                if (row.get("source_vocabulary") or {}).get("runtime_failure")]
+
+    def verdicts(self) -> list[dict]:
+        return [(row.get("source_vocabulary") or {}).get("runtime_failure") or {}
+                for row in self.runtime_failures()]
+
+    def checkpoint_head(self) -> dict:
+        from scripts.deterministic_workflow.checkpoint_store import FileCheckpointSaver
+        saver = FileCheckpointSaver(self.graph.checkpoint_path)
+        stored = saver.get_tuple({"configurable": {"thread_id": "graph",
+                                                   "checkpoint_ns": ""}})
+        return dict((stored.checkpoint or {}).get("channel_values") or {}) if stored else {}
+
+    def test_the_failure_became_a_typed_runtime_failure_not_a_settlement(self) -> None:
+        """Finding 6: a Reviewer's runtime failure is journalled by name and settles
+        NOTHING -- there is no verdict to route on, and none is invented."""
         self.assert_nothing_escaped()
-        rows = self.failed_rows()
-        self.assertTrue(
-            rows, "the failing dispatch left no failed settlement in the durable journal; "
-                  "there is then nothing for the workflow to route on")
-        for row in rows:
-            with self.subTest(intent=row["intent_id"]):
-                self.assertEqual(row["state"], "FAILED")
-                self.assertEqual(row["kind"], "SETTLEMENT_OBSERVED")
-                event = (row["source_vocabulary"] or {}).get("event") or {}
-                self.assertTrue(event.get("event_id"),
-                                "the settlement carries no event id, so the engine's own "
-                                "immediate `settlement(intent_id)` read finds nothing")
+        failures = self.runtime_failures()
+        self.assertEqual(len(failures), 1, "the failing reviewer left no runtime-failure row")
+        self.assertEqual(failures[0]["source_vocabulary"]["code"], "REVIEWER_RUNTIME_FAILURE")
+        self.assertEqual(failures[0]["source_vocabulary"]["role"], "PHASE_REVIEWER")
+        self.assertEqual(failures[0]["axes"]["settlement"], "not_settled")
+        self.assertEqual(failures[0]["axes"]["process_liveness"], "already exited")
+        self.assertEqual([row for row in self.graph.settlement_rows()
+                          if row["intent_id"] == failures[0]["intent_id"]], [],
+                         "the reviewer runtime failure was settled as a verdict")
+        self.assertEqual(self.failed_rows(), [], "a FAILED settlement exists for this run")
+        self.assertEqual(self.graph.summary.get("terminal_status"), "BLOCKED")
+        self.assertEqual((self.graph.summary.get("terminal_reason") or {}).get("code"),
+                         "REVIEWER_RUNTIME_FAILURE")
 
 
 @unittest.skipUnless(_langgraph_ok(), LANGGRAPH_REASON)
@@ -143,6 +175,26 @@ class AuthFailureRoutingTests(_FailingRun, unittest.TestCase):
 
     RUN = "run_r5auth"
     ENV = staticmethod(lambda room: {"OS37_GA_AUTH_FAIL": "1"})
+
+    def test_the_failure_became_a_typed_failed_settlement(self) -> None:
+        """R5's second clause: a VERDICT in the engine's own vocabulary, not an absence.
+        The failing dispatch here is the WORKER (the first turn), whose runtime failure
+        is the workflow's own `BLOCKED` status -- round 4 removed this clause for the
+        Reviewer roles only."""
+        self.assert_nothing_escaped()
+        rows = self.failed_rows()
+        self.assertTrue(
+            rows, "the failing dispatch left no failed settlement in the durable journal; "
+                  "there is then nothing for the workflow to route on")
+        for row in rows:
+            with self.subTest(intent=row["intent_id"]):
+                self.assertEqual(row["state"], "FAILED")
+                self.assertEqual(row["kind"], "SETTLEMENT_OBSERVED")
+                self.assertEqual(row["source_vocabulary"].get("terminal_role"), "WORKER")
+                event = (row["source_vocabulary"] or {}).get("event") or {}
+                self.assertTrue(event.get("event_id"),
+                                "the settlement carries no event id, so the engine's own "
+                                "immediate `settlement(intent_id)` read finds nothing")
 
     def test_the_named_cause_is_the_error_field_not_a_generic_failure(self) -> None:
         """`error_field_set`, so an operator sees WHICH leg of the predicate refused."""
@@ -194,12 +246,12 @@ class AuthFailureRoutingTests(_FailingRun, unittest.TestCase):
 
 
 @unittest.skipUnless(_langgraph_ok(), LANGGRAPH_REASON)
-class NonZeroExitRoutingTests(_FailingRun, unittest.TestCase):
+class NonZeroExitRoutingTests(_ReviewerRuntimeFailureRun, unittest.TestCase):
     """Cause 2 -- the process DIES non-zero with no completion record of any kind.
 
-    An OOM kill, a crash, a `set -e` abort.  Scoped to the first PHASE_REVIEWER dispatch so
-    the run can go on afterwards, which is what makes the recovery below observable rather
-    than inferred.
+    An OOM kill, a crash, a `set -e` abort.  Scoped to the first PHASE_REVIEWER dispatch.
+    Round 4 (finding 6): the run STOPS, typed, rather than repairing or correcting -- an
+    OOM-killed Reviewer produced no judgement, and the runtime hands the engine none.
     """
 
     RUN = "run_r5exit"
@@ -223,38 +275,52 @@ class NonZeroExitRoutingTests(_FailingRun, unittest.TestCase):
 
     def test_the_cause_is_reported_as_a_loss_not_as_a_reviewer_judgement(self) -> None:
         """`stage=lost`: the dispatch produced NO verdict, which is a different fact from a
-        Reviewer that considered the work and failed it."""
+        Reviewer that considered the work and failed it -- and (round 4) NO verdict is
+        what the engine receives."""
         self.assert_nothing_escaped()
         self.assertEqual({verdict.get("stage") for verdict in self.verdicts()}, {"lost"})
+        self.assertEqual({verdict.get("reason") for verdict in self.verdicts()},
+                         {"exit_code_unmapped"})
 
-    def test_the_run_recovers_through_the_bounded_repair_without_spending_a_phase_iteration(
-            self) -> None:
-        """OS-42 first, and a repair is NOT an attempt at the gate.
+    def test_the_run_stops_typed_without_spending_a_phase_iteration_or_a_repair(self) -> None:
+        """Finding 6.  No correction Worker, no repair dispatch, no phase iteration:
+        the run's own committed head still holds no reviewer result and the phase and
+        repair counters at zero.
 
-        The phase iteration counter is the assertion that matters: if a repaired round were
-        charged to the phase budget, a CLI that crashed once would eat an iteration the
-        Worker never got to use.
+        Mutation-sensitivity: settle the Reviewer runtime failure as `result: FAIL`
+        again and the head gains a `reviewer_result`, a spent phase iteration and a
+        correction (or repair) `DELIVERY_INTENT` after the failure.
         """
         self.assert_nothing_escaped()
-        self.assertEqual(self.graph.summary.get("terminal_status"), "COMPLETED",
-                         f"the run did not recover from a single crashed dispatch: "
+        self.assertEqual(self.graph.summary.get("terminal_status"), "BLOCKED",
                          f"{self.graph.summary!r}\n{self.graph.stderr}")
-        self.assertEqual(self.graph.summary.get("phase_iterations"), {"DESIGN": 1},
-                         "a repaired round was charged to the phase budget")
+        head = self.checkpoint_head()
+        self.assertIsNone(head.get("reviewer_result"))
+        self.assertEqual(head.get("phase_iterations"), {"DESIGN": 0},
+                         "a runtime failure was charged to the phase budget")
+        self.assertEqual(head.get("repair_attempts", 0), 0,
+                         "a runtime failure spent the validation-repair budget")
+        failure = self.runtime_failures()[0]
+        later = [row for row in self.graph.journal_rows()
+                 if row["kind"] == "DELIVERY_INTENT" and row["seq"] > failure["seq"]]
+        self.assertEqual(later, [], "a dispatch followed the reviewer runtime failure")
 
-    def test_exactly_one_dispatch_failed_and_the_rest_settled_normally(self) -> None:
-        """The steering really was one-shot, so the recovery is a recovery."""
+    def test_exactly_one_dispatch_failed_and_the_worker_settled_normally(self) -> None:
+        """The steering really was one-shot: the Worker settled, the Reviewer failed at
+        the runtime, and the process is proven dead."""
         self.assert_nothing_escaped()
-        self.assertEqual(len(self.failed_rows()), 1,
-                         "more than one dispatch failed, so this run measures something "
-                         "other than recovery from a single crash")
-        self.assertGreaterEqual(len(self.graph.settlement_rows()), 4,
-                                "the run settled fewer dispatches than a Worker, a phase "
-                                "Reviewer, its repair and a Final Review")
+        self.assertEqual(len(self.runtime_failures()), 1)
+        settled = self.graph.settlement_rows()
+        self.assertEqual([row["source_vocabulary"].get("terminal_role") for row in settled],
+                         ["WORKER"])
+        self.assertEqual(len(self.graph.spawn_rows()), 2)
+        pid = int(self.runtime_failures()[0]["source_vocabulary"]["pid"])
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
 
 
 @unittest.skipUnless(_langgraph_ok(), LANGGRAPH_REASON)
-class MissingResultRoutingTests(_FailingRun, unittest.TestCase):
+class MissingResultRoutingTests(_ReviewerRuntimeFailureRun, unittest.TestCase):
     """Cause 3 -- a CLEAN exit with no completion record: a silent CLI.
 
     The process reached readiness, proved delivery, and then exited 0 having declared
@@ -272,9 +338,9 @@ class MissingResultRoutingTests(_FailingRun, unittest.TestCase):
         self.assert_nothing_escaped()
         statuses = {verdict.get("exit_status") for verdict in self.verdicts()}
         self.assertEqual(statuses, {self.EXIT_STATUS},
-                         f"the settlement does not record the clean exit it observed: "
+                         f"the runtime failure does not record the clean exit it observed: "
                          f"{statuses}")
-        self.assertEqual({row["outcome"] for row in self.failed_rows()}, {"failed"})
+        self.assertEqual(self.failed_rows(), [], "exit 0 without a record was SETTLED")
 
     def test_it_is_distinguishable_from_a_crash_in_the_durable_record(self) -> None:
         """The whole point of R5's product change, asserted directly against cause 2.
@@ -291,12 +357,15 @@ class MissingResultRoutingTests(_FailingRun, unittest.TestCase):
                             "the two causes now declare the same exit status, so neither "
                             "test distinguishes anything")
 
-    def test_the_run_recovers_through_the_bounded_repair(self) -> None:
+    def test_the_run_stops_typed_and_charges_nothing(self) -> None:
         self.assert_nothing_escaped()
-        self.assertEqual(self.graph.summary.get("terminal_status"), "COMPLETED",
+        self.assertEqual(self.graph.summary.get("terminal_status"), "BLOCKED",
                          f"{self.graph.summary!r}\n{self.graph.stderr}")
-        self.assertEqual(self.graph.summary.get("phase_iterations"), {"DESIGN": 1})
-        self.assertEqual(len(self.failed_rows()), 1)
+        head = self.checkpoint_head()
+        self.assertIsNone(head.get("reviewer_result"))
+        self.assertEqual(head.get("phase_iterations"), {"DESIGN": 0})
+        self.assertEqual(head.get("repair_attempts", 0), 0)
+        self.assertEqual(len(self.runtime_failures()), 1)
 
 
 # =====================================================================================

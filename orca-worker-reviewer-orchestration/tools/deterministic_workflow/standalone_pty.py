@@ -32,6 +32,7 @@ import json
 import os
 import pty
 import re
+import select
 import shutil
 import signal
 import struct
@@ -180,7 +181,41 @@ def proc_start_ticks(pid: int) -> int:
         fields = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()
         return int(fields[19])
     except (OSError, IndexError, ValueError):
+        pass
+    # darwin (consolidated review round 4, finding 3).  ``proc_pidinfo(PROC_PIDTBSDINFO)``
+    # is the kernel's own start time for the pid -- a libc call, no fork, no subprocess,
+    # so it is as safe on the pre-exec path as the ``/proc`` read above.  Before this the
+    # MVP platform answered 0 for EVERY process, so the start-identity axis carried no
+    # evidence anywhere and a live pid absent from its tty could not be told from a
+    # recycled one.
+    return _darwin_start_ticks(pid)
+
+
+#: ``PROC_PIDTBSDINFO`` and the size of ``struct proc_bsdinfo`` (<sys/proc_info.h>).  The
+#: two start-time fields are the last two ``uint64_t`` members, at byte offsets 120 and
+#: 128; the size is asserted by the call itself, which returns fewer bytes on a mismatch.
+_PROC_PIDTBSDINFO = 3
+_PROC_PIDTBSDINFO_SIZE = 136
+
+
+def _darwin_start_ticks(pid: int) -> int:
+    lib = _libproc_handle()
+    if lib is None or not hasattr(lib, "proc_pidinfo"):
         return 0
+    import ctypes
+    try:
+        lib.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+                                     ctypes.c_void_p, ctypes.c_int]
+        lib.proc_pidinfo.restype = ctypes.c_int
+        buffer = ctypes.create_string_buffer(_PROC_PIDTBSDINFO_SIZE)
+        written = lib.proc_pidinfo(int(pid), _PROC_PIDTBSDINFO, 0, buffer,
+                                   _PROC_PIDTBSDINFO_SIZE)
+    except (OSError, ValueError, AttributeError):
+        return 0
+    if written != _PROC_PIDTBSDINFO_SIZE:
+        return 0
+    seconds, micros = struct.unpack_from("<QQ", buffer.raw, 120)
+    return int(seconds) * 1_000_000 + int(micros)
 
 
 def highest_open_fd(*, ceiling: int = 4096) -> int:
@@ -508,13 +543,51 @@ class PtySession(TypedDict):
     #: read it off this mapping under a key nothing ever wrote -- so the selector always saw
     #: an EMPTY argv even though preflight had rehearsed the real one.
     argv: tuple[str, ...]
+    #: The SUPERVISOR's end of the orphan guard (round 4, finding 1).  Its read end lives in
+    #: the exit watcher and becomes readable -- EOF -- only when every copy of this end is
+    #: closed, i.e. when the supervisor process is gone.  Closed by :func:`release`.
+    orphan_guard_fd: int
+
+
+class SpawnHandoffFailed(OSError):
+    """The session leader never reported an agent pid -- and the pty is RETAINED.
+
+    Round 4, finding 4.  The old shape closed the master and raised a bare ``OSError``, so
+    the caller had no handle at all over a leader it had forked and an agent that may have
+    reached ``execve`` in the meantime; the runtime then recorded ``spawn_failed`` with
+    ``teardown=not_required`` over a process it never proved absent.  This exception keeps
+    every piece of authority the parent still holds: the leader pid (its own child), the
+    open master, the slave name (so the tty-scoped process table can be read) and the
+    guard end -- enough to find, signal through the ownership ladder, reap and PROVE the
+    child's exit, or to retain it durably when that proof cannot be made.
+    """
+
+    def __init__(self, detail: str, *, leader_pid: int, master_fd: int, slave_name: str,
+                 pty_id: str, orphan_guard_fd: int, argv: tuple[str, ...]) -> None:
+        super().__init__(errno.ECHILD, detail)
+        self.leader_pid = leader_pid
+        self.master_fd = master_fd
+        self.slave_name = slave_name
+        self.pty_id = pty_id
+        self.orphan_guard_fd = orphan_guard_fd
+        self.argv = argv
+
+    def retained_session(self) -> "PtySession":
+        """The partial session the runtime keeps authority through.  ``pid`` is ``0``:
+        no agent identity was reported and none is invented; the runtime binds it from the
+        child's own spawn record, or from nothing."""
+        return {"master_fd": self.master_fd, "slave_name": self.slave_name, "pid": 0,
+                "pgid": 0, "sid": self.leader_pid, "leader_pid": self.leader_pid,
+                "pty_id": self.pty_id, "argv": self.argv,
+                "orphan_guard_fd": self.orphan_guard_fd}
 
 
 def spawn(*, argv: Sequence[str], env: Mapping[str, str], profile: StandaloneProfile,
           session_id: str, incarnation: str, spawn_record_target: str | os.PathLike[str],
           cwd: str | None = None, argv_digest: str = "", env_digest: str = "",
           sentinel: str | os.PathLike[str] | None = None,
-          fence: str = "", image: str | None = None) -> PtySession:
+          fence: str = "", image: str | None = None,
+          capture: str | os.PathLike[str] | None = None) -> PtySession:
     """``openpty`` -> ``fork`` (leader) -> ``fork`` (agent) -> ``setpgid`` -> ``tcsetpgrp``
     -> spawn record -> ``closerange`` -> ``execve``.
 
@@ -550,6 +623,18 @@ def spawn(*, argv: Sequence[str], env: Mapping[str, str], profile: StandalonePro
     The spawn record is still written by the process that is about to ``execve``, as the
     last instruction before it, so its ABSENCE still proves no ``execve`` happened
     (DESIGN D3.4a).  Nothing about that property moved.
+
+    **The agent and its exit evidence outlive the supervisor** (round 4, finding 1).  The
+    watcher ignores ``SIGHUP``, keeps ONE copy of the pty master open so the last close of
+    the supervisor's copy can never hang the pty up, and holds the read end of an *orphan
+    guard* pipe whose write end only the supervisor holds.  When that end reads EOF the
+    supervisor is gone: the watcher then drains the master itself -- into ``capture`` (the
+    session's own ``capture.log``, or the sentinel's sibling of that name), verbatim -- so
+    the agent is never blocked on a full pty buffer nobody reads, runs to its own end, is
+    reaped by the watcher and gets its fenced exit sentinel written.  Before this the
+    supervisor's death closed the only master, the kernel hung the pty up, ``SIGHUP`` killed
+    the session leader, and the leader's exit ``SIGHUP``ed the foreground agent: both
+    vanished and no sentinel was ever written.
     """
     # Read in the PARENT, and passed into the child, because the child may not spawn.
     host_boot_id = boot_id()
@@ -583,9 +668,12 @@ def spawn(*, argv: Sequence[str], env: Mapping[str, str], profile: StandalonePro
     spawn_record_target = os.path.abspath(os.fspath(spawn_record_target))
     if sentinel is not None:
         sentinel = os.path.abspath(os.fspath(sentinel))
+    if capture is None and sentinel is not None:
+        capture = os.path.join(os.path.dirname(sentinel), "capture.log")
+    elif capture is not None:
+        capture = os.path.abspath(os.fspath(capture))
     master_fd, slave_fd = pty.openpty()
     slave_name = os.ttyname(slave_fd)
-    close_up_to = highest_open_fd()
     fcntl.fcntl(master_fd, fcntl.F_SETFD, fcntl.FD_CLOEXEC)
     _set_raw(slave_fd)
     _set_winsize(slave_fd, profile.rows, profile.cols)
@@ -593,12 +681,21 @@ def spawn(*, argv: Sequence[str], env: Mapping[str, str], profile: StandalonePro
     # guessed.  Bounded, and a failure to learn it is a spawn failure -- never a fabricated
     # pid, because every ownership refusal in this module keys on the recorded pid.
     handoff_r, handoff_w = os.pipe()
+    # The orphan guard (finding 1): the watcher keeps `guard_r`; only the supervisor keeps
+    # `guard_w`, so the read end reports EOF exactly when the supervisor is gone.
+    guard_r, guard_w = os.pipe()
+    fcntl.fcntl(guard_w, fcntl.F_SETFD, fcntl.FD_CLOEXEC)
+    # Enumerated AFTER the pipes exist, so the child's `closerange` and the watcher's own
+    # descriptor sweep both cover them.
+    close_up_to = highest_open_fd()
+    capture_target = os.fsencode(os.fspath(capture)) if capture is not None else None
 
     started_at = _now_iso()
     leader_pid = os.fork()
     if leader_pid == 0:  # pragma: no cover - the leader never returns
         try:
             os.close(handoff_r)
+            os.close(guard_w)
             os.setsid()
             try:
                 fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
@@ -651,45 +748,137 @@ def spawn(*, argv: Sequence[str], env: Mapping[str, str], profile: StandalonePro
                     os._exit(127)
             os.write(handoff_w, b"%d\n" % agent_pid)
             os.close(handoff_w)
-            # ---- finding 9: the LEADER holds no pty descriptor while it waits ---------
-            # It inherited the master (from the parent) and the slave (its own 0/1/2 plus
-            # the original), and it never execs, so `FD_CLOEXEC` never closed either.
-            # Those copies are what kept the pty alive after the parent released its
-            # master: hangup cannot be produced while any copy of the master is open, and
-            # the slave's last close -- the EOF the parent's drain reads as "the agent is
-            # gone" -- cannot happen while the watcher still holds one.  The agent already
-            # has its own 0/1/2 on the slave; the watcher's job is `waitpid`, which needs
-            # no terminal at all.
-            try:
-                os.close(master_fd)
-                os.close(slave_fd)
-                null = os.open(os.devnull, os.O_RDWR)
-                for fd in (0, 1, 2):
-                    os.dup2(null, fd)
-                if null > 2:
-                    os.close(null)
-            except OSError:
-                pass
-            code = _wait_status_to_code(os.waitpid(agent_pid, 0)[1])
-            if sentinel is not None:
-                write_exit_sentinel(sentinel, code=code, fence=fence)
-            os._exit(code)
+            # ---- finding 9 (round 3) / finding 1 (round 4): what the WATCHER holds ------
+            # It holds NO slave descriptor: its 0/1/2 go to /dev/null and its inherited
+            # slave copy is closed, so the slave's last close is the agent's own.  It
+            # DOES keep one copy of the master -- deliberately, and that is the round-4
+            # correction of the round-3 shape that closed it: with the supervisor holding
+            # the only master, the supervisor's death was the pty's hangup, and the hangup
+            # killed first the watcher (the session leader) and then, through the leader's
+            # exit, the foreground agent.  The kept copy is a KEEPALIVE, not a reader:
+            # while the supervisor lives the watcher never reads it, and once the guard
+            # reports the supervisor gone the watcher drains it verbatim into the capture
+            # so the agent can finish.  Every other inherited descriptor is closed here,
+            # because a later dispatch's guard end inherited by THIS watcher would keep
+            # that dispatch's watcher from ever seeing its own supervisor die.
+            _watch(agent_pid, master_fd=master_fd, slave_fd=slave_fd, guard_r=guard_r,
+                   close_up_to=close_up_to, sentinel=sentinel, fence=fence,
+                   capture=capture_target)
         except BaseException:
             os._exit(127)
     os.close(slave_fd)
     os.close(handoff_w)
+    os.close(guard_r)
+    pty_id = f"pty-{uuid.uuid4().hex[:12]}"
+    argv_tuple = tuple(str(a) for a in argv)
     try:
         agent_pid = _read_handoff(handoff_r)
     finally:
         os.close(handoff_r)
     if agent_pid <= 0:
-        os.close(master_fd)
-        raise OSError(errno.ECHILD,
-                      "the pty session leader never reported an agent pid; no agent "
-                      "process identity exists, so none is invented")
+        # Finding 4.  The master is NOT closed and nothing is guessed: the parent keeps
+        # the leader pid, the open master, the slave name and the guard, and the caller
+        # decides -- from the child's own spawn record and the tty-scoped table -- whether
+        # an agent exists, terminates it through the ownership ladder, and proves it gone
+        # or retains it.  Closing the master here was the old path's only "teardown", and
+        # it was a hangup the kernel might or might not act on, never a proof.
+        raise SpawnHandoffFailed(
+            "the pty session leader never reported an agent pid; no agent process "
+            "identity exists, so none is invented -- the pty is retained for teardown",
+            leader_pid=leader_pid, master_fd=master_fd, slave_name=slave_name,
+            pty_id=pty_id, orphan_guard_fd=guard_w, argv=argv_tuple)
     return {"master_fd": master_fd, "slave_name": slave_name, "pid": agent_pid,
             "pgid": agent_pid, "sid": leader_pid, "leader_pid": leader_pid,
-            "pty_id": f"pty-{uuid.uuid4().hex[:12]}", "argv": tuple(str(a) for a in argv)}
+            "pty_id": pty_id, "argv": argv_tuple, "orphan_guard_fd": guard_w}
+
+
+def _watch(agent_pid: int, *, master_fd: int, slave_fd: int, guard_r: int,
+           close_up_to: int, sentinel: str | os.PathLike[str] | None, fence: str,
+           capture: bytes | None) -> None:  # pragma: no cover - runs in the forked watcher
+    """The exit watcher's whole life.  Raw ``os`` calls only: this is a forked child.
+
+    Never returns: it ``_exit``s with the agent's shell-shaped status after writing the
+    fenced sentinel.  ``SIGHUP`` is ignored so a hangup of the controlling pty -- which
+    the kept master makes impossible while this process lives, but which a stranger could
+    still deliver by hand -- can never destroy the exit evidence.
+    """
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    try:
+        os.close(slave_fd)
+        null = os.open(os.devnull, os.O_RDWR)
+        for fd in (0, 1, 2):
+            os.dup2(null, fd)
+        if null > 2:
+            os.close(null)
+    except OSError:
+        pass
+    keep = {master_fd, guard_r}
+    for fd in range(3, close_up_to + 1):
+        if fd not in keep:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+    orphaned = False
+    capture_fd = -1
+    status = 0
+    while True:
+        try:
+            done, status = os.waitpid(agent_pid, os.WNOHANG)
+        except ChildProcessError:
+            done, status = agent_pid, 0
+        if done == agent_pid:
+            break
+        if not orphaned:
+            try:
+                ready, _, _ = select.select([guard_r], [], [], 0.05)
+            except (OSError, ValueError):
+                ready = [guard_r]
+            if ready:
+                # EOF on the guard: the supervisor is gone.  From here the agent's output
+                # has no reader but this process, so it becomes the reader.
+                orphaned = True
+                try:
+                    os.close(guard_r)
+                except OSError:
+                    pass
+                if capture is not None:
+                    try:
+                        capture_fd = os.open(capture, os.O_WRONLY | os.O_APPEND | os.O_CREAT,
+                                             0o600)
+                    except OSError:
+                        capture_fd = -1
+            continue
+        _drain_once(master_fd, capture_fd, budget=0.05)
+    if orphaned:
+        # What the agent wrote between the last poll and its exit.
+        for _ in range(20):
+            if not _drain_once(master_fd, capture_fd, budget=0.02):
+                break
+    code = _wait_status_to_code(status)
+    if sentinel is not None:
+        write_exit_sentinel(sentinel, code=code, fence=fence)
+    os._exit(code)
+
+
+def _drain_once(master_fd: int, capture_fd: int, *, budget: float) -> int:  # pragma: no cover
+    """Read what is ready on the master within ``budget`` seconds; append it verbatim."""
+    try:
+        ready, _, _ = select.select([master_fd], [], [], budget)
+    except (OSError, ValueError):
+        return 0
+    if not ready:
+        return 0
+    try:
+        chunk = os.read(master_fd, 65_536)
+    except OSError:
+        return 0
+    if chunk and capture_fd >= 0:
+        try:
+            os.write(capture_fd, chunk)
+        except OSError:
+            pass
+    return len(chunk)
 
 
 def _read_handoff(fd: int, *, budget_ms: int = 10_000) -> int:
@@ -1032,12 +1221,27 @@ def exit_proven(record: Mapping[str, Any], snapshot: Mapping[str, Any]) -> dict[
     row = row_for(snapshot, pid)
     if row is not None and row["tty"] == record.get("captured_tty"):
         return {"proven": False, "reason": "incarnation_still_present"}
-    if _pid_exists(pid):
-        # The pid exists but is not on our tty.  Either it was recycled (so ours is gone)
-        # or it moved (which cannot happen for a session leader).  Recycling is not proof
-        # of OUR exit unless the incarnation is absent, which the row check just showed.
-        return {"proven": True, "reason": "incarnation_absent_from_captured_tty"}
-    return {"proven": True, "reason": "esrch_and_incarnation_absent"}
+    if not _pid_exists(pid):
+        return {"proven": True, "reason": "esrch_and_incarnation_absent"}
+    # ---- round 4, finding 3: the pid EXISTS but is not on the captured tty ----------
+    # That used to be accepted as proof of exit ("recycled, so ours is gone").  It is not:
+    # the recorded pid is the AGENT, not the session leader, and an agent that detached
+    # from the pty (setsid, a daemonising helper, a hangup survivor) is the SAME process
+    # incarnation, alive, off the tty.  The only same-incarnation identity the OS offers
+    # is the kernel's start time for the pid, so that is what decides: an equal start
+    # identity is the same live process; a different one is a recycled pid whose
+    # original is therefore gone; no identity on either side is UNKNOWN, which is never
+    # "exited".
+    expected = record.get("proc_start_ticks")
+    observed = proc_start_ticks(pid)
+    if not expected or not observed:
+        return {"proven": False, "reason": "exit_unproven:pid_exists_off_tty_without_start_identity",
+                "expected_start": expected, "observed_start": observed}
+    if int(observed) == int(expected):
+        return {"proven": False, "reason": "incarnation_detached_but_live",
+                "expected_start": expected, "observed_start": observed}
+    return {"proven": True, "reason": "pid_recycled_start_identity_mismatch",
+            "expected_start": expected, "observed_start": observed}
 
 
 def drain(master_fd: int, *, budget_ms: int = 500) -> int:
@@ -1137,3 +1341,15 @@ def release(session: Mapping[str, Any]) -> None:
             # Closed ONCE.  A second release over the same mapping would otherwise close
             # whatever descriptor number the kernel has since handed to somebody else.
             session["master_fd"] = -1
+    # The orphan guard's supervisor end (finding 1).  Closing it tells the watcher this
+    # supervisor no longer reads the master -- after a proven exit there is nothing left
+    # to read, and after a RETAINED (unsettled) dispatch it is exactly what lets the
+    # watcher take over draining so the live agent is not wedged on a full pty buffer.
+    guard = session.get("orphan_guard_fd")
+    if isinstance(guard, int) and guard >= 0:
+        try:
+            os.close(guard)
+        except OSError:
+            pass
+        if isinstance(session, dict):
+            session["orphan_guard_fd"] = -1

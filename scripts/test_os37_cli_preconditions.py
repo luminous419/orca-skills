@@ -36,7 +36,20 @@ from scripts.deterministic_workflow.standalone_profile import (CompletionSelecto
                                                                 Timeouts, parse_version)
 
 REPO = Path(__file__).resolve().parent.parent
-STUB_BIN = REPO / "scripts" / "fixtures" / "os37" / "bin"
+
+
+def _native_fixtures() -> Path:
+    """Round 4, finding 10: preflight refuses a `#!` wrapper by name, so every fixture a
+    profile names is the NATIVE image of the reviewed shell fixture (same script, C
+    trampoline), never the script itself."""
+    from scripts import os37_native_stub as native_stub
+    built = native_stub.native_fixture_dir()
+    if built is None:                                     # pragma: no cover - CI has cc
+        raise AssertionError(native_stub.NO_COMPILER_REASON)
+    return built
+
+
+STUB_BIN = _native_fixtures()
 ENV_DUMP = REPO / "scripts" / "fake_bin"
 
 #: The live half needs a real agent CLI on this host, which no CI runner has.  Gated on an
@@ -1032,7 +1045,7 @@ def _run_on_pty(argv, *, stdin_bytes, budget_s: float, env=None):
 # =========================================================================================
 # DESIGN §D4.2b / §D13.2a -- CAPABILITY-VS-REALITY CONFORMANCE, AND ITS FOUR OUTCOMES
 # =========================================================================================
-FIXTURE_BIN = pathlib.Path(__file__).resolve().parent / "fixtures" / "os37" / "bin"
+FIXTURE_BIN = STUB_BIN
 STREAMS = pathlib.Path(__file__).resolve().parent / "fixtures" / "os37" / "streams"
 
 

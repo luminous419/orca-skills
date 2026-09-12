@@ -759,12 +759,20 @@ class _Driver:
             # exit proof.  It is consulted only when the profile declared an extraction at
             # all, so a profile that declares none keeps the whole-transcript behaviour.
             try:
-                with open(path, encoding="utf-8", errors="replace") as handle:
-                    text_body = handle.read()
+                with open(path, "rb") as handle:
+                    raw = handle.read()
             except OSError:
-                text_body = ""
+                raw = b""
+            text_body = raw.decode("utf-8", errors="replace")
             if text_body.strip():
-                return {"body": text_body, "source": "output_last_message_path"}
+                import hashlib
+                # Round 4, finding 9: the file is named, digested and sized so the
+                # settlement can bind WHICH file it read.  The path itself is minted per
+                # dispatch by the runtime (session id + incarnation), never the profile's
+                # shared literal.
+                return {"body": text_body, "source": "output_last_message_path",
+                        "path": path, "sha256": hashlib.sha256(raw).hexdigest(),
+                        "bytes": len(raw)}
         return {"body": None, "source": "whole_transcript"}
 
     # -- per-driver record selection ------------------------------------------------------

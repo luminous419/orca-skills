@@ -660,6 +660,18 @@ def check_transition(*, source: str, target: str, event: str,
 FAILED_RESULT_BY_ROLE = {"WORKER": ("status", "BLOCKED")}
 FAILED_RESULT_DEFAULT = ("result", "FAIL")
 
+#: Round 4, finding 6.  The roles whose RUNTIME failure is NEVER a settlement.  A Reviewer's
+#: verdict vocabulary is `PASS|FAIL`, and `FAIL` is a judgement about the work: routing
+#: sends it to a correction Worker and charges a phase iteration.  An authentication
+#: expiry, an OOM kill, a readiness or completion timeout, a truncated capture, a missing
+#: secret -- none of those is a judgement about anything, so for these roles the runtime
+#: produces NO verdict at all: the exit is proven, the evidence is journalled under
+#: `REVIEWER_RUNTIME_FAILURE`, and the run stops as a typed BLOCKED terminal that dispatches
+#: no correction and spends no iteration.  A Worker keeps the workflow's own `BLOCKED`
+#: status, which is the vocabulary for "could not complete" rather than a judgement.
+RUNTIME_FAILURE_NOT_A_VERDICT_ROLES = ("PHASE_REVIEWER", "FINAL_REVIEWER")
+REVIEWER_RUNTIME_FAILURE = "REVIEWER_RUNTIME_FAILURE"
+
 
 def typed_failed_result(parsed: Mapping[str, Any], *, role: str,
                         verdict: Mapping[str, Any]) -> dict[str, Any]:

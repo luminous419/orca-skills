@@ -375,26 +375,39 @@ class F01ReviewerTimeoutPrecedesCorrectionTests(unittest.TestCase):
         shutil.rmtree(cls.room, ignore_errors=True)
 
     def test_the_reviewer_is_proven_dead_before_the_next_dispatch_is_journalled(self) -> None:
+        """Round 3 asserted the timed-out Reviewer was proven dead and reclaimed BEFORE the
+        correction round its typed `FAIL` opened.  Round 4 (finding 6) removes that
+        correction round altogether -- a timeout is a runtime failure, not a review
+        verdict -- so the same case now asserts the process facts unchanged (proven dead,
+        reaped, reclaimed, no leak) and that NO later dispatch of any kind follows: the
+        run stops as the typed `REVIEWER_RUNTIME_FAILURE` terminal."""
         self.assertIsNone(self.outcome.escaped, f"the run escaped: {self.outcome.escaped!r}")
         rows = self.outcome.journal_rows()
-        reviewer_settlements = [row for row in rows if row["kind"] == "SETTLEMENT_OBSERVED"
-                                and row["source_vocabulary"].get("completion_verdict", {})
-                                .get("stage") == "lost"]
-        self.assertTrue(reviewer_settlements,
-                        "no reviewer dispatch timed out; the case is vacuous")
-        first = reviewer_settlements[0]
+        failures = [row for row in rows if row["kind"] == "EVENT"
+                    and (row["source_vocabulary"].get("runtime_failure") or {})
+                    .get("stage") == "lost"]
+        self.assertTrue(failures, "no reviewer dispatch timed out; the case is vacuous")
+        first = failures[0]
+        self.assertEqual(first["source_vocabulary"]["code"], "REVIEWER_RUNTIME_FAILURE")
         self.assertEqual(first["axes"]["process_liveness"], "already exited")
         self.assertEqual(first["axes"]["cleanup_authority"], "authorized")
+        self.assertEqual(first["axes"]["settlement"], "not_settled")
+        self.assertEqual([row for row in rows if row["kind"] == "SETTLEMENT_OBSERVED"
+                          and row["intent_id"] == first["intent_id"]], [],
+                         "the timed-out reviewer was SETTLED; a timeout is not a verdict")
         reclaim = [row for row in rows if row["intent_id"] == first["intent_id"]
                    and row["source_vocabulary"].get("master_fd_closed")]
         self.assertTrue(reclaim, "the timed-out reviewer's pty was never reclaimed")
         self.assertTrue(reclaim[0]["source_vocabulary"]["leader_reaped"])
+        self.assertLess(reclaim[0]["seq"], first["seq"],
+                        "the failure was journalled before the process was reclaimed")
         later_intents = [row for row in rows if row["kind"] == "DELIVERY_INTENT"
                          and row["seq"] > first["seq"]]
-        self.assertTrue(later_intents, "no correction round followed the reviewer FAIL")
-        self.assertLess(reclaim[0]["seq"], later_intents[0]["seq"],
-                        "the correction round was journalled before the reviewer's "
-                        "process was reclaimed")
+        self.assertEqual(later_intents, [],
+                         "a correction round followed a reviewer TIMEOUT (finding 6)")
+        self.assertEqual(self.outcome.summary.get("terminal_status"), "BLOCKED")
+        self.assertEqual((self.outcome.summary.get("terminal_reason") or {}).get("code"),
+                         "REVIEWER_RUNTIME_FAILURE")
         pid = int(first["source_vocabulary"]["pid"])
         leader = int(reclaim[0]["source_vocabulary"]["leader_pid"])
         self.assertFalse(pid_alive(pid), "the timed-out reviewer is still alive")
@@ -908,14 +921,20 @@ class F09CompletionReclaimsResourcesTests(_Composed):
             self.assertEqual(reclaim[0]["axes"]["process_liveness"], "already exited")
 
     def test_the_exit_watcher_holds_no_pty_descriptor_while_it_waits(self) -> None:
-        """The watcher's inherited master/slave copies are closed: after the parent releases
-        its master the slave side is really hung up, which is what makes `drain` read EOF
-        rather than waiting on a copy the watcher still holds."""
-        source = inspect.getsource(pty_supervisor.spawn)
-        watcher = source.split("os.close(handoff_w)", 1)[1].split("os.waitpid(agent_pid, 0)", 1)[0]
-        self.assertIn("os.close(master_fd)", watcher)
-        self.assertIn("os.close(slave_fd)", watcher)
-        self.assertIn("os.devnull", watcher)
+        """The watcher holds no SLAVE descriptor and its stdio is /dev/null, so the slave's
+        last close is the agent's own.  Round 4 (finding 1) corrected the round-3 half of
+        this that closed the MASTER too: with the supervisor holding the only master its
+        death hung the pty up and destroyed the agent and the exit evidence.  The watcher
+        keeps exactly one master copy as a keepalive it never reads while the supervisor
+        lives, and the no-leak assertion above still holds because the watcher exits --
+        and drops it -- the moment the agent is reaped.  The real-subprocess proof is
+        `test_os37_lifecycle_boundary_regressions.F01SupervisorDeathTests`."""
+        source = inspect.getsource(pty_supervisor._watch)
+        self.assertIn("os.close(slave_fd)", source)
+        self.assertIn("os.devnull", source)
+        self.assertIn("keep = {master_fd, guard_r}", source)
+        self.assertNotIn("os.close(master_fd)", source)
+        self.assertIn("signal.signal(signal.SIGHUP, signal.SIG_IGN)", source)
 
 
 # =====================================================================================

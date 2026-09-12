@@ -297,6 +297,14 @@ def _is_codeish(line: str) -> bool:
     return any(token in stripped for token in ("=", "(", "return", "raise", "import"))
 
 
+def _native_stub_dir():
+    from scripts import os37_native_stub as native_stub
+    built = native_stub.native_stub_dir()
+    if built is None:                                     # pragma: no cover - CI has cc
+        raise AssertionError(native_stub.NO_COMPILER_REASON)
+    return built
+
+
 class LauncherWiringTests(unittest.TestCase):
     """C-DESIGN-1: all SEVEN `--adapter` sites, and D-2(b)'s one-declaration state."""
 
@@ -305,7 +313,8 @@ class LauncherWiringTests(unittest.TestCase):
         self.profile_spec = {
             "driver": "claude", "binary": "os37-stub-cli",
             "supported_range": [[1, 0, 0], [2, 0, 0]],
-            "bin_dirs": [str(ENGINE.parent / "fixtures" / "os37" / "bin")],
+            # The NATIVE image (round 4, finding 10: a `#!` wrapper is refused by name).
+            "bin_dirs": [str(_native_stub_dir())],
             "readiness_records": [{"channel": "structured", "record_type": "system",
                                    "session_field": "session_id"}],
             # D4.2a: a profile SPEC that omits the capability axis is `profile_invalid`.
