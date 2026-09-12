@@ -932,7 +932,9 @@ class F09CompletionReclaimsResourcesTests(_Composed):
         source = inspect.getsource(pty_supervisor._watch)
         self.assertIn("os.close(slave_fd)", source)
         self.assertIn("os.devnull", source)
-        self.assertIn("keep = {master_fd, guard_r}", source)
+        # The kept set: the master keepalive, the orphan guard and (correction iteration
+        # 2, CI-2) the SIGCHLD wake-up pipe -- still no slave, still nothing else.
+        self.assertIn("keep = {master_fd, guard_r, wake_r, wake_w}", source)
         self.assertNotIn("os.close(master_fd)", source)
         self.assertIn("signal.signal(signal.SIGHUP, signal.SIG_IGN)", source)
 

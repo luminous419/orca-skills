@@ -503,17 +503,14 @@ class StandaloneAdapter:
                 incarnation = str(row["process_incarnation"])
                 session_id = str(row.get("session_id") or "")
         run_id = self.run_id or ""
+        sentinel_path = None
         if session_id and incarnation:
-            sentinel = pty_supervisor.read_exit_sentinel(
-                pty_supervisor.exit_sentinel_path(self.artifact_base, run_id, session_id,
-                                                  incarnation),
-                fence=f"{session_id}:{incarnation}")
-            if sentinel["outcome"] == "exited":
-                return {"handle": handle, "handle_recovery": "listing_verified",
-                        "exit_status": sentinel["code"],
-                        "detail": "the run's own exit watcher wrote a fenced exit sentinel "
-                                  "for this session; the resource is proven ours and "
-                                  "proven ended"}
+            sentinel_path = pty_supervisor.exit_sentinel_path(
+                self.artifact_base, run_id, session_id, incarnation)
+            verified = self._verified_by_sentinel(handle, sentinel_path,
+                                                  fence=f"{session_id}:{incarnation}")
+            if verified is not None:
+                return verified
         if not tty or not pid:
             return {"handle": None, "handle_recovery": "listing_candidate",
                     "candidate": handle,
@@ -535,7 +532,32 @@ class StandaloneAdapter:
                     "detail": f"the process table for {tty!r} could not be read; "
                               "unreadable is unknown, and unknown is never verified"}
         row = pty_supervisor.row_for(snapshot, int(pid))
-        if row is None or row["tty"] != tty or str(row["pgid"]) != expected_pgid:
+        listed = (row is not None and row["tty"] == tty
+                  and str(row["pgid"]) == expected_pgid)
+        if not listed or str(row["stat"]).startswith("Z"):
+            # ---- correction iteration 2 (CI-2): EXIT EVIDENCE IN FLIGHT ----------------
+            # The pid is off its tty (or on it as a zombie) and no sentinel exists YET.
+            # Two different facts hide behind that: the process is gone with nothing
+            # to prove it (an orphan, `not_listed`), or it has just exited and the run's
+            # own exit watcher -- the session leader, still alive -- is about to reap it
+            # and write the fenced sentinel.  The old code answered `not_listed` for both
+            # and a pause landing in the second window refused TERMINAL_ORPHAN_POSSIBLE
+            # for a process that was proven ended a few milliseconds later.  While the
+            # watcher lives the evidence is IN FLIGHT: wait for it, bounded, and answer
+            # from the sentinel.  A watcher that is gone leaves nothing to wait for.
+            leader = int(record.get("sid") or 0)
+            if sentinel_path is not None:
+                verified = self._await_exit_evidence(
+                    handle, sentinel_path, fence=f"{session_id}:{incarnation}",
+                    leader_pid=leader)
+                if verified is not None:
+                    return verified
+            if listed and str(row["stat"]).startswith("Z"):
+                return {"handle": None, "handle_recovery": "listing_candidate",
+                        "candidate": handle,
+                        "detail": f"pid {pid} on {tty!r} is a zombie whose exit watcher "
+                                  "has not written the sentinel within the budget; "
+                                  "unknown is never verified and never acted on"}
             return {"handle": None, "handle_recovery": "not_listed",
                     "candidate": handle,
                     "detail": f"pid {pid} is not on {tty!r} in the recorded process "
@@ -548,6 +570,42 @@ class StandaloneAdapter:
                               "own spawn record does not corroborate the journal "
                               f"({probe['outcome']}); it is not proven ours"}
         return {"handle": handle, "handle_recovery": "listing_verified"}
+
+    #: How long a reader waits for exit evidence that is IN FLIGHT -- the watcher alive,
+    #: the agent exited, the sentinel not yet written.  Measured at ~10 ms on the MVP host
+    #: under load; the bound exists for a wedged watcher and is never the normal cost.
+    EXIT_EVIDENCE_BUDGET_MS = 2_000
+
+    @staticmethod
+    def _verified_by_sentinel(handle: str, sentinel_path: Any, *,
+                              fence: str) -> Mapping[str, Any] | None:
+        sentinel = pty_supervisor.read_exit_sentinel(sentinel_path, fence=fence)
+        if sentinel["outcome"] != "exited":
+            return None
+        return {"handle": handle, "handle_recovery": "listing_verified",
+                "exit_status": sentinel["code"],
+                "detail": "the run's own exit watcher wrote a fenced exit sentinel "
+                          "for this session; the resource is proven ours and "
+                          "proven ended"}
+
+    def _await_exit_evidence(self, handle: str, sentinel_path: Any, *, fence: str,
+                             leader_pid: int) -> Mapping[str, Any] | None:
+        """The fenced sentinel, awaited while the exit watcher is ALIVE.  CI-2.
+
+        Returns the verified answer the moment the sentinel lands; ``None`` when the
+        watcher is gone (nothing will ever write it) or the budget elapses (unknown).
+        The watcher is identified by the child's own spawn record (`sid` is the leader),
+        so a recycled leader pid can at worst make this wait the budget, never verify.
+        """
+        import time
+        deadline = time.time() + self.EXIT_EVIDENCE_BUDGET_MS / 1000.0
+        while True:
+            verified = self._verified_by_sentinel(handle, sentinel_path, fence=fence)
+            if verified is not None:
+                return verified
+            if leader_pid <= 0 or not _pid_present(leader_pid) or time.time() >= deadline:
+                return None
+            time.sleep(0.005)
 
     #: The pause-row columns the journal can answer, and the ``source_vocabulary`` key each
     #: is read from.  Named as data so the mapping is legible and so nothing here invents a
@@ -689,6 +747,16 @@ class StandaloneAdapter:
                 "process, and adopting one here would make the run look alive to the gate "
                 "deciding whether it is stalled")
         return self.runtime
+
+
+def _pid_present(pid: int) -> bool:
+    """``kill(pid, 0)``: exists (ours or not) vs ESRCH."""
+    import errno
+    try:
+        os.kill(pid, 0)
+    except OSError as exc:
+        return exc.errno == errno.EPERM
+    return True
 
 
 def _observation_base() -> Any:

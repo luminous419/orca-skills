@@ -812,7 +812,21 @@ def _watch(agent_pid: int, *, master_fd: int, slave_fd: int, guard_r: int,
             os.close(null)
     except OSError:
         pass
-    keep = {master_fd, guard_r}
+    # ---- correction iteration 2 (CI-2): the agent's exit wakes the watcher AT ONCE ------
+    # The round-4 loop polled `waitpid(WNOHANG)` every 50 ms, so between the agent's exit
+    # and the fenced sentinel there was a window of up to 50 ms in which the agent was a
+    # zombie -- off its tty, unsentinelled -- and a stranger reading the run in that window
+    # (`recover_handle`) saw an orphan.  Measured on the MVP host under load: 18 of 40
+    # reads landed in it; the sentinel arrived ~8-10 ms later.  A SIGCHLD wake-up pipe
+    # (`signal.set_wakeup_fd`) in every `select` below closes the window to the signal's
+    # own latency: the kernel writes the byte the instant the child exits and the very
+    # next `waitpid` reaps it.  The handler itself does nothing; PEP 475 would otherwise
+    # silently restart the `select` and swallow the signal.
+    wake_r, wake_w = os.pipe()
+    os.set_blocking(wake_w, False)
+    signal.set_wakeup_fd(wake_w, warn_on_full_buffer=False)
+    signal.signal(signal.SIGCHLD, lambda *_args: None)
+    keep = {master_fd, guard_r, wake_r, wake_w}
     for fd in range(3, close_up_to + 1):
         if fd not in keep:
             try:
@@ -831,9 +845,12 @@ def _watch(agent_pid: int, *, master_fd: int, slave_fd: int, guard_r: int,
             break
         if not orphaned:
             try:
-                ready, _, _ = select.select([guard_r], [], [], 0.05)
+                ready, _, _ = select.select([guard_r, wake_r], [], [], 0.05)
             except (OSError, ValueError):
                 ready = [guard_r]
+            if wake_r in ready:
+                _drain_wakeups(wake_r)
+                continue                       # a child changed state: reap it above
             if ready:
                 # EOF on the guard: the supervisor is gone.  From here the agent's output
                 # has no reader but this process, so it becomes the reader.
@@ -849,7 +866,7 @@ def _watch(agent_pid: int, *, master_fd: int, slave_fd: int, guard_r: int,
                     except OSError:
                         capture_fd = -1
             continue
-        _drain_once(master_fd, capture_fd, budget=0.05)
+        _drain_once(master_fd, capture_fd, budget=0.05, wake_r=wake_r)
     if orphaned:
         # What the agent wrote between the last poll and its exit.
         for _ in range(20):
@@ -861,13 +878,28 @@ def _watch(agent_pid: int, *, master_fd: int, slave_fd: int, guard_r: int,
     os._exit(code)
 
 
-def _drain_once(master_fd: int, capture_fd: int, *, budget: float) -> int:  # pragma: no cover
-    """Read what is ready on the master within ``budget`` seconds; append it verbatim."""
+def _drain_wakeups(wake_r: int) -> None:  # pragma: no cover - runs in the forked watcher
+    """Empty the SIGCHLD wake-up pipe so the next ``select`` waits again."""
     try:
-        ready, _, _ = select.select([master_fd], [], [], budget)
+        os.set_blocking(wake_r, False)
+        while os.read(wake_r, 64):
+            pass
+    except (BlockingIOError, OSError):
+        pass
+
+
+def _drain_once(master_fd: int, capture_fd: int, *, budget: float,
+                wake_r: int = -1) -> int:  # pragma: no cover
+    """Read what is ready on the master within ``budget`` seconds; append it verbatim.
+    Returns early -- reading nothing -- when the SIGCHLD wake-up pipe fires instead."""
+    fds = [master_fd] + ([wake_r] if wake_r >= 0 else [])
+    try:
+        ready, _, _ = select.select(fds, [], [], budget)
     except (OSError, ValueError):
         return 0
-    if not ready:
+    if wake_r >= 0 and wake_r in ready:
+        _drain_wakeups(wake_r)
+    if master_fd not in ready:
         return 0
     try:
         chunk = os.read(master_fd, 65_536)

@@ -288,11 +288,17 @@ def interpreter_wrapper(image: str, child_env: Mapping[str, str]) -> dict[str, A
     tokens = line.split()
     interpreter = tokens[0] if tokens else ""
     candidate = interpreter
+    named = ""
     if os.path.basename(interpreter) == "env" and len(tokens) > 1:
         named = next((t for t in tokens[1:] if not t.startswith("-")), "")
-        candidate = shutil.which(named, path=child_env.get("PATH", "")) or named
+        # Resolved against the CHILD's PATH, exactly as `env` would in the child.  A name
+        # the child cannot resolve is reported as EMPTY, never `realpath`ed -- correction
+        # iteration 2 (CI-1): `realpath("python3")` is a cwd-relative fabrication, and an
+        # image nobody can name is not an image that was identified.
+        candidate = shutil.which(named, path=child_env.get("PATH", "")) or ""
     return {"shebang": line, "interpreter": interpreter,
-            "interpreter_image": os.path.realpath(candidate) if candidate else ""}
+            "interpreter_image": os.path.realpath(candidate) if candidate else "",
+            **({"unresolved_interpreter": named} if named and not candidate else {})}
 
 
 def check_version(profile: StandaloneProfile, child_env: Mapping[str, str], *,

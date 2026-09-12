@@ -1012,8 +1012,20 @@ class F10ShebangWrapperTests(_Composed):
                   if o["check"] == "binary"][0]
         self.assertEqual(binary["reason"], "binary_wrapper_unsupported")
         self.assertEqual(binary["evidence"]["interpreter"], "/usr/bin/env")
-        self.assertTrue(binary["evidence"]["interpreter_image"].endswith("python3"),
-                        binary["evidence"])
+        # CI-1 (correction iteration 2).  The product resolves `env python3` against the
+        # CHILD's PATH and reports the REAL image (`realpath`); on ubuntu that is
+        # `/usr/bin/python3.1X`, on darwin `/usr/bin/python3` -- so the expectation is
+        # derived the same way on both platforms and compared EXACTLY, never by suffix.
+        child_path = env_policy.build_child_env(session.profile, spawn_token="t",
+                                                include_secrets=False)["PATH"]
+        resolved = shutil.which("python3", path=child_path)
+        expected_image = os.path.realpath(resolved) if resolved else ""
+        self.assertEqual(binary["evidence"]["interpreter_image"], expected_image,
+                         binary["evidence"])
+        if not resolved:
+            # A child PATH with no `python3` at all (a slim container): the image is
+            # honestly EMPTY and the unresolved name is reported, never a fabricated path.
+            self.assertEqual(binary["evidence"]["unresolved_interpreter"], "python3")
         self.assertEqual(binary["evidence"]["shebang"], "/usr/bin/env python3")
         event = ledger.get_settlement("intent-f10")
         self.assertEqual(event["result"]["standalone_failure"]["reason"],
@@ -1107,3 +1119,205 @@ class F11PreflightCacheTests(_Composed):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# =====================================================================================
+# CORRECTION ITERATION 2 -- CI failures on c7d19e2
+# =====================================================================================
+class CI2ExitEvidenceInFlightTests(_Composed):
+    """CI-2.  `F11RefusedInterruptTests.test_a_refused_interrupt_does_not_make_the_row_block_the_pause`
+    flaked (`PauseRefused: TERMINAL_ORPHAN_POSSIBLE … handle_recovery=not_listed`).
+
+    Diagnosis (`evidence/iter2/ci2_diagnose_before.txt`, 18 of 40 reads under load): the
+    agent had EXITED and was a zombie off its tty, its exit watcher was alive, and the fenced
+    sentinel landed ~8-10 ms LATER -- the round-4 watcher polled `waitpid` every 50 ms, so
+    `recover_handle` read the run inside that window and called a process that was proven
+    ended a moment later an orphan.  Two fixes, each locked here: the watcher wakes on
+    SIGCHLD (no window), and `recover_handle` treats "exited, watcher alive, no sentinel yet"
+    as exit evidence IN FLIGHT and awaits it, bounded, rather than answering `not_listed`.
+    """
+
+    def _journal_a_spawned_intent(self, run_id: str, intent_id: str, *, pid: int,
+                                  leader_pid: int, tty: str) -> tuple:
+        adapter, _state, _ledger = self.compose_spec(
+            stub_profile_spec("ready", worktree=self.worktree), run_id=run_id)
+        journal = self.journal(run_id)
+        session_id, incarnation = "sess-ci2", "inc-ci2"
+        record = {"session_id": session_id, "process_incarnation": incarnation,
+                  "pid": pid, "pgid": pid, "sid": leader_pid, "boot_id": "",
+                  "proc_start_ticks": 0, "argv_digest": "d", "env_digest": "e",
+                  "started_at": ""}
+        pty_supervisor.write_spawn_record(
+            pty_supervisor.spawn_record_path(self.base, run_id, intent_id, incarnation),
+            record)
+        for kind, event in (("EVENT", "spawned"), ("SPAWN_OBSERVED", "identity_bound")):
+            journal.append(journal_mod.make_record(
+                kind=kind, derived_from="pty", event=event, state="STARTING",
+                intent_id=intent_id, dispatch_id="d", task_id="t", session_id=session_id,
+                process_incarnation=incarnation,
+                axes={"settlement": "not_settled", "worker_resource": "retain",
+                      "process_liveness": "live", "cleanup_authority": "not_authorized"},
+                source_vocabulary={"pty_id": "pty-ci2", "pid": pid, "captured_tty": tty,
+                                   "session_digest": "d", "spawn_record": record,
+                                   "terminal_role": "WORKER",
+                                   "terminal_origin": "standalone_pty",
+                                   "terminal_owner": f"{session_id}:{incarnation}",
+                                   "agent_id": "a"}))
+        sentinel = pty_supervisor.exit_sentinel_path(self.base, run_id, session_id, incarnation)
+        sentinel.parent.mkdir(parents=True, exist_ok=True)
+        return adapter, sentinel, f"{session_id}:{incarnation}"
+
+    def _dead_pid(self) -> int:
+        child = subprocess.Popen(["true"])
+        child.wait()
+        return child.pid
+
+    def test_exit_evidence_in_flight_is_awaited_while_the_watcher_lives(self) -> None:
+        """A real 'watcher' process writes the sentinel 300 ms from now; the agent pid is
+        already gone.  `recover_handle` must answer `listing_verified` from the sentinel,
+        not `not_listed` from the empty tty table."""
+        agent = self._dead_pid()
+        sentinel_holder: list = []
+        watcher = os.fork()
+        if watcher == 0:  # pragma: no cover - the fake watcher
+            time.sleep(0.3)
+            path = Path(self.base) / "runs" / "run_ci2" / "standalone" / "sess-ci2" / "exit.inc-ci2"
+            pty_supervisor.write_exit_sentinel(path, code=0, fence="sess-ci2:inc-ci2")
+            os._exit(0)
+        self.addCleanup(lambda: kill_and_reap(watcher))
+        adapter, sentinel, fence = self._journal_a_spawned_intent(
+            "run_ci2", "intent-ci2", pid=agent, leader_pid=watcher, tty="ttys995")
+        adapter._table_reader = lambda tty: {"tty": tty, "captured_at": time.time(),
+                                             "rows": (), "readable": True}
+        started = time.time()
+        handle = adapter.recover_handle("intent-ci2")
+        elapsed = time.time() - started
+        self.assertEqual(handle["handle_recovery"], "listing_verified", handle)
+        self.assertEqual(handle["exit_status"], 0)
+        self.assertGreaterEqual(elapsed, 0.2, "the answer did not come from the awaited sentinel")
+        self.assertLess(elapsed, 1.5)
+        self.assertEqual(pty_supervisor.read_exit_sentinel(sentinel, fence=fence)["outcome"],
+                         "exited")
+
+    def test_a_zombie_on_the_tty_is_awaited_the_same_way(self) -> None:
+        agent = self._dead_pid()
+        watcher = os.fork()
+        if watcher == 0:  # pragma: no cover
+            time.sleep(0.2)
+            path = Path(self.base) / "runs" / "run_ci2z" / "standalone" / "sess-ci2" / "exit.inc-ci2"
+            pty_supervisor.write_exit_sentinel(path, code=3, fence="sess-ci2:inc-ci2")
+            os._exit(0)
+        self.addCleanup(lambda: kill_and_reap(watcher))
+        adapter, _sentinel, _fence = self._journal_a_spawned_intent(
+            "run_ci2z", "intent-ci2z", pid=agent, leader_pid=watcher, tty="ttys995")
+        zombie = {"pid": agent, "ppid": watcher, "pgid": agent, "sid": watcher,
+                  "tty": "ttys995", "stat": "Z+"}
+        adapter._table_reader = lambda tty: {"tty": tty, "captured_at": time.time(),
+                                             "rows": (zombie,), "readable": True}
+        handle = adapter.recover_handle("intent-ci2z")
+        self.assertEqual(handle["handle_recovery"], "listing_verified", handle)
+        self.assertEqual(handle["exit_status"], 3)
+
+    def test_a_gone_watcher_with_no_sentinel_is_still_an_orphan_and_waits_for_nothing(self) -> None:
+        agent, watcher = self._dead_pid(), self._dead_pid()
+        adapter, _sentinel, _fence = self._journal_a_spawned_intent(
+            "run_ci2o", "intent-ci2o", pid=agent, leader_pid=watcher, tty="ttys995")
+        adapter._table_reader = lambda tty: {"tty": tty, "captured_at": time.time(),
+                                             "rows": (), "readable": True}
+        started = time.time()
+        handle = adapter.recover_handle("intent-ci2o")
+        self.assertEqual(handle["handle_recovery"], "not_listed", handle)
+        self.assertLess(time.time() - started, 0.5, "waited for a watcher that is gone")
+
+    def test_a_wedged_watcher_is_unknown_never_verified(self) -> None:
+        """The bound: the watcher lives but never writes -- the budget elapses and the
+        answer is `listing_candidate` for a zombie row (unknown, never acted on) or
+        `not_listed` for an absent one; never `listing_verified`."""
+        agent = self._dead_pid()
+        watcher = subprocess.Popen(["sleep", "30"])
+        self.addCleanup(lambda: (watcher.kill(), watcher.wait()))
+        adapter, _sentinel, _fence = self._journal_a_spawned_intent(
+            "run_ci2w", "intent-ci2w", pid=agent, leader_pid=watcher.pid, tty="ttys995")
+        adapter.EXIT_EVIDENCE_BUDGET_MS = 200
+        zombie = {"pid": agent, "ppid": watcher.pid, "pgid": agent, "sid": watcher.pid,
+                  "tty": "ttys995", "stat": "Z+"}
+        adapter._table_reader = lambda tty: {"tty": tty, "captured_at": time.time(),
+                                             "rows": (zombie,), "readable": True}
+        handle = adapter.recover_handle("intent-ci2w")
+        self.assertEqual(handle["handle_recovery"], "listing_candidate", handle)
+
+    def test_the_watcher_wakes_on_sigchld_instead_of_polling(self) -> None:
+        source = inspect.getsource(pty_supervisor._watch)
+        self.assertIn("signal.set_wakeup_fd(wake_w", source)
+        self.assertIn("signal.signal(signal.SIGCHLD", source)
+        self.assertIn("select.select([guard_r, wake_r]", source)
+
+    def test_the_real_spawn_leaves_no_unsentinelled_zombie_window_under_load(self) -> None:
+        """The scenario that flaked, driven 15 times through the REAL spawn: the agent
+        exits at once, and `recover_handle` is asked immediately afterwards.  Every answer
+        must be `listing_verified` from the fenced sentinel."""
+        spec = stub_profile_spec("complete-claude", worktree=self.worktree)
+        adapter, _state, ledger = self.compose_spec(spec, run_id="run_ci2real")
+        outcomes = []
+        for number in range(15):
+            intent = self.intent(f"intent-ci2r-{number}", run_id="run_ci2real")
+            session = adapter.runtime.session_for(intent)
+            adapter._journal_planned(intent, session)
+            claim = ledger.claim(intent)
+            spawned = adapter.spawn_only(intent, lease_token=claim["lease_token"],
+                                         payload="work", rehearsal=lambda p, e, s: {
+                                             "channel": "structured", "record_type": "system",
+                                             "session_id": s},
+                                         mode_rehearsal=lambda p, e: {
+                                             "r_b_closed": True, "delivery_proof": True,
+                                             "auth_marker": None, "waited_without_prompt": True,
+                                             "evaluable": True, "identity_bound": True,
+                                             "detail": {}})
+            self.assertEqual(spawned["start_outcome"], "ready", spawned)
+            handle = adapter.recover_handle(intent["intent_id"])
+            outcomes.append(handle["handle_recovery"])
+            session.release()
+        self.assertEqual(outcomes, ["listing_verified"] * 15, outcomes)
+
+
+class CI1InterpreterImageResolutionTests(unittest.TestCase):
+    """CI-1.  The wrapper refusal names the REAL interpreter image, resolved against the
+    child PATH and `realpath`ed, on every platform (`/usr/bin/python3.12` on ubuntu)."""
+
+    def test_env_shebang_resolves_through_the_child_path_and_realpath(self) -> None:
+        room = Path(tempfile.mkdtemp(prefix="os37-ci1-"))
+        self.addCleanup(shutil.rmtree, room, True)
+        bindir = room / "bin"
+        bindir.mkdir()
+        real = bindir / "python3.99"
+        real.write_text("#!/bin/sh\nexit 0\n")
+        real.chmod(0o755)
+        (bindir / "python3").symlink_to(real)
+        wrapper = room / "wrapped"
+        wrapper.write_text("#!/usr/bin/env python3\n")
+        wrapper.chmod(0o755)
+        found = preflight_mod.interpreter_wrapper(str(wrapper), {"PATH": str(bindir)})
+        self.assertEqual(found["interpreter"], "/usr/bin/env")
+        self.assertEqual(found["interpreter_image"], os.path.realpath(real))
+        self.assertNotEqual(found["interpreter_image"], str(bindir / "python3"),
+                            "the symlink, not the image, was reported")
+
+    def test_an_env_name_the_child_cannot_resolve_is_reported_empty_not_fabricated(self) -> None:
+        room = Path(tempfile.mkdtemp(prefix="os37-ci1c-"))
+        self.addCleanup(shutil.rmtree, room, True)
+        wrapper = room / "wrapped"
+        wrapper.write_text("#!/usr/bin/env no-such-interpreter-os37\n")
+        wrapper.chmod(0o755)
+        found = preflight_mod.interpreter_wrapper(str(wrapper), {"PATH": str(room)})
+        self.assertEqual(found["interpreter_image"], "")
+        self.assertEqual(found["unresolved_interpreter"], "no-such-interpreter-os37")
+        self.assertNotIn(os.getcwd(), found["interpreter_image"])
+
+    def test_a_direct_shebang_is_realpathed_too(self) -> None:
+        room = Path(tempfile.mkdtemp(prefix="os37-ci1b-"))
+        self.addCleanup(shutil.rmtree, room, True)
+        wrapper = room / "wrapped"
+        wrapper.write_text("#!/bin/sh\n")
+        wrapper.chmod(0o755)
+        found = preflight_mod.interpreter_wrapper(str(wrapper), {"PATH": ""})
+        self.assertEqual(found["interpreter_image"], os.path.realpath("/bin/sh"))
