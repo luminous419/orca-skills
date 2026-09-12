@@ -595,12 +595,21 @@ class FullSupervisedDispatchTests(unittest.TestCase):
         probe = pty_supervisor.read_spawn_records(self.base, "run_e2e", "intent-e2e")
         self.assertEqual(probe["outcome"], "present",
                          "no execve was proven for a dispatch that settled")
-        kinds = [row["kind"] for row in journal.rows_for("intent-e2e")]
+        rows = journal.rows_for("intent-e2e")
+        kinds = [row["kind"] for row in rows]
         self.assertEqual(
             kinds,
             ["DELIVERY_INTENT", "EVENT", "SPAWN_OBSERVED", "RECEIPT_OBSERVED", "EVENT",
-             "EVENT", "SETTLEMENT_OBSERVED"],
+             "EVENT", "SETTLEMENT_OBSERVED", "EVENT"],
             "the journal's record order changed; DELIVERY_INTENT is FIRST by construction")
+        # The trailing EVENT is the supervisor RECLAIMING its own resources after the
+        # proven exit (consolidated review finding 9): the exit watcher reaped, the master
+        # fd closed.  Journalled so a stranger can see the completion leaked nothing.
+        reclaimed = rows[-1]["source_vocabulary"]
+        self.assertEqual(rows[-1]["event"], "exit_observed")
+        self.assertTrue(reclaimed["master_fd_closed"])
+        self.assertTrue(reclaimed["leader_reaped"], reclaimed)
+        self.assertEqual(rows[-1]["axes"]["process_liveness"], "already exited")
         # D4.3a / USER DIRECTIVE D-D.1, asserted as an ORDER rather than as a presence:
         # the atomic delivery intent is appended and fsynced BEFORE the process exists, so
         # a successor that finds no DELIVERY_INTENT has PROVED no fork happened.

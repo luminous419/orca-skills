@@ -18,12 +18,16 @@
 # platform-gated tests resolve to NOTHING and must RUN -- if one of them skips, the lane
 # fails. On Linux they must skip. Neither host gets the weaker contract.
 #
-# OS-37 adds twenty-one `always` entries.  All are opt-in live-runtime suites gated on an
-# env var no CI runner sets: the live per-CLI checks need a real agent CLI installed, the
-# standalone E2E spawns real local processes, and the R10 workflow E2E drives nine of them
-# through the real `run_workflow.py` with `orca` removed from PATH.  AC-37-24 requires a check that cannot run to be
-# recorded as "not established" rather than as a pass, which is what a declared skip is;
-# artifacts/runs/run_54d90086bd75/CONFORMANCE.md and TEST.md record all of them.
+# OS-37 adds 26 `always` entries:
+#   9 in test_os37_cli_preconditions, 7 in test_os37_per_driver_matrix, 7 in test_os37_r10_workflow_e2e, 3 in test_os37_standalone_e2e.
+# All are opt-in live-runtime suites gated on an env var no CI runner sets: the live
+# per-CLI checks need a real agent CLI installed, the standalone E2E spawns real local
+# processes, and the R10 workflow E2E drives its cases through the real `run_workflow.py`
+# with `orca` removed from PATH.  AC-37-24 requires a check that cannot run to be recorded
+# as "not established" rather than as a pass, which is what a declared skip is;
+# docs/conformance/OS37_CONFORMANCE.md records all of them.  The counts above are DERIVED
+# by the generator from the entries below at generation time, never typed by hand
+# (consolidated review finding 19).
 #
 # Deliberately absent, so they fail the lane if they ever occur: the git-availability skips
 # in the retained-report whitespace gate. If that gate stops running because git is missing

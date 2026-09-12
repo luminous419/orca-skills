@@ -200,18 +200,61 @@ class IdempotentAdmissionTests(unittest.TestCase):
             self.journal.open_dispatches()
 
     def test_s0_defers_to_the_ledgers_settlement_verdict(self) -> None:
-        """``admit`` READS the ledger's settlement; it does not re-decide it."""
-        class _Contradicting:
+        """``admit`` READS the ledger's settlement; it does not re-decide it.
+
+        Consolidated review finding 4: the contradiction is read on the EXECUTION axis of
+        both sides.  The ledger holds a `SettlementEvent` whose `outcome` is the frozen
+        transport vocabulary (`SUCCEEDED` for every delivered settlement, a typed FAILED
+        one included), so the ledger's execution outcome is DERIVED from the event's own
+        result -- `standalone_failure` present means the runtime settled it as failed.
+        This test used to hand `admit` a bare ``{"outcome": "SUCCEEDED"}`` and expect a
+        conflict against an incoming `failed` row, which asserted exactly the axis mix
+        the finding names.
+        """
+        from scripts.deterministic_workflow import standalone_lifecycle as lifecycle
+
+        class _Ledger:
+            def __init__(self, result):
+                self.result = result
+
+            def get_settlement(self, intent_id):
+                return {"outcome": "SUCCEEDED", "event_id": "event_ledger",
+                        "result": self.result}
+
+            def get_receipt(self, intent_id):
+                return None
+
+        # The ledger settled a SUCCEEDED execution; an incoming `failed` row contradicts.
+        succeeded = _Ledger({"status": "COMPLETE"})
+        result = self.journal.admit(settlement(outcome="failed", state="FAILED"),
+                                    runtime_state=succeeded)
+        self.assertEqual(result["outcome"], "refused")
+        self.assertEqual(result["code"], journal_mod.SETTLEMENT_CONFLICT)
+        # The ledger settled a FAILED execution (the runtime's own typed result); an
+        # incoming `succeeded` row contradicts, and an incoming `failed` row is ADMITTED --
+        # the transport `SUCCEEDED` on the envelope is not the execution outcome.
+        failed = _Ledger(lifecycle.typed_failed_result(
+            {"status": "COMPLETE"}, role="WORKER",
+            verdict={"outcome": "failed", "reason": "exit_code_nonzero"}))
+        result = self.journal.admit(settlement(outcome="succeeded"), runtime_state=failed)
+        self.assertEqual(result["outcome"], "refused")
+        self.assertEqual(result["code"], journal_mod.SETTLEMENT_CONFLICT)
+        result = self.journal.admit(settlement(outcome="failed", state="FAILED"),
+                                    runtime_state=failed)
+        self.assertEqual(result["outcome"], "admitted", result)
+        # A bare transport envelope with no result carries NO execution evidence, so
+        # nothing can be contradicted from it.
+        class _Bare:
             def get_settlement(self, intent_id):
                 return {"outcome": "SUCCEEDED"}
 
             def get_receipt(self, intent_id):
                 return None
 
-        result = self.journal.admit(settlement(outcome="failed"),
-                                    runtime_state=_Contradicting())
-        self.assertEqual(result["outcome"], "refused")
-        self.assertEqual(result["code"], journal_mod.SETTLEMENT_CONFLICT)
+        bare = self.journal.admit(settlement(outcome="failed", state="FAILED",
+                                             message_id="msg-bare"),
+                                  runtime_state=_Bare())
+        self.assertEqual(bare["outcome"], "admitted", bare)
 
     def test_a_malformed_record_kind_is_refused_at_construction(self) -> None:
         with self.assertRaises(ValueError):

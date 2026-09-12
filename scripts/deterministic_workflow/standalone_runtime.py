@@ -79,6 +79,65 @@ class StandaloneDispatchFailed(RuntimeError):
         self.exit_status = exit_status
 
 
+class StandaloneDispatchUnsettled(RuntimeError):
+    """A dispatch that MUST NOT settle, and says why by name.  Findings 1 and 7.
+
+    Two situations, and both are fail-closed by construction rather than by policy:
+
+    * ``teardown_unproven`` -- the dispatch did not complete, the interrupt ladder ran, and
+      the process's exit could NOT be proven.  A settlement here would be
+      `settled/release` over a process that may still be running in the worktree, and
+      the next dispatch would start beside it.  So NOTHING is settled: the journal
+      records a durable RETAINED state (`not_settled` / `retain` / `disputed`), the
+      ledger stays `EFFECTED`, and this is raised so the engine stops the run as a typed
+      BLOCKED terminal.  A successor's recovery ladder then finds an open, unsettled
+      effect and refuses to re-run it.
+    * ``settlement_refused`` -- the journal's admission ladder REFUSED the settlement
+      record (`SETTLEMENT_CONFLICT`, `SETTLEMENT_IDENTITY_MISMATCH`,
+      `FOREIGN_INCARNATION`).  The ledger is then NOT written, because a ledger that says
+      settled beside a journal that holds no terminal row is the permanent inconsistency
+      finding 7 names.
+
+    ``code`` is a member of the engine's existing idempotency vocabulary so the executor
+    boundary can project it onto a terminal without learning a standalone word.
+    """
+
+    def __init__(self, cause: str, detail: str, *, code: str = "IDEMPOTENCY_RECOVERY_BLOCKED",
+                 evidence: Mapping[str, Any] | None = None) -> None:
+        super().__init__(f"STANDALONE_DISPATCH_UNSETTLED:{cause}: {detail}")
+        self.cause = cause
+        self.detail = detail
+        self.code = code
+        self.evidence = dict(evidence or {})
+
+
+def failure_stage_for(exc: BaseException) -> str | None:
+    """The NAMED stage a runtime exception settles under, or ``None`` when it is not one
+    of the runtime's own failure types.  Consolidated review finding 6.
+
+    Every member here is an exception this runtime RAISES on a production path --
+    identity binding, delivery mode, teardown proof, ownership, the process table, the pty,
+    the journal -- and each one used to escape `adapter.start` as a plain exception,
+    through `executor._settle_now`, killing the graph with a traceback instead of settling
+    a typed outcome.  The table is CLOSED: a `TypeError` or a `KeyError` is a programming
+    error, not a dispatch outcome, and it still propagates.
+    """
+    table: tuple[tuple[type[BaseException], str], ...] = (
+        (drivers.IdentityBindingUnverified, "identity_binding_violated"),
+        (drivers.DeliveryModeMismatch, "delivery_mode_mismatch"),
+        (identity.StandaloneTeardownUnproven, "teardown_unproven"),
+        (identity.OwnershipRefused, "ownership_refused"),
+        (pty_supervisor.ProcessTableUnreadable, "process_table_unreadable"),
+        (pty_supervisor.PtyRefused, "pty_refused"),
+        (journal_mod.ExecutionJournal.IntentNotDurable, "delivery_intent_not_durable"),
+        (OSError, "os_error"),
+    )
+    for kind, stage in table:
+        if isinstance(exc, kind):
+            return stage
+    return None
+
+
 class _CapturedBody:
     """The agent's captured transcript, in the shape the SHARED result parser reads.
 
@@ -613,6 +672,10 @@ class StandaloneSession:
                           state="FAILED", vocabulary={"spawn_error": str(exc)})
             return self._receipt("failed", "spawn_failed", teardown="not_required")
         self.pty = dict(session)
+        # Finding 14.  The argv the kernel really loaded, kept where delivery verification
+        # reads it (`self.pty["argv"]`), so the replay selector sees the same composed argv
+        # preflight rehearsed rather than an empty tuple.
+        self.pty.setdefault("argv", tuple(str(a) for a in agent_argv))
         self.event_log.append("spawned")
 
         self.record = identity.make_record(
@@ -798,11 +861,18 @@ class StandaloneSession:
                 completion["state"].lower(), completion.get("lost_reason", ""),
                 dict(receipt),
                 exit_status=(completion.get("evidence") or {}).get("exit_status"))
+        verdict = dict(completion.get("verdict") or {})
         event = self._settle(completion["evidence"], lease_token=lease_token,
-                             result_parser=result_parser,
-                             verdict=completion.get("verdict"))
+                             result_parser=result_parser, verdict=verdict)
+        # Finding 10.  The reported outcome is the VERDICT's, the same value `_settle` just
+        # journalled -- never the completion STATE alone.  An exit 0 with no completion
+        # record used to arrive here as `state=COMPLETED` (through `exit_code_map[0]`)
+        # carrying `verdict.outcome=failed`, and this returned `succeeded` over a journal
+        # and ledger that had just recorded FAILED.
+        outcome = "succeeded" if (completion["state"] == "COMPLETED"
+                                  and verdict.get("outcome") == "succeeded") else "failed"
         return {**dict(receipt), "settled": True, "event_id": event["event_id"],
-                "outcome": "succeeded" if completion["state"] == "COMPLETED" else "failed"}
+                "outcome": outcome}
 
     def _existing_receipt(self) -> dict[str, Any] | None:
         """The receipt this intent already has, or ``None``.  Idempotency, the Orca way.
@@ -886,11 +956,18 @@ class StandaloneSession:
             mapped = lifecycle.map_exit_code(evidence["exit_status"],
                                              self.profile.exit_code_map)
             self.event_log.append("exit_observed")
-            return {"state": mapped["state"], "evidence": evidence,
+            # Finding 10.  NO COMPLETION RECORD IS NEVER A SUCCESS.  A profile that maps
+            # exit 0 to `COMPLETED` is stating what a clean exit means for a process that
+            # ALSO declared its result; a process that exited 0 without declaring one is a
+            # proven exit with a failed verdict -- a typed FAILED settlement, not a
+            # completed one and not a loss.
+            state = "FAILED" if mapped["state"] in lifecycle.SETTLED_STATES else mapped["state"]
+            return {"state": state, "evidence": evidence,
                     "lost_reason": mapped.get("lost_reason", ""),
                     "verdict": {"outcome": "failed", "reason": "no_completion_record",
                                 "detail": f"exit {evidence['exit_status']!r} with no "
-                                          "declared result record"}}
+                                          "declared result record",
+                                "exit_status": evidence["exit_status"]}}
         self.event_log.append("exit_unproven")
         return {"state": "LOST", "evidence": evidence,
                 "lost_reason": lifecycle.resolve_unknown(
@@ -971,6 +1048,10 @@ class StandaloneSession:
             raise StandaloneDispatchFailed("settlement_refused", admitted["code"], {})
         if self.runtime_state is not None:
             self.runtime_state.settle(self.intent_id, event, lease_token)
+        # Finding 9.  Both gates held -- the exit is PROVEN by the fenced sentinel -- so the
+        # supervisor's own resources are reclaimed here, on the normal completion path,
+        # rather than left to accumulate one master fd and one zombie watcher per dispatch.
+        self._reclaim(reason="settled")
         return event
 
     def settle_failed(self, failure: StandaloneDispatchFailed, *,
@@ -995,13 +1076,31 @@ class StandaloneSession:
         was observed, not a structured settlement record.
         """
         from .contracts import make_settlement_event
+        # ---- FINDING 1: TIMEOUT IS NOT SETTLEMENT ------------------------------------
+        # Nothing below runs until the process's exit is PROVEN -- by the fenced sentinel,
+        # or by the bounded interrupt ladder (terminate -> reap -> proof-of-death).  An
+        # exit that cannot be proven journals a durable RETAINED state and raises; it does
+        # not settle, so no subsequent work can start beside a possibly-live process.
+        proof = self._prove_exit_before_settlement(stage=failure.stage)
+        if not proof["proven"]:
+            raise StandaloneDispatchUnsettled(
+                "teardown_unproven",
+                f"{self.intent_id}: the dispatch failed at {failure.stage} and its process "
+                f"(pid {(self.record or {}).get('pid')}) could not be proven exited "
+                f"({proof['how']}); the resource is retained and nothing is settled",
+                evidence={"stage": failure.stage, "interrupt_outcome": proof["how"],
+                          "pid": (self.record or {}).get("pid"),
+                          "captured_tty": (self.record or {}).get("captured_tty")})
+        exit_status = (failure.exit_status if failure.exit_status is not None
+                       else proof.get("exit_status"))
         verdict = {"outcome": "failed", "reason": failure.reason or failure.stage,
                    "detail": str(failure), "stage": failure.stage,
                    # R5.  `None` is carried as a NAMED absence rather than dropped: a
                    # dispatch whose exit status was never observed is a different fact from
                    # one that exited 0, and the correction's three cause-specific
                    # regression tests rest on that distinction being durable.
-                   "exit_status": failure.exit_status}
+                   "exit_status": exit_status,
+                   "exit_proof": proof["how"]}
         extracted = self.driver.result_body(self.capture.transcript())
         body = extracted["body"]
         parsed = _default_result_parser(_CapturedBody(
@@ -1018,26 +1117,48 @@ class StandaloneSession:
             raise failure
         self.state = "FAILED"
         self.event_log.append("settlement_confirmed")
-        self.journal.admit(journal_mod.make_record(
+        spawned = self.record is not None
+        admitted = self.journal.admit(journal_mod.make_record(
             kind="SETTLEMENT_OBSERVED", derived_from="runtime_state",
             intent_id=self.intent_id, dispatch_id=self.dispatch_id, task_id=self.task_id,
             session_id=self.session_id, process_incarnation=self.incarnation,
             event="settlement_confirmed", state="FAILED", outcome="failed",
             message_id=event["event_id"], reported_by=self.fence,
+            # The axes say what was PROVEN.  A spawned process reaches this line only
+            # with its exit proven and its resources reclaimed, so it is `already exited`
+            # and the cleanup was `authorized`; a dispatch that never spawned has no
+            # process to be alive, and `disputed`/`not_authorized` states that no
+            # authority ever established one.
             axes=self._axes(settlement="settled", worker_resource="release",
-                            process_liveness="disputed",
-                            cleanup_authority="not_authorized"),
+                            process_liveness="already exited" if spawned else "disputed",
+                            cleanup_authority="authorized" if spawned else "not_authorized"),
             source_vocabulary={"event": dict(event), "driver": self.driver.name,
                                "completion_verdict": dict(verdict),
                                "result_body_source": extracted["source"],
+                               "exit_status": exit_status,
+                               "exit_proof": proof["how"],
+                               "teardown": "proven" if spawned else "not_required",
+                               "pid": (self.record or {}).get("pid"),
+                               "captured_tty": (self.record or {}).get("captured_tty"),
                                **self._terminal_provenance()}),
             runtime_state=self.runtime_state)
+        if admitted["outcome"] == "refused":
+            # Finding 7.  The journal REFUSED this settlement by name.  The ledger is NOT
+            # written: a ledger that says settled beside a journal holding no terminal row
+            # is a permanent inconsistency, and `open_dispatches` would keep the dispatch
+            # open against a ledger that has closed it.
+            raise StandaloneDispatchUnsettled(
+                "settlement_refused",
+                f"{self.intent_id}: the journal refused the failed settlement "
+                f"({admitted['code']}: {admitted['detail']}); the ledger is left unsettled",
+                evidence={"code": admitted["code"], "stage": failure.stage})
         if self.runtime_state is not None:
             self.runtime_state.settle(self.intent_id, event, lease_token)
         return {**dict(failure.receipt or self._receipt("failed", failure.reason,
                                                         teardown="not_required")),
                 "settled": True, "event_id": event["event_id"], "outcome": "failed",
-                "failure_stage": failure.stage}
+                "failure_stage": failure.stage, "exit_proof": proof["how"],
+                "teardown": "proven" if spawned else "not_required"}
 
     def _receipt(self, outcome: str, reason: str, *, teardown: str) -> StartReceipt:
         if outcome not in START_OUTCOMES:
@@ -1050,14 +1171,32 @@ class StandaloneSession:
                 "failure_reason": reason, "teardown": teardown}
 
     def _await_spawn_record(self, *, timeout_ms: int = 5000) -> dict[str, Any]:
+        """THIS incarnation's spawn record, and no other's.  Finding 15.
+
+        Scoped by incarnation, so a retry's identity bind cannot read an earlier attempt's
+        record -- present on disk from a process that is not the one just forked -- and
+        report `identity_bound` before its own child reached `execve`.  The record's own
+        `pid` must also be the pid the exit watcher handed up: a record naming another pid
+        is not this child's evidence.
+        """
         deadline = self._clock() + timeout_ms / 1000.0
         probe = pty_supervisor.read_spawn_records(self.artifact_base, self.run_id,
-                                                 self.intent_id)
+                                                 self.intent_id,
+                                                 incarnation=self.incarnation)
         while probe["outcome"] == "absent" and self._clock() < deadline:
             time.sleep(0.02)
             probe = pty_supervisor.read_spawn_records(self.artifact_base, self.run_id,
-                                                     self.intent_id)
-        return dict(probe)
+                                                     self.intent_id,
+                                                     incarnation=self.incarnation)
+        probe = dict(probe)
+        if probe["outcome"] == "present":
+            recorded_pid = (probe.get("record") or {}).get("pid")
+            spawned_pid = int((self.pty or {}).get("pid") or 0)
+            if spawned_pid and recorded_pid != spawned_pid:
+                probe.update({"outcome": "unknown", "record": None,
+                              "detail": f"spawn record for {self.incarnation!r} names pid "
+                                        f"{recorded_pid!r}, not the spawned {spawned_pid}"})
+        return probe
 
     def _prove_teardown(self) -> str:
         """A FAILED start proves its own teardown or RAISES (rule 1)."""
@@ -1100,7 +1239,122 @@ class StandaloneSession:
         identity.prove_teardown(reaped=reaped, esrch=esrch,
                                 incarnation_absent=incarnation_absent and snapshot.get(
                                     "readable", False))
+        # Finding 9: a proven teardown RECLAIMS what this process holds -- the exit watcher
+        # (its child, otherwise a zombie) and the pty master (otherwise a leaked fd).
+        self._reclaim(reason="failed_start")
         return "proven"
+
+    # -- finding 1 / finding 9: exit proof and resource reclamation ------------------------
+    def _read_sentinel(self) -> dict[str, Any]:
+        return pty_supervisor.read_exit_sentinel(
+            pty_supervisor.exit_sentinel_path(self.artifact_base, self.run_id,
+                                              self.session_id, self.incarnation),
+            fence=self.fence)
+
+    def _reclaim(self, *, reason: str) -> dict[str, Any]:
+        """Reap the exit watcher and release the pty master.  Finding 9.
+
+        Called ONLY after an exit is proven (a fenced sentinel, or the ladder's
+        proof-of-death).  Both halves are this process's own resources -- the watcher is
+        its child and the master fd is its descriptor -- so neither is an action on the
+        agent, and neither needs an ownership permit.  Recorded in the journal so a
+        stranger can see that the supervisor reclaimed rather than leaked.
+        """
+        reaped: dict[str, Any] = {"reaped": False, "status": None, "detail": "no pty"}
+        if self.pty is not None:
+            reaped = pty_supervisor.reap_leader(
+                self.pty, timeout_ms=self.profile.timeouts.physical_exit_timeout_ms)
+            self.release()
+        # An EVENT, not a `RELEASED` row: `open_dispatches` closes a dispatch on RELEASED,
+        # and reclaiming the supervisor's own descriptors is not the lifecycle release
+        # verb -- the dispatch is closed by its SETTLEMENT, which follows.
+        self._journal(kind="EVENT", derived_from="pty", event="exit_observed",
+                      state=self.state,
+                      lost_reason=self.lost_reason,
+                      axes=self._axes(settlement="not_settled" if self.state not in
+                                      lifecycle.SETTLED_STATES else "settled",
+                                      worker_resource="release",
+                                      process_liveness="already exited",
+                                      cleanup_authority="authorized"),
+                      vocabulary={"reason": reason, "leader_reaped": reaped["reaped"],
+                                  "leader_pid": (self.pty or {}).get("leader_pid"),
+                                  "leader_status": reaped["status"],
+                                  "leader_detail": reaped["detail"],
+                                  "master_fd_closed": True,
+                                  "pid": (self.record or {}).get("pid"),
+                                  "captured_tty": (self.record or {}).get("captured_tty"),
+                                  **self._terminal_provenance()})
+        return reaped
+
+    def _prove_exit_before_settlement(self, *, stage: str) -> dict[str, Any]:
+        """Bounded terminate -> reap -> exit proven, or a durable RETAINED state.  Finding 1.
+
+        The rule this enforces: **a timed-out or otherwise non-completing dispatch is never
+        recorded `settled/release` while its process may be alive.**  Before this, a
+        readiness, delivery or completion deadline raised `StandaloneDispatchFailed`,
+        `settle_failed` wrote `settled/release` with `process_liveness=disputed`, and the
+        engine started the next dispatch -- a correction round -- in the same worktree
+        beside the agent that was still running.
+
+        Three outcomes, each proven rather than assumed:
+
+        * the fenced exit SENTINEL already exists -> the OS-sourced exit is the proof; no
+          signal is sent;
+        * otherwise the four-rung INTERRUPT LADDER runs (graceful, bounded wait, force,
+          proof-of-death) and returns `interrupted_confirmed`/`terminated_forced` -> proven;
+        * otherwise (`exit_unproven`, `not_owned`, an unreadable table) -> NOT proven.  A
+          RETAINED state is journalled -- `not_settled` / `retain` / `disputed` /
+          `not_authorized`, `LOST/stop_unverified` -- nothing is settled, and the caller
+          raises `StandaloneDispatchUnsettled` so the run stops as a typed BLOCKED
+          terminal.  The open, unsettled journal row is what keeps every later pause and
+          recovery from starting work beside the process.
+
+        A proven exit is followed by reclamation: the watcher is reaped and the master fd
+        closed (finding 9), and the journal says so.
+        """
+        if self.record is None or self.pty is None:
+            return {"proven": True, "how": "not_required", "exit_status": None}
+        self.pump(timeout_ms=50)
+        sentinel = self._read_sentinel()
+        how = "exit_sentinel"
+        ladder: Mapping[str, Any] | None = None
+        if sentinel["outcome"] != "exited":
+            ladder = self.interrupt(f"dispatch_failed:{stage}")
+            outcome = str(ladder["interrupt_outcome"])
+            if outcome not in ("interrupted_confirmed", "terminated_forced"):
+                self.state = "LOST"
+                self.lost_reason = "stop_unverified"
+                self._journal(kind="EVENT", derived_from="process_table",
+                              event="exit_unproven", state="LOST",
+                              lost_reason="stop_unverified",
+                              axes=self._axes(settlement="not_settled",
+                                              worker_resource="retain",
+                                              process_liveness="disputed",
+                                              cleanup_authority="not_authorized"),
+                              vocabulary={"retained": True, "stage": stage,
+                                          "interrupt_outcome": outcome,
+                                          "ladder": [dict(step) for step in ladder["ladder"]],
+                                          "detail": "the dispatch did not complete and its "
+                                                    "process's exit could not be proven; "
+                                                    "nothing is settled and the resource "
+                                                    "is RETAINED by name",
+                                          "pid": self.record["pid"],
+                                          "captured_tty": self.record["captured_tty"],
+                                          **self._terminal_provenance()})
+                return {"proven": False, "how": outcome, "ladder": ladder,
+                        "exit_status": None}
+            how = f"interrupt_ladder:{outcome}"
+            # The watcher writes the sentinel right after reaping the agent; give it the
+            # physical-exit budget to land so the exit STATUS travels with the settlement.
+            deadline = self._clock() + self.profile.timeouts.physical_exit_timeout_ms / 1000.0
+            sentinel = self._read_sentinel()
+            while sentinel["outcome"] != "exited" and self._clock() < deadline:
+                time.sleep(0.02)
+                sentinel = self._read_sentinel()
+        reaped = self._reclaim(reason=f"{stage}:{how}")
+        return {"proven": True, "how": how, "ladder": ladder,
+                "exit_status": sentinel["code"] if sentinel["outcome"] == "exited" else None,
+                "leader_reaped": reaped["reaped"]}
 
     # -- readiness -----------------------------------------------------------------------
     def pump(self, *, timeout_ms: int = 50) -> int:
@@ -1108,6 +1362,8 @@ class StandaloneSession:
         if self.pty is None:
             return 0
         fd = int(self.pty["master_fd"])
+        if fd < 0:
+            return 0          # already released (finding 9): nothing to read from
         read = 0
         deadline = self._clock() + timeout_ms / 1000.0
         while self._clock() < deadline:
@@ -1132,8 +1388,9 @@ class StandaloneSession:
         snapshot = self._snapshot()
         liveness = None
         if snapshot.get("readable", False):
+            fd = int(self.pty["master_fd"])
             liveness = pty_supervisor.liveness_proof(
-                self.record, snapshot=snapshot, master_fd=int(self.pty["master_fd"]),
+                self.record, snapshot=snapshot, master_fd=fd if fd >= 0 else None,
                 expected_binary=self._resolved_binary())
         text = self.capture.transcript()
         # ONE identity for both binding modes: the minted value for `minted_echo`, the
@@ -1289,8 +1546,9 @@ class StandaloneSession:
             return {"intent_id": self.intent_id, "delivery": "stale_handle",
                     "proof": None, "frame_bytes": 0, "settle_ms": 0}
         snapshot = self._snapshot()
-        observed = pty_supervisor.row_for(snapshot, int(self.record["pid"])) \
-            if snapshot.get("readable") else None
+        # Finding 16: `{}` when the table was READ and holds no such pid, `None` only when
+        # it could not be read -- `verify` names the two differently.
+        observed = interrupt_mod.observed_row(snapshot, int(self.record["pid"]))
         try:
             permit = identity.assert_may_act(self.record, "write_input", observed=observed)
         except identity.OwnershipRefused:
@@ -1468,7 +1726,7 @@ class StandaloneSession:
 
     def _write_hint(self, hint: bytes, permit: Any) -> None:
         identity.require_permit(permit, self.record or {}, "signal")
-        if self.pty is not None:
+        if self.pty is not None and int(self.pty.get("master_fd", -1)) >= 0:
             os.write(int(self.pty["master_fd"]), hint)
 
     # -- completion / release -------------------------------------------------------------
@@ -1492,7 +1750,7 @@ class StandaloneSession:
         finish exiting; `standalone_pty.release` then drains whatever arrived in between and
         closes.
         """
-        if self.pty is not None:
+        if self.pty is not None and int(self.pty.get("master_fd", -1)) >= 0:
             self.pump(timeout_ms=100)
             pty_supervisor.release(self.pty)
 

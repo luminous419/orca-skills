@@ -61,6 +61,15 @@ OWNERSHIP_REFUSALS = ("unbound_tty", "tty_shared_with_driver", "captured_tty_mis
 #: `waitpid`s it and writes the exit sentinel a stranger process later reads; signalling it
 #: first would destroy the exit evidence.  `session_leader` is therefore derived from the
 #: record's `sid` -- a session leader's pgid IS its sid -- and never from the agent's pgid.
+#:
+#: **And when the leader IS the exit watcher it is not signalled at all** (consolidated
+#: review finding 12).  "Last" was still "too early": a SIGTERM/SIGKILL delivered to the
+#: watcher's group in the same rung as the agent's could kill the watcher BEFORE its
+#: `waitpid` returned, so the agent's exit sentinel was never written and proof-of-death
+#: was defeated by the very ladder meant to produce it.  The watcher needs no signal: it
+#: blocks in `waitpid` and exits by itself the instant the agent is reaped.  A record whose
+#: `sid` equals its own `pid` (no separate watcher -- the pre-topology shape) keeps the
+#: old two-rung ordering, because there the leader IS the agent.
 KILL_ORDER = ("descendant_groups", "session_leader")
 
 #: The ps keywords, in order.  `sess` is the portable spelling of the session
@@ -366,13 +375,22 @@ class SpawnRecordLookup(TypedDict):
 
 
 def read_spawn_records(artifact_base: str | os.PathLike[str], run_id: str,
-                       intent_id: str) -> SpawnRecordLookup:
+                       intent_id: str, *, incarnation: str = "") -> SpawnRecordLookup:
     """``absent`` proves no ``execve``; ``present`` means the effect may exist; ``unknown`` raises upstream.
 
     ``absent`` is returned ONLY when the intent directory was read successfully and holds no
     spawn record.  A missing directory counts as absent -- nothing was ever written for this
     intent, and the write precedes the exec -- but a directory that EXISTS and cannot be
     listed is ``unknown``, because that is exactly the case where a record might be there.
+
+    **``incarnation`` scopes the question to ONE attempt** (consolidated review finding
+    15).  Without it the lexicographically LATEST record was returned whatever the caller
+    asked about, so a retry's identity bind could read an EARLIER incarnation's record --
+    written by a process that is not the one just forked -- and bind the new attempt to it
+    before the new child's own exec.  With it, only ``spawn.<incarnation>`` is read, and a
+    record whose body names a different incarnation is refused as ``unknown`` rather than
+    adopted.  ``lookup`` still asks the unscoped question -- "did ANY execve happen for this
+    intent?" -- which is a different question with a different answer.
     """
     directory = spawn_record_dir(artifact_base, run_id, intent_id)
     if not directory.exists():
@@ -388,14 +406,23 @@ def read_spawn_records(artifact_base: str | os.PathLike[str], run_id: str,
         return {"outcome": "unknown", "record": None,
                 "detail": f"intent directory unreadable: {exc}"}
     names = [p for p in names if not p.name.endswith(".tmp")]
+    if incarnation:
+        names = [p for p in names if p.name == f"spawn.{incarnation}"]
     if not names:
         return {"outcome": "absent", "record": None,
-                "detail": "intent directory readable and holds no spawn record"}
+                "detail": ("intent directory readable and holds no spawn record"
+                           + (f" for incarnation {incarnation!r}" if incarnation else ""))}
     try:
         payload = json.loads(names[-1].read_text())
     except (OSError, ValueError) as exc:
         return {"outcome": "unknown", "record": None,
                 "detail": f"spawn record present but unreadable: {exc}"}
+    if incarnation and (not isinstance(payload, dict)
+                        or payload.get("process_incarnation") != incarnation):
+        return {"outcome": "unknown", "record": None,
+                "detail": f"spawn record for {incarnation!r} names another incarnation "
+                          f"{(payload or {}).get('process_incarnation')!r}; it is not "
+                          "this attempt's evidence"}
     return {"outcome": "present", "record": payload,
             "detail": "an execve was reached; the effect may exist and must be observed"}
 
@@ -476,6 +503,11 @@ class PtySession(TypedDict):
     sid: int
     leader_pid: int
     pty_id: str
+    #: The EXACT argv handed to ``execve`` (finding 14).  The runtime's delivery
+    #: verification hands the composed argv to the driver's replay selector, and it used to
+    #: read it off this mapping under a key nothing ever wrote -- so the selector always saw
+    #: an EMPTY argv even though preflight had rehearsed the real one.
+    argv: tuple[str, ...]
 
 
 def spawn(*, argv: Sequence[str], env: Mapping[str, str], profile: StandaloneProfile,
@@ -532,6 +564,25 @@ def spawn(*, argv: Sequence[str], env: Mapping[str, str], profile: StandalonePro
     if os.sep not in candidate:
         candidate = shutil.which(candidate, path=env.get("PATH", "")) or candidate
     image_path = os.path.realpath(candidate)
+    # ---- finding 3: every fallible pre-exec condition this PARENT can check is checked
+    # here, BEFORE the fork, so a child that cannot reach `execve` never gets far enough
+    # to write a spawn record.  A record is consumed as "an execve was reached", and the
+    # retry that follows is then IDEMPOTENCY-blocked -- for an agent that never ran.
+    if not os.path.isfile(image_path) or not os.access(image_path, os.X_OK):
+        raise OSError(errno.ENOENT,
+                      f"the agent image {image_path!r} is not an executable file; nothing "
+                      "was forked and no spawn record exists")
+    if cwd and not os.path.isdir(cwd):
+        raise OSError(errno.ENOENT,
+                      f"the declared worktree {cwd!r} is not a directory; nothing was "
+                      "forked and no spawn record exists")
+    # ABSOLUTE, resolved in the parent: the child `chdir`s into the worktree BEFORE it
+    # writes the spawn record (finding 3), so a relative artifact base would otherwise
+    # land the record inside the agent's worktree and the parent would read "no intent
+    # directory" for a child that did reach `execve`.
+    spawn_record_target = os.path.abspath(os.fspath(spawn_record_target))
+    if sentinel is not None:
+        sentinel = os.path.abspath(os.fspath(sentinel))
     master_fd, slave_fd = pty.openpty()
     slave_name = os.ttyname(slave_fd)
     close_up_to = highest_open_fd()
@@ -566,6 +617,14 @@ def spawn(*, argv: Sequence[str], env: Mapping[str, str], profile: StandalonePro
                     os.setpgid(0, 0)
                     os.tcsetpgrp(0, os.getpgrp())
                     child_pid = os.getpid()
+                    # ---- finding 3: EVERY fallible pre-exec operation comes BEFORE the
+                    # spawn record.  `chdir` used to come after it, so a missing or
+                    # unreadable worktree made the child die at 127 WITHOUT reaching
+                    # `execve` while a record saying "an execve was reached" already sat on
+                    # disk.  The record is the last write before `execve` and nothing
+                    # that can fail stands between the two any more.
+                    if cwd:
+                        os.chdir(cwd)
                     # THE LAST THING THIS PROCESS DOES BEFORE execve.  After the pre-effect
                     # claim, never before it.  Its ABSENCE is what proves no execve
                     # happened.
@@ -583,14 +642,34 @@ def spawn(*, argv: Sequence[str], env: Mapping[str, str], profile: StandalonePro
                         "argv_digest": argv_digest, "env_digest": env_digest,
                         "started_at": started_at,
                     })
-                    if cwd:
-                        os.chdir(cwd)
+                    # `closerange` cannot fail in a way that stops the exec -- it only
+                    # closes -- and it stays after the write because the write needs a
+                    # descriptor of its own.
                     os.closerange(3, close_up_to + 1)
                     os.execve(image_path, list(argv), dict(env))
                 except BaseException:
                     os._exit(127)
             os.write(handoff_w, b"%d\n" % agent_pid)
             os.close(handoff_w)
+            # ---- finding 9: the LEADER holds no pty descriptor while it waits ---------
+            # It inherited the master (from the parent) and the slave (its own 0/1/2 plus
+            # the original), and it never execs, so `FD_CLOEXEC` never closed either.
+            # Those copies are what kept the pty alive after the parent released its
+            # master: hangup cannot be produced while any copy of the master is open, and
+            # the slave's last close -- the EOF the parent's drain reads as "the agent is
+            # gone" -- cannot happen while the watcher still holds one.  The agent already
+            # has its own 0/1/2 on the slave; the watcher's job is `waitpid`, which needs
+            # no terminal at all.
+            try:
+                os.close(master_fd)
+                os.close(slave_fd)
+                null = os.open(os.devnull, os.O_RDWR)
+                for fd in (0, 1, 2):
+                    os.dup2(null, fd)
+                if null > 2:
+                    os.close(null)
+            except OSError:
+                pass
             code = _wait_status_to_code(os.waitpid(agent_pid, 0)[1])
             if sentinel is not None:
                 write_exit_sentinel(sentinel, code=code, fence=fence)
@@ -610,7 +689,7 @@ def spawn(*, argv: Sequence[str], env: Mapping[str, str], profile: StandalonePro
                       "process identity exists, so none is invented")
     return {"master_fd": master_fd, "slave_name": slave_name, "pid": agent_pid,
             "pgid": agent_pid, "sid": leader_pid, "leader_pid": leader_pid,
-            "pty_id": f"pty-{uuid.uuid4().hex[:12]}"}
+            "pty_id": f"pty-{uuid.uuid4().hex[:12]}", "argv": tuple(str(a) for a in argv)}
 
 
 def _read_handoff(fd: int, *, budget_ms: int = 10_000) -> int:
@@ -904,7 +983,15 @@ def signal_target(record: Mapping[str, Any], decision: Mapping[str, Any], sig: i
         leader = int(record.get("sid") or record["pgid"])
         for pgid in descendant_groups(snapshot, leader_pgid=leader):
             _try(sent, "descendant_groups", pgid, lambda: send_group(pgid, sig))
-        _try(sent, "session_leader", leader, lambda: send_group(leader, sig))
+        if leader == int(record["pid"]):
+            # No separate exit watcher: the leader is the agent itself, and the old
+            # ordering (descendants first, then it) is exactly right.
+            _try(sent, "session_leader", leader, lambda: send_group(leader, sig))
+        else:
+            # Finding 12.  The watcher is NEVER signalled: it must survive to reap the agent
+            # and write the exit sentinel, and it exits on its own once it has.
+            sent.append({"rung": "session_leader", "target": leader,
+                         "result": "withheld:exit_watcher"})
     else:
         pid = int(record["pid"])
         _try(sent, "root", pid, lambda: send_one(pid, sig))
@@ -995,6 +1082,39 @@ def drain(master_fd: int, *, budget_ms: int = 500) -> int:
     return drained
 
 
+def reap_leader(session: Mapping[str, Any], *, timeout_ms: int = 2_000) -> dict[str, Any]:
+    """``waitpid`` the exit watcher this process forked, bounded.  Finding 9.
+
+    The watcher is THIS process's child: nobody else can reap it, and an unreaped watcher
+    is a zombie for the life of the supervisor -- one per dispatch.  It exits by itself as
+    soon as it has reaped the agent and written the sentinel, so after a proven exit this
+    returns almost at once; the bound is for the case where it does not, which is reported
+    rather than waited on forever.
+
+    ``{"reaped": bool, "status": int|None, "detail": str}``.  ``ChildProcessError`` --
+    already reaped, or not our child (a stranger process asking) -- is ``reaped=True``
+    with no status: there is nothing left to collect.
+    """
+    pid = session.get("leader_pid")
+    if not isinstance(pid, int) or pid <= 0:
+        return {"reaped": False, "status": None, "detail": "no leader pid recorded"}
+    deadline = time.time() + timeout_ms / 1000.0
+    while True:
+        try:
+            done, status = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            return {"reaped": True, "status": None,
+                    "detail": "already reaped or not this process's child"}
+        except OSError as exc:
+            return {"reaped": False, "status": None, "detail": f"waitpid: {exc}"}
+        if done == pid:
+            return {"reaped": True, "status": _wait_status_to_code(status), "detail": ""}
+        if time.time() >= deadline:
+            return {"reaped": False, "status": None,
+                    "detail": "the exit watcher is still running at the deadline"}
+        time.sleep(0.02)
+
+
 def release(session: Mapping[str, Any]) -> None:
     """DRAIN, then close the master fd.  Does NOT delete the capture file (AC-37-05).
 
@@ -1013,3 +1133,7 @@ def release(session: Mapping[str, Any]) -> None:
             os.close(fd)
         except OSError:
             pass
+        if isinstance(session, dict):
+            # Closed ONCE.  A second release over the same mapping would otherwise close
+            # whatever descriptor number the kernel has since handed to somebody else.
+            session["master_fd"] = -1

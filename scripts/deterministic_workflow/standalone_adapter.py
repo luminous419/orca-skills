@@ -157,19 +157,47 @@ class StandaloneAdapter:
         session = self._require_runtime().session_for(intent)
         self._journal_planned(intent, session)
         try:
-            return session.run_dispatch(lease_token=lease_token)
-        except runtime_mod.StandaloneDispatchFailed as failure:
-            # EXTERNAL REVIEW #8.  This is the executor/launcher boundary, and before this
-            # it did not exist: `executor._settle_now` calls `adapter.start` and has no
-            # handler, so a readiness timeout, an auth expiry, an OOM kill or a missing
-            # result propagated out of the graph as a traceback and took the whole run with
-            # it.  A dispatch that could not produce a verdict is still an OUTCOME, and the
-            # engine has a vocabulary for it, so it is settled here as a TYPED FAILED
-            # settlement and routed by the engine's own policy.
-            #
-            # `settle_failed` re-raises if the lifecycle refuses the edge, so this is not a
-            # catch-all that can swallow an incoherent state.
-            return session.settle_failed(failure, lease_token=lease_token)
+            try:
+                return session.run_dispatch(lease_token=lease_token)
+            except runtime_mod.StandaloneDispatchFailed as failure:
+                # EXTERNAL REVIEW #8.  This is the executor/launcher boundary, and before
+                # this it did not exist: `executor._settle_now` calls `adapter.start` and
+                # has no handler, so a readiness timeout, an auth expiry, an OOM kill or a
+                # missing result propagated out of the graph as a traceback and took the
+                # whole run with it.  A dispatch that could not produce a verdict is still
+                # an OUTCOME, and the engine has a vocabulary for it, so it is settled here
+                # as a TYPED FAILED settlement and routed by the engine's own policy.
+                #
+                # `settle_failed` proves the process's exit FIRST (finding 1) and raises
+                # `StandaloneDispatchUnsettled` when it cannot, so this is not a catch-all
+                # that can settle over a live process or swallow an incoherent state.
+                return session.settle_failed(failure, lease_token=lease_token)
+            except runtime_mod.StandaloneDispatchUnsettled:
+                raise
+            except Exception as exc:  # noqa: BLE001 - re-raised below unless NAMED
+                # Consolidated review finding 6.  The runtime's OTHER production failures
+                # -- an identity-binding violation, a delivery-mode mismatch, an unprovable
+                # teardown, a refused ownership permit, an unreadable process table, a pty
+                # refusal, a non-durable intent, an OS error -- are plain exceptions and
+                # escaped exactly as `StandaloneDispatchFailed` once did.  Each is a NAMED
+                # member of `failure_stage_for`'s closed table and settles under its stage;
+                # anything outside the table is a programming error and still propagates.
+                stage = runtime_mod.failure_stage_for(exc)
+                if stage is None:
+                    raise
+                failure = runtime_mod.StandaloneDispatchFailed(
+                    stage, f"{type(exc).__name__}: {exc}",
+                    session._receipt("failed", stage, teardown="not_required")
+                    if session.record is None else None)
+                return session.settle_failed(failure, lease_token=lease_token)
+        except runtime_mod.StandaloneDispatchUnsettled as unsettled:
+            # Findings 1 and 7.  NOT a settlement, and NOT a traceback: the run stops as a
+            # typed BLOCKED terminal through the engine's own idempotency vocabulary.  The
+            # journal already holds the durable retained/refused state, the ledger stays
+            # EFFECTED, and a later recovery finds an open, unsettled effect and refuses to
+            # start work beside it.
+            from .executor import IdempotencyRecoveryError
+            raise IdempotencyRecoveryError(unsettled.code, str(unsettled)) from unsettled
 
     def spawn_only(self, intent: ActionIntent, *,
                    lease_token: str | None = None, **kwargs: Any) -> Mapping[str, Any]:
@@ -256,26 +284,6 @@ class StandaloneAdapter:
             if expected_fence and fence != expected_fence:
                 continue
             return event
-        return None
-
-    def _stored_settlement(self, intent_id: str) -> SettlementEvent | None:
-        """The settlement the authorities hold, WITHOUT the identity fence.
-
-        Private on purpose: the only callers are :meth:`settlement` and :meth:`resume`, and
-        each applies its OWN fence to the answer -- the ledger receipt's for the first, the
-        caller's receipt for the second.  Nothing outside this class may read a settlement
-        that no fence has been applied to.
-        """
-        rows_readable = self.settlement_journal.rows_for(intent_id)  # raises when unreadable
-        if self.runtime_state is not None:
-            stored = self.runtime_state.get_settlement(intent_id)
-            if stored is not None:
-                return stored
-        for row in reversed(rows_readable):
-            if row["kind"] == "SETTLEMENT_OBSERVED":
-                event = (row.get("source_vocabulary") or {}).get("event")
-                if isinstance(event, dict):
-                    return event
         return None
 
     def settlement(self, intent_id: str) -> SettlementEvent | None:
@@ -401,14 +409,16 @@ class StandaloneAdapter:
         expected_fence = str((receipt or {}).get("external_id") or "")
         if self.settlement_journal is None:
             return self.settlement(intent_id)
-        # UNFENCED on purpose: the fence below is this method's own act, applied against
-        # the receipt THIS caller holds rather than against whatever the ledger last
-        # recorded.  Reading a pre-fenced value here would make the comparison below a
-        # tautology and the fence unfalsifiable.
-        stored = self._stored_settlement(intent_id)
-        if stored is None:
-            return None
+        # Consolidated review finding 2.  The row the fence VALIDATES is the row whose
+        # event is RETURNED.  It used to load the latest stored settlement, separately find
+        # a row whose fence matched the receipt, and then return the previously loaded
+        # value -- so a matching session A followed by a foreign session B returned B's
+        # event under A's receipt.  Now the fenced row's own event is the answer, and the
+        # ledger -- read UNFENCED, deliberately, so this fence is falsifiable -- is
+        # consulted only to confirm it settled the SAME event; a ledger that settled a
+        # different one is a contradiction this method refuses rather than resolves.
         rows = self.settlement_journal.rows_for(intent_id)   # raises when unreadable
+        fenced_row: Mapping[str, Any] | None = None
         for row in reversed(rows):
             if row["kind"] != "SETTLEMENT_OBSERVED":
                 continue
@@ -416,8 +426,21 @@ class StandaloneAdapter:
             if expected_fence and fence != expected_fence:
                 # A replayed or foreign settlement is not harvested as this one's.
                 continue
+            fenced_row = row
+            break
+        if fenced_row is None:
+            return None
+        matched = (fenced_row.get("source_vocabulary") or {}).get("event")
+        stored = (self.runtime_state.get_settlement(intent_id)
+                  if self.runtime_state is not None else None)
+        if not isinstance(matched, dict):
+            # The fenced row proves THIS fence settled but carries no event of its own;
+            # the ledger is then the only authority for what it settled to.  Never the
+            # latest journal row -- that is the row the fence just refused.
             return stored
-        return None
+        if stored is not None and stored.get("event_id") != matched.get("event_id"):
+            return None
+        return matched
 
     # ---- +5 LifecycleSettlementPort (DD-1) ----------------------------------------------
     def open_dispatches(self) -> tuple[str, ...]:
@@ -428,19 +451,103 @@ class StandaloneAdapter:
         return self.settlement_journal.open_dispatches()
 
     def recover_handle(self, intent_id: str) -> Mapping[str, Any]:
-        """``listing_verified`` only on a durable digest.  RAISES when unreadable."""
+        """``listing_verified`` only against a LIVE authority.  RAISES when unreadable.
+
+        Consolidated review finding 8.  The journal NAMES the candidate -- the pty id, the
+        captured tty, the pid, the argv digest -- and the journal alone can never VERIFY
+        it: reading the "verified" digest and the candidate digest from the same file was a
+        tautology, so the loss of the pty/process after a supervisor crash went undetected
+        and a dead resource was reported `listing_verified`.
+
+        The verifying authorities are the ones the Orca adapter's live listing stands for
+        here:
+
+        * the OS PROCESS TABLE, tty-scoped, exactly as the interrupt ladder reads it: the
+          recorded pid must be present on the captured tty in the recorded process group;
+        * the CHILD-WRITTEN SPAWN RECORD for the journalled incarnation: written by the
+          agent itself before `execve`, it must name the same pid and the same argv digest
+          the journal carries.
+
+        Both hold -> ``listing_verified``.  A readable table without the pid ->
+        ``not_listed`` (the resource is gone; nothing may be acted on).  An unreadable
+        table -> ``listing_candidate`` (named for reporting, never acted on).  A present
+        process whose spawn record contradicts the journal -> ``unverified``.
+
+        A session whose exit is PROVEN is verified too, by a third live-side authority:
+        the fenced exit sentinel the run's own exit watcher wrote for exactly this
+        session and incarnation.  That is a resource this run can prove is its own and
+        prove has ENDED -- the opposite of an orphan -- so it is ``listing_verified`` and
+        the pause policy discharges it as `exited` from its own axes.
+        """
         if self.settlement_journal is None:
             raise RuntimeError(
                 f"{DISPATCH_UNACCOUNTED}: no durable settlement journal is wired")
-        verified = ""
-        rows = self.settlement_journal.rows_for(intent_id)
+        rows = self.settlement_journal.rows_for(intent_id)          # raises when unreadable
+        candidate = journal_mod.recover_handle(self.settlement_journal, intent_id)
+        if candidate["handle_recovery"] == "not_listed":
+            return candidate
+        handle = str(candidate.get("candidate") or candidate.get("handle") or "")
+        tty = pid = pgid = digest = incarnation = session_id = ""
         for row in reversed(rows):
-            digest = (row.get("source_vocabulary") or {}).get("session_digest")
-            if digest:
-                verified = str(digest)
-                break
-        return journal_mod.recover_handle(self.settlement_journal, intent_id,
-                                         verified_digest=verified)
+            vocab = row.get("source_vocabulary") or {}
+            if not tty and vocab.get("captured_tty"):
+                tty = str(vocab["captured_tty"])
+            if not pid and vocab.get("pid"):
+                pid = str(vocab["pid"])
+            if not digest and vocab.get("session_digest"):
+                digest = str(vocab["session_digest"])
+            spawn = vocab.get("spawn_record")
+            if isinstance(spawn, Mapping) and not pgid and spawn.get("pgid"):
+                pgid = str(spawn["pgid"])
+            if not incarnation and row.get("process_incarnation"):
+                incarnation = str(row["process_incarnation"])
+                session_id = str(row.get("session_id") or "")
+        run_id = self.run_id or ""
+        if session_id and incarnation:
+            sentinel = pty_supervisor.read_exit_sentinel(
+                pty_supervisor.exit_sentinel_path(self.artifact_base, run_id, session_id,
+                                                  incarnation),
+                fence=f"{session_id}:{incarnation}")
+            if sentinel["outcome"] == "exited":
+                return {"handle": handle, "handle_recovery": "listing_verified",
+                        "exit_status": sentinel["code"],
+                        "detail": "the run's own exit watcher wrote a fenced exit sentinel "
+                                  "for this session; the resource is proven ours and "
+                                  "proven ended"}
+        if not tty or not pid:
+            return {"handle": None, "handle_recovery": "listing_candidate",
+                    "candidate": handle,
+                    "detail": "the journal names no durable process address to verify "
+                              "the candidate against; it must not be acted on"}
+        probe = pty_supervisor.read_spawn_records(self.artifact_base, run_id, intent_id,
+                                                 incarnation=incarnation)
+        record = probe.get("record") or {}
+        # The group the agent must still be in: the journal's spawn observation, else the
+        # child's own record, else the pid itself -- the spawn topology makes the agent
+        # its own group leader (`setpgid(0, 0)`), so a pid found in ANOTHER group is a
+        # recycled pid, not this dispatch's process.
+        expected_pgid = pgid or str(record.get("pgid") or "") or pid
+        reader = self._table_reader or pty_supervisor.read_process_table
+        snapshot = reader(tty)
+        if not snapshot.get("readable", False):
+            return {"handle": None, "handle_recovery": "listing_candidate",
+                    "candidate": handle,
+                    "detail": f"the process table for {tty!r} could not be read; "
+                              "unreadable is unknown, and unknown is never verified"}
+        row = pty_supervisor.row_for(snapshot, int(pid))
+        if row is None or row["tty"] != tty or str(row["pgid"]) != expected_pgid:
+            return {"handle": None, "handle_recovery": "not_listed",
+                    "candidate": handle,
+                    "detail": f"pid {pid} is not on {tty!r} in the recorded process "
+                              "group; the pty session this run created is gone"}
+        if probe["outcome"] != "present" or str(record.get("pid")) != pid \
+                or (digest and str(record.get("argv_digest") or "") != digest):
+            return {"handle": None, "handle_recovery": "unverified",
+                    "candidate": handle,
+                    "detail": "a process holds the recorded pid and tty but the child's "
+                              "own spawn record does not corroborate the journal "
+                              f"({probe['outcome']}); it is not proven ours"}
+        return {"handle": handle, "handle_recovery": "listing_verified"}
 
     #: The pause-row columns the journal can answer, and the ``source_vocabulary`` key each
     #: is read from.  Named as data so the mapping is legible and so nothing here invents a
@@ -536,8 +643,9 @@ class StandaloneAdapter:
                     "refusal": "no_live_session_in_this_process",
                     "process_liveness": axes["process_liveness"]}
         snapshot = session._snapshot()
-        observed = pty_supervisor.row_for(snapshot, int(session.record["pid"])) \
-            if snapshot.get("readable") else None
+        # Finding 16: `{}` for a readable table that holds no such pid, `None` only when it
+        # could not be read.
+        observed = interrupt_mod.observed_row(snapshot, int(session.record["pid"]))
         try:
             outcome = interrupt_mod.release_terminal(
                 session.record, authority=authority,

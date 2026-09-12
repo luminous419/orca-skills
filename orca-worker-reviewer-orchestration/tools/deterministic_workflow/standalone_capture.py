@@ -114,11 +114,17 @@ class BoundedCapture:
         record_truncation = ""
         payload = chunk
         if len(payload) > self.limits.max_line_bytes:
-            # Only THIS record is stamped; the store as a whole is not truncated by one
-            # over-long line, so a later completion question is still answerable.
             record_truncation = TRUNCATION_LINE_BYTES
-            self._dropped += len(payload) - self.limits.max_line_bytes
             payload = payload[:self.limits.max_line_bytes]
+        # ---- consolidated review finding 13 -----------------------------------------
+        # A chunk the store could not keep WHOLE is counted exactly once, as the number of
+        # bytes that did not reach the file, and it makes the store `truncated` with the
+        # cause named.  It used to do neither: an over-long chunk was cut, its excess added
+        # to `dropped_bytes`, and the store was left `truncated=False` -- so a completion
+        # question was answered from a transcript whose result record may have been in
+        # the bytes that were cut.  And a cut chunk that THEN hit the record or total limit
+        # had its whole length added a second time.  R-7 applies to the cut as much as to
+        # the drop: bytes this store does not hold are bytes a reader cannot reason from.
         if self._records >= self.limits.max_records:
             self._truncation = TRUNCATION_RECORD_COUNT
             self._dropped += len(chunk)
@@ -137,7 +143,8 @@ class BoundedCapture:
         self._total += len(payload)
         self._records += 1
         if record_truncation:
-            self._truncation = self._truncation or None
+            self._dropped += len(chunk) - len(payload)
+            self._truncation = self._truncation or TRUNCATION_LINE_BYTES
         self._save_meta()
         return {"offset": offset, "at": at,
                 "data": payload.decode("utf-8", errors="replace"),

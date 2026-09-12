@@ -56,6 +56,7 @@
 #                                it at all, which is finding #3.
 #   OS37_GA_TURN_DELAY_MS=<ms>   sleep between READY and the completion record: an agent
 #                                turn that outruns the readiness window.  Finding #4.
+#   OS37_GA_TURN_DELAY_ROLE=<R>  scope the delay above to dispatches naming role <R>.
 #   OS37_GA_ARGV_DUMP=<file>     append this invocation's argv, one line per invocation,
 #                                INCLUDING the preflight probes.  Finding #6 observes the
 #                                declared auth probe at the process boundary.
@@ -155,9 +156,21 @@ if [ -n "${OS37_GA_EXIT_CODE_ONCE:-}" ] && [ ! -f "$OS37_GA_EXIT_CODE_ONCE" ]; t
 fi
 
 # ---- the LONG TURN leg (finding #4) -------------------------------------------------
+# `OS37_GA_TURN_DELAY_ROLE=<R>` scopes the delay to dispatches whose delivered intent
+# names role <R>, the same way the no-completion and exit-code legs are scoped, so a run
+# can be steered into ONE role's turn outrunning the completion bound (consolidated
+# follow-up review, finding 1: a timed-out Reviewer must be terminated and reaped before
+# the correction round it triggers may start).
 if [ -n "${OS37_GA_TURN_DELAY_MS:-}" ]; then
-  /usr/bin/env python3 -c 'import sys,time; time.sleep(float(sys.argv[1])/1000.0)' \
-    "$OS37_GA_TURN_DELAY_MS"
+  DELAY_SCOPED=1
+  if [ -n "${OS37_GA_TURN_DELAY_ROLE:-}" ]; then
+    DELAY_SCOPED=0
+    case "$PROMPT" in *"$OS37_GA_TURN_DELAY_ROLE"*) DELAY_SCOPED=1 ;; esac
+  fi
+  if [ "$DELAY_SCOPED" = "1" ]; then
+    /usr/bin/env python3 -c 'import sys,time; time.sleep(float(sys.argv[1])/1000.0)' \
+      "$OS37_GA_TURN_DELAY_MS"
+  fi
 fi
 
 # ---- the AUTHENTICATION-FAILURE leg (finding #2) ------------------------------------

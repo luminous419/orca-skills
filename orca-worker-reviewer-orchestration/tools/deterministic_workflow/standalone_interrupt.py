@@ -5,7 +5,8 @@
     r0  optional in-band graceful hint          <- never evidence of death
     r1  GRACEFUL: SIGTERM, group-scoped only where ownership is provable
     r2  BOUNDED WAIT, re-checking ownership AND mode AT FIRE TIME
-    G2  IDENTITY RE-VERIFICATION #2  --fail-->  "not_owned"          x no signal
+    G2  IDENTITY RE-VERIFICATION #2  --fail-->  "exit_unproven"      (rung 1 delivered)
+                                     --fail-->  "not_owned"          (nothing delivered)
     r3  FORCE: SIGKILL, group-scoped only where provable
     G3  IDENTITY RE-VERIFICATION #3  --fail-->  "exit_unproven"      x no settle
     r4  PROOF OF DEATH: bounded wait for an OS-confirmed exit
@@ -45,7 +46,14 @@ RUNGS = ("rung_0_hint", "rung_1_graceful", "rung_2_bounded_wait", "rung_3_force"
 #: Each gate, and what a failure at it produces.  Note that G3's failure is
 #: `exit_unproven`, NOT `not_owned`: by G3 a SIGKILL has already been sent, so ownership
 #: having changed does not mean nothing happened -- it means the outcome is unknown.
+#:
+#: The same rule governs G2 and the rung-2 wait ONCE RUNG 1 HAS DELIVERED A SIGNAL
+#: (consolidated review finding 11).  `not_owned` is defined as "no signal sent, no edge
+#: taken", and `lifecycle_for` maps it to NO transition -- so reporting it after a SIGTERM
+#: already reached the process journalled a delivered signal as a non-event.  After any
+#: delivery, a refusal is `exit_unproven`: something happened and its outcome is unknown.
 GATES = {"G1": "not_owned", "G2": "not_owned", "G3": "exit_unproven"}
+GATES_AFTER_SIGNAL = {"G2": "exit_unproven"}
 
 
 class LadderStep(TypedDict):
@@ -73,11 +81,30 @@ def _now_iso() -> str:
 
 
 def _result(intent_id: str, reason: str, outcome: str,
-            ladder: Sequence[LadderStep]) -> InterruptResult:
+            ladder: Sequence[LadderStep], *, signalled: bool = False) -> InterruptResult:
     if outcome not in INTERRUPT_OUTCOMES:
         raise ValueError(f"interrupt_outcome {outcome!r} is not a closed-set member")
+    if outcome == "not_owned" and signalled:
+        # Finding 11, enforced at the one constructor: `not_owned` may never be reported
+        # once a signal has been delivered.  It means "nothing was sent"; here something was.
+        outcome = "exit_unproven"
     return {"intent_id": intent_id, "reason": reason, "interrupt_outcome": outcome,
             "ladder": tuple(ladder)}
+
+
+def observed_row(snapshot: Mapping[str, Any], pid: int) -> Mapping[str, Any] | None:
+    """The row for ``pid``, ``{}`` when the table was READ and holds no such pid, ``None``
+    only when the table could not be read.  Finding 16.
+
+    :func:`standalone_identity.verify` already tells the two apart -- an empty mapping is
+    `not_owned:pid_absent_from_table`, ``None`` is `unverifiable:process_table_unreadable`
+    -- but every caller handed it `row_for(...)`, which answers ``None`` for both, so a
+    process that had PROVABLY EXITED was reported as one whose liveness could not be
+    established, and the proof-of-exit rung was unreachable for it.
+    """
+    if not snapshot.get("readable", False):
+        return None
+    return pty_supervisor.row_for(snapshot, pid) or {}
 
 
 class Gate:
@@ -162,7 +189,16 @@ def interrupt(intent_id: str, reason: str, *, record: Mapping[str, Any],
     if first["unreadable"]:
         ladder.append(_step("G1", verified=False, detail="process_table_unreadable"))
         return _result(intent_id, reason, "not_owned", ladder)
-    observed = pty_supervisor.row_for(first["snapshot"], int(record["pid"]))
+    observed = observed_row(first["snapshot"], int(record["pid"]))
+    if observed == {}:
+        # Finding 16.  The table was READ and this pid is not on the captured tty.  That is
+        # not "unreadable" and it is not "not ours": it is the proof-of-exit question,
+        # asked before any signal, and `exit_proven` answers it from the same snapshot.
+        proof = pty_supervisor.exit_proven(record, first["snapshot"])
+        if proof["proven"]:
+            ladder.append(_step("rung_4_proof_of_death", verified=True,
+                                detail=f"already exited before any signal: {proof['reason']}"))
+            return _result(intent_id, reason, "interrupted_confirmed", ladder)
     try:
         permit = identity.assert_may_act(record, "signal", observed=observed)
     except identity.OwnershipRefused as exc:
@@ -190,8 +226,14 @@ def interrupt(intent_id: str, reason: str, *, record: Mapping[str, Any],
     sent = pty_supervisor.signal_target(
         record, first["decision"], pty_supervisor.graceful_signal(), permit=permit,
         snapshot=first["snapshot"], killpg=killpg, kill=kill)
+    # Finding 11: from here on a refusal is reported against the fact that a signal WAS
+    # delivered.  `sent` lists what actually reached a process; the withheld exit watcher
+    # is listed by name and does not count.
+    signalled = any(step.get("result") == "sent" for step in sent["sent"])
+    withheld = sum(1 for step in sent["sent"] if str(step.get("result", "")).startswith("withheld"))
     ladder.append(_step("rung_1_graceful", verified=True,
-                        detail=f"scope={sent['scope']} sent={len(sent['sent'])}"))
+                        detail=f"scope={sent['scope']} sent={len(sent['sent']) - withheld}"
+                               + (f" withheld={withheld}" if withheld else "")))
 
     # -- rung 2: bounded wait, re-checking ownership AND mode AT FIRE TIME ------------------
     deadline = now() + profile.timeouts.graceful_force_timeout_ms / 1000.0
@@ -210,11 +252,12 @@ def interrupt(intent_id: str, reason: str, *, record: Mapping[str, Any],
             return _result(intent_id, reason, "interrupted_confirmed", ladder)
         if probe["decision"]["verdict"] != "owned":
             # Ownership changed while we waited.  The escalation is CANCELLED, not retried:
-            # a SIGKILL aimed at a recycled pid reaches a stranger.
+            # a SIGKILL aimed at a recycled pid reaches a stranger.  And because rung 1
+            # already delivered a signal, the outcome is UNKNOWN -- never `not_owned`.
             ladder.append(_step("rung_2_bounded_wait", verified=False,
                                 detail=f"ownership changed: {probe['decision']['refusal']}"
                                        "; escalation cancelled"))
-            return _result(intent_id, reason, "not_owned", ladder)
+            return _result(intent_id, reason, "not_owned", ladder, signalled=signalled)
     ladder.append(_step("rung_2_bounded_wait", verified=True, detail="deadline elapsed"))
 
     # -- G2 --------------------------------------------------------------------------------
@@ -223,14 +266,14 @@ def interrupt(intent_id: str, reason: str, *, record: Mapping[str, Any],
         ladder.append(_step("G2", verified=False,
                             detail="process_table_unreadable" if second["unreadable"]
                             else (second["decision"]["refusal"] or "not_owned")))
-        return _result(intent_id, reason, "not_owned", ladder)
+        return _result(intent_id, reason, "not_owned", ladder, signalled=signalled)
     ladder.append(_step("G2", verified=True))
-    observed2 = pty_supervisor.row_for(second["snapshot"], int(record["pid"]))
+    observed2 = observed_row(second["snapshot"], int(record["pid"]))
     try:
         permit2 = identity.assert_may_act(record, "signal", observed=observed2)
     except identity.OwnershipRefused as exc:
         ladder.append(_step("G2", verified=False, detail=str(exc)))
-        return _result(intent_id, reason, "not_owned", ladder)
+        return _result(intent_id, reason, "not_owned", ladder, signalled=signalled)
 
     # -- rung 3: force ---------------------------------------------------------------------
     attempts = 0
@@ -239,15 +282,16 @@ def interrupt(intent_id: str, reason: str, *, record: Mapping[str, Any],
         record, second["decision"], pty_supervisor.force_signal(), permit=permit2,
         snapshot=second["snapshot"], killpg=killpg, kill=kill)
     attempts += 1
+    delivered = [step for step in forced["sent"] if step.get("result") == "sent"]
     ladder.append(_step("rung_3_force", verified=True,
-                        detail=f"scope={forced['scope']} sent={len(forced['sent'])} "
+                        detail=f"scope={forced['scope']} sent={len(delivered)} "
                                f"attempt={attempts}"))
-    if not forced["sent"] and attempts < max_attempts:
+    if not delivered and attempts < max_attempts:
         # A FAILED force reverts the mode and RE-ARMS with one fewer attempt, rather than
         # reporting a termination that was never sent.
         rearm = gate.evaluate()
         if not rearm["unreadable"] and rearm["decision"]["verdict"] == "owned":
-            observed3 = pty_supervisor.row_for(rearm["snapshot"], int(record["pid"]))
+            observed3 = observed_row(rearm["snapshot"], int(record["pid"]))
             try:
                 permit3 = identity.assert_may_act(record, "signal", observed=observed3)
             except identity.OwnershipRefused:

@@ -689,6 +689,53 @@ def typed_failed_result(parsed: Mapping[str, Any], *, role: str,
     return result
 
 
+#: The two members of the journal's EXECUTION-OUTCOME axis.  This is the vocabulary
+#: `SETTLEMENT_OBSERVED.outcome` carries: whether the AGENT TURN completed under the
+#: profile's success predicate.  It is a different axis from `SettlementEvent.outcome`,
+#: whose frozen transport vocabulary says only that the settlement was DELIVERED
+#: (`SUCCEEDED`) -- a typed FAILED settlement travels as a `SUCCEEDED` event -- and it is
+#: a different axis again from the workflow verdict the result body carries
+#: (`status`/`result`).  Consolidated review finding 4 is what happens when one of these
+#: is compared against another.
+EXECUTION_OUTCOMES = ("succeeded", "failed")
+#: The key `typed_failed_result` stamps on every result the runtime settled as FAILED.
+EXECUTION_FAILURE_KEY = "standalone_failure"
+
+
+def execution_outcome_of(result: Mapping[str, Any] | None) -> str:
+    """The agent EXECUTION outcome a settled result carries, in the journal's own words.
+
+    Derived from the result the RUNTIME wrote, never from the transport envelope:
+    `typed_failed_result` is the single writer of a FAILED settlement's result and it stamps
+    `standalone_failure` on every one, so its presence IS the runtime's own record that the
+    turn did not succeed.  Everything else the runtime settled succeeded by construction --
+    `_settle` reaches `COMPLETED` only through the profile's predicate.  ``""`` for a result
+    that is not a mapping: no axis is derived from a shape nothing wrote.
+    """
+    if not isinstance(result, Mapping):
+        return ""
+    return "failed" if EXECUTION_FAILURE_KEY in result else "succeeded"
+
+
+def workflow_verdict_of(result: Mapping[str, Any] | None, *, role: str = "") -> tuple[str, str]:
+    """``(field, value)`` of the WORKFLOW verdict a result carries -- `status` for a Worker,
+    `result` for a Reviewer -- or ``("", "")`` when it carries none.  A third axis, read by
+    the same rule `typed_failed_result` writes by, so a comparison of two settlements reads
+    the same field on both sides."""
+    if not isinstance(result, Mapping):
+        return ("", "")
+    if role in FAILED_RESULT_BY_ROLE:
+        field = FAILED_RESULT_BY_ROLE[role][0]
+    elif "status" in result and "result" not in result:
+        field = "status"
+    elif "result" in result:
+        field = "result"
+    else:
+        field = "status"
+    value = result.get(field)
+    return (field, str(value).upper()) if isinstance(value, str) and value else ("", "")
+
+
 # ---- D5.4 the single fail-closed resolver ----------------------------------------------
 def resolve_unknown(situation: str, **facts: Any) -> dict[str, Any]:
     """ONE place to audit every unknown's disposition.

@@ -23,6 +23,7 @@ import os
 import re
 import sys
 import tempfile
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -166,6 +167,110 @@ def _standalone_observation(artifact_base: Any, capabilities: Any) -> Any:
         capabilities=capabilities)
 
 
+def standalone_profile_path(artifact_base: Any, run_id: str) -> Path:
+    """Where a standalone run's DRIVER PROFILE is persisted, beside its journal.
+
+    Consolidated review finding 5.  A stalled standalone run is recovered by a DIFFERENT
+    process -- the Watchdog -- which has to rebuild the same runtime the launcher built,
+    and the runtime is the profile: binary, driver, selectors, timeouts, worktree.  The
+    profile is a committed configuration file that names secrets only by REFERENCE
+    (`auth_secret_ref` holds environment names, never values; `driver_env` is non-secret by
+    contract), so persisting it under the run root discloses nothing the operator's own
+    profile file does not.
+    """
+    from .standalone_journal import journal_path
+    return journal_path(artifact_base, run_id).with_name("profile.json")
+
+
+def persist_standalone_profile(artifact_base: Any, run_id: str,
+                               profile_spec: Mapping[str, Any]) -> Path:
+    """Write the profile spec durably (tmp + rename).
+
+    Two files, because a run may be composed more than once: `run_cli` composes ONE
+    adapter for ONE profile, but a caller driving the composition root per dispatch (the
+    R10 real-agent harness, a mixed Worker/Reviewer CLI pairing) composes several under
+    one run id.  Every distinct profile is kept, content-addressed, under
+    ``standalone/profiles/<digest>.json`` (write-once), and ``standalone/profile.json``
+    names the CURRENT composition -- the one a recovery re-enters with.
+    """
+    target = standalone_profile_path(artifact_base, run_id)
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    def _plain(value: Any) -> Any:
+        # A Python caller may hand over `dataclasses.asdict(profile)`, whose
+        # `graceful_hint` is bytes; the JSON door re-encodes a str hint with `.encode()`,
+        # so the round trip through the persisted file is exact for any UTF-8 hint.
+        if isinstance(value, bytes):
+            return value.decode("utf-8", "surrogateescape")
+        raise TypeError(f"the profile spec is not JSON-shaped: {type(value).__name__}")
+    payload = json.dumps(dict(profile_spec), sort_keys=True, indent=2, ensure_ascii=False,
+                         default=_plain)
+    import hashlib
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+    archive = target.parent / "profiles" / f"{digest}.json"
+    archive.parent.mkdir(parents=True, exist_ok=True)
+
+    def _write(path: Path) -> None:
+        tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
+        with open(tmp, "w", encoding="utf-8") as handle:
+            handle.write(payload + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    if not archive.exists():
+        _write(archive)
+    current = None
+    if target.exists():
+        try:
+            current = target.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise LauncherError(
+                f"{STANDALONE_ADAPTER_REQUIRES_PROFILE}: the persisted profile at {target} "
+                f"is unreadable ({exc})") from exc
+    if current != payload + "\n":
+        _write(target)
+    return target
+
+
+def load_standalone_profile(artifact_base: Any, run_id: str) -> dict[str, Any] | None:
+    """The persisted profile spec, or ``None`` when the run never persisted one."""
+    target = standalone_profile_path(artifact_base, run_id)
+    if not target.exists():
+        return None
+    try:
+        spec = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise LauncherError(
+            f"{STANDALONE_ADAPTER_REQUIRES_PROFILE}: the persisted profile at {target} is "
+            f"unreadable ({exc})") from exc
+    if not isinstance(spec, dict):
+        raise LauncherError(
+            f"{STANDALONE_ADAPTER_REQUIRES_PROFILE}: the persisted profile at {target} is "
+            "not a JSON object")
+    return spec
+
+
+def build_standalone_runtime(artifact_base: Any, run_id: str, *, runtime_state: Any,
+                             profile_spec: Mapping[str, Any], journal: Any) -> Any:
+    """The ONE place a `StandaloneRuntime` is composed from a profile spec.
+
+    Shared by the launcher (a fresh run) and the Watchdog (a recovery of a stalled run),
+    so the runtime a recovery re-enters with is built by the same code that built the
+    original -- the same profile validation, the same declared worktree, the same journal.
+    """
+    from .standalone_profile import profile_from_mapping
+    from .standalone_runtime import StandaloneRuntime
+    try:
+        profile = profile_from_mapping(profile_spec)
+    except Exception as exc:  # noqa: BLE001 - a malformed profile refuses before any spawn
+        raise LauncherError(
+            f"{STANDALONE_ADAPTER_REQUIRES_PROFILE}: {exc}") from exc
+    return StandaloneRuntime(artifact_base=artifact_base, run_id=run_id,
+                             profile=profile, runtime_state=runtime_state,
+                             journal=journal,
+                             worktree_path=profile.worktree or None)
+
+
 def _standalone_pause_row_journal(artifact_base: Any, run_id: str) -> Any:
     """This run's PAUSE-ROW journal -- ``pause_store.FileSettlementJournal``, not the log.
 
@@ -218,19 +323,12 @@ def build_standalone_adapter(spec: dict[str, Any], *, artifact_base: Path,
     """
     from .standalone_adapter import StandaloneAdapter
     from .standalone_journal import ExecutionJournal
-    from .standalone_profile import profile_from_mapping
-    from .standalone_runtime import StandaloneRuntime
 
     resolved_run = run_id or spec.get("run_id") or "run_standalone"
     if profile_spec is None:
         raise LauncherError(
             f"{STANDALONE_ADAPTER_REQUIRES_PROFILE}: --adapter standalone needs an explicit "
             "driver profile; there is deliberately no built-in CLI table (AC-37-03)")
-    try:
-        profile = profile_from_mapping(profile_spec)
-    except Exception as exc:  # noqa: BLE001 - a malformed profile refuses before any spawn
-        raise LauncherError(
-            f"{STANDALONE_ADAPTER_REQUIRES_PROFILE}: {exc}") from exc
     journal = ExecutionJournal(artifact_base, resolved_run)
     # ---- OS-37 correction R3: the DECLARED worktree reaches the child -----------------
     # `StandaloneSession.worktree_path` defaults to `os.getcwd()`, and this composition
@@ -247,10 +345,13 @@ def build_standalone_adapter(spec: dict[str, Any], *, artifact_base: Path,
     # `or None` keeps the old behaviour for a profile that declares no worktree: the
     # session then falls back to `os.getcwd()` as before, and nothing about a run that
     # never named one changes.
-    runtime = StandaloneRuntime(artifact_base=artifact_base, run_id=resolved_run,
-                                profile=profile, runtime_state=runtime_state,
-                                journal=journal,
-                                worktree_path=profile.worktree or None)
+    runtime = build_standalone_runtime(artifact_base, resolved_run,
+                                       runtime_state=runtime_state,
+                                       profile_spec=profile_spec, journal=journal)
+    # Finding 5.  The profile is persisted under the run root BEFORE any effect, so the
+    # Watchdog can rebuild this exact runtime for a recovery instead of binding the
+    # recovered graph to an adapter with no runtime at all.
+    persist_standalone_profile(artifact_base, resolved_run, profile_spec)
     adapter = StandaloneAdapter(runtime, runtime_state=runtime_state,
                                 settlement_journal=journal,
                                 pause_row_journal=_standalone_pause_row_journal(
@@ -1390,6 +1491,10 @@ def _add_adapter_selection(mode: argparse.ArgumentParser) -> None:
     mode.add_argument("--project-root", default="",
                       help="project root the Orca adapter reads its quality profile and "
                            "agent routing from (default: the working directory)")
+    mode.add_argument("--standalone-profile", default="",
+                      help="JSON driver profile for --adapter standalone; optional, because "
+                           "a standalone run persists its own profile under its run root "
+                           "at launch and a recovery reads that by default (finding 5)")
 
 
 def _watchdog_wiring(args: argparse.Namespace, *, runner: Any = None,
@@ -1426,10 +1531,29 @@ def _watchdog_wiring(args: argparse.Namespace, *, runner: Any = None,
     bindings: dict[str, Any] = {}
 
     def bindings_for(run_id: str) -> Any:
-        """This run's durable ledger and journal.  Adopts nothing and claims nothing."""
+        """This run's durable ledger and journal.  Adopts nothing and claims nothing.
+
+        The ledger is keyed on the run's THREAD id, and the thread id is read from the
+        run's own durable record: the pause record when the run is paused, and the
+        committed checkpoint head when it is a stalled ACTIVE run with no pause record.
+        The head used to be consulted for neither, and a stalled active run -- the one
+        case the Watchdog exists for -- was therefore bound to a ledger named after the
+        run id rather than its thread, i.e. an EMPTY ledger in which every claim reads
+        `CREATED`; a recovery driven through this wiring re-entered the graph holding none
+        of the run's receipts and settlements.  Surfaced by the consolidated follow-up
+        review's finding 5 verification (watchdog discovery -> recovery -> a subsequent
+        execution node, asserted on the run's OWN ledger); it is adapter-neutral and the
+        Orca and fake arms below are untouched.
+        """
         if run_id not in bindings:
             record = pause_store.store_for(run_id, artifact_base=base).read(run_id)
-            thread_id = (record or {}).get("thread_id") or run_id
+            thread_id = (record or {}).get("thread_id") or ""
+            if not thread_id:
+                try:
+                    head = recovery_runtime.resolve_head(run_id, artifact_base=base)
+                except Exception:  # noqa: BLE001 - an unreadable head is refused later, by name
+                    head = None
+                thread_id = getattr(head, "thread_id", "") or run_id
             bindings[run_id] = (
                 FileRuntimeStateStore(default_runtime_state_path(run_id, thread_id)),
                 pause_store.journal_for(run_id, artifact_base=base))
@@ -1451,10 +1575,35 @@ def _watchdog_wiring(args: argparse.Namespace, *, runner: Any = None,
                 # OS-37 W-3.  The standalone runtime a recovery re-enters with is bound to
                 # THIS run's own durable journal and ledger, exactly as the Orca branch
                 # binds the stalled run's own harness.
+                #
+                # Consolidated review finding 5.  It is bound to a REAL runtime, rebuilt
+                # from the profile the run persisted at launch (or one the operator names
+                # with --standalone-profile).  This adapter is the one the recovered graph
+                # EXECUTES with: `runtime=None` was honest for the capability question
+                # (`capabilities_for` below still asks it that way, touching no process)
+                # but the recovered graph's EXECUTE_INTENT then called `start()` on it and
+                # died in `_require_runtime`, so a stalled standalone run became
+                # `escalation_observation_undecidable` forever instead of being recovered.
                 from .standalone_adapter import StandaloneAdapter
+                execution_journal = _standalone_journal_for(base, run_id)
+                spec_path = getattr(args, "standalone_profile", "")
+                if spec_path:
+                    profile_spec: Any = _read_json(spec_path, "--standalone-profile")
+                    if not isinstance(profile_spec, dict):
+                        raise LauncherError("the standalone profile must be a JSON object")
+                else:
+                    profile_spec = load_standalone_profile(base, run_id)
+                if profile_spec is None:
+                    raise LauncherError(
+                        f"{STANDALONE_ADAPTER_REQUIRES_PROFILE}: run {run_id!r} persisted no "
+                        "driver profile and none was given with --standalone-profile; a "
+                        "recovery cannot rebuild the runtime it would execute with")
+                runtime = build_standalone_runtime(base, run_id, runtime_state=ledger,
+                                                   profile_spec=profile_spec,
+                                                   journal=execution_journal)
                 adapter = StandaloneAdapter(
-                    None, runtime_state=ledger,
-                    settlement_journal=_standalone_journal_for(base, run_id),
+                    runtime, runtime_state=ledger,
+                    settlement_journal=execution_journal,
                     pause_row_journal=journal,
                     approval_port=approval_port, artifact_base=base, run_id=run_id)
             else:

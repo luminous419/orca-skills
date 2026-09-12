@@ -760,10 +760,26 @@ def profile_from_mapping(spec: Any) -> StandaloneProfile:
                                      "auth_probe.requires_flags"))
     else:
         raise ProfileError("auth_probe must be an object with an 'args' list")
-    markers = tuple(
-        (str(item[0]), str(item[1]))
-        for item in (spec.get("auth_markers") or ())
-        if isinstance(item, Sequence) and not isinstance(item, str) and len(item) == 2)
+    # Finding 18.  Every entry is validated, none is skipped: a malformed marker used to be
+    # silently DROPPED, which is the one thing a closed schema may never do -- an operator
+    # who wrote `["error", "authentication_failed", "extra"]` believed a marker was in
+    # force while the W-2 scan carried none.
+    raw_markers = spec.get("auth_markers")
+    if raw_markers is None:
+        raw_markers = ()
+    if isinstance(raw_markers, str) or not isinstance(raw_markers, Sequence):
+        raise ProfileError(
+            f"auth_markers must be a list of [field, expected-value] pairs, got "
+            f"{raw_markers!r}")
+    markers_list: list[tuple[str, str]] = []
+    for item in raw_markers:
+        if (isinstance(item, str) or not isinstance(item, Sequence) or len(item) != 2
+                or not all(isinstance(part, str) and part for part in item)):
+            raise ProfileError(
+                f"auth marker {item!r} must be a [field, expected-value] pair of non-empty "
+                "strings; a malformed marker is refused, never dropped")
+        markers_list.append((item[0], item[1]))
+    markers = tuple(markers_list)
     home = spec.get("home_policy") or {}
     capture = spec.get("capture") or {}
     timeouts = spec.get("timeouts") or {}

@@ -750,18 +750,19 @@ class F05OwnershipVocabularyTests(_ProductionPath):
         settled_intent = self.intent("intent-settled", run_id="run_pause")
         self.dispatch(adapter, ledger, settled_intent)
 
-        # A SECOND dispatch that is journalled but never settles: the `recovered` row.
-        # The pause row is opened through the SAME call `adapter.start` makes, so this is
-        # the production sequence with only the blocking dispatch left out.
+        # A SECOND dispatch that is spawned but never settles: the `recovered` row.  A REAL
+        # spawn (`spawn_only`, the adapter's own non-blocking verb) rather than a
+        # fabricated journal row naming a pid nobody holds: since the consolidated
+        # follow-up review's finding 8, `recover_handle` verifies the journal's candidate
+        # against the live process table and the run's own exit sentinel, and a row for a
+        # process that never existed is -- correctly -- an orphan it refuses.
         open_intent = self.intent("intent-open", run_id="run_pause")
         session = adapter.runtime.session_for(open_intent)
         adapter._journal_planned(open_intent, session)
-        session._journal(kind="EVENT", derived_from="pty", event="spawned",
-                         state="STARTING",
-                         vocabulary={"pty_id": "pty-open", "pid": 4242,
-                                     "captured_tty": "ttys999",
-                                     "session_digest": "digest-open",
-                                     **session._terminal_provenance()})
+        open_claim = ledger.claim(open_intent)
+        spawned = adapter.spawn_only(open_intent, lease_token=open_claim["lease_token"],
+                                     payload="work")
+        self.assertEqual(spawned["start_outcome"], "ready", spawned)
 
         # The REFUSAL is what the finding is: before the fix both rows raised
         # `PauseRefused(TERMINAL_OWNERSHIP_UNKNOWN)`.  It is caught and stated as an
@@ -1944,22 +1945,19 @@ class F11RefusedInterruptTests(_ProductionPath):
         from scripts.deterministic_workflow import executor
         profile = replay_profile(stream=STREAMS / "m14_claude_genuine_turn.stream",
                                  exit_code=0, worktree=self.worktree)
-        adapter, _state, _ledger = self.compose(profile, run_id="run_intpause")
+        adapter, _state, ledger = self.compose(profile, run_id="run_intpause")
         intent = self.intent("intent-intpause", run_id="run_intpause")
         session = adapter.runtime.session_for(intent)
         adapter._journal_planned(intent, session)
-        session.record = {"pid": 424243, "pgid": 424243, "sid": 424243,
-                          "captured_tty": "ttys998", "session_id": session.session_id,
-                          "process_incarnation": session.incarnation,
-                          "created_by_this_runtime": True, "host_scope": "local",
-                          "user_taken_over": False, "resource_kind": "pty_session",
-                          "spawn_token": session.spawn_token}
-        session._journal(kind="EVENT", derived_from="pty", event="spawned",
-                         state="STARTING",
-                         vocabulary={"pty_id": "pty-2", "pid": 424243,
-                                     "captured_tty": "ttys998",
-                                     "session_digest": "digest-2",
-                                     **session._terminal_provenance()})
+        # A REAL spawn, for the reason F5's case above gives: `recover_handle` now verifies
+        # the row against the live process table and the run's own exit sentinel
+        # (finding 8), so a fabricated pid is an orphan it correctly refuses.  The
+        # interrupt itself is still driven over an UNREADABLE table -- that is the refusal
+        # this case is about -- through the session's own injectable reader.
+        claim = ledger.claim(intent)
+        spawned = adapter.spawn_only(intent, lease_token=claim["lease_token"],
+                                     payload="work")
+        self.assertEqual(spawned["start_outcome"], "ready", spawned)
         session._table_reader = lambda tty: {"tty": tty, "captured_at": 0.0, "rows": (),
                                              "readable": False}
         session.interrupt("stop")
@@ -2741,6 +2739,20 @@ class E2EPostReceiptRestartIsFencedTests(_GraphAssertions, unittest.TestCase):
     PORT'S OWN PUBLIC API (`claim` -> `record_receipt` -> `release`) carrying a REAL receipt
     from a REAL `execve` and no settlement.  That is exactly what a process that died
     between `journal.admit(...)` and `runtime_state.settle(...)` leaves behind.
+
+    **The window is FAITHFUL** (consolidated follow-up review, finding 7).  Every OTHER
+    intent the first run settled is carried into the successor ledger exactly as the first
+    ledger holds it -- `claim` -> `record_receipt` -> `settle`, the same public API -- so
+    the successor holds what a Coordinator that crashed at that instant would hold: the
+    settlements it had already written, and the one receipt it had not yet settled.  The
+    earlier version handed the successor a ledger holding ONLY the target receipt, and the
+    positive half then reached COMPLETED only because the reviewer intent -- already
+    executed and settled by the first run under an incarnation the successor held no
+    receipt for -- was re-dispatched, refused `IDEMPOTENCY_RECOVERY_BLOCKED` at `start`,
+    had its failed settlement REFUSED by the journal (`SETTLEMENT_IDENTITY_MISMATCH`), and
+    was then written to the ledger anyway as a reviewer FAIL that drove a correction round.
+    That silent refusal is finding 7; with it fixed the same run stops as a typed BLOCKED
+    terminal, and this case would have been green only by way of the defect.
     """
 
     @classmethod
@@ -2779,10 +2791,23 @@ class E2EPostReceiptRestartIsFencedTests(_GraphAssertions, unittest.TestCase):
 
         successor_path = self.room / f"ledger_{tag}.json"
         successor = FileRuntimeStateStore(successor_path)
-        intent = {key: record[key] for key in
-                  ("intent_id", "command_id", "payload_digest", "run_id", "phase", "role",
-                   "round_kind")}
-        claimed = successor.claim(intent)
+
+        def intent_of(stored: dict) -> dict:
+            return {key: stored[key] for key in
+                    ("intent_id", "command_id", "payload_digest", "run_id", "phase",
+                     "role", "round_kind")}
+
+        # Every OTHER settled intent, carried over through the public API: what the
+        # crashed Coordinator had already written before it died.
+        for other_id, other in sorted(original._read().items()):
+            if other_id == intent_id or other.get("status") != "SETTLED":
+                continue
+            other_claim = successor.claim(intent_of(other))
+            successor.record_receipt(other_id, dict(other["receipt"]),
+                                     other_claim["lease_token"])
+            successor.settle(other_id, dict(other["settlement"]), other_claim["lease_token"])
+            self.assertEqual(successor.get_receipt(other_id)["status"], "SETTLED")
+        claimed = successor.claim(intent_of(record))
         successor.record_receipt(intent_id, receipt, claimed["lease_token"])
         successor.release(intent_id, claimed["lease_token"])
         self.assertEqual(successor.get_receipt(intent_id)["status"], "EFFECTED")
@@ -2855,6 +2880,7 @@ class E2EPostReceiptRestartIsFencedTests(_GraphAssertions, unittest.TestCase):
         before = self._spawns_for(self.first, intent_id)
         self.assertEqual(before, 1, "the first run did not spawn this dispatch exactly once")
 
+        spawned_before = len(self.first.spawn_rows())
         restart = self._restart_with_receipt(intent_id=intent_id,
                                              external_id=self._fence_of(row), tag="match")
         self.assert_nothing_escaped(restart)
@@ -2864,6 +2890,12 @@ class E2EPostReceiptRestartIsFencedTests(_GraphAssertions, unittest.TestCase):
         self.assertEqual(after, before,
                          "the successor RE-RAN an effect that already existed; the whole "
                          "point of external_resume is that it never does")
+        # Stronger than the per-intent count: the successor spawned NOTHING AT ALL.  With
+        # the faithful crash window every other effect is already settled in its ledger,
+        # so the whole run completes from collected evidence and no new process.
+        self.assertEqual(len(restart.spawn_rows()), spawned_before,
+                         "the successor spawned a process; a restart that holds every "
+                         "settlement and the one receipt has nothing left to execute")
         from scripts.deterministic_workflow.runtime_state import FileRuntimeStateStore
         self.assertIsNotNone(
             FileRuntimeStateStore(restart.ledger_path).get_settlement(intent_id),

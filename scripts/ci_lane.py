@@ -121,12 +121,16 @@ TOLERATED_MANIFEST_HEADER = """\
 # platform-gated tests resolve to NOTHING and must RUN -- if one of them skips, the lane
 # fails. On Linux they must skip. Neither host gets the weaker contract.
 #
-# OS-37 adds twenty-one `always` entries.  All are opt-in live-runtime suites gated on an
-# env var no CI runner sets: the live per-CLI checks need a real agent CLI installed, the
-# standalone E2E spawns real local processes, and the R10 workflow E2E drives nine of them
-# through the real `run_workflow.py` with `orca` removed from PATH.  AC-37-24 requires a check that cannot run to be
-# recorded as "not established" rather than as a pass, which is what a declared skip is;
-# artifacts/runs/run_54d90086bd75/CONFORMANCE.md and TEST.md record all of them.
+# OS-37 adds {os37_always} `always` entries:
+#   {os37_breakdown}.
+# All are opt-in live-runtime suites gated on an env var no CI runner sets: the live
+# per-CLI checks need a real agent CLI installed, the standalone E2E spawns real local
+# processes, and the R10 workflow E2E drives its cases through the real `run_workflow.py`
+# with `orca` removed from PATH.  AC-37-24 requires a check that cannot run to be recorded
+# as "not established" rather than as a pass, which is what a declared skip is;
+# docs/conformance/OS37_CONFORMANCE.md records all of them.  The counts above are DERIVED
+# by the generator from the entries below at generation time, never typed by hand
+# (consolidated review finding 19).
 #
 # Deliberately absent, so they fail the lane if they ever occur: the git-availability skips
 # in the retained-report whitespace gate. If that gate stops running because git is missing
@@ -1137,7 +1141,27 @@ def render_tolerated_manifest(alternatives: dict[str, list[tuple[str, str]]]) ->
             continue
         lines.append(f"# -- {condition} ({len(rows)}) --")
         lines.extend(f"{condition}\t{test_id}\t{reason}" for test_id, reason in rows)
-    return TOLERATED_MANIFEST_HEADER + "\n".join(lines) + "\n"
+    return tolerated_manifest_header(alternatives) + "\n".join(lines) + "\n"
+
+
+def tolerated_manifest_header(alternatives: dict[str, list[tuple[str, str]]]) -> str:
+    """The header with its OS-37 counts DERIVED from the entries (finding 19).
+
+    The checked-in header used to say "twenty-one" while the file it headed carried 26;
+    a number typed into prose drifts the moment an entry is added.  Every count here is
+    computed from the same `alternatives` the body is rendered from, so header and body
+    cannot disagree.
+    """
+    os37 = sorted(test_id for test_id, entries in alternatives.items()
+                  if test_id.startswith("test_os37_")
+                  and any(name == "always" for name, _reason in entries))
+    per_module: dict[str, int] = {}
+    for test_id in os37:
+        module = test_id.split(".", 1)[0]
+        per_module[module] = per_module.get(module, 0) + 1
+    breakdown = ", ".join(f"{count} in {module}" for module, count in sorted(per_module.items()))
+    return TOLERATED_MANIFEST_HEADER.format(os37_always=len(os37),
+                                            os37_breakdown=breakdown or "none")
 
 #: The decorators that ARE the platform gates, and the one module that declares them. The
 #: anti-drift check in `test_ci_lanes` reads these names out of the AST and holds the

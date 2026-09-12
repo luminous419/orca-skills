@@ -52,6 +52,32 @@ def event(**overrides) -> dict:
     return journal_mod.make_record(**fields)
 
 
+def live_table(*rows: dict, readable: bool = True):
+    """An injected tty-scoped process table -- the LIVE authority `recover_handle` verifies
+    the journal's candidate against (consolidated review finding 8)."""
+    import time as _time
+
+    def reader(tty: str) -> dict:
+        return {"tty": tty, "captured_at": _time.time(), "readable": readable,
+                "rows": tuple(rows)}
+    return reader
+
+
+AGENT_ROW = {"pid": 4242, "ppid": 4241, "pgid": 4242, "sid": 4241, "tty": "ttys042",
+             "stat": "S+"}
+
+
+def write_spawn_record(base, *, intent_id="intent-1", incarnation="i-1", pid=4242,
+                       argv_digest="digest-1") -> None:
+    """The CHILD-written spawn record, the second live-side authority."""
+    from scripts.deterministic_workflow import standalone_pty as pty_supervisor
+    pty_supervisor.write_spawn_record(
+        pty_supervisor.spawn_record_path(base, "run_1", intent_id, incarnation),
+        {"session_id": "s-1", "process_incarnation": incarnation, "pid": pid,
+         "pgid": pid, "sid": 4241, "boot_id": "", "proc_start_ticks": 0,
+         "argv_digest": argv_digest, "env_digest": "e", "started_at": ""})
+
+
 class _Base(unittest.TestCase):
 
     def setUp(self) -> None:
@@ -60,7 +86,7 @@ class _Base(unittest.TestCase):
         self.ledger = InMemoryRuntimeStateStore()
         self.adapter = StandaloneAdapter(
             None, runtime_state=self.ledger, settlement_journal=self.journal,
-            artifact_base=self.base, run_id="run_1")
+            artifact_base=self.base, run_id="run_1", table_reader=live_table(AGENT_ROW))
 
 
 # =====================================================================================
@@ -127,8 +153,12 @@ class RecoverHandleTests(_Base):
         # not_listed: the authority ANSWERED and holds no handle.
         self.assertEqual(self.adapter.recover_handle("intent-none")["handle_recovery"],
                          "not_listed")
-        # listing_verified: a durable digest proved it, so a handle is returned.
+        # listing_verified: the journal NAMES the candidate and two LIVE authorities prove
+        # it -- the tty-scoped process table holds the recorded pid in the recorded group,
+        # and the child's own spawn record names the same pid and argv digest
+        # (consolidated review finding 8: the journal alone never verifies itself).
         self.journal.append(event())
+        write_spawn_record(self.base)
         verified = self.adapter.recover_handle("intent-1")
         self.assertEqual(verified["handle_recovery"], "listing_verified")
         self.assertEqual(verified["handle"], "pty-1")
@@ -140,6 +170,43 @@ class RecoverHandleTests(_Base):
                           "a candidate must not be actionable; it exists so an abandon "
                           "report can NAME the resource")
         self.assertEqual(candidate["candidate"], "pty-1")
+
+    def test_recover_handle_detects_a_pty_lost_after_a_supervisor_crash(self) -> None:
+        """Finding 8.  The same journal, the process GONE: never `listing_verified`.
+
+        Before the fix the "verified" digest and the candidate digest were both read from
+        the journal, so this case -- the pty and its process lost after a supervisor crash
+        -- was reported `listing_verified` with an actionable handle.
+        """
+        self.journal.append(event())
+        write_spawn_record(self.base)
+        gone = StandaloneAdapter(
+            None, runtime_state=self.ledger, settlement_journal=self.journal,
+            artifact_base=self.base, run_id="run_1", table_reader=live_table())
+        lost = gone.recover_handle("intent-1")
+        self.assertEqual(lost["handle_recovery"], "not_listed")
+        self.assertIsNone(lost["handle"])
+        # An UNREADABLE table is unknown, never verified: a candidate, not a handle.
+        blind = StandaloneAdapter(
+            None, runtime_state=self.ledger, settlement_journal=self.journal,
+            artifact_base=self.base, run_id="run_1",
+            table_reader=live_table(readable=False))
+        unknown = blind.recover_handle("intent-1")
+        self.assertEqual(unknown["handle_recovery"], "listing_candidate")
+        self.assertIsNone(unknown["handle"])
+        # A pid recycled onto the tty in ANOTHER process group is not our resource.
+        recycled = StandaloneAdapter(
+            None, runtime_state=self.ledger, settlement_journal=self.journal,
+            artifact_base=self.base, run_id="run_1",
+            table_reader=live_table({**AGENT_ROW, "pgid": 99}))
+        self.assertEqual(recycled.recover_handle("intent-1")["handle_recovery"],
+                         "not_listed")
+        # A live process whose child-written spawn record CONTRADICTS the journal's digest
+        # is present but not proven ours.
+        write_spawn_record(self.base, argv_digest="digest-OTHER")
+        contradicted = self.adapter.recover_handle("intent-1")
+        self.assertEqual(contradicted["handle_recovery"], "unverified")
+        self.assertIsNone(contradicted["handle"])
 
     def test_recover_handle_raises_when_unreadable(self) -> None:
         self.journal.append(event())
@@ -166,6 +233,7 @@ class RecoverHandleTests(_Base):
     def test_disposition_record_candidate_address(self) -> None:
         """Row 18: called OUTSIDE the graph; the caller turns any exception into ``""``."""
         self.journal.append(event())
+        write_spawn_record(self.base)
         address = self.adapter.recover_handle("intent-1").get("handle") or ""
         self.assertEqual(address, "pty-1")
         self.journal.path.write_text("{corrupt\n")

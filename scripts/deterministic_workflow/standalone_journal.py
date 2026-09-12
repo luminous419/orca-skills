@@ -48,6 +48,7 @@ from pathlib import Path
 from typing import Any, Iterator, TypedDict
 
 from .contracts import OwnershipAxes, SettlementEvent, validate_axes
+from .standalone_lifecycle import execution_outcome_of, workflow_verdict_of
 
 #: The six record kinds.  **There is no CLAIMED.**  Every one of these describes something
 #: that was OBSERVED; none of them confers permission.
@@ -205,11 +206,14 @@ class ExecutionJournal:
         if not self.path.exists():
             return ()
         try:
-            raw = self.path.read_text()
+            raw = self.path.read_bytes()
         except OSError as exc:
             raise JournalUnreadable(f"{self.path}: {exc}") from exc
+        complete, torn = self._split_torn_tail(raw)
+        self.torn_tail_bytes = len(torn)
         out: list[JournalRecord] = []
-        for number, line in enumerate(raw.splitlines(), start=1):
+        for number, line in enumerate(complete.decode("utf-8", "replace").splitlines(),
+                                      start=1):
             if not line.strip():
                 continue
             try:
@@ -225,6 +229,40 @@ class ExecutionJournal:
                     "unreadable, which is not the same as empty")
             out.append(record)  # type: ignore[arg-type]
         return tuple(sorted(out, key=lambda r: r["seq"]))
+
+    #: Bytes of an unterminated, unparsable trailing line the last read found -- the
+    #: residue of an append the writer never completed.  Reported, never hidden.
+    torn_tail_bytes: int = 0
+
+    @staticmethod
+    def _split_torn_tail(raw: bytes) -> tuple[bytes, bytes]:
+        """``(complete lines, torn tail)``.  Consolidated review finding 17.
+
+        Every append writes ``line + "\n"`` inside one lock and returns only after
+        ``fsync``, so a well-formed journal ALWAYS ends in a newline.  A final line with no
+        newline is therefore the residue of an append that was cut off -- a crash between
+        `write` and `fsync` -- and it is a different fact from digest tampering: no record
+        was ever confirmed written, so no record is missing.  Treating it as tampering made
+        the whole journal permanently unreadable and blocked settlement, pause,
+        rediscovery and the watchdog sweep on a run that had merely crashed mid-append.
+
+        The rule is deliberately NARROW: only an UNTERMINATED final line that does NOT
+        parse as a complete, digest-verified record is torn.  A newline-terminated line
+        that fails is still tampering and still raises; an unterminated line that parses
+        and verifies is a whole record whose newline alone did not land, and it is kept.
+        """
+        if not raw or raw.endswith(b"\n"):
+            return raw, b""
+        head, _, tail = raw.rpartition(b"\n")
+        complete = head + b"\n" if head else b""
+        try:
+            record = json.loads(tail.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return complete, tail
+        if isinstance(record, dict) and "digest" in record \
+                and record_digest(record) == record["digest"]:
+            return raw, b""
+        return complete, tail
 
     def rows_for(self, intent_id: str) -> tuple[JournalRecord, ...]:
         return tuple(row for row in self.rows() if row["intent_id"] == intent_id)
@@ -242,8 +280,16 @@ class ExecutionJournal:
 
     # -- append --------------------------------------------------------------------------
     def append(self, record: Mapping[str, Any]) -> JournalRecord:
-        """Append one record.  ``open(a)`` + one ``write`` + ``flush`` + ``fsync``."""
+        """Append one record.  ``open(a)`` + one ``write`` + ``flush`` + ``fsync``.
+
+        A torn tail left by an earlier, never-completed append (finding 17) is retired
+        under the SAME lock before the new line is written, so the new record starts on a
+        line of its own.  What is removed was never a record: it is unterminated and does
+        not parse, and the writer that produced it never returned success for it.  A whole
+        record that merely lacks its newline is terminated, not removed.
+        """
         with self._append_lock():
+            self._retire_torn_tail()
             body = dict(record)
             body["seq"] = self._next_seq()
             body["writer"] = body.get("writer") or self.writer
@@ -264,6 +310,25 @@ class ExecutionJournal:
                 handle.flush()
                 os.fsync(handle.fileno())
             return complete
+
+    def _retire_torn_tail(self) -> None:
+        if not self.path.exists():
+            return
+        try:
+            raw = self.path.read_bytes()
+        except OSError as exc:
+            raise JournalUnreadable(f"{self.path}: {exc}") from exc
+        if not raw or raw.endswith(b"\n"):
+            return
+        complete, torn = self._split_torn_tail(raw)
+        with open(self.path, "r+b") as handle:
+            if torn:
+                handle.truncate(len(complete))
+            else:
+                handle.seek(0, os.SEEK_END)
+                handle.write(b"\n")
+            handle.flush()
+            os.fsync(handle.fileno())
 
     # -- D4.3a the ATOMIC delivery intent: append + fsync BEFORE the fork ----------------
     class IntentNotDurable(RuntimeError):
@@ -538,15 +603,39 @@ class ExecutionJournal:
 
 
 def _contradicts(settled: Mapping[str, Any], record: Mapping[str, Any]) -> bool:
-    stored = settled.get("outcome") if isinstance(settled, Mapping) else None
-    incoming = record.get("source_vocabulary", {}).get("outcome") or record.get("outcome")
-    if not stored or not incoming:
+    """Whether an incoming settlement report contradicts what the ledger already settled.
+
+    **Each axis is compared against ITSELF** (consolidated review finding 4).  The ledger
+    holds a `SettlementEvent`, whose `outcome` is the frozen TRANSPORT vocabulary and is
+    `SUCCEEDED` for every delivered settlement -- a typed FAILED settlement included.  The
+    journal row's `outcome` is the EXECUTION vocabulary (`succeeded`/`failed`): whether the
+    agent turn passed the profile's predicate.  Comparing the one against the other refused
+    every legitimate failed re-admission as `SETTLEMENT_CONFLICT` and admitted a
+    contradictory succeeded row without a murmur.
+
+    So the ledger's execution outcome is DERIVED from the settled event's own result --
+    `execution_outcome_of`, the reverse of the one function that writes a failed result --
+    and compared with the row's execution outcome; and the workflow verdict (`status` /
+    `result`) is compared with the verdict inside the row's own event, when it carries one.
+    The frozen event contract is not touched.
+    """
+    if not isinstance(settled, Mapping):
         return False
-    return str(stored).upper() not in (str(incoming).upper(),
-                                       _NORMALISED.get(str(incoming).lower(), ""))
-
-
-_NORMALISED = {"succeeded": "SUCCEEDED", "failed": "FAILED"}
+    stored_result = settled.get("result")
+    incoming = str(record.get("source_vocabulary", {}).get("outcome")
+                   or record.get("outcome") or "").lower()
+    if incoming:
+        stored_execution = execution_outcome_of(stored_result)
+        if stored_execution and incoming != stored_execution:
+            return True
+    incoming_event = (record.get("source_vocabulary") or {}).get("event")
+    if isinstance(incoming_event, Mapping) and isinstance(stored_result, Mapping):
+        stored_verdict = workflow_verdict_of(stored_result)
+        offered_verdict = workflow_verdict_of(incoming_event.get("result"))
+        if (stored_verdict[0] and offered_verdict[0]
+                and stored_verdict != offered_verdict):
+            return True
+    return False
 
 
 def _receipt_external_id(runtime_state: Any, intent_id: str) -> str:

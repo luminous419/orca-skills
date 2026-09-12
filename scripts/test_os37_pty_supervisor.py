@@ -549,9 +549,16 @@ class InterruptLadderTests(unittest.TestCase):
             "intent-1", "stop", record=record(), profile=profile(),
             table_reader=reader, supervisor_pid=999, killpg=spy.send_group,
             kill=spy.send_one, sleep=lambda s: None)
-        self.assertEqual(result["interrupt_outcome"], "not_owned")
+        # Consolidated review finding 11.  Rung 1 DELIVERED a SIGTERM, so the cancelled
+        # escalation is `exit_unproven` -- something happened and its outcome is unknown
+        # -- and never `not_owned`, which means "no signal sent, no edge taken" and which
+        # `lifecycle_for` maps to NO transition.  This test used to assert `not_owned`.
+        self.assertEqual(result["interrupt_outcome"], "exit_unproven")
+        self.assertEqual(interrupt_mod.lifecycle_for(result["interrupt_outcome"]),
+                         {"state": "LOST", "lost_reason": "stop_unverified"})
         self.assertEqual([sig for _p, sig in spy.killpg], [15],
                          "SIGKILL reached a recycled pid")
+        self.assertIn("escalation cancelled", result["ladder"][-1]["detail"])
 
     def test_an_unproven_exit_is_lost_never_terminated(self) -> None:
         spy = SignalSpy()
