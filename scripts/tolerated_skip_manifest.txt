@@ -18,6 +18,17 @@
 # platform-gated tests resolve to NOTHING and must RUN -- if one of them skips, the lane
 # fails. On Linux they must skip. Neither host gets the weaker contract.
 #
+# OS-37 adds 26 `always` entries:
+#   9 in test_os37_cli_preconditions, 7 in test_os37_per_driver_matrix, 7 in test_os37_r10_workflow_e2e, 3 in test_os37_standalone_e2e.
+# All are opt-in live-runtime suites gated on an env var no CI runner sets: the live
+# per-CLI checks need a real agent CLI installed, the standalone E2E spawns real local
+# processes, and the R10 workflow E2E drives its cases through the real `run_workflow.py`
+# with `orca` removed from PATH.  AC-37-24 requires a check that cannot run to be recorded
+# as "not established" rather than as a pass, which is what a declared skip is;
+# docs/conformance/OS37_CONFORMANCE.md records all of them.  The counts above are DERIVED
+# by the generator from the entries below at generation time, never typed by hand
+# (consolidated review finding 19).
+#
 # Deliberately absent, so they fail the lane if they ever occur: the git-availability skips
 # in the retained-report whitespace gate. If that gate stops running because git is missing
 # or the checkout is shallow, CI must go red, not quietly tolerate it.
@@ -26,13 +37,39 @@
 #   'no_sandbox_exec' observed by loading the suite under a simulated environment
 #   and reading the same __unittest_skip_why__ attributes TestCase.run consults.
 #
-# -- always (6) --
+# -- always (32) --
 always	test_orca_runtime.FinalReviewRuntimeIntegrationTests.test_final_review_terminal_freshness	requires --orca-runtime and a ready Orca runtime
 always	test_orca_runtime.OrcaRuntimeIntegrationTests.test_runtime_scenarios	requires --orca-runtime and a ready Orca runtime
 always	test_orca_runtime.QualityProfileRuntimeIntegrationTests.test_every_dispatch_of_the_run_carries_the_quality_gate	requires --orca-runtime and a ready Orca runtime
 always	test_orca_runtime.QualityProfileRuntimeIntegrationTests.test_quality_profile_phase_filtering	requires --orca-runtime and a ready Orca runtime
 always	test_orca_runtime.RiskRuntimeIntegrationTests.test_risk_conditional_phase_graph	requires --orca-runtime and a ready Orca runtime
 always	test_orca_runtime.SessionReuseRuntimeIntegrationTests.test_session_reuse_terminal_accounting	requires --orca-runtime and a ready Orca runtime
+always	test_os37_cli_preconditions.LiveCliTests.test_neither_real_cli_emits_a_record_before_its_prompt_is_delivered	requires ORCA_OS37_LIVE_CLI=1 and a real agent CLI on this host
+always	test_os37_cli_preconditions.LiveCliTests.test_the_adopted_identity_is_externally_re_verifiable	requires ORCA_OS37_LIVE_CLI=1 and a real agent CLI on this host
+always	test_os37_cli_preconditions.LiveCliTests.test_the_claude_argv_carries_every_flag_the_real_cli_requires	requires ORCA_OS37_LIVE_CLI=1 and a real agent CLI on this host
+always	test_os37_cli_preconditions.LiveCliTests.test_the_codex_argv_declares_no_forged_identity_channel	requires ORCA_OS37_LIVE_CLI=1 and a real agent CLI on this host
+always	test_os37_cli_preconditions.LiveCliTests.test_the_composed_claude_argv_is_accepted_by_the_real_cli_and_binds_r_b	requires ORCA_OS37_LIVE_CLI=1 and a real agent CLI on this host
+always	test_os37_cli_preconditions.LiveCliTests.test_the_installed_binaries_report_a_parsable_version	requires ORCA_OS37_LIVE_CLI=1 and a real agent CLI on this host
+always	test_os37_cli_preconditions.LiveCliTests.test_the_minted_session_id_is_a_uuid_as_the_design_specifies	requires ORCA_OS37_LIVE_CLI=1 and a real agent CLI on this host
+always	test_os37_cli_preconditions.LiveCliTests.test_the_production_claude_argv_reaches_a_real_delivery_proof	requires ORCA_OS37_LIVE_CLI=1 and a real agent CLI on this host
+always	test_os37_cli_preconditions.LiveCliTests.test_the_production_codex_argv_reaches_a_real_delivery_proof	requires ORCA_OS37_LIVE_CLI=1 and a real agent CLI on this host
+always	test_os37_per_driver_matrix.LivePerDriverOutcomeMatrixTests.test_live_a_sigkilled_process_group_is_lost_and_never_completed	requires ORCA_OS37_E2E=1; the standalone E2E drives real local processes
+always	test_os37_per_driver_matrix.LivePerDriverOutcomeMatrixTests.test_live_completion_needs_both_gates_for_both_drivers	requires ORCA_OS37_E2E=1; the standalone E2E drives real local processes
+always	test_os37_per_driver_matrix.LivePerDriverOutcomeMatrixTests.test_live_delivery_is_confirmed_for_both_drivers	requires ORCA_OS37_E2E=1; the standalone E2E drives real local processes
+always	test_os37_per_driver_matrix.LivePerDriverOutcomeMatrixTests.test_live_failure_comes_from_a_real_nonzero_exit_for_both_drivers	requires ORCA_OS37_E2E=1; the standalone E2E drives real local processes
+always	test_os37_per_driver_matrix.LivePerDriverOutcomeMatrixTests.test_live_interruption_is_proven_for_both_drivers	requires ORCA_OS37_E2E=1; the standalone E2E drives real local processes
+always	test_os37_per_driver_matrix.LivePerDriverOutcomeMatrixTests.test_live_lost_for_both_drivers_when_the_exit_cannot_be_classified	requires ORCA_OS37_E2E=1; the standalone E2E drives real local processes
+always	test_os37_per_driver_matrix.LivePerDriverOutcomeMatrixTests.test_live_timeout_for_both_drivers_is_timed_out_not_a_negative_fact	requires ORCA_OS37_E2E=1; the standalone E2E drives real local processes
+always	test_os37_r10_workflow_e2e.R10WorkflowE2ETests.test_every_dispatch_walked_the_whole_lifecycle_in_order	requires ORCA_OS37_E2E=1; the R10 workflow E2E drives real local agent processes
+always	test_os37_r10_workflow_e2e.R10WorkflowE2ETests.test_orca_was_not_resolvable_in_the_run	requires ORCA_OS37_E2E=1; the R10 workflow E2E drives real local agent processes
+always	test_os37_r10_workflow_e2e.R10WorkflowE2ETests.test_the_agent_binary_was_a_real_native_executable	requires ORCA_OS37_E2E=1; the R10 workflow E2E drives real local agent processes
+always	test_os37_r10_workflow_e2e.R10WorkflowE2ETests.test_the_loop_really_was_worker_reviewer_correction_final_review	requires ORCA_OS37_E2E=1; the R10 workflow E2E drives real local agent processes
+always	test_os37_r10_workflow_e2e.R10WorkflowE2ETests.test_the_readiness_quorum_closed_on_all_three_legs_every_time	requires ORCA_OS37_E2E=1; the R10 workflow E2E drives real local agent processes
+always	test_os37_r10_workflow_e2e.R10WorkflowE2ETests.test_the_run_is_requeryable_from_a_stranger_process	requires ORCA_OS37_E2E=1; the R10 workflow E2E drives real local agent processes
+always	test_os37_r10_workflow_e2e.R10WorkflowE2ETests.test_the_workflow_reached_completed	requires ORCA_OS37_E2E=1; the R10 workflow E2E drives real local agent processes
+always	test_os37_standalone_e2e.R10RealAgentEvidenceTests.test_the_recorded_evidence_is_not_fixture_sourced	requires ORCA_OS37_E2E=1; the standalone E2E drives real local processes
+always	test_os37_standalone_e2e.R10RealAgentEvidenceTests.test_the_retained_evidence_was_re_read_by_a_stranger_interpreter	requires ORCA_OS37_E2E=1; the standalone E2E drives real local processes
+always	test_os37_standalone_e2e.StandaloneE2ETests.test_real_runtime_smoke	requires ORCA_OS37_E2E=1; the standalone E2E drives real local processes
 # -- not_darwin (21) --
 not_darwin	test_review_isolation.BoundaryEnumerationTests.test_an_unexplained_boundary_is_a_hard_failure	the seatbelt backend is darwin-only; T-8.9 carries the fail-closed guarantee on every other platform
 not_darwin	test_review_isolation.BoundaryEnumerationTests.test_system_volumes_is_carved_out_whether_or_not_the_walk_finds_it	the seatbelt backend is darwin-only; T-8.9 carries the fail-closed guarantee on every other platform

@@ -49,14 +49,16 @@ other's condition, which is what makes running both of them evidence.
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import os
 import re
 import subprocess
 import sys
 import unittest
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
+from typing import Any, NamedTuple
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 REQUIREMENTS = REPO_ROOT / "requirements-langgraph.txt"
@@ -118,6 +120,17 @@ TOLERATED_MANIFEST_HEADER = """\
 # how unittest resolves stacked gates (the outermost decorator's reason wins). On macOS the
 # platform-gated tests resolve to NOTHING and must RUN -- if one of them skips, the lane
 # fails. On Linux they must skip. Neither host gets the weaker contract.
+#
+# OS-37 adds {os37_always} `always` entries:
+#   {os37_breakdown}.
+# All are opt-in live-runtime suites gated on an env var no CI runner sets: the live
+# per-CLI checks need a real agent CLI installed, the standalone E2E spawns real local
+# processes, and the R10 workflow E2E drives its cases through the real `run_workflow.py`
+# with `orca` removed from PATH.  AC-37-24 requires a check that cannot run to be recorded
+# as "not established" rather than as a pass, which is what a declared skip is;
+# docs/conformance/OS37_CONFORMANCE.md records all of them.  The counts above are DERIVED
+# by the generator from the entries below at generation time, never typed by hand
+# (consolidated review finding 19).
 #
 # Deliberately absent, so they fail the lane if they ever occur: the git-availability skips
 # in the retained-report whitespace gate. If that gate stops running because git is missing
@@ -231,6 +244,179 @@ def load_tolerated_alternatives(
                 f"expected one of {sorted(CONDITIONS)}")
         alternatives.setdefault(test_id, []).append((condition, reason))
     return alternatives
+
+
+# ---- OS-37 external review #12: the manifest is bound to the DECLARED TEST -------------
+# The anti-drift check used to accept "this module contains the reason string somewhere AND
+# this module contains a `skipUnless(` or `skipIf(` somewhere". Both halves are module-wide,
+# so an entry could name `Foo.test_bar` while the reason lived in an unrelated docstring and
+# the decorator guarded an unrelated class -- manifest and gate drifted apart with the check
+# still green. What follows resolves the guards that actually apply to ONE test id, so an
+# entry can only pass by naming a test that really is guarded with that reason.
+#
+# It reads the source with `ast` rather than importing the module: importing would execute
+# module-level gates (and, for the live suites, probe the host), and the question here is a
+# static one about what the source declares.
+_SKIP_CALLS = ("skipUnless", "skipIf")
+
+#: One resolved guard: the text to show an operator, and the matcher it binds with.
+SkipGuard = tuple[str, "re.Pattern[str]"]
+
+
+def _exact(value: str) -> SkipGuard:
+    return value, re.compile("^" + re.escape(value) + "$", re.DOTALL)
+
+
+def _joined_str_guard(node: Any) -> SkipGuard | None:
+    """An f-string reason as an anchored pattern, or ``None``.
+
+    `test_review_isolation`'s ``NEEDS_SANDBOX`` gate is spelled
+    ``f"{review_isolation.SANDBOX_EXEC} is not present on this host"``, so its reason has no
+    literal form in the source at all. Rather than resolve it by importing the module -- an
+    import that would run that module's own gates -- each interpolation becomes ``.+`` and
+    every literal segment is matched EXACTLY, in order, anchored at both ends. A hole may
+    not be empty, so the literal text still has to be right.
+    """
+    if not isinstance(node, ast.JoinedStr):
+        return None
+    display: list[str] = []
+    parts: list[str] = []
+    for value in node.values:
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            display.append(value.value)
+            parts.append(re.escape(value.value))
+        elif isinstance(value, ast.FormattedValue):
+            display.append("{...}")
+            parts.append(".+")
+        else:                                    # pragma: no cover - defensive
+            return None
+    return "".join(display), re.compile("^" + "".join(parts) + "$", re.DOTALL)
+
+
+def _guard_for(node: Any, constants: Mapping[str, str]) -> SkipGuard | None:
+    """The guard a decorator ARGUMENT denotes: a literal, a module constant, or an f-string."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return _exact(node.value)
+    if isinstance(node, ast.Name) and node.id in constants:
+        return _exact(constants[node.id])
+    if isinstance(node, ast.Attribute) and node.attr in constants:
+        return _exact(constants[node.attr])
+    return _joined_str_guard(node)
+
+
+def _skip_call_guard(node: Any, constants: Mapping[str, str]) -> SkipGuard | None:
+    """``unittest.skipUnless(cond, REASON)`` / ``skipIf(...)`` -> its guard, else ``None``."""
+    if not isinstance(node, ast.Call):
+        return None
+    name = node.func.attr if isinstance(node.func, ast.Attribute) else (
+        node.func.id if isinstance(node.func, ast.Name) else "")
+    if name not in _SKIP_CALLS or len(node.args) < 2:
+        return None
+    return _guard_for(node.args[1], constants)
+
+
+def _module_skip_constants(tree: Any) -> tuple[dict[str, str], dict[str, SkipGuard]]:
+    """``({NAME: string}, {ALIAS: guard})`` for one module.
+
+    The second map is what makes ``@DARWIN_ONLY`` resolvable: `test_review_isolation` builds
+    its gates as module-level decorator objects, so the reason never appears at the
+    decorated class at all.
+    """
+    constants: dict[str, str] = {}
+    for node in tree.body:
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and isinstance(node.value, ast.Constant)
+                and isinstance(node.value.value, str)):
+            constants[node.targets[0].id] = node.value.value
+    aliases: dict[str, SkipGuard] = {}
+    for node in tree.body:
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)):
+            guard = _skip_call_guard(node.value, constants)
+            if guard is not None:
+                aliases[node.targets[0].id] = guard
+    return constants, aliases
+
+
+def _decorator_guards(decorators: Sequence[Any], constants: Mapping[str, str],
+                      aliases: Mapping[str, SkipGuard]) -> list[SkipGuard]:
+    found: list[SkipGuard] = []
+    for decorator in decorators:
+        guard = _skip_call_guard(decorator, constants)
+        if guard is not None:
+            found.append(guard)
+        elif isinstance(decorator, ast.Name) and decorator.id in aliases:
+            found.append(aliases[decorator.id])
+        elif isinstance(decorator, ast.Attribute) and decorator.attr in aliases:
+            found.append(aliases[decorator.attr])
+    return found
+
+
+def _skip_test_guards(body: Sequence[Any], constants: Mapping[str, str]) -> list[SkipGuard]:
+    """Every reason a ``self.skipTest(...)`` inside ``body`` can raise."""
+    found: list[SkipGuard] = []
+    for node in body:
+        for child in ast.walk(node):
+            if not isinstance(child, ast.Call) or not isinstance(child.func, ast.Attribute):
+                continue
+            if child.func.attr != "skipTest" or not child.args:
+                continue
+            guard = _guard_for(child.args[0], constants)
+            if guard is not None:
+                found.append(guard)
+    return found
+
+
+def skip_guards_for(module_path: Path, class_name: str, method_name: str) -> list[SkipGuard]:
+    """Every skip a single test id can raise, resolved from the source alone.
+
+    The union of four sources, and no fifth:
+
+    1. a ``skipUnless``/``skipIf`` decorator on the METHOD;
+    2. the same on the METHOD'S OWN CLASS, including a module-level decorator alias;
+    3. a ``self.skipTest("...")`` inside the method;
+    4. a ``self.skipTest("...")`` inside the class's ``setUp`` or a NON-test helper of the
+       same class -- `test_orca_runtime` and the OS-37 live suites both gate through one,
+       and a gate is no less real for having a name.
+
+    Another TEST'S ``skipTest`` is never a guard on this one, which is exactly the binding
+    the module-wide check lacked. A class the module does not define yields ``[]``, so a
+    manifest entry naming a test that no longer exists fails rather than passing vacuously.
+    """
+    tree = ast.parse(module_path.read_text(encoding="utf-8"), filename=str(module_path))
+    constants, aliases = _module_skip_constants(tree)
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef) or node.name != class_name:
+            continue
+        guards = _decorator_guards(node.decorator_list, constants, aliases)
+        method = next((item for item in node.body
+                       if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+                       and item.name == method_name), None)
+        if method is None:
+            # FAIL-CLOSED, and this is the binding's whole point: a manifest entry naming a
+            # method this class does not define must not inherit its class's gate and pass.
+            # A renamed or deleted test is exactly the drift this check exists to catch.
+            return []
+        guards += _decorator_guards(method.decorator_list, constants, aliases)
+        guards += _skip_test_guards(method.body, constants)
+        for item in node.body:
+            if (isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and item.name != method_name and not item.name.startswith("test_")):
+                guards += _skip_test_guards(item.body, constants)
+        return guards
+    return []
+
+
+def skip_guard_binds(test_id: str, reason: str, *, root: Path | None = None) -> bool:
+    """Whether the DECLARED test really is guarded by a skip carrying ``reason``."""
+    module, _, rest = test_id.partition(".")
+    class_name, _, method_name = rest.partition(".")
+    path = (root or REPO_ROOT / "scripts") / f"{module}.py"
+    if not path.exists():
+        return False
+    return any(pattern.match(reason)
+               for _display, pattern in skip_guards_for(path, class_name, method_name))
 
 
 def expected_tolerated_skips(
@@ -638,13 +824,16 @@ if platform != sys.platform:
     except ImportError:
         pass
     sys.platform = platform
-if not sandbox_present:
-    _real_exists = Path.exists
+# Symmetric on purpose: the sandbox binary is made to look PRESENT as readily as absent, so
+# that the "no condition holds" environment can be observed from a host that lacks it.
+_real_exists = Path.exists
 
-    def _patched_exists(self):
-        return False if str(self) == sandbox_exec else _real_exists(self)
 
-    Path.exists = _patched_exists
+def _patched_exists(self):
+    return sandbox_present if str(self) == sandbox_exec else _real_exists(self)
+
+
+Path.exists = _patched_exists
 
 suite = unittest.TestLoader().discover(start_dir="scripts", pattern="test_*.py")
 
@@ -717,13 +906,164 @@ def observe_declared_skips(*, platform: str, sandbox_present: bool) -> list[tupl
     return [(test_id, why) for test_id, why in observed if not is_langgraph_skip(why)]
 
 
+# ---- OS-37 correction iteration 6: the gates the SOURCE declares, held to the manifest --
+# CI on 423bcb7 failed the absent lane with 30 LangGraph skips the manifest did not declare,
+# from two modules whose gated classes had been added without regenerating it. Nothing
+# local had been able to see that. The absent lane refuses to run on a host that has
+# langgraph, and in the present lane `skipUnless(True, ...)` hands the class back untouched
+# -- the gate leaves no attribute to read -- so a green present lane, and a green
+# `test_ci_lanes`, said nothing about whether the manifest was complete.
+#
+# This probe makes the gate visible from EITHER lane. It loads the suite in a child whose
+# import system refuses `langgraph`, so every import-time `_langgraph_ok()` evaluates False
+# and every `skipUnless` gate sets the same `__unittest_skip__` / `__unittest_skip_why__`
+# attributes `TestCase.run` consults -- on the class it decorates and, through inheritance,
+# on every fixture subclass in every module, which is the binding the AST walk in
+# `skip_guards_for` cannot follow across modules. The set it reports is the set the absent
+# lane would skip at LOAD time, observed without being in that lane. No test body executes.
+#
+# Stated rather than implied: a gate raised at RUN time -- `self.skipTest(...)` after an
+# ImportError inside the test body -- leaves no attribute and is invisible here. Such a test
+# is reported only as COLLECTED, which is all the probe can honestly say about it; the
+# absent lane's identity check still holds it, and `test_ci_lanes` names each one so that a
+# second is a decision rather than drift.
+_LANGGRAPH_REFUSED_PROBE = r'''
+import json, sys, unittest
+
+
+class _RefuseLangGraph:
+    """A finder ahead of every other: in this child, `langgraph` does not exist."""
+
+    def find_spec(self, name, path=None, target=None):
+        if name.split(".")[0] == "langgraph":
+            raise ModuleNotFoundError("langgraph is refused in this probe", name=name)
+        return None
+
+
+sys.meta_path.insert(0, _RefuseLangGraph())
+sys.path.insert(0, ".")
+suite = unittest.TestLoader().discover(start_dir="scripts", pattern="test_*.py")
+assert "langgraph" not in sys.modules, "the refusal did not hold"
+
+
+def walk(item):
+    if isinstance(item, unittest.TestSuite):
+        for child in item:
+            yield from walk(child)
+    else:
+        yield item
+
+
+collected, declared, unimportable = [], [], []
+for test in walk(suite):
+    if isinstance(test, unittest.loader._FailedTest):
+        unimportable.append(test.id())
+        continue
+    collected.append(test.id())
+    method = getattr(test, test._testMethodName, None)
+    if (getattr(test.__class__, "__unittest_skip__", False)
+            or getattr(method, "__unittest_skip__", False)):
+        why = (getattr(test.__class__, "__unittest_skip_why__", "")
+               or getattr(method, "__unittest_skip_why__", ""))
+        declared.append([test.id(), why])
+
+print("PROBE_JSON " + json.dumps({"collected": sorted(collected),
+                                  "declared": sorted(declared),
+                                  "unimportable": sorted(unimportable)}))
+'''
+
+
+class LangGraphGateProbe(NamedTuple):
+    """What the suite declares when `langgraph` is refused at import: the OBSERVATION."""
+
+    #: Every test id the loader collected -- the ids the lanes run.
+    collected: frozenset[str]
+    #: `{test id: reason}` for every test declared skipped at load time, for ANY reason.
+    declared: dict[str, str]
+    #: Modules the loader could not import with `langgraph` refused; the absent lane would
+    #: ERROR on these rather than skip, so they are a defect in their own right.
+    unimportable: tuple[str, ...]
+
+    @property
+    def langgraph_gated(self) -> frozenset[str]:
+        return frozenset(test_id for test_id, why in self.declared.items()
+                         if is_langgraph_skip(why))
+
+
+def observe_declared_langgraph_gates() -> LangGraphGateProbe:
+    """Load the suite with `langgraph` refused and read what declares itself skipped.
+
+    A SUBPROCESS, for the same reason as the platform probe: the import refusal must not
+    leak into the interpreter that judges the result.
+    """
+    completed = subprocess.run(
+        [sys.executable, "-c", _LANGGRAPH_REFUSED_PROBE],
+        cwd=str(REPO_ROOT), capture_output=True, text=True, check=False)
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"langgraph-refused probe failed: {completed.stderr.strip()}")
+    for line in completed.stdout.splitlines():
+        if line.startswith("PROBE_JSON "):
+            payload = json.loads(line[len("PROBE_JSON "):])
+            return LangGraphGateProbe(
+                collected=frozenset(payload["collected"]),
+                declared={test_id: why for test_id, why in payload["declared"]},
+                unimportable=tuple(payload["unimportable"]))
+    raise RuntimeError(f"langgraph-refused probe printed no result: {completed.stdout!r}")
+
+
+def check_declared_langgraph_gates(probe: LangGraphGateProbe,
+                                   expected: frozenset[str] | None = None) -> list[str]:
+    """Hold the manifest to the gates the source declares. Runs in BOTH lanes.
+
+    Three problems, each the present-lane-visible form of something only the absent lane
+    used to be able to say:
+
+    * a test DECLARES a LangGraph gate the manifest does not list -- the absent lane's
+      `unexpected`, which is exactly the 423bcb7 failure, now visible from a host that has
+      langgraph installed;
+    * a test module cannot be IMPORTED without langgraph -- the absent lane's ERROR;
+    * a manifest entry names a test the suite no longer COLLECTS -- the present lane's
+      `never_ran`, without needing to run anything.
+    """
+    if expected is None:
+        expected = load_expected_langgraph_skips()
+    problems: list[str] = []
+    if probe.unimportable:
+        problems.append(
+            f"{len(probe.unimportable)} test module(s) cannot be imported without "
+            "langgraph, so the dependency-absent lane would ERROR on them rather than "
+            "skip: "
+            + _sample(sorted(probe.unimportable)))
+    undeclared = probe.langgraph_gated - expected
+    if undeclared:
+        problems.append(
+            f"{len(undeclared)} test(s) declare a LangGraph gate that "
+            f"{LANGGRAPH_SKIP_MANIFEST.name} does not list. The dependency-absent lane "
+            "will fail on them as 'unexpected', and coverage has left that lane without "
+            "anyone deciding it should: " + _sample(sorted(undeclared))
+            + " -- regenerate the manifest from an environment WITHOUT langgraph "
+              "(`ci_lane --lane absent write-manifest`) and read the diff")
+    uncollected = expected - probe.collected
+    if uncollected:
+        problems.append(
+            f"{len(uncollected)} entr(y/ies) in {LANGGRAPH_SKIP_MANIFEST.name} name a test "
+            "the suite no longer collects; it was deleted or renamed: "
+            + _sample(sorted(uncollected)) + " -- regenerate the manifest")
+    return problems
+
+
 def derive_tolerated_alternatives(
     observed_here: set[tuple[str, str]],
 ) -> dict[str, list[tuple[str, str]]]:
     """Build the full, multi-platform declaration -- never a one-host view.
 
-    Three observations, because one host cannot see the whole contract:
+    Four observations, because one host cannot see the whole contract:
 
+    * ``darwin`` + sandbox-exec present -- the environment in which NO platform condition
+      holds. Whatever still declares itself skipped there is gated on something the
+      platform conditions do not describe (an opt-in env var, for the live suites), and
+      that observation is what separates a platform gate from an unconditional one.
     * ``linux`` + no sandbox-exec -- every platform-gated test, each with the reason that
       WINS when both gates hold (the outermost decorator's, which is how `unittest`
       resolves it). These become the ``not_darwin`` alternatives.
@@ -736,14 +1076,32 @@ def derive_tolerated_alternatives(
     A test carrying both gates therefore gets TWO lines and stays exact on both platforms,
     which is the whole point: adding the 22 unconditionally would be green on Linux and red
     on macOS, and observing only this host would be the reverse.
+
+    Why the first observation is not optional (OS-37 final review, R6): a decorator-style
+    env-var gate such as ``@unittest.skipUnless(E2E_ENABLED, ...)`` is visible to the
+    load-time probe in EVERY simulated environment. Without the unconditional baseline the
+    two platform simulations agree on it, and agreement between them was read as "the
+    sandbox binary alone explains it" -- 26 opt-in live-suite tests came out as
+    ``no_sandbox_exec``, a file that expected 6 skips on a Mac instead of 32. A skip that
+    is ALSO present when no condition holds is explained by neither condition.
     """
+    unconditional_reasons = dict(
+        observe_declared_skips(platform="darwin", sandbox_present=True))
     linux_rows = observe_declared_skips(platform="linux", sandbox_present=False)
     darwin_rows = observe_declared_skips(platform="darwin", sandbox_present=False)
     darwin_reasons = dict(darwin_rows)
 
     alternatives: dict[str, list[tuple[str, str]]] = {}
     for test_id, reason in linux_rows:
+        if unconditional_reasons.get(test_id) == reason:
+            # Skips identically when no platform condition holds: not a platform gate.
+            # It reaches the manifest through the runtime observation below, as `always`.
+            continue
         sandbox_reason = darwin_reasons.get(test_id)
+        if sandbox_reason is not None and unconditional_reasons.get(test_id) == sandbox_reason:
+            # The darwin-no-sandbox simulation shows the same reason the unconditional
+            # environment does, so the missing binary is not what this arm records.
+            sandbox_reason = None
         if sandbox_reason == reason:
             # The sandbox binary alone explains it; there is no darwin-specific arm.
             alternatives.setdefault(test_id, []).append(("no_sandbox_exec", reason))
@@ -783,13 +1141,100 @@ def render_tolerated_manifest(alternatives: dict[str, list[tuple[str, str]]]) ->
             continue
         lines.append(f"# -- {condition} ({len(rows)}) --")
         lines.extend(f"{condition}\t{test_id}\t{reason}" for test_id, reason in rows)
-    return TOLERATED_MANIFEST_HEADER + "\n".join(lines) + "\n"
+    return tolerated_manifest_header(alternatives) + "\n".join(lines) + "\n"
+
+
+def tolerated_manifest_header(alternatives: dict[str, list[tuple[str, str]]]) -> str:
+    """The header with its OS-37 counts DERIVED from the entries (finding 19).
+
+    The checked-in header used to say "twenty-one" while the file it headed carried 26;
+    a number typed into prose drifts the moment an entry is added.  Every count here is
+    computed from the same `alternatives` the body is rendered from, so header and body
+    cannot disagree.
+    """
+    os37 = sorted(test_id for test_id, entries in alternatives.items()
+                  if test_id.startswith("test_os37_")
+                  and any(name == "always" for name, _reason in entries))
+    per_module: dict[str, int] = {}
+    for test_id in os37:
+        module = test_id.split(".", 1)[0]
+        per_module[module] = per_module.get(module, 0) + 1
+    breakdown = ", ".join(f"{count} in {module}" for module, count in sorted(per_module.items()))
+    return TOLERATED_MANIFEST_HEADER.format(os37_always=len(os37),
+                                            os37_breakdown=breakdown or "none")
+
+#: The decorators that ARE the platform gates, and the one module that declares them. The
+#: anti-drift check in `test_ci_lanes` reads these names out of the AST and holds the
+#: checked-in manifest to them; the writer below holds its OWN output to the same reading
+#: before it is allowed to become the checked-in manifest.
+PLATFORM_GATE_DECORATORS = {"DARWIN_ONLY": "not_darwin", "NEEDS_SANDBOX": "no_sandbox_exec"}
+PLATFORM_GATED_MODULE = "test_review_isolation"
+
+
+def declared_platform_gates(root: Path | None = None) -> dict[str, set[str]]:
+    """`{test id: {condition, ...}}` -- the platform gates the SOURCE declares, from the AST.
+
+    Independent of the observation model on purpose: it never loads the suite and never
+    reads a ``__unittest_skip__`` attribute. It is the reading `test_ci_lanes` applies to
+    the checked-in file, made available to the writer so that a derivation which disagrees
+    with the source is refused at generation time rather than discovered by the next test
+    run.
+    """
+    path = (root or REPO_ROOT) / "scripts" / f"{PLATFORM_GATED_MODULE}.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+
+    def conditions(decorators: Sequence[Any]) -> set[str]:
+        return {PLATFORM_GATE_DECORATORS[node.id] for node in decorators
+                if isinstance(node, ast.Name) and node.id in PLATFORM_GATE_DECORATORS}
+
+    gates: dict[str, set[str]] = {}
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef):
+            continue
+        class_conditions = conditions(node.decorator_list)
+        for member in node.body:
+            if isinstance(member, ast.FunctionDef) and member.name.startswith("test"):
+                found = class_conditions | conditions(member.decorator_list)
+                if found:
+                    gates[f"{PLATFORM_GATED_MODULE}.{node.name}.{member.name}"] = found
+    return gates
+
+
+def check_tolerated_derivation(
+    alternatives: dict[str, list[tuple[str, str]]],
+    gates: dict[str, set[str]] | None = None,
+) -> list[str]:
+    """The anti-drift invariant, applied to a DERIVED declaration before it is written.
+
+    Both directions of `ManifestMatchesTheDeclaredGatesTests`: every platform arm the
+    derivation emits must be a gate the source declares for that very test, and every gate
+    the source declares must have its arm. A derivation that fails this is not a manifest,
+    it is the observation model being wrong -- which is exactly what happened when the
+    simulated environments agreed on an env-var gate and 26 opt-in tests were emitted under
+    ``no_sandbox_exec`` (OS-37 final review, R6). The writer exits non-zero on it and
+    leaves the checked-in file alone.
+    """
+    declared = gates if gates is not None else declared_platform_gates()
+    problems: list[str] = []
+    for test_id in sorted(set(alternatives) | set(declared)):
+        emitted = {condition for condition, _ in alternatives.get(test_id, [])
+                   if condition != "always"}
+        expected = declared.get(test_id, set())
+        if emitted != expected:
+            problems.append(
+                f"TOLERATED_DERIVATION_DRIFT: the derivation expects {test_id} to skip "
+                f"under {sorted(emitted)}, but the source declares {sorted(expected)}")
+    return problems
+
 
 def write_manifest(lane: str, *, verbosity: int = 0) -> int:
     """Regenerate LANGGRAPH_SKIP_MANIFEST from a real dependency-absent run.
 
     Refuses to run in the present lane: there is nothing to record there, and writing an
     empty manifest would silently disarm every assertion that depends on it.
+
+    Nothing is written until BOTH files have been derived and validated: a refusal leaves
+    the checked-in pair exactly as it found them, never one regenerated and one stale.
     """
     if lane != LANE_ABSENT:
         print("CI_LANE_ERROR: write-manifest requires --lane absent; the manifest is the "
@@ -807,11 +1252,8 @@ def write_manifest(lane: str, *, verbosity: int = 0) -> int:
         print("CI_LANE_ERROR: nothing skipped for a langgraph reason; refusing to write "
               "an empty manifest", file=sys.stderr)
         return 1
-    LANGGRAPH_SKIP_MANIFEST.write_text(MANIFEST_HEADER + "\n".join(ids) + "\n",
-                                       encoding="utf-8")
-    print(f"wrote {len(ids)} test ids to {LANGGRAPH_SKIP_MANIFEST}")
 
-    # The other half of the contract, written from the same run so the two cannot be
+    # The other half of the contract, derived from the same run so the two cannot be
     # generated against different trees. An EMPTY tolerated set is legitimate -- it means
     # nothing outside the LangGraph gates skips -- so, unlike the manifest above, it is
     # written rather than refused.
@@ -831,6 +1273,23 @@ def write_manifest(lane: str, *, verbosity: int = 0) -> int:
               "if it were universal.", file=sys.stderr)
         return 1
 
+    # Fail closed (OS-37 final review, R6): the derivation is held to the gates the source
+    # declares BEFORE it may become the checked-in file. Exit 0 after emitting a manifest
+    # that the suite's own anti-drift test rejects is not success, it is drift with a
+    # green light; the refusal names every disagreeing entry and writes nothing.
+    drift = check_tolerated_derivation(alternatives)
+    if drift:
+        for problem in drift:
+            print(f"CI_LANE_ERROR: {problem}", file=sys.stderr)
+        print(f"CI_LANE_ERROR: TOLERATED_DERIVATION_DRIFT: refusing to write "
+              f"{TOLERATED_SKIP_MANIFEST.name} ({len(drift)} entries disagree with the "
+              f"gates {PLATFORM_GATED_MODULE}.py declares); neither manifest was written",
+              file=sys.stderr)
+        return 1
+
+    LANGGRAPH_SKIP_MANIFEST.write_text(MANIFEST_HEADER + "\n".join(ids) + "\n",
+                                       encoding="utf-8")
+    print(f"wrote {len(ids)} test ids to {LANGGRAPH_SKIP_MANIFEST}")
     TOLERATED_SKIP_MANIFEST.write_text(render_tolerated_manifest(alternatives),
                                        encoding="utf-8")
     print(f"wrote {sum(counts.values())} tolerated-skip declarations for "

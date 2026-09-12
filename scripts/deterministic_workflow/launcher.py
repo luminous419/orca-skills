@@ -18,11 +18,13 @@ here therefore sets the limit explicitly from :func:`default_recursion_limit`.
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import os
 import re
 import sys
 import tempfile
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -31,7 +33,8 @@ from .contracts import BASE_CAPABILITIES
 from .executor import IdempotencyRecoveryError, terminal_node
 from .runtime_state import (RuntimeStateConflict, resolve_runtime_state,
                             runtime_state_error_code)
-from .state import StateError, initial_state, normalize_malformed_state, validate_state
+from .state import (StateError, initial_state, normalize_malformed_state, typed_update,
+                    validate_state)
 
 # Terminal status -> process exit code.  Distinct non-zero codes let a caller tell a
 # quality/decision block apart from an exhausted iteration budget.
@@ -104,7 +107,27 @@ def default_recursion_limit(state: dict[str, Any]) -> int:
 
 
 def build_state(spec: dict[str, Any]) -> dict[str, Any]:
-    """Build a validated initial state from a small JSON launch specification."""
+    """Build a validated initial state from a small JSON launch specification.
+
+    ---- OS-37 correction R4: the DECLARED decision block ------------------------------
+    ``decision_state`` is optional and defaults to ``initial_state``'s own ``CLEAR``, so a
+    specification that does not name one produces byte-for-byte the state it produced
+    before.  Naming one matters because ``decision_state`` is written by NO graph node --
+    ``state.SET_DECISION`` is its only writer -- so a run launched from this CLI could
+    never carry the NEEDS_INPUT/CONFLICT the pause route reads, and the graph's PAUSE node
+    was therefore unreachable from the command line for EVERY adapter, not just standalone.
+    The approval port alone does not fix that; both halves are the R4 wiring.
+
+    It is a DECLARATION, not an authority, and it buys nothing on its own: PAUSE still
+    requires a real ``human_approval`` port, still reconstructs the dispatch set durably,
+    and still refuses ``PAUSE_NOT_ADMISSIBLE`` unless the approval authority can produce
+    blocked sources that authenticate against this run's real OS-29 ledger.  A declared
+    block with nothing behind it therefore reaches BLOCK, exactly as before.
+
+    The value is applied through the engine's OWN ``SET_DECISION`` command rather than
+    written into the mapping, so an unknown member is refused by ``state.py``'s rule and
+    this function cannot become a second, laxer definition of the decision vocabulary.
+    """
     if not isinstance(spec, dict):
         raise LauncherError("state specification must be a JSON object")
     phases = spec.get("phases") or list(CANONICAL_PHASES)
@@ -113,13 +136,469 @@ def build_state(spec: dict[str, Any]) -> dict[str, Any]:
     capabilities = spec.get("capabilities")
     capabilities = frozenset(capabilities) if capabilities else BASE_CAPABILITIES
     try:
-        return dict(initial_state(
+        state = dict(initial_state(
             run_id=spec.get("run_id", "run_launcher"),
             thread_id=spec.get("thread_id", "launcher"),
             phases=tuple(phases), capabilities=capabilities,
             risk=spec.get("risk", "high"), max_iterations=spec.get("max_iterations", 5)))
+        declared = spec.get("decision_state")
+        if declared is not None:
+            state = dict(validate_state(
+                {**state, **typed_update(
+                    "SET_DECISION", decision_state=declared,
+                    decision_reason_code=spec.get("decision_reason_code"))},
+                expected_thread_id=state["thread_id"]))
+        return state
     except (StateError, TypeError, ValueError, KeyError, IndexError) as exc:
         raise LauncherError(f"invalid state specification: {exc}") from exc
+
+
+def _standalone_journal_for(artifact_base: Any, run_id: str) -> Any:
+    """This run's standalone execution journal.  Adopts nothing and claims nothing."""
+    from .standalone_journal import ExecutionJournal
+    return ExecutionJournal(artifact_base, run_id)
+
+
+def _standalone_observation(artifact_base: Any, capabilities: Any) -> Any:
+    """The OS-37 standalone ``RunObservationPort``.  Invokes no Orca CLI."""
+    from .standalone_adapter import StandaloneRunObservation
+    return StandaloneRunObservation(
+        artifact_base,
+        journal_factory=lambda run_id: _standalone_journal_for(artifact_base, run_id),
+        capabilities=capabilities)
+
+
+def standalone_profile_path(artifact_base: Any, run_id: str) -> Path:
+    """Where a standalone run's DRIVER PROFILE is persisted, beside its journal.
+
+    Consolidated review finding 5.  A stalled standalone run is recovered by a DIFFERENT
+    process -- the Watchdog -- which has to rebuild the same runtime the launcher built,
+    and the runtime is the profile: binary, driver, selectors, timeouts, worktree.  The
+    profile is a committed configuration file that names secrets only by REFERENCE
+    (`auth_secret_ref` holds environment names, never values; `driver_env` is non-secret by
+    contract), so persisting it under the run root discloses nothing the operator's own
+    profile file does not.
+    """
+    from .standalone_journal import journal_path
+    return journal_path(artifact_base, run_id).with_name("profile.json")
+
+
+def persist_standalone_profile(artifact_base: Any, run_id: str,
+                               profile_spec: Mapping[str, Any]) -> Path:
+    """Write the profile spec durably (tmp + rename).
+
+    Two files, because a run may be composed more than once: `run_cli` composes ONE
+    adapter for ONE profile, but a caller driving the composition root per dispatch (the
+    R10 real-agent harness, a mixed Worker/Reviewer CLI pairing) composes several under
+    one run id.  Every distinct profile is kept, content-addressed, under
+    ``standalone/profiles/<digest>.json`` (write-once), and ``standalone/profile.json``
+    names the CURRENT composition -- the one a recovery re-enters with.
+    """
+    target = standalone_profile_path(artifact_base, run_id)
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    def _plain(value: Any) -> Any:
+        # A Python caller may hand over `dataclasses.asdict(profile)`, whose
+        # `graceful_hint` is bytes; the JSON door re-encodes a str hint with `.encode()`,
+        # so the round trip through the persisted file is exact for any UTF-8 hint.
+        if isinstance(value, bytes):
+            return value.decode("utf-8", "surrogateescape")
+        raise TypeError(f"the profile spec is not JSON-shaped: {type(value).__name__}")
+    payload = json.dumps(dict(profile_spec), sort_keys=True, indent=2, ensure_ascii=False,
+                         default=_plain)
+    import hashlib
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+    archive = target.parent / "profiles" / f"{digest}.json"
+    archive.parent.mkdir(parents=True, exist_ok=True)
+
+    def _write(path: Path) -> None:
+        _durable_write(path, payload + "\n")
+    if not archive.exists():
+        _write(archive)
+    current = None
+    if target.exists():
+        try:
+            current = target.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise LauncherError(
+                f"{STANDALONE_ADAPTER_REQUIRES_PROFILE}: the persisted profile at {target} "
+                f"is unreadable ({exc})") from exc
+    if current != payload + "\n":
+        _write(target)
+    return target
+
+
+def _durable_write(path: Path, text: str) -> None:
+    """``write`` -> ``fsync(file)`` -> ``rename`` -> ``fsync(dir)``.  Round 4, finding 8.
+
+    The directory fsync is the half that was missing: a rename is a directory entry
+    change, and until the directory's own metadata reaches stable storage a crash can
+    leave the run's effects and journal on disk with NO profile (or no authority record)
+    beside them -- exactly the file the Watchdog needs to rebuild the runtime.  The same
+    discipline `standalone_pty.write_spawn_record` already applies to the spawn record.
+    """
+    tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
+    with open(tmp, "w", encoding="utf-8") as handle:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+    _fsync_directory(path.parent)
+
+
+def _fsync_directory(directory: Path) -> None:
+    try:
+        dir_fd = os.open(str(directory), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(dir_fd)
+    except OSError:
+        pass
+    finally:
+        os.close(dir_fd)
+
+
+# ---- round 4, finding 2: the runtime-state AUTHORITY recorded by the original launch ----
+STANDALONE_AUTHORITY_SCHEMA = "os37.standalone_authority.v1"
+
+#: Follow-up review finding 5.  A run's recorded runtime-state authority is CREATE-ONCE
+#: and EXACT-MATCH: a second launch of the same run and thread that names a different
+#: ledger (or a different approval authority, finding 8) is refused by this name before
+#: any process exists, and the record on disk is not touched.  A migration is an
+#: operator's explicit act on the record itself, never a side effect of re-invoking.
+STANDALONE_AUTHORITY_CONFLICT = "STANDALONE_AUTHORITY_CONFLICT"
+#: Follow-up review finding 8.  A recovery that cannot restore the exact launch-time
+#: approval authority binding refuses rather than composing a different one.
+STANDALONE_APPROVAL_AUTHORITY_MISMATCH = "STANDALONE_APPROVAL_AUTHORITY_MISMATCH"
+#: Follow-up review finding 2.  A run launched standalone is re-entered standalone; any
+#: other adapter selection on it is refused by name rather than composed silently.
+STANDALONE_RUN_ADAPTER_MISMATCH = "STANDALONE_RUN_ADAPTER_MISMATCH"
+
+
+def _safe_stem(value: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in value)
+
+
+def standalone_authority_path(artifact_base: Any, run_id: str, thread_id: str = "") -> Path:
+    """Where a standalone run records WHICH runtime-state ledger it was launched against.
+
+    Beside the persisted profile: `--runtime-state` names an operator-chosen ledger, and a
+    recovery that reconstructs the DEFAULT path instead reopens a different (empty)
+    authority, reads every claim as `CREATED`, re-executes an already-settled intent and
+    then fails `SETTLEMENT_IDENTITY_MISMATCH` against the real one.
+
+    ``runtime_state.json`` is the run's PRIMARY binding -- the first thread launched.  A
+    further thread of the same run id (the fixtures drive several through one room)
+    records its own ``runtime_state.<thread>.json``, so exact-match is per thread and one
+    thread's binding never overwrites another's.  ``thread_id=""`` names the primary.
+    """
+    from .standalone_journal import journal_path
+    directory = journal_path(artifact_base, run_id).parent
+    primary = directory / "runtime_state.json"
+    if not thread_id:
+        return primary
+    if primary.exists():
+        try:
+            held = json.loads(primary.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            held = None
+        if isinstance(held, dict) and held.get("thread_id") not in ("", thread_id):
+            return directory / f"runtime_state.{_safe_stem(thread_id)}.json"
+    return primary
+
+
+def approval_authority_name(approval_port: Any) -> str:
+    """The NAME of a configured approval authority, for the durable binding (finding 8).
+
+    ``none`` for no port, ``artifact`` for the real OS-30 artifact port, and a value
+    outside `APPROVAL_AUTHORITIES` for anything else -- which a recovery then refuses,
+    because a binding it cannot rebuild by name is a binding it cannot restore exactly.
+    """
+    if approval_port is None:
+        return NO_APPROVAL_AUTHORITY                    # "none"; defined below
+    try:
+        from scripts.clarification_protocol import ArtifactHumanApprovalPort
+    except ImportError:  # installed Skill layout exposes sibling tools directly
+        from clarification_protocol import ArtifactHumanApprovalPort  # type: ignore
+    if isinstance(approval_port, ArtifactHumanApprovalPort):
+        return ARTIFACT_APPROVAL_AUTHORITY
+    return f"unrecoverable:{type(approval_port).__name__}"
+
+
+def _authority_record(run_id: str, *, runtime_state_path: Any, thread_id: str,
+                      approval_authority: str) -> dict[str, Any]:
+    return {"schema": STANDALONE_AUTHORITY_SCHEMA, "run_id": run_id,
+            "adapter": STANDALONE_ADAPTER,
+            "runtime_state_path": str(Path(runtime_state_path).resolve()),
+            "thread_id": thread_id, "approval_authority": approval_authority}
+
+
+def persist_standalone_authority(artifact_base: Any, run_id: str, *,
+                                 runtime_state_path: Any, thread_id: str = "",
+                                 approval_authority: str = "none") -> Path:
+    """Record the launch bindings durably, CREATE-ONCE and EXACT-MATCH.  Finding 5 / 8.
+
+    The record names the ledger, the thread and the approval authority.  A record that
+    already exists for this run and thread must EQUAL the one this launch would write; a
+    different one is `STANDALONE_AUTHORITY_CONFLICT` -- raised before any process exists,
+    with the file untouched -- so a re-invocation with another ``--runtime-state`` (or
+    another ``--approval-authority``) can never redirect the recovery of a run it did not
+    launch, whether or not its own execution is later rejected.  An identical record is a
+    restart and writes nothing.
+    """
+    target = standalone_authority_path(artifact_base, run_id, thread_id)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if check_standalone_authority(artifact_base, run_id, runtime_state_path=runtime_state_path,
+                                  thread_id=thread_id,
+                                  approval_authority=approval_authority) is not None:
+        return target                                    # identical: a restart, no write
+    wanted = _authority_record(run_id, runtime_state_path=runtime_state_path,
+                               thread_id=thread_id, approval_authority=approval_authority)
+    _durable_write(target, json.dumps(wanted, sort_keys=True, indent=2) + "\n")
+    return target
+
+
+def load_standalone_authority(artifact_base: Any, run_id: str,
+                              thread_id: str = "") -> dict[str, Any] | None:
+    """The recorded authority, or ``None`` when the run recorded none.  Unreadable RAISES."""
+    target = standalone_authority_path(artifact_base, run_id, thread_id)
+    if not target.exists():
+        return None
+    try:
+        record = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise LauncherError(
+            f"{STANDALONE_ADAPTER_REQUIRES_LEDGER}: the persisted runtime-state authority "
+            f"at {target} is unreadable ({exc})") from exc
+    if (not isinstance(record, dict) or record.get("schema") != STANDALONE_AUTHORITY_SCHEMA
+            or not isinstance(record.get("runtime_state_path"), str)
+            or not record["runtime_state_path"]):
+        raise LauncherError(
+            f"{STANDALONE_ADAPTER_REQUIRES_LEDGER}: the persisted runtime-state authority "
+            f"at {target} does not name a ledger")
+    return record
+
+
+def check_standalone_authority(artifact_base: Any, run_id: str, *, runtime_state_path: Any,
+                               thread_id: str = "",
+                               approval_authority: str = "none") -> dict[str, Any] | None:
+    """READ-ONLY exact-match check: the recorded binding for this run/thread, or ``None``
+    when none is recorded; a recorded binding that DIFFERS raises
+    ``STANDALONE_AUTHORITY_CONFLICT``.  Writes nothing.  CORRECTION 2 split this out of
+    :func:`persist_standalone_authority` so composition can refuse a conflicting relaunch
+    before any claim while the CREATE is deferred until after the claim succeeds."""
+    target = standalone_authority_path(artifact_base, run_id, thread_id)
+    if not target.exists():
+        return None
+    wanted = _authority_record(run_id, runtime_state_path=runtime_state_path,
+                               thread_id=thread_id, approval_authority=approval_authority)
+    try:
+        current = json.loads(target.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise LauncherError(
+            f"{STANDALONE_ADAPTER_REQUIRES_LEDGER}: the persisted runtime-state "
+            f"authority at {target} is unreadable ({exc})") from exc
+    except ValueError as exc:
+        raise LauncherError(
+            f"{STANDALONE_AUTHORITY_CONFLICT}: the persisted runtime-state authority "
+            f"at {target} is not readable JSON ({exc}); it is not overwritten") from exc
+    if current == wanted:
+        return current
+    differing = sorted(key for key in set(wanted) | set(current or {})
+                       if (current or {}).get(key) != wanted.get(key))
+    raise LauncherError(
+        f"{STANDALONE_AUTHORITY_CONFLICT}: run {run_id!r} (thread {thread_id!r}) "
+        f"already records a different launch binding at {target} "
+        f"(differs in {', '.join(differing)}); the recorded binding is kept and a "
+        "migration must be an explicit act on that record")
+
+
+def publish_standalone_launch_bindings(artifact_base: Any, run_id: str, *,
+                                       profile_spec: Mapping[str, Any],
+                                       runtime_state_path: Any, thread_id: str = "",
+                                       approval_authority: str = "none") -> None:
+    """The ONE write of a standalone run's launch bindings: the profile, then the
+    create-once / exact-match authority record.  CORRECTION 2: called by `execute_state`
+    only after the run-scoped execution authority has been claimed SUCCESSFULLY -- so an
+    invocation refused `EXECUTION_AUTHORITY_HELD` (another Coordinator owns the run) can
+    never create or change the binding a Watchdog will recover from -- and before any
+    spawn, so a recovery of anything this launch does can rebuild its runtime.  An
+    in-memory ledger names no path and records no binding (the profile is still kept)."""
+    persist_standalone_profile(artifact_base, run_id, profile_spec)
+    if runtime_state_path is not None:
+        persist_standalone_authority(artifact_base, run_id,
+                                     runtime_state_path=runtime_state_path,
+                                     thread_id=thread_id,
+                                     approval_authority=approval_authority)
+
+
+def load_standalone_profile(artifact_base: Any, run_id: str) -> dict[str, Any] | None:
+    """The persisted profile spec, or ``None`` when the run never persisted one."""
+    target = standalone_profile_path(artifact_base, run_id)
+    if not target.exists():
+        return None
+    try:
+        spec = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise LauncherError(
+            f"{STANDALONE_ADAPTER_REQUIRES_PROFILE}: the persisted profile at {target} is "
+            f"unreadable ({exc})") from exc
+    if not isinstance(spec, dict):
+        raise LauncherError(
+            f"{STANDALONE_ADAPTER_REQUIRES_PROFILE}: the persisted profile at {target} is "
+            "not a JSON object")
+    return spec
+
+
+def build_standalone_runtime(artifact_base: Any, run_id: str, *, runtime_state: Any,
+                             profile_spec: Mapping[str, Any], journal: Any) -> Any:
+    """The ONE place a `StandaloneRuntime` is composed from a profile spec.
+
+    Shared by the launcher (a fresh run) and the Watchdog (a recovery of a stalled run),
+    so the runtime a recovery re-enters with is built by the same code that built the
+    original -- the same profile validation, the same declared worktree, the same journal.
+    """
+    from .standalone_profile import profile_from_mapping
+    from .standalone_runtime import StandaloneRuntime
+    try:
+        profile = profile_from_mapping(profile_spec)
+    except Exception as exc:  # noqa: BLE001 - a malformed profile refuses before any spawn
+        raise LauncherError(
+            f"{STANDALONE_ADAPTER_REQUIRES_PROFILE}: {exc}") from exc
+    return StandaloneRuntime(artifact_base=artifact_base, run_id=run_id,
+                             profile=profile, runtime_state=runtime_state,
+                             journal=journal,
+                             worktree_path=profile.worktree or None)
+
+
+def _standalone_pause_row_journal(artifact_base: Any, run_id: str) -> Any:
+    """This run's PAUSE-ROW journal -- ``pause_store.FileSettlementJournal``, not the log.
+
+    A different object from :func:`_standalone_journal_for` on purpose (external review
+    #9): that one is the append-only `ExecutionJournal` the LifecycleSettlementPort reads,
+    this one is the promotable one-row-per-intent store `executor`'s PAUSE and DISPOSE
+    nodes write through ``row()``/``record()``.  Same run, same artifact base, two files,
+    two interfaces.
+    """
+    from .pause_store import journal_for
+    return journal_for(run_id, artifact_base=artifact_base)
+
+
+def build_standalone_state(spec: dict[str, Any], adapter: Any) -> dict[str, Any]:
+    """OS-37 D-2(b): the standalone runtime carries ONE capability declaration, not two.
+
+    ``build_state`` above reads ``spec["capabilities"]``, so an operator's JSON and the
+    adapter's own ``capabilities()`` are two independent declarations that nothing
+    reconciles -- and ``validate_node`` gates on the FORMER while the ladder depends on the
+    LATTER.  For a runtime born in this ticket that gap is closable at no cost, so the
+    standalone path populates ``adapter_capabilities`` from the LIVE adapter.
+
+    **The Orca and fake paths are deliberately NOT changed** -- D-2(a).  Reconciling them
+    there is authorized by no acceptance criterion and would change routing for existing
+    runs and for historical replay.  That residual is carried forward as PR-1, named, with a
+    follow-up ticket proposed rather than silently fixed here.
+    """
+    return build_state({**spec, "capabilities": sorted(adapter.capabilities())})
+
+
+def build_standalone_adapter(spec: dict[str, Any], *, artifact_base: Path,
+                             run_id: str = "", runtime_state: Any = None,
+                             profile_spec: Any = None,
+                             approval_port: Any = None) -> tuple[Any, dict[str, Any]]:
+    """Compose the standalone adapter and the state it declares, in the fixed order.
+
+    Composition order matches the Orca path's exactly -- journal, then ledger, then the
+    adapter, then the state -- because the state is named after the run the ledger is keyed
+    on, and deriving either from the other would name something that does not exist.
+
+    ``approval_port`` is R4's conditional human-approval authority and defaults to ``None``,
+    which is the pre-R4 composition unchanged: with no port the adapter declares no
+    ``human_approval``, ``routing.pause_admissible`` refuses the route and a decision block
+    still terminates as BLOCKED.  When an operator DOES name an authority
+    (``--approval-authority artifact``) it is threaded in here, BEFORE the capability
+    snapshot below, for exactly the reason external review #10 gives for the ledger: the
+    state carries a frozen copy of ``adapter.capabilities()``, so a port attached after the
+    snapshot would leave the run declaring a capability the adapter has and the state does
+    not -- and ``routing`` reads the state.
+    """
+    from .standalone_adapter import StandaloneAdapter
+    from .standalone_journal import ExecutionJournal
+
+    resolved_run = run_id or spec.get("run_id") or "run_standalone"
+    if profile_spec is None:
+        raise LauncherError(
+            f"{STANDALONE_ADAPTER_REQUIRES_PROFILE}: --adapter standalone needs an explicit "
+            "driver profile; there is deliberately no built-in CLI table (AC-37-03)")
+    journal = ExecutionJournal(artifact_base, resolved_run)
+    # ---- OS-37 correction R3: the DECLARED worktree reaches the child -----------------
+    # `StandaloneSession.worktree_path` defaults to `os.getcwd()`, and this composition
+    # root never overrode it -- so every agent a shipped `run_workflow.py --adapter
+    # standalone` launched ran in the LAUNCHER's working directory, whatever worktree the
+    # profile declared.  It went unnoticed because a driver whose argv template happens to
+    # carry the worktree still put the agent in the right place; a driver with no such
+    # template simply inherited the launcher's cwd.  (Which drivers those are is the DRIVER
+    # LAYER's business and is deliberately not named here -- D4.1.)  The defect was
+    # invisible until the R10 real-CLI
+    # evidence was re-driven through this function, which is exactly why R3 requires it to
+    # be.
+    #
+    # `or None` keeps the old behaviour for a profile that declares no worktree: the
+    # session then falls back to `os.getcwd()` as before, and nothing about a run that
+    # never named one changes.
+    runtime = build_standalone_runtime(artifact_base, resolved_run,
+                                       runtime_state=runtime_state,
+                                       profile_spec=profile_spec, journal=journal)
+    # Finding 5 (round 4) / findings 5 and 8 (follow-up) / CORRECTION 2.  The profile and
+    # the launch binding (ledger path, thread, approval authority) are what a Watchdog
+    # rebuilds the runtime from, and the binding is create-once / exact-match.  They are
+    # NOT written here any more.  Composition happens before `execute_state` claims the
+    # run-scoped execution authority, so a first-writer race existed: while another
+    # Coordinator held the lease and no binding existed yet, an invocation that was about
+    # to be refused `EXECUTION_AUTHORITY_HELD` could still CREATE the binding, and the
+    # create-once rule then made that unauthorised binding permanent.  What happens here
+    # is READ-ONLY: a pre-existing DIFFERENT binding is refused by name now, before any
+    # claim and before any process (the exact-match refusal is unchanged); the WRITE is
+    # `publish_launch_bindings`, which `execute_state` calls immediately after a
+    # SUCCESSFUL claim and before any spawn, and a refused claim never reaches.
+    ledger_path = getattr(runtime_state, "path", None)
+    thread_id = str(spec.get("thread_id") or "")
+    approval_authority = approval_authority_name(approval_port)
+    if ledger_path is not None:
+        check_standalone_authority(artifact_base, resolved_run,
+                                   runtime_state_path=ledger_path, thread_id=thread_id,
+                                   approval_authority=approval_authority)
+    adapter = StandaloneAdapter(runtime, runtime_state=runtime_state,
+                                settlement_journal=journal,
+                                pause_row_journal=_standalone_pause_row_journal(
+                                    artifact_base, resolved_run),
+                                approval_port=approval_port,
+                                artifact_base=artifact_base, run_id=resolved_run)
+    # The post-claim publication step (CORRECTION 2), bound to THIS composition's facts
+    # and attached to the adapter so `execute_state` -- which is adapter-neutral and reads
+    # it by name -- can run it once the run is really this process's to launch.
+    adapter.publish_launch_bindings = functools.partial(
+        publish_standalone_launch_bindings, artifact_base, resolved_run,
+        profile_spec=profile_spec, runtime_state_path=ledger_path,
+        thread_id=thread_id, approval_authority=approval_authority)
+    # ---- OS-37 external review #10: the capability SNAPSHOT comes LAST ----------------
+    # `build_standalone_state` reads `adapter.capabilities()`, and `external_resume` is
+    # declared only when the identity fence has an authority to live in -- i.e. only once
+    # `runtime_state` is attached.  `run_cli` used to build the adapter here, build the
+    # state from it, and only THEN construct the durable ledger, so the snapshot was taken
+    # with `runtime_state=None` and the run permanently declared no `external_resume`:
+    # `executor._collect` then refused every post-receipt recovery with
+    # IDEMPOTENCY_RECOVERY_UNSUPPORTED, making a crash after the receipt unrecoverable.
+    # The ledger is now threaded in BEFORE the snapshot, and this refusal makes the
+    # ordering structural rather than a comment.
+    if runtime_state is None:
+        raise LauncherError(
+            f"{STANDALONE_ADAPTER_REQUIRES_LEDGER}: the durable runtime-state ledger must "
+            "be constructed BEFORE the standalone adapter, because the capability "
+            "declaration this state carries is snapshotted from the live adapter and "
+            "external_resume is withdrawn while the identity fence has no ledger to live in")
+    state = build_standalone_state({**spec, "run_id": resolved_run}, adapter)
+    return adapter, state
 
 
 # ---- OS-43 CRITICAL: the Coordinator's half of the run-scoped execution authority -----
@@ -308,6 +787,16 @@ def execute_state(raw_state: dict[str, Any], *, adapter: Any, checkpointer: Any 
     # unsettled completion, one step earlier.
     keeper = None
     try:
+        # ---- CORRECTION 2 (follow-up review finding 5): publish the launch bindings ---
+        # HERE -- the claim above succeeded, so this process is the run's launcher; a
+        # refused claim returned before this line and wrote nothing -- and BEFORE the graph
+        # is built, so no spawn can precede the record a Watchdog rebuilds from.  Read by
+        # name: the standalone composition attaches it, the Orca and fake adapters have no
+        # such attribute and are untouched.  A refusal raised here (a conflicting binding)
+        # leaves through the `finally` below, which releases the authority just claimed.
+        publish = getattr(adapter, "publish_launch_bindings", None)
+        if callable(publish):
+            publish()
         if "audit_sink" not in graph_options:
             # OS-42.  The run's own append-only ORCHESTRATOR_LOG.md is where the
             # validation-repair audit trail lands, and this is the entry point that knows
@@ -334,6 +823,19 @@ def execute_state(raw_state: dict[str, Any], *, adapter: Any, checkpointer: Any 
             # matches means a successor already owns this run.
             authority.fence(raw_state["run_id"], authority_token)
         final = graph.invoke(raw_state, config)
+        # ---- follow-up review finding 2: the pause record is written HELD ----------
+        # The Tier-2 record used to be written after the `finally` below had let the
+        # execution authority go, and a record that could not be written left the
+        # committed head an orphaned WAITING_FOR_INPUT under a CLI that said BLOCKED.
+        # Writing it here -- still the holder -- lets a failed write COMMIT the same
+        # BLOCKED terminal it reports, through the graph's own typed update, and lets
+        # `_settle_or_release` read that head and SETTLE the authority exactly as it
+        # would for any run that ended.  The pause store's own claim is a different
+        # authority from the execution lease (it serialises resumers, not executors),
+        # so holding one while taking the other claims nothing this caller lacks.
+        final = _finalize_pause_if_waiting(final, checkpointer=checkpointer,
+                                           artifact_base=artifact_base,
+                                           graph=graph, config=config)
     except recovery_store.RecoveryClaimLost as exc:
         # The fence refused -- at the transition or inside a node, before its effect.  The
         # run stops with a named reason; it does not finish work a successor now owns.
@@ -375,6 +877,120 @@ def execute_state(raw_state: dict[str, Any], *, adapter: Any, checkpointer: Any 
     return final
 
 
+#: The named refusal a pause that cannot be RECORDED reports.  It is a member of
+#: `pause_policy.PAUSE_REFUSAL_CODES`, so `terminal_node` already prints it as the reason a
+#: run BLOCKED rather than folding it into an ordinary decision block.
+PAUSE_RECORD_NOT_WRITTEN = "PAUSE_RECORD_MISSING"
+
+
+def _finalize_pause_if_waiting(final: dict[str, Any], *, checkpointer: Any,
+                               artifact_base: Path | None, graph: Any = None,
+                               config: Any = None) -> dict[str, Any]:
+    """Write the Tier-2 pause record after ``invoke`` returned.  R4's third wiring.
+
+    ``pause_runtime.finalize_pause`` had NO production caller: `resume_run` calls it for a
+    re-pause and the OS-31 fixtures call it themselves, but the ordinary graph entry point
+    -- this one, the one `run_workflow.py` uses -- never did.  A run that paused therefore
+    reached ``WAITING_FOR_INPUT``, published its clarification request and committed its
+    checkpoint, and then left NO durable pause record at all: `discover` could not list it,
+    `resume` refused it with `PAUSE_RECORD_MISSING`, and the pause was unrecoverable.  That
+    is the lifecycle-journal defect R4 suspected the missing approval port was masking, and
+    it was invisible for exactly that reason -- with no approval capability the PAUSE node
+    was unreachable, so nothing ever got far enough to notice.
+
+    Called INSIDE the held execution-authority section (follow-up review finding 2) --
+    the record is the pause's own durable authority, claimed through `pause_store`, and
+    taking it while still holding the execution lease claims nothing this caller lacks;
+    what it buys is that a failed write can still COMMIT a terminal to the run's own
+    checkpoint and have `_settle_or_release` seal the authority over it.
+
+    **Fail-closed, durably.**  A pause that cannot be recorded must not be REPORTED as a
+    pause: nothing could ever resume it, and exit code 4 would tell an operator to wait
+    for a human on a run no `discover` will ever list.  The refusal is converted into the
+    ordinary BLOCKED terminal, named, exactly as `pause_node`'s own refusals are -- AND
+    that terminal is written to the committed head through the graph's typed
+    `PAUSE_NOT_RECORDED` update, so the durable statement and the reported one are the
+    same statement.  A head that cannot be re-committed either is reported as BLOCKED
+    with BOTH failures named; it is never reported as a pause.
+
+    ``artifact_base is None`` means this caller named no run root, so there is nowhere a
+    pause record belongs; the state is returned untouched, which is what every in-process
+    test that drives the graph without an artifact tree already relies on.
+    """
+    if final.get("run_lifecycle") != "WAITING_FOR_INPUT" or artifact_base is None:
+        return final
+    from . import pause_runtime, pause_store
+    store_path = getattr(checkpointer, "path", None)
+    if store_path is None:
+        return _pause_not_recorded(
+            final, "the checkpointer names no durable store path, so a pause record "
+                   "would name a checkpoint store nothing can reopen")
+    try:
+        pause_runtime.finalize_pause(
+            final, saver=checkpointer,
+            store=pause_store.store_for(final["run_id"], artifact_base=artifact_base),
+            checkpoint_store_path=str(store_path), artifact_base=artifact_base)
+    except pause_runtime.PauseRefused as exc:
+        return _pause_not_recorded(final, str(exc), code=exc.code, graph=graph,
+                                   config=config)
+    except (OSError, ValueError, KeyError) as exc:  # noqa: BLE001 - unrecorded is refused
+        return _pause_not_recorded(final, f"{type(exc).__name__}: {exc}", graph=graph,
+                                   config=config)
+    return final
+
+
+def _pause_not_recorded(final: dict[str, Any], detail: str,
+                        code: str = PAUSE_RECORD_NOT_WRITTEN, *, graph: Any = None,
+                        config: Any = None) -> dict[str, Any]:
+    """Turn an unrecordable pause into the BLOCKED terminal, with the reason named --
+    and COMMIT it (finding 2), so the durable head is not an orphaned pause.
+
+    The commit goes THROUGH THE GRAPH'S OWN NODES, not around them: the paused head is
+    re-invoked on the same thread with ``route_token=BLOCK`` and the refusal as its
+    ``terminal_reason``, so VALIDATE judges the state, ROUTE short-circuits to the
+    recorded token exactly as it does for every terminal reason, and TERMINAL writes the
+    BLOCKED terminal -- naming the refusal, because `PAUSE_RECORD_MISSING` is a member of
+    `pause_policy.PAUSE_REFUSAL_CODES` and TERMINAL keeps those by name.  No raw
+    checkpoint write, no typed out-of-band command and no edit to any pinned policy
+    module: the same route a refused pause takes inside the graph.  The returned state is
+    the COMMITTED one, so what is reported is what is durable.
+
+    A head that cannot be re-committed either is reported BLOCKED with BOTH failures
+    named and ``head_committed=False``; it is never reported as a pause.
+    """
+    blocked = dict(final)
+    blocked["run_lifecycle"] = "ACTIVE"
+    blocked["route_token"] = "BLOCK"
+    blocked["terminal_reason"] = {"code": code, "message": detail}
+    terminal = terminal_node(blocked)
+    if graph is None or config is None:
+        return terminal
+    reentry = dict(final)
+    reentry["route_token"] = "BLOCK"
+    reentry["terminal_reason"] = {"code": code, "message": detail,
+                                  "phase": final.get("current_phase")}
+    try:
+        committed = graph.invoke(reentry, config)
+    except Exception as exc:  # noqa: BLE001 - both failures are NAMED, neither is a pause
+        terminal = dict(terminal)
+        terminal["terminal_reason"] = {
+            **terminal["terminal_reason"],
+            "message": f"{detail}; and the BLOCKED terminal could not be committed to "
+                       f"the checkpoint head ({type(exc).__name__}: {exc}); the durable "
+                       "head may still read WAITING_FOR_INPUT with no pause record",
+            "head_committed": False}
+        return terminal
+    if committed.get("terminal_status") != "BLOCKED":
+        terminal = dict(terminal)
+        terminal["terminal_reason"] = {
+            **terminal["terminal_reason"],
+            "message": f"{detail}; and the re-entry committed "
+                       f"{committed.get('terminal_status')!r} rather than BLOCKED",
+            "head_committed": False}
+        return terminal
+    return dict(committed)
+
+
 # ---- OS-42 F-002: the production Orca execution path ---------------------------------
 # Before this, the shipped launcher offered `--adapter fake` and nothing else, so the
 # bounded validation-repair loop could only ever run against scripted settlements. The
@@ -388,7 +1004,54 @@ def execute_state(raw_state: dict[str, Any], *, adapter: Any, checkpointer: Any 
 
 FAKE_ADAPTER = "fake"
 ORCA_ADAPTER = "orca"
-ADAPTERS = (FAKE_ADAPTER, ORCA_ADAPTER)
+# OS-37 WI-13.  The standalone runtime owns local agent processes itself and needs no Orca
+# process, binary, API or terminal lifecycle.  C-DESIGN-1: `--adapter` is declared at THREE
+# argparse sites over this one shared tuple, and dispatched at four more, so adding a member
+# here widens seven surfaces at once.  Every one of those seven is enumerated in DESIGN
+# D1.2, and the arms where `standalone` is meaningless are EXPLICIT REFUSALS rather than
+# fall-throughs -- a silent fall-through would compose a fake adapter under a standalone
+# flag, which is the worst possible reading of an operator's intent.
+STANDALONE_ADAPTER = "standalone"
+ADAPTERS = (FAKE_ADAPTER, ORCA_ADAPTER, STANDALONE_ADAPTER)
+
+# Refusals the standalone path raises BEFORE any process exists.
+STANDALONE_ADAPTER_REQUIRES_STATE = "STANDALONE_ADAPTER_REQUIRES_STATE"
+STANDALONE_ADAPTER_REQUIRES_PROFILE = "STANDALONE_ADAPTER_REQUIRES_PROFILE"
+#: Retired by the follow-up review's finding 2: the `resume` verb now COMPOSES the
+#: standalone runtime from the run's recorded launch binding instead of refusing it, and
+#: a foreign adapter on a standalone run is `STANDALONE_RUN_ADAPTER_MISMATCH`.  The name
+#: is kept so the conformance record's history still resolves; no site composes it.
+STANDALONE_ADAPTER_UNSUPPORTED_HERE = "STANDALONE_ADAPTER_UNSUPPORTED_HERE"
+#: OS-37 external review #10.  The capability declaration the standalone state carries is a
+#: SNAPSHOT of the live adapter, and `external_resume` is withdrawn while the identity fence
+#: has no ledger to live in -- so composing the adapter before the ledger silently produced
+#: a run that could never collect an effect an earlier process created.  Refused by name.
+STANDALONE_ADAPTER_REQUIRES_LEDGER = "STANDALONE_ADAPTER_REQUIRES_LEDGER"
+
+# ---- OS-37 correction R4: the CONFIGURED human-approval authority --------------------
+# `routing.pause_admissible` requires BOTH `human_approval` and `lifecycle_settlement`, and
+# the standalone composition declared only the second, so the graph's own PAUSE node was
+# unreachable for `--adapter standalone` -- a decision block terminated the run as BLOCKED
+# instead of becoming a durable, resumable pause.
+#
+# The fix is a WIRING, not a policy change, and it is deliberately CONDITIONAL.  Declaring
+# `human_approval` unconditionally would assert of every standalone run that a human
+# authority exists to answer it, which is exactly the dishonest declaration
+# `StandaloneAdapter.capabilities` refuses to make for `external_resume` on a wiring that
+# cannot back it.  So the authority is named by the operator, once, at the composition
+# root, and `NO_APPROVAL_AUTHORITY` is the default: a run launched without it composes
+# byte-for-byte the adapter it composed before, declares no `human_approval`, and still
+# routes a decision block to BLOCK.
+#
+# `ARTIFACT_APPROVAL_AUTHORITY` names the real OS-30 `ArtifactHumanApprovalPort` over the
+# run's own artifact base -- the SAME authority `run_pause_cli` and `_watchdog_wiring`
+# already resolve through `_artifact_approval_port`, so a run that pauses is answerable by
+# the `discover`/`resume` verbs that already ship.  There is no third member and no
+# stand-in: an authority that cannot really publish, show and ingest a decision is not one.
+NO_APPROVAL_AUTHORITY = "none"
+ARTIFACT_APPROVAL_AUTHORITY = "artifact"
+APPROVAL_AUTHORITIES = (NO_APPROVAL_AUTHORITY, ARTIFACT_APPROVAL_AUTHORITY)
+UNKNOWN_APPROVAL_AUTHORITY = "UNKNOWN_APPROVAL_AUTHORITY"
 
 # Refusals the production path raises BEFORE any Orca effect exists.
 ORCA_ADAPTER_REQUIRES_STATE = "ORCA_ADAPTER_REQUIRES_STATE"
@@ -589,7 +1252,28 @@ def build_parser() -> argparse.ArgumentParser:
                              "Orca runtime present; `orca` is the production path -- it "
                              "creates a real Orca Run and dispatches real agents through "
                              "OrcaAdapter, which is where the bounded validation-repair "
-                             "loop actually runs")
+                             "loop actually runs; `standalone` is the OS-37 headless "
+                             "runtime, which owns local agent processes itself and needs "
+                             "no Orca process, binary, API or terminal lifecycle")
+    parser.add_argument("--standalone-profile", default="",
+                        help="JSON file describing the driver profile --adapter standalone "
+                             "launches with (binary, supported version range, bin_dirs, "
+                             "auth secret REFERENCES, and the declared readiness records "
+                             "that are READY's only accepting evidence). May instead be "
+                             "given as `standalone_profile` inside --state. There is "
+                             "deliberately no default: AC-37-03 requires explicit "
+                             "configuration rather than a built-in CLI table")
+    parser.add_argument("--approval-authority", choices=APPROVAL_AUTHORITIES,
+                        default=NO_APPROVAL_AUTHORITY,
+                        help="the human-approval authority --adapter standalone composes "
+                             "with. `none` (the default) declares no `human_approval` "
+                             "capability, so a decision block terminates the run as "
+                             "BLOCKED exactly as before; `artifact` names the real OS-30 "
+                             "ArtifactHumanApprovalPort over --artifact-base, which makes "
+                             "the graph's PAUSE node reachable and the run answerable by "
+                             "the `discover`/`resume` verbs. It is deliberately opt-in: "
+                             "declaring the capability on a run no human is watching would "
+                             "assert an authority that does not exist")
     parser.add_argument("--objective", default="",
                         help="the Run objective (required by --adapter orca)")
     parser.add_argument("--agent-profile", default="",
@@ -902,14 +1586,42 @@ def run_pause_cli(argv: list[str]) -> int:
         if record is None:
             raise LauncherError(f"PAUSE_RECORD_MISSING: no paused run {args.run_id}")
         results = _read_json(args.results, "--results") if args.results else []
-        ledger = FileRuntimeStateStore(default_runtime_state_path(args.run_id,
-                                                                 record["thread_id"]))
         journal = pause_store.journal_for(args.run_id, artifact_base=base)
-        if getattr(args, "adapter", FAKE_ADAPTER) == ORCA_ADAPTER:
+        selected = getattr(args, "adapter", FAKE_ADAPTER)
+        if selected != STANDALONE_ADAPTER:
+            # The default ledger is opened for the fake and Orca compositions only: a
+            # standalone run reopens the ledger its launch RECORDED (below), and opening
+            # the default one beside it would create a second, empty authority.
+            ledger = FileRuntimeStateStore(default_runtime_state_path(args.run_id,
+                                                                     record["thread_id"]))
+            # Follow-up review finding 2.  A standalone-launched run is re-entered
+            # standalone or not at all; the fake default is refused on it by name.
+            refuse_foreign_composition(base, args.run_id, record["thread_id"],
+                                       selected=selected)
+        if selected == ORCA_ADAPTER:
             adapter = build_orca_adapter_for_run(
                 args.run_id, artifact_base=base, runtime_state=ledger,
                 run_owner=args.run_owner,
                 project_root=Path(args.project_root) if args.project_root else None)
+        elif selected == STANDALONE_ADAPTER:
+            # Follow-up review finding 2: END-TO-END.  The refusal that stood here is
+            # gone, and what replaced it is the composition the Watchdog already
+            # recovers with: the ORIGINAL profile, the ORIGINAL ledger (from the launch
+            # binding, never the default path), the ORIGINAL approval authority
+            # (finding 8) and the run's own journals -- so the paused round re-enters
+            # holding exactly the identity fence, ledger and capabilities it paused with,
+            # and an in-flight effect is collected through `resume` (finding 1) rather
+            # than re-run.  A run that recorded no binding is refused by name.
+            binding = load_standalone_authority(base, args.run_id, record["thread_id"])
+            if binding is None:
+                raise LauncherError(
+                    f"{STANDALONE_ADAPTER_REQUIRES_LEDGER}: run {args.run_id!r} recorded no "
+                    "standalone launch binding, so the ledger it paused against cannot be "
+                    "reopened; --adapter standalone resumes only a run launched standalone")
+            ledger = FileRuntimeStateStore(Path(binding["runtime_state_path"]))
+            adapter, _execution_journal, approval_port = standalone_recovery_composition(
+                base, args.run_id, thread_id=record["thread_id"], ledger=ledger,
+                pause_row_journal=journal)
         else:
             adapter = FakeAdapter(results, runtime_state=ledger, run_id=args.run_id,
                                   settlement_journal=journal)
@@ -1093,6 +1805,95 @@ def _add_adapter_selection(mode: argparse.ArgumentParser) -> None:
     mode.add_argument("--project-root", default="",
                       help="project root the Orca adapter reads its quality profile and "
                            "agent routing from (default: the working directory)")
+    mode.add_argument("--standalone-profile", default="",
+                      help="JSON driver profile for --adapter standalone; optional, because "
+                           "a standalone run persists its own profile under its run root "
+                           "at launch and a recovery reads that by default (finding 5)")
+
+
+def standalone_approval_port_for(base: Path, run_id: str, thread_id: str = "") -> Any:
+    """The EXACT launch-time approval authority of a standalone run, or a refusal.
+
+    Follow-up review finding 8.  The recovery used to hand every standalone run the
+    artifact approval port, so a run launched with ``--approval-authority none`` (no
+    `human_approval`, decision blocks BLOCK) was recovered declaring `human_approval`
+    and could route into a PAUSE its launch never admitted.  The binding is read from the
+    same record that names the ledger and rebuilt BY NAME through
+    `configured_approval_port`; a record that names none, or one that names an authority
+    this composition cannot rebuild, is refused rather than defaulted.
+    """
+    record = load_standalone_authority(base, run_id, thread_id)
+    if record is None:
+        # No binding recorded (a launch over an in-memory ledger records nothing).  The
+        # fail-closed direction is to declare NOTHING that cannot be proven: `none` --
+        # the launcher's own default -- declares no `human_approval`, so the recovered
+        # run can BLOCK on a decision but can never PAUSE through an authority its
+        # launch is not known to have had.  It is never the artifact port by default.
+        return None
+    name = record.get("approval_authority")
+    if name not in APPROVAL_AUTHORITIES:
+        raise LauncherError(
+            f"{STANDALONE_APPROVAL_AUTHORITY_MISMATCH}: run {run_id!r} was launched with "
+            f"approval authority {name!r}, which this composition cannot rebuild by name; "
+            "recovery is refused rather than composed with a different authority")
+    return configured_approval_port(str(name), base)
+
+
+def standalone_recovery_composition(base: Path, run_id: str, *, thread_id: str,
+                                    ledger: Any, pause_row_journal: Any,
+                                    profile_override: Any = None) -> tuple[Any, Any, Any]:
+    """The standalone runtime a RE-ENTRY is composed with: ``(adapter, execution
+    journal, approval port)``.  One function for the Watchdog and the `resume` verb.
+
+    Follow-up review finding 2.  The runtime is rebuilt from what the ORIGINAL launch
+    persisted -- its profile (or an operator's explicit override), its ledger (the
+    caller resolved it from the same record), and its approval authority restored by
+    name (finding 8) -- so the round a paused or stalled run re-enters is bound to the
+    identity fence, the ledger and the capabilities it held, not to a fresh default
+    composition.  Nothing here spawns: the adapter adopts in-flight effects through
+    `resume` (finding 1) and starts new ones only where the graph dispatches them.
+    """
+    from .standalone_adapter import StandaloneAdapter
+    execution_journal = _standalone_journal_for(base, run_id)
+    if profile_override is not None:
+        profile_spec: Any = profile_override
+    else:
+        profile_spec = load_standalone_profile(base, run_id)
+    if profile_spec is None:
+        raise LauncherError(
+            f"{STANDALONE_ADAPTER_REQUIRES_PROFILE}: run {run_id!r} persisted no "
+            "driver profile and none was given with --standalone-profile; a "
+            "recovery cannot rebuild the runtime it would execute with")
+    runtime = build_standalone_runtime(base, run_id, runtime_state=ledger,
+                                       profile_spec=profile_spec,
+                                       journal=execution_journal)
+    approval_port = standalone_approval_port_for(base, run_id, thread_id)
+    adapter = StandaloneAdapter(
+        runtime, runtime_state=ledger, settlement_journal=execution_journal,
+        pause_row_journal=pause_row_journal, approval_port=approval_port,
+        artifact_base=base, run_id=run_id)
+    return adapter, execution_journal, approval_port
+
+
+def refuse_foreign_composition(base: Path, run_id: str, thread_id: str, *,
+                               selected: str) -> None:
+    """Refuse re-entering a STANDALONE-launched run with any other adapter (finding 2).
+
+    A run that recorded a standalone launch binding holds an identity fence, a ledger and
+    an approval binding that only the standalone composition can honour.  Selecting --
+    or defaulting to -- the fake or Orca adapter on it is refused by name here, before
+    any effect, instead of silently composing a runtime that discards all three.
+    """
+    try:
+        record = load_standalone_authority(base, run_id, thread_id)
+    except LauncherError:
+        record = None
+    if record is not None and record.get("adapter", STANDALONE_ADAPTER) == STANDALONE_ADAPTER:
+        raise LauncherError(
+            f"{STANDALONE_RUN_ADAPTER_MISMATCH}: run {run_id!r} was launched with "
+            f"--adapter {STANDALONE_ADAPTER} and re-entering it needs the same; "
+            f"--adapter {selected} would compose a runtime that discards the run's "
+            "identity fence, ledger and approval binding")
 
 
 def _watchdog_wiring(args: argparse.Namespace, *, runner: Any = None,
@@ -1127,20 +1928,77 @@ def _watchdog_wiring(args: argparse.Namespace, *, runner: Any = None,
 
     adapters: dict[str, Any] = {}
     bindings: dict[str, Any] = {}
+    threads: dict[str, str] = {}
+    approvals: dict[str, Any] = {}
 
     def bindings_for(run_id: str) -> Any:
-        """This run's durable ledger and journal.  Adopts nothing and claims nothing."""
+        """This run's durable ledger and journal.  Adopts nothing and claims nothing.
+
+        The ledger is keyed on the run's THREAD id, and the thread id is read from the
+        run's own durable record: the pause record when the run is paused, and the
+        committed checkpoint head when it is a stalled ACTIVE run with no pause record.
+        The head used to be consulted for neither, and a stalled active run -- the one
+        case the Watchdog exists for -- was therefore bound to a ledger named after the
+        run id rather than its thread, i.e. an EMPTY ledger in which every claim reads
+        `CREATED`; a recovery driven through this wiring re-entered the graph holding none
+        of the run's receipts and settlements.  Surfaced by the consolidated follow-up
+        review's finding 5 verification (watchdog discovery -> recovery -> a subsequent
+        execution node, asserted on the run's OWN ledger); it is adapter-neutral and the
+        Orca and fake arms below are untouched.
+        """
         if run_id not in bindings:
             record = pause_store.store_for(run_id, artifact_base=base).read(run_id)
-            thread_id = (record or {}).get("thread_id") or run_id
+            thread_id = (record or {}).get("thread_id") or ""
+            if not thread_id:
+                try:
+                    head = recovery_runtime.resolve_head(run_id, artifact_base=base)
+                except Exception:  # noqa: BLE001 - an unreadable head is refused later, by name
+                    head = None
+                thread_id = getattr(head, "thread_id", "") or ""
+            # The thread the run's OWN durable record names; "" when nothing names one,
+            # in which case the launch binding read below is the run's PRIMARY one.
+            known_thread = thread_id
+            thread_id = thread_id or run_id
+            ledger_path = default_runtime_state_path(run_id, thread_id)
+            if adapter_name == STANDALONE_ADAPTER:
+                # Round 4, finding 2.  A standalone run launched with `--runtime-state`
+                # was recovered against the DEFAULT ledger -- a different, empty authority
+                # in which every claim reads CREATED -- so an already-settled intent was
+                # re-executed and the run then failed SETTLEMENT_IDENTITY_MISMATCH against
+                # the real one.  The launch records its ledger beside the profile, and the
+                # recovery reopens EXACTLY that.  A run that recorded none keeps the
+                # default, which is what its launch used.  The Orca and fake arms are
+                # untouched.
+                authority = load_standalone_authority(base, run_id, known_thread)
+                if authority is not None:
+                    ledger_path = Path(authority["runtime_state_path"])
             bindings[run_id] = (
-                FileRuntimeStateStore(default_runtime_state_path(run_id, thread_id)),
+                FileRuntimeStateStore(ledger_path),
                 pause_store.journal_for(run_id, artifact_base=base))
+            threads[run_id] = known_thread
         return bindings[run_id]
+
+    def approval_for(run_id: str) -> Any:
+        """The launch-time approval authority of a STANDALONE run, restored EXACTLY
+        (follow-up review finding 8), or a refusal by name.  Read from the same record
+        that names the ledger; a run that recorded no binding, or one this wiring cannot
+        rebuild by name, is refused rather than handed the artifact port by default."""
+        if run_id not in approvals:
+            bindings_for(run_id)
+            approvals[run_id] = standalone_approval_port_for(
+                base, run_id, threads.get(run_id, ""))
+        return approvals[run_id]
 
     def adapter_for(run_id: str) -> Any:
         if run_id not in adapters:
             ledger, journal = bindings_for(run_id)
+            if adapter_name != STANDALONE_ADAPTER:
+                # Follow-up review finding 2 / 8.  A run that RECORDED a standalone launch
+                # binding is re-entered with the standalone composition or not at all:
+                # composing the fake (or Orca) adapter over it would discard the identity
+                # fence, the ledger and the approval binding the run holds.
+                refuse_foreign_composition(base, run_id, threads.get(run_id, ""),
+                                           selected=adapter_name)
             if adapter_name == ORCA_ADAPTER:
                 # The REAL runtime, adopting the run that is already stalled.  Built per
                 # run, because the harness a recovery adopts is the stalled run's own.
@@ -1150,6 +2008,28 @@ def _watchdog_wiring(args: argparse.Namespace, *, runner: Any = None,
                     project_root=(Path(args.project_root)
                                   if getattr(args, "project_root", "") else None),
                     harness_factory=harness_factory)
+            elif adapter_name == STANDALONE_ADAPTER:
+                # OS-37 W-3.  The standalone runtime a recovery re-enters with is bound to
+                # THIS run's own durable journal and ledger, exactly as the Orca branch
+                # binds the stalled run's own harness.
+                #
+                # Consolidated review finding 5.  It is bound to a REAL runtime, rebuilt
+                # from the profile the run persisted at launch (or one the operator names
+                # with --standalone-profile).  This adapter is the one the recovered graph
+                # EXECUTES with: `runtime=None` was honest for the capability question
+                # (`capabilities_for` below still asks it that way, touching no process)
+                # but the recovered graph's EXECUTE_INTENT then called `start()` on it and
+                # died in `_require_runtime`, so a stalled standalone run became
+                # `escalation_observation_undecidable` forever instead of being recovered.
+                spec_path = getattr(args, "standalone_profile", "")
+                override: Any = None
+                if spec_path:
+                    override = _read_json(spec_path, "--standalone-profile")
+                    if not isinstance(override, dict):
+                        raise LauncherError("the standalone profile must be a JSON object")
+                adapter, _execution_journal, _port = standalone_recovery_composition(
+                    base, run_id, thread_id=threads.get(run_id, ""), ledger=ledger,
+                    pause_row_journal=journal, profile_override=override)
             else:
                 adapter = FakeAdapter(list(results), runtime_state=ledger,
                                       run_id=run_id, settlement_journal=journal,
@@ -1159,11 +2039,15 @@ def _watchdog_wiring(args: argparse.Namespace, *, runner: Any = None,
 
     def graph_factory_for(run_id: str) -> Any:
         adapter, ledger, journal = adapter_for(run_id)
+        # Finding 8: the recovered graph's PAUSE node publishes through the SAME
+        # authority the adapter declares, which for a standalone run is the recorded one.
+        port = (approval_for(run_id) if adapter_name == STANDALONE_ADAPTER
+                else approval_port)
 
         def factory(saver: Any) -> Any:
             from .graph import build_graph
             return build_graph(adapter, checkpointer=saver, runtime_state=ledger,
-                               approval_port=approval_port, journal=journal)
+                               approval_port=port, journal=journal)
         return factory
 
     def capabilities_for(run_id: str) -> Any:
@@ -1186,17 +2070,42 @@ def _watchdog_wiring(args: argparse.Namespace, *, runner: Any = None,
             ledger, journal = bindings_for(run_id)
             return OrcaAdapter(None, runtime_state=ledger, settlement_journal=journal,
                                approval_port=approval_port).capabilities()
+        if adapter_name == STANDALONE_ADAPTER:
+            # OS-37 D10.2.  `runtime=None` mirrors the Orca branch above for the same
+            # stated reason: asking what an adapter can do must not spawn, adopt or touch
+            # anything, or the run would look alive to the very gate deciding whether it
+            # is stalled.  This branch reads no process at all.
+            from .standalone_adapter import StandaloneAdapter
+            ledger, _journal = bindings_for(run_id)
+            return StandaloneAdapter(
+                None, runtime_state=ledger,
+                settlement_journal=_standalone_journal_for(base, run_id),
+                # Finding 8: the capability the run DECLARED at launch, restored from
+                # its record -- never the wiring's default port.
+                approval_port=approval_for(run_id), artifact_base=base,
+                run_id=run_id).capabilities()
         return adapter_for(run_id)[0].capabilities()
 
     from . import turn_boundary
-    return {
+    wiring = WatchdogWiring({
         "discovery": recovery_runtime.RunDiscovery(base),
         # The Orca listing authority is the real CLI boundary.  Where no `orca` binary
         # answers, the read RAISES and the sweep fails closed at R1 -- it never reads
         # "no dispatch is running" out of silence.
-        "observation": recovery_runtime.RunObservationAdapter(
-            base, runner=runner or turn_boundary._default_runner,
-            capabilities=capabilities_for),
+        # OS-37 DD-3 / W-3.  A standalone deployment has no `orca` binary to list
+        # dispatches, so the Orca listing authority would raise for every run and the
+        # sweep would fail closed at R1 forever.  The standalone observation answers the
+        # same fact from the run's OWN durable journal, keeping the three-way discipline
+        # exactly: unreadable RAISES (F1), "no open dispatch" is an empty tuple -- an
+        # ABSENCE, not an UNSUPPORTED -- and an uncovered fact still raises
+        # ObservationUnsupported.  F6/F7 are NOT relaxed; they gain a real authority.
+        # The orca and fake arms are byte-unchanged.
+        "observation": (
+            _standalone_observation(base, capabilities_for)
+            if adapter_name == STANDALONE_ADAPTER
+            else recovery_runtime.RunObservationAdapter(
+                base, runner=runner or turn_boundary._default_runner,
+                capabilities=capabilities_for)),
         "liveness": recovery_runtime.CoordinatorLivenessReader(base),
         # The gate and the outcome->action table BOTH read this clock: `react` stamps a
         # backoff deadline on it and a later sweep -- in a later process -- decides
@@ -1215,7 +2124,20 @@ def _watchdog_wiring(args: argparse.Namespace, *, runner: Any = None,
             graph_factory_for=graph_factory_for,
             recursion_limit=getattr(args, "recursion_limit", None)),
         "audit": watchdog_audit.FileWatchdogAudit(base),
-    }
+    })
+    # Round 4, finding 2: the per-run composition itself, as an ATTRIBUTE rather than a
+    # key -- the dict is unpacked straight into `watchdog_supervisor.sweep(**deps)`, whose
+    # signature is closed -- so a test can ask which ledger a recovery would reopen
+    # without driving a whole recovery.
+    wiring.adapter_for = adapter_for
+    return wiring
+
+
+class WatchdogWiring(dict):
+    """The five injected ports (a plain mapping for ``sweep(**deps)``) plus, as an
+    attribute the supervisor never sees, the per-run adapter composition."""
+
+    adapter_for: Any
 
 
 def run_watchdog_cli(argv: list[str], *, runner: Any = None,
@@ -1313,6 +2235,28 @@ def _artifact_approval_port(base: Path) -> Any:
     return ArtifactHumanApprovalPort(base)
 
 
+def configured_approval_port(authority: str, base: Path) -> Any:
+    """The approval authority the OPERATOR named, or ``None``.  R4's whole conditionality.
+
+    ``None`` is not a degraded port and is never substituted for one: it is the absence of
+    an authority, and the adapter's own ``capabilities()`` reads it as such and withdraws
+    ``human_approval``.  That is the same discipline the recovery capabilities already
+    follow -- declared on the wiring that makes them honourable, withdrawn when it is
+    absent -- rather than a flag that turns a declaration on while nothing backs it.
+
+    Refused by name for an unknown member so a typo cannot silently compose a run with no
+    authority under a flag that says it has one; ``build_parser`` already constrains the
+    command line, and this is the second line of defence for a programmatic caller.
+    """
+    if authority == NO_APPROVAL_AUTHORITY:
+        return None
+    if authority == ARTIFACT_APPROVAL_AUTHORITY:
+        return _artifact_approval_port(base)
+    raise LauncherError(
+        f"{UNKNOWN_APPROVAL_AUTHORITY}: {authority!r} is not one of "
+        f"{', '.join(APPROVAL_AUTHORITIES)}")
+
+
 def run_cli(argv: list[str] | None = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
     if raw and raw[0] in PAUSE_VERBS:
@@ -1329,6 +2273,32 @@ def run_cli(argv: list[str] | None = None) -> int:
             return 0
         state, results, orca_spec = _launch_inputs(args)
         from .runtime_state import FileRuntimeStateStore
+        runtime_state: Any = None
+        if args.adapter == STANDALONE_ADAPTER:
+            # OS-37 WI-13.  The standalone composition, in the SAME order the Orca path
+            # composes in -- with the LEDGER moved ahead of the adapter, which is external
+            # review finding #10.  The ledger has to exist first because the state this
+            # call returns carries a SNAPSHOT of `adapter.capabilities()`, and
+            # `external_resume` is withdrawn while the identity fence has no ledger to live
+            # in; taking the snapshot first made every standalone run declare no recovery
+            # capability at all.  Unlike the Orca path this needs no Run to exist -- there
+            # is no external Run -- so the run id comes from the launch spec and names only
+            # this runtime's own files.
+            resolved_run = orca_spec.get("run_id", "") or state.get("run_id", "")
+            runtime_state = FileRuntimeStateStore(
+                Path(args.runtime_state) if args.runtime_state
+                else default_runtime_state_path(resolved_run, state["thread_id"]))
+            # R4.  The approval authority is resolved HERE, at the composition root, and
+            # threaded in with the ledger -- before the capability snapshot the state
+            # carries.  `--adapter orca` and `--adapter fake` are deliberately NOT given
+            # this: what an Orca run declares is `OrcaAdapter`'s own answer and changing it
+            # is authorized by no acceptance criterion here.
+            adapter, state = build_standalone_adapter(
+                orca_spec, artifact_base=Path(args.artifact_base),
+                run_id=resolved_run, runtime_state=runtime_state,
+                profile_spec=_standalone_profile_spec(args),
+                approval_port=configured_approval_port(
+                    args.approval_authority, Path(args.artifact_base)))
         if args.adapter == ORCA_ADAPTER:
             # The production path.  The Run is created FIRST, because the run id it
             # returns is what the state, the artifact paths and the ledger are all named
@@ -1341,19 +2311,39 @@ def run_cli(argv: list[str] | None = None) -> int:
                 agent_profile_name=args.agent_profile, project_root=args.project_root)
         # Durable by default: without an explicit path the run still gets a real on-disk
         # ledger, because an unguarded default is exactly what lets a restart duplicate an
-        # external Task/Dispatch.
-        ledger_path = Path(args.runtime_state) if args.runtime_state else default_runtime_state_path(
-            state["run_id"], state["thread_id"])
-        runtime_state = FileRuntimeStateStore(ledger_path)
+        # external Task/Dispatch.  The standalone branch already built one above, and
+        # rebuilding it here would point the adapter at a ledger the capability snapshot
+        # was not taken against.
+        if runtime_state is None:
+            ledger_path = (Path(args.runtime_state) if args.runtime_state
+                           else default_runtime_state_path(state["run_id"],
+                                                           state["thread_id"]))
+            runtime_state = FileRuntimeStateStore(ledger_path)
         if args.adapter == ORCA_ADAPTER:
             adapter.runtime_state = runtime_state
+        elif args.adapter == STANDALONE_ADAPTER:
+            pass          # already threaded into the adapter AND its runtime, before the
+                          # capability snapshot that the state carries.
         else:
             from .fake_adapter import FakeAdapter
             adapter = FakeAdapter(results, runtime_state=runtime_state)
+        graph_extras: dict[str, Any] = {}
+        pause_rows = getattr(adapter, "pause_row_journal", None)
+        if pause_rows is not None:
+            # OS-37 external review #9, wired HERE rather than in `graph.py`.  `build_graph`
+            # otherwise falls back to `adapter.settlement_journal`, which for the standalone
+            # adapter is the append-only `ExecutionJournal` -- an object with no `row()` and
+            # no `record()`.  The PAUSE and DISPOSE nodes call both, the `AttributeError`
+            # was swallowed by `_settlement_row`'s broad handler, and every pause on a
+            # standalone run was reported as `DISPATCH_UNACCOUNTED`.  `graph.py` is a pinned
+            # policy module and this ticket adds no branch to it; the journal seam it
+            # already exposes is the correct place to say which journal this composition
+            # means.
+            graph_extras["journal"] = pause_rows
         final = execute_state(state, adapter=adapter, runtime_state=runtime_state,
                               recursion_limit=args.recursion_limit,
                               checkpoint_store_path=args.checkpoint_store,
-                              artifact_base=Path(args.artifact_base))
+                              artifact_base=Path(args.artifact_base), **graph_extras)
     except LauncherError as exc:
         print(f"run_workflow: {exc}", file=sys.stderr)
         return USAGE_EXIT_CODE
@@ -1365,6 +2355,27 @@ def run_cli(argv: list[str] | None = None) -> int:
         print(f"terminal_status={summary['terminal_status']} reason={reason} "
               f"phases={summary['requested_phases']} steps={summary['trace_length']}")
     return summary["exit_code"]
+
+
+def _standalone_profile_spec(args: argparse.Namespace) -> dict[str, Any] | None:
+    """The driver profile, from ``--standalone-profile`` or from the state spec.
+
+    Returns ``None`` when neither supplies one, so ``build_standalone_adapter`` refuses by
+    name.  There is deliberately no default profile: AC-37-03 requires explicit
+    configuration, and a built-in CLI table is exactly what U7 is routed around.
+    """
+    path = getattr(args, "standalone_profile", "")
+    if path:
+        spec = _read_json(path, "--standalone-profile")
+        if not isinstance(spec, dict):
+            raise LauncherError("the standalone profile must be a JSON object")
+        return spec
+    if getattr(args, "state", ""):
+        state_spec = _read_json(args.state, "--state")
+        if isinstance(state_spec, dict) and isinstance(
+                state_spec.get("standalone_profile"), dict):
+            return state_spec["standalone_profile"]
+    return None
 
 
 def _launch_inputs(
@@ -1381,6 +2392,23 @@ def _launch_inputs(
         if not args.state:
             raise LauncherError(
                 f"{ORCA_ADAPTER_REQUIRES_STATE}: --adapter orca needs --state")
+        spec = _read_json(args.state, "--state")
+        if not isinstance(spec, dict):
+            raise LauncherError("state specification must be a JSON object")
+        return build_state(spec), [], spec
+    if args.adapter == STANDALONE_ADAPTER:
+        # A standalone run scripts nothing either, for the same reason: it drives real
+        # local agent processes.  The state built here is PROVISIONAL -- `main` rebuilds it
+        # through `build_standalone_state` around the live adapter's own capabilities, which
+        # is D-2(b) -- so this call exists only to validate the spec and refuse early.
+        if not args.state:
+            raise LauncherError(
+                f"{STANDALONE_ADAPTER_REQUIRES_STATE}: --adapter standalone needs --state")
+        if args.results:
+            raise LauncherError(
+                f"{STANDALONE_ADAPTER_REQUIRES_STATE}: --results is the fake adapter's "
+                "scripted input; --adapter standalone drives real local processes and "
+                "scripts nothing")
         spec = _read_json(args.state, "--state")
         if not isinstance(spec, dict):
             raise LauncherError("state specification must be a JSON object")

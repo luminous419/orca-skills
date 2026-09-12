@@ -1,0 +1,250 @@
+#!/bin/sh
+# =====================================================================================
+# OS-37 BUGFIX iteration 2 -- the GRAPH-LEVEL fixture agent.
+#
+# `os37-r10-agent` drives the headline R10 evidence and its behaviour is frozen (USER
+# DIRECTIVE D-H), so the per-finding end-to-end graph regressions that external review
+# B-03 requires get their OWN fixture rather than new branches in that one.
+#
+# Like the R10 agent it BINDS ITS ANSWER TO THE DISPATCH IT WAS ACTUALLY GIVEN -- it reads
+# the delivered intent and answers as the role, phase, run and gate iteration that intent
+# really carries -- and it invents no schema: the record it emits is the repository's own
+# `scripts/fixtures/decision_gate/valid/worker_clear.json` with the binding fields, and
+# only those, replaced.
+#
+# What it adds is a set of SCENARIO SWITCHES, every one of them default-off, so that one
+# real `run_workflow.py --adapter standalone` run can exercise the leg a given finding is
+# about:
+#
+#   OS37_GA_FAIL_PHASE=<PHASE>   the phase reviewer returns FAIL on the first iteration of
+#                                that phase and PASS afterwards -- the CORRECTION leg.
+#   OS37_GA_AUTH_FAIL=1          the turn emits the measured authentication-failure shape
+#                                (`is_error:true`, `terminal_reason:"api_error"`) and exits
+#                                non-zero.  Finding #2's settlement predicate.
+#   OS37_GA_NO_RESULT_ONCE=<f>   the FIRST turn (only) emits readiness and a delivery proof
+#                                and then exits with NO completion record, which is what
+#                                `StandaloneDispatchFailed` is raised for.  `<f>` is the
+#                                once-marker; later turns behave normally, so the run can
+#                                reach the correction route.  Finding #8.
+#   OS37_GA_EXIT_CODE_ONCE=<f>   the FIRST turn (only) emits readiness and a delivery proof
+#                                and then exits NON-ZERO with no completion record at all.
+#                                `OS37_GA_EXIT_CODE` names the status (default 9) and
+#                                `OS37_GA_EXIT_CODE_ROLE` scopes it the same way below.
+#   OS37_GA_NO_RESULT_ROLE=<R>   restrict the switch above to dispatches whose delivered
+#                                intent names role <R>, so the failure lands on the leg the
+#                                finding is about rather than on the first turn of the run.
+#   OS37_GA_INTENT_DUMP=<dir>    write every delivered intent, by intent id.  EVIDENCE of
+#                                what the graph dispatched after a failure -- never an input
+#                                to anything this fixture decides.
+#   OS37_GA_AUTH_PROMPT=1        the declared auth probe ASKS A QUESTION instead of
+#                                answering one, and never exits.  A real CLI does exactly
+#                                this when its session has lapsed, and a preflight that
+#                                treats the ambiguity as anything but a refusal is how a
+#                                green preflight comes to sit on an unauthenticated CLI.
+#                                Finding #7's fail-closed prompt leg.
+#   OS37_GA_GATE=<stem>          answer with a DIFFERENT canonical decision-gate record
+#                                from `scripts/fixtures/decision_gate/valid/<stem>.json`
+#                                (for example `worker_needs_input`), so a run can be steered
+#                                into the engine's real PAUSE.  The record is still bound to
+#                                the delivered intent; only which canonical record is used
+#                                changes.  Findings #5 and #9 need a real paused run.
+#   OS37_GA_BODY_IN_RESULT=1     put the whole report INSIDE the structured completion
+#                                record's `result` field, which is the shape both installed
+#                                CLIs really emit (`--output-format stream-json`), instead
+#                                of writing it to the raw channel after the record.  A
+#                                profile then needs a `result_body_records` selector to find
+#                                it at all, which is finding #3.
+#   OS37_GA_TURN_DELAY_MS=<ms>   sleep between READY and the completion record: an agent
+#                                turn that outruns the readiness window.  Finding #4.
+#   OS37_GA_TURN_DELAY_ROLE=<R>  scope the delay above to dispatches naming role <R>.
+#   OS37_GA_ARGV_DUMP=<file>     append this invocation's argv, one line per invocation,
+#                                INCLUDING the preflight probes.  Finding #6 observes the
+#                                declared auth probe at the process boundary.
+#   OS37_GA_ENV_DUMP=<dir>       write EVERY invocation's environment, one file per pid --
+#                                the preflight probes included.  Finding #7 observes the
+#                                child environment the composition really built, at the
+#                                process boundary, rather than the one it meant to build.
+#
+# Answers `--version`, `--help` and the declared auth probe verb (`auth status`) like a real
+# CLI, because preflight runs all three under the same child env.
+# =====================================================================================
+SESSION_ID="${OS37_STUB_SESSION_ID:-}"
+WANT_VERSION=0
+WANT_HELP=0
+WANT_AUTH=0
+if [ -n "${OS37_GA_ARGV_DUMP:-}" ]; then
+  printf '%s\n' "$*" >> "$OS37_GA_ARGV_DUMP"
+fi
+if [ -n "${OS37_GA_ENV_DUMP:-}" ]; then
+  mkdir -p "$OS37_GA_ENV_DUMP"
+  env > "$OS37_GA_ENV_DUMP/$$.part"
+  mv "$OS37_GA_ENV_DUMP/$$.part" "$OS37_GA_ENV_DUMP/$$.env"
+fi
+for arg in "$@"; do
+  case "$arg" in auth) WANT_AUTH=1 ;; esac
+done
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --session-id) SESSION_ID="$2"; shift 2 ;;
+    --version) WANT_VERSION=1; shift ;;
+    --help) WANT_HELP=1; shift ;;
+    *) shift ;;
+  esac
+done
+
+if [ "$WANT_VERSION" = "1" ]; then echo "os37-graph-agent 1.2.3"; exit 0; fi
+if [ "$WANT_HELP" = "1" ]; then
+  echo "--bare --settings --strict-mcp-config --mcp-config --session-id -p"
+  echo "--output-format stream-json --include-partial-messages --permission-mode"
+  echo "--debug-file --no-session-persistence exec --json --ignore-user-config"
+  echo "--ephemeral -C --add-dir --skip-git-repo-check --color -s -o"
+  exit 0
+fi
+if [ "$WANT_AUTH" = "1" ]; then
+  if [ "${OS37_GA_AUTH_PROMPT:-}" = "1" ]; then
+    # A lapsed session: the CLI asks rather than answers, and waits for the answer.
+    echo "Login required, please sign in to continue"
+    exec cat > /dev/null
+  fi
+  # The DECLARED auth probe (`auth status`).  A real CLI answers it whatever else it is
+  # doing, and it is a different question from whether the agent turn authenticates.
+  echo '1.2.3 {"loggedIn": true}'
+  exit 0
+fi
+
+# 1. Readiness, on the structured channel, carrying the session id minted for THIS spawn.
+printf '{"type":"system","session_id":"%s"}\n' "$SESSION_ID"
+
+# 2. The delivered frame.  The runtime writes the frame then Enter, so it is one line.
+IFS= read -r PROMPT || PROMPT=""
+
+# 3. The delivery proof the driver verifies.
+printf '{"type":"message_start"}\n'
+
+# ---- the NO-COMPLETION leg (finding #8) --------------------------------------------
+# A turn that produced a delivery proof and then died without a completion record.  That
+# is exactly the input `StandaloneDispatchFailed` names, and before the fix it left the
+# graph as a traceback rather than as a verdict the workflow could route on.
+if [ -n "${OS37_GA_NO_RESULT_ONCE:-}" ] && [ ! -f "$OS37_GA_NO_RESULT_ONCE" ]; then
+  SCOPED=1
+  if [ -n "${OS37_GA_NO_RESULT_ROLE:-}" ]; then
+    SCOPED=0
+    case "$PROMPT" in *"$OS37_GA_NO_RESULT_ROLE"*) SCOPED=1 ;; esac
+  fi
+  if [ "$SCOPED" = "1" ]; then
+    : > "$OS37_GA_NO_RESULT_ONCE"
+    exit 0
+  fi
+fi
+
+# ---- the NON-ZERO EXIT leg (correction R5) -------------------------------------------
+# The process dies with a non-zero status and NO completion record of any kind -- an OOM
+# kill, a crash, a `set -e` abort.  Distinct from the authentication leg below, which emits
+# a TYPED terminal record and then exits non-zero: there the runtime has a named cause to
+# settle from, here it has only an exit status.  Scoped by role the same way the
+# no-completion leg is, so a run can be steered into it for exactly one dispatch.
+if [ -n "${OS37_GA_EXIT_CODE_ONCE:-}" ] && [ ! -f "$OS37_GA_EXIT_CODE_ONCE" ]; then
+  SCOPED=1
+  if [ -n "${OS37_GA_EXIT_CODE_ROLE:-}" ]; then
+    SCOPED=0
+    case "$PROMPT" in *"$OS37_GA_EXIT_CODE_ROLE"*) SCOPED=1 ;; esac
+  fi
+  if [ "$SCOPED" = "1" ]; then
+    : > "$OS37_GA_EXIT_CODE_ONCE"
+    exit "${OS37_GA_EXIT_CODE:-9}"
+  fi
+fi
+
+# ---- the LONG TURN leg (finding #4) -------------------------------------------------
+# `OS37_GA_TURN_DELAY_ROLE=<R>` scopes the delay to dispatches whose delivered intent
+# names role <R>, the same way the no-completion and exit-code legs are scoped, so a run
+# can be steered into ONE role's turn outrunning the completion bound (consolidated
+# follow-up review, finding 1: a timed-out Reviewer must be terminated and reaped before
+# the correction round it triggers may start).
+if [ -n "${OS37_GA_TURN_DELAY_MS:-}" ]; then
+  DELAY_SCOPED=1
+  if [ -n "${OS37_GA_TURN_DELAY_ROLE:-}" ]; then
+    DELAY_SCOPED=0
+    case "$PROMPT" in *"$OS37_GA_TURN_DELAY_ROLE"*) DELAY_SCOPED=1 ;; esac
+  fi
+  if [ "$DELAY_SCOPED" = "1" ]; then
+    /usr/bin/env python3 -c 'import sys,time; time.sleep(float(sys.argv[1])/1000.0)' \
+      "$OS37_GA_TURN_DELAY_MS"
+  fi
+fi
+
+# ---- the AUTHENTICATION-FAILURE leg (finding #2) ------------------------------------
+# The measured M-15 shape: `subtype:"success"` with `is_error:true` and a non-success
+# `terminal_reason`, and a non-zero exit.  Every one of those three legs refuses.
+if [ "${OS37_GA_AUTH_FAIL:-}" = "1" ]; then
+  printf '{"type":"result","subtype":"success","is_error":true,"terminal_reason":"api_error"}\n'
+  exit 1
+fi
+
+# 4. The completion record and the body, bound to the dispatch.  One interpreter
+#    call, so the verdict line and the record can never disagree about which role,
+#    phase or iteration this dispatch is -- and so the body can be placed either on
+#    the raw channel or inside the structured record from one construction.
+PROMPT="$PROMPT" \
+FIXTURES="$(cd "$(dirname "$0")/../../.." && pwd)/fixtures/decision_gate/valid" \
+/usr/bin/env python3 - <<'PY'
+import json, os, sys
+
+raw = os.environ["PROMPT"]
+start, end = raw.find("{"), raw.rfind("}")
+intent = json.loads(raw[start:end + 1]) if start >= 0 and end > start else {}
+
+dump = os.environ.get("OS37_GA_INTENT_DUMP")
+if dump:                       # evidence, never a decision input
+    os.makedirs(dump, exist_ok=True)
+    with open(os.path.join(dump, "%s.json" % intent.get("intent_id", "unknown")), "w") as fh:
+        json.dump(intent, fh, indent=2, sort_keys=True)
+
+role = str(intent.get("role", "WORKER"))
+phase = str(intent.get("phase", ""))
+round_kind = str(intent.get("round_kind", "")).upper()
+final_round = role == "FINAL_REVIEWER" or round_kind == "FINAL_REVIEW"
+reviewer = role in ("PHASE_REVIEWER", "FINAL_REVIEWER")
+
+if reviewer:
+    verdict = "PASS"
+    fail_phase = os.environ.get("OS37_GA_FAIL_PHASE", "")
+    if (fail_phase and not final_round and phase.upper() == fail_phase.upper()
+            and int(intent.get("phase_iteration") or 0) <= 1):
+        verdict = "FAIL"
+    report = ["RESULT: %s\n" % verdict]
+else:
+    report = ["STATUS: COMPLETE\n"]
+stem = os.environ.get("OS37_GA_GATE") or "worker_clear"
+record = json.load(open(os.path.join(os.environ["FIXTURES"], "%s.json" % stem)))
+report.append("DECISION_GATE_STATE: %s\n" % record["state"])
+
+if reviewer:
+    record["boundary"], record["source"], record["role"] = "B3", "reviewer", "reviewer"
+    record["verdict"] = verdict
+record["run"] = intent.get("run_id", record["run"])
+record["phase"] = "final_review" if final_round else phase.lower()
+record["responsible_phase"] = record["phase"]
+gate_iteration = intent.get("gate_iteration")
+if isinstance(gate_iteration, int) and gate_iteration >= 1:
+    record["iteration"] = gate_iteration
+record["source_binding"] = "artifacts/runs/%s/%s.md" % (
+    record["run"], record["phase"].upper())
+
+body = "".join(report) + "```decision-gate\n" \
+    + json.dumps(record, sort_keys=True) + "\n" + "```\n"
+
+completion = {"type": "result", "subtype": "success", "is_error": False,
+              "terminal_reason": "completed"}
+if os.environ.get("OS37_GA_BODY_IN_RESULT") == "1":
+    # The shape both installed CLIs emit under `--output-format stream-json`:
+    # the report is a FIELD of the completion record, so a profile with no
+    # `result_body_records` selector hands the whole JSON stream to the
+    # Markdown parser and finds nothing.  That is finding #3.
+    completion["result"] = body
+    sys.stdout.write(json.dumps(completion) + "\n")
+else:
+    sys.stdout.write(json.dumps(completion) + "\n")
+    sys.stdout.write(body)
+PY
+exit 0

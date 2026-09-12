@@ -1,0 +1,128 @@
+#!/bin/sh
+# =====================================================================================
+# OS-37 R10 fixture agent.  A stand-in agent CLI for the Orca-free
+# Worker -> Reviewer -> correction -> fresh Final Review E2E.
+#
+# It differs from `os37-stub-cli` in exactly one respect, and that respect is why it
+# exists: it BINDS ITS ANSWER TO THE DISPATCH IT WAS ACTUALLY GIVEN.  `os37-stub-cli`
+# emits the repository's canonical `worker_clear.json` verbatim, whose `run` is
+# `run_fixture`; OS-42's gate correctly refuses that as DECISION_GATE_INPUT_UNBOUND the
+# moment it is delivered into a real run, so that fixture cannot drive a multi-round
+# workflow.  This one reads the delivered intent and answers as the role, phase, run and
+# gate iteration that intent really carries.
+#
+# It invents no schema.  The record it emits is the repository's OWN canonical record --
+# `scripts/fixtures/decision_gate/valid/worker_clear.json` -- with the binding fields, and
+# only those, replaced by the dispatched values.  Everything else is byte-identical to the
+# fixture on disk, so this stays a test of the STANDALONE RUNTIME rather than a test of
+# whether the fixture author remembered OS-42's nineteen-field schema.
+#
+# Answers `--version` and `--help` like a real CLI (preflight runs both under the same
+# child env), and reads `--session-id` from ARGV exactly as a real driver passes it, so
+# readiness quorum leg R-B is genuinely exercised rather than simulated.
+#
+# `OS37_R10_FAIL_PHASE=<PHASE>` makes the PHASE Reviewer return FAIL the first time it
+# reviews that phase and PASS afterwards.  That is the CORRECTION leg: without a real
+# reviewer FAIL there is no correction round to observe, and with an unconditional one the
+# loop never terminates.
+# =====================================================================================
+SESSION_ID="${OS37_STUB_SESSION_ID:-}"
+WANT_VERSION=0
+WANT_HELP=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --session-id) SESSION_ID="$2"; shift 2 ;;
+    --version) WANT_VERSION=1; shift ;;
+    --help) WANT_HELP=1; shift ;;
+    *) shift ;;
+  esac
+done
+
+if [ "$WANT_VERSION" = "1" ]; then echo "os37-r10-agent 1.2.3"; exit 0; fi
+if [ "$WANT_HELP" = "1" ]; then
+  echo "--bare --settings --strict-mcp-config --mcp-config --session-id -p"
+  echo "--output-format stream-json --include-partial-messages --permission-mode"
+  echo "--debug-file --no-session-persistence exec --json --ignore-user-config"
+  echo "--ephemeral -C --add-dir --skip-git-repo-check --color -s -o"
+  exit 0
+fi
+
+# 1. Readiness, on the structured channel, carrying the session id minted for THIS spawn.
+printf '{"type":"system","session_id":"%s"}\n' "$SESSION_ID"
+
+# 2. The delivered frame.  The runtime writes the frame then Enter, so it is one line.
+IFS= read -r PROMPT || PROMPT=""
+
+# 3. The turn.  The structured turn-start is the delivery proof the driver verifies.
+#
+# `is_error` is EMITTED, and emitted false.  This fixture's profile declares it as the
+# completion selector's `error_field`, and D4.4's settlement predicate treats a
+# DECLARED-but-ABSENT error field as UNKNOWN rather than as false -- which is the
+# fail-closed direction, and is what OS-37's external review #2 asked for: a real CLI's
+# result record always carries the field, and a fixture that omitted it was relying on the
+# old behaviour where the record's mere existence meant success.
+printf '{"type":"message_start"}\n'
+printf '{"type":"result","subtype":"success","is_error":false}\n'
+
+# 4. The body, bound to the dispatch.  One interpreter call, so the verdict line and the
+#    record can never disagree about which role, phase or iteration this dispatch is.
+PROMPT="$PROMPT" \
+FIXTURES="$(cd "$(dirname "$0")/../../.." && pwd)/fixtures/decision_gate/valid" \
+/usr/bin/env python3 - <<'PY'
+import json, os, sys
+
+raw = os.environ["PROMPT"]
+# The runtime frames the prompt for a PTY -- bracketed paste around the payload -- so the
+# line the shell read carries the frame's markers as well as the JSON.  A real CLI strips
+# its own transport framing; this fixture does the same, by taking the outermost JSON
+# object on the line rather than assuming the line IS the object.
+start, end = raw.find("{"), raw.rfind("}")
+intent = json.loads(raw[start:end + 1]) if start >= 0 and end > start else {}
+
+role = str(intent.get("role", "WORKER"))
+phase = str(intent.get("phase", ""))
+round_kind = str(intent.get("round_kind", "")).upper()
+final_round = role == "FINAL_REVIEWER" or round_kind == "FINAL_REVIEW"
+reviewer = role in ("PHASE_REVIEWER", "FINAL_REVIEWER")
+
+dump = os.environ.get("OS37_R10_INTENT_DUMP")
+if dump:                       # evidence, never a decision input
+    os.makedirs(dump, exist_ok=True)
+    with open(os.path.join(dump, "%s.json" % intent.get("intent_id", "unknown")), "w") as fh:
+        json.dump(intent, fh, indent=2, sort_keys=True)
+
+# ---- the verdict -------------------------------------------------------------------
+if reviewer:
+    verdict = "PASS"
+    fail_phase = os.environ.get("OS37_R10_FAIL_PHASE", "")
+    if (fail_phase and not final_round and phase.upper() == fail_phase.upper()
+            and int(intent.get("phase_iteration") or 0) <= 1):
+        verdict = "FAIL"
+    sys.stdout.write("RESULT: %s\n" % verdict)
+else:
+    sys.stdout.write("STATUS: COMPLETE\n")
+sys.stdout.write("DECISION_GATE_STATE: CLEAR\n")
+
+# ---- the gate record, bound ---------------------------------------------------------
+record = json.load(open(os.path.join(os.environ["FIXTURES"], "worker_clear.json")))
+if reviewer:
+    record["boundary"], record["source"], record["role"] = "B3", "reviewer", "reviewer"
+    record["verdict"] = verdict
+record["run"] = intent.get("run_id", record["run"])
+# The FINAL REVIEW round is its own boundary: OS-42 binds its gate record to the phase
+# name `final_review`, not to whichever phase the state happens to be resting on.  A
+# record echoing the resting phase back is correctly refused as DECISION_GATE_INPUT_UNBOUND,
+# so the ROUND -- not the state cursor -- decides this field.
+record["phase"] = "final_review" if final_round else phase.lower()
+record["responsible_phase"] = record["phase"]
+gate_iteration = intent.get("gate_iteration")
+if isinstance(gate_iteration, int) and gate_iteration >= 1:
+    record["iteration"] = gate_iteration
+record["source_binding"] = "artifacts/runs/%s/%s.md" % (
+    record["run"], record["phase"].upper())
+
+sys.stdout.write("```decision-gate\n")
+sys.stdout.write(json.dumps(record, sort_keys=True) + "\n")
+sys.stdout.write("```\n")
+PY
+exit 0
