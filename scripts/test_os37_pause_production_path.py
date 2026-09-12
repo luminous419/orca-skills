@@ -562,10 +562,10 @@ class _PausedStandaloneRun:
     disposition are all the engine's.  The graph it drives is built here from the SAME
     `build_standalone_adapter` composition `run_cli` uses.
 
-    It is driven directly rather than through `run_pause_cli` because that CLI refuses
-    `--adapter standalone` by name, deliberately, and this correction does not remove that
-    refusal -- `test_the_pause_cli_still_refuses_a_standalone_resume_by_name` asserts it is
-    still there.
+    It is driven directly because it exercises the ENGINE's disposal entry point; the
+    shipped `resume` verb composes the same standalone runtime since the follow-up review
+    (finding 2) and refuses any other adapter on a standalone run --
+    `test_the_pause_cli_composes_standalone_and_refuses_a_foreign_adapter` asserts that.
     """
 
     RUN = "run_r4dispose"
@@ -637,10 +637,10 @@ class E2EStandaloneCancelThroughTheGraphTests(_PausedStandaloneRun, unittest.Tes
     ledger and the terminal disposition are all the ENGINE's.  The graph it drives is built
     from the SAME `build_standalone_adapter` composition `run_cli` uses.
 
-    It is driven directly rather than through `run_pause_cli` because that CLI refuses
-    `--adapter standalone` by name, deliberately, and this correction does not remove that
-    refusal -- `test_the_pause_cli_still_refuses_a_standalone_resume_by_name` asserts it is
-    still there.
+    It is driven directly because it exercises the ENGINE's disposal entry point; since
+    the follow-up review (finding 2) the shipped `resume` verb composes the same
+    standalone runtime and refuses any other adapter on a standalone run --
+    `test_the_pause_cli_composes_standalone_and_refuses_a_foreign_adapter` asserts that.
     """
 
     RUN = "run_r4cancel"
@@ -678,12 +678,17 @@ class E2EStandaloneCancelThroughTheGraphTests(_PausedStandaloneRun, unittest.Tes
         self.assertEqual(again.code, "RUN_ALREADY_CANCELLED")
         self.assertFalse(again.effect_performed)
 
-    def test_the_pause_cli_still_refuses_a_standalone_resume_by_name(self) -> None:
-        """The named limitation stays named.  R4 did not remove it and does not pretend to.
+    def test_the_pause_cli_composes_standalone_and_refuses_a_foreign_adapter(self) -> None:
+        """Follow-up review finding 2 REPLACED the named limitation this case used to lock.
 
-        `run_pause_cli` composes its adapter BEFORE the cancel/abandon branch, so this
-        refusal covers disposal through that CLI too; disposal in the process that owns the
-        run's artifacts goes through `pause_runtime.dispose_run`, as the case above does.
+        `resume --adapter standalone` used to be refused by name while omitting the flag
+        composed the FAKE adapter over a standalone run -- two contracts, neither
+        coherent.  Now there is one: a standalone-launched run is re-entered with the
+        standalone composition (its recorded profile, ledger and approval authority --
+        `test_os37_recovery_boundary_regressions.F02StandalonePauseResumesEndToEndTests`
+        drives that end to end), and the fake default is refused ON THIS RUN by name.
+        Disposal through this CLI therefore composes the same runtime the graph paused
+        with, and the in-process `pause_runtime.dispose_run` route above stays valid.
         """
         import contextlib
         import io
@@ -691,9 +696,10 @@ class E2EStandaloneCancelThroughTheGraphTests(_PausedStandaloneRun, unittest.Tes
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
             code = launcher.run_cli(["resume", "--run-id", self.RUN,
                                      "--artifact-base", str(self.base),
-                                     "--adapter", "standalone", "--cancel", "--json"])
+                                     "--adapter", "fake", "--cancel", "--json"])
         self.assertEqual(code, launcher.USAGE_EXIT_CODE)
-        self.assertIn(launcher.STANDALONE_ADAPTER_UNSUPPORTED_HERE, err.getvalue())
+        self.assertIn(launcher.STANDALONE_RUN_ADAPTER_MISMATCH, err.getvalue())
+        self.assertNotIn(launcher.STANDALONE_ADAPTER_UNSUPPORTED_HERE, err.getvalue())
 
 
 @unittest.skipUnless(_langgraph_ok(), LANGGRAPH_REASON)

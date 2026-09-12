@@ -221,7 +221,16 @@ class StandaloneSession:
         self._preflight_cache = preflight_cache if preflight_cache is not None else {}
         self._preflight_evidence: dict[str, Any] = {}
         self.profile = profile
-        self.artifact_base = Path(artifact_base)
+        # ---- follow-up review finding 6: ABSOLUTE, resolved in the SUPERVISOR ----------
+        # Every path this session mints under the artifact base -- the capture, the exit
+        # sentinel, the spawn record and the dispatch-scoped `-o` result file -- is handed
+        # to a child that `chdir`s into the agent's worktree before it runs.  A relative
+        # artifact base therefore named one file to the child (relative to the worktree)
+        # and another to this process (relative to the launcher's cwd): the driver's `-o`
+        # file was written successfully and `result_body()` read `None`.  The spawn
+        # already canonicalised its two paths in the parent; the session now canonicalises
+        # the base itself, so no path composed from it can split between two directories.
+        self.artifact_base = Path(os.path.abspath(os.fspath(artifact_base)))
         self.run_id = run_id
         self.journal = journal
         self.runtime_state = runtime_state
@@ -260,7 +269,8 @@ class StandaloneSession:
         scoped = profile
         if profile.output_last_message_path:
             self.last_message_path = str(
-                capture_mod.capture_path(artifact_base, run_id, self.session_id).with_name(
+                capture_mod.capture_path(self.artifact_base, run_id,
+                                         self.session_id).with_name(
                     f"last_message.{self.incarnation}.md"))
             scoped = profile.with_paths(output_last_message_path=self.last_message_path)
         self.driver = drivers.driver_for(scoped)
@@ -268,7 +278,7 @@ class StandaloneSession:
         self.record: dict[str, Any] | None = None
         self.pty: dict[str, Any] | None = None
         self.capture = capture_mod.BoundedCapture(
-            capture_mod.capture_path(artifact_base, run_id, self.session_id),
+            capture_mod.capture_path(self.artifact_base, run_id, self.session_id),
             limits=profile.capture)
         self.event_log: list[str] = []
         self.state = "STARTING"
@@ -283,6 +293,21 @@ class StandaloneSession:
         #: settles anything: D4.3c's precedence rule lets a typed terminal outcome settle a
         #: run whether or not a proof was ever constructed.
         self.delivery_proof: dict[str, Any] | None = None
+        #: The exit proof this session established, once it has (finding 3 of the
+        #: follow-up review).  ``None`` until then.  Securing the lifecycle twice would
+        #: re-run the ladder over a reclaimed pty, so the first proof is remembered.
+        self.exit_proof: dict[str, Any] | None = None
+        #: ``True`` for a session RECONSTRUCTED from durable evidence by a stranger process
+        #: (finding 1 of the follow-up review): it holds no pty master and no exit-watcher
+        #: child, only the ownership record, the capture file and the sentinel path.
+        self.adopted = False
+        #: Whether THIS session writes the ledger's settlement.  A supervising session
+        #: does, under the executor's lease token; an ADOPTED one does not -- the
+        #: collecting executor holds the only live lease and writes the ledger itself
+        #: (`executor._collect`), so the session records the journal row and hands the
+        #: event up.  The journal's admission ladder still fences against the ledger's
+        #: receipt either way.
+        self._writes_ledger = True
 
     # -- identity ------------------------------------------------------------------------
     @property
@@ -993,6 +1018,202 @@ class StandaloneSession:
                 "spawn_token": "", "start_outcome": "ready", "failure_reason": "",
                 "teardown": "not_required", "reused_existing_effect": True}
 
+    # -- follow-up review finding 1: COLLECT an in-flight dispatch from durable evidence --
+    def adopt(self, *, fence: str) -> dict[str, Any]:
+        """Rebuild THIS session's identity and ownership record from what a crashed
+        supervisor left on disk, fenced to ``fence``.  Spawns nothing.
+
+        The evidence, in the order it is trusted:
+
+        1. the CHILD-WRITTEN SPAWN RECORD for the fence's incarnation -- the agent's own
+           pid, group, session, start identity and argv digest, written before `execve`;
+        2. the JOURNAL's `spawned` / `SPAWN_OBSERVED` rows for the same fence -- the pty
+           id, the captured tty, the env digest and the dispatch/task ids the supervisor
+           observed;
+        3. the persisted PROFILE the runtime was rebuilt from (the caller's job).
+
+        The two must AGREE -- same pid, same session id, same argv digest -- or nothing is
+        adopted: a journal that names one process and a record that names another is not
+        this dispatch's evidence.  ``{"adopted": bool, "detail": str, ...}`` says which.
+        """
+        session_id, _, incarnation = fence.partition(":")
+        if not session_id or not incarnation:
+            return {"adopted": False, "detail": f"fence {fence!r} names no incarnation"}
+        rows = self.journal.rows_for(self.intent_id)
+        mine = [row for row in rows
+                if row.get("session_id") == session_id
+                and row.get("process_incarnation") == incarnation]
+        spawned = next((row for row in mine if row["kind"] == "EVENT"
+                        and row["event"] == "spawned"), None)
+        observed = next((row for row in mine if row["kind"] == "SPAWN_OBSERVED"), None)
+        if spawned is None:
+            return {"adopted": False,
+                    "detail": f"the journal holds no spawn observation for {fence!r}"}
+        probe = pty_supervisor.read_spawn_records(self.artifact_base, self.run_id,
+                                                 self.intent_id, incarnation=incarnation)
+        if probe["outcome"] != "present":
+            return {"adopted": False, "spawn_record": probe["outcome"],
+                    "detail": f"no child-written spawn record for {fence!r}: "
+                              f"{probe['detail']}"}
+        record = dict(probe["record"] or {})
+        vocab = dict(spawned.get("source_vocabulary") or {})
+        pid = int(record.get("pid") or 0)
+        if not pid or int(vocab.get("pid") or 0) != pid:
+            return {"adopted": False,
+                    "detail": f"the spawn record names pid {pid!r} and the journal "
+                              f"{vocab.get('pid')!r}; they do not name one process"}
+        if str(record.get("session_id") or "") != session_id:
+            return {"adopted": False,
+                    "detail": "the spawn record names another session id"}
+        argv_digest = str(vocab.get("argv_digest") or "")
+        if argv_digest and str(record.get("argv_digest") or "") != argv_digest:
+            return {"adopted": False,
+                    "detail": "the spawn record's argv digest contradicts the journal's"}
+        tty = str(vocab.get("captured_tty") or "")
+        pty_id = str(vocab.get("pty_id") or "")
+        env_digest = str(vocab.get("env_digest") or record.get("env_digest") or "")
+        if not tty or not pty_id or not argv_digest or not env_digest:
+            # Nothing is invented for an ownership record: an axis the journal never
+            # recorded is an axis this successor cannot verify, and the ladder must not
+            # act on a record that names a value nobody observed.
+            return {"adopted": False,
+                    "detail": "the journal names no captured tty / pty id / argv digest / "
+                              "env digest to verify ownership against"}
+        # ---- identity: the fence's, not freshly minted ------------------------------
+        self.session_id = session_id
+        self.incarnation = incarnation
+        self.adopted = True
+        self._writes_ledger = False
+        for row in mine:
+            if row.get("task_id"):
+                self.intent.setdefault("task_id", row["task_id"])
+            if row.get("dispatch_id"):
+                self.intent.setdefault("dispatch_id", row["dispatch_id"])
+        self.last_message_path = ""
+        scoped = self.profile
+        if self.profile.output_last_message_path:
+            self.last_message_path = str(
+                capture_mod.capture_path(self.artifact_base, self.run_id,
+                                         self.session_id).with_name(
+                    f"last_message.{self.incarnation}.md"))
+            scoped = self.profile.with_paths(output_last_message_path=self.last_message_path)
+        self.driver = drivers.driver_for(scoped)
+        self.capture = capture_mod.BoundedCapture(
+            capture_mod.capture_path(self.artifact_base, self.run_id, self.session_id),
+            limits=self.profile.capture)
+        self.pty = None
+        self.record = self._ownership_record(
+            pid=pid, pgid=int(record.get("pgid") or pid), sid=int(record.get("sid") or pid),
+            tty=tty, pty_id=pty_id, argv_digest=argv_digest, env_digest=env_digest)
+        self._bind_start_identity(record)
+        # The state the journal last observed for this fence, so the settlement edge is
+        # taken from where the crashed supervisor left off rather than from STARTING.
+        last_state = next((row["state"] for row in reversed(mine) if row.get("state")),
+                          "STARTING")
+        self.state = str(last_state) if str(last_state) in lifecycle.STATES else "STARTING"
+        self.event_log = ["spawned", "identity_bound"]
+        if observed is not None:
+            self.event_log.append("readiness_observed")
+        #: Whether the crashed supervisor PROVED the prompt delivered before it died.  For
+        #: `post_ready_delivery` a dispatch with no proof can never complete -- the prompt
+        #: was never written and a stranger holds no master to write it -- so `collect`
+        #: does not wait a completion budget for it.
+        self._delivery_proven = any(row["event"] == "delivery_proof_observed"
+                                    for row in mine)
+        self.delivery_intent = None
+        prior = self.journal.delivery_intent_for(self.intent_id)
+        if prior is not None:
+            self.delivery_intent = dict(prior.get("source_vocabulary") or {})
+        self._journal(kind="EVENT", derived_from="runtime_state", event="identity_bound",
+                      state=self.state,
+                      vocabulary={"adopted": True, "pid": pid, "captured_tty": tty,
+                                  "pty_id": pty_id, "argv_digest": argv_digest,
+                                  "spawn_record": record,
+                                  "detail": "a successor process reconstructed this "
+                                            "dispatch from its durable spawn record and "
+                                            "journal; nothing was spawned",
+                                  **self._terminal_provenance()})
+        return {"adopted": True, "detail": "", "pid": pid, "captured_tty": tty}
+
+    def collect(self, *, lease_token: str | None = None,
+                result_parser: Any = None) -> dict[str, Any]:
+        """Await and SETTLE an ADOPTED dispatch.  Exactly once, never a re-spawn.
+
+        The same completion machinery the supervising path runs, over the same evidence,
+        with one prelude: a stranger cannot `waitpid` the agent, so before waiting on the
+        sentinel it asks the process table (identity-fenced: pid, tty, group AND the
+        kernel start identity) whether the incarnation is still there.
+
+        * still there and ours -> wait for the sentinel under the completion bound, then
+          settle from the record + exit status like any dispatch; a bound that expires
+          runs the ownership ladder and settles the typed failure or RETAINS by name;
+        * gone, no sentinel yet, exit watcher (the recorded session leader) alive -> the
+          evidence is in flight; await it for the exit-evidence budget;
+        * gone, no sentinel, no watcher -> the exit is PROVEN by the table (ESRCH, or a
+          recycled pid with another start identity) and its status is a NAMED absence.
+          The dispatch settles from the capture under `no_completion_record` /
+          `cause_unreported` as the typed failure it is -- never as a success guessed
+          from a transcript with no exit status behind it;
+        * unreadable table or an unownable process -> nothing is settled; the caller
+          reports the dispatch unsettled and the run stops BLOCKED.
+        """
+        if not self.adopted or self.record is None:
+            raise StandaloneDispatchFailed("collect_without_adoption",
+                                           "collect() needs an adopted session", {})
+        sentinel = self._read_sentinel()
+        if sentinel["outcome"] != "exited":
+            snapshot = self._snapshot()
+            if not snapshot.get("readable", False):
+                raise StandaloneDispatchUnsettled(
+                    "teardown_unproven",
+                    f"{self.intent_id}: the process table for "
+                    f"{self.record['captured_tty']!r} could not be read; the adopted "
+                    "dispatch's liveness is unknown and nothing is settled")
+            proof = pty_supervisor.exit_proven(self.record, snapshot)
+            if proof["proven"]:
+                # Gone before any signal.  Give a still-live watcher its budget to land
+                # the sentinel, then take the table's proof as the exit proof.
+                leader = int(self.record.get("sid") or 0)
+                deadline = self._clock() + StandaloneRuntime.EXIT_EVIDENCE_BUDGET_MS / 1000.0
+                sentinel = self._read_sentinel()
+                while (sentinel["outcome"] != "exited" and leader > 0
+                       and _pid_present(leader) and self._clock() < deadline):
+                    time.sleep(0.01)
+                    sentinel = self._read_sentinel()
+                if sentinel["outcome"] != "exited":
+                    self.exit_proof = {"proven": True,
+                                       "how": f"process_table:{proof['reason']}",
+                                       "ladder": None, "exit_status": None}
+                    self._journal(kind="EVENT", derived_from="process_table",
+                                  event="exit_observed", state=self.state,
+                                  axes=self._axes(settlement="not_settled",
+                                                  worker_resource="release",
+                                                  process_liveness="already exited",
+                                                  cleanup_authority="authorized"),
+                                  vocabulary={"adopted": True, "exit_proof": proof,
+                                              "exit_status": None,
+                                              "detail": "no exit sentinel was written and "
+                                                        "the incarnation is proven gone; "
+                                                        "the exit status is unknown",
+                                              "pid": self.record["pid"],
+                                              "captured_tty": self.record["captured_tty"],
+                                              **self._terminal_provenance()})
+        receipt = self._receipt("ready", "", teardown="not_required")
+        receipt["adopted"] = True                                   # type: ignore[typeddict-unknown-key]
+        if (self.profile.delivery_mode == "post_ready_delivery"
+                and not self._delivery_proven and self._read_sentinel()["outcome"] != "exited"
+                and (self.exit_proof is None or not self.exit_proof["proven"])):
+            # The prompt was never proven delivered and nobody can deliver it now: the
+            # agent is waiting on a stdin that will never be written.  Waiting the
+            # completion budget would only delay the same typed outcome; the ladder
+            # terminates it, proves the exit, and the dispatch settles as the failure it
+            # is (or stays RETAINED by name when the proof cannot be made).
+            raise StandaloneDispatchFailed(
+                "delivery_not_observed",
+                "the supervisor died before the prompt was proven delivered; a successor "
+                "holds no channel to deliver it", dict(receipt))
+        return self._complete(receipt, lease_token=lease_token, result_parser=result_parser)
+
     def await_completion(self) -> dict[str, Any]:
         """Bounded wait for BOTH gates, then the profile's OWN success predicate.
 
@@ -1022,6 +1243,19 @@ class StandaloneSession:
         while self._clock() < deadline:
             if evidence["settlement_record"] is not None and evidence["exit_proven"]:
                 break
+            if evidence["exit_proven"]:
+                # ---- follow-up review finding 7: a PROVEN exit ends the wait ----------
+                # The exit sentinel is written by the watcher AFTER it reaped the agent
+                # and AFTER it drained what the agent wrote last, so once it exists no
+                # further byte can arrive on the master from that process.  Waiting the
+                # remaining budget -- the default is thirty minutes -- and re-parsing the
+                # same transcript every 200 ms could not change the answer; it only
+                # delayed the typed `no_completion_record` failure the branch below
+                # already defines.  One last drain, so a supervisor-side read that raced
+                # the sentinel is not lost, and then the evidence is final.
+                self.pump(timeout_ms=100)
+                evidence = self.completion()
+                break
             self.pump(timeout_ms=200)
             evidence = self.completion()
         if evidence["settlement_record"] is not None and evidence["exit_proven"]:
@@ -1047,8 +1281,16 @@ class StandaloneSession:
                     "lost_reason": lifecycle.resolve_unknown(
                         "exit_status_absent")["lost_reason"], "verdict": verdict}
         if not evidence["capture_answerable"]:
+            # The capture's OWN reason: `capture_truncated` for a bounded transcript,
+            # `evidence_unreadable` for one whose integrity metadata disagrees with its
+            # bytes (finding 4).  Both are members of the closed `LOST_REASONS`.
+            reason = str(evidence.get("lost_reason") or "capture_truncated")
+            disposition = (lifecycle.resolve_unknown("capture_truncated")
+                           if reason == "capture_truncated"
+                           else lifecycle.resolve_unknown("required_evidence_missing",
+                                                          lost_reason=reason))
             return {"state": "LOST", "evidence": evidence,
-                    "lost_reason": lifecycle.resolve_unknown("capture_truncated")["lost_reason"]}
+                    "lost_reason": disposition["lost_reason"]}
         if evidence["settlement_record"] is None and evidence["exit_proven"]:
             # The process ended and produced no declared result record.  Its exit status is
             # the only thing left, and an unmapped code is LOST -- never `exited{0}`.
@@ -1146,7 +1388,7 @@ class StandaloneSession:
             runtime_state=self.runtime_state)
         if admitted["outcome"] == "refused":
             raise StandaloneDispatchFailed("settlement_refused", admitted["code"], {})
-        if self.runtime_state is not None:
+        if self.runtime_state is not None and self._writes_ledger:
             self.runtime_state.settle(self.intent_id, event, lease_token)
         # Finding 9.  Both gates held -- the exit is PROVEN by the fenced sentinel -- so the
         # supervisor's own resources are reclaimed here, on the normal completion path,
@@ -1255,7 +1497,7 @@ class StandaloneSession:
                 f"{self.intent_id}: the journal refused the failed settlement "
                 f"({admitted['code']}: {admitted['detail']}); the ledger is left unsettled",
                 evidence={"code": admitted["code"], "stage": failure.stage})
-        if self.runtime_state is not None:
+        if self.runtime_state is not None and self._writes_ledger:
             self.runtime_state.settle(self.intent_id, event, lease_token)
         return {**dict(failure.receipt or self._receipt("failed", failure.reason,
                                                         teardown="not_required")),
@@ -1347,6 +1589,58 @@ class StandaloneSession:
             evidence={"stage": verdict.get("stage"), "reason": verdict.get("reason"),
                       "exit_status": verdict.get("exit_status"), "exit_proof": proof["how"],
                       "role": self.role, "pid": (self.record or {}).get("pid")})
+
+    def secure_after_unexpected(self, exc: BaseException) -> dict[str, Any]:
+        """LIFECYCLE SAFETY before a programming error may leave this runtime.  Finding 3.
+
+        `adapter.start` re-raises anything outside `failure_stage_for`'s closed table --
+        a `TypeError`, a `KeyError`, a rotated lease refused inside `record_receipt` --
+        and until this existed it re-raised it OVER A LIVE CHILD: the graph stopped with
+        a traceback and the agent kept running in the worktree, owned by nobody, its
+        dispatch neither settled nor recorded as retained.
+
+        So from the spawn onward every exit path goes through the ownership/identity
+        ladder first.  This method is that path for the unexpected ones: it proves the
+        process's exit (fenced sentinel, else the four-rung ladder, else nothing) and
+        reclaims the supervisor's resources when it can; when it cannot, the journal holds
+        a durable RETAINED + unsettled row (`_prove_exit_before_settlement` writes it) and
+        the dispatch stays OPEN, which is what blocks every later pause and execution
+        beside it.  Either way NOTHING is settled -- an error nobody named is not a
+        verdict -- and the row written here says so by name, so a stranger reading the run
+        can tell "the supervisor crashed after securing the child" from "the child was
+        abandoned".  The caller re-raises only after this returns.
+        """
+        if self.record is None:
+            return {"proven": True, "how": "not_required", "exit_status": None}
+        stage = f"unexpected_error:{type(exc).__name__}"
+        proof = self._prove_exit_before_settlement(stage=stage)
+        if proof["proven"] and self.state not in lifecycle.SETTLED_STATES:
+            self.state = "LOST"
+            self.lost_reason = "evidence_unreadable"
+        self._journal(kind="EVENT", derived_from="runtime_state",
+                      event="exit_observed" if proof["proven"] else "exit_unproven",
+                      state=self.state, lost_reason=self.lost_reason,
+                      axes=self._axes(settlement="not_settled",
+                                      worker_resource="release" if proof["proven"]
+                                      else "retain",
+                                      process_liveness="already exited" if proof["proven"]
+                                      else "disputed",
+                                      cleanup_authority="authorized" if proof["proven"]
+                                      else "not_authorized"),
+                      vocabulary={"unexpected_error": f"{type(exc).__name__}: {exc}",
+                                  "lifecycle_safety": proof["how"],
+                                  "exit_status": proof.get("exit_status"),
+                                  "settled": False, "retained": not proof["proven"],
+                                  "detail": "a programming error escaped the dispatch; the "
+                                            "process was " + ("proven exited and its "
+                                            "resources reclaimed" if proof["proven"] else
+                                            "NOT proven exited and is retained by name")
+                                            + "; nothing is settled and the error is "
+                                              "re-raised only now",
+                                  "pid": self.record["pid"],
+                                  "captured_tty": self.record["captured_tty"],
+                                  **self._terminal_provenance()})
+        return proof
 
     def _receipt(self, outcome: str, reason: str, *, teardown: str) -> StartReceipt:
         if outcome not in START_OUTCOMES:
@@ -1527,6 +1821,9 @@ class StandaloneSession:
         # Finding 9: a proven teardown RECLAIMS what this process holds -- the exit watcher
         # (its child, otherwise a zombie) and the pty master (otherwise a leaked fd).
         self._reclaim(reason=f"{reason}:{how}")
+        self.exit_proof = {"proven": True, "how": how, "ladder": None,
+                           "exit_status": (sentinel["code"] if sentinel["outcome"] == "exited"
+                                           else None)}
         return "proven"
 
     # -- finding 1 / finding 9: exit proof and resource reclamation ------------------------
@@ -1597,8 +1894,12 @@ class StandaloneSession:
         A proven exit is followed by reclamation: the watcher is reaped and the master fd
         closed (finding 9), and the journal says so.
         """
-        if self.record is None or self.pty is None:
+        if self.record is None or (self.pty is None and not self.adopted):
             return {"proven": True, "how": "not_required", "exit_status": None}
+        if self.exit_proof is not None:
+            # Already proven -- and the pty already reclaimed.  The ladder is not re-run
+            # over a released master; the proof that was made is the proof.
+            return dict(self.exit_proof)
         self.pump(timeout_ms=50)
         sentinel = self._read_sentinel()
         how = "exit_sentinel"
@@ -1637,9 +1938,11 @@ class StandaloneSession:
                 time.sleep(0.02)
                 sentinel = self._read_sentinel()
         reaped = self._reclaim(reason=f"{stage}:{how}")
-        return {"proven": True, "how": how, "ladder": ladder,
-                "exit_status": sentinel["code"] if sentinel["outcome"] == "exited" else None,
-                "leader_reaped": reaped["reaped"]}
+        self.exit_proof = {"proven": True, "how": how, "ladder": ladder,
+                           "exit_status": (sentinel["code"] if sentinel["outcome"] == "exited"
+                                           else None),
+                           "leader_reaped": reaped["reaped"]}
+        return dict(self.exit_proof)
 
     # -- readiness -----------------------------------------------------------------------
     def pump(self, *, timeout_ms: int = 50) -> int:
@@ -2021,12 +2324,28 @@ class StandaloneSession:
             pty_supervisor.exit_sentinel_path(self.artifact_base, self.run_id,
                                               self.session_id, self.incarnation),
             fence=self.fence)
+        if self.adopted:
+            # A stranger's view (finding 1): the exit watcher, not this process, is the
+            # one appending to the capture, so the meta and the bytes are re-read every
+            # time rather than trusted from memory.
+            self.capture.refresh()
         answerable = self.capture.completion_is_answerable()
-        return self.driver.completion_evidence(
+        exit_proven = sentinel["outcome"] == "exited"
+        if not exit_proven and self.exit_proof is not None and self.exit_proof["proven"]:
+            # The exit was proven by the ownership ladder / the process table with no
+            # sentinel to carry the status (a SIGKILLed watcher, DR-2).  The exit is a fact
+            # and the status is a NAMED absence -- `None`, never `0`.
+            exit_proven = True
+        evidence = self.driver.completion_evidence(
             self.capture.transcript(),
             exit_status=sentinel["code"] if sentinel["outcome"] == "exited" else None,
-            exit_proven=sentinel["outcome"] == "exited",
+            exit_proven=exit_proven,
             capture_answerable=answerable["answerable"])
+        if not answerable["answerable"]:
+            # The capture names WHY it cannot answer; the driver only knows THAT it cannot.
+            evidence["lost_reason"] = answerable["lost_reason"]
+            evidence["capture_integrity"] = answerable.get("integrity", "")
+        return evidence
 
     def release(self) -> None:
         """Drain into the capture, then close the pty master.  The file SURVIVES (AC-37-05).
@@ -2078,11 +2397,50 @@ class StandaloneRuntime:
                 f"no live session for {intent_id!r} in this process; a stranger process "
                 "reads the run through standalone_journal.rediscover instead") from None
 
+    #: How long an adopting reader waits for exit evidence that is IN FLIGHT -- the
+    #: watcher alive, the agent gone, the sentinel not yet written.  The same figure
+    #: `StandaloneAdapter.EXIT_EVIDENCE_BUDGET_MS` uses for `recover_handle`.
+    EXIT_EVIDENCE_BUDGET_MS = 2_000
+
+    def adopt_session(self, intent: Mapping[str, Any], *,
+                      fence: str) -> tuple[StandaloneSession | None, dict[str, Any]]:
+        """Follow-up review finding 1: a session over an effect ANOTHER process created.
+
+        Never reuses a live session of this process for the intent -- a live session
+        holds a pty this one must not -- and never registers the adopted one where
+        `session()` would hand it to `send`/`interrupt` as if it were supervised here.
+        """
+        intent_id = str(intent.get("intent_id", ""))
+        live = self.sessions.get(intent_id)
+        if live is not None and live.record is not None and not live.adopted:
+            return None, {"adopted": False,
+                          "detail": f"{intent_id!r} is supervised live in this process"}
+        session = self._session_factory(
+            intent=intent, profile=self.profile, artifact_base=self.artifact_base,
+            run_id=self.run_id, journal=self.journal, runtime_state=self.runtime_state,
+            **({"preflight_cache": self.preflight_cache}
+               if self._session_factory is StandaloneSession else {}),
+            **self._session_kwargs)
+        outcome = session.adopt(fence=fence)
+        if not outcome["adopted"]:
+            return None, outcome
+        return session, outcome
+
     def rediscover(self, *, intent_ids: Sequence[str] = ()) -> journal_mod.RunSnapshot:
         """The stranger-process read.  Holds none of a live session's objects."""
         return journal_mod.rediscover(self.run_id, self.artifact_base,
                                       runtime_state=self.runtime_state,
                                       intent_ids=intent_ids)
+
+
+def _pid_present(pid: int) -> bool:
+    """``kill(pid, 0)``: exists (ours or not) vs ESRCH."""
+    import errno
+    try:
+        os.kill(pid, 0)
+    except OSError as exc:
+        return exc.errno == errno.EPERM
+    return True
 
 
 def _tty_name(slave_name: str) -> str:

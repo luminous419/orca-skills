@@ -44,8 +44,9 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, TypedDict
 
+from . import standalone_capture as capture_mod
 from . import standalone_identity as identity
-from .standalone_profile import StandaloneProfile
+from .standalone_profile import CaptureLimits, StandaloneProfile
 
 # ---- the four ownership refusals (AC-37-02) --------------------------------------------
 #: Each one results in NO signal being sent, except R-OWN-2 which downgrades a group signal
@@ -763,7 +764,7 @@ def spawn(*, argv: Sequence[str], env: Mapping[str, str], profile: StandalonePro
             # that dispatch's watcher from ever seeing its own supervisor die.
             _watch(agent_pid, master_fd=master_fd, slave_fd=slave_fd, guard_r=guard_r,
                    close_up_to=close_up_to, sentinel=sentinel, fence=fence,
-                   capture=capture_target)
+                   capture=capture_target, capture_limits=profile.capture)
         except BaseException:
             os._exit(127)
     os.close(slave_fd)
@@ -794,13 +795,25 @@ def spawn(*, argv: Sequence[str], env: Mapping[str, str], profile: StandalonePro
 
 def _watch(agent_pid: int, *, master_fd: int, slave_fd: int, guard_r: int,
            close_up_to: int, sentinel: str | os.PathLike[str] | None, fence: str,
-           capture: bytes | None) -> None:  # pragma: no cover - runs in the forked watcher
+           capture: bytes | None,
+           capture_limits: CaptureLimits | None = None
+           ) -> None:  # pragma: no cover - runs in the forked watcher
     """The exit watcher's whole life.  Raw ``os`` calls only: this is a forked child.
 
     Never returns: it ``_exit``s with the agent's shell-shaped status after writing the
     fenced sentinel.  ``SIGHUP`` is ignored so a hangup of the controlling pty -- which
     the kept master makes impossible while this process lives, but which a stranger could
     still deliver by hand -- can never destroy the exit evidence.
+
+    **The orphan drain is BOUNDED by the profile's own capture limits** (consolidated
+    follow-up review, finding 4).  The round-4 shape appended every drained byte verbatim,
+    so a 4 KiB limit retained 131 KiB after supervisor death and the capture still
+    answered `answerable=True`.  Now every chunk goes through the same `admit_chunk`
+    decision `BoundedCapture` applies, the meta is rewritten after every append with the
+    running digest under `writer="exit_watcher"`, and a reader that finds the meta and
+    the bytes in disagreement fails closed.  The master is still drained past the limit
+    -- the agent must never block on a full pty buffer -- but the bytes are DROPPED and
+    counted, never written.
     """
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
     try:
@@ -834,7 +847,7 @@ def _watch(agent_pid: int, *, master_fd: int, slave_fd: int, guard_r: int,
             except OSError:
                 pass
     orphaned = False
-    capture_fd = -1
+    appender: capture_mod.RawBoundedAppender | None = None
     status = 0
     while True:
         try:
@@ -853,7 +866,8 @@ def _watch(agent_pid: int, *, master_fd: int, slave_fd: int, guard_r: int,
                 continue                       # a child changed state: reap it above
             if ready:
                 # EOF on the guard: the supervisor is gone.  From here the agent's output
-                # has no reader but this process, so it becomes the reader.
+                # has no reader but this process, so it becomes the reader -- under the
+                # SAME limits the supervisor applied (finding 4).
                 orphaned = True
                 try:
                     os.close(guard_r)
@@ -861,17 +875,20 @@ def _watch(agent_pid: int, *, master_fd: int, slave_fd: int, guard_r: int,
                     pass
                 if capture is not None:
                     try:
-                        capture_fd = os.open(capture, os.O_WRONLY | os.O_APPEND | os.O_CREAT,
-                                             0o600)
-                    except OSError:
-                        capture_fd = -1
+                        appender = capture_mod.RawBoundedAppender(
+                            capture, limits=capture_limits or CaptureLimits())
+                    except Exception:  # noqa: BLE001 - a watcher never dies of bookkeeping
+                        appender = None
             continue
-        _drain_once(master_fd, capture_fd, budget=0.05, wake_r=wake_r)
+        _drain_once(master_fd, appender, budget=0.05, wake_r=wake_r)
     if orphaned:
         # What the agent wrote between the last poll and its exit.
         for _ in range(20):
-            if not _drain_once(master_fd, capture_fd, budget=0.02):
+            if not _drain_once(master_fd, appender, budget=0.02):
                 break
+        if appender is not None:
+            appender.save_meta()
+            appender.close()
     code = _wait_status_to_code(status)
     if sentinel is not None:
         write_exit_sentinel(sentinel, code=code, fence=fence)
@@ -888,10 +905,11 @@ def _drain_wakeups(wake_r: int) -> None:  # pragma: no cover - runs in the forke
         pass
 
 
-def _drain_once(master_fd: int, capture_fd: int, *, budget: float,
+def _drain_once(master_fd: int, appender: Any, *, budget: float,
                 wake_r: int = -1) -> int:  # pragma: no cover
-    """Read what is ready on the master within ``budget`` seconds; append it verbatim.
-    Returns early -- reading nothing -- when the SIGCHLD wake-up pipe fires instead."""
+    """Read what is ready on the master within ``budget`` seconds; hand it to the BOUNDED
+    appender (finding 4), which decides what reaches the file.  Returns early -- reading
+    nothing -- when the SIGCHLD wake-up pipe fires instead."""
     fds = [master_fd] + ([wake_r] if wake_r >= 0 else [])
     try:
         ready, _, _ = select.select(fds, [], [], budget)
@@ -905,10 +923,10 @@ def _drain_once(master_fd: int, capture_fd: int, *, budget: float,
         chunk = os.read(master_fd, 65_536)
     except OSError:
         return 0
-    if chunk and capture_fd >= 0:
+    if chunk and appender is not None:
         try:
-            os.write(capture_fd, chunk)
-        except OSError:
+            appender.append(chunk)
+        except Exception:  # noqa: BLE001 - bookkeeping never stops the drain
             pass
     return len(chunk)
 

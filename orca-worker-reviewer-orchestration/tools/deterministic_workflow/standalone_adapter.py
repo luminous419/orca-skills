@@ -157,39 +157,7 @@ class StandaloneAdapter:
         session = self._require_runtime().session_for(intent)
         self._journal_planned(intent, session)
         try:
-            try:
-                return session.run_dispatch(lease_token=lease_token)
-            except runtime_mod.StandaloneDispatchFailed as failure:
-                # EXTERNAL REVIEW #8.  This is the executor/launcher boundary, and before
-                # this it did not exist: `executor._settle_now` calls `adapter.start` and
-                # has no handler, so a readiness timeout, an auth expiry, an OOM kill or a
-                # missing result propagated out of the graph as a traceback and took the
-                # whole run with it.  A dispatch that could not produce a verdict is still
-                # an OUTCOME, and the engine has a vocabulary for it, so it is settled here
-                # as a TYPED FAILED settlement and routed by the engine's own policy.
-                #
-                # `settle_failed` proves the process's exit FIRST (finding 1) and raises
-                # `StandaloneDispatchUnsettled` when it cannot, so this is not a catch-all
-                # that can settle over a live process or swallow an incoherent state.
-                return session.settle_failed(failure, lease_token=lease_token)
-            except runtime_mod.StandaloneDispatchUnsettled:
-                raise
-            except Exception as exc:  # noqa: BLE001 - re-raised below unless NAMED
-                # Consolidated review finding 6.  The runtime's OTHER production failures
-                # -- an identity-binding violation, a delivery-mode mismatch, an unprovable
-                # teardown, a refused ownership permit, an unreadable process table, a pty
-                # refusal, a non-durable intent, an OS error -- are plain exceptions and
-                # escaped exactly as `StandaloneDispatchFailed` once did.  Each is a NAMED
-                # member of `failure_stage_for`'s closed table and settles under its stage;
-                # anything outside the table is a programming error and still propagates.
-                stage = runtime_mod.failure_stage_for(exc)
-                if stage is None:
-                    raise
-                failure = runtime_mod.StandaloneDispatchFailed(
-                    stage, f"{type(exc).__name__}: {exc}",
-                    session._receipt("failed", stage, teardown="not_required")
-                    if session.record is None else None)
-                return session.settle_failed(failure, lease_token=lease_token)
+            return self._supervise(session, lease_token=lease_token)
         except runtime_mod.StandaloneDispatchUnsettled as unsettled:
             # Findings 1 and 7.  NOT a settlement, and NOT a traceback: the run stops as a
             # typed BLOCKED terminal through the engine's own idempotency vocabulary.  The
@@ -198,6 +166,52 @@ class StandaloneAdapter:
             # start work beside it.
             from .executor import IdempotencyRecoveryError
             raise IdempotencyRecoveryError(unsettled.code, str(unsettled)) from unsettled
+        except Exception as exc:  # noqa: BLE001 - re-raised, AFTER lifecycle safety
+            # Follow-up review finding 3.  Whatever escaped the closed failure table --
+            # from `run_dispatch`, or from inside `settle_failed` itself -- is a
+            # programming error and still propagates; but it propagates only once the
+            # child it may have left behind is proven exited and reclaimed, or durably
+            # recorded RETAINED + unsettled.  Never over a live, unowned agent.
+            session.secure_after_unexpected(exc)
+            raise
+
+    def _supervise(self, session: Any, *, lease_token: str | None) -> Mapping[str, Any]:
+        """Run the dispatch and settle every NAMED failure.  Unnamed ones escape to
+        :meth:`start`, which secures the lifecycle before letting them out."""
+        try:
+            return session.run_dispatch(lease_token=lease_token)
+        except runtime_mod.StandaloneDispatchFailed as failure:
+            # EXTERNAL REVIEW #8.  This is the executor/launcher boundary, and before
+            # this it did not exist: `executor._settle_now` calls `adapter.start` and
+            # has no handler, so a readiness timeout, an auth expiry, an OOM kill or a
+            # missing result propagated out of the graph as a traceback and took the
+            # whole run with it.  A dispatch that could not produce a verdict is still
+            # an OUTCOME, and the engine has a vocabulary for it, so it is settled here
+            # as a TYPED FAILED settlement and routed by the engine's own policy.
+            #
+            # `settle_failed` proves the process's exit FIRST (finding 1) and raises
+            # `StandaloneDispatchUnsettled` when it cannot, so this is not a catch-all
+            # that can settle over a live process or swallow an incoherent state.
+            return session.settle_failed(failure, lease_token=lease_token)
+        except runtime_mod.StandaloneDispatchUnsettled:
+            raise
+        except Exception as exc:  # noqa: BLE001 - re-raised below unless NAMED
+            # Consolidated review finding 6.  The runtime's OTHER production failures
+            # -- an identity-binding violation, a delivery-mode mismatch, an unprovable
+            # teardown, a refused ownership permit, an unreadable process table, a pty
+            # refusal, a non-durable intent, an OS error -- are plain exceptions and
+            # escaped exactly as `StandaloneDispatchFailed` once did.  Each is a NAMED
+            # member of `failure_stage_for`'s closed table and settles under its stage;
+            # anything outside the table is a programming error and still propagates --
+            # through `start`, which establishes lifecycle safety first (finding 3).
+            stage = runtime_mod.failure_stage_for(exc)
+            if stage is None:
+                raise
+            failure = runtime_mod.StandaloneDispatchFailed(
+                stage, f"{type(exc).__name__}: {exc}",
+                session._receipt("failed", stage, teardown="not_required")
+                if session.record is None else None)
+            return session.settle_failed(failure, lease_token=lease_token)
 
     def spawn_only(self, intent: ActionIntent, *,
                    lease_token: str | None = None, **kwargs: Any) -> Mapping[str, Any]:
@@ -429,7 +443,13 @@ class StandaloneAdapter:
             fenced_row = row
             break
         if fenced_row is None:
-            return None
+            # ---- follow-up review finding 1: COLLECT, do not merely look ------------
+            # No settlement row for this fence.  The receipt proves an `execve` happened
+            # (it is written only after the child's spawn record is read), so the effect
+            # exists or existed; the crashed supervisor simply never settled it.  The
+            # rebuilt runtime reconstructs the session from the durable evidence and
+            # settles it exactly once -- or leaves it durably unsettled by name.
+            return self._collect_in_flight(intent, expected_fence)
         matched = (fenced_row.get("source_vocabulary") or {}).get("event")
         stored = (self.runtime_state.get_settlement(intent_id)
                   if self.runtime_state is not None else None)
@@ -441,6 +461,62 @@ class StandaloneAdapter:
         if stored is not None and stored.get("event_id") != matched.get("event_id"):
             return None
         return matched
+
+    def _collect_in_flight(self, intent: ActionIntent,
+                           expected_fence: str) -> SettlementEvent | None:
+        """Reconstruct, fence, await and settle -- ONCE -- an in-flight dispatch.
+
+        Nothing is spawned here, ever: `adopt` reads the child's own spawn record and the
+        journal's spawn observation for the receipt's fence, and refuses when they do not
+        name one and the same process.  `collect` then waits for the exit sentinel (or
+        proves the exit through the identity-fenced process table / the ownership ladder)
+        and takes the same single settlement edge a supervised dispatch takes.  The
+        journal's admission ladder is the exactly-once guard: the fenced settlement row is
+        written before the event is handed up, and a second recovery finds that row first
+        (above) and collects nothing twice.  The LEDGER is written by the collecting
+        executor under its own lease token, not by the adopted session.
+
+        ``None`` only when the dispatch is still unsettled by name -- a refused adoption
+        (journalled), an unownable or unreadable process -- and every such refusal leaves
+        a durable row saying why.  A programming error still propagates, after lifecycle
+        safety is established (finding 3).
+        """
+        if not expected_fence or self.runtime is None:
+            return None
+        runtime = self.runtime
+        session, outcome = runtime.adopt_session(intent, fence=expected_fence)
+        intent_id = str(intent["intent_id"])
+        session_id, _, incarnation = expected_fence.partition(":")
+        if session is None:
+            self.settlement_journal.append(journal_mod.make_record(
+                kind="REFUSED", derived_from="runtime_state", intent_id=intent_id,
+                event="evidence_unreadable", state="LOST",
+                lost_reason="evidence_unreadable",
+                session_id=session_id, process_incarnation=incarnation,
+                axes={"settlement": "not_settled", "worker_resource": "retain",
+                      "process_liveness": "disputed", "cleanup_authority": "unknown"},
+                source_vocabulary={"recovery": "adoption_refused",
+                                   "detail": outcome.get("detail", ""),
+                                   "spawn_record": outcome.get("spawn_record", "")}))
+            return None
+        try:
+            try:
+                session.collect()
+            except runtime_mod.StandaloneDispatchFailed as failure:
+                session.settle_failed(failure)
+            except runtime_mod.StandaloneDispatchUnsettled:
+                raise
+            except Exception as exc:  # noqa: BLE001 - named -> settled; else secured, raised
+                stage = runtime_mod.failure_stage_for(exc)
+                if stage is None:
+                    session.secure_after_unexpected(exc)
+                    raise
+                session.settle_failed(runtime_mod.StandaloneDispatchFailed(
+                    stage, f"{type(exc).__name__}: {exc}"))
+        except runtime_mod.StandaloneDispatchUnsettled as unsettled:
+            from .executor import IdempotencyRecoveryError
+            raise IdempotencyRecoveryError(unsettled.code, str(unsettled)) from unsettled
+        return self._journal_settlement(intent_id, expected_fence=expected_fence)
 
     # ---- +5 LifecycleSettlementPort (DD-1) ----------------------------------------------
     def open_dispatches(self) -> tuple[str, ...]:

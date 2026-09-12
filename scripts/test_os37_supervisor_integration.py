@@ -515,14 +515,24 @@ class LauncherWiringTests(unittest.TestCase):
         self.assertIn(launcher.STANDALONE_ADAPTER_REQUIRES_PROFILE,
                       str(caught.exception))
 
-    def test_site_4_resume_refuses_standalone_explicitly(self) -> None:
-        """An EXPLICIT refusal, not a fall-through to the fake composition."""
+    def test_site_4_resume_composes_standalone_and_refuses_a_foreign_selection(self) -> None:
+        """Site 4 (the `resume` verb) is neither a fall-through NOR a refusal any more.
+
+        Follow-up review finding 2: `--adapter standalone` re-enters a paused run with
+        the composition the Watchdog already recovers with (`standalone_recovery_composition`
+        -- recorded profile, recorded ledger, recorded approval authority), and selecting
+        any OTHER adapter on a standalone-launched run is refused by name
+        (`STANDALONE_RUN_ADAPTER_MISMATCH`) rather than composed.  The old refusal
+        constant survives for its documentation history only and is composed at no site.
+        """
         from scripts.deterministic_workflow import launcher
-        source = inspect.getsource(launcher)
-        self.assertIn(launcher.STANDALONE_ADAPTER_UNSUPPORTED_HERE, source)
-        refusal = source.split(launcher.STANDALONE_ADAPTER_UNSUPPORTED_HERE, 1)[1]
-        self.assertIn("rediscover", refusal,
-                      "the refusal must name what an operator should do instead")
+        source = inspect.getsource(launcher.run_pause_cli)
+        self.assertIn("standalone_recovery_composition(", source,
+                      "the resume verb no longer composes the standalone runtime")
+        self.assertIn("refuse_foreign_composition(", source,
+                      "the resume verb no longer refuses a foreign adapter selection")
+        self.assertNotIn(launcher.STANDALONE_ADAPTER_UNSUPPORTED_HERE, source,
+                         "the resume verb still refuses --adapter standalone by name")
 
     def test_sites_5_and_6_the_orca_and_fake_arms_are_byte_unchanged(self) -> None:
         """Every standalone arm is ADDITIVE: the other two are untouched."""

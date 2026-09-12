@@ -244,10 +244,24 @@ class F02RecordedAuthorityTests(unittest.TestCase):
             profile_spec=agent_profile_spec(worktree=str(self.base / "worktree")))
         return adapter, state, ledger
 
+    def _launch(self, run_id: str, ledger_path: Path):
+        """Compose AND launch: since correction 2 of the follow-up round the binding is
+        published by `execute_state` after the run-scoped execution authority is claimed
+        (never at composition), so "the launch records its ledger" is asserted over a
+        launch -- interrupted ahead of its first dispatch, which spawns nothing."""
+        adapter, state, ledger = self._compose(run_id, ledger_path)
+        stalled = launcher.execute_state(
+            state, adapter=adapter, runtime_state=ledger,
+            journal=launcher._standalone_pause_row_journal(self.base, run_id),
+            artifact_base=self.base, interrupt_before=["EXECUTE_INTENT"], audit_sink=None)
+        self.assertTrue(stalled.get("pending_intent"), stalled.get("terminal_reason"))
+        return adapter, state, ledger
+
+    @unittest.skipUnless(_langgraph_ok(), LANGGRAPH_REASON)
     def test_the_launch_records_its_ledger_and_the_watchdog_reopens_exactly_it(self) -> None:
         custom = self.base / "elsewhere" / "custom-ledger.json"
         custom.parent.mkdir()
-        self._compose("run_f2auth", custom)
+        self._launch("run_f2auth", custom)
         recorded = launcher.load_standalone_authority(self.base, "run_f2auth")
         self.assertIsNotNone(recorded, "the launch persisted no runtime-state authority")
         self.assertEqual(Path(recorded["runtime_state_path"]), custom.resolve())
@@ -266,11 +280,17 @@ class F02RecordedAuthorityTests(unittest.TestCase):
 
     def test_a_run_that_recorded_no_authority_keeps_the_default(self) -> None:
         default = launcher.default_runtime_state_path("run_f2def", "t")
+        # Composed, never launched: since correction 2 nothing is recorded until the
+        # execution authority is claimed, so this run genuinely recorded no authority.
         self._compose("run_f2def", default)
-        launcher.standalone_authority_path(self.base, "run_f2def").unlink()
+        self.assertFalse(launcher.standalone_authority_path(self.base, "run_f2def").exists())
+        # A never-launched run persisted no profile either; the operator supplies one.
+        profile_file = self.base / "operator-profile.json"
+        profile_file.write_text(json.dumps(
+            agent_profile_spec(worktree=str(self.base / "worktree"))))
         args = argparse.Namespace(artifact_base=str(self.base), results="",
                                   adapter="standalone", run_owner="", project_root="",
-                                  standalone_profile="")
+                                  standalone_profile=str(profile_file))
         _adapter, ledger, _journal = launcher._watchdog_wiring(args).adapter_for("run_f2def")
         # No head and no pause record exist for a run that never executed, so the thread
         # id the default path is keyed on falls back to the run id -- the pre-existing

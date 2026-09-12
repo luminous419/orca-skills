@@ -1814,14 +1814,22 @@ class F10ExternalResumeIsArmedTests(_ProductionPath):
     def test_a_crash_after_the_receipt_is_collected_and_the_effect_is_not_re_run(self) -> None:
         """The consequence, end to end, through the recovery ladder itself.
 
-        The window finding #10 makes unrecoverable is: the receipt is durable (an `execve`
+        The window finding #10 made unrecoverable is: the receipt is durable (an `execve`
         provably happened) and no settlement is.  A successor process must OBSERVE that
         effect, never re-create it -- and `executor._collect` can only do that when the
         adapter DECLARES `external_resume`.  With the capability withdrawn, the ladder
         refuses `IDEMPOTENCY_RECOVERY_UNSUPPORTED` and the effect is stranded forever.
 
+        This case used to accept `IDEMPOTENCY_RECOVERY_BLOCKED` as the best reachable
+        outcome -- the ladder reached `resume`, which could only LOOK for a settlement.
+        Since the follow-up review's finding 1 `resume` COLLECTS: the successor rebuilds
+        the session from the receipt's fence, the spawn record and the journal, awaits
+        the exit evidence and settles exactly once.  So the ladder now RETURNS the
+        settlement, and the effect is still not re-run.
+
         Mutation-sensitivity: take the capability snapshot before the ledger again and the
-        refusal code changes from BLOCKED (an observation) to UNSUPPORTED (a dead end).
+        ladder raises UNSUPPORTED (a dead end) instead of returning a settlement; make
+        `resume` merely look again and it raises BLOCKED.
         """
         from scripts.deterministic_workflow import executor
         profile = replay_profile(stream=STREAMS / "m14_claude_genuine_turn.stream",
@@ -1844,17 +1852,25 @@ class F10ExternalResumeIsArmedTests(_ProductionPath):
         self.assertTrue((stored.get("receipt") or {}).get("external_id"))
         spawns_before = self._spawn_count("run_resume", "intent-resume")
         self.assertEqual(spawns_before, 1)
+        # The dead supervisor holds no pty: its master and its end of the orphan guard
+        # are gone, and the exit watcher becomes the capture's reader -- exactly what
+        # `release` does, and exactly what a SIGKILL would have done.
+        adapter.runtime.session("intent-resume").release()
 
         # A STRANGER process: a new adapter over the same durable files, holding none of
         # the first one's objects.
         successor, _state2, _ = self.compose(profile, run_id="run_resume", ledger=ledger)
-        with self.assertRaises(executor.IdempotencyRecoveryError) as refused:
-            executor._recover(successor, ledger, intent, dict(stored),
-                              claim["lease_token"])
-        self.assertEqual(
-            refused.exception.code, "IDEMPOTENCY_RECOVERY_BLOCKED",
-            "the ladder did not even reach `resume`; with external_resume undeclared it "
-            "refuses IDEMPOTENCY_RECOVERY_UNSUPPORTED and the effect is unrecoverable")
+        collected = executor._recover(successor, ledger, intent, dict(stored),
+                                      claim["lease_token"])
+        self.assertIsNotNone(collected, "the ladder returned no settlement")
+        self.assertEqual(ledger.get_settlement("intent-resume")["event_id"],
+                         collected["event_id"])
+        rows = [row for row in journal_mod.ExecutionJournal(self.base, "run_resume")
+                .rows_for("intent-resume") if row["kind"] == "SETTLEMENT_OBSERVED"]
+        self.assertEqual(len(rows), 1, "settled more than once")
+        self.assertEqual(f"{rows[0]['session_id']}:{rows[0]['process_incarnation']}",
+                         stored["receipt"]["external_id"],
+                         "the collected settlement is not fenced to the receipt")
         self.assertEqual(self._spawn_count("run_resume", "intent-resume"), spawns_before,
                          "the successor re-ran an effect that already existed")
 
@@ -2801,7 +2817,14 @@ class E2EPostReceiptRestartIsFencedTests(_GraphAssertions, unittest.TestCase):
                               tag: str) -> GraphRun:
         """Re-enter the SAME run root with a successor ledger in the crash window."""
         from scripts.deterministic_workflow.runtime_state import FileRuntimeStateStore
-        original = FileRuntimeStateStore(self.first.ledger_path)
+        # The run's ONE recorded ledger (follow-up review, finding 5): a successor
+        # Coordinator reopens exactly the authority the launch recorded -- a re-invocation
+        # naming another `--runtime-state` is refused by name before it executes -- so the
+        # crash window is written INTO that ledger.  What the first run left is snapshotted
+        # first, and the window is rebuilt from the snapshot through the public API.
+        snapshot = self.room / f"ledger_before_{tag}.json"
+        shutil.copy(self.first.ledger_path, snapshot)
+        original = FileRuntimeStateStore(snapshot)
         record = original.get_receipt(intent_id)
         self.assertIsNotNone(record, "the first run recorded no ledger record")
         self.assertEqual(record["status"], "SETTLED",
@@ -2810,7 +2833,8 @@ class E2EPostReceiptRestartIsFencedTests(_GraphAssertions, unittest.TestCase):
         receipt = dict(record["receipt"])
         receipt["external_id"] = external_id
 
-        successor_path = self.room / f"ledger_{tag}.json"
+        successor_path = self.first.ledger_path
+        successor_path.unlink()
         successor = FileRuntimeStateStore(successor_path)
 
         def intent_of(stored: dict) -> dict:
