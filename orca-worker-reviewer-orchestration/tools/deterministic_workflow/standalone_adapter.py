@@ -62,7 +62,8 @@ class StandaloneAdapter:
     def __init__(self, runtime: Any = None, *, runtime_state: Any = None,
                  settlement_journal: Any = None, approval_port: Any = None,
                  artifact_base: str | os.PathLike[str] = ".", run_id: str = "",
-                 table_reader: Any = None, pause_row_journal: Any = None) -> None:
+                 table_reader: Any = None, pause_row_journal: Any = None,
+                 prompt_composer: Any = None) -> None:
         # `runtime=None` is a supported, deliberate wiring: `capabilities()` is a
         # declaration about the adapter TYPE and its wiring and reads no process at all, so
         # the capability authority can ask without spawning, adopting or touching anything.
@@ -95,6 +96,15 @@ class StandaloneAdapter:
         self.run_id = run_id or getattr(runtime, "run_id", "")
         self._table_reader = table_reader
         self._events: dict[str, SettlementEvent] = {}
+        #: Follow-up review of `87f6179`, finding 5.  The ONE composer of the production
+        #: prompt for the Graph/adapter path: given the `ActionIntent` the graph's
+        #: EXECUTE_INTENT node hands `start`, it returns the role / phase / task-contract /
+        #: correction-instruction / review-output-contract text delivered to the real CLI.
+        #: ``None`` keeps the pre-finding behaviour -- the canonical intent JSON -- which is
+        #: what the fake and scripted paths still hand over, so this is additive and
+        #: adapter-neutral: the Orca and fake adapters have no such composer and are
+        #: unchanged.
+        self._prompt_composer = prompt_composer
 
     # ---- 1/6 capabilities ---------------------------------------------------------------
     def capabilities(self) -> frozenset[str]:
@@ -156,8 +166,17 @@ class StandaloneAdapter:
         """
         session = self._require_runtime().session_for(intent)
         self._journal_planned(intent, session)
+        # Finding 5.  The production prompt is rendered HERE, at the Graph/adapter
+        # boundary, from the intent the graph dispatched -- so `run_workflow --adapter
+        # standalone` delivers the role, phase, task contract, correction instruction and
+        # review-output contract, not the canonical `ActionIntent` JSON.  A composition
+        # with no composer (the fake/scripted paths, a direct operator call) still hands
+        # over the canonical payload, exactly as before.
+        payload = None
+        if self._prompt_composer is not None:
+            payload = self._prompt_composer(dict(intent))
         try:
-            return self._supervise(session, lease_token=lease_token)
+            return self._supervise(session, lease_token=lease_token, payload=payload)
         except runtime_mod.StandaloneDispatchUnsettled as unsettled:
             # Findings 1 and 7.  NOT a settlement, and NOT a traceback: the run stops as a
             # typed BLOCKED terminal through the engine's own idempotency vocabulary.  The
@@ -175,11 +194,15 @@ class StandaloneAdapter:
             session.secure_after_unexpected(exc)
             raise
 
-    def _supervise(self, session: Any, *, lease_token: str | None) -> Mapping[str, Any]:
+    def _supervise(self, session: Any, *, lease_token: str | None,
+                   payload: str | None = None) -> Mapping[str, Any]:
         """Run the dispatch and settle every NAMED failure.  Unnamed ones escape to
-        :meth:`start`, which secures the lifecycle before letting them out."""
+        :meth:`start`, which secures the lifecycle before letting them out.
+
+        ``payload`` is the rendered production prompt (finding 5) or ``None``; ``None``
+        lets ``run_dispatch`` compose the canonical intent, exactly as before."""
         try:
-            return session.run_dispatch(lease_token=lease_token)
+            return session.run_dispatch(lease_token=lease_token, payload=payload)
         except runtime_mod.StandaloneDispatchFailed as failure:
             # EXTERNAL REVIEW #8.  This is the executor/launcher boundary, and before
             # this it did not exist: `executor._settle_now` calls `adapter.start` and
@@ -874,13 +897,45 @@ class _StandaloneOrcaState:
 
     def __init__(self, artifact_base: str | os.PathLike[str] = ".", *,
                  journal_factory: Any, capabilities: Any = None, clock: Any = None,
-                 owner_id: str | None = None) -> None:
+                 owner_id: str | None = None, ledger_factory: Any = None) -> None:
         super().__init__(artifact_base, runner=None, capabilities=capabilities,
                          clock=clock, owner_id=owner_id)
         self._journal_factory = journal_factory
+        #: The run's durable ledger, so liveness can be read from the RECEIPT FENCE and
+        #: the exit sentinel and not merely the process table.  ``None`` falls back to the
+        #: process-table probe, which is still fenced by pid + tty + start identity.
+        self._ledger_factory = ledger_factory
 
     def orca_state(self, run_id: str) -> Mapping[str, Any]:
-        from .watchdog_observation import ObservationUnavailable, ObservationUnsupported
+        """F5 / F6 / F7 from FENCED liveness evidence, not an open journal row alone.
+
+        Consolidated follow-up review of ``87f6179``, finding 1.  This used to feed
+        ``journal.open_dispatches()`` straight into BOTH ``active_dispatches`` (F6) and
+        ``runnable_actions``, so a supervisor that crashed after the receipt left an open
+        row that the classifier read as a LIVE dispatch (``ACTIVE_DISPATCH_WAIT``) forever
+        -- and the ``adopt -> collect -> settle`` recovery the ``recover`` verb performs
+        was unreachable from a sweep.
+
+        An open row is not proof of a live worker.  Liveness is now read from the same
+        durable, identity-fenced evidence ``standalone_journal.rediscover`` reads -- the
+        receipt fence, the exit sentinel, and the process table probed by pid + tty +
+        kernel start identity -- and this reads NO terminal bytes, spawns nothing and
+        adopts nothing, so asking whether a run is live cannot make it look alive to the
+        gate deciding whether it is stalled.
+
+        * a dispatch whose worker is PROVABLY LIVE  -> ``active_dispatches`` (F6): a run
+          with work genuinely in flight is not stalled, and the Coordinator-liveness gate
+          decides separately whether an orphaned live worker's run may yet be taken over;
+        * a dispatch that is OPEN but whose worker has exited / is gone / left a sentinel
+          -> a runnable dispatch action (F5), so the run reaches ``STALLED_RECOVERABLE``
+          and the sweep recovers it exactly as the ``recover`` verb already does.
+
+        The three-way discipline is exact: an authority that cannot be read RAISES
+        ``ObservationUnavailable`` (F1); no open dispatch is an empty tuple (an ABSENCE);
+        a runtime with no journal authority wired at all is ``ObservationUnsupported``.
+        """
+        from .watchdog_observation import (ACTION_RECONCILE_DISPATCH,  # noqa: F401
+                                           ObservationUnavailable, ObservationUnsupported)
         if self._journal_factory is None:
             raise ObservationUnsupported(
                 f"{run_id}: no standalone dispatch authority is wired")
@@ -900,10 +955,35 @@ class _StandaloneOrcaState:
             raise ObservationUnavailable(f"{run_id}: {exc}") from exc
         except OSError as exc:
             raise ObservationUnavailable(f"{run_id}: {exc}") from exc
-        # An empty tuple is an ABSENCE, not an UNSUPPORTED.  That is the whole point of
-        # wiring this: F6/F7 gain a real second authority.
-        return {"active_dispatches": tuple(open_rows),
-                "runnable_actions": tuple(open_rows)}
+        if not open_rows:
+            # An empty tuple is an ABSENCE, not an UNSUPPORTED.
+            return {"active_dispatches": (), "runnable_actions": ()}
+        ledger = None
+        if self._ledger_factory is not None:
+            try:
+                ledger = self._ledger_factory(run_id)
+            except Exception:  # noqa: BLE001 - the process-table probe still fences liveness
+                ledger = None
+        try:
+            snapshot = journal_mod.rediscover(run_id, self.artifact_base,
+                                              runtime_state=ledger,
+                                              intent_ids=tuple(open_rows))
+        except journal_mod.JournalUnreadable as exc:
+            raise ObservationUnavailable(f"{run_id}: {exc}") from exc
+        except OSError as exc:
+            raise ObservationUnavailable(f"{run_id}: {exc}") from exc
+        live: list[str] = []
+        stalled: list[str] = []
+        for intent_id in open_rows:
+            state = str((snapshot["intents"].get(intent_id) or {}).get("state") or "")
+            # RUNNING is the ONLY state the fenced process probe reports for an incarnation
+            # that is still present and ours.  Everything else an open dispatch can be --
+            # exit_observed, LOST, absent/unprovable, or a receipt whose fence names a
+            # process the table no longer holds -- is a worker that is NOT live, so the
+            # dispatch is stalled and owed a recovery, never counted as work in flight.
+            (live if state == "RUNNING" else stalled).append(intent_id)
+        return {"active_dispatches": tuple(live),
+                "runnable_actions": tuple(stalled)}
 
 
 _OBSERVATION_CLASS: Any = None
@@ -927,15 +1007,21 @@ def observation_class() -> Any:
 
 def StandaloneRunObservation(artifact_base: str | os.PathLike[str] = ".", *,
                              journal_factory: Any, capabilities: Any = None,
-                             clock: Any = None, owner_id: str | None = None) -> Any:
+                             clock: Any = None, owner_id: str | None = None,
+                             ledger_factory: Any = None) -> Any:
     """Construct the standalone ``RunObservationPort`` -- DD-3.
 
     Spelled as a callable rather than a bare class so the base import stays lazy; it
     constructs the real subclass :func:`observation_class` returns, so callers that check
     ``isinstance`` against ``recovery_runtime.RunObservationAdapter`` still succeed.
+
+    ``ledger_factory`` (finding 1) gives the liveness probe the run's receipt fence and
+    exit sentinel; it is optional, and its absence falls back to the fenced process-table
+    probe.
     """
     return observation_class()(artifact_base, journal_factory=journal_factory,
-                               capabilities=capabilities, clock=clock, owner_id=owner_id)
+                               capabilities=capabilities, clock=clock, owner_id=owner_id,
+                               ledger_factory=ledger_factory)
 
 
 #: Kept as an alias because DESIGN D10.2's wiring snippet names a factory.

@@ -18,8 +18,8 @@
 # platform-gated tests resolve to NOTHING and must RUN -- if one of them skips, the lane
 # fails. On Linux they must skip. Neither host gets the weaker contract.
 #
-# OS-37 adds 26 `always` entries:
-#   9 in test_os37_cli_preconditions, 7 in test_os37_per_driver_matrix, 7 in test_os37_r10_workflow_e2e, 3 in test_os37_standalone_e2e.
+# OS-37 adds 30 `always` entries:
+#   9 in test_os37_cli_preconditions, 7 in test_os37_per_driver_matrix, 4 in test_os37_r10_graph_prompt_e2e, 7 in test_os37_r10_workflow_e2e, 3 in test_os37_standalone_e2e.
 # All are opt-in live-runtime suites gated on an env var no CI runner sets: the live
 # per-CLI checks need a real agent CLI installed, the standalone E2E spawns real local
 # processes, and the R10 workflow E2E drives its cases through the real `run_workflow.py`
@@ -37,7 +37,7 @@
 #   'no_sandbox_exec' observed by loading the suite under a simulated environment
 #   and reading the same __unittest_skip_why__ attributes TestCase.run consults.
 #
-# -- always (32) --
+# -- always (36) --
 always	test_orca_runtime.FinalReviewRuntimeIntegrationTests.test_final_review_terminal_freshness	requires --orca-runtime and a ready Orca runtime
 always	test_orca_runtime.OrcaRuntimeIntegrationTests.test_runtime_scenarios	requires --orca-runtime and a ready Orca runtime
 always	test_orca_runtime.QualityProfileRuntimeIntegrationTests.test_every_dispatch_of_the_run_carries_the_quality_gate	requires --orca-runtime and a ready Orca runtime
@@ -60,6 +60,10 @@ always	test_os37_per_driver_matrix.LivePerDriverOutcomeMatrixTests.test_live_fai
 always	test_os37_per_driver_matrix.LivePerDriverOutcomeMatrixTests.test_live_interruption_is_proven_for_both_drivers	requires ORCA_OS37_E2E=1; the standalone E2E drives real local processes
 always	test_os37_per_driver_matrix.LivePerDriverOutcomeMatrixTests.test_live_lost_for_both_drivers_when_the_exit_cannot_be_classified	requires ORCA_OS37_E2E=1; the standalone E2E drives real local processes
 always	test_os37_per_driver_matrix.LivePerDriverOutcomeMatrixTests.test_live_timeout_for_both_drivers_is_timed_out_not_a_negative_fact	requires ORCA_OS37_E2E=1; the standalone E2E drives real local processes
+always	test_os37_r10_graph_prompt_e2e.F5GraphPromptE2ETests.test_orca_was_not_resolvable_in_the_run	requires ORCA_OS37_E2E=1; the F5 graph-prompt E2E drives a real agent CLI through run_workflow.py with orca removed from PATH
+always	test_os37_r10_graph_prompt_e2e.F5GraphPromptE2ETests.test_the_loop_was_worker_reviewer_fail_correction_fresh_pass	requires ORCA_OS37_E2E=1; the F5 graph-prompt E2E drives a real agent CLI through run_workflow.py with orca removed from PATH
+always	test_os37_r10_graph_prompt_e2e.F5GraphPromptE2ETests.test_the_prompt_was_the_rendered_production_prompt_not_canonical_intent	requires ORCA_OS37_E2E=1; the F5 graph-prompt E2E drives a real agent CLI through run_workflow.py with orca removed from PATH
+always	test_os37_r10_graph_prompt_e2e.F5GraphPromptE2ETests.test_the_workflow_reached_completed_through_the_launcher	requires ORCA_OS37_E2E=1; the F5 graph-prompt E2E drives a real agent CLI through run_workflow.py with orca removed from PATH
 always	test_os37_r10_workflow_e2e.R10WorkflowE2ETests.test_every_dispatch_walked_the_whole_lifecycle_in_order	requires ORCA_OS37_E2E=1; the R10 workflow E2E drives real local agent processes
 always	test_os37_r10_workflow_e2e.R10WorkflowE2ETests.test_orca_was_not_resolvable_in_the_run	requires ORCA_OS37_E2E=1; the R10 workflow E2E drives real local agent processes
 always	test_os37_r10_workflow_e2e.R10WorkflowE2ETests.test_the_agent_binary_was_a_real_native_executable	requires ORCA_OS37_E2E=1; the R10 workflow E2E drives real local agent processes

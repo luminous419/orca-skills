@@ -159,13 +159,18 @@ def _standalone_journal_for(artifact_base: Any, run_id: str) -> Any:
     return ExecutionJournal(artifact_base, run_id)
 
 
-def _standalone_observation(artifact_base: Any, capabilities: Any) -> Any:
-    """The OS-37 standalone ``RunObservationPort``.  Invokes no Orca CLI."""
+def _standalone_observation(artifact_base: Any, capabilities: Any,
+                            ledger_factory: Any = None) -> Any:
+    """The OS-37 standalone ``RunObservationPort``.  Invokes no Orca CLI.
+
+    ``ledger_factory`` (consolidated follow-up review of ``87f6179``, finding 1) lets the
+    liveness probe read the receipt fence and the exit sentinel, so an open journal row is
+    never mistaken for a live worker; the wiring passes the run's launch-recorded ledger."""
     from .standalone_adapter import StandaloneRunObservation
     return StandaloneRunObservation(
         artifact_base,
         journal_factory=lambda run_id: _standalone_journal_for(artifact_base, run_id),
-        capabilities=capabilities)
+        capabilities=capabilities, ledger_factory=ledger_factory)
 
 
 def standalone_profile_path(artifact_base: Any, run_id: str) -> Path:
@@ -183,6 +188,40 @@ def standalone_profile_path(artifact_base: Any, run_id: str) -> Path:
     return journal_path(artifact_base, run_id).with_name("profile.json")
 
 
+def _profile_plain(value: Any) -> Any:
+    # A Python caller may hand over `dataclasses.asdict(profile)`, whose `graceful_hint`
+    # is bytes; the JSON door re-encodes a str hint with `.encode()`, so the round trip
+    # through the persisted file is exact for any UTF-8 hint.
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "surrogateescape")
+    raise TypeError(f"the profile spec is not JSON-shaped: {type(value).__name__}")
+
+
+def profile_payload(profile_spec: Mapping[str, Any]) -> str:
+    """The CANONICAL serialisation of a profile spec.  One function, so the digest a
+    launch binds, the archive a recovery reads and the check an override is validated
+    against are byte-identical -- content addressing is only sound if every caller
+    addresses the same bytes."""
+    return json.dumps(dict(profile_spec), sort_keys=True, indent=2, ensure_ascii=False,
+                      default=_profile_plain)
+
+
+def profile_digest(profile_spec: Mapping[str, Any]) -> str:
+    """The content address of a profile spec (follow-up review of ``87f6179``, finding
+    2).  The run/thread authority binds THIS value, a recovery rebuilds from the archive
+    named by it, and an ``--standalone-profile`` override is admitted only when its own
+    digest equals it -- so the profile a stalled run is recovered with is the profile it
+    was launched with, proven by content and not by a mutable global file."""
+    import hashlib
+    return hashlib.sha256(profile_payload(profile_spec).encode("utf-8")).hexdigest()[:16]
+
+
+def profile_archive_path(artifact_base: Any, run_id: str, digest: str) -> Path:
+    """``standalone/profiles/<digest>.json`` -- the write-once, content-addressed profile
+    a recovery of a given run/thread rebuilds from."""
+    return standalone_profile_path(artifact_base, run_id).parent / "profiles" / f"{digest}.json"
+
+
 def persist_standalone_profile(artifact_base: Any, run_id: str,
                                profile_spec: Mapping[str, Any]) -> Path:
     """Write the profile spec durably (tmp + rename).
@@ -196,19 +235,9 @@ def persist_standalone_profile(artifact_base: Any, run_id: str,
     """
     target = standalone_profile_path(artifact_base, run_id)
     target.parent.mkdir(parents=True, exist_ok=True)
-
-    def _plain(value: Any) -> Any:
-        # A Python caller may hand over `dataclasses.asdict(profile)`, whose
-        # `graceful_hint` is bytes; the JSON door re-encodes a str hint with `.encode()`,
-        # so the round trip through the persisted file is exact for any UTF-8 hint.
-        if isinstance(value, bytes):
-            return value.decode("utf-8", "surrogateescape")
-        raise TypeError(f"the profile spec is not JSON-shaped: {type(value).__name__}")
-    payload = json.dumps(dict(profile_spec), sort_keys=True, indent=2, ensure_ascii=False,
-                         default=_plain)
-    import hashlib
-    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
-    archive = target.parent / "profiles" / f"{digest}.json"
+    payload = profile_payload(profile_spec)
+    digest = profile_digest(profile_spec)
+    archive = profile_archive_path(artifact_base, run_id, digest)
     archive.parent.mkdir(parents=True, exist_ok=True)
 
     def _write(path: Path) -> None:
@@ -246,6 +275,18 @@ def _durable_write(path: Path, text: str) -> None:
     _fsync_directory(path.parent)
 
 
+def _durable_append(path: Path, text: str) -> None:
+    """Append one line and fsync it, so an audit trace reaches stable storage before the
+    change it records (B4).  Append rather than tmp+rename: the log is a growing history,
+    not a single latest value, and a torn tail is a legible partial entry the reader skips
+    rather than a lost file."""
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
+    _fsync_directory(path.parent)
+
+
 def _fsync_directory(directory: Path) -> None:
     try:
         dir_fd = os.open(str(directory), os.O_RDONLY)
@@ -274,13 +315,24 @@ STANDALONE_APPROVAL_AUTHORITY_MISMATCH = "STANDALONE_APPROVAL_AUTHORITY_MISMATCH
 #: Follow-up review finding 2.  A run launched standalone is re-entered standalone; any
 #: other adapter selection on it is refused by name rather than composed silently.
 STANDALONE_RUN_ADAPTER_MISMATCH = "STANDALONE_RUN_ADAPTER_MISMATCH"
+#: Follow-up review finding 2 / 9.  An ``--standalone-profile`` on a recovery whose digest
+#: does not equal the one the launch bound is refused: no silent override, no unverified
+#: substitution -- an exact digest match or an explicit audited migration only.
+STANDALONE_PROFILE_DIGEST_MISMATCH = "STANDALONE_PROFILE_DIGEST_MISMATCH"
+#: Iteration-2 review finding B4.  A profile migration that names no new profile, no actor
+#: or no reason, or whose new profile is identical to the bound one, is refused: a
+#: migration is a deliberate, attributable, CHANGING act, not a silent re-bind.
+STANDALONE_MIGRATION_REFUSED = "STANDALONE_MIGRATION_REFUSED"
+#: The durable audit-log schema for a profile migration.
+STANDALONE_MIGRATION_SCHEMA = "os37.standalone_profile_migration.v1"
 
 
 def _safe_stem(value: str) -> str:
     return "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in value)
 
 
-def standalone_authority_path(artifact_base: Any, run_id: str, thread_id: str = "") -> Path:
+def standalone_authority_path(artifact_base: Any, run_id: str, thread_id: str = "",
+                              *, for_write: bool = False) -> Path:
     """Where a standalone run records WHICH runtime-state ledger it was launched against.
 
     Beside the persisted profile: `--runtime-state` names an operator-chosen ledger, and a
@@ -292,19 +344,37 @@ def standalone_authority_path(artifact_base: Any, run_id: str, thread_id: str = 
     further thread of the same run id (the fixtures drive several through one room)
     records its own ``runtime_state.<thread>.json``, so exact-match is per thread and one
     thread's binding never overwrites another's.  ``thread_id=""`` names the primary.
+
+    Iteration-2 review finding B1.  The READ resolution NEVER lets an existing record
+    redirect verification around itself: a request for thread ``t`` resolves to the
+    per-thread file ONLY when that file EXISTS, and otherwise to the primary -- so a
+    primary whose ``thread_id`` was TAMPERED to name another thread can no longer bounce
+    the lookup to a missing per-thread file and make ``load_standalone_authority`` answer
+    ``None`` (which then let a foreign adapter in).  The primary is instead read AS this
+    thread's authority and refused by :func:`_validate_authority_record` when its recorded
+    thread does not match.  ``for_write=True`` keeps the old content-based routing -- a
+    SECOND thread's create must land in its own file rather than clobber the primary -- and
+    that read of the primary's thread is safe because the writer is recording its own
+    record under the create-once guard, not verifying an attacker-supplied one.
     """
     from .standalone_journal import journal_path
     directory = journal_path(artifact_base, run_id).parent
     primary = directory / "runtime_state.json"
     if not thread_id:
         return primary
-    if primary.exists():
+    per_thread = directory / f"runtime_state.{_safe_stem(thread_id)}.json"
+    if per_thread.exists():
+        return per_thread
+    if for_write and primary.exists():
         try:
             held = json.loads(primary.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             held = None
+        # A create for a DIFFERENT thread than the primary's own routes to its own file,
+        # so it never overwrites the primary.  An unreadable primary is left to the
+        # create-once check, which fails closed on it.
         if isinstance(held, dict) and held.get("thread_id") not in ("", thread_id):
-            return directory / f"runtime_state.{_safe_stem(thread_id)}.json"
+            return per_thread
     return primary
 
 
@@ -327,41 +397,124 @@ def approval_authority_name(approval_port: Any) -> str:
 
 
 def _authority_record(run_id: str, *, runtime_state_path: Any, thread_id: str,
-                      approval_authority: str) -> dict[str, Any]:
+                      approval_authority: str, profile_digest: str) -> dict[str, Any]:
     return {"schema": STANDALONE_AUTHORITY_SCHEMA, "run_id": run_id,
             "adapter": STANDALONE_ADAPTER,
             "runtime_state_path": str(Path(runtime_state_path).resolve()),
-            "thread_id": thread_id, "approval_authority": approval_authority}
+            "thread_id": thread_id, "approval_authority": approval_authority,
+            # Follow-up review of `87f6179`, finding 2.  The CONTENT ADDRESS of the
+            # profile this thread launched, bound into the closed record so a recovery
+            # rebuilds the runtime from `profiles/<digest>.json` -- the thread's OWN
+            # profile -- and never from the mutable, run-global `profile.json` that a
+            # second thread of the same run overwrites.
+            "profile_digest": profile_digest}
 
 
 def persist_standalone_authority(artifact_base: Any, run_id: str, *,
                                  runtime_state_path: Any, thread_id: str = "",
-                                 approval_authority: str = "none") -> Path:
-    """Record the launch bindings durably, CREATE-ONCE and EXACT-MATCH.  Finding 5 / 8.
+                                 approval_authority: str = "none",
+                                 profile_digest: str = "") -> Path:
+    """Record the launch bindings durably, CREATE-ONCE and EXACT-MATCH.  Finding 5 / 8 / 2.
 
-    The record names the ledger, the thread and the approval authority.  A record that
-    already exists for this run and thread must EQUAL the one this launch would write; a
-    different one is `STANDALONE_AUTHORITY_CONFLICT` -- raised before any process exists,
-    with the file untouched -- so a re-invocation with another ``--runtime-state`` (or
-    another ``--approval-authority``) can never redirect the recovery of a run it did not
-    launch, whether or not its own execution is later rejected.  An identical record is a
-    restart and writes nothing.
+    The record names the ledger, the thread, the approval authority and the PROFILE
+    DIGEST.  A record that already exists for this run and thread must EQUAL the one this
+    launch would write; a different one -- a different ledger, a different approval
+    authority, or a DIFFERENT PROFILE -- is `STANDALONE_AUTHORITY_CONFLICT`, raised before
+    any process exists with the file untouched, so a re-invocation can never redirect the
+    recovery of a run it did not launch.  An identical record is a restart and writes
+    nothing.
     """
-    target = standalone_authority_path(artifact_base, run_id, thread_id)
+    target = standalone_authority_path(artifact_base, run_id, thread_id, for_write=True)
     target.parent.mkdir(parents=True, exist_ok=True)
     if check_standalone_authority(artifact_base, run_id, runtime_state_path=runtime_state_path,
                                   thread_id=thread_id,
-                                  approval_authority=approval_authority) is not None:
+                                  approval_authority=approval_authority,
+                                  profile_digest=profile_digest) is not None:
         return target                                    # identical: a restart, no write
     wanted = _authority_record(run_id, runtime_state_path=runtime_state_path,
-                               thread_id=thread_id, approval_authority=approval_authority)
+                               thread_id=thread_id, approval_authority=approval_authority,
+                               profile_digest=profile_digest)
     _durable_write(target, json.dumps(wanted, sort_keys=True, indent=2) + "\n")
     return target
 
 
+def _validate_authority_record(record: Any, target: Any, run_id: str,
+                               requested_thread: str = "") -> dict[str, Any]:
+    """The CLOSED-record validation every read shares (finding 3 / B1).  A record that is
+    not a full, coherent standalone launch binding for THIS run and THIS thread is a
+    refusal, never treated as an absence: an existing-but-invalid authority must refuse
+    every recovery rather than fall through to a foreign composition.
+
+    ``requested_thread`` is the IMMUTABLE thread binding (B1).  The record's own
+    ``thread_id`` MUST equal it -- so a primary record whose ``thread_id`` was tampered to
+    name another thread is refused when read as this thread's authority rather than
+    silently bouncing the lookup to a missing per-thread file.  Iteration-3 finding B1':
+    the caller passes ``requested_thread=""`` ONLY after resolving the run's DURABLE thread
+    evidence (`load_standalone_authority` does this), so an empty value here means "the run
+    has no durable thread evidence to cross-check against" (an unrecoverable run with no
+    head and no pause record) -- NOT "accept any recorded thread".  There is deliberately
+    no ``requested_thread and ...`` guard that would let an empty value disable the check
+    on the recover/watchdog route: the emptiness is resolved to durable evidence BEFORE
+    this function, and only its genuine absence reaches here as "".
+    """
+    if (not isinstance(record, dict)
+            or record.get("schema") != STANDALONE_AUTHORITY_SCHEMA
+            or record.get("adapter") != STANDALONE_ADAPTER
+            or record.get("run_id") != run_id
+            or not isinstance(record.get("runtime_state_path"), str)
+            or not record["runtime_state_path"]
+            or record.get("approval_authority") in (None, "")
+            or not isinstance(record.get("profile_digest"), str)
+            or not record["profile_digest"]
+            or not isinstance(record.get("thread_id"), str)
+            or (requested_thread and record.get("thread_id") != requested_thread)):
+        raise LauncherError(
+            f"{STANDALONE_ADAPTER_REQUIRES_LEDGER}: the persisted runtime-state authority "
+            f"at {target} is not a complete standalone launch binding for run {run_id!r} "
+            f"thread {requested_thread!r} (ledger / approval authority / profile digest / "
+            "thread); recovery is refused rather than composed from an incomplete, foreign "
+            "or wrong-thread record")
+    return record
+
+
+def durable_thread_evidence(artifact_base: Any, run_id: str) -> str:
+    """The thread the run ACTUALLY launched, read from its own durable records.  B1'.
+
+    Every recovery route -- resume / cancel / abandon / recover / watchdog -- must validate
+    the authority's immutable thread binding against this, never against a caller-supplied
+    empty string.  The order mirrors the Watchdog wiring's own `bindings_for`: the pause
+    record's thread if the run is paused, else the committed checkpoint head's thread.  A
+    run with neither is not recoverable (it fails `RECOVERY_HEAD_MISSING` downstream), and
+    returns ``""`` -- there is genuinely no durable thread to cross-check against.
+    """
+    base = Path(artifact_base)
+    try:
+        from . import pause_store
+        record = pause_store.store_for(run_id, artifact_base=base).read(run_id)
+    except Exception:  # noqa: BLE001 - an unreadable pause store is not thread evidence
+        record = None
+    thread = str((record or {}).get("thread_id") or "")
+    if thread:
+        return thread
+    try:
+        from . import recovery_runtime
+        head = recovery_runtime.resolve_head(run_id, artifact_base=base)
+    except Exception:  # noqa: BLE001 - no committed head: no durable thread evidence
+        return ""
+    return str(getattr(head, "thread_id", "") or "")
+
+
 def load_standalone_authority(artifact_base: Any, run_id: str,
                               thread_id: str = "") -> dict[str, Any] | None:
-    """The recorded authority, or ``None`` when the run recorded none.  Unreadable RAISES."""
+    """The recorded authority, or ``None`` when the run recorded none.  Unreadable or
+    INVALID (including a WRONG-THREAD record, B1/B1') RAISES -- an existing-but-broken
+    record is a refusal, not an absence (finding 3).
+
+    B1'.  When the caller names no thread (``thread_id=""`` -- the recover/watchdog route,
+    which has no ``--thread-id``), the immutable thread binding is validated against the
+    run's DURABLE thread evidence (:func:`durable_thread_evidence`) rather than accepted as
+    "any".  So a tampered primary authority is refused with the typed authority error at
+    the authority boundary, BEFORE any downstream ``RECOVERY_*`` code, on every route."""
     target = standalone_authority_path(artifact_base, run_id, thread_id)
     if not target.exists():
         return None
@@ -371,28 +524,28 @@ def load_standalone_authority(artifact_base: Any, run_id: str,
         raise LauncherError(
             f"{STANDALONE_ADAPTER_REQUIRES_LEDGER}: the persisted runtime-state authority "
             f"at {target} is unreadable ({exc})") from exc
-    if (not isinstance(record, dict) or record.get("schema") != STANDALONE_AUTHORITY_SCHEMA
-            or not isinstance(record.get("runtime_state_path"), str)
-            or not record["runtime_state_path"]):
-        raise LauncherError(
-            f"{STANDALONE_ADAPTER_REQUIRES_LEDGER}: the persisted runtime-state authority "
-            f"at {target} does not name a ledger")
-    return record
+    effective_thread = thread_id or durable_thread_evidence(artifact_base, run_id)
+    return _validate_authority_record(record, target, run_id, effective_thread)
 
 
 def check_standalone_authority(artifact_base: Any, run_id: str, *, runtime_state_path: Any,
                                thread_id: str = "",
-                               approval_authority: str = "none") -> dict[str, Any] | None:
+                               approval_authority: str = "none",
+                               profile_digest: str = "") -> dict[str, Any] | None:
     """READ-ONLY exact-match check: the recorded binding for this run/thread, or ``None``
     when none is recorded; a recorded binding that DIFFERS raises
     ``STANDALONE_AUTHORITY_CONFLICT``.  Writes nothing.  CORRECTION 2 split this out of
     :func:`persist_standalone_authority` so composition can refuse a conflicting relaunch
-    before any claim while the CREATE is deferred until after the claim succeeds."""
-    target = standalone_authority_path(artifact_base, run_id, thread_id)
+    before any claim while the CREATE is deferred until after the claim succeeds.  This is
+    a WRITE-side check -- the launcher inspecting its own relaunch -- so it resolves the
+    path with ``for_write=True`` (B1): a second thread's check reads its own per-thread
+    file rather than the primary."""
+    target = standalone_authority_path(artifact_base, run_id, thread_id, for_write=True)
     if not target.exists():
         return None
     wanted = _authority_record(run_id, runtime_state_path=runtime_state_path,
-                               thread_id=thread_id, approval_authority=approval_authority)
+                               thread_id=thread_id, approval_authority=approval_authority,
+                               profile_digest=profile_digest)
     try:
         current = json.loads(target.read_text(encoding="utf-8"))
     except OSError as exc:
@@ -419,23 +572,22 @@ def publish_standalone_launch_bindings(artifact_base: Any, run_id: str, *,
                                        runtime_state_path: Any, thread_id: str = "",
                                        approval_authority: str = "none") -> None:
     """The ONE write of a standalone run's launch bindings: the profile, then the
-    create-once / exact-match authority record.  CORRECTION 2: called by `execute_state`
-    only after the run-scoped execution authority has been claimed SUCCESSFULLY -- so an
-    invocation refused `EXECUTION_AUTHORITY_HELD` (another Coordinator owns the run) can
-    never create or change the binding a Watchdog will recover from -- and before any
-    spawn, so a recovery of anything this launch does can rebuild its runtime.  An
-    in-memory ledger names no path and records no binding (the profile is still kept)."""
+    create-once / exact-match authority record that BINDS its digest.  CORRECTION 2:
+    called by `execute_state` only after the run-scoped execution authority has been
+    claimed SUCCESSFULLY -- so an invocation refused `EXECUTION_AUTHORITY_HELD` can never
+    create or change the binding a Watchdog will recover from -- and before any spawn, so
+    a recovery of anything this launch does can rebuild its runtime.  An in-memory ledger
+    names no path and records no binding (the profile is still kept)."""
     persist_standalone_profile(artifact_base, run_id, profile_spec)
     if runtime_state_path is not None:
         persist_standalone_authority(artifact_base, run_id,
                                      runtime_state_path=runtime_state_path,
                                      thread_id=thread_id,
-                                     approval_authority=approval_authority)
+                                     approval_authority=approval_authority,
+                                     profile_digest=profile_digest(profile_spec))
 
 
-def load_standalone_profile(artifact_base: Any, run_id: str) -> dict[str, Any] | None:
-    """The persisted profile spec, or ``None`` when the run never persisted one."""
-    target = standalone_profile_path(artifact_base, run_id)
+def _read_profile_file(target: Path) -> dict[str, Any] | None:
     if not target.exists():
         return None
     try:
@@ -449,6 +601,135 @@ def load_standalone_profile(artifact_base: Any, run_id: str) -> dict[str, Any] |
             f"{STANDALONE_ADAPTER_REQUIRES_PROFILE}: the persisted profile at {target} is "
             "not a JSON object")
     return spec
+
+
+def load_standalone_profile(artifact_base: Any, run_id: str,
+                            *, digest: str = "") -> dict[str, Any] | None:
+    """The persisted profile spec, or ``None`` when the run never persisted one.
+
+    ``digest`` (finding 2) reads the CONTENT-ADDRESSED archive a run/thread authority
+    bound -- `profiles/<digest>.json` -- so a recovery rebuilds the runtime from the
+    profile THAT thread launched, not from the run-global `profile.json` a later thread of
+    the same run overwrote.  The archive's own content is verified against the digest it is
+    named by, so a corrupted archive is refused rather than silently rebuilt.  Without a
+    digest it reads `profile.json`, which is the in-memory-ledger / single-composition
+    case that records no authority binding at all."""
+    if digest:
+        archive = profile_archive_path(artifact_base, run_id, digest)
+        spec = _read_profile_file(archive)
+        if spec is None:
+            raise LauncherError(
+                f"{STANDALONE_ADAPTER_REQUIRES_PROFILE}: run {run_id!r} bound profile "
+                f"digest {digest!r} but its archive {archive} is missing; the launch "
+                "profile cannot be rebuilt")
+        if profile_digest(spec) != digest:
+            raise LauncherError(
+                f"{STANDALONE_ADAPTER_REQUIRES_PROFILE}: the profile archive {archive} "
+                f"does not hash to the digest {digest!r} the launch bound; it is refused "
+                "rather than rebuilt from")
+        return spec
+    return _read_profile_file(standalone_profile_path(artifact_base, run_id))
+
+
+def standalone_migration_log_path(artifact_base: Any, run_id: str) -> Path:
+    """The durable, append-only audit log of profile migrations for a run.
+
+    Under the run's own artifact root beside the profile and authority, so a stranger
+    process (an auditor, a later recovery) can read the full history of who re-bound the
+    profile, from which digest to which, and why."""
+    return standalone_profile_path(artifact_base, run_id).with_name("profile_migrations.ndjson")
+
+
+def read_standalone_migrations(artifact_base: Any, run_id: str,
+                               thread_id: str = "") -> tuple[dict[str, Any], ...]:
+    """Every recorded migration for this run (optionally filtered to one thread), oldest
+    first.  RAISES on an unreadable log rather than pretending there were none."""
+    path = standalone_migration_log_path(artifact_base, run_id)
+    if not path.exists():
+        return ()
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise LauncherError(
+            f"{STANDALONE_MIGRATION_REFUSED}: the migration audit log at {path} is "
+            f"unreadable ({exc})") from exc
+    out: list[dict[str, Any]] = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError as exc:
+            raise LauncherError(
+                f"{STANDALONE_MIGRATION_REFUSED}: the migration audit log at {path} has an "
+                f"unparsable entry ({exc})") from exc
+        if not thread_id or record.get("thread_id") == thread_id:
+            out.append(record)
+    return tuple(out)
+
+
+def migrate_standalone_profile(artifact_base: Any, run_id: str, *, thread_id: str = "",
+                               new_profile_spec: Mapping[str, Any], actor: str,
+                               reason: str) -> dict[str, Any]:
+    """The ONE sanctioned, audited way to change a run/thread's bound profile.  B4.
+
+    The immutable launch authority is create-once and exact-digest by default (F2/F9): a
+    ``--standalone-profile`` that does not restate the bound digest is refused.  A
+    legitimate profile change -- a corrected binary path, a retuned timeout -- is therefore
+    a DELIBERATE, ATTRIBUTABLE, DURABLE act rather than a silent override or a hand edit of
+    the authority file:
+
+    1. the current authority is loaded and VALIDATED (a broken/foreign/wrong-thread record
+       refuses the migration, exactly as recovery would);
+    2. an audit record -- old digest, new digest, actor, reason, timestamp, thread -- is
+       appended to :func:`standalone_migration_log_path` and fsynced BEFORE anything is
+       re-bound, so a migration that changed the binding always left a durable trace;
+    3. the new profile is archived content-addressed, and the authority record is
+       rewritten with the new digest through the same durable writer the launch used.
+
+    A migration to the digest already bound is refused (nothing to migrate); a missing
+    actor or reason is refused (an unattributable migration is not audited).  Returns the
+    audit record.
+    """
+    if not str(actor).strip() or not str(reason).strip():
+        raise LauncherError(
+            f"{STANDALONE_MIGRATION_REFUSED}: a profile migration requires a non-empty "
+            "--actor-id and --reason; an unattributable re-bind is not an audited act")
+    record = load_standalone_authority(artifact_base, run_id, thread_id)
+    if record is None:
+        raise LauncherError(
+            f"{STANDALONE_MIGRATION_REFUSED}: run {run_id!r} (thread {thread_id!r}) records "
+            "no standalone launch binding to migrate")
+    old_digest = str(record["profile_digest"])
+    new_digest = profile_digest(new_profile_spec)
+    if new_digest == old_digest:
+        raise LauncherError(
+            f"{STANDALONE_MIGRATION_REFUSED}: the new profile hashes to the digest already "
+            f"bound ({old_digest!r}); there is nothing to migrate")
+    # Round-trip the new profile through the operator's JSON door, so a malformed profile
+    # is refused HERE (before any durable write) rather than at the next recovery.
+    from .standalone_profile import profile_from_mapping
+    try:
+        profile_from_mapping(new_profile_spec)
+    except Exception as exc:  # noqa: BLE001 - a malformed migration profile refuses now
+        raise LauncherError(
+            f"{STANDALONE_MIGRATION_REFUSED}: the new profile is invalid ({exc})") from exc
+    audit = {"schema": STANDALONE_MIGRATION_SCHEMA, "run_id": run_id,
+             "thread_id": thread_id, "old_profile_digest": old_digest,
+             "new_profile_digest": new_digest, "actor": str(actor),
+             "reason": str(reason), "migrated_at": _authority_now()}
+    # (2) durable audit FIRST -- append + fsync -- so the trace precedes the re-bind.
+    log = standalone_migration_log_path(artifact_base, run_id)
+    log.parent.mkdir(parents=True, exist_ok=True)
+    _durable_append(log, json.dumps(audit, sort_keys=True) + "\n")
+    # (3) archive the new profile, then re-bind the authority record with the new digest.
+    persist_standalone_profile(artifact_base, run_id, new_profile_spec)
+    migrated = dict(record)
+    migrated["profile_digest"] = new_digest
+    _durable_write(standalone_authority_path(artifact_base, run_id, thread_id, for_write=True),
+                   json.dumps(migrated, sort_keys=True, indent=2) + "\n")
+    return audit
 
 
 def build_standalone_runtime(artifact_base: Any, run_id: str, *, runtime_state: Any,
@@ -502,10 +783,120 @@ def build_standalone_state(spec: dict[str, Any], adapter: Any) -> dict[str, Any]
     return build_state({**spec, "capabilities": sorted(adapter.capabilities())})
 
 
+#: The role spellings the engine uses -> the `task_context`/`dispatch_context` ones.
+_STANDALONE_PROMPT_ROLE = {"WORKER": "worker", "PHASE_REVIEWER": "reviewer",
+                          "FINAL_REVIEWER": "final_reviewer"}
+
+
+def build_standalone_prompt_composer(*, objective: str,
+                                     requested_phases: tuple[str, ...],
+                                     risk: str = "high",
+                                     project_root: Path | None = None,
+                                     role_instructions: Mapping[str, str] | None = None
+                                     ) -> Any:
+    """The ONE renderer of the standalone production prompt -- follow-up review finding 5.
+
+    Consolidated review finding 5.  `StandaloneAdapter.start` used to hand the agent the
+    canonical `ActionIntent` JSON, because `ActionIntent` carries no prose and the
+    standalone runtime has no prompt renderer -- so `run_workflow --adapter standalone`
+    never delivered the role, phase, task contract, correction instruction or
+    review-output contract a real CLI needs to produce a valid gate record.  On the Orca
+    path that composition is `orca_runtime_harness.dispatch_context`, replayed into the
+    dispatch preamble by the Orca skill environment; a headless CLI has NO such
+    environment, so the standalone prompt must carry all of it itself.
+
+    This closure is that renderer.  Given the `ActionIntent` the graph's EXECUTE_INTENT
+    node hands `start`, it returns a SELF-CONTAINED prompt:
+
+    * a role / phase / run narrative -- who the agent is and that this prompt is its whole
+      instruction set;
+    * the run OBJECTIVE (the task contract), the same string a `--adapter orca` launch
+      passes as its objective;
+    * the review-output contract -- the exact `STATUS:` / `RESULT:` line and the
+      ``decision-gate`` record the workflow gate reads -- because the agent has no skill
+      that would otherwise carry it;
+    * on a CORRECTION or repair round, the correction instruction: read the reviewer's
+      findings (from the shared worktree / the repair defects) and address them;
+    * the SAME `dispatch_context` machine-control blocks the Orca path renders (task
+      boundary, quality gate, risk profile, the generated decision-gate contract, and on a
+      repair the validation-repair block), so ingress and egress cannot drift from the
+      Orca path's.
+
+    ``role_instructions`` maps a ``"<ROLE>:<ROUND_KIND>"`` key (e.g. ``"WORKER:PHASE_GATE"``)
+    to an extra instruction the launch supplies as DATA -- how a run scopes a first
+    iteration, say -- so a correction-loop demonstration's inducement rides the production
+    boundary rather than being composed by a harness below it.  Empty by default: a bare
+    production launch renders the production prompt and nothing else.
+    """
+    harness = _import_orca_runtime()
+    from . import artifact_identity
+    instructions = dict(role_instructions or {})
+
+    def render(intent: Mapping[str, Any]) -> str:
+        role = str(intent.get("role") or "WORKER")
+        ctx_role = _STANDALONE_PROMPT_ROLE.get(role, "worker")
+        phase = artifact_identity.contract_phase(role, str(intent.get("phase") or ""))
+        gate_iteration = int(intent.get("gate_iteration") or 1)
+        round_kind = str(intent.get("round_kind") or "PHASE_GATE")
+        repair_instruction = intent.get("repair_instruction")
+        mode = "complete" if role == "WORKER" else "pass"
+        spec, _boundary, _reviewer_ctx = harness.dispatch_context(
+            ctx_role, gate_iteration, mode, phase=phase, base_spec=objective,
+            run_id=str(intent.get("run_id") or ""),
+            requested_phases=tuple(p.lower() for p in requested_phases),
+            risk=risk, risk_source="explicit",
+            repair_instruction=repair_instruction)
+        lines = [
+            "=== STANDALONE AGENT DISPATCH ===",
+            f"You are the {role} for the {phase} phase of run "
+            f"{intent.get('run_id') or ''!s} (gate iteration {gate_iteration}, round "
+            f"{round_kind}).",
+            "You are a headless CLI agent with NO Orca skill environment loaded, so THIS "
+            "prompt is your COMPLETE instruction set.  Do the work in the current working "
+            "directory.",
+            "",
+        ]
+        if role == "WORKER":
+            if round_kind == "CORRECTION" or repair_instruction is not None:
+                lines += [
+                    "A reviewer read your previous submission against the task contract "
+                    "and returned findings; they are recorded in REVIEW.md in the current "
+                    "working directory (and, for a form repair, in the VALIDATION REPAIR "
+                    "block below).  READ them and address every finding, then update your "
+                    "work in place.",
+                ]
+            lines += [
+                "When you are done, your FINAL message MUST contain, on their own lines, "
+                "`STATUS: COMPLETE` and a `DECISION_GATE_STATE:` declaration, plus exactly "
+                "one fenced ```decision-gate JSON record filled in per the contract below. "
+                "Also write a short report to WORKER.md in the working directory.",
+            ]
+        else:
+            lines += [
+                "Review the worker's submission in the current working directory against "
+                "the task contract.  Reach your verdict from your OWN reading of the files; "
+                "do not assume a defect exists and do not assume the submission is correct.",
+                "Your FINAL message MUST begin with `RESULT: PASS` or `RESULT: FAIL` on its "
+                "own line, contain a `DECISION_GATE_STATE:` declaration and exactly one "
+                "fenced ```decision-gate JSON record whose `verdict` is that same PASS/FAIL, "
+                "filled in per the contract below.  Also write your findings to REVIEW.md "
+                "in the working directory (one bullet per finding, or 'None').",
+            ]
+        supplement = instructions.get(f"{role}:{round_kind}") or instructions.get(role)
+        if supplement:
+            lines += ["", supplement]
+        lines += ["", "--- TASK CONTRACT ---", objective, "--- END TASK CONTRACT ---",
+                  "", spec]
+        return "\n".join(lines)
+
+    return render
+
+
 def build_standalone_adapter(spec: dict[str, Any], *, artifact_base: Path,
                              run_id: str = "", runtime_state: Any = None,
                              profile_spec: Any = None,
-                             approval_port: Any = None) -> tuple[Any, dict[str, Any]]:
+                             approval_port: Any = None,
+                             prompt_composer: Any = None) -> tuple[Any, dict[str, Any]]:
     """Compose the standalone adapter and the state it declares, in the fixed order.
 
     Composition order matches the Orca path's exactly -- journal, then ledger, then the
@@ -565,15 +956,23 @@ def build_standalone_adapter(spec: dict[str, Any], *, artifact_base: Path,
     thread_id = str(spec.get("thread_id") or "")
     approval_authority = approval_authority_name(approval_port)
     if ledger_path is not None:
+        # Finding 2: the pre-claim exact-match check binds the profile digest too, so a
+        # relaunch of the same run/thread with a DIFFERENT profile is refused before any
+        # claim -- the create-once binding covers the profile, not only the ledger.
         check_standalone_authority(artifact_base, resolved_run,
                                    runtime_state_path=ledger_path, thread_id=thread_id,
-                                   approval_authority=approval_authority)
+                                   approval_authority=approval_authority,
+                                   profile_digest=profile_digest(profile_spec))
     adapter = StandaloneAdapter(runtime, runtime_state=runtime_state,
                                 settlement_journal=journal,
                                 pause_row_journal=_standalone_pause_row_journal(
                                     artifact_base, resolved_run),
                                 approval_port=approval_port,
-                                artifact_base=artifact_base, run_id=resolved_run)
+                                artifact_base=artifact_base, run_id=resolved_run,
+                                # Finding 5: the production prompt renderer, when the
+                                # composition root supplies one.  ``None`` keeps the
+                                # canonical-intent payload for the scripted/fake paths.
+                                prompt_composer=prompt_composer)
     # The post-claim publication step (CORRECTION 2), bound to THIS composition's facts
     # and attached to the adapter so `execute_state` -- which is adapter-neutral and reads
     # it by name -- can run it once the run is really this process's to launch.
@@ -1311,6 +1710,54 @@ TURN_VERBS = ("turn-end", "turn-end-hook", "turn-end-bind",
 #: OS-43.  New top-level verbs, registered beside the existing tables; every
 #: existing dispatch path is untouched, so a revert is dropping the registration.
 WATCHDOG_VERBS = ("watchdog", "recover")
+#: Iteration-2 review finding B4.  The explicit, audited profile-migration verb -- the ONE
+#: sanctioned way to change a run/thread's create-once profile binding.
+MIGRATE_VERBS = ("migrate-standalone-profile",)
+
+
+def build_migrate_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="run_workflow.py",
+        description="Explicit, audited migration of a standalone run's bound profile (B4).")
+    sub = parser.add_subparsers(dest="verb", required=True)
+    migrate = sub.add_parser("migrate-standalone-profile",
+                             help="re-bind a standalone run/thread's profile to a new one, "
+                                  "writing a durable audit record")
+    migrate.add_argument("--run-id", required=True)
+    migrate.add_argument("--thread-id", default="")
+    migrate.add_argument("--artifact-base", default=".")
+    migrate.add_argument("--standalone-profile", required=True,
+                         help="JSON file describing the NEW driver profile to bind")
+    migrate.add_argument("--actor-id", required=True,
+                         help="who is performing the migration (recorded in the audit log)")
+    migrate.add_argument("--reason", required=True,
+                         help="why the profile is being migrated (recorded in the audit log)")
+    migrate.add_argument("--json", action="store_true")
+    return parser
+
+
+def run_migrate_cli(argv: list[str]) -> int:
+    """The ``migrate-standalone-profile`` verb (B4).  Writes an audit record and re-binds
+    the authority create-once; refuses an unattributable or no-op migration by name."""
+    args = build_migrate_parser().parse_args(argv)
+    base = Path(args.artifact_base)
+    try:
+        new_profile = _read_json(args.standalone_profile, "--standalone-profile")
+        if not isinstance(new_profile, dict):
+            raise LauncherError("the standalone profile must be a JSON object")
+        audit = migrate_standalone_profile(
+            base, args.run_id, thread_id=args.thread_id, new_profile_spec=new_profile,
+            actor=args.actor_id, reason=args.reason)
+    except LauncherError as exc:
+        print(f"run_workflow: {exc}", file=sys.stderr)
+        return USAGE_EXIT_CODE
+    if args.json:
+        print(json.dumps(audit, sort_keys=True, ensure_ascii=False))
+    else:
+        print(f"run={args.run_id} thread={args.thread_id or '-'} "
+              f"migrated {audit['old_profile_digest']} -> {audit['new_profile_digest']} "
+              f"by {audit['actor']}")
+    return 0
 
 
 def build_turn_parser() -> argparse.ArgumentParser:
@@ -1545,6 +1992,11 @@ def build_pause_parser() -> argparse.ArgumentParser:
     resume.add_argument("--project-root", default="",
                         help="project root the Orca adapter reads its quality profile "
                              "and agent routing from (default: the working directory)")
+    resume.add_argument("--standalone-profile", default="",
+                        help="JSON driver profile for --adapter standalone; optional. "
+                             "Finding 9: consistent with the watchdog verbs, it is NOT a "
+                             "silent override -- it must hash to the digest the launch "
+                             "bound, or the resume is refused")
     resume.add_argument("--json", action="store_true")
     return parser
 
@@ -1619,9 +2071,14 @@ def run_pause_cli(argv: list[str]) -> int:
                     "standalone launch binding, so the ledger it paused against cannot be "
                     "reopened; --adapter standalone resumes only a run launched standalone")
             ledger = FileRuntimeStateStore(Path(binding["runtime_state_path"]))
+            override: Any = None
+            if getattr(args, "standalone_profile", ""):
+                override = _read_json(args.standalone_profile, "--standalone-profile")
+                if not isinstance(override, dict):
+                    raise LauncherError("the standalone profile must be a JSON object")
             adapter, _execution_journal, approval_port = standalone_recovery_composition(
                 base, args.run_id, thread_id=record["thread_id"], ledger=ledger,
-                pause_row_journal=journal)
+                pause_row_journal=journal, profile_override=override)
         else:
             adapter = FakeAdapter(results, runtime_state=ledger, run_id=args.run_id,
                                   settlement_journal=journal)
@@ -1808,7 +2265,11 @@ def _add_adapter_selection(mode: argparse.ArgumentParser) -> None:
     mode.add_argument("--standalone-profile", default="",
                       help="JSON driver profile for --adapter standalone; optional, because "
                            "a standalone run persists its own profile under its run root "
-                           "at launch and a recovery reads that by default (finding 5)")
+                           "at launch and a recovery reads that by default (finding 5). "
+                           "When given, it must hash to the digest the launch bound "
+                           "(finding 9): an exact match is a restatement, and any other "
+                           "profile is refused rather than silently overriding the "
+                           "recovery")
 
 
 def standalone_approval_port_for(base: Path, run_id: str, thread_id: str = "") -> Any:
@@ -1845,18 +2306,44 @@ def standalone_recovery_composition(base: Path, run_id: str, *, thread_id: str,
     """The standalone runtime a RE-ENTRY is composed with: ``(adapter, execution
     journal, approval port)``.  One function for the Watchdog and the `resume` verb.
 
-    Follow-up review finding 2.  The runtime is rebuilt from what the ORIGINAL launch
-    persisted -- its profile (or an operator's explicit override), its ledger (the
-    caller resolved it from the same record), and its approval authority restored by
-    name (finding 8) -- so the round a paused or stalled run re-enters is bound to the
-    identity fence, the ledger and the capabilities it held, not to a fresh default
-    composition.  Nothing here spawns: the adapter adopts in-flight effects through
-    `resume` (finding 1) and starts new ones only where the graph dispatches them.
+    Follow-up review finding 2.  The runtime is rebuilt from the CONTENT-ADDRESSED
+    profile the launch bound -- `profiles/<digest>.json`, the profile THIS thread
+    launched, verified against the digest the run/thread authority recorded -- its ledger
+    (the caller resolved it from the same record), and its approval authority restored by
+    name (finding 8), so the round a paused or stalled run re-enters is bound to the
+    identity fence, the ledger, the profile and the capabilities it held, not to a fresh
+    default composition and never to another thread's profile.
+
+    ``profile_override`` (findings 2 / 9) is the ``--standalone-profile`` a recovery may
+    carry.  It is NOT a silent override: it must hash to the SAME digest the launch bound,
+    in which case it is a restatement of the recorded profile; any other profile is
+    refused, because an unverified substitution is exactly the redirection the immutable
+    binding exists to prevent.  A run that recorded no authority binding (an in-memory
+    ledger) falls back to `profile.json`, and an override there is accepted because there
+    is no recorded digest to contradict.
+
+    Nothing here spawns: the adapter adopts in-flight effects through `resume` (finding 1)
+    and starts new ones only where the graph dispatches them.
     """
     from .standalone_adapter import StandaloneAdapter
     execution_journal = _standalone_journal_for(base, run_id)
+    record = load_standalone_authority(base, run_id, thread_id)
+    recorded_digest = str((record or {}).get("profile_digest") or "")
     if profile_override is not None:
+        # Finding 9: an override is admitted ONLY as an exact restatement of the bound
+        # digest.  A recorded run whose digest the override does not match is refused;
+        # a run with no recorded binding (in-memory ledger) has no digest to violate.
+        override_digest = profile_digest(profile_override)
+        if recorded_digest and override_digest != recorded_digest:
+            raise LauncherError(
+                f"{STANDALONE_PROFILE_DIGEST_MISMATCH}: run {run_id!r} (thread "
+                f"{thread_id!r}) was launched with profile digest {recorded_digest!r} and "
+                f"the --standalone-profile given hashes to {override_digest!r}; a recovery "
+                "may restate the recorded profile exactly or migrate it by an explicit "
+                "audited act, never override it unverified")
         profile_spec: Any = profile_override
+    elif recorded_digest:
+        profile_spec = load_standalone_profile(base, run_id, digest=recorded_digest)
     else:
         profile_spec = load_standalone_profile(base, run_id)
     if profile_spec is None:
@@ -1883,17 +2370,34 @@ def refuse_foreign_composition(base: Path, run_id: str, thread_id: str, *,
     an approval binding that only the standalone composition can honour.  Selecting --
     or defaulting to -- the fake or Orca adapter on it is refused by name here, before
     any effect, instead of silently composing a runtime that discards all three.
+
+    Finding 3.  An authority record that EXISTS and cannot be read or is not a complete
+    standalone binding is a REFUSAL, not an absence: `load_standalone_authority` raises,
+    and this used to swallow that and fall through to the foreign composition, so a
+    malformed authority file let a fake/Orca re-entry discard the original ledger, fence
+    and approval binding.  The raise now propagates -- existing-but-unreadable refuses
+    every recovery, exactly as an existing-and-standalone one does.
     """
-    try:
-        record = load_standalone_authority(base, run_id, thread_id)
-    except LauncherError:
-        record = None
+    record = load_standalone_authority(base, run_id, thread_id)
     if record is not None and record.get("adapter", STANDALONE_ADAPTER) == STANDALONE_ADAPTER:
         raise LauncherError(
             f"{STANDALONE_RUN_ADAPTER_MISMATCH}: run {run_id!r} was launched with "
             f"--adapter {STANDALONE_ADAPTER} and re-entering it needs the same; "
             f"--adapter {selected} would compose a runtime that discards the run's "
             "identity fence, ledger and approval binding")
+
+
+def _prevalidate_targeted_standalone_authority(base: Path, adapter_name: str,
+                                               run_id: str) -> None:
+    """B1'/B2'.  For a standalone recovery targeting a SPECIFIC run (`recover`, `watchdog
+    once --run-id`), validate the authority at the boundary so a tampered / malformed /
+    wrong-thread / incomplete record refuses with the typed authority error BEFORE any
+    recovery machinery -- not as a downstream ``RECOVERY_*`` code.  A no-op for any other
+    adapter and for a full sweep (no ``--run-id``); a run that recorded no authority loads
+    ``None`` and is untouched.  In its own function so the wiring's adapter-neutral
+    preamble carries no standalone-only symbol and the fake/Orca arms stay byte-unchanged."""
+    if adapter_name == STANDALONE_ADAPTER and run_id:
+        load_standalone_authority(base, run_id)
 
 
 def _watchdog_wiring(args: argparse.Namespace, *, runner: Any = None,
@@ -1925,6 +2429,18 @@ def _watchdog_wiring(args: argparse.Namespace, *, runner: Any = None,
             raise LauncherError(
                 f"{ORCA_ADAPTER_REQUIRES_STATE}: --adapter orca adopts an existing Run "
                 "and needs --run-owner, the terminal handle that owns it")
+
+    # Iteration-3 finding B1' / B2'.  When a SPECIFIC run is targeted (the `recover` verb
+    # always names one; `watchdog once --run-id` does too), the standalone authority is
+    # pre-validated at the wiring boundary, BEFORE any recovery machinery runs, so a
+    # tampered / malformed / wrong-thread / incomplete authority is refused with the typed
+    # authority error and never masked by a downstream `RECOVERY_*` code from a lazy load
+    # inside the recovery invocation.  Extracted into a helper (not inlined here) so this
+    # adapter-neutral preamble stays free of any standalone-only symbol -- the fake and
+    # Orca arms are byte-unchanged, which `test_os37_lifecycle_boundary_regressions`
+    # asserts by scanning this region.  A full sweep (no `--run-id`) is deliberately NOT
+    # pre-validated: one corrupt run must not abort the whole fleet.
+    _prevalidate_targeted_standalone_authority(base, adapter_name, getattr(args, "run_id", ""))
 
     adapters: dict[str, Any] = {}
     bindings: dict[str, Any] = {}
@@ -2101,7 +2617,12 @@ def _watchdog_wiring(args: argparse.Namespace, *, runner: Any = None,
         # ObservationUnsupported.  F6/F7 are NOT relaxed; they gain a real authority.
         # The orca and fake arms are byte-unchanged.
         "observation": (
-            _standalone_observation(base, capabilities_for)
+            _standalone_observation(
+                base, capabilities_for,
+                # Finding 1: the liveness probe reads the run's OWN launch-recorded
+                # ledger (bindings_for honours the recorded runtime-state path), so the
+                # receipt fence and exit sentinel decide F6, not the open journal row.
+                ledger_factory=lambda run_id: bindings_for(run_id)[0])
             if adapter_name == STANDALONE_ADAPTER
             else recovery_runtime.RunObservationAdapter(
                 base, runner=runner or turn_boundary._default_runner,
@@ -2265,6 +2786,8 @@ def run_cli(argv: list[str] | None = None) -> int:
         return run_turn_cli(raw)
     if raw and raw[0] in WATCHDOG_VERBS:
         return run_watchdog_cli(raw)
+    if raw and raw[0] in MIGRATE_VERBS:
+        return run_migrate_cli(raw)
     args = build_parser().parse_args(argv)
     try:
         version = require_runtime()
@@ -2293,12 +2816,30 @@ def run_cli(argv: list[str] | None = None) -> int:
             # carries.  `--adapter orca` and `--adapter fake` are deliberately NOT given
             # this: what an Orca run declares is `OrcaAdapter`'s own answer and changing it
             # is authorized by no acceptance criterion here.
+            # Finding 5.  When the launch names an OBJECTIVE (the task contract), the
+            # composition root builds the production prompt renderer from it, so
+            # EXECUTE_INTENT -> StandaloneAdapter.start delivers the role / phase / task
+            # contract / correction instruction / review-output contract to the real CLI
+            # rather than the canonical intent JSON.  A launch with no objective renders
+            # nothing (the pre-finding behaviour) -- the objective is required only for a
+            # run whose agents must be told what to do.
+            objective = str(args.objective or orca_spec.get("objective") or "")
+            composer = None
+            if objective:
+                composer = build_standalone_prompt_composer(
+                    objective=objective,
+                    requested_phases=tuple(orca_spec.get("phases") or CANONICAL_PHASES),
+                    risk=str(orca_spec.get("risk") or "high"),
+                    project_root=(Path(args.project_root)
+                                  if getattr(args, "project_root", None) else None),
+                    role_instructions=orca_spec.get("role_instructions"))
             adapter, state = build_standalone_adapter(
                 orca_spec, artifact_base=Path(args.artifact_base),
                 run_id=resolved_run, runtime_state=runtime_state,
                 profile_spec=_standalone_profile_spec(args),
                 approval_port=configured_approval_port(
-                    args.approval_authority, Path(args.artifact_base)))
+                    args.approval_authority, Path(args.artifact_base)),
+                prompt_composer=composer)
         if args.adapter == ORCA_ADAPTER:
             # The production path.  The Run is created FIRST, because the run id it
             # returns is what the state, the artifact paths and the ledger are all named

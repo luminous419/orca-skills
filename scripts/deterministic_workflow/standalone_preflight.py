@@ -625,10 +625,20 @@ def preflight_fingerprint(profile: StandaloneProfile, child_env: Mapping[str, st
     """What a cached preflight answer is keyed on.  ANY change re-runs everything.
 
     The declared profile (every field), the RESOLVED binary image with its size and
-    modification time (an upgrade in place changes it), the child environment minus the
-    per-spawn token (so two dispatches under one profile share a key), and the probe
-    inputs.  Deliberately over-inclusive: a cache that ever answered for a changed
-    binary would be a preflight that never ran.
+    modification time (an upgrade in place changes it), the child environment's NAMES
+    minus the per-spawn token (so two dispatches under one profile share a key), and the
+    probe inputs.  Deliberately over-inclusive on configuration: a cache that ever
+    answered for a changed binary would be a preflight that never ran.
+
+    **Names, never values** (consolidated follow-up review of 87f6179, finding 8).  This
+    digest is PUBLISHED -- it travels on the `spawned` row as `preflight_fingerprint` --
+    and the child environment holds the RESOLVED credentials.  Hashing their values
+    would make the journal a (weak, but real) oracle for a secret: the same boundary
+    `standalone_env.env_digest` already refuses to cross, and for the same reason.  The
+    stable configuration that shapes the environment (`bin_dirs`, `driver_env`,
+    `auth_secret_ref`'s NAMES, the home policy) is already inside `repr(profile)`, and
+    the auth check is never cached, so nothing a secret's VALUE could change is answered
+    from this key.
     """
     import hashlib
     import json as _json
@@ -639,10 +649,10 @@ def preflight_fingerprint(profile: StandaloneProfile, child_env: Mapping[str, st
         image_identity = [image, stat.st_size, stat.st_mtime_ns, stat.st_ino] if stat else [image]
     except OSError:
         image_identity = [image, "unstat-able"]
-    env_view = {name: value for name, value in sorted(child_env.items())
-                if name != env_policy.SPAWN_TOKEN_ENV}
+    env_names = sorted(name for name in child_env if name != env_policy.SPAWN_TOKEN_ENV)
     payload = _json.dumps({"profile": repr(profile), "image": image_identity,
-                           "env": env_view, "auth_probe_argv": list(auth_probe_argv or ()),
+                           "env_names": env_names,
+                           "auth_probe_argv": list(auth_probe_argv or ()),
                            "help_text": help_text}, sort_keys=True, default=str)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 

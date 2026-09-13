@@ -691,7 +691,16 @@ class F05WatchdogRecoversAStalledStandaloneRunTests(unittest.TestCase):
 
     def test_a_run_with_no_persisted_profile_is_refused_by_name_not_by_traceback(self) -> None:
         self._stall("run_f5nopro")
+        # Follow-up review of `87f6179`, finding 2: the recovery now rebuilds from the
+        # CONTENT-ADDRESSED profile the authority bound (`profiles/<digest>.json`), not the
+        # mutable `profile.json` pointer, so "no persisted profile" means removing the
+        # bound archive too -- deleting the pointer alone no longer loses the profile,
+        # which is the improvement.  The assertion (a NAMED refusal, then an operator
+        # profile recovers it) is unchanged.
+        import shutil as _shutil
         launcher.standalone_profile_path(self.base, "run_f5nopro").unlink()
+        _shutil.rmtree(launcher.standalone_profile_path(self.base, "run_f5nopro").parent
+                       / "profiles", ignore_errors=True)
         code, summary, stderr, escaped = self._recover("run_f5nopro")
         self.assertIsNone(escaped, f"the recovery escaped as {escaped!r}")
         self.assertEqual(code, 1)
@@ -1420,7 +1429,11 @@ class F19ManifestHeaderIsDerivedTests(unittest.TestCase):
         text = (REPO / "scripts" / "tolerated_skip_manifest.txt").read_text()
         actual = len([line for line in text.splitlines()
                       if line.startswith("always\ttest_os37_")])
-        self.assertEqual(actual, 26)
+        # 26 at `87f6179`; +4 for the F5 real-CLI graph-prompt E2E cases this round adds
+        # (`test_os37_r10_graph_prompt_e2e`), all gated on ORCA_OS37_E2E.  The number is
+        # the current truth of the derived header, not a preference -- the point of the
+        # test is that the header count EQUALS the real entry count, not what it is.
+        self.assertEqual(actual, 30)
         self.assertIn(f"OS-37 adds {actual} `always` entries", text)
         self.assertNotIn("twenty-one", text)
         self.assertNotIn("{os37_always}", text)

@@ -144,10 +144,16 @@ class ThreeWayDisciplineTests(_Base):
         self.assertEqual(state["active_dispatches"], ())
         self.assertEqual(state["runnable_actions"], ())
 
-    def test_an_open_dispatch_is_reported(self) -> None:
+    def test_an_open_dispatch_with_no_live_worker_is_reported_as_stalled_not_active(self) -> None:
+        """Consolidated follow-up review of `87f6179`, finding 1.  An open journal row is
+        NOT proof of a live worker: liveness is read from the fenced process / spawn /
+        sentinel evidence, and this row names no live process, so the dispatch is a STALLED
+        (runnable) one -- it reaches STALLED_RECOVERABLE -- and never `active_dispatches`
+        (which is ACTIVE_DISPATCH_WAIT, "work in flight", and would make the sweep decline
+        the very run it exists to recover)."""
         self.journal.append(event())
         state = self.observation().orca_state("run_1")
-        self.assertEqual(state["active_dispatches"], ("intent-1",))
+        self.assertEqual(state["active_dispatches"], ())
         self.assertEqual(state["runnable_actions"], ("intent-1",))
 
     def test_an_unreadable_authority_raises_unavailable(self) -> None:
@@ -264,10 +270,16 @@ class BothDirectionsTests(_Base):
     """V-7 written both ways: with the observation, and without it."""
 
     def test_with_standalone_observation_run_is_recoverable(self) -> None:
-        """The observation answers, so the fact is COVERED and the sweep can classify."""
+        """The observation answers, so the fact is COVERED and the sweep can classify.
+
+        Finding 1: a run whose only durable evidence is an open journal row with no live
+        worker is RECOVERABLE -- it must reach the runnable (STALLED_RECOVERABLE) arm, not
+        the active-dispatch (declines recovery) arm, which is the whole reason this
+        observation exists."""
         self.journal.append(event())
         state = self.observation().orca_state("run_1")
-        self.assertEqual(state["active_dispatches"], ("intent-1",))
+        self.assertEqual(state["active_dispatches"], ())
+        self.assertEqual(state["runnable_actions"], ("intent-1",))
 
     def test_without_it_run_classifies_unsupported_fail_closed(self) -> None:
         """The Orca observation with no runner raises UNSUPPORTED for every run.

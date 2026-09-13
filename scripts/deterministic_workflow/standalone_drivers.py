@@ -624,19 +624,25 @@ class _Driver:
 
     # -- D4.5: TWO methods, TWO disjoint return types ------------------------------------
     def readiness_evidence(self, text: str, *, minted_session_id: str,
-                           liveness: Mapping[str, Any] | None) -> dict[str, Any]:
+                           liveness: Mapping[str, Any] | None,
+                           delivered_payload: str = "") -> dict[str, Any]:
         """S3 evidence ONLY.  Can never express a completion.
 
         Builds the three-part quorum record: R-A comes in as ``liveness`` (built from the OS
         by :mod:`standalone_pty`, reading zero terminal bytes), R-B is looked for on the
         structured channel, refusals come from text, and every title/screen reading is
         segregated into ``supplementary``.
+
+        ``delivered_payload`` (L1) is the runtime's own delivered prompt: its lines are
+        excluded from the refusal scan and carried on the evidence so `may_send_prompt`'s
+        supplementary re-scan excludes them too, because the echo of a task that describes
+        a login prompt is not a login prompt.
         """
         bound = self.bound_readiness_signal(
             text, minted_session_id=minted_session_id,
             adopt=(self.profile.identity_binding == "adopted"
                    and not minted_session_id))
-        refusals = classify_refusals(text)
+        refusals = classify_refusals(text, exclude_text=delivered_payload)
         supplementary: list[dict[str, Any]] = []
         if text.strip():
             supplementary.append({"tier": "screen_preview", "text": text[-2000:],
@@ -644,7 +650,8 @@ class _Driver:
                                   "at": _now_iso()})
         return {"liveness": dict(liveness) if liveness else None,
                 "bound_signal": bound, "refusals": refusals,
-                "supplementary": tuple(supplementary)}
+                "supplementary": tuple(supplementary),
+                "delivered_payload": delivered_payload}
 
     def completion_evidence(self, text: str, *, exit_status: int | None,
                             exit_proven: bool,

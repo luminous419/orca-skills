@@ -54,6 +54,16 @@ WRITER_EXIT_WATCHER = "exit_watcher"
 #: The meta file's schema.  A meta that names another schema is a disagreement.
 META_SCHEMA = "os37.capture_meta.v2"
 
+#: The IRREVERSIBLE unanswerable causes a capture can record about itself (consolidated
+#: follow-up review of 87f6179, findings 6 and 7).  Once a meta names one, no later
+#: append, handoff or meta rewrite can clear it: the bytes a reader would reason from
+#: are known to be incomplete (a write failed) or known to disagree with what an
+#: earlier writer recorded (the inherited prefix failed its check), and neither fact is
+#: undone by writing more.  ``integrity()`` reports the cause by name and
+#: ``completion_is_answerable`` answers ``evidence_unreadable``.
+UNANSWERABLE_WRITE_FAILED = "write_failed"
+UNANSWERABLE_INHERITED_PREFIX = "inherited_"          # prefix + the integrity reason
+
 
 class CaptureRecord(TypedDict):
     offset: int
@@ -95,6 +105,8 @@ class BoundedCapture:
         self._digest = hashlib.sha256()
         self._writer = WRITER_SUPERVISOR
         self._meta_present = False
+        #: The irreversible unanswerable cause this capture recorded, or "".
+        self._unanswerable = ""
         self._load_meta()
 
     # -- meta ----------------------------------------------------------------------------
@@ -127,6 +139,7 @@ class BoundedCapture:
         truncation = meta.get("truncation")
         self._truncation = truncation if isinstance(truncation, str) and truncation else None
         self._writer = str(meta.get("writer") or WRITER_SUPERVISOR)
+        self._unanswerable = str(meta.get("unanswerable") or "")
         self._digest = _digest_of(self.path)
 
     def refresh(self) -> None:
@@ -137,7 +150,8 @@ class BoundedCapture:
     def _save_meta(self) -> None:
         write_meta(self._meta_path, records=self._records, total_bytes=self._total,
                    dropped_bytes=self._dropped, truncation=self._truncation or "",
-                   sha256=self._digest.hexdigest(), writer=self._writer)
+                   sha256=self._digest.hexdigest(), writer=self._writer,
+                   unanswerable=self._unanswerable)
         self._meta_present = True
 
     # -- append --------------------------------------------------------------------------
@@ -174,10 +188,20 @@ class BoundedCapture:
         if decision["truncation"]:
             self._truncation = self._truncation or decision["truncation"]
         offset = self._total
-        with open(self.path, "ab") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
+        try:
+            with open(self.path, "ab") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except OSError as exc:
+            # Finding 6.  Bytes this store could not put on disk are bytes a reader
+            # cannot reason from, and -- unlike a limit drop -- nothing about the file
+            # says so.  The failure is therefore recorded IRREVERSIBLY in the meta
+            # (best effort: the meta may fail for the same reason, and then the file
+            # and its absent/stale meta disagree, which `integrity()` also refuses)
+            # before the error propagates to the supervisor.
+            self._mark_unanswerable(UNANSWERABLE_WRITE_FAILED, detail=str(exc))
+            raise
         self._total += len(payload)
         self._records += 1
         self._digest.update(payload)
@@ -268,6 +292,27 @@ class BoundedCapture:
         """Who wrote the tail of this capture, per the meta: supervisor or exit watcher."""
         return self._writer
 
+    @property
+    def unanswerable(self) -> str:
+        """The irreversible unanswerable cause the meta records, or ``""``."""
+        return self._unanswerable
+
+    def _mark_unanswerable(self, cause: str, *, detail: str = "") -> None:
+        """Record ``cause`` in the meta, ONCE.  The first cause is kept; a later one does
+        not replace it, because the first is the one that made the capture unanswerable
+        and every later write happened over an already-unanswerable file."""
+        if not self._unanswerable:
+            self._unanswerable = cause
+        try:
+            # `total`/digest describe the FILE as it is, so the meta stays a true
+            # description of the bytes even while it names the failure.
+            self._total = self.size
+            self._digest = _digest_of(self.path)
+            self._save_meta()
+        except OSError:
+            pass
+        del detail
+
     def integrity(self) -> dict[str, Any]:
         """Whether the META and the BYTES agree.  Finding 4 (follow-up review).
 
@@ -296,6 +341,11 @@ class BoundedCapture:
         if meta.get("schema") != META_SCHEMA:
             return {"consistent": False, "reason": "meta_schema_mismatch",
                     "schema": meta.get("schema")}
+        unanswerable = str(meta.get("unanswerable") or "")
+        if unanswerable:
+            # Findings 6 / 7.  Irreversible by construction: whatever the bytes and the
+            # counters say NOW, a writer recorded that the capture is not evidence.
+            return {"consistent": False, "reason": unanswerable}
         if int(meta.get("total_bytes", -1)) != size:
             return {"consistent": False, "reason": "total_bytes_mismatch",
                     "meta_bytes": int(meta.get("total_bytes", -1)), "file_bytes": size}
@@ -384,12 +434,20 @@ class RawBoundedAppender:
         self.truncation = ""
         self.digest = hashlib.sha256()
         self.fd = -1
+        #: The irreversible unanswerable cause (findings 6 / 7), inherited from the
+        #: supervisor's meta or established by this writer.  Never cleared.
+        self.unanswerable = ""
+        self._meta_sha256 = ""
+        self._meta_present = False
         self._adopt_meta()
         self._digest_existing()
         try:
             self.fd = os.open(capture, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
         except OSError:
             self.fd = -1
+            # Finding 6.  A capture this writer cannot open is a capture whose tail it
+            # will lose; that is recorded now, not discovered by a reader later.
+            self._mark_unanswerable(UNANSWERABLE_WRITE_FAILED)
 
     def _adopt_meta(self) -> None:
         try:
@@ -408,13 +466,27 @@ class RawBoundedAppender:
         try:
             meta = json.loads(raw.decode("utf-8", errors="replace"))
         except ValueError:
+            # Finding 7.  A meta that EXISTS and cannot be parsed is an inherited
+            # integrity failure, not a blank slate: the supervisor described this
+            # capture and the description is unreadable, so nothing this writer
+            # records can vouch for the prefix.
+            self._mark_unanswerable(UNANSWERABLE_INHERITED_PREFIX + "meta_unparsable")
             return
         if not isinstance(meta, dict):
+            self._mark_unanswerable(UNANSWERABLE_INHERITED_PREFIX + "meta_unparsable")
             return
+        self._meta_present = True
         self.records = int(meta.get("records", 0) or 0)
         self.total = int(meta.get("total_bytes", 0) or 0)
         self.dropped = int(meta.get("dropped_bytes", 0) or 0)
         self.truncation = str(meta.get("truncation") or "")
+        self._meta_sha256 = str(meta.get("sha256") or "")
+        inherited = str(meta.get("unanswerable") or "")
+        if inherited:
+            # Irreversible: the supervisor already recorded it, this writer keeps it.
+            self.unanswerable = inherited
+        if meta.get("schema") != META_SCHEMA:
+            self._mark_unanswerable(UNANSWERABLE_INHERITED_PREFIX + "meta_schema_mismatch")
 
     def _digest_existing(self) -> None:
         """The digest of the bytes ALREADY on disk, so the running digest continues the
@@ -422,25 +494,50 @@ class RawBoundedAppender:
         supervisor's meta lagged its last write (a crash between the two): the FILE is the
         authority for the bytes, and the meta this writer produces describes the file."""
         size = 0
+        prefix = hashlib.sha256()
         try:
             fd = os.open(self.capture, os.O_RDONLY)
         except OSError:
+            if self._meta_present and self.total:
+                # The meta describes bytes this writer cannot read: inherited failure.
+                self._mark_unanswerable(UNANSWERABLE_INHERITED_PREFIX + "capture_unreadable")
             return
         try:
             while True:
                 chunk = os.read(fd, 65_536)
                 if not chunk:
                     break
+                # Finding 7.  The digest of the first `total` bytes -- the PREFIX the
+                # supervisor's meta describes -- is computed separately from the running
+                # digest, so the inherited description can be VERIFIED before this
+                # writer adopts it rather than silently re-derived from the bytes.
+                if size < self.total:
+                    prefix.update(chunk[:max(0, self.total - size)])
                 self.digest.update(chunk)
                 size += len(chunk)
         finally:
             os.close(fd)
+        if self._meta_present:
+            if size < self.total:
+                # The file is SHORTER than the supervisor said it was: bytes it recorded
+                # are gone.  Nothing this writer appends restores them.
+                self._mark_unanswerable(UNANSWERABLE_INHERITED_PREFIX + "total_bytes_mismatch")
+            elif self._meta_sha256 and prefix.hexdigest() != self._meta_sha256:
+                # Same length, different bytes: the recorded digest does not describe the
+                # prefix on disk.  This used to be recomputed and overwritten, which is
+                # exactly how a `sha256_mismatch` was "healed" at handoff.
+                self._mark_unanswerable(UNANSWERABLE_INHERITED_PREFIX + "sha256_mismatch")
         if size != self.total:
             # One supervisor append landed without its meta.  Counted as one record; the
             # limit logic below then sees the true total.
             if size > self.total:
                 self.records += 1
             self.total = size
+
+    def _mark_unanswerable(self, cause: str) -> None:
+        """Record ``cause`` ONCE, irreversibly; the first cause is the one kept."""
+        if not self.unanswerable:
+            self.unanswerable = cause
 
     def append(self, chunk: bytes) -> None:
         decision = admit_chunk(chunk, records=self.records, total=self.total,
@@ -453,10 +550,12 @@ class RawBoundedAppender:
             self.truncation = decision["truncation"]
         if payload is not None and self.fd >= 0:
             written = 0
+            failed = False
             while written < len(payload):
                 try:
                     written += os.write(self.fd, payload[written:])
                 except OSError:
+                    failed = True
                     break
             if written:
                 try:
@@ -466,13 +565,24 @@ class RawBoundedAppender:
             self.total += written
             self.records += 1
             self.digest.update(payload[:written])
+            if failed or written < len(payload):
+                # Finding 6.  The bytes that did not reach the file are DROPPED -- counted,
+                # like every other byte this contract loses -- and the loss is a write
+                # failure, which no later append undoes: irreversible, by name.
+                self.dropped += len(payload) - written
+                self._mark_unanswerable(UNANSWERABLE_WRITE_FAILED)
+        elif payload is not None:
+            # No descriptor (the open failed at construction): the whole chunk is lost.
+            self.dropped += len(payload)
+            self._mark_unanswerable(UNANSWERABLE_WRITE_FAILED)
         self.save_meta()
 
     def save_meta(self) -> None:
         try:
             write_meta(self.meta, records=self.records, total_bytes=self.total,
                        dropped_bytes=self.dropped, truncation=self.truncation,
-                       sha256=self.digest.hexdigest(), writer=WRITER_EXIT_WATCHER)
+                       sha256=self.digest.hexdigest(), writer=WRITER_EXIT_WATCHER,
+                       unanswerable=self.unanswerable)
         except OSError:
             pass
 
@@ -492,7 +602,8 @@ def meta_path_for(path: str | os.PathLike[str]) -> Path:
 
 
 def write_meta(path: str | os.PathLike[str], *, records: int, total_bytes: int,
-               dropped_bytes: int, truncation: str, sha256: str, writer: str) -> None:
+               dropped_bytes: int, truncation: str, sha256: str, writer: str,
+               unanswerable: str = "") -> None:
     """The ONE writer of a capture meta file, for both processes that may hold the pen.
 
     Raw ``os`` calls only (tmp + fsync + rename), because the exit watcher calls this from
@@ -504,7 +615,9 @@ def write_meta(path: str | os.PathLike[str], *, records: int, total_bytes: int,
                           "total_bytes": int(total_bytes),
                           "dropped_bytes": int(dropped_bytes),
                           "truncation": truncation or "", "sha256": sha256,
-                          "writer": writer}, sort_keys=True).encode()
+                          "writer": writer,
+                          # Findings 6 / 7: the irreversible unanswerable cause, or "".
+                          "unanswerable": unanswerable or ""}, sort_keys=True).encode()
     target = os.fsencode(os.fspath(path))
     tmp = target + b".tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)

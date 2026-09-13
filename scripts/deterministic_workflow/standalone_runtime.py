@@ -283,6 +283,10 @@ class StandaloneSession:
         self.event_log: list[str] = []
         self.state = "STARTING"
         self.lost_reason = ""
+        #: The runtime's OWN delivered prompt, for L1: refusal scans exclude its echo.
+        #: Set the moment a payload is handed to the pty (on the argv for
+        #: `launch_with_prompt`, at `send` for `post_ready_delivery`); "" until then.
+        self._delivered_payload = ""
         self._child_env: dict[str, str] = {}
         #: The ADOPTED identity (D4.4 A-1..A-6), frozen on first acceptance and compared by
         #: EQUALITY forever after.  Empty means "not yet observed", never "any id will do".
@@ -439,9 +443,18 @@ class StandaloneSession:
                  state: str = "", lost_reason: str = "",
                  axes: Mapping[str, str] | None = None,
                  vocabulary: Mapping[str, Any] | None = None, **extra: Any) -> None:
+        # Finding 4 (consolidated follow-up review of 87f6179).  A LOST row carries the
+        # session's lost_reason by DEFAULT: `make_record` refuses a LOST record without
+        # one, and a caller that restored the state but forgot the reason -- `adopt`
+        # did, for a retained dispatch -- turned a typed unsettled outcome into a
+        # ValueError traceback.  The reason is therefore part of the state, not a
+        # per-call argument every writer has to remember.
+        written_state = state or self.state
+        if written_state == "LOST" and not lost_reason:
+            lost_reason = self.lost_reason
         self.journal.append(journal_mod.make_record(
             kind=kind, derived_from=derived_from, event=event,
-            state=state or self.state, lost_reason=lost_reason,
+            state=written_state, lost_reason=lost_reason,
             intent_id=self.intent_id,
             dispatch_id=self.dispatch_id, task_id=self.task_id,
             session_id=self.session_id, process_incarnation=self.incarnation,
@@ -886,6 +899,11 @@ class StandaloneSession:
         # into the DELIVERY_INTENT record is taken from THIS value, so what is journalled
         # is always what is handed over.
         payload = payload if payload is not None else _canonical(self.intent)
+        # L1: for `launch_with_prompt` the prompt leaves on the argv, so a CLI that echoes
+        # its input has the prompt in the transcript before readiness is even scanned.
+        # Record it now so every refusal scan below excludes the runtime's own content.
+        if self.profile.delivery_mode == "launch_with_prompt":
+            self._delivered_payload = payload
         receipt = self.start(lease_token=lease_token, payload=payload, **start_kwargs)
         if receipt["start_outcome"] != "ready":
             raise StandaloneDispatchFailed(
@@ -1108,9 +1126,20 @@ class StandaloneSession:
         self._bind_start_identity(record)
         # The state the journal last observed for this fence, so the settlement edge is
         # taken from where the crashed supervisor left off rather than from STARTING.
-        last_state = next((row["state"] for row in reversed(mine) if row.get("state")),
-                          "STARTING")
-        self.state = str(last_state) if str(last_state) in lifecycle.STATES else "STARTING"
+        last_row = next((row for row in reversed(mine) if row.get("state")), None)
+        last_state = str(last_row["state"]) if last_row is not None else "STARTING"
+        self.state = last_state if last_state in lifecycle.STATES else "STARTING"
+        # Finding 4.  The fenced row's `lost_reason` is restored WITH its state: a
+        # dispatch the crashed supervisor retained as LOST (`secure_after_unexpected`,
+        # `_prove_exit_before_settlement`) is adopted as that typed LOST -- reason and
+        # all -- and every journal write the adoption and collection make below carries
+        # it, so the adoption records a typed unsettled outcome rather than escaping.
+        # A LOST row whose reason is outside the closed vocabulary is not adopted as
+        # LOST at all: `cause_unreported` is the vocabulary's own name for it.
+        self.lost_reason = ""
+        if self.state == "LOST":
+            reason = str((last_row or {}).get("lost_reason") or "")
+            self.lost_reason = reason if reason in lifecycle.LOST_REASONS else "cause_unreported"
         self.event_log = ["spawned", "identity_bound"]
         if observed is not None:
             self.event_log.append("readiness_observed")
@@ -1987,7 +2016,8 @@ class StandaloneSession:
         # keeps the lifecycle CLI-free.
         binding_id = self._binding_identity(text)
         evidence = self.driver.readiness_evidence(
-            text, minted_session_id=binding_id, liveness=liveness)
+            text, minted_session_id=binding_id, liveness=liveness,
+            delivered_payload=self._delivered_payload)
         verdict = lifecycle.may_send_prompt(
             evidence, minted_session_id=binding_id,
             declared_record_types=[s.record_type
@@ -2145,6 +2175,8 @@ class StandaloneSession:
         identity.require_permit(permit, self.record, "write_input")
         payload = command.get("payload") if isinstance(command, Mapping) else None
         text = payload if isinstance(payload, str) else _canonical(command)
+        # L1: the bytes about to be written are the runtime's own; their echo is not UI.
+        self._delivered_payload = text
         baseline = self.capture.size
         rate = self._measured_ingest_rate
         if rate is None:
@@ -2189,7 +2221,8 @@ class StandaloneSession:
         while self._clock() < deadline:
             self.pump()
             text = self.capture.transcript(baseline)
-            if classify := lifecycle.classify_refusals(text):
+            if classify := lifecycle.classify_refusals(
+                    text, exclude_text=self._delivered_payload):
                 return {"delivery": "blocked", "proof": None, "refusals": classify}
             if self.driver.turn_start_evidence(text) is not None:
                 return {"delivery": "delivered_confirmed", "proof": "turn_start"}

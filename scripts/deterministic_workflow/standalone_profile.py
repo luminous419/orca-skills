@@ -392,6 +392,18 @@ class Timeouts:
     """
 
     readiness_timeout_ms: int = 60_000
+    #: The bound on confirming DELIVERY -- that the framed prompt reached the agent -- by
+    #: one of the three named proofs (a structured turn-start, the screen echo of the
+    #: frame, or advancing output on an already-working agent).  Consolidated follow-up
+    #: review of `87f6179`, L2: this is deliberately NOT the bound on the agent's RESPONSE
+    #: (that is `completion_timeout_ms`), so on a healthy agent the first proof lands in
+    #: well under a second and 15 s is generous.  It IS a tuning bound, and a host whose
+    #: FIRST token is slow raises it on the profile -- the shipped real-CLI profile in
+    #: `scripts/os37_r10_graph_prompt_e2e.py` sets 120 s for exactly that reason.  The
+    #: boundary is measured in both directions (a first response later than the window is
+    #: `delivery_not_observed`; the same response inside a wider window is delivered) by
+    #: `test_os37_recovery_boundary_regressions.py::NB1SlowFirstResponseBoundaryTests`, so
+    #: the default is justified rather than transcribed, and the field is the tuning knob.
     delivery_verify_timeout_ms: int = 15_000
     #: How long the AGENT'S OWN TURN may take -- external review #4.
     #:

@@ -397,18 +397,80 @@ def readiness_decision_signature() -> tuple[str, ...]:
     return tuple(inspect.signature(decide_readiness).parameters)
 
 
-def classify_refusals(text: str, *, blocked_hint: bool = False) -> tuple[str, ...]:
+def strip_echoed(text: str, echoed: str) -> str:
+    r"""``text`` with the runtime's OWN delivered-prompt ECHO SPAN removed -- once.
+
+    Consolidated follow-up review of 87f6179 (L1) and its iteration-2 finding B3.  The
+    runtime delivers the engine's prompt -- role, phase, task contract, the words ``login
+    required`` if the TASK quotes them, a ``[y/N]`` the task describes -- into the pty, and
+    that delivered content appears in the transcript as the runtime's own echo.  Scanning
+    the transcript for runtime UI then fires on the runtime's OWN delivered content, a
+    false refusal and so a false BLOCK.
+
+    **Provenance-bound, not content subtraction (B3).**  Iteration 1 removed EVERY
+    transcript line equal to a prompt line, which also erased a GENUINE later refusal that
+    happened to be identical to a task line -- hiding real runtime output.  This instead
+    excludes ONE span: the runtime scans only the post-delivery region, where its own echo
+    of the delivered payload comes FIRST, so the exclusion is bound to that echo's
+    position and not to line content globally.
+
+    * PRIMARY -- the contiguous echo block: the first run of transcript lines that equals
+      the delivered payload's own line sequence is the echo, and exactly those lines are
+      dropped; anything before or after (a genuine runtime refusal further down) is kept.
+    * FALLBACK -- when the CLI reflowed the block so it is not contiguous: the FIRST
+      occurrence of each delivered line is consumed left to right (the echo precedes any
+      genuine output on the post-delivery region), so a SECOND, genuine occurrence of an
+      identical blocking line survives and still fires.
+
+    Either way the runtime's own delivered bytes are excluded by WHERE they are, and a real
+    ``not logged in`` the agent process emits later is never removed.
+    """
+    if not echoed or not text:
+        return text
+    lines = text.splitlines()
+    prompt = [line.strip() for line in echoed.replace("\r\n", "\n").splitlines()
+              if line.strip()]
+    if not prompt:
+        return text
+    nonblank = [i for i, line in enumerate(lines) if line.strip()]
+    stripped = [lines[i].strip() for i in nonblank]
+    n = len(prompt)
+    excluded: set[int] = set()
+    # PRIMARY: the first contiguous window of non-blank transcript lines equal to the
+    # delivered payload's line sequence IS the echo span.
+    for start in range(0, len(stripped) - n + 1):
+        if stripped[start:start + n] == prompt:
+            excluded = set(nonblank[start:start + n])
+            break
+    if not excluded:
+        # FALLBACK: consume the FIRST occurrence of each delivered line, left to right.
+        remaining = list(prompt)
+        for i in nonblank:
+            token = lines[i].strip()
+            if token in remaining:
+                excluded.add(i)
+                remaining.remove(token)
+    return "\n".join(line for i, line in enumerate(lines) if i not in excluded)
+
+
+def classify_refusals(text: str, *, blocked_hint: bool = False,
+                      exclude_text: str = "") -> tuple[str, ...]:
     """Refusals derived from OBSERVED TEXT.  Text may only subtract.
 
     Returns refusal codes, which R-C consumes.  There is no return value from this function
     that can make anything ready -- and that asymmetry is the design.
+
+    ``exclude_text`` is the runtime's OWN delivered prompt (L1): its lines are removed
+    from ``text`` before the scan, so a refusal is bound to output the runtime did not
+    author.  Excluding it is a further subtraction and never adds a refusal.
     """
+    scanned = strip_echoed(text, exclude_text) if exclude_text else text
     fired: list[str] = []
     if blocked_hint:
         fired.append("blocked_prompt_beats_idle")
-    if isinstance(text, str) and text:
+    if isinstance(scanned, str) and scanned:
         for pattern in BLOCKING_PROMPT_PATTERNS:
-            if pattern.search(text):
+            if pattern.search(scanned):
                 if "blocked_prompt_beats_idle" not in fired:
                     fired.append("blocked_prompt_beats_idle")
                 break
@@ -480,8 +542,9 @@ def may_send_prompt(evidence: Mapping[str, Any], *, minted_session_id: str,
     ``READY``, and never "not ready" as an established fact.
     """
     refusals = list(evidence.get("refusals") or ())
+    echoed = str(evidence.get("delivered_payload") or "")
     for observation in evidence.get("supplementary") or ():
-        for code in classify_refusals(observation.get("text", "")):
+        for code in classify_refusals(observation.get("text", ""), exclude_text=echoed):
             if code not in refusals:
                 refusals.append(code)
     verdict = decide_readiness(
