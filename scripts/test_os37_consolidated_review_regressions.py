@@ -24,6 +24,10 @@ the gated `test_os37_r10_graph_prompt_e2e.py`).
   8. the preflight fingerprint hashes config + env NAMES, never secret values;
   9. a recovery --standalone-profile is admitted only as an exact-digest restatement.
   L1. refusal detection excludes the runtime's OWN delivered prompt echo.
+  B1. (iteration-8 review) the echo is DERIVED from the transport recorded at the
+      delivery -- termios read on the pty master, argv vs pty write, framing -- and
+      excised only when proven; otherwise `echo_unproven` is named and blocks S3;
+      structured records are consulted before any free-text pattern.
 """
 from __future__ import annotations
 
@@ -32,6 +36,7 @@ import contextlib
 import io
 import json
 import os
+import random
 import shutil
 import signal
 import tempfile
@@ -53,6 +58,9 @@ from scripts.test_os37_followup_review_regressions import (  # noqa: E402
     _Composed, _langgraph_ok, LANGGRAPH_REASON, agent_profile_spec, open_fds, pid_alive,
     stub_profile_spec, zombies_among)
 from scripts.test_os37_lifecycle_boundary_regressions import INJECTED_REHEARSALS  # noqa: E402
+from scripts.deterministic_workflow import standalone_drivers as drivers_mod  # noqa: E402
+from scripts.test_os37_lifecycle import (  # noqa: E402
+    LIVE as _LIVE, MINTED as _MINTED, DECLARED as _DECLARED, bound as _bound)
 from scripts.test_os37_recovery_boundary_regressions import SUPERVISOR, _CrashRoom  # noqa: E402
 
 
@@ -406,48 +414,938 @@ class F8FingerprintIsSecretSafeTests(unittest.TestCase):
 
 
 # =====================================================================================
-# L1 -- refusal detection excludes the runtime's own delivered prompt echo
+# F-002 (supersedes L1/B3) -- refusal exclusion is bound to STRUCTURED delivery provenance
 # =====================================================================================
-class L1RefusalExcludesEchoedPromptTests(unittest.TestCase):
-    PROMPT = ("Implement the login form. Show 'login required, please sign in' when the "
-              "session lapsed, and confirm deletion with a [y/N] question.")
+# ---- F-002 / B1 transport helpers: the EchoTransport records the runtime writes at delivery
+def _tio(**over: Any) -> dict:
+    """A termios evidence block as `standalone_pty.termios_evidence` returns it: every flag
+    named, so `expected_echo_forms` derives the echo from EVIDENCE and never from a
+    default.  The base is an echoing pty in non-canonical mode with ONLCR (what a spawned
+    slave looks like once an agent turns ECHO on)."""
+    base = {"echo": True, "echoctl": True, "icanon": False, "isig": False, "iexten": False,
+            "ixon": False, "opost": True, "onlcr": True, "ocrnl": False, "onocr": False,
+            "onlret": False, "tab_expand": False, "icrnl": True, "inlcr": False,
+            "igncr": False, "special_bytes": []}
+    base.update(over)
+    return base
 
-    def test_the_echoed_prompt_does_not_fire_a_refusal(self) -> None:
-        transcript = self.PROMPT + "\r\n" + '{"type":"assistant"}' + "\r\n"
-        self.assertTrue(lifecycle.classify_refusals(transcript),
-                        "the raw transcript should trip the pattern (the base behaviour)")
-        self.assertEqual(
-            lifecycle.classify_refusals(transcript, exclude_text=self.PROMPT), (),
-            "the runtime's OWN delivered prompt was classified as a runtime refusal")
 
-    def test_a_real_login_line_still_fires_after_excluding_the_prompt(self) -> None:
-        transcript = self.PROMPT + "\r\nnot logged in\r\n"
-        self.assertTrue(
-            lifecycle.classify_refusals(transcript, exclude_text=self.PROMPT),
-            "excluding the prompt must not blind the scan to a genuine refusal line")
+def _pty(framed: bool = False, **tio: Any) -> dict:
+    return {"kind": "pty_write", "framed": framed, "termios": _tio(**tio), "cols": 120}
 
-    def test_b3_identical_blocking_line_in_prompt_and_runtime_only_the_prompt_is_excluded(self) -> None:
-        """B3.  The exclusion is bound to the runtime's OWN echo SPAN, not to content: a
-        prompt that quotes ``not logged in`` on its own line AND a genuine later runtime
-        ``not logged in`` collide, and only the prompt-origin occurrence is excluded -- the
-        runtime one still fires.  Iteration 1's content subtraction removed BOTH."""
-        prompt = ("You are the WORKER.\nHandle the case where the CLI prints:\n"
-                  "not logged in\nand raise ValueError.")
-        # The runtime's echo of the delivered prompt comes FIRST (post-delivery region),
-        # then a GENUINE runtime refusal emitting the identical line.
-        transcript = (prompt + "\r\n" + '{"type":"assistant"}' + "\r\n"
-                      + "not logged in" + "\r\n")
-        self.assertTrue(lifecycle.classify_refusals(transcript),
-                        "the raw transcript should trip the pattern")
-        self.assertTrue(
-            lifecycle.classify_refusals(transcript, exclude_text=prompt),
-            "the GENUINE runtime `not logged in` after the echo span was hidden -- the "
-            "exclusion is content subtraction, not span-bound provenance")
-        # And with ONLY the echo (no genuine later line) the exclusion silences it.
-        echo_only = prompt + "\r\n" + '{"type":"assistant"}' + "\r\n"
-        self.assertEqual(
-            lifecycle.classify_refusals(echo_only, exclude_text=prompt), (),
-            "the runtime's own echoed prompt line must not fire a refusal")
+
+ARGV_TRANSPORT = {"kind": "argv", "framed": False, "termios": None, "cols": 120}
+RAW_PTY = _pty(echo=False)                    # what `_set_raw` leaves: ECHO clear
+
+
+class F002RefusalExclusionIsEventBoundTests(unittest.TestCase):
+    """Final Adversarial Review F-002, hardened through the iteration-8 review (B1).
+
+    Iteration 5 bound exclusion to a bracketed-paste FRAME (not provenance -- an agent can
+    print those bytes).  Iterations 6-7 bound it to a delivery EVENT but mixed a raw-byte
+    delivery offset with indices into decoded/sanitised TEXT.  Iteration 8 matched in ONE
+    coordinate space (raw bytes) but byte-for-byte, assuming the pty echoes a write verbatim.
+
+    The contract is now: a span is excised ONLY when it (a) begins at/after the recorded
+    RAW-BYTE delivery offset, (b) the event carries the TRANSPORT recorded at the write and
+    (c) the span equals a form DERIVED from the delivered bytes under that transport, and
+    (d) it is the only such span in the delivery window.  Without a transport record the
+    echo is `echo_unproven:transport_unrecorded` -- named, nothing excised, fail closed.
+    Exclusion happens BEFORE decode; the removed content API stays gone.
+
+    **Superseded, strictly stronger:** every exclusion-expecting case below now carries the
+    transport that proves the echo; the iteration-8 form (event = offset + payload, no
+    transport) is re-asserted as `echo_unproven` -- a bare offset is no longer sufficient
+    provenance, because the same bytes at the same offset are also what a forged echo looks
+    like when the pty could not have echoed at all."""
+
+    @staticmethod
+    def _ev(payload: str, offset: int = 0, transport: dict | None = None) -> tuple[dict, ...]:
+        event = {"offset": offset, "payload": payload}
+        if transport is not None:
+            event["transport"] = transport
+        return (event,)
+
+    @staticmethod
+    def _cic(raw: bytes, events: tuple = ()) -> tuple:
+        return lifecycle.classify_refusals_in_capture(raw, events)
+
+    def _echo_state(self, raw: bytes, events: tuple) -> str:
+        return lifecycle.resolve_delivery_echo(raw, events)["state"]
+
+    def test_the_content_exclusion_api_is_gone(self) -> None:
+        self.assertFalse(hasattr(lifecycle, "strip_echoed"),
+                         "the content-based strip_echoed must be replaced")
+        self.assertNotIn("exclude_text", lifecycle.classify_refusals.__code__.co_varnames,
+                         "classify_refusals must not carry the content-exclusion parameter")
+
+    def test_strip_delivery_echo_is_byte_addressable(self) -> None:
+        # The primitive operates on RAW BYTES in one coordinate space, returning bytes --
+        # and excises only under a transport that proves the echo.
+        self.assertEqual(lifecycle.strip_delivery_echo(
+            b"login required", self._ev("login required", 0, _pty())), b"")
+        self.assertEqual(lifecycle.strip_delivery_echo(
+            b"login required", self._ev("login required")), b"login required",
+            "an event with no transport record proves nothing and excises nothing")
+        self.assertIsInstance(lifecycle.strip_delivery_echo(b"x", ()), bytes)
+
+    def test_the_review_probe_a_bare_refusal_string_still_fires(self) -> None:
+        self.assertTrue(lifecycle.classify_refusals("login required"),
+                        "a bare refusal string must fire")
+        self.assertTrue(self._cic(b"login required", ()),
+                        "with NO delivery event nothing is subtracted (fail closed)")
+
+    def test_a_proven_echo_at_the_recorded_byte_offset_is_excluded(self) -> None:
+        raw = b"login required\r\nok\r\n"
+        self.assertEqual(self._cic(raw, self._ev("login required", 0, _pty())), (),
+                         "the echo of the delivered payload at its byte offset must not fire")
+        # Iteration-8 form (offset only): unproven BY NAME, nothing excised, the scan fires.
+        bare = self._ev("login required")
+        self.assertTrue(self._cic(raw, bare))
+        res = lifecycle.resolve_delivery_echo(raw, bare)
+        self.assertEqual((res["state"], res["reason"]),
+                         ("echo_unproven", "event[0]:transport_unrecorded"))
+
+    def test_a_marker_shaped_span_without_an_event_is_not_excluded(self) -> None:
+        forged = b"\x1b[200~login required\x1b[201~\r\nok\r\n"
+        self.assertTrue(self._cic(forged, ()),
+                        "a marker-shaped span an agent emitted must not be excluded")
+        self.assertTrue(self._cic(forged, self._ev("a totally different prompt", 0, _pty())),
+                        "an event for a different payload must not exclude the forged frame")
+
+    def test_the_iteration7_bypass_esc_before_a_pre_delivery_refusal_still_fires(self) -> None:
+        # The iteration-7 reviewer's EXACT mutation, in raw-byte space: a raw ESC byte then a
+        # refusal at byte 1, delivery baseline at byte 4.  The refusal is PRE-delivery, so it
+        # must fire.  A raw-byte offset must never be compared with a sanitized-char index.
+        raw = b"\x1blogin required"                        # ESC(1) + "login required"@byte 1
+        self.assertTrue(self._cic(raw, self._ev("login required", 4, _pty())),
+                        "an ESC before a pre-delivery refusal must not shift it past the "
+                        "byte offset and get it excluded")
+
+    def test_multi_byte_utf8_before_a_pre_delivery_refusal_still_fires(self) -> None:
+        raw = "café ☕ ".encode("utf-8") + b"login required"
+        # baseline well past the refusal's byte start, but still pre-delivery for it.
+        self.assertTrue(self._cic(raw, self._ev("login required", len(raw) + 100, _pty())),
+                        "multi-byte UTF-8 before a pre-delivery refusal must not hide it")
+
+    def test_a_sanitised_esc_token_inside_the_delivered_payload_is_matched(self) -> None:
+        # A payload that carried a raw ESC is written as `<ESC>` (5 bytes) by sanitize_payload;
+        # the echo in the capture is those bytes.  The event carries the RAW payload; the
+        # matcher forms the delivered bytes itself and excises the echo.
+        payload = "\x1blogin required"
+        echoed = "<ESC>login required".encode("utf-8") + b"\r\nok\r\n"
+        self.assertEqual(self._cic(echoed, self._ev(payload, 0, _pty())), (),
+                         "the <ESC>-substituted echo of the delivered payload must be excluded")
+
+    def test_the_echo_straddling_a_chunk_boundary_is_still_excluded(self) -> None:
+        # Two capture chunks whose concatenation contains the echo at the recorded offset:
+        # exclusion is on the concatenated raw bytes, so a chunk split inside the echo does
+        # not defeat it.
+        chunk1 = b"prelude\r\nlogin req"
+        chunk2 = b"uired\r\ntrailer"
+        raw = chunk1 + chunk2
+        offset = raw.index(b"login required")
+        self.assertEqual(self._cic(raw, self._ev("login required", offset, _pty())), (),
+                         "an echo split across a chunk boundary must still be excluded")
+
+    def test_a_refusal_before_the_byte_offset_survives_the_echo_after_it(self) -> None:
+        raw = b"login required\r\nXXX\r\nlogin required"
+        offset = raw.rindex(b"login required")             # the echo is the LAST occurrence
+        events = self._ev("login required", offset, _pty())
+        self.assertEqual(self._echo_state(raw, events), "echo_proven")
+        self.assertTrue(self._cic(raw, events),
+                        "the pre-offset refusal must survive while the echo at offset is excised")
+
+    def test_only_the_payload_bytes_are_removed_not_an_adjacent_refusal(self) -> None:
+        payload = "here is your task, do it well"
+        raw = payload.encode("utf-8") + b"login required"
+        self.assertTrue(self._cic(raw, self._ev(payload, 0, _pty())),
+                        "a refusal glued after the echo survives; only the payload span goes")
+
+    def test_an_unmatched_event_payload_fails_closed(self) -> None:
+        events = self._ev("THE DELIVERED PROMPT WAS NEVER ECHOED", 0, _pty())
+        self.assertTrue(self._cic(b"login required\r\n", events),
+                        "with no proven echo the scan subtracts nothing (fail closed)")
+        res = lifecycle.resolve_delivery_echo(b"login required\r\n", events)
+        self.assertEqual((res["state"], res["reason"]),
+                         ("echo_unproven", "event[0]:echo_not_found"))
+
+    def test_a_real_claude_shaped_no_echo_capture_is_read_correctly(self) -> None:
+        delivered = "Role: worker. Objective: add two numbers. Return JSON."
+        benign = (b'{"type":"system","session_id":"s1"}\r\n'
+                  b'{"type":"assistant","text":"working"}\r\n'
+                  b'{"type":"result","is_error":false}\r\n')
+        self.assertNotIn(b"\x1b[200~", benign)              # like the real captures: no markers
+        events = self._ev(delivered, 0, ARGV_TRANSPORT)      # the prompt left with the execve
+        self.assertEqual(self._cic(benign, events), ())
+        self.assertEqual(self._echo_state(benign, events), "echo_absent",
+                         "an argv delivery PROVES no line-discipline echo: nothing unproven")
+        self.assertTrue(self._cic(benign + b"login required\r\n", events),
+                        "a genuine refusal in a no-echo real-shaped capture must fire")
+
+    def test_property_random_prefixes_never_hide_a_pre_baseline_refusal(self) -> None:
+        # For random byte prefixes containing ESC / multi-byte / control bytes: a refusal
+        # placed BEFORE the delivery baseline is NEVER excluded, and a genuine echo AT the
+        # baseline is ALWAYS excluded.  One coordinate space (raw bytes) makes both hold.
+        rng = random.Random(20260914)
+        pool = [b"\x1b", b"\x07", b"\x00", b"\x1b[0m", b"\xc3\xa9", b"\xe2\x9c\x93",
+                b"x", b" ", b"\r\n", b"\t", b".", b"#"]
+        refusal = b"login required"
+        for _ in range(500):
+            prefix = b"".join(rng.choice(pool) for _ in range(rng.randint(0, 12)))
+            # (A) echo AT the baseline, nothing before it -> excluded -> no fire.  The needle
+            # begins exactly at the baseline regardless of what bytes precede it.
+            raw_a = prefix + refusal
+            self.assertEqual(self._cic(raw_a, self._ev("login required", len(prefix), _pty())),
+                             (), f"echo at baseline not excluded; prefix={prefix!r}")
+            # (B) a refusal BEFORE the baseline (on its own line, so it is line-anchored) plus
+            # the echo at the baseline -> the echo is excised but the pre-baseline refusal
+            # fires.  This is the security property: a pre-delivery refusal is never hidden by
+            # a byte-vs-char coordinate shift, whatever ESC/multi-byte/control bytes precede it.
+            head = prefix + b"\r\n" + refusal + b"\r\n"
+            raw_b = head + refusal
+            self.assertTrue(self._cic(raw_b, self._ev("login required", len(head), _pty())),
+                            f"pre-baseline refusal wrongly hidden; prefix={prefix!r}")
+
+    def _s3(self, ev: dict) -> dict:
+        return lifecycle.may_send_prompt(ev, minted_session_id=_MINTED,
+                                         declared_record_types=_DECLARED)
+
+    def test_forged_exact_payload_frame_outside_the_span_denies_ready_via_may_send_prompt(self) -> None:
+        # Iteration-6/7 bypass through may_send_prompt, now in byte space: a valid R-A/R-B
+        # quorum, a delivery event at a DISTANT raw-byte offset, and an agent-forged frame in
+        # the supplementary preview carrying the EXACT payload -- plus an ESC before it, the
+        # iteration-7 twist.  The refusal must still fire; `ready` must be denied.
+        forged_raw = b"\x1blogin required\r\nok"
+        attack = {"liveness": _LIVE, "bound_signal": _bound(), "refusals": (),
+                  "delivery_events": ({"offset": 9999, "payload": "login required",
+                                       "transport": _pty()},),
+                  "supplementary": ({"tier": "screen_preview", "text": "<forged>",
+                                     "raw": forged_raw, "start_offset": 0,
+                                     "live_observed": True, "at": ""},)}
+        self.assertNotEqual(self._s3(attack)["verdict"], "ready",
+                            "a forged exact-payload frame outside the delivery span must not "
+                            "erase the refusal through may_send_prompt")
+
+    def test_a_legit_echo_at_the_recorded_offset_is_excluded_via_may_send_prompt(self) -> None:
+        # Control: the echo at the recorded byte offset (translated into the preview's byte
+        # coordinate) is excluded, so a quorum with only the echo present reaches ready.
+        prefix = b"\x1bpreamble\r\n"                        # includes an ESC before the echo
+        preview_raw = prefix + b"login required"
+        start_offset = 40
+        ok = {"liveness": _LIVE, "bound_signal": _bound(), "refusals": (),
+              "delivery_events": ({"offset": start_offset + len(prefix),
+                                   "payload": "login required", "transport": _pty()},),
+              "supplementary": ({"tier": "screen_preview", "text": "preview",
+                                 "raw": preview_raw, "start_offset": start_offset,
+                                 "live_observed": True, "at": ""},)}
+        self.assertEqual(self._s3(ok)["verdict"], "ready",
+                         "the echo at the recorded (translated) byte offset must be excluded")
+
+    def test_a_supplementary_without_raw_bytes_adds_no_refusal(self) -> None:
+        # Provenance requires raw bytes; a text-only observation cannot establish it and must
+        # add nothing beyond the authoritative refusals (never clamp / char-length arithmetic).
+        ev = {"liveness": _LIVE, "bound_signal": _bound(), "refusals": (),
+              "delivery_events": ({"offset": 0, "payload": "login required",
+                                   "transport": _pty()},),
+              "supplementary": ({"tier": "screen_preview", "text": "login required",
+                                 "start_offset": 0, "live_observed": True, "at": ""},)}
+        self.assertEqual(self._s3(ev)["verdict"], "ready",
+                         "a text-only observation must not re-derive a refusal by content")
+
+    def test_the_driver_readiness_scan_binds_to_raw_bytes_end_to_end(self) -> None:
+        base = Path(tempfile.mkdtemp(prefix="os37-f2drv-"))
+        self.addCleanup(shutil.rmtree, base, True)
+        (base / "wt").mkdir()
+        profile = profile_from_mapping(stub_profile_spec("alive", worktree=str(base / "wt")))
+        driver = drivers_mod.driver_for(profile)
+        payload = "please run the task, login required to continue"
+        ev = ({"offset": 0, "payload": payload, "transport": _pty()},)
+        # Echo present at byte 0 -> excluded (raw supplied) -> no refusal.
+        evidence = driver.readiness_evidence(
+            payload + "\r\n", minted_session_id="s1", liveness=None,
+            raw=(payload + "\r\n").encode("utf-8"), delivery_events=ev)
+        self.assertEqual(tuple(evidence["refusals"]), (),
+                         "the delivered-payload echo must be excluded on raw bytes")
+        self.assertEqual(evidence["echo"]["state"], "echo_proven")
+        # A pre-delivery refusal preceded by an ESC byte, delivery baseline past it -> fires.
+        raw = b"\x1blogin required\r\n"
+        evidence2 = driver.readiness_evidence(
+            raw.decode("utf-8", "replace"), minted_session_id="s1", liveness=None,
+            raw=raw, delivery_events=({"offset": 99, "payload": "login required",
+                                       "transport": _pty()},))
+        self.assertTrue(tuple(evidence2["refusals"]),
+                        "an ESC-preceded pre-delivery refusal must fire through the driver")
+        self.assertEqual(evidence2["refusal_source"], "free_text")
+
+
+# =====================================================================================
+# B1 -- delivery-echo provenance is DERIVED from the recorded transport, fail-closed BY NAME
+# =====================================================================================
+class B1EchoProvenanceIsTransportDerivedTests(unittest.TestCase):
+    """Iteration-8 review B1 (`REVIEW_BUGFIX_iteration8.md`): `_delivered_echo_bytes` /
+    `strip_delivery_echo` assumed the pty echoes the delivered payload byte-for-byte.  A
+    multiline prompt is written with LF and echoed with CRLF (`ONLCR`), so the echo was not
+    matched and runtime-authored task text (`login required`) fired as a runtime refusal.
+
+    The model now: the driver records an `EchoTransport` AT the delivery (`argv` /
+    `pty_write`, framing, and the pty's live termios read with `tcgetattr` on the master);
+    `lifecycle.expected_echo_forms` DERIVES the echo forms from that evidence (`ONLCR`,
+    `OCRNL`, `ONOCR`, `ECHOCTL`, tab expansion over every unobservable start column, the
+    two kernels' newline/column rule, bracketed-paste framing, line-discipline special
+    bytes); `resolve_delivery_echo` excises a span ONLY when exactly one span at/after the
+    recorded raw-byte offset equals a derived form.  Anything else is `echo_unproven` with
+    a NAMED reason (`ECHO_UNPROVEN_REASONS`), excludes nothing, and makes S3 `unprovable`.
+    Structured records are consulted before any free-text pattern (`refusal_evidence`).
+
+    Red on the iteration-8 staged tree (`evidence/B1_RED_at_staged_tree.txt`): the
+    reviewer's exact CRLF reproduction returns `('blocked_prompt_beats_idle',)`, the named
+    APIs (`resolve_delivery_echo`, `expected_echo_forms`, `refusal_evidence`,
+    `standalone_pty.echo_transport`) do not exist, and a tool-result quoting the task text
+    fires as a refusal."""
+
+    PAYLOAD = "Task contract:\nlogin required\nContinue"
+
+    @staticmethod
+    def _ev(payload: str, offset: int = 0, transport: dict | None = None,
+            **extra: Any) -> dict:
+        event: dict = {"offset": offset, "payload": payload, **extra}
+        if transport is not None:
+            event["transport"] = transport
+        return event
+
+    def _resolve(self, raw: bytes, *events: dict) -> dict:
+        return lifecycle.resolve_delivery_echo(raw, events)
+
+    def _refusals(self, raw: bytes, *events: dict) -> tuple:
+        return lifecycle.classify_refusals_in_capture(raw, events)
+
+    def _forms(self, payload: str, transport: dict) -> tuple:
+        derived = lifecycle.expected_echo_forms(payload, transport)
+        self.assertEqual(derived["state"], "echo_expected", derived)
+        return derived["forms"]
+
+    # -- the vocabulary ------------------------------------------------------------------
+    def test_the_echo_states_and_unproven_reasons_are_closed_and_named(self) -> None:
+        self.assertEqual(lifecycle.ECHO_STATES,
+                         ("no_delivery", "echo_absent", "echo_proven", "echo_unproven"))
+        self.assertIn("echo_unproven", lifecycle.ECHO_STATES)
+        for reason in ("transport_unrecorded", "termios_unreadable", "echo_not_found",
+                       "ambiguous_multiple_matches", "delivery_before_window",
+                       "control_byte_consumed_by_line_discipline"):
+            self.assertIn(reason, lifecycle.ECHO_UNPROVEN_REASONS)
+        self.assertEqual(lifecycle.ECHO_TRANSPORT_KINDS, ("argv", "pty_write"))
+        # The bracket bytes have ONE definition, shared by the framing function.
+        self.assertEqual(drivers_mod.BRACKET_START, lifecycle.BRACKETED_PASTE_START)
+        self.assertEqual(drivers_mod.BRACKET_END, lifecycle.BRACKETED_PASTE_END)
+
+    # -- 1. LF and CRLF multiline echo ---------------------------------------------------
+    def test_the_reviewers_crlf_reproduction_is_a_proven_echo_not_a_refusal(self) -> None:
+        raw = self.PAYLOAD.replace("\n", "\r\n").encode()
+        events = (self._ev(self.PAYLOAD, 0, _pty(onlcr=True)),)
+        self.assertEqual(lifecycle.strip_delivery_echo(raw, events), b"")
+        self.assertEqual(lifecycle.classify_refusals_in_capture(raw, events), (),
+                         "runtime-authored task text echoed with CRLF is NOT a refusal")
+        res = self._resolve(raw, *events)
+        self.assertEqual(res["state"], "echo_proven")
+        self.assertEqual(res["spans"], ((0, len(raw)),))
+
+    def test_lf_echo_under_onlcr_clear_is_proven_and_crlf_under_onlcr_set_is_the_only_form(self) -> None:
+        lf = self.PAYLOAD.encode()
+        crlf = self.PAYLOAD.replace("\n", "\r\n").encode()
+        # ONLCR clear: the echo is LF; CRLF is NOT a form (the derivation is from evidence).
+        self.assertEqual(self._forms(self.PAYLOAD, _pty(onlcr=False)), (lf,))
+        self.assertEqual(self._refusals(lf, self._ev(self.PAYLOAD, 0, _pty(onlcr=False))), ())
+        # ONLCR set: the echo is CRLF; an LF span is NOT it -> unproven by name, fires.
+        self.assertEqual(self._forms(self.PAYLOAD, _pty(onlcr=True)), (crlf,))
+        res = self._resolve(lf, self._ev(self.PAYLOAD, 0, _pty(onlcr=True)))
+        self.assertEqual((res["state"], res["reason"]),
+                         ("echo_unproven", "event[0]:echo_not_found"))
+        self.assertTrue(self._refusals(lf, self._ev(self.PAYLOAD, 0, _pty(onlcr=True))),
+                        "an unproven echo excludes nothing; the superset scan fires")
+        # OPOST clear disables every output translation: the LF form only.
+        self.assertEqual(self._forms(self.PAYLOAD, _pty(opost=False)), (lf,))
+
+    def test_ocrnl_onocr_and_ixon_are_derived_from_the_flags_not_assumed(self) -> None:
+        payload = "a\rb"
+        # ICRNL clear, OCRNL set: the CR is received as CR and output as LF (measured on a
+        # real pty: `a\nb`); under ECHOCTL the received CR is ^-rendered first (`a^Mb`).
+        self.assertEqual(self._forms(payload, _pty(icrnl=False, ocrnl=True, echoctl=False)),
+                         (b"a\nb",))
+        self.assertEqual(self._forms(payload, _pty(icrnl=False, ocrnl=True, echoctl=True)),
+                         (b"a^Mb",))
+        # ICRNL set (the default): CR becomes NL on input, then ONLCR echoes CRLF.
+        self.assertEqual(self._forms(payload, _pty(icrnl=True)), (b"a\r\nb",))
+        # IGNCR: the CR is dropped before it can be echoed.
+        self.assertEqual(self._forms(payload, _pty(igncr=True)), (b"ab",))
+        # ONOCR suppresses a CR at column 0 -- column-tracked, per byte (measured: `x` / `y\rx`).
+        self.assertEqual(self._forms("\rx", _pty(icrnl=False, onocr=True, echoctl=False)),
+                         (b"x",))
+        self.assertEqual(self._forms("y\rx", _pty(icrnl=False, onocr=True, echoctl=False)),
+                         (b"y\rx",))
+        # IXON arms VSTART/VSTOP as consumed bytes: the transport record names them and a
+        # payload carrying one has no derivable echo.
+        derived = lifecycle.expected_echo_forms(
+            "a\x13b", _pty(ixon=True, special_bytes=[0x11, 0x13]))
+        self.assertEqual((derived["state"], derived["reason"]),
+                         ("echo_unproven", "control_byte_consumed_by_line_discipline"))
+
+    # -- 2. multibyte UTF-8, incl. split across capture chunks ---------------------------
+    def test_multibyte_utf8_echo_split_across_chunks_is_proven_and_excised_whole(self) -> None:
+        payload = "café ☕ 한글\nlogin required\n終わり"
+        echo = payload.replace("\n", "\r\n").encode("utf-8")
+        cut = echo.index("☕".encode("utf-8")) + 1          # split INSIDE the 3-byte char
+        chunk1, chunk2 = b"pre\r\n" + echo[:cut], echo[cut:] + b"\r\npost"
+        raw = chunk1 + chunk2
+        events = (self._ev(payload, 5, _pty()),)
+        res = self._resolve(raw, *events)
+        self.assertEqual(res["state"], "echo_proven")
+        self.assertEqual(raw[res["spans"][0][0]:res["spans"][0][1]], echo)
+        self.assertEqual(lifecycle.strip_delivery_echo(raw, events), b"pre\r\n\r\npost")
+        self.assertEqual(self._refusals(raw, *events), ())
+        # A genuine refusal after the multibyte echo still fires; the pre-offset one too.
+        self.assertTrue(self._refusals(raw + b"\r\nlogin required\r\n", *events))
+        self.assertTrue(self._refusals(b"login required\r\n" + raw,
+                                       self._ev(payload, 21, _pty())))
+
+    # -- 3. ESC / control-sequence expansion in and around the payload -------------------
+    def test_control_bytes_are_rendered_as_the_line_discipline_renders_them(self) -> None:
+        # A raw ESC in the payload is DELIVERED as `<ESC>` (sanitize_payload) -- no control
+        # byte reaches the pty from the payload itself.  Other control bytes are echoed as
+        # ^X under ECHOCTL and verbatim without it; TAB and NL are never ^-rendered.
+        payload = "\x1b[31mlogin required\x01\t\n"
+        self.assertEqual(self._forms(payload, _pty(echoctl=True)),
+                         (b"<ESC>[31mlogin required^A\t\r\n",))
+        self.assertEqual(self._forms(payload, _pty(echoctl=False)),
+                         (b"<ESC>[31mlogin required\x01\t\r\n",))
+        # The bracketed-paste FRAME the runtime writes is echoed too, ESC as ^[ under ECHOCTL
+        # -- the frame is part of the proven span, so a fake frame elsewhere is not.
+        framed = self._forms("login required", _pty(framed=True))
+        self.assertEqual(framed, (b"^[[200~login required^[[201~",))
+        self.assertEqual(self._forms("login required", _pty(framed=True, echoctl=False)),
+                         (b"\x1b[200~login required\x1b[201~",))
+        # Agent-authored escape sequences AROUND the proven echo do not disturb it, and an
+        # ESC-prefixed genuine refusal after it still fires.
+        raw = b"\x1b[2J\x1b[H" + framed[0] + b"\r\n\x1b[1mlogin required\x1b[0m\r\n"
+        ev = self._ev("login required", 0, _pty(framed=True))
+        self.assertEqual(self._resolve(raw, ev)["state"], "echo_proven")
+        self.assertTrue(self._refusals(raw, ev))
+        self.assertEqual(self._refusals(b"\x1b[2J\x1b[H" + framed[0] + b"\r\nok\r\n", ev), ())
+        # A line-discipline SPECIAL byte in the payload (^C under ISIG) is CONSUMED, not
+        # echoed -- it flushes the queue -- so the echo is unproven by name.
+        derived = lifecycle.expected_echo_forms(
+            "a\x03b", _pty(isig=True, special_bytes=[0x03, 0x1c, 0x1a]))
+        self.assertEqual((derived["state"], derived["reason"]),
+                         ("echo_unproven", "control_byte_consumed_by_line_discipline"))
+
+    def test_tab_expansion_enumerates_every_unobservable_start_column(self) -> None:
+        payload = "ab\tc"
+        forms = self._forms(payload, _pty(tab_expand=True))
+        self.assertEqual(len(forms), 8, "one form per start column modulo the tab stop")
+        self.assertIn(b"ab      c", forms)          # column 0: 2 + 6 spaces
+        self.assertIn(b"ab   c", forms)             # column 5 (measured after 5 cols of output)
+        self.assertNotIn(b"ab\tc", forms)
+        self.assertEqual(self._forms(payload, _pty(tab_expand=False)), (b"ab\tc",))
+        # A multi-byte char and a ^X each advance the column by their BYTE count (2).
+        self.assertIn("é".encode() + b"      z", self._forms("é\tz", _pty(tab_expand=True)))
+        self.assertIn(b"^A      z", self._forms("\x01\tz", _pty(tab_expand=True)))
+        # Both kernels' newline/column rules are enumerated when neither ONLCR nor ONLRET
+        # decides it; ONLCR decides it (reset) and yields one form per column.
+        both = self._forms("a\n\tb", _pty(tab_expand=True, onlcr=False))
+        self.assertIn(b"a\n        b", both)        # BSD: NL resets the column
+        self.assertIn(b"a\n       b", both)         # Linux: NL keeps column 1
+        self.assertEqual(self._forms("a\n\tb", _pty(tab_expand=True, onlcr=True)),
+                         (b"a\r\n        b",))
+        # A proven tab-expanded echo is excised; the refusal after it fires.
+        raw = b"ab   c\r\nlogin required\r\n"
+        ev = self._ev(payload, 0, _pty(tab_expand=True))
+        self.assertEqual(self._resolve(raw, ev)["state"], "echo_proven")
+        self.assertTrue(self._refusals(raw, ev))
+        self.assertEqual(self._refusals(b"ab   c\r\nok\r\n", ev), ())
+
+    # -- 4. partial, repeated, delayed echo ----------------------------------------------
+    def test_a_partial_echo_is_unproven_by_name_and_excludes_nothing(self) -> None:
+        raw = b"Task contract:\r\nlogin req"                # the echo was cut short
+        ev = self._ev(self.PAYLOAD, 0, _pty())
+        res = self._resolve(raw, ev)
+        self.assertEqual((res["state"], res["reason"]),
+                         ("echo_unproven", "event[0]:echo_not_found"))
+        self.assertEqual(lifecycle.strip_delivery_echo(raw, (ev,)), raw)
+        self.assertEqual(self._refusals(raw, ev), (),
+                         "the cut-short bytes carry no refusal pattern")
+        self.assertTrue(self._refusals(b"Task contract:\r\nlogin required", ev),
+                        "a partial echo whose visible bytes match a pattern FIRES")
+
+    def test_a_repeated_echo_in_one_window_is_ambiguous_by_name(self) -> None:
+        echo = b"login required\r\n"
+        raw = echo + b"ok\r\n" + echo
+        ev = self._ev("login required\n", 0, _pty())
+        res = self._resolve(raw, ev)
+        self.assertEqual((res["state"], res["reason"]),
+                         ("echo_unproven", "event[0]:ambiguous_multiple_matches"))
+        self.assertEqual(lifecycle.strip_delivery_echo(raw, (ev,)), raw)
+        self.assertTrue(self._refusals(raw, ev), "nothing is guessed; the superset fires")
+
+    def test_a_delayed_echo_past_the_next_delivery_window_is_unproven_for_its_event(self) -> None:
+        first, second = "first prompt\n", "second prompt\n"
+        # The first echo lands AFTER the second event's offset -- outside its window.
+        raw = b"agent output\r\n" + b"second prompt\r\n" + b"first prompt\r\n"
+        ev1 = self._ev(first, 0, _pty())
+        ev2 = self._ev(second, len(b"agent output\r\n"), _pty())
+        res = self._resolve(raw, ev1, ev2)
+        self.assertEqual(res["state"], "echo_unproven")
+        self.assertEqual(res["reason"], "event[0]:echo_not_found")
+        per = {e["index"]: e for e in res["events"]}
+        self.assertEqual(per[0]["state"], "echo_unproven")
+        self.assertEqual(per[1]["state"], "echo_proven", "the second event's echo IS in its window")
+        self.assertEqual(lifecycle.strip_delivery_echo(raw, (ev1, ev2)), raw,
+                         "one unproven event fails the whole partition closed")
+        # In order, both are proven and both excised.
+        ordered = b"first prompt\r\n" + b"agent output\r\n" + b"second prompt\r\n"
+        ev2b = self._ev(second, len(b"first prompt\r\nagent output\r\n"), _pty())
+        self.assertEqual(self._resolve(ordered, ev1, ev2b)["state"], "echo_proven")
+        self.assertEqual(lifecycle.strip_delivery_echo(ordered, (ev1, ev2b)),
+                         b"agent output\r\n")
+
+    # -- 5. forged output carrying the same payload --------------------------------------
+    def test_a_forged_payload_outside_the_delivery_span_is_never_excluded(self) -> None:
+        echo = b"login required\r\n"
+        # Before the offset: the agent printed the exact payload before the write.
+        raw = b"forged: " + echo + b"real: " + echo
+        ev = self._ev("login required\n", len(b"forged: " + echo), _pty())
+        res = self._resolve(raw, ev)
+        self.assertEqual(res["state"], "echo_proven")
+        self.assertEqual(res["spans"], ((raw.rindex(echo), len(raw)),))
+        self.assertTrue(self._refusals(raw, ev), "the forged copy before the offset fires")
+
+    def test_a_forged_frame_when_the_pty_could_not_echo_is_never_excluded(self) -> None:
+        fake = b"\x1b[200~login required\x1b[201~\r\n"
+        # The runtime's own spawn leaves ECHO clear (`_set_raw`): the transport PROVES no
+        # echo, so the frame-shaped bytes are the agent's and fire.
+        ev = self._ev("login required", 0, RAW_PTY)
+        res = self._resolve(fake, ev)
+        self.assertEqual((res["state"], res["events"][0]["reason"]),
+                         ("echo_absent", "echo_flag_clear"))
+        self.assertTrue(self._refusals(fake, ev))
+        # argv delivery: the line discipline never saw the payload.
+        res = self._resolve(fake, self._ev("login required", 0, ARGV_TRANSPORT))
+        self.assertEqual((res["state"], res["events"][0]["reason"]),
+                         ("echo_absent", "argv_transport_cannot_echo"))
+        self.assertTrue(self._refusals(fake, self._ev("login required", 0, ARGV_TRANSPORT)))
+        # ECHO set with ECHOCTL: the real echo would render ESC as ^[; a RAW-ESC frame is not
+        # the derived form -> unproven by name, and it fires.
+        ev = self._ev("login required", 0, _pty(framed=True))
+        res = self._resolve(fake, ev)
+        self.assertEqual((res["state"], res["reason"]),
+                         ("echo_unproven", "event[0]:echo_not_found"))
+        self.assertTrue(self._refusals(fake, ev))
+
+    # -- 6. prompt and a genuine refusal containing the same string, both orders ---------
+    def test_the_same_string_as_prompt_and_as_genuine_refusal_fires_in_both_orders(self) -> None:
+        line = b"login required\r\n"
+        ev_at = lambda off: self._ev("login required\n", off, _pty())   # noqa: E731
+        # echo THEN refusal (both after the offset): two identical spans -> ambiguous, fires.
+        raw = line + line
+        res = self._resolve(raw, ev_at(0))
+        self.assertEqual(res["reason"], "event[0]:ambiguous_multiple_matches")
+        self.assertTrue(self._refusals(raw, ev_at(0)))
+        # refusal THEN echo, refusal before the offset: proven echo, pre-offset refusal fires.
+        res = self._resolve(raw, ev_at(len(line)))
+        self.assertEqual(res["state"], "echo_proven")
+        self.assertTrue(self._refusals(raw, ev_at(len(line))))
+        # echo THEN a DIFFERENT genuine refusal: proven, excised, the refusal fires.
+        raw2 = line + b"You are not logged in.\r\n"
+        self.assertEqual(self._resolve(raw2, ev_at(0))["state"], "echo_proven")
+        self.assertTrue(self._refusals(raw2, ev_at(0)))
+        # the control: echo alone is nothing.
+        self.assertEqual(self._refusals(line, ev_at(0)), ())
+
+    # -- 7. raw-byte offset vs sanitized-character offset disagreement -------------------
+    def test_a_raw_byte_offset_is_never_reconciled_with_a_sanitized_character_index(self) -> None:
+        # ESC (1 byte, rendered as 5 chars) and multi-byte chars BEFORE the offset: the
+        # character index of the refusal is far past the byte offset; the byte offset wins.
+        prefix = b"\x1b\x1b\x1b" + "☕☕".encode() + b"\r\n"     # 3 + 6 + 2 = 11 bytes
+        refusal = b"login required\r\n"
+        raw = prefix + refusal + refusal
+        offset = len(prefix) + len(refusal)                     # the SECOND line is the echo
+        ev = self._ev("login required\n", offset, _pty())
+        res = self._resolve(raw, ev)
+        self.assertEqual(res["spans"], ((offset, len(raw)),))
+        self.assertTrue(self._refusals(raw, ev), "the pre-offset refusal fires")
+        # The same offset expressed in sanitized CHARACTERS (3*5 + 2 + 2 + 16 = 35) would
+        # point past both lines: with it, nothing is proven and the scan still fires.
+        char_offset = 3 * len("<ESC>") + 2 + 2 + len(refusal)
+        res = self._resolve(raw, self._ev("login required\n", char_offset, _pty()))
+        self.assertEqual(res["reason"], "event[0]:echo_not_found")
+        self.assertTrue(self._refusals(raw, self._ev("login required\n", char_offset, _pty())))
+        # A negative (pre-window) offset is never clamped: unproven by name.
+        res = self._resolve(raw, self._ev("login required\n", -1, _pty()))
+        self.assertEqual(res["reason"], "event[0]:delivery_before_window")
+
+    # -- 8. a genuine refusal immediately AFTER the proven echo --------------------------
+    def test_a_genuine_refusal_immediately_after_the_proven_echo_fires(self) -> None:
+        echo = self.PAYLOAD.replace("\n", "\r\n").encode()
+        ev = self._ev(self.PAYLOAD, 0, _pty())
+        for tail in (b"login required", b"\r\nlogin required\r\n",
+                     b"You are not logged in.", b"\r\nAllow this tool to run?"):
+            with self.subTest(tail=tail):
+                raw = echo + tail
+                res = self._resolve(raw, ev)
+                self.assertEqual(res["state"], "echo_proven")
+                self.assertEqual(res["spans"], ((0, len(echo)),))
+                self.assertEqual(lifecycle.strip_delivery_echo(raw, (ev,)), tail)
+                self.assertTrue(self._refusals(raw, ev), f"{tail!r} must fire after the echo")
+
+    # -- structured-first refusal evidence -----------------------------------------------
+    def _claude_driver(self):
+        base = Path(tempfile.mkdtemp(prefix="os37-b1drv-"))
+        self.addCleanup(shutil.rmtree, base, True)
+        (base / "wt").mkdir()
+        spec = stub_profile_spec("alive", worktree=str(base / "wt"))
+        spec["auth_markers"] = [["error", "authentication_failed"],
+                                ["is_api_error_message", "True"],
+                                ["terminal_reason", "api_error"]]
+        return drivers_mod.driver_for(profile_from_mapping(spec))
+
+    def test_structured_records_are_consulted_first_and_free_text_is_the_fallback(self) -> None:
+        driver = self._claude_driver()
+        events = ({"offset": 0, "payload": "Task: login required\nContinue",
+                   "transport": ARGV_TRANSPORT},)
+        # A tool result / assistant message QUOTING the task text is that record's content,
+        # not a terminal gate: no refusal (the real F5 capture shape).
+        quoted = (b'{"type":"system","subtype":"init","session_id":"s1"}\r\n'
+                  b'{"type":"user","message":{"content":[{"type":"tool_result",'
+                  b'"content":"# WORKER.md\\nlogin required to continue"}]}}\r\n'
+                  b'{"type":"assistant","message":{"content":[{"type":"text",'
+                  b'"text":"The task says login required; proceeding."}]}}\r\n')
+        ev = driver.readiness_evidence(quoted.decode(), minted_session_id="s1",
+                                       liveness=None, raw=quoted, delivery_events=events)
+        self.assertEqual(tuple(ev["refusals"]), ())
+        self.assertEqual(ev["refusal_source"], "none")
+        self.assertEqual(ev["echo"]["state"], "echo_absent")
+        # A DECLARED structured marker fires with structured provenance, whatever the prose.
+        marked = quoted + (b'{"type":"assistant","session_id":"s1",'
+                           b'"error":"authentication_failed","message":{}}\r\n')
+        ev = driver.readiness_evidence(marked.decode(), minted_session_id="s1",
+                                       liveness=None, raw=marked, delivery_events=events)
+        self.assertEqual(tuple(ev["refusals"]), ("blocked_prompt_beats_idle",))
+        self.assertEqual(ev["refusal_source"], "structured")
+        self.assertEqual(ev["structured_hit"]["marker"]["field"], "error")
+        # Free text that is NOT a structured record is the fallback: a prose login gate fires.
+        prose = quoted + b"Please log in to continue.\r\n"
+        ev = driver.readiness_evidence(prose.decode(), minted_session_id="s1",
+                                       liveness=None, raw=prose, delivery_events=events)
+        self.assertEqual(tuple(ev["refusals"]), ("blocked_prompt_beats_idle",))
+        self.assertEqual(ev["refusal_source"], "free_text")
+        # And a text-only caller gets the same structured-first partition.
+        ev = driver.readiness_evidence(quoted.decode(), minted_session_id="s1", liveness=None)
+        self.assertEqual(tuple(ev["refusals"]), ())
+        self.assertTrue(driver.readiness_evidence(prose.decode(), minted_session_id="s1",
+                                                  liveness=None)["refusals"])
+
+    # -- fail closed BY NAME through S3 ---------------------------------------------------
+    def test_an_unproven_echo_makes_readiness_unprovable_and_named_never_ready(self) -> None:
+        base = {"liveness": _LIVE, "bound_signal": _bound(), "refusals": (),
+                "supplementary": ()}
+        for reason, echo in (
+                ("event[0]:transport_unrecorded", {"state": "echo_unproven"}),
+                ("event[0]:echo_not_found", {"state": "echo_unproven"}),
+                ("event[0]:ambiguous_multiple_matches", {"state": "echo_unproven"})):
+            with self.subTest(reason=reason):
+                verdict = lifecycle.may_send_prompt(
+                    {**base, "echo": {**echo, "reason": reason}},
+                    minted_session_id=_MINTED, declared_record_types=_DECLARED)
+                self.assertEqual(verdict["verdict"], "unprovable")
+                self.assertEqual(verdict["reason"], f"echo_unproven:{reason}")
+                self.assertTrue(verdict["quorum"]["R-C"], "no refusal fired -- and still not ready")
+                # And the deadline verdict CARRIES it, so a timeout stays named.
+                expired = lifecycle.may_send_prompt(
+                    {**base, "echo": {**echo, "reason": reason}},
+                    minted_session_id=_MINTED, declared_record_types=_DECLARED,
+                    deadline_expired=True)
+                self.assertEqual(expired["reason"], "deadline_expired")
+                self.assertEqual(expired["expired_on"]["reason"], f"echo_unproven:{reason}")
+        # Proven / absent echoes do not block a closed quorum.
+        for state in ("echo_proven", "echo_absent", "no_delivery"):
+            with self.subTest(state=state):
+                verdict = lifecycle.may_send_prompt(
+                    {**base, "echo": {"state": state, "reason": ""}},
+                    minted_session_id=_MINTED, declared_record_types=_DECLARED)
+                self.assertEqual(verdict["verdict"], "ready")
+        # A fired refusal keeps precedence over an unproven echo (both block).
+        verdict = lifecycle.may_send_prompt(
+            {**base, "refusals": ("blocked_prompt_beats_idle",),
+             "echo": {"state": "echo_unproven", "reason": "event[0]:echo_not_found"}},
+            minted_session_id=_MINTED, declared_record_types=_DECLARED)
+        self.assertEqual(verdict["verdict"], "not_ready")
+
+    def test_the_driver_reports_an_unproven_echo_end_to_end_through_s3(self) -> None:
+        driver = self._claude_driver()
+        raw = self.PAYLOAD.encode() + b"\r\n"                 # LF echo under an ONLCR transport
+        events = ({"offset": 0, "payload": self.PAYLOAD, "transport": _pty(onlcr=True)},)
+        ev = driver.readiness_evidence(raw.decode(), minted_session_id="s1", liveness=_LIVE,
+                                       raw=raw, delivery_events=events)
+        self.assertEqual(ev["echo"]["state"], "echo_unproven")
+        self.assertEqual(ev["echo"]["reason"], "event[0]:echo_not_found")
+        self.assertTrue(ev["refusals"], "the superset scan fires on the runtime's own text")
+        verdict = lifecycle.may_send_prompt(
+            {**ev, "bound_signal": _bound()}, minted_session_id=_MINTED,
+            declared_record_types=_DECLARED)
+        self.assertNotEqual(verdict["verdict"], "ready")
+        # The proven counterpart reaches ready on the same quorum.
+        proven = self.PAYLOAD.replace("\n", "\r\n").encode() + b"\r\n"
+        ev = driver.readiness_evidence(proven.decode(), minted_session_id="s1", liveness=_LIVE,
+                                       raw=proven, delivery_events=events)
+        self.assertEqual(ev["echo"]["state"], "echo_proven")
+        self.assertEqual(tuple(ev["refusals"]), ())
+        self.assertEqual(lifecycle.may_send_prompt(
+            {**ev, "bound_signal": _bound()}, minted_session_id=_MINTED,
+            declared_record_types=_DECLARED)["verdict"], "ready")
+
+    # -- the transport is READ from a real pty, and the derived forms match its real echo --
+    def test_a_real_pty_echo_equals_a_derived_form_under_its_read_termios(self) -> None:
+        import pty as _pty_mod
+        import select
+        import termios as _termios
+        from scripts.deterministic_workflow import standalone_pty as pty_supervisor
+
+        def drain(fd: int, budget_s: float = 0.5) -> bytes:
+            out, deadline = b"", time.monotonic() + budget_s
+            while time.monotonic() < deadline:
+                ready, _, _ = select.select([fd], [], [], 0.05)
+                if not ready:
+                    if out:
+                        break
+                    continue
+                try:
+                    chunk = os.read(fd, 4096)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                out += chunk
+            return out
+
+        payload = "Task contract:\nlogin required\tnow\x01\nContinue ☕"
+        cases = {"echo-off": lambda t: (t[3] & ~(_termios.ECHO | _termios.ICANON), t[1]),
+                 "echo-onlcr": lambda t: ((t[3] | _termios.ECHO) & ~_termios.ICANON, t[1]),
+                 "echo-no-onlcr": lambda t: ((t[3] | _termios.ECHO) & ~_termios.ICANON,
+                                             t[1] & ~_termios.ONLCR),
+                 "echo-tabs": lambda t: ((t[3] | _termios.ECHO) & ~_termios.ICANON,
+                                         t[1] | getattr(_termios, "TABDLY", 0) | 0x4),
+                 "echo-canonical": lambda t: (t[3] | _termios.ECHO | _termios.ICANON, t[1])}
+        for name, mutate in cases.items():
+            with self.subTest(case=name):
+                master, slave = _pty_mod.openpty()
+                self.addCleanup(os.close, master)
+                self.addCleanup(os.close, slave)
+                mode = _termios.tcgetattr(slave)
+                mode[3], mode[1] = mutate(mode)
+                _termios.tcsetattr(slave, _termios.TCSANOW, mode)
+                # The transport is read on the MASTER, at delivery time, as the runtime does.
+                transport = pty_supervisor.echo_transport(master, kind="pty_write",
+                                                          framed=True, cols=120)
+                self.assertIsNotNone(transport["termios"], "tcgetattr on the master")
+                for flag in lifecycle.TERMIOS_ECHO_FLAGS:
+                    self.assertIn(flag, transport["termios"])
+                self.assertEqual(transport["termios"]["echo"], name != "echo-off")
+                # Write exactly what `drivers.deliver` writes: the frame, then Enter.
+                frame = drivers_mod.frame_prompt(payload)
+                os.write(master, frame)
+                echoed = drain(master)
+                os.write(master, b"\r")
+                trailer = drain(master, 0.3)
+                os.read(slave, 65536)                              # the "agent" consumes it
+                events = ({"offset": 0, "payload": payload, "transport": transport},)
+                res = lifecycle.resolve_delivery_echo(echoed + trailer + b"ok\r\n", events)
+                if name == "echo-off":
+                    self.assertEqual(echoed, b"", "ECHO clear: the pty echoed nothing")
+                    self.assertEqual(res["state"], "echo_absent", res)
+                    continue
+                derived = lifecycle.expected_echo_forms(payload, transport)
+                self.assertEqual(derived["state"], "echo_expected", derived)
+                self.assertIn(echoed, derived["forms"],
+                              f"{name}: the real echo {echoed!r} is not among the derived "
+                              f"forms {derived['forms']!r}")
+                self.assertEqual(res["state"], "echo_proven", res)
+                self.assertEqual(res["spans"], ((0, len(echoed)),))
+                self.assertEqual(lifecycle.classify_refusals_in_capture(
+                    echoed + trailer + b"ok\r\n", events), (),
+                    f"{name}: the runtime's own echoed task text fired as a refusal")
+                self.assertTrue(lifecycle.classify_refusals_in_capture(
+                    echoed + trailer + b"You are not logged in.\r\n", events),
+                    f"{name}: a genuine refusal after the real echo must fire")
+
+    def test_termios_evidence_is_none_not_a_default_when_unreadable(self) -> None:
+        from scripts.deterministic_workflow import standalone_pty as pty_supervisor
+        r, w = os.pipe()
+        self.addCleanup(os.close, r)
+        self.addCleanup(os.close, w)
+        self.assertIsNone(pty_supervisor.termios_evidence(r), "a pipe has no termios")
+        transport = pty_supervisor.echo_transport(r, kind="pty_write", framed=True, cols=80)
+        self.assertIsNone(transport["termios"])
+        res = lifecycle.resolve_delivery_echo(
+            b"login required", ({"offset": 0, "payload": "login required",
+                                 "transport": transport},))
+        self.assertEqual((res["state"], res["reason"]),
+                         ("echo_unproven", "event[0]:termios_unreadable"))
+        self.assertEqual(pty_supervisor.echo_transport(None, kind="argv", framed=False,
+                                                       cols=80)["kind"], "argv")
+
+
+# =====================================================================================
+# B1'' -- (iteration-2 review) overlapping candidate spans are AMBIGUOUS, never collapsed
+# =====================================================================================
+class B1OverlappingCandidateSpansAreAmbiguousTests(unittest.TestCase):
+    """Iteration-1 review B1: `_occurrences` advanced its cursor by `len(form)` after a hit,
+    so a second candidate starting INSIDE the first was never seen -- payload `aaa` in raw
+    `aaaa` resolved `echo_proven` span `(0, 3)` and excised it, although `(1, 4)` is equally
+    supported by the evidence.  Ambiguity is now decided by SPAN IDENTITY across every start
+    position of every derived form: two distinct forms mapping to the same raw span are ONE
+    candidate (proven); any two distinct spans are `echo_unproven:ambiguous_multiple_matches`
+    with NO excision.  Red on the iteration-1 staged tree
+    (`evidence/iter2/B1_overlap_RED_at_iter1_tree.txt`)."""
+
+    @staticmethod
+    def _ev(payload: str, transport: dict | None = None, offset: int = 0) -> tuple[dict, ...]:
+        return ({"offset": offset, "payload": payload,
+                 "transport": transport if transport is not None else _pty(onlcr=False)},)
+
+    def _resolve(self, raw: bytes, payload: str, **kw: Any) -> dict:
+        return lifecycle.resolve_delivery_echo(raw, self._ev(payload, **kw))
+
+    def _assert_ambiguous(self, raw: bytes, payload: str, **kw: Any) -> None:
+        res = self._resolve(raw, payload, **kw)
+        self.assertEqual((res["state"], res["reason"]),
+                         ("echo_unproven", "event[0]:ambiguous_multiple_matches"), res)
+        self.assertEqual(res["spans"], ())
+        self.assertEqual(lifecycle.strip_delivery_echo(raw, self._ev(payload, **kw)), raw,
+                         "an ambiguous echo must excise NOTHING")
+
+    def test_the_reviewers_aaa_in_aaaa_attack_is_ambiguous_not_proven(self) -> None:
+        self._assert_ambiguous(b"aaaa", "aaa")
+        # The exact-length control is the single candidate and IS proven.
+        res = self._resolve(b"aaa", "aaa")
+        self.assertEqual((res["state"], res["spans"]), ("echo_proven", ((0, 3),)))
+
+    def test_overlap_where_the_payload_carries_a_blocking_phrase_fires(self) -> None:
+        payload = "login required login required"
+        raw = b"login required login required login required"
+        self._assert_ambiguous(raw, payload)                 # spans (0,29) and (15,44)
+        self.assertTrue(lifecycle.classify_refusals_in_capture(raw, self._ev(payload)),
+                        "nothing is excised, so the runtime's own phrase FIRES (fail closed)")
+        # The unambiguous control: exactly the payload, once -> proven, nothing fires.
+        self.assertEqual(self._resolve(payload.encode(), payload)["state"], "echo_proven")
+        self.assertEqual(lifecycle.classify_refusals_in_capture(payload.encode(),
+                                                                self._ev(payload)), ())
+
+    def test_distinct_derived_forms_on_the_same_raw_span_are_one_candidate(self) -> None:
+        # Tab expansion derives one form per unobservable start column; here two of them
+        # coincide with the same raw bytes only when... they cannot: forms are deduplicated.
+        # So build the case at the boundary the model itself exposes: `_occurrences` is fed
+        # two DISTINCT forms that both equal the raw window.  Same span twice == one candidate.
+        hits = lifecycle._occurrences(b"xx", (b"xx", b"xx"), 0, 2)
+        self.assertEqual(hits, [(0, 2)], "identical spans from distinct form slots dedupe")
+        # And through the public model: the newline/column rule enumerates two forms for
+        # `a\n\tb` under tab expansion with ONLCR clear; only ONE of them is in the capture, so
+        # exactly one distinct span exists -> proven.
+        transport = _pty(tab_expand=True, onlcr=False)
+        derived = lifecycle.expected_echo_forms("a\n\tb", transport)
+        self.assertGreater(len(derived["forms"]), 1)
+        for form in derived["forms"]:
+            with self.subTest(form=form):
+                res = self._resolve(b"<" + form + b">", "a\n\tb", transport=transport,
+                                    offset=0)
+                self.assertEqual(res["state"], "echo_proven", res)
+                self.assertEqual(res["spans"], ((1, 1 + len(form)),))
+
+    def test_distinct_derived_forms_on_different_spans_are_ambiguous(self) -> None:
+        transport = _pty(tab_expand=True, onlcr=False)
+        derived = lifecycle.expected_echo_forms("a\n\tb", transport)
+        two = derived["forms"][:2]
+        self.assertNotEqual(two[0], two[1])
+        raw = two[0] + b"\r\n" + two[1]                       # each form once, different spans
+        self._assert_ambiguous(raw, "a\n\tb", transport=transport)
+
+    def test_property_self_overlapping_payloads_are_proven_only_with_exactly_one_span(self) -> None:
+        rng = random.Random(20260915)
+        alphabet = ("a", "ab", "aba", "login required", "\n", " ", "x")
+        for _ in range(400):
+            unit = rng.choice(alphabet[:3]) if rng.random() < 0.7 else rng.choice(alphabet)
+            payload = unit * rng.randint(1, 4)
+            form = payload.encode()
+            # A raw window that SELF-OVERLAPS: the payload followed by one of its own
+            # suffixes (a shifted partial copy), optionally preceded by one of its prefixes
+            # and padded -- the shapes a cursor that skips `len(form)` cannot see.
+            j = rng.randint(0, len(form))
+            head = form[:rng.randint(0, len(form))] if rng.random() < 0.5 else b""
+            pad = rng.choice((b"", b"\n", b"|", b"zz"))
+            raw = pad + head + form + form[j:] + pad
+            events = self._ev(payload)
+            res = lifecycle.resolve_delivery_echo(raw, events)
+            # Ground truth by exhaustive enumeration of every start position.
+            spans = {(i, i + len(form)) for i in range(len(raw) - len(form) + 1)
+                     if raw[i:i + len(form)] == form}
+            if len(spans) == 1:
+                self.assertEqual(res["state"], "echo_proven", (payload, raw, res))
+                self.assertEqual(res["spans"], (next(iter(spans)),))
+            else:
+                self.assertEqual(res["state"], "echo_unproven", (payload, raw, res))
+                self.assertEqual(res["reason"], "event[0]:ambiguous_multiple_matches")
+                self.assertEqual(lifecycle.strip_delivery_echo(raw, events), raw)
+
+
+# =====================================================================================
+# B1' -- the RUNTIME records the transport at the write and journals the echo verdict
+# =====================================================================================
+class B1RuntimeRecordsTransportAtDeliveryTests(_Composed):
+    """`StandaloneSession.send` records the `EchoTransport` (kind, framing, live termios
+    read on the master at the write) in the delivery event; `_verify_delivery` partitions
+    the post-write bytes by it; the delivery journal row carries the echo verdict and the
+    transport, so an unproven echo is visible in the settlement.  Red on the staged tree:
+    the event has no `transport` key and the row has no `echo` vocabulary."""
+
+    def test_send_records_the_live_transport_and_journals_the_echo_verdict(self) -> None:
+        run_id = "run_b1rt"
+        spec = stub_profile_spec("deliver-claude", worktree=self.worktree,
+                                 timeouts={"delivery_verify_timeout_ms": 6000})
+        adapter, _state, ledger = self.compose_spec(spec, run_id=run_id)
+        intent = {**WORKER_INTENT_KEYS, "intent_id": "i-b1rt", "run_id": run_id,
+                  "role": "WORKER"}
+        claim = ledger.claim(intent)
+        session = adapter.runtime.session_for(intent)
+        receipt = session.start(lease_token=claim["lease_token"], **INJECTED_REHEARSALS)
+        self.assertEqual(receipt["start_outcome"], "ready", receipt)
+        payload = "Task contract:\nlogin required\nContinue"
+        result = session.send({"payload": payload})
+        self.assertEqual(result["delivery"], "delivered_confirmed", result)
+        self.assertEqual(result["proof"], "turn_start")
+        # The event carries the transport read at the write: a framed pty write into the
+        # raw-mode slave this runtime configured (`_set_raw` clears ECHO).
+        event = session.delivery_events[-1]
+        self.assertEqual(event["payload"], payload)
+        transport = event["transport"]
+        self.assertEqual((transport["kind"], transport["framed"]), ("pty_write", True))
+        self.assertIsNotNone(transport["termios"], "the master's termios was readable")
+        self.assertFalse(transport["termios"]["echo"])
+        for flag in lifecycle.TERMIOS_ECHO_FLAGS:
+            self.assertIn(flag, transport["termios"])
+        # The verifier partitioned by it: no echo possible -> nothing excluded, nothing
+        # unproven -- and the task text carried no refusal because nothing echoed it.
+        self.assertEqual(result["echo"]["state"], "echo_absent", result["echo"])
+        self.assertNotIn(b"login required", session.capture.raw(),
+                         "a raw-mode slave echoes nothing back into the capture")
+        # The journal row names the verdict and the transport.
+        rows = [r for r in self.journal(run_id).rows_for("i-b1rt")
+                if r["event"] == "delivery_proof_observed"]
+        self.assertEqual(len(rows), 1)
+        vocab = rows[0]["source_vocabulary"]
+        self.assertEqual(vocab["echo"]["state"], "echo_absent")
+        self.assertEqual(vocab["echo"]["events"][0]["reason"], "echo_flag_clear")
+        self.assertEqual(vocab["transport"]["kind"], "pty_write")
+        self.assertFalse(vocab["transport"]["termios"]["echo"])
+        self.assertEqual(vocab["refusals"], [])
+        json.dumps(vocab)                                     # journal-safe throughout
 
 
 # =====================================================================================
@@ -716,14 +1614,20 @@ class B4AuditedProfileMigrationTests(unittest.TestCase):
         new = launcher.load_standalone_authority(self.base, self.run, "t")["profile_digest"]
         self.assertNotEqual(new, old, "the authority was not re-bound")
         self.assertEqual(new, launcher.profile_digest(self.spec_b))
-        log = launcher.read_standalone_migrations(self.base, self.run, "t")
-        self.assertEqual(len(log), 1, "no durable audit record was written")
-        entry = log[0]
+        # F-001: EXACTLY ONE committed record (the two-phase protocol also wrote a prepared
+        # record, so the raw log has both; the committed one is the truthful migration).
+        committed = launcher.standalone_committed_migrations(self.base, self.run, "t")
+        self.assertEqual(len(committed), 1, "expected exactly one committed migration")
+        entry = committed[0]
         self.assertEqual(entry["old_profile_digest"], old)
         self.assertEqual(entry["new_profile_digest"], new)
         self.assertEqual(entry["actor"], "alice")
         self.assertEqual(entry["reason"], "retune worktree")
+        self.assertTrue(entry.get("migration_id"), "the record carries no operation id")
         self.assertTrue(entry.get("migrated_at"), "the audit record carries no timestamp")
+        raw = launcher.read_standalone_migrations(self.base, self.run, "t")
+        self.assertTrue(any(r.get("state") == launcher.MIGRATION_PREPARED for r in raw),
+                        "the two-phase protocol wrote no prepared record")
         # After migration the NEW profile is the accepted exact-digest restatement.
         adapter, _j, _p = launcher.standalone_recovery_composition(
             self.base, self.run, thread_id="t", ledger=self.ledger,
@@ -741,8 +1645,204 @@ class B4AuditedProfileMigrationTests(unittest.TestCase):
                 "--artifact-base", str(self.base), "--standalone-profile", str(same),
                 "--actor-id", "alice", "--reason", "no change"])
         self.assertNotEqual(code, 0, "a no-op migration must be refused")
-        self.assertEqual(launcher.read_standalone_migrations(self.base, self.run), (),
-                         "a refused no-op migration wrote an audit record")
+        self.assertEqual(launcher.standalone_committed_migrations(self.base, self.run), (),
+                         "a refused no-op migration committed a record")
+
+
+# =====================================================================================
+# F-001 -- audited migration is crash-consistent and replay-safe
+# =====================================================================================
+class _MigrationCrash(Exception):
+    pass
+
+
+class F001MigrationIsCrashConsistentAndReplaySafeTests(unittest.TestCase):
+    """Final Adversarial Review F-001.  The migration is a two-phase (prepared -> committed)
+    protocol keyed by a stable operation id; a crash at ANY durable-write boundary is
+    reconciled deterministically from the authority digest, and replay is idempotent.  Red
+    at `0678c33`: `migrate_standalone_profile` appended a completed audit record BEFORE the
+    re-bind, so a crash left a ghost completion and replay duplicated it; there was no
+    `migration_id`, no prepared/committed state, and no `reconcile_standalone_migrations`."""
+
+    def setUp(self) -> None:
+        self.base = Path(tempfile.mkdtemp(prefix="os37-f1mig-"))
+        self.addCleanup(shutil.rmtree, self.base, True)
+        (self.base / "wt-a").mkdir()
+        (self.base / "wt-b").mkdir()
+        self.run = "run_f1mig"
+        self.spec_a = stub_profile_spec("alive", worktree=str(self.base / "wt-a"))
+        self.spec_b = stub_profile_spec("alive", worktree=str(self.base / "wt-b"))
+        self.ledger = FileRuntimeStateStore(self.base / "l.json")
+        launcher.publish_standalone_launch_bindings(
+            self.base, self.run, profile_spec=self.spec_a,
+            runtime_state_path=self.ledger.path, thread_id="t")
+        self.new_digest = launcher.profile_digest(self.spec_b)
+
+    def test_a_crash_at_every_boundary_converges_to_one_committed_migration(self) -> None:
+        # Durable-write boundaries in one migration: prepared append, archive write(s),
+        # authority re-bind write, committed append.  Cover them all.
+        for crash_after in range(1, 6):
+            with self.subTest(crash_after=crash_after):
+                # Fresh run per crash point.
+                run = f"run_f1c{crash_after}"
+                launcher.publish_standalone_launch_bindings(
+                    self.base, run, profile_spec=self.spec_a,
+                    runtime_state_path=(self.base / f"l{crash_after}.json").resolve(),
+                    thread_id="t")
+                old = launcher.load_standalone_authority(self.base, run, "t")["profile_digest"]
+                real_append, real_write = launcher._durable_append, launcher._durable_write
+                n = {"i": 0}
+
+                def wrap(fn):
+                    def inner(*a, **k):
+                        n["i"] += 1
+                        out = fn(*a, **k)
+                        if n["i"] == crash_after:
+                            raise _MigrationCrash("boom")
+                        return out
+                    return inner
+                launcher._durable_append = wrap(real_append)   # type: ignore[assignment]
+                launcher._durable_write = wrap(real_write)     # type: ignore[assignment]
+                try:
+                    launcher.migrate_standalone_profile(
+                        self.base, run, thread_id="t", new_profile_spec=self.spec_b,
+                        actor="alice", reason="retune")
+                except _MigrationCrash:
+                    pass
+                finally:
+                    launcher._durable_append = real_append     # type: ignore[assignment]
+                    launcher._durable_write = real_write        # type: ignore[assignment]
+                # Recovery: a plain authority read reconciles the interrupted migration.
+                recovered = launcher.load_standalone_authority(self.base, run, "t")["profile_digest"]
+                # NO ghost committed record: at most one committed, and only if the re-bind
+                # durably landed (recovered == new).
+                committed = launcher.standalone_committed_migrations(self.base, run, "t")
+                if recovered == self.new_digest:
+                    self.assertEqual(len(committed), 1,
+                                     f"crash_after={crash_after}: rebind landed but not one committed")
+                else:
+                    self.assertEqual(recovered, old,
+                                     f"crash_after={crash_after}: authority half-applied")
+                    self.assertEqual(committed, (),
+                                     f"crash_after={crash_after}: GHOST committed with old digest")
+                # Replay of the identical operation is idempotent: converges to exactly one
+                # committed record and the new digest, no duplicate.
+                launcher.migrate_standalone_profile(
+                    self.base, run, thread_id="t", new_profile_spec=self.spec_b,
+                    actor="alice", reason="retune")
+                final = launcher.load_standalone_authority(self.base, run, "t")["profile_digest"]
+                self.assertEqual(final, self.new_digest,
+                                 f"crash_after={crash_after}: replay did not converge to new digest")
+                self.assertEqual(
+                    len(launcher.standalone_committed_migrations(self.base, run, "t")), 1,
+                    f"crash_after={crash_after}: replay produced a duplicate committed record")
+
+    def test_replay_after_a_clean_commit_is_idempotent(self) -> None:
+        launcher.migrate_standalone_profile(
+            self.base, self.run, thread_id="t", new_profile_spec=self.spec_b,
+            actor="alice", reason="retune")
+        first = launcher.standalone_committed_migrations(self.base, self.run, "t")
+        self.assertEqual(len(first), 1)
+        # Replaying the SAME operation appends no second committed record and returns it.
+        again = launcher.migrate_standalone_profile(
+            self.base, self.run, thread_id="t", new_profile_spec=self.spec_b,
+            actor="alice", reason="retune")
+        self.assertEqual(again["migration_id"], first[0]["migration_id"])
+        self.assertEqual(
+            len(launcher.standalone_committed_migrations(self.base, self.run, "t")), 1,
+            "replay after a clean commit duplicated the committed record")
+
+    # ---- iteration-5 B1: the replay key must not alias distinct epochs ------------------
+    def _authority_digest(self, run: str) -> str:
+        return launcher.load_standalone_authority(self.base, run, "t")["profile_digest"]
+
+    def _migrate(self, run: str, spec, actor: str, reason: str) -> dict:
+        return launcher.migrate_standalone_profile(
+            self.base, run, thread_id="t", new_profile_spec=spec, actor=actor, reason=reason)
+
+    def test_a_cross_epoch_a_b_a_history_never_aliases_a_later_migration(self) -> None:
+        # B1: A->B (alice/retune), B->A (bob/revert), then a DISTINCT A->B (alice/retune).
+        # Red at the iteration-5 tree: the third returned the FIRST committed record, the
+        # authority stayed on A and only two records existed.  It must move to B with THREE.
+        run = "run_f1epoch"
+        launcher.publish_standalone_launch_bindings(
+            self.base, run, profile_spec=self.spec_a,
+            runtime_state_path=(self.base / "lep.json").resolve(), thread_id="t")
+        digest_a = launcher.profile_digest(self.spec_a)
+        digest_b = launcher.profile_digest(self.spec_b)
+        self._migrate(run, self.spec_b, "alice", "retune")
+        self.assertEqual(self._authority_digest(run), digest_b)
+        self._migrate(run, self.spec_a, "bob", "revert")
+        self.assertEqual(self._authority_digest(run), digest_a)
+        third = self._migrate(run, self.spec_b, "alice", "retune")
+        self.assertEqual(self._authority_digest(run), digest_b,
+                         "the distinct later A->B must move the authority to B, not alias")
+        committed = launcher.standalone_committed_migrations(self.base, run, "t")
+        self.assertEqual(len(committed), 3,
+                         "A->B, B->A, A->B must record three committed migrations")
+        self.assertEqual(third["new_profile_digest"], digest_b)
+        # The two A->B operations are DISTINCT operation ids (different epoch), so the later
+        # one can never be mistaken for a replay of the earlier one.
+        ab_ids = [c["migration_id"] for c in committed
+                  if c.get("new_profile_digest") == digest_b]
+        self.assertEqual(len(ab_ids), 2)
+        self.assertNotEqual(ab_ids[0], ab_ids[1],
+                            "same actor/reason/target at a different epoch must not alias one id")
+
+    def test_a_crash_at_every_boundary_on_a_later_epoch_operation_converges(self) -> None:
+        digest_a = launcher.profile_digest(self.spec_a)
+        digest_b = launcher.profile_digest(self.spec_b)
+        for crash_after in range(1, 6):
+            with self.subTest(crash_after=crash_after):
+                run = f"run_f1lc{crash_after}"
+                launcher.publish_standalone_launch_bindings(
+                    self.base, run, profile_spec=self.spec_a,
+                    runtime_state_path=(self.base / f"llc{crash_after}.json").resolve(),
+                    thread_id="t")
+                # Two clean earlier epochs first: A->B, B->A.  Authority is back at A.
+                self._migrate(run, self.spec_b, "alice", "retune")
+                self._migrate(run, self.spec_a, "bob", "revert")
+                self.assertEqual(self._authority_digest(run), digest_a)
+                # Crash the LATER (third) A->B at durable-write boundary `crash_after`.
+                real_append, real_write = launcher._durable_append, launcher._durable_write
+                n = {"i": 0}
+
+                def wrap(fn):
+                    def inner(*a, **k):
+                        n["i"] += 1
+                        out = fn(*a, **k)
+                        if n["i"] == crash_after:
+                            raise _MigrationCrash("boom")
+                        return out
+                    return inner
+                launcher._durable_append = wrap(real_append)   # type: ignore[assignment]
+                launcher._durable_write = wrap(real_write)     # type: ignore[assignment]
+                try:
+                    self._migrate(run, self.spec_b, "alice", "retune")
+                except _MigrationCrash:
+                    pass
+                finally:
+                    launcher._durable_append = real_append     # type: ignore[assignment]
+                    launcher._durable_write = real_write        # type: ignore[assignment]
+                recovered = self._authority_digest(run)         # a read reconciles the attempt
+                committed = launcher.standalone_committed_migrations(self.base, run, "t")
+                # No ghost: the two earlier epochs are committed, and the third is committed
+                # only if its re-bind durably landed (roll forward); otherwise it rolled back.
+                if recovered == digest_b:
+                    self.assertEqual(len(committed), 3,
+                                     f"crash_after={crash_after}: rebind landed but not three committed")
+                else:
+                    self.assertEqual(recovered, digest_a,
+                                     f"crash_after={crash_after}: authority half-applied")
+                    self.assertEqual(len(committed), 2,
+                                     f"crash_after={crash_after}: GHOST/duplicate committed record")
+                # Replay the later operation: converges to B with exactly three committed.
+                self._migrate(run, self.spec_b, "alice", "retune")
+                self.assertEqual(self._authority_digest(run), digest_b,
+                                 f"crash_after={crash_after}: replay did not converge to B")
+                self.assertEqual(
+                    len(launcher.standalone_committed_migrations(self.base, run, "t")), 3,
+                    f"crash_after={crash_after}: replay did not converge to three committed")
 
 
 if __name__ == "__main__":

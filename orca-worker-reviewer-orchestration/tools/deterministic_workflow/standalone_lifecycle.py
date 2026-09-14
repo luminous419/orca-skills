@@ -41,10 +41,11 @@ from __future__ import annotations
 import inspect
 import re
 from collections.abc import Mapping, Sequence
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal, NotRequired, TypedDict
 
 from .contracts import (OwnershipAxes, VocabularyError, validate_axes,
                         validate_vocabulary_member)
+from .standalone_capture import structured_lines
 
 # ---- D5.1 the ten states, closed ------------------------------------------------------
 STATES = ("STARTING", "READY", "PROMPT_DELIVERED", "RUNNING", "WAITING_FOR_INPUT",
@@ -247,6 +248,11 @@ class ReadinessEvidence(TypedDict):
     bound_signal: BoundReadinessSignal | None
     refusals: tuple[str, ...]
     supplementary: tuple[TextObservation, ...]
+    #: F-002 / B1: the echo-provenance verdict the refusal scan was partitioned by
+    #: (:func:`resolve_delivery_echo`).  `echo_unproven` here makes S3 `unprovable`.
+    echo: Mapping[str, Any]
+    #: Where the refusals came from: ``structured`` / ``free_text`` / ``none``.
+    refusal_source: str
 
 
 class CompletionEvidence(TypedDict):
@@ -271,6 +277,9 @@ class ReadinessVerdict(TypedDict):
     verdict: str            # a member of READINESS_VERDICTS
     reason: str
     quorum: dict[str, bool]  # {"R-A": ..., "R-B": ..., "R-C": ...}
+    #: Present only on a `deadline_expired` verdict: the verdict/reason it expired on, so
+    #: an `echo_unproven` readiness timeout stays named through the settlement.
+    expired_on: NotRequired[dict[str, str]]
 
 
 class StateRecord(TypedDict):
@@ -397,84 +406,439 @@ def readiness_decision_signature() -> tuple[str, ...]:
     return tuple(inspect.signature(decide_readiness).parameters)
 
 
-def strip_echoed(text: str, echoed: str) -> str:
-    r"""``text`` with the runtime's OWN delivered-prompt ECHO SPAN removed -- once.
+# ---- F-002 / B1: delivery-echo PROVENANCE ---------------------------------------------
+#: The closed vocabulary of echo-provenance states.  `no_delivery` -- nothing was delivered,
+#: so nothing can be an echo; `echo_absent` -- something was delivered and the recorded
+#: transport PROVES the line discipline cannot have echoed it (it left with the `execve`,
+#: or `ECHO` was clear at the write); `echo_proven` -- exactly one span, at/after the
+#: recorded raw-byte offset, equals the delivered bytes under the transformation derived
+#: from the recorded transport; `echo_unproven` -- none of the above could be established.
+#: `echo_unproven` NAMES its reason and blocks readiness (`may_send_prompt` -> `unprovable`);
+#: it never excludes and never silently passes.
+ECHO_STATES = ("no_delivery", "echo_absent", "echo_proven", "echo_unproven")
+#: How a payload reached the CLI.  `argv`: at process creation, never through the pty
+#: input queue.  `pty_write`: written to the pty master by this runtime.
+ECHO_TRANSPORT_KINDS = ("argv", "pty_write")
+#: The reasons an echo can be `echo_unproven`, closed so a test can enumerate them.
+ECHO_UNPROVEN_REASONS = (
+    "transport_unrecorded",                     # the event carries no transport record
+    "transport_kind_unknown",                   # a kind outside ECHO_TRANSPORT_KINDS
+    "termios_unreadable",                       # tcgetattr failed at delivery time
+    "control_byte_consumed_by_line_discipline", # a c_cc special byte is in the payload
+    "delivery_before_window",                   # the recorded offset precedes this window
+    "echo_not_found",                           # no span equals any derived form (partial,
+                                                # delayed past the window, or absent)
+    "ambiguous_multiple_matches",               # more than one span equals a derived form
+)
+#: xterm bracketed-paste framing.  Terminal-standard bytes, not a CLI name.
+BRACKETED_PASTE_START = b"\x1b[200~"
+BRACKETED_PASTE_END = b"\x1b[201~"
+#: `standalone_drivers.sanitize_payload`'s substitution for a raw ESC in the payload.
+ESC_REPLACEMENT = b"<ESC>"
+#: The line discipline's tab stop.  Fixed at 8 by every termios implementation.
+TAB_STOP = 8
+#: The termios flags a transport record must carry for a `pty_write` echo to be derivable.
+TERMIOS_ECHO_FLAGS = ("echo", "echoctl", "icanon", "isig", "iexten", "ixon", "opost",
+                      "onlcr", "ocrnl", "onocr", "onlret", "tab_expand", "icrnl", "inlcr",
+                      "igncr")
 
-    Consolidated follow-up review of 87f6179 (L1) and its iteration-2 finding B3.  The
-    runtime delivers the engine's prompt -- role, phase, task contract, the words ``login
-    required`` if the TASK quotes them, a ``[y/N]`` the task describes -- into the pty, and
-    that delivered content appears in the transcript as the runtime's own echo.  Scanning
-    the transcript for runtime UI then fires on the runtime's OWN delivered content, a
-    false refusal and so a false BLOCK.
 
-    **Provenance-bound, not content subtraction (B3).**  Iteration 1 removed EVERY
-    transcript line equal to a prompt line, which also erased a GENUINE later refusal that
-    happened to be identical to a task line -- hiding real runtime output.  This instead
-    excludes ONE span: the runtime scans only the post-delivery region, where its own echo
-    of the delivered payload comes FIRST, so the exclusion is bound to that echo's
-    position and not to line content globally.
+class EchoTransport(TypedDict):
+    """What the driver/runtime recorded about the transport AT the delivery."""
 
-    * PRIMARY -- the contiguous echo block: the first run of transcript lines that equals
-      the delivered payload's own line sequence is the echo, and exactly those lines are
-      dropped; anything before or after (a genuine runtime refusal further down) is kept.
-    * FALLBACK -- when the CLI reflowed the block so it is not contiguous: the FIRST
-      occurrence of each delivered line is consumed left to right (the echo precedes any
-      genuine output on the post-delivery region), so a SECOND, genuine occurrence of an
-      identical blocking line survives and still fires.
+    kind: str                     # ECHO_TRANSPORT_KINDS
+    framed: bool                  # a bracketed-paste frame was written around the payload
+    termios: Mapping[str, Any] | None   # TERMIOS_ECHO_FLAGS + `special_bytes`, or None
+    cols: int
 
-    Either way the runtime's own delivered bytes are excluded by WHERE they are, and a real
-    ``not logged in`` the agent process emits later is never removed.
+
+class EchoResolution(TypedDict):
+    """The provenance verdict over a capture for a sequence of delivery events."""
+
+    state: str                    # ECHO_STATES
+    reason: str                   # "" or an ECHO_UNPROVEN_REASONS member (event-prefixed)
+    spans: tuple[tuple[int, int], ...]    # raw-byte spans, only when `echo_proven`
+    events: tuple[Mapping[str, Any], ...]  # one per event: index/offset/state/reason/span
+
+
+def _delivered_echo_bytes(payload: str) -> bytes:
+    """The exact BYTES the runtime handed over for ``payload`` -- what the line discipline
+    RECEIVES.  This is `standalone_drivers.sanitize_payload`: UTF-8, with every raw ESC
+    byte replaced by the literal ``b"<ESC>"``.  The echo is derived from these bytes and the
+    recorded transport; matching the derived form at the recorded raw-byte offset is what
+    binds an excluded span to the delivered payload's digest."""
+    return payload.encode("utf-8", "replace").replace(b"\x1b", ESC_REPLACEMENT)
+
+
+def _render_echo(body: bytes, flags: Mapping[str, Any], *, start_column: int,
+                 newline_resets_column: bool) -> bytes:
+    r"""ONE candidate echo of ``body`` under the termios ``flags``: the line discipline's
+    input translation (``c_iflag``), its control-character echo rendering (``ECHOCTL``) and
+    its output post-processing (``c_oflag``: ``ONLCR``, ``OCRNL``, ``ONOCR``, tab
+    expansion) applied byte by byte, tracking the output column the way the discipline
+    does (per BYTE -- a multi-byte character advances it by its byte count, ``^X`` by two).
+
+    ``start_column`` is the column the pty was at when the echo began -- unknown to this
+    runtime, so the caller enumerates it modulo the tab stop.  ``newline_resets_column``
+    is the one behaviour the two kernels this runtime runs on disagree about when neither
+    ``ONLCR`` nor ``ONLRET`` is set (BSD resets, Linux does not); the caller enumerates it.
     """
-    if not echoed or not text:
-        return text
-    lines = text.splitlines()
-    prompt = [line.strip() for line in echoed.replace("\r\n", "\n").splitlines()
-              if line.strip()]
-    if not prompt:
-        return text
-    nonblank = [i for i, line in enumerate(lines) if line.strip()]
-    stripped = [lines[i].strip() for i in nonblank]
-    n = len(prompt)
-    excluded: set[int] = set()
-    # PRIMARY: the first contiguous window of non-blank transcript lines equal to the
-    # delivered payload's line sequence IS the echo span.
-    for start in range(0, len(stripped) - n + 1):
-        if stripped[start:start + n] == prompt:
-            excluded = set(nonblank[start:start + n])
-            break
-    if not excluded:
-        # FALLBACK: consume the FIRST occurrence of each delivered line, left to right.
-        remaining = list(prompt)
-        for i in nonblank:
-            token = lines[i].strip()
-            if token in remaining:
-                excluded.add(i)
-                remaining.remove(token)
-    return "\n".join(line for i, line in enumerate(lines) if i not in excluded)
+    echoctl = bool(flags.get("echoctl"))
+    opost = bool(flags.get("opost"))
+    onlcr = bool(flags.get("onlcr"))
+    ocrnl = bool(flags.get("ocrnl"))
+    onocr = bool(flags.get("onocr"))
+    onlret = bool(flags.get("onlret"))
+    tab_expand = bool(flags.get("tab_expand"))
+    icrnl = bool(flags.get("icrnl"))
+    inlcr = bool(flags.get("inlcr"))
+    igncr = bool(flags.get("igncr"))
+    out = bytearray()
+    column = start_column
+    for byte in body:
+        # c_iflag: what the discipline RECEIVES for the byte that was written.
+        if byte == 0x0D:
+            if igncr:
+                continue
+            if icrnl:
+                byte = 0x0A
+        elif byte == 0x0A and inlcr:
+            byte = 0x0D
+        # ECHOCTL: a control byte other than TAB / NL is echoed as ^X (two columns).
+        if echoctl and ((byte < 0x20 and byte not in (0x09, 0x0A)) or byte == 0x7F):
+            out += b"^" + bytes([byte ^ 0x40])
+            column += 2
+            continue
+        if not opost:
+            out.append(byte)
+            continue
+        # c_oflag post-processing.
+        if byte == 0x0A:
+            if onlcr:
+                out += b"\r\n"
+                column = 0
+            else:
+                out.append(byte)
+                if onlret or newline_resets_column:
+                    column = 0
+            continue
+        if byte == 0x0D:
+            if onocr and column == 0:
+                continue                             # CR at column 0 is suppressed
+            if ocrnl:
+                out.append(0x0A)
+                if onlret or newline_resets_column:
+                    column = 0
+            else:
+                out.append(byte)
+                column = 0
+            continue
+        if byte == 0x09 and tab_expand:
+            width = TAB_STOP - (column % TAB_STOP)
+            out += b" " * width
+            column += width
+            continue
+        out.append(byte)
+        if byte == 0x08:
+            column = max(column - 1, 0)
+        elif byte >= 0x20 and byte != 0x7F:
+            column += 1
+    return bytes(out)
 
 
-def classify_refusals(text: str, *, blocked_hint: bool = False,
-                      exclude_text: str = "") -> tuple[str, ...]:
-    """Refusals derived from OBSERVED TEXT.  Text may only subtract.
+def expected_echo_forms(payload: str, transport: Mapping[str, Any]) -> dict[str, Any]:
+    """The echo forms the recorded ``transport`` can produce for ``payload`` -- DERIVED from
+    evidence (the transport kind and the termios flags read at delivery time), never from a
+    hard-coded alternate list.
 
-    Returns refusal codes, which R-C consumes.  There is no return value from this function
-    that can make anything ready -- and that asymmetry is the design.
-
-    ``exclude_text`` is the runtime's OWN delivered prompt (L1): its lines are removed
-    from ``text`` before the scan, so a refusal is bound to output the runtime did not
-    author.  Excluding it is a further subtraction and never adds a refusal.
+    Returns ``{"state", "reason", "forms"}`` where ``state`` is ``echo_absent`` (the
+    transport proves there is no line-discipline echo: the payload left with the ``execve``,
+    or ``ECHO`` was clear), ``echo_unproven`` (the transformation cannot be derived --
+    ``reason`` names why) or ``echo_expected`` (``forms`` is the non-empty tuple of byte
+    strings one of which the echo MUST equal).  Several forms exist only when the discipline
+    depends on state this runtime cannot observe -- the output column at the moment the
+    echo began (tab expansion) and the newline/column rule the two supported kernels
+    disagree on -- and every such form is enumerated rather than guessed at.
     """
-    scanned = strip_echoed(text, exclude_text) if exclude_text else text
+    kind = transport.get("kind")
+    if kind == "argv":
+        return {"state": "echo_absent", "reason": "argv_transport_cannot_echo", "forms": ()}
+    if kind != "pty_write":
+        return {"state": "echo_unproven", "reason": "transport_kind_unknown", "forms": ()}
+    flags = transport.get("termios")
+    if not isinstance(flags, Mapping) or any(name not in flags for name in TERMIOS_ECHO_FLAGS):
+        return {"state": "echo_unproven", "reason": "termios_unreadable", "forms": ()}
+    if not flags.get("echo"):
+        return {"state": "echo_absent", "reason": "echo_flag_clear", "forms": ()}
+    body = _delivered_echo_bytes(payload)
+    if transport.get("framed"):
+        body = BRACKETED_PASTE_START + body + BRACKETED_PASTE_END
+    special = {int(b) for b in (flags.get("special_bytes") or ())}
+    if special and any(byte in special for byte in body):
+        return {"state": "echo_unproven",
+                "reason": "control_byte_consumed_by_line_discipline", "forms": ()}
+    received_has_tab = 0x09 in body
+    received_has_newline = (0x0A in body) or (0x0D in body and bool(flags.get("icrnl")))
+    columns: tuple[int, ...] = (0,)
+    if flags.get("opost") and flags.get("tab_expand") and received_has_tab:
+        columns = tuple(range(TAB_STOP))
+    newline_rules: tuple[bool, ...] = (True,)
+    if (flags.get("opost") and flags.get("tab_expand") and received_has_tab
+            and received_has_newline and not flags.get("onlcr")
+            and not flags.get("onlret")):
+        newline_rules = (True, False)
+    forms: list[bytes] = []
+    for column in columns:
+        for rule in newline_rules:
+            form = _render_echo(body, flags, start_column=column,
+                                newline_resets_column=rule)
+            if form and form not in forms:
+                forms.append(form)
+    if not forms:
+        return {"state": "echo_absent", "reason": "empty_payload", "forms": ()}
+    return {"state": "echo_expected", "reason": "", "forms": tuple(forms)}
+
+
+def _occurrences(raw: bytes, forms: Sequence[bytes], lo: int, hi: int) -> list[tuple[int, int]]:
+    """Every DISTINCT span in ``raw[lo:hi]`` equal to one of ``forms`` (the whole form
+    inside the window), in raw-byte coordinates -- at EVERY start position.
+
+    Iteration-1 review B1: advancing the cursor by ``len(form)`` after a hit skipped a second
+    candidate that begins INSIDE the first, so payload ``aaa`` in ``aaaa`` was ``echo_proven``
+    at ``(0, 3)`` although ``(1, 4)`` is equally supported.  The cursor now advances by ONE
+    byte, so overlapping candidates are enumerated, and the result is a set of spans: two
+    distinct forms matching the same raw span are one candidate, any two distinct spans are
+    two.  Ambiguity is therefore decided by SPAN IDENTITY, not by search-loop behaviour.
+    """
+    found: set[tuple[int, int]] = set()
+    for form in forms:
+        cursor = lo
+        while True:
+            idx = raw.find(form, cursor, hi)
+            if idx == -1:
+                break
+            found.add((idx, idx + len(form)))
+            cursor = idx + 1
+    return sorted(found)
+
+
+def resolve_delivery_echo(raw: bytes,
+                          delivery_events: Sequence[Mapping[str, Any]] = ()) -> EchoResolution:
+    r"""The echo-provenance verdict over the RAW capture bytes for the recorded delivery
+    events -- in ONE coordinate space (raw capture bytes), fail-closed BY NAME.
+
+    Final Adversarial Review F-002, iteration-8 review B1.  Iterations 1-3 excluded by
+    content/position; iteration 5 by a bracketed-paste frame (not provenance -- an agent can
+    print those bytes); iterations 6-7 by a delivery *event* but mixed raw-byte offsets with
+    text indices; iteration 8 matched the delivered bytes byte-for-byte at the raw offset and
+    so assumed the pty echoes a write verbatim -- which it does not: the line discipline
+    translates LF to CRLF (``ONLCR``), renders control bytes as ``^X`` (``ECHOCTL``), expands
+    tabs, or echoes nothing at all (``ECHO`` clear, or a payload that left with the
+    ``execve``).
+
+    A span is PROVEN to be the echo of event *i* when ALL of these hold:
+
+    (a) it begins at or after the raw-byte ``offset`` the driver recorded at the write (the
+        capture size just before the bytes went out) and ends before the next event's offset;
+    (b) the event carries the `EchoTransport` recorded at that moment, and the transport
+        proves an echo is POSSIBLE (`pty_write` with ``ECHO`` set);
+    (c) the span EQUALS one of the forms :func:`expected_echo_forms` derives from the
+        delivered bytes and that transport;
+    (d) it is the ONLY DISTINCT such span in the window -- every start position of every
+        form is enumerated (overlapping candidates included), so ``aaa`` in ``aaaa`` is two
+        spans and therefore ambiguous, while two forms on one span are one candidate.
+
+    Anything less is not a guess: it is `echo_unproven` with a NAMED reason
+    (`ECHO_UNPROVEN_REASONS`), and an unproven echo excises NOTHING -- the refusal scan then
+    runs over the superset, so a refusal the runtime itself may have authored fires (a
+    fail-closed BLOCK, never a spurious pass) and `may_send_prompt` reports `unprovable`.
+    A transport that proves NO echo is possible (`argv`, or ``ECHO`` clear) is `echo_absent`:
+    nothing is excluded and nothing is unproven -- every captured byte is the agent's.
+    """
+    ordered: list[tuple[int, int, Mapping[str, Any], str]] = []
+    for index, ev in enumerate(delivery_events):
+        if not isinstance(ev, Mapping):
+            continue
+        payload = str(ev.get("payload") or "")
+        if not payload:
+            continue
+        ordered.append((int(ev.get("offset", 0) or 0), index, ev, payload))
+    if not ordered:
+        return {"state": "no_delivery", "reason": "", "spans": (), "events": ()}
+    ordered.sort(key=lambda item: (item[0], item[1]))
+    per_event: list[dict[str, Any]] = []
+    proven: list[tuple[int, int]] = []
+    first_unproven = ""
+    for position, (offset, index, ev, payload) in enumerate(ordered):
+        window_end = ordered[position + 1][0] if position + 1 < len(ordered) else len(raw)
+        window_end = max(window_end, offset)
+        entry: dict[str, Any] = {"index": index, "offset": offset, "window_end": window_end,
+                                 "state": "echo_unproven", "reason": "", "span": None,
+                                 "forms": 0}
+        transport = ev.get("transport")
+        if offset < 0:
+            # The recorded delivery began BEFORE this byte window: its echo is not provable
+            # here.  A provenance offset is never clamped to 0 (the iteration-6 bypass).
+            entry["reason"] = "delivery_before_window"
+        elif not isinstance(transport, Mapping):
+            entry["reason"] = "transport_unrecorded"
+        else:
+            derived = expected_echo_forms(payload, transport)
+            entry["forms"] = len(derived["forms"])
+            if derived["state"] == "echo_absent":
+                entry["state"] = "echo_absent"
+                entry["reason"] = derived["reason"]
+            elif derived["state"] == "echo_unproven":
+                entry["reason"] = derived["reason"]
+            else:
+                hits = _occurrences(raw, derived["forms"], offset, window_end)
+                if not hits:
+                    entry["reason"] = "echo_not_found"
+                elif len(hits) > 1:
+                    entry["reason"] = "ambiguous_multiple_matches"
+                else:
+                    entry["state"] = "echo_proven"
+                    entry["span"] = hits[0]
+                    proven.append(hits[0])
+        if entry["state"] == "echo_unproven" and not first_unproven:
+            first_unproven = f"event[{index}]:{entry['reason']}"
+        per_event.append(entry)
+    if first_unproven:
+        return {"state": "echo_unproven", "reason": first_unproven, "spans": (),
+                "events": tuple(per_event)}
+    if proven:
+        return {"state": "echo_proven", "reason": "", "spans": tuple(sorted(proven)),
+                "events": tuple(per_event)}
+    return {"state": "echo_absent", "reason": "", "spans": (), "events": tuple(per_event)}
+
+
+def _excise(raw: bytes, spans: Sequence[tuple[int, int]]) -> bytes:
+    if not spans:
+        return raw
+    out: list[bytes] = []
+    cursor = 0
+    for start, end in sorted(spans):
+        if start < cursor:                               # overlapping / already-excised span
+            cursor = max(cursor, end)
+            continue
+        out.append(raw[cursor:start])
+        cursor = end
+    out.append(raw[cursor:])
+    return b"".join(out)
+
+
+def strip_delivery_echo(raw: bytes, delivery_events: Sequence[Mapping[str, Any]] = ()) -> bytes:
+    """The RAW capture bytes with the runtime's OWN delivered-prompt echo removed -- ONLY
+    when :func:`resolve_delivery_echo` PROVES it (`echo_proven`).  Every other state
+    (`no_delivery`, `echo_absent`, `echo_unproven`) returns ``raw`` unchanged: nothing is
+    ever subtracted on a guess."""
+    if not raw or not delivery_events:
+        return raw
+    resolution = resolve_delivery_echo(raw, delivery_events)
+    if resolution["state"] != "echo_proven":
+        return raw
+    return _excise(raw, resolution["spans"])
+
+
+def _decode_capture(raw: bytes) -> str:
+    r"""Decode raw capture bytes the way `standalone_capture.transcript` does: UTF-8 with
+    ``errors="replace"``, then undo the pty's ``\r\n`` line-ending translation."""
+    return raw.decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "\n")
+
+
+def refusal_evidence(raw: bytes,
+                     delivery_events: Sequence[Mapping[str, Any]] = (),
+                     *, structured_refusal: Any = None,
+                     blocked_hint: bool = False) -> dict[str, Any]:
+    """Refusals over a capture, with echo PROVENANCE and STRUCTURED-FIRST classification.
+
+    1. :func:`resolve_delivery_echo` partitions the raw bytes.  Only an `echo_proven` span
+       is excised; an unproven echo leaves the superset in place (fail closed) and is named
+       in the returned ``echo`` block.
+    2. The remainder is decoded exactly as the capture's ``transcript`` view and split into
+       STRUCTURED records (lines that parse as JSON objects on the CLI's own channel) and
+       FREE TEXT (everything else), by the same rule as `standalone_capture.structured_lines`.
+    3. Structured records are consulted FIRST, through ``structured_refusal`` -- the driver's
+       typed-marker predicate over one parsed record (the profile's declared auth/setup
+       markers).  A hit fires the refusal with ``source == "structured"``.
+    4. Only when no structured record fires is the free text scanned by the portable
+       patterns (``source == "free_text"``).  Prose INSIDE a structured record -- an assistant
+       message, a tool result quoting the task, a replayed prompt -- is that record's
+       content, never a terminal gate, and is not pattern-matched: post-delivery free text is
+       a fallback, never an override of what the structured channel already typed.
+    """
+    echo = resolve_delivery_echo(raw, delivery_events)
+    remainder = _excise(raw, echo["spans"]) if echo["state"] == "echo_proven" else raw
+    text = _decode_capture(remainder)
+    records: list[Mapping[str, Any]] = []
+    prose: list[str] = []
+    for parsed, line in structured_lines(text):
+        if parsed is not None:
+            records.append(parsed)
+        else:
+            prose.append(line)
+    hit: dict[str, Any] | None = None
+    if structured_refusal is not None:
+        for record in records:
+            marker = structured_refusal(record)
+            if marker:
+                hit = {"record_type": record.get("type"), "marker": marker}
+                break
+    if hit is not None:
+        refusals: tuple[str, ...] = ("blocked_prompt_beats_idle",)
+        source = "structured"
+    else:
+        refusals = classify_refusals("\n".join(prose), blocked_hint=blocked_hint)
+        source = "free_text" if refusals else "none"
+    return {"refusals": refusals, "source": source, "echo": echo, "structured_hit": hit,
+            "structured_records": len(records), "free_text_lines": len(prose)}
+
+
+def classify_refusals_in_capture(raw: bytes,
+                                 delivery_events: Sequence[Mapping[str, Any]] = (),
+                                 *, blocked_hint: bool = False,
+                                 structured_refusal: Any = None) -> tuple[str, ...]:
+    """The refusal tuple of :func:`refusal_evidence`.  Exclusion is applied on the RAW bytes
+    at the recorded raw-byte offset under the recorded transport BEFORE any decode, so a
+    byte offset is never compared with a character index (F-002 coordinate integrity)."""
+    return refusal_evidence(raw, delivery_events, structured_refusal=structured_refusal,
+                            blocked_hint=blocked_hint)["refusals"]
+
+
+def classify_refusals(text: str, *, blocked_hint: bool = False) -> tuple[str, ...]:
+    """Refusals derived from OBSERVED TEXT.  Text may only subtract, and this function does
+    NOT subtract on its own: it scans exactly the text it is given.
+
+    F-002: there is deliberately no ``exclude_text`` content parameter any more.  A caller
+    that must exclude the runtime's own delivered echo passes text already narrowed by
+    :func:`strip_delivery_echo` (bound to the recorded delivery event, not to content or to
+    markers).  So the pure probe ``classify_refusals("login required")`` FIRES -- a bare
+    refusal string is never silently dropped -- and the only exclusion anywhere is a span
+    that provably equals a delivered payload at/after the offset the driver recorded.
+    """
     fired: list[str] = []
     if blocked_hint:
         fired.append("blocked_prompt_beats_idle")
-    if isinstance(scanned, str) and scanned:
-        for pattern in BLOCKING_PROMPT_PATTERNS:
-            if pattern.search(scanned):
+    if isinstance(text, str) and text:
+        # Scanned BOTH as given and with terminal control sequences removed: a CSI/OSC
+        # sequence glued to a word (``ESC[1mlogin``) is invisible on screen but defeats a
+        # word boundary, so the stripped view can only ADD a match, never remove one.
+        for view in (text, _strip_control_sequences(text)):
+            if any(pattern.search(view) for pattern in BLOCKING_PROMPT_PATTERNS):
                 if "blocked_prompt_beats_idle" not in fired:
                     fired.append("blocked_prompt_beats_idle")
                 break
     return tuple(fired)
+
+
+#: CSI (``ESC [ ... final``), OSC (``ESC ] ... BEL`` / ``ESC \``) and two-byte ESC sequences
+#: -- what a terminal consumes without displaying.
+_CONTROL_SEQUENCE = re.compile(
+    r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\].*?(?:\x07|\x1b\\)|\x1b[@-Z\\-_]", re.DOTALL)
+
+
+def _strip_control_sequences(text: str) -> str:
+    return _CONTROL_SEQUENCE.sub("", text)
 
 
 # ---- D5.3(2) the four surfaces, four separate orderings --------------------------------
@@ -542,9 +906,30 @@ def may_send_prompt(evidence: Mapping[str, Any], *, minted_session_id: str,
     ``READY``, and never "not ready" as an established fact.
     """
     refusals = list(evidence.get("refusals") or ())
-    echoed = str(evidence.get("delivered_payload") or "")
+    # `evidence["refusals"]` is authoritative: the driver computed it over the FULL raw
+    # capture in ONE coordinate space (byte offsets), excluding only the proven delivery echo.
+    # A supplementary observation is a TAIL of the capture; it can only ADD a refusal (never
+    # remove one).  When it carries its RAW bytes and the absolute byte `start_offset` where
+    # they begin, the delivery event's raw-byte offset is translated into that window
+    # (`offset - start_offset`) and the echo is excluded in raw-byte space too -- a byte
+    # offset is never compared with a character index (iteration-8 B1).  An observation with
+    # no raw bytes cannot establish provenance, so it adds nothing beyond the authoritative
+    # scan (never clamps an offset to 0, never re-derives it with character lengths).
+    delivery_events = tuple(ev for ev in (evidence.get("delivery_events") or ())
+                            if isinstance(ev, Mapping) and ev.get("payload"))
     for observation in evidence.get("supplementary") or ():
-        for code in classify_refusals(observation.get("text", ""), exclude_text=echoed):
+        raw = observation.get("raw")
+        if not isinstance(raw, (bytes, bytearray)):
+            continue                                     # no byte provenance -> add nothing
+        start = int(observation.get("start_offset", 0) or 0)
+        # The event travels WHOLE -- offset translated, transport untouched -- so the tail
+        # is partitioned under the same proven transformation as the authoritative scan.
+        # An event whose echo lies before the tail resolves `delivery_before_window` in
+        # this window and excises nothing; that is a property of the window, not of the
+        # capture, so it adds no refusal and does not by itself make S3 unprovable.
+        preview_events = tuple({**dict(ev), "offset": int(ev.get("offset", 0) or 0) - start}
+                               for ev in delivery_events)
+        for code in classify_refusals_in_capture(bytes(raw), preview_events):
             if code not in refusals:
                 refusals.append(code)
     verdict = decide_readiness(
@@ -552,9 +937,25 @@ def may_send_prompt(evidence: Mapping[str, Any], *, minted_session_id: str,
         minted_session_id=minted_session_id,
         declared_record_types=declared_record_types,
         structured_channel_readable=structured_channel_readable)
+    # F-002 / B1, fail closed BY NAME: when the driver's authoritative scan could not prove
+    # the delivered echo's provenance, the refusal partition is undecided.  No refusal fired
+    # over the superset is NOT the same as "no refusal" being established, so the verdict is
+    # `unprovable` -- named after the echo state -- and never `ready`.  A refusal that did
+    # fire keeps precedence: R-C already refused on the superset.
+    echo = evidence.get("echo")
+    if (verdict["verdict"] == "ready" and isinstance(echo, Mapping)
+            and echo.get("state") == "echo_unproven"):
+        verdict = {"verdict": "unprovable",
+                   "reason": f"echo_unproven:{echo.get('reason', '')}",
+                   "quorum": verdict["quorum"]}
     if verdict["verdict"] != "ready" and deadline_expired:
+        # The deadline verdict CARRIES the verdict it expired on, so a readiness timeout
+        # caused by an unproven echo settles as `deadline_expired` WITH `echo_unproven:...`
+        # visible in the journal row and the failure reason, not as a bare timeout.
         return {"verdict": "unprovable", "reason": "deadline_expired",
-                "quorum": verdict["quorum"]}
+                "quorum": verdict["quorum"],
+                "expired_on": {"verdict": verdict["verdict"],
+                               "reason": verdict.get("reason", "")}}
     return verdict
 
 

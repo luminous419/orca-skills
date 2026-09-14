@@ -30,11 +30,13 @@ import math
 import os
 import re
 from collections.abc import Mapping, Sequence
-from typing import Any, TypedDict
+from typing import Any, NotRequired, TypedDict
 
 from . import standalone_capture as capture
-from .standalone_lifecycle import (DELIVERY_OUTCOMES, DELIVERY_PROOFS, EVIDENCE_TIERS,
-                                   classify_refusals, decide_readiness)
+from .standalone_lifecycle import (BRACKETED_PASTE_END, BRACKETED_PASTE_START,
+                                   DELIVERY_OUTCOMES, DELIVERY_PROOFS, EVIDENCE_TIERS)
+from .standalone_lifecycle import ESC_REPLACEMENT as _LIFECYCLE_ESC_REPLACEMENT
+from .standalone_lifecycle import decide_readiness, refusal_evidence
 from .standalone_profile import (DELIVERY_MODES, IDENTITY_BINDINGS, RESUME_CHANNELS,
                                  StandaloneProfile)
 
@@ -44,11 +46,11 @@ from .standalone_profile import (DELIVERY_MODES, IDENTITY_BINDINGS, RESUME_CHANN
 EVIDENCE_KINDS = ("readiness", "turn_start", "wait", "delivery_proof", "completion", "exit")
 
 #: Paste-bracket framing.  `ESC[200~` ... `ESC[201~`.
-BRACKET_START = b"\x1b[200~"
-BRACKET_END = b"\x1b[201~"
+BRACKET_START = BRACKETED_PASTE_START
+BRACKET_END = BRACKETED_PASTE_END
 #: Every raw ESC in the PAYLOAD becomes these seven literal characters, so prompt text
 #: cannot inject a control sequence into the frame that carries it.
-ESC_REPLACEMENT = b"<ESC>"
+ESC_REPLACEMENT = _LIFECYCLE_ESC_REPLACEMENT          # ONE definition: the echo model's
 
 
 class DriverEvidence(TypedDict):
@@ -447,6 +449,11 @@ class DeliveryResult(TypedDict):
     proof: str | None
     frame_bytes: int
     settle_ms: int
+    #: F-002 / B1: the echo-provenance verdict the verifier partitioned the post-write
+    #: bytes by (`lifecycle.resolve_delivery_echo`), or ``None`` when no verification ran.
+    echo: Mapping[str, Any] | None
+    #: The refusals a `blocked` verification fired, when it did.
+    refusals: NotRequired[tuple[str, ...]]
 
 
 def deliver(master_fd: int, payload: str, *, profile: StandaloneProfile,
@@ -468,13 +475,13 @@ def deliver(master_fd: int, payload: str, *, profile: StandaloneProfile,
         write_frame(master_fd, frame, writer=writer)
     except OSError:
         return {"delivery": "not_writable", "proof": None, "frame_bytes": len(frame),
-                "settle_ms": settle}
+                "settle_ms": settle, "echo": None}
     pause(settle / 1000.0)
     try:
         write_frame(master_fd, b"\r", writer=writer)
     except OSError:
         return {"delivery": "not_writable", "proof": None, "frame_bytes": len(frame),
-                "settle_ms": settle}
+                "settle_ms": settle, "echo": None}
     outcome = verify(baseline_working)
     proof = outcome.get("proof")
     delivery = outcome.get("delivery", "not_observed")
@@ -482,8 +489,12 @@ def deliver(master_fd: int, payload: str, *, profile: StandaloneProfile,
         raise ValueError(f"delivery {delivery!r} is not a closed-set member")
     if proof is not None and proof not in DELIVERY_PROOFS:
         raise ValueError(f"proof {proof!r} is not a closed-set member")
-    return {"delivery": delivery, "proof": proof, "frame_bytes": len(frame),
-            "settle_ms": settle}
+    result: DeliveryResult = {"delivery": delivery, "proof": proof,
+                              "frame_bytes": len(frame), "settle_ms": settle,
+                              "echo": outcome.get("echo")}
+    if outcome.get("refusals"):
+        result["refusals"] = tuple(outcome["refusals"])
+    return result
 
 
 # ---- the driver base -------------------------------------------------------------------
@@ -602,13 +613,28 @@ class _Driver:
         KNOWN, not unverified.
         """
         for record in self.structured_records(text):
-            for field_path, expected in self.profile.auth_markers:
-                observed = _dig(record, field_path)
-                if observed is None:
-                    continue
-                if str(observed).lower() == str(expected).lower():
-                    return {"field": field_path, "expected": expected,
-                            "record_type": record.get("type"), "at": _now_iso()}
+            marker = self.structured_refusal(record)
+            if marker is not None:
+                return marker
+        return None
+
+    def structured_refusal(self, record: Mapping[str, Any]) -> dict[str, Any] | None:
+        """ONE parsed record against the profile's DECLARED auth/setup markers.
+
+        F-002 / B1 (structured-first refusal provenance): this is the predicate
+        `lifecycle.refusal_evidence` consults BEFORE any free-text pattern.  A record is a
+        refusal only through a declared typed field; the prose inside a record -- an
+        assistant message, a tool result, a replayed prompt -- is never pattern-matched.
+        """
+        if not isinstance(record, Mapping):
+            return None
+        for field_path, expected in self.profile.auth_markers:
+            observed = _dig(record, field_path)
+            if observed is None:
+                continue
+            if str(observed).lower() == str(expected).lower():
+                return {"field": field_path, "expected": expected,
+                        "record_type": record.get("type"), "at": _now_iso()}
         return None
 
     # -- parsing -------------------------------------------------------------------------
@@ -625,33 +651,57 @@ class _Driver:
     # -- D4.5: TWO methods, TWO disjoint return types ------------------------------------
     def readiness_evidence(self, text: str, *, minted_session_id: str,
                            liveness: Mapping[str, Any] | None,
-                           delivered_payload: str = "") -> dict[str, Any]:
+                           raw: bytes | None = None,
+                           delivery_events: Sequence[Mapping[str, Any]] = ()) -> dict[str, Any]:
         """S3 evidence ONLY.  Can never express a completion.
 
         Builds the three-part quorum record: R-A comes in as ``liveness`` (built from the OS
         by :mod:`standalone_pty`, reading zero terminal bytes), R-B is looked for on the
-        structured channel, refusals come from text, and every title/screen reading is
+        structured channel, refusals come from the capture, and every title/screen reading is
         segregated into ``supplementary``.
 
-        ``delivered_payload`` (L1) is the runtime's own delivered prompt: its lines are
-        excluded from the refusal scan and carried on the evidence so `may_send_prompt`'s
-        supplementary re-scan excludes them too, because the echo of a task that describes
-        a login prompt is not a login prompt.
+        F-002 / B1 (provenance): the refusal scan is `lifecycle.refusal_evidence` over the
+        RAW capture bytes when the runtime supplies them.  It excises ONLY a span PROVEN to
+        be the delivered payload's echo -- at/after the recorded raw-byte offset, equal to a
+        form derived from the transport recorded at the write -- and otherwise names the
+        echo state (`echo_absent` / `echo_unproven`) without subtracting anything.  It
+        consults STRUCTURED records first, through :meth:`structured_refusal` (the profile's
+        declared markers), and pattern-matches only the free text that is not a structured
+        record.  ``text`` (the decoded transcript) is still used for the bound-signal check
+        and the screen preview.  When no raw bytes are supplied (a text-only caller with no
+        delivery to exclude) the same structured-first scan runs over the encoded text with
+        no delivery event.  The screen preview carries its own raw bytes and the absolute
+        byte ``start_offset`` so a downstream supplementary re-scan stays in the same byte
+        coordinate space.
         """
         bound = self.bound_readiness_signal(
             text, minted_session_id=minted_session_id,
             adopt=(self.profile.identity_binding == "adopted"
                    and not minted_session_id))
-        refusals = classify_refusals(text, exclude_text=delivered_payload)
+        if raw is not None:
+            scan = refusal_evidence(raw, delivery_events,
+                                    structured_refusal=self.structured_refusal)
+        else:
+            scan = refusal_evidence(text.encode("utf-8", "replace"), (),
+                                    structured_refusal=self.structured_refusal)
+        refusals = scan["refusals"]
         supplementary: list[dict[str, Any]] = []
         if text.strip():
-            supplementary.append({"tier": "screen_preview", "text": text[-2000:],
-                                  "live_observed": liveness is not None,
-                                  "at": _now_iso()})
+            observation: dict[str, Any] = {"tier": "screen_preview", "text": text[-2000:],
+                                           "live_observed": liveness is not None,
+                                           "at": _now_iso()}
+            if raw is not None:
+                preview_raw = raw[-2000:]
+                observation["raw"] = preview_raw
+                observation["start_offset"] = len(raw) - len(preview_raw)
+            supplementary.append(observation)
         return {"liveness": dict(liveness) if liveness else None,
                 "bound_signal": bound, "refusals": refusals,
-                "supplementary": tuple(supplementary),
-                "delivered_payload": delivered_payload}
+                "refusal_source": scan["source"], "echo": scan["echo"],
+                "structured_hit": scan["structured_hit"],
+                "delivery_events": tuple(dict(ev) for ev in delivery_events
+                                         if isinstance(ev, Mapping)),
+                "supplementary": tuple(supplementary)}
 
     def completion_evidence(self, text: str, *, exit_status: int | None,
                             exit_proven: bool,

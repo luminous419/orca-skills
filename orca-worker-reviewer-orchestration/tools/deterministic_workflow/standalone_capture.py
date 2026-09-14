@@ -267,6 +267,21 @@ class BoundedCapture:
         except OSError:
             return ""
 
+    def raw(self, cursor: int = 0) -> bytes:
+        r"""The whole capture from the RAW byte offset ``cursor``, UNDECODED.
+
+        Delivery provenance is byte-addressable: the delivery event records a byte offset
+        (``size`` at the write), so the echo must be matched and excluded on THESE bytes,
+        before any UTF-8 decode or ``\r\n`` translation shifts positions (F-002 coordinate
+        integrity).  ``cursor`` is a byte offset into the same space as :attr:`size`.
+        """
+        try:
+            with open(self.path, "rb") as handle:
+                handle.seek(cursor)
+                return handle.read()
+        except OSError:
+            return b""
+
     @property
     def size(self) -> int:
         try:

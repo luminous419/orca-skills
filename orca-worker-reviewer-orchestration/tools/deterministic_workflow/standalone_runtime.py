@@ -283,16 +283,22 @@ class StandaloneSession:
         self.event_log: list[str] = []
         self.state = "STARTING"
         self.lost_reason = ""
-        #: The runtime's OWN delivered prompt, for L1: refusal scans exclude its echo.
-        #: Set the moment a payload is handed to the pty (on the argv for
-        #: `launch_with_prompt`, at `send` for `post_ready_delivery`); "" until then.
-        self._delivered_payload = ""
         self._child_env: dict[str, str] = {}
         #: The ADOPTED identity (D4.4 A-1..A-6), frozen on first acceptance and compared by
         #: EQUALITY forever after.  Empty means "not yet observed", never "any id will do".
         self.adopted_id = ""
         #: The `DELIVERY_INTENT` this dispatch journalled before its fork, or ``None``.
         self.delivery_intent: dict[str, Any] | None = None
+        #: F-002 / B1: the DELIVERY EVENTS observed at the driver/capture boundary -- one
+        #: per payload actually handed over -- each ``{offset, payload, transport, at}``
+        #: where ``offset`` is the capture size just before the write and ``transport`` is
+        #: the `EchoTransport` read AT that moment (`standalone_pty.echo_transport`: the
+        #: kind -- `argv` / `pty_write` -- the framing, and the pty's live termios).
+        #: `lifecycle.resolve_delivery_echo` excludes ONLY a span PROVEN to be that
+        #: payload's echo under that transport, at/after that offset; anything it cannot
+        #: prove is named `echo_unproven` and excludes nothing.  Empty until a prompt is
+        #: delivered.
+        self.delivery_events: list[dict[str, Any]] = []
         #: The `DeliveryProof` this dispatch constructed, or ``None``.  ``None`` never
         #: settles anything: D4.3c's precedence rule lets a typed terminal outcome settle a
         #: run whether or not a proof was ever constructed.
@@ -899,11 +905,6 @@ class StandaloneSession:
         # into the DELIVERY_INTENT record is taken from THIS value, so what is journalled
         # is always what is handed over.
         payload = payload if payload is not None else _canonical(self.intent)
-        # L1: for `launch_with_prompt` the prompt leaves on the argv, so a CLI that echoes
-        # its input has the prompt in the transcript before readiness is even scanned.
-        # Record it now so every refusal scan below excludes the runtime's own content.
-        if self.profile.delivery_mode == "launch_with_prompt":
-            self._delivered_payload = payload
         receipt = self.start(lease_token=lease_token, payload=payload, **start_kwargs)
         if receipt["start_outcome"] != "ready":
             raise StandaloneDispatchFailed(
@@ -920,6 +921,17 @@ class StandaloneSession:
             # WRITE -- but it still gates every advance out of `STARTING`, and nothing is
             # accepted on weaker evidence than in the other mode.  So a quorum that does not
             # close is still a NAMED failure here and delivery is not even attempted.
+            # F-002 / B1: the prompt was handed over at process creation -- it never entered
+            # the pty input queue, so the line discipline CANNOT have echoed it.  The
+            # delivery event records exactly that transport (`kind="argv"`), which the
+            # provenance model resolves to `echo_absent`: every captured byte is the
+            # agent's, nothing is excluded, and nothing is unproven.
+            if payload:
+                self.delivery_events.append({
+                    "offset": 0, "payload": payload,
+                    "transport": pty_supervisor.echo_transport(
+                        None, kind="argv", framed=False, cols=self.profile.cols),
+                    "at": _now_iso()})
             admission = self.await_ready()
             if admission["state"] != "READY":
                 # ONE exception, and it is D4.3c's precedence rule rather than a loophole: a
@@ -934,7 +946,7 @@ class StandaloneSession:
                 if self.driver.completion_record(self.capture.transcript()) is None:
                     raise StandaloneDispatchFailed(
                         "readiness_timed_out",
-                        str(admission["verdict"].get("reason", "")), receipt)
+                        _readiness_failure_reason(admission["verdict"]), receipt)
                 self._journal(kind="EVENT", derived_from="capture",
                               event="evidence_unreadable", state=self.state,
                               vocabulary={"detail": "the admission quorum did not close, "
@@ -961,7 +973,7 @@ class StandaloneSession:
                 # readiness timeout.
                 raise StandaloneDispatchFailed(
                     "readiness_timed_out",
-                    str(readiness["verdict"].get("reason", "")), receipt)
+                    _readiness_failure_reason(readiness["verdict"]), receipt)
             delivery = self.send({"payload": payload})
             if delivery["delivery"] != "delivered_confirmed":
                 # I-2: a proof, never the absence of a failure.  `not_observed` is NEVER
@@ -2017,7 +2029,8 @@ class StandaloneSession:
         binding_id = self._binding_identity(text)
         evidence = self.driver.readiness_evidence(
             text, minted_session_id=binding_id, liveness=liveness,
-            delivered_payload=self._delivered_payload)
+            raw=self.capture.raw(),                      # F-002: byte-addressable provenance
+            delivery_events=tuple(self.delivery_events))
         verdict = lifecycle.may_send_prompt(
             evidence, minted_session_id=binding_id,
             declared_record_types=[s.record_type
@@ -2038,6 +2051,8 @@ class StandaloneSession:
                                               process_liveness="live",
                                               cleanup_authority="not_authorized"),
                               vocabulary={"quorum": verdict["quorum"],
+                                          "echo": _journal_echo(evidence.get("echo")),
+                                          "refusal_source": evidence.get("refusal_source"),
                                           "pid": self.record["pid"],
                                           "captured_tty": self.record["captured_tty"]})
         return verdict
@@ -2175,8 +2190,6 @@ class StandaloneSession:
         identity.require_permit(permit, self.record, "write_input")
         payload = command.get("payload") if isinstance(command, Mapping) else None
         text = payload if isinstance(payload, str) else _canonical(command)
-        # L1: the bytes about to be written are the runtime's own; their echo is not UI.
-        self._delivered_payload = text
         baseline = self.capture.size
         rate = self._measured_ingest_rate
         if rate is None:
@@ -2185,10 +2198,22 @@ class StandaloneSession:
             # the child is not currently reading.  See `measure_ingest_rate`.
             rate = preflight_mod.measure_ingest_rate()
             self._measured_ingest_rate = rate
+        # F-002 / B1: record the DELIVERY EVENT at the moment of the write -- the capture
+        # offset just before the bytes go out, the exact payload, and the TRANSPORT the
+        # bytes go through: a bracketed-paste frame into a pty whose termios is read NOW
+        # (the agent may have changed it since spawn).  This record, not a marker in the
+        # output, is what `lifecycle.resolve_delivery_echo` derives the expected echo from.
+        delivery_event = {"offset": int(baseline), "payload": text,
+                          "transport": pty_supervisor.echo_transport(
+                              int(self.pty["master_fd"]), kind="pty_write", framed=True,
+                              cols=self.profile.cols),
+                          "at": _now_iso()}
+        self.delivery_events.append(delivery_event)
         result = drivers.deliver(
             int(self.pty["master_fd"]), text, profile=self.profile,
             measured_ingest_rate=rate,
-            verify=lambda working: self._verify_delivery(baseline, working))
+            verify=lambda working: self._verify_delivery(baseline, working,
+                                                         event=delivery_event))
         self.event_log.append("prompt_written")
         if result["delivery"] == "delivered_confirmed":
             self.event_log.append("delivery_proof_observed")
@@ -2205,32 +2230,59 @@ class StandaloneSession:
                                   "proof": result["proof"],
                                   "frame_bytes": result["frame_bytes"],
                                   "settle_ms": result["settle_ms"],
+                                  # F-002 / B1: the echo-provenance verdict and the
+                                  # transport it was derived from, journalled so an
+                                  # `echo_unproven` delivery is visible in the settlement.
+                                  "echo": _journal_echo(result.get("echo")),
+                                  "refusals": list(result.get("refusals") or ()),
+                                  "transport": dict(delivery_event["transport"]),
                                   "pid": self.record["pid"],
                                   "captured_tty": self.record["captured_tty"]})
         return {"intent_id": self.intent_id, **result}
 
-    def _verify_delivery(self, baseline: int, baseline_working: bool) -> dict[str, Any]:
+    def _verify_delivery(self, baseline: int, baseline_working: bool, *,
+                         event: Mapping[str, Any] | None = None) -> dict[str, Any]:
         """Poll for one of the three named proofs, bounded.
 
         The third proof -- the output sequence advanced -- is admissible ONLY when the agent
         was already working at baseline; otherwise advancing output is just the echo of our
         own frame.
+
+        F-002 / B1: the refusal scan is `lifecycle.refusal_evidence` over the RAW capture
+        bytes from ``baseline`` -- the same byte offset the delivery ``event`` recorded
+        (`capture.size`) -- with the event translated to raw-byte 0 of that slice and its
+        recorded TRANSPORT carried whole.  Only a span proven to be the frame's echo under
+        that transport is excluded; a refusal that is not the delivered payload -- including
+        one identical to task text, whatever ESC / multi-byte bytes precede it -- fires, and
+        an unproven echo excludes nothing and is named in the result.  The `screen_echo`
+        proof is that same PROVEN echo (`echo_proven`): the frame's bytes at the recorded
+        offset under the recorded transport, never the marker string found anywhere.
         """
         deadline = self._clock() + \
             self.profile.timeouts.delivery_verify_timeout_ms / 1000.0
+        events = ({**dict(event), "offset": 0},) if event and event.get("payload") else ()
+        scan: dict[str, Any] = {"refusals": (), "echo": {"state": "no_delivery",
+                                                         "reason": "", "spans": (),
+                                                         "events": ()}}
         while self._clock() < deadline:
             self.pump()
+            scan = lifecycle.refusal_evidence(
+                self.capture.raw(baseline), events,
+                structured_refusal=self.driver.structured_refusal)
+            if scan["refusals"]:
+                return {"delivery": "blocked", "proof": None,
+                        "refusals": scan["refusals"], "echo": scan["echo"]}
             text = self.capture.transcript(baseline)
-            if classify := lifecycle.classify_refusals(
-                    text, exclude_text=self._delivered_payload):
-                return {"delivery": "blocked", "proof": None, "refusals": classify}
             if self.driver.turn_start_evidence(text) is not None:
-                return {"delivery": "delivered_confirmed", "proof": "turn_start"}
-            if _frame_echoed(text):
-                return {"delivery": "delivered_confirmed", "proof": "screen_echo"}
+                return {"delivery": "delivered_confirmed", "proof": "turn_start",
+                        "echo": scan["echo"]}
+            if scan["echo"]["state"] == "echo_proven":
+                return {"delivery": "delivered_confirmed", "proof": "screen_echo",
+                        "echo": scan["echo"]}
             if baseline_working and self.capture.size > baseline:
-                return {"delivery": "delivered_confirmed", "proof": "output_sequence"}
-        return {"delivery": "not_observed", "proof": None}
+                return {"delivery": "delivered_confirmed", "proof": "output_sequence",
+                        "echo": scan["echo"]}
+        return {"delivery": "not_observed", "proof": None, "echo": scan["echo"]}
 
     # -- status --------------------------------------------------------------------------
     def status(self) -> dict[str, Any]:
@@ -2490,8 +2542,29 @@ def _canonical(command: Mapping[str, Any]) -> str:
     return _json.dumps(dict(command), sort_keys=True, ensure_ascii=False)
 
 
-def _frame_echoed(text: str) -> bool:
-    return "\x1b[200~" in text or "<ESC>[200~" in text
+def _readiness_failure_reason(verdict: Mapping[str, Any]) -> str:
+    """The NAMED reason a readiness wait failed on.  A `deadline_expired` verdict carries the
+    verdict it expired on (`expired_on`), so an `echo_unproven` timeout settles as
+    ``deadline_expired(echo_unproven:...)`` rather than as a bare timeout."""
+    reason = str(verdict.get("reason", ""))
+    expired_on = verdict.get("expired_on")
+    if isinstance(expired_on, Mapping) and expired_on.get("reason"):
+        return f"{reason}({expired_on['reason']})"
+    return reason
+
+
+def _journal_echo(echo: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """The journal-safe form of an `EchoResolution`: state, reason and the per-event
+    verdicts (offsets and spans as plain ints) -- never the payload bytes."""
+    if not isinstance(echo, Mapping):
+        return None
+    return {"state": str(echo.get("state", "")), "reason": str(echo.get("reason", "")),
+            "spans": [[int(a), int(b)] for a, b in (echo.get("spans") or ())],
+            "events": [{"index": int(e.get("index", 0)), "offset": int(e.get("offset", 0)),
+                        "state": str(e.get("state", "")), "reason": str(e.get("reason", "")),
+                        "span": [int(e["span"][0]), int(e["span"][1])]
+                        if e.get("span") else None}
+                       for e in (echo.get("events") or ()) if isinstance(e, Mapping)]}
 
 
 def _now_iso() -> str:

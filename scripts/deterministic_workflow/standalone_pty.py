@@ -980,6 +980,98 @@ def _set_raw(fd: int) -> None:
         pass
 
 
+#: The `termios` special characters the line discipline may CONSUME (a signal, a line
+#: edit, flow control) instead of echoing -- each gated on the mode flag that arms it.
+#: Read from the live `c_cc` array, never from a table of "usual" bindings.
+_SPECIAL_CC_BY_FLAG = (
+    ("isig", ("VINTR", "VQUIT", "VSUSP", "VDSUSP")),
+    ("icanon", ("VEOF", "VEOL", "VEOL2", "VERASE", "VKILL", "VWERASE", "VREPRINT",
+                "VERASE2")),
+    ("iexten", ("VLNEXT", "VDISCARD", "VSTATUS")),
+    ("ixon", ("VSTART", "VSTOP")),
+)
+_POSIX_VDISABLE = 0xFF
+
+
+def _cc_byte(cc: Sequence[Any], name: str) -> int | None:
+    index = getattr(termios, name, None)
+    if index is None or index >= len(cc):
+        return None
+    value = cc[index]
+    if isinstance(value, (bytes, bytearray)):
+        return value[0] if value else None
+    if isinstance(value, int):
+        return value
+    return None
+
+
+def termios_evidence(fd: int) -> dict[str, Any] | None:
+    """The line-discipline flags that decide WHAT an echo of a write to ``fd`` looks like.
+
+    F-002 / B1 (iteration-8 review).  Read with ``tcgetattr`` on the pty MASTER at delivery
+    time: the master and slave share one termios, so this is the slave's CURRENT mode --
+    including whatever the agent itself set after ``execve`` -- and not the mode this
+    runtime configured at spawn.  ``None`` when it cannot be read; the lifecycle then
+    reports the echo as `echo_unproven`, never guesses a transformation.
+
+    Every value is a plain bool/int so the record can travel in evidence and in the journal.
+    ``special_bytes`` are the ``c_cc`` bytes the discipline would CONSUME rather than echo
+    under the flags in force; a payload carrying one of them has no derivable echo.
+    """
+    try:
+        mode = termios.tcgetattr(fd)
+    except (termios.error, OSError, ValueError):
+        return None
+    iflag, oflag, _cflag, lflag, _ispeed, _ospeed, cc = mode
+    # Tab expansion is `TAB3` on both kernels: Linux spells it `XTABS == TAB3 == TABDLY`,
+    # BSD/macOS `OXTABS == TAB3` (a single bit inside `TABDLY`).  Testing the `TAB3` bits
+    # for equality is the one check that is exact on both.
+    tab3 = getattr(termios, "TAB3", 0)
+    flags = {
+        "echo": bool(lflag & termios.ECHO),
+        "echoctl": bool(lflag & getattr(termios, "ECHOCTL", 0)),
+        "icanon": bool(lflag & termios.ICANON),
+        "isig": bool(lflag & termios.ISIG),
+        "iexten": bool(lflag & getattr(termios, "IEXTEN", 0)),
+        "ixon": bool(iflag & termios.IXON),
+        "opost": bool(oflag & termios.OPOST),
+        "onlcr": bool(oflag & termios.ONLCR),
+        "ocrnl": bool(oflag & getattr(termios, "OCRNL", 0)),
+        "onocr": bool(oflag & getattr(termios, "ONOCR", 0)),
+        "onlret": bool(oflag & getattr(termios, "ONLRET", 0)),
+        "tab_expand": bool(tab3) and (oflag & tab3) == tab3,
+        "icrnl": bool(iflag & termios.ICRNL),
+        "inlcr": bool(iflag & termios.INLCR),
+        "igncr": bool(iflag & termios.IGNCR),
+    }
+    special: set[int] = set()
+    for flag, names in _SPECIAL_CC_BY_FLAG:
+        if not flags[flag]:
+            continue
+        for name in names:
+            value = _cc_byte(cc, name)
+            if value is not None and value != _POSIX_VDISABLE:
+                special.add(int(value))
+    flags["special_bytes"] = sorted(special)
+    return flags
+
+
+def echo_transport(fd: int | None, *, kind: str, framed: bool, cols: int) -> dict[str, Any]:
+    """The `EchoTransport` record for ONE delivery, read at the moment of that delivery.
+
+    ``kind`` is ``"argv"`` when the payload left with the ``execve`` (the line discipline
+    never saw it, so it cannot echo it) and ``"pty_write"`` when it was written to the pty.
+    ``framed`` says whether a bracketed-paste frame was written around it.  The termios
+    block is the evidence the lifecycle derives the expected echo FROM; it is ``None``, not
+    a default, when it could not be read.
+    """
+    record: dict[str, Any] = {"kind": kind, "framed": bool(framed), "cols": int(cols),
+                              "termios": None, "read_at": _now_iso()}
+    if kind == "pty_write" and fd is not None and fd >= 0:
+        record["termios"] = termios_evidence(fd)
+    return record
+
+
 def _set_winsize(fd: int, rows: int, cols: int) -> None:
     try:
         fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))

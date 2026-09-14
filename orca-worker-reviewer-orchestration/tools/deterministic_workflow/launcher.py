@@ -324,7 +324,13 @@ STANDALONE_PROFILE_DIGEST_MISMATCH = "STANDALONE_PROFILE_DIGEST_MISMATCH"
 #: migration is a deliberate, attributable, CHANGING act, not a silent re-bind.
 STANDALONE_MIGRATION_REFUSED = "STANDALONE_MIGRATION_REFUSED"
 #: The durable audit-log schema for a profile migration.
-STANDALONE_MIGRATION_SCHEMA = "os37.standalone_profile_migration.v1"
+STANDALONE_MIGRATION_SCHEMA = "os37.standalone_profile_migration.v2"
+#: The three states a migration record carries (F-001).  A migration is durable only when a
+#: ``committed`` record exists for its ``migration_id``; a ``prepared`` with no ``committed``
+#: is an interrupted attempt that recovery finishes (``committed``) or voids (``rolled_back``).
+MIGRATION_PREPARED = "prepared"
+MIGRATION_COMMITTED = "committed"
+MIGRATION_ROLLED_BACK = "rolled_back"
 
 
 def _safe_stem(value: str) -> str:
@@ -504,17 +510,10 @@ def durable_thread_evidence(artifact_base: Any, run_id: str) -> str:
     return str(getattr(head, "thread_id", "") or "")
 
 
-def load_standalone_authority(artifact_base: Any, run_id: str,
+def _load_authority_validated(artifact_base: Any, run_id: str,
                               thread_id: str = "") -> dict[str, Any] | None:
-    """The recorded authority, or ``None`` when the run recorded none.  Unreadable or
-    INVALID (including a WRONG-THREAD record, B1/B1') RAISES -- an existing-but-broken
-    record is a refusal, not an absence (finding 3).
-
-    B1'.  When the caller names no thread (``thread_id=""`` -- the recover/watchdog route,
-    which has no ``--thread-id``), the immutable thread binding is validated against the
-    run's DURABLE thread evidence (:func:`durable_thread_evidence`) rather than accepted as
-    "any".  So a tampered primary authority is refused with the typed authority error at
-    the authority boundary, BEFORE any downstream ``RECOVERY_*`` code, on every route."""
+    """Read + validate the authority record.  No reconciliation (avoids recursion with
+    :func:`reconcile_standalone_migrations`, which itself reads the authority)."""
     target = standalone_authority_path(artifact_base, run_id, thread_id)
     if not target.exists():
         return None
@@ -526,6 +525,27 @@ def load_standalone_authority(artifact_base: Any, run_id: str,
             f"at {target} is unreadable ({exc})") from exc
     effective_thread = thread_id or durable_thread_evidence(artifact_base, run_id)
     return _validate_authority_record(record, target, run_id, effective_thread)
+
+
+def load_standalone_authority(artifact_base: Any, run_id: str,
+                              thread_id: str = "") -> dict[str, Any] | None:
+    """The recorded authority, or ``None`` when the run recorded none.  Unreadable or
+    INVALID (including a WRONG-THREAD record, B1/B1') RAISES -- an existing-but-broken
+    record is a refusal, not an absence (finding 3).
+
+    B1'.  When the caller names no thread (``thread_id=""`` -- the recover/watchdog route,
+    which has no ``--thread-id``), the immutable thread binding is validated against the
+    run's DURABLE thread evidence (:func:`durable_thread_evidence`) rather than accepted as
+    "any".  So a tampered primary authority is refused with the typed authority error at
+    the authority boundary, BEFORE any downstream ``RECOVERY_*`` code, on every route.
+
+    F-001.  The authority READ PATH reconciles an interrupted migration first: a
+    ``prepared``-without-``committed`` migration is deterministically finished or rolled
+    back (:func:`reconcile_standalone_migrations`) so the digest a reader sees is the
+    committed one, never a half-applied one.  A run with no migration log takes a fast
+    no-op path, so ordinary loads are unaffected."""
+    reconcile_standalone_migrations(artifact_base, run_id, thread_id)
+    return _load_authority_validated(artifact_base, run_id, thread_id)
 
 
 def check_standalone_authority(artifact_base: Any, run_id: str, *, runtime_state_path: Any,
@@ -642,8 +662,9 @@ def standalone_migration_log_path(artifact_base: Any, run_id: str) -> Path:
 
 def read_standalone_migrations(artifact_base: Any, run_id: str,
                                thread_id: str = "") -> tuple[dict[str, Any], ...]:
-    """Every recorded migration for this run (optionally filtered to one thread), oldest
-    first.  RAISES on an unreadable log rather than pretending there were none."""
+    """Every recorded migration record for this run (optionally filtered to one thread),
+    oldest first -- ``prepared``, ``committed`` and ``rolled_back`` alike.  RAISES on an
+    unreadable / unparsable log rather than pretending there were none."""
     path = standalone_migration_log_path(artifact_base, run_id)
     if not path.exists():
         return ()
@@ -669,67 +690,188 @@ def read_standalone_migrations(artifact_base: Any, run_id: str,
     return tuple(out)
 
 
+def standalone_committed_migrations(artifact_base: Any, run_id: str,
+                                    thread_id: str = "") -> tuple[dict[str, Any], ...]:
+    """The COMMITTED migration records -- the truthful history of profile re-binds.  A
+    ``prepared`` with no ``committed`` is an interrupted attempt and is NOT a migration."""
+    return tuple(r for r in read_standalone_migrations(artifact_base, run_id, thread_id)
+                 if r.get("state") == MIGRATION_COMMITTED)
+
+
+def _migration_id(run_id: str, thread_id: str, old_digest: str, new_digest: str,
+                  actor: str, reason: str, epoch: int) -> str:
+    """The attributable operation identity / replay key (F-001; hardened for iteration-5 B1).
+
+    The SAME operation always hashes to the same id, so a crash retry is recognised and
+    never appends a second committed record.  What makes two migrations "the same operation"
+    now includes the AUTHORITY EPOCH it applies to -- both the validated source digest
+    (``old_digest``) and a monotonic ``epoch`` ordinal (the count of committed migrations
+    before it).  Without the epoch, a legitimate A->B, B->A, A->B history would give the two
+    A->B operations one id and the second could be mistaken for a replay of the first (the
+    iteration-5 blocking finding B1).  A different actor, reason, source, target OR epoch is
+    a different operation."""
+    import hashlib
+    payload = json.dumps({"run_id": run_id, "thread_id": thread_id,
+                          "old_profile_digest": str(old_digest),
+                          "new_profile_digest": str(new_digest), "actor": str(actor),
+                          "reason": str(reason), "epoch": int(epoch)}, sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _migration_states_by_id(artifact_base: Any, run_id: str,
+                            thread_id: str) -> dict[str, dict[str, dict[str, Any]]]:
+    """``migration_id -> {state -> record}`` for this run/thread."""
+    grouped: dict[str, dict[str, dict[str, Any]]] = {}
+    for rec in read_standalone_migrations(artifact_base, run_id, thread_id):
+        mid, state = rec.get("migration_id"), rec.get("state")
+        if mid and state:
+            grouped.setdefault(str(mid), {})[str(state)] = rec
+    return grouped
+
+
+def _append_migration_record(artifact_base: Any, run_id: str, record: dict[str, Any]) -> None:
+    log = standalone_migration_log_path(artifact_base, run_id)
+    log.parent.mkdir(parents=True, exist_ok=True)
+    _durable_append(log, json.dumps(record, sort_keys=True) + "\n")
+
+
+def reconcile_standalone_migrations(artifact_base: Any, run_id: str,
+                                    thread_id: str = "") -> None:
+    """Deterministically finish or roll back every interrupted migration (F-001).
+
+    A ``prepared`` record with neither ``committed`` nor ``rolled_back`` is an attempt that
+    crashed between durable-write boundaries.  Its terminal state is decided ONLY by the
+    authority's current digest -- the single source of truth:
+
+    * authority already names the prepared ``new_profile_digest`` AND that profile's
+      content-addressed archive exists  -> the re-bind is durably done, so append the
+      ``committed`` record (ROLL FORWARD);
+    * otherwise (authority still names the old digest, or the archive is missing)  -> the
+      re-bind never durably happened, so append a ``rolled_back`` record and leave the
+      authority on its old digest (ROLL BACK).
+
+    Append-only and idempotent: a migration already terminal is skipped, so a second
+    reconciliation (or a reconciliation racing a replay) adds nothing.  Fast no-op when the
+    run has no migration log at all -- which is every run that never migrated."""
+    if not standalone_migration_log_path(artifact_base, run_id).exists():
+        return
+    for mid, by_state in _migration_states_by_id(artifact_base, run_id, thread_id).items():
+        if MIGRATION_PREPARED not in by_state:
+            continue
+        if MIGRATION_COMMITTED in by_state or MIGRATION_ROLLED_BACK in by_state:
+            continue                                     # already terminal
+        prepared = by_state[MIGRATION_PREPARED]
+        thread = str(prepared.get("thread_id") or "")
+        new_digest = str(prepared.get("new_profile_digest") or "")
+        try:
+            current = _load_authority_validated(artifact_base, run_id, thread)
+        except LauncherError:
+            current = None                               # broken authority: cannot roll fwd
+        current_digest = str((current or {}).get("profile_digest") or "")
+        archive_ok = (bool(new_digest)
+                      and profile_archive_path(artifact_base, run_id, new_digest).exists())
+        terminal = dict(prepared)
+        if current_digest == new_digest and current_digest and archive_ok:
+            terminal["state"] = MIGRATION_COMMITTED       # roll forward
+            terminal["reconciled"] = True
+        else:
+            terminal["state"] = MIGRATION_ROLLED_BACK     # roll back
+            terminal["reconciled"] = True
+        terminal["recorded_at"] = _authority_now()
+        _append_migration_record(artifact_base, run_id, terminal)
+
+
 def migrate_standalone_profile(artifact_base: Any, run_id: str, *, thread_id: str = "",
                                new_profile_spec: Mapping[str, Any], actor: str,
                                reason: str) -> dict[str, Any]:
-    """The ONE sanctioned, audited way to change a run/thread's bound profile.  B4.
+    """The ONE sanctioned, audited, CRASH-CONSISTENT, REPLAY-SAFE way to re-bind a
+    run/thread's profile.  B4 + Final Adversarial Review F-001.
 
     The immutable launch authority is create-once and exact-digest by default (F2/F9): a
     ``--standalone-profile`` that does not restate the bound digest is refused.  A
-    legitimate profile change -- a corrected binary path, a retuned timeout -- is therefore
-    a DELIBERATE, ATTRIBUTABLE, DURABLE act rather than a silent override or a hand edit of
-    the authority file:
+    legitimate change is a DELIBERATE, ATTRIBUTABLE, TWO-PHASE act keyed by a stable
+    migration id (:func:`_migration_id`):
 
-    1. the current authority is loaded and VALIDATED (a broken/foreign/wrong-thread record
-       refuses the migration, exactly as recovery would);
-    2. an audit record -- old digest, new digest, actor, reason, timestamp, thread -- is
-       appended to :func:`standalone_migration_log_path` and fsynced BEFORE anything is
-       re-bound, so a migration that changed the binding always left a durable trace;
-    3. the new profile is archived content-addressed, and the authority record is
-       rewritten with the new digest through the same durable writer the launch used.
+    1. reconcile any interrupted prior migration (roll forward / back), then
+    2. if the authority ALREADY names the requested target and a committed operation of this
+       shape (same target, actor, reason) produced it -> IDEMPOTENT: return it, append
+       nothing.  This gate is authority-consistency, not id-presence (iteration-5 B1): a
+       distinct later migration at a different epoch is never mistaken for an old replay;
+    3. append a ``prepared`` record (the intent, keyed by the epoch-bound id) and fsync it;
+    4. archive the new profile content-addressed (write-once);
+    5. atomically re-bind the authority record (tmp + rename + dir fsync) to the new digest;
+    6. append the ``committed`` record keyed by the same id.
 
-    A migration to the digest already bound is refused (nothing to migrate); a missing
-    actor or reason is refused (an unattributable migration is not audited).  Returns the
-    audit record.
+    A crash at ANY boundary is reconciled deterministically from the authority digest on
+    the next read (:func:`reconcile_standalone_migrations` / :func:`load_standalone_authority`):
+    a ``prepared`` whose re-bind landed becomes ``committed``, one whose re-bind did not
+    becomes ``rolled_back`` -- so there is exactly ONE ``committed`` record per operation and
+    no ghost completion.  A missing actor/reason, or a no-op to the bound digest, is refused.
     """
     if not str(actor).strip() or not str(reason).strip():
         raise LauncherError(
             f"{STANDALONE_MIGRATION_REFUSED}: a profile migration requires a non-empty "
             "--actor-id and --reason; an unattributable re-bind is not an audited act")
+    reconcile_standalone_migrations(artifact_base, run_id, thread_id)
     record = load_standalone_authority(artifact_base, run_id, thread_id)
     if record is None:
         raise LauncherError(
             f"{STANDALONE_MIGRATION_REFUSED}: run {run_id!r} (thread {thread_id!r}) records "
             "no standalone launch binding to migrate")
-    old_digest = str(record["profile_digest"])
     new_digest = profile_digest(new_profile_spec)
-    if new_digest == old_digest:
+    old_digest = str(record["profile_digest"])
+    committed_records = standalone_committed_migrations(artifact_base, run_id, thread_id)
+    # ---- Idempotent replay, GATED ON AUTHORITY-CONSISTENCY (iteration-5 B1) --------------
+    # A committed operation is a replay of THIS request ONLY when the current authority
+    # already names the target that operation produced (authority == its new digest).  So a
+    # legitimate A->B, B->A, A->B history is safe: the third A->B reads authority == A, which
+    # is not the target B, so it is NOT mistaken for a replay of the first A->B -- it is a
+    # fresh migration and the authority actually moves.  The previous key returned any
+    # historical committed record with a matching id before checking the authority, leaving
+    # the authority on the wrong profile.
+    if old_digest == new_digest:
+        for committed in reversed(committed_records):
+            if (str(committed.get("new_profile_digest") or "") == new_digest
+                    and str(committed.get("actor") or "") == str(actor)
+                    and str(committed.get("reason") or "") == str(reason)):
+                return committed                         # authority already at this op's target
         raise LauncherError(
             f"{STANDALONE_MIGRATION_REFUSED}: the new profile hashes to the digest already "
             f"bound ({old_digest!r}); there is nothing to migrate")
-    # Round-trip the new profile through the operator's JSON door, so a malformed profile
-    # is refused HERE (before any durable write) rather than at the next recovery.
+    # Refuse a malformed profile BEFORE any durable write (not at the next recovery).
     from .standalone_profile import profile_from_mapping
     try:
         profile_from_mapping(new_profile_spec)
     except Exception as exc:  # noqa: BLE001 - a malformed migration profile refuses now
         raise LauncherError(
             f"{STANDALONE_MIGRATION_REFUSED}: the new profile is invalid ({exc})") from exc
-    audit = {"schema": STANDALONE_MIGRATION_SCHEMA, "run_id": run_id,
-             "thread_id": thread_id, "old_profile_digest": old_digest,
-             "new_profile_digest": new_digest, "actor": str(actor),
-             "reason": str(reason), "migrated_at": _authority_now()}
-    # (2) durable audit FIRST -- append + fsync -- so the trace precedes the re-bind.
-    log = standalone_migration_log_path(artifact_base, run_id)
-    log.parent.mkdir(parents=True, exist_ok=True)
-    _durable_append(log, json.dumps(audit, sort_keys=True) + "\n")
-    # (3) archive the new profile, then re-bind the authority record with the new digest.
+    # The operation identity binds the validated source epoch (old_digest) AND a monotonic
+    # ordinal (the count of committed migrations so far), so two same-shape migrations at
+    # DIFFERENT epochs never alias -- and a crash retry of THIS one, before it commits, reads
+    # the same committed count and so recomputes the same id (a rolled-back attempt added no
+    # committed record; a rolled-forward one is caught by the replay gate above).
+    epoch = len(committed_records)
+    mid = _migration_id(run_id, thread_id, old_digest, new_digest, actor, reason, epoch)
+    base_record = {"schema": STANDALONE_MIGRATION_SCHEMA, "migration_id": mid,
+                   "run_id": run_id, "thread_id": thread_id, "operation_epoch": epoch,
+                   "old_profile_digest": old_digest, "new_profile_digest": new_digest,
+                   "actor": str(actor), "reason": str(reason)}
+    # (3) PREPARED intent, fsynced -- the durable record that a re-bind was ABOUT to happen.
+    _append_migration_record(artifact_base, run_id,
+                             {**base_record, "state": MIGRATION_PREPARED,
+                              "prepared_at": _authority_now()})
+    # (4) archive the new profile (write-once, content-addressed).
     persist_standalone_profile(artifact_base, run_id, new_profile_spec)
+    # (5) atomically re-bind the authority to the new digest.
     migrated = dict(record)
     migrated["profile_digest"] = new_digest
     _durable_write(standalone_authority_path(artifact_base, run_id, thread_id, for_write=True),
                    json.dumps(migrated, sort_keys=True, indent=2) + "\n")
-    return audit
+    # (6) COMMITTED record keyed by the same id -- the migration is now durable and truthful.
+    committed = {**base_record, "state": MIGRATION_COMMITTED,
+                 "migrated_at": _authority_now()}
+    _append_migration_record(artifact_base, run_id, committed)
+    return committed
 
 
 def build_standalone_runtime(artifact_base: Any, run_id: str, *, runtime_state: Any,

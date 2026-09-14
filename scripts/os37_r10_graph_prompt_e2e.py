@@ -95,7 +95,12 @@ def _write_profile(cli: str, worktree: str, path: Path, *, codex_home: str = "")
                else claude_profile(worktree))
     document = profile_document(profile)
     document["worktree"] = worktree
-    document["extra_args"] = ["--strict-mcp-config", "--add-dir", worktree]
+    # Per CLI: `--strict-mcp-config` is a Claude Code flag; codex-cli (measured 0.153.2)
+    # rejects it with `error: unexpected argument '--strict-mcp-config'` (exit 2) before any
+    # record is emitted, which fails the preflight rehearsal as `profile_readiness_unverified`.
+    # Both CLIs accept `--add-dir`.
+    document["extra_args"] = (["--add-dir", worktree] if cli == "codex"
+                              else ["--strict-mcp-config", "--add-dir", worktree])
     document["add_dirs"] = []
 
     def _plain(value: Any) -> Any:
