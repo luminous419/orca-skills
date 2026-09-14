@@ -1192,51 +1192,96 @@ class CI2ExitEvidenceInFlightTests(_Composed):
         child.wait()
         return child.pid
 
-    def test_exit_evidence_in_flight_is_awaited_while_the_watcher_lives(self) -> None:
-        """A real 'watcher' process writes the sentinel 300 ms from now; the agent pid is
-        already gone.  `recover_handle` must answer `listing_verified` from the sentinel,
-        not `not_listed` from the empty tty table."""
-        agent = self._dead_pid()
-        sentinel_holder: list = []
+    def _fake_watcher_released_by_handshake(self, run_id: str, *, code: int) -> tuple[int, int]:
+        """A real 'watcher' process that writes the fenced sentinel ONLY once the test
+        releases it through a pipe -- and the test releases it from INSIDE `recover_handle`
+        (the injected table reader), after asserting the sentinel does not exist yet.
+
+        Correction iteration 4 (CI on `e439025`): the previous watcher slept a fixed 300 ms
+        FROM THE FORK and the lock asserted a wall-clock lower bound (`elapsed >= 0.2`) as a
+        PROXY for "the answer came from the awaited sentinel".  The journal/spawn-record setup
+        between the fork and `started` took >100 ms under CI load, the sentinel landed early,
+        and the proxy failed although `recover_handle` behaved correctly.  The handshake is
+        DIRECT evidence instead: the sentinel cannot exist before `recover_handle` has
+        consulted the process table and entered the in-flight wait, so `listing_verified`
+        with the sentinel's exit code can only have come from awaiting it.  No timing bound
+        is a proxy for provenance any more; the upper bound remains a budget.
+        """
+        go_r, go_w = os.pipe()
         watcher = os.fork()
         if watcher == 0:  # pragma: no cover - the fake watcher
-            time.sleep(0.3)
-            path = Path(self.base) / "runs" / "run_ci2" / "standalone" / "sess-ci2" / "exit.inc-ci2"
-            pty_supervisor.write_exit_sentinel(path, code=0, fence="sess-ci2:inc-ci2")
+            os.close(go_w)
+            os.read(go_r, 1)                                   # blocks until released
+            path = (Path(self.base) / "runs" / run_id / "standalone" / "sess-ci2"
+                    / "exit.inc-ci2")
+            pty_supervisor.write_exit_sentinel(path, code=code, fence="sess-ci2:inc-ci2")
             os._exit(0)
+        os.close(go_r)
         self.addCleanup(lambda: kill_and_reap(watcher))
+        return watcher, go_w
+
+    def _releasing_table_reader(self, sentinel: Path, go_w: int, rows: tuple,
+                                observed: dict):
+        """The injected process-table reader: records that `recover_handle` consulted the
+        table while NO sentinel existed, then releases the watcher.  Called from inside
+        `recover_handle`, after its early sentinel check has already returned nothing."""
+        def read(tty: str) -> dict:
+            observed["reads"] = observed.get("reads", 0) + 1
+            observed["sentinel_existed_at_table_read"] = sentinel.exists()
+            if observed["reads"] == 1:
+                os.write(go_w, b"g")
+                os.close(go_w)
+            return {"tty": tty, "captured_at": time.time(), "rows": rows, "readable": True}
+        return read
+
+    def test_exit_evidence_in_flight_is_awaited_while_the_watcher_lives(self) -> None:
+        """The agent pid is already gone; the run's watcher (alive) writes the sentinel only
+        after `recover_handle` has read the empty tty table.  `recover_handle` must answer
+        `listing_verified` FROM THE AWAITED SENTINEL, not `not_listed` from the table."""
+        agent = self._dead_pid()
+        watcher, go_w = self._fake_watcher_released_by_handshake("run_ci2", code=0)
         adapter, sentinel, fence = self._journal_a_spawned_intent(
             "run_ci2", "intent-ci2", pid=agent, leader_pid=watcher, tty="ttys995")
-        adapter._table_reader = lambda tty: {"tty": tty, "captured_at": time.time(),
-                                             "rows": (), "readable": True}
+        observed: dict = {}
+        adapter._table_reader = self._releasing_table_reader(sentinel, go_w, (), observed)
+        self.assertFalse(sentinel.exists(), "the sentinel must not exist before the call")
         started = time.time()
         handle = adapter.recover_handle("intent-ci2")
         elapsed = time.time() - started
         self.assertEqual(handle["handle_recovery"], "listing_verified", handle)
         self.assertEqual(handle["exit_status"], 0)
-        self.assertGreaterEqual(elapsed, 0.2, "the answer did not come from the awaited sentinel")
-        self.assertLess(elapsed, 1.5)
+        # DIRECT provenance: the table was consulted exactly once, while no sentinel existed,
+        # and only then was the watcher released -- so the verified answer can only have
+        # come from the in-flight wait on the sentinel that landed afterwards.
+        self.assertEqual(observed.get("reads"), 1, observed)
+        self.assertIs(observed.get("sentinel_existed_at_table_read"), False, observed)
+        self.assertIn("exit watcher wrote a fenced exit sentinel", handle["detail"])
+        self.assertLess(elapsed, 1.5, "the in-flight wait must answer well inside its budget")
         self.assertEqual(pty_supervisor.read_exit_sentinel(sentinel, fence=fence)["outcome"],
                          "exited")
 
     def test_a_zombie_on_the_tty_is_awaited_the_same_way(self) -> None:
         agent = self._dead_pid()
-        watcher = os.fork()
-        if watcher == 0:  # pragma: no cover
-            time.sleep(0.2)
-            path = Path(self.base) / "runs" / "run_ci2z" / "standalone" / "sess-ci2" / "exit.inc-ci2"
-            pty_supervisor.write_exit_sentinel(path, code=3, fence="sess-ci2:inc-ci2")
-            os._exit(0)
-        self.addCleanup(lambda: kill_and_reap(watcher))
-        adapter, _sentinel, _fence = self._journal_a_spawned_intent(
+        watcher, go_w = self._fake_watcher_released_by_handshake("run_ci2z", code=3)
+        adapter, sentinel, fence = self._journal_a_spawned_intent(
             "run_ci2z", "intent-ci2z", pid=agent, leader_pid=watcher, tty="ttys995")
         zombie = {"pid": agent, "ppid": watcher, "pgid": agent, "sid": watcher,
                   "tty": "ttys995", "stat": "Z+"}
-        adapter._table_reader = lambda tty: {"tty": tty, "captured_at": time.time(),
-                                             "rows": (zombie,), "readable": True}
+        observed: dict = {}
+        adapter._table_reader = self._releasing_table_reader(sentinel, go_w, (zombie,),
+                                                             observed)
+        self.assertFalse(sentinel.exists())
+        started = time.time()
         handle = adapter.recover_handle("intent-ci2z")
+        elapsed = time.time() - started
         self.assertEqual(handle["handle_recovery"], "listing_verified", handle)
         self.assertEqual(handle["exit_status"], 3)
+        self.assertEqual(observed.get("reads"), 1, observed)
+        self.assertIs(observed.get("sentinel_existed_at_table_read"), False, observed)
+        self.assertIn("exit watcher wrote a fenced exit sentinel", handle["detail"])
+        self.assertLess(elapsed, 1.5)
+        self.assertEqual(pty_supervisor.read_exit_sentinel(sentinel, fence=fence)["outcome"],
+                         "exited")
 
     def test_a_gone_watcher_with_no_sentinel_is_still_an_orphan_and_waits_for_nothing(self) -> None:
         agent, watcher = self._dead_pid(), self._dead_pid()
