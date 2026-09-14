@@ -64,6 +64,24 @@ META_SCHEMA = "os37.capture_meta.v2"
 UNANSWERABLE_WRITE_FAILED = "write_failed"
 UNANSWERABLE_INHERITED_PREFIX = "inherited_"          # prefix + the integrity reason
 
+#: Round-7 consolidated review, blocker 4.  The APPEND INTENT the supervisor writes
+#: durably BEFORE every data append: the offset the bytes will land at, their length and
+#: their digest.  It is the ONLY thing that can vouch for a suffix beyond the length the
+#: meta declares -- a crash between the data write and the meta write leaves exactly such a
+#: suffix, and the intent proves it is the supervisor's own bytes and not a forged or
+#: stale tail.  File-length inference (`size > total` => "one in-flight append") is gone:
+#: a suffix no intent describes is `unverified_tail`, irreversibly.
+APPEND_INTENT_SCHEMA = "os37.capture_append_intent.v1"
+#: The integrity reasons blocker 4 names.  `meta_missing` / `meta_unreadable` /
+#: `total_bytes_mismatch` are the reader-side reasons (a longer-than-declared file is
+#: `total_bytes_mismatch` with ``tail: unverified_tail`` when no append intent proves the
+#: suffix); `unverified_tail` is the name the exit watcher inherits IRREVERSIBLY for that
+#: same suffix at handoff.
+INTEGRITY_META_MISSING = "meta_missing"
+INTEGRITY_META_UNREADABLE = "meta_unreadable"
+INTEGRITY_TOTAL_BYTES_MISMATCH = "total_bytes_mismatch"
+INTEGRITY_UNVERIFIED_TAIL = "unverified_tail"
+
 
 class CaptureRecord(TypedDict):
     offset: int
@@ -95,6 +113,7 @@ class BoundedCapture:
         self.limits = limits or CaptureLimits()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._meta_path = self.path.with_name(self.path.name + ".meta.json")
+        self._intent_path = intent_path_for(self.path)
         self._records = 0
         self._total = 0
         self._dropped = 0
@@ -141,6 +160,14 @@ class BoundedCapture:
         self._writer = str(meta.get("writer") or WRITER_SUPERVISOR)
         self._unanswerable = str(meta.get("unanswerable") or "")
         self._digest = _digest_of(self.path)
+        # Blocker 4: a suffix beyond the declared length is adopted into the counters
+        # ONLY when the durable append intent proves it (offset, length and digest); an
+        # unproven one leaves the counters describing the declared prefix, and
+        # `integrity()` names it `unverified_tail`.
+        verified = verified_tail(self.path, self._intent_path, declared_total=self._total)
+        if verified["state"] == "verified":
+            self._records += 1
+            self._total = verified["size"]
 
     def refresh(self) -> None:
         """Re-read the meta and the file.  For a reader whose file another process --
@@ -189,6 +216,11 @@ class BoundedCapture:
             self._truncation = self._truncation or decision["truncation"]
         offset = self._total
         try:
+            # Blocker 4: the APPEND INTENT reaches stable storage BEFORE the bytes do.
+            # A crash after the data write and before the meta write then leaves a
+            # suffix the intent describes exactly -- the one recoverable case -- and any
+            # other suffix is provably not this writer's.
+            write_append_intent(self._intent_path, offset=offset, payload=payload)
             with open(self.path, "ab") as handle:
                 handle.write(payload)
                 handle.flush()
@@ -344,14 +376,18 @@ class BoundedCapture:
             size = 0
         try:
             meta = json.loads(self._meta_path.read_text())
-        except OSError:
+        except FileNotFoundError:
             meta = None
+        except OSError as exc:
+            # Blocker 4: a meta that EXISTS and cannot be opened is not an absent one.
+            return {"consistent": False, "reason": INTEGRITY_META_UNREADABLE,
+                    "detail": f"{type(exc).__name__}: {exc}"}
         except ValueError:
             return {"consistent": False, "reason": "meta_unparsable"}
         if meta is None:
             if size == 0:
                 return {"consistent": True, "reason": ""}
-            return {"consistent": False, "reason": "meta_missing",
+            return {"consistent": False, "reason": INTEGRITY_META_MISSING,
                     "file_bytes": size}
         if meta.get("schema") != META_SCHEMA:
             return {"consistent": False, "reason": "meta_schema_mismatch",
@@ -361,14 +397,32 @@ class BoundedCapture:
             # Findings 6 / 7.  Irreversible by construction: whatever the bytes and the
             # counters say NOW, a writer recorded that the capture is not evidence.
             return {"consistent": False, "reason": unanswerable}
-        if int(meta.get("total_bytes", -1)) != size:
-            return {"consistent": False, "reason": "total_bytes_mismatch",
-                    "meta_bytes": int(meta.get("total_bytes", -1)), "file_bytes": size}
+        declared = int(meta.get("total_bytes", -1))
         recorded = str(meta.get("sha256") or "")
-        actual = _digest_of(self.path).hexdigest()
-        if recorded != actual:
-            return {"consistent": False, "reason": "sha256_mismatch",
-                    "meta_sha256": recorded, "file_sha256": actual}
+        if declared < size and declared >= 0:
+            # Blocker 4.  A suffix beyond the declared length is evidence ONLY when the
+            # durable append intent describes it exactly AND the declared prefix still
+            # hashes to what the meta recorded; otherwise it is `unverified_tail` -- a
+            # forged or stale completion record in that region can never become
+            # settlement evidence, and no later meta write can clear this (a writer that
+            # adopts the file marks it irreversibly).
+            verified = verified_tail(self.path, self._intent_path, declared_total=declared)
+            prefix = _digest_of(self.path, limit=declared).hexdigest()
+            if verified["state"] != "verified":
+                return {"consistent": False, "reason": INTEGRITY_TOTAL_BYTES_MISMATCH,
+                        "meta_bytes": declared, "file_bytes": size,
+                        "tail": INTEGRITY_UNVERIFIED_TAIL, "detail": verified["reason"]}
+            if recorded != prefix:
+                return {"consistent": False, "reason": "sha256_mismatch",
+                        "meta_sha256": recorded, "file_sha256": prefix}
+        else:
+            if declared != size:
+                return {"consistent": False, "reason": INTEGRITY_TOTAL_BYTES_MISMATCH,
+                        "meta_bytes": declared, "file_bytes": size}
+            actual = _digest_of(self.path).hexdigest()
+            if recorded != actual:
+                return {"consistent": False, "reason": "sha256_mismatch",
+                        "meta_sha256": recorded, "file_sha256": actual}
         if meta.get("writer") not in (WRITER_SUPERVISOR, WRITER_EXIT_WATCHER):
             return {"consistent": False, "reason": "writer_unknown",
                     "writer": meta.get("writer")}
@@ -442,6 +496,7 @@ class RawBoundedAppender:
     def __init__(self, capture: bytes, *, limits: CaptureLimits) -> None:
         self.capture = capture
         self.meta = capture + b".meta.json"
+        self.intent = capture + b".intent.json"
         self.limits = limits
         self.records = 0
         self.total = 0
@@ -467,7 +522,16 @@ class RawBoundedAppender:
     def _adopt_meta(self) -> None:
         try:
             fd = os.open(self.meta, os.O_RDONLY)
+        except FileNotFoundError:
+            return                                   # genuinely absent; `_digest_existing`
+                                                     # decides whether that is a blank slate
         except OSError:
+            # Blocker 4.  A meta that EXISTS and cannot be opened (EACCES, EIO, a
+            # directory in its place) is NOT an absence: the supervisor described this
+            # capture and the description is unreadable, so nothing this writer records
+            # can vouch for the prefix.  Irreversible, by name.
+            self._mark_unanswerable(UNANSWERABLE_INHERITED_PREFIX + INTEGRITY_META_UNREADABLE)
+            self._meta_present = True
             return
         try:
             raw = b""
@@ -476,6 +540,13 @@ class RawBoundedAppender:
                 if not chunk:
                     break
                 raw += chunk
+        except OSError:
+            # Blocker 4, the other unreadable shape: the meta opened but cannot be READ
+            # (a directory in its place, EIO).  Same verdict as an unopenable one -- and
+            # the watcher must not die of it, or the tail is lost with nothing recorded.
+            self._mark_unanswerable(UNANSWERABLE_INHERITED_PREFIX + INTEGRITY_META_UNREADABLE)
+            self._meta_present = True
+            return
         finally:
             os.close(fd)
         try:
@@ -532,22 +603,40 @@ class RawBoundedAppender:
                 size += len(chunk)
         finally:
             os.close(fd)
-        if self._meta_present:
-            if size < self.total:
-                # The file is SHORTER than the supervisor said it was: bytes it recorded
-                # are gone.  Nothing this writer appends restores them.
-                self._mark_unanswerable(UNANSWERABLE_INHERITED_PREFIX + "total_bytes_mismatch")
-            elif self._meta_sha256 and prefix.hexdigest() != self._meta_sha256:
-                # Same length, different bytes: the recorded digest does not describe the
-                # prefix on disk.  This used to be recomputed and overwritten, which is
-                # exactly how a `sha256_mismatch` was "healed" at handoff.
-                self._mark_unanswerable(UNANSWERABLE_INHERITED_PREFIX + "sha256_mismatch")
-        if size != self.total:
-            # One supervisor append landed without its meta.  Counted as one record; the
-            # limit logic below then sees the true total.
-            if size > self.total:
-                self.records += 1
+        if not self._meta_present:
+            if size > 0:
+                # Blocker 4.  A capture that HOLDS BYTES and has no meta is not a blank
+                # slate: somebody wrote bytes this contract never described, and the meta
+                # this writer would produce next cannot vouch for them.  It used to hash
+                # them and carry on, which "healed" `meta_missing` at handoff.
+                self._mark_unanswerable(UNANSWERABLE_INHERITED_PREFIX + INTEGRITY_META_MISSING)
             self.total = size
+            return
+        if size < self.total:
+            # The file is SHORTER than the supervisor said it was: bytes it recorded
+            # are gone.  Nothing this writer appends restores them.
+            self._mark_unanswerable(UNANSWERABLE_INHERITED_PREFIX
+                                    + INTEGRITY_TOTAL_BYTES_MISMATCH)
+        elif self._meta_sha256 and prefix.hexdigest() != self._meta_sha256:
+            # Same length, different bytes: the recorded digest does not describe the
+            # prefix on disk.  This used to be recomputed and overwritten, which is
+            # exactly how a `sha256_mismatch` was "healed" at handoff.
+            self._mark_unanswerable(UNANSWERABLE_INHERITED_PREFIX + "sha256_mismatch")
+        elif size > self.total:
+            # Blocker 4.  A suffix beyond the declared length is adopted ONLY when the
+            # supervisor's durable APPEND INTENT describes it exactly (offset, length and
+            # digest) -- the crash-between-data-and-meta case, proven rather than
+            # inferred from the file length.  Anything else in that region is
+            # `unverified_tail`: irreversible, so a forged or stale completion record
+            # there can never become settlement evidence, whatever this writer appends.
+            verified = verified_tail(self.capture, self.intent, declared_total=self.total)
+            if verified["state"] == "verified":
+                self.records += 1
+            else:
+                self._mark_unanswerable(UNANSWERABLE_INHERITED_PREFIX
+                                        + INTEGRITY_UNVERIFIED_TAIL)
+        if size != self.total:
+            self.total = size                          # the meta describes the FILE as it is
 
     def _mark_unanswerable(self, cause: str) -> None:
         """Record ``cause`` ONCE, irreversibly; the first cause is the one kept."""
@@ -616,6 +705,103 @@ def meta_path_for(path: str | os.PathLike[str]) -> Path:
     return target.with_name(target.name + ".meta.json")
 
 
+def intent_path_for(path: str | os.PathLike[str]) -> Path:
+    """``<capture.log>.intent.json`` -- the durable APPEND INTENT (blocker 4)."""
+    target = Path(path)
+    return target.with_name(target.name + ".intent.json")
+
+
+def write_append_intent(path: str | os.PathLike[str] | bytes, *, offset: int,
+                        payload: bytes) -> None:
+    """Record, durably (tmp + fsync + rename), that ``payload`` is ABOUT to be appended at
+    ``offset``.  Raw ``os`` calls, like :func:`write_meta`, so either writer could call it;
+    only the supervisor's :class:`BoundedCapture` does, because the exit watcher writes
+    its meta after every append and never leaves a described-but-unrecorded suffix."""
+    record = json.dumps({"schema": APPEND_INTENT_SCHEMA, "offset": int(offset),
+                         "length": len(payload),
+                         "sha256": hashlib.sha256(payload).hexdigest()},
+                        sort_keys=True).encode()
+    target = os.fsencode(os.fspath(path)) if not isinstance(path, bytes) else path
+    tmp = target + b".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, record)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.rename(tmp, target)
+
+
+def _read_append_intent(path: str | os.PathLike[str] | bytes) -> dict[str, Any] | None:
+    target = os.fsencode(os.fspath(path)) if not isinstance(path, bytes) else path
+    try:
+        fd = os.open(target, os.O_RDONLY)
+    except OSError:
+        return None
+    try:
+        raw = b""
+        while True:
+            chunk = os.read(fd, 65_536)
+            if not chunk:
+                break
+            raw += chunk
+    finally:
+        os.close(fd)
+    try:
+        record = json.loads(raw.decode("utf-8", errors="replace"))
+    except ValueError:
+        return None
+    if not isinstance(record, dict) or record.get("schema") != APPEND_INTENT_SCHEMA:
+        return None
+    return record
+
+
+def verified_tail(capture: str | os.PathLike[str] | bytes,
+                  intent: str | os.PathLike[str] | bytes, *,
+                  declared_total: int) -> dict[str, Any]:
+    """Whether the bytes of ``capture`` BEYOND ``declared_total`` are the supervisor's own
+    in-flight append, PROVEN by the durable append intent (blocker 4).
+
+    ``{"state": "verified" | "unverified" | "none", "size": <file size>, "reason": ...}``.
+    ``none`` when the file is not longer than declared.  ``verified`` requires an intent
+    whose ``offset`` equals the declared length and whose ``length`` and ``sha256`` equal
+    those of the suffix on disk -- nothing is inferred from the file length alone.  Raw
+    ``os`` calls, so the forked exit watcher and the supervisor-side reader make the same
+    decision from the same files.
+    """
+    target = os.fsencode(os.fspath(capture)) if not isinstance(capture, bytes) else capture
+    try:
+        size = os.stat(target).st_size
+    except OSError:
+        size = 0
+    if size <= declared_total:
+        return {"state": "none", "size": size, "reason": ""}
+    record = _read_append_intent(intent)
+    if record is None:
+        return {"state": "unverified", "size": size, "reason": "no_append_intent"}
+    if int(record.get("offset", -1)) != declared_total:
+        return {"state": "unverified", "size": size, "reason": "intent_offset_mismatch"}
+    if int(record.get("length", -1)) != size - declared_total:
+        return {"state": "unverified", "size": size, "reason": "intent_length_mismatch"}
+    digest = hashlib.sha256()
+    try:
+        fd = os.open(target, os.O_RDONLY)
+    except OSError:
+        return {"state": "unverified", "size": size, "reason": "capture_unreadable"}
+    try:
+        os.lseek(fd, declared_total, os.SEEK_SET)
+        while True:
+            chunk = os.read(fd, 65_536)
+            if not chunk:
+                break
+            digest.update(chunk)
+    finally:
+        os.close(fd)
+    if digest.hexdigest() != str(record.get("sha256") or ""):
+        return {"state": "unverified", "size": size, "reason": "intent_digest_mismatch"}
+    return {"state": "verified", "size": size, "reason": ""}
+
+
 def write_meta(path: str | os.PathLike[str], *, records: int, total_bytes: int,
                dropped_bytes: int, truncation: str, sha256: str, writer: str,
                unanswerable: str = "") -> None:
@@ -644,13 +830,20 @@ def write_meta(path: str | os.PathLike[str], *, records: int, total_bytes: int,
     os.rename(tmp, target)
 
 
-def _digest_of(path: Path) -> Any:
-    """``sha256`` over the whole file, or over nothing when it does not exist."""
+def _digest_of(path: Path, *, limit: int | None = None) -> Any:
+    """``sha256`` over the whole file (or its first ``limit`` bytes), or over nothing when
+    it does not exist."""
     digest = hashlib.sha256()
+    remaining = limit
     try:
         with open(path, "rb") as handle:
             for chunk in iter(lambda: handle.read(65_536), b""):
+                if remaining is not None:
+                    chunk = chunk[:max(0, remaining)]
+                    remaining -= len(chunk)
                 digest.update(chunk)
+                if remaining is not None and remaining <= 0:
+                    break
     except OSError:
         pass
     return digest

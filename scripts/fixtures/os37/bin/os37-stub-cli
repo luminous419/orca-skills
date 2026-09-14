@@ -100,7 +100,14 @@ case "${OS37_STUB_MODE:-ready}" in
                      # completion gates.
                      printf '{"type":"system","session_id":"%s"}\n' "$SESSION_ID"
                      IFS= read -r PROMPT || PROMPT=""
+                     # Round-7 follow-up item 6: a turn start alone is no longer a delivery
+                     # proof (both installed CLIs were measured starting a turn on their
+                     # auth-failure legs).  The delivery proof is the record the driver's own
+                     # conjunctive selector accepts -- for the profile's declared `assistant`
+                     # type, one bound to the minted session id with a real model and a
+                     # server-issued request id.  The turn start still precedes it.
                      printf '{"type":"message_start"}\n'
+                     printf '{"type":"assistant","session_id":"%s","request_id":"req_stub_agent_1","message":{"model":"stub-agent-model-1","id":"msg_stub_agent_1","usage":{"input_tokens":2,"output_tokens":1}}}\n' "$SESSION_ID"
                      # `is_error` is EMITTED, and emitted false, because the profile
                      # declares it as the error field and the real CLI always carries it.
                      # `CompletionSelector`'s predicate treats a DECLARED-but-ABSENT error
@@ -132,17 +139,36 @@ case "${OS37_STUB_MODE:-ready}" in
                      # must be interruptible without ever having produced a readiness or a
                      # completion record, because the ladder does not depend on either.
                      sleep 30; exit 0 ;;
-  deliver-claude)    # DELIVERY, per driver.  Emits nothing until the prompt frame arrives,
-                     # then answers with the record `ClaudeDriver.turn_start_evidence` looks
-                     # for -- and with NOTHING ELSE, so `delivered_confirmed` can only be
-                     # reached through that driver's own proof and never through the frame
-                     # echo.
+  deliver-claude)    # TURN START ONLY, per driver.  Emits nothing until the prompt frame
+                     # arrives, then answers with the record `ClaudeDriver.turn_start_evidence`
+                     # looks for -- and with NOTHING ELSE.  Round-7 follow-up item 6: a turn
+                     # start alone is NOT delivery proof any more (both installed CLIs were
+                     # measured starting a turn on their auth-failure legs), so this mode is
+                     # the NEGATIVE leg: a post-ready write over it must end `not_observed`.
                      IFS= read -r _PROMPT || _PROMPT=""
                      printf '{"type":"message_start"}\n'
                      sleep 5; exit 0 ;;
   deliver-codex)     # The same, through `CodexDriver.turn_start_evidence`'s record instead.
                      IFS= read -r _PROMPT || _PROMPT=""
                      printf '{"type":"item.started","item":{"id":"item_0"}}\n'
+                     sleep 5; exit 0 ;;
+  deliver-claude-proof)
+                     # DELIVERY PROOF, per driver (round-7 item 6).  After the frame, the
+                     # record `claude_delivery_selector` accepts -- C-1 `assistant`, C-2 the
+                     # minted session id by equality, C-4/C-5 no error markers, C-6 a real
+                     # model identifier, C-7 a server-issued request id -- and nothing else,
+                     # so `delivered_confirmed` can only be reached through the driver's own
+                     # conjunctive selector and never through a turn start or the echo.
+                     IFS= read -r _PROMPT || _PROMPT=""
+                     printf '{"type":"message_start"}\n'
+                     printf '{"type":"assistant","session_id":"%s","request_id":"req_stub_1","message":{"model":"claude-stub-1","id":"msg_stub_1","usage":{"input_tokens":2,"output_tokens":1}}}\n' "$SESSION_ID"
+                     sleep 5; exit 0 ;;
+  deliver-codex-proof)
+                     # The same for `codex_delivery_selector` (K-1): a completed
+                     # `agent_message` item, preceded by the turn start it demotes.
+                     IFS= read -r _PROMPT || _PROMPT=""
+                     printf '{"type":"item.started","item":{"id":"item_0"}}\n'
+                     printf '{"type":"item.completed","item":{"id":"item_0","type":"agent_message"}}\n'
                      sleep 5; exit 0 ;;
   complete-claude)   # COMPLETION / FAILURE, per driver: the record
                      # `ClaudeDriver.completion_record` selects, then a real exit whose code

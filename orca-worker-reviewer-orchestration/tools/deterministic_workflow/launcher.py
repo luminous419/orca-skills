@@ -51,6 +51,29 @@ RECURSION_SAFETY_MARGIN = 20
 
 CANONICAL_PHASES = ("ANALYSIS", "PLAN", "DESIGN", "IMPLEMENTATION", "TEST")
 
+#: The thread a launch specification that names none is bound to.  Round-7 consolidated
+#: review, blocker 1: `build_state` defaulted the state/ledger identity to this value while
+#: `build_standalone_adapter` derived the create-once authority from the RAW optional field
+#: and recorded ``""`` -- two identities for one launch, so every later resume / recover /
+#: watchdog read the durable thread ``"launcher"`` and refused the authority as wrong-thread.
+#: There is now ONE resolver, :func:`effective_thread_id`, and every durable record (state,
+#: ledger path, authority, prompt composition, migration log) binds its answer.
+DEFAULT_THREAD_ID = "launcher"
+
+
+def effective_thread_id(spec: Mapping[str, Any]) -> str:
+    """The thread identity a launch specification EFFECTIVELY names: its ``thread_id`` when
+    it carries one, else :data:`DEFAULT_THREAD_ID`.  The one function every launch-time
+    writer of a standalone thread identity reads, so the ledger path, the authority, the
+    prompt composition and the migration log cannot disagree with the state about which
+    thread a run is.  It mirrors the expression `build_state` binds into the state --
+    ``spec.get("thread_id", "launcher")``, a line frozen by the D-2(a) byte guard over the
+    Orca/fake state builder, which is why that line is not rewritten to call this -- and
+    `build_standalone_adapter` asserts the two agree on every composition.  A spec that
+    names an EMPTY thread is refused by `state.validate_state` downstream exactly as
+    before; this resolver does not repair it."""
+    return spec.get("thread_id", DEFAULT_THREAD_ID)
+
 # Where the durable idempotency ledger lives when ``--runtime-state`` is not given.  It is
 # a real file, not an in-process store: the whole point is to survive the process, so that
 # a restart recovers the receipt instead of creating a second Task/Dispatch.  Operators
@@ -325,6 +348,36 @@ STANDALONE_PROFILE_DIGEST_MISMATCH = "STANDALONE_PROFILE_DIGEST_MISMATCH"
 STANDALONE_MIGRATION_REFUSED = "STANDALONE_MIGRATION_REFUSED"
 #: The durable audit-log schema for a profile migration.
 STANDALONE_MIGRATION_SCHEMA = "os37.standalone_profile_migration.v2"
+#: Round-7 consolidated review, blocker 3.  The run's DURABLE THREAD EVIDENCE (its pause
+#: record, else its committed checkpoint head) could not be READ: an unreadable or corrupt
+#: pause store / checkpoint is not an absence, and a recovery that cannot cross-check the
+#: authority's immutable thread binding against it is refused by this name -- on resume,
+#: recover, cancel, abandon and watchdog alike -- never composed from a record it could not
+#: verify.
+STANDALONE_THREAD_EVIDENCE_UNREADABLE = "STANDALONE_THREAD_EVIDENCE_UNREADABLE"
+#: Blocker 3, the other non-present state.  The run PROVABLY has no durable thread
+#: evidence (a readable pause store holding no record, a readable checkpoint store holding
+#: no head), so an authority record that exists for it cannot have its thread binding
+#: validated and no route may skip that check because the requested thread was empty.
+STANDALONE_THREAD_EVIDENCE_ABSENT = "STANDALONE_THREAD_EVIDENCE_ABSENT"
+#: Round-7 consolidated review, blocker 2.  The non-secret PROMPT COMPOSITION inputs a
+#: launch persisted (objective, requested phases, risk, project root, role instructions)
+#: cannot be rebuilt for a recovery -- the archive the authority binds is missing, does not
+#: hash to the bound digest, or is not a composition record -- so the recovery is refused
+#: by this name rather than dispatching the next Worker / Reviewer with raw intent JSON.
+STANDALONE_PROMPT_COMPOSITION_MISSING = "STANDALONE_PROMPT_COMPOSITION_MISSING"
+#: The durable schema of a persisted prompt composition (blocker 2).
+STANDALONE_PROMPT_COMPOSITION_SCHEMA = "os37.standalone_prompt_composition.v1"
+#: The two composers a launch can declare: the production renderer built from the
+#: persisted inputs, or NONE -- a launch that named no objective and therefore delivers the
+#: canonical intent payload.  ``none`` is the launch's OWN declaration, recorded at launch;
+#: it is never what a recovery falls back to when the record is missing.
+PROMPT_COMPOSER_PRODUCTION = "production"
+PROMPT_COMPOSER_NONE = "none"
+#: Blocker 3's tri-state for :func:`durable_thread_evidence`.
+THREAD_EVIDENCE_PRESENT = "present"
+THREAD_EVIDENCE_PROVEN_ABSENT = "proven_absent"
+THREAD_EVIDENCE_UNREADABLE = "unreadable"
 #: The three states a migration record carries (F-001).  A migration is durable only when a
 #: ``committed`` record exists for its ``migration_id``; a ``prepared`` with no ``committed``
 #: is an interrupted attempt that recovery finishes (``committed``) or voids (``rolled_back``).
@@ -403,7 +456,8 @@ def approval_authority_name(approval_port: Any) -> str:
 
 
 def _authority_record(run_id: str, *, runtime_state_path: Any, thread_id: str,
-                      approval_authority: str, profile_digest: str) -> dict[str, Any]:
+                      approval_authority: str, profile_digest: str,
+                      prompt_composition_digest: str = "") -> dict[str, Any]:
     return {"schema": STANDALONE_AUTHORITY_SCHEMA, "run_id": run_id,
             "adapter": STANDALONE_ADAPTER,
             "runtime_state_path": str(Path(runtime_state_path).resolve()),
@@ -413,13 +467,19 @@ def _authority_record(run_id: str, *, runtime_state_path: Any, thread_id: str,
             # rebuilds the runtime from `profiles/<digest>.json` -- the thread's OWN
             # profile -- and never from the mutable, run-global `profile.json` that a
             # second thread of the same run overwrites.
-            "profile_digest": profile_digest}
+            "profile_digest": profile_digest,
+            # Round-7 blocker 2.  The content address of the PROMPT COMPOSITION this
+            # thread launched with (`prompt_compositions/<digest>.json`), bound the same
+            # way, so a recovery rebuilds the SAME production prompt renderer -- or
+            # refuses by name -- and never dispatches raw intent JSON.
+            "prompt_composition_digest": prompt_composition_digest}
 
 
 def persist_standalone_authority(artifact_base: Any, run_id: str, *,
                                  runtime_state_path: Any, thread_id: str = "",
                                  approval_authority: str = "none",
-                                 profile_digest: str = "") -> Path:
+                                 profile_digest: str = "",
+                                 prompt_composition_digest: str = "") -> Path:
     """Record the launch bindings durably, CREATE-ONCE and EXACT-MATCH.  Finding 5 / 8 / 2.
 
     The record names the ledger, the thread, the approval authority and the PROFILE
@@ -435,34 +495,46 @@ def persist_standalone_authority(artifact_base: Any, run_id: str, *,
     if check_standalone_authority(artifact_base, run_id, runtime_state_path=runtime_state_path,
                                   thread_id=thread_id,
                                   approval_authority=approval_authority,
-                                  profile_digest=profile_digest) is not None:
+                                  profile_digest=profile_digest,
+                                  prompt_composition_digest=prompt_composition_digest
+                                  ) is not None:
         return target                                    # identical: a restart, no write
     wanted = _authority_record(run_id, runtime_state_path=runtime_state_path,
                                thread_id=thread_id, approval_authority=approval_authority,
-                               profile_digest=profile_digest)
+                               profile_digest=profile_digest,
+                               prompt_composition_digest=prompt_composition_digest)
     _durable_write(target, json.dumps(wanted, sort_keys=True, indent=2) + "\n")
     return target
 
 
 def _validate_authority_record(record: Any, target: Any, run_id: str,
-                               requested_thread: str = "") -> dict[str, Any]:
+                               requested_thread: str) -> dict[str, Any]:
     """The CLOSED-record validation every read shares (finding 3 / B1).  A record that is
     not a full, coherent standalone launch binding for THIS run and THIS thread is a
     refusal, never treated as an absence: an existing-but-invalid authority must refuse
     every recovery rather than fall through to a foreign composition.
 
-    ``requested_thread`` is the IMMUTABLE thread binding (B1).  The record's own
-    ``thread_id`` MUST equal it -- so a primary record whose ``thread_id`` was tampered to
-    name another thread is refused when read as this thread's authority rather than
-    silently bouncing the lookup to a missing per-thread file.  Iteration-3 finding B1':
-    the caller passes ``requested_thread=""`` ONLY after resolving the run's DURABLE thread
-    evidence (`load_standalone_authority` does this), so an empty value here means "the run
-    has no durable thread evidence to cross-check against" (an unrecoverable run with no
-    head and no pause record) -- NOT "accept any recorded thread".  There is deliberately
-    no ``requested_thread and ...`` guard that would let an empty value disable the check
-    on the recover/watchdog route: the emptiness is resolved to durable evidence BEFORE
-    this function, and only its genuine absence reaches here as "".
+    ``requested_thread`` is the IMMUTABLE thread binding (B1) and it is REQUIRED.  The
+    record's own ``thread_id`` MUST equal it -- so a primary record whose ``thread_id`` was
+    tampered to name another thread is refused when read as this thread's authority rather
+    than silently bouncing the lookup to a missing per-thread file.
+
+    Round-7 consolidated review, blocker 3.  The previous shape compared the thread ONLY
+    when ``requested_thread`` was truthy, and `durable_thread_evidence` answered ``""`` for
+    an UNREADABLE pause store or checkpoint as well as for a genuine absence -- so corrupt
+    durable state disabled the thread fence and a primary authority carrying another
+    thread was accepted on the recover/watchdog route.  There is no truthiness guard any
+    more: an empty ``requested_thread`` is itself refused here, by name, and the caller
+    (:func:`_load_authority_validated`) resolves its thread from the tri-state evidence
+    BEFORE this function and refuses ``unreadable`` and ``proven_absent`` by their own
+    names.  Nothing reaches the comparison below without a thread to compare against.
     """
+    if not requested_thread:
+        raise LauncherError(
+            f"{STANDALONE_THREAD_EVIDENCE_ABSENT}: the persisted runtime-state authority at "
+            f"{target} for run {run_id!r} cannot be validated because no thread identity "
+            "was resolved to check its immutable thread binding against; recovery is "
+            "refused rather than composed from a record whose thread was not verified")
     if (not isinstance(record, dict)
             or record.get("schema") != STANDALONE_AUTHORITY_SCHEMA
             or record.get("adapter") != STANDALONE_ADAPTER
@@ -472,42 +544,107 @@ def _validate_authority_record(record: Any, target: Any, run_id: str,
             or record.get("approval_authority") in (None, "")
             or not isinstance(record.get("profile_digest"), str)
             or not record["profile_digest"]
+            or not isinstance(record.get("prompt_composition_digest"), str)
+            or not record["prompt_composition_digest"]
             or not isinstance(record.get("thread_id"), str)
-            or (requested_thread and record.get("thread_id") != requested_thread)):
+            or not record["thread_id"]
+            or record["thread_id"] != requested_thread):
         raise LauncherError(
             f"{STANDALONE_ADAPTER_REQUIRES_LEDGER}: the persisted runtime-state authority "
             f"at {target} is not a complete standalone launch binding for run {run_id!r} "
             f"thread {requested_thread!r} (ledger / approval authority / profile digest / "
-            "thread); recovery is refused rather than composed from an incomplete, foreign "
-            "or wrong-thread record")
+            "prompt composition digest / thread); recovery is refused rather than composed "
+            "from an incomplete, foreign or wrong-thread record")
     return record
 
 
-def durable_thread_evidence(artifact_base: Any, run_id: str) -> str:
+class DurableThreadEvidence(dict):
+    """Blocker 3's TRI-STATE answer to "which thread did this run launch?".
+
+    ``kind`` is one of :data:`THREAD_EVIDENCE_PRESENT` (``thread_id`` names it and
+    ``source`` says which durable record did), :data:`THREAD_EVIDENCE_PROVEN_ABSENT` (the
+    pause store and the checkpoint store were BOTH READ and neither holds a record for the
+    run) or :data:`THREAD_EVIDENCE_UNREADABLE` (a read FAILED -- ``source`` names the
+    store and ``detail`` the failure).  A mapping rather than a string so that an
+    unreadable store can never be spelled the same as an absent one.
+    """
+
+    @property
+    def kind(self) -> str:
+        return str(self["kind"])
+
+    @property
+    def thread_id(self) -> str:
+        return str(self.get("thread_id") or "")
+
+    @property
+    def present(self) -> bool:
+        return self.kind == THREAD_EVIDENCE_PRESENT
+
+
+def durable_thread_evidence(artifact_base: Any, run_id: str) -> DurableThreadEvidence:
     """The thread the run ACTUALLY launched, read from its own durable records.  B1'.
 
     Every recovery route -- resume / cancel / abandon / recover / watchdog -- must validate
     the authority's immutable thread binding against this, never against a caller-supplied
     empty string.  The order mirrors the Watchdog wiring's own `bindings_for`: the pause
-    record's thread if the run is paused, else the committed checkpoint head's thread.  A
-    run with neither is not recoverable (it fails `RECOVERY_HEAD_MISSING` downstream), and
-    returns ``""`` -- there is genuinely no durable thread to cross-check against.
+    record's thread if the run is paused, else the committed checkpoint head's thread.
+
+    Round-7 blocker 3: the answer is a :class:`DurableThreadEvidence` TRI-STATE, never a
+    bare string.  A pause store or checkpoint that cannot be read is reported as
+    ``unreadable`` with the failing store named -- it used to be swallowed into ``""``,
+    the same spelling as a genuine absence, which let corrupt durable state disable the
+    thread fence.  ``proven_absent`` is reported only when BOTH stores were read
+    successfully and neither names a thread.
     """
     base = Path(artifact_base)
     try:
         from . import pause_store
         record = pause_store.store_for(run_id, artifact_base=base).read(run_id)
-    except Exception:  # noqa: BLE001 - an unreadable pause store is not thread evidence
-        record = None
+    except Exception as exc:  # noqa: BLE001 - an unreadable pause store is UNREADABLE evidence
+        return DurableThreadEvidence(kind=THREAD_EVIDENCE_UNREADABLE, thread_id="",
+                                     source="pause_store",
+                                     detail=f"{type(exc).__name__}: {exc}")
     thread = str((record or {}).get("thread_id") or "")
     if thread:
-        return thread
+        return DurableThreadEvidence(kind=THREAD_EVIDENCE_PRESENT, thread_id=thread,
+                                     source="pause_record", detail="")
     try:
         from . import recovery_runtime
         head = recovery_runtime.resolve_head(run_id, artifact_base=base)
-    except Exception:  # noqa: BLE001 - no committed head: no durable thread evidence
-        return ""
-    return str(getattr(head, "thread_id", "") or "")
+    except Exception as exc:  # noqa: BLE001 - an unreadable checkpoint is UNREADABLE evidence
+        return DurableThreadEvidence(kind=THREAD_EVIDENCE_UNREADABLE, thread_id="",
+                                     source="checkpoint_store",
+                                     detail=f"{type(exc).__name__}: {exc}")
+    thread = str(getattr(head, "thread_id", "") or "")
+    if thread:
+        return DurableThreadEvidence(kind=THREAD_EVIDENCE_PRESENT, thread_id=thread,
+                                     source="checkpoint_head", detail="")
+    return DurableThreadEvidence(kind=THREAD_EVIDENCE_PROVEN_ABSENT, thread_id="",
+                                 source="pause_store+checkpoint_store", detail="")
+
+
+def resolve_recovery_thread(artifact_base: Any, run_id: str, thread_id: str = "") -> str:
+    """The thread a recovery route validates against: the caller's own when it names one,
+    else the run's durable evidence -- with ``unreadable`` and ``proven_absent`` each
+    refused BY NAME (blocker 3) rather than collapsed into an empty string."""
+    if thread_id:
+        return thread_id
+    evidence = durable_thread_evidence(artifact_base, run_id)
+    if evidence.kind == THREAD_EVIDENCE_UNREADABLE:
+        raise LauncherError(
+            f"{STANDALONE_THREAD_EVIDENCE_UNREADABLE}: run {run_id!r}'s durable thread "
+            f"evidence could not be read from its {evidence['source']} "
+            f"({evidence['detail']}); an unreadable authority is not an absent one, and "
+            "recovery is refused rather than composed without a verified thread binding")
+    if evidence.kind != THREAD_EVIDENCE_PRESENT:
+        raise LauncherError(
+            f"{STANDALONE_THREAD_EVIDENCE_ABSENT}: run {run_id!r} has no durable thread "
+            "evidence (its pause store holds no record and its checkpoint store holds no "
+            "committed head), so the recorded launch authority's thread binding cannot be "
+            "validated and there is nothing to recover; recovery is refused rather than "
+            "composed from an unverified record")
+    return evidence.thread_id
 
 
 def _load_authority_validated(artifact_base: Any, run_id: str,
@@ -523,7 +660,7 @@ def _load_authority_validated(artifact_base: Any, run_id: str,
         raise LauncherError(
             f"{STANDALONE_ADAPTER_REQUIRES_LEDGER}: the persisted runtime-state authority "
             f"at {target} is unreadable ({exc})") from exc
-    effective_thread = thread_id or durable_thread_evidence(artifact_base, run_id)
+    effective_thread = resolve_recovery_thread(artifact_base, run_id, thread_id)
     return _validate_authority_record(record, target, run_id, effective_thread)
 
 
@@ -551,7 +688,8 @@ def load_standalone_authority(artifact_base: Any, run_id: str,
 def check_standalone_authority(artifact_base: Any, run_id: str, *, runtime_state_path: Any,
                                thread_id: str = "",
                                approval_authority: str = "none",
-                               profile_digest: str = "") -> dict[str, Any] | None:
+                               profile_digest: str = "",
+                               prompt_composition_digest: str = "") -> dict[str, Any] | None:
     """READ-ONLY exact-match check: the recorded binding for this run/thread, or ``None``
     when none is recorded; a recorded binding that DIFFERS raises
     ``STANDALONE_AUTHORITY_CONFLICT``.  Writes nothing.  CORRECTION 2 split this out of
@@ -565,7 +703,8 @@ def check_standalone_authority(artifact_base: Any, run_id: str, *, runtime_state
         return None
     wanted = _authority_record(run_id, runtime_state_path=runtime_state_path,
                                thread_id=thread_id, approval_authority=approval_authority,
-                               profile_digest=profile_digest)
+                               profile_digest=profile_digest,
+                               prompt_composition_digest=prompt_composition_digest)
     try:
         current = json.loads(target.read_text(encoding="utf-8"))
     except OSError as exc:
@@ -590,21 +729,35 @@ def check_standalone_authority(artifact_base: Any, run_id: str, *, runtime_state
 def publish_standalone_launch_bindings(artifact_base: Any, run_id: str, *,
                                        profile_spec: Mapping[str, Any],
                                        runtime_state_path: Any, thread_id: str = "",
-                                       approval_authority: str = "none") -> None:
-    """The ONE write of a standalone run's launch bindings: the profile, then the
-    create-once / exact-match authority record that BINDS its digest.  CORRECTION 2:
-    called by `execute_state` only after the run-scoped execution authority has been
-    claimed SUCCESSFULLY -- so an invocation refused `EXECUTION_AUTHORITY_HELD` can never
-    create or change the binding a Watchdog will recover from -- and before any spawn, so
-    a recovery of anything this launch does can rebuild its runtime.  An in-memory ledger
-    names no path and records no binding (the profile is still kept)."""
+                                       approval_authority: str = "none",
+                                       prompt_composition: Mapping[str, Any] | None = None
+                                       ) -> None:
+    """The ONE write of a standalone run's launch bindings: the profile, the PROMPT
+    COMPOSITION (round-7 blocker 2), then the create-once / exact-match authority record
+    that BINDS both digests.  CORRECTION 2: called by `execute_state` only after the
+    run-scoped execution authority has been claimed SUCCESSFULLY -- so an invocation
+    refused `EXECUTION_AUTHORITY_HELD` can never create or change the binding a Watchdog
+    will recover from -- and before any spawn, so a recovery of anything this launch does
+    can rebuild its runtime AND its production prompt.  An in-memory ledger names no path
+    and records no binding (the profile and the composition are still kept).
+
+    ``prompt_composition`` is the composition RECORD (:func:`prompt_composition_record`);
+    ``None`` means the launch supplied none, which is persisted as the launch's OWN
+    ``composer: none`` declaration -- distinct, by record, from a composition that was
+    lost.
+    """
     persist_standalone_profile(artifact_base, run_id, profile_spec)
+    composition = (dict(prompt_composition) if prompt_composition is not None
+                   else prompt_composition_record(None))
+    persist_standalone_prompt_composition(artifact_base, run_id, composition)
     if runtime_state_path is not None:
         persist_standalone_authority(artifact_base, run_id,
                                      runtime_state_path=runtime_state_path,
                                      thread_id=thread_id,
                                      approval_authority=approval_authority,
-                                     profile_digest=profile_digest(profile_spec))
+                                     profile_digest=profile_digest(profile_spec),
+                                     prompt_composition_digest=prompt_composition_digest(
+                                         composition))
 
 
 def _read_profile_file(target: Path) -> dict[str, Any] | None:
@@ -649,6 +802,154 @@ def load_standalone_profile(artifact_base: Any, run_id: str,
                 "rather than rebuilt from")
         return spec
     return _read_profile_file(standalone_profile_path(artifact_base, run_id))
+
+
+# ---- round-7 blocker 2: the PROMPT COMPOSITION a launch persists for its recoveries ----
+def prompt_composition_record(objective: str | None, *,
+                              requested_phases: tuple[str, ...] = (),
+                              risk: str = "high",
+                              project_root: Any = None,
+                              role_instructions: Mapping[str, Any] | None = None
+                              ) -> dict[str, Any]:
+    """The NON-SECRET inputs :func:`build_standalone_prompt_composer` needs, as ONE durable
+    record.  ``objective=None`` (or empty) declares ``composer: none`` -- the launch named
+    no task contract and delivers the canonical intent payload -- which is the launch's
+    own declaration and is recorded as such.  Everything else is exactly what the launch
+    handed the composer: the task contract, the requested phases, the risk, the ABSOLUTE
+    project root the quality profile is read under (blocker 7) and the role instructions
+    the launch supplied as data.  No secret can appear here: none of these inputs is one.
+    """
+    if not objective:
+        return {"schema": STANDALONE_PROMPT_COMPOSITION_SCHEMA,
+                "composer": PROMPT_COMPOSER_NONE}
+    return {"schema": STANDALONE_PROMPT_COMPOSITION_SCHEMA,
+            "composer": PROMPT_COMPOSER_PRODUCTION,
+            "objective": str(objective),
+            "requested_phases": [str(phase) for phase in requested_phases],
+            "risk": str(risk),
+            "project_root": (str(Path(project_root).resolve())
+                             if project_root is not None else None),
+            "role_instructions": {str(key): str(value)
+                                  for key, value in dict(role_instructions or {}).items()}}
+
+
+def prompt_composition_payload(composition: Mapping[str, Any]) -> str:
+    """The canonical serialisation of a composition record -- the bytes its digest names."""
+    return json.dumps(dict(composition), sort_keys=True, indent=2, ensure_ascii=False)
+
+
+def prompt_composition_digest(composition: Mapping[str, Any]) -> str:
+    """The content address the run/thread authority binds (blocker 2), computed over
+    :func:`prompt_composition_payload` exactly as :func:`profile_digest` is over the
+    profile, so a recovery can VERIFY the archive it rebuilds from."""
+    import hashlib
+    return hashlib.sha256(prompt_composition_payload(composition).encode("utf-8")
+                          ).hexdigest()[:16]
+
+
+def standalone_prompt_composition_path(artifact_base: Any, run_id: str) -> Path:
+    """``standalone/prompt_composition.json`` -- the CURRENT composition, beside the
+    profile, for a run that recorded no authority binding (in-memory ledger)."""
+    return standalone_profile_path(artifact_base, run_id).with_name("prompt_composition.json")
+
+
+def prompt_composition_archive_path(artifact_base: Any, run_id: str, digest: str) -> Path:
+    """``standalone/prompt_compositions/<digest>.json`` -- write-once, content-addressed."""
+    return (standalone_profile_path(artifact_base, run_id).parent / "prompt_compositions"
+            / f"{digest}.json")
+
+
+def persist_standalone_prompt_composition(artifact_base: Any, run_id: str,
+                                          composition: Mapping[str, Any]) -> Path:
+    """Write the composition durably: the content-addressed archive (write-once) and the
+    run's current composition (rewritten only when it changes) -- the same two-file
+    discipline as :func:`persist_standalone_profile`, for the same reason."""
+    target = standalone_prompt_composition_path(artifact_base, run_id)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    payload = prompt_composition_payload(composition) + "\n"
+    archive = prompt_composition_archive_path(artifact_base, run_id,
+                                             prompt_composition_digest(composition))
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    if not archive.exists():
+        _durable_write(archive, payload)
+    current = None
+    if target.exists():
+        try:
+            current = target.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise LauncherError(
+                f"{STANDALONE_PROMPT_COMPOSITION_MISSING}: the persisted prompt composition "
+                f"at {target} is unreadable ({exc})") from exc
+    if current != payload:
+        _durable_write(target, payload)
+    return target
+
+
+def _read_composition_file(target: Path, run_id: str) -> dict[str, Any] | None:
+    if not target.exists():
+        return None
+    try:
+        record = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise LauncherError(
+            f"{STANDALONE_PROMPT_COMPOSITION_MISSING}: run {run_id!r}'s persisted prompt "
+            f"composition at {target} is unreadable ({exc}); the production prompt cannot "
+            "be rebuilt and recovery is refused rather than dispatching raw intent JSON"
+        ) from exc
+    if (not isinstance(record, dict)
+            or record.get("schema") != STANDALONE_PROMPT_COMPOSITION_SCHEMA
+            or record.get("composer") not in (PROMPT_COMPOSER_PRODUCTION,
+                                              PROMPT_COMPOSER_NONE)):
+        raise LauncherError(
+            f"{STANDALONE_PROMPT_COMPOSITION_MISSING}: run {run_id!r}'s persisted prompt "
+            f"composition at {target} is not a composition record; the production prompt "
+            "cannot be rebuilt and recovery is refused rather than dispatching raw intent "
+            "JSON")
+    return record
+
+
+def load_standalone_prompt_composition(artifact_base: Any, run_id: str, *,
+                                       digest: str = "") -> dict[str, Any] | None:
+    """The persisted composition record.  With a ``digest`` (the one the run/thread
+    authority bound) the content-addressed archive is read and VERIFIED against it, and a
+    missing / unreadable / mismatching archive is the typed refusal
+    :data:`STANDALONE_PROMPT_COMPOSITION_MISSING`.  Without one -- a run that recorded no
+    authority binding -- the current ``prompt_composition.json`` is read, and ``None`` is
+    returned only when that file does not exist (a run that was composed but never
+    launched persisted nothing at all)."""
+    if digest:
+        archive = prompt_composition_archive_path(artifact_base, run_id, digest)
+        record = _read_composition_file(archive, run_id)
+        if record is None:
+            raise LauncherError(
+                f"{STANDALONE_PROMPT_COMPOSITION_MISSING}: run {run_id!r} bound prompt "
+                f"composition digest {digest!r} but its archive {archive} is missing; the "
+                "production prompt cannot be rebuilt and recovery is refused rather than "
+                "dispatching raw intent JSON")
+        if prompt_composition_digest(record) != digest:
+            raise LauncherError(
+                f"{STANDALONE_PROMPT_COMPOSITION_MISSING}: the prompt composition archive "
+                f"{archive} does not hash to the digest {digest!r} the launch bound; it is "
+                "refused rather than rebuilt from")
+        return record
+    return _read_composition_file(standalone_prompt_composition_path(artifact_base, run_id),
+                                  run_id)
+
+
+def composer_from_composition(composition: Mapping[str, Any] | None) -> Any:
+    """The prompt composer a persisted composition record describes: ``None`` for a
+    ``composer: none`` declaration (or no record at all), else the production renderer
+    rebuilt through :func:`build_standalone_prompt_composer` from the SAME inputs the
+    launch used -- objective, phases, risk, project root and role instructions."""
+    if composition is None or composition.get("composer") != PROMPT_COMPOSER_PRODUCTION:
+        return None
+    root = composition.get("project_root")
+    return build_standalone_prompt_composer(
+        objective=str(composition.get("objective") or ""),
+        requested_phases=tuple(composition.get("requested_phases") or ()),
+        risk=str(composition.get("risk") or "high"),
+        project_root=Path(root) if root else None,
+        role_instructions=dict(composition.get("role_instructions") or {}))
 
 
 def standalone_migration_log_path(artifact_base: Any, run_id: str) -> Path:
@@ -735,6 +1036,54 @@ def _append_migration_record(artifact_base: Any, run_id: str, record: dict[str, 
     _durable_append(log, json.dumps(record, sort_keys=True) + "\n")
 
 
+def standalone_migration_lock_path(artifact_base: Any, run_id: str) -> Path:
+    """The run-scoped INTER-PROCESS lock file every migration and reconciliation of this
+    run's profile authority takes (round-7 blocker 5).  Beside the log it serialises."""
+    return standalone_profile_path(artifact_base, run_id).with_name("profile_migrations.lock")
+
+
+class _MigrationLock:
+    """A real ``fcntl.flock`` on the run's lock file, held for the WHOLE of a migration
+    or a reconciliation (round-7 consolidated review, blocker 5).
+
+    Two interleavings were possible without it.  A recovery READ between the migrator's
+    authority re-bind and its committed append reconciled the operation first -- rolling
+    it forward -- and the migrator then appended the same terminal record, leaving
+    ``prepared -> committed -> committed``.  And two concurrent migrators read the same
+    old digest and epoch, both re-bound, and both committed a non-linear history.  The
+    lock is exclusive and process-scoped (a second open file description of the same
+    file blocks, so two threads of one process serialise as well), released on every
+    exit including a crash, and taken by BOTH the writer and the reader side so neither
+    can observe the other mid-operation.  Not re-entrant: :func:`migrate_standalone_profile`
+    reconciles through the ``_locked`` variant while it holds the lock.
+    """
+
+    def __init__(self, artifact_base: Any, run_id: str) -> None:
+        self.path = standalone_migration_lock_path(artifact_base, run_id)
+        self._fd = -1
+
+    def __enter__(self) -> "_MigrationLock":
+        import fcntl
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._fd = os.open(str(self.path), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(self._fd, fcntl.LOCK_EX)
+        except BaseException:
+            os.close(self._fd)
+            self._fd = -1
+            raise
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        import fcntl
+        if self._fd >= 0:
+            try:
+                fcntl.flock(self._fd, fcntl.LOCK_UN)
+            finally:
+                os.close(self._fd)
+                self._fd = -1
+
+
 def reconcile_standalone_migrations(artifact_base: Any, run_id: str,
                                     thread_id: str = "") -> None:
     """Deterministically finish or roll back every interrupted migration (F-001).
@@ -752,7 +1101,21 @@ def reconcile_standalone_migrations(artifact_base: Any, run_id: str,
 
     Append-only and idempotent: a migration already terminal is skipped, so a second
     reconciliation (or a reconciliation racing a replay) adds nothing.  Fast no-op when the
-    run has no migration log at all -- which is every run that never migrated."""
+    run has no migration log at all -- which is every run that never migrated.
+
+    Round-7 blocker 5: the reconciliation runs UNDER the run's inter-process migration
+    lock, so it can never observe a live migrator between its re-bind and its committed
+    append (and finish the operation out from under it); an interrupted attempt it does
+    observe is one whose migrator is gone."""
+    if not standalone_migration_log_path(artifact_base, run_id).exists():
+        return
+    with _MigrationLock(artifact_base, run_id):
+        _reconcile_standalone_migrations_locked(artifact_base, run_id, thread_id)
+
+
+def _reconcile_standalone_migrations_locked(artifact_base: Any, run_id: str,
+                                            thread_id: str = "") -> None:
+    """The body of :func:`reconcile_standalone_migrations`; the caller HOLDS the lock."""
     if not standalone_migration_log_path(artifact_base, run_id).exists():
         return
     for mid, by_state in _migration_states_by_id(artifact_base, run_id, thread_id).items():
@@ -812,12 +1175,28 @@ def migrate_standalone_profile(artifact_base: Any, run_id: str, *, thread_id: st
         raise LauncherError(
             f"{STANDALONE_MIGRATION_REFUSED}: a profile migration requires a non-empty "
             "--actor-id and --reason; an unattributable re-bind is not an audited act")
-    reconcile_standalone_migrations(artifact_base, run_id, thread_id)
-    record = load_standalone_authority(artifact_base, run_id, thread_id)
+    # Round-7 blocker 5: the WHOLE operation -- reconcile, read, prepare, archive, CAS
+    # re-bind, commit -- runs under the run's inter-process lock, so no reader reconciles
+    # it half-way and no second migrator interleaves with it.
+    with _MigrationLock(artifact_base, run_id):
+        return _migrate_standalone_profile_locked(
+            artifact_base, run_id, thread_id=thread_id, new_profile_spec=new_profile_spec,
+            actor=actor, reason=reason)
+
+
+def _migrate_standalone_profile_locked(artifact_base: Any, run_id: str, *, thread_id: str,
+                                       new_profile_spec: Mapping[str, Any], actor: str,
+                                       reason: str) -> dict[str, Any]:
+    """The body of :func:`migrate_standalone_profile`; the caller HOLDS the lock."""
+    _reconcile_standalone_migrations_locked(artifact_base, run_id, thread_id)
+    record = _load_authority_validated(artifact_base, run_id, thread_id)
     if record is None:
         raise LauncherError(
             f"{STANDALONE_MIGRATION_REFUSED}: run {run_id!r} (thread {thread_id!r}) records "
             "no standalone launch binding to migrate")
+    # Blocker 1: the operation is attributed to the thread the authority ACTUALLY binds
+    # (the effective identity), never to an empty caller-supplied one.
+    thread_id = str(record["thread_id"])
     new_digest = profile_digest(new_profile_spec)
     old_digest = str(record["profile_digest"])
     committed_records = standalone_committed_migrations(artifact_base, run_id, thread_id)
@@ -862,7 +1241,28 @@ def migrate_standalone_profile(artifact_base: Any, run_id: str, *, thread_id: st
                               "prepared_at": _authority_now()})
     # (4) archive the new profile (write-once, content-addressed).
     persist_standalone_profile(artifact_base, run_id, new_profile_spec)
-    # (5) atomically re-bind the authority to the new digest.
+    # (5) COMPARE-AND-SWAP, then atomically re-bind the authority to the new digest.
+    # Blocker 5: the authority and the committed epoch are RE-READ under the lock right
+    # before the re-bind and must still be the ones this operation was prepared against;
+    # any movement means another writer got in and this attempt is refused (its prepared
+    # record is rolled back by name) rather than re-binding over a digest it never
+    # validated.  Under the lock this cannot fire; it is the invariant stated as code.
+    current = _load_authority_validated(artifact_base, run_id, thread_id)
+    current_digest = str((current or {}).get("profile_digest") or "")
+    current_epoch = len(standalone_committed_migrations(artifact_base, run_id, thread_id))
+    if current_digest != old_digest or current_epoch != epoch:
+        _append_migration_record(artifact_base, run_id,
+                                 {**base_record, "state": MIGRATION_ROLLED_BACK,
+                                  "recorded_at": _authority_now(),
+                                  "cas_failed": {"expected_digest": old_digest,
+                                                 "observed_digest": current_digest,
+                                                 "expected_epoch": epoch,
+                                                 "observed_epoch": current_epoch}})
+        raise LauncherError(
+            f"{STANDALONE_MIGRATION_REFUSED}: run {run_id!r} (thread {thread_id!r}) "
+            f"authority moved from digest {old_digest!r} / epoch {epoch} to "
+            f"{current_digest!r} / epoch {current_epoch} before the re-bind; the attempt "
+            "is rolled back and must be re-issued against the current authority")
     migrated = dict(record)
     migrated["profile_digest"] = new_digest
     _durable_write(standalone_authority_path(artifact_base, run_id, thread_id, for_write=True),
@@ -973,6 +1373,24 @@ def build_standalone_prompt_composer(*, objective: str,
     harness = _import_orca_runtime()
     from . import artifact_identity
     instructions = dict(role_instructions or {})
+    # ---- round-7 consolidated review, follow-up item 7 -------------------------------
+    # `project_root` used to be accepted and IGNORED: `dispatch_context` then fell back
+    # to the harness's import-time `REPO_QUALITY_PROFILE`, i.e. the quality profile of
+    # THIS repository, whatever project the run was pointed at.  The profile is now
+    # resolved ONCE, here, under the given root -- the same `resolve_quality_profile`
+    # the Orca path's `OrcaRuntimeHarness.__init__` / `start_run` use, defaulting to the
+    # working directory exactly as `build_orca_adapter` does -- and an INVALID profile
+    # is the same pre-dispatch refusal the Orca path raises (`INVALID_QUALITY_PROFILE`),
+    # before any process exists.  An absent profile renders the absent block; a loaded
+    # one renders its attributes into every role's quality gate block.
+    quality = _import_quality_profile()
+    root = Path(project_root) if project_root is not None else Path.cwd()
+    quality_profile = quality.resolve_quality_profile(root)
+    if quality_profile.is_invalid:
+        raise LauncherError(
+            f"{quality.INVALID_PROFILE_REASON}: {root / quality_profile.path} exists but is "
+            f"not a valid quality profile ({quality_profile.error}); no standalone dispatch "
+            "is composed and the generic checklist is not restored")
 
     def render(intent: Mapping[str, Any]) -> str:
         role = str(intent.get("role") or "WORKER")
@@ -985,6 +1403,7 @@ def build_standalone_prompt_composer(*, objective: str,
         spec, _boundary, _reviewer_ctx = harness.dispatch_context(
             ctx_role, gate_iteration, mode, phase=phase, base_spec=objective,
             run_id=str(intent.get("run_id") or ""),
+            quality_profile=quality_profile,
             requested_phases=tuple(p.lower() for p in requested_phases),
             risk=risk, risk_source="explicit",
             repair_instruction=repair_instruction)
@@ -1038,7 +1457,8 @@ def build_standalone_adapter(spec: dict[str, Any], *, artifact_base: Path,
                              run_id: str = "", runtime_state: Any = None,
                              profile_spec: Any = None,
                              approval_port: Any = None,
-                             prompt_composer: Any = None) -> tuple[Any, dict[str, Any]]:
+                             prompt_composition: Mapping[str, Any] | None = None
+                             ) -> tuple[Any, dict[str, Any]]:
     """Compose the standalone adapter and the state it declares, in the fixed order.
 
     Composition order matches the Orca path's exactly -- journal, then ledger, then the
@@ -1095,8 +1515,20 @@ def build_standalone_adapter(spec: dict[str, Any], *, artifact_base: Path,
     # `publish_launch_bindings`, which `execute_state` calls immediately after a
     # SUCCESSFUL claim and before any spawn, and a refused claim never reaches.
     ledger_path = getattr(runtime_state, "path", None)
-    thread_id = str(spec.get("thread_id") or "")
+    # Round-7 blocker 1: the EFFECTIVE thread identity -- the same resolver `build_state`
+    # binds into the state (and `run_cli` keys the default ledger on) -- so a launch that
+    # omits `thread_id` records ONE identity everywhere, never `""` in the authority and
+    # `"launcher"` in the state and ledger.  Asserted structurally against the state
+    # built below.
+    thread_id = str(effective_thread_id(spec))
     approval_authority = approval_authority_name(approval_port)
+    # Blocker 2: the prompt composition is DATA at this boundary -- the record that is
+    # persisted at launch and bound (by digest) into the authority -- and the renderer is
+    # derived from it by the one function a recovery also derives it from.  ``None``
+    # declares `composer: none` (the canonical-intent payload of the scripted paths).
+    composition = (dict(prompt_composition) if prompt_composition is not None
+                   else prompt_composition_record(None))
+    composer = composer_from_composition(composition)
     if ledger_path is not None:
         # Finding 2: the pre-claim exact-match check binds the profile digest too, so a
         # relaunch of the same run/thread with a DIFFERENT profile is refused before any
@@ -1104,7 +1536,9 @@ def build_standalone_adapter(spec: dict[str, Any], *, artifact_base: Path,
         check_standalone_authority(artifact_base, resolved_run,
                                    runtime_state_path=ledger_path, thread_id=thread_id,
                                    approval_authority=approval_authority,
-                                   profile_digest=profile_digest(profile_spec))
+                                   profile_digest=profile_digest(profile_spec),
+                                   prompt_composition_digest=prompt_composition_digest(
+                                       composition))
     adapter = StandaloneAdapter(runtime, runtime_state=runtime_state,
                                 settlement_journal=journal,
                                 pause_row_journal=_standalone_pause_row_journal(
@@ -1114,14 +1548,15 @@ def build_standalone_adapter(spec: dict[str, Any], *, artifact_base: Path,
                                 # Finding 5: the production prompt renderer, when the
                                 # composition root supplies one.  ``None`` keeps the
                                 # canonical-intent payload for the scripted/fake paths.
-                                prompt_composer=prompt_composer)
+                                prompt_composer=composer)
     # The post-claim publication step (CORRECTION 2), bound to THIS composition's facts
     # and attached to the adapter so `execute_state` -- which is adapter-neutral and reads
     # it by name -- can run it once the run is really this process's to launch.
     adapter.publish_launch_bindings = functools.partial(
         publish_standalone_launch_bindings, artifact_base, resolved_run,
         profile_spec=profile_spec, runtime_state_path=ledger_path,
-        thread_id=thread_id, approval_authority=approval_authority)
+        thread_id=thread_id, approval_authority=approval_authority,
+        prompt_composition=composition)
     # ---- OS-37 external review #10: the capability SNAPSHOT comes LAST ----------------
     # `build_standalone_state` reads `adapter.capabilities()`, and `external_resume` is
     # declared only when the identity fence has an authority to live in -- i.e. only once
@@ -1139,6 +1574,11 @@ def build_standalone_adapter(spec: dict[str, Any], *, artifact_base: Path,
             "declaration this state carries is snapshotted from the live adapter and "
             "external_resume is withdrawn while the identity fence has no ledger to live in")
     state = build_standalone_state({**spec, "run_id": resolved_run}, adapter)
+    if state["thread_id"] != thread_id:
+        raise LauncherError(
+            f"{STANDALONE_ADAPTER_REQUIRES_LEDGER}: the state binds thread "
+            f"{state['thread_id']!r} but the launch authority would record {thread_id!r}; "
+            "one launch has exactly one thread identity")
     return adapter, state
 
 
@@ -1619,6 +2059,15 @@ def _import_orca_runtime() -> Any:
     except ImportError:  # pragma: no cover - flat installed Skill layout
         import orca_runtime_harness  # type: ignore[no-redef]
     return orca_runtime_harness
+
+
+def _import_quality_profile() -> Any:
+    """The quality-profile resolver, from the repository or the installed Skill layout."""
+    try:
+        from scripts import quality_profile
+    except ImportError:  # installed Skill layout exposes sibling tools directly
+        import quality_profile  # type: ignore[no-redef]
+    return quality_profile
 
 
 def _import_agent_profile() -> Any:
@@ -2273,6 +2722,16 @@ def run_pause_cli(argv: list[str]) -> int:
     except LauncherError as exc:
         print(f"run_workflow: {exc}", file=sys.stderr)
         return USAGE_EXIT_CODE
+    except pause_store.PauseStoreError as exc:
+        # Round-7 blocker 3.  The pause record is the DURABLE THREAD EVIDENCE every
+        # resume / cancel / abandon binds to; a store that exists and cannot be read is
+        # a typed, fail-closed refusal at this boundary -- adapter-neutral in shape, and
+        # named for the standalone composition whose thread fence it protects -- never
+        # an unhandled traceback and never an absence.
+        print(f"run_workflow: {STANDALONE_THREAD_EVIDENCE_UNREADABLE}: the durable pause "
+              f"record of run {args.run_id!r} could not be read ({exc}); an unreadable "
+              "authority is not an absent one and the verb is refused", file=sys.stderr)
+        return USAGE_EXIT_CODE
     if args.json:
         print(json.dumps(summary, sort_keys=True, ensure_ascii=False, default=str))
     else:
@@ -2497,10 +2956,32 @@ def standalone_recovery_composition(base: Path, run_id: str, *, thread_id: str,
                                        profile_spec=profile_spec,
                                        journal=execution_journal)
     approval_port = standalone_approval_port_for(base, run_id, thread_id)
+    # ---- round-7 consolidated review, blocker 2 ----------------------------------------
+    # The re-entry used to rebuild the adapter WITHOUT the production prompt composer, so
+    # the next Worker / Reviewer dispatch after a resume or a watchdog recovery received
+    # the raw `ActionIntent` JSON instead of the objective, role, task / review-output
+    # contract and correction instruction the launch delivered.  The composition inputs
+    # are persisted at launch (`publish_standalone_launch_bindings`) and their digest is
+    # bound into the same authority record that names the profile; here they are read
+    # back through that binding -- verified by content -- and the SAME renderer is
+    # rebuilt by `composer_from_composition`.  A bound composition that is missing,
+    # unreadable or does not hash to its digest is the typed refusal
+    # `STANDALONE_PROMPT_COMPOSITION_MISSING`: never a silent fallback to intent JSON.
+    # A `composer: none` record is the launch's OWN declaration (it named no objective)
+    # and is honoured as such.  A run with NO authority binding at all (in-memory ledger,
+    # or composed but never launched) reads its current `prompt_composition.json`, and
+    # only a run that persisted nothing whatsoever composes nothing.
+    recorded_composition = str((record or {}).get("prompt_composition_digest") or "")
+    if recorded_composition:
+        composition = load_standalone_prompt_composition(base, run_id,
+                                                         digest=recorded_composition)
+    else:
+        composition = load_standalone_prompt_composition(base, run_id)
     adapter = StandaloneAdapter(
         runtime, runtime_state=ledger, settlement_journal=execution_journal,
         pause_row_journal=pause_row_journal, approval_port=approval_port,
-        artifact_base=base, run_id=run_id)
+        artifact_base=base, run_id=run_id,
+        prompt_composer=composer_from_composition(composition))
     return adapter, execution_journal, approval_port
 
 
@@ -2965,23 +3446,24 @@ def run_cli(argv: list[str] | None = None) -> int:
             # rather than the canonical intent JSON.  A launch with no objective renders
             # nothing (the pre-finding behaviour) -- the objective is required only for a
             # run whose agents must be told what to do.
+            # Round-7 blocker 2: the composition is handed over as the DATA record that
+            # `execute_state` persists after the claim (and the authority binds), so a
+            # resume / watchdog recovery rebuilds the identical renderer from it.
             objective = str(args.objective or orca_spec.get("objective") or "")
-            composer = None
-            if objective:
-                composer = build_standalone_prompt_composer(
-                    objective=objective,
-                    requested_phases=tuple(orca_spec.get("phases") or CANONICAL_PHASES),
-                    risk=str(orca_spec.get("risk") or "high"),
-                    project_root=(Path(args.project_root)
-                                  if getattr(args, "project_root", None) else None),
-                    role_instructions=orca_spec.get("role_instructions"))
+            composition = prompt_composition_record(
+                objective or None,
+                requested_phases=tuple(orca_spec.get("phases") or CANONICAL_PHASES),
+                risk=str(orca_spec.get("risk") or "high"),
+                project_root=(Path(args.project_root)
+                              if getattr(args, "project_root", None) else Path.cwd()),
+                role_instructions=orca_spec.get("role_instructions"))
             adapter, state = build_standalone_adapter(
                 orca_spec, artifact_base=Path(args.artifact_base),
                 run_id=resolved_run, runtime_state=runtime_state,
                 profile_spec=_standalone_profile_spec(args),
                 approval_port=configured_approval_port(
                     args.approval_authority, Path(args.artifact_base)),
-                prompt_composer=composer)
+                prompt_composition=composition)
         if args.adapter == ORCA_ADAPTER:
             # The production path.  The Run is created FIRST, because the run id it
             # returns is what the state, the artifact paths and the ledger are all named

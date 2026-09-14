@@ -64,7 +64,16 @@
 #                                the preflight probes included.  Finding #7 observes the
 #                                child environment the composition really built, at the
 #                                process boundary, rather than the one it meant to build.
+#   OS37_GA_PROMPT_DUMP=<dir>    write the WHOLE delivered prompt of every turn, one file
+#                                per pid, exactly as this process read it off its stdin
+#                                (round-7 blocker 2).  EVIDENCE of what the runtime
+#                                actually delivered after a resume / watchdog recovery --
+#                                never an input to anything this fixture decides.
 #
+# The delivered frame may be the canonical intent JSON (one line) OR the multi-line
+# PRODUCTION prompt `launcher.build_standalone_prompt_composer` renders.  For the latter
+# the role / phase / run / gate iteration are read from the prompt's own header line
+# ("You are the <ROLE> for the <PHASE> phase of run <RUN> (gate iteration <N>, ...)").
 # Answers `--version`, `--help` and the declared auth probe verb (`auth status`) like a real
 # CLI, because preflight runs all three under the same child env.
 # =====================================================================================
@@ -115,11 +124,32 @@ fi
 # 1. Readiness, on the structured channel, carrying the session id minted for THIS spawn.
 printf '{"type":"system","session_id":"%s"}\n' "$SESSION_ID"
 
-# 2. The delivered frame.  The runtime writes the frame then Enter, so it is one line.
+# 2. The delivered frame.  The runtime writes ONE bracketed-paste frame then Enter: a
+#    canonical intent is one line, a rendered production prompt spans several, and the
+#    frame's own END marker (ESC[201~) says where it stops.
 IFS= read -r PROMPT || PROMPT=""
+END_MARK="$(printf '\033[201~')"
+case "$PROMPT" in
+  *"$END_MARK"*) ;;
+  *) while IFS= read -r LINE; do
+       PROMPT="$PROMPT
+$LINE"
+       case "$LINE" in *"$END_MARK"*) break ;; esac
+     done ;;
+esac
+if [ -n "${OS37_GA_PROMPT_DUMP:-}" ]; then
+  mkdir -p "$OS37_GA_PROMPT_DUMP"
+  printf '%s' "$PROMPT" > "$OS37_GA_PROMPT_DUMP/$$.part"
+  mv "$OS37_GA_PROMPT_DUMP/$$.part" "$OS37_GA_PROMPT_DUMP/$$.prompt"
+fi
 
-# 3. The delivery proof the driver verifies.
+# 3. The delivery proof the driver verifies.  Round-7 follow-up item 6: a turn start
+#    alone is no longer delivery proof (both installed CLIs were measured starting a turn
+#    on their auth-failure legs), so after the turn start comes the record
+#    `claude_delivery_selector` accepts -- an `assistant` record bound to the minted
+#    session id, with a real model identifier and a server-issued request id.
 printf '{"type":"message_start"}\n'
+printf '{"type":"assistant","session_id":"%s","request_id":"req_graph_agent_1","message":{"model":"graph-agent-model-1","id":"msg_graph_agent_1","usage":{"input_tokens":2,"output_tokens":1}}}\n' "$SESSION_ID"
 
 # ---- the NO-COMPLETION leg (finding #8) --------------------------------------------
 # A turn that produced a delivery proof and then died without a completion record.  That
@@ -190,9 +220,24 @@ FIXTURES="$(cd "$(dirname "$0")/../../.." && pwd)/fixtures/decision_gate/valid" 
 /usr/bin/env python3 - <<'PY'
 import json, os, sys
 
+import re
+
 raw = os.environ["PROMPT"]
 start, end = raw.find("{"), raw.rfind("}")
-intent = json.loads(raw[start:end + 1]) if start >= 0 and end > start else {}
+intent = {}
+if start >= 0 and end > start:
+    try:
+        intent = json.loads(raw[start:end + 1])
+    except ValueError:
+        intent = {}
+if not isinstance(intent, dict) or "role" not in intent:
+    # The rendered PRODUCTION prompt: bind to its header line, never to a guess.
+    header = re.search(r"You are the (\S+) for the (\S+) phase of run (\S+) "
+                       r"\(gate iteration (\d+), round (\S+)\)", raw)
+    intent = {} if header is None else {
+        "role": header.group(1), "phase": header.group(2), "run_id": header.group(3),
+        "gate_iteration": int(header.group(4)), "phase_iteration": int(header.group(4)),
+        "round_kind": header.group(5), "intent_id": "rendered-%d" % os.getpid()}
 
 dump = os.environ.get("OS37_GA_INTENT_DUMP")
 if dump:                       # evidence, never a decision input

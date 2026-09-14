@@ -255,6 +255,67 @@ qualified "at the pinned revision".
   `<artifact_base>/runs/<run_id>/standalone/<session_id>/capture.log`, is written verbatim,
   and `release()` does not delete it -- so a completion question asked by a later process
   has something to read.  Its truncation, if any, is reported rather than silent.
+* **`post_ready_delivery`'s echo emulator is FIXTURE-ONLY and does NOT support an
+  interactive TUI.**  The framing / `\r` / termios-echo machinery in `standalone_drivers`
+  and `standalone_lifecycle` (`frame_prompt`, `resolve_delivery_echo`,
+  `expected_echo_forms`) exists so that a `post_ready_delivery` write into a pty can be
+  matched and EXCLUDED from a completion scan; it is exercised only by
+  `scripts/fixtures/os37/bin/os37-waiting-cli` and is used by NO installed `claude` /
+  `codex` profile (both declare `launch_with_prompt`).  It reads the slave's line
+  discipline (`ECHO`, `ICANON`, the `c_cc` special bytes) and derives the echo forms a
+  cooperative terminal would produce; it is NOT a terminal emulator and it does NOT solve a
+  future interactive TUI that redraws the prompt with `ECHO` disabled -- such a TUI paints
+  its own screen and the emulator would see none of it.  It is retained as the path that
+  carries the readiness-before-delivery guarantee for a future post-ready driver, and its
+  boundary is recorded here rather than claimed as general TUI support.  The round-7
+  correction does NOT extend it: a `turn_start` record alone is no longer accepted as
+  delivery in either mode (both installed CLIs were measured starting a turn on their
+  authentication-failure legs, before any prompt could execute), so a post-ready write is
+  now confirmed by the driver's OWN conjunctive delivery selector -- the same class-B
+  `agent_response` proof `launch_with_prompt` requires -- and `screen_echo` remains exactly
+  the proven echo it was.
+* **A launch that omits `thread_id` binds ONE identity everywhere** (round-7 blocker 1).
+  `build_state`, the default ledger path, the create-once authority, the persisted prompt
+  composition and the migration log all read the same `effective_thread_id` (`"launcher"`
+  when the spec names none), and `build_standalone_adapter` refuses a composition whose
+  state and authority thread disagree.  A second thread of one run records its own
+  `runtime_state.<thread>.json` and never collides with the primary.
+* **Recovery rebuilds the PRODUCTION PROMPT, or refuses by name** (round-7 blocker 2).  The
+  non-secret composition inputs (objective, requested phases, risk, absolute project root,
+  role instructions) are persisted at launch, content-addressed, and their digest is bound
+  into the same create-once authority that names the profile.  A resume or watchdog recovery
+  reads them back through that binding and rebuilds the SAME
+  `build_standalone_prompt_composer`, so the next Worker / Reviewer dispatch receives the
+  full production prompt -- objective, role, task / review-output contract and correction
+  instruction -- never raw `ActionIntent` JSON.  A bound composition that is missing,
+  unreadable or does not hash to its digest is the typed refusal
+  `STANDALONE_PROMPT_COMPOSITION_MISSING`; a launch that named no objective persists an
+  explicit `composer: none` declaration and is honoured as such.
+* **Durable thread evidence is a TRI-STATE** (round-7 blocker 3).
+  `durable_thread_evidence` reports `present` / `proven_absent` / `unreadable`, never a bare
+  string.  An unreadable or corrupt pause store or checkpoint is `STANDALONE_THREAD_EVIDENCE_UNREADABLE`
+  -- fail-closed on resume, recover, cancel, abandon and watchdog -- and is never conflated
+  with a genuine absence; the authority's immutable thread binding is validated against the
+  resolved evidence, and the validator refuses an empty thread rather than skipping the
+  check.
+* **Capture handoff never promotes unverifiable bytes** (round-7 blocker 4).  A meta that is
+  missing, unreadable, or disagrees with the file's length or digest is an IRREVERSIBLE
+  unanswerable state that no later append or meta rewrite can clear.  A suffix beyond the
+  meta-declared length is evidence ONLY when the supervisor's durable APPEND INTENT (written
+  before the data) describes it by offset, length and digest; any other tail -- a forged or
+  stale completion record included -- is `unverified_tail` and can never become settlement
+  evidence.  File-length inference is gone.
+* **Profile migration and reconciliation are SERIALIZED** (round-7 blocker 5).  One
+  run-scoped inter-process `fcntl.flock` (`standalone/profile_migrations.lock`) covers the
+  whole of a migration and of a reconciliation, and the migrator compares-and-swaps the
+  bound digest and epoch under the lock before it re-binds -- so a reader can never reconcile
+  a live migration half-way and two migrators can never both re-bind.  The log holds exactly
+  one terminal record per migration id and a linear old->new digest chain.
+* **`project_root` reaches the standalone quality gate** (round-7 item 7).
+  `build_standalone_prompt_composer(project_root=...)` resolves `.orca/quality-profile.yaml`
+  under that root into every dispatch's quality gate block -- absent renders the absent
+  block, and an invalid profile is the same pre-dispatch `INVALID_QUALITY_PROFILE` refusal
+  the Orca path raises, before any process exists.
 * **A dispatch blocks the caller for as long as the agent runs.**  That is the engine's own
   contract for `start` and is what `LeaseKeeper` renews across.  It does not make the
   caller the lifecycle owner: the child is a `setsid` session leader and the journal,

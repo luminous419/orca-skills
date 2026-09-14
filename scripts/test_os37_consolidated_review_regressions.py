@@ -1461,7 +1461,9 @@ class B1RuntimeRecordsTransportAtDeliveryTests(_Composed):
 
     def test_send_records_the_live_transport_and_journals_the_echo_verdict(self) -> None:
         run_id = "run_b1rt"
-        spec = stub_profile_spec("deliver-claude", worktree=self.worktree,
+        # Round-7 item 6: the stub answers with the record the driver's conjunctive
+        # delivery selector accepts; a turn start alone no longer confirms a delivery.
+        spec = stub_profile_spec("deliver-claude-proof", worktree=self.worktree,
                                  timeouts={"delivery_verify_timeout_ms": 6000})
         adapter, _state, ledger = self.compose_spec(spec, run_id=run_id)
         intent = {**WORKER_INTENT_KEYS, "intent_id": "i-b1rt", "run_id": run_id,
@@ -1473,7 +1475,7 @@ class B1RuntimeRecordsTransportAtDeliveryTests(_Composed):
         payload = "Task contract:\nlogin required\nContinue"
         result = session.send({"payload": payload})
         self.assertEqual(result["delivery"], "delivered_confirmed", result)
-        self.assertEqual(result["proof"], "turn_start")
+        self.assertEqual(result["proof"], "agent_response")
         # The event carries the transport read at the write: a framed pty write into the
         # raw-mode slave this runtime configured (`_set_raw` clears ECHO).
         event = session.delivery_events[-1]

@@ -74,18 +74,25 @@ OUTCOMES = ("delivery", "completion", "failure", "interruption", "timeout", "los
 DRIVER_SHAPES = {
     "claude": {
         "turn_start": {"type": "message_start"},
+        # Round-7 follow-up item 6: the DELIVERY proof is the record the driver's own
+        # conjunctive selector accepts (`claude_delivery_selector`: an `assistant` record
+        # bound to the minted session with a real model and a server-issued request id),
+        # never the turn start alone.
+        "delivery_proof": {"type": "assistant"},
         "completion": {"type": "result", "subtype": "success"},
         "readiness_record_type": "system",
         "readiness_session_field": "session_id",
-        "stub_deliver_mode": "deliver-claude",
+        "stub_deliver_mode": "deliver-claude-proof",
         "stub_complete_mode": "complete-claude",
     },
     "codex": {
         "turn_start": {"type": "item.started", "item": {"id": "item_0"}},
+        # `codex_delivery_selector` K-1: a completed `agent_message` item.
+        "delivery_proof": {"type": "item.completed"},
         "completion": {"type": "turn.completed", "usage": {"input_tokens": 1}},
         "readiness_record_type": "thread.started",
         "readiness_session_field": "thread_id",
-        "stub_deliver_mode": "deliver-codex",
+        "stub_deliver_mode": "deliver-codex-proof",
         "stub_complete_mode": "complete-codex",
     },
 }
@@ -116,7 +123,7 @@ def driver_profile(name: str, **overrides) -> StandaloneProfile:
         delivery_mode="post_ready_delivery",
         identity_binding="minted_echo", identity_flag="--session-id",
         delivery_proofs=(DeliveryProofSelector(
-            channel="structured", record_type=shape["turn_start"]["type"]),),
+            channel="structured", record_type=shape["delivery_proof"]["type"]),),
         completion_records=(CompletionSelector(
             channel="structured", record_type=shape["completion"]["type"]),),
         timeouts=Timeouts(graceful_force_timeout_ms=20, force_retry_ms=1,
@@ -585,11 +592,19 @@ class LivePerDriverOutcomeMatrixTests(unittest.TestCase):
                     result["delivery"], "delivered_confirmed",
                     f"{name}: {session.capture.text()[-400:]!r}")
                 self.assertIn(result["proof"], lifecycle.DELIVERY_PROOFS)
+                # Round-7 item 6: confirmed through the driver's OWN conjunctive delivery
+                # selector (class B, `agent_response`), never through the turn start.
+                self.assertEqual(result["proof"], "agent_response", result)
+                self.assertEqual(result["delivery_proof"]["record_type"],
+                                 DRIVER_SHAPES[name]["delivery_proof"]["type"])
                 self.assertEqual(session.state, "PROMPT_DELIVERED")
                 self.assertIn("delivery_proof_observed", session.event_log)
                 self.assertIn(DRIVER_SHAPES[name]["turn_start"]["type"],
                               session.capture.text(),
                               f"{name}: the child never emitted its own turn-start record")
+                self.assertIn(DRIVER_SHAPES[name]["delivery_proof"]["type"],
+                              session.capture.text(),
+                              f"{name}: the child never emitted its delivery-proof record")
 
     # -- 2. COMPLETION ------------------------------------------------------------------
     def test_live_completion_needs_both_gates_for_both_drivers(self) -> None:

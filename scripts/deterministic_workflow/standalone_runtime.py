@@ -2209,11 +2209,24 @@ class StandaloneSession:
                               cols=self.profile.cols),
                           "at": _now_iso()}
         self.delivery_events.append(delivery_event)
+        # Round-7 consolidated review, follow-up item 6.  The delivery this write must
+        # prove is bound to a DELIVERY INTENT of its own: the identity this dispatch is
+        # bound to (the minted id, or the frozen adopted one) and the digest of THIS
+        # payload -- the same intent shape `launch_with_prompt` proves against -- so the
+        # driver's CONJUNCTIVE delivery selector, not a turn-start record, decides.
+        binding_id = self._binding_identity(self.capture.transcript()) or self.session_id
+        post_ready_intent = drivers.make_delivery_intent(
+            intent_id=self.intent_id, dispatch_id=self.dispatch_id, task_id=self.task_id,
+            session_id=binding_id, payload=text,
+            argv_digest=str((self.delivery_intent or {}).get("argv_digest") or ""),
+            attempt_incarnation=self.incarnation,
+            delivery_mode=self.profile.delivery_mode)
         result = drivers.deliver(
             int(self.pty["master_fd"]), text, profile=self.profile,
             measured_ingest_rate=rate,
             verify=lambda working: self._verify_delivery(baseline, working,
-                                                         event=delivery_event))
+                                                         event=delivery_event,
+                                                         intent=post_ready_intent))
         self.event_log.append("prompt_written")
         if result["delivery"] == "delivered_confirmed":
             self.event_log.append("delivery_proof_observed")
@@ -2241,12 +2254,24 @@ class StandaloneSession:
         return {"intent_id": self.intent_id, **result}
 
     def _verify_delivery(self, baseline: int, baseline_working: bool, *,
-                         event: Mapping[str, Any] | None = None) -> dict[str, Any]:
+                         event: Mapping[str, Any] | None = None,
+                         intent: Mapping[str, Any] | None = None) -> dict[str, Any]:
         """Poll for one of the three named proofs, bounded.
 
         The third proof -- the output sequence advanced -- is admissible ONLY when the agent
         was already working at baseline; otherwise advancing output is just the echo of our
         own frame.
+
+        Round-7 consolidated review, follow-up item 6.  A `turn_start` record ALONE is no
+        longer accepted as `delivered_confirmed`: both installed CLIs were MEASURED
+        starting a turn on their authentication-failure legs before any prompt could have
+        executed, and the driver documentation already said an assistant record alone is
+        not delivery proof.  The structured proof for a post-ready write is now the
+        driver's OWN conjunctive delivery selector (`driver.delivery_evidence`) applied to
+        the bytes after ``baseline`` against the write's delivery ``intent`` -- the same
+        class-B proof `launch_with_prompt` requires -- reported as ``agent_response``.  The
+        termios echo emulator is NOT extended: `screen_echo` is exactly the proven echo it
+        was, and `output_sequence` is unchanged.
 
         F-002 / B1: the refusal scan is `lifecycle.refusal_evidence` over the RAW capture
         bytes from ``baseline`` -- the same byte offset the delivery ``event`` recorded
@@ -2273,9 +2298,14 @@ class StandaloneSession:
                 return {"delivery": "blocked", "proof": None,
                         "refusals": scan["refusals"], "echo": scan["echo"]}
             text = self.capture.transcript(baseline)
-            if self.driver.turn_start_evidence(text) is not None:
-                return {"delivery": "delivered_confirmed", "proof": "turn_start",
-                        "echo": scan["echo"]}
+            if intent is not None:
+                proof = self.driver.delivery_evidence(
+                    text, intent=intent, channel_owned=self.pty is not None,
+                    composed_argv=list(self.pty.get("argv", ())) if self.pty else [])
+                if proof is not None:
+                    self.delivery_proof = dict(proof)
+                    return {"delivery": "delivered_confirmed", "proof": "agent_response",
+                            "echo": scan["echo"], "delivery_proof": dict(proof)}
             if scan["echo"]["state"] == "echo_proven":
                 return {"delivery": "delivered_confirmed", "proof": "screen_echo",
                         "echo": scan["echo"]}

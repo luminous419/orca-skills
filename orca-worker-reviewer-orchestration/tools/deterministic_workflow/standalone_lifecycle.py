@@ -127,12 +127,13 @@ INTERRUPT_OUTCOMES = ("interrupted_confirmed", "terminated_forced", "exit_unprov
 DELIVERY_OUTCOMES = ("delivered_confirmed", "not_observed", "blocked", "stale_handle",
                      "not_writable")
 #: `agent_response` (iteration 4) is the CONJUNCTIVE class-B proof: a record that carries
-#: positive evidence that the dispatched prompt reached model work.  `turn_start` is
-#: retained as a `post_ready_delivery` proof name -- in that mode the prompt was written by
-#: THIS runtime to a pty it owns, so a turn starting afterwards is bound to that write --
-#: but for `launch_with_prompt` it is DEMOTED and `agent_response` is the only class-B
-#: member, because a turn was MEASURED starting on the authentication-failure path of both
-#: installed CLIs, before any prompt could have executed.
+#: positive evidence that the dispatched prompt reached model work.  `turn_start` REMAINS
+#: in the closed vocabulary because journal rows written before the round-7 correction
+#: carry it, but the runtime EMITS it for NO delivery mode any more: a turn was MEASURED
+#: starting on the authentication-failure path of both installed CLIs, before any prompt
+#: could have executed, so in `post_ready_delivery` too the structured proof is the
+#: driver's own conjunctive delivery selector (`agent_response`), exactly as for
+#: `launch_with_prompt`.
 DELIVERY_PROOFS = ("screen_echo", "turn_start", "output_sequence", "agent_response")
 
 #: DESIGN D4.2b.  The CLOSED set of `failure_reason` values a capability-vs-reality

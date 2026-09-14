@@ -53,7 +53,7 @@ printf '{"type":"system","session_id":"%s"}\n' "$SESSION_ID"
 # 2. The delivered frame.  The runtime writes the frame then Enter, so it is one line.
 IFS= read -r PROMPT || PROMPT=""
 
-# 3. The turn.  The structured turn-start is the delivery proof the driver verifies.
+# 3. The turn.  The structured turn-start, then the delivery proof the driver verifies.
 #
 # `is_error` is EMITTED, and emitted false.  This fixture's profile declares it as the
 # completion selector's `error_field`, and D4.4's settlement predicate treats a
@@ -61,7 +61,12 @@ IFS= read -r PROMPT || PROMPT=""
 # fail-closed direction, and is what OS-37's external review #2 asked for: a real CLI's
 # result record always carries the field, and a fixture that omitted it was relying on the
 # old behaviour where the record's mere existence meant success.
+# Round-7 follow-up item 6: the turn start alone is no longer the delivery proof; the
+# record `claude_delivery_selector` accepts (an `assistant` record bound to the minted
+# session id, real model identifier, server-issued request id) follows it.  The fixture
+# is otherwise RETAINED unchanged (USER DIRECTIVE D-H).
 printf '{"type":"message_start"}\n'
+printf '{"type":"assistant","session_id":"%s","request_id":"req_r10_agent_1","message":{"model":"r10-agent-model-1","id":"msg_r10_agent_1","usage":{"input_tokens":2,"output_tokens":1}}}\n' "$SESSION_ID"
 printf '{"type":"result","subtype":"success","is_error":false}\n'
 
 # 4. The body, bound to the dispatch.  One interpreter call, so the verdict line and the

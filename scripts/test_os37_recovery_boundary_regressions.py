@@ -1024,6 +1024,7 @@ class F06ResultPathIsAbsoluteTests(_Composed):
         printf '{"type":"thread.started","thread_id":"%s"}\\n' "$SESSION"
         IFS= read -r PROMPT || PROMPT=""
         printf '{"type":"item.started","item":{"id":"item_0"}}\\n'
+        printf '{"type":"item.completed","item":{"id":"item_0","type":"agent_message"}}\\n'
         if [ -n "$OUT" ]; then
           mkdir -p "$(dirname "$OUT")" 2>/dev/null
           printf 'F6 BODY written by the agent\\nSTATUS: COMPLETE\\n' > "$OUT"
@@ -1044,7 +1045,9 @@ class F06ResultPathIsAbsoluteTests(_Composed):
             "identity_flag": "--session-id",
             "readiness_records": [{"channel": "structured", "record_type": "thread.started",
                                    "session_field": "thread_id"}],
-            "delivery_proofs": [{"channel": "structured", "record_type": "item.started"}],
+            # Round-7 item 6: the declared delivery proof is the record the codex
+            # selector accepts (K-1, a completed `agent_message` item), not the turn start.
+            "delivery_proofs": [{"channel": "structured", "record_type": "item.completed"}],
             "completion_records": [{"channel": "structured",
                                     "record_type": "turn.completed"}],
             # The body comes ONLY from the `-o` file: the record's own field is absent.
@@ -1245,7 +1248,7 @@ class NB1SlowFirstResponseBoundaryTests(_Composed):
         printf '{"type":"system","session_id":"%s"}\\n' "$SESSION"
         IFS= read -r PROMPT || PROMPT=""
         sleep "${OS37_SLOW_FIRST_RESPONSE_S:-0}"
-        printf '{"type":"assistant","message":{"content":[{"type":"text","text":"ok"}]}}\\n'
+        printf '{"type":"assistant","session_id":"%s","request_id":"req_slow_1","message":{"model":"slow-agent-model-1","id":"msg_slow_1","content":[{"type":"text","text":"ok"}]}}\\n' "$SESSION"
         printf '{"type":"result","is_error":false,"result":"STATUS: COMPLETE"}\\n'
         exit 0
     """)

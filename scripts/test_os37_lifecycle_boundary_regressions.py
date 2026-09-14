@@ -936,7 +936,7 @@ class F09ResultBodyProvenanceTests(_Composed):
             "identity_binding": "adopted",
             "readiness_records": [{"channel": "structured", "record_type": "thread.started",
                                    "session_field": "thread_id"}],
-            "delivery_proofs": [{"channel": "structured", "record_type": "item.started"}],
+            "delivery_proofs": [{"channel": "structured", "record_type": "item.completed"}],
             "completion_records": [{"channel": "structured", "record_type": "turn.completed"}],
             "result_body_records": [{"channel": "structured", "record_type": "item.completed",
                                      "body_field": "item.text"}],
