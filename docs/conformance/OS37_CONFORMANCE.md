@@ -311,6 +311,21 @@ qualified "at the pinned revision".
   bound digest and epoch under the lock before it re-binds -- so a reader can never reconcile
   a live migration half-way and two migrators can never both re-bind.  The log holds exactly
   one terminal record per migration id and a linear old->new digest chain.
+* **A relative profile worktree is FROZEN at launch and durable across recovery cwds**
+  (Final-Review iteration 5, B1).  A relative `worktree` (or `add_dirs` entry) in an
+  operator's profile means "relative to where I launch from"; `build_standalone_adapter`
+  resolves it to the launch process's absolute path (`freeze_profile_worktree`) BEFORE the
+  spec is digested, exact-match checked and archived, so the create-once digest is
+  computed over the FROZEN mapping -- it names the worktree the run actually executes in:
+  the same relative spec relaunched from the launch cwd is an exact-match restart, from any
+  other cwd it freezes to a different worktree and is `STANDALONE_AUTHORITY_CONFLICT`,
+  never a silent re-bind.  A resume / watchdog recovery started from ANY cwd rebuilds the
+  launch-time absolute worktree from the archive; a `--standalone-profile` restatement and
+  a `migrate-standalone-profile` profile pass the same freeze against their own process's
+  cwd.  The archive write door refuses an unfrozen spec and the read door refuses a legacy
+  archive (written by the pre-fix model) with `STANDALONE_PROFILE_WORKTREE_UNFROZEN`
+  rather than re-interpreting its bytes against a new cwd; such a run is recovered only
+  through the explicit, audited migration naming the launch-time absolute worktree.
 * **`project_root` reaches the standalone quality gate** (round-7 item 7).
   `build_standalone_prompt_composer(project_root=...)` resolves `.orca/quality-profile.yaml`
   under that root into every dispatch's quality gate block -- absent renders the absent

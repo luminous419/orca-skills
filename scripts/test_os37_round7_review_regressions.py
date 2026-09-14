@@ -852,5 +852,664 @@ class B2Item1EndToEndTraceTests(unittest.TestCase):
         self.assertEqual(wd_ledger.path.resolve(), ledger.path.resolve(), trace)
 
 
+# =====================================================================================
+# Iteration 3 (B2) -- legacy omitted-thread authority migration
+# =====================================================================================
+def _replay_legacy_omitted_thread_run(base: Path):
+    """Create a real omitted-``thread_id`` run stalled before its first dispatch (its
+    committed checkpoint head names the effective ``launcher`` identity) and DOWNGRADE its
+    authority to the exact PRE-fix on-disk shape: ``thread_id: ""`` and no
+    prompt-composition digest.  Returns ``(run_id, ledger, authority_path)``.  This is the
+    persisted-state compatibility case the final review's B2 is about."""
+    run_id = "run_b2legacy"
+    ledger = FileRuntimeStateStore(base / "ledger.json")
+    adapter, state = launcher.build_standalone_adapter(
+        {"run_id": run_id, "phases": ["DESIGN"], "max_iterations": 2},
+        artifact_base=base, run_id=run_id, runtime_state=ledger,
+        profile_spec=agent_profile_spec(worktree=str(base / "wt")))
+    stalled = launcher.execute_state(
+        state, adapter=adapter, runtime_state=ledger,
+        journal=launcher._standalone_pause_row_journal(base, run_id),
+        artifact_base=base, interrupt_before=["EXECUTE_INTENT"], audit_sink=None)
+    assert stalled.get("pending_intent"), stalled.get("terminal_reason")
+    target = launcher.standalone_authority_path(base, run_id, "")
+    current = json.loads(target.read_text())
+    legacy = {k: current[k] for k in ("schema", "run_id", "adapter",
+                                      "runtime_state_path", "approval_authority",
+                                      "profile_digest")}
+    legacy["thread_id"] = ""                              # the pre-fix omitted-thread shape
+    target.write_text(json.dumps(legacy, sort_keys=True, indent=2) + "\n")
+    return run_id, ledger, target
+
+
+@unittest.skipUnless(_langgraph_ok(), LANGGRAPH_REASON)
+class B2LegacyAuthorityUpgradeTests(unittest.TestCase):
+    """Final-Review iteration 3, B2.  A durable authority written by the PRE-fix model
+    (``thread_id: ""``, no composition digest) whose durable evidence names ``launcher`` is
+    atomically upgraded to the effective identity on the read path -- so a run launched at
+    the PR base can resume and be watchdog-recovered after upgrade -- while an empty-thread
+    authority whose evidence is absent / unreadable / another thread stays refused."""
+
+    def setUp(self) -> None:
+        self.base = Path(tempfile.mkdtemp(prefix="os37-r7-b2leg-"))
+        self.addCleanup(shutil.rmtree, self.base, True)
+        (self.base / "wt").mkdir()
+
+    def test_legacy_authority_is_upgraded_on_load_and_journaled(self) -> None:
+        run_id, _ledger, target = _replay_legacy_omitted_thread_run(self.base)
+        self.assertTrue(launcher._is_legacy_omitted_thread_authority(
+            json.loads(target.read_text()), run_id), "the replay is not the legacy shape")
+        # The read path (which the resume verb and watchdog wiring both call) UPGRADES it.
+        record = launcher.load_standalone_authority(self.base, run_id)
+        self.assertEqual(record["thread_id"], launcher.DEFAULT_THREAD_ID)
+        self.assertTrue(record.get("prompt_composition_digest"),
+                        "the upgrade did not bind the now-required composition digest")
+        upgrades = launcher.read_authority_upgrades(self.base, run_id)
+        self.assertEqual(len(upgrades), 1)
+        self.assertEqual(upgrades[0]["from_thread_id"], "")
+        self.assertEqual(upgrades[0]["to_thread_id"], launcher.DEFAULT_THREAD_ID)
+
+    def test_the_upgrade_is_idempotent(self) -> None:
+        run_id, _ledger, _target = _replay_legacy_omitted_thread_run(self.base)
+        launcher.load_standalone_authority(self.base, run_id)
+        launcher.load_standalone_authority(self.base, run_id)
+        launcher.load_standalone_authority(self.base, run_id, launcher.DEFAULT_THREAD_ID)
+        self.assertEqual(len(launcher.read_authority_upgrades(self.base, run_id)), 1,
+                         "a second read wrote a second upgrade record")
+
+    def test_a_stalled_legacy_run_is_watchdog_recovered(self) -> None:
+        import argparse
+        run_id, ledger, _target = _replay_legacy_omitted_thread_run(self.base)
+        # RED at 85bcbcc: the watchdog's authority load refuses the legacy record
+        # (STANDALONE_ADAPTER_REQUIRES_LEDGER).  On the fixed tree it upgrades and recovers.
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = launcher.run_watchdog_cli(
+                ["recover", "--run-id", run_id, "--artifact-base", str(self.base),
+                 "--adapter", "standalone", "--json"])
+        summary = json.loads(out.getvalue().strip().splitlines()[-1])
+        self.assertEqual(code, 0, f"{summary!r}\n{err.getvalue()}")
+        self.assertEqual(summary.get("status"), "RECOVERED", summary)
+        # The authority is now the upgraded, effective identity.
+        self.assertEqual(
+            launcher.load_standalone_authority(self.base, run_id)["thread_id"],
+            launcher.DEFAULT_THREAD_ID)
+
+    def test_a_stalled_legacy_run_resumes_after_upgrade(self) -> None:
+        # The `resume` verb re-enters through the SAME upgraded authority.  A stalled active
+        # run has no pause record, so this drives the watchdog `recover` route above AND
+        # asserts the resume verb's own authority load (the call `run_pause_cli` makes) now
+        # returns the upgraded record rather than raising.
+        run_id, _ledger, _target = _replay_legacy_omitted_thread_run(self.base)
+        record = launcher.load_standalone_authority(self.base, run_id, "")
+        self.assertIsNotNone(record)
+        self.assertEqual(record["thread_id"], launcher.DEFAULT_THREAD_ID)
+        # The resume verb re-enters through `standalone_recovery_composition`, which reads
+        # the (now upgraded) authority; it succeeds rather than raising the legacy refusal.
+        adapter, _j, _p = launcher.standalone_recovery_composition(
+            self.base, run_id, thread_id=launcher.DEFAULT_THREAD_ID,
+            ledger=FileRuntimeStateStore(self.base / "ledger.json"),
+            pause_row_journal=launcher._standalone_pause_row_journal(self.base, run_id))
+        self.assertIsNotNone(adapter)
+
+    def _legacy_with_evidence(self, run_id: str, evidence_kind: str):
+        """A legacy-shape authority whose durable evidence is absent / unreadable / a
+        FOREIGN thread -- none of which may be upgraded."""
+        ledger = FileRuntimeStateStore(self.base / f"{run_id}.json")
+        launcher.persist_standalone_profile(self.base, run_id, agent_profile_spec(
+            worktree=str(self.base / "wt")))
+        legacy = {"schema": launcher.STANDALONE_AUTHORITY_SCHEMA, "run_id": run_id,
+                  "adapter": launcher.STANDALONE_ADAPTER,
+                  "runtime_state_path": str(ledger.path.resolve()),
+                  "thread_id": "", "approval_authority": "none",
+                  "profile_digest": launcher.profile_digest(agent_profile_spec(
+                      worktree=str(self.base / "wt")))}
+        target = launcher.standalone_authority_path(self.base, run_id, "")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(legacy, sort_keys=True, indent=2) + "\n")
+        if evidence_kind == "unreadable":
+            ps = pause_store.pause_record_path(run_id, artifact_base=self.base)
+            ps.parent.mkdir(parents=True, exist_ok=True)
+            ps.write_text("{ corrupt")
+        return target
+
+    def test_legacy_shape_with_absent_evidence_is_refused(self) -> None:
+        target = self._legacy_with_evidence("run_b2absent", "absent")
+        before = target.read_bytes()
+        with self.assertRaises(launcher.LauncherError) as caught:
+            launcher.load_standalone_authority(self.base, "run_b2absent")
+        self.assertIn(launcher.STANDALONE_THREAD_EVIDENCE_ABSENT, str(caught.exception))
+        self.assertEqual(target.read_bytes(), before, "the legacy record was rewritten")
+        self.assertEqual(len(launcher.read_authority_upgrades(self.base, "run_b2absent")), 0)
+
+    def test_legacy_shape_with_unreadable_evidence_is_refused(self) -> None:
+        target = self._legacy_with_evidence("run_b2unread", "unreadable")
+        before = target.read_bytes()
+        with self.assertRaises(launcher.LauncherError) as caught:
+            launcher.load_standalone_authority(self.base, "run_b2unread")
+        self.assertIn(launcher.STANDALONE_THREAD_EVIDENCE_UNREADABLE, str(caught.exception))
+        self.assertEqual(target.read_bytes(), before)
+        self.assertEqual(len(launcher.read_authority_upgrades(self.base, "run_b2unread")), 0)
+
+    def test_legacy_shape_with_a_foreign_thread_evidence_is_not_upgraded(self) -> None:
+        # A run whose durable evidence names a DIFFERENT thread (not launcher): the legacy
+        # empty-thread authority must NOT be upgraded to that foreign thread -- that would
+        # be the foreign-authority bypass.  Replay a real run whose head names 'launcher',
+        # then TAMPER the durable evidence to name another thread and confirm no upgrade.
+        run_id, _ledger, target = _replay_legacy_omitted_thread_run(self.base)
+        # A pause record naming a FOREIGN thread shadows the head (pause is consulted first).
+        ps = pause_store.pause_record_path(run_id, artifact_base=self.base)
+        ps.parent.mkdir(parents=True, exist_ok=True)
+        ps.write_text("{ corrupt-foreign")          # unreadable -> not 'present launcher'
+        before = target.read_bytes()
+        with self.assertRaises(launcher.LauncherError):
+            launcher.load_standalone_authority(self.base, run_id)
+        self.assertEqual(target.read_bytes(), before, "a non-launcher-evidence legacy "
+                         "record was upgraded -- foreign-authority bypass")
+        self.assertEqual(len(launcher.read_authority_upgrades(self.base, run_id)), 0)
+
+
+def _ledger_for(base: Path):
+    return FileRuntimeStateStore(base / "ledger.json")
+
+
+# =====================================================================================
+# Iteration 3 (B1) -- the production preflight seeds the run-scoped auth home
+# =====================================================================================
+class B1ProductionAuthSeedTests(unittest.TestCase):
+    """Final-Review iteration 3, B1.  A profile that declares a credential seed source and
+    a config-root env name (a codex profile: ``auth_seed_source`` + ``CODEX_HOME``) has its
+    run-scoped home SEEDED by the production `StandaloneSession.start` path -- BEFORE the
+    auth probe -- so the docstring's promise ("seeded 0600 from the declared auth ref by the
+    production preflight") is honoured through `run_workflow --adapter standalone`, not only
+    by the R10 test harness.  A profile that declares no seed, and a Claude profile with no
+    ``seed_auth_home``, are untouched."""
+
+    def setUp(self) -> None:
+        self.base = Path(tempfile.mkdtemp(prefix="os37-r7-b1seed-"))
+        self.addCleanup(shutil.rmtree, self.base, True)
+
+    def _session(self, spec: dict, child_env: dict):
+        from scripts.deterministic_workflow import standalone_runtime as rt
+        from scripts.deterministic_workflow.standalone_profile import profile_from_mapping
+        from scripts.deterministic_workflow.standalone_journal import ExecutionJournal
+        profile = profile_from_mapping(spec)
+        sess = rt.StandaloneSession(
+            intent={"intent_id": "i", "role": "WORKER"}, profile=profile,
+            artifact_base=self.base, run_id="run_seed",
+            journal=ExecutionJournal(self.base, "run_seed"),
+            runtime_state=_ledger_for(self.base))
+        sess._child_env = dict(child_env)
+        return sess
+
+    def test_a_codex_profile_seeds_its_run_scoped_home_before_the_probe(self) -> None:
+        codex_home = str(self.base / "codex_home")
+        seed_src = self.base / "auth.json"
+        seed_src.write_text('{"tokens":{"access_token":"FIXTURE-NOT-A-REAL-SECRET"}}')
+        spec = {"driver": "codex", "binary": "codex", "supported_range": [[0, 1, 0], [9, 0, 0]],
+                "bin_dirs": ["/usr/bin"], "worktree": str(self.base),
+                "delivery_mode": "launch_with_prompt", "identity_binding": "adopted",
+                "readiness_records": [{"channel": "structured",
+                                       "record_type": "thread.started",
+                                       "session_field": "thread_id"}],
+                "delivery_proofs": [{"channel": "structured", "record_type": "turn.completed"}],
+                "completion_records": [{"channel": "structured", "record_type": "turn.completed"}],
+                "driver_env": {"CODEX_HOME": codex_home},
+                "auth_seed_source": str(seed_src), "auth_seed_dest_name": "auth.json"}
+        sess = self._session(spec, {"CODEX_HOME": codex_home})
+        result = sess._seed_run_scoped_auth()
+        self.assertTrue(result["seeded"], result)
+        dest = Path(codex_home) / "auth.json"
+        self.assertTrue(dest.exists(), "the run-scoped CODEX_HOME was not seeded")
+        self.assertEqual(oct(os.stat(dest).st_mode & 0o777), "0o600")
+        self.assertEqual(dest.read_text(), seed_src.read_text())
+        # The config root resolves from the child env's CODEX_HOME.
+        self.assertEqual(sess._config_home_root(), codex_home)
+
+    def test_a_claude_profile_is_a_no_op(self) -> None:
+        spec = {"driver": "claude", "binary": "claude", "supported_range": [[1, 0, 0], [9, 0, 0]],
+                "bin_dirs": ["/usr/bin"], "worktree": str(self.base),
+                "delivery_mode": "launch_with_prompt", "identity_binding": "minted_echo",
+                "identity_flag": "--session-id",
+                "readiness_records": [{"channel": "structured", "record_type": "system",
+                                       "session_field": "session_id"}],
+                "delivery_proofs": [{"channel": "structured", "record_type": "assistant"}],
+                "completion_records": [{"channel": "structured", "record_type": "result",
+                                        "error_field": "is_error"}]}
+        sess = self._session(spec, {})
+        result = sess._seed_run_scoped_auth()
+        self.assertFalse(result["seeded"])
+        self.assertEqual(result["reason"], "no_auth_seed_declared")
+
+
+# =====================================================================================
+# Iteration 4 (B1) -- a relative worktree is resolved to an absolute path
+# =====================================================================================
+class B1RelativeWorktreeResolvedTests(unittest.TestCase):
+    """Final-Review iteration 4, B1 root cause.  The runtime CHANGES DIRECTORY into the
+    worktree before a bounded probe/spawn, and a driver may ALSO compose the worktree into
+    the child argv as a change-directory flag (codex's ``-C``).  A RELATIVE worktree is then
+    re-applied against the already-changed directory -- the child resolves
+    ``<worktree>/<worktree>`` and refuses -- which is exactly why the real Codex recovery
+    loop settled BLOCKED while Claude (which composes an add-directory flag and runs in the
+    cwd) was unaffected.  `profile_from_mapping` now resolves the worktree to an ABSOLUTE
+    path at the one door every launch and recovery passes, so cwd and every worktree-derived
+    flag name the SAME directory.  RED at the current tree: the worktree stays relative."""
+
+    def _profile(self, worktree: str):
+        from scripts.deterministic_workflow.standalone_profile import profile_from_mapping
+        return profile_from_mapping({
+            "driver": "codex", "binary": "codex", "supported_range": [[0, 1, 0], [9, 0, 0]],
+            "bin_dirs": ["/usr/bin"], "worktree": worktree,
+            "delivery_mode": "launch_with_prompt", "identity_binding": "adopted",
+            "readiness_records": [{"channel": "structured",
+                                   "record_type": "thread.started",
+                                   "session_field": "thread_id"}],
+            "delivery_proofs": [{"channel": "structured", "record_type": "turn.completed"}],
+            "completion_records": [{"channel": "structured",
+                                    "record_type": "turn.completed"}]})
+
+    def test_a_relative_worktree_becomes_absolute(self) -> None:
+        prof = self._profile("artifacts/runs/x/wt")
+        self.assertTrue(os.path.isabs(prof.worktree),
+                        f"a relative worktree was not resolved: {prof.worktree!r}")
+        self.assertEqual(prof.worktree, os.path.abspath("artifacts/runs/x/wt"))
+
+    def test_the_codex_change_dir_flag_is_absolute_so_it_never_double_applies(self) -> None:
+        from scripts.deterministic_workflow import standalone_drivers as drivers
+        prof = self._profile("artifacts/runs/x/wt")
+        argv = list(drivers.driver_for(prof).argv(session_id="s", prompt="p"))
+        self.assertIn("-C", argv)
+        cd = argv[argv.index("-C") + 1]
+        self.assertTrue(os.path.isabs(cd),
+                        f"codex -C is relative and will re-apply after the chdir: {cd!r}")
+
+    def test_an_absolute_worktree_is_unchanged_and_empty_stays_empty(self) -> None:
+        abs_wt = os.path.abspath(os.sep + os.path.join("tmp", "some", "wt"))
+        self.assertEqual(self._profile(abs_wt).worktree, abs_wt)
+        self.assertEqual(self._profile("").worktree, "")
+
+
+# =====================================================================================
+# Iteration 5 (B1) -- the launch-time worktree is DURABLE across recovery cwd changes
+# =====================================================================================
+@contextlib.contextmanager
+def _cwd(path: Path):
+    """Run a block with the process cwd changed -- the launch and the recovery are then
+    two processes' worth of cwd in one test process."""
+    before = os.getcwd()
+    os.chdir(path)
+    try:
+        yield
+    finally:
+        os.chdir(before)
+
+
+def _codex_spec(worktree: str, add_dirs: list[str] | None = None) -> dict:
+    spec = {
+        "driver": "codex", "binary": "codex", "supported_range": [[0, 1, 0], [9, 0, 0]],
+        "bin_dirs": ["/usr/bin"], "worktree": worktree,
+        "delivery_mode": "launch_with_prompt", "identity_binding": "adopted",
+        "readiness_records": [{"channel": "structured", "record_type": "thread.started",
+                               "session_field": "thread_id"}],
+        "delivery_proofs": [{"channel": "structured", "record_type": "turn.completed"}],
+        "completion_records": [{"channel": "structured", "record_type": "turn.completed"}]}
+    if add_dirs is not None:
+        spec["add_dirs"] = add_dirs
+    return spec
+
+
+class B1DurableWorktreeFreezeTests(unittest.TestCase):
+    """Final-Review iteration 5, B1 (pure, no graph).  `persist_standalone_profile()`
+    archived the RAW mapping (``"worktree": "wt"``) and `profile_from_mapping()`
+    re-resolved it against the CURRENT process cwd on every launch and recovery, so a
+    Watchdog started from another cwd rebuilt a different, nonexistent worktree from
+    byte-identical archived bytes.  The launch door now FREEZES the launch-time absolute
+    path into the spec before it is digested and archived; the write door refuses an
+    unfrozen spec; the read door refuses a legacy one.  RED at the staged tree."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="os37-r7-b1frz-")).resolve()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.launch = self.tmp / "launch"
+        (self.launch / "wt").mkdir(parents=True)
+        (self.launch / "extra").mkdir()
+        self.recovery = self.tmp / "recovery"
+        self.recovery.mkdir()
+        self.base = self.tmp / "base"
+
+    def test_freeze_resolves_relative_paths_against_the_launch_cwd_only(self) -> None:
+        spec = _codex_spec("wt", add_dirs=["extra", "/abs/dir"])
+        with _cwd(self.launch):
+            frozen = launcher.freeze_profile_worktree(spec)
+        self.assertEqual(frozen["worktree"], str(self.launch / "wt"))
+        self.assertEqual(frozen["add_dirs"], [str(self.launch / "extra"), "/abs/dir"])
+        self.assertEqual(spec["worktree"], "wt", "the caller's mapping was mutated")
+        self.assertEqual(launcher.profile_unfrozen_paths(spec), ("worktree", "add_dirs[0]"))
+        self.assertEqual(launcher.profile_unfrozen_paths(frozen), ())
+        # An explicit base is honoured; an absolute spec is BYTE-unchanged (digest-stable).
+        explicit = launcher.freeze_profile_worktree(spec, launch_base=self.recovery)
+        self.assertEqual(explicit["worktree"], str(self.recovery / "wt"))
+        absolute = _codex_spec(str(self.launch / "wt") + "/", add_dirs=["/abs//dir/"])
+        self.assertEqual(launcher.freeze_profile_worktree(absolute), absolute)
+        self.assertEqual(launcher.profile_digest(launcher.freeze_profile_worktree(absolute)),
+                         launcher.profile_digest(absolute))
+        self.assertEqual(launcher.freeze_profile_worktree({"driver": "claude"}),
+                         {"driver": "claude"})
+
+    def test_the_archive_holds_the_launch_time_absolute_worktree(self) -> None:
+        # RED at the staged tree: the archive holds "wt" and a read from another cwd
+        # resolves it against that cwd.
+        spec = agent_profile_spec(worktree="wt")
+        with _cwd(self.launch):
+            frozen = launcher.freeze_profile_worktree(spec)
+            digest = launcher.profile_digest(frozen)
+            launcher.persist_standalone_profile(self.base, "run_frz", frozen)
+        archived = json.loads(launcher.profile_archive_path(
+            self.base, "run_frz", digest).read_text())
+        self.assertEqual(archived["worktree"], str(self.launch / "wt"))
+        from scripts.deterministic_workflow.standalone_profile import profile_from_mapping
+        with _cwd(self.recovery):
+            reloaded = launcher.load_standalone_profile(self.base, "run_frz", digest=digest)
+            profile = profile_from_mapping(reloaded)
+        self.assertEqual(profile.worktree, str(self.launch / "wt"))
+        self.assertFalse((self.recovery / "wt").exists())
+
+    def test_the_write_door_refuses_an_unfrozen_spec(self) -> None:
+        with _cwd(self.launch), self.assertRaises(launcher.LauncherError) as caught:
+            launcher.persist_standalone_profile(self.base, "run_raw",
+                                                agent_profile_spec(worktree="wt"))
+        self.assertIn(launcher.STANDALONE_PROFILE_WORKTREE_UNFROZEN, str(caught.exception))
+        self.assertFalse(launcher.standalone_profile_path(self.base, "run_raw").exists())
+        with _cwd(self.launch), self.assertRaises(launcher.LauncherError) as caught:
+            launcher.persist_standalone_profile(
+                self.base, "run_raw", _codex_spec(str(self.launch / "wt"), ["extra"]))
+        self.assertIn("add_dirs[0]", str(caught.exception))
+
+    def test_the_read_door_refuses_a_legacy_relative_archive_by_name(self) -> None:
+        # A pre-fix archive: raw relative bytes, digest over them.  Read from another cwd
+        # it is REFUSED by name, naming the audited migration -- never resolved here.
+        raw = agent_profile_spec(worktree="wt")
+        raw_digest = launcher.profile_digest(raw)
+        archive = launcher.profile_archive_path(self.base, "run_leg", raw_digest)
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        archive.write_text(launcher.profile_payload(raw) + "\n")
+        before = archive.read_bytes()
+        with _cwd(self.recovery), self.assertRaises(launcher.LauncherError) as caught:
+            launcher.load_standalone_profile(self.base, "run_leg", digest=raw_digest)
+        message = str(caught.exception)
+        self.assertIn(launcher.STANDALONE_PROFILE_WORKTREE_UNFROZEN, message)
+        self.assertIn("migrate-standalone-profile", message)
+        self.assertEqual(archive.read_bytes(), before, "the legacy archive was rewritten")
+        self.assertFalse((self.recovery / "wt").exists())
+        # The run-global `profile.json` (in-memory-ledger runs) is guarded the same way.
+        current = launcher.standalone_profile_path(self.base, "run_leg2")
+        current.parent.mkdir(parents=True, exist_ok=True)
+        current.write_text(launcher.profile_payload(raw) + "\n")
+        with _cwd(self.recovery), self.assertRaises(launcher.LauncherError) as caught:
+            launcher.load_standalone_profile(self.base, "run_leg2")
+        self.assertIn(launcher.STANDALONE_PROFILE_WORKTREE_UNFROZEN, str(caught.exception))
+
+    def test_codex_change_dir_and_add_dir_flags_are_the_launch_time_paths(self) -> None:
+        from scripts.deterministic_workflow import standalone_drivers as drivers
+        from scripts.deterministic_workflow.standalone_profile import profile_from_mapping
+        with _cwd(self.launch):
+            frozen = launcher.freeze_profile_worktree(_codex_spec("wt", ["extra"]))
+        with _cwd(self.recovery):
+            argv = list(drivers.driver_for(profile_from_mapping(frozen)).argv(
+                session_id="s", prompt="p"))
+        self.assertEqual(argv[argv.index("-C") + 1], str(self.launch / "wt"))
+        self.assertEqual(argv[argv.index("--add-dir") + 1], str(self.launch / "extra"))
+
+
+def _launch_relative_worktree_run(base: Path, launch_cwd: Path, run_id: str, *,
+                                  thread_id: str | None = "t"):
+    """A REAL launch from ``launch_cwd`` with the RELATIVE profile worktree ``"wt"``,
+    stalled before its first dispatch (its authority, frozen archive and checkpoint head
+    are durable).  Returns ``(ledger, raw_spec)``."""
+    ledger = FileRuntimeStateStore(base / "ledger.json")
+    raw = agent_profile_spec(worktree="wt")
+    spec = {"run_id": run_id, "phases": ["DESIGN"], "max_iterations": 2}
+    if thread_id is not None:
+        spec["thread_id"] = thread_id
+    with _cwd(launch_cwd):
+        adapter, state = launcher.build_standalone_adapter(
+            spec, artifact_base=base, run_id=run_id, runtime_state=ledger,
+            profile_spec=raw)
+        stalled = launcher.execute_state(
+            state, adapter=adapter, runtime_state=ledger,
+            journal=launcher._standalone_pause_row_journal(base, run_id),
+            artifact_base=base, interrupt_before=["EXECUTE_INTENT"], audit_sink=None)
+    assert stalled.get("pending_intent"), stalled.get("terminal_reason")
+    return ledger, raw
+
+
+@unittest.skipUnless(_langgraph_ok(), LANGGRAPH_REASON)
+class B1CrossCwdRecoveryTests(unittest.TestCase):
+    """Final-Review iteration 5, B1, through the production launcher + Graph + watchdog:
+    launch from cwd A with a RELATIVE worktree -> stall / crash -> recovery from cwd B.
+    The recovered adapter's worktree (its cwd and every worktree-derived flag) is the
+    launch-time absolute path and the real fixture dispatch succeeds; a relaunch of the
+    same relative spec from another cwd is the typed create-once conflict; a recovery
+    override restated from another cwd is the typed digest mismatch; a legacy relative
+    archive is refused by name and recovered only through the audited migration.  Every
+    case is RED at the staged tree (silent re-bind against cwd B)."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="os37-r7-b1x-")).resolve()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.launch = self.tmp / "launch"
+        (self.launch / "wt").mkdir(parents=True)
+        self.recovery = self.tmp / "recovery"
+        self.recovery.mkdir()
+        self.base = self.tmp / "base"
+
+    def _wiring_args(self):
+        import argparse
+        return argparse.Namespace(artifact_base=str(self.base), results="",
+                                  adapter="standalone", run_owner="", project_root="",
+                                  standalone_profile="")
+
+    def test_watchdog_and_resume_from_another_cwd_rebuild_the_launch_worktree(self) -> None:
+        run_id = "run_b1xwd"
+        ledger, _raw = _launch_relative_worktree_run(self.base, self.launch, run_id)
+        authority = launcher.load_standalone_authority(self.base, run_id, "t")
+        archived = launcher.load_standalone_profile(self.base, run_id,
+                                                    digest=authority["profile_digest"])
+        self.assertEqual(archived["worktree"], str(self.launch / "wt"),
+                         "the archive does not hold the launch-time absolute worktree")
+        # (a) the watchdog wiring's adapter, composed from cwd B.
+        with _cwd(self.recovery):
+            adapter, wd_ledger, _j = launcher._watchdog_wiring(
+                self._wiring_args()).adapter_for(run_id)
+        self.assertEqual(adapter.runtime.profile.worktree, str(self.launch / "wt"))
+        self.assertEqual(wd_ledger.path.resolve(), ledger.path.resolve())
+        # (b) the resume verb's composition, from cwd B.
+        with _cwd(self.recovery):
+            resumed, _j, _p = launcher.standalone_recovery_composition(
+                self.base, run_id, thread_id="t", ledger=ledger,
+                pause_row_journal=launcher._standalone_pause_row_journal(self.base, run_id))
+        self.assertEqual(resumed.runtime.profile.worktree, str(self.launch / "wt"))
+        # (c) the REAL recovery from cwd B: the fixture agent is dispatched in the
+        # launch-time worktree and the run completes.
+        out, err = io.StringIO(), io.StringIO()
+        with _cwd(self.recovery), contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(err):
+            code = launcher.run_watchdog_cli(
+                ["recover", "--run-id", run_id, "--artifact-base", str(self.base),
+                 "--adapter", "standalone", "--json"])
+        summary = json.loads(out.getvalue().strip().splitlines()[-1])
+        self.assertEqual(code, 0, f"{summary!r}\n{err.getvalue()}")
+        self.assertEqual(summary.get("status"), "RECOVERED", summary)
+        self.assertFalse((self.recovery / "wt").exists(),
+                         "the recovery re-interpreted the worktree against its own cwd")
+        # The dispatch the recovery ran names the launch-time worktree in its own row.
+        rows = launcher._standalone_pause_row_journal(self.base, run_id)
+        worktrees = {str(r.get("terminal_worktree") or "") for r in rows.rows().values()}
+        self.assertIn(str(self.launch / "wt"), worktrees, worktrees)
+
+    def test_relaunch_of_the_same_relative_spec_from_another_cwd_is_a_conflict(self) -> None:
+        run_id = "run_b1xrel"
+        ledger, raw = _launch_relative_worktree_run(self.base, self.launch, run_id)
+        spec = {"run_id": run_id, "thread_id": "t", "phases": ["DESIGN"],
+                "max_iterations": 2}
+        # From cwd B the same relative bytes freeze to ANOTHER worktree: a typed conflict
+        # at composition, before any claim -- never a silent re-bind.
+        with _cwd(self.recovery), self.assertRaises(launcher.LauncherError) as caught:
+            launcher.build_standalone_adapter(spec, artifact_base=self.base, run_id=run_id,
+                                              runtime_state=ledger, profile_spec=raw)
+        self.assertIn(launcher.STANDALONE_AUTHORITY_CONFLICT, str(caught.exception))
+        self.assertIn("profile_digest", str(caught.exception))
+        # From the launch cwd it is an exact-match restart.
+        with _cwd(self.launch):
+            adapter, _state = launcher.build_standalone_adapter(
+                spec, artifact_base=self.base, run_id=run_id, runtime_state=ledger,
+                profile_spec=raw)
+        self.assertEqual(adapter.runtime.profile.worktree, str(self.launch / "wt"))
+        authority = launcher.load_standalone_authority(self.base, run_id, "t")
+        self.assertEqual(authority["profile_digest"], launcher.profile_digest(
+            launcher.freeze_profile_worktree(raw, launch_base=self.launch)))
+
+    def test_a_recovery_override_restated_from_another_cwd_is_refused(self) -> None:
+        run_id = "run_b1xovr"
+        ledger, raw = _launch_relative_worktree_run(self.base, self.launch, run_id)
+        rows = launcher._standalone_pause_row_journal(self.base, run_id)
+        with _cwd(self.recovery), self.assertRaises(launcher.LauncherError) as caught:
+            launcher.standalone_recovery_composition(
+                self.base, run_id, thread_id="t", ledger=ledger, pause_row_journal=rows,
+                profile_override=raw)
+        self.assertIn(launcher.STANDALONE_PROFILE_DIGEST_MISMATCH, str(caught.exception))
+        # Restated from the launch cwd it is the exact restatement it claims to be.
+        with _cwd(self.launch):
+            adapter, _j, _p = launcher.standalone_recovery_composition(
+                self.base, run_id, thread_id="t", ledger=ledger, pause_row_journal=rows,
+                profile_override=raw)
+        self.assertEqual(adapter.runtime.profile.worktree, str(self.launch / "wt"))
+        # And an override that restates the FROZEN (absolute) spec matches from anywhere.
+        with _cwd(self.recovery):
+            adapter, _j, _p = launcher.standalone_recovery_composition(
+                self.base, run_id, thread_id="t", ledger=ledger, pause_row_journal=rows,
+                profile_override=launcher.freeze_profile_worktree(
+                    raw, launch_base=self.launch))
+        self.assertEqual(adapter.runtime.profile.worktree, str(self.launch / "wt"))
+
+    def _downgrade_to_legacy(self, run_id: str, raw: dict, *, legacy_thread: bool) -> Path:
+        """Rewrite a real run's durable binding to the PRE-fix shape: a RAW relative
+        archive (digest over the raw bytes) bound by the authority -- and, when
+        ``legacy_thread``, the iteration-3 legacy ``thread_id: ""`` / no-composition shape
+        on top, so the upgrade path is crossed as well."""
+        raw_digest = launcher.profile_digest(raw)
+        archive = launcher.profile_archive_path(self.base, run_id, raw_digest)
+        archive.write_text(launcher.profile_payload(raw) + "\n")
+        thread = "" if legacy_thread else launcher.DEFAULT_THREAD_ID
+        target = launcher.standalone_authority_path(self.base, run_id, thread,
+                                                    for_write=True)
+        record = json.loads(target.read_text())
+        record["profile_digest"] = raw_digest
+        if legacy_thread:
+            record.pop("prompt_composition_digest", None)
+            record["thread_id"] = ""
+        target.write_text(json.dumps(record, sort_keys=True, indent=2) + "\n")
+        return archive
+
+    def test_legacy_relative_archive_is_refused_from_another_cwd_then_migrated(self) -> None:
+        run_id = "run_b1xleg"
+        # An omitted-thread launch, so the authority is the effective `launcher` identity
+        # and the iteration-3 legacy DOWNGRADE below is the exact pre-fix shape.
+        ledger, raw = _launch_relative_worktree_run(self.base, self.launch, run_id,
+                                                    thread_id=None)
+        archive = self._downgrade_to_legacy(run_id, raw, legacy_thread=True)
+        before = archive.read_bytes()
+        rows = launcher._standalone_pause_row_journal(self.base, run_id)
+        with _cwd(self.recovery):
+            # The iteration-3 upgrade still happens (thread "" -> launcher) ...
+            record = launcher.load_standalone_authority(self.base, run_id)
+            self.assertEqual(record["thread_id"], launcher.DEFAULT_THREAD_ID)
+            # ... and the profile read then REFUSES the legacy relative archive by name --
+            # on the resume composition and on the watchdog route alike -- rather than
+            # rebuilding `<recovery>/wt`.
+            with self.assertRaises(launcher.LauncherError) as caught:
+                launcher.standalone_recovery_composition(
+                    self.base, run_id, thread_id=launcher.DEFAULT_THREAD_ID,
+                    ledger=ledger, pause_row_journal=rows)
+            self.assertIn(launcher.STANDALONE_PROFILE_WORKTREE_UNFROZEN,
+                          str(caught.exception))
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = launcher.run_watchdog_cli(
+                    ["recover", "--run-id", run_id, "--artifact-base", str(self.base),
+                     "--adapter", "standalone", "--json"])
+            self.assertNotEqual(code, 0)
+            self.assertIn(launcher.STANDALONE_PROFILE_WORKTREE_UNFROZEN,
+                          out.getvalue() + err.getvalue())
+        self.assertEqual(archive.read_bytes(), before, "the legacy archive was rewritten")
+        self.assertFalse((self.recovery / "wt").exists())
+        # The sanctioned remedy: the explicit, audited migration naming the launch-time
+        # ABSOLUTE worktree -- issued from cwd B -- after which recovery from cwd B
+        # rebuilds the launch worktree and the real fixture dispatch completes.
+        with _cwd(self.recovery):
+            audit = launcher.migrate_standalone_profile(
+                self.base, run_id, thread_id="",
+                new_profile_spec={**raw, "worktree": str(self.launch / "wt")},
+                actor="operator", reason="iteration-5 B1: freeze the legacy worktree")
+            self.assertEqual(audit["old_profile_digest"], launcher.profile_digest(raw))
+            adapter, _j, _p = launcher.standalone_recovery_composition(
+                self.base, run_id, thread_id=launcher.DEFAULT_THREAD_ID, ledger=ledger,
+                pause_row_journal=rows)
+            self.assertEqual(adapter.runtime.profile.worktree, str(self.launch / "wt"))
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = launcher.run_watchdog_cli(
+                    ["recover", "--run-id", run_id, "--artifact-base", str(self.base),
+                     "--adapter", "standalone", "--json"])
+        summary = json.loads(out.getvalue().strip().splitlines()[-1])
+        self.assertEqual(code, 0, f"{summary!r}\n{err.getvalue()}")
+        self.assertEqual(summary.get("status"), "RECOVERED", summary)
+        self.assertFalse((self.recovery / "wt").exists())
+
+    def test_a_migration_issued_with_a_relative_worktree_freezes_at_its_own_door(self) -> None:
+        run_id = "run_b1xmig"
+        ledger, raw = _launch_relative_worktree_run(self.base, self.launch, run_id)
+        elsewhere = self.tmp / "elsewhere"
+        (elsewhere / "wt2").mkdir(parents=True)
+        with _cwd(elsewhere):
+            audit = launcher.migrate_standalone_profile(
+                self.base, run_id, thread_id="t", new_profile_spec={**raw, "worktree": "wt2"},
+                actor="operator", reason="move")
+        archived = launcher.load_standalone_profile(self.base, run_id,
+                                                    digest=audit["new_profile_digest"])
+        self.assertEqual(archived["worktree"], str(elsewhere / "wt2"))
+        with _cwd(self.recovery):
+            adapter, _j, _p = launcher.standalone_recovery_composition(
+                self.base, run_id, thread_id="t", ledger=ledger,
+                pause_row_journal=launcher._standalone_pause_row_journal(self.base, run_id))
+        self.assertEqual(adapter.runtime.profile.worktree, str(elsewhere / "wt2"))
+
+
+@unittest.skipUnless(_langgraph_ok(), LANGGRAPH_REASON)
+class B1CrossCwdCrashRecoveryE2ETests(unittest.TestCase):
+    """The real crash: a REAL launch supervisor process started from ``<out>/launch_cwd``
+    with the RELATIVE worktree ``wt``, SIGKILLed after Worker i1 settled, then recovered by
+    a REAL, separate watchdog process started from ``<out>/recovery_cwd`` -- the fixture
+    driver here; the real `claude` / `codex` runs live in
+    ``scripts/os37_r10_recovery_prompt_e2e.py --cli ...`` and their retained evidence."""
+
+    def test_sigkill_then_watchdog_recovery_from_another_cwd(self) -> None:
+        from scripts import os37_r10_recovery_prompt_e2e as e2e
+        out = Path(tempfile.mkdtemp(prefix="os37-r7-b1xe2e-"))
+        self.addCleanup(shutil.rmtree, out, True)
+        record = e2e.run(out, "fixture", timeout_s=600.0)
+        self.assertEqual(record.get("outcome"), "ran", record)
+        self.assertNotEqual(record["launch_cwd"], record["recovery_cwd"], record)
+        self.assertEqual(record["profile_worktree_spec"], "wt", record)
+        self.assertEqual(record["archived_worktree"], record["launch_worktree"], record)
+        self.assertEqual(record["recovered_worktree"], record["launch_worktree"], record)
+        self.assertEqual(record["recovered_cwd_flag"], record["launch_worktree"], record)
+        self.assertFalse(record["recovery_cwd_worktree_exists"], record)
+        self.assertEqual(record["recover_status"], "RECOVERED", record)
+        self.assertEqual(record["terminal_status_after_recover"], "COMPLETED", record)
+        self.assertTrue(record["recovery_prompt_established"], record)
+
+
 if __name__ == "__main__":
     unittest.main()

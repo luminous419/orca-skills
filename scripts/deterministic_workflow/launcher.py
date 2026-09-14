@@ -245,6 +245,86 @@ def profile_archive_path(artifact_base: Any, run_id: str, digest: str) -> Path:
     return standalone_profile_path(artifact_base, run_id).parent / "profiles" / f"{digest}.json"
 
 
+def profile_unfrozen_paths(profile_spec: Mapping[str, Any]) -> tuple[str, ...]:
+    """The launch-relative directory fields of a profile spec that are still RELATIVE:
+    ``worktree`` and each ``add_dirs[i]``.  Empty means the spec is frozen -- every
+    directory it names is absolute and so means the same directory in every process."""
+    out: list[str] = []
+    worktree = profile_spec.get("worktree", "")
+    if isinstance(worktree, str) and worktree and not os.path.isabs(worktree):
+        out.append("worktree")
+    add_dirs = profile_spec.get("add_dirs") or ()
+    if isinstance(add_dirs, (list, tuple)):
+        for index, directory in enumerate(add_dirs):
+            if isinstance(directory, str) and directory and not os.path.isabs(directory):
+                out.append(f"add_dirs[{index}]")
+    return tuple(out)
+
+
+def freeze_profile_worktree(profile_spec: Mapping[str, Any], *,
+                            launch_base: Any = None) -> dict[str, Any]:
+    """The profile spec with its launch-relative directories FROZEN to the absolute paths
+    the launching process means by them -- Final-Review iteration 5, B1.
+
+    A profile is an operator's file, and a relative ``worktree`` (or ``add_dirs`` entry) in
+    it means "relative to where I launch from".  Iteration 4 resolved that at
+    `profile_from_mapping`, i.e. at RUNTIME CONSTRUCTION, against whatever process was
+    constructing -- but the archive the run/thread authority binds still held the RAW
+    relative string, so a Watchdog started from another cwd rebuilt a different worktree
+    from byte-identical archived bytes.  The resolution now happens ONCE, here, at the
+    launch composition door, BEFORE the spec is digested, exact-match checked, archived
+    and handed to the runtime: the archive holds the launch-time absolute path and no
+    later process interprets it.
+
+    ``launch_base`` is the directory a relative path is resolved against; ``None`` means
+    this process's cwd, which is what the operator's relative path means at launch.  An
+    absolute path is returned BYTE-UNCHANGED (no normalisation), so a spec that already
+    names absolute directories has the same digest it always had.  Empty stays empty.
+
+    **The create-once digest is computed over the FROZEN mapping.**  That is safe -- and
+    is the point -- because the digest names the launch conditions the run actually
+    executes under: two launches of the same relative spec from the same cwd freeze to the
+    same bytes and are an exact-match restart; from DIFFERENT cwds they freeze to
+    different bytes, which is a DIFFERENT worktree and therefore refused by name
+    (``STANDALONE_AUTHORITY_CONFLICT``) rather than silently re-bound.
+    """
+    frozen = dict(profile_spec)
+    base = os.fspath(launch_base) if launch_base is not None else os.getcwd()
+
+    def _absolute(directory: str) -> str:
+        return os.path.normpath(os.path.join(base, directory))
+    worktree = frozen.get("worktree", "")
+    if isinstance(worktree, str) and worktree and not os.path.isabs(worktree):
+        frozen["worktree"] = _absolute(worktree)
+    add_dirs = frozen.get("add_dirs")
+    if isinstance(add_dirs, (list, tuple)):
+        frozen["add_dirs"] = [
+            _absolute(d) if isinstance(d, str) and d and not os.path.isabs(d) else d
+            for d in add_dirs]
+    return frozen
+
+
+def _refuse_unfrozen_profile(profile_spec: Mapping[str, Any], *, where: str,
+                             remedy: str) -> None:
+    """The typed ``STANDALONE_PROFILE_WORKTREE_UNFROZEN`` refusal, raised by the write door
+    (an unfrozen spec must never reach an archive) and by the read door (an archive that
+    nevertheless holds one -- the pre-fix model's -- must never be interpreted here)."""
+    unfrozen = profile_unfrozen_paths(profile_spec)
+    if unfrozen:
+        values = []
+        for field in unfrozen:
+            if field == "worktree":
+                values.append(f"worktree={profile_spec.get('worktree')!r}")
+            else:
+                index = int(field[len("add_dirs["):-1])
+                values.append(f"{field}={profile_spec['add_dirs'][index]!r}")
+        raise LauncherError(
+            f"{STANDALONE_PROFILE_WORKTREE_UNFROZEN}: {where} names a RELATIVE directory "
+            f"({', '.join(values)}); a relative directory means one thing in the launching "
+            "process and another in any recovery process, so it is refused rather than "
+            f"re-interpreted against this process's cwd {os.getcwd()!r}; {remedy}")
+
+
 def persist_standalone_profile(artifact_base: Any, run_id: str,
                                profile_spec: Mapping[str, Any]) -> Path:
     """Write the profile spec durably (tmp + rename).
@@ -256,6 +336,12 @@ def persist_standalone_profile(artifact_base: Any, run_id: str,
     ``standalone/profiles/<digest>.json`` (write-once), and ``standalone/profile.json``
     names the CURRENT composition -- the one a recovery re-enters with.
     """
+    # Iteration 5, B1: the WRITE door.  An archive holds launch-time absolute directories
+    # or nothing; a relative one would be re-interpreted by whichever process reads it.
+    _refuse_unfrozen_profile(
+        profile_spec, where=f"the profile to persist for run {run_id!r}",
+        remedy="the launch composition freezes the spec (freeze_profile_worktree) before "
+               "it is digested and archived, so this is a caller that bypassed it")
     target = standalone_profile_path(artifact_base, run_id)
     target.parent.mkdir(parents=True, exist_ok=True)
     payload = profile_payload(profile_spec)
@@ -326,6 +412,17 @@ def _fsync_directory(directory: Path) -> None:
 # ---- round 4, finding 2: the runtime-state AUTHORITY recorded by the original launch ----
 STANDALONE_AUTHORITY_SCHEMA = "os37.standalone_authority.v1"
 
+#: Final-Review iteration 3, B2.  The durable log of a LEGACY-authority upgrade: a run
+#: launched by the PRE-fix model recorded ``thread_id: ""`` and no prompt-composition
+#: digest, while its durable checkpoint/pause evidence names ``"launcher"``.  The new
+#: validator refuses that shape, so such a run could not resume or be watchdog-recovered
+#: after upgrade.  The read path recognises ONLY that exact shape whose durable evidence
+#: PROVES ``launcher`` and atomically upgrades it to the effective identity, recording the
+#: act here (idempotent).  Any empty-thread authority whose evidence is absent / unreadable
+#: / another thread stays refused -- a blanket acceptance would reopen the foreign-authority
+#: bypass.
+STANDALONE_AUTHORITY_UPGRADE_SCHEMA = "os37.standalone_authority_upgrade.v1"
+
 #: Follow-up review finding 5.  A run's recorded runtime-state authority is CREATE-ONCE
 #: and EXACT-MATCH: a second launch of the same run and thread that names a different
 #: ledger (or a different approval authority, finding 8) is refused by this name before
@@ -346,6 +443,17 @@ STANDALONE_PROFILE_DIGEST_MISMATCH = "STANDALONE_PROFILE_DIGEST_MISMATCH"
 #: or no reason, or whose new profile is identical to the bound one, is refused: a
 #: migration is a deliberate, attributable, CHANGING act, not a silent re-bind.
 STANDALONE_MIGRATION_REFUSED = "STANDALONE_MIGRATION_REFUSED"
+#: Final-Review iteration 5, B1.  A persisted profile whose ``worktree`` (or an
+#: ``add_dirs`` entry) is a RELATIVE path is not durable: the launch resolved it against
+#: the launch process's cwd, and a recovery started from ANY OTHER cwd would resolve the
+#: same archived bytes to a different -- typically nonexistent -- directory.  The launch
+#: door now FREEZES the launch-time absolute path into the spec before it is digested,
+#: checked and archived (:func:`freeze_profile_worktree`), the write door refuses to
+#: archive an unfrozen spec, and the read door refuses to rebuild a runtime from one --
+#: a legacy archive written by the pre-fix model is recovered only through the explicit,
+#: audited profile migration (``migrate-standalone-profile``) that names the launch-time
+#: absolute worktree, never by re-interpreting its bytes against a new process cwd.
+STANDALONE_PROFILE_WORKTREE_UNFROZEN = "STANDALONE_PROFILE_WORKTREE_UNFROZEN"
 #: The durable audit-log schema for a profile migration.
 STANDALONE_MIGRATION_SCHEMA = "os37.standalone_profile_migration.v2"
 #: Round-7 consolidated review, blocker 3.  The run's DURABLE THREAD EVIDENCE (its pause
@@ -680,9 +788,116 @@ def load_standalone_authority(artifact_base: Any, run_id: str,
     ``prepared``-without-``committed`` migration is deterministically finished or rolled
     back (:func:`reconcile_standalone_migrations`) so the digest a reader sees is the
     committed one, never a half-applied one.  A run with no migration log takes a fast
-    no-op path, so ordinary loads are unaffected."""
+    no-op path, so ordinary loads are unaffected.
+
+    Final-Review iteration 3, B2.  The read path ALSO upgrades a genuine LEGACY authority
+    -- ``thread_id: ""`` with no prompt-composition digest -- to the effective identity
+    when (and ONLY when) the run's durable evidence PROVES ``launcher``, so an interrupted
+    run launched at the PR base can resume and be watchdog-recovered after upgrade.  An
+    empty-thread authority whose evidence is absent / unreadable / another thread is
+    untouched here and stays refused by :func:`_validate_authority_record`."""
     reconcile_standalone_migrations(artifact_base, run_id, thread_id)
+    _upgrade_legacy_authority_if_needed(artifact_base, run_id, thread_id)
     return _load_authority_validated(artifact_base, run_id, thread_id)
+
+
+def _is_legacy_omitted_thread_authority(record: Any, run_id: str) -> bool:
+    """Exactly the shape the PRE-fix model wrote for a launch that omitted ``thread_id``:
+    a complete standalone binding whose recorded thread is the EMPTY string and which
+    carries no prompt-composition digest.  Everything else (a non-empty wrong thread, a
+    missing ledger, a foreign run id) is NOT this shape and is left to the normal
+    validator -- so this recognises the compatibility case without widening into the
+    foreign-authority bypass the empty-thread guard exists to close."""
+    return (isinstance(record, dict)
+            and record.get("schema") == STANDALONE_AUTHORITY_SCHEMA
+            and record.get("adapter") == STANDALONE_ADAPTER
+            and record.get("run_id") == run_id
+            and isinstance(record.get("runtime_state_path"), str)
+            and bool(record.get("runtime_state_path"))
+            and record.get("approval_authority") not in (None, "")
+            and isinstance(record.get("profile_digest"), str)
+            and bool(record.get("profile_digest"))
+            and record.get("thread_id") == ""
+            and not record.get("prompt_composition_digest"))
+
+
+def _authority_upgrade_log_path(artifact_base: Any, run_id: str) -> Path:
+    """The durable, append-only audit log of legacy-authority upgrades for a run."""
+    return standalone_profile_path(artifact_base, run_id).with_name(
+        "authority_upgrades.ndjson")
+
+
+def read_authority_upgrades(artifact_base: Any, run_id: str) -> tuple[dict[str, Any], ...]:
+    """Every recorded legacy-authority upgrade for this run, oldest first."""
+    path = _authority_upgrade_log_path(artifact_base, run_id)
+    if not path.exists():
+        return ()
+    out: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line:
+            out.append(json.loads(line))
+    return tuple(out)
+
+
+def _upgrade_legacy_authority_if_needed(artifact_base: Any, run_id: str,
+                                        thread_id: str = "") -> None:
+    """Recognise ONLY the exact legacy omitted-``thread_id`` authority whose durable
+    evidence PROVES ``launcher`` and atomically upgrade it to the effective identity, under
+    the SAME run-scoped inter-process authority lock migration uses.  B2.
+
+    * Fast no-op unless the primary authority file exists and is the legacy shape (an
+      unreadable file is left to the validated read, which refuses it by name).
+    * Under the lock, re-read (another process may have upgraded already -> no-op).
+    * The upgrade proceeds ONLY when :func:`durable_thread_evidence` is ``present`` and
+      names :data:`DEFAULT_THREAD_ID`.  Absent / unreadable / any-other-thread leaves the
+      record untouched (still refused downstream) -- no blanket acceptance of empty-thread
+      authorities, which would reopen the foreign-authority bypass.
+    * The now-required prompt-composition binding is recovered from the run's persisted
+      composition when one exists; a legacy run that persisted none delivered the canonical
+      intent payload, so a ``composer: none`` composition is the faithful reconstruction and
+      is persisted and bound.  A persisted composition that is present-but-unreadable
+      propagates the item-2 typed :data:`STANDALONE_PROMPT_COMPOSITION_MISSING` refusal.
+    * The rewrite is atomic (``_durable_write``) and the act is journalled idempotently.
+    """
+    primary = standalone_authority_path(artifact_base, run_id, "")
+    if not primary.exists():
+        return
+    try:
+        record = json.loads(primary.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return                                           # the validated read refuses it
+    if not _is_legacy_omitted_thread_authority(record, run_id):
+        return
+    with _MigrationLock(artifact_base, run_id):
+        try:
+            record = json.loads(primary.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if not _is_legacy_omitted_thread_authority(record, run_id):
+            return                                       # already upgraded by a racer
+        evidence = durable_thread_evidence(artifact_base, run_id)
+        if evidence.kind != THREAD_EVIDENCE_PRESENT or evidence.thread_id != DEFAULT_THREAD_ID:
+            # Absent / unreadable / another thread: NOT the legacy `launcher` case.  Leave
+            # it refused -- upgrading it would be the foreign-authority bypass.
+            return
+        # Recover the composition binding, or refuse by the item-2 typed reason.
+        composition = load_standalone_prompt_composition(artifact_base, run_id)
+        if composition is None:
+            composition = prompt_composition_record(None)   # legacy raw-intent default
+            persist_standalone_prompt_composition(artifact_base, run_id, composition)
+        upgraded = dict(record)
+        upgraded["thread_id"] = DEFAULT_THREAD_ID
+        upgraded["prompt_composition_digest"] = prompt_composition_digest(composition)
+        _durable_write(primary, json.dumps(upgraded, sort_keys=True, indent=2) + "\n")
+        _durable_append(_authority_upgrade_log_path(artifact_base, run_id),
+                        json.dumps({"schema": STANDALONE_AUTHORITY_UPGRADE_SCHEMA,
+                                    "run_id": run_id,
+                                    "from_thread_id": "", "to_thread_id": DEFAULT_THREAD_ID,
+                                    "bound_prompt_composition_digest":
+                                        upgraded["prompt_composition_digest"],
+                                    "durable_evidence_source": evidence["source"],
+                                    "recorded_at": _authority_now()}, sort_keys=True) + "\n")
 
 
 def check_standalone_authority(artifact_base: Any, run_id: str, *, runtime_state_path: Any,
@@ -800,8 +1015,33 @@ def load_standalone_profile(artifact_base: Any, run_id: str,
                 f"{STANDALONE_ADAPTER_REQUIRES_PROFILE}: the profile archive {archive} "
                 f"does not hash to the digest {digest!r} the launch bound; it is refused "
                 "rather than rebuilt from")
+        _refuse_legacy_unfrozen_archive(spec, run_id, digest, archive)
         return spec
-    return _read_profile_file(standalone_profile_path(artifact_base, run_id))
+    spec = _read_profile_file(standalone_profile_path(artifact_base, run_id))
+    if spec is not None:
+        _refuse_legacy_unfrozen_archive(spec, run_id, "",
+                                        standalone_profile_path(artifact_base, run_id))
+    return spec
+
+
+def _refuse_legacy_unfrozen_archive(spec: Mapping[str, Any], run_id: str, digest: str,
+                                    archive: Path) -> None:
+    """Iteration 5, B1: the READ door.  An archive holding a relative ``worktree`` /
+    ``add_dirs`` entry was written by the PRE-fix model (the write door refuses one now).
+    Its bytes meant "relative to the launch cwd" and no durable record of that cwd exists
+    for such a run, so NOTHING here may guess: not this process's cwd (the reviewer's
+    ``<tmp>/recovery/wt`` probe) and not any other directory.  The run is recovered only
+    through the explicit, audited profile migration, which binds the launch-time absolute
+    worktree the operator names and leaves the audit trail of who re-bound what and why.
+    The refusal is the same on resume, recover, cancel, abandon and watchdog, because all
+    of them rebuild through this one read."""
+    _refuse_unfrozen_profile(
+        spec, where=(f"the persisted profile archive {archive} bound by run {run_id!r}"
+                     + (f" (digest {digest!r})" if digest else "")),
+        remedy="it was archived by the pre-fix model; re-bind the run with `run_workflow.py "
+               "migrate-standalone-profile --run-id ... --standalone-profile <the same "
+               "profile with the launch-time ABSOLUTE worktree> --actor-id ... --reason "
+               "...` (audited) and then recover it")
 
 
 # ---- round-7 blocker 2: the PROMPT COMPOSITION a launch persists for its recoveries ----
@@ -1175,6 +1415,12 @@ def migrate_standalone_profile(artifact_base: Any, run_id: str, *, thread_id: st
         raise LauncherError(
             f"{STANDALONE_MIGRATION_REFUSED}: a profile migration requires a non-empty "
             "--actor-id and --reason; an unattributable re-bind is not an audited act")
+    # Iteration 5, B1: the migration's NEW profile is frozen at its own door, against the
+    # migrating process's cwd -- the operator's explicit act names the directory as the
+    # operator means it -- so the archive it writes is absolute like every other and a
+    # legacy relative archive is re-bound to the launch-time absolute worktree the operator
+    # names, never to a re-interpretation of the old bytes.
+    new_profile_spec = freeze_profile_worktree(new_profile_spec)
     # Round-7 blocker 5: the WHOLE operation -- reconcile, read, prepare, archive, CAS
     # re-bind, commit -- runs under the run's inter-process lock, so no reader reconciles
     # it half-way and no second migrator interleaves with it.
@@ -1484,6 +1730,17 @@ def build_standalone_adapter(spec: dict[str, Any], *, artifact_base: Path,
             f"{STANDALONE_ADAPTER_REQUIRES_PROFILE}: --adapter standalone needs an explicit "
             "driver profile; there is deliberately no built-in CLI table (AC-37-03)")
     journal = ExecutionJournal(artifact_base, resolved_run)
+    # ---- Final-Review iteration 5, B1: the launch-time worktree is FROZEN here --------
+    # The ONE launch composition door.  A relative `worktree` / `add_dirs` entry in the
+    # operator's profile means "relative to where I launch from", and that meaning is
+    # fixed HERE, in the launching process, before the spec is digested (the create-once
+    # authority binding below), exact-match checked, archived (`publish_launch_bindings`)
+    # and handed to the runtime -- so the archive a Watchdog started from ANY cwd rebuilds
+    # from holds the launch-time absolute path, and the digest names the worktree the run
+    # really executes in (see `freeze_profile_worktree` for why hashing the frozen
+    # mapping is the safe choice: same cwd -> exact-match restart; another cwd -> a
+    # different worktree -> STANDALONE_AUTHORITY_CONFLICT, never a silent re-bind).
+    profile_spec = freeze_profile_worktree(profile_spec)
     # ---- OS-37 correction R3: the DECLARED worktree reaches the child -----------------
     # `StandaloneSession.worktree_path` defaults to `os.getcwd()`, and this composition
     # root never overrode it -- so every agent a shipped `run_workflow.py --adapter
@@ -2934,6 +3191,13 @@ def standalone_recovery_composition(base: Path, run_id: str, *, thread_id: str,
         # Finding 9: an override is admitted ONLY as an exact restatement of the bound
         # digest.  A recorded run whose digest the override does not match is refused;
         # a run with no recorded binding (in-memory ledger) has no digest to violate.
+        # Iteration 5, B1: the restatement passes the SAME freeze the launch did, against
+        # THIS process's cwd -- an operator's relative path means "relative to where I
+        # run this" on recovery exactly as it did on launch.  Restated from the launch
+        # cwd it freezes to the bound bytes and matches; restated from another cwd it
+        # freezes to another worktree and is the typed digest mismatch below, so an
+        # override can never re-bind a recovery to a directory the launch did not name.
+        profile_override = freeze_profile_worktree(profile_override)
         override_digest = profile_digest(profile_override)
         if recorded_digest and override_digest != recorded_digest:
             raise LauncherError(

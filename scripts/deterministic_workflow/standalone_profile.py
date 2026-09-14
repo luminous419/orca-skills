@@ -796,6 +796,34 @@ def profile_from_mapping(spec: Any) -> StandaloneProfile:
     capture = spec.get("capture") or {}
     timeouts = spec.get("timeouts") or {}
     hint = spec.get("graceful_hint") or b""
+    # ---- Final-Review iteration 4, B1: the worktree is resolved to an ABSOLUTE path -----
+    # The runtime CHANGES DIRECTORY into the worktree before the spawn (the bounded probe's
+    # cwd), and a driver may ALSO compose the worktree into the child argv as a
+    # change-directory flag.  When the worktree is RELATIVE, that flag is re-applied against
+    # the already-changed directory -- the child then resolves ``<worktree>/<worktree>``,
+    # which does not exist, and refuses.  (A driver that instead passes the worktree as an
+    # add-directory acl and simply runs in the cwd was unaffected, which is why the defect
+    # showed up on only one of the two installed CLIs.)  Resolving here, at the ONE door
+    # every launch and every recovery passes, makes the cwd and every worktree-derived flag
+    # name the SAME absolute directory, so the double-application cannot happen.  The
+    # profile DIGEST is not computed from this object; an empty worktree stays empty (the
+    # session's own ``os.getcwd()`` default, unchanged).
+    #
+    # Final-Review iteration 5, B1.  Resolving HERE was not durable: the archive a
+    # run/thread authority binds held the RAW relative string, and a recovery started from
+    # another cwd resolved the same bytes to another directory.  The DURABLE resolution
+    # is now the launcher's (`launcher.freeze_profile_worktree`, at the one launch /
+    # migration / override door, BEFORE the spec is digested and archived; the archive
+    # write door refuses an unfrozen spec and the read door refuses a legacy one), so for
+    # every persisted profile this `abspath` is the identity.  It is kept for the direct
+    # in-process caller that hands a relative spec to the runtime without persisting it:
+    # the cwd and every worktree-derived flag must still name ONE directory.  `add_dirs`
+    # entries are resolved the same way, for the same double-application reason.
+    import os as _os
+    worktree_spec = spec.get("worktree", "")
+    worktree_resolved = _os.path.abspath(worktree_spec) if worktree_spec else ""
+    add_dirs_resolved = tuple(_os.path.abspath(d) if d else d
+                              for d in _as_tuple(spec.get("add_dirs"), "add_dirs"))
     return StandaloneProfile(
         driver=spec.get("driver", ""), binary=spec.get("binary", ""),
         supported_range=(bounds[0], bounds[1]),  # type: ignore[arg-type]
@@ -811,8 +839,8 @@ def profile_from_mapping(spec: Any) -> StandaloneProfile:
         debug_file_path=spec.get("debug_file_path", ""),
         sandbox_mode=spec.get("sandbox_mode", ""),
         permission_mode=spec.get("permission_mode", ""),
-        add_dirs=_as_tuple(spec.get("add_dirs"), "add_dirs"),
-        worktree=spec.get("worktree", ""), term=spec.get("term", "xterm-256color"),
+        add_dirs=add_dirs_resolved,
+        worktree=worktree_resolved, term=spec.get("term", "xterm-256color"),
         rows=int(spec.get("rows", 40)), cols=int(spec.get("cols", 120)),
         home_policy=HomePolicy(**home) if isinstance(home, Mapping) else HomePolicy(),
         capture=CaptureLimits(**capture) if isinstance(capture, Mapping) else CaptureLimits(),

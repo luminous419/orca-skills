@@ -22,6 +22,13 @@ What it proves (iteration 2, addressing REVIEW_BUGFIX findings 3/10):
      pre-crash rendering the launch composer produced, and the correction Worker prompt
      carries the objective, the output contract AND the correction instruction.
 
+Iteration 5 (B1, durable worktree resolution): the profile declares the RELATIVE worktree
+``wt``; the launch supervisor is started from ``<out>/launch_cwd`` (where ``wt`` lives) and
+the recovery is a SEPARATE watchdog process started from ``<out>/recovery_cwd`` (which holds
+no ``wt``).  Both cwds, the archived worktree the launch bound and the worktree / cwd flag the
+recovered runtime composed are recorded in the evidence, so the recovery is proven to rebuild
+the LAUNCH-time absolute worktree and never ``<recovery_cwd>/wt``.
+
 `orca` is removed from PATH and every `ORCA_*` name stripped, asserted with a raise, in both
 the launch subprocess and the recovery process.  For `--cli codex` the run-scoped
 `CODEX_HOME` is seeded 0600 from `~/.codex/auth.json` by the production preflight; the seed
@@ -64,7 +71,8 @@ def _graph_agent_bin() -> str:
     return str(built)
 
 
-def build_profile(cli: str, worktree: str, *, codex_home: str = "") -> dict[str, Any]:
+def build_profile(cli: str, worktree: str, *, codex_home: str = "",
+                  launch_cwd: str = ".") -> dict[str, Any]:
     if cli == "fixture":
         return {
             "driver": "claude", "binary": "os37-graph-agent",
@@ -87,7 +95,12 @@ def build_profile(cli: str, worktree: str, *, codex_home: str = "") -> dict[str,
                          "delivery_verify_timeout_ms": 10000, "completion_timeout_ms": 20000},
         }
     if cli == "claude":
-        return profile_document(claude_profile(worktree))
+        # `--add-dir` rides `extra_args`, which the runtime composes VERBATIM (it is not a
+        # worktree-derived flag), so the harness gives it the absolute launch-time path;
+        # the profile's own `worktree` stays the relative spec under test.
+        return profile_document(claude_profile(
+            worktree, extra_args=("--strict-mcp-config", "--add-dir",
+                                  os.path.abspath(os.path.join(launch_cwd, worktree)))))
     if cli == "codex":
         return profile_document(codex_profile(worktree, codex_home))
     raise SystemExit(f"unknown --cli {cli!r}")
@@ -145,6 +158,12 @@ def _run_launch_child(cfg: dict[str, Any]) -> int:
          "max_iterations": 4}, artifact_base=base, run_id=run_id,
         runtime_state=ledger, profile_spec=profile, prompt_composition=composition)
     _tee_adapter_composer(adapter, Path(cfg["launch_dump"]), "launch")
+    # Iteration 5 (B1): the launch process's own account of where it ran and what it froze.
+    Path(cfg["launch_facts"]).write_text(json.dumps({
+        "launch_cwd": os.getcwd(),
+        "profile_worktree_spec": profile.get("worktree", ""),
+        "launch_worktree": adapter.runtime.profile.worktree,
+    }, indent=2))
     final = launcher.execute_state(
         state, adapter=adapter, runtime_state=ledger,
         journal=launcher._standalone_pause_row_journal(base, run_id),
@@ -155,6 +174,44 @@ def _run_launch_child(cfg: dict[str, Any]) -> int:
         "pending_intent": final.get("pending_intent"),
     }, default=str))
     time.sleep(3600)                                     # alive-but-stalled; parent SIGKILLs
+    return 0
+
+
+# ---- the recovery subprocess (a REAL, separate watchdog process from its OWN cwd) -------
+def _run_recover_child(cfg: dict[str, Any]) -> int:
+    """Iteration 5 (B1).  The recovery used to run in the parent's process (and cwd); it
+    is now a separate process started from ``recovery_cwd``, so a worktree the archive held
+    relative would be re-interpreted HERE, against a cwd that holds no ``wt``."""
+    assert_orca_free({k: v for k, v in os.environ.items()})
+    base = Path(cfg["base"])
+    run_id = cfg["run_id"]
+    facts: dict[str, Any] = {"recovery_cwd": os.getcwd()}
+    _install_composer_tee(Path(cfg["recover_dump"]))
+    real = launcher.standalone_recovery_composition
+
+    def observed(*args: Any, **kwargs: Any):
+        adapter, journal, port = real(*args, **kwargs)
+        profile = adapter.runtime.profile
+        facts["recovered_worktree"] = profile.worktree
+        facts["recovered_add_dirs"] = list(profile.add_dirs)
+        argv = list(drivers.driver_for(profile).argv(session_id="probe", prompt="probe"))
+        facts["recovered_argv_cwd_flags"] = {
+            flag: argv[argv.index(flag) + 1] for flag in ("-C", "--add-dir") if flag in argv}
+        # The flag a driver composes from the WORKTREE itself: codex's `-C`; claude runs in
+        # the cwd and carries `--add-dir` verbatim from `extra_args`.
+        facts["recovered_cwd_flag"] = facts["recovered_argv_cwd_flags"].get(
+            "-C", profile.worktree)
+        return adapter, journal, port
+    launcher.standalone_recovery_composition = observed
+    out, err = _sio(), _sio()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        code = launcher.run_watchdog_cli(
+            ["recover", "--run-id", run_id, "--artifact-base", str(base),
+             "--adapter", "standalone", "--recursion-limit", "200", "--json"])
+    Path(cfg["recover_stdout"]).write_text(out.getvalue())
+    Path(cfg["recover_stderr"]).write_text(err.getvalue())
+    facts["recover_exit"] = code
+    Path(cfg["recover_facts"]).write_text(json.dumps(facts, indent=2))
     return 0
 
 
@@ -239,12 +296,22 @@ def _sio():
 
 # ---- the orchestration ------------------------------------------------------------------
 def run(out_dir: Path, cli: str, *, timeout_s: float = 2400.0) -> dict[str, Any]:
+    # ABSOLUTE, so the worktree and every derived path name one directory regardless of the
+    # process cwd -- the launch subprocess and the in-process recovery resolve identically.
+    # (The production runtime also resolves a relative worktree now; this keeps the harness's
+    # own evidence paths absolute.)
+    out_dir = out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     base = out_dir / "artifact_base"
-    worktree = out_dir / "wt"
+    # Iteration 5 (B1): the profile names the RELATIVE worktree `wt`; the launch runs from
+    # `launch_cwd` (which holds it) and the recovery from `recovery_cwd` (which does not).
+    launch_cwd = out_dir / "launch_cwd"
+    recovery_cwd = out_dir / "recovery_cwd"
+    worktree_spec = "wt"
+    worktree = launch_cwd / worktree_spec
     launch_dump = out_dir / "launch_delivered"
     recover_dump = out_dir / "recover_delivered"
-    for path in (base, worktree, launch_dump, recover_dump):
+    for path in (base, worktree, recovery_cwd, launch_dump, recover_dump):
         path.mkdir(parents=True, exist_ok=True)
     codex_home = tempfile.mkdtemp(prefix="os37-codexhome-") if cli == "codex" else ""
     run_id = f"run_r7rec{cli}"
@@ -253,7 +320,8 @@ def run(out_dir: Path, cli: str, *, timeout_s: float = 2400.0) -> dict[str, Any]
     env = orca_free_environment()
     precondition = assert_orca_free(env)
     (out_dir / "preconditions.json").write_text(json.dumps(precondition, indent=2))
-    profile = build_profile(cli, str(worktree), codex_home=codex_home)
+    profile = build_profile(cli, worktree_spec, codex_home=codex_home,
+                            launch_cwd=str(launch_cwd))
 
     def _plain(value: Any) -> Any:                        # a real CLI profile carries bytes
         if isinstance(value, bytes):
@@ -265,9 +333,13 @@ def run(out_dir: Path, cli: str, *, timeout_s: float = 2400.0) -> dict[str, Any]
 
     child_cfg = {"base": str(base), "run_id": run_id, "thread_id": thread_id,
                  "ledger": str(ledger_path), "profile": str(out_dir / "profile.json"),
-                 "launch_dump": str(launch_dump), "marker": str(marker)}
+                 "launch_dump": str(launch_dump), "marker": str(marker),
+                 "launch_facts": str(out_dir / "launch_facts.json")}
     cfg_path = out_dir / "child_cfg.json"
     cfg_path.write_text(json.dumps(child_cfg))
+    # Both subprocesses run this file BY PATH (it puts the repository on `sys.path`
+    # itself), so neither needs the repository as its cwd -- the cwd is the variable.
+    this_file = str(Path(__file__).resolve())
 
     # No ORCA_OS40_* env: those names are ORCA-namespaced and the orca-free precondition
     # forbids them.  The launch child and the recovery both use the artifact-base default
@@ -276,20 +348,24 @@ def run(out_dir: Path, cli: str, *, timeout_s: float = 2400.0) -> dict[str, Any]
     child_env = dict(env)
 
     # (1) the REAL launch supervisor: Worker i1 -> committed settlement -> stall.
+    # The child's stderr is written to a file (never a PIPE that fills and is discarded on
+    # SIGKILL), so a launch that settles anything other than COMPLETE is diagnosable.
+    child_log = open(out_dir / "launch_child_stderr.txt", "wb")
     child = subprocess.Popen(
-        [sys.executable, "-m", "scripts.os37_r10_recovery_prompt_e2e",
-         "--child", str(cfg_path)],
-        env=child_env, cwd=str(REPO), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        [sys.executable, this_file, "--child", str(cfg_path)],
+        env=child_env, cwd=str(launch_cwd), stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL, stderr=child_log)
     started = time.time()
     stalled: dict[str, Any] = {}
     try:
         while not marker.exists():
             if child.poll() is not None:
-                _so, se = child.communicate()
+                child_log.flush()
+                se = (out_dir / "launch_child_stderr.txt").read_text(
+                    encoding="utf-8", errors="replace")
                 return {"cli": cli, "outcome": "blocked", "stage": "launch",
                         "reason": "the launch supervisor exited before stalling",
-                        "child_rc": child.returncode,
-                        "stderr": (se or b"").decode("utf-8", "replace")[-3000:]}
+                        "child_rc": child.returncode, "stderr": se[-3000:]}
             if time.time() - started > timeout_s:
                 child.kill()
                 return {"cli": cli, "outcome": "blocked", "stage": "launch",
@@ -319,28 +395,40 @@ def run(out_dir: Path, cli: str, *, timeout_s: float = 2400.0) -> dict[str, Any]
         pre_crash_prompt = launcher.composer_from_composition(composition)(pre_crash_intent)
         (out_dir / "pre_crash_reviewer_prompt.txt").write_text(pre_crash_prompt)
 
-    # (3) RECOVERY through the production watchdog wiring, in-process, same real driver.
-    _install_composer_tee(recover_dump)
-    saved = {"PATH": os.environ.get("PATH")}
-    os.environ["PATH"] = env["PATH"]
-    out, err = _sio(), _sio()
-    try:
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            code = launcher.run_watchdog_cli(
-                ["recover", "--run-id", run_id, "--artifact-base", str(base),
-                 "--adapter", "standalone", "--recursion-limit", "200", "--json"])
-    finally:
-        for key, value in saved.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
-    (out_dir / "recover_stdout.json").write_text(out.getvalue())
-    (out_dir / "recover_stderr.txt").write_text(err.getvalue())
+    launch_facts: dict[str, Any] = {}
+    with contextlib.suppress(Exception):
+        launch_facts = json.loads((out_dir / "launch_facts.json").read_text())
+    authority = launcher.load_standalone_authority(base, run_id, thread_id) or {}
+    archived_worktree = ""
+    with contextlib.suppress(Exception):
+        archived_worktree = str(launcher.load_standalone_profile(
+            base, run_id, digest=authority.get("profile_digest", "")).get("worktree", ""))
+
+    # (3) RECOVERY through the production watchdog wiring in a SEPARATE process started
+    # from `recovery_cwd`, same real driver.
+    recover_cfg = {"base": str(base), "run_id": run_id,
+                   "recover_dump": str(recover_dump),
+                   "recover_stdout": str(out_dir / "recover_stdout.json"),
+                   "recover_stderr": str(out_dir / "recover_stderr.txt"),
+                   "recover_facts": str(out_dir / "recover_facts.json")}
+    recover_cfg_path = out_dir / "recover_cfg.json"
+    recover_cfg_path.write_text(json.dumps(recover_cfg))
+    recover_proc = subprocess.run(
+        [sys.executable, this_file, "--recover", str(recover_cfg_path)],
+        env=child_env, cwd=str(recovery_cwd), stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout_s)
+    (out_dir / "recover_child_stderr.txt").write_bytes(recover_proc.stderr or b"")
+    recover_facts: dict[str, Any] = {}
+    with contextlib.suppress(Exception):
+        recover_facts = json.loads((out_dir / "recover_facts.json").read_text())
+    code = recover_facts.get("recover_exit", recover_proc.returncode or -1)
     summary: dict[str, Any] = {}
-    if out.getvalue().strip():
+    stdout_text = ""
+    with contextlib.suppress(Exception):
+        stdout_text = (out_dir / "recover_stdout.json").read_text()
+    if stdout_text.strip():
         with contextlib.suppress(Exception):
-            summary = json.loads(out.getvalue().strip().splitlines()[-1])
+            summary = json.loads(stdout_text.strip().splitlines()[-1])
 
     # (4) assertions, from the runtime's OWN structured delivery records.
     digests = _journal_delivery_digests(base, run_id)
@@ -362,10 +450,22 @@ def run(out_dir: Path, cli: str, *, timeout_s: float = 2400.0) -> dict[str, Any]
         for t in correction_recovered)
     final_shape = _settlement_shape(base, run_id)
 
+    launch_worktree = str(launch_facts.get("launch_worktree") or "")
     record: dict[str, Any] = {
         "cli": cli,
         "outcome": "ran",
         "orca_free": precondition,
+        # Iteration 5 (B1): the two cwds and what each process made of the worktree.
+        "launch_cwd": str(launch_facts.get("launch_cwd") or ""),
+        "recovery_cwd": str(recover_facts.get("recovery_cwd") or ""),
+        "profile_worktree_spec": str(launch_facts.get("profile_worktree_spec") or ""),
+        "launch_worktree": launch_worktree,
+        "archived_worktree": archived_worktree,
+        "recovered_worktree": str(recover_facts.get("recovered_worktree") or ""),
+        "recovered_cwd_flag": str(recover_facts.get("recovered_cwd_flag") or ""),
+        "recovered_argv_cwd_flags": recover_facts.get("recovered_argv_cwd_flags"),
+        "recovery_cwd_worktree_exists": (recovery_cwd / worktree_spec).exists(),
+        "recovery_process": "separate watchdog subprocess (recover verb)",
         "launch_worker_settled": bool(launch_settlements),
         "crash": "SIGKILL after APPLY_RESULT of Worker i1 (real supervisor subprocess)",
         "recover_exit": code,
@@ -379,11 +479,19 @@ def run(out_dir: Path, cli: str, *, timeout_s: float = 2400.0) -> dict[str, Any]
         "correction_prompt_carries_objective_and_instruction": correction_carries,
         "loop_shape": final_shape,
     }
+    record["worktree_durable_across_cwds"] = bool(
+        launch_worktree and os.path.isabs(launch_worktree)
+        and record["launch_cwd"] and record["recovery_cwd"]
+        and record["launch_cwd"] != record["recovery_cwd"]
+        and record["archived_worktree"] == launch_worktree
+        and record["recovered_worktree"] == launch_worktree
+        and record["recovered_cwd_flag"] == launch_worktree
+        and not record["recovery_cwd_worktree_exists"])
     record["recovery_prompt_established"] = bool(
         code == 0 and summary.get("status") == "RECOVERED"
         and record["terminal_status_after_recover"] == "COMPLETED"
         and record["all_captured_verified"] and byte_equal and correction_carries
-        and _loop_completed(final_shape))
+        and _loop_completed(final_shape) and record["worktree_durable_across_cwds"])
     if codex_home:
         shutil.rmtree(codex_home, ignore_errors=True)     # never retain the seed
     return record
@@ -393,6 +501,8 @@ def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     if args and args[0] == "--child":
         return _run_launch_child(json.loads(Path(args[1]).read_text()))
+    if args and args[0] == "--recover":
+        return _run_recover_child(json.loads(Path(args[1]).read_text()))
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("out_dir")
     parser.add_argument("--cli", default="fixture", choices=("fixture", "claude", "codex"))

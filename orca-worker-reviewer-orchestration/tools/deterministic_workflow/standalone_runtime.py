@@ -284,6 +284,10 @@ class StandaloneSession:
         self.state = "STARTING"
         self.lost_reason = ""
         self._child_env: dict[str, str] = {}
+        #: The run-scoped auth-seed result (path + reason, never a secret byte), set by
+        #: `start()` before the auth probe.  Final-Review iteration 3, B1.
+        self._auth_seed_result: dict[str, Any] = {"seeded": False, "reason": "not_started",
+                                                  "path": ""}
         #: The ADOPTED identity (D4.4 A-1..A-6), frozen on first acceptance and compared by
         #: EQUALITY forever after.  Empty means "not yet observed", never "any id will do".
         self.adopted_id = ""
@@ -605,6 +609,46 @@ class StandaloneSession:
             probe["output"], minted_session_id="" if adopt else minted_session_id,
             adopt=adopt)
 
+    def _config_home_root(self) -> str:
+        """The run-scoped config-root directory this profile's auth seed lands in.
+
+        The profile's explicit ``config_root`` when it names one, else the single
+        allowlisted per-driver config-root env name present in the built child env
+        (``standalone_profile.ALLOWED_CONFIG_ROOT_NAMES``).  Empty when the profile declares
+        no config root at all, in which case there is nothing to seed."""
+        from .standalone_profile import ALLOWED_CONFIG_ROOT_NAMES
+        if self.profile.config_root:
+            return self.profile.config_root
+        for name in sorted(ALLOWED_CONFIG_ROOT_NAMES):
+            value = self._child_env.get(name)
+            if value:
+                return value
+        return ""
+
+    def _seed_run_scoped_auth(self) -> dict[str, Any]:
+        """Seed the profile's declared credential file into the run-scoped config root,
+        BEFORE the auth probe -- the production half of B1.  A no-op (``{"seeded": False}``)
+        for a profile that declares no ``auth_seed_source`` and for a driver whose class
+        exposes no ``seed_auth_home``.  The driver's own :meth:`seed_auth_home` does the copy
+        (``0600``); this only resolves the destination ROOT and returns the driver's result
+        (a PATH and a reason, never a secret byte).  A seed that fails is not silently
+        swallowed into success -- the reason rides the result and the auth probe that
+        follows still refuses closed against an unseeded home."""
+        if not self.profile.auth_seed_source:
+            return {"seeded": False, "reason": "no_auth_seed_declared", "path": ""}
+        seeder = getattr(self.driver, "seed_auth_home", None)
+        if seeder is None:
+            return {"seeded": False, "reason": "driver_has_no_auth_home", "path": ""}
+        root = self._config_home_root()
+        if not root:
+            return {"seeded": False, "reason": "no_config_root_declared", "path": ""}
+        try:
+            os.makedirs(root, exist_ok=True)
+        except OSError as exc:
+            return {"seeded": False, "reason": "config_root_unwritable",
+                    "path": str(root), "detail": exc.__class__.__name__}
+        return seeder(root)
+
     def start(self, *, lease_token: str | None = None,
               auth_probe_argv: Sequence[str] | None = None,
               help_text: str | None = None, prober: Any = None,
@@ -621,6 +665,19 @@ class StandaloneSession:
         self._child_env = env_policy.build_child_env(
             self.profile, spawn_token=self.spawn_token,
             secret_resolver=self._secret_resolver)
+        # ---- Final-Review iteration 3, B1: SEED the run-scoped config home ---------------
+        # A profile may declare a credential file to seed into its run-scoped config root
+        # (`auth_seed_source` -> `<config-root>/auth_seed_dest_name`, 0600); the per-driver
+        # measurement that an EMPTY config root refuses authentication lives in the driver
+        # layer.  The seed used to be paid ONLY by the R10 test harness, so a profile that
+        # declared it and was launched through the production `run_workflow --adapter
+        # standalone` reached its auth probe against an EMPTY config root and every dispatch
+        # refused -- the exact gap the final review's recovery E2E hit.  The seed is now
+        # paid on the production path, BEFORE the fingerprint and the auth probe below, so a
+        # declared profile authenticates end to end and its recovery re-seeds the same root.
+        # A profile that declares no seed, and a driver whose class exposes no seeding
+        # method, are untouched.  Only the destination PATH is retained; never its content.
+        self._auth_seed_result = self._seed_run_scoped_auth()
         # The rehearsal DEFAULTS to the real one.  It stays injectable so the deterministic
         # tests can drive the refusal and acceptance branches without a live binary, but a
         # caller that supplies nothing gets a genuine bounded spawn rather than a refusal it
