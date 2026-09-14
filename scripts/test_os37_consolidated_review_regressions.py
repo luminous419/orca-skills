@@ -422,16 +422,24 @@ def _tio(**over: Any) -> dict:
     named, so `expected_echo_forms` derives the echo from EVIDENCE and never from a
     default.  The base is an echoing pty in non-canonical mode with ONLCR (what a spawned
     slave looks like once an agent turns ECHO on)."""
-    base = {"echo": True, "echoctl": True, "icanon": False, "isig": False, "iexten": False,
-            "ixon": False, "opost": True, "onlcr": True, "ocrnl": False, "onocr": False,
-            "onlret": False, "tab_expand": False, "icrnl": True, "inlcr": False,
-            "igncr": False, "special_bytes": []}
+    base = {"echo": True, "echoctl": True, "echonl": False, "icanon": False, "isig": False,
+            "iexten": False, "ixon": False, "opost": True, "onlcr": True, "ocrnl": False,
+            "onocr": False, "onlret": False, "tab_expand": False, "icrnl": True,
+            "inlcr": False, "igncr": False, "special_bytes": [],
+            # The LINE DISCIPLINE the flags were read from (iteration-3 CI correction): the
+            # BSD `ttydisc` (macOS) by default; `_linux()` builds the Linux `n_tty` variant.
+            "platform": "Darwin", "discipline": "bsd_ttydisc"}
     base.update(over)
     return base
 
 
 def _pty(framed: bool = False, **tio: Any) -> dict:
     return {"kind": "pty_write", "framed": framed, "termios": _tio(**tio), "cols": 120}
+
+
+def _linux(framed: bool = False, **tio: Any) -> dict:
+    """The same evidence block as read on a Linux pty (`n_tty`)."""
+    return _pty(framed=framed, platform="Linux", discipline="linux_n_tty", **tio)
 
 
 ARGV_TRANSPORT = {"kind": "argv", "framed": False, "termios": None, "cols": 120}
@@ -849,13 +857,18 @@ class B1EchoProvenanceIsTransportDerivedTests(unittest.TestCase):
         # A multi-byte char and a ^X each advance the column by their BYTE count (2).
         self.assertIn("é".encode() + b"      z", self._forms("é\tz", _pty(tab_expand=True)))
         self.assertIn(b"^A      z", self._forms("\x01\tz", _pty(tab_expand=True)))
-        # Both kernels' newline/column rules are enumerated when neither ONLCR nor ONLRET
-        # decides it; ONLCR decides it (reset) and yields one form per column.
-        both = self._forms("a\n\tb", _pty(tab_expand=True, onlcr=False))
-        self.assertIn(b"a\n        b", both)        # BSD: NL resets the column
-        self.assertIn(b"a\n       b", both)         # Linux: NL keeps column 1
+        # The newline/column rule is the DISCIPLINE's (iteration 3), read from the evidence,
+        # never enumerated: BSD resets the column on NL whether or not ONLCR is set; Linux
+        # keeps it (and in raw mode under ECHOCTL renders the NL as ^J, two columns).
+        self.assertEqual(self._forms("a\n\tb", _pty(tab_expand=True, onlcr=False)),
+                         (b"a\n        b",))                     # BSD: NL resets the column
         self.assertEqual(self._forms("a\n\tb", _pty(tab_expand=True, onlcr=True)),
                          (b"a\r\n        b",))
+        self.assertIn(b"a\n       b",                             # Linux, ECHOCTL clear: col 1
+                      self._forms("a\n\tb", _linux(tab_expand=True, onlcr=False,
+                                                    echoctl=False)))
+        self.assertIn(b"a^J     b",                                # Linux, ECHOCTL: ^J -> col 3
+                      self._forms("a\n\tb", _linux(tab_expand=True, onlcr=False)))
         # A proven tab-expanded echo is excised; the refusal after it fires.
         raw = b"ab   c\r\nlogin required\r\n"
         ev = self._ev(payload, 0, _pty(tab_expand=True))
@@ -1194,6 +1207,149 @@ class B1EchoProvenanceIsTransportDerivedTests(unittest.TestCase):
 
 
 # =====================================================================================
+# B1 (iteration 3, CI) -- the LINUX line discipline is a first-class transport variant
+# =====================================================================================
+class B1LinuxLineDisciplineIsAFirstClassTransportTests(unittest.TestCase):
+    """GitHub Actions run 34821771744 on `a4c8c5f` (ubuntu, all six jobs) failed three
+    subtests of the real-pty lock: the derived forms encoded the BSD/macOS line discipline
+    only.  Linux `n_tty` in NON-canonical mode renders a literal NL as `^J` under `ECHOCTL`
+    (BSD exempts TAB and NL; Linux exempts TAB only), emits no `\\r\\n`/`\\n`, and the output
+    column does NOT reset -- which also shifts `XTABS` expansion (3 spaces where BSD gives 2).
+
+    The transport evidence now records WHICH discipline the flags were read from
+    (`termios.platform`, `termios.discipline` in `standalone_pty.termios_evidence`), and
+    `expected_echo_forms` derives per discipline -- never from a "both kernels" guess.  An
+    evidence block without a known discipline is `echo_unproven:transport_unrecorded`.
+
+    These locks REPLAY the exact Linux echo bytes captured in the CI logs
+    (`evidence/CI_UBUNTU_a4c8c5f/job_*.log`) under a Linux transport, so the Linux behaviour
+    is proven on this host too; the unchanged real-pty lock proves the BSD side live.  Red at
+    `a4c8c5f` (`evidence/iter3/B1_linux_RED_at_a4c8c5f.txt`)."""
+
+    PAYLOAD = "Task contract:\nlogin required\tnow\x01\nContinue ☕"   # the real-pty payload
+    # The bytes six ubuntu jobs captured from a real Linux pty for that payload, framed:
+    CI_ONLCR = b"^[[200~Task contract:^Jlogin required\tnow^A^JContinue \xe2\x98\x95^[[201~"
+    CI_NO_ONLCR = CI_ONLCR                                        # identical: no NL is emitted
+    CI_TABS = b"^[[200~Task contract:^Jlogin required   now^A^JContinue \xe2\x98\x95^[[201~"
+    # `echo-canonical` PASSED on every ubuntu job against the single BSD-derived form, so the
+    # Linux canonical echo is that form: NL echoed raw through OPOST/ONLCR.
+    CI_CANONICAL = (b"^[[200~Task contract:\r\nlogin required\tnow^A\r\nContinue "
+                    b"\xe2\x98\x95^[[201~")
+
+    def _forms(self, transport: dict, payload: str | None = None) -> tuple:
+        derived = lifecycle.expected_echo_forms(payload or self.PAYLOAD, transport)
+        self.assertEqual(derived["state"], "echo_expected", derived)
+        return derived["forms"]
+
+    def _proven(self, raw: bytes, transport: dict, payload: str | None = None) -> None:
+        events = ({"offset": 0, "payload": payload or self.PAYLOAD, "transport": transport},)
+        res = lifecycle.resolve_delivery_echo(raw + b"\r\nok\r\n", events)
+        self.assertEqual(res["state"], "echo_proven", res)
+        self.assertEqual(res["spans"], ((0, len(raw)),))
+        self.assertEqual(lifecycle.classify_refusals_in_capture(raw + b"\r\nok\r\n", events),
+                         (), "the runtime's own echoed task text fired as a refusal")
+        self.assertTrue(lifecycle.classify_refusals_in_capture(
+            raw + b"\r\nYou are not logged in.\r\n", events),
+            "a genuine refusal after the proven Linux echo must fire")
+
+    def test_ci_case_echo_onlcr_linux_renders_a_raw_mode_nl_as_ctrl_j(self) -> None:
+        t = _linux(framed=True, onlcr=True)
+        self.assertEqual(self._forms(t), (self.CI_ONLCR,))
+        self._proven(self.CI_ONLCR, t)
+
+    def test_ci_case_echo_no_onlcr_is_the_same_bytes_because_no_nl_is_emitted(self) -> None:
+        t = _linux(framed=True, onlcr=False)
+        self.assertEqual(self._forms(t), (self.CI_NO_ONLCR,))
+        self._proven(self.CI_NO_ONLCR, t)
+
+    def test_ci_case_echo_tabs_counts_ctrl_j_as_two_columns_with_no_reset(self) -> None:
+        t = _linux(framed=True, onlcr=True, tab_expand=True)
+        forms = self._forms(t)
+        self.assertEqual(len(forms), 8, "one form per unobservable start column")
+        self.assertIn(self.CI_TABS, forms)               # start column 0: col 37 -> 3 spaces
+        self._proven(self.CI_TABS, t)
+        # The BSD derivation for the same flags is NOT a Linux form (2 spaces: NL reset it).
+        bsd = lifecycle.expected_echo_forms(self.PAYLOAD, _pty(framed=True, onlcr=True,
+                                                               tab_expand=True))["forms"]
+        self.assertNotIn(self.CI_TABS, bsd)
+        self.assertIn(b"^[[200~Task contract:\r\nlogin required  now^A\r\nContinue "
+                      b"\xe2\x98\x95^[[201~", bsd)
+
+    def test_ci_case_echo_canonical_linux_echoes_nl_raw_through_opost(self) -> None:
+        t = _linux(framed=True, onlcr=True, icanon=True)
+        self.assertEqual(self._forms(t), (self.CI_CANONICAL,))
+        self._proven(self.CI_CANONICAL, t)
+
+    def test_the_same_flags_derive_different_forms_per_discipline_never_both(self) -> None:
+        # ONE transport -> ONE discipline -> forms for THAT kernel only.  The former "both
+        # kernels" enumeration is gone: a BSD transport never carries a Linux form and vice
+        # versa, so a form can never be derived for the wrong kernel.
+        linux = self._forms(_linux(framed=True, onlcr=True))
+        bsd = self._forms(_pty(framed=True, onlcr=True))
+        self.assertEqual(linux, (self.CI_ONLCR,))
+        self.assertEqual(bsd, (self.CI_CANONICAL,))          # BSD raw-mode NL -> CRLF
+        self.assertFalse(set(linux) & set(bsd))
+        # Column accounting after NL differs per discipline under XTABS, ONLCR clear.
+        self.assertIn(b"a\n        b", self._forms(_pty(tab_expand=True, onlcr=False), "a\n\tb"))
+        self.assertEqual(self._forms(_linux(tab_expand=True, onlcr=False), "a\n\tb"),
+                         tuple(b"a^J" + b" " * (8 - ((c + 3) % 8)) + b"b" for c in range(8)))
+
+    def test_linux_cr_under_icrnl_is_echoed_raw_but_a_literal_nl_is_ctrl_j(self) -> None:
+        # n_tty: a CR that ICRNL turns into NL reaches `echo_char_raw` (OPOST: ONLCR -> CRLF,
+        # column reset); a literal NL byte is not a special char in raw mode and reaches
+        # `echo_char` (ECHOCTL -> ^J, column += 2).  Both from the kernel source; the NL leg
+        # is the one CI measured.
+        self.assertEqual(self._forms(_linux(onlcr=True), "a\rb\nc"), (b"a\r\nb^Jc",))
+        self.assertEqual(self._forms(_linux(onlcr=False), "a\rb\nc"), (b"a\nb^Jc",))
+        self.assertEqual(self._forms(_linux(onlcr=True, echoctl=False), "a\nb"), (b"a\r\nb",))
+        self.assertEqual(self._forms(_linux(onlcr=True, icrnl=False), "a\rb"), (b"a^Mb",))
+        self.assertEqual(self._forms(_linux(opost=False), "a\nb"), (b"a^Jb",))
+
+    def test_echonl_without_echo_is_a_partial_echo_named_unproven_on_both_disciplines(self) -> None:
+        for t in (_linux(echo=False, echonl=True, icanon=True),
+                  _pty(echo=False, echonl=True, icanon=True)):
+            with self.subTest(discipline=t["termios"]["discipline"]):
+                derived = lifecycle.expected_echo_forms("a\nb", t)
+                self.assertEqual((derived["state"], derived["reason"]),
+                                 ("echo_unproven", "echonl_partial_echo"))
+                self.assertIn("echonl_partial_echo", lifecycle.ECHO_UNPROVEN_REASONS)
+        # ECHONL with no NL in the payload, ECHO clear: nothing can echo -> absent.
+        self.assertEqual(lifecycle.expected_echo_forms(
+            "ab", _linux(echo=False, echonl=True, icanon=True))["state"], "echo_absent")
+
+    def test_an_unknown_or_missing_discipline_is_transport_unrecorded(self) -> None:
+        for bad in ({"discipline": None}, {"discipline": "solaris_ldterm"},
+                    {"discipline": ""}):
+            with self.subTest(bad=bad):
+                t = _pty(**bad)
+                derived = lifecycle.expected_echo_forms(self.PAYLOAD, t)
+                self.assertEqual((derived["state"], derived["reason"]),
+                                 ("echo_unproven", "transport_unrecorded"))
+                res = lifecycle.resolve_delivery_echo(
+                    self.CI_CANONICAL, ({"offset": 0, "payload": self.PAYLOAD,
+                                         "transport": t},))
+                self.assertEqual(res["reason"], "event[0]:transport_unrecorded")
+        t = _pty()
+        del t["termios"]["discipline"]
+        self.assertEqual(lifecycle.expected_echo_forms(self.PAYLOAD, t)["reason"],
+                         "transport_unrecorded")
+
+    def test_termios_evidence_records_the_discipline_of_this_host(self) -> None:
+        import pty as _pty_mod
+        from scripts.deterministic_workflow import standalone_pty as pty_supervisor
+        master, slave = _pty_mod.openpty()
+        self.addCleanup(os.close, master)
+        self.addCleanup(os.close, slave)
+        flags = pty_supervisor.termios_evidence(master)
+        self.assertIsNotNone(flags)
+        self.assertEqual(flags["platform"], os.uname().sysname)
+        expected = {"Linux": "linux_n_tty", "Darwin": "bsd_ttydisc"}.get(os.uname().sysname)
+        self.assertEqual(flags["discipline"], expected)
+        self.assertIn(flags["discipline"], lifecycle.LINE_DISCIPLINES)
+        self.assertIn("echonl", flags)
+
+
+# =====================================================================================
 # B1'' -- (iteration-2 review) overlapping candidate spans are AMBIGUOUS, never collapsed
 # =====================================================================================
 class B1OverlappingCandidateSpansAreAmbiguousTests(unittest.TestCase):
@@ -1240,32 +1396,30 @@ class B1OverlappingCandidateSpansAreAmbiguousTests(unittest.TestCase):
                                                                 self._ev(payload)), ())
 
     def test_distinct_derived_forms_on_the_same_raw_span_are_one_candidate(self) -> None:
-        # Tab expansion derives one form per unobservable start column; here two of them
-        # coincide with the same raw bytes only when... they cannot: forms are deduplicated.
-        # So build the case at the boundary the model itself exposes: `_occurrences` is fed
-        # two DISTINCT forms that both equal the raw window.  Same span twice == one candidate.
+        # `_occurrences` fed two DISTINCT form slots that both equal the raw window: the same
+        # span twice is ONE candidate.
         hits = lifecycle._occurrences(b"xx", (b"xx", b"xx"), 0, 2)
         self.assertEqual(hits, [(0, 2)], "identical spans from distinct form slots dedupe")
-        # And through the public model: the newline/column rule enumerates two forms for
-        # `a\n\tb` under tab expansion with ONLCR clear; only ONE of them is in the capture, so
-        # exactly one distinct span exists -> proven.
-        transport = _pty(tab_expand=True, onlcr=False)
-        derived = lifecycle.expected_echo_forms("a\n\tb", transport)
-        self.assertGreater(len(derived["forms"]), 1)
+        # And through the public model: tab expansion enumerates one form per unobservable
+        # start column (8 distinct forms for `ab\tc`); only ONE of them is in the capture, so
+        # exactly one distinct span exists -> proven, whichever column it was.
+        transport = _pty(tab_expand=True)
+        derived = lifecycle.expected_echo_forms("ab\tc", transport)
+        self.assertEqual(len(derived["forms"]), 8)
         for form in derived["forms"]:
             with self.subTest(form=form):
-                res = self._resolve(b"<" + form + b">", "a\n\tb", transport=transport,
+                res = self._resolve(b"<" + form + b">", "ab\tc", transport=transport,
                                     offset=0)
                 self.assertEqual(res["state"], "echo_proven", res)
                 self.assertEqual(res["spans"], ((1, 1 + len(form)),))
 
     def test_distinct_derived_forms_on_different_spans_are_ambiguous(self) -> None:
-        transport = _pty(tab_expand=True, onlcr=False)
-        derived = lifecycle.expected_echo_forms("a\n\tb", transport)
+        transport = _pty(tab_expand=True)
+        derived = lifecycle.expected_echo_forms("ab\tc", transport)
         two = derived["forms"][:2]
         self.assertNotEqual(two[0], two[1])
         raw = two[0] + b"\r\n" + two[1]                       # each form once, different spans
-        self._assert_ambiguous(raw, "a\n\tb", transport=transport)
+        self._assert_ambiguous(raw, "ab\tc", transport=transport)
 
     def test_property_self_overlapping_payloads_are_proven_only_with_exactly_one_span(self) -> None:
         rng = random.Random(20260915)

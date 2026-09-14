@@ -1027,9 +1027,17 @@ def termios_evidence(fd: int) -> dict[str, Any] | None:
     # BSD/macOS `OXTABS == TAB3` (a single bit inside `TABDLY`).  Testing the `TAB3` bits
     # for equality is the one check that is exact on both.
     tab3 = getattr(termios, "TAB3", 0)
-    flags = {
+    sysname = os.uname().sysname
+    flags: dict[str, Any] = {
+        # Which LINE DISCIPLINE these flags were read from (iteration-3 CI correction): the
+        # lifecycle derives the echo per discipline and refuses to derive one for a kernel
+        # the evidence does not name.  BSD `ttydisc` on Darwin, `n_tty` on Linux; anything
+        # else is recorded as `None` and resolves `transport_unrecorded`.
+        "platform": sysname,
+        "discipline": {"Darwin": "bsd_ttydisc", "Linux": "linux_n_tty"}.get(sysname),
         "echo": bool(lflag & termios.ECHO),
         "echoctl": bool(lflag & getattr(termios, "ECHOCTL", 0)),
+        "echonl": bool(lflag & getattr(termios, "ECHONL", 0)),
         "icanon": bool(lflag & termios.ICANON),
         "isig": bool(lflag & termios.ISIG),
         "iexten": bool(lflag & getattr(termios, "IEXTEN", 0)),

@@ -429,7 +429,13 @@ ECHO_UNPROVEN_REASONS = (
     "echo_not_found",                           # no span equals any derived form (partial,
                                                 # delayed past the window, or absent)
     "ambiguous_multiple_matches",               # more than one span equals a derived form
+    "echonl_partial_echo",                      # ECHO clear but ECHONL+ICANON echo the NLs
 )
+#: The LINE DISCIPLINES this runtime can derive an echo for, each measured on a real pty:
+#: the BSD `ttydisc` (macOS; measured on this host) and Linux `n_tty` (measured by CI, run
+#: 34821771744).  A transport whose evidence names neither is `transport_unrecorded`: a form
+#: is never derived for a kernel the evidence did not identify.
+LINE_DISCIPLINES = ("bsd_ttydisc", "linux_n_tty")
 #: xterm bracketed-paste framing.  Terminal-standard bytes, not a CLI name.
 BRACKETED_PASTE_START = b"\x1b[200~"
 BRACKETED_PASTE_END = b"\x1b[201~"
@@ -438,9 +444,9 @@ ESC_REPLACEMENT = b"<ESC>"
 #: The line discipline's tab stop.  Fixed at 8 by every termios implementation.
 TAB_STOP = 8
 #: The termios flags a transport record must carry for a `pty_write` echo to be derivable.
-TERMIOS_ECHO_FLAGS = ("echo", "echoctl", "icanon", "isig", "iexten", "ixon", "opost",
-                      "onlcr", "ocrnl", "onocr", "onlret", "tab_expand", "icrnl", "inlcr",
-                      "igncr")
+TERMIOS_ECHO_FLAGS = ("echo", "echoctl", "echonl", "icanon", "isig", "iexten", "ixon",
+                      "opost", "onlcr", "ocrnl", "onocr", "onlret", "tab_expand", "icrnl",
+                      "inlcr", "igncr")
 
 
 class EchoTransport(TypedDict):
@@ -448,7 +454,8 @@ class EchoTransport(TypedDict):
 
     kind: str                     # ECHO_TRANSPORT_KINDS
     framed: bool                  # a bracketed-paste frame was written around the payload
-    termios: Mapping[str, Any] | None   # TERMIOS_ECHO_FLAGS + `special_bytes`, or None
+    termios: Mapping[str, Any] | None   # TERMIOS_ECHO_FLAGS + `special_bytes` +
+                                        # `platform` + `discipline` (LINE_DISCIPLINES), or None
     cols: int
 
 
@@ -470,20 +477,32 @@ def _delivered_echo_bytes(payload: str) -> bytes:
     return payload.encode("utf-8", "replace").replace(b"\x1b", ESC_REPLACEMENT)
 
 
-def _render_echo(body: bytes, flags: Mapping[str, Any], *, start_column: int,
-                 newline_resets_column: bool) -> bytes:
-    r"""ONE candidate echo of ``body`` under the termios ``flags``: the line discipline's
-    input translation (``c_iflag``), its control-character echo rendering (``ECHOCTL``) and
-    its output post-processing (``c_oflag``: ``ONLCR``, ``OCRNL``, ``ONOCR``, tab
-    expansion) applied byte by byte, tracking the output column the way the discipline
-    does (per BYTE -- a multi-byte character advances it by its byte count, ``^X`` by two).
+def _render_echo(body: bytes, flags: Mapping[str, Any], *, discipline: str,
+                 start_column: int) -> bytes:
+    r"""ONE candidate echo of ``body`` under the termios ``flags`` of ONE line discipline:
+    input translation (``c_iflag``), control-character echo rendering (``ECHOCTL``) and
+    output post-processing (``c_oflag``: ``ONLCR``, ``OCRNL``, ``ONOCR``, tab expansion)
+    applied byte by byte, tracking the output column the way THAT discipline does (per
+    BYTE -- a multi-byte character advances it by its byte count, ``^X`` by two).
+
+    The two disciplines differ in exactly the places the CI run on `a4c8c5f` measured:
+
+    * BSD ``ttydisc`` (macOS, measured on this host): ``ECHOCTL`` exempts TAB and NL; a
+      received NL goes to output processing (``ONLCR`` -> CRLF) and resets the column
+      whether or not ``ONLCR``/``ONLRET`` is set.
+    * Linux ``n_tty`` (measured by ubuntu CI): in NON-canonical mode a LITERAL NL byte is not
+      a special character, so ``echo_char`` renders it ``^J`` under ``ECHOCTL`` -- no
+      ``\r\n``/``\n`` is emitted and the column advances by two, which is what shifts
+      ``XTABS`` expansion.  A CR that ``ICRNL`` turns into NL, and every NL in CANONICAL
+      mode, reach ``echo_char_raw`` and go through output processing (``ONLCR`` -> CRLF,
+      column reset; without ``ONLCR`` the column resets only under ``ONLRET``).
 
     ``start_column`` is the column the pty was at when the echo began -- unknown to this
-    runtime, so the caller enumerates it modulo the tab stop.  ``newline_resets_column``
-    is the one behaviour the two kernels this runtime runs on disagree about when neither
-    ``ONLCR`` nor ``ONLRET`` is set (BSD resets, Linux does not); the caller enumerates it.
+    runtime, so the caller enumerates it modulo the tab stop.
     """
+    linux = discipline == "linux_n_tty"
     echoctl = bool(flags.get("echoctl"))
+    icanon = bool(flags.get("icanon"))
     opost = bool(flags.get("opost"))
     onlcr = bool(flags.get("onlcr"))
     ocrnl = bool(flags.get("ocrnl"))
@@ -495,17 +514,26 @@ def _render_echo(body: bytes, flags: Mapping[str, Any], *, start_column: int,
     igncr = bool(flags.get("igncr"))
     out = bytearray()
     column = start_column
-    for byte in body:
+    for received in body:
         # c_iflag: what the discipline RECEIVES for the byte that was written.
+        byte = received
+        translated = False
         if byte == 0x0D:
             if igncr:
                 continue
             if icrnl:
-                byte = 0x0A
+                byte, translated = 0x0A, True
         elif byte == 0x0A and inlcr:
-            byte = 0x0D
-        # ECHOCTL: a control byte other than TAB / NL is echoed as ^X (two columns).
-        if echoctl and ((byte < 0x20 and byte not in (0x09, 0x0A)) or byte == 0x7F):
+            byte, translated = 0x0D, True
+        # ECHOCTL rendering.  BSD exempts TAB and NL.  Linux exempts TAB only, but a NL that
+        # arrived as a special character (ICRNL-translated CR, or any NL in canonical mode)
+        # is echoed RAW rather than through `echo_char`.
+        control = (byte < 0x20 and byte != 0x09) or byte == 0x7F
+        if byte == 0x0A:
+            ctrl_rendered = echoctl and linux and not icanon and not translated
+        else:
+            ctrl_rendered = echoctl and control
+        if ctrl_rendered:
             out += b"^" + bytes([byte ^ 0x40])
             column += 2
             continue
@@ -519,7 +547,7 @@ def _render_echo(body: bytes, flags: Mapping[str, Any], *, start_column: int,
                 column = 0
             else:
                 out.append(byte)
-                if onlret or newline_resets_column:
+                if onlret or not linux:              # BSD resets on NL regardless
                     column = 0
             continue
         if byte == 0x0D:
@@ -527,7 +555,7 @@ def _render_echo(body: bytes, flags: Mapping[str, Any], *, start_column: int,
                 continue                             # CR at column 0 is suppressed
             if ocrnl:
                 out.append(0x0A)
-                if onlret or newline_resets_column:
+                if onlret or not linux:
                     column = 0
             else:
                 out.append(byte)
@@ -548,17 +576,18 @@ def _render_echo(body: bytes, flags: Mapping[str, Any], *, start_column: int,
 
 def expected_echo_forms(payload: str, transport: Mapping[str, Any]) -> dict[str, Any]:
     """The echo forms the recorded ``transport`` can produce for ``payload`` -- DERIVED from
-    evidence (the transport kind and the termios flags read at delivery time), never from a
-    hard-coded alternate list.
+    evidence (the transport kind, the termios flags read at delivery time and the line
+    discipline they were read from), never from a hard-coded alternate list.
 
     Returns ``{"state", "reason", "forms"}`` where ``state`` is ``echo_absent`` (the
     transport proves there is no line-discipline echo: the payload left with the ``execve``,
     or ``ECHO`` was clear), ``echo_unproven`` (the transformation cannot be derived --
     ``reason`` names why) or ``echo_expected`` (``forms`` is the non-empty tuple of byte
     strings one of which the echo MUST equal).  Several forms exist only when the discipline
-    depends on state this runtime cannot observe -- the output column at the moment the
-    echo began (tab expansion) and the newline/column rule the two supported kernels
-    disagree on -- and every such form is enumerated rather than guessed at.
+    depends on state this runtime cannot observe -- the output column at the moment the echo
+    began (tab expansion) -- and every such form is enumerated rather than guessed at.  The
+    discipline itself is never enumerated: it is read from the evidence (`LINE_DISCIPLINES`),
+    and an evidence block that names none is `transport_unrecorded`.
     """
     kind = transport.get("kind")
     if kind == "argv":
@@ -568,32 +597,32 @@ def expected_echo_forms(payload: str, transport: Mapping[str, Any]) -> dict[str,
     flags = transport.get("termios")
     if not isinstance(flags, Mapping) or any(name not in flags for name in TERMIOS_ECHO_FLAGS):
         return {"state": "echo_unproven", "reason": "termios_unreadable", "forms": ()}
-    if not flags.get("echo"):
-        return {"state": "echo_absent", "reason": "echo_flag_clear", "forms": ()}
+    discipline = flags.get("discipline")
+    if discipline not in LINE_DISCIPLINES:
+        return {"state": "echo_unproven", "reason": "transport_unrecorded", "forms": ()}
     body = _delivered_echo_bytes(payload)
     if transport.get("framed"):
         body = BRACKETED_PASTE_START + body + BRACKETED_PASTE_END
+    received_newline = (0x0A in body and not flags.get("inlcr")) or \
+        (0x0D in body and bool(flags.get("icrnl")) and not flags.get("igncr"))
+    if not flags.get("echo"):
+        if flags.get("echonl") and flags.get("icanon") and received_newline:
+            # Only the newlines echo (both disciplines): a partial echo of unknown
+            # alignment is not provable -- and it carries no text to fire on.
+            return {"state": "echo_unproven", "reason": "echonl_partial_echo", "forms": ()}
+        return {"state": "echo_absent", "reason": "echo_flag_clear", "forms": ()}
     special = {int(b) for b in (flags.get("special_bytes") or ())}
     if special and any(byte in special for byte in body):
         return {"state": "echo_unproven",
                 "reason": "control_byte_consumed_by_line_discipline", "forms": ()}
-    received_has_tab = 0x09 in body
-    received_has_newline = (0x0A in body) or (0x0D in body and bool(flags.get("icrnl")))
     columns: tuple[int, ...] = (0,)
-    if flags.get("opost") and flags.get("tab_expand") and received_has_tab:
+    if flags.get("opost") and flags.get("tab_expand") and 0x09 in body:
         columns = tuple(range(TAB_STOP))
-    newline_rules: tuple[bool, ...] = (True,)
-    if (flags.get("opost") and flags.get("tab_expand") and received_has_tab
-            and received_has_newline and not flags.get("onlcr")
-            and not flags.get("onlret")):
-        newline_rules = (True, False)
     forms: list[bytes] = []
     for column in columns:
-        for rule in newline_rules:
-            form = _render_echo(body, flags, start_column=column,
-                                newline_resets_column=rule)
-            if form and form not in forms:
-                forms.append(form)
+        form = _render_echo(body, flags, discipline=str(discipline), start_column=column)
+        if form and form not in forms:
+            forms.append(form)
     if not forms:
         return {"state": "echo_absent", "reason": "empty_payload", "forms": ()}
     return {"state": "echo_expected", "reason": "", "forms": tuple(forms)}
