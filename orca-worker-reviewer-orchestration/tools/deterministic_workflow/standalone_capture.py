@@ -81,6 +81,36 @@ INTEGRITY_META_MISSING = "meta_missing"
 INTEGRITY_META_UNREADABLE = "meta_unreadable"
 INTEGRITY_TOTAL_BYTES_MISMATCH = "total_bytes_mismatch"
 INTEGRITY_UNVERIFIED_TAIL = "unverified_tail"
+#: Round-9 consolidated review, item 6.  The CLOSED v2 meta shape every writer produces
+#: (:func:`write_meta`) and the ONLY shape the exit watcher may inherit at handoff: exactly
+#: these keys, these types, a 64-hex-digit lowercase ``sha256``.  A meta that is not this
+#: shape -- absent / empty / malformed digest, a stray or missing key, a wrong type -- is
+#: `meta_invalid`, inherited IRREVERSIBLY: the watcher never re-derives the digest from
+#: the bytes and never writes a healed one back (it used to accept an empty ``sha256``,
+#: skip the prefix check and persist a freshly computed hash, so a capture that was
+#: unanswerable before the handoff answered after it).
+META_KEYS = frozenset({"schema", "records", "total_bytes", "dropped_bytes", "truncation",
+                       "sha256", "writer", "unanswerable"})
+INTEGRITY_META_INVALID = "meta_invalid"
+TRUNCATION_CAUSES = ("", TRUNCATION_TOTAL_BYTES, TRUNCATION_LINE_BYTES,
+                     TRUNCATION_RECORD_COUNT)
+
+#: Round-9 consolidated review, item 1.  The CAPTURE-FINALIZED PROOF: a fenced, crash-
+#: durable record written by the ONE process that drained the pty master to its HANGUP
+#: after the agent's proven exit -- the supervisor (`StandaloneSession.drain_after_exit`)
+#: or, after the supervisor died, the exit watcher (`standalone_pty._watch`) -- AFTER its
+#: last append and meta save reached stable storage, binding the capture's final length,
+#: its sha256 and the exit sentinel's identity (fence + code).  It is DISTINCT from the
+#: exit sentinel: the sentinel proves the PROCESS exited (the watcher writes it the moment
+#: `waitpid` returns, whether or not anybody has drained), and this proves the CAPTURE is
+#: complete.  An adopted successor settles only over a capture this record vouches for;
+#: a sentinel alone is `stream_end_unproven`.  The same file, with ``finality:
+#: "unproven"``, records WHY a drain did not reach the hangup (the bound elapsed with a
+#: slave still held open, or the master was unreadable) and what held the slave, so the
+#: retained-slave cause is observable rather than a bare `budget`.
+CAPTURE_FINALIZED_SCHEMA = "os37.capture_finalized.v1"
+FINALITY_PROVEN = "proven"
+FINALITY_UNPROVEN = "unproven"
 
 
 class CaptureRecord(TypedDict):
@@ -152,9 +182,17 @@ class BoundedCapture:
             self._digest = _digest_of(self.path)
             return
         self._meta_present = True
-        self._records = int(meta.get("records", 0))
-        self._total = int(meta.get("total_bytes", 0))
-        self._dropped = int(meta.get("dropped_bytes", 0))
+        if not isinstance(meta, dict):
+            meta = {}
+
+        def _count(name: str) -> int:
+            value = meta.get(name, 0)
+            return value if isinstance(value, int) and not isinstance(value, bool) else 0
+        # Counters are adopted defensively; whether the meta is the CLOSED shape is
+        # `integrity`'s question (item 6), answered by name, never by a crash here.
+        self._records = _count("records")
+        self._total = _count("total_bytes")
+        self._dropped = _count("dropped_bytes")
         truncation = meta.get("truncation")
         self._truncation = truncation if isinstance(truncation, str) and truncation else None
         self._writer = str(meta.get("writer") or WRITER_SUPERVISOR)
@@ -322,6 +360,17 @@ class BoundedCapture:
             return 0
 
     @property
+    def records(self) -> int:
+        """How many records the store has appended (per the meta / the verified tail)."""
+        return self._records
+
+    @property
+    def sha256(self) -> str:
+        """The digest of the FILE AS IT IS (recomputed on load, continued by every append
+        this store made) -- the value the capture-finalized proof binds (item 1)."""
+        return self._digest.hexdigest()
+
+    @property
     def truncated(self) -> bool:
         return self._truncation is not None
 
@@ -389,10 +438,18 @@ class BoundedCapture:
                 return {"consistent": True, "reason": ""}
             return {"consistent": False, "reason": INTEGRITY_META_MISSING,
                     "file_bytes": size}
-        if meta.get("schema") != META_SCHEMA:
+        if not isinstance(meta, dict) or meta.get("schema") != META_SCHEMA:
             return {"consistent": False, "reason": "meta_schema_mismatch",
-                    "schema": meta.get("schema")}
+                    "schema": meta.get("schema") if isinstance(meta, dict) else None}
         unanswerable = str(meta.get("unanswerable") or "")
+        if not unanswerable:
+            # Item 6 (round 9): the reader holds the meta to the SAME closed shape the
+            # exit watcher requires at handoff, so an absent / empty / malformed digest is
+            # refused by name here too -- never compared, never treated as "no digest".
+            problem = _meta_shape_problem(meta)
+            if problem:
+                return {"consistent": False, "reason": INTEGRITY_META_INVALID,
+                        "detail": problem}
         if unanswerable:
             # Findings 6 / 7.  Irreversible by construction: whatever the bytes and the
             # counters say NOW, a writer recorded that the capture is not evidence.
@@ -508,6 +565,12 @@ class RawBoundedAppender:
         #: supervisor's meta or established by this writer.  Never cleared.
         self.unanswerable = ""
         self._meta_sha256 = ""
+        #: Item 6: when the inherited meta failed its shape / prefix check, the ``sha256``
+        #: string it carried is preserved VERBATIM in everything this writer saves -- a
+        #: healed digest is exactly what must never be written back.  ``None`` means the
+        #: inherited description was verified and this writer's running digest continues
+        #: it.
+        self._inherited_sha256: str | None = None
         self._meta_present = False
         self._adopt_meta()
         self._digest_existing()
@@ -562,17 +625,37 @@ class RawBoundedAppender:
             self._mark_unanswerable(UNANSWERABLE_INHERITED_PREFIX + "meta_unparsable")
             return
         self._meta_present = True
-        self.records = int(meta.get("records", 0) or 0)
-        self.total = int(meta.get("total_bytes", 0) or 0)
-        self.dropped = int(meta.get("dropped_bytes", 0) or 0)
-        self.truncation = str(meta.get("truncation") or "")
-        self._meta_sha256 = str(meta.get("sha256") or "")
-        inherited = str(meta.get("unanswerable") or "")
-        if inherited:
+        inherited = meta.get("unanswerable")
+        if isinstance(inherited, str) and inherited:
             # Irreversible: the supervisor already recorded it, this writer keeps it.
             self.unanswerable = inherited
-        if meta.get("schema") != META_SCHEMA:
-            self._mark_unanswerable(UNANSWERABLE_INHERITED_PREFIX + "meta_schema_mismatch")
+        # ---- item 6 (round 9): the CLOSED v2 shape, or an inherited failure -----------
+        # Nothing below is coerced.  A meta that names another schema, lacks a key,
+        # carries a stray one, holds a wrong type or an invalid digest is not this
+        # contract's description of the prefix, and the description is what this writer
+        # would otherwise VOUCH for by continuing its digest.  The counters it does adopt
+        # then describe the FILE as it is (`_digest_existing`), the inherited ``sha256``
+        # string is kept VERBATIM in every meta this writer saves (never replaced by a
+        # digest it computed itself), and the capture stays unanswerable for good.
+        problem = _meta_shape_problem(meta)
+        if problem:
+            self._meta_sha256 = meta.get("sha256") if isinstance(meta.get("sha256"), str) else ""
+            self._inherited_sha256 = self._meta_sha256
+            self._mark_unanswerable(UNANSWERABLE_INHERITED_PREFIX + INTEGRITY_META_INVALID
+                                    + ":" + problem)
+            self.records = meta.get("records") if isinstance(meta.get("records"), int) else 0
+            self.total = (meta.get("total_bytes")
+                          if isinstance(meta.get("total_bytes"), int) else 0)
+            self.dropped = (meta.get("dropped_bytes")
+                            if isinstance(meta.get("dropped_bytes"), int) else 0)
+            self.truncation = (meta.get("truncation")
+                               if isinstance(meta.get("truncation"), str) else "")
+            return
+        self.records = int(meta["records"])
+        self.total = int(meta["total_bytes"])
+        self.dropped = int(meta["dropped_bytes"])
+        self.truncation = str(meta["truncation"])
+        self._meta_sha256 = str(meta["sha256"])
 
     def _digest_existing(self) -> None:
         """The digest of the bytes ALREADY on disk, so the running digest continues the
@@ -617,10 +700,15 @@ class RawBoundedAppender:
             # are gone.  Nothing this writer appends restores them.
             self._mark_unanswerable(UNANSWERABLE_INHERITED_PREFIX
                                     + INTEGRITY_TOTAL_BYTES_MISMATCH)
-        elif self._meta_sha256 and prefix.hexdigest() != self._meta_sha256:
+        elif self.unanswerable.startswith(UNANSWERABLE_INHERITED_PREFIX + INTEGRITY_META_INVALID):
+            pass                                          # item 6: already refused by shape
+        elif prefix.hexdigest() != self._meta_sha256:
             # Same length, different bytes: the recorded digest does not describe the
             # prefix on disk.  This used to be recomputed and overwritten, which is
-            # exactly how a `sha256_mismatch` was "healed" at handoff.
+            # exactly how a `sha256_mismatch` was "healed" at handoff.  (Item 6: an EMPTY
+            # recorded digest no longer skips this branch -- the shape check above has
+            # already refused it -- and the inherited string is what gets written back.)
+            self._inherited_sha256 = self._meta_sha256
             self._mark_unanswerable(UNANSWERABLE_INHERITED_PREFIX + "sha256_mismatch")
         elif size > self.total:
             # Blocker 4.  A suffix beyond the declared length is adopted ONLY when the
@@ -701,8 +789,11 @@ class RawBoundedAppender:
         try:
             write_meta(self.meta, records=self.records, total_bytes=self.total,
                        dropped_bytes=self.dropped, truncation=self.truncation,
-                       sha256=self.digest.hexdigest(), writer=WRITER_EXIT_WATCHER,
-                       unanswerable=self.unanswerable)
+                       # Item 6: an inherited description that failed its check is
+                       # written back AS INHERITED, never as a digest this writer derived.
+                       sha256=(self._inherited_sha256 if self._inherited_sha256 is not None
+                               else self.digest.hexdigest()),
+                       writer=WRITER_EXIT_WATCHER, unanswerable=self.unanswerable)
         except OSError:
             pass
 
@@ -713,6 +804,183 @@ class RawBoundedAppender:
             except OSError:
                 pass
             self.fd = -1
+
+
+def _meta_shape_problem(meta: Any) -> str:
+    """``""`` when ``meta`` is EXACTLY the closed v2 shape :func:`write_meta` produces;
+    otherwise the first problem, named (item 6, round 9).  Shared by the reader side
+    (:meth:`BoundedCapture.integrity`) and the exit watcher's handoff
+    (:class:`RawBoundedAppender`), so both refuse the same descriptions."""
+    if not isinstance(meta, dict):
+        return "not_an_object"
+    if meta.get("schema") != META_SCHEMA:
+        return "schema"
+    keys = set(meta)
+    if keys != META_KEYS:
+        missing = sorted(META_KEYS - keys)
+        extra = sorted(keys - META_KEYS)
+        return "keys:" + ",".join(["-" + k for k in missing] + ["+" + k for k in extra])
+    for name in ("records", "total_bytes", "dropped_bytes"):
+        value = meta[name]
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            return name
+    if meta["truncation"] not in TRUNCATION_CAUSES:
+        return "truncation"
+    if meta["writer"] not in (WRITER_SUPERVISOR, WRITER_EXIT_WATCHER):
+        return "writer"
+    if not isinstance(meta["unanswerable"], str):
+        return "unanswerable"
+    digest = meta["sha256"]
+    if (not isinstance(digest, str) or len(digest) != 64
+            or any(ch not in "0123456789abcdef" for ch in digest)):
+        return "sha256"
+    return ""
+
+
+def capture_finalized_path(capture: str | os.PathLike[str] | bytes,
+                           incarnation: str) -> bytes:
+    """``<capture.log>.finalized.<incarnation>.json`` -- the capture-finalized proof for
+    ONE incarnation, beside the capture it vouches for (item 1, round 9).  Bytes, because
+    the forked exit watcher addresses it with raw ``os`` calls."""
+    target = os.fsencode(os.fspath(capture)) if not isinstance(capture, bytes) else capture
+    return target + b".finalized." + incarnation.encode() + b".json"
+
+
+def write_capture_finalized(path: str | os.PathLike[str] | bytes, *, fence: str,
+                            finality: str, writer: str, ended: str, errno_name: str,
+                            total_bytes: int, sha256: str, records: int,
+                            exit_how: str, exit_code: int | None,
+                            holders: Mapping[str, Any] | None = None,
+                            detail: str = "") -> None:
+    """Write the fenced capture-finalized record durably (tmp + fsync + rename).  Raw
+    ``os`` calls only: the exit watcher calls this after ``fork`` without ``exec``.
+
+    ``finality == "proven"`` is written ONLY after the writer's last append and its meta
+    reached stable storage, and binds the capture's final ``total_bytes`` / ``sha256`` and
+    the exit evidence (``exit_how``: ``exit_sentinel`` with the sentinel's ``code``, or a
+    process-table / ladder proof with no code).  ``"unproven"`` records why the drain did
+    not reach the hangup and the ``holders`` evidence (what still held the pty slave).
+    """
+    if finality not in (FINALITY_PROVEN, FINALITY_UNPROVEN):
+        raise ValueError(f"finality must be proven|unproven, got {finality!r}")
+    record = {"schema": CAPTURE_FINALIZED_SCHEMA, "fence": fence, "finality": finality,
+              "writer": writer, "ended": ended, "errno": errno_name or "",
+              "total_bytes": int(total_bytes), "sha256": sha256, "records": int(records),
+              "exit": {"how": exit_how, "code": exit_code},
+              "holders": dict(holders or {}), "detail": detail or ""}
+    payload = json.dumps(record, sort_keys=True).encode()
+    target = os.fsencode(os.fspath(path)) if not isinstance(path, bytes) else path
+    tmp = target + b".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, payload)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.rename(tmp, target)
+    try:
+        dir_fd = os.open(os.path.dirname(target) or b".", os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(dir_fd)
+    except OSError:
+        pass
+    finally:
+        os.close(dir_fd)
+
+
+def read_capture_finalized(path: str | os.PathLike[str] | bytes, *,
+                           fence: str) -> dict[str, Any]:
+    """``{"outcome": "proven" | "unproven" | "absent" | "foreign" | "unreadable",
+    "record": dict | None, "detail": str}``.
+
+    A record whose fence is another incarnation's is ``foreign`` and its contents are
+    NOT returned -- the same replay refusal :func:`standalone_pty.read_exit_sentinel`
+    applies.  ``proven`` is the record's OWN claim; the caller still binds it to the
+    capture on disk (length, digest) and to the sentinel (:func:`finalized_matches`).
+    """
+    target = os.fsencode(os.fspath(path)) if not isinstance(path, bytes) else path
+    try:
+        fd = os.open(target, os.O_RDONLY)
+    except FileNotFoundError:
+        return {"outcome": "absent", "record": None, "detail": ""}
+    except OSError as exc:
+        return {"outcome": "unreadable", "record": None, "detail": str(exc)}
+    try:
+        raw = b""
+        while True:
+            chunk = os.read(fd, 65_536)
+            if not chunk:
+                break
+            raw += chunk
+    except OSError as exc:
+        return {"outcome": "unreadable", "record": None, "detail": str(exc)}
+    finally:
+        os.close(fd)
+    try:
+        record = json.loads(raw.decode("utf-8", errors="replace"))
+    except ValueError:
+        return {"outcome": "unreadable", "record": None, "detail": "malformed record"}
+    if not isinstance(record, dict) or record.get("schema") != CAPTURE_FINALIZED_SCHEMA:
+        return {"outcome": "unreadable", "record": None, "detail": "not a finalized record"}
+    if record.get("fence") != fence:
+        return {"outcome": "foreign", "record": None,
+                "detail": f"fence {record.get('fence')!r} is not {fence!r}"}
+    finality = record.get("finality")
+    if finality not in (FINALITY_PROVEN, FINALITY_UNPROVEN):
+        return {"outcome": "unreadable", "record": None,
+                "detail": f"finality {finality!r} is not proven|unproven"}
+    return {"outcome": finality, "record": record, "detail": ""}
+
+
+def finalized_matches(record: Mapping[str, Any], *, capture: str | os.PathLike[str],
+                      sentinel_code: int | None, sentinel_present: bool) -> dict[str, Any]:
+    """Bind a ``proven`` finalized record to the CAPTURE ON DISK and to the EXIT
+    SENTINEL: ``{"matches": bool, "reason": str}``.
+
+    The record must name the file's exact length and sha256 (a proof written over a
+    capture that later grew, shrank or changed is not a proof of THIS capture), must
+    hold the closed shape, and -- when written by the exit watcher, whose exit evidence is
+    the sentinel it writes next -- must name the sentinel's code.  A record that cites the
+    sentinel while none exists (or another code) is refused: the two files are one act
+    of one writer and must agree.
+    """
+    if record.get("finality") != FINALITY_PROVEN:
+        return {"matches": False, "reason": "not_proven"}
+    # `finality: proven` is the authoritative claim; ``ended`` is diagnostic (``hangup``
+    # for a reader that saw EOF/EIO, ``quiesced`` for the session-leader watcher whose
+    # reaped-agent drain went quiet with no slave holder -- both are the writer's SOUND
+    # completion, and the writer only stamps ``proven`` after that gate).
+    if record.get("ended") not in ("hangup", "quiesced"):
+        return {"matches": False, "reason": "ended_not_final"}
+    if record.get("writer") not in (WRITER_SUPERVISOR, WRITER_EXIT_WATCHER):
+        return {"matches": False, "reason": "writer_unknown"}
+    declared = record.get("total_bytes")
+    digest = record.get("sha256")
+    if not isinstance(declared, int) or isinstance(declared, bool) or declared < 0:
+        return {"matches": False, "reason": "total_bytes"}
+    if not isinstance(digest, str) or len(digest) != 64:
+        return {"matches": False, "reason": "sha256"}
+    try:
+        size = Path(capture).stat().st_size
+    except OSError:
+        size = 0
+    if size != declared:
+        return {"matches": False, "reason": "capture_length_mismatch",
+                "proof_bytes": declared, "file_bytes": size}
+    if _digest_of(Path(capture)).hexdigest() != digest:
+        return {"matches": False, "reason": "capture_digest_mismatch"}
+    exit_evidence = record.get("exit") if isinstance(record.get("exit"), dict) else {}
+    how = str(exit_evidence.get("how") or "")
+    if how == "exit_sentinel":
+        if not sentinel_present:
+            return {"matches": False, "reason": "sentinel_absent"}
+        if exit_evidence.get("code") != sentinel_code:
+            return {"matches": False, "reason": "sentinel_code_mismatch"}
+    elif not how:
+        return {"matches": False, "reason": "exit_evidence_missing"}
+    return {"matches": True, "reason": ""}
 
 
 def meta_path_for(path: str | os.PathLike[str]) -> Path:

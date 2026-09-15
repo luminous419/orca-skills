@@ -709,7 +709,11 @@ class StandaloneAdapter:
     #: How long a reader waits for exit evidence that is IN FLIGHT -- the watcher alive,
     #: the agent exited, the sentinel not yet written.  Measured at ~10 ms on the MVP host
     #: under load; the bound exists for a wedged watcher and is never the normal cost.
-    EXIT_EVIDENCE_BUDGET_MS = 2_000
+    #: Round-9 item 1: an ORPHANED watcher drains the master to the hangup (bounded by
+    #: the profile's `post_exit_drain_budget_ms`, default 2 s) BEFORE it writes the
+    #: sentinel, so this bound covers that default drain plus a margin; a slower profile
+    #: at worst makes this reader answer "unknown" for a sentinel that lands later.
+    EXIT_EVIDENCE_BUDGET_MS = 3_500
 
     @staticmethod
     def _verified_by_sentinel(handle: str, sentinel_path: Any, *,

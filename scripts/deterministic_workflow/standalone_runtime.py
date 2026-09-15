@@ -218,17 +218,25 @@ class StartReceipt(TypedDict):
     teardown: str             # "proven" | "not_required"
 
 
+#: Round-9 item 1.  The ONE positive finality: a fenced CAPTURE-FINALIZED proof on disk
+#: that binds the capture as it is.  Every other `finality` value is a refusal by name.
+FINALITY_CAPTURE_FINALIZED = "capture_finalized"
+
+
 def _stream_is_final(drained: Mapping[str, Any]) -> bool:
-    """Round-8 iteration 3: the ONE rule for "the pty stream's end was positively
-    observed".  A supervising session proves it by the HANGUP it read itself (EOF /
-    ``EIO``); an adopted session -- no master in this process -- by the exit watcher's
-    fenced sentinel, which the watcher writes only after its own final drain and meta
-    save.  ``budget``, ``master_unreadable`` and a masterless session whose exit was
-    proven only by the process table are NOT final."""
-    ended = drained.get("ended")
-    if ended == "hangup":
-        return True
-    return ended == "no_master" and drained.get("finality") == "exit_sentinel"
+    """Round-9 item 1: the ONE rule for "the pty stream's end was positively observed" --
+    the fenced CAPTURE-FINALIZED proof (`standalone_capture.write_capture_finalized`)
+    exists and binds the capture on disk.  A supervising session writes it itself, after
+    the HANGUP it read (EOF / ``EIO``) and after its last append and meta reached stable
+    storage; an adopted session -- no master in this process -- finds the one the exit
+    watcher wrote after ITS final drain, meta save and fsync, before the sentinel.  The
+    exit SENTINEL alone is NOT final (round-8 iteration 3 accepted it, and the watcher
+    writes it without draining whenever the supervisor was alive at the exit -- a
+    supervisor that then died before its own drain left a truncated capture that a
+    successor settled from).  ``budget``, ``master_unreadable``, a masterless session
+    with a sentinel but no proof, and a proof that does not match the capture are all
+    refused."""
+    return drained.get("finality") == FINALITY_CAPTURE_FINALIZED
 
 
 class StandaloneSession:
@@ -1317,7 +1325,12 @@ class StandaloneSession:
                 # Gone before any signal.  Give a still-live watcher its budget to land
                 # the sentinel, then take the table's proof as the exit proof.
                 leader = int(self.record.get("sid") or 0)
-                deadline = self._clock() + StandaloneRuntime.EXIT_EVIDENCE_BUDGET_MS / 1000.0
+                # Round-9 item 1: the watcher now drains TO THE HANGUP (bounded by the
+                # profile's post-exit drain budget) before it writes the sentinel, so a
+                # live watcher is given at least that bound plus a margin to land it.
+                wait_ms = max(StandaloneRuntime.EXIT_EVIDENCE_BUDGET_MS,
+                              self.profile.timeouts.post_exit_drain_budget_ms + 1_000)
+                deadline = self._clock() + wait_ms / 1000.0
                 sentinel = self._read_sentinel()
                 while (sentinel["outcome"] != "exited" and leader > 0
                        and _pid_present(leader) and self._clock() < deadline):
@@ -1383,7 +1396,7 @@ class StandaloneSession:
         """
         deadline = self._clock() + self.profile.timeouts.completion_timeout_ms / 1000.0
         evidence = self.completion()
-        while self._clock() < deadline:
+        while True:
             if evidence["exit_proven"]:
                 # ---- follow-up review finding 7: a PROVEN exit ends the wait ----------
                 # Once the exit is proven no further byte can ORIGINATE from the agent,
@@ -1402,10 +1415,17 @@ class StandaloneSession:
                 # gone), so the drain now reads TO THE HANGUP under a bound, whatever a
                 # record already present looks like: a candidate record seen before the
                 # hangup is not the final record until the hangup says so.
+                # Round-9 item 1: this branch is reached for EVERY proven exit -- an
+                # exit first observed at (or past) the completion deadline included.
+                # The loop used to test the deadline first, so an exit proven exactly
+                # then fell through with `post_exit_drain` unset and the finality gate
+                # below never ran; the gate is TOTAL now.
                 drained = self.drain_after_exit()
                 self.post_exit_drain = drained           # rides BOTH settlement rows
                 evidence = self.completion()
                 evidence["post_exit_drain"] = drained
+                break
+            if self._clock() >= deadline:
                 break
             self.pump(timeout_ms=200)
             evidence = self.completion()
@@ -1463,6 +1483,13 @@ class StandaloneSession:
             self._journal(kind="EVENT", derived_from="pty",
                           event="evidence_unreadable", state=self.state,
                           vocabulary={"post_exit_drain": dict(drained),
+                                      # Round-9: the finality found by name, and what
+                                      # held the slave, so the retained-slave cause
+                                      # is observable in the journal.
+                                      "finality": str(drained.get("finality") or ""),
+                                      "finality_detail": str(
+                                          drained.get("finality_detail") or ""),
+                                      "holders": dict(drained.get("holders") or {}),
                                       "settlement_record_present":
                                           evidence["settlement_record"] is not None,
                                       "exit_proven": bool(evidence["exit_proven"]),
@@ -2153,11 +2180,12 @@ class StandaloneSession:
         return dict(self.exit_proof)
 
     # -- readiness -----------------------------------------------------------------------
-    #: Round-8 iteration 2.  The bound on reading the pty stream TO ITS HANGUP after the
-    #: agent's exit is proven.  Normally the hangup arrives within milliseconds (the exit
-    #: watcher closes its slave descriptor right after writing the sentinel); the bound
-    #: exists for a stray descendant that inherited the slave and kept it open, and a
-    #: drain that ends by budget is recorded as such in the settlement's own vocabulary.
+    #: Round-8 iteration 2.  The DEFAULT bound on reading the pty stream TO ITS HANGUP
+    #: after the agent's exit is proven.  Round-9: the operative bound is the profile's
+    #: ``timeouts.post_exit_drain_budget_ms`` (same default), so an operator whose agents
+    #: leave descendants on the slave tunes configuration, not code; this constant is
+    #: kept as the documented default.  A drain that ends by budget is recorded as such,
+    #: with what held the slave, in the settlement's own vocabulary.
     POST_EXIT_DRAIN_BUDGET_MS = 2_000
 
     def drain_after_exit(self, *, budget_ms: int | None = None) -> dict[str, Any]:
@@ -2181,17 +2209,19 @@ class StandaloneSession:
         """
         if self.pty is None or int(self.pty["master_fd"]) < 0:
             # No master in THIS process (an adopted session: the supervisor that held it
-            # is gone).  The stream's reader of record is then the exit WATCHER, which
-            # drains the master after reaping the agent, saves the capture meta and only
-            # THEN writes the fenced sentinel -- so the sentinel's presence is the
-            # durable end-of-stream evidence here, and its absence (an exit proven only
-            # by the process table: a SIGKILLed watcher) means nobody observed the end.
+            # is gone).  Round-9 item 1: the positive end-of-stream evidence is the
+            # CAPTURE-FINALIZED proof the exit watcher wrote after its own final drain,
+            # meta save and fsync -- bound to the capture's length and digest and to the
+            # sentinel it wrote next.  The sentinel alone proves only that the process
+            # exited: the watcher writes it at once whenever the supervisor was alive at
+            # the exit, and a supervisor that then died before its own drain left a
+            # capture nobody finished.  `finality` names exactly what was found.
             sentinel = self._read_sentinel()
-            return {"bytes": 0, "ended": "no_master", "errno": "",
-                    "finality": ("exit_sentinel" if sentinel["outcome"] == "exited"
-                                 else "none")}
+            return self._finality_from_proof(
+                {"bytes": 0, "ended": "no_master", "errno": ""}, sentinel)
         fd = int(self.pty["master_fd"])
-        budget = (self.POST_EXIT_DRAIN_BUDGET_MS if budget_ms is None else budget_ms) / 1000.0
+        budget = (self.profile.timeouts.post_exit_drain_budget_ms if budget_ms is None
+                  else budget_ms) / 1000.0
         deadline = self._clock() + budget
         read = 0
 
@@ -2203,13 +2233,13 @@ class StandaloneSession:
         while True:
             remaining = deadline - self._clock()
             if remaining <= 0:
-                return {"bytes": read, "ended": "budget", "errno": ""}
+                return self._finalize_drain({"bytes": read, "ended": "budget", "errno": ""})
             try:
                 ready, _, _ = select.select([fd], [], [], min(0.05, remaining))
             except InterruptedError:
                 continue                                 # EINTR: retried, never an end
             except (OSError, ValueError) as exc:         # a master this process cannot poll
-                return _unreadable(exc)
+                return self._finalize_drain(_unreadable(exc))
             if not ready:
                 continue
             try:
@@ -2218,12 +2248,122 @@ class StandaloneSession:
                 continue                                 # EINTR: retried, never an end
             except OSError as exc:
                 if exc.errno == errno.EIO:               # the slave side is gone (Linux)
-                    return {"bytes": read, "ended": "hangup", "errno": "EIO"}
-                return _unreadable(exc)                  # anything else proves nothing
+                    return self._finalize_drain({"bytes": read, "ended": "hangup",
+                                                 "errno": "EIO"})
+                return self._finalize_drain(_unreadable(exc))  # anything else proves nothing
             if not chunk:                                # EOF: the same fact (darwin)
-                return {"bytes": read, "ended": "hangup", "errno": ""}
+                return self._finalize_drain({"bytes": read, "ended": "hangup", "errno": ""})
             self.capture.append(chunk, at=_now_iso())
             read += len(chunk)
+
+    def _finalized_path(self) -> bytes:
+        return capture_mod.capture_finalized_path(self.capture.path, self.incarnation)
+
+    def _finalize_drain(self, drained: dict[str, Any]) -> dict[str, Any]:
+        """The SUPERVISING session's half of item 1: after its own drain, write the fenced
+        capture-finalized record -- ``proven`` for a hangup, bound to the capture's final
+        length / digest (the last ``append`` already saved and fsynced the meta) and to
+        the exit evidence this session holds (the sentinel's code, or the ladder / table
+        proof); ``unproven`` otherwise, naming what still holds the slave (the tty-scoped
+        process table, minus the exited agent).  ``finality`` is set to
+        :data:`FINALITY_CAPTURE_FINALIZED` ONLY after the proof is durably written, so a
+        proof this process could not persist leaves the drain unproven by name."""
+        sentinel = self._read_sentinel()
+        if sentinel["outcome"] == "exited":
+            exit_how, exit_code = "exit_sentinel", sentinel["code"]
+        elif self.exit_proof is not None and self.exit_proof.get("proven"):
+            exit_how, exit_code = str(self.exit_proof.get("how") or "ladder"), None
+        else:
+            exit_how, exit_code = "", None
+        proven = drained.get("ended") == "hangup" and bool(exit_how)
+        holders: dict[str, Any] | None = None
+        detail = ""
+        if not proven:
+            holders = self._slave_holders_now()
+            detail = ("the pty did not hang up within the post-exit drain bound "
+                      f"({self.profile.timeouts.post_exit_drain_budget_ms} ms); a "
+                      "descendant may still hold the slave" if drained.get("ended") == "budget"
+                      else f"the master could not be read ({drained.get('errno')})"
+                      if drained.get("ended") == "master_unreadable"
+                      else "the exit is not proven; nothing binds the capture's end")
+        try:
+            capture_mod.write_capture_finalized(
+                self._finalized_path(), fence=self.fence,
+                finality=(capture_mod.FINALITY_PROVEN if proven
+                          else capture_mod.FINALITY_UNPROVEN),
+                writer=capture_mod.WRITER_SUPERVISOR, ended=str(drained.get("ended")),
+                errno_name=str(drained.get("errno") or ""),
+                total_bytes=self.capture.size, sha256=self.capture.sha256,
+                records=self.capture.records, exit_how=exit_how, exit_code=exit_code,
+                holders=holders, detail=detail)
+        except OSError as exc:
+            drained["finality"] = "none"
+            drained["finality_detail"] = f"finalized record not written: {exc}"
+            return drained
+        if proven:
+            drained["finality"] = FINALITY_CAPTURE_FINALIZED
+        else:
+            drained["finality"] = "none"
+            drained["finality_detail"] = detail
+            drained["holders"] = holders
+        return drained
+
+    def _finality_from_proof(self, drained: dict[str, Any],
+                             sentinel: Mapping[str, Any]) -> dict[str, Any]:
+        """Bind the on-disk finalized record (if any) to the capture and the sentinel for
+        a MASTERLESS session: ``finality`` becomes :data:`FINALITY_CAPTURE_FINALIZED`
+        only when a ``proven`` record of THIS fence names the capture's exact length and
+        digest and the sentinel's code.  Anything else is named: ``exit_sentinel_only``
+        (the round-8 hole), ``unproven`` (the watcher recorded why, with the holders),
+        ``foreign`` / ``unreadable`` / ``mismatch`` / ``none``."""
+        proof = capture_mod.read_capture_finalized(self._finalized_path(), fence=self.fence)
+        drained["sentinel"] = sentinel["outcome"]
+        if proof["outcome"] == capture_mod.FINALITY_PROVEN:
+            bound = capture_mod.finalized_matches(
+                proof["record"], capture=self.capture.path,
+                sentinel_code=sentinel.get("code"),
+                sentinel_present=sentinel["outcome"] == "exited")
+            if bound["matches"]:
+                drained["finality"] = FINALITY_CAPTURE_FINALIZED
+                drained["finalized"] = {k: proof["record"].get(k) for k in
+                                        ("writer", "ended", "total_bytes", "sha256")}
+                return drained
+            drained["finality"] = "mismatch"
+            drained["finality_detail"] = str(bound["reason"])
+            return drained
+        if proof["outcome"] == capture_mod.FINALITY_UNPROVEN:
+            record = proof["record"] or {}
+            drained["finality"] = "unproven"
+            drained["finality_detail"] = str(record.get("detail") or "")
+            drained["holders"] = dict(record.get("holders") or {})
+            drained["watcher_ended"] = str(record.get("ended") or "")
+            return drained
+        if proof["outcome"] in ("foreign", "unreadable"):
+            drained["finality"] = proof["outcome"]
+            drained["finality_detail"] = str(proof.get("detail") or "")
+            return drained
+        drained["finality"] = ("exit_sentinel_only" if sentinel["outcome"] == "exited"
+                               else "none")
+        return drained
+
+    def _slave_holders_now(self) -> dict[str, Any]:
+        """The tty-scoped process table for the captured tty, minus the agent itself:
+        what still holds the slave when a drain ends by budget (the retained-slave cause,
+        observable by name)."""
+        tty = str((self.record or {}).get("captured_tty") or "")
+        out: dict[str, Any] = {"tty": tty, "method": "process_table", "readable": False,
+                               "rows": []}
+        if not tty:
+            return out
+        try:
+            snapshot = self._snapshot()
+        except Exception:  # noqa: BLE001 - evidence, never a failure of the drain
+            return out
+        out["readable"] = bool(snapshot.get("readable", False))
+        agent = int((self.record or {}).get("pid") or 0)
+        out["rows"] = [dict(row) for row in snapshot.get("rows", ())
+                       if int(row.get("pid", 0)) != agent]
+        return out
 
     def pump(self, *, timeout_ms: int = 50) -> int:
         """Read whatever is available on the master fd into the bounded capture."""

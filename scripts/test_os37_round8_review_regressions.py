@@ -1776,12 +1776,16 @@ class Iteration3ReadClassificationTests(unittest.TestCase):
         self.assertEqual(drained["ended"], "master_unreadable", drained)
         self.assertIn(drained["errno"], ("EBADF", "ValueError"))
 
-    def test_a_masterless_session_is_final_only_by_the_watchers_sentinel(self) -> None:
+    def test_a_masterless_session_is_final_only_by_the_watchers_finalized_proof(self) -> None:
         """An ADOPTED session holds no master: its end-of-stream evidence is the exit
-        watcher's fenced sentinel (written after the watcher's own final drain and meta
-        save).  Without it -- an exit proven only by the process table -- nothing is
-        final.  (The full adopted path is `F01CrashedSupervisorDispatchIsCollectedTests`,
-        which settles COMPLETED through exactly this rule.)"""
+        watcher's fenced CAPTURE-FINALIZED proof (round-9 item 1), written after the
+        watcher's own final drain, meta save and fsync and BEFORE its sentinel.  The
+        sentinel alone -- which the watcher writes without draining whenever the
+        supervisor was alive at the exit -- is `exit_sentinel_only` and NOT final; an exit
+        proven only by the process table is `none`.  (Iteration 3 accepted the sentinel
+        alone here; that was the round-9 blocker.  The full adopted path is
+        `F01CrashedSupervisorDispatchIsCollectedTests`, which settles COMPLETED through
+        exactly this rule.)"""
         from scripts.deterministic_workflow.standalone_runtime import _stream_is_final
         self.session.pty = None
         drained = self.session.drain_after_exit(budget_ms=500)
@@ -1794,11 +1798,32 @@ class Iteration3ReadClassificationTests(unittest.TestCase):
         sentinel.parent.mkdir(parents=True, exist_ok=True)
         pty_supervisor.write_exit_sentinel(sentinel, code=0, fence=self.session.fence)
         drained = self.session.drain_after_exit(budget_ms=500)
-        self.assertEqual(drained["finality"], "exit_sentinel", drained)
+        self.assertEqual(drained["finality"], "exit_sentinel_only", drained)
+        self.assertFalse(_stream_is_final(drained), "a sentinel alone was taken as final")
+        # The watcher's proof, bound to the capture as it is and to the sentinel's code.
+        self.session.capture.append(b'{"type":"turn.completed"}\n', at="t")
+        proof = capture_mod.capture_finalized_path(self.session.capture.path,
+                                                   self.session.incarnation)
+        capture_mod.write_capture_finalized(
+            proof, fence=self.session.fence, finality=capture_mod.FINALITY_PROVEN,
+            writer=capture_mod.WRITER_EXIT_WATCHER, ended="hangup", errno_name="",
+            total_bytes=self.session.capture.size, sha256=self.session.capture.sha256,
+            records=1, exit_how="exit_sentinel", exit_code=0)
+        drained = self.session.drain_after_exit(budget_ms=500)
+        self.assertEqual(drained["finality"], "capture_finalized", drained)
         self.assertTrue(_stream_is_final(drained))
+        # A proof that no longer describes the capture (bytes appended after it) is a
+        # named mismatch, not finality.
+        with open(self.session.capture.path, "ab") as handle:
+            handle.write(b"stray\n")
+        drained = self.session.drain_after_exit(budget_ms=500)
+        self.assertEqual(drained["finality"], "mismatch", drained)
+        self.assertEqual(drained["finality_detail"], "capture_length_mismatch")
+        self.assertFalse(_stream_is_final(drained))
         # And a FOREIGN sentinel (another incarnation's) proves nothing.
         pty_supervisor.write_exit_sentinel(sentinel, code=0,
                                            fence=f"{self.session.session_id}:i-other")
-        self.assertEqual(self.session.drain_after_exit(budget_ms=500)["finality"], "none")
-        for ended in ("budget", "master_unreadable"):
+        self.assertFalse(_stream_is_final(self.session.drain_after_exit(budget_ms=500)))
+        for ended in ("budget", "master_unreadable", "hangup", "no_master"):
             self.assertFalse(_stream_is_final({"ended": ended, "finality": "exit_sentinel"}))
+            self.assertFalse(_stream_is_final({"ended": ended, "finality": "none"}))

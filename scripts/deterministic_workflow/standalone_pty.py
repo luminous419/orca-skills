@@ -766,7 +766,9 @@ def spawn(*, argv: Sequence[str], env: Mapping[str, str], profile: StandalonePro
             # that dispatch's watcher from ever seeing its own supervisor die.
             _watch(agent_pid, master_fd=master_fd, slave_fd=slave_fd, guard_r=guard_r,
                    close_up_to=close_up_to, sentinel=sentinel, fence=fence,
-                   capture=capture_target, capture_limits=profile.capture)
+                   capture=capture_target, capture_limits=profile.capture,
+                   slave_name=slave_name,
+                   drain_budget_ms=profile.timeouts.post_exit_drain_budget_ms)
         except BaseException:
             os._exit(127)
     os.close(slave_fd)
@@ -798,7 +800,8 @@ def spawn(*, argv: Sequence[str], env: Mapping[str, str], profile: StandalonePro
 def _watch(agent_pid: int, *, master_fd: int, slave_fd: int, guard_r: int,
            close_up_to: int, sentinel: str | os.PathLike[str] | None, fence: str,
            capture: bytes | None,
-           capture_limits: CaptureLimits | None = None
+           capture_limits: CaptureLimits | None = None,
+           slave_name: str = "", drain_budget_ms: int = 2_000
            ) -> None:  # pragma: no cover - runs in the forked watcher
     """The exit watcher's whole life.  Raw ``os`` calls only: this is a forked child.
 
@@ -816,6 +819,20 @@ def _watch(agent_pid: int, *, master_fd: int, slave_fd: int, guard_r: int,
     the bytes in disagreement fails closed.  The master is still drained past the limit
     -- the agent must never block on a full pty buffer -- but the bytes are DROPPED and
     counted, never written.
+
+    **The sentinel proves the EXIT; the finalized record proves the CAPTURE** (round-9
+    consolidated review, item 1).  When this watcher is the one finalizing -- the
+    supervisor is gone and it holds the only reader of the master -- it drains the master
+    TO THE HANGUP (bounded by the profile's ``post_exit_drain_budget_ms``; silence does
+    not end it), saves and fsyncs the capture meta, writes the fenced capture-finalized
+    proof (:func:`standalone_capture.write_capture_finalized`, bound to the capture's
+    final length + digest and to the sentinel it is about to write) and ONLY THEN writes
+    the exit sentinel.  A drain that ends by the bound (a descendant still holds the
+    slave) or by an unreadable master writes an ``unproven`` record naming what held the
+    slave, then the sentinel; a successor then settles `stream_end_unproven`.  When the
+    supervisor is ALIVE at the agent's exit it owns the drain and writes the proof itself;
+    the sentinel this watcher writes at once is exit evidence only and no reader may take
+    it for capture completion.
     """
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
     try:
@@ -883,18 +900,210 @@ def _watch(agent_pid: int, *, master_fd: int, slave_fd: int, guard_r: int,
                         appender = None
             continue
         _drain_once(master_fd, appender, budget=0.05, wake_r=wake_r)
-    if orphaned:
-        # What the agent wrote between the last poll and its exit.
-        for _ in range(20):
-            if not _drain_once(master_fd, appender, budget=0.02):
-                break
-        if appender is not None:
-            appender.save_meta()
-            appender.close()
     code = _wait_status_to_code(status)
+    if orphaned and capture is not None:
+        # This watcher is the one FINALIZING: drain to the hangup, persist, prove, and
+        # only then write the sentinel (item 1).  Nothing here may raise past the
+        # sentinel write -- a watcher that dies of bookkeeping loses the exit evidence.
+        try:
+            _finalize_orphaned_capture(
+                master_fd, appender, budget_s=max(0, int(drain_budget_ms)) / 1000.0,
+                finalized=capture_mod.capture_finalized_path(capture, fence.partition(":")[2]),
+                fence=fence, code=code, slave_name=slave_name)
+        except Exception:  # noqa: BLE001 - the sentinel is still written below
+            pass
     if sentinel is not None:
         write_exit_sentinel(sentinel, code=code, fence=fence)
     os._exit(code)
+
+
+def _finalize_orphaned_capture(master_fd: int, appender: Any, *, budget_s: float,
+                               finalized: bytes, fence: str, code: int | None,
+                               slave_name: str = "", clock: Any = time.monotonic,
+                               reader: Any = os.read,
+                               settle_s: float = 0.15) -> dict[str, Any]:
+    """The exit watcher's post-exit finalization (item 1, round 9).  Raw ``os`` calls;
+    in its own function so a real-pty test can drive it in-process.
+
+    The agent is ALREADY REAPED by the caller (``waitpid`` returned its exit status --
+    the strongest exit proof there is), so no further byte can ORIGINATE from the agent.
+    This drains what its output left in the pty and decides whether the capture is
+    COMPLETE:
+
+    * a clean EOF (``b""``) or ``errno.EIO`` is the pty HANGUP -- every slave descriptor
+      is closed -- and the capture is complete (Linux delivers this to the watcher; it
+      closes the flip-buffer lost-tail race the round-8 head existed to close);
+    * otherwise the drain runs until the master has been QUIET for ``settle_s`` after the
+      reap -- and THIS is the only sound "quiescence" gate, because it stands on the
+      REAPED exit (not on a final record + silence, which the review forbids): the writer
+      of record is provably gone.  It is ``proven`` only when NOTHING still holds the
+      slave (:func:`_slave_holders`: the agent's foreground process group is empty and no
+      ``/proc`` fd resolves to the slave).  A descendant that kept the slave open -- a
+      background dev server, an inherited MCP / language-server stdio -- keeps the group
+      non-empty (a normal fork inherits the agent's pgid) or shows in the ``/proc`` scan,
+      so the drain is ``unproven`` and the holder is NAMED.  **darwin caveat:** a
+      session-leader reader (this watcher) never sees the master EOF while it lives, and
+      darwin offers no subprocess-free fd enumeration, so a descendant that ALSO left the
+      agent's process group is not detectable here and the ``proven`` gate on darwin is
+      "reaped + quiesced + empty foreground group"; the conformance doc states this bound.
+
+    ``EINTR`` is retried; any other read / poll error is ``master_unreadable``.  Then, in
+    order: the appender's meta is saved (fsynced) and closed; the finalized record is
+    written -- ``proven`` or ``unproven`` per the above, bound to the capture's final
+    ``total_bytes`` / ``sha256`` and to the sentinel identity the caller writes NEXT.  The
+    caller writes the exit sentinel AFTER this returns, never before.
+    """
+    deadline = clock() + budget_s
+    ended, errno_name, read = "budget", "", 0
+    last_data = clock()
+    while True:
+        now = clock()
+        if now >= deadline:
+            ended = "budget"
+            break
+        try:
+            ready, _, _ = select.select([master_fd], [], [], min(0.05, deadline - now))
+        except InterruptedError:
+            continue
+        except (OSError, ValueError) as exc:
+            ended, errno_name = "master_unreadable", _errno_name(exc)
+            break
+        if not ready:
+            if clock() - last_data >= settle_s:
+                # Quiet for the settle window since the last byte, and the agent is
+                # reaped: no more bytes can ORIGINATE.  Whether that is FINAL is the
+                # holder probe below, not silence alone.
+                ended = "quiesced"
+                break
+            continue
+        try:
+            chunk = reader(master_fd, 65_536)
+        except InterruptedError:
+            continue
+        except OSError as exc:
+            if exc.errno == errno.EIO:
+                ended, errno_name = "hangup", "EIO"
+            else:
+                ended, errno_name = "master_unreadable", _errno_name(exc)
+            break
+        if not chunk:
+            ended = "hangup"
+            break
+        read += len(chunk)
+        last_data = clock()
+        if appender is not None:
+            try:
+                appender.append(chunk)
+            except Exception:  # noqa: BLE001 - bookkeeping never stops the drain
+                pass
+    total, digest, records = 0, "", 0
+    if appender is not None:
+        appender.save_meta()
+        appender.close()
+        total, records = int(appender.total), int(appender.records)
+        digest = appender.digest.hexdigest()
+    holders = None
+    if ended == "hangup" and appender is not None:
+        finality, detail = capture_mod.FINALITY_PROVEN, ""
+    elif ended == "quiesced" and appender is not None:
+        holders = _slave_holders(master_fd, slave_name)
+        if _slave_holder_present(holders):
+            finality = capture_mod.FINALITY_UNPROVEN
+            detail = ("the agent is reaped and its output quiesced, but a descendant "
+                      "still holds the pty slave; the capture may yet grow")
+        else:
+            finality, holders = capture_mod.FINALITY_PROVEN, None
+            detail = ""
+    else:
+        finality = capture_mod.FINALITY_UNPROVEN
+        holders = _slave_holders(master_fd, slave_name)
+        detail = ("no bounded appender could be built for the capture; nothing vouches "
+                  "for the bytes" if appender is None else
+                  "the pty output did not quiesce within the post-exit drain bound; a "
+                  "descendant may still hold the slave" if ended == "budget" else
+                  f"the master could not be read ({errno_name})")
+    capture_mod.write_capture_finalized(
+        finalized, fence=fence, finality=finality, writer=capture_mod.WRITER_EXIT_WATCHER,
+        ended=ended, errno_name=errno_name, total_bytes=total, sha256=digest,
+        records=records, exit_how="exit_sentinel", exit_code=code, holders=holders,
+        detail=detail)
+    return {"ended": ended, "errno": errno_name, "bytes": read, "finality": finality,
+            "total_bytes": total, "sha256": digest}
+
+
+def _slave_holder_present(holders: Mapping[str, Any]) -> bool:
+    """Whether :func:`_slave_holders` evidence names anything still holding the slave: the
+    agent's foreground process group has members, or a ``/proc`` fd resolves to it."""
+    if holders.get("foreground_group_present") is True:
+        return True
+    return bool(holders.get("rows"))
+
+
+def _errno_name(exc: BaseException) -> str:
+    code = getattr(exc, "errno", None)
+    return errno.errorcode.get(code, str(code)) if code is not None else type(exc).__name__
+
+
+def _slave_holders(master_fd: int, slave_name: str) -> dict[str, Any]:
+    """What still holds the pty SLAVE after the agent's exit -- the retained-slave cause,
+    made observable (round-9 Linux descendant / PTY scope, choice (a)).
+
+    Raw ``os`` calls only (a forked watcher runs this; nothing may spawn).  Two probes:
+    the slave's FOREGROUND process group (``tcgetpgrp`` on the master) and whether that
+    group still has members (``killpg(pgid, 0)``) -- both platforms; and on Linux a
+    ``/proc/<pid>/fd`` scan for descriptors that resolve to the slave's path, naming each
+    holder's pid and ``comm``.  darwin offers no subprocess-free fd enumeration here, so
+    its rows are empty and ``method`` says so; the supervisor-side reader adds the
+    tty-scoped process table (``ps -t``) when it reports the refusal.
+    """
+    out: dict[str, Any] = {"slave": slave_name, "method": "pgid_probe", "rows": [],
+                           "foreground_pgid": None, "foreground_group_present": None}
+    try:
+        pgid = os.tcgetpgrp(master_fd)
+        out["foreground_pgid"] = int(pgid)
+        try:
+            os.killpg(pgid, 0)
+            out["foreground_group_present"] = True
+        except ProcessLookupError:
+            out["foreground_group_present"] = False
+        except PermissionError:
+            out["foreground_group_present"] = True
+        except OSError:
+            pass
+    except OSError:
+        pass
+    if slave_name and os.path.isdir("/proc"):
+        out["method"] = "proc_fd_scan"
+        rows: list[dict[str, Any]] = []
+        try:
+            entries = os.listdir("/proc")
+        except OSError:
+            entries = []
+        for entry in entries:
+            if not entry.isdigit() or entry == str(os.getpid()):
+                continue
+            fd_dir = f"/proc/{entry}/fd"
+            try:
+                fds = os.listdir(fd_dir)
+            except OSError:
+                continue
+            held = []
+            for name in fds:
+                try:
+                    if os.readlink(f"{fd_dir}/{name}") == slave_name:
+                        held.append(int(name))
+                except OSError:
+                    continue
+            if held:
+                comm = ""
+                try:
+                    with open(f"/proc/{entry}/comm", "rb") as handle:
+                        comm = handle.read().decode("utf-8", "replace").strip()
+                except OSError:
+                    pass
+                rows.append({"pid": int(entry), "comm": comm, "fds": sorted(held)})
+        out["rows"] = rows
+    return out
 
 
 def _drain_wakeups(wake_r: int) -> None:  # pragma: no cover - runs in the forked watcher

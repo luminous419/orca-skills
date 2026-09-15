@@ -426,6 +426,17 @@ class Timeouts:
     force_retry_ms: int = 250
     preflight_timeout_ms: int = 20_000
     staleness_budget_ms: int = 1_000
+    #: Round-9 consolidated review, item 1 / Linux descendant scope.  The bound on the
+    #: POST-EXIT DRAIN: after the agent's exit is proven, the process that owns the pty
+    #: master (the supervisor, or the exit watcher once the supervisor is gone) reads the
+    #: master until the pty HANGS UP -- the only positive proof that no byte is still in
+    #: flight -- and this is how long it waits for that hangup.  A descendant that kept
+    #: the slave open (a background dev server, an inherited MCP / language-server stdio)
+    #: prevents the hangup; the drain then ends by this bound, the dispatch is the typed
+    #: `stream_end_unproven` and the finalized record names what held the slave.  Raise it
+    #: on the profile for agents whose children are known to outlive them briefly; it is
+    #: a tuning bound and never a proof.
+    post_exit_drain_budget_ms: int = 2_000
 
     def __post_init__(self) -> None:
         for name in self.__dataclass_fields__:  # noqa: PLC0206 - dataclass introspection
@@ -824,6 +835,13 @@ def profile_from_mapping(spec: Any) -> StandaloneProfile:
     # entries are resolved the same way, for the same double-application reason.
     import os as _os
     worktree_spec = spec.get("worktree", "")
+    # Round-9 item 4: ONLY a missing key or the exact empty string means "the launch
+    # cwd".  Every other non-string (`123`, `[]`, `{}`, `None`) is refused here by name --
+    # `[]` / `{}` used to fall through as "" and `123` died in `abspath` with a TypeError.
+    if not isinstance(worktree_spec, str):
+        raise ProfileError(
+            f"worktree must be a string path (or omitted / \"\" for the launch cwd), got "
+            f"{worktree_spec!r}")
     worktree_resolved = _os.path.abspath(worktree_spec) if worktree_spec else ""
     add_dirs_resolved = tuple(_os.path.abspath(d) if d else d
                               for d in _as_tuple(spec.get("add_dirs"), "add_dirs"))

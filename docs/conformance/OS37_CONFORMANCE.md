@@ -422,3 +422,106 @@ qualified "at the pinned revision".
   caller the lifecycle owner: the child is a `setsid` session leader and the journal,
   sentinel and ledger are plain files, so `standalone_journal.rediscover(run_id,
   artifact_base)` answers from a completely fresh process.
+
+## Round 9 -- consolidated external review of `fc21012` (issuecomment-5680361023)
+
+* **A CAPTURE-FINALIZED proof, DISTINCT from the exit sentinel** (round-9 item 1).  The exit
+  sentinel proves the *process* exited -- the exit watcher writes it the instant `waitpid`
+  returns, whether or not any output has been drained.  Whether the *capture* is complete
+  is a SEPARATE, crash-durable, fenced record
+  (`standalone_capture.write_capture_finalized`, `capture.log.finalized.<incarnation>.json`)
+  written only after the finalizing writer has completed its bounded drain, persisted the
+  capture meta and fsynced it; it binds the capture's final length + sha256 and the exit
+  identity (the sentinel's code, or a ladder/table proof).  `_stream_is_final` now accepts
+  ONLY that proof (`finality: capture_finalized`), matched against the capture on disk
+  (`finalized_matches`): a sentinel with no proof is `exit_sentinel_only` and NOT final.
+  This closes the round-8 hole -- the watcher may write the sentinel without draining when
+  the supervisor was alive, and a supervisor that then died before its own drain left a
+  truncated capture a successor settled from.  A supervising session writes the proof after
+  its own drain reaches the hangup; the exit watcher writes it after ITS orphan drain, and
+  ONLY THEN writes the sentinel.  The finality gate is TOTAL: an exit first observed AT (or
+  past) the completion deadline still runs the drain + finality gate.  Locked by
+  `test_os37_round9_review_regressions.py::Item1*` (real-pty watcher finalize included) and
+  the F01 adopted-recovery path.
+
+* **PTY scope: fail-closed and OBSERVABLE (choice a).**  A descendant that retains the pty
+  slave prevents the EOF/EIO hangup.  We do NOT accept "final record + N ms silence" as
+  success.  The finalizing drain is bounded by the profile's own
+  `timeouts.post_exit_drain_budget_ms` (default 2 s, an operator-tunable knob, not a
+  literal), and a drain that does not reach a sound completion is `stream_end_unproven`
+  (typed FAILED/LOST), with the RETAINED-SLAVE CAUSE NAMED in the finalized record's
+  `holders` evidence: the slave's foreground process group and whether it still has members
+  (both platforms), plus, on Linux, a `/proc/<pid>/fd` scan naming each holder's pid, comm
+  and fds.  The exit watcher is a `setsid` session leader and on darwin a session-leader
+  reader never sees the master EOF while it lives and darwin offers no subprocess-free fd
+  enumeration; there the `proven` gate is "agent reaped (its `waitpid` status in hand) +
+  output quiesced + the agent's foreground process group empty", which stands on the
+  reaped exit rather than on silence, and a descendant that ALSO left the agent's process
+  group is the stated darwin limit of the holder evidence.  Choice (c) -- the item-1
+  finalization protocol -- is the positive proof that stays sound when descendants exist;
+  choice (a)'s observability and configurable bound are how a genuinely retained slave is
+  reported.  Locked by
+  `test_os37_round9_review_regressions.py::Item1WatcherFinalizeOverRealPtyTests`.
+
+* **A crash-consistent prompt-composition upgrade / migration** (round-9 item 2).  The
+  legacy-authority upgrade (`_write_upgraded_legacy_authority`) is now the same reconcilable
+  two-phase act as profile migration: a durable `prepared` intent (keyed by an `upgrade_id`
+  + `attempt`) fsynced before anything changes, the composition persisted content-addressed,
+  a compare-and-swap authority rebind, then a `committed` record.  A crash at any cut point
+  is reconciled deterministically from the primary authority on the next read
+  (`reconcile_authority_upgrades`): rebind landed -> rolled forward to `committed`; rebind
+  did not -> `rolled_back` and the upgrade re-runs.  Replay after every cut point converges
+  to exactly one committed record for the live authority, and a crash after the rebind never
+  leaves the new composition bound without an audit record.  `read_authority_upgrades`
+  returns only COMMITTED upgrades.  Locked by
+  `test_os37_round9_review_regressions.py::Item2CrashConsistentUpgradeTests`.
+
+* **Per-run watchdog isolation** (round-9 item 3).  A malformed / unreadable / wrong-thread
+  authority for ONE run is converted, at the standalone composition boundary
+  (`capabilities_for`), into the observation port's typed `ObservationUnavailable` for THAT
+  run, so the fleet sweep records it as unreadable at observation, refuses its recovery
+  composition by name, and continues classifying and recovering the healthy runs.  A
+  targeted `--run-id` invocation is still pre-validated at the wiring boundary and fails
+  closed.  Locked by
+  `test_os37_round9_review_regressions.py::Item3PerRunWatchdogIsolationTests` (a real
+  multi-run sweep: one corrupt authority + one healthy stalled run -> the healthy run
+  recovered, the corrupt run reported by name).
+
+* **Invalid `worktree` TYPES are refused** (round-9 item 4).  Only a MISSING key or the
+  exact empty string `""` means "the launch cwd"; every other non-string value (`123`,
+  `[]`, `{}`, `None`, `1.5`, `True`) is the typed refusal
+  `STANDALONE_PROFILE_WORKTREE_INVALID` (or `ProfileError` at the runtime door) BEFORE the
+  spec is frozen, digested or persisted, at `freeze_profile_worktree`, the archive write
+  and read doors and `profile_from_mapping`.  Previously `[]` / `{}` fell through as "" and
+  `123` died in `abspath`.  Locked by
+  `test_os37_round9_review_regressions.py::Item4InvalidWorktreeTypeTests`.
+
+* **An existing profile archive is VALIDATED before authority bind** (round-9 item 5).  A
+  content-addressed archive that already sits under the digest a launch or migration is
+  about to bind is loaded through the production loader -- present, hashes to the digest,
+  frozen, a valid profile -- before `persist_standalone_profile` publishes it or a migration
+  rebinds authority to it; a corrupt / tampered / schema-invalid file there is the typed
+  refusal `STANDALONE_PROFILE_ARCHIVE_INVALID`, never the profile a recovery rebuilds.  The
+  same door validates an existing prompt-composition archive.  Locked by
+  `test_os37_round9_review_regressions.py::Item5ExistingArchiveValidatedTests`.
+
+* **A missing capture sha256 is NEVER healed** (round-9 item 6).  `RawBoundedAppender`
+  requires the closed v2 meta shape with a valid 64-hex-digit `sha256` at handoff
+  (`_meta_shape_problem`); an absent / empty / malformed digest -- or any other inherited
+  integrity failure -- is `inherited_meta_invalid`, irreversibly unanswerable: the watcher
+  never re-derives the digest from the bytes and writes the INHERITED `sha256` string
+  verbatim into every meta it saves, so a capture unanswerable before the handoff stays
+  unanswerable after it.  The reader's `integrity()` refuses the same shape by name
+  (`INTEGRITY_META_INVALID`).  Locked by
+  `test_os37_round9_review_regressions.py::Item6MissingDigestNeverHealedTests`.
+
+* **Documentation scope: `migrate-standalone-prompt-composition` supports ONLY the
+  omitted-thread legacy authority shape.**  The command (and the automatic legacy upgrade)
+  recognises exactly the pre-fix `thread_id: ""` authority with no prompt-composition digest
+  whose durable evidence proves the `launcher` thread; a legacy-looking record naming an
+  explicit thread is NOT that shape and is left to the normal validator, never silently
+  upgraded (`_is_legacy_omitted_thread_authority`).  The PR description and this record are
+  narrowed to that actual compatibility scope rather than claiming a general "a legacy run
+  lacking prompt composition is recoverable".  An explicit-thread legacy record is a
+  separate, unimplemented path.  Locked by
+  `test_os37_round9_review_regressions.py::DocScopeTests`.
