@@ -212,7 +212,12 @@ class ExecutionJournal:
         complete, torn = self._split_torn_tail(raw)
         self.torn_tail_bytes = len(torn)
         out: list[JournalRecord] = []
-        for number, line in enumerate(complete.decode("utf-8", "replace").splitlines(),
+        # Round-8 item 5: split on the protocol delimiter ONLY.  Records are written with
+        # `ensure_ascii=False`, so a vocabulary string holding U+2028 / U+2029 / U+0085
+        # lands raw in the file, and `splitlines()` cut such a record in two and raised
+        # `JournalUnreadable` over a record this journal had itself written.
+        from .standalone_capture import protocol_lines
+        for number, line in enumerate(protocol_lines(complete.decode("utf-8", "replace")),
                                       start=1):
             if not line.strip():
                 continue

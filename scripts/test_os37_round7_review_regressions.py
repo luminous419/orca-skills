@@ -1194,8 +1194,11 @@ class B1DurableWorktreeFreezeTests(unittest.TestCase):
         self.assertEqual(launcher.freeze_profile_worktree(absolute), absolute)
         self.assertEqual(launcher.profile_digest(launcher.freeze_profile_worktree(absolute)),
                          launcher.profile_digest(absolute))
-        self.assertEqual(launcher.freeze_profile_worktree({"driver": "claude"}),
-                         {"driver": "claude"})
+        # Round-8 item 3: an OMITTED worktree is frozen to the launch cwd itself (it used
+        # to stay omitted, which the runtime read as whichever process's cwd came next).
+        with _cwd(self.launch):
+            self.assertEqual(launcher.freeze_profile_worktree({"driver": "claude"}),
+                             {"driver": "claude", "worktree": str(self.launch)})
 
     def test_the_archive_holds_the_launch_time_absolute_worktree(self) -> None:
         # RED at the staged tree: the archive holds "wt" and a read from another cwd

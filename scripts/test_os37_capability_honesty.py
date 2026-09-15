@@ -222,8 +222,12 @@ class Condition1Tests(_Base):
             found,
             "lookup returned None with a spawn record present; that would authorize a "
             "second spawn of an effect that may already exist")
-        self.assertEqual(found["source"], "spawn_record")
         self.assertEqual(found["external_id"], "s-1:i-1")
+        # Round-8 item 1: the answer IS the receipt `executor._recover` records -- the
+        # closed key set, non-empty strings only, no provenance key (that used to be an
+        # extra `source` key, which the receipt validator refused as a corrupt ledger).
+        self.assertEqual(set(found), {"intent_id", "task_id", "dispatch_id", "external_id"})
+        self.assertTrue(all(isinstance(v, str) and v for v in found.values()), found)
 
     def test_stale_lease_token_refuses_receipt(self) -> None:
         """The REUSED fence is live: a rotated token makes ``record_receipt`` raise."""

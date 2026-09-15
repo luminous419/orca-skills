@@ -860,15 +860,42 @@ def capture_path(artifact_base: str | os.PathLike[str], run_id: str,
             / "capture.log")
 
 
+def protocol_lines(text: str) -> list[str]:
+    r"""Split a line-delimited PROTOCOL stream on its delimiter, ``\n``, and nothing else.
+
+    Round-8 item 5.  Every structured stream this runtime reads -- the CLIs' NDJSON event
+    streams, the execution journal, the migration and upgrade audit logs -- is delimited by
+    ``\n``, and JSON permits U+2028 / U+2029 / U+0085 RAW inside a string (the journal
+    is written with ``ensure_ascii=False``, and an agent's own output carries whatever the
+    agent wrote).  ``str.splitlines()`` splits on all of those (and on ``\x0b`` / ``\x0c``
+    / ``\x1c``-``\x1e``), so a perfectly valid record whose string held one of them was
+    cut in two: the driver saw two unparsable fragments instead of the settlement record,
+    and the journal reader raised ``JournalUnreadable`` over a record it had itself
+    written.  Splitting ONLY on the protocol delimiter keeps such a record whole.
+
+    ``\r\n``: a pty in canonical mode translates ``\n`` to ``\r\n`` on output.  The
+    capture's :meth:`BoundedCapture.transcript` already undoes that for parsers; a caller
+    handing raw ``\r\n`` text here gets lines ending in ``\r``, which every JSON reader
+    below strips before parsing -- so ``\r\n`` delimits exactly like ``\n``.  A trailing
+    delimiter yields no empty last piece (the same shape ``splitlines`` gave).
+    """
+    pieces = text.split("\n")
+    if pieces and pieces[-1] == "":
+        pieces.pop()
+    return pieces
+
+
 def structured_lines(text: str) -> tuple[tuple[dict[str, Any] | None, str], ...]:
     """Split a captured stream into ``(parsed-JSON-or-None, raw-line)`` pairs.
 
     An unparsable line is kept with ``None`` -- **never dropped**.  A line that is not JSON
     is not evidence of anything, but it is still part of the transcript, and dropping it
-    would make the capture disagree with the file it came from.
+    would make the capture disagree with the file it came from.  Split on the protocol
+    delimiter only (:func:`protocol_lines`), never on Unicode line separators inside a
+    record.
     """
     out: list[tuple[dict[str, Any] | None, str]] = []
-    for line in text.splitlines():
+    for line in protocol_lines(text):
         stripped = line.strip()
         if not stripped:
             continue

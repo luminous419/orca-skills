@@ -53,6 +53,49 @@ BRACKET_END = BRACKETED_PASTE_END
 ESC_REPLACEMENT = _LIFECYCLE_ESC_REPLACEMENT          # ONE definition: the echo model's
 
 
+
+def _seed_file_0600(source: str | os.PathLike[str], destination: "os.PathLike[str]") -> None:
+    """Copy ``source`` to ``destination`` so that NO observer ever sees the destination (or
+    the temp beside it) with a mode wider than ``0600`` -- round-8 item 9.
+
+    ``os.open(tmp, O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0o600)``: the kernel creates the
+    file with exactly that mode (``O_EXCL`` refuses to reuse an existing inode, so the mode
+    is never inherited from a file some other writer left; the umask can only CLEAR bits
+    of ``0o600``, never widen them).  The bytes are written and ``fsync``ed through that
+    descriptor, then ``os.replace`` atomically installs the temp as the destination -- the
+    destination therefore appears with its final bytes AND ``0600`` in one step, and a
+    re-seed on recovery replaces the previous seed the same way.  Never ``copyfile`` +
+    ``chmod``.
+    """
+    from pathlib import Path
+    destination = Path(destination)
+    tmp = destination.with_name(destination.name + f".{os.getpid()}.seed.tmp")
+    try:
+        os.unlink(tmp)                                   # a stale temp from a crashed seed
+    except FileNotFoundError:
+        pass
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_CLOEXEC", 0)
+    fd = os.open(tmp, flags, 0o600)
+    try:
+        with open(source, "rb") as reader, os.fdopen(fd, "wb") as writer:
+            fd = -1                                      # owned by `writer` now
+            while True:
+                chunk = reader.read(65536)
+                if not chunk:
+                    break
+                writer.write(chunk)
+            writer.flush()
+            os.fsync(writer.fileno())
+        os.replace(tmp, destination)
+    except BaseException:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
 class DriverEvidence(TypedDict):
     kind: str
     tier: str                     # a member of EVIDENCE_TIERS
@@ -1101,16 +1144,25 @@ class CodexDriver(_Driver):
         Nothing else from the real home is copied, the destination is ``0600``, and the
         return value names the destination PATH only -- never a byte of its content, and it
         is never journalled.
+
+        **0600 from the FIRST byte (round-8 item 9).**  This used to ``copyfile`` and then
+        ``chmod``, so between the two the destination carried the umask's default mode
+        (``0644`` under the usual umask, ``0666`` under a permissive one) while it already
+        held the credential.  The bytes now go into a temp file in the SAME directory
+        opened ``O_CREAT | O_EXCL | O_WRONLY`` with mode ``0600`` -- the mode is applied by
+        the kernel at creation and is umask-independent by construction, so no reader
+        ever observes a wider mode -- ``fsync``ed, and atomically renamed over the
+        destination.  A crash between the two leaves at most a ``0600`` temp file beside
+        it; a stale temp from an earlier crash is removed first, so ``O_EXCL`` cannot
+        refuse the seed it exists to protect.
         """
-        import shutil
         from pathlib import Path
         if not self.profile.auth_seed_source:
             return {"seeded": False, "reason": "no_auth_seed_declared", "path": ""}
         destination = Path(root) / self.profile.auth_seed_dest_name
         destination.parent.mkdir(parents=True, exist_ok=True)
         try:
-            shutil.copyfile(self.profile.auth_seed_source, destination)
-            os.chmod(destination, 0o600)
+            _seed_file_0600(self.profile.auth_seed_source, destination)
         except OSError as exc:
             # UNREADABLE is not ABSENT and is certainly not seeded: the caller turns this
             # into `auth_scope_unseeded`, a named preflight failure, never a silent run

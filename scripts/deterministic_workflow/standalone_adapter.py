@@ -56,6 +56,24 @@ def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _canonical_receipt(intent: Mapping[str, Any], *, external_id: str,
+                       task_id: Any, dispatch_id: Any, incarnation: str) -> dict[str, str]:
+    """EXACTLY the closed receipt shape `runtime_state._validate_receipt` accepts, for the
+    lookup path (round-8 item 1): ``intent_id`` / ``task_id`` / ``dispatch_id`` /
+    ``external_id``, every value a non-empty string.  A stored ``task_id`` /
+    ``dispatch_id`` is kept when it is a non-empty string; otherwise the identity is
+    DERIVED by the same functions `StandaloneSession` derives its own from, so the receipt
+    a stranger reconstructs from a spawn record equals the one the crashed supervisor
+    would have written.  No other key, ever."""
+    intent_id = str(intent["intent_id"])
+    task = (task_id if isinstance(task_id, str) and task_id
+            else runtime_mod.task_identity(intent))
+    dispatch = (dispatch_id if isinstance(dispatch_id, str) and dispatch_id
+                else runtime_mod.dispatch_identity(intent, incarnation))
+    return {"intent_id": intent_id, "task_id": task, "dispatch_id": dispatch,
+            "external_id": external_id}
+
+
 class StandaloneAdapter:
     """The standalone runtime's ``AgentExecutionPort`` (+ recovery, + lifecycle settlement)."""
 
@@ -397,6 +415,17 @@ class StandaloneAdapter:
         ``ExternalLookupUnavailable`` -> ``IDEMPOTENCY_RECOVERY_BLOCKED``.
 
         **There is no claim index here.**  The claim is ``runtime_state``'s.
+
+        **What it returns is a RECEIPT (round-8 item 1).**  `executor._recover` hands the
+        answer straight to ``runtime_state.record_receipt``, whose closed-set validator
+        (`runtime_state.RECEIPT_KEYS`, non-empty strings only) refuses anything else as a
+        CORRUPT ledger.  This used to return an extra ``source`` key and, from a stored
+        receipt, whatever ``task_id`` / ``dispatch_id`` happened to be there (``None``
+        included) -- so the exact spawn-record-before-receipt crash window the lookup
+        exists for ended in ``RuntimeStateCorrupt`` instead of collecting the in-flight
+        effect.  The answer is now exactly the receipt the supervising session would have
+        written: the four canonical keys, every value a non-empty string, the task and
+        dispatch identities derived by the SAME functions the session derives them with.
         """
         run_id = self.run_id or str(intent.get("run_id", ""))
         if not run_id:
@@ -411,10 +440,11 @@ class StandaloneAdapter:
                     f"the runtime-state ledger is unreadable: {exc}") from exc
             if stored and (stored.get("receipt") or {}).get("external_id"):
                 receipt = stored["receipt"]
-                return {"intent_id": intent_id, "external_id": receipt["external_id"],
-                        "task_id": receipt.get("task_id"),
-                        "dispatch_id": receipt.get("dispatch_id"),
-                        "source": "runtime_state_receipt"}
+                incarnation = str(receipt["external_id"]).partition(":")[2]
+                return _canonical_receipt(
+                    intent, external_id=str(receipt["external_id"]),
+                    task_id=receipt.get("task_id"), dispatch_id=receipt.get("dispatch_id"),
+                    incarnation=incarnation)
         probe = pty_supervisor.read_spawn_records(self.artifact_base, run_id, intent_id)
         if probe["outcome"] == "unknown":
             raise ExternalLookupUnavailable(
@@ -422,10 +452,16 @@ class StandaloneAdapter:
         if probe["outcome"] == "absent":
             return None
         record = probe["record"] or {}
-        return {"intent_id": intent_id,
-                "external_id": f"{record.get('session_id','')}:"
-                               f"{record.get('process_incarnation','')}",
-                "source": "spawn_record"}
+        session_id = str(record.get("session_id") or "")
+        incarnation = str(record.get("process_incarnation") or "")
+        if not session_id or not incarnation:
+            # A spawn record that names no fence proves an `execve` and identifies nothing
+            # to collect it by: unknown, never absence and never a receipt with a blank.
+            raise ExternalLookupUnavailable(
+                f"{intent_id}: the spawn record names no session/incarnation fence; the "
+                "effect exists but cannot be identified, which is not absence")
+        return _canonical_receipt(intent, external_id=f"{session_id}:{incarnation}",
+                                  task_id=None, dispatch_id=None, incarnation=incarnation)
 
     def resume(self, intent: ActionIntent,
                receipt: Mapping[str, Any]) -> SettlementEvent | None:

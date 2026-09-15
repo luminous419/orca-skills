@@ -187,6 +187,23 @@ def _default_result_parser(attempt: Any, intent: Mapping[str, Any]) -> dict[str,
     return decision_contract.parse_agent_settlement(attempt, intent)
 
 
+def task_identity(intent: Mapping[str, Any]) -> str:
+    """The standalone TASK identity of an intent: its explicit ``task_id`` when it carries
+    one, else ``task:<intent_id>`` (see :attr:`StandaloneSession.task_id`).  ONE function,
+    so the receipt the supervising session writes and the receipt a stranger's `lookup`
+    reconstructs from the spawn record name the same task."""
+    intent_id = str(intent.get("intent_id", ""))
+    return str(intent.get("task_id") or f"task:{intent_id}")
+
+
+def dispatch_identity(intent: Mapping[str, Any], incarnation: str) -> str:
+    """The standalone DISPATCH identity of one attempt: the intent's explicit
+    ``dispatch_id`` when it carries one, else ``dispatch:<intent_id>:<incarnation>`` (see
+    :attr:`StandaloneSession.dispatch_id`).  Shared with `lookup` for the same reason."""
+    intent_id = str(intent.get("intent_id", ""))
+    return str(intent.get("dispatch_id") or f"dispatch:{intent_id}:{incarnation}")
+
+
 class StartReceipt(TypedDict):
     intent_id: str
     session_id: str
@@ -345,7 +362,7 @@ class StandaloneSession:
         An explicit ``task_id`` on the intent still wins, because a caller that has one is
         naming something this runtime should not overwrite.
         """
-        return str(self.intent.get("task_id") or f"task:{self.intent_id}")
+        return task_identity(self.intent)
 
     @property
     def dispatch_id(self) -> str:
@@ -357,8 +374,7 @@ class StandaloneSession:
         journal's ``dispatch_id`` and its identity fence can never disagree about which
         attempt a record belongs to, which is what S-3's stale-dispatch refusal compares.
         """
-        return str(self.intent.get("dispatch_id")
-                   or f"dispatch:{self.intent_id}:{self.incarnation}")
+        return dispatch_identity(self.intent, self.incarnation)
 
     # -- D4.4 A-1..A-6: the `adopted` identity binding -----------------------------------
     def _binding_identity(self, text: str) -> str:
@@ -1356,6 +1372,37 @@ class StandaloneSession:
                 break
             self.pump(timeout_ms=200)
             evidence = self.completion()
+        if not evidence["capture_answerable"]:
+            # ---- round-8 item 2: ANSWERABILITY GATES EVERY SETTLEMENT RECORD ----------
+            # This used to sit BELOW the record+exit branch, so a parsed settlement record
+            # inside a capture the capture itself declares not to be evidence -- truncated,
+            # a meta that is missing / unreadable / disagrees with the bytes, a tail past
+            # the declared length nobody's append intent describes (a stranger's forged
+            # record) -- was still handed to the verdict and settled COMPLETED, and the
+            # ledger and journal recorded a success over evidence the capture had refused.
+            # The capture's own answer now comes FIRST: a record it cannot vouch for is no
+            # record, whatever it parses to, and the outcome is the capture's typed LOST
+            # reason (`capture_truncated` / `evidence_unreadable`, both closed-set members)
+            # which `_complete` raises and `settle_failed` turns into a typed FAILED
+            # settlement -- never a verdict read out of the refused bytes.
+            reason = str(evidence.get("lost_reason") or "capture_truncated")
+            disposition = (lifecycle.resolve_unknown("capture_truncated")
+                           if reason == "capture_truncated"
+                           else lifecycle.resolve_unknown("required_evidence_missing",
+                                                          lost_reason=reason))
+            self._journal(kind="EVENT", derived_from="capture",
+                          event="evidence_unreadable", state=self.state,
+                          vocabulary={"capture_answerable": False,
+                                      "capture_integrity": str(
+                                          evidence.get("capture_integrity") or ""),
+                                      "settlement_record_present":
+                                          evidence["settlement_record"] is not None,
+                                      "exit_proven": bool(evidence["exit_proven"]),
+                                      "detail": "the capture refuses to answer the "
+                                                "completion question; any settlement "
+                                                "record it holds is not evidence"})
+            return {"state": "LOST", "evidence": evidence,
+                    "lost_reason": disposition["lost_reason"]}
         if evidence["settlement_record"] is not None and evidence["exit_proven"]:
             verdict = self.driver.completion_verdict(evidence["settlement_record"],
                                                     exit_status=evidence["exit_status"])
@@ -1378,17 +1425,6 @@ class StandaloneSession:
             return {"state": "LOST", "evidence": evidence,
                     "lost_reason": lifecycle.resolve_unknown(
                         "exit_status_absent")["lost_reason"], "verdict": verdict}
-        if not evidence["capture_answerable"]:
-            # The capture's OWN reason: `capture_truncated` for a bounded transcript,
-            # `evidence_unreadable` for one whose integrity metadata disagrees with its
-            # bytes (finding 4).  Both are members of the closed `LOST_REASONS`.
-            reason = str(evidence.get("lost_reason") or "capture_truncated")
-            disposition = (lifecycle.resolve_unknown("capture_truncated")
-                           if reason == "capture_truncated"
-                           else lifecycle.resolve_unknown("required_evidence_missing",
-                                                          lost_reason=reason))
-            return {"state": "LOST", "evidence": evidence,
-                    "lost_reason": disposition["lost_reason"]}
         if evidence["settlement_record"] is None and evidence["exit_proven"]:
             # The process ended and produced no declared result record.  Its exit status is
             # the only thing left, and an unmapped code is LOST -- never `exited{0}`.

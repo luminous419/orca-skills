@@ -875,8 +875,12 @@ class F08DirectoryFsyncTests(unittest.TestCase):
             return real_fsync(fd)
         os.open, os.fsync = spy_open, spy_fsync
         try:
-            target = launcher.persist_standalone_profile(base, "run_f8", {"driver": "claude"})
-            launcher.persist_standalone_profile(base, "run_f8", {"driver": "codex"})
+            # Frozen (absolute-worktree) specs: the write door refuses an omitted worktree
+            # since round-8 item 3, and this case is about the fsync discipline alone.
+            target = launcher.persist_standalone_profile(
+                base, "run_f8", {"driver": "claude", "worktree": str(base)})
+            launcher.persist_standalone_profile(
+                base, "run_f8", {"driver": "codex", "worktree": str(base)})
             authority = launcher.persist_standalone_authority(
                 base, "run_f8", runtime_state_path=base / "ledger.json")
         finally:

@@ -291,6 +291,18 @@ qualified "at the pinned revision".
   unreadable or does not hash to its digest is the typed refusal
   `STANDALONE_PROMPT_COMPOSITION_MISSING`; a launch that named no objective persists an
   explicit `composer: none` declaration and is honoured as such.
+* **A legacy authority upgrade never INVENTS a composition** (round-8 item 4).  A pre-fix
+  run that persisted no composition is ambiguous -- the launch may have composed the
+  production prompt from an objective without recording it -- so the automatic upgrade of
+  its legacy (`thread_id: ""`, no composition digest) authority fails closed with
+  `STANDALONE_PROMPT_COMPOSITION_MISSING` on resume, recover and watchdog alike, bytes
+  untouched, and never infers `composer: none`.  The remedy is the explicit, audited
+  `run_workflow.py migrate-standalone-prompt-composition --run-id ... --state <launch
+  state> --objective <launch objective> [--project-root ...] --actor-id ... --reason ...`
+  (or `--composer-none` to declare, attributably, that the launch delivered the canonical
+  intent), which persists the supplied composition, upgrades the authority under the
+  migration lock and journals `composition_source: audited_migration` with actor and
+  reason.
 * **Durable thread evidence is a TRI-STATE** (round-7 blocker 3).
   `durable_thread_evidence` reports `present` / `proven_absent` / `unreadable`, never a bare
   string.  An unreadable or corrupt pause store or checkpoint is `STANDALONE_THREAD_EVIDENCE_UNREADABLE`
@@ -326,6 +338,49 @@ qualified "at the pinned revision".
   archive (written by the pre-fix model) with `STANDALONE_PROFILE_WORKTREE_UNFROZEN`
   rather than re-interpreting its bytes against a new cwd; such a run is recovered only
   through the explicit, audited migration naming the launch-time absolute worktree.
+* **An OMITTED profile worktree is frozen to the launch cwd** (round-8 item 3).  A profile
+  that names no `worktree` (or an empty one) used to reach the runtime empty, which the
+  session reads as "this process's cwd" -- the launcher's at launch and the RECOVERING
+  process's on resume / watchdog recovery, so a run launched in A and recovered from B
+  sent its next agents to B.  `freeze_profile_worktree` now binds an omitted worktree to
+  the launching process's absolute cwd at the same composition door, with the same digest
+  consequences (same cwd: exact-match restart; another cwd: `STANDALONE_AUTHORITY_CONFLICT`);
+  the write door refuses an unfrozen (relative OR omitted) spec and the read door refuses a
+  legacy empty archive by name, recovered only through `migrate-standalone-profile` naming
+  the launch cwd.
+* **Profile-migration attempts have their own identity and reconcile over VALID state**
+  (round-8 items 7 / 8).  Every migration record carries an `attempt` ordinal beside the
+  operation's `migration_id`, so a retry after a rolled-back attempt is reconciled on its
+  own state: the per-attempt invariant is exactly one `prepared` and at most one terminal
+  record per `(migration_id, attempt)`, and at most one `committed` per id; a legacy
+  attempt-less log is assigned attempts positionally.  Reconciliation reads the authority
+  through the validated loader (an unreadable authority PROPAGATES as its typed refusal,
+  never collapses to a rollback), rolls forward only after the target archive loads through
+  the production loader (digest AND profile schema), rolls back only with positive proof
+  that the authority still names the attempt's source digest, and refuses anything else as
+  `STANDALONE_MIGRATION_UNRECONCILABLE` with the attempt left open.
+* **Unanswerable capture never settles** (round-8 item 2).  `await_completion` asks the
+  capture whether it can answer BEFORE it looks at any settlement record: a parsed record
+  inside a truncated, forged (`unverified_tail`), digest-mismatching or meta-less capture is
+  not evidence, and the dispatch takes the capture's own typed LOST reason
+  (`capture_truncated` / `evidence_unreadable`) into a typed FAILED settlement (a Reviewer:
+  `REVIEWER_RUNTIME_FAILURE`, nothing settled) -- never `COMPLETED`, in the ledger or the
+  journal.
+* **The standalone `lookup()` answer IS a receipt** (round-8 item 1): exactly the closed
+  key set `runtime_state.RECEIPT_KEYS`, every value a non-empty string, the task and
+  dispatch identities derived by the same functions the supervising session derives them
+  with -- so the spawn-record-before-receipt crash window is collected through
+  `executor._recover -> record_receipt -> resume`, never refused as a corrupt ledger.
+* **Structured streams split on `\n` only** (round-8 item 5): every NDJSON reader (the
+  capture's `structured_lines`, the journal, the migration and upgrade audit logs, the
+  `ps` table) uses `standalone_capture.protocol_lines`; U+2028 / U+2029 / U+0085 inside a
+  JSON string never split a record, and `\r\n` delimits exactly like `\n`.
+* **G2 re-checks the fenced exit proof** (round-8 item 6): a process that exits between the
+  last rung-2 probe and the G2 read is `interrupted_confirmed` (INTERRUPTED), not an
+  ownership refusal, and no SIGKILL is sent.
+* **The credential seed is 0600 from its first byte** (round-8 item 9): the seed is written
+  to a temp opened `O_CREAT|O_EXCL|O_WRONLY, 0o600` in the destination directory
+  (umask-independent), `fsync`ed and atomically renamed -- never copied then `chmod`ed.
 * **`project_root` reaches the standalone quality gate** (round-7 item 7).
   `build_standalone_prompt_composer(project_root=...)` resolves `.orca/quality-profile.yaml`
   under that root into every dispatch's quality gate block -- absent renders the absent

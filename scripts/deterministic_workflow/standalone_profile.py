@@ -806,8 +806,11 @@ def profile_from_mapping(spec: Any) -> StandaloneProfile:
     # showed up on only one of the two installed CLIs.)  Resolving here, at the ONE door
     # every launch and every recovery passes, makes the cwd and every worktree-derived flag
     # name the SAME absolute directory, so the double-application cannot happen.  The
-    # profile DIGEST is not computed from this object; an empty worktree stays empty (the
-    # session's own ``os.getcwd()`` default, unchanged).
+    # profile DIGEST is not computed from this object; an empty worktree stays empty HERE
+    # (the session's own ``os.getcwd()`` default) -- and since round-8 item 3 the launcher
+    # freezes an omitted worktree to the launch cwd BEFORE it is digested and archived, so
+    # no persisted profile ever reaches this door empty (the write and read doors refuse
+    # one, `launcher.profile_unfrozen_paths`).
     #
     # Final-Review iteration 5, B1.  Resolving HERE was not durable: the archive a
     # run/thread authority binds held the RAW relative string, and a recovery started from

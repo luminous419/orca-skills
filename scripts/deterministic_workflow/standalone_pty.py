@@ -289,7 +289,9 @@ def read_process_table(tty: str, *,
         # EMPTY answer.  Any other status means the read itself failed.
         return {"tty": tty, "captured_at": captured_at, "rows": (), "readable": False}
     rows: list[ProcessRow] = []
-    for line in text.splitlines():
+    # Round-8 item 5: `ps` delimits rows with "\n"; split on that alone (the same
+    # protocol-delimiter rule every structured reader follows).
+    for line in capture_mod.protocol_lines(text):
         if not line.strip():
             continue
         match = _PS_LINE.match(line)

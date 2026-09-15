@@ -29,6 +29,12 @@ no ``wt``).  Both cwds, the archived worktree the launch bound and the worktree 
 recovered runtime composed are recorded in the evidence, so the recovery is proven to rebuild
 the LAUNCH-time absolute worktree and never ``<recovery_cwd>/wt``.
 
+Round-8 item 3 (omitted worktree): with ``--worktree omitted`` the profile names NO
+worktree at all; the launch runs from ``<out>/launch_cwd`` (which the frozen profile then
+binds as the absolute worktree) and the recovery from ``<out>/recovery_cwd``.  The evidence
+records that the archived, launch-time and recovered worktrees are all ``launch_cwd`` and
+that the recovery process never ran an agent in its own cwd.
+
 `orca` is removed from PATH and every `ORCA_*` name stripped, asserted with a raise, in both
 the launch subprocess and the recovery process.  For `--cli codex` the run-scoped
 `CODEX_HOME` is seeded 0600 from `~/.codex/auth.json` by the production preflight; the seed
@@ -73,6 +79,16 @@ def _graph_agent_bin() -> str:
 
 def build_profile(cli: str, worktree: str, *, codex_home: str = "",
                   launch_cwd: str = ".") -> dict[str, Any]:
+    """``worktree=""`` builds a profile that OMITS the worktree key entirely (round-8
+    item 3); the launch composition then freezes it to the launch cwd."""
+    profile = _build_profile(cli, worktree, codex_home=codex_home, launch_cwd=launch_cwd)
+    if not worktree:
+        profile.pop("worktree", None)
+    return profile
+
+
+def _build_profile(cli: str, worktree: str, *, codex_home: str = "",
+                   launch_cwd: str = ".") -> dict[str, Any]:
     if cli == "fixture":
         return {
             "driver": "claude", "binary": "os37-graph-agent",
@@ -100,7 +116,7 @@ def build_profile(cli: str, worktree: str, *, codex_home: str = "",
         # the profile's own `worktree` stays the relative spec under test.
         return profile_document(claude_profile(
             worktree, extra_args=("--strict-mcp-config", "--add-dir",
-                                  os.path.abspath(os.path.join(launch_cwd, worktree)))))
+                                  os.path.abspath(os.path.join(launch_cwd, worktree or ".")))))
     if cli == "codex":
         return profile_document(codex_profile(worktree, codex_home))
     raise SystemExit(f"unknown --cli {cli!r}")
@@ -161,7 +177,8 @@ def _run_launch_child(cfg: dict[str, Any]) -> int:
     # Iteration 5 (B1): the launch process's own account of where it ran and what it froze.
     Path(cfg["launch_facts"]).write_text(json.dumps({
         "launch_cwd": os.getcwd(),
-        "profile_worktree_spec": profile.get("worktree", ""),
+        "profile_worktree_spec": profile.get("worktree", "<omitted>"),
+        "profile_worktree_omitted": "worktree" not in profile,
         "launch_worktree": adapter.runtime.profile.worktree,
     }, indent=2))
     final = launcher.execute_state(
@@ -222,7 +239,7 @@ def _journal_delivery_digests(base: Path, run_id: str) -> dict[str, str]:
     out: dict[str, str] = {}
     if not path.exists():
         return out
-    for line in path.read_text().splitlines():
+    for line in path.read_text().split("\n"):          # the protocol delimiter only
         line = line.strip()
         if not line:
             continue
@@ -241,7 +258,7 @@ def _settlement_shape(base: Path, run_id: str) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     if not path.exists():
         return out
-    for line in path.read_text().splitlines():
+    for line in path.read_text().split("\n"):          # the protocol delimiter only
         line = line.strip()
         if not line:
             continue
@@ -295,7 +312,8 @@ def _sio():
 
 
 # ---- the orchestration ------------------------------------------------------------------
-def run(out_dir: Path, cli: str, *, timeout_s: float = 2400.0) -> dict[str, Any]:
+def run(out_dir: Path, cli: str, *, timeout_s: float = 2400.0,
+        worktree_mode: str = "relative") -> dict[str, Any]:
     # ABSOLUTE, so the worktree and every derived path name one directory regardless of the
     # process cwd -- the launch subprocess and the in-process recovery resolve identically.
     # (The production runtime also resolves a relative worktree now; this keeps the harness's
@@ -307,8 +325,9 @@ def run(out_dir: Path, cli: str, *, timeout_s: float = 2400.0) -> dict[str, Any]
     # `launch_cwd` (which holds it) and the recovery from `recovery_cwd` (which does not).
     launch_cwd = out_dir / "launch_cwd"
     recovery_cwd = out_dir / "recovery_cwd"
-    worktree_spec = "wt"
-    worktree = launch_cwd / worktree_spec
+    # Round-8 item 3: `omitted` names NO worktree; the launch cwd IS the worktree.
+    worktree_spec = "wt" if worktree_mode == "relative" else ""
+    worktree = launch_cwd / worktree_spec if worktree_spec else launch_cwd
     launch_dump = out_dir / "launch_delivered"
     recover_dump = out_dir / "recover_delivered"
     for path in (base, worktree, recovery_cwd, launch_dump, recover_dump):
@@ -454,6 +473,8 @@ def run(out_dir: Path, cli: str, *, timeout_s: float = 2400.0) -> dict[str, Any]
     record: dict[str, Any] = {
         "cli": cli,
         "outcome": "ran",
+        "worktree_mode": worktree_mode,
+        "profile_worktree_omitted": bool(launch_facts.get("profile_worktree_omitted")),
         "orca_free": precondition,
         # Iteration 5 (B1): the two cwds and what each process made of the worktree.
         "launch_cwd": str(launch_facts.get("launch_cwd") or ""),
@@ -464,7 +485,8 @@ def run(out_dir: Path, cli: str, *, timeout_s: float = 2400.0) -> dict[str, Any]
         "recovered_worktree": str(recover_facts.get("recovered_worktree") or ""),
         "recovered_cwd_flag": str(recover_facts.get("recovered_cwd_flag") or ""),
         "recovered_argv_cwd_flags": recover_facts.get("recovered_argv_cwd_flags"),
-        "recovery_cwd_worktree_exists": (recovery_cwd / worktree_spec).exists(),
+        "recovery_cwd_worktree_exists": ((recovery_cwd / worktree_spec).exists()
+                                         if worktree_spec else None),
         "recovery_process": "separate watchdog subprocess (recover verb)",
         "launch_worker_settled": bool(launch_settlements),
         "crash": "SIGKILL after APPLY_RESULT of Worker i1 (real supervisor subprocess)",
@@ -479,14 +501,19 @@ def run(out_dir: Path, cli: str, *, timeout_s: float = 2400.0) -> dict[str, Any]
         "correction_prompt_carries_objective_and_instruction": correction_carries,
         "loop_shape": final_shape,
     }
+    expected_worktree = (os.path.join(record["launch_cwd"], worktree_spec)
+                         if worktree_spec else record["launch_cwd"])
+    record["expected_worktree"] = expected_worktree
     record["worktree_durable_across_cwds"] = bool(
         launch_worktree and os.path.isabs(launch_worktree)
         and record["launch_cwd"] and record["recovery_cwd"]
         and record["launch_cwd"] != record["recovery_cwd"]
+        and launch_worktree == expected_worktree
         and record["archived_worktree"] == launch_worktree
         and record["recovered_worktree"] == launch_worktree
         and record["recovered_cwd_flag"] == launch_worktree
-        and not record["recovery_cwd_worktree_exists"])
+        and not record["recovery_cwd_worktree_exists"]
+        and (worktree_mode == "relative" or record["profile_worktree_omitted"]))
     record["recovery_prompt_established"] = bool(
         code == 0 and summary.get("status") == "RECOVERED"
         and record["terminal_status_after_recover"] == "COMPLETED"
@@ -507,8 +534,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("out_dir")
     parser.add_argument("--cli", default="fixture", choices=("fixture", "claude", "codex"))
     parser.add_argument("--timeout-s", type=float, default=2400.0)
+    parser.add_argument("--worktree", default="relative", choices=("relative", "omitted"),
+                        help="relative: the profile names the relative worktree `wt`; "
+                             "omitted: the profile names NO worktree (round-8 item 3)")
     ns = parser.parse_args(args)
-    record = run(Path(ns.out_dir), ns.cli, timeout_s=ns.timeout_s)
+    record = run(Path(ns.out_dir), ns.cli, timeout_s=ns.timeout_s,
+                 worktree_mode=ns.worktree)
     (Path(ns.out_dir) / "RECOVERY_PROMPT_EVIDENCE.json").write_text(
         json.dumps(record, indent=2, default=str))
     print(json.dumps(record, indent=2, default=str))

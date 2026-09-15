@@ -135,6 +135,17 @@ case "${OS37_STUB_MODE:-ready}" in
                      fi
                      printf '```\n'
                      exit 0 ;;
+  agent-linger)      # Readiness, the prompt frame, the turn start and the CONJUNCTIVE
+                     # delivery proof -- exactly as `agent` -- and then NO result record of
+                     # its own: it lingers `OS37_STUB_LINGER_S` seconds and exits 0, so the
+                     # exit sentinel is real.  Round-8 item 2's fixture: the only settlement
+                     # record such a capture can ever hold is one a STRANGER wrote into it
+                     # past the declared length, and that must never settle COMPLETED.
+                     printf '{"type":"system","session_id":"%s"}\n' "$SESSION_ID"
+                     IFS= read -r _PROMPT || _PROMPT=""
+                     printf '{"type":"message_start"}\n'
+                     printf '{"type":"assistant","session_id":"%s","request_id":"req_stub_linger_1","message":{"model":"stub-agent-model-1","id":"msg_stub_linger_1","usage":{"input_tokens":2,"output_tokens":1}}}\n' "$SESSION_ID"
+                     sleep "${OS37_STUB_LINGER_S:-4}"; exit 0 ;;
   alive)             # A live child that emits NOTHING.  The interrupt ladder's fixture: it
                      # must be interruptible without ever having produced a readiness or a
                      # completion record, because the ladder does not depend on either.

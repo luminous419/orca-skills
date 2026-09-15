@@ -246,12 +246,20 @@ def profile_archive_path(artifact_base: Any, run_id: str, digest: str) -> Path:
 
 
 def profile_unfrozen_paths(profile_spec: Mapping[str, Any]) -> tuple[str, ...]:
-    """The launch-relative directory fields of a profile spec that are still RELATIVE:
-    ``worktree`` and each ``add_dirs[i]``.  Empty means the spec is frozen -- every
-    directory it names is absolute and so means the same directory in every process."""
+    """The launch-relative directory fields of a profile spec that are still UNFROZEN:
+    a ``worktree`` that is RELATIVE **or OMITTED / EMPTY** (round-8 item 3), and each
+    relative ``add_dirs[i]``.  Empty means the spec is frozen -- every directory it names
+    is absolute and so means the same directory in every process.
+
+    An omitted worktree is unfrozen for the same reason a relative one is: the runtime
+    reads it as "this process's cwd" (`StandaloneSession.worktree_path` defaults to
+    ``os.getcwd()``), which is the launching process's directory at launch and the
+    RECOVERING process's directory on resume / watchdog recovery -- so a run launched in A
+    and recovered from B silently sent its next agents to B.  Only an ABSOLUTE worktree
+    means one directory everywhere."""
     out: list[str] = []
     worktree = profile_spec.get("worktree", "")
-    if isinstance(worktree, str) and worktree and not os.path.isabs(worktree):
+    if not (isinstance(worktree, str) and worktree and os.path.isabs(worktree)):
         out.append("worktree")
     add_dirs = profile_spec.get("add_dirs") or ()
     if isinstance(add_dirs, (list, tuple)):
@@ -279,7 +287,17 @@ def freeze_profile_worktree(profile_spec: Mapping[str, Any], *,
     ``launch_base`` is the directory a relative path is resolved against; ``None`` means
     this process's cwd, which is what the operator's relative path means at launch.  An
     absolute path is returned BYTE-UNCHANGED (no normalisation), so a spec that already
-    names absolute directories has the same digest it always had.  Empty stays empty.
+    names absolute directories has the same digest it always had.
+
+    **An OMITTED / EMPTY worktree is frozen to ``launch_base`` itself (round-8 item 3).**
+    The runtime reads an empty worktree as "this process's cwd", and the archive is read
+    by a DIFFERENT process on resume / watchdog recovery -- so a run launched in A and
+    recovered from B rebuilt a runtime whose agents ran in B.  The launch cwd is what the
+    operator meant, so that is what is persisted: absolute, bound into the digest, and
+    never re-interpreted.  The digest consequences are the same as for a relative path:
+    the same profile relaunched from the launch cwd is an exact-match restart, from
+    another cwd it is a different worktree and the typed ``STANDALONE_AUTHORITY_CONFLICT``.
+    An empty ``add_dirs`` entry is left alone -- it names no directory to freeze.
 
     **The create-once digest is computed over the FROZEN mapping.**  That is safe -- and
     is the point -- because the digest names the launch conditions the run actually
@@ -290,11 +308,15 @@ def freeze_profile_worktree(profile_spec: Mapping[str, Any], *,
     """
     frozen = dict(profile_spec)
     base = os.fspath(launch_base) if launch_base is not None else os.getcwd()
+    if not os.path.isabs(base):
+        base = os.path.abspath(base)
 
     def _absolute(directory: str) -> str:
         return os.path.normpath(os.path.join(base, directory))
     worktree = frozen.get("worktree", "")
-    if isinstance(worktree, str) and worktree and not os.path.isabs(worktree):
+    if not isinstance(worktree, str) or not worktree:
+        frozen["worktree"] = base                        # omitted: the launch cwd itself
+    elif not os.path.isabs(worktree):
         frozen["worktree"] = _absolute(worktree)
     add_dirs = frozen.get("add_dirs")
     if isinstance(add_dirs, (list, tuple)):
@@ -314,15 +336,16 @@ def _refuse_unfrozen_profile(profile_spec: Mapping[str, Any], *, where: str,
         values = []
         for field in unfrozen:
             if field == "worktree":
-                values.append(f"worktree={profile_spec.get('worktree')!r}")
+                values.append(f"worktree={profile_spec.get('worktree', '<omitted>')!r}")
             else:
                 index = int(field[len("add_dirs["):-1])
                 values.append(f"{field}={profile_spec['add_dirs'][index]!r}")
         raise LauncherError(
-            f"{STANDALONE_PROFILE_WORKTREE_UNFROZEN}: {where} names a RELATIVE directory "
-            f"({', '.join(values)}); a relative directory means one thing in the launching "
-            "process and another in any recovery process, so it is refused rather than "
-            f"re-interpreted against this process's cwd {os.getcwd()!r}; {remedy}")
+            f"{STANDALONE_PROFILE_WORKTREE_UNFROZEN}: {where} names a RELATIVE or OMITTED "
+            f"directory ({', '.join(values)}); such a directory means one thing in the "
+            "launching process (its cwd) and another in any recovery process, so it is "
+            "refused rather than re-interpreted against this process's cwd "
+            f"{os.getcwd()!r}; {remedy}")
 
 
 def persist_standalone_profile(artifact_base: Any, run_id: str,
@@ -492,6 +515,12 @@ THREAD_EVIDENCE_UNREADABLE = "unreadable"
 MIGRATION_PREPARED = "prepared"
 MIGRATION_COMMITTED = "committed"
 MIGRATION_ROLLED_BACK = "rolled_back"
+#: Round-8 item 8.  Reconciliation of an interrupted migration could not be decided from
+#: valid durable state: the authority names neither the attempt's source nor its target
+#: digest, the target's profile archive is missing / corrupt / not a profile, or the
+#: authority record is absent.  Nothing is appended; the attempt stays open and every
+#: authority read refuses by this name until the durable state is repaired.
+STANDALONE_MIGRATION_UNRECONCILABLE = "STANDALONE_MIGRATION_UNRECONCILABLE"
 
 
 def _safe_stem(value: str) -> str:
@@ -832,12 +861,59 @@ def read_authority_upgrades(artifact_base: Any, run_id: str) -> tuple[dict[str, 
     path = _authority_upgrade_log_path(artifact_base, run_id)
     if not path.exists():
         return ()
+    from .standalone_capture import protocol_lines
     out: list[dict[str, Any]] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in protocol_lines(path.read_text(encoding="utf-8")):
         line = line.strip()
         if line:
             out.append(json.loads(line))
     return tuple(out)
+
+
+def _legacy_authority_under_lock(artifact_base: Any, run_id: str
+                                 ) -> tuple[dict[str, Any] | None, DurableThreadEvidence | None]:
+    """The legacy omitted-thread authority record AND the durable evidence that proves it
+    launched as ``launcher`` -- or ``(None, None)`` when the primary file is absent /
+    unreadable / not the legacy shape / already upgraded, or when the evidence is absent
+    / unreadable / another thread (each of those stays refused downstream by name; none
+    is upgraded).  The CALLER holds the migration lock."""
+    primary = standalone_authority_path(artifact_base, run_id, "")
+    try:
+        record = json.loads(primary.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None, None
+    if not _is_legacy_omitted_thread_authority(record, run_id):
+        return None, None
+    evidence = durable_thread_evidence(artifact_base, run_id)
+    if evidence.kind != THREAD_EVIDENCE_PRESENT or evidence.thread_id != DEFAULT_THREAD_ID:
+        return None, None
+    return record, evidence
+
+
+def _write_upgraded_legacy_authority(artifact_base: Any, run_id: str, record: Mapping[str, Any],
+                                     composition: Mapping[str, Any],
+                                     evidence: DurableThreadEvidence, *,
+                                     composition_source: str, actor: str = "",
+                                     reason: str = "") -> dict[str, Any]:
+    """Atomically rewrite the legacy authority as the effective identity bound to
+    ``composition``'s digest, and journal the act.  The CALLER holds the lock and has
+    already persisted the composition it binds."""
+    primary = standalone_authority_path(artifact_base, run_id, "")
+    upgraded = dict(record)
+    upgraded["thread_id"] = DEFAULT_THREAD_ID
+    upgraded["prompt_composition_digest"] = prompt_composition_digest(composition)
+    _durable_write(primary, json.dumps(upgraded, sort_keys=True, indent=2) + "\n")
+    audit = {"schema": STANDALONE_AUTHORITY_UPGRADE_SCHEMA, "run_id": run_id,
+             "from_thread_id": "", "to_thread_id": DEFAULT_THREAD_ID,
+             "bound_prompt_composition_digest": upgraded["prompt_composition_digest"],
+             "bound_prompt_composer": str(composition.get("composer") or ""),
+             "composition_source": composition_source,
+             "actor": str(actor), "reason": str(reason),
+             "durable_evidence_source": evidence["source"],
+             "recorded_at": _authority_now()}
+    _durable_append(_authority_upgrade_log_path(artifact_base, run_id),
+                    json.dumps(audit, sort_keys=True) + "\n")
+    return audit
 
 
 def _upgrade_legacy_authority_if_needed(artifact_base: Any, run_id: str,
@@ -854,10 +930,19 @@ def _upgrade_legacy_authority_if_needed(artifact_base: Any, run_id: str,
       record untouched (still refused downstream) -- no blanket acceptance of empty-thread
       authorities, which would reopen the foreign-authority bypass.
     * The now-required prompt-composition binding is recovered from the run's persisted
-      composition when one exists; a legacy run that persisted none delivered the canonical
-      intent payload, so a ``composer: none`` composition is the faithful reconstruction and
-      is persisted and bound.  A persisted composition that is present-but-unreadable
-      propagates the item-2 typed :data:`STANDALONE_PROMPT_COMPOSITION_MISSING` refusal.
+      composition.  **A legacy run that persisted NONE is REFUSED (round-8 item 4)**: the
+      pre-fix launcher could compose the production prompt from an objective without
+      persisting anything, so "no composition on disk" is AMBIGUOUS between "the launch
+      delivered the canonical intent" and "the launch delivered the objective / role /
+      output-contract prompt and never recorded it".  Inferring ``composer: none`` here
+      silently downgraded every later dispatch of such a run to raw ``ActionIntent``
+      JSON.  The upgrade now fails closed with the typed
+      :data:`STANDALONE_PROMPT_COMPOSITION_MISSING` naming the remedy -- the explicit,
+      audited :func:`migrate_standalone_prompt_composition` (CLI
+      ``migrate-standalone-prompt-composition``), through which an operator SUPPLIES the
+      composition (or declares ``composer: none`` deliberately, attributed and reasoned).
+      A persisted composition that is present-but-unreadable propagates the same typed
+      refusal.
     * The rewrite is atomic (``_durable_write``) and the act is journalled idempotently.
     """
     primary = standalone_authority_path(artifact_base, run_id, "")
@@ -870,34 +955,83 @@ def _upgrade_legacy_authority_if_needed(artifact_base: Any, run_id: str,
     if not _is_legacy_omitted_thread_authority(record, run_id):
         return
     with _MigrationLock(artifact_base, run_id):
-        try:
-            record = json.loads(primary.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return
-        if not _is_legacy_omitted_thread_authority(record, run_id):
-            return                                       # already upgraded by a racer
-        evidence = durable_thread_evidence(artifact_base, run_id)
-        if evidence.kind != THREAD_EVIDENCE_PRESENT or evidence.thread_id != DEFAULT_THREAD_ID:
-            # Absent / unreadable / another thread: NOT the legacy `launcher` case.  Leave
-            # it refused -- upgrading it would be the foreign-authority bypass.
-            return
-        # Recover the composition binding, or refuse by the item-2 typed reason.
+        record, evidence = _legacy_authority_under_lock(artifact_base, run_id)
+        if record is None or evidence is None:
+            return                                       # upgraded by a racer / not the case
         composition = load_standalone_prompt_composition(artifact_base, run_id)
         if composition is None:
-            composition = prompt_composition_record(None)   # legacy raw-intent default
-            persist_standalone_prompt_composition(artifact_base, run_id, composition)
-        upgraded = dict(record)
-        upgraded["thread_id"] = DEFAULT_THREAD_ID
-        upgraded["prompt_composition_digest"] = prompt_composition_digest(composition)
-        _durable_write(primary, json.dumps(upgraded, sort_keys=True, indent=2) + "\n")
-        _durable_append(_authority_upgrade_log_path(artifact_base, run_id),
-                        json.dumps({"schema": STANDALONE_AUTHORITY_UPGRADE_SCHEMA,
-                                    "run_id": run_id,
-                                    "from_thread_id": "", "to_thread_id": DEFAULT_THREAD_ID,
-                                    "bound_prompt_composition_digest":
-                                        upgraded["prompt_composition_digest"],
-                                    "durable_evidence_source": evidence["source"],
-                                    "recorded_at": _authority_now()}, sort_keys=True) + "\n")
+            raise LauncherError(
+                f"{STANDALONE_PROMPT_COMPOSITION_MISSING}: run {run_id!r} carries a legacy "
+                "(pre-fix) launch authority and persisted NO prompt composition, so whether "
+                "its launch delivered the production prompt (objective / role / output "
+                "contract) or the canonical intent cannot be known from its durable state; "
+                "the upgrade refuses rather than infer `composer: none` and dispatch raw "
+                "ActionIntent JSON.  Supply the composition by the audited migration: "
+                "`run_workflow.py migrate-standalone-prompt-composition --run-id "
+                f"{run_id} --artifact-base ... --state <the launch state JSON> "
+                "--objective <the launch objective> [--project-root ...] --actor-id ... "
+                "--reason ...` (or `--composer-none` to declare, attributably, that the "
+                "launch delivered the canonical intent), then recover it")
+        _write_upgraded_legacy_authority(artifact_base, run_id, record, composition,
+                                         evidence, composition_source="persisted")
+
+
+def migrate_standalone_prompt_composition(artifact_base: Any, run_id: str, *,
+                                          composition: Mapping[str, Any], actor: str,
+                                          reason: str) -> dict[str, Any]:
+    """The ONE sanctioned, audited way to SUPPLY the prompt composition of a legacy
+    (pre-fix) run that persisted none -- round-8 item 4's remedy.
+
+    Under the run's inter-process migration lock: the primary authority must be the
+    exact legacy omitted-thread shape whose durable evidence proves ``launcher`` (the
+    same gate the automatic upgrade applies; anything else is refused by name -- an
+    already-bound run is never re-bound here, a foreign / unproven one never accepted).
+    The supplied composition record is validated, persisted content-addressed, and the
+    authority is atomically upgraded to the effective identity bound to its digest; the
+    audit row names the actor, the reason and ``composition_source: audited_migration``.
+    Replaying the identical migration (same digest, actor, reason) on the already-
+    upgraded run returns the recorded audit row and writes nothing.
+    """
+    if not str(actor).strip() or not str(reason).strip():
+        raise LauncherError(
+            f"{STANDALONE_MIGRATION_REFUSED}: a prompt-composition migration requires a "
+            "non-empty --actor-id and --reason; an unattributable binding is not an "
+            "audited act")
+    if (not isinstance(composition, Mapping)
+            or composition.get("schema") != STANDALONE_PROMPT_COMPOSITION_SCHEMA
+            or composition.get("composer") not in (PROMPT_COMPOSER_PRODUCTION,
+                                                   PROMPT_COMPOSER_NONE)
+            or (composition.get("composer") == PROMPT_COMPOSER_PRODUCTION
+                and not str(composition.get("objective") or ""))):
+        raise LauncherError(
+            f"{STANDALONE_MIGRATION_REFUSED}: the supplied prompt composition is not a "
+            "composition record (schema / composer / objective)")
+    composition = dict(composition)
+    digest = prompt_composition_digest(composition)
+    with _MigrationLock(artifact_base, run_id):
+        record, evidence = _legacy_authority_under_lock(artifact_base, run_id)
+        if record is None or evidence is None:
+            # Idempotent replay: the authority already binds THIS composition through a
+            # recorded upgrade of this actor/reason.
+            for audit in reversed(read_authority_upgrades(artifact_base, run_id)):
+                if (audit.get("bound_prompt_composition_digest") == digest
+                        and audit.get("composition_source") == "audited_migration"
+                        and audit.get("actor") == str(actor)
+                        and audit.get("reason") == str(reason)):
+                    current = _load_authority_validated(artifact_base, run_id,
+                                                        DEFAULT_THREAD_ID)
+                    if (current or {}).get("prompt_composition_digest") == digest:
+                        return dict(audit)
+            raise LauncherError(
+                f"{STANDALONE_MIGRATION_REFUSED}: run {run_id!r} records no legacy "
+                "(pre-fix) launch authority lacking a prompt composition whose durable "
+                "evidence proves the `launcher` thread; a run whose authority already "
+                "binds a composition is never re-bound here, and one whose thread evidence "
+                "is absent, unreadable or another thread's is not accepted")
+        persist_standalone_prompt_composition(artifact_base, run_id, composition)
+        return _write_upgraded_legacy_authority(
+            artifact_base, run_id, record, composition, evidence,
+            composition_source="audited_migration", actor=actor, reason=reason)
 
 
 def check_standalone_authority(artifact_base: Any, run_id: str, *, runtime_state_path: Any,
@@ -1026,11 +1160,12 @@ def load_standalone_profile(artifact_base: Any, run_id: str,
 
 def _refuse_legacy_unfrozen_archive(spec: Mapping[str, Any], run_id: str, digest: str,
                                     archive: Path) -> None:
-    """Iteration 5, B1: the READ door.  An archive holding a relative ``worktree`` /
-    ``add_dirs`` entry was written by the PRE-fix model (the write door refuses one now).
-    Its bytes meant "relative to the launch cwd" and no durable record of that cwd exists
-    for such a run, so NOTHING here may guess: not this process's cwd (the reviewer's
-    ``<tmp>/recovery/wt`` probe) and not any other directory.  The run is recovered only
+    """Iteration 5, B1 / round-8 item 3: the READ door.  An archive holding a relative
+    OR OMITTED ``worktree`` (or a relative ``add_dirs`` entry) was written by the PRE-fix
+    model (the write door refuses one now).  Its bytes meant "the launch cwd" and no
+    durable record of that cwd exists for such a run, so NOTHING here may guess: not this
+    process's cwd (the reviewer's ``<tmp>/recovery/wt`` probe, and the omitted-worktree
+    run recovered from B) and not any other directory.  The run is recovered only
     through the explicit, audited profile migration, which binds the launch-time absolute
     worktree the operator names and leaves the audit trail of who re-bound what and why.
     The refusal is the same on resume, recover, cancel, abandon and watchdog, because all
@@ -1209,8 +1344,9 @@ def read_standalone_migrations(artifact_base: Any, run_id: str,
     path = standalone_migration_log_path(artifact_base, run_id)
     if not path.exists():
         return ()
+    from .standalone_capture import protocol_lines
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
+        lines = protocol_lines(path.read_text(encoding="utf-8"))   # round-8 item 5
     except OSError as exc:
         raise LauncherError(
             f"{STANDALONE_MIGRATION_REFUSED}: the migration audit log at {path} is "
@@ -1259,15 +1395,66 @@ def _migration_id(run_id: str, thread_id: str, old_digest: str, new_digest: str,
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
-def _migration_states_by_id(artifact_base: Any, run_id: str,
-                            thread_id: str) -> dict[str, dict[str, dict[str, Any]]]:
-    """``migration_id -> {state -> record}`` for this run/thread."""
-    grouped: dict[str, dict[str, dict[str, Any]]] = {}
+def _migration_attempt_states(artifact_base: Any, run_id: str, thread_id: str
+                              ) -> dict[tuple[str, int], dict[str, dict[str, Any]]]:
+    """``(migration_id, attempt) -> {state -> record}`` for this run/thread, in log order.
+
+    Round-8 item 7.  The migration id names the OPERATION (source epoch, target, actor,
+    reason); the ``attempt`` ordinal names one TRY of it.  A rolled-back attempt and the
+    retry that follows it share the id and must not share a terminal state: grouping by id
+    alone let a historical ``rolled_back`` make the retry's ``prepared`` look terminal, so
+    a crash after the retry's re-bind left the new authority installed with no committed
+    record, forever.  Every record this tree writes carries ``attempt``; a record written
+    before the field existed is assigned positionally -- each attempt-less ``prepared``
+    opens the next attempt of its id and an attempt-less terminal closes the latest -- so
+    a legacy log reconciles by the same per-attempt rule."""
+    grouped: dict[tuple[str, int], dict[str, dict[str, Any]]] = {}
+    latest: dict[str, int] = {}
     for rec in read_standalone_migrations(artifact_base, run_id, thread_id):
         mid, state = rec.get("migration_id"), rec.get("state")
-        if mid and state:
-            grouped.setdefault(str(mid), {})[str(state)] = rec
+        if not mid or not state:
+            continue
+        mid = str(mid)
+        attempt = rec.get("attempt")
+        if isinstance(attempt, int) and attempt >= 1:
+            latest[mid] = max(latest.get(mid, 0), attempt)
+        elif state == MIGRATION_PREPARED:
+            attempt = latest.get(mid, 0) + 1
+            latest[mid] = attempt
+        else:
+            attempt = latest.get(mid, 1)
+            latest[mid] = attempt
+        grouped.setdefault((mid, int(attempt)), {})[str(state)] = rec
     return grouped
+
+
+def _next_migration_attempt(artifact_base: Any, run_id: str, thread_id: str,
+                            migration_id: str) -> int:
+    """The attempt ordinal a new try of ``migration_id`` records: one past the latest
+    attempt the log holds for it (1 for a first try).  The caller holds the lock."""
+    attempts = [attempt for (mid, attempt) in
+                _migration_attempt_states(artifact_base, run_id, thread_id) if mid == migration_id]
+    return (max(attempts) if attempts else 0) + 1
+
+
+def _validated_profile_archive(artifact_base: Any, run_id: str, digest: str) -> dict[str, Any]:
+    """The content-addressed profile archive ``digest`` names, loaded through the
+    PRODUCTION loader (`load_standalone_profile`: present, hashes to its digest, frozen)
+    AND validated as a profile (`profile_from_mapping`: the schema every launch and
+    recovery applies).  Raises the loader's / schema's typed refusal; never ``None``."""
+    from .standalone_profile import profile_from_mapping
+    spec = load_standalone_profile(artifact_base, run_id, digest=digest)
+    if spec is None:                                     # pragma: no cover - loader raises
+        raise LauncherError(
+            f"{STANDALONE_ADAPTER_REQUIRES_PROFILE}: run {run_id!r} has no profile archive "
+            f"for digest {digest!r}")
+    try:
+        profile_from_mapping(spec)
+    except Exception as exc:  # noqa: BLE001 - a malformed archive is refused by name
+        raise LauncherError(
+            f"{STANDALONE_ADAPTER_REQUIRES_PROFILE}: the profile archive for digest "
+            f"{digest!r} of run {run_id!r} is not a valid profile ({exc})") from exc
+    return spec
 
 
 def _append_migration_record(artifact_base: Any, run_id: str, record: dict[str, Any]) -> None:
@@ -1355,31 +1542,54 @@ def reconcile_standalone_migrations(artifact_base: Any, run_id: str,
 
 def _reconcile_standalone_migrations_locked(artifact_base: Any, run_id: str,
                                             thread_id: str = "") -> None:
-    """The body of :func:`reconcile_standalone_migrations`; the caller HOLDS the lock."""
+    """The body of :func:`reconcile_standalone_migrations`; the caller HOLDS the lock.
+
+    Per ATTEMPT (round-8 item 7), and decided only from VALID durable state (item 8):
+
+    * the authority is read through the validated loader -- an unreadable, malformed or
+      wrong-thread record is its own typed refusal and PROPAGATES (it used to collapse to
+      ``None`` and roll the attempt back with no proof of anything);
+    * authority == the attempt's target digest -> the target archive is loaded through
+      the PRODUCTION loader and validated as a profile; only then ``committed``.  A
+      missing / corrupt / non-profile archive is a typed refusal and the attempt stays
+      open (it used to commit because the file merely existed, after which every profile
+      load of the run refused);
+    * authority == the attempt's SOURCE digest -> POSITIVE proof the re-bind never landed
+      -> ``rolled_back``;
+    * anything else (a third digest, no authority record) is
+      :data:`STANDALONE_MIGRATION_UNRECONCILABLE`.
+    """
     if not standalone_migration_log_path(artifact_base, run_id).exists():
         return
-    for mid, by_state in _migration_states_by_id(artifact_base, run_id, thread_id).items():
+    for (mid, attempt), by_state in _migration_attempt_states(artifact_base, run_id,
+                                                              thread_id).items():
         if MIGRATION_PREPARED not in by_state:
             continue
         if MIGRATION_COMMITTED in by_state or MIGRATION_ROLLED_BACK in by_state:
-            continue                                     # already terminal
+            continue                                     # this attempt is terminal
         prepared = by_state[MIGRATION_PREPARED]
         thread = str(prepared.get("thread_id") or "")
+        old_digest = str(prepared.get("old_profile_digest") or "")
         new_digest = str(prepared.get("new_profile_digest") or "")
-        try:
-            current = _load_authority_validated(artifact_base, run_id, thread)
-        except LauncherError:
-            current = None                               # broken authority: cannot roll fwd
+        current = _load_authority_validated(artifact_base, run_id, thread)  # typed refusal
         current_digest = str((current or {}).get("profile_digest") or "")
-        archive_ok = (bool(new_digest)
-                      and profile_archive_path(artifact_base, run_id, new_digest).exists())
         terminal = dict(prepared)
-        if current_digest == new_digest and current_digest and archive_ok:
-            terminal["state"] = MIGRATION_COMMITTED       # roll forward
-            terminal["reconciled"] = True
+        terminal["attempt"] = attempt
+        terminal["reconciled"] = True
+        if current is not None and current_digest and current_digest == new_digest:
+            _validated_profile_archive(artifact_base, run_id, new_digest)   # typed refusal
+            terminal["state"] = MIGRATION_COMMITTED       # roll forward, over VALID state
+        elif current is not None and current_digest and current_digest == old_digest:
+            terminal["state"] = MIGRATION_ROLLED_BACK     # roll back, with positive proof
         else:
-            terminal["state"] = MIGRATION_ROLLED_BACK     # roll back
-            terminal["reconciled"] = True
+            raise LauncherError(
+                f"{STANDALONE_MIGRATION_UNRECONCILABLE}: run {run_id!r} (thread "
+                f"{thread!r}) has an interrupted profile migration {mid!r} attempt "
+                f"{attempt} from digest {old_digest!r} to {new_digest!r}, but its authority "
+                + ("records no profile binding" if current is None
+                   else f"names digest {current_digest!r}, which is neither")
+                + "; the attempt is left open and recovery is refused rather than "
+                "committed or rolled back over unproven state")
         terminal["recorded_at"] = _authority_now()
         _append_migration_record(artifact_base, run_id, terminal)
 
@@ -1477,7 +1687,12 @@ def _migrate_standalone_profile_locked(artifact_base: Any, run_id: str, *, threa
     # committed record; a rolled-forward one is caught by the replay gate above).
     epoch = len(committed_records)
     mid = _migration_id(run_id, thread_id, old_digest, new_digest, actor, reason, epoch)
+    # Round-8 item 7: this TRY of the operation gets its own attempt ordinal, so a retry
+    # after a rolled-back attempt is reconciled on its own state, never on the history
+    # of the attempt it replaces.
+    attempt = _next_migration_attempt(artifact_base, run_id, thread_id, mid)
     base_record = {"schema": STANDALONE_MIGRATION_SCHEMA, "migration_id": mid,
+                   "attempt": attempt,
                    "run_id": run_id, "thread_id": thread_id, "operation_epoch": epoch,
                    "old_profile_digest": old_digest, "new_profile_digest": new_digest,
                    "actor": str(actor), "reason": str(reason)}
@@ -1753,9 +1968,11 @@ def build_standalone_adapter(spec: dict[str, Any], *, artifact_base: Path,
     # evidence was re-driven through this function, which is exactly why R3 requires it to
     # be.
     #
-    # `or None` keeps the old behaviour for a profile that declares no worktree: the
-    # session then falls back to `os.getcwd()` as before, and nothing about a run that
-    # never named one changes.
+    # Round-8 item 3: a profile that declares NO worktree no longer reaches the runtime
+    # with an empty one -- `freeze_profile_worktree` above bound it to this launching
+    # process's absolute cwd, so the session's `os.getcwd()` fallback is never what a
+    # RECOVERING process reads.  (`build_standalone_runtime` keeps `or None` only for a
+    # direct in-process caller that never persists.)
     runtime = build_standalone_runtime(artifact_base, resolved_run,
                                        runtime_state=runtime_state,
                                        profile_spec=profile_spec, journal=journal)
@@ -2560,7 +2777,7 @@ TURN_VERBS = ("turn-end", "turn-end-hook", "turn-end-bind",
 WATCHDOG_VERBS = ("watchdog", "recover")
 #: Iteration-2 review finding B4.  The explicit, audited profile-migration verb -- the ONE
 #: sanctioned way to change a run/thread's create-once profile binding.
-MIGRATE_VERBS = ("migrate-standalone-profile",)
+MIGRATE_VERBS = ("migrate-standalone-profile", "migrate-standalone-prompt-composition")
 
 
 def build_migrate_parser() -> argparse.ArgumentParser:
@@ -2581,7 +2798,57 @@ def build_migrate_parser() -> argparse.ArgumentParser:
     migrate.add_argument("--reason", required=True,
                          help="why the profile is being migrated (recorded in the audit log)")
     migrate.add_argument("--json", action="store_true")
+    # Round-8 item 4: the audited remedy for a legacy run that persisted no composition.
+    compose = sub.add_parser(
+        "migrate-standalone-prompt-composition",
+        help="supply the prompt composition of a legacy (pre-fix) standalone run that "
+             "persisted none, upgrading its authority under a durable audit record")
+    compose.add_argument("--run-id", required=True)
+    compose.add_argument("--artifact-base", default=".")
+    compose.add_argument("--state", default="",
+                         help="the launch state JSON (phases, risk, role_instructions, "
+                              "objective) the run was launched with")
+    compose.add_argument("--objective", default="",
+                         help="the launch objective; overrides the state file's")
+    compose.add_argument("--project-root", default=None,
+                         help="the project root the launch was composed under "
+                              "(default: the current directory)")
+    compose.add_argument("--composer-none", action="store_true",
+                         help="declare, attributably, that the launch delivered the "
+                              "canonical intent payload (no objective)")
+    compose.add_argument("--actor-id", required=True)
+    compose.add_argument("--reason", required=True)
+    compose.add_argument("--json", action="store_true")
     return parser
+
+
+def _composition_from_migrate_args(args: argparse.Namespace) -> dict[str, Any]:
+    """The composition record a ``migrate-standalone-prompt-composition`` invocation
+    supplies, built by the SAME function the launch builds it with
+    (:func:`prompt_composition_record`), from the same inputs."""
+    if args.composer_none:
+        if args.objective or args.state:
+            raise LauncherError(
+                f"{STANDALONE_MIGRATION_REFUSED}: --composer-none declares the canonical "
+                "intent payload; it cannot be combined with --objective / --state")
+        return prompt_composition_record(None)
+    spec: dict[str, Any] = {}
+    if args.state:
+        loaded = _read_json(args.state, "--state")
+        if not isinstance(loaded, dict):
+            raise LauncherError("state specification must be a JSON object")
+        spec = loaded
+    objective = str(args.objective or spec.get("objective") or "")
+    if not objective:
+        raise LauncherError(
+            f"{STANDALONE_MIGRATION_REFUSED}: a prompt-composition migration must either "
+            "name the launch objective (--objective / the --state file's `objective`) or "
+            "declare --composer-none; a composition cannot be inferred")
+    return prompt_composition_record(
+        objective, requested_phases=tuple(spec.get("phases") or CANONICAL_PHASES),
+        risk=str(spec.get("risk") or "high"),
+        project_root=Path(args.project_root) if args.project_root else Path.cwd(),
+        role_instructions=spec.get("role_instructions"))
 
 
 def run_migrate_cli(argv: list[str]) -> int:
@@ -2589,6 +2856,21 @@ def run_migrate_cli(argv: list[str]) -> int:
     the authority create-once; refuses an unattributable or no-op migration by name."""
     args = build_migrate_parser().parse_args(argv)
     base = Path(args.artifact_base)
+    if args.verb == "migrate-standalone-prompt-composition":
+        try:
+            audit = migrate_standalone_prompt_composition(
+                base, args.run_id, composition=_composition_from_migrate_args(args),
+                actor=args.actor_id, reason=args.reason)
+        except LauncherError as exc:
+            print(f"run_workflow: {exc}", file=sys.stderr)
+            return USAGE_EXIT_CODE
+        if args.json:
+            print(json.dumps(audit, sort_keys=True, ensure_ascii=False))
+        else:
+            print(f"run={args.run_id} bound prompt composition "
+                  f"{audit['bound_prompt_composition_digest']} "
+                  f"(composer={audit['bound_prompt_composer']}) by {audit['actor']}")
+        return 0
     try:
         new_profile = _read_json(args.standalone_profile, "--standalone-profile")
         if not isinstance(new_profile, dict):

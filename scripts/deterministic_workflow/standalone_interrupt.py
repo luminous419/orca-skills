@@ -5,7 +5,8 @@
     r0  optional in-band graceful hint          <- never evidence of death
     r1  GRACEFUL: SIGTERM, group-scoped only where ownership is provable
     r2  BOUNDED WAIT, re-checking ownership AND mode AT FIRE TIME
-    G2  IDENTITY RE-VERIFICATION #2  --fail-->  "exit_unproven"      (rung 1 delivered)
+    G2  FENCED EXIT PROOF first      --proven--> "interrupted_confirmed" (exited after r2)
+        IDENTITY RE-VERIFICATION #2  --fail-->  "exit_unproven"      (rung 1 delivered)
                                      --fail-->  "not_owned"          (nothing delivered)
     r3  FORCE: SIGKILL, group-scoped only where provable
     G3  IDENTITY RE-VERIFICATION #3  --fail-->  "exit_unproven"      x no settle
@@ -262,6 +263,21 @@ def interrupt(intent_id: str, reason: str, *, record: Mapping[str, Any],
 
     # -- G2 --------------------------------------------------------------------------------
     second = gate.evaluate()
+    if not second["unreadable"]:
+        # Round-8 item 6.  The process can exit between the LAST rung-2 probe and this
+        # read: the graceful signal did its job a few milliseconds late.  The G2 snapshot
+        # then shows the pid absent from the captured tty, `check_ownership` refuses it
+        # (`pid_absent_from_table` / `captured_tty_mismatch`) and this gate reported
+        # `exit_unproven` -- LOST / `stop_unverified` -- for a process whose exit the
+        # SAME snapshot proves.  The fenced exit proof (pid gone from the tty AND from the
+        # OS, or a recycled pid with another start identity) is asked FIRST, exactly as
+        # the rung-2 loop asks it before its own ownership check; only an observation
+        # that does not prove the exit reaches the ownership refusal below.
+        proof = pty_supervisor.exit_proven(record, second["snapshot"])
+        if proof["proven"]:
+            ladder.append(_step("G2", verified=True,
+                                detail=f"natural exit before force: {proof['reason']}"))
+            return _result(intent_id, reason, "interrupted_confirmed", ladder)
     if second["unreadable"] or second["decision"]["verdict"] != "owned":
         ladder.append(_step("G2", verified=False,
                             detail="process_table_unreadable" if second["unreadable"]
