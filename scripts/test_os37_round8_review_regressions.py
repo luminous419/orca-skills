@@ -33,6 +33,18 @@ bytes, file modes, the migration audit log) rather than a helper's return value.
      rolls back only with positive proof, and refuses an undecidable state by name;
   9. the credential seed is 0600 from its first byte -- observed at every point, under a
      permissive umask -- with no auth bytes retained anywhere.
+
+Iteration 2 (CI job 104230478567 on `6908ea9`, F06 `outcome=failed, failure_reason=''`):
+a final record that reaches the pty master only AFTER the exit is proven is read to the
+HANGUP before any settlement decision (`drain_after_exit`, bounded); a failed receipt
+carries its typed reason; and the exit watcher's appender records its append intent
+BEFORE the bytes, so an in-flight suffix is `verified` and only a forged one is refused.
+
+Iteration 3 (reviewer finding, `REVIEW_BUGFIX_iteration2.md` §5/§10): only EOF / `EIO`
+is the hangup -- `EINTR` is retried, every other read / poll error is `master_unreadable`
+with the errno named -- and `await_completion` GATES settlement on positive stream
+finality: `ended != "hangup"` (`budget`, `master_unreadable`) is the typed LOST reason
+`stream_end_unproven`, never COMPLETED, never a success row or ledger receipt.
 """
 from __future__ import annotations
 
@@ -295,6 +307,8 @@ class Item2UnanswerableCaptureNeverSettlesTests(unittest.TestCase):
         # ... and NOTHING settled it as a success: not the return, not the ledger, not the
         # journal.
         self.assertNotEqual(receipt.get("outcome"), "succeeded", receipt)
+        # Iteration 2: the typed reason rides the receipt, not only the journal.
+        self.assertEqual(receipt.get("failure_reason"), "evidence_unreadable", receipt)
         self.assertNotEqual(session.state, "COMPLETED")
         settlement = ledger.get_settlement(intent["intent_id"])
         self.assertIsNotNone(settlement, "no typed settlement was written at all")
@@ -1300,3 +1314,491 @@ class Item8ValidatedReconciliationTests(_MigrationBase):
         helper = inspect.getsource(launcher._validated_profile_archive)
         self.assertIn("load_standalone_profile(", helper)
         self.assertIn("profile_from_mapping(", helper)
+
+
+# =====================================================================================
+# Iteration 2 -- a final record visible only AFTER the proven exit (the F06 CI ordering)
+# =====================================================================================
+def _late_final_record_agent(delay_s: str, *, emit_final: bool = True) -> str:
+    """The F06 agent with ITS LAST RECORD delayed past its own proven exit: it writes the
+    runtime's fenced exit sentinel (path + fence handed to it by the test through
+    `./.late-sentinel` in its cwd, the worktree), waits, and only then writes its `-o`
+    body and the final `turn.completed` record.  A late WRITER cannot model this on darwin
+    (the slave is revoked when the session leader exits), so the ordering is injected
+    through the runtime's own evidence channel instead -- the observable is identical to
+    the loaded Linux runner's: a fenced proven exit while the final bytes are still in
+    flight, then the pty hangup."""
+    from scripts.test_os37_recovery_boundary_regressions import F06ResultPathIsAbsoluteTests
+    import textwrap
+    original_tail = textwrap.dedent('''\
+        if [ -n "$OUT" ]; then
+          mkdir -p "$(dirname "$OUT")" 2>/dev/null
+          printf 'F6 BODY written by the agent\\nSTATUS: COMPLETE\\n' > "$OUT"
+        fi
+        printf '{"type":"turn.completed","usage":{"input_tokens":1}}\\n'
+        exit 0
+    ''')
+    final = ('''printf '{"type":"turn.completed","usage":{"input_tokens":1}}\\n'\n'''
+             if emit_final else "")
+    late_tail = textwrap.dedent(f'''\
+        if [ -f ./.late-sentinel ]; then
+          SENTINEL="$(sed -n 1p ./.late-sentinel)"; FENCE="$(sed -n 2p ./.late-sentinel)"
+          mkdir -p "$(dirname "$SENTINEL")" 2>/dev/null
+          printf '0\\t%s\\n' "$FENCE" > "$SENTINEL.tmp" && mv "$SENTINEL.tmp" "$SENTINEL"
+        fi
+        sleep {delay_s}
+        if [ -n "$OUT" ]; then
+          mkdir -p "$(dirname "$OUT")" 2>/dev/null
+          printf 'F6 BODY written by the agent\\nSTATUS: COMPLETE\\n' > "$OUT"
+        fi
+        {final}exit 0
+    ''')
+    agent = F06ResultPathIsAbsoluteTests.AGENT.replace(original_tail, late_tail)
+    assert agent != F06ResultPathIsAbsoluteTests.AGENT, "the late-record substitution did not apply"
+    return agent
+
+
+class _F06LateBase(unittest.TestCase):
+    """The exact F06 composition (native `-o` agent, cwd outside the worktree, RELATIVE
+    artifact base) with the sentinel-first agent fixtures; no tests of its own."""
+
+    def setUp(self) -> None:
+        from scripts.test_os37_recovery_boundary_regressions import compile_native_agent
+        self.base = Path(tempfile.mkdtemp(prefix="os37-r8-i2f06-")).resolve()
+        self.addCleanup(shutil.rmtree, self.base, True)
+        self.worktree = self.base / "worktree"
+        self.worktree.mkdir()
+        self._compile = compile_native_agent
+        self.adapters: list = []
+        self.addCleanup(self._release_every_session)
+        previous = os.getcwd()
+        launcher_cwd = self.base / "launcher-cwd"
+        launcher_cwd.mkdir()
+        os.chdir(launcher_cwd)                           # cwd != worktree, as in F06
+        self.addCleanup(os.chdir, previous)
+
+    def _release_every_session(self) -> None:
+        for adapter in self.adapters:
+            for session in list(getattr(adapter.runtime, "sessions", {}).values()):
+                with contextlib.suppress(Exception):
+                    session.release()
+
+    def _dispatch(self, run_id: str, agent_script: str):
+        from scripts.test_os37_recovery_boundary_regressions import F06ResultPathIsAbsoluteTests
+        from scripts.deterministic_workflow.runtime_state import InMemoryRuntimeStateStore
+        bin_dir = self._compile(self.base, f"f6-{run_id}", agent_script)
+
+        class _Shape:
+            worktree = str(self.worktree)
+        spec = F06ResultPathIsAbsoluteTests._spec(_Shape(), bin_dir)   # the F06 profile
+        spec["binary"] = f"f6-{run_id}"
+        relative = Path("rel-artifacts")
+        ledger = InMemoryRuntimeStateStore()
+        adapter, _state = launcher.build_standalone_adapter(
+            {"run_id": run_id, "thread_id": "t", "phases": ["IMPLEMENTATION"]},
+            artifact_base=relative, run_id=run_id, runtime_state=ledger, profile_spec=spec)
+        self.adapters.append(adapter)
+        intent = {**WORKER_INTENT_KEYS, "intent_id": f"i-{run_id}", "run_id": run_id,
+                  "role": "WORKER"}
+        session = adapter.runtime.session_for(intent)
+        sentinel = pty_supervisor.exit_sentinel_path(session.artifact_base, run_id,
+                                                     session.session_id, session.incarnation)
+        (self.worktree / ".late-sentinel").write_text(f"{sentinel}\n{session.fence}\n")
+        claim = ledger.claim(intent)
+        receipt = adapter.start(intent, lease_token=claim["lease_token"])
+        rows = journal_mod.ExecutionJournal(relative, run_id).rows_for(intent["intent_id"])
+        settled = [r for r in rows if r["kind"] == "SETTLEMENT_OBSERVED"]
+        return receipt, settled, session
+
+class Iteration2LateFinalRecordTests(_F06LateBase):
+    """RED at 6908ea9: `await_completion` settled on "a candidate record AND a proven exit"
+    without reading the stream to its hangup, so the final `turn.completed` that reached
+    the master after the sentinel was never read and the F06 dispatch settled
+    `FAILED / completion_record_undeclared` over its penultimate record -- with a receipt
+    that reported `failure_reason=''`."""
+
+    def test_a_final_record_visible_only_after_the_proven_exit_is_read_to_the_hangup(self) -> None:
+        receipt, settled, session = self._dispatch("run_r8i2late",
+                                                   _late_final_record_agent("0.3"))
+        self.assertEqual(receipt["outcome"], "succeeded", receipt)
+        self.assertEqual(receipt["failure_reason"], "")
+        self.assertEqual(len(settled), 1, settled)
+        self.assertEqual(settled[0]["state"], "COMPLETED")
+        vocab = settled[0]["source_vocabulary"]
+        self.assertEqual(vocab["result_body_source"], "output_last_message_path",
+                         "the body written by the agent was not read back")
+        drain = vocab["post_exit_drain"]
+        self.assertEqual(drain["ended"], "hangup", drain)
+        self.assertGreater(drain["bytes"], 0, "the post-exit drain read nothing; the "
+                                              "final record was settled without")
+        self.assertIn('"turn.completed"', session.capture.transcript())
+        self.assertTrue(session.capture.completion_is_answerable()["answerable"])
+
+    def test_a_failed_receipt_carries_its_typed_reason(self) -> None:
+        # The SAME ordering, but the agent never writes its final record: the verdict is
+        # `completion_record_undeclared` over `item.completed`, and the RECEIPT says so.
+        receipt, settled, _session = self._dispatch(
+            "run_r8i2nofinal", _late_final_record_agent("0.1", emit_final=False))
+        self.assertEqual(receipt["outcome"], "failed", receipt)
+        self.assertEqual(receipt["failure_reason"], "completion_record_undeclared", receipt)
+        self.assertEqual(len(settled), 1)
+        self.assertEqual(settled[0]["state"], "FAILED")
+        self.assertEqual(settled[0]["source_vocabulary"]["completion_verdict"]["reason"],
+                         receipt["failure_reason"])
+        self.assertEqual(settled[0]["source_vocabulary"]["post_exit_drain"]["ended"], "hangup")
+
+
+class Iteration2DrainAfterExitTests(unittest.TestCase):
+    """`drain_after_exit` over a real pty pair: a quiet `select` does NOT end it, the
+    hangup does, and a slave that never hangs up ends it by the BUDGET -- reported as such."""
+
+    def setUp(self) -> None:
+        import pty
+        from scripts.deterministic_workflow.standalone_profile import profile_from_mapping
+        from scripts.deterministic_workflow.standalone_runtime import StandaloneSession
+        self.base = Path(tempfile.mkdtemp(prefix="os37-r8-i2drain-"))
+        self.addCleanup(shutil.rmtree, self.base, True)
+        self.master, self.slave = pty.openpty()
+        self.addCleanup(self._close_fds)
+        profile = profile_from_mapping(stub_profile_spec("alive", worktree=str(self.base)))
+        self.session = StandaloneSession(
+            intent={"intent_id": "i-drain", "run_id": "run_drain", "role": "WORKER"},
+            profile=profile, artifact_base=self.base, run_id="run_drain",
+            journal=journal_mod.ExecutionJournal(self.base, "run_drain"))
+        self.session.capture = capture_mod.BoundedCapture(self.base / "capture.log")
+        self.session.pty = {"master_fd": self.master, "pty_id": "pty-drain"}
+
+    def _close_fds(self) -> None:
+        for fd in (self.master, self.slave):
+            with contextlib.suppress(OSError):
+                os.close(fd)
+
+    def test_silence_does_not_end_the_drain_but_the_hangup_does(self) -> None:
+        def writer() -> None:
+            time.sleep(0.25)                             # > the old 10 ms silence window
+            os.write(self.slave, b'{"type":"turn.completed"}\n')
+            time.sleep(0.05)
+            os.close(self.slave)                         # the hangup
+        thread = threading.Thread(target=writer, daemon=True)
+        thread.start()
+        drained = self.session.drain_after_exit(budget_ms=3000)
+        thread.join(timeout=2)
+        self.assertEqual(drained["ended"], "hangup", drained)
+        self.assertGreater(drained["bytes"], 0)
+        self.assertIn('"turn.completed"', self.session.capture.transcript())
+        # And the old shape, for contrast: `pump` returns on the first quiet select.
+        os.close(self.master)
+
+    def test_a_slave_that_never_hangs_up_ends_the_drain_by_budget(self) -> None:
+        os.write(self.slave, b'{"type":"item.completed"}\n')
+        started = time.monotonic()
+        drained = self.session.drain_after_exit(budget_ms=300)
+        elapsed = time.monotonic() - started
+        self.assertEqual(drained["ended"], "budget", drained)
+        self.assertGreater(drained["bytes"], 0)
+        self.assertGreaterEqual(elapsed, 0.25)
+        self.assertLess(elapsed, 2.0, "the bound was not honoured")
+
+
+class Iteration2WatcherAppendIntentTests(unittest.TestCase):
+    """The exit watcher's appender wrote bytes and THEN its meta with no append intent, so
+    a stranger reading between the two saw an `unverified_tail` -- the same integrity
+    verdict a forged record gets -- for bytes that were merely not yet fully visible.  Both
+    writers now record the intent BEFORE the bytes; the in-flight suffix is `verified`."""
+
+    def setUp(self) -> None:
+        self.base = Path(tempfile.mkdtemp(prefix="os37-r8-i2int-"))
+        self.addCleanup(shutil.rmtree, self.base, True)
+        self.path = self.base / "capture.log"
+        # A supervisor-written prefix with its meta, exactly as the watcher inherits it.
+        supervisor = capture_mod.BoundedCapture(self.path)
+        supervisor.append(b'{"type":"system","session_id":"s"}\n', at="t0")
+        self.reader = capture_mod.BoundedCapture(self.path)   # a stranger's view
+
+    def test_a_reader_between_the_bytes_and_the_meta_sees_a_verified_tail(self) -> None:
+        from scripts.deterministic_workflow.standalone_profile import CaptureLimits
+        appender = capture_mod.RawBoundedAppender(os.fsencode(str(self.path)),
+                                                  limits=CaptureLimits())
+        observed: dict[str, Any] = {}
+        real_save = appender.save_meta
+
+        def observe_then_save() -> None:
+            # The window: bytes on disk, meta not yet rewritten.
+            self.reader.refresh()
+            observed["integrity"] = self.reader.integrity()
+            observed["answerable"] = self.reader.completion_is_answerable()
+            real_save()
+        appender.save_meta = observe_then_save              # type: ignore[assignment]
+        appender.append(b'{"type":"result","subtype":"success"}\n')
+        appender.close()
+        self.assertTrue(observed, "the window was never observed")
+        self.assertTrue(observed["integrity"]["consistent"], observed)
+        self.assertTrue(observed["answerable"]["answerable"], observed)
+        # After the meta lands the same reader agrees, and a FORGED suffix (no intent)
+        # is still refused -- the gate distinguishes in-flight from forged.
+        self.reader.refresh()
+        self.assertTrue(self.reader.integrity()["consistent"])
+        with open(self.path, "ab") as handle:
+            handle.write(b'{"type":"result","subtype":"success","forged":true}\n')
+        self.reader.refresh()
+        integrity = self.reader.integrity()
+        self.assertFalse(integrity["consistent"])
+        self.assertEqual(integrity.get("tail"), capture_mod.INTEGRITY_UNVERIFIED_TAIL, integrity)
+
+
+# =====================================================================================
+# Iteration 3 -- read-error classification and POSITIVE stream finality
+# =====================================================================================
+def _sentinel_first_agent(*, after_sentinel: str) -> str:
+    """The F06 agent with the runtime's fenced exit sentinel written FIRST (path + fence
+    handed over through `./.late-sentinel`), followed by ``after_sentinel`` (shell)."""
+    from scripts.test_os37_recovery_boundary_regressions import F06ResultPathIsAbsoluteTests
+    import textwrap
+    original_tail = textwrap.dedent('''\
+        if [ -n "$OUT" ]; then
+          mkdir -p "$(dirname "$OUT")" 2>/dev/null
+          printf 'F6 BODY written by the agent\\nSTATUS: COMPLETE\\n' > "$OUT"
+        fi
+        printf '{"type":"turn.completed","usage":{"input_tokens":1}}\\n'
+        exit 0
+    ''')
+    late_tail = textwrap.dedent('''\
+        if [ -f ./.late-sentinel ]; then
+          SENTINEL="$(sed -n 1p ./.late-sentinel)"; FENCE="$(sed -n 2p ./.late-sentinel)"
+          mkdir -p "$(dirname "$SENTINEL")" 2>/dev/null
+          printf '0\\t%s\\n' "$FENCE" > "$SENTINEL.tmp" && mv "$SENTINEL.tmp" "$SENTINEL"
+        fi
+    ''') + textwrap.dedent(after_sentinel)
+    agent = F06ResultPathIsAbsoluteTests.AGENT.replace(original_tail, late_tail)
+    assert agent != F06ResultPathIsAbsoluteTests.AGENT, "the substitution did not apply"
+    return agent
+
+
+FINAL_RECORD_TAIL = '''\
+    sleep 0.3
+    if [ -n "$OUT" ]; then
+      mkdir -p "$(dirname "$OUT")" 2>/dev/null
+      printf 'F6 BODY written by the agent\\nSTATUS: COMPLETE\\n' > "$OUT"
+    fi
+    printf '{"type":"turn.completed","usage":{"input_tokens":1}}\\n'
+    exit 0
+'''
+HUNG_AGENT_TAIL = '''\
+    sleep 30
+    exit 0
+'''
+
+
+class Iteration3StreamFinalityTests(_F06LateBase):
+    """RED on the iteration-2 tree: every `OSError` from the master read was labelled
+    `hangup`, and `await_completion` recorded `post_exit_drain.ended` without gating on
+    it -- so a structured success could be authorised from a stream whose durable end was
+    never observed.  Production-wired: the F06 composition through `adapter.start`, the
+    read seam driven over the REAL pty, the fenced exit proven before the final bytes."""
+
+    def _dispatch_with_reader(self, run_id: str, agent_script: str, reader_factory,
+                              *, budget_ms: int | None = None):
+        """Like `_dispatch`, but the session's master reader is replaced by
+        `reader_factory(session, sentinel_path)` before the dispatch starts."""
+        from scripts.test_os37_recovery_boundary_regressions import F06ResultPathIsAbsoluteTests
+        from scripts.deterministic_workflow.runtime_state import InMemoryRuntimeStateStore
+        bin_dir = self._compile(self.base, f"f6-{run_id}", agent_script)
+
+        class _Shape:
+            worktree = str(self.worktree)
+        spec = F06ResultPathIsAbsoluteTests._spec(_Shape(), bin_dir)
+        spec["binary"] = f"f6-{run_id}"
+        relative = Path("rel-artifacts")
+        ledger = InMemoryRuntimeStateStore()
+        adapter, _state = launcher.build_standalone_adapter(
+            {"run_id": run_id, "thread_id": "t", "phases": ["IMPLEMENTATION"]},
+            artifact_base=relative, run_id=run_id, runtime_state=ledger, profile_spec=spec)
+        self.adapters.append(adapter)
+        intent = {**WORKER_INTENT_KEYS, "intent_id": f"i-{run_id}", "run_id": run_id,
+                  "role": "WORKER"}
+        session = adapter.runtime.session_for(intent)
+        sentinel = pty_supervisor.exit_sentinel_path(session.artifact_base, run_id,
+                                                     session.session_id, session.incarnation)
+        (self.worktree / ".late-sentinel").write_text(f"{sentinel}\n{session.fence}\n")
+        if reader_factory is not None:
+            session._master_reader = reader_factory(session, sentinel)
+        if budget_ms is not None:
+            session.POST_EXIT_DRAIN_BUDGET_MS = budget_ms
+        claim = ledger.claim(intent)
+        receipt = adapter.start(intent, lease_token=claim["lease_token"])
+        rows = journal_mod.ExecutionJournal(relative, run_id).rows_for(intent["intent_id"])
+        return receipt, rows, session, ledger, intent
+
+    def _assert_no_success_anywhere(self, receipt, rows, session, ledger, intent,
+                                    *, ended: str) -> None:
+        self.assertEqual(receipt["outcome"], "failed", receipt)
+        self.assertEqual(receipt["failure_reason"], "stream_end_unproven", receipt)
+        self.assertNotEqual(session.state, "COMPLETED")
+        self.assertFalse(any(r.get("state") == "COMPLETED" for r in rows),
+                         "a COMPLETED row was journalled without stream finality")
+        settled = [r for r in rows if r["kind"] == "SETTLEMENT_OBSERVED"]
+        self.assertEqual(len(settled), 1, settled)
+        self.assertEqual(settled[0]["state"], "FAILED")
+        self.assertEqual(settled[0]["outcome"], "failed")
+        verdict = settled[0]["source_vocabulary"]["completion_verdict"]
+        self.assertEqual(verdict["reason"], "stream_end_unproven", verdict)
+        stored = ledger.get_settlement(intent["intent_id"])
+        self.assertIsNotNone(stored)
+        self.assertEqual(stored["result"].get("status"), "BLOCKED", stored)
+        gate = [r for r in rows if r["kind"] == "EVENT"
+                and (r["source_vocabulary"].get("post_exit_drain") or {}).get("ended") == ended]
+        self.assertTrue(gate, f"no finality-gate trace naming ended={ended!r}")
+        self.assertTrue(gate[0]["source_vocabulary"]["settlement_record_present"],
+                        "the case did not hold a parsed candidate; nothing was gated")
+
+    def test_a_non_eio_read_failure_after_the_fenced_exit_is_a_typed_refusal(self) -> None:
+        def factory(session, sentinel):
+            def reader(fd, n):
+                if os.path.exists(sentinel):
+                    raise OSError(errno.EBADF, "mutated unreadable master")
+                return os.read(fd, n)
+            return reader
+        receipt, rows, session, ledger, intent = self._dispatch_with_reader(
+            "run_r8i3ebadf", _sentinel_first_agent(after_sentinel=FINAL_RECORD_TAIL), factory)
+        self._assert_no_success_anywhere(receipt, rows, session, ledger, intent,
+                                         ended="master_unreadable")
+        drain = [r for r in rows if r["kind"] == "SETTLEMENT_OBSERVED"][0][
+            "source_vocabulary"]["post_exit_drain"]
+        self.assertEqual(drain["errno"], "EBADF", drain)
+
+    def test_eintr_is_retried_and_the_stream_still_reads_to_the_hangup(self) -> None:
+        def factory(session, sentinel):
+            interrupts = {"n": 0}
+
+            def reader(fd, n):
+                if os.path.exists(sentinel) and interrupts["n"] < 3:
+                    interrupts["n"] += 1
+                    raise InterruptedError(errno.EINTR, "interrupted")
+                return os.read(fd, n)
+            session._interrupts = interrupts
+            return reader
+        receipt, rows, session, _ledger, _intent = self._dispatch_with_reader(
+            "run_r8i3eintr", _sentinel_first_agent(after_sentinel=FINAL_RECORD_TAIL), factory)
+        self.assertGreaterEqual(session._interrupts["n"], 1, "EINTR was never injected")
+        self.assertEqual(receipt["outcome"], "succeeded", receipt)
+        settled = [r for r in rows if r["kind"] == "SETTLEMENT_OBSERVED"]
+        self.assertEqual(settled[0]["state"], "COMPLETED")
+        drain = settled[0]["source_vocabulary"]["post_exit_drain"]
+        self.assertEqual(drain["ended"], "hangup", drain)
+        self.assertGreater(drain["bytes"], 0)
+
+    def test_a_drain_that_ends_by_budget_with_a_candidate_is_fail_closed(self) -> None:
+        # The agent writes the sentinel, then HANGS holding its slave open: the drain ends
+        # by the bound (500 ms) with `item.completed` parsed -- never a success; the
+        # ladder then terminates the hung process for the typed FAILED settlement.
+        receipt, rows, session, ledger, intent = self._dispatch_with_reader(
+            "run_r8i3budget", _sentinel_first_agent(after_sentinel=HUNG_AGENT_TAIL), None,
+            budget_ms=500)
+        self._assert_no_success_anywhere(receipt, rows, session, ledger, intent, ended="budget")
+
+
+class Iteration3ReadClassificationTests(unittest.TestCase):
+    """`drain_after_exit` over a real pty pair whose slave is STILL OPEN: only EOF / EIO
+    is hangup; EBADF (the reviewer's mutation) and a failing poll are `master_unreadable`
+    with the errno named; EINTR is retried."""
+
+    def setUp(self) -> None:
+        import pty
+        from scripts.deterministic_workflow.standalone_profile import profile_from_mapping
+        from scripts.deterministic_workflow.standalone_runtime import StandaloneSession
+        self.base = Path(tempfile.mkdtemp(prefix="os37-r8-i3cls-"))
+        self.addCleanup(shutil.rmtree, self.base, True)
+        self.master, self.slave = pty.openpty()
+        self.addCleanup(self._close_fds)
+        profile = profile_from_mapping(stub_profile_spec("alive", worktree=str(self.base)))
+        self.session = StandaloneSession(
+            intent={"intent_id": "i-cls", "run_id": "run_cls", "role": "WORKER"},
+            profile=profile, artifact_base=self.base, run_id="run_cls",
+            journal=journal_mod.ExecutionJournal(self.base, "run_cls"))
+        self.session.capture = capture_mod.BoundedCapture(self.base / "capture.log")
+        self.session.pty = {"master_fd": self.master, "pty_id": "pty-cls"}
+
+    def _close_fds(self) -> None:
+        for fd in (self.master, self.slave):
+            with contextlib.suppress(OSError):
+                os.close(fd)
+
+    def test_ebadf_with_the_slave_still_open_is_master_unreadable_not_hangup(self) -> None:
+        os.write(self.slave, b'{"type":"item.completed"}\n')
+
+        def reader(fd, n):
+            raise OSError(errno.EBADF, "mutated unreadable master")
+        self.session._master_reader = reader
+        drained = self.session.drain_after_exit(budget_ms=2000)
+        self.assertEqual(drained["ended"], "master_unreadable", drained)
+        self.assertEqual(drained["errno"], "EBADF", drained)
+        self.assertEqual(drained["bytes"], 0)
+
+    def test_eintr_is_retried_and_eof_is_the_hangup(self) -> None:
+        calls = {"n": 0}
+
+        def reader(fd, n):
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                raise InterruptedError(errno.EINTR, "interrupted")
+            return os.read(fd, n)
+        self.session._master_reader = reader
+
+        def writer() -> None:                            # darwin discards unread slave
+            os.write(self.slave, b'{"type":"turn.completed"}\n')   # output on close, so
+            time.sleep(0.3)                              # the bytes are read BEFORE the
+            os.close(self.slave)                         # hangup, as on a real exit
+        thread = threading.Thread(target=writer, daemon=True)
+        thread.start()
+        drained = self.session.drain_after_exit(budget_ms=3000)
+        thread.join(timeout=2)
+        self.assertEqual(drained["ended"], "hangup", drained)
+        self.assertGreaterEqual(calls["n"], 3)
+        self.assertIn('"turn.completed"', self.session.capture.transcript())
+
+    def test_eio_is_the_hangup_and_other_errnos_are_named(self) -> None:
+        for code, expected in ((errno.EIO, "hangup"), (errno.EACCES, "master_unreadable"),
+                               (errno.ENXIO, "master_unreadable")):
+            with self.subTest(errno=errno.errorcode[code]):
+                os.write(self.slave, b"x\n")
+
+                def reader(fd, n, code=code):
+                    raise OSError(code, "injected")
+                self.session._master_reader = reader
+                drained = self.session.drain_after_exit(budget_ms=2000)
+                self.assertEqual(drained["ended"], expected, drained)
+                self.assertEqual(drained["errno"], errno.errorcode[code])
+                os.read(self.master, 65536)              # clear the byte for the next case
+
+    def test_a_failing_poll_is_master_unreadable(self) -> None:
+        self.session.pty = {"master_fd": 10**6, "pty_id": "pty-bad"}   # not an open fd
+        drained = self.session.drain_after_exit(budget_ms=500)
+        self.assertEqual(drained["ended"], "master_unreadable", drained)
+        self.assertIn(drained["errno"], ("EBADF", "ValueError"))
+
+    def test_a_masterless_session_is_final_only_by_the_watchers_sentinel(self) -> None:
+        """An ADOPTED session holds no master: its end-of-stream evidence is the exit
+        watcher's fenced sentinel (written after the watcher's own final drain and meta
+        save).  Without it -- an exit proven only by the process table -- nothing is
+        final.  (The full adopted path is `F01CrashedSupervisorDispatchIsCollectedTests`,
+        which settles COMPLETED through exactly this rule.)"""
+        from scripts.deterministic_workflow.standalone_runtime import _stream_is_final
+        self.session.pty = None
+        drained = self.session.drain_after_exit(budget_ms=500)
+        self.assertEqual(drained["ended"], "no_master", drained)
+        self.assertEqual(drained["finality"], "none")
+        self.assertFalse(_stream_is_final(drained))
+        sentinel = pty_supervisor.exit_sentinel_path(
+            self.session.artifact_base, "run_cls", self.session.session_id,
+            self.session.incarnation)
+        sentinel.parent.mkdir(parents=True, exist_ok=True)
+        pty_supervisor.write_exit_sentinel(sentinel, code=0, fence=self.session.fence)
+        drained = self.session.drain_after_exit(budget_ms=500)
+        self.assertEqual(drained["finality"], "exit_sentinel", drained)
+        self.assertTrue(_stream_is_final(drained))
+        # And a FOREIGN sentinel (another incarnation's) proves nothing.
+        pty_supervisor.write_exit_sentinel(sentinel, code=0,
+                                           fence=f"{self.session.session_id}:i-other")
+        self.assertEqual(self.session.drain_after_exit(budget_ms=500)["finality"], "none")
+        for ended in ("budget", "master_unreadable"):
+            self.assertFalse(_stream_is_final({"ended": ended, "finality": "exit_sentinel"}))

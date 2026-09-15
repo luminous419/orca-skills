@@ -653,6 +653,22 @@ class RawBoundedAppender:
         elif decision["truncation"] and not self.truncation:
             self.truncation = decision["truncation"]
         if payload is not None and self.fd >= 0:
+            # Round-8 iteration 2: the SAME intent-before-bytes discipline the supervisor's
+            # `BoundedCapture.append` follows.  A stranger collecting this dispatch reads
+            # the file between this writer's bytes and its meta; without an intent that
+            # in-flight suffix was `unverified_tail` -- indistinguishable from a forged
+            # one -- so an answerability-first gate could refuse a capture that was merely
+            # not yet fully visible.  With the intent on stable storage first, the
+            # in-flight suffix is `verified` and the gate refuses only a real integrity
+            # failure.  An intent this writer cannot record makes the chunk a write
+            # failure (irreversible, by name), never an undescribed suffix.
+            try:
+                write_append_intent(self.intent, offset=self.total, payload=payload)
+            except OSError:
+                self.dropped += len(payload)
+                self._mark_unanswerable(UNANSWERABLE_WRITE_FAILED)
+                self.save_meta()
+                return
             written = 0
             failed = False
             while written < len(payload):
@@ -714,9 +730,11 @@ def intent_path_for(path: str | os.PathLike[str]) -> Path:
 def write_append_intent(path: str | os.PathLike[str] | bytes, *, offset: int,
                         payload: bytes) -> None:
     """Record, durably (tmp + fsync + rename), that ``payload`` is ABOUT to be appended at
-    ``offset``.  Raw ``os`` calls, like :func:`write_meta`, so either writer could call it;
-    only the supervisor's :class:`BoundedCapture` does, because the exit watcher writes
-    its meta after every append and never leaves a described-but-unrecorded suffix."""
+    ``offset``.  Raw ``os`` calls, like :func:`write_meta`, so BOTH writers call it: the
+    supervisor's :class:`BoundedCapture` and, since round-8 iteration 2, the exit
+    watcher's :class:`RawBoundedAppender` -- so a reader that lands between either
+    writer's bytes and its meta sees a VERIFIED in-flight suffix, never an unverified
+    one."""
     record = json.dumps({"schema": APPEND_INTENT_SCHEMA, "offset": int(offset),
                          "length": len(payload),
                          "sha256": hashlib.sha256(payload).hexdigest()},

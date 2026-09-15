@@ -366,6 +366,37 @@ qualified "at the pinned revision".
   (`capture_truncated` / `evidence_unreadable`) into a typed FAILED settlement (a Reviewer:
   `REVIEWER_RUNTIME_FAILURE`, nothing settled) -- never `COMPLETED`, in the ledger or the
   journal.
+* **A proven exit is followed by a drain to the pty HANGUP** (round-8 iteration 2, the
+  F06 CI ordering).  On Linux a slave write reaches the master through the tty
+  flip-buffer work queue, so under load the exit watcher's fenced sentinel can be durable
+  BEFORE the agent's final record is readable; `await_completion` used to settle on "a
+  candidate record and a proven exit" (or drain for 10 ms of silence) and so settled
+  `FAILED / completion_record_undeclared` over the penultimate record.  Once the exit is
+  proven, `StandaloneSession.drain_after_exit` now reads the master until the pty hangs
+  up (EOF / `EIO`), bounded by `POST_EXIT_DRAIN_BUDGET_MS`, and only then is the evidence
+  final; the settlement row records `post_exit_drain: {bytes, ended: hangup|budget}`.  A
+  failed dispatch receipt carries its typed `failure_reason` (it used to be the empty
+  start-receipt field).  The exit watcher's appender records its append intent BEFORE the
+  bytes, exactly as the supervisor's capture does, so a stranger reading an in-flight
+  append sees a `verified` tail: the answerability gate distinguishes "not yet fully
+  visible" (in flight, verified) from "integrity failed" (forged / truncated / meta
+  missing), and still refuses only the latter.
+* **Settlement requires POSITIVE stream finality** (round-8 iteration 3).  The post-exit
+  drain counts exactly two observations as the hangup -- a clean EOF and `errno.EIO`, the
+  pty's own "every slave descriptor is closed" signals; `EINTR` is retried; every other
+  read or poll error is `ended: master_unreadable` with the errno named (an unreadable
+  master proves nothing about the slave side).  `await_completion` authorises a structured
+  success ONLY from `post_exit_drain.ended == "hangup"`: `budget` (a slave still held open
+  when the bound elapsed -- a hung agent) and `master_unreadable` are the typed LOST reason
+  `stream_end_unproven` (a new, additive member of `LOST_REASONS`), settled by
+  `settle_failed` as a typed FAILURE with the reason on the receipt -- no COMPLETED state,
+  no settlement-success row, no success ledger receipt -- whatever completion candidate the
+  transcript holds, because a record read before the stream's end is not its final record.
+  An ADOPTED session (a stranger collecting a crashed supervisor's dispatch) holds no
+  master: its positive end-of-stream evidence is the exit watcher's fenced sentinel, which
+  the watcher writes only after its own final drain and meta save (`ended: no_master,
+  finality: exit_sentinel`); an exit proven only by the process table is not final there
+  either.  The drain outcome rides both settlement rows (`post_exit_drain`).
 * **The standalone `lookup()` answer IS a receipt** (round-8 item 1): exactly the closed
   key set `runtime_state.RECEIPT_KEYS`, every value a non-empty string, the task and
   dispatch identities derived by the same functions the supervising session derives them

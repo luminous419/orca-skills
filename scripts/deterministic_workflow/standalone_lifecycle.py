@@ -113,6 +113,12 @@ LOST_REASONS = (
     "stop_unverified", "host_status_unavailable", "cause_unreported",
     "exit_code_unmapped", "capture_truncated", "evidence_unreadable",
     "process_table_unreadable", "settlement_unconfirmed", "start_unknown",
+    # Round-8 iteration 3 (additive).  The pty stream's END was never positively observed
+    # after the proven exit: the post-exit drain ended by its bound (a slave still held
+    # open) or the master could not be read (a non-EIO read / select failure).  Whatever
+    # record the transcript holds, the stream is not proven final, so nothing settles as
+    # a success from it.
+    "stream_end_unproven",
 )
 
 #: The sentinel that is NOT an exit code.  A reader of this value reports LOST.
@@ -1280,6 +1286,11 @@ def resolve_unknown(situation: str, **facts: Any) -> dict[str, Any]:
         return {"state": "LOST", "lost_reason": "stop_unverified",
                 "process_liveness": "disputed", "cleanup_authority": "unknown",
                 "note": "never 'exited'; never permission to close"}
+    if situation == "stream_end_unproven":
+        return {"state": "LOST", "lost_reason": "stream_end_unproven",
+                "ended": facts.get("ended", ""),
+                "note": "the pty stream's end was not observed after the proven exit; a "
+                        "record read before the end is not the final record"}
     if situation == "required_evidence_missing":
         return {"state": "LOST", "lost_reason": facts.get("lost_reason") or "evidence_unreadable",
                 "note": "RULE 4: never a success guess"}
