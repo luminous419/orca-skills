@@ -294,7 +294,11 @@ class Item1WatcherFinalizeOverRealPtyTests(unittest.TestCase):
             self.base, output=b'{"type":"result"}\n', linger_child=True, budget_ms=800)
         self.assertEqual(record["outcome"], capture_mod.FINALITY_UNPROVEN, record)
         holders = record["record"]["holders"]
-        named = (holders.get("foreground_group_present") is True
+        # Iteration 4: the orphan finalizer names the retained slave holder through the
+        # COMPLETE libproc authority (`holders`/`unenumerable`); older foreground-group /
+        # tty-row fields are accepted too for records written by pre-iteration-4 writers.
+        named = (bool(holders.get("holders")) or bool(holders.get("unenumerable"))
+                 or holders.get("foreground_group_present") is True
                  or bool(holders.get("rows")))
         self.assertTrue(named, f"the retained-slave holder was not named: {holders}")
 

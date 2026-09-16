@@ -715,21 +715,31 @@ class DrainIsATeardownObligationTests(unittest.TestCase):
                 "nothing was waiting on the pty master, so this run proves nothing about "
                 "the drain obligation on either platform")
         finally:
-            pty_supervisor.drain(session["master_fd"])
+            # Round-10 item 1: release the drain handoff (and the master) BEFORE the
+            # blocking reap; the supervisor-alive watcher defers its exit until the handoff
+            # closes, as `_reclaim` releases it before `reap_leader`.
+            pty_supervisor.release(session)
             try:
                 os.waitpid(session["leader_pid"], 0)
             except OSError:
                 pass
-            pty_supervisor.release(session)
 
     def test_draining_makes_the_exiting_child_reapable(self) -> None:
-        """The POSITIVE half: with the drain, the same child reaps immediately."""
+        """The POSITIVE half: with the drain (and the drain-handoff release the new teardown
+        protocol adds -- round-10 item 1), the same child reaps immediately."""
         session = self._spawn()
         try:
             self._settle(session)
             drained = pty_supervisor.drain(session["master_fd"])
             self.assertGreater(drained, 0, "the stub wrote nothing to drain")
             os.killpg(session["pgid"], 9)
+            # The supervisor-alive watcher defers its exit until the supervisor releases the
+            # drain handoff (as `_reclaim` does before it reaps the leader); release it here
+            # so what this asserts is the drain's effect on the kernel wedge, not the linger.
+            handoff = session.get("drain_handoff_fd")
+            if isinstance(handoff, int) and handoff >= 0:
+                os.close(handoff)
+                session["drain_handoff_fd"] = -1
             self._settle(session, seconds=0.5)
             reaped = os.waitpid(session["leader_pid"], os.WNOHANG)
             self.assertEqual(
@@ -885,12 +895,15 @@ class TtyNormalisationTests(unittest.TestCase):
                 os.killpg(session["pgid"], 9)
             except OSError:
                 pass
-            pty_supervisor.drain(session["master_fd"])
+            # Round-10 item 1: the supervisor-alive watcher defers its exit until the drain
+            # handoff closes.  `release` closes it (and the master), exactly as `_reclaim`
+            # releases it before `reap_leader`, so the blocking reap does not wait out the
+            # linger ceiling.
+            pty_supervisor.release(session)
             try:
                 os.waitpid(session["leader_pid"], 0)
             except OSError:
                 pass
-            pty_supervisor.release(session)
 
 
 # =====================================================================================
@@ -1135,9 +1148,12 @@ class LiveExecutableIdentityTests(unittest.TestCase):
                 os.killpg(session["pgid"], 9)
             except OSError:
                 pass
-            pty_supervisor.drain(session["master_fd"])
+            # Round-10 item 1: the supervisor-alive watcher defers its exit until the drain
+            # handoff closes.  `release` closes it (and the master), exactly as `_reclaim`
+            # releases it before `reap_leader`, so the blocking reap does not wait out the
+            # linger ceiling.
+            pty_supervisor.release(session)
             try:
                 os.waitpid(session["leader_pid"], 0)
             except OSError:
                 pass
-            pty_supervisor.release(session)

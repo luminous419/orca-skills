@@ -342,7 +342,7 @@ class DriverContainmentTests(unittest.TestCase):
             "dataclasses",
             "datetime", "errno", "fcntl", "hashlib", "hmac", "importlib", "inspect", "io",
             "json", "math", "os", "pathlib", "pty", "re", "resource", "select", "shlex",
-            "shutil", "signal", "struct", "subprocess", "termios", "time", "tokenize",
+            "shutil", "signal", "struct", "subprocess", "sys", "termios", "time", "tokenize",
             "typing", "unittest", "uuid",
         }
         for path in _standalone_modules():

@@ -502,6 +502,14 @@ STANDALONE_PROFILE_DIGEST_MISMATCH = "STANDALONE_PROFILE_DIGEST_MISMATCH"
 #: or no reason, or whose new profile is identical to the bound one, is refused: a
 #: migration is a deliberate, attributable, CHANGING act, not a silent re-bind.
 STANDALONE_MIGRATION_REFUSED = "STANDALONE_MIGRATION_REFUSED"
+#: Iteration-4 F3.  The authority upgrade audit log has a crash-torn final fragment that
+#: could not be removed (the truncating open / ``ftruncate`` failed -- e.g. an owner
+#: append-only ``chflags uappnd`` log denies ``O_WRONLY`` while ``O_APPEND`` still works).
+#: The heal REFUSES before any append rather than appending a terminal record onto the
+#: fragment and forging a permanent newline-terminated corrupt line; the original bytes are
+#: unchanged and reads still skip the fragment, so recovery proceeds once the restriction is
+#: lifted.
+STANDALONE_UPGRADE_LOG_TORN_UNHEALED = "STANDALONE_UPGRADE_LOG_TORN_UNHEALED"
 #: Final-Review iteration 5, B1.  A persisted profile whose ``worktree`` (or an
 #: ``add_dirs`` entry) is a RELATIVE path is not durable: the launch resolved it against
 #: the launch process's cwd, and a recovery started from ANY OTHER cwd would resolve the
@@ -912,34 +920,122 @@ def _authority_upgrade_log_path(artifact_base: Any, run_id: str) -> Path:
 
 def read_authority_upgrade_records(artifact_base: Any, run_id: str
                                    ) -> tuple[dict[str, Any], ...]:
-    """EVERY record of the legacy-authority upgrade log, oldest first -- ``prepared``,
-    ``committed`` and ``rolled_back`` alike (round-9 item 2), plus any state-less record
-    the pre-fix single-write model appended (read as committed).  RAISES on an unreadable
-    or unparsable log rather than pretending there were none."""
+    """EVERY COMPLETE record of the legacy-authority upgrade log, oldest first --
+    ``prepared``, ``committed`` and ``rolled_back`` alike (round-9 item 2), plus any
+    state-less record the pre-fix single-write model appended (read as committed).
+
+    Round-10 item 3.  ``_durable_append`` writes one newline-terminated line per record
+    and its own contract says a crash-torn final fragment is a legible partial entry the
+    reader SKIPS -- but this reader parsed every fragment and RAISED on the torn tail, so a
+    single interrupted append (a crash between the write and its own ``\\n``) turned every
+    later authority read into a permanent ``STANDALONE_MIGRATION_REFUSED`` that
+    reconciliation, watchdog recovery and explicit recovery could never repair.  A record
+    is COMPLETE only when it is newline-terminated; the ONLY fragment ever tolerated is a
+    non-empty final line with no trailing ``\\n`` (the torn tail), which is quarantined and
+    NAMED in the evidence, never parsed.  A malformed but newline-TERMINATED record still
+    RAISES -- a complete line that does not parse is corruption, not a torn tail -- and so
+    does an unreadable log."""
     path = _authority_upgrade_log_path(artifact_base, run_id)
     if not path.exists():
         return ()
     from .standalone_capture import protocol_lines
     try:
-        lines = protocol_lines(path.read_text(encoding="utf-8"))
+        text = path.read_text(encoding="utf-8")
     except OSError as exc:
         raise LauncherError(
             f"{STANDALONE_MIGRATION_REFUSED}: the authority upgrade audit log at {path} is "
             f"unreadable ({exc})") from exc
+    lines = protocol_lines(text)
+    # A trailing delimiter yields no empty last piece (``protocol_lines`` pops it), so a
+    # text that does NOT end in ``\n`` has an unterminated final fragment as its last
+    # piece: the crash-torn tail.  Quarantine exactly that one, and nothing else.
+    if text and not text.endswith("\n") and lines:
+        torn = lines.pop()
+        _quarantine_torn_upgrade_tail(path, torn)
     out: list[dict[str, Any]] = []
     for line in lines:
-        line = line.strip()
-        if not line:
+        stripped = line.strip()
+        if not stripped:
             continue
         try:
-            record = json.loads(line)
+            record = json.loads(stripped)
         except ValueError as exc:
             raise LauncherError(
                 f"{STANDALONE_MIGRATION_REFUSED}: the authority upgrade audit log at {path} "
-                f"has an unparsable entry ({exc})") from exc
+                f"has an unparsable COMPLETE (newline-terminated) entry ({exc}); a torn "
+                "final fragment is skipped, but a complete corrupt record is not") from exc
         if isinstance(record, dict):
             out.append(record)
     return tuple(out)
+
+
+def _quarantine_torn_upgrade_tail(path: Path, fragment: str) -> None:
+    """Record the crash-torn final fragment of an upgrade log beside it, best-effort, so
+    the skipped bytes are legible EVIDENCE rather than silently dropped (round-10 item 3).
+    A read must never fail because the quarantine could not be written, and re-reading the
+    same torn tail overwrites the same file with the same content (idempotent)."""
+    try:
+        quarantine = path.with_name(path.name + ".torn")
+        quarantine.write_text(fragment, encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _heal_torn_upgrade_tail_locked(path: Path) -> None:
+    """Iteration-3 F2 / iteration-4 F3.  REMOVE a crash-torn final fragment from the upgrade
+    log so the next append lands on a clean record boundary -- called under the run's
+    migration lock BEFORE any append.
+
+    The read path (:func:`read_authority_upgrade_records`) only *skips* an unterminated
+    final fragment in memory; the bytes stay in the file, so the next reconciliation /
+    recovery append would concatenate its terminal record directly onto the fragment and
+    forge a newline-TERMINATED corrupt line that every later read then refuses forever
+    (reviewer `torn_replay.txt`).  Under the lock, this quarantines that fragment to
+    ``.torn`` (evidence, idempotent) and TRUNCATES the log to its last newline, fsynced, so
+    the fragment can never be a prefix of a future record.  A newline-terminated (COMPLETE)
+    log -- including one whose last complete record is corrupt -- is left byte-for-byte
+    untouched: a complete corrupt record is not a torn tail and must keep RAISING on read.
+
+    **Iteration-4 F3.**  If the fragment CANNOT be removed -- the truncating open or the
+    ``ftruncate``/``fsync`` fails (an owner append-only ``chflags uappnd`` log denies
+    ``O_WRONLY`` while ``O_APPEND`` still works, so the healer used to silently return and the
+    caller then appended a corrupting terminal record) -- this raises a TYPED refusal
+    (:data:`STANDALONE_UPGRADE_LOG_TORN_UNHEALED`) BEFORE any append, leaving the original log
+    bytes byte-for-byte unchanged.  Reads still skip the fragment in memory, so once the
+    restriction is lifted the heal succeeds and replay converges; nothing is ever appended
+    onto an unhealed torn tail."""
+    try:
+        data = path.read_bytes()
+    except FileNotFoundError:
+        return
+    except OSError:
+        return          # unreadable: leave it; the validated read surfaces it by name
+    if not data or data.endswith(b"\n"):
+        return          # empty or complete -- no torn tail to remove
+    keep = data.rfind(b"\n") + 1          # bytes up to and including the last newline (0 if none)
+    _quarantine_torn_upgrade_tail(path, data[keep:].decode("utf-8", "replace"))
+    try:
+        fd = os.open(str(path), os.O_WRONLY)
+    except OSError as exc:
+        raise LauncherError(
+            f"{STANDALONE_UPGRADE_LOG_TORN_UNHEALED}: the authority upgrade audit log at "
+            f"{path} has a crash-torn final fragment that could not be removed ({exc}); no "
+            "record is appended onto it (that would forge a newline-terminated corrupt line), "
+            "the original log bytes are unchanged, and reads still skip the fragment in memory "
+            "-- lift the restriction (e.g. `chflags nouappnd`) and the heal and replay proceed"
+        ) from exc
+    try:
+        os.ftruncate(fd, keep)
+        os.fsync(fd)
+    except OSError as exc:
+        raise LauncherError(
+            f"{STANDALONE_UPGRADE_LOG_TORN_UNHEALED}: the authority upgrade audit log at "
+            f"{path} has a crash-torn final fragment that could not be truncated ({exc}); no "
+            "record is appended onto it, the original log bytes are unchanged, and reads still "
+            "skip the fragment in memory") from exc
+    finally:
+        os.close(fd)
+    _fsync_directory(path.parent)
 
 
 def read_authority_upgrades(artifact_base: Any, run_id: str) -> tuple[dict[str, Any], ...]:
@@ -999,16 +1095,28 @@ def _reconcile_authority_upgrades_locked(artifact_base: Any, run_id: str) -> Non
     * the primary authority is the effective identity bound to the attempt's digest and
       the composition archive validates through the production loader -> the re-bind
       landed: append ``committed`` (ROLL FORWARD);
-    * the primary authority is still the exact legacy omitted-thread shape -> the re-bind
-      never landed: append ``rolled_back`` (ROLL BACK; the next read re-runs the upgrade
-      as a fresh attempt);
+    * the primary authority is still the exact legacy omitted-thread shape AND the
+      attempt's composition was already PUBLISHED (its content-addressed archive validates)
+      -> the operator's intent is fully durable but the rebind did not land: COMPLETE it
+      here -- atomically re-bind the primary to the attempt's digest and append
+      ``committed`` PRESERVING the prepared attempt's own identity (its ``actor`` /
+      ``reason`` / ``composition_source``) -- so the anonymous automatic upgrade never
+      consumes a published composition that belongs to an open EXPLICIT attempt and drops
+      its actor/reason (iteration-3 F3);
+    * the primary authority is still the legacy shape and the composition was NOT published
+      (crash before the two-phase writer's persist step) -> the re-bind never landed:
+      append ``rolled_back`` (ROLL BACK; the next read re-runs the upgrade as a fresh
+      attempt);
     * anything else (unreadable, another digest, another thread) is
       :data:`STANDALONE_MIGRATION_UNRECONCILABLE` -- nothing appended, the read refuses.
 
     Replaying the read after ANY crash cut point therefore converges to exactly one
-    ``committed`` record for the live authority, and a rebind is never left without an
-    audit record: the ``prepared`` intent precedes it on stable storage and this closes it.
+    ``committed`` record for the live authority, with the ORIGINAL actor/reason of an
+    explicit attempt preserved, and a rebind is never left without an audit record: the
+    ``prepared`` intent precedes it on stable storage and this closes it.
     """
+    log = _authority_upgrade_log_path(artifact_base, run_id)
+    _heal_torn_upgrade_tail_locked(log)                  # F2: clean boundary before appends
     primary = standalone_authority_path(artifact_base, run_id, "")
     for (uid, attempt), by_state in _upgrade_attempt_states(artifact_base, run_id).items():
         if MIGRATION_PREPARED not in by_state:
@@ -1031,7 +1139,18 @@ def _reconcile_authority_upgrades_locked(artifact_base: Any, run_id: str) -> Non
             load_standalone_prompt_composition(artifact_base, run_id, digest=digest)  # typed
             terminal["state"] = MIGRATION_COMMITTED
         elif _is_legacy_omitted_thread_authority(current, run_id):
-            terminal["state"] = MIGRATION_ROLLED_BACK
+            if digest and _composition_is_published(artifact_base, run_id, digest):
+                # F3: the publish landed, the rebind did not.  Roll the ORIGINAL prepared
+                # attempt FORWARD -- re-bind the primary to its digest and commit under its
+                # own identity -- rather than rolling it back and letting the anonymous
+                # automatic path re-bind the already-published composition with actor="".
+                upgraded = dict(current)
+                upgraded["thread_id"] = DEFAULT_THREAD_ID
+                upgraded["prompt_composition_digest"] = digest
+                _durable_write(primary, json.dumps(upgraded, sort_keys=True, indent=2) + "\n")
+                terminal["state"] = MIGRATION_COMMITTED
+            else:
+                terminal["state"] = MIGRATION_ROLLED_BACK
         else:
             raise LauncherError(
                 f"{STANDALONE_MIGRATION_UNRECONCILABLE}: run {run_id!r} has an interrupted "
@@ -1040,8 +1159,22 @@ def _reconcile_authority_upgrades_locked(artifact_base: Any, run_id: str) -> Non
                 "upgraded identity bound to that digest; the attempt is left open and every "
                 "authority read refuses rather than commit or roll back over unproven state")
         terminal["recorded_at"] = _authority_now()
-        _durable_append(_authority_upgrade_log_path(artifact_base, run_id),
-                        json.dumps(terminal, sort_keys=True) + "\n")
+        _durable_append(log, json.dumps(terminal, sort_keys=True) + "\n")
+
+
+def _composition_is_published(artifact_base: Any, run_id: str, digest: str) -> bool:
+    """Iteration-3 F3.  ``True`` when the content-addressed composition archive for
+    ``digest`` exists AND validates through the production loader -- i.e. the two-phase
+    upgrade writer's persist step (2) completed for this attempt before the crash.  A
+    missing archive is ``False`` (crash before persist -> roll back); a present-but-corrupt
+    archive propagates the typed :data:`STANDALONE_PROMPT_COMPOSITION_MISSING` refusal
+    rather than being silently treated as unpublished."""
+    if not digest:
+        return False
+    if not prompt_composition_archive_path(artifact_base, run_id, digest).exists():
+        return False
+    load_standalone_prompt_composition(artifact_base, run_id, digest=digest)   # typed refusal
+    return True
 
 
 def reconcile_authority_upgrades(artifact_base: Any, run_id: str) -> None:
@@ -1255,7 +1388,16 @@ def migrate_standalone_prompt_composition(artifact_base: Any, run_id: str, *,
                 "evidence proves the `launcher` thread; a run whose authority already "
                 "binds a composition is never re-bound here, and one whose thread evidence "
                 "is absent, unreadable or another thread's is not accepted")
-        persist_standalone_prompt_composition(artifact_base, run_id, composition)
+        # Round-10 item 4.  The composition is NOT pre-published here.  The pre-fix order
+        # persisted the composition BEFORE calling the two-phase writer (whose own protocol
+        # writes `prepared` FIRST and persists the composition SECOND); a crash after this
+        # outer persist but before the `prepared` record left the composition on disk with
+        # no audited intent, so the AUTOMATIC upgrade (`_upgrade_legacy_authority_if_needed`)
+        # would then find it and complete the upgrade as `composition_source=persisted,
+        # actor=""`, silently dropping the requested actor/reason and making this migration's
+        # replay refuse.  The two-phase `_write_upgraded_legacy_authority` is now the ONLY
+        # publication path: `prepared -> persist/rebind -> committed`, with actor/reason
+        # preserved across every crash cut and on replay.
         return _write_upgraded_legacy_authority(
             artifact_base, run_id, record, composition, evidence,
             composition_source="audited_migration", actor=actor, reason=reason)

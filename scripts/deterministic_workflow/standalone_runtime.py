@@ -23,6 +23,8 @@ from __future__ import annotations
 import errno
 import os
 import select
+import subprocess
+import sys
 import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -237,6 +239,21 @@ def _stream_is_final(drained: Mapping[str, Any]) -> bool:
     with a sentinel but no proof, and a proof that does not match the capture are all
     refused."""
     return drained.get("finality") == FINALITY_CAPTURE_FINALIZED
+
+
+def _holder_state_now(holders: Mapping[str, Any]) -> str:
+    """The tri-state absence verdict of the COMPLETE fail-closed ``libproc`` slave-descriptor
+    authority (iteration 4, option B): ``present`` (a process other than the exited agent and
+    the deferring watcher holds the slave DEVICE open -- on the tty or ``setsid``'d off it),
+    ``proven_absent`` (EVERY same-uid candidate's descriptors were read to completion and none
+    holds the slave), or ``unreadable`` (any candidate's enumeration failed for ANY reason --
+    a denied ``proc_pidinfo``, a growth failure, the listing itself: never a silent skip, and
+    UNREADABLE is never absence).  Only ``proven_absent`` -- a COMPLETE positive absence
+    obtained WHILE THE WATCHER IS HELD -- may authorise releasing the watcher so its revoke
+    delivers the real hangup; ``present`` and ``unreadable`` are both unproven and never
+    released.  ``ps``/``lsof``/tty membership authorise NOTHING (``lsof`` silently skips a
+    denied pid; this authority never does)."""
+    return str(holders.get("state") or "unreadable")
 
 
 class StandaloneSession:
@@ -2068,6 +2085,14 @@ class StandaloneSession:
                                               self.session_id, self.incarnation),
             fence=self.fence)
 
+    def _release_drain_handoff(self) -> None:
+        """Signal the supervisor's end of the drain handoff (round-10 item 1), releasing a
+        watcher still deferring its exit -- a byte then a close (see
+        :func:`pty_supervisor._signal_drain_handoff`).  Idempotent, and safe on an adopted
+        session (this process spawned nothing, so it holds no handoff end)."""
+        if self.pty is not None:
+            pty_supervisor._signal_drain_handoff(self.pty)
+
     def _reclaim(self, *, reason: str) -> dict[str, Any]:
         """Reap the exit watcher and release the pty master.  Finding 9.
 
@@ -2079,6 +2104,12 @@ class StandaloneSession:
         """
         reaped: dict[str, Any] = {"reaped": False, "status": None, "detail": "no pty"}
         if self.pty is not None:
+            # Round-10 item 1: RELEASE the deferring exit watcher BEFORE reaping it.  The
+            # supervisor-alive watcher blocks in `_await_drain_handoff` until this write end
+            # closes; the supervisor's own finalizing drain (`drain_after_exit`) has already
+            # run by the time `_reclaim` is reached, so closing it here lets the watcher exit
+            # at once and `reap_leader` does not wait out its physical-exit budget.
+            self._release_drain_handoff()
             reaped = pty_supervisor.reap_leader(
                 self.pty, timeout_ms=self.profile.timeouts.physical_exit_timeout_ms)
             self.release()
@@ -2188,24 +2219,39 @@ class StandaloneSession:
     #: with what held the slave, in the settlement's own vocabulary.
     POST_EXIT_DRAIN_BUDGET_MS = 2_000
 
+    #: The settle window (round-10 item 1, darwin): how long the master must be QUIET,
+    #: AFTER the exit is proven, before the drain RELEASES the deferring exit watcher so its
+    #: revoke delivers the real hangup that ends the read.  It stands on the PROVEN exit (the
+    #: watcher reaped the agent and wrote the sentinel), so no further byte can ORIGINATE and
+    #: the quiet means the tail is fully drained; the release then converts that quiet into a
+    #: real hangup rather than letting silence itself end the drain.
+    POST_EXIT_SETTLE_MS = 150
+
     def drain_after_exit(self, *, budget_ms: int | None = None) -> dict[str, Any]:
-        """Read the master into the capture until the pty HANGS UP, bounded.
+        """Read the master into the capture until the pty stream reaches a POSITIVE END,
+        bounded.
 
-        ``{"bytes": <appended>, "ended": "hangup" | "budget" | "no_master" |
+        ``{"bytes": <appended>, "ended": "hangup" | "quiesced" | "budget" | "no_master" |
         "master_unreadable", "errno": <name or "">}``.  Unlike :meth:`pump`, a quiet
-        ``select`` does NOT end this read: after a proven exit the only durable evidence
-        that no byte is still in flight is the hangup itself, so silence keeps waiting
-        until it -- or the bound.
+        ``select`` does not settle the stream cheaply -- the end must be positively
+        observed.
 
-        **What counts as the hangup (round-8 iteration 3).**  Exactly two observations:
-        a clean EOF (``b""``) and ``errno.EIO`` -- the pty's own "every slave descriptor
-        is closed" signals on the supported platforms.  ``EINTR`` is retried.  EVERY other
-        ``OSError`` from the read, and every ``OSError`` / ``ValueError`` from the poll, is
-        ``master_unreadable`` with the errno NAMED: a descriptor this process cannot read
-        proves nothing about the slave side, and iteration 2 mislabelled it as hangup
-        (the reviewer's ``EBADF`` mutation on a pty whose slave was still open returned
-        positive hangup evidence).  The caller -- :meth:`await_completion` -- authorises a
-        structured success ONLY from ``ended == "hangup"``.
+        **What counts as the positive end.**  On Linux the pty's own HANGUP: a clean EOF
+        (``b""``) or ``errno.EIO`` -- "every slave descriptor is closed" -- read TO the
+        hangup so a byte still in flight through the tty flip-buffer (round-8 iteration 3's
+        `flush_to_ldisc` race) is never missed.  On **darwin** the hangup NEVER arrives
+        while the exit watcher (the session leader) is alive: a session leader's exit is
+        what revokes the controlling tty and delivers the master EOF, and round-10 item 1
+        keeps that watcher ALIVE precisely so its exit cannot manufacture -- and truncate --
+        that hangup.  So on darwin the positive end is the master QUIESCING for
+        :data:`POST_EXIT_SETTLE_MS` AFTER the proven exit (the same reaped-then-quiesced end
+        the exit watcher's own `_finalize_orphaned_capture` uses on darwin), and
+        :meth:`_finalize_drain` proves it ONLY when the slave-holder probe finds a COMPLETE
+        positive absence (item 2).  ``EINTR`` is retried; every other ``OSError`` from the
+        read, and every ``OSError`` / ``ValueError`` from the poll, is ``master_unreadable``
+        with the errno NAMED (the reviewer's ``EBADF`` mutation proved nothing about the
+        slave side).  :meth:`await_completion` authorises a structured success ONLY through
+        :meth:`_finalize_drain`'s ``proven`` gate.
         """
         if self.pty is None or int(self.pty["master_fd"]) < 0:
             # No master in THIS process (an adopted session: the supervisor that held it
@@ -2225,36 +2271,126 @@ class StandaloneSession:
         deadline = self._clock() + budget
         read = 0
 
+        # Round-10 iteration 2.  On darwin the master EOF / EIO is delivered by the LAST slave
+        # close.  The exit watcher holds NO slave descriptor (`standalone_pty.spawn`: its
+        # 0/1/2 go to /dev/null and its inherited slave copy is closed), so the last slave
+        # close -- and thus the hangup -- is the AGENT's own, and it can arrive WHILE THE
+        # WATCHER IS STILL ALIVE.  The controlling invariant is that the watcher's exit /
+        # revoke MUST NEVER itself manufacture the hangup this drain accepts as proof -- so a
+        # hangup is a proof only when a COMPLETE POSITIVE SLAVE-ABSENCE PROOF (holder tri-state
+        # `proven_absent`) was obtained WHILE THE WATCHER WAS HELD.  There are two ways to
+        # reach that: (a) the drain reaches a quiet window, PROVES absence, and only then
+        # authorises the watcher's release (so its later revoke ends a stream provably without
+        # another writer); or (b) the agent's own hangup arrives with the watcher still ALIVE
+        # (no revoke, tty intact), and the drain proves absence at that hangup.  A `present` or
+        # `unreadable` holder authority is `unproven` (typed `stream_end_unproven`) on either
+        # path, never a hangup.  A hangup that arrives with the watcher already GONE and this
+        # drain not having authorised the release (it crashed, was killed, hit its ceiling, or
+        # was released by anything else) is `watcher_exit_unproven`: the probe would be
+        # post-revoke and cannot vouch for a discarded tail.  On Linux the slave's own close
+        # gives EOF / EIO independently of any watcher, so a hangup there is proof outright;
+        # `settle_s == 0` selects that platform and neither the absence gate nor the liveness
+        # guard applies.  Quiet time authorises nothing on its own: it is only the trigger to
+        # TRY the absence proof.
+        settle_s = (self.POST_EXIT_SETTLE_MS / 1000.0
+                    if sys.platform == "darwin" else 0.0)
+        # `had_watcher` keys on the STABLE session-leader identity, not on the handoff fd
+        # (which flips to -1 the moment the watcher is released): a darwin session that was
+        # spawned with a deferring watcher must, forever after, refuse a hangup this drain
+        # did not itself authorise -- even once the fd has closed.  A raw-pty test session
+        # (round-8 `Iteration2DrainAfterExitTests`) carries no `leader_pid`, so the guard
+        # does not apply and its slave-close hangup is proof outright.
+        had_watcher = (isinstance((self.pty or {}).get("leader_pid"), int)
+                       and int(self.pty["leader_pid"]) > 0)
+        last_data = self._clock()
+        handoff_released = False
+        absence_holders: dict[str, Any] | None = None
+
         def _unreadable(exc: BaseException) -> dict[str, Any]:
             code = getattr(exc, "errno", None)
             name = (errno.errorcode.get(code, str(code)) if code is not None
                     else type(exc).__name__)
             return {"bytes": read, "ended": "master_unreadable", "errno": name}
+
+        def _hangup_end(errno_name: str) -> dict[str, Any]:
+            # A darwin master EOF/EIO is delivered by the LAST slave close.  The watcher holds
+            # NO slave descriptor (see `standalone_pty.spawn`: its 0/1/2 go to /dev/null and
+            # its inherited slave copy is closed), so the last slave close -- and thus this
+            # hangup -- is the AGENT's own.  A hangup is therefore NOT necessarily a watcher
+            # revoke: it is the agent's genuine end-of-stream whenever the session-leader
+            # watcher is STILL ALIVE, holding the tty, at the moment of the hangup.  An EOF
+            # this drain itself authorised (`handoff_released`) already proved absence before
+            # releasing, so it is a hangup outright.  For an UNAUTHORISED hangup on darwin,
+            # the watcher's liveness discriminates -- and the watcher's exit never itself
+            # establishes the proof (the controlling invariant):
+            #
+            #   * watcher ALIVE (present on the captured tty, not a zombie): no revoke has
+            #     happened, the tty is intact, no tail can have been discarded.  PROVE slave
+            #     absence NOW, while the watcher is held -- the review's option (a).  A
+            #     COMPLETE positive absence (`proven_absent`: no process other than the exited
+            #     agent and the deferring watcher on the tty) is the end-of-stream proof, so
+            #     the hangup is genuine; a `present` or `unreadable` holder authority is
+            #     `unproven` (typed `stream_end_unproven`), never a hangup.
+            #   * watcher DEAD / zombie / gone: its exit revoked the tty and any holder probe
+            #     would be POST-revoke -- it cannot vouch for a discarded tail -- so the
+            #     hangup this drain did not authorise is `watcher_exit_unproven`.
+            if settle_s and had_watcher and not handoff_released:
+                if self._leader_alive():
+                    holders = self._slave_holders_now()
+                    if _holder_state_now(holders) == "proven_absent":
+                        return {"bytes": read, "ended": "hangup", "errno": errno_name,
+                                "holders": holders}
+                    return {"bytes": read, "ended": "retained_slave", "errno": errno_name,
+                            "holders": holders}
+                return {"bytes": read, "ended": "watcher_exit_unproven", "errno": errno_name,
+                        "holders": self._slave_holders_now()}
+            return {"bytes": read, "ended": "hangup", "errno": errno_name,
+                    "holders": absence_holders}
         while True:
-            remaining = deadline - self._clock()
-            if remaining <= 0:
+            now = self._clock()
+            if now >= deadline:
                 return self._finalize_drain({"bytes": read, "ended": "budget", "errno": ""})
             try:
-                ready, _, _ = select.select([fd], [], [], min(0.05, remaining))
+                ready, _, _ = select.select([fd], [], [], min(0.05, deadline - now))
             except InterruptedError:
                 continue                                 # EINTR: retried, never an end
             except (OSError, ValueError) as exc:         # a master this process cannot poll
                 return self._finalize_drain(_unreadable(exc))
             if not ready:
+                if (settle_s and had_watcher and not handoff_released
+                        and isinstance((self.pty or {}).get("drain_handoff_fd"), int)
+                        and int(self.pty["drain_handoff_fd"]) >= 0
+                        and self._clock() - last_data >= settle_s):
+                    # Quiet since the last byte: TRY to prove slave absence WHILE THE WATCHER
+                    # IS STILL HELD.  Only a COMPLETE positive absence (no process other than
+                    # the exited agent and the deferring watcher on the tty) releases the
+                    # watcher -- only then can its revoke EOF be accepted as the end of a
+                    # stream that provably has no other writer.  A `present` or `unreadable`
+                    # holder authority NEVER releases: the drain keeps reading, so a
+                    # transient child of the agent's own turn is waited out (the next quiet
+                    # check proves absence and releases), while a descendant that RETAINS the
+                    # slave never clears and the drain ends by BUDGET -> `unproven` ->
+                    # `stream_end_unproven`, its holders named.  Quiet time authorises
+                    # nothing on its own; it is only the trigger to try the absence proof.
+                    holders = self._slave_holders_now()
+                    if _holder_state_now(holders) == "proven_absent":
+                        absence_holders = holders
+                        self._release_drain_handoff()
+                        handoff_released = True
                 continue
             try:
                 chunk = self._master_reader(fd, self.profile.capture.read_chunk)
             except InterruptedError:
                 continue                                 # EINTR: retried, never an end
             except OSError as exc:
-                if exc.errno == errno.EIO:               # the slave side is gone (Linux)
-                    return self._finalize_drain({"bytes": read, "ended": "hangup",
-                                                 "errno": "EIO"})
+                if exc.errno == errno.EIO:               # the slave side is gone
+                    return self._finalize_drain(_hangup_end("EIO"))
                 return self._finalize_drain(_unreadable(exc))  # anything else proves nothing
-            if not chunk:                                # EOF: the same fact (darwin)
-                return self._finalize_drain({"bytes": read, "ended": "hangup", "errno": ""})
+            if not chunk:                                # EOF
+                return self._finalize_drain(_hangup_end(""))
             self.capture.append(chunk, at=_now_iso())
             read += len(chunk)
+            last_data = self._clock()
 
     def _finalized_path(self) -> bytes:
         return capture_mod.capture_finalized_path(self.capture.path, self.incarnation)
@@ -2275,17 +2411,42 @@ class StandaloneSession:
             exit_how, exit_code = str(self.exit_proof.get("how") or "ladder"), None
         else:
             exit_how, exit_code = "", None
-        proven = drained.get("ended") == "hangup" and bool(exit_how)
-        holders: dict[str, Any] | None = None
+        ended = drained.get("ended")
+        # Round-10 iteration 2: a HANGUP is the positive end -- but on darwin the drain only
+        # emits `ended == "hangup"` after it proved slave absence WHILE THE WATCHER WAS HELD:
+        # either it drained to a quiet window, proved absence and authorised the release, or a
+        # hangup arrived with the watcher STILL ALIVE (the agent's own last slave close, not a
+        # revoke) and it proved absence then.  Both carry that absence proof (`drained
+        # ["holders"]`) and neither is manufactured by the watcher's exit.  Every other end --
+        # `retained_slave` (a present/unreadable holder authority at the quiet check OR at a
+        # watcher-alive hangup), `watcher_exit_unproven` (a darwin hangup this supervisor did
+        # not authorise, arriving after the watcher was already gone), `budget`,
+        # `master_unreadable` -- is UNPROVEN, naming the holder / cause; the finality gate then
+        # settles a typed `stream_end_unproven`, never COMPLETED.
+        proven = ended == "hangup" and bool(exit_how)
+        # The absence / holder evidence: the drain already carries it (proven-absence on a
+        # hangup, the offending holders otherwise); fall back to a fresh probe only when it
+        # did not.
+        holders = drained.get("holders")
+        if not isinstance(holders, dict):
+            holders = self._slave_holders_now()
         detail = ""
         if not proven:
-            holders = self._slave_holders_now()
-            detail = ("the pty did not hang up within the post-exit drain bound "
-                      f"({self.profile.timeouts.post_exit_drain_budget_ms} ms); a "
-                      "descendant may still hold the slave" if drained.get("ended") == "budget"
-                      else f"the master could not be read ({drained.get('errno')})"
-                      if drained.get("ended") == "master_unreadable"
-                      else "the exit is not proven; nothing binds the capture's end")
+            detail = (
+                "a darwin master EOF arrived without this supervisor authorising the "
+                "watcher's release, so the watcher's exit -- not a proven slave absence -- "
+                "produced it; the revoke may have discarded a tail" if ended == "watcher_exit_unproven"
+                else "the pty hung up while the watcher was still held (the agent's own "
+                "hangup, no revoke), but a holder authority was present or unreadable on the "
+                "captured tty, so slave absence was never proven"
+                if ended == "retained_slave"
+                else "the pty did not hang up within the post-exit drain bound "
+                f"({self.profile.timeouts.post_exit_drain_budget_ms} ms); a descendant "
+                "retained the slave past the settle window (absence never proven)"
+                if ended == "budget"
+                else f"the master could not be read ({drained.get('errno')})"
+                if ended == "master_unreadable"
+                else "the exit is not proven; nothing binds the capture's end")
         try:
             capture_mod.write_capture_finalized(
                 self._finalized_path(), fence=self.fence,
@@ -2347,23 +2508,70 @@ class StandaloneSession:
         return drained
 
     def _slave_holders_now(self) -> dict[str, Any]:
-        """The tty-scoped process table for the captured tty, minus the agent itself:
-        what still holds the slave when a drain ends by budget (the retained-slave cause,
-        observable by name)."""
+        """The COMPLETE, fail-closed slave-descriptor authority (iteration 4, option B):
+        :func:`standalone_pty.slave_device_holders` enumerates EVERY same-uid process's open
+        descriptors (darwin ``libproc``) and matches each vnode fd against the slave device's
+        ``(dev, ino)``, so it finds a retained holder -- on the tty or ``setsid``'d off it --
+        and NEVER silently skips a process (a denied ``proc_pidinfo`` becomes ``unenumerable``
+        -> ``unreadable``, unlike ``lsof``).  The exited agent and the deferring watcher are
+        excluded (neither is a holder).  A tty-scoped ``ps -t`` listing is attached purely as
+        additional diagnostic naming; the ``state`` is the ``libproc`` authority's and nothing
+        else moves it."""
+        slave = str((self.pty or {}).get("slave_name") or "")
         tty = str((self.record or {}).get("captured_tty") or "")
-        out: dict[str, Any] = {"tty": tty, "method": "process_table", "readable": False,
-                               "rows": []}
-        if not tty:
-            return out
-        try:
-            snapshot = self._snapshot()
-        except Exception:  # noqa: BLE001 - evidence, never a failure of the drain
-            return out
-        out["readable"] = bool(snapshot.get("readable", False))
         agent = int((self.record or {}).get("pid") or 0)
-        out["rows"] = [dict(row) for row in snapshot.get("rows", ())
-                       if int(row.get("pid", 0)) != agent]
+        leader = int((self.pty or {}).get("leader_pid") or (self.record or {}).get("sid") or 0)
+        out = pty_supervisor.slave_device_holders(slave, exclude_pids=(agent, leader))
+        out["tty"] = tty
+        out["fd_holders"] = list(out.get("holders") or ())
+        # Diagnostic tty rows only (never a proof); best-effort.
+        rows: list[dict[str, Any]] = []
+        if tty:
+            try:
+                snapshot = self._snapshot()
+                rows = [dict(row) for row in snapshot.get("rows", ())
+                        if int(row.get("pid", 0)) not in (agent, leader)]
+            except Exception:  # noqa: BLE001 - evidence, never a failure of the drain
+                rows = []
+        out["rows"] = rows
         return out
+
+    def _leader_alive(self) -> bool:
+        """Round-10 iteration 2 (item 1): a NON-reaping, zombie-aware liveness probe of the
+        exit watcher (this supervisor's OWN child, ``leader_pid``), used by
+        ``drain_after_exit`` to tell the agent's genuine hangup (OUR watcher still running, so
+        it did not produce this hangup) from OUR watcher's own revoke (watcher gone).
+
+        The probe is PROCESS-scoped (``ps -p <leader> -o stat=``), NOT tty-scoped, and that is
+        deliberate: an agent that made the slave its OWN controlling terminal (via ``setsid`` +
+        ``TIOCSCTTY`` -- some real CLIs do) revokes that tty when it exits, which DETACHES our
+        still-alive watcher from the tty, so a ``ps -t`` of the captured tty no longer lists the
+        watcher even though it is very much alive and deferring (observed: ``ps -t`` row absent
+        while ``ps -p`` reports state ``Ss``).  That agent-exit revoke is the AGENT's own end-of-stream,
+        not OUR watcher's -- so the discriminator must be the watcher's PROCESS liveness, never
+        its tty membership.  ``ps -p`` targets one known pid (this process's own child); it is
+        not the tty-scoped ownership discovery the C2 rule governs and is not a ``ps -ax`` scan.
+
+        True ONLY when the watcher process exists with a non-zombie state.  GONE (empty
+        output), a ZOMBIE (its ``exit`` -- and thus any revoke of a tty IT led -- has already
+        run; it merely awaits ``reap``), or an unreadable/failed probe all read as NOT alive:
+        the caller then fails closed and refuses the unauthorised hangup as
+        ``watcher_exit_unproven``.  Never ``waitpid``s the leader -- that would reap it out
+        from under ``_reclaim``."""
+        leader = int((self.pty or {}).get("leader_pid") or (self.record or {}).get("sid") or 0)
+        if leader <= 0:
+            return False
+        try:
+            probe = subprocess.run(["ps", "-o", "stat=", "-p", str(leader)],
+                                   capture_output=True, text=True, timeout=10, check=False)
+        except (OSError, subprocess.SubprocessError):
+            return False           # could not look: UNKNOWN is never liveness, fail closed
+        if probe.returncode not in (0, 1):
+            return False
+        stat = (probe.stdout or "").strip()
+        if not stat:
+            return False           # the watcher is gone -- its exit (any revoke) already ran
+        return not stat.startswith("Z")
 
     def pump(self, *, timeout_ms: int = 50) -> int:
         """Read whatever is available on the master fd into the bounded capture."""

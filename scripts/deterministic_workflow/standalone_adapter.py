@@ -33,6 +33,7 @@ durable ledger and ``IDEMPOTENCY_PORT_REQUIRED`` cannot fire), ``.approval_port`
 """
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Mapping
 from pathlib import Path
@@ -684,7 +685,8 @@ class StandaloneAdapter:
             if sentinel_path is not None:
                 verified = self._await_exit_evidence(
                     handle, sentinel_path, fence=f"{session_id}:{incarnation}",
-                    leader_pid=leader)
+                    leader_pid=leader,
+                    budget_ms=self._exit_evidence_budget_ms(run_id, incarnation))
                 if verified is not None:
                     return verified
             if listed and str(row["stat"]).startswith("Z"):
@@ -706,14 +708,54 @@ class StandaloneAdapter:
                               f"({probe['outcome']}); it is not proven ours"}
         return {"handle": handle, "handle_recovery": "listing_verified"}
 
-    #: How long a reader waits for exit evidence that is IN FLIGHT -- the watcher alive,
-    #: the agent exited, the sentinel not yet written.  Measured at ~10 ms on the MVP host
-    #: under load; the bound exists for a wedged watcher and is never the normal cost.
-    #: Round-9 item 1: an ORPHANED watcher drains the master to the hangup (bounded by
-    #: the profile's `post_exit_drain_budget_ms`, default 2 s) BEFORE it writes the
-    #: sentinel, so this bound covers that default drain plus a margin; a slower profile
-    #: at worst makes this reader answer "unknown" for a sentinel that lands later.
+    #: The FALLBACK bound on how long a reader waits for exit evidence that is IN FLIGHT --
+    #: the watcher alive, the agent exited, the sentinel not yet written.  Measured at ~10
+    #: ms on the MVP host under load; the bound exists for a wedged watcher and is never the
+    #: normal cost.  Round-10 follow-up (b): the OPERATIVE bound is now derived per run from
+    #: the profile's own ``post_exit_drain_budget_ms`` -- the orphaned watcher drains the
+    #: master to the hangup under exactly that budget BEFORE it writes the sentinel, and a
+    #: supervisor-alive watcher DEFERS its exit until the supervisor's own drain (same
+    #: budget) is done -- plus :data:`EXIT_EVIDENCE_MARGIN_MS`.  This constant is used only
+    #: when the run's profile cannot be resolved, and the derived bound is never shorter
+    #: than it, so a slower profile no longer makes this reader answer "unknown" for a
+    #: sentinel that its own (raised) drain budget guaranteed would land later.
     EXIT_EVIDENCE_BUDGET_MS = 3_500
+    #: The margin added to the profile's ``post_exit_drain_budget_ms`` to cover the reap +
+    #: meta-save + sentinel write that follow the drain.  ``3_500 = 2_000 + 1_500`` keeps
+    #: the default identical to the pre-fix constant.
+    EXIT_EVIDENCE_MARGIN_MS = 1_500
+
+    def _exit_evidence_budget_ms(self, run_id: str, incarnation: str) -> int:
+        """The exit-evidence wait for THIS run, derived from its profile's
+        ``post_exit_drain_budget_ms`` (round-10 follow-up (b)), never shorter than the
+        :data:`EXIT_EVIDENCE_BUDGET_MS` fallback.  A profile that cannot be resolved (no
+        binding, unreadable, a corrupt archive) falls back to the constant rather than
+        raising -- this is a liveness wait, not an authority read."""
+        from . import launcher  # local import: the adapter must not import launcher at load
+        budget = None
+        try:
+            # Read the persisted profile spec WITHOUT the authority read path's
+            # reconciliation side effects (a liveness probe must not mutate the run): the
+            # digest-bound archive when the primary authority names one, else the run-global
+            # profile.json.  `post_exit_drain_budget_ms` is a tuning bound, so the run-global
+            # value is a sound source when a per-thread archive is not resolvable.
+            digest = ""
+            try:
+                primary = launcher.standalone_authority_path(self.artifact_base, run_id, "")
+                record = json.loads(primary.read_text(encoding="utf-8"))
+                digest = str((record or {}).get("profile_digest") or "")
+            except (OSError, ValueError, TypeError):
+                digest = ""
+            spec = launcher.load_standalone_profile(self.artifact_base, run_id, digest=digest)
+            if isinstance(spec, Mapping):
+                timeouts = spec.get("timeouts")
+                if isinstance(timeouts, Mapping):
+                    value = timeouts.get("post_exit_drain_budget_ms")
+                    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                        budget = value + self.EXIT_EVIDENCE_MARGIN_MS
+        except Exception:  # noqa: BLE001 - the fallback is the point; never raise here
+            budget = None
+        return max(self.EXIT_EVIDENCE_BUDGET_MS, budget) if budget else self.EXIT_EVIDENCE_BUDGET_MS
 
     @staticmethod
     def _verified_by_sentinel(handle: str, sentinel_path: Any, *,
@@ -728,16 +770,20 @@ class StandaloneAdapter:
                           "proven ended"}
 
     def _await_exit_evidence(self, handle: str, sentinel_path: Any, *, fence: str,
-                             leader_pid: int) -> Mapping[str, Any] | None:
+                             leader_pid: int, budget_ms: int | None = None
+                             ) -> Mapping[str, Any] | None:
         """The fenced sentinel, awaited while the exit watcher is ALIVE.  CI-2.
 
         Returns the verified answer the moment the sentinel lands; ``None`` when the
         watcher is gone (nothing will ever write it) or the budget elapses (unknown).
         The watcher is identified by the child's own spawn record (`sid` is the leader),
         so a recycled leader pid can at worst make this wait the budget, never verify.
+        ``budget_ms`` (round-10 follow-up (b)) is the per-run bound derived from the
+        profile's ``post_exit_drain_budget_ms``; ``None`` uses the fallback constant.
         """
         import time
-        deadline = time.time() + self.EXIT_EVIDENCE_BUDGET_MS / 1000.0
+        budget = self.EXIT_EVIDENCE_BUDGET_MS if budget_ms is None else budget_ms
+        deadline = time.time() + budget / 1000.0
         while True:
             verified = self._verified_by_sentinel(handle, sentinel_path, fence=fence)
             if verified is not None:

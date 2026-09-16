@@ -452,16 +452,71 @@ qualified "at the pinned revision".
   (typed FAILED/LOST), with the RETAINED-SLAVE CAUSE NAMED in the finalized record's
   `holders` evidence: the slave's foreground process group and whether it still has members
   (both platforms), plus, on Linux, a `/proc/<pid>/fd` scan naming each holder's pid, comm
-  and fds.  The exit watcher is a `setsid` session leader and on darwin a session-leader
-  reader never sees the master EOF while it lives and darwin offers no subprocess-free fd
-  enumeration; there the `proven` gate is "agent reaped (its `waitpid` status in hand) +
-  output quiesced + the agent's foreground process group empty", which stands on the
-  reaped exit rather than on silence, and a descendant that ALSO left the agent's process
-  group is the stated darwin limit of the holder evidence.  Choice (c) -- the item-1
-  finalization protocol -- is the positive proof that stays sound when descendants exist;
-  choice (a)'s observability and configurable bound are how a genuinely retained slave is
-  reported.  Locked by
-  `test_os37_round9_review_regressions.py::Item1WatcherFinalizeOverRealPtyTests`.
+  and fds.
+
+  **Iteration 4 (option B) -- the darwin proof gate is a COMPLETE, fail-closed `libproc`
+  slave-descriptor authority, the ONE deliberate exception to "the kernel hangup is the only
+  proof".**  Two darwin facts MEASURED on this host (probes retained under
+  `artifacts/runs/run_5855732a7f74/evidence/iter4/`) force this: (1) the exit watcher makes the
+  slave its CONTROLLING TERMINAL so the pty's unread tail is never reclaimed while it lives (a
+  slow supervisor never loses the tail), and a consequence is that NO alive process ever
+  observes the master hangup while that session leader lives -- not a separate reader (the
+  supervisor) and not even the leader itself as the SOLE master holder (the production orphan
+  path with no holder reads `ended=budget`, never a hangup); the hangup is delivered ONLY when
+  the ctty leader EXITS and revokes.  (2) Removing the controlling terminal makes the hangup
+  observable while the watcher lives, but darwin then reclaims the master's unread buffer
+  ~0.3-1 s after the agent exits -- reintroducing the lost tail.  So the hangup used as proof
+  is the watcher's release/revoke, and the RELEASE is gated on a COMPLETE positive
+  slave-absence proof obtained while the watcher is held.  The authority is `libproc`
+  (`standalone_pty.slave_device_holders`), NOT `lsof`, and the darwin `libproc` semantics it
+  rests on were pinned empirically (reviewer iter5 corrections):
+
+  * **Enumeration (F1).** `proc_listallpids` returns the number of PID **entries**, not a byte
+    length; the fill count is used directly (dividing by `sizeof(int32)` scanned one quarter of
+    the table and silently omitted any holder past the prefix).  A fill that reaches buffer
+    capacity is a truncation/growth and is re-queried, bounded, else `unreadable`.
+  * **Inspection gate (F2).** The gate for inspecting a process is FD INSPECTABILITY, never an
+    identity read.  A same-uid holder whose `PROC_PIDTBSDINFO` is denied is still caught because
+    its fd **listing** succeeds and is inspected directly (identity is not on the proof path).  A
+    process whose fd listing the kernel denies (`EPERM`/`EACCES`) is -- since we are not root --
+    provably not our uid; a mode-0620 owner-uid pty slave cannot be open in it, so it is the
+    diagnostic `other_uid` bucket and does not block the proof.  On darwin identity-readability
+    and fd-listing-readability are the same permission (both succeed iff same-uid), so this is a
+    kernel-enforced boundary, not an assumption.  Changed-uid (`setuid`) descendants are
+    explicitly OUT OF SCOPE and are not claimed as covered.
+  * **Fd-table race (F3).** A per-fd query failure is a MOVING fd table, not proof of absence: a
+    holder can `dup2` the slave onto a descriptor that was a pipe in an earlier snapshot and
+    close the originals (which then read `EBADF`).  Each process is therefore re-scanned over a
+    FRESH `PROC_PIDLISTFDS` listing (so a relocated slave is seen as a vnode now), and only TWO
+    consecutive, complete, IDENTICAL `(fd -> dev/ino)` scans count as inspected; an fd table that
+    never settles within the bound is `unstable` -> `unenumerable`.  A whole-process `ESRCH` is
+    `gone` (it holds nothing); a bystander that closes a fd once re-scans clean and still proves
+    absent, so ordinary churn does not make a busy host `unreadable`.
+  * **Exact-size decode (F4).** `PROC_PIDFDVNODEPATHINFO` returns exactly 1200 bytes for a valid
+    vnode fd (`vst_dev`@+24, `vst_ino`@+32; agrees with `fstat` of an open slave); a positive but
+    SHORT/long return, or a malformed listing length, is `unenumerable` for that pid and is never
+    decoded from the zero-filled buffer.
+
+  The ONE thing skipped (recorded, never silent) is a per-fd `EPERM`/`EACCES`: a pty slave vnode
+  is never permission-restricted (its `proc_pidfdinfo` succeeds in the reference and in a real
+  cross-process holder), so a fd macOS refuses to introspect is provably not the slave; without
+  this a host with any TCC-restricted-fd launchd agent would be permanently `unreadable`.  The
+  slave reference `(dev, ino)` is taken by `fstat` of an OPEN slave fd, whose pty vnode reports a
+  DIFFERENT inode than the devfs path node.  **Scope**, the explicit reviewable limit: every
+  process whose fds the kernel lets us read (exactly the same-uid set) is fully inspected; a
+  process of another uid is the diagnostic `other_uid` bucket and cannot hold a mode-0620
+  owner-uid slave.  "Complete" is NOT the whole host (an other-uid process's fds are
+  unreadable to a non-root owner and it cannot hold the slave) and NOT tty membership (`ps -t` is
+  blind to a `setsid` holder).  The release is a
+  TOCTOU-tight single step (prove, then close the handoff at once; no new holder can appear
+  after the agent's exit -- there is no process to fork-inherit the slave).  The orphan path
+  (the watcher, after the supervisor dies) runs the SAME authority before writing any `proven`
+  record; if it cannot run it in the forked context it writes `unproven`, never
+  `quiesced`-as-proven.  Choice (c) -- the item-1 finalization protocol -- is the positive
+  proof that stays sound when descendants exist; choice (a)'s observability and configurable
+  bound are how a genuinely retained slave is reported.  Locked by
+  `test_os37_round9_review_regressions.py::Item1WatcherFinalizeOverRealPtyTests` and
+  `test_os37_round10_review_regressions.py::Iteration4LibprocAuthorityTests`.
 
 * **A crash-consistent prompt-composition upgrade / migration** (round-9 item 2).  The
   legacy-authority upgrade (`_write_upgraded_legacy_authority`) is now the same reconcilable
@@ -525,3 +580,57 @@ qualified "at the pinned revision".
   lacking prompt composition is recoverable".  An explicit-thread legacy record is a
   separate, unimplemented path.  Locked by
   `test_os37_round9_review_regressions.py::DocScopeTests`.
+
+## Round 10 -- consolidated follow-up review of `bcd5c6d` (issuecomment-5688372349)
+
+* **The supervisor is the SINGLE finalizing owner and the exit watcher's exit can no longer
+  manufacture the hangup** (round-10 item 1).  On darwin a session leader's exit REVOKES the
+  controlling tty and DISCARDS the master's unread tail -- empirically reproduced on this
+  host (`artifacts/runs/.../evidence/repro/`): the pre-fix topology, watcher exiting the
+  instant it wrote the sentinel, left the supervisor's drain reading `[EOF]` with the tail
+  gone, so a success record followed by a lost final failure record settled
+  `COMPLETED/succeeded`.  The pre-fix darwin finality proof therefore stood entirely on that
+  revoke-manufactured hangup.  Now the supervisor-alive exit watcher DEFERS its own exit on a
+  drain-handoff pipe (`dh_r`/`dh_w`; the watcher blocks in `_await_drain_handoff` after
+  writing the sentinel, keeping the session-leader tty alive), and the supervisor drains the
+  WHOLE tail while the tty is alive.  The drain still ends only on the HANGUP -- the round-8/9
+  contract that silence never ends it is unchanged: on Linux the slave's own close gives EOF /
+  `EIO`; on darwin the supervisor, once the master has been QUIET for `POST_EXIT_SETTLE_MS`
+  after the proven exit (the tail is drained and no byte can still originate), RELEASES the
+  watcher (`_signal_drain_handoff`, and `_reclaim` / `release` release it too), whose exit
+  then delivers a REAL post-drain hangup.  So the revoke can no longer truncate the tail --
+  the tail is drained before it -- yet the proof still stands on the hangup, never on silence.
+  The watcher writes no proof in the supervisor-alive path, so a supervisor killed before its
+  proof still leaves none and a successor still refuses `stream_end_unproven`.
+  Locked by `test_os37_round10_review_regressions.py::Item1MacOSLostTailTests` and the
+  crash-cut locks of `::Finding1SupervisorCrashCutTests` (round 9), which stay green.
+
+* **`unreadable` slave-holder authority is never collapsed into absence** (round-10 item 2).
+  `standalone_pty._slave_holders` records whether each probe COMPLETED and
+  `_slave_holder_state` is a tri-state: `present` / `proven_absent` / `unreadable`.  A failed
+  `tcgetpgrp`, an unreadable `/proc`, or a skipped `/proc/<pid>/fd` entry is `unreadable` with
+  the failed authority NAMED, and only a COMPLETE positive absence proof yields `proven`.
+  `tcgetpgrp() <= 0` is "no usable foreground group" (a complete positive absence on that
+  axis), never a `killpg(0, 0)`.  Locked by
+  `test_os37_round10_review_regressions.py::Item2SlaveHolderTriStateTests`.
+
+* **A torn authority-upgrade log tail no longer blocks recovery** (round-10 item 3).
+  `read_authority_upgrade_records` consumes only newline-terminated records and quarantines
+  ONLY the final unterminated fragment (recorded in a `.torn` sibling); a complete corrupt
+  record still RAISES.  Locked by
+  `test_os37_round10_review_regressions.py::Item3TornUpgradeTailTests`.
+
+* **Explicit prompt migration does not pre-publish the composition** (round-10 item 4).
+  `migrate_standalone_prompt_composition` no longer persists the composition before the
+  two-phase writer; `_write_upgraded_legacy_authority` (`prepared -> persist/rebind ->
+  committed`) is the ONLY publication path, so a crash can no longer leave a composition on
+  disk with no `prepared` record for the automatic path to complete as
+  `composition_source=persisted, actor=""`.  Actor/reason are preserved across every crash cut
+  and on replay.  Locked by
+  `test_os37_round10_review_regressions.py::Item4NoPrePublicationTests`.
+
+* **Same-boundary follow-ups.**  (a) `_watch` re-checks the supervisor guard after reaping the
+  agent, so a simultaneous agent-exit and supervisor-death never skip orphan finalization.
+  (b) `recover_handle`'s exit-evidence wait is derived from the run profile's
+  `post_exit_drain_budget_ms` (`_exit_evidence_budget_ms`), not the fixed 3.5 s constant.
+  (c) `tcgetpgrp() <= 0` never triggers `killpg(0, 0)`.

@@ -26,6 +26,7 @@ Four refusals gate it, and each one sends NO signal.
 """
 from __future__ import annotations
 
+import ctypes
 import errno
 import fcntl
 import json
@@ -550,6 +551,12 @@ class PtySession(TypedDict):
     #: the exit watcher and becomes readable -- EOF -- only when every copy of this end is
     #: closed, i.e. when the supervisor process is gone.  Closed by :func:`release`.
     orphan_guard_fd: int
+    #: The SUPERVISOR's end of the DRAIN HANDOFF (round-10 item 1).  The watcher, having
+    #: reaped the agent and written the exit sentinel, defers its own exit -- keeping the
+    #: session-leader tty alive so an unread tail is not revoke-discarded on darwin -- until
+    #: this end is closed (in :meth:`StandaloneSession._reclaim`, after the supervisor's own
+    #: finalizing drain) or the supervisor dies.  Closed by :func:`release`.
+    drain_handoff_fd: int
 
 
 class SpawnHandoffFailed(OSError):
@@ -566,13 +573,15 @@ class SpawnHandoffFailed(OSError):
     """
 
     def __init__(self, detail: str, *, leader_pid: int, master_fd: int, slave_name: str,
-                 pty_id: str, orphan_guard_fd: int, argv: tuple[str, ...]) -> None:
+                 pty_id: str, orphan_guard_fd: int, argv: tuple[str, ...],
+                 drain_handoff_fd: int = -1) -> None:
         super().__init__(errno.ECHILD, detail)
         self.leader_pid = leader_pid
         self.master_fd = master_fd
         self.slave_name = slave_name
         self.pty_id = pty_id
         self.orphan_guard_fd = orphan_guard_fd
+        self.drain_handoff_fd = drain_handoff_fd
         self.argv = argv
 
     def retained_session(self) -> "PtySession":
@@ -582,7 +591,8 @@ class SpawnHandoffFailed(OSError):
         return {"master_fd": self.master_fd, "slave_name": self.slave_name, "pid": 0,
                 "pgid": 0, "sid": self.leader_pid, "leader_pid": self.leader_pid,
                 "pty_id": self.pty_id, "argv": self.argv,
-                "orphan_guard_fd": self.orphan_guard_fd}
+                "orphan_guard_fd": self.orphan_guard_fd,
+                "drain_handoff_fd": self.drain_handoff_fd}
 
 
 def spawn(*, argv: Sequence[str], env: Mapping[str, str], profile: StandaloneProfile,
@@ -688,6 +698,17 @@ def spawn(*, argv: Sequence[str], env: Mapping[str, str], profile: StandalonePro
     # `guard_w`, so the read end reports EOF exactly when the supervisor is gone.
     guard_r, guard_w = os.pipe()
     fcntl.fcntl(guard_w, fcntl.F_SETFD, fcntl.FD_CLOEXEC)
+    # The DRAIN HANDOFF (round-10 item 1): when the supervisor is alive at the agent's
+    # exit, IT owns the final drain -- but the watcher is the session LEADER, and on darwin
+    # a session leader's exit REVOKES the controlling tty and DISCARDS the unread tail still
+    # buffered on the master.  So the watcher, having reaped the agent and written the exit
+    # sentinel, DEFERS its own exit -- keeping the tty alive -- until the supervisor closes
+    # `dh_w` (it does so in `_reclaim`, after its own finalizing drain) or dies.  The
+    # watcher keeps `dh_r`; only the supervisor keeps `dh_w`.  This makes the supervisor the
+    # SINGLE finalizing owner in that path: watcher exit can no longer manufacture the
+    # hangup the supervisor reads as capture finality over a truncated capture.
+    dh_r, dh_w = os.pipe()
+    fcntl.fcntl(dh_w, fcntl.F_SETFD, fcntl.FD_CLOEXEC)
     # Enumerated AFTER the pipes exist, so the child's `closerange` and the watcher's own
     # descriptor sweep both cover them.
     close_up_to = highest_open_fd()
@@ -699,6 +720,7 @@ def spawn(*, argv: Sequence[str], env: Mapping[str, str], profile: StandalonePro
         try:
             os.close(handoff_r)
             os.close(guard_w)
+            os.close(dh_w)            # the watcher must not hold the supervisor's write end
             os.setsid()
             try:
                 fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
@@ -767,13 +789,14 @@ def spawn(*, argv: Sequence[str], env: Mapping[str, str], profile: StandalonePro
             _watch(agent_pid, master_fd=master_fd, slave_fd=slave_fd, guard_r=guard_r,
                    close_up_to=close_up_to, sentinel=sentinel, fence=fence,
                    capture=capture_target, capture_limits=profile.capture,
-                   slave_name=slave_name,
+                   slave_name=slave_name, dh_r=dh_r,
                    drain_budget_ms=profile.timeouts.post_exit_drain_budget_ms)
         except BaseException:
             os._exit(127)
     os.close(slave_fd)
     os.close(handoff_w)
     os.close(guard_r)
+    os.close(dh_r)                    # the supervisor keeps only the write end `dh_w`
     pty_id = f"pty-{uuid.uuid4().hex[:12]}"
     argv_tuple = tuple(str(a) for a in argv)
     try:
@@ -791,17 +814,19 @@ def spawn(*, argv: Sequence[str], env: Mapping[str, str], profile: StandalonePro
             "the pty session leader never reported an agent pid; no agent process "
             "identity exists, so none is invented -- the pty is retained for teardown",
             leader_pid=leader_pid, master_fd=master_fd, slave_name=slave_name,
-            pty_id=pty_id, orphan_guard_fd=guard_w, argv=argv_tuple)
+            pty_id=pty_id, orphan_guard_fd=guard_w, argv=argv_tuple,
+            drain_handoff_fd=dh_w)
     return {"master_fd": master_fd, "slave_name": slave_name, "pid": agent_pid,
             "pgid": agent_pid, "sid": leader_pid, "leader_pid": leader_pid,
-            "pty_id": pty_id, "argv": argv_tuple, "orphan_guard_fd": guard_w}
+            "pty_id": pty_id, "argv": argv_tuple, "orphan_guard_fd": guard_w,
+            "drain_handoff_fd": dh_w}
 
 
 def _watch(agent_pid: int, *, master_fd: int, slave_fd: int, guard_r: int,
            close_up_to: int, sentinel: str | os.PathLike[str] | None, fence: str,
            capture: bytes | None,
            capture_limits: CaptureLimits | None = None,
-           slave_name: str = "", drain_budget_ms: int = 2_000
+           slave_name: str = "", drain_budget_ms: int = 2_000, dh_r: int = -1
            ) -> None:  # pragma: no cover - runs in the forked watcher
     """The exit watcher's whole life.  Raw ``os`` calls only: this is a forked child.
 
@@ -833,6 +858,18 @@ def _watch(agent_pid: int, *, master_fd: int, slave_fd: int, guard_r: int,
     supervisor is ALIVE at the agent's exit it owns the drain and writes the proof itself;
     the sentinel this watcher writes at once is exit evidence only and no reader may take
     it for capture completion.
+
+    **The supervisor-alive watcher DEFERS its exit** (round-10 item 1).  On darwin a
+    session leader's exit REVOKES the controlling tty and discards the unread tail still
+    buffered on the master, so a watcher that reaped the agent, wrote the sentinel and
+    exited AT ONCE could manufacture the very hangup the supervisor then read as capture
+    finality -- over a capture the revoke had just truncated.  So when the supervisor is
+    alive this watcher writes the sentinel (the supervisor needs it to start its own drain)
+    and then BLOCKS in :func:`_await_drain_handoff`, keeping the session-leader tty alive,
+    until the supervisor closes ``dh_r``'s write end (it does so in ``_reclaim``, after its
+    own finalizing drain) or the supervisor dies.  It writes NO proof on that path -- the
+    supervisor is the single finalizing owner -- so a supervisor killed before its proof
+    still leaves no proof and a successor still refuses ``stream_end_unproven``.
     """
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
     try:
@@ -859,6 +896,8 @@ def _watch(agent_pid: int, *, master_fd: int, slave_fd: int, guard_r: int,
     signal.set_wakeup_fd(wake_w, warn_on_full_buffer=False)
     signal.signal(signal.SIGCHLD, lambda *_args: None)
     keep = {master_fd, guard_r, wake_r, wake_w}
+    if dh_r >= 0:
+        keep.add(dh_r)
     for fd in range(3, close_up_to + 1):
         if fd not in keep:
             try:
@@ -888,33 +927,96 @@ def _watch(agent_pid: int, *, master_fd: int, slave_fd: int, guard_r: int,
                 # has no reader but this process, so it becomes the reader -- under the
                 # SAME limits the supervisor applied (finding 4).
                 orphaned = True
-                try:
-                    os.close(guard_r)
-                except OSError:
-                    pass
-                if capture is not None:
-                    try:
-                        appender = capture_mod.RawBoundedAppender(
-                            capture, limits=capture_limits or CaptureLimits())
-                    except Exception:  # noqa: BLE001 - a watcher never dies of bookkeeping
-                        appender = None
+                appender = _orphan_take_over(guard_r, capture, capture_limits)
             continue
         _drain_once(master_fd, appender, budget=0.05, wake_r=wake_r)
     code = _wait_status_to_code(status)
-    if orphaned and capture is not None:
-        # This watcher is the one FINALIZING: drain to the hangup, persist, prove, and
-        # only then write the sentinel (item 1).  Nothing here may raise past the
-        # sentinel write -- a watcher that dies of bookkeeping loses the exit evidence.
+    # ---- round-10 follow-up (a): re-check the guard AFTER reaping -------------------------
+    # The agent's exit and the supervisor's death can be simultaneously ready: `waitpid`
+    # returns the agent (break) while EOF sits unread on the guard, and the SIGCHLD fast
+    # path above can `continue` past the guard check in the same iteration.  Either way the
+    # loop could exit with `orphaned` still False and skip orphan finalization -- writing a
+    # sentinel with no proof over a supervisor that was gone and whose tail this watcher
+    # alone could have drained.  A final non-blocking guard probe closes that race: a
+    # supervisor already gone is detected here and the orphan-finalize path below runs.
+    if not orphaned:
         try:
-            _finalize_orphaned_capture(
-                master_fd, appender, budget_s=max(0, int(drain_budget_ms)) / 1000.0,
-                finalized=capture_mod.capture_finalized_path(capture, fence.partition(":")[2]),
-                fence=fence, code=code, slave_name=slave_name)
-        except Exception:  # noqa: BLE001 - the sentinel is still written below
-            pass
-    if sentinel is not None:
-        write_exit_sentinel(sentinel, code=code, fence=fence)
+            ready, _, _ = select.select([guard_r], [], [], 0)
+        except (OSError, ValueError):
+            ready = []
+        if ready:
+            orphaned = True
+            appender = _orphan_take_over(guard_r, capture, capture_limits)
+    if orphaned:
+        if capture is not None:
+            # This watcher is the one FINALIZING: drain to the hangup, persist, prove, and
+            # only then write the sentinel (item 1).  Nothing here may raise past the
+            # sentinel write -- a watcher that dies of bookkeeping loses the exit evidence.
+            try:
+                _finalize_orphaned_capture(
+                    master_fd, appender,
+                    budget_s=max(0, int(drain_budget_ms)) / 1000.0,
+                    finalized=capture_mod.capture_finalized_path(
+                        capture, fence.partition(":")[2]),
+                    fence=fence, code=code, slave_name=slave_name)
+            except Exception:  # noqa: BLE001 - the sentinel is still written below
+                pass
+        if sentinel is not None:
+            write_exit_sentinel(sentinel, code=code, fence=fence)
+    else:
+        # Round-10 item 1: the supervisor was ALIVE at the reap and owns the final drain.
+        # Write the sentinel so it can start draining, then LINGER -- keeping the tty alive,
+        # writing no proof -- until it releases us (dh_r EOF, closed in `_reclaim`) or dies.
+        if sentinel is not None:
+            write_exit_sentinel(sentinel, code=code, fence=fence)
+        if dh_r >= 0:
+            _await_drain_handoff(dh_r, guard_r,
+                                 budget_s=max(0, int(drain_budget_ms)) / 1000.0)
     os._exit(code)
+
+
+def _orphan_take_over(guard_r: int, capture: bytes | None,
+                      capture_limits: "CaptureLimits | None"
+                      ) -> "capture_mod.RawBoundedAppender | None":  # pragma: no cover
+    """Close the (now-EOF) orphan guard and build the bounded appender the watcher drains
+    into once the supervisor is gone.  A watcher never dies of bookkeeping, so an appender
+    that cannot be built is ``None`` (the finalized record then names that nothing vouches
+    for the bytes)."""
+    try:
+        os.close(guard_r)
+    except OSError:
+        pass
+    if capture is None:
+        return None
+    try:
+        return capture_mod.RawBoundedAppender(capture, limits=capture_limits or CaptureLimits())
+    except Exception:  # noqa: BLE001 - a watcher never dies of bookkeeping
+        return None
+
+
+def _await_drain_handoff(dh_r: int, guard_r: int, *, budget_s: float
+                         ) -> None:  # pragma: no cover - runs in the forked watcher
+    """Round-10 item 1.  Block until the supervisor RELEASES this watcher -- which it does
+    by closing ``dh_r``'s write end in ``_reclaim``, after its own finalizing drain -- or
+    until the supervisor DIES (both the handoff and the orphan guard read EOF on its death),
+    or a generous ceiling elapses.  Reads no master byte and writes no proof: its ONLY job
+    is to keep the session-leader tty alive so the supervisor's drain sees the whole tail
+    rather than a revoke-truncated one.  The ceiling exists solely for a supervisor wedged
+    holding both fds without dying; it is a large multiple of the drain budget, so in the
+    normal path the supervisor always releases (or dies) first."""
+    ceiling = max(30.0, budget_s * 8.0)
+    deadline = time.monotonic() + ceiling
+    fds = [fd for fd in (dh_r, guard_r) if fd >= 0]
+    while fds:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        try:
+            ready, _, _ = select.select(fds, [], [], min(1.0, remaining))
+        except (OSError, ValueError):
+            return
+        if ready:
+            return  # released (drain done) or the supervisor died -- either way, exit
 
 
 def _finalize_orphaned_capture(master_fd: int, appender: Any, *, budget_s: float,
@@ -1006,17 +1108,39 @@ def _finalize_orphaned_capture(master_fd: int, appender: Any, *, budget_s: float
     if ended == "hangup" and appender is not None:
         finality, detail = capture_mod.FINALITY_PROVEN, ""
     elif ended == "quiesced" and appender is not None:
-        holders = _slave_holders(master_fd, slave_name)
-        if _slave_holder_present(holders):
-            finality = capture_mod.FINALITY_UNPROVEN
-            detail = ("the agent is reaped and its output quiesced, but a descendant "
-                      "still holds the pty slave; the capture may yet grow")
-        else:
+        # Iteration 4 (option B): silence after the reap is `proven` ONLY on a COMPLETE
+        # positive absence proof from the SAME fail-closed libproc slave-descriptor authority
+        # the supervisor uses (`slave_device_holders`) -- run here by the watcher before it
+        # writes any `proven` record.  A `present` holder (on the tty or setsid'd off it) OR
+        # an `unreadable` authority (any inaccessible pid: a denied `proc_pidinfo`, a growth
+        # failure, the listing itself -- NEVER a silent skip) is `unproven` with the cause
+        # NAMED.  If the authority cannot run at all in this forked context it raises and the
+        # `except` below records `unproven` -- never `quiesced`-as-proven.
+        try:
+            holders = slave_device_holders(slave_name, exclude_pids=(os.getpid(),))
+        except Exception as exc:  # noqa: BLE001 - a watcher never dies of bookkeeping
+            holders = {"method": "libproc", "state": "unreadable",
+                       "unenumerable": [{"pid": 0, "errno": repr(exc), "where": "forked"}]}
+        state = str(holders.get("state") or "unreadable")
+        if state == "proven_absent":
             finality, holders = capture_mod.FINALITY_PROVEN, None
             detail = ""
+        elif state == "present":
+            finality = capture_mod.FINALITY_UNPROVEN
+            detail = ("the agent is reaped and its output quiesced, but a process still holds "
+                      f"the pty slave open (pids {holders.get('holders')}); "
+                      "the capture may yet grow")
+        else:  # unreadable -- fail closed, name what could not be enumerated
+            finality = capture_mod.FINALITY_UNPROVEN
+            detail = ("the agent is reaped and its output quiesced, but the complete "
+                      "slave-descriptor authority could not be run to completion "
+                      f"({holders.get('unenumerable')}); a positive absence is not proven")
     else:
         finality = capture_mod.FINALITY_UNPROVEN
-        holders = _slave_holders(master_fd, slave_name)
+        try:
+            holders = slave_device_holders(slave_name, exclude_pids=(os.getpid(),))
+        except Exception:  # noqa: BLE001
+            holders = {"method": "libproc", "state": "unreadable"}
         detail = ("no bounded appender could be built for the capture; nothing vouches "
                   "for the bytes" if appender is None else
                   "the pty output did not quiesce within the post-exit drain bound; a "
@@ -1031,12 +1155,359 @@ def _finalize_orphaned_capture(master_fd: int, appender: Any, *, budget_s: float
             "total_bytes": total, "sha256": digest}
 
 
-def _slave_holder_present(holders: Mapping[str, Any]) -> bool:
-    """Whether :func:`_slave_holders` evidence names anything still holding the slave: the
-    agent's foreground process group has members, or a ``/proc`` fd resolves to it."""
-    if holders.get("foreground_group_present") is True:
-        return True
-    return bool(holders.get("rows"))
+#: Iteration 4/5 (option B).  darwin ``libproc`` constants for the COMPLETE slave-descriptor
+#: authority: enumerate EVERY process, and for every process whose file descriptors the kernel
+#: lets us read, match each CURRENT vnode fd's (device, inode) against the pty SLAVE's, so a
+#: holder is found however it names the fd and INCLUDING an off-tty ``setsid`` descendant.
+#: Iteration-5 reviewer corrections are baked into the helpers below: ``proc_listallpids``
+#: returns an ENTRY COUNT (F1); a process's identity is NEVER inferred from a denied read -- we
+#: inspect its fds directly and let the kernel's own permission boundary classify it (F2); a
+#: per-fd failure is a moving fd table, resolved by a stable double scan over a FRESH listing,
+#: never a "raced, not a holder" shortcut (F3); and a fixed-offset decode requires the EXACT
+#: structure length (F4).
+_PROC_ALL_PIDS = 1
+_PROC_PIDLISTFDS = 1
+_PROC_PIDFDVNODEPATHINFO = 2
+_PROC_PIDTBSDINFO = 3
+_PROX_FDTYPE_VNODE = 1
+_PROC_FDINFO_SIZE = 8                     # sizeof(struct proc_fdinfo): int32 fd + uint32 type
+#: sizeof(struct vnode_fdinfowithpath) as darwin ACTUALLY returns it for a valid vnode fd,
+#: verified empirically on this host (proc_fileinfo 24 + vnode_info_path incl. vip_path[MAXPATHLEN]
+#: = 1200 bytes; pty slave, regular file and tty all return exactly 1200).  A positive
+#: ``proc_pidfdinfo`` return of ANY OTHER length is a short/long read (reviewer iter5 F4) and is
+#: rejected -- the fixed-offset decode below is valid ONLY for the exact structure.
+_VNODE_FDINFOWITHPATH_SIZE = 1200
+_BSDINFO_SIZE = 256
+#: Byte offsets, verified empirically on darwin arm64/x86_64 (all little-endian):
+#:  proc_bsdinfo: pbi_ppid @16, pbi_uid @20, pbi_ruid @28 (after flags/status/xstatus/pid).
+#:  vnode_fdinfowithpath: proc_fileinfo (24 bytes) then vinfo_stat -> vst_dev @+0, vst_ino @+8
+#:  (fstat of an open pty slave and this decode agree; verified on a live slave fd).
+_BSD_PPID_OFF, _BSD_UID_OFF, _BSD_RUID_OFF = 16, 20, 28
+_VNODE_STAT_OFF, _VNODE_DEV_OFF, _VNODE_INO_OFF = 24, 0, 8
+#: Bounds for the fail-closed enumeration (reviewer iter5 F1/F3).
+_PIDLIST_MAX_ATTEMPTS = 6                 # re-query proc_listallpids until the count is stable
+_PIDLIST_SLACK = 4096                     # spare entry capacity; a full buffer means truncation
+_FD_SCAN_MAX_ATTEMPTS = 8                 # per-process: retries toward two identical clean scans
+_FD_SCAN_RETRY_SLEEP_S = 0.001           # let ordinary fd-table churn settle between retries
+_SHORT_READ_ERRNO = "short_read"         # sentinel: a positive but wrong-length libproc return
+
+try:
+    _LIBPROC = ctypes.CDLL("/usr/lib/libSystem.dylib", use_errno=True)
+    _LIBPROC.proc_listallpids.restype = ctypes.c_int
+    _LIBPROC.proc_pidinfo.restype = ctypes.c_int
+    _LIBPROC.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+                                      ctypes.c_void_p, ctypes.c_int]
+    _LIBPROC.proc_pidfdinfo.restype = ctypes.c_int
+    _LIBPROC.proc_pidfdinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                        ctypes.c_void_p, ctypes.c_int]
+except OSError:  # pragma: no cover - non-darwin
+    _LIBPROC = None
+
+
+def _libproc_pidinfo(pid: int, flavor: int, size: int) -> "tuple[bytes | None, int]":
+    """One ``proc_pidinfo`` call into a fixed buffer; ``(bytes, 0)`` or ``(None, errno)``.
+
+    Retained for diagnostics and because the identity flavor is a documented libproc entry
+    point, but it is DELIBERATELY NOT on the proof path (reviewer iter5 F2): the authority never
+    infers a process's UID from an identity read and never skips a process because that read was
+    denied.  Holders are found by inspecting file descriptors directly, which the kernel permits
+    for exactly the processes whose slave a mode-0620 owner-uid pty could be open in."""
+    buf = (ctypes.c_byte * size)()
+    got = _LIBPROC.proc_pidinfo(pid, flavor, 0, buf, size)
+    if got <= 0:
+        return None, (ctypes.get_errno() or errno.EINVAL)
+    return bytes(buf)[:got], 0
+
+
+def _libproc_fd_devino(pid: int, fd: int) -> "tuple[tuple[int, int] | None, object]":
+    """The (vst_dev, vst_ino) of one fd's vnode via ``proc_pidfdinfo`` /
+    ``PROC_PIDFDVNODEPATHINFO``.  Requires the return length to be EXACTLY
+    ``sizeof(struct vnode_fdinfowithpath)`` before decoding any fixed-offset field (reviewer
+    iter5 F4: a positive SHORT read must never be decoded from the zero-filled buffer).
+    ``(devino, 0)`` or ``(None, errno-or-sentinel)`` on ANY failure.  A non-vnode fd (pipe,
+    socket) and a closed fd both return ``EBADF`` here, which is why the caller queries only fds
+    whose CURRENT listing type is a vnode and treats an EBADF as a moving fd table, not absence."""
+    buf = (ctypes.c_byte * _VNODE_FDINFOWITHPATH_SIZE)()
+    got = _LIBPROC.proc_pidfdinfo(pid, fd, _PROC_PIDFDVNODEPATHINFO, buf,
+                                  _VNODE_FDINFOWITHPATH_SIZE)
+    if got <= 0:
+        return None, (ctypes.get_errno() or errno.EINVAL)
+    if got != _VNODE_FDINFOWITHPATH_SIZE:
+        return None, _SHORT_READ_ERRNO       # a partial/oversized structure is not authority
+    raw = bytes(buf)
+    base = _VNODE_STAT_OFF
+    dev = struct.unpack_from("<I", raw, base + _VNODE_DEV_OFF)[0]
+    ino = struct.unpack_from("<Q", raw, base + _VNODE_INO_OFF)[0]
+    return (dev, ino), 0
+
+
+def _slave_reference_devino(slave_name: str) -> "tuple[tuple[int, int] | None, str]":
+    """The pty slave's (device, inode) taken by ``fstat`` of an OPEN slave fd -- NOT
+    ``stat`` of the path, whose devfs node reports a DIFFERENT inode than the opened pty
+    vnode (measured).  ``O_NOCTTY`` so this transient open never acquires the tty; closed
+    before any scan.  ``(devino, "")`` or ``(None, reason)``."""
+    if not slave_name:
+        return None, "no slave name"
+    fd = -1
+    try:
+        fd = os.open(slave_name, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+        st = os.fstat(fd)
+        return (st.st_dev & 0xFFFFFFFF, st.st_ino), ""
+    except OSError as exc:
+        return None, f"fstat(slave): {_errno_name(exc)}"
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def _libproc_list_all_pids() -> "tuple[list[int] | None, str | None]":
+    """Every pid on the host via ``proc_listallpids``, whose fill return is the ENTRY COUNT --
+    the number of pids written, NOT a byte length (reviewer iter5 F1; verified: fill_return
+    tracks the number of nonzero entries, and dividing by ``sizeof(int32)`` silently drops three
+    quarters of the table).  Re-query into a buffer with slack until the fill is STRICTLY smaller
+    than the capacity (a fill that reaches capacity is a truncation/growth and is retried,
+    bounded).  ``(pids, None)`` or ``(None, reason)`` when it never stabilises."""
+    reason = "listallpids_unstable"
+    for _ in range(_PIDLIST_MAX_ATTEMPTS):
+        n = _LIBPROC.proc_listallpids(None, 0)             # entries needed
+        if n <= 0:
+            return None, f"listallpids_count:{_errno_name_n(ctypes.get_errno())}"
+        cap = int(n) + _PIDLIST_SLACK                      # entries
+        buf = (ctypes.c_int32 * cap)()
+        got = _LIBPROC.proc_listallpids(buf, ctypes.sizeof(buf))   # buffersize BYTES; returns ENTRIES
+        if got <= 0:
+            return None, f"listallpids_fill:{_errno_name_n(ctypes.get_errno())}"
+        if got >= cap:                                     # buffer full -> truncated / still growing
+            reason = "listallpids_truncated"
+            continue
+        return [buf[i] for i in range(int(got)) if buf[i] > 0], None
+    return None, reason
+
+
+def _libproc_list_vnode_fds(pid: int) -> "tuple[list[int] | None, object]":
+    """A FRESH ``PROC_PIDLISTFDS`` for ``pid``, returning the fds whose CURRENT type is a vnode
+    -- never a stale snapshot type (reviewer iter5 F3: a holder can ``dup2`` the slave onto a fd
+    that was a pipe in an earlier snapshot, so the type must be re-read every scan).
+    ``proc_pidinfo(PROC_PIDLISTFDS)`` returns a BYTE length (a whole number of
+    ``sizeof(struct proc_fdinfo)`` entries); a length that is not a whole number of entries, or
+    that fills the buffer (growth), is rejected (F4).  ``(fds, 0)`` or ``(None, errno)``."""
+    size = _LIBPROC.proc_pidinfo(pid, _PROC_PIDLISTFDS, 0, None, 0)   # bytes needed
+    if size <= 0:
+        return None, (ctypes.get_errno() or errno.EINVAL)
+    cap = int(size) + 16 * _PROC_FDINFO_SIZE               # byte slack; a full buffer => growth
+    buf = (ctypes.c_byte * cap)()
+    filled = _LIBPROC.proc_pidinfo(pid, _PROC_PIDLISTFDS, 0, buf, cap)   # bytes written
+    if filled <= 0:
+        return None, (ctypes.get_errno() or errno.EINVAL)
+    if filled >= cap or filled % _PROC_FDINFO_SIZE != 0:
+        return None, _SHORT_READ_ERRNO                     # growth / malformed listing length
+    raw = bytes(buf)
+    fds: list[int] = []
+    for i in range(filled // _PROC_FDINFO_SIZE):
+        fd = struct.unpack_from("<i", raw, i * _PROC_FDINFO_SIZE)[0]
+        ftype = struct.unpack_from("<I", raw, i * _PROC_FDINFO_SIZE + 4)[0]
+        if ftype == _PROX_FDTYPE_VNODE:
+            fds.append(fd)
+    return fds, 0
+
+
+def _scan_process_for_slave(pid: int, ref: "tuple[int, int]",
+                            exclude: "set[int]") -> "tuple[str, object]":
+    """Inspect ONE process for the slave with a fail-closed, race-resistant protocol
+    (reviewer iter5 F3).  Each attempt re-lists the process's fds FRESH and queries every
+    CURRENT vnode fd's ``(dev, ino)``; ANY per-fd failure that is not a whole-process exit means
+    the fd table moved under us (a holder can relocate the slave onto a former non-vnode fd and
+    close the originals -- the closed originals then read ``EBADF``), so the scan is discarded
+    and retried.  A process counts as inspected only after TWO consecutive, complete, IDENTICAL
+    scans, bounded; otherwise it is ``unstable``.  Returns ``('match', pid)`` |
+    ``('clean', None)`` | ``('gone', None)`` | ``('denied', None)`` | ``('unstable', reason)``.
+
+    ``denied`` (the listing itself is ``EPERM``/``EACCES``) is the kernel refusing to let us read
+    another uid's fds; since we are not root, that is trustworthy evidence the process is not our
+    uid, and a mode-0620 owner-uid pty slave cannot be open in a non-owner, non-root process.  A
+    changed-uid (``setuid``) descendant that dropped our uid while holding the slave is out of
+    this authority's scope and is NOT claimed as covered (reviewer iter5 F2)."""
+    prev: "dict[int, tuple[int, int]] | None" = None
+    for _ in range(_FD_SCAN_MAX_ATTEMPTS):
+        fds, err = _libproc_list_vnode_fds(pid)
+        if fds is None:
+            if _errno_is_gone(err):
+                return "gone", None
+            if err in (errno.EPERM, errno.EACCES):
+                return "denied", None
+            prev = None                                    # transient listing failure -> retry
+            time.sleep(_FD_SCAN_RETRY_SLEEP_S)
+            continue
+        scan: "dict[int, tuple[int, int]]" = {}
+        failed = False
+        for fd in fds:
+            devino, fe = _libproc_fd_devino(pid, fd)
+            if devino is None:
+                if _errno_is_gone(fe):
+                    return "gone", None
+                if fe in (errno.EPERM, errno.EACCES):
+                    # This fd's vnode is permission-restricted (a TCC/sandbox-protected resource
+                    # that macOS refuses to introspect even for the owner -- common on fd 3 of a
+                    # user's launchd agents).  A pty slave vnode is NEVER permission-restricted:
+                    # the slave's own vnode info is readable in the reference AND in a real holder
+                    # (verified), so a fd we are refused is PROVABLY not the slave.  Skip THIS fd
+                    # (never a match here) and keep inspecting the rest; do not fail the scan --
+                    # otherwise every host with a restricted-fd agent is permanently `unreadable`.
+                    scan[fd] = None                        # record it as inspected-but-restricted
+                    continue
+                failed = True                              # EBADF (closed/retyped) / short: a RACE / truncation
+                break
+            scan[fd] = devino
+        if failed:
+            prev = None
+            time.sleep(_FD_SCAN_RETRY_SLEEP_S)
+            continue
+        if prev is not None and scan == prev:
+            for devino in scan.values():
+                if devino is not None and devino == ref and pid not in exclude:
+                    return "match", pid
+            return "clean", None
+        prev = scan                                        # first clean scan; confirm it is stable
+    return "unstable", "fd_table_never_stabilised"
+
+
+def slave_device_holders(slave_name: str, *, exclude_pids: "Sequence[int]" = ()
+                         ) -> dict[str, Any]:
+    """Iteration 4/5 (option B) -- a COMPLETE, fail-closed slave-descriptor authority (darwin
+    ``libproc``), the ONE sanctioned exception to "the kernel hangup is the only proof": the
+    supervisor's release-of-the-deferring-watcher (whose revoke delivers the real hangup) is
+    gated on this proof, and the orphan watcher uses it before writing any ``proven`` record.
+
+    Enumerate EVERY process (``proc_listallpids``, ENTRY-COUNT semantics, truncation/growth
+    rejected -- F1).  The gate for inspecting a process is FD INSPECTABILITY, not an identity
+    read: for every pid we take a stable double scan of its CURRENT vnode fds
+    (:func:`_scan_process_for_slave`) and match each ``(vst_dev, vst_ino)`` against the slave's
+    (from ``fstat`` of the slave device).  A match on a pid other than the excluded agent /
+    watcher is a HOLDER (a retained slave, on the tty or ``setsid``'d off it).
+
+    The reviewer-iter5 corrections are the substance of this authority:
+
+    * F1 -- ``proc_listallpids`` returns the number of PID ENTRIES; the fill is used directly
+      (never divided by ``sizeof(int32)``), and a fill that reaches buffer capacity is a
+      truncation/growth that is retried and, if it never settles, ``unreadable``.
+    * F2 -- a process's UID is NEVER inferred from a denied identity read.  A same-uid holder
+      whose ``PROC_PIDTBSDINFO`` is denied is still caught because its FD LISTING succeeds and is
+      inspected.  A process whose fd LISTING the kernel denies (``EPERM``/``EACCES``) is, since we
+      are not root, provably not our uid and cannot hold a mode-0620 owner-uid slave; it is the
+      diagnostic ``other_uid`` bucket.  Changed-uid (``setuid``) descendants are explicitly OUT
+      OF SCOPE and not claimed as covered (no false lineage claim).
+    * F3 -- a per-fd failure is a MOVING fd table, not proof of absence: the process's scan is
+      re-taken over a FRESH listing (so a slave ``dup2``-relocated onto a former pipe fd is seen
+      as a vnode now), and only TWO consecutive, complete, identical scans count as inspected;
+      an fd table that never stabilises within the bound is ``unstable`` -> ``unenumerable``.
+    * F4 -- a fixed-offset decode requires the EXACT structure length; a positive short/long
+      ``proc_pidfdinfo`` or a malformed listing length is ``unenumerable`` for that pid, never
+      decoded from the zero-filled buffer.
+
+    ``{"method": "libproc", "state": "present"|"proven_absent"|"unreadable", "holders": [pid],
+    "unenumerable": [{"pid", "errno", "where"}], "other_uid": [pid], "gone": [pid],
+    "device": ...}``.  ``state`` is ``present`` if any holder, else ``unreadable`` if any process
+    was ``unenumerable`` (fail closed -- an incomplete scan is NEVER absence), else
+    ``proven_absent`` (processes that merely exited mid-scan, or are other-uid and thus cannot
+    hold the slave, do not block the proof)."""
+    out: dict[str, Any] = {"method": "libproc", "device": str(slave_name or ""),
+                           "state": "unreadable", "holders": [], "unenumerable": [],
+                           "other_uid": [], "gone": []}
+    if _LIBPROC is None:
+        out["unenumerable"].append({"pid": 0, "errno": "no_libproc", "where": "load"})
+        return out
+    ref, reason = _slave_reference_devino(slave_name)
+    if ref is None:
+        out["unenumerable"].append({"pid": 0, "errno": reason, "where": "slave_fstat"})
+        return out
+    exclude = set(int(p) for p in exclude_pids if p)
+    pids, list_reason = _libproc_list_all_pids()
+    if pids is None:
+        out["unenumerable"].append({"pid": 0, "errno": list_reason, "where": "listallpids"})
+        return out
+    holders: list[int] = []
+    for pid in pids:
+        if pid in exclude:
+            continue
+        result, detail = _scan_process_for_slave(pid, ref, exclude)
+        if result == "match":
+            holders.append(pid)
+        elif result == "clean":
+            continue
+        elif result == "gone":
+            out["gone"].append(pid)
+        elif result == "denied":
+            out["other_uid"].append(pid)
+        else:  # unstable -> the fd table never stabilised: fail closed, name the pid
+            out["unenumerable"].append({"pid": pid, "errno": str(detail or "unstable"),
+                                        "where": "fd_scan"})
+    out["holders"] = sorted(set(holders))
+    out["gone"] = sorted(set(out["gone"]))
+    out["other_uid"] = sorted(set(out["other_uid"]))
+    if out["holders"]:
+        out["state"] = "present"
+    elif out["unenumerable"]:
+        out["state"] = "unreadable"          # fail closed: an incomplete scan is never absence
+    else:
+        out["state"] = "proven_absent"
+    return out
+
+
+
+def _errno_name_n(code: object) -> str:
+    if isinstance(code, str):
+        return code
+    try:
+        return errno.errorcode.get(int(code or 0), str(code))
+    except (TypeError, ValueError):
+        return str(code)
+
+
+#: A candidate pid that VANISHES during the scan (``proc_pidinfo`` / ``proc_pidfdinfo`` returns
+#: ``ESRCH`` / ``ENOENT``) has EXITED -- the kernel released every descriptor it held at exit --
+#: so it provably holds no slave descriptor and is recorded ``gone`` (diagnostic), NEVER
+#: ``unenumerable``.  This is categorically distinct from a DENIED (``EPERM`` / ``EACCES``)
+#: inspection of a LIVE process (the reviewer's F1 interposer), which stays ``unenumerable`` ->
+#: ``unreadable`` -> unproven.  Without this split a busy host -- which churns transient same-uid
+#: pids constantly -- would read ``unreadable`` over a genuinely clean slave whenever a bystander
+#: process exited between the listing and its inspection.
+_PID_GONE_ERRNOS = frozenset((errno.ESRCH, errno.ENOENT))
+
+
+def _errno_is_gone(code: object) -> bool:
+    if not isinstance(code, int):
+        return False
+    return int(code or 0) in _PID_GONE_ERRNOS
+
+
+def _slave_holder_state(holders: Mapping[str, Any]) -> str:
+    """The tri-state absence verdict over :func:`_slave_holders` evidence (round-10 item 2):
+
+    * ``present`` -- something still holds the slave: the agent's foreground process group
+      has members, or a ``/proc`` fd resolves to it;
+    * ``proven_absent`` -- a COMPLETE positive absence proof: the foreground-group probe
+      COMPLETED and found the group empty and, where ``/proc`` exists, a COMPLETE scan
+      found no holder;
+    * ``unreadable`` -- an authority the absence proof needs could not be read (a failed
+      ``tcgetpgrp`` / ``killpg``, an unreadable ``/proc``, or a skipped ``/proc/<pid>/fd``).
+
+    Only ``proven_absent`` may authorise ``proven``.  ``present`` and ``unreadable`` are
+    both ``unproven`` -- an incomplete or unreadable probe is NEVER collapsed into absence,
+    which is the exact defect this replaces: failed ``tcgetpgrp`` / unreadable ``/proc`` /
+    skipped fd entries used to fall through to ``foreground_group_present=None, rows=[]`` and
+    read as `absent`, stamping ``proven`` over a probe that proved nothing."""
+    if holders.get("foreground_group_present") is True or holders.get("rows"):
+        return "present"
+    if holders.get("unreadable"):
+        return "unreadable"
+    if holders.get("foreground_probe") != "complete":
+        return "unreadable"
+    if holders.get("proc_scan") == "incomplete":
+        return "unreadable"
+    return "proven_absent"
 
 
 def _errno_name(exc: BaseException) -> str:
@@ -1044,55 +1515,92 @@ def _errno_name(exc: BaseException) -> str:
     return errno.errorcode.get(code, str(code)) if code is not None else type(exc).__name__
 
 
-def _slave_holders(master_fd: int, slave_name: str) -> dict[str, Any]:
+def _slave_holders(master_fd: int, slave_name: str, *,
+                   tcgetpgrp: Any = os.tcgetpgrp, killpg: Any = os.killpg,
+                   listdir: Any = os.listdir, readlink: Any = os.readlink,
+                   isdir: Any = os.path.isdir) -> dict[str, Any]:
     """What still holds the pty SLAVE after the agent's exit -- the retained-slave cause,
-    made observable (round-9 Linux descendant / PTY scope, choice (a)).
+    made observable (round-9 Linux descendant / PTY scope, choice (a)), as a TRI-STATE
+    result (round-10 item 2): every probe records whether it COMPLETED, and any authority
+    that could not be read is NAMED in ``unreadable`` rather than collapsed into absence.
 
     Raw ``os`` calls only (a forked watcher runs this; nothing may spawn).  Two probes:
     the slave's FOREGROUND process group (``tcgetpgrp`` on the master) and whether that
     group still has members (``killpg(pgid, 0)``) -- both platforms; and on Linux a
     ``/proc/<pid>/fd`` scan for descriptors that resolve to the slave's path, naming each
     holder's pid and ``comm``.  darwin offers no subprocess-free fd enumeration here, so
-    its rows are empty and ``method`` says so; the supervisor-side reader adds the
-    tty-scoped process table (``ps -t``) when it reports the refusal.
+    ``proc_scan`` is ``absent`` and the foreground-group probe is the only absence axis;
+    the supervisor-side reader adds the tty-scoped process table (``ps -t``) when it reports
+    the refusal.  The ``os`` calls are seams so error injection (``tcgetpgrp -> EIO``,
+    ``/proc listdir -> EACCES``, a skipped fd entry) is lockable over a real pty without
+    patching ``os`` globally.
     """
     out: dict[str, Any] = {"slave": slave_name, "method": "pgid_probe", "rows": [],
-                           "foreground_pgid": None, "foreground_group_present": None}
+                           "foreground_pgid": None, "foreground_group_present": None,
+                           "foreground_probe": "unreadable", "proc_scan": "absent",
+                           "unreadable": []}
     try:
-        pgid = os.tcgetpgrp(master_fd)
-        out["foreground_pgid"] = int(pgid)
-        try:
-            os.killpg(pgid, 0)
-            out["foreground_group_present"] = True
-        except ProcessLookupError:
+        pgid = int(tcgetpgrp(master_fd))
+        out["foreground_pgid"] = pgid
+        if pgid <= 0:
+            # Follow-up (c): ``tcgetpgrp() <= 0`` means "no usable foreground group", NOT a
+            # live holder -- and ``killpg(0, 0)`` / ``killpg(<negative>, 0)`` would signal
+            # the watcher's OWN process group (or, for 0, its group; the round-8 shape's
+            # latent suicide).  It is never called; this is a COMPLETE, positive absence on
+            # the foreground axis.
             out["foreground_group_present"] = False
-        except PermissionError:
-            out["foreground_group_present"] = True
-        except OSError:
-            pass
-    except OSError:
-        pass
-    if slave_name and os.path.isdir("/proc"):
+            out["foreground_probe"] = "complete"
+        else:
+            try:
+                killpg(pgid, 0)
+                out["foreground_group_present"] = True
+                out["foreground_probe"] = "complete"
+            except ProcessLookupError:
+                out["foreground_group_present"] = False
+                out["foreground_probe"] = "complete"
+            except PermissionError:
+                # A group we may not signal still EXISTS -- a present holder, proven.
+                out["foreground_group_present"] = True
+                out["foreground_probe"] = "complete"
+            except OSError as exc:
+                out["foreground_group_present"] = None
+                out["unreadable"].append(f"killpg:{_errno_name(exc)}")
+    except OSError as exc:
+        out["foreground_group_present"] = None
+        out["unreadable"].append(f"tcgetpgrp:{_errno_name(exc)}")
+    if slave_name and isdir("/proc"):
         out["method"] = "proc_fd_scan"
+        complete = True
         rows: list[dict[str, Any]] = []
         try:
-            entries = os.listdir("/proc")
-        except OSError:
+            entries = listdir("/proc")
+        except OSError as exc:
             entries = []
+            complete = False
+            out["unreadable"].append(f"proc_listdir:{_errno_name(exc)}")
         for entry in entries:
             if not entry.isdigit() or entry == str(os.getpid()):
                 continue
             fd_dir = f"/proc/{entry}/fd"
             try:
-                fds = os.listdir(fd_dir)
-            except OSError:
+                fds = listdir(fd_dir)
+            except FileNotFoundError:
+                continue                       # the process exited: it holds nothing
+            except OSError as exc:
+                # EACCES etc: this pid cannot be ruled out, so absence is not COMPLETE.
+                complete = False
+                out["unreadable"].append(f"proc_fd:{entry}:{_errno_name(exc)}")
                 continue
             held = []
             for name in fds:
                 try:
-                    if os.readlink(f"{fd_dir}/{name}") == slave_name:
+                    if readlink(f"{fd_dir}/{name}") == slave_name:
                         held.append(int(name))
-                except OSError:
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    complete = False
+                    out["unreadable"].append(f"proc_fd_link:{entry}/{name}:{_errno_name(exc)}")
                     continue
             if held:
                 comm = ""
@@ -1103,6 +1611,7 @@ def _slave_holders(master_fd: int, slave_name: str) -> dict[str, Any]:
                     pass
                 rows.append({"pid": int(entry), "comm": comm, "fds": sorted(held)})
         out["rows"] = rows
+        out["proc_scan"] = "complete" if complete else "incomplete"
     return out
 
 
@@ -1647,6 +2156,26 @@ def drain(master_fd: int, *, budget_ms: int = 500) -> int:
     return drained
 
 
+def _signal_drain_handoff(session: Mapping[str, Any]) -> None:
+    """Release a watcher deferring its exit in :func:`_await_drain_handoff` (round-10 item
+    1): write ONE byte to the handoff's write end, then close it.  The byte -- not the close
+    -- is the reliable wake: a ``select`` on the read end returns on the data whether or not
+    the last write end has closed, so a lingering descriptor copy can never wedge the
+    release.  Idempotent: the fd is set to ``-1`` once released."""
+    handoff = session.get("drain_handoff_fd")
+    if isinstance(handoff, int) and handoff >= 0:
+        try:
+            os.write(handoff, b"1")
+        except OSError:
+            pass
+        try:
+            os.close(handoff)
+        except OSError:
+            pass
+        if isinstance(session, dict):
+            session["drain_handoff_fd"] = -1
+
+
 def reap_leader(session: Mapping[str, Any], *, timeout_ms: int = 2_000) -> dict[str, Any]:
     """``waitpid`` the exit watcher this process forked, bounded.  Finding 9.
 
@@ -1659,10 +2188,16 @@ def reap_leader(session: Mapping[str, Any], *, timeout_ms: int = 2_000) -> dict[
     ``{"reaped": bool, "status": int|None, "detail": str}``.  ``ChildProcessError`` --
     already reaped, or not our child (a stranger process asking) -- is ``reaped=True``
     with no status: there is nothing left to collect.
+
+    Round-10 item 1: reaping the leader means the supervisor is DONE with the pty, so this
+    RELEASES the drain handoff first -- a supervisor-alive watcher defers its exit until
+    that write end closes, and reaping it before releasing would otherwise wait out the
+    linger ceiling.  Idempotent (``_reclaim`` also releases it explicitly first).
     """
     pid = session.get("leader_pid")
     if not isinstance(pid, int) or pid <= 0:
         return {"reaped": False, "status": None, "detail": "no leader pid recorded"}
+    _signal_drain_handoff(session)
     deadline = time.time() + timeout_ms / 1000.0
     while True:
         try:
@@ -1714,3 +2249,8 @@ def release(session: Mapping[str, Any]) -> None:
             pass
         if isinstance(session, dict):
             session["orphan_guard_fd"] = -1
+    # The drain handoff's supervisor end (round-10 item 1).  Signalling it releases a
+    # watcher still deferring its exit -- `_reclaim` signals it explicitly before reaping the
+    # leader, and `release` signals it once more (idempotent) so a path that reclaims without
+    # a full drain never leaves the watcher blocked.
+    _signal_drain_handoff(session)
