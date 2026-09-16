@@ -356,7 +356,11 @@ class CompositionSelectionTests(DeliveredWiringFixture):
                                           "--run-owner", "term_owner"])
                 self.assertEqual(orca.adapter, launcher.ORCA_ADAPTER)
                 self.assertEqual(orca.run_owner, "term_owner")
-        self.assertEqual(set(launcher.ADAPTERS), {"fake", "orca"})
+        # OS-37 C-DESIGN-1 widens the shared tuple to three.  The property this test
+        # asserts is unchanged and is asserted above: the DEFAULT stays `fake`, so no
+        # existing invocation changes meaning.  The set stays CLOSED, which is what pinning
+        # it is for -- a fourth member must be a visible edit here.
+        self.assertEqual(set(launcher.ADAPTERS), {"fake", "orca", "standalone"})
 
     def test_the_status_verb_offers_no_adapter_because_it_takes_no_action(self):
         args = launcher.build_watchdog_parser().parse_args(["watchdog", "status"])
