@@ -129,6 +129,34 @@
   (non-terminal checkpoint AND unreleased binding); no hard-coded run, no session cookie.
 - Real-CLI harness exit code reflects the roll-up (N-002).  Locks: `scripts/test_os48_review_i7_locks.py`.
 
+**Follow-up (review corrections F-015 / F-016, run_5fcd2beac376)**
+- Capture finality: the framing scan is bounded AND nested (`embedded_scan`, `ScanBudget`,
+  `walk_nested_objects`); inner objects of embedded objects and of parsable undeclared
+  containers are examined; string literals are data; a nested refusal needs a positive rule.
+  A scan that hits its bound is `record_scan_incomplete` (LOST), never "no candidates".
+- Linux identity: admission re-reads identity/parentage AFTER the pidfd is held and admits
+  only the proven same incarnation (`candidate_identity_unverified` otherwise, not a member);
+  a reader without a pidfd binds through the recorded pidfs inode (`fixed_object_id`,
+  `pidfd_binding`) or reports `pid_tick_unverified` (unknown) -- never alive from (pid, tick).
+  Darwin entries state `lifetime_binding: start_microsecond`.  Locks:
+  `scripts/test_os48_f015_f016_locks.py` (RED at checkpoint c8f2747).
+- Iteration 2 (REVIEW_IMPLEMENTATION.md F-015 / F-017 / F-016 / N-001): the framing scan
+  examines the nested content of EVERY parsable line -- a declared outer type (Claude
+  `system`/`assistant`, Codex `thread.started`/`item.completed`) is no exemption; the line
+  parser is total (`parse_record_line`: a depth the interpreter cannot follow is unparsable,
+  so a plain depth bomb is `record_scan_incomplete`, never an untyped `RecursionError`); the
+  pidfs inode is a recovery binding ONLY under the proven 64-bit >= 6.9 model
+  (`pidfs_lifetime_model`, recorded as `fixed_object_model`), every other model reads
+  `unknown`; darwin's `start_microsecond` is labelled a re-read timestamp, not a fixed object.
+- Iteration 3 (REVIEW_IMPLEMENTATION_iteration2 F-015 / F-017 / F-016): `parse_json` is the
+  one JSON entry point -- integers parse under the reader's own digit budget
+  (`UnconvertedInteger` beyond 4,000 digits, so an over-limit refusal is recognised, never
+  invalid prose), and a parser that cannot examine a candidate raises the typed
+  `ParseFailure` (`resource_limit` / `depth_limit` / `conversion_limit`) which the scan
+  reports as `record_scan_incomplete` -- a `MemoryError` never escapes the caller; the
+  recovery reader joins the ledger's recorded boot id to its current boot id before any
+  boot-scoped binding may say "alive" (`boot_unjoined` otherwise, never alive).
+
 **Added**
 - `scripts/test_os48_finality_locks.py`, `test_os48_ownership_locks.py`,
   `test_os48_evidence_locks.py`, `test_os48_recovery_cuts.py`, `test_os48_linux_locks.py`

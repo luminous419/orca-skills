@@ -336,8 +336,17 @@ class F016FixedObjectTests(unittest.TestCase):
         Path(os.fsdecode(path) + ".state.json").write_text(json.dumps({"schema": "os48.member.v1.state", "appended": 3, "failed": 0, "members": 2,
                                                                      "discovery": {"passes": 1, "listing_unreadable": 0, "listing_unstable": 0, "candidates_unreadable": 0, "forks_coalesced": 0, "watch_gaps": 0, "parents_unreadable": 0, "unobservable": 0, "root_watch": "subreaper", "reasons": [], "pids": []}}))
         residual = session.membership_residual()
-        alive = [a for a in residual["alive"] if a["pid"] == live]
-        self.assertEqual([(a["lifetime"], a.get("lifetime_binding")) for a in alive], [(2, "tick_granular")], residual)
+        # VERSIONED by run_5fcd2beac376 (REVIEW_IMPLEMENTATION_iteration8 F-016): the reader
+        # holds no fixed object and these rows record no independent binding (`fixed_object_id`),
+        # so lifetime 2 is `pid_tick_unverified` -- an UNKNOWN entry with its sibling count,
+        # never alive (it used to be reported alive as `tick_granular`).  One entry per lifetime
+        # is still what is asserted; the positive reading needs the pidfs binding (see
+        # scripts/test_os48_f015_f016_locks.F016RecoveryReaderTests).
+        self.assertEqual([a for a in residual["alive"] if a["pid"] == live], [], residual)
+        unknown = [u for u in residual["unknown"] if isinstance(u, dict) and u.get("pid") == live]
+        self.assertEqual([(u["lifetime"], u.get("lifetime_binding"), u.get("lifetime_siblings")) for u in unknown],
+                         [(2, "pid_tick_unverified", 1)], residual)
+        self.assertEqual(residual["outcome"], capture_mod.OUTCOME_DESCENDANTS_UNKNOWN)
         self.assertEqual([e["lifetime"] for e in residual["exited_incarnations"] if e["pid"] == live], [1])
 
     @PRIVATE_NS

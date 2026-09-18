@@ -944,11 +944,120 @@ marked).  Design: `artifacts/runs/run_f820764749d6/DESIGN.md` (topology A).  Mea
   PARTIAL / FLAKY / FAIL / NOT ESTABLISHED, 3 = evidence unverified) and the summary names the
   workload outcome separately from the adapter settlement claims.
 
+* **Follow-up run corrections (REVIEW_IMPLEMENTATION_iteration8.md F-015 / F-016, run
+  `run_5fcd2beac376`).**  (F-015, capture finality) the framing scan is a BOUNDED NESTED
+  traversal (`standalone_capture.embedded_scan` / `walk_nested_objects` / `ScanBudget`:
+  `EMBEDDED_SCAN_OBJECT_LIMIT` objects examined, `EMBEDDED_SCAN_DEPTH_LIMIT` nesting,
+  `EMBEDDED_SCAN_BYTE_BUDGET` characters visited, shared across the whole fenced range): every
+  object nested inside an embedded object -- and inside EVERY parsable line, whatever its
+  outer `type` (iteration 2, REVIEW_IMPLEMENTATION.md F-015: a declared readiness / delivery /
+  body / completion type on the container -- Claude `system` / `assistant`, Codex
+  `thread.started` / `item.completed` -- is NO exemption; a helper can open such a wrapper
+  around the root's record exactly as it can open `{"progress": `) -- is examined; the outer
+  record itself stays a record judged by R1/R2, only what it HOLDS is a candidate; a JSON string
+  literal's contents are never a record.  A nested object is a refusal only through a
+  POSITIVE rule (its declared completion type's `error_field`, a declared auth marker); a
+  nested generic `is_error` (a tool result inside a wrapper, a Codex `item.completed` error
+  item) is data.  A scan that reaches any bound before examining the whole range and found no
+  refusal is the NAMED outcome `record_scan_incomplete` (LOST, registered in `LOST_REASONS` /
+  `OS48_LOST_OUTCOMES`; the journal names the bound hit) -- never "no candidates", never
+  COMPLETED; a refusal the scan did reach still dominates.  (F-017, iteration 2) the line parser
+  itself is total: `standalone_capture.parse_record_line` / `structured_lines` classify a
+  JSON line the interpreter cannot follow (`RecursionError`, native py3.11 at ~1,000 levels) as
+  UNPARSABLE instead of raising, so a plain 5,000-level depth bomb reaches the bounded scan
+  and settles `record_scan_incomplete` (`depth_limit`) through every reader (readiness,
+  refusal evidence, completion selection).  (Iteration 3, REVIEW_IMPLEMENTATION_iteration2
+  F-015 / F-017) the ONE JSON entry point of every reader is `standalone_capture.parse_json`:
+  it parses integers under the reader's own digit budget (`INTEGER_DIGIT_BUDGET` = 4,000; a
+  longer token is kept as an `UnconvertedInteger` digit string, so the object is examined
+  WHOLE and a refusal it carries is recognised -- Python's 4,300-digit `int()` limit, which
+  `json.loads` surfaces as a plain `ValueError` rather than a `JSONDecodeError`, is never
+  reached), and it distinguishes a SYNTAX rejection (`JSONDecodeError`: prose) from a parser
+  that could not EXAMINE the candidate -- `MemoryError` -> `resource_limit`, `RecursionError`
+  -> `depth_limit`, any other `ValueError` -> `conversion_limit` -- raised as the typed
+  `ParseFailure`; such a line is unparsable for the record reader (never a record, never
+  prose) and the embedded scan that re-examines it ends `record_scan_incomplete` with that
+  reason unless its bounded re-parse examined the object whole.  Stated exactly: NOT every
+  parser limit fails closed by itself -- the interpreter's integer limit failed OPEN in
+  iteration 2 -- what fails closed is every failure `parse_json` classifies; a reached
+  refusal still dominates a later failure, and no general OOM / SIGKILL recovery is claimed.  **What R1 "refusal dominance" positively covers,
+  stated exactly:** a declared completion record whose error field is set, a declared auth
+  marker (top-level or nested anywhere), a completion-typed nested object whose error field is
+  set, a top-level embedded object with a truthy `is_error`, and the free-text refusal
+  patterns over prose lines -- each only where the bounded scan REACHED it; it is not a claim
+  that every conceivable refusal-shaped byte sequence inside `[0,N)` is recognised.  The
+  reviewer's 4,096-object exhaustion, the plain-root two-line wrapper (`{"progress": ` + the
+  root's own newline-terminated refusal + `}`), the declared-type one-line wrappers of both
+  installed grammars and the depth bomb all settle FAILED `refusal_in_boundary` / LOST
+  `record_scan_incomplete`, never COMPLETED.  This stays inside DESIGN §1.4 R1/R2: the
+  boundary `[0,N)` is unchanged, only what the scan examines inside it and what an unfinished
+  scan is allowed to mean.  (F-016, Linux identity) a pidfd acquired for a candidate may bind a
+  different birth than the one the pre-acquisition `/proc` reads described (the reviewer's
+  same-tick foreign peer): `_Membership._add` now re-reads identity AND parentage AFTER the
+  fixed object is held, polls the pidfd after the re-read (alive -> the read was of the bound
+  process), and re-checks the parent member's own fixed object; only the proven same
+  incarnation is admitted -- anything else is the named `candidate_identity_unverified:<why>`
+  (state counter `candidates_unverified`, residual `descendants_unknown`) and NOT a member; a
+  descendant whose pidfd cannot be obtained is `pidfd_unavailable` and NOT a member (the agent,
+  bound by the watcher's own `waitpid`, is the one exception).  A reader with NO held pidfd
+  (the supervisor's `membership_residual`; recovery after the watcher died) never reports a
+  Linux lifetime alive from (pid, start tick) equality: the watcher records the member's pidfs
+  inode as `fixed_object_id` TOGETHER with the inode lifetime MODEL it is valid under
+  (`fixed_object_model`), and ONLY under the one model this runtime can positively vouch for
+  (iteration 2, F-016; `standalone_pty.pidfs_lifetime_model`): a 64-bit Linux kernel at or
+  after 6.9, where the inspected primary sources (v6.12 `fs/pidfs.c` + `kernel/pid.c`, v6.16
+  `fs/pidfs.c`) assign `i_ino` from the monotonic 64-bit `struct pid` counter and never reuse
+  it for the life of the boot.  The 32-bit branches are NOT such a binding (v6.12 allocates
+  the number with `ida_alloc_range` and frees it on inode eviction -- a later different birth
+  may receive it; v6.16 exposes only the lower 32 bits plus a generation `st_ino` cannot
+  show), and a kernel before 6.9 has one shared anonymous pidfd inode; under any such model
+  the watcher records no binding and the reader answers UNKNOWN.  The reader
+  (`standalone_pty.pidfd_binding`) compares a fresh pidfd's inode only when the recorded model
+  equals the model it establishes on its own kernel: equal -> `lifetime_binding: pidfs_inode`
+  (alive, `binding_model` named); different -> `pidfs_inode_mismatch` (that incarnation is
+  positively gone); no inode on either side, no recorded model (an iteration-1 row), or a model
+  the reader cannot re-establish -> `pid_tick_unverified` with `binding_detail`
+  (`no_recorded_fixed_object_id` / `binding_model:unproven` / `binding_model:mismatch:…` /
+  `reader_binding:…`), an `unknown` entry and `descendants_unknown` (`tick_granular` is replaced
+  by `lifetime_siblings` + the binding).  Distinct self/member inode values alone prove
+  nothing about reuse.  (Iteration 3, F-016 -- the BOOT JOIN) every one of those bindings is
+  boot-scoped -- the start tick counts from boot, the pidfs inode counter (`pidfs_ino` /
+  `pidfs_ino_nr`, v6.9..v6.16) restarts on every boot, darwin's start time is a re-read --
+  so before ANY of them can say "the same incarnation" the reader joins the ledger's recorded
+  `identity.boot_id` to its own current boot id (DESIGN §2.1's boot identity axis): both
+  must be readable (non-empty) AND equal (`boot_joined: true`); a missing recorded boot, an
+  unreadable current boot, or a different boot is `unknown` `boot_unjoined` with
+  `binding_detail` `boot_id:unrecorded` / `boot_id:unreadable` / `boot_id:mismatch` and
+  `descendants_unknown` -- never alive (a different boot is reported conservatively as
+  unknown, not turned into a positive "gone" claim), on every platform.  No signal or settlement authority is derived from that reader on any
+  platform.  Darwin is unchanged and states its limitation honestly (N-001): the reader's alive
+  entries carry `lifetime_binding: start_microsecond` with `binding_detail:
+  reread_timestamp_not_fixed_object` -- the kernel's µs start identity RE-READ at decision
+  time (DESIGN §2.1's diagnostic identity axis), not an independently retained fixed object
+  and not the Linux binding guarantee; kqueue NOTE_EXIT pinned only the watcher's own
+  observation of an exit while it lived, it pins nothing for a later reader.  Additive ledger
+  fields (`os48.member.v1` unchanged; a row without `fixed_object_id` + `fixed_object_model`
+  reads as unverified).  Locks: `scripts/test_os48_f015_f016_locks.py` (real-caller F-015 exhaustion /
+  nested / one-line container / string-literal controls; F-016 admission seams, reader binding,
+  real-dispatch binding on both platforms, and the two PID-1 private-namespace same-tick
+  constructions; iteration 2: declared-wrapper locks for the fixture and both installed
+  grammars incl. the CRLF plain-root form, production-caller depth-bomb locks with plain /
+  prose / refusal-first controls, inode-model locks and the source-faithful 32-bit
+  recycling constructions; iteration 3: integer-limit production-caller locks for the fixture
+  and both installed grammars incl. prose / declared-wrapper framing, over-limit progress and
+  string-data controls, the selector factories and the bounded parser's conversion failure;
+  deterministic `MemoryError`-seam locks through the production caller (plain / prose /
+  two-line, refusal-first dominance, normal settlement) and every parser's classification;
+  the boot-join matrix (matching / recorded-missing / current-unreadable / different) over a
+  native own child and the PID-1 boot-counter-reset foreign-peer construction), RED at
+  checkpoint `c8f2747` (and, for each correction round's locks, at the previous round's
+  tree); `test_os48_review_i7_locks` reader lock versioned (`pid_tick_unverified`).
+
 * **Locks.**  `scripts/test_os48_finality_locks.py` (L-01/02/02b/03/04/10/10b/12),
   `test_os48_ownership_locks.py` (L-05/11/11b/14), `test_os48_evidence_locks.py` (L-06/07/08),
   `test_os48_recovery_cuts.py` (L-09/09b, C1-C7), `test_os48_crash_cuts.py` (real kills, C1-C9 /
   RC1-RC3), `test_os48_review_i1_locks.py` (F-001..F-006), `test_os48_review_i2_locks.py`
-  (i2 F-001/F-004/F-006/F-007), `test_os48_review_i3_locks.py` (i3 F-001/F-004/F-006/F-008), `test_os48_review_i4_locks.py` (i4 F-009), `test_os48_review_i5_locks.py` (i5 F-010 + adversarial pass, F-011), `test_os48_review_i6_locks.py` (i6 F-010 coalesced / pre-exec watch, F-011, F-012, F-013), `test_os48_review_i7_locks.py` (i7 F-015 framing, F-014 verified subreaper, F-016 fixed objects / lifetimes incl. the PID-1 private-namespace alias construction),
+  (i2 F-001/F-004/F-006/F-007), `test_os48_review_i3_locks.py` (i3 F-001/F-004/F-006/F-008), `test_os48_review_i4_locks.py` (i4 F-009), `test_os48_review_i5_locks.py` (i5 F-010 + adversarial pass, F-011), `test_os48_review_i6_locks.py` (i6 F-010 coalesced / pre-exec watch, F-011, F-012, F-013), `test_os48_review_i7_locks.py` (i7 F-015 framing, F-014 verified subreaper, F-016 fixed objects / lifetimes incl. the PID-1 private-namespace alias construction), `test_os48_f015_f016_locks.py` (i8 F-015 bounded nested scan / `record_scan_incomplete`, F-016 verified admission / reader binding, PID-1 same-tick foreign-peer constructions),
   `test_os48_linux_locks.py` (L-13 + membership, CI condition `not_linux`); the round-8/9/9i2/10 finality locks are versioned in
   place (`# superseded by OS-48` notes, W-F9).  Real-CLI proof: `scripts/os37_r10_real_agent.py` /
   `os37_r10_recovery_prompt_e2e.py` (Claude `session_field`, Codex `sidecar_file`).

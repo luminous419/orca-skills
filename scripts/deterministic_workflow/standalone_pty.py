@@ -1182,6 +1182,11 @@ DISCOVERY_CANDIDATE_UNREADABLE = "candidate_identity_unreadable"
 DISCOVERY_FORK_COALESCED = "fork_coalesced"
 DISCOVERY_OWNERSHIP_UNVERIFIED = "ownership_setup_unverified"
 DISCOVERY_PIDFD_UNAVAILABLE = "pidfd_unavailable"          # F-016: no fixed object for a Linux member
+#: REVIEW_IMPLEMENTATION_iteration8 F-016: a Linux candidate whose identity / parentage, re-read
+#: AFTER its fixed object (pidfd) was acquired, did not prove the SAME incarnation the
+#: pre-acquisition reads described (the pidfd died, the start tick or ppid differ, or the
+#: parent member's own fixed object no longer binds it) -- named, NOT a positive member.
+DISCOVERY_IDENTITY_UNVERIFIED = "candidate_identity_unverified"
 DISCOVERY_PASS_CEILING = "discovery_pass_ceiling"
 DISCOVERY_REAPED_UNATTRIBUTED = "reaped_unattributed"
 DISCOVERY_FORK_WATCH_GAP = "fork_watch_gap"
@@ -1206,6 +1211,7 @@ DISCOVERY_COUNTERS = {DISCOVERY_LISTING_UNREADABLE: "listing_unreadable",
                       DISCOVERY_PASS_CEILING: "unobservable",
                       DISCOVERY_OWNERSHIP_UNVERIFIED: "unobservable",
                       DISCOVERY_PIDFD_UNAVAILABLE: "unobservable",
+                      DISCOVERY_IDENTITY_UNVERIFIED: "candidates_unverified",
                       DISCOVERY_REAPED_UNATTRIBUTED: "unobservable"}
 _DISCOVERY_REASON_CEILING = 16
 _DISCOVERY_PID_CEILING = 64
@@ -1350,6 +1356,137 @@ def _process_info(pid: int) -> "tuple[int, int] | None":
     return _darwin_bsdinfo(pid) if sys.platform == "darwin" else _linux_stat(pid)
 
 
+def _pidfd_inode(fd: int) -> int:
+    """[FORKED-SAFE] The inode of a pidfd, ``0`` when unreadable.  An inode NUMBER alone proves
+    nothing about lifetimes: whether it is a non-recyclable identity of the process incarnation
+    depends on the kernel's pidfd inode model (:func:`pidfs_lifetime_model`), and on a kernel
+    without pidfs every pidfd shares one anonymous inode (:func:`_self_pidfd_inode` tells)."""
+    try:
+        return int(os.fstat(fd).st_ino)
+    except OSError:
+        return 0
+
+
+#: REVIEW_IMPLEMENTATION (run_5fcd2beac376) F-016 -- the ONE pidfd inode model this runtime
+#: accepts as a non-recyclable lifetime binding, and why.  Inspected primary sources:
+#: linux v6.12 `fs/pidfs.c` + `kernel/pid.c` and v6.16 `fs/pidfs.c`.  On a 64-BIT kernel a
+#: pidfs inode number is `struct pid.ino`, assigned from a monotonic 64-bit counter at pid
+#: allocation and never reassigned or reused for the life of the boot (v6.12: `pidfs_ino`
+#: under `pidmap_lock`; v6.16: `pidfs_add_pid`, `pidfs_ino(ino) == ino`).  The 32-BIT branches
+#: are NOT such a binding: v6.12 allocates the number with `ida_alloc_range` and frees it on
+#: inode eviction (a later different birth may receive it); v6.16 exposes only the lower 32
+#: bits plus a generation the reader cannot see through `st_ino`.  Kernels before 6.9 have no
+#: pidfs at all (one shared anonymous inode).  So the positive recovery binding is enabled
+#: ONLY when the running kernel is positively a 64-bit Linux at or after 6.9; every other
+#: model is UNPROVEN and a reader reports the lifetime as `unknown` by name.
+PIDFS_MODEL_STRUCT_PID_64 = "pidfs_struct_pid_64"
+_SIXTY_FOUR_BIT_MACHINES = frozenset({"x86_64", "amd64", "aarch64", "arm64", "ppc64", "ppc64le",
+                                      "s390x", "riscv64", "loongarch64", "mips64", "sparc64"})
+
+
+def _kernel_release_tuple(release: str) -> "tuple[int, int]":
+    """``(major, minor)`` of a `uname -r` string, ``(0, 0)`` when unparsable."""
+    try:
+        head = release.split("-", 1)[0].split("+", 1)[0]
+        major, minor = head.split(".")[:2]
+        return int(major), int(minor)
+    except (ValueError, AttributeError):
+        return 0, 0
+
+
+def pidfs_lifetime_model() -> str:
+    """[FORKED-SAFE] The pidfd inode lifetime model of the RUNNING kernel that this runtime
+    can positively vouch for: :data:`PIDFS_MODEL_STRUCT_PID_64` when this is a 64-bit
+    interpreter (which only a 64-bit kernel can run) AND `os.uname()` agrees (a 64-bit
+    machine, Linux at or after 6.9 -- the inspected sources' monotonic struct-pid axis);
+    ``""`` -- UNPROVEN -- for everything else (32-bit kernels, a 32-bit interpreter or
+    personality, kernels before pidfs, an unparsable release, any other platform).  A
+    watcher records a member's inode as `fixed_object_id` only under a proven model, and a
+    reader accepts an inode equality as "the same incarnation" only under the same proven
+    model; unproven means `unknown`, never alive."""
+    if sys.platform != "linux":
+        return ""
+    if sys.maxsize <= 2 ** 32:
+        # a 32-bit interpreter: the kernel may be 32-bit (a 32-bit userland can run on either),
+        # so the width is not positively established -- unproven
+        return ""
+    try:
+        uname = os.uname()
+    except OSError:
+        return ""
+    # a 64-bit interpreter can only run on a 64-bit kernel; `uname -m` must agree (a 32-bit
+    # personality reports a 32-bit machine and is refused)
+    if uname.sysname != "Linux" or uname.machine not in _SIXTY_FOUR_BIT_MACHINES:
+        return ""
+    if _kernel_release_tuple(uname.release) < (6, 9):
+        return ""
+    return PIDFS_MODEL_STRUCT_PID_64
+
+
+def _self_pidfd_inode() -> int:
+    """[FORKED-SAFE] The calling process's own pidfd inode: the reference that tells a unique
+    (pidfs) inode from the shared anonymous one.  ``0`` when no pidfd can be opened."""
+    if not hasattr(os, "pidfd_open"):
+        return 0
+    try:
+        fd = os.pidfd_open(os.getpid())
+    except OSError:
+        return 0
+    try:
+        return _pidfd_inode(fd)
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+
+
+def _pidfd_alive(fd: int) -> str:
+    """``alive`` (the pidfd's process has not exited -- so the pid is still THAT process),
+    ``exited`` (readable: it ended), ``unavailable`` (the fd cannot be polled)."""
+    try:
+        ready, _, _ = select.select([fd], [], [], 0)
+    except (OSError, ValueError):
+        return "unavailable"
+    return "exited" if ready else "alive"
+
+
+def pidfd_binding(pid: int) -> dict[str, Any]:
+    """REVIEW_IMPLEMENTATION_iteration8 F-016 -- the INDEPENDENT lifetime binding a reader with
+    no held pidfd can still obtain for the process holding ``pid`` NOW (a supervisor or a
+    recovery reader after the watcher died): ``{"state", "fixed_object_id"}``.
+
+    ``final`` + the pidfs inode of a fresh pidfd ONLY under a proven non-recyclable inode
+    model (:func:`pidfs_lifetime_model`, reported as ``model``) -- compared to the recorded
+    member's ``fixed_object_id``: equal -> the SAME incarnation; different -> that incarnation
+    is positively gone, the pid is another process's; ``absent`` when no process holds the
+    pid; ``unavailable`` when the kernel offers no binding this runtime can vouch for (no
+    `pidfd_open`, shared anonymous pidfd inodes, a 32-bit or otherwise unproven inode model
+    -- ``model`` says which) -- and then (pid, start tick) equality alone must NOT be read as
+    the recorded lifetime: ticks are not injective."""
+    model = pidfs_lifetime_model()
+    if sys.platform != "linux" or not hasattr(os, "pidfd_open") or int(pid) <= 0:
+        return {"state": "unavailable", "fixed_object_id": 0, "model": model}
+    try:
+        fd = os.pidfd_open(int(pid))
+    except ProcessLookupError:
+        return {"state": "absent", "fixed_object_id": 0, "model": model}
+    except OSError:
+        return {"state": "unavailable", "fixed_object_id": 0, "model": model}
+    try:
+        state = _pidfd_alive(fd)
+        if state == "exited":
+            # exited but not yet reaped: no live incarnation holds the pid
+            return {"state": "absent", "fixed_object_id": 0, "model": model}
+        if state != "alive" or not model:
+            return {"state": "unavailable", "fixed_object_id": 0, "model": model}
+        ino, ref = _pidfd_inode(fd), _self_pidfd_inode()
+        if not ino or not ref or ino == ref:
+            return {"state": "unavailable", "fixed_object_id": 0, "model": model}
+        return {"state": capture_mod.EVIDENCE_FINAL, "fixed_object_id": ino, "model": model}
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+
+
 def _member_identity(pid: int, start_id: int, boot_id: str, fence: str) -> dict[str, Any]:
     return identity.process_identity(pid=int(pid), start_id=int(start_id), boot_id=boot_id,
                                      incarnation=fence, source=evidence_source_id())
@@ -1406,6 +1543,7 @@ class _Membership:
         self.discovery: dict[str, Any] = {"passes": 0, "listing_unreadable": 0, "listing_unstable": 0,
                                           "candidates_unreadable": 0, "forks_coalesced": 0,
                                           "watch_gaps": 0, "parents_unreadable": 0, "unobservable": 0,
+                                          "candidates_unverified": 0,
                                           "root_watch": root_watch or "unregistered",
                                           "reasons": [], "pids": []}
         self._unreadable_seen: set[int] = set()
@@ -1415,6 +1553,14 @@ class _Membership:
         #: the member is observed exiting; identity of a cached member is asked of the pidfd,
         #: never of (pid, tick) equality.  Keyed like `members`.
         self._pidfds: dict[tuple[int, int, int], int] = {}
+        #: i8 F-016: this watcher's own pidfd inode -- the reference that tells a distinct
+        #: member inode from the shared anonymous inode of a kernel without pidfs (0: none) --
+        #: and the kernel's inode lifetime MODEL: a member's inode is recorded as its
+        #: `fixed_object_id` (a reader's binding) ONLY under the proven non-recyclable model
+        #: (`pidfs_lifetime_model`, run_5fcd2beac376 F-016); distinct values alone prove
+        #: nothing about reuse after this watcher's handle is gone
+        self._pidfs_ref = _self_pidfd_inode() if sys.platform == "linux" else 0
+        self._pidfs_model = pidfs_lifetime_model()
         self._root_watch = root_watch
         self._kq: Any = kq
         if sys.platform == "darwin" and self._kq is None:
@@ -1457,11 +1603,7 @@ class _Membership:
         fd = self._pidfds.get(key)
         if fd is None:
             return "unavailable"
-        try:
-            ready, _, _ = select.select([fd], [], [], 0)
-        except (OSError, ValueError):
-            return "unavailable"
-        return "exited" if ready else "alive"
+        return _pidfd_alive(fd)
 
     def _pgid(self, pid: int) -> int:
         try:
@@ -1498,7 +1640,23 @@ class _Membership:
         except OSError:
             pass
 
-    def _add(self, pid: int, start_id: int, role: str, observed_via: str) -> bool:
+    def _add(self, pid: int, start_id: int, role: str, observed_via: str, *,
+             ppid: int | None = None) -> bool:
+        """Admit ``(pid, start_id)`` as a positive member -- on Linux ONLY once its fixed object
+        binds the same incarnation the caller read (REVIEW_IMPLEMENTATION_iteration8 F-016).
+
+        The caller's ``start_id`` / ``ppid`` are PRE-acquisition reads of `/proc`; between them
+        and `pidfd_open` the process may be reaped and its pid (and, at tick granularity, its
+        start id) reborn as a FOREIGN process -- the reviewer's same-tick admission cut.  So a
+        descendant is admitted only when, AFTER the pidfd is held: (a) the pidfd is alive
+        (the pid has been that one process since the open), (b) `/proc` re-read through that
+        window reports the SAME start id and the SAME ppid the caller read (the read is bound
+        to the pidfd's process because that process was alive after it), and (c) the parent it
+        names is this subreaper or a member whose OWN fixed object is still alive after (b).
+        Anything else is the named `candidate_identity_unverified` and NOT a member; a pidfd
+        that cannot be obtained at all is `pidfd_unavailable` and NOT a member.  The agent
+        (P1) is this watcher's own child: its pid is held until our own `waitpid`, which is
+        the binding, so its pidfd needs no re-verification."""
         watch_registered = role == MEMBER_ROLE_AGENT and self._root_watch == "registered"
         if pid <= 0 or not start_id:
             return False
@@ -1530,13 +1688,38 @@ class _Membership:
                 self._discovery_unreadable(DISCOVERY_PIDFD_UNAVAILABLE,
                                            f"{type(exc).__name__}:{getattr(exc, 'errno', '')}",
                                            observed_via, [int(pid)])
+                if role != MEMBER_ROLE_AGENT:
+                    return False                           # i8: no fixed object, no positive member
+            exited_at_admission = False
+            if fd >= 0 and role != MEMBER_ROLE_AGENT:
+                unverified, exited_at_admission = self._unverified_after_acquisition(pid, start_id, ppid, fd)
+                if unverified:
+                    with contextlib.suppress(OSError):
+                        os.close(fd)
+                    if unverified != "fixed_object:gone":
+                        self._discovery_unreadable(DISCOVERY_IDENTITY_UNVERIFIED, unverified,
+                                                   observed_via, [int(pid)])
+                    # else: the bound process ended AND was reaped between the listing and
+                    # the acquisition -- ordinary churn (as a pid gone between the listing and
+                    # the read is); nothing alive is admitted and nothing is claimed about it
+                    return False
             if fd >= 0:
                 self._pidfds[key] = fd
                 record["fixed_object"] = "pidfd"
+                ino = _pidfd_inode(fd)
+                if self._pidfs_model and ino and self._pidfs_ref and ino != self._pidfs_ref:
+                    # a reader's binding, valid only under the recorded (proven) model
+                    record["fixed_object_id"] = ino
+                    record["fixed_object_model"] = self._pidfs_model
         elif sys.platform == "darwin":
             record["fixed_object"] = "kqueue_note_exit" if self._kq is not None else "none"
         self.members[key] = record
         self._append(record)
+        if sys.platform == "linux" and exited_at_admission:
+            # a ZOMBIE bound and verified through its fixed object: positively ours, and P5 at
+            # once (the subreaper's reap will follow); never a live member
+            self._exited(int(pid), int(start_id), via="pidfd_exit")
+            return True
         if watch_registered or self._kq is None:
             return True
         # a DESCENDANT's watch is registered after its birth: whatever it forked before this
@@ -1555,6 +1738,33 @@ class _Membership:
                                        f"{type(exc).__name__}:{getattr(exc, 'errno', '')}",
                                        observed_via, [int(pid)])
         return True
+
+    def _unverified_after_acquisition(self, pid: int, start_id: int, ppid: "int | None",
+                                      fd: int) -> "tuple[str, bool]":
+        """i8 F-016: ``(reason, exited)`` -- the reason the held ``fd`` does NOT prove the
+        incarnation the caller read (``""`` when it does), and whether the bound process has
+        already exited (a zombie: still holding its pid, still readable, positively ours when
+        the re-read matches -- P5 through the fixed object at once).  Order matters: `/proc` is
+        re-read FIRST and the pidfd polled AFTER, so an alive answer proves the process the
+        read described held the pid through the read; a zombie holds its pid until reaped, so
+        its re-read is bound the same way; the parent member's fixed object is polled after
+        that, for the same reason."""
+        again = _process_info(int(pid))
+        state = _pidfd_alive(fd)
+        if state == "unavailable":
+            return "fixed_object:unavailable", False
+        if again is None:
+            # exited AND reaped (or unreadable): nothing binds the pre-acquisition read
+            return ("fixed_object:gone" if state == "exited" else "reread:unreadable"), False
+        if int(again[1]) != int(start_id):
+            return f"start_id:{start_id}->{again[1]}", False
+        if ppid is not None and int(again[0]) != int(ppid):
+            return f"ppid:{ppid}->{again[0]}", False
+        if ppid is not None and int(ppid) != os.getpid():
+            parent = self._live_member_for(int(ppid))
+            if not isinstance(parent, dict):
+                return "parent:" + ("unreadable" if parent == "unreadable" else "unbound"), False
+        return "", state == "exited"
 
     def _live_member_for(self, ppid: int) -> "dict[str, Any] | str | None":
         """P3: the member record that a child with parent ``ppid`` may be attributed to -- a
@@ -1749,7 +1959,7 @@ class _Membership:
                     # with no recorded lifetime is still attributed below -- it was positively
                     # ours and its fixed object records P5 at once.
                     continue
-                if via and self._add(pid, start, MEMBER_ROLE_DESCENDANT, via):
+                if via and self._add(pid, start, MEMBER_ROLE_DESCENDANT, via, ppid=int(ppid)):
                     found += 1
             if unreadable:
                 self._unreadable_seen.update(unreadable)

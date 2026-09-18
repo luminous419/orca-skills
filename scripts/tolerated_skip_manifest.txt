@@ -39,7 +39,7 @@
 #   'no_sandbox_exec' observed by loading the suite under a simulated environment
 #   and reading the same __unittest_skip_why__ attributes TestCase.run consults.
 #
-# -- always (37) --
+# -- always (42) --
 always	test_orca_runtime.FinalReviewRuntimeIntegrationTests.test_final_review_terminal_freshness	requires --orca-runtime and a ready Orca runtime
 always	test_orca_runtime.OrcaRuntimeIntegrationTests.test_runtime_scenarios	requires --orca-runtime and a ready Orca runtime
 always	test_orca_runtime.QualityProfileRuntimeIntegrationTests.test_every_dispatch_of_the_run_carries_the_quality_gate	requires --orca-runtime and a ready Orca runtime
@@ -76,13 +76,19 @@ always	test_os37_r10_workflow_e2e.R10WorkflowE2ETests.test_the_workflow_reached_
 always	test_os37_standalone_e2e.R10RealAgentEvidenceTests.test_the_recorded_evidence_is_not_fixture_sourced	requires ORCA_OS37_E2E=1; the standalone E2E drives real local processes
 always	test_os37_standalone_e2e.R10RealAgentEvidenceTests.test_the_retained_evidence_was_re_read_by_a_stranger_interpreter	requires ORCA_OS37_E2E=1; the standalone E2E drives real local processes
 always	test_os37_standalone_e2e.StandaloneE2ETests.test_real_runtime_smoke	requires ORCA_OS37_E2E=1; the standalone E2E drives real local processes
+always	test_os48_f015_f016_locks.F016BootCounterResetTests.test_a_counter_reset_on_another_boot_never_reports_the_foreign_peer_alive	needs PID 1 of a private PID namespace with a writable ns_last_pid
+always	test_os48_f015_f016_locks.F016RecyclableInodeModelTests.test_a_32_bit_model_records_no_binding_and_the_reader_stays_unknown	needs PID 1 of a private PID namespace with a writable ns_last_pid
+always	test_os48_f015_f016_locks.F016RecyclableInodeModelTests.test_a_binding_recorded_under_the_proven_model_is_not_read_under_another	needs PID 1 of a private PID namespace with a writable ns_last_pid
+always	test_os48_f015_f016_locks.F016SameTickForeignPeerTests.test_a_delayed_acquisition_never_admits_the_foreign_peer_or_its_child	needs PID 1 of a private PID namespace with a writable ns_last_pid
+always	test_os48_f015_f016_locks.F016SameTickForeignPeerTests.test_a_reader_after_the_watcher_died_never_reports_the_foreign_peer_alive	needs PID 1 of a private PID namespace with a writable ns_last_pid
 always	test_os48_review_i7_locks.F016FixedObjectTests.test_native_same_pid_same_tick_reuse_is_a_new_lifetime	needs PID 1 of a private PID namespace with a writable ns_last_pid
-# -- not_darwin (55) --
+# -- not_darwin (56) --
 not_darwin	test_os48_evidence_locks.L06L08DiagnosticEnumerationTests.test_a_count_that_disagrees_with_the_fill_is_unreadable	OS-48 libproc evidence seams are darwin's (probe_03)
 not_darwin	test_os48_evidence_locks.L06L08DiagnosticEnumerationTests.test_a_short_pid_fill_is_unreadable_by_name	OS-48 libproc evidence seams are darwin's (probe_03)
 not_darwin	test_os48_evidence_locks.L06L08DiagnosticEnumerationTests.test_denied_stale_and_short_fd_reads_are_unreadable_never_absence	OS-48 libproc evidence seams are darwin's (probe_03)
 not_darwin	test_os48_evidence_locks.L06L08DiagnosticEnumerationTests.test_the_word_proven_never_appears_in_a_diagnostic_state	OS-48 libproc evidence seams are darwin's (probe_03)
 not_darwin	test_os48_evidence_locks.L07DarwinIdentityDecodeTests.test_a_short_bsdinfo_read_is_never_decoded	OS-48 libproc evidence seams are darwin's (probe_03)
+not_darwin	test_os48_f015_f016_locks.F016RealDispatchBindingTests.test_the_darwin_reader_states_its_microsecond_binding	the microsecond start identity is darwin's
 not_darwin	test_os48_finality_locks.L12DarwinFactLocks.test_a_held_slave_reference_retains_the_tail_across_a_late_read	OS-48 darwin fact lock: the kernel behaviour it pins is darwin's (probe_01/04/d1/d10)
 not_darwin	test_os48_finality_locks.L12DarwinFactLocks.test_kqueue_note_exit_on_a_zombie_is_esrch	OS-48 darwin fact lock: the kernel behaviour it pins is darwin's (probe_01/04/d1/d10)
 not_darwin	test_os48_finality_locks.L12DarwinFactLocks.test_the_last_slave_close_discards_the_unread_tail	OS-48 darwin fact lock: the kernel behaviour it pins is darwin's (probe_01/04/d1/d10)
@@ -133,7 +139,17 @@ not_darwin	test_review_isolation.NegativeContractTests.test_the_sandboxed_proces
 not_darwin	test_review_isolation.ProbeInterpreterShimTests.test_on_darwin_the_shimmed_system_git_is_actually_resolved_away	the seatbelt backend is darwin-only; T-8.9 carries the fail-closed guarantee on every other platform
 not_darwin	test_review_isolation.ProbeInterpreterShimTests.test_on_darwin_the_shimmed_system_python_is_actually_resolved_away	the seatbelt backend is darwin-only; T-8.9 carries the fail-closed guarantee on every other platform
 not_darwin	test_review_isolation.ProbeInterpreterShimTests.test_on_darwin_the_two_shimmed_tools_are_literally_the_same_file	the seatbelt backend is darwin-only; T-8.9 carries the fail-closed guarantee on every other platform
-# -- not_linux (22) --
+# -- not_linux (32) --
+not_linux	test_os48_f015_f016_locks.F016AdmissionVerificationTests.test_a_candidate_reaped_before_acquisition_is_never_admitted	pidfds and the /proc discovery walk are Linux's
+not_linux	test_os48_f015_f016_locks.F016AdmissionVerificationTests.test_a_candidate_whose_parentage_differs_after_acquisition_is_unverified	pidfds and the /proc discovery walk are Linux's
+not_linux	test_os48_f015_f016_locks.F016AdmissionVerificationTests.test_a_verified_descendant_holds_its_pidfd_and_records_its_binding	pidfds and the /proc discovery walk are Linux's
+not_linux	test_os48_f015_f016_locks.F016InodeModelTests.test_a_recorded_binding_under_an_unproven_or_different_model_is_unknown	pidfds and the /proc discovery walk are Linux's
+not_linux	test_os48_f015_f016_locks.F016InodeModelTests.test_an_unproven_model_records_no_binding_and_reads_none	pidfds and the /proc discovery walk are Linux's
+not_linux	test_os48_f015_f016_locks.F016InodeModelTests.test_the_model_is_proven_only_for_a_64_bit_kernel_at_or_after_6_9	pidfds and the /proc discovery walk are Linux's
+not_linux	test_os48_f015_f016_locks.F016RealDispatchBindingTests.test_the_linux_helper_is_alive_only_through_the_pidfs_binding_else_unknown	pidfds and the /proc discovery walk are Linux's
+not_linux	test_os48_f015_f016_locks.F016RecoveryReaderTests.test_a_reader_without_a_kernel_binding_is_unknown_even_with_a_recorded_one	pidfds and the /proc discovery walk are Linux's
+not_linux	test_os48_f015_f016_locks.F016RecoveryReaderTests.test_a_recorded_binding_the_kernel_confirms_is_alive_and_a_different_one_is_gone	pidfds and the /proc discovery walk are Linux's
+not_linux	test_os48_f015_f016_locks.F016RecoveryReaderTests.test_pid_and_tick_equality_alone_is_unknown_by_name_never_alive	pidfds and the /proc discovery walk are Linux's
 not_linux	test_os48_linux_locks.L13FenceOverLinuxPtyTests.test_the_production_spawn_settles_under_the_fence_on_linux	requires Linux: PR_SET_CHILD_SUBREAPER / pidfd / EIO retention (OS-48 L-13)
 not_linux	test_os48_linux_locks.L13MembershipLedgerTests.test_a_detached_helper_is_a_named_residual_on_linux	requires Linux: PR_SET_CHILD_SUBREAPER / pidfd / EIO retention (OS-48 L-13)
 not_linux	test_os48_linux_locks.L13MembershipLedgerTests.test_the_subreaper_ledger_records_a_reparented_descendant_and_its_reap	requires Linux: PR_SET_CHILD_SUBREAPER / pidfd / EIO retention (OS-48 L-13)

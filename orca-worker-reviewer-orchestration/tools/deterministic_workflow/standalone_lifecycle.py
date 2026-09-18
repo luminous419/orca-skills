@@ -131,6 +131,10 @@ LOST_REASONS = (
     # REVIEW_IMPLEMENTATION_iteration7 F-015: a completion-shaped object inside a line of the
     # fenced range that is not itself a record -- R2 ("exactly one") is unprovable.
     "record_framing_ambiguous",
+    # REVIEW_IMPLEMENTATION_iteration8 F-015: the bounded framing scan of the fenced range hit
+    # its bound (objects / depth / bytes) before examining everything and found no refusal in
+    # what it did examine -- R1 / R2 are UNDECIDED; an exhausted scan is never "no refusal".
+    "record_scan_incomplete",
 )
 
 #: OS-48 named outcomes that are FAILED verdict reasons (a settlement, not a loss).
@@ -148,7 +152,8 @@ OS48_LOST_OUTCOMES = frozenset({
     "identity_unreadable", "identity_changed", "evidence_inconsistent",
     "provenance_ambiguous", "provenance_unbound", "signal_unbound", "signal_target_reaped",
     "group_signal_refused", "fence_published_no_claim", "succession_unwitnessed",
-    "capture_truncated", "evidence_unreadable", "record_framing_ambiguous"})
+    "capture_truncated", "evidence_unreadable", "record_framing_ambiguous",
+    "record_scan_incomplete"})
 
 #: The sentinel that is NOT an exit code.  A reader of this value reports LOST.
 UNVERIFIED_PROCESS_EXIT_CODE = -1

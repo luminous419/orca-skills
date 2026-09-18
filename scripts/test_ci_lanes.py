@@ -1084,7 +1084,8 @@ class ManifestMatchesTheDeclaredGatesTests(unittest.TestCase):
     MODULES = (MODULE, "test_os48_linux_locks", "test_os48_finality_locks",
                "test_os48_evidence_locks", "test_os48_review_i1_locks", "test_os48_review_i2_locks",
                "test_os48_review_i3_locks", "test_os48_review_i4_locks", "test_os48_review_i5_locks",
-               "test_os48_review_i6_locks", "test_os48_review_i7_locks")
+               "test_os48_review_i6_locks", "test_os48_review_i7_locks",
+               "test_os48_f015_f016_locks")
 
     @classmethod
     def declared_gates(cls) -> dict[str, set[str]]:

@@ -404,11 +404,22 @@ class F006MembershipIdentityTests(unittest.TestCase):
     def test_two_incarnations_under_one_pid_stay_distinct(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             members = self._members(d, 4242, 100)
-            members._add(4242, 200, pty_supervisor.MEMBER_ROLE_DESCENDANT, "test")
+            added = members._add(4242, 200, pty_supervisor.MEMBER_ROLE_DESCENDANT, "test")
             members._exited(4242, 100)
             # superseded by OS-48 i8 (F-016): member keys are lifetimes (pid, start, n)
             self.assertTrue(members.members[(4242, 100, 1)].get("exited"))
-            self.assertFalse(members.members[(4242, 200, 1)].get("exited"))
+            if sys.platform == "linux":
+                # VERSIONED by run_5fcd2beac376 (i8 F-016): a Linux DESCENDANT is a member only
+                # through a fixed object that binds the incarnation the caller read; a pid the
+                # kernel does not hold (this fixture's 4242) has no pidfd -> refused by name
+                # (`pidfd_unavailable`), never recorded with `fixed_object: none`.  The agent's
+                # own incarnation (P1, bound by the watcher's waitpid) is unaffected.
+                self.assertFalse(added, members.members)
+                self.assertNotIn((4242, 200, 1), members.members)
+                self.assertTrue([r for r in members.discovery["reasons"] if r.startswith("pidfd_unavailable:")], members.discovery)
+            else:
+                self.assertTrue(added)
+                self.assertFalse(members.members[(4242, 200, 1)].get("exited"))
             records = pty_supervisor.read_members(d + "/members.jsonl")
             exited = [r for r in records if r["event"] == "exited"]
             self.assertEqual([(int(r["identity"]["pid"]), int(r["identity"]["start_id"])) for r in exited], [(4242, 100)])

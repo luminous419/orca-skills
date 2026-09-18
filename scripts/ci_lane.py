@@ -1196,7 +1196,7 @@ PLATFORM_GATED_MODULES = (PLATFORM_GATED_MODULE, "test_os48_linux_locks",
                           "test_os48_review_i1_locks", "test_os48_review_i2_locks",
                           "test_os48_review_i3_locks", "test_os48_review_i4_locks",
                           "test_os48_review_i5_locks", "test_os48_review_i6_locks",
-                          "test_os48_review_i7_locks")
+                          "test_os48_review_i7_locks", "test_os48_f015_f016_locks")
 
 
 def declared_platform_gates(root: Path | None = None) -> dict[str, set[str]]:

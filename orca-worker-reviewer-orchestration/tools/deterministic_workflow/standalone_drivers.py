@@ -754,34 +754,125 @@ class _Driver:
         declared = {s.record_type for s in self.profile.completion_records} or set(self._COMPLETION_TYPES)
         return tuple(dict(r) for r in self.structured_records(text) if r.get("type") in declared)
 
-    def framing_candidates(self, text: str) -> tuple[dict[str, Any], ...]:
-        """REVIEW_IMPLEMENTATION_iteration7 F-015: completion- or refusal-SHAPED objects that
+    def framing_scan(self, text: str) -> dict[str, Any]:
+        """REVIEW_IMPLEMENTATION_iteration7/8 F-015: completion- or refusal-SHAPED objects that
         the record grammar cannot see -- embedded in lines of ``text`` that do not parse as
         records (a cooperative helper's ``progress: `` prefix on the root's own refusal, a
-        suffix, a record split across two lines).  Each is ``{"record", "refusal", "run"}``:
-        ``refusal`` = the embedded object refuses (its declared ``error_field`` is truthy, its
-        ``is_error`` is truthy, or a declared structured auth marker matches).  A candidate is
-        never a settlement record: it is evidence that R1/R2 cannot be decided from the
-        parsable records alone."""
+        suffix, a record split across two lines, a WRAPPER ``{"progress": `` closed on a later
+        line around the root's record) -- examined through the BOUNDED NESTED traversal of
+        :func:`standalone_capture.embedded_scan` (i8: inner objects are examined; a JSON string
+        literal's contents are never a record).
+
+        ``{"candidates", "complete", "reason", "examined"}``.  Each candidate is
+        ``{"record", "refusal", "run", "record_type", "nested"}``: ``refusal`` = the object
+        refuses.  A TOP-LEVEL embedded object refuses when its declared ``error_field`` is
+        truthy, its ``is_error`` is truthy, or a declared structured auth marker matches (as
+        before); a NESTED object refuses only through a POSITIVE rule -- its declared completion
+        type's ``error_field`` or a declared auth marker -- so a tool-result's own ``is_error``
+        inside a wrapper is data, not the dispatch's refusal.  A candidate is never a settlement
+        record: it is evidence that R1/R2 cannot be decided from the parsable records alone.
+
+        ``complete == False`` means the scan hit its bound (``reason`` names it) and the rest of
+        the range was NOT examined: the caller must not read the candidates it did find as the
+        whole set -- an incomplete scan without a refusal is `record_scan_incomplete`.
+
+        What "refusal dominance" (R1) positively covers, stated plainly: a declared completion
+        record whose error field is set, a declared auth marker (top-level or nested anywhere),
+        a completion-typed nested object whose error field is set, a top-level embedded object
+        with a truthy ``is_error``, and the free-text refusal patterns over prose lines.  A
+        nested object's generic ``is_error`` outside a declared completion type is data and is
+        NOT a refusal; a refusal spelled inside a string literal is data."""
         declared = {s.record_type for s in self.profile.completion_records} or set(self._COMPLETION_TYPES)
         errors = {s.record_type: s.error_field for s in self.profile.completion_records if s.error_field}
+        # REVIEW_IMPLEMENTATION (run_5fcd2beac376) F-015: EVERY parsable line's nested content
+        # is examined -- a declared readiness / delivery / body / completion type on the outer
+        # object is no exemption.  A cooperative helper can open `{"type": "system",
+        # "progress": ` (a type the profile declares) around the root's own record exactly as
+        # it can open an undeclared wrapper, and the i1 grammar exemption let that one-line
+        # container hide a bound refusal inside [0, N).  The outer record itself is still
+        # judged only by R1/R2 (it is a record, not a framing candidate); what it HOLDS is
+        # examined under the NESTED positive rule below, which is what keeps a record's own
+        # data (a tool result's `is_error`, a Codex `item.completed` error item) from being
+        # read as the dispatch's refusal.
         out: list[dict[str, Any]] = []
-        for run in capture.unparsable_runs(text):
+        budget = capture.ScanBudget()
+        complete = True
+        reason = ""
+        examined = 0
+        # (run text, objects, all objects NESTED?, scan complete?, bound hit) -- in STREAM
+        # order: unparsable runs are scanned for embedded objects, parsable records are walked
+        # for what they hold, and the walk STOPS at the first line the record parser could not
+        # EXAMINE (iteration-3 review F-017 / F-015: an allocation, depth or conversion
+        # failure).  Such a line is never re-parsed as prose and never re-examined by the
+        # embedded scan -- a resource-failed candidate is not re-read to fail again on the
+        # same allocation -- so everything before it is examined (a reached refusal keeps its
+        # dominance) and everything from it on is UNEXAMINED: the scan is incomplete with
+        # the parser's own reason.
+        containers: list[tuple[str, list[dict[str, Any]], bool, bool, str]] = []
+        stopped = ""
+        run_lines: list[str] = []
+
+        def flush_run() -> bool:
+            run = "\n".join(run_lines)
+            run_lines.clear()
             if "{" not in run:
+                return True
+            scan = capture.embedded_scan(run, budget=budget)
+            containers.append((run, scan["objects"], False, bool(scan["complete"]), str(scan["reason"])))
+            return bool(scan["complete"])
+        for parsed, raw, failure in capture.structured_lines_with_failures(text):
+            if failure:
+                if not flush_run():
+                    break
+                stopped = failure
+                break
+            if parsed is None:
+                run_lines.append(raw)
                 continue
-            for obj in capture.embedded_objects(run):
+            if not flush_run():
+                break
+            inner: list[dict[str, Any]] = []
+            whole = capture.walk_nested_objects(parsed, inner, budget)
+            # the container itself is a parsable RECORD: only what it HOLDS is a candidate
+            # (its own top-level shape is a record R1/R2 already saw)
+            containers.append((raw, inner[1:], True, whole, budget.exhausted))
+            if not whole:
+                break
+        else:
+            flush_run()
+        for run, objects, all_nested, whole, why in containers:
+            examined += len(objects)
+            nested_ids: set[int] = set()
+            for obj in objects:
                 kind = obj.get("type")
+                nested = all_nested or id(obj) in nested_ids
                 refusal = False
                 if kind in errors and _truthy(_dig(obj, errors[kind]) if _dig(obj, errors[kind]) is not None else False):
                     refusal = True
-                if _truthy(obj.get("is_error")) if obj.get("is_error") is not None else False:
-                    refusal = True
                 if self.structured_refusal(obj) is not None:
                     refusal = True
+                if not nested and (_truthy(obj.get("is_error")) if obj.get("is_error") is not None else False):
+                    refusal = True
                 if kind in declared or refusal:
-                    out.append({"record": obj, "refusal": refusal,
-                                "run": run[:200], "record_type": kind})
-        return tuple(out)
+                    out.append({"record": obj, "refusal": refusal, "run": run[:200],
+                                "record_type": kind, "nested": nested})
+                if not nested:
+                    # every object reachable from a top-level one is NESTED (the scan lists a
+                    # top-level object before everything inside it)
+                    nested_ids.update(id(v) for v in _nested_values(obj))
+            if not whole:
+                complete = False
+                reason = str(why or capture.SCAN_INCOMPLETE_OBJECTS)
+                break
+        if complete and stopped:
+            complete = False
+            reason = stopped
+        return {"candidates": tuple(out), "complete": complete, "reason": reason, "examined": examined}
+
+    def framing_candidates(self, text: str) -> tuple[dict[str, Any], ...]:
+        """The candidates of :meth:`framing_scan` alone (a convenience; production selection
+        reads the scan, whose completeness it must not drop)."""
+        return self.framing_scan(text)["candidates"]
 
     def select_completion(self, text: str, *, raw: bytes | None = None,
                           bound_value: str = "", sidecar_present: bool = False,
@@ -798,7 +889,9 @@ class _Driver:
            (LOST: a second writer was possible); none → no record (FAILED `no_completion_record`);
            a completion-shaped object inside a line that is NOT a record (helper prefix /
            suffix / split framing, F-015) → ``record_framing_ambiguous`` (LOST: exactly-one is
-           unprovable) unless it refuses, in which case R1 applies;
+           unprovable) unless it refuses, in which case R1 applies; a framing scan that hit its
+           bound without finding a refusal → ``record_scan_incomplete`` (LOST: R1/R2 undecided;
+           i8);
         R3 **dispatch binding** -- the single record must satisfy the selector's
            ``binding_mode`` (`session_field`: the record carries ``binding_field == bound_value``;
            `sidecar_file`: the runtime-minted sidecar is present AND ``binding_field`` on the
@@ -816,7 +909,8 @@ class _Driver:
         # prefix / suffix / split framing inside [baseline, N)): a refusing one is a refusal
         # under R1 (dominance); any other makes R2 UNPROVABLE -> `record_framing_ambiguous`,
         # never a success.  The exact fenced bytes are untouched.
-        framing = self.framing_candidates(text)
+        framed = self.framing_scan(text)
+        framing = framed["candidates"]
         # R1 -- refusal dominance (structured-first, as `lifecycle.refusal_evidence` does).
         refusal: dict[str, Any] | None = None
         for item in framing:
@@ -850,6 +944,13 @@ class _Driver:
                 return {"record": last, "outcome": None, "refusal": refusal, "candidates": 1}
             return {"record": last, "outcome": capture.OUTCOME_REFUSAL_IN_BOUNDARY,
                     "refusal": refusal, "candidates": len(candidates)}
+        if not framed["complete"]:
+            # i8 F-015: the framing scan hit its bound BEFORE examining the whole range and
+            # found no refusal in what it did examine: R1 and R2 are UNDECIDED, not decided in
+            # the success's favour -- named, never COMPLETED.
+            return {"record": None, "outcome": capture.OUTCOME_RECORD_SCAN_INCOMPLETE,
+                    "refusal": None, "candidates": len(candidates) + len(framing),
+                    "scan": {"complete": False, "reason": framed["reason"], "examined": framed["examined"]}}
         if framing:
             return {"record": None, "outcome": capture.OUTCOME_RECORD_FRAMING_AMBIGUOUS,
                     "refusal": None, "candidates": len(candidates) + len(framing),
@@ -921,7 +1022,10 @@ class _Driver:
                 "source_vocabulary": {"driver": self.name,
                                       "record": record or {},
                                       "exit_code": exit_status,
-                                      "provenance_outcome": provenance_outcome},
+                                      "provenance_outcome": provenance_outcome,
+                                      # i8 F-015: which bound an incomplete framing scan hit
+                                      **({"scan": dict(selection["scan"])}
+                                         if selection is not None and selection.get("scan") else {})},
                 "at": _now_iso()}
 
     # -- D4.4's CONJUNCTIVE settlement predicate, applied rather than described ----------
@@ -1502,6 +1606,23 @@ def driver_for(profile: StandaloneProfile) -> _Driver:
         composed = type(f"{factory.__name__}PostReady", (_PostReadyDelivery, factory), {})
         _MODE_CLASSES[key] = composed
     return composed(profile)               # type: ignore[return-value]
+
+
+def _nested_values(obj: Any) -> list[Any]:
+    """Every dict reachable from ``obj`` through dicts and lists (never strings), for marking
+    NESTED framing candidates; mirrors `standalone_capture.walk_nested_objects`'s reach."""
+    out: list[Any] = []
+    level: list[Any] = [obj]
+    while level:
+        nxt: list[Any] = []
+        for node in level:
+            if isinstance(node, dict):
+                nxt.extend(v for v in node.values() if isinstance(v, (dict, list)))
+            elif isinstance(node, list):
+                nxt.extend(v for v in node if isinstance(v, (dict, list)))
+        out.extend(v for v in nxt if isinstance(v, dict))
+        level = nxt
+    return out
 
 
 def _truthy(value: Any) -> bool:

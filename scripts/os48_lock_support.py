@@ -81,14 +81,16 @@ def spawn_session(room: Room, agent: str, *, run_id: str, budget_ms: int = 3000,
                   image: str | None = None, argv: list[str] | None = None,
                   binding_mode: str = "single_record_optin", binding_field: str = "",
                   carrier_type: str = "", extra_env: dict[str, str] | None = None,
-                  pump_until_sentinel: bool = True, sidecar_path: str = ""):
+                  pump_until_sentinel: bool = True, sidecar_path: str = "",
+                  profile: StandaloneProfile | None = None):
     """A real `StandaloneSession` wired to a PRODUCTION-spawned pty.  ``agent`` is an `sh`
     script body (or ``argv`` overrides it).  The session's fence nonce is the one the
     watcher will write, exactly as `StandaloneSession.start` does.  Returns
     ``(session, sentinel_path)``; when ``pump_until_sentinel`` the supervisor pumps until the
-    watcher's sentinel exists (the exit-proven precondition of `drain_after_exit`)."""
-    profile = sh_profile(str(room.path), drain_ms=budget_ms, binding_mode=binding_mode,
-                         binding_field=binding_field, carrier_type=carrier_type)
+    watcher's sentinel exists (the exit-proven precondition of `drain_after_exit`).  An explicit
+    ``profile`` (a full CLI grammar, run_5fcd2beac376 F-015) replaces the `sh_profile` default."""
+    profile = profile or sh_profile(str(room.path), drain_ms=budget_ms, binding_mode=binding_mode,
+                                    binding_field=binding_field, carrier_type=carrier_type)
     session = rt.StandaloneSession(
         intent={"intent_id": f"i-{run_id}", "run_id": run_id, "role": "WORKER"},
         profile=profile, artifact_base=room.path / "art", run_id=run_id,

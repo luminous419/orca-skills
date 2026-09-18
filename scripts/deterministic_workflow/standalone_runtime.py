@@ -1555,12 +1555,15 @@ class StandaloneSession:
             return {"state": "FAILED", "evidence": evidence, "lost_reason": "", "verdict": verdict}
         if provenance in (capture_mod.OUTCOME_PROVENANCE_AMBIGUOUS,
                           capture_mod.OUTCOME_PROVENANCE_UNBOUND,
-                          capture_mod.OUTCOME_RECORD_FRAMING_AMBIGUOUS):
+                          capture_mod.OUTCOME_RECORD_FRAMING_AMBIGUOUS,
+                          capture_mod.OUTCOME_RECORD_SCAN_INCOMPLETE):
             disposition = lifecycle.resolve_unknown("os48_named", lost_reason=provenance)
             self._journal(kind="EVENT", derived_from="capture", event="evidence_unreadable",
                           state=self.state,
                           vocabulary={"provenance_outcome": provenance,
                                       "candidates": (evidence.get("source_vocabulary") or {}).get("candidates"),
+                                      # i8 F-015: the bound an incomplete framing scan hit
+                                      "scan": (evidence.get("source_vocabulary") or {}).get("scan"),
                                       "detail": "the completion record's provenance is not "
                                                 "bound to this dispatch's emitter subtree"})
             return {"state": "LOST", "evidence": evidence,
@@ -2257,8 +2260,13 @@ class StandaloneSession:
     def membership_residual(self) -> dict[str, Any]:  # noqa: C901 - one reader, every named branch
         """DESIGN §2.2: the ledger `members.<inc>.jsonl` re-read against the kernel NOW, keyed by
         INCARNATION (pid, start_id).  ``alive`` = members whose pinned start identity still
-        matches a live process (`descendants_unreaped`), ``unknown`` = members whose identity is
-        unreadable, ``exited`` = members the watcher saw exit or whose pid is gone / reused.
+        matches a live process (`descendants_unreaped`) AND whose recorded boot id equals this
+        reader's readable boot id (the boot join, iteration-2 review F-016) AND -- on Linux --
+        whose recorded pidfs inode a fresh pidfd's equals under the same proven inode model
+        (i8 F-016: tick equality alone is `pid_tick_unverified`, an ``unknown`` entry, never
+        alive), ``unknown`` = members whose identity is unreadable, whose boot cannot be
+        joined (`boot_unjoined`), or whose lifetime binding is unproven, ``exited`` = members
+        the watcher saw exit or whose pid is gone / reused / bound to a different pidfs inode.
         REVIEW_IMPLEMENTATION_iteration2 F-006: the ledger's own readability is part of the
         answer -- an unreadable / torn ledger, or a watcher that could not append every line,
         is `membership_unreadable`: the set is UNKNOWN and named, never "zero members".
@@ -2316,7 +2324,8 @@ class StandaloneSession:
                              if r.get("event") == pty_supervisor.MEMBER_EVENT_DISCOVERY_UNREADABLE]
         unreadable_passes = sum(int(discovery.get(k) or 0) for k in
                                 ("listing_unreadable", "listing_unstable", "candidates_unreadable",
-                                 "forks_coalesced", "watch_gaps", "parents_unreadable", "unobservable"))
+                                 "forks_coalesced", "watch_gaps", "parents_unreadable", "unobservable",
+                                 "candidates_unverified"))
         if unreadable_passes or discovery_records:
             reasons = list(discovery.get("reasons") or [])
             for r in discovery_records:
@@ -2338,6 +2347,7 @@ class StandaloneSession:
                                    "watch_gaps": discovery.get("watch_gaps"),
                                    "parents_unreadable": discovery.get("parents_unreadable"),
                                    "unobservable": discovery.get("unobservable"),
+                                   "candidates_unverified": discovery.get("candidates_unverified", 0),
                                    "records": len(discovery_records),
                                    "reasons": reasons, "pids": pids,
                                    "forks": forks[:_DISCOVERY_FORKS_REPORTED]})
@@ -2383,17 +2393,91 @@ class StandaloneSession:
             observed = self._identity_reader(pid)
             entry.update({"observed_start_id": observed.get("start_id"),
                           "observed_state": observed.get("start_state")})
-            # a supervisor-side reader has no fixed object: a live process under this key is
-            # the recorded lifetime unless the watcher recorded its exit -- and where another
-            # lifetime of the same key exists the binding is stated as tick-granular
             siblings = [k for k in latest if k[0] == pid and k[1] == start_id and k[2] != lifetime]
             if siblings:
-                entry["lifetime_binding"] = "tick_granular"
+                entry["lifetime_siblings"] = len(siblings)
             if observed.get("start_state") == capture_mod.EVIDENCE_FINAL:
-                if int(observed.get("start_id") or 0) == start_id:
-                    (out["alive"] if pid != agent else out["unknown"]).append(entry)
-                else:
+                if int(observed.get("start_id") or 0) != start_id:
                     gone.append(entry)                 # the pid was reused: that incarnation is gone
+                    continue
+                # REVIEW_IMPLEMENTATION_iteration2 (run_5fcd2beac376) F-016 -- the BOOT join
+                # (DESIGN §2.1's boot identity axis): every binding below is boot-scoped -- a
+                # start tick counts from boot, the pidfs inode counter (`pidfs_ino` /
+                # `pidfs_ino_nr`, kernel/pid.c + fs/pidfs.c v6.9..v6.16) restarts on every
+                # boot, darwin's start time is a wall-clock re-read -- so an equality is
+                # evidence of the SAME incarnation only when the ledger's recorded boot id
+                # and this reader's current boot id are BOTH readable (non-empty) AND equal.
+                # Missing / unreadable on either side -> UNKNOWN by name (never alive); a
+                # different boot -> conservatively UNKNOWN by name (no process outlives a
+                # reboot, but the reader does not turn a boot-source disagreement into a
+                # positive "gone" claim either).  Applied on every platform.
+                recorded_boot = str((record.get("identity") or {}).get("boot_id") or "")
+                current_boot = str(observed.get("boot_id") or "")
+                boot_problem = ("boot_id:unrecorded" if not recorded_boot
+                                else "boot_id:unreadable" if not current_boot
+                                else "boot_id:mismatch" if recorded_boot != current_boot else "")
+                if boot_problem:
+                    entry["lifetime_binding"] = "boot_unjoined"
+                    entry["binding_detail"] = boot_problem
+                    entry["recorded_boot_id"] = recorded_boot
+                    entry["observed_boot_id"] = current_boot
+                    out["unknown"].append(entry)
+                    if out["outcome"] is None:
+                        out["outcome"] = capture_mod.OUTCOME_DESCENDANTS_UNKNOWN
+                    continue
+                entry["boot_joined"] = True
+                # REVIEW_IMPLEMENTATION_iteration8 F-016: this reader holds NO fixed object (the
+                # watcher's pidfd / kqueue died with it, or never was this process's).  What
+                # binds a live process under the recorded key to the recorded LIFETIME:
+                #  * darwin -- the kernel's microsecond start time re-read now
+                #    (`proc_pidinfo`, DESIGN §2.1's identity axis).  NOTE_EXIT pinned only the
+                #    watcher's OWN observation of the exit while it lived; it pins nothing here;
+                #  * Linux -- (pid, start tick) equality is NOT injective (10 ms ticks): the
+                #    binding is the member's recorded pidfs inode (`fixed_object_id`) against a
+                #    fresh pidfd's (`pidfd_binding`), and ONLY under the proven non-recyclable
+                #    inode model the watcher recorded with it AND this reader's kernel reports
+                #    (`pidfs_lifetime_model`; run_5fcd2beac376 F-016: a 32-bit pidfs inode is
+                #    recyclable): equal -> the same incarnation; different -> positively gone;
+                #    no such inode on either side, or an unproven / mismatched model -> UNKNOWN
+                #    by name (`pid_tick_unverified`), never alive/owned.  No signal or
+                #    settlement authority is ever derived from this reader's answer (AC-10).
+                if sys.platform == "darwin":
+                    # N-001 (run_5fcd2beac376): a RE-READ kernel timestamp, not a fixed object
+                    # this reader holds -- a diagnostic identity axis, never a lifetime
+                    # guarantee and never the Linux independent-binding claim
+                    entry["lifetime_binding"] = "start_microsecond"
+                    entry["binding_detail"] = "reread_timestamp_not_fixed_object"
+                elif sys.platform == "linux" and pid != agent:
+                    binding = pty_supervisor.pidfd_binding(pid)
+                    recorded = int(record.get("fixed_object_id") or 0)
+                    recorded_model = str(record.get("fixed_object_model") or "")
+                    proven = (bool(recorded) and recorded_model
+                              and recorded_model == binding.get("model")
+                              and binding["state"] == capture_mod.EVIDENCE_FINAL)
+                    if binding["state"] == "absent":
+                        gone.append(entry)
+                        continue
+                    if proven:
+                        entry["binding_model"] = recorded_model
+                        if int(binding["fixed_object_id"]) == recorded:
+                            entry["lifetime_binding"] = "pidfs_inode"
+                        else:
+                            entry["lifetime_binding"] = "pidfs_inode_mismatch"
+                            gone.append(entry)
+                            continue
+                    else:
+                        entry["lifetime_binding"] = "pid_tick_unverified"
+                        entry["binding_detail"] = (
+                            "no_recorded_fixed_object_id" if not recorded
+                            else "binding_model:unproven" if not recorded_model
+                            else f"binding_model:mismatch:{recorded_model}!={binding.get('model') or 'unproven'}"
+                            if recorded_model != binding.get("model")
+                            else f"reader_binding:{binding['state']}")
+                        out["unknown"].append(entry)
+                        if out["outcome"] is None:
+                            out["outcome"] = capture_mod.OUTCOME_DESCENDANTS_UNKNOWN
+                        continue
+                (out["alive"] if pid != agent else out["unknown"]).append(entry)
             elif observed.get("start_state") == "absent":
                 gone.append(entry)
             else:
@@ -2577,7 +2661,7 @@ class StandaloneSession:
         interval = self._authoritative_interval()
         if interval is None:
             return ""
-        return capture_mod.BoundedCapture.transcript_of(self.capture.raw()[interval[0]:interval[1]])
+        return capture_mod.BoundedCapture.transcript_of(self.capture.raw(interval[0])[:interval[1] - interval[0]])
 
     def _sidecar_at_boundary(self) -> dict[str, Any]:
         """REVIEW_IMPLEMENTATION_iteration2 F-001: the declared sidecar as the WATCHER snapshotted
@@ -3631,28 +3715,56 @@ class StandaloneSession:
             # and the status is a NAMED absence -- `None`, never `0`.
             exit_proven = True
         selection = None
+        reader_exhausted = False
         if self._boundary is not None:
             # OS-48 DESIGN §1.4: settlement records are selected over the FENCED range
             # [baseline, N) only -- R1 refusal dominance, R2 exactly one, R3 dispatch binding.
             offset_n = int(self._boundary["offset_n"])
-            raw_all = self.capture.raw()
             baseline = min(max(0, int(self._settlement_baseline or 0)), offset_n)
-            fenced_raw = raw_all[baseline:offset_n]
-            fenced_text = fenced_raw.decode("utf-8", errors="replace")
-            events = ()
-            if self.delivery_intent and self.delivery_intent.get("payload"):
-                events = ({**dict(self.delivery_intent), "offset": 0},)
-            selection = self.driver.select_completion(
-                fenced_text, raw=fenced_raw,
-                bound_value=self._binding_identity(fenced_text) or "",
-                # REVIEW_IMPLEMENTATION_iteration3 F-001 (a): R3's presence fact is the IMMUTABLE
-                # fence snapshot (`present` at the owner's reap-step read), never a live
-                # exists()/getsize() -- a sidecar created, removed or resized after N cannot
-                # change the verdict.  `absent` / unreadable / unproven -> provenance_unbound.
-                sidecar_present=self._sidecar_state == capture_mod.SIDECAR_STATE_PRESENT,
-                delivery_events=events)
+            try:
+                # only the fenced range is read (iteration 3: no whole-capture copy before
+                # the bounded parsers run -- the reader's own allocations are kept minimal)
+                fenced_raw = self.capture.raw(baseline)[:offset_n - baseline]
+                fenced_text = fenced_raw.decode("utf-8", errors="replace")
+                events = ()
+                if self.delivery_intent and self.delivery_intent.get("payload"):
+                    events = ({**dict(self.delivery_intent), "offset": 0},)
+                selection = self.driver.select_completion(
+                    fenced_text, raw=fenced_raw,
+                    bound_value=self._binding_identity(fenced_text) or "",
+                    # REVIEW_IMPLEMENTATION_iteration3 F-001 (a): R3's presence fact is the IMMUTABLE
+                    # fence snapshot (`present` at the owner's reap-step read), never a live
+                    # exists()/getsize() -- a sidecar created, removed or resized after N cannot
+                    # change the verdict.  `absent` / unreadable / unproven -> provenance_unbound.
+                    sidecar_present=self._sidecar_state == capture_mod.SIDECAR_STATE_PRESENT,
+                    delivery_events=events)
+            except MemoryError:
+                # REVIEW_IMPLEMENTATION_iteration2 F-017: the reader could not EXAMINE the fenced
+                # range for want of memory -- in the parser (already classified inside
+                # `parse_json`) or in the reader's own copies / decodes / line splits around
+                # it.  Whatever was or was not read, nothing about the range is decided: the
+                # NAMED incomplete-scan outcome (`resource_limit`), never an escaping
+                # exception and never a settlement.  This bounds the settlement READER only;
+                # it is no recovery guarantee for a process-wide allocation failure elsewhere.
+                fenced_raw = b""
+                selection = {"record": None, "outcome": capture_mod.OUTCOME_RECORD_SCAN_INCOMPLETE,
+                             "refusal": None, "candidates": 0,
+                             "scan": {"complete": False, "reason": capture_mod.SCAN_INCOMPLETE_RESOURCE,
+                                      "examined": 0}}
+                reader_exhausted = True
+        text = ""
+        if not reader_exhausted:
+            try:
+                text = self._authoritative_text() if self._boundary is not None else self.capture.transcript()
+            except MemoryError:
+                # the same reader, one allocation later: the same named outcome (see above)
+                selection = {"record": None, "outcome": capture_mod.OUTCOME_RECORD_SCAN_INCOMPLETE,
+                             "refusal": None, "candidates": 0,
+                             "scan": {"complete": False, "reason": capture_mod.SCAN_INCOMPLETE_RESOURCE,
+                                      "examined": 0}} if self._boundary is not None else selection
+                text = ""
         evidence = self.driver.completion_evidence(
-            self._authoritative_text() if self._boundary is not None else self.capture.transcript(),
+            text,
             exit_status=sentinel["code"] if sentinel["outcome"] == "exited" else None,
             exit_proven=exit_proven,
             capture_answerable=answerable["answerable"],

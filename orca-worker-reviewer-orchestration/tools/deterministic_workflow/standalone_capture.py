@@ -144,6 +144,7 @@ OUTCOME_FENCE_PUBLISHED_NO_CLAIM = "fence_published_no_claim"
 OUTCOME_SUCCESSION_UNWITNESSED = "succession_unwitnessed"
 OUTCOME_PROVENANCE_AMBIGUOUS = "provenance_ambiguous"
 OUTCOME_RECORD_FRAMING_AMBIGUOUS = "record_framing_ambiguous"   # F-015: a completion-shaped object inside an unparsable line of [baseline, N)
+OUTCOME_RECORD_SCAN_INCOMPLETE = "record_scan_incomplete"       # F-015 (i8): the framing scan of [baseline, N) hit its bound -- R1/R2 undecidable
 OUTCOME_PROVENANCE_UNBOUND = "provenance_unbound"
 OUTCOME_REFUSAL_IN_BOUNDARY = "refusal_in_boundary"
 OUTCOME_DIAGNOSTIC_TAIL_UNACCOUNTED = "diagnostic_tail_unaccounted"
@@ -956,7 +957,9 @@ def find_release_marker(capture: bytes, nonce: str, *, after: int) -> tuple[int,
 
 
 def prefix_digest(capture: bytes, offset_n: int) -> str:
-    return hashlib.sha256(capture[:offset_n]).hexdigest()
+    # a memoryview: no second copy of the prefix (iteration 3: under address-space pressure
+    # the slice copy was the next allocation to fail after the parser was made total)
+    return hashlib.sha256(memoryview(capture)[:max(0, int(offset_n))]).hexdigest()
 
 
 def file_prefix_digest(path: str | os.PathLike[str] | bytes, offset_n: int) -> str:
@@ -1674,18 +1677,155 @@ def protocol_lines(text: str) -> list[str]:
     return pieces
 
 
-def embedded_objects(text: str, *, limit: int = 4096) -> list[dict[str, Any]]:
-    """REVIEW_IMPLEMENTATION_iteration7 F-015: every balanced JSON OBJECT embedded anywhere in
-    ``text`` (a run of lines that do not parse as records), in order -- a helper prefix
-    (`progress: {...}`), a suffix, or a record split across lines all leave a well-formed
-    object inside text that is not itself a record.  A scan of the first ``{`` ... its
-    balancing ``}`` (string- and escape-aware) that `json.loads` accepts as a dict is one
-    candidate; scanning resumes after it (or after a ``{`` that yields nothing).  Bounded by
-    ``limit`` objects.  NOT a parser of records: what it yields is evidence that a
-    completion-SHAPED object exists where the record grammar sees prose."""
+#: REVIEW_IMPLEMENTATION_iteration8 F-015 -- the framing scan's bounds.  A scan that reaches
+#: any of them is INCOMPLETE and says so (`EmbeddedScan.complete == False`); the selector turns
+#: that into the named outcome `record_scan_incomplete` (LOST), never into "no candidates".
+#: Objects: every JSON object EXAMINED (top-level and nested) across the whole fenced range;
+#: depth: nesting the traversal will descend; bytes: characters the balanced-object finder may
+#: visit in total (the finder re-scans after an unbalanced `{`, so this bounds its worst case
+#: independently of the capture's own byte limit).
+EMBEDDED_SCAN_OBJECT_LIMIT = 65_536
+EMBEDDED_SCAN_DEPTH_LIMIT = 64
+EMBEDDED_SCAN_BYTE_BUDGET = 64 * 1024 * 1024
+SCAN_INCOMPLETE_OBJECTS = "object_limit"
+SCAN_INCOMPLETE_DEPTH = "depth_limit"
+SCAN_INCOMPLETE_BYTES = "byte_budget"
+#: REVIEW_IMPLEMENTATION_iteration2 (run_5fcd2beac376) F-017 / F-015: the JSON parser gave up on a
+#: candidate for a reason that is NOT a syntax rejection -- an allocation failure
+#: (`MemoryError`) or a value-conversion failure that is not `JSONDecodeError` -- so the
+#: candidate is UNEXAMINED, never "invalid prose"
+SCAN_INCOMPLETE_RESOURCE = "resource_limit"
+SCAN_INCOMPLETE_CONVERSION = "conversion_limit"
+#: REVIEW_IMPLEMENTATION_iteration2 F-015: the reader's integer-conversion budget.  A JSON
+#: integer token longer than this is kept as an UNCONVERTED digit string (a `str` subclass,
+#: :class:`UnconvertedInteger`) instead of being converted -- the object is still parsed
+#: whole, so a refusal it carries is recognised; the interpreter's own `int(...)` string
+#: limit (4,300 digits by default) is never reached and never raises.  Python 3.11+ raises
+#: `ValueError` (not `JSONDecodeError`) from `json.loads` for a longer token; the i2 parsers
+#: read that as "invalid prose" and an earlier success won over a bound refusal.
+INTEGER_DIGIT_BUDGET = 4_000
+
+
+class UnconvertedInteger(str):
+    """A JSON integer token the reader did not convert (longer than
+    :data:`INTEGER_DIGIT_BUDGET` digits): its digits, as a string, so a record carrying it is
+    still examined whole.  Never compared as a number by this runtime."""
+    __slots__ = ()
+
+
+def _bounded_int(token: str) -> Any:
+    return int(token) if len(token) <= INTEGER_DIGIT_BUDGET else UnconvertedInteger(token)
+
+
+class ParseFailure(Exception):
+    """The JSON parser could not EXAMINE a candidate for a reason that is not a syntax
+    rejection: ``reason`` is one of `resource_limit` (`MemoryError`), `depth_limit`
+    (`RecursionError`), `conversion_limit` (a `ValueError` that is not `JSONDecodeError`,
+    i.e. a value the parser accepted syntactically but could not convert)."""
+
+    def __init__(self, reason: str, detail: str = "") -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.detail = detail
+
+
+def parse_json(text: str) -> Any:
+    """`json.loads` with the reader's bounded integer conversion; raises `json.JSONDecodeError`
+    for a SYNTAX rejection and :class:`ParseFailure` for everything else the parser can fail
+    with (allocation, depth, conversion) -- never any other exception.  THE one JSON entry
+    point of every reader on the settlement / readiness path (F-017: total by construction;
+    a seam for the resource-failure locks)."""
+    try:
+        return json.loads(text, parse_int=_bounded_int)
+    except json.JSONDecodeError:
+        raise
+    except MemoryError as exc:
+        raise ParseFailure(SCAN_INCOMPLETE_RESOURCE, type(exc).__name__) from None
+    except RecursionError as exc:
+        raise ParseFailure(SCAN_INCOMPLETE_DEPTH, type(exc).__name__) from None
+    except ValueError as exc:
+        raise ParseFailure(SCAN_INCOMPLETE_CONVERSION, f"{type(exc).__name__}: {exc}"[:200]) from None
+
+
+class ScanBudget:
+    """The mutable bound one framing scan shares across every unparsable run of a fenced
+    range: `objects` and `chars` count DOWN; `exhausted` names the first bound reached."""
+
+    def __init__(self, *, objects: int | None = None, depth: int | None = None,
+                 chars: int | None = None) -> None:
+        # the module bounds are read at construction (a lock may lower them by patching)
+        self.objects = int(EMBEDDED_SCAN_OBJECT_LIMIT if objects is None else objects)
+        self.depth = int(EMBEDDED_SCAN_DEPTH_LIMIT if depth is None else depth)
+        self.chars = int(EMBEDDED_SCAN_BYTE_BUDGET if chars is None else chars)
+        self.exhausted = ""
+
+    def spend_chars(self, n: int) -> bool:
+        self.chars -= int(n)
+        if self.chars < 0 and not self.exhausted:
+            self.exhausted = SCAN_INCOMPLETE_BYTES
+        return self.chars >= 0
+
+    def spend_object(self) -> bool:
+        self.objects -= 1
+        if self.objects < 0 and not self.exhausted:
+            self.exhausted = SCAN_INCOMPLETE_OBJECTS
+        return self.objects >= 0
+
+
+class EmbeddedScan(TypedDict):
+    """`embedded_scan`'s answer: every object EXAMINED (top-level and nested, traversal order),
+    whether the scan COMPLETED, and -- when it did not -- the bound it hit."""
+    objects: list[dict[str, Any]]
+    complete: bool
+    reason: str
+    examined: int
+
+
+def walk_nested_objects(root: Any, out: list[dict[str, Any]], budget: ScanBudget) -> bool:
+    """Every dict reachable from ``root`` through dicts and lists, breadth-first per level,
+    appended to ``out`` -- NEVER through a string: a JSON string literal is data, whatever it
+    spells (a serialized record inside a string is not a record).  ``False`` when the object or
+    depth bound stops the walk before every dict was examined."""
+    level: list[Any] = [root]
+    depth = 0
+    while level:
+        if depth > budget.depth:
+            if not budget.exhausted:
+                budget.exhausted = SCAN_INCOMPLETE_DEPTH
+            return False
+        nxt: list[Any] = []
+        for node in level:
+            if isinstance(node, dict):
+                if not budget.spend_object():
+                    return False
+                out.append(node)
+                nxt.extend(v for v in node.values() if isinstance(v, (dict, list)))
+            elif isinstance(node, list):
+                nxt.extend(v for v in node if isinstance(v, (dict, list)))
+        level = nxt
+        depth += 1
+    return True
+
+
+def embedded_scan(text: str, *, budget: ScanBudget | None = None) -> EmbeddedScan:
+    """REVIEW_IMPLEMENTATION_iteration7/8 F-015: every JSON OBJECT embedded anywhere in ``text``
+    (a run of lines that do not parse as records) -- a helper prefix (`progress: {...}`), a
+    suffix, a record split across lines, a cooperative WRAPPER closed later (`{"progress": `
+    + the root's own record + `}`) -- each balanced top-level object (string- and escape-aware,
+    `json.loads`-accepted) AND every object nested inside it through dicts and lists, in
+    order.  NOT a parser of records: what it yields is evidence that a completion-SHAPED or
+    refusing object exists where the record grammar sees prose.
+
+    BOUNDED and HONEST about it (i8): the shared ``budget`` limits the objects examined, the
+    nesting descended and the characters the finder visits; reaching any bound ends the scan
+    with ``complete == False`` and the bound's name -- the remainder was NOT examined, and a
+    caller must never read an incomplete scan as "no candidate".  A string literal's contents
+    are never descended or re-parsed."""
+    budget = budget or ScanBudget()
     out: list[dict[str, Any]] = []
+    complete = True
     i, n = 0, len(text)
-    while i < n and len(out) < limit:
+    while i < n:
         start = text.find("{", i)
         if start < 0:
             break
@@ -1710,25 +1850,44 @@ def embedded_objects(text: str, *, limit: int = 4096) -> list[dict[str, Any]]:
                     end = j
                     break
             j += 1
+        if not budget.spend_chars(j - start + 1):
+            complete = False
+            break
         if end < 0:
             i = start + 1
             continue
         try:
-            candidate = json.loads(text[start:end + 1])
-        except ValueError:
-            i = start + 1
+            candidate = parse_json(text[start:end + 1])
+        except json.JSONDecodeError:
+            i = start + 1                                  # a syntax rejection: not an object
             continue
+        except ParseFailure as failure:
+            # the parser gave up for a NON-syntax reason (allocation / depth / conversion):
+            # the candidate is UNEXAMINED by construction, never invalid prose
+            budget.exhausted = budget.exhausted or failure.reason
+            complete = False
+            break
         if isinstance(candidate, dict):
-            out.append(candidate)
+            if not walk_nested_objects(candidate, out, budget):
+                complete = False
+                break
             i = end + 1
         else:
             i = start + 1
-    return out
+    return {"objects": out, "complete": complete and not budget.exhausted,
+            "reason": budget.exhausted if (not complete or budget.exhausted) else "",
+            "examined": len(out)}
+
+
+def embedded_objects(text: str, *, limit: int = EMBEDDED_SCAN_OBJECT_LIMIT) -> list[dict[str, Any]]:
+    """The objects of :func:`embedded_scan` over ``text`` alone (a convenience for readers that
+    want the list; production selection reads the SCAN, whose completeness it must not drop)."""
+    return embedded_scan(text, budget=ScanBudget(objects=limit))["objects"]
 
 
 def unparsable_runs(text: str) -> list[str]:
     """The maximal runs of consecutive lines of ``text`` that are NOT records (joined with
-    the delimiter): what :func:`embedded_objects` scans (F-015).  A record split across two
+    the delimiter): what :func:`embedded_scan` scans (F-015).  A record split across two
     lines is one run; a helper prefix on a record line is one run."""
     runs: list[list[str]] = []
     current: list[str] = []
@@ -1751,21 +1910,76 @@ def structured_lines(text: str) -> tuple[tuple[dict[str, Any] | None, str], ...]
     would make the capture disagree with the file it came from.  Split on the protocol
     delimiter only (:func:`protocol_lines`), never on Unicode line separators inside a
     record.
+
+    REVIEW_IMPLEMENTATION (run_5fcd2beac376) F-017: this is the FIRST parser every reader
+    of the stream reaches (readiness, refusal evidence, completion selection), so a line the
+    JSON parser cannot follow to the end -- a nesting depth past the interpreter's recursion
+    limit raises ``RecursionError``, not ``ValueError`` -- must never escape as an untyped
+    exception.  Such a line is kept as an UNPARSABLE line (``None``), which routes it into the
+    bounded framing scan (:func:`embedded_scan`), where the same depth failure is the named
+    ``depth_limit`` and the settlement is `record_scan_incomplete` (LOST), never COMPLETED.
     """
     out: list[tuple[dict[str, Any] | None, str]] = []
     for line in protocol_lines(text):
         stripped = line.strip()
         if not stripped:
             continue
-        parsed: dict[str, Any] | None = None
-        if stripped[0] in "{[":
-            try:
-                candidate = json.loads(stripped)
-                parsed = candidate if isinstance(candidate, dict) else None
-            except ValueError:
-                parsed = None
-        out.append((parsed, line))
+        out.append((parse_record_line(stripped), line))
     return tuple(out)
+
+
+def parse_record_line(stripped: str) -> dict[str, Any] | None:
+    """One stripped line as a JSON OBJECT record, or ``None`` -- for a non-JSON line, a JSON
+    value that is not an object, and a line the parser could not examine (F-017 depth /
+    allocation, F-015 conversion: see :func:`line_parse_failure`, which names WHY so that no
+    caller reads such a line as harmless prose).  Total over its input: no exception leaves
+    this function for any text."""
+    parsed, _failure = _parse_record_line(stripped)
+    return parsed
+
+
+def _parse_record_line(stripped: str) -> "tuple[dict[str, Any] | None, str]":
+    """``(record-or-None, failure reason)``: the reason is ``""`` for a syntax rejection /
+    a non-object / a non-JSON line, else the :class:`ParseFailure` reason."""
+    if not stripped or stripped[0] not in "{[":
+        return None, ""
+    try:
+        candidate = parse_json(stripped)
+    except json.JSONDecodeError:
+        return None, ""
+    except ParseFailure as failure:
+        return None, failure.reason
+    return (candidate if isinstance(candidate, dict) else None), ""
+
+
+def structured_lines_with_failures(text: str) -> "tuple[tuple[dict[str, Any] | None, str, str], ...]":
+    """:func:`structured_lines` with a third element per line: ``""`` or the reason the record
+    parser could not EXAMINE the line (`resource_limit` / `depth_limit` / `conversion_limit`)
+    -- for readers that must stop at such a line instead of reading it as prose."""
+    out: list[tuple[dict[str, Any] | None, str, str]] = []
+    for line in protocol_lines(text):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        parsed, reason = _parse_record_line(stripped)
+        out.append((parsed, line, reason))
+    return tuple(out)
+
+
+def line_parse_failures(text: str) -> list[dict[str, Any]]:
+    """REVIEW_IMPLEMENTATION_iteration2 F-017 / F-015: every line of ``text`` the record parser
+    could not EXAMINE (allocation / depth / conversion), as ``{"index", "reason"}`` -- the
+    evidence a scan needs to declare itself incomplete instead of treating the line as prose
+    and the range as fully examined."""
+    out: list[dict[str, Any]] = []
+    for index, line in enumerate(protocol_lines(text)):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        _parsed, reason = _parse_record_line(stripped)
+        if reason:
+            out.append({"index": index, "reason": reason})
+    return out
 
 
 def redacted_summary(store: BoundedCapture, env_names: Mapping[str, Any] | None = None) -> dict[str, Any]:
