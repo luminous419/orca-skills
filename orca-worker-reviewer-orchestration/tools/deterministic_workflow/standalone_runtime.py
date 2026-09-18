@@ -1410,6 +1410,42 @@ class StandaloneSession:
                 "holds no channel to deliver it", dict(receipt))
         return self._complete(receipt, lease_token=lease_token, result_parser=result_parser)
 
+    @staticmethod
+    def _positive_selection_over_bound_fence(evidence: Mapping[str, Any],
+                                             boundary: "dict[str, Any] | None") -> bool:
+        """True when ``evidence`` was already a POSITIVE settlement selection taken over the
+        SAME verified immutable boundary that is now bound -- so a second scan of the identical
+        [baseline, N) bytes would be redundant and a later reader failure in it must not erase
+        the selection (run_7859f202457c F-017).
+
+        Positive = a refusal in the boundary, or a bound completion record (a `settlement_record`
+        the selector returned).  The named LOST selection outcomes (`provenance_ambiguous`,
+        `provenance_unbound`, `record_scan_incomplete`, `record_framing_ambiguous`) carry no
+        record and are NOT positive -- they are re-scanned as before.
+
+        Same boundary = both the prior evidence and the now-bound fence carry a boundary with an
+        equal `offset_n` AND an equal `sha256_prefix` (the fence digest).  A prior scan with no
+        boundary, or over a not-yet-verified / different range, is NOT kept: the legitimate
+        pre-fence supersession the double scan exists for still happens."""
+        if boundary is None:
+            return False
+        prior_boundary = evidence.get("boundary")
+        if not isinstance(prior_boundary, Mapping):
+            return False
+        now_fence = boundary.get("fence") or {}
+        now_prefix = ((now_fence.get("boundary") or {}).get("sha256_prefix"))
+        prior_fence = prior_boundary.get("fence") or {}
+        prior_prefix = ((prior_fence.get("boundary") or {}).get("sha256_prefix"))
+        if (prior_boundary.get("offset_n") != boundary.get("offset_n")
+                or not now_prefix or now_prefix != prior_prefix):
+            return False
+        if evidence.get("provenance_outcome") == capture_mod.OUTCOME_REFUSAL_IN_BOUNDARY:
+            return True
+        # a bound completion record the selector returned (outcome is None for a clean bind
+        # and for a sole error-field refusal, both of which carry the record); the LOST
+        # outcomes above all carry `settlement_record is None`.
+        return evidence.get("settlement_record") is not None
+
     def await_completion(self) -> dict[str, Any]:
         """Bounded wait for BOTH gates, then the profile's OWN success predicate.
 
@@ -1460,9 +1496,31 @@ class StandaloneSession:
                 # The loop used to test the deadline first, so an exit proven exactly
                 # then fell through with `post_exit_drain` unset and the finality gate
                 # below never ran; the gate is TOTAL now.
+                # run_7859f202457c F-017 (REVIEW_IMPLEMENTATION.md, iteration 2): the drain
+                # binds/verifies the fence and lets the FIRST authoritative scan run over
+                # [baseline, N).  When the fence was NOT yet bound at the initial
+                # `completion()` above (the ordinary path: no boundary, or a boundary the
+                # drain is about to supersede), that first scan carried no selection and the
+                # post-drain scan is exactly what produces the settlement -- unchanged.  But
+                # when the fence was ALREADY bound and verified before this call (a
+                # production-drained/adopted session: the reviewer's pre-bound caller
+                # construction) the initial `completion()` already positively selected over
+                # this same immutable range; a SECOND scan of the identical bytes can only
+                # repeat that result or, on a settlement-reader allocation failure, ERASE it
+                # (`record_scan_incomplete`, record/refusal None).  So the redundant re-scan
+                # is skipped precisely when the prior evidence already reached a positive
+                # selection (a refusal, or a bound completion record) over the SAME verified
+                # boundary the drain establishes (same N, same fence digest); a selected
+                # refusal / completion then dominates a later reader failure, which per
+                # DESIGN §1.4 R1 it must.  Any other prior evidence is superseded by the
+                # post-drain scan exactly as before.
+                prior = evidence
                 drained = self.drain_after_exit()
                 self.post_exit_drain = drained           # rides BOTH settlement rows
-                evidence = self.completion()
+                if self._positive_selection_over_bound_fence(prior, self._boundary):
+                    evidence = prior
+                else:
+                    evidence = self.completion()
                 evidence["post_exit_drain"] = drained
                 break
             if self._clock() >= deadline:
@@ -3715,15 +3773,20 @@ class StandaloneSession:
             # and the status is a NAMED absence -- `None`, never `0`.
             exit_proven = True
         selection = None
-        reader_exhausted = False
         if self._boundary is not None:
             # OS-48 DESIGN §1.4: settlement records are selected over the FENCED range
             # [baseline, N) only -- R1 refusal dominance, R2 exactly one, R3 dispatch binding.
             offset_n = int(self._boundary["offset_n"])
             baseline = min(max(0, int(self._settlement_baseline or 0)), offset_n)
             try:
-                # only the fenced range is read (iteration 3: no whole-capture copy before
-                # the bounded parsers run -- the reader's own allocations are kept minimal)
+                # The SEMANTIC rule: only [baseline, N) reaches the selector.  The PHYSICAL
+                # read (run_5fcd2beac376 N-003, stated exactly): `capture.raw(baseline)` reads
+                # the file from `baseline` THROUGH EOF -- the fence marker and whatever
+                # diagnostic tail has been appended since -- and the slice below then keeps
+                # the prefix; it is a whole-tail read followed by prefix slicing, not a
+                # bounded read of N-baseline bytes.  The bytes past N are dropped before any
+                # parser sees them, so they can change nothing; a bounded read would only
+                # shrink this reader's own allocation.
                 fenced_raw = self.capture.raw(baseline)[:offset_n - baseline]
                 fenced_text = fenced_raw.decode("utf-8", errors="replace")
                 events = ()
@@ -3751,17 +3814,26 @@ class StandaloneSession:
                              "refusal": None, "candidates": 0,
                              "scan": {"complete": False, "reason": capture_mod.SCAN_INCOMPLETE_RESOURCE,
                                       "examined": 0}}
-                reader_exhausted = True
+        # run_7859f202457c F-017 (REVIEW_IMPLEMENTATION_iteration3 of run_5fcd2beac376): with a
+        # fence, the SELECTION above is the whole settlement input -- `completion_evidence`
+        # takes its record / provenance outcome / refusal from `selection` and never reads
+        # `text` when one is supplied.  Iteration 3 nevertheless re-read [baseline, N) here
+        # (`_authoritative_text`) and, when THAT second read raised `MemoryError`, replaced
+        # an already-selected `refusal_in_boundary` with `record_scan_incomplete` -- a
+        # positively established R1 refusal turned into LOST by a read whose result nothing
+        # consumed.  The redundant read is gone: once `select_completion` has returned, no
+        # further read of the capture takes place in this method, so no later reader
+        # failure can reach the selection (DESIGN §1.4 R1: a selected refusal dominates;
+        # the same holds for a selected completion record).  Diagnostics that would need
+        # the range again must be read AFTER settlement and may never feed back into it.
+        # Without a fence there is no selection at all and the legacy last-of-type reading
+        # of the transcript is the driver's only input (an allocation failure there leaves
+        # `text` empty and `selection` None -- no record, never a settlement).
         text = ""
-        if not reader_exhausted:
+        if self._boundary is None:
             try:
-                text = self._authoritative_text() if self._boundary is not None else self.capture.transcript()
+                text = self.capture.transcript()
             except MemoryError:
-                # the same reader, one allocation later: the same named outcome (see above)
-                selection = {"record": None, "outcome": capture_mod.OUTCOME_RECORD_SCAN_INCOMPLETE,
-                             "refusal": None, "candidates": 0,
-                             "scan": {"complete": False, "reason": capture_mod.SCAN_INCOMPLETE_RESOURCE,
-                                      "examined": 0}} if self._boundary is not None else selection
                 text = ""
         evidence = self.driver.completion_evidence(
             text,

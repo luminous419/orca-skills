@@ -25,6 +25,14 @@ through the REAL caller the reviewer used, RED at checkpoint c8f2747 and GREEN w
   name (`pid_tick_unverified`).  Darwin's reader states its binding (`start_microsecond`)
   and is not weakened.
 
+* F-017 (run_7859f202457c; REVIEW_IMPLEMENTATION_iteration3 of run_5fcd2beac376, RED at
+  checkpoint 709cea0).  A refusal `select_completion` has POSITIVELY selected over the verified
+  `[baseline, N)` is never replaced by a reader failure that comes after the selection
+  (`probe_reached_refusal_contract`): `completion()` no longer re-reads the range once the
+  selector has returned, so a `MemoryError` at that point has nothing to overwrite -- FAILED
+  `refusal_in_boundary` with the refusal provenance retained, never LOST
+  `record_scan_incomplete`; a selected completion record likewise keeps its own verdict.
+
 The same-tick constructions need PID 1 of a private PID namespace with a writable
 ``ns_last_pid`` (docker ``--privileged``), exactly as the reviewer ran them; the allocator
 is the only thing the driver controls -- every kernel observation is real.
@@ -32,6 +40,8 @@ is the only thing the driver controls -- every kernel observation is real.
 from __future__ import annotations
 
 import contextlib
+import hashlib
+import inspect
 import json
 import os
 import signal
@@ -1322,6 +1332,370 @@ class F016BootCounterResetTests(F016SameTickForeignPeerTests):
         unknown = [u for u in r["recovered"]["unknown"] if isinstance(u, dict) and u.get("pid") == peer]
         self.assertEqual([(u["lifetime_binding"], u["binding_detail"]) for u in unknown], [("boot_unjoined", "boot_id:mismatch")], r["recovered"])
         self.assertEqual(r["recovered"]["outcome"], capture_mod.OUTCOME_DESCENDANTS_UNKNOWN)
+
+
+# =====================================================================================
+# F-017 (run_7859f202457c; REVIEW_IMPLEMENTATION_iteration3 of run_5fcd2beac376) -- a SELECTED
+# refusal is never overwritten by a reader failure that comes AFTER the selection
+# =====================================================================================
+class F017SelectedRefusalDominanceTests(_FramingDispatch):
+    """The reviewer's `probe_reached_refusal_contract` / `probe_reached_refusal_witness`, ported
+    as the required assertion: the production spawn + `await_completion` over a real cooperative
+    PTY root that writes a BOUND success and then a BOUND `is_error: true` refusal, exits 0; the
+    actual production `select_completion` is wrapped (never replaced) to record when it returns
+    a positive `refusal_in_boundary`; from that moment on, the NEXT read of the fenced range
+    raises a deterministic `MemoryError` (an allocation seam, never host memory stress).
+
+    At 709cea0 `completion()` re-read `[baseline, N)` after the selection (`_authoritative_text`),
+    and the failure of THAT read replaced the selected refusal with `record_scan_incomplete`:
+    `await_completion` returned LOST with no verdict.  DESIGN §1.4 R1 / ORIGINAL_REQUEST §2:
+    a refusal positively established over the verified boundary dominates every later parser /
+    reader failure -- FAILED `refusal_in_boundary`, the refusal provenance retained.  The fix
+    removes the redundant read (nothing consumed its result); the seams below are armed on the
+    production session and stay armed through the whole wait, so the lock holds whether the
+    read is absent (now) or ever reintroduced as a diagnostic-only read."""
+
+    #: the reviewer's root: two bound records in stream order, success first, refusal second
+    ROOT = """import os,json
+sid=os.environ['OS48_TEST_SID']
+for is_error in (False,True):
+ os.write(1,(json.dumps(dict(type='result',is_error=is_error,session_id=sid,result='body'))+'\\n').encode())
+"""
+    #: the completion counterpart: one bound success, nothing else
+    SUCCESS_ROOT = """import os,json
+sid=os.environ['OS48_TEST_SID']
+os.write(1,(json.dumps(dict(type='result',is_error=False,session_id=sid,result='body'))+'\\n').encode())
+"""
+
+    def _spawn(self, run_id: str, root: str):
+        agent = self.room.path / f"root-{run_id}.py"
+        agent.write_text(root)
+        session, _sentinel = spawn_session(self.room, "", run_id=run_id, argv=[PYTHON, str(agent)], image=PYTHON,
+                                           binding_mode="session_field", binding_field="session_id")
+        return session
+
+    @contextlib.contextmanager
+    def _fault_after_selection(self, session, *, reached_when, seam: str):
+        """Wrap the REAL selector to record every positive selection (`reached_when(selection)`);
+        once one has been reached, the named reader (`authoritative_text` = the reviewer's
+        exact seam `_authoritative_text`; `capture_raw` = ANY raw read of the capture) raises
+        `MemoryError` on every later call.  Yields ``{"reached": [...], "faults": [...]}``."""
+        state = {"reached": [], "faults": []}
+        real_select = session.driver.select_completion
+        real_text = session._authoritative_text
+        real_raw = session.capture.raw
+
+        def select(*args, **kwargs):
+            selection = real_select(*args, **kwargs)
+            if reached_when(selection):
+                state["reached"].append(selection)
+            return selection
+
+        def failing_text():
+            if state["reached"]:
+                state["faults"].append("_authoritative_text after a positive selection")
+                raise MemoryError("deterministic post-selection reader allocation seam")
+            return real_text()
+
+        def failing_raw(cursor: int = 0):
+            if state["reached"]:
+                state["faults"].append(f"capture.raw({cursor}) after a positive selection")
+                raise MemoryError("deterministic post-selection capture read seam")
+            return real_raw(cursor)
+
+        patches = [patch.object(session.driver, "select_completion", select)]
+        if seam == "authoritative_text":
+            patches.append(patch.object(session, "_authoritative_text", failing_text))
+        elif seam == "capture_raw":
+            patches.append(patch.object(session.capture, "raw", failing_raw))
+        else:
+            assert seam == "none", seam
+        with contextlib.ExitStack() as stack:
+            for ptch in patches:
+                stack.enter_context(ptch)
+            yield state
+
+    def _verified_prefix(self, session) -> bytes:
+        """`[0, N)` re-read AFTER the seams are gone, joined to the fence's own sha256."""
+        fence = session._boundary["fence"]
+        n = fence["boundary"]["offset_n"]
+        prefix = session.capture.raw()[:n]
+        self.assertEqual(hashlib.sha256(prefix).hexdigest(), fence["boundary"]["sha256_prefix"])
+        return prefix
+
+    def _await_with_seam(self, run_id: str, root: str, *, seam: str, reached_when):
+        session = self._spawn(run_id, root)
+        with self._fault_after_selection(session, reached_when=reached_when, seam=seam) as state:
+            try:
+                result = session.await_completion()
+            except MemoryError as exc:
+                self.fail(f"MemoryError escaped the production caller: {exc}")
+        return session, result, state, self._verified_prefix(session)
+
+    @staticmethod
+    def _is_refusal(selection) -> bool:
+        return selection.get("refusal") is not None
+
+    @staticmethod
+    def _is_bound_completion(selection) -> bool:
+        return selection.get("record") is not None and selection.get("refusal") is None
+
+    def _assert_selected_refusal_retained(self, result, state, prefix) -> None:
+        self.assertTrue(state["reached"], "the production selector never reached the refusal")
+        self.assertEqual(state["reached"][-1]["outcome"], capture_mod.OUTCOME_REFUSAL_IN_BOUNDARY, state["reached"][-1])
+        self.assertEqual(state["reached"][-1]["refusal"]["source"], "error_field", state["reached"][-1])
+        self.assertTrue(any(json.loads(line).get("is_error") is True
+                            for line in prefix.decode().splitlines() if line.strip()),
+                        "the refusal is not inside [0, N)")
+        # the reviewer's required disposition, verbatim: FAILED / refusal_in_boundary
+        self.assertEqual(result["state"], "FAILED", result)
+        self.assertEqual((result.get("verdict") or {}).get("reason"), capture_mod.OUTCOME_REFUSAL_IN_BOUNDARY, result)
+        self.assertEqual(result.get("lost_reason"), "", result)
+        # ... and the refusal PROVENANCE is retained on the evidence, not merely the state
+        evidence = result["evidence"]
+        self.assertEqual(evidence["provenance_outcome"], capture_mod.OUTCOME_REFUSAL_IN_BOUNDARY, evidence)
+        self.assertEqual((evidence.get("refusal") or {}).get("source"), "error_field", evidence)
+        self.assertNotEqual((evidence.get("source_vocabulary") or {}).get("provenance_outcome"), SCAN_INCOMPLETE, evidence)
+
+    def test_a_selected_refusal_survives_a_memory_error_in_the_read_that_follows_the_selection(self) -> None:
+        """The reviewer's exact ordering: first read -> a valid bound refusal is selected; the
+        next `_authoritative_text` -> `MemoryError`; final state FAILED `refusal_in_boundary`."""
+        _s, result, state, prefix = self._await_with_seam(
+            "f017-selected-refusal-text", self.ROOT, seam="authoritative_text", reached_when=self._is_refusal)
+        self._assert_selected_refusal_retained(result, state, prefix)
+
+    def test_a_selected_refusal_survives_a_memory_error_in_any_later_capture_read(self) -> None:
+        """Stronger than the reviewer's seam: EVERY raw read of the capture after the selection
+        fails, whatever reader would issue it -- the selection still settles the dispatch."""
+        _s, result, state, prefix = self._await_with_seam(
+            "f017-selected-refusal-raw", self.ROOT, seam="capture_raw", reached_when=self._is_refusal)
+        self._assert_selected_refusal_retained(result, state, prefix)
+
+    def test_the_normal_control_settles_the_same_refusal(self) -> None:
+        """No fault at all (the reviewer's `REFUSAL_CONTROL`): the same root, the same verdict."""
+        _s, result, state, prefix = self._await_with_seam(
+            "f017-selected-refusal-control", self.ROOT, seam="none", reached_when=self._is_refusal)
+        self._assert_selected_refusal_retained(result, state, prefix)
+        self.assertEqual(state["faults"], [])
+
+    def test_a_selected_completion_survives_a_memory_error_in_the_read_that_follows_the_selection(self) -> None:
+        """The same rule for a selected COMPLETION record (ORIGINAL_REQUEST §2: a later read
+        failure changes the selection into no other outcome): a bound success selected, the
+        next read fails -> COMPLETED on its own verdict, never `record_scan_incomplete`."""
+        for seam in ("authoritative_text", "capture_raw"):
+            with self.subTest(seam=seam):
+                _s, result, state, prefix = self._await_with_seam(
+                    f"f017-selected-completion-{seam}", self.SUCCESS_ROOT, seam=seam,
+                    reached_when=self._is_bound_completion)
+                self.assertTrue(state["reached"], "the production selector never selected the bound record")
+                # an ELIGIBLE selection: a bound record, no refusal, no named non-success outcome
+                self.assertIsNone(state["reached"][-1]["outcome"], state["reached"][-1])
+                self.assertEqual(state["reached"][-1]["record"].get("is_error"), False, state["reached"][-1])
+                self.assertIn(b'"is_error": false', prefix)
+                self.assertEqual(result["state"], "COMPLETED", result)
+                self.assertEqual((result.get("verdict") or {}).get("outcome"), "succeeded", result)
+                self.assertNotEqual(result["evidence"]["provenance_outcome"], SCAN_INCOMPLETE, result["evidence"])
+
+    def test_completion_reads_the_fenced_range_once_and_never_after_the_selection(self) -> None:
+        """The option this run took (read REMOVED, not diagnostic-only): after the selector has
+        returned, `completion()` issues no further read of the capture at all, so no later
+        reader failure has a path to the selection.  This pins the implementation choice; if a
+        diagnostic-only post-selection read is ever reintroduced, version this lock (never
+        delete it) and keep the two dominance locks above, which do not depend on it."""
+        _s, _result, state, _prefix = self._await_with_seam(
+            "f017-no-read-after-selection", self.ROOT, seam="capture_raw", reached_when=self._is_refusal)
+        self.assertEqual(state["faults"], [], "a capture read followed the positive selection")
+        self.assertEqual(len(state["reached"]), 1, state["reached"])
+
+
+# =====================================================================================
+# F-017 (run_7859f202457c iteration 2; REVIEW_IMPLEMENTATION.md remaining branch) -- the
+# PRE-BOUND caller path: await_completion() must not re-scan and erase a positive selection
+# already reached over the SAME verified immutable boundary
+# =====================================================================================
+class F017PreBoundAwaitDominanceTests(_FramingDispatch):
+    """The reviewer's `probe_prebound_await_contract`, ported as production-caller locks.
+
+    Unlike `F017SelectedRefusalDominanceTests` (which enters `await_completion` with NO bound
+    fence, so the fault falls on the first-and-only scan), here the PRODUCTION drain
+    (`drain_after_exit`) is run BEFORE `await_completion`, exactly as a re-driven /
+    already-drained session reaches it.  The fence is then bound and verified when
+    `await_completion`'s initial `completion()` runs, so that first scan positively selects.
+    `await_completion` then, on the proven exit, drains again (idempotent) and used to re-scan
+    the SAME `[baseline, N)` unconditionally -- a `MemoryError` in that second settlement
+    reader replaced the already-selected refusal (or bound completion) with
+    `record_scan_incomplete` -> LOST.  Required (DESIGN 1.4 R1 / ORIGINAL_REQUEST 2): the
+    positive selection over the verified boundary dominates; the redundant re-scan is skipped.
+
+    The seam faults ONLY a `capture.raw` whose immediate caller is `completion` and ONLY after
+    a positive selection has been reached -- fence verification, journal and drain reads are
+    left intact, isolating the settlement-reader site exactly as the reviewer's probe does.
+    The ordinary not-yet-bound path (no pre-await drain) is exercised too, and must be
+    unchanged (the post-drain scan still supersedes a pre-fence non-selection)."""
+
+    REFUSAL_ROOT = ("import os,json\n"
+                    "sid=os.environ['OS48_TEST_SID']\n"
+                    "for is_error in (False,True):\n"
+                    " os.write(1,(json.dumps(dict(type='result',session_id=sid,is_error=is_error,result='body'))+'\\n').encode())\n")
+    SUCCESS_ROOT = ("import os,json\n"
+                    "sid=os.environ['OS48_TEST_SID']\n"
+                    "os.write(1,(json.dumps(dict(type='result',session_id=sid,is_error=False,result='body'))+'\\n').encode())\n")
+
+    def _spawn(self, run_id, root):
+        agent = self.room.path / ("root-" + run_id + ".py")
+        agent.write_text(root)
+        session, _sentinel = spawn_session(self.room, "", run_id=run_id, argv=[PYTHON, str(agent)], image=PYTHON,
+                                           binding_mode="session_field", binding_field="session_id")
+        return session
+
+    def _drain_before_await(self, session):
+        """The production post-exit drain, run BEFORE await -- it binds and verifies the fence
+        (the reviewer's construction; no fabricated selection, no assignment to `_boundary`)."""
+        until = time.time() + 5
+        while session._read_sentinel()["outcome"] != "exited" and time.time() < until:
+            session.pump(timeout_ms=100)
+        drained = session.drain_after_exit()
+        self.assertIsNotNone(session._boundary, drained)
+        self.assertEqual(drained.get("finality"), "capture_finalized", drained)
+
+    @contextlib.contextmanager
+    def _fault_in_completion_after_selection(self, session, *, reached_when, fault):
+        """Wrap the REAL selector to record positive selections; fault a `capture.raw` whose
+        immediate caller is `completion` (the settlement reader) once one has been reached."""
+        state = {"reached": [], "faults": []}
+        real_select = session.driver.select_completion
+        real_raw = session.capture.raw
+
+        def select(*args, **kwargs):
+            selection = real_select(*args, **kwargs)
+            if reached_when(selection):
+                state["reached"].append(selection)
+            return selection
+
+        def failing_raw(cursor=0):
+            if (fault and state["reached"]
+                    and inspect.currentframe().f_back.f_code.co_name == "completion"):
+                state["faults"].append("completion capture.raw after a positive selection")
+                raise MemoryError("post-selection settlement-reader allocation seam")
+            return real_raw(cursor)
+
+        with patch.object(session.driver, "select_completion", select), \
+                patch.object(session.capture, "raw", failing_raw):
+            yield state
+
+    def _verified_prefix(self, session):
+        fence = session._boundary["fence"]
+        n = fence["boundary"]["offset_n"]
+        prefix = session.capture.raw()[:n]
+        self.assertEqual(hashlib.sha256(prefix).hexdigest(), fence["boundary"]["sha256_prefix"])
+        return prefix
+
+    @staticmethod
+    def _is_refusal(selection):
+        return selection.get("refusal") is not None
+
+    @staticmethod
+    def _is_bound_completion(selection):
+        return selection.get("record") is not None and selection.get("refusal") is None
+
+    def _run_prebound(self, run_id, root, *, fault, reached_when):
+        session = self._spawn(run_id, root)
+        self._drain_before_await(session)          # fence bound + verified BEFORE await
+        with self._fault_in_completion_after_selection(session, reached_when=reached_when, fault=fault) as state:
+            try:
+                result = session.await_completion()
+            except MemoryError as exc:
+                self.fail("MemoryError escaped the production caller: " + str(exc))
+        return session, result, state, self._verified_prefix(session)
+
+    def test_a_prebound_selected_refusal_survives_a_later_completion_reader_memory_error(self):
+        session, result, state, prefix = self._run_prebound(
+            "f017-prebound-refusal-fault", self.REFUSAL_ROOT, fault=True, reached_when=self._is_refusal)
+        self.assertTrue(state["reached"], "the production selector never reached the refusal")
+        self.assertEqual(state["reached"][-1]["outcome"], capture_mod.OUTCOME_REFUSAL_IN_BOUNDARY, state["reached"][-1])
+        # The seam is ARMED to fault any `completion()` capture.raw after the selection.  With
+        # the fix it does NOT fire (the redundant re-scan is skipped); at 709cea0 / the i1 tree
+        # it fires and this same disposition assertion goes RED (LOST).  Firing is the OLD
+        # mechanism, so it is reported, not required (`state["faults"]`).
+        self.assertIn(b'"is_error": true', prefix, "the refusal is not inside [0, N)")
+        self.assertEqual(result["state"], "FAILED", result)
+        self.assertEqual((result.get("verdict") or {}).get("reason"), capture_mod.OUTCOME_REFUSAL_IN_BOUNDARY, result)
+        self.assertEqual(result.get("lost_reason"), "", result)
+        self.assertEqual(result["evidence"]["provenance_outcome"], capture_mod.OUTCOME_REFUSAL_IN_BOUNDARY, result["evidence"])
+        self.assertEqual((result["evidence"].get("refusal") or {}).get("source"), "error_field", result["evidence"])
+
+    def test_the_prebound_refusal_control_settles_failed_without_the_fault(self):
+        session, result, state, prefix = self._run_prebound(
+            "f017-prebound-refusal-control", self.REFUSAL_ROOT, fault=False, reached_when=self._is_refusal)
+        self.assertEqual(state["faults"], [])
+        self.assertEqual(result["state"], "FAILED", result)
+        self.assertEqual((result.get("verdict") or {}).get("reason"), capture_mod.OUTCOME_REFUSAL_IN_BOUNDARY, result)
+
+    def test_a_prebound_selected_completion_survives_a_later_completion_reader_memory_error(self):
+        session, result, state, prefix = self._run_prebound(
+            "f017-prebound-completion-fault", self.SUCCESS_ROOT, fault=True, reached_when=self._is_bound_completion)
+        self.assertTrue(state["reached"], "the production selector never selected the bound record")
+        self.assertIsNone(state["reached"][-1]["outcome"], state["reached"][-1])
+        # armed, reported not required (see the refusal fault lock)
+        self.assertIn(b'"is_error": false', prefix)
+        self.assertEqual(result["state"], "COMPLETED", result)
+        self.assertEqual((result.get("verdict") or {}).get("outcome"), "succeeded", result)
+        self.assertNotEqual(result["evidence"]["provenance_outcome"], SCAN_INCOMPLETE, result["evidence"])
+
+    def test_the_prebound_completion_control_settles_completed_without_the_fault(self):
+        session, result, state, prefix = self._run_prebound(
+            "f017-prebound-completion-control", self.SUCCESS_ROOT, fault=False, reached_when=self._is_bound_completion)
+        self.assertEqual(state["faults"], [])
+        self.assertEqual(result["state"], "COMPLETED", result)
+        self.assertEqual((result.get("verdict") or {}).get("outcome"), "succeeded", result)
+
+    def test_the_prebound_second_scan_is_skipped_when_the_first_selected_over_the_same_fence(self):
+        """The option this run took (skip the re-scan, not carry-forward): when await enters
+        with the fence already bound and the first `completion()` positively selects over it,
+        `await_completion` makes NO second `completion()` call -- so the armed post-selection
+        settlement-reader seam never fires.  Counts production `completion()` calls and asserts
+        the seam stayed silent while the refusal still settled FAILED.  Version -- never delete
+        -- if the fix is ever changed to carry-forward-with-a-second-read; the four dominance
+        locks above assert the disposition and do not depend on this count."""
+        session = self._spawn("f017-prebound-skip", self.REFUSAL_ROOT)
+        self._drain_before_await(session)
+        calls = []
+        real_completion = session.completion
+
+        def traced_completion():
+            calls.append(1)
+            return real_completion()
+        with patch.object(session, "completion", traced_completion), \
+                self._fault_in_completion_after_selection(session, reached_when=self._is_refusal, fault=True) as state:
+            result = session.await_completion()
+        session.capture.raw  # (patched context has exited)
+        self.assertEqual(len(calls), 1, f"await_completion re-scanned the same verified boundary ({len(calls)} completion() calls)")
+        self.assertEqual(state["faults"], [], "a completion() capture.raw followed the positive selection")
+        self.assertEqual(result["state"], "FAILED", result)
+        self.assertEqual((result.get("verdict") or {}).get("reason"), capture_mod.OUTCOME_REFUSAL_IN_BOUNDARY, result)
+
+    def test_the_ordinary_not_yet_bound_path_still_supersedes_the_pre_fence_scan(self):
+        """No pre-await drain: `await_completion`'s first `completion()` runs with NO bound
+        fence (no selection), and the post-drain scan is what settles the dispatch -- the
+        legitimate supersession the double scan exists for.  A refusal root still settles
+        FAILED / `refusal_in_boundary`, proving the skip is conditioned on a prior positive
+        selection over the SAME verified boundary and does not defeat the normal path."""
+        session = self._spawn("f017-not-yet-bound", self.REFUSAL_ROOT)
+        real_completion = session.completion
+        calls = []
+
+        def traced_completion():
+            ev = real_completion()
+            calls.append(ev.get("boundary"))
+            return ev
+        with patch.object(session, "completion", traced_completion):
+            result = session.await_completion()
+        self.assertIsNone(calls[0], "the first completion() unexpectedly already had a bound fence")
+        self.assertIsNotNone(session._boundary, "the drain never bound the fence")
+        prefix = self._verified_prefix(session)
+        self.assertIn(b'"is_error": true', prefix)
+        self.assertEqual(result["state"], "FAILED", result)
+        self.assertEqual((result.get("verdict") or {}).get("reason"), capture_mod.OUTCOME_REFUSAL_IN_BOUNDARY, result)
 
 
 if __name__ == "__main__":

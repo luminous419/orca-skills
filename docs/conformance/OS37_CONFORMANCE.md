@@ -980,7 +980,10 @@ marked).  Design: `artifacts/runs/run_f820764749d6/DESIGN.md` (topology A).  Mea
   reason unless its bounded re-parse examined the object whole.  Stated exactly: NOT every
   parser limit fails closed by itself -- the interpreter's integer limit failed OPEN in
   iteration 2 -- what fails closed is every failure `parse_json` classifies; a reached
-  refusal still dominates a later failure, and no general OOM / SIGKILL recovery is claimed.  **What R1 "refusal dominance" positively covers,
+  refusal still dominates a later failure INSIDE the scan (the iteration-3 tree did NOT yet
+  honour this at the reader site AFTER the selection -- F-017 of `REVIEW_IMPLEMENTATION_iteration3`,
+  corrected in run `run_7859f202457c`, next bullet), and no general OOM / SIGKILL recovery is
+  claimed.  **What R1 "refusal dominance" positively covers,
   stated exactly:** a declared completion record whose error field is set, a declared auth
   marker (top-level or nested anywhere), a completion-typed nested object whose error field is
   set, a top-level embedded object with a truthy `is_error`, and the free-text refusal
@@ -1053,11 +1056,91 @@ marked).  Design: `artifacts/runs/run_f820764749d6/DESIGN.md` (topology A).  Mea
   checkpoint `c8f2747` (and, for each correction round's locks, at the previous round's
   tree); `test_os48_review_i7_locks` reader lock versioned (`pid_tick_unverified`).
 
+* **Follow-up run correction (REVIEW_IMPLEMENTATION_iteration3.md F-017 / N-003 of
+  `run_5fcd2beac376`, run `run_7859f202457c`).**  (F-017, a SELECTED refusal survives a later
+  reader failure) the iteration-3 `completion()` re-read `[baseline, N)` a second time AFTER
+  `select_completion` had returned, and a `MemoryError` in that second read unconditionally
+  replaced the selection with `record_scan_incomplete` (record `None`, refusal `None`) -- an R1
+  refusal positively established over the verified boundary settled LOST instead of FAILED
+  `refusal_in_boundary`, on darwin and Linux (the reviewer's `probe_reached_refusal_contract`).
+  The second read was REDUNDANT: `completion_evidence` takes the record, provenance outcome and
+  refusal from the selection and never reads its `text` argument when a selection is supplied.
+  The option taken is REMOVAL, not "diagnostic-only": within a SINGLE `completion()` call, with
+  a fence, the range is read exactly once (before the selector) and no further read follows the
+  selector inside that call, so a reader failure there cannot reach the selection; a
+  `MemoryError` BEFORE / INSIDE the selection is still the named `record_scan_incomplete`
+  (`resource_limit`), unchanged.  **(Iteration 2, run `run_7859f202457c`, the REMAINING F-017
+  branch -- the CALLER path.)**  The earlier statement "any read that follows the selection
+  (none today)" was true only WITHIN one `completion()`; the CALLER, `await_completion()`, still
+  read twice.  It calls `completion()` for its initial evidence, and then -- once the exit is
+  proven -- runs the post-exit drain (`drain_after_exit`, which binds and verifies the fence)
+  and calls `completion()` AGAIN, unconditionally discarding the first evidence.  That second
+  scan exists for a legitimate reason: on the ordinary path the fence is NOT yet bound at the
+  initial call, so its first scan carries no selection and the post-drain scan is what settles
+  the dispatch.  But when the fence was ALREADY bound and verified before `await_completion`
+  (a production-drained / adopted session), the initial scan already positively selected over
+  the SAME immutable `[baseline, N)`, and the second scan re-read the identical bytes -- a
+  `MemoryError` in it replaced the selected refusal (or bound completion) with
+  `record_scan_incomplete` → LOST.  Fix: `await_completion` skips the redundant post-drain
+  re-scan precisely when the prior evidence already reached a POSITIVE selection (a refusal, or
+  a bound completion record) over the SAME verified boundary the drain establishes -- equal
+  `offset_n` AND equal fence `sha256_prefix` (`_positive_selection_over_bound_fence`).  A prior
+  scan with no boundary, or over a not-yet-verified / different range, is still superseded by
+  the post-drain scan, so the legitimate pre-fence supersession is preserved.  Stated exactly
+  for the whole caller: with a bound fence, `completion()` reads the range once and nothing in
+  that call follows the selector; and `await_completion()` performs the settlement scan once
+  over a given verified boundary -- it does NOT re-scan a boundary a positive selection was
+  already reached over, so no later reader failure can turn a selected refusal / completion into
+  LOST, COMPLETED or any other outcome (DESIGN §1.4 R1).  Without a fence nothing is selected
+  and the legacy transcript reading remains the driver's only input.  Locks (production spawn +
+  `await_completion` over a real cooperative PTY root writing a bound success then a bound
+  `is_error: true` refusal; the real selector wrapped, never replaced; a deterministic
+  `MemoryError` seam on the read that follows the positive selection -- the reviewer's exact
+  `_authoritative_text` seam and, stronger, ANY `capture.raw` after it; the normal control; the
+  selected-completion counterpart; and the implementation-choice lock that no capture read
+  follows the selection): `scripts/test_os48_f015_f016_locks.py::F017SelectedRefusalDominanceTests`;
+  and, for the caller-path branch (iteration 2), `F017PreBoundAwaitDominanceTests` -- a session
+  the production `drain_after_exit` bound BEFORE `await_completion` (pre-bound refusal fault,
+  pre-bound completion fault, both controls, the re-scan-skipped proof, and the ordinary
+  not-yet-bound supersession path), RED at checkpoint `709cea0` AND on the iteration-1 tree,
+  RED at checkpoint `709cea0` (4 dominance locks LOST, the no-read lock records the read; the
+  control passes on both trees, as a control must), GREEN on darwin and non-root read-only Linux.
+  (N-003, the physical read stated exactly) "only the fenced range is read" / "no whole-capture
+  copy" overstated it: `capture.raw(baseline)` reads the file from `baseline` THROUGH EOF --
+  the fence marker and whatever diagnostic tail has been appended since -- and the reader then
+  slices the returned bytes to `N - baseline`; it is a whole-tail read followed by prefix
+  slicing, not a bounded read of `N - baseline` bytes.  The SEMANTIC rule is unchanged and is
+  the one the locks hold: only the `[baseline, N)` prefix reaches any parser, selector, body
+  extraction, fallback or digest; bytes past N are dropped before any of them runs and can
+  change nothing.  A bounded physical read would only shrink the reader's own allocation and
+  is not implemented here.
+  **Known fail-closed limitations (documented, not solved; each answers UNKNOWN / a named
+  non-success, never a positive claim):**
+  - *32-bit Linux and Linux before 6.9* -- no pidfs inode lifetime model this runtime can
+    vouch for (`pidfs_lifetime_model` unproven: the 32-bit branches recycle the number, a
+    pre-6.9 kernel has one shared anonymous pidfd inode); the watcher records no
+    `fixed_object_id` and the pidfd-less recovery reader answers `pid_tick_unverified`
+    (`binding_model:unproven`) -- `unknown`, `descendants_unknown`, never alive.
+  - *darwin recovery identity is a timestamp axis* -- the reader's binding is the kernel's
+    microsecond start time RE-READ at decision time (`start_microsecond`,
+    `reread_timestamp_not_fixed_object`), not an independently retained fixed object; kqueue
+    `NOTE_EXIT` pinned only the live watcher's own observation.  No settlement or signal
+    authority is derived from it.
+  - *no OOM / SIGKILL guarantee outside the settlement reader* -- what is bounded is the
+    settlement READER in `completion()`: an allocation failure before or inside the selection
+    is the named `record_scan_incomplete`, and after the selection there is no read left to
+    fail.  An allocation failure elsewhere in the supervisor process (the fence / release
+    readers, the journal, the typed-result body extraction in `_settle` that runs AFTER
+    `await_completion` has returned its verdict, or the interpreter itself) and a SIGKILL of
+    the supervisor or the watcher remain the process's own: the dispatch is then collected
+    by recovery from durable evidence (`adopt`, the exit sentinel, the fence) or reported as
+    a named non-success (`IDEMPOTENCY_RECOVERY_BLOCKED`, `fence_missing`,
+    `diagnostic_tail_unaccounted`), never synthesized into a settlement.
 * **Locks.**  `scripts/test_os48_finality_locks.py` (L-01/02/02b/03/04/10/10b/12),
   `test_os48_ownership_locks.py` (L-05/11/11b/14), `test_os48_evidence_locks.py` (L-06/07/08),
   `test_os48_recovery_cuts.py` (L-09/09b, C1-C7), `test_os48_crash_cuts.py` (real kills, C1-C9 /
   RC1-RC3), `test_os48_review_i1_locks.py` (F-001..F-006), `test_os48_review_i2_locks.py`
-  (i2 F-001/F-004/F-006/F-007), `test_os48_review_i3_locks.py` (i3 F-001/F-004/F-006/F-008), `test_os48_review_i4_locks.py` (i4 F-009), `test_os48_review_i5_locks.py` (i5 F-010 + adversarial pass, F-011), `test_os48_review_i6_locks.py` (i6 F-010 coalesced / pre-exec watch, F-011, F-012, F-013), `test_os48_review_i7_locks.py` (i7 F-015 framing, F-014 verified subreaper, F-016 fixed objects / lifetimes incl. the PID-1 private-namespace alias construction), `test_os48_f015_f016_locks.py` (i8 F-015 bounded nested scan / `record_scan_incomplete`, F-016 verified admission / reader binding, PID-1 same-tick foreign-peer constructions),
+  (i2 F-001/F-004/F-006/F-007), `test_os48_review_i3_locks.py` (i3 F-001/F-004/F-006/F-008), `test_os48_review_i4_locks.py` (i4 F-009), `test_os48_review_i5_locks.py` (i5 F-010 + adversarial pass, F-011), `test_os48_review_i6_locks.py` (i6 F-010 coalesced / pre-exec watch, F-011, F-012, F-013), `test_os48_review_i7_locks.py` (i7 F-015 framing, F-014 verified subreaper, F-016 fixed objects / lifetimes incl. the PID-1 private-namespace alias construction), `test_os48_f015_f016_locks.py` (i8 F-015 bounded nested scan / `record_scan_incomplete`, F-016 verified admission / reader binding, PID-1 same-tick foreign-peer constructions; run_7859f202457c F-017 selected-refusal dominance over a post-selection reader failure),
   `test_os48_linux_locks.py` (L-13 + membership, CI condition `not_linux`); the round-8/9/9i2/10 finality locks are versioned in
   place (`# superseded by OS-48` notes, W-F9).  Real-CLI proof: `scripts/os37_r10_real_agent.py` /
   `os37_r10_recovery_prompt_e2e.py` (Claude `session_field`, Codex `sidecar_file`).

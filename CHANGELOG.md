@@ -156,6 +156,30 @@
   reports as `record_scan_incomplete` -- a `MemoryError` never escapes the caller; the
   recovery reader joins the ledger's recorded boot id to its current boot id before any
   boot-scoped binding may say "alive" (`boot_unjoined` otherwise, never alive).
+- Follow-up run `run_7859f202457c` (REVIEW_IMPLEMENTATION_iteration3 F-017 / N-003):
+  `completion()` no longer re-reads `[baseline, N)` after `select_completion` has returned --
+  the second read was redundant (`completion_evidence` never reads `text` when a selection is
+  supplied) and a `MemoryError` in it replaced an already-selected `refusal_in_boundary` with
+  `record_scan_incomplete` (LOST); a selected refusal (and a selected completion record) now
+  settles on its own verdict whatever a later reader does.  The physical read is stated
+  exactly (a whole-tail `capture.raw(baseline)` read followed by prefix slicing; only the
+  prefix reaches the selector) and the fail-closed known limitations (32-bit / Linux < 6.9
+  recovery `unknown`, darwin's re-read timestamp axis, no OOM / SIGKILL guarantee outside the
+  settlement reader) are documented in `docs/conformance/OS37_CONFORMANCE.md`.  Locks:
+  `scripts/test_os48_f015_f016_locks.py::F017SelectedRefusalDominanceTests` (RED at checkpoint
+  709cea0).
+- Iteration 2 (REVIEW_IMPLEMENTATION.md, the remaining F-017 caller branch): `await_completion()`
+  read the settlement twice -- an initial `completion()` then, once the exit was proven, the
+  post-exit drain and a SECOND `completion()` that discarded the first evidence.  When the fence
+  was already bound before the call (a production-drained / adopted session), the initial scan
+  positively selected over the same immutable `[baseline, N)` and the second re-scan of the
+  identical bytes could erase it on a `MemoryError` (LOST).  `await_completion()` now skips the
+  redundant post-drain re-scan when the prior evidence already reached a positive selection (a
+  refusal or a bound completion record) over the SAME verified boundary (equal N and fence
+  digest); a not-yet-bound / different-range prior scan is still superseded, so the legitimate
+  pre-fence supersession is preserved.  The "no read follows the selection" claim is qualified to
+  the actual caller behaviour in `docs/conformance/OS37_CONFORMANCE.md`.  Locks:
+  `F017PreBoundAwaitDominanceTests` (RED at checkpoint 709cea0 and on the iteration-1 tree).
 
 **Added**
 - `scripts/test_os48_finality_locks.py`, `test_os48_ownership_locks.py`,
