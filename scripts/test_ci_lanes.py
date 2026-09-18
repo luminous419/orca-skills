@@ -575,24 +575,32 @@ class ToleratedSkipConditionTests(unittest.TestCase):
 
     #: A stand-in declaration with one entry of each shape, including a double-gated test.
     #: These tests assert the CONTRACT, so they must not drift when the real manifest does.
+    LINUX_REASON = "requires Linux: PR_SET_CHILD_SUBREAPER / pidfd / EIO retention (OS-48)"
+
+    #: A stand-in declaration with one entry of each shape, including a double-gated test.
+    #: These tests assert the CONTRACT, so they must not drift when the real manifest does.
     ALTERNATIVES = {
         "m.Live.test_needs_runtime": [("always", LIVE_REASON)],
         "m.Seatbelt.test_darwin_only": [("not_darwin", DARWIN_REASON)],
         "m.Seatbelt.test_both_gates": [("not_darwin", DARWIN_REASON),
                                        ("no_sandbox_exec", SANDBOX_REASON)],
         "m.Profile.test_needs_binary": [("no_sandbox_exec", SANDBOX_REASON)],
+        "m.Linux.test_linux_only": [("not_linux", LINUX_REASON)],
     }
     EXPECTED_LANGGRAPH = frozenset({"m.C.test_alpha"})
 
     # Environments, as the predicate table `expected_tolerated_skips` consumes.
     LINUX = {"always": lambda: True,
              "not_darwin": lambda: True,
+             "not_linux": lambda: False,
              "no_sandbox_exec": lambda: True}
     MACOS = {"always": lambda: True,
              "not_darwin": lambda: False,
+             "not_linux": lambda: True,
              "no_sandbox_exec": lambda: False}
     MACOS_NO_BINARY = {"always": lambda: True,
                        "not_darwin": lambda: False,
+                       "not_linux": lambda: True,
                        "no_sandbox_exec": lambda: True}
 
     def expected(self, environment):
@@ -622,9 +630,27 @@ class ToleratedSkipConditionTests(unittest.TestCase):
         }))
 
     def test_macos_expects_only_the_unconditional_skip(self) -> None:
-        """On macOS the platform-gated tests RUN, so they are absent from the expected set."""
+        """On macOS the darwin-gated tests RUN, so they are absent from the expected set --
+        and the OS-48 Linux-only locks are expected to SKIP there, by name."""
         self.assertEqual(self.expected(self.MACOS),
-                         frozenset({("m.Live.test_needs_runtime", self.LIVE_REASON)}))
+                         frozenset({("m.Live.test_needs_runtime", self.LIVE_REASON),
+                                    ("m.Linux.test_linux_only", self.LINUX_REASON)}))
+
+    def test_a_linux_only_lock_that_SKIPPED_on_linux_fails(self) -> None:
+        """OS-48 W-CI-LANES: the `not_linux` arm is not tolerated on Linux -- a Linux-native
+        lock that skips on ubuntu-latest is the weaker contract, and the lane fails."""
+        problems = self.check(self.LINUX, self.expected(self.LINUX)
+                              | {("m.Linux.test_linux_only", self.LINUX_REASON)})
+        self.assertTrue(problems, "a Linux-only lock skipped on Linux and the lane passed")
+        self.assertTrue(any("m.Linux.test_linux_only" in p for p in problems), problems)
+
+    def test_a_linux_only_lock_that_RAN_on_macos_fails(self) -> None:
+        """The other direction: the manifest expects the skip on macOS; a run without it is
+        a missing declared skip and fails the lane (the contract is exact, not a ceiling)."""
+        problems = self.check(self.MACOS, self.expected(self.MACOS)
+                              - {("m.Linux.test_linux_only", self.LINUX_REASON)})
+        self.assertTrue(problems)
+        self.assertTrue(any("m.Linux.test_linux_only" in p for p in problems), problems)
 
     def test_a_darwin_host_without_the_binary_falls_to_the_second_arm(self) -> None:
         """The reason the double-gated entries need TWO lines and not one.
@@ -637,6 +663,7 @@ class ToleratedSkipConditionTests(unittest.TestCase):
             ("m.Live.test_needs_runtime", self.LIVE_REASON),
             ("m.Seatbelt.test_both_gates", self.SANDBOX_REASON),
             ("m.Profile.test_needs_binary", self.SANDBOX_REASON),
+            ("m.Linux.test_linux_only", self.LINUX_REASON),
         }))
 
     # -- the exact set passes, on each platform ------------------------------------------
@@ -700,12 +727,16 @@ class ToleratedSkipConditionTests(unittest.TestCase):
         in the macOS expected set. This asserts that directly, because it is the property
         the whole round turns on.
         """
+        # The environment in which each platform condition does NOT hold -- where the test
+        # must RUN (OS-48 adds `not_linux`, whose running platform is Linux).
+        runs_on = {"not_darwin": self.MACOS, "no_sandbox_exec": self.MACOS,
+                   "not_linux": self.LINUX}
         for test_id, entries in self.ALTERNATIVES.items():
             if entries[0][0] == "always":
                 continue
             with self.subTest(test_id=test_id):
                 self.assertNotIn(
-                    test_id, {i for i, _ in self.expected(self.MACOS)},
+                    test_id, {i for i, _ in self.expected(runs_on[entries[0][0]])},
                     f"{test_id} is tolerated on a platform where it is supposed to run")
 
     def test_an_unknown_condition_token_is_refused_at_load(self) -> None:
@@ -737,6 +768,7 @@ class ToleratedManifestProvenanceTests(unittest.TestCase):
         self.assertIn("not_darwin", conditions)
         self.assertIn("no_sandbox_exec", conditions)
         self.assertIn("always", conditions)
+        self.assertIn("not_linux", conditions)          # OS-48 W-CI-LANES
 
     def test_the_manifest_records_the_host_it_was_generated_on(self) -> None:
         text = ci_lane.TOLERATED_SKIP_MANIFEST.read_text(encoding="utf-8")
@@ -822,9 +854,11 @@ class ToleratedDerivationTests(unittest.TestCase):
 
     #: What the load-time probe reports in each environment, for one test of each shape.
     #: The env-gated test is visible in ALL of them -- that is the whole difficulty.
+    LINUX_REASON = ToleratedSkipConditionTests.LINUX_REASON
     OBSERVATIONS = {
         ("darwin", True): [
-            ("m.E2E.test_live", E2E_REASON)],
+            ("m.E2E.test_live", E2E_REASON),
+            ("m.Linux.test_linux_only", LINUX_REASON)],
         ("linux", False): [
             ("m.E2E.test_live", E2E_REASON),
             ("m.Seatbelt.test_both_gates", DARWIN_REASON),
@@ -832,11 +866,13 @@ class ToleratedDerivationTests(unittest.TestCase):
             ("m.Profile.test_needs_binary", SANDBOX_REASON)],
         ("darwin", False): [
             ("m.E2E.test_live", E2E_REASON),
+            ("m.Linux.test_linux_only", LINUX_REASON),
             ("m.Seatbelt.test_both_gates", SANDBOX_REASON),
             ("m.Profile.test_needs_binary", SANDBOX_REASON)],
     }
     #: What the real run on a darwin host WITH the binary reports as non-LangGraph skips.
     OBSERVED_HERE = {("m.E2E.test_live", E2E_REASON),
+                     ("m.Linux.test_linux_only", LINUX_REASON),
                      ("m.Live.test_needs_runtime", ToleratedSkipConditionTests.LIVE_REASON)}
 
     def setUp(self) -> None:
@@ -862,7 +898,11 @@ class ToleratedDerivationTests(unittest.TestCase):
                           ("no_sandbox_exec", self.SANDBOX_REASON)])
         self.assertEqual(derived["m.Profile.test_needs_binary"],
                          [("no_sandbox_exec", self.SANDBOX_REASON)])
-        self.assertEqual(len(derived), 5)
+        # OS-48: a test that skips in both darwin simulations and RUNS in the linux one is
+        # `not_linux` -- never `always` (which would fail the Linux lane when it runs).
+        self.assertEqual(derived["m.Linux.test_linux_only"],
+                         [("not_linux", self.LINUX_REASON)])
+        self.assertEqual(len(derived), 6)
 
     def test_the_derivation_observes_the_environment_in_which_no_condition_holds(self) -> None:
         """Pins the mechanism, not just the outcome: darwin + sandbox-exec is consulted."""
@@ -890,13 +930,19 @@ class ToleratedDerivationTests(unittest.TestCase):
             with self.subTest(test_id=test_id):
                 self.assertNotIn(self.DARWIN_REASON, reason)
                 self.assertNotIn(self.SANDBOX_REASON, reason)
-                self.assertEqual(checked_in.get(test_id), [("always", reason)])
+                # OS-48: a Linux-only lock ALSO skips in the no-condition (darwin) environment;
+                # it is declared `not_linux`, the one platform arm that holds there.
+                self.assertIn(checked_in.get(test_id),
+                              ([("always", reason)], [("not_linux", reason)]))
 
     def test_the_writers_reading_of_the_gates_is_the_anti_drift_tests_reading(self) -> None:
         """The writer refuses against the SAME reading the checked-in file is held to."""
         self.assertEqual(ci_lane.declared_platform_gates(),
                          ManifestMatchesTheDeclaredGatesTests.declared_gates())
         self.assertGreater(len(ci_lane.declared_platform_gates()), 10)
+        # OS-48: the Linux-native locks' gates are read by the SAME walk.
+        self.assertTrue(any(test_id.startswith("test_os48_linux_locks.") and gates == {"not_linux"}
+                            for test_id, gates in ci_lane.declared_platform_gates().items()))
 
     def test_the_checked_in_manifest_passes_the_writers_own_invariant(self) -> None:
         self.assertEqual(
@@ -978,14 +1024,19 @@ class ToleratedDerivationTests(unittest.TestCase):
                              "the writer overwrote the tolerated manifest despite refusing")
             self.assertEqual(langgraph.read_text(encoding="utf-8"), "SENTINEL\n",
                              "the writer overwrote the LangGraph manifest despite refusing")
-            # What it refused is precisely the mis-derivation: the env-gated suites.
-            refused = {line.split(" expects ", 1)[1].split(" to skip", 1)[0]
-                       for line in stderr.splitlines()
-                       if "the derivation expects" in line}
+            # What it refused is precisely the mis-derivation: the env-gated suites -- plus,
+            # since OS-48, the `not_linux` locks, which a blinded unconditional observation
+            # cannot classify either (they skip in the no-condition environment by design).
+            not_linux = {t for t, es in checked_in.items() for c, _ in es if c == "not_linux"}
+            refused_lines = [line for line in stderr.splitlines() if "the derivation expects" in line]
+            refused = {line.split(" expects ", 1)[1].split(" to skip", 1)[0] for line in refused_lines}
             self.assertTrue(refused)
-            self.assertEqual(refused, {t for t, _ in always} & refused)
-            self.assertTrue(all("no_sandbox_exec" in line for line in stderr.splitlines()
-                                if "the derivation expects" in line))
+            self.assertTrue(refused & not_linux, "the blinded model classified the Linux locks")
+            env_gated = refused - not_linux
+            self.assertTrue(env_gated)
+            self.assertEqual(env_gated, {t for t, _ in always} & env_gated)
+            self.assertTrue(all("no_sandbox_exec" in line for line in refused_lines
+                                if not any(t in line for t in not_linux)))
 
     def test_the_writer_emits_the_checked_in_manifest_from_the_real_observations(self) -> None:
         """End to end short of the suite run: real probes, the real darwin runtime skips.
@@ -1025,31 +1076,38 @@ class ManifestMatchesTheDeclaredGatesTests(unittest.TestCase):
     this test fail rather than being silently absorbed.
     """
 
-    GATE_CONDITIONS = {"DARWIN_ONLY": "not_darwin", "NEEDS_SANDBOX": "no_sandbox_exec"}
+    GATE_CONDITIONS = {"DARWIN_ONLY": "not_darwin", "NEEDS_SANDBOX": "no_sandbox_exec",
+                       "LINUX_ONLY": "not_linux"}
     MODULE = "test_review_isolation"
+    #: OS-48 (W-CI-LANES): the Linux-native locks declare `LINUX_ONLY` on every class; the
+    #: finality / evidence lock modules declare `DARWIN_ONLY` on their darwin-only classes.
+    MODULES = (MODULE, "test_os48_linux_locks", "test_os48_finality_locks",
+               "test_os48_evidence_locks", "test_os48_review_i1_locks", "test_os48_review_i2_locks",
+               "test_os48_review_i3_locks", "test_os48_review_i4_locks", "test_os48_review_i5_locks",
+               "test_os48_review_i6_locks", "test_os48_review_i7_locks")
 
     @classmethod
     def declared_gates(cls) -> dict[str, set[str]]:
         """`{test id: {condition, ...}}` read from the decorators in the source."""
         import ast
 
-        source = (REPO_ROOT / "scripts" / f"{cls.MODULE}.py").read_text(encoding="utf-8")
-
         def conditions(decorators):
             return {cls.GATE_CONDITIONS[node.id] for node in decorators
                     if isinstance(node, ast.Name) and node.id in cls.GATE_CONDITIONS}
 
         gates: dict[str, set[str]] = {}
-        for node in ast.parse(source).body:
-            if not isinstance(node, ast.ClassDef):
-                continue
-            class_conditions = conditions(node.decorator_list)
-            for member in node.body:
-                if (isinstance(member, ast.FunctionDef)
-                        and member.name.startswith("test")):
-                    found = class_conditions | conditions(member.decorator_list)
-                    if found:
-                        gates[f"{cls.MODULE}.{node.name}.{member.name}"] = found
+        for module in cls.MODULES:
+            source = (REPO_ROOT / "scripts" / f"{module}.py").read_text(encoding="utf-8")
+            for node in ast.parse(source).body:
+                if not isinstance(node, ast.ClassDef):
+                    continue
+                class_conditions = conditions(node.decorator_list)
+                for member in node.body:
+                    if (isinstance(member, ast.FunctionDef)
+                            and member.name.startswith("test")):
+                        found = class_conditions | conditions(member.decorator_list)
+                        if found:
+                            gates[f"{module}.{node.name}.{member.name}"] = found
         return gates
 
     def test_the_source_declares_platform_gates_at_all(self) -> None:

@@ -1,5 +1,145 @@
 # Changelog
 
+## OS-48 — positive PTY capture finality and execution ownership authority
+
+**Changed (standalone adapter; both copies)**
+- Capture finality is a POSITIVE in-band fact: the exit watcher keeps one slave descriptor
+  (the owner-held reference), writes the fence marker `<<OS48-FENCE nonce>>` after reaping
+  the pinned root, and the supervisor drains TO THE MARKER; the fence
+  `capture.log.fence.<inc>.json` (`os48.capture_fence.v1`, `sha256(capture[0,N))`, published
+  link-exclusively) is the only thing `_stream_is_final` accepts.  Hangup / EOF / quiet
+  windows / holder enumerations prove nothing; `os37.capture_finalized.v1` is refused by name
+  (`legacy_finalized_record`); `write_capture_finalized` / `read_capture_finalized` /
+  `finalized_matches`, `_await_drain_handoff`, `POST_EXIT_SETTLE_MS`, `_finalize_orphaned_capture`
+  are removed.
+- Settlement is decided over `[baseline, N)` by three structural rules: refusal dominance
+  (`refusal_in_boundary`, FAILED), exactly one completion record (`provenance_ambiguous`), and
+  the dispatch binding (`CompletionSelector.binding_mode` -- `session_field` / `sidecar_file` /
+  `single_record_optin`, REQUIRED in every profile spec; `provenance_unbound`).  Post-N records
+  are diagnostic.
+- Two-phase release (`R` -> RELEASE marker -> `release.<inc>` record -> `C` -> close) retains
+  every acknowledged pre-release byte; `diagnostic_tail_unaccounted` / `release_record_missing`
+  name what could not be retained.  `reap_leader` drains the master while waiting.
+- Finalizer ownership is a witnessed generation chain `owner.<inc>.g<n>`
+  (`os48.finalizer_owner.v1`) with `relinquish.<inc>.g<n>` records, an incarnation-bound
+  parent-death witness (kqueue NOTE_EXIT / pidfd; zombies are `absent`), fence-first and
+  predecessor+1 claim validation; the orphan watcher finishes its dead supervisor's publication
+  and leaves `capture.log.orphan.<inc>.json`; a masterless successor waits fence-first and
+  re-evaluates a lost claim race.
+- Execution ownership is incarnation-bound: `proc_start_ticks` + `boot_id` are REQUIRED on the
+  signal path (`identity_unreadable` / `identity_changed`), the agent is signalled through the
+  watcher's control socket (`signal_target_reaped`, `signal_unbound`), `may_killpg` always
+  refuses (`group_signal_refused`); Linux watcher is a subreaper that never consumes the root's
+  status; `read_identity` distinguishes `final` / `absent` / `unreadable`.
+- `slave_device_holders` / `_slave_holders` are diagnostics (`present` / `unreadable` /
+  `none_observed`; denied, short, stale reads `unreadable` by name) reached by no decision.
+- `LOST_REASONS` gains the OS-48 named outcomes (`boundary_unproven`, `fence_*`,
+  `owner_conflict`, `finalizer_alive`, `exit_unproven`, `identity_*`, `provenance_*`,
+  `signal_*`, `group_signal_refused`, `fence_published_no_claim`, `succession_unwitnessed`).
+
+**Iteration 2 (review corrections F-001..F-007)**
+- Settlement reads only `[baseline, N)` and the sidecar state frozen with the fence
+  (`fence.sidecar`, `result_body_provenance.interval`).  *Superseded by iteration 4:* the
+  frozen sidecar is the presence fact only; bodies come from the stream.
+- The orphan watcher binds its death witness to the highest owner's identity
+  (`_ParentWitness.covers`, per-pid evidence for a different owner; `may_claim_generation`
+  refuses a live owner first).
+- The RELEASE marker is written once per nonce and reused by the orphan path;
+  `verify_release_record` + adoption-time recovery (`_recover_release_boundary`,
+  `successor_from_capture`); a failed publication is `release_record_missing`, never final.
+- Positive partial libproc fills are named (`listallpids_partial`, `listing_partial_fill`,
+  `fd_walk_unbounded`) via a fresh-count / own-pid check and an independent fd-table walk.
+- No claim / fence without complete identities on every axis (`identity.identity_complete`,
+  `watcher_start_id` pinned at spawn); `fence_matches` refuses unreadable identities.
+- Positive membership ledger `members.<inc>.jsonl` (`os48.member.v1`; kqueue NOTE_FORK /
+  subreaper + `/proc` walks) and the `descendants_unreaped` residual at teardown.
+- New locks: `scripts/test_os48_crash_cuts.py` (real SIGKILL cuts C1-C9 / RC1-RC3, concurrent
+  successors; `scripts/os48_cut_harness.py`), `scripts/test_os48_review_i1_locks.py`; handshakes
+  replace scheduling sleeps in the post-N locks.
+
+**Iteration 3 (review corrections F-001 / F-004 / F-006 / F-007)**
+- The sidecar is snapshotted by the watcher in its reap step (`snapshot_sidecar`,
+  `capture.log.sidecar.<inc>.{json,bytes}`); an unproven sidecar is refused by name
+  (`sidecar_unproven`).  *Superseded by iteration 4:* the snapshot is the presence fact only,
+  never a body source.
+- PID enumeration completeness comes from an independent `kern.proc.all` cross-check
+  (`listallpids_partial` / `listallpids_crosscheck_unreadable`); an unreadable fd-table size is
+  `fd_table_size_unreadable`.
+- Membership keyed by incarnation with live-parent verification; `read_ledger` names
+  unreadable / torn ledgers; `members.<inc>.state.json` accounting; `membership_unreadable`.
+- `standalone_capture._LINK_HOOK` (test-only) at the tmp->link boundary; RC2/RC3 locks at the
+  real boundary on both custodian paths (`scripts/test_os48_review_i2_locks.py`).
+
+**Iteration 4 (review corrections F-001 / F-004 / F-006 / F-008)**
+- Sidecar content is never a settlement body source (`sidecar_unproven`, bodies from the stream);
+  R3's `sidecar_file` presence is the immutable fence snapshot (`instant: reap_step_before_marker`),
+  never a live `exists()`; `snapshot_sidecar` names EACCES/EIO `sidecar_unreadable` (ENOENT = `absent`).
+- PID enumeration completeness = exact three-way agreement (`listallpids_unstable` otherwise).
+- Ledger content joined to the durable append count and re-read (`membership_unreadable` on a
+  short whole-line prefix or changing accounting).
+- Locks: `scripts/test_os48_review_i3_locks.py`; earlier sidecar-body locks versioned.
+
+**Iteration 5 (review correction F-009, N-001)**
+- Descendant discovery that cannot be read is accounted DURABLY and separately from the
+  ledger appends: a failed / changing process listing or a live candidate no identity source
+  will read writes a `discovery_unreadable` ledger record and a `discovery` block in
+  `members.<inc>.state.json`; `membership_residual()` names it `descendants_unknown` with the
+  reasons (the positive set is kept; nothing unknown is ever signalled); `_reclaim` journals it
+  as a `descendants_unreaped` row; the capture fence stays valid.  darwin re-reads a candidate
+  refused by `PROC_PIDTBSDINFO` from the independent `kern.proc.pid` source before calling it
+  unreadable.  Locks: `scripts/test_os48_review_i4_locks.py`.
+- Stale "content fixed at N" wording replaced by the reap-step presence-fact wording (N-001).
+
+**Iteration 6 (review corrections F-010 / F-011, N-001)**
+- A positive NOTE_FORK whose child cannot be attributed (already exited, or reparented because
+  the parent exited first) is a durable `fork_unattributed` record with the parent identity and
+  the kernel event; `membership_residual()` reports `descendants_unknown` with the fork named
+  (fail-closed discharge: only a child attributed in the fork-triggered walk itself).  Every
+  other silent-drop path is named: `fork_watch_unregistered`, `fork_watch_unavailable`,
+  `fork_events_unreadable`, `member_ceiling_exceeded`, `parent_identity_unreadable`; a
+  `release_wait` walk runs while the watcher waits for the release.  Linux attributes the same
+  cut positively through the subreaper.  Locks: `scripts/test_os48_review_i5_locks.py`; the i4
+  lock root uses an acknowledged ordering gate instead of a timed linger.
+- The OS-42 historical-artifact lock protects every settled run on disk (tracked or not) and
+  excludes only positively active runs (unreleased OS-44 coordinator-session binding); mutation
+  controls added.
+- The last inline "after this read is after N" comment removed (N-001).
+
+**Iteration 7 (review corrections F-010 / F-011 / F-012 / F-013 -- the conservative model)**
+- Descendant accounting is UNKNOWN by default; only positive facts contribute (spawn record,
+  the root's fork watch registered BEFORE exec via a gate pipe in `spawn`, a parent's CURRENT
+  start match, the Linux subreaper's adopted child, an observed exit).  A coalesced NOTE_FORK
+  is `fork_coalesced` and is never discharged; every descendant carries `fork_watch_gap`; the
+  held-zombie parent exception is removed (`parent_identity_unreadable`); a subreaper-parented
+  candidate with an unreadable start is `candidate_identity_unreadable`; `watch_ended` names
+  members alive when the watcher stops.  Locks: `scripts/test_os48_review_i6_locks.py`.
+- The OS-42 historical lock's active set is only what the invocation names (env / this
+  session's own binding); root-component exclusion; stale-binding and nested-name controls.
+
+**Iteration 8 (review corrections F-011 / F-014 / F-015 / F-016, N-002)**
+- Capture finality: a completion/refusal-shaped JSON object embedded in a non-record line of
+  the fenced range is a framing candidate -- a refusing one is `refusal_in_boundary`, any other
+  is `record_framing_ambiguous` (LOST); never COMPLETED (`embedded_objects`, `framing_candidates`).
+- Linux ownership: the subreaper is installed AND verified before the root is released; the
+  receipt is `root_watch=subreaper`, a failure is `ownership_setup_unverified` (unknown).
+- Linux identity: every member holds a pidfd (fixed object) until observed exiting; parent
+  attribution goes through the pidfd; members are lifetimes `(pid, start, n)`; the reader
+  keeps one entry per lifetime and states tick-granular bindings.
+- History lock: active = explicit `OS42_ACTIVE_RUN_IDS` or a positive live-writer fact
+  (non-terminal checkpoint AND unreleased binding); no hard-coded run, no session cookie.
+- Real-CLI harness exit code reflects the roll-up (N-002).  Locks: `scripts/test_os48_review_i7_locks.py`.
+
+**Added**
+- `scripts/test_os48_finality_locks.py`, `test_os48_ownership_locks.py`,
+  `test_os48_evidence_locks.py`, `test_os48_recovery_cuts.py`, `test_os48_linux_locks.py`
+  (+ `scripts/os48_lock_support.py`); CI condition `not_linux` in `scripts/ci_lane.py`
+  (`LINUX_ONLY` gates, `test_os48_linux_locks` as a platform-gated module); manifests
+  regenerated.
+- The round-8/9/9i2/10 finality locks are versioned in place with `# superseded by OS-48`
+  notes (W-F9); `docs/conformance/OS37_CONFORMANCE.md` gains the OS-48 section and marks the
+  superseded bullets (including the measured correction of the round-10 "hangup only at
+  leader exit" claim).
+
 ## OS-42 — schema-derived decision-gate contract with bounded validation repair
 
 **Added**

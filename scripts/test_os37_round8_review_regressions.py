@@ -44,7 +44,7 @@ Iteration 3 (reviewer finding, `REVIEW_BUGFIX_iteration2.md` §5/§10): only EOF
 is the hangup -- `EINTR` is retried, every other read / poll error is `master_unreadable`
 with the errno named -- and `await_completion` GATES settlement on positive stream
 finality: `ended != "hangup"` (`budget`, `master_unreadable`) is the typed LOST reason
-`stream_end_unproven`, never COMPLETED, never a success row or ledger receipt.
+`boundary_unproven`, never COMPLETED, never a success row or ledger receipt.
 """
 from __future__ import annotations
 
@@ -79,6 +79,7 @@ from scripts.test_os37_followup_review_regressions import (  # noqa: E402
 from scripts.test_os37_pty_supervisor import SignalSpy, profile as ladder_profile  # noqa: E402
 from scripts.test_os37_pty_supervisor import record as ladder_record  # noqa: E402
 from scripts.test_os37_pty_supervisor import snapshot as ladder_snapshot  # noqa: E402
+from scripts.test_os37_pty_supervisor import BOOT_ID as LADDER_BOOT_ID, START_ID as LADDER_START_ID  # noqa: E402
 from scripts.test_os37_round7_review_regressions import _cwd  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
@@ -487,7 +488,9 @@ class Item6G2ExitProofTests(unittest.TestCase):
         pid = _free_pid()
         record = ladder_record(pid=pid, pgid=pid, sid=pid)
         present = ladder_snapshot(rows=({"pid": pid, "ppid": 1, "pgid": pid, "sid": pid,
-                                         "tty": "ttys042", "stat": "Ss"},))
+                                         "tty": "ttys042", "stat": "Ss",
+                                         "start_id": LADDER_START_ID, "start_state": "final",
+                                         "boot_id": LADDER_BOOT_ID},))
         reads = {"n": 0}
 
         def reader(tty):
@@ -503,7 +506,7 @@ class Item6G2ExitProofTests(unittest.TestCase):
             "intent-1", "stop", record=record,
             profile=ladder_profile(graceful_force_timeout_ms=20),
             table_reader=reader, supervisor_pid=999, killpg=spy.send_group,
-            kill=spy.send_one, sleep=lambda s: None, clock=clock)
+            kill=spy.send_one, watcher=spy.via_watcher, sleep=lambda s: None, clock=clock)
         return result, spy, reads
 
     def test_an_exit_between_the_last_probe_and_g2_is_the_proven_exit(self) -> None:
@@ -512,9 +515,10 @@ class Item6G2ExitProofTests(unittest.TestCase):
         self.assertEqual(result["interrupt_outcome"], "interrupted_confirmed", result)
         self.assertEqual(interrupt_mod.lifecycle_for(result["interrupt_outcome"]),
                          {"state": "INTERRUPTED", "lost_reason": ""})
-        self.assertEqual([sig for _p, sig in spy.killpg], [15],
+        self.assertEqual(spy.watcher, [15],
                          "SIGKILL was sent (or SIGTERM was not) around a proven exit")
         self.assertEqual(spy.kill, [])
+        self.assertEqual(spy.killpg, [], "OS-48: no user-space group signal")
         g2 = [s for s in result["ladder"] if s["rung"] == "G2"]
         self.assertTrue(g2 and g2[-1]["identity_verified"], result["ladder"])
         self.assertIn("natural exit", g2[-1]["detail"])
@@ -524,11 +528,15 @@ class Item6G2ExitProofTests(unittest.TestCase):
         has no start identity to compare -- NOT a proven exit, so the ownership refusal
         after a delivered signal stays `exit_unproven` and no SIGKILL is sent."""
         me = os.getpid()
-        record = ladder_record(pid=me, pgid=me, sid=me)
+        my_start = pty_supervisor.proc_start_ticks(me)
+        my_boot = pty_supervisor.host_boot_id()
+        record = ladder_record(pid=me, pgid=me, sid=me, proc_start_ticks=my_start, boot_id=my_boot)
         present = ladder_snapshot(rows=({"pid": me, "ppid": 1, "pgid": me, "sid": me,
-                                         "tty": "ttys042", "stat": "Ss"},))
+                                         "tty": "ttys042", "stat": "Ss", "start_id": my_start,
+                                         "start_state": "final", "boot_id": my_boot},))
         detached = ladder_snapshot(rows=({"pid": me, "ppid": 1, "pgid": me, "sid": me,
-                                          "tty": "ttys777", "stat": "Ss"},))
+                                          "tty": "ttys777", "stat": "Ss", "start_id": my_start,
+                                          "start_state": "final", "boot_id": my_boot},))
         reads = {"n": 0}
 
         def reader(tty):
@@ -544,9 +552,10 @@ class Item6G2ExitProofTests(unittest.TestCase):
             "intent-1", "stop", record=record,
             profile=ladder_profile(graceful_force_timeout_ms=20),
             table_reader=reader, supervisor_pid=999, killpg=spy.send_group,
-            kill=spy.send_one, sleep=lambda s: None, clock=clock)
+            kill=spy.send_one, watcher=spy.via_watcher, sleep=lambda s: None, clock=clock)
         self.assertEqual(result["interrupt_outcome"], "exit_unproven", result)
-        self.assertEqual([sig for _p, sig in spy.killpg], [15])
+        self.assertEqual(spy.watcher, [15])
+        self.assertEqual(spy.killpg, [], "OS-48: no user-space group signal")
         self.assertFalse(any(s["rung"] == "G2" and s["identity_verified"]
                              for s in result["ladder"]), result["ladder"])
 
@@ -577,7 +586,7 @@ class Item9SeedModeTests(unittest.TestCase):
                                    "session_field": "thread_id"}],
             "delivery_proofs": [{"channel": "structured", "record_type": "item.completed"}],
             "completion_records": [{"channel": "structured",
-                                    "record_type": "turn.completed"}],
+                                    "record_type": "turn.completed", "binding_mode": "single_record_optin"}],
             "auth_seed_source": str(self.source), "auth_seed_dest_name": "auth.json",
             "config_root": str(self.home)}))
 
@@ -1425,10 +1434,14 @@ class Iteration2LateFinalRecordTests(_F06LateBase):
         self.assertEqual(len(settled), 1, settled)
         self.assertEqual(settled[0]["state"], "COMPLETED")
         vocab = settled[0]["source_vocabulary"]
-        self.assertEqual(vocab["result_body_source"], "output_last_message_path",
-                         "the body written by the agent was not read back")
+        # superseded by OS-48 i4 (F-001 option ii): the `-o` sidecar is never a settlement
+        # body source; the body is the F06 agent's on-stream `agent_message` (the real
+        # Codex shape) and the sidecar is only the R3 presence fact frozen in the fence.
+        self.assertEqual(vocab["result_body_source"], "item.completed.item.text", vocab)
+        self.assertNotIn("path", vocab["result_body_provenance"])
+        self.assertEqual(vocab["fence"]["sidecar"]["state"], "present", vocab["fence"]["sidecar"])
         drain = vocab["post_exit_drain"]
-        self.assertEqual(drain["ended"], "hangup", drain)
+        self.assertEqual(drain["ended"], "marker", drain)     # OS-48: the fence marker is the end
         self.assertGreater(drain["bytes"], 0, "the post-exit drain read nothing; the "
                                               "final record was settled without")
         self.assertIn('"turn.completed"', session.capture.transcript())
@@ -1445,12 +1458,16 @@ class Iteration2LateFinalRecordTests(_F06LateBase):
         self.assertEqual(settled[0]["state"], "FAILED")
         self.assertEqual(settled[0]["source_vocabulary"]["completion_verdict"]["reason"],
                          receipt["failure_reason"])
-        self.assertEqual(settled[0]["source_vocabulary"]["post_exit_drain"]["ended"], "hangup")
+        self.assertEqual(settled[0]["source_vocabulary"]["post_exit_drain"]["ended"], "marker")
 
 
 class Iteration2DrainAfterExitTests(unittest.TestCase):
-    """`drain_after_exit` over a real pty pair: a quiet `select` does NOT end it, the
-    hangup does, and a slave that never hangs up ends it by the BUDGET -- reported as such."""
+    """`drain_after_exit` over a real pty pair: a quiet `select` does NOT end it, the FENCE
+    MARKER does, and a slave whose owner never writes the marker ends it by the BUDGET --
+    reported as such (`boundary_unproven`).
+
+    # superseded by OS-48: the round-8 end was the hangup (EOF/EIO); OS-48's positive end is
+    # the in-band marker, and an EOF/EIO without it is `master_unreadable` -> `boundary_unproven`."""
 
     def setUp(self) -> None:
         import pty
@@ -1467,6 +1484,10 @@ class Iteration2DrainAfterExitTests(unittest.TestCase):
             journal=journal_mod.ExecutionJournal(self.base, "run_drain"))
         self.session.capture = capture_mod.BoundedCapture(self.base / "capture.log")
         self.session.pty = {"master_fd": self.master, "pty_id": "pty-drain"}
+        # OS-48: a raw pty session has no watcher; the test plays the owner (it writes the
+        # fence marker into the slave) and the exit is stipulated proven so the fence can bind.
+        self.session.exit_proof = {"proven": True, "how": "table", "exit_status": None}
+        self.marker = capture_mod.marker_bytes(self.session.fence_nonce)
 
     def _close_fds(self) -> None:
         for fd in (self.master, self.slave):
@@ -1478,12 +1499,12 @@ class Iteration2DrainAfterExitTests(unittest.TestCase):
             time.sleep(0.25)                             # > the old 10 ms silence window
             os.write(self.slave, b'{"type":"turn.completed"}\n')
             time.sleep(0.05)
-            os.close(self.slave)                         # the hangup
+            os.write(self.slave, self.marker)            # OS-48: the positive end is the marker
         thread = threading.Thread(target=writer, daemon=True)
         thread.start()
         drained = self.session.drain_after_exit(budget_ms=3000)
         thread.join(timeout=2)
-        self.assertEqual(drained["ended"], "hangup", drained)
+        self.assertEqual(drained["ended"], "marker", drained)
         self.assertGreater(drained["bytes"], 0)
         self.assertIn('"turn.completed"', self.session.capture.transcript())
         # And the old shape, for contrast: `pump` returns on the first quiet select.
@@ -1590,7 +1611,10 @@ HUNG_AGENT_TAIL = '''\
 
 
 class Iteration3StreamFinalityTests(_F06LateBase):
-    """RED on the iteration-2 tree: every `OSError` from the master read was labelled
+    """# superseded by OS-48: `stream_end_unproven` is `boundary_unproven`; the drain's end is
+    # the marker, never a hangup (the F06 fixtures' writers write the marker instead of closing).
+
+    RED on the iteration-2 tree: every `OSError` from the master read was labelled
     `hangup`, and `await_completion` recorded `post_exit_drain.ended` without gating on
     it -- so a structured success could be authorised from a stream whose durable end was
     never observed.  Production-wired: the F06 composition through `adapter.start`, the
@@ -1632,7 +1656,7 @@ class Iteration3StreamFinalityTests(_F06LateBase):
     def _assert_no_success_anywhere(self, receipt, rows, session, ledger, intent,
                                     *, ended: str) -> None:
         self.assertEqual(receipt["outcome"], "failed", receipt)
-        self.assertEqual(receipt["failure_reason"], "stream_end_unproven", receipt)
+        self.assertEqual(receipt["failure_reason"], "boundary_unproven", receipt)
         self.assertNotEqual(session.state, "COMPLETED")
         self.assertFalse(any(r.get("state") == "COMPLETED" for r in rows),
                          "a COMPLETED row was journalled without stream finality")
@@ -1641,7 +1665,7 @@ class Iteration3StreamFinalityTests(_F06LateBase):
         self.assertEqual(settled[0]["state"], "FAILED")
         self.assertEqual(settled[0]["outcome"], "failed")
         verdict = settled[0]["source_vocabulary"]["completion_verdict"]
-        self.assertEqual(verdict["reason"], "stream_end_unproven", verdict)
+        self.assertEqual(verdict["reason"], "boundary_unproven", verdict)
         stored = ledger.get_settlement(intent["intent_id"])
         self.assertIsNotNone(stored)
         self.assertEqual(stored["result"].get("status"), "BLOCKED", stored)
@@ -1684,7 +1708,7 @@ class Iteration3StreamFinalityTests(_F06LateBase):
         settled = [r for r in rows if r["kind"] == "SETTLEMENT_OBSERVED"]
         self.assertEqual(settled[0]["state"], "COMPLETED")
         drain = settled[0]["source_vocabulary"]["post_exit_drain"]
-        self.assertEqual(drain["ended"], "hangup", drain)
+        self.assertEqual(drain["ended"], "marker", drain)     # OS-48: the fence marker is the end
         self.assertGreater(drain["bytes"], 0)
 
     def test_a_drain_that_ends_by_budget_with_a_candidate_is_fail_closed(self) -> None:
@@ -1698,9 +1722,11 @@ class Iteration3StreamFinalityTests(_F06LateBase):
 
 
 class Iteration3ReadClassificationTests(unittest.TestCase):
-    """`drain_after_exit` over a real pty pair whose slave is STILL OPEN: only EOF / EIO
-    is hangup; EBADF (the reviewer's mutation) and a failing poll are `master_unreadable`
-    with the errno named; EINTR is retried."""
+    """`drain_after_exit` over a real pty pair whose slave is STILL OPEN: EOF / EIO / EBADF
+    (the reviewer's mutation) and a failing poll are all `master_unreadable` with the errno
+    named -- none of them is the end (only the marker is); EINTR is retried.
+
+    # superseded by OS-48: EOF / EIO were the `hangup` end at round 8."""
 
     def setUp(self) -> None:
         import pty
@@ -1717,6 +1743,8 @@ class Iteration3ReadClassificationTests(unittest.TestCase):
             journal=journal_mod.ExecutionJournal(self.base, "run_cls"))
         self.session.capture = capture_mod.BoundedCapture(self.base / "capture.log")
         self.session.pty = {"master_fd": self.master, "pty_id": "pty-cls"}
+        self.session.exit_proof = {"proven": True, "how": "table", "exit_status": None}
+        self.marker = capture_mod.marker_bytes(self.session.fence_nonce)
 
     def _close_fds(self) -> None:
         for fd in (self.master, self.slave):
@@ -1745,19 +1773,22 @@ class Iteration3ReadClassificationTests(unittest.TestCase):
         self.session._master_reader = reader
 
         def writer() -> None:                            # darwin discards unread slave
-            os.write(self.slave, b'{"type":"turn.completed"}\n')   # output on close, so
-            time.sleep(0.3)                              # the bytes are read BEFORE the
-            os.close(self.slave)                         # hangup, as on a real exit
+            os.write(self.slave, b'{"type":"turn.completed"}\n')
+            time.sleep(0.3)
+            os.write(self.slave, self.marker)            # OS-48: the marker, not a hangup
         thread = threading.Thread(target=writer, daemon=True)
         thread.start()
         drained = self.session.drain_after_exit(budget_ms=3000)
         thread.join(timeout=2)
-        self.assertEqual(drained["ended"], "hangup", drained)
+        self.assertEqual(drained["ended"], "marker", drained)
         self.assertGreaterEqual(calls["n"], 3)
         self.assertIn('"turn.completed"', self.session.capture.transcript())
 
     def test_eio_is_the_hangup_and_other_errnos_are_named(self) -> None:
-        for code, expected in ((errno.EIO, "hangup"), (errno.EACCES, "master_unreadable"),
+        # OS-48: EIO is no longer a positive end -- with the owner-held slave reference a
+        # hangup before the marker is impossible on the normal path, so it is
+        # `master_unreadable` by name like every other read failure.
+        for code, expected in ((errno.EIO, "master_unreadable"), (errno.EACCES, "master_unreadable"),
                                (errno.ENXIO, "master_unreadable")):
             with self.subTest(errno=errno.errorcode[code]):
                 os.write(self.slave, b"x\n")
@@ -1777,17 +1808,17 @@ class Iteration3ReadClassificationTests(unittest.TestCase):
         self.assertIn(drained["errno"], ("EBADF", "ValueError"))
 
     def test_a_masterless_session_is_final_only_by_the_watchers_finalized_proof(self) -> None:
-        """An ADOPTED session holds no master: its end-of-stream evidence is the exit
-        watcher's fenced CAPTURE-FINALIZED proof (round-9 item 1), written after the
-        watcher's own final drain, meta save and fsync and BEFORE its sentinel.  The
-        sentinel alone -- which the watcher writes without draining whenever the
-        supervisor was alive at the exit -- is `exit_sentinel_only` and NOT final; an exit
-        proven only by the process table is `none`.  (Iteration 3 accepted the sentinel
-        alone here; that was the round-9 blocker.  The full adopted path is
-        `F01CrashedSupervisorDispatchIsCollectedTests`, which settles COMPLETED through
-        exactly this rule.)"""
+        """Superseded by OS-48 (DESIGN §1.5 / §5): an ADOPTED session holds no master; its
+        finality is the verified CAPTURE FENCE on disk.  The sentinel alone is `none` (not
+        final); a LEGACY os37 finalized record is refused by name (`legacy_finalized_record`);
+        a fence whose digest does not match the capture is `fence_mismatch`; only a fence that
+        binds the marker offset N, sha256(capture[0:N)) and the sentinel is final."""
         from scripts.deterministic_workflow.standalone_runtime import _stream_is_final
         self.session.pty = None
+        # OS-48 F-005: a successor publishes nothing without the pinned emitter identity axes
+        self.session.record = dict(self.session.record or {}, pid=int((self.session.record or {}).get("pid") or 4242),
+                                   pgid=4242, proc_start_ticks=7, boot_id="b")
+        self.session.exit_proof = None
         drained = self.session.drain_after_exit(budget_ms=500)
         self.assertEqual(drained["ended"], "no_master", drained)
         self.assertEqual(drained["finality"], "none")
@@ -1798,32 +1829,38 @@ class Iteration3ReadClassificationTests(unittest.TestCase):
         sentinel.parent.mkdir(parents=True, exist_ok=True)
         pty_supervisor.write_exit_sentinel(sentinel, code=0, fence=self.session.fence)
         drained = self.session.drain_after_exit(budget_ms=500)
-        self.assertEqual(drained["finality"], "exit_sentinel_only", drained)
+        self.assertEqual(drained["finality"], "none", drained)
+        self.assertEqual(drained["outcome"], "boundary_unproven", drained)
         self.assertFalse(_stream_is_final(drained), "a sentinel alone was taken as final")
-        # The watcher's proof, bound to the capture as it is and to the sentinel's code.
-        self.session.capture.append(b'{"type":"turn.completed"}\n', at="t")
-        proof = capture_mod.capture_finalized_path(self.session.capture.path,
-                                                   self.session.incarnation)
-        capture_mod.write_capture_finalized(
-            proof, fence=self.session.fence, finality=capture_mod.FINALITY_PROVEN,
-            writer=capture_mod.WRITER_EXIT_WATCHER, ended="hangup", errno_name="",
-            total_bytes=self.session.capture.size, sha256=self.session.capture.sha256,
-            records=1, exit_how="exit_sentinel", exit_code=0)
+        # a legacy os37 record is never evidence
+        legacy = capture_mod.capture_finalized_path(self.session.capture.path,
+                                                    self.session.incarnation)
+        Path(os.fsdecode(legacy)).write_text('{"schema": "os37.capture_finalized.v1"}')
+        drained = self.session.drain_after_exit(budget_ms=500)
+        self.assertEqual(drained["finality"], "legacy_finalized_record", drained)
+        self.assertFalse(_stream_is_final(drained))
+        os.unlink(legacy)
+        # the marker in the capture lets a SUCCESSOR publish the fence -- and only then is it final
+        self.session.capture.append(b'{"type":"turn.completed"}\n' + self.marker, at="t")
         drained = self.session.drain_after_exit(budget_ms=500)
         self.assertEqual(drained["finality"], "capture_finalized", drained)
         self.assertTrue(_stream_is_final(drained))
-        # A proof that no longer describes the capture (bytes appended after it) is a
-        # named mismatch, not finality.
-        with open(self.session.capture.path, "ab") as handle:
-            handle.write(b"stray\n")
+        fence = capture_mod.read_capture_fence(self.session._fence_path(), fence=self.session.fence)
+        self.assertEqual(fence["outcome"], "final")
+        self.assertEqual(fence["record"]["owner"]["owner_role"], "successor")
+        # a capture whose fenced prefix no longer matches the fence is a named mismatch
+        with open(self.session.capture.path, "r+b") as handle:
+            handle.seek(0)
+            handle.write(b"X")
+        self.session._boundary = None
         drained = self.session.drain_after_exit(budget_ms=500)
         self.assertEqual(drained["finality"], "mismatch", drained)
-        self.assertEqual(drained["finality_detail"], "capture_length_mismatch")
+        self.assertEqual(drained["outcome"], "fence_mismatch")
         self.assertFalse(_stream_is_final(drained))
         # And a FOREIGN sentinel (another incarnation's) proves nothing.
         pty_supervisor.write_exit_sentinel(sentinel, code=0,
                                            fence=f"{self.session.session_id}:i-other")
         self.assertFalse(_stream_is_final(self.session.drain_after_exit(budget_ms=500)))
-        for ended in ("budget", "master_unreadable", "hangup", "no_master"):
+        for ended in ("budget", "master_unreadable", "marker", "no_master"):
             self.assertFalse(_stream_is_final({"ended": ended, "finality": "exit_sentinel"}))
             self.assertFalse(_stream_is_final({"ended": ended, "finality": "none"}))

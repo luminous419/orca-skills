@@ -26,8 +26,11 @@ Four refusals gate it, and each one sends NO signal.
 """
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import errno
+import socket
+import sys
 import fcntl
 import json
 import os
@@ -158,11 +161,25 @@ def boot_id() -> str:
             return Path(path).read_text().strip()
         except OSError:
             pass
-    try:  # darwin
-        out = subprocess.run(["sysctl", "-n", "kern.boottime"], capture_output=True,
+    # darwin (OS-48): `kern.bootsessionuuid` -- a UUID minted once per boot.  `kern.boottime`
+    # was used before, but its `usec` field DRIFTS between reads (NTP slewing adjusts the
+    # kernel's boottime: MEASURED in run_f820764749d6 -- 229493 vs 168681 usec, hours
+    # apart on one boot), so a supervisor and a later successor could read two different
+    # "boot ids" for one boot and refuse every ownership check as `identity_changed`.  The
+    # boottime SECONDS are the fallback where the UUID sysctl is absent.
+    try:
+        out = subprocess.run(["sysctl", "-n", "kern.bootsessionuuid"], capture_output=True,
                              text=True, timeout=5, check=False)
         if out.returncode == 0 and out.stdout.strip():
             return out.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        out = subprocess.run(["sysctl", "-n", "kern.boottime"], capture_output=True,
+                             text=True, timeout=5, check=False)
+        if out.returncode == 0 and out.stdout.strip():
+            match = re.search(r"sec = (\d+)", out.stdout)
+            return f"boottime_sec={match.group(1)}" if match else out.stdout.strip()
     except (OSError, subprocess.SubprocessError):
         pass
     return ""
@@ -557,6 +574,14 @@ class PtySession(TypedDict):
     #: this end is closed (in :meth:`StandaloneSession._reclaim`, after the supervisor's own
     #: finalizing drain) or the supervisor dies.  Closed by :func:`release`.
     drain_handoff_fd: int
+    #: OS-48 DESIGN §2.3: the SUPERVISOR's end of the control socket over which it asks the
+    #: watcher (the agent's parent) to deliver a signal -- delivery bound to the pinned
+    #: incarnation by the watcher's single reap-and-deliver thread.  Closed by :func:`release`.
+    control_fd: int
+    #: OS-48 DESIGN §1.5: the fence nonce minted by the supervisor before the spawn; the
+    #: watcher writes `marker_bytes(fence_nonce)` after the reap and the settlement boundary N
+    #: is where that marker lands in the capture.
+    fence_nonce: str
 
 
 class SpawnHandoffFailed(OSError):
@@ -574,8 +599,11 @@ class SpawnHandoffFailed(OSError):
 
     def __init__(self, detail: str, *, leader_pid: int, master_fd: int, slave_name: str,
                  pty_id: str, orphan_guard_fd: int, argv: tuple[str, ...],
-                 drain_handoff_fd: int = -1) -> None:
+                 drain_handoff_fd: int = -1, control_fd: int = -1,
+                 fence_nonce: str = "") -> None:
         super().__init__(errno.ECHILD, detail)
+        self.control_fd = control_fd
+        self.fence_nonce = fence_nonce
         self.leader_pid = leader_pid
         self.master_fd = master_fd
         self.slave_name = slave_name
@@ -592,7 +620,8 @@ class SpawnHandoffFailed(OSError):
                 "pgid": 0, "sid": self.leader_pid, "leader_pid": self.leader_pid,
                 "pty_id": self.pty_id, "argv": self.argv,
                 "orphan_guard_fd": self.orphan_guard_fd,
-                "drain_handoff_fd": self.drain_handoff_fd}
+                "drain_handoff_fd": self.drain_handoff_fd, "control_fd": self.control_fd,
+                "fence_nonce": self.fence_nonce}
 
 
 def spawn(*, argv: Sequence[str], env: Mapping[str, str], profile: StandaloneProfile,
@@ -600,7 +629,10 @@ def spawn(*, argv: Sequence[str], env: Mapping[str, str], profile: StandalonePro
           cwd: str | None = None, argv_digest: str = "", env_digest: str = "",
           sentinel: str | os.PathLike[str] | None = None,
           fence: str = "", image: str | None = None,
-          capture: str | os.PathLike[str] | None = None) -> PtySession:
+          capture: str | os.PathLike[str] | None = None,
+          fence_nonce: str = "",
+          supervisor_identity: Mapping[str, Any] | None = None,
+          sidecar_path: str = "") -> PtySession:
     """``openpty`` -> ``fork`` (leader) -> ``fork`` (agent) -> ``setpgid`` -> ``tcsetpgrp``
     -> spawn record -> ``closerange`` -> ``execve``.
 
@@ -650,7 +682,15 @@ def spawn(*, argv: Sequence[str], env: Mapping[str, str], profile: StandalonePro
     vanished and no sentinel was ever written.
     """
     # Read in the PARENT, and passed into the child, because the child may not spawn.
-    host_boot_id = boot_id()
+    host_boot = host_boot_id()
+    # OS-48: the fence nonce (DESIGN §1.5) is minted BEFORE the fork and carried by the spawn
+    # record, so a successor can search the capture for the marker with nobody alive.
+    if not fence_nonce:
+        fence_nonce = uuid.uuid4().hex
+    if supervisor_identity is None:
+        supervisor_identity = identity.process_identity(
+            pid=os.getpid(), start_id=proc_start_ticks(os.getpid()), boot_id=host_boot,
+            incarnation=fence, source=evidence_source_id())
     # Resolved in the PARENT so the image the kernel loads is, BY CONSTRUCTION, the same
     # path R-A leg 4 compares against.  Callers that already resolved the profile's binary
     # pass it as `image`; that is the load-bearing wiring, because it makes "what was
@@ -709,6 +749,17 @@ def spawn(*, argv: Sequence[str], env: Mapping[str, str], profile: StandalonePro
     # hangup the supervisor reads as capture finality over a truncated capture.
     dh_r, dh_w = os.pipe()
     fcntl.fcntl(dh_w, fcntl.F_SETFD, fcntl.FD_CLOEXEC)
+    # OS-48 DESIGN §2.3: the CONTROL socket for watcher-mediated signal delivery.  The
+    # supervisor keeps `ctl_sup` (CLOEXEC); the watcher keeps `ctl_w`.
+    ctl_sup_sock, ctl_w_sock = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    ctl_sup, ctl_w = ctl_sup_sock.detach(), ctl_w_sock.detach()
+    fcntl.fcntl(ctl_sup, fcntl.F_SETFD, fcntl.FD_CLOEXEC)
+    # OS-48 iteration 7 (F-010): the fork-watch GATE.  The agent child blocks on `gate_r`
+    # until the watcher has registered its NOTE_FORK|NOTE_EXIT watch on the child's pid --
+    # BEFORE the child can `execve`, and the pre-exec child never forks -- so every fork
+    # the root ever performs is observed (coalesced, never counted) and the root has no
+    # pre-registration window.  A registration that fails is named `fork_watch_gap`.
+    gate_r, gate_w = os.pipe()
     # Enumerated AFTER the pipes exist, so the child's `closerange` and the watcher's own
     # descriptor sweep both cover them.
     close_up_to = highest_open_fd()
@@ -721,6 +772,7 @@ def spawn(*, argv: Sequence[str], env: Mapping[str, str], profile: StandalonePro
             os.close(handoff_r)
             os.close(guard_w)
             os.close(dh_w)            # the watcher must not hold the supervisor's write end
+            os.close(ctl_sup)
             os.setsid()
             try:
                 fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
@@ -739,6 +791,15 @@ def spawn(*, argv: Sequence[str], env: Mapping[str, str], profile: StandalonePro
                     os.setpgid(0, 0)
                     os.tcsetpgrp(0, os.getpgrp())
                     child_pid = os.getpid()
+                    # F-010: wait for the watcher's fork watch (one byte, or EOF if the
+                    # watcher is gone -- then there is no watcher to account anything).
+                    # Before `chdir`: nothing fallible stands after the spawn record.
+                    try:
+                        os.close(gate_w)
+                        os.read(gate_r, 1)
+                        os.close(gate_r)
+                    except OSError:
+                        pass
                     # ---- finding 3: EVERY fallible pre-exec operation comes BEFORE the
                     # spawn record.  `chdir` used to come after it, so a missing or
                     # unreadable worktree made the child die at 127 WITHOUT reaching
@@ -759,10 +820,15 @@ def spawn(*, argv: Sequence[str], env: Mapping[str, str], profile: StandalonePro
                     write_spawn_record(spawn_record_target, {
                         "session_id": session_id, "process_incarnation": incarnation,
                         "pid": child_pid, "pgid": os.getpgid(0), "sid": os.getsid(0),
-                        "boot_id": host_boot_id,
+                        "boot_id": host_boot,
                         "proc_start_ticks": proc_start_ticks(child_pid),
                         "argv_digest": argv_digest, "env_digest": env_digest,
                         "started_at": started_at,
+                        # OS-48: the fence nonce, the evidence source and the SUPERVISOR's
+                        # pinned identity (the watcher's parent-death witness target).
+                        "fence_nonce": fence_nonce,
+                        "evidence_source": evidence_source_id(),
+                        "supervisor_identity": dict(supervisor_identity),
                     })
                     # `closerange` cannot fail in a way that stops the exec -- it only
                     # closes -- and it stays after the write because the write needs a
@@ -771,12 +837,23 @@ def spawn(*, argv: Sequence[str], env: Mapping[str, str], profile: StandalonePro
                     os.execve(image_path, list(argv), dict(env))
                 except BaseException:
                     os._exit(127)
+            # ---- F-010: register the ROOT's fork/exit watch BEFORE releasing it to exec ----
+            members_kq, root_watch = _register_root_watch(agent_pid)
+            try:
+                os.close(gate_r)
+                os.write(gate_w, b"1")
+                os.close(gate_w)
+            except OSError:
+                pass
             os.write(handoff_w, b"%d\n" % agent_pid)
             os.close(handoff_w)
-            # ---- finding 9 (round 3) / finding 1 (round 4): what the WATCHER holds ------
-            # It holds NO slave descriptor: its 0/1/2 go to /dev/null and its inherited
-            # slave copy is closed, so the slave's last close is the agent's own.  It
-            # DOES keep one copy of the master -- deliberately, and that is the round-4
+            # ---- what the WATCHER holds (OS-48 DESIGN §1.3) ---------------------------
+            # It KEEPS ONE slave descriptor -- the owner-held slave reference: its 0/1/2 go
+            # to /dev/null, but the retained slave fd is what it writes the fence / RELEASE
+            # markers through and what keeps the kernel from discarding the unread tail;
+            # descendants that inherited the slave keep writing (after N: diagnostic tail)
+            # until the two-phase release closes this reference.  It ALSO keeps one copy
+            # of the master -- deliberately, and that is the round-4
             # correction of the round-3 shape that closed it: with the supervisor holding
             # the only master, the supervisor's death was the pty's hangup, and the hangup
             # killed first the watcher (the session leader) and then, through the leader's
@@ -790,13 +867,20 @@ def spawn(*, argv: Sequence[str], env: Mapping[str, str], profile: StandalonePro
                    close_up_to=close_up_to, sentinel=sentinel, fence=fence,
                    capture=capture_target, capture_limits=profile.capture,
                    slave_name=slave_name, dh_r=dh_r,
-                   drain_budget_ms=profile.timeouts.post_exit_drain_budget_ms)
+                   drain_budget_ms=profile.timeouts.post_exit_drain_budget_ms,
+                   control_fd=ctl_w, fence_nonce=fence_nonce,
+                   supervisor_identity=supervisor_identity, host_boot_id=host_boot,
+                   agent_start_id=proc_start_ticks(agent_pid), sidecar_path=sidecar_path,
+                   members_kq=members_kq, root_watch=root_watch)
         except BaseException:
             os._exit(127)
     os.close(slave_fd)
     os.close(handoff_w)
+    os.close(gate_r)
+    os.close(gate_w)
     os.close(guard_r)
     os.close(dh_r)                    # the supervisor keeps only the write end `dh_w`
+    os.close(ctl_w)                   # the supervisor keeps only its own control end
     pty_id = f"pty-{uuid.uuid4().hex[:12]}"
     argv_tuple = tuple(str(a) for a in argv)
     try:
@@ -815,89 +899,99 @@ def spawn(*, argv: Sequence[str], env: Mapping[str, str], profile: StandalonePro
             "identity exists, so none is invented -- the pty is retained for teardown",
             leader_pid=leader_pid, master_fd=master_fd, slave_name=slave_name,
             pty_id=pty_id, orphan_guard_fd=guard_w, argv=argv_tuple,
-            drain_handoff_fd=dh_w)
+            drain_handoff_fd=dh_w, control_fd=ctl_sup, fence_nonce=fence_nonce)
+    # F-005: the watcher's start identity is read NOW, while it is positively alive as our
+    # child (the handoff just proved it), and pinned on the session -- the fence's
+    # `reaped_by` is this pinned identity, never a later read of a possibly-dead pid.
     return {"master_fd": master_fd, "slave_name": slave_name, "pid": agent_pid,
             "pgid": agent_pid, "sid": leader_pid, "leader_pid": leader_pid,
             "pty_id": pty_id, "argv": argv_tuple, "orphan_guard_fd": guard_w,
-            "drain_handoff_fd": dh_w}
+            "drain_handoff_fd": dh_w, "control_fd": ctl_sup, "fence_nonce": fence_nonce,
+            "watcher_start_id": proc_start_ticks(leader_pid), "boot_id": host_boot}
+
+
+def _register_root_watch(agent_pid: int) -> "tuple[Any, str]":
+    """[FORKED-SAFE] Establish the platform's ownership mechanism on the not-yet-exec'd root
+    and return its RECEIPT ``(kqueue | None, status)``: darwin -- the membership kqueue with
+    NOTE_FORK|NOTE_EXIT registered on the root (``"registered"``, positive: every later fork
+    of the root is observed; ``"unavailable:*"`` / ``"<Error>:<errno>"`` -- the named gap);
+    Linux -- ``PR_SET_CHILD_SUBREAPER`` installed AND read back (``"subreaper"``, positive;
+    ``"ownership_setup_unverified:*"`` -- the named failure, F-014)."""
+    if sys.platform != "darwin":
+        # F-014: Linux's positive ownership mechanism is the SUBREAPER; it is installed and
+        # verified HERE, before the gate releases the root, so no fork of the root can
+        # precede it.  The receipt (or the named failure) travels with the membership.
+        return None, _set_subreaper()
+    try:
+        kq = select.kqueue()
+    except OSError as exc:
+        return None, f"unavailable:{type(exc).__name__}:{getattr(exc, 'errno', '')}"
+    try:
+        kq.control([select.kevent(agent_pid, filter=select.KQ_FILTER_PROC, flags=select.KQ_EV_ADD,
+                                  fflags=select.KQ_NOTE_FORK | select.KQ_NOTE_EXIT)], 0, 0)
+    except OSError as exc:
+        return kq, f"{type(exc).__name__}:{getattr(exc, 'errno', '')}"
+    return kq, "registered"
 
 
 def _watch(agent_pid: int, *, master_fd: int, slave_fd: int, guard_r: int,
            close_up_to: int, sentinel: str | os.PathLike[str] | None, fence: str,
            capture: bytes | None,
            capture_limits: CaptureLimits | None = None,
-           slave_name: str = "", drain_budget_ms: int = 2_000, dh_r: int = -1
+           slave_name: str = "", drain_budget_ms: int = 2_000, dh_r: int = -1,
+           control_fd: int = -1, fence_nonce: str = "",
+           supervisor_identity: Mapping[str, Any] | None = None,
+           host_boot_id: str = "", agent_start_id: int = 0, sidecar_path: str = "",
+           members_kq: Any = None, root_watch: str = ""
            ) -> None:  # pragma: no cover - runs in the forked watcher
-    """The exit watcher's whole life.  Raw ``os`` calls only: this is a forked child.
+    """The exit watcher's whole life (OS-48 DESIGN §1.6 / §2.3 / §2.5).  Raw ``os`` calls only.
 
-    Never returns: it ``_exit``s with the agent's shell-shaped status after writing the
-    fenced sentinel.  ``SIGHUP`` is ignored so a hangup of the controlling pty -- which
-    the kept master makes impossible while this process lives, but which a stranger could
-    still deliver by hand -- can never destroy the exit evidence.
+    **It KEEPS one slave descriptor** (the owner-held slave reference, DESIGN §1.3): while it
+    is open the kernel never reclaims the unread tail (probe_d1: 3 s / 10 s late reads intact
+    on darwin and Linux, ctty or not) and no EOF can be manufactured by anyone else.  It is
+    closed only on release-2 (the supervisor confirmed it consumed the RELEASE marker) or at the
+    end of the orphan finalize.
 
-    **The orphan drain is BOUNDED by the profile's own capture limits** (consolidated
-    follow-up review, finding 4).  The round-4 shape appended every drained byte verbatim,
-    so a 4 KiB limit retained 131 KiB after supervisor death and the capture still
-    answered `answerable=True`.  Now every chunk goes through the same `admit_chunk`
-    decision `BoundedCapture` applies, the meta is rewritten after every append with the
-    running digest under `writer="exit_watcher"`, and a reader that finds the meta and
-    the bytes in disagreement fails closed.  The master is still drained past the limit
-    -- the agent must never block on a full pty buffer -- but the bytes are DROPPED and
-    counted, never written.
+    **It is the agent's PARENT and the SAME single thread both reaps and delivers signals**
+    (DESIGN §2.3, F-002): a ``SIG`` request served before its own ``waitpid`` reaps the child
+    addresses a pid the kernel cannot reuse (a zombie holds its pid until reaped -- probe_d7);
+    after the reap a request is refused ``signal_target_reaped``.  It never sends ``killpg``.
 
-    **The sentinel proves the EXIT; the finalized record proves the CAPTURE** (round-9
-    consolidated review, item 1).  When this watcher is the one finalizing -- the
-    supervisor is gone and it holds the only reader of the master -- it drains the master
-    TO THE HANGUP (bounded by the profile's ``post_exit_drain_budget_ms``; silence does
-    not end it), saves and fsyncs the capture meta, writes the fenced capture-finalized
-    proof (:func:`standalone_capture.write_capture_finalized`, bound to the capture's
-    final length + digest and to the sentinel it is about to write) and ONLY THEN writes
-    the exit sentinel.  A drain that ends by the bound (a descendant still holds the
-    slave) or by an unreadable master writes an ``unproven`` record naming what held the
-    slave, then the sentinel; a successor then settles `stream_end_unproven`.  When the
-    supervisor is ALIVE at the agent's exit it owns the drain and writes the proof itself;
-    the sentinel this watcher writes at once is exit evidence only and no reader may take
-    it for capture completion.
-
-    **The supervisor-alive watcher DEFERS its exit** (round-10 item 1).  On darwin a
-    session leader's exit REVOKES the controlling tty and discards the unread tail still
-    buffered on the master, so a watcher that reaped the agent, wrote the sentinel and
-    exited AT ONCE could manufacture the very hangup the supervisor then read as capture
-    finality -- over a capture the revoke had just truncated.  So when the supervisor is
-    alive this watcher writes the sentinel (the supervisor needs it to start its own drain)
-    and then BLOCKS in :func:`_await_drain_handoff`, keeping the session-leader tty alive,
-    until the supervisor closes ``dh_r``'s write end (it does so in ``_reclaim``, after its
-    own finalizing drain) or the supervisor dies.  It writes NO proof on that path -- the
-    supervisor is the single finalizing owner -- so a supervisor killed before its proof
-    still leaves no proof and a successor still refuses ``stream_end_unproven``.
+    **After the reap it writes the FENCE MARKER into its slave fd, then the exit sentinel**
+    (DESIGN §1.6).  The marker's offset in the capture is the settlement boundary N.  Then it
+    DEFERS (supervisor alive): serves ``R`` (release-1: write the RELEASE marker) and ``C``
+    (release-2: close the slave) on the drain handoff, or -- on guard EOF -- runs the ORPHAN
+    finalize: drain to the marker, fence-first, claim a generation only with a durable
+    relinquishment record or its incarnation-bound parent-death witness (never guard EOF
+    alone -- probe_d11), publish the fence, RELEASE marker, drain to R, release record, close.
     """
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
     try:
-        os.close(slave_fd)
         null = os.open(os.devnull, os.O_RDWR)
         for fd in (0, 1, 2):
-            os.dup2(null, fd)
-        if null > 2:
+            if fd != slave_fd:
+                os.dup2(null, fd)
+        if null > 2 and null != slave_fd:
             os.close(null)
     except OSError:
         pass
-    # ---- correction iteration 2 (CI-2): the agent's exit wakes the watcher AT ONCE ------
-    # The round-4 loop polled `waitpid(WNOHANG)` every 50 ms, so between the agent's exit
-    # and the fenced sentinel there was a window of up to 50 ms in which the agent was a
-    # zombie -- off its tty, unsentinelled -- and a stranger reading the run in that window
-    # (`recover_handle`) saw an orphan.  Measured on the MVP host under load: 18 of 40
-    # reads landed in it; the sentinel arrived ~8-10 ms later.  A SIGCHLD wake-up pipe
-    # (`signal.set_wakeup_fd`) in every `select` below closes the window to the signal's
-    # own latency: the kernel writes the byte the instant the child exits and the very
-    # next `waitpid` reaps it.  The handler itself does nothing; PEP 475 would otherwise
-    # silently restart the `select` and swallow the signal.
     wake_r, wake_w = os.pipe()
     os.set_blocking(wake_w, False)
     signal.set_wakeup_fd(wake_w, warn_on_full_buffer=False)
     signal.signal(signal.SIGCHLD, lambda *_args: None)
-    keep = {master_fd, guard_r, wake_r, wake_w}
+    # ---- the incarnation-bound PARENT-DEATH WITNESS (DESIGN §2.5 rule 2, probe_d11) ----------
+    witness = _ParentWitness(supervisor_identity or {})
+    # ---- the POSITIVE membership set (DESIGN §2.2, REVIEW_IMPLEMENTATION F-006) ---------------
+    members = _Membership(members_path(capture, fence.partition(":")[2]) if capture is not None else None,
+                          fence=fence, boot_id=host_boot_id, agent_pid=agent_pid,
+                          agent_start_id=agent_start_id, kq=members_kq, root_watch=root_watch)
+    keep = {master_fd, guard_r, wake_r, wake_w, slave_fd}
     if dh_r >= 0:
         keep.add(dh_r)
+    if control_fd >= 0:
+        keep.add(control_fd)
+    keep.update(witness.fds())
+    keep.update(members.fds())
     for fd in range(3, close_up_to + 1):
         if fd not in keep:
             try:
@@ -907,6 +1001,11 @@ def _watch(agent_pid: int, *, master_fd: int, slave_fd: int, guard_r: int,
     orphaned = False
     appender: capture_mod.RawBoundedAppender | None = None
     status = 0
+    ctl = _ControlServer(control_fd, agent_pid=agent_pid, fence=fence)
+    # A child forked BEFORE the NOTE_FORK registration is found by the first walk; a later
+    # periodic walk (bounded, ~1 s) covers an event the kqueue coalesced or dropped.
+    members.discover("watch_start")
+    next_walk = time.monotonic() + 1.0
     while True:
         try:
             done, status = os.waitpid(agent_pid, os.WNOHANG)
@@ -914,31 +1013,63 @@ def _watch(agent_pid: int, *, master_fd: int, slave_fd: int, guard_r: int,
             done, status = agent_pid, 0
         if done == agent_pid:
             break
+        if sys.platform == "linux":
+            _reap_reparented(agent_pid, members)
+        if time.monotonic() >= next_walk:
+            members.discover("periodic")
+            next_walk = time.monotonic() + 1.0
         if not orphaned:
+            fds = [guard_r, wake_r] + ([control_fd] if control_fd >= 0 else []) + sorted(members.fds())
             try:
-                ready, _, _ = select.select([guard_r, wake_r], [], [], 0.05)
+                ready, _, _ = select.select(fds, [], [], 0.05)
             except (OSError, ValueError):
                 ready = [guard_r]
+            if control_fd >= 0 and control_fd in ready:
+                ctl.serve(reaped=False)
+                continue
+            if any(fd in ready for fd in members.fds()):
+                members.serve()                       # NOTE_FORK -> bounded discovery
+                continue
             if wake_r in ready:
                 _drain_wakeups(wake_r)
-                continue                       # a child changed state: reap it above
-            if ready:
-                # EOF on the guard: the supervisor is gone.  From here the agent's output
-                # has no reader but this process, so it becomes the reader -- under the
-                # SAME limits the supervisor applied (finding 4).
+                if sys.platform == "linux":
+                    members.discover("sigchld")       # a reparented / forked descendant
+                continue
+            if guard_r in ready:
                 orphaned = True
                 appender = _orphan_take_over(guard_r, capture, capture_limits)
             continue
+        if control_fd >= 0:
+            try:
+                ready, _, _ = select.select([control_fd], [], [], 0)
+            except (OSError, ValueError):
+                ready = []
+            if ready:
+                ctl.serve(reaped=False)
+        members.serve()
         _drain_once(master_fd, appender, budget=0.05, wake_r=wake_r)
     code = _wait_status_to_code(status)
-    # ---- round-10 follow-up (a): re-check the guard AFTER reaping -------------------------
-    # The agent's exit and the supervisor's death can be simultaneously ready: `waitpid`
-    # returns the agent (break) while EOF sits unread on the guard, and the SIGCHLD fast
-    # path above can `continue` past the guard check in the same iteration.  Either way the
-    # loop could exit with `orphaned` still False and skip orphan finalization -- writing a
-    # sentinel with no proof over a supervisor that was gone and whose tail this watcher
-    # alone could have drained.  A final non-blocking guard probe closes that race: a
-    # supervisor already gone is detected here and the orphan-finalize path below runs.
+    # ---- F-001 (iterations 3-4): the DECLARED sidecar is read + digested + snapshotted HERE,
+    # in the same step that reaped the root and before the marker is emitted -- the PRESENCE
+    # fact for R3 (instant `reap_step_before_marker`).  This does NOT bind the file's content
+    # to N (a helper may still write before the marker lands), which is why the content is
+    # never a settlement body source.
+    if capture is not None and sidecar_path:
+        try:
+            capture_mod.snapshot_sidecar(capture, fence.partition(":")[2], fence=fence,
+                                         sidecar_path=sidecar_path, captured_at=_now_iso())
+        except Exception:  # noqa: BLE001 - no record => readers say `sidecar_unproven`
+            pass
+    # the root is reaped: one last bounded discovery (children forked at its very end), and
+    # its own exit is a positive ledger fact
+    members.serve()
+    members.discover("agent_reaped")
+    members.note_reaped(agent_pid)
+    # ---- the FENCE MARKER, written by the OWNER into ITS slave fd AFTER the reap -------------
+    marker_written = _write_marker_bounded(slave_fd, capture_mod.marker_bytes(fence_nonce)
+                                           if fence_nonce else b"", master_fd, appender)
+    if sentinel is not None:
+        write_exit_sentinel(sentinel, code=code, fence=fence)
     if not orphaned:
         try:
             ready, _, _ = select.select([guard_r], [], [], 0)
@@ -947,31 +1078,40 @@ def _watch(agent_pid: int, *, master_fd: int, slave_fd: int, guard_r: int,
         if ready:
             orphaned = True
             appender = _orphan_take_over(guard_r, capture, capture_limits)
-    if orphaned:
-        if capture is not None:
-            # This watcher is the one FINALIZING: drain to the hangup, persist, prove, and
-            # only then write the sentinel (item 1).  Nothing here may raise past the
-            # sentinel write -- a watcher that dies of bookkeeping loses the exit evidence.
-            try:
-                _finalize_orphaned_capture(
-                    master_fd, appender,
-                    budget_s=max(0, int(drain_budget_ms)) / 1000.0,
-                    finalized=capture_mod.capture_finalized_path(
-                        capture, fence.partition(":")[2]),
-                    fence=fence, code=code, slave_name=slave_name)
-            except Exception:  # noqa: BLE001 - the sentinel is still written below
-                pass
-        if sentinel is not None:
-            write_exit_sentinel(sentinel, code=code, fence=fence)
-    else:
-        # Round-10 item 1: the supervisor was ALIVE at the reap and owns the final drain.
-        # Write the sentinel so it can start draining, then LINGER -- keeping the tty alive,
-        # writing no proof -- until it releases us (dh_r EOF, closed in `_reclaim`) or dies.
-        if sentinel is not None:
-            write_exit_sentinel(sentinel, code=code, fence=fence)
-        if dh_r >= 0:
-            _await_drain_handoff(dh_r, guard_r,
-                                 budget_s=max(0, int(drain_budget_ms)) / 1000.0)
+    release_written = False
+    if not orphaned and dh_r >= 0:
+        next_release_walk = [time.monotonic() + 1.0]
+
+        def _tick() -> None:
+            members.serve()                           # darwin NOTE_EXIT / NOTE_FORK
+            if sys.platform == "linux":
+                _reap_reparented(agent_pid, members)  # reparented descendants: reaped, recorded
+            if time.monotonic() >= next_release_walk[0]:
+                # F-010 adversarial pass: a descendant reparented (Linux: to this subreaper)
+                # or forked while the watcher waits for the release is still discoverable
+                members.discover("release_wait")
+                next_release_walk[0] = time.monotonic() + 1.0
+        orphaned, release_written = _defer_for_release(
+            dh_r, guard_r, control_fd, ctl, slave_fd, fence_nonce, master_fd,
+            budget_s=max(0, int(drain_budget_ms)) / 1000.0, on_tick=_tick)
+        if orphaned:
+            appender = _orphan_take_over(guard_r, capture, capture_limits)
+    if orphaned and capture is not None:
+        try:
+            _orphan_finalize(master_fd, slave_fd, appender, capture=capture, fence=fence,
+                             fence_nonce=fence_nonce, code=code, marker_written=marker_written,
+                             sentinel=sentinel, witness=witness,
+                             budget_s=max(0, int(drain_budget_ms)) / 1000.0,
+                             host_boot_id=host_boot_id, agent_pid=agent_pid,
+                             agent_start_id=agent_start_id, release_written=release_written,
+                             sidecar_path=sidecar_path)
+        except Exception:  # noqa: BLE001 - a watcher never dies of bookkeeping
+            pass
+    members.close()                                    # final ledger accounting
+    try:
+        os.close(slave_fd)
+    except OSError:
+        pass
     os._exit(code)
 
 
@@ -980,8 +1120,8 @@ def _orphan_take_over(guard_r: int, capture: bytes | None,
                       ) -> "capture_mod.RawBoundedAppender | None":  # pragma: no cover
     """Close the (now-EOF) orphan guard and build the bounded appender the watcher drains
     into once the supervisor is gone.  A watcher never dies of bookkeeping, so an appender
-    that cannot be built is ``None`` (the finalized record then names that nothing vouches
-    for the bytes)."""
+    that cannot be built is ``None`` (the orphan finalize then publishes nothing for bytes
+    nothing vouches for)."""
     try:
         os.close(guard_r)
     except OSError:
@@ -994,165 +1134,1350 @@ def _orphan_take_over(guard_r: int, capture: bytes | None,
         return None
 
 
-def _await_drain_handoff(dh_r: int, guard_r: int, *, budget_s: float
-                         ) -> None:  # pragma: no cover - runs in the forked watcher
-    """Round-10 item 1.  Block until the supervisor RELEASES this watcher -- which it does
-    by closing ``dh_r``'s write end in ``_reclaim``, after its own finalizing drain -- or
-    until the supervisor DIES (both the handoff and the orphan guard read EOF on its death),
-    or a generous ceiling elapses.  Reads no master byte and writes no proof: its ONLY job
-    is to keep the session-leader tty alive so the supervisor's drain sees the whole tail
-    rather than a revoke-truncated one.  The ceiling exists solely for a supervisor wedged
-    holding both fds without dying; it is a large multiple of the drain budget, so in the
-    normal path the supervisor always releases (or dies) first."""
+
+# ---- OS-48 DESIGN §2.2: the POSITIVE membership set `members.<inc>.jsonl` ----------------------
+MEMBER_SCHEMA = "os48.member.v1"
+MEMBER_ROLE_AGENT = "agent"
+MEMBER_ROLE_DESCENDANT = "descendant"
+MEMBER_EVENT_OBSERVED = "observed"
+MEMBER_EVENT_EXITED = "exited"
+#: REVIEW_IMPLEMENTATION_iteration4 F-009: a discovery pass whose evidence could NOT be read
+#: (the process listing failed / kept changing, or a live candidate's identity was
+#: unreadable by every source) is a durable ledger fact of its own -- the set is UNKNOWN
+#: beyond what was positively observed, and a reader must say so.
+MEMBER_EVENT_DISCOVERY_UNREADABLE = "discovery_unreadable"
+DISCOVERY_LISTING_UNREADABLE = "listing_unreadable"
+DISCOVERY_LISTING_UNSTABLE = "listing_unstable"
+DISCOVERY_CANDIDATE_UNREADABLE = "candidate_identity_unreadable"
+#: REVIEW_IMPLEMENTATION_iteration6 (F-010 / F-012 / F-013, coordinator direction): the
+#: descendant accounting is modelled CONSERVATIVELY -- the residual is UNKNOWN by default and
+#: only an enumerated set of POSITIVE facts clears a piece of it.  Every discovery kind below
+#: is a durable `discovery_unreadable` ledger record; none is ever discharged by a later
+#: observation (a kqueue NOTE_FORK is COALESCED: it proves "at least one fork", never the set
+#: of children, and no kernel interface enumerates the children of a fork event).
+#:  * `fork_coalesced`          -- a NOTE_FORK observed on a member: its children beyond the
+#:                                 ones positively attributed are UNKNOWN (never cleared);
+#:  * `fork_watch_gap`          -- a window in which a member's forks were unobservable: the
+#:                                 root when its watch could not be registered before exec
+#:                                 (the gate in `spawn` normally closes that window), and
+#:                                 EVERY descendant (its watch is registered after its birth);
+#:  * `parent_identity_unreadable` -- a candidate names a member pid as its parent but the
+#:                                 member's CURRENT start identity cannot be read by any
+#:                                 source while the kernel still holds the pid: the
+#:                                 attribution can be neither made nor refused (F-012: a held
+#:                                 zombie pid is NOT a witness of the cached incarnation);
+#:  * `candidate_identity_unreadable` -- a live candidate no source will read, or a candidate
+#:                                 positively parented to a member / the subreaper whose start
+#:                                 identity is unreadable (zero) -- named, never omitted (F-013);
+#:  * `fork_watch_unregistered` -- a member's fork/exit watch could not be registered;
+#:  * `fork_watch_unavailable`  -- no kqueue at all (darwin);
+#:  * `fork_events_unreadable`  -- the kqueue read failed: pending events (forks) were lost;
+#:  * `member_ceiling_exceeded` -- a positively attributed descendant the ledger will not hold;
+#:  * `watch_ended`             -- members still alive when the watcher stopped observing:
+#:                                 their later forks are unobservable;
+#:  * `discovery_pass_ceiling`  -- a walk was still attributing when its bounded passes ran
+#:                                 out: deeper generations may exist (worker's adversarial pass);
+#:  * `reaped_unattributed`     -- Linux: the subreaper reaped a descendant no walk had
+#:                                 attributed -- it existed, forked unobserved, and is gone.
+DISCOVERY_FORK_COALESCED = "fork_coalesced"
+DISCOVERY_OWNERSHIP_UNVERIFIED = "ownership_setup_unverified"
+DISCOVERY_PIDFD_UNAVAILABLE = "pidfd_unavailable"          # F-016: no fixed object for a Linux member
+DISCOVERY_PASS_CEILING = "discovery_pass_ceiling"
+DISCOVERY_REAPED_UNATTRIBUTED = "reaped_unattributed"
+DISCOVERY_FORK_WATCH_GAP = "fork_watch_gap"
+DISCOVERY_PARENT_UNREADABLE = "parent_identity_unreadable"
+DISCOVERY_WATCH_UNREGISTERED = "fork_watch_unregistered"
+DISCOVERY_WATCH_UNAVAILABLE = "fork_watch_unavailable"
+DISCOVERY_EVENTS_UNREADABLE = "fork_events_unreadable"
+DISCOVERY_CEILING_EXCEEDED = "member_ceiling_exceeded"
+DISCOVERY_WATCH_ENDED = "watch_ended"
+#: state-file counter per kind
+DISCOVERY_COUNTERS = {DISCOVERY_LISTING_UNREADABLE: "listing_unreadable",
+                      DISCOVERY_LISTING_UNSTABLE: "listing_unstable",
+                      DISCOVERY_CANDIDATE_UNREADABLE: "candidates_unreadable",
+                      DISCOVERY_FORK_COALESCED: "forks_coalesced",
+                      DISCOVERY_FORK_WATCH_GAP: "watch_gaps",
+                      DISCOVERY_PARENT_UNREADABLE: "parents_unreadable",
+                      DISCOVERY_WATCH_UNREGISTERED: "unobservable",
+                      DISCOVERY_WATCH_UNAVAILABLE: "unobservable",
+                      DISCOVERY_EVENTS_UNREADABLE: "unobservable",
+                      DISCOVERY_CEILING_EXCEEDED: "unobservable",
+                      DISCOVERY_WATCH_ENDED: "unobservable",
+                      DISCOVERY_PASS_CEILING: "unobservable",
+                      DISCOVERY_OWNERSHIP_UNVERIFIED: "unobservable",
+                      DISCOVERY_PIDFD_UNAVAILABLE: "unobservable",
+                      DISCOVERY_REAPED_UNATTRIBUTED: "unobservable"}
+_DISCOVERY_REASON_CEILING = 16
+_DISCOVERY_PID_CEILING = 64
+#: Bounded discovery: passes per trigger and the ceiling on members (a fork bomb stays named).
+_MEMBER_DISCOVERY_PASSES = 3
+_MEMBER_CEILING = 512
+
+
+def members_path(capture: str | os.PathLike[str] | bytes, incarnation: str) -> bytes:
+    """``<capture dir>/members.<inc>.jsonl`` -- append-only, one `MemberRecord` per line."""
+    target = os.fsencode(os.fspath(capture)) if not isinstance(capture, bytes) else capture
+    return os.path.join(os.path.dirname(target) or b".", b"members." + incarnation.encode() + b".jsonl")
+
+
+def read_members(path: str | os.PathLike[str] | bytes) -> list[dict[str, Any]]:
+    """Every complete (newline-terminated, well-formed) member line; see :func:`read_ledger`
+    for the readability state a decision must consult."""
+    return read_ledger(path)["records"]
+
+
+def read_ledger(path: str | os.PathLike[str] | bytes) -> dict[str, Any]:
+    """REVIEW_IMPLEMENTATION_iteration2 F-006: the ledger with its READABILITY named --
+    ``{"records", "state": final|absent|unreadable, "torn": n, "error"}``.  A read the kernel
+    refuses (EACCES, EIO, ...) is `unreadable`, never an empty set; a torn final fragment is
+    counted (it adds no member but it is evidence the ledger was still being written)."""
+    target = os.fsencode(os.fspath(path)) if not isinstance(path, bytes) else path
+    try:
+        with open(target, "rb") as handle:
+            raw = handle.read()
+    except FileNotFoundError:
+        return {"records": [], "state": "absent", "torn": 0, "error": ""}
+    except OSError as exc:
+        return {"records": [], "state": capture_mod.EVIDENCE_UNREADABLE, "torn": 0,
+                "error": f"{type(exc).__name__}:{getattr(exc, 'errno', '')}"}
+    out: list[dict[str, Any]] = []
+    torn = 0
+    lines = raw.split(b"\n")
+    if lines and lines[-1]:
+        torn = 1                                       # an unterminated final fragment
+    for line in lines[:-1]:
+        try:
+            record = json.loads(line.decode("utf-8"))
+        except ValueError:
+            torn += 1
+            continue
+        if isinstance(record, dict) and record.get("schema") == MEMBER_SCHEMA:
+            out.append(record)
+        else:
+            torn += 1
+    return {"records": out, "state": capture_mod.EVIDENCE_FINAL, "torn": torn, "error": ""}
+
+
+def _append_member(path: bytes, record: Mapping[str, Any]) -> bool:
+    """[FORKED-SAFE] Append ONE line (write + fsync); never rewrites.  ``False`` = not appended."""
+    payload = json.dumps(dict(record), sort_keys=True).encode() + b"\n"
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    except OSError:
+        return False
+    try:
+        os.write(fd, payload)
+        os.fsync(fd)
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def _darwin_bsdinfo(pid: int) -> "tuple[int, int] | None":
+    """[FORKED-SAFE] ``(ppid, start_ticks)`` from an EXACT-size ``PROC_PIDTBSDINFO`` read
+    (``pbi_ppid`` at byte 16; start time at 120/128); ``None`` when unreadable / partial."""
+    lib = _libproc_handle()
+    if lib is None or not hasattr(lib, "proc_pidinfo"):
+        return None
+    try:
+        lib.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+                                     ctypes.c_void_p, ctypes.c_int]
+        lib.proc_pidinfo.restype = ctypes.c_int
+        buffer = ctypes.create_string_buffer(_PROC_PIDTBSDINFO_SIZE)
+        written = lib.proc_pidinfo(int(pid), _PROC_PIDTBSDINFO, 0, buffer, _PROC_PIDTBSDINFO_SIZE)
+    except (OSError, ValueError, AttributeError):
+        return None
+    if written != _PROC_PIDTBSDINFO_SIZE:
+        return None
+    ppid = struct.unpack_from("<I", buffer.raw, 16)[0]
+    seconds, micros = struct.unpack_from("<QQ", buffer.raw, 120)
+    return int(ppid), int(seconds) * 1_000_000 + int(micros)
+
+
+def _darwin_kinfo(pid: int) -> "tuple[int, int] | None":
+    """[FORKED-SAFE] ``(ppid, start_id)`` from the kernel's OTHER per-process read, ``sysctl
+    kern.proc.pid`` (a single ``kinfo_proc``: ``p_starttime`` tv_sec at byte 0 / tv_usec at
+    byte 8, ``e_ppid`` at byte 560 -- verified against the calling process and ``PROC_PIDTBSDINFO``
+    in this run's evidence).  A pid that is gone answers ZERO bytes (``None`` here, like
+    ``_darwin_bsdinfo``); anything but one whole struct is unreadable (``None``).  This is the
+    independent source consulted when ``PROC_PIDTBSDINFO`` refuses a candidate
+    (REVIEW_IMPLEMENTATION_iteration4 F-009) -- the identity it yields is the SAME
+    ``start_id`` the ledger keys members by."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        mib = (ctypes.c_int * 4)(1, 14, 1, int(pid))              # CTL_KERN, KERN_PROC, KERN_PROC_PID
+        buf = ctypes.create_string_buffer(_KINFO_PROC_SIZE)
+        got = ctypes.c_size_t(_KINFO_PROC_SIZE)
+        if libc.sysctl(mib, 4, buf, ctypes.byref(got), None, 0) != 0:
+            return None
+        if got.value != _KINFO_PROC_SIZE:
+            return None
+        raw = buf.raw
+        if struct.unpack_from("<i", raw, _KINFO_PROC_PID_OFF)[0] != int(pid):
+            return None
+        seconds = struct.unpack_from("<q", raw, _KINFO_PROC_START_SEC_OFF)[0]
+        micros = struct.unpack_from("<i", raw, _KINFO_PROC_START_USEC_OFF)[0]
+        ppid = struct.unpack_from("<i", raw, _KINFO_PROC_PPID_OFF)[0]
+        return int(ppid), int(seconds) * 1_000_000 + int(micros)
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def _process_info_fallback(pid: int) -> "tuple[int, int] | None":
+    """[FORKED-SAFE] The independent per-process identity read consulted only when
+    :func:`_process_info` answered ``None`` for a candidate (F-009): darwin ``kern.proc.pid``;
+    Linux has no second source (``None``)."""
+    return _darwin_kinfo(pid) if sys.platform == "darwin" else None
+
+
+def _linux_stat(pid: int) -> "tuple[int, int] | None":
+    """[FORKED-SAFE] ``(ppid, start_ticks)`` from ``/proc/<pid>/stat``; ``None`` when gone."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as handle:
+            text = handle.read().decode("utf-8", "replace")
+        fields = text.rsplit(") ", 1)[1].split()
+        return int(fields[1]), int(fields[19])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def _process_info(pid: int) -> "tuple[int, int] | None":
+    """[FORKED-SAFE] ``(ppid, start_ticks)`` from the platform evidence source, or ``None``."""
+    return _darwin_bsdinfo(pid) if sys.platform == "darwin" else _linux_stat(pid)
+
+
+def _member_identity(pid: int, start_id: int, boot_id: str, fence: str) -> dict[str, Any]:
+    return identity.process_identity(pid=int(pid), start_id=int(start_id), boot_id=boot_id,
+                                     incarnation=fence, source=evidence_source_id())
+
+
+class _Membership:
+    """[FORKED-SAFE] The watcher's positive membership set (DESIGN §2.2): the agent from the
+    spawn record; descendants discovered -- darwin: kqueue ``NOTE_FORK`` on every member
+    *triggers* a bounded ``ppid == member`` walk of ``proc_listallpids`` + ``PROC_PIDTBSDINFO``
+    with the child's start identity captured at first sight; Linux: a ``/proc`` ppid walk on
+    ``SIGCHLD`` (the watcher is a subreaper, so orphaned descendants reparent to it and are
+    reaped by ``waitpid``).  Discovery may MISS (a child that forked and exited between the
+    event and the read) -- which only ever makes the set smaller; absence from the set means
+    ``unknown``, never "not ours".  Membership never widens the signal authority: members are
+    for ownership / teardown accounting only (the residual `descendants_unreaped`).
+
+    REVIEW_IMPLEMENTATION_iteration2 F-006: members are keyed by INCARNATION ``(pid, start_id)``,
+    never by pid alone; a child is attributed to a parent only when the parent member is a
+    LIVE, CURRENT incarnation (its start identity re-read NOW equals the recorded one and it
+    has not exited) -- an exited, stale or reused parent attributes nothing; every ledger
+    append is accounted (`appended` / `failed`) in ``members.<inc>.state.json`` so a reader can
+    tell a short ledger from a complete one.
+
+    REVIEW_IMPLEMENTATION_iteration4 F-009: discovery that could NOT be read is accounted
+    SEPARATELY from successful appends -- a failed / changing process listing, or a live
+    candidate whose identity no source can read, is (a) a `discovery_unreadable` ledger
+    record with its reason and (b) a `discovery` block in the state file (`passes`,
+    `listing_unreadable`, `listing_unstable`, `candidates_unreadable`, `reasons`, `pids`).
+    A reader (`membership_residual`) turns any of those into the named outcome
+    `descendants_unknown`: the positive set stays what it is, and the rest is UNKNOWN --
+    never "no descendants".  A candidate refused by ``PROC_PIDTBSDINFO`` is re-read from the
+    independent ``kern.proc.pid`` source first; only a candidate unreadable by every source
+    while the kernel still holds its pid (not a zombie, not gone) is unknown.
+
+    REVIEW_IMPLEMENTATION_iteration6 (the conservative model).  POSITIVE facts, and only
+    these, contribute to the answer:
+      P1 the spawn record -- the root's pid + start identity (the watcher's own child);
+      P2 the root's fork/exit watch registered BEFORE its exec (`spawn`'s gate);
+      P3 a candidate whose ppid is a member whose CURRENT start identity re-read now
+         equals the recorded one (alive; a held zombie / unreadable pid is NOT a witness);
+      P4 Linux: a candidate whose ppid is the watcher itself (the subreaper's adopted
+         child) -- a positive member candidate regardless of its own start readability;
+      P5 a member's exit observed by the watcher (NOTE_EXIT / its own waitpid / waitid).
+    Everything else is a named UNKNOWN that no later observation discharges."""
+
+    def __init__(self, path: bytes | None, *, fence: str, boot_id: str,
+                 agent_pid: int, agent_start_id: int, kq: Any = None, root_watch: str = "") -> None:
+        self.path = path
+        self.fence = fence
+        self.boot_id = boot_id
+        self.members: dict[tuple[int, int], dict[str, Any]] = {}
+        self.appended = 0
+        self.failed = 0
+        self.discovery: dict[str, Any] = {"passes": 0, "listing_unreadable": 0, "listing_unstable": 0,
+                                          "candidates_unreadable": 0, "forks_coalesced": 0,
+                                          "watch_gaps": 0, "parents_unreadable": 0, "unobservable": 0,
+                                          "root_watch": root_watch or "unregistered",
+                                          "reasons": [], "pids": []}
+        self._unreadable_seen: set[int] = set()
+        self._once: set[str] = set()
+        self._forked: dict[int, int] = {}
+        #: F-016: the FIXED object per Linux member -- a pidfd held from attribution until
+        #: the member is observed exiting; identity of a cached member is asked of the pidfd,
+        #: never of (pid, tick) equality.  Keyed like `members`.
+        self._pidfds: dict[tuple[int, int, int], int] = {}
+        self._root_watch = root_watch
+        self._kq: Any = kq
+        if sys.platform == "darwin" and self._kq is None:
+            try:
+                self._kq = select.kqueue()
+            except OSError:
+                self._kq = None
+        # P1 + P2: the root's watch was registered by `spawn` before the exec (positive) --
+        # or it was not, and that is the root's named gap
+        if not self._add(agent_pid, agent_start_id, MEMBER_ROLE_AGENT, "spawn_record"):
+            # the root's own start identity is unreadable: it is OURS (P1's pid) and
+            # unrecordable by incarnation -- named, never a silent empty set
+            self._discovery_unreadable(DISCOVERY_CANDIDATE_UNREADABLE, "root_start_unreadable",
+                                       "watch_start", [int(agent_pid)])
+        if sys.platform == "darwin":
+            if self._kq is None:
+                self._discovery_unreadable(DISCOVERY_WATCH_UNAVAILABLE, "kqueue_unavailable", "watch_start")
+            elif root_watch != "registered":
+                self._discovery_unreadable(DISCOVERY_FORK_WATCH_GAP, f"root:{root_watch or 'unregistered'}",
+                                           "watch_start", [int(agent_pid)])
+        elif root_watch != "subreaper":
+            # F-014: the subreaper was not positively established before the root could
+            # fork: every reparenting the walks rely on (P4) is unproven for this dispatch
+            self._discovery_unreadable(DISCOVERY_OWNERSHIP_UNVERIFIED,
+                                       root_watch or "ownership_setup_unverified:unset",
+                                       "watch_start", [int(agent_pid)])
+
+    def fds(self) -> set[int]:
+        out = {self._kq.fileno()} if self._kq is not None else set()
+        out.update(self._pidfds.values())
+        return out
+
+    def _lifetimes(self, pid: int, start_id: int) -> "list[tuple[tuple[int, int, int], dict[str, Any]]]":
+        return [(k, r) for k, r in self.members.items() if k[0] == int(pid) and k[1] == int(start_id)]
+
+    def _pidfd_state(self, key: "tuple[int, int, int]") -> str:
+        """The fixed object's answer for a Linux member: ``alive`` (the pidfd's process has not
+        exited -- so the pid is still THAT process), ``exited`` (readable: the process ended),
+        ``unavailable`` (no pidfd was obtained)."""
+        fd = self._pidfds.get(key)
+        if fd is None:
+            return "unavailable"
+        try:
+            ready, _, _ = select.select([fd], [], [], 0)
+        except (OSError, ValueError):
+            return "unavailable"
+        return "exited" if ready else "alive"
+
+    def _pgid(self, pid: int) -> int:
+        try:
+            return int(os.getpgid(pid))
+        except OSError:
+            return 0
+
+    def _append(self, record: Mapping[str, Any]) -> None:
+        if self.path is None:
+            return
+        if _append_member(self.path, record):
+            self.appended += 1
+        else:
+            self.failed += 1
+        self._write_state()
+
+    def _write_state(self) -> None:
+        """``members.<inc>.state.json``: how many lines this watcher appended and how many it
+        could not -- a reader treats `failed > 0` (or a missing state) as unknown accounting."""
+        if self.path is None:
+            return
+        state = {"schema": MEMBER_SCHEMA + ".state", "appended": self.appended, "failed": self.failed,
+                 "members": len(self.members), "discovery": json.loads(json.dumps(self.discovery)),
+                 "written_at": _now_iso()}
+        tmp = self.path + b".state.json.tmp"
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+            try:
+                os.write(fd, json.dumps(state, sort_keys=True).encode())
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.rename(tmp, self.path + b".state.json")
+        except OSError:
+            pass
+
+    def _add(self, pid: int, start_id: int, role: str, observed_via: str) -> bool:
+        watch_registered = role == MEMBER_ROLE_AGENT and self._root_watch == "registered"
+        if pid <= 0 or not start_id:
+            return False
+        lifetimes = self._lifetimes(pid, start_id)
+        if any(not r.get("exited") for _k, r in lifetimes):
+            return False                                   # that lifetime is already a member
+        # F-016: a (pid, start) key whose recorded lifetimes ALL exited names a NEW lifetime --
+        # Linux start ticks are not injective, so a cached exited key never suppresses a live
+        # candidate; the ledger carries the lifetime ordinal
+        lifetime = len(lifetimes) + 1
+        key = (int(pid), int(start_id), lifetime)
+        if len(self.members) >= _MEMBER_CEILING:
+            # a POSITIVELY attributed descendant that the ledger will not hold is not "not
+            # ours" -- it is unknown from here on, and said so (once per pid)
+            if pid not in self._unreadable_seen:
+                self._unreadable_seen.add(pid)
+                self._discovery_unreadable(DISCOVERY_CEILING_EXCEEDED, f"ceiling:{_MEMBER_CEILING}",
+                                           observed_via, [int(pid)])
+            return False
+        record = {"schema": MEMBER_SCHEMA, "event": MEMBER_EVENT_OBSERVED,
+                  "identity": _member_identity(pid, start_id, self.boot_id, self.fence),
+                  "role": role, "observed_via": observed_via, "pgid": self._pgid(pid),
+                  "lifetime": lifetime, "fixed_object": "none", "observed_at": _now_iso()}
+        if sys.platform == "linux":
+            fd = -1
+            try:
+                fd = os.pidfd_open(int(pid))                 # the FIXED object (F-016)
+            except (OSError, AttributeError) as exc:
+                self._discovery_unreadable(DISCOVERY_PIDFD_UNAVAILABLE,
+                                           f"{type(exc).__name__}:{getattr(exc, 'errno', '')}",
+                                           observed_via, [int(pid)])
+            if fd >= 0:
+                self._pidfds[key] = fd
+                record["fixed_object"] = "pidfd"
+        elif sys.platform == "darwin":
+            record["fixed_object"] = "kqueue_note_exit" if self._kq is not None else "none"
+        self.members[key] = record
+        self._append(record)
+        if watch_registered or self._kq is None:
+            return True
+        # a DESCENDANT's watch is registered after its birth: whatever it forked before this
+        # instant is unobservable -- the named gap (never cleared)
+        self._discovery_unreadable(DISCOVERY_FORK_WATCH_GAP, "registered_after_birth", observed_via, [int(pid)])
+        try:
+            self._kq.control([select.kevent(pid, filter=select.KQ_FILTER_PROC,
+                                            flags=select.KQ_EV_ADD,
+                                            fflags=select.KQ_NOTE_FORK | select.KQ_NOTE_EXIT)],
+                             0, 0)
+        except OSError as exc:
+            # the member was gone before its watch existed (ESRCH: it already exited --
+            # possibly after forking) or the kernel refused the watch: ITS forks are
+            # unobservable.
+            self._discovery_unreadable(DISCOVERY_WATCH_UNREGISTERED,
+                                       f"{type(exc).__name__}:{getattr(exc, 'errno', '')}",
+                                       observed_via, [int(pid)])
+        return True
+
+    def _live_member_for(self, ppid: int) -> "dict[str, Any] | str | None":
+        """P3: the member record that a child with parent ``ppid`` may be attributed to -- a
+        member with that pid whose CURRENT start identity, re-read now by a positive source,
+        equals the recorded one and which has not been observed exiting.  ``None`` refuses
+        POSITIVELY (the kernel says no process holds the pid -- a live child naming it was
+        forked by a reused pid -- or the pid holds a different, readable incarnation).
+        ``"unreadable"`` (F-012): the identity can be read by no source while the kernel still
+        holds the pid (live and refused, or a zombie): holding a numeric pid does not bind
+        the zombie to the cached incarnation -- another parent may have reaped that one --
+        so the attribution can be neither made nor refused and the caller records the
+        child as UNKNOWN.  The old held-zombie exception is gone."""
+        unreadable = False
+        for key, record in list(self.members.items()):
+            pid, start_id = key[0], key[1]
+            if pid != ppid or record.get("exited"):
+                continue
+            if sys.platform == "linux":
+                # F-016: the FIXED object decides -- an alive pidfd means the pid is still
+                # exactly that process (a pid is held until reaped); an exited one is P5 and
+                # the pid may already belong to someone else; no pidfd = unreadable
+                state = self._pidfd_state(key)
+                if state == "alive":
+                    return record
+                if state == "exited":
+                    self._exited(pid, start_id, via="pidfd_exit")
+                    continue
+                unreadable = True
+                continue
+            info = _process_info(pid) or _process_info_fallback(pid)
+            if info is not None:
+                if int(info[1]) == int(start_id):
+                    return record
+                continue                                   # a different incarnation holds the pid
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                continue                                   # positively gone: the pid was reused
+            except OSError:
+                pass
+            unreadable = True
+        return "unreadable" if unreadable else None
+
+    def _exited(self, pid: int, start_id: int | None = None, via: str = "") -> None:
+        for key, record in list(self.members.items()):
+            mpid, mstart = key[0], key[1]
+            if mpid != pid or record.get("exited"):
+                continue
+            if start_id is not None and mstart != start_id:
+                continue
+            record["exited"] = True
+            fd = self._pidfds.pop(key, None)
+            if fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+            self._append({"schema": MEMBER_SCHEMA, "event": MEMBER_EVENT_EXITED,
+                          "identity": record["identity"], "role": record["role"], "lifetime": record.get("lifetime", 1),
+                          "observed_via": via or ("note_exit" if sys.platform == "darwin" else "subreaper_reap"),
+                          "pgid": record.get("pgid", 0), "observed_at": _now_iso()})
+
+    def _discovery_unreadable(self, kind: str, reason: str, trigger: str,
+                              pids: "list[int] | None" = None,
+                              parent: "Mapping[str, Any] | None" = None,
+                              evidence: "Mapping[str, Any] | None" = None) -> None:
+        """F-009 / F-010: account discovery uncertainty DURABLY and separately from the appends
+        -- the state file's `discovery` block (counted even when the ledger line cannot be
+        written) and one `discovery_unreadable` ledger record naming the kind, the reason, the
+        trigger, the pids concerned and, for a fork, the PARENT identity + the kernel event."""
+        counter = DISCOVERY_COUNTERS[kind]
+        self.discovery[counter] += len(pids) if pids else 1
+        tag = f"{kind}:{reason}"
+        if tag not in self.discovery["reasons"] and len(self.discovery["reasons"]) < _DISCOVERY_REASON_CEILING:
+            self.discovery["reasons"].append(tag)
+        for pid in pids or ():
+            if len(self.discovery["pids"]) < _DISCOVERY_PID_CEILING and pid not in self.discovery["pids"]:
+                self.discovery["pids"].append(int(pid))
+        self._append({"schema": MEMBER_SCHEMA, "event": MEMBER_EVENT_DISCOVERY_UNREADABLE,
+                      "kind": kind, "reason": reason, "trigger": trigger,
+                      "pids": [int(p) for p in (pids or ())][:_DISCOVERY_PID_CEILING],
+                      "parent": dict(parent) if parent else None,
+                      "evidence": dict(evidence) if evidence else None,
+                      "pass": self.discovery["passes"], "fence": self.fence,
+                      "observed_at": _now_iso()})
+
+    def _record_for_pid(self, pid: int) -> "dict[str, Any] | None":
+        """The latest member record (any incarnation, live first) for ``pid``."""
+        live = [r for k, r in self.members.items() if k[0] == pid and not r.get("exited")]
+        if live:
+            return live[-1]
+        gone = [r for k, r in self.members.items() if k[0] == pid]
+        return gone[-1] if gone else None
+
+    def _list_candidates(self) -> "tuple[list[int] | None, str]":
+        """The process table for one pass, or ``(None, reason)`` when it cannot be read --
+        darwin: the cross-checked libproc listing (`listallpids_*` reasons); Linux: `/proc`."""
+        if sys.platform == "darwin":
+            pids, why = _libproc_list_all_pids()
+            if pids is None:
+                return None, str(why or "listallpids_unreadable")
+            return list(pids), ""
+        try:
+            return [int(name) for name in os.listdir("/proc") if name.isdigit()], ""
+        except OSError as exc:
+            return None, f"proc_listdir:{type(exc).__name__}:{getattr(exc, 'errno', '')}"
+
+    def discover(self, reason: str) -> int:
+        """One bounded discovery pass set: add every process whose ppid is a LIVE, CURRENT member
+        incarnation (P3) or, on Linux, this subreaper itself (P4), with its start identity
+        captured now.  Returns the number of members added.  Every non-positive observation
+        is a named UNKNOWN (iteration 6 model): a listing that cannot be read / settle
+        (`listing_*`); a live candidate no source will read, or one positively parented to
+        a member / the subreaper whose start identity is unreadable
+        (`candidate_identity_unreadable`, F-013); a candidate whose parent member cannot be
+        re-read (`parent_identity_unreadable`, F-012); and ``self._forked`` -- the member
+        pids whose NOTE_FORK `serve` just observed -- each a `fork_coalesced` record with the
+        parent identity and the kernel event, whether or not this walk attributed children
+        to it (a coalesced notification never proves the set of children; F-010)."""
+        added = 0
+        listing_failed = False
+        forked, self._forked = self._forked, {}
+        for parent_pid, fflags in forked.items():
+            record = self._record_for_pid(parent_pid) or {}
+            identity = record.get("identity") or {"pid": parent_pid}
+            presence = _pid_presence(parent_pid)
+            self._discovery_unreadable(
+                DISCOVERY_FORK_COALESCED, f"parent:{parent_pid}", reason, [int(parent_pid)],
+                parent=identity,
+                evidence={"fflags": int(fflags), "note_fork": bool(fflags & select.KQ_NOTE_FORK),
+                          "note_exit": bool(fflags & select.KQ_NOTE_EXIT),
+                          "parent_exited": bool(record.get("exited")) or presence == "absent",
+                          "parent_presence": presence})
+        for _ in range(_MEMBER_DISCOVERY_PASSES):
+            found = 0
+            self.discovery["passes"] += 1
+            candidates, why = self._list_candidates()
+            if candidates is None:
+                kind = (DISCOVERY_LISTING_UNSTABLE if why == "listallpids_unstable"
+                        else DISCOVERY_LISTING_UNREADABLE)
+                self._discovery_unreadable(kind, why, reason)
+                listing_failed = True
+                break
+            known_pids = {k[0] for k in self.members}
+            unreadable: list[int] = []
+            parent_unreadable: list[int] = []
+            me = os.getpid()
+            for pid in candidates:
+                if pid == me:
+                    continue
+                info = _process_info(pid) or _process_info_fallback(pid)
+                if info is None:
+                    # gone between the listing and the read is ordinary (ESRCH / a zombie);
+                    # a pid the kernel still HOLDS whose identity no source will read is not
+                    if _pid_presence(pid) == "absent":
+                        continue
+                    info = _process_info(pid) or _process_info_fallback(pid)   # a reused pid reads now
+                    if info is None:
+                        if pid not in self._unreadable_seen:
+                            unreadable.append(int(pid))
+                        continue
+                ppid, start = info
+                current = [(k, r) for k, r in self._lifetimes(pid, start) if not r.get("exited")]
+                if current:
+                    if sys.platform == "linux" and self._pidfd_state(current[-1][0]) == "exited":
+                        # F-016: the recorded lifetime ended (its fixed object says so) and
+                        # a live process holds the same (pid, tick): a NEW lifetime -- fall
+                        # through and attribute it on its own parentage
+                        self._exited(pid, start, via="pidfd_exit")
+                    else:
+                        continue
+                ours_by_parent = ppid in known_pids or (sys.platform == "linux" and ppid == me)
+                if not start:
+                    # F-013: a readable ppid with NO start identity -- positively parented to
+                    # a member or to this subreaper, it is OURS and unrecordable by
+                    # incarnation: unknown, by pid, never omitted
+                    if ours_by_parent and pid not in self._unreadable_seen:
+                        unreadable.append(int(pid))
+                    continue
+                via = ""
+                if ppid in known_pids:
+                    parent = self._live_member_for(ppid)
+                    if parent == "unreadable":
+                        parent_unreadable.append(int(pid))
+                        continue
+                    if parent is not None:
+                        via = ("note_fork_ppid_scan" if sys.platform == "darwin" else "proc_ppid_walk") + f":{reason}"
+                if not via and sys.platform == "linux" and ppid == me:
+                    via = f"subreaper_reparent:{reason}"                       # P4
+                if via and self._lifetimes(pid, start) and _pid_presence(pid) == "absent":
+                    # a ZOMBIE (exited, not yet reaped -- e.g. the root itself before the
+                    # watcher's own waitpid) whose key is ALREADY a recorded lifetime IS that
+                    # lifetime: never a NEW one (found by the i8 non-root docker run).  A zombie
+                    # with no recorded lifetime is still attributed below -- it was positively
+                    # ours and its fixed object records P5 at once.
+                    continue
+                if via and self._add(pid, start, MEMBER_ROLE_DESCENDANT, via):
+                    found += 1
+            if unreadable:
+                self._unreadable_seen.update(unreadable)
+                self._discovery_unreadable(DISCOVERY_CANDIDATE_UNREADABLE,
+                                           "process_info_unreadable", reason, unreadable)
+            if parent_unreadable:
+                self._discovery_unreadable(DISCOVERY_PARENT_UNREADABLE,
+                                           "parent_member_unreadable", reason, parent_unreadable)
+            added += found
+            if not found:
+                break
+        else:
+            # every bounded pass attributed something: a deeper generation may still exist
+            self._discovery_unreadable(DISCOVERY_PASS_CEILING, f"passes:{_MEMBER_DISCOVERY_PASSES}", reason)
+        self._write_state()                          # the pass count is durable evidence too
+        return added
+
+    def serve(self) -> None:
+        """darwin: consume kqueue events -- NOTE_FORK triggers discovery, NOTE_EXIT marks the
+        member exited (its pid is now free to be reused; the ledger keeps its identity).
+        Linux: poll the held pidfds -- a readable one is P5 for that member (F-016)."""
+        if sys.platform == "linux":
+            for key in list(self._pidfds):
+                if self._pidfd_state(key) == "exited":
+                    self._exited(key[0], key[1], via="pidfd_exit")
+            return
+        if self._kq is None:
+            return
+        try:
+            events = self._kq.control(None, 64, 0)
+        except OSError as exc:
+            # the events (forks among them) that were pending are LOST evidence: said once
+            tag = f"{type(exc).__name__}:{getattr(exc, 'errno', '')}"
+            if tag not in self._once:
+                self._once.add(tag)
+                self._discovery_unreadable(DISCOVERY_EVENTS_UNREADABLE, tag, "serve")
+            return
+        forked: dict[int, int] = {}
+        exited: list[int] = []
+        for event in events:
+            if event.fflags & select.KQ_NOTE_FORK:
+                forked[int(event.ident)] = int(event.fflags)
+            if event.fflags & select.KQ_NOTE_EXIT:
+                exited.append(int(event.ident))
+        # F-010: the fork-triggered walk runs BEFORE the exits are marked; every observed
+        # fork is a `fork_coalesced` unknown whatever the walk attributes
+        if forked:
+            self._forked = forked
+            self.discover("note_fork")
+        for pid in exited:
+            self._exited(pid)
+
+    def note_reaped(self, pid: int) -> None:
+        """P5 for a Linux subreaper reap.  A reaped pid that no walk ever attributed is a
+        POSITIVE fact that an unaccounted descendant existed (and forked unobserved): named."""
+        if not any(k[0] == pid for k in self.members):
+            self._discovery_unreadable(DISCOVERY_REAPED_UNATTRIBUTED, "subreaper_reap", "reap", [int(pid)])
+            return
+        self._exited(pid)
+
+    def close(self) -> None:
+        """The watcher stops observing: one last walk (a descendant reparented / forked since
+        the previous one), then every member not observed exiting (P5) may still fork --
+        their later descendants are unobservable, a named UNKNOWN (`watch_ended`)."""
+        try:
+            self.discover("close")
+        except Exception:  # noqa: BLE001 - the ledger must still be closed
+            pass
+        alive = sorted({k[0] for k, r in self.members.items() if not r.get("exited")})
+        if alive:
+            self._discovery_unreadable(DISCOVERY_WATCH_ENDED, "members_alive_at_watcher_exit", "close", alive)
+        self._write_state()
+        for fd in self._pidfds.values():
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        self._pidfds.clear()
+        if self._kq is not None:
+            try:
+                self._kq.close()
+            except OSError:
+                pass
+            self._kq = None
+
+
+class _ParentWitness:
+    """[FORKED-SAFE] The watcher's incarnation-bound death witness for the SUPERVISOR (its
+    parent), registered at start -- darwin: kqueue ``NOTE_EXIT`` on the pinned pid; Linux:
+    ``pidfd_open``.  Guard EOF is relinquishment-or-death; only this witness (or a durable
+    relinquishment record) may authorise succession (DESIGN §2.5, probe_d11)."""
+
+    def __init__(self, identity: Mapping[str, Any]) -> None:
+        self.pid = int(identity.get("pid") or 0)
+        self.start_id = int(identity.get("start_id") or 0)
+        self.state = "unreadable"
+        self._kq: Any = None
+        self._pidfd = -1
+        if self.pid <= 0:
+            return
+        try:
+            observed = proc_start_ticks(self.pid)
+        except Exception:  # noqa: BLE001
+            observed = 0
+        if not self.start_id:
+            self.state = "unreadable"
+            return
+        if not observed:
+            # The pinned pid may already be GONE (the supervisor died between the fork and
+            # this registration): ESRCH is the kernel's positive answer that no process has
+            # the pid, so the pinned incarnation is dead -- witnessed.  Anything else is
+            # unreadable.
+            self.state = "final" if _pid_presence(self.pid) == "absent" else "unreadable"
+            return
+        if observed != self.start_id:
+            self.state = "inconsistent"
+            return
+        try:
+            if sys.platform == "darwin":
+                self._kq = select.kqueue()
+                self._kq.control([select.kevent(self.pid, filter=select.KQ_FILTER_PROC,
+                                                flags=select.KQ_EV_ADD,
+                                                fflags=select.KQ_NOTE_EXIT)], 0, 0)
+            elif hasattr(os, "pidfd_open"):
+                self._pidfd = os.pidfd_open(self.pid)
+            else:
+                return
+            self.state = "present"
+        except OSError as exc:
+            # ESRCH at registration: the kernel has no LIVE process for the pid whose start
+            # identity matched a moment ago -- the pinned incarnation is already dead (a
+            # zombie awaiting its parent, or reaped between the two reads): witnessed.
+            self.state = "final" if exc.errno == errno.ESRCH else "unreadable"
+
+    def covers(self, pid: int, start_id: int) -> bool:
+        """Whether this witness was registered on EXACTLY the incarnation ``(pid, start_id)``
+        (F-002: a witness is evidence about the process it was pinned to and no other)."""
+        return int(pid or 0) == self.pid and int(start_id or 0) == self.start_id and self.pid > 0
+
+    def fds(self) -> set[int]:
+        out: set[int] = set()
+        if self._kq is not None:
+            out.add(self._kq.fileno())
+        if self._pidfd >= 0:
+            out.add(self._pidfd)
+        return out
+
+    def fired(self, timeout: float = 0.0) -> str:
+        """``final`` once the pinned incarnation's exit was witnessed; else the current state."""
+        if self.state == "final":
+            return "final"
+        try:
+            if self._kq is not None:
+                if self._kq.control(None, 1, timeout):
+                    self.state = "final"
+            elif self._pidfd >= 0:
+                ready, _, _ = select.select([self._pidfd], [], [], timeout)
+                if ready:
+                    self.state = "final"
+        except OSError:
+            self.state = "unreadable"
+        return self.state
+
+
+class _ControlServer:
+    """[FORKED-SAFE] Serves ``SIG <signum> <fence>\\n`` requests on the control socket.  The
+    caller (the watcher's single loop) tells it whether the child is already reaped."""
+
+    def __init__(self, fd: int, *, agent_pid: int, fence: str) -> None:
+        self.fd = fd
+        self.agent_pid = agent_pid
+        self.fence = fence
+        self.reaped = False
+
+    def serve(self, *, reaped: bool) -> None:
+        if self.fd < 0:
+            return
+        try:
+            request = os.read(self.fd, 256)
+        except OSError:
+            return
+        if not request:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+            self.fd = -1
+            return
+        for line in request.split(b"\n"):
+            if not line.strip():
+                continue
+            parts = line.split()
+            reply = b"refused:malformed"
+            if len(parts) == 3 and parts[0] == b"SIG":
+                try:
+                    signum = int(parts[1])
+                except ValueError:
+                    signum = -1
+                if parts[2].decode("utf-8", "replace") != self.fence:
+                    reply = b"refused:signal_unbound"
+                elif reaped or self.reaped:
+                    reply = b"refused:signal_target_reaped"
+                elif signum <= 0:
+                    reply = b"refused:malformed"
+                else:
+                    try:
+                        os.kill(self.agent_pid, signum)       # bound: same thread, child not yet reaped
+                        reply = b"sent"
+                    except ProcessLookupError:
+                        reply = b"refused:esrch"
+                    except OSError as exc:
+                        reply = f"refused:errno_{exc.errno}".encode()
+            try:
+                os.write(self.fd, reply + b"\n")
+            except OSError:
+                pass
+
+
+_PR_SET_CHILD_SUBREAPER = 36
+_PR_GET_CHILD_SUBREAPER = 37
+
+
+def _set_subreaper() -> str:  # pragma: no cover - linux only
+    """Linux: ``prctl(PR_SET_CHILD_SUBREAPER)`` via ctypes so orphaned descendants reparent to
+    the watcher and are reaped with a positive exit status (DESIGN probe_d3).
+
+    REVIEW_IMPLEMENTATION_iteration7 F-014: the setup is VERIFIED -- the set call's return is
+    checked and ``PR_GET_CHILD_SUBREAPER`` must read back 1 -- and the RECEIPT is returned:
+    ``"subreaper"`` (positive) or the named failure ``"ownership_setup_unverified:<why>"``.
+    A platform name is never a receipt."""
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.prctl.restype = ctypes.c_int
+        if libc.prctl(_PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
+            return f"ownership_setup_unverified:set:{_errno_name_n(ctypes.get_errno())}"
+        flag = ctypes.c_int(-1)
+        if libc.prctl(_PR_GET_CHILD_SUBREAPER, ctypes.byref(flag), 0, 0, 0) != 0:
+            return f"ownership_setup_unverified:get:{_errno_name_n(ctypes.get_errno())}"
+        if flag.value != 1:
+            return f"ownership_setup_unverified:readback:{flag.value}"
+    except (OSError, AttributeError, ValueError) as exc:
+        return f"ownership_setup_unverified:{type(exc).__name__}"
+    return "subreaper"
+
+
+def _reap_reparented(agent_pid: int, members: "_Membership | None" = None) -> None:  # pragma: no cover - linux only
+    """Linux subreaper: collect any reparented descendant that exited -- NEVER the agent,
+    whose exit status is the pinned root's proof and must be collected by the watcher's own
+    `waitpid(agent_pid)` (a `waitpid(-1)` here could consume it and forge code 0).  The
+    candidate is PEEKED with ``WNOWAIT`` first and reaped only by its own pid."""
+    if not hasattr(os, "waitid"):
+        return
+    while True:
+        try:
+            info = os.waitid(os.P_ALL, 0, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        except ChildProcessError:
+            return
+        if info is None or int(info.si_pid) <= 0 or int(info.si_pid) == agent_pid:
+            return
+        try:
+            os.waitpid(int(info.si_pid), os.WNOHANG)
+        except ChildProcessError:
+            return
+        if members is not None:
+            members.note_reaped(int(info.si_pid))
+
+
+def _write_marker_bounded(slave_fd: int, marker: bytes, master_fd: int,
+                          appender: Any, attempts: int = 200) -> bool:
+    """[FORKED-SAFE] Write the marker into the owner-held slave fd WITHOUT blocking forever
+    (DESIGN O-3): the fd is set non-blocking for the write; on EAGAIN the watcher drains the
+    master it holds (so the FIFO can make room) and retries, bounded.  ``False`` = the marker
+    could not be written (a successor then reads `boundary_unproven` by name)."""
+    if not marker or slave_fd < 0:
+        return False
+    try:
+        flags = fcntl.fcntl(slave_fd, fcntl.F_GETFL)
+        fcntl.fcntl(slave_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+    except OSError:
+        flags = None
+    written = 0
+    ok = False
+    try:
+        for _ in range(attempts):
+            try:
+                written += os.write(slave_fd, marker[written:])
+            except BlockingIOError:
+                if appender is not None:
+                    _drain_once(master_fd, appender, budget=0.01)
+                else:
+                    time.sleep(0.005)
+                continue
+            except OSError:
+                break
+            if written >= len(marker):
+                ok = True
+                break
+    finally:
+        if flags is not None:
+            try:
+                fcntl.fcntl(slave_fd, fcntl.F_SETFL, flags)
+            except OSError:
+                pass
+    return ok
+
+
+def _defer_for_release(dh_r: int, guard_r: int, control_fd: int, ctl: "_ControlServer",
+                       slave_fd: int, fence_nonce: str, master_fd: int, *,
+                       budget_s: float, on_tick: Any = None) -> tuple[bool, bool]:  # pragma: no cover - runs in the forked watcher
+    """DESIGN §1.6 two-phase release, watcher side.  Blocks after the sentinel, keeping the
+    slave reference, serving: ``R`` (release-1: write the RELEASE marker, close NOTHING),
+    ``C`` (release-2: the supervisor consumed up to R -- close is done by the caller), control
+    requests (all refused `signal_target_reaped` now), and guard EOF (supervisor gone ->
+    returns ``True`` = orphan).  A generous ceiling covers a supervisor wedged holding both
+    ends; expiry returns ``False`` (the slave is then closed without a release record and a
+    successor names `diagnostic_tail_unaccounted`)."""
     ceiling = max(30.0, budget_s * 8.0)
     deadline = time.monotonic() + ceiling
-    fds = [fd for fd in (dh_r, guard_r) if fd >= 0]
+    fds = [fd for fd in (dh_r, guard_r, control_fd) if fd >= 0]
+    # REVIEW_IMPLEMENTATION F-003: the RELEASE marker is written AT MOST ONCE per nonce.  The
+    # flag travels back to the caller so an orphan finalize that follows a served release-1
+    # REUSES the marker already in the stream instead of emitting a duplicate (which would
+    # make the boundary `inconsistent`).
+    release_written = False
     while fds:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            return
+            return False, release_written
+        if on_tick is not None:
+            on_tick()                                 # membership bookkeeping while deferring
         try:
-            ready, _, _ = select.select(fds, [], [], min(1.0, remaining))
+            ready, _, _ = select.select(fds, [], [], min(0.25, remaining))
         except (OSError, ValueError):
-            return
-        if ready:
-            return  # released (drain done) or the supervisor died -- either way, exit
-
-
-def _finalize_orphaned_capture(master_fd: int, appender: Any, *, budget_s: float,
-                               finalized: bytes, fence: str, code: int | None,
-                               slave_name: str = "", clock: Any = time.monotonic,
-                               reader: Any = os.read,
-                               settle_s: float = 0.15) -> dict[str, Any]:
-    """The exit watcher's post-exit finalization (item 1, round 9).  Raw ``os`` calls;
-    in its own function so a real-pty test can drive it in-process.
-
-    The agent is ALREADY REAPED by the caller (``waitpid`` returned its exit status --
-    the strongest exit proof there is), so no further byte can ORIGINATE from the agent.
-    This drains what its output left in the pty and decides whether the capture is
-    COMPLETE:
-
-    * a clean EOF (``b""``) or ``errno.EIO`` is the pty HANGUP -- every slave descriptor
-      is closed -- and the capture is complete (Linux delivers this to the watcher; it
-      closes the flip-buffer lost-tail race the round-8 head existed to close);
-    * otherwise the drain runs until the master has been QUIET for ``settle_s`` after the
-      reap -- and THIS is the only sound "quiescence" gate, because it stands on the
-      REAPED exit (not on a final record + silence, which the review forbids): the writer
-      of record is provably gone.  It is ``proven`` only when NOTHING still holds the
-      slave (:func:`_slave_holders`: the agent's foreground process group is empty and no
-      ``/proc`` fd resolves to the slave).  A descendant that kept the slave open -- a
-      background dev server, an inherited MCP / language-server stdio -- keeps the group
-      non-empty (a normal fork inherits the agent's pgid) or shows in the ``/proc`` scan,
-      so the drain is ``unproven`` and the holder is NAMED.  **darwin caveat:** a
-      session-leader reader (this watcher) never sees the master EOF while it lives, and
-      darwin offers no subprocess-free fd enumeration, so a descendant that ALSO left the
-      agent's process group is not detectable here and the ``proven`` gate on darwin is
-      "reaped + quiesced + empty foreground group"; the conformance doc states this bound.
-
-    ``EINTR`` is retried; any other read / poll error is ``master_unreadable``.  Then, in
-    order: the appender's meta is saved (fsynced) and closed; the finalized record is
-    written -- ``proven`` or ``unproven`` per the above, bound to the capture's final
-    ``total_bytes`` / ``sha256`` and to the sentinel identity the caller writes NEXT.  The
-    caller writes the exit sentinel AFTER this returns, never before.
-    """
-    deadline = clock() + budget_s
-    ended, errno_name, read = "budget", "", 0
-    last_data = clock()
-    while True:
-        now = clock()
-        if now >= deadline:
-            ended = "budget"
-            break
-        try:
-            ready, _, _ = select.select([master_fd], [], [], min(0.05, deadline - now))
-        except InterruptedError:
+            return False, release_written
+        if control_fd >= 0 and control_fd in ready:
+            ctl.serve(reaped=True)
+            if ctl.fd < 0:
+                fds = [fd for fd in fds if fd != control_fd]
             continue
-        except (OSError, ValueError) as exc:
-            ended, errno_name = "master_unreadable", _errno_name(exc)
+        if dh_r in ready:
+            try:
+                byte = os.read(dh_r, 1)
+            except OSError:
+                byte = b""
+            if byte == b"R":
+                if not release_written:
+                    _write_marker_bounded(slave_fd, capture_mod.release_marker_bytes(fence_nonce)
+                                          if fence_nonce else b"", master_fd, None)
+                    release_written = True
+                continue
+            if byte == b"C":
+                return False, release_written         # release-2: the caller closes the slave
+            if byte == b"":
+                # the supervisor's write end closed (its `release`): relinquishment-or-death;
+                # the guard decides below
+                fds = [fd for fd in fds if fd != dh_r]
+                continue
+            continue                                  # legacy "1" byte: keep waiting for C/guard
+        if guard_r in ready:
+            return True, release_written
+    return False, release_written
+
+
+def _orphan_finalize(master_fd: int, slave_fd: int, appender: Any, *, capture: bytes,
+                     fence: str, fence_nonce: str, code: int, marker_written: bool,
+                     sentinel: str | os.PathLike[str] | None, witness: "_ParentWitness",
+                     budget_s: float, host_boot_id: str, agent_pid: int, agent_start_id: int,
+                     clock: Any = time.monotonic, reader: Any = os.read,
+                     release_written: bool = False, sidecar_path: str = "") -> dict[str, Any]:
+    """[FORKED-SAFE] The exit watcher's ORPHAN finalize (DESIGN §1.6 orphan path).  The agent
+    is reaped and the marker written; the supervisor is gone (guard EOF).  In order:
+    1. drain the master into the capture until the FENCE MARKER is in the capture FILE (bounded);
+    2. FENCE FIRST: a published fence makes this watcher a CUSTODIAN (no claim, verify only);
+    3. else decide succession by `may_claim_generation` -- a durable relinquishment record or the
+       incarnation-bound parent-death witness authorises a claim of exactly predecessor+1;
+    4. publish the fence (link-exclusive);
+    5. release: RELEASE marker -> drain to R -> release record -> close the slave -> drain to EOF.
+    Never raises past the caller; every non-success leaves a NAMED state for a successor."""
+    out: dict[str, Any] = {"role": "", "outcome": None}
+    incarnation = fence.partition(":")[2]
+    directory = os.path.dirname(capture) or b"."
+    deadline = clock() + max(budget_s, 0.5)
+    marker_len = 0
+    offset_n = -1
+    while clock() < deadline:
+        if appender is not None:
+            _drain_once(master_fd, appender, budget=0.05)
+        try:
+            data = _read_file(capture)
+        except OSError:
+            data = b""
+        offset_n, marker_len, state = capture_mod.marker_span(data, fence_nonce) if fence_nonce else (-1, 0, "unknown")
+        if state == capture_mod.EVIDENCE_FINAL:
+            break
+        if state == capture_mod.EVIDENCE_INCONSISTENT:
+            offset_n = -1
+            break
+        if not marker_written and appender is None:
+            break
+    if appender is not None:
+        try:
+            appender.save_meta()
+        except Exception:  # noqa: BLE001
+            pass
+    if offset_n < 0:
+        out["outcome"] = capture_mod.OUTCOME_BOUNDARY_UNPROVEN
+        return out
+    fence_path = capture_mod.capture_fence_path(capture, incarnation)
+    existing = capture_mod.read_capture_fence(fence_path, fence=fence)
+    owner_identity = identity.process_identity(pid=os.getpid(), start_id=proc_start_ticks(os.getpid()),
+                                               boot_id=host_boot_id, incarnation=fence,
+                                               source=evidence_source_id())
+    emitter_identity = identity.process_identity(pid=agent_pid, start_id=agent_start_id,
+                                                 boot_id=host_boot_id, incarnation=fence,
+                                                 source=evidence_source_id())
+    generation = None
+    if existing["outcome"] == capture_mod.EVIDENCE_FINAL:
+        out["role"] = "custodian"
+    elif not (identity.identity_complete(owner_identity) and identity.identity_complete(emitter_identity)):
+        # REVIEW_IMPLEMENTATION F-005: no claim, no publication with an unreadable identity.
+        out["role"] = "custodian_no_claim"
+        out["outcome"] = identity.IDENTITY_UNREADABLE
+    else:
+        highest, highest_rec, gstate = capture_mod.read_generations(directory, incarnation)
+        relinquish = capture_mod.read_relinquish(directory, incarnation, highest)["outcome"] == "present" if highest else False
+        # DESIGN §2.5 rule 2 / cut C4: guard EOF ALONE never authorises a claim -- not even
+        # g1.  The pinned supervisor's death must be WITNESSED (kqueue NOTE_EXIT / pidfd on the
+        # incarnation pinned at spawn) or durably relinquished; the fds close a moment before
+        # the exit is notified, so the witness is given a short bounded wait, never assumed.
+        witness_state = witness.fired(1.0 if witness.state == "present" else 0.0)
+        out["highest_generation"] = highest
+        alive: bool | None = None
+        death_evidence = "note_exit_pinned" if sys.platform == "darwin" else "pidfd_readable"
+        if highest and highest_rec:
+            # REVIEW_IMPLEMENTATION F-002: the parent-death witness was registered on the
+            # SUPERVISOR incarnation pinned at spawn.  It is evidence about that process only.
+            # If the highest generation is owned by a DIFFERENT incarnation (a successor that
+            # claimed over the dead supervisor), the witness does not cover it: obtain exact,
+            # per-pid evidence for THAT owner (`read_identity`: absent = positively gone,
+            # final+equal start = positively alive, unreadable = no claim) -- never reuse g1's
+            # death for g2.
+            owner = highest_rec.get("owner") or {}
+            pinned_pid, pinned_start = int(owner.get("pid") or 0), int(owner.get("start_id") or 0)
+            if witness.covers(pinned_pid, pinned_start):
+                alive = witness_state != "final" and _pid_presence(pinned_pid) != "absent"
+                if alive:
+                    witness_state = "present" if witness_state == "present" else witness_state
+            else:
+                observed = read_identity(pinned_pid) if pinned_pid > 0 else {"start_state": "unreadable", "start_id": 0}
+                if observed["start_state"] == "absent":
+                    alive, witness_state, death_evidence = False, "final", "esrch_or_zombie_pinned_pid"
+                elif observed["start_state"] != capture_mod.EVIDENCE_FINAL or not pinned_start:
+                    alive, witness_state = None, capture_mod.EVIDENCE_UNREADABLE
+                elif int(observed["start_id"]) == pinned_start:
+                    alive, witness_state = True, capture_mod.EVIDENCE_UNKNOWN
+                else:
+                    alive, witness_state, death_evidence = False, "final", "start_identity_mismatch_pinned_pid"
+        elif highest == 0 and witness_state == "final":
+            # No generation at all: the supervisor that could have claimed g1 is the pinned
+            # parent and its death is what the witness attests.
+            pass
+        out["witness"] = witness_state
+        out["highest_owner_alive"] = alive
+        action, outcome = capture_mod.may_claim_generation(
+            fence_published=False, highest_owner_alive=alive if highest else None,
+            relinquish_record=relinquish, death_witness=witness_state)
+        if action != "claim":
+            # No claim -- but this watcher still HOLDS the only slave reference, so the
+            # release protocol below is its obligation regardless (RC1 shape): whoever
+            # publishes the fence needs the RELEASE marker in the stream to bound the tail.
+            out["outcome"] = outcome or capture_mod.OUTCOME_SUCCESSION_UNWITNESSED
+            out["role"] = "custodian_no_claim"
+            generation = None
+        predecessor = (highest_rec or {}).get("owner") if highest else None
+        evidence = {"predecessor_generation": highest, "predecessor": predecessor or {},
+                    "relinquish_record": relinquish, "death_witness": witness_state,
+                    "highest_owner_alive": alive}
+        generation = None if action != "claim" else capture_mod.make_owner_generation(
+            fence=fence, generation=highest + 1, owner_role=capture_mod.OWNER_EXIT_WATCHER,
+            owner=owner_identity, claim_reason="orphan_guard_eof",
+            superseded=predecessor,
+            death_evidence=("relinquish_record" if relinquish else death_evidence),
+            claimed_at=_now_iso())
+        refused = (capture_mod.claim_generation(directory, incarnation, generation, evidence)
+                   if generation is not None else out["outcome"])
+        if refused is not None:
+            out["outcome"] = refused
+            out["role"] = out["role"] or "custodian_no_claim"
+            generation = None
+        data = _read_file(capture)
+        snapshot = capture_mod.read_sidecar_snapshot(capture, incarnation, fence=fence)
+        sidecar_field = (None if not sidecar_path else
+                         {k: snapshot["record"].get(k) for k in ("state", "path", "sha256", "bytes", "instant", "error")}
+                         if snapshot["record"] is not None else {"state": capture_mod.SIDECAR_STATE_UNPROVEN})
+        record = None if generation is None else capture_mod.make_capture_fence(
+            fence=fence,
+            emitter=emitter_identity,
+            emitter_pgid=agent_pid, offset_n=offset_n, marker_len=marker_len,
+            marker_nonce=fence_nonce, sha256_prefix=capture_mod.prefix_digest(data, offset_n),
+            tail_bytes_at_publish=max(0, len(data) - offset_n - marker_len),
+            exit_how="exit_sentinel" if sentinel is not None else "waitpid_by_parent",
+            exit_code=code, reaped_by=owner_identity, owner=generation,
+            evidence_source=evidence_source_id(),
+            provenance=[capture_mod_PROVENANCE_REAPED, capture_mod_PROVENANCE_MARKER_WRITTEN,
+                        capture_mod_PROVENANCE_MARKER_OBSERVED, capture_mod_PROVENANCE_OWNER_CLAIMED,
+                        capture_mod_PROVENANCE_SENTINEL],
+            published_at=_now_iso(), sidecar=sidecar_field)
+        if record is None:
+            pass                                       # no claim: release only, publish nothing
+        elif not capture_mod.write_capture_fence(fence_path, record):
+            out["role"] = "custodian"                  # lost the link race: verify, never overwrite
+        else:
+            out["role"] = "finalizer"
+    # ---- release: RELEASE marker -> drain to R -> release record -> close -> drain to EOF ---
+    # F-003: a RELEASE marker already written for a served release-1 (the supervisor died
+    # between release-1 and its record) is REUSED -- the boundary R is whatever the stream
+    # already holds; a second marker with the same nonce would make it `inconsistent`.
+    if not release_written:
+        _write_marker_bounded(slave_fd, capture_mod.release_marker_bytes(fence_nonce), master_fd, appender)
+    out["release_marker_reused"] = bool(release_written)
+    r_deadline = clock() + max(budget_s, 0.5)
+    offset_r, r_state = -1, capture_mod.EVIDENCE_UNKNOWN
+    while clock() < r_deadline:
+        if appender is not None:
+            _drain_once(master_fd, appender, budget=0.05)
+        data = _read_file(capture)
+        offset_r, r_len, r_state = capture_mod.find_release_marker(data, fence_nonce, after=offset_n)
+        if r_state != capture_mod.EVIDENCE_UNKNOWN:
+            break
+    if appender is not None:
+        try:
+            appender.save_meta()
+        except Exception:  # noqa: BLE001
+            pass
+    out["release_state"] = r_state if offset_r >= 0 or r_state == capture_mod.EVIDENCE_INCONSISTENT else capture_mod.EVIDENCE_UNKNOWN
+    if offset_r < 0:
+        out["release_outcome"] = (capture_mod.OUTCOME_DIAGNOSTIC_TAIL_UNACCOUNTED
+                                  if r_state == capture_mod.EVIDENCE_INCONSISTENT
+                                  else capture_mod.OUTCOME_RELEASE_RECORD_MISSING)
+    if offset_r >= 0 and capture_mod.read_capture_fence(fence_path, fence=fence)["outcome"] == capture_mod.EVIDENCE_FINAL:
+        data = _read_file(capture)
+        tail = data[offset_n + marker_len:offset_r]
+        out["release_outcome"] = None
+        capture_mod.write_release_record(
+            capture_mod.release_record_path(capture, incarnation),
+            capture_mod.make_release_record(
+                fence=fence, fence_file_sha256=capture_mod.file_digest(fence_path),
+                release_nonce=fence_nonce, offset_r=offset_r, retained_tail_bytes=len(tail),
+                retained_tail_sha256=capture_mod.prefix_digest(tail, len(tail)),
+                custodian=owner_identity, custodian_role=capture_mod.OWNER_EXIT_WATCHER,
+                state=capture_mod.EVIDENCE_FINAL, published_at=_now_iso()))
+    try:
+        os.close(slave_fd)
+    except OSError:
+        pass
+    # Closing the owner-held reference releases only THIS holder's slave: a descendant that
+    # still holds an inherited slave can keep writing (post-release bytes -- darwin may
+    # discard them on its last close, residual O-8, named), so what the master still holds
+    # is read out, bounded, and everything here is DIAGNOSTIC -- nothing after N is proof.
+    eof_deadline = clock() + 0.25
+    while clock() < eof_deadline:
+        try:
+            ready, _, _ = select.select([master_fd], [], [], 0.05)
+        except (OSError, ValueError):
             break
         if not ready:
-            if clock() - last_data >= settle_s:
-                # Quiet for the settle window since the last byte, and the agent is
-                # reaped: no more bytes can ORIGINATE.  Whether that is FINAL is the
-                # holder probe below, not silence alone.
-                ended = "quiesced"
-                break
             continue
         try:
             chunk = reader(master_fd, 65_536)
-        except InterruptedError:
-            continue
-        except OSError as exc:
-            if exc.errno == errno.EIO:
-                ended, errno_name = "hangup", "EIO"
-            else:
-                ended, errno_name = "master_unreadable", _errno_name(exc)
+        except OSError:
             break
         if not chunk:
-            ended = "hangup"
             break
-        read += len(chunk)
-        last_data = clock()
         if appender is not None:
             try:
                 appender.append(chunk)
-            except Exception:  # noqa: BLE001 - bookkeeping never stops the drain
+            except Exception:  # noqa: BLE001
                 pass
-    total, digest, records = 0, "", 0
     if appender is not None:
-        appender.save_meta()
-        appender.close()
-        total, records = int(appender.total), int(appender.records)
-        digest = appender.digest.hexdigest()
-    holders = None
-    if ended == "hangup" and appender is not None:
-        finality, detail = capture_mod.FINALITY_PROVEN, ""
-    elif ended == "quiesced" and appender is not None:
-        # Iteration 4 (option B): silence after the reap is `proven` ONLY on a COMPLETE
-        # positive absence proof from the SAME fail-closed libproc slave-descriptor authority
-        # the supervisor uses (`slave_device_holders`) -- run here by the watcher before it
-        # writes any `proven` record.  A `present` holder (on the tty or setsid'd off it) OR
-        # an `unreadable` authority (any inaccessible pid: a denied `proc_pidinfo`, a growth
-        # failure, the listing itself -- NEVER a silent skip) is `unproven` with the cause
-        # NAMED.  If the authority cannot run at all in this forked context it raises and the
-        # `except` below records `unproven` -- never `quiesced`-as-proven.
         try:
-            holders = slave_device_holders(slave_name, exclude_pids=(os.getpid(),))
-        except Exception as exc:  # noqa: BLE001 - a watcher never dies of bookkeeping
-            holders = {"method": "libproc", "state": "unreadable",
-                       "unenumerable": [{"pid": 0, "errno": repr(exc), "where": "forked"}]}
-        state = str(holders.get("state") or "unreadable")
-        if state == "proven_absent":
-            finality, holders = capture_mod.FINALITY_PROVEN, None
-            detail = ""
-        elif state == "present":
-            finality = capture_mod.FINALITY_UNPROVEN
-            detail = ("the agent is reaped and its output quiesced, but a process still holds "
-                      f"the pty slave open (pids {holders.get('holders')}); "
-                      "the capture may yet grow")
-        else:  # unreadable -- fail closed, name what could not be enumerated
-            finality = capture_mod.FINALITY_UNPROVEN
-            detail = ("the agent is reaped and its output quiesced, but the complete "
-                      "slave-descriptor authority could not be run to completion "
-                      f"({holders.get('unenumerable')}); a positive absence is not proven")
-    else:
-        finality = capture_mod.FINALITY_UNPROVEN
-        try:
-            holders = slave_device_holders(slave_name, exclude_pids=(os.getpid(),))
+            appender.save_meta()
+            appender.close()
         except Exception:  # noqa: BLE001
-            holders = {"method": "libproc", "state": "unreadable"}
-        detail = ("no bounded appender could be built for the capture; nothing vouches "
-                  "for the bytes" if appender is None else
-                  "the pty output did not quiesce within the post-exit drain bound; a "
-                  "descendant may still hold the slave" if ended == "budget" else
-                  f"the master could not be read ({errno_name})")
-    capture_mod.write_capture_finalized(
-        finalized, fence=fence, finality=finality, writer=capture_mod.WRITER_EXIT_WATCHER,
-        ended=ended, errno_name=errno_name, total_bytes=total, sha256=digest,
-        records=records, exit_how="exit_sentinel", exit_code=code, holders=holders,
-        detail=detail)
-    return {"ended": ended, "errno": errno_name, "bytes": read, "finality": finality,
-            "total_bytes": total, "sha256": digest}
+            pass
+    _write_orphan_note(capture, incarnation, out)
+    return out
+
+
+def orphan_note_path(capture: str | os.PathLike[str] | bytes, incarnation: str) -> bytes:
+    """``<capture>.orphan.<inc>.json``: the orphan watcher's NAMED outcome (DESIGN §2.6: every
+    non-success leaves a named state for a successor).  Diagnostic; never a proof."""
+    target = os.fsencode(os.fspath(capture)) if not isinstance(capture, bytes) else capture
+    return target + b".orphan." + incarnation.encode() + b".json"
+
+
+def _write_orphan_note(capture: bytes, incarnation: str, note: Mapping[str, Any]) -> None:
+    """[FORKED-SAFE] Best-effort durable note of the orphan finalize's outcome."""
+    path = orphan_note_path(capture, incarnation)
+    tmp = path + b".tmp"
+    try:
+        payload = json.dumps(dict(note), sort_keys=True).encode()
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        try:
+            os.write(fd, payload)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.rename(tmp, path)
+    except (OSError, TypeError, ValueError):
+        pass
+
+
+def _read_file(path: bytes) -> bytes:
+    """[FORKED-SAFE] Whole-file read with raw ``os`` (the capture is bounded by its limits)."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        out = b""
+        while True:
+            chunk = os.read(fd, 1 << 20)
+            if not chunk:
+                return out
+            out += chunk
+    finally:
+        os.close(fd)
+
+
+#: DESIGN §1.5 provenance facts (mirrored from the design stub).
+capture_mod_PROVENANCE_REAPED = "emitter_reaped_by_parent_waitpid"
+capture_mod_PROVENANCE_MARKER_WRITTEN = "marker_written_by_owner_into_owner_held_slave_after_reap"
+capture_mod_PROVENANCE_MARKER_OBSERVED = "marker_observed_in_capture_at_offset_n"
+capture_mod_PROVENANCE_OWNER_CLAIMED = "owner_record_claimed_exclusive_link"
+capture_mod_PROVENANCE_SENTINEL = "exit_sentinel_present_same_fence"
+
+
+def evidence_source_id() -> str:
+    return (identity.EVIDENCE_SOURCE_DARWIN if sys.platform == "darwin"
+            else identity.EVIDENCE_SOURCE_LINUX)
+
+
+_HOST_BOOT_ID: str | None = None
+
+
+def host_boot_id() -> str:
+    """The host boot identity, read once per process (parent-only: darwin uses a subprocess)."""
+    global _HOST_BOOT_ID
+    if _HOST_BOOT_ID is None:
+        _HOST_BOOT_ID = boot_id()
+    return _HOST_BOOT_ID
+
+
+def read_identity(pid: int) -> dict[str, Any]:
+    """The platform evidence source's identity read for ``pid`` AT DECISION TIME (DESIGN §2.1):
+    ``{"start_id", "start_state", "boot_id"}``.  ``start_state`` is ``final`` when the kernel
+    answered, ``unreadable`` otherwise; the boot id is the host's."""
+    try:
+        start = proc_start_ticks(int(pid)) if int(pid) > 0 else 0
+    except Exception:  # noqa: BLE001
+        start = 0
+    if start:
+        state = capture_mod.EVIDENCE_FINAL
+    else:
+        state = _pid_presence(int(pid))
+    return {"start_id": int(start or 0), "start_state": state, "boot_id": host_boot_id()}
+
+
+def _pid_presence(pid: int) -> str:
+    """``absent`` when the kernel POSITIVELY answers that no process has ``pid`` right now
+    (``kill(pid, 0)`` -> ESRCH -- pids are unique among live processes, so the pinned
+    incarnation cannot be alive); ``unreadable`` for every other answer (EPERM: a process
+    exists but is not ours; any other error).  Never inferred from a table scan."""
+    if pid <= 0:
+        return capture_mod.EVIDENCE_UNREADABLE
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return "absent"
+    except OSError:
+        return capture_mod.EVIDENCE_UNREADABLE
+    # A pid the kernel still holds but whose identity is unreadable is a ZOMBIE candidate.
+    # darwin: `kevent(EVFILT_PROC)` answers ESRCH for a zombie (no LIVE process has the pid --
+    # measured in this run's evidence); a zombie has exited, so the pinned incarnation is not
+    # alive.  Linux: `/proc/<pid>/stat` state `Z`.  Anything else stays unreadable.
+    if sys.platform == "darwin":
+        try:
+            kq = select.kqueue()
+            try:
+                kq.control([select.kevent(pid, filter=select.KQ_FILTER_PROC,
+                                          flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+                                          fflags=select.KQ_NOTE_EXIT)], 0, 0)
+            finally:
+                kq.close()
+        except OSError as exc:
+            if exc.errno == errno.ESRCH:
+                return "absent"
+        return capture_mod.EVIDENCE_UNREADABLE
+    try:
+        state = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()[0]
+    except (OSError, IndexError):
+        return capture_mod.EVIDENCE_UNREADABLE
+    return "absent" if state == "Z" else capture_mod.EVIDENCE_UNREADABLE
+
+
+def request_watcher_signal(control_fd: int, sig: int, fence: str, *,
+                           timeout_s: float = 5.0) -> str:
+    """Ask the exit watcher (the agent's parent) to deliver ``sig`` (DESIGN §2.3).  Returns
+    ``"sent"`` or a named refusal (``refused:signal_target_reaped`` / ``refused:signal_unbound``
+    / ``refused:esrch`` / ``refused:no_watcher``)."""
+    if not isinstance(control_fd, int) or control_fd < 0:
+        return "refused:no_watcher"
+    try:
+        os.write(control_fd, f"SIG {int(sig)} {fence}\n".encode())
+    except OSError:
+        return "refused:no_watcher"
+    deadline = time.monotonic() + timeout_s
+    buf = b""
+    while time.monotonic() < deadline and b"\n" not in buf:
+        try:
+            ready, _, _ = select.select([control_fd], [], [], 0.05)
+        except (OSError, ValueError):
+            return "refused:no_watcher"
+        if not ready:
+            continue
+        try:
+            chunk = os.read(control_fd, 256)
+        except OSError:
+            return "refused:no_watcher"
+        if not chunk:
+            return "refused:no_watcher"
+        buf += chunk
+    return buf.split(b"\n", 1)[0].decode("utf-8", "replace") or "refused:no_watcher"
 
 
 #: Iteration 4/5 (option B).  darwin ``libproc`` constants for the COMPLETE slave-descriptor
@@ -1185,11 +2510,19 @@ _BSDINFO_SIZE = 256
 _BSD_PPID_OFF, _BSD_UID_OFF, _BSD_RUID_OFF = 16, 20, 28
 _VNODE_STAT_OFF, _VNODE_DEV_OFF, _VNODE_INO_OFF = 24, 0, 8
 #: Bounds for the fail-closed enumeration (reviewer iter5 F1/F3).
-_PIDLIST_MAX_ATTEMPTS = 6                 # re-query proc_listallpids until the count is stable
+_PIDLIST_MAX_ATTEMPTS = 12                # re-query proc_listallpids until the three enumerations agree
+_PIDLIST_RETRY_SLEEP_S = 0.001            # let ordinary process churn settle between attempts (i5 flake: 6 back-to-back ~0.5 ms attempts all disagreed under host churn)
 _PIDLIST_SLACK = 4096                     # spare entry capacity; a full buffer means truncation
 _FD_SCAN_MAX_ATTEMPTS = 8                 # per-process: retries toward two identical clean scans
 _FD_SCAN_RETRY_SLEEP_S = 0.001           # let ordinary fd-table churn settle between retries
 _SHORT_READ_ERRNO = "short_read"         # sentinel: a positive but wrong-length libproc return
+_PARTIAL_FILL_ERRNO = "partial_fill"     # sentinel: a whole-entry PREFIX shorter than the count (F-004)
+_KINFO_PROC_SIZE = 648                   # sizeof(struct kinfo_proc), macOS 64-bit
+_KINFO_PROC_PID_OFF = 40                 # kp_proc.p_pid (verified: own pid / parent / pid 1 all found there)
+_KINFO_PROC_START_SEC_OFF = 0            # kp_proc.p_starttime.tv_sec  (int64; == PROC_PIDTBSDINFO pbi_start_tvsec)
+_KINFO_PROC_START_USEC_OFF = 8           # kp_proc.p_starttime.tv_usec (int32; == pbi_start_tvusec)
+_KINFO_PROC_PPID_OFF = 560               # kp_eproc.e_ppid (verified: own parent found there, 0 mismatches over the table)
+_FD_WALK_CEILING = 2048                  # fd-table indices the F-004 cross-check will walk per process
 
 try:
     _LIBPROC = ctypes.CDLL("/usr/lib/libSystem.dylib", use_errno=True)
@@ -1272,6 +2605,7 @@ def _libproc_list_all_pids() -> "tuple[list[int] | None, str | None]":
     bounded).  ``(pids, None)`` or ``(None, reason)`` when it never stabilises."""
     reason = "listallpids_unstable"
     for _ in range(_PIDLIST_MAX_ATTEMPTS):
+        before = _sysctl_all_pids()                        # the independent walk, BEFORE the fill
         n = _LIBPROC.proc_listallpids(None, 0)             # entries needed
         if n <= 0:
             return None, f"listallpids_count:{_errno_name_n(ctypes.get_errno())}"
@@ -1282,9 +2616,65 @@ def _libproc_list_all_pids() -> "tuple[list[int] | None, str | None]":
             return None, f"listallpids_fill:{_errno_name_n(ctypes.get_errno())}"
         if got >= cap:                                     # buffer full -> truncated / still growing
             reason = "listallpids_truncated"
+            time.sleep(_PIDLIST_RETRY_SLEEP_S)
             continue
-        return [buf[i] for i in range(int(got)) if buf[i] > 0], None
+        pids = [buf[i] for i in range(int(got)) if buf[i] > 0]
+        # REVIEW_IMPLEMENTATION_iteration2 F-004: a POSITIVE fill is never trusted on its own
+        # -- the count query is the table CAPACITY plus kernel slack, so no deficit rule can
+        # tell a missed entry from churn.  Completeness is a CROSS-CHECK against an INDEPENDENT
+        # kernel enumeration (`sysctl kern.proc.all`): every pid the sysctl walk reports that
+        # the libproc fill omitted is a missed entry -> `listallpids_partial`; a walk that cannot
+        # be read is `listallpids_crosscheck_unreadable`; disagreement that never settles under
+        # churn is `listallpids_unstable`.  The scanner's own pid is an additional anchor only.
+        after = _sysctl_all_pids()
+        if before is None or after is None:
+            return None, "listallpids_crosscheck_unreadable"
+        filled = set(pids)
+        # REVIEW_IMPLEMENTATION_iteration3 F-004: completeness is claimed ONLY when the three
+        # enumerations AGREE EXACTLY (independent walk before == libproc fill == independent
+        # walk after).  A pid in both walks and absent from the fill is a MISSED entry
+        # (`listallpids_partial`); any other disagreement -- a process born or exited between
+        # the reads, which is indistinguishable from a partial fill from user space -- is
+        # changing evidence: retried, and named `listallpids_unstable` if it never settles.
+        # An intersection is never treated as completeness.
+        if (before & after) - filled or os.getpid() not in filled:
+            return None, "listallpids_partial"
+        if before == filled == after:
+            return pids, None
+        reason = "listallpids_unstable"
+        time.sleep(_PIDLIST_RETRY_SLEEP_S)
     return None, reason
+
+
+def _sysctl_all_pids() -> "set[int] | None":
+    """[darwin] The pids of `sysctl kern.proc.all` -- the kernel's OTHER enumeration of the
+    process table (a `kinfo_proc` array, pid at byte 40 -- verified against the calling
+    process, its parent and pid 1).  ``None`` when the walk cannot be read."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        mib = (ctypes.c_int * 3)(1, 14, 0)                       # CTL_KERN, KERN_PROC, KERN_PROC_ALL
+        for _ in range(4):
+            size = ctypes.c_size_t(0)
+            if libc.sysctl(mib, 3, None, ctypes.byref(size), None, 0) != 0 or size.value <= 0:
+                return None
+            cap = size.value + _KINFO_PROC_SIZE * 64
+            buf = ctypes.create_string_buffer(cap)
+            got = ctypes.c_size_t(cap)
+            if libc.sysctl(mib, 3, buf, ctypes.byref(got), None, 0) != 0:
+                return None
+            if got.value >= cap or got.value % _KINFO_PROC_SIZE != 0:
+                continue                                          # grew past the buffer: retry
+            raw = buf.raw[:got.value]
+            pids = {struct.unpack_from("<i", raw, i * _KINFO_PROC_SIZE + _KINFO_PROC_PID_OFF)[0]
+                    for i in range(got.value // _KINFO_PROC_SIZE)}
+            pids.discard(0)
+            if os.getpid() in pids:
+                return pids
+        return None
+    except (OSError, ValueError, AttributeError):
+        return None
 
 
 def _libproc_list_vnode_fds(pid: int) -> "tuple[list[int] | None, object]":
@@ -1314,6 +2704,45 @@ def _libproc_list_vnode_fds(pid: int) -> "tuple[list[int] | None, object]":
     return fds, 0
 
 
+def _fd_walk_omissions(pid: int, listed: "list[int]") -> "list[int] | None":
+    """[F-004 cross-check] The vnode fds answered by a per-index walk of ``pid``'s fd table that
+    the listing ``listed`` omitted; ``None`` when the table is too large to walk within the
+    bound (then the scan is `unreadable`, never assumed complete).  Uses a complete BSDINFO
+    read for the table size; an unreadable size is treated as the ceiling."""
+    info_size = _darwin_bsdinfo_nfiles(pid)
+    if info_size is None:
+        return None                                   # F-004 (i2): unreadable size = unreadable walk
+    if info_size > _FD_WALK_CEILING:
+        return None
+    known = set(listed)
+    omitted: list[int] = []
+    for fd in range(int(info_size)):
+        if fd in known:
+            continue
+        devino, err = _libproc_fd_devino(pid, fd)
+        if devino is not None or err == _SHORT_READ_ERRNO:
+            omitted.append(fd)
+    return omitted
+
+
+def _darwin_bsdinfo_nfiles(pid: int) -> "int | None":
+    """[FORKED-SAFE] ``pbi_nfiles`` (the fd TABLE size, byte 96 of an exact-136 BSDINFO)."""
+    lib = _libproc_handle()
+    if lib is None or not hasattr(lib, "proc_pidinfo"):
+        return None
+    try:
+        lib.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+                                     ctypes.c_void_p, ctypes.c_int]
+        lib.proc_pidinfo.restype = ctypes.c_int
+        buffer = ctypes.create_string_buffer(_PROC_PIDTBSDINFO_SIZE)
+        written = lib.proc_pidinfo(int(pid), _PROC_PIDTBSDINFO, 0, buffer, _PROC_PIDTBSDINFO_SIZE)
+    except (OSError, ValueError, AttributeError):
+        return None
+    if written != _PROC_PIDTBSDINFO_SIZE:
+        return None
+    return int(struct.unpack_from("<I", buffer.raw, 96)[0])
+
+
 def _scan_process_for_slave(pid: int, ref: "tuple[int, int]",
                             exclude: "set[int]") -> "tuple[str, object]":
     """Inspect ONE process for the slave with a fail-closed, race-resistant protocol
@@ -1337,17 +2766,38 @@ def _scan_process_for_slave(pid: int, ref: "tuple[int, int]",
             if _errno_is_gone(err):
                 return "gone", None
             if err in (errno.EPERM, errno.EACCES):
-                return "denied", None
+                # OS-48 (I-2): a DENIED listing is unreadable evidence, never "not our uid".
+                return "unstable", "listing_denied"
+            if err in (_SHORT_READ_ERRNO, _PARTIAL_FILL_ERRNO):
+                # F-004: a positive partial / malformed listing is NAMED, never retried into
+                # a clean scan (a retry that happened to agree would still omit the fd).
+                return "unstable", f"listing_{err}"
             prev = None                                    # transient listing failure -> retry
             time.sleep(_FD_SCAN_RETRY_SLEEP_S)
             continue
+        # REVIEW_IMPLEMENTATION F-004: the listing is a SINGLE positive read whose fill length
+        # cannot be validated by the count query (that query returns the fd-table CAPACITY plus
+        # slack, measured 45 entries for 4 open fds).  A whole-entry prefix that omits a live
+        # vnode fd is therefore caught by an INDEPENDENT read: walk every fd index of the table
+        # (`pbi_nfiles`, bounded) with `PROC_PIDFDVNODEPATHINFO`; a vnode fd the walk answers
+        # that the listing did not name means the listing was partial -> named, never clean.
+        omitted = _fd_walk_omissions(pid, fds)
+        if omitted is None:
+            # the independent walk could not be taken (table size unreadable / beyond the
+            # bound): the listing is UNVERIFIED -- named, never clean
+            return "unstable", ("fd_walk_unbounded" if _darwin_bsdinfo_nfiles(pid) is not None
+                                else "fd_table_size_unreadable")
+        if omitted:
+            return "unstable", "listing_partial_fill"
         scan: "dict[int, tuple[int, int]]" = {}
         failed = False
         for fd in fds:
             devino, fe = _libproc_fd_devino(pid, fd)
             if devino is None:
                 if _errno_is_gone(fe):
-                    return "gone", None
+                    # OS-48 (I-2, ANALYSIS F8): a per-fd ENOENT is a REVOKED (stale) vnode on a
+                    # LIVE process, never proof the process is gone -- unreadable by name.
+                    return "unstable", "stale_revoked_fd"
                 if fe in (errno.EPERM, errno.EACCES):
                     # This fd's vnode is permission-restricted (a TCC/sandbox-protected resource
                     # that macOS refuses to introspect even for the owner -- common on fd 3 of a
@@ -1356,8 +2806,8 @@ def _scan_process_for_slave(pid: int, ref: "tuple[int, int]",
                     # (verified), so a fd we are refused is PROVABLY not the slave.  Skip THIS fd
                     # (never a match here) and keep inspecting the rest; do not fail the scan --
                     # otherwise every host with a restricted-fd agent is permanently `unreadable`.
-                    scan[fd] = None                        # record it as inspected-but-restricted
-                    continue
+                    # OS-48 (I-2): a denied per-fd read is unreadable evidence, not "not the slave".
+                    return "unstable", "fd_denied"
                 failed = True                              # EBADF (closed/retyped) / short: a RACE / truncation
                 break
             scan[fd] = devino
@@ -1376,7 +2826,15 @@ def _scan_process_for_slave(pid: int, ref: "tuple[int, int]",
 
 def slave_device_holders(slave_name: str, *, exclude_pids: "Sequence[int]" = ()
                          ) -> dict[str, Any]:
-    """Iteration 4/5 (option B) -- a COMPLETE, fail-closed slave-descriptor authority (darwin
+    """**OS-48: DIAGNOSTIC ONLY.**  A negative whole-process-table / descriptor enumeration is
+    never evidence of finality (ANALYSIS F0: `proc_listallpids` / `PROC_PIDLISTFDS` /
+    `PROC_PIDFDVNODEPATHINFO` are independent non-atomic reads, and ordinary fork / SCM_RIGHTS
+    / close between them defeat any negative).  No decision function calls this; the runtime
+    journals it as `holders_diagnostic` at most.  Its states are `present` / `unreadable` /
+    `none_observed` -- the word "proven" does not occur.  Denied, short and stale (revoked
+    ENOENT) reads are `unreadable` by name (I-2).
+
+    Historical: iteration 4/5 (option B) -- a COMPLETE, fail-closed slave-descriptor authority (darwin
     ``libproc``), the ONE sanctioned exception to "the kernel hangup is the only proof": the
     supervisor's release-of-the-deferring-watcher (whose revoke delivers the real hangup) is
     gated on this proof, and the orphan watcher uses it before writing any ``proven`` record.
@@ -1407,11 +2865,11 @@ def slave_device_holders(slave_name: str, *, exclude_pids: "Sequence[int]" = ()
       ``proc_pidfdinfo`` or a malformed listing length is ``unenumerable`` for that pid, never
       decoded from the zero-filled buffer.
 
-    ``{"method": "libproc", "state": "present"|"proven_absent"|"unreadable", "holders": [pid],
+    ``{"method": "libproc", "state": "present"|"none_observed"|"unreadable", "holders": [pid],
     "unenumerable": [{"pid", "errno", "where"}], "other_uid": [pid], "gone": [pid],
     "device": ...}``.  ``state`` is ``present`` if any holder, else ``unreadable`` if any process
     was ``unenumerable`` (fail closed -- an incomplete scan is NEVER absence), else
-    ``proven_absent`` (processes that merely exited mid-scan, or are other-uid and thus cannot
+    ``none_observed`` (DIAGNOSTIC; processes that merely exited mid-scan, or are other-uid and thus cannot
     hold the slave, do not block the proof)."""
     out: dict[str, Any] = {"method": "libproc", "device": str(slave_name or ""),
                            "state": "unreadable", "holders": [], "unenumerable": [],
@@ -1452,7 +2910,9 @@ def slave_device_holders(slave_name: str, *, exclude_pids: "Sequence[int]" = ()
     elif out["unenumerable"]:
         out["state"] = "unreadable"          # fail closed: an incomplete scan is never absence
     else:
-        out["state"] = "proven_absent"
+        # OS-48: a scan that found nothing is `none_observed` -- DIAGNOSTIC ONLY.  It is not
+        # "proven_absent": no negative enumeration can be (ANALYSIS F0, DESIGN I-1).
+        out["state"] = "none_observed"
     return out
 
 
@@ -1488,13 +2948,13 @@ def _slave_holder_state(holders: Mapping[str, Any]) -> str:
 
     * ``present`` -- something still holds the slave: the agent's foreground process group
       has members, or a ``/proc`` fd resolves to it;
-    * ``proven_absent`` -- a COMPLETE positive absence proof: the foreground-group probe
+    * ``none_observed`` -- (DIAGNOSTIC ONLY under OS-48) the probe completed and found nothing: the foreground-group probe
       COMPLETED and found the group empty and, where ``/proc`` exists, a COMPLETE scan
       found no holder;
     * ``unreadable`` -- an authority the absence proof needs could not be read (a failed
       ``tcgetpgrp`` / ``killpg``, an unreadable ``/proc``, or a skipped ``/proc/<pid>/fd``).
 
-    Only ``proven_absent`` may authorise ``proven``.  ``present`` and ``unreadable`` are
+    Under OS-48 NONE of these states authorises anything; they are journal diagnostics.  ``present`` and ``unreadable`` are
     both ``unproven`` -- an incomplete or unreadable probe is NEVER collapsed into absence,
     which is the exact defect this replaces: failed ``tcgetpgrp`` / unreadable ``/proc`` /
     skipped fd entries used to fall through to ``foreground_group_present=None, rows=[]`` and
@@ -1507,7 +2967,7 @@ def _slave_holder_state(holders: Mapping[str, Any]) -> str:
         return "unreadable"
     if holders.get("proc_scan") == "incomplete":
         return "unreadable"
-    return "proven_absent"
+    return "none_observed"
 
 
 def _errno_name(exc: BaseException) -> str:
@@ -2012,48 +3472,49 @@ def _proc_pidpath(pid: int) -> str:
 # ---- signalling ------------------------------------------------------------------------
 def signal_target(record: Mapping[str, Any], decision: Mapping[str, Any], sig: int, *,
                   permit: Any, snapshot: Mapping[str, Any],
-                  killpg: Any = None, kill: Any = None) -> dict[str, Any]:
-    """Send ``sig``, honouring the ownership decision.  Takes a :class:`Permit`.
+                  killpg: Any = None, kill: Any = None, watcher: Any = None,
+                  pidfd_send: Any = None) -> dict[str, Any]:
+    """Send ``sig`` to the AGENT through an incarnation-bound path, honouring the decision.
+    Takes a :class:`Permit` (the only way in: :func:`standalone_identity.assert_may_act`).
 
-    The permit parameter is not decoration: it is the only way into this function, and only
-    :func:`standalone_identity.assert_may_act` can produce one.  A caller cannot signal a
-    process without having re-verified ownership, because there is no overload that omits it.
+    OS-48 DESIGN §2.3 (F-002 / F-003):
 
-    ``scope == "none"`` sends NOTHING and reports the refusal.  ``scope == "root"`` sends to
-    the single pid, never the group -- that is the tty-shared case, where a group signal
-    would reach the supervisor itself.
+    * the agent is signalled **by the exit watcher** -- its parent, whose single thread both
+      reaps and delivers, so a request served before the reap addresses a pid the kernel
+      cannot reuse (probe_d7) -- through ``watcher(sig)`` (the control-socket request);
+      ``refused:signal_target_reaped`` after the reap, ``refused:signal_unbound`` when no
+      watcher exists (a darwin non-child has no atomic signal primitive; on Linux a held
+      pidfd may be supplied as ``pidfd_send``);
+    * **no user-space ``killpg`` is ever sent** (`may_killpg` → `group_signal_refused`): a
+      leader's identity does not cover the recipients at delivery.  Group teardown is the
+      kernel's own SIGHUP to the foreground process group at controlling-tty revoke
+      (probe_d8).  The ``killpg`` / ``kill`` seams remain only so a lock can PROVE nothing
+      reaches them.
     """
     identity.require_permit(permit, record, "signal")
     if decision.get("verdict") != "owned" or decision.get("scope") == "none":
         return {"sent": (), "refusal": decision.get("refusal") or "not_owned",
                 "scope": "none"}
-    send_group = killpg or os.killpg
-    send_one = kill or os.kill
     sent: list[dict[str, Any]] = []
-    if decision["scope"] == "group":
-        # C4: descendant groups FIRST, the session leader LAST.
-        #
-        # The leader's group is the RECORD'S SID, not its pgid: a session leader's pgid is
-        # its own pid, which is its sid, and the agent lives in a DIFFERENT group under it
-        # (see :func:`spawn`).  Using the agent's pgid here would invert C4 -- it would
-        # signal the leader first, killing the process that has to reap the agent and write
-        # the exit sentinel, and a proven exit would become an unprovable one.  Falls back
-        # to the pgid where no sid was recorded, which is the pre-topology shape.
-        leader = int(record.get("sid") or record["pgid"])
-        for pgid in descendant_groups(snapshot, leader_pgid=leader):
-            _try(sent, "descendant_groups", pgid, lambda: send_group(pgid, sig))
-        if leader == int(record["pid"]):
-            # No separate exit watcher: the leader is the agent itself, and the old
-            # ordering (descendants first, then it) is exactly right.
-            _try(sent, "session_leader", leader, lambda: send_group(leader, sig))
-        else:
-            # Finding 12.  The watcher is NEVER signalled: it must survive to reap the agent
-            # and write the exit sentinel, and it exits on its own once it has.
-            sent.append({"rung": "session_leader", "target": leader,
-                         "result": "withheld:exit_watcher"})
+    _allowed, why = identity.may_killpg(int(record.get("pgid") or 0))
+    sent.append({"rung": "descendant_groups", "target": int(record.get("pgid") or 0),
+                 "result": f"withheld:{why}"})
+    leader = int(record.get("sid") or record["pgid"])
+    if leader != int(record["pid"]):
+        sent.append({"rung": "session_leader", "target": leader,
+                     "result": "withheld:exit_watcher"})
+    pid = int(record["pid"])
+    if watcher is not None:
+        try:
+            result = str(watcher(sig))
+        except Exception as exc:  # noqa: BLE001
+            result = f"refused:{type(exc).__name__}"
+        sent.append({"rung": "agent_via_watcher", "target": pid, "result": result})
+    elif pidfd_send is not None:
+        _try(sent, "agent_via_pidfd", pid, lambda: pidfd_send(sig))
     else:
-        pid = int(record["pid"])
-        _try(sent, "root", pid, lambda: send_one(pid, sig))
+        sent.append({"rung": "agent_via_watcher", "target": pid,
+                     "result": "refused:" + identity.SIGNAL_UNBOUND})
     return {"sent": tuple(sent), "refusal": decision.get("refusal", ""),
             "scope": decision["scope"]}
 
@@ -2156,16 +3617,31 @@ def drain(master_fd: int, *, budget_ms: int = 500) -> int:
     return drained
 
 
+def request_release_1(session: Mapping[str, Any]) -> bool:
+    """OS-48 release-1 (DESIGN §1.8): ask the deferring watcher to write the RELEASE marker
+    into its slave fd.  It closes NOTHING yet.  ``False`` when no handoff end exists."""
+    handoff = session.get("drain_handoff_fd")
+    if isinstance(handoff, int) and handoff >= 0:
+        try:
+            os.write(handoff, b"R")
+            return True
+        except OSError:
+            return False
+    return False
+
+
 def _signal_drain_handoff(session: Mapping[str, Any]) -> None:
-    """Release a watcher deferring its exit in :func:`_await_drain_handoff` (round-10 item
-    1): write ONE byte to the handoff's write end, then close it.  The byte -- not the close
-    -- is the reliable wake: a ``select`` on the read end returns on the data whether or not
+    """OS-48 release-2: tell a watcher deferring in :func:`_defer_for_release` that the
+    custodian has consumed the stream up to the RELEASE marker -- write the ``C`` byte to the
+    handoff's write end, then close it (the watcher then closes its owner-held slave
+    reference).  The byte -- not the close -- is the reliable wake: a ``select`` on the read
+    end returns on the data whether or not
     the last write end has closed, so a lingering descriptor copy can never wedge the
     release.  Idempotent: the fd is set to ``-1`` once released."""
     handoff = session.get("drain_handoff_fd")
     if isinstance(handoff, int) and handoff >= 0:
         try:
-            os.write(handoff, b"1")
+            os.write(handoff, b"C")       # OS-48 release-2: the custodian consumed up to R
         except OSError:
             pass
         try:
@@ -2198,21 +3674,34 @@ def reap_leader(session: Mapping[str, Any], *, timeout_ms: int = 2_000) -> dict[
     if not isinstance(pid, int) or pid <= 0:
         return {"reaped": False, "status": None, "detail": "no leader pid recorded"}
     _signal_drain_handoff(session)
+    # OS-48: the watcher HOLDS a slave reference and wrote the fence marker through it, so
+    # its exit closes a slave with output pending on the master -- the exact wedge
+    # :func:`drain` documents ("trying to exit" until the master is read).  A caller that
+    # already drained (the runtime's two-phase release) loses nothing here; a raw caller
+    # gets the teardown obligation honoured (bytes DISCARDED, counted, never claimed).
+    master = session.get("master_fd")
+    master = master if isinstance(master, int) and master >= 0 else -1
+    drained = 0
     deadline = time.time() + timeout_ms / 1000.0
     while True:
         try:
             done, status = os.waitpid(pid, os.WNOHANG)
         except ChildProcessError:
-            return {"reaped": True, "status": None,
+            return {"reaped": True, "status": None, "drained_bytes": drained,
                     "detail": "already reaped or not this process's child"}
         except OSError as exc:
-            return {"reaped": False, "status": None, "detail": f"waitpid: {exc}"}
+            return {"reaped": False, "status": None, "drained_bytes": drained,
+                    "detail": f"waitpid: {exc}"}
         if done == pid:
-            return {"reaped": True, "status": _wait_status_to_code(status), "detail": ""}
+            return {"reaped": True, "status": _wait_status_to_code(status),
+                    "drained_bytes": drained, "detail": ""}
         if time.time() >= deadline:
-            return {"reaped": False, "status": None,
+            return {"reaped": False, "status": None, "drained_bytes": drained,
                     "detail": "the exit watcher is still running at the deadline"}
-        time.sleep(0.02)
+        if master >= 0:
+            drained += drain(master, budget_ms=20)
+        else:
+            time.sleep(0.02)
 
 
 def release(session: Mapping[str, Any]) -> None:
@@ -2254,3 +3743,12 @@ def release(session: Mapping[str, Any]) -> None:
     # leader, and `release` signals it once more (idempotent) so a path that reclaims without
     # a full drain never leaves the watcher blocked.
     _signal_drain_handoff(session)
+    # OS-48: the control socket's supervisor end.
+    control = session.get("control_fd")
+    if isinstance(control, int) and control >= 0:
+        try:
+            os.close(control)
+        except OSError:
+            pass
+        if isinstance(session, dict):
+            session["control_fd"] = -1

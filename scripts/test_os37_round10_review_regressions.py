@@ -1,4 +1,15 @@
-"""OS-37 BUGFIX round 10 (run_5855732a7f74): the consolidated follow-up review of `bcd5c6d`
+"""OS-37 BUGFIX round 10 (run_5855732a7f74) -- VERSIONED BY OS-48 (run_f820764749d6, W-F9).
+
+OS-48 retires the round-10 finality premise (a negative holder enumeration authorises the
+watcher release whose hangup is the proof).  The finality fact is now POSITIVE: the watcher
+holds the owner slave reference, writes the in-band fence marker after `waitpid`, and the
+supervisor drains TO THE MARKER (boundary N, fence `os48.capture_fence.v1`).  Items 1 / iter-2 /
+iter-4 below are rewritten over the fence; the libproc enumeration is `LibprocDiagnosticsTests`
+(a diagnostic, never an authority); `Item2SlaveHolderTriStateTests` keeps `_slave_holders` as a
+diagnostic (`none_observed`, not `proven_absent`) with the non-positive `killpg` guard lock.
+Items 3 / 4 and follow-up (b) are unaffected.  The original round-10 text follows for the record.
+
+ORIGINAL: the consolidated follow-up review of `bcd5c6d`
 (issuecomment-5688372349) -- FOUR merge blockers plus three same-boundary follow-ups.  Every
 lock here is RED at `bcd5c6d` and GREEN at the corrected head, and exercises the PRODUCTION
 wiring rather than a reimplementation.
@@ -73,25 +84,21 @@ def _sh_profile(worktree: str, *, drain_ms: int = 2_000) -> object:
 
 
 # =====================================================================================
-# Item 1 -- macOS lost-tail: the supervisor-alive watcher DEFERS its exit so its
-# session-leader revoke cannot manufacture / truncate the hangup the supervisor drains on
+# Item 1 -- macOS lost-tail, OS-48 form: the watcher HOLDS the owner slave reference and
+# writes the in-band fence marker after its reap; the supervisor drains TO THE MARKER
 # =====================================================================================
 class Item1MacOSLostTailTests(unittest.TestCase):
     """[P1] On darwin a session leader's exit REVOKES the controlling tty and DISCARDS the
-    master's unread tail, so a watcher that reaped the agent, wrote the sentinel and exited AT
-    ONCE manufactured -- and truncated -- the hangup the supervisor read as capture finality.
-    The fix DEFERS the supervisor-alive watcher's exit (a drain-handoff pipe) until the
-    supervisor has drained; the supervisor drains the whole tail while the tty is alive and
-    only THEN releases the watcher, whose revoke delivers a REAL post-drain hangup.
+    master's unread tail (OS-48 [MEASURED probe_01/04]: the discard happens on the LAST slave
+    close, ~0.5-0.7 s, even with a live ctty leader).  Round 10 answered with a deferred watcher
+    exit + a holder proof; OS-48 (DESIGN topology A) answers positively: the watcher keeps ONE
+    slave reference (nothing can be discarded while it is held), writes the fence marker
+    ``<<OS48-FENCE nonce>>`` into the slave after `waitpid`, and the supervisor drains TO THE
+    MARKER -- the boundary N is a positive fact in the capture, not the absence of a holder.
 
-    At `bcd5c6d` the watcher exits the instant it writes the sentinel -- there is no
-    drain-handoff at all -- and the supervisor's drain that runs after the revoke can read a
-    truncated (or empty) tail.  The deterministic discriminator here is the presence of that
-    deferred-exit machinery (platform-independent -- RED at `bcd5c6d` everywhere); the
-    tail-preservation it buys is confirmed behaviourally (a real pty on any platform: on
-    Linux the slave's own close gives the hangup, on darwin the released watcher's revoke
-    does) and the raw darwin revoke-truncation is reproduced at `bcd5c6d` in
-    `evidence/repro/`.  No platform gate, so no CI-lane tolerated-skip is needed."""
+    # superseded by OS-48: the round-10 discriminator was `drain_handoff_fd` + `_await_drain_handoff`
+    # (a deferred exit alone) and `ended == "hangup"`; OS-48 keeps the deferral for the TWO-PHASE
+    # release but the finality fact is the marker (`ended == "marker"`), never a hangup."""
 
     def setUp(self) -> None:
         self.room = Path(tempfile.mkdtemp(prefix="os37-r10-tail-")).resolve()
@@ -108,7 +115,8 @@ class Item1MacOSLostTailTests(unittest.TestCase):
                     os.kill(int(pid), signal.SIGKILL)
 
     def _spawn(self, agent_body: str, *, session_id="sess", incarnation="inc1",
-               capture: str | None = None):
+               capture: str | None = None, fence_nonce: str = "",
+               supervisor_identity: dict | None = None):
         agent = self.room / f"agent-{session_id}-{incarnation}.sh"
         agent.write_text("#!/bin/sh\n" + agent_body)
         agent.chmod(0o755)
@@ -123,39 +131,50 @@ class Item1MacOSLostTailTests(unittest.TestCase):
             spawn_record_target=str(pty_supervisor.spawn_record_path(
                 base, "run_t", "i", incarnation)),
             cwd=str(self.room), sentinel=str(sentinel), fence=f"{session_id}:{incarnation}",
-            image="/bin/sh", capture=capture)
+            image="/bin/sh", capture=capture, fence_nonce=fence_nonce,
+            supervisor_identity=supervisor_identity)
         self._sessions.append(session)
         return session, Path(str(sentinel)), Path(capture)
 
     def test_the_spawn_and_watch_provide_the_deferred_exit_machinery(self) -> None:
-        """The DETERMINISTIC discriminator: `spawn` hands the supervisor a drain-handoff
-        write end and the pty module has the deferred-exit / release primitives.  At
-        `bcd5c6d` there is no `drain_handoff_fd` and no `_await_drain_handoff` /
-        `_signal_drain_handoff` at all -- the watcher exits the instant it writes the
-        sentinel, so on darwin its session-leader revoke manufactures (and can truncate) the
-        hangup the supervisor drains on.  The tail-preservation behaviour this enables is
-        confirmed green below and reproduced at `bcd5c6d` in `evidence/repro/`."""
-        session, sentinel, _cap = self._spawn(
+        """The DETERMINISTIC discriminator, OS-48 form: `spawn` hands the supervisor the
+        drain-handoff write end (two-phase release), the watcher CONTROL socket (mediated signal
+        delivery) and the minted FENCE NONCE the watcher will write; the pty module has the
+        release / defer / orphan-finalize / bounded-marker primitives.  At `b9aecce` none of
+        `control_fd` / `fence_nonce` / `request_release_1` / `_defer_for_release` /
+        `_orphan_finalize` / `_write_marker_bounded` exist."""
+        session, sentinel, cap = self._spawn(
             "printf '{\"is_error\":false}\\n'\nexit 0\n")
-        self.assertIn("drain_handoff_fd", session,
-                      "spawn does not provide the drain handoff; the watcher cannot defer "
-                      "its exit and its revoke manufactures the hangup")
+        self.assertIn("drain_handoff_fd", session)
         self.assertGreaterEqual(int(session["drain_handoff_fd"]), 0)
-        self.assertTrue(hasattr(pty_supervisor, "_await_drain_handoff"),
-                        "no deferred-exit primitive")
-        self.assertTrue(hasattr(pty_supervisor, "_signal_drain_handoff"),
-                        "no drain-handoff release primitive")
+        self.assertIn("control_fd", session, "spawn does not provide the watcher control socket")
+        self.assertGreaterEqual(int(session["control_fd"]), 0)
+        self.assertRegex(str(session.get("fence_nonce") or ""), r"^[0-9a-f]{32}$")
+        for name in ("request_release_1", "_signal_drain_handoff", "_defer_for_release",
+                     "_orphan_finalize", "_write_marker_bounded", "request_watcher_signal"):
+            self.assertTrue(hasattr(pty_supervisor, name), f"no OS-48 primitive {name}")
         deadline = time.time() + 15
         while not sentinel.exists() and time.time() < deadline:
             time.sleep(0.01)
         self.assertTrue(sentinel.exists(), "the watcher never wrote the exit sentinel")
+        # the marker is IN THE STREAM after the reap (the slave is still held, so it is readable)
+        buf = b""
+        deadline = time.time() + 5
+        while capture_mod.find_marker(buf, session["fence_nonce"])[0] < 0 and time.time() < deadline:
+            import select as _select
+            if _select.select([session["master_fd"]], [], [], 0.1)[0]:
+                with contextlib.suppress(OSError):
+                    buf += os.read(session["master_fd"], 65536)
+        self.assertGreaterEqual(capture_mod.find_marker(buf, session["fence_nonce"])[0], 0,
+                                f"the watcher did not write the fence marker: {buf!r}")
 
     def test_the_supervisor_drain_preserves_the_final_tail_before_the_revoke(self) -> None:
-        """A real `StandaloneSession.drain_after_exit` over a production-spawned pty: the
-        agent writes a success record then a FINAL FAILURE record and exits; the supervisor's
-        drain runs after a delay (a slow supervisor -- at `bcd5c6d` the watcher's revoke has
-        already discarded the tail by then).  Here the deferring watcher keeps the tty alive,
-        the drain reads the WHOLE tail, then releases the watcher for a real hangup."""
+        """A real `StandaloneSession.drain_after_exit` over a production-spawned pty: the agent
+        writes a success record then a FINAL FAILURE record and exits; the supervisor's drain
+        runs after a delay (a slow supervisor -- at `bcd5c6d` the watcher's revoke had already
+        discarded the tail by then).  OS-48: the watcher holds the slave reference, so nothing
+        is discarded; the drain ends AT THE MARKER, BOTH records are inside ``[0, N)`` and the
+        fence is published `final`."""
         from scripts.deterministic_workflow import standalone_journal as journal_mod
         from scripts.deterministic_workflow.standalone_runtime import StandaloneSession
         session = StandaloneSession(
@@ -169,44 +188,48 @@ class Item1MacOSLostTailTests(unittest.TestCase):
             "printf '{\"type\":\"result\",\"is_error\":false}\\n'\n"
             "printf '{\"type\":\"result\",\"is_error\":true}\\n'\n"
             "exit 0\n",
-            session_id=session.session_id, incarnation=session.incarnation, capture=cap)
+            session_id=session.session_id, incarnation=session.incarnation, capture=cap,
+            fence_nonce=session.fence_nonce,
+            supervisor_identity=session._self_identity(capture_mod.OWNER_SUPERVISOR))
         session.pty = spawn
-        session.record = {"pid": spawn["pid"], "captured_tty": _tty(spawn["slave_name"])}
+        session.record = {"pid": spawn["pid"], "pgid": spawn["pid"],
+                          "captured_tty": _tty(spawn["slave_name"]),
+                          "proc_start_ticks": pty_supervisor.proc_start_ticks(spawn["pid"]),
+                          "boot_id": pty_supervisor.host_boot_id()}
         deadline = time.time() + 15
         while not sentinel.exists() and time.time() < deadline:
             time.sleep(0.01)
         self.assertTrue(sentinel.exists())
         time.sleep(0.4)          # a slow supervisor: at bcd5c6d the revoke has fired by now
         drained = session.drain_after_exit(budget_ms=4000)
-        self.assertEqual(drained["ended"], "hangup", drained)
+        self.assertEqual(drained["ended"], "marker", drained)
         self.assertEqual(drained["finality"], "capture_finalized", drained)
-        transcript = session.capture.transcript()
-        self.assertIn('"is_error":true', transcript,
-                      "the FINAL failure record was revoke-discarded before the drain")
-        self.assertIn('"is_error":false', transcript)
+        raw = session.capture.raw()
+        n = int(drained["offset_n"])
+        prefix = raw[:n]
+        self.assertIn(b'"is_error":true', prefix,
+                      "the FINAL failure record was discarded before the boundary")
+        self.assertIn(b'"is_error":false', prefix)
+        span = capture_mod.marker_span(raw, session.fence_nonce)
+        self.assertEqual((span[0], span[1]), (n, int(drained["marker_len"])), span)
+        fence = capture_mod.read_capture_fence(session._fence_path(), fence=session.fence)
+        self.assertEqual(fence["outcome"], capture_mod.EVIDENCE_FINAL, fence)
+        self.assertEqual(fence["record"]["boundary"]["sha256_prefix"],
+                         capture_mod.prefix_digest(raw, n))
 
 
 # =====================================================================================
-# Iteration 2 correction -- watcher exit / revoke must NEVER manufacture the proof
+# Iteration 2 correction, OS-48 form -- NO hangup / EOF / holder enumeration ever
+# establishes the proof; the in-band marker does
 # =====================================================================================
 from scripts.deterministic_workflow.standalone_runtime import (  # noqa: E402
     StandaloneSession, _stream_is_final)
 from scripts.deterministic_workflow import standalone_journal as _journal_mod  # noqa: E402
 
 
-class Iteration2FinalityBoundaryTests(unittest.TestCase):
-    """[P1] The controlling invariant the iteration-1 reviewer required: watcher exit /
-    revoke must NEVER itself establish the proof the supervisor consumes.  The supervisor
-    releases the deferring watcher (and accepts its revoke EOF as the end) ONLY after it has
-    obtained a COMPLETE positive slave-absence proof WHILE THE WATCHER IS STILL HELD; a
-    `present` or `unreadable` holder authority never releases and ends the drain `unproven`
-    (typed `stream_end_unproven`), and a darwin EOF this supervisor did not authorise is
-    `unproven` too.
-
-    Iteration-1 tree (`evidence/iter1/`): `drain_after_exit` released the watcher after 150
-    ms of QUIET alone, with no holder proof, so a retained-slave descendant that wrote a late
-    record -- or a watcher that exited on its own -- manufactured the proven hangup and the
-    settlement COMPLETED.  Every lock below is RED there and GREEN here."""
+class _WiredRoom(unittest.TestCase):
+    """Shared fixture: a real `StandaloneSession` over a PRODUCTION-spawned pty (the OS-48
+    spawn: owner-held slave reference, fence nonce, control socket)."""
 
     def setUp(self) -> None:
         self.room = Path(tempfile.mkdtemp(prefix="os37-r10i2-")).resolve()
@@ -225,11 +248,13 @@ class Iteration2FinalityBoundaryTests(unittest.TestCase):
             with contextlib.suppress(OSError, TypeError):
                 os.killpg(int(s.get("pgid") or 0), signal.SIGKILL)
 
-    def _wired(self, agent_body: str, *, run_id: str, budget_ms: int = 1500):
+    def _wired(self, agent_body: str, *, run_id: str, budget_ms: int = 1500,
+               pump: bool = True):
         """A real `StandaloneSession` wired to a production-spawned pty running ``agent_body``
-        (an ``sh`` script).  Returns ``(session, sentinel_path)`` after the watcher has
-        reaped the agent and written the sentinel (so `drain_after_exit`'s exit-proven
-        precondition holds), the watcher DEFERRING its exit."""
+        (an ``sh`` script).  Returns ``(session, sentinel_path)``; with ``pump`` (default) the
+        supervisor pumps -- exactly as `await_completion` does -- until the watcher has reaped
+        the agent and written the sentinel (so `drain_after_exit`'s exit-proven precondition
+        holds), the watcher still HOLDING its slave reference and deferring for release."""
         session = StandaloneSession(
             intent={"intent_id": f"i-{run_id}", "run_id": run_id, "role": "WORKER"},
             profile=_sh_profile(str(self.room), drain_ms=budget_ms),
@@ -251,114 +276,167 @@ class Iteration2FinalityBoundaryTests(unittest.TestCase):
             spawn_record_target=str(pty_supervisor.spawn_record_path(
                 base, run_id, "i", session.incarnation)),
             cwd=str(self.room), sentinel=str(sentinel), fence=session.fence,
-            image="/bin/sh", capture=cap)
+            image="/bin/sh", capture=cap, fence_nonce=session.fence_nonce,
+            supervisor_identity=session._self_identity(capture_mod.OWNER_SUPERVISOR))
         self._sessions.append(spawn)
         session.pty = spawn
-        session.record = {"pid": spawn["pid"], "pgid": spawn["pid"],
-                          "captured_tty": _tty(spawn["slave_name"])}
-        # Iteration 4: capture the stream CONTINUOUSLY while waiting for the exit sentinel,
-        # exactly as the production supervisor's `await_completion` pumps.  The pty now has no
-        # controlling terminal (the kernel hangup is the finality proof), so the master's
-        # unread buffer must be drained promptly -- a supervisor that read nothing for a while
-        # after the agent's last slave close would let the kernel reclaim the tail.  A reader
-        # that keeps up (production, and this helper) captures the whole tail; the subsequent
-        # `drain_after_exit` then observes the hangup over an already-complete capture.
-        deadline = time.time() + 15
-        while not Path(str(sentinel)).exists() and time.time() < deadline:
-            session.pump(timeout_ms=20)
-        self.assertTrue(Path(str(sentinel)).exists(), "the watcher never wrote the sentinel")
-        session.pump(timeout_ms=50)
+        session.record = {"pid": spawn["pid"], "pgid": spawn["pid"], "sid": spawn["sid"],
+                          "captured_tty": _tty(spawn["slave_name"]),
+                          "proc_start_ticks": pty_supervisor.proc_start_ticks(spawn["pid"]),
+                          "boot_id": pty_supervisor.host_boot_id()}
+        if pump:
+            deadline = time.time() + 15
+            while not Path(str(sentinel)).exists() and time.time() < deadline:
+                session.pump(timeout_ms=20)
+            self.assertTrue(Path(str(sentinel)).exists(), "the watcher never wrote the sentinel")
+            session.pump(timeout_ms=50)
         return session, Path(str(sentinel))
 
-    def _proof(self, session) -> dict:
-        return capture_mod.read_capture_finalized(session._finalized_path(),
-                                                  fence=session.fence)
+    def _fence(self, session) -> dict:
+        return capture_mod.read_capture_fence(session._fence_path(), fence=session.fence)
+
+    def _read_more(self, session, needle: bytes, *, seconds: float) -> bytes:
+        """Keep reading the (still-alive) master into the capture until ``needle`` is present
+        or ``seconds`` elapse; returns the raw capture."""
+        deadline = time.time() + seconds
+        while needle not in session.capture.raw() and time.time() < deadline:
+            session.pump(timeout_ms=50)
+        return session.capture.raw()
+
+    def _read_until_marker(self, session, *, seconds: float) -> None:
+        deadline = time.time() + seconds
+        while (capture_mod.find_marker(session.capture.raw(), session.fence_nonce)[0] < 0
+               and time.time() < deadline):
+            session.pump(timeout_ms=50)
+
+    @staticmethod
+    def _offsets(raw: bytes, needle: bytes) -> list[int]:
+        out, i = [], raw.find(needle)
+        while i >= 0:
+            out.append(i)
+            i = raw.find(needle, i + 1)
+        return out
+
+
+class Iteration2FinalityBoundaryTests(_WiredRoom):
+    """[P1] The controlling invariant, OS-48 form (DESIGN I-1): no hangup, EOF, quiet window
+    or holder enumeration ever establishes the proof the supervisor consumes -- the pinned
+    root's exit (`waitpid` by its parent) plus the in-band fence marker written by the
+    owner-held slave reference DO.  The settlement window is ``[baseline, N)``; every byte a
+    retained-slave descendant writes after the marker is DIAGNOSTIC (after N) and can neither
+    fail nor complete the dispatch; a hangup without the marker is `boundary_unproven`.
+
+    # superseded by OS-48: the round-10 `stream_end_unproven` / `watcher_exit_unproven` /
+    # `proven_absent`-gated release locks (`:278-537` at b9aecce) -- their premise (a negative
+    # holder scan authorises the release; the release's hangup is the proof) is retired."""
 
     # -- Lock 1: retained-slave descendant + late final failure record -------------------
-    def test_a_retained_slave_descendant_with_a_late_final_record_is_unproven(self) -> None:
-        """The agent emits a success record and EXITS; a descendant it forked KEEPS the
-        slave, stays quiet past the settle window, then writes a final FAILURE record and
-        holds the slave past the drain budget.  The supervisor must never turn that into a
-        proven hangup: the drain ends `unproven` (a holder was present at every quiet check),
-        names the holder, and the finality gate would settle `stream_end_unproven` -- NOT
-        COMPLETED.  RED at `bcd5c6d`/iter1 (released on quiet before the late record, revoke
-        discarded it, COMPLETED)."""
+    def test_a_retained_slave_descendant_late_record_lands_after_the_boundary(self) -> None:
+        """The agent emits a success record and EXITS; a descendant it forked KEEPS the slave,
+        stays quiet, then writes a FAILURE record and holds the slave for seconds.  OS-48: the
+        marker is written when the pinned root is reaped, so the late record lands AFTER N --
+        diagnostic, never part of the settlement window -- and the drain ends at the marker,
+        never `budget`.  The slave is still held by the watcher, so the late bytes are
+        retained (not discarded) and readable after N.  At b9aecce this was
+        `stream_end_unproven` (the holder blocked the release)."""
+        trigger = self.room / "retain.go"
+        # HANDSHAKE (OS-48 F-007): the descendant writes only once the fence is bound.
         session, _sent = self._wired(
             "printf '{\"type\":\"result\",\"is_error\":false}\\n'\n"
-            "( sleep 0.4; printf '{\"type\":\"result\",\"is_error\":true}\\n'; sleep 5 ) &\n"
-            "exit 0\n", run_id="run_r10i2_retain", budget_ms=1500)
+            "( while [ ! -e %s ]; do sleep 0.01; done; printf '{\"type\":\"result\",\"is_error\":true}\\n'; sleep 5 ) &\n"
+            "exit 0\n" % trigger, run_id="run_r10i2_retain", budget_ms=1500)
         drained = session.drain_after_exit(budget_ms=1500)
-        self.assertNotEqual(drained.get("finality"), "capture_finalized",
-                            f"a retained-slave descendant manufactured a proven hangup: {drained}")
-        self.assertFalse(_stream_is_final(drained))
-        self.assertEqual(drained.get("ended"), "budget", drained)
-        holders = drained.get("holders") or {}
-        self.assertTrue(holders.get("rows"),
-                        f"the retained-slave holder was not named in the evidence: {holders}")
-        proof = self._proof(session)
-        self.assertEqual(proof["outcome"], capture_mod.FINALITY_UNPROVEN, proof)
+        self.assertEqual(drained.get("ended"), "marker", drained)
+        self.assertTrue(_stream_is_final(drained), drained)
+        n = int(drained["offset_n"])
+        raw = session.capture.raw()
+        self.assertIn(b'"is_error":false', raw[:n])
+        self.assertNotIn(b'"is_error":true', raw[:n],
+                         "a post-reap descendant record leaked into the settlement window")
+        trigger.write_text("go")
+        raw = self._read_more(session, b'"is_error":true', seconds=3.0)
+        late = self._offsets(raw, b'"is_error":true')
+        self.assertTrue(late, "the retained holder's late record was discarded (slave not held)")
+        self.assertGreaterEqual(min(late), n + int(drained["marker_len"]), (n, late))
+        self.assertEqual(self._fence(session)["outcome"], capture_mod.EVIDENCE_FINAL)
+        self.assertEqual(int(self._fence(session)["record"]["boundary"]["offset_n"]), n)
 
-    # -- Lock 5: positive path, no descendant, complete absence proof --------------------
-    def test_the_positive_path_with_no_descendant_is_proven_with_both_records(self) -> None:
-        """Lock 5 (positive path) AND Lock 4 (other-owner mutation is caught).  No descendant:
-        complete absence proof -> release -> hangup -> PROVEN, both records captured.  And the
-        SUPERVISOR is the single finalizing owner: even after a SECOND component (the exit
-        watcher, or any other) forges a proof at the fence, the supervisor's own finalization
-        is the one that stands -- the other-owner record never becomes the consumed proof."""
+    # -- Lock 5: positive path, both records before N, supervisor-owned fence ------------
+    def test_the_positive_path_publishes_the_supervisor_fence_with_both_records(self) -> None:
+        """No descendant: both records precede the marker; the drain ends at the marker; the
+        fence is `final`, owned by generation g1 = THIS supervisor, its digest is the prefix
+        digest; the two-phase release then retains the (empty) diagnostic tail and publishes
+        `release.<inc>` `final` with R after N."""
         session, _sent = self._wired(
             "printf '{\"type\":\"result\",\"is_error\":false}\\n'\n"
             "printf '{\"type\":\"result\",\"is_error\":true}\\n'\n"
             "exit 0\n", run_id="run_r10i2_pos", budget_ms=4000)
-        # Lock 4: a SECOND owner (the exit watcher) writes a proof BEFORE the supervisor
-        # finalizes -- a forged PROVEN record with a bogus digest.  The supervisor's single
-        # finalization must override it, so the watcher's proof never stands as the consumed
-        # one (in production the supervisor-alive watcher writes NO proof at all; this forces
-        # the adversarial case and confirms the single owner wins).
-        capture_mod.write_capture_finalized(
-            session._finalized_path(), fence=session.fence,
-            finality=capture_mod.FINALITY_PROVEN, writer=capture_mod.WRITER_EXIT_WATCHER,
-            ended="hangup", errno_name="", total_bytes=999999, sha256="deadbeef" * 8,
-            records=999, exit_how="exit_sentinel", exit_code=0, holders={}, detail="forged")
         drained = session.drain_after_exit(budget_ms=4000)
-        self.assertEqual(drained.get("ended"), "hangup", drained)
+        self.assertEqual(drained.get("ended"), "marker", drained)
         self.assertTrue(_stream_is_final(drained), drained)
-        transcript = session.capture.transcript()
-        self.assertIn('"is_error":false', transcript)
-        self.assertIn('"is_error":true', transcript)
-        proof = self._proof(session)
-        self.assertEqual(proof["outcome"], capture_mod.FINALITY_PROVEN, proof)
-        # Single finalizing owner: the SUPERVISOR wrote the proof; the forged watcher proof
-        # (bogus digest / record count) did NOT stand.
-        self.assertEqual(proof["record"]["writer"], capture_mod.WRITER_SUPERVISOR)
-        self.assertNotEqual(proof["record"]["sha256"], "deadbeef" * 8, proof)
-        self.assertEqual(int(proof["record"]["total_bytes"]), session.capture.size, proof)
+        n = int(drained["offset_n"])
+        raw = session.capture.raw()
+        self.assertIn(b'"is_error":false', raw[:n])
+        self.assertIn(b'"is_error":true', raw[:n])
+        fence = self._fence(session)
+        self.assertEqual(fence["outcome"], capture_mod.EVIDENCE_FINAL, fence)
+        record = fence["record"]
+        self.assertEqual(record["owner"]["owner_role"], capture_mod.OWNER_SUPERVISOR)
+        self.assertEqual(int(record["owner"]["generation"]), 1)
+        self.assertEqual(int(record["owner"]["owner"]["pid"]), os.getpid())
+        self.assertEqual(record["boundary"]["sha256_prefix"], capture_mod.prefix_digest(raw, n))
+        released = session._release_two_phase()
+        self.assertEqual(released["state"], capture_mod.EVIDENCE_FINAL, released)
+        self.assertGreater(int(released["offset_r"]), n)
+        rel = capture_mod.read_release_record(session._release_path(), fence=session.fence)
+        self.assertEqual(rel["outcome"], capture_mod.EVIDENCE_FINAL, rel)
+        self.assertEqual(int(rel["record"]["retained_tail_bytes"]), 0, rel)
 
-    # -- Lock 6: a watcher that exits before the supervisor authorises it is unproven -----
-    def test_a_watcher_exit_before_an_authorised_release_is_unproven(self) -> None:
-        """The review's original repro on the fixed tree: the exit watcher exits (revokes the
-        tty) BEFORE the supervisor's drain authorises its release.  The hangup then arrives
-        with the watcher already GONE, so any holder probe is POST-revoke and cannot vouch for
-        a discarded tail -- the supervisor must refuse it as `watcher_exit_unproven`; RED at
-        iter1 (the EOF took the unconditional proven branch -> COMPLETED).  The discriminator
-        is the watcher's LIVENESS at the hangup (`_leader_alive`): a hangup with the watcher
-        gone (here) is unproven, while a hangup with the watcher still HELD is the agent's own
-        end-of-stream and proves once absence is shown (locked by
-        `test_an_agent_hangup_while_the_watcher_is_held_is_proven`).  This test RUNS on every
-        platform (no skip -- the CI-lane manifest only declares platform gates in
-        `test_review_isolation`), but the darwin arm is the load-bearing lock: on Linux the
-        agent's own last slave close is the genuine hangup, independent of the watcher, so
-        there the same scenario legitimately proves."""
+    # -- Lock 4: another writer's record at the fence path is never overwritten or accepted
+    def test_a_forged_fence_at_the_path_is_never_overwritten_and_never_accepted(self) -> None:
+        """A SECOND component publishes a fence (bogus digest / boundary) at the fence path
+        BEFORE the supervisor finalizes.  OS-48 publication is link-EXCLUSIVE: the supervisor
+        never overwrites it; it reads it and VERIFIES it against the capture, and the mismatch
+        is a NAMED non-success (`fence_mismatch`) -- the forged record does not stand as the
+        proof and no success is possible over it."""
+        session, _sent = self._wired(
+            "printf '{\"type\":\"result\",\"is_error\":false}\\n'\n"
+            "exit 0\n", run_id="run_r10i2_forge", budget_ms=4000)
+        forged = capture_mod.make_capture_fence(
+            fence=session.fence, emitter={"pid": 1, "start_id": 1, "boot_id": "x"},
+            emitter_pgid=1, offset_n=7, marker_len=43, marker_nonce=session.fence_nonce,
+            sha256_prefix="deadbeef" * 8, tail_bytes_at_publish=0, exit_how="exit_sentinel",
+            exit_code=0, reaped_by=None,
+            owner={"owner_role": capture_mod.OWNER_EXIT_WATCHER, "generation": 1,
+                   "owner": {"pid": 1, "start_id": 1, "boot_id": "x"}},
+            evidence_source="forged", provenance=["forged"], published_at="now")
+        capture_mod.write_capture_fence(session._fence_path(), forged)
+        before = Path(os.fsdecode(session._fence_path())).read_bytes()
+        drained = session.drain_after_exit(budget_ms=4000)
+        self.assertEqual(drained.get("ended"), "marker", drained)
+        self.assertFalse(_stream_is_final(drained), drained)
+        self.assertEqual(drained.get("outcome"), capture_mod.OUTCOME_FENCE_MISMATCH, drained)
+        self.assertEqual(Path(os.fsdecode(session._fence_path())).read_bytes(), before,
+                         "the forged fence was overwritten (publication must be exclusive)")
+
+    # -- Lock 6 (C3): the watcher's death AFTER the marker does not disturb the boundary --
+    def test_a_watcher_death_after_the_marker_does_not_disturb_the_boundary(self) -> None:
+        """The exit watcher is released (closes its slave reference and exits) BEFORE the
+        supervisor's finalizing drain.  Round 10 called this `watcher_exit_unproven` (the
+        hangup arrived with the watcher gone).  OS-48 (cut C3): the marker was written and
+        captured BEFORE the watcher went, so the boundary is intact and the fence publishes
+        from it; what the watcher's death costs is the RELEASE protocol -- no RELEASE marker
+        can ever be written, so the release record is NAMED `diagnostic_tail_unaccounted` /
+        `release_record_missing`, never silently `final`."""
         session, _sent = self._wired(
             "printf '{\"type\":\"result\",\"is_error\":false}\\n'\n"
             "printf '{\"type\":\"result\",\"is_error\":true}\\n'\n"
             "exit 0\n", run_id="run_r10i2_wexit", budget_ms=4000)
+        self._read_until_marker(session, seconds=5.0)
+        self.assertGreaterEqual(capture_mod.find_marker(session.capture.raw(), session.fence_nonce)[0],
+                                0, "the marker never arrived while held")
         leader = int(session.pty["leader_pid"])
-        # Force the watcher to EXIT (revoking the tty) BEFORE the supervisor's drain
-        # authorises it -- the exact race the review requires the fixed tree to refuse.  The
-        # watcher exits on ANY drain-handoff readiness, so signalling the handoff here stands
-        # in for a watcher that exited on its own / crashed / hit its ceiling; the darwin EOF
-        # its revoke then delivers was NOT authorised by this drain's proven-absence path.
-        pty_supervisor._signal_drain_handoff(session.pty)
+        pty_supervisor._signal_drain_handoff(session.pty)     # release-2 without release-1
         deadline = time.time() + 5
         while time.time() < deadline:
             try:
@@ -368,126 +446,76 @@ class Iteration2FinalityBoundaryTests(unittest.TestCase):
             if done == leader:
                 break
             time.sleep(0.02)
-        time.sleep(0.2)                          # let the revoke settle
+        time.sleep(0.2)                          # let any revoke settle
         drained = session.drain_after_exit(budget_ms=4000)
-        if sys.platform == "darwin":
-            # The load-bearing arm: the hangup arrives with the watcher already GONE and this
-            # supervisor did not authorise the release -> unproven, never COMPLETED.
-            self.assertNotEqual(drained.get("finality"), "capture_finalized",
-                                f"a watcher-exit revoke was accepted as proof: {drained}")
-            self.assertFalse(_stream_is_final(drained))
-            self.assertEqual(drained.get("ended"), "watcher_exit_unproven", drained)
-            proof = self._proof(session)
-            self.assertEqual(proof["outcome"], capture_mod.FINALITY_UNPROVEN, proof)
-        else:
-            # On Linux the agent's own last slave close is a genuine hangup independent of
-            # the watcher, so the same scenario legitimately proves; the watcher's exit is
-            # not the fact that establishes it.
-            self.assertIn(drained.get("ended"), ("hangup", "budget"), drained)
+        self.assertEqual(drained.get("ended"), "marker", drained)
+        self.assertTrue(_stream_is_final(drained), drained)
+        n = int(drained["offset_n"])
+        raw = session.capture.raw()
+        self.assertIn(b'"is_error":true', raw[:n])
+        released = session._release_two_phase()
+        self.assertNotEqual(released["state"], capture_mod.EVIDENCE_FINAL, released)
+        self.assertEqual(released["outcome"], capture_mod.OUTCOME_DIAGNOSTIC_TAIL_UNACCOUNTED)
+        self.assertEqual(self._fence(session)["outcome"], capture_mod.EVIDENCE_FINAL)
 
-    # -- Lock 7: an agent hangup while the watcher is HELD proves (the darwin production
-    #    reality this iteration corrects) ----------------------------------------------------
-    def test_an_agent_hangup_while_the_watcher_is_held_is_proven(self) -> None:
-        """The darwin fact the iteration-2 finality boundary must respect: the exit watcher
-        holds NO slave descriptor (`standalone_pty.spawn`), so the LAST slave close -- and
-        thus the master hangup -- is the AGENT's own, and it can arrive WHILE THE WATCHER IS
-        STILL ALIVE and deferring (this is what the real codex/claude recovery dispatch does:
-        `await_completion`'s `pump` has already drained the whole capture, so the supervisor's
-        finalizing drain begins already at that agent hangup, `read == 0`).  That hangup is
-        NOT a watcher revoke: the watcher is held, the tty is intact, no tail can have been
-        discarded.  With no other holder on the tty the supervisor PROVES absence while the
-        watcher is held and the hangup is genuine -> COMPLETED.
-
-        RED on the pre-fix iteration-2 tree (a `bcd5c6d`+iter1 first-cut that treated EVERY
-        unauthorised hangup as a revoke -> `watcher_exit_unproven` -> the claude/codex recovery
-        E2E settled BLOCKED); GREEN here.  The complementary direction -- a hangup with the
-        watcher already GONE -> `watcher_exit_unproven` -- is locked by
-        `test_a_watcher_exit_before_an_authorised_release_is_unproven`; together they lock the
-        `_leader_alive` discriminator.
-
-        The production condition is a hangup readable on the master (`select` returns it, the
-        read yields EOF) on the drain's FIRST iteration -- before any quiet window -- WHILE the
-        watcher is still alive.  A plain `sh` agent cannot produce that over a real darwin pty
-        (its master does not report the hangup while the session leader lives, so the drain
-        would instead reach its quiet window and release), so the hangup is injected by pointing
-        the drain's master fd at an already-hung-up pipe (write end closed) after the pump --
-        an immediately-readable EOF -- while the REAL production watcher stays genuinely alive
-        and deferring on the captured tty, which is what the drain's liveness probe reads.  The
-        darwin arm is the load-bearing lock."""
+    # -- Lock 7 (L-01/L-12 in the OS-48 suites): an EOF without the marker proves nothing --
+    def test_an_eof_without_the_marker_authorises_nothing(self) -> None:
+        """# superseded by OS-48: round 10's `test_an_agent_hangup_while_the_watcher_is_held_is_proven`
+        # made a hangup-with-live-watcher the proof.  OS-48: an EOF / hangup is NEVER the proof.
+        The drain's master is pointed at an already-hung-up pipe (an immediately readable EOF)
+        before the marker was ever captured: the drain ends `master_unreadable`, the outcome is
+        `boundary_unproven`, no fence is published, and `_stream_is_final` is False -- on every
+        platform, with the real watcher genuinely alive and holding the slave."""
         session, _sent = self._wired(
-            "printf '{\"type\":\"result\",\"is_error\":false}\\n'\n"
-            "printf '{\"type\":\"result\",\"is_error\":true}\\n'\n"
-            "exit 0\n", run_id="run_r10i2_alive", budget_ms=4000)
-        # Drain the real tail exactly as production's `await_completion` pump does, so the
-        # finalizing drain begins already at the agent's hangup.
-        for _ in range(50):
-            if session.pump(timeout_ms=200) == 0:
-                break
-        transcript = session.capture.transcript()
-        self.assertIn('"is_error":false', transcript, "the pump did not capture the records")
-        self.assertIn('"is_error":true', transcript, "the pump did not capture the records")
-        # The watcher is STILL ALIVE and deferring here (nothing released it): the session
-        # leader is on the captured tty, which is what the drain's liveness probe reads.
-        leader = int(session.pty["leader_pid"])
-        snapshot = pty_supervisor.read_process_table(session.record["captured_tty"])
-        self.assertIsNotNone(pty_supervisor.row_for(snapshot, leader),
-                             "the deferring watcher must still hold the tty before the hangup")
-        # Point the drain at an already-hung-up master: a pipe whose write end is closed reads
-        # EOF on the FIRST `select`+read, exactly like the agent's own last slave close arriving
-        # before any quiet window -- while the real watcher (above) is still alive on the tty.
+            "printf '{\"type\":\"result\",\"is_error\":false}\\n'\nexit 0\n",
+            run_id="run_r10i2_eof", budget_ms=1500, pump=False)
+        real_master = int(session.pty["master_fd"])
         hup_r, hup_w = os.pipe()
         os.close(hup_w)
-
         def _close_hup() -> None:
             with contextlib.suppress(OSError):
                 os.close(hup_r)
         self.addCleanup(_close_hup)
         session.pty["master_fd"] = hup_r
-        drained = session.drain_after_exit(budget_ms=4000)
-        if sys.platform == "darwin":
-            self.assertEqual(drained.get("ended"), "hangup", drained)
-            self.assertTrue(_stream_is_final(drained), drained)
-            proof = self._proof(session)
-            self.assertEqual(proof["outcome"], capture_mod.FINALITY_PROVEN, proof)
-            self.assertEqual(proof["record"]["writer"], capture_mod.WRITER_SUPERVISOR)
-            # the absence proof was taken WHILE THE WATCHER WAS HELD: no holder named.
-            self.assertFalse((drained.get("holders") or {}).get("rows"), drained)
-        else:
-            # On Linux `settle_s == 0`: the slave close is the hangup outright, no guard.
-            self.assertEqual(drained.get("ended"), "hangup", drained)
-            self.assertTrue(_stream_is_final(drained), drained)
+        try:
+            drained = session.drain_after_exit(budget_ms=1500)
+        finally:
+            session.pty["master_fd"] = real_master
+        self.assertEqual(drained.get("ended"), "master_unreadable", drained)
+        self.assertEqual(drained.get("outcome"), capture_mod.OUTCOME_BOUNDARY_UNPROVEN, drained)
+        self.assertFalse(_stream_is_final(drained), drained)
+        self.assertEqual(self._fence(session)["outcome"], "absent", self._fence(session))
 
-    # -- Lock 2: bytes readable at release time (a descendant timed to the release) -------
-    def test_a_descendant_writing_at_release_time_is_never_lost_and_succeeded(self) -> None:
-        """A descendant that keeps the slave and writes right around the settle window is a
-        HOLDER at the quiet check, so the supervisor never releases the watcher into a
-        hangup; the record it writes is therefore never lost-and-succeeded -- the drain is
-        `unproven` (holder present) whether or not that byte was captured."""
+    # -- Lock 2: a descendant writing around the marker is ORDERED by the marker ---------
+    def test_a_descendant_writing_around_the_marker_is_ordered_by_the_marker(self) -> None:
+        """A descendant that keeps the slave and writes right around the reap is ordered by
+        the tty's own byte order: its record is either wholly inside ``[0, N)`` (it preceded
+        the marker -- then it is in the settlement window, honestly) or wholly after the
+        marker (diagnostic).  Either way the drain ends at the marker and the window is
+        positively bounded; at b9aecce this was `budget` + `stream_end_unproven`."""
         session, _sent = self._wired(
             "printf '{\"type\":\"result\",\"is_error\":false}\\n'\n"
             "( sleep 0.15; printf '{\"type\":\"result\",\"is_error\":true}\\n'; sleep 5 ) &\n"
             "exit 0\n", run_id="run_r10i2_race", budget_ms=1200)
         drained = session.drain_after_exit(budget_ms=1200)
-        self.assertFalse(_stream_is_final(drained),
-                         f"a descendant writing at the release window was lost-and-succeeded: "
-                         f"{drained}")
-        self.assertEqual(drained.get("ended"), "budget", drained)
+        self.assertEqual(drained.get("ended"), "marker", drained)
+        self.assertTrue(_stream_is_final(drained), drained)
+        n, mlen = int(drained["offset_n"]), int(drained["marker_len"])
+        raw = self._read_more(session, b'"is_error":true', seconds=3.0)
+        rec = b'{"type":"result","is_error":true}\n'
+        for off in self._offsets(raw, rec):
+            self.assertTrue(off + len(rec) <= n or off >= n + mlen,
+                            f"a record straddles the boundary: off={off} n={n}")
 
-    # -- Lock 8 (iteration 3, F1): a DETACHED (setsid) slave holder is a complete-absence
-    #    counterexample -- `ps -t` is blind to it, the slave-descriptor scan is not ---------
-    def test_a_detached_setsid_slave_holder_with_a_late_record_is_unproven(self) -> None:
-        """The reviewer's iteration-2 counterexample (`detached_holder2.txt`): the agent
-        emits a success record and forks a child that calls ``setsid()`` while KEEPING the
-        pty slave as its 0/1/2, then exits; the child stays quiet past the settle window and
-        writes a late FAILURE record.  Having left the tty session, the child is invisible to
-        the tty-scoped ``ps -t`` probe, so at iteration 2 the empty tty table read as
-        ``proven_absent`` and authorised the watcher release whose revoke truncated the
-        child's tail (its late write got EIO) and the dispatch settled PROVEN over success
-        only.  The COMPLETE slave-descriptor authority (``_slave_device_fd_holders`` via
-        ``lsof`` on the slave DEVICE) catches the off-tty holder: absence is never proven, the
-        watcher is never released, the drain ends by ``budget`` -> UNPROVEN with the holder
-        NAMED, and -- no premature revoke -- the child's late record is preserved.  RED on the
-        iteration-2 tree; darwin is the load-bearing arm."""
+    # -- Lock 8: a DETACHED (setsid) slave holder -- invisible to `ps -t` -- changes nothing
+    def test_a_detached_setsid_slave_holder_late_record_lands_after_the_boundary(self) -> None:
+        """The reviewer's iteration-2 counterexample (`detached_holder2.txt`): the agent emits
+        a success record and forks a child that calls ``setsid()`` while KEEPING the pty slave
+        as its 0/1/2, then exits; the child writes a late FAILURE record.  Round 10 needed a
+        COMPLETE descriptor enumeration to see the off-tty holder.  OS-48 needs NO enumeration:
+        the marker is written at the root's reap, the late record lands after N, the fence is
+        `final` over ``[0, N)`` and -- because the watcher holds the slave -- the child's late
+        write is retained, never EIO'd by a premature revoke."""
         agent = self.room / "detached_agent.py"
         pidfile = self.room / "holder.pid"
         agent.write_text(
@@ -497,7 +525,7 @@ class Iteration2FinalityBoundaryTests(unittest.TestCase):
             "    os.setsid()\n"                       # leave the tty session, KEEP slave 0/1/2
             "    signal.signal(signal.SIGHUP, signal.SIG_IGN)\n"
             "    open(%r, 'w').write(str(os.getpid()))\n" % str(pidfile) +
-            "    time.sleep(0.4)\n"
+            "    while not os.path.exists(%r): time.sleep(0.005)\n" % str(self.room / "detached.go") +
             "    try: os.write(1, b'{\"type\":\"result\",\"is_error\":true}\\n')\n"
             "    except OSError: pass\n"
             "    time.sleep(5)\n"
@@ -517,88 +545,98 @@ class Iteration2FinalityBoundaryTests(unittest.TestCase):
         self.addCleanup(_kill_holder)
         os.kill(holder, 0)                            # the off-tty holder is alive
         drained = session.drain_after_exit(budget_ms=1500)
-        holders = drained.get("holders") or {}
-        if sys.platform == "darwin":
-            self.assertEqual(drained.get("ended"), "budget", drained)
-            self.assertFalse(_stream_is_final(drained), drained)
-            self.assertIn(holder, holders.get("fd_holders") or [],
-                          f"the detached slave holder was not named in the evidence: {holders}")
-            proof = self._proof(session)
-            self.assertEqual(proof["outcome"], capture_mod.FINALITY_UNPROVEN, proof)
-            os.kill(holder, 0)                        # never revoked out from under it
-            # the holder's late record was preserved (no premature revoke)
-            self.assertIn('"is_error":true', session.capture.transcript(), drained)
-        else:
-            self.assertFalse(_stream_is_final(drained), drained)
+        self.assertEqual(drained.get("ended"), "marker", drained)
+        self.assertTrue(_stream_is_final(drained), drained)
+        n = int(drained["offset_n"])
+        self.assertNotIn(b'"is_error":true', session.capture.raw()[:n])
+        (self.room / "detached.go").write_text("go")     # HANDSHAKE (F-007): write after N is bound
+        raw = self._read_more(session, b'"is_error":true', seconds=3.0)
+        late = self._offsets(raw, b'"is_error":true')
+        self.assertTrue(late, "the detached holder's late record was lost (premature revoke)")
+        self.assertGreaterEqual(min(late), n + int(drained["marker_len"]))
+        os.kill(holder, 0)                            # never revoked out from under it
+        self.assertEqual(self._fence(session)["outcome"], capture_mod.EVIDENCE_FINAL)
 
 
 # =====================================================================================
-# Iteration 4 -- the COMPLETE, fail-closed libproc slave-descriptor authority (option B)
+# Iteration 4/5 libproc enumeration, OS-48 form -- a DIAGNOSTIC, never an authority
 # =====================================================================================
-class Iteration4LibprocAuthorityTests(Iteration2FinalityBoundaryTests):
-    """[P1] Iteration 4/5: the darwin ``libproc`` slave-descriptor authority (option B) that gates
-    the supervisor's release of the deferring watcher and the orphan finalizer.  Iteration 5
-    corrects four native defects the iter-4 reviewer found INSIDE the authority (all verified
-    against real darwin ``libproc`` semantics -- ``proc_listallpids`` returns an ENTRY COUNT; a
-    process's identity read and its fd listing are permitted by the kernel iff it is our uid; the
-    ``vnode_fdinfowithpath`` structure is 1200 bytes; a non-vnode or closed fd both read ``EBADF``):
+class LibprocDiagnosticsTests(_WiredRoom):
+    """# superseded by OS-48: `Iteration4LibprocAuthorityTests` -- the "COMPLETE, fail-closed
+    # slave-descriptor authority" whose `proven_absent` gated the watcher release.
 
-    * F1 -- the pid listing uses the ENTRY count directly (never ``// sizeof(int32)``, which
-      dropped three quarters of the table) and rejects truncation/growth.
-    * F2 -- the gate for inspecting a process is FD INSPECTABILITY, not an identity read: a
-      same-uid holder whose ``PROC_PIDTBSDINFO`` is denied is still caught because its fd LISTING
-      succeeds; a process whose fd listing the kernel denies is (we are not root) provably not our
-      uid and cannot hold a mode-0620 owner-uid slave (``other_uid``); changed-uid descendants are
-      explicitly out of scope, not falsely claimed.
-    * F3 -- a per-fd failure is a MOVING fd table (a holder can ``dup2`` the slave onto a former
-      pipe fd and close the originals): the process is re-scanned over a FRESH listing until two
-      consecutive complete identical scans agree, bounded; never a "raced, not a holder" skip.
-    * F4 -- a fixed-offset decode requires the EXACT structure length; a positive SHORT read is
-      ``unenumerable`` for that pid, never decoded from the zero-filled buffer.
-
-    A per-fd ``EPERM`` is the ONE thing skipped (recorded, not silent): a pty slave vnode is never
-    permission-restricted, so a fd macOS refuses to introspect is provably not the slave; without
-    this a host with any TCC-restricted-fd launchd agent would be permanently ``unreadable``.  The
-    real-PTY detached-holder / positive-path locks live in the parent (inherited)."""
+    OS-48 (ANALYSIS F0, DESIGN I-1/§2.6): a negative whole-process-table / descriptor scan is
+    never evidence of anything (`proc_listallpids` / `PROC_PIDLISTFDS` / `PROC_PIDFDVNODEPATHINFO`
+    are non-atomic; fork / SCM_RIGHTS / close between them defeat every negative).  The
+    enumeration survives as a DIAGNOSTIC: its states are `present` / `unreadable` /
+    `none_observed` (the word "proven" does not occur), denied / short / stale reads are
+    `unreadable` BY NAME, and no decision function reaches it (the last lock here).  The same
+    iter-5 constructions (F1-F4) are kept as diagnostic-layer regressions: they must still
+    NAME what they saw."""
 
     def _clean_slave(self):
         session, _sent = self._wired("printf 'x\\n'\nexit 0\n", run_id="run_r10i4_clean",
                                      budget_ms=1500)
         return session
 
-    def test_the_deferring_watcher_holds_no_slave_descriptor(self) -> None:
-        """The spawn invariant the whole model rests on: the exit watcher (session leader) holds
-        NO slave descriptor, so the last slave close -- and thus the hangup its release delivers
-        -- is the agent's own.  The libproc authority must NOT find the leader among the holders."""
+    def _holder_scan(self) -> dict:
+        """Scan the holder fixture's slave, excluding the agent and the watcher (which HOLDS the
+        owner reference by design)."""
+        return pty_supervisor.slave_device_holders(self._holder_slave,
+                                                   exclude_pids=self._holder_exclude)
+
+    def _scan(self, session) -> dict:
+        return pty_supervisor.slave_device_holders(
+            session.pty["slave_name"],
+            exclude_pids=(int(session.record["pid"]), int(session.pty["leader_pid"])))
+
+    def test_the_watcher_holds_the_owner_slave_reference(self) -> None:
+        """OS-48 G1 inverts the round-10 spawn invariant: the exit watcher (session leader) HOLDS
+        ONE slave reference (nothing can be discarded while it is held; it writes the marker
+        through it).  The diagnostic must SEE the leader among the holders when it is not
+        excluded."""
         if sys.platform != "darwin":
             return
         session = self._clean_slave()
         leader = int(session.pty["leader_pid"])
-        holders = pty_supervisor.slave_device_holders(session.pty["slave_name"])
-        self.assertNotIn(leader, holders.get("holders") or [],
-                         f"the exit watcher holds a slave descriptor: {holders}")
+        holders = pty_supervisor.slave_device_holders(session.pty["slave_name"],
+                                                      exclude_pids=(int(session.record["pid"]),))
+        self.assertIn(leader, holders.get("holders") or [],
+                      f"the watcher does not hold the owner slave reference: {holders}")
+        self.assertEqual(holders.get("state"), "present")
 
-    def test_a_clean_slave_proves_absent_despite_other_uid_processes(self) -> None:
-        """A clean slave (no same-uid holder) is `proven_absent` even though the host is full of
-        OTHER-uid processes whose fd listings the kernel denies us -- they are the diagnostic
-        `other_uid` bucket and never block the proof, and no genuinely-restricted same-uid fd
-        makes the scan `unreadable`."""
+    def test_a_clean_slave_is_never_positively_absent(self) -> None:
+        """A clean slave (no same-uid holder besides the excluded watcher) on a host full of
+        OTHER-uid processes whose fd listings the kernel denies: the diagnostic is `unreadable`
+        with every denied listing NAMED (`listing_denied`) -- never `proven_absent`, never a
+        silent `other_uid` skip -- and holds no holder."""
         if sys.platform != "darwin":
             return
         session = self._clean_slave()
         session.drain_after_exit(budget_ms=1500)
-        holders = pty_supervisor.slave_device_holders(
-            session.pty["slave_name"],
-            exclude_pids=(int(session.record["pid"]), int(session.pty["leader_pid"])))
-        self.assertEqual(holders.get("state"), "proven_absent", holders)
-        self.assertTrue(holders.get("other_uid"), "no other-uid processes were listed at all")
-        self.assertFalse(holders.get("unenumerable"), holders)
+        holders = self._scan(session)
+        self.assertNotEqual(holders.get("state"), "present", holders)
+        self.assertNotIn("proven", str(holders.get("state")))
+        self.assertIn(holders.get("state"), ("unreadable", "none_observed"), holders)
+        self.assertFalse(holders.get("holders"), holders)
+        if holders["state"] == "unreadable":
+            # superseded by OS-48 (i3/i4 F-004, versioned in i8): the fd cross-check names its
+            # own unreadable states -- an fd table beyond the bounded walk (`fd_walk_unbounded`),
+            # an unreadable table size, a partial fill -- all honest "unreadable", never clean
+            self.assertTrue(all(u.get("errno") in ("listing_denied", "fd_denied",
+                                                     "stale_revoked_fd",
+                                                     "fd_table_never_stabilised",
+                                                     "fd_walk_unbounded",
+                                                     "fd_table_size_unreadable",
+                                                     "listing_partial_fill")
+                                or isinstance(u.get("errno"), int)
+                                for u in holders["unenumerable"]), holders)
+            self.assertTrue(any(u.get("errno") == "listing_denied"
+                                for u in holders["unenumerable"]), holders)
 
     def test_the_pid_listing_returns_every_entry_not_a_quarter(self) -> None:
-        """F1: `proc_listallpids` returns the number of PID ENTRIES, so the authority must scan
-        the whole table.  The production listing must return ~as many pids as the raw native
-        nonzero count -- NOT a quarter of it (the `// sizeof(int32)` regression scanned 1/4 and
-        silently omitted a holder past the prefix, reviewer iter5 F1)."""
+        """F1 (kept, diagnostic layer): `proc_listallpids` returns the number of PID ENTRIES;
+        the listing must return the whole table, not a quarter of it."""
         if sys.platform != "darwin":
             return
         n = pty_supervisor._LIBPROC.proc_listallpids(None, 0)
@@ -607,16 +645,15 @@ class Iteration4LibprocAuthorityTests(Iteration2FinalityBoundaryTests):
         native_nonzero = len([1 for i in range(len(buf)) if buf[i] > 0])
         pids, reason = pty_supervisor._libproc_list_all_pids()
         self.assertIsNotNone(pids, f"listing failed: {reason}")
-        # the production listing is the whole table, not a quarter of it
         self.assertGreater(len(pids), (got // 4) + 8,
                            f"the listing looks byte-length-divided: {len(pids)} vs got//4={got // 4}")
         self.assertGreaterEqual(len(pids), int(native_nonzero * 0.6),
                                 f"the listing dropped most of the table: {len(pids)} of {native_nonzero}")
 
     def test_a_quarter_count_listing_misses_a_tail_holder_MUTATION(self) -> None:
-        """F1 mutation: a listing that keeps only the first quarter of the entries (the byte-length
-        regression) drops a holder whose pid sits past that prefix, so the authority reads absence
-        over a live holder.  That the real full-count listing prevents this is the lock."""
+        """F1 mutation (diagnostic layer): a quarter-count listing drops a live holder past the
+        prefix -- the diagnostic then fails to NAME it (`present` is missed).  That the real
+        full-count listing names it is the lock; nothing downstream depends on either."""
         if sys.platform != "darwin":
             return
         holder = self._spawn_setsid_holder()
@@ -628,19 +665,17 @@ class Iteration4LibprocAuthorityTests(Iteration2FinalityBoundaryTests):
                 return pids, reason
             keep = pids[: max(1, len(pids) // 4)]
             if holder in pids and holder not in keep:
-                return keep, None                 # holder pushed past the truncated prefix
+                return keep, None
             return [p for p in keep if p != holder], None
         pty_supervisor._libproc_list_all_pids = _quarter
         self.addCleanup(setattr, pty_supervisor, "_libproc_list_all_pids", real)
-        holders = pty_supervisor.slave_device_holders(self._holder_slave)
-        self.assertEqual(holders.get("state"), "proven_absent",
-                         f"the quarter-count mutation did not hide the tail holder: {holders}")
+        holders = self._holder_scan()
+        self.assertNotIn(holder, holders.get("holders") or [], holders)
+        self.assertNotEqual(holders.get("state"), "present", holders)
 
     def test_a_holder_with_denied_identity_is_still_caught_by_fd_inspection(self) -> None:
-        """F2: a live same-uid setsid holder whose IDENTITY read (`PROC_PIDTBSDINFO`) is denied is
-        NEVER classified other-uid and skipped (the iter-4 defect).  Its fd LISTING still succeeds,
-        so the authority inspects its descriptors directly and finds the slave -> `present`, never
-        `proven_absent`.  The denied identity is not on the proof path at all."""
+        """F2 (kept): a live same-uid setsid holder whose IDENTITY read is denied is still
+        NAMED `present` through its fd listing."""
         if sys.platform != "darwin":
             return
         holder = self._spawn_setsid_holder()
@@ -652,16 +687,15 @@ class Iteration4LibprocAuthorityTests(Iteration2FinalityBoundaryTests):
             return _real(pid, flavor, size)
         pty_supervisor._libproc_pidinfo = _deny_identity
         self.addCleanup(setattr, pty_supervisor, "_libproc_pidinfo", real)
-        holders = pty_supervisor.slave_device_holders(self._holder_slave)
+        holders = self._holder_scan()
         self.assertEqual(holders.get("state"), "present", holders)
-        self.assertIn(holder, holders.get("holders") or [],
-                      f"the denied-identity holder was not caught via fd inspection: {holders}")
+        self.assertIn(holder, holders.get("holders") or [], holders)
 
-    def test_a_denied_fd_listing_is_other_uid_not_unenumerable(self) -> None:
-        """F2: a process whose fd LISTING the kernel denies (`EPERM`) is, since we are not root,
-        provably not our uid; a mode-0620 owner-uid pty slave cannot be open in it, so it is the
-        diagnostic `other_uid` bucket and does NOT make the proof `unreadable`.  (Changed-uid
-        `setuid` descendants are out of this authority's scope and are not claimed as covered.)"""
+    def test_a_denied_fd_listing_is_unreadable_not_absence(self) -> None:
+        """# superseded by OS-48: `test_a_denied_fd_listing_is_other_uid_not_unenumerable` read a
+        # denied listing as the `other_uid` bucket that "cannot hold the slave".
+        OS-48 I-2: a denied read is UNREADABLE evidence, named `listing_denied` for that pid;
+        the diagnostic is `unreadable`, never an absence."""
         if sys.platform != "darwin":
             return
         session = self._clean_slave()
@@ -675,19 +709,16 @@ class Iteration4LibprocAuthorityTests(Iteration2FinalityBoundaryTests):
             return _real(pid)
         pty_supervisor._libproc_list_vnode_fds = _deny_listing
         self.addCleanup(setattr, pty_supervisor, "_libproc_list_vnode_fds", real)
-        holders = pty_supervisor.slave_device_holders(
-            session.pty["slave_name"],
-            exclude_pids=(int(session.record["pid"]), int(session.pty["leader_pid"])))
-        self.assertIn(me, holders.get("other_uid") or [], holders)
-        self.assertFalse(any(u.get("pid") == me for u in holders.get("unenumerable") or ()), holders)
-        self.assertEqual(holders.get("state"), "proven_absent", holders)
+        holders = self._scan(session)
+        self.assertNotIn(me, holders.get("other_uid") or [], holders)
+        rows = [u for u in holders.get("unenumerable") or () if u.get("pid") == me]
+        self.assertEqual([u.get("errno") for u in rows], ["listing_denied"], holders)
+        self.assertEqual(holders.get("state"), "unreadable", holders)
 
-    def test_a_relocated_slave_is_caught_never_proven_absent(self) -> None:
-        """F3: a holder that, DURING the scan, `dup2`s the slave onto a descriptor that was a pipe
-        in the fresh listing and closes 0/1/2 (so the originals read EBADF) must NOT read as
-        absent.  The stable double scan over a FRESH listing re-reads the fd types and finds the
-        relocated slave -> `present` (or `unreadable` if the table never settles), never
-        `proven_absent`."""
+    def test_a_relocated_slave_is_caught_never_absent(self) -> None:
+        """F3 (kept): a holder that `dup2`-relocates the slave DURING the scan is re-scanned
+        over a FRESH listing -> `present` (or `unreadable` if the table never settles), never
+        `none_observed`."""
         if sys.platform != "darwin":
             return
         holder, cmd, ack = self._spawn_relocating_holder()
@@ -704,16 +735,13 @@ class Iteration4LibprocAuthorityTests(Iteration2FinalityBoundaryTests):
             return _real(pid, fd)
         pty_supervisor._libproc_fd_devino = _seam
         self.addCleanup(setattr, pty_supervisor, "_libproc_fd_devino", real)
-        holders = pty_supervisor.slave_device_holders(self._holder_slave)
-        self.assertNotEqual(holders.get("state"), "proven_absent",
-                            f"a relocated live slave was read as absent: {holders}")
+        holders = self._holder_scan()
+        self.assertNotEqual(holders.get("state"), "none_observed", holders)
         self.assertIn(holders.get("state"), ("present", "unreadable"), holders)
 
     def test_treating_a_relocation_ebadf_as_gone_is_caught_MUTATION(self) -> None:
-        """F3 mutation: if a per-fd EBADF is treated as the whole process being gone, the holder's
-        closed original descriptors drop the process before its FRESH listing can reveal the
-        relocated slave -> absence over a live holder.  That the real code re-scans instead is the
-        lock."""
+        """F3 mutation (diagnostic layer): EBADF-as-gone drops the relocating holder before
+        the fresh listing reveals the relocated slave, so it is never NAMED."""
         if sys.platform != "darwin":
             return
         holder, cmd, ack = self._spawn_relocating_holder()
@@ -733,15 +761,14 @@ class Iteration4LibprocAuthorityTests(Iteration2FinalityBoundaryTests):
             return devino, e
         pty_supervisor._libproc_fd_devino = _mutate
         self.addCleanup(setattr, pty_supervisor, "_libproc_fd_devino", real)
-        holders = pty_supervisor.slave_device_holders(self._holder_slave)
-        self.assertEqual(holders.get("state"), "proven_absent",
-                         f"the EBADF-as-gone mutation did not hide the relocated holder: {holders}")
+        holders = self._holder_scan()
+        self.assertNotIn(holder, holders.get("holders") or [], holders)
+        self.assertNotEqual(holders.get("state"), "present", holders)
 
-    def test_a_bystander_that_closes_a_fd_once_still_proves_absent(self) -> None:
-        """F3 positive: a BYSTANDER (not a holder) that closes a vnode fd once during the scan
-        makes one per-fd query EBADF; the process is re-scanned over a fresh listing and, being
-        clean and now stable, does NOT block the proof -- ordinary fd-table churn on a busy host
-        still converges to `proven_absent` within the retry bound (the F01-under-load guarantee)."""
+    def test_a_bystander_that_closes_a_fd_once_is_rescanned(self) -> None:
+        """F3 positive (kept): a BYSTANDER that closes a vnode fd once during the scan is
+        re-scanned over a fresh listing and, being clean and stable, is neither a holder nor
+        `unenumerable`."""
         if sys.platform != "darwin":
             return
         session = self._clean_slave()
@@ -757,17 +784,34 @@ class Iteration4LibprocAuthorityTests(Iteration2FinalityBoundaryTests):
             return _real(pid, fd)
         pty_supervisor._libproc_fd_devino = _flap
         self.addCleanup(setattr, pty_supervisor, "_libproc_fd_devino", real)
-        holders = pty_supervisor.slave_device_holders(
-            session.pty["slave_name"],
-            exclude_pids=(int(session.record["pid"]), int(session.pty["leader_pid"])))
-        self.assertEqual(holders.get("state"), "proven_absent", holders)
-        self.assertFalse(holders.get("unenumerable"), holders)
+        holders = self._scan(session)
+        self.assertNotEqual(holders.get("state"), "present", holders)
+        self.assertFalse(any(u.get("pid") == me for u in holders.get("unenumerable") or ()), holders)
 
     def test_a_race_exited_candidate_is_gone_not_unreadable(self) -> None:
-        """A same-uid candidate that EXITS during the scan (`proc_pidfdinfo` -> ESRCH) has
-        released every descriptor at exit, so it is `gone` (diagnostic) and does NOT make the
-        authority `unreadable`: a genuinely clean slave still proves absent while a busy host
-        churns transient same-uid pids."""
+        """Kept: a candidate whose LISTING vanishes (ESRCH) has exited -- it is `gone`
+        (diagnostic), not `unenumerable`."""
+        if sys.platform != "darwin":
+            return
+        session = self._clean_slave()
+        session.drain_after_exit(budget_ms=1500)
+        me = os.getpid()
+        real = pty_supervisor._libproc_list_vnode_fds
+
+        def _vanish(pid, _real=real):
+            if pid == me:
+                return None, errno.ESRCH
+            return _real(pid)
+        pty_supervisor._libproc_list_vnode_fds = _vanish
+        self.addCleanup(setattr, pty_supervisor, "_libproc_list_vnode_fds", real)
+        holders = self._scan(session)
+        self.assertIn(me, holders.get("gone") or [], holders)
+        self.assertFalse(any(u.get("pid") == me for u in holders.get("unenumerable") or ()), holders)
+
+    def test_a_revoked_fd_enoent_is_stale_not_gone(self) -> None:
+        """The twin (DESIGN W-F9; ANALYSIS probe_03 part 2): a per-fd ENOENT on a LIVE process is
+        a REVOKED (stale) vnode, never "the process is gone" -- named `stale_revoked_fd`, the
+        diagnostic `unreadable`, the pid NOT in `gone`."""
         if sys.platform != "darwin":
             return
         session = self._clean_slave()
@@ -775,23 +819,21 @@ class Iteration4LibprocAuthorityTests(Iteration2FinalityBoundaryTests):
         me = os.getpid()
         real = pty_supervisor._libproc_fd_devino
 
-        def _vanish(pid, fd, _real=real):
+        def _stale(pid, fd, _real=real):
             if pid == me:
-                return None, errno.ESRCH
+                return None, errno.ENOENT
             return _real(pid, fd)
-        pty_supervisor._libproc_fd_devino = _vanish
+        pty_supervisor._libproc_fd_devino = _stale
         self.addCleanup(setattr, pty_supervisor, "_libproc_fd_devino", real)
-        holders = pty_supervisor.slave_device_holders(
-            session.pty["slave_name"],
-            exclude_pids=(int(session.record["pid"]), int(session.pty["leader_pid"])))
-        self.assertEqual(holders.get("state"), "proven_absent", holders)
-        self.assertIn(me, holders.get("gone") or [], holders)
-        self.assertFalse(any(u.get("pid") == me for u in holders.get("unenumerable") or ()), holders)
+        holders = self._scan(session)
+        self.assertNotIn(me, holders.get("gone") or [], holders)
+        rows = [u for u in holders.get("unenumerable") or () if u.get("pid") == me]
+        self.assertEqual([u.get("errno") for u in rows], ["stale_revoked_fd"], holders)
+        self.assertEqual(holders.get("state"), "unreadable", holders)
 
     def test_a_short_per_fd_read_is_unenumerable(self) -> None:
-        """F4: a positive but SHORT `proc_pidfdinfo` return (fewer than the 1200-byte structure)
-        for a live holder's descriptors must never be decoded from the zero-filled buffer; the
-        holder is `unenumerable` and the authority `unreadable`, never `proven_absent`."""
+        """F4 (kept): a positive SHORT `proc_pidfdinfo` return is never decoded; the holder is
+        `unenumerable` and the diagnostic `unreadable`."""
         if sys.platform != "darwin":
             return
         holder = self._spawn_setsid_holder()
@@ -807,16 +849,14 @@ class Iteration4LibprocAuthorityTests(Iteration2FinalityBoundaryTests):
                 return realL.proc_pidfdinfo(pid, fd, flavor, buf, size)
         pty_supervisor._LIBPROC = _Short()
         self.addCleanup(setattr, pty_supervisor, "_LIBPROC", realL)
-        holders = pty_supervisor.slave_device_holders(self._holder_slave)
+        holders = self._holder_scan()
         self.assertEqual(holders.get("state"), "unreadable", holders)
         self.assertTrue(any(u.get("pid") == holder for u in holders.get("unenumerable") or ()),
                         f"the short-read holder was not named unenumerable: {holders}")
 
     def test_accepting_a_short_read_is_caught_MUTATION(self) -> None:
-        """F4 mutation: a decode that accepts a short read (the iter-4 `got <= 0`-only check)
-        yields a garbage `(dev, ino)` that fails the match, so the live holder is silently missed
-        and absence is wrongly proven.  That the real exact-size gate refuses the decode is the
-        lock."""
+        """F4 mutation (diagnostic layer): a decode that accepts a short read yields garbage
+        that fails the match, so the live holder is never NAMED."""
         if sys.platform != "darwin":
             return
         holder = self._spawn_setsid_holder()
@@ -828,13 +868,11 @@ class Iteration4LibprocAuthorityTests(Iteration2FinalityBoundaryTests):
             return _real(pid, fd)
         pty_supervisor._libproc_fd_devino = _accept_short
         self.addCleanup(setattr, pty_supervisor, "_libproc_fd_devino", real)
-        holders = pty_supervisor.slave_device_holders(self._holder_slave)
-        self.assertEqual(holders.get("state"), "proven_absent",
-                         f"accepting a garbage short read failed to hide the holder: {holders}")
+        holders = self._holder_scan()
+        self.assertNotIn(holder, holders.get("holders") or [], holders)
 
     def test_a_failed_process_listing_is_unreadable(self) -> None:
-        """If `proc_listallpids` itself fails, the authority is `unreadable` -- the scan could not
-        even begin, so absence is not proven."""
+        """Kept: if `proc_listallpids` itself fails, the diagnostic is `unreadable`."""
         if sys.platform != "darwin":
             return
         holder = self._spawn_setsid_holder()
@@ -845,32 +883,31 @@ class Iteration4LibprocAuthorityTests(Iteration2FinalityBoundaryTests):
             return -1
         pty_supervisor._LIBPROC.proc_listallpids = _fail
         self.addCleanup(setattr, pty_supervisor._LIBPROC, "proc_listallpids", real)
-        holders = pty_supervisor.slave_device_holders(self._holder_slave)
+        holders = self._holder_scan()
         self.assertEqual(holders.get("state"), "unreadable", holders)
         _ = holder
 
-    def test_skipping_a_holder_pid_is_caught(self) -> None:
-        """Adversarial mutation: make the authority SILENTLY return `proven_absent` despite a live
-        holder (the lsof defect).  Under the mutation the inherited detached-holder lock's
-        `unproven` assertion FAILS; MUTATION_CAUGHT confirms the lock depends on the authority."""
-        if sys.platform != "darwin":
-            return
-        real = pty_supervisor.slave_device_holders
-
-        def _skip_holder(slave_name, *, exclude_pids=()):
-            return {"method": "libproc", "state": "proven_absent", "holders": [],
-                    "unenumerable": [], "other_uid": [], "gone": [], "device": slave_name}
-        pty_supervisor.slave_device_holders = _skip_holder
-        try:
-            caught = False
-            try:
-                self.test_a_detached_setsid_slave_holder_with_a_late_record_is_unproven()
-            except AssertionError:
-                caught = True
-            self.assertTrue(caught, "skipping the holder was NOT caught: the lock does not "
-                            "depend on the complete authority")
-        finally:
-            pty_supervisor.slave_device_holders = real
+    def test_the_enumeration_is_not_on_any_decision_path(self) -> None:
+        """# superseded by OS-48: `test_skipping_a_holder_pid_is_caught` proved the finality lock
+        # DEPENDED on the enumeration.  OS-48 proves the opposite (DESIGN L-14 shape): both
+        enumerations are replaced by functions that RAISE; the production drain, fence
+        publication and two-phase release still complete `final` -- no decision reaches them."""
+        def _boom(*_a, **_k):
+            raise AssertionError("a decision path consulted the holder enumeration")
+        for name in ("slave_device_holders", "_slave_holders", "_slave_holder_state",
+                     "_slave_device_fd_holders"):
+            if hasattr(pty_supervisor, name):
+                real = getattr(pty_supervisor, name)
+                setattr(pty_supervisor, name, _boom)
+                self.addCleanup(setattr, pty_supervisor, name, real)
+        session, _sent = self._wired(
+            "printf '{\"type\":\"result\",\"is_error\":false}\\n'\nexit 0\n",
+            run_id="run_r10i4_nodecision", budget_ms=3000)
+        drained = session.drain_after_exit(budget_ms=3000)
+        self.assertEqual(drained.get("ended"), "marker", drained)
+        self.assertTrue(_stream_is_final(drained), drained)
+        released = session._release_two_phase()
+        self.assertEqual(released["state"], capture_mod.EVIDENCE_FINAL, released)
 
     # -- helper: a live same-uid setsid holder retaining the slave stdio ------------------
     def _spawn_setsid_holder(self) -> int:
@@ -889,6 +926,7 @@ class Iteration4LibprocAuthorityTests(Iteration2FinalityBoundaryTests):
         session, _sent = self._wired(f"exec {sys.executable} {agent}\n",
                                      run_id="run_r10i4_holder", budget_ms=1500)
         self._holder_slave = session.pty["slave_name"]
+        self._holder_exclude = (int(session.record["pid"]), int(session.pty["leader_pid"]))
         deadline = time.time() + 5
         while not pidfile.exists() and time.time() < deadline:
             time.sleep(0.02)
@@ -930,6 +968,7 @@ class Iteration4LibprocAuthorityTests(Iteration2FinalityBoundaryTests):
         session, _sent = self._wired(f"exec {sys.executable} {agent}\n",
                                      run_id="run_r10i5_reloc", budget_ms=1500)
         self._holder_slave = session.pty["slave_name"]
+        self._holder_exclude = (int(session.record["pid"]), int(session.pty["leader_pid"]))
         deadline = time.time() + 5
         while not pidfile.exists() and time.time() < deadline:
             time.sleep(0.02)
@@ -944,14 +983,14 @@ class Iteration4LibprocAuthorityTests(Iteration2FinalityBoundaryTests):
 
 
 
-
-
 # =====================================================================================
 # Item 2 -- the slave-holder probe is tri-state; unreadable is never absence  (+ follow-up c)
 # =====================================================================================
 class Item2SlaveHolderTriStateTests(unittest.TestCase):
     """[P1] `_slave_holders` records whether each probe COMPLETED, and
-    `_slave_holder_state` yields `present` / `proven_absent` / `unreadable`.  At `bcd5c6d`
+    `_slave_holder_state` yields `present` / `none_observed` / `unreadable` (OS-48: a
+    DIAGNOSTIC -- `none_observed` replaces `proven_absent`; the non-positive `killpg` guard
+    lock is retained, DESIGN L-11).  At `bcd5c6d`
     `_slave_holders` collapsed a failed `tcgetpgrp` / unreadable `/proc` / skipped fd into
     `foreground_group_present=None, rows=[]`, and `_slave_holder_present` read that as
     ABSENCE -> `proven`."""
@@ -1016,16 +1055,18 @@ class Item2SlaveHolderTriStateTests(unittest.TestCase):
             isdir=lambda _p: False)
         self.assertEqual(calls, [], "killpg was called for a non-positive foreground pgid")
         self.assertIs(holders["foreground_group_present"], False)
-        self.assertEqual(pty_supervisor._slave_holder_state(holders), "proven_absent")
+        self.assertEqual(pty_supervisor._slave_holder_state(holders), "none_observed")
 
-    def test_a_complete_empty_probe_is_proven_absent(self) -> None:
+    def test_a_complete_empty_probe_is_none_observed(self) -> None:
+        """# superseded by OS-48: `test_a_complete_empty_probe_is_proven_absent` -- an empty
+        # tty-scoped probe is `none_observed` (diagnostic), never a positive absence."""
         master = self._real_master()
         holders = pty_supervisor._slave_holders(
             master, self._slave_name,
             tcgetpgrp=lambda _fd: 999999,
             killpg=lambda _p, _s: (_ for _ in ()).throw(ProcessLookupError()),
             isdir=lambda _p: False)
-        self.assertEqual(pty_supervisor._slave_holder_state(holders), "proven_absent")
+        self.assertEqual(pty_supervisor._slave_holder_state(holders), "none_observed")
 
     def test_a_present_foreground_group_is_present(self) -> None:
         master = self._real_master()

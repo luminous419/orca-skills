@@ -1,6 +1,12 @@
 """OS-37 BUGFIX (run_829ca55e36c9): one behaviour-based lock per merge blocker of the
 consolidated external review of head `fc21012` (issuecomment-5680361023).
 
+VERSIONED BY OS-48 (run_f820764749d6, W-F9): item 1's `os37.capture_finalized.v1` proof
+(whole-file length + digest after a quiet drain; `stream_end_unproven`) is retired.  The
+OS-48 proof is the FENCE `os48.capture_fence.v1` -- a positive boundary N at the in-band
+marker with sha256(capture[0,N)) -- and its named non-success is `boundary_unproven`.  The
+item-1 classes below are rewritten over the fence; items 2-6 are unaffected.
+
 Each test FAILS at `fc21012` and passes after the fix, and each exercises PRODUCTION
 wiring -- `standalone_capture`'s finalized-proof contract over a REAL pty, the exit
 watcher's forked drain, `StandaloneSession.await_completion` / `drain_after_exit`, the
@@ -72,91 +78,139 @@ CONFORMANCE = REPO / "docs" / "conformance" / "OS37_CONFORMANCE.md"
 
 
 # =====================================================================================
-# Item 1 -- the capture-finalized proof, distinct from the exit sentinel
+# Item 1 -- the capture FENCE (OS-48), distinct from the exit sentinel
 # =====================================================================================
-class Item1FinalizedProofContractTests(unittest.TestCase):
+# superseded by OS-48: `Item1FinalizedProofContractTests` locked `os37.capture_finalized.v1`
+# (a whole-file length+digest proof written after a quiet drain).  The OS-48 proof is the
+# FENCE `os48.capture_fence.v1`: a positive boundary N (the in-band marker's offset) with
+# sha256(capture[0,N)); bytes after N are diagnostic and never disturb it.
+def _fence_record(*, fence: str, nonce: str, data: bytes, exit_how: str = "exit_sentinel",
+                  exit_code: int | None = 0, **over: Any) -> dict[str, Any]:
+    offset_n, marker_len, state = capture_mod.marker_span(data, nonce)
+    assert state == capture_mod.EVIDENCE_FINAL, state
+    args = dict(fence=fence, emitter={"pid": 1, "start_id": 1, "boot_id": "b"}, emitter_pgid=1,
+                offset_n=offset_n, marker_len=marker_len, marker_nonce=nonce,
+                sha256_prefix=capture_mod.prefix_digest(data, offset_n),
+                tail_bytes_at_publish=len(data) - offset_n - marker_len, exit_how=exit_how,
+                exit_code=exit_code, reaped_by=None,
+                owner={"owner_role": capture_mod.OWNER_SUPERVISOR, "generation": 1,
+                       "owner": {"pid": 2, "start_id": 2, "boot_id": "b"}},
+                evidence_source="test", provenance=["test"], published_at="t")
+    args.update(over)
+    return capture_mod.make_capture_fence(**args)
+
+
+class Item1FenceContractTests(unittest.TestCase):
     def setUp(self) -> None:
         self.base = Path(tempfile.mkdtemp(prefix="os37-r9-i1c-"))
         self.addCleanup(shutil.rmtree, self.base, True)
         self.capture = self.base / "capture.log"
-        self.capture.write_bytes(b'{"type":"result","subtype":"success"}\n')
+        self.nonce = "0" * 32
+        self.capture.write_bytes(b'{"type":"result","subtype":"success"}\n'
+                                 + capture_mod.marker_bytes(self.nonce))
         self.fence = "sess:i-1"
 
-    def _proof(self, **over: Any) -> bytes:
-        args = dict(fence=self.fence, finality=capture_mod.FINALITY_PROVEN,
-                    writer=capture_mod.WRITER_EXIT_WATCHER, ended="hangup", errno_name="",
-                    total_bytes=self.capture.stat().st_size,
-                    sha256=capture_mod._digest_of(self.capture).hexdigest(),
-                    records=1, exit_how="exit_sentinel", exit_code=0)
-        args.update(over)
-        path = capture_mod.capture_finalized_path(os.fsencode(str(self.capture)), "i-1")
-        capture_mod.write_capture_finalized(path, **args)
+    def _publish(self, **over: Any) -> bytes:
+        record = _fence_record(fence=self.fence, nonce=self.nonce,
+                               data=self.capture.read_bytes(), **over)
+        path = capture_mod.capture_fence_path(os.fsencode(str(self.capture)), "i-1")
+        self.assertTrue(capture_mod.write_capture_fence(path, record))
         return path
 
-    def test_a_proven_record_binds_the_capture_and_the_sentinel(self) -> None:
-        path = self._proof()
-        read = capture_mod.read_capture_finalized(path, fence=self.fence)
-        self.assertEqual(read["outcome"], capture_mod.FINALITY_PROVEN)
-        bound = capture_mod.finalized_matches(read["record"], capture=self.capture,
-                                              sentinel_code=0, sentinel_present=True)
+    def test_a_final_fence_binds_the_capture_prefix_and_the_sentinel(self) -> None:
+        path = self._publish()
+        read = capture_mod.read_capture_fence(path, fence=self.fence)
+        self.assertEqual(read["outcome"], capture_mod.EVIDENCE_FINAL)
+        bound = capture_mod.fence_matches(read["record"], capture=self.capture,
+                                          sentinel_code=0, sentinel_present=True)
         self.assertTrue(bound["matches"], bound)
 
-    def test_a_proof_over_a_capture_that_later_grew_no_longer_matches(self) -> None:
-        path = self._proof()
+    def test_bytes_after_the_boundary_never_disturb_the_fence(self) -> None:
+        """# superseded by OS-48: `..._a_capture_that_later_grew_no_longer_matches` -- growth
+        # AFTER N is the diagnostic tail (retained, never bound); a change INSIDE [0, N) is."""
+        path = self._publish()
         with open(self.capture, "ab") as handle:
-            handle.write(b'{"forged":true}\n')            # a byte the proof never bound
-        read = capture_mod.read_capture_finalized(path, fence=self.fence)
-        bound = capture_mod.finalized_matches(read["record"], capture=self.capture,
-                                              sentinel_code=0, sentinel_present=True)
+            handle.write(b'{"late":true}\n')                 # after N: diagnostic
+        read = capture_mod.read_capture_fence(path, fence=self.fence)
+        self.assertTrue(capture_mod.fence_matches(read["record"], capture=self.capture,
+                                                  sentinel_code=0, sentinel_present=True)["matches"])
+        data = bytearray(self.capture.read_bytes())
+        data[0:1] = b"["                                        # inside [0, N)
+        self.capture.write_bytes(bytes(data))
+        bound = capture_mod.fence_matches(read["record"], capture=self.capture,
+                                          sentinel_code=0, sentinel_present=True)
         self.assertFalse(bound["matches"])
-        self.assertEqual(bound["reason"], "capture_length_mismatch")
+        self.assertEqual(bound["reason"], "capture_digest_mismatch")
 
-    def test_a_watcher_proof_that_cites_the_sentinel_needs_the_sentinel_to_agree(self) -> None:
-        path = self._proof(exit_code=0)
-        read = capture_mod.read_capture_finalized(path, fence=self.fence)
-        # No sentinel, or a different code, refuses: the two files are one writer's act.
-        self.assertFalse(capture_mod.finalized_matches(
+    def test_a_fence_that_cites_the_sentinel_needs_the_sentinel_to_agree(self) -> None:
+        path = self._publish(exit_code=0)
+        read = capture_mod.read_capture_fence(path, fence=self.fence)
+        self.assertEqual(capture_mod.fence_matches(
             read["record"], capture=self.capture, sentinel_code=None,
-            sentinel_present=False)["matches"])
-        self.assertEqual(capture_mod.finalized_matches(
+            sentinel_present=False)["reason"], "sentinel_absent")
+        self.assertEqual(capture_mod.fence_matches(
             read["record"], capture=self.capture, sentinel_code=7,
             sentinel_present=True)["reason"], "sentinel_code_mismatch")
 
     def test_a_foreign_fence_returns_no_record(self) -> None:
-        path = self._proof()
-        read = capture_mod.read_capture_finalized(path, fence="sess:i-other")
+        path = self._publish()
+        read = capture_mod.read_capture_fence(path, fence="sess:i-other")
         self.assertEqual(read["outcome"], "foreign")
+        self.assertIsNone(read["record"])
+
+    def test_the_fence_is_link_exclusive_and_never_overwritten(self) -> None:
+        path = self._publish()
+        before = Path(os.fsdecode(path)).read_bytes()
+        second = _fence_record(fence=self.fence, nonce=self.nonce,
+                               data=self.capture.read_bytes(), published_at="later")
+        self.assertFalse(capture_mod.write_capture_fence(path, second))
+        self.assertEqual(Path(os.fsdecode(path)).read_bytes(), before)
+
+    def test_a_legacy_finalized_record_is_refused_by_name(self) -> None:
+        legacy = capture_mod.capture_finalized_path(os.fsencode(str(self.capture)), "i-1")
+        Path(os.fsdecode(legacy)).write_text(json.dumps({
+            "schema": capture_mod.LEGACY_FINALIZED_SCHEMA, "fence": self.fence,
+            "finality": "proven"}))
+        read = capture_mod.read_capture_fence(
+            capture_mod.capture_fence_path(os.fsencode(str(self.capture)), "i-1"),
+            fence=self.fence, legacy_path=legacy)
+        self.assertEqual(read["outcome"], capture_mod.OUTCOME_LEGACY_FINALIZED, read)
         self.assertIsNone(read["record"])
 
 
 class Item1StreamFinalityIsTheProofTests(unittest.TestCase):
-    """`_stream_is_final` accepts ONLY the capture-finalized proof; the exit sentinel
-    alone -- the round-8 rule -- is refused (the hole item 1 closes)."""
+    """`_stream_is_final` accepts ONLY a VERIFIED FENCE (`capture_finalized`); the exit
+    sentinel alone -- the round-8 rule -- is refused, and so is every OS-48 named
+    non-success."""
 
-    def test_only_the_finalized_proof_is_final(self) -> None:
+    def test_only_the_verified_fence_is_final(self) -> None:
         f = runtime_mod._stream_is_final
         self.assertTrue(f({"finality": "capture_finalized"}))
         for other in ("exit_sentinel", "exit_sentinel_only", "none", "unproven",
-                      "mismatch", "foreign", ""):
+                      "mismatch", "foreign", "absent", "legacy_finalized_record", ""):
             self.assertFalse(f({"finality": other}), other)
         # The round-8 shape a stale reader might build is no longer final.
         self.assertFalse(f({"ended": "no_master", "finality": "exit_sentinel"}))
 
 
 class Item1MasterlessRequiresTheProofTests(unittest.TestCase):
-    """An adopted (masterless) session settles finality ONLY from a matching finalized
-    proof.  A sentinel with no proof -- the crashed-mid-drain supervisor -- is
-    `exit_sentinel_only` and NOT final."""
+    """An adopted (masterless) session settles finality ONLY from a matching fence.  A
+    sentinel with no fence and no captured marker -- the crashed-mid-drain supervisor -- is
+    `boundary_unproven` and NOT final; a legacy finalized record is refused BY NAME."""
 
     def setUp(self) -> None:
         self.base = Path(tempfile.mkdtemp(prefix="os37-r9-i1m-"))
         self.addCleanup(shutil.rmtree, self.base, True)
-        profile = profile_from_mapping(stub_profile_spec("alive", worktree=str(self.base)))
+        profile = profile_from_mapping(stub_profile_spec("alive", worktree=str(self.base),
+                                                         timeouts={"post_exit_drain_budget_ms": 200}))
         self.session = runtime_mod.StandaloneSession(
             intent={"intent_id": "i-m", "run_id": "run_m", "role": "WORKER"},
             profile=profile, artifact_base=self.base, run_id="run_m",
             journal=journal_mod.ExecutionJournal(self.base, "run_m"))
         self.session.pty = None                            # adopted: no master
+        # F-005: an adopted session's record carries the pinned emitter identity axes
+        # (bound from the spawn record in production); a successor publishes nothing without them.
+        self.session.record = {"pid": 4242, "pgid": 4242, "proc_start_ticks": 7, "boot_id": "b"}
         self.session.capture = capture_mod.BoundedCapture(self.base / "capture.log")
         self.session.capture.append(b'{"type":"result","subtype":"success"}\n', at="t")
 
@@ -167,60 +221,98 @@ class Item1MasterlessRequiresTheProofTests(unittest.TestCase):
         pty_supervisor.write_exit_sentinel(s, code=0, fence=self.session.fence)
         return s
 
-    def test_a_sentinel_with_no_finalized_proof_is_not_final(self) -> None:
+    def _marker(self) -> None:
+        self.session.capture.append(capture_mod.marker_bytes(self.session.fence_nonce), at="t")
+
+    def test_a_sentinel_with_no_fence_and_no_marker_is_not_final(self) -> None:
         self._sentinel()
         drained = self.session.drain_after_exit(budget_ms=200)
-        self.assertEqual(drained["finality"], "exit_sentinel_only", drained)
+        self.assertEqual(drained["finality"], "none", drained)
+        self.assertEqual(drained["outcome"], capture_mod.OUTCOME_BOUNDARY_UNPROVEN, drained)
         self.assertFalse(runtime_mod._stream_is_final(drained))
 
-    def test_the_matching_finalized_proof_is_final(self) -> None:
+    def test_the_matching_fence_is_final(self) -> None:
         self._sentinel()
+        self._marker()
         cap = self.session.capture
-        capture_mod.write_capture_finalized(
-            capture_mod.capture_finalized_path(cap.path, self.session.incarnation),
-            fence=self.session.fence, finality=capture_mod.FINALITY_PROVEN,
-            writer=capture_mod.WRITER_EXIT_WATCHER, ended="quiesced", errno_name="",
-            total_bytes=cap.size, sha256=cap.sha256, records=1,
-            exit_how="exit_sentinel", exit_code=0)
+        capture_mod.write_capture_fence(
+            self.session._fence_path(),
+            _fence_record(fence=self.session.fence, nonce=self.session.fence_nonce,
+                          data=cap.raw()))
         drained = self.session.drain_after_exit(budget_ms=200)
         self.assertEqual(drained["finality"], "capture_finalized", drained)
         self.assertTrue(runtime_mod._stream_is_final(drained))
+        self.assertEqual(int(drained["offset_n"]), cap.raw().index(b"\n<<OS48-FENCE"))
 
-    def test_an_unproven_proof_names_the_holder_and_is_not_final(self) -> None:
+    def test_a_captured_marker_with_no_fence_lets_the_successor_publish(self) -> None:
+        """C7 shape: the sentinel AND the marker are on disk but the owner died before
+        publishing (no generation at all): the successor claims g1 and publishes from the
+        captured marker; the fence then binds and is final."""
+        self._sentinel()
+        self._marker()
+        drained = self.session.drain_after_exit(budget_ms=200)
+        self.assertEqual(drained["finality"], "capture_finalized", drained)
+        fence = capture_mod.read_capture_fence(self.session._fence_path(), fence=self.session.fence)
+        self.assertEqual(fence["record"]["owner"]["owner_role"], capture_mod.OWNER_SUCCESSOR)
+        self.assertIn("published_by_successor_from_captured_marker", fence["record"]["provenance"])
+
+    def test_a_fence_that_does_not_bind_the_capture_is_a_named_mismatch(self) -> None:
+        self._sentinel()
+        self._marker()
+        cap = self.session.capture
+        record = _fence_record(fence=self.session.fence, nonce=self.session.fence_nonce,
+                               data=cap.raw(), sha256_prefix="ab" * 32)
+        capture_mod.write_capture_fence(self.session._fence_path(), record)
+        drained = self.session.drain_after_exit(budget_ms=200)
+        self.assertEqual(drained["finality"], "mismatch", drained)
+        self.assertEqual(drained["outcome"], capture_mod.OUTCOME_FENCE_MISMATCH, drained)
+        self.assertFalse(runtime_mod._stream_is_final(drained))
+
+    def test_a_legacy_finalized_record_is_refused_not_final(self) -> None:
+        """# superseded by OS-48: `test_an_unproven_proof_names_the_holder_and_is_not_final`
+        # -- the legacy record shape is refused BY NAME, whatever it says."""
         self._sentinel()
         cap = self.session.capture
-        capture_mod.write_capture_finalized(
-            capture_mod.capture_finalized_path(cap.path, self.session.incarnation),
-            fence=self.session.fence, finality=capture_mod.FINALITY_UNPROVEN,
-            writer=capture_mod.WRITER_EXIT_WATCHER, ended="budget", errno_name="",
-            total_bytes=cap.size, sha256=cap.sha256, records=1,
-            exit_how="exit_sentinel", exit_code=0,
-            holders={"slave": "/dev/ttys9", "rows": [{"pid": 4242, "comm": "devserver"}]},
-            detail="a descendant still holds the slave")
+        legacy = capture_mod.capture_finalized_path(cap.path, self.session.incarnation)
+        Path(os.fsdecode(legacy)).write_text(json.dumps({
+            "schema": capture_mod.LEGACY_FINALIZED_SCHEMA, "fence": self.session.fence,
+            "finality": "proven", "total_bytes": cap.size, "sha256": cap.sha256}))
         drained = self.session.drain_after_exit(budget_ms=200)
-        self.assertEqual(drained["finality"], "unproven", drained)
+        self.assertEqual(drained["finality"], capture_mod.OUTCOME_LEGACY_FINALIZED, drained)
+        self.assertEqual(drained["outcome"], capture_mod.OUTCOME_LEGACY_FINALIZED, drained)
         self.assertFalse(runtime_mod._stream_is_final(drained))
-        self.assertEqual(drained["holders"]["rows"][0]["comm"], "devserver")
+
+
+class _FiredWitness:
+    """A parent-death witness already in state `final` (the supervisor's death is stipulated
+    for the forked-topology lock; the death rule itself is locked in test_os48_recovery_cuts)."""
+    state = "final"
+
+    def fired(self, _timeout: float = 0.0) -> str:
+        return "final"
+
+    def fds(self) -> set:
+        return set()
 
 
 def _run_watcher_finalize(base: Path, *, output: bytes, linger_child: bool,
                           budget_ms: int = 2000) -> dict:
-    """Drive the EXACT production pty topology and run `_finalize_orphaned_capture` in the
-    forked leader/watcher, returning the finalized record read back from disk.
+    """Drive the EXACT production pty topology and run `_orphan_finalize` in the forked
+    leader/watcher, returning the fence read back from disk plus the capture.
 
-    leader (setsid + TIOCSCTTY) -> agent (setpgid + tcsetpgrp): the agent writes ``output``,
-    optionally forks a child that LINGERS in the agent's process group holding the slave,
-    then exits.  The leader closes its slave, reaps the agent and finalizes -- reading the
-    master while the leader (session leader) lives, exactly as production does.
+    leader (setsid + TIOCSCTTY, KEEPS one slave fd -- the owner-held reference) -> agent
+    (setpgid + tcsetpgrp): the agent writes ``output``, optionally forks a child that LINGERS
+    in the agent's process group holding the slave, then exits.  The leader reaps the agent,
+    writes the fence marker through its slave reference and finalizes as an orphan.
     """
     import pty
     import termios
     import fcntl
     master, slave = pty.openpty()
-    slave_name = os.ttyname(slave)
     capture = os.fsencode(str(base / "capture.log"))
-    finalized = capture_mod.capture_finalized_path(capture, "i-w")
+    nonce = "f" * 32
     fcntl.fcntl(master, fcntl.F_SETFD, fcntl.FD_CLOEXEC)
+    host_boot = pty_supervisor.host_boot_id()
     leader = os.fork()
     if leader == 0:                                        # pragma: no cover - forked child
         try:
@@ -242,78 +334,91 @@ def _run_watcher_finalize(base: Path, *, output: bytes, linger_child: bool,
                         os._exit(0)
                 os.write(1, output)
                 os._exit(0)
-            os.close(slave)
             null = os.open(os.devnull, os.O_RDWR)
             for fd in (0, 1, 2):
                 os.dup2(null, fd)
             os.close(null)
-            os.waitpid(agent, 0)
+            agent_start = pty_supervisor.proc_start_ticks(agent)
             appender = capture_mod.RawBoundedAppender(capture, limits=CaptureLimits())
-            pty_supervisor._finalize_orphaned_capture(
-                master, appender, budget_s=budget_ms / 1000.0, finalized=finalized,
-                fence="sess:i-w", code=0, slave_name=slave_name, settle_s=0.1)
+            while True:
+                done, status = os.waitpid(agent, os.WNOHANG)
+                if done == agent:
+                    break
+                pty_supervisor._drain_once(master, appender, budget=0.02)
+            written = pty_supervisor._write_marker_bounded(
+                slave, capture_mod.marker_bytes(nonce), master, appender)
+            pty_supervisor._orphan_finalize(
+                master, slave, appender, capture=capture, fence="sess:i-w", fence_nonce=nonce,
+                code=0, marker_written=written, sentinel=None, witness=_FiredWitness(),
+                budget_s=budget_ms / 1000.0, host_boot_id=host_boot, agent_pid=agent,
+                agent_start_id=agent_start)
             os._exit(0)
         except BaseException:
             os._exit(127)
     os.close(slave)
-    os.waitpid(leader, 0)
+    _, status = os.waitpid(leader, 0)
     os.close(master)
-    return capture_mod.read_capture_finalized(finalized, fence="sess:i-w")
+    fence = capture_mod.read_capture_fence(capture_mod.capture_fence_path(capture, "i-w"),
+                                           fence="sess:i-w")
+    return {"fence": fence, "capture": (base / "capture.log").read_bytes(), "nonce": nonce,
+            "leader_status": status,
+            "release": capture_mod.read_release_record(
+                capture_mod.release_record_path(capture, "i-w"), fence="sess:i-w")}
 
 
 class Item1WatcherFinalizeOverRealPtyTests(unittest.TestCase):
-    """The forked exit watcher's `_finalize_orphaned_capture` over a REAL pty pair in the
-    production topology: a reaped agent whose output quiesced with NO slave holder ->
-    `proven`; a descendant in the agent's group that keeps the slave open -> `unproven`,
-    holder NAMED."""
+    """The forked exit watcher's `_orphan_finalize` over a REAL pty pair in the production
+    topology: a reaped agent -> the marker is the boundary and the fence binds the prefix;
+    a descendant in the agent's group that keeps the slave open changes NOTHING about the
+    boundary (its bytes, if any, are after N) -- no holder enumeration is consulted."""
 
     def setUp(self) -> None:
         self.base = Path(tempfile.mkdtemp(prefix="os37-r9-i1w-"))
         self.addCleanup(shutil.rmtree, self.base, True)
 
-    def test_a_reaped_agent_that_quiesced_with_no_holder_is_proven(self) -> None:
-        record = _run_watcher_finalize(
-            self.base, output=b'{"type":"result","subtype":"success"}\n',
-            linger_child=False)
-        # The reaped agent's output quiesced and no descendant held the slave, so the
-        # watcher's own drain proves the capture complete.  (Byte-for-byte completeness of
-        # the drained output is covered end to end by
-        # `test_os37_recovery_boundary_regressions.py::F01CrashedSupervisorDispatchIsCollectedTests`,
-        # where the supervisor's main loop drains the agent's output during its run; here
-        # the isolated agent writes and exits at once, and darwin discards a sole holder's
-        # unread output on the last slave close, so this locks the FINALITY DECISION.)
-        self.assertEqual(record["outcome"], capture_mod.FINALITY_PROVEN, record)
-        # The proof binds the capture on disk (length + digest), whatever its size.
-        bound = capture_mod.finalized_matches(
-            record["record"], capture=self.base / "capture.log",
-            sentinel_code=0, sentinel_present=True)
+    def _check(self, run: dict, output: bytes) -> None:
+        fence = run["fence"]
+        self.assertEqual(fence["outcome"], capture_mod.EVIDENCE_FINAL, fence)
+        record = fence["record"]
+        bound = capture_mod.fence_matches(record, capture=self.base / "capture.log",
+                                          sentinel_code=None, sentinel_present=False)
         self.assertTrue(bound["matches"], bound)
+        n = int(record["boundary"]["offset_n"])
+        self.assertIn(output.replace(b"\n", b"\r\n"), run["capture"][:n])
+        self.assertEqual(record["owner"]["owner_role"], capture_mod.OWNER_EXIT_WATCHER)
+        self.assertEqual(int(record["owner"]["generation"]), 1)
+        self.assertEqual(run["release"]["outcome"], capture_mod.EVIDENCE_FINAL, run["release"])
+        self.assertGreater(int(run["release"]["record"]["offset_r"]), n)
 
-    def test_a_retained_slave_descendant_is_unproven_and_the_holder_is_named(self) -> None:
-        record = _run_watcher_finalize(
-            self.base, output=b'{"type":"result"}\n', linger_child=True, budget_ms=800)
-        self.assertEqual(record["outcome"], capture_mod.FINALITY_UNPROVEN, record)
-        holders = record["record"]["holders"]
-        # Iteration 4: the orphan finalizer names the retained slave holder through the
-        # COMPLETE libproc authority (`holders`/`unenumerable`); older foreground-group /
-        # tty-row fields are accepted too for records written by pre-iteration-4 writers.
-        named = (bool(holders.get("holders")) or bool(holders.get("unenumerable"))
-                 or holders.get("foreground_group_present") is True
-                 or bool(holders.get("rows")))
-        self.assertTrue(named, f"the retained-slave holder was not named: {holders}")
+    def test_a_reaped_agent_with_no_holder_publishes_the_fence(self) -> None:
+        output = b'{"type":"result","subtype":"success"}\n'
+        run = _run_watcher_finalize(self.base, output=output, linger_child=False)
+        self._check(run, output)
+
+    def test_a_retained_slave_descendant_changes_nothing_about_the_boundary(self) -> None:
+        """# superseded by OS-48: `..._is_unproven_and_the_holder_is_named` -- a retained
+        # slave holder no longer withholds finality; N is the marker, published at once."""
+        output = b'{"type":"result"}\n'
+        started = time.time()
+        run = _run_watcher_finalize(self.base, output=output, linger_child=True, budget_ms=800)
+        self._check(run, output)
+        # The lingering holder (3 s) did not gate the publication: the leader finished well
+        # before the holder's own exit.
+        self.assertLess(time.time() - started, 2.5)
 
 
 class Item1TotalFinalityGateTests(unittest.TestCase):
     """`await_completion`: an exit first observed AT (or past) the completion deadline
     still runs the finality gate.  Red at `fc21012`: the `while self._clock() < deadline`
     head skipped the drain when the exit landed exactly at the deadline, so the settlement
-    escaped the gate."""
+    escaped the gate.  OS-48: the gate's refusal is `boundary_unproven`."""
 
     def setUp(self) -> None:
         self.base = Path(tempfile.mkdtemp(prefix="os37-r9-i1t-"))
         self.addCleanup(shutil.rmtree, self.base, True)
         profile = profile_from_mapping(stub_profile_spec(
-            "alive", worktree=str(self.base), timeouts={"completion_timeout_ms": 1}))
+            "alive", worktree=str(self.base),
+            timeouts={"completion_timeout_ms": 1, "post_exit_drain_budget_ms": 200}))
         self.session = runtime_mod.StandaloneSession(
             intent={"intent_id": "i-t", "run_id": "run_t", "role": "WORKER"},
             profile=profile, artifact_base=self.base, run_id="run_t",
@@ -333,9 +438,10 @@ class Item1TotalFinalityGateTests(unittest.TestCase):
         self.assertEqual(result["state"], "LOST", result)
         self.assertEqual(result["lost_reason"],
                          runtime_mod.lifecycle.resolve_unknown(
-                             "stream_end_unproven")["lost_reason"])
+                             "boundary_unproven")["lost_reason"])
         self.assertIsNotNone(self.session.post_exit_drain,
                              "the finality gate never ran for a deadline-time exit")
+
 
 
 # =====================================================================================

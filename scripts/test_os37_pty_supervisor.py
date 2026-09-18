@@ -50,6 +50,12 @@ def profile(**timeouts) -> StandaloneProfile:
                              **timeouts}))
 
 
+#: OS-48: the identity axes the injected rows and records share (a lock that models PID reuse
+#: overrides `start_id` on the row).
+START_ID = 1_700_000_000_000_001
+BOOT_ID = "boot-test"
+
+
 def record(**overrides) -> dict:
     fields = dict(
         run_id="run_os37", repo_id="repo-1",
@@ -59,7 +65,10 @@ def record(**overrides) -> dict:
         captured_tty=TTY, pty_id="pty-1", process_incarnation="i-1",
         host_scope="local", spawn_token="t-1", started_at="2026-09-10T00:00:00Z",
         argv_digest="ad", env_digest="ed", created_by_this_runtime=True,
-        resource_kind="pty_session", user_taken_over=False)
+        resource_kind="pty_session", user_taken_over=False,
+        # OS-48 (DESIGN §2.1): the kernel start identity and boot id every record carries;
+        # the injected rows below carry the same axes (`start_id` / `boot_id`).
+        proc_start_ticks=START_ID, boot_id=BOOT_ID)
     fields.update(overrides)
     return identity.make_record(**fields)
 
@@ -68,7 +77,7 @@ def snapshot(rows=None, *, age_s: float = 0.0, readable: bool = True,
              tty: str = TTY) -> dict:
     if rows is None:
         rows = ({"pid": CHILD_PID, "ppid": 1, "pgid": CHILD_PID, "sid": CHILD_PID,
-                 "tty": TTY, "stat": "Ss"},)
+                 "tty": TTY, "stat": "Ss", "start_id": START_ID, "start_state": "final", "boot_id": BOOT_ID},)
     return {"tty": tty, "captured_at": time.time() - age_s, "rows": tuple(rows),
             "readable": readable}
 
@@ -79,9 +88,16 @@ class SignalSpy:
     def __init__(self) -> None:
         self.killpg: list[tuple[int, int]] = []
         self.kill: list[tuple[int, int]] = []
+        self.watcher: list[int] = []
 
     def send_group(self, pgid: int, sig: int) -> None:
         self.killpg.append((pgid, sig))
+
+    def via_watcher(self, sig: int) -> str:
+        """OS-48: the watcher-mediated delivery seam (DESIGN §2.3).  Records and answers
+        ``sent`` -- the ladder's only legal delivery path to the agent."""
+        self.watcher.append(sig)
+        return "sent"
 
     def send_one(self, pid: int, sig: int) -> None:
         self.kill.append((pid, sig))
@@ -108,7 +124,7 @@ class OwnershipRefusalTests(unittest.TestCase):
             return decision, spy, None
         sent = pty_supervisor.signal_target(
             rec, decision, 15, permit=permit, snapshot=snap,
-            killpg=spy.send_group, kill=spy.send_one)
+            killpg=spy.send_group, kill=spy.send_one, watcher=spy.via_watcher)
         return decision, spy, sent
 
     def test_refuses_unbound_tty(self) -> None:
@@ -123,7 +139,7 @@ class OwnershipRefusalTests(unittest.TestCase):
         spy = SignalSpy()
         sent = pty_supervisor.signal_target(
             rec, decision, 15, permit=_forged_permit_is_impossible(self, rec),
-            snapshot=snapshot(), killpg=spy.send_group, kill=spy.send_one)
+            snapshot=snapshot(), killpg=spy.send_group, kill=spy.send_one, watcher=spy.via_watcher)
         self.assertEqual(spy.total, 0, "a signal was sent on an unbound tty")
         self.assertEqual(sent["sent"], ())
 
@@ -135,21 +151,24 @@ class OwnershipRefusalTests(unittest.TestCase):
         """
         snap = snapshot(rows=(
             {"pid": CHILD_PID, "ppid": 1, "pgid": CHILD_PID, "sid": CHILD_PID,
-             "tty": TTY, "stat": "Ss"},
+             "tty": TTY, "stat": "Ss", "start_id": START_ID, "start_state": "final", "boot_id": BOOT_ID},
             {"pid": os.getpid(), "ppid": 1, "pgid": os.getpid(), "sid": os.getpid(),
-             "tty": TTY, "stat": "S+"}))
+             "tty": TTY, "stat": "S+", "start_id": START_ID, "start_state": "final", "boot_id": BOOT_ID}))
         decision, spy, sent = self._signal(record(), snap, supervisor_pid=os.getpid())
         self.assertEqual(decision["verdict"], "owned")
         self.assertEqual(decision["refusal"], "tty_shared_with_driver")
         self.assertEqual(decision["scope"], "root")
         self.assertEqual(spy.killpg, [],
                          "killpg was used on a tty the supervisor itself is on")
-        self.assertEqual(spy.kill, [(CHILD_PID, 15)])
+        # OS-48 (superseded by OS-48: the integer-pid `kill` is never used; delivery is
+        # watcher-mediated so the target is bound to the pinned incarnation -- DESIGN §2.3).
+        self.assertEqual(spy.kill, [])
+        self.assertEqual(spy.watcher, [15])
 
     def test_refuses_captured_tty_mismatch(self) -> None:
         """R-OWN-3: a recycled pid -- present, on another tty -- gets NO signal."""
         snap = snapshot(rows=({"pid": CHILD_PID, "ppid": 1, "pgid": 7, "sid": 7,
-                               "tty": "ttys999", "stat": "Ss"},))
+                               "tty": "ttys999", "stat": "Ss", "start_id": START_ID, "start_state": "final", "boot_id": BOOT_ID},))
         decision, spy, _sent = self._signal(record(), snap)
         self.assertEqual(decision["verdict"], "refused")
         self.assertEqual(decision["refusal"], "captured_tty_mismatch")
@@ -168,7 +187,7 @@ class OwnershipRefusalTests(unittest.TestCase):
             permit=identity.assert_may_act(record(), "signal",
                                            observed=pty_supervisor.row_for(snapshot(),
                                                                            CHILD_PID)),
-            snapshot=snapshot(age_s=5.0), killpg=spy.send_group, kill=spy.send_one)
+            snapshot=snapshot(age_s=5.0), killpg=spy.send_group, kill=spy.send_one, watcher=spy.via_watcher)
         self.assertEqual(spy.total, 0, "a stale snapshot was signalled from")
 
     def test_an_unreadable_table_raises_rather_than_reading_as_exited(self) -> None:
@@ -181,17 +200,23 @@ class OwnershipRefusalTests(unittest.TestCase):
         self.assertEqual(proof["reason"], "process_table_unreadable")
 
     def test_kill_ordering_puts_descendant_groups_before_the_leader(self) -> None:
-        """C4 / DR-1: the exec wrapper makes this a real ordering, not a no-op."""
+        """C4 / DR-1 -- superseded by OS-48 (`test_no_group_signal_is_ever_sent`): user-space
+        ``killpg`` is never an authority (a leader's identity does not cover the recipients
+        at delivery); the descendant group is WITHHELD by name and the agent is signalled
+        through the watcher.  Group teardown is the kernel's SIGHUP at revoke (probe_d8)."""
         snap = snapshot(rows=(
             {"pid": CHILD_PID, "ppid": 1, "pgid": CHILD_PID, "sid": CHILD_PID,
-             "tty": TTY, "stat": "Ss"},
+             "tty": TTY, "stat": "Ss", "start_id": START_ID, "start_state": "final", "boot_id": BOOT_ID},
             {"pid": 5000, "ppid": CHILD_PID, "pgid": 5000, "sid": CHILD_PID,
-             "tty": TTY, "stat": "S"}))
-        decision, spy, _sent = self._signal(record(), snap)
+             "tty": TTY, "stat": "S", "start_id": START_ID, "start_state": "final", "boot_id": BOOT_ID}))
+        decision, spy, sent = self._signal(record(), snap)
         self.assertEqual(decision["scope"], "group")
-        self.assertEqual([pgid for pgid, _ in spy.killpg], [5000, CHILD_PID],
-                         "the session leader must be signalled LAST, or it reaps its "
-                         "children before they are signalled")
+        self.assertEqual(spy.killpg, [], "a user-space group signal was sent (OS-48 forbids it)")
+        self.assertEqual(spy.kill, [])
+        self.assertEqual(spy.watcher, [15])
+        rungs = {step["rung"]: step["result"] for step in sent["sent"]}
+        self.assertEqual(rungs["descendant_groups"], "withheld:group_signal_refused")
+        self.assertEqual(rungs["agent_via_watcher"], "sent")
 
 
 def _forged_permit_is_impossible(case: unittest.TestCase, rec) -> object:
@@ -508,11 +533,11 @@ class InterruptLadderTests(unittest.TestCase):
     def test_the_ladder_refuses_before_any_signal_when_ownership_fails(self) -> None:
         spy = SignalSpy()
         mismatched = snapshot(rows=({"pid": CHILD_PID, "ppid": 1, "pgid": 7, "sid": 7,
-                                     "tty": "ttys999", "stat": "Ss"},))
+                                     "tty": "ttys999", "stat": "Ss", "start_id": START_ID, "start_state": "final", "boot_id": BOOT_ID},))
         result = interrupt_mod.interrupt(
             "intent-1", "stop", record=record(), profile=profile(),
             table_reader=lambda tty: mismatched, supervisor_pid=999,
-            killpg=spy.send_group, kill=spy.send_one, sleep=lambda s: None)
+            killpg=spy.send_group, kill=spy.send_one, watcher=spy.via_watcher, sleep=lambda s: None)
         self.assertEqual(result["interrupt_outcome"], "not_owned")
         self.assertEqual(spy.total, 0, "the ladder signalled a process it did not own")
 
@@ -529,16 +554,17 @@ class InterruptLadderTests(unittest.TestCase):
         result = interrupt_mod.interrupt(
             "intent-1", "stop", record=record(), profile=profile(),
             table_reader=reader, supervisor_pid=999, killpg=spy.send_group,
-            kill=spy.send_one, sleep=lambda s: None)
+            kill=spy.send_one, watcher=spy.via_watcher, sleep=lambda s: None)
         self.assertEqual(result["interrupt_outcome"], "interrupted_confirmed")
-        self.assertEqual([sig for _pgid, sig in spy.killpg], [15],
+        self.assertEqual(spy.killpg, [], "OS-48: no user-space group signal")
+        self.assertEqual(spy.watcher, [15],
                          "SIGKILL was sent although the child had already exited")
 
     def test_ownership_changing_during_the_wait_cancels_the_escalation(self) -> None:
         """The recycled-pid case: the escalation is CANCELLED, never retried."""
         calls = {"n": 0}
         recycled = snapshot(rows=({"pid": CHILD_PID, "ppid": 1, "pgid": 99, "sid": 99,
-                                   "tty": TTY, "stat": "Ss"},))
+                                   "tty": TTY, "stat": "Ss", "start_id": START_ID, "start_state": "final", "boot_id": BOOT_ID},))
 
         def reader(tty):
             calls["n"] += 1
@@ -548,7 +574,7 @@ class InterruptLadderTests(unittest.TestCase):
         result = interrupt_mod.interrupt(
             "intent-1", "stop", record=record(), profile=profile(),
             table_reader=reader, supervisor_pid=999, killpg=spy.send_group,
-            kill=spy.send_one, sleep=lambda s: None)
+            kill=spy.send_one, watcher=spy.via_watcher, sleep=lambda s: None)
         # Consolidated review finding 11.  Rung 1 DELIVERED a SIGTERM, so the cancelled
         # escalation is `exit_unproven` -- something happened and its outcome is unknown
         # -- and never `not_owned`, which means "no signal sent, no edge taken" and which
@@ -556,7 +582,8 @@ class InterruptLadderTests(unittest.TestCase):
         self.assertEqual(result["interrupt_outcome"], "exit_unproven")
         self.assertEqual(interrupt_mod.lifecycle_for(result["interrupt_outcome"]),
                          {"state": "LOST", "lost_reason": "stop_unverified"})
-        self.assertEqual([sig for _p, sig in spy.killpg], [15],
+        self.assertEqual(spy.killpg, [], "OS-48: no user-space group signal")
+        self.assertEqual(spy.watcher, [15],
                          "SIGKILL reached a recycled pid")
         self.assertIn("escalation cancelled", result["ladder"][-1]["detail"])
 
@@ -565,7 +592,7 @@ class InterruptLadderTests(unittest.TestCase):
         result = interrupt_mod.interrupt(
             "intent-1", "stop", record=record(), profile=profile(),
             table_reader=lambda tty: snapshot(), supervisor_pid=999,
-            killpg=spy.send_group, kill=spy.send_one, sleep=lambda s: None)
+            killpg=spy.send_group, kill=spy.send_one, watcher=spy.via_watcher, sleep=lambda s: None)
         self.assertEqual(result["interrupt_outcome"], "exit_unproven")
         mapped = interrupt_mod.lifecycle_for("exit_unproven")
         self.assertEqual(mapped["state"], "LOST")
@@ -736,12 +763,18 @@ class DrainIsATeardownObligationTests(unittest.TestCase):
             # The supervisor-alive watcher defers its exit until the supervisor releases the
             # drain handoff (as `_reclaim` does before it reaps the leader); release it here
             # so what this asserts is the drain's effect on the kernel wedge, not the linger.
-            handoff = session.get("drain_handoff_fd")
-            if isinstance(handoff, int) and handoff >= 0:
-                os.close(handoff)
-                session["drain_handoff_fd"] = -1
-            self._settle(session, seconds=0.5)
-            reaped = os.waitpid(session["leader_pid"], os.WNOHANG)
+            # OS-48: release-2 (`C`) -- the watcher keeps its slave reference until the
+            # custodian confirms consumption; a bare close of the handoff is relinquishment,
+            # not a release (DESIGN §1.8).
+            pty_supervisor._signal_drain_handoff(session)
+            # OS-48: the watcher writes the fence marker into its slave fd after the reap; a
+            # supervisor keeps READING the master (as `pump` does), so the FIFO is never left
+            # full under it -- this is the drain obligation, applied continuously.
+            deadline = time.time() + 2.0
+            reaped = (0, 0)
+            while time.time() < deadline and reaped[0] != session["leader_pid"]:
+                pty_supervisor.drain(session["master_fd"], budget_ms=50)
+                reaped = os.waitpid(session["leader_pid"], os.WNOHANG)
             self.assertEqual(
                 reaped[0], session["leader_pid"],
                 "the child was still unreapable after draining; teardown proof and the "
@@ -982,9 +1015,9 @@ class ReadinessProcessProofTests(unittest.TestCase):
         """
         rows = (
             {"pid": CHILD_PID, "ppid": 1, "pgid": CHILD_PID, "sid": CHILD_PID,
-             "tty": TTY, "stat": "Ss"},
+             "tty": TTY, "stat": "Ss", "start_id": START_ID, "start_state": "final", "boot_id": BOOT_ID},
             {"pid": CHILD_PID + 7, "ppid": CHILD_PID, "pgid": CHILD_PID,
-             "sid": CHILD_PID, "tty": TTY, "stat": "S"},
+             "sid": CHILD_PID, "tty": TTY, "stat": "S", "start_id": START_ID, "start_state": "final", "boot_id": BOOT_ID},
         )
         proof = self._proof(rows=rows,
                             images={CHILD_PID: self.FOREIGN,
@@ -997,9 +1030,9 @@ class ReadinessProcessProofTests(unittest.TestCase):
         """A descendant group holding the foreground is not the child's group holding it."""
         rows = (
             {"pid": CHILD_PID, "ppid": 1, "pgid": CHILD_PID, "sid": CHILD_PID,
-             "tty": TTY, "stat": "Ss"},
+             "tty": TTY, "stat": "Ss", "start_id": START_ID, "start_state": "final", "boot_id": BOOT_ID},
             {"pid": CHILD_PID + 9, "ppid": CHILD_PID, "pgid": CHILD_PID + 9,
-             "sid": CHILD_PID, "tty": TTY, "stat": "S+"},
+             "sid": CHILD_PID, "tty": TTY, "stat": "S+", "start_id": START_ID, "start_state": "final", "boot_id": BOOT_ID},
         )
         proof = self._proof(fg_pgid=CHILD_PID + 9, rows=rows,
                             images={CHILD_PID + 9: self.EXPECTED})
@@ -1102,7 +1135,7 @@ class LiveExecutableIdentityTests(unittest.TestCase):
         proof = pty_supervisor.liveness_proof(
             record(pid=pid, pgid=pid, sid=pid),
             snapshot=snapshot(rows=({"pid": pid, "ppid": 1, "pgid": pid, "sid": pid,
-                                     "tty": TTY, "stat": "S+"},)),
+                                     "tty": TTY, "stat": "S+", "start_id": START_ID, "start_state": "final", "boot_id": BOOT_ID},)),
             master_fd=None, expected_binary=str(self.script),
             waitpid_status=lambda: True, tcgetpgrp=lambda: pid)
         self.assertFalse(proof["foreground_executable_matches"])

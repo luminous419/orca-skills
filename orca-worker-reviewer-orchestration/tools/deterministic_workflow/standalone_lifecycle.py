@@ -119,7 +119,36 @@ LOST_REASONS = (
     # record the transcript holds, the stream is not proven final, so nothing settles as
     # a success from it.
     "stream_end_unproven",
+    # OS-48 (DESIGN §5/§6, additive).  The fence / ownership machinery's named non-success
+    # outcomes.  `stream_end_unproven` above is kept for LEGACY journal rows only: OS-48 has
+    # no producer for it -- the positive boundary is the fence marker, and its absence is
+    # `boundary_unproven`.
+    "boundary_unproven", "fence_missing", "fence_mismatch", "fence_foreign",
+    "legacy_finalized_record", "owner_conflict", "finalizer_alive", "exit_unproven",
+    "identity_unreadable", "identity_changed", "evidence_inconsistent",
+    "provenance_ambiguous", "provenance_unbound", "signal_unbound", "signal_target_reaped",
+    "group_signal_refused", "fence_published_no_claim", "succession_unwitnessed",
+    # REVIEW_IMPLEMENTATION_iteration7 F-015: a completion-shaped object inside a line of the
+    # fenced range that is not itself a record -- R2 ("exactly one") is unprovable.
+    "record_framing_ambiguous",
 )
+
+#: OS-48 named outcomes that are FAILED verdict reasons (a settlement, not a loss).
+OS48_FAILED_REASONS = ("refusal_in_boundary", "refusal_free_text", "no_completion_record")
+#: OS-48 DIAGNOSTIC (journal-only) names: they never move a settlement.
+OS48_DIAGNOSTIC_NAMES = ("descendants_unreaped", "diagnostic_tail_unaccounted",
+                         "release_record_missing", "path_opener_indistinguishable",
+                         "membership_unreadable", "descendants_unknown", "sidecar_unproven",
+                         "sidecar_unreadable")
+#: The closed set of OS-48 LOST outcomes (a subset of LOST_REASONS), for readers that must
+#: refuse an unknown name rather than pass it through.
+OS48_LOST_OUTCOMES = frozenset({
+    "boundary_unproven", "fence_missing", "fence_mismatch", "fence_foreign",
+    "legacy_finalized_record", "owner_conflict", "finalizer_alive", "exit_unproven",
+    "identity_unreadable", "identity_changed", "evidence_inconsistent",
+    "provenance_ambiguous", "provenance_unbound", "signal_unbound", "signal_target_reaped",
+    "group_signal_refused", "fence_published_no_claim", "succession_unwitnessed",
+    "capture_truncated", "evidence_unreadable", "record_framing_ambiguous"})
 
 #: The sentinel that is NOT an exit code.  A reader of this value reports LOST.
 UNVERIFIED_PROCESS_EXIT_CODE = -1
@@ -1291,6 +1320,17 @@ def resolve_unknown(situation: str, **facts: Any) -> dict[str, Any]:
                 "ended": facts.get("ended", ""),
                 "note": "the pty stream's end was not observed after the proven exit; a "
                         "record read before the end is not the final record"}
+    if situation == "boundary_unproven":
+        return {"state": "LOST", "lost_reason": "boundary_unproven",
+                "ended": facts.get("ended", ""),
+                "note": "OS-48: the fence marker was never observed in an answerable capture; "
+                        "no record it holds is inside a proven boundary"}
+    if situation == "os48_named":
+        reason = str(facts.get("lost_reason") or "")
+        if reason not in OS48_LOST_OUTCOMES:
+            raise LifecycleError(f"{reason!r} is not an OS-48 LOST outcome")
+        return {"state": "LOST", "lost_reason": reason, "detail": str(facts.get("detail") or ""),
+                "note": "OS-48: a named fail-closed outcome; never a success"}
     if situation == "required_evidence_missing":
         return {"state": "LOST", "lost_reason": facts.get("lost_reason") or "evidence_unreadable",
                 "note": "RULE 4: never a success guess"}

@@ -23,8 +23,12 @@ routing, decision-gate, review or recovery policy. Nothing here forks Orca or re
 
 **POSIX (macOS, Linux), local host, CPython 3.11+, Python standard library only.**
 
-The PTY layer is built on `pty`, `os.forkpty` / `os.openpty`, `os.setsid`, `os.killpg`,
-`os.waitpid`, `termios` / `tty` and `select`. **No new runtime dependency is added.** That is not a
+The PTY layer is built on `pty`, `os.forkpty` / `os.openpty`, `os.setsid`, `os.waitpid`,
+`termios` / `tty`, `select`, `socket` (the watcher control socketpair, OS-48) and, per platform,
+`select.kqueue` (darwin) / `os.pidfd_open` + `prctl` via `ctypes` (Linux) for the
+incarnation-bound death witness.  `os.killpg` is **no longer a delivery primitive** (OS-48:
+`group_signal_refused`; group teardown is the kernel's SIGHUP at controlling-tty revoke).
+**No new runtime dependency is added.** That is not a
 preference: `skills:docs/COMPATIBILITY.md:44-46` states that this project "uses only the Python
 standard library" on CPython 3.11+, and changing that is a project-policy decision this work does not make.
 

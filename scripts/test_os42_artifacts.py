@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import json
+import os
 import re
 import unittest
 from pathlib import Path
@@ -300,6 +302,23 @@ class InstalledCopyTests(unittest.TestCase):
         release_manifest.verify_source_tree()
 
 
+def _langgraph_ok() -> bool:
+    """The OS-40 checkpoint store (used by the history-lock fixtures) needs the pinned LangGraph."""
+    try:
+        import langgraph  # noqa: F401
+        import langgraph.graph  # noqa: F401
+    except ImportError:
+        return False
+    try:
+        import importlib.metadata
+        return importlib.metadata.version("langgraph") == "0.2.76"
+    except importlib.metadata.PackageNotFoundError:
+        return False
+
+
+NEEDS_CHECKPOINT_STORE = unittest.skipUnless(_langgraph_ok(), "requires pinned langgraph 0.2.76")
+
+
 class HistoricalArtifactTests(unittest.TestCase):
     def test_no_historical_run_artifact_is_written_by_this_suite(self) -> None:
         """An explicit ticket requirement: historical runs and artifacts are never
@@ -314,18 +333,231 @@ class HistoricalArtifactTests(unittest.TestCase):
 
 
     # ---- the same requirement, asserted on BEHAVIOUR rather than on a grep -----------
-    CURRENT_RUN = "run_70401d3e9964"
+    #: OS-44 coordinator-session binding written into an orchestrated run's directory.
+    ACTIVE_BINDING_SCHEMA = "os44.coordinator_session_binding.v1"
+    #: The current invocation names its active run(s) here (comma-separated run ids) -- a
+    #: lane run inside an orchestrated worktree MUST name the run it belongs to, e.g.
+    #: `OS42_ACTIVE_RUN_IDS=run_f820764749d6 python3 -m scripts.ci_lane --lane present run`;
+    #: without it every run on disk is history unless a POSITIVE live-writer fact exists, and a
+    #: concurrent writer under an unnamed active run is (honestly) detected as a modification
+    #: of history.
+    ACTIVE_RUNS_ENV = "OS42_ACTIVE_RUN_IDS"
+    #: `run_status` values that END a run (OS-42 `RUN_STATUS_VALUES` minus WAITING_FOR_INPUT).
+    TERMINAL_RUN_STATUSES = frozenset({"COMPLETED", "BLOCKED", "ERROR", "ESCALATED", "CANCELLED", "ABANDONED"})
 
-    def historical_digest(self) -> dict:
-        """sha256 of every artifact belonging to a run that is not the current one."""
-        runs = REPO_ROOT / "artifacts" / "runs"
-        digest = {}
-        for path in sorted(runs.rglob("*")):
-            if not path.is_file() or self.CURRENT_RUN in path.parts:
+    @classmethod
+    def active_runs(cls, runs: Path, env: "dict | None" = None) -> set:
+        """The run ids that are ACTIVE for this invocation -- and nothing inferred:
+          * the explicit invocation scope `OS42_ACTIVE_RUN_IDS`;
+          * a POSITIVE live-writer fact: a run whose workflow checkpoint is present with a
+            NON-terminal `run_status` AND whose coordinator-session binding is unreleased --
+            both required (an unreleased binding alone is a cookie that names a run, not a
+            writer; a non-terminal checkpoint alone may be an abandoned run).
+        OS-48 iteration 8 (F-011): no hard-coded legacy run and no same-session cookie -- a
+        session id identifies a run but does not prove a current writer, so a run resumed by
+        the same session after its terminal checkpoint is history."""
+        env = os.environ if env is None else env
+        active = set()
+        active.update(x.strip() for x in (env.get(cls.ACTIVE_RUNS_ENV) or "").split(",") if x.strip())
+        if not runs.is_dir():
+            return active
+        from scripts.deterministic_workflow.turn_boundary import read_workflow_checkpoint
+        base = runs.parent.parent
+        for run in runs.iterdir():
+            if not run.is_dir() or run.name in active:
                 continue
+            bindings = list((run / "coordinator_session").glob("*.json")) if (run / "coordinator_session").is_dir() else []
+            unreleased = False
+            for binding in bindings:
+                try:
+                    record = json.loads(binding.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    continue
+                if (isinstance(record, dict) and record.get("schema") == cls.ACTIVE_BINDING_SCHEMA
+                        and record.get("run_id") == run.name and record.get("released_at") is None):
+                    unreleased = True
+            if not unreleased:
+                continue
+            try:
+                state = read_workflow_checkpoint(run.name, artifact_base=base)
+            except Exception:  # noqa: BLE001 - an unreadable checkpoint is no positive fact
+                continue
+            if state.get("present") and str(state.get("run_status") or "") not in cls.TERMINAL_RUN_STATUSES:
+                active.add(run.name)
+        return active
+
+    @classmethod
+    def historical_files(cls, runs: "Path | None" = None, env: "dict | None" = None) -> list:
+        """Every file on disk under `artifacts/runs` -- tracked or untracked -- whose ROOT run
+        directory is not an active run (:meth:`active_runs`).  Only the first path component
+        decides (F-011): a settled run's archive that happens to contain a directory named
+        like the active run is history."""
+        runs = runs if runs is not None else REPO_ROOT / "artifacts" / "runs"
+        active = cls.active_runs(runs, env)
+        return [path for path in sorted(runs.rglob("*"))
+                if path.is_file() and path.relative_to(runs).parts[0] not in active]
+
+    @classmethod
+    def historical_digest(cls, runs: "Path | None" = None, env: "dict | None" = None) -> dict:
+        """sha256 of every historical run artifact (see :meth:`historical_files`)."""
+        runs = runs if runs is not None else REPO_ROOT / "artifacts" / "runs"
+        digest = {}
+        for path in cls.historical_files(runs, env):
             digest[str(path.relative_to(runs))] = hashlib.sha256(
                 path.read_bytes()).hexdigest()
         return digest
+
+    # ---- mutation controls for the lock's own scope (OS-48 iterations 6-8, F-011) -------
+    def _checkpoint(self, base: Path, run: str, *, terminal: bool) -> None:
+        """Commit a workflow checkpoint for ``run`` with the REAL producers (the OS-40 store
+        needs the pinned LangGraph: without it these controls skip with the LangGraph
+        reason and run in the present lane; the real-tree lock below runs in both)."""
+        from scripts.deterministic_workflow.checkpoint_store import FileCheckpointSaver
+        from scripts.deterministic_workflow.contracts import BASE_CAPABILITIES
+        from scripts.deterministic_workflow.state import initial_state
+        state = dict(initial_state(run_id=run, thread_id="thread_main", phases=("ANALYSIS", "PLAN"),
+                                   capabilities=BASE_CAPABILITIES))
+        if terminal:
+            state.update(terminal_status="COMPLETED", run_lifecycle="SETTLED", pending_role=None, route_token="COMPLETE")
+        cp = {"v": 1, "id": "cp", "ts": "2026-01-01T00:00:00Z", "channel_values": state,
+              "channel_versions": {k: 1 for k in state}, "versions_seen": {}, "pending_sends": []}
+        FileCheckpointSaver(base / "artifacts" / "runs" / run / ".workflow_checkpoints.json").put(
+            {"configurable": {"thread_id": "thread_main", "checkpoint_ns": ""}}, cp, {"source": "loop", "step": 0},
+            {k: 1 for k in state})
+
+    def _fixture_runs(self) -> Path:
+        """A runs tree with: a settled run git does not know; a settled run whose coordinator
+        died right after a terminal COMPLETED checkpoint, leaving its binding UNRELEASED (the
+        reviewer's stale-cookie cut, any session); a settled run whose archive contains a
+        directory named like the active run; a settled root named like OS-42's legacy run id;
+        a run that is LIVE by the positive fact (non-terminal checkpoint + unreleased binding);
+        and the ACTIVE run named by the invocation.  Bindings/checkpoints come from the real
+        producers."""
+        from scripts.deterministic_workflow import turn_boundary as tb
+        base = Path(self.enterContext(TemporaryDirectory()))
+        runs = base / "artifacts" / "runs"
+        (runs / "run_settleduntracked").mkdir(parents=True)
+        (runs / "run_settleduntracked" / "accepted.md").write_text("accepted historical evidence")
+        self.assertTrue(tb.bind_session_run("run_settledcrashed", session_id="coordinator-that-died", artifact_base=base))
+        self._checkpoint(base, "run_settledcrashed", terminal=True)
+        (runs / "run_settledcrashed" / "FINAL_REVIEW.md").write_text("terminal COMPLETED checkpoint committed; binding never released")
+        (runs / "run_settledarchive" / "evidence" / "run_active0").mkdir(parents=True)
+        (runs / "run_settledarchive" / "evidence" / "run_active0" / "accepted.md").write_text("accepted historical archive")
+        (runs / "run_70401d3e9964").mkdir()
+        (runs / "run_70401d3e9964" / "accepted.md").write_text("OS-42's own run is history like any other")
+        self.assertTrue(tb.bind_session_run("run_live0", session_id="a-live-coordinator", artifact_base=base))
+        self._checkpoint(base, "run_live0", terminal=False)
+        (runs / "run_live0" / "evidence").mkdir()
+        (runs / "run_live0" / "evidence" / "log.txt").write_text("line 1\n")
+        self.assertTrue(tb.bind_session_run("run_active0", session_id="the-live-coordinator", artifact_base=base))
+        (runs / "run_active0" / "evidence").mkdir()
+        (runs / "run_active0" / "evidence" / "log.txt").write_text("line 1\n")
+        return runs
+
+    ACTIVE_ENV = {"OS42_ACTIVE_RUN_IDS": "run_active0", "CLAUDE_CODE_SESSION_ID": ""}
+    EMPTY_ENV = {"OS42_ACTIVE_RUN_IDS": "", "CLAUDE_CODE_SESSION_ID": ""}
+
+    @NEEDS_CHECKPOINT_STORE
+    def test_an_untracked_settled_change_or_deletion_is_detected(self) -> None:
+        runs = self._fixture_runs()
+        self.assertEqual(self.active_runs(runs, self.ACTIVE_ENV), {"run_active0", "run_live0"})
+        before = self.historical_digest(runs, self.ACTIVE_ENV)
+        self.assertIn("run_settleduntracked/accepted.md", before)
+        self.assertFalse([k for k in before if k.startswith(("run_active0/", "run_live0/"))], before)
+        (runs / "run_settleduntracked" / "accepted.md").write_text("changed historical evidence")
+        self.assertNotEqual(self.historical_digest(runs, self.ACTIVE_ENV), before, "an untracked settled change went undetected")
+        (runs / "run_settleduntracked" / "accepted.md").write_text("accepted historical evidence")
+        self.assertEqual(self.historical_digest(runs, self.ACTIVE_ENV), before)
+        (runs / "run_settleduntracked" / "accepted.md").unlink()
+        self.assertNotEqual(self.historical_digest(runs, self.ACTIVE_ENV), before, "a settled deletion went undetected")
+
+    @NEEDS_CHECKPOINT_STORE
+    def test_an_empty_invocation_protects_every_settled_root_including_the_legacy_id(self) -> None:
+        """`probe_history_hardcoded_active`: with nothing named, only the positive live-writer
+        fact is active; OS-42's legacy run id is history like any other root."""
+        runs = self._fixture_runs()
+        self.assertEqual(self.active_runs(runs, self.EMPTY_ENV), {"run_live0"})
+        before = self.historical_digest(runs, self.EMPTY_ENV)
+        self.assertIn("run_70401d3e9964/accepted.md", before)
+        self.assertIn("run_active0/evidence/log.txt", before)          # unnamed and no live fact: history
+        (runs / "run_70401d3e9964" / "accepted.md").write_text("changed")
+        self.assertNotEqual(self.historical_digest(runs, self.EMPTY_ENV), before, "the legacy root went unprotected")
+
+    @NEEDS_CHECKPOINT_STORE
+    def test_a_terminal_run_with_an_unreleased_binding_is_protected_for_any_session(self) -> None:
+        """`probe_history_terminal_stale_binding` + `probe_history_own_session_terminal`: a
+        terminal checkpoint with an unreleased cookie is history -- for another session and
+        for the SAME session resuming it (a cookie names a run; it is not a writer)."""
+        runs = self._fixture_runs()
+        for env in (self.ACTIVE_ENV, self.EMPTY_ENV, {"OS42_ACTIVE_RUN_IDS": "", "CLAUDE_CODE_SESSION_ID": "coordinator-that-died"}):
+            self.assertNotIn("run_settledcrashed", self.active_runs(runs, env), env)
+            before = self.historical_digest(runs, env)
+            self.assertIn("run_settledcrashed/FINAL_REVIEW.md", before)
+            (runs / "run_settledcrashed" / "FINAL_REVIEW.md").write_text(f"changed settled evidence {env}")
+            self.assertNotEqual(self.historical_digest(runs, env), before, env)
+
+    @NEEDS_CHECKPOINT_STORE
+    def test_a_nested_active_name_inside_a_settled_run_is_protected(self) -> None:
+        """`probe_history_nested_active_name`: only the ROOT run directory decides."""
+        runs = self._fixture_runs()
+        before = self.historical_digest(runs, self.ACTIVE_ENV)
+        self.assertIn("run_settledarchive/evidence/run_active0/accepted.md", before)
+        (runs / "run_settledarchive" / "evidence" / "run_active0" / "accepted.md").write_text("changed historical archive")
+        self.assertNotEqual(self.historical_digest(runs, self.ACTIVE_ENV), before, "a nested active-name path went unprotected")
+
+    @NEEDS_CHECKPOINT_STORE
+    def test_an_active_run_evidence_append_is_excluded(self) -> None:
+        """The named active run's writers and the positively live run's writers never move the
+        digest; once the invocation stops naming a run (and it has no live fact) it is history."""
+        runs = self._fixture_runs()
+        before = self.historical_digest(runs, self.ACTIVE_ENV)
+        for run in ("run_active0", "run_live0"):
+            with (runs / run / "evidence" / "log.txt").open("a") as handle:
+                handle.write("line 2 (a concurrent evidence writer)\n")
+            (runs / run / "evidence" / "new_probe.txt").write_text("more evidence")
+        self.assertEqual(self.historical_digest(runs, self.ACTIVE_ENV), before)
+        after = self.historical_digest(runs, self.EMPTY_ENV)
+        self.assertIn("run_active0/evidence/new_probe.txt", after)
+        self.assertNotIn("run_live0/evidence/new_probe.txt", after)
+
+    @NEEDS_CHECKPOINT_STORE
+    def test_the_positive_live_writer_fact_needs_both_halves(self) -> None:
+        """Non-terminal checkpoint + unreleased binding = active; either half alone is not."""
+        from scripts.deterministic_workflow import turn_boundary as tb
+        runs = self._fixture_runs()
+        base = runs.parent.parent
+        self.assertIn("run_live0", self.active_runs(runs, self.EMPTY_ENV))
+        tb.release_session_run("run_live0", session_id="a-live-coordinator", artifact_base=base)
+        self.assertNotIn("run_live0", self.active_runs(runs, self.EMPTY_ENV), "a released binding is no writer")
+        self.assertTrue(tb.bind_session_run("run_live0", session_id="a-live-coordinator", artifact_base=base))
+        self._checkpoint(base, "run_live0", terminal=True)
+        self.assertNotIn("run_live0", self.active_runs(runs, self.EMPTY_ENV), "a terminal checkpoint is no writer")
+
+    def test_the_real_tree_protects_every_settled_run_tracked_or_not(self) -> None:
+        """On this checkout: every git-tracked run artifact is in the digest, every file of
+        every non-active run directory is in the digest (untracked included), and nothing of
+        an active run is."""
+        import subprocess
+        runs = REPO_ROOT / "artifacts" / "runs"
+        if not runs.is_dir():
+            self.skipTest("no run artifacts in this checkout")
+        active = self.active_runs(runs)
+        digest = self.historical_digest(runs)
+        try:
+            tracked = subprocess.run(["git", "ls-files", "-z", "--", str(runs)], cwd=REPO_ROOT,
+                                     capture_output=True, check=True).stdout.split(b"\0")
+        except (OSError, subprocess.CalledProcessError):
+            tracked = []
+        for entry in tracked:
+            if not entry:
+                continue
+            rel = str((REPO_ROOT / entry.decode("utf-8")).relative_to(runs))
+            if Path(rel).parts[0] not in active:
+                self.assertIn(rel, digest, f"tracked history dropped: {rel}")
+        on_disk = {str(p.relative_to(runs)) for p in runs.rglob("*")
+                   if p.is_file() and p.relative_to(runs).parts[0] not in active}
+        self.assertEqual(on_disk, set(digest), "an untracked settled artifact is unprotected")
+        self.assertFalse([k for k in digest if Path(k).parts[0] in active])
 
     def test_the_feature_write_paths_touch_no_historical_run_artifact(self) -> None:
         """The structural test above greps three modules for `write_text(`.
@@ -353,9 +585,8 @@ class HistoricalArtifactTests(unittest.TestCase):
             base = Path(directory)
             # A run id that names a REAL historical run: if the base were ignored, the
             # write would land on that run's directory and the digest would move.
-            historical = sorted(
-                path.name for path in runs.iterdir()
-                if path.is_dir() and path.name != self.CURRENT_RUN)
+            historical = sorted({
+                path.relative_to(runs).parts[0] for path in self.historical_files()})
             sink = RunLoggingAuditSink(historical[0], artifact_base=base)
             for index, event in enumerate(audit.AUDIT_EVENTS):
                 sink.deliver(event, f"key-{index}",

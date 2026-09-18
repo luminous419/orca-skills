@@ -114,6 +114,8 @@ TOLERATED_MANIFEST_HEADER = """\
 #   always           expected on every platform (the opt-in live-runtime suite, gated on
 #                    ORCA_RUNTIME_TEST=1, which no CI runner sets)
 #   not_darwin       expected iff sys.platform != "darwin" (the seatbelt backend)
+#   not_linux        expected iff sys.platform != "linux" (OS-48: the subreaper / pidfd /
+#                    EIO-retention locks in test_os48_linux_locks)
 #   no_sandbox_exec  expected iff /usr/bin/sandbox-exec is absent
 #
 # A test may declare more than one condition; the lines are in PRECEDENCE order, matching
@@ -206,6 +208,10 @@ CONDITIONS: dict[str, Callable[[], bool]] = {
     # The seatbelt backend is darwin-only; on every other platform T-8.9 carries the
     # fail-closed guarantee instead and these tests declare themselves skipped.
     "not_darwin": lambda: sys.platform != "darwin",
+    # OS-48 (W-CI-LANES): the Linux-native locks -- PR_SET_CHILD_SUBREAPER, pidfd delivery,
+    # EIO tail retention -- declare themselves skipped on every other platform.  On Linux
+    # they must RUN; on macOS they must skip.  Neither host gets the weaker contract.
+    "not_linux": lambda: sys.platform != "linux",
     # A darwin host without the binary, and every non-darwin host.
     "no_sandbox_exec": lambda: not Path(SANDBOX_EXEC).exists(),
 }
@@ -1110,6 +1116,18 @@ def derive_tolerated_alternatives(
         if sandbox_reason is not None:
             alternatives[test_id].append(("no_sandbox_exec", sandbox_reason))
 
+    # OS-48 (W-CI-LANES): the `not_linux` arm is the mirror image -- a test that skips in BOTH
+    # darwin simulations (with and without the binary, same reason) and does NOT skip in the
+    # linux simulation is gated on the platform being Linux.  A test skipping identically in
+    # every simulation is an env-var gate and stays out (it is `always`, below).
+    linux_reasons = dict(linux_rows)
+    for test_id, reason in sorted(unconditional_reasons.items()):
+        if test_id in linux_reasons:
+            continue
+        if darwin_reasons.get(test_id) != reason:
+            continue
+        alternatives.setdefault(test_id, []).append(("not_linux", reason))
+
     platform_gated = set(alternatives)
     for test_id, reason in sorted(observed_here):
         if test_id not in platform_gated:
@@ -1128,7 +1146,7 @@ def render_tolerated_manifest(alternatives: dict[str, list[tuple[str, str]]]) ->
     lines = [
         f"# generated on: platform={sys.platform} "
         f"sandbox_exec_present={str(Path(SANDBOX_EXEC).exists()).lower()}",
-        "# conditions: 'always' observed at runtime on this host; 'not_darwin' and",
+        "# conditions: 'always' observed at runtime on this host; 'not_darwin', 'not_linux' and",
         "#   'no_sandbox_exec' observed by loading the suite under a simulated environment",
         "#   and reading the same __unittest_skip_why__ attributes TestCase.run consults.",
         "#",
@@ -1167,8 +1185,18 @@ def tolerated_manifest_header(alternatives: dict[str, list[tuple[str, str]]]) ->
 #: anti-drift check in `test_ci_lanes` reads these names out of the AST and holds the
 #: checked-in manifest to them; the writer below holds its OWN output to the same reading
 #: before it is allowed to become the checked-in manifest.
-PLATFORM_GATE_DECORATORS = {"DARWIN_ONLY": "not_darwin", "NEEDS_SANDBOX": "no_sandbox_exec"}
+PLATFORM_GATE_DECORATORS = {"DARWIN_ONLY": "not_darwin", "NEEDS_SANDBOX": "no_sandbox_exec",
+                            "LINUX_ONLY": "not_linux"}
 PLATFORM_GATED_MODULE = "test_review_isolation"
+#: OS-48 (W-CI-LANES): the modules that declare platform gates.  `test_os48_linux_locks`
+#: gates every class on `LINUX_ONLY`; the finality / evidence lock modules gate their darwin
+#: fact locks and libproc seams on `DARWIN_ONLY`.
+PLATFORM_GATED_MODULES = (PLATFORM_GATED_MODULE, "test_os48_linux_locks",
+                          "test_os48_finality_locks", "test_os48_evidence_locks",
+                          "test_os48_review_i1_locks", "test_os48_review_i2_locks",
+                          "test_os48_review_i3_locks", "test_os48_review_i4_locks",
+                          "test_os48_review_i5_locks", "test_os48_review_i6_locks",
+                          "test_os48_review_i7_locks")
 
 
 def declared_platform_gates(root: Path | None = None) -> dict[str, set[str]]:
@@ -1180,23 +1208,23 @@ def declared_platform_gates(root: Path | None = None) -> dict[str, set[str]]:
     with the source is refused at generation time rather than discovered by the next test
     run.
     """
-    path = (root or REPO_ROOT) / "scripts" / f"{PLATFORM_GATED_MODULE}.py"
-    tree = ast.parse(path.read_text(encoding="utf-8"))
-
     def conditions(decorators: Sequence[Any]) -> set[str]:
         return {PLATFORM_GATE_DECORATORS[node.id] for node in decorators
                 if isinstance(node, ast.Name) and node.id in PLATFORM_GATE_DECORATORS}
 
     gates: dict[str, set[str]] = {}
-    for node in tree.body:
-        if not isinstance(node, ast.ClassDef):
-            continue
-        class_conditions = conditions(node.decorator_list)
-        for member in node.body:
-            if isinstance(member, ast.FunctionDef) and member.name.startswith("test"):
-                found = class_conditions | conditions(member.decorator_list)
-                if found:
-                    gates[f"{PLATFORM_GATED_MODULE}.{node.name}.{member.name}"] = found
+    for module in PLATFORM_GATED_MODULES:
+        path = (root or REPO_ROOT) / "scripts" / f"{module}.py"
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in tree.body:
+            if not isinstance(node, ast.ClassDef):
+                continue
+            class_conditions = conditions(node.decorator_list)
+            for member in node.body:
+                if isinstance(member, ast.FunctionDef) and member.name.startswith("test"):
+                    found = class_conditions | conditions(member.decorator_list)
+                    if found:
+                        gates[f"{module}.{node.name}.{member.name}"] = found
     return gates
 
 
@@ -1266,7 +1294,7 @@ def write_manifest(lane: str, *, verbosity: int = 0) -> int:
     # it were universal. `scripts/test_review_isolation.py` declares platform gates, so a
     # manifest with no conditional arm can only mean the simulation silently produced
     # nothing -- which would hand CI a file that is exact here and wrong on the runner.
-    conditional = counts["not_darwin"] + counts["no_sandbox_exec"]
+    conditional = counts["not_darwin"] + counts["no_sandbox_exec"] + counts["not_linux"]
     if not conditional:
         print("CI_LANE_ERROR: the derived manifest has no platform-conditional entries, but "
               "the suite declares platform gates. Refusing to write a one-platform view as "
@@ -1283,7 +1311,7 @@ def write_manifest(lane: str, *, verbosity: int = 0) -> int:
             print(f"CI_LANE_ERROR: {problem}", file=sys.stderr)
         print(f"CI_LANE_ERROR: TOLERATED_DERIVATION_DRIFT: refusing to write "
               f"{TOLERATED_SKIP_MANIFEST.name} ({len(drift)} entries disagree with the "
-              f"gates {PLATFORM_GATED_MODULE}.py declares); neither manifest was written",
+              f"gates {', '.join(PLATFORM_GATED_MODULES)} declare); neither manifest was written",
               file=sys.stderr)
         return 1
 

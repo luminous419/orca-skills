@@ -271,7 +271,7 @@ class F01CrashedSupervisorDispatchIsCollectedTests(_CrashRoom):
         self.assertEqual(len(settled), 1, [r["state"] for r in settled])
         self.assertEqual(f"{settled[0]['session_id']}:{settled[0]['process_incarnation']}",
                          fence, "the settlement is not fenced to the receipt")
-        self.assertEqual(settled[0]["state"], "COMPLETED")
+        self.assertEqual(settled[0]["state"], "COMPLETED", settled[0])
         adopted = [row for row in rows
                    if (row.get("source_vocabulary") or {}).get("adopted") is True
                    and row["event"] == "identity_bound"]
@@ -708,6 +708,13 @@ class F04OrphanDrainIsBoundedTests(unittest.TestCase):
         _wait_until(sentinel.exists, timeout=30, what="the exit sentinel")
         read = pty_supervisor.read_exit_sentinel(sentinel, fence="sess:inc1")
         self.assertEqual(read, {"outcome": "exited", "code": 0})
+        # OS-48: the sentinel is written BEFORE the orphan finalize (marker drain, fence,
+        # two-phase release, meta save/close); the orphan watcher's durable end is its own
+        # exit.  A stranger reading the capture meta mid-finalize sees an in-flight append
+        # (`evidence_unreadable`), which is the honest answer at that instant, not this lock's
+        # subject -- so wait for the watcher to be gone before reading.
+        _wait_until(lambda: not pid_alive(info["leader_pid"]), timeout=30,
+                    what="the orphan watcher's exit")
         capture_path = Path(info["capture"])
         # -- bounded disk: the limit held, and it is the profile's ---------------------
         self.assertLessEqual(capture_path.stat().st_size, 4096,
@@ -1002,7 +1009,9 @@ class F06ResultPathIsAbsoluteTests(_Composed):
 
     #: A CLI whose `-o` behaviour is the one this finding is about: it writes its final
     #: message to the path it was handed, relative to ITS OWN cwd.  Native (finding 10),
-    #: through the same trampoline the other fixtures use.
+    #: through the same trampoline the other fixtures use.  Superseded by OS-48 i4: the
+    #: agent_message also carries the body on the stream (as real `codex exec --json`
+    #: does), because the `-o` file is only the R3 presence fact, never the body.
     AGENT = textwrap.dedent("""\
         #!/bin/sh
         SESSION=""; OUT=""; WANT_VERSION=0; WANT_HELP=0; WANT_AUTH=0
@@ -1024,7 +1033,7 @@ class F06ResultPathIsAbsoluteTests(_Composed):
         printf '{"type":"thread.started","thread_id":"%s"}\\n' "$SESSION"
         IFS= read -r PROMPT || PROMPT=""
         printf '{"type":"item.started","item":{"id":"item_0"}}\\n'
-        printf '{"type":"item.completed","item":{"id":"item_0","type":"agent_message"}}\\n'
+        printf '{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"F6 BODY written by the agent\\\\nSTATUS: COMPLETE"}}\\n'
         if [ -n "$OUT" ]; then
           mkdir -p "$(dirname "$OUT")" 2>/dev/null
           printf 'F6 BODY written by the agent\\nSTATUS: COMPLETE\\n' > "$OUT"
@@ -1049,10 +1058,13 @@ class F06ResultPathIsAbsoluteTests(_Composed):
             # selector accepts (K-1, a completed `agent_message` item), not the turn start.
             "delivery_proofs": [{"channel": "structured", "record_type": "item.completed"}],
             "completion_records": [{"channel": "structured",
-                                    "record_type": "turn.completed"}],
-            # The body comes ONLY from the `-o` file: the record's own field is absent.
-            "result_body_records": [{"channel": "structured", "record_type": "turn.completed",
-                                     "body_field": "final_message"}],
+                                    "record_type": "turn.completed", "binding_mode": "single_record_optin"}],
+            # Superseded by OS-48 i4 (F-001 option ii): the `-o` file is never a settlement
+            # body source, so the body record is the completed `agent_message` on the
+            # stream -- the real `codex exec --json` shape -- and `-o` stays the R3
+            # presence fact (still absolute, still written by the agent, still snapshotted).
+            "result_body_records": [{"channel": "structured", "record_type": "item.completed",
+                                     "item_type": "agent_message", "body_field": "item.text"}],
             "output_last_message_path": "last.md",
             "auth_probe": {"args": ["login", "status"]},
             "timeouts": {"preflight_timeout_ms": 3000, "readiness_timeout_ms": 8000,
@@ -1086,12 +1098,17 @@ class F06ResultPathIsAbsoluteTests(_Composed):
                 .rows_for("intent-f6") if row["kind"] == "SETTLEMENT_OBSERVED"]
         self.assertEqual(len(rows), 1)
         vocab = rows[0]["source_vocabulary"]
-        self.assertEqual(vocab["result_body_source"], "output_last_message_path",
-                         "the body written by the agent was not read back")
+        # superseded by OS-48 i4 (F-001 option ii): the `-o` sidecar is never a settlement
+        # body source -- the body is the stream's, and the sidecar contributes only the
+        # R3 presence fact frozen in the fence.  The absolute path is still the one handed
+        # to the agent (so the file the agent wrote IS the one the fence snapshotted).
+        self.assertEqual(vocab["result_body_source"], "item.completed.item.text", vocab)
         provenance = vocab["result_body_provenance"]
-        self.assertTrue(os.path.isabs(provenance["path"]), provenance)
-        self.assertTrue(Path(provenance["path"]).is_file(), provenance)
-        self.assertTrue(provenance["scoped_to_this_dispatch"])
+        self.assertNotIn("path", provenance, "the `-o` file was read as the body")
+        self.assertEqual(vocab["fence"]["sidecar"]["state"], "present", vocab["fence"]["sidecar"])
+        self.assertEqual(vocab["fence"]["sidecar"]["path"], session.last_message_path)
+        self.assertTrue(os.path.isabs(session.last_message_path), session.last_message_path)
+        self.assertTrue(Path(session.last_message_path).is_file(), session.last_message_path)
         self.assertEqual([p.name for p in Path(self.worktree).rglob("last_message.*")], [],
                          "the agent wrote the result file inside its worktree")
         self.assertEqual(vocab["event"]["result"]["status"], "COMPLETE")
@@ -1263,7 +1280,7 @@ class NB1SlowFirstResponseBoundaryTests(_Composed):
             "readiness_records": [{"channel": "structured", "record_type": "system",
                                    "session_field": "session_id"}],
             "delivery_proofs": [{"channel": "structured", "record_type": "assistant"}],
-            "completion_records": [{"channel": "structured", "record_type": "result",
+            "completion_records": [{"channel": "structured", "record_type": "result", "binding_mode": "single_record_optin",
                                     "error_field": "is_error"}],
             "driver_env": {"OS37_SLOW_FIRST_RESPONSE_S": str(slow_s)},
             "auth_probe": {"args": ["auth", "status"]},

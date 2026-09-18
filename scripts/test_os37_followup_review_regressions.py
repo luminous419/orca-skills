@@ -144,7 +144,7 @@ def stub_profile_spec(mode: str, *, worktree: str, timeouts: dict | None = None,
         "readiness_records": [{"channel": "structured", "record_type": "system",
                                "session_field": "session_id"}],
         "delivery_proofs": [{"channel": "structured", "record_type": "assistant"}],
-        "completion_records": [{"channel": "structured", "record_type": "result",
+        "completion_records": [{"channel": "structured", "record_type": "result", "binding_mode": "single_record_optin",
                                 "error_field": "is_error"}],
         "auth_probe": {"args": ["auth", "status"]},
         "timeouts": {"preflight_timeout_ms": 1500, "readiness_timeout_ms": 5000,
@@ -168,7 +168,7 @@ def agent_profile_spec(*, worktree: str, driver_env: dict | None = None,
         "delivery_mode": "post_ready_delivery", "identity_binding": "minted_echo",
         "identity_flag": "--session-id",
         "delivery_proofs": [{"channel": "structured", "record_type": "assistant"}],
-        "completion_records": [{"channel": "structured", "record_type": "result",
+        "completion_records": [{"channel": "structured", "record_type": "result", "binding_mode": "single_record_optin",
                                 "error_field": "is_error", "success_field": "terminal_reason",
                                 "success_values": ["completed"]}],
         "result_body_records": [{"channel": "structured", "record_type": "result",
@@ -938,14 +938,18 @@ class F09CompletionReclaimsResourcesTests(_Composed):
         lives, and the no-leak assertion above still holds because the watcher exits --
         and drops it -- the moment the agent is reaped.  The real-subprocess proof is
         `test_os37_lifecycle_boundary_regressions.F01SupervisorDeathTests`."""
+        # Superseded by OS-48 (DESIGN §1.3): the watcher KEEPS exactly one slave descriptor --
+        # the owner-held reference that keeps the kernel from reclaiming the unread tail and
+        # makes the fence marker writable after the reap -- plus the master keepalive, the
+        # orphan guard, the SIGCHLD wake-up pipe, the drain handoff, the control socket and
+        # its parent-death witness; its stdio is still /dev/null and it still ignores SIGHUP.
         source = inspect.getsource(pty_supervisor._watch)
-        self.assertIn("os.close(slave_fd)", source)
         self.assertIn("os.devnull", source)
-        # The kept set: the master keepalive, the orphan guard and (correction iteration
-        # 2, CI-2) the SIGCHLD wake-up pipe -- still no slave, still nothing else.
-        self.assertIn("keep = {master_fd, guard_r, wake_r, wake_w}", source)
+        self.assertIn("keep = {master_fd, guard_r, wake_r, wake_w, slave_fd}", source)
         self.assertNotIn("os.close(master_fd)", source)
         self.assertIn("signal.signal(signal.SIGHUP, signal.SIG_IGN)", source)
+        # the slave reference is released only at the very end (release-2 / orphan finalize)
+        self.assertEqual(source.count("os.close(slave_fd)"), 1)
 
 
 # =====================================================================================
@@ -988,9 +992,12 @@ RECORD = {"pid": 4242, "pgid": 4242, "sid": 4241, "captured_tty": "ttys042",
           "process_incarnation": "i", "host_scope": "local", "spawn_token": "tok",
           "started_at": "", "argv_digest": "", "env_digest": "",
           "created_by_this_runtime": True, "resource_kind": "pty_session",
-          "user_taken_over": False}
+          "user_taken_over": False,
+          # OS-48: the identity axes every record carries (DESIGN §2.1).
+          "proc_start_ticks": 1_700_000_000_000_042, "boot_id": "boot-test"}
 AGENT_ROW = {"pid": 4242, "ppid": 4241, "pgid": 4242, "sid": 4241, "tty": "ttys042",
-             "stat": "S+"}
+             "stat": "S+", "start_id": 1_700_000_000_000_042, "start_state": "final",
+             "boot_id": "boot-test"}
 LEADER_ROW = {"pid": 4241, "ppid": 1, "pgid": 4241, "sid": 4241, "tty": "ttys042",
               "stat": "Ss"}
 
@@ -1023,7 +1030,8 @@ class F11DeliveredSignalIsNeverNotOwnedTests(unittest.TestCase):
             "i", "stop", record=RECORD, profile=_ladder_profile(),
             table_reader=_table(lambda n: (AGENT_ROW, LEADER_ROW), stale_after=1),
             supervisor_pid=1, killpg=lambda pg, sig: signals.append((pg, sig)),
-            kill=lambda p, sig: signals.append((p, sig)))
+            kill=lambda p, sig: signals.append((p, sig)),
+            watcher=lambda sig: (signals.append(("watcher", sig)), "sent")[1])
         self.assertTrue(signals, "rung 1 delivered nothing; the case is vacuous")
         self.assertEqual(result["interrupt_outcome"], "exit_unproven")
         self.assertEqual(interrupt_mod.lifecycle_for("exit_unproven"),
@@ -1048,6 +1056,7 @@ class F11DeliveredSignalIsNeverNotOwnedTests(unittest.TestCase):
             table_reader=_table(lambda n: (AGENT_ROW, LEADER_ROW) if n <= 1 else None),
             supervisor_pid=1, killpg=lambda pg, sig: signals.append((pg, sig)),
             kill=lambda p, sig: signals.append((p, sig)), sleep=lambda s: None,
+            watcher=lambda sig: (signals.append(("watcher", sig)), "sent")[1],
             clock=clock)
         self.assertTrue(signals, "rung 1 delivered nothing; the case is vacuous")
         self.assertEqual(result["ladder"][-1]["rung"], "G2", result["ladder"])
@@ -1059,7 +1068,8 @@ class F11DeliveredSignalIsNeverNotOwnedTests(unittest.TestCase):
             "i", "stop", record=RECORD, profile=_ladder_profile(),
             table_reader=_table(lambda n: (AGENT_ROW, LEADER_ROW), stale_after=0),
             supervisor_pid=1, killpg=lambda pg, sig: signals.append((pg, sig)),
-            kill=lambda p, sig: signals.append((p, sig)))
+            kill=lambda p, sig: signals.append((p, sig)),
+            watcher=lambda sig: (signals.append(("watcher", sig)), "sent")[1])
         self.assertEqual(signals, [])
         self.assertEqual(result["interrupt_outcome"], "not_owned")
 
@@ -1067,6 +1077,9 @@ class F11DeliveredSignalIsNeverNotOwnedTests(unittest.TestCase):
 class F12ExitWatcherIsNeverSignalledTests(unittest.TestCase):
 
     def test_group_scope_signals_descendants_and_withholds_the_watcher(self) -> None:
+        """Superseded by OS-48 (DESIGN §2.3 / F-003): NO user-space group signal is ever sent
+        -- the descendant group is withheld by name (`group_signal_refused`), the watcher is
+        still withheld, and the agent is signalled THROUGH the watcher (its parent)."""
         snapshot = {"tty": "ttys042", "captured_at": time.time(), "readable": True,
                     "rows": (LEADER_ROW, AGENT_ROW)}
         permit = identity.assert_may_act(RECORD, "signal", observed=AGENT_ROW)
@@ -1074,12 +1087,17 @@ class F12ExitWatcherIsNeverSignalledTests(unittest.TestCase):
                                                   supervisor_pid=1)
         self.assertEqual(decision["scope"], "group")
         sent: list = []
+        via: list = []
         outcome = pty_supervisor.signal_target(RECORD, decision, 15, permit=permit,
                                                snapshot=snapshot,
-                                               killpg=lambda pg, sig: sent.append(pg))
-        self.assertEqual(sent, [4242], "the exit watcher's group was signalled")
-        withheld = [step for step in outcome["sent"] if step["rung"] == "session_leader"]
-        self.assertEqual(withheld[0]["result"], "withheld:exit_watcher")
+                                               killpg=lambda pg, sig: sent.append(pg),
+                                               watcher=lambda sig: (via.append(sig), "sent")[1])
+        self.assertEqual(sent, [], "a user-space group signal was sent (OS-48 forbids it)")
+        self.assertEqual(via, [15])
+        rungs = {step["rung"]: step["result"] for step in outcome["sent"]}
+        self.assertEqual(rungs["descendant_groups"], "withheld:group_signal_refused")
+        self.assertEqual(rungs["session_leader"], "withheld:exit_watcher")
+        self.assertEqual(rungs["agent_via_watcher"], "sent")
 
     def test_a_real_interrupt_leaves_the_watcher_alive_to_write_the_sentinel(self) -> None:
         base = Path(tempfile.mkdtemp())
@@ -1107,10 +1125,16 @@ class F12ExitWatcherIsNeverSignalledTests(unittest.TestCase):
             pty_id=session["pty_id"], process_incarnation="i-1", host_scope="local",
             spawn_token="tok", started_at="1970-01-01T00:00:00Z", argv_digest="d",
             env_digest="e", created_by_this_runtime=True, resource_kind="pty_session",
-            user_taken_over=False)
+            user_taken_over=False,
+            # OS-48: the identity axes `start()` binds from the spawn record (DESIGN §2.1).
+            proc_start_ticks=pty_supervisor.proc_start_ticks(session["pid"]),
+            boot_id=pty_supervisor.host_boot_id())
         result = interrupt_mod.interrupt(
             "intent-f12", "stop", record=record, profile=prof,
-            drain=lambda: pty_supervisor.drain(session["master_fd"], budget_ms=50))
+            drain=lambda: pty_supervisor.drain(session["master_fd"], budget_ms=50),
+            # OS-48: delivery is watcher-mediated over the control socket (DESIGN §2.3).
+            watcher=lambda sig: pty_supervisor.request_watcher_signal(
+                session["control_fd"], sig, "s-1:i-1"))
         self.assertIn(result["interrupt_outcome"],
                       ("interrupted_confirmed", "terminated_forced"), result)
         deadline = time.time() + 5

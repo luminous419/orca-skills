@@ -746,11 +746,169 @@ class _Driver:
                                          if isinstance(ev, Mapping)),
                 "supplementary": tuple(supplementary)}
 
+    #: The record types this driver's completion selectors may name.  Subclasses narrow it.
+    _COMPLETION_TYPES: tuple[str, ...] = ()
+
+    def completion_candidates(self, text: str) -> tuple[dict[str, Any], ...]:
+        """Every declared-type completion record in stream order (OS-48 R2 counts them)."""
+        declared = {s.record_type for s in self.profile.completion_records} or set(self._COMPLETION_TYPES)
+        return tuple(dict(r) for r in self.structured_records(text) if r.get("type") in declared)
+
+    def framing_candidates(self, text: str) -> tuple[dict[str, Any], ...]:
+        """REVIEW_IMPLEMENTATION_iteration7 F-015: completion- or refusal-SHAPED objects that
+        the record grammar cannot see -- embedded in lines of ``text`` that do not parse as
+        records (a cooperative helper's ``progress: `` prefix on the root's own refusal, a
+        suffix, a record split across two lines).  Each is ``{"record", "refusal", "run"}``:
+        ``refusal`` = the embedded object refuses (its declared ``error_field`` is truthy, its
+        ``is_error`` is truthy, or a declared structured auth marker matches).  A candidate is
+        never a settlement record: it is evidence that R1/R2 cannot be decided from the
+        parsable records alone."""
+        declared = {s.record_type for s in self.profile.completion_records} or set(self._COMPLETION_TYPES)
+        errors = {s.record_type: s.error_field for s in self.profile.completion_records if s.error_field}
+        out: list[dict[str, Any]] = []
+        for run in capture.unparsable_runs(text):
+            if "{" not in run:
+                continue
+            for obj in capture.embedded_objects(run):
+                kind = obj.get("type")
+                refusal = False
+                if kind in errors and _truthy(_dig(obj, errors[kind]) if _dig(obj, errors[kind]) is not None else False):
+                    refusal = True
+                if _truthy(obj.get("is_error")) if obj.get("is_error") is not None else False:
+                    refusal = True
+                if self.structured_refusal(obj) is not None:
+                    refusal = True
+                if kind in declared or refusal:
+                    out.append({"record": obj, "refusal": refusal,
+                                "run": run[:200], "record_type": kind})
+        return tuple(out)
+
+    def select_completion(self, text: str, *, raw: bytes | None = None,
+                          bound_value: str = "", sidecar_present: bool = False,
+                          delivery_events: Sequence[Mapping[str, Any]] = ()) -> dict[str, Any]:
+        """OS-48 DESIGN §1.4 -- settlement selection over the FENCED range ``[baseline, N)``
+        (``text`` / ``raw`` are already bounded by the caller).  Three structural rules, each
+        fail-closed, none depending on per-pid attribution (a pty cannot provide it):
+
+        R1 **refusal dominance** -- any error / refusal record anywhere in the range (a declared
+           completion record whose ``error_field`` is truthy, a structured auth marker, or a
+           free-text refusal over the prose lines) → ``refusal_in_boundary`` (FAILED), regardless
+           of its position relative to a success record;
+        R2 **exactly one** -- more than one declared completion record → ``provenance_ambiguous``
+           (LOST: a second writer was possible); none → no record (FAILED `no_completion_record`);
+           a completion-shaped object inside a line that is NOT a record (helper prefix /
+           suffix / split framing, F-015) → ``record_framing_ambiguous`` (LOST: exactly-one is
+           unprovable) unless it refuses, in which case R1 applies;
+        R3 **dispatch binding** -- the single record must satisfy the selector's
+           ``binding_mode`` (`session_field`: the record carries ``binding_field == bound_value``;
+           `sidecar_file`: the runtime-minted sidecar is present AND ``binding_field`` on the
+           record or on the most recent ``carrier_type`` record before it equals ``bound_value``;
+           `single_record_optin`: no binding); an undeclared mode, an empty bound value, an
+           absent / mismatched / unreadable field → ``provenance_unbound`` (LOST).
+
+        ``{"record": dict|None, "outcome": None|str, "refusal": dict|None, "candidates": int}``.
+        A success is returned ONLY when all three hold; ``completion_verdict`` (the PINNED
+        agent's exit code) still applies afterwards.
+        """
+        records = self.structured_records(text)
+        candidates = self.completion_candidates(text)
+        # F-015 -- completion/refusal-SHAPED objects the record grammar cannot see (helper
+        # prefix / suffix / split framing inside [baseline, N)): a refusing one is a refusal
+        # under R1 (dominance); any other makes R2 UNPROVABLE -> `record_framing_ambiguous`,
+        # never a success.  The exact fenced bytes are untouched.
+        framing = self.framing_candidates(text)
+        # R1 -- refusal dominance (structured-first, as `lifecycle.refusal_evidence` does).
+        refusal: dict[str, Any] | None = None
+        for item in framing:
+            if item["refusal"]:
+                refusal = {"source": "framing_ambiguous_refusal", "record_type": item["record_type"],
+                           "embedded": item["record"], "run": item["run"]}
+                break
+        for rec in candidates:
+            selector = next((s for s in self.profile.completion_records
+                             if s.record_type == rec.get("type")), None)
+            if selector is not None and selector.error_field:
+                observed = _dig(rec, selector.error_field)
+                if observed is not None and _truthy(observed):
+                    refusal = {"source": "error_field", "record_type": rec.get("type"),
+                               "field": selector.error_field, "value": observed}
+                    break
+        if refusal is None:
+            scan = refusal_evidence(raw if raw is not None else text.encode("utf-8", "replace"),
+                                    delivery_events, structured_refusal=self.structured_refusal)
+            if scan["refusals"]:
+                refusal = {"source": scan["source"], "refusals": list(scan["refusals"]),
+                           "structured_hit": scan.get("structured_hit")}
+        last = candidates[-1] if candidates else None
+        if refusal is not None:
+            if (refusal.get("source") == "error_field" and len(candidates) == 1
+                    and refusal.get("record_type") == candidates[0].get("type")):
+                # The ONLY completion record refuses through its own declared error field:
+                # `completion_verdict` names that leg (`error_field_set`) -- the same fail-closed
+                # outcome, with the operator-visible leg preserved.  R1 dominance is what makes
+                # a refusal BEFORE a later success count; here there is no later success.
+                return {"record": last, "outcome": None, "refusal": refusal, "candidates": 1}
+            return {"record": last, "outcome": capture.OUTCOME_REFUSAL_IN_BOUNDARY,
+                    "refusal": refusal, "candidates": len(candidates)}
+        if framing:
+            return {"record": None, "outcome": capture.OUTCOME_RECORD_FRAMING_AMBIGUOUS,
+                    "refusal": None, "candidates": len(candidates) + len(framing),
+                    "framing": [{"record_type": f["record_type"], "run": f["run"]} for f in framing]}
+        if not candidates:
+            # No DECLARED completion record.  The driver's last record of a completion SHAPE
+            # (an undeclared type) is still handed to `completion_verdict` so the operator
+            # sees `completion_record_undeclared` rather than a bare absence; it can only
+            # refuse there (an undeclared type never matches a selector).
+            legacy = self.completion_record(text)
+            return {"record": legacy, "outcome": None, "refusal": None, "candidates": 0}
+        if len(candidates) > 1:
+            return {"record": None, "outcome": capture.OUTCOME_PROVENANCE_AMBIGUOUS,
+                    "refusal": None, "candidates": len(candidates)}
+        only = candidates[0]
+        selector = next((s for s in self.profile.completion_records
+                         if s.record_type == only.get("type")), None)
+        mode = selector.binding_mode if selector is not None else ""
+        unbound = {"record": None, "outcome": capture.OUTCOME_PROVENANCE_UNBOUND,
+                   "refusal": None, "candidates": 1}
+        if mode == "single_record_optin":
+            return {"record": only, "outcome": None, "refusal": None, "candidates": 1}
+        if mode not in ("session_field", "sidecar_file") or not bound_value:
+            return unbound
+        field = selector.binding_field
+        if mode == "session_field":
+            if str(_dig(only, field) if _dig(only, field) is not None else "") != bound_value:
+                return unbound
+            return {"record": only, "outcome": None, "refusal": None, "candidates": 1}
+        if not sidecar_present:
+            return unbound
+        observed = _dig(only, field)
+        if observed is None:
+            idx = next((i for i, r in enumerate(records) if r is not None and r == only), None)
+            carrier = None
+            if idx is not None:
+                carrier = next((r for r in reversed(records[:idx])
+                                if r.get("type") == selector.carrier_type), None)
+            observed = None if carrier is None else _dig(carrier, field)
+        if observed is None or str(observed) != bound_value:
+            return unbound
+        return {"record": only, "outcome": None, "refusal": None, "candidates": 1}
+
     def completion_evidence(self, text: str, *, exit_status: int | None,
                             exit_proven: bool,
-                            capture_answerable: bool = True) -> dict[str, Any]:
-        """Settlement candidates ONLY.  Can never express readiness."""
-        record = self.completion_record(text)
+                            capture_answerable: bool = True,
+                            selection: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """Settlement candidates ONLY.  Can never express readiness.  With ``selection`` (the
+        OS-48 `select_completion` result over the fenced range) the settlement record and its
+        provenance outcome come from it; without one the legacy last-of-type record is used
+        and ``provenance_outcome`` is ``provenance_unbound`` (never a fenced success)."""
+        if selection is not None:
+            record = selection.get("record")
+            provenance_outcome = selection.get("outcome")
+            refusal = selection.get("refusal")
+        else:
+            record = self.completion_record(text)
+            provenance_outcome = capture.OUTCOME_PROVENANCE_UNBOUND if record is not None else None
+            refusal = None
         lost_reason = ""
         if not capture_answerable:
             lost_reason = capture.CAPTURE_TRUNCATED_LOST_REASON
@@ -759,9 +917,11 @@ class _Driver:
         return {"exit_status": exit_status, "exit_proven": exit_proven,
                 "settlement_record": record, "capture_answerable": capture_answerable,
                 "lost_reason": lost_reason,
+                "provenance_outcome": provenance_outcome, "refusal": refusal,
                 "source_vocabulary": {"driver": self.name,
                                       "record": record or {},
-                                      "exit_code": exit_status},
+                                      "exit_code": exit_status,
+                                      "provenance_outcome": provenance_outcome},
                 "at": _now_iso()}
 
     # -- D4.4's CONJUNCTIVE settlement predicate, applied rather than described ----------
@@ -835,13 +995,21 @@ class _Driver:
         return {"outcome": "succeeded", "reason": "", "detail": ""}
 
     # -- D4.4 / review #3: the FINAL MESSAGE BODY, and only it ---------------------------
-    def result_body(self, text: str) -> dict[str, Any]:
+    def result_body(self, text: str, *, sidecar: bytes | None = None,
+                    allow_path: bool = True) -> dict[str, Any]:
         """``{"body": str|None, "source": str}`` -- the agent's own final message.
 
         Profile-declared, so this base implementation serves every driver and no CLI name is
         hard-coded here.  ``body=None`` means the profile declared no extraction, and the
-        caller then hands the WHOLE transcript to the shared parser exactly as before --
+        caller then hands the WHOLE of ``text`` to the shared parser exactly as before --
         which is correct for the scripted fixture CLIs whose transcript IS a report.
+
+        OS-48 (REVIEW_IMPLEMENTATION F-001): ``text`` is the caller's AUTHORITATIVE interval
+        (`[baseline, N)` of the fenced capture -- `StandaloneSession._authoritative_text`),
+        never the whole mutable transcript; and the ``-o`` sidecar is consulted through
+        ``sidecar`` -- the bytes the runtime FROZE when it bound the fence -- rather than
+        re-read from a path a later writer could still change.  Only when the caller passes
+        no frozen copy (pre-OS-48 callers) is the file read here.
         """
         for selector in self.profile.result_body_records:
             for record in reversed(self.structured_records(text)):
@@ -854,15 +1022,23 @@ class _Driver:
                     return {"body": value,
                             "source": f"{selector.record_type}.{selector.body_field}"}
         path = self.profile.output_last_message_path
-        if path and self.profile.result_body_records and os.path.exists(path):
+        # OS-48 (REVIEW_IMPLEMENTATION_iteration3 F-001): the `-o` file is NOT a settlement body
+        # source -- its content cannot be bound to the boundary N.  The runtime passes
+        # `allow_path=False` and no bytes; the branch survives only for explicit legacy callers
+        # that hand in a frozen copy themselves.
+        if (path and self.profile.result_body_records
+                and (sidecar is not None or (allow_path and os.path.exists(path)))):
             # The `-o` file is a SECOND source for the same body, never a substitute for the
             # exit proof.  It is consulted only when the profile declared an extraction at
             # all, so a profile that declares none keeps the whole-transcript behaviour.
-            try:
-                with open(path, "rb") as handle:
-                    raw = handle.read()
-            except OSError:
-                raw = b""
+            if sidecar is not None:
+                raw = sidecar
+            else:
+                try:
+                    with open(path, "rb") as handle:
+                        raw = handle.read()
+                except OSError:
+                    raw = b""
             text_body = raw.decode("utf-8", errors="replace")
             if text_body.strip():
                 import hashlib
@@ -938,6 +1114,7 @@ class _Driver:
 
 
 class ClaudeDriver(_Driver):
+    _COMPLETION_TYPES = ("result",)
     """The Claude Code CLI driver.  Every flag comes from the profile."""
 
     name = "claude"
@@ -1053,6 +1230,8 @@ class ClaudeDriver(_Driver):
 
 class CodexDriver(_Driver):
     """The Codex CLI driver.  Every flag comes from the profile."""
+
+    _COMPLETION_TYPES = ("turn.completed", "task_complete", "item.completed")
 
     name = "codex"
 

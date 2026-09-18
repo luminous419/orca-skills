@@ -114,7 +114,8 @@ cat > "$OUT/profile.json" <<JSON
     {"channel": "structured", "record_type": "assistant"}
   ],
   "completion_records": [
-    {"channel": "structured", "record_type": "result", "error_field": "is_error"}
+    {"channel": "structured", "record_type": "result", "error_field": "is_error",
+     "binding_mode": "single_record_optin"}
   ],
   "driver_env": {"OS37_R10_FAIL_PHASE": "$FAIL_PHASE",
                  "OS37_R10_INTENT_DUMP": "$OUT/intents"},

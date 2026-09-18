@@ -80,9 +80,12 @@ def profile(**overrides) -> StandaloneProfile:
         identity_binding="minted_echo", identity_flag="--session-id",
         delivery_proofs=(DeliveryProofSelector(channel="structured",
                                                record_type="assistant"),),
+        # OS-48 R3: the fixture stub emits ONE unbound `result` record; `single_record_optin`
+        # is the fixture-only binding (the installed CLIs bind `session_field` / `sidecar_file`).
         completion_records=(CompletionSelector(channel="structured",
                                                record_type="result",
-                                               error_field="is_error"),),
+                                               error_field="is_error",
+                                               binding_mode="single_record_optin"),),
         # The completion bound is DECLARED, not inherited.  Its production default is
         # sized for a real agent turn (external review #4), so a fixture that drives a
         # non-completing dispatch must name its own or wait half an hour.
@@ -596,12 +599,30 @@ class FullSupervisedDispatchTests(unittest.TestCase):
         self.assertEqual(probe["outcome"], "present",
                          "no execve was proven for a dispatch that settled")
         rows = journal.rows_for("intent-e2e")
+        # superseded by OS-48 i6 (F-010): teardown may journal ONE diagnostic
+        # `descendants_unreaped` EVENT before `exit_observed` whenever the agent's forks could
+        # not all be attributed (fail-closed `descendants_unknown`) -- a residual that never
+        # moves the settlement; the order lock is asserted on every other row.
+        residual = [row for row in rows if row.get("event") == "descendants_unreaped"]
+        self.assertLessEqual(len(residual), 1, residual)
+        for row in residual:
+            self.assertEqual(row["kind"], "EVENT")
+            self.assertIn(row["source_vocabulary"]["outcome"], ("descendants_unknown", "membership_unreadable", None))
+            self.assertLess(rows.index(row), len(rows) - 1, "the residual row must precede exit_observed")
+        rows = [row for row in rows if row.get("event") != "descendants_unreaped"]
         kinds = [row["kind"] for row in rows]
         self.assertEqual(
             kinds,
             ["DELIVERY_INTENT", "EVENT", "SPAWN_OBSERVED", "RECEIPT_OBSERVED", "EVENT",
-             "EVENT", "SETTLEMENT_OBSERVED", "EVENT"],
-            "the journal's record order changed; DELIVERY_INTENT is FIRST by construction")
+             "EVENT", "EVENT", "EVENT", "SETTLEMENT_OBSERVED", "EVENT", "EVENT"],
+            "the journal's record order changed; DELIVERY_INTENT is FIRST by construction: "
+            + repr([(row["kind"], row.get("event")) for row in rows]))
+        # OS-48: the finality events are journalled IN ORDER before the settlement -- the
+        # owner generation claim, then the verified fence -- and the two-phase release after it.
+        events = [row.get("event") for row in rows if row["kind"] == "EVENT"]
+        self.assertEqual(events, ["spawned", "readiness_observed", "delivery_proof_observed",
+                                  "owner_claimed", "fence_published", "release_observed",
+                                  "exit_observed"], events)
         # The trailing EVENT is the supervisor RECLAIMING its own resources after the
         # proven exit (consolidated review finding 9): the exit watcher reaped, the master
         # fd closed.  Journalled so a stranger can see the completion leaked nothing.

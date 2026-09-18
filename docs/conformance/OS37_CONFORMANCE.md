@@ -381,7 +381,10 @@ qualified "at the pinned revision".
   append sees a `verified` tail: the answerability gate distinguishes "not yet fully
   visible" (in flight, verified) from "integrity failed" (forged / truncated / meta
   missing), and still refuses only the latter.
-* **Settlement requires POSITIVE stream finality** (round-8 iteration 3).  The post-exit
+* **Settlement requires POSITIVE stream finality** (round-8 iteration 3).  **Superseded by
+  OS-48 (see the OS-48 section below): the positive fact is now the in-band FENCE MARKER at
+  boundary N, never a hangup; `stream_end_unproven` is retired in favour of
+  `boundary_unproven`.**  Historical text follows.  The post-exit
   drain counts exactly two observations as the hangup -- a clean EOF and `errno.EIO`, the
   pty's own "every slave descriptor is closed" signals; `EINTR` is retried; every other
   read or poll error is `ended: master_unreadable` with the errno named (an unreadable
@@ -425,7 +428,11 @@ qualified "at the pinned revision".
 
 ## Round 9 -- consolidated external review of `fc21012` (issuecomment-5680361023)
 
-* **A CAPTURE-FINALIZED proof, DISTINCT from the exit sentinel** (round-9 item 1).  The exit
+* **A CAPTURE-FINALIZED proof, DISTINCT from the exit sentinel** (round-9 item 1).
+  **Superseded by OS-48: `os37.capture_finalized.v1` is REFUSED BY NAME
+  (`legacy_finalized_record`); the proof is the fence `os48.capture_fence.v1` bound to
+  `sha256(capture[0,N))`.  `write_capture_finalized` / `read_capture_finalized` /
+  `finalized_matches` no longer exist.**  Historical text follows.  The exit
   sentinel proves the *process* exited -- the exit watcher writes it the instant `waitpid`
   returns, whether or not any output has been drained.  Whether the *capture* is complete
   is a SEPARATE, crash-durable, fenced record
@@ -444,7 +451,11 @@ qualified "at the pinned revision".
   `test_os37_round9_review_regressions.py::Item1*` (real-pty watcher finalize included) and
   the F01 adopted-recovery path.
 
-* **PTY scope: fail-closed and OBSERVABLE (choice a).**  A descendant that retains the pty
+* **PTY scope: fail-closed and OBSERVABLE (choice a).**  **Superseded by OS-48: a retained
+  slave no longer withholds finality -- its bytes land after N and are retained as a
+  diagnostic tail; the holder enumeration below is a DIAGNOSTIC (`present` / `unreadable` /
+  `none_observed`) that no decision consults (ANALYSIS F0: a negative whole-process-table
+  scan is never proof).**  Historical text follows.  A descendant that retains the pty
   slave prevents the EOF/EIO hangup.  We do NOT accept "final record + N ms silence" as
   success.  The finalizing drain is bounded by the profile's own
   `timeouts.post_exit_drain_budget_ms` (default 2 s, an operator-tunable knob, not a
@@ -463,7 +474,11 @@ qualified "at the pinned revision".
   observes the master hangup while that session leader lives -- not a separate reader (the
   supervisor) and not even the leader itself as the SOLE master holder (the production orphan
   path with no holder reads `ended=budget`, never a hangup); the hangup is delivered ONLY when
-  the ctty leader EXITS and revokes.  (2) Removing the controlling terminal makes the hangup
+  the ctty leader EXITS and revokes.  **[OS-48 CORRECTION, MEASURED: this claim is false.  The
+  darwin master reports EOF on the LAST SLAVE CLOSE whether or not the ctty leader lives, and
+  the unread tail is discarded ~0.5-0.7 s after that close (run_f820764749d6
+  `evidence/analysis/probe_01`, `probe_04`); only a HELD slave reference retains it
+  (`evidence/design/probe_d1`).  This is why OS-48 makes the watcher hold one.]**  (2) Removing the controlling terminal makes the hangup
   observable while the watcher lives, but darwin then reclaims the master's unread buffer
   ~0.3-1 s after the agent exits -- reintroducing the lost tail.  So the hangup used as proof
   is the watcher's release/revoke, and the RELEASE is gated on a COMPLETE positive
@@ -584,7 +599,10 @@ qualified "at the pinned revision".
 ## Round 10 -- consolidated follow-up review of `bcd5c6d` (issuecomment-5688372349)
 
 * **The supervisor is the SINGLE finalizing owner and the exit watcher's exit can no longer
-  manufacture the hangup** (round-10 item 1).  On darwin a session leader's exit REVOKES the
+  manufacture the hangup** (round-10 item 1).  **Superseded by OS-48: no hangup is ever a
+  proof; the watcher HOLDS the owner slave reference, writes the fence marker after its
+  `waitpid`, and the release is TWO-PHASE (RELEASE marker -> `release.<inc>` record -> close);
+  `_await_drain_handoff` and `POST_EXIT_SETTLE_MS` no longer exist.**  Historical text follows.  On darwin a session leader's exit REVOKES the
   controlling tty and DISCARDS the master's unread tail -- empirically reproduced on this
   host (`artifacts/runs/.../evidence/repro/`): the pre-fix topology, watcher exiting the
   instant it wrote the sentinel, left the supervisor's drain reading `[EOF]` with the tail
@@ -606,8 +624,11 @@ qualified "at the pinned revision".
   crash-cut locks of `::Finding1SupervisorCrashCutTests` (round 9), which stay green.
 
 * **`unreadable` slave-holder authority is never collapsed into absence** (round-10 item 2).
+  **OS-48: `_slave_holders` / `_slave_holder_state` are DIAGNOSTIC only; the states are
+  `present` / `none_observed` / `unreadable` (the word "proven" does not occur); the
+  non-positive `killpg` guard is retained.**
   `standalone_pty._slave_holders` records whether each probe COMPLETED and
-  `_slave_holder_state` is a tri-state: `present` / `proven_absent` / `unreadable`.  A failed
+  `_slave_holder_state` is a tri-state: `present` / `none_observed` / `unreadable`.  A failed
   `tcgetpgrp`, an unreadable `/proc`, or a skipped `/proc/<pid>/fd` entry is `unreadable` with
   the failed authority NAMED, and only a COMPLETE positive absence proof yields `proven`.
   `tcgetpgrp() <= 0` is "no usable foreground group" (a complete positive absence on that
@@ -634,3 +655,300 @@ qualified "at the pinned revision".
   (b) `recover_handle`'s exit-evidence wait is derived from the run profile's
   `post_exit_drain_budget_ms` (`_exit_evidence_budget_ms`), not the fixed 3.5 s constant.
   (c) `tcgetpgrp() <= 0` never triggers `killpg(0, 0)`.
+
+## OS-48 -- positive PTY capture finality and execution ownership authority (run_f820764749d6)
+
+Supersedes the round-8/9/10 finality model above (the historical bullets are kept, each
+marked).  Design: `artifacts/runs/run_f820764749d6/DESIGN.md` (topology A).  Measured facts:
+`evidence/analysis/` (probe_01..14) and `evidence/design/` (probe_d1..d15) of that run.
+
+* **The finality fact is POSITIVE and in-band.**  The exit watcher (session leader, the agent's
+  PARENT) keeps ONE slave descriptor -- the *owner-held slave reference* -- for the life of the
+  dispatch, so the kernel never reclaims the master's unread tail and nobody can manufacture an
+  EOF (darwin discards the tail ~0.5-0.7 s after the LAST slave close, measured; Linux retains
+  it and reads `EIO`).  After `waitpid` reaps the pinned root it writes the FENCE MARKER
+  `\n<<OS48-FENCE <nonce>>>\n` (the nonce minted by the supervisor before the spawn,
+  `PtySession.fence_nonce`) into that slave, then the exit sentinel.  The marker's offset in the
+  capture is the boundary **N**; the settlement window is `[baseline, N)`; every byte after N is
+  a DIAGNOSTIC tail.  The supervisor's `drain_after_exit` drains TO THE MARKER (ends `marker` |
+  `budget` | `master_unreadable` | `marker_inconsistent`; silence never ends it) and publishes
+  the fence `capture.log.fence.<inc>.json` (`os48.capture_fence.v1`: `boundary.offset_n`,
+  `marker_len`, `marker_nonce`, `sha256_prefix = sha256(capture[0,N))`, `exit`, `owner`,
+  `provenance`) with a link-EXCLUSIVE tmp+fsync+link publication -- a fence is never
+  overwritten; a later actor VERIFIES it (`fence_matches`: prefix digest + sentinel agreement).
+  `_stream_is_final` holds ONLY for a verified fence (`finality: capture_finalized`).  A legacy
+  `os37.capture_finalized.v1` record is refused by name (`legacy_finalized_record`).  Named
+  non-successes: `boundary_unproven`, `fence_missing`, `fence_mismatch`, `fence_foreign`,
+  `exit_unproven` (all LOST); a hangup / EOF proves nothing.
+
+* **Settlement rules over `[baseline, N)`** (`_Driver.select_completion`, R1-R3): **R1 refusal
+  dominance** -- any declared error record, structured auth marker or free-text refusal in the
+  window ⇒ FAILED `refusal_in_boundary`, whatever its position; **R2 exactly one** declared
+  completion record ⇒ else `provenance_ambiguous` (LOST); **R3 the dispatch binding**
+  (`CompletionSelector.binding_mode`, REQUIRED in every profile spec: `session_field` -- Claude
+  `result.session_id == minted`; `sidecar_file` -- Codex `-o` sidecar present + `thread_id` on
+  the record or its most recent `thread.started` carrier; `single_record_optin` -- fixtures
+  only; an empty / mismatched / unreadable bound ⇒ `provenance_unbound`, LOST).  A bound
+  success by ANY member of the supervised subtree inside the window is legitimate (N-002); a
+  completion record after N is diagnostic, never settlement.
+
+* **Two-phase release and the retained diagnostic tail** (AC-9).  `_reclaim` runs
+  `_release_two_phase`: release-1 (`R` byte) -> the watcher writes `\n<<OS48-RELEASE
+  <nonce>>>\n`; the supervisor drains to R and publishes `capture.log.release.<inc>.json`
+  (`os48.release_boundary.v1`: `offset_r`, `retained_tail_bytes`, `retained_tail_sha256`,
+  `custodian`); release-2 (`C` byte) -> the watcher closes its slave reference; the supervisor
+  reads to EOF/EIO (diagnostic).  Every acknowledged pre-R byte is retained; a release the
+  watcher could not serve is NAMED `diagnostic_tail_unaccounted` (+ `release_record_missing`),
+  never a silent loss, and never touches `[0, N)`.  `reap_leader` drains the master while it
+  waits (a leader exiting with pending output wedges in `E` otherwise).
+
+* **Finalizer ownership is a witnessed generation chain.**  `owner.<inc>.g<n>`
+  (`os48.finalizer_owner.v1`, exclusive link) names who may publish: the supervisor claims g1
+  at the marker (`owner_conflict` if it loses); a fence ends every claim (fence-first,
+  `fence_published_no_claim`); guard EOF is *relinquishment-or-death* and NEVER authorises a
+  claim by itself (`succession_unwitnessed`) -- a claim needs the owner's durable
+  `relinquish.<inc>.g<n>` record (written by `release()` for a generation it will not finish)
+  or the incarnation-bound parent-death witness (darwin `kqueue NOTE_EXIT` on the pinned
+  pid+start identity, ESRCH at registration = already dead, a zombie is `absent`; Linux
+  `pidfd_open` / `/proc` state `Z`); a claim is bound to the pinned predecessor (`claim_target`
+  = predecessor+1, `validate_claim`), a live highest owner is `finalizer_alive`, an unreadable
+  one `identity_unreadable`.  The orphan watcher (supervisor dead) finishes the publication
+  itself -- drain to marker, claim, fence, RELEASE, record, close -- and leaves a durable
+  `capture.log.orphan.<inc>.json` note naming its outcome; without a claim it still performs
+  the release as custodian.  A masterless successor (`_fence_from_disk`) waits fence-first for
+  the marker, publishes from a captured marker only with a proven exit and an absent /
+  relinquished / dead owner, and re-evaluates a lost claim race until the winner's fence appears.
+  Crash cuts C1-C9 / RC1-RC4 (DESIGN §1.7) each yield the same N/digest or a named outcome.
+
+* **Execution ownership is bound to an incarnation, never a pid.**  Spawn records and rows carry
+  `proc_start_ticks` + `boot_id` (REQUIRED axes: `verify` is `unverifiable: identity_unreadable`
+  without them, `not_owned: identity_changed` on a mismatch; `read_identity` reads them at
+  decision time: `final` / `absent` (ESRCH or zombie) / `unreadable`).  The agent is signalled
+  ONLY through the watcher's control socket (`request_watcher_signal`: `sent` before its reap,
+  `refused:signal_target_reaped` after, `refused:signal_unbound` for a foreign fence) -- the
+  same single thread reaps and delivers, so a pre-reap request cannot hit a recycled pid; a
+  darwin non-child is `signal_unbound` (no signal); Linux descendants go through a pidfd.
+  `may_killpg` always refuses (`group_signal_refused`): group teardown is the kernel's own
+  SIGHUP at controlling-tty revoke (measured on both platforms); members outside the group are
+  reported `descendants_unreaped`.  The Linux watcher is a `PR_SET_CHILD_SUBREAPER` that never
+  consumes the pinned root's own status (`waitid(WNOWAIT)` peek).
+
+* **Diagnostics are diagnostics.**  `slave_device_holders` (libproc) and `_slave_holders` (tty
+  table) survive with states `present` / `unreadable` / `none_observed`; denied, short and
+  stale (revoked ENOENT) reads are `unreadable` by name; no decision function calls them (a
+  static + mutation lock).  The journal records `holders_diagnostic`, `diagnostic_tail_bytes`,
+  `path_opener_indistinguishable` (residual O-10) beside the fence.
+
+* **Iteration 2 corrections (REVIEW_IMPLEMENTATION.md F-001..F-007).**  (F-001) every
+  settlement extraction, parser input, fallback and settled digest reads the AUTHORITATIVE
+  interval `[baseline, N)` (`StandaloneSession._authoritative_text`), and the `-o` sidecar is
+  FROZEN when the fence binds (its digest travels in the fence's `sidecar` field; a sidecar that
+  no longer matches is `evidence_inconsistent`); the journal's `result_body_provenance.interval`
+  names the interval and its sha256.  (F-002) the orphan watcher's death witness is bound to the
+  incarnation it was registered on (`_ParentWitness.covers`); when the highest owner is a
+  different incarnation the watcher obtains per-pid evidence for THAT owner (`absent` = positively
+  gone, alive = `finalizer_alive`, unreadable = `identity_unreadable`) -- a witness for g1 never
+  supersedes a live g2, and `may_claim_generation` refuses a positively live owner before any
+  witness is consulted.  (F-003) the RELEASE marker is written at most once per nonce (a served
+  release-1 is REUSED by the orphan path); `verify_release_record` joins the record to the fence
+  file digest, the nonce, R in the capture and the retained-tail digest; an adopted session
+  verifies or RECOVERS the release boundary (`successor_from_capture`) and names
+  `release_record_missing` / `diagnostic_tail_unaccounted`; a failed publication (ENOSPC) is never
+  `final`.  (F-004) a positive partial fill is named: the pid table is checked against a fresh
+  count (kernel slack 20 + churn tolerance) and the scanner's own pid (`listallpids_partial`),
+  and an fd listing is cross-checked by an independent per-index walk of the fd table
+  (`listing_partial_fill`); a table too large to walk is `fd_walk_unbounded`.  (F-005) NO claim
+  and NO fence without positive complete identities (pid > 0, start_id > 0, boot id) for the
+  owner, the emitter and the reaper (`identity.identity_complete`; the watcher's identity is
+  pinned at spawn as `watcher_start_id`); `fence_matches` refuses a fence carrying an
+  unreadable identity (`identity_unreadable`).  (F-006) the positive membership ledger
+  `members.<inc>.jsonl` (`os48.member.v1`: identity with start id, role `agent` / `descendant`,
+  `observed_via`, `pgid`, `observed` / `exited` events) is written by the watcher -- darwin:
+  kqueue `NOTE_FORK|NOTE_EXIT` on every member triggering a bounded `ppid == member` walk of
+  `proc_listallpids` + BSDINFO (plus an initial and a ~1 s periodic walk), Linux: subreaper
+  reaps + a `/proc` ppid walk on SIGCHLD; `_reclaim` re-reads every member's pinned identity and
+  journals `descendants_unreaped` (alive members) / `unknown` (unreadable) -- no member is ever
+  signalled.  (F-007) `scripts/test_os48_crash_cuts.py` SIGKILLs a real supervisor / watcher at
+  deterministic pause seams for C1-C9 and RC1-RC3 with concurrent successors, and
+  `scripts/test_os48_review_i1_locks.py` re-runs every reviewer construction through the real
+  callers; scheduling sleeps in the post-N locks are replaced by handshakes.
+
+* **Iteration 3 corrections (REVIEW_IMPLEMENTATION_iteration2.md F-001/F-004/F-006/F-007).**
+  (F-001 -- *superseded by the iteration-4 correction below*: the reap-step read fixes the
+  sidecar's PRESENCE fact, not its content; a helper write between that read and the marker
+  is still inside N, so the snapshot bytes are no longer a settlement body source.)  The
+  declared `-o` sidecar is read, digested and snapshotted by the EXIT WATCHER in its reap step
+  (`snapshot_sidecar` -> `capture.log.sidecar.<inc>.json` + `.bytes`, link-exclusive; instant
+  `reap_step_before_marker`).  The fence's `sidecar` field is that snapshot (`present` /
+  `absent` / `sidecar_unreadable` / `sidecar_unproven`), never a digest sampled after N; a
+  sidecar the fence did not prove is refused by name
+  (`result_body_provenance.sidecar_refused = sidecar_unproven`) on the supervisor, orphan and
+  adoption paths.  (F-004) `_libproc_list_all_pids` claims completeness only from an INDEPENDENT
+  kernel enumeration (`sysctl kern.proc.all`, taken before and after the fill): any pid present in
+  both walks and absent from the fill is `listallpids_partial`; an unreadable walk is
+  `listallpids_crosscheck_unreadable`; no deficit tolerance and no single anchor; an unreadable
+  fd-table size makes the fd cross-check `fd_table_size_unreadable`, never clean.  (F-006)
+  members are keyed by incarnation `(pid, start_id)`; a child is attributed only to a parent
+  member whose identity re-read NOW equals the recorded one (or a zombie still holding that pid);
+  exited / stale / reused parents attribute nothing; the ledger's readability is part of the
+  answer (`read_ledger`: unreadable / torn; `members.<inc>.state.json` accounts every append) --
+  `membership_unreadable` with explicit `unknown` accounting, never "zero members".  (F-007) the
+  RC2 cut is taken at the real tmp-fsynced -> link boundary (`standalone_capture._LINK_HOOK`, a
+  test-only seam) on the supervisor and orphan-watcher paths, with the boundary state asserted
+  and simultaneous recovery without deleting a winner (`test_os48_review_i2_locks`).
+
+* **Iteration 4 corrections (REVIEW_IMPLEMENTATION_iteration3.md F-001/F-004/F-006/F-008).**
+  (F-001) DESIGN defines ONE boundary -- the marker's stream offset N (§1.2 "authoritative
+  boundary = the root's reaped exit materialised as the fence marker"; §1.4 R3 "sidecar present
+  **and** field == bound_value ... absent / unreadable -> `provenance_unbound`") and no
+  auxiliary-content boundary, so sidecar CONTENT is refused as a settlement body source by name
+  (`result_body_provenance.sidecar_refused = sidecar_unproven`; `result_body(allow_path=False)`;
+  bodies come only from in-stream records -- the installed Codex profile reads
+  `item.completed` / `agent_message` / `item.text`, measured by the real codex smoke), and R3's
+  presence fact is the IMMUTABLE fence snapshot taken by the owner in the reap step (recorded
+  with its instant `reap_step_before_marker`): a sidecar created, removed or resized after N
+  never changes a verdict on the supervisor, orphan or adoption path.  (F-004) PID enumeration
+  completeness requires EXACT agreement of the independent walk before the fill, the fill and
+  the walk after; any other disagreement is `listallpids_unstable` (a missed entry present in
+  both walks: `listallpids_partial`); an intersection is never completeness.  (F-006) the ledger's
+  readable content is joined to the durable append count (`members.<inc>.state.json`) and re-read
+  once: a whole-line prefix shorter than `appended`, or accounting/content that changes between
+  the reads, is `membership_unreadable` with the unknown remainder (`read` / `appended`) named.
+  (F-008) `snapshot_sidecar` distinguishes ENOENT (`absent`, positive) from any other open/read
+  failure (`sidecar_unreadable`, errno recorded); neither approves a `sidecar_file` binding.
+
+* **Iteration 5 corrections (REVIEW_IMPLEMENTATION_iteration4.md F-009, N-001).**  (F-009)
+  `_Membership.discover` never turns unreadable evidence into an empty candidate list: a process
+  listing that fails (`listallpids_*` on darwin, a denied `/proc` on Linux) or will not settle,
+  and a live candidate whose identity no source will read (darwin consults the independent
+  `kern.proc.pid` read before giving up), are accounted SEPARATELY from the appends -- a
+  `discovery_unreadable` ledger record (kind / reason / trigger / pids) and a `discovery` block
+  (`passes`, `listing_unreadable`, `listing_unstable`, `candidates_unreadable`, `reasons`,
+  `pids`) in `members.<inc>.state.json`.  `membership_residual()` joins both into the named
+  outcome `descendants_unknown` (dominated by `membership_unreadable` when the ledger itself is
+  unreadable / short), keeps the positive set, and `_reclaim` journals a `descendants_unreaped`
+  row over it; nothing unknown is signalled; the capture fence stays valid (a G2 accounting
+  residual, not a capture failure); the accounting persists for an adopting successor.  (N-001)
+  the sidecar snapshot is documented as the reap-step PRESENCE fact only.
+
+* **Iteration 6 corrections (REVIEW_IMPLEMENTATION_iteration5.md F-010, F-011, N-001).**
+  (F-010) a POSITIVE kernel fork whose child cannot be attributed is never silently clean:
+  `serve` runs the fork-triggered walk BEFORE marking exits and hands `discover` the member
+  pids whose NOTE_FORK it served; a fork event that no child attributed to that parent IN THAT
+  CALL discharges (the child already exited -- possibly after forking -- or was reparented
+  because its parent exited first, e.g. NOTE_FORK|NOTE_EXIT delivered together) is a durable
+  `discovery_unreadable` record of kind `fork_unattributed` carrying the parent identity and
+  the kernel event (`fflags`, `parent_exited`, `parent_presence`), counted as
+  `forks_unattributed`; the residual is `descendants_unknown` with the fork named, on the
+  supervisor and adopting-successor paths; the positive set is kept, nothing unknown is
+  signalled, the fence stays valid.  Discharge is fail-closed: a child a periodic walk
+  happened to attribute just before the event was served is NOT credited (a spurious UNKNOWN,
+  never a spurious clean), and kqueue's coalescing of repeated forks into one event means one
+  attributed child discharges the event it was served with.  On Linux there are no fork
+  events; the same cut is attributed POSITIVELY because the watcher is a subreaper and the
+  orphaned helper reparents to it (`subreaper_reparent`), and a `release_wait` walk (1 s) runs
+  while the watcher waits for the release on both platforms.  The worker's own adversarial
+  pass named every other path where a positive event or a readable observation could drop a
+  live descendant: a member whose fork/exit watch could not be registered
+  (`fork_watch_unregistered`, e.g. gone before the kqueue add), no kqueue at all
+  (`fork_watch_unavailable`), an unreadable kqueue read (`fork_events_unreadable`, once per
+  error), a positively attributed descendant the ledger ceiling would not hold
+  (`member_ceiling_exceeded`), and a candidate whose parent member no identity source will
+  re-read while the kernel still holds the pid (`parent_identity_unreadable`; `_live_member_for`
+  is tri-state: attributable / positively refused / unreadable).  Remaining, documented
+  limit (DESIGN §2.2 "discovery may MISS"): a fork by a process in the window between its
+  birth and the registration of its watch leaves no kernel evidence and is not accounted.
+  (F-011) the OS-42 historical-artifact lock protects EVERY settled run on disk, tracked or
+  not; only runs that are POSITIVELY active -- an unreleased OS-44 coordinator-session binding
+  (`coordinator_session/*.json`, `released_at: null`), the hard-coded OS-42 run, or an explicit
+  `OS42_ACTIVE_RUN_IDS` allow-list -- are excluded; mutation controls cover an untracked
+  settled change and deletion (detected), an active-run evidence append (excluded) and a
+  released binding (protected again).  (N-001) the last inline "after this read is after N"
+  comment is replaced by the presence-fact wording.
+
+* **Iteration 7 corrections (REVIEW_IMPLEMENTATION_iteration6.md F-010 / F-011 / F-012 /
+  F-013) -- the CONSERVATIVE descendant model.**  Six successive reviews found a path where
+  discovery promoted uncertainty to a clean result; the model is now the other way round: the
+  residual is UNKNOWN by default and only an enumerated set of POSITIVE facts contributes --
+  P1 the spawn record (the root's pid + start identity, the watcher's own child); P2 the root's
+  fork/exit watch registered BEFORE its exec (`spawn` holds the not-yet-exec'd child on a gate
+  pipe until the watcher's kqueue add has returned -- the pre-exec child never forks, so the
+  root has no pre-registration window; a failed add is the named `fork_watch_gap`); P3 a
+  candidate whose ppid is a member whose CURRENT start identity re-read now equals the
+  recorded one (a held zombie / unreadable pid is NOT a witness of the cached incarnation --
+  the iteration-6 held-zombie exception is gone, F-012); P4 Linux: a candidate whose ppid is
+  the watcher itself (the subreaper's adopted child) is a positive member candidate whatever
+  its own start readability -- an unreadable (zero) start is `candidate_identity_unreadable`,
+  named by pid, never omitted (F-013); P5 a member's exit observed by the watcher.  Every
+  non-positive observation is a durable `discovery_unreadable` record that NO later
+  observation discharges: `fork_coalesced` (a NOTE_FORK on a member -- coalesced, it proves
+  "at least one fork", never the set of children; F-010: attributing one child does not clear
+  it), `fork_watch_gap` (the root without P2; EVERY descendant, whose watch is registered
+  after its birth), `parent_identity_unreadable`, `candidate_identity_unreadable`,
+  `listing_unreadable` / `listing_unstable`, `fork_watch_unregistered`,
+  `fork_watch_unavailable`, `fork_events_unreadable`, `member_ceiling_exceeded`, and
+  `watch_ended` (members still alive when the watcher stopped observing).  Consequence: a
+  darwin dispatch is clean only when its root, under a pre-exec watch, never forked; a root
+  that forked is `descendants_unknown` with its positively attributed members listed alive --
+  acceptable per DESIGN §2.2 (a smaller positive set; absence stays unknown and is reported;
+  nothing unknown is ever signalled; the fence stays valid).  On Linux there are no fork
+  events and the subreaper is the positive mechanism; the pre-reclaim residual of a
+  non-forking or fully attributed tree is clean.  (F-011) the OS-42 historical-artifact
+  lock's active set is ONLY what the invocation names -- `OS42_ACTIVE_RUN_IDS`, the hard-coded
+  OS-42 run, or a run whose `coordinator_session` binding names THIS process's own
+  `CLAUDE_CODE_SESSION_ID` and is unreleased; an unreleased binding of any OTHER session is
+  never evidence of activity (a coordinator that died after a terminal checkpoint leaves one);
+  exclusion is by the ROOT run-directory component only.  A lane run inside an orchestrated
+  worktree must name its run (`OS42_ACTIVE_RUN_IDS=<run> python3 -m scripts.ci_lane ...`).
+
+* **Iteration 8 corrections (REVIEW_IMPLEMENTATION_iteration7.md F-011 / F-014 / F-015 /
+  F-016, N-002).**  (F-015, capture finality) R1/R2 are decided over MORE than the parsable
+  records: every run of lines in `[baseline, N)` that does not parse as a record is scanned
+  for embedded balanced JSON objects (`standalone_capture.embedded_objects` /
+  `unparsable_runs`; string- and escape-aware); an object of a declared completion type or
+  carrying a refusal marker (its declared `error_field`, `is_error`, a structured auth
+  marker) is a `framing_candidate` (`standalone_drivers.framing_candidates`): a refusing one
+  is a refusal under R1 (`refusal_in_boundary`, FAILED); any other makes "exactly one"
+  unprovable -- `record_framing_ambiguous` (LOST, registered in `LOST_REASONS` /
+  `OS48_LOST_OUTCOMES`), never COMPLETED.  A cooperative helper's `progress: ` prefix on the
+  root's own refusal, a suffix, and a record split across lines are all covered; prose braces
+  that hold no completion-shaped object do not widen the candidates; the fenced byte prefix
+  is untouched.  This stays inside DESIGN §1.4 R1/R2 (it widens what counts as a candidate
+  and refuses on ambiguity) and does not weaken AC-4.  (F-014, Linux ownership)
+  `PR_SET_CHILD_SUBREAPER` is installed AND verified (`PR_GET_CHILD_SUBREAPER` reads back 1)
+  by `_set_subreaper` inside `_register_root_watch`, i.e. BEFORE `spawn`'s gate releases the
+  root, and its RECEIPT (`"subreaper"`) travels as `root_watch`; a failed / unverifiable
+  setup is the durable `ownership_setup_unverified:<why>` record (`unobservable`) for the whole
+  dispatch and the residual is `descendants_unknown` (`discovery=unwatched`); the string
+  "linux" is no longer a receipt.  The reviewer's delayed-setup cut can no longer start a
+  root at all (the gate holds it; the leader refuses the spawn by name).  (F-016, Linux
+  identity) (pid, start tick) is not injective at tick granularity, so every positively
+  attributed Linux member holds a FIXED object -- a `pidfd_open` descriptor kept from
+  attribution until the member is observed exiting; `_live_member_for` asks the pidfd
+  (`alive` = the pid is still exactly that process; `exited` = P5 through the fixed object;
+  no pidfd = unreadable), never (pid, tick) equality; the watcher polls the held pidfds for
+  exits (`serve`, and the select loop wakes on them); members are LIFETIMES `(pid, start,
+  n)`: a live process presenting the key of an EXITED lifetime is a new lifetime (attributed
+  on its own parentage, own pidfd), and a cached UNEXITED tuple whose pidfd has died is
+  marked exited and never adopts another process's child; a member without a pidfd is
+  `pidfd_unavailable` (unknown).  The supervisor-side reader keeps one residual entry per
+  lifetime and states `lifetime_binding: tick_granular` where two lifetimes share a key.  On
+  darwin the start identity is µs-granular and pinned by kqueue NOTE_EXIT on the watched pid
+  (`fixed_object: kqueue_note_exit`); no pidfd exists there and that is stated in the record.
+  (F-011) the OS-42 historical lock's active set is ONLY the explicit invocation scope
+  (`OS42_ACTIVE_RUN_IDS`) or a POSITIVE live-writer fact -- a run whose workflow checkpoint is
+  present with a non-terminal `run_status` AND whose session binding is unreleased (both
+  required); no hard-coded legacy run, no session cookie (a cookie names a run, it is not a
+  writer); root-directory exclusion in the lock and in every correction lock.  (N-002) the
+  real-CLI harness's exit code is a receipt of its roll-up (0 = PASS + verified evidence, 2 =
+  PARTIAL / FLAKY / FAIL / NOT ESTABLISHED, 3 = evidence unverified) and the summary names the
+  workload outcome separately from the adapter settlement claims.
+
+* **Locks.**  `scripts/test_os48_finality_locks.py` (L-01/02/02b/03/04/10/10b/12),
+  `test_os48_ownership_locks.py` (L-05/11/11b/14), `test_os48_evidence_locks.py` (L-06/07/08),
+  `test_os48_recovery_cuts.py` (L-09/09b, C1-C7), `test_os48_crash_cuts.py` (real kills, C1-C9 /
+  RC1-RC3), `test_os48_review_i1_locks.py` (F-001..F-006), `test_os48_review_i2_locks.py`
+  (i2 F-001/F-004/F-006/F-007), `test_os48_review_i3_locks.py` (i3 F-001/F-004/F-006/F-008), `test_os48_review_i4_locks.py` (i4 F-009), `test_os48_review_i5_locks.py` (i5 F-010 + adversarial pass, F-011), `test_os48_review_i6_locks.py` (i6 F-010 coalesced / pre-exec watch, F-011, F-012, F-013), `test_os48_review_i7_locks.py` (i7 F-015 framing, F-014 verified subreaper, F-016 fixed objects / lifetimes incl. the PID-1 private-namespace alias construction),
+  `test_os48_linux_locks.py` (L-13 + membership, CI condition `not_linux`); the round-8/9/9i2/10 finality locks are versioned in
+  place (`# superseded by OS-48` notes, W-F9).  Real-CLI proof: `scripts/os37_r10_real_agent.py` /
+  `os37_r10_recovery_prompt_e2e.py` (Claude `session_field`, Codex `sidecar_file`).

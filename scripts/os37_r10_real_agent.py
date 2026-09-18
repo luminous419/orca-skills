@@ -222,7 +222,11 @@ def claude_profile(worktree: str, **overrides):
         completion_records=(CompletionSelector(channel="structured", record_type="result",
                                                error_field="is_error",
                                                success_field="terminal_reason",
-                                               success_values=("completed",)),),
+                                               success_values=("completed",),
+                                               # OS-48 R3: the `result` record must carry the
+                                               # minted --session-id (DESIGN probe_d6/d15).
+                                               binding_mode="session_field",
+                                               binding_field="session_id"),),
         # D4.0 M-14: the final assistant text is the `result` record's own `result` field.
         # Declaring it is what lets the driver hand the SHARED settlement parser a BODY
         # instead of the whole JSON event stream (external review #3).
@@ -265,7 +269,13 @@ def codex_profile(worktree: str, codex_home: str, **overrides):
                          DeliveryProofSelector(channel="structured",
                                                record_type="turn.completed"),),
         completion_records=(CompletionSelector(channel="structured",
-                                               record_type="turn.completed"),),
+                                               record_type="turn.completed",
+                                               # OS-48 R3: the runtime-minted `-o` sidecar AND
+                                               # the thread bound at readiness (carried by
+                                               # `thread.started`, DESIGN probe_d6/d15).
+                                               binding_mode="sidecar_file",
+                                               binding_field="thread_id",
+                                               carrier_type="thread.started"),),
         # D4.0 M-8: the final assistant text arrives as an `item.completed` whose item type
         # is `agent_message`; `-o` carries the same body as a second source, which
         # `_Driver.result_body` consults after the selector.
@@ -781,11 +791,22 @@ def main(argv: list[str] | None = None) -> int:
         _write(out_dir, rows, blocked_rows, preconditions, env)
     summary = _write(out_dir, rows, blocked_rows, preconditions, env)
     verification = verify_retained_evidence(out_dir) if rows else {}
-    print(json.dumps({"overall": summary["roll_up"]["overall"],
+    overall = summary["roll_up"]["overall"]
+    # OS-48 iteration 8, N-002: the process exit code is a RECEIPT of the roll-up, not of
+    # the shell -- a PARTIAL / FLAKY / FAIL / NOT ESTABLISHED workload is exit 2 (an
+    # honest non-PASS), a PASS with verified evidence is 0, unverified evidence is 3.  The
+    # printed summary names the workload outcome separately from the adapter settlement
+    # claims, which are audited elsewhere (`proof_join_audit.py`) and never rounded up here.
+    verified = bool(verification.get("all_runs_verified", False)) if rows else False
+    print(json.dumps({"overall": overall,
+                      "workload_outcome": "PASS" if overall == "PASS" else "NON_PASS",
+                      "exit_code_meaning": "0 = every CLI pairing PASS and retained evidence verified; "
+                                           "2 = workload PARTIAL/FLAKY/FAIL/NOT ESTABLISHED; 3 = evidence unverified",
                       "per_cli": summary["roll_up"]["per_cli"],
-                      "retained_evidence_verified":
-                          verification.get("all_runs_verified", False)}, indent=2))
-    return 0
+                      "retained_evidence_verified": verified}, indent=2))
+    if overall != "PASS":
+        return 2
+    return 0 if verified else 3
 
 
 def _write(out_dir: Path, rows: list[dict[str, Any]],

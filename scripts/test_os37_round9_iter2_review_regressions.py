@@ -2,6 +2,11 @@
 iteration-1 reviewer required (`REVIEW_BUGFIX.md` §11 findings 1 and 2).  The item 1–6
 IMPLEMENTATION was judged sound; these add the missing red-at-`fc21012` / green-here locks.
 
+VERSIONED BY OS-48 (run_f820764749d6, W-F9): finding 1's crash cut is rewritten as the
+DESIGN §1.7 cuts C5/C6 over `owner.<inc>.g<n>` + the fence -- the watcher finishes a
+publication its dead supervisor started; the successor settles only from a verified fence.
+Finding 2 is unaffected.
+
 Finding 1 — the real-PTY supervisor crash-cut.  A PRODUCTION supervisor
 (`build_standalone_adapter` -> `execute_state` -> `adapter.start` -> `StandaloneSession`)
 runs a real dispatch on a real POSIX pty with a real forked exit watcher; the supervisor is
@@ -55,48 +60,57 @@ REPO = Path(__file__).resolve().parent.parent
 
 
 # =====================================================================================
-# Finding 1 — the real-PTY supervisor crash-cut, between the sentinel and the proof
+# Finding 1 — the real-PTY supervisor crash-cut, OS-48 form (DESIGN §1.7 cuts C4/C5/C6)
 # =====================================================================================
+# superseded by OS-48: the round-9 cut was "between the watcher's sentinel and the
+# supervisor's proof", and the adopted successor REFUSED (`stream_end_unproven`).  Under
+# OS-48 the exit watcher HOLDS the owner slave reference and defers; when the supervisor
+# dies at that cut the watcher's guard reads EOF, its incarnation-bound parent-death witness
+# fires, and the WATCHER finishes the job -- claims the next generation and publishes the
+# fence from the marker it wrote.  The boundary survives the crash; the successor settles
+# COMPLETED from a fence whose owner is the exit watcher (never from a sentinel alone).
+#
 # The supervisor subprocess installs a TEST-ONLY barrier on
-# `StandaloneSession._finalize_drain` (the supervising session's proof writer).  It is
-# NOT a production seam: the forked exit watcher never calls `_finalize_drain` (it writes
-# its own proof through the module-level `_finalize_orphaned_capture`), so this monkeypatch
-# in the supervisor process cannot change the watcher's behaviour.  The barrier lets the
-# parent stop the supervisor deterministically at one of two cut points:
-#   * `finalize_before` — reached-marker, block, THEN the original: killed while blocked,
-#     the proof was never written (the NEGATIVE cut);
-#   * `finalize_after`  — the original (which writes the proof), reached-marker, block:
-#     killed while blocked, the proof exists but the dispatch is not yet settled (POSITIVE).
+# `standalone_capture.write_capture_fence` -- the supervising session's fence publication --
+# active ONLY in the supervisor's own pid (the forked watcher inherits the patch but the
+# guard `os.getpid() == SUP` makes it a pass-through there).  Cut points:
+#   * `publish_before` — the supervisor has CLAIMED g1 (`owner.<inc>.g1` links) and blocks
+#     before writing the fence: killed there, g1 belongs to a dead owner and no fence exists
+#     (cut C5);
+#   * `publish_after`  — the fence is written, then the supervisor blocks before settling:
+#     killed there, the successor settles from the SUPERVISOR-written fence (cut C6 twin).
 _BARRIER_SUPERVISOR = textwrap.dedent("""
     import json, os, sys, time
     sys.path.insert(0, sys.argv[1])
     (base, run_id, ledger_path, profile_path, barrier_dir, mode) = sys.argv[2:8]
     from pathlib import Path
     from scripts.deterministic_workflow import launcher, recovery_store
+    from scripts.deterministic_workflow import standalone_capture as capture_mod
     from scripts.deterministic_workflow.runtime_state import FileRuntimeStateStore
-    from scripts.deterministic_workflow.standalone_runtime import StandaloneSession
     reached = Path(barrier_dir) / "reached"
     release = Path(barrier_dir) / "release"
-    _orig = StandaloneSession._finalize_drain
+    SUP = os.getpid()
+    _orig = capture_mod.write_capture_fence
     _fired = {"n": 0}
-    def _barrier(self, drained):
-        if _fired["n"]:
-            return _orig(self, drained)
+    def _barrier(path, record):
+        if os.getpid() != SUP or _fired["n"]:
+            return _orig(path, record)
         _fired["n"] = 1
-        if mode == "finalize_after":
-            out = _orig(self, drained)               # writes the proof FIRST
+        if mode == "publish_after":
+            out = _orig(path, record)                # writes the fence FIRST
             reached.write_text("1")
             deadline = time.time() + 120
             while not release.exists() and time.time() < deadline:
                 time.sleep(0.02)
             return out
-        # finalize_before: reached, block, THEN the original (never reached if killed)
+        # publish_before: g1 is claimed already; reached, block, THEN the write (never
+        # reached if killed)
         reached.write_text("1")
         deadline = time.time() + 120
         while not release.exists() and time.time() < deadline:
             time.sleep(0.02)
-        return _orig(self, drained)
-    StandaloneSession._finalize_drain = _barrier
+        return _orig(path, record)
+    capture_mod.write_capture_fence = _barrier
     lease = 3.0
     ledger = FileRuntimeStateStore(Path(ledger_path), lease_seconds=lease)
     profile = json.loads(Path(profile_path).read_text())
@@ -116,10 +130,10 @@ _BARRIER_SUPERVISOR = textwrap.dedent("""
 
 @unittest.skipUnless(_langgraph_ok(), LANGGRAPH_REASON)
 class Finding1SupervisorCrashCutTests(_CrashRoom):
-    """[P1] The production supervisor is SIGKILLed between the fenced exit sentinel and its
-    own finalized proof; the adopted successor refuses (`stream_end_unproven`) rather than
-    settling from the capture the sentinel alone would have vouched for.  Red at `fc21012`
-    (sentinel alone was stream-final -> COMPLETED); green here."""
+    """[P1] The production supervisor is SIGKILLed at the fence-publication cut; OS-48: the
+    exit watcher (owner-held slave reference, incarnation-bound death witness) finishes the
+    publication, and the adopted successor settles from a VERIFIED fence -- never from the
+    sentinel alone, never from a generation whose owner is dead without a witness."""
 
     def _profile(self) -> dict:
         # A short Worker turn: the barrier, not the turn length, controls the cut.
@@ -158,84 +172,72 @@ class Finding1SupervisorCrashCutTests(_CrashRoom):
         self.agent_pids.append(int(row["source_vocabulary"]["pid"]))
         return row
 
-    def _sentinel_and_proof(self, run_id: str, spawned: dict) -> tuple[Path, Path]:
+    def _paths(self, run_id: str, spawned: dict) -> tuple[Path, Path, Path, str]:
         sess = spawned["session_id"]
         inc = spawned["process_incarnation"]
+        capture = capture_mod.capture_path(self.base, run_id, sess)
         sentinel = pty_supervisor.exit_sentinel_path(self.base, run_id, sess, inc)
-        proof = Path(os.fsdecode(capture_mod.capture_finalized_path(
-            capture_mod.capture_path(self.base, run_id, sess), inc)))
-        return sentinel, proof
+        fence = Path(os.fsdecode(capture_mod.capture_fence_path(capture, inc)))
+        owner_dir = Path(os.fsdecode(os.path.dirname(os.fsencode(os.fspath(capture)))))
+        return sentinel, fence, owner_dir, f"{sess}:{inc}"
 
     def _settlements(self, run_id: str, intent_id: str) -> list[dict]:
         return [r for r in self.journal(run_id).rows_for(intent_id)
                 if r["kind"] == "SETTLEMENT_OBSERVED"]
 
-    def _worker_intent_id(self, run_id: str) -> str:
-        for r in self.journal(run_id).rows():
-            if r.get("event") == "spawned" and r.get("kind") == "EVENT":
-                return str(r["intent_id"])
-        raise AssertionError("no worker intent")
-
-    def test_a_kill_between_sentinel_and_proof_refuses_stream_end_unproven(self) -> None:
+    def test_a_kill_after_the_claim_before_the_fence_is_finished_by_the_watcher(self) -> None:
+        """Cut C5: the supervisor CLAIMED g1 and is killed before writing the fence.  The
+        watcher (guard EOF + witnessed death of the pinned supervisor; g1's owner positively
+        dead by its start identity) claims g2 -- superseding the dead g1 -- and publishes the
+        fence from its own marker.  The adopted successor settles COMPLETED from THAT fence,
+        exactly once.  # superseded by OS-48: `..._refuses_stream_end_unproven`."""
         run_id = "run_cutneg"
-        barrier = self._launch_barriered(run_id, "finalize_before")
+        barrier = self._launch_barriered(run_id, "publish_before")
         spawned = self._worker_spawn(run_id)
         intent_id = str(spawned["intent_id"])
-        sentinel, proof = self._sentinel_and_proof(run_id, spawned)
-        # The barrier is reached only after the drain; the watcher has written the sentinel
-        # and exited (it does not orphan-finalize once the agent is reaped), and the proof
-        # is NOT yet written.
+        sentinel, fence, owner_dir, fence_id = self._paths(run_id, spawned)
+        inc = spawned["process_incarnation"]
         _wait_until(lambda: (barrier / "reached").exists() and sentinel.exists(),
-                    timeout=60, what="the sentinel + the pre-proof barrier")
-        self.assertFalse(proof.exists(),
-                         "the supervisor wrote its finalized proof before the cut")
-        self.assertEqual(pty_supervisor.read_exit_sentinel(sentinel, fence=f"{spawned['session_id']}:{spawned['process_incarnation']}")["outcome"],
-                         "exited", "the watcher had not written the sentinel at the cut")
-        # THE CRASH: a real SIGKILL of the real supervisor process, blocked before its proof.
+                    timeout=60, what="the sentinel + the pre-publication barrier")
+        self.assertFalse(fence.exists(), "the supervisor wrote its fence before the cut")
+        highest, g1, state = capture_mod.read_generations(owner_dir, inc)
+        self.assertEqual((highest, state), (1, capture_mod.EVIDENCE_FINAL), (highest, state))
+        self.assertEqual(g1["owner_role"], capture_mod.OWNER_SUPERVISOR)
+        self.assertEqual(int(g1["owner"]["pid"]), self.supervisor.pid)
+        # THE CRASH: a real SIGKILL of the real supervisor process, blocked before its fence.
         self.kill_supervisor()
+        # The watcher finishes: witnessed death -> g2 -> fence.
+        _wait_until(fence.exists, timeout=15, what="the watcher-published fence")
+        record = capture_mod.read_capture_fence(os.fsencode(str(fence)), fence=fence_id)
+        self.assertEqual(record["outcome"], capture_mod.EVIDENCE_FINAL, record)
+        owner = record["record"]["owner"]
+        self.assertEqual(owner["owner_role"], capture_mod.OWNER_EXIT_WATCHER, owner)
+        self.assertEqual(int(owner["generation"]), 2, owner)
+        self.assertEqual(int((owner.get("superseded") or {}).get("pid") or 0), self.supervisor.pid)
+        self.assertIn(owner.get("death_evidence"), ("note_exit_pinned", "pidfd_readable"))
         time.sleep(self.LEASE_SECONDS + 0.5)
-        # No proof exists and no lingering watcher will write one (the watcher exited after
-        # the sentinel), so the adopted successor must refuse.
-        self.assertFalse(proof.exists(), "a finalized proof appeared after the crash")
         code, summary, stderr, escaped = self.recover(run_id)
         self.assertIsNone(escaped, f"the recovery escaped: {escaped!r}")
         settled = self._settlements(run_id, intent_id)
         self.assertEqual(len(settled), 1, f"{summary!r}\n{stderr}")
-        self.assertEqual(settled[0]["state"], "FAILED",
-                         "the adopted successor settled from the unproven stream")
-        self.assertNotEqual(settled[0]["outcome"], "succeeded")
-        verdict = (settled[0]["source_vocabulary"] or {}).get("completion_verdict") or {}
-        self.assertEqual(verdict.get("reason"), "stream_end_unproven",
-                         settled[0]["source_vocabulary"])
-        # No success receipt / settlement in the ledger.
-        ledger = FileRuntimeStateStore(launcher.default_runtime_state_path(run_id, "t"))
-        ledger_settlement = ledger.get_settlement(intent_id)
-        self.assertTrue(ledger_settlement is None
-                        or ledger_settlement.get("status") != "succeeded",
-                        ledger_settlement)
-        head = None
-        with contextlib.suppress(Exception):
-            from scripts.deterministic_workflow import recovery_runtime
-            head = recovery_runtime.resolve_head(run_id, artifact_base=self.base)
-        if head is not None:
-            self.assertNotEqual(head.state.get("terminal_status"), "COMPLETED",
-                                "the run reached COMPLETED over an unproven stream")
+        self.assertEqual(settled[0]["state"], "COMPLETED", settled[0])
+        drain = (settled[0]["source_vocabulary"] or {}).get("post_exit_drain") or {}
+        self.assertEqual(drain.get("finality"), "capture_finalized", drain)
+        self.assertEqual((drain.get("fence") or {}).get("owner", {}).get("owner_role"),
+                         capture_mod.OWNER_EXIT_WATCHER, drain)
 
-    def test_the_positive_twin_settles_from_the_supervisor_written_proof(self) -> None:
+    def test_the_positive_twin_settles_from_the_supervisor_written_fence(self) -> None:
         run_id = "run_cutpos"
-        barrier = self._launch_barriered(run_id, "finalize_after")
+        barrier = self._launch_barriered(run_id, "publish_after")
         spawned = self._worker_spawn(run_id)
         intent_id = str(spawned["intent_id"])
-        sentinel, proof = self._sentinel_and_proof(run_id, spawned)
-        # The barrier is reached AFTER `_finalize_drain` wrote the proof; kill before the
-        # supervisor settles, so the ADOPTED successor is the one that settles.
-        _wait_until(lambda: (barrier / "reached").exists() and proof.exists(),
-                    timeout=60, what="the supervisor-written finalized proof")
-        record = capture_mod.read_capture_finalized(
-            os.fsencode(str(proof)),
-            fence=f"{spawned['session_id']}:{spawned['process_incarnation']}")
-        self.assertEqual(record["outcome"], capture_mod.FINALITY_PROVEN, record)
-        self.assertEqual(record["record"]["writer"], capture_mod.WRITER_SUPERVISOR)
+        sentinel, fence, owner_dir, fence_id = self._paths(run_id, spawned)
+        _wait_until(lambda: (barrier / "reached").exists() and fence.exists(),
+                    timeout=60, what="the supervisor-written fence")
+        record = capture_mod.read_capture_fence(os.fsencode(str(fence)), fence=fence_id)
+        self.assertEqual(record["outcome"], capture_mod.EVIDENCE_FINAL, record)
+        self.assertEqual(record["record"]["owner"]["owner_role"], capture_mod.OWNER_SUPERVISOR)
+        before = fence.read_bytes()
         self.kill_supervisor()
         time.sleep(self.LEASE_SECONDS + 0.5)
         code, summary, stderr, escaped = self.recover(run_id)
@@ -243,13 +245,15 @@ class Finding1SupervisorCrashCutTests(_CrashRoom):
         settled = self._settlements(run_id, intent_id)
         self.assertEqual(len(settled), 1, f"{summary!r}\n{stderr}")
         self.assertEqual(settled[0]["state"], "COMPLETED",
-                         "the adopted successor did not honour the supervisor's proof")
+                         "the adopted successor did not honour the supervisor's fence")
+        # Terminal rule: the published fence was never overwritten by watcher or successor.
+        self.assertEqual(fence.read_bytes(), before)
 
-    def test_the_watcher_finalized_path_never_leaves_a_sentinel_without_a_proof(self) -> None:
-        """The orphaned (watcher-finalizes) path writes the proof BEFORE the sentinel, so a
-        watcher-written sentinel always implies a matching proof — there is no
-        'between sentinel and proof' window for the watcher to be killed in.  A real full
-        `_watch` over a real pty, driven through the production spawn, is the authority."""
+    def test_the_watcher_orphan_path_publishes_the_fence_beside_its_sentinel(self) -> None:
+        """The orphaned (watcher-finalizes) path: the marker is in the stream BEFORE the
+        sentinel (owner-held reference), and the orphan finalize publishes the fence and the
+        release record after it.  A real full `_watch` over a real pty, driven through the
+        production spawn, is the authority."""
         room = Path(tempfile.mkdtemp(prefix="os37-r9i2-watch-"))
         self.addCleanup(shutil.rmtree, room, True)
         agent = room / "agent.sh"
@@ -284,7 +288,7 @@ class Finding1SupervisorCrashCutTests(_CrashRoom):
                 spawn_record_target=pty.spawn_record_path(base,"run_w","i","inc1"),
                 cwd=room, sentinel=str(sent), fence="sess:inc1", image="/bin/sh",
                 capture=cap)
-            json.dump({"leader": s["leader_pid"], "agent": s["pid"],
+            json.dump({"leader": s["leader_pid"], "agent": s["pid"], "nonce": s["fence_nonce"],
                        "sentinel": str(sent), "capture": cap}, open(handoff,"w"))
             os._exit(0)                      # supervisor dies at once: the watcher orphans
         """))
@@ -301,18 +305,25 @@ class Finding1SupervisorCrashCutTests(_CrashRoom):
                     os.kill(int(p), signal.SIGKILL)
         self.addCleanup(_reap)
         sentinel = Path(info["sentinel"])
-        proof = Path(os.fsdecode(capture_mod.capture_finalized_path(
-            os.fsencode(info["capture"]), "inc1")))
-        # The watcher orphan-drains, writes the PROOF, then the sentinel — so whenever the
-        # sentinel exists the proof exists too.
+        capture = os.fsencode(info["capture"])
+        fence = Path(os.fsdecode(capture_mod.capture_fence_path(capture, "inc1")))
         _wait_until(sentinel.exists, timeout=30, what="the watcher's sentinel")
-        self.assertTrue(proof.exists(),
-                        "the watcher wrote a sentinel with no finalized proof beside it")
-        record = capture_mod.read_capture_finalized(os.fsencode(str(proof)),
-                                                    fence="sess:inc1")
-        self.assertIn(record["outcome"],
-                      (capture_mod.FINALITY_PROVEN, capture_mod.FINALITY_UNPROVEN),
-                      record)
+        _wait_until(fence.exists, timeout=15, what="the watcher's fence")
+        record = capture_mod.read_capture_fence(os.fsencode(str(fence)), fence="sess:inc1")
+        self.assertEqual(record["outcome"], capture_mod.EVIDENCE_FINAL, record)
+        self.assertEqual(record["record"]["owner"]["owner_role"], capture_mod.OWNER_EXIT_WATCHER)
+        bound = capture_mod.fence_matches(record["record"], capture=capture,
+                                          sentinel_code=0, sentinel_present=True)
+        self.assertTrue(bound["matches"], bound)
+        data = Path(info["capture"]).read_bytes()
+        n = int(record["record"]["boundary"]["offset_n"])
+        self.assertIn(b'"is_error":false', data[:n])
+        _wait_until(lambda: not pid_alive(int(info["leader"])), timeout=15,
+                    what="the watcher's exit")
+        release = capture_mod.read_release_record(
+            capture_mod.release_record_path(capture, "inc1"), fence="sess:inc1")
+        self.assertEqual(release["outcome"], capture_mod.EVIDENCE_FINAL, release)
+
 
 
 # =====================================================================================

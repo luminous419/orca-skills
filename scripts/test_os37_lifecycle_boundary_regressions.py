@@ -70,7 +70,7 @@ def sh_profile(room: str, *script_args: str, timeouts: dict | None = None):
         "readiness_records": [{"channel": "structured", "record_type": "system",
                                "session_field": "session_id"}],
         "delivery_proofs": [{"channel": "structured", "record_type": "assistant"}],
-        "completion_records": [{"channel": "structured", "record_type": "result",
+        "completion_records": [{"channel": "structured", "record_type": "result", "binding_mode": "single_record_optin",
                                 "error_field": "is_error"}],
         "delivery_mode": "post_ready_delivery", "identity_binding": "minted_echo",
         "identity_flag": "--session-id", "extra_args": list(script_args),
@@ -941,7 +941,7 @@ class F09ResultBodyProvenanceTests(_Composed):
             "readiness_records": [{"channel": "structured", "record_type": "thread.started",
                                    "session_field": "thread_id"}],
             "delivery_proofs": [{"channel": "structured", "record_type": "item.completed"}],
-            "completion_records": [{"channel": "structured", "record_type": "turn.completed"}],
+            "completion_records": [{"channel": "structured", "record_type": "turn.completed", "binding_mode": "single_record_optin"}],
             "result_body_records": [{"channel": "structured", "record_type": "item.completed",
                                      "body_field": "item.text"}],
             "output_last_message_path": str(room / "shared-last-message.md")})
@@ -1319,7 +1319,9 @@ class CI2ExitEvidenceInFlightTests(_Composed):
         source = inspect.getsource(pty_supervisor._watch)
         self.assertIn("signal.set_wakeup_fd(wake_w", source)
         self.assertIn("signal.signal(signal.SIGCHLD", source)
-        self.assertIn("select.select([guard_r, wake_r]", source)
+        # OS-48: the pre-exit select set is built once (`fds = [guard_r, wake_r] + control`)
+        self.assertIn("fds = [guard_r, wake_r]", source)
+        self.assertIn("select.select(fds", source)
 
     def test_the_real_spawn_leaves_no_unsentinelled_zombie_window_under_load(self) -> None:
         """The scenario that flaked, driven 15 times through the REAL spawn: the agent

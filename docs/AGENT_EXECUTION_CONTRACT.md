@@ -197,6 +197,20 @@ A conforming adapter carries four identities, and they are not interchangeable.
 | **Process incarnation** | Minted at spawn, matched on `${session}:${incarnation}`. A candidate session whose incarnation id is missing or untrimmed yields **`unverifiable`, not `exited`**. | `src/main/runtime/orchestration/worker-terminal-process-liveness.ts:39-62, 57-61` |
 | **Host scope** | A closed tagged union `local \| wsl{distro} \| ssh{targetId}`; **anything unparsable is `None`**, never a default. Liveness questions are never asked cross-host by accident. | `src/main/runtime/orchestration/worker-terminal-process-liveness.ts:3-37, 36` |
 
+**OS-48 amendments (standalone adapter, run_f820764749d6).** (1) The **process incarnation** row is
+strengthened: a pid is bound by its *kernel start identity* (`proc_start_ticks`) **and** the host
+`boot_id`, both REQUIRED on the record and on every observation (`standalone_identity.verify`:
+missing → `unverifiable: identity_unreadable`; mismatch → `not_owned: identity_changed`); the agent
+is signalled only through its parent watcher (`signal_target_reaped` after the reap,
+`signal_unbound` without a watcher) and user-space `killpg` is never an authority
+(`group_signal_refused`).  (2) **COMPLETED / FAILED for a standalone dispatch** additionally
+require *positive capture finality*: a verified fence `os48.capture_fence.v1` at the in-band
+marker boundary N, and a settlement record chosen over `[baseline, N)` by refusal dominance,
+exactly-one and the dispatch binding (`binding_mode`); a hangup, a sentinel alone, a negative
+process-table scan or a legacy `os37.capture_finalized.v1` record never enter either state
+(`boundary_unproven` / `provenance_unbound` / `legacy_finalized_record` are LOST).  See
+`docs/conformance/OS37_CONFORMANCE.md` § OS-48.
+
 **Authority is identity, not knowledge.** A settlement or heartbeat is authorized by the *identity*
 of its sender, not by its ability to quote the right ids: "payload knowledge alone is not authority"
 (`src/main/runtime/orchestration/lifecycle-reconciliation.ts:16-28, 25-27`). A standalone adapter,
