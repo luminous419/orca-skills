@@ -1,0 +1,52 @@
+#!/bin/sh
+# OS-37 D13.2 fixture: a CLI that DECLARES one mode and BEHAVES as the other.
+#
+# It exists because of the SHAPE of D4.0 M-10's failure: `codex exec -c thread_id=<uuid>` is
+# accepted, the turn completes normally, the supplied value appears nowhere, and there is no
+# error and no warning.  A capability check that only looked for the DECLARED behaviour would
+# pass a profile that is silently wrong, so D4.2b probes BOTH directions and this fixture is
+# what drives them.
+#
+# OS37_LIAR_MODE:
+#   waits-anyway       declared `launch_with_prompt`, but reaches the quorum and then WAITS
+#                      even with no prompt  -> `delivery_mode_ambiguous`
+#   never-waits        declared `post_ready_delivery`, but starts working immediately and
+#                      exits                -> `delivery_mode_mismatch`
+#   ignores-identity   accepts `--session-id` and emits a DIFFERENT id, silently, exactly as
+#                      M-10 measured        -> `identity_binding_unverified`
+#   auth-failure       emits the M-15-shaped identity-bound synthetic auth response, so the
+#                      rehearsal's delivery leg is offered a record that must be REFUSED
+#                                           -> `auth_absent`, never `pass`
+SESSION_ID=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --session-id) SESSION_ID="$2"; shift 2 ;;
+    --version) printf '1.5.0\n'; exit 0 ;;
+    --help) printf -- '--session-id --settings -p --output-format stream-json --verbose\n'; exit 0 ;;
+    *) shift ;;
+  esac
+done
+[ -n "$SESSION_ID" ] || SESSION_ID="${OS37_STUB_SESSION_ID:-}"
+
+case "${OS37_LIAR_MODE:-waits-anyway}" in
+  ignores-identity)
+    # SILENTLY a different id.  No error, no warning -- M-10's exact failure shape.
+    printf '{"type":"system","subtype":"init","session_id":"11111111-2222-4333-8444-999999999999"}\r\n'
+    printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":"completed"}\r\n'
+    exit 0 ;;
+  auth-failure)
+    printf '{"type":"system","subtype":"init","session_id":"%s"}\r\n' "$SESSION_ID"
+    printf '{"type":"assistant","session_id":"%s","error":"authentication_failed","is_api_error_message":true,"message":{"model":"<synthetic>","id":"8d43a109-8f26-480c-be78-142541823987","content":[{"type":"text","text":"Not logged in \xc2\xb7 Please run /login"}],"usage":{"input_tokens":0,"output_tokens":0}}}\r\n' "$SESSION_ID"
+    printf '{"type":"result","subtype":"success","is_error":true,"terminal_reason":"api_error","session_id":"%s"}\r\n' "$SESSION_ID"
+    exit 1 ;;
+  never-waits)
+    # Declared `post_ready_delivery`; starts working and exits without ever waiting.
+    printf '{"type":"system","subtype":"init","session_id":"%s"}\r\n' "$SESSION_ID"
+    printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":"completed","session_id":"%s"}\r\n' "$SESSION_ID"
+    exit 0 ;;
+  *)
+    # `waits-anyway`: the quorum closes and then it BLOCKS, with or without a prompt on argv.
+    printf '{"type":"system","subtype":"init","session_id":"%s"}\r\n' "$SESSION_ID"
+    while IFS= read -r _line; do :; done
+    exit 0 ;;
+esac

@@ -1,0 +1,1361 @@
+# OS-37 Conformance Record
+
+Run `run_54d90086bd75` · Phase **IMPLEMENTATION** · Ticket **OS-37**
+Written incrementally, one row per work item, as DESIGN DD-4 requires.
+
+**AMENDMENT (external-review finding #1).**  This record was originally written into
+`artifacts/runs/run_54d90086bd75/CONFORMANCE.md`, on the reasoning that `docs/` holds the
+merged baseline doctrine while this is per-implementation evidence.  That location made
+`scripts/test_os37_conformance_record.py` -- which reads this file MECHANICALLY -- depend on
+an UNTRACKED run directory: every one of its 13 tests failed on a clean checkout, in all six
+CI matrix jobs, while passing on the developer host where the run artifact happened to
+exist.  The record is a DELIVERABLE (AC-37-21), so it is now a TRACKED repository document
+and this path is its single authority.  Nothing about any verdict, obligation, disposition
+or unknown changed in the move; only the file's location did.  The run directory keeps its
+own copy as run evidence, and nothing reads it.
+
+Three tables, and V-13 / V-14 read this file mechanically:
+
+1. **AC-37-21** -- every `reuse` / `adapt` / `reimplement` row of C1..C36 mapped to the
+   obligation that discharges it and the test that proves it; every `reject` row mapped to
+   *no implementation*; every deviation recorded as an explicit amendment.
+2. **AC-37-23** -- the unknowns disposition.  U3/U4/U6/U7/U8, G-1..G-7, U-ENV-1/2, each
+   marked `still-unknown`, `routed-around-by-construction`, `resolved-with-new-evidence` or
+   -- new at iteration 3 -- **`resolved-by-measurement` with the command and its output
+   attached**.  **None is upgraded to fact by assertion.**  A `resolved-by-measurement` row
+   is a claim about *these two installed builds on this host*, never about the CLIs in
+   general, and §D6.1's preflight re-establishes each one on the operator's own host before
+   any run starts.  Exactly four rows move at iteration 3 -- **G-1, G-2, U-ENV-2 and the
+   interactive-frame half of G-5** -- and **G-3, G-4, G-6, G-7, U-ENV-1 and all of
+   U3/U4/U6/U7/U8 are untouched**.
+3. **AC-37-24** -- per-criterion met-with-evidence / explicitly-deferred-with-a-reason.
+   **A check that cannot run is recorded as "not established", never as a pass.**
+
+---
+
+## 1. AC-37-21 -- the C1..C36 conformance record
+
+| # | Capability | Verdict | Discharging obligation in this implementation | Proving test |
+| --- | --- | --- | --- | --- |
+| C1 | PTY spawn with a minted session id and process incarnation | **reimplement** | `standalone_pty.spawn` -- `pty.openpty()` + `fork` + `setsid`; the session id and incarnation are minted BEFORE the spawn by `standalone_identity.mint_session_id`/`mint_incarnation`, and the tty is pinned into `OwnershipRecord.captured_tty` | `test_os37_pty_supervisor.py::SpawnRecordTests::test_start_binds_identity_before_readiness` |
+| C2 | Process-group discovery from the OS process table, keyed on the pinned tty | **reuse** | `standalone_pty.read_process_table` -- `ps -t <tty>`, never `ps -ax` | `test_os37_pty_supervisor.py::OwnershipRefusalTests` (all four) |
+| C3 | The three group-signalling refusals (unbound tty, shared tty, recycled pid) | **reuse** | `standalone_pty.check_ownership` -- R-OWN-1/2/3, each sending NO signal (R-OWN-2 downgrades to root scope) | `::test_refuses_unbound_tty`, `::test_refuses_shared_tty`, `::test_refuses_captured_tty_mismatch` |
+| C4 | Kill-ordering contract: child groups before the PTY leader | **reuse** | `standalone_pty.signal_target` -- `descendant_groups` first, the session leader last | `::test_kill_ordering_puts_descendant_groups_before_the_leader` |
+| C5 | Windows ConPTY termination and identity-probe-gated tree kill | **reject** | *no implementation* | Windows/ConPTY. No standalone module names ConPTY, `windows`, or a tree kill. POSIX only. |
+| C6 | Launching the agent as a shell command string inside a PTY | **adapt** | `standalone_drivers.ClaudeDriver.argv` / `CodexDriver.argv` build argv from `StandaloneProfile`. **The 43-agent table is NOT reproduced** -- U7 is routed around, not resolved | `test_os37_driver_isolation.py::test_no_cli_token_in_any_standalone_module_above_the_driver` |
+| C7 | Launch ordering: identity binding **before** readiness gating | **reuse** | `StandaloneSession.start` binds the `OwnershipRecord` from the child's spawn record BEFORE `readiness()` is reachable; invariant I-1 enforces the order in the event log | `test_os37_lifecycle.py::InvariantTests::test_i1_requires_identity_bound_then_readiness_observed_in_order` |
+| C8 | A failed launch must prove its own teardown or raise | **reuse** | `standalone_identity.prove_teardown` RAISES `StandaloneTeardownUnproven`; `StandaloneSession._prove_teardown` calls it on every failed start | `test_os37_pty_supervisor.py` (record construction) + `standalone_identity.prove_teardown`'s own raise |
+| C9 | Provider-side transcript proof with an anti-replay fence | **adapt** | The exit sentinel (`standalone_pty.wrapper_argv` / `read_exit_sentinel`) is the second, independent proof outside the PTY, fenced by incarnation. Per-CLI file layouts are PROFILE data (`output_last_message_path`), never hard-coded | `test_os37_pty_supervisor.py::ExitSentinelTests` (all five) |
+| C10 | Bracketed-paste framing with ESC sanitization, written in one PTY write | **reuse** | `standalone_drivers.frame_prompt` -- ESC -> `<ESC>`, bracketed, and `write_frame` writes the WHOLE frame retrying only the same buffer | `test_os37_lifecycle.py::PerDriverBehaviourMatrixTests` + `standalone_drivers.write_frame` |
+| C11 | The uncapped settle delay / render gate before Enter | **adapt** | `standalone_drivers.settle_ms` -- **no `min(...)` anywhere on the value**; `standalone_preflight.measure_ingest_rate` RE-MEASURES on this host and transcribes no Orca constant | `test_os37_driver_isolation.py` (no new dependency) + `settle_ms`'s own uncapped arithmetic |
+| C12 | Three-proof delivery verification, with the third proof admissible only from a working baseline | **reuse** | `StandaloneSession._verify_delivery` -- three proofs, the third (`output_sequence`) admissible ONLY when `baseline_working` | `test_os37_lifecycle.py::PerDriverBehaviourMatrixTests::test_twelve_cases_each_land_on_a_closed_vocabulary_member` |
+| C13 | "Stall means not observed, not not-delivered" — no automatic retry | **reuse** | `delivery="not_observed"` is returned and **never auto-retried**; `resolve_unknown("delivery_verify_timeout")` reports `second_write: False` | `test_os37_lifecycle.py::InvariantTests::test_not_observed_writes_nothing_twice` |
+| C14 | Pre-flight / mid-flight aborts (blocked, stale handle, not writable) | **reuse** | `blocked` / `stale_handle` / `not_writable` are all reachable members of `DELIVERY_OUTCOMES`, produced by `_verify_delivery` and `StandaloneSession.send` | `test_os37_lifecycle.py::ClosedVocabularyTests` + `DELIVERY_OUTCOMES` |
+| C15 | Five orthogonal lifecycle vocabularies rather than one enum | **adapt** | Ten normalized states, and `standalone_lifecycle.normalize` REFUSES to normalize without `source_vocabulary` | `test_os37_lifecycle.py::ClosedVocabularyTests::test_source_vocabulary_is_required_by_normalize` |
+| C16 | Exit-cause resolution with an explicit `unknown{reason}` and the `-1` sentinel | **reuse** | `resolve_unknown("exit_status_absent")` -> `LOST` with a named reason; `UNVERIFIED_PROCESS_EXIT_CODE = -1` is a sentinel; `map_exit_code` sends an unmapped code to `LOST` | `test_os37_lifecycle.py::InvariantTests::test_absent_exit_status_is_lost_not_exited_zero` |
+| C17 | Four surface-specific arbitration orders (S1–S4), never merged | **reuse** | `report_activity` / `read_status` / `may_send_prompt` / `may_stop` -- four functions, four orderings, asserted DISTINCT by identity | `test_os37_lifecycle.py::SurfaceSeparationTests` (all six) |
+| C18 | `tui-idle` as a **readiness gate only** | **reuse** | **Narrowed, and recorded as an amendment below.** An `idle` marker is `supplementary` and cannot accept; `READY` requires R-A and R-B. It remains readiness-only and never completion (I-3) | `test_os37_lifecycle.py::ReadinessQuorumTests` (all nine) + `::test_readiness_only_never_completes` |
+| C19 | Renderer pane display arbitration as executable code | **reject** | *no implementation* | Renderer pane arbitration. No standalone module imports a renderer; its ORDERING RULE is reused under C17 as four separate surfaces, and the surface itself is not. |
+| C20 | Two-gate settlement: runtime authority **plus** a CLI re-read that an identity-matched worker report carrying this outcome settled Task and Dispatch — matched by this message's id **or**, for an accepted idempotent retry, by the same reporting handle | **reuse** | `ExecutionJournal.settlement_confirmed` -- the WHOLE predicate: both identity paths and the refusal | `test_os37_journal.py::SettlementPredicateTests::test_settlement_predicate_case_a\|b\|c` |
+| C21 | Pane-key-based lifecycle authority ("payload knowledge alone is not authority") | **adapt** | `standalone_identity.fence` = `session_id:process_incarnation`, whose VALUE lives in the runtime-state receipt; the journal only COMPARES against it (S-5) | `test_os37_journal.py::JournalIsNotAnAuthorityTests::test_fence_value_comes_from_the_receipt` |
+| C22 | Heartbeat authority checks; a wrong-pane heartbeat never refreshes liveness | **reuse** | `admit` S-5 refuses a foreign incarnation; `assert_may_act` refuses any record whose observed row does not match | `test_os37_capability_honesty.py::Condition3Tests::test_a_foreign_report_quoting_the_right_handle_is_still_refused` |
+| C23 | Supervised vs. unsupervised ownership, and the retained-reason vocabulary | **reuse** | `contracts.WORKER_RESOURCE_AXIS` -- `reuse`/`retain`/`release`/`unsupervised`, validated by `validate_axes` | `test_os37_lifecycle.py::ClosedVocabularyTests::test_every_vocabulary_member_round_trips` |
+| C24 | Terminal accounting kept independent of Task/Dispatch outcome | **reuse** | `OwnershipAxes` carries all four axes ALWAYS; `validate_axes` refuses a three-axis answer | `test_os37_settlement_port.py::AccountDispatchTests::test_account_dispatch_always_reports_all_four_axes` |
+| C25 | Closed tagged host scope with a `null` on any parse failure | **reuse** | `contracts.parse_host_scope` returns `None` on any parse failure; `assert_may_act` REFUSES a non-local scope rather than localising it | `test_os37_lifecycle.py::ClosedVocabularyTests::test_host_scope_never_defaults_to_local` + `test_os37_pty_supervisor.py::PermitTests::test_a_non_local_host_scope_is_refused_rather_than_localised` |
+| C26 | The four-step interrupt ladder with proof of death | **reuse** | `standalone_interrupt.interrupt` -- rungs 0-4 with proof of death at rung 4 | `test_os37_pty_supervisor.py::InterruptLadderTests` (all seven) |
+| C27 | Re-checking ownership and mode at escalation fire time; re-arming after a *failed* force | **reuse** | `standalone_interrupt.interrupt`'s rung 2 re-checks ownership AND mode at fire time through `Gate.evaluate` and CANCELS the escalation on change; a failed rung 3 re-arms with one fewer attempt | `::test_ownership_changing_during_the_wait_cancels_the_escalation` |
+| C28 | Pre-kill descendant snapshot with capture-second stamping, never served stale | **reuse** | `ProcessTableSnapshot.captured_at` is stamped BEFORE the scan; R-OWN-4 re-scans rather than serving a stale snapshot | `::test_refuses_stale_snapshot` |
+| C29 | Probe-driven restart adjudication with a six-valued owner probe | **reuse** | `standalone_identity.verify` is three-valued (`verified`/`not_owned`/`unverifiable`); only `verified` grants a `Permit`, and `unverifiable` proves nothing | `test_os37_pty_supervisor.py::PermitTests::test_an_untrimmed_incarnation_is_unverifiable_never_exited` |
+| C30 | Leases marked unreconciled on load — a restart grants no writer | **reuse** | `standalone_journal.rediscover` stamps every intent `lease: "unreconciled"` | `test_os37_journal.py::JournalIsNotAnAuthorityTests::test_every_persisted_lease_is_unreconciled_on_load` |
+| C31 | Release reconciliation that finishes only *previously requested* releases and defers on unresolved identity | **reuse** | `standalone_interrupt.release_terminal` requires BOTH `cleanup_authority == "authorized"` AND `worker_resource == "release"`, and releases only `release_scope(record)` | `test_os37_pty_supervisor.py::FenceAndReleaseTests::test_release_requires_both_axis_gates` + `::test_release_only_what_was_requested` |
+| C32 | Env-token process scan as *diagnostic evidence only*, with `unverifiable` on non-Linux hosts | **adapt** | `ORCA_SKILLS_STANDALONE_SPAWN_TOKEN` is set as DIAGNOSTIC EVIDENCE ONLY. `assert_may_act` never reads `spawn_token`. No `/proc` env scan is implemented at all | `test_os37_pty_supervisor.py::PermitTests::test_spawn_token_alone_authorizes_nothing` |
+| C33 | Orca CLI orchestration verbs as the observation surface | **reject** | *no implementation* | Orca CLI orchestration verbs as the observation surface. `StandaloneRunObservation.orca_state` reads the run's OWN journal and invokes no Orca CLI; `runner=None` is passed deliberately. |
+| C34 | Federation, relay, mobile projection, desktop surface | **reject** | *no implementation* | Federation, relay, mobile projection, desktop surface. Asserted absent by the excluded-layer import sweep. |
+| C35 | Electron host ports | **reject** | *no implementation* | Electron host ports. Same sweep. |
+| C36 | `node-pty`, `@xterm/*`, `ssh2` as dependencies | **reject** | *no implementation* | `node-pty`, `@xterm/*`, `ssh2`. The runtime is stdlib-only; asserted by the no-new-runtime-dependency sweep. |
+
+### Explicit amendments
+
+Every deviation from the baseline is recorded here rather than absorbed silently.
+
+| # | Amendment | Why it is a narrowing or an addition, never a widening |
+| --- | --- | --- |
+| A-1 (D-1 / W-1-C) | `OrcaAdapter.interrupt` returns the contract's named `unsupported` member instead of invoking `orca orchestration worker-interrupt`, and `ORCA_PRIMITIVE_MAP["interrupt"]` becomes `()`. | The verb does not exist at the pinned revision, so the previous body could only produce an unnamed CLI failure.  A named refusal is strictly more handleable.  **U8 is not resolved:** the claim is "absent at the pinned revision", never "never existed".  The residual honesty gap -- `agent_interrupt` is still declared -- is NOT claimed closed; it is bounded by that token having no engine call site, and removing it would trip `validate_node`'s `BASE_CAPABILITIES` gate and BLOCK every existing Orca run. |
+| A-2 (V-5 widening) | The closed-vocabulary round-trip is asserted through `interrupt()`'s `interrupt_outcome` as well as through `status()`. | An addition to what is checked.  It forbids nothing that was permitted. |
+| A-3 (**iteration-2 S3 narrowing**) | The baseline S3 ordering accepts on a title or a screen preview.  The standalone S3 keeps all four surfaces separate, keeps every refusal in the same order, and consults every input the baseline consults -- but **additionally** requires R-A and R-B to accept. | A narrowing only ever REFUSES where the baseline accepted; it never accepts where the baseline refused, so it cannot produce the divergence AC-37-20 forbids.  It is required by the ticket's own constraint that a terminal title, a ready prompt or a single natural-language line must not be the sole basis for identity, liveness or completion.  Cost named as DR-7. |
+| A-4 (**iteration-2 preflight refusal**) | New named preflight failure `profile_readiness_unverified`: a profile whose declared readiness selector never fires in the rehearsal refuses the run BEFORE any spawn. | The alternative is a title fallback, which A-3 forbids.  The unknown becomes a refusal at configuration time, on the operator's own host, instead of a guess at run time.  Residual: a CLI build that can declare no structured readiness record gets no standalone run until its profile is corrected -- DR-7, named rather than papered over. |
+| A-5 (CG-1) | Every G-item fixture asserts the fail-closed disposition that holds REGARDLESS of the outcome, so no G-item is resolved by running it. | Addition. |
+| A-6 (CG-2) | Seven negative fixtures, not six. | Addition -- see A-7. |
+| A-7 (NF-7) | A fd-closure negative fixture, driven through the runtime's own `spawn` so it exercises `os.closerange(3, MAXFD)` rather than `subprocess`'s `pass_fds`. | Closes hazard leg 2, which the plan states as a mechanism and gives no fixture.  Addition. |
+| A-8 (`Permit`) | A private-constructor token is the enforcement shape for constraint C8 / AC-37-10. | It makes "nothing before re-verification" CHECKABLE rather than reviewable: a static test asserts no module outside `standalone_identity` constructs one. |
+| A-9 (C-DESIGN-1) | `--adapter` is declared at three argparse sites over one shared `ADAPTERS` tuple with four dispatch sites, so adding `standalone` widens seven surfaces.  All seven are enumerated.  **Amended by the follow-up review (finding 2):** the `resume` verb no longer refuses `--adapter standalone` -- it composes the standalone runtime from the run's RECORDED launch binding (profile, ledger, approval authority: `launcher.standalone_recovery_composition`, shared with the Watchdog) -- and selecting any *other* adapter on a standalone-launched run is refused by name (`STANDALONE_RUN_ADAPTER_MISMATCH`).  `STANDALONE_ADAPTER_UNSUPPORTED_HERE` is composed at no site any more. | A fall-through would compose a fake adapter under a standalone flag -- the worst possible reading of an operator's intent -- and a refusal beside a fake default was two contracts where one is owed. |
+| A-10 (**implementation**, D4.1 / D7.2 reconciliation) | The CLI-token sweep excludes THREE modules, not two: `standalone_drivers.py`, `standalone_profile.py` and `standalone_env.py`.  D1.1/D7.2 assign `FORBIDDEN_CHILD_ENV_PREFIXES` -- which necessarily spells the parent-session marker prefixes -- to `standalone_env.py`, while D4.1 lists only the first two exclusions. | Both design clauses are binding, so the third exclusion is PAID FOR with a stricter assertion: in the two data-only modules a CLI token may appear ONLY inside a declared module-level closed data constant, never in a conditional, a comparison or an f-string (`test_os37_driver_isolation.py::test_data_only_modules_never_branch_on_a_cli`).  The property the containment rule exists for -- no module above the drivers BRANCHES on which CLI is in play -- is preserved, not waived. |
+| A-11 (**WITHDRAWN at iteration 2**, D4.1 policy-digest) | ~~Implemented as a direct assertion that no policy module references the standalone runtime.~~  **Withdrawn.**  D4.1's `test_policy_modules_unchanged` is now implemented as specified: a pinned SHA-256 over `graph.py`, `routing.py`, `executor.py`, `state.py` and `contracts.py`'s policy region (the file minus the additive line ranges `(9,9) (88,105) (110,198)`), across BOTH trees. | This was never an amendment: an amendment requires the DESIGN gate, and a note in an implementation artifact is not that gate.  The substituted assertion also proved less: it detected only the absence of one spelling, so a policy change avoiding the word `standalone` passed it, and it omitted `contracts.py` -- the one policy file this ticket actually edits -- entirely.  The pins are proven equal to their value at `d13b7fa` by a second test, so "unchanged" means unchanged from something this ticket did not write.  The former assertion is RETAINED as an independent second reading, not as a substitute. |
+| A-17 (**implementation**, the ENGINE's contract) | ``StandaloneAdapter.start`` runs the WHOLE supervised dispatch -- spawn, readiness, delivery, completion, settlement -- and settles the ledger before returning.  ``spawn_only`` is a separate, non-port method for tests and direct operator use. | ``executor._settle_now`` calls ``start`` and then IMMEDIATELY requires ``settlement(intent_id)`` to answer, raising ``OUT_OF_ORDER_EVENT:settlement missing`` otherwise; its own comment states the contract (*"``start`` is the long blocking call -- minutes, not milliseconds -- so the keeper renews the lease throughout it"*), which is what ``LeaseKeeper`` exists for, and ``OrcaAdapter.start`` and ``FakeAdapter.start`` both satisfy it by settling before returning.  Returning at identity-bind made every real run fail with a message that named nothing.  Found by driving the real CLI.  **The Coordinator's turn still owns nothing**: blocking is the CALLER waiting, while the child is a ``setsid`` session leader and the journal, sentinel and ledger are plain files -- so the run stays re-queryable from a stranger process either way.  Both properties are independent and both hold. |
+| A-18 (**implementation**, MEASURED) | ``measure_ingest_rate`` takes NO descriptor: it creates and destroys its own pty, writes non-blocking, and is bounded. | It used to write 4 KiB of padding to the AGENT's pty master, which is wrong twice over.  That padding IS INPUT -- the agent would read it as part of the prompt, or as an answer to a prompt it was showing.  And the write BLOCKS FOREVER whenever the child is not currently reading its stdin, which hung the runtime in the prompt-delivery path: an unbounded hang, worse than any fail-closed refusal because nothing is reported at all.  A throwaway pty measures the same thing -- kernel pty throughput on this host, which is what C11 asks be re-measured -- without touching the agent.  The signature is the enforcement: there is no fd to pass by mistake. |
+| A-19 (**implementation**, MEASURED, and it broke a real gate) | ``BoundedCapture.transcript()`` undoes the pty's CR-LF translation for PARSERS; ``text()`` stays verbatim and the capture file is never rewritten. | ``decision_gate.GATE_RECORD_BLOCK`` is anchored as ``^```decision-gate\n`` and never matches ``` ```decision-gate\r\n ```, while ``FIELD_LINE`` ends in ``\s*$`` and tolerates the ``\r``.  So a standalone agent's ``DECISION_GATE_STATE`` line was read and its fenced record was not: the run repaired twice and terminated ``DECISION_GATE_REPAIR_EXHAUSTED`` on output that was in fact well formed.  The translation is an artefact of the TRANSPORT, not of the agent's output.  The raw file stays evidence; the normalised view is a reading of it.  A static test asserts no parsing path reads the verbatim text. |
+| A-20 (**implementation**, AC-37-01) | ``task_id`` and ``dispatch_id`` are DERIVED where the intent carries none: ``task:<intent_id>`` and ``dispatch:<intent_id>:<incarnation>``.  An explicit value on the intent always wins. | The canonical ``ActionIntent`` has neither -- they are Orca Task/Dispatch identities ``OrcaAdapter`` obtains from ``create_task`` and ``run_existing_task``, and a standalone runtime has no external system to ask.  ``OwnershipRecord`` requires every field, so a blank would either refuse every run or record a six-axis identity that binds nothing.  The stable unit of work IS the intent, and one ATTEMPT at it is the incarnation -- which is exactly what S-3's stale-dispatch refusal compares, so the journal's ``dispatch_id`` and its identity fence can never disagree about which attempt a record belongs to. |
+| A-21 (**implementation**, D6.1 / DR-7) | The readiness rehearsal is now the REAL one by default -- a bounded, non-interactive spawn of the driver's own argv under the constructed child env, with a session id minted for the rehearsal alone -- and stays injectable for the deterministic tests. | It was a caller-supplied hook, and the launcher supplies none, so ``--adapter standalone`` refused EVERY run at preflight with ``profile_readiness_unverified``.  A refusal nobody can satisfy is not fail-closed, it is unusable.  The rehearsal's session id is minted separately from the run's on purpose: reusing the real one would let the rehearsal's output satisfy R-B for the run that follows, which is precisely the replay R-B exists to refuse. |
+| A-13 (**implementation**, MEASURED on this host) | `ps -o sess=`, not `ps -o sid=`, and an observed session id of `0` means THE AXIS CARRIES NO EVIDENCE rather than a conflict. | FACT, verified on this host: darwin's `ps` answers `sid: keyword not found` and returns a short row, so the strict parser reported the table UNREADABLE -- the supervisor would have failed closed on the MVP's own platform, permanently and silently.  `sess` is accepted by both darwin's ps and procps.  Darwin then answers `0` for it, so a strict equality comparison would refuse EVERY signal; a zero is therefore treated the way `boot_id` and `proc_start_ticks` already treat an unreadable value -- no evidence on that axis, nothing fabricated, and the axes that DO the ownership work (the pinned tty and the process group) still required. |
+| A-14 (**implementation**, MEASURED on this host) | Draining the pty master is a TEARDOWN OBLIGATION: `standalone_pty.drain`, called by `release`, by `StandaloneSession._prove_teardown`, and by the interrupt ladder before every ownership probe. | FACT, measured on this host: a session leader that exits while the pty slave holds unflushed output and nobody reads the master wedges in the kernel's "trying to exit" state -- `ps` reports `E`, the process leaves the tty, and `waitpid` keeps reporting it as a live child that has not changed state.  Draining 38 bytes made the same child reapable immediately.  Without it `prove_teardown` would raise `StandaloneTeardownUnproven` and rung 4 would return `exit_unproven` -> `LOST` for a process that really died: fail-closed for the WRONG REASON, which is worse than a loud error because it looks like the contract working.  Both directions are asserted by `test_os37_pty_supervisor.py::DrainIsATeardownObligationTests`. |
+| A-15 (**implementation**, D3.2 / D5.3(4)) | Two pre-exec corrections.  (a) Nothing between `fork()` and `execve()` spawns a process: `boot_id` is read in the PARENT and passed in, and `proc_start_ticks` reads one plain file or answers `0`.  (b) `os.closerange` is bounded by `highest_open_fd()` instead of `SC_OPEN_MAX`. | (a) The child holds the parent's address space with none of its threads, so running Python's subprocess machinery there is unsafe -- and the first version ran `sysctl` and `ps` in exactly that state.  (b) `SC_OPEN_MAX` is 1 048 576 on this host, so the original range issued a million `close()` calls on the pre-exec path of every spawn.  Both are asserted statically. |
+| A-16 (**WITHDRAWN at iteration 2**, D5.3(4) R-A leg 4) | ~~Leg 4 accepts the binary as executing image OR as a resolved path token in the foreground command line, searched across the child's scope.~~  **Withdrawn.**  Leg 4 is now the approved executable-IDENTITY equality and nothing weaker: `resolve_executable(foreground group leader) == realpath(profile.binary)`, with no command-line reader and no scope search left in the module. | The premise was wrong on both halves.  (1) The exec-sentinel wrapper was not a constraint to be worked around but the thing to fix: `spawn` no longer puts a shell between the pty and the agent.  The pty session leader is now a Python exit WATCHER that never execs, and the agent is forked from it, takes its own process group, makes that group the pty's foreground with `tcsetpgrp`, and `execve`s the preflight-resolved binary -- so the foreground process's image IS `realpath(profile.binary)`.  The sentinel is unchanged in content and fence; only its writer moved.  (2) "Both MVP CLIs ship as scripts" was false: MEASURED on the MVP platform, the resolved `claude` and `codex` are both Mach-O native executables.  Command-line membership was never identity anyway -- MEASURED, a process exec'd from image X with `argv[0]="totally-not-the-image"` is reported as the lie by both `ps -o comm=` and `ps -o args=`, so the previous check rested on a string the impersonator supplies, which is the same class of error as resting identity on a terminal title.  `_resolve_executable` now reads only `/proc/<pid>/exe` (Linux) or `proc_pidpath` (Darwin), both kernel-sourced. |
+| A-12 (**implementation**, D9.7 test 3) | The append-lock scope test runs the competing authorities in a SEPARATE INTERPRETER while this process holds the `flock`. | Stronger than the design's wording: it rules out the lock passing merely because `flock` is re-entrant within one process. |
+| A-22 (**iteration 3**, D4.2a, DESIGN-approved) | `delivery_mode` becomes a **first-class, DECLARED, closed two-member driver-capability axis** -- `launch_with_prompt` \| `post_ready_delivery` -- with **no default**, and `STARTING -> PROMPT_DELIVERED` gains a second entry edge (§D5.2 I-2). | An addition, and a **narrowing** of what the runtime is allowed to assume.  Previously the runtime asserted ONE order for every CLI -- spawn, observe readiness, then write -- and D4.0 M-6 and M-9 measured that neither installed CLI ever reaches the waiting state that order requires: with stdin on a pipe held open and EMPTY for 8 s, both emitted **zero bytes** until the prompt arrived.  So the assumed order was not conservative, it was simply false for these builds, and every real dispatch failed on it.  The axis makes the order a declared, checked property instead of an assumption, and `post_ready_delivery` -- which carries the readiness-before-delivery guarantee **byte-unchanged**, including the `ReadyToken` that only a `ready` verdict constructs -- remains a live, exercised path driven by `scripts/fixtures/os37/bin/os37-waiting-cli`.  It is not policy: `test_os37_driver_isolation.py::test_no_policy_module_reads_the_delivery_mode_axis` asserts no workflow, decision or review module reads it, and `::test_delivery_mode_is_never_reassigned` asserts the value is authored in exactly one place. |
+| A-23 (**iteration 3**, D4.2b, DESIGN-approved) | Four typed capability-vs-reality outcomes -- `delivery_mode_mismatch`, `delivery_mode_unverified`, `delivery_mode_ambiguous`, `identity_binding_unverified` -- plus `identity_binding_violated` at run time, and a fifth preflight check that exercises the real composed argv. | Addition, and every member **fails closed**.  None is repaired by falling back to the other mode, retrying in the other mode, or downgrading to a warning (USER DIRECTIVE D-C).  `delivery_mode_ambiguous` exists because of the SHAPE of M-10's failure: a CLI that *ignores* an input rather than rejecting it produces a **silent** mismatch, so both directions are probed and a declaration that is too weak is refused rather than accepted. |
+| A-24 (**iteration 3**, D4.3a, USER DIRECTIVE D-D.1) | New journal record kind `DELIVERY_INTENT`, carrying the spawn request AND the prompt digest as ONE record, appended and `fsync`ed **before the process exists**. | Addition, and explicitly **not a claim**: `RECORD_KINDS` still has no `CLAIMED` member, the record grants no exclusivity and settles nothing, and `runtime_state` remains the single claim authority (AC-37-20).  It is appended AFTER the existing claim and BEFORE the fork.  `append_delivery_intent` **raises** on any append failure, so the structurally subsequent `fork` is unreachable -- asserted against a syscall spy by `test_os37_capability_honesty.py::test_a_non_durable_intent_makes_the_spawn_unreachable` and `::test_the_intent_is_journalled_before_the_spawn_and_not_after`, and as a non-claim by `test_os37_journal.py::DeliveryIntentTests::test_the_intent_is_not_a_claim`. |
+| A-25 (**iteration 3**, D4.4 A-1..A-6, DESIGN-approved) | R-B gains a second binding mode, `adopted`, for a CLI that mints its own identity and exposes no caller-supplied channel. | Not a weakening.  M-7: no flag on the Codex `exec` subcommand accepts a caller-supplied thread id.  M-10: supplying one is **accepted, ignored, and neither errors nor warns** -- so a profile composing it would have been silently wrong while looking correct, which is a worse failure than none.  `adopted` binds through channel provenance the OS establishes (a master fd this runtime created, with `os.closerange(3, MAXFD)` before `execve`), acceptance of the FIRST declared record only, an irrevocable freeze into the existing runtime-state receipt under the lease token the frozen `start` signature already carries, and equality forever after.  On one axis it is **better** evidenced than `minted_echo`: M-11 measured `codex exec resume <a never-minted id>` refusing with a typed `no rollout found for thread id ... (code -32600)` and no side effect, so the adopted value is re-verifiable against the CLI's own durable state by a stranger process -- `test_os37_cli_preconditions.py::LiveCliTests::test_the_adopted_identity_is_externally_re_verifiable`. |
+| A-26 (**iteration 3**, D4.2, MEASURED, supersedes PLAN P4.4) | The mandated argv changes in four measured places: `--bare` **removed**, `--verbose` **required**, `--safe-mode --setting-sources ''` **added**, `--ephemeral` **de-mandated**, and the Codex `CODEX_HOME` **seeded** with exactly the credential file the profile names, `0600`. | Every one is a MEASUREMENT, not a preference, and PLAN P4.4's transcribed set is wrong on this host.  M-2: `--bare` forces `apiKeySource:"none"` and an `authentication_failed` turn on an OAuth-authenticated host -- its own `--help` says auth becomes *strictly* `ANTHROPIC_API_KEY` -- so mandating it made every real dispatch fail.  M-3: without `--verbose` the structured channel never opens at all.  M-4: the same run **without** `--safe-mode --setting-sources ''` carries ten `hook_started`/`hook_response` records from this repository's own `SessionStart` hooks, and the un-isolated payload contained this very orchestration run's transcript -- so the isolation set is what makes D13.6(c) precondition 6 true rather than hoped for.  M-11: `--ephemeral` leaves no rollout and `codex exec resume` is the only re-verification channel Codex has, so mandating it silently withdrew `external_resume`; it is now conditional and the honesty rule decides which the operator gets.  M-8: an **empty** run-scoped `CODEX_HOME` yields `401 Unauthorized` with an absent `-o` file. |
+| A-27 (**iteration 4**, D4.3c, DESIGN-approved) | The Claude and Codex Class-B delivery proofs become **CONJUNCTIVE PREDICATES** over measured record fields, and `turn.started` / a bare identity-bound `assistant` record are **DEMOTED** to `tier="raw"` lifecycle observations. | A **strict narrowing**: every record the new selectors admit was already admitted, and they admit none that was not.  M-15 measured a **pure login failure** emitting `{"type":"assistant", "session_id":"<THE RUNTIME'S OWN MINTED ID>", "error":"authentication_failed", "is_api_error_message":true, "message":{"model":"<synthetic>"}}` with every `usage` counter `0` and no `request_id`.  An identity-bound record proves process and session **provenance**; it does not prove that the dispatched prompt executed, and under the type-only test that record would have constructed a `DeliveryProof` and entered `PROMPT_DELIVERED` -- the same family of defect this ticket exists to prevent, one state earlier.  C-4..C-7 are **four independent refusals** of that one record.  M-8's 401 leg emits `turn.started` **before authentication and before any model work**, so Codex had the analogous hole and it is closed the same way.  Proven by `test_os37_lifecycle.py::DeliverySelectorTests` -- nine cases over **byte-for-byte recorded streams** in `scripts/fixtures/os37/streams/`, each with its positive twin so the selectors are provably not vacuous, plus `::test_delivery_selector_conjuncts_are_each_load_bearing` which fails the moment a refactor reduces the conjunction. |
+| A-28 (**iteration 3**, D4.3e, USER DIRECTIVE D-D.5) | Dispatch identity is `(intent_id, dispatch_id, prompt_digest)` with `attempt_incarnation` distinguishing attempts, and a retry **never re-executes the same prompt**. | Addition, using the EXISTING authority: the ladder stays `claim -> record_receipt -> settle` and the `DELIVERY_INTENT` record is the OBSERVATION that lets a successor's `lookup` answer precisely.  Nothing here mints, excludes or fences.  A prompt is a side-effecting action against a paid API and against a worktree, so an uncollectable effect **blocks** rather than repeats -- recorded as DR-10.  Asserted against a syscall spy: exactly ONE `execve` across both attempts (`test_os37_capability_honesty.py::PromptIdempotencyTests`). |
+| A-29 (**implementation**, MEASURED, and it silently ate the prompt) | The Claude driver composes `--` before the positional prompt; the Codex driver deliberately does **not**. | MEASURED, and the two behave differently.  Claude's `--add-dir <directories...>` is **variadic**: the same argv with `--add-dir <dir>` before the prompt and no separator answers `Error: Input must be provided either through stdin or as a prompt argument when using --print`, because the flag consumed the prompt -- a **silent** loss that presents as a CLI complaint about a prompt that was in fact supplied.  With `--` the identical argv completes normally, `rc=0`.  The separator makes the positional immune to EVERY variadic flag, including ones nobody has measured, which is the only version of this fix that survives a CLI update.  Codex's `--add-dir <DIR>` takes exactly one value, and MEASURED: prepending `--` there additionally emits `Reading additional input from stdin...` and waits on stdin -- on a runtime-owned pty that never sees EOF, a hang.  This is exactly the per-CLI knowledge D4.1's containment rule exists to absorb: it lives in `standalone_drivers.py` and nothing above it knows. |
+| A-30 (**implementation**, D6.1, and it refused every launch-mode profile) | The readiness rehearsal composes the profile's argv **in the mode it declares**, so a `launch_with_prompt` profile is rehearsed WITH the trivial no-op payload. | Without it the rehearsal spawned a `launch_with_prompt` CLI with no prompt, which M-5/M-6/M-9 measured emitting nothing at all -- so R-B never closed and preflight refused every such profile with `profile_readiness_unverified`.  That is the same defect A-21 fixed one layer up: a refusal nobody can satisfy is not fail-closed, it is unusable.  The payload is the smallest thing that produces a real turn, because the rehearsal exists to establish that the declared selectors FIRE, not to do work. |
+| A-32 (**implementation**, AC-37-03, found by running the opt-in gate) | `CodexDriver.argv` now composes `profile.identity_flag` when the profile names one; it was ignoring the field entirely. | AC-37-03 requires argv to come from the PROFILE, and a field the driver silently drops is a declaration the operator can make and never receive.  Nothing shipping was affected -- the shipping Codex profile declares `adopted` and names no flag, and `StandaloneProfile` refuses the two together -- but a profile that DID name one would have been silently inert, which is M-10's silently-ignored-identity failure shape seen from the other side.  Found only because the opt-in `ORCA_OS37_E2E=1` lane was run deliberately: it is not part of the default discovery command, so a green default board said nothing about it, and the twelve-case live outcome matrix was failing 14 of 15 cases. |
+| A-31 (**implementation**, D13.6, deadline sizing) | The R10 real-agent profiles raise `readiness_timeout_ms` from the 60 s default to 900 s. | Weakens no gate.  Completion stays **conjunctive** (a declared result record AND a `waitpid`-sourced exit), a timeout is still `TIMED_OUT` and never `COMPLETED`, and every refusal is untouched.  MEASURED: a worker writing two modules and a report takes 55-70 s and a correction pass that must first read a review takes longer, so under the default a run reached `PROMPT_DELIVERED` and then timed out **with the work already done** -- a deadline bug reported as a lost dispatch.  These are profile fields precisely so an operator whose host is slower changes configuration rather than code (`docs/ORCA_RUNTIME_PRIMITIVES.md` C11). |
+
+---
+
+## 2. AC-37-23 -- the unknowns disposition
+
+**No unknown is upgraded to fact anywhere in this implementation.**  Every Orca claim is
+qualified "at the pinned revision".
+
+| # | Unknown | Disposition | Where the implementation is indifferent to the answer |
+| --- | --- | --- | --- |
+| U3 | Whether Orca's headless runtime can be reproduced | `routed-around-by-construction` | Nothing here rebuilds Orca headlessly.  The standalone runtime owns its own processes and shares no code with Orca. |
+| U4 | The provenance semantics behind `WAITING_FOR_INPUT` | `still-unknown` | `WAIT_PROVENANCE` travels with every wait value (`status()["wait"]["provenance"]`), so the state stays PROVISIONAL rather than being asserted. |
+| U6 | Whether Orca's capture survives terminal release | `routed-around-by-construction` | `standalone_capture` owns its own store under the run root and `release()` does not delete it, so AC-37-05 holds independently of U6. |
+| U7 | What Orca's 43-CLI launch table contains | `routed-around-by-construction` | Argv is built from `StandaloneProfile`, never from a table.  There is no built-in CLI table to be right or wrong about. |
+| U8 | Whether an interrupt verb existed in an earlier Orca release | `still-unknown` | Stated only as "absent at the pinned revision `v1.4.197`".  `OrcaAdapter.interrupt`'s docstring says so explicitly and claims nothing about history. |
+| G-1 | What a driver's binary does with no credentials | **`resolved-by-measurement`** (iteration 3, DESIGN D6.3) | **MEASURED on this host, both CLIs, with the exact commands and bytes recorded in `evidence/iteration3/REAL_CLI_MEASUREMENTS_iteration3.md` and replayed byte-for-byte as `scripts/fixtures/os37/streams/`.**  Claude under `--bare` with `ANTHROPIC_API_KEY` unset (M-2/M-15): first byte at 0.22 s, `rc=1`, `system/init` carrying the MINTED id -> an `assistant` record with `error:"authentication_failed"`, `is_api_error_message:true`, `model:"<synthetic>"`, every `usage` counter `0`, text `Not logged in · Please run /login` -> `result{subtype:"success", is_error:true, terminal_reason:"api_error"}`.  **No tty prompt appears at any point.**  Codex against an unseeded run-scoped `CODEX_HOME` (M-8): first byte at 0.29 s, `rc=1`, `-o` **absent**, `thread.started` -> `turn.started` -> `error{401 Unauthorized}` -> `item.completed{item.type:"error"}` -> `turn.failed`.  The fail-closed assertion the fixture had to make **regardless of the outcome** still holds and is now driven by these exact bytes: preflight refuses with `auth_absent`, the conjunctive delivery selector refuses on four independent conjuncts so `PROMPT_DELIVERED` is unreachable, and the completion rule refuses on `is_error` and on the exit status.  **A login prompt is never READY and is never a delivery.**  `test_os37_lifecycle.py::DeliverySelectorTests` + `test_os37_cli_preconditions.py::DeliveryModeRehearsalTests::test_launch_mode_rehearsal_refuses_auth_failure_shape`. |
+| G-2 | Whether a given driver offers a `login status` equivalent | **`resolved-by-measurement`** (iteration 3, DESIGN D6.3) | **MEASURED (M-13): both do, and both are bounded and non-interactive.**  `claude auth status` exits `0` with machine-readable JSON -- `{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","subscriptionType":"max"}`; `codex login status` exits `0` with `Logged in using ChatGPT`.  So the preflight `auth` check has a real probe on both installed CLIs rather than the `unknown` it previously had to return.  **The fail-closed structure is untouched**: with no probe verb and no credential declared the verdict is still `unknown`, `compose` still treats `unknown` as a refusal, and D4.2b W-2 additionally lets the LATER rehearsal override a PASSING probe -- so a credential that lapses between the two observations produces `auth_absent`, never a green preflight.  `test_os37_cli_preconditions.py::DeliveryModeRehearsalTests::test_rehearsal_auth_marker_overrides_a_passing_auth_probe`. |
+| G-3 | What a driver emits for an old or unsupported build | `still-unknown` | `version_unparsable` and `version_unsupported` are both failures.  There is no "assume supported" branch. |
+| G-4 | What an update prompt looks like on the wire | **`still-unknown`, and deliberately so** | It cannot satisfy R-B -- a typed record on the structured channel carrying a session id minted in this process -- whatever its shape.  The evidence is `::test_arbitrary_interactive_frame_is_never_ready`, a property over 10 000 generated frames INCLUDING structurally novel ones, not a fixture for one observed frame. |
+| G-5 | What a permission prompt looks like | **the INTERACTIVE-FRAME half is `resolved-by-measurement`; the rest stays `still-unknown`** (iteration 3, DESIGN D6.3) | **MEASURED (M-12):** `claude -p '<a prompt needing Bash>' --permission-mode manual --permission-prompts none --tools Bash --safe-mode --setting-sources ''` emitted `system/init` -> `assistant` -> `rate_limit_event` -> `user` -> `assistant` -> `result{is_error:false, terminal_reason:"completed", permission_denials:[]}` in 3.82 s and **wrote no interactive frame to the pty at any point**.  Under `--print`, permission handling on this build is **structural** -- a `permission_denials` field and a `--permission-prompts` flag -- not a tty dialogue.  **This removes no refusal.**  `BLOCKING_PROMPT_PATTERNS`, R-1, R-2 and `::test_arbitrary_interactive_frame_is_never_ready` are all unchanged and still run, because a design that RELIED on `-p` never prompting would be exactly the assumption this ticket forbids; and what a permission prompt looks like **on a build that does emit one** remains unmeasured. |
+| G-6 | Whether `--ignore-user-config` reads a hooks file from the run-scoped config root | `still-unknown` | Both `HomePolicy` branches are implemented from the start.  If it does, the profile flips to `sandbox` and NO code changes. |
+| G-7 | Exact exit codes per cause per CLI | `still-unknown` | The mapping table is profile data and an EMPTY table is a valid, fail-closed configuration: every unmapped code becomes `LOST` with `lost_reason="exit_code_unmapped"`. |
+| U-ENV-1 | Whether a config-directory variable is honoured | `still-unknown` | **No claim of config isolation beyond the declared flags appears anywhere** -- asserted by `::test_u_env_1_no_config_isolation_is_claimed_beyond_the_declared_flags`. |
+| U-ENV-2 | Config-root semantics under `--ignore-user-config` | **`resolved-by-measurement`** (iteration 3, DESIGN D6.3) | **MEASURED (M-8), and the answer is that the flag does NOT isolate auth.**  The two-root question is settled by the two legs of one experiment: `CODEX_HOME=<a fresh EMPTY dir> codex exec --json --ignore-user-config ...` returns `401 Unauthorized`, `rc=1`, with the `-o` file **absent**; the SAME argv with that root **seeded** with a copy of the credential file returns `rc=0` with `-o` present.  So authentication resolves through `CODEX_HOME` **even under `--ignore-user-config`**, exactly as that flag's own help states.  The implementation consequence is a REQUIREMENT rather than a precaution: the run-scoped root MUST be seeded with exactly the credential file the profile names, `0600` and nothing else copied (`CodexDriver.seed_auth_home`), and a declared seed that does not exist is the named preflight failure `auth_scope_unseeded` rather than a `401` at run time.  Nothing is assumed isolated by a flag alone -- the earlier disposition's caution is now a measurement. |
+
+### Residuals carried forward, named
+
+| # | Residual | Why it is not closed here |
+| --- | --- | --- |
+| PR-1 | The **Orca** launch path can still assert a capability its adapter lacks: `build_state` reads `spec["capabilities"]` while the ladder depends on `adapter.capabilities()`. | Out of scope by D-2(a): reconciling it there is authorized by no acceptance criterion and would change routing for existing runs and for historical replay.  Closed for the STANDALONE path only, by `build_standalone_state`.  Follow-up ticket proposed. |
+| DR-2 | A `SIGKILL`ed exec wrapper writes no exit sentinel, so `resume` returns `None` where a settlement "morally" happened. | Fail-closed and correct.  `None` routes to `IDEMPOTENCY_RECOVERY_BLOCKED`; it never synthesizes a settlement.  The declaration promises an effect can be observed and collected WHEN IT SETTLED, not that every effect settles. |
+| DR-7 | A CLI build that can declare no structured readiness record can never reach `READY`. | Deliberate, and the fail-closed direction.  Refused at preflight with `profile_readiness_unverified`, on the operator's own host, at configuration time -- never worked around with a title fallback. |
+| D7.3 leg 3 | On-disk config reachable through an inherited real `HOME` is **not fully closed**. | Named as such.  Whether the Tier-C flags suppress it is U-ENV-1 / U-ENV-2 / G-6.  The `sandbox` `HomePolicy` branch is implemented and selectable now. |
+| DR-10 (**iteration 3**, D4.3e) | The unsafe window is exactly one instruction wide: a crash between `execve` and `runtime_state.record_receipt`.  If the wrapper is `SIGKILL`ed no exit sentinel exists, `resume` returns `None`, and the dispatch is **BLOCKED** rather than re-executed. | That is the correct direction, and it is a deliberate cost.  A prompt is a side-effecting action against a paid API and against a worktree, so an uncollectable effect must block, not repeat.  §D3.4a already narrows the window: the spawn record is written by the child BEFORE `execve`, so a present record means "may exist" and forbids re-spawning.  `test_os37_capability_honesty.py::PromptIdempotencyTests::test_retry_never_reexecutes_the_same_prompt` asserts exactly one `execve` across both attempts against a syscall spy. |
+| DR-9 (**iteration 3**, D4.2a) | `post_ready_delivery` real-CLI behaviour is **not established**: neither installed CLI declares it, and the mode is exercised only against `scripts/fixtures/os37/bin/os37-waiting-cli`. | Recorded as **not established**, never as a pass.  M-6 and M-9 measured that neither installed build has a wait-for-input state, so there is nothing on this host to establish it against.  The mode is retained because it is an explicit user requirement (D-A), because the measurement is version-scoped -- `--input-format stream-json` is documented as *"realtime streaming input"* and `codex exec-server` exists as `[EXPERIMENTAL]`, and §D6.1's `delivery_mode` check would DETECT either becoming a post-ready channel rather than requiring a redesign -- and because it is the path that carries the readiness-before-delivery guarantee for every future driver. |
+| Recovery without LangGraph | A standalone deployment with no LangGraph gets **no recovery**. | `recovery_runtime` already refuses by name BEFORE any claim when the pinned runtime is absent.  Recorded here as an operator note rather than discovered at run time. |
+
+---
+
+## 3. AC-37-24 -- per-criterion status
+
+| Criterion | Status | Evidence |
+| --- | --- | --- |
+| AC-37-01 process/session identity bound to run/repo/worktree/agent/task/dispatch | met | `standalone_identity.OwnershipRecord` -- every field required, no defaults; `make_record` refuses an alias worktree selector |
+| AC-37-02 tty-scoped ownership discovery and the four refusals | met | `test_os37_pty_supervisor.py::OwnershipRefusalTests`, each asserting NO signal via a spy |
+| AC-37-03 configuration-driven driver launch | met | `StandaloneProfile`; `--adapter standalone` refuses without an explicit profile (`STANDALONE_ADAPTER_REQUIRES_PROFILE`) |
+| AC-37-04 prompt delivery with evidence | met | `frame_prompt` / `settle_ms` (uncapped) / `_verify_delivery`'s three proofs |
+| AC-37-05 bounded capture with named truncation, readable after release | met | `standalone_capture.BoundedCapture`; `release()` does not delete the file |
+| AC-37-06 readiness/completion evidence separated | met | Disjoint types, four surfaces, I-3's single entry edge; `test_os37_lifecycle.py` |
+| AC-37-07 source vocabulary survives normalization | met | `normalize` REFUSES without it; `validate_vocabulary_member` raises on a non-member |
+| AC-37-08 the four surfaces stay four | met | `::test_merged_ordering_fails_at_least_one_surface` |
+| AC-37-09 the settlement predicate, whole | met | `::test_settlement_predicate_case_a\|b\|c` |
+| AC-37-10 nothing before ownership re-verification | met | The `Permit` token; `::test_no_module_outside_standalone_identity_constructs_a_permit` |
+| AC-37-11 graceful -> bounded wait -> re-verify -> force | met | `standalone_interrupt.interrupt`, rungs 0-4 with three gates |
+| AC-37-12 re-queryable after a Coordinator turn ends | met | `rediscover` from a SEPARATE INTERPRETER; `test_os37_standalone_e2e.py::RequeryAfterTurnEndTests` |
+| AC-37-13 the four ownership axes | met | `contracts.OwnershipAxes` + `validate_axes`; all four always |
+| AC-37-14 closed host scope, `None` on parse failure | met | `parse_host_scope`; `assert_may_act` refuses a non-local scope |
+| AC-37-15 honest `external_resume` declaration | met | Declared, with all four conditions bound to named mechanisms; V-6 written BOTH directions |
+| AC-37-16 `lifecycle_settlement` conditional on a durable journal | met | `::test_lifecycle_settlement_undeclared_pause_falls_back_to_block`, driven through `routing.phase_gate` |
+| AC-37-17 OS-43 observation and capability wiring | met | `StandaloneRunObservation`; `capabilities_for`'s third branch; F6/F7 NOT relaxed |
+| AC-37-18 no excluded-layer import | met | `test_os37_driver_isolation.py::test_no_excluded_layer_import` |
+| AC-37-19 no new runtime dependency | met | `::test_no_new_runtime_dependency` -- stdlib or intra-package only |
+| AC-37-20 policy conformance across fake/orca/standalone | met | `test_os37_adapter_conformance.py`, ONE body, three adapters, plus a meta-assertion that the body does not branch on an adapter name |
+| Two Supervisors racing the same run recovery claim | met | `test_os37_journal.py::TwoSupervisorsCannotBothWinTests` — asserted DIRECTLY rather than argued from the journal's non-authority: exactly one `CREATED` per scope (`recovery_store.claim` for the run, `runtime_state.claim` for the intent), one of them across a SEPARATE INTERPRETER because two Watchdog sweeps are two processes; resuming requires the minted token and a resemblance is refused; and no standalone module imports `recovery_store`, `pause_store` or `pause_runtime`, so none can hold, take over or resemble a run-level claim |
+| AC-37-21 the conformance record | met | This document; read mechanically by `test_os37_conformance_record.py` |
+| AC-37-22 the six port signatures frozen | met | `ports.py`'s digest pinned as a LITERAL, plus the six signatures matched against the file's own source |
+| AC-37-23 unknowns disposition | met | Section 2 above; `::test_u3_u4_u6_u7_u8_not_upgraded` |
+| AC-37-24 per-criterion record | met | This section |
+| WI-17 a complete standalone dispatch, spawn to settlement (AC-37-11's end-to-end evidence) | met | **Driven through the real `run_workflow.py --adapter standalone` CLI and asserted deterministically by `test_os37_standalone_e2e.py::FullSupervisedDispatchTests`.**  One dispatch walks the whole lifecycle in order -- `spawned, identity_bound, readiness_observed, prompt_written, delivery_proof_observed, exit_observed, settlement_confirmed` -- with the child's own spawn record present, the ONE ledger receipt naming `session:incarnation`, ledger status `SETTLED`, a settlement that `contracts.validate_event` accepts unchanged, a result derived by the SHARED policy parser, the journal's six records, and a STRANGER PROCESS reading the settled run back.  Through the CLI, **three consecutive dispatches** each reached `COMPLETED` -- six journal records apiece, `spawned` through `settlement_confirmed` -- with no Orca process, binary, API or terminal at any point.  The journal records intents rather than roles, so no role attribution is claimed; the run did advance past the worker gate into the final-review stage. |
+| A fully green TERMINAL STATUS for the Orca-free workflow | **not established** | The three dispatches each settled, and the run then terminated `BLOCKED` -- `DECISION_GATE_LIFECYCLE_DEFECT` -- because the STUB FIXTURE's decision-gate record is the repository's own `worker_clear.json`, which is bound to `run_fixture` rather than to the live run.  That is OS-42's ledger-binding check refusing a record bound to another run, i.e. **the deterministic workflow policy running unchanged over the standalone runtime, which is the ticket's goal** -- not a standalone defect.  Making the fixture construct a record bound to the live run is fixture work in OS-42's gate schema, and it is recorded here as not established rather than claimed. |
+| **R10 -- the real-agent, Orca-free Worker -> Reviewer -> correction -> fresh Final Review E2E** (implementation item 14; `FINAL_REVIEW.md` F-002) | **met at iteration 3** | `scripts/os37_r10_real_agent.py`, captured at `artifacts/runs/run_54d90086bd75/evidence/r10_real_agent/`. **7 four-step runs, 28 real agent dispatches: `claude` 3/3 CONFORMING, `codex` 3/3 CONFORMING, plus a mixed worker-`claude`/reviewer-`codex` run.** Each run is Worker -> Reviewer -> a deliberately induced FAIL -> correction -> a **fresh** Final Review, each dispatch a separate real CLI on its own headless PTY through the UNCHANGED `StandaloneSession.run_dispatch` with the shipping profile. The FAIL is induced by controlling the WORKER'S INPUT: the reviewer is not told a defect exists, not told a verdict, given no verdict-selection variable, and its instruction block is **byte-identical** between step 2 and step 4. The verdict is parsed out of `REVIEW.md` — a file the agent wrote — by `decision_contract.parse_agent_settlement`, the **production** parser, and `test_os37_standalone_e2e.py::test_the_real_agent_harness_cannot_author_a_verdict` walks the harness's AST and fails on any assignment or return of a PASS/FAIL literal to a verdict-shaped name. `orca` is unresolvable on the child `PATH` and no `ORCA_*` name reaches the child, both asserted with a raise. Every dispatch journalled its `DELIVERY_INTENT` before its spawn record and constructed a typed class-B `DeliveryProof`; a **stranger interpreter** re-read all seven journals and confirmed it from the files alone. **The retained fixture E2E is inadmissible here and is enforced as such** (D-H). The inducement was measured INEFFECTIVE once and a correction INEFFECTIVE once; both were reported and fixed by sharpening the worker's input, never by supplying a verdict — see `IMPLEMENTATION.md` and `JOURNAL_PROVENANCE.md`. |
+| Live per-CLI behaviour against real installed binaries -- the DRIVER-CONTRACT half | **met at iteration 3** | `ORCA_OS37_LIVE_CLI=1` runs **9** cases against `claude 2.1.260` and `codex-cli 0.153.2`; all nine EXECUTE and pass.  Two of them compose each CLI's **production** argv and drive it to a real conjunctive class-B `DeliveryProof`, with a genuine success completion record, **no** typed authentication marker, and **zero** `hook_started` records -- the last being the measured proof that `--safe-mode --setting-sources ''` really isolates the child from this repository's own `SessionStart` hooks (§D13.6(c) precondition 6).  The Codex case drives BOTH legs of M-8: an **unseeded** run-scoped `CODEX_HOME` yields `401`, an absent `-o` file, a `turn.started` emitted before authentication, and **no** delivery proof; the **seeded** root yields a real `agent_message` item and a `turn.completed`.  One case exercises the adopted binding's external re-verification (M-11's typed refusal of a never-minted id).  **At Final Adversarial Review attempt 1 this row was NOT MET and one of its cases FAILED when the reviewer independently re-ran it**; that case asserted the opposite of what the approved DESIGN now requires and is replaced by the assertion the measurement supports (amendment A-25, and the `## Review Feedback Resolution -- iteration 3` section of `IMPLEMENTATION.md`). |
+| Live per-CLI behaviour -- the TWELVE-CASE OUTCOME MATRIX against real installed binaries | **not established** | The twelve runtime-boundary cases (delivery / completion / failure / interruption / timeout / lost, x two drivers) run against `scripts/fixtures/os37/bin/os37-stub-cli`.  Per USER DIRECTIVE D-H that half is **inadmissible** as evidence for the real-CLI half, and the two are recorded in separate rows for exactly that reason.  Executing all twelve against the installed binaries is the TEST phase's obligation and is **not** claimed here. |
+| `post_ready_delivery` real-CLI behaviour (DR-9) | **not established** | Neither installed CLI declares the mode: M-6 and M-9 measured that with stdin on a pipe held open and EMPTY for 8 s, both emit **zero bytes** until the prompt arrives, so neither has a wait-for-input state and there is nothing on this host to establish it against.  The mode is implemented, wired and exercised end to end against `scripts/fixtures/os37/bin/os37-waiting-cli`, which is runtime-boundary evidence and is recorded as such. |
+| Live per-CLI behaviour, the ORIGINAL iteration-2 row (superseded, retained for the record) | **superseded at iteration 3** | `test_os37_cli_preconditions.py::LiveCliTests` and `test_os37_standalone_e2e.py::StandaloneE2ETests` are skip-gated on `ORCA_OS37_LIVE_CLI=1` / `ORCA_OS37_E2E=1`.  At iteration 2 they did not run, so the row read NOT ESTABLISHED -- never a pass.  The deterministic half runs against `scripts/fixtures/os37/bin/os37-stub-cli`, which reads `--session-id` from ARGV exactly as a real driver passes it, answers `--version`/`--help` like a real binary, and chooses its result vocabulary from the ROLE in the delivered prompt -- so the readiness quorum, the settlement parser and the Worker/Reviewer distinction are all genuinely exercised rather than simulated. |
+| The six-job LangGraph x Python CI matrix | **not established** | This worktree is one point in that matrix (Python 3.11.8, `langgraph 0.2.76` present).  The `absent` lane and the 3.12/3.13 rows are CI's to run; the manifests are updated so both lanes' identity contracts hold. |
+
+---
+
+## Operator notes
+
+* **A standalone deployment without the pinned LangGraph runtime gets no recovery.**  The
+  recovery path refuses by name before any claim.  The standalone runtime itself is
+  stdlib-only and imports and passes with LangGraph absent.
+* **The profile is mandatory and has no default.**  `--adapter standalone` needs
+  `--standalone-profile` or a `standalone_profile` object inside `--state`.
+* **`resume --adapter standalone` re-enters a paused run with its RECORDED bindings**
+  (follow-up review, finding 2; this replaces the earlier "refused by `resume`" residual).
+  The launch records, beside the persisted profile, a create-once / exact-match binding
+  (`standalone/runtime_state.json`: ledger path, thread, adapter, approval authority --
+  findings 5 and 8), and both the Watchdog and the `resume` verb compose the runtime from
+  it.  Both records are published by `execute_state` only AFTER the run-scoped execution
+  authority has been claimed successfully and before any spawn (correction 2): an
+  invocation refused `EXECUTION_AUTHORITY_HELD` creates and changes nothing, while a
+  pre-existing different binding is still refused at composition, before any claim.  Selecting any other adapter on a standalone-launched run is refused by name
+  (`STANDALONE_RUN_ADAPTER_MISMATCH`); a second launch that names another ledger or
+  approval authority is `STANDALONE_AUTHORITY_CONFLICT` before any process exists.  An
+  in-flight dispatch of a crashed supervisor is COLLECTED from its durable evidence
+  (finding 1), never re-spawned; an unrecordable pause commits the same BLOCKED terminal
+  it reports (finding 2).
+* **A profile that declares no structured readiness record cannot run.**  That is DR-7, and
+  it is the fail-closed direction.
+* **Preflight spawns the binary up to SIX times before the run starts** (iteration 3, up
+  from three) -- once for `--version`, once for `--help` when the profile declares
+  `required_flags`, once for the READINESS REHEARSAL, once for the DELIVERY-MODE REHEARSAL,
+  once more with **no prompt** to probe the opposite direction, and once for the bounded
+  credential probe.  All are bounded and non-interactive.  **This is a real cost and it is
+  worth naming plainly: on a `launch_with_prompt` driver, two of those spawns are real model
+  turns and they consume the operator's quota.**  They are the price of two properties the
+  ticket requires: R-B being the only accepting readiness evidence, and a declared capability
+  never being trusted.  The rehearsal payload is deliberately the smallest thing that can
+  produce a real turn (`Reply with exactly: OK`), because the rehearsals exist to establish
+  that the declared selectors FIRE, not to do work.
+* **Both directions are probed, and the second spawn is not redundant.**  D4.0 M-10 measured
+  a CLI *silently ignoring* a supplied identity -- accepted, turn completed, value nowhere,
+  no error and no warning.  A check that looked only for the declared behaviour would pass a
+  profile that is wrong, so a `launch_with_prompt` declaration is additionally spawned with
+  no prompt at all, and a CLI that reaches the quorum and then waits makes the declaration
+  `delivery_mode_ambiguous` rather than silently taking the weaker guarantee.
+* **Do not run `scripts/os37_r10_real_agent.py` and the test suite at the same time.**  The
+  R10 harness writes into `artifacts/runs/<run_id>/evidence/r10_real_agent/`, and
+  `test_os42_artifacts.HistoricalArtifactTests` snapshots a digest of everything under
+  `artifacts/runs/` before and after.  Run them concurrently and that test fails -- correctly,
+  because an artifact under that tree really did change.  It is a real interaction rather than
+  a flake, and the fix is sequencing, not a weaker assertion.
+* **A Codex-shaped profile MUST name a credential file to seed** into its run-scoped
+  `CODEX_HOME`.  M-8 measured an empty root yielding `401 Unauthorized` with an absent `-o`
+  file; a declared seed that does not exist is the named preflight failure
+  `auth_scope_unseeded`, never a `401` discovered at run time.  Exactly the named file is
+  copied, `0600`, and nothing else from the real home.
+* **`--ephemeral` and `external_resume` are mutually exclusive** for the Codex driver.  M-11:
+  `--ephemeral` leaves no rollout, and `codex exec resume` is the only re-verification and
+  resume channel that CLI has.  A profile that selects `--ephemeral` therefore declares
+  `resume_channel="none"`, and `capabilities()` reflects that -- the honesty rule decides
+  which one the operator gets rather than the argv deciding it behind their back.
+* **Every credential the profile names must resolve, or the start fails `auth_absent`.**
+  The profile names a REFERENCE and the runtime resolves it at spawn; an empty resolution is
+  a failure, not "no credential configured", because spawning under it would turn a
+  configuration error into an interactive login prompt at run time.
+* **The agent's transcript survives the session.**  It is at
+  `<artifact_base>/runs/<run_id>/standalone/<session_id>/capture.log`, is written verbatim,
+  and `release()` does not delete it -- so a completion question asked by a later process
+  has something to read.  Its truncation, if any, is reported rather than silent.
+* **`post_ready_delivery`'s echo emulator is FIXTURE-ONLY and does NOT support an
+  interactive TUI.**  The framing / `\r` / termios-echo machinery in `standalone_drivers`
+  and `standalone_lifecycle` (`frame_prompt`, `resolve_delivery_echo`,
+  `expected_echo_forms`) exists so that a `post_ready_delivery` write into a pty can be
+  matched and EXCLUDED from a completion scan; it is exercised only by
+  `scripts/fixtures/os37/bin/os37-waiting-cli` and is used by NO installed `claude` /
+  `codex` profile (both declare `launch_with_prompt`).  It reads the slave's line
+  discipline (`ECHO`, `ICANON`, the `c_cc` special bytes) and derives the echo forms a
+  cooperative terminal would produce; it is NOT a terminal emulator and it does NOT solve a
+  future interactive TUI that redraws the prompt with `ECHO` disabled -- such a TUI paints
+  its own screen and the emulator would see none of it.  It is retained as the path that
+  carries the readiness-before-delivery guarantee for a future post-ready driver, and its
+  boundary is recorded here rather than claimed as general TUI support.  The round-7
+  correction does NOT extend it: a `turn_start` record alone is no longer accepted as
+  delivery in either mode (both installed CLIs were measured starting a turn on their
+  authentication-failure legs, before any prompt could execute), so a post-ready write is
+  now confirmed by the driver's OWN conjunctive delivery selector -- the same class-B
+  `agent_response` proof `launch_with_prompt` requires -- and `screen_echo` remains exactly
+  the proven echo it was.
+* **A launch that omits `thread_id` binds ONE identity everywhere** (round-7 blocker 1).
+  `build_state`, the default ledger path, the create-once authority, the persisted prompt
+  composition and the migration log all read the same `effective_thread_id` (`"launcher"`
+  when the spec names none), and `build_standalone_adapter` refuses a composition whose
+  state and authority thread disagree.  A second thread of one run records its own
+  `runtime_state.<thread>.json` and never collides with the primary.
+* **Recovery rebuilds the PRODUCTION PROMPT, or refuses by name** (round-7 blocker 2).  The
+  non-secret composition inputs (objective, requested phases, risk, absolute project root,
+  role instructions) are persisted at launch, content-addressed, and their digest is bound
+  into the same create-once authority that names the profile.  A resume or watchdog recovery
+  reads them back through that binding and rebuilds the SAME
+  `build_standalone_prompt_composer`, so the next Worker / Reviewer dispatch receives the
+  full production prompt -- objective, role, task / review-output contract and correction
+  instruction -- never raw `ActionIntent` JSON.  A bound composition that is missing,
+  unreadable or does not hash to its digest is the typed refusal
+  `STANDALONE_PROMPT_COMPOSITION_MISSING`; a launch that named no objective persists an
+  explicit `composer: none` declaration and is honoured as such.
+* **A legacy authority upgrade never INVENTS a composition** (round-8 item 4).  A pre-fix
+  run that persisted no composition is ambiguous -- the launch may have composed the
+  production prompt from an objective without recording it -- so the automatic upgrade of
+  its legacy (`thread_id: ""`, no composition digest) authority fails closed with
+  `STANDALONE_PROMPT_COMPOSITION_MISSING` on resume, recover and watchdog alike, bytes
+  untouched, and never infers `composer: none`.  The remedy is the explicit, audited
+  `run_workflow.py migrate-standalone-prompt-composition --run-id ... --state <launch
+  state> --objective <launch objective> [--project-root ...] --actor-id ... --reason ...`
+  (or `--composer-none` to declare, attributably, that the launch delivered the canonical
+  intent), which persists the supplied composition, upgrades the authority under the
+  migration lock and journals `composition_source: audited_migration` with actor and
+  reason.
+* **Durable thread evidence is a TRI-STATE** (round-7 blocker 3).
+  `durable_thread_evidence` reports `present` / `proven_absent` / `unreadable`, never a bare
+  string.  An unreadable or corrupt pause store or checkpoint is `STANDALONE_THREAD_EVIDENCE_UNREADABLE`
+  -- fail-closed on resume, recover, cancel, abandon and watchdog -- and is never conflated
+  with a genuine absence; the authority's immutable thread binding is validated against the
+  resolved evidence, and the validator refuses an empty thread rather than skipping the
+  check.
+* **Capture handoff never promotes unverifiable bytes** (round-7 blocker 4).  A meta that is
+  missing, unreadable, or disagrees with the file's length or digest is an IRREVERSIBLE
+  unanswerable state that no later append or meta rewrite can clear.  A suffix beyond the
+  meta-declared length is evidence ONLY when the supervisor's durable APPEND INTENT (written
+  before the data) describes it by offset, length and digest; any other tail -- a forged or
+  stale completion record included -- is `unverified_tail` and can never become settlement
+  evidence.  File-length inference is gone.
+* **Profile migration and reconciliation are SERIALIZED** (round-7 blocker 5).  One
+  run-scoped inter-process `fcntl.flock` (`standalone/profile_migrations.lock`) covers the
+  whole of a migration and of a reconciliation, and the migrator compares-and-swaps the
+  bound digest and epoch under the lock before it re-binds -- so a reader can never reconcile
+  a live migration half-way and two migrators can never both re-bind.  The log holds exactly
+  one terminal record per migration id and a linear old->new digest chain.
+* **A relative profile worktree is FROZEN at launch and durable across recovery cwds**
+  (Final-Review iteration 5, B1).  A relative `worktree` (or `add_dirs` entry) in an
+  operator's profile means "relative to where I launch from"; `build_standalone_adapter`
+  resolves it to the launch process's absolute path (`freeze_profile_worktree`) BEFORE the
+  spec is digested, exact-match checked and archived, so the create-once digest is
+  computed over the FROZEN mapping -- it names the worktree the run actually executes in:
+  the same relative spec relaunched from the launch cwd is an exact-match restart, from any
+  other cwd it freezes to a different worktree and is `STANDALONE_AUTHORITY_CONFLICT`,
+  never a silent re-bind.  A resume / watchdog recovery started from ANY cwd rebuilds the
+  launch-time absolute worktree from the archive; a `--standalone-profile` restatement and
+  a `migrate-standalone-profile` profile pass the same freeze against their own process's
+  cwd.  The archive write door refuses an unfrozen spec and the read door refuses a legacy
+  archive (written by the pre-fix model) with `STANDALONE_PROFILE_WORKTREE_UNFROZEN`
+  rather than re-interpreting its bytes against a new cwd; such a run is recovered only
+  through the explicit, audited migration naming the launch-time absolute worktree.
+* **An OMITTED profile worktree is frozen to the launch cwd** (round-8 item 3).  A profile
+  that names no `worktree` (or an empty one) used to reach the runtime empty, which the
+  session reads as "this process's cwd" -- the launcher's at launch and the RECOVERING
+  process's on resume / watchdog recovery, so a run launched in A and recovered from B
+  sent its next agents to B.  `freeze_profile_worktree` now binds an omitted worktree to
+  the launching process's absolute cwd at the same composition door, with the same digest
+  consequences (same cwd: exact-match restart; another cwd: `STANDALONE_AUTHORITY_CONFLICT`);
+  the write door refuses an unfrozen (relative OR omitted) spec and the read door refuses a
+  legacy empty archive by name, recovered only through `migrate-standalone-profile` naming
+  the launch cwd.
+* **Profile-migration attempts have their own identity and reconcile over VALID state**
+  (round-8 items 7 / 8).  Every migration record carries an `attempt` ordinal beside the
+  operation's `migration_id`, so a retry after a rolled-back attempt is reconciled on its
+  own state: the per-attempt invariant is exactly one `prepared` and at most one terminal
+  record per `(migration_id, attempt)`, and at most one `committed` per id; a legacy
+  attempt-less log is assigned attempts positionally.  Reconciliation reads the authority
+  through the validated loader (an unreadable authority PROPAGATES as its typed refusal,
+  never collapses to a rollback), rolls forward only after the target archive loads through
+  the production loader (digest AND profile schema), rolls back only with positive proof
+  that the authority still names the attempt's source digest, and refuses anything else as
+  `STANDALONE_MIGRATION_UNRECONCILABLE` with the attempt left open.
+* **Unanswerable capture never settles** (round-8 item 2).  `await_completion` asks the
+  capture whether it can answer BEFORE it looks at any settlement record: a parsed record
+  inside a truncated, forged (`unverified_tail`), digest-mismatching or meta-less capture is
+  not evidence, and the dispatch takes the capture's own typed LOST reason
+  (`capture_truncated` / `evidence_unreadable`) into a typed FAILED settlement (a Reviewer:
+  `REVIEWER_RUNTIME_FAILURE`, nothing settled) -- never `COMPLETED`, in the ledger or the
+  journal.
+* **A proven exit is followed by a drain to the pty HANGUP** (round-8 iteration 2, the
+  F06 CI ordering).  On Linux a slave write reaches the master through the tty
+  flip-buffer work queue, so under load the exit watcher's fenced sentinel can be durable
+  BEFORE the agent's final record is readable; `await_completion` used to settle on "a
+  candidate record and a proven exit" (or drain for 10 ms of silence) and so settled
+  `FAILED / completion_record_undeclared` over the penultimate record.  Once the exit is
+  proven, `StandaloneSession.drain_after_exit` now reads the master until the pty hangs
+  up (EOF / `EIO`), bounded by `POST_EXIT_DRAIN_BUDGET_MS`, and only then is the evidence
+  final; the settlement row records `post_exit_drain: {bytes, ended: hangup|budget}`.  A
+  failed dispatch receipt carries its typed `failure_reason` (it used to be the empty
+  start-receipt field).  The exit watcher's appender records its append intent BEFORE the
+  bytes, exactly as the supervisor's capture does, so a stranger reading an in-flight
+  append sees a `verified` tail: the answerability gate distinguishes "not yet fully
+  visible" (in flight, verified) from "integrity failed" (forged / truncated / meta
+  missing), and still refuses only the latter.
+* **Settlement requires POSITIVE stream finality** (round-8 iteration 3).  **Superseded by
+  OS-48 (see the OS-48 section below): the positive fact is now the in-band FENCE MARKER at
+  boundary N, never a hangup; `stream_end_unproven` is retired in favour of
+  `boundary_unproven`.**  Historical text follows.  The post-exit
+  drain counts exactly two observations as the hangup -- a clean EOF and `errno.EIO`, the
+  pty's own "every slave descriptor is closed" signals; `EINTR` is retried; every other
+  read or poll error is `ended: master_unreadable` with the errno named (an unreadable
+  master proves nothing about the slave side).  `await_completion` authorises a structured
+  success ONLY from `post_exit_drain.ended == "hangup"`: `budget` (a slave still held open
+  when the bound elapsed -- a hung agent) and `master_unreadable` are the typed LOST reason
+  `stream_end_unproven` (a new, additive member of `LOST_REASONS`), settled by
+  `settle_failed` as a typed FAILURE with the reason on the receipt -- no COMPLETED state,
+  no settlement-success row, no success ledger receipt -- whatever completion candidate the
+  transcript holds, because a record read before the stream's end is not its final record.
+  An ADOPTED session (a stranger collecting a crashed supervisor's dispatch) holds no
+  master: its positive end-of-stream evidence is the exit watcher's fenced sentinel, which
+  the watcher writes only after its own final drain and meta save (`ended: no_master,
+  finality: exit_sentinel`); an exit proven only by the process table is not final there
+  either.  The drain outcome rides both settlement rows (`post_exit_drain`).
+* **The standalone `lookup()` answer IS a receipt** (round-8 item 1): exactly the closed
+  key set `runtime_state.RECEIPT_KEYS`, every value a non-empty string, the task and
+  dispatch identities derived by the same functions the supervising session derives them
+  with -- so the spawn-record-before-receipt crash window is collected through
+  `executor._recover -> record_receipt -> resume`, never refused as a corrupt ledger.
+* **Structured streams split on `\n` only** (round-8 item 5): every NDJSON reader (the
+  capture's `structured_lines`, the journal, the migration and upgrade audit logs, the
+  `ps` table) uses `standalone_capture.protocol_lines`; U+2028 / U+2029 / U+0085 inside a
+  JSON string never split a record, and `\r\n` delimits exactly like `\n`.
+* **G2 re-checks the fenced exit proof** (round-8 item 6): a process that exits between the
+  last rung-2 probe and the G2 read is `interrupted_confirmed` (INTERRUPTED), not an
+  ownership refusal, and no SIGKILL is sent.
+* **The credential seed is 0600 from its first byte** (round-8 item 9): the seed is written
+  to a temp opened `O_CREAT|O_EXCL|O_WRONLY, 0o600` in the destination directory
+  (umask-independent), `fsync`ed and atomically renamed -- never copied then `chmod`ed.
+* **`project_root` reaches the standalone quality gate** (round-7 item 7).
+  `build_standalone_prompt_composer(project_root=...)` resolves `.orca/quality-profile.yaml`
+  under that root into every dispatch's quality gate block -- absent renders the absent
+  block, and an invalid profile is the same pre-dispatch `INVALID_QUALITY_PROFILE` refusal
+  the Orca path raises, before any process exists.
+* **A dispatch blocks the caller for as long as the agent runs.**  That is the engine's own
+  contract for `start` and is what `LeaseKeeper` renews across.  It does not make the
+  caller the lifecycle owner: the child is a `setsid` session leader and the journal,
+  sentinel and ledger are plain files, so `standalone_journal.rediscover(run_id,
+  artifact_base)` answers from a completely fresh process.
+
+## Round 9 -- consolidated external review of `fc21012` (issuecomment-5680361023)
+
+* **A CAPTURE-FINALIZED proof, DISTINCT from the exit sentinel** (round-9 item 1).
+  **Superseded by OS-48: `os37.capture_finalized.v1` is REFUSED BY NAME
+  (`legacy_finalized_record`); the proof is the fence `os48.capture_fence.v1` bound to
+  `sha256(capture[0,N))`.  `write_capture_finalized` / `read_capture_finalized` /
+  `finalized_matches` no longer exist.**  Historical text follows.  The exit
+  sentinel proves the *process* exited -- the exit watcher writes it the instant `waitpid`
+  returns, whether or not any output has been drained.  Whether the *capture* is complete
+  is a SEPARATE, crash-durable, fenced record
+  (`standalone_capture.write_capture_finalized`, `capture.log.finalized.<incarnation>.json`)
+  written only after the finalizing writer has completed its bounded drain, persisted the
+  capture meta and fsynced it; it binds the capture's final length + sha256 and the exit
+  identity (the sentinel's code, or a ladder/table proof).  `_stream_is_final` now accepts
+  ONLY that proof (`finality: capture_finalized`), matched against the capture on disk
+  (`finalized_matches`): a sentinel with no proof is `exit_sentinel_only` and NOT final.
+  This closes the round-8 hole -- the watcher may write the sentinel without draining when
+  the supervisor was alive, and a supervisor that then died before its own drain left a
+  truncated capture a successor settled from.  A supervising session writes the proof after
+  its own drain reaches the hangup; the exit watcher writes it after ITS orphan drain, and
+  ONLY THEN writes the sentinel.  The finality gate is TOTAL: an exit first observed AT (or
+  past) the completion deadline still runs the drain + finality gate.  Locked by
+  `test_os37_round9_review_regressions.py::Item1*` (real-pty watcher finalize included) and
+  the F01 adopted-recovery path.
+
+* **PTY scope: fail-closed and OBSERVABLE (choice a).**  **Superseded by OS-48: a retained
+  slave no longer withholds finality -- its bytes land after N and are retained as a
+  diagnostic tail; the holder enumeration below is a DIAGNOSTIC (`present` / `unreadable` /
+  `none_observed`) that no decision consults (ANALYSIS F0: a negative whole-process-table
+  scan is never proof).**  Historical text follows.  A descendant that retains the pty
+  slave prevents the EOF/EIO hangup.  We do NOT accept "final record + N ms silence" as
+  success.  The finalizing drain is bounded by the profile's own
+  `timeouts.post_exit_drain_budget_ms` (default 2 s, an operator-tunable knob, not a
+  literal), and a drain that does not reach a sound completion is `stream_end_unproven`
+  (typed FAILED/LOST), with the RETAINED-SLAVE CAUSE NAMED in the finalized record's
+  `holders` evidence: the slave's foreground process group and whether it still has members
+  (both platforms), plus, on Linux, a `/proc/<pid>/fd` scan naming each holder's pid, comm
+  and fds.
+
+  **Iteration 4 (option B) -- the darwin proof gate is a COMPLETE, fail-closed `libproc`
+  slave-descriptor authority, the ONE deliberate exception to "the kernel hangup is the only
+  proof".**  Two darwin facts MEASURED on this host (probes retained under
+  `artifacts/runs/run_5855732a7f74/evidence/iter4/`) force this: (1) the exit watcher makes the
+  slave its CONTROLLING TERMINAL so the pty's unread tail is never reclaimed while it lives (a
+  slow supervisor never loses the tail), and a consequence is that NO alive process ever
+  observes the master hangup while that session leader lives -- not a separate reader (the
+  supervisor) and not even the leader itself as the SOLE master holder (the production orphan
+  path with no holder reads `ended=budget`, never a hangup); the hangup is delivered ONLY when
+  the ctty leader EXITS and revokes.  **[OS-48 CORRECTION, MEASURED: this claim is false.  The
+  darwin master reports EOF on the LAST SLAVE CLOSE whether or not the ctty leader lives, and
+  the unread tail is discarded ~0.5-0.7 s after that close (run_f820764749d6
+  `evidence/analysis/probe_01`, `probe_04`); only a HELD slave reference retains it
+  (`evidence/design/probe_d1`).  This is why OS-48 makes the watcher hold one.]**  (2) Removing the controlling terminal makes the hangup
+  observable while the watcher lives, but darwin then reclaims the master's unread buffer
+  ~0.3-1 s after the agent exits -- reintroducing the lost tail.  So the hangup used as proof
+  is the watcher's release/revoke, and the RELEASE is gated on a COMPLETE positive
+  slave-absence proof obtained while the watcher is held.  The authority is `libproc`
+  (`standalone_pty.slave_device_holders`), NOT `lsof`, and the darwin `libproc` semantics it
+  rests on were pinned empirically (reviewer iter5 corrections):
+
+  * **Enumeration (F1).** `proc_listallpids` returns the number of PID **entries**, not a byte
+    length; the fill count is used directly (dividing by `sizeof(int32)` scanned one quarter of
+    the table and silently omitted any holder past the prefix).  A fill that reaches buffer
+    capacity is a truncation/growth and is re-queried, bounded, else `unreadable`.
+  * **Inspection gate (F2).** The gate for inspecting a process is FD INSPECTABILITY, never an
+    identity read.  A same-uid holder whose `PROC_PIDTBSDINFO` is denied is still caught because
+    its fd **listing** succeeds and is inspected directly (identity is not on the proof path).  A
+    process whose fd listing the kernel denies (`EPERM`/`EACCES`) is -- since we are not root --
+    provably not our uid; a mode-0620 owner-uid pty slave cannot be open in it, so it is the
+    diagnostic `other_uid` bucket and does not block the proof.  On darwin identity-readability
+    and fd-listing-readability are the same permission (both succeed iff same-uid), so this is a
+    kernel-enforced boundary, not an assumption.  Changed-uid (`setuid`) descendants are
+    explicitly OUT OF SCOPE and are not claimed as covered.
+  * **Fd-table race (F3).** A per-fd query failure is a MOVING fd table, not proof of absence: a
+    holder can `dup2` the slave onto a descriptor that was a pipe in an earlier snapshot and
+    close the originals (which then read `EBADF`).  Each process is therefore re-scanned over a
+    FRESH `PROC_PIDLISTFDS` listing (so a relocated slave is seen as a vnode now), and only TWO
+    consecutive, complete, IDENTICAL `(fd -> dev/ino)` scans count as inspected; an fd table that
+    never settles within the bound is `unstable` -> `unenumerable`.  A whole-process `ESRCH` is
+    `gone` (it holds nothing); a bystander that closes a fd once re-scans clean and still proves
+    absent, so ordinary churn does not make a busy host `unreadable`.
+  * **Exact-size decode (F4).** `PROC_PIDFDVNODEPATHINFO` returns exactly 1200 bytes for a valid
+    vnode fd (`vst_dev`@+24, `vst_ino`@+32; agrees with `fstat` of an open slave); a positive but
+    SHORT/long return, or a malformed listing length, is `unenumerable` for that pid and is never
+    decoded from the zero-filled buffer.
+
+  The ONE thing skipped (recorded, never silent) is a per-fd `EPERM`/`EACCES`: a pty slave vnode
+  is never permission-restricted (its `proc_pidfdinfo` succeeds in the reference and in a real
+  cross-process holder), so a fd macOS refuses to introspect is provably not the slave; without
+  this a host with any TCC-restricted-fd launchd agent would be permanently `unreadable`.  The
+  slave reference `(dev, ino)` is taken by `fstat` of an OPEN slave fd, whose pty vnode reports a
+  DIFFERENT inode than the devfs path node.  **Scope**, the explicit reviewable limit: every
+  process whose fds the kernel lets us read (exactly the same-uid set) is fully inspected; a
+  process of another uid is the diagnostic `other_uid` bucket and cannot hold a mode-0620
+  owner-uid slave.  "Complete" is NOT the whole host (an other-uid process's fds are
+  unreadable to a non-root owner and it cannot hold the slave) and NOT tty membership (`ps -t` is
+  blind to a `setsid` holder).  The release is a
+  TOCTOU-tight single step (prove, then close the handoff at once; no new holder can appear
+  after the agent's exit -- there is no process to fork-inherit the slave).  The orphan path
+  (the watcher, after the supervisor dies) runs the SAME authority before writing any `proven`
+  record; if it cannot run it in the forked context it writes `unproven`, never
+  `quiesced`-as-proven.  Choice (c) -- the item-1 finalization protocol -- is the positive
+  proof that stays sound when descendants exist; choice (a)'s observability and configurable
+  bound are how a genuinely retained slave is reported.  Locked by
+  `test_os37_round9_review_regressions.py::Item1WatcherFinalizeOverRealPtyTests` and
+  `test_os37_round10_review_regressions.py::Iteration4LibprocAuthorityTests`.
+
+* **A crash-consistent prompt-composition upgrade / migration** (round-9 item 2).  The
+  legacy-authority upgrade (`_write_upgraded_legacy_authority`) is now the same reconcilable
+  two-phase act as profile migration: a durable `prepared` intent (keyed by an `upgrade_id`
+  + `attempt`) fsynced before anything changes, the composition persisted content-addressed,
+  a compare-and-swap authority rebind, then a `committed` record.  A crash at any cut point
+  is reconciled deterministically from the primary authority on the next read
+  (`reconcile_authority_upgrades`): rebind landed -> rolled forward to `committed`; rebind
+  did not -> `rolled_back` and the upgrade re-runs.  Replay after every cut point converges
+  to exactly one committed record for the live authority, and a crash after the rebind never
+  leaves the new composition bound without an audit record.  `read_authority_upgrades`
+  returns only COMMITTED upgrades.  Locked by
+  `test_os37_round9_review_regressions.py::Item2CrashConsistentUpgradeTests`.
+
+* **Per-run watchdog isolation** (round-9 item 3).  A malformed / unreadable / wrong-thread
+  authority for ONE run is converted, at the standalone composition boundary
+  (`capabilities_for`), into the observation port's typed `ObservationUnavailable` for THAT
+  run, so the fleet sweep records it as unreadable at observation, refuses its recovery
+  composition by name, and continues classifying and recovering the healthy runs.  A
+  targeted `--run-id` invocation is still pre-validated at the wiring boundary and fails
+  closed.  Locked by
+  `test_os37_round9_review_regressions.py::Item3PerRunWatchdogIsolationTests` (a real
+  multi-run sweep: one corrupt authority + one healthy stalled run -> the healthy run
+  recovered, the corrupt run reported by name).
+
+* **Invalid `worktree` TYPES are refused** (round-9 item 4).  Only a MISSING key or the
+  exact empty string `""` means "the launch cwd"; every other non-string value (`123`,
+  `[]`, `{}`, `None`, `1.5`, `True`) is the typed refusal
+  `STANDALONE_PROFILE_WORKTREE_INVALID` (or `ProfileError` at the runtime door) BEFORE the
+  spec is frozen, digested or persisted, at `freeze_profile_worktree`, the archive write
+  and read doors and `profile_from_mapping`.  Previously `[]` / `{}` fell through as "" and
+  `123` died in `abspath`.  Locked by
+  `test_os37_round9_review_regressions.py::Item4InvalidWorktreeTypeTests`.
+
+* **An existing profile archive is VALIDATED before authority bind** (round-9 item 5).  A
+  content-addressed archive that already sits under the digest a launch or migration is
+  about to bind is loaded through the production loader -- present, hashes to the digest,
+  frozen, a valid profile -- before `persist_standalone_profile` publishes it or a migration
+  rebinds authority to it; a corrupt / tampered / schema-invalid file there is the typed
+  refusal `STANDALONE_PROFILE_ARCHIVE_INVALID`, never the profile a recovery rebuilds.  The
+  same door validates an existing prompt-composition archive.  Locked by
+  `test_os37_round9_review_regressions.py::Item5ExistingArchiveValidatedTests`.
+
+* **A missing capture sha256 is NEVER healed** (round-9 item 6).  `RawBoundedAppender`
+  requires the closed v2 meta shape with a valid 64-hex-digit `sha256` at handoff
+  (`_meta_shape_problem`); an absent / empty / malformed digest -- or any other inherited
+  integrity failure -- is `inherited_meta_invalid`, irreversibly unanswerable: the watcher
+  never re-derives the digest from the bytes and writes the INHERITED `sha256` string
+  verbatim into every meta it saves, so a capture unanswerable before the handoff stays
+  unanswerable after it.  The reader's `integrity()` refuses the same shape by name
+  (`INTEGRITY_META_INVALID`).  Locked by
+  `test_os37_round9_review_regressions.py::Item6MissingDigestNeverHealedTests`.
+
+* **Documentation scope: `migrate-standalone-prompt-composition` supports ONLY the
+  omitted-thread legacy authority shape.**  The command (and the automatic legacy upgrade)
+  recognises exactly the pre-fix `thread_id: ""` authority with no prompt-composition digest
+  whose durable evidence proves the `launcher` thread; a legacy-looking record naming an
+  explicit thread is NOT that shape and is left to the normal validator, never silently
+  upgraded (`_is_legacy_omitted_thread_authority`).  The PR description and this record are
+  narrowed to that actual compatibility scope rather than claiming a general "a legacy run
+  lacking prompt composition is recoverable".  An explicit-thread legacy record is a
+  separate, unimplemented path.  Locked by
+  `test_os37_round9_review_regressions.py::DocScopeTests`.
+
+## Round 10 -- consolidated follow-up review of `bcd5c6d` (issuecomment-5688372349)
+
+* **The supervisor is the SINGLE finalizing owner and the exit watcher's exit can no longer
+  manufacture the hangup** (round-10 item 1).  **Superseded by OS-48: no hangup is ever a
+  proof; the watcher HOLDS the owner slave reference, writes the fence marker after its
+  `waitpid`, and the release is TWO-PHASE (RELEASE marker -> `release.<inc>` record -> close);
+  `_await_drain_handoff` and `POST_EXIT_SETTLE_MS` no longer exist.**  Historical text follows.  On darwin a session leader's exit REVOKES the
+  controlling tty and DISCARDS the master's unread tail -- empirically reproduced on this
+  host (`artifacts/runs/.../evidence/repro/`): the pre-fix topology, watcher exiting the
+  instant it wrote the sentinel, left the supervisor's drain reading `[EOF]` with the tail
+  gone, so a success record followed by a lost final failure record settled
+  `COMPLETED/succeeded`.  The pre-fix darwin finality proof therefore stood entirely on that
+  revoke-manufactured hangup.  Now the supervisor-alive exit watcher DEFERS its own exit on a
+  drain-handoff pipe (`dh_r`/`dh_w`; the watcher blocks in `_await_drain_handoff` after
+  writing the sentinel, keeping the session-leader tty alive), and the supervisor drains the
+  WHOLE tail while the tty is alive.  The drain still ends only on the HANGUP -- the round-8/9
+  contract that silence never ends it is unchanged: on Linux the slave's own close gives EOF /
+  `EIO`; on darwin the supervisor, once the master has been QUIET for `POST_EXIT_SETTLE_MS`
+  after the proven exit (the tail is drained and no byte can still originate), RELEASES the
+  watcher (`_signal_drain_handoff`, and `_reclaim` / `release` release it too), whose exit
+  then delivers a REAL post-drain hangup.  So the revoke can no longer truncate the tail --
+  the tail is drained before it -- yet the proof still stands on the hangup, never on silence.
+  The watcher writes no proof in the supervisor-alive path, so a supervisor killed before its
+  proof still leaves none and a successor still refuses `stream_end_unproven`.
+  Locked by `test_os37_round10_review_regressions.py::Item1MacOSLostTailTests` and the
+  crash-cut locks of `::Finding1SupervisorCrashCutTests` (round 9), which stay green.
+
+* **`unreadable` slave-holder authority is never collapsed into absence** (round-10 item 2).
+  **OS-48: `_slave_holders` / `_slave_holder_state` are DIAGNOSTIC only; the states are
+  `present` / `none_observed` / `unreadable` (the word "proven" does not occur); the
+  non-positive `killpg` guard is retained.**
+  `standalone_pty._slave_holders` records whether each probe COMPLETED and
+  `_slave_holder_state` is a tri-state: `present` / `none_observed` / `unreadable`.  A failed
+  `tcgetpgrp`, an unreadable `/proc`, or a skipped `/proc/<pid>/fd` entry is `unreadable` with
+  the failed authority NAMED, and only a COMPLETE positive absence proof yields `proven`.
+  `tcgetpgrp() <= 0` is "no usable foreground group" (a complete positive absence on that
+  axis), never a `killpg(0, 0)`.  Locked by
+  `test_os37_round10_review_regressions.py::Item2SlaveHolderTriStateTests`.
+
+* **A torn authority-upgrade log tail no longer blocks recovery** (round-10 item 3).
+  `read_authority_upgrade_records` consumes only newline-terminated records and quarantines
+  ONLY the final unterminated fragment (recorded in a `.torn` sibling); a complete corrupt
+  record still RAISES.  Locked by
+  `test_os37_round10_review_regressions.py::Item3TornUpgradeTailTests`.
+
+* **Explicit prompt migration does not pre-publish the composition** (round-10 item 4).
+  `migrate_standalone_prompt_composition` no longer persists the composition before the
+  two-phase writer; `_write_upgraded_legacy_authority` (`prepared -> persist/rebind ->
+  committed`) is the ONLY publication path, so a crash can no longer leave a composition on
+  disk with no `prepared` record for the automatic path to complete as
+  `composition_source=persisted, actor=""`.  Actor/reason are preserved across every crash cut
+  and on replay.  Locked by
+  `test_os37_round10_review_regressions.py::Item4NoPrePublicationTests`.
+
+* **Same-boundary follow-ups.**  (a) `_watch` re-checks the supervisor guard after reaping the
+  agent, so a simultaneous agent-exit and supervisor-death never skip orphan finalization.
+  (b) `recover_handle`'s exit-evidence wait is derived from the run profile's
+  `post_exit_drain_budget_ms` (`_exit_evidence_budget_ms`), not the fixed 3.5 s constant.
+  (c) `tcgetpgrp() <= 0` never triggers `killpg(0, 0)`.
+
+## OS-48 -- positive PTY capture finality and execution ownership authority (run_f820764749d6)
+
+Supersedes the round-8/9/10 finality model above (the historical bullets are kept, each
+marked).  Design: `artifacts/runs/run_f820764749d6/DESIGN.md` (topology A).  Measured facts:
+`evidence/analysis/` (probe_01..14) and `evidence/design/` (probe_d1..d15) of that run.
+
+* **The finality fact is POSITIVE and in-band.**  The exit watcher (session leader, the agent's
+  PARENT) keeps ONE slave descriptor -- the *owner-held slave reference* -- for the life of the
+  dispatch, so the kernel never reclaims the master's unread tail and nobody can manufacture an
+  EOF (darwin discards the tail ~0.5-0.7 s after the LAST slave close, measured; Linux retains
+  it and reads `EIO`).  After `waitpid` reaps the pinned root it writes the FENCE MARKER
+  `\n<<OS48-FENCE <nonce>>>\n` (the nonce minted by the supervisor before the spawn,
+  `PtySession.fence_nonce`) into that slave, then the exit sentinel.  The marker's offset in the
+  capture is the boundary **N**; the settlement window is `[baseline, N)`; every byte after N is
+  a DIAGNOSTIC tail.  The supervisor's `drain_after_exit` drains TO THE MARKER (ends `marker` |
+  `budget` | `master_unreadable` | `marker_inconsistent`; silence never ends it) and publishes
+  the fence `capture.log.fence.<inc>.json` (`os48.capture_fence.v1`: `boundary.offset_n`,
+  `marker_len`, `marker_nonce`, `sha256_prefix = sha256(capture[0,N))`, `exit`, `owner`,
+  `provenance`) with a link-EXCLUSIVE tmp+fsync+link publication -- a fence is never
+  overwritten; a later actor VERIFIES it (`fence_matches`: prefix digest + sentinel agreement).
+  `_stream_is_final` holds ONLY for a verified fence (`finality: capture_finalized`).  A legacy
+  `os37.capture_finalized.v1` record is refused by name (`legacy_finalized_record`).  Named
+  non-successes: `boundary_unproven`, `fence_missing`, `fence_mismatch`, `fence_foreign`,
+  `exit_unproven` (all LOST); a hangup / EOF proves nothing.
+
+* **Settlement rules over `[baseline, N)`** (`_Driver.select_completion`, R1-R3): **R1 refusal
+  dominance** -- any declared error record, structured auth marker or free-text refusal in the
+  window ⇒ FAILED `refusal_in_boundary`, whatever its position; **R2 exactly one** declared
+  completion record ⇒ else `provenance_ambiguous` (LOST); **R3 the dispatch binding**
+  (`CompletionSelector.binding_mode`, REQUIRED in every profile spec: `session_field` -- Claude
+  `result.session_id == minted`; `sidecar_file` -- Codex `-o` sidecar present + `thread_id` on
+  the record or its most recent `thread.started` carrier; `single_record_optin` -- fixtures
+  only; an empty / mismatched / unreadable bound ⇒ `provenance_unbound`, LOST).  A bound
+  success by ANY member of the supervised subtree inside the window is legitimate (N-002); a
+  completion record after N is diagnostic, never settlement.
+
+* **Two-phase release and the retained diagnostic tail** (AC-9).  `_reclaim` runs
+  `_release_two_phase`: release-1 (`R` byte) -> the watcher writes `\n<<OS48-RELEASE
+  <nonce>>>\n`; the supervisor drains to R and publishes `capture.log.release.<inc>.json`
+  (`os48.release_boundary.v1`: `offset_r`, `retained_tail_bytes`, `retained_tail_sha256`,
+  `custodian`); release-2 (`C` byte) -> the watcher closes its slave reference; the supervisor
+  reads to EOF/EIO (diagnostic).  Every acknowledged pre-R byte is retained; a release the
+  watcher could not serve is NAMED `diagnostic_tail_unaccounted` (+ `release_record_missing`),
+  never a silent loss, and never touches `[0, N)`.  `reap_leader` drains the master while it
+  waits (a leader exiting with pending output wedges in `E` otherwise).
+
+* **Finalizer ownership is a witnessed generation chain.**  `owner.<inc>.g<n>`
+  (`os48.finalizer_owner.v1`, exclusive link) names who may publish: the supervisor claims g1
+  at the marker (`owner_conflict` if it loses); a fence ends every claim (fence-first,
+  `fence_published_no_claim`); guard EOF is *relinquishment-or-death* and NEVER authorises a
+  claim by itself (`succession_unwitnessed`) -- a claim needs the owner's durable
+  `relinquish.<inc>.g<n>` record (written by `release()` for a generation it will not finish)
+  or the incarnation-bound parent-death witness (darwin `kqueue NOTE_EXIT` on the pinned
+  pid+start identity, ESRCH at registration = already dead, a zombie is `absent`; Linux
+  `pidfd_open` / `/proc` state `Z`); a claim is bound to the pinned predecessor (`claim_target`
+  = predecessor+1, `validate_claim`), a live highest owner is `finalizer_alive`, an unreadable
+  one `identity_unreadable`.  The orphan watcher (supervisor dead) finishes the publication
+  itself -- drain to marker, claim, fence, RELEASE, record, close -- and leaves a durable
+  `capture.log.orphan.<inc>.json` note naming its outcome; without a claim it still performs
+  the release as custodian.  A masterless successor (`_fence_from_disk`) waits fence-first for
+  the marker, publishes from a captured marker only with a proven exit and an absent /
+  relinquished / dead owner, and re-evaluates a lost claim race until the winner's fence appears.
+  Crash cuts C1-C9 / RC1-RC4 (DESIGN §1.7) each yield the same N/digest or a named outcome.
+
+* **Execution ownership is bound to an incarnation, never a pid.**  Spawn records and rows carry
+  `proc_start_ticks` + `boot_id` (REQUIRED axes: `verify` is `unverifiable: identity_unreadable`
+  without them, `not_owned: identity_changed` on a mismatch; `read_identity` reads them at
+  decision time: `final` / `absent` (ESRCH or zombie) / `unreadable`).  The agent is signalled
+  ONLY through the watcher's control socket (`request_watcher_signal`: `sent` before its reap,
+  `refused:signal_target_reaped` after, `refused:signal_unbound` for a foreign fence) -- the
+  same single thread reaps and delivers, so a pre-reap request cannot hit a recycled pid; a
+  darwin non-child is `signal_unbound` (no signal); Linux descendants go through a pidfd.
+  `may_killpg` always refuses (`group_signal_refused`): group teardown is the kernel's own
+  SIGHUP at controlling-tty revoke (measured on both platforms); members outside the group are
+  reported `descendants_unreaped`.  The Linux watcher is a `PR_SET_CHILD_SUBREAPER` that never
+  consumes the pinned root's own status (`waitid(WNOWAIT)` peek).
+
+* **Diagnostics are diagnostics.**  `slave_device_holders` (libproc) and `_slave_holders` (tty
+  table) survive with states `present` / `unreadable` / `none_observed`; denied, short and
+  stale (revoked ENOENT) reads are `unreadable` by name; no decision function calls them (a
+  static + mutation lock).  The journal records `holders_diagnostic`, `diagnostic_tail_bytes`,
+  `path_opener_indistinguishable` (residual O-10) beside the fence.
+
+* **Iteration 2 corrections (REVIEW_IMPLEMENTATION.md F-001..F-007).**  (F-001) every
+  settlement extraction, parser input, fallback and settled digest reads the AUTHORITATIVE
+  interval `[baseline, N)` (`StandaloneSession._authoritative_text`), and the `-o` sidecar is
+  FROZEN when the fence binds (its digest travels in the fence's `sidecar` field; a sidecar that
+  no longer matches is `evidence_inconsistent`); the journal's `result_body_provenance.interval`
+  names the interval and its sha256.  (F-002) the orphan watcher's death witness is bound to the
+  incarnation it was registered on (`_ParentWitness.covers`); when the highest owner is a
+  different incarnation the watcher obtains per-pid evidence for THAT owner (`absent` = positively
+  gone, alive = `finalizer_alive`, unreadable = `identity_unreadable`) -- a witness for g1 never
+  supersedes a live g2, and `may_claim_generation` refuses a positively live owner before any
+  witness is consulted.  (F-003) the RELEASE marker is written at most once per nonce (a served
+  release-1 is REUSED by the orphan path); `verify_release_record` joins the record to the fence
+  file digest, the nonce, R in the capture and the retained-tail digest; an adopted session
+  verifies or RECOVERS the release boundary (`successor_from_capture`) and names
+  `release_record_missing` / `diagnostic_tail_unaccounted`; a failed publication (ENOSPC) is never
+  `final`.  (F-004) a positive partial fill is named: the pid table is checked against a fresh
+  count (kernel slack 20 + churn tolerance) and the scanner's own pid (`listallpids_partial`),
+  and an fd listing is cross-checked by an independent per-index walk of the fd table
+  (`listing_partial_fill`); a table too large to walk is `fd_walk_unbounded`.  (F-005) NO claim
+  and NO fence without positive complete identities (pid > 0, start_id > 0, boot id) for the
+  owner, the emitter and the reaper (`identity.identity_complete`; the watcher's identity is
+  pinned at spawn as `watcher_start_id`); `fence_matches` refuses a fence carrying an
+  unreadable identity (`identity_unreadable`).  (F-006) the positive membership ledger
+  `members.<inc>.jsonl` (`os48.member.v1`: identity with start id, role `agent` / `descendant`,
+  `observed_via`, `pgid`, `observed` / `exited` events) is written by the watcher -- darwin:
+  kqueue `NOTE_FORK|NOTE_EXIT` on every member triggering a bounded `ppid == member` walk of
+  `proc_listallpids` + BSDINFO (plus an initial and a ~1 s periodic walk), Linux: subreaper
+  reaps + a `/proc` ppid walk on SIGCHLD; `_reclaim` re-reads every member's pinned identity and
+  journals `descendants_unreaped` (alive members) / `unknown` (unreadable) -- no member is ever
+  signalled.  (F-007) `scripts/test_os48_crash_cuts.py` SIGKILLs a real supervisor / watcher at
+  deterministic pause seams for C1-C9 and RC1-RC3 with concurrent successors, and
+  `scripts/test_os48_review_i1_locks.py` re-runs every reviewer construction through the real
+  callers; scheduling sleeps in the post-N locks are replaced by handshakes.
+
+* **Iteration 3 corrections (REVIEW_IMPLEMENTATION_iteration2.md F-001/F-004/F-006/F-007).**
+  (F-001 -- *superseded by the iteration-4 correction below*: the reap-step read fixes the
+  sidecar's PRESENCE fact, not its content; a helper write between that read and the marker
+  is still inside N, so the snapshot bytes are no longer a settlement body source.)  The
+  declared `-o` sidecar is read, digested and snapshotted by the EXIT WATCHER in its reap step
+  (`snapshot_sidecar` -> `capture.log.sidecar.<inc>.json` + `.bytes`, link-exclusive; instant
+  `reap_step_before_marker`).  The fence's `sidecar` field is that snapshot (`present` /
+  `absent` / `sidecar_unreadable` / `sidecar_unproven`), never a digest sampled after N; a
+  sidecar the fence did not prove is refused by name
+  (`result_body_provenance.sidecar_refused = sidecar_unproven`) on the supervisor, orphan and
+  adoption paths.  (F-004) `_libproc_list_all_pids` claims completeness only from an INDEPENDENT
+  kernel enumeration (`sysctl kern.proc.all`, taken before and after the fill): any pid present in
+  both walks and absent from the fill is `listallpids_partial`; an unreadable walk is
+  `listallpids_crosscheck_unreadable`; no deficit tolerance and no single anchor; an unreadable
+  fd-table size makes the fd cross-check `fd_table_size_unreadable`, never clean.  (F-006)
+  members are keyed by incarnation `(pid, start_id)`; a child is attributed only to a parent
+  member whose identity re-read NOW equals the recorded one (or a zombie still holding that pid);
+  exited / stale / reused parents attribute nothing; the ledger's readability is part of the
+  answer (`read_ledger`: unreadable / torn; `members.<inc>.state.json` accounts every append) --
+  `membership_unreadable` with explicit `unknown` accounting, never "zero members".  (F-007) the
+  RC2 cut is taken at the real tmp-fsynced -> link boundary (`standalone_capture._LINK_HOOK`, a
+  test-only seam) on the supervisor and orphan-watcher paths, with the boundary state asserted
+  and simultaneous recovery without deleting a winner (`test_os48_review_i2_locks`).
+
+* **Iteration 4 corrections (REVIEW_IMPLEMENTATION_iteration3.md F-001/F-004/F-006/F-008).**
+  (F-001) DESIGN defines ONE boundary -- the marker's stream offset N (§1.2 "authoritative
+  boundary = the root's reaped exit materialised as the fence marker"; §1.4 R3 "sidecar present
+  **and** field == bound_value ... absent / unreadable -> `provenance_unbound`") and no
+  auxiliary-content boundary, so sidecar CONTENT is refused as a settlement body source by name
+  (`result_body_provenance.sidecar_refused = sidecar_unproven`; `result_body(allow_path=False)`;
+  bodies come only from in-stream records -- the installed Codex profile reads
+  `item.completed` / `agent_message` / `item.text`, measured by the real codex smoke), and R3's
+  presence fact is the IMMUTABLE fence snapshot taken by the owner in the reap step (recorded
+  with its instant `reap_step_before_marker`): a sidecar created, removed or resized after N
+  never changes a verdict on the supervisor, orphan or adoption path.  (F-004) PID enumeration
+  completeness requires EXACT agreement of the independent walk before the fill, the fill and
+  the walk after; any other disagreement is `listallpids_unstable` (a missed entry present in
+  both walks: `listallpids_partial`); an intersection is never completeness.  (F-006) the ledger's
+  readable content is joined to the durable append count (`members.<inc>.state.json`) and re-read
+  once: a whole-line prefix shorter than `appended`, or accounting/content that changes between
+  the reads, is `membership_unreadable` with the unknown remainder (`read` / `appended`) named.
+  (F-008) `snapshot_sidecar` distinguishes ENOENT (`absent`, positive) from any other open/read
+  failure (`sidecar_unreadable`, errno recorded); neither approves a `sidecar_file` binding.
+
+* **Iteration 5 corrections (REVIEW_IMPLEMENTATION_iteration4.md F-009, N-001).**  (F-009)
+  `_Membership.discover` never turns unreadable evidence into an empty candidate list: a process
+  listing that fails (`listallpids_*` on darwin, a denied `/proc` on Linux) or will not settle,
+  and a live candidate whose identity no source will read (darwin consults the independent
+  `kern.proc.pid` read before giving up), are accounted SEPARATELY from the appends -- a
+  `discovery_unreadable` ledger record (kind / reason / trigger / pids) and a `discovery` block
+  (`passes`, `listing_unreadable`, `listing_unstable`, `candidates_unreadable`, `reasons`,
+  `pids`) in `members.<inc>.state.json`.  `membership_residual()` joins both into the named
+  outcome `descendants_unknown` (dominated by `membership_unreadable` when the ledger itself is
+  unreadable / short), keeps the positive set, and `_reclaim` journals a `descendants_unreaped`
+  row over it; nothing unknown is signalled; the capture fence stays valid (a G2 accounting
+  residual, not a capture failure); the accounting persists for an adopting successor.  (N-001)
+  the sidecar snapshot is documented as the reap-step PRESENCE fact only.
+
+* **Iteration 6 corrections (REVIEW_IMPLEMENTATION_iteration5.md F-010, F-011, N-001).**
+  (F-010) a POSITIVE kernel fork whose child cannot be attributed is never silently clean:
+  `serve` runs the fork-triggered walk BEFORE marking exits and hands `discover` the member
+  pids whose NOTE_FORK it served; a fork event that no child attributed to that parent IN THAT
+  CALL discharges (the child already exited -- possibly after forking -- or was reparented
+  because its parent exited first, e.g. NOTE_FORK|NOTE_EXIT delivered together) is a durable
+  `discovery_unreadable` record of kind `fork_unattributed` carrying the parent identity and
+  the kernel event (`fflags`, `parent_exited`, `parent_presence`), counted as
+  `forks_unattributed`; the residual is `descendants_unknown` with the fork named, on the
+  supervisor and adopting-successor paths; the positive set is kept, nothing unknown is
+  signalled, the fence stays valid.  Discharge is fail-closed: a child a periodic walk
+  happened to attribute just before the event was served is NOT credited (a spurious UNKNOWN,
+  never a spurious clean), and kqueue's coalescing of repeated forks into one event means one
+  attributed child discharges the event it was served with.  On Linux there are no fork
+  events; the same cut is attributed POSITIVELY because the watcher is a subreaper and the
+  orphaned helper reparents to it (`subreaper_reparent`), and a `release_wait` walk (1 s) runs
+  while the watcher waits for the release on both platforms.  The worker's own adversarial
+  pass named every other path where a positive event or a readable observation could drop a
+  live descendant: a member whose fork/exit watch could not be registered
+  (`fork_watch_unregistered`, e.g. gone before the kqueue add), no kqueue at all
+  (`fork_watch_unavailable`), an unreadable kqueue read (`fork_events_unreadable`, once per
+  error), a positively attributed descendant the ledger ceiling would not hold
+  (`member_ceiling_exceeded`), and a candidate whose parent member no identity source will
+  re-read while the kernel still holds the pid (`parent_identity_unreadable`; `_live_member_for`
+  is tri-state: attributable / positively refused / unreadable).  Remaining, documented
+  limit (DESIGN §2.2 "discovery may MISS"): a fork by a process in the window between its
+  birth and the registration of its watch leaves no kernel evidence and is not accounted.
+  (F-011) the OS-42 historical-artifact lock protects EVERY settled run on disk, tracked or
+  not; only runs that are POSITIVELY active -- an unreleased OS-44 coordinator-session binding
+  (`coordinator_session/*.json`, `released_at: null`), the hard-coded OS-42 run, or an explicit
+  `OS42_ACTIVE_RUN_IDS` allow-list -- are excluded; mutation controls cover an untracked
+  settled change and deletion (detected), an active-run evidence append (excluded) and a
+  released binding (protected again).  (N-001) the last inline "after this read is after N"
+  comment is replaced by the presence-fact wording.
+
+* **Iteration 7 corrections (REVIEW_IMPLEMENTATION_iteration6.md F-010 / F-011 / F-012 /
+  F-013) -- the CONSERVATIVE descendant model.**  Six successive reviews found a path where
+  discovery promoted uncertainty to a clean result; the model is now the other way round: the
+  residual is UNKNOWN by default and only an enumerated set of POSITIVE facts contributes --
+  P1 the spawn record (the root's pid + start identity, the watcher's own child); P2 the root's
+  fork/exit watch registered BEFORE its exec (`spawn` holds the not-yet-exec'd child on a gate
+  pipe until the watcher's kqueue add has returned -- the pre-exec child never forks, so the
+  root has no pre-registration window; a failed add is the named `fork_watch_gap`); P3 a
+  candidate whose ppid is a member whose CURRENT start identity re-read now equals the
+  recorded one (a held zombie / unreadable pid is NOT a witness of the cached incarnation --
+  the iteration-6 held-zombie exception is gone, F-012); P4 Linux: a candidate whose ppid is
+  the watcher itself (the subreaper's adopted child) is a positive member candidate whatever
+  its own start readability -- an unreadable (zero) start is `candidate_identity_unreadable`,
+  named by pid, never omitted (F-013); P5 a member's exit observed by the watcher.  Every
+  non-positive observation is a durable `discovery_unreadable` record that NO later
+  observation discharges: `fork_coalesced` (a NOTE_FORK on a member -- coalesced, it proves
+  "at least one fork", never the set of children; F-010: attributing one child does not clear
+  it), `fork_watch_gap` (the root without P2; EVERY descendant, whose watch is registered
+  after its birth), `parent_identity_unreadable`, `candidate_identity_unreadable`,
+  `listing_unreadable` / `listing_unstable`, `fork_watch_unregistered`,
+  `fork_watch_unavailable`, `fork_events_unreadable`, `member_ceiling_exceeded`, and
+  `watch_ended` (members still alive when the watcher stopped observing).  Consequence: a
+  darwin dispatch is clean only when its root, under a pre-exec watch, never forked; a root
+  that forked is `descendants_unknown` with its positively attributed members listed alive --
+  acceptable per DESIGN §2.2 (a smaller positive set; absence stays unknown and is reported;
+  nothing unknown is ever signalled; the fence stays valid).  On Linux there are no fork
+  events and the subreaper is the positive mechanism; the pre-reclaim residual of a
+  non-forking or fully attributed tree is clean.  (F-011) the OS-42 historical-artifact
+  lock's active set is ONLY what the invocation names -- `OS42_ACTIVE_RUN_IDS`, the hard-coded
+  OS-42 run, or a run whose `coordinator_session` binding names THIS process's own
+  `CLAUDE_CODE_SESSION_ID` and is unreleased; an unreleased binding of any OTHER session is
+  never evidence of activity (a coordinator that died after a terminal checkpoint leaves one);
+  exclusion is by the ROOT run-directory component only.  A lane run inside an orchestrated
+  worktree must name its run (`OS42_ACTIVE_RUN_IDS=<run> python3 -m scripts.ci_lane ...`).
+
+* **Iteration 8 corrections (REVIEW_IMPLEMENTATION_iteration7.md F-011 / F-014 / F-015 /
+  F-016, N-002).**  (F-015, capture finality) R1/R2 are decided over MORE than the parsable
+  records: every run of lines in `[baseline, N)` that does not parse as a record is scanned
+  for embedded balanced JSON objects (`standalone_capture.embedded_objects` /
+  `unparsable_runs`; string- and escape-aware); an object of a declared completion type or
+  carrying a refusal marker (its declared `error_field`, `is_error`, a structured auth
+  marker) is a `framing_candidate` (`standalone_drivers.framing_candidates`): a refusing one
+  is a refusal under R1 (`refusal_in_boundary`, FAILED); any other makes "exactly one"
+  unprovable -- `record_framing_ambiguous` (LOST, registered in `LOST_REASONS` /
+  `OS48_LOST_OUTCOMES`), never COMPLETED.  A cooperative helper's `progress: ` prefix on the
+  root's own refusal, a suffix, and a record split across lines are all covered; prose braces
+  that hold no completion-shaped object do not widen the candidates; the fenced byte prefix
+  is untouched.  This stays inside DESIGN §1.4 R1/R2 (it widens what counts as a candidate
+  and refuses on ambiguity) and does not weaken AC-4.  (F-014, Linux ownership)
+  `PR_SET_CHILD_SUBREAPER` is installed AND verified (`PR_GET_CHILD_SUBREAPER` reads back 1)
+  by `_set_subreaper` inside `_register_root_watch`, i.e. BEFORE `spawn`'s gate releases the
+  root, and its RECEIPT (`"subreaper"`) travels as `root_watch`; a failed / unverifiable
+  setup is the durable `ownership_setup_unverified:<why>` record (`unobservable`) for the whole
+  dispatch and the residual is `descendants_unknown` (`discovery=unwatched`); the string
+  "linux" is no longer a receipt.  The reviewer's delayed-setup cut can no longer start a
+  root at all (the gate holds it; the leader refuses the spawn by name).  (F-016, Linux
+  identity) (pid, start tick) is not injective at tick granularity, so every positively
+  attributed Linux member holds a FIXED object -- a `pidfd_open` descriptor kept from
+  attribution until the member is observed exiting; `_live_member_for` asks the pidfd
+  (`alive` = the pid is still exactly that process; `exited` = P5 through the fixed object;
+  no pidfd = unreadable), never (pid, tick) equality; the watcher polls the held pidfds for
+  exits (`serve`, and the select loop wakes on them); members are LIFETIMES `(pid, start,
+  n)`: a live process presenting the key of an EXITED lifetime is a new lifetime (attributed
+  on its own parentage, own pidfd), and a cached UNEXITED tuple whose pidfd has died is
+  marked exited and never adopts another process's child; a member without a pidfd is
+  `pidfd_unavailable` (unknown).  The supervisor-side reader keeps one residual entry per
+  lifetime and states `lifetime_binding: tick_granular` where two lifetimes share a key.  On
+  darwin the start identity is µs-granular and pinned by kqueue NOTE_EXIT on the watched pid
+  (`fixed_object: kqueue_note_exit`); no pidfd exists there and that is stated in the record.
+  (F-011) the OS-42 historical lock's active set is ONLY the explicit invocation scope
+  (`OS42_ACTIVE_RUN_IDS`) or a POSITIVE live-writer fact -- a run whose workflow checkpoint is
+  present with a non-terminal `run_status` AND whose session binding is unreleased (both
+  required); no hard-coded legacy run, no session cookie (a cookie names a run, it is not a
+  writer); root-directory exclusion in the lock and in every correction lock.  (N-002) the
+  real-CLI harness's exit code is a receipt of its roll-up (0 = PASS + verified evidence, 2 =
+  PARTIAL / FLAKY / FAIL / NOT ESTABLISHED, 3 = evidence unverified) and the summary names the
+  workload outcome separately from the adapter settlement claims.
+
+* **Follow-up run corrections (REVIEW_IMPLEMENTATION_iteration8.md F-015 / F-016, run
+  `run_5fcd2beac376`).**  (F-015, capture finality) the framing scan is a BOUNDED NESTED
+  traversal (`standalone_capture.embedded_scan` / `walk_nested_objects` / `ScanBudget`:
+  `EMBEDDED_SCAN_OBJECT_LIMIT` objects examined, `EMBEDDED_SCAN_DEPTH_LIMIT` nesting,
+  `EMBEDDED_SCAN_BYTE_BUDGET` characters visited, shared across the whole fenced range): every
+  object nested inside an embedded object -- and inside EVERY parsable line, whatever its
+  outer `type` (iteration 2, REVIEW_IMPLEMENTATION.md F-015: a declared readiness / delivery /
+  body / completion type on the container -- Claude `system` / `assistant`, Codex
+  `thread.started` / `item.completed` -- is NO exemption; a helper can open such a wrapper
+  around the root's record exactly as it can open `{"progress": `) -- is examined; the outer
+  record itself stays a record judged by R1/R2, only what it HOLDS is a candidate; a JSON string
+  literal's contents are never a record.  A nested object is a refusal only through a
+  POSITIVE rule (its declared completion type's `error_field`, a declared auth marker); a
+  nested generic `is_error` (a tool result inside a wrapper, a Codex `item.completed` error
+  item) is data.  A scan that reaches any bound before examining the whole range and found no
+  refusal is the NAMED outcome `record_scan_incomplete` (LOST, registered in `LOST_REASONS` /
+  `OS48_LOST_OUTCOMES`; the journal names the bound hit) -- never "no candidates", never
+  COMPLETED; a refusal the scan did reach still dominates.  (F-017, iteration 2) the line parser
+  itself is total: `standalone_capture.parse_record_line` / `structured_lines` classify a
+  JSON line the interpreter cannot follow (`RecursionError`, native py3.11 at ~1,000 levels) as
+  UNPARSABLE instead of raising, so a plain 5,000-level depth bomb reaches the bounded scan
+  and settles `record_scan_incomplete` (`depth_limit`) through every reader (readiness,
+  refusal evidence, completion selection).  (Iteration 3, REVIEW_IMPLEMENTATION_iteration2
+  F-015 / F-017) the ONE JSON entry point of every reader is `standalone_capture.parse_json`:
+  it parses integers under the reader's own digit budget (`INTEGER_DIGIT_BUDGET` = 4,000; a
+  longer token is kept as an `UnconvertedInteger` digit string, so the object is examined
+  WHOLE and a refusal it carries is recognised -- Python's 4,300-digit `int()` limit, which
+  `json.loads` surfaces as a plain `ValueError` rather than a `JSONDecodeError`, is never
+  reached), and it distinguishes a SYNTAX rejection (`JSONDecodeError`: prose) from a parser
+  that could not EXAMINE the candidate -- `MemoryError` -> `resource_limit`, `RecursionError`
+  -> `depth_limit`, any other `ValueError` -> `conversion_limit` -- raised as the typed
+  `ParseFailure`; such a line is unparsable for the record reader (never a record, never
+  prose) and the embedded scan that re-examines it ends `record_scan_incomplete` with that
+  reason unless its bounded re-parse examined the object whole.  Stated exactly: NOT every
+  parser limit fails closed by itself -- the interpreter's integer limit failed OPEN in
+  iteration 2 -- what fails closed is every failure `parse_json` classifies; a reached
+  refusal still dominates a later failure INSIDE the scan (the iteration-3 tree did NOT yet
+  honour this at the reader site AFTER the selection -- F-017 of `REVIEW_IMPLEMENTATION_iteration3`,
+  corrected in run `run_7859f202457c`, next bullet), and no general OOM / SIGKILL recovery is
+  claimed.  **What R1 "refusal dominance" positively covers,
+  stated exactly:** a declared completion record whose error field is set, a declared auth
+  marker (top-level or nested anywhere), a completion-typed nested object whose error field is
+  set, a top-level embedded object with a truthy `is_error`, and the free-text refusal
+  patterns over prose lines -- each only where the bounded scan REACHED it; it is not a claim
+  that every conceivable refusal-shaped byte sequence inside `[0,N)` is recognised.  The
+  reviewer's 4,096-object exhaustion, the plain-root two-line wrapper (`{"progress": ` + the
+  root's own newline-terminated refusal + `}`), the declared-type one-line wrappers of both
+  installed grammars and the depth bomb all settle FAILED `refusal_in_boundary` / LOST
+  `record_scan_incomplete`, never COMPLETED.  This stays inside DESIGN §1.4 R1/R2: the
+  boundary `[0,N)` is unchanged, only what the scan examines inside it and what an unfinished
+  scan is allowed to mean.  (F-016, Linux identity) a pidfd acquired for a candidate may bind a
+  different birth than the one the pre-acquisition `/proc` reads described (the reviewer's
+  same-tick foreign peer): `_Membership._add` now re-reads identity AND parentage AFTER the
+  fixed object is held, polls the pidfd after the re-read (alive -> the read was of the bound
+  process), and re-checks the parent member's own fixed object; only the proven same
+  incarnation is admitted -- anything else is the named `candidate_identity_unverified:<why>`
+  (state counter `candidates_unverified`, residual `descendants_unknown`) and NOT a member; a
+  descendant whose pidfd cannot be obtained is `pidfd_unavailable` and NOT a member (the agent,
+  bound by the watcher's own `waitpid`, is the one exception).  A reader with NO held pidfd
+  (the supervisor's `membership_residual`; recovery after the watcher died) never reports a
+  Linux lifetime alive from (pid, start tick) equality: the watcher records the member's pidfs
+  inode as `fixed_object_id` TOGETHER with the inode lifetime MODEL it is valid under
+  (`fixed_object_model`), and ONLY under the one model this runtime can positively vouch for
+  (iteration 2, F-016; `standalone_pty.pidfs_lifetime_model`): a 64-bit Linux kernel at or
+  after 6.9, where the inspected primary sources (v6.12 `fs/pidfs.c` + `kernel/pid.c`, v6.16
+  `fs/pidfs.c`) assign `i_ino` from the monotonic 64-bit `struct pid` counter and never reuse
+  it for the life of the boot.  The 32-bit branches are NOT such a binding (v6.12 allocates
+  the number with `ida_alloc_range` and frees it on inode eviction -- a later different birth
+  may receive it; v6.16 exposes only the lower 32 bits plus a generation `st_ino` cannot
+  show), and a kernel before 6.9 has one shared anonymous pidfd inode; under any such model
+  the watcher records no binding and the reader answers UNKNOWN.  The reader
+  (`standalone_pty.pidfd_binding`) compares a fresh pidfd's inode only when the recorded model
+  equals the model it establishes on its own kernel: equal -> `lifetime_binding: pidfs_inode`
+  (alive, `binding_model` named); different -> `pidfs_inode_mismatch` (that incarnation is
+  positively gone); no inode on either side, no recorded model (an iteration-1 row), or a model
+  the reader cannot re-establish -> `pid_tick_unverified` with `binding_detail`
+  (`no_recorded_fixed_object_id` / `binding_model:unproven` / `binding_model:mismatch:…` /
+  `reader_binding:…`), an `unknown` entry and `descendants_unknown` (`tick_granular` is replaced
+  by `lifetime_siblings` + the binding).  Distinct self/member inode values alone prove
+  nothing about reuse.  (Iteration 3, F-016 -- the BOOT JOIN) every one of those bindings is
+  boot-scoped -- the start tick counts from boot, the pidfs inode counter (`pidfs_ino` /
+  `pidfs_ino_nr`, v6.9..v6.16) restarts on every boot, darwin's start time is a re-read --
+  so before ANY of them can say "the same incarnation" the reader joins the ledger's recorded
+  `identity.boot_id` to its own current boot id (DESIGN §2.1's boot identity axis): both
+  must be readable (non-empty) AND equal (`boot_joined: true`); a missing recorded boot, an
+  unreadable current boot, or a different boot is `unknown` `boot_unjoined` with
+  `binding_detail` `boot_id:unrecorded` / `boot_id:unreadable` / `boot_id:mismatch` and
+  `descendants_unknown` -- never alive (a different boot is reported conservatively as
+  unknown, not turned into a positive "gone" claim), on every platform.  No signal or settlement authority is derived from that reader on any
+  platform.  Darwin is unchanged and states its limitation honestly (N-001): the reader's alive
+  entries carry `lifetime_binding: start_microsecond` with `binding_detail:
+  reread_timestamp_not_fixed_object` -- the kernel's µs start identity RE-READ at decision
+  time (DESIGN §2.1's diagnostic identity axis), not an independently retained fixed object
+  and not the Linux binding guarantee; kqueue NOTE_EXIT pinned only the watcher's own
+  observation of an exit while it lived, it pins nothing for a later reader.  Additive ledger
+  fields (`os48.member.v1` unchanged; a row without `fixed_object_id` + `fixed_object_model`
+  reads as unverified).  Locks: `scripts/test_os48_f015_f016_locks.py` (real-caller F-015 exhaustion /
+  nested / one-line container / string-literal controls; F-016 admission seams, reader binding,
+  real-dispatch binding on both platforms, and the two PID-1 private-namespace same-tick
+  constructions; iteration 2: declared-wrapper locks for the fixture and both installed
+  grammars incl. the CRLF plain-root form, production-caller depth-bomb locks with plain /
+  prose / refusal-first controls, inode-model locks and the source-faithful 32-bit
+  recycling constructions; iteration 3: integer-limit production-caller locks for the fixture
+  and both installed grammars incl. prose / declared-wrapper framing, over-limit progress and
+  string-data controls, the selector factories and the bounded parser's conversion failure;
+  deterministic `MemoryError`-seam locks through the production caller (plain / prose /
+  two-line, refusal-first dominance, normal settlement) and every parser's classification;
+  the boot-join matrix (matching / recorded-missing / current-unreadable / different) over a
+  native own child and the PID-1 boot-counter-reset foreign-peer construction), RED at
+  checkpoint `c8f2747` (and, for each correction round's locks, at the previous round's
+  tree); `test_os48_review_i7_locks` reader lock versioned (`pid_tick_unverified`).
+
+* **Follow-up run correction (REVIEW_IMPLEMENTATION_iteration3.md F-017 / N-003 of
+  `run_5fcd2beac376`, run `run_7859f202457c`).**  (F-017, a SELECTED refusal survives a later
+  reader failure) the iteration-3 `completion()` re-read `[baseline, N)` a second time AFTER
+  `select_completion` had returned, and a `MemoryError` in that second read unconditionally
+  replaced the selection with `record_scan_incomplete` (record `None`, refusal `None`) -- an R1
+  refusal positively established over the verified boundary settled LOST instead of FAILED
+  `refusal_in_boundary`, on darwin and Linux (the reviewer's `probe_reached_refusal_contract`).
+  The second read was REDUNDANT: `completion_evidence` takes the record, provenance outcome and
+  refusal from the selection and never reads its `text` argument when a selection is supplied.
+  The option taken is REMOVAL, not "diagnostic-only": within a SINGLE `completion()` call, with
+  a fence, the range is read exactly once (before the selector) and no further read follows the
+  selector inside that call, so a reader failure there cannot reach the selection; a
+  `MemoryError` BEFORE / INSIDE the selection is still the named `record_scan_incomplete`
+  (`resource_limit`), unchanged.  **(Iteration 2, run `run_7859f202457c`, the REMAINING F-017
+  branch -- the CALLER path.)**  The earlier statement "any read that follows the selection
+  (none today)" was true only WITHIN one `completion()`; the CALLER, `await_completion()`, still
+  read twice.  It calls `completion()` for its initial evidence, and then -- once the exit is
+  proven -- runs the post-exit drain (`drain_after_exit`, which binds and verifies the fence)
+  and calls `completion()` AGAIN, unconditionally discarding the first evidence.  That second
+  scan exists for a legitimate reason: on the ordinary path the fence is NOT yet bound at the
+  initial call, so its first scan carries no selection and the post-drain scan is what settles
+  the dispatch.  But when the fence was ALREADY bound and verified before `await_completion`
+  (a production-drained / adopted session), the initial scan already positively selected over
+  the SAME immutable `[baseline, N)`, and the second scan re-read the identical bytes -- a
+  `MemoryError` in it replaced the selected refusal (or bound completion) with
+  `record_scan_incomplete` → LOST.  Fix: `await_completion` skips the redundant post-drain
+  re-scan precisely when the prior evidence already reached a POSITIVE selection (a refusal, or
+  a bound completion record) over the SAME verified boundary the drain establishes -- equal
+  `offset_n` AND equal fence `sha256_prefix` (`_positive_selection_over_bound_fence`).  A prior
+  scan with no boundary, or over a not-yet-verified / different range, is still superseded by
+  the post-drain scan, so the legitimate pre-fence supersession is preserved.  Stated exactly
+  for the whole caller: with a bound fence, `completion()` reads the range once and nothing in
+  that call follows the selector; and `await_completion()` performs the settlement scan once
+  over a given verified boundary -- it does NOT re-scan a boundary a positive selection was
+  already reached over, so no later reader failure can turn a selected refusal / completion into
+  LOST, COMPLETED or any other outcome (DESIGN §1.4 R1).  Without a fence nothing is selected
+  and the legacy transcript reading remains the driver's only input.  Locks (production spawn +
+  `await_completion` over a real cooperative PTY root writing a bound success then a bound
+  `is_error: true` refusal; the real selector wrapped, never replaced; a deterministic
+  `MemoryError` seam on the read that follows the positive selection -- the reviewer's exact
+  `_authoritative_text` seam and, stronger, ANY `capture.raw` after it; the normal control; the
+  selected-completion counterpart; and the implementation-choice lock that no capture read
+  follows the selection): `scripts/test_os48_f015_f016_locks.py::F017SelectedRefusalDominanceTests`;
+  and, for the caller-path branch (iteration 2), `F017PreBoundAwaitDominanceTests` -- a session
+  the production `drain_after_exit` bound BEFORE `await_completion` (pre-bound refusal fault,
+  pre-bound completion fault, both controls, the re-scan-skipped proof, and the ordinary
+  not-yet-bound supersession path), RED at checkpoint `709cea0` AND on the iteration-1 tree,
+  RED at checkpoint `709cea0` (4 dominance locks LOST, the no-read lock records the read; the
+  control passes on both trees, as a control must), GREEN on darwin and non-root read-only Linux.
+  (N-003, the physical read stated exactly) "only the fenced range is read" / "no whole-capture
+  copy" overstated it: `capture.raw(baseline)` reads the file from `baseline` THROUGH EOF --
+  the fence marker and whatever diagnostic tail has been appended since -- and the reader then
+  slices the returned bytes to `N - baseline`; it is a whole-tail read followed by prefix
+  slicing, not a bounded read of `N - baseline` bytes.  The SEMANTIC rule is unchanged and is
+  the one the locks hold: only the `[baseline, N)` prefix reaches any parser, selector, body
+  extraction, fallback or digest; bytes past N are dropped before any of them runs and can
+  change nothing.  A bounded physical read would only shrink the reader's own allocation and
+  is not implemented here.  *Superseded by the PR #36 corrections below: the physical read IS
+  bounded now, and the whole-file answerability no longer gates a fenced settlement.*
+* **PR #36 consolidated review corrections (issuecomment-5739898842 on head `c9b8d04`, run
+  `run_9af92a7f320d`).**  (1, P1 -- a post-fence diagnostic tail changed a bound settlement)
+  `completion()` checked the WHOLE capture's answerability / integrity and read
+  `capture.raw(baseline)` through EOF, so a ~70 KB diagnostic line written after the fence
+  tripped the store's limit (`line_bytes` / `total_bytes`) and flipped a bound success to
+  `state=LOST lost_reason=capture_truncated has_record=True`, and a tail too large to
+  allocate flipped it to `record_scan_incomplete`.  Now: with a VERIFIED fence the
+  settlement read is ONE bounded read of exactly `N - baseline` bytes
+  (`BoundedCapture.raw(cursor, limit)`; the marker and the tail are never read, allocated or
+  decoded by a settlement), and the answerability a settlement rests on is the fence's own
+  recorded fact about `[0, N)` -- `capture_at_publish` (`answerable`, `lost_reason`,
+  `integrity`, `truncation`, `dropped_bytes`, `total_bytes`), MEASURED by every publisher
+  (supervisor `_publish_fence`, orphan watcher `_orphan_finalize` from its appender state,
+  successor `_successor_attempt`; `capture_state_at_publish` / `fenced_answerability`; the
+  provenance entry `capture_integrity_answerable_at_publish` is listed only when the
+  measurement is positive -- it used to be asserted unmeasured).  Every limit drop, line cut,
+  failed write or meta disagreement AFTER the publish lies past the bytes the fence bound and
+  is recorded as diagnostic evidence only (`evidence.post_boundary`: truncation, dropped
+  bytes, unanswerable cause, size, N, the answerability source); a bound success stays
+  COMPLETED, a bound refusal stays FAILED `refusal_in_boundary`, and a session whose fence is
+  already bound re-verifies it over `[0, N)` (`fence_matches`) instead of re-scanning the
+  whole capture for the marker.  A fence without the fact (published before the field
+  existed) keeps the whole-capture answer in force -- fail-closed, never widened.  **Stated
+  exactly (residual):** a truncation the store recorded BEFORE the publish -- including one
+  a post-N tail caused between the marker and the publication -- is unattributable to a side
+  of N without an offset in the meta (whose v2 key set is closed) and stays fail-closed
+  (`capture_truncated` / `evidence_unreadable` from the fence's own record); only what
+  happens after the publish is proven to be post-N.  (2, P2 -- no prompt-echo provenance)
+  `completion()` looked for `delivery_intent.payload`, which `make_delivery_intent` never sets
+  (the intent carries a digest), so the fenced selector always received an empty event
+  tuple and, under `post_ready_delivery` with ECHO set, the echoed prompt's "not logged in"
+  fired R1 (`FAILED refusal_in_boundary`, source `free_text`), its result-JSON example was a
+  second completion / framing candidate (`provenance_ambiguous` / `record_framing_ambiguous`)
+  -- MEASURED through the real `start` -> `send` -> `await_completion` path.  Now the selector
+  receives `self.delivery_events` (payload + `EchoTransport` + offset, translated to the
+  fenced range's raw-byte coordinates) and `select_completion` excises a PROVEN echo before
+  records, candidates and framing are read (an unproven echo excludes nothing; a negative
+  translated offset is `delivery_before_window`); `evidence.settlement_range` names the
+  baseline, N, the bytes read, the event count and the echo state.  (3, P2 -- the marker
+  write mutated the agent's stdio flags) `_write_marker_bounded` set `O_NONBLOCK` on the
+  watcher's `slave_fd`, the SAME open file description as the agent's 0/1/2 and every
+  descendant's inherited stdio; MEASURED from inside a descendant with the output FIFO held
+  full: 500+ `F_GETFL` samples carrying `O_NONBLOCK` during the retry loop, and the bit still
+  set when the window ended.  Now the FENCE and RELEASE markers go through a descriptor opened
+  SEPARATELY by the slave's device path (`_open_marker_descriptor`: `O_WRONLY | O_NOCTTY |
+  O_NONBLOCK`, `O_CLOEXEC`; its own open file description; closed after the write; the path
+  is the spawn's `slave_name`, or `ttyname(slave_fd)` read at the call) and the owner-held
+  `slave_fd` is never written through and never has a flag changed.  MEASURED on this host:
+  the subtree's flags are invariant before / during / after the write (`L-5`), the marker
+  lands in-band after every agent byte through the new descriptor (256 KiB, sha256-joined to
+  the fence), and the bounded write still lands under a REAL full queue once the supervisor
+  pumps.  The O-3 bound is unchanged; when the path cannot be opened or the bound elapses the
+  marker is unwritten and a successor reads `boundary_unproven` by name -- there is no
+  fallback to mutating the shared description.  (4, P2 -- adoption lost the baseline and the
+  events) `adopt()` left `_settlement_baseline = 0` and `delivery_events = []`, so the same
+  run settled differently live and adopted (MEASURED: live COMPLETED over the excluded echo
+  vs adopted `refusal_in_boundary` from the echo; baseline 71 vs 0).  Now `send()` and the
+  `launch_with_prompt` branch of `run_dispatch` persist both BEFORE the prompt bytes go out as
+  ONE journal row `delivery_recorded` (`derived_from: driver`; closed vocabulary: `baseline`,
+  `delivery_mode`, per-event `index` / `offset` / `payload_sha256` / `payload_bytes` /
+  `transport` / `at` / `echo_proof`).  **No byte of the prompt is written anywhere durable
+  (REVIEW_BUGFIX i1 F-001, iteration 2).**  The iteration-1 candidate additionally wrote
+  `capture.log.delivery.<inc>.json` with every event's full `payload` -- for an `argv` delivery
+  a NEW plaintext copy of a prompt that is not in the capture at all (the reviewer's
+  `plaintext_probe.py`: `secret_in_capture=false, secret_in_delivery_record=true`), against the
+  journal's own rule (`append_delivery_intent`: the prompt DIGEST, never the prompt).  That
+  record no longer exists.  The durable provenance is the `echo_proof` (`os48.echo_proof.v1`,
+  `standalone_lifecycle.echo_proof`, derived from the same evidence the live resolver uses):
+  for an echo-ABSENT transport (`argv`; `pty_write` with ECHO clear) the class `echo_absent`
+  by name with its reason and no forms; for an echo-possible pty write the class
+  `echo_expected` with the sha256 + byte length of EVERY echo form the recorded transport can
+  produce (`expected_echo_forms`); otherwise `echo_unproven` with the derived reason.
+  `adopt()` restores the baseline and one PAYLOAD-LESS event per recorded event (offset,
+  transport, `at`, `echo_proof`); `resolve_delivery_echo` resolves such an event from its
+  proof: `echo_absent` by name (never `no_delivery`); for `echo_expected` a DIGEST-VERIFIED
+  span -- the candidate positions are the occurrences of the frame-start rendering under the
+  recorded transport (a non-secret prefix every form of a framed delivery begins with;
+  `_frame_anchor`), or every position under `ECHO_PROOF_SCAN_BUDGET_BYTES` for an unframed
+  delivery (past the budget: `proof_scan_bounded`, unproven) -- with the same uniqueness rule
+  (two distinct spans -> `ambiguous_multiple_matches`), so live (payload) and adopted (digest)
+  resolve the identical `echo` block: state, reason and spans.  **(Iteration 3,
+  REVIEW_BUGFIX_iteration2 F-002 -- the proof is a CLAIM, the transport is the FACT.)**  The
+  iteration-2 resolver trusted the proof's declared class: a forged `echo_expected` proof on an
+  adopted `argv` event whose digest named agent refusal bytes resolved `echo_proven` and
+  `strip_delivery_echo` removed the refusal before R1 (the reviewer's `forged_proof_probe.py`:
+  `refusal_present_after=false`); the inverse (`echo_absent` on an ECHO-set pty) was trusted too.
+  Now a restored proof is BOUND to what the recorded transport alone permits BEFORE any digest is
+  compared (`standalone_lifecycle.transport_echo_capability`, derived from the transport exactly
+  as `expected_echo_forms` derives it, with no payload; `_bound_proof`): `argv` and an ECHO-clear
+  pty prove ABSENCE and accept only the canonical `echo_absent` proof carrying the transport's own
+  reason (`argv_transport_cannot_echo` / `echo_flag_clear`) and no forms (an ECHO-clear pty with
+  ECHONL+ICANON also accepts the live `echonl_partial_echo` unproven); an ECHO-set pty is
+  echo-POSSIBLE and accepts only `echo_expected` with 1..`TAB_STOP` forms (exactly 1 unless the
+  transport expands tabs), or the live `control_byte_consumed_by_line_discipline` unproven; an
+  unevaluable transport (`transport_kind_unknown` / `termios_unreadable` / `transport_unrecorded`)
+  accepts only its own `echo_unproven` reason.  Every other combination -- `echo_expected` (or any
+  forms-bearing proof) on an absent transport, `echo_absent` on a possible one, a reason the
+  transport cannot have produced, forms on a non-expected class, no forms on `echo_expected`, an
+  impossible form count, an unknown class or schema -- is `echo_unproven` with a NAMED reason
+  (`proof_class_contradicts_transport`, `proof_reason_contradicts_transport`,
+  `proof_forms_contradict_class`, `proof_forms_count_contradicts_transport`, `proof_unrecorded`)
+  and NO span: nothing is excised, R1 sees every agent byte, and live == adopted holds for every
+  transport because the live path records exactly the proof its transport permits.  The
+  reviewer's probe now reports `echo_unproven`, `spans=[]`, `refusal_present_after=true`.  A
+  missing, malformed or non-verifying proof (wrong digest, wrong length, no proof) remains
+  `echo_unproven` / `proof_unrecorded` / `echo_not_found` -- NOTHING is excised, never a wider
+  excision; a row
+  whose event vocabulary is not the closed shape (a `payload` key, say) restores no event and
+  is journalled `delivery_provenance_unrestored` (`delivery_recorded_events_malformed`).  What
+  pty+ECHO keeps, stated exactly: digests of strings whose bytes the line discipline already
+  echoed into `capture.log` when the echo occurred -- MEASURED (L-10): after an ECHO turn the
+  prompt is on disk in exactly one file, the capture itself, and every persisted form digest
+  matches a span of that capture; when no echo occurred the digests match nothing and reveal
+  nothing beyond the digest class the delivery intent already accepts.  The adoption's
+  `identity_bound` row carries `settlement_baseline`, `delivery_events_restored`,
+  `delivery_provenance` (`restored` | the reason).  Live and adopted settlements of one run
+  were, through iteration 3, identical in baseline, delivery provenance, boundary and verdict
+  -- SUPERSEDED by the paragraph that follows.
+  **(run_c296ff67c325 -- REVIEW_BUGFIX_iteration3 F-003, resolved under the USER DECISION that
+  narrows PR36-4; `artifacts/runs/run_c296ff67c325/ORIGINAL_REQUEST.md`.)**  F-003: on an
+  ECHO-set `pty_write` a structurally consistent forged `echo_expected` proof whose one form
+  digest named agent bytes already visible in the capture (`not logged in`) was accepted by the
+  iteration-3 binding (class / reason / form-count only) -- the adoption excised the refusal
+  and settled COMPLETED where live had FAILED (the reviewer's `echo_set_forgery_probe.py`).
+  Root cause: the `delivery_recorded` row is UNKEYED (a same-user writer rewrites it and
+  re-digests it with `record_digest`), so nothing in it can be excision authority without a
+  real authentication authority -- which the decision forbids introducing (no MAC, key or new
+  secret; no new field on existing rows treated as authenticated; no plaintext prompt at rest).
+  The decision instead narrows what adoption is for: *"Adoption does not guarantee the same
+  availability as live.  Adopted success must be narrower than or equal to live success, and
+  adoption may not remove unauthenticated evidence to produce a success verdict."*  Contract
+  now in force: (i) LIVE is unchanged -- `send()` / `run_dispatch` -> `completion()` in the same
+  process excises exactly the echo it observed itself (payload in memory, offset, transport;
+  `resolve_delivery_echo`'s payload leg), nothing wider; (ii) ADOPTED -- `adopt()` ->
+  `_restore_delivery` restores the baseline and one payload-less event per recorded event
+  (offset, transport, `at`), and such an event carries NO excision authority:
+  `resolve_delivery_echo` resolves it STRUCTURALLY from the transport KIND alone
+  (`standalone_lifecycle.unobserved_delivery_echo`) -- `argv` (`launch_with_prompt`) is
+  `echo_absent` / `argv_transport_cannot_echo` because the payload left with the `execve` and
+  never entered the pty input queue; `pty_write` -- ECHO set, ECHO clear, termios unreadable,
+  whatever the row's flags say -- is `echo_unproven` / `payload_unobserved` (a new
+  `ECHO_UNPROVEN_REASONS` member: this process holds no delivered payload, so no span can be
+  proven to be the echo); an unknown kind is `transport_kind_unknown`.  No capture byte is
+  read for such an event, no digest is compared, no span is produced, NOTHING is excised.
+  (iii) The `echo_proof` PRODUCER is removed (`standalone_lifecycle.echo_proof`,
+  `_echo_proof_of`, `_bound_proof`, `transport_echo_capability`, `_frame_anchor`,
+  `_digest_occurrences`, `ECHO_PROOF_*`, `PROOF_CONTRADICTION_REASONS` no longer exist) so no
+  authority-looking field remains for a future reader to trust; the row's closed vocabulary is
+  now `index` / `offset` / `payload_sha256` / `payload_bytes` / `transport` / `at`, and the
+  digest, length and transport that remain are DIAGNOSTIC ONLY (they are never consulted as
+  authority; the transport's kind decides only the `echo_absent` / `echo_unproven` NAME, never
+  an excision).  A row carrying the pre-decision `echo_proof` key is not the closed shape and
+  restores no event (`delivery_provenance_unrestored` / `delivery_recorded_events_malformed`;
+  the selector then sees `no_delivery` and excludes nothing).  (iv) CONSEQUENCE, accepted:
+  adoption is STRICTER than live on an ECHO-set pty -- an ECHO turn live settled COMPLETED
+  after excising its own echo settles, on adoption, FAILED `refusal_in_boundary` when the echoed
+  prompt text carries a refusal-like phrase ("not logged in"), or LOST
+  `record_framing_ambiguous` when it carries a result-JSON example (the echo is a framing
+  candidate); an adopted argv settlement is unchanged (live == adopted); an adopted ECHO-clear
+  or termios-unreadable pty settlement is unchanged in verdict (only its echo NAME is
+  `payload_unobserved`).  What is impossible: an adopted COMPLETED that live would not have
+  produced (`adopted_success` is a subset of `live_success`, on the same settlement record),
+  and any adopted excision at all.  MEASURED matrix (F3-L2, `PR36F003AdoptedSuccessSubsetTests`;
+  live / adopted): argv -- C/C, F/F, C/C, C/C; pty ECHO set -- C/C, F/F, C/F
+  `refusal_in_boundary`, C/L `record_framing_ambiguous`; pty ECHO clear -- C/C, F/F, C/C, C/C;
+  pty termios unreadable -- C/C, F/F, F/F, L/L (columns: clean completion, agent refusal,
+  refusal-like prompt echo + completion, JSON-example prompt echo + completion).  The reviewer's
+  probe now reports `forged_state=echo_unproven`, `forged_spans=[]`, `refusal_after_forged=true`,
+  `actual_echo_after_forged=true` (live unchanged: `echo_proven` at `[0,15]`).  Locks
+  (`scripts/test_os48_pr36_locks.py`, RED at `92d8432`, GREEN after; the i1-i3 locks whose
+  expectation the decision changed are REWRITTEN with a note naming it, none deleted): F3-L1 a
+  structurally complete forged / stale / tampered row -- the reviewer's ECHO-set forged-forms
+  row through the REAL adopt path (92d8432: false COMPLETED), the closed-shape row with its
+  digest re-pointed, the ECHO flag cleared, the termios dropped, the kind rewritten, the
+  genuine pre-decision proof, the argv forgeries of F-002 -- has no effect on adopted excision
+  (spans `[]`, every agent byte survives), plus the resolver reads no capture byte for a
+  restored event; F3-L2 the matrix above; F3-L3 argv live == adopted (L-7 / L-8 / L-9 / L-11 /
+  L-12 retained); F3-L4 `pty_write` + ECHO possible / unreadable -> `echo_unproven` /
+  `payload_unobserved` by name, no span, whatever the row carries (L-13, L-14 rewritten: every
+  proof material inert on every transport); F3-L5 the refusal-like prompt and the result-JSON
+  example settle FAILED / LOST by name on adoption, never COMPLETED; F3-L6 the PR36-1..3 locks,
+  the F-015 / F-016 / F-017 locks and the affected suites unchanged.  Locks (`scripts/test_os48_pr36_locks.py`,
+  every counterexample RED at `c9b8d04`, GREEN after; both copies byte-identical): L-1 the
+  over-limit tail (`line_bytes` and `total_bytes`) after a bound success and after a bound
+  refusal, through the production spawn + `await_completion`, the pre-bound re-await and a
+  masterless successor, plus the whole-tail allocation seam; L-2 the read seam (ONE read at
+  `baseline` of `N - baseline` bytes, none past N; the physical `read(limit)`); L-3 the ECHO
+  turn through the real `start` -> `send` -> `await_completion` (refusal phrase + y/n + JSON
+  example -> COMPLETED; JSON example alone; the agent's own refusal still dominates; the
+  selector unit lock; the `argv` transport reaching the selector as `echo_absent`); L-4 live vs
+  adopted (completion and refusal turns; the durable row + record; the missing-record
+  fail-closed path) through the real `adopt()`; L-5 the descendant's `F_GETFL` samples with a
+  full FIFO, the 256 KiB in-band measurement, the shared-descriptor unit lock; L-6 parity.
+  Iteration 2 (REVIEW_BUGFIX i1 F-001; RED on the iteration-1 tree, GREEN after): L-7 a
+  sentinel secret in a `launch_with_prompt` (argv) prompt is absent from EVERY file under the
+  run's base (the whole tree is scanned) while live and adopted settle identically, through
+  the real `run_dispatch` and the real `adopt()`; L-8 the same with the Orca dispatch preamble
+  shape (capability-token line + task / dispatch ids, multi-line); L-9 an adopted argv event
+  resolves `echo_absent` by name with the live == adopted `echo` block; L-10 for pty+ECHO the
+  prompt is in the capture alone, every persisted form digest matches a capture span, the
+  adoption excises exactly that span, and a wrong digest / wrong length / missing proof or a
+  malformed row is fail-closed by name (plus resolver unit locks: framed / unframed / budget /
+  malformed).  Iteration 3 (F-002; RED on the iteration-2 tree): L-11 a forged `echo_expected`
+  proof on an adopted argv event whose digest names the agent's `not logged in` bytes -- through
+  the real adopt path over a re-digested tampered `delivery_recorded` row -- resolves
+  `echo_unproven` / `proof_class_contradicts_transport`, excises nothing and settles FAILED
+  `refusal_in_boundary` exactly as live; L-12 the same forgery aimed at the bound `result` line
+  keeps the record (COMPLETED == live); L-13 the inverse `echo_absent` proof on the ECHO turn is
+  unproven by name and the unforged row still resolves identically live and adopted; L-14 the
+  resolver matrix -- 17 class x transport x forms contradictions each `echo_unproven` with its
+  named reason and no span, the consistent cases unchanged, the reviewer's probe verbatim.  The
+  OS-37 native stub fixture gains the `agent-script` mode (the turn is a lock-supplied `sh`
+  script; the argv prompt is its second argument) for the real start/send/adopt path.
+  **Known fail-closed limitations (documented, not solved; each answers UNKNOWN / a named
+  non-success, never a positive claim):**
+  - *32-bit Linux and Linux before 6.9* -- no pidfs inode lifetime model this runtime can
+    vouch for (`pidfs_lifetime_model` unproven: the 32-bit branches recycle the number, a
+    pre-6.9 kernel has one shared anonymous pidfd inode); the watcher records no
+    `fixed_object_id` and the pidfd-less recovery reader answers `pid_tick_unverified`
+    (`binding_model:unproven`) -- `unknown`, `descendants_unknown`, never alive.
+  - *darwin recovery identity is a timestamp axis* -- the reader's binding is the kernel's
+    microsecond start time RE-READ at decision time (`start_microsecond`,
+    `reread_timestamp_not_fixed_object`), not an independently retained fixed object; kqueue
+    `NOTE_EXIT` pinned only the live watcher's own observation.  No settlement or signal
+    authority is derived from it.
+  - *no OOM / SIGKILL guarantee outside the settlement reader* -- what is bounded is the
+    settlement READER in `completion()`: an allocation failure before or inside the selection
+    is the named `record_scan_incomplete`, and after the selection there is no read left to
+    fail.  An allocation failure elsewhere in the supervisor process (the fence / release
+    readers, the journal, the typed-result body extraction in `_settle` that runs AFTER
+    `await_completion` has returned its verdict, or the interpreter itself) and a SIGKILL of
+    the supervisor or the watcher remain the process's own: the dispatch is then collected
+    by recovery from durable evidence (`adopt`, the exit sentinel, the fence) or reported as
+    a named non-success (`IDEMPOTENCY_RECOVERY_BLOCKED`, `fence_missing`,
+    `diagnostic_tail_unaccounted`), never synthesized into a settlement.
+* **Locks.**  `scripts/test_os48_finality_locks.py` (L-01/02/02b/03/04/10/10b/12),
+  `test_os48_ownership_locks.py` (L-05/11/11b/14), `test_os48_evidence_locks.py` (L-06/07/08),
+  `test_os48_recovery_cuts.py` (L-09/09b, C1-C7), `test_os48_crash_cuts.py` (real kills, C1-C9 /
+  RC1-RC3), `test_os48_review_i1_locks.py` (F-001..F-006), `test_os48_review_i2_locks.py`
+  (i2 F-001/F-004/F-006/F-007), `test_os48_review_i3_locks.py` (i3 F-001/F-004/F-006/F-008), `test_os48_review_i4_locks.py` (i4 F-009), `test_os48_review_i5_locks.py` (i5 F-010 + adversarial pass, F-011), `test_os48_review_i6_locks.py` (i6 F-010 coalesced / pre-exec watch, F-011, F-012, F-013), `test_os48_review_i7_locks.py` (i7 F-015 framing, F-014 verified subreaper, F-016 fixed objects / lifetimes incl. the PID-1 private-namespace alias construction), `test_os48_f015_f016_locks.py` (i8 F-015 bounded nested scan / `record_scan_incomplete`, F-016 verified admission / reader binding, PID-1 same-tick foreign-peer constructions; run_7859f202457c F-017 selected-refusal dominance over a post-selection reader failure),
+  `test_os48_pr36_locks.py` (PR #36 comment 5739898842: L-1..L-6 -- bounded settlement read and fence-recorded answerability, echo provenance, the separate marker descriptor, adoption restoring baseline + digest-only delivery provenance, parity; L-7..L-10 -- no plaintext prompt at rest; L-11..L-14 -- proofs bound to the recorded transport),
+  `test_os48_linux_locks.py` (L-13 + membership, CI condition `not_linux`); the round-8/9/9i2/10 finality locks are versioned in
+  place (`# superseded by OS-48` notes, W-F9).  Real-CLI proof: `scripts/os37_r10_real_agent.py` /
+  `os37_r10_recovery_prompt_e2e.py` (Claude `session_field`, Codex `sidecar_file`).

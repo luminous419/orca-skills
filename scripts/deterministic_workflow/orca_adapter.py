@@ -16,6 +16,10 @@ from .contracts import (BASE_CAPABILITIES, EXTERNAL_LOOKUP, LIFECYCLE_SETTLEMENT
 # `id:<repo-id>::<path>` selector denotes the same worktree in every process.
 WORKTREE_ALIASES = frozenset({"current", "active"})
 
+# OS-37 D-1 / WI-02.  The named refusal ``interrupt`` returns.  A refusal with a name is
+# handleable; an unnamed CLI failure invoking a nonexistent verb is not.
+ORCA_INTERRUPT_PRIMITIVE_ABSENT = "ORCA_INTERRUPT_PRIMITIVE_ABSENT"
+
 
 def _default_result_parser(attempt: Any, intent: ActionIntent) -> dict[str, Any]:
     """`decision_contract.parse_agent_settlement`, imported lazily.
@@ -477,9 +481,24 @@ class OrcaAdapter:
                 "dispatch_id": receipt["dispatch_id"]}
 
     def interrupt(self, intent_id: str, reason: str) -> dict[str, Any]:
+        """No Orca primitive expresses a non-settling interrupt at the pinned revision.
+
+        The pinned spec defines exactly eight ``worker-*`` verbs and none of them is an
+        interrupt (``docs/ORCA_RUNTIME_PRIMITIVES.md:880-883``).  The previous body called
+        ``orchestration worker-interrupt``, a verb that does not exist, so the only thing
+        it could produce was an unnamed CLI failure.  Whether such a verb existed in an
+        EARLIER release was never investigated (U8) and is not claimed here.
+
+        Returning the contract's own ``unsupported`` member is a NAMED refusal, not a
+        silent no-op: the caller must handle a closed-vocabulary member, no CLI verb is
+        invoked, and nothing is settled -- ``ports.py``'s :class:`LifecycleSettlementPort`
+        states it directly, "interrupting is not settling".
+        """
         receipt = self._receipts[intent_id]
-        return self.harness.call("orchestration", "worker-interrupt", "--dispatch",
-                                 receipt["dispatch_id"], "--reason", reason)
+        return {"intent_id": intent_id, "reason": reason,
+                "interrupt_outcome": "unsupported",
+                "refusal": ORCA_INTERRUPT_PRIMITIVE_ABSENT,
+                "dispatch_id": receipt["dispatch_id"]}
 
 
 def _now() -> str:
@@ -491,5 +510,10 @@ ORCA_PRIMITIVE_MAP = {
     "start": ("create_task", "run_existing_task"),
     "send": ("call",),
     "status": ("task_status",),
-    "interrupt": ("call",),
+    # OS-37 D-1 / WI-02.  Empty, not ``("call",)``: no Orca primitive expresses a
+    # non-settling interrupt at the pinned revision, so claiming one here was the second
+    # place in this module asserting a verb that does not exist.  See
+    # ``OrcaAdapter.interrupt``, which now returns the contract's named ``unsupported``
+    # member instead of invoking a CLI verb.
+    "interrupt": (),
 }
