@@ -1296,7 +1296,51 @@ marked).  Design: `artifacts/runs/run_f820764749d6/DESIGN.md` (topology A).  Mea
   `payload_unobserved` by name, no span, whatever the row carries (L-13, L-14 rewritten: every
   proof material inert on every transport); F3-L5 the refusal-like prompt and the result-JSON
   example settle FAILED / LOST by name on adoption, never COMPLETED; F3-L6 the PR36-1..3 locks,
-  the F-015 / F-016 / F-017 locks and the affected suites unchanged.  Locks (`scripts/test_os48_pr36_locks.py`,
+  the F-015 / F-016 / F-017 locks and the affected suites unchanged.
+  **(run_d6391487ff44 -- the unkeyed `delivery_recorded.baseline` merge blocker; the SAME USER
+  DECISION narrowing PR36-4, closed at the BASELINE as F-003 closed it at the echo proof.)**
+  The `delivery_recorded` row's `baseline` is ALSO unkeyed -- a same-user writer rewrites it and
+  re-digests the row with `record_digest` -- so it is NOT a settlement authority any more than
+  the `echo_proof` was.  At 991847f `_restore_delivery` assigned `self._settlement_baseline =
+  row.baseline` BEFORE validating the event list and LEFT it applied when the events were
+  rejected as malformed; `completion()` then selected over `[baseline, N)`, so a forged/stale
+  later baseline (row re-digested) narrowed the fenced prefix PAST a refusal and the adopted
+  session settled COMPLETED where the live session settled FAILED `refusal_in_boundary` (MEASURED
+  RED: examined range narrowed to `[158, 246)`, the refusal at a lower offset excluded, a false
+  COMPLETED).  Contract now in force: adoption NEVER derives its settlement baseline from the
+  row.  With no authenticated baseline source the successor settles over the FULL fenced prefix
+  `[0, N)` (`_settlement_baseline` stays 0), examining a SUPERSET of the `[live_baseline, N)` the
+  live session examined -- so the adopted settlement is a subset of live's (SAFETY parity),
+  never wider (no AVAILABILITY parity).  A malformed row applies NOTHING (the baseline stays 0
+  and no events are restored -- the pre-fix "left applied on rejection" bug is gone); a MISSING
+  row, MULTIPLE `delivery_recorded` rows, or a forged LAST-row substitution cannot narrow the
+  range because the baseline is 0 regardless of which row is last.  The row's `baseline` (and the
+  event offsets) survive ONLY as DIAGNOSTIC evidence -- `_restore_delivery` returns
+  `journal_baseline_diagnostic`, journalled on the adoption's `identity_bound` row (alongside
+  `settlement_baseline: 0`) and on `delivery_provenance_unrestored` -- and reach neither
+  `completion()`'s selection range, `_positive_selection_over_bound_fence`, `refusal_evidence`
+  nor any narrowing.  LIVE is unchanged: `send()` sets `_settlement_baseline` in memory (the
+  capture offset just before its own prompt write) and `completion()` selects over that
+  `[baseline, N)` exactly as before.  CONSEQUENCE, accepted and documented: adoption guarantees
+  SAFETY parity (adopted success is a subset of live success), NOT availability parity -- a
+  refusal-like or JSON-example prompt echo that fell BEFORE the live baseline is now inside the
+  examined range on adoption and may make the adopted settlement STRICTER (FAILED
+  `refusal_in_boundary` / LOST `record_framing_ambiguous` by name), never wider.  No MAC / key /
+  secret and no new authenticated field were introduced.  Locks
+  (`scripts/test_os48_pr36_locks.py::PR36BaselineNotAuthorityTests`, RED at `991847f`, GREEN
+  after; both copies byte-identical): L-1 a forged later baseline past the refusal, re-digested,
+  through the REAL adopt path -> adopted NOT COMPLETED (FAILED `refusal_in_boundary`,
+  settlement_range.baseline == 0); L-2 the same with a malformed event list (a `payload` key; a
+  non-list) -> the range is not narrowed (baseline 0, no event restored, the row named
+  `delivery_provenance_unrestored` with `journal_baseline_diagnostic`); L-3 a missing row (full
+  `[0, N)`, no wider than live) and multiple rows with a forged last row (the last row does not
+  substitute an authority).  The adoption locks whose expectation legitimately changed (L-4, L-10
+  and the F3-L2 matrix asserted "adopted baseline == live baseline"; the L-4 identity_bound row
+  carried `settlement_baseline == live baseline`) are REWRITTEN to "adopted baseline == 0,
+  examines the full prefix `[0, N)`, live baseline survives as `journal_baseline_diagnostic`"
+  with a note citing this run -- none deleted or weakened; the transport/echo matrix verdicts are
+  UNCHANGED (the extra `[0, live_baseline)` bytes are the readiness `system` record, inert for
+  refusal / completion / framing selection).  Locks (`scripts/test_os48_pr36_locks.py`,
   every counterexample RED at `c9b8d04`, GREEN after; both copies byte-identical): L-1 the
   over-limit tail (`line_bytes` and `total_bytes`) after a bound success and after a bound
   refusal, through the production spawn + `await_completion`, the pre-bound re-await and a

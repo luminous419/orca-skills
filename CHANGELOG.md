@@ -262,6 +262,33 @@
   example LOST `record_framing_ambiguous` -- and never wider (`adopted_success` is a subset of
   `live_success`); the argv path is unchanged (live == adopted).  No MAC / key / secret, no
   new authenticated field, no plaintext prompt at rest.
+- (4, run_d6391487ff44 -- the unkeyed `delivery_recorded.baseline` merge blocker, closing the
+  same USER DECISION at the baseline as F-003 closed it at the echo proof.)  The row's `baseline`
+  is ALSO unkeyed -- a same-user writer rewrites it and re-digests the row -- so it is not a
+  settlement authority either.  `_restore_delivery` at 991847f assigned
+  `self._settlement_baseline = row.baseline` BEFORE validating the events and LEFT it applied
+  when they were rejected as malformed; `completion()` then selected over `[baseline, N)`, so a
+  forged/stale later baseline narrowed the fenced prefix PAST a refusal and the adopted session
+  settled COMPLETED where live settled FAILED `refusal_in_boundary`.  Now adoption NEVER derives
+  its baseline from the row: with no authenticated baseline source the successor settles over the
+  FULL fenced prefix `[0, N)` (`_settlement_baseline` stays 0), examining a superset of what live
+  examined -- so its settlement is a subset of live's (SAFETY parity), never wider (no
+  AVAILABILITY parity).  A malformed row applies nothing (baseline stays 0, no events restored);
+  a missing / multiply-recorded / last-row-substituted row cannot narrow the range because the
+  baseline is 0 regardless.  `delivery_recorded.baseline` is DIAGNOSTIC-ONLY: it survives as
+  `journal_baseline_diagnostic` on the `identity_bound` / `delivery_provenance_unrestored` rows
+  and reaches neither `completion()`'s selection range, `_positive_selection_over_bound_fence`,
+  `refusal_evidence` nor any narrowing.  Live is unchanged (it sets `_settlement_baseline` in
+  memory before its own prompt write).  Consequence, accepted and documented: adoption guarantees
+  SAFETY parity (adopted success subset of live success), not AVAILABILITY parity -- a
+  refusal-like or JSON-example prompt echo before the live baseline is now inside `[0, N)` on
+  adoption and may make the settlement STRICTER, never wider.  No MAC / key / secret, no new
+  authenticated field.  Locks (`scripts/test_os48_pr36_locks.py::PR36BaselineNotAuthorityTests`,
+  L-1..L-3, RED at `991847f`, GREEN after): a forged later baseline cannot hide a refusal on
+  adoption, a malformed event row + forged baseline does not narrow the range, missing / multiple
+  rows (forged last row) never substitute an authority; the F3 / L-4 / L-10 / L-13 adoption locks
+  are rewritten from "adopted baseline == live baseline" to "adopted baseline == 0, examines the
+  full prefix" with a note citing `run_d6391487ff44`, none deleted.
 - Locks: `scripts/test_os48_pr36_locks.py` (L-1..L-6; every counterexample RED at `c9b8d04`;
   iteration 2 L-7..L-10 RED on the iteration-1 tree: an argv sentinel secret -- including the
   Orca dispatch-capability preamble shape -- absent from every file the run wrote with live ==

@@ -869,8 +869,18 @@ def _echo_block(session) -> dict:
 
 
 def _assert_same_range(case: unittest.TestCase, live, adopted) -> None:
-    case.assertEqual(int(adopted._settlement_baseline or 0), int(live._settlement_baseline or 0),
-                     "the adopted session restored a different settlement baseline")
+    """run_d6391487ff44 (the unkeyed `delivery_recorded.baseline` merge blocker; rewritten from
+    the i1-i3 "adopted baseline == live baseline"): the adopted session NEVER derives a baseline
+    from the unkeyed row -- it settles over the FULL fenced prefix ``[0, N)`` (baseline 0), a
+    SUPERSET of the live-observed ``[live_baseline, N)``.  So the adopted baseline is 0 (never
+    the live one) and the adopted range is never narrower than live's -- the property the
+    forged-baseline defect violated.  Provenance offsets are still the recorded ones (they carry
+    no excision authority; run_c296ff67c325) and the events stay payload-less (F-001)."""
+    case.assertEqual(int(adopted._settlement_baseline or 0), 0,
+                     "the adopted session did not settle over the full fenced prefix [0, N)")
+    case.assertGreaterEqual(int(live._settlement_baseline or 0), 0)
+    case.assertLessEqual(int(adopted._settlement_baseline or 0), int(live._settlement_baseline or 0),
+                         "the adopted examined range is narrower than the live one")
     case.assertEqual(_provenance(adopted), _provenance(live),
                      "the adopted session restored different delivery provenance")
     case.assertTrue(all(ev.get("payload") == "" for ev in adopted.delivery_events),
@@ -879,8 +889,10 @@ def _assert_same_range(case: unittest.TestCase, live, adopted) -> None:
 
 def _assert_identical(case: unittest.TestCase, live, live_result, adopted, adopted_result) -> None:
     """live == adopted: baseline, provenance, echo block, verdict, evidence.  Holds for the
-    `argv` path (F3-L3: `echo_absent` by structure on both sides); an ECHO transport is
-    compared with `_assert_not_wider` instead (run_c296ff67c325)."""
+    `argv` path (F3-L3: `echo_absent` by structure on both sides, and the live `argv` baseline
+    is itself 0 -- `send()` is never called -- so adoption's baseline-0 rule leaves the range
+    identical); an ECHO transport (where live has a non-zero baseline) is compared with
+    `_assert_not_wider` instead (run_c296ff67c325, run_d6391487ff44)."""
     _assert_same_range(case, live, adopted)
     case.assertEqual(_echo_block(adopted), _echo_block(live), "live and adopted resolve the echo differently")
     case.assertEqual(adopted_result["state"], live_result["state"], (live_result, adopted_result))
@@ -896,10 +908,11 @@ def _assert_identical(case: unittest.TestCase, live, live_result, adopted, adopt
 
 
 def _assert_not_wider(case: unittest.TestCase, live, live_result, adopted, adopted_result) -> dict:
-    """run_c296ff67c325 (USER DECISION): the adopted settlement reads the SAME [baseline, N)
-    with the same (payload-less) provenance, EXCISES NOTHING (no `echo_proven`, no span) and
-    is never wider than the live one: adopted COMPLETED => live COMPLETED on the same record.
-    Returns the adopted echo block for the caller's named assertions."""
+    """run_c296ff67c325 + run_d6391487ff44 (USER DECISION / the baseline merge blocker): the
+    adopted settlement examines the FULL fenced prefix ``[0, N)`` -- a superset of live's
+    ``[live_baseline, N)`` -- with payload-less provenance, EXCISES NOTHING (no `echo_proven`,
+    no span) and is never wider than the live one: adopted COMPLETED => live COMPLETED on the
+    same record.  Returns the adopted echo block for the caller's named assertions."""
     _assert_same_range(case, live, adopted)
     block = _echo_block(adopted)
     case.assertNotEqual(block["state"], "echo_proven", f"the adoption excised an echo: {block}")
@@ -911,7 +924,10 @@ def _assert_not_wider(case: unittest.TestCase, live, live_result, adopted, adopt
     case.assertEqual(((ae.get("boundary") or {}).get("fence") or {}).get("boundary"),
                      ((le.get("boundary") or {}).get("fence") or {}).get("boundary"))
     rng = ae.get("settlement_range") or {}
-    case.assertEqual(rng.get("baseline"), (le.get("settlement_range") or {}).get("baseline"))
+    # run_d6391487ff44: the adopted examined range starts at 0 (the full prefix), not the live
+    # baseline; a value <= the live baseline is never wider.
+    case.assertEqual(rng.get("baseline"), 0, "the adoption did not examine [0, N)")
+    case.assertLessEqual(rng.get("baseline"), (le.get("settlement_range") or {}).get("baseline") or 0)
     case.assertNotEqual(rng.get("echo"), "echo_proven", rng)
     case.assertEqual(rng.get("echo"), block["state"], (rng, block))
     if adopted_result["state"] == "COMPLETED":
@@ -1001,7 +1017,12 @@ class PR36F4AdoptionRestoresProvenanceTests(_StubTurn):
                 if r["kind"] == "EVENT" and r["event"] == "identity_bound"
                 and (r.get("source_vocabulary") or {}).get("adopted") is True]
         self.assertEqual(len(rows), 1, rows)
-        self.assertEqual(rows[0]["source_vocabulary"].get("settlement_baseline"), live._settlement_baseline, rows[0])
+        # run_d6391487ff44: the adopted settlement baseline is 0 (the full fenced prefix), and
+        # the live baseline it did NOT adopt survives only as `journal_baseline_diagnostic`.
+        self.assertEqual(rows[0]["source_vocabulary"].get("settlement_baseline"), 0, rows[0])
+        self.assertGreater(live._settlement_baseline, 0)
+        self.assertEqual(rows[0]["source_vocabulary"].get("journal_baseline_diagnostic"),
+                         live._settlement_baseline, rows[0])
         self.assertEqual(rows[0]["source_vocabulary"].get("delivery_events_restored"), 1, rows[0])
         self.assertEqual(rows[0]["source_vocabulary"].get("delivery_provenance"), "restored", rows[0])
 
@@ -1098,8 +1119,11 @@ class PR36F4AdoptionRestoresProvenanceTests(_StubTurn):
                 baseline, n, fenced = self._fenced(adopted)
                 self.assertIn(refusal, fenced)
                 self.assertIn(echo_form, fenced)          # every byte survives -- the real echo too
-                # then the names
-                self.assertEqual(adopted._settlement_baseline, live._settlement_baseline)
+                # then the names.  run_d6391487ff44: the adopted baseline is 0 (the full fenced
+                # prefix), whatever the unkeyed row's baseline; the live baseline it did not
+                # adopt survives as a diagnostic only.
+                self.assertEqual(adopted._settlement_baseline, 0)
+                self.assertGreater(live._settlement_baseline, 0)
                 self.assertEqual(len(adopted.delivery_events), restored, adopted.delivery_events)
                 self.assertEqual(block["state"], state, block)
                 if restored:
@@ -1112,8 +1136,12 @@ class PR36F4AdoptionRestoresProvenanceTests(_StubTurn):
     def test_l10_a_malformed_delivery_row_is_named_and_restores_no_event(self) -> None:
         """A `delivery_recorded` row whose event vocabulary is not the closed shape -- one that
         carries a `payload` key, or the pre-decision `echo_proof` key (run_c296ff67c325) --
-        restores NO event, keeps the baseline, and is journalled
-        `delivery_provenance_unrestored` by name."""
+        restores NO event and is journalled `delivery_provenance_unrestored` by name.
+        run_d6391487ff44 (the baseline merge blocker; rewritten from "keeps the baseline"): after
+        the rejection NOTHING from the row is applied -- the baseline stays 0 (the row's
+        `baseline` 71 was NEVER a settlement authority and survives only as the diagnostic
+        `journal_baseline_diagnostic`), so a malformed row + forged baseline cannot narrow the
+        examined range."""
         live = self._session("pr36-l10-malformed", _ECHO_AGENT % {"records": _record(False)})
         transport = {"kind": "pty_write", "framed": True, "cols": 80, "termios": None, "read_at": ""}
         shapes = {
@@ -1130,19 +1158,25 @@ class PR36F4AdoptionRestoresProvenanceTests(_StubTurn):
                 rows = [{"kind": "EVENT", "event": "delivery_recorded",
                          "source_vocabulary": {"baseline": 71, "delivery_mode": "post_ready_delivery", "events": [event]}}]
                 out = stranger._restore_delivery(rows)
-                self.assertEqual(out, {"restored": False, "reason": "delivery_recorded_events_malformed", "events": 0})
-                self.assertEqual(stranger._settlement_baseline, 71)
+                self.assertEqual(out, {"restored": False, "reason": "delivery_recorded_events_malformed",
+                                       "events": 0, "journal_baseline_diagnostic": 71})
+                self.assertEqual(stranger._settlement_baseline, 0)      # NOT 71: nothing from the row is applied
                 self.assertEqual(stranger.delivery_events, [])
                 named = [r for r in stranger.journal.rows_for(live.intent_id)
                          if r.get("event") == "delivery_provenance_unrestored"]
                 self.assertEqual(len(named), index + 1, named)          # one per malformed shape, same journal
                 self.assertEqual(named[-1]["source_vocabulary"]["reason"], "delivery_recorded_events_malformed")
-                # the well-formed post-decision row restores the event WITHOUT any proof key
+                self.assertEqual(named[-1]["source_vocabulary"]["settlement_baseline"], 0)
+                self.assertEqual(named[-1]["source_vocabulary"]["journal_baseline_diagnostic"], 71)
+                # the well-formed post-decision row restores the event WITHOUT any proof key,
+                # and STILL never adopts the row's baseline (it stays 0)
                 good = {"index": 0, "offset": 71, "payload_sha256": "0" * 64, "payload_bytes": 4, "transport": transport, "at": ""}
                 rows[0]["source_vocabulary"]["events"] = [good]
                 fresh = _stranger(live)
                 fresh.session_id, fresh.incarnation = live.session_id, live.incarnation
-                self.assertEqual(fresh._restore_delivery(rows), {"restored": True, "reason": "", "events": 1})
+                self.assertEqual(fresh._restore_delivery(rows),
+                                 {"restored": True, "reason": "", "events": 1, "journal_baseline_diagnostic": 71})
+                self.assertEqual(fresh._settlement_baseline, 0)
                 self.assertEqual(fresh.delivery_events, [{"offset": 71, "payload": "", "transport": transport, "at": ""}])
 
 
@@ -1852,6 +1886,176 @@ class PR36F003AdoptedSuccessSubsetTests(_StubTurn):
                 lo, ao = self._assert_cell("pty_echo_set", output)
                 self.assertEqual(lo, self.C)
                 self.assertEqual(ao, stricter)
+
+
+# =====================================================================================
+# run_d6391487ff44 -- the unkeyed `delivery_recorded.baseline` is NOT a settlement authority
+# (L-1 forged later baseline, L-2 malformed events + forged baseline, L-3 missing / multiple
+# rows).  Every counterexample is RED at 991847f (where `_restore_delivery` assigned
+# `_settlement_baseline = row.baseline` BEFORE validating the events and left it applied on
+# rejection) and GREEN after the fix (baseline stays 0; the row's baseline survives only as
+# `journal_baseline_diagnostic`).  Rewrites nothing -- these are new locks for the merge blocker.
+# =====================================================================================
+def _rewrite_delivery_rows(case, live, mutate, *, expect_rows: int = 1) -> None:
+    """Rewrite every `delivery_recorded` row of ``live``'s intent through ``mutate(row)`` and
+    re-digest it (`record_digest`; the journal has no secret), so `rows()` still verifies -- the
+    same-user tampering the unkeyed row invites."""
+    path = journal_mod.journal_path(live.artifact_base, live.run_id)
+    lines = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    out, forged = [], 0
+    for line in lines:
+        row = json.loads(line)
+        if row.get("intent_id") == live.intent_id and row.get("event") == "delivery_recorded":
+            mutate(row)
+            row["digest"] = journal_mod.record_digest(row)
+            forged += 1
+        out.append(json.dumps(row, sort_keys=True, ensure_ascii=False))
+    case.assertEqual(forged, expect_rows)
+    path.write_text("\n".join(out) + "\n", encoding="utf-8")
+
+
+def _append_forged_last_row(case, live, *, baseline: int) -> None:
+    """Append a SECOND `delivery_recorded` row (a copy of the first, its baseline forged) with a
+    higher ``seq`` so it becomes the LAST such row -- the substitution `_restore_delivery`'s
+    `named[-1]` would trust.  Re-digested so the journal reads."""
+    path = journal_mod.journal_path(live.artifact_base, live.run_id)
+    lines = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    rows = [json.loads(ln) for ln in lines]
+    orig = next(r for r in rows if r.get("intent_id") == live.intent_id and r.get("event") == "delivery_recorded")
+    dup = json.loads(json.dumps(orig))
+    dup["seq"] = max(int(r.get("seq") or 0) for r in rows) + 1
+    dup["source_vocabulary"]["baseline"] = baseline
+    dup.pop("digest", None)
+    dup["digest"] = journal_mod.record_digest(dup)
+    rows.append(dup)
+    path.write_text("\n".join(json.dumps(r, sort_keys=True, ensure_ascii=False) for r in rows) + "\n",
+                    encoding="utf-8")
+
+
+def _remove_delivery_rows(case, live) -> int:
+    path = journal_mod.journal_path(live.artifact_base, live.run_id)
+    lines = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    rows = [json.loads(ln) for ln in lines]
+    kept = [r for r in rows if not (r.get("intent_id") == live.intent_id and r.get("event") == "delivery_recorded")]
+    path.write_text("\n".join(json.dumps(r, sort_keys=True, ensure_ascii=False) for r in kept) + "\n",
+                    encoding="utf-8")
+    return len(rows) - len(kept)
+
+
+class PR36BaselineNotAuthorityTests(_StubTurn):
+    """The merge blocker: a forged/stale `delivery_recorded.baseline` narrowing the adopted
+    fenced prefix past a refusal.  A live ECHO-set turn whose HARMLESS prompt is delivered; the
+    agent prints the refusal prose `not logged in`, then a bound success.  Live excises the echo
+    it observed and R1 fires on `not logged in` -> FAILED `refusal_in_boundary`.  A same-user
+    writer then rewrites the row's `baseline` to a value PAST the refusal and re-digests it: at
+    991847f the adoption examined `[baseline, N)`, which STARTS after the refusal, saw only the
+    success record and settled COMPLETED -- a false success live never produced.  After the fix
+    the adopted baseline is 0 regardless of the row, so the refusal is always in `[0, N)` and the
+    verdict is FAILED, never COMPLETED."""
+
+    F = ("FAILED", REFUSAL_IN_BOUNDARY)
+
+    def _live_refusal_after_echo(self, run_id: str):
+        """A live run that settled FAILED `refusal_in_boundary` with the refusal AFTER the
+        prompt echo.  Returns (live, live_result, forged_baseline) where forged_baseline is a
+        value PAST the refusal (the start of the success record) -- the value a forger would
+        pick to hide the refusal."""
+        live = self._session(run_id, _ECHO_AGENT % {"records": "printf 'not logged in\\n'\n" + _record(False)})
+        live_result = self._pty_turn(live, lambda sid: "harmless prompt for %s" % sid)
+        self.assertEqual((live_result["state"], (live_result.get("verdict") or {}).get("reason")), self.F, live_result)
+        raw = live.capture.raw()
+        refusal_end = raw.index(b"not logged in") + len(b"not logged in")
+        success = raw.index(b'{"type":"result"', refusal_end)
+        forged_baseline = success                     # [forged, N) excludes the refusal, keeps the success
+        self.assertGreater(forged_baseline, int(live._settlement_baseline or 0))
+        return live, live_result, forged_baseline
+
+    def _pty_turn(self, session, prompt_of) -> dict:
+        from scripts.test_os37_lifecycle_boundary_regressions import INJECTED_REHEARSALS
+        receipt = session.start(payload="rehearsal", **INJECTED_REHEARSALS)
+        self.sessions.append(session)
+        self.assertEqual(receipt["start_outcome"], "ready", receipt)
+        ready = session.await_ready()
+        self.assertEqual(ready["state"], "READY", ready)
+        session.send({"payload": prompt_of(session.session_id)})
+        return session.await_completion()
+
+    def _adopt_and_settle(self, live):
+        adopted = _stranger(live)
+        self.assertTrue(adopted.adopt(fence=live.fence)["adopted"])
+        return adopted, adopted.await_completion()
+
+    def _assert_not_completed_over_full_prefix(self, live, adopted, adopted_result, *, forged_baseline):
+        self.assertNotEqual(adopted_result["state"], "COMPLETED",
+                            f"the forged baseline produced a COMPLETED live did not: {adopted_result}")
+        self.assertEqual(adopted._settlement_baseline, 0, "adoption adopted the forged baseline")
+        rng = adopted_result["evidence"].get("settlement_range") or {}
+        self.assertEqual(rng.get("baseline"), 0, f"the examined range was narrowed: {rng}")
+        # the refusal the forged baseline tried to hide is inside the examined range
+        self.assertIn(b"not logged in", adopted.capture.raw()[0:int(adopted._boundary["offset_n"])])
+        self.assertGreater(forged_baseline, 0)
+
+    def test_l1_a_forged_later_baseline_cannot_hide_a_refusal_on_adoption(self) -> None:
+        """L-1: rewrite the row's `baseline` PAST the refusal and re-digest -> adopted is NOT
+        COMPLETED (FAILED `refusal_in_boundary`), via the REAL adopt path.  991847f: COMPLETED."""
+        live, live_result, forged = self._live_refusal_after_echo("pr36-bl-l1")
+        _rewrite_delivery_rows(self, live, lambda row: row["source_vocabulary"].__setitem__("baseline", forged))
+        adopted, adopted_result = self._adopt_and_settle(live)
+        self._assert_not_completed_over_full_prefix(live, adopted, adopted_result, forged_baseline=forged)
+        self.assertEqual(((adopted_result.get("verdict") or {}).get("reason")), REFUSAL_IN_BOUNDARY, adopted_result)
+        # the live baseline survives only as a diagnostic; the forged row value is inert
+        self.assertGreater(live._settlement_baseline, 0)
+
+    def test_l2_a_malformed_event_row_with_a_forged_baseline_does_not_narrow_the_range(self) -> None:
+        """L-2: the same forged later baseline AND a malformed event list (a `payload` key; a
+        non-list) -> the range is NOT narrowed (settlement_range.baseline == 0) and the verdict
+        is not COMPLETED.  991847f left the forged baseline applied even after rejecting the
+        events, so `[forged, N)` hid the refusal and it settled COMPLETED."""
+        for name, malform in (
+            ("payload_key", lambda row: [ev.__setitem__("payload", "x") for ev in row["source_vocabulary"]["events"]]),
+            ("events_not_a_list", lambda row: row["source_vocabulary"].__setitem__("events", "nope")),
+        ):
+            with self.subTest(shape=name):
+                live, live_result, forged = self._live_refusal_after_echo(f"pr36-bl-l2-{name}"[:60])
+
+                def mutate(row, _malform=malform):
+                    row["source_vocabulary"]["baseline"] = forged
+                    _malform(row)
+
+                _rewrite_delivery_rows(self, live, mutate)
+                adopted, adopted_result = self._adopt_and_settle(live)
+                self._assert_not_completed_over_full_prefix(live, adopted, adopted_result, forged_baseline=forged)
+                # nothing from the malformed row was restored
+                self.assertEqual(adopted.delivery_events, [], adopted.delivery_events)
+                named = [r for r in adopted.journal.rows_for(live.intent_id)
+                         if r.get("event") == "delivery_provenance_unrestored"]
+                self.assertTrue(named, "the malformed row was not named")
+                self.assertEqual(named[-1]["source_vocabulary"]["settlement_baseline"], 0)
+                self.assertEqual(named[-1]["source_vocabulary"]["journal_baseline_diagnostic"], forged)
+
+    def test_l3_missing_and_multiple_rows_never_narrow_the_range(self) -> None:
+        """L-3: (a) a MISSING `delivery_recorded` row -> baseline 0, full `[0, N)`, verdict no
+        wider than live; (b) a SECOND row appended with a forged later baseline as the LAST row
+        -> the last row does NOT substitute an authority (baseline stays 0, not COMPLETED).
+        991847f trusted `named[-1]`, so the appended forged row narrowed the range to COMPLETED."""
+        # (a) missing row: baseline 0 at both 991847f and after -- the fail-closed property lock
+        live_a, result_a, _ = self._live_refusal_after_echo("pr36-bl-l3-missing")
+        self.assertEqual(_remove_delivery_rows(self, live_a), 1)
+        adopted_a, adopted_result_a = self._adopt_and_settle(live_a)
+        self.assertEqual(adopted_a._settlement_baseline, 0)
+        self.assertNotEqual(adopted_result_a["state"], "COMPLETED", adopted_result_a)
+        self.assertEqual((adopted_result_a["evidence"].get("settlement_range") or {}).get("baseline"), 0)
+        self.assertEqual(adopted_a.delivery_events, [], "a missing row restored an event")
+        # (b) multiple rows, forged last row past the refusal
+        live_b, result_b, forged = self._live_refusal_after_echo("pr36-bl-l3-multi")
+        _append_forged_last_row(self, live_b, baseline=forged)
+        named_rows = [r for r in journal_mod.ExecutionJournal(live_b.artifact_base, live_b.run_id).rows_for(live_b.intent_id)
+                      if r.get("event") == "delivery_recorded"]
+        self.assertEqual(len(named_rows), 2, "the second row was not appended")
+        self.assertEqual(named_rows[-1]["source_vocabulary"]["baseline"], forged)
+        adopted_b, adopted_result_b = self._adopt_and_settle(live_b)
+        self._assert_not_completed_over_full_prefix(live_b, adopted_b, adopted_result_b, forged_baseline=forged)
+        self.assertEqual(((adopted_result_b.get("verdict") or {}).get("reason")), REFUSAL_IN_BOUNDARY, adopted_result_b)
 
 
 # =====================================================================================

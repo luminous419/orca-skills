@@ -1316,12 +1316,14 @@ class StandaloneSession:
         prior = self.journal.delivery_intent_for(self.intent_id)
         if prior is not None:
             self.delivery_intent = dict(prior.get("source_vocabulary") or {})
-        # OS-48 PR #36 finding 4: the settlement baseline and the payload-less delivery
-        # events the live session recorded before its prompt write are restored from the
-        # journal row, so this successor settles the SAME [baseline, N) (baseline 0 made the
-        # same run settle differently).  run_c296ff67c325 (F-003): the restored events carry
-        # NO excision authority -- the unkeyed row's digests are diagnostic -- so this
-        # settlement may be stricter than the live one and is never wider.
+        # OS-48 PR #36 finding 4: the payload-less delivery events the live session recorded
+        # before its prompt write are restored from the journal row.  run_c296ff67c325 (F-003):
+        # the restored events carry NO excision authority -- the unkeyed row's digests are
+        # diagnostic.  run_d6391487ff44 (the unkeyed `delivery_recorded.baseline` merge
+        # blocker): the baseline is NOT restored either -- the unkeyed row is no settlement
+        # authority, so this successor settles over the FULL fenced prefix [0, N) (baseline 0)
+        # and can only be stricter than live, never wider.  The row's baseline is kept as
+        # DIAGNOSTIC evidence (`journal_baseline_diagnostic`) and fed to nothing.
         delivery = self._restore_delivery(mine)
         self._journal(kind="EVENT", derived_from="runtime_state", event="identity_bound",
                       state=self.state,
@@ -1329,6 +1331,7 @@ class StandaloneSession:
                                   "pty_id": pty_id, "argv_digest": argv_digest,
                                   "spawn_record": record,
                                   "settlement_baseline": int(self._settlement_baseline or 0),
+                                  "journal_baseline_diagnostic": delivery.get("journal_baseline_diagnostic"),
                                   "delivery_events_restored": int(delivery["events"]),
                                   "delivery_provenance": ("restored" if delivery["restored"]
                                                           else delivery["reason"]),
@@ -3667,25 +3670,46 @@ class StandaloneSession:
 
     def _restore_delivery(self, rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         """The adopt-side half: from the LAST `delivery_recorded` row of this incarnation,
-        restore the baseline and one PAYLOAD-LESS event per recorded event -- offset,
-        transport, `at` -- so the successor settles the SAME ``[baseline, N)`` the live
-        session settled.  The restored events carry NO excision authority
-        (run_c296ff67c325, F-003): `resolve_delivery_echo` resolves a payload-less event from
-        its transport KIND alone -- `argv` is `echo_absent` by structure, `pty_write` is
-        `echo_unproven` / `payload_unobserved` -- and excises nothing, so an adopted
-        settlement is never wider than the live one (it may be stricter: the accepted
-        contract).  A row whose event vocabulary is not the closed shape (a `payload` key, a
-        pre-decision `echo_proof` key, ...) restores NO event and is journalled by name
-        (`delivery_provenance_unrestored`): the selector then excludes nothing (fail closed)."""
+        restore one PAYLOAD-LESS event per recorded event -- offset, transport, `at`.  The
+        restored events carry NO excision authority (run_c296ff67c325, F-003):
+        `resolve_delivery_echo` resolves a payload-less event from its transport KIND alone --
+        `argv` is `echo_absent` by structure, `pty_write` is `echo_unproven` /
+        `payload_unobserved` -- and excises nothing.
+
+        run_d6391487ff44 (the unkeyed `delivery_recorded.baseline` merge blocker): the adopted
+        session NEVER derives its ``_settlement_baseline`` from the row.  The row is UNKEYED --
+        a same-user writer rewrites its ``baseline`` and re-digests it with `record_digest` --
+        so a restored baseline is no more authenticated than the events beside it, and applying
+        one lets a forged/stale later baseline narrow the fenced prefix ``[0, N)`` PAST a
+        refusal (adopted COMPLETED where live FAILED; the earlier code also LEFT the row's
+        baseline applied when the event list was rejected as malformed).  With no authenticated
+        baseline source the successor settles over the FULL fenced prefix ``[0, N)``
+        (``_settlement_baseline`` stays 0): it examines a SUPERSET of what live examined, so its
+        settlement is a subset of live's (SAFETY parity -- adopted success is a subset of live
+        success), never wider (no AVAILABILITY parity -- an echoed refusal- or JSON-example
+        prompt before the live baseline is now inside the examined range and may make the
+        adopted settlement STRICTER: FAILED `refusal_in_boundary` / LOST
+        `record_framing_ambiguous`).  The row's ``baseline`` survives ONLY as DIAGNOSTIC
+        evidence (returned as ``journal_baseline_diagnostic``, journalled below and on
+        `identity_bound`); it never reaches `completion()`'s selection range,
+        `_positive_selection_over_bound_fence`, `refusal_evidence` or any narrowing.
+
+        A row whose event vocabulary is not the closed shape (a `payload` key, a pre-decision
+        `echo_proof` key, ...) restores NO event and is journalled by name
+        (`delivery_provenance_unrestored`); nothing from the row is applied (fail closed)."""
         self._settlement_baseline = 0
         self.delivery_events = []
         named = [row for row in rows if row.get("kind") == "EVENT"
                  and row.get("event") == self.DELIVERY_RECORDED_EVENT]
         if not named:
-            return {"restored": False, "reason": "no_delivery_recorded_row", "events": 0}
+            return {"restored": False, "reason": "no_delivery_recorded_row", "events": 0,
+                    "journal_baseline_diagnostic": None}
         vocab = dict(named[-1].get("source_vocabulary") or {})
-        baseline = vocab.get("baseline")
-        self._settlement_baseline = baseline if isinstance(baseline, int) and not isinstance(baseline, bool) else 0
+        # DIAGNOSTIC ONLY: the row's baseline is recorded for evidence and NEVER applied to
+        # `_settlement_baseline` -- the unkeyed row is not a settlement authority.
+        row_baseline = vocab.get("baseline")
+        journal_baseline = (row_baseline if isinstance(row_baseline, int)
+                            and not isinstance(row_baseline, bool) else None)
         recorded = vocab.get("events")
         reason = ""
         if not isinstance(recorded, list):
@@ -3696,15 +3720,18 @@ class StandaloneSession:
         if reason:
             self._journal(kind="EVENT", derived_from="driver", event=self.DELIVERY_UNRESTORED_EVENT,
                           state=self.state,
-                          vocabulary={"reason": reason, "baseline": int(self._settlement_baseline),
+                          vocabulary={"reason": reason, "settlement_baseline": 0,
+                                      "journal_baseline_diagnostic": journal_baseline,
                                       "events_named": len(recorded) if isinstance(recorded, list) else 0,
                                       "events_restored": 0})
-            return {"restored": False, "reason": reason, "events": 0}
+            return {"restored": False, "reason": reason, "events": 0,
+                    "journal_baseline_diagnostic": journal_baseline}
         self.delivery_events = [{"offset": int(ev.get("offset", 0) or 0), "payload": "",
                                  "transport": dict(ev["transport"]) if isinstance(ev.get("transport"), Mapping) else None,
                                  "at": str(ev.get("at") or "")}
                                 for ev in recorded]
-        return {"restored": True, "reason": "", "events": len(self.delivery_events)}
+        return {"restored": True, "reason": "", "events": len(self.delivery_events),
+                "journal_baseline_diagnostic": journal_baseline}
 
     def _verify_delivery(self, baseline: int, baseline_working: bool, *,
                          event: Mapping[str, Any] | None = None,
