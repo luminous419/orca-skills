@@ -611,18 +611,32 @@ class FullSupervisedDispatchTests(unittest.TestCase):
             self.assertLess(rows.index(row), len(rows) - 1, "the residual row must precede exit_observed")
         rows = [row for row in rows if row.get("event") != "descendants_unreaped"]
         kinds = [row["kind"] for row in rows]
+        # OS-48 PR #36 finding 4 (run_9af92a7f320d): the settlement baseline and the delivery
+        # event are journalled (`delivery_recorded`, digests only) BEFORE the prompt bytes go
+        # out -- between readiness and the delivery proof; one more EVENT in the fixed order.
         self.assertEqual(
             kinds,
             ["DELIVERY_INTENT", "EVENT", "SPAWN_OBSERVED", "RECEIPT_OBSERVED", "EVENT",
-             "EVENT", "EVENT", "EVENT", "SETTLEMENT_OBSERVED", "EVENT", "EVENT"],
+             "EVENT", "EVENT", "EVENT", "EVENT", "SETTLEMENT_OBSERVED", "EVENT", "EVENT"],
             "the journal's record order changed; DELIVERY_INTENT is FIRST by construction: "
             + repr([(row["kind"], row.get("event")) for row in rows]))
         # OS-48: the finality events are journalled IN ORDER before the settlement -- the
         # owner generation claim, then the verified fence -- and the two-phase release after it.
         events = [row.get("event") for row in rows if row["kind"] == "EVENT"]
-        self.assertEqual(events, ["spawned", "readiness_observed", "delivery_proof_observed",
-                                  "owner_claimed", "fence_published", "release_observed",
-                                  "exit_observed"], events)
+        self.assertEqual(events, ["spawned", "readiness_observed", "delivery_recorded",
+                                  "delivery_proof_observed", "owner_claimed", "fence_published",
+                                  "release_observed", "exit_observed"], events)
+        recorded = next(row for row in rows if row.get("event") == "delivery_recorded")
+        self.assertEqual({k for ev in recorded["source_vocabulary"]["events"] for k in ev},
+                         {"index", "offset", "payload_sha256", "payload_bytes", "transport", "at", "echo_proof"},
+                         "the delivery_recorded row's event vocabulary is not the closed set (never the prompt)")
+        # i2 (REVIEW_BUGFIX F-001): the row is digest-only -- no payload key, no side record;
+        # the echo proof is the class by name (`echo_absent` for this stub's ECHO-clear pty)
+        self.assertNotIn("record", recorded["source_vocabulary"], recorded)
+        for ev in recorded["source_vocabulary"]["events"]:
+            self.assertNotIn("payload", ev)
+            self.assertEqual(ev["echo_proof"]["schema"], "os48.echo_proof.v1", ev)
+            self.assertIn(ev["echo_proof"]["class"], ("echo_absent", "echo_expected", "echo_unproven"), ev)
         # The trailing EVENT is the supervisor RECLAIMING its own resources after the
         # proven exit (consolidated review finding 9): the exit watcher reaped, the master
         # fd closed.  Journalled so a stranger can see the completion leaked nothing.

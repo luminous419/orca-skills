@@ -216,5 +216,17 @@ case "${OS37_STUB_MODE:-ready}" in
                      cat "${OS37_STUB_STREAM}"
                      exit "${OS37_STUB_EXIT_CODE:-0}" ;;
   exit-code)         exit "${OS37_STUB_EXIT_CODE:-0}" ;;
+  agent-script)      # OS-48 PR #36 locks (scripts/test_os48_pr36_locks.py): the WHOLE turn is
+                     # an operator-supplied `sh` script -- readiness, echo mode, the prompt
+                     # read, the records -- run as this stub's child exactly like the modes
+                     # above, so the real `start` -> `send` -> `await_completion` path (and the
+                     # journal an adoption reads) is driven over a scripted agent whose bytes
+                     # the lock controls.  Arguments: the minted session id, then the prompt
+                     # positional when the profile is `launch_with_prompt` (empty otherwise).
+                     if [ -z "${OS37_STUB_AGENT_SCRIPT:-}" ] || [ ! -f "${OS37_STUB_AGENT_SCRIPT}" ]; then
+                       echo "agent-script needs OS37_STUB_AGENT_SCRIPT to name a readable file" >&2
+                       exit 64
+                     fi
+                     exec /bin/sh "${OS37_STUB_AGENT_SCRIPT}" "$SESSION_ID" "$LAST_POSITIONAL" ;;
   *)                 echo "unknown OS37_STUB_MODE"; exit 64 ;;
 esac

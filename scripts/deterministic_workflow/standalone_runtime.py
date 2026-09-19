@@ -1073,6 +1073,7 @@ class StandaloneSession:
                     "transport": pty_supervisor.echo_transport(
                         None, kind="argv", framed=False, cols=self.profile.cols),
                     "at": _now_iso()})
+                self._record_delivery()                   # PR #36 finding 4 (see `send`)
             admission = self.await_ready()
             if admission["state"] != "READY":
                 # ONE exception, and it is D4.3c's precedence rule rather than a loophole: a
@@ -1315,11 +1316,20 @@ class StandaloneSession:
         prior = self.journal.delivery_intent_for(self.intent_id)
         if prior is not None:
             self.delivery_intent = dict(prior.get("source_vocabulary") or {})
+        # OS-48 PR #36 finding 4: the settlement baseline and the delivery events' digest-only
+        # provenance the live session recorded before its prompt write are restored from the
+        # journal row, so this successor settles the SAME [baseline, N) with the SAME echo
+        # provenance (baseline 0 / no events made the same run settle differently).
+        delivery = self._restore_delivery(mine)
         self._journal(kind="EVENT", derived_from="runtime_state", event="identity_bound",
                       state=self.state,
                       vocabulary={"adopted": True, "pid": pid, "captured_tty": tty,
                                   "pty_id": pty_id, "argv_digest": argv_digest,
                                   "spawn_record": record,
+                                  "settlement_baseline": int(self._settlement_baseline or 0),
+                                  "delivery_events_restored": int(delivery["events"]),
+                                  "delivery_provenance": ("restored" if delivery["restored"]
+                                                          else delivery["reason"]),
                                   "detail": "a successor process reconstructed this "
                                             "dispatch from its durable spawn record and "
                                             "journal; nothing was spawned",
@@ -1748,6 +1758,10 @@ class StandaloneSession:
                                "fence": (self._boundary or {}).get("fence"),
                                "boundary": {"offset_n": (self._boundary or {}).get("offset_n"),
                                             "baseline": self._settlement_baseline},
+                               # PR #36 findings 1 / 2: the bounded range the selector read
+                               # and the post-N diagnostic state, on the settlement row
+                               "settlement_range": evidence.get("settlement_range"),
+                               "post_boundary": evidence.get("post_boundary"),
                                "provenance_outcome": evidence.get("provenance_outcome"),
                                "diagnostic_tail_bytes": (self._release or {}).get("retained_tail_bytes"),
                                "diagnostic_tail_sha256": (self._release or {}).get("retained_tail_sha256"),
@@ -2638,6 +2652,16 @@ class StandaloneSession:
         or descriptor enumeration.  A masterless (adopted) session reads the fence from disk
         (:meth:`_fence_from_disk`) instead.
         """
+        if self._boundary is not None:
+            # PR #36 finding 1: a fence this session already bound is a property of the fence
+            # file and of [0, N) -- re-verified over exactly those bytes (`fence_matches`
+            # digests the prefix) and never by re-scanning the whole capture for the marker:
+            # the diagnostic tail appended since is not read by a settlement path at all.
+            existing = capture_mod.read_capture_fence(self._fence_path(), fence=self.fence)
+            return self._bind_fence({"bytes": 0, "ended": "marker", "errno": "",
+                                     "offset_n": int(self._boundary["offset_n"]),
+                                     "marker_len": int(self._boundary.get("marker_len") or 0)},
+                                    existing, self._read_sentinel())
         if self.pty is None or int(self.pty["master_fd"]) < 0:
             return self._fence_from_disk({"bytes": 0, "ended": "no_master", "errno": ""})
         fd = int(self.pty["master_fd"])
@@ -2845,6 +2869,10 @@ class StandaloneSession:
             self._journal(kind="EVENT", derived_from="pty", event="owner_claimed",
                           state=self.state, vocabulary={"generation": 1, "owner": owner})
             data = self.capture.raw()
+            # PR #36 finding 1: the capture's answerability is MEASURED here, at publish, and
+            # bound into the fence as the fact a fenced settlement reads; the provenance
+            # entry is listed only when the measurement is positive.
+            publish_state = self._capture_state_at_publish()
             record = capture_mod.make_capture_fence(
                 fence=self.fence, emitter=emitter,
                 emitter_pgid=int((self.record or {}).get("pgid") or 0),
@@ -2856,12 +2884,13 @@ class StandaloneSession:
                 owner=generation, evidence_source=pty_supervisor.evidence_source_id(),
                 provenance=[pty_supervisor.capture_mod_PROVENANCE_REAPED,
                             pty_supervisor.capture_mod_PROVENANCE_MARKER_WRITTEN,
-                            pty_supervisor.capture_mod_PROVENANCE_MARKER_OBSERVED,
-                            "capture_integrity_answerable_at_publish",
-                            pty_supervisor.capture_mod_PROVENANCE_OWNER_CLAIMED,
-                            pty_supervisor.capture_mod_PROVENANCE_SENTINEL if exit_how == "exit_sentinel" else exit_how],
+                            pty_supervisor.capture_mod_PROVENANCE_MARKER_OBSERVED]
+                           + ([pty_supervisor.capture_mod_PROVENANCE_ANSWERABLE_AT_PUBLISH]
+                              if publish_state["answerable"] else [])
+                           + [pty_supervisor.capture_mod_PROVENANCE_OWNER_CLAIMED,
+                              pty_supervisor.capture_mod_PROVENANCE_SENTINEL if exit_how == "exit_sentinel" else exit_how],
                 published_at=_now_iso(),
-                sidecar=self._sidecar_fence_field())
+                sidecar=self._sidecar_fence_field(), capture_state=publish_state)
             try:
                 capture_mod.write_capture_fence(fence_path, record)
             except OSError as exc:
@@ -2870,6 +2899,16 @@ class StandaloneSession:
                 return drained
             existing = capture_mod.read_capture_fence(fence_path, fence=self.fence)
         return self._bind_fence(drained, existing, sentinel)
+
+    def _capture_state_at_publish(self) -> dict[str, Any]:
+        """PR #36 finding 1: the store's answerability and counters AT PUBLISH (an adopted /
+        masterless publisher re-reads the meta first), in the fence's closed shape."""
+        if self.adopted:
+            self.capture.refresh()
+        return capture_mod.capture_state_at_publish(
+            answerable=self.capture.completion_is_answerable(),
+            truncation=self.capture.truncation, dropped_bytes=self.capture.dropped_bytes,
+            total_bytes=self.capture.size)
 
     def _bind_fence(self, drained: dict[str, Any], existing: Mapping[str, Any],
                     sentinel: Mapping[str, Any]) -> dict[str, Any]:
@@ -2912,7 +2951,9 @@ class StandaloneSession:
                       vocabulary={"offset_n": int(boundary["offset_n"]),
                                   "sha256_prefix": boundary.get("sha256_prefix"),
                                   "owner": record.get("owner"), "exit": record.get("exit"),
-                                  "provenance": record.get("provenance")})
+                                  "provenance": record.get("provenance"),
+                                  # PR #36 finding 1: the answerability fact the settlement reads
+                                  "capture_at_publish": record.get("capture_at_publish")})
         return drained
 
     def _fence_from_disk(self, drained: dict[str, Any]) -> dict[str, Any]:
@@ -3040,6 +3081,7 @@ class StandaloneSession:
             drained["outcome"] = refused
             drained["finality_detail"] = f"succession lost: {refused}"
             return refused
+        publish_state = self._capture_state_at_publish()          # PR #36 finding 1
         record = capture_mod.make_capture_fence(
             fence=self.fence, emitter=emitter,
             emitter_pgid=int((self.record or {}).get("pgid") or 0),
@@ -3050,8 +3092,11 @@ class StandaloneSession:
             evidence_source=pty_supervisor.evidence_source_id(),
             provenance=[pty_supervisor.capture_mod_PROVENANCE_MARKER_OBSERVED,
                         pty_supervisor.capture_mod_PROVENANCE_OWNER_CLAIMED,
-                        "published_by_successor_from_captured_marker"],
-            published_at=_now_iso(), sidecar=self._sidecar_fence_field())
+                        "published_by_successor_from_captured_marker"]
+                       + ([pty_supervisor.capture_mod_PROVENANCE_ANSWERABLE_AT_PUBLISH]
+                          if publish_state["answerable"] else []),
+            published_at=_now_iso(), sidecar=self._sidecar_fence_field(),
+            capture_state=publish_state)
         try:
             capture_mod.write_capture_fence(self._fence_path(), record)
         except OSError as exc:
@@ -3529,6 +3574,11 @@ class StandaloneSession:
                               cols=self.profile.cols),
                           "at": _now_iso()}
         self.delivery_events.append(delivery_event)
+        # OS-48 PR #36 finding 4: the baseline and the event's DIGEST-ONLY provenance are
+        # DURABLE before the bytes go out (never the prompt: REVIEW_BUGFIX F-001), so a
+        # successor adopting this dispatch after a supervisor crash settles over the same
+        # [baseline, N) with the same echo provenance (`adopt` restores both).
+        self._record_delivery()
         # Round-7 consolidated review, follow-up item 6.  The delivery this write must
         # prove is bound to a DELIVERY INTENT of its own: the identity this dispatch is
         # bound to (the minted id, or the frozen adopted one) and the digest of THIS
@@ -3572,6 +3622,81 @@ class StandaloneSession:
                                   "pid": self.record["pid"],
                                   "captured_tty": self.record["captured_tty"]})
         return {"intent_id": self.intent_id, **result}
+
+    # -- OS-48 PR #36 finding 4: durable delivery provenance ----------------------------------
+    #: the journal row's `event` names (closed): the provenance was recorded; an adoption that
+    #: could not restore what the journal names
+    DELIVERY_RECORDED_EVENT = "delivery_recorded"
+    DELIVERY_UNRESTORED_EVENT = "delivery_provenance_unrestored"
+    #: the closed per-event vocabulary of a `delivery_recorded` row -- digests and transport
+    #: facts only; there is NO payload key (REVIEW_BUGFIX F-001)
+    DELIVERY_EVENT_ROW_KEYS = ("index", "offset", "payload_sha256", "payload_bytes", "transport",
+                               "at", "echo_proof")
+
+    def _record_delivery(self) -> None:
+        """Persist `_settlement_baseline` + `delivery_events` as ONE journal row
+        `delivery_recorded` whose closed vocabulary carries, per event, the offset, the
+        `EchoTransport`, the payload's sha256 + byte length, `at`, and the DIGEST-ONLY
+        `echo_proof` (`lifecycle.echo_proof`: the echo class by name -- `echo_absent` for an
+        `argv` delivery or a pty write with ECHO clear -- or, for an echo-possible pty write,
+        the sha256 + length of each echo form the recorded transport can produce).  No byte
+        of the prompt is written anywhere durable (REVIEW_BUGFIX i1 F-001: the journal is a
+        plain file a stranger reads -- `append_delivery_intent`'s rule -- and an `argv` prompt
+        is not in the capture either); the earlier `capture.log.delivery.<inc>.json` record,
+        which carried the payload, no longer exists.  A successor restores the baseline and
+        payload-less events from this row (`_restore_delivery`) and `resolve_delivery_echo`
+        resolves them from the proof to the SAME verdict the live payload produced."""
+        self._journal(kind="EVENT", derived_from="driver", event=self.DELIVERY_RECORDED_EVENT,
+                      state=self.state,
+                      vocabulary={"baseline": int(self._settlement_baseline or 0),
+                                  "delivery_mode": self.profile.delivery_mode,
+                                  "events": [{"index": i, "offset": int(ev.get("offset", 0) or 0),
+                                              "payload_sha256": _sha256_text(str(ev.get("payload") or "")),
+                                              "payload_bytes": len(str(ev.get("payload") or "").encode("utf-8")),
+                                              "transport": _journal_transport(ev.get("transport")),
+                                              "at": str(ev.get("at") or ""),
+                                              "echo_proof": lifecycle.echo_proof(
+                                                  str(ev.get("payload") or ""),
+                                                  ev.get("transport") if isinstance(ev.get("transport"), Mapping) else {})}
+                                             for i, ev in enumerate(self.delivery_events)]})
+
+    def _restore_delivery(self, rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+        """The adopt-side half: from the LAST `delivery_recorded` row of this incarnation,
+        restore the baseline and one PAYLOAD-LESS event per recorded event -- offset,
+        transport, `at` and the `echo_proof` -- so the fenced selector excludes exactly what
+        the live session excluded (an `echo_absent` class by name; a digest-verified span for
+        an echo-possible transport) and nothing on any weaker evidence.  A row whose event
+        vocabulary is not the closed shape restores NO event and is journalled by name
+        (`delivery_provenance_unrestored`): the selector then excludes nothing (fail closed)."""
+        self._settlement_baseline = 0
+        self.delivery_events = []
+        named = [row for row in rows if row.get("kind") == "EVENT"
+                 and row.get("event") == self.DELIVERY_RECORDED_EVENT]
+        if not named:
+            return {"restored": False, "reason": "no_delivery_recorded_row", "events": 0}
+        vocab = dict(named[-1].get("source_vocabulary") or {})
+        baseline = vocab.get("baseline")
+        self._settlement_baseline = baseline if isinstance(baseline, int) and not isinstance(baseline, bool) else 0
+        recorded = vocab.get("events")
+        reason = ""
+        if not isinstance(recorded, list):
+            reason = "delivery_recorded_row_malformed"
+        elif any(not isinstance(ev, Mapping) or set(ev) != set(self.DELIVERY_EVENT_ROW_KEYS)
+                 or "payload" in ev for ev in recorded):
+            reason = "delivery_recorded_events_malformed"
+        if reason:
+            self._journal(kind="EVENT", derived_from="driver", event=self.DELIVERY_UNRESTORED_EVENT,
+                          state=self.state,
+                          vocabulary={"reason": reason, "baseline": int(self._settlement_baseline),
+                                      "events_named": len(recorded) if isinstance(recorded, list) else 0,
+                                      "events_restored": 0})
+            return {"restored": False, "reason": reason, "events": 0}
+        self.delivery_events = [{"offset": int(ev.get("offset", 0) or 0), "payload": "",
+                                 "transport": dict(ev["transport"]) if isinstance(ev.get("transport"), Mapping) else None,
+                                 "at": str(ev.get("at") or ""),
+                                 "echo_proof": dict(ev["echo_proof"]) if isinstance(ev.get("echo_proof"), Mapping) else None}
+                                for ev in recorded]
+        return {"restored": True, "reason": "", "events": len(self.delivery_events)}
 
     def _verify_delivery(self, baseline: int, baseline_working: bool, *,
                          event: Mapping[str, Any] | None = None,
@@ -3765,7 +3890,29 @@ class StandaloneSession:
             # one appending to the capture, so the meta and the bytes are re-read every
             # time rather than trusted from memory.
             self.capture.refresh()
-        answerable = self.capture.completion_is_answerable()
+        # OS-48 PR #36 finding 1: with a VERIFIED fence the answerability a settlement rests on
+        # is the fence's own recorded fact about [0, N) (`capture_at_publish`: the store had
+        # lost nothing when the owner published), never the live WHOLE-FILE state -- every
+        # limit drop / line cut / failed write / meta disagreement after the publish lies past
+        # the bytes the fence bound and is a fact about the diagnostic tail only.  On that
+        # path the whole file is not digested or read at all; the store's COUNTERS (the meta's
+        # truncation cause, dropped bytes, the irreversible unanswerable cause, the size) are
+        # recorded as `post_boundary` -- diagnostic evidence by name, moving nothing.  Before a
+        # fence is bound, or for a fence that carries no such fact (published before the field
+        # existed), the whole-capture answer stays in force -- fail-closed, as before.
+        post_boundary: dict[str, Any] | None = None
+        fenced = capture_mod.fenced_answerability(self._boundary.get("fence")) if self._boundary else None
+        if fenced is not None and fenced["source"] == capture_mod.ANSWERABILITY_SOURCE_FENCE:
+            answerable = fenced
+        else:
+            answerable = self.capture.completion_is_answerable()
+        if self._boundary is not None:
+            post_boundary = {"truncation": self.capture.truncation or "",
+                             "dropped_bytes": int(self.capture.dropped_bytes),
+                             "unanswerable": str(self.capture.unanswerable or ""),
+                             "size": int(self.capture.size),
+                             "offset_n": int(self._boundary["offset_n"]),
+                             "answerability_source": str((fenced or {}).get("source") or "")}
         exit_proven = sentinel["outcome"] == "exited"
         if not exit_proven and self.exit_proof is not None and self.exit_proof["proven"]:
             # The exit was proven by the ownership ladder / the process table with no
@@ -3779,19 +3926,22 @@ class StandaloneSession:
             offset_n = int(self._boundary["offset_n"])
             baseline = min(max(0, int(self._settlement_baseline or 0)), offset_n)
             try:
-                # The SEMANTIC rule: only [baseline, N) reaches the selector.  The PHYSICAL
-                # read (run_5fcd2beac376 N-003, stated exactly): `capture.raw(baseline)` reads
-                # the file from `baseline` THROUGH EOF -- the fence marker and whatever
-                # diagnostic tail has been appended since -- and the slice below then keeps
-                # the prefix; it is a whole-tail read followed by prefix slicing, not a
-                # bounded read of N-baseline bytes.  The bytes past N are dropped before any
-                # parser sees them, so they can change nothing; a bounded read would only
-                # shrink this reader's own allocation.
-                fenced_raw = self.capture.raw(baseline)[:offset_n - baseline]
+                # The SEMANTIC rule: only [baseline, N) reaches the selector -- and (PR #36
+                # finding 1) the PHYSICAL read is exactly that: ONE bounded read of
+                # `N - baseline` bytes at `baseline`.  The marker and whatever diagnostic tail
+                # has been appended since are never read, allocated or decoded here, so a
+                # tail of any size -- or one too large to allocate -- has no path into this
+                # settlement (run_5fcd2beac376 N-003 read the file through EOF and sliced).
+                fenced_raw = self.capture.raw(baseline, offset_n - baseline)
                 fenced_text = fenced_raw.decode("utf-8", errors="replace")
-                events = ()
-                if self.delivery_intent and self.delivery_intent.get("payload"):
-                    events = ({**dict(self.delivery_intent), "offset": 0},)
+                # PR #36 finding 2: the selector gets the REAL delivery provenance -- the
+                # events `send` / `run_dispatch` recorded (payload, the `EchoTransport` read at
+                # the write, the capture offset of the write) -- translated into the fenced
+                # range's raw-byte coordinates.  `delivery_intent` carries a digest, never a
+                # payload, and could prove no echo; a negative translated offset (a delivery
+                # before the baseline) is `delivery_before_window`, unproven, excludes nothing.
+                events = tuple({**dict(ev), "offset": int(ev.get("offset", 0) or 0) - baseline}
+                               for ev in self.delivery_events if isinstance(ev, Mapping))
                 selection = self.driver.select_completion(
                     fenced_text, raw=fenced_raw,
                     bound_value=self._binding_identity(fenced_text) or "",
@@ -3801,6 +3951,12 @@ class StandaloneSession:
                     # change the verdict.  `absent` / unreadable / unproven -> provenance_unbound.
                     sidecar_present=self._sidecar_state == capture_mod.SIDECAR_STATE_PRESENT,
                     delivery_events=events)
+                selection = dict(selection)
+                selection["settlement_range"] = {
+                    "baseline": baseline, "offset_n": offset_n, "read_bytes": len(fenced_raw),
+                    "delivery_events": len(events),
+                    "echo": str((selection.get("echo") or {}).get("state") or "no_delivery"),
+                    "echo_reason": str((selection.get("echo") or {}).get("reason") or "")}
             except MemoryError:
                 # REVIEW_IMPLEMENTATION_iteration2 F-017: the reader could not EXAMINE the fenced
                 # range for want of memory -- in the parser (already classified inside
@@ -3842,6 +3998,10 @@ class StandaloneSession:
             capture_answerable=answerable["answerable"],
             selection=selection)
         evidence["boundary"] = dict(self._boundary) if self._boundary else None
+        if selection is not None and selection.get("settlement_range"):
+            evidence["settlement_range"] = dict(selection["settlement_range"])
+        if post_boundary is not None:
+            evidence["post_boundary"] = post_boundary
         if not answerable["answerable"]:
             # The capture names WHY it cannot answer; the driver only knows THAT it cannot.
             evidence["lost_reason"] = answerable["lost_reason"]
@@ -3993,6 +4153,23 @@ def _journal_echo(echo: Mapping[str, Any] | None) -> dict[str, Any] | None:
                         "span": [int(e["span"][0]), int(e["span"][1])]
                         if e.get("span") else None}
                        for e in (echo.get("events") or ()) if isinstance(e, Mapping)]}
+
+
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _journal_transport(transport: Any) -> dict[str, Any] | None:
+    """The journal-safe form of an `EchoTransport`: kind, framing, columns and the termios
+    flags (plain bools / ints already) -- no payload bytes are in it."""
+    if not isinstance(transport, Mapping):
+        return None
+    out = {"kind": str(transport.get("kind", "")), "framed": bool(transport.get("framed")),
+           "cols": int(transport.get("cols", 0) or 0), "read_at": str(transport.get("read_at", ""))}
+    flags = transport.get("termios")
+    out["termios"] = ({str(k): (list(v) if isinstance(v, (list, tuple)) else v) for k, v in flags.items()}
+                      if isinstance(flags, Mapping) else None)
+    return out
 
 
 def _now_iso() -> str:

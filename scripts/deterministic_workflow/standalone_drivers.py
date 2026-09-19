@@ -36,7 +36,8 @@ from . import standalone_capture as capture
 from .standalone_lifecycle import (BRACKETED_PASTE_END, BRACKETED_PASTE_START,
                                    DELIVERY_OUTCOMES, DELIVERY_PROOFS, EVIDENCE_TIERS)
 from .standalone_lifecycle import ESC_REPLACEMENT as _LIFECYCLE_ESC_REPLACEMENT
-from .standalone_lifecycle import decide_readiness, refusal_evidence
+from .standalone_lifecycle import (decide_readiness, refusal_evidence, resolve_delivery_echo,
+                                   strip_delivery_echo)
 from .standalone_profile import (DELIVERY_MODES, IDENTITY_BINDINGS, RESUME_CHANNELS,
                                  StandaloneProfile)
 
@@ -899,10 +900,27 @@ class _Driver:
            `single_record_optin`: no binding); an undeclared mode, an empty bound value, an
            absent / mismatched / unreadable field → ``provenance_unbound`` (LOST).
 
-        ``{"record": dict|None, "outcome": None|str, "refusal": dict|None, "candidates": int}``.
-        A success is returned ONLY when all three hold; ``completion_verdict`` (the PINNED
-        agent's exit code) still applies afterwards.
+        ``{"record": dict|None, "outcome": None|str, "refusal": dict|None, "candidates": int,
+        "echo": {"state", "reason", "spans"}}``.  A success is returned ONLY when all three
+        hold; ``completion_verdict`` (the PINNED agent's exit code) still applies afterwards.
+
+        OS-48 PR #36 finding 2 (echo provenance): ``delivery_events`` are the runtime's REAL
+        delivery events -- payload, the `EchoTransport` read at the write, and the offset
+        translated into ``raw``'s coordinates.  A span `lifecycle.resolve_delivery_echo`
+        PROVES to be the echo of a delivered prompt is excised from ``raw`` BEFORE anything
+        below reads records, candidates or framing, so prompt text the line discipline echoed
+        back -- a refusal phrase, a y/n question, a result-JSON example -- is never a refusal,
+        a framing candidate or a completion candidate.  Only a PROVEN echo is excised; an
+        unproven one (`echo_unproven`, named) excludes nothing, and the scan then runs over
+        the superset -- fail closed, exactly as `refusal_evidence` already did for R1.
         """
+        echo: dict[str, Any] = {"state": "no_delivery", "reason": "", "spans": ()}
+        if raw is not None and delivery_events:
+            resolution = resolve_delivery_echo(raw, delivery_events)
+            echo = {"state": str(resolution["state"]), "reason": str(resolution["reason"]),
+                    "spans": tuple(tuple(span) for span in resolution["spans"])}
+            if resolution["state"] == "echo_proven":
+                text = capture.BoundedCapture.transcript_of(strip_delivery_echo(raw, delivery_events))
         records = self.structured_records(text)
         candidates = self.completion_candidates(text)
         # F-015 -- completion/refusal-SHAPED objects the record grammar cannot see (helper
@@ -941,19 +959,19 @@ class _Driver:
                 # `completion_verdict` names that leg (`error_field_set`) -- the same fail-closed
                 # outcome, with the operator-visible leg preserved.  R1 dominance is what makes
                 # a refusal BEFORE a later success count; here there is no later success.
-                return {"record": last, "outcome": None, "refusal": refusal, "candidates": 1}
+                return {"record": last, "outcome": None, "refusal": refusal, "candidates": 1, "echo": echo}
             return {"record": last, "outcome": capture.OUTCOME_REFUSAL_IN_BOUNDARY,
-                    "refusal": refusal, "candidates": len(candidates)}
+                    "refusal": refusal, "candidates": len(candidates), "echo": echo}
         if not framed["complete"]:
             # i8 F-015: the framing scan hit its bound BEFORE examining the whole range and
             # found no refusal in what it did examine: R1 and R2 are UNDECIDED, not decided in
             # the success's favour -- named, never COMPLETED.
             return {"record": None, "outcome": capture.OUTCOME_RECORD_SCAN_INCOMPLETE,
-                    "refusal": None, "candidates": len(candidates) + len(framing),
+                    "refusal": None, "candidates": len(candidates) + len(framing), "echo": echo,
                     "scan": {"complete": False, "reason": framed["reason"], "examined": framed["examined"]}}
         if framing:
             return {"record": None, "outcome": capture.OUTCOME_RECORD_FRAMING_AMBIGUOUS,
-                    "refusal": None, "candidates": len(candidates) + len(framing),
+                    "refusal": None, "candidates": len(candidates) + len(framing), "echo": echo,
                     "framing": [{"record_type": f["record_type"], "run": f["run"]} for f in framing]}
         if not candidates:
             # No DECLARED completion record.  The driver's last record of a completion SHAPE
@@ -961,25 +979,26 @@ class _Driver:
             # sees `completion_record_undeclared` rather than a bare absence; it can only
             # refuse there (an undeclared type never matches a selector).
             legacy = self.completion_record(text)
-            return {"record": legacy, "outcome": None, "refusal": None, "candidates": 0}
+            return {"record": legacy, "outcome": None, "refusal": None, "candidates": 0, "echo": echo}
         if len(candidates) > 1:
             return {"record": None, "outcome": capture.OUTCOME_PROVENANCE_AMBIGUOUS,
-                    "refusal": None, "candidates": len(candidates)}
+                    "refusal": None, "candidates": len(candidates), "echo": echo}
         only = candidates[0]
         selector = next((s for s in self.profile.completion_records
                          if s.record_type == only.get("type")), None)
         mode = selector.binding_mode if selector is not None else ""
         unbound = {"record": None, "outcome": capture.OUTCOME_PROVENANCE_UNBOUND,
-                   "refusal": None, "candidates": 1}
+                   "refusal": None, "candidates": 1, "echo": echo}
+        bound = {"record": only, "outcome": None, "refusal": None, "candidates": 1, "echo": echo}
         if mode == "single_record_optin":
-            return {"record": only, "outcome": None, "refusal": None, "candidates": 1}
+            return bound
         if mode not in ("session_field", "sidecar_file") or not bound_value:
             return unbound
         field = selector.binding_field
         if mode == "session_field":
             if str(_dig(only, field) if _dig(only, field) is not None else "") != bound_value:
                 return unbound
-            return {"record": only, "outcome": None, "refusal": None, "candidates": 1}
+            return bound
         if not sidecar_present:
             return unbound
         observed = _dig(only, field)
@@ -992,7 +1011,7 @@ class _Driver:
             observed = None if carrier is None else _dig(carrier, field)
         if observed is None or str(observed) != bound_value:
             return unbound
-        return {"record": only, "outcome": None, "refusal": None, "candidates": 1}
+        return bound
 
     def completion_evidence(self, text: str, *, exit_status: int | None,
                             exit_proven: bool,

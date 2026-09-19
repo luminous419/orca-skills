@@ -1067,7 +1067,8 @@ def _watch(agent_pid: int, *, master_fd: int, slave_fd: int, guard_r: int,
     members.note_reaped(agent_pid)
     # ---- the FENCE MARKER, written by the OWNER into ITS slave fd AFTER the reap -------------
     marker_written = _write_marker_bounded(slave_fd, capture_mod.marker_bytes(fence_nonce)
-                                           if fence_nonce else b"", master_fd, appender)
+                                           if fence_nonce else b"", master_fd, appender,
+                                           slave_name=slave_name)
     if sentinel is not None:
         write_exit_sentinel(sentinel, code=code, fence=fence)
     if not orphaned:
@@ -1093,7 +1094,8 @@ def _watch(agent_pid: int, *, master_fd: int, slave_fd: int, guard_r: int,
                 next_release_walk[0] = time.monotonic() + 1.0
         orphaned, release_written = _defer_for_release(
             dh_r, guard_r, control_fd, ctl, slave_fd, fence_nonce, master_fd,
-            budget_s=max(0, int(drain_budget_ms)) / 1000.0, on_tick=_tick)
+            budget_s=max(0, int(drain_budget_ms)) / 1000.0, on_tick=_tick,
+            slave_name=slave_name)
         if orphaned:
             appender = _orphan_take_over(guard_r, capture, capture_limits)
     if orphaned and capture is not None:
@@ -1104,7 +1106,7 @@ def _watch(agent_pid: int, *, master_fd: int, slave_fd: int, guard_r: int,
                              budget_s=max(0, int(drain_budget_ms)) / 1000.0,
                              host_boot_id=host_boot_id, agent_pid=agent_pid,
                              agent_start_id=agent_start_id, release_written=release_written,
-                             sidecar_path=sidecar_path)
+                             sidecar_path=sidecar_path, slave_name=slave_name)
         except Exception:  # noqa: BLE001 - a watcher never dies of bookkeeping
             pass
     members.close()                                    # final ledger accounting
@@ -2225,25 +2227,56 @@ def _reap_reparented(agent_pid: int, members: "_Membership | None" = None) -> No
             members.note_reaped(int(info.si_pid))
 
 
+def _open_marker_descriptor(slave_fd: int, slave_name: str = "") -> int:
+    """[FORKED-SAFE] A NEW open file description on the slave device, opened by PATH
+    (``slave_name``, or the device name of ``slave_fd`` read now), non-blocking from the open:
+    its file-status flags are its own.  ``-1`` when it cannot be opened (the caller then
+    writes nothing and the boundary stays `boundary_unproven` by name -- it never falls back
+    to mutating a shared description)."""
+    path = slave_name
+    if not path:
+        try:
+            path = os.ttyname(slave_fd)
+        except OSError:
+            return -1
+    try:
+        return os.open(path, os.O_WRONLY | os.O_NOCTTY | os.O_NONBLOCK
+                       | getattr(os, "O_CLOEXEC", 0))
+    except OSError:
+        return -1
+
+
 def _write_marker_bounded(slave_fd: int, marker: bytes, master_fd: int,
-                          appender: Any, attempts: int = 200) -> bool:
-    """[FORKED-SAFE] Write the marker into the owner-held slave fd WITHOUT blocking forever
-    (DESIGN O-3): the fd is set non-blocking for the write; on EAGAIN the watcher drains the
-    master it holds (so the FIFO can make room) and retries, bounded.  ``False`` = the marker
-    could not be written (a successor then reads `boundary_unproven` by name)."""
+                          appender: Any, attempts: int = 200, *, slave_name: str = "") -> bool:
+    """[FORKED-SAFE] Write the marker into the slave's output FIFO WITHOUT blocking forever
+    (DESIGN O-3) and WITHOUT touching the file-status flags of any descriptor the agent
+    subtree shares (OS-48 PR #36 finding 3).
+
+    The owner-held ``slave_fd`` is the SAME open file description as the agent's 0/1/2 (the
+    leader ``dup2``'d it before forking the agent) and as every descendant's inherited stdio;
+    an ``F_SETFL(O_NONBLOCK)`` on it -- what this function did before -- turned the whole
+    subtree's blocking reads/writes into ``EAGAIN`` / short writes for the duration of the
+    marker write (MEASURED from inside a descendant: `test_os48_pr36_locks` L-5).  The marker
+    is therefore written through a descriptor opened SEPARATELY by the slave's device path
+    (`_open_marker_descriptor`): a new open file description, non-blocking from its open, on
+    the same tty -- the same single output FIFO (DESIGN §1.1), so the in-band ordering fact is
+    unchanged (re-measured over 256 KiB, L-5) -- and closed right after.  ``slave_fd`` is
+    never written through and never has a flag set or cleared; it remains the owner-held
+    KEEPALIVE reference only (DESIGN §1.3).  On ``EAGAIN`` the watcher drains the master it
+    holds (so the FIFO can make room) and retries, bounded.  ``False`` = the marker could not
+    be written (no device path, the path could not be opened, or the bound elapsed): a
+    successor then reads `boundary_unproven` by name."""
     if not marker or slave_fd < 0:
         return False
-    try:
-        flags = fcntl.fcntl(slave_fd, fcntl.F_GETFL)
-        fcntl.fcntl(slave_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
-    except OSError:
-        flags = None
+    marker_fd = _open_marker_descriptor(slave_fd, slave_name)
+    if marker_fd < 0:
+        return False
     written = 0
     ok = False
     try:
         for _ in range(attempts):
             try:
-                written += os.write(slave_fd, marker[written:])
+                written += os.write(marker_fd, marker[written:])
             except BlockingIOError:
                 if appender is not None:
                     _drain_once(master_fd, appender, budget=0.01)
@@ -2256,17 +2289,17 @@ def _write_marker_bounded(slave_fd: int, marker: bytes, master_fd: int,
                 ok = True
                 break
     finally:
-        if flags is not None:
-            try:
-                fcntl.fcntl(slave_fd, fcntl.F_SETFL, flags)
-            except OSError:
-                pass
+        try:
+            os.close(marker_fd)
+        except OSError:
+            pass
     return ok
 
 
 def _defer_for_release(dh_r: int, guard_r: int, control_fd: int, ctl: "_ControlServer",
                        slave_fd: int, fence_nonce: str, master_fd: int, *,
-                       budget_s: float, on_tick: Any = None) -> tuple[bool, bool]:  # pragma: no cover - runs in the forked watcher
+                       budget_s: float, on_tick: Any = None,
+                       slave_name: str = "") -> tuple[bool, bool]:  # pragma: no cover - runs in the forked watcher
     """DESIGN §1.6 two-phase release, watcher side.  Blocks after the sentinel, keeping the
     slave reference, serving: ``R`` (release-1: write the RELEASE marker, close NOTHING),
     ``C`` (release-2: the supervisor consumed up to R -- close is done by the caller), control
@@ -2305,7 +2338,8 @@ def _defer_for_release(dh_r: int, guard_r: int, control_fd: int, ctl: "_ControlS
             if byte == b"R":
                 if not release_written:
                     _write_marker_bounded(slave_fd, capture_mod.release_marker_bytes(fence_nonce)
-                                          if fence_nonce else b"", master_fd, None)
+                                          if fence_nonce else b"", master_fd, None,
+                                          slave_name=slave_name)
                     release_written = True
                 continue
             if byte == b"C":
@@ -2326,7 +2360,8 @@ def _orphan_finalize(master_fd: int, slave_fd: int, appender: Any, *, capture: b
                      sentinel: str | os.PathLike[str] | None, witness: "_ParentWitness",
                      budget_s: float, host_boot_id: str, agent_pid: int, agent_start_id: int,
                      clock: Any = time.monotonic, reader: Any = os.read,
-                     release_written: bool = False, sidecar_path: str = "") -> dict[str, Any]:
+                     release_written: bool = False, sidecar_path: str = "",
+                     slave_name: str = "") -> dict[str, Any]:
     """[FORKED-SAFE] The exit watcher's ORPHAN finalize (DESIGN §1.6 orphan path).  The agent
     is reaped and the marker written; the supervisor is gone (guard EOF).  In order:
     1. drain the master into the capture until the FENCE MARKER is in the capture FILE (bounded);
@@ -2452,6 +2487,23 @@ def _orphan_finalize(master_fd: int, slave_fd: int, appender: Any, *, capture: b
         sidecar_field = (None if not sidecar_path else
                          {k: snapshot["record"].get(k) for k in ("state", "path", "sha256", "bytes", "instant", "error")}
                          if snapshot["record"] is not None else {"state": capture_mod.SIDECAR_STATE_UNPROVEN})
+        # PR #36 finding 1: the capture's answerability AT PUBLISH, from this writer's own
+        # appender state (raw, forked-safe): a limit drop / line cut (`truncation`) or an
+        # irreversible unanswerable cause (`unanswerable`) recorded up to now means the range
+        # is not vouched for; otherwise [0, N) is complete and later tail events are diagnostic.
+        publish_state = None
+        if appender is not None:
+            lost = ""
+            integrity = ""
+            if getattr(appender, "unanswerable", ""):
+                lost, integrity = capture_mod.CAPTURE_INTEGRITY_LOST_REASON, str(appender.unanswerable)
+            elif getattr(appender, "truncation", ""):
+                lost = capture_mod.CAPTURE_TRUNCATED_LOST_REASON
+            publish_state = capture_mod.capture_state_at_publish(
+                answerable={"answerable": not lost, "lost_reason": lost, "integrity": integrity},
+                truncation=getattr(appender, "truncation", ""),
+                dropped_bytes=int(getattr(appender, "dropped", 0) or 0),
+                total_bytes=int(getattr(appender, "total", 0) or 0))
         record = None if generation is None else capture_mod.make_capture_fence(
             fence=fence,
             emitter=emitter_identity,
@@ -2463,8 +2515,10 @@ def _orphan_finalize(master_fd: int, slave_fd: int, appender: Any, *, capture: b
             evidence_source=evidence_source_id(),
             provenance=[capture_mod_PROVENANCE_REAPED, capture_mod_PROVENANCE_MARKER_WRITTEN,
                         capture_mod_PROVENANCE_MARKER_OBSERVED, capture_mod_PROVENANCE_OWNER_CLAIMED,
-                        capture_mod_PROVENANCE_SENTINEL],
-            published_at=_now_iso(), sidecar=sidecar_field)
+                        capture_mod_PROVENANCE_SENTINEL]
+                       + ([capture_mod_PROVENANCE_ANSWERABLE_AT_PUBLISH]
+                          if publish_state and publish_state["answerable"] else []),
+            published_at=_now_iso(), sidecar=sidecar_field, capture_state=publish_state)
         if record is None:
             pass                                       # no claim: release only, publish nothing
         elif not capture_mod.write_capture_fence(fence_path, record):
@@ -2476,7 +2530,8 @@ def _orphan_finalize(master_fd: int, slave_fd: int, appender: Any, *, capture: b
     # between release-1 and its record) is REUSED -- the boundary R is whatever the stream
     # already holds; a second marker with the same nonce would make it `inconsistent`.
     if not release_written:
-        _write_marker_bounded(slave_fd, capture_mod.release_marker_bytes(fence_nonce), master_fd, appender)
+        _write_marker_bounded(slave_fd, capture_mod.release_marker_bytes(fence_nonce), master_fd, appender,
+                              slave_name=slave_name)
     out["release_marker_reused"] = bool(release_written)
     r_deadline = clock() + max(budget_s, 0.5)
     offset_r, r_state = -1, capture_mod.EVIDENCE_UNKNOWN
@@ -2590,6 +2645,9 @@ capture_mod_PROVENANCE_MARKER_WRITTEN = "marker_written_by_owner_into_owner_held
 capture_mod_PROVENANCE_MARKER_OBSERVED = "marker_observed_in_capture_at_offset_n"
 capture_mod_PROVENANCE_OWNER_CLAIMED = "owner_record_claimed_exclusive_link"
 capture_mod_PROVENANCE_SENTINEL = "exit_sentinel_present_same_fence"
+#: PR #36 finding 1: listed ONLY when the publisher MEASURED the capture answerable at publish
+#: (the fence's `capture_at_publish` field carries the fact itself).
+capture_mod_PROVENANCE_ANSWERABLE_AT_PUBLISH = "capture_integrity_answerable_at_publish"
 
 
 def evidence_source_id() -> str:

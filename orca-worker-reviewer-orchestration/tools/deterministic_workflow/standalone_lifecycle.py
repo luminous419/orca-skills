@@ -669,6 +669,181 @@ def expected_echo_forms(payload: str, transport: Mapping[str, Any]) -> dict[str,
     return {"state": "echo_expected", "reason": "", "forms": tuple(forms)}
 
 
+#: OS-48 PR #36 review i1 F-001 -- the DURABLE echo proof of a delivery event: what a successor
+#: needs to excise EXACTLY the echo the live session would have excised, carrying NO byte of the
+#: payload.  For an echo-absent transport (`argv`; `pty_write` with ECHO clear) it is the CLASS
+#: itself, by name; for an echo-possible transport it is the sha256 + length of every echo form
+#: the transport can produce (`expected_echo_forms`), so a candidate span is verified by digest.
+#: The repository's rule for the delivery intent (`ExecutionJournal.append_delivery_intent`: the
+#: journal carries the prompt DIGEST, never the prompt) applies to this record unchanged.
+ECHO_PROOF_SCHEMA = "os48.echo_proof.v1"
+ECHO_PROOF_KEYS = ("schema", "class", "reason", "forms")
+ECHO_PROOF_CLASSES = ("echo_absent", "echo_expected", "echo_unproven")
+#: The bound on a digest-verified scan WITHOUT a frame anchor (an unframed delivery): the number
+#: of bytes hashed (sum over forms of length x candidate positions).  Past it the proof is
+#: `echo_unproven` / `proof_scan_bounded` -- fail closed, never a guessed span.
+ECHO_PROOF_SCAN_BUDGET_BYTES = 64 * 1024 * 1024
+
+
+def echo_proof(payload: str, transport: Mapping[str, Any]) -> dict[str, Any]:
+    """The durable, digest-only proof for one delivery event (`ECHO_PROOF_SCHEMA`), derived
+    from the same evidence the live resolver uses (`expected_echo_forms`).  Contains no byte
+    of ``payload``: ``class`` (`echo_absent` / `echo_expected` / `echo_unproven`), the derived
+    ``reason`` and, for `echo_expected`, ``forms`` = ``[{"sha256", "bytes"}]`` per form."""
+    import hashlib
+    derived = expected_echo_forms(payload, transport)
+    state = str(derived["state"])
+    return {"schema": ECHO_PROOF_SCHEMA,
+            "class": "echo_expected" if state == "echo_expected" else
+                     ("echo_absent" if state == "echo_absent" else "echo_unproven"),
+            "reason": str(derived.get("reason") or ""),
+            "forms": [{"sha256": hashlib.sha256(form).hexdigest(), "bytes": len(form)}
+                      for form in (derived.get("forms") or ()) if state == "echo_expected"]}
+
+
+def _echo_proof_of(event: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The event's `echo_proof` when it is the closed shape; ``None`` otherwise (a malformed or
+    absent proof restores nothing -- the event then resolves `echo_unproven`)."""
+    proof = event.get("echo_proof")
+    if (not isinstance(proof, Mapping) or set(proof) != set(ECHO_PROOF_KEYS)
+            or proof.get("schema") != ECHO_PROOF_SCHEMA or proof.get("class") not in ECHO_PROOF_CLASSES
+            or not isinstance(proof.get("forms"), (list, tuple))):
+        return None
+    forms = []
+    for form in proof["forms"]:
+        if (not isinstance(form, Mapping) or not isinstance(form.get("sha256"), str)
+                or len(form["sha256"]) != 64 or not isinstance(form.get("bytes"), int)
+                or isinstance(form.get("bytes"), bool) or form["bytes"] <= 0):
+            return None
+        forms.append((str(form["sha256"]).lower(), int(form["bytes"])))
+    return {"class": str(proof["class"]), "reason": str(proof.get("reason") or ""), "forms": forms}
+
+
+#: REVIEW_BUGFIX_iteration2 F-002 -- the NAMED reasons a restored proof is refused for contradicting
+#: the recorded transport (each resolves `echo_unproven`, no span: nothing is excised).
+PROOF_CONTRADICTION_REASONS = ("proof_class_contradicts_transport", "proof_reason_contradicts_transport",
+                               "proof_forms_contradict_class", "proof_forms_count_contradicts_transport",
+                               "proof_unrecorded")
+
+
+def transport_echo_capability(transport: Mapping[str, Any]) -> dict[str, Any]:
+    """What the recorded TRANSPORT ALONE permits, derived exactly as `expected_echo_forms`
+    derives it from evidence, without any payload: ``{"state": "echo_absent" | "echo_possible" |
+    "echo_unproven", "reason", "tab_expand", "echonl_partial"}``.  `echo_absent` -- the payload
+    left with the `execve` (`argv_transport_cannot_echo`) or ECHO was clear (`echo_flag_clear`);
+    `echo_possible` -- a `pty_write` whose termios has ECHO set; `echo_unproven` -- the transport
+    cannot be evaluated (`transport_kind_unknown` / `termios_unreadable` / `transport_unrecorded`).
+    ``echonl_partial`` names the one ECHO-clear case a live payload can still turn into
+    `echo_unproven` (`echonl_partial_echo`: ECHONL + ICANON and a newline in the payload)."""
+    kind = transport.get("kind") if isinstance(transport, Mapping) else None
+    if kind == "argv":
+        return {"state": "echo_absent", "reason": "argv_transport_cannot_echo", "tab_expand": False,
+                "echonl_partial": False}
+    if kind != "pty_write":
+        return {"state": "echo_unproven", "reason": "transport_kind_unknown", "tab_expand": False,
+                "echonl_partial": False}
+    flags = transport.get("termios")
+    if not isinstance(flags, Mapping) or any(name not in flags for name in TERMIOS_ECHO_FLAGS):
+        return {"state": "echo_unproven", "reason": "termios_unreadable", "tab_expand": False,
+                "echonl_partial": False}
+    if flags.get("discipline") not in LINE_DISCIPLINES:
+        return {"state": "echo_unproven", "reason": "transport_unrecorded", "tab_expand": False,
+                "echonl_partial": False}
+    if not flags.get("echo"):
+        return {"state": "echo_absent", "reason": "echo_flag_clear", "tab_expand": False,
+                "echonl_partial": bool(flags.get("echonl")) and bool(flags.get("icanon"))}
+    return {"state": "echo_possible", "reason": "", "tab_expand": bool(flags.get("opost")) and bool(flags.get("tab_expand")),
+            "echonl_partial": False}
+
+
+def _bound_proof(proof: dict[str, Any], transport: Mapping[str, Any]) -> dict[str, Any]:
+    """REVIEW_BUGFIX_iteration2 F-002: bind a restored proof to what the RECORDED TRANSPORT can
+    produce BEFORE any digest is compared.  A proof is a claim the live session made; the
+    transport is the fact.  Returns ``{"accept": "absent" | "scan" | "unproven", "reason"}``:
+    `absent` only for an `echo_absent` proof whose reason is the transport's own absence reason
+    and which carries no forms, on a transport that proves absence; `scan` only for an
+    `echo_expected` proof with 1..TAB_STOP forms (exactly 1 unless the transport expands tabs)
+    on an echo-possible transport; everything else -- an `echo_expected` claim on `argv` or an
+    ECHO-clear pty (the reviewer's forged proof), an `echo_absent` claim on an ECHO-set pty, a
+    reason the transport cannot have produced, forms on a non-expected class, no forms on
+    `echo_expected`, an impossible form count, an unevaluable transport -- is `unproven` with a
+    NAMED reason (`PROOF_CONTRADICTION_REASONS` or the transport's own).  Nothing is excised on
+    an `unproven` result."""
+    cap = transport_echo_capability(transport)
+    klass, reason, forms = proof["class"], proof["reason"], proof["forms"]
+    if klass != "echo_expected" and forms:
+        return {"accept": "unproven", "reason": "proof_forms_contradict_class"}
+    if cap["state"] == "echo_unproven":
+        # the transport itself cannot be evaluated: only a proof that says so is consistent
+        if klass == "echo_unproven" and reason == cap["reason"]:
+            return {"accept": "unproven", "reason": reason}
+        return {"accept": "unproven", "reason": "proof_class_contradicts_transport"}
+    if cap["state"] == "echo_absent":
+        if klass == "echo_absent":
+            if reason != cap["reason"]:
+                return {"accept": "unproven", "reason": "proof_reason_contradicts_transport"}
+            return {"accept": "absent", "reason": reason}
+        if klass == "echo_unproven" and cap["echonl_partial"] and reason == "echonl_partial_echo":
+            return {"accept": "unproven", "reason": reason}       # the one live ECHO-clear unproven
+        return {"accept": "unproven", "reason": "proof_class_contradicts_transport"}
+    # echo-possible transport
+    if klass == "echo_absent":
+        return {"accept": "unproven", "reason": "proof_class_contradicts_transport"}
+    if klass == "echo_unproven":
+        if reason == "control_byte_consumed_by_line_discipline":
+            return {"accept": "unproven", "reason": reason}       # the one live ECHO-set unproven
+        return {"accept": "unproven", "reason": "proof_reason_contradicts_transport"}
+    if not forms:
+        return {"accept": "unproven", "reason": "proof_forms_contradict_class"}
+    if len(forms) > (TAB_STOP if cap["tab_expand"] else 1):
+        return {"accept": "unproven", "reason": "proof_forms_count_contradicts_transport"}
+    return {"accept": "scan", "reason": ""}
+
+
+def _frame_anchor(transport: Mapping[str, Any]) -> bytes | None:
+    """For a FRAMED `pty_write` delivery: the rendering of the bracketed-paste START under the
+    recorded transport -- a non-secret prefix every echo form of that delivery begins with
+    (`_render_echo` is prefix-preserving and the frame start carries no tab), so a digest scan
+    need only verify the positions where the anchor occurs."""
+    if not transport.get("framed") or transport.get("kind") != "pty_write":
+        return None
+    flags = transport.get("termios")
+    if not isinstance(flags, Mapping) or flags.get("discipline") not in LINE_DISCIPLINES:
+        return None
+    anchor = _render_echo(BRACKETED_PASTE_START, flags, discipline=str(flags["discipline"]),
+                          start_column=0)
+    return anchor or None
+
+
+def _digest_occurrences(raw: bytes, forms: Sequence[tuple[str, int]], lo: int, hi: int,
+                        anchor: bytes | None) -> list[tuple[int, int]] | None:
+    """`_occurrences` over DIGESTS: every distinct span in ``raw[lo:hi]`` whose sha256 and
+    length equal one of ``forms``.  With an ``anchor`` only anchor positions are candidates
+    (exactly the positions a byte-equal form can start at); without one every position is,
+    under `ECHO_PROOF_SCAN_BUDGET_BYTES` -- ``None`` when the scan would exceed the budget."""
+    import hashlib
+    found: set[tuple[int, int]] = set()
+    if anchor:
+        cursor = lo
+        while True:
+            idx = raw.find(anchor, cursor, hi)
+            if idx == -1:
+                break
+            for sha, length in forms:
+                if idx + length <= hi and hashlib.sha256(raw[idx:idx + length]).hexdigest() == sha:
+                    found.add((idx, idx + length))
+            cursor = idx + 1
+        return sorted(found)
+    cost = sum(length * max(0, hi - lo - length + 1) for _sha, length in forms)
+    if cost > ECHO_PROOF_SCAN_BUDGET_BYTES:
+        return None
+    for sha, length in forms:
+        for idx in range(lo, hi - length + 1):
+            if hashlib.sha256(raw[idx:idx + length]).hexdigest() == sha:
+                found.add((idx, idx + length))
+    return sorted(found)
+
+
 def _occurrences(raw: bytes, forms: Sequence[bytes], lo: int, hi: int) -> list[tuple[int, int]]:
     """Every DISTINCT span in ``raw[lo:hi]`` equal to one of ``forms`` (the whole form
     inside the window), in raw-byte coordinates -- at EVERY start position.
@@ -730,7 +905,10 @@ def resolve_delivery_echo(raw: bytes,
         if not isinstance(ev, Mapping):
             continue
         payload = str(ev.get("payload") or "")
-        if not payload:
+        # PR #36 review i1 F-001: a RESTORED event (an adoption) carries no payload -- only its
+        # durable `echo_proof` (the class by name, or the forms' digests); it is resolved from
+        # that proof below, by digest, to the same verdict the live payload produced.
+        if not payload and not isinstance(ev.get("echo_proof"), Mapping):
             continue
         ordered.append((int(ev.get("offset", 0) or 0), index, ev, payload))
     if not ordered:
@@ -752,6 +930,36 @@ def resolve_delivery_echo(raw: bytes,
             entry["reason"] = "delivery_before_window"
         elif not isinstance(transport, Mapping):
             entry["reason"] = "transport_unrecorded"
+        elif not payload:
+            proof = _echo_proof_of(ev)
+            if proof is None:
+                entry["reason"] = "proof_unrecorded"          # malformed / missing: excludes nothing
+                bound = None
+            else:
+                # F-002: the transport is the fact, the proof is a claim -- bound first,
+                # digest-compared only when the claim is one this transport can have produced
+                bound = _bound_proof(proof, transport)
+            if bound is None:
+                pass
+            elif bound["accept"] == "absent":
+                entry["state"] = "echo_absent"
+                entry["reason"] = bound["reason"]
+            elif bound["accept"] != "scan":
+                entry["reason"] = bound["reason"] or "proof_unrecorded"
+            else:
+                entry["forms"] = len(proof["forms"])
+                hits = _digest_occurrences(raw, proof["forms"], offset, window_end,
+                                           _frame_anchor(transport))
+                if hits is None:
+                    entry["reason"] = "proof_scan_bounded"
+                elif not hits:
+                    entry["reason"] = "echo_not_found"
+                elif len(hits) > 1:
+                    entry["reason"] = "ambiguous_multiple_matches"
+                else:
+                    entry["state"] = "echo_proven"
+                    entry["span"] = hits[0]
+                    proven.append(hits[0])
         else:
             derived = expected_echo_forms(payload, transport)
             entry["forms"] = len(derived["forms"])

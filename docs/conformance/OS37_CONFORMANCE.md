@@ -1113,7 +1113,157 @@ marked).  Design: `artifacts/runs/run_f820764749d6/DESIGN.md` (topology A).  Mea
   the one the locks hold: only the `[baseline, N)` prefix reaches any parser, selector, body
   extraction, fallback or digest; bytes past N are dropped before any of them runs and can
   change nothing.  A bounded physical read would only shrink the reader's own allocation and
-  is not implemented here.
+  is not implemented here.  *Superseded by the PR #36 corrections below: the physical read IS
+  bounded now, and the whole-file answerability no longer gates a fenced settlement.*
+* **PR #36 consolidated review corrections (issuecomment-5739898842 on head `c9b8d04`, run
+  `run_9af92a7f320d`).**  (1, P1 -- a post-fence diagnostic tail changed a bound settlement)
+  `completion()` checked the WHOLE capture's answerability / integrity and read
+  `capture.raw(baseline)` through EOF, so a ~70 KB diagnostic line written after the fence
+  tripped the store's limit (`line_bytes` / `total_bytes`) and flipped a bound success to
+  `state=LOST lost_reason=capture_truncated has_record=True`, and a tail too large to
+  allocate flipped it to `record_scan_incomplete`.  Now: with a VERIFIED fence the
+  settlement read is ONE bounded read of exactly `N - baseline` bytes
+  (`BoundedCapture.raw(cursor, limit)`; the marker and the tail are never read, allocated or
+  decoded by a settlement), and the answerability a settlement rests on is the fence's own
+  recorded fact about `[0, N)` -- `capture_at_publish` (`answerable`, `lost_reason`,
+  `integrity`, `truncation`, `dropped_bytes`, `total_bytes`), MEASURED by every publisher
+  (supervisor `_publish_fence`, orphan watcher `_orphan_finalize` from its appender state,
+  successor `_successor_attempt`; `capture_state_at_publish` / `fenced_answerability`; the
+  provenance entry `capture_integrity_answerable_at_publish` is listed only when the
+  measurement is positive -- it used to be asserted unmeasured).  Every limit drop, line cut,
+  failed write or meta disagreement AFTER the publish lies past the bytes the fence bound and
+  is recorded as diagnostic evidence only (`evidence.post_boundary`: truncation, dropped
+  bytes, unanswerable cause, size, N, the answerability source); a bound success stays
+  COMPLETED, a bound refusal stays FAILED `refusal_in_boundary`, and a session whose fence is
+  already bound re-verifies it over `[0, N)` (`fence_matches`) instead of re-scanning the
+  whole capture for the marker.  A fence without the fact (published before the field
+  existed) keeps the whole-capture answer in force -- fail-closed, never widened.  **Stated
+  exactly (residual):** a truncation the store recorded BEFORE the publish -- including one
+  a post-N tail caused between the marker and the publication -- is unattributable to a side
+  of N without an offset in the meta (whose v2 key set is closed) and stays fail-closed
+  (`capture_truncated` / `evidence_unreadable` from the fence's own record); only what
+  happens after the publish is proven to be post-N.  (2, P2 -- no prompt-echo provenance)
+  `completion()` looked for `delivery_intent.payload`, which `make_delivery_intent` never sets
+  (the intent carries a digest), so the fenced selector always received an empty event
+  tuple and, under `post_ready_delivery` with ECHO set, the echoed prompt's "not logged in"
+  fired R1 (`FAILED refusal_in_boundary`, source `free_text`), its result-JSON example was a
+  second completion / framing candidate (`provenance_ambiguous` / `record_framing_ambiguous`)
+  -- MEASURED through the real `start` -> `send` -> `await_completion` path.  Now the selector
+  receives `self.delivery_events` (payload + `EchoTransport` + offset, translated to the
+  fenced range's raw-byte coordinates) and `select_completion` excises a PROVEN echo before
+  records, candidates and framing are read (an unproven echo excludes nothing; a negative
+  translated offset is `delivery_before_window`); `evidence.settlement_range` names the
+  baseline, N, the bytes read, the event count and the echo state.  (3, P2 -- the marker
+  write mutated the agent's stdio flags) `_write_marker_bounded` set `O_NONBLOCK` on the
+  watcher's `slave_fd`, the SAME open file description as the agent's 0/1/2 and every
+  descendant's inherited stdio; MEASURED from inside a descendant with the output FIFO held
+  full: 500+ `F_GETFL` samples carrying `O_NONBLOCK` during the retry loop, and the bit still
+  set when the window ended.  Now the FENCE and RELEASE markers go through a descriptor opened
+  SEPARATELY by the slave's device path (`_open_marker_descriptor`: `O_WRONLY | O_NOCTTY |
+  O_NONBLOCK`, `O_CLOEXEC`; its own open file description; closed after the write; the path
+  is the spawn's `slave_name`, or `ttyname(slave_fd)` read at the call) and the owner-held
+  `slave_fd` is never written through and never has a flag changed.  MEASURED on this host:
+  the subtree's flags are invariant before / during / after the write (`L-5`), the marker
+  lands in-band after every agent byte through the new descriptor (256 KiB, sha256-joined to
+  the fence), and the bounded write still lands under a REAL full queue once the supervisor
+  pumps.  The O-3 bound is unchanged; when the path cannot be opened or the bound elapses the
+  marker is unwritten and a successor reads `boundary_unproven` by name -- there is no
+  fallback to mutating the shared description.  (4, P2 -- adoption lost the baseline and the
+  events) `adopt()` left `_settlement_baseline = 0` and `delivery_events = []`, so the same
+  run settled differently live and adopted (MEASURED: live COMPLETED over the excluded echo
+  vs adopted `refusal_in_boundary` from the echo; baseline 71 vs 0).  Now `send()` and the
+  `launch_with_prompt` branch of `run_dispatch` persist both BEFORE the prompt bytes go out as
+  ONE journal row `delivery_recorded` (`derived_from: driver`; closed vocabulary: `baseline`,
+  `delivery_mode`, per-event `index` / `offset` / `payload_sha256` / `payload_bytes` /
+  `transport` / `at` / `echo_proof`).  **No byte of the prompt is written anywhere durable
+  (REVIEW_BUGFIX i1 F-001, iteration 2).**  The iteration-1 candidate additionally wrote
+  `capture.log.delivery.<inc>.json` with every event's full `payload` -- for an `argv` delivery
+  a NEW plaintext copy of a prompt that is not in the capture at all (the reviewer's
+  `plaintext_probe.py`: `secret_in_capture=false, secret_in_delivery_record=true`), against the
+  journal's own rule (`append_delivery_intent`: the prompt DIGEST, never the prompt).  That
+  record no longer exists.  The durable provenance is the `echo_proof` (`os48.echo_proof.v1`,
+  `standalone_lifecycle.echo_proof`, derived from the same evidence the live resolver uses):
+  for an echo-ABSENT transport (`argv`; `pty_write` with ECHO clear) the class `echo_absent`
+  by name with its reason and no forms; for an echo-possible pty write the class
+  `echo_expected` with the sha256 + byte length of EVERY echo form the recorded transport can
+  produce (`expected_echo_forms`); otherwise `echo_unproven` with the derived reason.
+  `adopt()` restores the baseline and one PAYLOAD-LESS event per recorded event (offset,
+  transport, `at`, `echo_proof`); `resolve_delivery_echo` resolves such an event from its
+  proof: `echo_absent` by name (never `no_delivery`); for `echo_expected` a DIGEST-VERIFIED
+  span -- the candidate positions are the occurrences of the frame-start rendering under the
+  recorded transport (a non-secret prefix every form of a framed delivery begins with;
+  `_frame_anchor`), or every position under `ECHO_PROOF_SCAN_BUDGET_BYTES` for an unframed
+  delivery (past the budget: `proof_scan_bounded`, unproven) -- with the same uniqueness rule
+  (two distinct spans -> `ambiguous_multiple_matches`), so live (payload) and adopted (digest)
+  resolve the identical `echo` block: state, reason and spans.  **(Iteration 3,
+  REVIEW_BUGFIX_iteration2 F-002 -- the proof is a CLAIM, the transport is the FACT.)**  The
+  iteration-2 resolver trusted the proof's declared class: a forged `echo_expected` proof on an
+  adopted `argv` event whose digest named agent refusal bytes resolved `echo_proven` and
+  `strip_delivery_echo` removed the refusal before R1 (the reviewer's `forged_proof_probe.py`:
+  `refusal_present_after=false`); the inverse (`echo_absent` on an ECHO-set pty) was trusted too.
+  Now a restored proof is BOUND to what the recorded transport alone permits BEFORE any digest is
+  compared (`standalone_lifecycle.transport_echo_capability`, derived from the transport exactly
+  as `expected_echo_forms` derives it, with no payload; `_bound_proof`): `argv` and an ECHO-clear
+  pty prove ABSENCE and accept only the canonical `echo_absent` proof carrying the transport's own
+  reason (`argv_transport_cannot_echo` / `echo_flag_clear`) and no forms (an ECHO-clear pty with
+  ECHONL+ICANON also accepts the live `echonl_partial_echo` unproven); an ECHO-set pty is
+  echo-POSSIBLE and accepts only `echo_expected` with 1..`TAB_STOP` forms (exactly 1 unless the
+  transport expands tabs), or the live `control_byte_consumed_by_line_discipline` unproven; an
+  unevaluable transport (`transport_kind_unknown` / `termios_unreadable` / `transport_unrecorded`)
+  accepts only its own `echo_unproven` reason.  Every other combination -- `echo_expected` (or any
+  forms-bearing proof) on an absent transport, `echo_absent` on a possible one, a reason the
+  transport cannot have produced, forms on a non-expected class, no forms on `echo_expected`, an
+  impossible form count, an unknown class or schema -- is `echo_unproven` with a NAMED reason
+  (`proof_class_contradicts_transport`, `proof_reason_contradicts_transport`,
+  `proof_forms_contradict_class`, `proof_forms_count_contradicts_transport`, `proof_unrecorded`)
+  and NO span: nothing is excised, R1 sees every agent byte, and live == adopted holds for every
+  transport because the live path records exactly the proof its transport permits.  The
+  reviewer's probe now reports `echo_unproven`, `spans=[]`, `refusal_present_after=true`.  A
+  missing, malformed or non-verifying proof (wrong digest, wrong length, no proof) remains
+  `echo_unproven` / `proof_unrecorded` / `echo_not_found` -- NOTHING is excised, never a wider
+  excision; a row
+  whose event vocabulary is not the closed shape (a `payload` key, say) restores no event and
+  is journalled `delivery_provenance_unrestored` (`delivery_recorded_events_malformed`).  What
+  pty+ECHO keeps, stated exactly: digests of strings whose bytes the line discipline already
+  echoed into `capture.log` when the echo occurred -- MEASURED (L-10): after an ECHO turn the
+  prompt is on disk in exactly one file, the capture itself, and every persisted form digest
+  matches a span of that capture; when no echo occurred the digests match nothing and reveal
+  nothing beyond the digest class the delivery intent already accepts.  The adoption's
+  `identity_bound` row carries `settlement_baseline`, `delivery_events_restored`,
+  `delivery_provenance` (`restored` | the reason).  Live and adopted settlements of one run
+  are identical in
+  baseline, delivery provenance, boundary and verdict.  Locks (`scripts/test_os48_pr36_locks.py`,
+  every counterexample RED at `c9b8d04`, GREEN after; both copies byte-identical): L-1 the
+  over-limit tail (`line_bytes` and `total_bytes`) after a bound success and after a bound
+  refusal, through the production spawn + `await_completion`, the pre-bound re-await and a
+  masterless successor, plus the whole-tail allocation seam; L-2 the read seam (ONE read at
+  `baseline` of `N - baseline` bytes, none past N; the physical `read(limit)`); L-3 the ECHO
+  turn through the real `start` -> `send` -> `await_completion` (refusal phrase + y/n + JSON
+  example -> COMPLETED; JSON example alone; the agent's own refusal still dominates; the
+  selector unit lock; the `argv` transport reaching the selector as `echo_absent`); L-4 live vs
+  adopted (completion and refusal turns; the durable row + record; the missing-record
+  fail-closed path) through the real `adopt()`; L-5 the descendant's `F_GETFL` samples with a
+  full FIFO, the 256 KiB in-band measurement, the shared-descriptor unit lock; L-6 parity.
+  Iteration 2 (REVIEW_BUGFIX i1 F-001; RED on the iteration-1 tree, GREEN after): L-7 a
+  sentinel secret in a `launch_with_prompt` (argv) prompt is absent from EVERY file under the
+  run's base (the whole tree is scanned) while live and adopted settle identically, through
+  the real `run_dispatch` and the real `adopt()`; L-8 the same with the Orca dispatch preamble
+  shape (capability-token line + task / dispatch ids, multi-line); L-9 an adopted argv event
+  resolves `echo_absent` by name with the live == adopted `echo` block; L-10 for pty+ECHO the
+  prompt is in the capture alone, every persisted form digest matches a capture span, the
+  adoption excises exactly that span, and a wrong digest / wrong length / missing proof or a
+  malformed row is fail-closed by name (plus resolver unit locks: framed / unframed / budget /
+  malformed).  Iteration 3 (F-002; RED on the iteration-2 tree): L-11 a forged `echo_expected`
+  proof on an adopted argv event whose digest names the agent's `not logged in` bytes -- through
+  the real adopt path over a re-digested tampered `delivery_recorded` row -- resolves
+  `echo_unproven` / `proof_class_contradicts_transport`, excises nothing and settles FAILED
+  `refusal_in_boundary` exactly as live; L-12 the same forgery aimed at the bound `result` line
+  keeps the record (COMPLETED == live); L-13 the inverse `echo_absent` proof on the ECHO turn is
+  unproven by name and the unforged row still resolves identically live and adopted; L-14 the
+  resolver matrix -- 17 class x transport x forms contradictions each `echo_unproven` with its
+  named reason and no span, the consistent cases unchanged, the reviewer's probe verbatim.  The
+  OS-37 native stub fixture gains the `agent-script` mode (the turn is a lock-supplied `sh`
+  script; the argv prompt is its second argument) for the real start/send/adopt path.
   **Known fail-closed limitations (documented, not solved; each answers UNKNOWN / a named
   non-success, never a positive claim):**
   - *32-bit Linux and Linux before 6.9* -- no pidfs inode lifetime model this runtime can
@@ -1141,6 +1291,7 @@ marked).  Design: `artifacts/runs/run_f820764749d6/DESIGN.md` (topology A).  Mea
   `test_os48_recovery_cuts.py` (L-09/09b, C1-C7), `test_os48_crash_cuts.py` (real kills, C1-C9 /
   RC1-RC3), `test_os48_review_i1_locks.py` (F-001..F-006), `test_os48_review_i2_locks.py`
   (i2 F-001/F-004/F-006/F-007), `test_os48_review_i3_locks.py` (i3 F-001/F-004/F-006/F-008), `test_os48_review_i4_locks.py` (i4 F-009), `test_os48_review_i5_locks.py` (i5 F-010 + adversarial pass, F-011), `test_os48_review_i6_locks.py` (i6 F-010 coalesced / pre-exec watch, F-011, F-012, F-013), `test_os48_review_i7_locks.py` (i7 F-015 framing, F-014 verified subreaper, F-016 fixed objects / lifetimes incl. the PID-1 private-namespace alias construction), `test_os48_f015_f016_locks.py` (i8 F-015 bounded nested scan / `record_scan_incomplete`, F-016 verified admission / reader binding, PID-1 same-tick foreign-peer constructions; run_7859f202457c F-017 selected-refusal dominance over a post-selection reader failure),
+  `test_os48_pr36_locks.py` (PR #36 comment 5739898842: L-1..L-6 -- bounded settlement read and fence-recorded answerability, echo provenance, the separate marker descriptor, adoption restoring baseline + digest-only delivery provenance, parity; L-7..L-10 -- no plaintext prompt at rest; L-11..L-14 -- proofs bound to the recorded transport),
   `test_os48_linux_locks.py` (L-13 + membership, CI condition `not_linux`); the round-8/9/9i2/10 finality locks are versioned in
   place (`# superseded by OS-48` notes, W-F9).  Real-CLI proof: `scripts/os37_r10_real_agent.py` /
   `os37_r10_recovery_prompt_e2e.py` (Claude `session_field`, Codex `sidecar_file`).

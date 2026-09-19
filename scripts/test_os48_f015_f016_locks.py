@@ -1397,11 +1397,14 @@ os.write(1,(json.dumps(dict(type='result',is_error=False,session_id=sid,result='
                 raise MemoryError("deterministic post-selection reader allocation seam")
             return real_text()
 
-        def failing_raw(cursor: int = 0):
+        def failing_raw(cursor: int = 0, limit=None):
+            # PR #36 finding 1 (run_9af92a7f320d): the settlement read is now the BOUNDED
+            # `raw(baseline, N - baseline)`; the seam covers both spellings so the lock keeps
+            # holding for any raw read, bounded or not.
             if state["reached"]:
-                state["faults"].append(f"capture.raw({cursor}) after a positive selection")
+                state["faults"].append(f"capture.raw({cursor}, {limit}) after a positive selection")
                 raise MemoryError("deterministic post-selection capture read seam")
-            return real_raw(cursor)
+            return real_raw(cursor) if limit is None else real_raw(cursor, limit)
 
         patches = [patch.object(session.driver, "select_completion", select)]
         if seam == "authoritative_text":
@@ -1572,12 +1575,13 @@ class F017PreBoundAwaitDominanceTests(_FramingDispatch):
                 state["reached"].append(selection)
             return selection
 
-        def failing_raw(cursor=0):
+        def failing_raw(cursor=0, limit=None):
+            # PR #36 finding 1 (run_9af92a7f320d): bounded settlement read; both spellings covered.
             if (fault and state["reached"]
                     and inspect.currentframe().f_back.f_code.co_name == "completion"):
                 state["faults"].append("completion capture.raw after a positive selection")
                 raise MemoryError("post-selection settlement-reader allocation seam")
-            return real_raw(cursor)
+            return real_raw(cursor) if limit is None else real_raw(cursor, limit)
 
         with patch.object(session.driver, "select_completion", select), \
                 patch.object(session.capture, "raw", failing_raw):

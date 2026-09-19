@@ -393,18 +393,27 @@ class BoundedCapture:
         except OSError:
             return ""
 
-    def raw(self, cursor: int = 0) -> bytes:
-        r"""The whole capture from the RAW byte offset ``cursor``, UNDECODED.
+    def raw(self, cursor: int = 0, limit: int | None = None) -> bytes:
+        r"""The capture from the RAW byte offset ``cursor``, UNDECODED -- to EOF, or, with
+        ``limit``, EXACTLY the next ``limit`` bytes (one bounded ``read(limit)``; never a
+        read to EOF followed by a slice).
 
         Delivery provenance is byte-addressable: the delivery event records a byte offset
         (``size`` at the write), so the echo must be matched and excluded on THESE bytes,
         before any UTF-8 decode or ``\r\n`` translation shifts positions (F-002 coordinate
         integrity).  ``cursor`` is a byte offset into the same space as :attr:`size`.
+
+        OS-48 PR #36 finding 1: the SETTLEMENT reader passes ``limit = N - baseline`` so the
+        bytes past the fence boundary -- the marker and whatever diagnostic tail has been
+        appended since, of any size -- are never read, never allocated and never decoded by
+        a settlement; a tail too large to allocate cannot fail a read that does not touch it.
         """
+        if limit is not None and limit < 0:
+            raise ValueError("a capture read limit is a byte count and cannot be negative")
         try:
             with open(self.path, "rb") as handle:
                 handle.seek(cursor)
-                return handle.read()
+                return handle.read() if limit is None else handle.read(limit)
         except OSError:
             return b""
 
@@ -1161,20 +1170,72 @@ def read_sidecar_snapshot(capture: str | os.PathLike[str] | bytes, incarnation: 
     return {"state": SIDECAR_STATE_PRESENT, "record": record, "raw": raw}
 
 
+#: OS-48 PR #36 finding 1 -- the CAPTURE STATE AT PUBLISH, bound into the fence.  The fence's
+#: digest proves that ``capture.log[0:N)`` IS what the owner published; this fact proves that the
+#: store had LOST NOTHING when it was published (no limit drop / line cut, no failed write, a
+#: meta that described the bytes) -- so ``[0, N)`` is a COMPLETE authoritative range.  Every
+#: limit decision, write failure or meta disagreement that happens AFTER the publish lies at an
+#: offset past the bytes the fence bound, and is a fact about the DIAGNOSTIC TAIL only.  A
+#: settlement over a verified fence therefore reads its answerability HERE, never from the live
+#: whole-file state; a fence without the fact (published before this field existed) leaves the
+#: whole-capture answer in force -- fail-closed, never widened.
+CAPTURE_STATE_KEYS = ("answerable", "lost_reason", "integrity", "truncation", "dropped_bytes",
+                      "total_bytes")
+#: `fenced_answerability(...)["source"]`: which fact answered.
+ANSWERABILITY_SOURCE_FENCE = "fence_capture_at_publish"
+ANSWERABILITY_SOURCE_WHOLE = "whole_capture"
+
+
+def capture_state_at_publish(*, answerable: Mapping[str, Any], truncation: str | None,
+                             dropped_bytes: int, total_bytes: int) -> dict[str, Any]:
+    """[FORKED-SAFE] The closed `capture_at_publish` shape from a `completion_is_answerable`
+    answer (or the watcher's appender-derived equivalent) and the store's counters."""
+    return {"answerable": bool(answerable.get("answerable")),
+            "lost_reason": str(answerable.get("lost_reason") or ""),
+            "integrity": str(answerable.get("integrity") or ""),
+            "truncation": str(truncation or ""),
+            "dropped_bytes": int(dropped_bytes or 0), "total_bytes": int(total_bytes or 0)}
+
+
+def fenced_answerability(fence_record: Mapping[str, Any] | None) -> dict[str, Any]:
+    """The answerability of ``[0, N)`` a VERIFIED fence records, or ``None``-source when the
+    fence carries no such fact.  ``{"answerable", "lost_reason", "integrity", "source"}`` with
+    ``source`` = `fence_capture_at_publish` when the fence's `capture_at_publish` field is the
+    closed shape, else `whole_capture` (the caller falls back to the live whole-file answer).
+    A recorded ``answerable: false`` is returned AS RECORDED (the reason it names): a range the
+    owner could not vouch for at publish is not vouched for later either."""
+    state = fence_record.get("capture_at_publish") if isinstance(fence_record, Mapping) else None
+    if (not isinstance(state, Mapping) or set(state) != set(CAPTURE_STATE_KEYS)
+            or not isinstance(state.get("answerable"), bool)):
+        return {"answerable": False, "lost_reason": "", "integrity": "",
+                "source": ANSWERABILITY_SOURCE_WHOLE}
+    if state["answerable"]:
+        return {"answerable": True, "lost_reason": "", "integrity": "",
+                "source": ANSWERABILITY_SOURCE_FENCE}
+    return {"answerable": False,
+            "lost_reason": str(state.get("lost_reason") or CAPTURE_INTEGRITY_LOST_REASON),
+            "integrity": str(state.get("integrity") or ""),
+            "source": ANSWERABILITY_SOURCE_FENCE}
+
+
 def make_capture_fence(*, fence: str, emitter: Mapping[str, Any], emitter_pgid: int,
                        offset_n: int, marker_len: int, marker_nonce: str, sha256_prefix: str,
                        tail_bytes_at_publish: int, exit_how: str, exit_code: int | None,
                        reaped_by: Mapping[str, Any] | None, owner: Mapping[str, Any],
                        evidence_source: str, provenance: Sequence[str],
-                       published_at: str, sidecar: Mapping[str, Any] | None = None) -> dict[str, Any]:
+                       published_at: str, sidecar: Mapping[str, Any] | None = None,
+                       capture_state: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """The fence record.  ``sidecar`` (OS-48 F-001, iterations 3-4) is the watcher's snapshot of
     the declared ``-o`` file taken in its reap step (instant `reap_step_before_marker`) --
     ``{"state", "path", "sha256", "bytes", "instant", "error"}`` with state `present` /
     `absent` / `sidecar_unreadable` / `sidecar_unproven` -- the immutable PRESENCE fact for R3;
     it never binds the file's content to N and is never a settlement body source; ``None``
     when the profile declares no sidecar.  A state first sampled after N is never a proof and
-    is never recorded here."""
+    is never recorded here.  ``capture_state`` (PR #36 finding 1) is the publisher's
+    :func:`capture_state_at_publish` -- the store's answerability AT PUBLISH, the fact a fenced
+    settlement reads instead of the live whole-file state."""
     return {"schema": CAPTURE_FENCE_SCHEMA, "fence": fence, "sidecar": dict(sidecar) if sidecar else None,
+            "capture_at_publish": dict(capture_state) if capture_state else None,
             "emitter": dict(emitter), "emitter_pgid": int(emitter_pgid),
             "boundary": {"offset_n": int(offset_n), "marker_offset": int(offset_n),
                          "marker_len": int(marker_len), "marker_nonce": marker_nonce,
