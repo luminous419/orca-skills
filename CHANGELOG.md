@@ -239,7 +239,29 @@
   forged `echo_expected` proof on an adopted `argv` event can no longer excise agent bytes whose
   digest it names (the reviewer's `forged_proof_probe.py` now keeps the refusal).  `identity_bound` carries
   `settlement_baseline` / `delivery_events_restored` / `delivery_provenance`.  Live and adopted
-  settlements of one run are identical in baseline, provenance (echo block) and verdict.
+  settlements of one run were identical in baseline, provenance (echo block) and verdict
+  through iteration 3 -- superseded by the next bullet.
+- (4, F-003 -- run_c296ff67c325, under the USER DECISION narrowing PR36-4: "Adoption does not
+  guarantee the same availability as live.  Adopted success must be narrower than or equal to
+  live success, and adoption may not remove unauthenticated evidence to produce a success
+  verdict.")  The iteration-3 binding accepted, on an ECHO-set pty, a forged `echo_expected`
+  proof whose form digest named agent refusal bytes and excised them on adoption (a false
+  COMPLETED live never produced).  The `delivery_recorded` row is unkeyed, so nothing in it is
+  excision authority any more: the `echo_proof` producer and the whole proof-binding / digest
+  scan (`echo_proof`, `_echo_proof_of`, `_bound_proof`, `transport_echo_capability`,
+  `_frame_anchor`, `_digest_occurrences`, `ECHO_PROOF_*`, `PROOF_CONTRADICTION_REASONS`) are
+  REMOVED; the row's closed vocabulary is `index` / `offset` / `payload_sha256` /
+  `payload_bytes` / `transport` / `at` (digest, length and transport are diagnostic only; a row
+  carrying the pre-decision `echo_proof` key restores no event).  A restored (payload-less)
+  event is resolved STRUCTURALLY from its transport kind (`unobserved_delivery_echo`): `argv`
+  -> `echo_absent` / `argv_transport_cannot_echo`; `pty_write` (ECHO set, clear or unreadable)
+  -> `echo_unproven` / `payload_unobserved` (new `ECHO_UNPROVEN_REASONS` member); no capture
+  byte read, no span, nothing excised.  Live is unchanged (it excises only the echo it observed
+  itself, payload in memory).  Adoption is therefore STRICTER than live on an ECHO-set pty --
+  an echoed refusal-like phrase settles FAILED `refusal_in_boundary`, an echoed result-JSON
+  example LOST `record_framing_ambiguous` -- and never wider (`adopted_success` is a subset of
+  `live_success`); the argv path is unchanged (live == adopted).  No MAC / key / secret, no
+  new authenticated field, no plaintext prompt at rest.
 - Locks: `scripts/test_os48_pr36_locks.py` (L-1..L-6; every counterexample RED at `c9b8d04`;
   iteration 2 L-7..L-10 RED on the iteration-1 tree: an argv sentinel secret -- including the
   Orca dispatch-capability preamble shape -- absent from every file the run wrote with live ==
@@ -248,7 +270,13 @@
   the iteration-2 tree: a forged `echo_expected` proof on an adopted argv event cannot excise a
   refusal or a completion record -- live == adopted verdict through the real adopt path over a
   re-digested tampered journal row -- the inverse `echo_absent` on an ECHO-set pty is unproven
-  by name, and the resolver matrix of class x transport x forms contradictions); the OS-37 stub
+  by name, and the resolver matrix of class x transport x forms contradictions; run_c296ff67c325
+  F3-L1..F3-L5 RED at `92d8432`: the reviewer's ECHO-set forgery through the real adopt path and
+  every tampered / stale row shape excise nothing, the transport x output matrix asserts
+  `adopted COMPLETED => live COMPLETED` with the stricter outcomes by name, argv live == adopted,
+  `pty_write` restored events `payload_unobserved` by name, a refusal-like prompt / JSON example
+  never a false COMPLETED on adoption; the i1-i3 locks whose expectation the decision changed
+  are rewritten with a note, none deleted); the OS-37 stub
   fixture gains the `agent-script` mode for the real `start`/`send`/adopt path; the F-017 read
   seams cover the bounded spelling.
 

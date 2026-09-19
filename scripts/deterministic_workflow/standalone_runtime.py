@@ -1316,10 +1316,12 @@ class StandaloneSession:
         prior = self.journal.delivery_intent_for(self.intent_id)
         if prior is not None:
             self.delivery_intent = dict(prior.get("source_vocabulary") or {})
-        # OS-48 PR #36 finding 4: the settlement baseline and the delivery events' digest-only
-        # provenance the live session recorded before its prompt write are restored from the
-        # journal row, so this successor settles the SAME [baseline, N) with the SAME echo
-        # provenance (baseline 0 / no events made the same run settle differently).
+        # OS-48 PR #36 finding 4: the settlement baseline and the payload-less delivery
+        # events the live session recorded before its prompt write are restored from the
+        # journal row, so this successor settles the SAME [baseline, N) (baseline 0 made the
+        # same run settle differently).  run_c296ff67c325 (F-003): the restored events carry
+        # NO excision authority -- the unkeyed row's digests are diagnostic -- so this
+        # settlement may be stricter than the live one and is never wider.
         delivery = self._restore_delivery(mine)
         self._journal(kind="EVENT", derived_from="runtime_state", event="identity_bound",
                       state=self.state,
@@ -3628,24 +3630,30 @@ class StandaloneSession:
     #: could not restore what the journal names
     DELIVERY_RECORDED_EVENT = "delivery_recorded"
     DELIVERY_UNRESTORED_EVENT = "delivery_provenance_unrestored"
-    #: the closed per-event vocabulary of a `delivery_recorded` row -- digests and transport
-    #: facts only; there is NO payload key (REVIEW_BUGFIX F-001)
+    #: the closed per-event vocabulary of a `delivery_recorded` row -- the offset, the
+    #: transport, the payload's digest + length, `at`.  There is NO payload key (REVIEW_BUGFIX
+    #: F-001) and, since run_c296ff67c325 (F-003), NO `echo_proof`: the digest, length and
+    #: transport are DIAGNOSTIC ONLY -- an adoption never consults them as excision authority.
     DELIVERY_EVENT_ROW_KEYS = ("index", "offset", "payload_sha256", "payload_bytes", "transport",
-                               "at", "echo_proof")
+                               "at")
 
     def _record_delivery(self) -> None:
         """Persist `_settlement_baseline` + `delivery_events` as ONE journal row
         `delivery_recorded` whose closed vocabulary carries, per event, the offset, the
-        `EchoTransport`, the payload's sha256 + byte length, `at`, and the DIGEST-ONLY
-        `echo_proof` (`lifecycle.echo_proof`: the echo class by name -- `echo_absent` for an
-        `argv` delivery or a pty write with ECHO clear -- or, for an echo-possible pty write,
-        the sha256 + length of each echo form the recorded transport can produce).  No byte
-        of the prompt is written anywhere durable (REVIEW_BUGFIX i1 F-001: the journal is a
-        plain file a stranger reads -- `append_delivery_intent`'s rule -- and an `argv` prompt
-        is not in the capture either); the earlier `capture.log.delivery.<inc>.json` record,
-        which carried the payload, no longer exists.  A successor restores the baseline and
-        payload-less events from this row (`_restore_delivery`) and `resolve_delivery_echo`
-        resolves them from the proof to the SAME verdict the live payload produced."""
+        `EchoTransport`, the payload's sha256 + byte length and `at`.  No byte of the prompt
+        is written anywhere durable (REVIEW_BUGFIX i1 F-001: the journal is a plain file a
+        stranger reads -- `append_delivery_intent`'s rule -- and an `argv` prompt is not in
+        the capture either); the earlier `capture.log.delivery.<inc>.json` record, which
+        carried the payload, no longer exists.
+
+        run_c296ff67c325 (PR #36 F-003; the USER DECISION narrowing PR36-4): the row is an
+        UNKEYED record a same-user writer can rewrite and re-digest, so nothing in it is
+        excision authority.  The former digest-only `echo_proof` (the echo forms' sha256 +
+        length) is no longer produced -- a tampered proof could name any visible agent span --
+        and the payload digest / length / transport that remain are diagnostic only.  A
+        successor restores the baseline and payload-less events from this row
+        (`_restore_delivery`); `resolve_delivery_echo` then resolves them STRUCTURALLY
+        (`lifecycle.unobserved_delivery_echo`) and excises nothing."""
         self._journal(kind="EVENT", derived_from="driver", event=self.DELIVERY_RECORDED_EVENT,
                       state=self.state,
                       vocabulary={"baseline": int(self._settlement_baseline or 0),
@@ -3654,19 +3662,20 @@ class StandaloneSession:
                                               "payload_sha256": _sha256_text(str(ev.get("payload") or "")),
                                               "payload_bytes": len(str(ev.get("payload") or "").encode("utf-8")),
                                               "transport": _journal_transport(ev.get("transport")),
-                                              "at": str(ev.get("at") or ""),
-                                              "echo_proof": lifecycle.echo_proof(
-                                                  str(ev.get("payload") or ""),
-                                                  ev.get("transport") if isinstance(ev.get("transport"), Mapping) else {})}
+                                              "at": str(ev.get("at") or "")}
                                              for i, ev in enumerate(self.delivery_events)]})
 
     def _restore_delivery(self, rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         """The adopt-side half: from the LAST `delivery_recorded` row of this incarnation,
         restore the baseline and one PAYLOAD-LESS event per recorded event -- offset,
-        transport, `at` and the `echo_proof` -- so the fenced selector excludes exactly what
-        the live session excluded (an `echo_absent` class by name; a digest-verified span for
-        an echo-possible transport) and nothing on any weaker evidence.  A row whose event
-        vocabulary is not the closed shape restores NO event and is journalled by name
+        transport, `at` -- so the successor settles the SAME ``[baseline, N)`` the live
+        session settled.  The restored events carry NO excision authority
+        (run_c296ff67c325, F-003): `resolve_delivery_echo` resolves a payload-less event from
+        its transport KIND alone -- `argv` is `echo_absent` by structure, `pty_write` is
+        `echo_unproven` / `payload_unobserved` -- and excises nothing, so an adopted
+        settlement is never wider than the live one (it may be stricter: the accepted
+        contract).  A row whose event vocabulary is not the closed shape (a `payload` key, a
+        pre-decision `echo_proof` key, ...) restores NO event and is journalled by name
         (`delivery_provenance_unrestored`): the selector then excludes nothing (fail closed)."""
         self._settlement_baseline = 0
         self.delivery_events = []
@@ -3693,8 +3702,7 @@ class StandaloneSession:
             return {"restored": False, "reason": reason, "events": 0}
         self.delivery_events = [{"offset": int(ev.get("offset", 0) or 0), "payload": "",
                                  "transport": dict(ev["transport"]) if isinstance(ev.get("transport"), Mapping) else None,
-                                 "at": str(ev.get("at") or ""),
-                                 "echo_proof": dict(ev["echo_proof"]) if isinstance(ev.get("echo_proof"), Mapping) else None}
+                                 "at": str(ev.get("at") or "")}
                                 for ev in recorded]
         return {"restored": True, "reason": "", "events": len(self.delivery_events)}
 

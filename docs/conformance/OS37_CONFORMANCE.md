@@ -1231,8 +1231,72 @@ marked).  Design: `artifacts/runs/run_f820764749d6/DESIGN.md` (topology A).  Mea
   nothing beyond the digest class the delivery intent already accepts.  The adoption's
   `identity_bound` row carries `settlement_baseline`, `delivery_events_restored`,
   `delivery_provenance` (`restored` | the reason).  Live and adopted settlements of one run
-  are identical in
-  baseline, delivery provenance, boundary and verdict.  Locks (`scripts/test_os48_pr36_locks.py`,
+  were, through iteration 3, identical in baseline, delivery provenance, boundary and verdict
+  -- SUPERSEDED by the paragraph that follows.
+  **(run_c296ff67c325 -- REVIEW_BUGFIX_iteration3 F-003, resolved under the USER DECISION that
+  narrows PR36-4; `artifacts/runs/run_c296ff67c325/ORIGINAL_REQUEST.md`.)**  F-003: on an
+  ECHO-set `pty_write` a structurally consistent forged `echo_expected` proof whose one form
+  digest named agent bytes already visible in the capture (`not logged in`) was accepted by the
+  iteration-3 binding (class / reason / form-count only) -- the adoption excised the refusal
+  and settled COMPLETED where live had FAILED (the reviewer's `echo_set_forgery_probe.py`).
+  Root cause: the `delivery_recorded` row is UNKEYED (a same-user writer rewrites it and
+  re-digests it with `record_digest`), so nothing in it can be excision authority without a
+  real authentication authority -- which the decision forbids introducing (no MAC, key or new
+  secret; no new field on existing rows treated as authenticated; no plaintext prompt at rest).
+  The decision instead narrows what adoption is for: *"Adoption does not guarantee the same
+  availability as live.  Adopted success must be narrower than or equal to live success, and
+  adoption may not remove unauthenticated evidence to produce a success verdict."*  Contract
+  now in force: (i) LIVE is unchanged -- `send()` / `run_dispatch` -> `completion()` in the same
+  process excises exactly the echo it observed itself (payload in memory, offset, transport;
+  `resolve_delivery_echo`'s payload leg), nothing wider; (ii) ADOPTED -- `adopt()` ->
+  `_restore_delivery` restores the baseline and one payload-less event per recorded event
+  (offset, transport, `at`), and such an event carries NO excision authority:
+  `resolve_delivery_echo` resolves it STRUCTURALLY from the transport KIND alone
+  (`standalone_lifecycle.unobserved_delivery_echo`) -- `argv` (`launch_with_prompt`) is
+  `echo_absent` / `argv_transport_cannot_echo` because the payload left with the `execve` and
+  never entered the pty input queue; `pty_write` -- ECHO set, ECHO clear, termios unreadable,
+  whatever the row's flags say -- is `echo_unproven` / `payload_unobserved` (a new
+  `ECHO_UNPROVEN_REASONS` member: this process holds no delivered payload, so no span can be
+  proven to be the echo); an unknown kind is `transport_kind_unknown`.  No capture byte is
+  read for such an event, no digest is compared, no span is produced, NOTHING is excised.
+  (iii) The `echo_proof` PRODUCER is removed (`standalone_lifecycle.echo_proof`,
+  `_echo_proof_of`, `_bound_proof`, `transport_echo_capability`, `_frame_anchor`,
+  `_digest_occurrences`, `ECHO_PROOF_*`, `PROOF_CONTRADICTION_REASONS` no longer exist) so no
+  authority-looking field remains for a future reader to trust; the row's closed vocabulary is
+  now `index` / `offset` / `payload_sha256` / `payload_bytes` / `transport` / `at`, and the
+  digest, length and transport that remain are DIAGNOSTIC ONLY (they are never consulted as
+  authority; the transport's kind decides only the `echo_absent` / `echo_unproven` NAME, never
+  an excision).  A row carrying the pre-decision `echo_proof` key is not the closed shape and
+  restores no event (`delivery_provenance_unrestored` / `delivery_recorded_events_malformed`;
+  the selector then sees `no_delivery` and excludes nothing).  (iv) CONSEQUENCE, accepted:
+  adoption is STRICTER than live on an ECHO-set pty -- an ECHO turn live settled COMPLETED
+  after excising its own echo settles, on adoption, FAILED `refusal_in_boundary` when the echoed
+  prompt text carries a refusal-like phrase ("not logged in"), or LOST
+  `record_framing_ambiguous` when it carries a result-JSON example (the echo is a framing
+  candidate); an adopted argv settlement is unchanged (live == adopted); an adopted ECHO-clear
+  or termios-unreadable pty settlement is unchanged in verdict (only its echo NAME is
+  `payload_unobserved`).  What is impossible: an adopted COMPLETED that live would not have
+  produced (`adopted_success` is a subset of `live_success`, on the same settlement record),
+  and any adopted excision at all.  MEASURED matrix (F3-L2, `PR36F003AdoptedSuccessSubsetTests`;
+  live / adopted): argv -- C/C, F/F, C/C, C/C; pty ECHO set -- C/C, F/F, C/F
+  `refusal_in_boundary`, C/L `record_framing_ambiguous`; pty ECHO clear -- C/C, F/F, C/C, C/C;
+  pty termios unreadable -- C/C, F/F, F/F, L/L (columns: clean completion, agent refusal,
+  refusal-like prompt echo + completion, JSON-example prompt echo + completion).  The reviewer's
+  probe now reports `forged_state=echo_unproven`, `forged_spans=[]`, `refusal_after_forged=true`,
+  `actual_echo_after_forged=true` (live unchanged: `echo_proven` at `[0,15]`).  Locks
+  (`scripts/test_os48_pr36_locks.py`, RED at `92d8432`, GREEN after; the i1-i3 locks whose
+  expectation the decision changed are REWRITTEN with a note naming it, none deleted): F3-L1 a
+  structurally complete forged / stale / tampered row -- the reviewer's ECHO-set forged-forms
+  row through the REAL adopt path (92d8432: false COMPLETED), the closed-shape row with its
+  digest re-pointed, the ECHO flag cleared, the termios dropped, the kind rewritten, the
+  genuine pre-decision proof, the argv forgeries of F-002 -- has no effect on adopted excision
+  (spans `[]`, every agent byte survives), plus the resolver reads no capture byte for a
+  restored event; F3-L2 the matrix above; F3-L3 argv live == adopted (L-7 / L-8 / L-9 / L-11 /
+  L-12 retained); F3-L4 `pty_write` + ECHO possible / unreadable -> `echo_unproven` /
+  `payload_unobserved` by name, no span, whatever the row carries (L-13, L-14 rewritten: every
+  proof material inert on every transport); F3-L5 the refusal-like prompt and the result-JSON
+  example settle FAILED / LOST by name on adoption, never COMPLETED; F3-L6 the PR36-1..3 locks,
+  the F-015 / F-016 / F-017 locks and the affected suites unchanged.  Locks (`scripts/test_os48_pr36_locks.py`,
   every counterexample RED at `c9b8d04`, GREEN after; both copies byte-identical): L-1 the
   over-limit tail (`line_bytes` and `total_bytes`) after a bound success and after a bound
   refusal, through the production spawn + `await_completion`, the pre-bound re-await and a

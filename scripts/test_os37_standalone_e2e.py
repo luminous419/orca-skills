@@ -627,16 +627,18 @@ class FullSupervisedDispatchTests(unittest.TestCase):
                                   "delivery_proof_observed", "owner_claimed", "fence_published",
                                   "release_observed", "exit_observed"], events)
         recorded = next(row for row in rows if row.get("event") == "delivery_recorded")
+        # run_c296ff67c325 (F-003, USER DECISION in ORIGINAL_REQUEST.md): the closed vocabulary
+        # carries NO `echo_proof` any more -- the unkeyed row is diagnostic, never excision
+        # authority -- so the set below is the post-decision shape (i2/i3 listed `echo_proof`).
         self.assertEqual({k for ev in recorded["source_vocabulary"]["events"] for k in ev},
-                         {"index", "offset", "payload_sha256", "payload_bytes", "transport", "at", "echo_proof"},
+                         {"index", "offset", "payload_sha256", "payload_bytes", "transport", "at"},
                          "the delivery_recorded row's event vocabulary is not the closed set (never the prompt)")
-        # i2 (REVIEW_BUGFIX F-001): the row is digest-only -- no payload key, no side record;
-        # the echo proof is the class by name (`echo_absent` for this stub's ECHO-clear pty)
+        # i2 (REVIEW_BUGFIX F-001): the row is digest-only -- no payload key, no side record
         self.assertNotIn("record", recorded["source_vocabulary"], recorded)
         for ev in recorded["source_vocabulary"]["events"]:
             self.assertNotIn("payload", ev)
-            self.assertEqual(ev["echo_proof"]["schema"], "os48.echo_proof.v1", ev)
-            self.assertIn(ev["echo_proof"]["class"], ("echo_absent", "echo_expected", "echo_unproven"), ev)
+            self.assertNotIn("echo_proof", ev)
+            self.assertEqual(ev["transport"]["kind"], "pty_write", ev)
         # The trailing EVENT is the supervisor RECLAIMING its own resources after the
         # proven exit (consolidated review finding 9): the exit watcher reaped, the master
         # fd closed.  Journalled so a stranger can see the completion leaked nothing.

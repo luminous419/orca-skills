@@ -38,7 +38,8 @@ through the PRODUCTION caller the reviewer named, RED at head ``c9b8d04`` and GR
   material adds no byte to what capture.log already holds (measured: the prompt appears in
   capture.log alone), and a tampered / missing proof on adoption resolves `echo_unproven` /
   excludes nothing -- never a wider excision.
-* REVIEW_BUGFIX_iteration2 F-002 (iteration 3; L-11..L-14).  A restored proof is BOUND to the
+* REVIEW_BUGFIX_iteration2 F-002 (iteration 3; L-11..L-14; the MECHANISM below is SUPERSEDED by
+  run_c296ff67c325 -- next bullet -- the locks are retained / rewritten).  A restored proof was BOUND to the
   recorded transport before any digest is compared (`lifecycle._bound_proof` /
   `transport_echo_capability`): a transport that proves absence (`argv`, ECHO-clear pty) accepts
   only a canonical `echo_absent` proof; an echo-possible transport accepts only `echo_expected`
@@ -47,6 +48,28 @@ through the PRODUCTION caller the reviewer named, RED at head ``c9b8d04`` and GR
   matches agent refusal- or completion-shaped bytes excises nothing (R1 holds; live == adopted
   verdict), the inverse (`echo_absent` on an ECHO-set pty) is unproven by name, and the two
   consistent cases resolve exactly as before.
+
+* run_c296ff67c325 -- REVIEW_BUGFIX_iteration3 F-003 under the USER DECISION that narrows PR36-4
+  (`artifacts/runs/run_c296ff67c325/ORIGINAL_REQUEST.md`: "Adoption does not guarantee the same
+  availability as live.  Adopted success must be narrower than or equal to live success, and
+  adoption may not remove unauthenticated evidence to produce a success verdict").  The
+  `delivery_recorded` row is UNKEYED (a same-user writer re-digests it), so NOTHING in it is
+  excision authority: the `echo_proof` producer is gone, the row carries offset / transport /
+  payload digest + length (diagnostic only), and a restored event resolves from its transport
+  KIND alone -- `argv` `echo_absent` by structure, `pty_write` `echo_unproven` /
+  `payload_unobserved` -- excising nothing.  Live is unchanged (it excises only an echo it
+  observed itself, payload in memory).  Consequence, accepted: adopted may be STRICTER than live
+  (the echoed refusal phrase fires R1 -> FAILED `refusal_in_boundary`; the echoed JSON example is
+  a framing candidate -> LOST `record_framing_ambiguous`); impossible: an adopted COMPLETED that
+  live would not produce, and any adopted excision at all.  Every earlier lock whose
+  expectation was "live == adopted echo block / verdict" on an ECHO transport is REWRITTEN below
+  to the new contract with a note naming the decision (L-4, L-10, L-13, L-14, the resolver
+  units); none is deleted.  New locks: F3-L1 (forged / stale / tampered rows have no effect on
+  adopted excision, via the REAL adopt path and the reviewer's probe verbatim), F3-L2 (the
+  transport x output matrix: adopted COMPLETED => live COMPLETED, stricter outcomes by name),
+  F3-L3 (argv: live == adopted, unchanged), F3-L4 (pty_write + ECHO possible / unreadable ->
+  `echo_unproven` by name, no span, whatever the row carries), F3-L5 (refusal-like prompt and
+  result-JSON example never a false COMPLETED on adoption).
 
 Every native lock orders its adversarial events with seams -- a go-file the test writes, a pipe
 the descendant signals, a FULL output FIFO, an injected reader -- never a sleep aimed at a window.
@@ -83,6 +106,14 @@ REPO = Path(__file__).resolve().parent.parent
 #: BEHAVIOUR (a wrong state), never on a missing attribute
 REFUSAL_IN_BOUNDARY = "refusal_in_boundary"
 PROVENANCE_AMBIGUOUS = "provenance_ambiguous"
+FRAMING_AMBIGUOUS = "record_framing_ambiguous"
+#: run_c296ff67c325 (F-003): the NAMED reason a restored (payload-less) `pty_write` event is
+#: unproven, and the closed row vocabulary WITHOUT `echo_proof` -- literals, so 92d8432 fails on
+#: behaviour (a proven span / a wider verdict), never on a missing attribute
+PAYLOAD_UNOBSERVED = "payload_unobserved"
+ROW_KEYS = {"index", "offset", "payload_sha256", "payload_bytes", "transport", "at"}
+#: the pre-decision proof shape 92d8432 wrote and trusted; forged rows below carry it VERBATIM
+ECHO_PROOF_SCHEMA = "os48.echo_proof.v1"
 SCAN_INCOMPLETE = "record_scan_incomplete"
 CAPTURE_TRUNCATED = "capture_truncated"
 
@@ -815,16 +846,13 @@ def fcntl_getfl(fd: int) -> int:
 
 def _provenance(session) -> list[tuple]:
     """The provenance an event carries, in the form BOTH sides can be compared on: offset,
-    transport kind + ECHO flag, and the digest-only `echo_proof` -- derived from the payload on
-    the live side, restored from the journal on the adopted side (REVIEW_BUGFIX i1 F-001: the
-    payload itself is never restored, so it is not part of the comparison)."""
+    transport kind + ECHO flag (REVIEW_BUGFIX i1 F-001: the payload itself is never restored;
+    run_c296ff67c325 F-003: there is no `echo_proof` any more -- the row's digests are
+    diagnostic and no side compares them as authority)."""
     out = []
     for ev in session.delivery_events:
         transport = ev.get("transport") or {}
-        proof = (dict(ev["echo_proof"]) if isinstance(ev.get("echo_proof"), dict)
-                 else lifecycle.echo_proof(str(ev.get("payload") or ""), transport))
-        out.append((int(ev["offset"]), transport.get("kind"),
-                    (transport.get("termios") or {}).get("echo"), json.dumps(proof, sort_keys=True)))
+        out.append((int(ev["offset"]), transport.get("kind"), (transport.get("termios") or {}).get("echo")))
     return out
 
 
@@ -840,13 +868,20 @@ def _echo_block(session) -> dict:
                        for e in res["events"]]}
 
 
-def _assert_identical(case: unittest.TestCase, live, live_result, adopted, adopted_result) -> None:
+def _assert_same_range(case: unittest.TestCase, live, adopted) -> None:
     case.assertEqual(int(adopted._settlement_baseline or 0), int(live._settlement_baseline or 0),
                      "the adopted session restored a different settlement baseline")
     case.assertEqual(_provenance(adopted), _provenance(live),
                      "the adopted session restored different delivery provenance")
     case.assertTrue(all(ev.get("payload") == "" for ev in adopted.delivery_events),
                     "the adoption restored a payload (F-001)")
+
+
+def _assert_identical(case: unittest.TestCase, live, live_result, adopted, adopted_result) -> None:
+    """live == adopted: baseline, provenance, echo block, verdict, evidence.  Holds for the
+    `argv` path (F3-L3: `echo_absent` by structure on both sides); an ECHO transport is
+    compared with `_assert_not_wider` instead (run_c296ff67c325)."""
+    _assert_same_range(case, live, adopted)
     case.assertEqual(_echo_block(adopted), _echo_block(live), "live and adopted resolve the echo differently")
     case.assertEqual(adopted_result["state"], live_result["state"], (live_result, adopted_result))
     case.assertEqual((adopted_result.get("verdict") or {}).get("reason"),
@@ -860,58 +895,136 @@ def _assert_identical(case: unittest.TestCase, live, live_result, adopted, adopt
     case.assertEqual(ae.get("settlement_range"), le.get("settlement_range"))
 
 
+def _assert_not_wider(case: unittest.TestCase, live, live_result, adopted, adopted_result) -> dict:
+    """run_c296ff67c325 (USER DECISION): the adopted settlement reads the SAME [baseline, N)
+    with the same (payload-less) provenance, EXCISES NOTHING (no `echo_proven`, no span) and
+    is never wider than the live one: adopted COMPLETED => live COMPLETED on the same record.
+    Returns the adopted echo block for the caller's named assertions."""
+    _assert_same_range(case, live, adopted)
+    block = _echo_block(adopted)
+    case.assertNotEqual(block["state"], "echo_proven", f"the adoption excised an echo: {block}")
+    case.assertEqual(block["spans"], [], f"the adoption produced a span: {block}")
+    for entry in block["events"]:
+        case.assertIsNone(entry["span"], block)
+    le, ae = live_result["evidence"], adopted_result["evidence"]
+    case.assertEqual((ae.get("boundary") or {}).get("offset_n"), (le.get("boundary") or {}).get("offset_n"))
+    case.assertEqual(((ae.get("boundary") or {}).get("fence") or {}).get("boundary"),
+                     ((le.get("boundary") or {}).get("fence") or {}).get("boundary"))
+    rng = ae.get("settlement_range") or {}
+    case.assertEqual(rng.get("baseline"), (le.get("settlement_range") or {}).get("baseline"))
+    case.assertNotEqual(rng.get("echo"), "echo_proven", rng)
+    case.assertEqual(rng.get("echo"), block["state"], (rng, block))
+    if adopted_result["state"] == "COMPLETED":
+        case.assertEqual(live_result["state"], "COMPLETED",
+                         f"adopted COMPLETED where live did not: {live_result} / {adopted_result}")
+        case.assertEqual(ae.get("settlement_record"), le.get("settlement_record"))
+    return block
+
+
+def _forge_row(case: unittest.TestCase, live: rt.StandaloneSession, forge, *, expect_rows: int = 1) -> None:
+    """Rewrite the live journal's `delivery_recorded` row through ``forge(event_dict)`` and
+    re-digest it (`record_digest`; the journal has no secret) so `rows()` still reads -- the
+    same-user tampering F-002 / F-003 name."""
+    path = journal_mod.journal_path(live.artifact_base, live.run_id)
+    lines = path.read_text(encoding="utf-8").splitlines()
+    out, forged = [], 0
+    for line in lines:
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        if row.get("intent_id") == live.intent_id and row.get("event") == "delivery_recorded":
+            for ev in row["source_vocabulary"]["events"]:
+                forge(ev)
+            row["digest"] = journal_mod.record_digest(row)
+            forged += 1
+        out.append(json.dumps(row, sort_keys=True, ensure_ascii=False))
+    case.assertEqual(forged, expect_rows)
+    path.write_text("\n".join(out) + "\n", encoding="utf-8")
+
+
+def _stranger(live: rt.StandaloneSession) -> rt.StandaloneSession:
+    return rt.StandaloneSession(
+        intent=dict(live.intent), profile=live.profile, artifact_base=live.artifact_base,
+        run_id=live.run_id, journal=journal_mod.ExecutionJournal(live.artifact_base, live.run_id))
+
+
 class PR36F4AdoptionRestoresProvenanceTests(_StubTurn):
     """The REAL adopt path over the journal a LIVE session wrote: the same run, settled live
     and then reconstructed by a stranger session (`adopt(fence=...)` -> masterless
-    `drain_after_exit` -> `completion`) must produce the same baseline, the same delivery
-    provenance and the same verdict.  c9b8d04 adopts baseline 0 and an empty event list."""
+    `drain_after_exit` -> `completion`) reads the same baseline and the same (payload-less)
+    provenance.  c9b8d04 adopted baseline 0 and an empty event list.
+
+    run_c296ff67c325 (USER DECISION, ORIGINAL_REQUEST.md): the i1-i3 expectation "same echo
+    block, same verdict" on the ECHO transport is REWRITTEN -- the restored events carry no
+    excision authority, so the adopted ECHO turn is `echo_unproven` / `payload_unobserved`,
+    excises nothing and settles STRICTER (FAILED `refusal_in_boundary` on the echoed "not
+    logged in") where live COMPLETED; adopted COMPLETED => live COMPLETED always holds."""
 
     def _adopt(self, live: rt.StandaloneSession) -> rt.StandaloneSession:
-        stranger = rt.StandaloneSession(
-            intent=dict(live.intent), profile=live.profile, artifact_base=live.artifact_base,
-            run_id=live.run_id, journal=journal_mod.ExecutionJournal(live.artifact_base, live.run_id))
+        stranger = _stranger(live)
         outcome = stranger.adopt(fence=live.fence)
         self.assertTrue(outcome["adopted"], outcome)
         return stranger
-
-    def _assert_identical(self, live, live_result, adopted, adopted_result) -> None:
-        _assert_identical(self, live, live_result, adopted, adopted_result)
 
     @staticmethod
     def _echo_block(session) -> dict:
         return _echo_block(session)
 
-    def test_l4_live_and_adopted_settle_the_same_completion(self) -> None:
-        """The ECHO turn: live excludes the proven echo and completes; c9b8d04's adoption
-        (baseline 0, no events) reads the echo as a refusal -> the verdicts differ."""
+    def _assert_stricter_refusal(self, live, live_result, adopted, adopted_result) -> dict:
+        block = _assert_not_wider(self, live, live_result, adopted, adopted_result)
+        self.assertEqual(block["state"], "echo_unproven", block)
+        self.assertEqual(block["events"][0]["reason"], PAYLOAD_UNOBSERVED, block)
+        self.assertEqual(adopted_result["state"], "FAILED", adopted_result)
+        self.assertEqual((adopted_result.get("verdict") or {}).get("reason"), REFUSAL_IN_BOUNDARY, adopted_result)
+        rng = adopted_result["evidence"].get("settlement_range") or {}
+        self.assertEqual((rng.get("echo"), rng.get("echo_reason"), rng.get("delivery_events")),
+                         ("echo_unproven", "event[0]:" + PAYLOAD_UNOBSERVED, 1), rng)
+        return block
+
+    def test_l4_the_adopted_echo_turn_restores_the_range_and_settles_no_wider_than_live(self) -> None:
+        """(i1-i3: `test_l4_live_and_adopted_settle_the_same_completion`; rewritten under the
+        run_c296ff67c325 USER DECISION.)  The ECHO turn: live excises the echo it observed and
+        COMPLETES; the adoption restores the baseline and the event but excises NOTHING (no
+        payload in memory), so the echoed "not logged in" fires R1 -> FAILED
+        `refusal_in_boundary`: stricter than live, never wider.  92d8432 resolved the restored
+        proof `echo_proven` and COMPLETED (RED on the named outcome)."""
         live = self._session("pr36-l4-completion", _ECHO_AGENT % {"records": _record(False)})
         _sent, live_result = self._turn(live, _echo_prompt)
         self.assertEqual(live_result["state"], "COMPLETED", live_result)
+        self.assertEqual(_echo_block(live)["state"], "echo_proven")           # live: unchanged
         adopted = self._adopt(live)
         adopted_result = adopted.await_completion()
-        self._assert_identical(live, live_result, adopted, adopted_result)
+        self._assert_stricter_refusal(live, live_result, adopted, adopted_result)
+        self.assertEqual((adopted_result["evidence"].get("refusal") or {}).get("source"), "free_text",
+                         adopted_result["evidence"])
         rows = [r for r in adopted.journal.rows_for(live.intent_id)
                 if r["kind"] == "EVENT" and r["event"] == "identity_bound"
                 and (r.get("source_vocabulary") or {}).get("adopted") is True]
         self.assertEqual(len(rows), 1, rows)
         self.assertEqual(rows[0]["source_vocabulary"].get("settlement_baseline"), live._settlement_baseline, rows[0])
+        self.assertEqual(rows[0]["source_vocabulary"].get("delivery_events_restored"), 1, rows[0])
+        self.assertEqual(rows[0]["source_vocabulary"].get("delivery_provenance"), "restored", rows[0])
 
     def test_l4_live_and_adopted_settle_the_same_refusal(self) -> None:
-        """`refusal_in_boundary` on BOTH sides, over the same baseline and provenance."""
+        """`refusal_in_boundary` on BOTH sides, over the same baseline and provenance (the
+        agent's own bound refusal dominates on both; run_c296ff67c325: the echo blocks now
+        differ by design -- live `echo_proven`, adopted `echo_unproven` -- and the verdicts
+        still agree)."""
         live = self._session("pr36-l4-refusal", _ECHO_AGENT % {"records": _record(False) + _record(True)})
         _sent, live_result = self._turn(live, _echo_prompt)
         self.assertEqual(live_result["state"], "FAILED", live_result)
         self.assertEqual((live_result.get("verdict") or {}).get("reason"), REFUSAL_IN_BOUNDARY)
         adopted = self._adopt(live)
         adopted_result = adopted.await_completion()
-        self._assert_identical(live, live_result, adopted, adopted_result)
-        self.assertEqual((adopted_result.get("verdict") or {}).get("reason"), REFUSAL_IN_BOUNDARY)
+        self._assert_stricter_refusal(live, live_result, adopted, adopted_result)
+        self.assertEqual(adopted_result["evidence"]["provenance_outcome"], live_result["evidence"]["provenance_outcome"])
 
     def test_l4_the_live_session_persists_the_baseline_and_events_before_the_prompt_write(self) -> None:
         """The durable provenance exists the moment the prompt is written: ONE journal row
-        with a closed vocabulary -- digests and transport facts, never the prompt -- readable
-        by a stranger.  (i2: the i1 side record `capture.log.delivery.<inc>.json` no longer
-        exists -- it carried the payload, REVIEW_BUGFIX F-001 -- so the row IS the record.)"""
+        with a closed vocabulary -- the offset, the transport, the payload digest + length,
+        never the prompt -- readable by a stranger.  (i2: the i1 side record is gone;
+        run_c296ff67c325: the row carries NO `echo_proof` -- no digest of any echo form, nothing
+        a future reader could take for excision authority.)"""
         live = self._session("pr36-l4-durable", _ECHO_AGENT % {"records": _record(False)})
         _sent, _result = self._turn(live, _echo_prompt)
         rows = [r for r in live.journal.rows_for(live.intent_id)
@@ -921,12 +1034,14 @@ class PR36F4AdoptionRestoresProvenanceTests(_StubTurn):
         self.assertEqual(vocab.get("baseline"), live._settlement_baseline, vocab)
         self.assertEqual(len(vocab.get("events") or ()), 1, vocab)
         event = vocab["events"][0]
-        self.assertEqual(set(event), {"index", "offset", "payload_sha256", "payload_bytes", "transport", "at", "echo_proof"})
+        self.assertEqual(set(event), ROW_KEYS, "the row's vocabulary is not the closed post-decision shape")
         self.assertEqual(event["payload_sha256"], _sha(live.delivery_events[0]["payload"].encode("utf-8")))
-        self.assertEqual(event["echo_proof"], lifecycle.echo_proof(live.delivery_events[0]["payload"],
-                                                                   live.delivery_events[0]["transport"]))
-        self.assertEqual(event["echo_proof"]["class"], "echo_expected", event)
-        self.assertNotIn("not logged in", json.dumps(rows[0]), "the journal carried the prompt text")
+        self.assertEqual(event["transport"]["kind"], "pty_write")
+        self.assertTrue(event["transport"]["termios"]["echo"], event)
+        dumped = json.dumps(rows[0])
+        self.assertNotIn("echo_proof", dumped, "the row still carries the pre-decision proof")
+        self.assertNotIn('"forms"', dumped, "the row still carries echo-form digests")
+        self.assertNotIn("not logged in", dumped, "the journal carried the prompt text")
         # the prompt is on disk in exactly one file: the capture, where the line discipline
         # ECHOED it (that is the transport, not a record of ours)
         self.assertEqual(self._files_holding(_echo_prompt(live.session_id)),
@@ -934,56 +1049,101 @@ class PR36F4AdoptionRestoresProvenanceTests(_StubTurn):
         # the i1 side record is GONE, not merely emptied
         self.assertEqual([p for p in live.capture.path.parent.iterdir() if ".delivery." in p.name], [])
 
-    def test_l10_a_tampered_or_missing_echo_proof_on_adoption_fails_closed(self) -> None:
-        """L-10 (fail-closed half): the adoption restores the proof, and a proof that does not
-        verify against the capture -- a wrong form digest, or no proof at all -- resolves
-        `echo_unproven` / `no_delivery`: NOTHING is excised (the echoed "not logged in" then
-        fires R1 as it must), never a wider excision.  The live verdict is COMPLETED."""
+    def test_l10_a_tampered_row_on_adoption_excises_nothing(self) -> None:
+        """(i2: `test_l10_a_tampered_or_missing_echo_proof_on_adoption_fails_closed`; rewritten
+        under run_c296ff67c325 -- there is no proof to tamper.)  F3-L1 / F3-L4 through the REAL
+        adopt path over a re-digested row: whatever the row is made to say -- the ECHO flag
+        cleared, the termios dropped, the kind rewritten to `argv`, the payload digest + length
+        re-pointed at the refusal bytes, the pre-decision `echo_proof` shape re-added with forms
+        naming the refusal -- the adoption excises NOTHING (no `echo_proven`, no span) and the
+        echoed "not logged in" fires R1: FAILED `refusal_in_boundary`, never the live
+        COMPLETED.  Named per variant: `payload_unobserved` for every `pty_write` row,
+        `echo_absent` (structural, still no span) for the `argv` rewrite, `no_delivery` for the
+        malformed pre-decision shape (restores no event)."""
         live = self._session("pr36-l10-tamper", _ECHO_AGENT % {"records": _record(False)})
         _sent, live_result = self._turn(live, _echo_prompt)
         self.assertEqual(live_result["state"], "COMPLETED", live_result)
-        for how in ("wrong_digest", "no_proof", "wrong_length"):
-            with self.subTest(how=how):
+        refusal = b"not logged in"
+        echo_form = lifecycle.expected_echo_forms(live.delivery_events[0]["payload"], live.delivery_events[0]["transport"])["forms"][0]
+
+        def echo_cleared(ev): ev["transport"]["termios"]["echo"] = False
+        def termios_dropped(ev): ev["transport"]["termios"] = None
+        def kind_argv(ev): ev["transport"]["kind"] = "argv"; ev["transport"]["framed"] = False; ev["transport"]["termios"] = None
+        def digest_refusal(ev): ev["payload_sha256"] = _sha(refusal); ev["payload_bytes"] = len(refusal)
+        def proof_readded(ev):
+            ev["transport"]["framed"] = False           # the unframed scan 92d8432 ran budget-bounded over every position
+            ev["echo_proof"] = {"schema": ECHO_PROOF_SCHEMA, "class": "echo_expected", "reason": "",
+                                "forms": [{"sha256": _sha(refusal), "bytes": len(refusal)}]}
+        def proof_genuine(ev):
+            ev["echo_proof"] = {"schema": ECHO_PROOF_SCHEMA, "class": "echo_expected", "reason": "",
+                                "forms": [{"sha256": _sha(echo_form), "bytes": len(echo_form)}]}
+        variants = [("echo_flag_cleared", echo_cleared, "echo_unproven", PAYLOAD_UNOBSERVED, 1),
+                    ("termios_dropped", termios_dropped, "echo_unproven", PAYLOAD_UNOBSERVED, 1),
+                    ("kind_rewritten_argv", kind_argv, "echo_absent", "argv_transport_cannot_echo", 1),
+                    ("digest_names_refusal", digest_refusal, "echo_unproven", PAYLOAD_UNOBSERVED, 1),
+                    ("pre_decision_proof_forged_to_refusal", proof_readded, "no_delivery", "", 0),
+                    ("pre_decision_proof_genuine", proof_genuine, "no_delivery", "", 0)]
+        original = journal_mod.journal_path(live.artifact_base, live.run_id).read_bytes()
+        for name, forge, state, reason, restored in variants:
+            with self.subTest(tamper=name):
+                journal_mod.journal_path(live.artifact_base, live.run_id).write_bytes(original)
+                _forge_row(self, live, forge)
                 adopted = self._adopt(live)
-                self.assertEqual(adopted._settlement_baseline, live._settlement_baseline)
-                self.assertEqual(len(adopted.delivery_events), 1)
-                event = adopted.delivery_events[0]
-                self.assertEqual(event["payload"], "")
-                if how == "wrong_digest":
-                    event["echo_proof"]["forms"][0]["sha256"] = "0" * 64
-                elif how == "wrong_length":
-                    event["echo_proof"]["forms"][0]["bytes"] += 1
-                else:
-                    del event["echo_proof"]
                 result = adopted.await_completion()
+                # behaviour first: no wider settlement, no span, every agent byte survives
+                self.assertEqual(result["state"], "FAILED", f"a tampered row widened the settlement: {result}")
+                self.assertEqual((result.get("verdict") or {}).get("reason"), REFUSAL_IN_BOUNDARY, result)
                 block = self._echo_block(adopted)
-                self.assertEqual(block["spans"], [], block)
-                self.assertIn(block["state"], ("echo_unproven", "no_delivery"), block)
-                self.assertEqual(result["state"], "FAILED", "a tampered proof widened the excision")
-                self.assertEqual((result.get("verdict") or {}).get("reason"), REFUSAL_IN_BOUNDARY)
-                self.assertEqual((result["evidence"].get("settlement_range") or {}).get("echo"), block["state"])
+                self.assertEqual(block["spans"], [], f"the tampered row excised a span: {block}")
+                baseline, n, fenced = self._fenced(adopted)
+                self.assertIn(refusal, fenced)
+                self.assertIn(echo_form, fenced)          # every byte survives -- the real echo too
+                # then the names
+                self.assertEqual(adopted._settlement_baseline, live._settlement_baseline)
+                self.assertEqual(len(adopted.delivery_events), restored, adopted.delivery_events)
+                self.assertEqual(block["state"], state, block)
+                if restored:
+                    self.assertEqual(block["events"][0]["reason"], reason, block)
+                    self.assertEqual(adopted.delivery_events[0]["payload"], "")
+                    self.assertNotIn("echo_proof", adopted.delivery_events[0])
+                rng = result["evidence"].get("settlement_range") or {}
+                self.assertEqual((rng.get("echo"), rng.get("delivery_events")), (state, restored), rng)
 
     def test_l10_a_malformed_delivery_row_is_named_and_restores_no_event(self) -> None:
         """A `delivery_recorded` row whose event vocabulary is not the closed shape -- one that
-        carries a `payload` key, say -- restores NO event, keeps the baseline, and is
-        journalled `delivery_provenance_unrestored` by name."""
+        carries a `payload` key, or the pre-decision `echo_proof` key (run_c296ff67c325) --
+        restores NO event, keeps the baseline, and is journalled
+        `delivery_provenance_unrestored` by name."""
         live = self._session("pr36-l10-malformed", _ECHO_AGENT % {"records": _record(False)})
-        stranger = rt.StandaloneSession(
-            intent=dict(live.intent), profile=live.profile, artifact_base=live.artifact_base,
-            run_id=live.run_id, journal=journal_mod.ExecutionJournal(live.artifact_base, live.run_id))
-        stranger.session_id, stranger.incarnation = live.session_id, live.incarnation
-        rows = [{"kind": "EVENT", "event": "delivery_recorded",
-                 "source_vocabulary": {"baseline": 71, "delivery_mode": "post_ready_delivery",
-                                       "events": [{"index": 0, "offset": 71, "payload": "leak", "transport": None,
-                                                   "at": "", "echo_proof": None}]}}]
-        out = stranger._restore_delivery(rows)
-        self.assertEqual(out, {"restored": False, "reason": "delivery_recorded_events_malformed", "events": 0})
-        self.assertEqual(stranger._settlement_baseline, 71)
-        self.assertEqual(stranger.delivery_events, [])
-        named = [r for r in stranger.journal.rows_for(live.intent_id)
-                 if r.get("event") == "delivery_provenance_unrestored"]
-        self.assertEqual(len(named), 1, named)
-        self.assertEqual(named[0]["source_vocabulary"]["reason"], "delivery_recorded_events_malformed")
+        transport = {"kind": "pty_write", "framed": True, "cols": 80, "termios": None, "read_at": ""}
+        shapes = {
+            "payload_key": {"index": 0, "offset": 71, "payload": "leak", "transport": transport, "at": ""},
+            "pre_decision_echo_proof_key": {"index": 0, "offset": 71, "payload_sha256": "0" * 64, "payload_bytes": 4,
+                                            "transport": transport, "at": "",
+                                            "echo_proof": {"schema": ECHO_PROOF_SCHEMA, "class": "echo_absent",
+                                                           "reason": "echo_flag_clear", "forms": []}},
+        }
+        for index, (name, event) in enumerate(shapes.items()):
+            with self.subTest(shape=name):
+                stranger = _stranger(live)
+                stranger.session_id, stranger.incarnation = live.session_id, live.incarnation
+                rows = [{"kind": "EVENT", "event": "delivery_recorded",
+                         "source_vocabulary": {"baseline": 71, "delivery_mode": "post_ready_delivery", "events": [event]}}]
+                out = stranger._restore_delivery(rows)
+                self.assertEqual(out, {"restored": False, "reason": "delivery_recorded_events_malformed", "events": 0})
+                self.assertEqual(stranger._settlement_baseline, 71)
+                self.assertEqual(stranger.delivery_events, [])
+                named = [r for r in stranger.journal.rows_for(live.intent_id)
+                         if r.get("event") == "delivery_provenance_unrestored"]
+                self.assertEqual(len(named), index + 1, named)          # one per malformed shape, same journal
+                self.assertEqual(named[-1]["source_vocabulary"]["reason"], "delivery_recorded_events_malformed")
+                # the well-formed post-decision row restores the event WITHOUT any proof key
+                good = {"index": 0, "offset": 71, "payload_sha256": "0" * 64, "payload_bytes": 4, "transport": transport, "at": ""}
+                rows[0]["source_vocabulary"]["events"] = [good]
+                fresh = _stranger(live)
+                fresh.session_id, fresh.incarnation = live.session_id, live.incarnation
+                self.assertEqual(fresh._restore_delivery(rows), {"restored": True, "reason": "", "events": 1})
+                self.assertEqual(fresh.delivery_events, [{"offset": 71, "payload": "", "transport": transport, "at": ""}])
 
 
 # =====================================================================================
@@ -1021,9 +1181,7 @@ class PR36F001NoPlaintextAtRestTests(_StubTurn):
     digests and the echo class only, and every file the run wrote is scanned."""
 
     def _adopt(self, live: rt.StandaloneSession) -> rt.StandaloneSession:
-        stranger = rt.StandaloneSession(
-            intent=dict(live.intent), profile=live.profile, artifact_base=live.artifact_base,
-            run_id=live.run_id, journal=journal_mod.ExecutionJournal(live.artifact_base, live.run_id))
+        stranger = _stranger(live)
         outcome = stranger.adopt(fence=live.fence)
         self.assertTrue(outcome["adopted"], outcome)
         return stranger
@@ -1061,12 +1219,12 @@ class PR36F001NoPlaintextAtRestTests(_StubTurn):
         self.assertEqual(live_result["state"], "COMPLETED", live_result)
         self._assert_live_adopted_identical(live, live_result, adopted, adopted_result)
         # the journal row names the transport and the digest, and nothing else of the prompt
+        # (run_c296ff67c325: and no `echo_proof` -- the closed post-decision vocabulary)
         row = [r for r in live.journal.rows_for(live.intent_id) if r.get("event") == "delivery_recorded"][-1]
         event = row["source_vocabulary"]["events"][0]
-        self.assertEqual(set(event), {"index", "offset", "payload_sha256", "payload_bytes", "transport", "at", "echo_proof"})
+        self.assertEqual(set(event), ROW_KEYS)
         self.assertEqual(event["payload_sha256"], _sha(prompt_of(live.session_id).encode("utf-8")))
-        self.assertEqual(event["echo_proof"], {"schema": "os48.echo_proof.v1", "class": "echo_absent",
-                                               "reason": "argv_transport_cannot_echo", "forms": []})
+        self.assertEqual(event["transport"]["kind"], "argv")
 
     def test_l8_a_dispatch_capability_bearing_prompt_is_absent_from_every_durable_artifact(self) -> None:
         """L-8: the same with the Orca preamble shape (capability token line + task / dispatch
@@ -1078,12 +1236,12 @@ class PR36F001NoPlaintextAtRestTests(_StubTurn):
         self._assert_live_adopted_identical(live, live_result, adopted, adopted_result)
 
     def test_l9_an_adopted_argv_delivery_resolves_echo_absent_by_name(self) -> None:
-        """L-9: the restored argv event carries its transport and proof and resolves
-        `echo_absent` BY NAME (not `no_delivery`); live == adopted `echo` block and verdict."""
+        """L-9 / F3-L3: the restored argv event carries its transport (no proof --
+        run_c296ff67c325) and resolves `echo_absent` BY NAME, STRUCTURALLY (not `no_delivery`);
+        live == adopted `echo` block and verdict -- the argv path is unchanged."""
         live, live_result, adopted, adopted_result = self._argv_run("pr36-l9-absent", _preamble_prompt)
         self.assertEqual([ev["payload"] for ev in adopted.delivery_events], [""])
         self.assertEqual(adopted.delivery_events[0]["transport"]["kind"], "argv")
-        self.assertEqual(adopted.delivery_events[0]["echo_proof"]["class"], "echo_absent")
         block = _echo_block(adopted)
         self.assertEqual(block["state"], "echo_absent", block)
         self.assertEqual(block["events"][0]["state"], "echo_absent", block)
@@ -1091,13 +1249,17 @@ class PR36F001NoPlaintextAtRestTests(_StubTurn):
         self.assertEqual(block, _echo_block(live))
         self.assertEqual((adopted_result["evidence"].get("settlement_range") or {}).get("echo"), "echo_absent")
         self.assertEqual(adopted_result["evidence"].get("settlement_range"), live_result["evidence"].get("settlement_range"))
+        self.assertEqual(set(adopted.delivery_events[0]), {"offset", "payload", "transport", "at"})   # no proof restored
 
     def test_l10_pty_echo_provenance_adds_no_byte_beyond_the_capture(self) -> None:
         """L-10 (exposure half, MEASURED): for `post_ready_delivery` + ECHO the prompt text is
-        on disk in exactly ONE file -- capture.log, where the line discipline echoed it --
-        and the persisted provenance is digests only (the row's proof forms are
-        {sha256, bytes}; no file other than the capture holds the prompt or any of its
-        lines)."""
+        on disk in exactly ONE file -- capture.log, where the line discipline echoed it -- and
+        the persisted provenance is the payload digest + length and the transport (no file
+        other than the capture holds the prompt or any of its lines).  run_c296ff67c325: the
+        row carries NO echo-form digests at all, and the adoption excises NOTHING -- it is
+        `echo_unproven` / `payload_unobserved` and settles stricter (FAILED
+        `refusal_in_boundary` on the echoed phrase) where live COMPLETED; i2 asserted "the
+        adoption excises exactly that span" (RED at 92d8432 on `echo_proven`)."""
         live = self._session("pr36-l10-echo", _ECHO_AGENT % {"records": _record(False)})
         prompt_of = lambda sid: _echo_prompt(sid) + " Auth: " + SENTINEL  # noqa: E731
         _sent, live_result = self._turn(live, prompt_of)
@@ -1107,57 +1269,34 @@ class PR36F001NoPlaintextAtRestTests(_StubTurn):
                          f"the prompt is held by other files than the capture's own echo: {holders}")
         row = [r for r in live.journal.rows_for(live.intent_id) if r.get("event") == "delivery_recorded"][-1]
         event = row["source_vocabulary"]["events"][0]
-        self.assertEqual(event["echo_proof"]["class"], "echo_expected")
-        self.assertTrue(event["echo_proof"]["forms"], event)
-        for form in event["echo_proof"]["forms"]:
-            self.assertEqual(set(form), {"sha256", "bytes"})
-            self.assertRegex(form["sha256"], r"^[0-9a-f]{64}$")
-        # every persisted form digest is the digest of bytes that ARE in the capture (the echo)
-        raw = live.capture.raw()
-        for form in event["echo_proof"]["forms"]:
-            length = form["bytes"]
-            self.assertTrue(any(_sha(raw[i:i + length]) == form["sha256"]
-                                for i in range(0, len(raw) - length + 1)), "a persisted form digest matches no capture span")
-        # ... and the adoption excises exactly that span
+        self.assertEqual(set(event), ROW_KEYS)
+        self.assertNotIn("echo_proof", json.dumps(row))
+        self.assertNotIn('"forms"', json.dumps(row))
+        self.assertEqual(event["payload_bytes"], len(prompt_of(live.session_id).encode("utf-8")))
+        # ... and the adoption excises nothing of it
         adopted = self._adopt(live)
         adopted_result = adopted.await_completion()
-        _assert_identical(self, live, live_result, adopted, adopted_result)
-        block = _echo_block(adopted)
-        self.assertEqual(block["state"], "echo_proven", block)
-        self.assertEqual(len(block["spans"]), 1, block)
+        block = _assert_not_wider(self, live, live_result, adopted, adopted_result)
+        self.assertEqual((block["state"], block["events"][0]["reason"]), ("echo_unproven", PAYLOAD_UNOBSERVED), block)
+        self.assertEqual(adopted_result["state"], "FAILED", adopted_result)
+        self.assertEqual((adopted_result.get("verdict") or {}).get("reason"), REFUSAL_IN_BOUNDARY)
 
 
 class PR36F002ProofTransportBindingTests(_StubTurn):
-    """REVIEW_BUGFIX_iteration2 F-002: the payload-less resolver trusted the proof's declared
-    class independently of the recorded transport, so a forged `echo_expected` proof on an
+    """REVIEW_BUGFIX_iteration2 F-002 (retained, closed): a forged `echo_expected` proof on an
     adopted `argv` event excised agent bytes whose digest it named (the reviewer's
-    `forged_proof_probe.py`: `not logged in` removed before R1).  These locks drive the REAL
-    adopt path over a journal whose `delivery_recorded` row was tampered (the row re-digested,
-    as a same-user writer could), RED on the iteration-2 tree, GREEN after."""
+    `forged_proof_probe.py`).  These locks drive the REAL adopt path over a journal whose
+    `delivery_recorded` row was tampered (re-digested, as a same-user writer could).
 
-    def _forge_row(self, live: rt.StandaloneSession, forge) -> None:
-        """Rewrite the live journal's `delivery_recorded` row through ``forge(event_dict)`` and
-        re-digest it (`record_digest`; the journal has no secret) so `rows()` still reads."""
-        path = journal_mod.journal_path(live.artifact_base, live.run_id)
-        lines = path.read_text(encoding="utf-8").splitlines()
-        out, forged = [], 0
-        for line in lines:
-            if not line.strip():
-                continue
-            row = json.loads(line)
-            if row.get("intent_id") == live.intent_id and row.get("event") == "delivery_recorded":
-                for ev in row["source_vocabulary"]["events"]:
-                    forge(ev)
-                row["digest"] = journal_mod.record_digest(row)
-                forged += 1
-            out.append(json.dumps(row, sort_keys=True, ensure_ascii=False))
-        self.assertEqual(forged, 1)
-        path.write_text("\n".join(out) + "\n", encoding="utf-8")
+    run_c296ff67c325: the proof no longer exists.  A row carrying the pre-decision
+    `echo_proof` shape is not the closed vocabulary and restores NO event (`no_delivery`); a
+    closed-shape row with its digest re-pointed at the agent bytes restores an event that
+    resolves STRUCTURALLY (`argv` -> `echo_absent`).  Either way nothing is excised and the
+    argv verdict equals live (F3-L3).  L-13's "unforged row resolves identically" half is
+    REWRITTEN: on the ECHO transport the unforged row now settles stricter (the decision)."""
 
     def _adopt(self, live: rt.StandaloneSession) -> rt.StandaloneSession:
-        stranger = rt.StandaloneSession(
-            intent=dict(live.intent), profile=live.profile, artifact_base=live.artifact_base,
-            run_id=live.run_id, journal=journal_mod.ExecutionJournal(live.artifact_base, live.run_id))
+        stranger = _stranger(live)
         outcome = stranger.adopt(fence=live.fence)
         self.assertTrue(outcome["adopted"], outcome)
         return stranger
@@ -1165,8 +1304,16 @@ class PR36F002ProofTransportBindingTests(_StubTurn):
     @staticmethod
     def _forged_expected(target: bytes):
         def forge(ev):
-            ev["echo_proof"] = {"schema": lifecycle.ECHO_PROOF_SCHEMA, "class": "echo_expected", "reason": "",
+            ev["echo_proof"] = {"schema": ECHO_PROOF_SCHEMA, "class": "echo_expected", "reason": "",
                                 "forms": [{"sha256": _sha(target), "bytes": len(target)}]}
+        return forge
+
+    @staticmethod
+    def _digest_repointed(target: bytes):
+        def forge(ev):
+            ev.pop("echo_proof", None)                 # the closed post-decision shape ...
+            ev["payload_sha256"] = _sha(target)        # ... with its diagnostics re-pointed
+            ev["payload_bytes"] = len(target)
         return forge
 
     def _argv_live(self, run_id: str, records: str):
@@ -1176,91 +1323,110 @@ class PR36F002ProofTransportBindingTests(_StubTurn):
         live_result = live.await_completion()
         return live, live_result
 
-    def _assert_unproven_no_span(self, session, reason: str) -> dict:
+    def _assert_no_span(self, session, *, states: tuple, reason: str) -> dict:
         block = _echo_block(session)
-        self.assertEqual(block["state"], "echo_unproven", block)
+        self.assertIn(block["state"], states, block)
+        self.assertNotEqual(block["state"], "echo_proven", block)
         self.assertEqual(block["spans"], [], block)
-        self.assertEqual(block["events"][0]["reason"], reason, block)
+        if block["events"]:
+            self.assertEqual(block["events"][0]["reason"], reason, block)
         return block
+
+    def _forged_argv(self, live, live_result, raw: bytes, target: bytes, *, expect_state: str):
+        """Both tamper shapes; each adoption excises nothing and settles exactly as live."""
+        original = journal_mod.journal_path(live.artifact_base, live.run_id).read_bytes()
+        for name, forge, states, reason, restored in (
+                ("pre_decision_proof_forged", self._forged_expected(target), ("echo_unproven", "no_delivery"), "proof_class_contradicts_transport", None),
+                ("closed_shape_digest_repointed", self._digest_repointed(target), ("echo_absent", "no_delivery"), "argv_transport_cannot_echo", None)):
+            with self.subTest(tamper=name):
+                journal_mod.journal_path(live.artifact_base, live.run_id).write_bytes(original)
+                _forge_row(self, live, forge)
+                adopted = self._adopt(live)
+                adopted_result = adopted.await_completion()
+                block = self._assert_no_span(adopted, states=states, reason=reason)
+                self.assertEqual(adopted_result["state"], expect_state, adopted_result)
+                self.assertEqual((adopted_result.get("verdict") or {}).get("reason"),
+                                 (live_result.get("verdict") or {}).get("reason"))
+                self.assertEqual(adopted_result["evidence"]["provenance_outcome"], live_result["evidence"]["provenance_outcome"])
+                self.assertEqual((adopted_result["evidence"].get("settlement_range") or {}).get("echo"), block["state"])
+                # the strip itself removes nothing from the fenced range
+                events = tuple({**dict(ev), "offset": int(ev["offset"])} for ev in adopted.delivery_events)
+                self.assertEqual(lifecycle.strip_delivery_echo(raw, events), raw)
+                self.assertIn(target, raw)
 
     def test_l11_a_forged_echo_expected_proof_on_argv_cannot_excise_a_refusal(self) -> None:
         """L-11: the agent prints the refusal prose `not logged in` and a bound success (live
-        R1 -> FAILED `refusal_in_boundary`).  The journal row's argv proof is forged into an
-        `echo_expected` proof whose digest names exactly the refusal bytes.  i2: the adoption
-        resolved `echo_proven`, excised the refusal and COMPLETED; now: `echo_unproven` /
-        `proof_class_contradicts_transport`, no span, the refusal survives, FAILED
-        `refusal_in_boundary` -- identical to live."""
+        R1 -> FAILED `refusal_in_boundary`).  The row is forged to name exactly the refusal
+        bytes (i2's proof shape, and the closed shape's digest); the adoption excises nothing
+        and settles FAILED `refusal_in_boundary` -- identical to live."""
         live, live_result = self._argv_live(
             "pr36-l11-refusal", "printf 'not logged in\\n'\n" + _record(False))
         self.assertEqual(live_result["state"], "FAILED", live_result)
         self.assertEqual((live_result.get("verdict") or {}).get("reason"), REFUSAL_IN_BOUNDARY, live_result)
         n = int(live._boundary["offset_n"])
         raw = live.capture.raw()[:n]
-        target = b"not logged in"
-        self.assertIn(target, raw)
-        self._forge_row(live, self._forged_expected(target))
-        adopted = self._adopt(live)
-        self.assertEqual(adopted.delivery_events[0]["echo_proof"]["class"], "echo_expected")   # the forgery arrived
-        adopted_result = adopted.await_completion()
-        self._assert_unproven_no_span(adopted, "proof_class_contradicts_transport")
-        self.assertEqual(adopted_result["state"], "FAILED", adopted_result)
-        self.assertEqual((adopted_result.get("verdict") or {}).get("reason"), REFUSAL_IN_BOUNDARY, adopted_result)
-        self.assertEqual(adopted_result["evidence"]["provenance_outcome"], live_result["evidence"]["provenance_outcome"])
-        self.assertEqual((adopted_result["evidence"].get("settlement_range") or {}).get("echo"), "echo_unproven")
-        # the strip itself removes nothing from the fenced range
-        events = tuple({**dict(ev), "offset": int(ev["offset"])} for ev in adopted.delivery_events)
-        self.assertEqual(lifecycle.strip_delivery_echo(raw, events), raw)
+        self._forged_argv(live, live_result, raw, b"not logged in", expect_state="FAILED")
 
     def test_l12_a_forged_echo_expected_proof_on_argv_cannot_excise_a_completion_record(self) -> None:
-        """L-12: the same forgery aimed at the agent's bound `result` line.  i2: the record was
-        excised and the adoption settled FAILED `no_completion_record` while live COMPLETED;
-        now: unproven by name, the record stays, COMPLETED == live."""
+        """L-12: the same forgery aimed at the agent's bound `result` line: the record stays,
+        COMPLETED == live on the same settlement record."""
         live, live_result = self._argv_live("pr36-l12-record", _record(False))
         self.assertEqual(live_result["state"], "COMPLETED", live_result)
         n = int(live._boundary["offset_n"])
         raw = live.capture.raw()[:n]
         line = next(seg for seg in raw.split(b"\n") if b'"type":"result"' in seg)
-        target = line + b"\n"                                         # the record line, as captured
-        self.assertIn(target, raw)
-        self._forge_row(live, self._forged_expected(target))
+        self._forged_argv(live, live_result, raw, line + b"\n", expect_state="COMPLETED")
         adopted = self._adopt(live)
-        adopted_result = adopted.await_completion()
-        self._assert_unproven_no_span(adopted, "proof_class_contradicts_transport")
-        self.assertEqual(adopted_result["state"], "COMPLETED", adopted_result)
-        self.assertEqual((adopted_result.get("verdict") or {}).get("outcome"), "succeeded")
-        self.assertEqual(adopted_result["evidence"]["settlement_record"], live_result["evidence"]["settlement_record"])
+        self.assertEqual(adopted.await_completion()["evidence"]["settlement_record"], live_result["evidence"]["settlement_record"])
 
     def test_l13_an_echo_absent_proof_on_an_echo_set_pty_write_is_unproven_by_name(self) -> None:
-        """L-13 (the inverse): the ECHO turn's row is forged into a canonical `echo_absent`
-        proof.  i2 trusted it (`echo_absent`, live `echo_proven` -> the echo blocks diverged);
-        now `echo_unproven` / `proof_class_contradicts_transport`, no span -- the echoed
-        "not logged in" then fires R1 on the adopted side exactly as it would for any unproven
-        echo (fail closed).  The unforged row still resolves identically live and adopted."""
+        """L-13 (the inverse): the ECHO turn's row is forged to claim absence -- i2's
+        `echo_absent` proof (a pre-decision shape: restores no event), and the closed shape's
+        transport rewritten to ECHO clear (restores an event: `payload_unobserved`).  Neither
+        excises anything: the echoed "not logged in" fires R1 on the adopted side (FAILED
+        `refusal_in_boundary`).  REWRITTEN under run_c296ff67c325: the UNFORGED row settles the
+        SAME way -- stricter than live's COMPLETED, by the decision -- where i3 asserted
+        live == adopted (RED at 92d8432: adopted `echo_proven`, COMPLETED)."""
         live = self._session("pr36-l13-inverse", _ECHO_AGENT % {"records": _record(False)})
         _sent, live_result = self._turn(live, _echo_prompt)
         self.assertEqual(live_result["state"], "COMPLETED", live_result)
         self.assertEqual(_echo_block(live)["state"], "echo_proven")
+        original = journal_mod.journal_path(live.artifact_base, live.run_id).read_bytes()
 
-        def forge(ev):
-            ev["echo_proof"] = {"schema": lifecycle.ECHO_PROOF_SCHEMA, "class": "echo_absent",
-                                "reason": "echo_flag_clear", "forms": []}
-        self._forge_row(live, forge)
-        adopted = self._adopt(live)
-        adopted_result = adopted.await_completion()
-        block = self._assert_unproven_no_span(adopted, "proof_class_contradicts_transport")
-        self.assertEqual(adopted_result["state"], "FAILED", adopted_result)
-        self.assertEqual((adopted_result.get("verdict") or {}).get("reason"), REFUSAL_IN_BOUNDARY)
-        self.assertEqual((adopted_result["evidence"].get("settlement_range") or {}).get("echo"), block["state"])
-        # ... and the UNFORGED row still resolves identically live and adopted (the consistent case)
-        self._forge_row(live, lambda ev: ev.__setitem__("echo_proof", lifecycle.echo_proof(
-            live.delivery_events[0]["payload"], live.delivery_events[0]["transport"])))
-        restored = self._adopt(live)
-        _assert_identical(self, live, live_result, restored, restored.await_completion())
+        def absent_proof(ev):
+            ev["echo_proof"] = {"schema": ECHO_PROOF_SCHEMA, "class": "echo_absent", "reason": "echo_flag_clear", "forms": []}
+
+        def echo_clear(ev):
+            ev.pop("echo_proof", None)
+            ev["transport"]["termios"]["echo"] = False
+
+        for name, forge, states, reason in (("pre_decision_absent_proof", absent_proof, ("echo_unproven", "no_delivery"), "proof_class_contradicts_transport"),
+                                            ("closed_shape_echo_cleared", echo_clear, ("echo_unproven",), PAYLOAD_UNOBSERVED),
+                                            ("unforged", lambda ev: ev.pop("echo_proof", None), ("echo_unproven",), PAYLOAD_UNOBSERVED)):
+            with self.subTest(row=name):
+                journal_mod.journal_path(live.artifact_base, live.run_id).write_bytes(original)
+                _forge_row(self, live, forge)
+                adopted = self._adopt(live)
+                adopted_result = adopted.await_completion()
+                block = self._assert_no_span(adopted, states=states, reason=reason)
+                self.assertEqual(adopted_result["state"], "FAILED", adopted_result)
+                self.assertEqual((adopted_result.get("verdict") or {}).get("reason"), REFUSAL_IN_BOUNDARY)
+                self.assertEqual((adopted_result["evidence"].get("settlement_range") or {}).get("echo"), block["state"])
+                if name == "unforged":
+                    _assert_not_wider(self, live, live_result, adopted, adopted_result)
 
 
 class PR36F002ProofMatrixTests(unittest.TestCase):
-    """L-14: the resolver unit matrix -- every class x transport x forms contradiction is
-    `echo_unproven` with the NAMED reason and no span; the consistent cases resolve as before."""
+    """L-14 (REWRITTEN under run_c296ff67c325): the resolver unit matrix.  i3 asserted every
+    class x transport x forms CONTRADICTION is unproven by a proof-binding reason and every
+    CONSISTENT proof resolves as the payload does (`echo_proven` on ECHO-set pty).  The
+    decision removes the proof's authority altogether: for a payload-less event EVERY proof
+    material -- contradictory, consistent, genuine, malformed, absent -- is inert, and the
+    verdict is the transport kind's alone: `argv` -> `echo_absent` / `argv_transport_cannot_echo`;
+    `pty_write` (ECHO set, ECHO clear, termios unreadable) -> `echo_unproven` /
+    `payload_unobserved`; an unknown kind -> `transport_kind_unknown`.  No span, ever; the
+    strip returns the bytes unchanged.  The genuine-proof cases are RED at 92d8432
+    (`echo_proven`, a span)."""
 
     def _pty_transport(self, *, echo: bool, framed: bool = True):
         import pty as _pty
@@ -1277,16 +1443,17 @@ class PR36F002ProofMatrixTests(unittest.TestCase):
 
     @staticmethod
     def _proof(klass, reason="", forms=()):
-        return {"schema": lifecycle.ECHO_PROOF_SCHEMA, "class": klass, "reason": reason, "forms": list(forms)}
+        return {"schema": ECHO_PROOF_SCHEMA, "class": klass, "reason": reason, "forms": list(forms)}
 
     def _resolve(self, raw, transport, proof):
         ev = ({"offset": 0, "payload": "", "transport": transport, "at": "", "echo_proof": proof},)
         return lifecycle.resolve_delivery_echo(raw, ev)
 
-    def test_l14_every_contradiction_is_unproven_by_name_with_no_span(self) -> None:
+    def test_l14_every_proof_material_is_inert_and_the_kind_alone_decides(self) -> None:
         argv = pty_supervisor.echo_transport(None, kind="argv", framed=False, cols=80)
         echo_on = self._pty_transport(echo=True)
         echo_off = self._pty_transport(echo=False)
+        unreadable = {**self._pty_transport(echo=True), "termios": None}
         unknown = {"kind": "pipe", "framed": False, "cols": 80, "termios": None, "read_at": ""}
         payload = "not logged in " + SENTINEL
         forms_on = lifecycle.expected_echo_forms(payload, echo_on)["forms"]
@@ -1294,72 +1461,124 @@ class PR36F002ProofMatrixTests(unittest.TestCase):
         raw = agent + b"\r\n" + forms_on[0] + b"\r\n"
         good_forms = [{"sha256": _sha(f), "bytes": len(f)} for f in forms_on]
         forged = [{"sha256": _sha(agent), "bytes": len(agent)}]
-        cases = [
-            # (transport, proof, expected NAMED reason)
-            (argv, self._proof("echo_expected", "", forged), "proof_class_contradicts_transport"),
-            (argv, self._proof("echo_unproven", "termios_unreadable"), "proof_class_contradicts_transport"),
-            (argv, self._proof("echo_absent", "echo_flag_clear"), "proof_reason_contradicts_transport"),
-            (argv, self._proof("echo_absent", "argv_transport_cannot_echo", forged), "proof_forms_contradict_class"),
-            (echo_off, self._proof("echo_expected", "", forged), "proof_class_contradicts_transport"),
-            (echo_off, self._proof("echo_absent", "argv_transport_cannot_echo"), "proof_reason_contradicts_transport"),
-            (echo_off, self._proof("echo_unproven", "echonl_partial_echo"), "proof_class_contradicts_transport"),  # no ECHONL+ICANON here
-            (echo_on, self._proof("echo_absent", "echo_flag_clear"), "proof_class_contradicts_transport"),
-            (echo_on, self._proof("echo_absent", "argv_transport_cannot_echo"), "proof_class_contradicts_transport"),
-            (echo_on, self._proof("echo_expected", ""), "proof_forms_contradict_class"),
-            (echo_on, self._proof("echo_expected", "", good_forms * 9), "proof_forms_count_contradicts_transport"),
-            (echo_on, self._proof("echo_unproven", "made_up_reason"), "proof_reason_contradicts_transport"),
-            (unknown, self._proof("echo_expected", "", forged), "proof_class_contradicts_transport"),
-            (unknown, self._proof("echo_absent", "argv_transport_cannot_echo"), "proof_class_contradicts_transport"),
-            (unknown, self._proof("echo_unproven", "transport_kind_unknown"), "transport_kind_unknown"),
-            (echo_on, {**self._proof("echo_expected", "", good_forms), "schema": "os48.echo_proof.v0"}, "proof_unrecorded"),
-            (echo_on, self._proof("echo_whatever", "", good_forms), "proof_unrecorded"),
+        expected = {"argv": ("echo_absent", "argv_transport_cannot_echo"),
+                    "pty_write": ("echo_unproven", PAYLOAD_UNOBSERVED),
+                    "pipe": ("echo_unproven", "transport_kind_unknown")}
+        materials = [
+            ("forged_expected", self._proof("echo_expected", "", forged)),
+            ("genuine_expected", self._proof("echo_expected", "", good_forms)),
+            ("absent_argv_reason", self._proof("echo_absent", "argv_transport_cannot_echo")),
+            ("absent_flag_clear", self._proof("echo_absent", "echo_flag_clear")),
+            ("absent_with_forms", self._proof("echo_absent", "argv_transport_cannot_echo", forged)),
+            ("unproven_termios", self._proof("echo_unproven", "termios_unreadable")),
+            ("unproven_echonl", self._proof("echo_unproven", "echonl_partial_echo")),
+            ("unproven_kind", self._proof("echo_unproven", "transport_kind_unknown")),
+            ("unproven_made_up", self._proof("echo_unproven", "made_up_reason")),
+            ("expected_no_forms", self._proof("echo_expected", "")),
+            ("expected_nine_forms", self._proof("echo_expected", "", good_forms * 9)),
+            ("old_schema", {**self._proof("echo_expected", "", good_forms), "schema": "os48.echo_proof.v0"}),
+            ("unknown_class", self._proof("echo_whatever", "", good_forms)),
+            ("proof_none", None),
+            ("proof_absent", "ABSENT"),
         ]
-        for transport, proof, reason in cases:
-            with self.subTest(kind=transport.get("kind"), klass=proof.get("class"), reason=reason):
-                res = self._resolve(raw, transport, proof)
-                self.assertEqual(res["state"], "echo_unproven", res)
-                self.assertEqual(res["spans"], (), res)
-                self.assertEqual(res["events"][0]["reason"], reason, res)
-                self.assertEqual(lifecycle.strip_delivery_echo(
-                    raw, ({"offset": 0, "payload": "", "transport": transport, "at": "", "echo_proof": proof},)), raw)
-        # the CONSISTENT cases, unchanged
-        absent = self._resolve(raw, argv, self._proof("echo_absent", "argv_transport_cannot_echo"))
-        self.assertEqual((absent["state"], absent["events"][0]["reason"]), ("echo_absent", "argv_transport_cannot_echo"))
-        absent_off = self._resolve(raw, echo_off, self._proof("echo_absent", "echo_flag_clear"))
-        self.assertEqual((absent_off["state"], absent_off["events"][0]["reason"]), ("echo_absent", "echo_flag_clear"))
-        proven = self._resolve(raw, echo_on, self._proof("echo_expected", "", good_forms))
+        transports = [("argv", argv), ("echo_on", echo_on), ("echo_off", echo_off), ("termios_unreadable", unreadable), ("unknown", unknown)]
+        for tname, transport in transports:
+            for mname, proof in materials:
+                with self.subTest(transport=tname, material=mname):
+                    ev = {"offset": 0, "payload": "", "transport": transport, "at": ""}
+                    if proof != "ABSENT":
+                        ev["echo_proof"] = proof
+                    res = lifecycle.resolve_delivery_echo(raw, (ev,))
+                    state, reason = expected[transport["kind"]]
+                    self.assertEqual((res["state"], res["spans"]), (state, ()), res)
+                    self.assertEqual((res["events"][0]["state"], res["events"][0]["reason"], res["events"][0]["span"]),
+                                     (state, reason, None), res)
+                    self.assertEqual(lifecycle.strip_delivery_echo(raw, (ev,)), raw)
+        # the LIVE control is unchanged: the payload in memory proves the echo on the ECHO-set pty ...
         live = lifecycle.resolve_delivery_echo(raw, ({"offset": 0, "payload": payload, "transport": echo_on, "at": ""},))
-        self.assertEqual(live["state"], "echo_proven", live)
-        self.assertEqual((proven["state"], proven["spans"]), (live["state"], live["spans"]))
-        # uniqueness still decides: the form twice -> ambiguous on both sides
+        self.assertEqual((live["state"], live["spans"]), ("echo_proven", ((len(agent) + 2, len(agent) + 2 + len(forms_on[0])),)), live)
+        # ... is absent by structure on argv / ECHO clear, unproven by name when unreadable
+        for transport, state, reason in ((argv, "echo_absent", "argv_transport_cannot_echo"),
+                                         (echo_off, "echo_absent", "echo_flag_clear"),
+                                         (unreadable, "echo_unproven", "termios_unreadable")):
+            with self.subTest(live=transport.get("kind"), echo=(transport.get("termios") or {}).get("echo")):
+                res = lifecycle.resolve_delivery_echo(raw, ({"offset": 0, "payload": payload, "transport": transport, "at": ""},))
+                self.assertEqual((res["state"], res["events"][0]["reason"], res["spans"]), (state, reason, ()), res)
+        # ... and ambiguity on the live side stays ambiguity; the restored side is unproven regardless
         raw2 = forms_on[0] + b"\r\n" + forms_on[0] + b"\r\n"
-        amb = self._resolve(raw2, echo_on, self._proof("echo_expected", "", good_forms))
+        amb = lifecycle.resolve_delivery_echo(raw2, ({"offset": 0, "payload": payload, "transport": echo_on, "at": ""},))
         self.assertEqual((amb["state"], amb["reason"]), ("echo_unproven", "event[0]:ambiguous_multiple_matches"))
-        # the recorded proof of every live transport passes its own binding (live == adopted)
-        for transport in (argv, echo_on, echo_off):
-            with self.subTest(consistent=transport.get("kind"), echo=(transport.get("termios") or {}).get("echo")):
-                proof = lifecycle.echo_proof(payload, transport)
-                res = self._resolve(raw, transport, proof)
-                live_res = lifecycle.resolve_delivery_echo(raw, ({"offset": 0, "payload": payload, "transport": transport, "at": ""},))
-                self.assertEqual((res["state"], res["reason"], res["spans"]), (live_res["state"], live_res["reason"], live_res["spans"]))
+        restored = self._resolve(raw2, echo_on, self._proof("echo_expected", "", good_forms))
+        self.assertEqual((restored["state"], restored["reason"], restored["spans"]), ("echo_unproven", "event[0]:" + PAYLOAD_UNOBSERVED, ()))
 
     def test_l14_the_reviewers_forged_proof_probe_keeps_the_refusal(self) -> None:
-        """The reviewer's `forged_proof_probe.py`, verbatim shape."""
+        """The reviewer's F-002 `forged_proof_probe.py`, verbatim shape (still closed)."""
         refusal = b"not logged in"
         raw = refusal + b'\n{"type":"result","is_error":false}\n'
         event = {"offset": 0, "payload": "", "transport": {"kind": "argv", "framed": False, "termios": None, "cols": 80},
-                 "at": "", "echo_proof": {"schema": lifecycle.ECHO_PROOF_SCHEMA, "class": "echo_expected", "reason": "",
+                 "at": "", "echo_proof": {"schema": ECHO_PROOF_SCHEMA, "class": "echo_expected", "reason": "",
                                           "forms": [{"sha256": _sha(refusal), "bytes": len(refusal)}]}}
         result = lifecycle.resolve_delivery_echo(raw, (event,))
-        self.assertEqual((result["state"], result["spans"]), ("echo_unproven", ()), result)
-        self.assertEqual(result["events"][0]["reason"], "proof_class_contradicts_transport")
+        self.assertNotEqual(result["state"], "echo_proven", result)
+        self.assertEqual(result["spans"], (), result)
         self.assertIn(refusal, lifecycle.strip_delivery_echo(raw, (event,)))
 
+    def test_l14_the_reviewers_echo_set_forgery_probe_excises_nothing(self) -> None:
+        """F3-L1 (unit): the reviewer's F-003 `echo_set_forgery_probe.py`, verbatim construction
+        -- a GENUINE ECHO-set unframed pty transport, a capture holding the real echo of a
+        harmless prompt at [0,15], the agent refusal `not logged in` at [17,30] and a result
+        record; the payload-less event carries a structurally consistent one-form
+        `echo_expected` proof whose digest names the refusal.  92d8432: `echo_proven`
+        [[17,30]] -- the refusal excised, the real echo kept.  Now: `echo_unproven` /
+        `payload_unobserved`, no span, both spans survive; live still proves [0,15]."""
+        transport = self._pty_transport(echo=True, framed=False)
+        payload = "harmless prompt"
+        actual_echo = lifecycle.expected_echo_forms(payload, transport)["forms"][0]
+        refusal = b"not logged in"
+        raw = actual_echo + b"\r\n" + refusal + b'\n{"type":"result","is_error":false}\n'
+        live_event = {"offset": 0, "payload": payload, "transport": transport, "at": ""}
+        forged_event = {"offset": 0, "payload": "", "transport": transport, "at": "",
+                        "echo_proof": {"schema": ECHO_PROOF_SCHEMA, "class": "echo_expected", "reason": "",
+                                       "forms": [{"sha256": _sha(refusal), "bytes": len(refusal)}]}}
+        live = lifecycle.resolve_delivery_echo(raw, (live_event,))
+        forged = lifecycle.resolve_delivery_echo(raw, (forged_event,))
+        self.assertEqual((live["state"], live["spans"]), ("echo_proven", ((0, len(actual_echo)),)), live)
+        self.assertEqual((forged["state"], forged["spans"]), ("echo_unproven", ()), forged)
+        self.assertEqual(forged["events"][0]["reason"], PAYLOAD_UNOBSERVED, forged)
+        forged_after = lifecycle.strip_delivery_echo(raw, (forged_event,))
+        self.assertEqual(forged_after, raw)
+        self.assertIn(refusal, forged_after)
+        self.assertIn(actual_echo, forged_after)
+        self.assertNotIn(actual_echo, lifecycle.strip_delivery_echo(raw, (live_event,)))   # live: unchanged
 
-class PR36F001EchoProofResolverTests(unittest.TestCase):
-    """Unit-level: `resolve_delivery_echo` over a payload-less event carrying a digest-only
-    `echo_proof` yields the SAME block the payload yields -- anchored (framed) and unframed
-    (bounded full scan); the scan budget and a malformed proof fail closed by name."""
+
+class _SpiedBytes(bytes):
+    """A capture whose every read the resolver could make is counted (F3-L1 unit: the
+    payload-less leg must not read the capture at all -- no anchor search, no digest)."""
+
+    reads = 0
+
+    def find(self, *a, **kw):
+        _SpiedBytes.reads += 1
+        return super().find(*a, **kw)
+
+    def __getitem__(self, item):
+        if isinstance(item, slice):
+            _SpiedBytes.reads += 1
+        return super().__getitem__(item)
+
+    def __iter__(self):
+        _SpiedBytes.reads += 1
+        return super().__iter__()
+
+
+class PR36F003UnobservedEventResolverTests(unittest.TestCase):
+    """(i2: `PR36F001EchoProofResolverTests` -- "a payload-less event carrying a digest-only
+    proof yields the SAME block the payload yields"; REWRITTEN under run_c296ff67c325.)  A
+    payload-less event yields NO span whatever it carries -- framed or unframed, anchored or
+    not, budget or no budget: there is no digest scan any more.  The live payload still
+    proves its echo; the restored event is `echo_unproven` / `payload_unobserved` on
+    `pty_write`, `echo_absent` on `argv`, and the resolver reads no capture byte for it."""
 
     def _transport(self, *, framed: bool):
         import pty as _pty
@@ -1373,60 +1592,266 @@ class PR36F001EchoProofResolverTests(unittest.TestCase):
 
     def _blocks(self, raw: bytes, payload: str, transport, offset: int = 0):
         live = ({"offset": offset, "payload": payload, "transport": transport, "at": ""},)
-        proof = lifecycle.echo_proof(payload, transport)
-        restored = ({"offset": offset, "payload": "", "transport": transport, "at": "", "echo_proof": proof},)
-        return lifecycle.resolve_delivery_echo(raw, live), lifecycle.resolve_delivery_echo(raw, restored), proof
+        restored = ({"offset": offset, "payload": "", "transport": transport, "at": ""},)
+        return lifecycle.resolve_delivery_echo(raw, live), lifecycle.resolve_delivery_echo(raw, restored)
 
-    def test_a_framed_proof_resolves_the_same_span_as_the_payload(self) -> None:
+    def _assert_unobserved(self, block, offset: int = 0) -> None:
+        self.assertEqual((block["state"], block["reason"], block["spans"]),
+                         ("echo_unproven", "event[0]:" + PAYLOAD_UNOBSERVED, ()), block)
+        self.assertEqual([(e["state"], e["reason"], e["span"], e["forms"]) for e in block["events"]],
+                         [("echo_unproven", PAYLOAD_UNOBSERVED, None, 0)], block)
+
+    def test_a_framed_restored_event_yields_no_span_where_the_payload_proves_one(self) -> None:
         transport = self._transport(framed=True)
         payload = _echo_prompt("sid-unit") + " Auth: " + SENTINEL
         forms = lifecycle.expected_echo_forms(payload, transport)["forms"]
         raw = b"prelude\r\n" + forms[0] + b"\r\n{\"type\":\"result\"}\r\n"
-        a, b, proof = self._blocks(raw, payload, transport)
-        self.assertEqual(a["state"], "echo_proven", a)
-        self.assertEqual((b["state"], b["reason"], b["spans"]), (a["state"], a["reason"], a["spans"]))
-        self.assertEqual([(e["state"], e["reason"], e["span"], e["forms"]) for e in b["events"]],
-                         [(e["state"], e["reason"], e["span"], e["forms"]) for e in a["events"]])
-        self.assertNotIn(SENTINEL.encode(), json.dumps(proof).encode())
-        self.assertEqual(set(proof), {"schema", "class", "reason", "forms"})
+        a, b = self._blocks(raw, payload, transport)
+        self.assertEqual((a["state"], a["spans"]), ("echo_proven", ((9, 9 + len(forms[0])),)), a)
+        self._assert_unobserved(b)
+        self.assertEqual(lifecycle.strip_delivery_echo(raw, ({"offset": 0, "payload": "", "transport": transport, "at": ""},)), raw)
 
-    def test_an_unframed_proof_resolves_by_bounded_full_scan(self) -> None:
+    def test_an_unframed_restored_event_yields_no_span_and_no_scan(self) -> None:
         transport = self._transport(framed=False)
         payload = "unframed line " + SENTINEL
         forms = lifecycle.expected_echo_forms(payload, transport)["forms"]
         raw = b"x" * 300 + forms[0] + b"\r\nrest\r\n"
-        a, b, _proof = self._blocks(raw, payload, transport)
+        a, b = self._blocks(raw, payload, transport)
         self.assertEqual(a["state"], "echo_proven")
-        self.assertEqual((b["state"], b["spans"]), (a["state"], a["spans"]))
-        # ambiguity is decided identically: the form twice -> unproven on both sides
+        self._assert_unobserved(b)
+        # ambiguity on the live side; the restored side is unproven by the same name regardless
         raw2 = forms[0] + b"\r\n" + forms[0] + b"\r\n"
-        a2, b2, _p = self._blocks(raw2, payload, transport)
+        a2, b2 = self._blocks(raw2, payload, transport)
         self.assertEqual((a2["state"], a2["reason"]), ("echo_unproven", "event[0]:ambiguous_multiple_matches"))
-        self.assertEqual((b2["state"], b2["reason"]), (a2["state"], a2["reason"]))
+        self._assert_unobserved(b2)
+        # a delivery before the window is still named as such, ahead of the structural verdict
+        before = lifecycle.resolve_delivery_echo(raw, ({"offset": -1, "payload": "", "transport": transport, "at": ""},))
+        self.assertEqual((before["state"], before["reason"]), ("echo_unproven", "event[0]:delivery_before_window"))
 
-    def test_the_scan_budget_and_a_malformed_proof_fail_closed_by_name(self) -> None:
+    def test_the_resolver_reads_no_capture_byte_for_a_restored_event(self) -> None:
+        """F3-L1 (unit): whatever the event carries -- a genuine proof of the real echo, a
+        forged one, none -- the payload-less leg touches NO byte of the capture (92d8432 ran an
+        anchor search / a digest scan over it) and produces no span; `argv` is absent by name."""
         transport = self._transport(framed=False)
         payload = "p " + SENTINEL
         forms = lifecycle.expected_echo_forms(payload, transport)["forms"]
-        raw = b"y" * 1000 + forms[0]
-        with patch.object(lifecycle, "ECHO_PROOF_SCAN_BUDGET_BYTES", 10):
-            _a, b, _p = self._blocks(raw, payload, transport)
-        self.assertEqual((b["state"], b["reason"]), ("echo_unproven", "event[0]:proof_scan_bounded"))
-        self.assertEqual(b["spans"], ())
-        proof = lifecycle.echo_proof(payload, transport)
-        for broken in ({**proof, "forms": [{"sha256": "0" * 64, "bytes": forms[0].__len__()}]},
-                       {**proof, "class": "echo_expected", "forms": []},
-                       {**proof, "schema": "other"}, {**proof, "forms": [{"sha256": "zz", "bytes": 1}]}, None):
-            with self.subTest(broken=str(broken)[:60]):
-                ev = ({"offset": 0, "payload": "", "transport": transport, "at": "", "echo_proof": broken},)
-                res = lifecycle.resolve_delivery_echo(raw, ev)
-                self.assertIn(res["state"], ("echo_unproven", "no_delivery"), res)
-                self.assertEqual(res["spans"], ())
+        raw = _SpiedBytes(b"y" * 1000 + forms[0])
+        genuine = {"schema": ECHO_PROOF_SCHEMA, "class": "echo_expected", "reason": "",
+                   "forms": [{"sha256": _sha(forms[0]), "bytes": len(forms[0])}]}
+        for name, proof in (("genuine", genuine), ("wrong_digest", {**genuine, "forms": [{"sha256": "0" * 64, "bytes": len(forms[0])}]}),
+                            ("no_forms", {**genuine, "forms": []}), ("other_schema", {**genuine, "schema": "other"}),
+                            ("garbage", {**genuine, "forms": [{"sha256": "zz", "bytes": 1}]}), ("none", None), ("absent", "ABSENT")):
+            with self.subTest(material=name):
+                ev = {"offset": 0, "payload": "", "transport": transport, "at": ""}
+                if proof != "ABSENT":
+                    ev["echo_proof"] = proof
+                _SpiedBytes.reads = 0
+                res = lifecycle.resolve_delivery_echo(raw, (ev,))
+                self.assertEqual(_SpiedBytes.reads, 0, f"the restored event read the capture ({_SpiedBytes.reads} reads)")
+                self.assertEqual((res["state"], res["reason"], res["spans"]), ("echo_unproven", "event[0]:" + PAYLOAD_UNOBSERVED, ()), res)
+        # the LIVE leg does read it (the control that the spy counts)
+        _SpiedBytes.reads = 0
+        live = lifecycle.resolve_delivery_echo(raw, ({"offset": 0, "payload": payload, "transport": transport, "at": ""},))
+        self.assertEqual(live["state"], "echo_proven", live)
+        self.assertGreater(_SpiedBytes.reads, 0)
         absent = lifecycle.resolve_delivery_echo(raw, ({"offset": 0, "payload": "", "at": "",
-                                                        "transport": pty_supervisor.echo_transport(None, kind="argv", framed=False, cols=80),
-                                                        "echo_proof": lifecycle.echo_proof("secret", {"kind": "argv"})},))
-        self.assertEqual(absent["state"], "echo_absent", absent)
-        self.assertEqual(absent["events"][0]["reason"], "argv_transport_cannot_echo")
+                                                        "transport": pty_supervisor.echo_transport(None, kind="argv", framed=False, cols=80)},))
+        self.assertEqual((absent["state"], absent["events"][0]["reason"], absent["spans"]),
+                         ("echo_absent", "argv_transport_cannot_echo", ()), absent)
+
+
+# =====================================================================================
+# run_c296ff67c325 F-003 -- F3-L2: adopted_success is a subset of live_success (the matrix)
+# =====================================================================================
+#: the ECHO-CLEAR turn: cooked mode WITHOUT echo -- the prompt is read, nothing is echoed
+_NOECHO_AGENT = """SID="$1"
+stty -echo icanon
+printf '{"type":"system","session_id":"%%s"}\\n' "$SID"
+IFS= read -r PROMPT
+%(records)s
+exit 0
+"""
+
+
+def _json_example_prompt(session_id: str) -> str:
+    """A prompt carrying a result-JSON example bound to THIS dispatch and no refusal phrase."""
+    return ('Reply with exactly one result line like this example: '
+            '{"type":"result","is_error":false,"session_id":"%s"}' % session_id)
+
+
+def _clean_prompt(session_id: str) -> str:
+    return "Continue the task and reply with one bound result line for %s." % session_id
+
+
+class PR36F003AdoptedSuccessSubsetTests(_StubTurn):
+    """F3-L2 / F3-L5: for every transport x agent-output cell, settle the SAME run live and
+    adopted (the REAL adopt path over the live journal) and assert the decision's invariant
+    `adopted COMPLETED => live COMPLETED` (on the same record), plus the cell's outcome BY
+    NAME -- where adoption is stricter, the stricter outcome is the one the decision accepts:
+
+    transport            | clean       | refusal     | refusal-like prompt + ok | JSON-example prompt + ok
+    argv                 | C / C       | F / F       | C / C                    | C / C
+    pty ECHO set         | C / C       | F / F       | C / F refusal_in_boundary| C / L record_framing_ambiguous
+    pty ECHO clear       | C / C       | F / F       | C / C                    | C / C
+    pty termios unreadable| C / C      | F / F       | F / F (live cannot prove the echo either) | L / L
+
+    (C = COMPLETED, F = FAILED `refusal_in_boundary`, L = LOST `record_framing_ambiguous`;
+    live / adopted).  92d8432 adopted the two ECHO-set "stricter" cells as COMPLETED
+    (RED on the named outcome); the invariant itself holds on every cell.  The unreadable
+    termios is a seam (`termios_evidence` returns None at the write), never a sleep."""
+
+    OUTPUTS = {
+        "clean_completion": (_clean_prompt, _record(False)),
+        "refusal": (_clean_prompt, _record(False) + _record(True)),
+        "refusal_like_prompt_echo": (_echo_prompt, _record(False)),
+        "json_example_prompt_echo": (_json_example_prompt, _record(False)),
+    }
+    C, F, L = ("COMPLETED", None), ("FAILED", REFUSAL_IN_BOUNDARY), ("LOST", FRAMING_AMBIGUOUS)
+    EXPECTED = {
+        "argv": {"clean_completion": (C, C), "refusal": (F, F), "refusal_like_prompt_echo": (C, C), "json_example_prompt_echo": (C, C)},
+        "pty_echo_set": {"clean_completion": (C, C), "refusal": (F, F), "refusal_like_prompt_echo": (C, F), "json_example_prompt_echo": (C, L)},
+        "pty_echo_clear": {"clean_completion": (C, C), "refusal": (F, F), "refusal_like_prompt_echo": (C, C), "json_example_prompt_echo": (C, C)},
+        "pty_termios_unreadable": {"clean_completion": (C, C), "refusal": (F, F), "refusal_like_prompt_echo": (F, F), "json_example_prompt_echo": (L, L)},
+    }
+
+    def _cell(self, transport: str, output: str):
+        prompt_of, records = self.OUTPUTS[output]
+        run_id = f"pr36-f3l2-{transport}-{output}"[:60].replace("_", "-")
+        if transport == "argv":
+            live = self._session(run_id, _ARGV_AGENT % {"records": records}, delivery_mode="launch_with_prompt")
+            self._argv_turn(live, prompt_of(live.session_id))
+            live_result = live.await_completion()
+        else:
+            script = _NOECHO_AGENT if transport == "pty_echo_clear" else _ECHO_AGENT
+            live = self._session(run_id, script % {"records": records})
+            if transport == "pty_termios_unreadable":
+                with patch.object(pty_supervisor, "termios_evidence", lambda fd: None):
+                    live_result = self._pty_turn(live, prompt_of)
+            else:
+                live_result = self._pty_turn(live, prompt_of)
+        adopted = _stranger(live)
+        outcome = adopted.adopt(fence=live.fence)
+        self.assertTrue(outcome["adopted"], outcome)
+        adopted_result = adopted.await_completion()
+        return live, live_result, adopted, adopted_result
+
+    def _pty_turn(self, session, prompt_of) -> dict:
+        from scripts.test_os37_lifecycle_boundary_regressions import INJECTED_REHEARSALS
+        receipt = session.start(payload="rehearsal", **INJECTED_REHEARSALS)
+        self.sessions.append(session)
+        self.assertEqual(receipt["start_outcome"], "ready", receipt)
+        ready = session.await_ready()
+        self.assertEqual(ready["state"], "READY", ready)
+        session.send({"payload": prompt_of(session.session_id)})      # the delivery outcome is the cell's
+        return session.await_completion()
+
+    @staticmethod
+    def _verdict_of(result) -> tuple:
+        if result["state"] == "COMPLETED":
+            return ("COMPLETED", None)
+        if result["state"] == "LOST":
+            return ("LOST", result.get("lost_reason") or result["evidence"].get("provenance_outcome"))
+        return (result["state"], (result.get("verdict") or {}).get("reason"))
+
+    def _assert_cell(self, transport: str, output: str) -> tuple:
+        live, live_result, adopted, adopted_result = self._cell(transport, output)
+        lo, ao = self._verdict_of(live_result), self._verdict_of(adopted_result)
+        # the invariant: an adopted success is a live success on the same record
+        if ao[0] == "COMPLETED":
+            self.assertEqual(lo[0], "COMPLETED", f"{transport}/{output}: adopted COMPLETED, live {lo}")
+            self.assertEqual(adopted_result["evidence"].get("settlement_record"), live_result["evidence"].get("settlement_record"))
+        # the cell's outcomes by name (where adoption is stricter, the decision's outcome)
+        expected_live, expected_adopted = self.EXPECTED[transport][output]
+        self.assertEqual((lo, ao), (expected_live, expected_adopted), f"{transport}/{output}: live {lo}, adopted {ao}")
+        # the adoption excised nothing and read the same range
+        if transport == "argv":
+            _assert_identical(self, live, live_result, adopted, adopted_result)
+        else:
+            block = _assert_not_wider(self, live, live_result, adopted, adopted_result)
+            self.assertEqual((block["state"], block["events"][0]["reason"]), ("echo_unproven", PAYLOAD_UNOBSERVED), block)
+        return lo, ao
+
+    def test_f3l2_argv(self) -> None:
+        for output in self.OUTPUTS:
+            with self.subTest(output=output):
+                self._assert_cell("argv", output)
+
+    def test_f3l2_pty_echo_set(self) -> None:
+        for output in self.OUTPUTS:
+            with self.subTest(output=output):
+                self._assert_cell("pty_echo_set", output)
+
+    def test_f3l2_pty_echo_clear(self) -> None:
+        for output in self.OUTPUTS:
+            with self.subTest(output=output):
+                self._assert_cell("pty_echo_clear", output)
+
+    def test_f3l2_pty_termios_unreadable(self) -> None:
+        for output in self.OUTPUTS:
+            with self.subTest(output=output):
+                self._assert_cell("pty_termios_unreadable", output)
+
+    def test_f3l1_the_reviewers_forgery_through_the_real_adopt_path_cannot_produce_a_false_completed(self) -> None:
+        """F3-L1 (the F-003 counterexample, REAL path): an ECHO-set turn whose prompt is
+        HARMLESS; the agent prints the refusal prose `not logged in`, then a bound success.
+        Live: the echo it observed is excised, R1 fires on the agent's refusal -> FAILED
+        `refusal_in_boundary`.  The row is then tampered exactly as the reviewer's
+        `echo_set_forgery_probe.py` constructs it -- the pre-decision `echo_expected` proof
+        with ONE form whose sha256 / length name the refusal bytes, on an unframed ECHO-set
+        transport -- and re-digested.  92d8432: the adoption resolved `echo_proven` over the
+        refusal, excised it and settled COMPLETED -- a false success live never produced (RED).
+        Now the row is not the closed vocabulary (restores no event) and, in its closed-shape
+        variant (digest re-pointed, no proof key), the restored event is `payload_unobserved`:
+        nothing is excised, the refusal fires, FAILED `refusal_in_boundary` == live."""
+        live = self._session("pr36-f3l1-forgery", _ECHO_AGENT % {"records": "printf 'not logged in\\n'\n" + _record(False)})
+        live_result = self._pty_turn(live, lambda sid: "harmless prompt for %s" % sid)
+        self.assertEqual(self._verdict_of(live_result), self.F, live_result)
+        self.assertEqual(_echo_block(live)["state"], "echo_proven", _echo_block(live))       # live: the real echo
+        baseline, n, fenced = self._fenced(live)
+        refusal = b"not logged in"
+        self.assertEqual(fenced.count(refusal), 1, fenced)
+        original = journal_mod.journal_path(live.artifact_base, live.run_id).read_bytes()
+
+        def reviewer_forgery(ev):
+            ev["transport"]["framed"] = False
+            ev["echo_proof"] = {"schema": ECHO_PROOF_SCHEMA, "class": "echo_expected", "reason": "",
+                                "forms": [{"sha256": _sha(refusal), "bytes": len(refusal)}]}
+
+        def closed_shape_forgery(ev):
+            ev.pop("echo_proof", None)
+            ev["transport"]["framed"] = False
+            ev["payload_sha256"], ev["payload_bytes"] = _sha(refusal), len(refusal)
+
+        for name, forge, state, restored in (("reviewers_probe_row", reviewer_forgery, "no_delivery", 0),
+                                             ("closed_shape_row", closed_shape_forgery, "echo_unproven", 1)):
+            with self.subTest(row=name):
+                journal_mod.journal_path(live.artifact_base, live.run_id).write_bytes(original)
+                _forge_row(self, live, forge)
+                adopted = _stranger(live)
+                self.assertTrue(adopted.adopt(fence=live.fence)["adopted"])
+                adopted_result = adopted.await_completion()
+                self.assertEqual(self._verdict_of(adopted_result), self.F,
+                                 f"the forged row produced a settlement live did not: {adopted_result}")
+                block = _echo_block(adopted)
+                self.assertEqual(block["spans"], [], block)
+                self.assertIn(refusal, self._fenced(adopted)[2])
+                self.assertEqual(block["state"], state, block)
+                self.assertEqual(len(adopted.delivery_events), restored)
+                if restored:
+                    self.assertEqual(block["events"][0]["reason"], PAYLOAD_UNOBSERVED, block)
+                self.assertEqual((adopted_result["evidence"].get("settlement_range") or {}).get("echo"), state)
+                self.assertEqual(adopted_result["evidence"]["provenance_outcome"], live_result["evidence"]["provenance_outcome"])
+
+    def test_f3l5_a_refusal_like_prompt_and_a_json_example_never_yield_a_false_completed(self) -> None:
+        """F3-L5, by name: on the ECHO-set pty the echoed refusal-like prompt settles FAILED
+        `refusal_in_boundary` and the echoed JSON example LOST `record_framing_ambiguous` on
+        adoption -- never COMPLETED -- while live (which observed and excised the echo)
+        COMPLETED both.  The stricter outcome is the decision's, not a defect."""
+        for output, stricter in (("refusal_like_prompt_echo", self.F), ("json_example_prompt_echo", self.L)):
+            with self.subTest(output=output):
+                lo, ao = self._assert_cell("pty_echo_set", output)
+                self.assertEqual(lo, self.C)
+                self.assertEqual(ao, stricter)
 
 
 # =====================================================================================
