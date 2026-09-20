@@ -1,0 +1,40 @@
+#!/bin/sh
+# OS-37 D13.2 fixture: a CLI that GENUINELY WAITS for its prompt.
+#
+# Neither installed CLI does (D4.0 M-6, M-9: zero bytes until the prompt arrives), and that
+# is a MEASUREMENT about two builds on one host, not a property of CLIs.  So the
+# `post_ready_delivery` path -- the one that carries the readiness-before-delivery guarantee
+# and the `ReadyToken` gate -- would otherwise be untestable, and an untested path is a path
+# that rots.  This fixture makes it a LIVE path whose correctness does not wait on any vendor
+# shipping the mode.  Precedent: `scripts/fake_bin/fake-agent`.
+#
+# Behaviour: emit a declared readiness record carrying the MINTED id, then block on stdin
+# until a bracketed-paste frame arrives, then emit a delivery proof and a completion record.
+SESSION_ID=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --session-id) SESSION_ID="$2"; shift 2 ;;
+    --version) printf '1.5.0\n'; exit 0 ;;
+    --help) printf -- '--session-id --settings -p --output-format stream-json --verbose\n'; exit 0 ;;
+    *) shift ;;
+  esac
+done
+[ -n "$SESSION_ID" ] || SESSION_ID="${OS37_STUB_SESSION_ID:-}"
+
+# 1. READINESS, before any prompt exists.  This is the whole point of the fixture.
+printf '{"type":"system","subtype":"init","session_id":"%s"}\r\n' "$SESSION_ID"
+
+# 2. WAIT.  Nothing is emitted here -- a byte emitted while waiting would let a caller
+#    mistake liveness for progress.
+FRAME=""
+while IFS= read -r line; do
+  FRAME="$FRAME$line"
+  case "$FRAME" in
+    *"[200~"*"[201~"*) break ;;
+  esac
+done
+
+# 3. Only NOW: a delivery proof that satisfies the conjunctive selector, then completion.
+printf '{"type":"assistant","session_id":"%s","request_id":"req_fixture01","message":{"model":"fixture-model-1","id":"msg_fixture01","content":[{"type":"text","text":"OK"}],"usage":{"input_tokens":2,"output_tokens":1}}}\r\n' "$SESSION_ID"
+printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":"completed","session_id":"%s","result":"OK"}\r\n' "$SESSION_ID"
+exit 0

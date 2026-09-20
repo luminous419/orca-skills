@@ -14,3 +14,14 @@
 # _iterationFalse / _iteration2.0 become generatable, unexempted, digest-bound paths that fail the
 # whitespace gate. See DESIGN D-A.7 and INV-ATTEMPT-2 (D-A.7.4-prime).
 artifacts/runs/*/final_review_audit/**/report.md -whitespace
+
+# OS-37 captured CLI streams are BYTE-EXACT recordings of a real pty session, and a pty in
+# canonical mode translates NL to CR NL (ONLCR), so every line legitimately ends `\r\n`.
+# git's whitespace gate reads that CR as trailing whitespace and reported all four fixtures
+# in every CI job. The bytes are EVIDENCE: `standalone_capture.structured_lines` and the
+# M-14 / M-15 / M-8 driver selector tests read these files as the literal output the CLI
+# produced, so trimming them would silently rewrite a measurement to satisfy a linter.
+# The exemption is therefore declared here, exactly as the retained Final Review reports
+# above declare theirs, and `-text` additionally pins the bytes so no platform's eol
+# conversion can rewrite a recording either. Scope is exactly these recordings.
+scripts/fixtures/os37/streams/*.stream -whitespace -text

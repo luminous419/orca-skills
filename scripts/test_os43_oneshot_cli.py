@@ -43,7 +43,10 @@ class VerbRegistrationTests(unittest.TestCase):
         self.assertEqual(args.adapter, launcher.FAKE_ADAPTER,
                          "no existing invocation may change meaning; the revert is one "
                          "line")
-        self.assertEqual(set(launcher.ADAPTERS), {"fake", "orca"})
+        # OS-37 C-DESIGN-1 widens the shared tuple to three.  The assertion above is the
+        # one that matters and is untouched: `resume` still DEFAULTS to `fake`.  The set
+        # stays closed so a fourth member cannot appear without an edit here.
+        self.assertEqual(set(launcher.ADAPTERS), {"fake", "orca", "standalone"})
         both = parser.parse_args(["resume", "--run-id", RUN, "--adapter", "orca"])
         self.assertEqual(both.adapter, "orca")
 

@@ -11,6 +11,8 @@
 #   always           expected on every platform (the opt-in live-runtime suite, gated on
 #                    ORCA_RUNTIME_TEST=1, which no CI runner sets)
 #   not_darwin       expected iff sys.platform != "darwin" (the seatbelt backend)
+#   not_linux        expected iff sys.platform != "linux" (OS-48: the subreaper / pidfd /
+#                    EIO-retention locks in test_os48_linux_locks)
 #   no_sandbox_exec  expected iff /usr/bin/sandbox-exec is absent
 #
 # A test may declare more than one condition; the lines are in PRECEDENCE order, matching
@@ -18,22 +20,104 @@
 # platform-gated tests resolve to NOTHING and must RUN -- if one of them skips, the lane
 # fails. On Linux they must skip. Neither host gets the weaker contract.
 #
+# OS-37 adds 30 `always` entries:
+#   9 in test_os37_cli_preconditions, 7 in test_os37_per_driver_matrix, 4 in test_os37_r10_graph_prompt_e2e, 7 in test_os37_r10_workflow_e2e, 3 in test_os37_standalone_e2e.
+# All are opt-in live-runtime suites gated on an env var no CI runner sets: the live
+# per-CLI checks need a real agent CLI installed, the standalone E2E spawns real local
+# processes, and the R10 workflow E2E drives its cases through the real `run_workflow.py`
+# with `orca` removed from PATH.  AC-37-24 requires a check that cannot run to be recorded
+# as "not established" rather than as a pass, which is what a declared skip is;
+# docs/conformance/OS37_CONFORMANCE.md records all of them.  The counts above are DERIVED
+# by the generator from the entries below at generation time, never typed by hand
+# (consolidated review finding 19).
+#
 # Deliberately absent, so they fail the lane if they ever occur: the git-availability skips
 # in the retained-report whitespace gate. If that gate stops running because git is missing
 # or the checkout is shallow, CI must go red, not quietly tolerate it.
 # generated on: platform=darwin sandbox_exec_present=true
-# conditions: 'always' observed at runtime on this host; 'not_darwin' and
+# conditions: 'always' observed at runtime on this host; 'not_darwin', 'not_linux' and
 #   'no_sandbox_exec' observed by loading the suite under a simulated environment
 #   and reading the same __unittest_skip_why__ attributes TestCase.run consults.
 #
-# -- always (6) --
+# -- always (42) --
 always	test_orca_runtime.FinalReviewRuntimeIntegrationTests.test_final_review_terminal_freshness	requires --orca-runtime and a ready Orca runtime
 always	test_orca_runtime.OrcaRuntimeIntegrationTests.test_runtime_scenarios	requires --orca-runtime and a ready Orca runtime
 always	test_orca_runtime.QualityProfileRuntimeIntegrationTests.test_every_dispatch_of_the_run_carries_the_quality_gate	requires --orca-runtime and a ready Orca runtime
 always	test_orca_runtime.QualityProfileRuntimeIntegrationTests.test_quality_profile_phase_filtering	requires --orca-runtime and a ready Orca runtime
 always	test_orca_runtime.RiskRuntimeIntegrationTests.test_risk_conditional_phase_graph	requires --orca-runtime and a ready Orca runtime
 always	test_orca_runtime.SessionReuseRuntimeIntegrationTests.test_session_reuse_terminal_accounting	requires --orca-runtime and a ready Orca runtime
-# -- not_darwin (21) --
+always	test_os37_cli_preconditions.LiveCliTests.test_neither_real_cli_emits_a_record_before_its_prompt_is_delivered	requires ORCA_OS37_LIVE_CLI=1 and a real agent CLI on this host
+always	test_os37_cli_preconditions.LiveCliTests.test_the_adopted_identity_is_externally_re_verifiable	requires ORCA_OS37_LIVE_CLI=1 and a real agent CLI on this host
+always	test_os37_cli_preconditions.LiveCliTests.test_the_claude_argv_carries_every_flag_the_real_cli_requires	requires ORCA_OS37_LIVE_CLI=1 and a real agent CLI on this host
+always	test_os37_cli_preconditions.LiveCliTests.test_the_codex_argv_declares_no_forged_identity_channel	requires ORCA_OS37_LIVE_CLI=1 and a real agent CLI on this host
+always	test_os37_cli_preconditions.LiveCliTests.test_the_composed_claude_argv_is_accepted_by_the_real_cli_and_binds_r_b	requires ORCA_OS37_LIVE_CLI=1 and a real agent CLI on this host
+always	test_os37_cli_preconditions.LiveCliTests.test_the_installed_binaries_report_a_parsable_version	requires ORCA_OS37_LIVE_CLI=1 and a real agent CLI on this host
+always	test_os37_cli_preconditions.LiveCliTests.test_the_minted_session_id_is_a_uuid_as_the_design_specifies	requires ORCA_OS37_LIVE_CLI=1 and a real agent CLI on this host
+always	test_os37_cli_preconditions.LiveCliTests.test_the_production_claude_argv_reaches_a_real_delivery_proof	requires ORCA_OS37_LIVE_CLI=1 and a real agent CLI on this host
+always	test_os37_cli_preconditions.LiveCliTests.test_the_production_codex_argv_reaches_a_real_delivery_proof	requires ORCA_OS37_LIVE_CLI=1 and a real agent CLI on this host
+always	test_os37_per_driver_matrix.LivePerDriverOutcomeMatrixTests.test_live_a_sigkilled_process_group_is_lost_and_never_completed	requires ORCA_OS37_E2E=1; the standalone E2E drives real local processes
+always	test_os37_per_driver_matrix.LivePerDriverOutcomeMatrixTests.test_live_completion_needs_both_gates_for_both_drivers	requires ORCA_OS37_E2E=1; the standalone E2E drives real local processes
+always	test_os37_per_driver_matrix.LivePerDriverOutcomeMatrixTests.test_live_delivery_is_confirmed_for_both_drivers	requires ORCA_OS37_E2E=1; the standalone E2E drives real local processes
+always	test_os37_per_driver_matrix.LivePerDriverOutcomeMatrixTests.test_live_failure_comes_from_a_real_nonzero_exit_for_both_drivers	requires ORCA_OS37_E2E=1; the standalone E2E drives real local processes
+always	test_os37_per_driver_matrix.LivePerDriverOutcomeMatrixTests.test_live_interruption_is_proven_for_both_drivers	requires ORCA_OS37_E2E=1; the standalone E2E drives real local processes
+always	test_os37_per_driver_matrix.LivePerDriverOutcomeMatrixTests.test_live_lost_for_both_drivers_when_the_exit_cannot_be_classified	requires ORCA_OS37_E2E=1; the standalone E2E drives real local processes
+always	test_os37_per_driver_matrix.LivePerDriverOutcomeMatrixTests.test_live_timeout_for_both_drivers_is_timed_out_not_a_negative_fact	requires ORCA_OS37_E2E=1; the standalone E2E drives real local processes
+always	test_os37_r10_graph_prompt_e2e.F5GraphPromptE2ETests.test_orca_was_not_resolvable_in_the_run	requires ORCA_OS37_E2E=1; the F5 graph-prompt E2E drives a real agent CLI through run_workflow.py with orca removed from PATH
+always	test_os37_r10_graph_prompt_e2e.F5GraphPromptE2ETests.test_the_loop_was_worker_reviewer_fail_correction_fresh_pass	requires ORCA_OS37_E2E=1; the F5 graph-prompt E2E drives a real agent CLI through run_workflow.py with orca removed from PATH
+always	test_os37_r10_graph_prompt_e2e.F5GraphPromptE2ETests.test_the_prompt_was_the_rendered_production_prompt_not_canonical_intent	requires ORCA_OS37_E2E=1; the F5 graph-prompt E2E drives a real agent CLI through run_workflow.py with orca removed from PATH
+always	test_os37_r10_graph_prompt_e2e.F5GraphPromptE2ETests.test_the_workflow_reached_completed_through_the_launcher	requires ORCA_OS37_E2E=1; the F5 graph-prompt E2E drives a real agent CLI through run_workflow.py with orca removed from PATH
+always	test_os37_r10_workflow_e2e.R10WorkflowE2ETests.test_every_dispatch_walked_the_whole_lifecycle_in_order	requires ORCA_OS37_E2E=1; the R10 workflow E2E drives real local agent processes
+always	test_os37_r10_workflow_e2e.R10WorkflowE2ETests.test_orca_was_not_resolvable_in_the_run	requires ORCA_OS37_E2E=1; the R10 workflow E2E drives real local agent processes
+always	test_os37_r10_workflow_e2e.R10WorkflowE2ETests.test_the_agent_binary_was_a_real_native_executable	requires ORCA_OS37_E2E=1; the R10 workflow E2E drives real local agent processes
+always	test_os37_r10_workflow_e2e.R10WorkflowE2ETests.test_the_loop_really_was_worker_reviewer_correction_final_review	requires ORCA_OS37_E2E=1; the R10 workflow E2E drives real local agent processes
+always	test_os37_r10_workflow_e2e.R10WorkflowE2ETests.test_the_readiness_quorum_closed_on_all_three_legs_every_time	requires ORCA_OS37_E2E=1; the R10 workflow E2E drives real local agent processes
+always	test_os37_r10_workflow_e2e.R10WorkflowE2ETests.test_the_run_is_requeryable_from_a_stranger_process	requires ORCA_OS37_E2E=1; the R10 workflow E2E drives real local agent processes
+always	test_os37_r10_workflow_e2e.R10WorkflowE2ETests.test_the_workflow_reached_completed	requires ORCA_OS37_E2E=1; the R10 workflow E2E drives real local agent processes
+always	test_os37_standalone_e2e.R10RealAgentEvidenceTests.test_the_recorded_evidence_is_not_fixture_sourced	requires ORCA_OS37_E2E=1; the standalone E2E drives real local processes
+always	test_os37_standalone_e2e.R10RealAgentEvidenceTests.test_the_retained_evidence_was_re_read_by_a_stranger_interpreter	requires ORCA_OS37_E2E=1; the standalone E2E drives real local processes
+always	test_os37_standalone_e2e.StandaloneE2ETests.test_real_runtime_smoke	requires ORCA_OS37_E2E=1; the standalone E2E drives real local processes
+always	test_os48_f015_f016_locks.F016BootCounterResetTests.test_a_counter_reset_on_another_boot_never_reports_the_foreign_peer_alive	needs PID 1 of a private PID namespace with a writable ns_last_pid
+always	test_os48_f015_f016_locks.F016RecyclableInodeModelTests.test_a_32_bit_model_records_no_binding_and_the_reader_stays_unknown	needs PID 1 of a private PID namespace with a writable ns_last_pid
+always	test_os48_f015_f016_locks.F016RecyclableInodeModelTests.test_a_binding_recorded_under_the_proven_model_is_not_read_under_another	needs PID 1 of a private PID namespace with a writable ns_last_pid
+always	test_os48_f015_f016_locks.F016SameTickForeignPeerTests.test_a_delayed_acquisition_never_admits_the_foreign_peer_or_its_child	needs PID 1 of a private PID namespace with a writable ns_last_pid
+always	test_os48_f015_f016_locks.F016SameTickForeignPeerTests.test_a_reader_after_the_watcher_died_never_reports_the_foreign_peer_alive	needs PID 1 of a private PID namespace with a writable ns_last_pid
+always	test_os48_review_i7_locks.F016FixedObjectTests.test_native_same_pid_same_tick_reuse_is_a_new_lifetime	needs PID 1 of a private PID namespace with a writable ns_last_pid
+# -- not_darwin (56) --
+not_darwin	test_os48_evidence_locks.L06L08DiagnosticEnumerationTests.test_a_count_that_disagrees_with_the_fill_is_unreadable	OS-48 libproc evidence seams are darwin's (probe_03)
+not_darwin	test_os48_evidence_locks.L06L08DiagnosticEnumerationTests.test_a_short_pid_fill_is_unreadable_by_name	OS-48 libproc evidence seams are darwin's (probe_03)
+not_darwin	test_os48_evidence_locks.L06L08DiagnosticEnumerationTests.test_denied_stale_and_short_fd_reads_are_unreadable_never_absence	OS-48 libproc evidence seams are darwin's (probe_03)
+not_darwin	test_os48_evidence_locks.L06L08DiagnosticEnumerationTests.test_the_word_proven_never_appears_in_a_diagnostic_state	OS-48 libproc evidence seams are darwin's (probe_03)
+not_darwin	test_os48_evidence_locks.L07DarwinIdentityDecodeTests.test_a_short_bsdinfo_read_is_never_decoded	OS-48 libproc evidence seams are darwin's (probe_03)
+not_darwin	test_os48_f015_f016_locks.F016RealDispatchBindingTests.test_the_darwin_reader_states_its_microsecond_binding	the microsecond start identity is darwin's
+not_darwin	test_os48_finality_locks.L12DarwinFactLocks.test_a_held_slave_reference_retains_the_tail_across_a_late_read	OS-48 darwin fact lock: the kernel behaviour it pins is darwin's (probe_01/04/d1/d10)
+not_darwin	test_os48_finality_locks.L12DarwinFactLocks.test_kqueue_note_exit_on_a_zombie_is_esrch	OS-48 darwin fact lock: the kernel behaviour it pins is darwin's (probe_01/04/d1/d10)
+not_darwin	test_os48_finality_locks.L12DarwinFactLocks.test_the_last_slave_close_discards_the_unread_tail	OS-48 darwin fact lock: the kernel behaviour it pins is darwin's (probe_01/04/d1/d10)
+not_darwin	test_os48_finality_locks.L12DarwinFactLocks.test_the_marker_survives_onlcr_translation	OS-48 darwin fact lock: the kernel behaviour it pins is darwin's (probe_01/04/d1/d10)
+not_darwin	test_os48_review_i1_locks.F004PartialFillTests.test_a_short_positive_pid_fill_is_listallpids_partial	OS-48 libproc evidence seams are darwin's (probe_03)
+not_darwin	test_os48_review_i1_locks.F004PartialFillTests.test_a_whole_entry_fd_prefix_omitting_the_live_slave_is_listing_partial	OS-48 libproc evidence seams are darwin's (probe_03)
+not_darwin	test_os48_review_i2_locks.F004PartialReadTests.test_a_small_partial_prefix_with_the_scanner_pid_is_listallpids_partial	OS-48 libproc evidence seams are darwin's (probe_03)
+not_darwin	test_os48_review_i2_locks.F004PartialReadTests.test_an_unreadable_fd_table_size_never_yields_a_clean_scan	OS-48 libproc evidence seams are darwin's (probe_03)
+not_darwin	test_os48_review_i2_locks.F004PartialReadTests.test_an_unreadable_independent_walk_is_named_not_complete	OS-48 libproc evidence seams are darwin's (probe_03)
+not_darwin	test_os48_review_i2_locks.F004PartialReadTests.test_the_diagnostic_never_approves_finality	OS-48 libproc evidence seams are darwin's (probe_03)
+not_darwin	test_os48_review_i2_locks.F004PartialReadTests.test_the_real_table_passes_the_independent_cross_check	OS-48 libproc evidence seams are darwin's (probe_03)
+not_darwin	test_os48_review_i3_locks.F004BirthDuringFillTests.test_a_partial_fill_that_omits_a_process_born_before_the_fill_is_unstable	OS-48 libproc evidence seams are darwin's (probe_03)
+not_darwin	test_os48_review_i3_locks.F004BirthDuringFillTests.test_exact_three_way_agreement_is_the_only_completeness	OS-48 libproc evidence seams are darwin's (probe_03)
+not_darwin	test_os48_review_i3_locks.F004BirthDuringFillTests.test_the_single_attempt_reading_of_a_birth_during_fill_is_unstable	OS-48 libproc evidence seams are darwin's (probe_03)
+not_darwin	test_os48_review_i4_locks.F009AdoptionPersistenceTests.test_a_successor_reads_the_same_descendants_unknown	OS-48 libproc evidence seams are darwin's (probe_03)
+not_darwin	test_os48_review_i4_locks.F009CandidateIdentityTests.test_a_refused_bsdinfo_is_resolved_by_the_independent_read	OS-48 libproc evidence seams are darwin's (probe_03)
+not_darwin	test_os48_review_i4_locks.F009CandidateIdentityTests.test_the_independent_read_agrees_with_bsdinfo_and_refuses_a_gone_pid	OS-48 libproc evidence seams are darwin's (probe_03)
+not_darwin	test_os48_review_i4_locks.F009ListingUnreadableTests.test_a_failed_native_listing_is_descendants_unknown	OS-48 libproc evidence seams are darwin's (probe_03)
+not_darwin	test_os48_review_i4_locks.F009ListingUnreadableTests.test_an_unstable_listing_is_descendants_unknown	OS-48 libproc evidence seams are darwin's (probe_03)
+not_darwin	test_os48_review_i5_locks.F010OtherSilentDropPathsTests.test_a_watch_that_cannot_be_registered_is_unobservable	OS-48 libproc evidence seams are darwin's (probe_03)
+not_darwin	test_os48_review_i5_locks.F010OtherSilentDropPathsTests.test_an_unreadable_event_read_is_named_once	OS-48 libproc evidence seams are darwin's (probe_03)
+not_darwin	test_os48_review_i5_locks.F010OtherSilentDropPathsTests.test_no_kqueue_is_fork_watch_unavailable	OS-48 libproc evidence seams are darwin's (probe_03)
+not_darwin	test_os48_review_i5_locks.F010RegisteredForkParentExitTests.test_the_cut_is_recovered_by_an_adopting_successor	OS-48 libproc evidence seams are darwin's (probe_03)
+not_darwin	test_os48_review_i5_locks.F010RegisteredForkParentExitTests.test_the_reviewers_cut_is_descendants_unknown_with_the_fork_named	OS-48 libproc evidence seams are darwin's (probe_03)
+not_darwin	test_os48_review_i6_locks.F010CoalescedForkTests.test_a_coalesced_fork_stays_unknown_after_one_child_is_attributed	OS-48 libproc evidence seams are darwin's (probe_03)
+not_darwin	test_os48_review_i6_locks.F010CoalescedForkTests.test_a_fork_before_the_first_walk_is_seen_by_the_pre_exec_watch	OS-48 libproc evidence seams are darwin's (probe_03)
+not_darwin	test_os48_review_i6_locks.F010CoalescedForkTests.test_a_root_watch_that_could_not_be_registered_is_a_named_gap	OS-48 libproc evidence seams are darwin's (probe_03)
+not_darwin	test_os48_review_i6_locks.F010CoalescedForkTests.test_every_attributed_descendant_carries_its_own_watch_gap	OS-48 libproc evidence seams are darwin's (probe_03)
+not_darwin	test_os48_review_i6_locks.F010CoalescedForkTests.test_the_coalesced_residual_is_recovered_by_an_adopting_successor	OS-48 libproc evidence seams are darwin's (probe_03)
 not_darwin	test_review_isolation.BoundaryEnumerationTests.test_an_unexplained_boundary_is_a_hard_failure	the seatbelt backend is darwin-only; T-8.9 carries the fail-closed guarantee on every other platform
 not_darwin	test_review_isolation.BoundaryEnumerationTests.test_system_volumes_is_carved_out_whether_or_not_the_walk_finds_it	the seatbelt backend is darwin-only; T-8.9 carries the fail-closed guarantee on every other platform
 not_darwin	test_review_isolation.BoundaryEnumerationTests.test_the_two_authorities_are_readable_and_agree_about_the_known_set	the seatbelt backend is darwin-only; T-8.9 carries the fail-closed guarantee on every other platform
@@ -55,6 +139,39 @@ not_darwin	test_review_isolation.NegativeContractTests.test_the_sandboxed_proces
 not_darwin	test_review_isolation.ProbeInterpreterShimTests.test_on_darwin_the_shimmed_system_git_is_actually_resolved_away	the seatbelt backend is darwin-only; T-8.9 carries the fail-closed guarantee on every other platform
 not_darwin	test_review_isolation.ProbeInterpreterShimTests.test_on_darwin_the_shimmed_system_python_is_actually_resolved_away	the seatbelt backend is darwin-only; T-8.9 carries the fail-closed guarantee on every other platform
 not_darwin	test_review_isolation.ProbeInterpreterShimTests.test_on_darwin_the_two_shimmed_tools_are_literally_the_same_file	the seatbelt backend is darwin-only; T-8.9 carries the fail-closed guarantee on every other platform
+# -- not_linux (32) --
+not_linux	test_os48_f015_f016_locks.F016AdmissionVerificationTests.test_a_candidate_reaped_before_acquisition_is_never_admitted	pidfds and the /proc discovery walk are Linux's
+not_linux	test_os48_f015_f016_locks.F016AdmissionVerificationTests.test_a_candidate_whose_parentage_differs_after_acquisition_is_unverified	pidfds and the /proc discovery walk are Linux's
+not_linux	test_os48_f015_f016_locks.F016AdmissionVerificationTests.test_a_verified_descendant_holds_its_pidfd_and_records_its_binding	pidfds and the /proc discovery walk are Linux's
+not_linux	test_os48_f015_f016_locks.F016InodeModelTests.test_a_recorded_binding_under_an_unproven_or_different_model_is_unknown	pidfds and the /proc discovery walk are Linux's
+not_linux	test_os48_f015_f016_locks.F016InodeModelTests.test_an_unproven_model_records_no_binding_and_reads_none	pidfds and the /proc discovery walk are Linux's
+not_linux	test_os48_f015_f016_locks.F016InodeModelTests.test_the_model_is_proven_only_for_a_64_bit_kernel_at_or_after_6_9	pidfds and the /proc discovery walk are Linux's
+not_linux	test_os48_f015_f016_locks.F016RealDispatchBindingTests.test_the_linux_helper_is_alive_only_through_the_pidfs_binding_else_unknown	pidfds and the /proc discovery walk are Linux's
+not_linux	test_os48_f015_f016_locks.F016RecoveryReaderTests.test_a_reader_without_a_kernel_binding_is_unknown_even_with_a_recorded_one	pidfds and the /proc discovery walk are Linux's
+not_linux	test_os48_f015_f016_locks.F016RecoveryReaderTests.test_a_recorded_binding_the_kernel_confirms_is_alive_and_a_different_one_is_gone	pidfds and the /proc discovery walk are Linux's
+not_linux	test_os48_f015_f016_locks.F016RecoveryReaderTests.test_pid_and_tick_equality_alone_is_unknown_by_name_never_alive	pidfds and the /proc discovery walk are Linux's
+not_linux	test_os48_linux_locks.L13FenceOverLinuxPtyTests.test_the_production_spawn_settles_under_the_fence_on_linux	requires Linux: PR_SET_CHILD_SUBREAPER / pidfd / EIO retention (OS-48 L-13)
+not_linux	test_os48_linux_locks.L13MembershipLedgerTests.test_a_detached_helper_is_a_named_residual_on_linux	requires Linux: PR_SET_CHILD_SUBREAPER / pidfd / EIO retention (OS-48 L-13)
+not_linux	test_os48_linux_locks.L13MembershipLedgerTests.test_the_subreaper_ledger_records_a_reparented_descendant_and_its_reap	requires Linux: PR_SET_CHILD_SUBREAPER / pidfd / EIO retention (OS-48 L-13)
+not_linux	test_os48_linux_locks.L13PidfdAndProcIdentityTests.test_a_zombie_is_absent_by_its_proc_state	requires Linux: PR_SET_CHILD_SUBREAPER / pidfd / EIO retention (OS-48 L-13)
+not_linux	test_os48_linux_locks.L13PidfdAndProcIdentityTests.test_the_boot_id_is_the_kernel_random_boot_id	requires Linux: PR_SET_CHILD_SUBREAPER / pidfd / EIO retention (OS-48 L-13)
+not_linux	test_os48_linux_locks.L13PidfdAndProcIdentityTests.test_the_delivery_path_for_a_descendant_is_pidfd_on_linux	requires Linux: PR_SET_CHILD_SUBREAPER / pidfd / EIO retention (OS-48 L-13)
+not_linux	test_os48_linux_locks.L13PidfdAndProcIdentityTests.test_the_parent_death_witness_uses_pidfd_and_fires_on_exit	requires Linux: PR_SET_CHILD_SUBREAPER / pidfd / EIO retention (OS-48 L-13)
+not_linux	test_os48_linux_locks.L13PtyRetentionFacts.test_the_master_retains_the_tail_after_the_last_slave_close_then_eio	requires Linux: PR_SET_CHILD_SUBREAPER / pidfd / EIO retention (OS-48 L-13)
+not_linux	test_os48_linux_locks.L13SubreaperTests.test_reap_reparented_never_consumes_the_agent	requires Linux: PR_SET_CHILD_SUBREAPER / pidfd / EIO retention (OS-48 L-13)
+not_linux	test_os48_linux_locks.L13SubreaperTests.test_the_watcher_is_a_subreaper_and_the_agent_exit_code_survives_it	requires Linux: PR_SET_CHILD_SUBREAPER / pidfd / EIO retention (OS-48 L-13)
+not_linux	test_os48_review_i4_locks.F009AdoptionPersistenceTests.test_a_successor_reads_the_same_descendants_unknown_linux	the /proc discovery walk is Linux's
+not_linux	test_os48_review_i4_locks.F009ListingUnreadableTests.test_a_denied_proc_listing_is_descendants_unknown	the /proc discovery walk is Linux's
+not_linux	test_os48_review_i5_locks.F010RegisteredForkParentExitTests.test_the_same_cut_on_linux_attributes_the_helper_through_the_subreaper	the /proc discovery walk is Linux's
+not_linux	test_os48_review_i6_locks.F013SubreaperZeroStartTests.test_a_zero_start_subreaper_orphan_is_named_never_omitted	the /proc discovery walk is Linux's
+not_linux	test_os48_review_i6_locks.F013SubreaperZeroStartTests.test_the_readable_subreaper_orphan_is_a_positive_member	the /proc discovery walk is Linux's
+not_linux	test_os48_review_i6_locks.F013SubreaperZeroStartTests.test_the_zero_start_orphan_residual_is_recovered_by_an_adopting_successor	the /proc discovery walk is Linux's
+not_linux	test_os48_review_i7_locks.F014SubreaperBeforeGateTests.test_a_failed_or_unverifiable_setup_is_the_named_residual	the /proc discovery walk is Linux's
+not_linux	test_os48_review_i7_locks.F014SubreaperBeforeGateTests.test_the_receipt_precedes_the_roots_first_act_and_is_positive	the /proc discovery walk is Linux's
+not_linux	test_os48_review_i7_locks.F014SubreaperBeforeGateTests.test_the_reviewers_delayed_setup_cut_can_no_longer_start_a_root	the /proc discovery walk is Linux's
+not_linux	test_os48_review_i7_locks.F016FixedObjectTests.test_a_cached_exited_key_never_suppresses_a_live_candidate	the /proc discovery walk is Linux's
+not_linux	test_os48_review_i7_locks.F016FixedObjectTests.test_a_cached_unexited_member_whose_pidfd_died_never_adopts_a_new_holder_of_its_pid	the /proc discovery walk is Linux's
+not_linux	test_os48_review_i7_locks.F016FixedObjectTests.test_the_residual_reader_keeps_one_entry_per_lifetime	the /proc discovery walk is Linux's
 # -- no_sandbox_exec (14) --
 no_sandbox_exec	test_review_isolation.Neg5ContractTests.test_t95_every_admitted_root_carries_its_class_pass_set_and_vocabulary	/usr/bin/sandbox-exec is not present on this host
 no_sandbox_exec	test_review_isolation.Neg5ContractTests.test_t95_there_is_no_opt_in_imm_content_scan_anywhere	/usr/bin/sandbox-exec is not present on this host

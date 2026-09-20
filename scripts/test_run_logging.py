@@ -3958,6 +3958,22 @@ GITATTRIBUTES_RULE = (
     "artifacts/runs/*/final_review_audit/**/report.md -whitespace"
 )
 
+#: OS-37 external review #1 adds a SECOND narrowly-scoped rule, and the closed list is
+#: pinned here so a third one -- or a broadened pattern -- is a deliberate decision rather
+#: than a quiet edit.  A.6's rule is not "exactly one line", it is "exactly the paths whose
+#: bytes are EVIDENCE, and no others".
+#:
+#: The OS-37 streams are byte-exact recordings of a real pty session.  A pty in canonical
+#: mode translates NL to CR NL, so every recorded line ends `\r\n` and git's whitespace gate
+#: read that CR as trailing whitespace in all four fixtures, in every CI job.  Trimming them
+#: would rewrite a MEASUREMENT to satisfy a linter -- the driver selector tests read these
+#: files as the literal bytes the CLI produced -- so the exemption is declared instead, and
+#: `-text` additionally pins the bytes against any platform's eol conversion.
+GITATTRIBUTES_STREAM_RULE = (
+    "scripts/fixtures/os37/streams/*.stream -whitespace -text"
+)
+GITATTRIBUTES_RULES = (GITATTRIBUTES_RULE, GITATTRIBUTES_STREAM_RULE)
+
 
 class RetainedReportWhitespaceExemptionTests(unittest.TestCase):
     """T-5a: `git diff --check` passes AND the exempted bytes were never trimmed.
@@ -4052,10 +4068,22 @@ class RetainedReportWhitespaceExemptionTests(unittest.TestCase):
         ]
         self.assertEqual(
             rules,
-            [GITATTRIBUTES_RULE],
-            "A.6 allows exactly one scoped rule; a repo-wide or broadened pattern "
-            "is a design violation",
+            list(GITATTRIBUTES_RULES),
+            "A.6 allows exactly the scoped rules pinned in GITATTRIBUTES_RULES; a "
+            "repo-wide or broadened pattern is a design violation",
         )
+        # And the scope really is narrow, asserted independently of the literals above so a
+        # future rule cannot be waved through by adding it to the pin.  Every pattern must
+        # name a directory path -- never the repository root, never a bare extension glob.
+        for rule in rules:
+            pattern = rule.split()[0]
+            with self.subTest(pattern=pattern):
+                self.assertIn("/", pattern,
+                              "a root-level pattern is repo-wide in effect")
+                self.assertFalse(pattern.startswith(("*", "**")),
+                                 "a leading wildcard matches every directory")
+                self.assertNotEqual(pattern.split("/")[0], "**",
+                                    "a leading '**' segment is repo-wide")
 
     # -- (b) the exempted bytes are untouched ----------------------------------------
 

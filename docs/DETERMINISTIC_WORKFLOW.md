@@ -254,7 +254,9 @@ does not change. OS-38 source extraction remains out of scope.
   documented Orca primitive, and `task-create` accepts no idempotency key. Recovery of an
   already-dispatched Orca effect therefore terminates `BLOCKED`
   (`IDEMPOTENCY_RECOVERY_UNSUPPORTED`) and the reconciliation is an operator decision.
-  Closing that window is OS-37's production process/PTY ownership work.
+  Closing that window is OS-37's production process/PTY ownership work; OS-48 makes the
+  standalone side of it positive (fence-bounded capture finality, witnessed finalizer
+  ownership, incarnation-bound signalling -- `docs/conformance/OS37_CONFORMANCE.md` § OS-48).
 - **A residual create-then-crash window remains.** The durable claim is written before
   `create_task`, so a crash is always detectable, but the external identifier only exists
   after the call returns. Without a caller-supplied idempotency key the window cannot be
