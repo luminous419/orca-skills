@@ -224,6 +224,10 @@ class DeliveryProofSelector:
             raise ProfileError("delivery proof requires_flags must be a tuple of strings")
 
 
+#: OS-48: the closed set of completion binding modes (``""`` = undeclared, refused at settlement).
+COMPLETION_BINDING_MODES = ("", "session_field", "sidecar_file", "single_record_optin")
+
+
 @dataclass(frozen=True)
 class CompletionSelector:
     """One declared admissible COMPLETION record (DESIGN D4.4).
@@ -250,8 +254,29 @@ class CompletionSelector:
     #: only ever REFUSE -- a code outside it makes the dispatch a failure, never a success
     #: it would not otherwise have been.
     success_exit_codes: tuple[int, ...] = (0,)
+    #: OS-48 DESIGN §1.4 R3 -- the DISPATCH BINDING of the single completion record (a binding
+    #: to THIS dispatch's session, explicitly NOT a writer credential -- a pty cannot
+    #: authenticate writers and inherited session context is legitimately shared by the
+    #: emitter subtree).  ``session_field``: the record itself carries `binding_field` equal
+    #: to the identity bound at readiness (claude: `result.session_id` == the minted
+    #: --session-id, DESIGN probe_d6).  ``sidecar_file``: the runtime-minted `-o` sidecar the
+    #: emitter process writes must be present AND `binding_field` -- on the record or on the
+    #: most recent `carrier_type` record before it -- must equal the bound value (codex:
+    #: `thread.started.thread_id`).  ``single_record_optin``: no binding exists (fixture
+    #: profiles only; the conformance record names the class).  An UNDECLARED binding
+    #: (``""``) makes every success `provenance_unbound` at settlement; a spec loaded from
+    #: JSON must declare one (`ProfileError`).
+    binding_mode: str = ""
+    binding_field: str = ""
+    carrier_type: str = ""
 
     def __post_init__(self) -> None:
+        if self.binding_mode not in COMPLETION_BINDING_MODES:
+            raise ProfileError(
+                f"completion binding_mode {self.binding_mode!r} is not one of "
+                f"{COMPLETION_BINDING_MODES!r}")
+        if self.binding_mode in ("session_field", "sidecar_file") and not self.binding_field:
+            raise ProfileError(f"binding_mode {self.binding_mode!r} needs a binding_field")
         if self.channel not in READINESS_CHANNELS:
             raise ProfileError(
                 f"completion channel {self.channel!r} is not one of {READINESS_CHANNELS!r}")
@@ -426,16 +451,15 @@ class Timeouts:
     force_retry_ms: int = 250
     preflight_timeout_ms: int = 20_000
     staleness_budget_ms: int = 1_000
-    #: Round-9 consolidated review, item 1 / Linux descendant scope.  The bound on the
-    #: POST-EXIT DRAIN: after the agent's exit is proven, the process that owns the pty
-    #: master (the supervisor, or the exit watcher once the supervisor is gone) reads the
-    #: master until the pty HANGS UP -- the only positive proof that no byte is still in
-    #: flight -- and this is how long it waits for that hangup.  A descendant that kept
-    #: the slave open (a background dev server, an inherited MCP / language-server stdio)
-    #: prevents the hangup; the drain then ends by this bound, the dispatch is the typed
-    #: `stream_end_unproven` and the finalized record names what held the slave.  Raise it
-    #: on the profile for agents whose children are known to outlive them briefly; it is
-    #: a tuning bound and never a proof.
+    #: The bound on the POST-EXIT DRAIN (OS-48): after the agent's exit is proven, the
+    #: process that owns the pty master (the supervisor, or the exit watcher once the
+    #: supervisor is gone) reads the master until the FENCE MARKER -- the positive end of the
+    #: authoritative interval; a hangup proves nothing -- and this is how long it waits for it (the exit watcher
+    #: writes it into its owner-held slave reference right after reaping the root; a
+    #: descendant that kept the slave open no longer withholds it -- its bytes land after
+    #: the marker as a diagnostic tail).  A drain that does not reach the marker within this
+    #: bound is the typed LOST reason `boundary_unproven`; the bound also paces the two-phase
+    #: release and the successor's fence-first wait.  It is a tuning bound and never a proof.
     post_exit_drain_budget_ms: int = 2_000
 
     def __post_init__(self) -> None:
@@ -763,7 +787,10 @@ def profile_from_mapping(spec: Any) -> StandaloneProfile:
                                                     "success_values"),
                            success_exit_codes=tuple(
                                int(code) for code in item["success_exit_codes"])
-                           if "success_exit_codes" in item else (0,))
+                           if "success_exit_codes" in item else (0,),
+                           binding_mode=_required_binding_mode(item),
+                           binding_field=str(item.get("binding_field", "") or ""),
+                           carrier_type=str(item.get("carrier_type", "") or ""))
         for item in (spec.get("completion_records") or ())
         if isinstance(item, Mapping) or _raise_selector(item))
     result_body_records = tuple(
@@ -886,6 +913,17 @@ def profile_from_mapping(spec: Any) -> StandaloneProfile:
         auth_seed_dest_name=spec.get("auth_seed_dest_name", ""),
         auth_markers=markers,
     )
+
+
+def _required_binding_mode(item: Mapping[str, Any]) -> str:
+    """OS-48 §5: a completion selector loaded from a JSON spec MUST declare its binding mode
+    explicitly -- silence is not an opt-in."""
+    mode = item.get("binding_mode")
+    if not isinstance(mode, str) or mode not in COMPLETION_BINDING_MODES or not mode:
+        raise ProfileError(
+            "completion_records entries must declare binding_mode "
+            f"(one of {COMPLETION_BINDING_MODES[1:]!r}); got {mode!r}")
+    return mode
 
 
 def _raise_selector(item: Any) -> bool:

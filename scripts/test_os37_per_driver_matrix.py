@@ -133,6 +133,12 @@ def driver_profile(name: str, **overrides) -> StandaloneProfile:
     return StandaloneProfile(**fields)
 
 
+#: OS-48: the identity axes the injected rows and records share (a lock that models PID reuse
+#: overrides `start_id` on the row).
+START_ID = 1_700_000_000_000_001
+BOOT_ID = "boot-test"
+
+
 def _record(**overrides) -> dict:
     fields = dict(
         run_id="run_matrix", repo_id="repo-1",
@@ -142,7 +148,10 @@ def _record(**overrides) -> dict:
         captured_tty=TTY, pty_id="pty-1", process_incarnation="i-1",
         host_scope="local", spawn_token="t-1", started_at="2026-09-10T00:00:00Z",
         argv_digest="ad", env_digest="ed", created_by_this_runtime=True,
-        resource_kind="pty_session", user_taken_over=False)
+        resource_kind="pty_session", user_taken_over=False,
+        # OS-48 (DESIGN §2.1): the kernel start identity and boot id every record carries;
+        # the injected rows below carry the same axes (`start_id` / `boot_id`).
+        proc_start_ticks=START_ID, boot_id=BOOT_ID)
     fields.update(overrides)
     return identity.make_record(**fields)
 
@@ -150,7 +159,7 @@ def _record(**overrides) -> dict:
 def _snapshot(rows=None, *, readable: bool = True) -> dict:
     if rows is None:
         rows = ({"pid": CHILD_PID, "ppid": 1, "pgid": CHILD_PID, "sid": CHILD_PID,
-                 "tty": TTY, "stat": "Ss"},)
+                 "tty": TTY, "stat": "Ss", "start_id": START_ID, "start_state": "final", "boot_id": BOOT_ID},)
     return {"tty": TTY, "captured_at": time.time(), "rows": tuple(rows),
             "readable": readable}
 
@@ -323,6 +332,9 @@ class PerDriverEvidenceBoundaryTests(unittest.TestCase):
                     supervisor_pid=999,
                     killpg=lambda pgid, sig: sent.append((pgid, sig)),
                     kill=lambda pid, sig: sent.append((pid, sig)),
+                    # OS-48: delivery to the agent is watcher-mediated (DESIGN §2.3); the
+                    # integer-pid / group seams above must stay EMPTY.
+                    watcher=lambda sig: (sent.append(("watcher", sig)), "sent")[1],
                     sleep=lambda _s: None)
 
                 self.assertIn(result["interrupt_outcome"],
@@ -332,8 +344,9 @@ class PerDriverEvidenceBoundaryTests(unittest.TestCase):
                 self.assertEqual(mapped["state"], "INTERRUPTED")
                 self.assertIn(mapped["state"], lifecycle.STATES)
                 self.assertEqual(mapped["lost_reason"], "")
-                self.assertEqual([sig for _t, sig in sent], [15],
-                                 f"{name}: the ladder escalated past a proven exit")
+                self.assertEqual(sent, [("watcher", 15)],
+                                 f"{name}: the ladder escalated past a proven exit, or sent "
+                                 "an integer-pid / group signal (OS-48 forbids both)")
                 gates = [step for step in result["ladder"]
                          if step["rung"].startswith("G")]
                 self.assertTrue(gates, f"{name}: the ladder recorded no identity gate")

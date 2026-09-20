@@ -335,7 +335,7 @@ class LauncherWiringTests(unittest.TestCase):
             "delivery_mode": "post_ready_delivery",
             "identity_binding": "minted_echo", "identity_flag": "--session-id",
             "delivery_proofs": [{"channel": "structured", "record_type": "assistant"}],
-            "completion_records": [{"channel": "structured", "record_type": "result",
+            "completion_records": [{"channel": "structured", "record_type": "result", "binding_mode": "single_record_optin",
                                     "error_field": "is_error"}]}
 
     def test_site_1_standalone_is_a_member_of_the_shared_adapters_tuple(self) -> None:

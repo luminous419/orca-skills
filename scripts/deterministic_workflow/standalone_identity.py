@@ -126,6 +126,11 @@ class OwnershipRecord(TypedDict):
 
 
 _REQUIRED_KEYS = frozenset(OwnershipRecord.__annotations__)
+#: OS-48 (DESIGN §2.1): the identity axes a record created by this version ALWAYS carries
+#: (`proc_start_ticks` is the kernel start identity; `boot_id` the host boot identity) plus the
+#: fence nonce / evidence source.  Optional at construction so a record can be built before the
+#: child's spawn record binds them; REQUIRED by `verify` on every signal path.
+_OPTIONAL_KEYS = frozenset({"proc_start_ticks", "boot_id", "fence_nonce", "evidence_source"})
 
 # The module-private construction token.  A `Permit` whose `_token` is not this object
 # raises.  It is a plain object() rather than a string so it cannot be guessed, typed,
@@ -213,7 +218,7 @@ def make_record(**fields: Any) -> OwnershipRecord:
     Defaulting it would let a handle minted for another host be signalled here.
     """
     missing = _REQUIRED_KEYS - set(fields)
-    extra = set(fields) - _REQUIRED_KEYS
+    extra = set(fields) - _REQUIRED_KEYS - _OPTIONAL_KEYS
     if missing or extra:
         raise IdentityError(
             f"ownership record needs exactly {sorted(_REQUIRED_KEYS)!r}; "
@@ -249,6 +254,105 @@ def fence(record: Mapping[str, Any]) -> str:
     ledger's, never trusted in place of it.
     """
     return f"{record['session_id']}:{record['process_incarnation']}"
+
+
+# ---- OS-48 process identity (DESIGN §2.1 / §2.3) ---------------------------------------------
+#: The closed evidence-state vocabulary (mirrors `standalone_capture.EVIDENCE_*`).
+EVIDENCE_PRESENT, EVIDENCE_FINAL, EVIDENCE_UNREADABLE = "present", "final", "unreadable"
+EVIDENCE_INCONSISTENT, EVIDENCE_UNKNOWN = "inconsistent", "unknown"
+PROCESS_IDENTITY_SCHEMA = "os48.process_identity.v1"
+#: Named identity / signal outcomes (members of `standalone_lifecycle.LOST_REASONS`).
+IDENTITY_UNREADABLE = "identity_unreadable"
+IDENTITY_CHANGED = "identity_changed"
+SIGNAL_UNBOUND = "signal_unbound"
+SIGNAL_TARGET_REAPED = "signal_target_reaped"
+GROUP_SIGNAL_REFUSED = "group_signal_refused"
+EVIDENCE_SOURCE_DARWIN = "darwin_libproc_kqueue"
+EVIDENCE_SOURCE_LINUX = "linux_proc_pidfd_subreaper"
+
+
+class ProcessIdentity(TypedDict):
+    """pid + kernel start identity + boot id + incarnation.  ``start_id`` is the platform's
+    kernel start time as an integer (darwin ``pbi_start_tvsec*1e6+tvusec``; Linux
+    ``/proc/<pid>/stat`` field 22); ``0`` means UNREADABLE, never "epoch"."""
+    schema: str
+    pid: int
+    start_id: int
+    boot_id: str
+    incarnation: str
+    source: str
+
+
+def process_identity(*, pid: int, start_id: int, boot_id: str, incarnation: str,
+                     source: str) -> ProcessIdentity:
+    return {"schema": PROCESS_IDENTITY_SCHEMA, "pid": int(pid), "start_id": int(start_id or 0),
+            "boot_id": str(boot_id or ""), "incarnation": str(incarnation or ""),
+            "source": str(source or "")}
+
+
+def identity_of_record(record: Mapping[str, Any], *, source: str = "") -> ProcessIdentity:
+    """The ownership record's pinned identity (``proc_start_ticks`` IS the start identity)."""
+    return process_identity(pid=int(record.get("pid") or 0),
+                            start_id=int(record.get("proc_start_ticks") or 0),
+                            boot_id=str(record.get("boot_id") or ""),
+                            incarnation=fence(record) if record.get("session_id") else "",
+                            source=source or str(record.get("evidence_source") or ""))
+
+
+def identity_complete(candidate: Mapping[str, Any] | None) -> bool:
+    """OS-48 (REVIEW_IMPLEMENTATION F-005): a REQUIRED identity is positive and complete only
+    with a live pid, a non-zero kernel start identity and a non-empty boot id.  A zero start
+    id is the evidence source's "unreadable" -- it may never be promoted into a proof."""
+    if not isinstance(candidate, Mapping):
+        return False
+    try:
+        return (int(candidate.get("pid") or 0) > 0 and int(candidate.get("start_id") or 0) > 0
+                and bool(str(candidate.get("boot_id") or "")))
+    except (TypeError, ValueError):
+        return False
+
+
+def compare_identity(recorded: Mapping[str, Any], observed_start: int, observed_state: str,
+                     host_boot_id: str) -> tuple[bool, str | None]:
+    """DESIGN §2.1 signal-path rule: equal start identity AND equal boot id, or a NAMED refusal.
+    A zero / unreadable start on either side, or an EMPTY boot id on either side (F-002), is
+    `identity_unreadable`, never a match."""
+    if observed_state != EVIDENCE_FINAL or not observed_start or not recorded.get("start_id"):
+        return False, IDENTITY_UNREADABLE
+    if not recorded.get("boot_id") or not host_boot_id:
+        return False, IDENTITY_UNREADABLE
+    if str(recorded["boot_id"]) != str(host_boot_id):
+        return False, IDENTITY_CHANGED
+    if int(observed_start) != int(recorded["start_id"]):
+        return False, IDENTITY_CHANGED
+    return True, None
+
+
+def may_killpg(pgid: int, members_known: Any = (), group_actual: Any = None) -> tuple[bool, str]:
+    """DESIGN §2.3 (F-003): user-space ``killpg`` is NEVER an OS-48 authority -- a leader's
+    identity does not cover the recipients at delivery and no user-space read can pin a group's
+    membership.  Always ``(False, "group_signal_refused")``.  Group teardown is the kernel's own
+    atomic SIGHUP to the foreground process group at controlling-tty revoke (probe_d8)."""
+    return False, GROUP_SIGNAL_REFUSED
+
+
+def delivery_path(target_role: str, platform: str, *, have_pidfd: bool) -> str:
+    """DESIGN §2.3: which incarnation-bound delivery path exists for a target, or ``refuse``."""
+    if target_role == "agent":
+        return "watcher_mediated"
+    if platform == "linux" and have_pidfd:
+        return "pidfd_send_signal"
+    return "refuse:" + SIGNAL_UNBOUND
+
+
+class SuccessionEvidence(TypedDict):
+    """DESIGN §2.5 rule 3 (F-004): the death / relinquishment evidence and the predecessor it was
+    obtained for, read TOGETHER and pinned before any decision."""
+    predecessor_generation: int
+    predecessor: ProcessIdentity
+    relinquish_record: bool
+    death_witness: str
+    highest_owner_alive: bool | None
 
 
 # ---- verification ----------------------------------------------------------------------
@@ -313,12 +417,30 @@ def verify(record: Mapping[str, Any], observed: Mapping[str, Any] | None) -> Ver
                     "evidence": {f"expected_{axis}": record.get(axis),
                                  f"observed_{axis}": observed_value,
                                  "axis_reported": True}}
-    for axis in ("boot_id", "proc_start_ticks"):
-        expected = record.get(axis)
-        if expected is not None and axis in observed and observed[axis] != expected:
-            # A pid recycled across a reboot, or a pid recycled within one.
-            return {"verdict": "not_owned", "reason": f"{axis}_mismatch",
-                    "evidence": {f"expected_{axis}": expected, f"observed_{axis}": observed[axis]}}
+    # ---- OS-48 (DESIGN §2.1): the kernel start identity and the boot id are REQUIRED axes on
+    # the signal path, read at decision time by the platform evidence source and carried on the
+    # observed row as `start_id` / `start_state` / `boot_id`.  A record or an observation that
+    # lacks them is `unverifiable: identity_unreadable` -- never a match (F-002); a mismatch is
+    # `not_owned: identity_changed` (a recycled pid).  Identity verification is a permit
+    # precondition only: it never by itself authorises an integer-pid `kill` (delivery is
+    # watcher-mediated or pidfd-bound, DESIGN §2.3).
+    ok, why = compare_identity(
+        {"start_id": record.get("proc_start_ticks"), "boot_id": record.get("boot_id")},
+        int(observed.get("start_id") or 0), str(observed.get("start_state") or EVIDENCE_UNKNOWN),
+        str(observed.get("boot_id") or ""))
+    if not ok:
+        if why == IDENTITY_UNREADABLE:
+            return {"verdict": "unverifiable", "reason": IDENTITY_UNREADABLE,
+                    "evidence": {"expected_start": record.get("proc_start_ticks"),
+                                 "observed_start": observed.get("start_id"),
+                                 "observed_state": observed.get("start_state"),
+                                 "expected_boot": record.get("boot_id"),
+                                 "observed_boot": observed.get("boot_id")}}
+        return {"verdict": "not_owned", "reason": IDENTITY_CHANGED,
+                "evidence": {"expected_start": record.get("proc_start_ticks"),
+                             "observed_start": observed.get("start_id"),
+                             "expected_boot": record.get("boot_id"),
+                             "observed_boot": observed.get("boot_id")}}
     return {"verdict": "verified", "reason": "", "evidence": dict(observed)}
 
 

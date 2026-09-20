@@ -25,7 +25,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from collections.abc import Mapping
+import re
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, TypedDict
 
@@ -95,22 +96,77 @@ INTEGRITY_META_INVALID = "meta_invalid"
 TRUNCATION_CAUSES = ("", TRUNCATION_TOTAL_BYTES, TRUNCATION_LINE_BYTES,
                      TRUNCATION_RECORD_COUNT)
 
-#: Round-9 consolidated review, item 1.  The CAPTURE-FINALIZED PROOF: a fenced, crash-
-#: durable record written by the ONE process that drained the pty master to its HANGUP
-#: after the agent's proven exit -- the supervisor (`StandaloneSession.drain_after_exit`)
-#: or, after the supervisor died, the exit watcher (`standalone_pty._watch`) -- AFTER its
-#: last append and meta save reached stable storage, binding the capture's final length,
-#: its sha256 and the exit sentinel's identity (fence + code).  It is DISTINCT from the
-#: exit sentinel: the sentinel proves the PROCESS exited (the watcher writes it the moment
-#: `waitpid` returns, whether or not anybody has drained), and this proves the CAPTURE is
-#: complete.  An adopted successor settles only over a capture this record vouches for;
-#: a sentinel alone is `stream_end_unproven`.  The same file, with ``finality:
-#: "unproven"``, records WHY a drain did not reach the hangup (the bound elapsed with a
-#: slave still held open, or the master was unreadable) and what held the slave, so the
-#: retained-slave cause is observable rather than a bare `budget`.
-CAPTURE_FINALIZED_SCHEMA = "os37.capture_finalized.v1"
-FINALITY_PROVEN = "proven"
-FINALITY_UNPROVEN = "unproven"
+#: OS-48.  The LEGACY capture-finalized proof (`os37.capture_finalized.v1`) is no longer evidence
+#: of anything: it rested on a negative whole-process-table scan (ANALYSIS F0).  A reader that
+#: finds ONLY such a record answers `legacy_finalized_record` by name (DESIGN §5); nothing is
+#: upgraded in place.  The OS-48 positive proof is the CAPTURE FENCE below.
+LEGACY_FINALIZED_SCHEMA = "os37.capture_finalized.v1"
+
+#: OS-48 DESIGN §1 -- the CAPTURE FENCE (`os48.capture_fence.v1`): written ONLY by the claimed
+#: finalizing owner, tmp+fsync+link (exclusive) + dir fsync, after the owner (the exit watcher,
+#: which holds one slave fd for the life of the dispatch) reaped the pinned agent incarnation and
+#: wrote the FENCE MARKER into its own slave fd.  The marker's offset in `capture.log` is the
+#: settlement boundary N: every byte any subtree member wrote before the root's exit is in
+#: `[0, N)` (the pty's single output FIFO -- DESIGN probe_d1, macOS + Linux), and nothing written
+#: after the marker can be.  The fence binds N, sha256(capture[0:N)), the emitter identity, the exit
+#: evidence and the owner generation -- positive facts about fixed objects, never a scan.
+CAPTURE_FENCE_SCHEMA = "os48.capture_fence.v1"
+#: DESIGN §1.8 -- the RELEASE RECORD (`os48.release_boundary.v1`): the diagnostic retention
+#: boundary R (the RELEASE marker's offset), a SEPARATE durable record written by the custodian
+#: after the fence, joined to the fence by incarnation + fence-file sha256.
+RELEASE_BOUNDARY_SCHEMA = "os48.release_boundary.v1"
+#: DESIGN §2.5 -- finalizer OWNER GENERATIONS (`os48.finalizer_owner.v1`, `owner.<inc>.g<n>`) and a
+#: live owner's durable RELINQUISHMENT (`os48.relinquish.v1`, `relinquish.<inc>.g<n>`).
+FINALIZER_OWNER_SCHEMA = "os48.finalizer_owner.v1"
+RELINQUISH_SCHEMA = "os48.relinquish.v1"
+
+#: DESIGN §1.7 -- the closed evidence-state vocabulary.  Only FINAL may authorise a settlement; a
+#: negative enumeration can never produce it (it lands in UNKNOWN).
+EVIDENCE_PRESENT = "present"
+EVIDENCE_FINAL = "final"
+EVIDENCE_UNREADABLE = "unreadable"
+EVIDENCE_INCONSISTENT = "inconsistent"
+EVIDENCE_UNKNOWN = "unknown"
+EVIDENCE_STATES = frozenset({EVIDENCE_PRESENT, EVIDENCE_FINAL, EVIDENCE_UNREADABLE,
+                             EVIDENCE_INCONSISTENT, EVIDENCE_UNKNOWN})
+
+#: DESIGN §6 -- named non-success outcomes produced by the fence / ownership machinery.  Every one
+#: is a member of `standalone_lifecycle.LOST_REASONS` (LOST) or a FAILED verdict reason, or a
+#: DIAGNOSTIC (journal-only) name; none can become COMPLETED.
+OUTCOME_BOUNDARY_UNPROVEN = "boundary_unproven"
+OUTCOME_FENCE_MISSING = "fence_missing"
+OUTCOME_FENCE_MISMATCH = "fence_mismatch"
+OUTCOME_FENCE_FOREIGN = "fence_foreign"
+OUTCOME_LEGACY_FINALIZED = "legacy_finalized_record"
+OUTCOME_OWNER_CONFLICT = "owner_conflict"
+OUTCOME_FINALIZER_ALIVE = "finalizer_alive"
+OUTCOME_FENCE_PUBLISHED_NO_CLAIM = "fence_published_no_claim"
+OUTCOME_SUCCESSION_UNWITNESSED = "succession_unwitnessed"
+OUTCOME_PROVENANCE_AMBIGUOUS = "provenance_ambiguous"
+OUTCOME_RECORD_FRAMING_AMBIGUOUS = "record_framing_ambiguous"   # F-015: a completion-shaped object inside an unparsable line of [baseline, N)
+OUTCOME_RECORD_SCAN_INCOMPLETE = "record_scan_incomplete"       # F-015 (i8): the framing scan of [baseline, N) hit its bound -- R1/R2 undecidable
+OUTCOME_PROVENANCE_UNBOUND = "provenance_unbound"
+OUTCOME_REFUSAL_IN_BOUNDARY = "refusal_in_boundary"
+OUTCOME_DIAGNOSTIC_TAIL_UNACCOUNTED = "diagnostic_tail_unaccounted"
+OUTCOME_RELEASE_RECORD_MISSING = "release_record_missing"
+OUTCOME_MEMBERSHIP_UNREADABLE = "membership_unreadable"   # the positive set is UNKNOWN (ledger unreadable / incomplete)
+OUTCOME_DESCENDANTS_UNKNOWN = "descendants_unknown"       # F-009: discovery could not be read; the set beyond the positive members is UNKNOWN
+#: USER DECISION C2 (run_11b4061df84d, PR #36): an ADOPTED session of a `post_ready_delivery`
+#: dispatch cannot restore a trustworthy settlement baseline (the live baseline lives only in
+#: the crashed supervisor's memory; the journal's copy is unkeyed), so a selection that would
+#: otherwise be a SUCCESS over `[0, N)` is this named LOST outcome instead -- refusal /
+#: reader-failure dominance is preserved first; `launch_with_prompt` (baseline 0) is untouched.
+OUTCOME_ADOPTED_BASELINE_UNKNOWN = "adopted_baseline_unknown"
+
+#: The two finalizing owner roles the fence admits -- the supervisor (holds the master) and the
+#: exit watcher (holds the OWNER SLAVE REFERENCE and writes the marker) -- plus the successor,
+#: which holds neither and may publish only when the marker is ALREADY in the capture.
+OWNER_SUPERVISOR = "supervisor"
+OWNER_EXIT_WATCHER = "exit_watcher"
+OWNER_SUCCESSOR = "successor"
+#: Kept for readers of legacy journal rows (`writer=` values of os37 records).
+WRITER_SUPERVISOR = OWNER_SUPERVISOR
+WRITER_EXIT_WATCHER = OWNER_EXIT_WATCHER
 
 
 class CaptureRecord(TypedDict):
@@ -324,6 +380,12 @@ class BoundedCapture:
         """
         return self.text(cursor).replace("\r\n", "\n").replace("\r", "\n")
 
+    @staticmethod
+    def transcript_of(raw: bytes) -> str:
+        r"""The :meth:`transcript` reading of an arbitrary byte interval of the capture (OS-48:
+        the authoritative ``[baseline, N)`` slice a settlement is allowed to parse)."""
+        return raw.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+
     def text(self, cursor: int = 0) -> str:
         r"""The whole capture from ``cursor``, decoded VERBATIM.  For evidence.
 
@@ -337,18 +399,27 @@ class BoundedCapture:
         except OSError:
             return ""
 
-    def raw(self, cursor: int = 0) -> bytes:
-        r"""The whole capture from the RAW byte offset ``cursor``, UNDECODED.
+    def raw(self, cursor: int = 0, limit: int | None = None) -> bytes:
+        r"""The capture from the RAW byte offset ``cursor``, UNDECODED -- to EOF, or, with
+        ``limit``, EXACTLY the next ``limit`` bytes (one bounded ``read(limit)``; never a
+        read to EOF followed by a slice).
 
         Delivery provenance is byte-addressable: the delivery event records a byte offset
         (``size`` at the write), so the echo must be matched and excluded on THESE bytes,
         before any UTF-8 decode or ``\r\n`` translation shifts positions (F-002 coordinate
         integrity).  ``cursor`` is a byte offset into the same space as :attr:`size`.
+
+        OS-48 PR #36 finding 1: the SETTLEMENT reader passes ``limit = N - baseline`` so the
+        bytes past the fence boundary -- the marker and whatever diagnostic tail has been
+        appended since, of any size -- are never read, never allocated and never decoded by
+        a settlement; a tail too large to allocate cannot fail a read that does not touch it.
         """
+        if limit is not None and limit < 0:
+            raise ValueError("a capture read limit is a byte count and cannot be negative")
         try:
             with open(self.path, "rb") as handle:
                 handle.seek(cursor)
-                return handle.read()
+                return handle.read() if limit is None else handle.read(limit)
         except OSError:
             return b""
 
@@ -839,70 +910,149 @@ def _meta_shape_problem(meta: Any) -> str:
 
 def capture_finalized_path(capture: str | os.PathLike[str] | bytes,
                            incarnation: str) -> bytes:
-    """``<capture.log>.finalized.<incarnation>.json`` -- the capture-finalized proof for
-    ONE incarnation, beside the capture it vouches for (item 1, round 9).  Bytes, because
-    the forked exit watcher addresses it with raw ``os`` calls."""
+    """``<capture.log>.finalized.<incarnation>.json`` -- the LEGACY os37 record's path, kept only
+    so a reader can detect (and refuse by name) a run finalized by the superseded protocol."""
     target = os.fsencode(os.fspath(capture)) if not isinstance(capture, bytes) else capture
     return target + b".finalized." + incarnation.encode() + b".json"
 
 
-def write_capture_finalized(path: str | os.PathLike[str] | bytes, *, fence: str,
-                            finality: str, writer: str, ended: str, errno_name: str,
-                            total_bytes: int, sha256: str, records: int,
-                            exit_how: str, exit_code: int | None,
-                            holders: Mapping[str, Any] | None = None,
-                            detail: str = "") -> None:
-    """Write the fenced capture-finalized record durably (tmp + fsync + rename).  Raw
-    ``os`` calls only: the exit watcher calls this after ``fork`` without ``exec``.
+# ---- OS-48 fence markers (DESIGN §1.1 / §1.8) -- [FORKED-SAFE] -------------------------------
+_NONCE_RE = re.compile(r"[0-9a-f]{32}")
 
-    ``finality == "proven"`` is written ONLY after the writer's last append and its meta
-    reached stable storage, and binds the capture's final ``total_bytes`` / ``sha256`` and
-    the exit evidence (``exit_how``: ``exit_sentinel`` with the sentinel's ``code``, or a
-    process-table / ladder proof with no code).  ``"unproven"`` records why the drain did
-    not reach the hangup and the ``holders`` evidence (what still held the pty slave).
-    """
-    if finality not in (FINALITY_PROVEN, FINALITY_UNPROVEN):
-        raise ValueError(f"finality must be proven|unproven, got {finality!r}")
-    record = {"schema": CAPTURE_FINALIZED_SCHEMA, "fence": fence, "finality": finality,
-              "writer": writer, "ended": ended, "errno": errno_name or "",
-              "total_bytes": int(total_bytes), "sha256": sha256, "records": int(records),
-              "exit": {"how": exit_how, "code": exit_code},
-              "holders": dict(holders or {}), "detail": detail or ""}
-    payload = json.dumps(record, sort_keys=True).encode()
+
+def marker_bytes(nonce: str) -> bytes:
+    """[FORKED-SAFE] The in-band FENCE marker the owner writes into ITS OWN slave fd after the
+    pinned agent incarnation is reaped.  The pty output queue is a single FIFO, so every byte
+    written to any slave descriptor before this call is delivered to the master before it."""
+    if not _NONCE_RE.fullmatch(nonce or ""):
+        raise ValueError("fence nonce must be 32 lowercase hex chars")
+    return b"\n<<OS48-FENCE " + nonce.encode() + b">>\n"
+
+
+def release_marker_bytes(nonce: str) -> bytes:
+    """[FORKED-SAFE] The RELEASE marker (DESIGN §1.8), written on release-1; the owner closes its
+    slave reference only on release-2, after the custodian consumed up to it."""
+    if not _NONCE_RE.fullmatch(nonce or ""):
+        raise ValueError("fence nonce must be 32 lowercase hex chars")
+    return b"\n<<OS48-RELEASE " + nonce.encode() + b">>\n"
+
+
+_FENCE_RE_TEMPLATE = rb"\r?\n<<OS48-FENCE %s>>\r?\n"
+_RELEASE_RE_TEMPLATE = rb"\r?\n<<OS48-RELEASE %s>>\r?\n"
+
+
+def _find_once(pattern: bytes, capture: bytes, after: int) -> tuple[int, int, str]:
+    hits = list(re.finditer(pattern, capture[after:]))
+    if not hits:
+        return -1, 0, EVIDENCE_UNKNOWN
+    if len(hits) > 1:
+        return -1, 0, EVIDENCE_INCONSISTENT
+    return after + hits[0].start(), hits[0].end() - hits[0].start(), EVIDENCE_FINAL
+
+
+def find_marker(capture: bytes, nonce: str) -> tuple[int, str]:
+    """[FORKED-SAFE] ``(N, "final")`` when the fence marker for ``nonce`` occurs EXACTLY once;
+    ``(-1, "unknown")`` when absent (`boundary_unproven`); ``(-1, "inconsistent")`` when it occurs
+    more than once (a duplicated marker is never evidence).  Tolerant of ONLCR (``\\r\\n``)."""
+    marker_bytes(nonce)
+    offset, _length, state = _find_once(_FENCE_RE_TEMPLATE % nonce.encode(), capture, 0)
+    return offset, state
+
+
+def marker_span(capture: bytes, nonce: str) -> tuple[int, int, str]:
+    """Like :func:`find_marker` but also returns the matched marker length (ONLCR may widen it)."""
+    marker_bytes(nonce)
+    return _find_once(_FENCE_RE_TEMPLATE % nonce.encode(), capture, 0)
+
+
+def find_release_marker(capture: bytes, nonce: str, *, after: int) -> tuple[int, int, str]:
+    """[FORKED-SAFE] ``(R, length, state)`` for the RELEASE marker searched only AFTER the fence."""
+    release_marker_bytes(nonce)
+    return _find_once(_RELEASE_RE_TEMPLATE % nonce.encode(), capture, max(0, after))
+
+
+def prefix_digest(capture: bytes, offset_n: int) -> str:
+    # a memoryview: no second copy of the prefix (iteration 3: under address-space pressure
+    # the slice copy was the next allocation to fail after the parser was made total)
+    return hashlib.sha256(memoryview(capture)[:max(0, int(offset_n))]).hexdigest()
+
+
+def file_prefix_digest(path: str | os.PathLike[str] | bytes, offset_n: int) -> str:
+    """[FORKED-SAFE] sha256 of the first ``offset_n`` bytes of a file, read with raw ``os``."""
     target = os.fsencode(os.fspath(path)) if not isinstance(path, bytes) else path
-    tmp = target + b".tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    digest = hashlib.sha256()
+    fd = os.open(target, os.O_RDONLY)
+    try:
+        remaining = int(offset_n)
+        while remaining > 0:
+            chunk = os.read(fd, min(65_536, remaining))
+            if not chunk:
+                break
+            digest.update(chunk)
+            remaining -= len(chunk)
+    finally:
+        os.close(fd)
+    return digest.hexdigest()
+
+
+def _file_size(path: bytes) -> int:
+    try:
+        return int(os.stat(path).st_size)
+    except OSError:
+        return -1
+
+
+# ---- durable, exclusive record publication -- [FORKED-SAFE] ---------------------------------
+#: Test-only seam at the tmp-fsynced -> link boundary of :func:`publish_exclusive`
+#: (REVIEW_IMPLEMENTATION_iteration2 F-007).  Production never sets it.
+_LINK_HOOK: Any = None
+
+
+def publish_exclusive(path: str | os.PathLike[str] | bytes, payload: bytes) -> bool:
+    """[FORKED-SAFE] Write ``payload`` to a private tmp (fsync), then ``os.link(tmp, path)`` --
+    atomic and EXCLUSIVE: exactly one publisher of a given path wins, a torn record cannot exist
+    (a tmp is never authoritative), and the directory is fsynced after a win.  ``True`` when this
+    call published, ``False`` when the path already existed (the caller reads the winner)."""
+    target = os.fsencode(os.fspath(path)) if not isinstance(path, bytes) else path
+    tmp = target + b".tmp." + str(os.getpid()).encode()
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         os.write(fd, payload)
         os.fsync(fd)
     finally:
         os.close(fd)
-    os.rename(tmp, target)
+    if _LINK_HOOK is not None:
+        # The RC2 crash boundary (DESIGN §1.7): the tmp is fsynced and the target is not yet
+        # linked.  Test-only seam (`None` in production); a lock pauses / kills HERE.
+        _LINK_HOOK(tmp, target)
     try:
-        dir_fd = os.open(os.path.dirname(target) or b".", os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        os.fsync(dir_fd)
-    except OSError:
-        pass
+        os.link(tmp, target)
+        won = True
+    except FileExistsError:
+        won = False
     finally:
-        os.close(dir_fd)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+    if won:
+        try:
+            dir_fd = os.open(os.path.dirname(target) or b".", os.O_RDONLY)
+        except OSError:
+            return True
+        try:
+            os.fsync(dir_fd)
+        except OSError:
+            pass
+        finally:
+            os.close(dir_fd)
+    return won
 
 
-def read_capture_finalized(path: str | os.PathLike[str] | bytes, *,
-                           fence: str) -> dict[str, Any]:
-    """``{"outcome": "proven" | "unproven" | "absent" | "foreign" | "unreadable",
-    "record": dict | None, "detail": str}``.
-
-    A record whose fence is another incarnation's is ``foreign`` and its contents are
-    NOT returned -- the same replay refusal :func:`standalone_pty.read_exit_sentinel`
-    applies.  ``proven`` is the record's OWN claim; the caller still binds it to the
-    capture on disk (length, digest) and to the sentinel (:func:`finalized_matches`).
-    """
-    target = os.fsencode(os.fspath(path)) if not isinstance(path, bytes) else path
+def _read_json_record(path: bytes, schema: str) -> dict[str, Any]:
+    """``{"outcome": "present"|"absent"|"unreadable", "record": dict|None, "detail": str}``."""
     try:
-        fd = os.open(target, os.O_RDONLY)
+        fd = os.open(path, os.O_RDONLY)
     except FileNotFoundError:
         return {"outcome": "absent", "record": None, "detail": ""}
     except OSError as exc:
@@ -922,55 +1072,266 @@ def read_capture_finalized(path: str | os.PathLike[str] | bytes, *,
         record = json.loads(raw.decode("utf-8", errors="replace"))
     except ValueError:
         return {"outcome": "unreadable", "record": None, "detail": "malformed record"}
-    if not isinstance(record, dict) or record.get("schema") != CAPTURE_FINALIZED_SCHEMA:
-        return {"outcome": "unreadable", "record": None, "detail": "not a finalized record"}
+    if not isinstance(record, dict) or record.get("schema") != schema:
+        return {"outcome": "unreadable", "record": None,
+                "detail": f"not a {schema} record"}
+    return {"outcome": "present", "record": record, "detail": ""}
+
+
+# ---- the capture fence (DESIGN §1.5) -----------------------------------------------------------
+def capture_fence_path(capture: str | os.PathLike[str] | bytes, incarnation: str) -> bytes:
+    """``<capture.log>.fence.<incarnation>.json``."""
+    target = os.fsencode(os.fspath(capture)) if not isinstance(capture, bytes) else capture
+    return target + b".fence." + incarnation.encode() + b".json"
+
+
+# ---- OS-48 (REVIEW_IMPLEMENTATION_iteration2 F-001): the sidecar snapshot AT the boundary -------
+SIDECAR_SNAPSHOT_SCHEMA = "os48.sidecar_snapshot.v1"
+SIDECAR_STATE_PRESENT = "present"          # the declared file existed at the owner's reap-step read
+SIDECAR_STATE_ABSENT = "absent"            # ENOENT at that read: a POSITIVE absence
+SIDECAR_STATE_UNREADABLE = "sidecar_unreadable"  # denied / EIO / short at that read: NOT absence (F-008)
+SIDECAR_STATE_UNPROVEN = "sidecar_unproven"  # no snapshot record at all: the presence fact is unproven
+SIDECAR_STATE_NONE = "none_declared"       # the profile declares no sidecar
+#: Where the owner's read sits relative to the marker (F-001 (b)): the read is taken in the
+#: reap step, after `waitpid` and BEFORE the marker is emitted.  It is recorded in the fence
+#: as a fact about the read, never as a claim that file content is bound to the stream offset N
+#: -- the design defines ONE boundary (the marker's stream offset) and no auxiliary-content
+#: boundary, so sidecar CONTENT is never a settlement body source (`sidecar_unproven`); the
+#: snapshot serves R3's presence fact only, immutably.
+SIDECAR_INSTANT_REAP_STEP = "reap_step_before_marker"
+
+
+def sidecar_snapshot_path(capture: str | os.PathLike[str] | bytes, incarnation: str) -> bytes:
+    target = os.fsencode(os.fspath(capture)) if not isinstance(capture, bytes) else capture
+    return target + b".sidecar." + incarnation.encode() + b".json"
+
+
+def sidecar_bytes_path(capture: str | os.PathLike[str] | bytes, incarnation: str) -> bytes:
+    target = os.fsencode(os.fspath(capture)) if not isinstance(capture, bytes) else capture
+    return target + b".sidecar." + incarnation.encode() + b".bytes"
+
+
+def snapshot_sidecar(capture: bytes, incarnation: str, *, fence: str, sidecar_path: str,
+                     captured_at: str) -> dict[str, Any]:
+    """[FORKED-SAFE] Read + digest the DECLARED sidecar file and publish (link-exclusive) both
+    the bytes and the record -- called by the exit watcher in its reap step (instant
+    `reap_step_before_marker`).  What this fixes is the sidecar's PRESENCE FACT for R3
+    (`present` / `absent` / `sidecar_unreadable`), pinned in the fence so no later creation,
+    removal or resize can move a verdict.  It does NOT bind the file's CONTENT to the stream
+    boundary N: a helper may still write between this read and the marker, which is why the
+    content is never a settlement body source (REVIEW_IMPLEMENTATION_iteration3 F-001, option
+    ii -- `result_body(allow_path=False)`, `sidecar_refused = sidecar_unproven`).  A record
+    that could not be published is reported as `sidecar_unproven` by every later reader."""
+    record: dict[str, Any] = {"schema": SIDECAR_SNAPSHOT_SCHEMA, "fence": fence,
+                              "path": sidecar_path, "captured_at": captured_at,
+                              "instant": SIDECAR_INSTANT_REAP_STEP,
+                              "state": SIDECAR_STATE_UNPROVEN, "sha256": None, "bytes": 0, "error": ""}
+    raw: bytes | None = None
+    try:
+        fd = os.open(sidecar_path, os.O_RDONLY)
+        try:
+            chunks = []
+            while True:
+                chunk = os.read(fd, 1 << 20)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            raw = b"".join(chunks)
+        finally:
+            os.close(fd)
+    except FileNotFoundError:
+        record["state"] = SIDECAR_STATE_ABSENT               # ENOENT: positive absence
+    except OSError as exc:
+        # REVIEW_IMPLEMENTATION_iteration3 F-008: EACCES / EIO / any other failure is NOT
+        # absence -- the presence fact is unreadable, named, and can approve nothing.
+        record["state"] = SIDECAR_STATE_UNREADABLE
+        record["error"] = f"{type(exc).__name__}:{getattr(exc, 'errno', '')}"
+    if raw is not None:
+        record.update({"state": SIDECAR_STATE_PRESENT, "sha256": hashlib.sha256(raw).hexdigest(),
+                       "bytes": len(raw)})
+        publish_exclusive(sidecar_bytes_path(capture, incarnation), raw)
+    publish_exclusive(sidecar_snapshot_path(capture, incarnation),
+                      json.dumps(record, sort_keys=True).encode())
+    return record
+
+
+def read_sidecar_snapshot(capture: str | os.PathLike[str] | bytes, incarnation: str, *,
+                          fence: str) -> dict[str, Any]:
+    """``{"state": present|absent|sidecar_unproven, "record", "raw"}`` -- the bytes are returned
+    ONLY when they re-digest to the record (a torn / substituted bytes file is `sidecar_unproven`)."""
+    target = os.fsencode(os.fspath(capture)) if not isinstance(capture, bytes) else capture
+    got = _read_json_record(sidecar_snapshot_path(target, incarnation), SIDECAR_SNAPSHOT_SCHEMA)
+    if got["outcome"] != "present" or got["record"].get("fence") != fence:
+        return {"state": SIDECAR_STATE_UNPROVEN, "record": None, "raw": None}
+    record = got["record"]
+    if record.get("state") in (SIDECAR_STATE_ABSENT, SIDECAR_STATE_UNREADABLE, SIDECAR_STATE_UNPROVEN):
+        return {"state": record.get("state"), "record": record, "raw": None}
+    try:
+        with open(sidecar_bytes_path(target, incarnation), "rb") as handle:
+            raw = handle.read()
+    except OSError:
+        return {"state": SIDECAR_STATE_UNPROVEN, "record": record, "raw": None}
+    if hashlib.sha256(raw).hexdigest() != record.get("sha256") or len(raw) != int(record.get("bytes") or -1):
+        return {"state": SIDECAR_STATE_UNPROVEN, "record": record, "raw": None}
+    return {"state": SIDECAR_STATE_PRESENT, "record": record, "raw": raw}
+
+
+#: OS-48 PR #36 finding 1 -- the CAPTURE STATE AT PUBLISH, bound into the fence.  The fence's
+#: digest proves that ``capture.log[0:N)`` IS what the owner published; this fact proves that the
+#: store had LOST NOTHING when it was published (no limit drop / line cut, no failed write, a
+#: meta that described the bytes) -- so ``[0, N)`` is a COMPLETE authoritative range.  Every
+#: limit decision, write failure or meta disagreement that happens AFTER the publish lies at an
+#: offset past the bytes the fence bound, and is a fact about the DIAGNOSTIC TAIL only.  A
+#: settlement over a verified fence therefore reads its answerability HERE, never from the live
+#: whole-file state; a fence without the fact (published before this field existed) leaves the
+#: whole-capture answer in force -- fail-closed, never widened.
+CAPTURE_STATE_KEYS = ("answerable", "lost_reason", "integrity", "truncation", "dropped_bytes",
+                      "total_bytes")
+#: `fenced_answerability(...)["source"]`: which fact answered.
+ANSWERABILITY_SOURCE_FENCE = "fence_capture_at_publish"
+ANSWERABILITY_SOURCE_WHOLE = "whole_capture"
+
+
+def capture_state_at_publish(*, answerable: Mapping[str, Any], truncation: str | None,
+                             dropped_bytes: int, total_bytes: int) -> dict[str, Any]:
+    """[FORKED-SAFE] The closed `capture_at_publish` shape from a `completion_is_answerable`
+    answer (or the watcher's appender-derived equivalent) and the store's counters."""
+    return {"answerable": bool(answerable.get("answerable")),
+            "lost_reason": str(answerable.get("lost_reason") or ""),
+            "integrity": str(answerable.get("integrity") or ""),
+            "truncation": str(truncation or ""),
+            "dropped_bytes": int(dropped_bytes or 0), "total_bytes": int(total_bytes or 0)}
+
+
+def fenced_answerability(fence_record: Mapping[str, Any] | None) -> dict[str, Any]:
+    """The answerability of ``[0, N)`` a VERIFIED fence records, or ``None``-source when the
+    fence carries no such fact.  ``{"answerable", "lost_reason", "integrity", "source"}`` with
+    ``source`` = `fence_capture_at_publish` when the fence's `capture_at_publish` field is the
+    closed shape, else `whole_capture` (the caller falls back to the live whole-file answer).
+    A recorded ``answerable: false`` is returned AS RECORDED (the reason it names): a range the
+    owner could not vouch for at publish is not vouched for later either."""
+    state = fence_record.get("capture_at_publish") if isinstance(fence_record, Mapping) else None
+    if (not isinstance(state, Mapping) or set(state) != set(CAPTURE_STATE_KEYS)
+            or not isinstance(state.get("answerable"), bool)):
+        return {"answerable": False, "lost_reason": "", "integrity": "",
+                "source": ANSWERABILITY_SOURCE_WHOLE}
+    if state["answerable"]:
+        return {"answerable": True, "lost_reason": "", "integrity": "",
+                "source": ANSWERABILITY_SOURCE_FENCE}
+    return {"answerable": False,
+            "lost_reason": str(state.get("lost_reason") or CAPTURE_INTEGRITY_LOST_REASON),
+            "integrity": str(state.get("integrity") or ""),
+            "source": ANSWERABILITY_SOURCE_FENCE}
+
+
+def make_capture_fence(*, fence: str, emitter: Mapping[str, Any], emitter_pgid: int,
+                       offset_n: int, marker_len: int, marker_nonce: str, sha256_prefix: str,
+                       tail_bytes_at_publish: int, exit_how: str, exit_code: int | None,
+                       reaped_by: Mapping[str, Any] | None, owner: Mapping[str, Any],
+                       evidence_source: str, provenance: Sequence[str],
+                       published_at: str, sidecar: Mapping[str, Any] | None = None,
+                       capture_state: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """The fence record.  ``sidecar`` (OS-48 F-001, iterations 3-4) is the watcher's snapshot of
+    the declared ``-o`` file taken in its reap step (instant `reap_step_before_marker`) --
+    ``{"state", "path", "sha256", "bytes", "instant", "error"}`` with state `present` /
+    `absent` / `sidecar_unreadable` / `sidecar_unproven` -- the immutable PRESENCE fact for R3;
+    it never binds the file's content to N and is never a settlement body source; ``None``
+    when the profile declares no sidecar.  A state first sampled after N is never a proof and
+    is never recorded here.  ``capture_state`` (PR #36 finding 1) is the publisher's
+    :func:`capture_state_at_publish` -- the store's answerability AT PUBLISH, the fact a fenced
+    settlement reads instead of the live whole-file state."""
+    return {"schema": CAPTURE_FENCE_SCHEMA, "fence": fence, "sidecar": dict(sidecar) if sidecar else None,
+            "capture_at_publish": dict(capture_state) if capture_state else None,
+            "emitter": dict(emitter), "emitter_pgid": int(emitter_pgid),
+            "boundary": {"offset_n": int(offset_n), "marker_offset": int(offset_n),
+                         "marker_len": int(marker_len), "marker_nonce": marker_nonce,
+                         "sha256_prefix": sha256_prefix,
+                         "tail_bytes_at_publish": int(tail_bytes_at_publish)},
+            "exit": {"how": exit_how, "code": exit_code,
+                     "reaped_by": dict(reaped_by) if reaped_by else None},
+            "owner": dict(owner), "evidence_source": evidence_source,
+            "published_at": published_at, "provenance": list(provenance)}
+
+
+def write_capture_fence(path: str | os.PathLike[str] | bytes, record: Mapping[str, Any]) -> bool:
+    """[FORKED-SAFE] Publish the fence exclusively.  ``False`` = a fence already exists (the
+    caller reads and verifies it; it never overwrites -- I-6)."""
+    if record.get("schema") != CAPTURE_FENCE_SCHEMA:
+        raise ValueError("not a capture fence record")
+    return publish_exclusive(path, json.dumps(record, sort_keys=True).encode())
+
+
+def read_capture_fence(path: str | os.PathLike[str] | bytes, *, fence: str,
+                       legacy_path: str | os.PathLike[str] | bytes | None = None) -> dict[str, Any]:
+    """``{"outcome": "final"|"absent"|"foreign"|"unreadable"|"legacy_finalized_record", "record"}``.
+    A fence of another incarnation is ``foreign`` and its contents are NOT returned.  When no
+    fence exists but a legacy os37 finalized record does, the outcome is the NAMED refusal
+    ``legacy_finalized_record`` -- never finality (DESIGN §5)."""
+    target = os.fsencode(os.fspath(path)) if not isinstance(path, bytes) else path
+    got = _read_json_record(target, CAPTURE_FENCE_SCHEMA)
+    if got["outcome"] == "absent":
+        if legacy_path is not None:
+            legacy = os.fsencode(os.fspath(legacy_path)) if not isinstance(legacy_path, bytes) else legacy_path
+            if _file_size(legacy) >= 0:
+                return {"outcome": OUTCOME_LEGACY_FINALIZED, "record": None,
+                        "detail": "an os37.capture_finalized.v1 record exists and is not evidence"}
+        return {"outcome": "absent", "record": None, "detail": ""}
+    if got["outcome"] == "unreadable":
+        return got
+    record = got["record"]
     if record.get("fence") != fence:
         return {"outcome": "foreign", "record": None,
                 "detail": f"fence {record.get('fence')!r} is not {fence!r}"}
-    finality = record.get("finality")
-    if finality not in (FINALITY_PROVEN, FINALITY_UNPROVEN):
-        return {"outcome": "unreadable", "record": None,
-                "detail": f"finality {finality!r} is not proven|unproven"}
-    return {"outcome": finality, "record": record, "detail": ""}
+    return {"outcome": EVIDENCE_FINAL, "record": record, "detail": ""}
 
 
-def finalized_matches(record: Mapping[str, Any], *, capture: str | os.PathLike[str],
-                      sentinel_code: int | None, sentinel_present: bool) -> dict[str, Any]:
-    """Bind a ``proven`` finalized record to the CAPTURE ON DISK and to the EXIT
-    SENTINEL: ``{"matches": bool, "reason": str}``.
-
-    The record must name the file's exact length and sha256 (a proof written over a
-    capture that later grew, shrank or changed is not a proof of THIS capture), must
-    hold the closed shape, and -- when written by the exit watcher, whose exit evidence is
-    the sentinel it writes next -- must name the sentinel's code.  A record that cites the
-    sentinel while none exists (or another code) is refused: the two files are one act
-    of one writer and must agree.
-    """
-    if record.get("finality") != FINALITY_PROVEN:
-        return {"matches": False, "reason": "not_proven"}
-    # `finality: proven` is the authoritative claim; ``ended`` is diagnostic (``hangup``
-    # for a reader that saw EOF/EIO, ``quiesced`` for the session-leader watcher whose
-    # reaped-agent drain went quiet with no slave holder -- both are the writer's SOUND
-    # completion, and the writer only stamps ``proven`` after that gate).
-    if record.get("ended") not in ("hangup", "quiesced"):
-        return {"matches": False, "reason": "ended_not_final"}
-    if record.get("writer") not in (WRITER_SUPERVISOR, WRITER_EXIT_WATCHER):
-        return {"matches": False, "reason": "writer_unknown"}
-    declared = record.get("total_bytes")
-    digest = record.get("sha256")
-    if not isinstance(declared, int) or isinstance(declared, bool) or declared < 0:
-        return {"matches": False, "reason": "total_bytes"}
-    if not isinstance(digest, str) or len(digest) != 64:
-        return {"matches": False, "reason": "sha256"}
+def _identity_complete(candidate: Any) -> bool:
+    """[FORKED-SAFE] pid > 0, start_id > 0, non-empty boot id (mirrors
+    `standalone_identity.identity_complete`; duplicated so this module stays import-free)."""
+    if not isinstance(candidate, Mapping):
+        return False
     try:
-        size = Path(capture).stat().st_size
-    except OSError:
-        size = 0
-    if size != declared:
-        return {"matches": False, "reason": "capture_length_mismatch",
-                "proof_bytes": declared, "file_bytes": size}
-    if _digest_of(Path(capture)).hexdigest() != digest:
-        return {"matches": False, "reason": "capture_digest_mismatch"}
+        return (int(candidate.get("pid") or 0) > 0 and int(candidate.get("start_id") or 0) > 0
+                and bool(str(candidate.get("boot_id") or "")))
+    except (TypeError, ValueError):
+        return False
+
+
+def fence_matches(record: Mapping[str, Any], *, capture: str | os.PathLike[str] | bytes,
+                  sentinel_code: int | None, sentinel_present: bool) -> dict[str, Any]:
+    """Bind a fence to the CAPTURE ON DISK and to the exit sentinel: the file must hold at
+    least N bytes, sha256(file[0:N)) must equal the fence's digest, and a fence citing the
+    sentinel must agree with it.  ``{"matches": bool, "reason": str}``."""
+    boundary = record.get("boundary") if isinstance(record.get("boundary"), dict) else {}
+    offset_n = boundary.get("offset_n")
+    digest = boundary.get("sha256_prefix")
+    # REVIEW_IMPLEMENTATION F-005: the REQUIRED typed identities the fence joins -- the
+    # emitter, the finalizing owner and (when cited) the reaper -- must be positive and
+    # complete (pid > 0, start_id > 0, boot id); a fence carrying an unreadable identity is
+    # `identity_unreadable`, never a match.
+    for axis, candidate in (("emitter", record.get("emitter")),
+                            ("owner", (record.get("owner") or {}).get("owner")
+                             if isinstance(record.get("owner"), dict) else None),
+                            ("reaped_by", (record.get("exit") or {}).get("reaped_by")
+                             if isinstance(record.get("exit"), dict) else None)):
+        if axis == "reaped_by" and candidate is None:
+            continue
+        if not _identity_complete(candidate):
+            return {"matches": False, "reason": "identity_unreadable", "axis": axis}
+    if not isinstance(offset_n, int) or isinstance(offset_n, bool) or offset_n < 0:
+        return {"matches": False, "reason": "offset_n"}
+    if not isinstance(digest, str) or len(digest) != 64:
+        return {"matches": False, "reason": "sha256_prefix"}
+    target = os.fsencode(os.fspath(capture)) if not isinstance(capture, bytes) else capture
+    size = _file_size(target)
+    if size < offset_n:
+        return {"matches": False, "reason": "capture_shorter_than_boundary",
+                "proof_bytes": offset_n, "file_bytes": size}
+    try:
+        if file_prefix_digest(target, offset_n) != digest:
+            return {"matches": False, "reason": "capture_digest_mismatch"}
+    except OSError as exc:
+        return {"matches": False, "reason": f"capture_unreadable:{exc.errno}"}
     exit_evidence = record.get("exit") if isinstance(record.get("exit"), dict) else {}
     how = str(exit_evidence.get("how") or "")
     if how == "exit_sentinel":
@@ -981,6 +1342,218 @@ def finalized_matches(record: Mapping[str, Any], *, capture: str | os.PathLike[s
     elif not how:
         return {"matches": False, "reason": "exit_evidence_missing"}
     return {"matches": True, "reason": ""}
+
+
+# ---- the release record (DESIGN §1.8) ------------------------------------------------------------
+def release_record_path(capture: str | os.PathLike[str] | bytes, incarnation: str) -> bytes:
+    target = os.fsencode(os.fspath(capture)) if not isinstance(capture, bytes) else capture
+    return target + b".release." + incarnation.encode() + b".json"
+
+
+def make_release_record(*, fence: str, fence_file_sha256: str, release_nonce: str, offset_r: int,
+                        retained_tail_bytes: int, retained_tail_sha256: str,
+                        custodian: Mapping[str, Any], custodian_role: str, state: str,
+                        published_at: str) -> dict[str, Any]:
+    return {"schema": RELEASE_BOUNDARY_SCHEMA, "fence": fence,
+            "fence_file_sha256": fence_file_sha256, "release_nonce": release_nonce,
+            "offset_r": int(offset_r), "retained_tail_bytes": int(retained_tail_bytes),
+            "retained_tail_sha256": retained_tail_sha256, "custodian": dict(custodian),
+            "custodian_role": custodian_role, "state": state, "published_at": published_at}
+
+
+def write_release_record(path: str | os.PathLike[str] | bytes, record: Mapping[str, Any]) -> bool:
+    if record.get("schema") != RELEASE_BOUNDARY_SCHEMA:
+        raise ValueError("not a release record")
+    return publish_exclusive(path, json.dumps(record, sort_keys=True).encode())
+
+
+def read_release_record(path: str | os.PathLike[str] | bytes, *, fence: str) -> dict[str, Any]:
+    target = os.fsencode(os.fspath(path)) if not isinstance(path, bytes) else path
+    got = _read_json_record(target, RELEASE_BOUNDARY_SCHEMA)
+    if got["outcome"] != "present":
+        return got
+    if got["record"].get("fence") != fence:
+        return {"outcome": "foreign", "record": None, "detail": "release record of another incarnation"}
+    return {"outcome": EVIDENCE_FINAL, "record": got["record"], "detail": ""}
+
+
+def verify_release_record(record: Mapping[str, Any], *, capture: bytes, fence_path: bytes,
+                          fence_record: Mapping[str, Any]) -> dict[str, Any]:
+    """[FORKED-SAFE] REVIEW_IMPLEMENTATION F-003: join a release record to the SAME proof --
+    the fence file digest it cites, the fence's nonce and boundary N, and the retained tail
+    ``capture[N+marker_len : R)`` recomputed from the capture bytes.  ``{"matches", "reason"}``."""
+    boundary = fence_record.get("boundary") if isinstance(fence_record.get("boundary"), dict) else {}
+    offset_n = int(boundary.get("offset_n", -1))
+    marker_len = int(boundary.get("marker_len") or 0)
+    if record.get("release_nonce") != boundary.get("marker_nonce"):
+        return {"matches": False, "reason": "release_nonce_mismatch"}
+    try:
+        if record.get("fence_file_sha256") != file_digest(fence_path):
+            return {"matches": False, "reason": "fence_file_digest_mismatch"}
+    except OSError:
+        return {"matches": False, "reason": "fence_file_unreadable"}
+    r = int(record.get("offset_r", -1))
+    if r <= offset_n or r > len(capture):
+        return {"matches": False, "reason": "offset_r_outside_capture"}
+    found, _length, state = find_release_marker(capture, str(record.get("release_nonce") or ""), after=offset_n)
+    if state != EVIDENCE_FINAL or found != r:
+        return {"matches": False, "reason": "release_marker_" + ("duplicated" if state == EVIDENCE_INCONSISTENT else "absent_or_moved")}
+    tail = capture[offset_n + marker_len:r]
+    if len(tail) != int(record.get("retained_tail_bytes", -1)):
+        return {"matches": False, "reason": "retained_tail_length_mismatch"}
+    if hashlib.sha256(tail).hexdigest() != record.get("retained_tail_sha256"):
+        return {"matches": False, "reason": "retained_tail_digest_mismatch"}
+    return {"matches": True, "reason": ""}
+
+
+def file_digest(path: str | os.PathLike[str] | bytes) -> str:
+    target = os.fsencode(os.fspath(path)) if not isinstance(path, bytes) else path
+    size = _file_size(target)
+    return file_prefix_digest(target, size) if size >= 0 else ""
+
+
+def recover_release_boundary(capture: bytes, nonce: str, offset_n: int, *,
+                             release_record_present: bool) -> tuple[int, int, str, str | None]:
+    """DESIGN §1.8: ``(R, marker_len, state, outcome)`` -- R from the capture when the RELEASE
+    marker is present (the retained tail is then provable exactly as on the live path); absent
+    → the retention boundary is UNKNOWN (`diagnostic_tail_unaccounted`, plus
+    `release_record_missing` when no record exists either).  `[0,N)` is untouched either way."""
+    r, length, state = find_release_marker(capture, nonce, after=offset_n)
+    if state == EVIDENCE_FINAL:
+        return r, length, state, None
+    if state == EVIDENCE_INCONSISTENT:
+        return -1, 0, state, OUTCOME_DIAGNOSTIC_TAIL_UNACCOUNTED
+    return -1, 0, EVIDENCE_UNKNOWN, (OUTCOME_DIAGNOSTIC_TAIL_UNACCOUNTED if release_record_present
+                                     else OUTCOME_RELEASE_RECORD_MISSING)
+
+
+# ---- finalizer owner generations (DESIGN §2.5) -----------------------------------------------------
+def owner_generation_path(directory: str | os.PathLike[str] | bytes, incarnation: str,
+                          generation: int) -> bytes:
+    base = os.fsencode(os.fspath(directory)) if not isinstance(directory, bytes) else directory
+    return os.path.join(base, b"owner." + incarnation.encode() + b".g" + str(int(generation)).encode())
+
+
+def relinquish_path(directory: str | os.PathLike[str] | bytes, incarnation: str,
+                    generation: int) -> bytes:
+    base = os.fsencode(os.fspath(directory)) if not isinstance(directory, bytes) else directory
+    return os.path.join(base, b"relinquish." + incarnation.encode() + b".g" + str(int(generation)).encode())
+
+
+def read_generations(directory: str | os.PathLike[str] | bytes, incarnation: str
+                     ) -> tuple[int, dict[str, Any] | None, str]:
+    """``(highest_generation, highest_record, state)``: the highest LINKED generation for this
+    incarnation (0 when none); ``state`` is ``final`` (readable) or ``unreadable``."""
+    base = os.fsencode(os.fspath(directory)) if not isinstance(directory, bytes) else directory
+    prefix = b"owner." + incarnation.encode() + b".g"
+    try:
+        names = os.listdir(base)
+    except OSError:
+        return 0, None, EVIDENCE_UNREADABLE
+    highest, record = 0, None
+    for name in names:
+        if not name.startswith(prefix) or b".tmp." in name:
+            continue
+        try:
+            generation = int(name[len(prefix):])
+        except ValueError:
+            continue
+        if generation > highest:
+            got = _read_json_record(os.path.join(base, name), FINALIZER_OWNER_SCHEMA)
+            if got["outcome"] != "present":
+                return 0, None, EVIDENCE_UNREADABLE
+            highest, record = generation, got["record"]
+    return highest, record, EVIDENCE_FINAL
+
+
+def make_owner_generation(*, fence: str, generation: int, owner_role: str,
+                          owner: Mapping[str, Any], claim_reason: str,
+                          superseded: Mapping[str, Any] | None, death_evidence: str,
+                          claimed_at: str) -> dict[str, Any]:
+    return {"schema": FINALIZER_OWNER_SCHEMA, "fence": fence, "generation": int(generation),
+            "owner_role": owner_role, "owner": dict(owner), "claimed_at": claimed_at,
+            "claim_reason": claim_reason,
+            "superseded": dict(superseded) if superseded else None,
+            "death_evidence": death_evidence}
+
+
+def claim_target(evidence: Mapping[str, Any]) -> int:
+    """DESIGN §2.5 rule 3: the ONLY generation a claim carrying ``evidence`` may link."""
+    return int(evidence["predecessor_generation"]) + 1
+
+
+def validate_claim(record: Mapping[str, Any], evidence: Mapping[str, Any], *,
+                   highest_linked_now: int) -> str | None:
+    """Refuse by name (`owner_conflict`) a link that is not exactly predecessor+1 for the pinned
+    predecessor, or attempted after another generation superseded that predecessor."""
+    if int(record.get("generation", -1)) != claim_target(evidence):
+        return OUTCOME_OWNER_CONFLICT
+    predecessor = evidence.get("predecessor") or {}
+    if int(evidence["predecessor_generation"]) > 0:
+        superseded = record.get("superseded") or {}
+        if (superseded.get("pid"), superseded.get("start_id")) != (predecessor.get("pid"), predecessor.get("start_id")):
+            return OUTCOME_OWNER_CONFLICT
+    if int(highest_linked_now) != int(evidence["predecessor_generation"]):
+        return OUTCOME_OWNER_CONFLICT
+    return None
+
+
+def may_claim_generation(*, fence_published: bool, highest_owner_alive: bool | None,
+                         relinquish_record: bool, death_witness: str) -> tuple[str, str | None]:
+    """DESIGN §2.5 rules 1-2.  ``("custodian"|"claim"|"refuse", outcome)``.
+    Terminal rule: once a fence is published NO generation may be claimed -- a later actor is a
+    CUSTODIAN (release/cleanup only).  Death rule: guard EOF is relinquishment-or-death; a claim
+    needs the owner's durable relinquishment record or an incarnation-bound death witness in
+    state ``final``; anything else refuses by name."""
+    if fence_published:
+        if highest_owner_alive and not relinquish_record:
+            return "custodian", OUTCOME_FENCE_PUBLISHED_NO_CLAIM
+        return "custodian", None
+    if relinquish_record:
+        return "claim", None
+    # REVIEW_IMPLEMENTATION F-002: a POSITIVELY LIVE highest owner is refused BEFORE any death
+    # witness is consulted -- a witness can only ever be for the owner it was registered on,
+    # and the caller must have re-bound it to the highest owner's identity (`witness_for`);
+    # a live owner with a "final" witness is a contradiction, never a claim.
+    if highest_owner_alive:
+        return "refuse", OUTCOME_FINALIZER_ALIVE
+    if death_witness == EVIDENCE_FINAL:
+        return "claim", None
+    if death_witness in (EVIDENCE_UNREADABLE, EVIDENCE_INCONSISTENT):
+        return "refuse", "identity_unreadable"
+    return "refuse", OUTCOME_SUCCESSION_UNWITNESSED
+
+
+def claim_generation(directory: str | os.PathLike[str] | bytes, incarnation: str,
+                     record: Mapping[str, Any], evidence: Mapping[str, Any]) -> str | None:
+    """[FORKED-SAFE] Validate the claim against the pinned evidence and the generations linked
+    NOW, then link it exclusively.  ``None`` = won; else the named refusal."""
+    if record.get("schema") != FINALIZER_OWNER_SCHEMA:
+        raise ValueError("not an owner generation record")
+    highest, _rec, state = read_generations(directory, incarnation)
+    if state != EVIDENCE_FINAL:
+        return "identity_unreadable"
+    why = validate_claim(record, evidence, highest_linked_now=highest)
+    if why is not None:
+        return why
+    target = owner_generation_path(directory, incarnation, int(record["generation"]))
+    if publish_exclusive(target, json.dumps(record, sort_keys=True).encode()):
+        return None
+    return OUTCOME_OWNER_CONFLICT
+
+
+def write_relinquish(directory: str | os.PathLike[str] | bytes, incarnation: str, *,
+                     fence: str, generation: int, owner: Mapping[str, Any], reason: str,
+                     written_at: str) -> bool:
+    record = {"schema": RELINQUISH_SCHEMA, "fence": fence, "generation": int(generation),
+              "owner": dict(owner), "reason": reason, "written_at": written_at}
+    return publish_exclusive(relinquish_path(directory, incarnation, generation),
+                             json.dumps(record, sort_keys=True).encode())
+
+
+def read_relinquish(directory: str | os.PathLike[str] | bytes, incarnation: str,
+                    generation: int) -> dict[str, Any]:
+    return _read_json_record(relinquish_path(directory, incarnation, generation), RELINQUISH_SCHEMA)
 
 
 def meta_path_for(path: str | os.PathLike[str]) -> Path:
@@ -1171,6 +1744,231 @@ def protocol_lines(text: str) -> list[str]:
     return pieces
 
 
+#: REVIEW_IMPLEMENTATION_iteration8 F-015 -- the framing scan's bounds.  A scan that reaches
+#: any of them is INCOMPLETE and says so (`EmbeddedScan.complete == False`); the selector turns
+#: that into the named outcome `record_scan_incomplete` (LOST), never into "no candidates".
+#: Objects: every JSON object EXAMINED (top-level and nested) across the whole fenced range;
+#: depth: nesting the traversal will descend; bytes: characters the balanced-object finder may
+#: visit in total (the finder re-scans after an unbalanced `{`, so this bounds its worst case
+#: independently of the capture's own byte limit).
+EMBEDDED_SCAN_OBJECT_LIMIT = 65_536
+EMBEDDED_SCAN_DEPTH_LIMIT = 64
+EMBEDDED_SCAN_BYTE_BUDGET = 64 * 1024 * 1024
+SCAN_INCOMPLETE_OBJECTS = "object_limit"
+SCAN_INCOMPLETE_DEPTH = "depth_limit"
+SCAN_INCOMPLETE_BYTES = "byte_budget"
+#: REVIEW_IMPLEMENTATION_iteration2 (run_5fcd2beac376) F-017 / F-015: the JSON parser gave up on a
+#: candidate for a reason that is NOT a syntax rejection -- an allocation failure
+#: (`MemoryError`) or a value-conversion failure that is not `JSONDecodeError` -- so the
+#: candidate is UNEXAMINED, never "invalid prose"
+SCAN_INCOMPLETE_RESOURCE = "resource_limit"
+SCAN_INCOMPLETE_CONVERSION = "conversion_limit"
+#: REVIEW_IMPLEMENTATION_iteration2 F-015: the reader's integer-conversion budget.  A JSON
+#: integer token longer than this is kept as an UNCONVERTED digit string (a `str` subclass,
+#: :class:`UnconvertedInteger`) instead of being converted -- the object is still parsed
+#: whole, so a refusal it carries is recognised; the interpreter's own `int(...)` string
+#: limit (4,300 digits by default) is never reached and never raises.  Python 3.11+ raises
+#: `ValueError` (not `JSONDecodeError`) from `json.loads` for a longer token; the i2 parsers
+#: read that as "invalid prose" and an earlier success won over a bound refusal.
+INTEGER_DIGIT_BUDGET = 4_000
+
+
+class UnconvertedInteger(str):
+    """A JSON integer token the reader did not convert (longer than
+    :data:`INTEGER_DIGIT_BUDGET` digits): its digits, as a string, so a record carrying it is
+    still examined whole.  Never compared as a number by this runtime."""
+    __slots__ = ()
+
+
+def _bounded_int(token: str) -> Any:
+    return int(token) if len(token) <= INTEGER_DIGIT_BUDGET else UnconvertedInteger(token)
+
+
+class ParseFailure(Exception):
+    """The JSON parser could not EXAMINE a candidate for a reason that is not a syntax
+    rejection: ``reason`` is one of `resource_limit` (`MemoryError`), `depth_limit`
+    (`RecursionError`), `conversion_limit` (a `ValueError` that is not `JSONDecodeError`,
+    i.e. a value the parser accepted syntactically but could not convert)."""
+
+    def __init__(self, reason: str, detail: str = "") -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.detail = detail
+
+
+def parse_json(text: str) -> Any:
+    """`json.loads` with the reader's bounded integer conversion; raises `json.JSONDecodeError`
+    for a SYNTAX rejection and :class:`ParseFailure` for everything else the parser can fail
+    with (allocation, depth, conversion) -- never any other exception.  THE one JSON entry
+    point of every reader on the settlement / readiness path (F-017: total by construction;
+    a seam for the resource-failure locks)."""
+    try:
+        return json.loads(text, parse_int=_bounded_int)
+    except json.JSONDecodeError:
+        raise
+    except MemoryError as exc:
+        raise ParseFailure(SCAN_INCOMPLETE_RESOURCE, type(exc).__name__) from None
+    except RecursionError as exc:
+        raise ParseFailure(SCAN_INCOMPLETE_DEPTH, type(exc).__name__) from None
+    except ValueError as exc:
+        raise ParseFailure(SCAN_INCOMPLETE_CONVERSION, f"{type(exc).__name__}: {exc}"[:200]) from None
+
+
+class ScanBudget:
+    """The mutable bound one framing scan shares across every unparsable run of a fenced
+    range: `objects` and `chars` count DOWN; `exhausted` names the first bound reached."""
+
+    def __init__(self, *, objects: int | None = None, depth: int | None = None,
+                 chars: int | None = None) -> None:
+        # the module bounds are read at construction (a lock may lower them by patching)
+        self.objects = int(EMBEDDED_SCAN_OBJECT_LIMIT if objects is None else objects)
+        self.depth = int(EMBEDDED_SCAN_DEPTH_LIMIT if depth is None else depth)
+        self.chars = int(EMBEDDED_SCAN_BYTE_BUDGET if chars is None else chars)
+        self.exhausted = ""
+
+    def spend_chars(self, n: int) -> bool:
+        self.chars -= int(n)
+        if self.chars < 0 and not self.exhausted:
+            self.exhausted = SCAN_INCOMPLETE_BYTES
+        return self.chars >= 0
+
+    def spend_object(self) -> bool:
+        self.objects -= 1
+        if self.objects < 0 and not self.exhausted:
+            self.exhausted = SCAN_INCOMPLETE_OBJECTS
+        return self.objects >= 0
+
+
+class EmbeddedScan(TypedDict):
+    """`embedded_scan`'s answer: every object EXAMINED (top-level and nested, traversal order),
+    whether the scan COMPLETED, and -- when it did not -- the bound it hit."""
+    objects: list[dict[str, Any]]
+    complete: bool
+    reason: str
+    examined: int
+
+
+def walk_nested_objects(root: Any, out: list[dict[str, Any]], budget: ScanBudget) -> bool:
+    """Every dict reachable from ``root`` through dicts and lists, breadth-first per level,
+    appended to ``out`` -- NEVER through a string: a JSON string literal is data, whatever it
+    spells (a serialized record inside a string is not a record).  ``False`` when the object or
+    depth bound stops the walk before every dict was examined."""
+    level: list[Any] = [root]
+    depth = 0
+    while level:
+        if depth > budget.depth:
+            if not budget.exhausted:
+                budget.exhausted = SCAN_INCOMPLETE_DEPTH
+            return False
+        nxt: list[Any] = []
+        for node in level:
+            if isinstance(node, dict):
+                if not budget.spend_object():
+                    return False
+                out.append(node)
+                nxt.extend(v for v in node.values() if isinstance(v, (dict, list)))
+            elif isinstance(node, list):
+                nxt.extend(v for v in node if isinstance(v, (dict, list)))
+        level = nxt
+        depth += 1
+    return True
+
+
+def embedded_scan(text: str, *, budget: ScanBudget | None = None) -> EmbeddedScan:
+    """REVIEW_IMPLEMENTATION_iteration7/8 F-015: every JSON OBJECT embedded anywhere in ``text``
+    (a run of lines that do not parse as records) -- a helper prefix (`progress: {...}`), a
+    suffix, a record split across lines, a cooperative WRAPPER closed later (`{"progress": `
+    + the root's own record + `}`) -- each balanced top-level object (string- and escape-aware,
+    `json.loads`-accepted) AND every object nested inside it through dicts and lists, in
+    order.  NOT a parser of records: what it yields is evidence that a completion-SHAPED or
+    refusing object exists where the record grammar sees prose.
+
+    BOUNDED and HONEST about it (i8): the shared ``budget`` limits the objects examined, the
+    nesting descended and the characters the finder visits; reaching any bound ends the scan
+    with ``complete == False`` and the bound's name -- the remainder was NOT examined, and a
+    caller must never read an incomplete scan as "no candidate".  A string literal's contents
+    are never descended or re-parsed."""
+    budget = budget or ScanBudget()
+    out: list[dict[str, Any]] = []
+    complete = True
+    i, n = 0, len(text)
+    while i < n:
+        start = text.find("{", i)
+        if start < 0:
+            break
+        depth, j, in_str, esc = 0, start, False, False
+        end = -1
+        while j < n:
+            ch = text[j]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+            elif ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = j
+                    break
+            j += 1
+        if not budget.spend_chars(j - start + 1):
+            complete = False
+            break
+        if end < 0:
+            i = start + 1
+            continue
+        try:
+            candidate = parse_json(text[start:end + 1])
+        except json.JSONDecodeError:
+            i = start + 1                                  # a syntax rejection: not an object
+            continue
+        except ParseFailure as failure:
+            # the parser gave up for a NON-syntax reason (allocation / depth / conversion):
+            # the candidate is UNEXAMINED by construction, never invalid prose
+            budget.exhausted = budget.exhausted or failure.reason
+            complete = False
+            break
+        if isinstance(candidate, dict):
+            if not walk_nested_objects(candidate, out, budget):
+                complete = False
+                break
+            i = end + 1
+        else:
+            i = start + 1
+    return {"objects": out, "complete": complete and not budget.exhausted,
+            "reason": budget.exhausted if (not complete or budget.exhausted) else "",
+            "examined": len(out)}
+
+
+def embedded_objects(text: str, *, limit: int = EMBEDDED_SCAN_OBJECT_LIMIT) -> list[dict[str, Any]]:
+    """The objects of :func:`embedded_scan` over ``text`` alone (a convenience for readers that
+    want the list; production selection reads the SCAN, whose completeness it must not drop)."""
+    return embedded_scan(text, budget=ScanBudget(objects=limit))["objects"]
+
+
+def unparsable_runs(text: str) -> list[str]:
+    """The maximal runs of consecutive lines of ``text`` that are NOT records (joined with
+    the delimiter): what :func:`embedded_scan` scans (F-015).  A record split across two
+    lines is one run; a helper prefix on a record line is one run."""
+    runs: list[list[str]] = []
+    current: list[str] = []
+    for parsed, raw in structured_lines(text):
+        if parsed is None:
+            current.append(raw)
+        elif current:
+            runs.append(current)
+            current = []
+    if current:
+        runs.append(current)
+    return ["\n".join(run) for run in runs]
+
+
 def structured_lines(text: str) -> tuple[tuple[dict[str, Any] | None, str], ...]:
     """Split a captured stream into ``(parsed-JSON-or-None, raw-line)`` pairs.
 
@@ -1179,21 +1977,76 @@ def structured_lines(text: str) -> tuple[tuple[dict[str, Any] | None, str], ...]
     would make the capture disagree with the file it came from.  Split on the protocol
     delimiter only (:func:`protocol_lines`), never on Unicode line separators inside a
     record.
+
+    REVIEW_IMPLEMENTATION (run_5fcd2beac376) F-017: this is the FIRST parser every reader
+    of the stream reaches (readiness, refusal evidence, completion selection), so a line the
+    JSON parser cannot follow to the end -- a nesting depth past the interpreter's recursion
+    limit raises ``RecursionError``, not ``ValueError`` -- must never escape as an untyped
+    exception.  Such a line is kept as an UNPARSABLE line (``None``), which routes it into the
+    bounded framing scan (:func:`embedded_scan`), where the same depth failure is the named
+    ``depth_limit`` and the settlement is `record_scan_incomplete` (LOST), never COMPLETED.
     """
     out: list[tuple[dict[str, Any] | None, str]] = []
     for line in protocol_lines(text):
         stripped = line.strip()
         if not stripped:
             continue
-        parsed: dict[str, Any] | None = None
-        if stripped[0] in "{[":
-            try:
-                candidate = json.loads(stripped)
-                parsed = candidate if isinstance(candidate, dict) else None
-            except ValueError:
-                parsed = None
-        out.append((parsed, line))
+        out.append((parse_record_line(stripped), line))
     return tuple(out)
+
+
+def parse_record_line(stripped: str) -> dict[str, Any] | None:
+    """One stripped line as a JSON OBJECT record, or ``None`` -- for a non-JSON line, a JSON
+    value that is not an object, and a line the parser could not examine (F-017 depth /
+    allocation, F-015 conversion: see :func:`line_parse_failure`, which names WHY so that no
+    caller reads such a line as harmless prose).  Total over its input: no exception leaves
+    this function for any text."""
+    parsed, _failure = _parse_record_line(stripped)
+    return parsed
+
+
+def _parse_record_line(stripped: str) -> "tuple[dict[str, Any] | None, str]":
+    """``(record-or-None, failure reason)``: the reason is ``""`` for a syntax rejection /
+    a non-object / a non-JSON line, else the :class:`ParseFailure` reason."""
+    if not stripped or stripped[0] not in "{[":
+        return None, ""
+    try:
+        candidate = parse_json(stripped)
+    except json.JSONDecodeError:
+        return None, ""
+    except ParseFailure as failure:
+        return None, failure.reason
+    return (candidate if isinstance(candidate, dict) else None), ""
+
+
+def structured_lines_with_failures(text: str) -> "tuple[tuple[dict[str, Any] | None, str, str], ...]":
+    """:func:`structured_lines` with a third element per line: ``""`` or the reason the record
+    parser could not EXAMINE the line (`resource_limit` / `depth_limit` / `conversion_limit`)
+    -- for readers that must stop at such a line instead of reading it as prose."""
+    out: list[tuple[dict[str, Any] | None, str, str]] = []
+    for line in protocol_lines(text):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        parsed, reason = _parse_record_line(stripped)
+        out.append((parsed, line, reason))
+    return tuple(out)
+
+
+def line_parse_failures(text: str) -> list[dict[str, Any]]:
+    """REVIEW_IMPLEMENTATION_iteration2 F-017 / F-015: every line of ``text`` the record parser
+    could not EXAMINE (allocation / depth / conversion), as ``{"index", "reason"}`` -- the
+    evidence a scan needs to declare itself incomplete instead of treating the line as prose
+    and the range as fully examined."""
+    out: list[dict[str, Any]] = []
+    for index, line in enumerate(protocol_lines(text)):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        _parsed, reason = _parse_record_line(stripped)
+        if reason:
+            out.append({"index": index, "reason": reason})
+    return out
 
 
 def redacted_summary(store: BoundedCapture, env_names: Mapping[str, Any] | None = None) -> dict[str, Any]:

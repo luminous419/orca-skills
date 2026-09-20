@@ -34,6 +34,7 @@ import time
 from collections.abc import Mapping, Sequence
 from typing import Any, TypedDict
 
+from . import standalone_capture as capture_mod
 from . import standalone_identity as identity
 from . import standalone_pty as pty_supervisor
 from .standalone_lifecycle import INTERRUPT_OUTCOMES
@@ -93,7 +94,8 @@ def _result(intent_id: str, reason: str, outcome: str,
             "ladder": tuple(ladder)}
 
 
-def observed_row(snapshot: Mapping[str, Any], pid: int) -> Mapping[str, Any] | None:
+def observed_row(snapshot: Mapping[str, Any], pid: int,
+                 identity_reader: Any = None) -> Mapping[str, Any] | None:
     """The row for ``pid``, ``{}`` when the table was READ and holds no such pid, ``None``
     only when the table could not be read.  Finding 16.
 
@@ -105,7 +107,20 @@ def observed_row(snapshot: Mapping[str, Any], pid: int) -> Mapping[str, Any] | N
     """
     if not snapshot.get("readable", False):
         return None
-    return pty_supervisor.row_for(snapshot, pid) or {}
+    row = pty_supervisor.row_for(snapshot, pid)
+    if row is None:
+        return {}
+    # OS-48 DESIGN §2.1: the identity axes are read AT DECISION TIME by the platform
+    # evidence source (never from `ps`) and carried on the observed row; `verify` requires
+    # them.  `identity_reader` is a seam so a lock can model reuse / unreadable identity.
+    observed = dict(row)
+    if "start_id" not in observed:
+        # An INJECTED table (a lock) may carry the identity axes on its rows; a real one
+        # never does (`ps` reports none), so the evidence source is consulted.
+        reader = identity_reader or pty_supervisor.read_identity
+        observed.update(reader(pid))
+    observed.setdefault("start_state", capture_mod.EVIDENCE_FINAL if observed.get("start_id") else capture_mod.EVIDENCE_UNREADABLE)
+    return observed
 
 
 class Gate:
@@ -119,10 +134,11 @@ class Gate:
 
     def __init__(self, record: Mapping[str, Any], profile: StandaloneProfile, *,
                  table_reader: Any = None, supervisor_pid: int | None = None,
-                 drain: Any = None) -> None:
+                 drain: Any = None, identity_reader: Any = None) -> None:
         self.record = record
         self.profile = profile
         self._table_reader = table_reader or pty_supervisor.read_process_table
+        self.identity_reader = identity_reader or pty_supervisor.read_identity
         self._supervisor_pid = supervisor_pid
         # A TEARDOWN OBLIGATION, not a convenience.  An exiting session leader whose pty
         # slave holds unflushed output and whose master nobody reads wedges in the kernel's
@@ -166,7 +182,8 @@ def interrupt(intent_id: str, reason: str, *, record: Mapping[str, Any],
               table_reader: Any = None, supervisor_pid: int | None = None,
               killpg: Any = None, kill: Any = None,
               write_hint: Any = None, sleep: Any = None,
-              clock: Any = None, drain: Any = None) -> InterruptResult:
+              clock: Any = None, drain: Any = None,
+              identity_reader: Any = None, watcher: Any = None) -> InterruptResult:
     """Run the ladder.  Every rung is gated; nothing happens before re-verification.
 
     ``killpg``/``kill``/``write_hint``/``sleep``/``clock`` are injectable so the whole
@@ -182,7 +199,7 @@ def interrupt(intent_id: str, reason: str, *, record: Mapping[str, Any],
     now = clock or time.time
     pause = sleep or time.sleep
     gate = Gate(record, profile, table_reader=table_reader, supervisor_pid=supervisor_pid,
-                drain=drain)
+                drain=drain, identity_reader=identity_reader)
     ladder: list[LadderStep] = []
 
     # -- G0: the seven never-touch obligations -------------------------------------------
@@ -190,7 +207,7 @@ def interrupt(intent_id: str, reason: str, *, record: Mapping[str, Any],
     if first["unreadable"]:
         ladder.append(_step("G1", verified=False, detail="process_table_unreadable"))
         return _result(intent_id, reason, "not_owned", ladder)
-    observed = observed_row(first["snapshot"], int(record["pid"]))
+    observed = observed_row(first["snapshot"], int(record["pid"]), gate.identity_reader)
     if observed == {}:
         # Finding 16.  The table was READ and this pid is not on the captured tty.  That is
         # not "unreadable" and it is not "not ours": it is the proof-of-exit question,
@@ -226,7 +243,7 @@ def interrupt(intent_id: str, reason: str, *, record: Mapping[str, Any],
     # -- rung 1: graceful SIGTERM ----------------------------------------------------------
     sent = pty_supervisor.signal_target(
         record, first["decision"], pty_supervisor.graceful_signal(), permit=permit,
-        snapshot=first["snapshot"], killpg=killpg, kill=kill)
+        snapshot=first["snapshot"], killpg=killpg, kill=kill, watcher=watcher)
     # Finding 11: from here on a refusal is reported against the fact that a signal WAS
     # delivered.  `sent` lists what actually reached a process; the withheld exit watcher
     # is listed by name and does not count.
@@ -284,7 +301,7 @@ def interrupt(intent_id: str, reason: str, *, record: Mapping[str, Any],
                             else (second["decision"]["refusal"] or "not_owned")))
         return _result(intent_id, reason, "not_owned", ladder, signalled=signalled)
     ladder.append(_step("G2", verified=True))
-    observed2 = observed_row(second["snapshot"], int(record["pid"]))
+    observed2 = observed_row(second["snapshot"], int(record["pid"]), gate.identity_reader)
     try:
         permit2 = identity.assert_may_act(record, "signal", observed=observed2)
     except identity.OwnershipRefused as exc:
@@ -296,7 +313,7 @@ def interrupt(intent_id: str, reason: str, *, record: Mapping[str, Any],
     max_attempts = 2
     forced = pty_supervisor.signal_target(
         record, second["decision"], pty_supervisor.force_signal(), permit=permit2,
-        snapshot=second["snapshot"], killpg=killpg, kill=kill)
+        snapshot=second["snapshot"], killpg=killpg, kill=kill, watcher=watcher)
     attempts += 1
     delivered = [step for step in forced["sent"] if step.get("result") == "sent"]
     ladder.append(_step("rung_3_force", verified=True,
@@ -307,7 +324,7 @@ def interrupt(intent_id: str, reason: str, *, record: Mapping[str, Any],
         # reporting a termination that was never sent.
         rearm = gate.evaluate()
         if not rearm["unreadable"] and rearm["decision"]["verdict"] == "owned":
-            observed3 = observed_row(rearm["snapshot"], int(record["pid"]))
+            observed3 = observed_row(rearm["snapshot"], int(record["pid"]), gate.identity_reader)
             try:
                 permit3 = identity.assert_may_act(record, "signal", observed=observed3)
             except identity.OwnershipRefused:
@@ -315,7 +332,8 @@ def interrupt(intent_id: str, reason: str, *, record: Mapping[str, Any],
             if permit3 is not None:
                 forced = pty_supervisor.signal_target(
                     record, rearm["decision"], pty_supervisor.force_signal(),
-                    permit=permit3, snapshot=rearm["snapshot"], killpg=killpg, kill=kill)
+                    permit=permit3, snapshot=rearm["snapshot"], killpg=killpg, kill=kill,
+                    watcher=watcher)
                 attempts += 1
                 ladder.append(_step("rung_3_force", verified=True,
                                     detail=f"re-armed attempt={attempts} "

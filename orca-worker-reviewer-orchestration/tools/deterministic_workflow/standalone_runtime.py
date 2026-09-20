@@ -21,11 +21,14 @@ process can re-query all of it.
 from __future__ import annotations
 
 import errno
+import hashlib
+import json
 import os
 import select
 import subprocess
 import sys
 import time
+import uuid
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, TypedDict
@@ -220,40 +223,25 @@ class StartReceipt(TypedDict):
     teardown: str             # "proven" | "not_required"
 
 
-#: Round-9 item 1.  The ONE positive finality: a fenced CAPTURE-FINALIZED proof on disk
-#: that binds the capture as it is.  Every other `finality` value is a refusal by name.
+#: OS-48 DESIGN §1.5.  The ONE positive finality: a verified CAPTURE FENCE on disk
+#: (`os48.capture_fence.v1`) that binds the settlement boundary N and sha256(capture[0:N)) to
+#: the pinned emitter's proven exit and to the finalizing owner generation.  Every other
+#: `finality` value is a refusal by name.  The constant's NAME is kept from round 9 (its
+#: consumers are the same); its MEANING is the fence, never a hangup or a scan.
 FINALITY_CAPTURE_FINALIZED = "capture_finalized"
 
 
 def _stream_is_final(drained: Mapping[str, Any]) -> bool:
-    """Round-9 item 1: the ONE rule for "the pty stream's end was positively observed" --
-    the fenced CAPTURE-FINALIZED proof (`standalone_capture.write_capture_finalized`)
-    exists and binds the capture on disk.  A supervising session writes it itself, after
-    the HANGUP it read (EOF / ``EIO``) and after its last append and meta reached stable
-    storage; an adopted session -- no master in this process -- finds the one the exit
-    watcher wrote after ITS final drain, meta save and fsync, before the sentinel.  The
-    exit SENTINEL alone is NOT final (round-8 iteration 3 accepted it, and the watcher
-    writes it without draining whenever the supervisor was alive at the exit -- a
-    supervisor that then died before its own drain left a truncated capture that a
-    successor settled from).  ``budget``, ``master_unreadable``, a masterless session
-    with a sentinel but no proof, and a proof that does not match the capture are all
-    refused."""
+    """OS-48: the ONE rule for "the authoritative boundary is proven" -- a verified fence on
+    disk (:func:`standalone_capture.fence_matches`) bound to this incarnation.  ``budget``,
+    ``master_unreadable``, a masterless session with a sentinel but no fence, a legacy
+    os37 finalized record, a foreign fence, a mismatching fence and a boundary a successor
+    cannot find in the capture are all refused by name."""
     return drained.get("finality") == FINALITY_CAPTURE_FINALIZED
 
 
-def _holder_state_now(holders: Mapping[str, Any]) -> str:
-    """The tri-state absence verdict of the COMPLETE fail-closed ``libproc`` slave-descriptor
-    authority (iteration 4, option B): ``present`` (a process other than the exited agent and
-    the deferring watcher holds the slave DEVICE open -- on the tty or ``setsid``'d off it),
-    ``proven_absent`` (EVERY same-uid candidate's descriptors were read to completion and none
-    holds the slave), or ``unreadable`` (any candidate's enumeration failed for ANY reason --
-    a denied ``proc_pidinfo``, a growth failure, the listing itself: never a silent skip, and
-    UNREADABLE is never absence).  Only ``proven_absent`` -- a COMPLETE positive absence
-    obtained WHILE THE WATCHER IS HELD -- may authorise releasing the watcher so its revoke
-    delivers the real hangup; ``present`` and ``unreadable`` are both unproven and never
-    released.  ``ps``/``lsof``/tty membership authorise NOTHING (``lsof`` silently skips a
-    denied pid; this authority never does)."""
-    return str(holders.get("state") or "unreadable")
+#: F-010: how many unattributed fork records a residual repeats verbatim (the ledger keeps all).
+_DISCOVERY_FORKS_REPORTED = 16
 
 
 class StandaloneSession:
@@ -371,6 +359,23 @@ class StandaloneSession:
         #: follow-up review).  ``None`` until then.  Securing the lifecycle twice would
         #: re-run the ladder over a reclaimed pty, so the first proof is remembered.
         self.exit_proof: dict[str, Any] | None = None
+        #: OS-48 (DESIGN §1.5): the fence nonce, minted BEFORE the spawn and carried by the
+        #: spawn record + the journal `spawned` row; the settlement boundary N is where the
+        #: watcher's `marker_bytes(fence_nonce)` lands in the capture.
+        self.fence_nonce = uuid.uuid4().hex
+        #: The verified boundary once a fence is bound: {"offset_n", "marker_len", "fence"}.
+        self._boundary: dict[str, Any] | None = None
+        #: The release-boundary observation once the two-phase release ran.
+        self._release: dict[str, Any] | None = None
+        #: DESIGN §2.1: the platform evidence source's identity read at decision time (a seam:
+        #: a lock injects one to model reuse / unreadable identity without a real pid).
+        self._identity_reader = pty_supervisor.read_identity
+        #: The delivery baseline offset (DELIVERY_INTENT): settlement records are selected
+        #: over [baseline, N) only.
+        self._settlement_baseline = 0
+        #: OS-48 F-001: the `-o` sidecar frozen when the fence was bound (`_freeze_sidecar`).
+        self._sidecar_frozen: dict[str, Any] | None = None
+        self._sidecar_state: str = capture_mod.SIDECAR_STATE_NONE
         #: Round-8 iteration 2/3: how the post-exit drain ENDED (`hangup` / `budget` /
         #: `master_unreadable` / `no_master`, bytes, errno) -- recorded on the settlement
         #: row of the success AND the failure path, so the finality decision is auditable.
@@ -908,7 +913,10 @@ class StandaloneSession:
                 spawn_record_target=str(spawn_target), cwd=self.worktree_path,
                 argv_digest=argv_digest, env_digest=env_digest,
                 sentinel=str(sentinel), fence=self.fence,
-                image=self._resolved_binary())
+                image=self._resolved_binary(),
+                fence_nonce=self.fence_nonce,
+                supervisor_identity=self._self_identity(capture_mod.OWNER_SUPERVISOR),
+                sidecar_path=self.last_message_path)
         except pty_supervisor.SpawnHandoffFailed as exc:
             # Round 4, finding 4.  A leader was forked and an agent MAY have reached
             # `execve`; the parent just never learned its pid.  Nothing is settled from
@@ -923,6 +931,7 @@ class StandaloneSession:
                           state="FAILED", vocabulary={"spawn_error": str(exc)})
             return self._receipt("failed", "spawn_failed", teardown="not_required")
         self.pty = dict(session)
+        self.fence_nonce = str(self.pty.get("fence_nonce") or self.fence_nonce)
         # Finding 14.  The argv the kernel really loaded, kept where delivery verification
         # reads it (`self.pty["argv"]`), so the replay selector sees the same composed argv
         # preflight rehearsed rather than an empty tuple.
@@ -943,11 +952,23 @@ class StandaloneSession:
             argv_digest=argv_digest, env_digest=env_digest,
             created_by_this_runtime=True, resource_kind="pty_session",
             user_taken_over=False)
+        # OS-48 DESIGN §2.1: a PROVISIONAL identity read of the reported pid at once (the
+        # evidence source, at decision time), so a failed start whose child never reaches
+        # `execve` can still be torn down through an identity-checked ladder; the child's own
+        # spawn record supersedes it below and a disagreement is a refusal, never a bind.
+        provisional = self._identity_reader(int(session["pid"]))
+        if provisional.get("start_state") == capture_mod.EVIDENCE_FINAL:
+            self.record["proc_start_ticks"] = int(provisional["start_id"])
+            self.record["boot_id"] = str(provisional.get("boot_id") or "")
+            self.record["evidence_source"] = pty_supervisor.evidence_source_id()
         self._journal(kind="EVENT", derived_from="pty", event="spawned", state="STARTING",
                       vocabulary={"pty_id": session["pty_id"], "pid": session["pid"],
                                   "captured_tty": self.record["captured_tty"],
                                   "argv_digest": argv_digest, "env_digest": env_digest,
                                   "session_digest": argv_digest,
+                                  "fence_nonce": self.fence_nonce,
+                                  "supervisor_identity": self._self_identity(capture_mod.OWNER_SUPERVISOR),
+                                  "evidence_source": pty_supervisor.evidence_source_id(),
                                   **self._preflight_evidence,
                                   **self._terminal_provenance()})
 
@@ -1052,6 +1073,7 @@ class StandaloneSession:
                     "transport": pty_supervisor.echo_transport(
                         None, kind="argv", framed=False, cols=self.profile.cols),
                     "at": _now_iso()})
+                self._record_delivery()                   # PR #36 finding 4 (see `send`)
             admission = self.await_ready()
             if admission["state"] != "READY":
                 # ONE exception, and it is D4.3c's precedence rule rather than a loophole: a
@@ -1263,6 +1285,8 @@ class StandaloneSession:
             pid=pid, pgid=int(record.get("pgid") or pid), sid=int(record.get("sid") or pid),
             tty=tty, pty_id=pty_id, argv_digest=argv_digest, env_digest=env_digest)
         self._bind_start_identity(record)
+        if not record.get("fence_nonce") and vocab.get("fence_nonce"):
+            self.fence_nonce = str(vocab["fence_nonce"])
         # The state the journal last observed for this fence, so the settlement edge is
         # taken from where the crashed supervisor left off rather than from STARTING.
         last_row = next((row for row in reversed(mine) if row.get("state")), None)
@@ -1292,11 +1316,25 @@ class StandaloneSession:
         prior = self.journal.delivery_intent_for(self.intent_id)
         if prior is not None:
             self.delivery_intent = dict(prior.get("source_vocabulary") or {})
+        # OS-48 PR #36 finding 4: the payload-less delivery events the live session recorded
+        # before its prompt write are restored from the journal row.  run_c296ff67c325 (F-003):
+        # the restored events carry NO excision authority -- the unkeyed row's digests are
+        # diagnostic.  run_d6391487ff44 (the unkeyed `delivery_recorded.baseline` merge
+        # blocker): the baseline is NOT restored either -- the unkeyed row is no settlement
+        # authority, so this successor settles over the FULL fenced prefix [0, N) (baseline 0)
+        # and can only be stricter than live, never wider.  The row's baseline is kept as
+        # DIAGNOSTIC evidence (`journal_baseline_diagnostic`) and fed to nothing.
+        delivery = self._restore_delivery(mine)
         self._journal(kind="EVENT", derived_from="runtime_state", event="identity_bound",
                       state=self.state,
                       vocabulary={"adopted": True, "pid": pid, "captured_tty": tty,
                                   "pty_id": pty_id, "argv_digest": argv_digest,
                                   "spawn_record": record,
+                                  "settlement_baseline": int(self._settlement_baseline or 0),
+                                  "journal_baseline_diagnostic": delivery.get("journal_baseline_diagnostic"),
+                                  "delivery_events_restored": int(delivery["events"]),
+                                  "delivery_provenance": ("restored" if delivery["restored"]
+                                                          else delivery["reason"]),
                                   "detail": "a successor process reconstructed this "
                                             "dispatch from its durable spawn record and "
                                             "journal; nothing was spawned",
@@ -1342,9 +1380,9 @@ class StandaloneSession:
                 # Gone before any signal.  Give a still-live watcher its budget to land
                 # the sentinel, then take the table's proof as the exit proof.
                 leader = int(self.record.get("sid") or 0)
-                # Round-9 item 1: the watcher now drains TO THE HANGUP (bounded by the
-                # profile's post-exit drain budget) before it writes the sentinel, so a
-                # live watcher is given at least that bound plus a margin to land it.
+                # OS-48: the watcher writes the fence marker and then the sentinel right
+                # after its `waitpid`; a live watcher is given the drain bound plus a
+                # margin to land it (the bound also paces the two-phase release).
                 wait_ms = max(StandaloneRuntime.EXIT_EVIDENCE_BUDGET_MS,
                               self.profile.timeouts.post_exit_drain_budget_ms + 1_000)
                 deadline = self._clock() + wait_ms / 1000.0
@@ -1387,6 +1425,42 @@ class StandaloneSession:
                 "holds no channel to deliver it", dict(receipt))
         return self._complete(receipt, lease_token=lease_token, result_parser=result_parser)
 
+    @staticmethod
+    def _positive_selection_over_bound_fence(evidence: Mapping[str, Any],
+                                             boundary: "dict[str, Any] | None") -> bool:
+        """True when ``evidence`` was already a POSITIVE settlement selection taken over the
+        SAME verified immutable boundary that is now bound -- so a second scan of the identical
+        [baseline, N) bytes would be redundant and a later reader failure in it must not erase
+        the selection (run_7859f202457c F-017).
+
+        Positive = a refusal in the boundary, or a bound completion record (a `settlement_record`
+        the selector returned).  The named LOST selection outcomes (`provenance_ambiguous`,
+        `provenance_unbound`, `record_scan_incomplete`, `record_framing_ambiguous`) carry no
+        record and are NOT positive -- they are re-scanned as before.
+
+        Same boundary = both the prior evidence and the now-bound fence carry a boundary with an
+        equal `offset_n` AND an equal `sha256_prefix` (the fence digest).  A prior scan with no
+        boundary, or over a not-yet-verified / different range, is NOT kept: the legitimate
+        pre-fence supersession the double scan exists for still happens."""
+        if boundary is None:
+            return False
+        prior_boundary = evidence.get("boundary")
+        if not isinstance(prior_boundary, Mapping):
+            return False
+        now_fence = boundary.get("fence") or {}
+        now_prefix = ((now_fence.get("boundary") or {}).get("sha256_prefix"))
+        prior_fence = prior_boundary.get("fence") or {}
+        prior_prefix = ((prior_fence.get("boundary") or {}).get("sha256_prefix"))
+        if (prior_boundary.get("offset_n") != boundary.get("offset_n")
+                or not now_prefix or now_prefix != prior_prefix):
+            return False
+        if evidence.get("provenance_outcome") == capture_mod.OUTCOME_REFUSAL_IN_BOUNDARY:
+            return True
+        # a bound completion record the selector returned (outcome is None for a clean bind
+        # and for a sole error-field refusal, both of which carry the record); the LOST
+        # outcomes above all carry `settlement_record is None`.
+        return evidence.get("settlement_record") is not None
+
     def await_completion(self) -> dict[str, Any]:
         """Bounded wait for BOTH gates, then the profile's OWN success predicate.
 
@@ -1426,20 +1500,42 @@ class StandaloneSession:
                 # readable, and the "one last drain" here was `pump(timeout_ms=100)`,
                 # which breaks at the first 10 ms `select` silence -- the record was
                 # never read and the F06 dispatch settled FAILED over its penultimate
-                # record.  The stream's END is not silence but the pty HANGUP (EOF /
-                # EIO on the master once the last slave descriptor -- the agent's, and
-                # the watcher's own, which it closes right after the sentinel -- is
-                # gone), so the drain now reads TO THE HANGUP under a bound, whatever a
-                # record already present looks like: a candidate record seen before the
-                # hangup is not the final record until the hangup says so.
+                # record.  The stream's END is not silence and (OS-48) not a hangup either:
+                # it is the FENCE MARKER the watcher writes through its owner-held slave
+                # reference after reaping the root, so the drain reads TO THE MARKER under
+                # a bound, whatever a record already present looks like: a candidate record
+                # seen before the marker is not final until the marker bounds it, and a
+                # record after it is a diagnostic-tail byte.
                 # Round-9 item 1: this branch is reached for EVERY proven exit -- an
                 # exit first observed at (or past) the completion deadline included.
                 # The loop used to test the deadline first, so an exit proven exactly
                 # then fell through with `post_exit_drain` unset and the finality gate
                 # below never ran; the gate is TOTAL now.
+                # run_7859f202457c F-017 (REVIEW_IMPLEMENTATION.md, iteration 2): the drain
+                # binds/verifies the fence and lets the FIRST authoritative scan run over
+                # [baseline, N).  When the fence was NOT yet bound at the initial
+                # `completion()` above (the ordinary path: no boundary, or a boundary the
+                # drain is about to supersede), that first scan carried no selection and the
+                # post-drain scan is exactly what produces the settlement -- unchanged.  But
+                # when the fence was ALREADY bound and verified before this call (a
+                # production-drained/adopted session: the reviewer's pre-bound caller
+                # construction) the initial `completion()` already positively selected over
+                # this same immutable range; a SECOND scan of the identical bytes can only
+                # repeat that result or, on a settlement-reader allocation failure, ERASE it
+                # (`record_scan_incomplete`, record/refusal None).  So the redundant re-scan
+                # is skipped precisely when the prior evidence already reached a positive
+                # selection (a refusal, or a bound completion record) over the SAME verified
+                # boundary the drain establishes (same N, same fence digest); a selected
+                # refusal / completion then dominates a later reader failure, which per
+                # DESIGN §1.4 R1 it must.  Any other prior evidence is superseded by the
+                # post-drain scan exactly as before.
+                prior = evidence
                 drained = self.drain_after_exit()
                 self.post_exit_drain = drained           # rides BOTH settlement rows
-                evidence = self.completion()
+                if self._positive_selection_over_bound_fence(prior, self._boundary):
+                    evidence = prior
+                else:
+                    evidence = self.completion()
                 evidence["post_exit_drain"] = drained
                 break
             if self._clock() >= deadline:
@@ -1486,17 +1582,19 @@ class StandaloneSession:
             # recorded that and went on to evaluate whatever record the transcript held,
             # so a structured success could be authorised from a stream whose end was
             # never observed -- a record read before the end is not the final record.
-            # (An ADOPTED session holds no master: its positive evidence is the exit
-            # watcher's sentinel, written after the watcher's own final drain and meta
-            # save -- `_stream_is_final` accepts exactly that; a table-only exit proof
-            # with no sentinel is refused here too.)
-            # The disposition is the typed LOST reason `stream_end_unproven`: no
+            # (An ADOPTED session holds no master: its positive evidence is the verified
+            # FENCE on disk -- `_fence_from_disk` -- never the sentinel alone.)
+            # OS-48: the disposition is the NAMED LOST reason the drain produced
+            # (`boundary_unproven`, `exit_unproven`, `fence_*`, `owner_conflict`, ...): no
             # COMPLETED state, no settlement-success row, no success ledger receipt;
             # `_complete` raises it and `settle_failed` settles the typed FAILURE with
-            # the reason on the receipt.  A hung agent that never closes its slave is a
-            # LOST/failed dispatch after the bound, never a success.
-            disposition = lifecycle.resolve_unknown("stream_end_unproven",
-                                                    ended=drained.get("ended"))
+            # the reason on the receipt.  A watcher that never writes the marker within
+            # the bound is a LOST/failed dispatch, never a success.
+            named = str(drained.get("outcome") or capture_mod.OUTCOME_BOUNDARY_UNPROVEN)
+            if named not in lifecycle.OS48_LOST_OUTCOMES:
+                named = capture_mod.OUTCOME_BOUNDARY_UNPROVEN
+            disposition = lifecycle.resolve_unknown("os48_named", lost_reason=named,
+                                                    detail=str(drained.get("finality_detail") or ""))
             self._journal(kind="EVENT", derived_from="pty",
                           event="evidence_unreadable", state=self.state,
                           vocabulary={"post_exit_drain": dict(drained),
@@ -1510,9 +1608,40 @@ class StandaloneSession:
                                       "settlement_record_present":
                                           evidence["settlement_record"] is not None,
                                       "exit_proven": bool(evidence["exit_proven"]),
-                                      "detail": "the pty stream's end was not observed "
-                                                "after the proven exit; no settlement "
-                                                "record it holds is final"})
+                                      "detail": "the authoritative boundary is not proven "
+                                                "(no verified fence); no settlement record "
+                                                "the capture holds is inside a proven boundary"})
+            return {"state": "LOST", "evidence": evidence,
+                    "lost_reason": disposition["lost_reason"]}
+        provenance = evidence.get("provenance_outcome")
+        if provenance == capture_mod.OUTCOME_REFUSAL_IN_BOUNDARY:
+            # OS-48 R1: a refusal anywhere inside the authoritative range dominates -- a typed
+            # FAILED settlement, whatever success record the range also holds.
+            verdict = {"outcome": "failed", "reason": capture_mod.OUTCOME_REFUSAL_IN_BOUNDARY,
+                       "detail": str(evidence.get("refusal") or ""),
+                       "exit_status": evidence["exit_status"]}
+            self.event_log.append("exit_observed")
+            self._journal(kind="EVENT", derived_from="capture", event="evidence_unreadable",
+                          state=self.state,
+                          vocabulary={"completion_verdict": dict(verdict),
+                                      "detail": "a refusal inside the fenced range dominates"})
+            return {"state": "FAILED", "evidence": evidence, "lost_reason": "", "verdict": verdict}
+        if provenance in (capture_mod.OUTCOME_PROVENANCE_AMBIGUOUS,
+                          capture_mod.OUTCOME_PROVENANCE_UNBOUND,
+                          capture_mod.OUTCOME_RECORD_FRAMING_AMBIGUOUS,
+                          capture_mod.OUTCOME_RECORD_SCAN_INCOMPLETE,
+                          capture_mod.OUTCOME_ADOPTED_BASELINE_UNKNOWN):
+            disposition = lifecycle.resolve_unknown("os48_named", lost_reason=provenance)
+            self._journal(kind="EVENT", derived_from="capture", event="evidence_unreadable",
+                          state=self.state,
+                          vocabulary={"provenance_outcome": provenance,
+                                      "candidates": (evidence.get("source_vocabulary") or {}).get("candidates"),
+                                      # i8 F-015: the bound an incomplete framing scan hit
+                                      "scan": (evidence.get("source_vocabulary") or {}).get("scan"),
+                                      # USER DECISION C2: the withheld adopted post_ready success
+                                      "adoption": (evidence.get("source_vocabulary") or {}).get("adoption"),
+                                      "detail": "the completion record's provenance is not "
+                                                "bound to this dispatch's emitter subtree"})
             return {"state": "LOST", "evidence": evidence,
                     "lost_reason": disposition["lost_reason"]}
         if evidence["settlement_record"] is not None and evidence["exit_proven"]:
@@ -1589,10 +1718,14 @@ class StandaloneSession:
         """
         from .contracts import make_settlement_event
         parser = result_parser or _default_result_parser
-        extracted = self.driver.result_body(self.capture.transcript())
+        # OS-48 F-001: every extraction, parser input and fallback reads the AUTHORITATIVE
+        # interval [baseline, N) and the sidecar copy frozen with the fence -- never the
+        # whole transcript, which a diagnostic-tail writer can still be appending to.
+        authoritative = self._authoritative_text()
+        extracted = self._extract_body(authoritative)
         body = extracted["body"]
         result = dict(parser(_CapturedBody(
-            body if body is not None else self.capture.transcript()), self.intent))
+            body if body is not None else authoritative), self.intent))
         outcome = str((verdict or {}).get("outcome") or "succeeded")
         if outcome != "succeeded":
             result = lifecycle.typed_failed_result(
@@ -1630,6 +1763,18 @@ class StandaloneSession:
                                "result_body_provenance": self._body_provenance(extracted),
                                "post_exit_drain": dict(evidence.get("post_exit_drain")
                                                        or self.post_exit_drain or {}),
+                               "fence": (self._boundary or {}).get("fence"),
+                               "boundary": {"offset_n": (self._boundary or {}).get("offset_n"),
+                                            "baseline": self._settlement_baseline},
+                               # PR #36 findings 1 / 2: the bounded range the selector read
+                               # and the post-N diagnostic state, on the settlement row
+                               "settlement_range": evidence.get("settlement_range"),
+                               "post_boundary": evidence.get("post_boundary"),
+                               "provenance_outcome": evidence.get("provenance_outcome"),
+                               "diagnostic_tail_bytes": (self._release or {}).get("retained_tail_bytes"),
+                               "diagnostic_tail_sha256": (self._release or {}).get("retained_tail_sha256"),
+                               "diagnostic_tail_state": (self._release or {}).get("state"),
+                               "holders_diagnostic": self._holders_diagnostic(),
                                "pid": (self.record or {}).get("pid"),
                                "captured_tty": (self.record or {}).get("captured_tty"),
                                **self._terminal_provenance()}),
@@ -1693,10 +1838,13 @@ class StandaloneSession:
                    "exit_proof": proof["how"]}
         if self._runtime_failure_is_not_a_verdict():
             raise self._runtime_failure_not_settled(verdict, proof, lease_token=lease_token)
-        extracted = self.driver.result_body(self.capture.transcript())
+        # OS-48 F-001: a FAILED settlement parses the same authoritative interval (or, with
+        # no fence at all, nothing authoritative -- an empty body, never the mutable tail).
+        authoritative = self._authoritative_text()
+        extracted = self._extract_body(authoritative)
         body = extracted["body"]
         parsed = _default_result_parser(_CapturedBody(
-            body if body is not None else self.capture.transcript()), self.intent)
+            body if body is not None else authoritative), self.intent)
         result = lifecycle.typed_failed_result(
             parsed, role=str(self.intent.get("role") or ""), verdict=verdict)
         event = make_settlement_event(self.intent, result,
@@ -1757,6 +1905,18 @@ class StandaloneSession:
                 "failure_stage": failure.stage, "exit_proof": proof["how"],
                 "teardown": "proven" if spawned else "not_required"}
 
+    def _extract_body(self, authoritative: str) -> dict[str, Any]:
+        """The settled body: the structured record's IN-BOUNDARY body, else nothing (the
+        authoritative interval itself).  The declared `-o` sidecar is NEVER a body source
+        (F-001 (b), option ii): its content cannot be bound to the stream boundary N, so it is
+        refused by name (`sidecar_unproven`) and the provenance says so; every installed
+        profile carries its final body on the stream (the driver's `result_body_records`)."""
+        extracted = self.driver.result_body(authoritative, allow_path=False)
+        if extracted["source"] == "whole_transcript" and self.last_message_path:
+            extracted = dict(extracted, sidecar_refused=capture_mod.SIDECAR_STATE_UNPROVEN,
+                             sidecar_presence=self._sidecar_state)
+        return extracted
+
     def _body_provenance(self, extracted: Mapping[str, Any]) -> dict[str, Any]:
         """WHERE the settled body came from, bound to this dispatch.  Finding 9.
 
@@ -1770,6 +1930,18 @@ class StandaloneSession:
                                       "session_id": self.session_id,
                                       "process_incarnation": self.incarnation,
                                       "dispatch_id": self.dispatch_id}
+        # OS-48 F-001: the interval the body was taken from and its digest, so a reader can
+        # re-derive the settled body from `capture.log[baseline:N)` and nothing else.
+        interval = self._authoritative_interval()
+        if interval is not None:
+            raw = self.capture.raw()[interval[0]:interval[1]]
+            provenance["interval"] = {"baseline": interval[0], "offset_n": interval[1],
+                                      "sha256": hashlib.sha256(raw).hexdigest()}
+        else:
+            provenance["interval"] = None
+        if extracted.get("sidecar_refused"):
+            provenance["sidecar_refused"] = extracted["sidecar_refused"]
+            provenance["sidecar_presence"] = extracted.get("sidecar_presence")
         path = extracted.get("path")
         if path:
             provenance["path"] = str(path)
@@ -1944,10 +2116,22 @@ class StandaloneSession:
         """
         if self.record is None:
             return
-        for axis in ("proc_start_ticks", "boot_id"):
+        provisional = int(self.record.get("proc_start_ticks") or 0)
+        recorded = int(spawn_record.get("proc_start_ticks") or 0)
+        if provisional and recorded and provisional != recorded:
+            # The pid we read was not the child that wrote the record: a reuse between the
+            # spawn and the provisional read.  The child's OWN value is authoritative and the
+            # disagreement is journalled by name; nothing is signalled from the provisional.
+            self._journal(kind="EVENT", derived_from="pty", event="identity_bound",
+                          state=self.state,
+                          vocabulary={"identity_changed": True, "provisional_start": provisional,
+                                      "recorded_start": recorded})
+        for axis in ("proc_start_ticks", "boot_id", "fence_nonce", "evidence_source"):
             value = spawn_record.get(axis)
             if value:
                 self.record[axis] = value
+        if spawn_record.get("fence_nonce"):
+            self.fence_nonce = str(spawn_record["fence_nonce"])
 
     def _teardown_after_handoff_failure(self, failure: pty_supervisor.SpawnHandoffFailed, *,
                                         argv_digest: str, env_digest: str) -> StartReceipt:
@@ -2047,7 +2231,6 @@ class StandaloneSession:
         # did -- so without this it would raise StandaloneTeardownUnproven for a process
         # that was about to die cleanly.
         self.pump(timeout_ms=100)
-        pid = int(self.record["pid"])
         sentinel = self._read_sentinel()
         how = "exit_sentinel"
         if sentinel["outcome"] != "exited":
@@ -2104,15 +2287,31 @@ class StandaloneSession:
         """
         reaped: dict[str, Any] = {"reaped": False, "status": None, "detail": "no pty"}
         if self.pty is not None:
-            # Round-10 item 1: RELEASE the deferring exit watcher BEFORE reaping it.  The
-            # supervisor-alive watcher blocks in `_await_drain_handoff` until this write end
-            # closes; the supervisor's own finalizing drain (`drain_after_exit`) has already
-            # run by the time `_reclaim` is reached, so closing it here lets the watcher exit
-            # at once and `reap_leader` does not wait out its physical-exit budget.
+            # RELEASE the deferring exit watcher BEFORE reaping it: the supervisor-alive
+            # watcher blocks in `_defer_for_release` (serving R / C / the control socket)
+            # until release-2; the supervisor's own finalizing drain (`drain_after_exit`)
+            # has already run by the time `_reclaim` is reached.
+            # OS-48 DESIGN §1.8: the TWO-PHASE release runs BEFORE the watcher is released --
+            # release-1 (RELEASE marker), drain to R, `release.<inc>`, release-2 (the watcher
+            # closes its slave reference), read to EOF -- so no acknowledged pre-R byte is lost.
+            if self._boundary is not None and self._release is None:
+                try:
+                    self._release_two_phase()
+                except Exception as exc:  # noqa: BLE001 - never lose the reclaim to bookkeeping
+                    self._release = {"outcome": capture_mod.OUTCOME_DIAGNOSTIC_TAIL_UNACCOUNTED,
+                                     "error": repr(exc)}
             self._release_drain_handoff()
             reaped = pty_supervisor.reap_leader(
                 self.pty, timeout_ms=self.profile.timeouts.physical_exit_timeout_ms)
             self.release()
+        # OS-48 DESIGN §2.2 (F-006): teardown ACCOUNTS for the positive membership set -- a
+        # member the watcher observed that is still positively alive (its pinned start
+        # identity re-read now) is the NAMED residual `descendants_unreaped`; an unreadable
+        # member stays `unknown`.  No member is ever signalled here (AC-10).
+        residual = self.membership_residual()
+        if residual["alive"] or residual["unknown"] or residual.get("outcome"):
+            self._journal(kind="EVENT", derived_from="pty", event="descendants_unreaped",
+                          state=self.state, vocabulary=dict(residual))
         # An EVENT, not a `RELEASED` row: `open_dispatches` closes a dispatch on RELEASED,
         # and reclaiming the supervisor's own descriptors is not the lifecycle release
         # verb -- the dispatch is closed by its SETTLEMENT, which follows.
@@ -2129,10 +2328,243 @@ class StandaloneSession:
                                   "leader_status": reaped["status"],
                                   "leader_detail": reaped["detail"],
                                   "master_fd_closed": True,
+                                  "membership": {k: v for k, v in residual.items() if k != "members"},
                                   "pid": (self.record or {}).get("pid"),
                                   "captured_tty": (self.record or {}).get("captured_tty"),
                                   **self._terminal_provenance()})
         return reaped
+
+    def _members_path(self) -> bytes:
+        return pty_supervisor.members_path(self.capture.path, self.incarnation)
+
+    def membership_residual(self) -> dict[str, Any]:  # noqa: C901 - one reader, every named branch
+        """DESIGN §2.2: the ledger `members.<inc>.jsonl` re-read against the kernel NOW, keyed by
+        INCARNATION (pid, start_id).  ``alive`` = members whose pinned start identity still
+        matches a live process (`descendants_unreaped`) AND whose recorded boot id equals this
+        reader's readable boot id (the boot join, iteration-2 review F-016) AND -- on Linux --
+        whose recorded pidfs inode a fresh pidfd's equals under the same proven inode model
+        (i8 F-016: tick equality alone is `pid_tick_unverified`, an ``unknown`` entry, never
+        alive), ``unknown`` = members whose identity is unreadable, whose boot cannot be
+        joined (`boot_unjoined`), or whose lifetime binding is unproven, ``exited`` = members
+        the watcher saw exit or whose pid is gone / reused / bound to a different pidfs inode.
+        REVIEW_IMPLEMENTATION_iteration2 F-006: the ledger's own readability is part of the
+        answer -- an unreadable / torn ledger, or a watcher that could not append every line,
+        is `membership_unreadable`: the set is UNKNOWN and named, never "zero members".
+        REVIEW_IMPLEMENTATION_iteration4 F-009: DISCOVERY readability is part of the answer
+        too -- a watcher whose process listing failed or kept changing, or that met a live
+        candidate no identity source would read, wrote `discovery_unreadable` ledger records
+        and a `discovery` accounting block; the residual is then `descendants_unknown` with the
+        reasons named: the positive members are reported as usual, and everything the
+        watcher could not see is UNKNOWN, never "no descendants"."""
+        def _read_both() -> tuple[dict[str, Any], dict[str, Any] | None]:
+            ledger = pty_supervisor.read_ledger(self._members_path())
+            state_path = os.fsdecode(self._members_path()) + ".state.json"
+            try:
+                with open(state_path, "rb") as handle:
+                    accounting = json.loads(handle.read().decode("utf-8"))
+            except (OSError, ValueError):
+                accounting = None
+            return ledger, accounting
+        # REVIEW_IMPLEMENTATION_iteration3 F-006: the readable content is JOINED to the durable
+        # append accounting and re-read once -- a whole-line prefix that is shorter than the
+        # count the watcher appended, an accounting that changes between the reads, or an
+        # accounting naming another fence is a contradiction: named `membership_unreadable`
+        # with the unknown remainder, never "clean".
+        ledger, accounting = _read_both()
+        ledger2, accounting2 = _read_both()
+        out: dict[str, Any] = {"members": 0, "alive": [], "unknown": [], "exited": [],
+                               "ledger": os.fsdecode(self._members_path()),
+                               "ledger_state": ledger["state"], "ledger_torn": ledger["torn"],
+                               "ledger_error": ledger["error"], "outcome": None,
+                               "accounting": accounting}
+        if ledger["state"] != capture_mod.EVIDENCE_FINAL:
+            out["outcome"] = capture_mod.OUTCOME_MEMBERSHIP_UNREADABLE
+            out["unknown"] = [{"ledger": ledger["state"], "error": ledger["error"]}]
+            return out
+        read_count = len(ledger["records"]) + int(ledger["torn"])
+        appended = int((accounting or {}).get("appended") or 0)
+        changing = (ledger2["records"] != ledger["records"] or ledger2["torn"] != ledger["torn"]
+                    or accounting2 != accounting)
+        short = accounting is not None and read_count != appended
+        if (ledger["torn"] or accounting is None or int(accounting.get("failed") or 0) > 0
+                or short or changing):
+            # lines the watcher could not write, a fragment, a prefix shorter than the durable
+            # append count, or evidence still changing: the set is at least as large as what
+            # was read -- report what is known AND name the unknown remainder
+            out["outcome"] = capture_mod.OUTCOME_MEMBERSHIP_UNREADABLE
+            out["unknown"].append({"ledger": "changing" if changing else "incomplete",
+                                   "torn": ledger["torn"], "read": read_count, "appended": appended,
+                                   "append_failed": (accounting or {}).get("failed"),
+                                   "accounting": "absent" if accounting is None else "present"})
+        # F-009: discovery accounting -- the state file's `discovery` block joined to the
+        # ledger's own `discovery_unreadable` records (either alone is enough: a record whose
+        # state write was lost, or a state count whose ledger line could not be appended).
+        discovery = dict((accounting or {}).get("discovery") or {})
+        discovery_records = [r for r in ledger["records"]
+                             if r.get("event") == pty_supervisor.MEMBER_EVENT_DISCOVERY_UNREADABLE]
+        unreadable_passes = sum(int(discovery.get(k) or 0) for k in
+                                ("listing_unreadable", "listing_unstable", "candidates_unreadable",
+                                 "forks_coalesced", "watch_gaps", "parents_unreadable", "unobservable",
+                                 "candidates_unverified"))
+        if unreadable_passes or discovery_records:
+            reasons = list(discovery.get("reasons") or [])
+            for r in discovery_records:
+                tag = f"{r.get('kind')}:{r.get('reason')}"
+                if tag not in reasons:
+                    reasons.append(tag)
+            pids = sorted({int(p) for r in discovery_records for p in (r.get("pids") or ())}
+                          | {int(p) for p in (discovery.get("pids") or ())})
+            forks = [{"parent": r.get("parent"), "evidence": r.get("evidence"), "trigger": r.get("trigger")}
+                     for r in discovery_records
+                     if r.get("kind") == pty_supervisor.DISCOVERY_FORK_COALESCED]
+            out["unknown"].append({"discovery": "unreadable",
+                                   "passes": discovery.get("passes"),
+                                   "root_watch": discovery.get("root_watch"),
+                                   "listing_unreadable": discovery.get("listing_unreadable"),
+                                   "listing_unstable": discovery.get("listing_unstable"),
+                                   "candidates_unreadable": discovery.get("candidates_unreadable"),
+                                   "forks_coalesced": discovery.get("forks_coalesced"),
+                                   "watch_gaps": discovery.get("watch_gaps"),
+                                   "parents_unreadable": discovery.get("parents_unreadable"),
+                                   "unobservable": discovery.get("unobservable"),
+                                   "candidates_unverified": discovery.get("candidates_unverified", 0),
+                                   "records": len(discovery_records),
+                                   "reasons": reasons, "pids": pids,
+                                   "forks": forks[:_DISCOVERY_FORKS_REPORTED]})
+            out["discovery"] = "unreadable"
+            if out["outcome"] is None:
+                out["outcome"] = capture_mod.OUTCOME_DESCENDANTS_UNKNOWN
+        else:
+            # readable AND positively watched: the root's watch preceded its exec (P2) and no
+            # fork was ever observed -- the only way a darwin dispatch is clean; on Linux the
+            # subreaper (P4) is the positive mechanism and no root watch exists
+            watched = discovery.get("root_watch") in ("registered", "subreaper")
+            out["discovery"] = ("readable" if discovery and watched else
+                                "unaccounted" if not discovery else "unwatched")
+            if discovery and not watched and out["outcome"] is None:
+                out["outcome"] = capture_mod.OUTCOME_DESCENDANTS_UNKNOWN
+                out["unknown"].append({"discovery": "unwatched", "root_watch": discovery.get("root_watch")})
+        # REVIEW_IMPLEMENTATION_iteration7 F-016: members are LIFETIMES `(pid, start_id,
+        # lifetime)` -- on Linux (pid, tick) is not injective, so the watcher records a new
+        # lifetime ordinal whenever a live process reappears under an exited key.  The reader
+        # keeps one entry per lifetime; the exit event carries its lifetime.
+        latest: dict[tuple[int, int, int], dict[str, Any]] = {}
+        exited: set[tuple[int, int, int]] = set()
+        for record in ledger["records"]:
+            ident = record.get("identity") or {}
+            key = (int(ident.get("pid") or 0), int(ident.get("start_id") or 0), int(record.get("lifetime") or 1))
+            if key[0] <= 0 or record.get("event") not in (pty_supervisor.MEMBER_EVENT_OBSERVED,
+                                                          pty_supervisor.MEMBER_EVENT_EXITED):
+                continue
+            if record.get("event") == pty_supervisor.MEMBER_EVENT_EXITED:
+                exited.add(key)
+            else:
+                latest.setdefault(key, record)
+        out["members"] = len(latest)
+        agent = int((self.record or {}).get("pid") or 0)
+        gone: list[dict[str, Any]] = []
+        for (pid, start_id, lifetime), record in latest.items():
+            entry = {"pid": pid, "start_id": start_id, "lifetime": lifetime, "role": record.get("role"),
+                     "observed_via": record.get("observed_via"),
+                     "fixed_object": record.get("fixed_object", "none")}
+            if (pid, start_id, lifetime) in exited:
+                gone.append(entry)
+                continue
+            observed = self._identity_reader(pid)
+            entry.update({"observed_start_id": observed.get("start_id"),
+                          "observed_state": observed.get("start_state")})
+            siblings = [k for k in latest if k[0] == pid and k[1] == start_id and k[2] != lifetime]
+            if siblings:
+                entry["lifetime_siblings"] = len(siblings)
+            if observed.get("start_state") == capture_mod.EVIDENCE_FINAL:
+                if int(observed.get("start_id") or 0) != start_id:
+                    gone.append(entry)                 # the pid was reused: that incarnation is gone
+                    continue
+                # REVIEW_IMPLEMENTATION_iteration2 (run_5fcd2beac376) F-016 -- the BOOT join
+                # (DESIGN §2.1's boot identity axis): every binding below is boot-scoped -- a
+                # start tick counts from boot, the pidfs inode counter (`pidfs_ino` /
+                # `pidfs_ino_nr`, kernel/pid.c + fs/pidfs.c v6.9..v6.16) restarts on every
+                # boot, darwin's start time is a wall-clock re-read -- so an equality is
+                # evidence of the SAME incarnation only when the ledger's recorded boot id
+                # and this reader's current boot id are BOTH readable (non-empty) AND equal.
+                # Missing / unreadable on either side -> UNKNOWN by name (never alive); a
+                # different boot -> conservatively UNKNOWN by name (no process outlives a
+                # reboot, but the reader does not turn a boot-source disagreement into a
+                # positive "gone" claim either).  Applied on every platform.
+                recorded_boot = str((record.get("identity") or {}).get("boot_id") or "")
+                current_boot = str(observed.get("boot_id") or "")
+                boot_problem = ("boot_id:unrecorded" if not recorded_boot
+                                else "boot_id:unreadable" if not current_boot
+                                else "boot_id:mismatch" if recorded_boot != current_boot else "")
+                if boot_problem:
+                    entry["lifetime_binding"] = "boot_unjoined"
+                    entry["binding_detail"] = boot_problem
+                    entry["recorded_boot_id"] = recorded_boot
+                    entry["observed_boot_id"] = current_boot
+                    out["unknown"].append(entry)
+                    if out["outcome"] is None:
+                        out["outcome"] = capture_mod.OUTCOME_DESCENDANTS_UNKNOWN
+                    continue
+                entry["boot_joined"] = True
+                # REVIEW_IMPLEMENTATION_iteration8 F-016: this reader holds NO fixed object (the
+                # watcher's pidfd / kqueue died with it, or never was this process's).  What
+                # binds a live process under the recorded key to the recorded LIFETIME:
+                #  * darwin -- the kernel's microsecond start time re-read now
+                #    (`proc_pidinfo`, DESIGN §2.1's identity axis).  NOTE_EXIT pinned only the
+                #    watcher's OWN observation of the exit while it lived; it pins nothing here;
+                #  * Linux -- (pid, start tick) equality is NOT injective (10 ms ticks): the
+                #    binding is the member's recorded pidfs inode (`fixed_object_id`) against a
+                #    fresh pidfd's (`pidfd_binding`), and ONLY under the proven non-recyclable
+                #    inode model the watcher recorded with it AND this reader's kernel reports
+                #    (`pidfs_lifetime_model`; run_5fcd2beac376 F-016: a 32-bit pidfs inode is
+                #    recyclable): equal -> the same incarnation; different -> positively gone;
+                #    no such inode on either side, or an unproven / mismatched model -> UNKNOWN
+                #    by name (`pid_tick_unverified`), never alive/owned.  No signal or
+                #    settlement authority is ever derived from this reader's answer (AC-10).
+                if sys.platform == "darwin":
+                    # N-001 (run_5fcd2beac376): a RE-READ kernel timestamp, not a fixed object
+                    # this reader holds -- a diagnostic identity axis, never a lifetime
+                    # guarantee and never the Linux independent-binding claim
+                    entry["lifetime_binding"] = "start_microsecond"
+                    entry["binding_detail"] = "reread_timestamp_not_fixed_object"
+                elif sys.platform == "linux" and pid != agent:
+                    binding = pty_supervisor.pidfd_binding(pid)
+                    recorded = int(record.get("fixed_object_id") or 0)
+                    recorded_model = str(record.get("fixed_object_model") or "")
+                    proven = (bool(recorded) and recorded_model
+                              and recorded_model == binding.get("model")
+                              and binding["state"] == capture_mod.EVIDENCE_FINAL)
+                    if binding["state"] == "absent":
+                        gone.append(entry)
+                        continue
+                    if proven:
+                        entry["binding_model"] = recorded_model
+                        if int(binding["fixed_object_id"]) == recorded:
+                            entry["lifetime_binding"] = "pidfs_inode"
+                        else:
+                            entry["lifetime_binding"] = "pidfs_inode_mismatch"
+                            gone.append(entry)
+                            continue
+                    else:
+                        entry["lifetime_binding"] = "pid_tick_unverified"
+                        entry["binding_detail"] = (
+                            "no_recorded_fixed_object_id" if not recorded
+                            else "binding_model:unproven" if not recorded_model
+                            else f"binding_model:mismatch:{recorded_model}!={binding.get('model') or 'unproven'}"
+                            if recorded_model != binding.get("model")
+                            else f"reader_binding:{binding['state']}")
+                        out["unknown"].append(entry)
+                        if out["outcome"] is None:
+                            out["outcome"] = capture_mod.OUTCOME_DESCENDANTS_UNKNOWN
+                        continue
+                (out["alive"] if pid != agent else out["unknown"]).append(entry)
+            elif observed.get("start_state") == "absent":
+                gone.append(entry)
+            else:
+                out["unknown"].append(entry)
+        out["exited"] = sorted({e["pid"] for e in gone})
+        out["exited_incarnations"] = gone
+        return out
 
     def _prove_exit_before_settlement(self, *, stage: str) -> dict[str, Any]:
         """Bounded terminate -> reap -> exit proven, or a durable RETAINED state.  Finding 1.
@@ -2211,100 +2643,41 @@ class StandaloneSession:
         return dict(self.exit_proof)
 
     # -- readiness -----------------------------------------------------------------------
-    #: Round-8 iteration 2.  The DEFAULT bound on reading the pty stream TO ITS HANGUP
-    #: after the agent's exit is proven.  Round-9: the operative bound is the profile's
-    #: ``timeouts.post_exit_drain_budget_ms`` (same default), so an operator whose agents
-    #: leave descendants on the slave tunes configuration, not code; this constant is
-    #: kept as the documented default.  A drain that ends by budget is recorded as such,
-    #: with what held the slave, in the settlement's own vocabulary.
+    #: Round-8 iteration 2 / OS-48.  The DEFAULT bound on reading the pty stream TO THE FENCE
+    #: MARKER after the agent's exit is proven; the operative bound is the profile's
+    #: ``timeouts.post_exit_drain_budget_ms`` (same default).
     POST_EXIT_DRAIN_BUDGET_MS = 2_000
 
-    #: The settle window (round-10 item 1, darwin): how long the master must be QUIET,
-    #: AFTER the exit is proven, before the drain RELEASES the deferring exit watcher so its
-    #: revoke delivers the real hangup that ends the read.  It stands on the PROVEN exit (the
-    #: watcher reaped the agent and wrote the sentinel), so no further byte can ORIGINATE and
-    #: the quiet means the tail is fully drained; the release then converts that quiet into a
-    #: real hangup rather than letting silence itself end the drain.
-    POST_EXIT_SETTLE_MS = 150
-
     def drain_after_exit(self, *, budget_ms: int | None = None) -> dict[str, Any]:
-        """Read the master into the capture until the pty stream reaches a POSITIVE END,
-        bounded.
+        """OS-48 DESIGN §1.6: read the master into the capture until the FENCE MARKER for this
+        incarnation is in the capture (the positive boundary), bounded; then publish the fence.
 
-        ``{"bytes": <appended>, "ended": "hangup" | "quiesced" | "budget" | "no_master" |
-        "master_unreadable", "errno": <name or "">}``.  Unlike :meth:`pump`, a quiet
-        ``select`` does not settle the stream cheaply -- the end must be positively
-        observed.
-
-        **What counts as the positive end.**  On Linux the pty's own HANGUP: a clean EOF
-        (``b""``) or ``errno.EIO`` -- "every slave descriptor is closed" -- read TO the
-        hangup so a byte still in flight through the tty flip-buffer (round-8 iteration 3's
-        `flush_to_ldisc` race) is never missed.  On **darwin** the hangup NEVER arrives
-        while the exit watcher (the session leader) is alive: a session leader's exit is
-        what revokes the controlling tty and delivers the master EOF, and round-10 item 1
-        keeps that watcher ALIVE precisely so its exit cannot manufacture -- and truncate --
-        that hangup.  So on darwin the positive end is the master QUIESCING for
-        :data:`POST_EXIT_SETTLE_MS` AFTER the proven exit (the same reaped-then-quiesced end
-        the exit watcher's own `_finalize_orphaned_capture` uses on darwin), and
-        :meth:`_finalize_drain` proves it ONLY when the slave-holder probe finds a COMPLETE
-        positive absence (item 2).  ``EINTR`` is retried; every other ``OSError`` from the
-        read, and every ``OSError`` / ``ValueError`` from the poll, is ``master_unreadable``
-        with the errno NAMED (the reviewer's ``EBADF`` mutation proved nothing about the
-        slave side).  :meth:`await_completion` authorises a structured success ONLY through
-        :meth:`_finalize_drain`'s ``proven`` gate.
+        ``{"bytes", "ended": "marker" | "budget" | "master_unreadable" | "no_master" |
+        "marker_inconsistent", "errno", "offset_n", "marker_len", "finality",
+        "finality_detail", "fence"}``.  Silence never ends the drain; a hangup (EOF / EIO)
+        before the marker is ``master_unreadable`` by name (the owner-held slave reference
+        makes it impossible on the normal path -- probe_d1); nothing here consults any process
+        or descriptor enumeration.  A masterless (adopted) session reads the fence from disk
+        (:meth:`_fence_from_disk`) instead.
         """
+        if self._boundary is not None:
+            # PR #36 finding 1: a fence this session already bound is a property of the fence
+            # file and of [0, N) -- re-verified over exactly those bytes (`fence_matches`
+            # digests the prefix) and never by re-scanning the whole capture for the marker:
+            # the diagnostic tail appended since is not read by a settlement path at all.
+            existing = capture_mod.read_capture_fence(self._fence_path(), fence=self.fence)
+            return self._bind_fence({"bytes": 0, "ended": "marker", "errno": "",
+                                     "offset_n": int(self._boundary["offset_n"]),
+                                     "marker_len": int(self._boundary.get("marker_len") or 0)},
+                                    existing, self._read_sentinel())
         if self.pty is None or int(self.pty["master_fd"]) < 0:
-            # No master in THIS process (an adopted session: the supervisor that held it
-            # is gone).  Round-9 item 1: the positive end-of-stream evidence is the
-            # CAPTURE-FINALIZED proof the exit watcher wrote after its own final drain,
-            # meta save and fsync -- bound to the capture's length and digest and to the
-            # sentinel it wrote next.  The sentinel alone proves only that the process
-            # exited: the watcher writes it at once whenever the supervisor was alive at
-            # the exit, and a supervisor that then died before its own drain left a
-            # capture nobody finished.  `finality` names exactly what was found.
-            sentinel = self._read_sentinel()
-            return self._finality_from_proof(
-                {"bytes": 0, "ended": "no_master", "errno": ""}, sentinel)
+            return self._fence_from_disk({"bytes": 0, "ended": "no_master", "errno": ""})
         fd = int(self.pty["master_fd"])
         budget = (self.profile.timeouts.post_exit_drain_budget_ms if budget_ms is None
                   else budget_ms) / 1000.0
         deadline = self._clock() + budget
         read = 0
-
-        # Round-10 iteration 2.  On darwin the master EOF / EIO is delivered by the LAST slave
-        # close.  The exit watcher holds NO slave descriptor (`standalone_pty.spawn`: its
-        # 0/1/2 go to /dev/null and its inherited slave copy is closed), so the last slave
-        # close -- and thus the hangup -- is the AGENT's own, and it can arrive WHILE THE
-        # WATCHER IS STILL ALIVE.  The controlling invariant is that the watcher's exit /
-        # revoke MUST NEVER itself manufacture the hangup this drain accepts as proof -- so a
-        # hangup is a proof only when a COMPLETE POSITIVE SLAVE-ABSENCE PROOF (holder tri-state
-        # `proven_absent`) was obtained WHILE THE WATCHER WAS HELD.  There are two ways to
-        # reach that: (a) the drain reaches a quiet window, PROVES absence, and only then
-        # authorises the watcher's release (so its later revoke ends a stream provably without
-        # another writer); or (b) the agent's own hangup arrives with the watcher still ALIVE
-        # (no revoke, tty intact), and the drain proves absence at that hangup.  A `present` or
-        # `unreadable` holder authority is `unproven` (typed `stream_end_unproven`) on either
-        # path, never a hangup.  A hangup that arrives with the watcher already GONE and this
-        # drain not having authorised the release (it crashed, was killed, hit its ceiling, or
-        # was released by anything else) is `watcher_exit_unproven`: the probe would be
-        # post-revoke and cannot vouch for a discarded tail.  On Linux the slave's own close
-        # gives EOF / EIO independently of any watcher, so a hangup there is proof outright;
-        # `settle_s == 0` selects that platform and neither the absence gate nor the liveness
-        # guard applies.  Quiet time authorises nothing on its own: it is only the trigger to
-        # TRY the absence proof.
-        settle_s = (self.POST_EXIT_SETTLE_MS / 1000.0
-                    if sys.platform == "darwin" else 0.0)
-        # `had_watcher` keys on the STABLE session-leader identity, not on the handoff fd
-        # (which flips to -1 the moment the watcher is released): a darwin session that was
-        # spawned with a deferring watcher must, forever after, refuse a hangup this drain
-        # did not itself authorise -- even once the fd has closed.  A raw-pty test session
-        # (round-8 `Iteration2DrainAfterExitTests`) carries no `leader_pid`, so the guard
-        # does not apply and its slave-close hangup is proof outright.
-        had_watcher = (isinstance((self.pty or {}).get("leader_pid"), int)
-                       and int(self.pty["leader_pid"]) > 0)
-        last_data = self._clock()
-        handoff_released = False
-        absence_holders: dict[str, Any] | None = None
+        nonce = str(self.fence_nonce or "")
 
         def _unreadable(exc: BaseException) -> dict[str, Any]:
             code = getattr(exc, "errno", None)
@@ -2312,252 +2685,660 @@ class StandaloneSession:
                     else type(exc).__name__)
             return {"bytes": read, "ended": "master_unreadable", "errno": name}
 
-        def _hangup_end(errno_name: str) -> dict[str, Any]:
-            # A darwin master EOF/EIO is delivered by the LAST slave close.  The watcher holds
-            # NO slave descriptor (see `standalone_pty.spawn`: its 0/1/2 go to /dev/null and
-            # its inherited slave copy is closed), so the last slave close -- and thus this
-            # hangup -- is the AGENT's own.  A hangup is therefore NOT necessarily a watcher
-            # revoke: it is the agent's genuine end-of-stream whenever the session-leader
-            # watcher is STILL ALIVE, holding the tty, at the moment of the hangup.  An EOF
-            # this drain itself authorised (`handoff_released`) already proved absence before
-            # releasing, so it is a hangup outright.  For an UNAUTHORISED hangup on darwin,
-            # the watcher's liveness discriminates -- and the watcher's exit never itself
-            # establishes the proof (the controlling invariant):
-            #
-            #   * watcher ALIVE (present on the captured tty, not a zombie): no revoke has
-            #     happened, the tty is intact, no tail can have been discarded.  PROVE slave
-            #     absence NOW, while the watcher is held -- the review's option (a).  A
-            #     COMPLETE positive absence (`proven_absent`: no process other than the exited
-            #     agent and the deferring watcher on the tty) is the end-of-stream proof, so
-            #     the hangup is genuine; a `present` or `unreadable` holder authority is
-            #     `unproven` (typed `stream_end_unproven`), never a hangup.
-            #   * watcher DEAD / zombie / gone: its exit revoked the tty and any holder probe
-            #     would be POST-revoke -- it cannot vouch for a discarded tail -- so the
-            #     hangup this drain did not authorise is `watcher_exit_unproven`.
-            if settle_s and had_watcher and not handoff_released:
-                if self._leader_alive():
-                    holders = self._slave_holders_now()
-                    if _holder_state_now(holders) == "proven_absent":
-                        return {"bytes": read, "ended": "hangup", "errno": errno_name,
-                                "holders": holders}
-                    return {"bytes": read, "ended": "retained_slave", "errno": errno_name,
-                            "holders": holders}
-                return {"bytes": read, "ended": "watcher_exit_unproven", "errno": errno_name,
-                        "holders": self._slave_holders_now()}
-            return {"bytes": read, "ended": "hangup", "errno": errno_name,
-                    "holders": absence_holders}
+        def _boundary() -> dict[str, Any] | None:
+            data = self.capture.raw()
+            offset_n, marker_len, state = capture_mod.marker_span(data, nonce) if nonce else (-1, 0, capture_mod.EVIDENCE_UNKNOWN)
+            if state == capture_mod.EVIDENCE_FINAL:
+                return {"bytes": read, "ended": "marker", "errno": "", "offset_n": offset_n,
+                        "marker_len": marker_len}
+            if state == capture_mod.EVIDENCE_INCONSISTENT:
+                return {"bytes": read, "ended": "marker_inconsistent", "errno": ""}
+            return None
+
+        found = _boundary()                              # the marker may already be captured
+        if found is not None:
+            return self._publish_fence(found)
         while True:
             now = self._clock()
             if now >= deadline:
-                return self._finalize_drain({"bytes": read, "ended": "budget", "errno": ""})
+                return self._publish_fence({"bytes": read, "ended": "budget", "errno": ""})
             try:
                 ready, _, _ = select.select([fd], [], [], min(0.05, deadline - now))
             except InterruptedError:
-                continue                                 # EINTR: retried, never an end
-            except (OSError, ValueError) as exc:         # a master this process cannot poll
-                return self._finalize_drain(_unreadable(exc))
+                continue
+            except (OSError, ValueError) as exc:
+                return self._publish_fence(_unreadable(exc))
             if not ready:
-                if (settle_s and had_watcher and not handoff_released
-                        and isinstance((self.pty or {}).get("drain_handoff_fd"), int)
-                        and int(self.pty["drain_handoff_fd"]) >= 0
-                        and self._clock() - last_data >= settle_s):
-                    # Quiet since the last byte: TRY to prove slave absence WHILE THE WATCHER
-                    # IS STILL HELD.  Only a COMPLETE positive absence (no process other than
-                    # the exited agent and the deferring watcher on the tty) releases the
-                    # watcher -- only then can its revoke EOF be accepted as the end of a
-                    # stream that provably has no other writer.  A `present` or `unreadable`
-                    # holder authority NEVER releases: the drain keeps reading, so a
-                    # transient child of the agent's own turn is waited out (the next quiet
-                    # check proves absence and releases), while a descendant that RETAINS the
-                    # slave never clears and the drain ends by BUDGET -> `unproven` ->
-                    # `stream_end_unproven`, its holders named.  Quiet time authorises
-                    # nothing on its own; it is only the trigger to try the absence proof.
-                    holders = self._slave_holders_now()
-                    if _holder_state_now(holders) == "proven_absent":
-                        absence_holders = holders
-                        self._release_drain_handoff()
-                        handoff_released = True
                 continue
             try:
                 chunk = self._master_reader(fd, self.profile.capture.read_chunk)
             except InterruptedError:
-                continue                                 # EINTR: retried, never an end
+                continue
             except OSError as exc:
-                if exc.errno == errno.EIO:               # the slave side is gone
-                    return self._finalize_drain(_hangup_end("EIO"))
-                return self._finalize_drain(_unreadable(exc))  # anything else proves nothing
-            if not chunk:                                # EOF
-                return self._finalize_drain(_hangup_end(""))
+                if exc.errno == errno.EIO:
+                    return self._publish_fence({"bytes": read, "ended": "master_unreadable",
+                                                "errno": "EIO"})
+                return self._publish_fence(_unreadable(exc))
+            if not chunk:
+                return self._publish_fence({"bytes": read, "ended": "master_unreadable",
+                                            "errno": "EOF"})
             self.capture.append(chunk, at=_now_iso())
             read += len(chunk)
-            last_data = self._clock()
+            if b"OS48-FENCE" in chunk or b"OS48-FENCE" in self._tail_window + chunk:
+                found = _boundary()
+                if found is not None:
+                    return self._publish_fence(found)
+            self._tail_window = (self._tail_window + chunk)[-128:]
 
-    def _finalized_path(self) -> bytes:
-        return capture_mod.capture_finalized_path(self.capture.path, self.incarnation)
+    _tail_window: bytes = b""
 
-    def _finalize_drain(self, drained: dict[str, Any]) -> dict[str, Any]:
-        """The SUPERVISING session's half of item 1: after its own drain, write the fenced
-        capture-finalized record -- ``proven`` for a hangup, bound to the capture's final
-        length / digest (the last ``append`` already saved and fsynced the meta) and to
-        the exit evidence this session holds (the sentinel's code, or the ladder / table
-        proof); ``unproven`` otherwise, naming what still holds the slave (the tty-scoped
-        process table, minus the exited agent).  ``finality`` is set to
-        :data:`FINALITY_CAPTURE_FINALIZED` ONLY after the proof is durably written, so a
-        proof this process could not persist leaves the drain unproven by name."""
+    def _fence_path(self) -> bytes:
+        return capture_mod.capture_fence_path(self.capture.path, self.incarnation)
+
+    # ---- OS-48 F-001: the AUTHORITATIVE interval and the frozen sidecar -----------------
+    def _authoritative_interval(self) -> tuple[int, int] | None:
+        """``(baseline, N)`` once a verified fence is bound; ``None`` before finality."""
+        if self._boundary is None:
+            return None
+        offset_n = int(self._boundary["offset_n"])
+        return min(max(0, int(self._settlement_baseline or 0)), offset_n), offset_n
+
+    def _authoritative_text(self) -> str:
+        """The transcript reading of ``[baseline, N)`` -- the ONLY bytes a settlement may
+        parse, extract a body from, fall back to, or digest (REVIEW_IMPLEMENTATION F-001: a
+        later writer's bytes after N are a diagnostic tail and can change nothing).  Before a
+        fence exists there is no authoritative interval and this is the empty string."""
+        interval = self._authoritative_interval()
+        if interval is None:
+            return ""
+        return capture_mod.BoundedCapture.transcript_of(self.capture.raw(interval[0])[:interval[1] - interval[0]])
+
+    def _sidecar_at_boundary(self) -> dict[str, Any]:
+        """REVIEW_IMPLEMENTATION_iteration2 F-001: the declared sidecar as the WATCHER snapshotted
+        it AT the boundary (read + digested in the reap step, before the marker).  Never a
+        live read of the path -- a digest first sampled after N proves nothing about [0,N).
+        ``{"state": present|absent|sidecar_unproven|none_declared, "record", "raw"}``."""
+        if not self.last_message_path:
+            return {"state": capture_mod.SIDECAR_STATE_NONE, "record": None, "raw": None}
+        return capture_mod.read_sidecar_snapshot(self.capture.path, self.incarnation, fence=self.fence)
+
+    def _sidecar_fence_field(self) -> dict[str, Any] | None:
+        snap = self._sidecar_at_boundary()
+        if snap["state"] == capture_mod.SIDECAR_STATE_NONE:
+            return None
+        if snap["record"] is None:
+            return {"state": capture_mod.SIDECAR_STATE_UNPROVEN}
+        return {k: snap["record"].get(k) for k in ("state", "path", "sha256", "bytes", "instant", "error")}
+
+    def _freeze_sidecar(self, fence_record: Mapping[str, Any]) -> str | None:
+        """Bind R3's sidecar PRESENCE fact to the fence: the state the owner recorded at its
+        reap-step read (`present` / `absent` / `sidecar_unreadable` / `sidecar_unproven`),
+        immutable once published -- late creation, deletion or resize of the file can never
+        change the verdict (REVIEW_IMPLEMENTATION_iteration3 F-001 (a)).  Sidecar CONTENT is
+        never a settlement body source (F-001 (b): the design has one boundary, the marker's
+        stream offset; file content cannot be bound to it), so nothing is frozen for
+        extraction.  Returns ``None``; the state is exposed as ``_sidecar_state``."""
+        self._sidecar_frozen = None
+        recorded = fence_record.get("sidecar") if isinstance(fence_record.get("sidecar"), dict) else None
+        if not self.last_message_path and recorded is None:
+            self._sidecar_state = capture_mod.SIDECAR_STATE_NONE
+            return None
+        if recorded is None:
+            self._sidecar_state = capture_mod.SIDECAR_STATE_UNPROVEN
+            return None
+        state = str(recorded.get("state") or capture_mod.SIDECAR_STATE_UNPROVEN)
+        self._sidecar_state = state if state in (capture_mod.SIDECAR_STATE_PRESENT, capture_mod.SIDECAR_STATE_ABSENT,
+                                                 capture_mod.SIDECAR_STATE_UNREADABLE) else capture_mod.SIDECAR_STATE_UNPROVEN
+        return None
+    def _release_path(self) -> bytes:
+        return capture_mod.release_record_path(self.capture.path, self.incarnation)
+
+    def _owner_dir(self) -> str:
+        return os.path.dirname(os.fspath(self.capture.path))
+
+    def _self_identity(self, role: str) -> dict[str, Any]:
+        return identity.process_identity(
+            pid=os.getpid(), start_id=pty_supervisor.proc_start_ticks(os.getpid()),
+            boot_id=pty_supervisor.host_boot_id(), incarnation=self.fence,
+            source=pty_supervisor.evidence_source_id())
+
+    def _emitter_identity(self) -> dict[str, Any]:
+        record = self.record or {}
+        return identity.process_identity(
+            pid=int(record.get("pid") or 0), start_id=int(record.get("proc_start_ticks") or 0),
+            boot_id=str(record.get("boot_id") or ""), incarnation=self.fence,
+            source=str(record.get("evidence_source") or pty_supervisor.evidence_source_id()))
+
+    def _publish_fence(self, drained: dict[str, Any]) -> dict[str, Any]:
+        """The SUPERVISING session's fence publication (DESIGN §1.5 / §2.5).  On ``ended ==
+        "marker"``: claim generation g1 (tmp+fsync+link -- exclusive; a lost claim is
+        `owner_conflict`), then publish the fence (link-exclusive; a lost link means someone
+        already published -- read and VERIFY, never overwrite).  Every other end is a NAMED
+        non-success and publishes nothing.  ``finality`` is set to
+        :data:`FINALITY_CAPTURE_FINALIZED` ONLY when a verified fence exists."""
+        ended = drained.get("ended")
+        drained["finality"] = "none"
+        if ended != "marker":
+            drained["finality_detail"] = {
+                "budget": "the fence marker was not observed within the post-exit drain bound",
+                "master_unreadable": f"the master could not be read to the marker ({drained.get('errno')})",
+                "marker_inconsistent": "the fence marker occurs more than once in the capture",
+            }.get(str(ended), "the fence marker was not observed")
+            drained["outcome"] = capture_mod.OUTCOME_BOUNDARY_UNPROVEN
+            return drained
         sentinel = self._read_sentinel()
         if sentinel["outcome"] == "exited":
             exit_how, exit_code = "exit_sentinel", sentinel["code"]
         elif self.exit_proof is not None and self.exit_proof.get("proven"):
             exit_how, exit_code = str(self.exit_proof.get("how") or "ladder"), None
         else:
-            exit_how, exit_code = "", None
-        ended = drained.get("ended")
-        # Round-10 iteration 2: a HANGUP is the positive end -- but on darwin the drain only
-        # emits `ended == "hangup"` after it proved slave absence WHILE THE WATCHER WAS HELD:
-        # either it drained to a quiet window, proved absence and authorised the release, or a
-        # hangup arrived with the watcher STILL ALIVE (the agent's own last slave close, not a
-        # revoke) and it proved absence then.  Both carry that absence proof (`drained
-        # ["holders"]`) and neither is manufactured by the watcher's exit.  Every other end --
-        # `retained_slave` (a present/unreadable holder authority at the quiet check OR at a
-        # watcher-alive hangup), `watcher_exit_unproven` (a darwin hangup this supervisor did
-        # not authorise, arriving after the watcher was already gone), `budget`,
-        # `master_unreadable` -- is UNPROVEN, naming the holder / cause; the finality gate then
-        # settles a typed `stream_end_unproven`, never COMPLETED.
-        proven = ended == "hangup" and bool(exit_how)
-        # The absence / holder evidence: the drain already carries it (proven-absence on a
-        # hangup, the offending holders otherwise); fall back to a fresh probe only when it
-        # did not.
-        holders = drained.get("holders")
-        if not isinstance(holders, dict):
-            holders = self._slave_holders_now()
-        detail = ""
-        if not proven:
-            detail = (
-                "a darwin master EOF arrived without this supervisor authorising the "
-                "watcher's release, so the watcher's exit -- not a proven slave absence -- "
-                "produced it; the revoke may have discarded a tail" if ended == "watcher_exit_unproven"
-                else "the pty hung up while the watcher was still held (the agent's own "
-                "hangup, no revoke), but a holder authority was present or unreadable on the "
-                "captured tty, so slave absence was never proven"
-                if ended == "retained_slave"
-                else "the pty did not hang up within the post-exit drain bound "
-                f"({self.profile.timeouts.post_exit_drain_budget_ms} ms); a descendant "
-                "retained the slave past the settle window (absence never proven)"
-                if ended == "budget"
-                else f"the master could not be read ({drained.get('errno')})"
-                if ended == "master_unreadable"
-                else "the exit is not proven; nothing binds the capture's end")
-        try:
-            capture_mod.write_capture_finalized(
-                self._finalized_path(), fence=self.fence,
-                finality=(capture_mod.FINALITY_PROVEN if proven
-                          else capture_mod.FINALITY_UNPROVEN),
-                writer=capture_mod.WRITER_SUPERVISOR, ended=str(drained.get("ended")),
-                errno_name=str(drained.get("errno") or ""),
-                total_bytes=self.capture.size, sha256=self.capture.sha256,
-                records=self.capture.records, exit_how=exit_how, exit_code=exit_code,
-                holders=holders, detail=detail)
-        except OSError as exc:
-            drained["finality"] = "none"
-            drained["finality_detail"] = f"finalized record not written: {exc}"
+            drained["finality_detail"] = "the exit is not proven; nothing binds the boundary"
+            drained["outcome"] = "exit_unproven"
             return drained
-        if proven:
-            drained["finality"] = FINALITY_CAPTURE_FINALIZED
+        offset_n, marker_len = int(drained["offset_n"]), int(drained["marker_len"])
+        fence_path = self._fence_path()
+        existing = capture_mod.read_capture_fence(fence_path, fence=self.fence)
+        if existing["outcome"] != capture_mod.EVIDENCE_FINAL:
+            owner = self._self_identity(capture_mod.OWNER_SUPERVISOR)
+            emitter = self._emitter_identity()
+            leader_pid = int((self.pty or {}).get("leader_pid") or 0)
+            reaper = identity.process_identity(
+                pid=leader_pid, start_id=int((self.pty or {}).get("watcher_start_id") or 0),
+                boot_id=str((self.pty or {}).get("boot_id") or pty_supervisor.host_boot_id()),
+                incarnation=self.fence, source=pty_supervisor.evidence_source_id())
+            # REVIEW_IMPLEMENTATION F-005: NO claim and NO publication without positive,
+            # complete identities for the owner (this process), the emitter (the pinned
+            # root) and the reaper (the watcher).  An unreadable start identity is the
+            # named LOST outcome `identity_unreadable`, never a zero inside a proof.
+            for axis, candidate in (("owner", owner), ("emitter", emitter), ("reaped_by", reaper)):
+                if not identity.identity_complete(candidate):
+                    self._journal(kind="EVENT", derived_from="pty", event="identity_unreadable",
+                                  state=self.state, vocabulary={"axis": axis, "identity": dict(candidate)})
+                    drained["finality_detail"] = f"the {axis} identity is not positively readable"
+                    drained["outcome"] = identity.IDENTITY_UNREADABLE
+                    return drained
+            evidence = {"predecessor_generation": 0, "predecessor": {}, "relinquish_record": False,
+                        "death_witness": capture_mod.EVIDENCE_FINAL, "highest_owner_alive": None}
+            generation = capture_mod.make_owner_generation(
+                fence=self.fence, generation=1, owner_role=capture_mod.OWNER_SUPERVISOR,
+                owner=owner, claim_reason="supervisor_alive_at_exit", superseded=None,
+                death_evidence="", claimed_at=_now_iso())
+            refused = capture_mod.claim_generation(self._owner_dir(), self.incarnation,
+                                                   generation, evidence)
+            if refused is not None:
+                highest, highest_rec, _state = capture_mod.read_generations(self._owner_dir(), self.incarnation)
+                self._journal(kind="EVENT", derived_from="pty", event="owner_conflict",
+                              state=self.state, vocabulary={"refusal": refused,
+                                                            "highest_generation": highest,
+                                                            "highest_owner": (highest_rec or {}).get("owner")})
+                drained["finality_detail"] = f"the finalizer generation could not be claimed ({refused})"
+                drained["outcome"] = refused
+                return drained
+            self._journal(kind="EVENT", derived_from="pty", event="owner_claimed",
+                          state=self.state, vocabulary={"generation": 1, "owner": owner})
+            data = self.capture.raw()
+            # PR #36 finding 1: the capture's answerability is MEASURED here, at publish, and
+            # bound into the fence as the fact a fenced settlement reads; the provenance
+            # entry is listed only when the measurement is positive.
+            publish_state = self._capture_state_at_publish()
+            record = capture_mod.make_capture_fence(
+                fence=self.fence, emitter=emitter,
+                emitter_pgid=int((self.record or {}).get("pgid") or 0),
+                offset_n=offset_n, marker_len=marker_len, marker_nonce=self.fence_nonce,
+                sha256_prefix=capture_mod.prefix_digest(data, offset_n),
+                tail_bytes_at_publish=max(0, len(data) - offset_n - marker_len),
+                exit_how=exit_how, exit_code=exit_code,
+                reaped_by=reaper,
+                owner=generation, evidence_source=pty_supervisor.evidence_source_id(),
+                provenance=[pty_supervisor.capture_mod_PROVENANCE_REAPED,
+                            pty_supervisor.capture_mod_PROVENANCE_MARKER_WRITTEN,
+                            pty_supervisor.capture_mod_PROVENANCE_MARKER_OBSERVED]
+                           + ([pty_supervisor.capture_mod_PROVENANCE_ANSWERABLE_AT_PUBLISH]
+                              if publish_state["answerable"] else [])
+                           + [pty_supervisor.capture_mod_PROVENANCE_OWNER_CLAIMED,
+                              pty_supervisor.capture_mod_PROVENANCE_SENTINEL if exit_how == "exit_sentinel" else exit_how],
+                published_at=_now_iso(),
+                sidecar=self._sidecar_fence_field(), capture_state=publish_state)
+            try:
+                capture_mod.write_capture_fence(fence_path, record)
+            except OSError as exc:
+                drained["finality_detail"] = f"fence not written: {exc}"
+                drained["outcome"] = capture_mod.OUTCOME_FENCE_MISSING
+                return drained
+            existing = capture_mod.read_capture_fence(fence_path, fence=self.fence)
+        return self._bind_fence(drained, existing, sentinel)
+
+    def _capture_state_at_publish(self) -> dict[str, Any]:
+        """PR #36 finding 1: the store's answerability and counters AT PUBLISH (an adopted /
+        masterless publisher re-reads the meta first), in the fence's closed shape."""
+        if self.adopted:
+            self.capture.refresh()
+        return capture_mod.capture_state_at_publish(
+            answerable=self.capture.completion_is_answerable(),
+            truncation=self.capture.truncation, dropped_bytes=self.capture.dropped_bytes,
+            total_bytes=self.capture.size)
+
+    def _bind_fence(self, drained: dict[str, Any], existing: Mapping[str, Any],
+                    sentinel: Mapping[str, Any]) -> dict[str, Any]:
+        """Verify a fence on disk against the capture and the sentinel; only a MATCH is final."""
+        if existing["outcome"] != capture_mod.EVIDENCE_FINAL:
+            drained["finality"] = str(existing["outcome"])
+            drained["finality_detail"] = str(existing.get("detail") or "")
+            drained["outcome"] = (capture_mod.OUTCOME_LEGACY_FINALIZED
+                                  if existing["outcome"] == capture_mod.OUTCOME_LEGACY_FINALIZED
+                                  else capture_mod.OUTCOME_FENCE_FOREIGN if existing["outcome"] == "foreign"
+                                  else capture_mod.OUTCOME_FENCE_MISSING)
+            return drained
+        record = existing["record"]
+        bound = capture_mod.fence_matches(record, capture=self.capture.path,
+                                          sentinel_code=sentinel.get("code"),
+                                          sentinel_present=sentinel["outcome"] == "exited")
+        if not bound["matches"]:
+            drained["finality"] = "mismatch"
+            drained["finality_detail"] = str(bound["reason"]) + (f":{bound['axis']}" if bound.get("axis") else "")
+            drained["outcome"] = (identity.IDENTITY_UNREADABLE if bound["reason"] == "identity_unreadable"
+                                  else capture_mod.OUTCOME_FENCE_MISMATCH)
+            return drained
+        boundary = record["boundary"]
+        sidecar_refusal = self._freeze_sidecar(record)
+        if sidecar_refusal is not None:
+            drained["finality"] = "mismatch"
+            drained["finality_detail"] = "the -o sidecar no longer matches the digest the fence froze"
+            drained["outcome"] = sidecar_refusal
+            return drained
+        self._boundary = {"offset_n": int(boundary["offset_n"]),
+                          "marker_len": int(boundary.get("marker_len") or 0),
+                          "fence": record}
+        drained["finality"] = FINALITY_CAPTURE_FINALIZED
+        drained["offset_n"] = int(boundary["offset_n"])
+        drained["marker_len"] = int(boundary.get("marker_len") or 0)
+        drained["fence"] = {k: record.get(k) for k in ("owner", "exit", "evidence_source", "published_at")}
+        drained["fence"]["boundary"] = dict(boundary)
+        self._journal(kind="EVENT", derived_from="pty", event="fence_published",
+                      state=self.state,
+                      vocabulary={"offset_n": int(boundary["offset_n"]),
+                                  "sha256_prefix": boundary.get("sha256_prefix"),
+                                  "owner": record.get("owner"), "exit": record.get("exit"),
+                                  "provenance": record.get("provenance"),
+                                  # PR #36 finding 1: the answerability fact the settlement reads
+                                  "capture_at_publish": record.get("capture_at_publish")})
+        return drained
+
+    def _fence_from_disk(self, drained: dict[str, Any]) -> dict[str, Any]:
+        """A MASTERLESS session (adopted; the supervisor that held the master is gone):
+        finality is the fence on disk, verified against the capture and the sentinel.  Without
+        a fence, a SUCCESSOR may publish one ONLY when the marker is already in the capture,
+        the exit is proven, and the highest owner generation is absent, relinquished or
+        positively dead (a per-pid identity read, never a scan) -- DESIGN §1.6 C2/C7."""
+        sentinel = self._read_sentinel()
+        drained["sentinel"] = sentinel["outcome"]
+        existing = capture_mod.read_capture_fence(self._fence_path(), fence=self.fence,
+                                                  legacy_path=capture_mod.capture_finalized_path(
+                                                      self.capture.path, self.incarnation))
+        if existing["outcome"] == capture_mod.EVIDENCE_FINAL:
+            return self._bind_adopted(drained, existing, sentinel)
+        if existing["outcome"] != "absent":
+            return self._bind_adopted(drained, existing, sentinel)
+        # No fence.  Can THIS successor publish one?  The orphan watcher writes the sentinel
+        # BEFORE it drains the marker into the capture file and publishes, so a successor
+        # that reads the sentinel first waits -- fence-first, then the capture -- bounded by
+        # the drain budget; silence at the bound is `boundary_unproven`, named.
+        nonce = str(self.fence_nonce or "")
+        deadline = self._clock() + self.profile.timeouts.post_exit_drain_budget_ms / 1000.0
+        while True:
+            data = self.capture.raw()
+            offset_n, marker_len, state = capture_mod.marker_span(data, nonce) if nonce else (-1, 0, capture_mod.EVIDENCE_UNKNOWN)
+            if state in (capture_mod.EVIDENCE_FINAL, capture_mod.EVIDENCE_INCONSISTENT):
+                break
+            if self._clock() >= deadline:
+                break
+            time.sleep(0.05)
+            existing = capture_mod.read_capture_fence(self._fence_path(), fence=self.fence)
+            if existing["outcome"] != "absent":
+                return self._bind_adopted(drained, existing, sentinel)
+        if state != capture_mod.EVIDENCE_FINAL:
+            drained["finality"] = "none"
+            drained["finality_detail"] = ("the fence marker is not in the capture; the boundary "
+                                          "cannot be proven by a successor")
+            drained["outcome"] = capture_mod.OUTCOME_BOUNDARY_UNPROVEN
+            return drained
+        if sentinel["outcome"] == "exited":
+            exit_how, exit_code = "exit_sentinel", sentinel["code"]
+        elif self.exit_proof is not None and self.exit_proof.get("proven"):
+            exit_how, exit_code = str(self.exit_proof.get("how") or "table"), None
         else:
             drained["finality"] = "none"
-            drained["finality_detail"] = detail
-            drained["holders"] = holders
-        return drained
-
-    def _finality_from_proof(self, drained: dict[str, Any],
-                             sentinel: Mapping[str, Any]) -> dict[str, Any]:
-        """Bind the on-disk finalized record (if any) to the capture and the sentinel for
-        a MASTERLESS session: ``finality`` becomes :data:`FINALITY_CAPTURE_FINALIZED`
-        only when a ``proven`` record of THIS fence names the capture's exact length and
-        digest and the sentinel's code.  Anything else is named: ``exit_sentinel_only``
-        (the round-8 hole), ``unproven`` (the watcher recorded why, with the holders),
-        ``foreign`` / ``unreadable`` / ``mismatch`` / ``none``."""
-        proof = capture_mod.read_capture_finalized(self._finalized_path(), fence=self.fence)
-        drained["sentinel"] = sentinel["outcome"]
-        if proof["outcome"] == capture_mod.FINALITY_PROVEN:
-            bound = capture_mod.finalized_matches(
-                proof["record"], capture=self.capture.path,
-                sentinel_code=sentinel.get("code"),
-                sentinel_present=sentinel["outcome"] == "exited")
-            if bound["matches"]:
-                drained["finality"] = FINALITY_CAPTURE_FINALIZED
-                drained["finalized"] = {k: proof["record"].get(k) for k in
-                                        ("writer", "ended", "total_bytes", "sha256")}
+            drained["outcome"] = "exit_unproven"
+            drained["finality_detail"] = "no sentinel and no proven exit of the pinned incarnation"
+            return drained
+        # A lost claim race is not a verdict: the winner (the orphan watcher, or another
+        # successor) is publishing the fence NOW.  Re-evaluate fence-first, bounded by the drain
+        # budget: a fence that appears is verified and bound; a live winner without a fence is
+        # `finalizer_alive` at the bound; a winner that died without publishing is superseded
+        # by a fresh claim (its death is read per pid, never scanned).
+        deadline = self._clock() + self.profile.timeouts.post_exit_drain_budget_ms / 1000.0
+        while True:
+            outcome = self._successor_attempt(drained, sentinel, data, offset_n, marker_len,
+                                              nonce, exit_how, exit_code)
+            if outcome is None:
                 return drained
-            drained["finality"] = "mismatch"
-            drained["finality_detail"] = str(bound["reason"])
-            return drained
-        if proof["outcome"] == capture_mod.FINALITY_UNPROVEN:
-            record = proof["record"] or {}
-            drained["finality"] = "unproven"
-            drained["finality_detail"] = str(record.get("detail") or "")
-            drained["holders"] = dict(record.get("holders") or {})
-            drained["watcher_ended"] = str(record.get("ended") or "")
-            return drained
-        if proof["outcome"] in ("foreign", "unreadable"):
-            drained["finality"] = proof["outcome"]
-            drained["finality_detail"] = str(proof.get("detail") or "")
-            return drained
-        drained["finality"] = ("exit_sentinel_only" if sentinel["outcome"] == "exited"
-                               else "none")
-        return drained
+            if outcome not in (capture_mod.OUTCOME_OWNER_CONFLICT, capture_mod.OUTCOME_FINALIZER_ALIVE):
+                return drained
+            if self._clock() >= deadline:
+                return drained
+            time.sleep(0.05)
+            existing = capture_mod.read_capture_fence(self._fence_path(), fence=self.fence)
+            if existing["outcome"] != "absent":
+                return self._bind_adopted(drained, existing, sentinel)
+            data = self.capture.raw()
 
-    def _slave_holders_now(self) -> dict[str, Any]:
-        """The COMPLETE, fail-closed slave-descriptor authority (iteration 4, option B):
-        :func:`standalone_pty.slave_device_holders` enumerates EVERY same-uid process's open
-        descriptors (darwin ``libproc``) and matches each vnode fd against the slave device's
-        ``(dev, ino)``, so it finds a retained holder -- on the tty or ``setsid``'d off it --
-        and NEVER silently skips a process (a denied ``proc_pidinfo`` becomes ``unenumerable``
-        -> ``unreadable``, unlike ``lsof``).  The exited agent and the deferring watcher are
-        excluded (neither is a holder).  A tty-scoped ``ps -t`` listing is attached purely as
-        additional diagnostic naming; the ``state`` is the ``libproc`` authority's and nothing
-        else moves it."""
-        slave = str((self.pty or {}).get("slave_name") or "")
+    def _successor_attempt(self, drained: dict[str, Any], sentinel: Mapping[str, Any],
+                           data: bytes, offset_n: int, marker_len: int, nonce: str,
+                           exit_how: str, exit_code: int | None) -> str | None:
+        """One successor claim-and-publish attempt (see :meth:`_fence_from_disk`).  ``None``
+        when ``drained`` is final (bound); else the NAMED refusal (also set on ``drained``)."""
+        highest, highest_rec, gstate = capture_mod.read_generations(self._owner_dir(), self.incarnation)
+        if gstate != capture_mod.EVIDENCE_FINAL:
+            drained["finality"] = "none"
+            drained["outcome"] = "identity_unreadable"
+            drained["finality_detail"] = "the owner generations could not be read"
+            return "identity_unreadable"
+        alive: bool | None = None
+        witness = capture_mod.EVIDENCE_FINAL
+        relinquish = False
+        predecessor = None
+        if highest and highest_rec:
+            predecessor = highest_rec.get("owner") or {}
+            observed = self._identity_reader(int(predecessor.get("pid") or 0))
+            if observed["start_state"] == "absent":
+                alive, witness = False, capture_mod.EVIDENCE_FINAL      # ESRCH: that incarnation is gone
+            elif observed["start_state"] != capture_mod.EVIDENCE_FINAL:
+                alive, witness = None, capture_mod.EVIDENCE_UNREADABLE  # EPERM/other: no evidence
+            else:
+                alive = int(observed["start_id"]) == int(predecessor.get("start_id") or -1)
+                witness = capture_mod.EVIDENCE_UNKNOWN if alive else capture_mod.EVIDENCE_FINAL
+            relinquish = capture_mod.read_relinquish(self._owner_dir(), self.incarnation, highest)["outcome"] == "present"
+        action, outcome = capture_mod.may_claim_generation(
+            fence_published=False, highest_owner_alive=alive, relinquish_record=relinquish,
+            death_witness=witness)
+        if action != "claim":
+            drained["finality"] = "none"
+            drained["outcome"] = outcome or capture_mod.OUTCOME_FINALIZER_ALIVE
+            drained["finality_detail"] = f"succession refused: {drained['outcome']}"
+            return str(drained["outcome"])
+        owner = self._self_identity(capture_mod.OWNER_SUCCESSOR)
+        emitter = self._emitter_identity()
+        for axis, candidate in (("owner", owner), ("emitter", emitter)):
+            if not identity.identity_complete(candidate):        # F-005
+                drained["finality"] = "none"
+                drained["outcome"] = identity.IDENTITY_UNREADABLE
+                drained["finality_detail"] = f"the {axis} identity is not positively readable"
+                return identity.IDENTITY_UNREADABLE
+        evidence = {"predecessor_generation": highest, "predecessor": predecessor or {},
+                    "relinquish_record": relinquish, "death_witness": witness,
+                    "highest_owner_alive": alive}
+        generation = capture_mod.make_owner_generation(
+            fence=self.fence, generation=highest + 1, owner_role=capture_mod.OWNER_SUCCESSOR,
+            owner=owner, claim_reason="successor_owner_dead" if highest else "successor_no_owner",
+            superseded=predecessor, death_evidence=("relinquish_record" if relinquish else
+                                                    ("esrch_or_start_identity_mismatch" if highest else "")),
+            claimed_at=_now_iso())
+        refused = capture_mod.claim_generation(self._owner_dir(), self.incarnation, generation, evidence)
+        if refused is not None:
+            drained["finality"] = "none"
+            drained["outcome"] = refused
+            drained["finality_detail"] = f"succession lost: {refused}"
+            return refused
+        publish_state = self._capture_state_at_publish()          # PR #36 finding 1
+        record = capture_mod.make_capture_fence(
+            fence=self.fence, emitter=emitter,
+            emitter_pgid=int((self.record or {}).get("pgid") or 0),
+            offset_n=offset_n, marker_len=marker_len, marker_nonce=nonce,
+            sha256_prefix=capture_mod.prefix_digest(data, offset_n),
+            tail_bytes_at_publish=max(0, len(data) - offset_n - marker_len),
+            exit_how=exit_how, exit_code=exit_code, reaped_by=None, owner=generation,
+            evidence_source=pty_supervisor.evidence_source_id(),
+            provenance=[pty_supervisor.capture_mod_PROVENANCE_MARKER_OBSERVED,
+                        pty_supervisor.capture_mod_PROVENANCE_OWNER_CLAIMED,
+                        "published_by_successor_from_captured_marker"]
+                       + ([pty_supervisor.capture_mod_PROVENANCE_ANSWERABLE_AT_PUBLISH]
+                          if publish_state["answerable"] else []),
+            published_at=_now_iso(), sidecar=self._sidecar_fence_field(),
+            capture_state=publish_state)
+        try:
+            capture_mod.write_capture_fence(self._fence_path(), record)
+        except OSError as exc:
+            drained["finality"] = "none"
+            drained["outcome"] = capture_mod.OUTCOME_FENCE_MISSING
+            drained["finality_detail"] = f"fence not written: {exc}"
+            return capture_mod.OUTCOME_FENCE_MISSING
+        self._bind_adopted(drained, capture_mod.read_capture_fence(self._fence_path(), fence=self.fence), sentinel)
+        return None
+
+    def _bind_adopted(self, drained: dict[str, Any], existing: Mapping[str, Any],
+                      sentinel: Mapping[str, Any]) -> dict[str, Any]:
+        """Masterless binding: verify the fence, then (F-003) reconcile the release boundary
+        from the record or the captured RELEASE marker so the settlement names the tail."""
+        out = self._bind_fence(drained, existing, sentinel)
+        if out.get("finality") == FINALITY_CAPTURE_FINALIZED:
+            out["release"] = self._recover_release_boundary()
+        return out
+
+    def _recover_release_boundary(self) -> dict[str, Any]:
+        """REVIEW_IMPLEMENTATION F-003, the ADOPTED (masterless) side of the release protocol:
+        verify the `release.<inc>` record against the fence and the capture, or recover the
+        boundary R from a single RELEASE marker already in the capture (the custodian died
+        between release-1 and its record) and publish the record as `successor_from_capture`;
+        a duplicated marker is `inconsistent` -> `diagnostic_tail_unaccounted`; nothing at all
+        is `release_record_missing`.  `[0, N)` and the fence are never touched."""
+        out: dict[str, Any] = {"offset_r": -1, "retained_tail_bytes": 0, "post_release_bytes": None,
+                               "state": capture_mod.EVIDENCE_UNKNOWN, "outcome": None,
+                               "recovered_by": "adoption"}
+        if self._boundary is None:
+            out["outcome"] = capture_mod.OUTCOME_DIAGNOSTIC_TAIL_UNACCOUNTED
+            return out
+        data = self.capture.raw()
+        fence_record = self._boundary["fence"]
+        offset_n = int(self._boundary["offset_n"])
+        marker_len = int(self._boundary.get("marker_len") or 0)
+        nonce = str(fence_record.get("boundary", {}).get("marker_nonce") or self.fence_nonce or "")
+        on_disk = capture_mod.read_release_record(self._release_path(), fence=self.fence)
+        if on_disk["outcome"] == capture_mod.EVIDENCE_FINAL:
+            joined = capture_mod.verify_release_record(on_disk["record"], capture=data,
+                                                       fence_path=self._fence_path(),
+                                                       fence_record=fence_record)
+            record = on_disk["record"]
+            if joined["matches"]:
+                out.update({"offset_r": int(record["offset_r"]),
+                            "retained_tail_bytes": int(record["retained_tail_bytes"]),
+                            "retained_tail_sha256": record["retained_tail_sha256"],
+                            "state": capture_mod.EVIDENCE_FINAL, "recovered_by": "record_verified"})
+            else:
+                out.update({"state": capture_mod.EVIDENCE_INCONSISTENT,
+                            "outcome": capture_mod.OUTCOME_DIAGNOSTIC_TAIL_UNACCOUNTED,
+                            "release_record": joined["reason"]})
+            self._release = out
+            return out
+        offset_r, _r_len, state, outcome = capture_mod.recover_release_boundary(
+            data, nonce, offset_n, release_record_present=on_disk["outcome"] not in ("absent",))
+        if state != capture_mod.EVIDENCE_FINAL:
+            out.update({"state": state, "outcome": outcome,
+                        "release_record": capture_mod.OUTCOME_RELEASE_RECORD_MISSING
+                        if on_disk["outcome"] == "absent" else on_disk["outcome"]})
+            self._release = out
+            return out
+        tail = data[offset_n + marker_len:offset_r]
+        record = capture_mod.make_release_record(
+            fence=self.fence, fence_file_sha256=capture_mod.file_digest(self._fence_path()),
+            release_nonce=nonce, offset_r=offset_r, retained_tail_bytes=len(tail),
+            retained_tail_sha256=capture_mod.prefix_digest(tail, len(tail)),
+            custodian=self._self_identity(capture_mod.OWNER_SUCCESSOR),
+            custodian_role=capture_mod.OWNER_SUCCESSOR, state=capture_mod.EVIDENCE_FINAL,
+            published_at=_now_iso())
+        try:
+            capture_mod.write_release_record(self._release_path(), record)
+        except OSError:
+            pass
+        verified = capture_mod.read_release_record(self._release_path(), fence=self.fence)
+        if (verified["outcome"] == capture_mod.EVIDENCE_FINAL
+                and capture_mod.verify_release_record(verified["record"], capture=data,
+                                                      fence_path=self._fence_path(),
+                                                      fence_record=fence_record)["matches"]):
+            out.update({"offset_r": offset_r, "retained_tail_bytes": len(tail),
+                        "retained_tail_sha256": record["retained_tail_sha256"],
+                        "state": capture_mod.EVIDENCE_FINAL, "recovered_by": "successor_from_capture"})
+        else:
+            out.update({"offset_r": offset_r, "retained_tail_bytes": len(tail),
+                        "state": capture_mod.EVIDENCE_UNKNOWN,
+                        "outcome": capture_mod.OUTCOME_DIAGNOSTIC_TAIL_UNACCOUNTED,
+                        "release_record": capture_mod.OUTCOME_RELEASE_RECORD_MISSING})
+        self._release = out
+        self._journal(kind="EVENT", derived_from="pty", event="release_observed",
+                      state=self.state, vocabulary=dict(out))
+        return out
+
+    def _release_two_phase(self) -> dict[str, Any]:
+        """OS-48 DESIGN §1.8, supervisor side: release-1 (the watcher writes the RELEASE marker),
+        drain the master to R, publish `release.<inc>` (exclusive), release-2 (the watcher
+        closes its slave reference), read to EOF/EIO and journal the post-release count.
+        Every non-success is NAMED (`diagnostic_tail_unaccounted`, `release_record_missing`);
+        the authoritative prefix is never touched."""
+        out: dict[str, Any] = {"offset_r": -1, "retained_tail_bytes": 0, "post_release_bytes": 0,
+                               "state": capture_mod.EVIDENCE_UNKNOWN, "outcome": None}
+        if self.pty is None or int(self.pty.get("master_fd", -1)) < 0 or self._boundary is None:
+            out["outcome"] = capture_mod.OUTCOME_DIAGNOSTIC_TAIL_UNACCOUNTED
+            return out
+        fd = int(self.pty["master_fd"])
+        nonce = str(self.fence_nonce or "")
+        offset_n = int(self._boundary["offset_n"])
+        marker_len = int(self._boundary.get("marker_len") or 0)
+        if not pty_supervisor.request_release_1(self.pty):
+            # C3: no watcher can serve release-1 (it is gone): the tail boundary is unknown
+            # and no record can exist -- both named.
+            out["outcome"] = capture_mod.OUTCOME_DIAGNOSTIC_TAIL_UNACCOUNTED
+            out["release_record"] = capture_mod.OUTCOME_RELEASE_RECORD_MISSING
+            self._release = out
+            self._journal(kind="EVENT", derived_from="pty", event="release_observed",
+                          state=self.state, vocabulary=dict(out))
+            return out
+        deadline = self._clock() + self.profile.timeouts.post_exit_drain_budget_ms / 1000.0
+        offset_r, r_len = -1, 0
+        while self._clock() < deadline:
+            data = self.capture.raw()
+            offset_r, r_len, state = capture_mod.find_release_marker(data, nonce, after=offset_n)
+            if state == capture_mod.EVIDENCE_FINAL:
+                break
+            if state == capture_mod.EVIDENCE_INCONSISTENT:
+                offset_r = -1
+                break
+            try:
+                ready, _, _ = select.select([fd], [], [], 0.05)
+            except (OSError, ValueError):
+                break
+            if not ready:
+                continue
+            try:
+                chunk = self._master_reader(fd, self.profile.capture.read_chunk)
+            except OSError:
+                break
+            if not chunk:
+                break
+            self.capture.append(chunk, at=_now_iso())
+        if offset_r >= 0:
+            data = self.capture.raw()
+            tail = data[offset_n + marker_len:offset_r]
+            record = capture_mod.make_release_record(
+                fence=self.fence, fence_file_sha256=capture_mod.file_digest(self._fence_path()),
+                release_nonce=nonce, offset_r=offset_r, retained_tail_bytes=len(tail),
+                retained_tail_sha256=capture_mod.prefix_digest(tail, len(tail)),
+                custodian=self._self_identity(capture_mod.OWNER_SUPERVISOR),
+                custodian_role=capture_mod.OWNER_SUPERVISOR, state=capture_mod.EVIDENCE_FINAL,
+                published_at=_now_iso())
+            out.update({"offset_r": offset_r, "retained_tail_bytes": len(tail),
+                        "retained_tail_sha256": record["retained_tail_sha256"]})
+            try:
+                published = capture_mod.write_release_record(self._release_path(), record)
+            except OSError as exc:
+                published = False
+                out["publish_error"] = f"{type(exc).__name__}:{getattr(exc, 'errno', '')}"
+            on_disk = capture_mod.read_release_record(self._release_path(), fence=self.fence)
+            if on_disk["outcome"] == capture_mod.EVIDENCE_FINAL:
+                # F-003: `final` means the record is ON DISK and joins this proof -- a lost
+                # link race to an equivalent record is verified, never assumed.
+                joined = capture_mod.verify_release_record(
+                    on_disk["record"], capture=data, fence_path=self._fence_path(),
+                    fence_record=self._boundary["fence"])
+                if joined["matches"]:
+                    out["state"] = capture_mod.EVIDENCE_FINAL
+                    out["published_by_this_process"] = bool(published)
+                else:
+                    out["state"] = capture_mod.EVIDENCE_INCONSISTENT
+                    out["outcome"] = capture_mod.OUTCOME_DIAGNOSTIC_TAIL_UNACCOUNTED
+                    out["release_record"] = joined["reason"]
+            else:
+                # the record could not be published (ENOSPC, EROFS, ...): the tail boundary
+                # is observed in the stream but NOT durable -- named, never `final`.
+                out["state"] = capture_mod.EVIDENCE_UNKNOWN
+                out["outcome"] = capture_mod.OUTCOME_DIAGNOSTIC_TAIL_UNACCOUNTED
+                out["release_record"] = capture_mod.OUTCOME_RELEASE_RECORD_MISSING
+        else:
+            out["outcome"] = capture_mod.OUTCOME_DIAGNOSTIC_TAIL_UNACCOUNTED
+            out["release_record"] = capture_mod.OUTCOME_RELEASE_RECORD_MISSING
+        pty_supervisor._signal_drain_handoff(self.pty)          # release-2
+        post = 0
+        eof_deadline = self._clock() + 2.0
+        while self._clock() < eof_deadline:
+            try:
+                ready, _, _ = select.select([fd], [], [], 0.05)
+            except (OSError, ValueError):
+                break
+            if not ready:
+                continue
+            try:
+                chunk = self._master_reader(fd, self.profile.capture.read_chunk)
+            except OSError:
+                break
+            if not chunk:
+                break
+            self.capture.append(chunk, at=_now_iso())
+            post += len(chunk)
+        out["post_release_bytes"] = post
+        self._release = out
+        self._journal(kind="EVENT", derived_from="pty", event="release_observed",
+                      state=self.state, vocabulary=dict(out))
+        return out
+
+    def _holders_diagnostic(self) -> dict[str, Any]:
+        """DIAGNOSTIC ONLY (DESIGN §2.6): the tty-scoped table rows other than the agent and the
+        watcher, for the journal.  Never consulted by any decision; the libproc enumeration is
+        not called from the runtime at all."""
         tty = str((self.record or {}).get("captured_tty") or "")
         agent = int((self.record or {}).get("pid") or 0)
         leader = int((self.pty or {}).get("leader_pid") or (self.record or {}).get("sid") or 0)
-        out = pty_supervisor.slave_device_holders(slave, exclude_pids=(agent, leader))
-        out["tty"] = tty
-        out["fd_holders"] = list(out.get("holders") or ())
-        # Diagnostic tty rows only (never a proof); best-effort.
         rows: list[dict[str, Any]] = []
         if tty:
             try:
                 snapshot = self._snapshot()
                 rows = [dict(row) for row in snapshot.get("rows", ())
                         if int(row.get("pid", 0)) not in (agent, leader)]
-            except Exception:  # noqa: BLE001 - evidence, never a failure of the drain
+            except Exception:  # noqa: BLE001
                 rows = []
-        out["rows"] = rows
-        return out
+        return {"method": "ps_t_diagnostic", "tty": tty, "rows": rows,
+                "note": "diagnostic only; a negative enumeration is never evidence"}
+
+    def _watcher_signal(self, sig: int) -> str:
+        """OS-48 DESIGN §2.3: deliver ``sig`` to the agent THROUGH THE WATCHER (its parent) over
+        the control socket -- ``sent`` or a named refusal.  Without a control end (an adopted
+        session, a raw test session) the target is `signal_unbound`: no integer-pid kill."""
+        control = (self.pty or {}).get("control_fd")
+        if not isinstance(control, int) or control < 0:
+            return "refused:" + identity.SIGNAL_UNBOUND
+        return pty_supervisor.request_watcher_signal(control, sig, self.fence)
 
     def _leader_alive(self) -> bool:
-        """Round-10 iteration 2 (item 1): a NON-reaping, zombie-aware liveness probe of the
-        exit watcher (this supervisor's OWN child, ``leader_pid``), used by
-        ``drain_after_exit`` to tell the agent's genuine hangup (OUR watcher still running, so
-        it did not produce this hangup) from OUR watcher's own revoke (watcher gone).
-
-        The probe is PROCESS-scoped (``ps -p <leader> -o stat=``), NOT tty-scoped, and that is
-        deliberate: an agent that made the slave its OWN controlling terminal (via ``setsid`` +
-        ``TIOCSCTTY`` -- some real CLIs do) revokes that tty when it exits, which DETACHES our
-        still-alive watcher from the tty, so a ``ps -t`` of the captured tty no longer lists the
-        watcher even though it is very much alive and deferring (observed: ``ps -t`` row absent
-        while ``ps -p`` reports state ``Ss``).  That agent-exit revoke is the AGENT's own end-of-stream,
-        not OUR watcher's -- so the discriminator must be the watcher's PROCESS liveness, never
-        its tty membership.  ``ps -p`` targets one known pid (this process's own child); it is
-        not the tty-scoped ownership discovery the C2 rule governs and is not a ``ps -ax`` scan.
-
-        True ONLY when the watcher process exists with a non-zombie state.  GONE (empty
-        output), a ZOMBIE (its ``exit`` -- and thus any revoke of a tty IT led -- has already
-        run; it merely awaits ``reap``), or an unreadable/failed probe all read as NOT alive:
-        the caller then fails closed and refuses the unauthorised hangup as
-        ``watcher_exit_unproven``.  Never ``waitpid``s the leader -- that would reap it out
-        from under ``_reclaim``."""
+        """A NON-reaping, zombie-aware liveness probe of the exit watcher (this supervisor's own
+        child), PROCESS-scoped (``ps -o stat= -p``), used only for diagnostics and by the
+        adopted-session exit-evidence wait.  Never ``waitpid``s the leader."""
         leader = int((self.pty or {}).get("leader_pid") or (self.record or {}).get("sid") or 0)
         if leader <= 0:
             return False
@@ -2565,12 +3346,12 @@ class StandaloneSession:
             probe = subprocess.run(["ps", "-o", "stat=", "-p", str(leader)],
                                    capture_output=True, text=True, timeout=10, check=False)
         except (OSError, subprocess.SubprocessError):
-            return False           # could not look: UNKNOWN is never liveness, fail closed
+            return False
         if probe.returncode not in (0, 1):
             return False
         stat = (probe.stdout or "").strip()
         if not stat:
-            return False           # the watcher is gone -- its exit (any revoke) already ran
+            return False
         return not stat.startswith("Z")
 
     def pump(self, *, timeout_ms: int = 50) -> int:
@@ -2770,7 +3551,8 @@ class StandaloneSession:
         snapshot = self._snapshot()
         # Finding 16: `{}` when the table was READ and holds no such pid, `None` only when
         # it could not be read -- `verify` names the two differently.
-        observed = interrupt_mod.observed_row(snapshot, int(self.record["pid"]))
+        observed = interrupt_mod.observed_row(snapshot, int(self.record["pid"]),
+                                              self._identity_reader)
         try:
             permit = identity.assert_may_act(self.record, "write_input", observed=observed)
         except identity.OwnershipRefused:
@@ -2780,6 +3562,8 @@ class StandaloneSession:
         payload = command.get("payload") if isinstance(command, Mapping) else None
         text = payload if isinstance(payload, str) else _canonical(command)
         baseline = self.capture.size
+        # OS-48 §1.4: settlement records are selected over [baseline, N) -- the delivery baseline.
+        self._settlement_baseline = int(baseline)
         rate = self._measured_ingest_rate
         if rate is None:
             # Measured on a THROWAWAY pty, never on this session's: padding written into a
@@ -2798,6 +3582,11 @@ class StandaloneSession:
                               cols=self.profile.cols),
                           "at": _now_iso()}
         self.delivery_events.append(delivery_event)
+        # OS-48 PR #36 finding 4: the baseline and the event's DIGEST-ONLY provenance are
+        # DURABLE before the bytes go out (never the prompt: REVIEW_BUGFIX F-001), so a
+        # successor adopting this dispatch after a supervisor crash settles over the same
+        # [baseline, N) with the same echo provenance (`adopt` restores both).
+        self._record_delivery()
         # Round-7 consolidated review, follow-up item 6.  The delivery this write must
         # prove is bound to a DELIVERY INTENT of its own: the identity this dispatch is
         # bound to (the minted id, or the frozen adopted one) and the digest of THIS
@@ -2841,6 +3630,111 @@ class StandaloneSession:
                                   "pid": self.record["pid"],
                                   "captured_tty": self.record["captured_tty"]})
         return {"intent_id": self.intent_id, **result}
+
+    # -- OS-48 PR #36 finding 4: durable delivery provenance ----------------------------------
+    #: the journal row's `event` names (closed): the provenance was recorded; an adoption that
+    #: could not restore what the journal names
+    DELIVERY_RECORDED_EVENT = "delivery_recorded"
+    DELIVERY_UNRESTORED_EVENT = "delivery_provenance_unrestored"
+    #: the closed per-event vocabulary of a `delivery_recorded` row -- the offset, the
+    #: transport, the payload's digest + length, `at`.  There is NO payload key (REVIEW_BUGFIX
+    #: F-001) and, since run_c296ff67c325 (F-003), NO `echo_proof`: the digest, length and
+    #: transport are DIAGNOSTIC ONLY -- an adoption never consults them as excision authority.
+    DELIVERY_EVENT_ROW_KEYS = ("index", "offset", "payload_sha256", "payload_bytes", "transport",
+                               "at")
+
+    def _record_delivery(self) -> None:
+        """Persist `_settlement_baseline` + `delivery_events` as ONE journal row
+        `delivery_recorded` whose closed vocabulary carries, per event, the offset, the
+        `EchoTransport`, the payload's sha256 + byte length and `at`.  No byte of the prompt
+        is written anywhere durable (REVIEW_BUGFIX i1 F-001: the journal is a plain file a
+        stranger reads -- `append_delivery_intent`'s rule -- and an `argv` prompt is not in
+        the capture either); the earlier `capture.log.delivery.<inc>.json` record, which
+        carried the payload, no longer exists.
+
+        run_c296ff67c325 (PR #36 F-003; the USER DECISION narrowing PR36-4): the row is an
+        UNKEYED record a same-user writer can rewrite and re-digest, so nothing in it is
+        excision authority.  The former digest-only `echo_proof` (the echo forms' sha256 +
+        length) is no longer produced -- a tampered proof could name any visible agent span --
+        and the payload digest / length / transport that remain are diagnostic only.  A
+        successor restores the baseline and payload-less events from this row
+        (`_restore_delivery`); `resolve_delivery_echo` then resolves them STRUCTURALLY
+        (`lifecycle.unobserved_delivery_echo`) and excises nothing."""
+        self._journal(kind="EVENT", derived_from="driver", event=self.DELIVERY_RECORDED_EVENT,
+                      state=self.state,
+                      vocabulary={"baseline": int(self._settlement_baseline or 0),
+                                  "delivery_mode": self.profile.delivery_mode,
+                                  "events": [{"index": i, "offset": int(ev.get("offset", 0) or 0),
+                                              "payload_sha256": _sha256_text(str(ev.get("payload") or "")),
+                                              "payload_bytes": len(str(ev.get("payload") or "").encode("utf-8")),
+                                              "transport": _journal_transport(ev.get("transport")),
+                                              "at": str(ev.get("at") or "")}
+                                             for i, ev in enumerate(self.delivery_events)]})
+
+    def _restore_delivery(self, rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+        """The adopt-side half: from the LAST `delivery_recorded` row of this incarnation,
+        restore one PAYLOAD-LESS event per recorded event -- offset, transport, `at`.  The
+        restored events carry NO excision authority (run_c296ff67c325, F-003):
+        `resolve_delivery_echo` resolves a payload-less event from its transport KIND alone --
+        `argv` is `echo_absent` by structure, `pty_write` is `echo_unproven` /
+        `payload_unobserved` -- and excises nothing.
+
+        run_d6391487ff44 (the unkeyed `delivery_recorded.baseline` merge blocker): the adopted
+        session NEVER derives its ``_settlement_baseline`` from the row.  The row is UNKEYED --
+        a same-user writer rewrites its ``baseline`` and re-digests it with `record_digest` --
+        so a restored baseline is no more authenticated than the events beside it, and applying
+        one lets a forged/stale later baseline narrow the fenced prefix ``[0, N)`` PAST a
+        refusal (adopted COMPLETED where live FAILED; the earlier code also LEFT the row's
+        baseline applied when the event list was rejected as malformed).  With no authenticated
+        baseline source the successor settles over the FULL fenced prefix ``[0, N)``
+        (``_settlement_baseline`` stays 0): it examines a SUPERSET of what live examined, so its
+        settlement is a subset of live's (SAFETY parity -- adopted success is a subset of live
+        success), never wider (no AVAILABILITY parity -- an echoed refusal- or JSON-example
+        prompt before the live baseline is now inside the examined range and may make the
+        adopted settlement STRICTER: FAILED `refusal_in_boundary` / LOST
+        `record_framing_ambiguous`).  The row's ``baseline`` survives ONLY as DIAGNOSTIC
+        evidence (returned as ``journal_baseline_diagnostic``, journalled below and on
+        `identity_bound`); it never reaches `completion()`'s selection range,
+        `_positive_selection_over_bound_fence`, `refusal_evidence` or any narrowing.
+
+        A row whose event vocabulary is not the closed shape (a `payload` key, a pre-decision
+        `echo_proof` key, ...) restores NO event and is journalled by name
+        (`delivery_provenance_unrestored`); nothing from the row is applied (fail closed)."""
+        self._settlement_baseline = 0
+        self.delivery_events = []
+        named = [row for row in rows if row.get("kind") == "EVENT"
+                 and row.get("event") == self.DELIVERY_RECORDED_EVENT]
+        if not named:
+            return {"restored": False, "reason": "no_delivery_recorded_row", "events": 0,
+                    "journal_baseline_diagnostic": None}
+        vocab = dict(named[-1].get("source_vocabulary") or {})
+        # DIAGNOSTIC ONLY: the row's baseline is recorded for evidence and NEVER applied to
+        # `_settlement_baseline` -- the unkeyed row is not a settlement authority.
+        row_baseline = vocab.get("baseline")
+        journal_baseline = (row_baseline if isinstance(row_baseline, int)
+                            and not isinstance(row_baseline, bool) else None)
+        recorded = vocab.get("events")
+        reason = ""
+        if not isinstance(recorded, list):
+            reason = "delivery_recorded_row_malformed"
+        elif any(not isinstance(ev, Mapping) or set(ev) != set(self.DELIVERY_EVENT_ROW_KEYS)
+                 or "payload" in ev for ev in recorded):
+            reason = "delivery_recorded_events_malformed"
+        if reason:
+            self._journal(kind="EVENT", derived_from="driver", event=self.DELIVERY_UNRESTORED_EVENT,
+                          state=self.state,
+                          vocabulary={"reason": reason, "settlement_baseline": 0,
+                                      "journal_baseline_diagnostic": journal_baseline,
+                                      "events_named": len(recorded) if isinstance(recorded, list) else 0,
+                                      "events_restored": 0})
+            return {"restored": False, "reason": reason, "events": 0,
+                    "journal_baseline_diagnostic": journal_baseline}
+        self.delivery_events = [{"offset": int(ev.get("offset", 0) or 0), "payload": "",
+                                 "transport": dict(ev["transport"]) if isinstance(ev.get("transport"), Mapping) else None,
+                                 "at": str(ev.get("at") or "")}
+                                for ev in recorded]
+        return {"restored": True, "reason": "", "events": len(self.delivery_events),
+                "journal_baseline_diagnostic": journal_baseline}
 
     def _verify_delivery(self, baseline: int, baseline_working: bool, *,
                          event: Mapping[str, Any] | None = None,
@@ -2978,6 +3872,7 @@ class StandaloneSession:
             self.intent_id, reason, record=self.record, profile=self.profile,
             table_reader=self._table_reader, supervisor_pid=self._supervisor_pid,
             write_hint=self._write_hint if self.profile.graceful_hint else None,
+            identity_reader=self._identity_reader, watcher=self._watcher_signal,
             # Drain into the CAPTURE rather than discarding: the ladder needs the pipe
             # empty so an exiting child can finish exiting, and the transcript is evidence
             # this run must keep.  One call satisfies both.
@@ -3033,18 +3928,123 @@ class StandaloneSession:
             # one appending to the capture, so the meta and the bytes are re-read every
             # time rather than trusted from memory.
             self.capture.refresh()
-        answerable = self.capture.completion_is_answerable()
+        # OS-48 PR #36 finding 1: with a VERIFIED fence the answerability a settlement rests on
+        # is the fence's own recorded fact about [0, N) (`capture_at_publish`: the store had
+        # lost nothing when the owner published), never the live WHOLE-FILE state -- every
+        # limit drop / line cut / failed write / meta disagreement after the publish lies past
+        # the bytes the fence bound and is a fact about the diagnostic tail only.  On that
+        # path the whole file is not digested or read at all; the store's COUNTERS (the meta's
+        # truncation cause, dropped bytes, the irreversible unanswerable cause, the size) are
+        # recorded as `post_boundary` -- diagnostic evidence by name, moving nothing.  Before a
+        # fence is bound, or for a fence that carries no such fact (published before the field
+        # existed), the whole-capture answer stays in force -- fail-closed, as before.
+        post_boundary: dict[str, Any] | None = None
+        fenced = capture_mod.fenced_answerability(self._boundary.get("fence")) if self._boundary else None
+        if fenced is not None and fenced["source"] == capture_mod.ANSWERABILITY_SOURCE_FENCE:
+            answerable = fenced
+        else:
+            answerable = self.capture.completion_is_answerable()
+        if self._boundary is not None:
+            post_boundary = {"truncation": self.capture.truncation or "",
+                             "dropped_bytes": int(self.capture.dropped_bytes),
+                             "unanswerable": str(self.capture.unanswerable or ""),
+                             "size": int(self.capture.size),
+                             "offset_n": int(self._boundary["offset_n"]),
+                             "answerability_source": str((fenced or {}).get("source") or "")}
         exit_proven = sentinel["outcome"] == "exited"
         if not exit_proven and self.exit_proof is not None and self.exit_proof["proven"]:
             # The exit was proven by the ownership ladder / the process table with no
             # sentinel to carry the status (a SIGKILLed watcher, DR-2).  The exit is a fact
             # and the status is a NAMED absence -- `None`, never `0`.
             exit_proven = True
+        selection = None
+        if self._boundary is not None:
+            # OS-48 DESIGN §1.4: settlement records are selected over the FENCED range
+            # [baseline, N) only -- R1 refusal dominance, R2 exactly one, R3 dispatch binding.
+            offset_n = int(self._boundary["offset_n"])
+            baseline = min(max(0, int(self._settlement_baseline or 0)), offset_n)
+            try:
+                # The SEMANTIC rule: only [baseline, N) reaches the selector -- and (PR #36
+                # finding 1) the PHYSICAL read is exactly that: ONE bounded read of
+                # `N - baseline` bytes at `baseline`.  The marker and whatever diagnostic tail
+                # has been appended since are never read, allocated or decoded here, so a
+                # tail of any size -- or one too large to allocate -- has no path into this
+                # settlement (run_5fcd2beac376 N-003 read the file through EOF and sliced).
+                fenced_raw = self.capture.raw(baseline, offset_n - baseline)
+                fenced_text = fenced_raw.decode("utf-8", errors="replace")
+                # PR #36 finding 2: the selector gets the REAL delivery provenance -- the
+                # events `send` / `run_dispatch` recorded (payload, the `EchoTransport` read at
+                # the write, the capture offset of the write) -- translated into the fenced
+                # range's raw-byte coordinates.  `delivery_intent` carries a digest, never a
+                # payload, and could prove no echo; a negative translated offset (a delivery
+                # before the baseline) is `delivery_before_window`, unproven, excludes nothing.
+                events = tuple({**dict(ev), "offset": int(ev.get("offset", 0) or 0) - baseline}
+                               for ev in self.delivery_events if isinstance(ev, Mapping))
+                selection = self.driver.select_completion(
+                    fenced_text, raw=fenced_raw,
+                    bound_value=self._binding_identity(fenced_text) or "",
+                    # REVIEW_IMPLEMENTATION_iteration3 F-001 (a): R3's presence fact is the IMMUTABLE
+                    # fence snapshot (`present` at the owner's reap-step read), never a live
+                    # exists()/getsize() -- a sidecar created, removed or resized after N cannot
+                    # change the verdict.  `absent` / unreadable / unproven -> provenance_unbound.
+                    sidecar_present=self._sidecar_state == capture_mod.SIDECAR_STATE_PRESENT,
+                    delivery_events=events)
+                selection = dict(selection)
+                selection["settlement_range"] = {
+                    "baseline": baseline, "offset_n": offset_n, "read_bytes": len(fenced_raw),
+                    "delivery_events": len(events),
+                    "echo": str((selection.get("echo") or {}).get("state") or "no_delivery"),
+                    "echo_reason": str((selection.get("echo") or {}).get("reason") or "")}
+                # USER DECISION C2 (run_11b4061df84d): the one place every adopted settlement
+                # passes (`await_completion` / `collect` / `_collect_in_flight` all reach this
+                # method) -- an adopted `post_ready_delivery` success is withheld by name.
+                selection = withhold_adopted_post_ready_success(
+                    selection, adopted=self.adopted, delivery_mode=self.profile.delivery_mode)
+            except MemoryError:
+                # REVIEW_IMPLEMENTATION_iteration2 F-017: the reader could not EXAMINE the fenced
+                # range for want of memory -- in the parser (already classified inside
+                # `parse_json`) or in the reader's own copies / decodes / line splits around
+                # it.  Whatever was or was not read, nothing about the range is decided: the
+                # NAMED incomplete-scan outcome (`resource_limit`), never an escaping
+                # exception and never a settlement.  This bounds the settlement READER only;
+                # it is no recovery guarantee for a process-wide allocation failure elsewhere.
+                fenced_raw = b""
+                selection = {"record": None, "outcome": capture_mod.OUTCOME_RECORD_SCAN_INCOMPLETE,
+                             "refusal": None, "candidates": 0,
+                             "scan": {"complete": False, "reason": capture_mod.SCAN_INCOMPLETE_RESOURCE,
+                                      "examined": 0}}
+        # run_7859f202457c F-017 (REVIEW_IMPLEMENTATION_iteration3 of run_5fcd2beac376): with a
+        # fence, the SELECTION above is the whole settlement input -- `completion_evidence`
+        # takes its record / provenance outcome / refusal from `selection` and never reads
+        # `text` when one is supplied.  Iteration 3 nevertheless re-read [baseline, N) here
+        # (`_authoritative_text`) and, when THAT second read raised `MemoryError`, replaced
+        # an already-selected `refusal_in_boundary` with `record_scan_incomplete` -- a
+        # positively established R1 refusal turned into LOST by a read whose result nothing
+        # consumed.  The redundant read is gone: once `select_completion` has returned, no
+        # further read of the capture takes place in this method, so no later reader
+        # failure can reach the selection (DESIGN §1.4 R1: a selected refusal dominates;
+        # the same holds for a selected completion record).  Diagnostics that would need
+        # the range again must be read AFTER settlement and may never feed back into it.
+        # Without a fence there is no selection at all and the legacy last-of-type reading
+        # of the transcript is the driver's only input (an allocation failure there leaves
+        # `text` empty and `selection` None -- no record, never a settlement).
+        text = ""
+        if self._boundary is None:
+            try:
+                text = self.capture.transcript()
+            except MemoryError:
+                text = ""
         evidence = self.driver.completion_evidence(
-            self.capture.transcript(),
+            text,
             exit_status=sentinel["code"] if sentinel["outcome"] == "exited" else None,
             exit_proven=exit_proven,
-            capture_answerable=answerable["answerable"])
+            capture_answerable=answerable["answerable"],
+            selection=selection)
+        evidence["boundary"] = dict(self._boundary) if self._boundary else None
+        if selection is not None and selection.get("settlement_range"):
+            evidence["settlement_range"] = dict(selection["settlement_range"])
+        if post_boundary is not None:
+            evidence["post_boundary"] = post_boundary
         if not answerable["answerable"]:
             # The capture names WHY it cannot answer; the driver only knows THAT it cannot.
             evidence["lost_reason"] = answerable["lost_reason"]
@@ -3060,6 +4060,18 @@ class StandaloneSession:
         """
         if self.pty is not None and int(self.pty.get("master_fd", -1)) >= 0:
             self.pump(timeout_ms=100)
+            # OS-48 DESIGN §2.5 rule 2: closing the guard while ALIVE is a RELINQUISHMENT, and
+            # the watcher may only succeed a live owner through this durable record -- guard EOF
+            # alone is never death evidence (probe_d11).
+            try:
+                highest, _rec, _state = capture_mod.read_generations(self._owner_dir(), self.incarnation)
+                if highest and self._boundary is None:
+                    capture_mod.write_relinquish(
+                        self._owner_dir(), self.incarnation, fence=self.fence, generation=highest,
+                        owner=self._self_identity(capture_mod.OWNER_SUPERVISOR),
+                        reason="release_handoff", written_at=_now_iso())
+            except Exception:  # noqa: BLE001 - the release itself must proceed
+                pass
             pty_supervisor.release(self.pty)
 
 
@@ -3137,6 +4149,52 @@ class StandaloneRuntime:
                                       intent_ids=intent_ids)
 
 
+def withhold_adopted_post_ready_success(selection: Mapping[str, Any], *, adopted: bool,
+                                        delivery_mode: str) -> dict[str, Any]:
+    """USER DECISION C2 (run_11b4061df84d, USER_DECISION_C2.md; PR #36 review F-001).
+
+    An ADOPTED session of a ``post_ready_delivery`` dispatch examines the full fenced prefix
+    ``[0, N)`` because no trustworthy settlement baseline can be restored: the live one lived
+    in the crashed supervisor's memory (`send()` read `capture.size` at the prompt write) and
+    the journal's copy is unkeyed and never authority (run_d6391487ff44).  Nothing in the
+    fenced bytes marks the delivery instant, so a sole bound completion record emitted BEFORE
+    the prompt is indistinguishable from one emitted after it -- the range growth that can
+    only REJECT under R1 / R2 / framing / scan could ESTABLISH a success here.
+
+    Rule, baseline-independent and consulting no journal value: every refusal / reader-failure
+    outcome the selector already produced is preserved (`refusal_in_boundary`, the sole
+    error-field refusal, `provenance_ambiguous`, `provenance_unbound`,
+    `record_framing_ambiguous`, `record_scan_incomplete` -- each stricter-or-equal to live),
+    and a selection that would otherwise carry a RECORD to the verdict -- ``outcome is None``
+    with no refusal: a bound record, `single_record_optin`, or the legacy undeclared record --
+    becomes the NAMED LOST outcome `adopted_baseline_unknown` with the record withheld (no record
+    at all stays FAILED `no_completion_record`, already stricter-or-equal to live).  So
+    an adopted ``post_ready_delivery`` dispatch can never settle COMPLETED, while
+    ``launch_with_prompt`` (baseline 0: live and adopted examine the same range; both shipping
+    profiles) and every LIVE settlement are untouched.  Pure, so the invariant locks apply the
+    very same function to the selector's output.
+    """
+    out = dict(selection)
+    if not adopted or delivery_mode != "post_ready_delivery":
+        return out
+    if out.get("outcome") is not None or out.get("refusal") is not None:
+        return out
+    withheld = out.get("record")
+    if withheld is None:
+        # no record reached the verdict at all: FAILED `no_completion_record`, already
+        # stricter-or-equal to live -- there is no success to withhold
+        return out
+    out.update({
+        "record": None, "outcome": capture_mod.OUTCOME_ADOPTED_BASELINE_UNKNOWN,
+        "adoption": {"rule": capture_mod.OUTCOME_ADOPTED_BASELINE_UNKNOWN,
+                     "delivery_mode": delivery_mode,
+                     "withheld_record_type": (withheld.get("type") if isinstance(withheld, Mapping) else None),
+                     "detail": "an adopted post_ready_delivery settlement cannot restore the "
+                               "live baseline; a success over [0, N) is withheld by name "
+                               "(USER DECISION C2)"}})
+    return out
+
+
 def _pid_present(pid: int) -> bool:
     """``kill(pid, 0)``: exists (ours or not) vs ESRCH."""
     import errno
@@ -3184,6 +4242,23 @@ def _journal_echo(echo: Mapping[str, Any] | None) -> dict[str, Any] | None:
                         "span": [int(e["span"][0]), int(e["span"][1])]
                         if e.get("span") else None}
                        for e in (echo.get("events") or ()) if isinstance(e, Mapping)]}
+
+
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _journal_transport(transport: Any) -> dict[str, Any] | None:
+    """The journal-safe form of an `EchoTransport`: kind, framing, columns and the termios
+    flags (plain bools / ints already) -- no payload bytes are in it."""
+    if not isinstance(transport, Mapping):
+        return None
+    out = {"kind": str(transport.get("kind", "")), "framed": bool(transport.get("framed")),
+           "cols": int(transport.get("cols", 0) or 0), "read_at": str(transport.get("read_at", ""))}
+    flags = transport.get("termios")
+    out["termios"] = ({str(k): (list(v) if isinstance(v, (list, tuple)) else v) for k, v in flags.items()}
+                      if isinstance(flags, Mapping) else None)
+    return out
 
 
 def _now_iso() -> str:

@@ -119,7 +119,45 @@ LOST_REASONS = (
     # record the transcript holds, the stream is not proven final, so nothing settles as
     # a success from it.
     "stream_end_unproven",
+    # OS-48 (DESIGN §5/§6, additive).  The fence / ownership machinery's named non-success
+    # outcomes.  `stream_end_unproven` above is kept for LEGACY journal rows only: OS-48 has
+    # no producer for it -- the positive boundary is the fence marker, and its absence is
+    # `boundary_unproven`.
+    "boundary_unproven", "fence_missing", "fence_mismatch", "fence_foreign",
+    "legacy_finalized_record", "owner_conflict", "finalizer_alive", "exit_unproven",
+    "identity_unreadable", "identity_changed", "evidence_inconsistent",
+    "provenance_ambiguous", "provenance_unbound", "signal_unbound", "signal_target_reaped",
+    "group_signal_refused", "fence_published_no_claim", "succession_unwitnessed",
+    # REVIEW_IMPLEMENTATION_iteration7 F-015: a completion-shaped object inside a line of the
+    # fenced range that is not itself a record -- R2 ("exactly one") is unprovable.
+    "record_framing_ambiguous",
+    # REVIEW_IMPLEMENTATION_iteration8 F-015: the bounded framing scan of the fenced range hit
+    # its bound (objects / depth / bytes) before examining everything and found no refusal in
+    # what it did examine -- R1 / R2 are UNDECIDED; an exhausted scan is never "no refusal".
+    "record_scan_incomplete",
+    # USER DECISION C2 (run_11b4061df84d): an adopted `post_ready_delivery` settlement that
+    # would otherwise be a success -- the live baseline cannot be restored, so no positive
+    # settlement; named, never COMPLETED.
+    "adopted_baseline_unknown",
 )
+
+#: OS-48 named outcomes that are FAILED verdict reasons (a settlement, not a loss).
+OS48_FAILED_REASONS = ("refusal_in_boundary", "refusal_free_text", "no_completion_record")
+#: OS-48 DIAGNOSTIC (journal-only) names: they never move a settlement.
+OS48_DIAGNOSTIC_NAMES = ("descendants_unreaped", "diagnostic_tail_unaccounted",
+                         "release_record_missing", "path_opener_indistinguishable",
+                         "membership_unreadable", "descendants_unknown", "sidecar_unproven",
+                         "sidecar_unreadable")
+#: The closed set of OS-48 LOST outcomes (a subset of LOST_REASONS), for readers that must
+#: refuse an unknown name rather than pass it through.
+OS48_LOST_OUTCOMES = frozenset({
+    "boundary_unproven", "fence_missing", "fence_mismatch", "fence_foreign",
+    "legacy_finalized_record", "owner_conflict", "finalizer_alive", "exit_unproven",
+    "identity_unreadable", "identity_changed", "evidence_inconsistent",
+    "provenance_ambiguous", "provenance_unbound", "signal_unbound", "signal_target_reaped",
+    "group_signal_refused", "fence_published_no_claim", "succession_unwitnessed",
+    "capture_truncated", "evidence_unreadable", "record_framing_ambiguous",
+    "record_scan_incomplete", "adopted_baseline_unknown"})
 
 #: The sentinel that is NOT an exit code.  A reader of this value reports LOST.
 UNVERIFIED_PROCESS_EXIT_CODE = -1
@@ -437,6 +475,9 @@ ECHO_UNPROVEN_REASONS = (
                                                 # delayed past the window, or absent)
     "ambiguous_multiple_matches",               # more than one span equals a derived form
     "echonl_partial_echo",                      # ECHO clear but ECHONL+ICANON echo the NLs
+    "payload_unobserved",                       # this process holds no delivered payload (a
+                                                # RESTORED event: the adopting process never
+                                                # observed the delivery) -- run_c296ff67c325
 )
 #: The LINE DISCIPLINES this runtime can derive an echo for, each measured on a real pty:
 #: the BSD `ttydisc` (macOS; measured on this host) and Linux `n_tty` (measured by CI, run
@@ -635,6 +676,32 @@ def expected_echo_forms(payload: str, transport: Mapping[str, Any]) -> dict[str,
     return {"state": "echo_expected", "reason": "", "forms": tuple(forms)}
 
 
+def unobserved_delivery_echo(transport: Mapping[str, Any]) -> dict[str, Any]:
+    """run_c296ff67c325 (PR #36 F-003, the USER DECISION narrowing PR36-4): the echo verdict for
+    a delivery event whose PAYLOAD this process does not hold -- a RESTORED event (`adopt` ->
+    `_restore_delivery`), i.e. a delivery the settling process never observed.  Such an event
+    carries NO excision authority: the verdict is derived from the transport KIND alone and
+    never from anything an unkeyed journal row asserts -- no digest, no proof class, no
+    resolved span, no termios flag, no R1 outcome.
+
+    ``argv`` -> `echo_absent` / `argv_transport_cannot_echo`: structural -- the payload left
+    with the ``execve`` and never entered the pty input queue, so no line discipline can have
+    echoed it.  ``pty_write`` -> `echo_unproven` / `payload_unobserved`: an echo may have
+    landed (ECHO set), may not have (ECHO clear), or the state at delivery is unknowable to
+    this process; without the delivered bytes IN MEMORY no span can be proven to be the echo,
+    so NOTHING is excised.  Any other kind -> `transport_kind_unknown`.  The consequence is
+    the accepted contract: an adopted settlement may be STRICTER than the live one (an echoed
+    refusal-like phrase fires R1; an echoed result-JSON example is a second candidate), and it
+    can never be wider (`adopted_success` is a subset of `live_success`).
+    """
+    kind = transport.get("kind") if isinstance(transport, Mapping) else None
+    if kind == "argv":
+        return {"state": "echo_absent", "reason": "argv_transport_cannot_echo"}
+    if kind == "pty_write":
+        return {"state": "echo_unproven", "reason": "payload_unobserved"}
+    return {"state": "echo_unproven", "reason": "transport_kind_unknown"}
+
+
 def _occurrences(raw: bytes, forms: Sequence[bytes], lo: int, hi: int) -> list[tuple[int, int]]:
     """Every DISTINCT span in ``raw[lo:hi]`` equal to one of ``forms`` (the whole form
     inside the window), in raw-byte coordinates -- at EVERY start position.
@@ -690,14 +757,22 @@ def resolve_delivery_echo(raw: bytes,
     fail-closed BLOCK, never a spurious pass) and `may_send_prompt` reports `unprovable`.
     A transport that proves NO echo is possible (`argv`, or ``ECHO`` clear) is `echo_absent`:
     nothing is excluded and nothing is unproven -- every captured byte is the agent's.
+
+    run_c296ff67c325 (PR #36 F-003; the USER DECISION narrowing PR36-4).  Only a payload held
+    IN MEMORY by the process that delivered it can prove an echo.  An event WITHOUT a payload
+    (a restored event on adoption) is resolved by :func:`unobserved_delivery_echo` from the
+    transport kind alone -- `argv` is `echo_absent` by structure, `pty_write` is
+    `echo_unproven` / `payload_unobserved` -- and excises nothing.  No journal-carried
+    digest, proof, span or verdict is ever excision authority.
     """
     ordered: list[tuple[int, int, Mapping[str, Any], str]] = []
     for index, ev in enumerate(delivery_events):
         if not isinstance(ev, Mapping):
             continue
         payload = str(ev.get("payload") or "")
-        if not payload:
-            continue
+        # run_c296ff67c325 (F-003): a RESTORED event (an adoption) carries no payload and is
+        # resolved STRUCTURALLY below (`unobserved_delivery_echo`) -- it holds no excision
+        # authority, whatever else the journal row it came from may carry.
         ordered.append((int(ev.get("offset", 0) or 0), index, ev, payload))
     if not ordered:
         return {"state": "no_delivery", "reason": "", "spans": (), "events": ()}
@@ -718,6 +793,13 @@ def resolve_delivery_echo(raw: bytes,
             entry["reason"] = "delivery_before_window"
         elif not isinstance(transport, Mapping):
             entry["reason"] = "transport_unrecorded"
+        elif not payload:
+            # run_c296ff67c325 (F-003): no payload in memory -> no derivable echo.  The verdict
+            # comes from the transport KIND alone; no capture byte is read, no digest compared,
+            # no span produced.  `echo_absent` only where the kind makes an echo impossible.
+            structural = unobserved_delivery_echo(transport)
+            entry["state"] = structural["state"]
+            entry["reason"] = structural["reason"]
         else:
             derived = expected_echo_forms(payload, transport)
             entry["forms"] = len(derived["forms"])
@@ -1291,6 +1373,17 @@ def resolve_unknown(situation: str, **facts: Any) -> dict[str, Any]:
                 "ended": facts.get("ended", ""),
                 "note": "the pty stream's end was not observed after the proven exit; a "
                         "record read before the end is not the final record"}
+    if situation == "boundary_unproven":
+        return {"state": "LOST", "lost_reason": "boundary_unproven",
+                "ended": facts.get("ended", ""),
+                "note": "OS-48: the fence marker was never observed in an answerable capture; "
+                        "no record it holds is inside a proven boundary"}
+    if situation == "os48_named":
+        reason = str(facts.get("lost_reason") or "")
+        if reason not in OS48_LOST_OUTCOMES:
+            raise LifecycleError(f"{reason!r} is not an OS-48 LOST outcome")
+        return {"state": "LOST", "lost_reason": reason, "detail": str(facts.get("detail") or ""),
+                "note": "OS-48: a named fail-closed outcome; never a success"}
     if situation == "required_evidence_missing":
         return {"state": "LOST", "lost_reason": facts.get("lost_reason") or "evidence_unreadable",
                 "note": "RULE 4: never a success guess"}

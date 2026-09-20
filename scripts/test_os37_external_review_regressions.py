@@ -320,7 +320,10 @@ def profile_spec(profile: StandaloneProfile) -> dict:
         "completion_records": [{"channel": s.channel, "record_type": s.record_type,
                                 "error_field": s.error_field,
                                 "success_field": s.success_field,
-                                "success_values": list(s.success_values)}
+                                "success_values": list(s.success_values),
+                                "binding_mode": s.binding_mode or "single_record_optin",
+                                "binding_field": s.binding_field,
+                                "carrier_type": s.carrier_type}
                                for s in profile.completion_records],
         "result_body_records": [{"channel": s.channel, "record_type": s.record_type,
                                  "body_field": s.body_field, "item_type": s.item_type}
@@ -2220,7 +2223,7 @@ def graph_profile_document(*, worktree: Path, driver_env: dict[str, str],
         "delivery_proofs": [{"channel": "structured", "record_type": "assistant"}],
         # The CONJUNCTIVE completion predicate finding #2 is about, declared in full: the
         # error field, the success field and its admissible values.
-        "completion_records": [{"channel": "structured", "record_type": "result",
+        "completion_records": [{"channel": "structured", "record_type": "result", "binding_mode": "single_record_optin",
                                 "error_field": "is_error",
                                 "success_field": "terminal_reason",
                                 "success_values": ["completed"]}],

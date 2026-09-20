@@ -80,9 +80,12 @@ def profile(**overrides) -> StandaloneProfile:
         identity_binding="minted_echo", identity_flag="--session-id",
         delivery_proofs=(DeliveryProofSelector(channel="structured",
                                                record_type="assistant"),),
+        # OS-48 R3: the fixture stub emits ONE unbound `result` record; `single_record_optin`
+        # is the fixture-only binding (the installed CLIs bind `session_field` / `sidecar_file`).
         completion_records=(CompletionSelector(channel="structured",
                                                record_type="result",
-                                               error_field="is_error"),),
+                                               error_field="is_error",
+                                               binding_mode="single_record_optin"),),
         # The completion bound is DECLARED, not inherited.  Its production default is
         # sized for a real agent turn (external review #4), so a fixture that drives a
         # non-completing dispatch must name its own or wait half an hour.
@@ -596,12 +599,46 @@ class FullSupervisedDispatchTests(unittest.TestCase):
         self.assertEqual(probe["outcome"], "present",
                          "no execve was proven for a dispatch that settled")
         rows = journal.rows_for("intent-e2e")
+        # superseded by OS-48 i6 (F-010): teardown may journal ONE diagnostic
+        # `descendants_unreaped` EVENT before `exit_observed` whenever the agent's forks could
+        # not all be attributed (fail-closed `descendants_unknown`) -- a residual that never
+        # moves the settlement; the order lock is asserted on every other row.
+        residual = [row for row in rows if row.get("event") == "descendants_unreaped"]
+        self.assertLessEqual(len(residual), 1, residual)
+        for row in residual:
+            self.assertEqual(row["kind"], "EVENT")
+            self.assertIn(row["source_vocabulary"]["outcome"], ("descendants_unknown", "membership_unreadable", None))
+            self.assertLess(rows.index(row), len(rows) - 1, "the residual row must precede exit_observed")
+        rows = [row for row in rows if row.get("event") != "descendants_unreaped"]
         kinds = [row["kind"] for row in rows]
+        # OS-48 PR #36 finding 4 (run_9af92a7f320d): the settlement baseline and the delivery
+        # event are journalled (`delivery_recorded`, digests only) BEFORE the prompt bytes go
+        # out -- between readiness and the delivery proof; one more EVENT in the fixed order.
         self.assertEqual(
             kinds,
             ["DELIVERY_INTENT", "EVENT", "SPAWN_OBSERVED", "RECEIPT_OBSERVED", "EVENT",
-             "EVENT", "SETTLEMENT_OBSERVED", "EVENT"],
-            "the journal's record order changed; DELIVERY_INTENT is FIRST by construction")
+             "EVENT", "EVENT", "EVENT", "EVENT", "SETTLEMENT_OBSERVED", "EVENT", "EVENT"],
+            "the journal's record order changed; DELIVERY_INTENT is FIRST by construction: "
+            + repr([(row["kind"], row.get("event")) for row in rows]))
+        # OS-48: the finality events are journalled IN ORDER before the settlement -- the
+        # owner generation claim, then the verified fence -- and the two-phase release after it.
+        events = [row.get("event") for row in rows if row["kind"] == "EVENT"]
+        self.assertEqual(events, ["spawned", "readiness_observed", "delivery_recorded",
+                                  "delivery_proof_observed", "owner_claimed", "fence_published",
+                                  "release_observed", "exit_observed"], events)
+        recorded = next(row for row in rows if row.get("event") == "delivery_recorded")
+        # run_c296ff67c325 (F-003, USER DECISION in ORIGINAL_REQUEST.md): the closed vocabulary
+        # carries NO `echo_proof` any more -- the unkeyed row is diagnostic, never excision
+        # authority -- so the set below is the post-decision shape (i2/i3 listed `echo_proof`).
+        self.assertEqual({k for ev in recorded["source_vocabulary"]["events"] for k in ev},
+                         {"index", "offset", "payload_sha256", "payload_bytes", "transport", "at"},
+                         "the delivery_recorded row's event vocabulary is not the closed set (never the prompt)")
+        # i2 (REVIEW_BUGFIX F-001): the row is digest-only -- no payload key, no side record
+        self.assertNotIn("record", recorded["source_vocabulary"], recorded)
+        for ev in recorded["source_vocabulary"]["events"]:
+            self.assertNotIn("payload", ev)
+            self.assertNotIn("echo_proof", ev)
+            self.assertEqual(ev["transport"]["kind"], "pty_write", ev)
         # The trailing EVENT is the supervisor RECLAIMING its own resources after the
         # proven exit (consolidated review finding 9): the exit watcher reaped, the master
         # fd closed.  Journalled so a stranger can see the completion leaked nothing.

@@ -36,7 +36,8 @@ from . import standalone_capture as capture
 from .standalone_lifecycle import (BRACKETED_PASTE_END, BRACKETED_PASTE_START,
                                    DELIVERY_OUTCOMES, DELIVERY_PROOFS, EVIDENCE_TIERS)
 from .standalone_lifecycle import ESC_REPLACEMENT as _LIFECYCLE_ESC_REPLACEMENT
-from .standalone_lifecycle import decide_readiness, refusal_evidence
+from .standalone_lifecycle import (decide_readiness, refusal_evidence, resolve_delivery_echo,
+                                   strip_delivery_echo)
 from .standalone_profile import (DELIVERY_MODES, IDENTITY_BINDINGS, RESUME_CHANNELS,
                                  StandaloneProfile)
 
@@ -746,11 +747,288 @@ class _Driver:
                                          if isinstance(ev, Mapping)),
                 "supplementary": tuple(supplementary)}
 
+    #: The record types this driver's completion selectors may name.  Subclasses narrow it.
+    _COMPLETION_TYPES: tuple[str, ...] = ()
+
+    def completion_candidates(self, text: str) -> tuple[dict[str, Any], ...]:
+        """Every declared-type completion record in stream order (OS-48 R2 counts them)."""
+        declared = {s.record_type for s in self.profile.completion_records} or set(self._COMPLETION_TYPES)
+        return tuple(dict(r) for r in self.structured_records(text) if r.get("type") in declared)
+
+    def framing_scan(self, text: str) -> dict[str, Any]:
+        """REVIEW_IMPLEMENTATION_iteration7/8 F-015: completion- or refusal-SHAPED objects that
+        the record grammar cannot see -- embedded in lines of ``text`` that do not parse as
+        records (a cooperative helper's ``progress: `` prefix on the root's own refusal, a
+        suffix, a record split across two lines, a WRAPPER ``{"progress": `` closed on a later
+        line around the root's record) -- examined through the BOUNDED NESTED traversal of
+        :func:`standalone_capture.embedded_scan` (i8: inner objects are examined; a JSON string
+        literal's contents are never a record).
+
+        ``{"candidates", "complete", "reason", "examined"}``.  Each candidate is
+        ``{"record", "refusal", "run", "record_type", "nested"}``: ``refusal`` = the object
+        refuses.  A TOP-LEVEL embedded object refuses when its declared ``error_field`` is
+        truthy, its ``is_error`` is truthy, or a declared structured auth marker matches (as
+        before); a NESTED object refuses only through a POSITIVE rule -- its declared completion
+        type's ``error_field`` or a declared auth marker -- so a tool-result's own ``is_error``
+        inside a wrapper is data, not the dispatch's refusal.  A candidate is never a settlement
+        record: it is evidence that R1/R2 cannot be decided from the parsable records alone.
+
+        ``complete == False`` means the scan hit its bound (``reason`` names it) and the rest of
+        the range was NOT examined: the caller must not read the candidates it did find as the
+        whole set -- an incomplete scan without a refusal is `record_scan_incomplete`.
+
+        What "refusal dominance" (R1) positively covers, stated plainly: a declared completion
+        record whose error field is set, a declared auth marker (top-level or nested anywhere),
+        a completion-typed nested object whose error field is set, a top-level embedded object
+        with a truthy ``is_error``, and the free-text refusal patterns over prose lines.  A
+        nested object's generic ``is_error`` outside a declared completion type is data and is
+        NOT a refusal; a refusal spelled inside a string literal is data."""
+        declared = {s.record_type for s in self.profile.completion_records} or set(self._COMPLETION_TYPES)
+        errors = {s.record_type: s.error_field for s in self.profile.completion_records if s.error_field}
+        # REVIEW_IMPLEMENTATION (run_5fcd2beac376) F-015: EVERY parsable line's nested content
+        # is examined -- a declared readiness / delivery / body / completion type on the outer
+        # object is no exemption.  A cooperative helper can open `{"type": "system",
+        # "progress": ` (a type the profile declares) around the root's own record exactly as
+        # it can open an undeclared wrapper, and the i1 grammar exemption let that one-line
+        # container hide a bound refusal inside [0, N).  The outer record itself is still
+        # judged only by R1/R2 (it is a record, not a framing candidate); what it HOLDS is
+        # examined under the NESTED positive rule below, which is what keeps a record's own
+        # data (a tool result's `is_error`, a Codex `item.completed` error item) from being
+        # read as the dispatch's refusal.
+        out: list[dict[str, Any]] = []
+        budget = capture.ScanBudget()
+        complete = True
+        reason = ""
+        examined = 0
+        # (run text, objects, all objects NESTED?, scan complete?, bound hit) -- in STREAM
+        # order: unparsable runs are scanned for embedded objects, parsable records are walked
+        # for what they hold, and the walk STOPS at the first line the record parser could not
+        # EXAMINE (iteration-3 review F-017 / F-015: an allocation, depth or conversion
+        # failure).  Such a line is never re-parsed as prose and never re-examined by the
+        # embedded scan -- a resource-failed candidate is not re-read to fail again on the
+        # same allocation -- so everything before it is examined (a reached refusal keeps its
+        # dominance) and everything from it on is UNEXAMINED: the scan is incomplete with
+        # the parser's own reason.
+        containers: list[tuple[str, list[dict[str, Any]], bool, bool, str]] = []
+        stopped = ""
+        run_lines: list[str] = []
+
+        def flush_run() -> bool:
+            run = "\n".join(run_lines)
+            run_lines.clear()
+            if "{" not in run:
+                return True
+            scan = capture.embedded_scan(run, budget=budget)
+            containers.append((run, scan["objects"], False, bool(scan["complete"]), str(scan["reason"])))
+            return bool(scan["complete"])
+        for parsed, raw, failure in capture.structured_lines_with_failures(text):
+            if failure:
+                if not flush_run():
+                    break
+                stopped = failure
+                break
+            if parsed is None:
+                run_lines.append(raw)
+                continue
+            if not flush_run():
+                break
+            inner: list[dict[str, Any]] = []
+            whole = capture.walk_nested_objects(parsed, inner, budget)
+            # the container itself is a parsable RECORD: only what it HOLDS is a candidate
+            # (its own top-level shape is a record R1/R2 already saw)
+            containers.append((raw, inner[1:], True, whole, budget.exhausted))
+            if not whole:
+                break
+        else:
+            flush_run()
+        for run, objects, all_nested, whole, why in containers:
+            examined += len(objects)
+            nested_ids: set[int] = set()
+            for obj in objects:
+                kind = obj.get("type")
+                nested = all_nested or id(obj) in nested_ids
+                refusal = False
+                if kind in errors and _truthy(_dig(obj, errors[kind]) if _dig(obj, errors[kind]) is not None else False):
+                    refusal = True
+                if self.structured_refusal(obj) is not None:
+                    refusal = True
+                if not nested and (_truthy(obj.get("is_error")) if obj.get("is_error") is not None else False):
+                    refusal = True
+                if kind in declared or refusal:
+                    out.append({"record": obj, "refusal": refusal, "run": run[:200],
+                                "record_type": kind, "nested": nested})
+                if not nested:
+                    # every object reachable from a top-level one is NESTED (the scan lists a
+                    # top-level object before everything inside it)
+                    nested_ids.update(id(v) for v in _nested_values(obj))
+            if not whole:
+                complete = False
+                reason = str(why or capture.SCAN_INCOMPLETE_OBJECTS)
+                break
+        if complete and stopped:
+            complete = False
+            reason = stopped
+        return {"candidates": tuple(out), "complete": complete, "reason": reason, "examined": examined}
+
+    def framing_candidates(self, text: str) -> tuple[dict[str, Any], ...]:
+        """The candidates of :meth:`framing_scan` alone (a convenience; production selection
+        reads the scan, whose completeness it must not drop)."""
+        return self.framing_scan(text)["candidates"]
+
+    def select_completion(self, text: str, *, raw: bytes | None = None,
+                          bound_value: str = "", sidecar_present: bool = False,
+                          delivery_events: Sequence[Mapping[str, Any]] = ()) -> dict[str, Any]:
+        """OS-48 DESIGN §1.4 -- settlement selection over the FENCED range ``[baseline, N)``
+        (``text`` / ``raw`` are already bounded by the caller).  Three structural rules, each
+        fail-closed, none depending on per-pid attribution (a pty cannot provide it):
+
+        R1 **refusal dominance** -- any error / refusal record anywhere in the range (a declared
+           completion record whose ``error_field`` is truthy, a structured auth marker, or a
+           free-text refusal over the prose lines) → ``refusal_in_boundary`` (FAILED), regardless
+           of its position relative to a success record;
+        R2 **exactly one** -- more than one declared completion record → ``provenance_ambiguous``
+           (LOST: a second writer was possible); none → no record (FAILED `no_completion_record`);
+           a completion-shaped object inside a line that is NOT a record (helper prefix /
+           suffix / split framing, F-015) → ``record_framing_ambiguous`` (LOST: exactly-one is
+           unprovable) unless it refuses, in which case R1 applies; a framing scan that hit its
+           bound without finding a refusal → ``record_scan_incomplete`` (LOST: R1/R2 undecided;
+           i8);
+        R3 **dispatch binding** -- the single record must satisfy the selector's
+           ``binding_mode`` (`session_field`: the record carries ``binding_field == bound_value``;
+           `sidecar_file`: the runtime-minted sidecar is present AND ``binding_field`` on the
+           record or on the most recent ``carrier_type`` record before it equals ``bound_value``;
+           `single_record_optin`: no binding); an undeclared mode, an empty bound value, an
+           absent / mismatched / unreadable field → ``provenance_unbound`` (LOST).
+
+        ``{"record": dict|None, "outcome": None|str, "refusal": dict|None, "candidates": int,
+        "echo": {"state", "reason", "spans"}}``.  A success is returned ONLY when all three
+        hold; ``completion_verdict`` (the PINNED agent's exit code) still applies afterwards.
+
+        OS-48 PR #36 finding 2 (echo provenance): ``delivery_events`` are the runtime's REAL
+        delivery events -- payload, the `EchoTransport` read at the write, and the offset
+        translated into ``raw``'s coordinates.  A span `lifecycle.resolve_delivery_echo`
+        PROVES to be the echo of a delivered prompt is excised from ``raw`` BEFORE anything
+        below reads records, candidates or framing, so prompt text the line discipline echoed
+        back -- a refusal phrase, a y/n question, a result-JSON example -- is never a refusal,
+        a framing candidate or a completion candidate.  Only a PROVEN echo is excised; an
+        unproven one (`echo_unproven`, named) excludes nothing, and the scan then runs over
+        the superset -- fail closed, exactly as `refusal_evidence` already did for R1.
+        """
+        echo: dict[str, Any] = {"state": "no_delivery", "reason": "", "spans": ()}
+        if raw is not None and delivery_events:
+            resolution = resolve_delivery_echo(raw, delivery_events)
+            echo = {"state": str(resolution["state"]), "reason": str(resolution["reason"]),
+                    "spans": tuple(tuple(span) for span in resolution["spans"])}
+            if resolution["state"] == "echo_proven":
+                text = capture.BoundedCapture.transcript_of(strip_delivery_echo(raw, delivery_events))
+        records = self.structured_records(text)
+        candidates = self.completion_candidates(text)
+        # F-015 -- completion/refusal-SHAPED objects the record grammar cannot see (helper
+        # prefix / suffix / split framing inside [baseline, N)): a refusing one is a refusal
+        # under R1 (dominance); any other makes R2 UNPROVABLE -> `record_framing_ambiguous`,
+        # never a success.  The exact fenced bytes are untouched.
+        framed = self.framing_scan(text)
+        framing = framed["candidates"]
+        # R1 -- refusal dominance (structured-first, as `lifecycle.refusal_evidence` does).
+        refusal: dict[str, Any] | None = None
+        for item in framing:
+            if item["refusal"]:
+                refusal = {"source": "framing_ambiguous_refusal", "record_type": item["record_type"],
+                           "embedded": item["record"], "run": item["run"]}
+                break
+        for rec in candidates:
+            selector = next((s for s in self.profile.completion_records
+                             if s.record_type == rec.get("type")), None)
+            if selector is not None and selector.error_field:
+                observed = _dig(rec, selector.error_field)
+                if observed is not None and _truthy(observed):
+                    refusal = {"source": "error_field", "record_type": rec.get("type"),
+                               "field": selector.error_field, "value": observed}
+                    break
+        if refusal is None:
+            scan = refusal_evidence(raw if raw is not None else text.encode("utf-8", "replace"),
+                                    delivery_events, structured_refusal=self.structured_refusal)
+            if scan["refusals"]:
+                refusal = {"source": scan["source"], "refusals": list(scan["refusals"]),
+                           "structured_hit": scan.get("structured_hit")}
+        last = candidates[-1] if candidates else None
+        if refusal is not None:
+            if (refusal.get("source") == "error_field" and len(candidates) == 1
+                    and refusal.get("record_type") == candidates[0].get("type")):
+                # The ONLY completion record refuses through its own declared error field:
+                # `completion_verdict` names that leg (`error_field_set`) -- the same fail-closed
+                # outcome, with the operator-visible leg preserved.  R1 dominance is what makes
+                # a refusal BEFORE a later success count; here there is no later success.
+                return {"record": last, "outcome": None, "refusal": refusal, "candidates": 1, "echo": echo}
+            return {"record": last, "outcome": capture.OUTCOME_REFUSAL_IN_BOUNDARY,
+                    "refusal": refusal, "candidates": len(candidates), "echo": echo}
+        if not framed["complete"]:
+            # i8 F-015: the framing scan hit its bound BEFORE examining the whole range and
+            # found no refusal in what it did examine: R1 and R2 are UNDECIDED, not decided in
+            # the success's favour -- named, never COMPLETED.
+            return {"record": None, "outcome": capture.OUTCOME_RECORD_SCAN_INCOMPLETE,
+                    "refusal": None, "candidates": len(candidates) + len(framing), "echo": echo,
+                    "scan": {"complete": False, "reason": framed["reason"], "examined": framed["examined"]}}
+        if framing:
+            return {"record": None, "outcome": capture.OUTCOME_RECORD_FRAMING_AMBIGUOUS,
+                    "refusal": None, "candidates": len(candidates) + len(framing), "echo": echo,
+                    "framing": [{"record_type": f["record_type"], "run": f["run"]} for f in framing]}
+        if not candidates:
+            # No DECLARED completion record.  The driver's last record of a completion SHAPE
+            # (an undeclared type) is still handed to `completion_verdict` so the operator
+            # sees `completion_record_undeclared` rather than a bare absence; it can only
+            # refuse there (an undeclared type never matches a selector).
+            legacy = self.completion_record(text)
+            return {"record": legacy, "outcome": None, "refusal": None, "candidates": 0, "echo": echo}
+        if len(candidates) > 1:
+            return {"record": None, "outcome": capture.OUTCOME_PROVENANCE_AMBIGUOUS,
+                    "refusal": None, "candidates": len(candidates), "echo": echo}
+        only = candidates[0]
+        selector = next((s for s in self.profile.completion_records
+                         if s.record_type == only.get("type")), None)
+        mode = selector.binding_mode if selector is not None else ""
+        unbound = {"record": None, "outcome": capture.OUTCOME_PROVENANCE_UNBOUND,
+                   "refusal": None, "candidates": 1, "echo": echo}
+        bound = {"record": only, "outcome": None, "refusal": None, "candidates": 1, "echo": echo}
+        if mode == "single_record_optin":
+            return bound
+        if mode not in ("session_field", "sidecar_file") or not bound_value:
+            return unbound
+        field = selector.binding_field
+        if mode == "session_field":
+            if str(_dig(only, field) if _dig(only, field) is not None else "") != bound_value:
+                return unbound
+            return bound
+        if not sidecar_present:
+            return unbound
+        observed = _dig(only, field)
+        if observed is None:
+            idx = next((i for i, r in enumerate(records) if r is not None and r == only), None)
+            carrier = None
+            if idx is not None:
+                carrier = next((r for r in reversed(records[:idx])
+                                if r.get("type") == selector.carrier_type), None)
+            observed = None if carrier is None else _dig(carrier, field)
+        if observed is None or str(observed) != bound_value:
+            return unbound
+        return bound
+
     def completion_evidence(self, text: str, *, exit_status: int | None,
                             exit_proven: bool,
-                            capture_answerable: bool = True) -> dict[str, Any]:
-        """Settlement candidates ONLY.  Can never express readiness."""
-        record = self.completion_record(text)
+                            capture_answerable: bool = True,
+                            selection: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """Settlement candidates ONLY.  Can never express readiness.  With ``selection`` (the
+        OS-48 `select_completion` result over the fenced range) the settlement record and its
+        provenance outcome come from it; without one the legacy last-of-type record is used
+        and ``provenance_outcome`` is ``provenance_unbound`` (never a fenced success)."""
+        if selection is not None:
+            record = selection.get("record")
+            provenance_outcome = selection.get("outcome")
+            refusal = selection.get("refusal")
+        else:
+            record = self.completion_record(text)
+            provenance_outcome = capture.OUTCOME_PROVENANCE_UNBOUND if record is not None else None
+            refusal = None
         lost_reason = ""
         if not capture_answerable:
             lost_reason = capture.CAPTURE_TRUNCATED_LOST_REASON
@@ -759,9 +1037,18 @@ class _Driver:
         return {"exit_status": exit_status, "exit_proven": exit_proven,
                 "settlement_record": record, "capture_answerable": capture_answerable,
                 "lost_reason": lost_reason,
+                "provenance_outcome": provenance_outcome, "refusal": refusal,
                 "source_vocabulary": {"driver": self.name,
                                       "record": record or {},
-                                      "exit_code": exit_status},
+                                      "exit_code": exit_status,
+                                      "provenance_outcome": provenance_outcome,
+                                      # i8 F-015: which bound an incomplete framing scan hit
+                                      **({"scan": dict(selection["scan"])}
+                                         if selection is not None and selection.get("scan") else {}),
+                                      # USER DECISION C2: the adopted post_ready_delivery success
+                                      # withheld by name (`adopted_baseline_unknown`)
+                                      **({"adoption": dict(selection["adoption"])}
+                                         if selection is not None and selection.get("adoption") else {})},
                 "at": _now_iso()}
 
     # -- D4.4's CONJUNCTIVE settlement predicate, applied rather than described ----------
@@ -835,13 +1122,21 @@ class _Driver:
         return {"outcome": "succeeded", "reason": "", "detail": ""}
 
     # -- D4.4 / review #3: the FINAL MESSAGE BODY, and only it ---------------------------
-    def result_body(self, text: str) -> dict[str, Any]:
+    def result_body(self, text: str, *, sidecar: bytes | None = None,
+                    allow_path: bool = True) -> dict[str, Any]:
         """``{"body": str|None, "source": str}`` -- the agent's own final message.
 
         Profile-declared, so this base implementation serves every driver and no CLI name is
         hard-coded here.  ``body=None`` means the profile declared no extraction, and the
-        caller then hands the WHOLE transcript to the shared parser exactly as before --
+        caller then hands the WHOLE of ``text`` to the shared parser exactly as before --
         which is correct for the scripted fixture CLIs whose transcript IS a report.
+
+        OS-48 (REVIEW_IMPLEMENTATION F-001): ``text`` is the caller's AUTHORITATIVE interval
+        (`[baseline, N)` of the fenced capture -- `StandaloneSession._authoritative_text`),
+        never the whole mutable transcript; and the ``-o`` sidecar is consulted through
+        ``sidecar`` -- the bytes the runtime FROZE when it bound the fence -- rather than
+        re-read from a path a later writer could still change.  Only when the caller passes
+        no frozen copy (pre-OS-48 callers) is the file read here.
         """
         for selector in self.profile.result_body_records:
             for record in reversed(self.structured_records(text)):
@@ -854,15 +1149,23 @@ class _Driver:
                     return {"body": value,
                             "source": f"{selector.record_type}.{selector.body_field}"}
         path = self.profile.output_last_message_path
-        if path and self.profile.result_body_records and os.path.exists(path):
+        # OS-48 (REVIEW_IMPLEMENTATION_iteration3 F-001): the `-o` file is NOT a settlement body
+        # source -- its content cannot be bound to the boundary N.  The runtime passes
+        # `allow_path=False` and no bytes; the branch survives only for explicit legacy callers
+        # that hand in a frozen copy themselves.
+        if (path and self.profile.result_body_records
+                and (sidecar is not None or (allow_path and os.path.exists(path)))):
             # The `-o` file is a SECOND source for the same body, never a substitute for the
             # exit proof.  It is consulted only when the profile declared an extraction at
             # all, so a profile that declares none keeps the whole-transcript behaviour.
-            try:
-                with open(path, "rb") as handle:
-                    raw = handle.read()
-            except OSError:
-                raw = b""
+            if sidecar is not None:
+                raw = sidecar
+            else:
+                try:
+                    with open(path, "rb") as handle:
+                        raw = handle.read()
+                except OSError:
+                    raw = b""
             text_body = raw.decode("utf-8", errors="replace")
             if text_body.strip():
                 import hashlib
@@ -938,6 +1241,7 @@ class _Driver:
 
 
 class ClaudeDriver(_Driver):
+    _COMPLETION_TYPES = ("result",)
     """The Claude Code CLI driver.  Every flag comes from the profile."""
 
     name = "claude"
@@ -1053,6 +1357,8 @@ class ClaudeDriver(_Driver):
 
 class CodexDriver(_Driver):
     """The Codex CLI driver.  Every flag comes from the profile."""
+
+    _COMPLETION_TYPES = ("turn.completed", "task_complete", "item.completed")
 
     name = "codex"
 
@@ -1323,6 +1629,23 @@ def driver_for(profile: StandaloneProfile) -> _Driver:
         composed = type(f"{factory.__name__}PostReady", (_PostReadyDelivery, factory), {})
         _MODE_CLASSES[key] = composed
     return composed(profile)               # type: ignore[return-value]
+
+
+def _nested_values(obj: Any) -> list[Any]:
+    """Every dict reachable from ``obj`` through dicts and lists (never strings), for marking
+    NESTED framing candidates; mirrors `standalone_capture.walk_nested_objects`'s reach."""
+    out: list[Any] = []
+    level: list[Any] = [obj]
+    while level:
+        nxt: list[Any] = []
+        for node in level:
+            if isinstance(node, dict):
+                nxt.extend(v for v in node.values() if isinstance(v, (dict, list)))
+            elif isinstance(node, list):
+                nxt.extend(v for v in node if isinstance(v, (dict, list)))
+        out.extend(v for v in nxt if isinstance(v, dict))
+        level = nxt
+    return out
 
 
 def _truthy(value: Any) -> bool:

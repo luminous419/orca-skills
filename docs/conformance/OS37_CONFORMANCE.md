@@ -381,7 +381,10 @@ qualified "at the pinned revision".
   append sees a `verified` tail: the answerability gate distinguishes "not yet fully
   visible" (in flight, verified) from "integrity failed" (forged / truncated / meta
   missing), and still refuses only the latter.
-* **Settlement requires POSITIVE stream finality** (round-8 iteration 3).  The post-exit
+* **Settlement requires POSITIVE stream finality** (round-8 iteration 3).  **Superseded by
+  OS-48 (see the OS-48 section below): the positive fact is now the in-band FENCE MARKER at
+  boundary N, never a hangup; `stream_end_unproven` is retired in favour of
+  `boundary_unproven`.**  Historical text follows.  The post-exit
   drain counts exactly two observations as the hangup -- a clean EOF and `errno.EIO`, the
   pty's own "every slave descriptor is closed" signals; `EINTR` is retried; every other
   read or poll error is `ended: master_unreadable` with the errno named (an unreadable
@@ -425,7 +428,11 @@ qualified "at the pinned revision".
 
 ## Round 9 -- consolidated external review of `fc21012` (issuecomment-5680361023)
 
-* **A CAPTURE-FINALIZED proof, DISTINCT from the exit sentinel** (round-9 item 1).  The exit
+* **A CAPTURE-FINALIZED proof, DISTINCT from the exit sentinel** (round-9 item 1).
+  **Superseded by OS-48: `os37.capture_finalized.v1` is REFUSED BY NAME
+  (`legacy_finalized_record`); the proof is the fence `os48.capture_fence.v1` bound to
+  `sha256(capture[0,N))`.  `write_capture_finalized` / `read_capture_finalized` /
+  `finalized_matches` no longer exist.**  Historical text follows.  The exit
   sentinel proves the *process* exited -- the exit watcher writes it the instant `waitpid`
   returns, whether or not any output has been drained.  Whether the *capture* is complete
   is a SEPARATE, crash-durable, fenced record
@@ -444,7 +451,11 @@ qualified "at the pinned revision".
   `test_os37_round9_review_regressions.py::Item1*` (real-pty watcher finalize included) and
   the F01 adopted-recovery path.
 
-* **PTY scope: fail-closed and OBSERVABLE (choice a).**  A descendant that retains the pty
+* **PTY scope: fail-closed and OBSERVABLE (choice a).**  **Superseded by OS-48: a retained
+  slave no longer withholds finality -- its bytes land after N and are retained as a
+  diagnostic tail; the holder enumeration below is a DIAGNOSTIC (`present` / `unreadable` /
+  `none_observed`) that no decision consults (ANALYSIS F0: a negative whole-process-table
+  scan is never proof).**  Historical text follows.  A descendant that retains the pty
   slave prevents the EOF/EIO hangup.  We do NOT accept "final record + N ms silence" as
   success.  The finalizing drain is bounded by the profile's own
   `timeouts.post_exit_drain_budget_ms` (default 2 s, an operator-tunable knob, not a
@@ -463,7 +474,11 @@ qualified "at the pinned revision".
   observes the master hangup while that session leader lives -- not a separate reader (the
   supervisor) and not even the leader itself as the SOLE master holder (the production orphan
   path with no holder reads `ended=budget`, never a hangup); the hangup is delivered ONLY when
-  the ctty leader EXITS and revokes.  (2) Removing the controlling terminal makes the hangup
+  the ctty leader EXITS and revokes.  **[OS-48 CORRECTION, MEASURED: this claim is false.  The
+  darwin master reports EOF on the LAST SLAVE CLOSE whether or not the ctty leader lives, and
+  the unread tail is discarded ~0.5-0.7 s after that close (run_f820764749d6
+  `evidence/analysis/probe_01`, `probe_04`); only a HELD slave reference retains it
+  (`evidence/design/probe_d1`).  This is why OS-48 makes the watcher hold one.]**  (2) Removing the controlling terminal makes the hangup
   observable while the watcher lives, but darwin then reclaims the master's unread buffer
   ~0.3-1 s after the agent exits -- reintroducing the lost tail.  So the hangup used as proof
   is the watcher's release/revoke, and the RELEASE is gated on a COMPLETE positive
@@ -584,7 +599,10 @@ qualified "at the pinned revision".
 ## Round 10 -- consolidated follow-up review of `bcd5c6d` (issuecomment-5688372349)
 
 * **The supervisor is the SINGLE finalizing owner and the exit watcher's exit can no longer
-  manufacture the hangup** (round-10 item 1).  On darwin a session leader's exit REVOKES the
+  manufacture the hangup** (round-10 item 1).  **Superseded by OS-48: no hangup is ever a
+  proof; the watcher HOLDS the owner slave reference, writes the fence marker after its
+  `waitpid`, and the release is TWO-PHASE (RELEASE marker -> `release.<inc>` record -> close);
+  `_await_drain_handoff` and `POST_EXIT_SETTLE_MS` no longer exist.**  Historical text follows.  On darwin a session leader's exit REVOKES the
   controlling tty and DISCARDS the master's unread tail -- empirically reproduced on this
   host (`artifacts/runs/.../evidence/repro/`): the pre-fix topology, watcher exiting the
   instant it wrote the sentinel, left the supervisor's drain reading `[EOF]` with the tail
@@ -606,8 +624,11 @@ qualified "at the pinned revision".
   crash-cut locks of `::Finding1SupervisorCrashCutTests` (round 9), which stay green.
 
 * **`unreadable` slave-holder authority is never collapsed into absence** (round-10 item 2).
+  **OS-48: `_slave_holders` / `_slave_holder_state` are DIAGNOSTIC only; the states are
+  `present` / `none_observed` / `unreadable` (the word "proven" does not occur); the
+  non-positive `killpg` guard is retained.**
   `standalone_pty._slave_holders` records whether each probe COMPLETED and
-  `_slave_holder_state` is a tri-state: `present` / `proven_absent` / `unreadable`.  A failed
+  `_slave_holder_state` is a tri-state: `present` / `none_observed` / `unreadable`.  A failed
   `tcgetpgrp`, an unreadable `/proc`, or a skipped `/proc/<pid>/fd` entry is `unreadable` with
   the failed authority NAMED, and only a COMPLETE positive absence proof yields `proven`.
   `tcgetpgrp() <= 0` is "no usable foreground group" (a complete positive absence on that
@@ -634,3 +655,834 @@ qualified "at the pinned revision".
   (b) `recover_handle`'s exit-evidence wait is derived from the run profile's
   `post_exit_drain_budget_ms` (`_exit_evidence_budget_ms`), not the fixed 3.5 s constant.
   (c) `tcgetpgrp() <= 0` never triggers `killpg(0, 0)`.
+
+## OS-48 -- positive PTY capture finality and execution ownership authority (run_f820764749d6)
+
+Supersedes the round-8/9/10 finality model above (the historical bullets are kept, each
+marked).  Design: `artifacts/runs/run_f820764749d6/DESIGN.md` (topology A).  Measured facts:
+`evidence/analysis/` (probe_01..14) and `evidence/design/` (probe_d1..d15) of that run.
+
+* **The finality fact is POSITIVE and in-band.**  The exit watcher (session leader, the agent's
+  PARENT) keeps ONE slave descriptor -- the *owner-held slave reference* -- for the life of the
+  dispatch, so the kernel never reclaims the master's unread tail and nobody can manufacture an
+  EOF (darwin discards the tail ~0.5-0.7 s after the LAST slave close, measured; Linux retains
+  it and reads `EIO`).  After `waitpid` reaps the pinned root it writes the FENCE MARKER
+  `\n<<OS48-FENCE <nonce>>>\n` (the nonce minted by the supervisor before the spawn,
+  `PtySession.fence_nonce`) into that slave, then the exit sentinel.  The marker's offset in the
+  capture is the boundary **N**; the settlement window is `[baseline, N)`; every byte after N is
+  a DIAGNOSTIC tail.  The supervisor's `drain_after_exit` drains TO THE MARKER (ends `marker` |
+  `budget` | `master_unreadable` | `marker_inconsistent`; silence never ends it) and publishes
+  the fence `capture.log.fence.<inc>.json` (`os48.capture_fence.v1`: `boundary.offset_n`,
+  `marker_len`, `marker_nonce`, `sha256_prefix = sha256(capture[0,N))`, `exit`, `owner`,
+  `provenance`) with a link-EXCLUSIVE tmp+fsync+link publication -- a fence is never
+  overwritten; a later actor VERIFIES it (`fence_matches`: prefix digest + sentinel agreement).
+  `_stream_is_final` holds ONLY for a verified fence (`finality: capture_finalized`).  A legacy
+  `os37.capture_finalized.v1` record is refused by name (`legacy_finalized_record`).  Named
+  non-successes: `boundary_unproven`, `fence_missing`, `fence_mismatch`, `fence_foreign`,
+  `exit_unproven` (all LOST); a hangup / EOF proves nothing.
+
+* **Settlement rules over `[baseline, N)`** (`_Driver.select_completion`, R1-R3): **R1 refusal
+  dominance** -- any declared error record, structured auth marker or free-text refusal in the
+  window ⇒ FAILED `refusal_in_boundary`, whatever its position; **R2 exactly one** declared
+  completion record ⇒ else `provenance_ambiguous` (LOST); **R3 the dispatch binding**
+  (`CompletionSelector.binding_mode`, REQUIRED in every profile spec: `session_field` -- Claude
+  `result.session_id == minted`; `sidecar_file` -- Codex `-o` sidecar present + `thread_id` on
+  the record or its most recent `thread.started` carrier; `single_record_optin` -- fixtures
+  only; an empty / mismatched / unreadable bound ⇒ `provenance_unbound`, LOST).  A bound
+  success by ANY member of the supervised subtree inside the window is legitimate (N-002); a
+  completion record after N is diagnostic, never settlement.
+  **Supported profile surface and adoption semantics for the R3 binding (run_11b4061df84d,
+  USER_DECISION_C2.md).**  Every `delivery_mode` × `binding_mode` × carrier combination is
+  ADMITTED (the i1 `PreBaselineCarrierRefused` refusal of `post_ready_delivery` +
+  `sidecar_file` + `carrier_type` is removed: no live profile surface is forbidden).  What
+  differs is ADOPTION: an ADOPTED settlement of a `post_ready_delivery` dispatch never returns a
+  success.  The live baseline exists only in the live supervisor's memory (`send()` reads
+  `capture.size` at the prompt write) and the journal's copy is unkeyed and never authority, and
+  nothing in the fenced bytes marks the delivery instant -- so over `[0, N)` a sole bound
+  completion record emitted BEFORE the prompt is indistinguishable from one emitted after it
+  (the R3 carrier fallback and the record-field bindings alike can turn extra pre-baseline
+  evidence into positive authority).  Rule (`standalone_runtime.withhold_adopted_post_ready_success`,
+  applied in `StandaloneSession.completion()`, the one place every adopted settlement --
+  `await_completion` / `collect` / `StandaloneAdapter._collect_in_flight` -- passes; pure,
+  baseline-independent, consulting no journal value): refusal / reader-failure dominance is
+  preserved FIRST (`refusal_in_boundary`, the sole error-field refusal `error_field_set`,
+  `provenance_ambiguous`, `provenance_unbound`, `record_framing_ambiguous`,
+  `record_scan_incomplete`, `capture_truncated`; no record at all stays FAILED
+  `no_completion_record`), and a selection that would otherwise carry a record to the verdict
+  (a bound record, `single_record_optin`, the legacy undeclared record) is the NAMED LOST
+  outcome **`adopted_baseline_unknown`** (in `LOST_REASONS` / `OS48_LOST_OUTCOMES`;
+  `OUTCOME_ADOPTED_BASELINE_UNKNOWN`) with the record withheld and a journalled `adoption`
+  diagnostic naming the withheld record type.  Through the production recovery path this is
+  the typed FAILED settlement (`result.status BLOCKED`, `standalone_failure.reason
+  adopted_baseline_unknown`), never COMPLETED.  LIVE `post_ready_delivery` settlement over
+  `[baseline, N)` is unchanged; `launch_with_prompt` (baseline 0: live and adopted examine the
+  same range -- both shipping profiles, Claude `session_field` and Codex `sidecar_file` +
+  carrier) is unchanged live AND adopted.  Invariant: `adopted COMPLETED ⇒ live COMPLETED` on
+  every admitted cell for every capture shape, including a sole completion record emitted
+  before the live baseline -- adoption guarantees SAFETY parity, not AVAILABILITY parity, and
+  for `post_ready_delivery` dispatches a successor can settle only a NON-success: the recovered
+  dispatch is the typed failure, the recovered run terminates BLOCKED by name (`UNIT_TEST_BLOCKED`,
+  `standalone_failure.reason adopted_baseline_unknown`; `test_os37_recovery_boundary_regressions`
+  F01 rewritten), and re-launching is the operator's decision -- never a COMPLETED claimed on
+  evidence the live supervisor could not have accepted.
+
+* **Two-phase release and the retained diagnostic tail** (AC-9).  `_reclaim` runs
+  `_release_two_phase`: release-1 (`R` byte) -> the watcher writes `\n<<OS48-RELEASE
+  <nonce>>>\n`; the supervisor drains to R and publishes `capture.log.release.<inc>.json`
+  (`os48.release_boundary.v1`: `offset_r`, `retained_tail_bytes`, `retained_tail_sha256`,
+  `custodian`); release-2 (`C` byte) -> the watcher closes its slave reference; the supervisor
+  reads to EOF/EIO (diagnostic).  Every acknowledged pre-R byte is retained; a release the
+  watcher could not serve is NAMED `diagnostic_tail_unaccounted` (+ `release_record_missing`),
+  never a silent loss, and never touches `[0, N)`.  `reap_leader` drains the master while it
+  waits (a leader exiting with pending output wedges in `E` otherwise).
+
+* **Finalizer ownership is a witnessed generation chain.**  `owner.<inc>.g<n>`
+  (`os48.finalizer_owner.v1`, exclusive link) names who may publish: the supervisor claims g1
+  at the marker (`owner_conflict` if it loses); a fence ends every claim (fence-first,
+  `fence_published_no_claim`); guard EOF is *relinquishment-or-death* and NEVER authorises a
+  claim by itself (`succession_unwitnessed`) -- a claim needs the owner's durable
+  `relinquish.<inc>.g<n>` record (written by `release()` for a generation it will not finish)
+  or the incarnation-bound parent-death witness (darwin `kqueue NOTE_EXIT` on the pinned
+  pid+start identity, ESRCH at registration = already dead, a zombie is `absent`; Linux
+  `pidfd_open` / `/proc` state `Z`); a claim is bound to the pinned predecessor (`claim_target`
+  = predecessor+1, `validate_claim`), a live highest owner is `finalizer_alive`, an unreadable
+  one `identity_unreadable`.  The orphan watcher (supervisor dead) finishes the publication
+  itself -- drain to marker, claim, fence, RELEASE, record, close -- and leaves a durable
+  `capture.log.orphan.<inc>.json` note naming its outcome; without a claim it still performs
+  the release as custodian.  A masterless successor (`_fence_from_disk`) waits fence-first for
+  the marker, publishes from a captured marker only with a proven exit and an absent /
+  relinquished / dead owner, and re-evaluates a lost claim race until the winner's fence appears.
+  Crash cuts C1-C9 / RC1-RC4 (DESIGN §1.7) each yield the same N/digest or a named outcome.
+
+* **Execution ownership is bound to an incarnation, never a pid.**  Spawn records and rows carry
+  `proc_start_ticks` + `boot_id` (REQUIRED axes: `verify` is `unverifiable: identity_unreadable`
+  without them, `not_owned: identity_changed` on a mismatch; `read_identity` reads them at
+  decision time: `final` / `absent` (ESRCH or zombie) / `unreadable`).  The agent is signalled
+  ONLY through the watcher's control socket (`request_watcher_signal`: `sent` before its reap,
+  `refused:signal_target_reaped` after, `refused:signal_unbound` for a foreign fence) -- the
+  same single thread reaps and delivers, so a pre-reap request cannot hit a recycled pid; a
+  darwin non-child is `signal_unbound` (no signal); Linux descendants go through a pidfd.
+  `may_killpg` always refuses (`group_signal_refused`): group teardown is the kernel's own
+  SIGHUP at controlling-tty revoke (measured on both platforms); members outside the group are
+  reported `descendants_unreaped`.  The Linux watcher is a `PR_SET_CHILD_SUBREAPER` that never
+  consumes the pinned root's own status (`waitid(WNOWAIT)` peek).
+
+* **Diagnostics are diagnostics.**  `slave_device_holders` (libproc) and `_slave_holders` (tty
+  table) survive with states `present` / `unreadable` / `none_observed`; denied, short and
+  stale (revoked ENOENT) reads are `unreadable` by name; no decision function calls them (a
+  static + mutation lock).  The journal records `holders_diagnostic`, `diagnostic_tail_bytes`,
+  `path_opener_indistinguishable` (residual O-10) beside the fence.
+
+* **Iteration 2 corrections (REVIEW_IMPLEMENTATION.md F-001..F-007).**  (F-001) every
+  settlement extraction, parser input, fallback and settled digest reads the AUTHORITATIVE
+  interval `[baseline, N)` (`StandaloneSession._authoritative_text`), and the `-o` sidecar is
+  FROZEN when the fence binds (its digest travels in the fence's `sidecar` field; a sidecar that
+  no longer matches is `evidence_inconsistent`); the journal's `result_body_provenance.interval`
+  names the interval and its sha256.  (F-002) the orphan watcher's death witness is bound to the
+  incarnation it was registered on (`_ParentWitness.covers`); when the highest owner is a
+  different incarnation the watcher obtains per-pid evidence for THAT owner (`absent` = positively
+  gone, alive = `finalizer_alive`, unreadable = `identity_unreadable`) -- a witness for g1 never
+  supersedes a live g2, and `may_claim_generation` refuses a positively live owner before any
+  witness is consulted.  (F-003) the RELEASE marker is written at most once per nonce (a served
+  release-1 is REUSED by the orphan path); `verify_release_record` joins the record to the fence
+  file digest, the nonce, R in the capture and the retained-tail digest; an adopted session
+  verifies or RECOVERS the release boundary (`successor_from_capture`) and names
+  `release_record_missing` / `diagnostic_tail_unaccounted`; a failed publication (ENOSPC) is never
+  `final`.  (F-004) a positive partial fill is named: the pid table is checked against a fresh
+  count (kernel slack 20 + churn tolerance) and the scanner's own pid (`listallpids_partial`),
+  and an fd listing is cross-checked by an independent per-index walk of the fd table
+  (`listing_partial_fill`); a table too large to walk is `fd_walk_unbounded`.  (F-005) NO claim
+  and NO fence without positive complete identities (pid > 0, start_id > 0, boot id) for the
+  owner, the emitter and the reaper (`identity.identity_complete`; the watcher's identity is
+  pinned at spawn as `watcher_start_id`); `fence_matches` refuses a fence carrying an
+  unreadable identity (`identity_unreadable`).  (F-006) the positive membership ledger
+  `members.<inc>.jsonl` (`os48.member.v1`: identity with start id, role `agent` / `descendant`,
+  `observed_via`, `pgid`, `observed` / `exited` events) is written by the watcher -- darwin:
+  kqueue `NOTE_FORK|NOTE_EXIT` on every member triggering a bounded `ppid == member` walk of
+  `proc_listallpids` + BSDINFO (plus an initial and a ~1 s periodic walk), Linux: subreaper
+  reaps + a `/proc` ppid walk on SIGCHLD; `_reclaim` re-reads every member's pinned identity and
+  journals `descendants_unreaped` (alive members) / `unknown` (unreadable) -- no member is ever
+  signalled.  (F-007) `scripts/test_os48_crash_cuts.py` SIGKILLs a real supervisor / watcher at
+  deterministic pause seams for C1-C9 and RC1-RC3 with concurrent successors, and
+  `scripts/test_os48_review_i1_locks.py` re-runs every reviewer construction through the real
+  callers; scheduling sleeps in the post-N locks are replaced by handshakes.
+
+* **Iteration 3 corrections (REVIEW_IMPLEMENTATION_iteration2.md F-001/F-004/F-006/F-007).**
+  (F-001 -- *superseded by the iteration-4 correction below*: the reap-step read fixes the
+  sidecar's PRESENCE fact, not its content; a helper write between that read and the marker
+  is still inside N, so the snapshot bytes are no longer a settlement body source.)  The
+  declared `-o` sidecar is read, digested and snapshotted by the EXIT WATCHER in its reap step
+  (`snapshot_sidecar` -> `capture.log.sidecar.<inc>.json` + `.bytes`, link-exclusive; instant
+  `reap_step_before_marker`).  The fence's `sidecar` field is that snapshot (`present` /
+  `absent` / `sidecar_unreadable` / `sidecar_unproven`), never a digest sampled after N; a
+  sidecar the fence did not prove is refused by name
+  (`result_body_provenance.sidecar_refused = sidecar_unproven`) on the supervisor, orphan and
+  adoption paths.  (F-004) `_libproc_list_all_pids` claims completeness only from an INDEPENDENT
+  kernel enumeration (`sysctl kern.proc.all`, taken before and after the fill): any pid present in
+  both walks and absent from the fill is `listallpids_partial`; an unreadable walk is
+  `listallpids_crosscheck_unreadable`; no deficit tolerance and no single anchor; an unreadable
+  fd-table size makes the fd cross-check `fd_table_size_unreadable`, never clean.  (F-006)
+  members are keyed by incarnation `(pid, start_id)`; a child is attributed only to a parent
+  member whose identity re-read NOW equals the recorded one (or a zombie still holding that pid);
+  exited / stale / reused parents attribute nothing; the ledger's readability is part of the
+  answer (`read_ledger`: unreadable / torn; `members.<inc>.state.json` accounts every append) --
+  `membership_unreadable` with explicit `unknown` accounting, never "zero members".  (F-007) the
+  RC2 cut is taken at the real tmp-fsynced -> link boundary (`standalone_capture._LINK_HOOK`, a
+  test-only seam) on the supervisor and orphan-watcher paths, with the boundary state asserted
+  and simultaneous recovery without deleting a winner (`test_os48_review_i2_locks`).
+
+* **Iteration 4 corrections (REVIEW_IMPLEMENTATION_iteration3.md F-001/F-004/F-006/F-008).**
+  (F-001) DESIGN defines ONE boundary -- the marker's stream offset N (§1.2 "authoritative
+  boundary = the root's reaped exit materialised as the fence marker"; §1.4 R3 "sidecar present
+  **and** field == bound_value ... absent / unreadable -> `provenance_unbound`") and no
+  auxiliary-content boundary, so sidecar CONTENT is refused as a settlement body source by name
+  (`result_body_provenance.sidecar_refused = sidecar_unproven`; `result_body(allow_path=False)`;
+  bodies come only from in-stream records -- the installed Codex profile reads
+  `item.completed` / `agent_message` / `item.text`, measured by the real codex smoke), and R3's
+  presence fact is the IMMUTABLE fence snapshot taken by the owner in the reap step (recorded
+  with its instant `reap_step_before_marker`): a sidecar created, removed or resized after N
+  never changes a verdict on the supervisor, orphan or adoption path.  (F-004) PID enumeration
+  completeness requires EXACT agreement of the independent walk before the fill, the fill and
+  the walk after; any other disagreement is `listallpids_unstable` (a missed entry present in
+  both walks: `listallpids_partial`); an intersection is never completeness.  (F-006) the ledger's
+  readable content is joined to the durable append count (`members.<inc>.state.json`) and re-read
+  once: a whole-line prefix shorter than `appended`, or accounting/content that changes between
+  the reads, is `membership_unreadable` with the unknown remainder (`read` / `appended`) named.
+  (F-008) `snapshot_sidecar` distinguishes ENOENT (`absent`, positive) from any other open/read
+  failure (`sidecar_unreadable`, errno recorded); neither approves a `sidecar_file` binding.
+
+* **Iteration 5 corrections (REVIEW_IMPLEMENTATION_iteration4.md F-009, N-001).**  (F-009)
+  `_Membership.discover` never turns unreadable evidence into an empty candidate list: a process
+  listing that fails (`listallpids_*` on darwin, a denied `/proc` on Linux) or will not settle,
+  and a live candidate whose identity no source will read (darwin consults the independent
+  `kern.proc.pid` read before giving up), are accounted SEPARATELY from the appends -- a
+  `discovery_unreadable` ledger record (kind / reason / trigger / pids) and a `discovery` block
+  (`passes`, `listing_unreadable`, `listing_unstable`, `candidates_unreadable`, `reasons`,
+  `pids`) in `members.<inc>.state.json`.  `membership_residual()` joins both into the named
+  outcome `descendants_unknown` (dominated by `membership_unreadable` when the ledger itself is
+  unreadable / short), keeps the positive set, and `_reclaim` journals a `descendants_unreaped`
+  row over it; nothing unknown is signalled; the capture fence stays valid (a G2 accounting
+  residual, not a capture failure); the accounting persists for an adopting successor.  (N-001)
+  the sidecar snapshot is documented as the reap-step PRESENCE fact only.
+
+* **Iteration 6 corrections (REVIEW_IMPLEMENTATION_iteration5.md F-010, F-011, N-001).**
+  (F-010) a POSITIVE kernel fork whose child cannot be attributed is never silently clean:
+  `serve` runs the fork-triggered walk BEFORE marking exits and hands `discover` the member
+  pids whose NOTE_FORK it served; a fork event that no child attributed to that parent IN THAT
+  CALL discharges (the child already exited -- possibly after forking -- or was reparented
+  because its parent exited first, e.g. NOTE_FORK|NOTE_EXIT delivered together) is a durable
+  `discovery_unreadable` record of kind `fork_unattributed` carrying the parent identity and
+  the kernel event (`fflags`, `parent_exited`, `parent_presence`), counted as
+  `forks_unattributed`; the residual is `descendants_unknown` with the fork named, on the
+  supervisor and adopting-successor paths; the positive set is kept, nothing unknown is
+  signalled, the fence stays valid.  Discharge is fail-closed: a child a periodic walk
+  happened to attribute just before the event was served is NOT credited (a spurious UNKNOWN,
+  never a spurious clean), and kqueue's coalescing of repeated forks into one event means one
+  attributed child discharges the event it was served with.  On Linux there are no fork
+  events; the same cut is attributed POSITIVELY because the watcher is a subreaper and the
+  orphaned helper reparents to it (`subreaper_reparent`), and a `release_wait` walk (1 s) runs
+  while the watcher waits for the release on both platforms.  The worker's own adversarial
+  pass named every other path where a positive event or a readable observation could drop a
+  live descendant: a member whose fork/exit watch could not be registered
+  (`fork_watch_unregistered`, e.g. gone before the kqueue add), no kqueue at all
+  (`fork_watch_unavailable`), an unreadable kqueue read (`fork_events_unreadable`, once per
+  error), a positively attributed descendant the ledger ceiling would not hold
+  (`member_ceiling_exceeded`), and a candidate whose parent member no identity source will
+  re-read while the kernel still holds the pid (`parent_identity_unreadable`; `_live_member_for`
+  is tri-state: attributable / positively refused / unreadable).  Remaining, documented
+  limit (DESIGN §2.2 "discovery may MISS"): a fork by a process in the window between its
+  birth and the registration of its watch leaves no kernel evidence and is not accounted.
+  (F-011) the OS-42 historical-artifact lock protects EVERY settled run on disk, tracked or
+  not; only runs that are POSITIVELY active -- an unreleased OS-44 coordinator-session binding
+  (`coordinator_session/*.json`, `released_at: null`), the hard-coded OS-42 run, or an explicit
+  `OS42_ACTIVE_RUN_IDS` allow-list -- are excluded; mutation controls cover an untracked
+  settled change and deletion (detected), an active-run evidence append (excluded) and a
+  released binding (protected again).  (N-001) the last inline "after this read is after N"
+  comment is replaced by the presence-fact wording.
+
+* **Iteration 7 corrections (REVIEW_IMPLEMENTATION_iteration6.md F-010 / F-011 / F-012 /
+  F-013) -- the CONSERVATIVE descendant model.**  Six successive reviews found a path where
+  discovery promoted uncertainty to a clean result; the model is now the other way round: the
+  residual is UNKNOWN by default and only an enumerated set of POSITIVE facts contributes --
+  P1 the spawn record (the root's pid + start identity, the watcher's own child); P2 the root's
+  fork/exit watch registered BEFORE its exec (`spawn` holds the not-yet-exec'd child on a gate
+  pipe until the watcher's kqueue add has returned -- the pre-exec child never forks, so the
+  root has no pre-registration window; a failed add is the named `fork_watch_gap`); P3 a
+  candidate whose ppid is a member whose CURRENT start identity re-read now equals the
+  recorded one (a held zombie / unreadable pid is NOT a witness of the cached incarnation --
+  the iteration-6 held-zombie exception is gone, F-012); P4 Linux: a candidate whose ppid is
+  the watcher itself (the subreaper's adopted child) is a positive member candidate whatever
+  its own start readability -- an unreadable (zero) start is `candidate_identity_unreadable`,
+  named by pid, never omitted (F-013); P5 a member's exit observed by the watcher.  Every
+  non-positive observation is a durable `discovery_unreadable` record that NO later
+  observation discharges: `fork_coalesced` (a NOTE_FORK on a member -- coalesced, it proves
+  "at least one fork", never the set of children; F-010: attributing one child does not clear
+  it), `fork_watch_gap` (the root without P2; EVERY descendant, whose watch is registered
+  after its birth), `parent_identity_unreadable`, `candidate_identity_unreadable`,
+  `listing_unreadable` / `listing_unstable`, `fork_watch_unregistered`,
+  `fork_watch_unavailable`, `fork_events_unreadable`, `member_ceiling_exceeded`, and
+  `watch_ended` (members still alive when the watcher stopped observing).  Consequence: a
+  darwin dispatch is clean only when its root, under a pre-exec watch, never forked; a root
+  that forked is `descendants_unknown` with its positively attributed members listed alive --
+  acceptable per DESIGN §2.2 (a smaller positive set; absence stays unknown and is reported;
+  nothing unknown is ever signalled; the fence stays valid).  On Linux there are no fork
+  events and the subreaper is the positive mechanism; the pre-reclaim residual of a
+  non-forking or fully attributed tree is clean.  (F-011) the OS-42 historical-artifact
+  lock's active set is ONLY what the invocation names -- `OS42_ACTIVE_RUN_IDS`, the hard-coded
+  OS-42 run, or a run whose `coordinator_session` binding names THIS process's own
+  `CLAUDE_CODE_SESSION_ID` and is unreleased; an unreleased binding of any OTHER session is
+  never evidence of activity (a coordinator that died after a terminal checkpoint leaves one);
+  exclusion is by the ROOT run-directory component only.  A lane run inside an orchestrated
+  worktree must name its run (`OS42_ACTIVE_RUN_IDS=<run> python3 -m scripts.ci_lane ...`).
+
+* **Iteration 8 corrections (REVIEW_IMPLEMENTATION_iteration7.md F-011 / F-014 / F-015 /
+  F-016, N-002).**  (F-015, capture finality) R1/R2 are decided over MORE than the parsable
+  records: every run of lines in `[baseline, N)` that does not parse as a record is scanned
+  for embedded balanced JSON objects (`standalone_capture.embedded_objects` /
+  `unparsable_runs`; string- and escape-aware); an object of a declared completion type or
+  carrying a refusal marker (its declared `error_field`, `is_error`, a structured auth
+  marker) is a `framing_candidate` (`standalone_drivers.framing_candidates`): a refusing one
+  is a refusal under R1 (`refusal_in_boundary`, FAILED); any other makes "exactly one"
+  unprovable -- `record_framing_ambiguous` (LOST, registered in `LOST_REASONS` /
+  `OS48_LOST_OUTCOMES`), never COMPLETED.  A cooperative helper's `progress: ` prefix on the
+  root's own refusal, a suffix, and a record split across lines are all covered; prose braces
+  that hold no completion-shaped object do not widen the candidates; the fenced byte prefix
+  is untouched.  This stays inside DESIGN §1.4 R1/R2 (it widens what counts as a candidate
+  and refuses on ambiguity) and does not weaken AC-4.  (F-014, Linux ownership)
+  `PR_SET_CHILD_SUBREAPER` is installed AND verified (`PR_GET_CHILD_SUBREAPER` reads back 1)
+  by `_set_subreaper` inside `_register_root_watch`, i.e. BEFORE `spawn`'s gate releases the
+  root, and its RECEIPT (`"subreaper"`) travels as `root_watch`; a failed / unverifiable
+  setup is the durable `ownership_setup_unverified:<why>` record (`unobservable`) for the whole
+  dispatch and the residual is `descendants_unknown` (`discovery=unwatched`); the string
+  "linux" is no longer a receipt.  The reviewer's delayed-setup cut can no longer start a
+  root at all (the gate holds it; the leader refuses the spawn by name).  (F-016, Linux
+  identity) (pid, start tick) is not injective at tick granularity, so every positively
+  attributed Linux member holds a FIXED object -- a `pidfd_open` descriptor kept from
+  attribution until the member is observed exiting; `_live_member_for` asks the pidfd
+  (`alive` = the pid is still exactly that process; `exited` = P5 through the fixed object;
+  no pidfd = unreadable), never (pid, tick) equality; the watcher polls the held pidfds for
+  exits (`serve`, and the select loop wakes on them); members are LIFETIMES `(pid, start,
+  n)`: a live process presenting the key of an EXITED lifetime is a new lifetime (attributed
+  on its own parentage, own pidfd), and a cached UNEXITED tuple whose pidfd has died is
+  marked exited and never adopts another process's child; a member without a pidfd is
+  `pidfd_unavailable` (unknown).  The supervisor-side reader keeps one residual entry per
+  lifetime and states `lifetime_binding: tick_granular` where two lifetimes share a key.  On
+  darwin the start identity is µs-granular and pinned by kqueue NOTE_EXIT on the watched pid
+  (`fixed_object: kqueue_note_exit`); no pidfd exists there and that is stated in the record.
+  (F-011) the OS-42 historical lock's active set is ONLY the explicit invocation scope
+  (`OS42_ACTIVE_RUN_IDS`) or a POSITIVE live-writer fact -- a run whose workflow checkpoint is
+  present with a non-terminal `run_status` AND whose session binding is unreleased (both
+  required); no hard-coded legacy run, no session cookie (a cookie names a run, it is not a
+  writer); root-directory exclusion in the lock and in every correction lock.  (N-002) the
+  real-CLI harness's exit code is a receipt of its roll-up (0 = PASS + verified evidence, 2 =
+  PARTIAL / FLAKY / FAIL / NOT ESTABLISHED, 3 = evidence unverified) and the summary names the
+  workload outcome separately from the adapter settlement claims.
+
+* **Follow-up run corrections (REVIEW_IMPLEMENTATION_iteration8.md F-015 / F-016, run
+  `run_5fcd2beac376`).**  (F-015, capture finality) the framing scan is a BOUNDED NESTED
+  traversal (`standalone_capture.embedded_scan` / `walk_nested_objects` / `ScanBudget`:
+  `EMBEDDED_SCAN_OBJECT_LIMIT` objects examined, `EMBEDDED_SCAN_DEPTH_LIMIT` nesting,
+  `EMBEDDED_SCAN_BYTE_BUDGET` characters visited, shared across the whole fenced range): every
+  object nested inside an embedded object -- and inside EVERY parsable line, whatever its
+  outer `type` (iteration 2, REVIEW_IMPLEMENTATION.md F-015: a declared readiness / delivery /
+  body / completion type on the container -- Claude `system` / `assistant`, Codex
+  `thread.started` / `item.completed` -- is NO exemption; a helper can open such a wrapper
+  around the root's record exactly as it can open `{"progress": `) -- is examined; the outer
+  record itself stays a record judged by R1/R2, only what it HOLDS is a candidate; a JSON string
+  literal's contents are never a record.  A nested object is a refusal only through a
+  POSITIVE rule (its declared completion type's `error_field`, a declared auth marker); a
+  nested generic `is_error` (a tool result inside a wrapper, a Codex `item.completed` error
+  item) is data.  A scan that reaches any bound before examining the whole range and found no
+  refusal is the NAMED outcome `record_scan_incomplete` (LOST, registered in `LOST_REASONS` /
+  `OS48_LOST_OUTCOMES`; the journal names the bound hit) -- never "no candidates", never
+  COMPLETED; a refusal the scan did reach still dominates.  (F-017, iteration 2) the line parser
+  itself is total: `standalone_capture.parse_record_line` / `structured_lines` classify a
+  JSON line the interpreter cannot follow (`RecursionError`, native py3.11 at ~1,000 levels) as
+  UNPARSABLE instead of raising, so a plain 5,000-level depth bomb reaches the bounded scan
+  and settles `record_scan_incomplete` (`depth_limit`) through every reader (readiness,
+  refusal evidence, completion selection).  (Iteration 3, REVIEW_IMPLEMENTATION_iteration2
+  F-015 / F-017) the ONE JSON entry point of every reader is `standalone_capture.parse_json`:
+  it parses integers under the reader's own digit budget (`INTEGER_DIGIT_BUDGET` = 4,000; a
+  longer token is kept as an `UnconvertedInteger` digit string, so the object is examined
+  WHOLE and a refusal it carries is recognised -- Python's 4,300-digit `int()` limit, which
+  `json.loads` surfaces as a plain `ValueError` rather than a `JSONDecodeError`, is never
+  reached), and it distinguishes a SYNTAX rejection (`JSONDecodeError`: prose) from a parser
+  that could not EXAMINE the candidate -- `MemoryError` -> `resource_limit`, `RecursionError`
+  -> `depth_limit`, any other `ValueError` -> `conversion_limit` -- raised as the typed
+  `ParseFailure`; such a line is unparsable for the record reader (never a record, never
+  prose) and the embedded scan that re-examines it ends `record_scan_incomplete` with that
+  reason unless its bounded re-parse examined the object whole.  Stated exactly: NOT every
+  parser limit fails closed by itself -- the interpreter's integer limit failed OPEN in
+  iteration 2 -- what fails closed is every failure `parse_json` classifies; a reached
+  refusal still dominates a later failure INSIDE the scan (the iteration-3 tree did NOT yet
+  honour this at the reader site AFTER the selection -- F-017 of `REVIEW_IMPLEMENTATION_iteration3`,
+  corrected in run `run_7859f202457c`, next bullet), and no general OOM / SIGKILL recovery is
+  claimed.  **What R1 "refusal dominance" positively covers,
+  stated exactly:** a declared completion record whose error field is set, a declared auth
+  marker (top-level or nested anywhere), a completion-typed nested object whose error field is
+  set, a top-level embedded object with a truthy `is_error`, and the free-text refusal
+  patterns over prose lines -- each only where the bounded scan REACHED it; it is not a claim
+  that every conceivable refusal-shaped byte sequence inside `[0,N)` is recognised.  The
+  reviewer's 4,096-object exhaustion, the plain-root two-line wrapper (`{"progress": ` + the
+  root's own newline-terminated refusal + `}`), the declared-type one-line wrappers of both
+  installed grammars and the depth bomb all settle FAILED `refusal_in_boundary` / LOST
+  `record_scan_incomplete`, never COMPLETED.  This stays inside DESIGN §1.4 R1/R2: the
+  boundary `[0,N)` is unchanged, only what the scan examines inside it and what an unfinished
+  scan is allowed to mean.  (F-016, Linux identity) a pidfd acquired for a candidate may bind a
+  different birth than the one the pre-acquisition `/proc` reads described (the reviewer's
+  same-tick foreign peer): `_Membership._add` now re-reads identity AND parentage AFTER the
+  fixed object is held, polls the pidfd after the re-read (alive -> the read was of the bound
+  process), and re-checks the parent member's own fixed object; only the proven same
+  incarnation is admitted -- anything else is the named `candidate_identity_unverified:<why>`
+  (state counter `candidates_unverified`, residual `descendants_unknown`) and NOT a member; a
+  descendant whose pidfd cannot be obtained is `pidfd_unavailable` and NOT a member (the agent,
+  bound by the watcher's own `waitpid`, is the one exception).  A reader with NO held pidfd
+  (the supervisor's `membership_residual`; recovery after the watcher died) never reports a
+  Linux lifetime alive from (pid, start tick) equality: the watcher records the member's pidfs
+  inode as `fixed_object_id` TOGETHER with the inode lifetime MODEL it is valid under
+  (`fixed_object_model`), and ONLY under the one model this runtime can positively vouch for
+  (iteration 2, F-016; `standalone_pty.pidfs_lifetime_model`): a 64-bit Linux kernel at or
+  after 6.9, where the inspected primary sources (v6.12 `fs/pidfs.c` + `kernel/pid.c`, v6.16
+  `fs/pidfs.c`) assign `i_ino` from the monotonic 64-bit `struct pid` counter and never reuse
+  it for the life of the boot.  The 32-bit branches are NOT such a binding (v6.12 allocates
+  the number with `ida_alloc_range` and frees it on inode eviction -- a later different birth
+  may receive it; v6.16 exposes only the lower 32 bits plus a generation `st_ino` cannot
+  show), and a kernel before 6.9 has one shared anonymous pidfd inode; under any such model
+  the watcher records no binding and the reader answers UNKNOWN.  The reader
+  (`standalone_pty.pidfd_binding`) compares a fresh pidfd's inode only when the recorded model
+  equals the model it establishes on its own kernel: equal -> `lifetime_binding: pidfs_inode`
+  (alive, `binding_model` named); different -> `pidfs_inode_mismatch` (that incarnation is
+  positively gone); no inode on either side, no recorded model (an iteration-1 row), or a model
+  the reader cannot re-establish -> `pid_tick_unverified` with `binding_detail`
+  (`no_recorded_fixed_object_id` / `binding_model:unproven` / `binding_model:mismatch:…` /
+  `reader_binding:…`), an `unknown` entry and `descendants_unknown` (`tick_granular` is replaced
+  by `lifetime_siblings` + the binding).  Distinct self/member inode values alone prove
+  nothing about reuse.  (Iteration 3, F-016 -- the BOOT JOIN) every one of those bindings is
+  boot-scoped -- the start tick counts from boot, the pidfs inode counter (`pidfs_ino` /
+  `pidfs_ino_nr`, v6.9..v6.16) restarts on every boot, darwin's start time is a re-read --
+  so before ANY of them can say "the same incarnation" the reader joins the ledger's recorded
+  `identity.boot_id` to its own current boot id (DESIGN §2.1's boot identity axis): both
+  must be readable (non-empty) AND equal (`boot_joined: true`); a missing recorded boot, an
+  unreadable current boot, or a different boot is `unknown` `boot_unjoined` with
+  `binding_detail` `boot_id:unrecorded` / `boot_id:unreadable` / `boot_id:mismatch` and
+  `descendants_unknown` -- never alive (a different boot is reported conservatively as
+  unknown, not turned into a positive "gone" claim), on every platform.  No signal or settlement authority is derived from that reader on any
+  platform.  Darwin is unchanged and states its limitation honestly (N-001): the reader's alive
+  entries carry `lifetime_binding: start_microsecond` with `binding_detail:
+  reread_timestamp_not_fixed_object` -- the kernel's µs start identity RE-READ at decision
+  time (DESIGN §2.1's diagnostic identity axis), not an independently retained fixed object
+  and not the Linux binding guarantee; kqueue NOTE_EXIT pinned only the watcher's own
+  observation of an exit while it lived, it pins nothing for a later reader.  Additive ledger
+  fields (`os48.member.v1` unchanged; a row without `fixed_object_id` + `fixed_object_model`
+  reads as unverified).  Locks: `scripts/test_os48_f015_f016_locks.py` (real-caller F-015 exhaustion /
+  nested / one-line container / string-literal controls; F-016 admission seams, reader binding,
+  real-dispatch binding on both platforms, and the two PID-1 private-namespace same-tick
+  constructions; iteration 2: declared-wrapper locks for the fixture and both installed
+  grammars incl. the CRLF plain-root form, production-caller depth-bomb locks with plain /
+  prose / refusal-first controls, inode-model locks and the source-faithful 32-bit
+  recycling constructions; iteration 3: integer-limit production-caller locks for the fixture
+  and both installed grammars incl. prose / declared-wrapper framing, over-limit progress and
+  string-data controls, the selector factories and the bounded parser's conversion failure;
+  deterministic `MemoryError`-seam locks through the production caller (plain / prose /
+  two-line, refusal-first dominance, normal settlement) and every parser's classification;
+  the boot-join matrix (matching / recorded-missing / current-unreadable / different) over a
+  native own child and the PID-1 boot-counter-reset foreign-peer construction), RED at
+  checkpoint `c8f2747` (and, for each correction round's locks, at the previous round's
+  tree); `test_os48_review_i7_locks` reader lock versioned (`pid_tick_unverified`).
+
+* **Follow-up run correction (REVIEW_IMPLEMENTATION_iteration3.md F-017 / N-003 of
+  `run_5fcd2beac376`, run `run_7859f202457c`).**  (F-017, a SELECTED refusal survives a later
+  reader failure) the iteration-3 `completion()` re-read `[baseline, N)` a second time AFTER
+  `select_completion` had returned, and a `MemoryError` in that second read unconditionally
+  replaced the selection with `record_scan_incomplete` (record `None`, refusal `None`) -- an R1
+  refusal positively established over the verified boundary settled LOST instead of FAILED
+  `refusal_in_boundary`, on darwin and Linux (the reviewer's `probe_reached_refusal_contract`).
+  The second read was REDUNDANT: `completion_evidence` takes the record, provenance outcome and
+  refusal from the selection and never reads its `text` argument when a selection is supplied.
+  The option taken is REMOVAL, not "diagnostic-only": within a SINGLE `completion()` call, with
+  a fence, the range is read exactly once (before the selector) and no further read follows the
+  selector inside that call, so a reader failure there cannot reach the selection; a
+  `MemoryError` BEFORE / INSIDE the selection is still the named `record_scan_incomplete`
+  (`resource_limit`), unchanged.  **(Iteration 2, run `run_7859f202457c`, the REMAINING F-017
+  branch -- the CALLER path.)**  The earlier statement "any read that follows the selection
+  (none today)" was true only WITHIN one `completion()`; the CALLER, `await_completion()`, still
+  read twice.  It calls `completion()` for its initial evidence, and then -- once the exit is
+  proven -- runs the post-exit drain (`drain_after_exit`, which binds and verifies the fence)
+  and calls `completion()` AGAIN, unconditionally discarding the first evidence.  That second
+  scan exists for a legitimate reason: on the ordinary path the fence is NOT yet bound at the
+  initial call, so its first scan carries no selection and the post-drain scan is what settles
+  the dispatch.  But when the fence was ALREADY bound and verified before `await_completion`
+  (a production-drained / adopted session), the initial scan already positively selected over
+  the SAME immutable `[baseline, N)`, and the second scan re-read the identical bytes -- a
+  `MemoryError` in it replaced the selected refusal (or bound completion) with
+  `record_scan_incomplete` → LOST.  Fix: `await_completion` skips the redundant post-drain
+  re-scan precisely when the prior evidence already reached a POSITIVE selection (a refusal, or
+  a bound completion record) over the SAME verified boundary the drain establishes -- equal
+  `offset_n` AND equal fence `sha256_prefix` (`_positive_selection_over_bound_fence`).  A prior
+  scan with no boundary, or over a not-yet-verified / different range, is still superseded by
+  the post-drain scan, so the legitimate pre-fence supersession is preserved.  Stated exactly
+  for the whole caller: with a bound fence, `completion()` reads the range once and nothing in
+  that call follows the selector; and `await_completion()` performs the settlement scan once
+  over a given verified boundary -- it does NOT re-scan a boundary a positive selection was
+  already reached over, so no later reader failure can turn a selected refusal / completion into
+  LOST, COMPLETED or any other outcome (DESIGN §1.4 R1).  Without a fence nothing is selected
+  and the legacy transcript reading remains the driver's only input.  Locks (production spawn +
+  `await_completion` over a real cooperative PTY root writing a bound success then a bound
+  `is_error: true` refusal; the real selector wrapped, never replaced; a deterministic
+  `MemoryError` seam on the read that follows the positive selection -- the reviewer's exact
+  `_authoritative_text` seam and, stronger, ANY `capture.raw` after it; the normal control; the
+  selected-completion counterpart; and the implementation-choice lock that no capture read
+  follows the selection): `scripts/test_os48_f015_f016_locks.py::F017SelectedRefusalDominanceTests`;
+  and, for the caller-path branch (iteration 2), `F017PreBoundAwaitDominanceTests` -- a session
+  the production `drain_after_exit` bound BEFORE `await_completion` (pre-bound refusal fault,
+  pre-bound completion fault, both controls, the re-scan-skipped proof, and the ordinary
+  not-yet-bound supersession path), RED at checkpoint `709cea0` AND on the iteration-1 tree,
+  RED at checkpoint `709cea0` (4 dominance locks LOST, the no-read lock records the read; the
+  control passes on both trees, as a control must), GREEN on darwin and non-root read-only Linux.
+  (N-003, the physical read stated exactly) "only the fenced range is read" / "no whole-capture
+  copy" overstated it: `capture.raw(baseline)` reads the file from `baseline` THROUGH EOF --
+  the fence marker and whatever diagnostic tail has been appended since -- and the reader then
+  slices the returned bytes to `N - baseline`; it is a whole-tail read followed by prefix
+  slicing, not a bounded read of `N - baseline` bytes.  The SEMANTIC rule is unchanged and is
+  the one the locks hold: only the `[baseline, N)` prefix reaches any parser, selector, body
+  extraction, fallback or digest; bytes past N are dropped before any of them runs and can
+  change nothing.  A bounded physical read would only shrink the reader's own allocation and
+  is not implemented here.  *Superseded by the PR #36 corrections below: the physical read IS
+  bounded now, and the whole-file answerability no longer gates a fenced settlement.*
+* **PR #36 consolidated review corrections (issuecomment-5739898842 on head `c9b8d04`, run
+  `run_9af92a7f320d`).**  (1, P1 -- a post-fence diagnostic tail changed a bound settlement)
+  `completion()` checked the WHOLE capture's answerability / integrity and read
+  `capture.raw(baseline)` through EOF, so a ~70 KB diagnostic line written after the fence
+  tripped the store's limit (`line_bytes` / `total_bytes`) and flipped a bound success to
+  `state=LOST lost_reason=capture_truncated has_record=True`, and a tail too large to
+  allocate flipped it to `record_scan_incomplete`.  Now: with a VERIFIED fence the
+  settlement read is ONE bounded read of exactly `N - baseline` bytes
+  (`BoundedCapture.raw(cursor, limit)`; the marker and the tail are never read, allocated or
+  decoded by a settlement), and the answerability a settlement rests on is the fence's own
+  recorded fact about `[0, N)` -- `capture_at_publish` (`answerable`, `lost_reason`,
+  `integrity`, `truncation`, `dropped_bytes`, `total_bytes`), MEASURED by every publisher
+  (supervisor `_publish_fence`, orphan watcher `_orphan_finalize` from its appender state,
+  successor `_successor_attempt`; `capture_state_at_publish` / `fenced_answerability`; the
+  provenance entry `capture_integrity_answerable_at_publish` is listed only when the
+  measurement is positive -- it used to be asserted unmeasured).  Every limit drop, line cut,
+  failed write or meta disagreement AFTER the publish lies past the bytes the fence bound and
+  is recorded as diagnostic evidence only (`evidence.post_boundary`: truncation, dropped
+  bytes, unanswerable cause, size, N, the answerability source); a bound success stays
+  COMPLETED, a bound refusal stays FAILED `refusal_in_boundary`, and a session whose fence is
+  already bound re-verifies it over `[0, N)` (`fence_matches`) instead of re-scanning the
+  whole capture for the marker.  A fence without the fact (published before the field
+  existed) keeps the whole-capture answer in force -- fail-closed, never widened.  **Stated
+  exactly (residual):** a truncation the store recorded BEFORE the publish -- including one
+  a post-N tail caused between the marker and the publication -- is unattributable to a side
+  of N without an offset in the meta (whose v2 key set is closed) and stays fail-closed
+  (`capture_truncated` / `evidence_unreadable` from the fence's own record); only what
+  happens after the publish is proven to be post-N.  (2, P2 -- no prompt-echo provenance)
+  `completion()` looked for `delivery_intent.payload`, which `make_delivery_intent` never sets
+  (the intent carries a digest), so the fenced selector always received an empty event
+  tuple and, under `post_ready_delivery` with ECHO set, the echoed prompt's "not logged in"
+  fired R1 (`FAILED refusal_in_boundary`, source `free_text`), its result-JSON example was a
+  second completion / framing candidate (`provenance_ambiguous` / `record_framing_ambiguous`)
+  -- MEASURED through the real `start` -> `send` -> `await_completion` path.  Now the selector
+  receives `self.delivery_events` (payload + `EchoTransport` + offset, translated to the
+  fenced range's raw-byte coordinates) and `select_completion` excises a PROVEN echo before
+  records, candidates and framing are read (an unproven echo excludes nothing; a negative
+  translated offset is `delivery_before_window`); `evidence.settlement_range` names the
+  baseline, N, the bytes read, the event count and the echo state.  (3, P2 -- the marker
+  write mutated the agent's stdio flags) `_write_marker_bounded` set `O_NONBLOCK` on the
+  watcher's `slave_fd`, the SAME open file description as the agent's 0/1/2 and every
+  descendant's inherited stdio; MEASURED from inside a descendant with the output FIFO held
+  full: 500+ `F_GETFL` samples carrying `O_NONBLOCK` during the retry loop, and the bit still
+  set when the window ended.  Now the FENCE and RELEASE markers go through a descriptor opened
+  SEPARATELY by the slave's device path (`_open_marker_descriptor`: `O_WRONLY | O_NOCTTY |
+  O_NONBLOCK`, `O_CLOEXEC`; its own open file description; closed after the write; the path
+  is the spawn's `slave_name`, or `ttyname(slave_fd)` read at the call) and the owner-held
+  `slave_fd` is never written through and never has a flag changed.  MEASURED on this host:
+  the subtree's flags are invariant before / during / after the write (`L-5`), the marker
+  lands in-band after every agent byte through the new descriptor (256 KiB, sha256-joined to
+  the fence), and the bounded write still lands under a REAL full queue once the supervisor
+  pumps.  The O-3 bound is unchanged; when the path cannot be opened or the bound elapses the
+  marker is unwritten and a successor reads `boundary_unproven` by name -- there is no
+  fallback to mutating the shared description.  (4, P2 -- adoption lost the baseline and the
+  events) `adopt()` left `_settlement_baseline = 0` and `delivery_events = []`, so the same
+  run settled differently live and adopted (MEASURED: live COMPLETED over the excluded echo
+  vs adopted `refusal_in_boundary` from the echo; baseline 71 vs 0).  Now `send()` and the
+  `launch_with_prompt` branch of `run_dispatch` persist both BEFORE the prompt bytes go out as
+  ONE journal row `delivery_recorded` (`derived_from: driver`; closed vocabulary: `baseline`,
+  `delivery_mode`, per-event `index` / `offset` / `payload_sha256` / `payload_bytes` /
+  `transport` / `at` / `echo_proof`).  **No byte of the prompt is written anywhere durable
+  (REVIEW_BUGFIX i1 F-001, iteration 2).**  The iteration-1 candidate additionally wrote
+  `capture.log.delivery.<inc>.json` with every event's full `payload` -- for an `argv` delivery
+  a NEW plaintext copy of a prompt that is not in the capture at all (the reviewer's
+  `plaintext_probe.py`: `secret_in_capture=false, secret_in_delivery_record=true`), against the
+  journal's own rule (`append_delivery_intent`: the prompt DIGEST, never the prompt).  That
+  record no longer exists.  The durable provenance is the `echo_proof` (`os48.echo_proof.v1`,
+  `standalone_lifecycle.echo_proof`, derived from the same evidence the live resolver uses):
+  for an echo-ABSENT transport (`argv`; `pty_write` with ECHO clear) the class `echo_absent`
+  by name with its reason and no forms; for an echo-possible pty write the class
+  `echo_expected` with the sha256 + byte length of EVERY echo form the recorded transport can
+  produce (`expected_echo_forms`); otherwise `echo_unproven` with the derived reason.
+  `adopt()` restores the baseline and one PAYLOAD-LESS event per recorded event (offset,
+  transport, `at`, `echo_proof`); `resolve_delivery_echo` resolves such an event from its
+  proof: `echo_absent` by name (never `no_delivery`); for `echo_expected` a DIGEST-VERIFIED
+  span -- the candidate positions are the occurrences of the frame-start rendering under the
+  recorded transport (a non-secret prefix every form of a framed delivery begins with;
+  `_frame_anchor`), or every position under `ECHO_PROOF_SCAN_BUDGET_BYTES` for an unframed
+  delivery (past the budget: `proof_scan_bounded`, unproven) -- with the same uniqueness rule
+  (two distinct spans -> `ambiguous_multiple_matches`), so live (payload) and adopted (digest)
+  resolve the identical `echo` block: state, reason and spans.  **(Iteration 3,
+  REVIEW_BUGFIX_iteration2 F-002 -- the proof is a CLAIM, the transport is the FACT.)**  The
+  iteration-2 resolver trusted the proof's declared class: a forged `echo_expected` proof on an
+  adopted `argv` event whose digest named agent refusal bytes resolved `echo_proven` and
+  `strip_delivery_echo` removed the refusal before R1 (the reviewer's `forged_proof_probe.py`:
+  `refusal_present_after=false`); the inverse (`echo_absent` on an ECHO-set pty) was trusted too.
+  Now a restored proof is BOUND to what the recorded transport alone permits BEFORE any digest is
+  compared (`standalone_lifecycle.transport_echo_capability`, derived from the transport exactly
+  as `expected_echo_forms` derives it, with no payload; `_bound_proof`): `argv` and an ECHO-clear
+  pty prove ABSENCE and accept only the canonical `echo_absent` proof carrying the transport's own
+  reason (`argv_transport_cannot_echo` / `echo_flag_clear`) and no forms (an ECHO-clear pty with
+  ECHONL+ICANON also accepts the live `echonl_partial_echo` unproven); an ECHO-set pty is
+  echo-POSSIBLE and accepts only `echo_expected` with 1..`TAB_STOP` forms (exactly 1 unless the
+  transport expands tabs), or the live `control_byte_consumed_by_line_discipline` unproven; an
+  unevaluable transport (`transport_kind_unknown` / `termios_unreadable` / `transport_unrecorded`)
+  accepts only its own `echo_unproven` reason.  Every other combination -- `echo_expected` (or any
+  forms-bearing proof) on an absent transport, `echo_absent` on a possible one, a reason the
+  transport cannot have produced, forms on a non-expected class, no forms on `echo_expected`, an
+  impossible form count, an unknown class or schema -- is `echo_unproven` with a NAMED reason
+  (`proof_class_contradicts_transport`, `proof_reason_contradicts_transport`,
+  `proof_forms_contradict_class`, `proof_forms_count_contradicts_transport`, `proof_unrecorded`)
+  and NO span: nothing is excised, R1 sees every agent byte, and live == adopted holds for every
+  transport because the live path records exactly the proof its transport permits.  The
+  reviewer's probe now reports `echo_unproven`, `spans=[]`, `refusal_present_after=true`.  A
+  missing, malformed or non-verifying proof (wrong digest, wrong length, no proof) remains
+  `echo_unproven` / `proof_unrecorded` / `echo_not_found` -- NOTHING is excised, never a wider
+  excision; a row
+  whose event vocabulary is not the closed shape (a `payload` key, say) restores no event and
+  is journalled `delivery_provenance_unrestored` (`delivery_recorded_events_malformed`).  What
+  pty+ECHO keeps, stated exactly: digests of strings whose bytes the line discipline already
+  echoed into `capture.log` when the echo occurred -- MEASURED (L-10): after an ECHO turn the
+  prompt is on disk in exactly one file, the capture itself, and every persisted form digest
+  matches a span of that capture; when no echo occurred the digests match nothing and reveal
+  nothing beyond the digest class the delivery intent already accepts.  The adoption's
+  `identity_bound` row carries `settlement_baseline`, `delivery_events_restored`,
+  `delivery_provenance` (`restored` | the reason).  Live and adopted settlements of one run
+  were, through iteration 3, identical in baseline, delivery provenance, boundary and verdict
+  -- SUPERSEDED by the paragraph that follows.
+  **(run_c296ff67c325 -- REVIEW_BUGFIX_iteration3 F-003, resolved under the USER DECISION that
+  narrows PR36-4; `artifacts/runs/run_c296ff67c325/ORIGINAL_REQUEST.md`.)**  F-003: on an
+  ECHO-set `pty_write` a structurally consistent forged `echo_expected` proof whose one form
+  digest named agent bytes already visible in the capture (`not logged in`) was accepted by the
+  iteration-3 binding (class / reason / form-count only) -- the adoption excised the refusal
+  and settled COMPLETED where live had FAILED (the reviewer's `echo_set_forgery_probe.py`).
+  Root cause: the `delivery_recorded` row is UNKEYED (a same-user writer rewrites it and
+  re-digests it with `record_digest`), so nothing in it can be excision authority without a
+  real authentication authority -- which the decision forbids introducing (no MAC, key or new
+  secret; no new field on existing rows treated as authenticated; no plaintext prompt at rest).
+  The decision instead narrows what adoption is for: *"Adoption does not guarantee the same
+  availability as live.  Adopted success must be narrower than or equal to live success, and
+  adoption may not remove unauthenticated evidence to produce a success verdict."*  Contract
+  now in force: (i) LIVE is unchanged -- `send()` / `run_dispatch` -> `completion()` in the same
+  process excises exactly the echo it observed itself (payload in memory, offset, transport;
+  `resolve_delivery_echo`'s payload leg), nothing wider; (ii) ADOPTED -- `adopt()` ->
+  `_restore_delivery` restores the baseline and one payload-less event per recorded event
+  (offset, transport, `at`), and such an event carries NO excision authority:
+  `resolve_delivery_echo` resolves it STRUCTURALLY from the transport KIND alone
+  (`standalone_lifecycle.unobserved_delivery_echo`) -- `argv` (`launch_with_prompt`) is
+  `echo_absent` / `argv_transport_cannot_echo` because the payload left with the `execve` and
+  never entered the pty input queue; `pty_write` -- ECHO set, ECHO clear, termios unreadable,
+  whatever the row's flags say -- is `echo_unproven` / `payload_unobserved` (a new
+  `ECHO_UNPROVEN_REASONS` member: this process holds no delivered payload, so no span can be
+  proven to be the echo); an unknown kind is `transport_kind_unknown`.  No capture byte is
+  read for such an event, no digest is compared, no span is produced, NOTHING is excised.
+  (iii) The `echo_proof` PRODUCER is removed (`standalone_lifecycle.echo_proof`,
+  `_echo_proof_of`, `_bound_proof`, `transport_echo_capability`, `_frame_anchor`,
+  `_digest_occurrences`, `ECHO_PROOF_*`, `PROOF_CONTRADICTION_REASONS` no longer exist) so no
+  authority-looking field remains for a future reader to trust; the row's closed vocabulary is
+  now `index` / `offset` / `payload_sha256` / `payload_bytes` / `transport` / `at`, and the
+  digest, length and transport that remain are DIAGNOSTIC ONLY (they are never consulted as
+  authority; the transport's kind decides only the `echo_absent` / `echo_unproven` NAME, never
+  an excision).  A row carrying the pre-decision `echo_proof` key is not the closed shape and
+  restores no event (`delivery_provenance_unrestored` / `delivery_recorded_events_malformed`;
+  the selector then sees `no_delivery` and excludes nothing).  (iv) CONSEQUENCE, accepted:
+  adoption is STRICTER than live on an ECHO-set pty -- an ECHO turn live settled COMPLETED
+  after excising its own echo settles, on adoption, FAILED `refusal_in_boundary` when the echoed
+  prompt text carries a refusal-like phrase ("not logged in"), or LOST
+  `record_framing_ambiguous` when it carries a result-JSON example (the echo is a framing
+  candidate); an adopted argv settlement is unchanged (live == adopted); an adopted ECHO-clear
+  or termios-unreadable pty settlement is unchanged in verdict (only its echo NAME is
+  `payload_unobserved`).  What is impossible: an adopted COMPLETED that live would not have
+  produced (`adopted_success` is a subset of `live_success`, on the same settlement record),
+  and any adopted excision at all.  MEASURED matrix (F3-L2, `PR36F003AdoptedSuccessSubsetTests`;
+  live / adopted): argv -- C/C, F/F, C/C, C/C; pty ECHO set -- C/C, F/F, C/F
+  `refusal_in_boundary`, C/L `record_framing_ambiguous`; pty ECHO clear -- C/C, F/F, C/C, C/C;
+  pty termios unreadable -- C/C, F/F, F/F, L/L (columns: clean completion, agent refusal,
+  refusal-like prompt echo + completion, JSON-example prompt echo + completion).  The reviewer's
+  probe now reports `forged_state=echo_unproven`, `forged_spans=[]`, `refusal_after_forged=true`,
+  `actual_echo_after_forged=true` (live unchanged: `echo_proven` at `[0,15]`).  Locks
+  (`scripts/test_os48_pr36_locks.py`, RED at `92d8432`, GREEN after; the i1-i3 locks whose
+  expectation the decision changed are REWRITTEN with a note naming it, none deleted): F3-L1 a
+  structurally complete forged / stale / tampered row -- the reviewer's ECHO-set forged-forms
+  row through the REAL adopt path (92d8432: false COMPLETED), the closed-shape row with its
+  digest re-pointed, the ECHO flag cleared, the termios dropped, the kind rewritten, the
+  genuine pre-decision proof, the argv forgeries of F-002 -- has no effect on adopted excision
+  (spans `[]`, every agent byte survives), plus the resolver reads no capture byte for a
+  restored event; F3-L2 the matrix above; F3-L3 argv live == adopted (L-7 / L-8 / L-9 / L-11 /
+  L-12 retained); F3-L4 `pty_write` + ECHO possible / unreadable -> `echo_unproven` /
+  `payload_unobserved` by name, no span, whatever the row carries (L-13, L-14 rewritten: every
+  proof material inert on every transport); F3-L5 the refusal-like prompt and the result-JSON
+  example settle FAILED / LOST by name on adoption, never COMPLETED; F3-L6 the PR36-1..3 locks,
+  the F-015 / F-016 / F-017 locks and the affected suites unchanged.
+  **(run_d6391487ff44 -- the unkeyed `delivery_recorded.baseline` merge blocker; the SAME USER
+  DECISION narrowing PR36-4, closed at the BASELINE as F-003 closed it at the echo proof.)**
+  The `delivery_recorded` row's `baseline` is ALSO unkeyed -- a same-user writer rewrites it and
+  re-digests the row with `record_digest` -- so it is NOT a settlement authority any more than
+  the `echo_proof` was.  At 991847f `_restore_delivery` assigned `self._settlement_baseline =
+  row.baseline` BEFORE validating the event list and LEFT it applied when the events were
+  rejected as malformed; `completion()` then selected over `[baseline, N)`, so a forged/stale
+  later baseline (row re-digested) narrowed the fenced prefix PAST a refusal and the adopted
+  session settled COMPLETED where the live session settled FAILED `refusal_in_boundary` (MEASURED
+  RED: examined range narrowed to `[158, 246)`, the refusal at a lower offset excluded, a false
+  COMPLETED).  Contract now in force: adoption NEVER derives its settlement baseline from the
+  row.  With no authenticated baseline source the successor settles over the FULL fenced prefix
+  `[0, N)` (`_settlement_baseline` stays 0), examining a SUPERSET of the `[live_baseline, N)` the
+  live session examined -- so the adopted settlement is a subset of live's (SAFETY parity),
+  never wider (no AVAILABILITY parity).  A malformed row applies NOTHING (the baseline stays 0
+  and no events are restored -- the pre-fix "left applied on rejection" bug is gone); a MISSING
+  row, MULTIPLE `delivery_recorded` rows, or a forged LAST-row substitution cannot narrow the
+  range because the baseline is 0 regardless of which row is last.  The row's `baseline` (and the
+  event offsets) survive ONLY as DIAGNOSTIC evidence -- `_restore_delivery` returns
+  `journal_baseline_diagnostic`, journalled on the adoption's `identity_bound` row (alongside
+  `settlement_baseline: 0`) and on `delivery_provenance_unrestored` -- and reach neither
+  `completion()`'s selection range, `_positive_selection_over_bound_fence`, `refusal_evidence`
+  nor any narrowing.  LIVE is unchanged: `send()` sets `_settlement_baseline` in memory (the
+  capture offset just before its own prompt write) and `completion()` selects over that
+  `[baseline, N)` exactly as before.  CONSEQUENCE, accepted and documented: adoption guarantees
+  SAFETY parity (adopted success is a subset of live success), NOT availability parity -- a
+  refusal-like or JSON-example prompt echo that fell BEFORE the live baseline is now inside the
+  examined range on adoption and may make the adopted settlement STRICTER (FAILED
+  `refusal_in_boundary` / LOST `record_framing_ambiguous` by name), never wider.  No MAC / key /
+  secret and no new authenticated field were introduced.  Locks
+  (`scripts/test_os48_pr36_locks.py::PR36BaselineNotAuthorityTests`, RED at `991847f`, GREEN
+  after; both copies byte-identical): L-1 a forged later baseline past the refusal, re-digested,
+  through the REAL adopt path -> adopted NOT COMPLETED (FAILED `refusal_in_boundary`,
+  settlement_range.baseline == 0); L-2 the same with a malformed event list (a `payload` key; a
+  non-list) -> the range is not narrowed (baseline 0, no event restored, the row named
+  `delivery_provenance_unrestored` with `journal_baseline_diagnostic`); L-3 a missing row (full
+  `[0, N)`, no wider than live) and multiple rows with a forged last row (the last row does not
+  substitute an authority).  The adoption locks whose expectation legitimately changed (L-4, L-10
+  and the F3-L2 matrix asserted "adopted baseline == live baseline"; the L-4 identity_bound row
+  carried `settlement_baseline == live baseline`) are REWRITTEN to "adopted baseline == 0,
+  examines the full prefix `[0, N)`, live baseline survives as `journal_baseline_diagnostic`"
+  with a note citing this run -- none deleted or weakened; the transport/echo matrix verdicts are
+  UNCHANGED (the extra `[0, live_baseline)` bytes are the readiness `system` record, inert for
+  refusal / completion / framing selection).
+  **(run_11b4061df84d -- the R3 `sidecar_file` carrier merge blocker and the sole-pre-delivery
+  completion; PR #36 comments 5747199243 / 5747098383 at `37b3f58`; REVIEW_BUGFIX F-001 / F-002;
+  USER DECISION C2.)**  The `[0, N)` adopted range is monotone-SAFE for R1 (refusal dominance),
+  R2 (exactly-one / framing / scan) and the echo excision (adoption excises nothing) -- more
+  examined evidence can only REJECT -- but NOT for the positive paths: the R3 `sidecar_file`
+  carrier fallback (a `carrier_type` record BEFORE the live baseline binds a record live could
+  not: MEASURED at 37b3f58 through the production loader + selector and the real
+  `StandaloneSession` live-vs-`adopt()` path, live `provenance_unbound` over `[149, 185)`,
+  adopted COMPLETED over `[0, 185)`) and, generally, a sole bound completion record emitted
+  BEFORE the prompt was delivered (`session_field` / `single_record_optin` / record-field
+  `sidecar_file` under `post_ready_delivery`: MEASURED live `no_completion_record` over
+  `[159, 159)`, adopted COMPLETED over `[0, N)`).  No baseline-independent selector rule can
+  close them: any rule that returns COMPLETED on adoption for some post-delivery capture returns
+  COMPLETED on the byte-identical pre-delivery replica (same fence digest, bound value and
+  sidecar snapshot) while live settles `no_completion_record`; breaking the symmetry needs the
+  live baseline (gone), the journal baseline (forbidden as positive authority), a runtime-written
+  delivery mark (a design change, unkeyed) or a MAC / key (forbidden).  The i1 candidate
+  (refusing `post_ready_delivery` + `sidecar_file` + `carrier_type` at construction,
+  `PreBaselineCarrierRefused`) closed the carrier shape only; the USER DECISION (C2,
+  `USER_DECISION_C2.md`) closes the mechanism: an adopted `post_ready_delivery` settlement never
+  returns a success -- named LOST `adopted_baseline_unknown` after refusal / reader-failure
+  dominance (see the R3 binding surface above) -- and the i1 refusal is removed (with C2 the
+  combination cannot produce an adopted-only success and its live behaviour was never the
+  defect; no live surface is forbidden without a design justification).  No new baseline
+  authority, no MAC / key, the adopted `[0, N)` range (baseline 0), live `[baseline, N)`, R1
+  dominance and the previous-blocker locks are unchanged.  Consequence, accepted by the user: a
+  successor cannot claim a `post_ready_delivery` in-flight dispatch COMPLETED (it settles the
+  typed failure and the recovered run terminates BLOCKED by name); neither shipping profile is
+  affected (both `launch_with_prompt`).  Locks (`scripts/test_os48_pr36_locks.py::PR36R3CarrierAuthorityTests`
+  / `PR36R3CarrierAuthorityNativeTests`, RED at `37b3f58`, GREEN after): L-1 the P1 profile
+  ADMITTED through both constructors, live binds iff the carrier is inside `[baseline, N)`,
+  adopted `adopted_baseline_unknown` (driver level and the real session path: 37b3f58 settled
+  COMPLETED); L-2 the normal carrier path (L-02b) live under both delivery modes; L-3 the
+  shipping Codex shape live == adopted (COMPLETED / `provenance_unbound` on both); L-4
+  `session_field` / `single_record_optin` post-ready adoption withheld by name; L-6 the ASSERTED
+  12-cell × 15-shape matrix (every cell admitted; `adopted COMPLETED ⇒ live COMPLETED`;
+  `launch_with_prompt` identical on both sides; `post_ready_delivery` adopted never COMPLETED and
+  `adopted_baseline_unknown` exactly where the raw `[0, N)` selection was a success -- the pure
+  rule withholds a success and nothing else) incl. `sole_completion_pre_delivery`,
+  completion-then-refusal (dominated on both sides) and completion-then-second-completion
+  (ambiguous on adoption); L-8 the sole-pre-delivery shape on the real session path (live
+  `no_completion_record`, adopted `adopted_baseline_unknown`; 37b3f58 COMPLETED); L-9 the
+  production `StandaloneAdapter._collect_in_flight` recovery of a post-ready dispatch settles
+  the typed failure `adopted_baseline_unknown` (a `launch_with_prompt` recovery still
+  COMPLETED); L-7 both copies byte-identical.  The F-003 transport × output matrix is
+  rewritten with a note: the five adopted `COMPLETED` pty cells are `adopted_baseline_unknown`
+  (the argv column unchanged); the OS-48 cut harness (which never delivers a prompt, baseline 0
+  on both sides) declares `launch_with_prompt` and locks the post-ready successor outcome
+  separately (`test_os48_crash_cuts` C4-C2).  Locks (`scripts/test_os48_pr36_locks.py`,
+  every counterexample RED at `c9b8d04`, GREEN after; both copies byte-identical): L-1 the
+  over-limit tail (`line_bytes` and `total_bytes`) after a bound success and after a bound
+  refusal, through the production spawn + `await_completion`, the pre-bound re-await and a
+  masterless successor, plus the whole-tail allocation seam; L-2 the read seam (ONE read at
+  `baseline` of `N - baseline` bytes, none past N; the physical `read(limit)`); L-3 the ECHO
+  turn through the real `start` -> `send` -> `await_completion` (refusal phrase + y/n + JSON
+  example -> COMPLETED; JSON example alone; the agent's own refusal still dominates; the
+  selector unit lock; the `argv` transport reaching the selector as `echo_absent`); L-4 live vs
+  adopted (completion and refusal turns; the durable row + record; the missing-record
+  fail-closed path) through the real `adopt()`; L-5 the descendant's `F_GETFL` samples with a
+  full FIFO, the 256 KiB in-band measurement, the shared-descriptor unit lock; L-6 parity.
+  Iteration 2 (REVIEW_BUGFIX i1 F-001; RED on the iteration-1 tree, GREEN after): L-7 a
+  sentinel secret in a `launch_with_prompt` (argv) prompt is absent from EVERY file under the
+  run's base (the whole tree is scanned) while live and adopted settle identically, through
+  the real `run_dispatch` and the real `adopt()`; L-8 the same with the Orca dispatch preamble
+  shape (capability-token line + task / dispatch ids, multi-line); L-9 an adopted argv event
+  resolves `echo_absent` by name with the live == adopted `echo` block; L-10 for pty+ECHO the
+  prompt is in the capture alone, every persisted form digest matches a capture span, the
+  adoption excises exactly that span, and a wrong digest / wrong length / missing proof or a
+  malformed row is fail-closed by name (plus resolver unit locks: framed / unframed / budget /
+  malformed).  Iteration 3 (F-002; RED on the iteration-2 tree): L-11 a forged `echo_expected`
+  proof on an adopted argv event whose digest names the agent's `not logged in` bytes -- through
+  the real adopt path over a re-digested tampered `delivery_recorded` row -- resolves
+  `echo_unproven` / `proof_class_contradicts_transport`, excises nothing and settles FAILED
+  `refusal_in_boundary` exactly as live; L-12 the same forgery aimed at the bound `result` line
+  keeps the record (COMPLETED == live); L-13 the inverse `echo_absent` proof on the ECHO turn is
+  unproven by name and the unforged row still resolves identically live and adopted; L-14 the
+  resolver matrix -- 17 class x transport x forms contradictions each `echo_unproven` with its
+  named reason and no span, the consistent cases unchanged, the reviewer's probe verbatim.  The
+  OS-37 native stub fixture gains the `agent-script` mode (the turn is a lock-supplied `sh`
+  script; the argv prompt is its second argument) for the real start/send/adopt path.
+  **Known fail-closed limitations (documented, not solved; each answers UNKNOWN / a named
+  non-success, never a positive claim):**
+  - *32-bit Linux and Linux before 6.9* -- no pidfs inode lifetime model this runtime can
+    vouch for (`pidfs_lifetime_model` unproven: the 32-bit branches recycle the number, a
+    pre-6.9 kernel has one shared anonymous pidfd inode); the watcher records no
+    `fixed_object_id` and the pidfd-less recovery reader answers `pid_tick_unverified`
+    (`binding_model:unproven`) -- `unknown`, `descendants_unknown`, never alive.
+  - *darwin recovery identity is a timestamp axis* -- the reader's binding is the kernel's
+    microsecond start time RE-READ at decision time (`start_microsecond`,
+    `reread_timestamp_not_fixed_object`), not an independently retained fixed object; kqueue
+    `NOTE_EXIT` pinned only the live watcher's own observation.  No settlement or signal
+    authority is derived from it.
+  - *no OOM / SIGKILL guarantee outside the settlement reader* -- what is bounded is the
+    settlement READER in `completion()`: an allocation failure before or inside the selection
+    is the named `record_scan_incomplete`, and after the selection there is no read left to
+    fail.  An allocation failure elsewhere in the supervisor process (the fence / release
+    readers, the journal, the typed-result body extraction in `_settle` that runs AFTER
+    `await_completion` has returned its verdict, or the interpreter itself) and a SIGKILL of
+    the supervisor or the watcher remain the process's own: the dispatch is then collected
+    by recovery from durable evidence (`adopt`, the exit sentinel, the fence) or reported as
+    a named non-success (`IDEMPOTENCY_RECOVERY_BLOCKED`, `fence_missing`,
+    `diagnostic_tail_unaccounted`), never synthesized into a settlement.
+* **Locks.**  `scripts/test_os48_finality_locks.py` (L-01/02/02b/03/04/10/10b/12),
+  `test_os48_ownership_locks.py` (L-05/11/11b/14), `test_os48_evidence_locks.py` (L-06/07/08),
+  `test_os48_recovery_cuts.py` (L-09/09b, C1-C7), `test_os48_crash_cuts.py` (real kills, C1-C9 /
+  RC1-RC3), `test_os48_review_i1_locks.py` (F-001..F-006), `test_os48_review_i2_locks.py`
+  (i2 F-001/F-004/F-006/F-007), `test_os48_review_i3_locks.py` (i3 F-001/F-004/F-006/F-008), `test_os48_review_i4_locks.py` (i4 F-009), `test_os48_review_i5_locks.py` (i5 F-010 + adversarial pass, F-011), `test_os48_review_i6_locks.py` (i6 F-010 coalesced / pre-exec watch, F-011, F-012, F-013), `test_os48_review_i7_locks.py` (i7 F-015 framing, F-014 verified subreaper, F-016 fixed objects / lifetimes incl. the PID-1 private-namespace alias construction), `test_os48_f015_f016_locks.py` (i8 F-015 bounded nested scan / `record_scan_incomplete`, F-016 verified admission / reader binding, PID-1 same-tick foreign-peer constructions; run_7859f202457c F-017 selected-refusal dominance over a post-selection reader failure),
+  `test_os48_pr36_locks.py` (PR #36 comment 5739898842: L-1..L-6 -- bounded settlement read and fence-recorded answerability, echo provenance, the separate marker descriptor, adoption restoring baseline + digest-only delivery provenance, parity; L-7..L-10 -- no plaintext prompt at rest; L-11..L-14 -- proofs bound to the recorded transport),
+  `test_os48_linux_locks.py` (L-13 + membership, CI condition `not_linux`); the round-8/9/9i2/10 finality locks are versioned in
+  place (`# superseded by OS-48` notes, W-F9).  Real-CLI proof: `scripts/os37_r10_real_agent.py` /
+  `os37_r10_recovery_prompt_e2e.py` (Claude `session_field`, Codex `sidecar_file`).

@@ -341,7 +341,7 @@ class DriverContainmentTests(unittest.TestCase):
             "__future__", "ast", "collections", "contextlib", "copy", "ctypes",
             "dataclasses",
             "datetime", "errno", "fcntl", "hashlib", "hmac", "importlib", "inspect", "io",
-            "json", "math", "os", "pathlib", "pty", "re", "resource", "select", "shlex",
+            "json", "math", "os", "pathlib", "pty", "re", "resource", "select", "shlex", "socket",
             "shutil", "signal", "struct", "subprocess", "sys", "termios", "time", "tokenize",
             "typing", "unittest", "uuid",
         }

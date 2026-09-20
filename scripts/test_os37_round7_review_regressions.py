@@ -1053,7 +1053,7 @@ class B1ProductionAuthSeedTests(unittest.TestCase):
                                        "record_type": "thread.started",
                                        "session_field": "thread_id"}],
                 "delivery_proofs": [{"channel": "structured", "record_type": "turn.completed"}],
-                "completion_records": [{"channel": "structured", "record_type": "turn.completed"}],
+                "completion_records": [{"channel": "structured", "record_type": "turn.completed", "binding_mode": "single_record_optin"}],
                 "driver_env": {"CODEX_HOME": codex_home},
                 "auth_seed_source": str(seed_src), "auth_seed_dest_name": "auth.json"}
         sess = self._session(spec, {"CODEX_HOME": codex_home})
@@ -1074,7 +1074,7 @@ class B1ProductionAuthSeedTests(unittest.TestCase):
                 "readiness_records": [{"channel": "structured", "record_type": "system",
                                        "session_field": "session_id"}],
                 "delivery_proofs": [{"channel": "structured", "record_type": "assistant"}],
-                "completion_records": [{"channel": "structured", "record_type": "result",
+                "completion_records": [{"channel": "structured", "record_type": "result", "binding_mode": "single_record_optin",
                                         "error_field": "is_error"}]}
         sess = self._session(spec, {})
         result = sess._seed_run_scoped_auth()
@@ -1107,7 +1107,7 @@ class B1RelativeWorktreeResolvedTests(unittest.TestCase):
                                    "session_field": "thread_id"}],
             "delivery_proofs": [{"channel": "structured", "record_type": "turn.completed"}],
             "completion_records": [{"channel": "structured",
-                                    "record_type": "turn.completed"}]})
+                                    "record_type": "turn.completed", "binding_mode": "single_record_optin"}]})
 
     def test_a_relative_worktree_becomes_absolute(self) -> None:
         prof = self._profile("artifacts/runs/x/wt")
@@ -1153,7 +1153,7 @@ def _codex_spec(worktree: str, add_dirs: list[str] | None = None) -> dict:
         "readiness_records": [{"channel": "structured", "record_type": "thread.started",
                                "session_field": "thread_id"}],
         "delivery_proofs": [{"channel": "structured", "record_type": "turn.completed"}],
-        "completion_records": [{"channel": "structured", "record_type": "turn.completed"}]}
+        "completion_records": [{"channel": "structured", "record_type": "turn.completed", "binding_mode": "single_record_optin"}]}
     if add_dirs is not None:
         spec["add_dirs"] = add_dirs
     return spec
