@@ -145,9 +145,14 @@ class F001AuthoritativeBodyTests(_RoomCase):
         and an adopted session settles the same boundary body from the same snapshot."""
         sidecar = self.room.path / "last_message.md"
         sidecar.write_text("FROZEN SIDECAR BODY")
+        # USER_DECISION_C2.md (run_11b4061df84d): the successor below inherits THIS profile; no
+        # prompt is ever delivered here (baseline 0 on both sides), so the fixture declares
+        # `launch_with_prompt` -- under `post_ready_delivery` an adopted settlement is never
+        # COMPLETED (`adopted_baseline_unknown`; locked in test_os48_pr36_locks L-8/L-9).
         session, sentinel = spawn_session(self.room, SUCCESS + "exit 0\n", run_id="f001sc",
                                           binding_mode="session_field", binding_field="session_id",
-                                          pump_until_sentinel=False, sidecar_path=str(sidecar))
+                                          pump_until_sentinel=False, sidecar_path=str(sidecar),
+                                          delivery_mode="launch_with_prompt")
         session.profile = replace(session.profile, output_last_message_path=str(sidecar),
                                   result_body_records=(ResultBodySelector(channel="structured",
                                                                           record_type="result", body_field="result"),))

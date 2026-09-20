@@ -151,6 +151,12 @@ OUTCOME_DIAGNOSTIC_TAIL_UNACCOUNTED = "diagnostic_tail_unaccounted"
 OUTCOME_RELEASE_RECORD_MISSING = "release_record_missing"
 OUTCOME_MEMBERSHIP_UNREADABLE = "membership_unreadable"   # the positive set is UNKNOWN (ledger unreadable / incomplete)
 OUTCOME_DESCENDANTS_UNKNOWN = "descendants_unknown"       # F-009: discovery could not be read; the set beyond the positive members is UNKNOWN
+#: USER DECISION C2 (run_11b4061df84d, PR #36): an ADOPTED session of a `post_ready_delivery`
+#: dispatch cannot restore a trustworthy settlement baseline (the live baseline lives only in
+#: the crashed supervisor's memory; the journal's copy is unkeyed), so a selection that would
+#: otherwise be a SUCCESS over `[0, N)` is this named LOST outcome instead -- refusal /
+#: reader-failure dominance is preserved first; `launch_with_prompt` (baseline 0) is untouched.
+OUTCOME_ADOPTED_BASELINE_UNKNOWN = "adopted_baseline_unknown"
 
 #: The two finalizing owner roles the fence admits -- the supervisor (holds the master) and the
 #: exit watcher (holds the OWNER SLAVE REFERENCE and writes the marker) -- plus the successor,

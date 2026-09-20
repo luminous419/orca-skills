@@ -289,6 +289,39 @@
   rows (forged last row) never substitute an authority; the F3 / L-4 / L-10 / L-13 adoption locks
   are rewritten from "adopted baseline == live baseline" to "adopted baseline == 0, examines the
   full prefix" with a note citing `run_d6391487ff44`, none deleted.
+- (4, run_11b4061df84d -- the R3 `sidecar_file` carrier merge blocker at `37b3f58`; USER DECISION
+  C2.)  The adopted `[0, N)` range is monotone-safe for R1 / R2 / framing / scan / echo excision
+  (more evidence only rejects) but NOT for the positive paths: the R3 `sidecar_file` carrier
+  fallback binds the sole completion record through a `carrier_type` record before it, and any
+  record-field / opt-in binding accepts a sole bound completion record -- so a carrier or a
+  completion emitted BEFORE the live delivery baseline (structural under `post_ready_delivery`:
+  the carrier is emitted at readiness) settled LOST / `no_completion_record` live and COMPLETED
+  on adoption (measured through the production loader + selector and the real live-vs-`adopt()`
+  path): an adopted-only success.  No baseline-independent selector rule can close it (a
+  pre-delivery replica of any accepted capture is byte-identical to adoption).  Fix (C2, the
+  user's decision; no new baseline authority, no MAC / key, adopted range and live unchanged): an
+  ADOPTED settlement of a `post_ready_delivery` dispatch never returns a success --
+  `standalone_runtime.withhold_adopted_post_ready_success`, applied in
+  `StandaloneSession.completion()` (the one place every adopted settlement passes: `collect`,
+  `_collect_in_flight`), preserves refusal / reader-failure dominance first and turns a would-be
+  success (bound record, `single_record_optin`, the legacy undeclared record) into the NAMED
+  LOST `adopted_baseline_unknown` (`OUTCOME_ADOPTED_BASELINE_UNKNOWN`; in `LOST_REASONS` /
+  `OS48_LOST_OUTCOMES`) with the record withheld and an `adoption` diagnostic; the production
+  recovery path settles it as the typed failure (`standalone_failure.reason`; a recovered
+  post-ready in-flight dispatch terminates the run BLOCKED, never COMPLETED --
+  `test_os37_recovery_boundary_regressions` F01 rewritten with a note).  LIVE
+  `post_ready_delivery` and both `launch_with_prompt` paths (baseline 0; both shipping profiles)
+  are unchanged.  The i1 profile refusal `PreBaselineCarrierRefused` is REMOVED (every
+  `delivery_mode` × `binding_mode` × carrier cell is admitted; no live surface forbidden).
+  Locks (`scripts/test_os48_pr36_locks.py::PR36R3CarrierAuthorityTests` /
+  `PR36R3CarrierAuthorityNativeTests`, RED at `37b3f58`, GREEN after): the P1 admitted and never
+  adopted-only (driver + real session); the normal carrier path live under both modes; the
+  shipping Codex shape live == adopted; the ASSERTED 12-cell × 15-shape invariant matrix incl.
+  the sole-pre-delivery completion; the real-session sole-pre-delivery lock; the production
+  `_collect_in_flight` recovery lock; the F-003 pty matrix rewritten (adopted `COMPLETED` cells
+  -> `adopted_baseline_unknown`, argv unchanged); the cut harness declares `launch_with_prompt`
+  (it delivers no prompt) with the post-ready successor outcome locked in `test_os48_crash_cuts`
+  C4-C2; the profile module in the parity lock.
 - Locks: `scripts/test_os48_pr36_locks.py` (L-1..L-6; every counterexample RED at `c9b8d04`;
   iteration 2 L-7..L-10 RED on the iteration-1 tree: an argv sentinel secret -- including the
   Orca dispatch-capability preamble shape -- absent from every file the run wrote with live ==

@@ -113,7 +113,8 @@ def supervisor_child(room: Room, *, run_id: str, cut: str, install: Callable[[Pa
             install(pause, os.getpid())
             session, sentinel = spawn_session(room, agent, run_id=run_id, budget_ms=budget_ms,
                                               binding_mode="session_field", binding_field="session_id",
-                                              pump_until_sentinel=False, sidecar_path=sidecar_path)
+                                              pump_until_sentinel=False, sidecar_path=sidecar_path,
+                                              delivery_mode=CUT_DELIVERY_MODE)
             info = {"supervisor_pid": os.getpid(), "leader_pid": session.pty["leader_pid"],
                     "agent_pid": session.pty["pid"], "session_id": session.session_id,
                     "incarnation": session.incarnation, "fence": session.fence,
@@ -155,16 +156,28 @@ def kill_child(info: dict[str, Any]) -> None:
         os.waitpid(pid, 0)
 
 
-def successor(room: Room, info: dict[str, Any], *, budget_ms: int = 3000) -> rt.StandaloneSession:
+#: USER_DECISION_C2.md (run_11b4061df84d): an ADOPTED settlement of a `post_ready_delivery`
+#: dispatch is never COMPLETED (named LOST `adopted_baseline_unknown`).  The cut harness never
+#: delivers a prompt -- no `send()`, the live baseline is 0 on both sides, exactly the
+#: `launch_with_prompt` shape -- so its fixture now DECLARES that mode: the cut locks keep
+#: testing what they lock (fence binding, ownership succession, successor SETTLEMENT over the
+#: same N / digest) and the earlier `post_ready_delivery` default, which was incidental, would
+#: have withheld every successor settlement by name.  The C2 outcome itself is locked under the
+#: `post_ready_delivery` fixture (`test_os48_crash_cuts` C4-C2, `test_os48_pr36_locks` L-8/L-9).
+CUT_DELIVERY_MODE = "launch_with_prompt"
+
+
+def successor(room: Room, info: dict[str, Any], *, budget_ms: int = 3000,
+              delivery_mode: str = CUT_DELIVERY_MODE) -> rt.StandaloneSession:
     """The production MASTERLESS session over the crashed dispatch's artifact base: identity
     from the child-written spawn record (the pinned start identity), no master, the same
     fence nonce.  This is `adopt()`'s outcome without its journal join (the join itself is
-    locked by the OS-37 recovery suites)."""
+    locked by the OS-37 recovery suites).  ``delivery_mode`` -- see `CUT_DELIVERY_MODE`."""
     base = Path(info["art"])
     session = rt.StandaloneSession(
         intent={"intent_id": f"i-{info['run_id']}", "run_id": info["run_id"], "role": "WORKER"},
         profile=sh_profile(str(room.path), drain_ms=budget_ms, binding_mode="session_field",
-                           binding_field="session_id"),
+                           binding_field="session_id", delivery_mode=delivery_mode),
         artifact_base=base, run_id=info["run_id"],
         journal=journal_mod.ExecutionJournal(base, info["run_id"]))
     session.session_id = info["session_id"]

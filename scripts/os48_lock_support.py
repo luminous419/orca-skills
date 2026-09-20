@@ -33,9 +33,14 @@ PYTHON = sys.executable
 
 
 def sh_profile(room: str, *, drain_ms: int = 3000, binding_mode: str = "single_record_optin",
-               binding_field: str = "", carrier_type: str = "") -> StandaloneProfile:
+               binding_field: str = "", carrier_type: str = "",
+               delivery_mode: str = "post_ready_delivery") -> StandaloneProfile:
     """A `/bin/sh` fixture profile (the production loader's shape) with the OS-48 completion
-    binding declared explicitly."""
+    binding declared explicitly.  ``delivery_mode`` (run_11b4061df84d, USER_DECISION_C2.md): an
+    ADOPTED settlement of a `post_ready_delivery` dispatch is never COMPLETED
+    (`adopted_baseline_unknown`); locks that exercise successor SETTLEMENT over a dispatch the
+    harness never delivered a prompt to (baseline 0 on both sides) declare
+    `launch_with_prompt`, which C2 leaves untouched."""
     completion = {"channel": "structured", "record_type": "result", "error_field": "is_error",
                   "binding_mode": binding_mode}
     if binding_field:
@@ -48,7 +53,7 @@ def sh_profile(room: str, *, drain_ms: int = 3000, binding_mode: str = "single_r
         "readiness_records": [{"channel": "structured", "record_type": "system",
                                "session_field": "session_id"}],
         "completion_records": [completion],
-        "delivery_mode": "post_ready_delivery", "identity_binding": "minted_echo",
+        "delivery_mode": delivery_mode, "identity_binding": "minted_echo",
         "identity_flag": "--session-id",
         "timeouts": {"post_exit_drain_budget_ms": drain_ms, "physical_exit_timeout_ms": 4000,
                      "completion_timeout_ms": 20000}})
@@ -82,7 +87,8 @@ def spawn_session(room: Room, agent: str, *, run_id: str, budget_ms: int = 3000,
                   binding_mode: str = "single_record_optin", binding_field: str = "",
                   carrier_type: str = "", extra_env: dict[str, str] | None = None,
                   pump_until_sentinel: bool = True, sidecar_path: str = "",
-                  profile: StandaloneProfile | None = None):
+                  profile: StandaloneProfile | None = None,
+                  delivery_mode: str = "post_ready_delivery"):
     """A real `StandaloneSession` wired to a PRODUCTION-spawned pty.  ``agent`` is an `sh`
     script body (or ``argv`` overrides it).  The session's fence nonce is the one the
     watcher will write, exactly as `StandaloneSession.start` does.  Returns
@@ -90,7 +96,8 @@ def spawn_session(room: Room, agent: str, *, run_id: str, budget_ms: int = 3000,
     watcher's sentinel exists (the exit-proven precondition of `drain_after_exit`).  An explicit
     ``profile`` (a full CLI grammar, run_5fcd2beac376 F-015) replaces the `sh_profile` default."""
     profile = profile or sh_profile(str(room.path), drain_ms=budget_ms, binding_mode=binding_mode,
-                                    binding_field=binding_field, carrier_type=carrier_type)
+                                    binding_field=binding_field, carrier_type=carrier_type,
+                                    delivery_mode=delivery_mode)
     session = rt.StandaloneSession(
         intent={"intent_id": f"i-{run_id}", "run_id": run_id, "role": "WORKER"},
         profile=profile, artifact_base=room.path / "art", run_id=run_id,

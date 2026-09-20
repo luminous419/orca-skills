@@ -208,8 +208,11 @@ require *positive capture finality*: a verified fence `os48.capture_fence.v1` at
 marker boundary N, and a settlement record chosen over `[baseline, N)` by refusal dominance,
 exactly-one and the dispatch binding (`binding_mode`); a hangup, a sentinel alone, a negative
 process-table scan or a legacy `os37.capture_finalized.v1` record never enter either state
-(`boundary_unproven` / `provenance_unbound` / `legacy_finalized_record` are LOST).  See
-`docs/conformance/OS37_CONFORMANCE.md` § OS-48.
+(`boundary_unproven` / `provenance_unbound` / `legacy_finalized_record` are LOST).  An ADOPTED
+settlement (a successor over a crashed supervisor's dispatch) examines `[0, N)` and can only be
+stricter than the live one; for a `post_ready_delivery` dispatch it is never COMPLETED -- a
+would-be success is the named LOST `adopted_baseline_unknown` (USER DECISION C2,
+run_11b4061df84d).  See `docs/conformance/OS37_CONFORMANCE.md` § OS-48.
 
 **Authority is identity, not knowledge.** A settlement or heartbeat is authorized by the *identity*
 of its sender, not by its ability to quote the right ids: "payload knowledge alone is not authority"

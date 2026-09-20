@@ -691,6 +691,40 @@ marked).  Design: `artifacts/runs/run_f820764749d6/DESIGN.md` (topology A).  Mea
   only; an empty / mismatched / unreadable bound ⇒ `provenance_unbound`, LOST).  A bound
   success by ANY member of the supervised subtree inside the window is legitimate (N-002); a
   completion record after N is diagnostic, never settlement.
+  **Supported profile surface and adoption semantics for the R3 binding (run_11b4061df84d,
+  USER_DECISION_C2.md).**  Every `delivery_mode` × `binding_mode` × carrier combination is
+  ADMITTED (the i1 `PreBaselineCarrierRefused` refusal of `post_ready_delivery` +
+  `sidecar_file` + `carrier_type` is removed: no live profile surface is forbidden).  What
+  differs is ADOPTION: an ADOPTED settlement of a `post_ready_delivery` dispatch never returns a
+  success.  The live baseline exists only in the live supervisor's memory (`send()` reads
+  `capture.size` at the prompt write) and the journal's copy is unkeyed and never authority, and
+  nothing in the fenced bytes marks the delivery instant -- so over `[0, N)` a sole bound
+  completion record emitted BEFORE the prompt is indistinguishable from one emitted after it
+  (the R3 carrier fallback and the record-field bindings alike can turn extra pre-baseline
+  evidence into positive authority).  Rule (`standalone_runtime.withhold_adopted_post_ready_success`,
+  applied in `StandaloneSession.completion()`, the one place every adopted settlement --
+  `await_completion` / `collect` / `StandaloneAdapter._collect_in_flight` -- passes; pure,
+  baseline-independent, consulting no journal value): refusal / reader-failure dominance is
+  preserved FIRST (`refusal_in_boundary`, the sole error-field refusal `error_field_set`,
+  `provenance_ambiguous`, `provenance_unbound`, `record_framing_ambiguous`,
+  `record_scan_incomplete`, `capture_truncated`; no record at all stays FAILED
+  `no_completion_record`), and a selection that would otherwise carry a record to the verdict
+  (a bound record, `single_record_optin`, the legacy undeclared record) is the NAMED LOST
+  outcome **`adopted_baseline_unknown`** (in `LOST_REASONS` / `OS48_LOST_OUTCOMES`;
+  `OUTCOME_ADOPTED_BASELINE_UNKNOWN`) with the record withheld and a journalled `adoption`
+  diagnostic naming the withheld record type.  Through the production recovery path this is
+  the typed FAILED settlement (`result.status BLOCKED`, `standalone_failure.reason
+  adopted_baseline_unknown`), never COMPLETED.  LIVE `post_ready_delivery` settlement over
+  `[baseline, N)` is unchanged; `launch_with_prompt` (baseline 0: live and adopted examine the
+  same range -- both shipping profiles, Claude `session_field` and Codex `sidecar_file` +
+  carrier) is unchanged live AND adopted.  Invariant: `adopted COMPLETED ⇒ live COMPLETED` on
+  every admitted cell for every capture shape, including a sole completion record emitted
+  before the live baseline -- adoption guarantees SAFETY parity, not AVAILABILITY parity, and
+  for `post_ready_delivery` dispatches a successor can settle only a NON-success: the recovered
+  dispatch is the typed failure, the recovered run terminates BLOCKED by name (`UNIT_TEST_BLOCKED`,
+  `standalone_failure.reason adopted_baseline_unknown`; `test_os37_recovery_boundary_regressions`
+  F01 rewritten), and re-launching is the operator's decision -- never a COMPLETED claimed on
+  evidence the live supervisor could not have accepted.
 
 * **Two-phase release and the retained diagnostic tail** (AC-9).  `_reclaim` runs
   `_release_two_phase`: release-1 (`R` byte) -> the watcher writes `\n<<OS48-RELEASE
@@ -1340,7 +1374,56 @@ marked).  Design: `artifacts/runs/run_f820764749d6/DESIGN.md` (topology A).  Mea
   examines the full prefix `[0, N)`, live baseline survives as `journal_baseline_diagnostic`"
   with a note citing this run -- none deleted or weakened; the transport/echo matrix verdicts are
   UNCHANGED (the extra `[0, live_baseline)` bytes are the readiness `system` record, inert for
-  refusal / completion / framing selection).  Locks (`scripts/test_os48_pr36_locks.py`,
+  refusal / completion / framing selection).
+  **(run_11b4061df84d -- the R3 `sidecar_file` carrier merge blocker and the sole-pre-delivery
+  completion; PR #36 comments 5747199243 / 5747098383 at `37b3f58`; REVIEW_BUGFIX F-001 / F-002;
+  USER DECISION C2.)**  The `[0, N)` adopted range is monotone-SAFE for R1 (refusal dominance),
+  R2 (exactly-one / framing / scan) and the echo excision (adoption excises nothing) -- more
+  examined evidence can only REJECT -- but NOT for the positive paths: the R3 `sidecar_file`
+  carrier fallback (a `carrier_type` record BEFORE the live baseline binds a record live could
+  not: MEASURED at 37b3f58 through the production loader + selector and the real
+  `StandaloneSession` live-vs-`adopt()` path, live `provenance_unbound` over `[149, 185)`,
+  adopted COMPLETED over `[0, 185)`) and, generally, a sole bound completion record emitted
+  BEFORE the prompt was delivered (`session_field` / `single_record_optin` / record-field
+  `sidecar_file` under `post_ready_delivery`: MEASURED live `no_completion_record` over
+  `[159, 159)`, adopted COMPLETED over `[0, N)`).  No baseline-independent selector rule can
+  close them: any rule that returns COMPLETED on adoption for some post-delivery capture returns
+  COMPLETED on the byte-identical pre-delivery replica (same fence digest, bound value and
+  sidecar snapshot) while live settles `no_completion_record`; breaking the symmetry needs the
+  live baseline (gone), the journal baseline (forbidden as positive authority), a runtime-written
+  delivery mark (a design change, unkeyed) or a MAC / key (forbidden).  The i1 candidate
+  (refusing `post_ready_delivery` + `sidecar_file` + `carrier_type` at construction,
+  `PreBaselineCarrierRefused`) closed the carrier shape only; the USER DECISION (C2,
+  `USER_DECISION_C2.md`) closes the mechanism: an adopted `post_ready_delivery` settlement never
+  returns a success -- named LOST `adopted_baseline_unknown` after refusal / reader-failure
+  dominance (see the R3 binding surface above) -- and the i1 refusal is removed (with C2 the
+  combination cannot produce an adopted-only success and its live behaviour was never the
+  defect; no live surface is forbidden without a design justification).  No new baseline
+  authority, no MAC / key, the adopted `[0, N)` range (baseline 0), live `[baseline, N)`, R1
+  dominance and the previous-blocker locks are unchanged.  Consequence, accepted by the user: a
+  successor cannot claim a `post_ready_delivery` in-flight dispatch COMPLETED (it settles the
+  typed failure and the recovered run terminates BLOCKED by name); neither shipping profile is
+  affected (both `launch_with_prompt`).  Locks (`scripts/test_os48_pr36_locks.py::PR36R3CarrierAuthorityTests`
+  / `PR36R3CarrierAuthorityNativeTests`, RED at `37b3f58`, GREEN after): L-1 the P1 profile
+  ADMITTED through both constructors, live binds iff the carrier is inside `[baseline, N)`,
+  adopted `adopted_baseline_unknown` (driver level and the real session path: 37b3f58 settled
+  COMPLETED); L-2 the normal carrier path (L-02b) live under both delivery modes; L-3 the
+  shipping Codex shape live == adopted (COMPLETED / `provenance_unbound` on both); L-4
+  `session_field` / `single_record_optin` post-ready adoption withheld by name; L-6 the ASSERTED
+  12-cell × 15-shape matrix (every cell admitted; `adopted COMPLETED ⇒ live COMPLETED`;
+  `launch_with_prompt` identical on both sides; `post_ready_delivery` adopted never COMPLETED and
+  `adopted_baseline_unknown` exactly where the raw `[0, N)` selection was a success -- the pure
+  rule withholds a success and nothing else) incl. `sole_completion_pre_delivery`,
+  completion-then-refusal (dominated on both sides) and completion-then-second-completion
+  (ambiguous on adoption); L-8 the sole-pre-delivery shape on the real session path (live
+  `no_completion_record`, adopted `adopted_baseline_unknown`; 37b3f58 COMPLETED); L-9 the
+  production `StandaloneAdapter._collect_in_flight` recovery of a post-ready dispatch settles
+  the typed failure `adopted_baseline_unknown` (a `launch_with_prompt` recovery still
+  COMPLETED); L-7 both copies byte-identical.  The F-003 transport × output matrix is
+  rewritten with a note: the five adopted `COMPLETED` pty cells are `adopted_baseline_unknown`
+  (the argv column unchanged); the OS-48 cut harness (which never delivers a prompt, baseline 0
+  on both sides) declares `launch_with_prompt` and locks the post-ready successor outcome
+  separately (`test_os48_crash_cuts` C4-C2).  Locks (`scripts/test_os48_pr36_locks.py`,
   every counterexample RED at `c9b8d04`, GREEN after; both copies byte-identical): L-1 the
   over-limit tail (`line_bytes` and `total_bytes`) after a bound success and after a bound
   refusal, through the production spawn + `await_completion`, the pre-bound re-await and a

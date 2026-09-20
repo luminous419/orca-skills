@@ -271,7 +271,15 @@ class F01CrashedSupervisorDispatchIsCollectedTests(_CrashRoom):
         self.assertEqual(len(settled), 1, [r["state"] for r in settled])
         self.assertEqual(f"{settled[0]['session_id']}:{settled[0]['process_incarnation']}",
                          fence, "the settlement is not fenced to the receipt")
-        self.assertEqual(settled[0]["state"], "COMPLETED", settled[0])
+        # USER_DECISION_C2.md (run_11b4061df84d): this fixture is `post_ready_delivery` and the
+        # dispatch is collected by a SUCCESSOR (adopted), which can no longer settle a positive
+        # completion -- the exactly-once, fenced settlement is the typed FAILED
+        # `adopted_baseline_unknown` (was COMPLETED); every other fact this lock guards --
+        # one settlement, fenced to the receipt, the adopted identity, no re-spawn, ledger ==
+        # journal event, no live child / leak -- is unchanged.
+        self.assertEqual(settled[0]["state"], "FAILED", settled[0])
+        self.assertEqual((settled[0]["source_vocabulary"].get("completion_verdict") or {}).get("reason"),
+                         "adopted_baseline_unknown", settled[0]["source_vocabulary"].get("completion_verdict"))
         adopted = [row for row in rows
                    if (row.get("source_vocabulary") or {}).get("adopted") is True
                    and row["event"] == "identity_bound"]
@@ -307,7 +315,12 @@ class F01CrashedSupervisorDispatchIsCollectedTests(_CrashRoom):
         self.assertEqual(capture.writer, capture_mod.WRITER_EXIT_WATCHER,
                          "the exit watcher did not take over the capture")
         head = recovery_runtime.resolve_head(run_id, artifact_base=self.base)
-        self.assertEqual(head.state.get("terminal_status"), "COMPLETED",
+        # USER_DECISION_C2.md: the collected dispatch settled the typed failure, so the recovered
+        # run terminates BLOCKED by name (was COMPLETED) -- recovered, settled exactly once,
+        # never a success the live supervisor did not produce.
+        self.assertEqual(head.state.get("terminal_status"), "BLOCKED",
+                         head.state.get("terminal_reason"))
+        self.assertEqual((head.state.get("terminal_reason") or {}).get("code"), "UNIT_TEST_BLOCKED",
                          head.state.get("terminal_reason"))
 
     def test_a_dead_agent_with_no_sentinel_settles_typed_and_never_succeeds(self) -> None:

@@ -189,8 +189,9 @@ class Finding1SupervisorCrashCutTests(_CrashRoom):
         """Cut C5: the supervisor CLAIMED g1 and is killed before writing the fence.  The
         watcher (guard EOF + witnessed death of the pinned supervisor; g1's owner positively
         dead by its start identity) claims g2 -- superseding the dead g1 -- and publishes the
-        fence from its own marker.  The adopted successor settles COMPLETED from THAT fence,
-        exactly once.  # superseded by OS-48: `..._refuses_stream_end_unproven`."""
+        fence from its own marker.  The adopted successor settles from THAT fence, exactly
+        once (USER_DECISION_C2.md: as the typed failure `adopted_baseline_unknown`, never a
+        success).  # superseded by OS-48: `..._refuses_stream_end_unproven`."""
         run_id = "run_cutneg"
         barrier = self._launch_barriered(run_id, "publish_before")
         spawned = self._worker_spawn(run_id)
@@ -220,7 +221,13 @@ class Finding1SupervisorCrashCutTests(_CrashRoom):
         self.assertIsNone(escaped, f"the recovery escaped: {escaped!r}")
         settled = self._settlements(run_id, intent_id)
         self.assertEqual(len(settled), 1, f"{summary!r}\n{stderr}")
-        self.assertEqual(settled[0]["state"], "COMPLETED", settled[0])
+        # USER_DECISION_C2.md (run_11b4061df84d): the successor ADOPTS a `post_ready_delivery`
+        # dispatch and can no longer settle a positive completion -- the single fenced
+        # settlement from the watcher's fence is the typed FAILED `adopted_baseline_unknown`
+        # (was COMPLETED); the fence / ownership facts below are unchanged.
+        self.assertEqual(settled[0]["state"], "FAILED", settled[0])
+        self.assertEqual((settled[0]["source_vocabulary"].get("completion_verdict") or {}).get("reason"),
+                         "adopted_baseline_unknown", settled[0]["source_vocabulary"].get("completion_verdict"))
         drain = (settled[0]["source_vocabulary"] or {}).get("post_exit_drain") or {}
         self.assertEqual(drain.get("finality"), "capture_finalized", drain)
         self.assertEqual((drain.get("fence") or {}).get("owner", {}).get("owner_role"),
@@ -244,8 +251,13 @@ class Finding1SupervisorCrashCutTests(_CrashRoom):
         self.assertIsNone(escaped, f"the recovery escaped: {escaped!r}")
         settled = self._settlements(run_id, intent_id)
         self.assertEqual(len(settled), 1, f"{summary!r}\n{stderr}")
-        self.assertEqual(settled[0]["state"], "COMPLETED",
+        # USER_DECISION_C2.md: settled exactly once from the supervisor's fence, as the typed
+        # FAILED `adopted_baseline_unknown` (was COMPLETED) -- an adopted post_ready_delivery
+        # settlement is never a success; the fence is honoured (untouched below).
+        self.assertEqual(settled[0]["state"], "FAILED",
                          "the adopted successor did not honour the supervisor's fence")
+        self.assertEqual((settled[0]["source_vocabulary"].get("completion_verdict") or {}).get("reason"),
+                         "adopted_baseline_unknown", settled[0]["source_vocabulary"].get("completion_verdict"))
         # Terminal rule: the published fence was never overwritten by watcher or successor.
         self.assertEqual(fence.read_bytes(), before)
 

@@ -1044,7 +1044,11 @@ class _Driver:
                                       "provenance_outcome": provenance_outcome,
                                       # i8 F-015: which bound an incomplete framing scan hit
                                       **({"scan": dict(selection["scan"])}
-                                         if selection is not None and selection.get("scan") else {})},
+                                         if selection is not None and selection.get("scan") else {}),
+                                      # USER DECISION C2: the adopted post_ready_delivery success
+                                      # withheld by name (`adopted_baseline_unknown`)
+                                      **({"adoption": dict(selection["adoption"])}
+                                         if selection is not None and selection.get("adoption") else {})},
                 "at": _now_iso()}
 
     # -- D4.4's CONJUNCTIVE settlement predicate, applied rather than described ----------

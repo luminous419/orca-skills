@@ -89,6 +89,7 @@ import time
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from typing import Any, Mapping
 from unittest.mock import patch
 
 from scripts.deterministic_workflow import standalone_capture as capture_mod  # noqa: E402
@@ -1725,14 +1726,18 @@ class PR36F003AdoptedSuccessSubsetTests(_StubTurn):
 
     transport            | clean       | refusal     | refusal-like prompt + ok | JSON-example prompt + ok
     argv                 | C / C       | F / F       | C / C                    | C / C
-    pty ECHO set         | C / C       | F / F       | C / F refusal_in_boundary| C / L record_framing_ambiguous
-    pty ECHO clear       | C / C       | F / F       | C / C                    | C / C
-    pty termios unreadable| C / C      | F / F       | F / F (live cannot prove the echo either) | L / L
+    pty ECHO set         | C / B       | F / F       | C / F refusal_in_boundary| C / L record_framing_ambiguous
+    pty ECHO clear       | C / B       | F / F       | C / B                    | C / B
+    pty termios unreadable| C / B      | F / F       | F / F (live cannot prove the echo either) | L / L
 
-    (C = COMPLETED, F = FAILED `refusal_in_boundary`, L = LOST `record_framing_ambiguous`;
-    live / adopted).  92d8432 adopted the two ECHO-set "stricter" cells as COMPLETED
-    (RED on the named outcome); the invariant itself holds on every cell.  The unreadable
-    termios is a seam (`termios_evidence` returns None at the write), never a sleep."""
+    (C = COMPLETED, F = FAILED `refusal_in_boundary`, L = LOST `record_framing_ambiguous`,
+    B = LOST `adopted_baseline_unknown`; live / adopted).  92d8432 adopted the two ECHO-set
+    "stricter" cells as COMPLETED (RED on the named outcome); the invariant itself holds on
+    every cell.  USER_DECISION_C2.md (run_11b4061df84d): the pty transports are
+    `post_ready_delivery`, whose ADOPTED settlement is never COMPLETED -- the five adopted
+    `C` cells of i1-i3 are now `B` by name (37b3f58 settled them COMPLETED); the argv column
+    (`launch_with_prompt`, baseline 0) is unchanged.  The unreadable termios is a seam
+    (`termios_evidence` returns None at the write), never a sleep."""
 
     OUTPUTS = {
         "clean_completion": (_clean_prompt, _record(False)),
@@ -1741,11 +1746,16 @@ class PR36F003AdoptedSuccessSubsetTests(_StubTurn):
         "json_example_prompt_echo": (_json_example_prompt, _record(False)),
     }
     C, F, L = ("COMPLETED", None), ("FAILED", REFUSAL_IN_BOUNDARY), ("LOST", FRAMING_AMBIGUOUS)
+    #: USER_DECISION_C2.md (run_11b4061df84d): an ADOPTED settlement of a `post_ready_delivery`
+    #: dispatch (the three pty transports) never returns a success -- every adopted COMPLETED
+    #: cell below is the named LOST `adopted_baseline_unknown`; refusal / framing dominance
+    #: (F, L) is preserved first; the argv (`launch_with_prompt`, baseline 0) column is unchanged.
+    B = ("LOST", "adopted_baseline_unknown")
     EXPECTED = {
         "argv": {"clean_completion": (C, C), "refusal": (F, F), "refusal_like_prompt_echo": (C, C), "json_example_prompt_echo": (C, C)},
-        "pty_echo_set": {"clean_completion": (C, C), "refusal": (F, F), "refusal_like_prompt_echo": (C, F), "json_example_prompt_echo": (C, L)},
-        "pty_echo_clear": {"clean_completion": (C, C), "refusal": (F, F), "refusal_like_prompt_echo": (C, C), "json_example_prompt_echo": (C, C)},
-        "pty_termios_unreadable": {"clean_completion": (C, C), "refusal": (F, F), "refusal_like_prompt_echo": (F, F), "json_example_prompt_echo": (L, L)},
+        "pty_echo_set": {"clean_completion": (C, B), "refusal": (F, F), "refusal_like_prompt_echo": (C, F), "json_example_prompt_echo": (C, L)},
+        "pty_echo_clear": {"clean_completion": (C, B), "refusal": (F, F), "refusal_like_prompt_echo": (C, B), "json_example_prompt_echo": (C, B)},
+        "pty_termios_unreadable": {"clean_completion": (C, B), "refusal": (F, F), "refusal_like_prompt_echo": (F, F), "json_example_prompt_echo": (L, L)},
     }
 
     def _cell(self, transport: str, output: str):
@@ -2063,7 +2073,9 @@ class PR36BaselineNotAuthorityTests(_StubTurn):
 # =====================================================================================
 class PR36L6ParityTests(unittest.TestCase):
     MODULES = ("standalone_runtime.py", "standalone_capture.py", "standalone_pty.py",
-               "standalone_drivers.py", "standalone_journal.py", "standalone_lifecycle.py")
+               "standalone_drivers.py", "standalone_journal.py", "standalone_lifecycle.py",
+               # run_11b4061df84d (L-7): the profile validator is where the R3 carrier fix lives
+               "standalone_profile.py")
 
     def test_l6_the_deploy_copy_and_the_mirror_are_byte_identical(self) -> None:
         deploy = REPO / "orca-worker-reviewer-orchestration" / "tools" / "deterministic_workflow"
@@ -2072,6 +2084,648 @@ class PR36L6ParityTests(unittest.TestCase):
             with self.subTest(module=name):
                 self.assertEqual((deploy / name).read_bytes(), (mirror / name).read_bytes(),
                                  f"{name}: the deploy copy and the mirror differ")
+
+
+# =====================================================================================
+# run_11b4061df84d -- adopted settlement never mints positive authority from [0, N)
+# (PR #36 comments 5747199243 §3 / 5747098383 [P1] at 37b3f58; REVIEW_BUGFIX F-001/F-002;
+#  USER_DECISION_C2.md)
+# =====================================================================================
+#: the C2 outcome, spelled as a literal so 37b3f58 fails on BEHAVIOUR (an adopted COMPLETED),
+#: never on a missing attribute
+ADOPTED_BASELINE_UNKNOWN = "adopted_baseline_unknown"
+
+
+def _c2_rule():
+    """The production C2 function -- or the IDENTITY on a tree without it (37b3f58), so the
+    locks below fail on BEHAVIOUR (an adopted success not withheld), never on an attribute."""
+    return getattr(rt, "withhold_adopted_post_ready_success", None) or (lambda selection, **_kw: dict(selection))
+
+
+def _r3_spec(delivery_mode: str, binding_mode: str, carrier: bool, *, worktree: str = "/tmp",
+             record_type: str = "result", field: str | None = None) -> dict:
+    """An `sh` claude-driver profile MAPPING (the production loader's shape) for one cell of
+    the delivery_mode x binding_mode x carrier matrix.  `binding_field` follows the mode
+    (`session_field` binds on `session_id`, `sidecar_file` on `thread_id`), the carrier is
+    `thread.started` when declared."""
+    completion = {"channel": "structured", "record_type": record_type, "error_field": "is_error",
+                  "binding_mode": binding_mode}
+    if field is None:
+        field = {"session_field": "session_id", "sidecar_file": "thread_id"}.get(binding_mode, "")
+    if field:
+        completion["binding_field"] = field
+    if carrier:
+        completion["carrier_type"] = "thread.started"
+    spec = {
+        "driver": "claude", "binary": "sh", "supported_range": [[1, 0, 0], [9, 0, 0]],
+        "bin_dirs": ["/bin"], "worktree": worktree,
+        "readiness_records": [{"channel": "structured", "record_type": "system",
+                               "session_field": "session_id"}],
+        "completion_records": [completion],
+        "delivery_mode": delivery_mode, "identity_binding": "minted_echo",
+        "identity_flag": "--session-id",
+    }
+    if delivery_mode == "launch_with_prompt":
+        spec["delivery_proofs"] = [{"channel": "structured", "record_type": "assistant"}]
+    return spec
+
+
+def _r3_profile_direct(spec: dict):
+    """The SAME cell through the direct dataclass constructor (no loader)."""
+    from scripts.deterministic_workflow.standalone_profile import (CompletionSelector,
+                                                                   DeliveryProofSelector,
+                                                                   ReadinessSelector,
+                                                                   StandaloneProfile)
+    c = spec["completion_records"][0]
+    return StandaloneProfile(
+        driver=spec["driver"], binary=spec["binary"],
+        supported_range=tuple(tuple(b) for b in spec["supported_range"]),
+        bin_dirs=tuple(spec["bin_dirs"]), worktree=spec["worktree"],
+        delivery_mode=spec["delivery_mode"], identity_binding=spec["identity_binding"],
+        identity_flag=spec["identity_flag"],
+        readiness_records=tuple(ReadinessSelector(**r) for r in spec["readiness_records"]),
+        delivery_proofs=tuple(DeliveryProofSelector(**d) for d in spec.get("delivery_proofs", ())),
+        completion_records=(CompletionSelector(
+            channel=c["channel"], record_type=c["record_type"], error_field=c["error_field"],
+            binding_mode=c["binding_mode"], binding_field=c.get("binding_field", ""),
+            carrier_type=c.get("carrier_type", "")),))
+
+
+#: every cell of the supported matrix -- ALL admitted (USER_DECISION_C2.md: the i1
+#: `PreBaselineCarrierRefused` is removed; no live profile surface is forbidden)
+R3_CELLS = tuple((mode, binding, carrier)
+                 for mode in ("launch_with_prompt", "post_ready_delivery")
+                 for binding in ("session_field", "sidecar_file", "single_record_optin")
+                 for carrier in (True, False))
+
+
+class _RangeSettler:
+    """The production selector over `[live_baseline, N)` (what the LIVE session examines: under
+    `post_ready_delivery` `send()` sets `_settlement_baseline = capture.size` AFTER readiness,
+    so the baseline is the byte after the last pre-delivery record; under `launch_with_prompt`
+    `send()` is never called and the baseline is 0) and over `[0, N)` (what the ADOPTED session
+    examines since run_d6391487ff44: no unkeyed journal baseline) -- the adopted selection then
+    passes through the PRODUCTION C2 rule `standalone_runtime.withhold_adopted_post_ready_success`
+    exactly as `StandaloneSession.completion()` applies it.  `verdict_of` classifies a selection
+    as the runtime does: COMPLETED only when the selector returns a record with no outcome AND
+    `completion_verdict` (exit 0) succeeds; otherwise the NAMED outcome."""
+
+    READY = {"type": "system", "session_id": "S"}
+    CARRIER = {"type": "thread.started", "thread_id": "S"}
+    CARRIER_OTHER = {"type": "thread.started", "thread_id": "OTHER"}
+
+    def __init__(self, case: unittest.TestCase, profile) -> None:
+        from scripts.deterministic_workflow import standalone_drivers as drivers
+        self.case = case
+        self.profile = profile
+        self.driver = drivers.driver_for(profile)
+
+    @staticmethod
+    def lines(records) -> str:
+        return "".join((json.dumps(r) if isinstance(r, dict) else str(r)) + "\n" for r in records)
+
+    def select(self, text: str, **kw) -> dict:
+        raw = text.encode()
+        return self.driver.select_completion(text, raw=raw, **kw)
+
+    def verdict_of(self, sel: Mapping[str, Any]) -> str:
+        if sel["outcome"] is not None:
+            return f"LOST/FAILED {sel['outcome']}"
+        if sel["record"] is None:
+            return "FAILED no_completion_record"
+        verdict = self.driver.completion_verdict(sel["record"], exit_status=0)
+        if verdict["outcome"] == "succeeded":
+            return "COMPLETED"
+        return f"{verdict['outcome'].upper()} {verdict['reason']}"
+
+    def settle(self, pre: list, post: list, **kw) -> tuple[str, str, dict, dict, dict]:
+        """``pre`` records are emitted BEFORE the prompt delivery, ``post`` after.  Returns
+        (live verdict, adopted verdict, live selection, adopted selection, the RAW adopted
+        selection before the C2 rule)."""
+        pre_text, post_text = self.lines(pre), self.lines(post)
+        whole = pre_text + post_text
+        baseline = len(pre_text.encode()) if self.profile.delivery_mode == "post_ready_delivery" else 0
+        rule = _c2_rule()
+        live = rule(self.select(whole.encode()[baseline:].decode(), **kw), adopted=False,
+                    delivery_mode=self.profile.delivery_mode)
+        raw_adopted = self.select(whole, **kw)
+        adopted = rule(raw_adopted, adopted=True, delivery_mode=self.profile.delivery_mode)
+        return self.verdict_of(live), self.verdict_of(adopted), live, adopted, raw_adopted
+
+
+def _r3_completion(*, ok: bool, bound_field: str | None = None) -> dict:
+    rec: dict = {"type": "result", "is_error": not ok}
+    if bound_field:
+        rec[bound_field] = "S"
+    return rec
+
+
+class PR36R3CarrierAuthorityTests(unittest.TestCase):
+    """run_11b4061df84d.  The adopted range `[0, N)` (baseline 0, run_d6391487ff44) is a SUPERSET
+    of the live `[baseline, N)`.  Range growth is monotone-safe for R1 / R2 / framing / scan
+    (more evidence can only REJECT) but NOT for two positive paths: the R3 `sidecar_file`
+    carrier fallback (a carrier BEFORE the live baseline binds a record live could not -- the
+    P1 at 37b3f58) and, more generally, a sole bound completion record emitted BEFORE the prompt
+    was delivered (REVIEW_BUGFIX F-001: `session_field` / `single_record_optin` / record-field
+    `sidecar_file` under `post_ready_delivery`).  Nothing in the fenced bytes marks the delivery
+    instant, so no baseline-independent selector rule can tell the two apart.
+
+    USER DECISION C2 (USER_DECISION_C2.md): an ADOPTED settlement of a `post_ready_delivery`
+    dispatch never returns a success -- refusal / reader-failure dominance is preserved first
+    and a would-be success is the NAMED LOST outcome `adopted_baseline_unknown`
+    (`standalone_runtime.withhold_adopted_post_ready_success`, applied in
+    `StandaloneSession.completion()`, the one place every adopted settlement passes).  LIVE
+    `post_ready_delivery` and BOTH `launch_with_prompt` paths (baseline 0: live range ==
+    adopted range) are unchanged.  The i1 profile refusal `PreBaselineCarrierRefused` is
+    REMOVED: with C2 the combination cannot produce an adopted-only success and its live
+    behaviour was never the defect.  Driver-level locks here (the production selector + the
+    production C2 function); the real-session locks are in `PR36R3CarrierAuthorityNativeTests`."""
+
+    P1 = ("post_ready_delivery", "sidecar_file", True)
+
+    # ---- L-1 (a): the P1 profile is ADMITTED; live binds iff the carrier is in range; adopted never
+    def test_l1a_the_p1_profile_is_admitted_and_can_never_settle_adopted_only(self) -> None:
+        """Both constructors admit `post_ready_delivery + sidecar_file + carrier` (no
+        ProfileError of any name); live binds through the carrier iff the carrier lies inside
+        `[baseline, N)` (pre-baseline -> `provenance_unbound`, post-baseline -> COMPLETED);
+        adopted is LOST `adopted_baseline_unknown` in both shapes -- never COMPLETED, and never
+        the pre-baseline-carrier success 37b3f58 produced."""
+        spec = _r3_spec(*self.P1)
+        for name, build in (("profile_from_mapping", lambda: profile_from_mapping(spec)),
+                            ("StandaloneProfile(...)", lambda: _r3_profile_direct(spec))):
+            with self.subTest(constructor=name):
+                profile = build()                       # raises -> the surface was forbidden
+                settler = _RangeSettler(self, profile)
+                lv, av, live, adopted, raw = settler.settle([settler.READY, settler.CARRIER], [_r3_completion(ok=True)],
+                                                            bound_value="S", sidecar_present=True)
+                self.assertEqual(lv, "LOST/FAILED provenance_unbound", live)
+                self.assertEqual(av, f"LOST/FAILED {ADOPTED_BASELINE_UNKNOWN}", adopted)
+                self.assertEqual(settler.verdict_of(raw), "COMPLETED", "the raw [0, N) selection is not the P1 shape")
+                self.assertIsNone(adopted["record"], adopted)
+                self.assertEqual(adopted["adoption"]["withheld_record_type"], "result", adopted)
+                lv, av, live, adopted, raw = settler.settle([settler.READY], [settler.CARRIER, _r3_completion(ok=True)],
+                                                            bound_value="S", sidecar_present=True)
+                self.assertEqual(lv, "COMPLETED", live)          # live: unchanged positive path
+                self.assertEqual(av, f"LOST/FAILED {ADOPTED_BASELINE_UNKNOWN}", adopted)
+
+    def test_l1a_every_cell_of_the_supported_matrix_is_admitted(self) -> None:
+        """USER_DECISION_C2.md: no live profile surface is forbidden -- all 12 cells load
+        through both constructors."""
+        for cell in R3_CELLS:
+            with self.subTest(cell=cell):
+                spec = _r3_spec(*cell)
+                profile_from_mapping(spec)
+                _r3_profile_direct(spec)
+
+    # ---- L-1 (c): no admitted profile binds through a carrier live could not see -------------
+    def test_l1c_no_admitted_carrier_profile_binds_through_a_carrier_live_could_not_see(self) -> None:
+        """For every admitted cell that declares a carrier: `session_field` /
+        `single_record_optin` never consult it (selection identical with and without the
+        carrier), `launch_with_prompt` examines the same range on both sides (identical
+        selection), and under `post_ready_delivery` the adopted side is never COMPLETED."""
+        for mode in ("launch_with_prompt", "post_ready_delivery"):
+            for binding in ("session_field", "sidecar_file", "single_record_optin"):
+                settler = _RangeSettler(self, profile_from_mapping(_r3_spec(mode, binding, True)))
+                sidecar = binding == "sidecar_file"
+                bound_field = {"session_field": "session_id"}.get(binding)
+                for shape, pre, post in (
+                        ("carrier_pre/bound_post", [settler.READY, settler.CARRIER], [_r3_completion(ok=True, bound_field=bound_field)]),
+                        ("carrier_post/bound_post", [settler.READY], [settler.CARRIER, _r3_completion(ok=True, bound_field=bound_field)]),
+                        ("carrier_absent/bound_post", [settler.READY], [_r3_completion(ok=True, bound_field=bound_field)])):
+                    with self.subTest(cell=(mode, binding), shape=shape):
+                        lv, av, live, adopted, _raw = settler.settle(pre, post, bound_value="S", sidecar_present=sidecar)
+                        if av == "COMPLETED":
+                            self.assertEqual(lv, "COMPLETED", f"adopted-only success: live {lv} / adopted {av}")
+                            self.assertEqual(adopted["record"], live["record"])
+                        if mode == "post_ready_delivery":
+                            self.assertNotEqual(av, "COMPLETED", f"an adopted post_ready_delivery success: {adopted}")
+                        else:
+                            self.assertEqual(live, adopted, "launch_with_prompt: live and adopted examined the same range and differ")
+                        if binding != "sidecar_file":
+                            lv2, av2, _, _, _ = settler.settle([r for r in pre if r is not settler.CARRIER],
+                                                                [r for r in post if r is not settler.CARRIER],
+                                                                bound_value="S", sidecar_present=sidecar)
+                            self.assertEqual((lv, av), (lv2, av2), f"the carrier changed a {binding} selection")
+
+    # ---- L-2: the normal carrier path keeps its positive behaviour (live, both modes) -------
+    def test_l2_the_normal_carrier_path_keeps_its_positive_behaviour(self) -> None:
+        """The L-02b contract on the LIVE side under both delivery modes: record lacking the
+        field, the carrier before it (inside the live range) carries it, sidecar present ⇒
+        bound; a different / empty / absent thread, a missing sidecar, an empty bound value ⇒
+        `provenance_unbound`.  On adoption `launch_with_prompt` is identical and
+        `post_ready_delivery` is never COMPLETED.  GREEN at 37b3f58 for the live legs (a pure
+        regression guard); RED there for the post_ready adopted leg."""
+        for mode in ("launch_with_prompt", "post_ready_delivery"):
+            settler = _RangeSettler(self, profile_from_mapping(_r3_spec(mode, "sidecar_file", True)))
+            bound = [settler.READY, settler.CARRIER, _r3_completion(ok=True)]
+            with self.subTest(mode=mode, case="bound"):
+                lv, av, live, adopted, _ = settler.settle([settler.READY], bound[1:], bound_value="S", sidecar_present=True)
+                self.assertEqual(lv, "COMPLETED", live)
+                self.assertEqual(live["record"], _r3_completion(ok=True))
+                self.assertEqual(av, "COMPLETED" if mode == "launch_with_prompt" else f"LOST/FAILED {ADOPTED_BASELINE_UNKNOWN}", adopted)
+            for name, records, kw in (
+                    ("different thread", [settler.READY, settler.CARRIER_OTHER, _r3_completion(ok=True)], dict(bound_value="S", sidecar_present=True)),
+                    ("empty thread", [settler.READY, {"type": "thread.started", "thread_id": ""}, _r3_completion(ok=True)], dict(bound_value="S", sidecar_present=True)),
+                    ("absent carrier", [settler.READY, _r3_completion(ok=True)], dict(bound_value="S", sidecar_present=True)),
+                    ("missing sidecar", bound, dict(bound_value="S", sidecar_present=False)),
+                    ("empty bound", bound, dict(bound_value="", sidecar_present=True))):
+                with self.subTest(mode=mode, case=name):
+                    lv, av, live, adopted, _ = settler.settle([records[0]], records[1:], **kw)
+                    self.assertEqual((lv, av), ("LOST/FAILED provenance_unbound",) * 2, (live, adopted))
+                    self.assertIsNone(live["record"])
+
+    # ---- L-3 (driver level): the shipping profiles load, unchanged ---------------------------
+    def test_l3_the_shipping_profiles_load_unchanged(self) -> None:
+        """`codex_profile` (launch_with_prompt + sidecar_file + carrier thread.started) and
+        `claude_profile` (launch_with_prompt + session_field -- BOTH shipping profiles are
+        `launch_with_prompt`, `scripts/os37_r10_real_agent.py`) construct exactly as before; a
+        codex-shaped capture (thread.started, then the sole turn.completed lacking thread_id)
+        settles COMPLETED over the same range live and adopted (baseline 0 ⇒ same range; C2
+        does not apply), and a missing sidecar / a different thread is `provenance_unbound` on
+        both."""
+        from scripts.os37_r10_real_agent import claude_profile, codex_profile
+        codex = codex_profile("/tmp", "/tmp")
+        self.assertEqual(codex.delivery_mode, "launch_with_prompt")
+        self.assertEqual((codex.completion_records[0].binding_mode, codex.completion_records[0].binding_field,
+                          codex.completion_records[0].carrier_type), ("sidecar_file", "thread_id", "thread.started"))
+        claude = claude_profile("/tmp")
+        self.assertEqual(claude.delivery_mode, "launch_with_prompt")
+        self.assertEqual((claude.completion_records[0].binding_mode, claude.completion_records[0].carrier_type),
+                         ("session_field", ""))
+        settler = _RangeSettler(self, codex)
+        started = {"type": "thread.started", "thread_id": "T1"}
+        done = {"type": "turn.completed", "usage": {"input_tokens": 1}}
+        lv, av, live, adopted, _ = settler.settle([started, done], [], bound_value="T1", sidecar_present=True)
+        self.assertEqual((lv, av), ("COMPLETED", "COMPLETED"), (live, adopted))
+        self.assertEqual(live, adopted)
+        self.assertEqual(live["record"], done)
+        for name, records, kw in (("missing sidecar", [started, done], dict(bound_value="T1", sidecar_present=False)),
+                                  ("different thread", [{"type": "thread.started", "thread_id": "T2"}, done],
+                                   dict(bound_value="T1", sidecar_present=True))):
+            with self.subTest(case=name):
+                lv, av, live, adopted, _ = settler.settle(records, [], **kw)
+                self.assertEqual((lv, av), ("LOST/FAILED provenance_unbound",) * 2, (live, adopted))
+                self.assertEqual(live, adopted)
+
+    # ---- L-6: the asserted invariant matrix ----------------------------------------------------
+    SHAPES = (
+        # (name, pre-delivery records, post-delivery records)  -- CARRIER = `thread.started`
+        ("carrier_pre/bound_post", ["READY", "CARRIER"], ["OK"]),
+        ("carrier_post/bound_post", ["READY"], ["CARRIER", "OK"]),
+        ("carrier_absent/bound_post", ["READY"], ["OK"]),
+        ("carrier_pre/refusing_post", ["READY", "CARRIER"], ["ERR"]),
+        ("carrier_post/refusing_post", ["READY"], ["CARRIER", "ERR"]),
+        ("carrier_absent/refusing_post", ["READY"], ["ERR"]),
+        ("refusal_pre/bound_post", ["READY", "ERR"], ["OK"]),
+        ("prose_refusal_pre/bound_post", ["READY", "not logged in"], ["OK"]),
+        ("echo_example_pre/bound_post", ["READY", "EXAMPLE"], ["OK"]),
+        ("carrier_pre/two_bound_post", ["READY", "CARRIER"], ["OK", "OK"]),
+        ("carrier_pre/nothing_post", ["READY", "CARRIER"], []),
+        # REVIEW_BUGFIX F-002: the pre-delivery completion shapes, ASSERTED
+        ("sole_completion_pre_delivery", ["READY", "CARRIER", "OK"], []),
+        ("completion_pre/refusal_post", ["READY", "CARRIER", "OK"], ["ERR"]),
+        ("completion_pre/second_completion_post", ["READY", "CARRIER", "OK"], ["OK"]),
+        ("completion_pre/prose_refusal_post", ["READY", "CARRIER", "OK"], ["not logged in"]),
+    )
+
+    def _records(self, settler: _RangeSettler, names: list[str], binding: str) -> list:
+        bound_field = {"session_field": "session_id"}.get(binding)
+        table = {"READY": settler.READY, "CARRIER": settler.CARRIER,
+                 "OK": _r3_completion(ok=True, bound_field=bound_field),
+                 "ERR": _r3_completion(ok=False, bound_field=bound_field),
+                 "EXAMPLE": "example: " + json.dumps(_r3_completion(ok=True, bound_field=bound_field))}
+        return [table.get(n, n) for n in names]
+
+    def test_l6_the_supported_profile_matrix_never_settles_adopted_only(self) -> None:
+        """delivery_mode x binding_mode x carrier declared/not (12 cells, ALL admitted) x 15
+        capture shapes incl. the pre-delivery completion shapes: on every cell/shape
+        `adopted COMPLETED ⇒ live COMPLETED` on the same record; `launch_with_prompt` is
+        identical on both sides; under `post_ready_delivery` the adopted side is NEVER
+        COMPLETED and is `adopted_baseline_unknown` exactly where the raw `[0, N)` selection
+        would have been a success (the C2 rule withholds a success and nothing else -- every
+        refusal / reader-failure outcome is preserved).  The matrix is printed for BUGFIX.md."""
+        rows: list[str] = []
+        for mode, binding, carrier in R3_CELLS:
+            cell = f"{mode} + {binding} + carrier={'yes' if carrier else 'no'}"
+            spec = _r3_spec(mode, binding, carrier)
+            profile_from_mapping(spec)
+            _r3_profile_direct(spec)
+            settler = _RangeSettler(self, profile_from_mapping(spec))
+            sidecar = binding == "sidecar_file"
+            outcomes = []
+            for shape, pre, post in self.SHAPES:
+                with self.subTest(cell=cell, shape=shape):
+                    lv, av, live, adopted, raw = settler.settle(self._records(settler, pre, binding),
+                                                                 self._records(settler, post, binding),
+                                                                 bound_value="S", sidecar_present=sidecar)
+                    if av == "COMPLETED":
+                        self.assertEqual(lv, "COMPLETED", f"{cell} / {shape}: adopted-only success (live {lv})")
+                        self.assertEqual(adopted["record"], live["record"], f"{cell} / {shape}: different record")
+                    if mode == "launch_with_prompt":
+                        self.assertEqual(live, adopted, f"{cell} / {shape}: baseline 0 yet live != adopted")
+                    else:
+                        self.assertNotEqual(av, "COMPLETED", f"{cell} / {shape}: an adopted post_ready_delivery success")
+                        rv = settler.verdict_of(raw)
+                        if rv == "COMPLETED":
+                            self.assertEqual(av, f"LOST/FAILED {ADOPTED_BASELINE_UNKNOWN}", f"{cell} / {shape}: a raw success not withheld by name")
+                            self.assertIsNone(adopted["record"])
+                        else:
+                            self.assertEqual(av, rv, f"{cell} / {shape}: C2 changed a non-success outcome")
+                    outcomes.append(f"{shape}: {lv} / {av}")
+            rows.append(f"| {cell} | " + "<br>".join(outcomes) + " |")
+        print("\nL-6 supported profile matrix (live / adopted per capture shape; ALL 12 cells admitted):")
+        print("| cell | shapes |\n|---|---|")
+        print("\n".join(rows))
+
+    def test_l6_the_c2_rule_withholds_only_a_success(self) -> None:
+        """`withhold_adopted_post_ready_success` itself: inert for live and for
+        `launch_with_prompt`; every non-success selection (refusal, ambiguity, unbound,
+        framing, scan) passes through unchanged; a success becomes `adopted_baseline_unknown`
+        with the record withheld and the diagnostic naming the withheld type."""
+        success = {"record": {"type": "result", "is_error": False}, "outcome": None, "refusal": None, "candidates": 1}
+        refusing = {"record": {"type": "result", "is_error": True}, "outcome": None,
+                    "refusal": {"source": "error_field"}, "candidates": 1}
+        rule = _c2_rule()
+        for name, sel in (("success/live", success), ("success/launch", success)):
+            adopted = name.endswith("launch")
+            out = rule(sel, adopted=adopted, delivery_mode="launch_with_prompt" if adopted else "post_ready_delivery")
+            self.assertEqual(out, sel, name)
+        out = rule(success, adopted=True, delivery_mode="post_ready_delivery")
+        self.assertEqual((out.get("outcome"), out.get("record"), (out.get("adoption") or {}).get("withheld_record_type")),
+                         (ADOPTED_BASELINE_UNKNOWN, None, "result"), out)
+        self.assertEqual(rule(refusing, adopted=True, delivery_mode="post_ready_delivery"), refusing)
+        none_reached = {"record": None, "outcome": None, "refusal": None, "candidates": 0}
+        self.assertEqual(rule(none_reached, adopted=True, delivery_mode="post_ready_delivery"), none_reached,
+                         "no record reached the verdict: FAILED no_completion_record stays")
+        for outcome in ("refusal_in_boundary", "provenance_ambiguous", "provenance_unbound",
+                        "record_framing_ambiguous", "record_scan_incomplete"):
+            sel = {"record": None, "outcome": outcome, "refusal": None, "candidates": 0}
+            self.assertEqual(rule(sel, adopted=True, delivery_mode="post_ready_delivery"), sel, outcome)
+        self.assertIn(ADOPTED_BASELINE_UNKNOWN, lifecycle.LOST_REASONS)
+        self.assertIn(ADOPTED_BASELINE_UNKNOWN, lifecycle.OS48_LOST_OUTCOMES)
+        self.assertEqual(getattr(capture_mod, "OUTCOME_ADOPTED_BASELINE_UNKNOWN", ""), ADOPTED_BASELINE_UNKNOWN)
+
+
+class PR36R3CarrierAuthorityNativeTests(_StubTurn):
+    """The same contract through the REAL `StandaloneSession` live-vs-`adopt()` path over the
+    native stub (as `PR36F003AdoptedSuccessSubsetTests` does) and through the production
+    recovery path `StandaloneAdapter._collect_in_flight`."""
+
+    #: post-ready turn (no echo): readiness, then the CARRIER (pre-delivery by construction),
+    #: then the prompt read, then the completion WITHOUT the binding field
+    _CARRIER_AGENT = """SID="$1"
+stty -echo icanon
+printf '{"type":"system","session_id":"%%s"}\\n' "$SID"
+printf '{"type":"thread.started","thread_id":"%%s"}\\n' "$SID"
+IFS= read -r PROMPT
+%(records)s
+exit 0
+"""
+    #: the sole-pre-delivery shape: readiness, a BOUND success, THEN the prompt read, nothing after
+    _PRE_DELIVERY_AGENT = """SID="$1"
+stty -echo icanon
+printf '{"type":"system","session_id":"%%s"}\\n' "$SID"
+%(records)s
+IFS= read -r PROMPT
+exit 0
+"""
+    #: argv turn (launch_with_prompt): readiness, the CARRIER, the delivery proof, the completion
+    _CODEX_SHAPED_AGENT = """SID="$1"; PROMPT="$2"; THREAD="%(thread)s"
+printf '{"type":"system","session_id":"%%s"}\\n' "$SID"
+printf '{"type":"thread.started","thread_id":"%%s"}\\n' "$THREAD"
+sleep 0.2
+printf '{"type":"assistant","session_id":"%%s","request_id":"req_stub_agent_1","message":{"model":"stub-agent-model-1","id":"msg_stub_agent_1","usage":{"input_tokens":2,"output_tokens":1}}}\\n' "$SID"
+printf '{"type":"turn.completed","usage":{"input_tokens":1}}\\n'
+exit 0
+"""
+
+    def _sidecar_session(self, run_id: str, script_body: str, *, delivery_mode: str, completion: dict,
+                         sidecar: bool):
+        """A stub session whose profile declares `output_last_message_path` (so the runtime
+        mints the dispatch-scoped sidecar and the watcher snapshots its presence at the
+        boundary) and the given completion selector.  ``sidecar`` pre-creates the file."""
+        script = self.base / f"agent-{run_id}.sh"
+        script.write_text(script_body)
+        spec = _stub_spec(str(self.base), str(script))
+        spec["delivery_mode"] = delivery_mode
+        if delivery_mode == "launch_with_prompt":
+            spec["delivery_proofs"] = [{"channel": "structured", "record_type": "assistant"}]
+        spec["completion_records"] = [completion]
+        spec["output_last_message_path"] = str(self.base / "last_message.md")
+        profile = profile_from_mapping(spec)            # raises -> the surface was forbidden
+        session = rt.StandaloneSession(
+            intent={"intent_id": f"i-{run_id}", "run_id": run_id, "role": "WORKER",
+                    "task_id": f"t-{run_id}", "dispatch_id": f"d-{run_id}"},
+            profile=profile, artifact_base=self.base / "art", run_id=run_id,
+            journal=journal_mod.ExecutionJournal(self.base / "art", run_id))
+        self.assertTrue(session.last_message_path, "the runtime minted no dispatch-scoped sidecar path")
+        if sidecar:
+            Path(session.last_message_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(session.last_message_path).write_text("final body\n")
+        return session
+
+    @staticmethod
+    def _verdict(result) -> tuple:
+        return PR36F003AdoptedSuccessSubsetTests._verdict_of(result)
+
+    def _adopted(self, live):
+        adopted = _stranger(live)
+        outcome = adopted.adopt(fence=live.fence)
+        self.assertTrue(outcome["adopted"], outcome)
+        return adopted, adopted.await_completion()
+
+    def _assert_withheld(self, live, live_result, adopted, adopted_result, *, withheld_type: str = "result") -> None:
+        """The C2 outcome BY NAME on the real path: LOST `adopted_baseline_unknown`, no
+        settlement record, the diagnostic naming the withheld record type, journalled; the
+        adoption examined [0, N) (baseline 0) and excised nothing."""
+        self.assertEqual(self._verdict(adopted_result), ("LOST", ADOPTED_BASELINE_UNKNOWN), adopted_result)
+        self.assertIsNone(adopted_result["evidence"].get("settlement_record"), adopted_result["evidence"])
+        vocab = adopted_result["evidence"].get("source_vocabulary") or {}
+        self.assertEqual((vocab.get("adoption") or {}).get("withheld_record_type"), withheld_type, vocab)
+        rows = [r for r in adopted.journal.rows_for(live.intent_id)
+                if (r.get("source_vocabulary") or {}).get("provenance_outcome") == ADOPTED_BASELINE_UNKNOWN]
+        self.assertGreaterEqual(len(rows), 1, "the C2 outcome was not journalled by name")
+        self.assertEqual(rows[-1]["source_vocabulary"].get("adoption", {}).get("withheld_record_type"), withheld_type, rows[-1])
+        _assert_not_wider(self, live, live_result, adopted, adopted_result)
+
+    # ---- L-1 (b): the P1 counterexample on the real session path ----------------------------
+    def test_l1b_the_p1_counterexample_never_settles_adopted_only_on_the_real_session_path(self) -> None:
+        """The reviewers' counterexample END TO END: `post_ready_delivery + sidecar_file +
+        carrier thread.started` (ADMITTED); the agent emits the carrier at readiness (BEFORE
+        `send()` sets the baseline) and, after the prompt, a `result` lacking `thread_id`; the
+        sidecar is present.  Live: LOST `provenance_unbound` (the carrier is outside
+        [baseline, N)).  Adopted: LOST `adopted_baseline_unknown` by name -- 37b3f58 settled
+        COMPLETED here (RED, the reproduction itself)."""
+        session = self._sidecar_session(
+            "pr36-r3-l1b", self._CARRIER_AGENT % {"records": _r3_lines(ok=True)},
+            delivery_mode="post_ready_delivery",
+            completion={"channel": "structured", "record_type": "result", "error_field": "is_error",
+                        "binding_mode": "sidecar_file", "binding_field": "thread_id",
+                        "carrier_type": "thread.started"}, sidecar=True)
+        live_result = PR36F003AdoptedSuccessSubsetTests._pty_turn(self, session, lambda sid: "Continue the task.")
+        self.assertGreater(int(session._settlement_baseline or 0), 0, "post_ready_delivery set no baseline")
+        baseline, n, fenced = self._fenced(session)
+        self.assertNotIn(b'"thread.started"', fenced, "the carrier is not pre-baseline")
+        self.assertEqual(session._sidecar_state, capture_mod.SIDECAR_STATE_PRESENT, session._sidecar_state)
+        adopted, adopted_result = self._adopted(session)
+        lo, ao = self._verdict(live_result), self._verdict(adopted_result)
+        print(f"\nL-1b: live {lo} range [{baseline},{n}) / adopted {ao} range "
+              f"[{(adopted_result['evidence'].get('settlement_range') or {}).get('baseline')},{n})")
+        self.assertEqual(lo, ("LOST", "provenance_unbound"), live_result)
+        self._assert_withheld(session, live_result, adopted, adopted_result)
+
+    # ---- L-3: the shipping Codex shape, live and adopted (unchanged) --------------------------
+    def _codex_shaped(self, run_id: str, *, thread: str, sidecar: bool):
+        session = self._sidecar_session(
+            run_id, self._CODEX_SHAPED_AGENT % {"thread": thread},
+            delivery_mode="launch_with_prompt",
+            completion={"channel": "structured", "record_type": "turn.completed",
+                        "binding_mode": "sidecar_file", "binding_field": "thread_id",
+                        "carrier_type": "thread.started"}, sidecar=sidecar)
+        try:
+            self._argv_turn(session, "Continue the task.")
+        except rt.StandaloneDispatchFailed:
+            pass                                    # a LOST dispatch raises; the settlement is read below
+        live_result = session.await_completion()
+        self.assertEqual(int(session._settlement_baseline or 0), 0, "launch_with_prompt set a non-zero baseline")
+        adopted, adopted_result = self._adopted(session)
+        return session, live_result, adopted, adopted_result
+
+    def test_l3_the_shipping_codex_shape_settles_the_same_live_and_adopted(self) -> None:
+        """`launch_with_prompt + sidecar_file + carrier`: thread.started then a sole
+        turn.completed lacking thread_id, sidecar present ⇒ COMPLETED live AND adopted on the
+        same record over the SAME range (baseline 0 on both; C2 does not apply); a missing
+        sidecar or a different thread ⇒ LOST `provenance_unbound` on both."""
+        live, live_result, adopted, adopted_result = self._codex_shaped("pr36-r3-l3-ok", thread="$SID", sidecar=True)
+        self.assertEqual(self._verdict(live_result), ("COMPLETED", None), live_result)
+        self.assertEqual(self._verdict(adopted_result), ("COMPLETED", None), adopted_result)
+        self.assertEqual(adopted_result["evidence"]["settlement_record"].get("type"), "turn.completed")
+        _assert_identical(self, live, live_result, adopted, adopted_result)
+        for name, kw in (("missing sidecar", dict(thread="$SID", sidecar=False)),
+                         ("different thread", dict(thread="OTHER", sidecar=True))):
+            with self.subTest(case=name):
+                live, live_result, adopted, adopted_result = self._codex_shaped(f"pr36-r3-l3-{name[:4]}", **kw)
+                self.assertEqual(self._verdict(live_result), ("LOST", "provenance_unbound"), live_result)
+                self.assertEqual(self._verdict(adopted_result), ("LOST", "provenance_unbound"), adopted_result)
+                _assert_identical(self, live, live_result, adopted, adopted_result)
+
+    # ---- L-4: session_field / single_record_optin, post_ready: live COMPLETED, adopted withheld
+    def test_l4_session_field_and_single_record_optin_post_ready_adoption_is_withheld_by_name(self) -> None:
+        """`post_ready_delivery` with a pre-baseline `thread.started` record present:
+        `session_field` binds on the record itself and `single_record_optin` binds nothing --
+        live COMPLETED on both; adopted LOST `adopted_baseline_unknown` on both (USER DECISION
+        C2; i1 asserted COMPLETED / COMPLETED here).  The pty `session_field` cells of
+        `PR36F003AdoptedSuccessSubsetTests` cover the transport x output matrix."""
+        for name, completion, records in (
+                ("session_field", {"channel": "structured", "record_type": "result", "error_field": "is_error",
+                                   "binding_mode": "session_field", "binding_field": "session_id"}, _record(False)),
+                ("single_record_optin", {"channel": "structured", "record_type": "result", "error_field": "is_error",
+                                         "binding_mode": "single_record_optin"}, _r3_lines(ok=True))):
+            with self.subTest(binding=name):
+                session = self._sidecar_session(
+                    f"pr36-r3-l4-{name[:7]}", self._CARRIER_AGENT % {"records": records},
+                    delivery_mode="post_ready_delivery", completion=completion, sidecar=False)
+                live_result = PR36F003AdoptedSuccessSubsetTests._pty_turn(self, session, lambda sid: "Continue the task.")
+                self.assertGreater(int(session._settlement_baseline or 0), 0)
+                self.assertNotIn(b'"thread.started"', self._fenced(session)[2])
+                self.assertEqual(self._verdict(live_result), ("COMPLETED", None), live_result)
+                adopted, adopted_result = self._adopted(session)
+                self._assert_withheld(session, live_result, adopted, adopted_result)
+
+    # ---- L-8: the sole-pre-delivery completion on the real path (REVIEW_BUGFIX F-001 / F-002)
+    def test_l8_a_sole_completion_emitted_before_the_prompt_never_settles_adopted_only(self) -> None:
+        """`post_ready_delivery + session_field`: readiness, a BOUND success, THEN the prompt
+        read, exit 0 -- the i1 residual measurement, now asserted.  Live: no candidate in
+        [baseline, N) -> not COMPLETED (`no_completion_record`).  Adopted: the sole record is
+        inside [0, N) and binds -- 37b3f58 settled COMPLETED (RED); now LOST
+        `adopted_baseline_unknown` by name."""
+        session = self._session("pr36-r3-l8", self._PRE_DELIVERY_AGENT % {"records": _record(False)})
+        live_result = PR36F003AdoptedSuccessSubsetTests._pty_turn(self, session, lambda sid: "Continue the task.")
+        baseline, n, fenced = self._fenced(session)
+        self.assertGreater(baseline, 0)
+        self.assertNotIn(b'"result"', fenced, "the sole completion is not pre-baseline")
+        self.assertIn(b'"result"', session.capture.raw()[:baseline])
+        self.assertNotEqual(live_result["state"], "COMPLETED", live_result)
+        self.assertEqual((live_result.get("verdict") or {}).get("reason"), "no_completion_record", live_result)
+        adopted, adopted_result = self._adopted(session)
+        print(f"\nL-8: live {self._verdict(live_result)} range [{baseline},{n}) / adopted {self._verdict(adopted_result)} range [0,{n})")
+        self._assert_withheld(session, live_result, adopted, adopted_result)
+
+    def test_l8_a_pre_delivery_completion_followed_by_a_refusal_or_a_second_completion_is_dominated_on_both_sides(self) -> None:
+        """The other pre-delivery variants on the real path: completion BEFORE the prompt then
+        a refusal after it -> FAILED `refusal_in_boundary` on both sides (R1 dominates the
+        withheld success); completion before then a SECOND completion after -> live COMPLETED
+        (one candidate in its range), adopted LOST `provenance_ambiguous` (two candidates in
+        [0, N)) -- never `adopted_baseline_unknown`, which only ever replaces a success."""
+        agent = self._PRE_DELIVERY_AGENT.replace("IFS= read -r PROMPT\n", "IFS= read -r PROMPT\n%(after)s")
+        for name, after, live_expect, adopted_expect in (
+                # live sees ONLY the refusing record (the sole error-field refusal leg,
+                # `error_field_set`); adopted sees success + refusal -> R1 `refusal_in_boundary`
+                ("refusal_after", _record(True), ("FAILED", "error_field_set"), ("FAILED", REFUSAL_IN_BOUNDARY)),
+                ("second_completion_after", _record(False), ("COMPLETED", None), ("LOST", PROVENANCE_AMBIGUOUS))):
+            with self.subTest(case=name):
+                session = self._session(f"pr36-r3-l8-{name[:6]}", agent % {"records": _record(False), "after": after})
+                live_result = PR36F003AdoptedSuccessSubsetTests._pty_turn(self, session, lambda sid: "Continue the task.")
+                self.assertEqual(self._verdict(live_result), live_expect, live_result)
+                adopted, adopted_result = self._adopted(session)
+                self.assertEqual(self._verdict(adopted_result), adopted_expect, adopted_result)
+                _assert_not_wider(self, session, live_result, adopted, adopted_result)
+
+    # ---- L-9: the production recovery path settles the C2 outcome by name --------------------
+    def test_l9_the_production_collect_in_flight_recovery_settles_adopted_baseline_unknown(self) -> None:
+        """`StandaloneAdapter._collect_in_flight` -> `StandaloneRuntime.adopt_session` ->
+        `StandaloneSession.collect()` over a `post_ready_delivery` dispatch whose live
+        supervisor settled COMPLETED: `collect()` raises the LOST `adopted_baseline_unknown`,
+        which the adapter turns into the TYPED FAILED settlement (`settle_failed`: the
+        AGENT_SETTLED event carries `result.status == BLOCKED` with
+        `standalone_failure.reason == adopted_baseline_unknown`, and the fenced
+        SETTLEMENT_OBSERVED row the adapter reads back is state FAILED with that verdict
+        reason) -- never a COMPLETED settlement.  The same recovery over a
+        `launch_with_prompt` dispatch settles COMPLETED (unchanged)."""
+        from scripts.deterministic_workflow.standalone_adapter import StandaloneAdapter
+        for mode, expect in (("post_ready_delivery", ("FAILED", ADOPTED_BASELINE_UNKNOWN)),
+                             ("launch_with_prompt", ("COMPLETED", None))):
+            with self.subTest(delivery_mode=mode):
+                run_id = f"pr36-r3-l9-{mode[:5]}"
+                if mode == "post_ready_delivery":
+                    live = self._session(run_id, _NOECHO_AGENT % {"records": _record(False)})
+                    live_result = PR36F003AdoptedSuccessSubsetTests._pty_turn(self, live, lambda sid: "Continue the task.")
+                else:
+                    live = self._session(run_id, _ARGV_AGENT % {"records": _record(False)}, delivery_mode="launch_with_prompt")
+                    self._argv_turn(live, "Continue the task.")
+                    live_result = live.await_completion()
+                self.assertEqual(live_result["state"], "COMPLETED", live_result)
+                intent = dict(live.intent, command_id="c", payload_digest="0" * 64)
+                runtime = rt.StandaloneRuntime(artifact_base=live.artifact_base, run_id=live.run_id,
+                                               profile=live.profile,
+                                               journal=journal_mod.ExecutionJournal(live.artifact_base, live.run_id))
+                adapter = StandaloneAdapter(runtime, settlement_journal=runtime.journal,
+                                            artifact_base=live.artifact_base, run_id=live.run_id)
+                event = adapter._collect_in_flight(intent, live.fence)
+                self.assertIsNotNone(event, "the production recovery settled nothing")
+                rows = [r for r in runtime.journal.rows_for(live.intent_id)
+                        if r.get("kind") == "SETTLEMENT_OBSERVED" and r.get("reported_by") == live.fence
+                        and (r.get("source_vocabulary") or {}).get("event", {}).get("event_id") == event.get("event_id")]
+                self.assertEqual(len(rows), 1, "the adapter's fenced settlement row is missing or duplicated")
+                verdict = (rows[0].get("source_vocabulary") or {}).get("completion_verdict") or {}
+                if expect[0] == "FAILED":
+                    self.assertEqual((event.get("result") or {}).get("status"), "BLOCKED", event)
+                    self.assertEqual(((event.get("result") or {}).get("standalone_failure") or {}).get("reason"),
+                                     ADOPTED_BASELINE_UNKNOWN, event)
+                    self.assertEqual((rows[0].get("state"), rows[0].get("outcome")), ("FAILED", "failed"), rows[0])
+                    self.assertEqual(verdict.get("reason"), expect[1], verdict)
+                    self.assertEqual(verdict.get("stage"), "lost", verdict)
+                    withheld = [r for r in runtime.journal.rows_for(live.intent_id)
+                                if (r.get("source_vocabulary") or {}).get("provenance_outcome") == ADOPTED_BASELINE_UNKNOWN]
+                    self.assertTrue(withheld, "the C2 outcome was not journalled by name on the recovery path")
+                else:
+                    self.assertNotIn("standalone_failure", event.get("result") or {}, event)
+                    self.assertEqual((rows[0].get("state"), rows[0].get("outcome")), ("COMPLETED", "succeeded"), rows[0])
+
+
+def _r3_lines(*, ok: bool) -> str:
+    """A `result` record WITHOUT any binding field (the sidecar carrier shape)."""
+    return 'printf \'{"type":"result","is_error":%s}\\n\'\n' % ("false" if ok else "true")
 
 
 if __name__ == "__main__":

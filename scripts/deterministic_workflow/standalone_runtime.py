@@ -1629,7 +1629,8 @@ class StandaloneSession:
         if provenance in (capture_mod.OUTCOME_PROVENANCE_AMBIGUOUS,
                           capture_mod.OUTCOME_PROVENANCE_UNBOUND,
                           capture_mod.OUTCOME_RECORD_FRAMING_AMBIGUOUS,
-                          capture_mod.OUTCOME_RECORD_SCAN_INCOMPLETE):
+                          capture_mod.OUTCOME_RECORD_SCAN_INCOMPLETE,
+                          capture_mod.OUTCOME_ADOPTED_BASELINE_UNKNOWN):
             disposition = lifecycle.resolve_unknown("os48_named", lost_reason=provenance)
             self._journal(kind="EVENT", derived_from="capture", event="evidence_unreadable",
                           state=self.state,
@@ -1637,6 +1638,8 @@ class StandaloneSession:
                                       "candidates": (evidence.get("source_vocabulary") or {}).get("candidates"),
                                       # i8 F-015: the bound an incomplete framing scan hit
                                       "scan": (evidence.get("source_vocabulary") or {}).get("scan"),
+                                      # USER DECISION C2: the withheld adopted post_ready success
+                                      "adoption": (evidence.get("source_vocabulary") or {}).get("adoption"),
                                       "detail": "the completion record's provenance is not "
                                                 "bound to this dispatch's emitter subtree"})
             return {"state": "LOST", "evidence": evidence,
@@ -3992,6 +3995,11 @@ class StandaloneSession:
                     "delivery_events": len(events),
                     "echo": str((selection.get("echo") or {}).get("state") or "no_delivery"),
                     "echo_reason": str((selection.get("echo") or {}).get("reason") or "")}
+                # USER DECISION C2 (run_11b4061df84d): the one place every adopted settlement
+                # passes (`await_completion` / `collect` / `_collect_in_flight` all reach this
+                # method) -- an adopted `post_ready_delivery` success is withheld by name.
+                selection = withhold_adopted_post_ready_success(
+                    selection, adopted=self.adopted, delivery_mode=self.profile.delivery_mode)
             except MemoryError:
                 # REVIEW_IMPLEMENTATION_iteration2 F-017: the reader could not EXAMINE the fenced
                 # range for want of memory -- in the parser (already classified inside
@@ -4139,6 +4147,52 @@ class StandaloneRuntime:
         return journal_mod.rediscover(self.run_id, self.artifact_base,
                                       runtime_state=self.runtime_state,
                                       intent_ids=intent_ids)
+
+
+def withhold_adopted_post_ready_success(selection: Mapping[str, Any], *, adopted: bool,
+                                        delivery_mode: str) -> dict[str, Any]:
+    """USER DECISION C2 (run_11b4061df84d, USER_DECISION_C2.md; PR #36 review F-001).
+
+    An ADOPTED session of a ``post_ready_delivery`` dispatch examines the full fenced prefix
+    ``[0, N)`` because no trustworthy settlement baseline can be restored: the live one lived
+    in the crashed supervisor's memory (`send()` read `capture.size` at the prompt write) and
+    the journal's copy is unkeyed and never authority (run_d6391487ff44).  Nothing in the
+    fenced bytes marks the delivery instant, so a sole bound completion record emitted BEFORE
+    the prompt is indistinguishable from one emitted after it -- the range growth that can
+    only REJECT under R1 / R2 / framing / scan could ESTABLISH a success here.
+
+    Rule, baseline-independent and consulting no journal value: every refusal / reader-failure
+    outcome the selector already produced is preserved (`refusal_in_boundary`, the sole
+    error-field refusal, `provenance_ambiguous`, `provenance_unbound`,
+    `record_framing_ambiguous`, `record_scan_incomplete` -- each stricter-or-equal to live),
+    and a selection that would otherwise carry a RECORD to the verdict -- ``outcome is None``
+    with no refusal: a bound record, `single_record_optin`, or the legacy undeclared record --
+    becomes the NAMED LOST outcome `adopted_baseline_unknown` with the record withheld (no record
+    at all stays FAILED `no_completion_record`, already stricter-or-equal to live).  So
+    an adopted ``post_ready_delivery`` dispatch can never settle COMPLETED, while
+    ``launch_with_prompt`` (baseline 0: live and adopted examine the same range; both shipping
+    profiles) and every LIVE settlement are untouched.  Pure, so the invariant locks apply the
+    very same function to the selector's output.
+    """
+    out = dict(selection)
+    if not adopted or delivery_mode != "post_ready_delivery":
+        return out
+    if out.get("outcome") is not None or out.get("refusal") is not None:
+        return out
+    withheld = out.get("record")
+    if withheld is None:
+        # no record reached the verdict at all: FAILED `no_completion_record`, already
+        # stricter-or-equal to live -- there is no success to withhold
+        return out
+    out.update({
+        "record": None, "outcome": capture_mod.OUTCOME_ADOPTED_BASELINE_UNKNOWN,
+        "adoption": {"rule": capture_mod.OUTCOME_ADOPTED_BASELINE_UNKNOWN,
+                     "delivery_mode": delivery_mode,
+                     "withheld_record_type": (withheld.get("type") if isinstance(withheld, Mapping) else None),
+                     "detail": "an adopted post_ready_delivery settlement cannot restore the "
+                               "live baseline; a success over [0, N) is withheld by name "
+                               "(USER DECISION C2)"}})
+    return out
 
 
 def _pid_present(pid: int) -> bool:

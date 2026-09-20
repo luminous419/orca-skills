@@ -138,11 +138,12 @@ class L01LostTailTests(_RoomCase):
 # L-02 / L-02b -- settlement over [baseline, N): R1 dominance, R2 exactly one, R3 binding
 # =====================================================================================
 class L02SettlementRulesTests(unittest.TestCase):
-    def _driver(self, mode: str = "session_field", field: str = "session_id", carrier: str = ""):
+    def _driver(self, mode: str = "session_field", field: str = "session_id", carrier: str = "",
+                delivery_mode: str = "post_ready_delivery"):
         room = Room()
         self.addCleanup(room.close)
         profile = sh_profile(str(room.path), binding_mode=mode, binding_field=field,
-                             carrier_type=carrier)
+                             carrier_type=carrier, delivery_mode=delivery_mode)
         return drivers.driver_for(profile)
 
     def _select(self, driver, records: list[dict], **kw) -> dict:
@@ -222,8 +223,20 @@ class L02SettlementRulesTests(unittest.TestCase):
     def test_codex_sidecar_binding_needs_the_sidecar_and_the_thread(self) -> None:
         """L-02b: `sidecar_file` -- the runtime-minted sidecar must be present AND the thread
         id on the record or on the most recent carrier before it must equal the bound one;
-        different / empty / absent thread or a missing sidecar ⇒ `provenance_unbound`."""
-        driver = self._driver(mode="sidecar_file", field="thread_id", carrier="thread.started")
+        different / empty / absent thread or a missing sidecar ⇒ `provenance_unbound`.
+
+        run_11b4061df84d: the i1 correction refused this fixture's `post_ready_delivery` +
+        `sidecar_file` + carrier shape at construction; under USER_DECISION_C2.md that refusal
+        is REMOVED (an adopted post_ready_delivery settlement is never COMPLETED, so the
+        adopted-only success that motivated it cannot arise; the live profile surface is not
+        forbidden without a design justification) and the lock is back on its original
+        fixture, under BOTH delivery modes: the selector contract is delivery-mode-independent."""
+        for delivery_mode in ("post_ready_delivery", "launch_with_prompt"):
+            with self.subTest(delivery_mode=delivery_mode):
+                self._assert_sidecar_binding(self._driver(mode="sidecar_file", field="thread_id",
+                                                          carrier="thread.started", delivery_mode=delivery_mode))
+
+    def _assert_sidecar_binding(self, driver) -> None:
         bound = [{"type": "thread.started", "thread_id": "T1"},
                  {"type": "result", "is_error": False}]
         sel = self._select(driver, bound, bound_value="T1", sidecar_present=True)

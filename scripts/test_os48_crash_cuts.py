@@ -109,6 +109,16 @@ class SupervisorDeathCuts(_CutCase):
         _same_proof(self, info, drained)
         self.assertEqual(read_release(info)["outcome"], capture_mod.EVIDENCE_FINAL)
         self.assertEqual(settle(s)["state"], "COMPLETED")
+        # C4-C2 (USER_DECISION_C2.md, run_11b4061df84d): the SAME crashed dispatch adopted under a
+        # `post_ready_delivery` profile binds the same proof but its settlement is never
+        # COMPLETED -- the named LOST `adopted_baseline_unknown` (the fixture above declares
+        # `launch_with_prompt`, which C2 leaves untouched: see os48_cut_harness.CUT_DELIVERY_MODE).
+        s2 = successor(self.room, info, delivery_mode="post_ready_delivery")
+        _same_proof(self, info, s2.drain_after_exit(budget_ms=3000))
+        settled = settle(s2)
+        self.assertEqual((settled["state"], settled["completion"].get("lost_reason")),
+                         ("LOST", "adopted_baseline_unknown"), settled["completion"])
+        self.assertIsNone(settled["event"])
 
     def test_c5_supervisor_killed_after_claim_before_fence_the_watcher_supersedes_g1(self) -> None:
         """C5: S claimed g1 and is SIGKILLed paused before `write_capture_fence`.  W's witness is
