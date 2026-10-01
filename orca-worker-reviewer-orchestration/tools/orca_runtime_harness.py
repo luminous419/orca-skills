@@ -41,6 +41,20 @@ try:
         strip_task_context,
     )
     from scripts import clarification_protocol, decision_gate, decision_policy, run_logging
+    from scripts.agent_profile import (
+        MODEL_EVIDENCE_MISMATCH,
+        MODEL_EVIDENCE_NONE,
+        MODEL_EVIDENCE_REQUESTED,
+        MODEL_EVIDENCE_STALE,
+        MODEL_EVIDENCE_STATES,
+        MODEL_EVIDENCE_UNVERIFIABLE,
+        MODEL_EVIDENCE_VERIFIED,
+        EVENT_AGENT_IDENTITY_BOUND,
+        MODEL_SELECTION_VERIFIED_CAPABILITY,
+        MODEL_TOKEN_PATTERN,
+        REASON_WORKER_REVIEWER_MUST_DIFFER,
+        effective_identity_independent,
+    )
     from scripts.deterministic_workflow import quiescence, turn_boundary
     from scripts.workflow_contract import load_workflow_output_contract
 except ModuleNotFoundError:  # direct `python3 scripts/...` execution
@@ -69,6 +83,20 @@ except ModuleNotFoundError:  # direct `python3 scripts/...` execution
     import decision_policy
     import run_logging
     import clarification_protocol
+    from agent_profile import (
+        MODEL_EVIDENCE_MISMATCH,
+        MODEL_EVIDENCE_NONE,
+        MODEL_EVIDENCE_REQUESTED,
+        MODEL_EVIDENCE_STALE,
+        MODEL_EVIDENCE_STATES,
+        MODEL_EVIDENCE_UNVERIFIABLE,
+        MODEL_EVIDENCE_VERIFIED,
+        EVENT_AGENT_IDENTITY_BOUND,
+        MODEL_SELECTION_VERIFIED_CAPABILITY,
+        MODEL_TOKEN_PATTERN,
+        REASON_WORKER_REVIEWER_MUST_DIFFER,
+        effective_identity_independent,
+    )
     from deterministic_workflow import quiescence, turn_boundary
     from workflow_contract import load_workflow_output_contract
 
@@ -592,6 +620,148 @@ def _flag_value(args: list[str], flag: str) -> str | None:
     return None
 
 
+# ---- OS-49: the model-selection seam's two closed vocabularies ------------------------
+# Both are snake_case `<axis>_<verdict>`, the naming shape
+# `standalone_lifecycle.CAPABILITY_FAILURE_REASONS` and `standalone_preflight.REASONS`
+# already use.  They are ORCHESTRATION-ONLY, because only this runtime has a
+# pre-delivery barrier; the SCREAMING_SNAKE policy codes live in `agent_profile` and are
+# imported above rather than restated here, so the two layers cannot drift.
+
+#: How a model selection may be REQUESTED.  CLOSED, and deliberately ONE member.
+#: `launch_argv` is NOT a member: a model-pinned wrapper's argv was composed before this
+#: session existed, so it is not a request attributable to THIS attempt -- it is evidence
+#: of what was requested of the operating system, never of what a provider resolved.  An
+#: interactive `/model` member cannot be added without the syntax and acknowledgement
+#: semantics this repository has not observed and refuses to invent.  So this tuple is a
+#: second, independent mechanism keeping the real Claude runtime fail-closed: no real
+#: adapter can name a member, and a `request_method` outside the set is
+#: `model_selection_unsupported`.  OS-14 adding a member is the visible, reviewable act
+#: that lifts the refusal.
+MODEL_SELECTION_REQUEST_METHODS = ("driver_select_and_verify",)
+
+#: In LIFECYCLE ORDER, so the tuple itself documents that the request precedes the
+#: observation.  Every member is a refusal BEFORE delivery; none is repaired by retrying,
+#: by falling back to a weaker observation, or by downgrading to a warning.
+MODEL_SELECTION_UNSUPPORTED = "model_selection_unsupported"
+MODEL_SELECTION_REQUEST_ABSENT = "model_selection_request_absent"
+MODEL_SELECTION_REQUEST_STALE = "model_selection_request_stale"
+MODEL_SELECTION_UNVERIFIED = "model_selection_unverified"
+MODEL_SELECTION_MISMATCH = "model_selection_mismatch"
+MODEL_SELECTION_AMBIGUOUS = "model_selection_ambiguous"
+MODEL_SELECTION_PAIR_UNADMITTED = "model_selection_pair_unadmitted"
+MODEL_SELECTION_FAILURE_REASONS = (
+    # ---- the REQUEST leg ----
+    MODEL_SELECTION_UNSUPPORTED,     # a selection cannot be requested at all: no driver,
+                                     # or no supported request method
+    MODEL_SELECTION_REQUEST_ABSENT,  # a result with no attested request -- the
+                                     # pre-existing / default model-state case
+    MODEL_SELECTION_REQUEST_STALE,   # a request attested for another attempt or key, or
+                                     # ordinals not drawn from this ticket, not exactly
+                                     # two, or not in order
+    # ---- the OBSERVATION leg ----
+    MODEL_SELECTION_UNVERIFIED,      # requested, never positively observed
+    MODEL_SELECTION_MISMATCH,        # requested != resolved
+    MODEL_SELECTION_AMBIGUOUS,       # two contradictory resolved values for one identity
+    # ---- the PAIR leg: positive Worker/Reviewer independence, before any delivery ----
+    MODEL_SELECTION_PAIR_UNADMITTED, # a same-command pair whose COUNTERPART has no
+                                     # verified model evidence yet, so independence is
+                                     # not positively established and NOTHING may be
+                                     # delivered for either role
+)
+
+#: The reuse gate's model condition names, beside `agent_command_mismatch` and
+#: `observation_not_for_this_dispatch`.
+MODEL_IDENTITY_MISMATCH = "model_identity_mismatch"
+MODEL_IDENTITY_UNVERIFIED = "model_identity_unverified"
+MODEL_IDENTITY_STALE = "model_identity_stale"
+MODEL_CAPABILITY_UNSUPPORTED = "model_capability_unsupported"
+MODEL_IDENTITY_FAILURE_REASONS = (
+    MODEL_IDENTITY_MISMATCH,
+    MODEL_IDENTITY_UNVERIFIED,
+    MODEL_IDENTITY_STALE,
+    MODEL_CAPABILITY_UNSUPPORTED,
+)
+
+
+@dataclass(frozen=True)
+class ModelSelectionTicket:
+    """ONE model-selection attempt.  Minted by the BARRIER -- never by a caller, never by
+    a driver -- and revoked the moment the driver's single call returns.
+
+    `token` and `stamp` are the two things that make the request leg unforgeable and
+    non-carryable, and they are deliberately different mechanisms:
+
+    * `token` is the attempt's IDENTITY: the barrier's own six-part key plus a run-scoped
+      ordinal the harness issues exactly once and never reissues.  No previous attempt, no
+      other session, no other `(role, phase)` and no pre-existing model state can hold it,
+      because it did not exist until this barrier ran.
+    * `stamp` is the attempt's ORDERING: a bound closure over the harness's private
+      monotone counter.  A driver cannot obtain a valid ordinal without CALLING it, and the
+      barrier knows the counter's value before and after the call -- so a fabricated
+      ordinal, a reused one, a missing one and an extra one are all detectable
+      arithmetically, by the harness, with no provider knowledge and no trust in the
+      driver's own account of what it did.
+
+    Why ordinals and not a timestamp: a clock reading a driver prints itself is not
+    ordering evidence, and this package already refuses self-reported evidence of that
+    shape.  A counter the driver does not OWN is different in kind -- the only way to get
+    the next ordinal is to ask the harness, and the harness counts how often it was asked.
+    """
+
+    run_id: str
+    task_id: str
+    terminal: str
+    role: str
+    phase: str
+    attempt: int
+    command: str
+    requested_model: str
+    #: f"{run}:{task}:{terminal}:{role}:{phase}:{attempt}:{ordinal}"
+    token: str
+    #: Single-use window.  Raises once the barrier revokes the ticket.
+    stamp: Callable[[], int]
+
+
+@dataclass(frozen=True)
+class ModelEvidence:
+    """One model-selection ATTEMPT: what was requested, through what, when -- and what was
+    THEN observed.
+
+    TWO LEGS, each separately attested, because a verdict about only the second one is
+    satisfiable by reading a model state nothing in this attempt asked for.  Whatever model
+    a fresh session happens to be on before anything requested a change is a STATE, not the
+    RESULT of a selection.
+
+    Defined HERE, beside `ReuseObservation`, rather than in `deterministic_workflow`: this
+    module is the runtime and takes no engine-package import.  The SCREAMING_SNAKE policy
+    vocabulary and the six model-evidence states are imported from `agent_profile`, which
+    owns them, so there is exactly one spelling of each.
+    """
+
+    state: str = ""                    # one of agent_profile.MODEL_EVIDENCE_STATES
+    requested_model: str = ""
+    resolved_model: str = ""
+    # ---- leg 1: the REQUEST, attested -------------------------------------------------
+    selection_token: str = ""          # MUST equal the ticket's token, exactly
+    request_method: str = ""           # MUST be in MODEL_SELECTION_REQUEST_METHODS
+    request_stamp: int = 0             # MUST be the ticket's FIRST drawn ordinal
+    # ---- leg 2: the OBSERVATION -------------------------------------------------------
+    observation_method: str = ""       # which declared locator produced the resolved value
+    observe_stamp: int = 0             # MUST be the SECOND drawn ordinal, > request_stamp
+    capability: str = ""               # MUST be MODEL_SELECTION_VERIFIED_CAPABILITY
+    observed_at_run: str = ""
+    observed_at_task: str = ""
+    observed_at_terminal: str = ""
+    observed_at_role: str = ""
+    observed_at_phase: str = ""
+    observed_at_attempt: int = 0
+
+    @property
+    def request_evidence(self) -> str:
+        """The one-cell rendering the ledger and the durable provenance row carry."""
+        return f"{self.selection_token}:{self.request_stamp}->{self.observe_stamp}"
+
+
 @dataclass(frozen=True)
 class ReuseObservation:
     """One fresh, read-only pre-reuse look at a terminal, taken for ONE dispatch.
@@ -986,6 +1156,7 @@ class OrcaRuntimeHarness:
         risk: str = "high",
         risk_source: str = "default",
         agent_routing: Any | None = None,
+        model_driver: Any | None = None,
         human_approval_port: Any | None = None,
         clarification_inputs: dict[str, dict[str, object]] | None = None,
     ) -> None:
@@ -1011,6 +1182,38 @@ class OrcaRuntimeHarness:
         # None is the default so a scenario that selects no profile dispatches the
         # same specs and records the same ledger values as before this field existed.
         self.agent_routing = agent_routing
+        # ---- OS-49. The ONLY thing that can make a declared model routable here.
+        # `None` is the default and means NO CAPABILITY: with no driver a selection
+        # cannot even be REQUESTED, so a declared model is refused before delivery
+        # with `model_selection_unsupported`. A driver must implement ONE method,
+        # `select_and_verify(ticket) -> ModelEvidence`, and must attest BOTH ordered
+        # legs of the lifecycle for the attempt the ticket names. Declaring no model
+        # anywhere means the driver is never consulted and this harness behaves
+        # byte-identically to before OS-49.
+        self.model_driver = model_driver
+        # (phase, role) -> the ModelEvidence the barrier ACCEPTED. Written only on a
+        # successful barrier, never on a refusal, so it can never record a value that
+        # did not earn a delivery. This is what makes the resolved-value independence
+        # re-check and the non-drift refusal possible: a Reviewer's barrier reads its
+        # Worker counterpart's accepted identity, and a later round that resolves to a
+        # DIFFERENT model for the same (phase, role) is refused rather than logged.
+        self._model_identity: dict[tuple[str, str], ModelEvidence] = {}
+        # The harness-private monotone ordinal counter. A driver cannot advance it
+        # except by calling the bound `stamp()` of a ticket this harness minted, and
+        # the barrier reads it before and after the driver's one call -- which is the
+        # whole of the ordering proof, and it is integer arithmetic over values this
+        # harness itself issued.
+        self._model_selection_seq: int = 0
+        # Tokens whose `stamp()` window is still open. A ticket is revoked in a
+        # `finally:`, so a raising driver cannot leave a live stamp behind, and a
+        # driver that keeps the ticket and stamps later gets an error rather than a
+        # usable ordinal from the NEXT attempt's window.
+        self._model_selection_open_tokens: set[str] = set()
+        # terminal handle -> the accepted evidence awaiting rebinding to a dispatch id.
+        # The Dispatch does not exist yet when the barrier runs on rung 3 (the very call
+        # that delivers creates it), so the evidence is keyed on the handle here and
+        # rebound by _attach_terminal() the moment the id is known.
+        self._model_pending_evidence: dict[str, ModelEvidence] = {}
         # The tree the run's quality profile is read from, and the ONE resolution
         # every spec this harness renders is built from. start_run() re-reads it once
         # at the run boundary and then nothing re-reads it until the next run: a
@@ -1175,11 +1378,19 @@ class OrcaRuntimeHarness:
         owner_dispatch_id: str | None = None,
         created_by: str = "",
         agent_command: str = "",
+        requested_model: str = "",
+        model_state: str = "",
     ) -> dict[str, Any]:
         """Create the ledger row for a terminal at creation/adoption time.
 
         role and origin are the only axis (c2) evidence that exists, and the runtime
         keeps neither, so they are recorded here or lost forever.
+
+        OS-49 adds six model fields under the SAME "never overwrite a recorded value
+        blank" rule the existing evidence follows. Only `requested_model` and
+        `model_state` can be supplied at creation -- at creation nothing has been
+        requested and nothing resolved, so the other four are written later, by the
+        barrier and by _attach_terminal(), and are deliberately not parameters.
         """
         if role not in TERMINAL_ROLE_CLASSES:
             raise OrcaRuntimeError(f"unknown terminal role: {role}")
@@ -1205,6 +1416,20 @@ class OrcaRuntimeHarness:
                 "retain_reason": "",
                 "terminal_effect": "",
                 "owner_dispatch_ids": [owner_dispatch_id] if owner_dispatch_id else [],
+                # ---- OS-49 model identity evidence -------------------------
+                # What the materialized routing DECLARED for this role.
+                "requested_model": requested_model,
+                # Written by GATE B only, never at creation: a resolved model is the
+                # result of a selection this session was asked to make, and nothing
+                # has asked yet.
+                "resolved_model": "",
+                "model_state": model_state or MODEL_EVIDENCE_NONE,
+                # The REQUEST leg, written by _attach_terminal() from the evidence the
+                # barrier ACCEPTED. A `verified` row with these blank is a
+                # contradiction, and reuse condition 9 refuses it as such.
+                "model_request_method": "",
+                "model_request_evidence": "",
+                "model_observed_at_dispatch": "",
             }
         else:  # ownership transfer, never a role promotion (reuse chain)
             row["owner_dispatch_id"] = owner_dispatch_id or row["owner_dispatch_id"]
@@ -1212,6 +1437,22 @@ class OrcaRuntimeHarness:
                 row["created_by"] = created_by
             if agent_command:                 # never overwrite a recorded value blank
                 row["agent_command"] = agent_command
+            if requested_model:               # same rule, same reason
+                row["requested_model"] = requested_model
+            if model_state:
+                row["model_state"] = model_state
+            # A row created before OS-49 existed in this process (a test that built one
+            # by hand, a recovered shape) is brought up to the full key set WITHOUT
+            # overwriting anything it already carries.
+            for key, default in (
+                ("requested_model", ""),
+                ("resolved_model", ""),
+                ("model_state", MODEL_EVIDENCE_NONE),
+                ("model_request_method", ""),
+                ("model_request_evidence", ""),
+                ("model_observed_at_dispatch", ""),
+            ):
+                row.setdefault(key, default)
             if owner_dispatch_id and (
                 not row["owner_dispatch_ids"]
                 or row["owner_dispatch_ids"][-1] != owner_dispatch_id
@@ -1222,6 +1463,28 @@ class OrcaRuntimeHarness:
         )
         row["action"] = "retained"
         return row
+
+    def _rebind_model_evidence(self, handle: str, dispatch_id: str) -> None:
+        """OS-49. Rebind the barrier's accepted evidence to the Dispatch id.
+
+        The key the barrier verifies against is
+        `(run, task, handle, role, phase, attempt)` and NOT `dispatch_id`, because on
+        rung 3 the Dispatch is created by the very call that delivers -- so the id does
+        not exist yet when the evidence has to be judged. The moment it does exist, the
+        evidence is rebound here, together with its REQUEST leg: those three cells are
+        what reuse condition 9's staleness and contradiction rows read, and what the
+        durable provenance row carries. The ticket object itself is already revoked and
+        is never stored.
+        """
+        evidence = self._model_pending_evidence.pop(handle, None)
+        row = self._terminals.get(handle)
+        if evidence is None or row is None:
+            return
+        row["resolved_model"] = evidence.resolved_model
+        row["model_state"] = evidence.state
+        row["model_request_method"] = evidence.request_method
+        row["model_request_evidence"] = evidence.request_evidence
+        row["model_observed_at_dispatch"] = dispatch_id
 
     def _attach_terminal(
         self, handle: str, dispatch_id: str, created_by: str
@@ -1245,14 +1508,17 @@ class OrcaRuntimeHarness:
             # the demotion is conservativeness 0 -> 1 here, and settle_attempt
             # performs the only allowed upward transition once axis (a) has confirmed.
             self.demote_or_promote_role(handle, "active_worker", settled=False)
+            self._rebind_model_evidence(handle, dispatch_id)
             return row
-        return self.register_terminal(
+        row = self.register_terminal(
             handle,
             role="external_or_adopted",
             origin="adopted",
             owner_dispatch_id=dispatch_id,
             created_by=created_by,
         )
+        self._rebind_model_evidence(handle, dispatch_id)
+        return row
 
     def demote_or_promote_role(
         self, handle: str, new_role: str, *, settled: bool
@@ -1426,10 +1692,18 @@ class OrcaRuntimeHarness:
         *,
         role: str = "",
         agent_command: str = "",
+        requested_model: str = "",
         dispatch_id: str = "",
         observation: "ReuseObservation | None" = None,
     ) -> tuple[bool, tuple[str, ...]]:
-        """The eight-condition reuse gate. Returns (eligible, failure names).
+        """The NINE-condition reuse gate. Returns (eligible, failure names).
+
+        OS-49 APPENDED condition 9 (`compatible_model_identity`). It did not replace or
+        relax any of the eight that were here, and it can only ever REFUSE a reuse that
+        would otherwise have been allowed -- so no ownership, finality or provenance
+        protection is weakened, and nothing that was refused before becomes allowed.
+        Composition, exactly: existing eligibility AND compatible command AND positively
+        compatible model identity.
 
         Pure with respect to the runtime: issues ZERO Orca commands and writes
         nothing. The fresh liveness look is an ARGUMENT, never something this method
@@ -1510,6 +1784,18 @@ class OrcaRuntimeHarness:
         if recovery:
             reasons.append(recovery)
 
+        # ---- 9. compatible model identity (OS-49) -----------------------------
+        # Evaluated the same never-short-circuit way as the eight above, so a negative
+        # test binds to exactly one name. Two keys, two checks, neither substituting for
+        # the other: THIS condition judges the PREVIOUS dispatch's recorded identity
+        # against the next request, while the pre-delivery barrier judges THIS dispatch's
+        # resolved model before it delivers.
+        reasons.extend(
+            self._model_identity_reuse_reasons(
+                row, requested_model=requested_model, dispatch_id=dispatch_id
+            )
+        )
+
         if reasons:
             # De-duplicated: lifecycle_recovery_state() answers
             # `previous_dispatch_not_finalized` for an absent settlement row, which is
@@ -1517,12 +1803,84 @@ class OrcaRuntimeHarness:
             return False, tuple(sorted(set(reasons)))
         return True, ()
 
+    def _model_identity_reuse_reasons(
+        self, row: dict[str, Any], *, requested_model: str, dispatch_id: str
+    ) -> tuple[str, ...]:
+        """Reuse condition 9, as a total function over the recorded row.
+
+        Row 1 of the truth table is the compatibility guarantee and it is the FIRST
+        branch: a chain with no model anywhere -- the previous dispatch recorded none and
+        the next dispatch requests none -- produces exactly the pre-OS-49 decision, with
+        no new name and nothing read. Everything after that branch requires a model to be
+        involved on at least one side.
+        """
+        recorded_state = str(row.get("model_state") or MODEL_EVIDENCE_NONE)
+        recorded_requested = str(row.get("requested_model") or "")
+        recorded_resolved = str(row.get("resolved_model") or "")
+        recorded_method = str(row.get("model_request_method") or "")
+        recorded_request_evidence = str(row.get("model_request_evidence") or "")
+        recorded_dispatch = str(row.get("model_observed_at_dispatch") or "")
+        no_model_recorded = (
+            recorded_state == MODEL_EVIDENCE_NONE
+            and not recorded_requested
+            and not recorded_resolved
+        )
+        if no_model_recorded and not requested_model:
+            return ()                       # row 1: today's decision, byte-identical
+
+        reasons: list[str] = []
+        # Row 9. No driver means THIS dispatch could not request a selection either, so
+        # there is no way to re-establish the identity the reuse would carry forward.
+        if self.model_driver is None:
+            reasons.append(MODEL_CAPABILITY_UNSUPPORTED)
+        # Row 8. An internally contradictory row is never a basis for reuse. A `verified`
+        # model with no record that anything REQUESTED it is exactly as contradictory as a
+        # `verified` model with no resolved value.
+        contradictory = (
+            (recorded_state == MODEL_EVIDENCE_VERIFIED and not recorded_resolved)
+            or (
+                recorded_state == MODEL_EVIDENCE_VERIFIED
+                and (not recorded_method or not recorded_request_evidence)
+            )
+            or (recorded_resolved and recorded_state != MODEL_EVIDENCE_VERIFIED)
+            or (
+                recorded_method
+                and recorded_method not in MODEL_SELECTION_REQUEST_METHODS
+            )
+        )
+        if contradictory:
+            reasons.append(MODEL_IDENTITY_STALE)
+        # Row 7. Evidence that was not observed for the dispatch being handed over is
+        # stale by construction. A DIFFERENT key from the barrier's: this one is about the
+        # PREVIOUS dispatch.
+        #
+        # Gated on the row actually CLAIMING evidence. When the previous dispatch recorded
+        # none at all, "its evidence is not for this dispatch" is vacuously true and would
+        # emit a second name for one fact -- and the fact is the other one: no verified
+        # model was ever recorded, i.e. `model_identity_unverified`. One fact, one name, as
+        # the eight pre-existing conditions already require.
+        elif (
+            (recorded_state != MODEL_EVIDENCE_NONE or recorded_resolved)
+            and recorded_dispatch != dispatch_id
+        ):
+            reasons.append(MODEL_IDENTITY_STALE)
+        # Rows 5 and 6. `unverified` is not `pass`: a previous identity that was never
+        # positively resolved proves nothing about the session's current model.
+        if recorded_state != MODEL_EVIDENCE_VERIFIED:
+            reasons.append(MODEL_IDENTITY_UNVERIFIED)
+        # Rows 3 and 4. A changed model is a changed agent, and declared -> undeclared is
+        # a change like any other.
+        elif recorded_requested != requested_model:
+            reasons.append(MODEL_IDENTITY_MISMATCH)
+        return tuple(reasons)
+
     def terminal_for_next_dispatch(
         self,
         handle: str = "",
         *,
         role: str = "",
         agent_command: str = "",
+        requested_model: str = "",
         dispatch_id: str = "",
     ) -> str | None:
         """The one place a reuse decision becomes the NEXT dispatch's `terminal=`.
@@ -1547,6 +1905,7 @@ class OrcaRuntimeHarness:
             handle,
             role=role,
             agent_command=agent_command,
+            requested_model=requested_model,
             dispatch_id=dispatch_id,
             observation=self.observe_for_reuse(
                 dispatch_id=dispatch_id, handle=handle
@@ -1562,6 +1921,7 @@ class OrcaRuntimeHarness:
             "dispatch_id": dispatch_id,
             "eligible": eligible,
             "reasons": list(reasons),
+            "requested_model": requested_model,
         }
         return handle if eligible else None
 
@@ -2192,6 +2552,13 @@ class OrcaRuntimeHarness:
         # reusing a session across that change would hand the next phase the wrong
         # agent while every other reuse condition still passed.
         agent_command = self.resolved_agent_command(role, phase) or shlex.join(command)
+        # OS-49. The MODEL this role is routed to, recorded as a SEPARATE ledger field.
+        # The string passed to `terminal create --command` below is UNCHANGED: a model is
+        # never concatenated into it. Doing so would make the model shell input AND would
+        # silently change the reuse gate's condition-2 key, so that one command's two
+        # models would look like two different executables to a gate that is supposed to
+        # judge them on a second axis.
+        requested_model = self.resolved_agent_model(role, phase)
         created = self.call(
             "terminal",
             "create",
@@ -2211,8 +2578,58 @@ class OrcaRuntimeHarness:
             if role.endswith("reviewer")
             else "phase_worker",
             agent_command=agent_command,  # W-20: the reuse gate's condition 2 evidence
+            requested_model=requested_model,   # OS-49: condition 9's declared half
+            model_state=(
+                MODEL_EVIDENCE_REQUESTED if requested_model else MODEL_EVIDENCE_NONE
+            ),
         )
         return handle
+
+    @staticmethod
+    def _barrier_phase(role: str, phase: str | None) -> str:
+        """The phase name the pre-delivery barrier keys this attempt to.
+
+        A Final Adversarial Review attempt carries no workflow phase, so it keys to the
+        reserved final-review slot -- which is also the slot its routing entry lives in.
+        Every other role keys to its own phase, and "" stays "" so the barrier's
+        fail-closed argument check can see a genuinely missing value.
+        """
+        if role.startswith("final"):
+            return phase or FINAL_REVIEW_PHASE
+        return phase or ""
+
+    @staticmethod
+    def _routing_key(role: str, phase: str = "") -> tuple[str, str]:
+        """The ONE role -> (phase, routing-role) mapping, factored out of one place.
+
+        OS-49 made this a correctness property rather than tidiness: a command and a
+        model read through two independent lookups could disagree, and the disagreement
+        would be invisible in the ledger and in the durable provenance row. Both
+        accessors below, and the barrier, go through this.
+
+        OS-49 iteration 2 (review F-001). The PHASE is part of the mapping, not just the
+        role spelling. A Final Adversarial Review is dispatched as role "reviewer" in
+        phase `final_review` -- the only spelling any production initiator produces, and
+        the one `_barrier_phase()` already maps onto the reserved slot -- so keying the
+        routing role off the role string alone sent that attempt to a ("final_review",
+        "reviewer") entry that does not exist. The lookup missed, the barrier returned at
+        `if not requested`, and the declared Final Reviewer model was never requested,
+        never verified and never recorded. `final_review` is a reviewer-only gate over a
+        whole run (task_context.FINAL_REVIEW_PHASE), so it has exactly ONE routing slot
+        and either spelling of the role resolves to it.
+
+        This widens the slot's REACHABILITY only. The Final Reviewer stays outside the
+        PAIR-admission rule, because `final_reviewer` has no counterpart entry to look
+        up -- which is a property of the role map in the barrier, not of this mapping.
+        """
+        if role.startswith("final") or phase == FINAL_REVIEW_PHASE:
+            return FINAL_REVIEW_PHASE, "final_reviewer"
+        return phase, ("reviewer" if role.endswith("reviewer") else "worker")
+
+    def _routing_entry_for(self, role: str, phase: str = "") -> Any | None:
+        if self.agent_routing is None:
+            return None
+        return self.agent_routing.for_role(*self._routing_key(role, phase))
 
     def resolved_agent_command(self, role: str, phase: str = "") -> str:
         """The resolved command for `role` in `phase`, or "" when there is no routing.
@@ -2221,16 +2638,22 @@ class OrcaRuntimeHarness:
         legacy answer, and every caller falls back to what it used before -- which is
         what keeps a scenario that selected no profile dispatching the same commands
         and recording the same ledger values as before this method existed.
+
+        Behaviour UNCHANGED by OS-49.
         """
-        if self.agent_routing is None:
-            return ""
-        if role.startswith("final"):
-            entry = self.agent_routing.for_role("final_review", "final_reviewer")
-        else:
-            entry = self.agent_routing.for_role(
-                phase, "reviewer" if role.endswith("reviewer") else "worker"
-            )
+        entry = self._routing_entry_for(role, phase)
         return entry.command if entry is not None else ""
+
+    def resolved_agent_model(self, role: str, phase: str = "") -> str:
+        """The resolved MODEL for `role` in `phase`, read from the SAME entry as the
+        command, or "" when none is declared.
+
+        "" is the legacy answer and the overwhelmingly common one: a v1 document, a
+        model-less v2 document and a profile-omitted run all produce it, and every
+        model-aware behaviour in this class is gated on a non-empty value.
+        """
+        entry = self._routing_entry_for(role, phase)
+        return entry.model if entry is not None else ""
 
     def wait_for_tui_idle(self, terminal: str) -> str:
         """Middle rung of the custom-command placement ladder (SKILL.md section 6).
@@ -2266,7 +2689,581 @@ class OrcaRuntimeHarness:
             row["tui_idle"] = state
         return state
 
-    def start_worker(self, task_id: str, terminal: str, spec: str) -> tuple[str, bool]:
+    # ---- OS-49 GATE B: the pre-delivery model-identity barrier ------------------------
+
+    def _mint_model_selection_ticket(
+        self,
+        *,
+        task_id: str,
+        terminal: str,
+        role: str,
+        phase: str,
+        attempt: int,
+        command: str,
+        requested_model: str,
+    ) -> tuple[ModelSelectionTicket, int]:
+        """Mint ONE single-use ticket and return it with the ordinal it was issued at.
+
+        The returned `t` is the counter's value AFTER minting, so a conforming driver's
+        two `stamp()` calls must yield exactly `t + 1` then `t + 2`, and the counter must
+        end at `t + 2`. That triple is the whole ordering proof.
+        """
+        self._model_selection_seq += 1
+        issued_at = self._model_selection_seq
+        token = ":".join(
+            (
+                self.run_id or "",
+                task_id,
+                terminal,
+                role,
+                phase,
+                str(attempt),
+                str(issued_at),
+            )
+        )
+        self._model_selection_open_tokens.add(token)
+
+        def stamp() -> int:
+            if token not in self._model_selection_open_tokens:
+                raise OrcaRuntimeError(
+                    "model-selection ticket is revoked: a stamp may only be drawn "
+                    "during the single select_and_verify() call the barrier minted it "
+                    f"for (token={token!r})"
+                )
+            self._model_selection_seq += 1
+            return self._model_selection_seq
+
+        ticket = ModelSelectionTicket(
+            run_id=self.run_id or "",
+            task_id=task_id,
+            terminal=terminal,
+            role=role,
+            phase=phase,
+            attempt=attempt,
+            command=command,
+            requested_model=requested_model,
+            token=token,
+            stamp=stamp,
+        )
+        return ticket, issued_at
+
+    def _revoke_model_selection_ticket(self, ticket: ModelSelectionTicket) -> None:
+        """Close the stamp window. Called in a `finally:`, so a raising driver cannot
+        leave a live stamp behind to spend inside the NEXT attempt's window."""
+        self._model_selection_open_tokens.discard(ticket.token)
+
+    def _model_refusal(
+        self,
+        reason: str,
+        *,
+        role: str,
+        phase: str,
+        attempt: int,
+        command: str,
+        requested_model: str,
+        evidence: "ModelEvidence | None" = None,
+        ticket: "ModelSelectionTicket | None" = None,
+        expected_window: tuple[int, int] | None = None,
+        drawn_to: int | None = None,
+        detail: str = "",
+    ) -> OrcaRuntimeError:
+        """The barrier's refusal, carrying the WHOLE diagnosis.
+
+        Shaped like the OS-41 acknowledgement gate's: a reader must be able to see which
+        LEG of the lifecycle failed and why, not merely that a model was unverified.
+        """
+        parts = [
+            f"{reason}: refusing to deliver a task before the requested model is "
+            "positively verified",
+            f"role={role!r}",
+            f"phase={phase!r}",
+            f"attempt={attempt}",
+            f"command={command!r}",
+            f"requested_model={requested_model!r}",
+        ]
+        if ticket is not None:
+            parts.append(f"minted_token={ticket.token!r}")
+        if expected_window is not None:
+            parts.append(
+                f"expected_stamps={expected_window[0]}->{expected_window[1]}"
+            )
+        if drawn_to is not None:
+            parts.append(f"counter_after_driver={drawn_to}")
+        if evidence is not None:
+            parts.extend(
+                (
+                    f"evidence_state={evidence.state!r}",
+                    f"resolved_model={evidence.resolved_model!r}",
+                    f"request_method={evidence.request_method!r}",
+                    f"selection_token={evidence.selection_token!r}",
+                    f"request_stamp={evidence.request_stamp}",
+                    f"observe_stamp={evidence.observe_stamp}",
+                    f"observation_method={evidence.observation_method!r}",
+                    f"capability={evidence.capability!r}",
+                    "observed_at="
+                    + ":".join(
+                        (
+                            evidence.observed_at_run,
+                            evidence.observed_at_task,
+                            evidence.observed_at_terminal,
+                            evidence.observed_at_role,
+                            evidence.observed_at_phase,
+                            str(evidence.observed_at_attempt),
+                        )
+                    ),
+                )
+            )
+        else:
+            parts.append("evidence=none")
+        if detail:
+            parts.append(detail)
+        return OrcaRuntimeError("; ".join(parts))
+
+    def _gate_b_model_identity(
+        self, *, task_id: str, terminal: str, role: str, phase: str, attempt: int
+    ) -> None:
+        """GATE B: the ONE mandatory fail-closed barrier before BOTH delivery acts.
+
+        A one-line reading of the shared core with `require_pair_admission=True`, which
+        is the single difference between a DELIVERY and the public pre-pass: a delivery
+        additionally requires that a same-command counterpart's model is already
+        positively verified, so independence is never assumed on the strength of two
+        declared tokens.
+        """
+        self._verify_model_identity(
+            task_id=task_id,
+            terminal=terminal,
+            role=role,
+            phase=phase,
+            attempt=attempt,
+            require_pair_admission=True,
+        )
+
+    def verify_model_identity(
+        self,
+        task_id: str,
+        terminal: str,
+        *,
+        role: str,
+        phase: str,
+        attempt: int,
+    ) -> None:
+        """The model-selection PRE-PASS: request, positively verify, record, deliver
+        NOTHING.
+
+        Exists because of review F-001. A same-command Worker/Reviewer pair cannot be
+        admitted by the Worker's own barrier -- at that moment the Reviewer session does
+        not exist, nothing has been observed for it, and two distinct declared tokens are
+        not evidence of two agents. So the admission has to happen BEFORE the first
+        delivery of either role, and that requires a step that can verify a role's model
+        without dispatching to it. This is that step.
+
+        The lifecycle for a same-command model-aware pair is therefore:
+
+            create/attach BOTH sessions
+              -> verify_model_identity(worker)     request -> positively verify -> record
+              -> verify_model_identity(reviewer)   request -> positively verify -> record
+                                                   (and compare, on RESOLVED values)
+              -> start_worker(...)                 Gate B re-verifies and delivers
+
+        Runs exactly the same legs (a)-(i) as Gate B, through the same ticket, the same
+        ordinal window and the same closed vocabularies, and records the identity only on
+        acceptance -- so a refused pre-pass leaves no trace a later round could read as
+        earned. The ONLY relaxation is `require_pair_admission=False`: the first role
+        verified necessarily has no counterpart record yet, and requiring one here would
+        make the pre-pass unsatisfiable. It cannot be used to skip the delivery-time
+        requirement, because `start_worker()` applies that requirement itself, on every
+        role and every round, whatever the pre-pass did.
+
+        Idempotent in the sense that matters: a second pre-pass or the later Gate B
+        verification for the same (phase, role) must resolve to the same model or leg (i)
+        refuses with `model_selection_ambiguous`.
+
+        A no-op on a legacy run and on a role with no declared model, exactly as Gate B
+        is -- so a caller may call it unconditionally.
+        """
+        self._verify_model_identity(
+            task_id=task_id,
+            terminal=terminal,
+            role=role,
+            phase=phase,
+            attempt=attempt,
+            require_pair_admission=False,
+        )
+
+    def _verify_model_identity(
+        self,
+        *,
+        task_id: str,
+        terminal: str,
+        role: str,
+        phase: str,
+        attempt: int,
+        require_pair_admission: bool,
+    ) -> None:
+        """The shared model-selection verification core.
+
+        Gate B reads it at `start_worker()`'s entry, which is the single point strictly
+        before
+        the rung-3 `worker-start --terminal` delivery AND the rung-4
+        `dispatch` + `terminal send` delivery, and which both centralized dispatch
+        initiators (`run_existing_task`, `observe_unexpected_exit`) and all three roles
+        and every round kind necessarily pass. A caller-supplied hook would not be:
+        `terminal_observer` is optional and absent from `observe_unexpected_exit`, which
+        is the exact bypass class that once let that initiator reach `start_worker`
+        without the OS-29 B1 guard.
+
+        Nothing is delivered when this raises: no `worker-start`, no `dispatch` and no
+        `terminal send` has run at the point it does.
+
+        What the harness OWNS here, all of it integer arithmetic and string equality over
+        values this harness itself issued or defined: (a) a request leg exists at all;
+        (b) its `request_method` and `capability` are members of closed sets defined
+        here; (c) its `selection_token` is the token THIS barrier minted; (d) its two
+        ordinals are the two this barrier's counter actually issued, in order, exactly
+        twice; (e) the state is exactly `verified`; (f) `resolved_model` is non-empty and
+        well-formed; (g) `requested_model` echoes back unchanged; (h) freshness against
+        the six-part attempt key; (i) consistency with any earlier record for this
+        `(phase, role)`; (j) the effective-identity rule, re-applied to RESOLVED values,
+        which on a DELIVERY additionally REQUIRES a same-command counterpart to be
+        positively verified already (`require_pair_admission`).
+
+        What it does NOT own, deliberately: whether a resolved value SATISFIES the
+        request. Only something that can observe a provider's resolution can know that
+        (`--model opus` has been measured resolving to `claude-opus-5`), so the DRIVER
+        owns satisfaction and must report `mismatch` rather than silently accepting. The
+        harness implements no alias table and needs no provider knowledge.
+
+        What no seam can prove, stated rather than hidden: a driver that deliberately
+        LIES -- draws both ordinals in order and reports a request it never issued -- is
+        undetectable from inside the harness. What is guaranteed is that the request is a
+        required, separately attested leg, so an implementation cannot satisfy the
+        contract by observation alone; that the attestation is bound to an attempt key
+        and an ordinal window the driver cannot manufacture, so evidence cannot be
+        carried over from a previous attempt, another session or an unrequested default
+        state; and that the only drivers permitted to attest in this release are the
+        deterministic/fake seam, i.e. reviewable test code inside this repository.
+
+        The pre-pass inherits exactly that limit and adds no new one: a caller can run
+        `verify_model_identity()` against a counterpart session it then never uses, and
+        the Worker would deliver. That is the same trust placed in the driver, not a new
+        hole -- the counterpart's own later delivery still verifies, and leg (i) refuses
+        any model that drifted. What the pre-pass removes is the ability to deliver a
+        same-command Worker with NO counterpart evidence at all, which required no
+        misbehaviour from anyone and was the iteration-1 defect.
+        """
+        routing = self.agent_routing
+        if routing is None:
+            return                              # legacy path: byte-identical to today
+        # The fail-closed ARGUMENT check comes FIRST, and is keyed on the RUN being
+        # model-aware rather than on this role's entry. It has to: the entry lookup needs
+        # the phase, so checking the arguments afterwards would let an omitted `phase`
+        # make the lookup MISS and the barrier skip itself -- silently, on a run that
+        # declares models. A future caller that forgets to thread the identity therefore
+        # gets a refused dispatch, which is observable, rather than an unverified
+        # delivery, which is not.
+        if getattr(routing, "is_model_aware", False) and not (role and phase and attempt):
+            raise self._model_refusal(
+                MODEL_SELECTION_UNVERIFIED,
+                role=role,
+                phase=phase,
+                attempt=attempt,
+                command="",
+                requested_model="",
+                detail="this run's routing declares a model, and the barrier was not "
+                "given the (role, phase, attempt) identity this attempt's model evidence "
+                "must be keyed to",
+            )
+        entry = self._routing_entry_for(role, phase)
+        command = entry.command if entry is not None else ""
+        requested = entry.model if entry is not None else ""
+        if not requested:
+            return                              # state `none`: no model for this role
+        # ---- from here a model IS declared, so nothing below may be skipped ----------
+        if self.model_driver is None:
+            # Not merely "cannot observe": with no driver a selection cannot even be
+            # REQUESTED, which is a stronger and differently-named failure.
+            raise self._model_refusal(
+                MODEL_SELECTION_UNSUPPORTED,
+                role=role,
+                phase=phase,
+                attempt=attempt,
+                command=command,
+                requested_model=requested,
+                detail="no model-selection driver is wired in, so a selection cannot "
+                "be requested on this placement",
+            )
+        ticket, issued_at = self._mint_model_selection_ticket(
+            task_id=task_id,
+            terminal=terminal,
+            role=role,
+            phase=phase,
+            attempt=attempt,
+            command=command,
+            requested_model=requested,
+        )
+        expected = (issued_at + 1, issued_at + 2)
+        try:
+            evidence = self.model_driver.select_and_verify(ticket)
+        finally:
+            self._revoke_model_selection_ticket(ticket)
+        drawn_to = self._model_selection_seq
+
+        def refuse(reason: str, detail: str = "") -> OrcaRuntimeError:
+            return self._model_refusal(
+                reason,
+                role=role,
+                phase=phase,
+                attempt=attempt,
+                command=command,
+                requested_model=requested,
+                evidence=evidence if isinstance(evidence, ModelEvidence) else None,
+                ticket=ticket,
+                expected_window=expected,
+                drawn_to=drawn_to,
+                detail=detail,
+            )
+
+        # A wrong TYPE must be REFUSED, never raise a TypeError -- the same rule
+        # reuse_eligible() already applies to a mis-typed ReuseObservation.
+        if not isinstance(evidence, ModelEvidence):
+            raise refuse(
+                MODEL_SELECTION_UNVERIFIED,
+                f"the driver returned {type(evidence).__name__}, not ModelEvidence",
+            )
+        if evidence.state not in MODEL_EVIDENCE_STATES:
+            raise refuse(
+                MODEL_SELECTION_UNVERIFIED,
+                f"state {evidence.state!r} is outside the closed vocabulary "
+                f"{MODEL_EVIDENCE_STATES}",
+            )
+        # ---- leg 1: the REQUEST ------------------------------------------------------
+        if not evidence.selection_token or not evidence.request_method or (
+            evidence.request_stamp == 0
+        ):
+            raise refuse(
+                MODEL_SELECTION_REQUEST_ABSENT,
+                "no model selection was attested as REQUESTED for this attempt; "
+                "reading a pre-existing or default model state is not evidence that "
+                "anything asked for it",
+            )
+        if evidence.request_method not in MODEL_SELECTION_REQUEST_METHODS:
+            raise refuse(
+                MODEL_SELECTION_UNSUPPORTED,
+                f"request_method {evidence.request_method!r} is outside the closed set "
+                f"{MODEL_SELECTION_REQUEST_METHODS}",
+            )
+        if evidence.capability != MODEL_SELECTION_VERIFIED_CAPABILITY:
+            raise refuse(
+                MODEL_SELECTION_UNSUPPORTED,
+                "the evidence does not name the "
+                f"{MODEL_SELECTION_VERIFIED_CAPABILITY!r} capability",
+            )
+        if evidence.selection_token != ticket.token:
+            raise refuse(
+                MODEL_SELECTION_REQUEST_STALE,
+                "the attested request belongs to another attempt, session or role: its "
+                "token is not the one this barrier minted",
+            )
+        if evidence.observe_stamp == 0:
+            raise refuse(
+                MODEL_SELECTION_UNVERIFIED,
+                "a selection was requested and no resolved model was ever observed",
+            )
+        if (
+            evidence.request_stamp != expected[0]
+            or evidence.observe_stamp != expected[1]
+            or drawn_to != expected[1]
+        ):
+            raise refuse(
+                MODEL_SELECTION_REQUEST_STALE,
+                "the two ordinals were not drawn from this ticket exactly twice, in "
+                "order: the only way to obtain one is to call the ticket's stamp(), and "
+                "this harness counted how often it was asked",
+            )
+        observed_key = (
+            evidence.observed_at_run,
+            evidence.observed_at_task,
+            evidence.observed_at_terminal,
+            evidence.observed_at_role,
+            evidence.observed_at_phase,
+            evidence.observed_at_attempt,
+        )
+        if observed_key != (
+            self.run_id or "",
+            task_id,
+            terminal,
+            role,
+            phase,
+            attempt,
+        ):
+            raise refuse(
+                MODEL_SELECTION_REQUEST_STALE,
+                "the evidence was not observed for this (run, task, terminal, role, "
+                "phase, attempt) key",
+            )
+        if evidence.requested_model != requested:
+            raise refuse(
+                MODEL_SELECTION_MISMATCH,
+                "the evidence does not echo back the model this routing requested",
+            )
+        # ---- leg 2: the OBSERVATION's own verdict -------------------------------------
+        if evidence.state != MODEL_EVIDENCE_VERIFIED:
+            raise refuse(
+                {
+                    MODEL_EVIDENCE_MISMATCH: MODEL_SELECTION_MISMATCH,
+                    MODEL_EVIDENCE_UNVERIFIABLE: MODEL_SELECTION_UNSUPPORTED,
+                    MODEL_EVIDENCE_STALE: MODEL_SELECTION_UNVERIFIED,
+                    MODEL_EVIDENCE_REQUESTED: MODEL_SELECTION_UNVERIFIED,
+                    MODEL_EVIDENCE_NONE: MODEL_SELECTION_UNVERIFIED,
+                }.get(evidence.state, MODEL_SELECTION_UNVERIFIED),
+                f"the driver reported state {evidence.state!r}; only "
+                f"{MODEL_EVIDENCE_VERIFIED!r} admits a delivery",
+            )
+        if not evidence.resolved_model or not MODEL_TOKEN_PATTERN.fullmatch(
+            evidence.resolved_model
+        ):
+            raise refuse(
+                MODEL_SELECTION_UNVERIFIED,
+                f"resolved_model {evidence.resolved_model!r} is empty or is not a "
+                "simple model token, so it is not a model identity",
+            )
+        previous = self._model_identity.get((phase, self._routing_key(role, phase)[1]))
+        if previous is not None and previous.resolved_model != evidence.resolved_model:
+            raise refuse(
+                MODEL_SELECTION_AMBIGUOUS,
+                "an earlier accepted attempt for this (phase, role) resolved to "
+                f"{previous.resolved_model!r}; a model that silently changed between "
+                "rounds does not merely get logged, the dispatch does not happen",
+            )
+        # ---- (j) the effective-identity rule, on RESOLVED values ----------------------
+        # The half the declaration-time gate structurally cannot see: two DISTINCT
+        # declared tokens can resolve to one model, and only a resolved-value comparison
+        # refuses that.
+        #
+        # OS-49 iteration 2 (review F-001). This check used to run only when a
+        # counterpart record HAPPENED to exist, which made it vacuous on the Worker --
+        # whose dispatch precedes its Reviewer session -- so a same-command pair's Worker
+        # was DELIVERED and only the Reviewer, arriving second, was refused. A Worker that
+        # has already run was admitted without independence ever being positively
+        # established, which is precisely what the ticket forbids. The fix is not to
+        # delete the check but to move the ADMISSION: on a SAME-COMMAND pair the
+        # counterpart's verified evidence must ALREADY EXIST at the first delivery of
+        # EITHER role, and its absence is a refusal with its own name.
+        #
+        # How a caller satisfies it: create/attach BOTH sessions, call the public
+        # `verify_model_identity()` pre-pass for each role -- which runs legs (a)-(i) and
+        # records the identity but DELIVERS NOTHING -- and only then dispatch. A caller
+        # that cannot create both sessions up front cannot route a same-command
+        # model-aware pair at all, which is the fail-closed outcome, not a gap.
+        #
+        # DISTINCT-command pairs are untouched: row 1 of the rule makes them independent
+        # on the commands alone, so no counterpart evidence is required and the
+        # pre-OS-49 lifecycle stands. The Final Reviewer is deliberately outside this
+        # rule and has no counterpart to look up.
+        routing_role = self._routing_key(role, phase)[1]
+        counterpart_role = {"worker": "reviewer", "reviewer": "worker"}.get(routing_role)
+        if counterpart_role is not None:
+            counterpart = self._model_identity.get((phase, counterpart_role))
+            # OS-49 iteration 2 (review F-002). Model evidence is RUN-SCOPED, and this
+            # is the read that GRANTS pair admission, so the scope has to be enforced
+            # here. A record observed in another run says nothing about whether this
+            # run has a counterpart session at all: it was accepted against that run's
+            # six-part attempt key, and the run it names is already on the record. Left
+            # unchecked, a second run on the same harness instance inherited the first
+            # run's counterpart evidence and delivered a same-command Worker whose
+            # Reviewer did not exist in that run.
+            #
+            # Dropping it into the `counterpart is None` branch below is the fail-closed
+            # reading, not a silent discard: a SAME-COMMAND delivery is refused as
+            # MODEL_SELECTION_PAIR_UNADMITTED, and a distinct-command pair -- independent
+            # on its commands alone -- is unaffected. It can refuse nothing a same-run
+            # pair does today, because a same-run record's `observed_at_run` is this run
+            # by construction (leg (h) already refused anything else at acceptance).
+            # `finish()` also clears both model maps at the run boundary; this check is
+            # what holds if a caller ever re-points `run_id` without going through it.
+            if counterpart is not None and counterpart.observed_at_run != (
+                self.run_id or ""
+            ):
+                counterpart = None
+            counterpart_entry = self.agent_routing.for_role(phase, counterpart_role)
+            # Scoped exactly as Gate A's pair check is: to a counterpart that is REQUIRED
+            # and resolved. At LOW risk the Reviewer entry exists but is optional and no
+            # Reviewer is ever dispatched, so there is no pair to admit -- and the
+            # repository's standing rule is that a role nobody dispatches must not fail a
+            # run (the same reason the PATH check is scoped to required roles). An
+            # unresolved required role is validate_required_roles()' business.
+            same_command = (
+                counterpart_entry is not None
+                and counterpart_entry.required
+                and counterpart_entry.resolved
+                and counterpart_entry.command == command
+            )
+            if counterpart is None:
+                if require_pair_admission and same_command:
+                    raise refuse(
+                        MODEL_SELECTION_PAIR_UNADMITTED,
+                        f"the {counterpart_role} of phase {phase!r} shares this "
+                        f"command {command!r} and has no positively verified model "
+                        "evidence yet, so Worker/Reviewer independence rests on nothing "
+                        "but two declared tokens -- which can alias onto one model. "
+                        "Verify both effective identities with verify_model_identity() "
+                        "before delivering either",
+                    )
+            elif counterpart_entry is not None:
+                independent, reason = effective_identity_independent(
+                    (command, evidence.resolved_model, MODEL_EVIDENCE_VERIFIED),
+                    (
+                        counterpart_entry.command,
+                        counterpart.resolved_model,
+                        MODEL_EVIDENCE_VERIFIED,
+                    ),
+                )
+                if not independent:
+                    raise refuse(
+                        reason or REASON_WORKER_REVIEWER_MUST_DIFFER,
+                        f"the {counterpart_role} of phase {phase!r} already resolved to "
+                        f"command {counterpart_entry.command!r} model "
+                        f"{counterpart.resolved_model!r}; two distinct declared tokens "
+                        "that resolve to one model are not two agents",
+                    )
+        # Accepted. Recorded ONLY here, so no refused attempt can leave a trace that a
+        # later round or a provenance row would read as earned.
+        self._model_identity[(phase, routing_role)] = evidence
+        self._model_pending_evidence[terminal] = evidence
+        row = self._terminals.get(terminal)
+        if row is not None:
+            row["resolved_model"] = evidence.resolved_model
+            row["model_state"] = evidence.state
+
+    def start_worker(
+        self,
+        task_id: str,
+        terminal: str,
+        spec: str,
+        *,
+        role: str = "",
+        phase: str = "",
+        attempt: int = 0,
+    ) -> tuple[str, bool]:
+        """OS-49: the three keyword-only identity parameters are what the pre-delivery
+        barrier keys this attempt's model evidence to. They have defaults so all nine
+        existing unpack sites bind unchanged and the return type stays
+        `tuple[str, bool]`, but OMITTING them on a model-aware run is a REFUSAL, not a
+        skip -- see `_gate_b_model_identity`.
+        """
+        # GATE B, the first statement, deliberately ahead of the own-handle refusal and
+        # therefore ahead of wait_for_tui_idle(), the rung-3 delivery and the rung-4
+        # delivery. It does not displace the OS-29 B1 guard (which runs earlier, in both
+        # initiators) and does not move the OS-41 acknowledgement gate (which runs
+        # later, on the receipt).
+        self._gate_b_model_identity(
+            task_id=task_id,
+            terminal=terminal,
+            role=role,
+            phase=phase,
+            attempt=attempt,
+        )
         assert self.run_owner
         if terminal == os.environ.get(SELF_HANDLE_ENV):
             raise OrcaRuntimeError(
@@ -3631,6 +4628,20 @@ class OrcaRuntimeHarness:
         # == "") but still advances the scope's last-known end time.
         if self._timing is not None:
             self._timing.record_scope_activity(ended_at=ended_at, result=gate_result)
+        # OS-49 V8. ONE sibling row per settled dispatch, emitted immediately BEFORE the
+        # settled row, from this same funnel and under the same _safe_log guard -- so
+        # every round kind and both initiators are covered by one piece of code.
+        #
+        # A new EVENT NAME, never a new COLUMN: every reader does
+        # `if len(cells) != len(ORCHESTRATOR_LOG_COLUMNS): continue`, so a new column
+        # would leave historical rows on disk and make all of them invisible. And never an
+        # overload of the settled row's `detail`, which is the OS-17 body_excerpt
+        # diagnostic -- appending to it would redefine an existing event's existing
+        # column.
+        self._log_agent_identity_row(
+            phase=phase, attempt=attempt, terminal_created=terminal_created,
+            round_kind=round_kind,
+        )
         self._safe_log(
             run_logging.log_orchestrator_event,
             self.run_id,
@@ -3687,6 +4698,82 @@ class OrcaRuntimeHarness:
         if round_kind == "final_review":
             self._log_final_review_audit(attempt=attempt, event=event)
 
+    def _log_agent_identity_row(
+        self,
+        *,
+        phase: str | None,
+        attempt: "RuntimeAttempt",
+        terminal_created: bool,
+        round_kind: str,
+    ) -> None:
+        """The durable answer to "which effective agent identity produced this result?".
+
+        Emitted ONLY when this run's routing actually carries model identity, mirroring
+        `RunRouting.evidence_rows()`'s own rule that a legacy routing produces nothing at
+        all -- so a legacy run's logs stay byte-identical. Absence is unambiguous because
+        the run-scoped `agent_profile_selected` / `agent_routing_resolved` rows already
+        say up front whether this run's routing carries a model.
+
+        Provenance is NOT the gate. This runs after settlement inside `_safe_log`, so a
+        failed write lands in `self._logging_errors` and never unwinds an already-settled
+        Dispatch. That is only safe because enforcement lives in the two gates: a missing
+        identity row can never be what PERMITTED an unverified delivery.
+        """
+        routing = self.agent_routing
+        if routing is None or not getattr(routing, "is_model_aware", False):
+            return
+        phase_name = phase or ""
+        role = attempt.role or ""
+        # OS-49 iteration 2 (review F-001): BOTH halves of the key come from the one
+        # mapping. Re-spelling the entry phase here was a second, narrower copy of the
+        # Final Reviewer rule that recognised only the `final_reviewer` role string, so
+        # this row read a different slot than the barrier wrote.
+        entry_phase, routing_role = self._routing_key(role, phase_name)
+        entry = self._routing_entry_for(role, phase_name)
+        evidence = self._model_identity.get((entry_phase, routing_role))
+        if evidence is None:
+            evidence = self._model_identity.get((phase_name, routing_role))
+        state = evidence.state if evidence is not None else MODEL_EVIDENCE_NONE
+        detail = " ".join(
+            (
+                f"command={entry.command if entry is not None else ''}",
+                f"requested_model={(entry.model if entry is not None else '') or 'none'}",
+                f"resolved_model={(evidence.resolved_model if evidence else '') or 'none'}",
+                f"request_method={(evidence.request_method if evidence else '') or 'none'}",
+                f"selection_token={(evidence.selection_token if evidence else '') or 'none'}",
+                f"request_stamp={evidence.request_stamp if evidence else 0}",
+                f"observe_stamp={evidence.observe_stamp if evidence else 0}",
+                f"observation_method={(evidence.observation_method if evidence else '') or 'none'}",
+                f"selection_capability={(evidence.capability if evidence else '') or 'none'}",
+                "selection_verified="
+                + ("true" if state == MODEL_EVIDENCE_VERIFIED else "false"),
+                f"profile={routing.profile_name or 'none'}",
+                f"profile_source={routing.profile_source or 'none'}",
+                f"schema={getattr(routing, 'schema_version', 0)}",
+            )
+        )
+        self._safe_log(
+            run_logging.log_orchestrator_event,
+            self.run_id,
+            base=self.artifact_dir,
+            event=EVENT_AGENT_IDENTITY_BOUND,
+            phase=phase_name,
+            role=role,
+            iteration=attempt.iteration,
+            task_id=attempt.task_id,
+            dispatch_id=attempt.dispatch_id,
+            terminal=attempt.terminal,
+            action="created" if terminal_created else "reused",
+            reuse=attempt.terminal_effect,
+            risk=self.risk,
+            round_kind=round_kind,
+            # Exactly ONE of the six model-evidence states, so "did this dispatch run on
+            # a positively verified model?" is a COLUMN SCAN rather than a detail parse,
+            # and `verified` can never be inferred from the absence of anything.
+            result=f"model_state={state}",
+            detail=detail,
+        )
+
     def _log_final_review_audit(
         self, *, attempt: "RuntimeAttempt", event: str
     ) -> None:
@@ -3723,6 +4810,37 @@ class OrcaRuntimeHarness:
             if self.agent_routing is not None
             else None
         )
+        # The evidence the barrier ACCEPTED for this Final Review attempt, or None when no
+        # model was declared. Read from the run-scoped map rather than re-observed: a Final
+        # Review that re-derived an identity could silently differ from the one the run was
+        # routed with, which is exactly the drift OS-49 forbids.
+        final_evidence = self._model_identity.get(
+            (FINAL_REVIEW_PHASE, "final_reviewer")
+        )
+        # OS-49 iteration 2 (review F-001). The five model fields are ONE bundle written
+        # from ONE source. They used to come from two: `reviewer_requested_model` from the
+        # routing and the other four from the evidence, so a record could DECLARE a
+        # requested model while carrying no evidence that anything resolved it -- an
+        # internally contradictory record, which is exactly the shape reuse condition 9
+        # refuses to act on.
+        #
+        # The routing-key fix above already makes that shape unreachable rather than
+        # unlikely: the barrier precedes BOTH delivery acts, settlement follows delivery,
+        # and this method only runs on a settled attempt -- so a Final Review record can
+        # only exist after the declared model was positively verified. This is the second
+        # lock, local to the record: the declared value is emitted only together with the
+        # evidence the barrier's leg (g) proved echoed it back. It is still read from the
+        # MATERIALIZED routing and still never re-derived here; it simply cannot appear
+        # alone. With no model declared, or on any attempt whose evidence is absent, all
+        # five fields stay empty/`none` -- and the identity row for the same dispatch
+        # still records the declared token beside `model_state=none`, so nothing the run
+        # observed is lost from its durable evidence.
+        declared_model = entry.model if entry is not None and entry.resolved else ""
+        model_verified = (
+            final_evidence is not None
+            and final_evidence.state == MODEL_EVIDENCE_VERIFIED
+            and final_evidence.requested_model == declared_model
+        )
         self._safe_log(
             run_logging.write_final_review_audit_record,
             self.run_id,
@@ -3739,6 +4857,23 @@ class OrcaRuntimeHarness:
             ),
             reviewer_agent_origin=(
                 entry.origin if entry is not None and entry.resolved else "unknown"
+            ),
+            # OS-49. The Final Reviewer's model identity, read from the MATERIALIZED
+            # routing and the evidence the barrier accepted -- never re-derived here. That
+            # is what makes the Final Adversarial Review preserve the identity the run was
+            # routed with rather than silently observe a different one.
+            reviewer_requested_model=declared_model if model_verified else "",
+            reviewer_resolved_model=(
+                final_evidence.resolved_model if model_verified else ""
+            ),
+            reviewer_model_state=(
+                final_evidence.state if model_verified else MODEL_EVIDENCE_NONE
+            ),
+            reviewer_model_request_method=(
+                final_evidence.request_method if model_verified else ""
+            ),
+            reviewer_model_request_evidence=(
+                final_evidence.request_evidence if model_verified else ""
             ),
             # The runtime's OWN labels, verbatim. Never mapped into an enum, and
             # never compared against a threshold constant.
@@ -4474,7 +5609,13 @@ class OrcaRuntimeHarness:
         self._open_phase_iteration_boundary(
             phase or "", iteration, opened_at=dispatch_started_at
         )
-        dispatch_id, supervised = self.start_worker(task_id, handle, spec)
+        # OS-49: the barrier's attempt identity. Threaded from the values this dispatch
+        # already has -- never defaulted, never inferred from unrelated state -- because
+        # omitting them on a model-aware run is a refusal, not a skip.
+        dispatch_id, supervised = self.start_worker(
+            task_id, handle, spec,
+            role=role, phase=self._barrier_phase(role, phase), attempt=iteration,
+        )
         done, delivery_id = self.wait_for_done(dispatch_id, task_id)
         attempt = self.settle_attempt(
             role,
@@ -4768,7 +5909,10 @@ class OrcaRuntimeHarness:
         handle = self.create_fake_terminal(
             role, "exit", iteration=iteration, phase=phase
         )
-        dispatch_id, supervised = self.start_worker(task_id, handle, spec)
+        dispatch_id, supervised = self.start_worker(
+            task_id, handle, spec,
+            role=role, phase=self._barrier_phase(role, phase), attempt=iteration,
+        )
         assert self.run_owner
         # Same STEP 0 gate as settle_attempt: this path also issues worker-abandon and
         # worker-release, so no lifecycle mutation may run before the claim.
@@ -4980,6 +6124,15 @@ class OrcaRuntimeHarness:
         self._ledger = {}
         self._deliveries = {}
         self._deliveries_restored_for = ""
+        # OS-49 iteration 2 (review F-002). The model-identity maps are per-run state
+        # exactly like the three collections above: every record in them was accepted
+        # against ONE run's six-part attempt key, and `run_runtime_scenarios()` drives
+        # several start_run/finish cycles on one harness instance. Leaving them behind
+        # let the next run read a previous run's counterpart evidence as its own pair
+        # admission, and let leg (i) compare a new run's model against a record no
+        # session in that run produced.
+        self._model_identity = {}
+        self._model_pending_evidence = {}
         return result
 
     def _release_terminated_process(self, handle: str) -> bool:
@@ -5338,7 +6491,9 @@ def run_session_reuse_runtime_scenario(artifact_dir: Path) -> RuntimeScenarioRes
     reviewer_previous: RuntimeAttempt | None = None
     decisions: list[dict[str, Any]] = []
 
-    def next_terminal(previous: RuntimeAttempt | None, role: str) -> str | None:
+    def next_terminal(
+        previous: RuntimeAttempt | None, role: str, phase: str = ""
+    ) -> str | None:
         """Ask the production gate which terminal the next attempt runs on.
 
         `role` is the intended role of the attempt about to be dispatched, spelled
@@ -5361,6 +6516,12 @@ def run_session_reuse_runtime_scenario(artifact_dir: Path) -> RuntimeScenarioRes
             previous.terminal,
             role="phase_reviewer" if role.endswith("reviewer") else "phase_worker",
             agent_command=harness.ledger_terminal(previous.terminal)["agent_command"],
+            # OS-49 condition 9. The MODEL the NEXT dispatch requests, read from the
+            # materialized routing for the role and phase that dispatch will run -- never
+            # from the previous dispatch's own record, which is the value condition 9
+            # compares AGAINST. "" on every run that declares no model, which is what
+            # keeps this scenario's recorded answers byte-identical there.
+            requested_model=harness.resolved_agent_model(role, phase),
             dispatch_id=previous.dispatch_id,
         )
         if harness.last_reuse_decision is not None:
@@ -5410,7 +6571,7 @@ def run_session_reuse_runtime_scenario(artifact_dir: Path) -> RuntimeScenarioRes
             phase=phase,
             spec=worker_spec,
             lifecycle="release" if last else "reuse",
-            terminal=next_terminal(worker_previous, "worker"),
+            terminal=next_terminal(worker_previous, "worker", phase),
             # OS-41: a budget for the phases that REMAIN, not for the whole chain.
             # The fake agent exits once it has served this many dispatches, and that
             # exit is the only release receipt the tracked path has. With the whole
@@ -5467,7 +6628,7 @@ def run_session_reuse_runtime_scenario(artifact_dir: Path) -> RuntimeScenarioRes
             spec=reviewer_spec,
             evidence=reviewer_evidence,
             lifecycle="release" if last else "reuse",
-            terminal=next_terminal(reviewer_previous, "reviewer"),
+            terminal=next_terminal(reviewer_previous, "reviewer", phase),
             # OS-41: a budget for the phases that REMAIN, not for the whole chain.
             # The fake agent exits once it has served this many dispatches, and that
             # exit is the only release receipt the tracked path has. With the whole

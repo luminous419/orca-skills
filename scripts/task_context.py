@@ -191,6 +191,15 @@ AGENT_ROUTING_KEYS = (
     "phase_worker",
     "phase_reviewer",
     "final_reviewer",
+    # OS-49. The MODEL half of each role's effective identity, beside the command half
+    # and never folded into it. Rendered unconditionally like every other member, so a
+    # profile-selected spec always carries all three and a legacy run still renders no
+    # block at all. Per-dispatch VERIFICATION method and capability are deliberately NOT
+    # here: the spec is the dispatch's INPUT, not its evidence, and those are
+    # per-dispatch facts that live in the run's provenance row instead.
+    "phase_worker_model",
+    "phase_reviewer_model",
+    "final_reviewer_model",
     "resolution_sources",
     "routing_scope",
     "routing_mutability",
@@ -199,6 +208,10 @@ AGENT_ROUTING_KEYS = (
 # that exists but is not required at this risk level.
 ROUTING_NOT_APPLICABLE = "not_applicable"
 ROUTING_NOT_REQUIRED = "not_required"
+# OS-49. What a RESOLVED role whose routing declares no model reads. Reuses the existing
+# `"none"` spelling the routing evidence rows already use for "the profile supplied
+# nothing here", rather than inventing a second word for the same idea.
+ROUTING_NO_MODEL = "none"
 ROUTING_IMMUTABLE = "immutable_for_this_run"
 
 
@@ -535,12 +548,26 @@ def build_agent_routing_context(
             return ROUTING_NOT_REQUIRED if not entry.required else ""
         return entry.command
 
+    def _model(entry: Any) -> str:
+        """OS-49. The same vocabulary as _command(), with one addition: an entry that
+        resolved to a command but declares no model reads ROUTING_NO_MODEL, so "this role
+        runs on whatever its command defaults to" is a STATED value rather than a blank
+        a reader has to interpret."""
+        if entry is None:
+            return ROUTING_NOT_APPLICABLE
+        if not entry.resolved:
+            return ROUTING_NOT_REQUIRED if not entry.required else ""
+        return getattr(entry, "model", "") or ROUTING_NO_MODEL
+
     return {
         "agent_profile": routing.profile_name,
         "agent_profile_source": routing.profile_source,
         "phase_worker": _command(worker),
         "phase_reviewer": _command(reviewer),
         "final_reviewer": _command(final),
+        "phase_worker_model": _model(worker),
+        "phase_reviewer_model": _model(reviewer),
+        "final_reviewer_model": _model(final),
         "resolution_sources": " ".join(sources),
         "routing_scope": "run" if routing.runtime == "orchestration" else "invocation",
         "routing_mutability": ROUTING_IMMUTABLE,

@@ -11,7 +11,7 @@
 #
 # Schema (this is all of it):
 #
-#   version        integer, currently 1
+#   version        integer, 1 or 2 -- see "Schema versions" below
 #   profiles       mapping of profile name -> profile
 #     defaults     optional; worker and/or reviewer used when a phase says nothing
 #     phases       optional; per-phase worker/reviewer for any of the seven phases
@@ -39,6 +39,129 @@
 # reviewer -- at MEDIUM or HIGH the same run would stop with
 # AGENT_ROLE_UNRESOLVED. The loop skill has no risk axis and always reviews, so
 # every phase needs a reviewer there.
+#
+# ---------------------------------------------------------------------------
+# COMMAND vs MODEL IDENTITY (OS-49)
+# ---------------------------------------------------------------------------
+#
+# An agent's EFFECTIVE IDENTITY is (command, model), not the command alone. One
+# executable can now select a model per session, so two phases that both run
+# `claude` are not automatically two different agents.
+#
+# The Worker/Reviewer independence rule, in full:
+#
+#   * Different commands           -> independent. Unchanged from before OS-49.
+#   * Same command, and BOTH sides'
+#     models positively VERIFIED
+#     and different                -> independent.
+#   * Anything else                -> refused, fail-closed:
+#                                     WORKER_REVIEWER_MUST_DIFFER.
+#
+# "Anything else" explicitly includes a same-command pair with no models, a
+# same-command pair declaring the SAME model, and a same-command pair whose models
+# are declared but not positively verified. An unknown or unverified model is never
+# evidence of independence. The rule is CATEGORICAL: it applies at `version: 1`
+# exactly as at `version: 2`.
+#
+# This is the one configuration value that does not survive OS-49: a `version: 1`
+# profile that put the same command on both sides of a MEDIUM/HIGH-risk gate is now
+# refused before the Run is created. Give the two sides different commands (the
+# `diverse` profile below), or declare two different verified models on one command
+# once a model-selection capability exists.
+#
+# ---------------------------------------------------------------------------
+# SCHEMA VERSIONS
+# ---------------------------------------------------------------------------
+#
+#   version: 1   A role value is a COMMAND STRING. Frozen -- this version's meaning
+#                will not change, and a model cannot be expressed in it at all.
+#   version: 2   A role value is a command string OR a `{command, model}` mapping.
+#                A plain string in a v2 document means exactly what it means in v1:
+#                a command, no model. Mixed forms in one document are legal.
+#
+# A model may be written in exactly five positions and nowhere else:
+# `defaults.worker`, `defaults.reviewer`, `phases.<phase>.worker`,
+# `phases.<phase>.reviewer` and `final_review.reviewer`. There is no document-level
+# or phase-level `model` key and no `models:` block.
+#
+# Everything below fails closed, before any Run, Task, Dispatch or terminal exists:
+#
+#   version: 3                      -> INVALID_AGENT_PROFILE
+#                                      "unsupported schema version 3; supported: 1, 2"
+#   a mapping role value in v1       -> INVALID_AGENT_PROFILE
+#                                      "a model-aware role value requires schema
+#                                       version 2; this document declares version 1"
+#   an unknown key anywhere,
+#   including inside a role mapping  -> INVALID_AGENT_PROFILE
+#                                      "unknown key(s) effort; allowed: command, model"
+#   a mapping with no `command`      -> INVALID_AGENT_PROFILE
+#   `model:` empty, numeric, a list  -> INVALID_AGENT_PROFILE
+#   an INLINE `{command: ..., ...}`  -> INVALID_AGENT_PROFILE
+#                                      "a role mapping must be written as an indented
+#                                       block, not inline"  (the restricted YAML
+#                                       reader has no flow-mapping support)
+#   `model: ../x`, `a b`, `-x`,
+#   `a;b`, `$(x)`, `<synthetic>`     -> INVALID_AGENT_MODEL
+#                                      "is not a simple model token"
+#
+# An older installed Skill reading a `version: 2` file refuses it by VERSION
+# ("unsupported schema version 2; supported: 1") rather than by complaining about
+# the role value's type. That is deliberate: the message names the cause and the
+# remedy, and the model declaration stays in the file instead of being deleted.
+#
+# ---------------------------------------------------------------------------
+# MODEL SELECTION IS FAIL-CLOSED
+# ---------------------------------------------------------------------------
+#
+# Declaring NO model preserves today's behaviour byte-for-byte: nothing is
+# requested, nothing is verified, no new refusal exists, and the logs are identical
+# to a pre-OS-49 run.
+#
+# Declaring a model commits the run to this ordered lifecycle, per dispatch:
+#
+#   create/attach session -> REQUEST model selection -> positively VERIFY the
+#   resolved model -> deliver the task -> record provenance
+#
+# A Worker or Reviewer task is NEVER delivered before the requested model has been
+# positively verified for that attempt. The named refusals are
+# `model_selection_unsupported` (a selection cannot be requested at all),
+# `model_selection_request_absent` (no selection was requested for this attempt --
+# reading a pre-existing or default model state is not evidence),
+# `model_selection_request_stale` (the request belongs to another attempt, or the
+# two legs were not drawn in order), `model_selection_unverified` (requested, never
+# positively observed), `model_selection_mismatch` (requested != resolved) and
+# `model_selection_ambiguous` (contradictory resolved values).
+#
+# ONE COMMAND, TWO MODELS: THE PAIR IS ADMITTED BEFORE THE FIRST DELIVERY.
+# Declaring two different models on one command is an OBLIGATION, not a pass -- two
+# declared tokens can alias onto a single resolved model, and a declaration is not an
+# observation. A per-role barrier cannot settle it either: the Worker is dispatched
+# before the Reviewer session exists, so there is no counterpart to compare against at
+# that moment. So a same-command pair follows:
+#
+#   create/attach BOTH sessions -> request + positively VERIFY the worker's model
+#   -> request + positively VERIFY the reviewer's model -> deliver the first task
+#
+# Delivering either role while its same-command counterpart has no positively verified
+# model is refused with `model_selection_pair_unadmitted`, before any dispatch or send.
+# A path that cannot bring both sessions up first cannot route a same-command
+# model-aware pair at all -- fail-closed, by design. Pairs with DIFFERENT commands are
+# unaffected: they are independent on the commands alone and their lifecycle is
+# unchanged, and so is an OPTIONAL counterpart -- at LOW risk the Reviewer is optional
+# and never dispatched, so there is no pair to admit.
+#
+# IN THIS RELEASE a declared model is REFUSED on every real placement, with
+# AGENT_MODEL_NOT_SUPPORTED at profile-validation time. Claude Code's `/model`
+# syntax, acknowledgement format and output semantics are not observable here, and
+# Orca's `worker-start --model` is unreachable from this runtime, so no real adapter
+# can honestly claim it both requested a selection and observed the resolution.
+# Model-aware routing is positively supported only on the deterministic driver seam.
+# Supplying the first adapter that can honestly declare `model_selection_verified`
+# in a real environment is OS-14's work; see docs/COMPATIBILITY.md.
+#
+# Session reuse is MODEL-BOUND: a terminal is reused only when the previous
+# dispatch's model identity is positively compatible with the next request. See the
+# orchestration skill's `#### Session reuse contract`, condition 9.
 
 version: 1
 
@@ -55,22 +178,67 @@ profiles:
         worker: claude
         reviewer: codex
       design:
-        # The same command on both sides is allowed. The sessions are still
-        # separate -- a Worker session is never reused as a Reviewer session.
+        # Both sides of a gate must be different EFFECTIVE identities. Two separate
+        # sessions on one command are not two agents: separate sessions remain a
+        # real invariant, but they are no longer sufficient evidence of
+        # independence, so the same command on both sides is refused.
         worker: claude
-        reviewer: claude
+        reviewer: codex
       implementation:
         worker: codex
-        reviewer: codex
+        reviewer: claude
       test:
         worker: codex
         reviewer: claude
     final_review:
       reviewer: codex
 
-  # Everything on one command. Equivalent to a plain worker=/reviewer= invocation,
-  # written down so a team can name it.
-  uniform:
+  # The Final Adversarial Reviewer is deliberately OUTSIDE the Worker/Reviewer
+  # independence rule -- no contract requires it to differ from a phase Worker --
+  # so it may legitimately repeat a command used elsewhere in the profile.
+  single-vendor-phases:
     defaults:
       worker: claude
+      reviewer: codex
+    final_review:
       reviewer: claude
+
+# ---------------------------------------------------------------------------
+# A MODEL-AWARE DOCUMENT, in full. Commented out on purpose, for two reasons:
+# a document declares ONE `version:` and the profiles above are v1, and a shipped
+# example must never carry a profile the shipped gate refuses -- which a declared
+# model currently is on every real placement (AGENT_MODEL_NOT_SUPPORTED).
+#
+# Note the INDENTED BLOCK mapping. `worker: {command: claude, model: glm-5.2}`
+# written inline is NOT valid here: the restricted YAML reader supports flow
+# sequences but not flow mappings, and the inline form is refused with
+# "a role mapping must be written as an indented block, not inline".
+#
+#   version: 2
+#
+#   profiles:
+#
+#     # One executable, two different verified model identities -- the capability
+#     # OS-49 exists for. This pair is independent ONLY because both models are
+#     # positively verified at delivery time AND differ as RESOLVED values. Two
+#     # distinct declared tokens that resolve to the same model are refused.
+#     glm-split:
+#       defaults:
+#         worker:
+#           command: claude
+#           model: glm-5.2
+#         reviewer:
+#           command: claude
+#           model: glm-5.3-flash
+#       phases:
+#         design:
+#           # A per-phase override carrying its own model. Mixed forms are legal:
+#           # the reviewer below is a plain string, i.e. a command with no model.
+#           worker:
+#             command: claude
+#             model: glm-5.3-flash
+#           reviewer: codex
+#       final_review:
+#         reviewer:
+#           command: claude
+#           model: glm-5.2

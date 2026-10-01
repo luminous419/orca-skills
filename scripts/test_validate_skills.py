@@ -1763,14 +1763,31 @@ class ValidatorRegressionTests(unittest.TestCase):
             "session reuse contract keys drifted"
         )
 
-    def test_reuse_eligibility_shorter_than_eight_conditions_fails(self) -> None:
+    def test_reuse_eligibility_shorter_than_the_full_condition_set_fails(self) -> None:
+        """OS-49 appended a ninth condition, so the truncation and the expected message
+        move with it. What this test asserts is unchanged: dropping a condition from the
+        machine line is rejected rather than silently shrinking the gate."""
         self.mutate_orchestration_skill(
-            ", not_coordinator_or_adopted, not_in_lifecycle_recovery\n",
+            ", not_coordinator_or_adopted, not_in_lifecycle_recovery"
+            ", compatible_model_identity\n",
             "\n",
         )
 
         self.assert_lifecycle_contract_rejected(
-            "REUSE_ELIGIBILITY must list exactly eight conditions"
+            "REUSE_ELIGIBILITY must list exactly nine conditions"
+        )
+
+    def test_dropping_only_the_model_condition_fails(self) -> None:
+        """The ninth condition specifically: removing it from the machine line must be
+        rejected, so the shipped contract cannot quietly return to an eight-condition
+        gate while the code enforces nine."""
+        self.mutate_orchestration_skill(
+            ", compatible_model_identity\n",
+            "\n",
+        )
+
+        self.assert_lifecycle_contract_rejected(
+            "REUSE_ELIGIBILITY must list exactly nine conditions"
         )
 
     def test_reuse_zero_command_sentence_removal_fails(self) -> None:
@@ -2116,9 +2133,13 @@ class ValidatorRegressionTests(unittest.TestCase):
     def test_a_schema_version_that_drifts_from_the_writer_fails(self) -> None:
         """The version is stated in two places by necessity -- the constant and the
         prose. This validator is what keeps them one value instead of two."""
+        # Derived from the writer's own constant rather than transcribed, so this
+        # mutation target cannot go stale the next time the record takes an additive
+        # MINOR bump -- which is exactly what happened at OS-49 (1.0 -> 1.1).
         self.mutate_orchestration_skill(
-            "FINAL_REVIEW_AUDIT_SCHEMA_VERSION = 1.0",
-            "FINAL_REVIEW_AUDIT_SCHEMA_VERSION = 2.0",
+            f"FINAL_REVIEW_AUDIT_SCHEMA_VERSION = "
+            f"{run_logging.FINAL_REVIEW_AUDIT_SCHEMA_VERSION}",
+            "FINAL_REVIEW_AUDIT_SCHEMA_VERSION = 9.9",
         )
 
         self.assert_lifecycle_contract_rejected(

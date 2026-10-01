@@ -73,6 +73,28 @@ class OrcaAdapter:
         effect fails closed (``IDEMPOTENCY_RECOVERY_UNSUPPORTED`` -> BLOCKED) and the
         remaining reconciliation is an operator decision.  Closing that window is OS-37's
         production process/PTY ownership work, not OS-40's.
+
+        OS-49: ``model_selection_verified`` is deliberately **not** declared, for TWO
+        independent reasons, either of which alone forbids the token.
+
+        (i) This adapter cannot REQUEST a model selection.  Orca's
+        ``worker-start --model`` is unreachable from this runtime -- the recognized-agent-id
+        rung has no code path here, and the two rungs this adapter does use refuse
+        ``--model`` at flag validation -- and no in-band model-selection syntax,
+        acknowledgement format or output semantics has been observed for any agent this
+        adapter drives.  So it can name no member of the harness's closed
+        ``MODEL_SELECTION_REQUEST_METHODS``.  That vocabulary is deliberately per-runtime
+        rather than per-CLI: this module branches on no agent's identity, here or anywhere.
+
+        (ii) It cannot OBSERVE a resolution.  It has no declared resolved-model locator,
+        and a launch receipt's own echo of what was asked for is not an observation of what
+        a provider resolved.
+
+        This is what makes the real-runtime path fail closed: a profile that declares a
+        model is refused at profile-validation time with ``AGENT_MODEL_NOT_SUPPORTED``,
+        before any Run exists, and a declared model that somehow reached a dispatch would be
+        refused again at the pre-delivery barrier.  Supplying the first adapter that can
+        honestly declare both legs is OS-14's work, not OS-49's.
         """
         offered = BASE_CAPABILITIES | frozenset(
             {"dispatch_provenance", "dependency_edges", "runtime_ownership", EXTERNAL_LOOKUP}

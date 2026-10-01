@@ -948,7 +948,11 @@ class RunTimingTracker:
 # module would have to be added to release_manifest.py's required_skill_paths(); a
 # function here rides the parity rule that already exists.
 
-FINAL_REVIEW_AUDIT_SCHEMA_VERSION = "1.0"
+# 1.1, a MINOR bump, for OS-49's five additive reviewer-model fields. A MAJOR bump is
+# FORBIDDEN here: the reader checks only the MAJOR component plus the presence of
+# _REQUIRED_RECORD_FIELDS, so bumping MAJOR would make every historical 1.0 record read
+# as `unknown_major` -- the records this family exists to preserve.
+FINAL_REVIEW_AUDIT_SCHEMA_VERSION = "1.1"
 FINAL_REVIEW_REDACTION_POLICY_VERSION = "redaction/1.1"
 # 2.0, not 1.1: `orchestrator_log.content` is GONE and `orchestrator_log.digest` is
 # renamed, both of which break a reader that has not been updated. The rename is the
@@ -993,6 +997,17 @@ FINAL_REVIEW_EVIDENCE_BUNDLE_FILENAME = "FINAL_REVIEW_EVIDENCE_BUNDLE.json"
 FINAL_REVIEW_REDACTED_METADATA_FIELDS = (
     "reviewer_agent_command",
     "reviewer_agent_origin",
+    # OS-49. The Final Reviewer's model identity, including its REQUEST leg, so which
+    # effective agent identity produced this review is reconstructible from the record
+    # alone. They join this tuple beside the two command fields and for the same reason:
+    # they are free-form strings the routing and the driver wrote, so they pass through
+    # the same versioned policy rather than sitting "next to" a covered field and
+    # silently skipping it.
+    "reviewer_requested_model",
+    "reviewer_resolved_model",
+    "reviewer_model_state",
+    "reviewer_model_request_method",
+    "reviewer_model_request_evidence",
     "failure_detail",
     "notes",
     "stored_task_spec.capture_error",
@@ -3109,6 +3124,11 @@ def write_final_review_audit_record(
     reviewer_terminal: str = "",
     reviewer_agent_command: str = "",
     reviewer_agent_origin: str = "",
+    reviewer_requested_model: str = "",
+    reviewer_resolved_model: str = "",
+    reviewer_model_state: str = "",
+    reviewer_model_request_method: str = "",
+    reviewer_model_request_evidence: str = "",
     report_path: str | Path | None = None,
     failure_detail: str = "",
     observed_input_bytes: int | None = None,
@@ -3177,6 +3197,18 @@ def write_final_review_audit_record(
         "reviewer_terminal": reviewer_terminal,
         "reviewer_agent_command": reviewer_agent_command,
         "reviewer_agent_origin": reviewer_agent_origin,
+        # OS-49. Additive, and empty on every run that declares no model -- which is what
+        # keeps a 1.0-era record and a 1.1 record of a model-less run the same document in
+        # every way that matters. `reviewer_model_request_evidence` is the one-cell
+        # `token:request_stamp->observe_stamp` rendering, so "a selection was REQUESTED for
+        # this attempt BEFORE the resolved model was observed" is reconstructible from the
+        # record by the arithmetic request_stamp < observe_stamp, with no appeal to code
+        # that is no longer running.
+        "reviewer_requested_model": reviewer_requested_model,
+        "reviewer_resolved_model": reviewer_resolved_model,
+        "reviewer_model_state": reviewer_model_state,
+        "reviewer_model_request_method": reviewer_model_request_method,
+        "reviewer_model_request_evidence": reviewer_model_request_evidence,
     }
     repository = _capture_repository_state() if capture else None
     if repository is not None:

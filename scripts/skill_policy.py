@@ -12,24 +12,30 @@ from typing import Any, Callable
 
 try:  # pragma: no cover - import shim, exercised by both invocation forms
     from scripts.agent_profile import (
+        MODEL_EVIDENCE_NONE,
         RUNTIME_LOOP,
         RUNTIME_ORCHESTRATION,
         AgentProfileError,
         RunRouting,
+        effective_identity_independent,
         materialize_run_routing,
         select_agent_profile,
+        validate_effective_identity,
         validate_required_roles,
         validate_profile_command_safety,
         validate_routing_commands,
     )
 except ImportError:  # pragma: no cover - same module, flat import path
     from agent_profile import (
+        MODEL_EVIDENCE_NONE,
         RUNTIME_LOOP,
         RUNTIME_ORCHESTRATION,
         AgentProfileError,
         RunRouting,
+        effective_identity_independent,
         materialize_run_routing,
         select_agent_profile,
+        validate_effective_identity,
         validate_required_roles,
         validate_profile_command_safety,
         validate_routing_commands,
@@ -317,7 +323,15 @@ def evaluate_invocation(
                 reviewer=reviewer,
                 max_iterations=None,
             )
-        if worker == reviewer:
+        # OS-49: the ONE implementation of the effective-identity rule, not a second
+        # `worker == reviewer` that could drift from it. On this legacy path no
+        # model exists anywhere, so both sides' evidence state is `none` and the
+        # rule's row 4 applies -- behaviourally byte-identical to the pre-OS-49
+        # comparison it replaces, which is the point of routing it through here.
+        independent, _reason = effective_identity_independent(
+            (worker, "", MODEL_EVIDENCE_NONE), (reviewer, "", MODEL_EVIDENCE_NONE)
+        )
+        if not independent:
             return _blocked(
                 errors["worker_reviewer_must_differ"],
                 worker=worker,
@@ -564,6 +578,16 @@ def _resolve_agent_routing(
             which=which,
         )
         validate_required_roles(routing)
+        # OS-49 GATE A, third and last in this enumerated order, deliberately.
+        # Independence is only a meaningful question once both sides have resolved
+        # to an allowlisted command that exists; asking it first would report
+        # WORKER_REVIEWER_MUST_DIFFER for a pair whose real defect is an unrouted
+        # role. No capability is offered here -- this is a real production door, and
+        # no real placement in this environment can request a model selection and
+        # positively observe the resolution -- so a declared model is refused with
+        # AGENT_MODEL_NOT_SUPPORTED before any Run exists. That default is the
+        # fail-closed behaviour, not an omission.
+        validate_effective_identity(routing)
     except AgentProfileError as exc:
         return replace(
             decision, status="BLOCKED", reason=exc.reason, should_execute=False

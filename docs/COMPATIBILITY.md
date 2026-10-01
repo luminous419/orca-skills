@@ -391,3 +391,234 @@ cross-session resume are not claimed.
 New clarification requests and responses use schema generation v2; homogeneous historical v1 single-item artifacts remain immutable and are never migrated or rewritten.
 
 OS-30 adds a separate `clarifications/` namespace and does not widen or migrate the OS-28/OS-29 decision ledger. Historical blocked runs without that directory remain valid historical evidence. The installed orchestration tool uses only Python 3.11+ standard-library APIs and its adjacent shipped `run_logging.py`; the loop Skill documents the semantics but does not expose the artifact runtime.
+
+## OS-49 — model-aware agent routing: `version: 2` is additive, and a declared model is refused
+
+OS-49 makes an agent's **effective identity** `(command, model)` rather than the command
+alone. The three historical GLM/Gemma rows in the compatibility matrix above are **not**
+restated, re-scoped or re-dated by this section; it appends only, and it claims **no**
+company-environment validation of any kind.
+
+### Agent Profile schema versions
+
+| version | role value | status |
+| --- | --- | --- |
+| 1 | a command **string**; a model is not representable at all | **FROZEN.** This version's meaning will not change, and every existing v1 document parses, routes and logs exactly as before |
+| 2 | a command string **or** a `{command, model}` indented **block mapping** | the model-aware schema |
+
+`SUPPORTED_SCHEMA_VERSIONS` is `(1, 2)` and the shared policy contract's
+`agent_profile.schema_versions` is `[1, 2]` in **both** skills. A plain string role value in
+a v2 document means exactly what it means in v1. Mixed forms in one document are legal. A
+model may be written in exactly five positions — `defaults.worker`, `defaults.reviewer`,
+`phases.<phase>.worker`, `phases.<phase>.reviewer`, `final_review.reviewer` — and nowhere
+else.
+
+The inline spelling `worker: {command: claude, model: glm-5.2}` does **not** work: the
+restricted YAML reader supports flow sequences but not flow mappings, so the indented block
+is the only valid form and the inline one is refused by name.
+
+**Reading a newer document with an older installed Skill** fails closed by VERSION
+(`unsupported schema version 2; supported: 1`) rather than by complaining about the role
+value's type. That is deliberate: the message names the cause and the remedy, and the model
+declaration stays in the file instead of being deleted — a deleted declaration would produce
+a silently model-less run, which is the outcome this feature exists to prevent.
+
+### The one v1 configuration value that does not survive
+
+A `version: 1` profile that put the **same command** on both sides of a MEDIUM/HIGH-risk
+gate is now refused with `WORKER_REVIEWER_MUST_DIFFER`, before any Run, Task, Dispatch or
+terminal exists. The independence rule is **categorical** — it applies at v1 exactly as at
+v2, because a model-selecting executable makes a command string insufficient evidence of
+identity regardless of which schema version declared it.
+
+Two separate sessions on one command remain a real invariant, owned by the session reuse
+gate's role condition, but they are **no longer sufficient**. `.orca/agent-profiles.example.yaml`
+was migrated in the same change, and its previous comment asserting the opposite was
+replaced.
+
+Unaffected: **distinct model-pinned wrapper commands.** A profile routing `claude-opus`
+against `codex-sol` declares no model, carries evidence state `none` everywhere, and routes
+exactly as before.
+
+### Model selection is fail-closed, and the real runtime is UNSUPPORTED here
+
+Declaring **no** model preserves pre-OS-49 behaviour byte-for-byte: no selection is
+requested, no driver is consulted, no new refusal exists, and the logs are identical.
+
+Declaring a model commits the run to this ordered lifecycle, per dispatch:
+
+```text
+create/attach session -> REQUEST model selection -> positively VERIFY the resolved model
+-> deliver the task -> record provenance
+```
+
+A Worker or Reviewer task is **never** delivered before the requested model has been
+positively verified **for that attempt**. Reading whatever model a session happens to
+already be on is not evidence: a selection must have been *requested*, and the resolution
+observed *afterwards*.
+
+| failure | means |
+| --- | --- |
+| `AGENT_MODEL_NOT_SUPPORTED` | the model is well-formed but nothing in this run can select it and positively observe the result |
+| `INVALID_AGENT_MODEL` | the model value is not a simple model token |
+| `model_selection_unsupported` | a selection cannot be requested at all — no driver, or no supported request method |
+| `model_selection_request_absent` | no selection was requested for this attempt |
+| `model_selection_request_stale` | the request belongs to another attempt, or the two legs were not drawn in order |
+| `model_selection_unverified` | requested, never positively observed |
+| `model_selection_mismatch` | requested ≠ resolved |
+| `model_selection_ambiguous` | contradictory resolved values for one identity |
+| `model_selection_pair_unadmitted` | a same-command counterpart holds no positively verified model, so independence is not established and nothing may be delivered for either role |
+
+**In this release a declared model is REFUSED on every real placement**, with
+`AGENT_MODEL_NOT_SUPPORTED` at profile-validation time. Three independent mechanisms produce
+that refusal, any one of them sufficient: the capability parameter defaults to empty and
+neither production door passes one; the Orca adapter declares no model capability; and no
+real adapter can name a member of the closed request-method vocabulary. This is a designed
+fail-closed state, not a gap — Claude Code's in-band model-selection syntax, its
+acknowledgement format and its output semantics have not been observed in this environment,
+and Orca's `worker-start --model` is unreachable from this runtime. Nothing here parses a
+model-selection acknowledgement, and no module composes such a command.
+
+Model-aware routing is positively supported **only** on the deterministic driver seam, where
+the request leg is honest: the reference driver records a requested model against the
+session and reads that state back, composing no command and parsing no output.
+
+### Worker/Reviewer independence is admitted as a PAIR, before the first delivery
+
+`requested` is a **declaration**, not an observation, so two distinct declared models on one
+command are **not** evidence of two agents — two declared tokens can alias onto one resolved
+model. Declaration-time classification therefore has **three** outcomes, not two:
+
+| outcome | when | effect |
+| --- | --- | --- |
+| `independent` | the commands differ, **or** both models are positively resolved and differ | routes |
+| `refused` | same command with the same declared model, one side declaring no model, or a placement that cannot select or observe a model | refused before any Run, Task, Dispatch or terminal exists |
+| `pending_model_verification` | same command, two **distinct declared** models | an **obligation**, not a pass |
+
+A `pending` pair carries an obligation the declaration gate structurally cannot discharge,
+and a per-role barrier cannot discharge it either: a Worker dispatch precedes its Reviewer
+session, so at the Worker's barrier there is no counterpart to compare against. The pair is
+therefore admitted **as a pair**, before the first delivery of **either** role:
+
+```text
+create/attach BOTH sessions
+  -> request + positively verify the worker's model
+  -> request + positively verify the reviewer's model      == pair admission
+  -> deliver the first task                                (either role)
+```
+
+Attempting to deliver either role while its same-command counterpart holds no positively
+verified model is refused with `model_selection_pair_unadmitted`, and no `worker-start`, no
+`dispatch` and no `terminal send` has run at that point. A path that cannot bring both
+sessions up before the first delivery therefore **cannot route a same-command model-aware
+pair at all** — a fail-closed outcome, not a gap.
+
+`AGENT_PROFILE_MODEL_GATES` names three gates (`declaration_before_run`,
+`verification_before_delivery`, `pair_admission_before_first_delivery`) and
+`AGENT_PROFILE_MODEL_LIFECYCLE` names five ordered steps (`attach_both_sessions`,
+`request_selection`, `verify_resolved`, `admit_pair`, `deliver_task`). The per-dispatch
+lifecycle stated earlier in this section remains exactly true for every role; this
+subsection adds the pair step that a same-command pair additionally requires. Both contract
+values are exact ordered equalities checked by `scripts/validate_skills.py` and locked by
+`scripts/test_os49_contract_locks.py`.
+
+**Unaffected: distinct-command pairs.** Independence holds on the commands alone, so no
+counterpart evidence is required and the delivery lifecycle is byte-identical to before
+OS-49 — which is what keeps this repository's own `claude-opus` / `codex-sol` wrappers, and
+every v1 document, routing unchanged. A model-less run has no model axis and therefore no
+obligation.
+
+**Also unaffected: an OPTIONAL counterpart.** The requirement is scoped to a counterpart
+that is **required** and resolved, exactly as the declaration gate's pair check is. At LOW
+risk the Reviewer entry exists but is optional and no Reviewer is ever dispatched, so there
+is no pair to admit and a LOW-risk model-aware Worker routes unchanged — the same rule the
+PATH check follows: a role nobody dispatches must not fail a run. An unresolved *required*
+role is still `AGENT_PROFILE_ROLE_UNRESOLVED`'s business, not this gate's.
+
+### Session reuse is model-bound
+
+The session reuse gate has **nine** conditions; OS-49 appended `compatible_model_identity`
+and changed none of the eight. It can only ever refuse a reuse that would otherwise have
+been allowed, so no OS-37/OS-48 ownership, finality or provenance protection is weakened and
+nothing previously refused becomes allowed. A chain with no model anywhere produces exactly
+the pre-OS-49 decisions.
+
+Reuse is refused when the previous dispatch's model differs from the next request, when the
+previous identity cannot be positively verified, when no record shows the model was actually
+*requested* on that dispatch, when the evidence belongs to another dispatch, when the row is
+internally contradictory, or when no model-selection capability exists.
+
+### Model provenance
+
+`ORCHESTRATOR_LOG_COLUMNS` is **byte-unchanged**. Provenance is a new event NAME,
+`agent_identity_bound`, emitted once per settled dispatch beside the settlement row — not a
+new column, because every reader skips a row whose cell count differs and a new column would
+make every historical row invisible. Its `result` cell carries exactly one model-evidence
+state and its `detail` cell carries the command, the requested and resolved models, the
+request method, the selection token and both ordinals, so *"a selection was requested for
+this attempt before the resolved model was observed"* is reconstructible from the artifact
+alone by arithmetic.
+
+The Final Review audit record takes a **MINOR** bump, `1.0` → `1.1`, for five additive
+reviewer-model fields. A MAJOR bump is forbidden: the reader checks only the MAJOR
+component, so bumping it would make every historical `1.0` record read as `unknown_major`.
+The standalone journal gains **no** field — its digest covers the record, so a schema break
+there is not authorised.
+
+Correction, re-review, downstream revalidation and the Final Adversarial Review all preserve
+the materialized routing identity. A round that resolves to a different model for the same
+`(phase, role)` is **refused** rather than logged, and every round re-runs the full
+lifecycle: a round cannot inherit an earlier round's verification.
+
+### The loop skill
+
+`orca-worker-reviewer-loop` needs no new mechanism. The profile parser is shared, so a
+`version: 2` model-bearing document parses identically there and is not a syntax error.
+Because that runtime has no Dispatch, no reuse chain and no pre-delivery barrier, a declared
+model is refused there with `AGENT_MODEL_NOT_SUPPORTED` — through the **same** code path as
+the orchestration runtime, not a runtime branch. No reuse condition, no delivery barrier and
+no agent-profile anchor block is added to the loop skill.
+
+### Two corrections made during OS-49's own TEST phase
+
+Both were found by the TEST phase, reproduced independently by the phase Reviewer, and
+fixed in `orca_runtime_harness.py` inside OS-49. They are recorded here because each one
+changes an observable behaviour relative to the state the IMPLEMENTATION phase left, and
+neither relaxes anything.
+
+**The Final Adversarial Review's model is routed, requested and verified on the spelling
+production dispatches.** A Final Review attempt is dispatched as role `reviewer` in phase
+`final_review` — the only spelling any production initiator produces. The role → routing
+key mapping recognised the Final Reviewer by the ROLE STRING alone, so that attempt looked
+up an entry that does not exist, the pre-delivery barrier returned at "no model declared",
+and a declared `final_review.reviewer.model` was never requested, never verified and never
+recorded while the task was delivered anyway. The phase is now part of the mapping:
+`final_review` is a reviewer-only gate over a whole run and therefore has exactly one
+routing slot, which either spelling of the role resolves to. The Final Reviewer is now
+subject to the same request → verify → deliver barrier every phase role already was, and
+stays **outside** the pair-admission rule exactly as documented above, because
+`final_reviewer` has no counterpart role to look up. The audit record's five reviewer-model
+fields are also written as one bundle from one source, so a record can no longer name a
+`reviewer_requested_model` without the evidence that resolved it.
+
+**Model evidence is run-scoped.** Accepted model evidence is per-run state exactly like the
+terminal ledger and the delivery cursor: every record was accepted against one run's
+six-part attempt key, and the record already names the run it was observed in. It is now
+cleared at the run boundary alongside those collections, and the counterpart read that
+GRANTS pair admission additionally requires the counterpart's `observed_at_run` to be the
+active run. Without both, a second run on one harness instance inherited the first run's
+counterpart evidence and delivered a same-command Worker whose Reviewer did not exist in
+that run at all. This can refuse nothing a same-run pair did before — a same-run record's
+`observed_at_run` is the active run by construction — and a cross-run record now falls to
+`model_selection_pair_unadmitted`, which is the fail-closed outcome.
+
+### What remains for OS-14
+
+- company-environment verification of model-aware routing; **nothing here claims it**
+- which of GLM-5.2 and GLM-5.3-flash should be Worker and which Reviewer
+- the real shape of a launch receipt's effective-model field (unobserved; nothing depends on it)
+- real in-band model-selection syntax, acknowledgement format and output semantics
+- whether the company environment's `claude` is reachable as a recognized Orca agent id
+- whether `claude-gemma` leaves `known_agent_commands` (unchanged by OS-49)
+- the first adapter or driver that can **honestly declare both legs** in a real environment,
+  which is the one thing that lifts OS-49's fail-closed refusal for a real run

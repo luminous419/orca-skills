@@ -82,6 +82,13 @@ REQUIRED_ERROR_CODES = (
     "INVALID_AGENT_PROFILE",
     "UNKNOWN_AGENT_PROFILE",
     "AGENT_ROLE_UNRESOLVED",
+    # OS-49. Also SHARED, for the same reason: the profile PARSER is one module serving
+    # both runtimes, so a model-bearing document reaches both and both must be able to
+    # name why they refused it. The two codes are the exact model analogues of
+    # INVALID_AGENT_COMMAND (token shape, whole definition) and AGENT_NOT_ALLOWED
+    # (usability in this environment, required entries only).
+    "INVALID_AGENT_MODEL",
+    "AGENT_MODEL_NOT_SUPPORTED",
 )
 
 USER_ABSOLUTE_PATH_PATTERNS = (
@@ -196,6 +203,9 @@ REUSE_CONTRACT: dict[str, tuple[str, ...]] = {
         "not_explicitly_retained",
         "not_coordinator_or_adopted",
         "not_in_lifecycle_recovery",
+        # OS-49. APPENDED, never substituted: the gate genuinely has nine conditions now,
+        # and condition 9 can only ever REFUSE a reuse the eight above would have allowed.
+        "compatible_model_identity",
     ),
     "REUSE_TERMINATION": ("zero_lifecycle_commands", "finalize_exactly_once"),
     "REUSE_ORDER": (
@@ -852,10 +862,15 @@ AGENT_PROFILE_CONTRACT: dict[str, tuple[str, ...]] = {
     "AGENT_PROFILE_PARAMETER": ("profile",),
     "AGENT_PROFILE_SELECTION_STATES": ("omitted", "selected", "invalid"),
     "AGENT_PROFILE_RESOLUTION_SCOPE": ("resolved_once_before_run_never_per_attempt",),
+    # OS-49 inserted a genuine STEP into this enumerated order: the declaration-time
+    # effective-identity gate runs after the command and required-role gates and still
+    # before the Run exists. Leaving the value unchanged would ship a contract stating an
+    # order the code no longer follows.
     "AGENT_PROFILE_GATE_ORDER": (
         "materialize",
         "validate_commands",
         "validate_required_roles",
+        "validate_effective_identity",
         "create_run",
     ),
     "AGENT_PROFILE_PHASE_WORKER_PRECEDENCE": ("explicit", "phase", "defaults"),
@@ -886,8 +901,48 @@ AGENT_PROFILE_CONTRACT: dict[str, tuple[str, ...]] = {
     "AGENT_PROFILE_RISK_DEPENDENCY": ("reads_settled_risk_never_modifies",),
     "AGENT_PROFILE_QUALITY_AXIS": ("independent",),
     "AGENT_PROFILE_LEGACY": ("omitted_profile_preserves_existing_behavior",),
+    # ---- OS-49: the seven model-identity facts, orchestration-only -------------------
+    # They belong in this anchor block rather than in the SHARED policy contract because
+    # only this runtime has a pre-delivery verification barrier. The loop skill gets the
+    # shared schema version and the two shared error codes and no barrier contract.
+    "AGENT_PROFILE_ROLE_VALUE": (
+        "command_string_v1",
+        "command_or_command_model_mapping_v2",
+    ),
+    "AGENT_PROFILE_SCHEMA_V1_MEANING": (
+        "command_string_only_model_not_representable",
+    ),
+    "AGENT_PROFILE_MODEL_EVIDENCE_STATES": (
+        "none", "requested", "verified", "mismatch", "unverifiable", "stale",
+    ),
+    "AGENT_PROFILE_EFFECTIVE_IDENTITY": ("command_and_positively_resolved_model",),
+    # Three gates, not two. The third was added for OS-49 review finding F-001: the
+    # first two are per-ROLE and cannot establish Worker/Reviewer independence on one
+    # command, because the Worker's dispatch precedes its Reviewer session. Independence
+    # on a same-command pair is therefore admitted as a PAIR, before the first delivery
+    # of either role.
+    "AGENT_PROFILE_MODEL_GATES": (
+        "declaration_before_run",
+        "verification_before_delivery",
+        "pair_admission_before_first_delivery",
+    ),
+    # The ORDERED lifecycle, as a declared contract VALUE the validator compares rather
+    # than prose a reader has to infer: a task is never delivered before a selection was
+    # requested for that attempt, the resolution was THEN positively observed, and -- on
+    # a same-command pair -- the COUNTERPART's resolution was positively observed too.
+    # `attach_both_sessions` is what makes that last step possible at all.
+    "AGENT_PROFILE_MODEL_LIFECYCLE": (
+        "attach_both_sessions", "request_selection", "verify_resolved", "admit_pair",
+        "deliver_task",
+    ),
+    "AGENT_PROFILE_MODEL_SELECTION": (
+        "declared_driver_capability_only_never_launch_argument",
+    ),
 }
-AGENT_PROFILE_CONTRACT_MAX_LINES = 18
+# Raised from 18 in the same change that added the seven keys above. The constant is a
+# cap on an EXACT enumeration, so adding contract keys is the intended way to grow it;
+# the new exact count is itself asserted by scripts/test_os49_contract_locks.py.
+AGENT_PROFILE_CONTRACT_MAX_LINES = 25
 AGENT_PROFILE_PARAMETER_DOC_ANCHOR = "profile=<name>"
 # The sentences that keep the two runtime differences from quietly disappearing from
 # the loop skill. Prose rather than an anchor block: orca-worker-reviewer-loop has no
@@ -1422,9 +1477,16 @@ def validate_machine_readable_contracts(validation: Validation) -> None:
         )
         # OS-4 R11: this is about the LEGACY default PAIR only -- the two commands a
         # profile-less invocation falls back to. It says nothing about a `defaults`
-        # block inside an agent profile, where worker and reviewer are allowed to be
-        # the same command (session separation is a different invariant, owned by the
-        # reuse gate's role condition).
+        # block inside an agent profile; that block's independence is judged by the
+        # effective-identity gate, not here.
+        #
+        # OS-49 corrected the rationale this comment used to carry. Session
+        # separation is still a distinct invariant owned by the reuse gate's role
+        # condition, but it is NO LONGER SUFFICIENT: one executable can select a
+        # model per session, so a same-command Worker/Reviewer pair is independent
+        # only when both sides' models are positively verified and different.
+        # A same-command pair inside a profile is therefore refused with
+        # WORKER_REVIEWER_MUST_DIFFER unless it carries two verified models.
         validation.check(
             defaults.get("worker") in known_commands
             and defaults.get("reviewer") in known_commands
@@ -1511,6 +1573,8 @@ def validate_machine_readable_contracts(validation: Validation) -> None:
             "invalid_agent_profile",
             "unknown_agent_profile",
             "agent_role_unresolved",
+            "invalid_agent_model",
+            "agent_model_not_supported",
         }
         validation.check(
             set(errors) == required_error_keys
@@ -1901,8 +1965,8 @@ def validate_reuse_contract(validation: Validation) -> None:
     )
     eligibility = parsed.get("REUSE_ELIGIBILITY", ())
     validation.check(
-        len(eligibility) == 8,
-        "REUSE_ELIGIBILITY must list exactly eight conditions",
+        len(eligibility) == 9,
+        "REUSE_ELIGIBILITY must list exactly nine conditions",
     )
     validation.check(
         "zero_lifecycle_commands" in parsed.get("REUSE_TERMINATION", ()),
@@ -2862,7 +2926,13 @@ FINAL_REVIEW_AUDIT_SECTION_END = "\n## 10."
 # paraphrase this validator would accept a weaker version of.
 FINAL_REVIEW_AUDIT_ANCHORS = (
     "final_review_audit/",
-    "FINAL_REVIEW_AUDIT_SCHEMA_VERSION = 1.0",
+    # OS-49: derived from the module constant rather than transcribed. The separate
+    # check below already requires the prose and run_logging to agree, so a hard-coded
+    # literal here was a SECOND source of truth for one version -- it went stale the
+    # moment the audit record took its additive MINOR bump, while the real invariant
+    # ("the SKILL text states the version the writer actually stamps") held throughout.
+    # Deriving it keeps the anchor and cannot disagree with the writer.
+    f"FINAL_REVIEW_AUDIT_SCHEMA_VERSION = {run_logging.FINAL_REVIEW_AUDIT_SCHEMA_VERSION}",
     "FINAL_REVIEW_REDACTION_POLICY_VERSION = redaction/1.1",
     "FINAL_REVIEW_EVIDENCE_BUNDLE.json",
     "final-review-audit-write",

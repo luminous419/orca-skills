@@ -2986,6 +2986,15 @@ def orca_run_routing(*, agent_profile_name: str, requested_phases: tuple[str, ..
             f"{ORCA_ADAPTER_REQUIRES_AGENT_PROFILE}: profile {agent_profile_name!r} "
             "leaves required roles unrouted: "
             + ", ".join(f"{entry.phase}/{entry.role}" for entry in unresolved))
+    # OS-49 GATE A, this door's copy. Every validation the Coordinator's door applies
+    # must also land here or the shipped launcher becomes a weaker entrance into the
+    # same runtime. No capability is offered, exactly as on the policy door, so a
+    # declared model is refused with AGENT_MODEL_NOT_SUPPORTED before the Run exists.
+    try:
+        agent_profile.validate_effective_identity(routing)
+    except agent_profile.AgentProfileError as exc:
+        raise LauncherError(
+            f"{ORCA_ADAPTER_REQUIRES_AGENT_PROFILE}: {exc.reason}: {exc}") from exc
     return routing
 
 

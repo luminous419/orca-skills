@@ -290,7 +290,7 @@ phase 전이, phase gate, correction loop, iteration budget, Final Review routin
     "parameter": "profile",
     "project_source": ".orca/agent-profiles.yaml",
     "user_source": "~/.orca/agent-profiles.yaml",
-    "schema_versions": [1],
+    "schema_versions": [1, 2],
     "source_precedence": ["project_local", "user_global"],
     "merge": "whole_definition"
   },
@@ -334,7 +334,9 @@ phase 전이, phase gate, correction loop, iteration budget, Final Review routin
     "unsupported_phase_combination": "UNSUPPORTED_PHASE_COMBINATION",
     "invalid_agent_profile": "INVALID_AGENT_PROFILE",
     "unknown_agent_profile": "UNKNOWN_AGENT_PROFILE",
-    "agent_role_unresolved": "AGENT_ROLE_UNRESOLVED"
+    "agent_role_unresolved": "AGENT_ROLE_UNRESOLVED",
+    "invalid_agent_model": "INVALID_AGENT_MODEL",
+    "agent_model_not_supported": "AGENT_MODEL_NOT_SUPPORTED"
   },
   "decision_policy": {
     "schema_version": 1,
@@ -664,11 +666,89 @@ STATUS: BLOCKED
 REASON: AGENT_ROLE_UNRESOLVED
 ```
 
+```text
+STATUS: BLOCKED
+REASON: INVALID_AGENT_MODEL
+```
+
+```text
+STATUS: BLOCKED
+REASON: AGENT_MODEL_NOT_SUPPORTED
+```
+
 `INVALID_AGENT_PROFILE`은 파일이 존재하지만 malformed YAML / 미지원 `version` / unknown 또는 중복 키 /
 unknown phase key / 비어 있거나 문자열이 아닌 command 값 / 읽을 수 없는 경로인 경우다.
 `UNKNOWN_AGENT_PROFILE`은 그 이름의 profile이 두 source 어디에도 없는 경우이며, 값이 없는
 `profile=`도 생략이 아니라 명시적으로 잘못된 값이므로 여기에 해당한다.
 `AGENT_ROLE_UNRESOLVED`는 required role이 precedence 체인을 모두 거쳐도 command를 얻지 못한 경우다.
+
+`INVALID_AGENT_MODEL`은 선언된 model 값이 simple model token이 아닌 경우다(경로 구분자, 공백,
+shell metacharacter, 앞의 `-`, 꺾쇠 placeholder 등). command token과 **별개의 pattern**으로 판정하며,
+model이 command token으로 취급되거나 command 문자열에 합성되는 code path는 존재하지 않는다. 판정 범위는
+selected profile **정의 전체**다 — 이번 invocation이 요청하지 않은 phase의 `model: $(x)`도 trust 문제다.
+`AGENT_MODEL_NOT_SUPPORTED`는 model 값 자체는 well-formed이지만, 이 run에서 그 model을 **선택 요청하고
+해석된 결과를 긍정적으로 관측할 수 있는 capability가 없는** 경우다. 판정 범위는 required entry뿐이며,
+dispatch되지 않는 role의 model 선언이 환경 사실 때문에 run을 막지는 않는다.
+
+### Command identity vs model identity (OS-49)
+
+effective agent identity는 `(command, model)`이다. 하나의 executable이 session마다 model을 선택할 수
+있으므로, command 문자열만으로는 두 agent를 구분하지 못한다. Agent Profile schema `version: 1`은
+**frozen**이다 — role 값은 command 문자열이고 model은 표현할 수 없다. `version: 2`에서 role 값은
+command 문자열 또는 `{command, model}` **block mapping**이며, v2 문서 안의 문자열 role 값은 v1과 정확히
+같은 의미다(command만, model 없음). model은 `defaults.worker`, `defaults.reviewer`,
+`phases.<phase>.worker`, `phases.<phase>.reviewer`, `final_review.reviewer` 다섯 자리에만 쓸 수 있다.
+
+알려지지 않은 schema version, 알려지지 않은 키(role mapping 내부 포함), v1 문서의 mapping role 값,
+`command`가 없는 mapping, 잘못된 타입의 `model`, inline flow mapping, 잘못된 model token은 모두
+Run 생성 이전에 fail-closed로 막힌다.
+
+model을 **선언하지 않으면** 동작은 OS-49 이전과 byte 단위로 동일하다. model을 선언하면 그 model을
+선택 요청하고 해석 결과를 긍정적으로 검증할 수 있는 **명시적으로 지원된 driver/capability**가 있어야만
+routing된다. 이 release에서 실제 runtime 경로에는 그런 capability가 없으므로, model을 선언한 profile은
+`AGENT_MODEL_NOT_SUPPORTED`로 막힌다. 이는 누락이 아니라 설계된 fail-closed 동작이다 — 실제
+model-selection 문법·확인 형식·출력 의미가 이 환경에서 관측되지 않았고, 관측되지 않은 것을 근거로
+삼지 않기 때문이다. 실제 환경 검증과 어느 GLM model이 Worker/Reviewer가 되는지는 OS-14의 범위다.
+
+#### Worker/Reviewer independence는 pair로 승인된다
+
+independence는 **positively resolved model**로만 성립한다. 선언된 model(`requested`)은 관측이 아니라
+선언이므로, 같은 command에 서로 다른 model을 **선언**했다는 사실만으로는 두 agent라는 증거가 되지
+않는다 — 서로 다른 두 선언 token이 하나의 resolved model로 alias될 수 있기 때문이다. 따라서 declaration
+시점의 판정은 두 값이 아니라 **세 값**이다:
+
+- `independent` — command가 다르거나, 양쪽 model이 모두 positively resolved이고 서로 다르다.
+- `refused` — 같은 command + 같은 선언 model, 한쪽 model 미선언, model을 선택/관측할 수 없는 placement.
+  Run 생성 이전에 막힌다.
+- `pending_model_verification` — 같은 command + 서로 다른 선언 model. **통과가 아니라 의무**다.
+
+`pending` pair는 **첫 delivery 이전에** 양쪽 effective identity가 모두 positively verified되고 서로
+달라야 한다. role 단위 barrier만으로는 이것을 성립시킬 수 없다 — Worker dispatch는 Reviewer session이
+존재하기 전에 일어나므로, Worker 쪽 barrier에는 비교할 counterpart가 없다. 그래서 같은 command를 쓰는
+pair의 lifecycle은 다음 순서를 **반드시** 따른다:
+
+```text
+create/attach BOTH sessions
+  -> request model selection + positively verify   (worker)
+  -> request model selection + positively verify   (reviewer)   == pair admission
+  -> deliver the first task                        (either role)
+```
+
+counterpart의 verified model 기록이 없는 상태에서 Worker든 Reviewer든 delivery를 시도하면
+`model_selection_pair_unadmitted`로 거부되며, 그 시점에 `worker-start`/`dispatch`/`terminal send`는 하나도
+실행되지 않는다. 양쪽 session을 미리 확보할 수 없는 경로는 같은 command의 model-aware pair를 routing할
+수 없다 — 이것은 누락이 아니라 fail-closed 결과다. **command가 서로 다른 pair는 영향을 받지 않는다**:
+rule의 첫 번째 row가 command만으로 independence를 성립시키므로, model-pinned wrapper
+(`claude-opus` / `codex-sol`) routing과 그 lifecycle은 OS-49 이전과 동일하다.
+
+pair 요구는 **required이고 resolved된** counterpart에만 적용된다 — declaration gate의 pair 판정과 정확히
+같은 범위다. LOW risk에서는 Reviewer entry가 존재하지만 optional이고 dispatch되지 않으므로 승인할 pair가
+없고, LOW의 model-aware Worker는 그대로 routing된다. dispatch되지 않는 role이 run을 막지 않는다는 것은
+PATH check가 이미 따르는 규칙이다.
+
+이 판정은 phase, risk, quality profile, decision policy를 읽지 않는다. required role 집합을 **읽기만**
+하는 것은 PATH check와 동일한 범위 규칙이며 risk를 바꾸지 않는다. model identity는 기존 `agent_profile`
+축 **안에** 있다.
 
 resolved routing은 이 run 동안 immutable하다. profile 파일이 run 중 변경되어도 correction과
 re-review는 profile을 다시 읽지 않고 최초 resolution을 그대로 사용한다.
@@ -762,6 +842,8 @@ process liveness(axis (c1)), cleanup authority(axis (c2))는 각각 따로 확�
 
 ```text
 dispatchId | taskId | phase | iteration | terminal handle | terminal role | terminal origin |
+agent command | requested model | resolved model | model state | model request method |
+model request evidence | model observed at dispatch |
 (a) | (b) | (c1) | (c2) | finalized
 ```
 
@@ -789,7 +871,7 @@ dispatchId | taskId | phase | iteration | terminal handle | terminal role | term
 reuse는 같은 session에서 Worker와 Reviewer 역할을 바꾸는 것을 허용하지 않는다.
 동일 역할의 동일 agent가 즉시 수행할 다음 Task — 같은 phase의 correction 또는 re-review Task와
 다음 phase의 Task를 모두 포함한다 — 를 수행하는 경우에 사용한다.
-reuse 가능 여부는 아래 `#### Session reuse contract`의 8개 eligibility 조건을 전부 만족할 때에만 참이며,
+reuse 가능 여부는 아래 `#### Session reuse contract`의 9개 eligibility 조건을 전부 만족할 때에만 참이며,
 하나라도 만족하지 못하면 그 handle을 버리고 새 terminal을 만든다.
 
 단 하나의 예외가 있다. §17 Final Adversarial Review Dispatch에는 이 reuse 권장이 적용되지 않는다.
@@ -809,7 +891,7 @@ terminal의 close 판단은 새 Dispatch를 기준으로 한다.
 
 #### Session reuse contract
 
-reuse는 아래 8개 조건을 전부 만족할 때에만 허용된다. 하나라도 만족하지 못하면 그 handle을 버리고 새
+reuse는 아래 9개 조건을 전부 만족할 때에만 허용된다. 하나라도 만족하지 못하면 그 handle을 버리고 새
 terminal을 만들며, 만족하지 못한 조건의 이름을 section 16 보고에 남긴다. 판정은 fail-closed다 —
 확인되지 않은 값은 통과가 아니라 실패다.
 
@@ -836,13 +918,22 @@ terminal을 만들며, 만족하지 못한 조건의 이름을 section 16 보고
 8. `not_in_lifecycle_recovery` — 이전 Dispatch가 recovery/error 상태가 아니다. settlement가 진행 중으로
    남아 있거나, settle되지 못한 사유가 기록되어 있거나, 이전 attempt가 outcome을 남기지 못한 경우는
    전부 여기에 걸린다.
+9. `compatible_model_identity` — 두 Dispatch의 model identity가 긍정적으로 호환된다. 양쪽 모두
+   model을 선언하지 않았다면 이 조건은 지금까지와 동일하게 통과한다. 한쪽이라도 model을 선언했다면,
+   이전 Dispatch의 resolved model이 positively verified로 기록되어 있고 다음 Dispatch가 요청하는
+   model과 같아야 한다. 또한 그 resolved model이 해당 Dispatch에서 실제로 요청된 것이라는 기록
+   (request method와 request evidence)이 함께 남아 있어야 한다. 이전 model을 확인할 수 없거나,
+   요청 기록이 없거나, 요청 model이 다르거나, 선언 -> 미선언으로 바뀌거나, 기록이 이 Dispatch의 것이
+   아니거나, 기록이 서로 모순되거나, model을 선택·검증할 수 있는 capability가 없으면 reuse하지 않는다.
+   확인되지 않은 값은 통과가 아니라 실패다. 이 조건은 기존 8개를 대체하거나 완화하지 않고 **추가**만
+   하므로, 지금까지 거부되던 reuse가 이 조건 때문에 허용되는 경우는 없다.
 
 section 17 Final Adversarial Review Dispatch에는 이 계약이 적용되지 않는다. 모든 Final Adversarial
 Review attempt는 새로 생성한 terminal을 쓰며 어떤 reuse chain에도 들어가지 않는다.
 
 ```text
 REUSE_SCOPE = same_role_across_phases_and_iterations
-REUSE_ELIGIBILITY = same_role, same_agent_command, live_process, previous_dispatch_settled, ownership_transferable, not_explicitly_retained, not_coordinator_or_adopted, not_in_lifecycle_recovery
+REUSE_ELIGIBILITY = same_role, same_agent_command, live_process, previous_dispatch_settled, ownership_transferable, not_explicitly_retained, not_coordinator_or_adopted, not_in_lifecycle_recovery, compatible_model_identity
 REUSE_TERMINATION = zero_lifecycle_commands, finalize_exactly_once
 REUSE_ORDER = verify_settlement, finalize_previous_dispatch, start_next_task_on_same_terminal
 ```
@@ -1506,7 +1597,7 @@ OS-7 범위다 — 이 절이 남기는 것은 그 분석의 입력이 될 원�
 ```text
 <ARTIFACT_ROOT>final_review_audit/
     <dispatch_key>/                 published record -- 완전한 상태로만 존재한다
-        record.json                 audit record (schema_version = 1.0)
+        record.json                 audit record (schema_version = 1.1)
         input.md                    보존된 redacted stored Task spec
         report.md                   보존된 redacted report snapshot
     .staging/                       record가 아니다. reader는 전부 무시한다
@@ -1537,10 +1628,15 @@ embed 직전에 같은 policy로 sanitize되어 `orchestrator_log.content_redact
 없다 — force도, overwrite flag도, update 함수도 없다. retry는 새 Task/Dispatch identity를 갖고 따라서
 새 dispatch_key를 갖는다. record를 "정정"한다는 것은 새 record를 쓰는 것이다.
 
-**schema version과 reader 호환 규칙.** `record.json`의 첫 키는 `schema_version`이고 v1.0의 값은
-`FINAL_REVIEW_AUDIT_SCHEMA_VERSION = 1.0`이다. MAJOR가 1이 아니면 reader는 해석을 **거부**하고
+**schema version과 reader 호환 규칙.** `record.json`의 첫 키는 `schema_version`이고 현재 값은
+`FINAL_REVIEW_AUDIT_SCHEMA_VERSION = 1.1`이다. MAJOR가 1이 아니면 reader는 해석을 **거부**하고
 `unknown`으로 보고한다 — 어떤 필드로부터도 provenance를 추론하지 않는다. MAJOR가 1이고 MINOR가 더
 높으면 아는 필드만 읽고 모르는 필드는 무시한다. 필드 추가는 MINOR, 기존 필드의 의미 변경은 MAJOR다.
+OS-49가 Final Reviewer의 model identity 5개 필드(`reviewer_requested_model`,
+`reviewer_resolved_model`, `reviewer_model_state`, `reviewer_model_request_method`,
+`reviewer_model_request_evidence`)를 **추가**했으므로 1.0 -> 1.1은 MINOR다. MAJOR를 올리는 것은
+금지된다 — 그러면 기존의 모든 1.0 record가 `unknown`으로 읽히는데, 그 record들이야말로 이 family가
+보존하려는 대상이다. 5개 필드는 모두 redaction policy 적용 대상이다.
 
 **provenance는 fail-closed다.** `provenance_state`는 `accepted | voided | unknown`이고 어떤 기본값도
 `accepted`가 아니다 (`FINAL_REVIEW_PROVENANCE_DEFAULT = unknown`). 파일이 없거나, 파싱되지 않거나,
@@ -1866,7 +1962,7 @@ QUALITY_GATE_CONTEXT_ROLES = worker, reviewer, final_reviewer
 AGENT_PROFILE_PARAMETER = profile
 AGENT_PROFILE_SELECTION_STATES = omitted, selected, invalid
 AGENT_PROFILE_RESOLUTION_SCOPE = resolved_once_before_run_never_per_attempt
-AGENT_PROFILE_GATE_ORDER = materialize, validate_commands, validate_required_roles, create_run
+AGENT_PROFILE_GATE_ORDER = materialize, validate_commands, validate_required_roles, validate_effective_identity, create_run
 AGENT_PROFILE_PHASE_WORKER_PRECEDENCE = explicit, phase, defaults
 AGENT_PROFILE_PHASE_REVIEWER_PRECEDENCE = explicit, phase, defaults
 AGENT_PROFILE_FINAL_REVIEWER_PRECEDENCE = final_review, explicit, defaults
@@ -1881,6 +1977,13 @@ AGENT_PROFILE_SECRETS = never_recorded
 AGENT_PROFILE_RISK_DEPENDENCY = reads_settled_risk_never_modifies
 AGENT_PROFILE_QUALITY_AXIS = independent
 AGENT_PROFILE_LEGACY = omitted_profile_preserves_existing_behavior
+AGENT_PROFILE_ROLE_VALUE = command_string_v1, command_or_command_model_mapping_v2
+AGENT_PROFILE_SCHEMA_V1_MEANING = command_string_only_model_not_representable
+AGENT_PROFILE_MODEL_EVIDENCE_STATES = none, requested, verified, mismatch, unverifiable, stale
+AGENT_PROFILE_EFFECTIVE_IDENTITY = command_and_positively_resolved_model
+AGENT_PROFILE_MODEL_GATES = declaration_before_run, verification_before_delivery, pair_admission_before_first_delivery
+AGENT_PROFILE_MODEL_LIFECYCLE = attach_both_sessions, request_selection, verify_resolved, admit_pair, deliver_task
+AGENT_PROFILE_MODEL_SELECTION = declared_driver_capability_only_never_launch_argument
 ```
 
 ## 12. FAIL Loop

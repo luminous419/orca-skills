@@ -70,6 +70,14 @@ REASONS = (
     # `401 Unauthorized`, so "declared but not seeded" is its own named failure rather than
     # an auth mystery at run time.
     "auth_scope_unseeded",
+    # OS-49.  The `profile_flag_unsupported` analogue for model selection: this profile
+    # declares WHERE a resolved model could be read, but the standalone path declares no
+    # channel through which a selection can be REQUESTED for a given attempt.  An
+    # observation locator alone is not a model-selection capability, so the profile is
+    # refused here, at configuration time, rather than being allowed to deliver a task on
+    # a model nothing asked it to adopt.  Lifting this refusal means supplying the request
+    # half, which is OS-14's work.
+    "model_selection_unsupported",
 )
 
 
@@ -394,6 +402,19 @@ def check_profile(profile: StandaloneProfile, child_env: Mapping[str, str], *,
         return _outcome("profile", "fail", "profile_readiness_unverified",
                         {"detail": "the profile declares no readiness_records; READY has "
                                    "no accepting evidence and no text fallback exists"})
+    # OS-49.  A declared ModelSelector is the OBSERVATION half of model selection only.
+    # The standalone path declares no channel through which a selection can be REQUESTED
+    # for a specific attempt, and inventing one would mean assuming a `/model` syntax,
+    # acknowledgement format and output semantics that are not observable here.  So a
+    # profile carrying a selector is refused BEFORE any spawn, by name.  Both shipping
+    # profiles declare no selector and are unaffected.
+    if profile.model_selector is not None:
+        return _outcome("profile", "fail", "model_selection_unsupported",
+                        {"detail": "the profile declares a model_selector but no channel "
+                                   "through which a model selection can be REQUESTED for "
+                                   "an attempt; an observation locator alone is not a "
+                                   "model-selection capability",
+                         "model_field": profile.model_selector.model_field})
     for name, path in (("settings_path", profile.settings_path),
                        ("mcp_config_path", profile.mcp_config_path),
                        ("config_root", profile.config_root),
