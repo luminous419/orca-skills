@@ -2935,13 +2935,28 @@ def _import_skill_policy() -> Any:
 
 
 def orca_run_routing(*, agent_profile_name: str, requested_phases: tuple[str, ...],
-                     risk: str, project_root: Path) -> Any:
+                     risk: str, project_root: Path, model_driver: Any = None) -> Any:
     """Materialize the run's agent routing, or refuse.
 
     A routing is REQUIRED on this path and is not defaulted. Without one the harness
     falls back to its repository-local fake-agent shim, which does not exist in an
     installed tree -- so an installed run with no routing would create a terminal that
     can never settle. Refusing here means no Task, no Dispatch and no terminal is made.
+
+    OS-49 BUGFIX (review M6). `model_driver` is the SEAM, and `None` -- the production
+    default -- is what keeps the real runtime fail-closed: with no driver the derived
+    capability set is empty, so Gate A below refuses a declared model with
+    `AGENT_MODEL_NOT_SUPPORTED` before any Run exists, exactly as it did when nothing could
+    be passed at all. The parameter exists because model-aware routing was otherwise
+    reachable ONLY by a test instantiating `OrcaRuntimeHarness` directly: no construction
+    path carried a driver, so the whole `routing -> capability -> Gate A -> harness ->
+    Gate B` chain had no door.
+
+    The capability is derived by `agent_profile.model_selection_capabilities()`, the ONE
+    rule Gate B's barrier also reads, and `build_orca_adapter()` hands the SAME driver
+    object to this function and to the harness -- so the two gates cannot disagree about
+    whether this run can select a model. OS-14 supplies a driver that can honestly request
+    and observe a real selection; nothing about this chain changes when it does.
     """
     agent_profile = _import_agent_profile()
     if not agent_profile_name:
@@ -2988,10 +3003,15 @@ def orca_run_routing(*, agent_profile_name: str, requested_phases: tuple[str, ..
             + ", ".join(f"{entry.phase}/{entry.role}" for entry in unresolved))
     # OS-49 GATE A, this door's copy. Every validation the Coordinator's door applies
     # must also land here or the shipped launcher becomes a weaker entrance into the
-    # same runtime. No capability is offered, exactly as on the policy door, so a
-    # declared model is refused with AGENT_MODEL_NOT_SUPPORTED before the Run exists.
+    # same runtime. The capability comes from the injected driver and from nothing else,
+    # through the one derivation Gate B reads, so the default `model_driver=None` offers
+    # an EMPTY set and a declared model is refused with AGENT_MODEL_NOT_SUPPORTED before
+    # the Run exists.
     try:
-        agent_profile.validate_effective_identity(routing)
+        agent_profile.validate_effective_identity(
+            routing,
+            model_capabilities=agent_profile.model_selection_capabilities(model_driver),
+        )
     except agent_profile.AgentProfileError as exc:
         raise LauncherError(
             f"{ORCA_ADAPTER_REQUIRES_AGENT_PROFILE}: {exc.reason}: {exc}") from exc
@@ -3001,7 +3021,8 @@ def orca_run_routing(*, agent_profile_name: str, requested_phases: tuple[str, ..
 def build_orca_adapter(spec: dict[str, Any], *, objective: str, artifact_base: Path,
                        runtime_state: Any = None, agent_profile_name: str = "",
                        project_root: Path | None = None,
-                       harness_factory: Any = None) -> tuple[Any, dict[str, Any]]:
+                       harness_factory: Any = None,
+                       model_driver: Any = None) -> tuple[Any, dict[str, Any]]:
     """Create the Orca Run and return ``(adapter, state)`` bound to it.
 
     The state is built AFTER the Run exists and carries the Orca Run's own id, so the
@@ -3011,6 +3032,13 @@ def build_orca_adapter(spec: dict[str, Any], *, objective: str, artifact_base: P
     ``harness_factory`` exists so a test can substitute the process boundary without
     substituting the adapter, the harness, the graph or the launcher -- everything this
     finding is about stays real.
+
+    OS-49 BUGFIX (review M6). ``model_driver`` is threaded to BOTH gates from here, and it
+    is the same object in both places: ``orca_run_routing()`` derives Gate A's capability
+    from it and the harness receives it for Gate B. ``None`` is the production default and
+    is passed to the harness factory NOT AT ALL -- the keyword is omitted entirely rather
+    than passed as ``None`` -- so a default construction is byte-identical to before this
+    parameter existed and no existing ``harness_factory`` has to grow a parameter.
     """
     runtime = _import_orca_runtime()
     if not objective:
@@ -3027,8 +3055,10 @@ def build_orca_adapter(spec: dict[str, Any], *, objective: str, artifact_base: P
     routing = orca_run_routing(
         agent_profile_name=agent_profile_name,
         requested_phases=tuple(phase.lower() for phase in phases),
-        risk=risk, project_root=root)
+        risk=risk, project_root=root, model_driver=model_driver)
     factory = harness_factory or runtime.OrcaRuntimeHarness
+    # Omitted, not passed as None: see the docstring. One driver object, both gates.
+    model_seam = {} if model_driver is None else {"model_driver": model_driver}
     try:
         # `artifact_dir` is the BASE the run root is provisioned under -- run_logging
         # appends `artifacts/runs/<run_id>/` itself -- so it is passed before the Run
@@ -3036,7 +3066,8 @@ def build_orca_adapter(spec: dict[str, Any], *, objective: str, artifact_base: P
         # move the run's decision ledger out from under the very first pre-dispatch B1
         # guard, which then reads an absence and refuses.
         harness = factory(artifact_base, risk=risk, risk_source=risk_source,
-                          agent_routing=routing, quality_profile_root=root)
+                          agent_routing=routing, quality_profile_root=root,
+                          **model_seam)
         harness.preflight()
         run_id = harness.start_run(
             objective, requested_phases=tuple(phase.lower() for phase in phases))

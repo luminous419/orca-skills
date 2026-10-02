@@ -345,6 +345,19 @@ copy of `ORCHESTRATOR_LOG.md` embedded in it; text that is not residue-free unde
 is omitted from the bundle with a stated reason and a digest rather than embedded. The
 authoritative local log is never rewritten.
 
+**The policy version and the coverage set are different axes.** `redaction/MAJOR.MINOR`
+versions the five ordered categories above — the text transformation — and nothing else;
+`redact_text()` is a pure function of (text, policy_version) that admits exactly one
+version, because a digest is comparable only to a digest produced under the same policy.
+WHICH record fields pass through it is versioned by `FINAL_REVIEW_AUDIT_SCHEMA_VERSION`
+instead, and is additionally recorded verbatim in every record as
+`metadata_redaction.covered_fields`, so a reader never deduces coverage from the version
+string. OS-49 added five reviewer-model fields to the coverage set: that is the audit
+schema's MINOR bump (1.0 → 1.1), not a policy bump, and the policy correctly stayed at
+`redaction/1.1` — bumping it for a coverage change would make every historical
+`*_digest_post_redaction` unverifiable through the single-version function, which is the
+same reason a MAJOR audit-schema bump is forbidden.
+
 **Packaging, and what the baseline capture guarantees.** `scripts/` is included in the release
 archive, so a downloaded tarball contains
 `scripts/fixtures/final_review_eval/key/answer_key.json`. That is unchanged and is stated rather
@@ -525,8 +538,21 @@ values are exact ordered equalities checked by `scripts/validate_skills.py` and 
 **Unaffected: distinct-command pairs.** Independence holds on the commands alone, so no
 counterpart evidence is required and the delivery lifecycle is byte-identical to before
 OS-49 — which is what keeps this repository's own `claude-opus` / `codex-sol` wrappers, and
-every v1 document, routing unchanged. A model-less run has no model axis and therefore no
-obligation.
+every **distinct-command** document of either schema version, routing unchanged. A
+model-less run has no model axis and therefore no obligation.
+
+**Affected, and stated rather than implied: a same-command `version: 1` pair is now
+rejected.** Schema v1 **parsing** is unchanged and stays frozen — a v1 role value is a
+command string and a model cannot be expressed there — but the effective-identity rule is
+**categorical**, so it applies at every schema version. A v1 profile that puts the same
+command on both sides of a MEDIUM/HIGH phase pair (`worker: claude` + `reviewer: claude`)
+is refused `WORKER_REVIEWER_MUST_DIFFER` at Gate A, before any Run exists, because same
+command plus no distinguishing model is not two agents. That is a behaviour change for such
+a document, and it is the one OS-49 change that is not purely additive on the v1 path. It is
+not new policy so much as the old `WORKER_REVIEWER_MUST_DIFFER` invariant now being reached
+through the profile path too; an earlier claim in this section that the lifecycle is
+"byte-identical" and that "every v1 document" routes unchanged was true only of the
+distinct-command case, and the narrower claim above is the accurate one.
 
 **Also unaffected: an OPTIONAL counterpart.** The requirement is scoped to a counterpart
 that is **required** and resolved, exactly as the declaration gate's pair check is. At LOW

@@ -953,6 +953,37 @@ class RunTimingTracker:
 # _REQUIRED_RECORD_FIELDS, so bumping MAJOR would make every historical 1.0 record read
 # as `unknown_major` -- the records this family exists to preserve.
 FINAL_REVIEW_AUDIT_SCHEMA_VERSION = "1.1"
+# ---- TWO version axes, and which one moves when (OS-49 BUGFIX, review N2) -------------
+# Review N2 observed, correctly, that OS-49 added five fields to
+# FINAL_REVIEW_REDACTED_METADATA_FIELDS while leaving this string at `redaction/1.1`, and
+# asked whether one policy version was now identifying two coverage sets. Checked against
+# the contract: it is not, because the two things are versioned on DIFFERENT axes and the
+# contract never asked this string to denote coverage.
+#
+#   `redaction/MAJOR.MINOR` versions the TEXT TRANSFORMATION -- the ordered
+#   REDACTION_CATEGORIES tuple below and nothing else. `redact_text()` is documented as a
+#   pure function of (text, policy_version) and REFUSES any version but this one, because
+#   "a digest is only comparable against a digest produced by the SAME policy". That is
+#   why docs/COMPATIBILITY.md states this version's meaning in terms of its five categories
+#   and says that ADDING A CATEGORY (Windows paths, say) is the MINOR bump. OS-49 added no
+#   category and changed no substitution, so every `*_digest_post_redaction` ever written
+#   under `redaction/1.1` is still byte-reproducible. Bumping it for a coverage change
+#   would be actively WRONG here: this function admits exactly one version, so the bump
+#   would make every historical record's digest unverifiable -- destroying the evidence the
+#   audit family exists to preserve, which is the same reasoning that FORBIDS a MAJOR bump
+#   of FINAL_REVIEW_AUDIT_SCHEMA_VERSION above.
+#
+#   FIELD COVERAGE is versioned by FINAL_REVIEW_AUDIT_SCHEMA_VERSION, which OS-49 did bump
+#   1.0 -> 1.1 for exactly those five fields ("필드 추가는 MINOR"), and it is additionally
+#   RECORDED, not inferred: every record carries
+#   `metadata_redaction.covered_fields` verbatim. So a reader never has to deduce coverage
+#   from a policy string, and one policy version cannot identify two coverage sets because
+#   it identifies none -- each record states its own.
+#
+# What WAS missing is that nothing said this, and nothing locked this string against the
+# thing it does denote. `scripts/test_os49_contract_locks.py::RedactionPolicyVersionTests`
+# now pins the category tuple to this version, so a future category change that forgets the
+# bump fails, and asserts that coverage travels in the record.
 FINAL_REVIEW_REDACTION_POLICY_VERSION = "redaction/1.1"
 # 2.0, not 1.1: `orchestrator_log.content` is GONE and `orchestrator_log.digest` is
 # renamed, both of which break a reader that has not been updated. The rename is the

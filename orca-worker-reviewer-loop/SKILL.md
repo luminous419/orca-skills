@@ -490,8 +490,13 @@ default 처리, `WORKER_REVIEWER_MUST_DIFFER` 검사가 지금과 동일하게 �
 3. requested phase와 Final Review에 대한 routing materialize
 4. required role의 resolved command에만 PATH 검사
 5. required role이 전부 resolve되었는지 검사
-6. 위가 모두 통과한 경우에만 Run 생성
+6. required entry에 effective identity 검사 (GATE A)      -- model capability + pair independence
+7. 위가 모두 통과한 경우에만 Run 생성
 ```
+
+6번은 두 Skill이 **같은 구현을 공유**하는 `validate_effective_identity`다. 이 Skill에는 model을 검증할
+capability가 없으므로 required entry의 선언된 model은 여기서 `AGENT_MODEL_NOT_SUPPORTED`로 막히고,
+model 축이 없는 pair의 판정은 OS-49 이전의 `worker == reviewer` 비교와 byte 단위로 동일하다.
 
 2번의 검사 대상은 **selected profile이 선언한 모든 command**다 — `defaults`, 이 invocation이 요청하지
 않은 phase를 포함한 모든 `phases.<phase>`, `final_review`, 그리고 이 invocation에 실제로 주어진 explicit
@@ -579,9 +584,12 @@ required entry에 선언된 model은 이 Skill에서 `AGENT_MODEL_NOT_SUPPORTED`
 Worker/Reviewer independence 판정 자체도 두 Skill이 **같은 구현을 공유**한다. independence는 positively
 resolved model로만 성립하며 선언된 model은 증거가 되지 않는다. 이 Skill에서는 model을 선언한 required
 entry가 애초에 `AGENT_MODEL_NOT_SUPPORTED`로 막히므로 model 축이 존재하지 않는 pair만 남고, 그 pair의
-판정은 `worker == reviewer` 비교와 정확히 같다 — 즉 OS-49 이전과 byte 단위로 동일하다. 같은 command를
-쓰는 pair를 첫 delivery 이전에 승인하는 orchestration 쪽 pair-admission 절차는 이 Skill에 없으며,
-필요하지도 않다.
+**판정 자체는** `worker == reviewer` 비교와 정확히 같다. 다만 그 판정이 **적용되는 범위**는 넓어졌다 —
+OS-49 이전에 이 비교는 profile을 쓰지 않는 경로에만 있었으므로, 양쪽에 같은 command를 쓴
+`version: 1` profile은 이제 Run 생성 이전에 `WORKER_REVIEWER_MUST_DIFFER`로 거부된다. 이것이 v1
+경로에서 유일하게 additive하지 않은 변화이며, command가 서로 다른 문서는 영향을 받지 않는다. 같은
+command를 쓰는 pair를 첫 delivery 이전에 승인하는 orchestration 쪽 pair-admission 절차는 이 Skill에
+없으며, 필요하지도 않다.
 
 resolved routing은 이 run 동안 immutable하다. profile 파일이 run 중 변경되어도 correction과
 re-review는 profile을 다시 읽지 않고 최초 resolution을 그대로 사용한다.

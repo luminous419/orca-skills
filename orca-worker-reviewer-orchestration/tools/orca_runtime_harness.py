@@ -54,6 +54,7 @@ try:
         MODEL_TOKEN_PATTERN,
         REASON_WORKER_REVIEWER_MUST_DIFFER,
         effective_identity_independent,
+        model_selection_capabilities,
     )
     from scripts.deterministic_workflow import quiescence, turn_boundary
     from scripts.workflow_contract import load_workflow_output_contract
@@ -96,6 +97,7 @@ except ModuleNotFoundError:  # direct `python3 scripts/...` execution
         MODEL_TOKEN_PATTERN,
         REASON_WORKER_REVIEWER_MUST_DIFFER,
         effective_identity_independent,
+        model_selection_capabilities,
     )
     from deterministic_workflow import quiescence, turn_boundary
     from workflow_contract import load_workflow_output_contract
@@ -683,6 +685,12 @@ MODEL_IDENTITY_FAILURE_REASONS = (
 )
 
 
+#: "this key was not present", as distinct from a recorded empty string. Used by the
+#: model-evidence snapshot (review N1) so a rollback can tell `pop()` from `set to ""` and
+#: restore a row to exactly the shape it had, rather than to a plausible one.
+_ABSENT = object()
+
+
 @dataclass(frozen=True)
 class ModelSelectionTicket:
     """ONE model-selection attempt.  Minted by the BARRIER -- never by a caller, never by
@@ -1214,6 +1222,24 @@ class OrcaRuntimeHarness:
         # that delivers creates it), so the evidence is keyed on the handle here and
         # rebound by _attach_terminal() the moment the id is known.
         self._model_pending_evidence: dict[str, ModelEvidence] = {}
+        # OS-49 BUGFIX (review M2/M5). terminal handle -> (routing_role, phase, evidence)
+        # for the LAST evidence this run accepted on that PHYSICAL SESSION. The two maps
+        # above are keyed on (phase, role) and on a pending rebinding; neither can answer
+        # a question about the SESSION, and both of the defects this map closes were
+        # questions about the session:
+        #
+        #   M2 cross-phase resolved-model drift -- one terminal reused from IMPLEMENTATION
+        #       into TEST with the SAME requested alias resolving to a DIFFERENT model.
+        #       The (phase, role) key differs, so leg (i) never compared them and equal
+        #       request aliases were accepted as proof of an unchanged agent.
+        #   M5 one session verified as BOTH roles -- `ModelEvidence.observed_at_terminal`
+        #       carried the discriminator all along and nothing read it, so a same-command
+        #       pair could be "admitted" by one physical terminal playing both parts,
+        #       which is exactly what `Worker session != Reviewer session` forbids.
+        #
+        # Run-scoped like the two above and cleared by finish() for the same reason: every
+        # record in it was accepted against ONE run's six-part attempt key.
+        self._model_session_identity: dict[str, tuple[str, str, ModelEvidence]] = {}
         # The tree the run's quality profile is read from, and the ONE resolution
         # every spec this harness renders is built from. start_run() re-reads it once
         # at the run boundary and then nothing re-reads it until the next run: a
@@ -1831,7 +1857,13 @@ class OrcaRuntimeHarness:
         reasons: list[str] = []
         # Row 9. No driver means THIS dispatch could not request a selection either, so
         # there is no way to re-establish the identity the reuse would carry forward.
-        if self.model_driver is None:
+        # OS-49 BUGFIX (review M3/M6): asked through the ONE capability derivation the two
+        # gates read, so a driver object that exists but cannot be called is `unsupported`
+        # here exactly as it is at the barrier, rather than passing this condition and
+        # then leaking a raw AttributeError at delivery time.
+        if MODEL_SELECTION_VERIFIED_CAPABILITY not in model_selection_capabilities(
+            self.model_driver
+        ):
             reasons.append(MODEL_CAPABILITY_UNSUPPORTED)
         # Row 8. An internally contradictory row is never a basis for reuse. A `verified`
         # model with no record that anything REQUESTED it is exactly as contradictory as a
@@ -2819,9 +2851,81 @@ class OrcaRuntimeHarness:
             parts.append(detail)
         return OrcaRuntimeError("; ".join(parts))
 
+    #: The terminal-row cells the barrier (and `_rebind_model_evidence()`) write, so a
+    #: rollback restores a row to exactly the shape it had before this attempt touched it.
+    _MODEL_ROW_CELLS = (
+        "resolved_model",
+        "model_state",
+        "model_request_method",
+        "model_request_evidence",
+        "model_observed_at_dispatch",
+    )
+
+    def _model_evidence_snapshot(
+        self, *, terminal: str, role: str, phase: str
+    ) -> dict[str, Any]:
+        """Everything an accepted barrier would OVERWRITE for this attempt, as it is now.
+
+        OS-49 BUGFIX (review N1). Model verification is recorded at the barrier, which is
+        `start_worker()`'s FIRST statement, and the rest of that method can still refuse
+        or fail -- the own-handle refusal, the TUI-idle wait, a `worker-start` that never
+        reaches a ready worker, the OS-41 acknowledgement gate, a failing `dispatch`. The
+        accepted record outlived all of those, and because it is exactly what grants pair
+        admission and what reuse condition 9 reads, a delivery that never happened could
+        authorize a later one as if it had.
+
+        A snapshot/restore rather than a delete, deliberately: a rollback must leave the
+        state EXACTLY as it was immediately before this attempt's barrier ran. Deleting
+        would also discard a record an earlier, separate and successful
+        `verify_model_identity()` pre-pass legitimately earned, which would refuse a
+        retry that should be allowed. Restoring makes the lifetime of this attempt's
+        evidence the lifetime of this attempt's delivery, and nothing wider.
+        """
+        identity_key = (phase, self._routing_key(role, phase)[1])
+        row = self._terminals.get(terminal)
+        return {
+            "identity_key": identity_key,
+            "identity": self._model_identity.get(identity_key, _ABSENT),
+            "pending": self._model_pending_evidence.get(terminal, _ABSENT),
+            "session": self._model_session_identity.get(terminal, _ABSENT),
+            "terminal": terminal,
+            "row_cells": (
+                None if row is None
+                else {cell: row.get(cell, _ABSENT) for cell in self._MODEL_ROW_CELLS}
+            ),
+        }
+
+    def _restore_model_evidence(self, snapshot: dict[str, Any] | None) -> None:
+        """Undo every write an accepted barrier made for one attempt. Total, and silent.
+
+        Called from the failure path of `start_worker()` only, where an exception is
+        already on its way out: this must never replace that exception with one of its
+        own, so every lookup is absence-tolerant.
+        """
+        if not snapshot:
+            return
+        for mapping, key, value in (
+            (self._model_identity, snapshot["identity_key"], snapshot["identity"]),
+            (self._model_pending_evidence, snapshot["terminal"], snapshot["pending"]),
+            (self._model_session_identity, snapshot["terminal"], snapshot["session"]),
+        ):
+            if value is _ABSENT:
+                mapping.pop(key, None)
+            else:
+                mapping[key] = value
+        cells = snapshot["row_cells"]
+        row = self._terminals.get(snapshot["terminal"])
+        if cells is None or row is None:
+            return
+        for cell, value in cells.items():
+            if value is _ABSENT:
+                row.pop(cell, None)
+            else:
+                row[cell] = value
+
     def _gate_b_model_identity(
         self, *, task_id: str, terminal: str, role: str, phase: str, attempt: int
-    ) -> None:
+    ) -> dict[str, Any]:
         """GATE B: the ONE mandatory fail-closed barrier before BOTH delivery acts.
 
         A one-line reading of the shared core with `require_pair_admission=True`, which
@@ -2829,7 +2933,15 @@ class OrcaRuntimeHarness:
         additionally requires that a same-command counterpart's model is already
         positively verified, so independence is never assumed on the strength of two
         declared tokens.
+
+        Returns the pre-barrier snapshot `start_worker()` restores if the delivery it was
+        taken for never completes (review N1). The barrier itself is unchanged: a REFUSAL
+        still records nothing, so the snapshot matters only for the case the refusal
+        vocabulary cannot cover -- an ACCEPTED model on a delivery that then failed.
         """
+        snapshot = self._model_evidence_snapshot(
+            terminal=terminal, role=role, phase=phase
+        )
         self._verify_model_identity(
             task_id=task_id,
             terminal=terminal,
@@ -2838,6 +2950,7 @@ class OrcaRuntimeHarness:
             attempt=attempt,
             require_pair_admission=True,
         )
+        return snapshot
 
     def verify_model_identity(
         self,
@@ -2980,9 +3093,21 @@ class OrcaRuntimeHarness:
         if not requested:
             return                              # state `none`: no model for this role
         # ---- from here a model IS declared, so nothing below may be skipped ----------
-        if self.model_driver is None:
-            # Not merely "cannot observe": with no driver a selection cannot even be
-            # REQUESTED, which is a stronger and differently-named failure.
+        # OS-49 BUGFIX (review M3). The SHAPE check, through the one capability
+        # derivation Gate A also reads (`agent_profile.model_selection_capabilities`), so
+        # the declaration gate and this barrier cannot disagree about what counts as a
+        # driver. It used to ask `self.model_driver is None`, which three different broken
+        # drivers all passed: one with no `select_and_verify` at all, one whose
+        # `select_and_verify` is a non-callable attribute, and -- because the call below
+        # had no handler -- one that raises. Each escaped as a raw AttributeError,
+        # TypeError or arbitrary driver exception, i.e. OUTSIDE the closed OS-49 failure
+        # vocabulary, which is precisely what a caller cannot branch on.
+        #
+        # Not merely "cannot observe": with no CALLABLE driver a selection cannot even be
+        # REQUESTED, which is a stronger and differently-named failure.
+        if MODEL_SELECTION_VERIFIED_CAPABILITY not in model_selection_capabilities(
+            self.model_driver
+        ):
             raise self._model_refusal(
                 MODEL_SELECTION_UNSUPPORTED,
                 role=role,
@@ -2990,8 +3115,9 @@ class OrcaRuntimeHarness:
                 attempt=attempt,
                 command=command,
                 requested_model=requested,
-                detail="no model-selection driver is wired in, so a selection cannot "
-                "be requested on this placement",
+                detail="no model-selection driver with a callable select_and_verify() is "
+                "wired in, so a selection cannot be requested on this placement "
+                f"(driver={type(self.model_driver).__name__})",
             )
         ticket, issued_at = self._mint_model_selection_ticket(
             task_id=task_id,
@@ -3003,11 +3129,37 @@ class OrcaRuntimeHarness:
             requested_model=requested,
         )
         expected = (issued_at + 1, issued_at + 2)
+        # OS-49 BUGFIX (review M3). A driver that RAISES is a failed selection, not a
+        # harness defect, so it is normalized into the closed vocabulary here instead of
+        # propagating whatever the driver chose to throw. `model_selection_unverified` is
+        # the right member by the vocabulary's own lifecycle order: a selection was
+        # requested and no resolved model was ever positively observed. The `finally:`
+        # still revokes the ticket first, so a raising driver cannot leave a live stamp
+        # behind for the NEXT attempt's window, and `Exception` deliberately does not
+        # swallow KeyboardInterrupt or SystemExit.
+        driver_failure: BaseException | None = None
+        evidence: Any = None
         try:
             evidence = self.model_driver.select_and_verify(ticket)
+        except Exception as exc:                       # noqa: BLE001 - normalized below
+            driver_failure = exc
         finally:
             self._revoke_model_selection_ticket(ticket)
         drawn_to = self._model_selection_seq
+        if driver_failure is not None:
+            raise self._model_refusal(
+                MODEL_SELECTION_UNVERIFIED,
+                role=role,
+                phase=phase,
+                attempt=attempt,
+                command=command,
+                requested_model=requested,
+                ticket=ticket,
+                expected_window=expected,
+                drawn_to=drawn_to,
+                detail="the model-selection driver raised "
+                f"{type(driver_failure).__name__}: {driver_failure}",
+            ) from driver_failure
 
         def refuse(reason: str, detail: str = "") -> OrcaRuntimeError:
             return self._model_refusal(
@@ -3210,6 +3362,30 @@ class OrcaRuntimeHarness:
                         "Verify both effective identities with verify_model_identity() "
                         "before delivering either",
                     )
+            elif counterpart.observed_at_terminal == terminal:
+                # OS-49 BUGFIX (review M5). The SESSION half of pair admission, and it is
+                # NOT gated on `require_pair_admission`: the defect it closes is reachable
+                # through the PRE-PASS alone (verify reviewer on term_1/model-B, then
+                # verify worker on term_1/model-A), after which the pair looked admitted
+                # to every later delivery. Two resolved models on one physical terminal is
+                # one agent wearing two hats, whatever the models say, so comparing only
+                # `(command, resolved_model)` could never refuse it --
+                # `ModelEvidence.observed_at_terminal` carried the discriminator all along
+                # and nothing read it.
+                #
+                # Ungated by command, too: `Worker session != Reviewer session` is a
+                # categorical Skill invariant, not a same-command special case, and a
+                # legitimate pair always holds two distinct handles -- the reuse gate's
+                # condition 1 already refuses carrying one session across roles -- so this
+                # can refuse nothing a correct caller does.
+                raise refuse(
+                    REASON_WORKER_REVIEWER_MUST_DIFFER,
+                    f"the {counterpart_role} of phase {phase!r} was positively verified "
+                    f"on this very session {terminal!r} (resolved "
+                    f"{counterpart.resolved_model!r}); one physical session cannot be "
+                    "both sides of a pair, so its independence is not established no "
+                    "matter which models the two verifications resolved to",
+                )
             elif counterpart_entry is not None:
                 independent, reason = effective_identity_independent(
                     (command, evidence.resolved_model, MODEL_EVIDENCE_VERIFIED),
@@ -3227,10 +3403,38 @@ class OrcaRuntimeHarness:
                         f"{counterpart.resolved_model!r}; two distinct declared tokens "
                         "that resolve to one model are not two agents",
                     )
+        # ---- (k) the SESSION's own identity history (OS-49 BUGFIX, review M2/M5) ------
+        # Leg (i) above compares against the last record for this (phase, ROLE); this leg
+        # compares against the last record for this physical TERMINAL. They are different
+        # keys answering different questions, and the gap between them was M2: one session
+        # reused from IMPLEMENTATION into TEST has a DIFFERENT (phase, role) key, so leg
+        # (i) missed entirely and the only comparison left was the requested ALIAS -- which
+        # is a declaration, and two attempts declaring alias-X prove nothing about whether
+        # the provider resolved it to model-A both times.
+        #
+        # Ordered AFTER the counterpart block deliberately: when one terminal has been
+        # verified for both roles, the fact that matters is the PAIR violation above, which
+        # has its own name and its own invariant. Reaching here means the session is being
+        # re-verified for the SAME routing role, where a changed resolved model is exactly
+        # `model_selection_ambiguous` -- the same name leg (i) uses for the same fact.
+        session_previous = self._model_session_identity.get(terminal)
+        if session_previous is not None:
+            previous_role, previous_phase, previous_evidence = session_previous
+            if previous_evidence.resolved_model != evidence.resolved_model:
+                raise refuse(
+                    MODEL_SELECTION_AMBIGUOUS,
+                    f"session {terminal!r} was already positively verified as "
+                    f"{previous_role!r} of phase {previous_phase!r} resolving to "
+                    f"{previous_evidence.resolved_model!r}; a session whose resolved "
+                    "model changed between attempts is not the agent that was verified, "
+                    "and an equal requested alias is a declaration rather than evidence "
+                    "that the provider resolved it the same way twice",
+                )
         # Accepted. Recorded ONLY here, so no refused attempt can leave a trace that a
         # later round or a provenance row would read as earned.
         self._model_identity[(phase, routing_role)] = evidence
         self._model_pending_evidence[terminal] = evidence
+        self._model_session_identity[terminal] = (routing_role, phase, evidence)
         row = self._terminals.get(terminal)
         if row is not None:
             row["resolved_model"] = evidence.resolved_model
@@ -3257,106 +3461,118 @@ class OrcaRuntimeHarness:
         # delivery. It does not displace the OS-29 B1 guard (which runs earlier, in both
         # initiators) and does not move the OS-41 acknowledgement gate (which runs
         # later, on the receipt).
-        self._gate_b_model_identity(
+        snapshot = self._gate_b_model_identity(
             task_id=task_id,
             terminal=terminal,
             role=role,
             phase=phase,
             attempt=attempt,
         )
-        assert self.run_owner
-        if terminal == os.environ.get(SELF_HANDLE_ENV):
-            raise OrcaRuntimeError(
-                "refusing to register the caller's own terminal as a worker resource"
-            )
-        # Ladder rung 3, in order: the terminal already exists, so idle first, adopt
-        # second. Both steps precede any dispatch, so rung 4 can never run ahead of it.
-        self.wait_for_tui_idle(terminal)
-        started = self.call(
-            "orchestration",
-            "worker-start",
-            "--task",
-            task_id,
-            "--terminal",
-            terminal,
-            "--from",
-            self.run_owner,
-            allow_error=True,
-        )
-        if started.get("ok"):
-            result = started["result"]
-            # OS-41 STEP 3a. The acknowledgement gate, ABOVE the ledger write: a
-            # supervised attachment is recorded only for a start the runtime itself
-            # calls ready. Anything else raises with the whole launch diagnosis
-            # attached, having registered nothing -- a half-started Dispatch must not
-            # become a row that later reads like a live supervised worker.
-            if "state" not in result:
-                # A success receipt with no `state` at all. Legitimate on exactly one
-                # HISTORICAL point observation (see
-                # WORKER_START_STATELESS_RECEIPT_VERSION -- no longer in the current
-                # executable support set, so this branch is offline-covered only) and
-                # missing lifecycle evidence everywhere else -- including on a
-                # 1.4.196 runtime, where `state` is the field that carries the launch
-                # outcome, and on a harness that never identified its runtime.
-                # BUGFIX-I1-MAJOR-1: this branch used to be unconditional, which let a
-                # malformed 1.4.196 receipt be written to the ledger as an adopted
-                # supervised worker.
-                if self.orca_app_version != WORKER_START_STATELESS_RECEIPT_VERSION:
-                    raise OrcaRuntimeError(
-                        "worker-start returned a success receipt with no launch "
-                        "state; that shape is accepted only from the point-verified "
-                        f"Orca {WORKER_START_STATELESS_RECEIPT_VERSION} runtime, and "
-                        "this harness has validated "
-                        f"{self.orca_app_version or 'no runtime'}: "
-                        f"dispatchId={result.get('dispatchId')!r} result={result!r}"
-                    )
-            elif str(result.get("state")) != WORKER_START_READY_STATE:
+        # OS-49 BUGFIX (review N1). Everything below is the DELIVERY, and an accepted
+        # model identity must not outlive it. The barrier records on acceptance -- which
+        # it must, because the pair-admission and reuse reads happen against that record
+        # -- but every refusal and failure from here on means no task was delivered on
+        # that identity, so the record is rolled back to exactly its pre-barrier state and
+        # the exception continues unchanged. `BaseException`, not `Exception`: a
+        # KeyboardInterrupt between the barrier and the delivery leaves the same false
+        # evidence behind, and the handler re-raises rather than absorbing anything.
+        try:
+            assert self.run_owner
+            if terminal == os.environ.get(SELF_HANDLE_ENV):
                 raise OrcaRuntimeError(
-                    "worker-start did not reach a ready worker: "
-                    f"state={str(result.get('state'))!r} "
-                    f"stage={result.get('stage')!r} "
-                    f"failedStage={result.get('failedStage')!r} "
-                    f"lastError={result.get('lastError')!r} "
-                    f"dispatchId={result.get('dispatchId')!r} "
-                    f"residualResources={result.get('residualResources')!r}"
+                    "refusing to register the caller's own terminal as a worker resource"
                 )
-            dispatch_id = result["dispatchId"]
-            self._attach_terminal(terminal, dispatch_id, "supervised_adopted")
-            # W-21. Deliberately NOT widened into the return type: tuple[str, bool] is
-            # unpacked at nine call sites, seven of them existing tests. Consumers read
-            # ledger_terminal(handle)["terminal_effect"] instead.
-            self.record_terminal_effect(
-                terminal, worker_start_terminal_effect(result)
+            # Ladder rung 3, in order: the terminal already exists, so idle first, adopt
+            # second. Both steps precede any dispatch, so rung 4 can never run ahead of it.
+            self.wait_for_tui_idle(terminal)
+            started = self.call(
+                "orchestration",
+                "worker-start",
+                "--task",
+                task_id,
+                "--terminal",
+                terminal,
+                "--from",
+                self.run_owner,
+                allow_error=True,
             )
-            return dispatch_id, True
-        error = started.get("error", {})
-        # Only agent_unconfigured is a branch signal; every other error is a real
-        # failure (SKILL.md section 6 Custom command handling, rule 1).
-        if error.get("code") != "agent_unconfigured":
-            raise OrcaRuntimeError(f"worker-start failed: {error}")
-        dispatched = self.call(
-            "orchestration",
-            "dispatch",
-            "--task",
-            task_id,
-            "--to",
-            terminal,
-            "--from",
-            self.run_owner,
-        )
-        dispatch_id = dispatched["result"]["dispatch"]["id"]
-        prompt = (
-            f"taskId: {task_id}\n"
-            f"dispatchId: {dispatch_id}\n"
-            "Use worker_done exactly once with an explicit outcome.\n"
-            "=== TASK ===\n"
-            f"{spec}"
-        )
-        self.call(
-            "terminal", "send", "--terminal", terminal, "--text", prompt, "--enter"
-        )
-        self._attach_terminal(terminal, dispatch_id, "low_level_tracked")
-        return dispatch_id, False
+            if started.get("ok"):
+                result = started["result"]
+                # OS-41 STEP 3a. The acknowledgement gate, ABOVE the ledger write: a
+                # supervised attachment is recorded only for a start the runtime itself
+                # calls ready. Anything else raises with the whole launch diagnosis
+                # attached, having registered nothing -- a half-started Dispatch must not
+                # become a row that later reads like a live supervised worker.
+                if "state" not in result:
+                    # A success receipt with no `state` at all. Legitimate on exactly one
+                    # HISTORICAL point observation (see
+                    # WORKER_START_STATELESS_RECEIPT_VERSION -- no longer in the current
+                    # executable support set, so this branch is offline-covered only) and
+                    # missing lifecycle evidence everywhere else -- including on a
+                    # 1.4.196 runtime, where `state` is the field that carries the launch
+                    # outcome, and on a harness that never identified its runtime.
+                    # BUGFIX-I1-MAJOR-1: this branch used to be unconditional, which let a
+                    # malformed 1.4.196 receipt be written to the ledger as an adopted
+                    # supervised worker.
+                    if self.orca_app_version != WORKER_START_STATELESS_RECEIPT_VERSION:
+                        raise OrcaRuntimeError(
+                            "worker-start returned a success receipt with no launch "
+                            "state; that shape is accepted only from the point-verified "
+                            f"Orca {WORKER_START_STATELESS_RECEIPT_VERSION} runtime, and "
+                            "this harness has validated "
+                            f"{self.orca_app_version or 'no runtime'}: "
+                            f"dispatchId={result.get('dispatchId')!r} result={result!r}"
+                        )
+                elif str(result.get("state")) != WORKER_START_READY_STATE:
+                    raise OrcaRuntimeError(
+                        "worker-start did not reach a ready worker: "
+                        f"state={str(result.get('state'))!r} "
+                        f"stage={result.get('stage')!r} "
+                        f"failedStage={result.get('failedStage')!r} "
+                        f"lastError={result.get('lastError')!r} "
+                        f"dispatchId={result.get('dispatchId')!r} "
+                        f"residualResources={result.get('residualResources')!r}"
+                    )
+                dispatch_id = result["dispatchId"]
+                self._attach_terminal(terminal, dispatch_id, "supervised_adopted")
+                # W-21. Deliberately NOT widened into the return type: tuple[str, bool] is
+                # unpacked at nine call sites, seven of them existing tests. Consumers read
+                # ledger_terminal(handle)["terminal_effect"] instead.
+                self.record_terminal_effect(
+                    terminal, worker_start_terminal_effect(result)
+                )
+                return dispatch_id, True
+            error = started.get("error", {})
+            # Only agent_unconfigured is a branch signal; every other error is a real
+            # failure (SKILL.md section 6 Custom command handling, rule 1).
+            if error.get("code") != "agent_unconfigured":
+                raise OrcaRuntimeError(f"worker-start failed: {error}")
+            dispatched = self.call(
+                "orchestration",
+                "dispatch",
+                "--task",
+                task_id,
+                "--to",
+                terminal,
+                "--from",
+                self.run_owner,
+            )
+            dispatch_id = dispatched["result"]["dispatch"]["id"]
+            prompt = (
+                f"taskId: {task_id}\n"
+                f"dispatchId: {dispatch_id}\n"
+                "Use worker_done exactly once with an explicit outcome.\n"
+                "=== TASK ===\n"
+                f"{spec}"
+            )
+            self.call(
+                "terminal", "send", "--terminal", terminal, "--text", prompt, "--enter"
+            )
+            self._attach_terminal(terminal, dispatch_id, "low_level_tracked")
+            return dispatch_id, False
+        except BaseException:
+            self._restore_model_evidence(snapshot)
+            raise
 
     def delivery_obligations(self) -> dict[str, str]:
         """Every open delivery obligation this Coordinator holds, by kind.
@@ -6133,6 +6349,7 @@ class OrcaRuntimeHarness:
         # session in that run produced.
         self._model_identity = {}
         self._model_pending_evidence = {}
+        self._model_session_identity = {}
         return result
 
     def _release_terminated_process(self, handle: str) -> bool:

@@ -11,17 +11,33 @@ validation added in a future ticket fails this test until it lands on both doors
 from __future__ import annotations
 
 import ast
+import inspect
+import os
 import re
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts import agent_profile
 from scripts.agent_profile import (
+    MODEL_SELECTION_VERIFIED_CAPABILITY,
     REASON_MODEL_NOT_SUPPORTED,
     REASON_WORKER_REVIEWER_MUST_DIFFER,
 )
 from scripts.deterministic_workflow import launcher
+
+#: The agent commands the profiles below route to. The door's PATH check (`validate_
+#: routing_commands`, gate 4) runs BEFORE Gate A, so on a host without these executables
+#: every behavioural test below stopped at `AGENT_COMMAND_NOT_FOUND` and never reached the
+#: gate it exists to test -- which is exactly how all six CI lanes failed on PR head
+#: c3d7484 while passing on a developer machine that happens to have a Claude CLI.
+#:
+#: The fix is to OWN the PATH rather than to hope: `LauncherBehaviourTests.setUp` writes an
+#: executable shim per command into a temporary directory and makes that directory the
+#: ENTIRE PATH. So the host's real `claude`/`codex` are invisible too, and the test behaves
+#: identically on a machine that has them and on one that does not.
+ROUTED_COMMANDS = ("claude", "codex")
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 POLICY_DOOR = REPO_ROOT / "scripts" / "skill_policy.py"
@@ -122,24 +138,99 @@ class LauncherParityTests(unittest.TestCase):
                     "validate_effective_identity", called_validators(path, function)
                 )
 
-    def test_neither_door_offers_a_model_capability(self) -> None:
-        """The default is EMPTY, and that single default is what makes the real-runtime
-        path honestly fail closed. A door that passed one would have to be able to both
-        request a selection and observe the resolution, which neither can."""
-        for path in (POLICY_DOOR, LAUNCHER_DOOR):
-            text = path.read_text(encoding="utf-8")
-            with self.subTest(door=path.name):
-                self.assertNotIn("model_capabilities=", text)
-                self.assertNotIn("MODEL_SELECTION_VERIFIED", text)
+    def test_the_policy_door_offers_no_model_capability_at_all(self) -> None:
+        """The Coordinator's door has no driver to be given and never names a capability.
+
+        Unchanged by the M6 seam: this door produces a PolicyDecision, not a harness, so
+        there is no second gate for it to agree with and nothing for a driver to be
+        threaded to. A capability spelled here would be a capability nothing could honour.
+        """
+        text = POLICY_DOOR.read_text(encoding="utf-8")
+        self.assertNotIn("model_capabilities=", text)
+        self.assertNotIn("MODEL_SELECTION_VERIFIED", text)
+
+    def test_the_launcher_doors_capability_comes_only_from_an_injected_driver(self) -> None:
+        """OS-49 BUGFIX (review M6). The launcher door GAINED a `model_driver` seam, and the
+        previous version of this test asserted the string `model_capabilities=` never
+        appeared in launcher.py -- which encoded the old behaviour exactly: that NO
+        construction path could carry a driver, which is the defect M6 names.
+
+        Replacing a grep with three stronger, behavioural facts rather than deleting it:
+
+          1. the parameter's default is `None`, so a default construction offers nothing;
+          2. the capability is DERIVED from that parameter through the one shared
+             derivation, never spelled as a literal, so Gate A and Gate B cannot disagree;
+          3. no literal capability token is written on this door at all.
+
+        The behavioural half -- that a declared model is still refused when no driver is
+        passed -- is `test_a_declared_model_is_refused_through_the_launcher` below, which
+        calls the door for real.
+        """
+        for function in (launcher.orca_run_routing, launcher.build_orca_adapter):
+            with self.subTest(function=function.__name__):
+                parameter = inspect.signature(function).parameters["model_driver"]
+                self.assertIs(parameter.default, None)
+        text = LAUNCHER_DOOR.read_text(encoding="utf-8")
+        self.assertIn(
+            "model_capabilities=agent_profile.model_selection_capabilities(model_driver)",
+            text,
+            "Gate A's capability must be derived from the injected driver through the one "
+            "shared derivation, not spelled on this door",
+        )
+        self.assertNotIn("MODEL_SELECTION_VERIFIED", text)
+        self.assertNotIn(MODEL_SELECTION_VERIFIED_CAPABILITY, text)
+
+    def test_no_launcher_cli_flag_exposes_the_driver_seam(self) -> None:
+        """The seam is a CODE parameter, never configuration -- the M4 lesson applied to
+        M6. A `--model-driver` flag would be a user-loadable way to claim a capability
+        nothing in this release can honour."""
+        text = LAUNCHER_DOOR.read_text(encoding="utf-8")
+        for flag in ("--model-driver", "--model_driver", "--model-capability"):
+            with self.subTest(flag=flag):
+                self.assertNotIn(flag, text)
+
+    def test_both_gates_read_one_capability_derivation(self) -> None:
+        """Gate A (this door) and Gate B (the harness barrier) must not have two rules.
+
+        `model_selection_capabilities` is that one rule; both call sites are asserted by
+        name, and the harness is asserted to no longer ask the weaker `is None` question
+        that let a driver without a callable `select_and_verify` through Gate B.
+        """
+        harness = REPO_ROOT / "scripts" / "orca_runtime_harness.py"
+        door = LAUNCHER_DOOR.read_text(encoding="utf-8")
+        runtime = harness.read_text(encoding="utf-8")
+        self.assertIn("agent_profile.model_selection_capabilities(model_driver)", door)
+        self.assertIn("model_selection_capabilities(\n            self.model_driver\n        )",
+                      runtime)
+        self.assertNotIn("if self.model_driver is None:", runtime)
 
 
 class LauncherBehaviourTests(unittest.TestCase):
-    """The same profile must be refused through the launcher with the SAME reason."""
+    """The same profile must be refused through the launcher with the SAME reason.
+
+    HOST-INDEPENDENT by construction: `setUp` replaces the whole PATH with a directory
+    holding one shim per routed command, so the PATH gate that precedes Gate A resolves on
+    every machine and every CI lane, and the assertions below are about the gate under test
+    rather than about what the developer happens to have installed. Nothing is weakened --
+    the shims only make the commands RESOLVABLE; no validator, reason code or assertion is
+    relaxed, and a profile that should be refused is still refused for the same reason.
+    """
 
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.project = Path(self.temporary_directory.name)
         (self.project / ".orca").mkdir(parents=True)
+        binaries = self.project / "bin"
+        binaries.mkdir()
+        for command in ROUTED_COMMANDS:
+            shim = binaries / command
+            shim.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            shim.chmod(0o755)
+        # The ENTIRE PATH, not a prefix: a host `claude` must not be able to satisfy the
+        # gate either, or the test would still be measuring the host on half the machines.
+        patcher = patch.dict(os.environ, {"PATH": str(binaries)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
@@ -149,13 +240,29 @@ class LauncherBehaviourTests(unittest.TestCase):
             text, encoding="utf-8"
         )
 
-    def run_door(self, name: str, *, risk: str = "high"):
+    def run_door(self, name: str, *, risk: str = "high", model_driver=None):
         return launcher.orca_run_routing(
             agent_profile_name=name,
             requested_phases=("implementation",),
             risk=risk,
             project_root=self.project,
+            **({} if model_driver is None else {"model_driver": model_driver}),
         )
+
+    def test_every_routed_command_resolves_on_the_sandbox_path(self) -> None:
+        """The sandbox itself, asserted -- otherwise a broken shim would silently turn
+        every refusal test below back into an AGENT_COMMAND_NOT_FOUND test that passes for
+        the wrong reason."""
+        import shutil
+
+        for command in ROUTED_COMMANDS:
+            with self.subTest(command=command):
+                resolved = shutil.which(command)
+                self.assertIsNotNone(resolved, f"{command} does not resolve")
+                self.assertTrue(
+                    str(resolved).startswith(str(self.project)),
+                    f"{command} resolved to {resolved!r}, outside the sandbox",
+                )
 
     def test_a_declared_model_is_refused_through_the_launcher(self) -> None:
         self.write(
@@ -175,7 +282,12 @@ class LauncherBehaviourTests(unittest.TestCase):
         )
         with self.assertRaises(launcher.LauncherError) as caught:
             self.run_door("split")
-        self.assertIn(REASON_MODEL_NOT_SUPPORTED, str(caught.exception))
+        message = str(caught.exception)
+        self.assertIn(REASON_MODEL_NOT_SUPPORTED, message)
+        # The PATH gate is BEHIND us, not merely absent from the message: that is the whole
+        # point of the sandbox, and asserting it keeps this test from silently degrading
+        # into "something failed" if the shims ever stop working.
+        self.assertNotIn("AGENT_COMMAND_NOT_FOUND", message)
 
     def test_a_same_command_pair_is_refused_through_the_launcher(self) -> None:
         self.write(
@@ -191,7 +303,9 @@ class LauncherBehaviourTests(unittest.TestCase):
         )
         with self.assertRaises(launcher.LauncherError) as caught:
             self.run_door("same")
-        self.assertIn(REASON_WORKER_REVIEWER_MUST_DIFFER, str(caught.exception))
+        message = str(caught.exception)
+        self.assertIn(REASON_WORKER_REVIEWER_MUST_DIFFER, message)
+        self.assertNotIn("AGENT_COMMAND_NOT_FOUND", message)
 
     def test_a_malformed_model_token_is_refused_through_the_launcher(self) -> None:
         self.write(
@@ -223,13 +337,10 @@ class LauncherBehaviourTests(unittest.TestCase):
             "    final_review:\n"
             "      reviewer: codex\n"
         )
-        try:
-            routing = self.run_door("fine")
-        except launcher.LauncherError as error:
-            # PATH absence is an environment fact, not an OS-49 refusal; the point of this
-            # test is that no MODEL reason appears.
-            self.assertIn("AGENT_COMMAND_NOT_FOUND", str(error))
-            return
+        # No `except` fallback any more: PATH absence used to be tolerated here as an
+        # environment fact, which made the real assertion skippable on exactly the hosts
+        # that matter. The sandbox removes the environment fact, so the door must ROUTE.
+        routing = self.run_door("fine")
         self.assertFalse(routing.is_model_aware)
 
 

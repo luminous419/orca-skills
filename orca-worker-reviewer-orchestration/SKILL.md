@@ -631,8 +631,14 @@ default 처리, `WORKER_REVIEWER_MUST_DIFFER` 검사가 지금과 동일하게 �
 3. requested phase와 Final Review에 대한 routing materialize
 4. required role의 resolved command에만 PATH 검사
 5. required role이 전부 resolve되었는지 검사
-6. 위가 모두 통과한 경우에만 Run 생성
+6. required entry에 effective identity 검사 (GATE A)      -- model capability + pair independence
+7. 위가 모두 통과한 경우에만 Run 생성
 ```
+
+6번이 `AGENT_PROFILE_GATE_ORDER`의 `validate_effective_identity`이며, 이 산문 목록과 그 contract
+값은 같은 순서를 말한다. 6번이 5번 뒤에 오는 것은 의도적이다 — independence는 양쪽이 allowlist를
+통과한 존재하는 command로 resolve된 뒤에야 의미 있는 질문이고, 먼저 물으면 실제 결함이 unrouted
+role인 pair에 `WORKER_REVIEWER_MUST_DIFFER`를 보고하게 된다. 6번의 판정 범위는 required entry뿐이다.
 
 2번의 검사 대상은 **selected profile이 선언한 모든 command**다 — `defaults`, 이 invocation이 요청하지
 않은 phase를 포함한 모든 `phases.<phase>`, `final_review`, 그리고 이 invocation에 실제로 주어진 explicit
@@ -721,6 +727,14 @@ independence는 **positively resolved model**로만 성립한다. 선언된 mode
 - `refused` — 같은 command + 같은 선언 model, 한쪽 model 미선언, model을 선택/관측할 수 없는 placement.
   Run 생성 이전에 막힌다.
 - `pending_model_verification` — 같은 command + 서로 다른 선언 model. **통과가 아니라 의무**다.
+
+이 rule은 **categorical**이다 — schema version과 무관하게 materialize된 모든 Worker/Reviewer pair에
+적용된다. 따라서 `version: 1` 문서도 **parsing은 그대로 frozen**이지만, MEDIUM/HIGH phase pair의 양쪽에
+같은 command를 쓴 v1 profile(`worker: claude` + `reviewer: claude`)은 Run 생성 이전에
+`WORKER_REVIEWER_MUST_DIFFER`로 거부된다. OS-49 이전에 이 비교는 profile을 쓰지 않는 경로에만 있었고
+profile로 resolve된 pair에는 적용되지 않았으므로, 이것이 v1 경로에서 유일하게 additive하지 않은 변화다.
+model을 구분 축으로 쓸 수 없는 v1에서 같은 command는 두 agent가 아니기 때문이다. command가 서로 다른 v1
+문서(`claude-opus` / `codex-sol` 같은 model-pinned wrapper 포함)는 영향을 받지 않는다.
 
 `pending` pair는 **첫 delivery 이전에** 양쪽 effective identity가 모두 positively verified되고 서로
 달라야 한다. role 단위 barrier만으로는 이것을 성립시킬 수 없다 — Worker dispatch는 Reviewer session이
@@ -1637,6 +1651,15 @@ OS-49가 Final Reviewer의 model identity 5개 필드(`reviewer_requested_model`
 `reviewer_model_request_evidence`)를 **추가**했으므로 1.0 -> 1.1은 MINOR다. MAJOR를 올리는 것은
 금지된다 — 그러면 기존의 모든 1.0 record가 `unknown`으로 읽히는데, 그 record들이야말로 이 family가
 보존하려는 대상이다. 5개 필드는 모두 redaction policy 적용 대상이다.
+
+**두 version 축을 혼동하지 않는다.** `FINAL_REVIEW_AUDIT_SCHEMA_VERSION`은 record가 담는 **field 집합**을
+versioning하고, `FINAL_REVIEW_REDACTION_POLICY_VERSION`(`redaction/1.1`)은 **text 변환 자체** — 즉 다섯 개
+ordered category — 를 versioning한다. 따라서 redaction 대상 field가 늘어난 것은 audit schema MINOR bump
+(1.0 -> 1.1)이고 redaction policy bump가 아니다. category를 추가하거나 치환 결과를 바꾸는 것만이 policy
+bump다. policy version을 field 추가 때문에 올리면 `redact_text()`는 단 하나의 version만 허용하므로 기존
+record의 `*_digest_post_redaction`을 재도출할 수 없게 되는데, 이는 audit schema의 MAJOR bump를 금지하는
+것과 똑같은 이유로 금지된다. 어떤 field가 대상이었는지는 version에서 추론하지 않는다 — 모든 record가
+`metadata_redaction.covered_fields`로 자기 coverage를 직접 담는다.
 
 **provenance는 fail-closed다.** `provenance_state`는 `accepted | voided | unknown`이고 어떤 기본값도
 `accepted`가 아니다 (`FINAL_REVIEW_PROVENANCE_DEFAULT = unknown`). 파일이 없거나, 파싱되지 않거나,

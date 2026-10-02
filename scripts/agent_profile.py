@@ -1335,6 +1335,33 @@ def declaration_evidence_state(model: str) -> str:
     return MODEL_EVIDENCE_REQUESTED if model else MODEL_EVIDENCE_NONE
 
 
+def model_selection_capabilities(driver: Any) -> frozenset[str]:
+    """The ONE derivation of a model-selection capability from a driver object.
+
+    OS-49 BUGFIX (review M3/M6). Gate A took a `model_capabilities` set and Gate B asked
+    `driver is None`, which are two different questions: an object that merely EXISTS
+    answered the second one yes. A driver that cannot be CALLED is not a capability, and
+    a declaration gate that admits a model the delivery barrier will then refuse -- or,
+    worse, that leaks an `AttributeError` out of the barrier instead of a named refusal --
+    is the two gates disagreeing. So both gates now read this function, over the same
+    driver object, and there is exactly one rule:
+
+        a model-selection capability exists IFF `select_and_verify` is CALLABLE on it.
+
+    The token means BOTH legs (a selection was REQUESTED for this attempt and the
+    resolution was THEN observed), and `select_and_verify` is the single method that can
+    honour both -- which is why its callability is the whole test and why
+    `deterministic_workflow.fake_adapter.FakeAdapter.capabilities()` reads this same
+    function rather than re-spelling the predicate.
+
+    `None` -- the production default on every real door -- yields the EMPTY set, so the
+    real runtime stays fail-closed by default rather than by remembering to pass nothing.
+    """
+    if callable(getattr(driver, "select_and_verify", None)):
+        return frozenset({MODEL_SELECTION_VERIFIED_CAPABILITY})
+    return frozenset()
+
+
 def validate_effective_identity(
     routing: RunRouting,
     *,

@@ -284,6 +284,125 @@ class NoFourthAxisTests(unittest.TestCase):
         self.assertEqual(len(decision_policy.CANONICAL_INDEPENDENT_AXES), 3)
 
 
+class RedactionPolicyVersionTests(unittest.TestCase):
+    """OS-49 BUGFIX (review N2). Which version axis moves when, locked.
+
+    The finding's OBSERVATION is true: OS-49 grew
+    `FINAL_REVIEW_REDACTED_METADATA_FIELDS` by five fields and left
+    `FINAL_REVIEW_REDACTION_POLICY_VERSION` at `redaction/1.1`. Its CONCLUSION -- that the
+    policy version must therefore be bumped -- is not what the contract says, and these
+    tests are the evidence, so the question cannot be re-litigated from memory:
+
+      * `redaction/MAJOR.MINOR` denotes the TEXT TRANSFORMATION. `redact_text()` is a pure
+        function of (text, policy_version) and admits exactly ONE version, because a digest
+        is only comparable to a digest produced under the same policy.
+        docs/COMPATIBILITY.md states the version's meaning as its five ordered categories
+        and names ADDING A CATEGORY as the MINOR bump. OS-49 added none.
+      * Bumping it would make every historical `*_digest_post_redaction` unverifiable
+        through the single-version function -- the same reason a MAJOR bump of the audit
+        schema is explicitly FORBIDDEN.
+      * FIELD COVERAGE is versioned by `FINAL_REVIEW_AUDIT_SCHEMA_VERSION` (bumped 1.0 ->
+        1.1 by OS-49 for exactly those five fields) and is RECORDED per record as
+        `metadata_redaction.covered_fields`, so no reader infers coverage from the policy
+        string.
+    """
+
+    #: The five ordered categories `redaction/1.1` IS. A change here without a policy bump
+    #: is what this lock exists to fail.
+    CATEGORIES_AT_1_1 = (
+        "orca_dispatch_capability",
+        "url_credential",
+        "env_secret_pattern",
+        "absolute_local_path",
+        "foreign_absolute_path",
+    )
+
+    #: The five fields OS-49 added to the COVERAGE set -- the other axis entirely.
+    OS49_COVERED_FIELDS = (
+        "reviewer_requested_model",
+        "reviewer_resolved_model",
+        "reviewer_model_state",
+        "reviewer_model_request_method",
+        "reviewer_model_request_evidence",
+    )
+
+    def test_the_policy_version_denotes_the_category_tuple(self) -> None:
+        from scripts import run_logging
+
+        self.assertEqual(
+            run_logging.FINAL_REVIEW_REDACTION_POLICY_VERSION, "redaction/1.1"
+        )
+        self.assertEqual(
+            tuple(name for name, _pattern, _replacement in run_logging.REDACTION_CATEGORIES),
+            self.CATEGORIES_AT_1_1,
+        )
+
+    def test_the_compatibility_record_states_the_version_in_terms_of_categories(self) -> None:
+        """The contract reading, read from the document rather than asserted."""
+        text = COMPATIBILITY.read_text(encoding="utf-8")
+        self.assertIn(
+            "**Redaction policy `redaction/1.1` covers POSIX paths only.**", text
+        )
+        self.assertIn("The policy has five ordered", text)
+        self.assertIn("is a MINOR policy bump", text)
+
+    def test_the_coverage_set_moved_the_audit_schema_version_instead(self) -> None:
+        from scripts import run_logging
+
+        for field in self.OS49_COVERED_FIELDS:
+            with self.subTest(field=field):
+                self.assertIn(field, run_logging.FINAL_REVIEW_REDACTED_METADATA_FIELDS)
+        self.assertEqual(run_logging.FINAL_REVIEW_AUDIT_SCHEMA_VERSION, "1.1")
+        # MAJOR unchanged, which is the half that keeps historical 1.0 records readable.
+        self.assertEqual(
+            run_logging.FINAL_REVIEW_AUDIT_SCHEMA_VERSION.split(".")[0], "1"
+        )
+
+    def test_coverage_is_recorded_in_every_record_not_inferred_from_the_version(self) -> None:
+        """Why one policy version cannot identify two coverage sets: it identifies none.
+        Each record carries its own `covered_fields`, so a reader compares sets rather than
+        deducing them from a string."""
+        from scripts import run_logging
+
+        source = Path(run_logging.__file__).read_text(encoding="utf-8")
+        self.assertIn(
+            '"covered_fields": list(FINAL_REVIEW_REDACTED_METADATA_FIELDS),', source
+        )
+        self.assertIn(
+            '"redaction_policy_version": FINAL_REVIEW_REDACTION_POLICY_VERSION,', source
+        )
+
+    def test_a_digest_under_the_recorded_policy_is_still_reproducible(self) -> None:
+        """The property a bump would have broken, demonstrated rather than argued: the
+        policy admits exactly one version, so a historical digest is re-derivable only while
+        this string is the one those records name."""
+        from scripts import run_logging
+
+        # A FOREIGN absolute path, never a home-rooted literal: `release_manifest`'s source
+        # scan refuses a user-name spelling in any packaged file, which is the same posture
+        # the policy under test implements.
+        sample = "see /opt/evidence/report.md and dcap_" + "A" * 48
+        first, counts = run_logging.redact_text(sample)
+        second, again = run_logging.redact_text(
+            sample, policy_version=run_logging.FINAL_REVIEW_REDACTION_POLICY_VERSION
+        )
+        self.assertEqual(first, second)
+        self.assertEqual(counts, again)
+        with self.assertRaises(run_logging.RunLoggingError):
+            run_logging.redact_text(sample, policy_version="redaction/1.2")
+
+    def test_the_two_axes_are_documented_at_the_constant(self) -> None:
+        """A future reader must find the distinction where the constant is, not only here."""
+        from scripts import run_logging
+
+        source = Path(run_logging.__file__).read_text(encoding="utf-8")
+        head = source[: source.index('FINAL_REVIEW_REDACTION_POLICY_VERSION = "redaction/1.1"')]
+        tail = head[head.index("FINAL_REVIEW_AUDIT_SCHEMA_VERSION = \"1.1\""):]
+        self.assertIn("TWO version axes", tail)
+        self.assertIn("REDACTION_CATEGORIES", tail)
+        self.assertIn("covered_fields", tail)
+
+
 class HistoricalEvidenceIsUntouchedTests(unittest.TestCase):
     #: The three historical validation rows, byte for byte as they shipped. OS-49 appends
     #: only; it rewrites no historical compatibility evidence.

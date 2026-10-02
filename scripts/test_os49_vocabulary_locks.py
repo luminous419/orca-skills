@@ -221,10 +221,21 @@ class CapabilityTokenTests(unittest.TestCase):
 
 
 class PreflightVocabularyTests(unittest.TestCase):
-    def test_reasons_gained_exactly_one_member(self) -> None:
-        self.assertIn("model_selection_unsupported", standalone_preflight.REASONS)
+    def test_the_standalone_vocabulary_names_no_model_reason(self) -> None:
+        """OS-49 BUGFIX (review M4). This lock used to require exactly ONE model member,
+        `model_selection_unsupported`, which OS-49 added for a preflight branch that could
+        only ever fire on a directly-constructed dataclass -- `model_selector` is not in the
+        profile loader's closed key set and nothing loads it. The dead surface is removed,
+        so the honest lock is the inverse: the STANDALONE preflight vocabulary names no
+        model reason at all, because the standalone path has no model axis.
+
+        The orchestration barrier's own `model_selection_unsupported` is a DIFFERENT,
+        reachable vocabulary (`orca_runtime_harness.MODEL_SELECTION_FAILURE_REASONS`) and is
+        asserted intact by `scripts/test_os49_driver_seam.py` and by
+        `FailureVocabularyTests` in this file.
+        """
         self.assertEqual(
-            len([r for r in standalone_preflight.REASONS if "model" in r]), 1
+            [reason for reason in standalone_preflight.REASONS if "model" in reason], []
         )
 
     def test_verdicts_are_unchanged(self) -> None:
@@ -262,10 +273,16 @@ class PatternSeparationTests(unittest.TestCase):
 
 
 class StandaloneSchemaTests(unittest.TestCase):
-    def test_the_selector_is_profile_data_with_no_default(self) -> None:
+    def test_the_profile_schema_carries_no_model_field_at_all(self) -> None:
+        """OS-49 BUGFIX (review M4). The previous lock asserted a `model_selector` field
+        EXISTED with a `None` default, which is precisely the half-wired state the review
+        refuses: a configuration field no loader accepts. The schema now carries no model
+        field, so there is nothing a user can write that the loader will reject and nothing
+        the preflight has to refuse."""
         profile_fields = standalone_profile.StandaloneProfile.__dataclass_fields__
-        self.assertIn("model_selector", profile_fields)
-        self.assertIsNone(profile_fields["model_selector"].default)
+        self.assertEqual(
+            [name for name in profile_fields if "model" in name], []
+        )
 
     def test_extra_args_is_not_a_model_carrier(self) -> None:
         """OS-49 closes today's unverified hole by REFUSING a model routed that way, never
@@ -277,7 +294,7 @@ class StandaloneSchemaTests(unittest.TestCase):
         for line in source.splitlines():
             if "extra_args" in line:
                 with self.subTest(line=line.strip()[:70]):
-                    self.assertNotIn("model", line.lower().replace("model_selector", ""))
+                    self.assertNotIn("model", line.lower())
 
 
 if __name__ == "__main__":

@@ -15,6 +15,49 @@ from .contracts import (BASE_CAPABILITIES, EXTERNAL_LOOKUP, EXTERNAL_RESUME,
                         MODEL_SELECTION_VERIFIED, ActionIntent,
                         RECOVERY_CAPABILITIES, SettlementEvent, make_settlement_event)
 
+def _import_orca_runtime() -> Any:
+    """``orca_runtime_harness``, imported lazily and from EITHER layout.
+
+    OS-49 BUGFIX (review M1). This used to be ``from ..orca_runtime_harness import
+    ModelEvidence`` inside ``InProcessModelDriver.select_and_verify()``. The parent-package
+    form resolves only in the repository layout, where this package is
+    ``scripts.deterministic_workflow`` and ``..`` is ``scripts``. In the INSTALLED flat
+    Skill layout ``deterministic_workflow`` is top-level and the harness is a ``tools/``
+    sibling, so ``..`` points outside every package and the import raises::
+
+        ImportError: attempted relative import beyond top-level package
+
+    Because the import was lazy, the module still imported cleanly and the defect appeared
+    only when the method was CALLED -- which is why the regression for it has to call
+    ``select_and_verify()`` in a flat-layout ``sys.path`` and not merely import the module.
+
+    Lazy for the reason ``launcher._import_orca_runtime`` and
+    ``orca_adapter._default_result_parser`` are, and written the same way deliberately:
+    this module is inside the shipped engine package and the harness is a ``tools/``
+    sibling, so a module-scope import would make the whole package unimportable in an
+    installation that carries only the engine.
+    """
+    try:                                        # repository layout
+        from scripts import orca_runtime_harness
+    except ImportError:                         # pragma: no cover - flat installed layout
+        import orca_runtime_harness             # type: ignore[no-redef]
+    return orca_runtime_harness
+
+
+def _import_agent_profile() -> Any:
+    """``agent_profile``, from the repository or the installed Skill layout.
+
+    Reached only from ``FakeAdapter.capabilities()``, so the model-selection capability
+    this adapter declares is derived by the SAME function the two gates read
+    (review M6) instead of by a third copy of the predicate.
+    """
+    try:                                        # repository layout
+        from scripts import agent_profile
+    except ImportError:                         # pragma: no cover - flat installed layout
+        import agent_profile                    # type: ignore[no-redef]
+    return agent_profile
+
+
 def stipulated_gate_envelope(intent: ActionIntent) -> dict[str, Any]:
     """A well-formed CLEAR gate envelope for a SCRIPTED settlement.
 
@@ -237,7 +280,9 @@ class InProcessModelDriver:
         self.tickets: list[Any] = []
 
     def select_and_verify(self, ticket: Any) -> Any:
-        from ..orca_runtime_harness import ModelEvidence   # lazy: no module-level import
+        # Dual-layout, lazy: see `_import_orca_runtime` for why the parent-relative form
+        # this replaced could not work in the installed flat Skill layout (review M1).
+        ModelEvidence = _import_orca_runtime().ModelEvidence
 
         self.tickets.append(ticket)
         # ---- leg 1: REQUEST ------------------------------------------------------------
@@ -323,7 +368,13 @@ class FakeAdapter:
         # -- a selection was REQUESTED for this attempt and the resolution was THEN
         # observed.  `select_and_verify` is the method that can honour both, so its
         # presence is what is checked.
-        if callable(getattr(self.model_driver, "select_and_verify", None)):
+        # OS-49 BUGFIX (review M6): derived through `agent_profile.
+        # model_selection_capabilities()`, the ONE place the rule lives, so this
+        # adapter's declaration, Gate A's precondition and Gate B's barrier cannot
+        # disagree about what counts as a driver. The rule is unchanged -- a CALLABLE
+        # `select_and_verify` and nothing else -- so no declaration moves.
+        if MODEL_SELECTION_VERIFIED in _import_agent_profile(
+        ).model_selection_capabilities(self.model_driver):
             offered = offered | frozenset({MODEL_SELECTION_VERIFIED})
         if self.external_world is None:
             return offered

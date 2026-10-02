@@ -18,11 +18,7 @@ from scripts.deterministic_workflow.contracts import (
     MODEL_SELECTION_VERIFIED,
 )
 from scripts.deterministic_workflow.fake_adapter import FakeAdapter, InProcessModelDriver
-from scripts.deterministic_workflow.standalone_profile import (
-    ModelSelector,
-    ProfileError,
-    READINESS_CHANNELS,
-)
+from scripts.deterministic_workflow.standalone_profile import READINESS_CHANNELS
 from scripts.orca_runtime_harness import ModelSelectionTicket
 
 
@@ -43,93 +39,71 @@ def ticket(**overrides) -> ModelSelectionTicket:
     return ModelSelectionTicket(**fields)
 
 
-class ModelSelectorTests(unittest.TestCase):
-    def test_only_the_structured_channel_is_declarable(self) -> None:
+class DeadModelSelectorSurfaceIsGoneTests(unittest.TestCase):
+    """OS-49 BUGFIX (review M4). The `ModelSelector` / `model_selector` / preflight trio is
+    REMOVED, and this class is the lock that keeps it from coming back half-wired.
+
+    What it was: a `ModelSelector` dataclass, an optional `StandaloneProfile.model_selector`
+    field, and a `check_profile()` branch refusing a profile that carried one with
+    `model_selection_unsupported`. What it was NOT: loadable. `model_selector` is absent
+    from the profile loader's closed key set, and no loader, archive, digest or round-trip
+    path ever set it -- so the only way to populate the field was to construct the
+    dataclass directly in a test, and the only thing the preflight branch could refuse was
+    a test fixture. The three tests that exercised it (one per behaviour above) therefore
+    proved that a surface no user can reach refuses correctly.
+
+    These replace them deliberately, with the inverse claim: the surface is absent. The
+    alternative fix -- wiring the field through loader, schema, closed key set, archive,
+    digest and round-trip -- would create a real, documented configuration option for an
+    observation locator that cannot mean anything until OS-14 supplies the model-REQUEST
+    half, and would then have to be either honoured or refused. Removing is the smaller
+    coherent change, and OS-14 can reintroduce the field together with the half that makes
+    it load.
+
+    The honesty claim the removed tests were ALSO defending -- that an observation locator
+    alone never earns `model_selection_verified` -- is unaffected and is asserted by
+    `CapabilityHonestyTests.test_an_object_that_can_only_observe_is_not_a_driver` below,
+    which tests the live capability derivation rather than a dead dataclass.
+    """
+
+    def test_the_selector_dataclass_is_gone(self) -> None:
+        self.assertFalse(hasattr(standalone_profile, "ModelSelector"))
+
+    def test_the_profile_carries_no_model_selector_field(self) -> None:
+        fields = standalone_profile.StandaloneProfile.__dataclass_fields__
+        self.assertNotIn("model_selector", fields)
+
+    def test_the_unreachable_preflight_reason_is_gone(self) -> None:
+        """A named reason no reachable configuration can produce is a claim the preflight
+        vocabulary cannot keep. The ORCHESTRATION-layer `model_selection_unsupported` is a
+        different vocabulary, is reachable, and is asserted still present below."""
+        self.assertNotIn("model_selection_unsupported", standalone_preflight.REASONS)
+        source = Path(standalone_preflight.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("profile.model_selector", source)
+
+    def test_the_orchestration_barriers_own_reason_is_untouched(self) -> None:
+        """The removal is scoped to the STANDALONE preflight surface. The barrier's own
+        closed vocabulary -- the one a model-aware dispatch is actually refused by -- keeps
+        every member, and `model_selection_unsupported` is still what a missing or
+        non-callable driver produces (review M3)."""
+        from scripts.orca_runtime_harness import (
+            MODEL_SELECTION_FAILURE_REASONS,
+            MODEL_SELECTION_UNSUPPORTED,
+        )
+
+        self.assertEqual(MODEL_SELECTION_UNSUPPORTED, "model_selection_unsupported")
+        self.assertIn(MODEL_SELECTION_UNSUPPORTED, MODEL_SELECTION_FAILURE_REASONS)
+        self.assertEqual(len(MODEL_SELECTION_FAILURE_REASONS), 7)
+
+    def test_the_structured_only_channel_rule_still_stands_for_live_selectors(self) -> None:
+        """`READINESS_CHANNELS` is what the removed selector validated against, and it is
+        still the single declarable channel for every selector family that remains -- so
+        removing the dead one did not loosen the rule it shared."""
         self.assertEqual(READINESS_CHANNELS, ("structured",))
-        ModelSelector(channel="structured", record_type="system", model_field="m")
-        for channel in ("screen", "title", "stdout", ""):
-            with self.subTest(channel=channel):
-                with self.assertRaises(ProfileError):
-                    ModelSelector(
-                        channel=channel, record_type="system", model_field="m"
-                    )
-
-    def test_an_empty_record_type_or_field_is_refused(self) -> None:
-        for field in ("record_type", "model_field"):
-            with self.subTest(field=field):
-                with self.assertRaises(ProfileError):
-                    ModelSelector(
-                        channel="structured",
-                        **{"record_type": "system", "model_field": "m", field: ""},
-                    )
-
-    def test_the_record_type_is_matched_by_equality_not_as_a_pattern(self) -> None:
-        """A pattern would match a frame that merely QUOTES the value."""
-        source = Path(
-            standalone_profile.__file__
-        ).read_text(encoding="utf-8")
-        start = source.index("class ModelSelector")
-        body = source[start:source.index("class CaptureLimits")]
-        self.assertIn("EQUALITY", body)
-        self.assertNotIn("re.compile", body)
-        self.assertNotIn(".match(", body)
-
-
-class SelectorAloneEarnsNothingTests(unittest.TestCase):
-    """The load-bearing honesty assertion: the OBSERVATION half never licenses delivery."""
-
-    def base_profile(self, **overrides) -> standalone_profile.StandaloneProfile:
-        fields = dict(
-            driver="claude",
-            binary="claude",
-            supported_range=((0, 0, 0), (99, 0, 0)),
-            readiness_records=(
-                standalone_profile.ReadinessSelector(
-                    channel="structured", record_type="system",
-                    session_field="session_id",
-                ),
-            ),
-            delivery_mode=standalone_profile.DELIVERY_MODES[0],
-            # `adopted` rather than `minted_echo`: the latter additionally requires an
-            # identity flag, and which binding this fixture uses is irrelevant to the
-            # model-selector question under test.
-            identity_binding="adopted",
-            delivery_proofs=(
-                standalone_profile.DeliveryProofSelector(
-                    channel="structured", record_type="assistant"
-                ),
-            ),
-        )
-        fields.update(overrides)
-        return standalone_profile.StandaloneProfile(**fields)
-
-    def test_a_profile_with_a_selector_is_refused_at_preflight(self) -> None:
-        profile = self.base_profile(
-            model_selector=ModelSelector(
-                channel="structured", record_type="system", model_field="message.model"
+        with self.assertRaises(standalone_profile.ProfileError):
+            standalone_profile.ReadinessSelector(
+                channel="screen", record_type="system", session_field="session_id"
             )
-        )
-        outcome = standalone_preflight.check_profile(profile, {})
-        self.assertEqual(outcome["verdict"], "fail")
-        self.assertEqual(outcome["reason"], "model_selection_unsupported")
-
-    def test_the_refusal_names_the_missing_request_half(self) -> None:
-        profile = self.base_profile(
-            model_selector=ModelSelector(
-                channel="structured", record_type="system", model_field="m"
-            )
-        )
-        outcome = standalone_preflight.check_profile(profile, {})
-        self.assertIn("REQUESTED", outcome["evidence"]["detail"])
-
-    def test_a_profile_with_no_selector_is_unaffected(self) -> None:
-        """Both shipping profiles declare none, so their behaviour is byte-identical."""
-        outcome = standalone_preflight.check_profile(self.base_profile(), {})
-        self.assertNotEqual(outcome["reason"], "model_selection_unsupported")
-
-    def test_unknown_is_never_pass(self) -> None:
-        self.assertEqual(standalone_preflight.VERDICTS, ("pass", "fail", "unknown"))
-        self.assertNotEqual("unknown", "pass")
 
 
 class CapabilityHonestyTests(unittest.TestCase):

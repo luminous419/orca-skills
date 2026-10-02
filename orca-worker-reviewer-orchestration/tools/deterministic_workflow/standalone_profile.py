@@ -380,44 +380,6 @@ class ResultBodySelector:
 
 
 @dataclass(frozen=True)
-class ModelSelector:
-    """Where a RESOLVED model id lives inside the CLI's own structured stream (OS-49).
-
-    THE OBSERVATION HALF ONLY.  A selector names where a resolved value can be READ; it
-    is not a request, it never causes a selection, and it NEVER on its own earns the
-    `model_selection_verified` capability.  A profile that declares a selector and no
-    supported model-REQUEST channel is refused `model_selection_unsupported` at
-    preflight, before any spawn -- exactly as `profile_readiness_unverified` already
-    refuses a profile whose declared readiness selector could never fire.  That is the
-    whole reason the capability token means both legs rather than one.
-
-    Profile DATA, never per-CLI code.  A field path hard-coded here would be a claim
-    about a live stream nobody in this repository has observed; a declared one is a claim
-    the profile's author makes and the preflight verifies, which is the same discipline
-    `ResultBodySelector.body_field` already follows.
-
-    ``record_type`` is matched by EQUALITY, never as a pattern, and ``model_field`` is a
-    dotted path into the record.  Only the `structured` channel is declarable: a title or
-    screen channel is not evidence, on this package's own existing rule that a line of
-    natural-language output is never sufficient evidence for identity.
-    """
-
-    channel: str
-    record_type: str
-    model_field: str
-
-    def __post_init__(self) -> None:
-        if self.channel not in READINESS_CHANNELS:
-            raise ProfileError(
-                f"model selector channel {self.channel!r} is not one of "
-                f"{READINESS_CHANNELS!r}; a title or screen channel is not declarable")
-        for name in ("record_type", "model_field"):
-            value = getattr(self, name)
-            if not isinstance(value, str) or not value:
-                raise ProfileError(f"model selector {name} must be a non-empty string")
-
-
-@dataclass(frozen=True)
 class CaptureLimits:
     """Bounded output capture limits (AC-37-05, DESIGN D3.3).
 
@@ -615,14 +577,16 @@ class StandaloneProfile:
     #: a `(dotted-field, expected-value)` pair over a PARSED record.  The login TEXT is
     #: never a marker -- these are record fields.
     auth_markers: tuple[tuple[str, str], ...] = ()
-    #: OS-49.  Where a RESOLVED model id can be READ in this CLI's structured stream.
-    #: ``None`` means none is declared, which is the shipping state for both profiles and
-    #: keeps their behaviour byte-identical.  Declaring one does NOT make the profile
-    #: model-aware: a selector is the observation half only, and the standalone path
-    #: declares no model-REQUEST channel, so a profile carrying a selector is refused
-    #: `model_selection_unsupported` at preflight.  The field exists so OS-14 can supply
-    #: the request half without a schema change.
-    model_selector: ModelSelector | None = None
+    # OS-49 BUGFIX (review M4).  A `model_selector: ModelSelector | None` field used to sit
+    # here, together with a `ModelSelector` dataclass above and a preflight branch that
+    # refused a profile carrying one.  None of it was reachable: the field is absent from
+    # the loader's closed key set, no loader, archive, digest or round-trip path carries
+    # it, and the only way to populate it was to construct the dataclass directly in a
+    # test.  So the preflight refusal protected nothing and the field was a configuration
+    # surface a normal user could not load -- which is worse than an absent one, because it
+    # reads like a supported option.  Removed until OS-14 supplies the model-REQUEST half
+    # that would make an observation locator mean something; `scripts/test_os49_driver_
+    # seam.py` locks the absence so it cannot come back half-wired.
 
     def __post_init__(self) -> None:
         if self.driver not in DRIVER_KINDS:
