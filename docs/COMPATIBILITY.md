@@ -559,7 +559,7 @@ that is **required** and resolved, exactly as the declaration gate's pair check 
 risk the Reviewer entry exists but is optional and no Reviewer is ever dispatched, so there
 is no pair to admit and a LOW-risk model-aware Worker routes unchanged — the same rule the
 PATH check follows: a role nobody dispatches must not fail a run. An unresolved *required*
-role is still `AGENT_PROFILE_ROLE_UNRESOLVED`'s business, not this gate's.
+role is still `AGENT_ROLE_UNRESOLVED`'s business, not this gate's.
 
 ### Session reuse is model-bound
 

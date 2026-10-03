@@ -328,10 +328,20 @@ class SessionModelDriftTests(BarrierTestCase):
         )
 
     def test_the_drift_record_is_run_scoped(self) -> None:
-        """`finish()` clears the session map with the other per-run model state, so a
-        second run on the same harness instance is not refused by the first run's record."""
+        """A second run on the same harness instance is not refused by the first run's record.
+
+        OS-49 BUGFIX (review B1). This test used to hand-copy the three assignments
+        `finish()` made and assert against the copy. The intent was right and the copy was
+        the weakness: B2 added two more pieces of run-scoped model state and an imitation of
+        the run boundary cannot notice that, so the test went on claiming the boundary was
+        clean while asserting nothing about it. It now drives the REAL boundary --
+        `start_run()`, which is also where B1 moved the reset to, because that is the one
+        point every run passes through whether or not the previous one reached `finish()`.
+        """
         driver = drifting("model-a", "model-b")
-        _recorder, harness = self.drift_harness(driver)
+        recorder, harness = self.drift_harness(driver)
+        recorder.results["run-create"] = {"run": {"id": "run_drift_one"}}
+        harness.start_run("drift one", requested_phases=("implementation", "test"))
         handle = harness.create_fake_terminal(
             "worker", "complete", iteration=1, phase="implementation"
         )
@@ -339,12 +349,9 @@ class SessionModelDriftTests(BarrierTestCase):
             "task_impl", handle, role="worker", phase="implementation", attempt=1
         )
         self.assertIn(handle, harness._model_session_identity)
-        # Exactly what finish() does to the three per-run maps. The point is that the
-        # session map is one of them: a second run on this harness instance must not be
-        # refused by a record no session in that run produced.
-        harness._model_identity = {}
-        harness._model_pending_evidence = {}
-        harness._model_session_identity = {}
+        # The real run boundary, with run 1 NEVER finishing -- which is the B1 premise.
+        recorder.results["run-create"] = {"run": {"id": "run_drift_two"}}
+        harness.start_run("drift two", requested_phases=("implementation", "test"))
         harness.verify_model_identity(
             "task_impl2", handle, role="worker", phase="implementation", attempt=2
         )
@@ -352,15 +359,33 @@ class SessionModelDriftTests(BarrierTestCase):
             harness._model_session_identity[handle][2].resolved_model, "model-b"
         )
 
-    def test_finish_clears_the_session_map(self) -> None:
-        """Asserted against the real `finish()` source rather than against a copy of what
-        it is believed to do, so a map added later and forgotten here is caught."""
+    def test_both_run_boundaries_clear_every_piece_of_run_scoped_model_state(self) -> None:
+        """Asserted against the real sources rather than against a copy of what they do.
+
+        OS-49 BUGFIX (review B1/B2). Two changes from the iteration-2 version. It now reads
+        `start_run()` as well as `finish()`, because `finish()` alone was the B1 defect: a
+        run that fails or is abandoned never reaches it, and the state leaked into the next
+        run. And it now requires the two B2 history maps, so the next map added to the run's
+        model state cannot be forgotten at either boundary without a test saying so.
+        """
         import inspect
 
-        source = inspect.getsource(OrcaRuntimeHarness.finish)
-        self.assertIn("self._model_session_identity = {}", source)
-        self.assertIn("self._model_identity = {}", source)
-        self.assertIn("self._model_pending_evidence = {}", source)
+        maps = (
+            "self._model_identity = {}",
+            "self._model_pending_evidence = {}",
+            "self._model_session_identity = {}",
+            "self._model_role_history = {}",
+            "self._model_session_history = {}",
+        )
+        for boundary in (OrcaRuntimeHarness.start_run, OrcaRuntimeHarness.finish):
+            source = inspect.getsource(boundary)
+            for reset in maps:
+                self.assertIn(
+                    reset, source,
+                    f"{boundary.__name__}() does not clear {reset!r}; run-scoped model "
+                    "state that survives a run boundary can refuse or admit the next run "
+                    "on evidence no session in it produced",
+                )
 
 
 # ---- M3 -------------------------------------------------------------------------------
