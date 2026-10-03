@@ -217,14 +217,53 @@ class BarrierTestCase(unittest.TestCase):
             f"the barrier refused but these delivery commands still ran: {delivered}",
         )
 
+    #: Default for `refuse()`'s `admit_pair`, set per TEST CLASS by what that class is
+    #: about. A class whose subject is a DRIVER leg sets it True so its deliveries can
+    #: reach the driver at all after the final-review R2 hoist; a class whose subject IS
+    #: pair admission leaves it False. Declared here so the choice is visible on the
+    #: class rather than repeated on every call.
+    ADMIT_PAIR = False
+
     def refuse(self, *, driver, role="worker", phase="implementation", attempt=1,
-               routing_text=SPLIT_PROFILE, routing_name="split"):
-        recorder = RecordingExec()
+               routing_text=SPLIT_PROFILE, routing_name="split", admit_pair=None):
+        """Drive `start_worker()` to a refusal and return (message, harness, recorder).
+
+        `admit_pair` positively verifies the SAME-COMMAND COUNTERPART first, with a
+        CONFORMING driver, and only then swaps in this test's `driver`.
+
+        OS-49 iteration 2 (final review R2). It exists because the R2 hoist moved the
+        missing-counterpart pair check ABOVE `select_and_verify()`, which changed this
+        helper's default premise. Formerly every `refuse()` ran on a pair whose
+        counterpart held no evidence, and that was harmless: the pair check sat at the
+        very END of the barrier, so a test of an earlier leg -- a fabricated ordinal, a
+        wrong return type, a raising driver -- refused on its own leg long before pair
+        admission was consulted. Post-hoist the pair check is FIRST, so on a same-command
+        pair an unadmitted delivery can no longer reach any driver leg at all. That is
+        the point of the hoist, not a side effect: the session must not be switched for a
+        delivery already known inadmissible.
+
+        So a test whose subject is a DRIVER leg now has to supply an admissible pair to
+        reach its subject. `admit_pair=True` says exactly that, and it is opt-in rather
+        than the default precisely so the tests whose subject IS the unadmitted pair
+        (`test_the_worker_is_not_delivered_before_the_reviewer_model_is_verified` and its
+        symmetric twin) keep the premise they are about. No assertion anywhere moves;
+        only the setup of the tests that need a reachable driver call.
+        """
+        if admit_pair is None:
+            admit_pair = self.ADMIT_PAIR
+        recorder = SequentialTerminalExec() if admit_pair else RecordingExec()
         harness = self.build(
             recorder,
             routing=routing_from(routing_text, routing_name),
-            model_driver=driver,
+            # The counterpart's pre-pass must be able to SUCCEED, so it cannot run on the
+            # deliberately-broken driver under test. `InProcessModelDriver` echoes the
+            # declared token back as the resolved one, so the counterpart verifies to its
+            # own declared model and the pair is independent on resolved values.
+            model_driver=InProcessModelDriver() if admit_pair else driver,
         )
+        if admit_pair:
+            self.admit_counterpart(harness, role, phase=phase, attempt=attempt)
+            harness.model_driver = driver      # now the leg under test is reachable
         handle = harness.create_fake_terminal(role, "complete", iteration=attempt,
                                              phase=phase)
         recorder.commands.clear()
@@ -376,6 +415,10 @@ class PositiveVerificationTests(BarrierTestCase):
 
 
 class FailClosedBarrierTests(BarrierTestCase):
+    #: Every test here is about a DRIVER leg, so the pair must be admissible for the
+    #: delivery to reach the driver at all (final review R2). See `refuse()`.
+    ADMIT_PAIR = True
+
     def test_declared_model_without_a_driver_is_refused(self) -> None:
         message = self.assertRefusedWith(MODEL_SELECTION_UNSUPPORTED, driver=None)
         self.assertIn("a selection cannot be requested", message)
@@ -594,6 +637,10 @@ class TheOrderingGroupTests(BarrierTestCase):
     point: an ordering requirement no test can fail is not enforced.
     """
 
+    #: Every refusal here is a DRIVER-leg refusal, so the pair must be admissible for the
+    #: delivery to reach the driver at all (final review R2). See `refuse()`.
+    ADMIT_PAIR = True
+
     def test_request_precedes_verification_on_the_driver_seam(self) -> None:
         recorder = SequentialTerminalExec()
         driver = InProcessModelDriver()
@@ -768,11 +815,17 @@ class TheOrderingGroupTests(BarrierTestCase):
         self.assertIn("revoked", str(caught.exception))
 
     def test_a_raising_driver_leaves_no_live_stamp_behind(self) -> None:
-        recorder = RecordingExec()
+        # Builds its own harness rather than going through `refuse()`, so it admits the
+        # counterpart the way `test_the_ticket_is_single_use_and_revoked_after_the_call`
+        # above already does: the subject is what the ticket looks like AFTER the driver
+        # ran, which the final-review R2 hoist makes unreachable on an unadmitted pair.
+        recorder = SequentialTerminalExec()
         kept: list = []
 
-        class Exploding:
+        class Exploding(InProcessModelDriver):
             def select_and_verify(self, ticket):
+                if ticket.role != "worker":
+                    return super().select_and_verify(ticket)  # admit the counterpart
                 kept.append(ticket)
                 raise RuntimeError("driver blew up")
 
@@ -780,6 +833,7 @@ class TheOrderingGroupTests(BarrierTestCase):
             recorder, routing=routing_from(SPLIT_PROFILE, "split"),
             model_driver=Exploding(),
         )
+        self.admit_counterpart(harness, "worker")
         handle = harness.create_fake_terminal("worker", "complete", iteration=1,
                                              phase="implementation")
         recorder.commands.clear()

@@ -2861,6 +2861,20 @@ class OrcaRuntimeHarness:
         "model_observed_at_dispatch",
     )
 
+    #: The value each of those cells carries on a row that has NO model evidence -- the
+    #: exact shape `register_terminal()` creates. Not a `pop`, deliberately: reuse
+    #: condition 9 and the durable provenance row read these keys by name, so removing
+    #: them would turn "this session has no verified model" into a KeyError. Written by
+    #: the two paths that have to un-advertise evidence: a rollback whose snapshot
+    #: predates the row's existence (review N1) and `_stale_model_evidence()` (review B1).
+    _MODEL_ROW_CLEARED = {
+        "resolved_model": "",
+        "model_state": MODEL_EVIDENCE_NONE,
+        "model_request_method": "",
+        "model_request_evidence": "",
+        "model_observed_at_dispatch": "",
+    }
+
     def _model_evidence_snapshot(
         self, *, terminal: str, role: str, phase: str
     ) -> dict[str, Any]:
@@ -2915,13 +2929,103 @@ class OrcaRuntimeHarness:
                 mapping[key] = value
         cells = snapshot["row_cells"]
         row = self._terminals.get(snapshot["terminal"])
-        if cells is None or row is None:
+        if row is None:
+            return
+        if cells is None:
+            # OS-49 BUGFIX (review N1, second round). `row_cells is None` does not mean
+            # "nothing to undo", it means the row DID NOT EXIST when the snapshot was
+            # taken -- and `start_worker()`'s `_attach_terminal()` creates one for an
+            # unseen handle, then `_rebind_model_evidence()` writes this attempt's
+            # accepted evidence onto it, all of it AFTER the barrier and all of it inside
+            # the delivery this rollback is undoing. Returning early left that brand-new
+            # row advertising resolved_model/model_state/model_observed_at_dispatch for a
+            # delivery that never completed, which is the contradictory state reuse
+            # condition 9 and the provenance row would read as earned.
+            #
+            # The cells are CLEARED to their creation-time shape rather than the row
+            # being deleted: the rollback did not create the row (`_attach_terminal()`
+            # did, as an adoption, and the adoption itself is a real observation of a
+            # handle this Coordinator now owns), so removing it would discard axis (c2)
+            # role/origin evidence that exists nowhere else. Only the MODEL cells belong
+            # to this attempt, so only they are undone.
+            row.update(self._MODEL_ROW_CLEARED)
             return
         for cell, value in cells.items():
             if value is _ABSENT:
                 row.pop(cell, None)
             else:
                 row[cell] = value
+
+    def _counterpart_model_identity(
+        self, *, phase: str, routing_role: str
+    ) -> tuple[str | None, Any]:
+        """The counterpart role of `(phase, routing_role)` and its RUN-SCOPED record.
+
+        One derivation, read by both halves of pair admission -- the PRE-selection
+        session check and the POST-selection effective-identity comparison (review B1).
+        They used to be one block, and splitting them without extracting this would have
+        left two copies of the run-scope filter free to disagree about which records
+        count.
+
+        The run scope is review F-002's and is unchanged: model evidence is RUN-scoped,
+        and a record observed in another run says nothing about whether THIS run has a
+        counterpart session at all. Returning `None` for it is the fail-closed reading --
+        a same-command delivery is then refused as `MODEL_SELECTION_PAIR_UNADMITTED`.
+
+        `(None, None)` means this role has no counterpart in the rule at all (the Final
+        Reviewer), which is deliberately outside it.
+        """
+        counterpart_role = {"worker": "reviewer", "reviewer": "worker"}.get(routing_role)
+        if counterpart_role is None:
+            return None, None
+        counterpart = self._model_identity.get((phase, counterpart_role))
+        if counterpart is not None and counterpart.observed_at_run != (self.run_id or ""):
+            counterpart = None
+        return counterpart_role, counterpart
+
+    def _stale_model_evidence(self, terminal: str) -> None:
+        """Invalidate every model record that CLAIMS TO DESCRIBE this physical session.
+
+        OS-49 BUGFIX (review B1). The one thing a refusal after `select_and_verify()` has
+        run cannot do is pretend the session is untouched. Selection is the act that
+        switches the session, so by the time any post-selection leg refuses, the physical
+        model of `terminal` is whatever the driver left it on -- which is, at best,
+        unknown to this harness and, at worst, exactly the model the refusal was about.
+        Every record that was earned against the model this session USED to be on has
+        therefore stopped describing it.
+
+        Restoring such a record would be the defect: B1's reproduction is precisely a
+        Reviewer record for `terminal` surviving a refused Worker attempt on `terminal`
+        and then granting pair admission to a LATER delivery on a different session,
+        while both physical sessions sat on one model. So this stales rather than
+        restores, and it is keyed on the TERMINAL rather than on `(phase, role)`: a
+        record for ANY phase or role that names this session as the place it was observed
+        is equally no longer a description of it.
+
+        What it does NOT touch, and must not: records observed at OTHER terminals. Those
+        sessions were not asked to select anything by this attempt, so their evidence
+        still describes them. Nor `requested_model` on the row -- that is the routing's
+        DECLARATION, not evidence, and it did not become false.
+
+        Recovery is a positive re-verification, not a restore: the caller runs
+        `verify_model_identity()` against the session again, the driver selects and
+        observes again, and the record that results describes the session as it ACTUALLY
+        is. Until then a same-command counterpart delivery is refused as
+        `MODEL_SELECTION_PAIR_UNADMITTED`, which is the existing vocabulary member for
+        "the counterpart has no positively verified model evidence" -- which, after
+        staling, is the literal truth. No new refusal reason is needed or added.
+        """
+        self._model_session_identity.pop(terminal, None)
+        self._model_pending_evidence.pop(terminal, None)
+        for key in [
+            key
+            for key, evidence in self._model_identity.items()
+            if evidence.observed_at_terminal == terminal
+        ]:
+            del self._model_identity[key]
+        row = self._terminals.get(terminal)
+        if row is not None:
+            row.update(self._MODEL_ROW_CLEARED)
 
     def _gate_b_model_identity(
         self, *, task_id: str, terminal: str, role: str, phase: str, attempt: int
@@ -3119,6 +3223,99 @@ class OrcaRuntimeHarness:
                 "wired in, so a selection cannot be requested on this placement "
                 f"(driver={type(self.model_driver).__name__})",
             )
+        # ---- PRE-SELECTION: the conflicts decidable WITHOUT the driver (review B1) ---
+        # Everything from `_mint_model_selection_ticket()` down is AFTER the physical
+        # session may have been switched, because `select_and_verify()` is the act that
+        # switches it. A check that needs nothing the driver produces therefore has no
+        # business running there: refusing afterwards means the session was mutated for
+        # an attempt that was always going to be rejected, and B1 is exactly what that
+        # window cost -- a Reviewer record for this terminal outliving a Worker attempt
+        # that had already moved the terminal off the model the record names.
+        #
+        # BOTH halves of pair admission are that kind of check, and both are decided
+        # here. (Iteration 1 hoisted only the first and its comment claimed that was "the
+        # only one in this method"; final review R2 showed the claim was false and the
+        # second one is corrected along with it.)
+        #
+        #   1. the SESSION conflict -- `counterpart.observed_at_terminal` vs `terminal`,
+        #      two harness-held strings compared for equality.
+        #   2. the MISSING same-command counterpart -- `counterpart is None`,
+        #      `require_pair_admission`, and the counterpart entry's `required`,
+        #      `resolved` and `command` against this `command`. Every one of them is
+        #      harness state or a parameter of this call; not one is produced by the
+        #      driver.
+        #
+        # The two differ in ONE respect, and deliberately. Check 1 is UNGATED by
+        # `require_pair_admission` (review M5, unchanged): the defect it closes is
+        # reachable through the PRE-PASS alone -- verify reviewer on term_1/model-B, then
+        # verify worker on term_1/model-A -- after which the pair looked admitted to every
+        # later delivery. Ungated by command, too: `Worker session != Reviewer session` is
+        # a categorical Skill invariant, not a same-command special case, and a legitimate
+        # pair always holds two distinct handles, so it can refuse nothing a correct
+        # caller does.
+        #
+        # Check 2 IS gated by `require_pair_admission`, and that gate is load-bearing
+        # rather than incidental. The pre-pass is HOW a caller bootstraps a same-command
+        # pair: the first role it verifies necessarily has no counterpart evidence yet, so
+        # a pre-pass that refused on counterpart absence would make same-command pairs
+        # unroutable -- the condition would be unsatisfiable by construction. It is only a
+        # DELIVERY that may not proceed on an unadmitted pair, which is exactly what
+        # `require_pair_admission` names.
+        #
+        # For both checks the reason, the message and the gating are byte-for-byte what
+        # the post-selection copies raised, so no caller's or test's expectation moves.
+        # What moves is WHEN: no ticket has been minted, no ordinal drawn and no driver
+        # called when either fires, which is the positive, assertable proof that the
+        # mutation window is gone rather than merely narrowed. Both post-selection copies
+        # REMAIN as re-entrancy backstops -- hoisting is an addition, not a move.
+        routing_role = self._routing_key(role, phase)[1]
+        counterpart_role, counterpart = self._counterpart_model_identity(
+            phase=phase, routing_role=routing_role
+        )
+        if counterpart is not None and counterpart.observed_at_terminal == terminal:
+            raise self._model_refusal(
+                REASON_WORKER_REVIEWER_MUST_DIFFER,
+                role=role,
+                phase=phase,
+                attempt=attempt,
+                command=command,
+                requested_model=requested,
+                detail=f"the {counterpart_role} of phase {phase!r} was positively "
+                f"verified on this very session {terminal!r} (resolved "
+                f"{counterpart.resolved_model!r}); one physical session cannot be both "
+                "sides of a pair, so its independence is not established no matter "
+                "which models the two verifications resolved to",
+            )
+        if (
+            counterpart is None
+            and counterpart_role is not None
+            and require_pair_admission
+        ):
+            # Check 2 (final review R2). The same-command scoping is read off the SAME
+            # routing entry the post-selection copy reads, and with the same
+            # required/resolved predicate, so the hoist and the backstop cannot disagree
+            # about which pairs the rule covers.
+            counterpart_entry = self.agent_routing.for_role(phase, counterpart_role)
+            if (
+                counterpart_entry is not None
+                and counterpart_entry.required
+                and counterpart_entry.resolved
+                and counterpart_entry.command == command
+            ):
+                raise self._model_refusal(
+                    MODEL_SELECTION_PAIR_UNADMITTED,
+                    role=role,
+                    phase=phase,
+                    attempt=attempt,
+                    command=command,
+                    requested_model=requested,
+                    detail=f"the {counterpart_role} of phase {phase!r} shares this "
+                    f"command {command!r} and has no positively verified model "
+                    "evidence yet, so Worker/Reviewer independence rests on nothing "
+                    "but two declared tokens -- which can alias onto one model. "
+                    "Verify both effective identities with verify_model_identity() "
+                    "before delivering either",
+                )
         ticket, issued_at = self._mint_model_selection_ticket(
             task_id=task_id,
             terminal=terminal,
@@ -3137,14 +3334,43 @@ class OrcaRuntimeHarness:
         # still revokes the ticket first, so a raising driver cannot leave a live stamp
         # behind for the NEXT attempt's window, and `Exception` deliberately does not
         # swallow KeyboardInterrupt or SystemExit.
-        driver_failure: BaseException | None = None
+        #
+        # OS-49 iteration 2 (final review R1). Normalization and EVIDENCE INVALIDATION
+        # are two different concerns, and the defect was that they shared one branch.
+        # `except Exception` is the right NORMALIZATION boundary -- an interrupt or an
+        # interpreter exit is not a failed model selection and must keep propagating as
+        # itself -- but it is the wrong INVALIDATION boundary: a driver that calls
+        # `ticket.stamp()` and then raises `KeyboardInterrupt` has begun selecting, so
+        # the session may already be switched, yet the staling below used to be skipped
+        # along with the normalization and every record naming the session stayed
+        # authoritative. The invariant is about the SIDE EFFECT, not about the exception's
+        # type: once selection may have occurred, no unsuccessful exit may leave the
+        # pre-existing evidence authoritative.
+        #
+        # So the handler is `BaseException`, it stales FIRST, and only then decides
+        # whether this exception is one the closed vocabulary speaks for. Non-`Exception`
+        # control flow is re-raised untouched -- same type, same traceback, not wrapped in
+        # `OrcaRuntimeError` -- so the M3-era interrupt/finality semantics are preserved
+        # exactly. The nested `finally:` keeps the revoke-then-stale ORDER the ordinary
+        # failure path already had, so no existing behaviour moves.
+        driver_failure: Exception | None = None
         evidence: Any = None
         try:
-            evidence = self.model_driver.select_and_verify(ticket)
-        except Exception as exc:                       # noqa: BLE001 - normalized below
+            try:
+                evidence = self.model_driver.select_and_verify(ticket)
+            finally:
+                self._revoke_model_selection_ticket(ticket)
+        except BaseException as exc:                   # noqa: BLE001 - re-raised below
+            # OS-49 BUGFIX (review B1), widened by R1. `select_and_verify()` RAN. A
+            # driver that raised part-way through is the strongest case for staling, not
+            # the weakest: it is the one path on which nobody -- not the driver, not this
+            # harness -- can say whether the session was switched before the exception.
+            # Unknown is not "unchanged", so every record describing this session is
+            # invalidated here too, and recovery is a positive re-verification.
+            self._stale_model_evidence(terminal)
+            if not isinstance(exc, Exception):
+                raise                      # KeyboardInterrupt / SystemExit, as themselves
             driver_failure = exc
-        finally:
-            self._revoke_model_selection_ticket(ticket)
         drawn_to = self._model_selection_seq
         if driver_failure is not None:
             raise self._model_refusal(
@@ -3162,6 +3388,22 @@ class OrcaRuntimeHarness:
             ) from driver_failure
 
         def refuse(reason: str, detail: str = "") -> OrcaRuntimeError:
+            """Build a POST-SELECTION refusal -- and stale this session on the way out.
+
+            OS-49 BUGFIX (review B1). Every `raise refuse(...)` below sits after
+            `select_and_verify()` has returned, so by construction reaching any of them
+            means the physical session may already carry a different model than the
+            records naming it claim. `_stale_model_evidence()` is therefore part of what
+            a post-selection refusal IS, not a thing each site must remember to do: a
+            future leg added below inherits it, and a leg hoisted above `refuse`'s
+            definition -- i.e. above the driver call -- correctly does not get it.
+
+            Pre-selection refusals deliberately do NOT come through here. They use
+            `self._model_refusal` directly, because nothing was requested of the session
+            and its evidence still describes it; staling there would discard a record an
+            earlier successful verification legitimately earned.
+            """
+            self._stale_model_evidence(terminal)
             return self._model_refusal(
                 reason,
                 role=role,
@@ -3313,31 +3555,15 @@ class OrcaRuntimeHarness:
         # on the commands alone, so no counterpart evidence is required and the
         # pre-OS-49 lifecycle stands. The Final Reviewer is deliberately outside this
         # rule and has no counterpart to look up.
-        routing_role = self._routing_key(role, phase)[1]
-        counterpart_role = {"worker": "reviewer", "reviewer": "worker"}.get(routing_role)
+        # RE-READ, not the pre-selection values reused: `select_and_verify()` is
+        # arbitrary driver code that ran in between, and the honest assumption about
+        # arbitrary code is that harness state may have moved under it. The run-scope
+        # filter (review F-002) lives in `_counterpart_model_identity()` so this read and
+        # the pre-selection one cannot disagree about which records count.
+        counterpart_role, counterpart = self._counterpart_model_identity(
+            phase=phase, routing_role=routing_role
+        )
         if counterpart_role is not None:
-            counterpart = self._model_identity.get((phase, counterpart_role))
-            # OS-49 iteration 2 (review F-002). Model evidence is RUN-SCOPED, and this
-            # is the read that GRANTS pair admission, so the scope has to be enforced
-            # here. A record observed in another run says nothing about whether this
-            # run has a counterpart session at all: it was accepted against that run's
-            # six-part attempt key, and the run it names is already on the record. Left
-            # unchecked, a second run on the same harness instance inherited the first
-            # run's counterpart evidence and delivered a same-command Worker whose
-            # Reviewer did not exist in that run.
-            #
-            # Dropping it into the `counterpart is None` branch below is the fail-closed
-            # reading, not a silent discard: a SAME-COMMAND delivery is refused as
-            # MODEL_SELECTION_PAIR_UNADMITTED, and a distinct-command pair -- independent
-            # on its commands alone -- is unaffected. It can refuse nothing a same-run
-            # pair does today, because a same-run record's `observed_at_run` is this run
-            # by construction (leg (h) already refused anything else at acceptance).
-            # `finish()` also clears both model maps at the run boundary; this check is
-            # what holds if a caller ever re-points `run_id` without going through it.
-            if counterpart is not None and counterpart.observed_at_run != (
-                self.run_id or ""
-            ):
-                counterpart = None
             counterpart_entry = self.agent_routing.for_role(phase, counterpart_role)
             # Scoped exactly as Gate A's pair check is: to a counterpart that is REQUIRED
             # and resolved. At LOW risk the Reviewer entry exists but is optional and no
@@ -3352,6 +3578,20 @@ class OrcaRuntimeHarness:
                 and counterpart_entry.command == command
             )
             if counterpart is None:
+                # OS-49 iteration 2 (final review R2), retained as the POST-selection
+                # backstop after the identical condition was hoisted above the driver
+                # call. The pre-selection copy is the one that fires for every ordinary
+                # caller, and it is the one that matters, because it fires before the
+                # session can be switched.
+                #
+                # This copy is not dead code, for the same reason the session check's
+                # backstop is not: `select_and_verify()` is arbitrary driver code running
+                # between the two reads, and a driver that re-enters this method -- or
+                # otherwise writes `_model_identity` -- can DELETE or run-scope-invalidate
+                # a counterpart record that existed at the pre-check, which the
+                # pre-selection read could not have anticipated. It is also what stops a
+                # future reordering from silently reopening the window: delete the hoist
+                # and this still refuses, just later and with the session already mutated.
                 if require_pair_admission and same_command:
                     raise refuse(
                         MODEL_SELECTION_PAIR_UNADMITTED,
@@ -3363,21 +3603,24 @@ class OrcaRuntimeHarness:
                         "before delivering either",
                     )
             elif counterpart.observed_at_terminal == terminal:
-                # OS-49 BUGFIX (review M5). The SESSION half of pair admission, and it is
-                # NOT gated on `require_pair_admission`: the defect it closes is reachable
-                # through the PRE-PASS alone (verify reviewer on term_1/model-B, then
-                # verify worker on term_1/model-A), after which the pair looked admitted
-                # to every later delivery. Two resolved models on one physical terminal is
-                # one agent wearing two hats, whatever the models say, so comparing only
-                # `(command, resolved_model)` could never refuse it --
-                # `ModelEvidence.observed_at_terminal` carried the discriminator all along
-                # and nothing read it.
+                # OS-49 BUGFIX (review M5), retained as the POST-selection backstop after
+                # review B1 hoisted the same comparison above the driver call. The
+                # pre-selection copy is the one that fires for every ordinary caller, and
+                # it is the one that matters, because it fires before the session can be
+                # switched.
                 #
-                # Ungated by command, too: `Worker session != Reviewer session` is a
-                # categorical Skill invariant, not a same-command special case, and a
-                # legitimate pair always holds two distinct handles -- the reuse gate's
-                # condition 1 already refuses carrying one session across roles -- so this
-                # can refuse nothing a correct caller does.
+                # This copy is not dead code and is not redundant. `select_and_verify()`
+                # is arbitrary driver code executing between the two reads, and a driver
+                # that re-enters `verify_model_identity()` -- or otherwise writes
+                # `_model_identity` -- can create a counterpart record naming THIS
+                # terminal in that window, which the pre-selection read could not have
+                # seen. It is also the guard that stops a future reordering of this method
+                # from silently reopening B1: delete the hoist and this still refuses,
+                # just later and with the session already mutated.
+                #
+                # Reached post-selection, it therefore goes through `refuse()` and STALES
+                # the session, which is correct for exactly the reason the hoist exists:
+                # here the switch really did happen.
                 raise refuse(
                     REASON_WORKER_REVIEWER_MUST_DIFFER,
                     f"the {counterpart_role} of phase {phase!r} was positively verified "

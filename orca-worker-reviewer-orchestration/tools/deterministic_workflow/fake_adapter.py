@@ -373,8 +373,19 @@ class FakeAdapter:
         # adapter's declaration, Gate A's precondition and Gate B's barrier cannot
         # disagree about what counts as a driver. The rule is unchanged -- a CALLABLE
         # `select_and_verify` and nothing else -- so no declaration moves.
-        if MODEL_SELECTION_VERIFIED in _import_agent_profile(
-        ).model_selection_capabilities(self.model_driver):
+        #
+        # OS-49 BUGFIX (review N2). The `None` short-circuit is NOT a second copy of the
+        # predicate and cannot disagree with it: `model_selection_capabilities(None)` is
+        # documented to yield the EMPTY set, so both spellings decline the capability for
+        # a driverless adapter and only the import is skipped. It has to be skipped,
+        # because `capabilities()` is read on every FakeAdapter -- the overwhelming
+        # majority of which carry no model driver at all -- and the DEFAULT no-driver
+        # path must not depend on `agent_profile` being importable in the layout it runs
+        # in. A cross-package import performed only to be told "nothing" is a dependency
+        # the default path does not own.
+        if self.model_driver is not None and MODEL_SELECTION_VERIFIED in (
+            _import_agent_profile().model_selection_capabilities(self.model_driver)
+        ):
             offered = offered | frozenset({MODEL_SELECTION_VERIFIED})
         if self.external_world is None:
             return offered

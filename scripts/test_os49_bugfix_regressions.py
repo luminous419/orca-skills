@@ -399,6 +399,12 @@ class DriverShapeTests(BarrierTestCase):
     the first three cases fails pre-fix on the exception TYPE alone.
     """
 
+    #: Every case here is about a DRIVER's shape or failure, so the pair must be
+    #: admissible for the delivery to reach the driver at all (final review R2). The two
+    #: cases that refuse ABOVE the driver call -- a missing and a non-callable
+    #: `select_and_verify` -- are unaffected either way. See `BarrierTestCase.refuse()`.
+    ADMIT_PAIR = True
+
     def test_a_driver_without_select_and_verify_is_unsupported(self) -> None:
         message = self.assertRefusedWith(
             MODEL_SELECTION_UNSUPPORTED, driver=BrokenDriverShapes.Missing()
@@ -562,7 +568,26 @@ class PairSessionIdentityTests(BarrierTestCase):
         )
 
     def test_the_refused_second_role_records_nothing(self) -> None:
-        """A refused pre-pass must leave no trace a later delivery could read as earned."""
+        """A refused pre-pass must leave no trace a later delivery could read as earned.
+
+        WHY THIS TEST'S MEANING CHANGED UNDER THE B1 HOIST (final review R3). Read the
+        surviving reviewer record below against the two code shapes:
+
+          PRE-HOIST: the session check sat BELOW `select_and_verify()`, so attempt 2
+          actually CALLED this `drifting("model-b", "model-a")` driver and it switched
+          handle onto model-a. The assertions then said a reviewer/model-b record
+          SURVIVES a session that had physically moved to model-a -- i.e. the test
+          encoded the B1 defect as correct behaviour.
+
+          POST-HOIST: the conflict is decided from harness state before a ticket is
+          minted, so the driver is NEVER CALLED on attempt 2 and the session is never
+          switched. The same reviewer/model-b record is now a TRUE description of
+          handle, which is the only reason these assertions are sound.
+
+        So what makes the surviving record correct is the HOIST, not retention after a
+        switched session. `_stale_model_evidence()` deliberately does not run here,
+        because a pre-selection refusal asked nothing of the session.
+        """
         driver = drifting("model-b", "model-a")
         _recorder, harness = self.one_session_harness(driver)
         handle = harness.create_fake_terminal(
