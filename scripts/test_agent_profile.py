@@ -67,6 +67,12 @@ EXAMPLE_PROFILE = REPO_ROOT / ".orca" / "agent-profiles.example.yaml"
 KNOWN_COMMANDS = ("claude", "codex", "claude-glm", "claude-gemma")
 CUSTOM_PATTERN = re.compile(r"(?:claude|codex)-[A-Za-z0-9._-]+", re.ASCII)
 
+# OS-49 re-pointed the two same-command phase overrides this fixture used to
+# carry (`design` claude/claude and `implementation` codex/codex). They were
+# written when a same-command pair was an accepted configuration; the
+# effective-identity rule now refuses one, so keeping them here would make this
+# fixture a document the shipped gate rejects. The same-command configurations
+# live on as explicit NEGATIVE cases in scripts/test_os49_effective_identity.py.
 VALID = textwrap.dedent(
     """\
     version: 1
@@ -78,10 +84,10 @@ VALID = textwrap.dedent(
         phases:
           design:
             worker: claude
-            reviewer: claude
+            reviewer: codex
           implementation:
             worker: codex
-            reviewer: codex
+            reviewer: claude
         final_review:
           reviewer: codex
     """
@@ -142,8 +148,12 @@ class SchemaOnlyParsingTests(unittest.TestCase):
         self.assertEqual(profile.name, "diverse")
         self.assertEqual(profile.default_for(ROLE_WORKER), "claude")
         self.assertEqual(profile.default_for(ROLE_REVIEWER), "codex")
-        self.assertEqual(profile.phase_for("design", ROLE_REVIEWER), "claude")
+        # The two expectations below follow the OS-49 fixture re-pointing above.
+        # What this test asserts is unchanged: a phase override is read from the
+        # phase block, not from `defaults`.
+        self.assertEqual(profile.phase_for("design", ROLE_REVIEWER), "codex")
         self.assertEqual(profile.phase_for("implementation", ROLE_WORKER), "codex")
+        self.assertEqual(profile.phase_for("implementation", ROLE_REVIEWER), "claude")
         self.assertEqual(profile.final_reviewer(), "codex")
 
     def test_multiple_named_profiles_coexist_in_one_file(self) -> None:
@@ -211,8 +221,12 @@ class SchemaOnlyParsingTests(unittest.TestCase):
             load('version: "1"\nprofiles:\n  p:\n    defaults:\n      worker: claude\n')
 
     def test_an_unsupported_version_is_explicit(self) -> None:
+        # OS-49 made 2 a SUPPORTED version (the model-aware schema), so the literal
+        # moves to the first version that is still unsupported. The invariant the
+        # test exists for -- an out-of-range version fails closed rather than being
+        # read as the nearest known one -- is unchanged and still asserted here.
         with self.assertRaises(AgentProfileError):
-            load("version: 2\nprofiles:\n  p:\n    defaults:\n      worker: claude\n")
+            load("version: 3\nprofiles:\n  p:\n    defaults:\n      worker: claude\n")
 
     def test_malformed_yaml_raises_instead_of_parsing_partially(self) -> None:
         with self.assertRaises(AgentProfileError):

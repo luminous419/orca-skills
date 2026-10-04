@@ -866,8 +866,16 @@ class E2EHarness:
         for entry in self.agent_routing.entries:
             command = entry.command or "unresolved"
             suffix = "" if entry.required else ", optional"
+            # OS-49. The MODEL half of the effective identity, appended to the SAME line
+            # rather than folded into the command: a reader must be able to see that two
+            # entries sharing a command are told apart by their models. Absent entirely
+            # when no model is declared, so a run that declares none renders a
+            # byte-identical block.
+            identity = command if not getattr(entry, "model", "") else (
+                f"{command} model={entry.model}"
+            )
             lines.append(
-                f"  {entry.phase} {entry.role}={command} "
+                f"  {entry.phase} {entry.role}={identity} "
                 f"({entry.origin or 'none'}{suffix})"
             )
         return tuple(lines)

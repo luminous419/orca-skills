@@ -577,6 +577,16 @@ class StandaloneProfile:
     #: a `(dotted-field, expected-value)` pair over a PARSED record.  The login TEXT is
     #: never a marker -- these are record fields.
     auth_markers: tuple[tuple[str, str], ...] = ()
+    # OS-49 BUGFIX (review M4).  A `model_selector: ModelSelector | None` field used to sit
+    # here, together with a `ModelSelector` dataclass above and a preflight branch that
+    # refused a profile carrying one.  None of it was reachable: the field is absent from
+    # the loader's closed key set, no loader, archive, digest or round-trip path carries
+    # it, and the only way to populate it was to construct the dataclass directly in a
+    # test.  So the preflight refusal protected nothing and the field was a configuration
+    # surface a normal user could not load -- which is worse than an absent one, because it
+    # reads like a supported option.  Removed until OS-14 supplies the model-REQUEST half
+    # that would make an observation locator mean something; `scripts/test_os49_driver_
+    # seam.py` locks the absence so it cannot come back half-wired.
 
     def __post_init__(self) -> None:
         if self.driver not in DRIVER_KINDS:

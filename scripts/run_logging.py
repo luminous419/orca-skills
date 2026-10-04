@@ -948,7 +948,42 @@ class RunTimingTracker:
 # module would have to be added to release_manifest.py's required_skill_paths(); a
 # function here rides the parity rule that already exists.
 
-FINAL_REVIEW_AUDIT_SCHEMA_VERSION = "1.0"
+# 1.1, a MINOR bump, for OS-49's five additive reviewer-model fields. A MAJOR bump is
+# FORBIDDEN here: the reader checks only the MAJOR component plus the presence of
+# _REQUIRED_RECORD_FIELDS, so bumping MAJOR would make every historical 1.0 record read
+# as `unknown_major` -- the records this family exists to preserve.
+FINAL_REVIEW_AUDIT_SCHEMA_VERSION = "1.1"
+# ---- TWO version axes, and which one moves when (OS-49 BUGFIX, review N2) -------------
+# Review N2 observed, correctly, that OS-49 added five fields to
+# FINAL_REVIEW_REDACTED_METADATA_FIELDS while leaving this string at `redaction/1.1`, and
+# asked whether one policy version was now identifying two coverage sets. Checked against
+# the contract: it is not, because the two things are versioned on DIFFERENT axes and the
+# contract never asked this string to denote coverage.
+#
+#   `redaction/MAJOR.MINOR` versions the TEXT TRANSFORMATION -- the ordered
+#   REDACTION_CATEGORIES tuple below and nothing else. `redact_text()` is documented as a
+#   pure function of (text, policy_version) and REFUSES any version but this one, because
+#   "a digest is only comparable against a digest produced by the SAME policy". That is
+#   why docs/COMPATIBILITY.md states this version's meaning in terms of its five categories
+#   and says that ADDING A CATEGORY (Windows paths, say) is the MINOR bump. OS-49 added no
+#   category and changed no substitution, so every `*_digest_post_redaction` ever written
+#   under `redaction/1.1` is still byte-reproducible. Bumping it for a coverage change
+#   would be actively WRONG here: this function admits exactly one version, so the bump
+#   would make every historical record's digest unverifiable -- destroying the evidence the
+#   audit family exists to preserve, which is the same reasoning that FORBIDS a MAJOR bump
+#   of FINAL_REVIEW_AUDIT_SCHEMA_VERSION above.
+#
+#   FIELD COVERAGE is versioned by FINAL_REVIEW_AUDIT_SCHEMA_VERSION, which OS-49 did bump
+#   1.0 -> 1.1 for exactly those five fields ("필드 추가는 MINOR"), and it is additionally
+#   RECORDED, not inferred: every record carries
+#   `metadata_redaction.covered_fields` verbatim. So a reader never has to deduce coverage
+#   from a policy string, and one policy version cannot identify two coverage sets because
+#   it identifies none -- each record states its own.
+#
+# What WAS missing is that nothing said this, and nothing locked this string against the
+# thing it does denote. `scripts/test_os49_contract_locks.py::RedactionPolicyVersionTests`
+# now pins the category tuple to this version, so a future category change that forgets the
+# bump fails, and asserts that coverage travels in the record.
 FINAL_REVIEW_REDACTION_POLICY_VERSION = "redaction/1.1"
 # 2.0, not 1.1: `orchestrator_log.content` is GONE and `orchestrator_log.digest` is
 # renamed, both of which break a reader that has not been updated. The rename is the
@@ -993,6 +1028,17 @@ FINAL_REVIEW_EVIDENCE_BUNDLE_FILENAME = "FINAL_REVIEW_EVIDENCE_BUNDLE.json"
 FINAL_REVIEW_REDACTED_METADATA_FIELDS = (
     "reviewer_agent_command",
     "reviewer_agent_origin",
+    # OS-49. The Final Reviewer's model identity, including its REQUEST leg, so which
+    # effective agent identity produced this review is reconstructible from the record
+    # alone. They join this tuple beside the two command fields and for the same reason:
+    # they are free-form strings the routing and the driver wrote, so they pass through
+    # the same versioned policy rather than sitting "next to" a covered field and
+    # silently skipping it.
+    "reviewer_requested_model",
+    "reviewer_resolved_model",
+    "reviewer_model_state",
+    "reviewer_model_request_method",
+    "reviewer_model_request_evidence",
     "failure_detail",
     "notes",
     "stored_task_spec.capture_error",
@@ -3109,6 +3155,11 @@ def write_final_review_audit_record(
     reviewer_terminal: str = "",
     reviewer_agent_command: str = "",
     reviewer_agent_origin: str = "",
+    reviewer_requested_model: str = "",
+    reviewer_resolved_model: str = "",
+    reviewer_model_state: str = "",
+    reviewer_model_request_method: str = "",
+    reviewer_model_request_evidence: str = "",
     report_path: str | Path | None = None,
     failure_detail: str = "",
     observed_input_bytes: int | None = None,
@@ -3177,6 +3228,18 @@ def write_final_review_audit_record(
         "reviewer_terminal": reviewer_terminal,
         "reviewer_agent_command": reviewer_agent_command,
         "reviewer_agent_origin": reviewer_agent_origin,
+        # OS-49. Additive, and empty on every run that declares no model -- which is what
+        # keeps a 1.0-era record and a 1.1 record of a model-less run the same document in
+        # every way that matters. `reviewer_model_request_evidence` is the one-cell
+        # `token:request_stamp->observe_stamp` rendering, so "a selection was REQUESTED for
+        # this attempt BEFORE the resolved model was observed" is reconstructible from the
+        # record by the arithmetic request_stamp < observe_stamp, with no appeal to code
+        # that is no longer running.
+        "reviewer_requested_model": reviewer_requested_model,
+        "reviewer_resolved_model": reviewer_resolved_model,
+        "reviewer_model_state": reviewer_model_state,
+        "reviewer_model_request_method": reviewer_model_request_method,
+        "reviewer_model_request_evidence": reviewer_model_request_evidence,
     }
     repository = _capture_repository_state() if capture else None
     if repository is not None:

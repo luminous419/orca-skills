@@ -11,8 +11,52 @@ from typing import Any
 from . import artifact_identity
 from . import pause_policy
 from .contracts import (BASE_CAPABILITIES, EXTERNAL_LOOKUP, EXTERNAL_RESUME,
-                        GATE_ENVELOPE_KEYS, LIFECYCLE_SETTLEMENT, ActionIntent,
+                        GATE_ENVELOPE_KEYS, LIFECYCLE_SETTLEMENT,
+                        MODEL_SELECTION_VERIFIED, ActionIntent,
                         RECOVERY_CAPABILITIES, SettlementEvent, make_settlement_event)
+
+def _import_orca_runtime() -> Any:
+    """``orca_runtime_harness``, imported lazily and from EITHER layout.
+
+    OS-49 BUGFIX (review M1). This used to be ``from ..orca_runtime_harness import
+    ModelEvidence`` inside ``InProcessModelDriver.select_and_verify()``. The parent-package
+    form resolves only in the repository layout, where this package is
+    ``scripts.deterministic_workflow`` and ``..`` is ``scripts``. In the INSTALLED flat
+    Skill layout ``deterministic_workflow`` is top-level and the harness is a ``tools/``
+    sibling, so ``..`` points outside every package and the import raises::
+
+        ImportError: attempted relative import beyond top-level package
+
+    Because the import was lazy, the module still imported cleanly and the defect appeared
+    only when the method was CALLED -- which is why the regression for it has to call
+    ``select_and_verify()`` in a flat-layout ``sys.path`` and not merely import the module.
+
+    Lazy for the reason ``launcher._import_orca_runtime`` and
+    ``orca_adapter._default_result_parser`` are, and written the same way deliberately:
+    this module is inside the shipped engine package and the harness is a ``tools/``
+    sibling, so a module-scope import would make the whole package unimportable in an
+    installation that carries only the engine.
+    """
+    try:                                        # repository layout
+        from scripts import orca_runtime_harness
+    except ImportError:                         # pragma: no cover - flat installed layout
+        import orca_runtime_harness             # type: ignore[no-redef]
+    return orca_runtime_harness
+
+
+def _import_agent_profile() -> Any:
+    """``agent_profile``, from the repository or the installed Skill layout.
+
+    Reached only from ``FakeAdapter.capabilities()``, so the model-selection capability
+    this adapter declares is derived by the SAME function the two gates read
+    (review M6) instead of by a third copy of the predicate.
+    """
+    try:                                        # repository layout
+        from scripts import agent_profile
+    except ImportError:                         # pragma: no cover - flat installed layout
+        import agent_profile                    # type: ignore[no-redef]
+    return agent_profile
+
 
 def stipulated_gate_envelope(intent: ActionIntent) -> dict[str, Any]:
     """A well-formed CLEAR gate envelope for a SCRIPTED settlement.
@@ -187,6 +231,93 @@ class FileExternalWorld:
 class IdempotencyConflict(ValueError): pass
 
 
+class InProcessModelDriver:
+    """OS-49's reference model-selection driver, and the ONLY one in this release.
+
+    It exists so the request-then-verify lifecycle can be exercised DETERMINISTICALLY
+    without inventing any real runtime behaviour.  Its "channel" is its own in-process
+    session state: ``select_and_verify`` RECORDS a requested model against the ticket's
+    terminal and then READS that state back as the resolved value.  No model-selection
+    command string is composed, no acknowledgement format is assumed and no output is
+    parsed at any point -- which is what makes the honesty claim checkable rather than
+    asserted, and what keeps the real runtime refused.
+
+    It obeys the five ordered obligations the barrier checks arithmetically:
+
+      1. draw an ordinal immediately BEFORE issuing the request,
+      2. issue the request for ``ticket.requested_model`` on ``ticket.terminal``,
+      3. observe the resolved model AFTER step 2,
+      4. draw a second ordinal AFTER that observation,
+      5. return evidence carrying the ticket's own token and the attempt key.
+
+    ``resolve`` is the one injection point a test needs: it maps a requested model to what
+    the "provider" resolved, so a test can construct a MISMATCH (resolve to something
+    else), an ALIAS that collapses two requests onto one model, or a malformed value --
+    each of which the barrier must refuse.  SATISFACTION is the driver's own judgement, by
+    design: the harness implements no alias table, because only something that can observe
+    a provider's resolution can know whether a resolved value satisfied a request.  A
+    driver that resolves to a different model must therefore report ``mismatch`` itself
+    rather than silently accept, and this one does.
+
+    ``requests`` records ``("request", ordinal)`` / ``("observe", ordinal)`` in call order,
+    so a test can assert the ORDER at the driver rather than only at the barrier -- which
+    is what keeps a barrier bug and a driver bug distinguishable.
+    """
+
+    #: The one member of the harness's closed request-method vocabulary this driver can
+    #: honestly name.  Spelled here rather than imported: this package takes no import
+    #: from the runtime harness, and a lock test pins the two spellings equal.
+    REQUEST_METHOD = "driver_select_and_verify"
+    OBSERVATION_METHOD = "in_process_session_state"
+
+    def __init__(self, *, resolve: Any = None, state: str = "verified") -> None:
+        self.resolve = resolve
+        self.state = state
+        #: terminal handle -> the model this driver was last asked to select on it.  The
+        #: REQUEST leg's effect, and the only thing the observation leg is allowed to read.
+        self.sessions: dict[str, str] = {}
+        self.requests: list[tuple[str, int]] = []
+        self.tickets: list[Any] = []
+
+    def select_and_verify(self, ticket: Any) -> Any:
+        # Dual-layout, lazy: see `_import_orca_runtime` for why the parent-relative form
+        # this replaced could not work in the installed flat Skill layout (review M1).
+        ModelEvidence = _import_orca_runtime().ModelEvidence
+
+        self.tickets.append(ticket)
+        # ---- leg 1: REQUEST ------------------------------------------------------------
+        request_stamp = ticket.stamp()
+        self.requests.append(("request", request_stamp))
+        self.sessions[ticket.terminal] = ticket.requested_model
+        # ---- leg 2: OBSERVE, and only now ----------------------------------------------
+        requested = self.sessions[ticket.terminal]
+        resolved = self.resolve(requested) if callable(self.resolve) else requested
+        observe_stamp = ticket.stamp()
+        self.requests.append(("observe", observe_stamp))
+        state = self.state
+        if state == "verified" and resolved != requested:
+            # The driver owns SATISFACTION and must say so rather than let the harness
+            # guess.  An alias table lives in a provider, never here.
+            state = "mismatch"
+        return ModelEvidence(
+            state=state,
+            requested_model=ticket.requested_model,
+            resolved_model=resolved,
+            selection_token=ticket.token,
+            request_method=self.REQUEST_METHOD,
+            request_stamp=request_stamp,
+            observation_method=self.OBSERVATION_METHOD,
+            observe_stamp=observe_stamp,
+            capability=MODEL_SELECTION_VERIFIED,
+            observed_at_run=ticket.run_id,
+            observed_at_task=ticket.task_id,
+            observed_at_terminal=ticket.terminal,
+            observed_at_role=ticket.role,
+            observed_at_phase=ticket.phase,
+            observed_at_attempt=ticket.attempt,
+        )
+
+
 class FakeAdapter:
     """The Orca-independent adapter, and OS-31's ``LifecycleSettlementPort`` reference impl.
 
@@ -199,7 +330,8 @@ class FakeAdapter:
                  runtime_state: Any = None, external_world: Any = None,
                  run_id: str = "", settlement_journal: Any = None,
                  approval_port: Any = None, worktree: str = "id:fakerepo::/fake/wt",
-                 axes: dict[str, dict[str, Any]] | None = None):
+                 axes: dict[str, dict[str, Any]] | None = None,
+                 model_driver: Any = None):
         self.results = list(results); self._capabilities = capabilities
         self.receipts: dict[str, dict[str, Any]] = {}; self.events: dict[str, SettlementEvent] = {}
         self.runtime_state = runtime_state
@@ -215,6 +347,11 @@ class FakeAdapter:
         self.axes: dict[str, dict[str, Any]] = dict(axes or {})
         self.lifecycle_commands: list[tuple[str, str]] = []
         self.listing_readable = True
+        # OS-49.  A model-selection DRIVER -- an object implementing
+        # `select_and_verify(ticket) -> ModelEvidence`, which must REQUEST a selection for
+        # the attempt the ticket names and only THEN observe the resolution.  `None` is the
+        # default and declares nothing.
+        self.model_driver = model_driver
 
     def capabilities(self) -> frozenset[str]:
         # The recovery capabilities are declared only when a durable external world actually
@@ -225,6 +362,31 @@ class FakeAdapter:
             offered = offered | frozenset({LIFECYCLE_SETTLEMENT})
         if self.approval_port is not None:
             offered = offered | frozenset({"human_approval"})
+        # OS-49, the same conditional-declaration discipline.  The condition is a DRIVER,
+        # not an evidence source: an object that can only answer "what model is this
+        # session on" is not a driver and earns nothing, because the token means BOTH legs
+        # -- a selection was REQUESTED for this attempt and the resolution was THEN
+        # observed.  `select_and_verify` is the method that can honour both, so its
+        # presence is what is checked.
+        # OS-49 BUGFIX (review M6): derived through `agent_profile.
+        # model_selection_capabilities()`, the ONE place the rule lives, so this
+        # adapter's declaration, Gate A's precondition and Gate B's barrier cannot
+        # disagree about what counts as a driver. The rule is unchanged -- a CALLABLE
+        # `select_and_verify` and nothing else -- so no declaration moves.
+        #
+        # OS-49 BUGFIX (review N2). The `None` short-circuit is NOT a second copy of the
+        # predicate and cannot disagree with it: `model_selection_capabilities(None)` is
+        # documented to yield the EMPTY set, so both spellings decline the capability for
+        # a driverless adapter and only the import is skipped. It has to be skipped,
+        # because `capabilities()` is read on every FakeAdapter -- the overwhelming
+        # majority of which carry no model driver at all -- and the DEFAULT no-driver
+        # path must not depend on `agent_profile` being importable in the layout it runs
+        # in. A cross-package import performed only to be told "nothing" is a dependency
+        # the default path does not own.
+        if self.model_driver is not None and MODEL_SELECTION_VERIFIED in (
+            _import_agent_profile().model_selection_capabilities(self.model_driver)
+        ):
+            offered = offered | frozenset({MODEL_SELECTION_VERIFIED})
         if self.external_world is None:
             return offered
         return offered | RECOVERY_CAPABILITIES

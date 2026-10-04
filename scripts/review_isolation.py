@@ -1074,6 +1074,13 @@ def wrap_command(session: Path, command: str, agent_path: Sequence[str] = ()) ->
     reason the sandbox wrapper is: the gate compares the resolved role command, so
     wrapping must be applied at launch or every isolated dispatch looks like a different
     agent to the gate.
+
+    OS-49: the IDENTICAL rule holds for a role's MODEL. This function composes a launch
+    line out of `command` and nothing else; a model is carried as a separate value by the
+    routing and the ledger and must NEVER be folded into `agent_command` here. Folding one
+    in would make it shell input, and would change the reuse gate's command key so that
+    one executable's two models looked like two different executables to a gate whose job
+    is to tell them apart on a second axis.
     """
     review_root = shlex.quote(str(session / "review_root"))
     tmp = shlex.quote(str(session / "tmp"))

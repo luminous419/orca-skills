@@ -126,6 +126,52 @@ class DeclarationHonestyTests(_Base):
             self.adapter.capabilities() <= CAPABILITIES,
             f"undeclared tokens: {sorted(self.adapter.capabilities() - CAPABILITIES)}")
 
+    # ---- OS-49: the same discipline, for the model-selection token -------------------
+    # The assertion is over the PAIR of legs, not over one of them: an adapter that gains
+    # an observation locator alone still fails it, because the token means a selection was
+    # REQUESTED for this attempt AND the resolution was THEN observed. Extended here
+    # rather than relaxed: nothing above changes.
+
+    def test_the_standalone_adapter_declares_no_model_capability(self) -> None:
+        """It can OBSERVE at most, never REQUEST: the standalone profile declares no
+        model-request channel, and inventing one would mean assuming an in-band syntax this
+        repository has not observed. So a profile carrying a selector is refused at
+        preflight and the adapter declares nothing, whatever is wired in."""
+        from scripts.deterministic_workflow.contracts import MODEL_SELECTION_VERIFIED
+
+        for adapter in (
+            StandaloneAdapter(None),
+            StandaloneAdapter(None, runtime_state=self.ledger),
+            StandaloneAdapter(None, runtime_state=self.ledger,
+                              settlement_journal=self.journal,
+                              artifact_base=self.base, run_id="run_1"),
+            self.adapter,
+        ):
+            self.assertNotIn(MODEL_SELECTION_VERIFIED, adapter.capabilities())
+
+    def test_an_observation_only_object_does_not_earn_the_model_token(self) -> None:
+        """The condition is a DRIVER that can do both legs, never an evidence source."""
+        from scripts.deterministic_workflow.contracts import MODEL_SELECTION_VERIFIED
+        from scripts.deterministic_workflow.fake_adapter import (
+            FakeAdapter,
+            InProcessModelDriver,
+        )
+
+        class ObserverOnly:
+            """Can answer "what model is this session on" and nothing else."""
+
+            def resolved_model(self, terminal: str) -> str:
+                return "glm-5.2"
+
+        self.assertNotIn(
+            MODEL_SELECTION_VERIFIED,
+            FakeAdapter([], model_driver=ObserverOnly()).capabilities())
+        self.assertNotIn(
+            MODEL_SELECTION_VERIFIED, FakeAdapter([]).capabilities())
+        self.assertIn(
+            MODEL_SELECTION_VERIFIED,
+            FakeAdapter([], model_driver=InProcessModelDriver()).capabilities())
+
 
 # =====================================================================================
 class Condition1Tests(_Base):

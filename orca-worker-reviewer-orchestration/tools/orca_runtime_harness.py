@@ -41,6 +41,21 @@ try:
         strip_task_context,
     )
     from scripts import clarification_protocol, decision_gate, decision_policy, run_logging
+    from scripts.agent_profile import (
+        MODEL_EVIDENCE_MISMATCH,
+        MODEL_EVIDENCE_NONE,
+        MODEL_EVIDENCE_REQUESTED,
+        MODEL_EVIDENCE_STALE,
+        MODEL_EVIDENCE_STATES,
+        MODEL_EVIDENCE_UNVERIFIABLE,
+        MODEL_EVIDENCE_VERIFIED,
+        EVENT_AGENT_IDENTITY_BOUND,
+        MODEL_SELECTION_VERIFIED_CAPABILITY,
+        MODEL_TOKEN_PATTERN,
+        REASON_WORKER_REVIEWER_MUST_DIFFER,
+        effective_identity_independent,
+        model_selection_capabilities,
+    )
     from scripts.deterministic_workflow import quiescence, turn_boundary
     from scripts.workflow_contract import load_workflow_output_contract
 except ModuleNotFoundError:  # direct `python3 scripts/...` execution
@@ -69,6 +84,21 @@ except ModuleNotFoundError:  # direct `python3 scripts/...` execution
     import decision_policy
     import run_logging
     import clarification_protocol
+    from agent_profile import (
+        MODEL_EVIDENCE_MISMATCH,
+        MODEL_EVIDENCE_NONE,
+        MODEL_EVIDENCE_REQUESTED,
+        MODEL_EVIDENCE_STALE,
+        MODEL_EVIDENCE_STATES,
+        MODEL_EVIDENCE_UNVERIFIABLE,
+        MODEL_EVIDENCE_VERIFIED,
+        EVENT_AGENT_IDENTITY_BOUND,
+        MODEL_SELECTION_VERIFIED_CAPABILITY,
+        MODEL_TOKEN_PATTERN,
+        REASON_WORKER_REVIEWER_MUST_DIFFER,
+        effective_identity_independent,
+        model_selection_capabilities,
+    )
     from deterministic_workflow import quiescence, turn_boundary
     from workflow_contract import load_workflow_output_contract
 
@@ -520,6 +550,162 @@ class UnsupportedOrcaContract(OrcaRuntimeError):
     pass
 
 
+#: What a diagnostic says in place of a value's own text when that text cannot be produced
+#: at all. Named constants rather than inline literals because the regressions assert on
+#: them: a diagnostic that says nothing is worse than one that says why it says nothing.
+UNRENDERABLE_TEXT = "<unrenderable: __str__ and __repr__ both raised>"
+UNRENDERABLE_TYPE_NAME = "<unrenderable type name>"
+UNRENDERABLE_REPR = "<unrenderable: __repr__ raised>"
+
+
+def safe_text(value: Any) -> str:
+    """`str(value)` -- total for ordinary `Exception`; control flow propagates.
+
+    OS-49 BUGFIX (review 5970292670, N-4). The superseded first line said "TOTAL. Never
+    raises, whatever `value` does", and that was an unconditional claim the code has not
+    made true since review F-002 narrowed the captures below from `BaseException` to
+    `Exception`. Stated exactly, and this is the split every helper in this group shares:
+
+        ordinary `Exception` from `__str__` / `__repr__`  -> handled, fallback text
+        KeyboardInterrupt / SystemExit / GeneratorExit    -> PROPAGATE as themselves
+
+    The split is deliberate and the behaviour is correct as it stands; N-4 is a wording
+    correction and changes no capture. Do NOT re-widen anything here to `BaseException`
+    in order to make the old sentence true -- that is the F-002 defect, reintroduced.
+
+    OS-49 BUGFIX iteration 2 (review F-001). A diagnostic must not be able to replace the
+    failure it is diagnosing. Every `except` handler in this module that renders what it
+    caught is a normalization boundary, and on the model-selection path the caught object
+    is NOT this repository's: it comes from `select_and_verify()` or from reading the
+    `ModelEvidence` that call returned, which is arbitrary third-party code, and an
+    exception class is free to define a `__str__` that raises. The eager `f"...{exc}..."`
+    those handlers used therefore raised a NEW, unrelated exception from inside the
+    handler that existed to stop exactly that, and the caller lost BOTH the normalized
+    refusal and the diagnosis.
+
+    Falls back `str` -> `repr` -> a fixed stand-in, because a fix that guarded only
+    `str()` would still escape through a `repr()` fallback -- and `repr()` is the obvious
+    fallback, so that second shape is the one a partial fix leaves open.
+
+    `Exception` -- NOT `BaseException` -- is the correct width here, and iteration 2 had
+    it wrong. OS-49 BUGFIX iteration 3 (review F-002). The superseded docstring argued
+    that an interrupt raised by a hostile `__str__` "is not an operator stopping the run".
+    That argument describes INTENT, and intent is precisely what this boundary cannot
+    observe: `KeyboardInterrupt` IS a `BaseException`, so `except BaseException` consumed
+    it regardless of where it came from. A REAL asynchronous interrupt -- the operator's
+    Ctrl-C, delivered by the signal machinery while a slow `__str__` happened to be
+    running -- was therefore swallowed and replaced by fallback text while the run carried
+    on. Reproduced with a signal timer armed inside `__str__`:
+        SWALLOWED <__str__ raised; repr: <fallback after swallowed operator interrupt>>
+
+    `Exception` closes F-002 and keeps F-001 total in a SINGLE narrowing, because the
+    split falls exactly on the control-flow boundary:
+        KeyboardInterrupt / SystemExit / GeneratorExit  not `Exception` -> PROPAGATE
+        MemoryError / RecursionError / RuntimeError          `Exception` -> still caught
+    Every realistic hostile-`__str__`/`__repr__` failure is an `Exception`, so rendering
+    stays total for all of them; every control-flow escape now leaves as itself.
+
+    The one behaviour this deliberately moves: a hostile `__str__` that DELIBERATELY
+    raises `KeyboardInterrupt` now propagates instead of being rendered. That is not a new
+    hole, it is consistent with the surrounding design -- the post-selection handler
+    stales the session and then re-raises non-`Exception` untouched under the R1 rule, so
+    a driver that raises `KeyboardInterrupt` from `__str__` is treated identically to one
+    that raises it from `select_and_verify()`, which the design explicitly says propagates
+    as itself. Do not re-widen this to `BaseException`.
+    """
+    try:
+        return str(value)
+    except Exception:                                # noqa: BLE001 - total for Exception
+        pass
+    try:
+        return f"<__str__ raised; repr: {value!r}>"
+    except Exception:                                # noqa: BLE001 - total for Exception
+        return UNRENDERABLE_TEXT
+
+
+def safe_repr(value: Any) -> str:
+    """`repr(value)` -- total for ordinary `Exception`; control flow propagates.
+
+    OS-49 BUGFIX (review 5970292670, N-1). The `!r` sibling of `safe_text`, added for the
+    one place that needs it: `_model_refusal()` renders the DRIVER'S evidence with `!r` in
+    order to diagnose why a delivery was refused, and the driver owns every one of those
+    field values. A `__repr__` that raises therefore let a DIAGNOSTIC replace the refusal
+    it was diagnosing -- the F-001 shape, at the one render boundary F-001 did not reach
+    because `!r` is not `str()`.
+
+    Byte-identical to `f"{value!r}"` for every value that renders at all, so no existing
+    refusal message, log row or test expectation moves.
+
+    `Exception`, not `BaseException`, for the reason `safe_text` spells out: an interrupt
+    raised inside `__repr__` is an operator decision and leaves as itself.
+    """
+    try:
+        return repr(value)
+    except Exception:                                # noqa: BLE001 - N-4 split, see above
+        return UNRENDERABLE_REPR
+
+
+def safe_type_name(value: Any) -> str:
+    """`type(value).__name__` -- total for ordinary `Exception`; control flow propagates.
+
+    The same reason as `safe_text`: a metaclass may define `__name__`, and `__name__` is
+    not obliged to be a string.
+
+    Catches `Exception`, not `BaseException`, for the reason spelled out in `safe_text`
+    (review F-002): a metaclass `__name__` is arbitrary code, so an operator interrupt can
+    land inside it, and an interrupt is not a rendering failure to be papered over.
+
+    OS-49 BUGFIX (review 5970292670, N-4). The superseded word was "TOTAL", unqualified,
+    which overstated a capture that is -- correctly -- `Exception`-wide only. Wording only;
+    the capture is unchanged.
+    """
+    try:
+        name = type(value).__name__
+    except Exception:                                # noqa: BLE001 - total for Exception
+        return UNRENDERABLE_TYPE_NAME
+    return name if isinstance(name, str) else UNRENDERABLE_TYPE_NAME
+
+
+def safe_exception_text(exc: BaseException) -> str:
+    """`f"{type(exc).__name__}: {exc}"` -- total for ordinary `Exception`; control flow
+    propagates.
+
+    Byte-identical to that eager f-string for every exception that renders at all, so no
+    existing refusal reason, message, log row or test expectation moves. It differs only
+    where the eager form RAISED, which is the defect.
+
+    OS-49 BUGFIX (review 5970292670, N-4). The superseded word was "TOTAL", unqualified.
+    This helper is exactly as total as the two it composes and no more: an interrupt
+    raised from inside `exc.__str__` or from a metaclass `__name__` leaves as itself.
+    Wording only; no capture moves.
+    """
+    return f"{safe_type_name(exc)}: {safe_text(exc)}"
+
+
+def _writer_label(writer: Any) -> str:
+    """The name a `_safe_log` row carries for its writer -- as total as the error text:
+    ordinary `Exception` is handled, control-flow exceptions propagate.
+
+    `getattr(writer, "__name__", writer)` is itself a render of a caller-supplied object
+    on the fallback leg, and `__name__` may be a raising property, so both legs are
+    guarded.
+
+    `Exception`, not `BaseException`, for the reason spelled out in `safe_text` (review
+    F-002). This is the fourth render boundary of the same shape; F-001 was a fix applied
+    at one site while a sibling kept the defect alive, so the narrowing is applied to
+    every one of them at once rather than only to the lines the finding cited.
+
+    OS-49 BUGFIX (review 5970292670, N-4). "total, like the error text" was the same
+    unconditional claim as `safe_text`'s, inherited by reference; it now carries the same
+    qualification. Wording only; both legs still catch `Exception`.
+    """
+    try:
+        name = writer.__name__
+    except Exception:                                # noqa: BLE001 - total for Exception
+        name = writer
+    return safe_text(name)
+
+
 def validate_orca_contract(
     app_version: str, orchestration_guide: str, cli_guide: str
 ) -> None:
@@ -590,6 +776,210 @@ def _flag_value(args: list[str], flag: str) -> str | None:
         if token == flag and index + 1 < len(args):
             return args[index + 1]
     return None
+
+
+# ---- OS-49: the model-selection seam's two closed vocabularies ------------------------
+# Both are snake_case `<axis>_<verdict>`, the naming shape
+# `standalone_lifecycle.CAPABILITY_FAILURE_REASONS` and `standalone_preflight.REASONS`
+# already use.  They are ORCHESTRATION-ONLY, because only this runtime has a
+# pre-delivery barrier; the SCREAMING_SNAKE policy codes live in `agent_profile` and are
+# imported above rather than restated here, so the two layers cannot drift.
+
+#: How a model selection may be REQUESTED.  CLOSED, and deliberately ONE member.
+#: `launch_argv` is NOT a member: a model-pinned wrapper's argv was composed before this
+#: session existed, so it is not a request attributable to THIS attempt -- it is evidence
+#: of what was requested of the operating system, never of what a provider resolved.  An
+#: interactive `/model` member cannot be added without the syntax and acknowledgement
+#: semantics this repository has not observed and refuses to invent.  So this tuple is a
+#: second, independent mechanism keeping the real Claude runtime fail-closed: no real
+#: adapter can name a member, and a `request_method` outside the set is
+#: `model_selection_unsupported`.  OS-14 adding a member is the visible, reviewable act
+#: that lifts the refusal.
+MODEL_SELECTION_REQUEST_METHODS = ("driver_select_and_verify",)
+
+#: How a resolved model may be OBSERVED.  CLOSED, and -- like the request methods above --
+#: deliberately ONE member, naming the only locator any driver in this release actually
+#: reads (`fake_adapter.InProcessModelDriver.OBSERVATION_METHOD`).
+#:
+#: OS-49 BUGFIX (review 5970292670, N-1a).  `observation_method` was the one attested
+#: field of `ModelEvidence` the barrier never validated: declared `str` and only ever
+#: RENDERED, so an arbitrary object passed the barrier and was stored as authority, then
+#: evaluated later from the settled-dispatch logging funnel.  It is leg 2's counterpart to
+#: `request_method` and now has leg 2's counterpart of that field's closed-set rule.
+#:
+#: The contract is TYPE AND VALUE, in that order, and the type test is `type(...) is str`
+#: rather than `isinstance`: a `str` SUBCLASS may override `__eq__`, so an `isinstance`
+#: gate would hand the membership test below an object that can still raise -- which is
+#: the defect, one layer down.  A value outside the set is never coerced into one with
+#: `str()` or `safe_text()`; coercion is what turns an arbitrary object into apparently
+#: valid evidence, and this barrier's whole job is to refuse it instead.
+#:
+#: OS-49 BUGFIX (final review F-013).  The contract is unchanged; its TYPE half MOVED.  It
+#: was the only attested field with such a check, and a check at its point of use runs
+#: after earlier legs have already touched other unvalidated values, so all fifteen type
+#: checks now sit in one hoisted gate immediately after the attested snapshot.  This
+#: tuple's membership test -- the VALUE half -- still runs at leg 2, under the same reason
+#: code and with the same diagnostic.
+#:
+#: A real `/model` locator (OS-14) adding a member is the visible, reviewable act that
+#: admits it, exactly as it is for `MODEL_SELECTION_REQUEST_METHODS`.
+MODEL_SELECTION_OBSERVATION_METHODS = ("in_process_session_state",)
+
+#: In LIFECYCLE ORDER, so the tuple itself documents that the request precedes the
+#: observation.  Every member is a refusal BEFORE delivery; none is repaired by retrying,
+#: by falling back to a weaker observation, or by downgrading to a warning.
+MODEL_SELECTION_UNSUPPORTED = "model_selection_unsupported"
+MODEL_SELECTION_REQUEST_ABSENT = "model_selection_request_absent"
+MODEL_SELECTION_REQUEST_STALE = "model_selection_request_stale"
+MODEL_SELECTION_UNVERIFIED = "model_selection_unverified"
+MODEL_SELECTION_MISMATCH = "model_selection_mismatch"
+MODEL_SELECTION_AMBIGUOUS = "model_selection_ambiguous"
+MODEL_SELECTION_PAIR_UNADMITTED = "model_selection_pair_unadmitted"
+MODEL_SELECTION_FAILURE_REASONS = (
+    # ---- the REQUEST leg ----
+    MODEL_SELECTION_UNSUPPORTED,     # a selection cannot be requested at all: no driver,
+                                     # or no supported request method
+    MODEL_SELECTION_REQUEST_ABSENT,  # a result with no attested request -- the
+                                     # pre-existing / default model-state case
+    MODEL_SELECTION_REQUEST_STALE,   # a request attested for another attempt or key, or
+                                     # ordinals not drawn from this ticket, not exactly
+                                     # two, or not in order
+    # ---- the OBSERVATION leg ----
+    MODEL_SELECTION_UNVERIFIED,      # requested, never positively observed
+    MODEL_SELECTION_MISMATCH,        # requested != resolved
+    MODEL_SELECTION_AMBIGUOUS,       # two contradictory resolved values for one identity
+    # ---- the PAIR leg: positive Worker/Reviewer independence, before any delivery ----
+    MODEL_SELECTION_PAIR_UNADMITTED, # a same-command pair whose COUNTERPART has no
+                                     # verified model evidence yet, so independence is
+                                     # not positively established and NOTHING may be
+                                     # delivered for either role
+)
+
+#: The shared second clause of a TYPE-GATE refusal, for the thirteen attested fields that
+#: have no leg-specific sentence of their own (OS-49 BUGFIX, final review F-013).  Spelled
+#: once so fifteen refusals cannot drift apart, and worded about what the harness needs
+#: rather than about the driver's intent: a value this barrier must compare, store and
+#: render has to BE a value, and an object that defines those operations itself is still
+#: driver code at every later read.
+ATTESTED_PRIMITIVE_NOTE = (
+    "an attested model-evidence field must be a value this harness can compare, store "
+    "and render, not an object whose behaviour the driver still controls"
+)
+
+#: Per-field reason code for a failed type gate.  Only the two fields whose malformed-type
+#: contract is already LOCKED by tests appear here; every other field falls back to
+#: `model_selection_unverified`, because an attested field that is not a primitive is not
+#: evidence of anything and `unverified` is the vocabulary's name for that.
+#:
+#:   * `observation_method` -> `model_selection_unsupported`.  N-1a's contract: leg 2
+#:     attests WHICH declared locator produced the resolved value, so a value that is not
+#:     a name does not name a locator this repository implements.
+#:   * `resolved_model` -> `model_selection_unverified`.  The B3 malformed-type contract,
+#:     which enumerates eight non-string shapes and requires every one of them to leave
+#:     the barrier inside the closed vocabulary under this member.
+ATTESTED_FIELD_TYPE_REFUSALS = {
+    "observation_method": MODEL_SELECTION_UNSUPPORTED,
+    "resolved_model": MODEL_SELECTION_UNVERIFIED,
+}
+
+#: The reuse gate's model condition names, beside `agent_command_mismatch` and
+#: `observation_not_for_this_dispatch`.
+MODEL_IDENTITY_MISMATCH = "model_identity_mismatch"
+MODEL_IDENTITY_UNVERIFIED = "model_identity_unverified"
+MODEL_IDENTITY_STALE = "model_identity_stale"
+MODEL_CAPABILITY_UNSUPPORTED = "model_capability_unsupported"
+MODEL_IDENTITY_FAILURE_REASONS = (
+    MODEL_IDENTITY_MISMATCH,
+    MODEL_IDENTITY_UNVERIFIED,
+    MODEL_IDENTITY_STALE,
+    MODEL_CAPABILITY_UNSUPPORTED,
+)
+
+
+#: "this key was not present", as distinct from a recorded empty string. Used by the
+#: model-evidence snapshot (review N1) so a rollback can tell `pop()` from `set to ""` and
+#: restore a row to exactly the shape it had, rather than to a plausible one.
+_ABSENT = object()
+
+
+@dataclass(frozen=True)
+class ModelSelectionTicket:
+    """ONE model-selection attempt.  Minted by the BARRIER -- never by a caller, never by
+    a driver -- and revoked the moment the driver's single call returns.
+
+    `token` and `stamp` are the two things that make the request leg unforgeable and
+    non-carryable, and they are deliberately different mechanisms:
+
+    * `token` is the attempt's IDENTITY: the barrier's own six-part key plus a run-scoped
+      ordinal the harness issues exactly once and never reissues.  No previous attempt, no
+      other session, no other `(role, phase)` and no pre-existing model state can hold it,
+      because it did not exist until this barrier ran.
+    * `stamp` is the attempt's ORDERING: a bound closure over the harness's private
+      monotone counter.  A driver cannot obtain a valid ordinal without CALLING it, and the
+      barrier knows the counter's value before and after the call -- so a fabricated
+      ordinal, a reused one, a missing one and an extra one are all detectable
+      arithmetically, by the harness, with no provider knowledge and no trust in the
+      driver's own account of what it did.
+
+    Why ordinals and not a timestamp: a clock reading a driver prints itself is not
+    ordering evidence, and this package already refuses self-reported evidence of that
+    shape.  A counter the driver does not OWN is different in kind -- the only way to get
+    the next ordinal is to ask the harness, and the harness counts how often it was asked.
+    """
+
+    run_id: str
+    task_id: str
+    terminal: str
+    role: str
+    phase: str
+    attempt: int
+    command: str
+    requested_model: str
+    #: f"{run}:{task}:{terminal}:{role}:{phase}:{attempt}:{ordinal}"
+    token: str
+    #: Single-use window.  Raises once the barrier revokes the ticket.
+    stamp: Callable[[], int]
+
+
+@dataclass(frozen=True)
+class ModelEvidence:
+    """One model-selection ATTEMPT: what was requested, through what, when -- and what was
+    THEN observed.
+
+    TWO LEGS, each separately attested, because a verdict about only the second one is
+    satisfiable by reading a model state nothing in this attempt asked for.  Whatever model
+    a fresh session happens to be on before anything requested a change is a STATE, not the
+    RESULT of a selection.
+
+    Defined HERE, beside `ReuseObservation`, rather than in `deterministic_workflow`: this
+    module is the runtime and takes no engine-package import.  The SCREAMING_SNAKE policy
+    vocabulary and the six model-evidence states are imported from `agent_profile`, which
+    owns them, so there is exactly one spelling of each.
+    """
+
+    state: str = ""                    # one of agent_profile.MODEL_EVIDENCE_STATES
+    requested_model: str = ""
+    resolved_model: str = ""
+    # ---- leg 1: the REQUEST, attested -------------------------------------------------
+    selection_token: str = ""          # MUST equal the ticket's token, exactly
+    request_method: str = ""           # MUST be in MODEL_SELECTION_REQUEST_METHODS
+    request_stamp: int = 0             # MUST be the ticket's FIRST drawn ordinal
+    # ---- leg 2: the OBSERVATION -------------------------------------------------------
+    observation_method: str = ""       # MUST be in MODEL_SELECTION_OBSERVATION_METHODS:
+                                       # which declared locator produced the resolved value
+    observe_stamp: int = 0             # MUST be the SECOND drawn ordinal, > request_stamp
+    capability: str = ""               # MUST be MODEL_SELECTION_VERIFIED_CAPABILITY
+    observed_at_run: str = ""
+    observed_at_task: str = ""
+    observed_at_terminal: str = ""
+    observed_at_role: str = ""
+    observed_at_phase: str = ""
+    observed_at_attempt: int = 0
+
+    @property
+    def request_evidence(self) -> str:
+        """The one-cell rendering the ledger and the durable provenance row carry."""
+        return f"{self.selection_token}:{self.request_stamp}->{self.observe_stamp}"
 
 
 @dataclass(frozen=True)
@@ -986,6 +1376,7 @@ class OrcaRuntimeHarness:
         risk: str = "high",
         risk_source: str = "default",
         agent_routing: Any | None = None,
+        model_driver: Any | None = None,
         human_approval_port: Any | None = None,
         clarification_inputs: dict[str, dict[str, object]] | None = None,
     ) -> None:
@@ -1011,6 +1402,105 @@ class OrcaRuntimeHarness:
         # None is the default so a scenario that selects no profile dispatches the
         # same specs and records the same ledger values as before this field existed.
         self.agent_routing = agent_routing
+        # ---- OS-49. The ONLY thing that can make a declared model routable here.
+        # `None` is the default and means NO CAPABILITY: with no driver a selection
+        # cannot even be REQUESTED, so a declared model is refused before delivery
+        # with `model_selection_unsupported`. A driver must implement ONE method,
+        # `select_and_verify(ticket) -> ModelEvidence`, and must attest BOTH ordered
+        # legs of the lifecycle for the attempt the ticket names. Declaring no model
+        # anywhere means the driver is never consulted and this harness behaves
+        # byte-identically to before OS-49.
+        self.model_driver = model_driver
+        # (phase, role) -> the ModelEvidence the barrier ACCEPTED. Written only on a
+        # successful barrier, never on a refusal, so it can never record a value that
+        # did not earn a delivery. This is what makes the resolved-value independence
+        # re-check and the non-drift refusal possible: a Reviewer's barrier reads its
+        # Worker counterpart's accepted identity, and a later round that resolves to a
+        # DIFFERENT model for the same (phase, role) is refused rather than logged.
+        self._model_identity: dict[tuple[str, str], ModelEvidence] = {}
+        # The harness-private monotone ordinal counter. A driver cannot advance it
+        # except by calling the bound `stamp()` of a ticket this harness minted, and
+        # the barrier reads it before and after the driver's one call -- which is the
+        # whole of the ordering proof, and it is integer arithmetic over values this
+        # harness itself issued.
+        self._model_selection_seq: int = 0
+        # Tokens whose `stamp()` window is still open. A ticket is revoked in a
+        # `finally:`, so a raising driver cannot leave a live stamp behind, and a
+        # driver that keeps the ticket and stamps later gets an error rather than a
+        # usable ordinal from the NEXT attempt's window.
+        self._model_selection_open_tokens: set[str] = set()
+        # terminal handle -> the accepted evidence awaiting rebinding to a dispatch id.
+        # The Dispatch does not exist yet when the barrier runs on rung 3 (the very call
+        # that delivers creates it), so the evidence is keyed on the handle here and
+        # rebound by _attach_terminal() the moment the id is known.
+        self._model_pending_evidence: dict[str, ModelEvidence] = {}
+        # OS-49 BUGFIX (review M2/M5). terminal handle -> (routing_role, phase, evidence)
+        # for the LAST evidence this run accepted on that PHYSICAL SESSION. The two maps
+        # above are keyed on (phase, role) and on a pending rebinding; neither can answer
+        # a question about the SESSION, and both of the defects this map closes were
+        # questions about the session:
+        #
+        #   M2 cross-phase resolved-model drift -- one terminal reused from IMPLEMENTATION
+        #       into TEST with the SAME requested alias resolving to a DIFFERENT model.
+        #       The (phase, role) key differs, so leg (i) never compared them and equal
+        #       request aliases were accepted as proof of an unchanged agent.
+        #   M5 one session verified as BOTH roles -- `ModelEvidence.observed_at_terminal`
+        #       carried the discriminator all along and nothing read it, so a same-command
+        #       pair could be "admitted" by one physical terminal playing both parts,
+        #       which is exactly what `Worker session != Reviewer session` forbids.
+        #
+        # Run-scoped like the two above and cleared by finish() for the same reason: every
+        # record in it was accepted against ONE run's six-part attempt key.
+        self._model_session_identity: dict[str, tuple[str, str, ModelEvidence]] = {}
+        # ---- OS-49 BUGFIX (review B2). The IDENTITY HISTORY, which is a different thing
+        # from the three maps above and needs a different LIFETIME.
+        #
+        # The three maps above hold CURRENT AUTHORITATIVE EVIDENCE: what pair admission
+        # and reuse condition 9 are allowed to act on. Authority is REVOCABLE -- once a
+        # selection has executed and then failed validation, nothing in them still
+        # describes the physical session, so `_stale_model_evidence()` drops them.
+        #
+        # These two hold IDENTITY HISTORY: the bare fact that, at some point in THIS run,
+        # a `(phase, role)` slot and a physical session were positively observed resolving
+        # to a particular model. That fact does not stop being true when the authority
+        # derived from it is revoked, and B2 is what happened when the two were conflated:
+        #
+        #     session S:  alias-X -> model-A   accepted
+        #     same S:     alias-X -> model-B   refused as drift, which STALED S
+        #     retry on S: alias-X -> model-B   ACCEPTED, because the staling had deleted
+        #                                      the very baseline that knew S was model-A
+        #
+        # So a refused drift attempt was the way to LAUNDER a drifting session into an
+        # accepted one -- two refusals in a row would have been fail-closed, and instead
+        # the first refusal cleared the ground for the second attempt to pass. History is
+        # therefore APPEND-ONLY for the life of the run and survives staling, while
+        # authority stays revocable. Drift legs (i) and (k) read HISTORY; pair admission,
+        # reuse and the provenance rows read AUTHORITY. Neither can do the other's job.
+        #
+        # Recovery is unaffected and still works, because recovery means resolving BACK to
+        # the baseline: S re-selected onto model-A matches its history and is accepted, and
+        # its authority is re-established by that fresh positive observation. What is now
+        # refused is re-badging S as a DIFFERENT model, for which the remedy is a new
+        # session -- which is available and cheap -- not an erased history.
+        #
+        # OS-49 BUGFIX (review 5970292670, N-3). "A new session" is the remedy for a
+        # DRIFTED SESSION, and it is not a way to change a ROLE's model. The replacement
+        # must still resolve to the role's established baseline: leg (i) is keyed on
+        # (phase, routing role) and reads `_model_role_history`, which moving to a fresh
+        # terminal does not touch, so a replacement resolving to a different model is
+        # refused on the new session for the rest of the run, exactly as it was on the
+        # old one. A role's resolved model changes in a NEW RUN, never mid-run.
+        #
+        # Only the resolved model is kept, not the evidence: history answers "what did
+        # this slot/session resolve to", and holding the whole record would invite some
+        # future reader to treat a historical record as authority, which is the conflation
+        # this split exists to prevent.
+        #
+        # RUN-SCOPED, which is what keeps B1's reset sufficient: cleared in `start_run()`
+        # beside the three maps above and in `finish()`, so no run can read another run's
+        # history and a declared model may legitimately change between runs.
+        self._model_role_history: dict[tuple[str, str], str] = {}
+        self._model_session_history: dict[str, tuple[str, str, str]] = {}
         # The tree the run's quality profile is read from, and the ONE resolution
         # every spec this harness renders is built from. start_run() re-reads it once
         # at the run boundary and then nothing re-reads it until the next run: a
@@ -1175,11 +1665,19 @@ class OrcaRuntimeHarness:
         owner_dispatch_id: str | None = None,
         created_by: str = "",
         agent_command: str = "",
+        requested_model: str = "",
+        model_state: str = "",
     ) -> dict[str, Any]:
         """Create the ledger row for a terminal at creation/adoption time.
 
         role and origin are the only axis (c2) evidence that exists, and the runtime
         keeps neither, so they are recorded here or lost forever.
+
+        OS-49 adds six model fields under the SAME "never overwrite a recorded value
+        blank" rule the existing evidence follows. Only `requested_model` and
+        `model_state` can be supplied at creation -- at creation nothing has been
+        requested and nothing resolved, so the other four are written later, by the
+        barrier and by _attach_terminal(), and are deliberately not parameters.
         """
         if role not in TERMINAL_ROLE_CLASSES:
             raise OrcaRuntimeError(f"unknown terminal role: {role}")
@@ -1205,6 +1703,20 @@ class OrcaRuntimeHarness:
                 "retain_reason": "",
                 "terminal_effect": "",
                 "owner_dispatch_ids": [owner_dispatch_id] if owner_dispatch_id else [],
+                # ---- OS-49 model identity evidence -------------------------
+                # What the materialized routing DECLARED for this role.
+                "requested_model": requested_model,
+                # Written by GATE B only, never at creation: a resolved model is the
+                # result of a selection this session was asked to make, and nothing
+                # has asked yet.
+                "resolved_model": "",
+                "model_state": model_state or MODEL_EVIDENCE_NONE,
+                # The REQUEST leg, written by _attach_terminal() from the evidence the
+                # barrier ACCEPTED. A `verified` row with these blank is a
+                # contradiction, and reuse condition 9 refuses it as such.
+                "model_request_method": "",
+                "model_request_evidence": "",
+                "model_observed_at_dispatch": "",
             }
         else:  # ownership transfer, never a role promotion (reuse chain)
             row["owner_dispatch_id"] = owner_dispatch_id or row["owner_dispatch_id"]
@@ -1212,6 +1724,22 @@ class OrcaRuntimeHarness:
                 row["created_by"] = created_by
             if agent_command:                 # never overwrite a recorded value blank
                 row["agent_command"] = agent_command
+            if requested_model:               # same rule, same reason
+                row["requested_model"] = requested_model
+            if model_state:
+                row["model_state"] = model_state
+            # A row created before OS-49 existed in this process (a test that built one
+            # by hand, a recovered shape) is brought up to the full key set WITHOUT
+            # overwriting anything it already carries.
+            for key, default in (
+                ("requested_model", ""),
+                ("resolved_model", ""),
+                ("model_state", MODEL_EVIDENCE_NONE),
+                ("model_request_method", ""),
+                ("model_request_evidence", ""),
+                ("model_observed_at_dispatch", ""),
+            ):
+                row.setdefault(key, default)
             if owner_dispatch_id and (
                 not row["owner_dispatch_ids"]
                 or row["owner_dispatch_ids"][-1] != owner_dispatch_id
@@ -1222,6 +1750,28 @@ class OrcaRuntimeHarness:
         )
         row["action"] = "retained"
         return row
+
+    def _rebind_model_evidence(self, handle: str, dispatch_id: str) -> None:
+        """OS-49. Rebind the barrier's accepted evidence to the Dispatch id.
+
+        The key the barrier verifies against is
+        `(run, task, handle, role, phase, attempt)` and NOT `dispatch_id`, because on
+        rung 3 the Dispatch is created by the very call that delivers -- so the id does
+        not exist yet when the evidence has to be judged. The moment it does exist, the
+        evidence is rebound here, together with its REQUEST leg: those three cells are
+        what reuse condition 9's staleness and contradiction rows read, and what the
+        durable provenance row carries. The ticket object itself is already revoked and
+        is never stored.
+        """
+        evidence = self._model_pending_evidence.pop(handle, None)
+        row = self._terminals.get(handle)
+        if evidence is None or row is None:
+            return
+        row["resolved_model"] = evidence.resolved_model
+        row["model_state"] = evidence.state
+        row["model_request_method"] = evidence.request_method
+        row["model_request_evidence"] = evidence.request_evidence
+        row["model_observed_at_dispatch"] = dispatch_id
 
     def _attach_terminal(
         self, handle: str, dispatch_id: str, created_by: str
@@ -1245,14 +1795,17 @@ class OrcaRuntimeHarness:
             # the demotion is conservativeness 0 -> 1 here, and settle_attempt
             # performs the only allowed upward transition once axis (a) has confirmed.
             self.demote_or_promote_role(handle, "active_worker", settled=False)
+            self._rebind_model_evidence(handle, dispatch_id)
             return row
-        return self.register_terminal(
+        row = self.register_terminal(
             handle,
             role="external_or_adopted",
             origin="adopted",
             owner_dispatch_id=dispatch_id,
             created_by=created_by,
         )
+        self._rebind_model_evidence(handle, dispatch_id)
+        return row
 
     def demote_or_promote_role(
         self, handle: str, new_role: str, *, settled: bool
@@ -1426,10 +1979,18 @@ class OrcaRuntimeHarness:
         *,
         role: str = "",
         agent_command: str = "",
+        requested_model: str = "",
         dispatch_id: str = "",
         observation: "ReuseObservation | None" = None,
     ) -> tuple[bool, tuple[str, ...]]:
-        """The eight-condition reuse gate. Returns (eligible, failure names).
+        """The NINE-condition reuse gate. Returns (eligible, failure names).
+
+        OS-49 APPENDED condition 9 (`compatible_model_identity`). It did not replace or
+        relax any of the eight that were here, and it can only ever REFUSE a reuse that
+        would otherwise have been allowed -- so no ownership, finality or provenance
+        protection is weakened, and nothing that was refused before becomes allowed.
+        Composition, exactly: existing eligibility AND compatible command AND positively
+        compatible model identity.
 
         Pure with respect to the runtime: issues ZERO Orca commands and writes
         nothing. The fresh liveness look is an ARGUMENT, never something this method
@@ -1510,6 +2071,18 @@ class OrcaRuntimeHarness:
         if recovery:
             reasons.append(recovery)
 
+        # ---- 9. compatible model identity (OS-49) -----------------------------
+        # Evaluated the same never-short-circuit way as the eight above, so a negative
+        # test binds to exactly one name. Two keys, two checks, neither substituting for
+        # the other: THIS condition judges the PREVIOUS dispatch's recorded identity
+        # against the next request, while the pre-delivery barrier judges THIS dispatch's
+        # resolved model before it delivers.
+        reasons.extend(
+            self._model_identity_reuse_reasons(
+                row, requested_model=requested_model, dispatch_id=dispatch_id
+            )
+        )
+
         if reasons:
             # De-duplicated: lifecycle_recovery_state() answers
             # `previous_dispatch_not_finalized` for an absent settlement row, which is
@@ -1517,12 +2090,90 @@ class OrcaRuntimeHarness:
             return False, tuple(sorted(set(reasons)))
         return True, ()
 
+    def _model_identity_reuse_reasons(
+        self, row: dict[str, Any], *, requested_model: str, dispatch_id: str
+    ) -> tuple[str, ...]:
+        """Reuse condition 9, as a total function over the recorded row.
+
+        Row 1 of the truth table is the compatibility guarantee and it is the FIRST
+        branch: a chain with no model anywhere -- the previous dispatch recorded none and
+        the next dispatch requests none -- produces exactly the pre-OS-49 decision, with
+        no new name and nothing read. Everything after that branch requires a model to be
+        involved on at least one side.
+        """
+        recorded_state = str(row.get("model_state") or MODEL_EVIDENCE_NONE)
+        recorded_requested = str(row.get("requested_model") or "")
+        recorded_resolved = str(row.get("resolved_model") or "")
+        recorded_method = str(row.get("model_request_method") or "")
+        recorded_request_evidence = str(row.get("model_request_evidence") or "")
+        recorded_dispatch = str(row.get("model_observed_at_dispatch") or "")
+        no_model_recorded = (
+            recorded_state == MODEL_EVIDENCE_NONE
+            and not recorded_requested
+            and not recorded_resolved
+        )
+        if no_model_recorded and not requested_model:
+            return ()                       # row 1: today's decision, byte-identical
+
+        reasons: list[str] = []
+        # Row 9. No driver means THIS dispatch could not request a selection either, so
+        # there is no way to re-establish the identity the reuse would carry forward.
+        # OS-49 BUGFIX (review M3/M6): asked through the ONE capability derivation the two
+        # gates read, so a driver object that exists but cannot be called is `unsupported`
+        # here exactly as it is at the barrier, rather than passing this condition and
+        # then leaking a raw AttributeError at delivery time.
+        if MODEL_SELECTION_VERIFIED_CAPABILITY not in model_selection_capabilities(
+            self.model_driver
+        ):
+            reasons.append(MODEL_CAPABILITY_UNSUPPORTED)
+        # Row 8. An internally contradictory row is never a basis for reuse. A `verified`
+        # model with no record that anything REQUESTED it is exactly as contradictory as a
+        # `verified` model with no resolved value.
+        contradictory = (
+            (recorded_state == MODEL_EVIDENCE_VERIFIED and not recorded_resolved)
+            or (
+                recorded_state == MODEL_EVIDENCE_VERIFIED
+                and (not recorded_method or not recorded_request_evidence)
+            )
+            or (recorded_resolved and recorded_state != MODEL_EVIDENCE_VERIFIED)
+            or (
+                recorded_method
+                and recorded_method not in MODEL_SELECTION_REQUEST_METHODS
+            )
+        )
+        if contradictory:
+            reasons.append(MODEL_IDENTITY_STALE)
+        # Row 7. Evidence that was not observed for the dispatch being handed over is
+        # stale by construction. A DIFFERENT key from the barrier's: this one is about the
+        # PREVIOUS dispatch.
+        #
+        # Gated on the row actually CLAIMING evidence. When the previous dispatch recorded
+        # none at all, "its evidence is not for this dispatch" is vacuously true and would
+        # emit a second name for one fact -- and the fact is the other one: no verified
+        # model was ever recorded, i.e. `model_identity_unverified`. One fact, one name, as
+        # the eight pre-existing conditions already require.
+        elif (
+            (recorded_state != MODEL_EVIDENCE_NONE or recorded_resolved)
+            and recorded_dispatch != dispatch_id
+        ):
+            reasons.append(MODEL_IDENTITY_STALE)
+        # Rows 5 and 6. `unverified` is not `pass`: a previous identity that was never
+        # positively resolved proves nothing about the session's current model.
+        if recorded_state != MODEL_EVIDENCE_VERIFIED:
+            reasons.append(MODEL_IDENTITY_UNVERIFIED)
+        # Rows 3 and 4. A changed model is a changed agent, and declared -> undeclared is
+        # a change like any other.
+        elif recorded_requested != requested_model:
+            reasons.append(MODEL_IDENTITY_MISMATCH)
+        return tuple(reasons)
+
     def terminal_for_next_dispatch(
         self,
         handle: str = "",
         *,
         role: str = "",
         agent_command: str = "",
+        requested_model: str = "",
         dispatch_id: str = "",
     ) -> str | None:
         """The one place a reuse decision becomes the NEXT dispatch's `terminal=`.
@@ -1547,6 +2198,7 @@ class OrcaRuntimeHarness:
             handle,
             role=role,
             agent_command=agent_command,
+            requested_model=requested_model,
             dispatch_id=dispatch_id,
             observation=self.observe_for_reuse(
                 dispatch_id=dispatch_id, handle=handle
@@ -1562,6 +2214,7 @@ class OrcaRuntimeHarness:
             "dispatch_id": dispatch_id,
             "eligible": eligible,
             "reasons": list(reasons),
+            "requested_model": requested_model,
         }
         return handle if eligible else None
 
@@ -2004,6 +2657,33 @@ class OrcaRuntimeHarness:
         # is cleared with the same statement.
         self._last_settled = None
         self._pending_verification = None
+        # OS-49 BUGFIX (review B1). The model state is RUN-SCOPED and must be cleared HERE,
+        # at the run boundary, beside every other per-run reset above -- not only in
+        # `finish()`.
+        #
+        # `finish()` is the CLEAN exit and is not reached by a run that fails, is abandoned,
+        # or raises on the way out; `start_run()` is the one point every run passes through
+        # by construction. Clearing only on the way out therefore left a window: one
+        # harness instance (which is the normal shape -- `run_runtime_scenarios()` drives
+        # A..I on a single instance) whose run 1 died before `finish()` carried run 1's
+        # model records into run 2, where leg (k) read a previous run's resolved model as
+        # run 2's drift baseline and REFUSED a legitimate verification as
+        # `model_selection_ambiguous`. The F-002 run filter in
+        # `_counterpart_model_identity()` covered the counterpart read only;
+        # `_model_session_identity` is keyed on the TERMINAL and `_model_pending_evidence`
+        # carries no run scope at all, so neither was covered by it.
+        #
+        # Resetting rather than run-scoping each read is deliberate, and is the direction
+        # the review asked for first: a filter makes a leaked record INVISIBLE at one site
+        # and leaves it live for every site added later, while clearing the state makes the
+        # leak unrepresentable. With these five statements the maps are run-scoped by
+        # construction, which is also what lets the B2 history be append-only without
+        # becoming permanent -- `for the life of the run` is enforced right here.
+        self._model_identity = {}
+        self._model_pending_evidence = {}
+        self._model_session_identity = {}
+        self._model_role_history = {}
+        self._model_session_history = {}
         # Provisioned here, once, immediately after the run id is known -- and
         # BEFORE any caller can create a Task whose artifact_contract names this
         # directory. Scoped under artifact_dir (this harness's own scratch space),
@@ -2192,6 +2872,13 @@ class OrcaRuntimeHarness:
         # reusing a session across that change would hand the next phase the wrong
         # agent while every other reuse condition still passed.
         agent_command = self.resolved_agent_command(role, phase) or shlex.join(command)
+        # OS-49. The MODEL this role is routed to, recorded as a SEPARATE ledger field.
+        # The string passed to `terminal create --command` below is UNCHANGED: a model is
+        # never concatenated into it. Doing so would make the model shell input AND would
+        # silently change the reuse gate's condition-2 key, so that one command's two
+        # models would look like two different executables to a gate that is supposed to
+        # judge them on a second axis.
+        requested_model = self.resolved_agent_model(role, phase)
         created = self.call(
             "terminal",
             "create",
@@ -2211,8 +2898,121 @@ class OrcaRuntimeHarness:
             if role.endswith("reviewer")
             else "phase_worker",
             agent_command=agent_command,  # W-20: the reuse gate's condition 2 evidence
+            requested_model=requested_model,   # OS-49: condition 9's declared half
+            model_state=(
+                MODEL_EVIDENCE_REQUESTED if requested_model else MODEL_EVIDENCE_NONE
+            ),
         )
         return handle
+
+    @staticmethod
+    def _barrier_phase(role: str, phase: str | None) -> str:
+        """The phase name the pre-delivery barrier keys this attempt to.
+
+        A Final Adversarial Review attempt carries no workflow phase, so it keys to the
+        reserved final-review slot -- which is also the slot its routing entry lives in.
+        Every other role keys to its own phase, and "" stays "" so the barrier's
+        fail-closed argument check can see a genuinely missing value.
+        """
+        if role.startswith("final"):
+            return phase or FINAL_REVIEW_PHASE
+        return phase or ""
+
+    @staticmethod
+    def _routing_key(role: str, phase: str = "") -> tuple[str, str]:
+        """The ONE role -> (phase, routing-role) mapping, factored out of one place.
+
+        OS-49 made this a correctness property rather than tidiness: a command and a
+        model read through two independent lookups could disagree, and the disagreement
+        would be invisible in the ledger and in the durable provenance row. Both
+        accessors below, and the barrier, go through this.
+
+        OS-49 iteration 2 (review F-001). The PHASE is part of the mapping, not just the
+        role spelling. A Final Adversarial Review is dispatched as role "reviewer" in
+        phase `final_review` -- the only spelling any production initiator produces, and
+        the one `_barrier_phase()` already maps onto the reserved slot -- so keying the
+        routing role off the role string alone sent that attempt to a ("final_review",
+        "reviewer") entry that does not exist. The lookup missed, the barrier returned at
+        `if not requested`, and the declared Final Reviewer model was never requested,
+        never verified and never recorded. `final_review` is a reviewer-only gate over a
+        whole run (task_context.FINAL_REVIEW_PHASE), so it has exactly ONE routing slot
+        and either spelling of the role resolves to it.
+
+        OS-49 BUGFIX (review N2). What this CHANGES, stated rather than understated. The
+        iteration-2 text claimed it "widens the slot's REACHABILITY only", and that was
+        wrong by omission: every accessor built on this mapping -- `_routing_entry_for()`,
+        and therefore `resolved_agent_command()` and `resolved_agent_model()` -- now
+        RESOLVES DIFFERENTLY for a Final Adversarial Review attempt. Called with
+        `phase="final_review"` and role `"reviewer"` (the spelling production initiators
+        produce) it used to look up a ("final_review", "reviewer") entry that does not
+        exist and return `""`; it now returns the Final Reviewer slot's command and model.
+        A caller that relied on `""` to mean "no routing" for Final Review gets a real
+        command instead. That is the intended fix -- the declared Final Reviewer model was
+        otherwise never requested, never verified and never recorded -- but it is a
+        behaviour change in the public accessors, not merely a wider lookup.
+        What is genuinely unchanged: the PAIR-admission rule. The Final Reviewer stays
+        outside it, because `final_reviewer` has no counterpart entry to look up -- which
+        is a property of the role map in the barrier, not of this mapping.
+        """
+        if role.startswith("final") or phase == FINAL_REVIEW_PHASE:
+            return FINAL_REVIEW_PHASE, "final_reviewer"
+        return phase, ("reviewer" if role.endswith("reviewer") else "worker")
+
+    @staticmethod
+    def _routing_is_model_aware(routing: Any) -> bool:
+        """Does `routing` declare a model anywhere -- answered FAIL-CLOSED (review N1).
+
+        `getattr(routing, "is_model_aware", False)` was the wrong default for a predicate
+        that gates a fail-closed barrier. On the real `RunRouting` it is a property and
+        always answers (`agent_profile.RunRouting.is_model_aware`), so no legitimate
+        routing's behaviour changes here. The exposure is the object that CANNOT answer: a
+        duck-typed stand-in, a partially constructed routing, a shape some future caller
+        passes in. `False` read every one of those as "this run declares no model", which
+        skipped Gate B's argument check silently -- and a guard that disappears when it
+        cannot evaluate itself is not a guard.
+
+        So an object that cannot answer is treated as model-AWARE, which is the strict
+        reading in both places this is used: in the barrier it keeps the (role, phase,
+        attempt) identity REQUIRED, so a malformed routing yields a refused dispatch
+        (observable) instead of an unverified delivery (not observable); in the provenance
+        row it keeps the row being EMITTED, so the durable evidence errs towards recording
+        more rather than less. A raising property is the same case as a missing one -- the
+        question went unanswered -- and an undeclared fact is unknown, not false.
+
+        `None` is the one shape that answers `False`, and it is not a malformed object: it
+        is the explicit legacy sentinel for "no routing at all", checked by every caller
+        before this point and byte-identical to pre-OS-49 behaviour.
+
+        OS-49 BUGFIX (review 5970292670, N-2). The TRUTH-VALUE EVALUATION is inside the
+        guard too, and that is the whole of this fix. The `except` previously covered only
+        the attribute READ, so the three shapes the helper reasons about were not treated
+        alike: a missing `is_model_aware` and a raising PROPERTY both reached the
+        conservative answer, while an attribute that EXISTS and returns an object whose
+        `__bool__` raises escaped from `return bool(aware)` as a raw exception -- out of a
+        `@staticmethod` predicate, into a fail-closed barrier and into the settled-dispatch
+        logging funnel. All three are the same fact: the question went unanswered. An
+        unanswered question is answered model-AWARE here, never by an exception.
+
+        The capture stays `Exception`, deliberately, and must not be widened. The width is
+        the control-flow boundary review F-002 established across this module: a
+        KeyboardInterrupt, SystemExit or GeneratorExit raised from inside a property or a
+        `__bool__` is an operator or interpreter decision, not an unanswered question, and
+        it leaves as itself. `None`, and a genuine `True`/`False`, are untouched.
+        """
+        if routing is None:
+            return False
+        try:
+            aware = getattr(routing, "is_model_aware", _ABSENT)
+            if aware is _ABSENT:
+                return True                 # no such attribute: answered nothing
+            return bool(aware)              # a raising `__bool__`: also answered nothing
+        except Exception:                   # noqa: BLE001 - see the docstring's N-2 note
+            return True
+
+    def _routing_entry_for(self, role: str, phase: str = "") -> Any | None:
+        if self.agent_routing is None:
+            return None
+        return self.agent_routing.for_role(*self._routing_key(role, phase))
 
     def resolved_agent_command(self, role: str, phase: str = "") -> str:
         """The resolved command for `role` in `phase`, or "" when there is no routing.
@@ -2221,16 +3021,29 @@ class OrcaRuntimeHarness:
         legacy answer, and every caller falls back to what it used before -- which is
         what keeps a scenario that selected no profile dispatching the same commands
         and recording the same ledger values as before this method existed.
+
+        OS-49 BUGFIX (review N2). The old "Behaviour UNCHANGED by OS-49" line was true of
+        iteration 1 and stopped being true when `_routing_key()` mapped
+        `phase == final_review` onto the reserved Final Reviewer slot. ONE case moved, and
+        only one: called for a Final Adversarial Review -- role `"reviewer"` with
+        `phase="final_review"`, or any role spelled `final*` -- this used to miss the
+        lookup and return `""`, and now returns the Final Reviewer slot's resolved command.
+        Every other (role, phase) answers exactly what it answered before, and a run that
+        selected no profile still gets `""` everywhere.
         """
-        if self.agent_routing is None:
-            return ""
-        if role.startswith("final"):
-            entry = self.agent_routing.for_role("final_review", "final_reviewer")
-        else:
-            entry = self.agent_routing.for_role(
-                phase, "reviewer" if role.endswith("reviewer") else "worker"
-            )
+        entry = self._routing_entry_for(role, phase)
         return entry.command if entry is not None else ""
+
+    def resolved_agent_model(self, role: str, phase: str = "") -> str:
+        """The resolved MODEL for `role` in `phase`, read from the SAME entry as the
+        command, or "" when none is declared.
+
+        "" is the legacy answer and the overwhelmingly common one: a v1 document, a
+        model-less v2 document and a profile-omitted run all produce it, and every
+        model-aware behaviour in this class is gated on a non-empty value.
+        """
+        entry = self._routing_entry_for(role, phase)
+        return entry.model if entry is not None else ""
 
     def wait_for_tui_idle(self, terminal: str) -> str:
         """Middle rung of the custom-command placement ladder (SKILL.md section 6).
@@ -2266,100 +3079,1478 @@ class OrcaRuntimeHarness:
             row["tui_idle"] = state
         return state
 
-    def start_worker(self, task_id: str, terminal: str, spec: str) -> tuple[str, bool]:
-        assert self.run_owner
-        if terminal == os.environ.get(SELF_HANDLE_ENV):
-            raise OrcaRuntimeError(
-                "refusing to register the caller's own terminal as a worker resource"
+    # ---- OS-49 GATE B: the pre-delivery model-identity barrier ------------------------
+
+    def _mint_model_selection_ticket(
+        self,
+        *,
+        task_id: str,
+        terminal: str,
+        role: str,
+        phase: str,
+        attempt: int,
+        command: str,
+        requested_model: str,
+    ) -> tuple[ModelSelectionTicket, int]:
+        """Mint ONE single-use ticket and return it with the ordinal it was issued at.
+
+        The returned `t` is the counter's value AFTER minting, so a conforming driver's
+        two `stamp()` calls must yield exactly `t + 1` then `t + 2`, and the counter must
+        end at `t + 2`. That triple is the whole ordering proof.
+        """
+        self._model_selection_seq += 1
+        issued_at = self._model_selection_seq
+        token = ":".join(
+            (
+                self.run_id or "",
+                task_id,
+                terminal,
+                role,
+                phase,
+                str(attempt),
+                str(issued_at),
             )
-        # Ladder rung 3, in order: the terminal already exists, so idle first, adopt
-        # second. Both steps precede any dispatch, so rung 4 can never run ahead of it.
-        self.wait_for_tui_idle(terminal)
-        started = self.call(
-            "orchestration",
-            "worker-start",
-            "--task",
-            task_id,
-            "--terminal",
-            terminal,
-            "--from",
-            self.run_owner,
-            allow_error=True,
         )
-        if started.get("ok"):
-            result = started["result"]
-            # OS-41 STEP 3a. The acknowledgement gate, ABOVE the ledger write: a
-            # supervised attachment is recorded only for a start the runtime itself
-            # calls ready. Anything else raises with the whole launch diagnosis
-            # attached, having registered nothing -- a half-started Dispatch must not
-            # become a row that later reads like a live supervised worker.
-            if "state" not in result:
-                # A success receipt with no `state` at all. Legitimate on exactly one
-                # HISTORICAL point observation (see
-                # WORKER_START_STATELESS_RECEIPT_VERSION -- no longer in the current
-                # executable support set, so this branch is offline-covered only) and
-                # missing lifecycle evidence everywhere else -- including on a
-                # 1.4.196 runtime, where `state` is the field that carries the launch
-                # outcome, and on a harness that never identified its runtime.
-                # BUGFIX-I1-MAJOR-1: this branch used to be unconditional, which let a
-                # malformed 1.4.196 receipt be written to the ledger as an adopted
-                # supervised worker.
-                if self.orca_app_version != WORKER_START_STATELESS_RECEIPT_VERSION:
-                    raise OrcaRuntimeError(
-                        "worker-start returned a success receipt with no launch "
-                        "state; that shape is accepted only from the point-verified "
-                        f"Orca {WORKER_START_STATELESS_RECEIPT_VERSION} runtime, and "
-                        "this harness has validated "
-                        f"{self.orca_app_version or 'no runtime'}: "
-                        f"dispatchId={result.get('dispatchId')!r} result={result!r}"
-                    )
-            elif str(result.get("state")) != WORKER_START_READY_STATE:
+        self._model_selection_open_tokens.add(token)
+
+        def stamp() -> int:
+            if token not in self._model_selection_open_tokens:
                 raise OrcaRuntimeError(
-                    "worker-start did not reach a ready worker: "
-                    f"state={str(result.get('state'))!r} "
-                    f"stage={result.get('stage')!r} "
-                    f"failedStage={result.get('failedStage')!r} "
-                    f"lastError={result.get('lastError')!r} "
-                    f"dispatchId={result.get('dispatchId')!r} "
-                    f"residualResources={result.get('residualResources')!r}"
+                    "model-selection ticket is revoked: a stamp may only be drawn "
+                    "during the single select_and_verify() call the barrier minted it "
+                    f"for (token={token!r})"
                 )
-            dispatch_id = result["dispatchId"]
-            self._attach_terminal(terminal, dispatch_id, "supervised_adopted")
-            # W-21. Deliberately NOT widened into the return type: tuple[str, bool] is
-            # unpacked at nine call sites, seven of them existing tests. Consumers read
-            # ledger_terminal(handle)["terminal_effect"] instead.
-            self.record_terminal_effect(
-                terminal, worker_start_terminal_effect(result)
+            self._model_selection_seq += 1
+            return self._model_selection_seq
+
+        ticket = ModelSelectionTicket(
+            run_id=self.run_id or "",
+            task_id=task_id,
+            terminal=terminal,
+            role=role,
+            phase=phase,
+            attempt=attempt,
+            command=command,
+            requested_model=requested_model,
+            token=token,
+            stamp=stamp,
+        )
+        return ticket, issued_at
+
+    def _revoke_model_selection_ticket(self, ticket: ModelSelectionTicket) -> None:
+        """Close the stamp window. Called in a `finally:`, so a raising driver cannot
+        leave a live stamp behind to spend inside the NEXT attempt's window."""
+        self._model_selection_open_tokens.discard(ticket.token)
+
+    def _model_refusal(
+        self,
+        reason: str,
+        *,
+        role: str,
+        phase: str,
+        attempt: int,
+        command: str,
+        requested_model: str,
+        evidence: "ModelEvidence | None" = None,
+        ticket: "ModelSelectionTicket | None" = None,
+        expected_window: tuple[int, int] | None = None,
+        drawn_to: int | None = None,
+        detail: str = "",
+    ) -> OrcaRuntimeError:
+        """The barrier's refusal, carrying the WHOLE diagnosis.
+
+        Shaped like the OS-41 acknowledgement gate's: a reader must be able to see which
+        LEG of the lifecycle failed and why, not merely that a model was unverified.
+        """
+        parts = [
+            f"{reason}: refusing to deliver a task before the requested model is "
+            "positively verified",
+            f"role={role!r}",
+            f"phase={phase!r}",
+            f"attempt={attempt}",
+            f"command={command!r}",
+            f"requested_model={requested_model!r}",
+        ]
+        if ticket is not None:
+            parts.append(f"minted_token={ticket.token!r}")
+        if expected_window is not None:
+            parts.append(
+                f"expected_stamps={expected_window[0]}->{expected_window[1]}"
             )
-            return dispatch_id, True
-        error = started.get("error", {})
-        # Only agent_unconfigured is a branch signal; every other error is a real
-        # failure (SKILL.md section 6 Custom command handling, rule 1).
-        if error.get("code") != "agent_unconfigured":
-            raise OrcaRuntimeError(f"worker-start failed: {error}")
-        dispatched = self.call(
-            "orchestration",
-            "dispatch",
-            "--task",
-            task_id,
-            "--to",
-            terminal,
-            "--from",
-            self.run_owner,
+        if drawn_to is not None:
+            parts.append(f"counter_after_driver={drawn_to}")
+        if evidence is not None:
+            # OS-49 BUGFIX (review 5970292670, N-1, fix point 3). EVERY cell below renders
+            # a field of the DRIVER'S `ModelEvidence`, and `ModelEvidence` is a plain
+            # frozen dataclass with no field validation, so each one is an arbitrary
+            # object whose `__repr__`, `__str__` or `__format__` may raise. Eager `!r` and
+            # `{}` therefore let the DIAGNOSTIC replace the refusal it exists to explain:
+            # the specific reason -- `model_selection_unsupported` for an observation
+            # method outside the closed set, say -- was lost and the caller received the
+            # generic malformed-evidence normalization from the B3 boundary instead. The
+            # review states the rule directly: keep diagnostics subordinate to the failure
+            # being reported.
+            #
+            # `safe_repr` / `safe_text` are byte-identical to `!r` / `str()` for every
+            # value that renders at all, so no existing refusal message moves. The
+            # `observed_at` join is included: `":".join()` over a non-string raises
+            # `TypeError`, which is the same escape with a different spelling.
+            parts.extend(
+                (
+                    f"evidence_state={safe_repr(evidence.state)}",
+                    f"resolved_model={safe_repr(evidence.resolved_model)}",
+                    f"request_method={safe_repr(evidence.request_method)}",
+                    f"selection_token={safe_repr(evidence.selection_token)}",
+                    f"request_stamp={safe_text(evidence.request_stamp)}",
+                    f"observe_stamp={safe_text(evidence.observe_stamp)}",
+                    f"observation_method={safe_repr(evidence.observation_method)}",
+                    f"capability={safe_repr(evidence.capability)}",
+                    "observed_at="
+                    + ":".join(
+                        (
+                            safe_text(evidence.observed_at_run),
+                            safe_text(evidence.observed_at_task),
+                            safe_text(evidence.observed_at_terminal),
+                            safe_text(evidence.observed_at_role),
+                            safe_text(evidence.observed_at_phase),
+                            safe_text(evidence.observed_at_attempt),
+                        )
+                    ),
+                )
+            )
+        else:
+            parts.append("evidence=none")
+        if detail:
+            parts.append(detail)
+        return OrcaRuntimeError("; ".join(parts))
+
+    #: The terminal-row cells the barrier (and `_rebind_model_evidence()`) write, so a
+    #: rollback restores a row to exactly the shape it had before this attempt touched it.
+    _MODEL_ROW_CELLS = (
+        "resolved_model",
+        "model_state",
+        "model_request_method",
+        "model_request_evidence",
+        "model_observed_at_dispatch",
+    )
+
+    #: The value each of those cells carries on a row that has NO model evidence -- the
+    #: exact shape `register_terminal()` creates. Not a `pop`, deliberately: reuse
+    #: condition 9 and the durable provenance row read these keys by name, so removing
+    #: them would turn "this session has no verified model" into a KeyError. Written by
+    #: the two paths that have to un-advertise evidence: a rollback whose snapshot
+    #: predates the row's existence (review N1) and `_stale_model_evidence()` (review B1).
+    _MODEL_ROW_CLEARED = {
+        "resolved_model": "",
+        "model_state": MODEL_EVIDENCE_NONE,
+        "model_request_method": "",
+        "model_request_evidence": "",
+        "model_observed_at_dispatch": "",
+    }
+
+    def _model_evidence_snapshot(
+        self, *, terminal: str, role: str, phase: str
+    ) -> dict[str, Any]:
+        """Everything an accepted barrier would OVERWRITE for this attempt, as it is now.
+
+        OS-49 BUGFIX (review N1). Model verification is recorded at the barrier, which is
+        `start_worker()`'s FIRST statement, and the rest of that method can still refuse
+        or fail -- the own-handle refusal, the TUI-idle wait, a `worker-start` that never
+        reaches a ready worker, the OS-41 acknowledgement gate, a failing `dispatch`. The
+        accepted record outlived all of those, and because it is exactly what grants pair
+        admission and what reuse condition 9 reads, a delivery that never happened could
+        authorize a later one as if it had.
+
+        A snapshot/restore rather than a delete, deliberately: a rollback must leave the
+        state EXACTLY as it was immediately before this attempt's barrier ran. Deleting
+        would also discard a record an earlier, separate and successful
+        `verify_model_identity()` pre-pass legitimately earned, which would refuse a
+        retry that should be allowed. Restoring makes the lifetime of this attempt's
+        evidence the lifetime of this attempt's delivery, and nothing wider.
+        """
+        identity_key = (phase, self._routing_key(role, phase)[1])
+        row = self._terminals.get(terminal)
+        return {
+            "identity_key": identity_key,
+            "identity": self._model_identity.get(identity_key, _ABSENT),
+            "pending": self._model_pending_evidence.get(terminal, _ABSENT),
+            "session": self._model_session_identity.get(terminal, _ABSENT),
+            "terminal": terminal,
+            "row_cells": (
+                None if row is None
+                else {cell: row.get(cell, _ABSENT) for cell in self._MODEL_ROW_CELLS}
+            ),
+        }
+
+    def _restore_model_evidence(self, snapshot: dict[str, Any] | None) -> None:
+        """Undo every write an accepted barrier made for one attempt. Total, and silent.
+
+        Called from the failure path of `start_worker()` only, where an exception is
+        already on its way out: this must never replace that exception with one of its
+        own, so every lookup is absence-tolerant.
+        """
+        if not snapshot:
+            return
+        for mapping, key, value in (
+            (self._model_identity, snapshot["identity_key"], snapshot["identity"]),
+            (self._model_pending_evidence, snapshot["terminal"], snapshot["pending"]),
+            (self._model_session_identity, snapshot["terminal"], snapshot["session"]),
+        ):
+            if value is _ABSENT:
+                mapping.pop(key, None)
+            else:
+                mapping[key] = value
+        cells = snapshot["row_cells"]
+        row = self._terminals.get(snapshot["terminal"])
+        if row is None:
+            return
+        if cells is None:
+            # OS-49 BUGFIX (review N1, second round). `row_cells is None` does not mean
+            # "nothing to undo", it means the row DID NOT EXIST when the snapshot was
+            # taken -- and `start_worker()`'s `_attach_terminal()` creates one for an
+            # unseen handle, then `_rebind_model_evidence()` writes this attempt's
+            # accepted evidence onto it, all of it AFTER the barrier and all of it inside
+            # the delivery this rollback is undoing. Returning early left that brand-new
+            # row advertising resolved_model/model_state/model_observed_at_dispatch for a
+            # delivery that never completed, which is the contradictory state reuse
+            # condition 9 and the provenance row would read as earned.
+            #
+            # The cells are CLEARED to their creation-time shape rather than the row
+            # being deleted: the rollback did not create the row (`_attach_terminal()`
+            # did, as an adoption, and the adoption itself is a real observation of a
+            # handle this Coordinator now owns), so removing it would discard axis (c2)
+            # role/origin evidence that exists nowhere else. Only the MODEL cells belong
+            # to this attempt, so only they are undone.
+            row.update(self._MODEL_ROW_CLEARED)
+            return
+        for cell, value in cells.items():
+            if value is _ABSENT:
+                row.pop(cell, None)
+            else:
+                row[cell] = value
+
+    def _counterpart_model_identity(
+        self, *, phase: str, routing_role: str
+    ) -> tuple[str | None, Any]:
+        """The counterpart role of `(phase, routing_role)` and its RUN-SCOPED record.
+
+        One derivation, read by both halves of pair admission -- the PRE-selection
+        session check and the POST-selection effective-identity comparison (review B1).
+        They used to be one block, and splitting them without extracting this would have
+        left two copies of the run-scope filter free to disagree about which records
+        count.
+
+        The run scope is review F-002's and is unchanged: model evidence is RUN-scoped,
+        and a record observed in another run says nothing about whether THIS run has a
+        counterpart session at all. Returning `None` for it is the fail-closed reading --
+        a same-command delivery is then refused as `MODEL_SELECTION_PAIR_UNADMITTED`.
+
+        `(None, None)` means this role has no counterpart in the rule at all (the Final
+        Reviewer), which is deliberately outside it.
+        """
+        counterpart_role = {"worker": "reviewer", "reviewer": "worker"}.get(routing_role)
+        if counterpart_role is None:
+            return None, None
+        counterpart = self._model_identity.get((phase, counterpart_role))
+        if counterpart is not None and counterpart.observed_at_run != (self.run_id or ""):
+            counterpart = None
+        return counterpart_role, counterpart
+
+    def _stale_model_evidence(self, terminal: str) -> None:
+        """Invalidate every model record that CLAIMS TO DESCRIBE this physical session.
+
+        OS-49 BUGFIX (review B1). The one thing a refusal after `select_and_verify()` has
+        run cannot do is pretend the session is untouched. Selection is the act that
+        switches the session, so by the time any post-selection leg refuses, the physical
+        model of `terminal` is whatever the driver left it on -- which is, at best,
+        unknown to this harness and, at worst, exactly the model the refusal was about.
+        Every record that was earned against the model this session USED to be on has
+        therefore stopped describing it.
+
+        Restoring such a record would be the defect: B1's reproduction is precisely a
+        Reviewer record for `terminal` surviving a refused Worker attempt on `terminal`
+        and then granting pair admission to a LATER delivery on a different session,
+        while both physical sessions sat on one model. So this stales rather than
+        restores, and it is keyed on the TERMINAL rather than on `(phase, role)`: a
+        record for ANY phase or role that names this session as the place it was observed
+        is equally no longer a description of it.
+
+        What it does NOT touch, and must not: records observed at OTHER terminals. Those
+        sessions were not asked to select anything by this attempt, so their evidence
+        still describes them. Nor `requested_model` on the row -- that is the routing's
+        DECLARATION, not evidence, and it did not become false.
+
+        Recovery is a positive re-verification, not a restore: the caller runs
+        `verify_model_identity()` against the session again, the driver selects and
+        observes again, and the record that results describes the session as it ACTUALLY
+        is. Until then a same-command counterpart delivery is refused as
+        `MODEL_SELECTION_PAIR_UNADMITTED`, which is the existing vocabulary member for
+        "the counterpart has no positively verified model evidence" -- which, after
+        staling, is the literal truth. No new refusal reason is needed or added.
+
+        OS-49 BUGFIX (review B2). What it also does NOT touch, and must not:
+        `_model_role_history` / `_model_session_history`. Revoking AUTHORITY is this
+        method's whole job; erasing HISTORY was its defect. The three maps below answer
+        "may this evidence admit a pair or authorize a reuse?", and after a selection that
+        failed validation the honest answer is no. The two history maps answer "what did
+        this slot, and this physical session, ever positively resolve to in this run?", and
+        a failed validation does not make an earlier positive observation un-happen. Deleting
+        them turned the FIRST drift refusal into a laundering step for the second attempt:
+        accept model-A, refuse model-B, retry model-B and be accepted because the only
+        record that knew about model-A had just been deleted by the refusal. Drift legs (i)
+        and (k) therefore read history, which this method leaves alone, and a drifting
+        session's remedy is a new session rather than a retry on a cleared slate.
+
+        OS-49 BUGFIX (review 5970292670, N-3). What "a new session" does and does not buy,
+        qualified -- the superseded sentence stopped at "a new session" and read as though
+        any fresh session recovers a drifted role. It does not. A fresh session clears leg
+        (k) only, which is keyed on the physical TERMINAL and which no history names for a
+        terminal that has never been verified. Leg (i) is keyed on the (phase, ROUTING
+        ROLE) and reads `_model_role_history`, which a new session does not touch, so
+        WITHIN THIS RUN the fresh session must still resolve to that ROLE'S ESTABLISHED
+        BASELINE. Resolving to a different model for the same role is refused on the new
+        session exactly as it was on the old one. A role resolving to a different model is
+        a NEW RUN's business, which is precisely why both history maps are run-scoped.
+        This is a statement of what the two legs already do; neither check is relaxed.
+        """
+        self._model_session_identity.pop(terminal, None)
+        self._model_pending_evidence.pop(terminal, None)
+        for key in [
+            key
+            for key, evidence in self._model_identity.items()
+            if evidence.observed_at_terminal == terminal
+        ]:
+            del self._model_identity[key]
+        row = self._terminals.get(terminal)
+        if row is not None:
+            row.update(self._MODEL_ROW_CLEARED)
+
+    def _gate_b_model_identity(
+        self, *, task_id: str, terminal: str, role: str, phase: str, attempt: int
+    ) -> dict[str, Any]:
+        """GATE B: the ONE mandatory fail-closed barrier before BOTH delivery acts.
+
+        A one-line reading of the shared core with `require_pair_admission=True`, which
+        is the single difference between a DELIVERY and the public pre-pass: a delivery
+        additionally requires that a same-command counterpart's model is already
+        positively verified, so independence is never assumed on the strength of two
+        declared tokens.
+
+        Returns the pre-barrier snapshot `start_worker()` restores if the delivery it was
+        taken for never completes (review N1). The barrier itself is unchanged: a REFUSAL
+        still records nothing, so the snapshot matters only for the case the refusal
+        vocabulary cannot cover -- an ACCEPTED model on a delivery that then failed.
+        """
+        snapshot = self._model_evidence_snapshot(
+            terminal=terminal, role=role, phase=phase
         )
-        dispatch_id = dispatched["result"]["dispatch"]["id"]
-        prompt = (
-            f"taskId: {task_id}\n"
-            f"dispatchId: {dispatch_id}\n"
-            "Use worker_done exactly once with an explicit outcome.\n"
-            "=== TASK ===\n"
-            f"{spec}"
+        self._verify_model_identity(
+            task_id=task_id,
+            terminal=terminal,
+            role=role,
+            phase=phase,
+            attempt=attempt,
+            require_pair_admission=True,
         )
-        self.call(
-            "terminal", "send", "--terminal", terminal, "--text", prompt, "--enter"
+        return snapshot
+
+    def verify_model_identity(
+        self,
+        task_id: str,
+        terminal: str,
+        *,
+        role: str,
+        phase: str,
+        attempt: int,
+    ) -> None:
+        """The model-selection PRE-PASS: request, positively verify, record, deliver
+        NOTHING.
+
+        Exists because of review F-001. A same-command Worker/Reviewer pair cannot be
+        admitted by the Worker's own barrier -- at that moment the Reviewer session does
+        not exist, nothing has been observed for it, and two distinct declared tokens are
+        not evidence of two agents. So the admission has to happen BEFORE the first
+        delivery of either role, and that requires a step that can verify a role's model
+        without dispatching to it. This is that step.
+
+        The lifecycle for a same-command model-aware pair is therefore:
+
+            create/attach BOTH sessions
+              -> verify_model_identity(worker)     request -> positively verify -> record
+              -> verify_model_identity(reviewer)   request -> positively verify -> record
+                                                   (and compare, on RESOLVED values)
+              -> start_worker(...)                 Gate B re-verifies and delivers
+
+        Runs exactly the same legs (a)-(i) as Gate B, through the same ticket, the same
+        ordinal window and the same closed vocabularies, and records the identity only on
+        acceptance -- so a refused pre-pass leaves no trace a later round could read as
+        earned. The ONLY relaxation is `require_pair_admission=False`: the first role
+        verified necessarily has no counterpart record yet, and requiring one here would
+        make the pre-pass unsatisfiable. It cannot be used to skip the delivery-time
+        requirement, because `start_worker()` applies that requirement itself, on every
+        role and every round, whatever the pre-pass did.
+
+        Idempotent in the sense that matters: a second pre-pass or the later Gate B
+        verification for the same (phase, role) must resolve to the same model or leg (i)
+        refuses with `model_selection_ambiguous`.
+
+        A no-op on a legacy run and on a role with no declared model, exactly as Gate B
+        is -- so a caller may call it unconditionally.
+        """
+        self._verify_model_identity(
+            task_id=task_id,
+            terminal=terminal,
+            role=role,
+            phase=phase,
+            attempt=attempt,
+            require_pair_admission=False,
         )
-        self._attach_terminal(terminal, dispatch_id, "low_level_tracked")
-        return dispatch_id, False
+
+    def _verify_model_identity(
+        self,
+        *,
+        task_id: str,
+        terminal: str,
+        role: str,
+        phase: str,
+        attempt: int,
+        require_pair_admission: bool,
+    ) -> None:
+        """The shared model-selection verification core.
+
+        Gate B reads it at `start_worker()`'s entry, which is the single point strictly
+        before
+        the rung-3 `worker-start --terminal` delivery AND the rung-4
+        `dispatch` + `terminal send` delivery, and which both centralized dispatch
+        initiators (`run_existing_task`, `observe_unexpected_exit`) and all three roles
+        and every round kind necessarily pass. A caller-supplied hook would not be:
+        `terminal_observer` is optional and absent from `observe_unexpected_exit`, which
+        is the exact bypass class that once let that initiator reach `start_worker`
+        without the OS-29 B1 guard.
+
+        Nothing is delivered when this raises: no `worker-start`, no `dispatch` and no
+        `terminal send` has run at the point it does.
+
+        What the harness OWNS here, all of it integer arithmetic and string equality over
+        values this harness itself issued or defined: (a) a request leg exists at all;
+        (b) its `request_method` and `capability` are members of closed sets defined
+        here; (c) its `selection_token` is the token THIS barrier minted; (d) its two
+        ordinals are the two this barrier's counter actually issued, in order, exactly
+        twice; (e) the state is exactly `verified`; (f) `resolved_model` is non-empty and
+        well-formed; (g) `requested_model` echoes back unchanged; (h) freshness against
+        the six-part attempt key; (i) consistency with any earlier record for this
+        `(phase, role)`; (j) the effective-identity rule, re-applied to RESOLVED values,
+        which on a DELIVERY additionally REQUIRES a same-command counterpart to be
+        positively verified already (`require_pair_admission`).
+
+        What it does NOT own, deliberately: whether a resolved value SATISFIES the
+        request. Only something that can observe a provider's resolution can know that
+        (`--model opus` has been measured resolving to `claude-opus-5`), so the DRIVER
+        owns satisfaction and must report `mismatch` rather than silently accepting. The
+        harness implements no alias table and needs no provider knowledge.
+
+        What no seam can prove, stated rather than hidden: a driver that deliberately
+        LIES -- draws both ordinals in order and reports a request it never issued -- is
+        undetectable from inside the harness. What is guaranteed is that the request is a
+        required, separately attested leg, so an implementation cannot satisfy the
+        contract by observation alone; that the attestation is bound to an attempt key
+        and an ordinal window the driver cannot manufacture, so evidence cannot be
+        carried over from a previous attempt, another session or an unrequested default
+        state; and that the only drivers permitted to attest in this release are the
+        deterministic/fake seam, i.e. reviewable test code inside this repository.
+
+        The pre-pass inherits exactly that limit and adds no new one: a caller can run
+        `verify_model_identity()` against a counterpart session it then never uses, and
+        the Worker would deliver. That is the same trust placed in the driver, not a new
+        hole -- the counterpart's own later delivery still verifies, and leg (i) refuses
+        any model that drifted. What the pre-pass removes is the ability to deliver a
+        same-command Worker with NO counterpart evidence at all, which required no
+        misbehaviour from anyone and was the iteration-1 defect.
+        """
+        routing = self.agent_routing
+        if routing is None:
+            return                              # legacy path: byte-identical to today
+        # The fail-closed ARGUMENT check comes FIRST, and is keyed on the RUN being
+        # model-aware rather than on this role's entry. It has to: the entry lookup needs
+        # the phase, so checking the arguments afterwards would let an omitted `phase`
+        # make the lookup MISS and the barrier skip itself -- silently, on a run that
+        # declares models. A future caller that forgets to thread the identity therefore
+        # gets a refused dispatch, which is observable, rather than an unverified
+        # delivery, which is not.
+        if self._routing_is_model_aware(routing) and not (role and phase and attempt):
+            raise self._model_refusal(
+                MODEL_SELECTION_UNVERIFIED,
+                role=role,
+                phase=phase,
+                attempt=attempt,
+                command="",
+                requested_model="",
+                detail="this run's routing declares a model, and the barrier was not "
+                "given the (role, phase, attempt) identity this attempt's model evidence "
+                "must be keyed to",
+            )
+        entry = self._routing_entry_for(role, phase)
+        command = entry.command if entry is not None else ""
+        requested = entry.model if entry is not None else ""
+        if not requested:
+            return                              # state `none`: no model for this role
+        # ---- from here a model IS declared, so nothing below may be skipped ----------
+        # OS-49 BUGFIX (review M3). The SHAPE check, through the one capability
+        # derivation Gate A also reads (`agent_profile.model_selection_capabilities`), so
+        # the declaration gate and this barrier cannot disagree about what counts as a
+        # driver. It used to ask `self.model_driver is None`, which three different broken
+        # drivers all passed: one with no `select_and_verify` at all, one whose
+        # `select_and_verify` is a non-callable attribute, and -- because the call below
+        # had no handler -- one that raises. Each escaped as a raw AttributeError,
+        # TypeError or arbitrary driver exception, i.e. OUTSIDE the closed OS-49 failure
+        # vocabulary, which is precisely what a caller cannot branch on.
+        #
+        # Not merely "cannot observe": with no CALLABLE driver a selection cannot even be
+        # REQUESTED, which is a stronger and differently-named failure.
+        if MODEL_SELECTION_VERIFIED_CAPABILITY not in model_selection_capabilities(
+            self.model_driver
+        ):
+            raise self._model_refusal(
+                MODEL_SELECTION_UNSUPPORTED,
+                role=role,
+                phase=phase,
+                attempt=attempt,
+                command=command,
+                requested_model=requested,
+                detail="no model-selection driver with a callable select_and_verify() is "
+                "wired in, so a selection cannot be requested on this placement "
+                f"(driver={type(self.model_driver).__name__})",
+            )
+        # ---- PRE-SELECTION: the conflicts decidable WITHOUT the driver (review B1) ---
+        # Everything from `_mint_model_selection_ticket()` down is AFTER the physical
+        # session may have been switched, because `select_and_verify()` is the act that
+        # switches it. A check that needs nothing the driver produces therefore has no
+        # business running there: refusing afterwards means the session was mutated for
+        # an attempt that was always going to be rejected, and B1 is exactly what that
+        # window cost -- a Reviewer record for this terminal outliving a Worker attempt
+        # that had already moved the terminal off the model the record names.
+        #
+        # BOTH halves of pair admission are that kind of check, and both are decided
+        # here. (Iteration 1 hoisted only the first and its comment claimed that was "the
+        # only one in this method"; final review R2 showed the claim was false and the
+        # second one is corrected along with it.)
+        #
+        #   1. the SESSION conflict -- `counterpart.observed_at_terminal` vs `terminal`,
+        #      two harness-held strings compared for equality.
+        #   2. the MISSING same-command counterpart -- `counterpart is None`,
+        #      `require_pair_admission`, and the counterpart entry's `required`,
+        #      `resolved` and `command` against this `command`. Every one of them is
+        #      harness state or a parameter of this call; not one is produced by the
+        #      driver.
+        #
+        # The two differ in ONE respect, and deliberately. Check 1 is UNGATED by
+        # `require_pair_admission` (review M5, unchanged): the defect it closes is
+        # reachable through the PRE-PASS alone -- verify reviewer on term_1/model-B, then
+        # verify worker on term_1/model-A -- after which the pair looked admitted to every
+        # later delivery. Ungated by command, too: `Worker session != Reviewer session` is
+        # a categorical Skill invariant, not a same-command special case, and a legitimate
+        # pair always holds two distinct handles, so it can refuse nothing a correct
+        # caller does.
+        #
+        # Check 2 IS gated by `require_pair_admission`, and that gate is load-bearing
+        # rather than incidental. The pre-pass is HOW a caller bootstraps a same-command
+        # pair: the first role it verifies necessarily has no counterpart evidence yet, so
+        # a pre-pass that refused on counterpart absence would make same-command pairs
+        # unroutable -- the condition would be unsatisfiable by construction. It is only a
+        # DELIVERY that may not proceed on an unadmitted pair, which is exactly what
+        # `require_pair_admission` names.
+        #
+        # For both checks the reason, the message and the gating are byte-for-byte what
+        # the post-selection copies raised, so no caller's or test's expectation moves.
+        # What moves is WHEN: no ticket has been minted, no ordinal drawn and no driver
+        # called when either fires, which is the positive, assertable proof that the
+        # mutation window is gone rather than merely narrowed. Both post-selection copies
+        # REMAIN as re-entrancy backstops -- hoisting is an addition, not a move.
+        routing_role = self._routing_key(role, phase)[1]
+        counterpart_role, counterpart = self._counterpart_model_identity(
+            phase=phase, routing_role=routing_role
+        )
+        if counterpart is not None and counterpart.observed_at_terminal == terminal:
+            raise self._model_refusal(
+                REASON_WORKER_REVIEWER_MUST_DIFFER,
+                role=role,
+                phase=phase,
+                attempt=attempt,
+                command=command,
+                requested_model=requested,
+                detail=f"the {counterpart_role} of phase {phase!r} was positively "
+                f"verified on this very session {terminal!r} (resolved "
+                f"{counterpart.resolved_model!r}); one physical session cannot be both "
+                "sides of a pair, so its independence is not established no matter "
+                "which models the two verifications resolved to",
+            )
+        if (
+            counterpart is None
+            and counterpart_role is not None
+            and require_pair_admission
+        ):
+            # Check 2 (final review R2). The same-command scoping is read off the SAME
+            # routing entry the post-selection copy reads, and with the same
+            # required/resolved predicate, so the hoist and the backstop cannot disagree
+            # about which pairs the rule covers.
+            counterpart_entry = self.agent_routing.for_role(phase, counterpart_role)
+            if (
+                counterpart_entry is not None
+                and counterpart_entry.required
+                and counterpart_entry.resolved
+                and counterpart_entry.command == command
+            ):
+                raise self._model_refusal(
+                    MODEL_SELECTION_PAIR_UNADMITTED,
+                    role=role,
+                    phase=phase,
+                    attempt=attempt,
+                    command=command,
+                    requested_model=requested,
+                    detail=f"the {counterpart_role} of phase {phase!r} shares this "
+                    f"command {command!r} and has no positively verified model "
+                    "evidence yet, so Worker/Reviewer independence rests on nothing "
+                    "but two declared tokens -- which can alias onto one model. "
+                    "Verify both effective identities with verify_model_identity() "
+                    "before delivering either",
+                )
+        ticket, issued_at = self._mint_model_selection_ticket(
+            task_id=task_id,
+            terminal=terminal,
+            role=role,
+            phase=phase,
+            attempt=attempt,
+            command=command,
+            requested_model=requested,
+        )
+        expected = (issued_at + 1, issued_at + 2)
+        # OS-49 BUGFIX (review M3). A driver that RAISES is a failed selection, not a
+        # harness defect, so it is normalized into the closed vocabulary here instead of
+        # propagating whatever the driver chose to throw. `model_selection_unverified` is
+        # the right member by the vocabulary's own lifecycle order: a selection was
+        # requested and no resolved model was ever positively observed. The `finally:`
+        # still revokes the ticket first, so a raising driver cannot leave a live stamp
+        # behind for the NEXT attempt's window, and `Exception` deliberately does not
+        # swallow KeyboardInterrupt or SystemExit.
+        #
+        # OS-49 iteration 2 (final review R1). Normalization and EVIDENCE INVALIDATION
+        # are two different concerns, and the defect was that they shared one branch.
+        # `except Exception` is the right NORMALIZATION boundary -- an interrupt or an
+        # interpreter exit is not a failed model selection and must keep propagating as
+        # itself -- but it is the wrong INVALIDATION boundary: a driver that calls
+        # `ticket.stamp()` and then raises `KeyboardInterrupt` has begun selecting, so
+        # the session may already be switched, yet the staling below used to be skipped
+        # along with the normalization and every record naming the session stayed
+        # authoritative. The invariant is about the SIDE EFFECT, not about the exception's
+        # type: once selection may have occurred, no unsuccessful exit may leave the
+        # pre-existing evidence authoritative.
+        #
+        # So the handler is `BaseException`, it stales FIRST, and only then decides
+        # whether this exception is one the closed vocabulary speaks for. Non-`Exception`
+        # control flow is re-raised untouched -- same type, same traceback, not wrapped in
+        # `OrcaRuntimeError` -- so the M3-era interrupt/finality semantics are preserved
+        # exactly. The nested `finally:` keeps the revoke-then-stale ORDER the ordinary
+        # failure path already had, so no existing behaviour moves.
+        driver_failure: Exception | None = None
+        evidence: Any = None
+        try:
+            try:
+                evidence = self.model_driver.select_and_verify(ticket)
+            finally:
+                self._revoke_model_selection_ticket(ticket)
+        except BaseException as exc:                   # noqa: BLE001 - re-raised below
+            # OS-49 BUGFIX (review B1), widened by R1. `select_and_verify()` RAN. A
+            # driver that raised part-way through is the strongest case for staling, not
+            # the weakest: it is the one path on which nobody -- not the driver, not this
+            # harness -- can say whether the session was switched before the exception.
+            # Unknown is not "unchanged", so every record describing this session is
+            # invalidated here too, and recovery is a positive re-verification.
+            self._stale_model_evidence(terminal)
+            if not isinstance(exc, Exception):
+                raise                      # KeyboardInterrupt / SystemExit, as themselves
+            driver_failure = exc
+        drawn_to = self._model_selection_seq
+        if driver_failure is not None:
+            raise self._model_refusal(
+                MODEL_SELECTION_UNVERIFIED,
+                role=role,
+                phase=phase,
+                attempt=attempt,
+                command=command,
+                requested_model=requested,
+                ticket=ticket,
+                expected_window=expected,
+                drawn_to=drawn_to,
+                detail="the model-selection driver raised "
+                f"{safe_exception_text(driver_failure)}",
+            ) from driver_failure
+
+        # ---- POST-SELECTION VALIDATION BOUNDARY (OS-49 BUGFIX, review B3) ------------
+        # ONE try/except around EVERY leg that runs after `select_and_verify()` has
+        # returned, and the invariant it enforces is about the SIDE EFFECT rather than
+        # about any particular leg: selection is the act that switches the physical
+        # session, so once it has executed, NO unsuccessful exit from this method may
+        # leave the current session evidence authoritative. Not "no refusal" -- no EXIT.
+        #
+        # What the previous round got wrong, and why the one-site fix was not enough.
+        # `refuse()` stales, so every leg that goes THROUGH `refuse()` was covered; what
+        # was not covered was a leg that never gets there because reading the evidence
+        # itself raises. `MODEL_TOKEN_PATTERN.fullmatch(evidence.resolved_model)` with a
+        # non-string `resolved_model` raises `TypeError` straight out of this method, past
+        # every `refuse()` call site, and the session kept its authoritative record even
+        # though the driver had already switched it. `ModelEvidence` is a plain frozen
+        # dataclass with no field validation, so a driver may return ANY type in ANY field,
+        # and a `TypeError` is reachable from any leg that does more than compare for
+        # equality.
+        #
+        # So this is deliberately NOT a patch for `resolved_model=123`. Fixing that one
+        # site would leave the next leg, and every leg added below in future, free to raise
+        # its way past invalidation again. The boundary is placed where the SIDE EFFECT is
+        # -- immediately after the driver call -- so a leg cannot be added inside it without
+        # inheriting the invalidation, which is the same structural argument `refuse()`
+        # itself was built on, applied to exceptions instead of refusals.
+        #
+        # `BaseException`, for the reason R1 established for the driver call: a
+        # `KeyboardInterrupt` arriving mid-validation leaves the session just as switched
+        # as a `TypeError` does, and the invariant is about the switch. Control flow that
+        # the closed vocabulary does not speak for is re-raised as ITSELF after staling --
+        # same type, same traceback -- so interrupt and interpreter-exit semantics do not
+        # move.
+        #
+        # The accepted record writes at the very bottom are INSIDE the boundary too. They
+        # are the last thing this method does, so nothing can fail after them today; having
+        # them inside means that if anything ever does, the half-written authority is
+        # invalidated rather than left standing.
+        try:
+            def refuse(reason: str, detail: str = "") -> OrcaRuntimeError:
+                """Build a POST-SELECTION refusal -- and stale this session on the way out.
+
+                OS-49 BUGFIX (review B1). Every `raise refuse(...)` below sits after
+                `select_and_verify()` has returned, so by construction reaching any of them
+                means the physical session may already carry a different model than the
+                records naming it claim. `_stale_model_evidence()` is therefore part of what
+                a post-selection refusal IS, not a thing each site must remember to do: a
+                future leg added below inherits it, and a leg hoisted above `refuse`'s
+                definition -- i.e. above the driver call -- correctly does not get it.
+
+                Pre-selection refusals deliberately do NOT come through here. They use
+                `self._model_refusal` directly, because nothing was requested of the session
+                and its evidence still describes it; staling there would discard a record an
+                earlier successful verification legitimately earned.
+                """
+                self._stale_model_evidence(terminal)
+                return self._model_refusal(
+                    reason,
+                    role=role,
+                    phase=phase,
+                    attempt=attempt,
+                    command=command,
+                    requested_model=requested,
+                    evidence=evidence if isinstance(evidence, ModelEvidence) else None,
+                    ticket=ticket,
+                    expected_window=expected,
+                    drawn_to=drawn_to,
+                    detail=detail,
+                )
+
+            # A wrong TYPE must be REFUSED, never raise a TypeError -- the same rule
+            # reuse_eligible() already applies to a mis-typed ReuseObservation.
+            if not isinstance(evidence, ModelEvidence):
+                raise refuse(
+                    MODEL_SELECTION_UNVERIFIED,
+                    f"the driver returned {type(evidence).__name__}, not ModelEvidence",
+                )
+            # ---- the ATTESTED SNAPSHOT: each field read off the driver EXACTLY ONCE ----
+            # OS-49 BUGFIX (final review F-012). `ModelEvidence` is `frozen`, but `frozen`
+            # only blocks `__setattr__`; it does nothing about a SUBCLASS that overrides
+            # `__getattribute__` or redeclares a field as a property. Admission above is
+            # `isinstance`, so a subclass IS accepted -- and this barrier used to read each
+            # attested field again at every leg that needed it, then store the DRIVER'S OWN
+            # OBJECT into all three authority maps. So a subclass could return the
+            # supported exact `str` for the two reads leg 2's vocabulary check makes, be
+            # accepted, and return an arbitrary object on the next read: the value that was
+            # VALIDATED was not the value that was STORED. That is N-1a again in
+            # time-of-check/time-of-use form -- an arbitrary value reaching logging, reuse
+            # and provenance code as authority, after the dispatch it authorized settled.
+            #
+            # The fix is CANONICALIZATION, not exact-class rejection. Admission stays
+            # `isinstance` deliberately: production constructs the exact class only, and
+            # every `ModelEvidence` subclass in this repository is an adversarial fixture
+            # whose purpose is to reach LATER legs, so rejecting subclasses at the door
+            # would change which leg they exercise rather than fix anything. Instead every
+            # field is read HERE, once, into a local; every leg below validates the LOCAL;
+            # and the accept block at the bottom stores a freshly constructed exact-class
+            # `ModelEvidence` built only from these locals. The driver's OBJECT is never
+            # authority, which closes the mutate-after-acceptance route in the same move as
+            # the subclass route.
+            #
+            # OS-49 BUGFIX (final review F-013). That is the CONTAINER half, and on its own
+            # it is not enough: the superseded wording here claimed no later read could
+            # re-enter driver code, which was false, because the locals this block captures
+            # are still whatever OBJECTS the driver put in the fields. The type gate
+            # immediately below is the VALUE half, and the claim holds only with both: the
+            # fifteen locals are proven exact `str` / `int` before any other leg touches
+            # them, so the canonical record built from them carries no driver code at all.
+            #
+            # These reads are INSIDE the post-selection boundary, so a field whose read
+            # raises an ordinary `Exception` still stales and still normalizes to
+            # `model_selection_unverified`, and `KeyboardInterrupt`, `SystemExit` and
+            # `GeneratorExit` still propagate as themselves. Hoisting moves WHEN such a
+            # read raises, not WHAT the barrier does about it.
+            #
+            # `refuse()` above deliberately keeps rendering the DRIVER'S object: a refusal
+            # diagnostic describes the value being REJECTED, which is by definition the
+            # driver's and not any canonical form of it, nothing it renders becomes
+            # authority, and a hostile renderer there is normalized by this very boundary
+            # (F-001). The read-once obligation is about what becomes AUTHORITY.
+            attested_state = evidence.state
+            attested_requested_model = evidence.requested_model
+            attested_resolved_model = evidence.resolved_model
+            attested_selection_token = evidence.selection_token
+            attested_request_method = evidence.request_method
+            attested_request_stamp = evidence.request_stamp
+            attested_observation_method = evidence.observation_method
+            attested_observe_stamp = evidence.observe_stamp
+            attested_capability = evidence.capability
+            attested_observed_at_run = evidence.observed_at_run
+            attested_observed_at_task = evidence.observed_at_task
+            attested_observed_at_terminal = evidence.observed_at_terminal
+            attested_observed_at_role = evidence.observed_at_role
+            attested_observed_at_phase = evidence.observed_at_phase
+            attested_observed_at_attempt = evidence.observed_at_attempt
+            # ---- the TYPE GATE: no leg touches a value whose TYPE is not proven ---------
+            # OS-49 BUGFIX (final review F-013). F-012 canonicalized the CONTAINER; this
+            # gate canonicalizes the trust in the VALUES it carries, and the two are one
+            # lesson in two parts: a freshly constructed exact-class `ModelEvidence` does
+            # nothing about the fifteen arbitrary objects stored INSIDE it. `ModelEvidence`
+            # is a plain frozen dataclass with no field validation, so a driver may put ANY
+            # object in ANY field -- and before this gate exactly ONE attested value was
+            # exact-type-checked (`observation_method`, N-1a). The other fourteen were
+            # validated only by operations the value itself defines: truthiness,
+            # `==`/`!=`, tuple equality and `in`. A driver-owned object that answers those
+            # cooperatively passed every leg and was then copied BY REFERENCE into the
+            # canonical record, so all three authority maps held executable driver code --
+            # which the review demonstrated by having `_rebind_model_evidence()` re-enter a
+            # `selection_token`'s `__format__` through `request_evidence` and raise, leaving
+            # a half-written terminal row after the dispatch had settled.
+            #
+            # `type(x) is str` / `type(x) is int`, not `isinstance`: a SUBCLASS may override
+            # `__eq__`, `__ne__`, `__bool__`, `__hash__`, `__format__`, `__str__` or
+            # `__repr__`, which is every operation a later reader performs, so an
+            # `isinstance` gate would still hand those readers an object that can lie or
+            # raise. `type(x) is int` rejects `bool`, which is INTENDED and is the same rule
+            # DESIGN M-14 already applies to `attempt`: `True == 1`, so a bool ordinal
+            # silently aliases a real one.
+            #
+            # Nothing here COERCES. `str(x)` or `safe_text(x)` would turn an arbitrary
+            # object into an apparently valid attestation, which is precisely the acceptance
+            # this gate exists to refuse -- the rule N-1a stated for one field, now applied
+            # to all fifteen.
+            #
+            # HOISTED to run IMMEDIATELY after the single read of each field and BEFORE any
+            # other leg, because placing the checks "where each field is used" would leave
+            # the ORDERING hole the review's probe did not even need: the request-presence
+            # leg below performs a TRUTHINESS test on `selection_token`, and the state leg
+            # performs a MEMBERSHIP test, so a hostile `__bool__` or `__eq__` fired before
+            # any type check could run. Between the snapshot above and this gate the values
+            # are not touched at all -- building the tuple below binds references and
+            # `type(...) is ...` reads the type object, neither of which enters driver code.
+            #
+            # Fields in DECLARATION order, so the field reported is deterministic. The
+            # reason code is per-field because two of them are already locked by tests:
+            # `observation_method` is `model_selection_unsupported` (N-1a: leg 2 names a
+            # LOCATOR, and a locator that is not a name is unsupported) and `resolved_model`
+            # is `model_selection_unverified` (the B3 malformed-type contract). The
+            # remaining thirteen take `model_selection_unverified`: an attested field that
+            # is not a primitive is not evidence of anything, verified least of all.
+            #
+            # The diagnostic renders only `safe_type_name(...)` of the offending value, and
+            # `refuse()` -> `_model_refusal()` renders the REJECTED driver object through
+            # `safe_repr` / `safe_text` (N-1). That is deliberate and is not a hole: a
+            # refusal diagnostic describes the value being REJECTED, nothing it renders
+            # becomes authority, and a hostile renderer there is normalized by this very
+            # boundary (F-001).
+            #
+            # Reached post-selection, so every failure goes through `refuse()`: current
+            # authority for this session is staled, and `_model_role_history` /
+            # `_model_session_history` are left standing, exactly as review B2 established.
+            for attested_name, attested_value, attested_type, attested_note in (
+                ("state", attested_state, str, ATTESTED_PRIMITIVE_NOTE),
+                ("requested_model", attested_requested_model, str,
+                 ATTESTED_PRIMITIVE_NOTE),
+                ("resolved_model", attested_resolved_model, str,
+                 ATTESTED_PRIMITIVE_NOTE),
+                ("selection_token", attested_selection_token, str,
+                 ATTESTED_PRIMITIVE_NOTE),
+                ("request_method", attested_request_method, str,
+                 ATTESTED_PRIMITIVE_NOTE),
+                ("request_stamp", attested_request_stamp, int,
+                 ATTESTED_PRIMITIVE_NOTE),
+                ("observation_method", attested_observation_method, str,
+                 "leg 2 must name the locator that produced the resolved value, and an "
+                 "object is not a name"),
+                ("observe_stamp", attested_observe_stamp, int,
+                 ATTESTED_PRIMITIVE_NOTE),
+                ("capability", attested_capability, str, ATTESTED_PRIMITIVE_NOTE),
+                ("observed_at_run", attested_observed_at_run, str,
+                 ATTESTED_PRIMITIVE_NOTE),
+                ("observed_at_task", attested_observed_at_task, str,
+                 ATTESTED_PRIMITIVE_NOTE),
+                ("observed_at_terminal", attested_observed_at_terminal, str,
+                 ATTESTED_PRIMITIVE_NOTE),
+                ("observed_at_role", attested_observed_at_role, str,
+                 ATTESTED_PRIMITIVE_NOTE),
+                ("observed_at_phase", attested_observed_at_phase, str,
+                 ATTESTED_PRIMITIVE_NOTE),
+                ("observed_at_attempt", attested_observed_at_attempt, int,
+                 ATTESTED_PRIMITIVE_NOTE),
+            ):
+                if type(attested_value) is attested_type:
+                    continue
+                raise refuse(
+                    ATTESTED_FIELD_TYPE_REFUSALS.get(
+                        attested_name, MODEL_SELECTION_UNVERIFIED
+                    ),
+                    f"{attested_name} is {safe_type_name(attested_value)}, not "
+                    f"{attested_type.__name__}; {attested_note}",
+                )
+            if attested_state not in MODEL_EVIDENCE_STATES:
+                raise refuse(
+                    MODEL_SELECTION_UNVERIFIED,
+                    f"state {attested_state!r} is outside the closed vocabulary "
+                    f"{MODEL_EVIDENCE_STATES}",
+                )
+            # ---- leg 1: the REQUEST ------------------------------------------------------
+            if not attested_selection_token or not attested_request_method or (
+                attested_request_stamp == 0
+            ):
+                raise refuse(
+                    MODEL_SELECTION_REQUEST_ABSENT,
+                    "no model selection was attested as REQUESTED for this attempt; "
+                    "reading a pre-existing or default model state is not evidence that "
+                    "anything asked for it",
+                )
+            if attested_request_method not in MODEL_SELECTION_REQUEST_METHODS:
+                raise refuse(
+                    MODEL_SELECTION_UNSUPPORTED,
+                    f"request_method {attested_request_method!r} is outside the closed set "
+                    f"{MODEL_SELECTION_REQUEST_METHODS}",
+                )
+            if attested_capability != MODEL_SELECTION_VERIFIED_CAPABILITY:
+                raise refuse(
+                    MODEL_SELECTION_UNSUPPORTED,
+                    "the evidence does not name the "
+                    f"{MODEL_SELECTION_VERIFIED_CAPABILITY!r} capability",
+                )
+            # ---- leg 2's vocabulary, validated HERE and not merely rendered later -------
+            # OS-49 BUGFIX (review 5970292670, N-1a). `observation_method` is the only
+            # attested field this barrier accepted without looking at it: declared `str`,
+            # never validated, and read at just two sites that RENDER it -- the refusal
+            # diagnostic above and the `agent_identity_bound` row, the second of which runs
+            # from the settled-dispatch logging funnel. So an arbitrary object -- one whose
+            # `__bool__` or `__str__` raises -- passed the barrier, was STORED AS AUTHORITY
+            # by the accept block at the bottom of this method, and detonated later, after
+            # the dispatch it authorized had already settled.
+            #
+            # Validated beside `request_method` and `capability` because it is the same
+            # kind of thing: a closed-vocabulary member naming a mechanism this repository
+            # has actually implemented. Leg 2's attestation is as much a claim about HOW
+            # the value was obtained as leg 1's is, and a claim naming a locator that does
+            # not exist is `model_selection_unsupported` -- the same member, for the same
+            # reason, as an unsupported `request_method`.
+            #
+            # TYPE FIRST, then VALUE -- and OS-49 BUGFIX (final review F-013) MOVED the
+            # type half UPWARDS into the type gate, byte-identical reason code and
+            # byte-identical diagnostic, because this field was the only one of the fifteen
+            # that had such a check and a check sitting at its point of use runs AFTER the
+            # legs above it have already touched other unvalidated values. It is not
+            # duplicated here: a second `type(...) is not str` test at this line would be
+            # unreachable. What remains here is the VALUE half, which is this leg's own
+            # business. `type(...) is str` rather than `isinstance` for the reason the gate
+            # spells out: the membership test below is `==` against each member, and a `str`
+            # SUBCLASS may override `__eq__`.
+            #
+            # Reached post-selection, so it goes through `refuse()`: current authority for
+            # this session is staled, and `_model_role_history` / `_model_session_history`
+            # -- the non-drift record -- are deliberately left standing, exactly as review
+            # B2 established for every other post-selection refusal.
+            if attested_observation_method not in MODEL_SELECTION_OBSERVATION_METHODS:
+                raise refuse(
+                    MODEL_SELECTION_UNSUPPORTED,
+                    f"observation_method {attested_observation_method!r} is outside the "
+                    f"closed set {MODEL_SELECTION_OBSERVATION_METHODS}",
+                )
+            if attested_selection_token != ticket.token:
+                raise refuse(
+                    MODEL_SELECTION_REQUEST_STALE,
+                    "the attested request belongs to another attempt, session or role: its "
+                    "token is not the one this barrier minted",
+                )
+            if attested_observe_stamp == 0:
+                raise refuse(
+                    MODEL_SELECTION_UNVERIFIED,
+                    "a selection was requested and no resolved model was ever observed",
+                )
+            if (
+                attested_request_stamp != expected[0]
+                or attested_observe_stamp != expected[1]
+                or drawn_to != expected[1]
+            ):
+                raise refuse(
+                    MODEL_SELECTION_REQUEST_STALE,
+                    "the two ordinals were not drawn from this ticket exactly twice, in "
+                    "order: the only way to obtain one is to call the ticket's stamp(), and "
+                    "this harness counted how often it was asked",
+                )
+            observed_key = (
+                attested_observed_at_run,
+                attested_observed_at_task,
+                attested_observed_at_terminal,
+                attested_observed_at_role,
+                attested_observed_at_phase,
+                attested_observed_at_attempt,
+            )
+            if observed_key != (
+                self.run_id or "",
+                task_id,
+                terminal,
+                role,
+                phase,
+                attempt,
+            ):
+                raise refuse(
+                    MODEL_SELECTION_REQUEST_STALE,
+                    "the evidence was not observed for this (run, task, terminal, role, "
+                    "phase, attempt) key",
+                )
+            if attested_requested_model != requested:
+                raise refuse(
+                    MODEL_SELECTION_MISMATCH,
+                    "the evidence does not echo back the model this routing requested",
+                )
+            # ---- leg 2: the OBSERVATION's own verdict -------------------------------------
+            if attested_state != MODEL_EVIDENCE_VERIFIED:
+                raise refuse(
+                    {
+                        MODEL_EVIDENCE_MISMATCH: MODEL_SELECTION_MISMATCH,
+                        MODEL_EVIDENCE_UNVERIFIABLE: MODEL_SELECTION_UNSUPPORTED,
+                        MODEL_EVIDENCE_STALE: MODEL_SELECTION_UNVERIFIED,
+                        MODEL_EVIDENCE_REQUESTED: MODEL_SELECTION_UNVERIFIED,
+                        MODEL_EVIDENCE_NONE: MODEL_SELECTION_UNVERIFIED,
+                    }.get(attested_state, MODEL_SELECTION_UNVERIFIED),
+                    f"the driver reported state {attested_state!r}; only "
+                    f"{MODEL_EVIDENCE_VERIFIED!r} admits a delivery",
+                )
+            if not attested_resolved_model or not MODEL_TOKEN_PATTERN.fullmatch(
+                attested_resolved_model
+            ):
+                raise refuse(
+                    MODEL_SELECTION_UNVERIFIED,
+                    f"resolved_model {attested_resolved_model!r} is empty or is not a "
+                    "simple model token, so it is not a model identity",
+                )
+            # OS-49 BUGFIX (review B2). Read off the HISTORY, not off `_model_identity`.
+            # `_model_identity` is revocable authority and `_stale_model_evidence()` drops it,
+            # so reading it here made the drift baseline disappear exactly when a drift had
+            # just been refused -- which is to say, exactly when it was needed. The history is
+            # append-only for the run, so the second attempt at a drifted model is refused for
+            # the same reason the first one was instead of sliding through on a cleared slate.
+            previous_model = self._model_role_history.get((phase, routing_role))
+            if previous_model is not None and previous_model != attested_resolved_model:
+                raise refuse(
+                    MODEL_SELECTION_AMBIGUOUS,
+                    "an earlier accepted attempt for this (phase, role) resolved to "
+                    f"{previous_model!r}; a model that silently changed between "
+                    "rounds does not merely get logged, the dispatch does not happen",
+                )
+            # ---- (j) the effective-identity rule, on RESOLVED values ----------------------
+            # The half the declaration-time gate structurally cannot see: two DISTINCT
+            # declared tokens can resolve to one model, and only a resolved-value comparison
+            # refuses that.
+            #
+            # OS-49 iteration 2 (review F-001). This check used to run only when a
+            # counterpart record HAPPENED to exist, which made it vacuous on the Worker --
+            # whose dispatch precedes its Reviewer session -- so a same-command pair's Worker
+            # was DELIVERED and only the Reviewer, arriving second, was refused. A Worker that
+            # has already run was admitted without independence ever being positively
+            # established, which is precisely what the ticket forbids. The fix is not to
+            # delete the check but to move the ADMISSION: on a SAME-COMMAND pair the
+            # counterpart's verified evidence must ALREADY EXIST at the first delivery of
+            # EITHER role, and its absence is a refusal with its own name.
+            #
+            # How a caller satisfies it: create/attach BOTH sessions, call the public
+            # `verify_model_identity()` pre-pass for each role -- which runs legs (a)-(i) and
+            # records the identity but DELIVERS NOTHING -- and only then dispatch. A caller
+            # that cannot create both sessions up front cannot route a same-command
+            # model-aware pair at all, which is the fail-closed outcome, not a gap.
+            #
+            # DISTINCT-command pairs are untouched: row 1 of the rule makes them independent
+            # on the commands alone, so no counterpart evidence is required and the
+            # pre-OS-49 lifecycle stands. The Final Reviewer is deliberately outside this
+            # rule and has no counterpart to look up.
+            # RE-READ, not the pre-selection values reused: `select_and_verify()` is
+            # arbitrary driver code that ran in between, and the honest assumption about
+            # arbitrary code is that harness state may have moved under it. The run-scope
+            # filter (review F-002) lives in `_counterpart_model_identity()` so this read and
+            # the pre-selection one cannot disagree about which records count.
+            counterpart_role, counterpart = self._counterpart_model_identity(
+                phase=phase, routing_role=routing_role
+            )
+            if counterpart_role is not None:
+                counterpart_entry = self.agent_routing.for_role(phase, counterpart_role)
+                # Scoped exactly as Gate A's pair check is: to a counterpart that is REQUIRED
+                # and resolved. At LOW risk the Reviewer entry exists but is optional and no
+                # Reviewer is ever dispatched, so there is no pair to admit -- and the
+                # repository's standing rule is that a role nobody dispatches must not fail a
+                # run (the same reason the PATH check is scoped to required roles). An
+                # unresolved required role is validate_required_roles()' business.
+                same_command = (
+                    counterpart_entry is not None
+                    and counterpart_entry.required
+                    and counterpart_entry.resolved
+                    and counterpart_entry.command == command
+                )
+                if counterpart is None:
+                    # OS-49 iteration 2 (final review R2), retained as the POST-selection
+                    # backstop after the identical condition was hoisted above the driver
+                    # call. The pre-selection copy is the one that fires for every ordinary
+                    # caller, and it is the one that matters, because it fires before the
+                    # session can be switched.
+                    #
+                    # This copy is not dead code, for the same reason the session check's
+                    # backstop is not: `select_and_verify()` is arbitrary driver code running
+                    # between the two reads, and a driver that re-enters this method -- or
+                    # otherwise writes `_model_identity` -- can DELETE or run-scope-invalidate
+                    # a counterpart record that existed at the pre-check, which the
+                    # pre-selection read could not have anticipated. It is also what stops a
+                    # future reordering from silently reopening the window: delete the hoist
+                    # and this still refuses, just later and with the session already mutated.
+                    if require_pair_admission and same_command:
+                        raise refuse(
+                            MODEL_SELECTION_PAIR_UNADMITTED,
+                            f"the {counterpart_role} of phase {phase!r} shares this "
+                            f"command {command!r} and has no positively verified model "
+                            "evidence yet, so Worker/Reviewer independence rests on nothing "
+                            "but two declared tokens -- which can alias onto one model. "
+                            "Verify both effective identities with verify_model_identity() "
+                            "before delivering either",
+                        )
+                elif counterpart.observed_at_terminal == terminal:
+                    # OS-49 BUGFIX (review M5), retained as the POST-selection backstop after
+                    # review B1 hoisted the same comparison above the driver call. The
+                    # pre-selection copy is the one that fires for every ordinary caller, and
+                    # it is the one that matters, because it fires before the session can be
+                    # switched.
+                    #
+                    # This copy is not dead code and is not redundant. `select_and_verify()`
+                    # is arbitrary driver code executing between the two reads, and a driver
+                    # that re-enters `verify_model_identity()` -- or otherwise writes
+                    # `_model_identity` -- can create a counterpart record naming THIS
+                    # terminal in that window, which the pre-selection read could not have
+                    # seen. It is also the guard that stops a future reordering of this method
+                    # from silently reopening B1: delete the hoist and this still refuses,
+                    # just later and with the session already mutated.
+                    #
+                    # Reached post-selection, it therefore goes through `refuse()` and STALES
+                    # the session, which is correct for exactly the reason the hoist exists:
+                    # here the switch really did happen.
+                    raise refuse(
+                        REASON_WORKER_REVIEWER_MUST_DIFFER,
+                        f"the {counterpart_role} of phase {phase!r} was positively verified "
+                        f"on this very session {terminal!r} (resolved "
+                        f"{counterpart.resolved_model!r}); one physical session cannot be "
+                        "both sides of a pair, so its independence is not established no "
+                        "matter which models the two verifications resolved to",
+                    )
+                elif counterpart_entry is not None:
+                    independent, reason = effective_identity_independent(
+                        (command, attested_resolved_model, MODEL_EVIDENCE_VERIFIED),
+                        (
+                            counterpart_entry.command,
+                            counterpart.resolved_model,
+                            MODEL_EVIDENCE_VERIFIED,
+                        ),
+                    )
+                    if not independent:
+                        raise refuse(
+                            reason or REASON_WORKER_REVIEWER_MUST_DIFFER,
+                            f"the {counterpart_role} of phase {phase!r} already resolved to "
+                            f"command {counterpart_entry.command!r} model "
+                            f"{counterpart.resolved_model!r}; two distinct declared tokens "
+                            "that resolve to one model are not two agents",
+                        )
+            # ---- (k) the SESSION's own identity history (OS-49 BUGFIX, review M2/M5) ------
+            # Leg (i) above compares against the last record for this (phase, ROLE); this leg
+            # compares against the last record for this physical TERMINAL. They are different
+            # keys answering different questions, and the gap between them was M2: one session
+            # reused from IMPLEMENTATION into TEST has a DIFFERENT (phase, role) key, so leg
+            # (i) missed entirely and the only comparison left was the requested ALIAS -- which
+            # is a declaration, and two attempts declaring alias-X prove nothing about whether
+            # the provider resolved it to model-A both times.
+            #
+            # Ordered AFTER the counterpart block deliberately: when one terminal has been
+            # verified for both roles, the fact that matters is the PAIR violation above, which
+            # has its own name and its own invariant. Reaching here means the session is being
+            # re-verified for the SAME routing role, where a changed resolved model is exactly
+            # `model_selection_ambiguous` -- the same name leg (i) uses for the same fact.
+            #
+            # OS-49 BUGFIX (review B2). Read off `_model_session_history`, not off
+            # `_model_session_identity`. This is THE B2 site: `_stale_model_evidence()` popped
+            # the authoritative session record, which was the only drift baseline this leg had,
+            # so the sequence `alias-X -> model-A accepted`, `alias-X -> model-B refused`,
+            # `alias-X -> model-B retried` found nothing to compare against on the third
+            # attempt and admitted the very drift the second attempt was refused for. The
+            # history survives staling, so the retry is refused too.
+            #
+            # This is not a permanent stall. A retry that resolves BACK to the session's
+            # baseline still matches history and is still accepted -- that is RECOVERY, and it
+            # is what re-establishes authority. What is refused is the other case: a session
+            # whose resolved model CHANGED is, by OS-49's own stated principle, not the agent
+            # that was verified, so it cannot be re-badged. Its replacement is a new session,
+            # which every caller can create and which costs a `terminal create`.
+            #
+            # OS-49 BUGFIX (review 5970292670, N-3). The replacement session is NOT a way to
+            # change the role's model, and the superseded wording did not say so. A new
+            # terminal is unknown to THIS leg's `_model_session_history` and so clears THIS
+            # leg; it is not known to leg (i) either way, because leg (i) is keyed on
+            # (phase, routing role) and that key is unchanged by moving sessions. So inside
+            # one run the replacement must still resolve to the ROLE's established baseline,
+            # and a replacement that resolves to anything else is refused by leg (i) with the
+            # same `model_selection_ambiguous` name. Changing a role's resolved model is a
+            # new RUN, not a new session.
+            session_previous = self._model_session_history.get(terminal)
+            if session_previous is not None:
+                previous_role, previous_phase, previous_model = session_previous
+                if previous_model != attested_resolved_model:
+                    raise refuse(
+                        MODEL_SELECTION_AMBIGUOUS,
+                        f"session {terminal!r} was already positively verified as "
+                        f"{previous_role!r} of phase {previous_phase!r} resolving to "
+                        f"{previous_model!r}; a session whose resolved "
+                        "model changed between attempts is not the agent that was verified, "
+                        "and an equal requested alias is a declaration rather than evidence "
+                        "that the provider resolved it the same way twice",
+                    )
+            # Accepted. Recorded ONLY here, so no refused attempt can leave a trace that a
+            # later round or a provenance row would read as earned.
+            # OS-49 BUGFIX (final review F-012). The authority is the CANONICAL record,
+            # built only from the locals the legs above validated -- never the driver's
+            # object. Exact-class and frozen, and -- OS-49 BUGFIX (final review F-013) --
+            # carrying only values the type gate proved to be exact `str` / `int`, so every
+            # later reader (the `agent_identity_bound` row, reuse condition 9, the
+            # provenance rows, `_rebind_model_evidence()`'s `request_evidence`, the refusal
+            # diagnostics of a LATER attempt) reads the validated values back and cannot
+            # re-enter driver code. BOTH halves are load-bearing for that last sentence: an
+            # exact-class wrapper around fifteen driver-owned objects was F-013, and
+            # exact-typed values inside the driver's own object would still be a
+            # time-of-check/time-of-use split. Constructed here rather than at the top
+            # because it must carry what was VALIDATED, and that is only known once every
+            # leg has passed.
+            canonical = ModelEvidence(
+                state=attested_state,
+                requested_model=attested_requested_model,
+                resolved_model=attested_resolved_model,
+                selection_token=attested_selection_token,
+                request_method=attested_request_method,
+                request_stamp=attested_request_stamp,
+                observation_method=attested_observation_method,
+                observe_stamp=attested_observe_stamp,
+                capability=attested_capability,
+                observed_at_run=attested_observed_at_run,
+                observed_at_task=attested_observed_at_task,
+                observed_at_terminal=attested_observed_at_terminal,
+                observed_at_role=attested_observed_at_role,
+                observed_at_phase=attested_observed_at_phase,
+                observed_at_attempt=attested_observed_at_attempt,
+            )
+            self._model_identity[(phase, routing_role)] = canonical
+            self._model_pending_evidence[terminal] = canonical
+            self._model_session_identity[terminal] = (routing_role, phase, canonical)
+            # OS-49 BUGFIX (review B2). The HISTORY half of the same acceptance, written in the
+            # same statement group so authority can never exist without the history that
+            # explains it. Deliberately NOT rolled back by `_restore_model_evidence()`: that
+            # rollback exists because an accepted barrier must not authorize a delivery that
+            # never completed, and it is about AUTHORITY. The selection itself did happen, so
+            # the session really is on this model and the history row is true whether or not
+            # the delivery that followed it survived.
+            self._model_role_history[(phase, routing_role)] = attested_resolved_model
+            self._model_session_history[terminal] = (
+                routing_role, phase, attested_resolved_model
+            )
+            row = self._terminals.get(terminal)
+            if row is not None:
+                row["resolved_model"] = attested_resolved_model
+                row["model_state"] = attested_state
+        except BaseException as exc:                   # noqa: BLE001 - re-raised below
+            # The invariant, in two statements. Stale FIRST -- unconditionally, before
+            # anything is decided about what kind of failure this is -- then decide how the
+            # failure should travel.
+            self._stale_model_evidence(terminal)
+            if isinstance(exc, OrcaRuntimeError) or not isinstance(exc, Exception):
+                # A refusal this method built (every `raise refuse(...)` above, which has
+                # already staled -- `_stale_model_evidence()` is idempotent), or control
+                # flow the vocabulary does not speak for. Both propagate untouched, so no
+                # existing refusal reason, message or exception type moves.
+                raise
+            # Anything else is MALFORMED EVIDENCE: the driver returned a shape this
+            # harness's own validation could not evaluate. That is a failed selection, not
+            # a harness defect, so it is normalized into the closed vocabulary for exactly
+            # the reason M3 normalized a raising driver -- a caller cannot branch on a
+            # `TypeError`. `model_selection_unverified` is the right member: a selection was
+            # requested and no resolved model was ever positively verified.
+            #
+            # `evidence` is deliberately NOT passed to the refusal. Rendering it reads every
+            # field, which is the operation that just raised, and a diagnostic must not be
+            # able to replace the failure it is diagnosing. The type name and the exception
+            # text carry the diagnosis instead.
+            raise self._model_refusal(
+                MODEL_SELECTION_UNVERIFIED,
+                role=role,
+                phase=phase,
+                attempt=attempt,
+                command=command,
+                requested_model=requested,
+                ticket=ticket,
+                expected_window=expected,
+                drawn_to=drawn_to,
+                detail="post-selection validation of the driver's evidence raised "
+                f"{safe_exception_text(exc)}; the evidence is malformed, so no resolved "
+                "model was positively verified for this attempt",
+            ) from exc
+
+    def start_worker(
+        self,
+        task_id: str,
+        terminal: str,
+        spec: str,
+        *,
+        role: str = "",
+        phase: str = "",
+        attempt: int = 0,
+    ) -> tuple[str, bool]:
+        """OS-49: the three keyword-only identity parameters are what the pre-delivery
+        barrier keys this attempt's model evidence to. They have defaults so all nine
+        existing unpack sites bind unchanged and the return type stays
+        `tuple[str, bool]`, but OMITTING them on a model-aware run is a REFUSAL, not a
+        skip -- see `_gate_b_model_identity`.
+        """
+        # GATE B, the first statement, deliberately ahead of the own-handle refusal and
+        # therefore ahead of wait_for_tui_idle(), the rung-3 delivery and the rung-4
+        # delivery. It does not displace the OS-29 B1 guard (which runs earlier, in both
+        # initiators) and does not move the OS-41 acknowledgement gate (which runs
+        # later, on the receipt).
+        snapshot = self._gate_b_model_identity(
+            task_id=task_id,
+            terminal=terminal,
+            role=role,
+            phase=phase,
+            attempt=attempt,
+        )
+        # OS-49 BUGFIX (review N1). Everything below is the DELIVERY, and an accepted
+        # model identity must not outlive it. The barrier records on acceptance -- which
+        # it must, because the pair-admission and reuse reads happen against that record
+        # -- but every refusal and failure from here on means no task was delivered on
+        # that identity, so the record is rolled back to exactly its pre-barrier state and
+        # the exception continues unchanged. `BaseException`, not `Exception`: a
+        # KeyboardInterrupt between the barrier and the delivery leaves the same false
+        # evidence behind, and the handler re-raises rather than absorbing anything.
+        try:
+            assert self.run_owner
+            if terminal == os.environ.get(SELF_HANDLE_ENV):
+                raise OrcaRuntimeError(
+                    "refusing to register the caller's own terminal as a worker resource"
+                )
+            # Ladder rung 3, in order: the terminal already exists, so idle first, adopt
+            # second. Both steps precede any dispatch, so rung 4 can never run ahead of it.
+            self.wait_for_tui_idle(terminal)
+            started = self.call(
+                "orchestration",
+                "worker-start",
+                "--task",
+                task_id,
+                "--terminal",
+                terminal,
+                "--from",
+                self.run_owner,
+                allow_error=True,
+            )
+            if started.get("ok"):
+                result = started["result"]
+                # OS-41 STEP 3a. The acknowledgement gate, ABOVE the ledger write: a
+                # supervised attachment is recorded only for a start the runtime itself
+                # calls ready. Anything else raises with the whole launch diagnosis
+                # attached, having registered nothing -- a half-started Dispatch must not
+                # become a row that later reads like a live supervised worker.
+                if "state" not in result:
+                    # A success receipt with no `state` at all. Legitimate on exactly one
+                    # HISTORICAL point observation (see
+                    # WORKER_START_STATELESS_RECEIPT_VERSION -- no longer in the current
+                    # executable support set, so this branch is offline-covered only) and
+                    # missing lifecycle evidence everywhere else -- including on a
+                    # 1.4.196 runtime, where `state` is the field that carries the launch
+                    # outcome, and on a harness that never identified its runtime.
+                    # BUGFIX-I1-MAJOR-1: this branch used to be unconditional, which let a
+                    # malformed 1.4.196 receipt be written to the ledger as an adopted
+                    # supervised worker.
+                    if self.orca_app_version != WORKER_START_STATELESS_RECEIPT_VERSION:
+                        raise OrcaRuntimeError(
+                            "worker-start returned a success receipt with no launch "
+                            "state; that shape is accepted only from the point-verified "
+                            f"Orca {WORKER_START_STATELESS_RECEIPT_VERSION} runtime, and "
+                            "this harness has validated "
+                            f"{self.orca_app_version or 'no runtime'}: "
+                            f"dispatchId={result.get('dispatchId')!r} result={result!r}"
+                        )
+                elif str(result.get("state")) != WORKER_START_READY_STATE:
+                    raise OrcaRuntimeError(
+                        "worker-start did not reach a ready worker: "
+                        f"state={str(result.get('state'))!r} "
+                        f"stage={result.get('stage')!r} "
+                        f"failedStage={result.get('failedStage')!r} "
+                        f"lastError={result.get('lastError')!r} "
+                        f"dispatchId={result.get('dispatchId')!r} "
+                        f"residualResources={result.get('residualResources')!r}"
+                    )
+                dispatch_id = result["dispatchId"]
+                self._attach_terminal(terminal, dispatch_id, "supervised_adopted")
+                # W-21. Deliberately NOT widened into the return type: tuple[str, bool] is
+                # unpacked at nine call sites, seven of them existing tests. Consumers read
+                # ledger_terminal(handle)["terminal_effect"] instead.
+                self.record_terminal_effect(
+                    terminal, worker_start_terminal_effect(result)
+                )
+                return dispatch_id, True
+            error = started.get("error", {})
+            # Only agent_unconfigured is a branch signal; every other error is a real
+            # failure (SKILL.md section 6 Custom command handling, rule 1).
+            if error.get("code") != "agent_unconfigured":
+                raise OrcaRuntimeError(f"worker-start failed: {error}")
+            dispatched = self.call(
+                "orchestration",
+                "dispatch",
+                "--task",
+                task_id,
+                "--to",
+                terminal,
+                "--from",
+                self.run_owner,
+            )
+            dispatch_id = dispatched["result"]["dispatch"]["id"]
+            prompt = (
+                f"taskId: {task_id}\n"
+                f"dispatchId: {dispatch_id}\n"
+                "Use worker_done exactly once with an explicit outcome.\n"
+                "=== TASK ===\n"
+                f"{spec}"
+            )
+            self.call(
+                "terminal", "send", "--terminal", terminal, "--text", prompt, "--enter"
+            )
+            self._attach_terminal(terminal, dispatch_id, "low_level_tracked")
+            return dispatch_id, False
+        except BaseException:
+            self._restore_model_evidence(snapshot)
+            raise
 
     def delivery_obligations(self) -> dict[str, str]:
         """Every open delivery obligation this Coordinator holds, by kind.
@@ -2918,7 +5109,7 @@ class OrcaRuntimeHarness:
                     try:
                         payload = json.loads(message["payload"])
                     except (TypeError, ValueError) as error:
-                        payload = {"_unparsable": " ".join(str(error).split())}
+                        payload = {"_unparsable": " ".join(safe_text(error).split())}
                     provenance, mismatch = quiescence.worker_done_provenance(
                         payload,
                         expected_task_id=task_id,
@@ -3070,7 +5261,7 @@ class OrcaRuntimeHarness:
         except OrcaRuntimeError as error:
             # The STEP 0 claim is one-way and stays in place; record why it was
             # refused so the recovery path finds a reason, not a bare stuck row.
-            self._ledger[dispatch_id]["unsettled_reason"] = str(error)
+            self._ledger[dispatch_id]["unsettled_reason"] = safe_text(error)
             raise
 
         # ==== STEP 2. exactly one lifecycle mutation ========================
@@ -3211,14 +5402,50 @@ class OrcaRuntimeHarness:
     # harness already built for its own return value, so no new state is
     # invented for logging's sake. Every write goes through _safe_log so a
     # logging failure -- a full disk, an unwritable path -- is recorded in
-    # self._logging_errors and never raised into the caller, which would
+    # self._logging_errors and not raised into the caller, which would
     # otherwise turn an already-settled Dispatch into an apparent failure.
+    #
+    # OS-49 BUGFIX (review 5970292670, N-4). Stated with its actual width rather than
+    # unconditionally: _safe_log catches `Exception`, so an ordinary logging failure is
+    # recorded and absorbed, while KeyboardInterrupt / SystemExit / GeneratorExit
+    # PROPAGATE through it as themselves. That split is correct and deliberate -- review
+    # F-002 established that an operator's Ctrl-C arriving inside a slow writer is not a
+    # logging failure to be papered over -- and the superseded "never raised into the
+    # caller" phrasing described only its first half. Do not widen this to
+    # `BaseException` to make the old sentence true.
 
     def _safe_log(self, writer: Any, *args: Any, **kwargs: Any) -> None:
+        """Run one non-authoritative logging operation inside the guard.
+
+        `writer` is any callable whose failure may not change a lifecycle decision --
+        a `run_logging` writer, or (OS-49 BUGFIX, review 5970292670 N-1) a method of
+        this class that PREPARES and then writes a row. Wrapping the preparation too is
+        the point of accepting a method here: a row whose construction raises outside
+        the guard is exactly as capable of unwinding a settled Dispatch as a failed
+        write, and the guard that only covered the write did not say so.
+
+        WIDTH, stated rather than implied (OS-49 BUGFIX, review 5970292670 N-4). This
+        catches `Exception`. An ordinary logging failure is recorded and absorbed;
+        KeyboardInterrupt, SystemExit and GeneratorExit PROPAGATE through it as
+        themselves. The superseded section note said only "never raised into the
+        caller", which described the first half. The split is deliberate -- review F-002
+        established that an operator's Ctrl-C arriving inside a slow writer is not a
+        logging failure to be papered over -- so do not widen this to `BaseException` in
+        order to make the old sentence true.
+        """
         try:
             writer(*args, **kwargs)
         except Exception as error:  # noqa: BLE001 -- see the section note above
-            self._logging_errors.append(f"{getattr(writer, '__name__', writer)}: {error}")
+            # OS-49 BUGFIX iteration 2 (review F-001). Both halves of the row are
+            # rendered through the total-for-`Exception` helpers. This guard's promise is
+            # that an ordinary logging failure never reaches the caller, and an eager
+            # `f"...{error}"` could break that promise from inside the guard itself -- the
+            # same escape F-001 found on the model-selection boundary, with the
+            # consequence section 9 forbids by name: an already-settled Dispatch turning
+            # into an apparent failure.
+            self._logging_errors.append(
+                f"{_writer_label(writer)}: {safe_text(error)}"
+            )
 
     def _audit_coordinator(self, event: str, **fields: Any) -> None:
         """One immutable record in this run's append-only Coordinator audit.
@@ -3244,10 +5471,11 @@ class OrcaRuntimeHarness:
                 self.run_id, event, dict(fields), base=self.artifact_dir
             )
         except Exception as error:  # noqa: BLE001 -- recorded and re-raised, never lost
-            self._logging_errors.append(f"append_coordinator_audit_record: {error}")
+            failure = safe_text(error)               # review F-001: total, see safe_text
+            self._logging_errors.append(f"append_coordinator_audit_record: {failure}")
             raise OrcaRuntimeError(
                 f"coordinator audit record {event!r} could not be published for run "
-                f"{self.run_id} ({error}); it is the only source a restarted "
+                f"{self.run_id} ({failure}); it is the only source a restarted "
                 "Coordinator can recover the delivery ledger from, so the run fails "
                 "closed here instead of continuing unrecoverably"
             ) from error
@@ -3383,10 +5611,11 @@ class OrcaRuntimeHarness:
                 self.run_id, base=self.artifact_dir
             )
         except (OSError, run_logging.CoordinatorAuditError, ValueError) as error:
-            self._logging_errors.append(f"replay_delivery_ledger: {error}")
+            failure = safe_text(error)               # review F-001: total, see safe_text
+            self._logging_errors.append(f"replay_delivery_ledger: {failure}")
             raise OrcaRuntimeError(
                 f"the coordinator audit for run {self.run_id} could not be read "
-                f"({error}); it is the only source that distinguishes an "
+                f"({failure}); it is the only source that distinguishes an "
                 "already-processed delivery from a new one, so the Coordinator fails "
                 "closed rather than arm a waiter that could adopt a replay"
             ) from error
@@ -3491,8 +5720,11 @@ class OrcaRuntimeHarness:
         hook payload, so the two are the same value by construction.
 
         Returns the path written, or "" when there was nothing to bind or the record
-        could not be published. Never raises: this is a convenience for a hook that is
-        opt-in, and it may not be able to fail a Run.
+        could not be published. Does not raise on an ordinary `Exception`: this is a
+        convenience for a hook that is opt-in, and it may not be able to fail a Run.
+        Control-flow exceptions (KeyboardInterrupt / SystemExit / GeneratorExit) are not
+        caught and propagate -- the N-4 split, stated here too because this is the same
+        unconditional phrasing in the same module.
         """
         try:
             path = turn_boundary.bind_session_run(
@@ -3505,8 +5737,12 @@ class OrcaRuntimeHarness:
         # says nothing about a beating heart; the liveness lease is refreshed on a
         # cadence INDEPENDENT of any claimed section, which is what makes "the
         # Coordinator's heartbeat expired" a fact rather than a false positive.
-        # Under the same never-raises discipline as the binding: a liveness record may
-        # no more fail a Run than a binding may.
+        # Under the same discipline as the binding, carrying the same N-4 qualification
+        # the docstring above now states: on an ordinary `Exception` a liveness record
+        # may no more fail a Run than a binding may, while KeyboardInterrupt /
+        # SystemExit / GeneratorExit are not caught and propagate. The unconditional
+        # phrasing that stood here (OS-49 BUGFIX iteration 2, review F-001) contradicted
+        # the `except Exception` three lines above it. Wording only; no capture moves.
         self._begin_turn_boundary_liveness()
         return str(path) if path is not None else ""
 
@@ -3518,11 +5754,13 @@ class OrcaRuntimeHarness:
     def _begin_turn_boundary_liveness(self) -> None:
         """Start the OS-43 liveness keeper for `self.run_id`, retiring any predecessor.
 
-        Never raises, for the same reason `_bind_turn_boundary_session` does not: this is
-        an observability producer, and it may not fail a Run. Binding a second Run on one
-        instance retires the first Run's keeper first, so an instance never keeps a lease
-        alive for a Run it has moved on from -- the mirror of `stop()`'s own rule in
-        `lease_keeper`.
+        Does not raise on an ordinary `Exception`, for the same reason
+        `_bind_turn_boundary_session` does not: this is an observability producer, and it
+        may not fail a Run. Control-flow exceptions propagate (review 5970292670, N-4).
+
+        Binding a second Run on one instance retires the first Run's keeper first, so an
+        instance never keeps a lease alive for a Run it has moved on from -- the mirror
+        of `stop()`'s own rule in `lease_keeper`.
         """
         if os.environ.get(self.LIVENESS_ENV, "1").strip().lower() in (
             "0",
@@ -3544,7 +5782,11 @@ class OrcaRuntimeHarness:
             self._liveness_run_id = ""
 
     def _end_turn_boundary_liveness(self) -> None:
-        """Retire the liveness keeper and record the release. Never raises."""
+        """Retire the liveness keeper and record the release.
+
+        Does not raise on an ordinary `Exception`; control-flow exceptions propagate --
+        the same N-4 split as every other guard in this module.
+        """
         keeper = getattr(self, "_liveness_keeper", None)
         run_id = getattr(self, "_liveness_run_id", "")
         self._liveness_keeper = None
@@ -3631,6 +5873,43 @@ class OrcaRuntimeHarness:
         # == "") but still advances the scope's last-known end time.
         if self._timing is not None:
             self._timing.record_scope_activity(ended_at=ended_at, result=gate_result)
+        # OS-49 V8. ONE sibling row per settled dispatch, emitted immediately BEFORE the
+        # settled row, from this same funnel and under the same _safe_log guard -- so
+        # every round kind and both initiators are covered by one piece of code.
+        #
+        # A new EVENT NAME, never a new COLUMN: every reader does
+        # `if len(cells) != len(ORCHESTRATOR_LOG_COLUMNS): continue`, so a new column
+        # would leave historical rows on disk and make all of them invisible. And never an
+        # overload of the settled row's `detail`, which is the OS-17 body_excerpt
+        # diagnostic -- appending to it would redefine an existing event's existing
+        # column.
+        #
+        # OS-49 BUGFIX (review 5970292670, N-1b). The WHOLE operation goes through
+        # `_safe_log`, not just the write inside it. This call used to be direct, and
+        # "under the same _safe_log guard" was true only of the final writer call: the
+        # routing read, the `_routing_is_model_aware()` predicate, `_routing_key()`, the
+        # two `_model_identity` lookups and the `detail` assembly -- which RENDERS driver
+        # -supplied evidence fields -- all ran outside it. By the time `_log_attempt()` is
+        # reached the dispatch has SETTLED, so an exception from any of those unwound
+        # `run_existing_task()` between `settle_attempt()` and its return: it interrupted
+        # normal return of an already-settled result and skipped the three recording steps
+        # below (the settled row, the timing row and, on a Final Review, the audit record).
+        # That is the non-authoritative-logging contract broken from inside the funnel
+        # that states it.
+        #
+        # Deliberately NARROW, and this is the line the review draws explicitly. It wraps
+        # ONE non-authoritative row. `_log_attempt()` itself is NOT blanket-wrapped, and
+        # the two authoritative families keep their fail-closed behaviour exactly:
+        # `_record_decision_from_attempt()` above still raises, and `_audit_coordinator()`
+        # still records AND re-raises, because a Coordinator audit record is the only
+        # thing a restarted Coordinator can recover the delivery ledger from. `_safe_log`
+        # catches `Exception`, so KeyboardInterrupt / SystemExit / GeneratorExit still
+        # propagate and the F-002 interrupt defect is not reintroduced.
+        self._safe_log(
+            self._log_agent_identity_row,
+            phase=phase, attempt=attempt, terminal_created=terminal_created,
+            round_kind=round_kind,
+        )
         self._safe_log(
             run_logging.log_orchestrator_event,
             self.run_id,
@@ -3687,6 +5966,95 @@ class OrcaRuntimeHarness:
         if round_kind == "final_review":
             self._log_final_review_audit(attempt=attempt, event=event)
 
+    def _log_agent_identity_row(
+        self,
+        *,
+        phase: str | None,
+        attempt: "RuntimeAttempt",
+        terminal_created: bool,
+        round_kind: str,
+    ) -> None:
+        """The durable answer to "which effective agent identity produced this result?".
+
+        Emitted ONLY when this run's routing actually carries model identity, mirroring
+        `RunRouting.evidence_rows()`'s own rule that a legacy routing produces nothing at
+        all -- so a legacy run's logs stay byte-identical. Absence is unambiguous because
+        the run-scoped `agent_profile_selected` / `agent_routing_resolved` rows already
+        say up front whether this run's routing carries a model.
+
+        Provenance is NOT the gate. This runs after settlement, and its CALL SITE passes
+        the whole method through `_safe_log`, so an ordinary failure anywhere in it --
+        predicate, routing lookup, row construction or the write -- lands in
+        `self._logging_errors` and does not unwind an already-settled Dispatch. That is
+        only safe because enforcement lives in the two gates: a missing identity row can
+        never be what PERMITTED an unverified delivery.
+
+        OS-49 BUGFIX (review 5970292670, N-1b). The superseded sentence said "This runs
+        after settlement inside `_safe_log`", and for the PREPARATION phase it was simply
+        false: the caller invoked this method directly and only the writer call at the
+        bottom was guarded, so everything above that line -- including `detail`, which
+        renders driver-supplied evidence fields -- ran outside the guard. The fix is at
+        the call site in `_log_attempt()`, which is why this docstring now says where the
+        boundary actually is instead of asserting a property this body cannot provide for
+        itself. The inner `_safe_log` around the writer is KEPT: it is not redundant, it
+        is what makes a failed WRITE record itself under the writer's own name
+        (`log_orchestrator_event: ...`) rather than under this method's.
+        """
+        routing = self.agent_routing
+        if not self._routing_is_model_aware(routing):
+            return
+        phase_name = phase or ""
+        role = attempt.role or ""
+        # OS-49 iteration 2 (review F-001): BOTH halves of the key come from the one
+        # mapping. Re-spelling the entry phase here was a second, narrower copy of the
+        # Final Reviewer rule that recognised only the `final_reviewer` role string, so
+        # this row read a different slot than the barrier wrote.
+        entry_phase, routing_role = self._routing_key(role, phase_name)
+        entry = self._routing_entry_for(role, phase_name)
+        evidence = self._model_identity.get((entry_phase, routing_role))
+        if evidence is None:
+            evidence = self._model_identity.get((phase_name, routing_role))
+        state = evidence.state if evidence is not None else MODEL_EVIDENCE_NONE
+        detail = " ".join(
+            (
+                f"command={entry.command if entry is not None else ''}",
+                f"requested_model={(entry.model if entry is not None else '') or 'none'}",
+                f"resolved_model={(evidence.resolved_model if evidence else '') or 'none'}",
+                f"request_method={(evidence.request_method if evidence else '') or 'none'}",
+                f"selection_token={(evidence.selection_token if evidence else '') or 'none'}",
+                f"request_stamp={evidence.request_stamp if evidence else 0}",
+                f"observe_stamp={evidence.observe_stamp if evidence else 0}",
+                f"observation_method={(evidence.observation_method if evidence else '') or 'none'}",
+                f"selection_capability={(evidence.capability if evidence else '') or 'none'}",
+                "selection_verified="
+                + ("true" if state == MODEL_EVIDENCE_VERIFIED else "false"),
+                f"profile={routing.profile_name or 'none'}",
+                f"profile_source={routing.profile_source or 'none'}",
+                f"schema={getattr(routing, 'schema_version', 0)}",
+            )
+        )
+        self._safe_log(
+            run_logging.log_orchestrator_event,
+            self.run_id,
+            base=self.artifact_dir,
+            event=EVENT_AGENT_IDENTITY_BOUND,
+            phase=phase_name,
+            role=role,
+            iteration=attempt.iteration,
+            task_id=attempt.task_id,
+            dispatch_id=attempt.dispatch_id,
+            terminal=attempt.terminal,
+            action="created" if terminal_created else "reused",
+            reuse=attempt.terminal_effect,
+            risk=self.risk,
+            round_kind=round_kind,
+            # Exactly ONE of the six model-evidence states, so "did this dispatch run on
+            # a positively verified model?" is a COLUMN SCAN rather than a detail parse,
+            # and `verified` can never be inferred from the absence of anything.
+            result=f"model_state={state}",
+            detail=detail,
+        )
+
     def _log_final_review_audit(
         self, *, attempt: "RuntimeAttempt", event: str
     ) -> None:
@@ -3723,6 +6091,37 @@ class OrcaRuntimeHarness:
             if self.agent_routing is not None
             else None
         )
+        # The evidence the barrier ACCEPTED for this Final Review attempt, or None when no
+        # model was declared. Read from the run-scoped map rather than re-observed: a Final
+        # Review that re-derived an identity could silently differ from the one the run was
+        # routed with, which is exactly the drift OS-49 forbids.
+        final_evidence = self._model_identity.get(
+            (FINAL_REVIEW_PHASE, "final_reviewer")
+        )
+        # OS-49 iteration 2 (review F-001). The five model fields are ONE bundle written
+        # from ONE source. They used to come from two: `reviewer_requested_model` from the
+        # routing and the other four from the evidence, so a record could DECLARE a
+        # requested model while carrying no evidence that anything resolved it -- an
+        # internally contradictory record, which is exactly the shape reuse condition 9
+        # refuses to act on.
+        #
+        # The routing-key fix above already makes that shape unreachable rather than
+        # unlikely: the barrier precedes BOTH delivery acts, settlement follows delivery,
+        # and this method only runs on a settled attempt -- so a Final Review record can
+        # only exist after the declared model was positively verified. This is the second
+        # lock, local to the record: the declared value is emitted only together with the
+        # evidence the barrier's leg (g) proved echoed it back. It is still read from the
+        # MATERIALIZED routing and still never re-derived here; it simply cannot appear
+        # alone. With no model declared, or on any attempt whose evidence is absent, all
+        # five fields stay empty/`none` -- and the identity row for the same dispatch
+        # still records the declared token beside `model_state=none`, so nothing the run
+        # observed is lost from its durable evidence.
+        declared_model = entry.model if entry is not None and entry.resolved else ""
+        model_verified = (
+            final_evidence is not None
+            and final_evidence.state == MODEL_EVIDENCE_VERIFIED
+            and final_evidence.requested_model == declared_model
+        )
         self._safe_log(
             run_logging.write_final_review_audit_record,
             self.run_id,
@@ -3739,6 +6138,23 @@ class OrcaRuntimeHarness:
             ),
             reviewer_agent_origin=(
                 entry.origin if entry is not None and entry.resolved else "unknown"
+            ),
+            # OS-49. The Final Reviewer's model identity, read from the MATERIALIZED
+            # routing and the evidence the barrier accepted -- never re-derived here. That
+            # is what makes the Final Adversarial Review preserve the identity the run was
+            # routed with rather than silently observe a different one.
+            reviewer_requested_model=declared_model if model_verified else "",
+            reviewer_resolved_model=(
+                final_evidence.resolved_model if model_verified else ""
+            ),
+            reviewer_model_state=(
+                final_evidence.state if model_verified else MODEL_EVIDENCE_NONE
+            ),
+            reviewer_model_request_method=(
+                final_evidence.request_method if model_verified else ""
+            ),
+            reviewer_model_request_evidence=(
+                final_evidence.request_evidence if model_verified else ""
             ),
             # The runtime's OWN labels, verbatim. Never mapped into an enum, and
             # never compared against a threshold constant.
@@ -4068,7 +6484,9 @@ class OrcaRuntimeHarness:
             # fail-closed direction. A logging failure may not turn a settled
             # dispatch into a failure, and it may not turn a refusal into an
             # admission either.
-            self._logging_errors.append(f"append_decision_ledger_record: {error}")
+            self._logging_errors.append(
+                f"append_decision_ledger_record: {safe_text(error)}"
+            )
         self._last_settled = settled
         # A record was published for this round, so the round is bound and no repair
         # may claim it again.
@@ -4274,7 +6692,7 @@ class OrcaRuntimeHarness:
                 self.human_approval_port.promote(run_id=self.run_id, sources=sources)
         except Exception as exc:  # publication cannot mutate status or dispatch
             keys = sorted(source.source_ledger_key for source in locals().get("sources", ()))
-            error = json.dumps({"exception":type(exc).__name__,"message":str(exc),"ledger_keys":keys},
+            error = json.dumps({"exception":safe_type_name(exc),"message":safe_text(exc),"ledger_keys":keys},
                                sort_keys=True,separators=(",",":"))
             self.clarification_errors.append(error)
             self._safe_log(
@@ -4474,7 +6892,13 @@ class OrcaRuntimeHarness:
         self._open_phase_iteration_boundary(
             phase or "", iteration, opened_at=dispatch_started_at
         )
-        dispatch_id, supervised = self.start_worker(task_id, handle, spec)
+        # OS-49: the barrier's attempt identity. Threaded from the values this dispatch
+        # already has -- never defaulted, never inferred from unrelated state -- because
+        # omitting them on a model-aware run is a refusal, not a skip.
+        dispatch_id, supervised = self.start_worker(
+            task_id, handle, spec,
+            role=role, phase=self._barrier_phase(role, phase), attempt=iteration,
+        )
         done, delivery_id = self.wait_for_done(dispatch_id, task_id)
         attempt = self.settle_attempt(
             role,
@@ -4768,7 +7192,10 @@ class OrcaRuntimeHarness:
         handle = self.create_fake_terminal(
             role, "exit", iteration=iteration, phase=phase
         )
-        dispatch_id, supervised = self.start_worker(task_id, handle, spec)
+        dispatch_id, supervised = self.start_worker(
+            task_id, handle, spec,
+            role=role, phase=self._barrier_phase(role, phase), attempt=iteration,
+        )
         assert self.run_owner
         # Same STEP 0 gate as settle_attempt: this path also issues worker-abandon and
         # worker-release, so no lifecycle mutation may run before the claim.
@@ -4980,6 +7407,27 @@ class OrcaRuntimeHarness:
         self._ledger = {}
         self._deliveries = {}
         self._deliveries_restored_for = ""
+        # OS-49 iteration 2 (review F-002). The model-identity maps are per-run state
+        # exactly like the three collections above: every record in them was accepted
+        # against ONE run's six-part attempt key, and `run_runtime_scenarios()` drives
+        # several start_run/finish cycles on one harness instance. Leaving them behind
+        # let the next run read a previous run's counterpart evidence as its own pair
+        # admission, and let leg (i) compare a new run's model against a record no
+        # session in that run produced.
+        #
+        # OS-49 BUGFIX (review B1). `start_run()` now clears the same state at the run
+        # boundary, which is the reset that actually closes the leak -- a run that never
+        # reaches this method cannot be cleaned up by it. These statements stay because
+        # they are still correct and still useful: a cleanly finished run should not leave
+        # model records live in the interval before the next `start_run()`, where a stray
+        # read would find them. Two resets, neither of them load-bearing alone.
+        self._model_identity = {}
+        self._model_pending_evidence = {}
+        self._model_session_identity = {}
+        # OS-49 BUGFIX (review B2). The identity history is run-scoped exactly like the
+        # three authoritative maps above: "append-only for the life of the RUN".
+        self._model_role_history = {}
+        self._model_session_history = {}
         return result
 
     def _release_terminated_process(self, handle: str) -> bool:
@@ -5338,7 +7786,9 @@ def run_session_reuse_runtime_scenario(artifact_dir: Path) -> RuntimeScenarioRes
     reviewer_previous: RuntimeAttempt | None = None
     decisions: list[dict[str, Any]] = []
 
-    def next_terminal(previous: RuntimeAttempt | None, role: str) -> str | None:
+    def next_terminal(
+        previous: RuntimeAttempt | None, role: str, phase: str = ""
+    ) -> str | None:
         """Ask the production gate which terminal the next attempt runs on.
 
         `role` is the intended role of the attempt about to be dispatched, spelled
@@ -5361,6 +7811,12 @@ def run_session_reuse_runtime_scenario(artifact_dir: Path) -> RuntimeScenarioRes
             previous.terminal,
             role="phase_reviewer" if role.endswith("reviewer") else "phase_worker",
             agent_command=harness.ledger_terminal(previous.terminal)["agent_command"],
+            # OS-49 condition 9. The MODEL the NEXT dispatch requests, read from the
+            # materialized routing for the role and phase that dispatch will run -- never
+            # from the previous dispatch's own record, which is the value condition 9
+            # compares AGAINST. "" on every run that declares no model, which is what
+            # keeps this scenario's recorded answers byte-identical there.
+            requested_model=harness.resolved_agent_model(role, phase),
             dispatch_id=previous.dispatch_id,
         )
         if harness.last_reuse_decision is not None:
@@ -5410,7 +7866,7 @@ def run_session_reuse_runtime_scenario(artifact_dir: Path) -> RuntimeScenarioRes
             phase=phase,
             spec=worker_spec,
             lifecycle="release" if last else "reuse",
-            terminal=next_terminal(worker_previous, "worker"),
+            terminal=next_terminal(worker_previous, "worker", phase),
             # OS-41: a budget for the phases that REMAIN, not for the whole chain.
             # The fake agent exits once it has served this many dispatches, and that
             # exit is the only release receipt the tracked path has. With the whole
@@ -5467,7 +7923,7 @@ def run_session_reuse_runtime_scenario(artifact_dir: Path) -> RuntimeScenarioRes
             spec=reviewer_spec,
             evidence=reviewer_evidence,
             lifecycle="release" if last else "reuse",
-            terminal=next_terminal(reviewer_previous, "reviewer"),
+            terminal=next_terminal(reviewer_previous, "reviewer", phase),
             # OS-41: a budget for the phases that REMAIN, not for the whole chain.
             # The fake agent exits once it has served this many dispatches, and that
             # exit is the only release receipt the tracked path has. With the whole

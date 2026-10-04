@@ -179,7 +179,7 @@ DEFAULT_MAX_ITERATIONS = 5
     "parameter": "profile",
     "project_source": ".orca/agent-profiles.yaml",
     "user_source": "~/.orca/agent-profiles.yaml",
-    "schema_versions": [1],
+    "schema_versions": [1, 2],
     "source_precedence": ["project_local", "user_global"],
     "merge": "whole_definition"
   },
@@ -223,7 +223,9 @@ DEFAULT_MAX_ITERATIONS = 5
     "unsupported_phase_combination": "UNSUPPORTED_PHASE_COMBINATION",
     "invalid_agent_profile": "INVALID_AGENT_PROFILE",
     "unknown_agent_profile": "UNKNOWN_AGENT_PROFILE",
-    "agent_role_unresolved": "AGENT_ROLE_UNRESOLVED"
+    "agent_role_unresolved": "AGENT_ROLE_UNRESOLVED",
+    "invalid_agent_model": "INVALID_AGENT_MODEL",
+    "agent_model_not_supported": "AGENT_MODEL_NOT_SUPPORTED"
   },
   "decision_policy": {
     "schema_version": 1,
@@ -488,8 +490,13 @@ default 처리, `WORKER_REVIEWER_MUST_DIFFER` 검사가 지금과 동일하게 �
 3. requested phase와 Final Review에 대한 routing materialize
 4. required role의 resolved command에만 PATH 검사
 5. required role이 전부 resolve되었는지 검사
-6. 위가 모두 통과한 경우에만 Run 생성
+6. required entry에 effective identity 검사 (GATE A)      -- model capability + pair independence
+7. 위가 모두 통과한 경우에만 Run 생성
 ```
+
+6번은 두 Skill이 **같은 구현을 공유**하는 `validate_effective_identity`다. 이 Skill에는 model을 검증할
+capability가 없으므로 required entry의 선언된 model은 여기서 `AGENT_MODEL_NOT_SUPPORTED`로 막히고,
+model 축이 없는 pair의 판정은 OS-49 이전의 `worker == reviewer` 비교와 byte 단위로 동일하다.
 
 2번의 검사 대상은 **selected profile이 선언한 모든 command**다 — `defaults`, 이 invocation이 요청하지
 않은 phase를 포함한 모든 `phases.<phase>`, `final_review`, 그리고 이 invocation에 실제로 주어진 explicit
@@ -523,11 +530,66 @@ STATUS: BLOCKED
 REASON: AGENT_ROLE_UNRESOLVED
 ```
 
+```text
+STATUS: BLOCKED
+REASON: INVALID_AGENT_MODEL
+```
+
+```text
+STATUS: BLOCKED
+REASON: AGENT_MODEL_NOT_SUPPORTED
+```
+
 `INVALID_AGENT_PROFILE`은 파일이 존재하지만 malformed YAML / 미지원 `version` / unknown 또는 중복 키 /
 unknown phase key / 비어 있거나 문자열이 아닌 command 값 / 읽을 수 없는 경로인 경우다.
 `UNKNOWN_AGENT_PROFILE`은 그 이름의 profile이 두 source 어디에도 없는 경우이며, 값이 없는
 `profile=`도 생략이 아니라 명시적으로 잘못된 값이므로 여기에 해당한다.
 `AGENT_ROLE_UNRESOLVED`는 required role이 precedence 체인을 모두 거쳐도 command를 얻지 못한 경우다.
+
+`INVALID_AGENT_MODEL`은 선언된 model 값이 simple model token이 아닌 경우다(경로 구분자, 공백,
+shell metacharacter, 앞의 `-`, 꺾쇠 placeholder 등). command token과 **별개의 pattern**으로 판정하며,
+model이 command token으로 취급되거나 command 문자열에 합성되는 code path는 존재하지 않는다. 판정 범위는
+selected profile **정의 전체**다 — 이번 invocation이 요청하지 않은 phase의 `model: $(x)`도 trust 문제다.
+`AGENT_MODEL_NOT_SUPPORTED`는 model 값 자체는 well-formed이지만, 이 run에서 그 model을 **선택 요청하고
+해석된 결과를 긍정적으로 관측할 수 있는 capability가 없는** 경우다. 판정 범위는 required entry뿐이며,
+dispatch되지 않는 role의 model 선언이 환경 사실 때문에 run을 막지는 않는다.
+
+### Command identity vs model identity (OS-49)
+
+effective agent identity는 `(command, model)`이다. 하나의 executable이 session마다 model을 선택할 수
+있으므로, command 문자열만으로는 두 agent를 구분하지 못한다. Agent Profile schema `version: 1`은
+**frozen**이다 — role 값은 command 문자열이고 model은 표현할 수 없다. `version: 2`에서 role 값은
+command 문자열 또는 `{command, model}` **block mapping**이며, v2 문서 안의 문자열 role 값은 v1과 정확히
+같은 의미다(command만, model 없음). model은 `defaults.worker`, `defaults.reviewer`,
+`phases.<phase>.worker`, `phases.<phase>.reviewer`, `final_review.reviewer` 다섯 자리에만 쓸 수 있다.
+
+알려지지 않은 schema version, 알려지지 않은 키(role mapping 내부 포함), v1 문서의 mapping role 값,
+`command`가 없는 mapping, 잘못된 타입의 `model`, inline flow mapping, 잘못된 model token은 모두
+Run 생성 이전에 fail-closed로 막힌다.
+
+model을 **선언하지 않으면** 동작은 OS-49 이전과 byte 단위로 동일하다. model을 선언하면 그 model을
+선택 요청하고 해석 결과를 긍정적으로 검증할 수 있는 **명시적으로 지원된 driver/capability**가 있어야만
+routing된다. 이 release에서 실제 runtime 경로에는 그런 capability가 없으므로, model을 선언한 profile은
+`AGENT_MODEL_NOT_SUPPORTED`로 막힌다. 이는 누락이 아니라 설계된 fail-closed 동작이다 — 실제
+model-selection 문법·확인 형식·출력 의미가 이 환경에서 관측되지 않았고, 관측되지 않은 것을 근거로
+삼지 않기 때문이다. 실제 환경 검증과 어느 GLM model이 Worker/Reviewer가 되는지는 OS-14의 범위다.
+
+이 Skill은 Agent Profile **parser를 공유**하므로 `version: 2` model-bearing 문서가 여기서도 동일하게
+parse된다 — syntax error가 아니다. 그러나 이 Skill에는 Dispatch, session reuse chain, lifecycle ledger,
+그리고 task 전달 이전의 model 검증 barrier가 없다. 검증할 수 없는 model을 routing해서는 안 되므로,
+required entry에 선언된 model은 이 Skill에서 `AGENT_MODEL_NOT_SUPPORTED`로 막힌다. 이는 runtime별 분기가
+아니라 두 Skill이 공유하는 동일한 code path이며, 이 Skill 전용 reuse 조건이나 delivery barrier는 추가되지
+않는다.
+
+Worker/Reviewer independence 판정 자체도 두 Skill이 **같은 구현을 공유**한다. independence는 positively
+resolved model로만 성립하며 선언된 model은 증거가 되지 않는다. 이 Skill에서는 model을 선언한 required
+entry가 애초에 `AGENT_MODEL_NOT_SUPPORTED`로 막히므로 model 축이 존재하지 않는 pair만 남고, 그 pair의
+**판정 자체는** `worker == reviewer` 비교와 정확히 같다. 다만 그 판정이 **적용되는 범위**는 넓어졌다 —
+OS-49 이전에 이 비교는 profile을 쓰지 않는 경로에만 있었으므로, 양쪽에 같은 command를 쓴
+`version: 1` profile은 이제 Run 생성 이전에 `WORKER_REVIEWER_MUST_DIFFER`로 거부된다. 이것이 v1
+경로에서 유일하게 additive하지 않은 변화이며, command가 서로 다른 문서는 영향을 받지 않는다. 같은
+command를 쓰는 pair를 첫 delivery 이전에 승인하는 orchestration 쪽 pair-admission 절차는 이 Skill에
+없으며, 필요하지도 않다.
 
 resolved routing은 이 run 동안 immutable하다. profile 파일이 run 중 변경되어도 correction과
 re-review는 profile을 다시 읽지 않고 최초 resolution을 그대로 사용한다.

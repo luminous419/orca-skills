@@ -4510,6 +4510,39 @@ NEUTRALITY_WORKFLOWS = {
 # Agent Profile. Without it family A would carry no Final Review spec at all.
 NEUTRALITY_PROFILES = (("none", None), ("multi", "diverse"))
 
+#: OS-49's ENUMERATED delta to the reviewer-visible Task spec, and the only one.
+#:
+#: The neutrality golden is a capture at `NEUTRALITY_COMMIT`, and it exists to answer one
+#: question mechanically: did OS-22's observability work change a dispatched byte?  OS-49
+#: deliberately adds the MODEL half of each role's effective identity to the AGENT ROUTING
+#: block, so a profile-selected spec legitimately gained exactly three lines.
+#:
+#: Regenerating the golden would answer the OS-22 question with "today equals today", i.e.
+#: retire the claim.  So the comparison below instead REMOVES exactly these three keys from
+#: the CURRENT spec and requires every other byte to match the golden.  The OS-22 claim
+#: survives intact, and OS-49's delta becomes a pinned, enumerated fact: all three keys or
+#: none, nothing else added, nothing else moved.  A fourth key, a renamed key, or any other
+#: edited line still fails, byte-strict, exactly as before.
+#:
+#: `profile=none` specs render no routing block at all and therefore carry NO delta -- they
+#: are still compared byte-for-byte against the golden with nothing removed, which is the
+#: legacy-path compatibility proof.
+OS49_ROUTING_DELTA_KEYS = (
+    "phase_worker_model",
+    "phase_reviewer_model",
+    "final_reviewer_model",
+)
+
+
+def strip_os49_routing_delta(spec: str) -> tuple[str, tuple[str, ...]]:
+    """Split a spec into (everything the golden should still match, the OS-49 lines)."""
+    kept: list[str] = []
+    removed: list[str] = []
+    for line in spec.split("\n"):
+        key = line.split(":", 1)[0]
+        (removed if key in OS49_ROUTING_DELTA_KEYS else kept).append(line)
+    return "\n".join(kept), tuple(removed)
+
 # Enumerated, closed, and each entry justified below. Nothing else is substituted.
 _TASK_SPEC_SUBSTITUTIONS = (
     ("workspace_path", lambda ws: str(ws), "<WORKSPACE>"),
@@ -4802,8 +4835,27 @@ class FinalReviewObservabilityNeutralityTests(unittest.TestCase):
         cls.repo_root = Path(__file__).resolve().parents[1]
 
     def assertSpecBytesEqual(self, current: str, stored: str, label: str) -> None:
-        """The one comparison helper the real assertions and the mutation test share."""
-        self.assertEqual(current.encode("utf-8"), stored.encode("utf-8"), label)
+        """The one comparison helper the real assertions and the mutation test share.
+
+        OS-49: the three enumerated routing-model lines are removed from `current` first,
+        and the removal itself is asserted to be all-or-nothing and exactly those three
+        keys -- see OS49_ROUTING_DELTA_KEYS for why the golden is not regenerated.
+        Everything that survives is still compared as UTF-8 BYTES, with no splitting, no
+        stripping and no reserialization, so the comparison is as strict as it ever was.
+        """
+        reduced, removed = strip_os49_routing_delta(current)
+        self.assertIn(
+            len(removed), (0, len(OS49_ROUTING_DELTA_KEYS)),
+            f"{label}: the OS-49 routing delta must be all three keys or none; got "
+            f"{removed!r}",
+        )
+        if removed:
+            self.assertEqual(
+                [line.split(":", 1)[0] for line in removed],
+                list(OS49_ROUTING_DELTA_KEYS),
+                f"{label}: the OS-49 routing delta keys or their order changed",
+            )
+        self.assertEqual(reduced.encode("utf-8"), stored.encode("utf-8"), label)
 
     def test_the_golden_records_its_own_provenance(self) -> None:
         self.assertEqual(self.golden["captured_from_commit"], NEUTRALITY_COMMIT)

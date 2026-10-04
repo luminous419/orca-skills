@@ -686,6 +686,123 @@ class AgentProfileInvocationTests(unittest.TestCase):
         self.assertIsNotNone(decision.routing)
         self.assertEqual(decision.routing.runtime, "loop")
 
+    # ---- OS-49 loop parity ---------------------------------------------------------
+    # The Agent Profile PARSER is one module serving both runtimes, so a model-bearing
+    # document reaches both. The loop runtime has no Dispatch, no session reuse chain, no
+    # lifecycle ledger and therefore NO pre-delivery verification barrier -- so a model it
+    # could never verify must never be routed there. That is achieved by the SAME code
+    # path, not by a runtime branch: neither door offers a capability, so a required model
+    # declaration is refused at declaration time on BOTH. There is deliberately no
+    # RUNTIME_LOOP / RUNTIME_ORCHESTRATION branch anywhere in OS-49's change set.
+    MODEL_AWARE_DOCUMENT = (
+        "version: 2\n"
+        "profiles:\n"
+        "  split:\n"
+        "    defaults:\n"
+        "      worker:\n        command: claude\n        model: glm-5.2\n"
+        "      reviewer:\n        command: claude\n        model: glm-5.3-flash\n"
+        "    final_review:\n      reviewer: codex\n"
+    )
+
+    def write_model_aware_profile(self) -> None:
+        (self.project / ".orca" / "agent-profiles.yaml").write_text(
+            self.MODEL_AWARE_DOCUMENT, encoding="utf-8"
+        )
+
+    def test_a_model_bearing_profile_parses_identically_on_both_runtimes(self) -> None:
+        """It is not a syntax error on the loop runtime: one parser, one answer."""
+        from scripts.agent_profile import load_agent_profiles_text
+
+        profiles = dict(
+            load_agent_profiles_text(
+                self.MODEL_AWARE_DOCUMENT, path="t.yaml", source="project_local"
+            )
+        )
+        self.assertEqual(profiles["split"].schema_version, 2)
+        self.assertEqual(
+            profiles["split"].default_value_for("worker").model, "glm-5.2"
+        )
+
+    def test_a_declared_model_is_refused_at_declaration_on_both_runtimes(self) -> None:
+        self.write_model_aware_profile()
+        for skill_path in SKILL_PATHS:
+            with self.subTest(skill=skill_path.parent.name):
+                decision = self.evaluate(
+                    skill_path, " profile=split phases=analysis risk=high 요청"
+                )
+                self.assertEqual(decision.status, "BLOCKED")
+                self.assertEqual(decision.reason, "AGENT_MODEL_NOT_SUPPORTED")
+                self.assertFalse(decision.should_execute)
+
+    def test_a_malformed_model_is_refused_on_both_runtimes(self) -> None:
+        (self.project / ".orca" / "agent-profiles.yaml").write_text(
+            "version: 2\n"
+            "profiles:\n"
+            "  bad:\n"
+            "    defaults:\n"
+            "      worker:\n        command: claude\n        model: $(x)\n"
+            "      reviewer: codex\n"
+            "    final_review:\n      reviewer: codex\n",
+            encoding="utf-8",
+        )
+        for skill_path in SKILL_PATHS:
+            with self.subTest(skill=skill_path.parent.name):
+                decision = self.evaluate(
+                    skill_path, " profile=bad phases=analysis risk=high 요청"
+                )
+                self.assertEqual(decision.status, "BLOCKED")
+                self.assertEqual(decision.reason, "INVALID_AGENT_MODEL")
+
+    def test_a_same_command_pair_is_refused_on_both_runtimes(self) -> None:
+        """The one v1 configuration value that does not survive OS-49, refused identically
+        on both runtimes and before any Run exists."""
+        (self.project / ".orca" / "agent-profiles.yaml").write_text(
+            "version: 1\n"
+            "profiles:\n"
+            "  same:\n"
+            "    defaults:\n      worker: claude\n      reviewer: claude\n"
+            "    final_review:\n      reviewer: codex\n",
+            encoding="utf-8",
+        )
+        for skill_path in SKILL_PATHS:
+            with self.subTest(skill=skill_path.parent.name):
+                decision = self.evaluate(
+                    skill_path, " profile=same phases=analysis risk=high 요청"
+                )
+                self.assertEqual(decision.status, "BLOCKED")
+                self.assertEqual(decision.reason, "WORKER_REVIEWER_MUST_DIFFER")
+
+    def test_a_model_less_v2_document_routes_on_both_runtimes(self) -> None:
+        (self.project / ".orca" / "agent-profiles.yaml").write_text(
+            "version: 2\n"
+            "profiles:\n"
+            "  plain:\n"
+            "    defaults:\n      worker: claude\n      reviewer: codex\n"
+            "    final_review:\n      reviewer: codex\n",
+            encoding="utf-8",
+        )
+        for skill_path in SKILL_PATHS:
+            with self.subTest(skill=skill_path.parent.name):
+                decision = self.evaluate(
+                    skill_path, " profile=plain phases=analysis risk=high 요청"
+                )
+                self.assertEqual(decision.status, "VALID", decision.reason)
+                self.assertFalse(decision.routing.is_model_aware)
+                self.assertEqual(decision.routing.schema_version, 2)
+
+    def test_no_runtime_branch_exists_in_the_model_path(self) -> None:
+        """The loop runtime needs no branch, no flag and no runtime test: the refusal is
+        the SAME code path as the orchestration runtime's."""
+        from pathlib import Path as _Path
+
+        source = (
+            _Path(__file__).resolve().parents[1] / "scripts" / "agent_profile.py"
+        ).read_text(encoding="utf-8")
+        start = source.index("def validate_effective_identity")
+        body = source[start:source.index("def _identity_text")]
+        self.assertNotIn("RUNTIME_LOOP", body)
+        self.assertNotIn("RUNTIME_ORCHESTRATION", body)
+
 
 if __name__ == "__main__":
     unittest.main()

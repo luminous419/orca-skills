@@ -102,7 +102,21 @@ STANDALONE_CAPABILITIES = frozenset({
     PTY_SESSION, PROMPT_DELIVERY_VERIFIED, INTERRUPT_LADDER, PROCESS_GROUP_OWNERSHIP,
     SESSION_REDISCOVERY,
 })
-CAPABILITIES = BASE_CAPABILITIES | RECOVERY_CAPABILITIES | STANDALONE_CAPABILITIES | frozenset({
+# ---- OS-49 model-aware agent routing (ADDITIVE ONLY) --------------------------------
+# BOTH legs, or the token is not declarable: a model selection was REQUESTED for this
+# attempt, and the RESOLVED model was THEN observed through a declared locator.  An
+# adapter that can only read a model state it never asked for declares NOTHING here --
+# whatever model a session happens to be on before anything asked it to change is a
+# state, not the result of a selection, and a capability that could be earned by
+# reading one would make the request step optional.
+#
+# Named by exact analogy to `PROMPT_DELIVERY_VERIFIED` above: delivery is PROVEN, not
+# assumed.  `BASE_CAPABILITIES` is deliberately NOT touched, for the reason stated
+# there, and `CAPABILITIES` is only ever read as the allowed superset, so widening it
+# forbids nothing and changes no existing declaration.
+MODEL_SELECTION_VERIFIED = "model_selection_verified"
+MODEL_CAPABILITIES = frozenset({MODEL_SELECTION_VERIFIED})
+CAPABILITIES = BASE_CAPABILITIES | RECOVERY_CAPABILITIES | STANDALONE_CAPABILITIES | MODEL_CAPABILITIES | frozenset({
     "human_approval", "dispatch_provenance", "dependency_edges", "runtime_ownership",
     LIFECYCLE_SETTLEMENT,
 })

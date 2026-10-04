@@ -67,19 +67,27 @@ POLICY_MODULE_DIGESTS = {
 #: -- D4.1's "excluded by line range".  Everything OUTSIDE these ranges is the POLICY
 #: REGION, and it must be byte-identical to `BASELINE_REV`'s.  The ranges are:
 #:   (9, 9)      the added `collections.abc` import
-#:   (88, 105)   the STANDALONE_CAPABILITIES block, ending at the one pre-existing policy
-#:               line this ticket edits -- the `CAPABILITIES` union.  It is inside the
-#:               excluded range precisely BECAUSE it changed; the assertion below pins what
-#:               it changed FROM, so the exclusion cannot be used to hide anything else.
-#:   (110, 218)  the ownership-axis vocabularies and their validator.  It grew at the
+#:   (88, 119)   the STANDALONE_CAPABILITIES block, then OS-49's MODEL_CAPABILITIES block,
+#:               ending at the one pre-existing policy line both tickets edit -- the
+#:               `CAPABILITIES` union.  It is inside the excluded range precisely BECAUSE
+#:               it changed; the assertion below pins what it changed FROM, so the
+#:               exclusion cannot be used to hide anything else.  OS-49 widened the range
+#:               END only: it inserted an additive block and added one more term to that
+#:               same union line, and the three CONTINUATION lines of the union
+#:               ("human_approval"..., LIFECYCLE_SETTLEMENT, "})") are deliberately left
+#:               OUTSIDE the range and therefore still pinned byte-for-byte -- so a model
+#:               capability could not have been smuggled in by reformatting them.
+#:   (124, 232)  the ownership-axis vocabularies and their validator.  It grew at the
 #:               BUGFIX phase: external review #5 found `settlement` and `process_liveness`
 #:               carrying members `pause_policy` does not accept, so the two tuples were
 #:               narrowed to the authority's own and the reasoning was written down beside
 #:               them.  The range END moved with the added lines; the region OUTSIDE it is
 #:               still pinned byte-for-byte to `BASELINE_REV`, which is what the digest
-#:               below proves, so widening the range cannot hide a policy edit.
+#:               below proves, so widening the range cannot hide a policy edit.  OS-49
+#:               SHIFTED this range by the 14 lines its additive block added above it and
+#:               changed not one of its bytes.
 #: The additive region itself is checked by V-5, per D4.1.
-CONTRACTS_ADDITIVE_RANGES = ((9, 9), (88, 105), (110, 218))
+CONTRACTS_ADDITIVE_RANGES = ((9, 9), (88, 119), (124, 232))
 
 #: The digest of `contracts.py`'s policy region.  Equal, byte for byte, to `BASELINE_REV`'s
 #: `contracts.py` minus the single line below -- which the test PROVES rather than asserts,
