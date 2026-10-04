@@ -555,10 +555,23 @@ class UnsupportedOrcaContract(OrcaRuntimeError):
 #: them: a diagnostic that says nothing is worse than one that says why it says nothing.
 UNRENDERABLE_TEXT = "<unrenderable: __str__ and __repr__ both raised>"
 UNRENDERABLE_TYPE_NAME = "<unrenderable type name>"
+UNRENDERABLE_REPR = "<unrenderable: __repr__ raised>"
 
 
 def safe_text(value: Any) -> str:
-    """`str(value)` -- TOTAL. Never raises, whatever `value` does.
+    """`str(value)` -- total for ordinary `Exception`; control flow propagates.
+
+    OS-49 BUGFIX (review 5970292670, N-4). The superseded first line said "TOTAL. Never
+    raises, whatever `value` does", and that was an unconditional claim the code has not
+    made true since review F-002 narrowed the captures below from `BaseException` to
+    `Exception`. Stated exactly, and this is the split every helper in this group shares:
+
+        ordinary `Exception` from `__str__` / `__repr__`  -> handled, fallback text
+        KeyboardInterrupt / SystemExit / GeneratorExit    -> PROPAGATE as themselves
+
+    The split is deliberate and the behaviour is correct as it stands; N-4 is a wording
+    correction and changes no capture. Do NOT re-widen anything here to `BaseException`
+    in order to make the old sentence true -- that is the F-002 defect, reintroduced.
 
     OS-49 BUGFIX iteration 2 (review F-001). A diagnostic must not be able to replace the
     failure it is diagnosing. Every `except` handler in this module that renders what it
@@ -610,13 +623,41 @@ def safe_text(value: Any) -> str:
         return UNRENDERABLE_TEXT
 
 
+def safe_repr(value: Any) -> str:
+    """`repr(value)` -- total for ordinary `Exception`; control flow propagates.
+
+    OS-49 BUGFIX (review 5970292670, N-1). The `!r` sibling of `safe_text`, added for the
+    one place that needs it: `_model_refusal()` renders the DRIVER'S evidence with `!r` in
+    order to diagnose why a delivery was refused, and the driver owns every one of those
+    field values. A `__repr__` that raises therefore let a DIAGNOSTIC replace the refusal
+    it was diagnosing -- the F-001 shape, at the one render boundary F-001 did not reach
+    because `!r` is not `str()`.
+
+    Byte-identical to `f"{value!r}"` for every value that renders at all, so no existing
+    refusal message, log row or test expectation moves.
+
+    `Exception`, not `BaseException`, for the reason `safe_text` spells out: an interrupt
+    raised inside `__repr__` is an operator decision and leaves as itself.
+    """
+    try:
+        return repr(value)
+    except Exception:                                # noqa: BLE001 - N-4 split, see above
+        return UNRENDERABLE_REPR
+
+
 def safe_type_name(value: Any) -> str:
-    """`type(value).__name__` -- TOTAL, for the same reason: a metaclass may define it,
-    and `__name__` is not obliged to be a string.
+    """`type(value).__name__` -- total for ordinary `Exception`; control flow propagates.
+
+    The same reason as `safe_text`: a metaclass may define `__name__`, and `__name__` is
+    not obliged to be a string.
 
     Catches `Exception`, not `BaseException`, for the reason spelled out in `safe_text`
     (review F-002): a metaclass `__name__` is arbitrary code, so an operator interrupt can
     land inside it, and an interrupt is not a rendering failure to be papered over.
+
+    OS-49 BUGFIX (review 5970292670, N-4). The superseded word was "TOTAL", unqualified,
+    which overstated a capture that is -- correctly -- `Exception`-wide only. Wording only;
+    the capture is unchanged.
     """
     try:
         name = type(value).__name__
@@ -626,17 +667,24 @@ def safe_type_name(value: Any) -> str:
 
 
 def safe_exception_text(exc: BaseException) -> str:
-    """`f"{type(exc).__name__}: {exc}"` -- TOTAL.
+    """`f"{type(exc).__name__}: {exc}"` -- total for ordinary `Exception`; control flow
+    propagates.
 
     Byte-identical to that eager f-string for every exception that renders at all, so no
     existing refusal reason, message, log row or test expectation moves. It differs only
     where the eager form RAISED, which is the defect.
+
+    OS-49 BUGFIX (review 5970292670, N-4). The superseded word was "TOTAL", unqualified.
+    This helper is exactly as total as the two it composes and no more: an interrupt
+    raised from inside `exc.__str__` or from a metaclass `__name__` leaves as itself.
+    Wording only; no capture moves.
     """
     return f"{safe_type_name(exc)}: {safe_text(exc)}"
 
 
 def _writer_label(writer: Any) -> str:
-    """The name a `_safe_log` row carries for its writer -- total, like the error text.
+    """The name a `_safe_log` row carries for its writer -- as total as the error text:
+    ordinary `Exception` is handled, control-flow exceptions propagate.
 
     `getattr(writer, "__name__", writer)` is itself a render of a caller-supplied object
     on the fallback leg, and `__name__` may be a raising property, so both legs are
@@ -646,6 +694,10 @@ def _writer_label(writer: Any) -> str:
     F-002). This is the fourth render boundary of the same shape; F-001 was a fix applied
     at one site while a sibling kept the defect alive, so the narrowing is applied to
     every one of them at once rather than only to the lines the finding cited.
+
+    OS-49 BUGFIX (review 5970292670, N-4). "total, like the error text" was the same
+    unconditional claim as `safe_text`'s, inherited by reference; it now carries the same
+    qualification. Wording only; both legs still catch `Exception`.
     """
     try:
         name = writer.__name__
@@ -745,6 +797,34 @@ def _flag_value(args: list[str], flag: str) -> str | None:
 #: that lifts the refusal.
 MODEL_SELECTION_REQUEST_METHODS = ("driver_select_and_verify",)
 
+#: How a resolved model may be OBSERVED.  CLOSED, and -- like the request methods above --
+#: deliberately ONE member, naming the only locator any driver in this release actually
+#: reads (`fake_adapter.InProcessModelDriver.OBSERVATION_METHOD`).
+#:
+#: OS-49 BUGFIX (review 5970292670, N-1a).  `observation_method` was the one attested
+#: field of `ModelEvidence` the barrier never validated: declared `str` and only ever
+#: RENDERED, so an arbitrary object passed the barrier and was stored as authority, then
+#: evaluated later from the settled-dispatch logging funnel.  It is leg 2's counterpart to
+#: `request_method` and now has leg 2's counterpart of that field's closed-set rule.
+#:
+#: The contract is TYPE AND VALUE, in that order, and the type test is `type(...) is str`
+#: rather than `isinstance`: a `str` SUBCLASS may override `__eq__`, so an `isinstance`
+#: gate would hand the membership test below an object that can still raise -- which is
+#: the defect, one layer down.  A value outside the set is never coerced into one with
+#: `str()` or `safe_text()`; coercion is what turns an arbitrary object into apparently
+#: valid evidence, and this barrier's whole job is to refuse it instead.
+#:
+#: OS-49 BUGFIX (final review F-013).  The contract is unchanged; its TYPE half MOVED.  It
+#: was the only attested field with such a check, and a check at its point of use runs
+#: after earlier legs have already touched other unvalidated values, so all fifteen type
+#: checks now sit in one hoisted gate immediately after the attested snapshot.  This
+#: tuple's membership test -- the VALUE half -- still runs at leg 2, under the same reason
+#: code and with the same diagnostic.
+#:
+#: A real `/model` locator (OS-14) adding a member is the visible, reviewable act that
+#: admits it, exactly as it is for `MODEL_SELECTION_REQUEST_METHODS`.
+MODEL_SELECTION_OBSERVATION_METHODS = ("in_process_session_state",)
+
 #: In LIFECYCLE ORDER, so the tuple itself documents that the request precedes the
 #: observation.  Every member is a refusal BEFORE delivery; none is repaired by retrying,
 #: by falling back to a weaker observation, or by downgrading to a warning.
@@ -774,6 +854,33 @@ MODEL_SELECTION_FAILURE_REASONS = (
                                      # not positively established and NOTHING may be
                                      # delivered for either role
 )
+
+#: The shared second clause of a TYPE-GATE refusal, for the thirteen attested fields that
+#: have no leg-specific sentence of their own (OS-49 BUGFIX, final review F-013).  Spelled
+#: once so fifteen refusals cannot drift apart, and worded about what the harness needs
+#: rather than about the driver's intent: a value this barrier must compare, store and
+#: render has to BE a value, and an object that defines those operations itself is still
+#: driver code at every later read.
+ATTESTED_PRIMITIVE_NOTE = (
+    "an attested model-evidence field must be a value this harness can compare, store "
+    "and render, not an object whose behaviour the driver still controls"
+)
+
+#: Per-field reason code for a failed type gate.  Only the two fields whose malformed-type
+#: contract is already LOCKED by tests appear here; every other field falls back to
+#: `model_selection_unverified`, because an attested field that is not a primitive is not
+#: evidence of anything and `unverified` is the vocabulary's name for that.
+#:
+#:   * `observation_method` -> `model_selection_unsupported`.  N-1a's contract: leg 2
+#:     attests WHICH declared locator produced the resolved value, so a value that is not
+#:     a name does not name a locator this repository implements.
+#:   * `resolved_model` -> `model_selection_unverified`.  The B3 malformed-type contract,
+#:     which enumerates eight non-string shapes and requires every one of them to leave
+#:     the barrier inside the closed vocabulary under this member.
+ATTESTED_FIELD_TYPE_REFUSALS = {
+    "observation_method": MODEL_SELECTION_UNSUPPORTED,
+    "resolved_model": MODEL_SELECTION_UNVERIFIED,
+}
 
 #: The reuse gate's model condition names, beside `agent_command_mismatch` and
 #: `observation_not_for_this_dispatch`.
@@ -858,7 +965,8 @@ class ModelEvidence:
     request_method: str = ""           # MUST be in MODEL_SELECTION_REQUEST_METHODS
     request_stamp: int = 0             # MUST be the ticket's FIRST drawn ordinal
     # ---- leg 2: the OBSERVATION -------------------------------------------------------
-    observation_method: str = ""       # which declared locator produced the resolved value
+    observation_method: str = ""       # MUST be in MODEL_SELECTION_OBSERVATION_METHODS:
+                                       # which declared locator produced the resolved value
     observe_stamp: int = 0             # MUST be the SECOND drawn ordinal, > request_stamp
     capability: str = ""               # MUST be MODEL_SELECTION_VERIFIED_CAPABILITY
     observed_at_run: str = ""
@@ -1372,8 +1480,16 @@ class OrcaRuntimeHarness:
         # Recovery is unaffected and still works, because recovery means resolving BACK to
         # the baseline: S re-selected onto model-A matches its history and is accepted, and
         # its authority is re-established by that fresh positive observation. What is now
-        # refused is re-badging S as a DIFFERENT model, for which the remedy is a NEW
+        # refused is re-badging S as a DIFFERENT model, for which the remedy is a new
         # session -- which is available and cheap -- not an erased history.
+        #
+        # OS-49 BUGFIX (review 5970292670, N-3). "A new session" is the remedy for a
+        # DRIFTED SESSION, and it is not a way to change a ROLE's model. The replacement
+        # must still resolve to the role's established baseline: leg (i) is keyed on
+        # (phase, routing role) and reads `_model_role_history`, which moving to a fresh
+        # terminal does not touch, so a replacement resolving to a different model is
+        # refused on the new session for the rest of the run, exactly as it was on the
+        # old one. A role's resolved model changes in a NEW RUN, never mid-run.
         #
         # Only the resolved model is kept, not the evidence: history answers "what did
         # this slot/session resolve to", and holding the whole record would invite some
@@ -2866,16 +2982,32 @@ class OrcaRuntimeHarness:
         `None` is the one shape that answers `False`, and it is not a malformed object: it
         is the explicit legacy sentinel for "no routing at all", checked by every caller
         before this point and byte-identical to pre-OS-49 behaviour.
+
+        OS-49 BUGFIX (review 5970292670, N-2). The TRUTH-VALUE EVALUATION is inside the
+        guard too, and that is the whole of this fix. The `except` previously covered only
+        the attribute READ, so the three shapes the helper reasons about were not treated
+        alike: a missing `is_model_aware` and a raising PROPERTY both reached the
+        conservative answer, while an attribute that EXISTS and returns an object whose
+        `__bool__` raises escaped from `return bool(aware)` as a raw exception -- out of a
+        `@staticmethod` predicate, into a fail-closed barrier and into the settled-dispatch
+        logging funnel. All three are the same fact: the question went unanswered. An
+        unanswered question is answered model-AWARE here, never by an exception.
+
+        The capture stays `Exception`, deliberately, and must not be widened. The width is
+        the control-flow boundary review F-002 established across this module: a
+        KeyboardInterrupt, SystemExit or GeneratorExit raised from inside a property or a
+        `__bool__` is an operator or interpreter decision, not an unanswered question, and
+        it leaves as itself. `None`, and a genuine `True`/`False`, are untouched.
         """
         if routing is None:
             return False
         try:
             aware = getattr(routing, "is_model_aware", _ABSENT)
-        except Exception:                   # a property that raises answered nothing
+            if aware is _ABSENT:
+                return True                 # no such attribute: answered nothing
+            return bool(aware)              # a raising `__bool__`: also answered nothing
+        except Exception:                   # noqa: BLE001 - see the docstring's N-2 note
             return True
-        if aware is _ABSENT:
-            return True
-        return bool(aware)
 
     def _routing_entry_for(self, role: str, phase: str = "") -> Any | None:
         if self.agent_routing is None:
@@ -3048,25 +3180,40 @@ class OrcaRuntimeHarness:
         if drawn_to is not None:
             parts.append(f"counter_after_driver={drawn_to}")
         if evidence is not None:
+            # OS-49 BUGFIX (review 5970292670, N-1, fix point 3). EVERY cell below renders
+            # a field of the DRIVER'S `ModelEvidence`, and `ModelEvidence` is a plain
+            # frozen dataclass with no field validation, so each one is an arbitrary
+            # object whose `__repr__`, `__str__` or `__format__` may raise. Eager `!r` and
+            # `{}` therefore let the DIAGNOSTIC replace the refusal it exists to explain:
+            # the specific reason -- `model_selection_unsupported` for an observation
+            # method outside the closed set, say -- was lost and the caller received the
+            # generic malformed-evidence normalization from the B3 boundary instead. The
+            # review states the rule directly: keep diagnostics subordinate to the failure
+            # being reported.
+            #
+            # `safe_repr` / `safe_text` are byte-identical to `!r` / `str()` for every
+            # value that renders at all, so no existing refusal message moves. The
+            # `observed_at` join is included: `":".join()` over a non-string raises
+            # `TypeError`, which is the same escape with a different spelling.
             parts.extend(
                 (
-                    f"evidence_state={evidence.state!r}",
-                    f"resolved_model={evidence.resolved_model!r}",
-                    f"request_method={evidence.request_method!r}",
-                    f"selection_token={evidence.selection_token!r}",
-                    f"request_stamp={evidence.request_stamp}",
-                    f"observe_stamp={evidence.observe_stamp}",
-                    f"observation_method={evidence.observation_method!r}",
-                    f"capability={evidence.capability!r}",
+                    f"evidence_state={safe_repr(evidence.state)}",
+                    f"resolved_model={safe_repr(evidence.resolved_model)}",
+                    f"request_method={safe_repr(evidence.request_method)}",
+                    f"selection_token={safe_repr(evidence.selection_token)}",
+                    f"request_stamp={safe_text(evidence.request_stamp)}",
+                    f"observe_stamp={safe_text(evidence.observe_stamp)}",
+                    f"observation_method={safe_repr(evidence.observation_method)}",
+                    f"capability={safe_repr(evidence.capability)}",
                     "observed_at="
                     + ":".join(
                         (
-                            evidence.observed_at_run,
-                            evidence.observed_at_task,
-                            evidence.observed_at_terminal,
-                            evidence.observed_at_role,
-                            evidence.observed_at_phase,
-                            str(evidence.observed_at_attempt),
+                            safe_text(evidence.observed_at_run),
+                            safe_text(evidence.observed_at_task),
+                            safe_text(evidence.observed_at_terminal),
+                            safe_text(evidence.observed_at_role),
+                            safe_text(evidence.observed_at_phase),
+                            safe_text(evidence.observed_at_attempt),
                         )
                     ),
                 )
@@ -3253,6 +3400,18 @@ class OrcaRuntimeHarness:
         record that knew about model-A had just been deleted by the refusal. Drift legs (i)
         and (k) therefore read history, which this method leaves alone, and a drifting
         session's remedy is a new session rather than a retry on a cleared slate.
+
+        OS-49 BUGFIX (review 5970292670, N-3). What "a new session" does and does not buy,
+        qualified -- the superseded sentence stopped at "a new session" and read as though
+        any fresh session recovers a drifted role. It does not. A fresh session clears leg
+        (k) only, which is keyed on the physical TERMINAL and which no history names for a
+        terminal that has never been verified. Leg (i) is keyed on the (phase, ROUTING
+        ROLE) and reads `_model_role_history`, which a new session does not touch, so
+        WITHIN THIS RUN the fresh session must still resolve to that ROLE'S ESTABLISHED
+        BASELINE. Resolving to a different model for the same role is refused on the new
+        session exactly as it was on the old one. A role resolving to a different model is
+        a NEW RUN's business, which is precisely why both history maps are run-scoped.
+        This is a statement of what the two legs already do; neither check is relaxed.
         """
         self._model_session_identity.pop(terminal, None)
         self._model_pending_evidence.pop(terminal, None)
@@ -3701,15 +3860,169 @@ class OrcaRuntimeHarness:
                     MODEL_SELECTION_UNVERIFIED,
                     f"the driver returned {type(evidence).__name__}, not ModelEvidence",
                 )
-            if evidence.state not in MODEL_EVIDENCE_STATES:
+            # ---- the ATTESTED SNAPSHOT: each field read off the driver EXACTLY ONCE ----
+            # OS-49 BUGFIX (final review F-012). `ModelEvidence` is `frozen`, but `frozen`
+            # only blocks `__setattr__`; it does nothing about a SUBCLASS that overrides
+            # `__getattribute__` or redeclares a field as a property. Admission above is
+            # `isinstance`, so a subclass IS accepted -- and this barrier used to read each
+            # attested field again at every leg that needed it, then store the DRIVER'S OWN
+            # OBJECT into all three authority maps. So a subclass could return the
+            # supported exact `str` for the two reads leg 2's vocabulary check makes, be
+            # accepted, and return an arbitrary object on the next read: the value that was
+            # VALIDATED was not the value that was STORED. That is N-1a again in
+            # time-of-check/time-of-use form -- an arbitrary value reaching logging, reuse
+            # and provenance code as authority, after the dispatch it authorized settled.
+            #
+            # The fix is CANONICALIZATION, not exact-class rejection. Admission stays
+            # `isinstance` deliberately: production constructs the exact class only, and
+            # every `ModelEvidence` subclass in this repository is an adversarial fixture
+            # whose purpose is to reach LATER legs, so rejecting subclasses at the door
+            # would change which leg they exercise rather than fix anything. Instead every
+            # field is read HERE, once, into a local; every leg below validates the LOCAL;
+            # and the accept block at the bottom stores a freshly constructed exact-class
+            # `ModelEvidence` built only from these locals. The driver's OBJECT is never
+            # authority, which closes the mutate-after-acceptance route in the same move as
+            # the subclass route.
+            #
+            # OS-49 BUGFIX (final review F-013). That is the CONTAINER half, and on its own
+            # it is not enough: the superseded wording here claimed no later read could
+            # re-enter driver code, which was false, because the locals this block captures
+            # are still whatever OBJECTS the driver put in the fields. The type gate
+            # immediately below is the VALUE half, and the claim holds only with both: the
+            # fifteen locals are proven exact `str` / `int` before any other leg touches
+            # them, so the canonical record built from them carries no driver code at all.
+            #
+            # These reads are INSIDE the post-selection boundary, so a field whose read
+            # raises an ordinary `Exception` still stales and still normalizes to
+            # `model_selection_unverified`, and `KeyboardInterrupt`, `SystemExit` and
+            # `GeneratorExit` still propagate as themselves. Hoisting moves WHEN such a
+            # read raises, not WHAT the barrier does about it.
+            #
+            # `refuse()` above deliberately keeps rendering the DRIVER'S object: a refusal
+            # diagnostic describes the value being REJECTED, which is by definition the
+            # driver's and not any canonical form of it, nothing it renders becomes
+            # authority, and a hostile renderer there is normalized by this very boundary
+            # (F-001). The read-once obligation is about what becomes AUTHORITY.
+            attested_state = evidence.state
+            attested_requested_model = evidence.requested_model
+            attested_resolved_model = evidence.resolved_model
+            attested_selection_token = evidence.selection_token
+            attested_request_method = evidence.request_method
+            attested_request_stamp = evidence.request_stamp
+            attested_observation_method = evidence.observation_method
+            attested_observe_stamp = evidence.observe_stamp
+            attested_capability = evidence.capability
+            attested_observed_at_run = evidence.observed_at_run
+            attested_observed_at_task = evidence.observed_at_task
+            attested_observed_at_terminal = evidence.observed_at_terminal
+            attested_observed_at_role = evidence.observed_at_role
+            attested_observed_at_phase = evidence.observed_at_phase
+            attested_observed_at_attempt = evidence.observed_at_attempt
+            # ---- the TYPE GATE: no leg touches a value whose TYPE is not proven ---------
+            # OS-49 BUGFIX (final review F-013). F-012 canonicalized the CONTAINER; this
+            # gate canonicalizes the trust in the VALUES it carries, and the two are one
+            # lesson in two parts: a freshly constructed exact-class `ModelEvidence` does
+            # nothing about the fifteen arbitrary objects stored INSIDE it. `ModelEvidence`
+            # is a plain frozen dataclass with no field validation, so a driver may put ANY
+            # object in ANY field -- and before this gate exactly ONE attested value was
+            # exact-type-checked (`observation_method`, N-1a). The other fourteen were
+            # validated only by operations the value itself defines: truthiness,
+            # `==`/`!=`, tuple equality and `in`. A driver-owned object that answers those
+            # cooperatively passed every leg and was then copied BY REFERENCE into the
+            # canonical record, so all three authority maps held executable driver code --
+            # which the review demonstrated by having `_rebind_model_evidence()` re-enter a
+            # `selection_token`'s `__format__` through `request_evidence` and raise, leaving
+            # a half-written terminal row after the dispatch had settled.
+            #
+            # `type(x) is str` / `type(x) is int`, not `isinstance`: a SUBCLASS may override
+            # `__eq__`, `__ne__`, `__bool__`, `__hash__`, `__format__`, `__str__` or
+            # `__repr__`, which is every operation a later reader performs, so an
+            # `isinstance` gate would still hand those readers an object that can lie or
+            # raise. `type(x) is int` rejects `bool`, which is INTENDED and is the same rule
+            # DESIGN M-14 already applies to `attempt`: `True == 1`, so a bool ordinal
+            # silently aliases a real one.
+            #
+            # Nothing here COERCES. `str(x)` or `safe_text(x)` would turn an arbitrary
+            # object into an apparently valid attestation, which is precisely the acceptance
+            # this gate exists to refuse -- the rule N-1a stated for one field, now applied
+            # to all fifteen.
+            #
+            # HOISTED to run IMMEDIATELY after the single read of each field and BEFORE any
+            # other leg, because placing the checks "where each field is used" would leave
+            # the ORDERING hole the review's probe did not even need: the request-presence
+            # leg below performs a TRUTHINESS test on `selection_token`, and the state leg
+            # performs a MEMBERSHIP test, so a hostile `__bool__` or `__eq__` fired before
+            # any type check could run. Between the snapshot above and this gate the values
+            # are not touched at all -- building the tuple below binds references and
+            # `type(...) is ...` reads the type object, neither of which enters driver code.
+            #
+            # Fields in DECLARATION order, so the field reported is deterministic. The
+            # reason code is per-field because two of them are already locked by tests:
+            # `observation_method` is `model_selection_unsupported` (N-1a: leg 2 names a
+            # LOCATOR, and a locator that is not a name is unsupported) and `resolved_model`
+            # is `model_selection_unverified` (the B3 malformed-type contract). The
+            # remaining thirteen take `model_selection_unverified`: an attested field that
+            # is not a primitive is not evidence of anything, verified least of all.
+            #
+            # The diagnostic renders only `safe_type_name(...)` of the offending value, and
+            # `refuse()` -> `_model_refusal()` renders the REJECTED driver object through
+            # `safe_repr` / `safe_text` (N-1). That is deliberate and is not a hole: a
+            # refusal diagnostic describes the value being REJECTED, nothing it renders
+            # becomes authority, and a hostile renderer there is normalized by this very
+            # boundary (F-001).
+            #
+            # Reached post-selection, so every failure goes through `refuse()`: current
+            # authority for this session is staled, and `_model_role_history` /
+            # `_model_session_history` are left standing, exactly as review B2 established.
+            for attested_name, attested_value, attested_type, attested_note in (
+                ("state", attested_state, str, ATTESTED_PRIMITIVE_NOTE),
+                ("requested_model", attested_requested_model, str,
+                 ATTESTED_PRIMITIVE_NOTE),
+                ("resolved_model", attested_resolved_model, str,
+                 ATTESTED_PRIMITIVE_NOTE),
+                ("selection_token", attested_selection_token, str,
+                 ATTESTED_PRIMITIVE_NOTE),
+                ("request_method", attested_request_method, str,
+                 ATTESTED_PRIMITIVE_NOTE),
+                ("request_stamp", attested_request_stamp, int,
+                 ATTESTED_PRIMITIVE_NOTE),
+                ("observation_method", attested_observation_method, str,
+                 "leg 2 must name the locator that produced the resolved value, and an "
+                 "object is not a name"),
+                ("observe_stamp", attested_observe_stamp, int,
+                 ATTESTED_PRIMITIVE_NOTE),
+                ("capability", attested_capability, str, ATTESTED_PRIMITIVE_NOTE),
+                ("observed_at_run", attested_observed_at_run, str,
+                 ATTESTED_PRIMITIVE_NOTE),
+                ("observed_at_task", attested_observed_at_task, str,
+                 ATTESTED_PRIMITIVE_NOTE),
+                ("observed_at_terminal", attested_observed_at_terminal, str,
+                 ATTESTED_PRIMITIVE_NOTE),
+                ("observed_at_role", attested_observed_at_role, str,
+                 ATTESTED_PRIMITIVE_NOTE),
+                ("observed_at_phase", attested_observed_at_phase, str,
+                 ATTESTED_PRIMITIVE_NOTE),
+                ("observed_at_attempt", attested_observed_at_attempt, int,
+                 ATTESTED_PRIMITIVE_NOTE),
+            ):
+                if type(attested_value) is attested_type:
+                    continue
+                raise refuse(
+                    ATTESTED_FIELD_TYPE_REFUSALS.get(
+                        attested_name, MODEL_SELECTION_UNVERIFIED
+                    ),
+                    f"{attested_name} is {safe_type_name(attested_value)}, not "
+                    f"{attested_type.__name__}; {attested_note}",
+                )
+            if attested_state not in MODEL_EVIDENCE_STATES:
                 raise refuse(
                     MODEL_SELECTION_UNVERIFIED,
-                    f"state {evidence.state!r} is outside the closed vocabulary "
+                    f"state {attested_state!r} is outside the closed vocabulary "
                     f"{MODEL_EVIDENCE_STATES}",
                 )
             # ---- leg 1: the REQUEST ------------------------------------------------------
-            if not evidence.selection_token or not evidence.request_method or (
-                evidence.request_stamp == 0
+            if not attested_selection_token or not attested_request_method or (
+                attested_request_stamp == 0
             ):
                 raise refuse(
                     MODEL_SELECTION_REQUEST_ABSENT,
@@ -3717,32 +4030,70 @@ class OrcaRuntimeHarness:
                     "reading a pre-existing or default model state is not evidence that "
                     "anything asked for it",
                 )
-            if evidence.request_method not in MODEL_SELECTION_REQUEST_METHODS:
+            if attested_request_method not in MODEL_SELECTION_REQUEST_METHODS:
                 raise refuse(
                     MODEL_SELECTION_UNSUPPORTED,
-                    f"request_method {evidence.request_method!r} is outside the closed set "
+                    f"request_method {attested_request_method!r} is outside the closed set "
                     f"{MODEL_SELECTION_REQUEST_METHODS}",
                 )
-            if evidence.capability != MODEL_SELECTION_VERIFIED_CAPABILITY:
+            if attested_capability != MODEL_SELECTION_VERIFIED_CAPABILITY:
                 raise refuse(
                     MODEL_SELECTION_UNSUPPORTED,
                     "the evidence does not name the "
                     f"{MODEL_SELECTION_VERIFIED_CAPABILITY!r} capability",
                 )
-            if evidence.selection_token != ticket.token:
+            # ---- leg 2's vocabulary, validated HERE and not merely rendered later -------
+            # OS-49 BUGFIX (review 5970292670, N-1a). `observation_method` is the only
+            # attested field this barrier accepted without looking at it: declared `str`,
+            # never validated, and read at just two sites that RENDER it -- the refusal
+            # diagnostic above and the `agent_identity_bound` row, the second of which runs
+            # from the settled-dispatch logging funnel. So an arbitrary object -- one whose
+            # `__bool__` or `__str__` raises -- passed the barrier, was STORED AS AUTHORITY
+            # by the accept block at the bottom of this method, and detonated later, after
+            # the dispatch it authorized had already settled.
+            #
+            # Validated beside `request_method` and `capability` because it is the same
+            # kind of thing: a closed-vocabulary member naming a mechanism this repository
+            # has actually implemented. Leg 2's attestation is as much a claim about HOW
+            # the value was obtained as leg 1's is, and a claim naming a locator that does
+            # not exist is `model_selection_unsupported` -- the same member, for the same
+            # reason, as an unsupported `request_method`.
+            #
+            # TYPE FIRST, then VALUE -- and OS-49 BUGFIX (final review F-013) MOVED the
+            # type half UPWARDS into the type gate, byte-identical reason code and
+            # byte-identical diagnostic, because this field was the only one of the fifteen
+            # that had such a check and a check sitting at its point of use runs AFTER the
+            # legs above it have already touched other unvalidated values. It is not
+            # duplicated here: a second `type(...) is not str` test at this line would be
+            # unreachable. What remains here is the VALUE half, which is this leg's own
+            # business. `type(...) is str` rather than `isinstance` for the reason the gate
+            # spells out: the membership test below is `==` against each member, and a `str`
+            # SUBCLASS may override `__eq__`.
+            #
+            # Reached post-selection, so it goes through `refuse()`: current authority for
+            # this session is staled, and `_model_role_history` / `_model_session_history`
+            # -- the non-drift record -- are deliberately left standing, exactly as review
+            # B2 established for every other post-selection refusal.
+            if attested_observation_method not in MODEL_SELECTION_OBSERVATION_METHODS:
+                raise refuse(
+                    MODEL_SELECTION_UNSUPPORTED,
+                    f"observation_method {attested_observation_method!r} is outside the "
+                    f"closed set {MODEL_SELECTION_OBSERVATION_METHODS}",
+                )
+            if attested_selection_token != ticket.token:
                 raise refuse(
                     MODEL_SELECTION_REQUEST_STALE,
                     "the attested request belongs to another attempt, session or role: its "
                     "token is not the one this barrier minted",
                 )
-            if evidence.observe_stamp == 0:
+            if attested_observe_stamp == 0:
                 raise refuse(
                     MODEL_SELECTION_UNVERIFIED,
                     "a selection was requested and no resolved model was ever observed",
                 )
             if (
-                evidence.request_stamp != expected[0]
-                or evidence.observe_stamp != expected[1]
+                attested_request_stamp != expected[0]
+                or attested_observe_stamp != expected[1]
                 or drawn_to != expected[1]
             ):
                 raise refuse(
@@ -3752,12 +4103,12 @@ class OrcaRuntimeHarness:
                     "this harness counted how often it was asked",
                 )
             observed_key = (
-                evidence.observed_at_run,
-                evidence.observed_at_task,
-                evidence.observed_at_terminal,
-                evidence.observed_at_role,
-                evidence.observed_at_phase,
-                evidence.observed_at_attempt,
+                attested_observed_at_run,
+                attested_observed_at_task,
+                attested_observed_at_terminal,
+                attested_observed_at_role,
+                attested_observed_at_phase,
+                attested_observed_at_attempt,
             )
             if observed_key != (
                 self.run_id or "",
@@ -3772,13 +4123,13 @@ class OrcaRuntimeHarness:
                     "the evidence was not observed for this (run, task, terminal, role, "
                     "phase, attempt) key",
                 )
-            if evidence.requested_model != requested:
+            if attested_requested_model != requested:
                 raise refuse(
                     MODEL_SELECTION_MISMATCH,
                     "the evidence does not echo back the model this routing requested",
                 )
             # ---- leg 2: the OBSERVATION's own verdict -------------------------------------
-            if evidence.state != MODEL_EVIDENCE_VERIFIED:
+            if attested_state != MODEL_EVIDENCE_VERIFIED:
                 raise refuse(
                     {
                         MODEL_EVIDENCE_MISMATCH: MODEL_SELECTION_MISMATCH,
@@ -3786,16 +4137,16 @@ class OrcaRuntimeHarness:
                         MODEL_EVIDENCE_STALE: MODEL_SELECTION_UNVERIFIED,
                         MODEL_EVIDENCE_REQUESTED: MODEL_SELECTION_UNVERIFIED,
                         MODEL_EVIDENCE_NONE: MODEL_SELECTION_UNVERIFIED,
-                    }.get(evidence.state, MODEL_SELECTION_UNVERIFIED),
-                    f"the driver reported state {evidence.state!r}; only "
+                    }.get(attested_state, MODEL_SELECTION_UNVERIFIED),
+                    f"the driver reported state {attested_state!r}; only "
                     f"{MODEL_EVIDENCE_VERIFIED!r} admits a delivery",
                 )
-            if not evidence.resolved_model or not MODEL_TOKEN_PATTERN.fullmatch(
-                evidence.resolved_model
+            if not attested_resolved_model or not MODEL_TOKEN_PATTERN.fullmatch(
+                attested_resolved_model
             ):
                 raise refuse(
                     MODEL_SELECTION_UNVERIFIED,
-                    f"resolved_model {evidence.resolved_model!r} is empty or is not a "
+                    f"resolved_model {attested_resolved_model!r} is empty or is not a "
                     "simple model token, so it is not a model identity",
                 )
             # OS-49 BUGFIX (review B2). Read off the HISTORY, not off `_model_identity`.
@@ -3805,7 +4156,7 @@ class OrcaRuntimeHarness:
             # append-only for the run, so the second attempt at a drifted model is refused for
             # the same reason the first one was instead of sliding through on a cleared slate.
             previous_model = self._model_role_history.get((phase, routing_role))
-            if previous_model is not None and previous_model != evidence.resolved_model:
+            if previous_model is not None and previous_model != attested_resolved_model:
                 raise refuse(
                     MODEL_SELECTION_AMBIGUOUS,
                     "an earlier accepted attempt for this (phase, role) resolved to "
@@ -3913,7 +4264,7 @@ class OrcaRuntimeHarness:
                     )
                 elif counterpart_entry is not None:
                     independent, reason = effective_identity_independent(
-                        (command, evidence.resolved_model, MODEL_EVIDENCE_VERIFIED),
+                        (command, attested_resolved_model, MODEL_EVIDENCE_VERIFIED),
                         (
                             counterpart_entry.command,
                             counterpart.resolved_model,
@@ -3957,10 +4308,20 @@ class OrcaRuntimeHarness:
             # whose resolved model CHANGED is, by OS-49's own stated principle, not the agent
             # that was verified, so it cannot be re-badged. Its replacement is a new session,
             # which every caller can create and which costs a `terminal create`.
+            #
+            # OS-49 BUGFIX (review 5970292670, N-3). The replacement session is NOT a way to
+            # change the role's model, and the superseded wording did not say so. A new
+            # terminal is unknown to THIS leg's `_model_session_history` and so clears THIS
+            # leg; it is not known to leg (i) either way, because leg (i) is keyed on
+            # (phase, routing role) and that key is unchanged by moving sessions. So inside
+            # one run the replacement must still resolve to the ROLE's established baseline,
+            # and a replacement that resolves to anything else is refused by leg (i) with the
+            # same `model_selection_ambiguous` name. Changing a role's resolved model is a
+            # new RUN, not a new session.
             session_previous = self._model_session_history.get(terminal)
             if session_previous is not None:
                 previous_role, previous_phase, previous_model = session_previous
-                if previous_model != evidence.resolved_model:
+                if previous_model != attested_resolved_model:
                     raise refuse(
                         MODEL_SELECTION_AMBIGUOUS,
                         f"session {terminal!r} was already positively verified as "
@@ -3972,9 +4333,39 @@ class OrcaRuntimeHarness:
                     )
             # Accepted. Recorded ONLY here, so no refused attempt can leave a trace that a
             # later round or a provenance row would read as earned.
-            self._model_identity[(phase, routing_role)] = evidence
-            self._model_pending_evidence[terminal] = evidence
-            self._model_session_identity[terminal] = (routing_role, phase, evidence)
+            # OS-49 BUGFIX (final review F-012). The authority is the CANONICAL record,
+            # built only from the locals the legs above validated -- never the driver's
+            # object. Exact-class and frozen, and -- OS-49 BUGFIX (final review F-013) --
+            # carrying only values the type gate proved to be exact `str` / `int`, so every
+            # later reader (the `agent_identity_bound` row, reuse condition 9, the
+            # provenance rows, `_rebind_model_evidence()`'s `request_evidence`, the refusal
+            # diagnostics of a LATER attempt) reads the validated values back and cannot
+            # re-enter driver code. BOTH halves are load-bearing for that last sentence: an
+            # exact-class wrapper around fifteen driver-owned objects was F-013, and
+            # exact-typed values inside the driver's own object would still be a
+            # time-of-check/time-of-use split. Constructed here rather than at the top
+            # because it must carry what was VALIDATED, and that is only known once every
+            # leg has passed.
+            canonical = ModelEvidence(
+                state=attested_state,
+                requested_model=attested_requested_model,
+                resolved_model=attested_resolved_model,
+                selection_token=attested_selection_token,
+                request_method=attested_request_method,
+                request_stamp=attested_request_stamp,
+                observation_method=attested_observation_method,
+                observe_stamp=attested_observe_stamp,
+                capability=attested_capability,
+                observed_at_run=attested_observed_at_run,
+                observed_at_task=attested_observed_at_task,
+                observed_at_terminal=attested_observed_at_terminal,
+                observed_at_role=attested_observed_at_role,
+                observed_at_phase=attested_observed_at_phase,
+                observed_at_attempt=attested_observed_at_attempt,
+            )
+            self._model_identity[(phase, routing_role)] = canonical
+            self._model_pending_evidence[terminal] = canonical
+            self._model_session_identity[terminal] = (routing_role, phase, canonical)
             # OS-49 BUGFIX (review B2). The HISTORY half of the same acceptance, written in the
             # same statement group so authority can never exist without the history that
             # explains it. Deliberately NOT rolled back by `_restore_model_evidence()`: that
@@ -3982,14 +4373,14 @@ class OrcaRuntimeHarness:
             # never completed, and it is about AUTHORITY. The selection itself did happen, so
             # the session really is on this model and the history row is true whether or not
             # the delivery that followed it survived.
-            self._model_role_history[(phase, routing_role)] = evidence.resolved_model
+            self._model_role_history[(phase, routing_role)] = attested_resolved_model
             self._model_session_history[terminal] = (
-                routing_role, phase, evidence.resolved_model
+                routing_role, phase, attested_resolved_model
             )
             row = self._terminals.get(terminal)
             if row is not None:
-                row["resolved_model"] = evidence.resolved_model
-                row["model_state"] = evidence.state
+                row["resolved_model"] = attested_resolved_model
+                row["model_state"] = attested_state
         except BaseException as exc:                   # noqa: BLE001 - re-raised below
             # The invariant, in two statements. Stale FIRST -- unconditionally, before
             # anything is decided about what kind of failure this is -- then decide how the
@@ -5011,19 +5402,47 @@ class OrcaRuntimeHarness:
     # harness already built for its own return value, so no new state is
     # invented for logging's sake. Every write goes through _safe_log so a
     # logging failure -- a full disk, an unwritable path -- is recorded in
-    # self._logging_errors and never raised into the caller, which would
+    # self._logging_errors and not raised into the caller, which would
     # otherwise turn an already-settled Dispatch into an apparent failure.
+    #
+    # OS-49 BUGFIX (review 5970292670, N-4). Stated with its actual width rather than
+    # unconditionally: _safe_log catches `Exception`, so an ordinary logging failure is
+    # recorded and absorbed, while KeyboardInterrupt / SystemExit / GeneratorExit
+    # PROPAGATE through it as themselves. That split is correct and deliberate -- review
+    # F-002 established that an operator's Ctrl-C arriving inside a slow writer is not a
+    # logging failure to be papered over -- and the superseded "never raised into the
+    # caller" phrasing described only its first half. Do not widen this to
+    # `BaseException` to make the old sentence true.
 
     def _safe_log(self, writer: Any, *args: Any, **kwargs: Any) -> None:
+        """Run one non-authoritative logging operation inside the guard.
+
+        `writer` is any callable whose failure may not change a lifecycle decision --
+        a `run_logging` writer, or (OS-49 BUGFIX, review 5970292670 N-1) a method of
+        this class that PREPARES and then writes a row. Wrapping the preparation too is
+        the point of accepting a method here: a row whose construction raises outside
+        the guard is exactly as capable of unwinding a settled Dispatch as a failed
+        write, and the guard that only covered the write did not say so.
+
+        WIDTH, stated rather than implied (OS-49 BUGFIX, review 5970292670 N-4). This
+        catches `Exception`. An ordinary logging failure is recorded and absorbed;
+        KeyboardInterrupt, SystemExit and GeneratorExit PROPAGATE through it as
+        themselves. The superseded section note said only "never raised into the
+        caller", which described the first half. The split is deliberate -- review F-002
+        established that an operator's Ctrl-C arriving inside a slow writer is not a
+        logging failure to be papered over -- so do not widen this to `BaseException` in
+        order to make the old sentence true.
+        """
         try:
             writer(*args, **kwargs)
         except Exception as error:  # noqa: BLE001 -- see the section note above
             # OS-49 BUGFIX iteration 2 (review F-001). Both halves of the row are
-            # rendered TOTALLY. This guard's entire promise is that a logging failure
-            # never reaches the caller, and an eager `f"...{error}"` could break that
-            # promise from inside the guard itself -- the same escape F-001 found on the
-            # model-selection boundary, with the consequence section 9 forbids by name:
-            # an already-settled Dispatch turning into an apparent failure.
+            # rendered through the total-for-`Exception` helpers. This guard's promise is
+            # that an ordinary logging failure never reaches the caller, and an eager
+            # `f"...{error}"` could break that promise from inside the guard itself -- the
+            # same escape F-001 found on the model-selection boundary, with the
+            # consequence section 9 forbids by name: an already-settled Dispatch turning
+            # into an apparent failure.
             self._logging_errors.append(
                 f"{_writer_label(writer)}: {safe_text(error)}"
             )
@@ -5301,8 +5720,11 @@ class OrcaRuntimeHarness:
         hook payload, so the two are the same value by construction.
 
         Returns the path written, or "" when there was nothing to bind or the record
-        could not be published. Never raises: this is a convenience for a hook that is
-        opt-in, and it may not be able to fail a Run.
+        could not be published. Does not raise on an ordinary `Exception`: this is a
+        convenience for a hook that is opt-in, and it may not be able to fail a Run.
+        Control-flow exceptions (KeyboardInterrupt / SystemExit / GeneratorExit) are not
+        caught and propagate -- the N-4 split, stated here too because this is the same
+        unconditional phrasing in the same module.
         """
         try:
             path = turn_boundary.bind_session_run(
@@ -5315,8 +5737,12 @@ class OrcaRuntimeHarness:
         # says nothing about a beating heart; the liveness lease is refreshed on a
         # cadence INDEPENDENT of any claimed section, which is what makes "the
         # Coordinator's heartbeat expired" a fact rather than a false positive.
-        # Under the same never-raises discipline as the binding: a liveness record may
-        # no more fail a Run than a binding may.
+        # Under the same discipline as the binding, carrying the same N-4 qualification
+        # the docstring above now states: on an ordinary `Exception` a liveness record
+        # may no more fail a Run than a binding may, while KeyboardInterrupt /
+        # SystemExit / GeneratorExit are not caught and propagate. The unconditional
+        # phrasing that stood here (OS-49 BUGFIX iteration 2, review F-001) contradicted
+        # the `except Exception` three lines above it. Wording only; no capture moves.
         self._begin_turn_boundary_liveness()
         return str(path) if path is not None else ""
 
@@ -5328,11 +5754,13 @@ class OrcaRuntimeHarness:
     def _begin_turn_boundary_liveness(self) -> None:
         """Start the OS-43 liveness keeper for `self.run_id`, retiring any predecessor.
 
-        Never raises, for the same reason `_bind_turn_boundary_session` does not: this is
-        an observability producer, and it may not fail a Run. Binding a second Run on one
-        instance retires the first Run's keeper first, so an instance never keeps a lease
-        alive for a Run it has moved on from -- the mirror of `stop()`'s own rule in
-        `lease_keeper`.
+        Does not raise on an ordinary `Exception`, for the same reason
+        `_bind_turn_boundary_session` does not: this is an observability producer, and it
+        may not fail a Run. Control-flow exceptions propagate (review 5970292670, N-4).
+
+        Binding a second Run on one instance retires the first Run's keeper first, so an
+        instance never keeps a lease alive for a Run it has moved on from -- the mirror
+        of `stop()`'s own rule in `lease_keeper`.
         """
         if os.environ.get(self.LIVENESS_ENV, "1").strip().lower() in (
             "0",
@@ -5354,7 +5782,11 @@ class OrcaRuntimeHarness:
             self._liveness_run_id = ""
 
     def _end_turn_boundary_liveness(self) -> None:
-        """Retire the liveness keeper and record the release. Never raises."""
+        """Retire the liveness keeper and record the release.
+
+        Does not raise on an ordinary `Exception`; control-flow exceptions propagate --
+        the same N-4 split as every other guard in this module.
+        """
         keeper = getattr(self, "_liveness_keeper", None)
         run_id = getattr(self, "_liveness_run_id", "")
         self._liveness_keeper = None
@@ -5451,7 +5883,30 @@ class OrcaRuntimeHarness:
         # overload of the settled row's `detail`, which is the OS-17 body_excerpt
         # diagnostic -- appending to it would redefine an existing event's existing
         # column.
-        self._log_agent_identity_row(
+        #
+        # OS-49 BUGFIX (review 5970292670, N-1b). The WHOLE operation goes through
+        # `_safe_log`, not just the write inside it. This call used to be direct, and
+        # "under the same _safe_log guard" was true only of the final writer call: the
+        # routing read, the `_routing_is_model_aware()` predicate, `_routing_key()`, the
+        # two `_model_identity` lookups and the `detail` assembly -- which RENDERS driver
+        # -supplied evidence fields -- all ran outside it. By the time `_log_attempt()` is
+        # reached the dispatch has SETTLED, so an exception from any of those unwound
+        # `run_existing_task()` between `settle_attempt()` and its return: it interrupted
+        # normal return of an already-settled result and skipped the three recording steps
+        # below (the settled row, the timing row and, on a Final Review, the audit record).
+        # That is the non-authoritative-logging contract broken from inside the funnel
+        # that states it.
+        #
+        # Deliberately NARROW, and this is the line the review draws explicitly. It wraps
+        # ONE non-authoritative row. `_log_attempt()` itself is NOT blanket-wrapped, and
+        # the two authoritative families keep their fail-closed behaviour exactly:
+        # `_record_decision_from_attempt()` above still raises, and `_audit_coordinator()`
+        # still records AND re-raises, because a Coordinator audit record is the only
+        # thing a restarted Coordinator can recover the delivery ledger from. `_safe_log`
+        # catches `Exception`, so KeyboardInterrupt / SystemExit / GeneratorExit still
+        # propagate and the F-002 interrupt defect is not reintroduced.
+        self._safe_log(
+            self._log_agent_identity_row,
             phase=phase, attempt=attempt, terminal_created=terminal_created,
             round_kind=round_kind,
         )
@@ -5527,10 +5982,23 @@ class OrcaRuntimeHarness:
         the run-scoped `agent_profile_selected` / `agent_routing_resolved` rows already
         say up front whether this run's routing carries a model.
 
-        Provenance is NOT the gate. This runs after settlement inside `_safe_log`, so a
-        failed write lands in `self._logging_errors` and never unwinds an already-settled
-        Dispatch. That is only safe because enforcement lives in the two gates: a missing
-        identity row can never be what PERMITTED an unverified delivery.
+        Provenance is NOT the gate. This runs after settlement, and its CALL SITE passes
+        the whole method through `_safe_log`, so an ordinary failure anywhere in it --
+        predicate, routing lookup, row construction or the write -- lands in
+        `self._logging_errors` and does not unwind an already-settled Dispatch. That is
+        only safe because enforcement lives in the two gates: a missing identity row can
+        never be what PERMITTED an unverified delivery.
+
+        OS-49 BUGFIX (review 5970292670, N-1b). The superseded sentence said "This runs
+        after settlement inside `_safe_log`", and for the PREPARATION phase it was simply
+        false: the caller invoked this method directly and only the writer call at the
+        bottom was guarded, so everything above that line -- including `detail`, which
+        renders driver-supplied evidence fields -- ran outside the guard. The fix is at
+        the call site in `_log_attempt()`, which is why this docstring now says where the
+        boundary actually is instead of asserting a property this body cannot provide for
+        itself. The inner `_safe_log` around the writer is KEPT: it is not redundant, it
+        is what makes a failed WRITE record itself under the writer's own name
+        (`log_orchestrator_event: ...`) rather than under this method's.
         """
         routing = self.agent_routing
         if not self._routing_is_model_aware(routing):
