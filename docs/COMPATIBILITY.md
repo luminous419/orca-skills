@@ -496,6 +496,55 @@ Model-aware routing is positively supported **only** on the deterministic driver
 the request leg is honest: the reference driver records a requested model against the
 session and reads that state back, composing no command and parsing no output.
 
+**OS-14 — the normal workflow now performs the preparation itself, and it is DURABLY
+recorded.** Before OS-14 the public pre-pass that admits a same-command pair had no caller
+under `scripts/deterministic_workflow/`: only tests created both sessions and pre-admitted
+the pair. The Orca-adapter workflow path now prepares both sessions, verifies both model
+identities through the injected driver seam, and only then delivers the first task — and a
+preparation or verification failure delivers **nothing**, for either role. The preparation's
+provenance is durable, so re-entry and restart either continue with **no duplicate effect**
+or stop with a named `PAIR_PREPARATION_*` reason. None of this changes the fail-closed
+default above: with no driver a declared model is still refused `AGENT_MODEL_NOT_SUPPORTED`
+at the declaration gate, before any Run exists, and the reference driver's success remains
+evidence about the **wiring** only — never about any real provider model.
+
+**Every Orca-adapter run now carries a run-root launch record**
+(`.pair_launch_binding.json`), written at run OPEN, model-less runs included, with
+`model_aware` recorded as the string `"true"` or `"false"`. The file's EXISTENCE is not the
+signal — its content is — so an absent record can never be mistaken for a legacy run. A run
+opened by a **pre-feature** engine therefore has none, and adopting it stops by name
+(`PAIR_PREPARATION_LAUNCH_RECORD_ABSENT`); the operator relaunches it, and nothing was
+prepared under it, so no prepared session is orphaned. An adoption never WRITES a launch
+record, so it cannot manufacture the authority it is supposed to be checked against. A
+relaunch of the **same run id** under a **different** routing or launch kind is refused at
+the launch boundary as `ORCA_RUN_BINDING_CONFLICT`, before any Task exists.
+
+**The launch identity a successor is reconciled against includes the DRIVER CLASS.** The
+record binds the driver's layout-normalised, round-trip-verified import path
+(`"<module>:<qualname>"`), not its short `__name__`, which two different classes can share.
+A successor that reconstructs the same routing digest but injects a *different* capable
+driver class — including one whose `__name__` is identical — is refused
+`PAIR_PREPARATION_BINDING_MISMATCH` before any effect. A driver whose class has **no durable
+name** (a function-local class, a `type("X", …)` built at run time) cannot open a model-aware
+run at all: `AGENT_MODEL_DRIVER_UNIDENTIFIABLE`, at the routing gate, before a harness, Run,
+Task, Dispatch or terminal exists. A driver's **injected behaviour** is explicitly NOT
+bindable — a live callable has no stable durable identity — and is covered instead by
+mandatory fresh re-verification on every pass plus the cross-process drift block
+(`PAIR_PREPARATION_MODEL_DRIFT`).
+
+**Automatic resume is not guaranteed at every crash window, and a named block is the
+designed outcome** wherever creation, ownership, configuration or verification state is
+unknown. A `VERIFIED` record is **never** restored as a current verification: authority lives
+only in process memory, `resume_run` restores none of it, and every preparation pass re-runs
+the driver's two legs for both roles. A model-aware adoption also reconstructs its routing
+from the run's **own committed declaration** — its requested phases and its risk, from one
+read — and refuses `ORCA_RUN_DECLARATION_UNREADABLE` rather than guessing; a **legacy**
+adoption never performs that read and behaves exactly as it does today. One pre-OS-14
+behaviour is deliberately replaced: a **resumed model-aware** run used to deliver
+**unverified**, because the shipped recovery constructor reconstructed neither routing nor
+driver; it now stops `PAIR_PREPARATION_BINDING_UNVERIFIABLE` before any Task, terminal or
+Dispatch.
+
 ### Worker/Reviewer independence is admitted as a PAIR, before the first delivery
 
 `requested` is a **declaration**, not an observation, so two distinct declared models on one
@@ -560,6 +609,29 @@ risk the Reviewer entry exists but is optional and no Reviewer is ever dispatche
 is no pair to admit and a LOW-risk model-aware Worker routes unchanged — the same rule the
 PATH check follows: a role nobody dispatches must not fail a run. An unresolved *required*
 role is still `AGENT_ROLE_UNRESOLVED`'s business, not this gate's.
+
+**OS-14 — who performs the pair admission.** The lifecycle above is now executed by the
+Orca-adapter workflow path itself, inside `OrcaAdapter.start` and strictly before the Task
+is created: it prepares both sessions, verifies both identities, and refuses the whole
+attempt if either half fails. The predicate that decides whether a delivery needs an
+admitted pair is a single public derivation on the harness
+(`OrcaRuntimeHarness.pair_admission_required`), read by the adapter and copied nowhere, and
+the same-command condition it rests on is one private helper read by all three of its call
+sites — so the declaration gate, the delivery barrier's backstop and the workflow path
+cannot disagree about which pairs the rule covers.
+
+**Reviewer SESSION preparation is distinct from Reviewer TASK execution.** The Reviewer's
+session is brought up with the Worker's, before the first delivery, because that is what
+pair admission requires. Its **Task**, **Dispatch** and `worker-start` appear only at the
+Reviewer's own graph turn, after the Worker's result has been applied — no dependency is
+bypassed and nothing is force-ready. A correction or re-review round is a different gate
+round, prepares a **fresh** pair under its own key, and is admitted only on evidence
+re-earned during that round.
+
+**Unaffected: distinct-command and LOW-risk model-aware runs, and model-less runs.** None of
+them has a pair to admit, so none of them prepares anything: the command sequence is
+byte-identical to before OS-14, with the single run-root launch record described in the
+fail-closed section as the only delta.
 
 ### Session reuse is model-bound
 
@@ -639,6 +711,24 @@ that run at all. This can refuse nothing a same-run pair did before — a same-r
 `model_selection_pair_unadmitted`, which is the fail-closed outcome.
 
 ### What remains for OS-14
+
+OS-14 is split into two tracks, and only one of them is implemented.
+
+**TRACK A — implemented.** The common Worker/Reviewer pair preparation described above:
+preparation, dual verification and pair admission performed by the normal Orca-adapter
+workflow, with durable preparation provenance, re-entry/restart guarantees and named
+fail-closed refusals. It is driven by the **reference** driver, which is evidence about the
+wiring only.
+
+**TRACK B — DESIGN ONLY, nothing implemented.** `docs/OS-14-claude-driver-design.md` is the
+design for a real Claude Code model-selection driver: request semantics, evidence and
+validity windows, execution lifetime, and the attachment target, together with the coupled
+code boundaries and the decisions that remain open. **No real driver, no interactive
+model-switch experiment and no company-environment work is implemented by it**, and a
+declared model on a real placement stays refused exactly as the fail-closed section above
+states.
+
+The items below remain open for a real environment:
 
 - company-environment verification of model-aware routing; **nothing here claims it**
 - which of GLM-5.2 and GLM-5.3-flash should be Worker and which Reviewer

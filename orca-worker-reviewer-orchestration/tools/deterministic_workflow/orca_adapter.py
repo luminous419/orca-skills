@@ -7,6 +7,7 @@ from typing import Any, Callable
 
 from . import artifact_identity
 from . import pause_policy
+from . import pause_store
 from .contracts import (BASE_CAPABILITIES, EXTERNAL_LOOKUP, LIFECYCLE_SETTLEMENT,
                         ActionIntent, ExternalLookupUnavailable, SettlementEvent,
                         make_settlement_event)
@@ -19,6 +20,60 @@ WORKTREE_ALIASES = frozenset({"current", "active"})
 # OS-37 D-1 / WI-02.  The named refusal ``interrupt`` returns.  A refusal with a name is
 # handleable; an unnamed CLI failure invoking a nonexistent verb is not.
 ORCA_INTERRUPT_PRIMITIVE_ABSENT = "ORCA_INTERRUPT_PRIMITIVE_ABSENT"
+
+# ---- OS-14 pair preparation ----------------------------------------------------------
+#: Fixed order => deterministic logs and a deterministic create sequence.
+_PAIR_ROLES = ("worker", "reviewer")
+#: Mirrors `start`'s own `mode` derivation.
+_PAIR_ROLE_MODES = {"worker": "complete", "reviewer": "pass"}
+
+PAIR_PREPARATION_REFUSAL_CODES = frozenset({        # CLOSED.  The complete set.
+    "PAIR_PREPARATION_LAUNCH_RECORD_ABSENT",   # neither record nor entry proves anything
+    "PAIR_PREPARATION_BINDING_LOST",           # entries exist, the record does not
+    "PAIR_PREPARATION_BINDING_UNVERIFIABLE",   # this process cannot verify the binding
+    "PAIR_PREPARATION_BINDING_MISMATCH",       # a different routing, DRIVER or launch kind
+    "PAIR_PREPARATION_RECORD_CORRUPT",         # incl. an older schema_version
+    "PAIR_PREPARATION_OWNERSHIP_MISMATCH",     # the entry names a different run
+    "PAIR_PREPARATION_OUTCOME_UNKNOWN",        # neither success nor confirmed absence
+    "PAIR_PREPARATION_SESSION_UNVERIFIED",     # title matched, digest did not
+    "PAIR_PREPARATION_SESSION_ABSENT",         # provably gone
+    "PAIR_PREPARATION_SCOPE_UNRESOLVED",       # the scope could not be established
+    "PAIR_PREPARATION_SESSION_NOT_DISTINCT",   # one handle for both roles
+    "PAIR_PREPARATION_MODEL_DRIFT",            # cross-process model drift
+    "PAIR_PREPARATION_MODEL_UNOBSERVED",       # mandatory re-verification left no
+                                               # readable resolved model
+})
+
+
+def _OrcaCommandRefused() -> type[BaseException]:
+    """The typed refusal class, resolved lazily; ``Exception`` when the runtime is absent.
+
+    This package deliberately takes no module-import-time dependency on
+    ``scripts/orca_runtime_harness.py`` (see ``fake_adapter._import_orca_runtime``).
+    Resolving to ``Exception`` cannot weaken anything: the generic ``except Exception`` arm
+    already refuses with ``PAIR_PREPARATION_OUTCOME_UNKNOWN``, so a missing runtime can
+    only make a verdict MORE conservative, never less.
+    """
+    try:  # repository layout
+        from scripts.orca_runtime_harness import OrcaCommandRefused
+    except ImportError:  # pragma: no cover - flat installed layout
+        try:
+            from orca_runtime_harness import OrcaCommandRefused  # type: ignore[no-redef]
+        except ImportError:
+            return Exception
+    return OrcaCommandRefused
+
+
+def _unknown_create_detail(exc: BaseException) -> str:
+    """What an UNKNOWN creation outcome is allowed to say about itself.
+
+    The exception TYPE is the verdict; the text is only the message.  No private recorder
+    state, no `lifecycle_commands()`, no `self._raw` is read.
+    """
+    return (f"the terminal create for a prepared session did not report an outcome this "
+            f"process could read ({type(exc).__name__}: {exc}); a session may or may not "
+            "exist, so this is NEITHER success NOR confirmed absence and no durable "
+            "result was recorded")
 
 
 def _default_result_parser(attempt: Any, intent: ActionIntent) -> dict[str, Any]:
@@ -42,7 +97,8 @@ class OrcaAdapter:
     def __init__(self, harness: Any,
                  result_parser: Callable[[Any, ActionIntent], dict[str, Any]] | None = None,
                  runtime_state: Any = None, settlement_journal: Any = None,
-                 approval_port: Any = None):
+                 approval_port: Any = None,
+                 pair_binding: Any = None, pair_preparation: Any = None):
         self.harness = harness
         # OS-42: the default parser now TRANSPORTS an agent's decision-gate output into
         # `result["gate"]` instead of refusing any body that is not JSON. A JSON body
@@ -55,6 +111,13 @@ class OrcaAdapter:
         # Coordinator does not have.
         self.settlement_journal = settlement_journal
         self.approval_port = approval_port
+        # OS-14: the run's LAUNCH RECORD (read-only here; only the launcher writes one)
+        # and the per-(phase, gate_iteration, role) PREPARATION entries.  Both default to
+        # None so every existing construction binds unchanged, and when `pair_binding` is
+        # None the binding check does not run at all -- that is the FEATURE being unwired,
+        # a construction-level axis deliberately separate from the run-root axis.
+        self.pair_binding = pair_binding
+        self.pair_preparation = pair_preparation
         self._receipts: dict[str, dict[str, Any]] = {}
         self._events: dict[str, SettlementEvent] = {}
 
@@ -95,6 +158,15 @@ class OrcaAdapter:
         before any Run exists, and a declared model that somehow reached a dispatch would be
         refused again at the pre-delivery barrier.  Supplying the first adapter that can
         honestly declare both legs is OS-14's work, not OS-49's.
+
+        OS-14 PRECISION, because the pair-preparation work could otherwise be misread as
+        changing this answer: this adapter now PREPARES and VERIFIES a Worker/Reviewer pair
+        through the harness's injected ``model_driver`` seam, and that changes NOTHING here.
+        The token still says what THIS adapter can request and observe BY ITSELF, and the
+        answer is still neither: the request and the observation belong to the driver, the
+        driver is injected rather than named here, and a run with no driver stays refused at
+        the declaration gate.  Wiring the two OS-14 pair stores declares no token either --
+        ``LIFECYCLE_SETTLEMENT`` still hangs off ``settlement_journal`` and off nothing else.
         """
         offered = BASE_CAPABILITIES | frozenset(
             {"dispatch_provenance", "dependency_edges", "runtime_ownership", EXTERNAL_LOOKUP}
@@ -186,17 +258,8 @@ class OrcaAdapter:
                 raise ValueError("IDEMPOTENCY_CONFLICT")
             return deepcopy(existing)
         spec = json.dumps(intent, sort_keys=True, separators=(",", ":"))
-        # ---- E0: the PLANNED row, written BEFORE `task-create` ----
-        # Not one field of it is a runtime observation of an effect -- role, origin, the
-        # run-unique title and the stable worktree selector are all this caller's own
-        # choice -- so not one field of it can be lost with the effect.
-        planned = self._journal_planned(intent)
-        task_id = self.harness.create_task(spec)
-        # The external Task now exists.  Record its durable identity immediately so a crash
-        # before the dispatch settles cannot look like "never started" on the next process.
-        self._record_receipt(intent, {"task_id": task_id}, lease_token)
-        self._journal(intent["intent_id"], stage="OPENED", task_id=task_id,
-                      opened_at=_now())
+        # ---- two PURE derivations, hoisted from below.  No I/O, no effect. ----
+        role = self._role(intent)
         # OS-42 F-001: read the ONE derivation. `validate_settlement_node` binds the
         # returned record with the identical call, so ingress and egress cannot drift.
         phase = artifact_identity.contract_phase(intent["role"], intent["phase"])
@@ -207,10 +270,39 @@ class OrcaAdapter:
         # so the dispatched task context, the artifact path and the applied result can no
         # longer disagree about which gate attempt this was.
         iteration = intent["gate_iteration"]
+        # ---- OS-14: the LAUNCH-RECORD check.  UNCONDITIONAL, before ANY effect, and
+        #      deliberately OUTSIDE the pair_admission_required guard. ----
+        self._assert_preparation_binding(intent)
+        prepare = (self.pair_preparation is not None
+                   and self._pair_admission_required(role, phase))
+        # ---- E0: the PLANNED row, written BEFORE `task-create` ----
+        # Not one field of it is a runtime observation of an effect -- role, origin, the
+        # run-unique title and the stable worktree selector are all this caller's own
+        # choice -- so not one field of it can be lost with the effect.
+        planned = self._journal_planned(
+            intent,
+            pair_title=(self._pair_terminal_title(phase=phase, attempt=iteration,
+                                                  role=role) if prepare else None))
+        # ---- OS-14: PAIR PREPARATION, strictly BEFORE create_task ----
+        # The only placement that keeps the same-process retry working: the durable
+        # receipt is written only AFTER `create_task`, so a preparation failure leaves the
+        # runtime record at CLAIMED and `_recover` takes the LOOKUP rung and re-runs
+        # `start` instead of stopping at IDEMPOTENCY_RECOVERY_UNSUPPORTED.
+        prepared = (self._prepare_pair(phase=phase, attempt=iteration, planned=planned)
+                    if prepare else {})
+        task_id = self.harness.create_task(spec)
+        # The external Task now exists.  Record its durable identity immediately so a crash
+        # before the dispatch settles cannot look like "never started" on the next process.
+        self._record_receipt(intent, {"task_id": task_id}, lease_token)
+        self._journal(intent["intent_id"], stage="OPENED", task_id=task_id,
+                      opened_at=_now())
         mode = "complete" if intent["role"] == "WORKER" else "pass"
         attempt, terminal = self.harness.run_existing_task(
-            self._role(intent), iteration, mode, task_id,
+            role, iteration, mode, task_id,
             phase=phase, spec=spec, round_kind=intent["round_kind"].lower(),
+            # `None` is `run_existing_task`'s own default, so the non-prepared path is
+            # byte-identical: a prepared handle suppresses the lazy create, nothing else.
+            terminal=prepared.get(role),
             terminal_title=(planned or {}).get("terminal_title"),
             terminal_worktree=(planned or {}).get("terminal_worktree"),
             terminal_observer=(self._journal_intended(intent["intent_id"])
@@ -258,8 +350,21 @@ class OrcaAdapter:
                 "would produce a row that LOOKS recoverable and is not")
         return f"id:{worktree_id}"
 
-    def _journal_planned(self, intent: ActionIntent) -> dict[str, Any] | None:
-        """Refuse BEFORE E1 rather than fall back to the alias: nothing is made, nothing leaks."""
+    def _journal_planned(self, intent: ActionIntent, *,
+                         pair_title: str | None = None) -> dict[str, Any] | None:
+        """Refuse BEFORE E1 rather than fall back to the alias: nothing is made, nothing leaks.
+
+        OS-14: on the pair-admission path the row carries the PREPARED title, because
+        `terminal=<prepared handle>` means `create_fake_terminal` does not run inside
+        `run_existing_task` and the title seam is unused for that dispatch -- while
+        `terminal_observer` still writes INTENDED with the prepared handle's digest.  With
+        the row's title left at `os31-{run}-{intent}` the row would hold a digest for a
+        session whose title it does not name, and `recover_handle` would title-narrow to
+        ZERO candidates and report `not_listed` -- claiming a live session is gone.
+        `pair_title` is computed from the intent alone, so it is available BEFORE
+        preparation runs, and it is `None` on every routing-less path (where the
+        expression below is the current literal, byte for byte).
+        """
         if self.settlement_journal is None:
             return None
         run_id = getattr(self.harness, "run_id", "") or ""
@@ -268,13 +373,260 @@ class OrcaAdapter:
         self._journal(
             intent_id, stage="PLANNED", run_id=run_id,
             payload_digest=intent["payload_digest"],
-            terminal_title=f"os31-{run_id}-{intent_id}",
+            terminal_title=(pair_title or f"os31-{run_id}-{intent_id}"),
             terminal_worktree=self.origin_worktree_selector(),
             terminal_role="active_worker", terminal_origin="self_created",
             terminal_intended_role=role, terminal_owner=run_id or intent_id,
             created_by=run_id or intent_id, provenance_source="journal",
             planned_at=_now())
         return self.settlement_journal.row(intent_id)
+
+    # ---- OS-14: pair preparation -----------------------------------------------------
+    def _pair_admission_required(self, role: str, phase: str) -> bool:
+        """Read the HARNESS's predicate; keep no second copy."""
+        predicate = getattr(self.harness, "pair_admission_required", None)
+        return bool(predicate(role, phase)) if callable(predicate) else False
+
+    def _pair_terminal_title(self, *, phase: str, attempt: Any, role: str) -> str:
+        run_id = getattr(self.harness, "run_id", "") or ""
+        return f"{run_id}-pair-{phase}-{attempt}-{role}"
+
+    def _refuse_preparation(self, code: str, message: str) -> None:
+        """The ONE exit for every new refusal.  Returns nothing: it always raises.
+
+        ``IdempotencyRecoveryError`` is the shipped adapter -> BLOCKED projection
+        (``executor.py``: "``code`` is the terminal reason a caller projects onto a BLOCKED
+        terminal state"), and ``launcher.execute_state`` performs that projection.  Raising
+        it from an adapter is already done twice in ``standalone_adapter.py`` behind the
+        same lazy import.
+        """
+        assert code in PAIR_PREPARATION_REFUSAL_CODES, code    # a typo cannot ship
+        from .executor import IdempotencyRecoveryError          # lazy, as standalone does
+        raise IdempotencyRecoveryError(code, message)
+
+    def _assert_preparation_binding(self, intent: ActionIntent) -> None:
+        """Require a POSITIVE durable statement before taking ANY non-blocking path.
+
+        Deliberately OUTSIDE the pair-admission guard: a successor built with no routing
+        answers ``False`` to that predicate, so a check placed inside it would never run --
+        which is exactly how the shipped adoption path delivered unverified before OS-14.
+        """
+        if self.pair_binding is None:
+            return                  # the FEATURE is unwired (construction-level axis)
+        try:
+            binding = self.pair_binding.binding()
+            prepared_any = (self.pair_preparation is not None
+                            and self.pair_preparation.has_any())
+        except pause_store.PauseStoreError as exc:   # incl. PairPreparationCorrupt
+            self._refuse_preparation("PAIR_PREPARATION_RECORD_CORRUPT", str(exc))
+            return
+        if binding is None:
+            if prepared_any:
+                self._refuse_preparation(
+                    "PAIR_PREPARATION_BINDING_LOST",
+                    "preparation entries exist for this run but its run-root launch "
+                    "record does not; an entry can only exist if the record was written "
+                    "first, so the record has been LOST -- never a legacy run")
+            self._refuse_preparation(
+                "PAIR_PREPARATION_LAUNCH_RECORD_ABSENT",
+                "no launch record and no preparation entry: nothing proves whether this "
+                "run was launched model-aware, and an absence is not a verdict in either "
+                "direction.  Relaunch the run (nothing was prepared under it)")
+            return
+        # The ONE derivation, resolved DEFENSIVELY and only now -- after the two
+        # absent-record rows above, which do not consult it at all, so a harness that
+        # cannot answer never hides `PAIR_PREPARATION_BINDING_LOST` or
+        # `PAIR_PREPARATION_LAUNCH_RECORD_ABSENT` behind an AttributeError.
+        #
+        # A harness that does not implement `routing_binding()` cannot STATE its own
+        # routing identity, so this process cannot verify the run's launch binding: that is
+        # an unanswered question, and the answer to an unanswered question here is a NAMED
+        # refusal, never a crash and never a pass.  Same discipline as
+        # `_pair_admission_required` above (which reads its predicate through `getattr`)
+        # and as `OrcaRuntimeHarness._routing_is_model_aware` (which reads an object that
+        # cannot answer as model-AWARE): an undeclared fact is unknown, not false.
+        derive = getattr(self.harness, "routing_binding", None)
+        if not callable(derive):
+            self._refuse_preparation(
+                "PAIR_PREPARATION_BINDING_UNVERIFIABLE",
+                "this process's harness cannot state its own routing identity "
+                f"({type(self.harness).__name__} implements no routing_binding()), so "
+                "this run's launch record cannot be reconciled against anything")
+        live = derive()
+        if binding["model_aware"] == "false":
+            if live["model_aware"] == "true":
+                self._refuse_preparation(
+                    "PAIR_PREPARATION_BINDING_MISMATCH",
+                    "this run was LAUNCHED legacy and this process holds a model-aware "
+                    "routing; a run is not re-bound to a different kind of launch mid-run")
+            return                  # LEGACY -- authorised by a POSITIVE statement
+        if live["model_aware"] != "true":
+            self._refuse_preparation(
+                "PAIR_PREPARATION_BINDING_UNVERIFIABLE",
+                "this run was launched model-aware and this process holds no model-aware "
+                "routing, so its routing/driver binding cannot be verified")
+        # ---- the FULL launch identity, cell by cell, BEFORE any effect ---------------
+        # Driven off the key tuple itself, so a cell added to the record later is compared
+        # by construction rather than being silently ignored.
+        for key in pause_store.PAIR_LAUNCH_IDENTITY_KEYS:
+            if live[key] != binding[key]:
+                self._refuse_preparation(
+                    "PAIR_PREPARATION_BINDING_MISMATCH",
+                    f"this run's launch record binds {key}={binding[key]!r} and this "
+                    f"process holds {live[key]!r}: a DIFFERENT launch identity under this "
+                    "run's own name.  The routing AND the driver are both part of that "
+                    "identity -- a run is not re-bound to a different model-selection "
+                    "driver mid-run, and past verified evidence is never restored as this "
+                    "process's verification success")
+
+    def _prepare_pair(self, *, phase: str, attempt: Any,
+                      planned: dict[str, Any] | None) -> dict[str, str]:
+        """Prepare BOTH roles of this gate round; return ``{role: handle}``.
+
+        Creates no Task, no Dispatch, and SENDS NOTHING to any session.  Session creation,
+        ledger adoption and verification only -- the adoption is a write to THIS process's
+        in-memory terminal ledger and issues no ``orca`` command.
+        """
+        store = self.pair_preparation
+        run_id = getattr(self.harness, "run_id", "") or ""
+        selector = ((planned or {}).get("terminal_worktree")
+                    or self.origin_worktree_selector())
+        try:
+            entries = {role: store.entry(phase, attempt, role) for role in _PAIR_ROLES}
+        except pause_store.PauseStoreError as exc:
+            self._refuse_preparation("PAIR_PREPARATION_RECORD_CORRUPT", str(exc))
+            raise                                   # unreachable; _refuse always raises
+        # The listing is read ONCE, and ONLY when something was already prepared: a first
+        # pass has no title and no digest to resolve, so it issues no `terminal list`.
+        listing: Any = None
+        scope_resolved = True
+        if any(entry is not None for entry in entries.values()):
+            listing, scope_resolved = self._prepared_listing(selector)
+        handles: dict[str, str] = {}
+        for role in _PAIR_ROLES:
+            handles[role] = self._prepare_role(
+                role=role, phase=phase, attempt=attempt, selector=selector,
+                run_id=run_id, store=store, entry=entries[role],
+                listing=listing, scope_resolved=scope_resolved)
+        if len(set(handles.values())) != len(handles):
+            self._refuse_preparation(
+                "PAIR_PREPARATION_SESSION_NOT_DISTINCT",
+                f"the runtime returned ONE handle for both roles of {phase!r} attempt "
+                f"{attempt}; one physical session cannot be both sides of a pair")
+        # ---- verification: BOTH roles, UNCONDITIONALLY, on EVERY pass ---------------
+        for role in _PAIR_ROLES:
+            previous = (entries[role] or {}).get("resolved_model_observed") or ""
+            declared = self.harness.resolved_agent_model(role, phase)
+            self.harness.verify_model_identity("", handles[role], role=role, phase=phase,
+                                               attempt=attempt)
+            # The accepted canonical result, through the PUBLIC accessor, which works for
+            # a handle created in THIS process and for an ADOPTED one alike -- because
+            # `_prepare_role` registered the adopted handle BEFORE this call.
+            resolved = self.harness.ledger_terminal(handles[role]).get(
+                "resolved_model") or ""
+            if declared and not resolved:
+                # FAIL CLOSED: an unregistered handle reads back as the synthetic
+                # `unknown_role` row, which carries no `resolved_model` key at all, so a
+                # missing adoption would otherwise surface as a silent "" -- skipping the
+                # drift comparison AND erasing the durable observation.
+                self._refuse_preparation(
+                    "PAIR_PREPARATION_MODEL_UNOBSERVED",
+                    f"{phase!r} attempt {attempt} {role}: the routing declares "
+                    f"{declared!r} and this process's re-verification left no readable "
+                    "resolved model for the session; nothing is adopted, refreshed or "
+                    "recorded on an unobservable verification")
+            if previous and resolved and previous != resolved:
+                # BEFORE any write: the prior durable observation is still on disk when
+                # this refuses, so the next reader -- and the operator -- can still see
+                # what the run originally observed.
+                self._refuse_preparation(
+                    "PAIR_PREPARATION_MODEL_DRIFT",
+                    f"{phase!r} attempt {attempt} {role}: this run's durable record "
+                    f"observed {previous!r} and this process re-verified {resolved!r}; "
+                    "the in-process drift leg is empty after a restart, so this is the "
+                    "only place the change is visible")
+            # PRESERVE-UNTIL-COMPARED.  Reached only when the comparison SUCCEEDED
+            # (equal, or no prior observation).  `resolved_model_observed` is supplied
+            # ONLY when it is non-empty: `record()` merges the supplied cells and leaves
+            # every other cell as it stands, so an undeclared role's pass refreshes the
+            # stage and the timestamp without overwriting a stored observation with "".
+            store.record(phase, attempt, role, stage="VERIFIED",
+                         observed_at_run=run_id, verified_at=_now(),
+                         **({"resolved_model_observed": resolved} if resolved else {}))
+        return handles
+
+    def _prepare_role(self, *, role: str, phase: str, attempt: Any, selector: str,
+                      run_id: str, store: Any, entry: dict[str, Any] | None,
+                      listing: Any, scope_resolved: bool) -> str:
+        verdict = pause_policy.resolve_prepared_terminal(
+            entry, listing, run_id=run_id, scope_resolved=scope_resolved)
+        if verdict["action"] == "adopt":
+            # A RECORD HIT creates nothing -- but it must be REGISTERED before anything
+            # reads harness ledger state for it.  Idempotent: a handle this process
+            # created is already in the ledger and keeps its own provenance.
+            self.harness.adopt_prepared_terminal(verdict["handle"], role, phase=phase)
+            return verdict["handle"]
+        if verdict["action"] == "block":
+            self._refuse_preparation(
+                verdict["code"],
+                f"{phase!r} attempt {attempt} {role}: stage="
+                f"{(entry or {}).get('stage', 'absent')!r} "
+                f"handle_recovery={verdict['handle_recovery']!r} "
+                f"candidate={verdict.get('candidate_handle', '')!r}")
+        create_attempt = (1 if entry is None
+                          else int(entry["create_attempt"])
+                          + (1 if entry["stage"] == "CREATE_REFUSED" else 0))
+        title = self._pair_terminal_title(phase=phase, attempt=attempt, role=role)
+        # ---- 1. INTENT, strictly BEFORE the external effect -------------------------
+        store.record(phase, attempt, role, stage="CREATE_INTENDED",
+                     create_attempt=str(create_attempt), terminal_title=title,
+                     terminal_worktree=selector,
+                     requested_model=self.harness.resolved_agent_model(role, phase),
+                     create_intended_at=_now())
+        # ---- 2. the ONLY external effect of preparation ------------------------------
+        try:
+            handle = self.harness.create_fake_terminal(
+                role, _PAIR_ROLE_MODES[role], iteration=attempt, phase=phase,
+                title=title, worktree=selector)
+        except _OrcaCommandRefused() as exc:
+            if getattr(exc, "command", ())[:2] == ("terminal", "create") and (
+                    getattr(exc, "ok", None) is False):
+                store.record(phase, attempt, role, stage="CREATE_REFUSED",
+                             create_settled_at=_now(),
+                             refusal_command=json.dumps(list(exc.command),
+                                                        separators=(",", ":")),
+                             refusal_error_code=exc.error_code,
+                             refusal_receipt_digest=exc.receipt_digest)
+                raise                                # the runtime's OWN error, unchanged
+            self._refuse_preparation("PAIR_PREPARATION_OUTCOME_UNKNOWN",
+                                     _unknown_create_detail(exc))
+        except Exception as exc:  # noqa: BLE001 - unknown is never confirmed absence
+            # NO durable write: the entry stays at CREATE_INTENDED, which IS the record of
+            # the uncertainty.  BaseException is NOT caught, so KeyboardInterrupt /
+            # SystemExit / GeneratorExit escape as themselves.
+            self._refuse_preparation("PAIR_PREPARATION_OUTCOME_UNKNOWN",
+                                     _unknown_create_detail(exc))
+        # ---- 3. IDENTITY, only AFTER observation -------------------------------------
+        store.record(phase, attempt, role, stage="CREATED", create_settled_at=_now(),
+                     terminal_digest=pause_policy.terminal_digest(handle))
+        return handle
+
+    def _prepared_listing(self, selector: str) -> tuple[Any, bool]:
+        """The I/O half, copied from ``recover_handle`` rather than re-invented."""
+        if not selector or selector in WORKTREE_ALIASES:
+            self._refuse_preparation(
+                "PAIR_PREPARATION_SCOPE_UNRESOLVED",
+                f"{selector!r} is an alias, not a stable id:<repo-id>::<path> selector")
+        try:
+            listing: Any = list(self.harness.list_terminals(worktree=selector))
+        except Exception:  # noqa: BLE001 - unreadable is unknown, never empty
+            return None, False
+        scope_resolved = True
+        if not listing:
+            resolved = self.harness.resolve_worktree(selector)
+            expected = selector.split("id:", 1)[-1]
+            scope_resolved = bool(resolved) and resolved.get("id") == expected
+        return listing, scope_resolved
 
     def _journal_intended(self, intent_id: str) -> Callable[[str], None]:
         def observer(handle: str) -> None:

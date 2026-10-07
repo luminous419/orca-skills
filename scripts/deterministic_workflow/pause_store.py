@@ -1,7 +1,7 @@
 """Tier-2 durable pause index, coordination fence, projection and settlement journal.
 
-Two durable files live here, both over the :mod:`durable_store` discipline (flock on a
-sidecar + ``fsync`` + ``os.replace``), and neither imports LangGraph or Orca (OS-31 §10.1):
+Four durable files live here, all over the :mod:`durable_store` discipline (flock on a
+sidecar + ``fsync`` + ``os.replace``), and none imports LangGraph or Orca (OS-31 §10.1):
 
 ``.pause_state.json``          one record per **run** -- discovery identity, claim/lease
                                fence, checkpoint pointer, disposition, applied set and the
@@ -10,6 +10,14 @@ sidecar + ``fsync`` + ``os.replace``), and neither imports LangGraph or Orca (OS
                                effect it describes, so a fresh process can reconstruct the
                                dispatch set and terminal provenance a dead process held
                                only in memory.
+``.pair_launch_binding.json``  OS-14: ONE record per run -- WHICH KIND of launch opened it
+                               (its routing identity and model-selection driver class),
+                               written at run OPEN for **every** Orca-adapter run so an
+                               absent record can never be mistaken for a legacy one.
+``.pair_preparation.json``     OS-14: one entry per (phase, gate_iteration, role) -- WHAT
+                               was prepared for a Worker/Reviewer pair, with the creation
+                               INTENT written before the external effect and the created
+                               session's identity written only after observing it.
 
 The pause record is **never** the authority for execution state.  That is the OS-40
 checkpoint (PLAN D2/F-001); ``projection`` is subordinate and is documented as such so no
@@ -805,3 +813,359 @@ def store_for(run_id: str, *, artifact_base: str | os.PathLike[str],
 
 def iter_journal_stages() -> Iterator[str]:
     yield from JOURNAL_STAGES
+
+
+# ======================================================================================
+# OS-14 pair preparation: the two NEW durable documents
+# ======================================================================================
+# ---- the launch binding: WHICH KIND of launch opened this run ------------------------
+PAIR_BINDING_SCHEMA_VERSION = "os14.pair_launch_binding.v1"
+PAIR_BINDING_FILENAME = ".pair_launch_binding.json"
+PAIR_BINDING_KEYS = (
+    "run_id", "runtime", "profile_name", "profile_source",
+    "routing_schema_version",      # decimal string; "0" / "" means no profile document
+    "routing_digest",              # "" iff model_aware == "false"
+    "model_aware",                 # the STRING "true" or "false" -- never a bool
+    "driver_type_id",              # the driver CLASS's normalised import path, "" for none
+    "recorded_by", "recorded_at",
+)
+PAIR_BINDING_MODEL_AWARE = ("true", "false")
+PAIR_BINDING_IDENTITY_KEYS = tuple(
+    key for key in PAIR_BINDING_KEYS if key not in ("recorded_by", "recorded_at"))
+#: The LAUNCH IDENTITY: exactly the cells ``harness.routing_binding()`` emits, which is
+#: exactly what ``OrcaAdapter._assert_preparation_binding`` compares on adoption.  Derived
+#: from PAIR_BINDING_KEYS rather than re-spelled, so a cell added to the record in a later
+#: schema version is COMPARED by construction instead of being silently ignored.
+PAIR_LAUNCH_IDENTITY_KEYS = tuple(
+    key for key in PAIR_BINDING_IDENTITY_KEYS if key != "run_id")
+
+# ---- the preparation entries: WHAT was prepared for which pair ----------------------
+PAIR_PREPARATION_SCHEMA_VERSION = "os14.pair_preparation.v1"
+PAIR_PREPARATION_FILENAME = ".pair_preparation.json"
+PAIR_PREPARATION_STAGES = ("CREATE_INTENDED", "CREATE_REFUSED", "CREATED", "VERIFIED")
+PAIR_PREPARATION_ROLES = ("worker", "reviewer")
+PAIR_ENTRY_KEYS = (
+    "run_id", "phase", "gate_iteration", "role",        # identity
+    "stage", "create_attempt",                          # progress (decimal strings)
+    "terminal_title", "terminal_worktree",              # INTENT -- before the effect
+    "terminal_digest",                                  # IDENTITY -- after observation
+    "requested_model",                                  # the routing's DECLARATION
+    "resolved_model_observed", "observed_at_run",       # prior-pass provenance
+    "refusal_command", "refusal_error_code", "refusal_receipt_digest",
+    "recorded_by",
+    "create_intended_at", "create_settled_at", "verified_at",
+)
+#: Cleared when a NEW create attempt is published, so a retry's ``CREATE_INTENDED`` never
+#: carries the previous attempt's observation or refusal.  Mirrors the harness's own
+#: ``_MODEL_ROW_CLEARED`` discipline.
+_PAIR_ENTRY_ATTEMPT_CLEARED = {
+    "terminal_digest": "", "refusal_command": "", "refusal_error_code": "",
+    "refusal_receipt_digest": "", "create_settled_at": "", "verified_at": "",
+}
+
+
+def _iso_now() -> str:
+    """The ONE ISO second-precision timestamp helper this module writes ``*_at`` cells with.
+
+    Same format as ``orca_adapter._now()`` and deliberately the same local-import shape.
+    NAMED DIFFERENTLY from :meth:`FilePauseRecordStore._now`, which is an INSTANCE method
+    returning the lease clock's FLOAT and is untouched: two different things may not share
+    one name in one module.
+    """
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class PairPreparationCorrupt(PauseStoreError):
+    """A pair launch record or preparation entry fails its own closed schema.
+
+    Never read as "nothing was prepared" and never as "a legacy run": an unreadable
+    authority is not an absent one.  :class:`PauseStoreError` is a ``ValueError`` subclass,
+    so catching it cannot swallow control flow.
+    """
+
+
+def pair_binding_path(run_id: str, *,
+                      artifact_base: str | os.PathLike[str]) -> Path:
+    return run_root(artifact_base, run_id) / PAIR_BINDING_FILENAME
+
+
+def pair_preparation_path(run_id: str, *,
+                          artifact_base: str | os.PathLike[str]) -> Path:
+    return run_root(artifact_base, run_id) / PAIR_PREPARATION_FILENAME
+
+
+def validate_pair_binding(run_id: str, binding: Any) -> dict[str, Any]:
+    """Whole-or-nothing, byte-for-byte the discipline of :func:`validate_journal_row`."""
+    if not isinstance(binding, Mapping) or set(binding) != set(PAIR_BINDING_KEYS):
+        raise PairPreparationCorrupt(
+            "PAIR_BINDING_CORRUPT:closed fields: "
+            f"{sorted(binding) if isinstance(binding, Mapping) else type(binding).__name__}")
+    for key in PAIR_BINDING_KEYS:                       # EVERY value is a str
+        if not isinstance(binding[key], str):
+            raise PairPreparationCorrupt(f"PAIR_BINDING_CORRUPT:{key} type")
+    if not binding["run_id"] or binding["run_id"] != run_id:
+        raise PairPreparationCorrupt(
+            f"PAIR_BINDING_CORRUPT:identity {binding['run_id']!r} != {run_id!r}")
+    if binding["model_aware"] not in PAIR_BINDING_MODEL_AWARE:
+        raise PairPreparationCorrupt(
+            f"PAIR_BINDING_CORRUPT:model_aware {binding['model_aware']!r}")
+    if binding["model_aware"] == "true" and not binding["routing_digest"]:
+        raise PairPreparationCorrupt(
+            "PAIR_BINDING_CORRUPT:model-aware without a digest")
+    if binding["model_aware"] == "false" and (binding["routing_digest"]
+                                              or binding["driver_type_id"]):
+        raise PairPreparationCorrupt(
+            "PAIR_BINDING_CORRUPT:a legacy launch statement carries no routing digest "
+            "and no driver")
+    return dict(binding)
+
+
+def new_pair_binding(**fields: Any) -> dict[str, Any]:
+    binding: dict[str, Any] = {key: "" for key in PAIR_BINDING_KEYS}
+    binding["model_aware"] = "false"
+    binding.update(fields)
+    return validate_pair_binding(binding["run_id"], binding)
+
+
+def pair_key(phase: Any, gate_iteration: Any) -> str:
+    """``<phase>#<gate_iteration>`` -- ONE pair per gate round.  ``#`` is reserved."""
+    if "#" in str(phase):
+        raise PairPreparationCorrupt(
+            "PAIR_PREPARATION_CORRUPT:phase may not contain '#'")
+    return f"{phase}#{gate_iteration}"
+
+
+def validate_pair_entry(entry: Any) -> dict[str, Any]:
+    """Whole-or-nothing, the same discipline as :func:`validate_journal_row`."""
+    if not isinstance(entry, Mapping) or set(entry) != set(PAIR_ENTRY_KEYS):
+        raise PairPreparationCorrupt(
+            "PAIR_PREPARATION_CORRUPT:entry closed fields: "
+            f"{sorted(entry) if isinstance(entry, Mapping) else type(entry).__name__}")
+    for key in PAIR_ENTRY_KEYS:
+        if not isinstance(entry[key], str):
+            raise PairPreparationCorrupt(f"PAIR_PREPARATION_CORRUPT:{key} type")
+    if entry["stage"] not in PAIR_PREPARATION_STAGES:
+        raise PairPreparationCorrupt(
+            f"PAIR_PREPARATION_CORRUPT:unknown stage {entry['stage']!r}")
+    if entry["role"] not in PAIR_PREPARATION_ROLES:
+        raise PairPreparationCorrupt(
+            f"PAIR_PREPARATION_CORRUPT:unknown role {entry['role']!r}")
+    for key in ("run_id", "phase", "gate_iteration", "role"):
+        if not entry[key]:
+            raise PairPreparationCorrupt(f"PAIR_PREPARATION_CORRUPT:identity {key}")
+    if "#" in entry["phase"]:
+        raise PairPreparationCorrupt(
+            "PAIR_PREPARATION_CORRUPT:phase may not contain '#'")
+    for key in ("gate_iteration", "create_attempt"):
+        value = entry[key]
+        if not value.isdigit() or int(value) < 1:
+            raise PairPreparationCorrupt(
+                f"PAIR_PREPARATION_CORRUPT:{key} {value!r} is not a decimal >= 1")
+    return dict(entry)
+
+
+def new_pair_entry(**fields: Any) -> dict[str, Any]:
+    entry: dict[str, Any] = {key: "" for key in PAIR_ENTRY_KEYS}
+    entry["stage"] = "CREATE_INTENDED"
+    entry["create_attempt"] = "1"
+    entry.update(fields)
+    return validate_pair_entry(entry)
+
+
+class FilePairBindingStore:
+    """The run's LAUNCH RECORD.  Written ONCE, at run OPEN, by the launcher.
+
+    An adoption NEVER writes one -- a successor may not manufacture the authority it is
+    supposed to be checked against.
+    """
+
+    def __init__(self, path: str | os.PathLike[str], *, run_id: str,
+                 owner_id: str | None = None, clock: Any | None = None,
+                 lock_timeout_seconds: float = DEFAULT_LOCK_TIMEOUT_SECONDS) -> None:
+        try:
+            self._section = FileCriticalSection(path, clock=clock,
+                                                lock_timeout_seconds=lock_timeout_seconds)
+        except LockUnavailable as exc:  # pragma: no cover - non-POSIX hosts only
+            raise PauseStoreLockUnavailable(str(exc)) from exc
+        self.path = Path(path)
+        self.run_id = run_id
+        self.owner_id = owner_id or default_owner_id()
+
+    def _read(self) -> dict[str, Any] | None:
+        document = read_json_document(self.path,
+                                      schema_version=PAIR_BINDING_SCHEMA_VERSION,
+                                      corrupt_exc=PairPreparationCorrupt)
+        if not document:
+            return None                        # ABSENT -- and absence is no verdict
+        if set(document) - {"schema_version", "binding"}:
+            raise PairPreparationCorrupt("PAIR_BINDING_CORRUPT:top-level keys")
+        return validate_pair_binding(self.run_id, document.get("binding"))
+
+    def binding(self) -> dict[str, Any] | None:
+        with self._section.locked():
+            found = self._read()
+            return deepcopy(found) if found is not None else None
+
+    def record_binding(self, **fields: Any) -> dict[str, Any]:
+        """Create-once.  Identical identity cells re-record as a no-op; a DIFFERING one
+        raises, exactly as ``launcher.check_standalone_authority`` refuses to silently
+        re-bind a standalone launch.
+        """
+        candidate = new_pair_binding(run_id=self.run_id, recorded_by=self.owner_id,
+                                     recorded_at=_iso_now(), **fields)
+        with self._section.locked():
+            existing = self._read()
+            if existing is not None:
+                if any(existing[key] != candidate[key]
+                       for key in PAIR_BINDING_IDENTITY_KEYS):
+                    raise PairPreparationCorrupt(
+                        "PAIR_BINDING_CONFLICT:this run is already bound to a different "
+                        "launch record; a run is not re-bound to a different kind of "
+                        "launch, or a different routing, under its own name")
+                return deepcopy(existing)      # the FIRST record's provenance stands
+            write_json_document(self.path, {
+                "schema_version": PAIR_BINDING_SCHEMA_VERSION, "binding": candidate})
+            return deepcopy(candidate)
+
+
+class FilePairPreparationStore:
+    """One row per ``(phase, gate_iteration, role)``.
+
+    NOT the settlement journal: it is deliberately absent from
+    ``OrcaAdapter.capabilities()`` and changes no journal stage.
+    ``PAIR_PREPARATION_STAGES`` is this document's OWN closed set and does not touch,
+    alias or reinterpret :data:`JOURNAL_STAGES`.
+    """
+
+    def __init__(self, path: str | os.PathLike[str], *, run_id: str,
+                 owner_id: str | None = None, clock: Any | None = None,
+                 lock_timeout_seconds: float = DEFAULT_LOCK_TIMEOUT_SECONDS) -> None:
+        try:
+            self._section = FileCriticalSection(path, clock=clock,
+                                                lock_timeout_seconds=lock_timeout_seconds)
+        except LockUnavailable as exc:  # pragma: no cover - non-POSIX hosts only
+            raise PauseStoreLockUnavailable(str(exc)) from exc
+        self.path = Path(path)
+        self.run_id = run_id
+        self.owner_id = owner_id or default_owner_id()
+
+    def _read(self) -> dict[str, Any]:
+        document = read_json_document(self.path,
+                                      schema_version=PAIR_PREPARATION_SCHEMA_VERSION,
+                                      corrupt_exc=PairPreparationCorrupt)
+        if not document:
+            return {}
+        if set(document) - {"schema_version", "pairs"}:
+            raise PairPreparationCorrupt("PAIR_PREPARATION_CORRUPT:top-level keys")
+        pairs = document.get("pairs")
+        if not isinstance(pairs, dict):
+            raise PairPreparationCorrupt("PAIR_PREPARATION_CORRUPT:pairs container")
+        for key, slot in pairs.items():
+            if not isinstance(slot, dict):
+                raise PairPreparationCorrupt("PAIR_PREPARATION_CORRUPT:pair container")
+            for role, entry in slot.items():
+                validated = validate_pair_entry(entry)
+                # Row identity, exactly as the journal checks it: the cells must agree
+                # with the key they are filed under.
+                if (role != validated["role"]
+                        or pair_key(validated["phase"],
+                                    validated["gate_iteration"]) != key):
+                    raise PairPreparationCorrupt(
+                        "PAIR_PREPARATION_CORRUPT:entry identity")
+        return pairs
+
+    def _write(self, pairs: dict[str, Any]) -> None:
+        for slot in pairs.values():
+            for entry in slot.values():
+                validate_pair_entry(entry)
+        write_json_document(self.path, {
+            "schema_version": PAIR_PREPARATION_SCHEMA_VERSION, "pairs": pairs})
+
+    def pairs(self) -> dict[str, dict[str, dict[str, Any]]]:
+        with self._section.locked():
+            return deepcopy(self._read())
+
+    def entry(self, phase: Any, gate_iteration: Any,
+              role: str) -> dict[str, Any] | None:
+        key = pair_key(phase, gate_iteration)
+        with self._section.locked():
+            found = self._read().get(key, {}).get(role)
+            return deepcopy(found) if found is not None else None
+
+    def has_any(self) -> bool:
+        """"Any entry at all exists".
+
+        Used for EXACTLY ONE purpose: separating a LOST launch record from an ABSENT one.
+        It may never decide that a run is legacy -- only a positive
+        ``binding()["model_aware"] == "false"`` may do that.
+        """
+        with self._section.locked():
+            return any(slot for slot in self._read().values())
+
+    def record(self, phase: Any, gate_iteration: Any, role: str, *,
+               stage: str, **fields: Any) -> dict[str, Any]:
+        """Write or promote one whole entry.
+
+        Promotion is monotonic on ``(create_attempt, PAIR_PREPARATION_STAGES.index(stage))``.
+        Re-recording ``VERIFIED`` on a later pass is rank-equal, hence permitted, and
+        refreshes ``resolved_model_observed`` / ``verified_at``.
+        """
+        if stage not in PAIR_PREPARATION_STAGES:
+            raise PairPreparationCorrupt(
+                f"PAIR_PREPARATION_CORRUPT:unknown stage {stage!r}")
+        key = pair_key(phase, gate_iteration)
+        with self._section.locked():
+            pairs = self._read()
+            slot = pairs.setdefault(key, {})
+            existing = slot.get(role)
+            if existing is None:
+                entry = new_pair_entry(run_id=self.run_id, phase=str(phase),
+                                       gate_iteration=str(gate_iteration), role=role,
+                                       stage=stage, recorded_by=self.owner_id, **fields)
+            else:
+                old_attempt = int(existing["create_attempt"])
+                new_attempt = int(fields.get("create_attempt",
+                                             existing["create_attempt"]))
+                old_rank = (old_attempt,
+                            PAIR_PREPARATION_STAGES.index(existing["stage"]))
+                new_rank = (new_attempt, PAIR_PREPARATION_STAGES.index(stage))
+                if new_rank < old_rank:
+                    raise PairPreparationCorrupt(
+                        "PAIR_PREPARATION_CORRUPT:non-monotonic promotion "
+                        f"{old_rank} -> {new_rank}")
+                if new_attempt == old_attempt and existing["stage"] == "CREATE_REFUSED":
+                    raise PairPreparationCorrupt(
+                        "PAIR_PREPARATION_CORRUPT:CREATE_REFUSED and CREATED are "
+                        "ALTERNATIVE successors of one CREATE_INTENDED and are never "
+                        "promoted into each other; a retry carries create_attempt + 1")
+                if new_attempt > old_attempt and stage != "CREATE_INTENDED":
+                    raise PairPreparationCorrupt(
+                        "PAIR_PREPARATION_CORRUPT:a new create attempt is published as "
+                        "CREATE_INTENDED before its effect, never after it")
+                entry = dict(existing)
+                if new_attempt > old_attempt:
+                    entry.update(_PAIR_ENTRY_ATTEMPT_CLEARED)
+                entry.update(fields)
+                entry["create_attempt"] = str(new_attempt)
+                entry["stage"] = stage
+                entry["recorded_by"] = self.owner_id
+                entry = validate_pair_entry(entry)
+            slot[role] = entry
+            self._write(pairs)
+            return deepcopy(entry)
+
+
+def pair_binding_for(run_id: str, *, artifact_base: str | os.PathLike[str],
+                     clock: Any | None = None,
+                     owner_id: str | None = None) -> FilePairBindingStore:
+    return FilePairBindingStore(pair_binding_path(run_id, artifact_base=artifact_base),
+                                run_id=run_id, clock=clock, owner_id=owner_id)
+
+
+def pair_preparation_for(run_id: str, *, artifact_base: str | os.PathLike[str],
+                         clock: Any | None = None,
+                         owner_id: str | None = None) -> FilePairPreparationStore:
+    return FilePairPreparationStore(
+        pair_preparation_path(run_id, artifact_base=artifact_base),
+        run_id=run_id, clock=clock, owner_id=owner_id)
